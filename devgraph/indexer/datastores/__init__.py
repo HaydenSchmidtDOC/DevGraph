@@ -1,0 +1,1 @@
+"""Datastore extractor for DevGraph."""
