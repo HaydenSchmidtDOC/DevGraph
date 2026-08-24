@@ -1,0 +1,26 @@
+# DevGraph's own isolated Neo4j instance.
+# Fully separate from any other project's containers on this machine —
+# distinct container/volume names and host ports to avoid collisions.
+# Local-first per the Design Brief: no external network exposure beyond localhost.
+version: "3.8"
+
+services:
+  devgraph-neo4j:
+    image: docker.io/library/neo4j:5.26-community
+    container_name: devgraph-neo4j
+    ports:
+      - "127.0.0.1:7474:7474" # HTTP browser UI
+      - "127.0.0.1:7687:7687" # Bolt protocol
+    environment:
+      NEO4J_AUTH: "neo4j/devgraph-local-dev"
+      NEO4J_PLUGINS: "[]"
+      NEO4J_dbms_usage__report_enabled: "false"
+    volumes:
+      - devgraph_neo4j_data:/data
+      - devgraph_neo4j_logs:/logs
+
+volumes:
+  devgraph_neo4j_data:
+    name: devgraph_neo4j_data
+  devgraph_neo4j_logs:
+    name: devgraph_neo4j_logs

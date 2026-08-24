@@ -1,0 +1,37 @@
+[project]
+name = "devgraph"
+version = "0.1.0"
+description = "Local-first developer knowledge graph platform"
+requires-python = ">=3.13"
+dependencies = [
+    "neo4j>=5.26",
+    "tree-sitter>=0.23,<0.24",
+    "tree-sitter-python>=0.23,<0.24",
+    "watchdog>=5.0",
+    "typer>=0.13",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "pyyaml>=6.0",
+    "pystray>=0.19",
+    "pillow>=10.4",
+    "mcp>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+devgraph = "devgraph.cli.main:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["devgraph*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

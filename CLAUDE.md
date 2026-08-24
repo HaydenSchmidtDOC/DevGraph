@@ -4,13 +4,21 @@ Local-first developer knowledge graph platform. Builds and maintains a structure
 
 ## Status
 
-Pre-implementation. This repo currently contains only planning docs (this file, `AGENTS.md`, `Blueprints/`) — no source code, no services, no Neo4j instance, no MCP server exist here yet. Do not assume any tooling, dependency, or running service beyond what you can see in the working tree. Treat claims in this file about "the indexer," "the MCP layer," etc. as target architecture, not present state, until the corresponding code lands.
+Phase 1 implementation in progress. `devgraph/` package scaffold, venv, and a local Neo4j container exist. Treat claims about specific extractors/tools as complete only once their code and tests actually land — check `devgraph/` before assuming a component works.
 
 Git is initialized locally; no remote is configured yet. Container runtime is **Podman** (not Docker) — see the Design Brief and Implementation Plan.
 
 ## Commands
 
-None yet — no build, test, lint, or run step exists until the first service/package is added. When you add the first real code (agent, indexer, MCP server), update this section with the actual commands rather than guessing a stack ahead of time.
+- Create venv: `python -m venv .venv`
+- Install (editable, with dev deps): `.venv/Scripts/python -m pip install -e ".[dev]"`
+- Run tests: `.venv/Scripts/python -m pytest`
+- Start DevGraph's Neo4j (isolated container, not shared with other projects):
+  `podman run -d --name devgraph-neo4j -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 -e NEO4J_AUTH=neo4j/devgraph-local-dev -v devgraph_neo4j_data:/data -v devgraph_neo4j_logs:/logs docker.io/library/neo4j:5.26-community`
+  (see `deploy/podman-compose.yml` for the declarative form; requires a compose provider to use directly — `podman run` above needs none)
+- CLI entrypoint (once installed): `devgraph add <path>`, `devgraph list`, `devgraph status`
+
+**Podman note**: on this machine `podman.exe` may not be on PATH by default even though it's installed — check `%LOCALAPPDATA%\Programs\Podman` before assuming it's missing. Never install new software to the host; DevGraph's dependencies live in `.venv/` and containers only. Never touch containers/volumes belonging to other projects (e.g. anything prefixed differently from `devgraph-`) — DevGraph's containers are named `devgraph-*` specifically to stay isolated from other services running on the same machine.
 
 ## Structure
 
@@ -28,7 +36,6 @@ None yet — no build, test, lint, or run step exists until the first service/pa
 
 - **This repo has no `code-review-graph` / knowledge-graph MCP tool.** If such a tool ever appears in your available tools list for this session, it belongs to a different project — do not assume it applies here, and do not reference it in docs or code for this repo. (`.claude/skills/` and the hook-based `.claude/settings.json` that referenced it were removed as stale carry-over from another repo — don't re-add graph-tool skills/hooks until DevGraph's own MCP layer actually exists.)
 - Read [AGENTS.md](AGENTS.md) for how to work in a docs-only / pre-code repo.
-- Since there's no existing codebase to search, favor reading the actual files in `Blueprints/` over recalling this summary — the brief is the detail; this file is the index.
 - When implementation starts, prefer targeted edits over rewriting whole files, and don't duplicate logic — but there's no `shared/` or established convention yet, so the first services you write **set** the convention; choose deliberately since later code will follow the pattern, not the other way around.
 
 ## Privacy
