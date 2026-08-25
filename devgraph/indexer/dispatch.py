@@ -49,6 +49,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     docs_root = (repo_root / docs_path).resolve() if docs_path else None
     py_files: list[tuple[str, str]] = []  # (rel_path, content), for the cross-link pass below
 
+    paths = _expand_with_reverse_dependents(engine, repo_id, repo_root, paths)
+
     for path in paths:
         path = Path(path)
         try:
@@ -64,6 +66,15 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         rel_path = resolved.relative_to(repo_root.resolve()).as_posix()
 
         if resolved.suffix == ".py":
+            # Prune this file's previously-indexed nodes before re-extracting,
+            # not just MERGE-upsert the current contents: a Function/Class
+            # removed from the file (edited, not deleted) would otherwise
+            # survive in the graph forever, since MERGE only ever adds/
+            # updates matching nodes, never removes ones the current source
+            # no longer produces. Safe to do unconditionally — index_python_file
+            # immediately re-upserts everything still present, including the
+            # Module node itself, via the same repo-relative key.
+            engine.delete_nodes_by_source_file(repo_id, rel_path)
             index_python_file(engine, repo_id, resolved, repo_root=repo_root)
             indexed += 1
         elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
@@ -87,6 +98,20 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             _index_apis(engine, repo_id, rel_path, content)
             py_files.append((rel_path, content))
 
+    # Second pass: re-run the Python extractor (no re-prune) over every .py
+    # file in this batch. Batch iteration order is unspecified (paths is a
+    # set), so a CALLS/IMPORTS edge from file X to file Y within the SAME
+    # batch can silently fail to materialize on the first pass if X happens
+    # to be processed before Y — upsert_relationship only MATCH-MATCHes
+    # existing endpoint nodes, it doesn't create them, so Y's node isn't
+    # there yet when X's edges are upserted. Re-indexing (not re-pruning)
+    # every file a second time is idempotent (see
+    # test_index_file_creates_idempotent_nodes) and guarantees every node
+    # in the batch exists before every file's edges are attempted at least
+    # once, regardless of first-pass order.
+    for rel_path, _content in py_files:
+        index_python_file(engine, repo_id, repo_root / rel_path, repo_root=repo_root)
+
     # Service cross-linking runs as a final pass, after every file in this
     # batch (including any compose file) has been indexed — Service nodes'
     # build_context properties must already be in the graph for this to find
@@ -96,6 +121,48 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         _link_to_owning_service(engine, repo_id, rel_path, content)
 
     return indexed
+
+
+def _expand_with_reverse_dependents(
+    engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path]
+) -> set[Path]:
+    """Widen a changed-files batch to also include direct importers of any
+    changed .py file already in the graph.
+
+    Without this, a CALLS/IMPORTS edge in some other file (e.g. a caller of
+    a since-renamed/removed function) is only ever re-evaluated when that
+    other file happens to be edited again, or a full rescan runs — it isn't
+    a dangling edge (upsert_relationship only MATCH-MATCHes real endpoint
+    nodes), but it silently goes stale/missing until then. One level of
+    fan-out only (direct importers, not transitive) to keep this a cheap
+    per-change lookup rather than a repo walk; transitive staleness is rare
+    enough that `--full` remains the intended escape hatch for it.
+    """
+    root_resolved = repo_root.resolve()
+    expanded = set(paths)
+    original_py_rel_paths = set()
+
+    for path in paths:
+        try:
+            resolved = Path(path).resolve()
+        except OSError:
+            continue
+        if resolved.suffix != ".py" or not str(resolved).startswith(str(root_resolved)):
+            continue
+        try:
+            original_py_rel_paths.add(resolved.relative_to(root_resolved).as_posix())
+        except ValueError:
+            continue
+
+    for rel_path in original_py_rel_paths:
+        for importer_rel_path in engine.find_importing_modules(repo_id, rel_path):
+            if importer_rel_path in original_py_rel_paths:
+                continue
+            importer_path = (root_resolved / importer_rel_path).resolve()
+            if importer_path.exists():
+                expanded.add(importer_path)
+
+    return expanded
 
 
 def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path]) -> int:

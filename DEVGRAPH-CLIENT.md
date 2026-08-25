@@ -251,14 +251,28 @@ Two things worth knowing about how they work:
 
 ## 5. Keeping the graph current
 
-`devgraph add`/`rescan` do a full scan, and the watcher-to-indexer wiring
-now exists (`devgraph.agent.TrayApp`, `python -m devgraph.agent.tray`) — but
-the tray app is a separate always-on process most workflows won't have
-running, and there's no CLI subcommand for it yet (it's a standalone script
-entry point, not `devgraph <something>`). Without it running, nothing
-watches this repo live: re-run `devgraph rescan <repo_id>` after a
-meaningful batch of changes. A stale graph gives stale answers, so don't
-rely on it for anything time-sensitive without refreshing first.
+`devgraph add`/`rescan` do a full scan. For ongoing changes, connecting an
+MCP client (Claude Code, etc.) auto-starts the tray app (watcher +
+incremental indexer, `devgraph.agent.TrayApp`) as a detached background
+process if one isn't already running — no manual step needed in the common
+case. It watches every registered repo and reindexes changed files as
+they're saved, and **shuts back down automatically when the last connected
+MCP client disconnects** — each MCP server process registers itself as a
+"holder" of the shared tray process on connect and releases that hold on
+clean shutdown, so with a single client, closing it stops indexing right
+along with it; with multiple clients connected at once, the tray keeps
+running until all of them have disconnected, not just the first one to go.
+You can also manage it directly with `devgraph tray start`/`stop`/`status`
+(e.g. to run it without any MCP client attached, or to force-stop it
+immediately regardless of any still-connected clients) — the MCP server and
+the CLI share the same PID-tracked process, so either one starting it is
+enough. It is **not** registered to survive reboot/logout — after a reboot,
+either reconnect an MCP client or run `devgraph tray start` once. If for any
+reason it isn't running, nothing watches this repo live: re-run `devgraph
+rescan <repo_id>` after a meaningful batch of changes, or check `devgraph
+status`/`devgraph tray status` to see whether it's already running. A stale
+graph gives stale answers, so don't rely on it for anything time-sensitive
+without confirming liveness or refreshing first.
 
 ## Non-negotiables when working with DevGraph from this repo
 

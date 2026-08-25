@@ -133,8 +133,8 @@ def get_service_dependencies(
     OPTIONAL MATCH (s)-[:USES|DEPENDS_ON|RUNS]->(dep)
     OPTIONAL MATCH (s)-[:CALLS]->(called:Service)
     RETURN s.name as service,
-           COLLECT(DISTINCT {{name: dep.name, type: labels(dep)[0], repo_id: dep.repo_id}}) as dependencies,
-           COLLECT(DISTINCT {{name: called.name, repo_id: called.repo_id}}) as calls
+           [d IN COLLECT(DISTINCT {{name: dep.name, type: labels(dep)[0], repo_id: dep.repo_id}}) WHERE d.name IS NOT NULL] as dependencies,
+           [c IN COLLECT(DISTINCT {{name: called.name, repo_id: called.repo_id}}) WHERE c.name IS NOT NULL] as calls
     """
     params = {"service_name": service_name}
     if not cross_repo:

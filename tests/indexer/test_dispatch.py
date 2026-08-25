@@ -49,6 +49,84 @@ class TestIndexPaths:
         finally:
             engine.delete_repository(repo_id)
 
+    def test_reindexing_prunes_symbols_removed_from_the_file(self, engine, temp_repo):
+        """A function/class removed from a file (edited, not deleted) must not
+        survive in the graph as a stale node after the file is reindexed.
+
+        MERGE-based upserts only ever add/update matching nodes, never
+        remove ones the current source no longer produces — index_paths must
+        explicitly prune this file's previously-indexed nodes before
+        re-extracting, or a removed symbol lingers forever until the whole
+        repo is deleted and re-added.
+        """
+        repo_id = "_smoketest_dispatch_prune"
+        py_file = temp_repo / "service.py"
+        py_file.write_text("def keep():\n    pass\n\ndef remove_me():\n    pass\n")
+
+        try:
+            index_paths(engine, repo_id, temp_repo, {py_file})
+            result = engine.run_cypher(
+                "MATCH (f:Function {repo_id: $repo_id}) RETURN f.name as name",
+                {"repo_id": repo_id},
+            )
+            names = {r["name"] for r in result}
+            assert {"keep", "remove_me"} <= names
+
+            # Edit the file to remove one function, then reindex it again —
+            # simulating a rescan/live-reindex after that edit.
+            py_file.write_text("def keep():\n    pass\n")
+            index_paths(engine, repo_id, temp_repo, {py_file})
+
+            result = engine.run_cypher(
+                "MATCH (f:Function {repo_id: $repo_id}) RETURN f.name as name",
+                {"repo_id": repo_id},
+            )
+            names = {r["name"] for r in result}
+            assert names == {"keep"}, f"stale node(s) survived reindex: {names}"
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_reindexing_a_file_also_refreshes_its_direct_importers(self, engine, temp_repo):
+        """Renaming a function in file A must update file B's CALLS edge even
+        though only A was passed to index_paths — B is a direct importer of
+        A (via an IMPORTS edge already in the graph), so it should be
+        transparently pulled into the same reindex batch.
+
+        Without this, upsert_relationship's MATCH-MATCH semantics mean B's
+        stale CALLS edge to the old function name just silently never
+        re-resolves until B itself is edited or a full rescan runs.
+        """
+        repo_id = "_smoketest_dispatch_reverse_deps"
+        a_file = temp_repo / "a.py"
+        b_file = temp_repo / "b.py"
+        a_file.write_text("def do_thing():\n    pass\n")
+        b_file.write_text("from a import do_thing\n\ndef caller():\n    do_thing()\n")
+
+        try:
+            index_paths(engine, repo_id, temp_repo, {a_file, b_file})
+
+            result = engine.run_cypher(
+                "MATCH (:Function {repo_id: $repo_id, name: 'caller'})"
+                "-[:CALLS]->(f:Function {repo_id: $repo_id}) RETURN f.name as name",
+                {"repo_id": repo_id},
+            )
+            assert {r["name"] for r in result} == {"do_thing"}
+
+            # Rename the called function in a.py, then reindex ONLY a.py —
+            # simulating a live edit where the watcher only saw a.py change.
+            a_file.write_text("def do_other_thing():\n    pass\n")
+            index_paths(engine, repo_id, temp_repo, {a_file})
+
+            result = engine.run_cypher(
+                "MATCH (:Function {repo_id: $repo_id, name: 'caller'})"
+                "-[:CALLS]->(f:Function {repo_id: $repo_id}) RETURN f.name as name",
+                {"repo_id": repo_id},
+            )
+            names = {r["name"] for r in result}
+            assert "do_thing" not in names, f"stale CALLS edge survived: {names}"
+        finally:
+            engine.delete_repository(repo_id)
+
     def test_indexes_datastore_usage_from_same_python_file(self, engine, temp_repo):
         repo_id = "_smoketest_dispatch_datastore"
         py_file = temp_repo / "db.py"

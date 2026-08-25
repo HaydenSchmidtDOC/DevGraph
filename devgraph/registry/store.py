@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,18 +69,34 @@ class RepoRegistry:
 
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
-        existing_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(repos)")}
-        for column, migration in _MIGRATIONS:
-            if column not in existing_cols:
-                self._conn.execute(migration)
-        self._conn.commit()
+        # check_same_thread=False + an RLock: this registry is read/written
+        # from multiple threads in practice (each registered repo's watcher
+        # fires its debounce callback on its own threading.Timer thread, plus
+        # the tray app's health-check thread and the main thread) — sqlite3's
+        # default check_same_thread=True raised
+        # "SQLite objects created in a thread can only be used in that same
+        # thread" on essentially every watcher-triggered reindex, since the
+        # Timer thread is never the thread that created this connection. The
+        # RLock (not a plain Lock) serializes actual access, since a shared
+        # SQLite connection is only safe for one thread to use at a time even
+        # with check_same_thread=False — RLock specifically because a few
+        # methods below (set_docs_path, set_last_indexed_commit) call self.get()
+        # internally while already holding the lock.
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._lock = threading.RLock()
+        with self._lock:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.executescript(_SCHEMA)
+            self._conn.commit()
+            existing_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(repos)")}
+            for column, migration in _MIGRATIONS:
+                if column not in existing_cols:
+                    self._conn.execute(migration)
+            self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def add_repo(self, path: str | Path, repo_id: str | None = None) -> RepoRecord:
         resolved = Path(path).resolve()
@@ -88,32 +105,34 @@ class RepoRegistry:
         if not (resolved / ".git").exists():
             raise ValueError(f"not a git repository: {resolved}")
 
-        existing = self._conn.execute(
-            "SELECT repo_id FROM repos WHERE path = ?", (str(resolved),)
-        ).fetchone()
-        if existing:
-            raise ValueError(f"already registered as '{existing[0]}': {resolved}")
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT repo_id FROM repos WHERE path = ?", (str(resolved),)
+            ).fetchone()
+            if existing:
+                raise ValueError(f"already registered as '{existing[0]}': {resolved}")
 
-        candidate = _slugify(repo_id or resolved.name)
-        final_id = candidate
-        suffix = 2
-        while self._conn.execute(
-            "SELECT 1 FROM repos WHERE repo_id = ?", (final_id,)
-        ).fetchone():
-            final_id = f"{candidate}-{suffix}"
-            suffix += 1
+            candidate = _slugify(repo_id or resolved.name)
+            final_id = candidate
+            suffix = 2
+            while self._conn.execute(
+                "SELECT 1 FROM repos WHERE repo_id = ?", (final_id,)
+            ).fetchone():
+                final_id = f"{candidate}-{suffix}"
+                suffix += 1
 
-        self._conn.execute(
-            "INSERT INTO repos (repo_id, path, active, watch_enabled, last_indexed) "
-            "VALUES (?, ?, 1, 1, NULL)",
-            (final_id, str(resolved)),
-        )
-        self._conn.commit()
+            self._conn.execute(
+                "INSERT INTO repos (repo_id, path, active, watch_enabled, last_indexed) "
+                "VALUES (?, ?, 1, 1, NULL)",
+                (final_id, str(resolved)),
+            )
+            self._conn.commit()
         return RepoRecord(final_id, resolved, True, True, None)
 
     def remove_repo(self, repo_id: str) -> None:
-        cur = self._conn.execute("DELETE FROM repos WHERE repo_id = ?", (repo_id,))
-        self._conn.commit()
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM repos WHERE repo_id = ?", (repo_id,))
+            self._conn.commit()
         if cur.rowcount == 0:
             raise ValueError(f"no such repo_id: {repo_id}")
 
@@ -124,19 +143,21 @@ class RepoRegistry:
         self._set_flag(repo_id, "watch_enabled", False)
 
     def _set_flag(self, repo_id: str, column: str, value: bool) -> None:
-        cur = self._conn.execute(
-            f"UPDATE repos SET {column} = ? WHERE repo_id = ?", (int(value), repo_id)
-        )
-        self._conn.commit()
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE repos SET {column} = ? WHERE repo_id = ?", (int(value), repo_id)
+            )
+            self._conn.commit()
         if cur.rowcount == 0:
             raise ValueError(f"no such repo_id: {repo_id}")
 
     def mark_indexed(self, repo_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        self._conn.execute(
-            "UPDATE repos SET last_indexed = ? WHERE repo_id = ?", (now, repo_id)
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE repos SET last_indexed = ? WHERE repo_id = ?", (now, repo_id)
+            )
+            self._conn.commit()
 
     def set_docs_path(self, repo_id: str, docs_path: str | Path | None) -> None:
         """Set (or clear, with None) the repo-relative docs path for the docs extractor.
@@ -145,14 +166,15 @@ class RepoRegistry:
         have registered `repo_id` via add_repo; this never introduces a new
         filesystem root outside the repo itself.
         """
-        repo = self.get(repo_id)
-        if repo is None:
-            raise ValueError(f"no such repo_id: {repo_id}")
-        value = str(docs_path) if docs_path is not None else None
-        self._conn.execute(
-            "UPDATE repos SET docs_path = ? WHERE repo_id = ?", (value, repo_id)
-        )
-        self._conn.commit()
+        with self._lock:
+            repo = self.get(repo_id)
+            if repo is None:
+                raise ValueError(f"no such repo_id: {repo_id}")
+            value = str(docs_path) if docs_path is not None else None
+            self._conn.execute(
+                "UPDATE repos SET docs_path = ? WHERE repo_id = ?", (value, repo_id)
+            )
+            self._conn.commit()
 
     def set_pr_source_enabled(self, repo_id: str, enabled: bool) -> None:
         """Opt this repo in/out of PR ingestion (Phase 3). Default is off (Principle 2)."""
@@ -164,13 +186,14 @@ class RepoRegistry:
 
     def set_last_indexed_commit(self, repo_id: str, sha: str | None) -> None:
         """Record the most recently walked commit SHA for incremental git history indexing."""
-        repo = self.get(repo_id)
-        if repo is None:
-            raise ValueError(f"no such repo_id: {repo_id}")
-        self._conn.execute(
-            "UPDATE repos SET last_indexed_commit = ? WHERE repo_id = ?", (sha, repo_id)
-        )
-        self._conn.commit()
+        with self._lock:
+            repo = self.get(repo_id)
+            if repo is None:
+                raise ValueError(f"no such repo_id: {repo_id}")
+            self._conn.execute(
+                "UPDATE repos SET last_indexed_commit = ? WHERE repo_id = ?", (sha, repo_id)
+            )
+            self._conn.commit()
 
     _COLUMNS = (
         "repo_id, path, active, watch_enabled, last_indexed, docs_path, "
@@ -178,17 +201,19 @@ class RepoRegistry:
     )
 
     def get(self, repo_id: str) -> RepoRecord | None:
-        row = self._conn.execute(
-            f"SELECT {self._COLUMNS} FROM repos WHERE repo_id = ?",
-            (repo_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._COLUMNS} FROM repos WHERE repo_id = ?",
+                (repo_id,),
+            ).fetchone()
         return self._row_to_record(row) if row else None
 
     def list_repos(self, active_only: bool = False) -> list[RepoRecord]:
         query = f"SELECT {self._COLUMNS} FROM repos"
         if active_only:
             query += " WHERE active = 1"
-        rows = self._conn.execute(query).fetchall()
+        with self._lock:
+            rows = self._conn.execute(query).fetchall()
         return [self._row_to_record(r) for r in rows]
 
     @staticmethod

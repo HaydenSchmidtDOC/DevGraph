@@ -123,6 +123,9 @@ class TestGetServiceDependencies:
         dep_names = [d["name"] for d in result.get("dependencies", [])]
         assert "PostgresDB" in dep_names
         assert "QdrantDB" in dep_names
+        # AuthService has no outbound CALLS edges; the OPTIONAL MATCH should
+        # not leak a placeholder {name: null, repo_id: null} entry.
+        assert result.get("calls", []) == []
 
     def test_service_dependencies_no_cross_repo(self, seeded_graph):
         """Test that dependencies don't cross repo boundaries by default."""

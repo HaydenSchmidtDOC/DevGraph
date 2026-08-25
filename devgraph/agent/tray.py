@@ -72,10 +72,10 @@ class TrayApp:
             len(changed_paths),
             len(deleted_paths),
         )
-        repo = self._registry.get(repo_id)
-        if repo is None:
-            return  # repo was removed between the event firing and now
         try:
+            repo = self._registry.get(repo_id)
+            if repo is None:
+                return  # repo was removed between the event firing and now
             if changed_paths:
                 index_paths(self._engine, repo_id, repo.path, changed_paths, docs_path=repo.docs_path)
             if deleted_paths:

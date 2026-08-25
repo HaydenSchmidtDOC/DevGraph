@@ -84,6 +84,27 @@ class GraphEngine:
                 properties=properties or {},
             )
 
+    def find_importing_modules(self, repo_id: str, module_name: str) -> list[str]:
+        """Return the repo-relative paths of every Module with an IMPORTS edge
+        into `module_name` (direct importers only, one level).
+
+        Used to widen an incremental reindex to a changed file's dependents:
+        a CALLS/IMPORTS edge in an importer's own extracted source is only
+        re-evaluated when that importer's file is itself reindexed, so a
+        rename/removal in the imported file otherwise leaves the importer's
+        edges stale until it happens to be edited again or a full rescan
+        runs. See dispatch.py's index_paths.
+        """
+        with self._driver.session() as session:
+            result = session.run(
+                "MATCH (m:Module {repo_id: $repo_id})-[:IMPORTS]->"
+                "(target:Module {repo_id: $repo_id, name: $module_name}) "
+                "RETURN m.name as name",
+                repo_id=repo_id,
+                module_name=module_name,
+            )
+            return [record["name"] for record in result]
+
     def delete_nodes_by_source_file(self, repo_id: str, file_name: str) -> None:
         """Remove every node whose provenance property names this file, scoped to repo_id.
 

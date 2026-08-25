@@ -13,7 +13,13 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable
 
-from watchdog.events import FileDeletedEvent, FileModifiedEvent, FileSystemEventHandler
+from watchdog.events import (
+    FileCreatedEvent,
+    FileDeletedEvent,
+    FileModifiedEvent,
+    FileMovedEvent,
+    FileSystemEventHandler,
+)
 from watchdog.observers import Observer
 
 from devgraph.config import get_settings
@@ -152,6 +158,24 @@ class _RepoEventHandler(FileSystemEventHandler):
                 self._deleted_paths.discard(event_path)
                 self._reset_debounce()
 
+    def on_created(self, event: FileCreatedEvent) -> None:
+        """Record file creation and set debounce timer.
+
+        Also covers the "write to a temp file, then create the real path"
+        half of an atomic-save sequence some editors/tools use — without
+        this, a plain on_modified-only handler misses the file entirely if
+        the save never touches an already-existing inode via a modify event.
+        """
+        if event.is_directory:
+            return
+
+        event_path = Path(event.src_path)
+        if self._is_tracked_path(event_path):
+            with self._lock:
+                self._changed_paths.add(event_path)
+                self._deleted_paths.discard(event_path)
+                self._reset_debounce()
+
     def on_deleted(self, event: FileDeletedEvent) -> None:
         """Record file deletion and set debounce timer."""
         if event.is_directory:
@@ -161,6 +185,37 @@ class _RepoEventHandler(FileSystemEventHandler):
         with self._lock:
             self._deleted_paths.add(event_path)
             self._changed_paths.discard(event_path)
+            self._reset_debounce()
+
+    def on_moved(self, event: FileMovedEvent) -> None:
+        """Record an atomic-save rename (temp-file -> real path) as a change.
+
+        Some editors/tools save by writing a temp file then renaming it onto
+        the real path — watchdog reports that as delete(old) + moved(temp,
+        real) rather than a modify on the real path, which an on_modified/
+        on_deleted-only handler silently misses: the delete would wrongly
+        queue the real path for removal, and nothing would ever queue it as
+        changed. Treat the destination as changed and clear any stray delete
+        recorded for it in the same debounce window; also treat the source
+        path being vacated as no longer deleted (it may have raced in as a
+        delete just before this move, e.g. rename onto an existing path).
+        """
+        if event.is_directory:
+            return
+
+        dest_path = Path(event.dest_path)
+        src_path = Path(event.src_path)
+        with self._lock:
+            if self._is_tracked_path(dest_path):
+                self._changed_paths.add(dest_path)
+                self._deleted_paths.discard(dest_path)
+                self._deleted_paths.discard(src_path)
+            else:
+                # Destination isn't a file DevGraph tracks (e.g. moved out of
+                # the repo or into a non-file); treat it like a deletion of
+                # the original path.
+                self._deleted_paths.add(src_path)
+                self._changed_paths.discard(src_path)
             self._reset_debounce()
 
     def _is_tracked_path(self, path: Path) -> bool:

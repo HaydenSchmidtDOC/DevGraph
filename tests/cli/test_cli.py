@@ -64,11 +64,15 @@ def require_neo4j():
 def _block_real_registry(monkeypatch, tmp_path):
     """Safety net: any CLI invocation that forgets to patch get_settings falls
     back to an empty throwaway registry instead of the developer's real
-    ~/.devgraph/registry.sqlite3. A previous version of this suite leaked
-    tmp* repo entries into the real registry because cli.main imports
-    get_settings directly (its own reference, separate from
-    devgraph.config.get_settings) — patching only the config module's copy
-    silently missed it.
+    ~/.devgraph/registry.sqlite3 (and, critically for the tray commands, the
+    developer's real tray.pid/tray_holders — without this, a tray test can
+    read/kill/report on a genuinely-running tray process on the machine
+    running the tests). A previous version of this suite leaked tmp* repo
+    entries into the real registry because cli.main imports get_settings
+    directly (its own reference, separate from devgraph.config.get_settings)
+    — patching only the config module's copy silently missed it. The same
+    pitfall recurred when tray lifecycle logic moved into
+    devgraph.agent.lifecycle, which has its own get_settings reference too.
 
     Implemented as a default, not a hard replacement: tests still call
     `patch.object(..., "get_settings", return_value=...)` to point at their
@@ -83,10 +87,12 @@ def _block_real_registry(monkeypatch, tmp_path):
 
     _fallback_get_settings.cache_clear = lambda: None  # tests call this defensively
 
+    from devgraph.agent import lifecycle
     from devgraph.cli import main as cli_main
 
     monkeypatch.setattr(cli_main, "get_settings", _fallback_get_settings)
     monkeypatch.setattr(config_module, "get_settings", _fallback_get_settings)
+    monkeypatch.setattr(lifecycle, "get_settings", _fallback_get_settings)
 
 
 def _mock_settings(db_path):
@@ -555,3 +561,69 @@ def test_cli_client_config_mcp_add_only(runner, temp_registry_db):
         collapsed = " ".join(l.strip() for l in result.stdout.strip().splitlines())
         assert collapsed.startswith("claude mcp add devgraph")
         assert "devgraph.mcp.server" in collapsed
+
+
+def test_cli_tray_status_not_running(runner, temp_registry_db):
+    """'devgraph tray status' reports not-running when no PID file exists."""
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    from devgraph.agent import lifecycle
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(lifecycle, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["tray", "status"])
+        assert result.exit_code == 0, f"stdout: {result.stdout}"
+        assert "not running" in result.stdout
+        assert "devgraph tray start" in result.stdout
+
+
+def test_cli_tray_start_then_status_then_stop(runner, temp_registry_db):
+    """'devgraph tray start' records a PID that 'status'/'stop' then recognize.
+
+    Spawning the real tray app would require pystray/a live Neo4j and a GUI
+    tray context, so this patches subprocess.Popen with a fake process object
+    and patches the liveness probe to track that fake PID as alive until
+    'stop' is called — exercising the PID-file lifecycle without the
+    real OS-level process.
+    """
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    from devgraph.agent import lifecycle
+    from devgraph.cli import main as cli_main
+
+    fake_pid = 999999
+    fake_process = MagicMock()
+    fake_process.pid = fake_pid
+    alive = {fake_pid}
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(lifecycle, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(lifecycle.subprocess, "Popen", return_value=fake_process), \
+         patch.object(lifecycle, "pid_is_running", side_effect=lambda pid: pid in alive), \
+         patch.object(lifecycle, "resolve_venv_python", return_value=Path("python")), \
+         patch.object(lifecycle, "resolve_repo_root", return_value=Path(".")):
+        start_result = runner.invoke(app, ["tray", "start"])
+        assert start_result.exit_code == 0, f"stdout: {start_result.stdout}"
+        assert str(fake_pid) in start_result.stdout
+
+        status_result = runner.invoke(app, ["tray", "status"])
+        assert "running" in status_result.stdout
+        assert str(fake_pid) in status_result.stdout
+
+        # Starting again while "alive" should be a no-op, not a second spawn.
+        restart_result = runner.invoke(app, ["tray", "start"])
+        assert "already running" in restart_result.stdout
+        lifecycle.subprocess.Popen.assert_called_once()
+
+        with patch.object(cli_main.os, "kill") as fake_kill:
+            stop_result = runner.invoke(app, ["tray", "stop"])
+            assert stop_result.exit_code == 0, f"stdout: {stop_result.stdout}"
+            fake_kill.assert_called_once_with(fake_pid, cli_main.signal.SIGTERM)
+        alive.discard(fake_pid)
+
+        final_status = runner.invoke(app, ["tray", "status"])
+        assert "not running" in final_status.stdout

@@ -30,12 +30,14 @@ Run directly: `.venv/Scripts/python -m devgraph.mcp.server`
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
+from devgraph.agent import lifecycle
 from devgraph.config.settings import get_settings
 from devgraph.graph.engine import GraphEngine
 from devgraph.mcp import tools as devgraph_tools
@@ -270,6 +272,24 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
 def main() -> None:
     """Entry point: connect to Neo4j, initialize schema, run the stdio MCP server.
 
+    Also starts the tray app (watcher + incremental indexer) as a detached
+    background process if one isn't already running, so a registered repo's
+    saved changes get reindexed without anyone manually running
+    `devgraph tray start` or `python -m devgraph.agent.tray` first. This is a
+    no-op when a tray process is already alive (per its PID file) — safe to
+    call from every concurrently-connected MCP client's own server process,
+    since an MCP client spawns one of these per connection (see this
+    module's docstring).
+
+    This process also registers itself as a "holder" of the shared tray
+    process (devgraph/agent/lifecycle.py's holder tracking) and unregisters
+    on shutdown, stopping the tray only if it was the last holder. Multiple
+    MCP clients can be connected at once, each with its own server process —
+    tying the tray's lifetime to any single one of those exiting would
+    silently stop live indexing for every other still-connected client, so
+    shutdown is refcounted across all of them instead. `devgraph tray stop`
+    remains available to force a stop regardless of holders.
+
     Run with: `.venv/Scripts/python -m devgraph.mcp.server`
     """
     settings = get_settings()
@@ -278,12 +298,27 @@ def main() -> None:
     engine.init_schema()
     registry = RepoRegistry(settings.registry_db_path)
 
+    logger = logging.getLogger(__name__)
+    try:
+        lifecycle.start_tray_if_not_running()
+        lifecycle.register_tray_holder()
+    except Exception:
+        logger.warning(
+            "failed to auto-start the DevGraph tray app; live reindexing will not run "
+            "until 'devgraph tray start' is run manually",
+            exc_info=True,
+        )
+
     server = build_server(engine, registry)
     try:
         server.run("stdio")
     finally:
         engine.close()
         registry.close()
+        try:
+            lifecycle.stop_tray_if_last_holder()
+        except Exception:
+            logger.warning("failed to stop the DevGraph tray app on shutdown", exc_info=True)
 
 
 if __name__ == "__main__":

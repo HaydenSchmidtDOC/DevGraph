@@ -190,6 +190,56 @@ def test_watcher_manager_collects_deletions(temp_registry_db, temp_git_repo):
         watcher.stop()
 
 
+def test_watcher_manager_collects_atomic_rename_save(temp_registry_db, temp_git_repo):
+    """Some editors/tools save by writing a temp file then renaming it onto
+    the real path, rather than modifying the real path's inode in place.
+    watchdog reports that as delete(real_path) + moved(temp, real_path), not
+    a modify on real_path — a handler that only implements on_modified/
+    on_deleted misses the file being changed entirely (and wrongly records
+    a stray deletion). This was a real bug: live reindexing silently never
+    fired for saves that go through this path.
+    """
+    registry = temp_registry_db
+    repo_record = registry.add_repo(temp_git_repo)
+
+    test_file = temp_git_repo / "test_normalization.py"
+    test_file.write_text("def foo():\n    pass\n")
+
+    changes_collected = {}
+    deletions_collected = {}
+
+    def on_changes(repo_id: str, paths: set[Path], deleted: set[Path]) -> None:
+        if paths:
+            changes_collected.setdefault(repo_id, set()).update(paths)
+        if deleted:
+            deletions_collected.setdefault(repo_id, set()).update(deleted)
+
+    watcher = WatcherManager(registry, on_changes)
+    watcher.start()
+
+    try:
+        time.sleep(0.5)  # let the initial create settle
+
+        tmp_file = temp_git_repo / "test_normalization.py.tmp"
+        tmp_file.write_text("def foo():\n    pass\n\ndef devgraph_index_probe():\n    pass\n")
+        tmp_file.replace(test_file)  # atomic rename onto the real path
+
+        time.sleep(1.5)
+
+        assert repo_record.repo_id in changes_collected, (
+            "atomic-rename save never fired a change event — this is the "
+            "silent live-reindexing failure mode"
+        )
+        resolved_changed = {p.resolve() for p in changes_collected[repo_record.repo_id]}
+        assert test_file.resolve() in resolved_changed
+
+        # The real path must not be left recorded as deleted alongside being changed.
+        resolved_deleted = {p.resolve() for p in deletions_collected.get(repo_record.repo_id, set())}
+        assert test_file.resolve() not in resolved_deleted
+    finally:
+        watcher.stop()
+
+
 def test_watcher_manager_never_accepts_raw_paths(temp_registry_db, temp_git_repo):
     """Security test: verify WatcherManager has no method accepting raw paths."""
 

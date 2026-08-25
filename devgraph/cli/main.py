@@ -1,7 +1,9 @@
 """DevGraph CLI: register repositories, manage watch settings, check status."""
 
 import importlib.metadata
+import os
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -12,6 +14,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from devgraph.agent import lifecycle
 from devgraph.cli._env import resolve_podman, resolve_repo_root, resolve_venv_python
 from devgraph.config import get_settings
 from devgraph.graph.engine import GraphEngine
@@ -21,6 +24,8 @@ from devgraph.indexer.git_history.extractor import index_repo_history
 from devgraph.registry.store import RepoRegistry
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
+tray_app = typer.Typer(help="Manage the DevGraph tray app (live watcher + incremental indexer) as a background process.")
+app.add_typer(tray_app, name="tray")
 console = Console()
 
 
@@ -235,6 +240,65 @@ def watch(action: str, repo_id: str) -> None:
     except Exception as e:
         console.print(f"[red][X] Error:[/red] {e}")
         raise typer.Exit(code=1)
+
+
+@tray_app.command("start")
+def tray_start() -> None:
+    """Launch the tray app (watcher + incremental indexer) as a detached background process.
+
+    No-op if a tray process (per the PID file) is already running. This does
+    not register the process to survive reboots/logout — rerun after each
+    login, or wire it into your own Startup-folder/Task Scheduler entry.
+
+    Note: connecting an MCP client (e.g. Claude Code) also auto-starts this
+    the same way, so most workflows never need to run this by hand — it's
+    here for manual control (checking in on it, or running it without an
+    MCP client attached).
+    """
+    started_pid = lifecycle.start_tray_if_not_running()
+    if started_pid is None:
+        existing_pid = lifecycle.read_tray_pid()
+        console.print(f"[yellow]Tray app already running[/yellow] (pid {existing_pid})")
+        return
+
+    console.print(f"[green][OK][/green] Tray app started (pid {started_pid})")
+    console.print("  Run 'devgraph status' to confirm the heartbeat once it's up.")
+
+
+@tray_app.command("stop")
+def tray_stop() -> None:
+    """Force-stop the background tray process, regardless of any connected MCP clients.
+
+    Every connected MCP client's server process holds a "hold" on the tray
+    (see devgraph/agent/lifecycle.py) so a single client disconnecting
+    doesn't stop indexing for the others — this command overrides that and
+    stops it outright, clearing all recorded holders in the process.
+    """
+    pid = lifecycle.read_tray_pid()
+    lifecycle.clear_tray_holders()
+    if pid is None or not lifecycle.pid_is_running(pid):
+        console.print("[yellow]Tray app is not running[/yellow] (no live PID on record)")
+        lifecycle.tray_pid_path().unlink(missing_ok=True)
+        return
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        console.print(f"[green][OK][/green] Sent stop signal to tray app (pid {pid})")
+    except OSError as e:
+        console.print(f"[red][X] Error:[/red] failed to stop pid {pid}: {e}")
+        raise typer.Exit(code=1)
+    finally:
+        lifecycle.tray_pid_path().unlink(missing_ok=True)
+
+
+@tray_app.command("status")
+def tray_status() -> None:
+    """Report whether the background tray process (per the PID file) is alive."""
+    pid = lifecycle.read_tray_pid()
+    if pid is not None and lifecycle.pid_is_running(pid):
+        console.print(f"[green][OK] running[/green] (pid {pid})")
+    else:
+        console.print("[yellow]not running[/yellow] (start with 'devgraph tray start')")
 
 
 @app.command()
@@ -455,7 +519,7 @@ def status() -> None:
     if liveness == "running":
         console.print("  [green][OK] running[/green]")
     elif liveness == "not running":
-        console.print("  [yellow]not running[/yellow] (no heartbeat file — start with 'python -m devgraph.agent.tray')")
+        console.print("  [yellow]not running[/yellow] (no heartbeat file — start with 'devgraph tray start')")
     else:
         console.print(f"  [red]{liveness}[/red]")
 
