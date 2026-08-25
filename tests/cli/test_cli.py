@@ -1,5 +1,6 @@
 """Tests for DevGraph CLI."""
 
+import json
 import subprocess
 import tempfile
 from pathlib import Path
@@ -561,6 +562,78 @@ def test_cli_client_config_mcp_add_only(runner, temp_registry_db):
         collapsed = " ".join(l.strip() for l in result.stdout.strip().splitlines())
         assert collapsed.startswith("claude mcp add devgraph")
         assert "devgraph.mcp.server" in collapsed
+
+
+def test_cli_client_config_vscode_creates_new_mcp_json(runner, temp_registry_db, monkeypatch):
+    """'devgraph client-config --target vscode --run' creates mcp.json when none exists."""
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    with tempfile.TemporaryDirectory() as appdata_dir:
+        monkeypatch.setenv("APPDATA", appdata_dir)
+
+        config_module.get_settings.cache_clear()
+        with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
+            result = runner.invoke(app, ["client-config", "--target", "vscode", "--run"])
+            assert result.exit_code == 0, f"stdout: {result.stdout}"
+
+        mcp_json = Path(appdata_dir) / "Code" / "User" / "mcp.json"
+        assert mcp_json.exists()
+        data = json.loads(mcp_json.read_text(encoding="utf-8"))
+        assert data["servers"]["devgraph"]["args"] == ["-m", "devgraph.mcp.server"]
+        assert data["servers"]["devgraph"]["type"] == "stdio"
+
+
+def test_cli_client_config_vscode_preserves_existing_servers(runner, temp_registry_db, monkeypatch):
+    """Registering devgraph must not clobber other servers already in mcp.json."""
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    with tempfile.TemporaryDirectory() as appdata_dir:
+        monkeypatch.setenv("APPDATA", appdata_dir)
+        mcp_dir = Path(appdata_dir) / "Code" / "User"
+        mcp_dir.mkdir(parents=True)
+        existing = {"servers": {"other-server": {"type": "stdio", "command": "other.exe", "args": []}}}
+        (mcp_dir / "mcp.json").write_text(json.dumps(existing), encoding="utf-8")
+
+        config_module.get_settings.cache_clear()
+        with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
+            result = runner.invoke(app, ["client-config", "--target", "vscode", "--run"])
+            assert result.exit_code == 0, f"stdout: {result.stdout}"
+
+        data = json.loads((mcp_dir / "mcp.json").read_text(encoding="utf-8"))
+        assert "other-server" in data["servers"]
+        assert data["servers"]["other-server"]["command"] == "other.exe"
+        assert "devgraph" in data["servers"]
+
+
+def test_cli_client_config_vscode_idempotent(runner, temp_registry_db, monkeypatch):
+    """Running vscode registration twice produces the same devgraph entry."""
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    with tempfile.TemporaryDirectory() as appdata_dir:
+        monkeypatch.setenv("APPDATA", appdata_dir)
+
+        config_module.get_settings.cache_clear()
+        with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
+            runner.invoke(app, ["client-config", "--target", "vscode", "--run"])
+            first = json.loads((Path(appdata_dir) / "Code" / "User" / "mcp.json").read_text(encoding="utf-8"))
+            runner.invoke(app, ["client-config", "--target", "vscode", "--run"])
+            second = json.loads((Path(appdata_dir) / "Code" / "User" / "mcp.json").read_text(encoding="utf-8"))
+
+        assert first == second
+
+
+def test_cli_client_config_invalid_target(runner, temp_registry_db):
+    """An unrecognized --target value fails cleanly."""
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["client-config", "--target", "bogus"])
+        assert result.exit_code != 0
 
 
 def test_cli_tray_status_not_running(runner, temp_registry_db):

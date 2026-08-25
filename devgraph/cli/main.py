@@ -1,6 +1,7 @@
 """DevGraph CLI: register repositories, manage watch settings, check status."""
 
 import importlib.metadata
+import json
 import os
 import shutil
 import signal
@@ -635,13 +636,66 @@ def doctor() -> None:
     console.print("[green]All checks passed.[/green]")
 
 
+def _vscode_mcp_config_path() -> Path:
+    """User-level VS Code MCP config path.
+
+    Windows only today (matches the rest of the CLI's Windows-first scope);
+    `%APPDATA%` is always set in a normal Windows user session.
+    """
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        raise RuntimeError("%APPDATA% is not set; cannot locate VS Code's user config directory")
+    return Path(appdata) / "Code" / "User" / "mcp.json"
+
+
+def _register_vscode(python_path: Path, repo_root: Path) -> bool:
+    """Upsert a 'devgraph' entry into VS Code's user-level mcp.json.
+
+    Merges into any existing file rather than overwriting it — other
+    registered servers must survive this call untouched. Returns True on
+    success; prints its own error and returns False on failure so callers
+    (e.g. a multi-target loop) can report per-target status instead of
+    aborting the whole run.
+    """
+    config_path = _vscode_mcp_config_path()
+    try:
+        if config_path.exists():
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        else:
+            data = {}
+    except (OSError, json.JSONDecodeError) as exc:
+        console.print(f"[red][X] Error:[/red] could not read {config_path}: {exc}")
+        return False
+
+    data.setdefault("servers", {})
+    data["servers"]["devgraph"] = {
+        "type": "stdio",
+        "command": str(python_path),
+        "args": ["-m", "devgraph.mcp.server"],
+        "cwd": str(repo_root),
+    }
+
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        console.print(f"[red][X] Error:[/red] could not write {config_path}: {exc}")
+        return False
+
+    console.print(f"[green][OK][/green] VS Code: registered 'devgraph' in {config_path}")
+    return True
+
+
 @app.command(name="client-config")
 def client_config(
     claude_mcp_add_only: bool = typer.Option(
         False, "--claude-mcp-add-only", help="Print just the 'claude mcp add' one-liner."
     ),
     run: bool = typer.Option(
-        False, "--run", help="Execute the constructed 'claude mcp add' command via the 'claude' CLI (opt-in; print-only is the default)."
+        False, "--run", help="Execute registration for the selected --target(s) (opt-in; print-only is the default)."
+    ),
+    target: str = typer.Option(
+        "both", "--target", help="Which client(s) to print/run registration for: 'claude', 'vscode', or 'both'."
     ),
 ) -> None:
     """Print (or optionally run) the MCP registration command for this machine's checkout.
@@ -650,9 +704,15 @@ def client_config(
     machines instead of hardcoding a literal path — copy/paste this into any
     client repo's docs instead of a fixed path that only works on one machine.
     """
+    if target not in ("claude", "vscode", "both"):
+        console.print(f"[red][X] Error:[/red] --target must be 'claude', 'vscode', or 'both' (got '{target}')")
+        raise typer.Exit(code=1)
+
     python_path = resolve_venv_python()
     repo_root = resolve_repo_root()
     mcp_add_line = f'claude mcp add devgraph -- "{python_path}" -m devgraph.mcp.server'
+    want_claude = target in ("claude", "both")
+    want_vscode = target in ("vscode", "both")
 
     if claude_mcp_add_only:
         console.print(mcp_add_line, soft_wrap=True)
@@ -661,22 +721,44 @@ def client_config(
         console.print(f"- **command**: {python_path}")
         console.print("- **args**: -m devgraph.mcp.server")
         console.print(f"- **cwd**: {repo_root}\n")
-        console.print("```bash")
-        console.print(mcp_add_line, soft_wrap=True)
-        console.print("```")
+        if want_claude:
+            console.print("```bash")
+            console.print(mcp_add_line, soft_wrap=True)
+            console.print("```")
+        if want_vscode:
+            console.print(f"\nVS Code (user mcp.json at {_vscode_mcp_config_path()}):")
+            console.print("```json")
+            console.print(json.dumps(
+                {"servers": {"devgraph": {
+                    "type": "stdio",
+                    "command": str(python_path),
+                    "args": ["-m", "devgraph.mcp.server"],
+                    "cwd": str(repo_root),
+                }}},
+                indent=2,
+            ))
+            console.print("```")
 
     if run:
-        claude_path = shutil.which("claude")
-        if claude_path is None:
-            console.print("[red][X] Error:[/red] 'claude' not found on PATH; cannot run --run")
+        any_failed = False
+        if want_claude:
+            claude_path = shutil.which("claude")
+            if claude_path is None:
+                console.print("[red][X] Error:[/red] 'claude' not found on PATH; skipping Claude Code registration")
+                any_failed = True
+            else:
+                console.print(f"\n[bold]Running:[/bold] {mcp_add_line}")
+                result = subprocess.run(
+                    [claude_path, "mcp", "add", "devgraph", "--", str(python_path), "-m", "devgraph.mcp.server"],
+                    cwd=str(repo_root),
+                )
+                if result.returncode != 0:
+                    any_failed = True
+        if want_vscode:
+            if not _register_vscode(python_path, repo_root):
+                any_failed = True
+        if any_failed:
             raise typer.Exit(code=1)
-        console.print(f"\n[bold]Running:[/bold] {mcp_add_line}")
-        result = subprocess.run(
-            [claude_path, "mcp", "add", "devgraph", "--", str(python_path), "-m", "devgraph.mcp.server"],
-            cwd=str(repo_root),
-        )
-        if result.returncode != 0:
-            raise typer.Exit(code=result.returncode)
 
 
 if __name__ == "__main__":
