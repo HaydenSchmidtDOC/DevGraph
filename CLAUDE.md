@@ -4,7 +4,7 @@ Local-first developer knowledge graph platform. Builds and maintains a structure
 
 ## Status
 
-Phase 1 complete and verified (registry, graph engine, Tree-sitter Python indexer, container/API/datastore extractors, watcher, 10 MCP tools, CLI, tray app). Phase 2 (Requirements/DesignDecisions/ArchitectureNotes) and Phase 3 (git history + opt-in PR/issue ingestion) are implemented on top of it. Phase 4 (enterprise federation) remains design-only/optional per the Implementation Plan. Treat claims about specific extractors/tools as complete only once their code and tests actually land — check `devgraph/` before assuming a component works.
+Phases 1-3 complete and verified: registry, graph engine, Tree-sitter Python indexer, container/API/datastore extractors, watcher, CLI, tray app (Phase 1); Requirements/DesignDecisions/ArchitectureNotes docs extractor (Phase 2); git history + opt-in PR/issue ingestion (Phase 3). 16 MCP tools total across the three phases. Phase 4 (enterprise federation) is intentionally design-only/optional — see `Blueprints/Design Brief #2.md` — and should not be implemented without a fresh design pass informed by real multi-developer usage. Treat claims about specific extractors/tools as complete only once their code and tests actually land — check `devgraph/` before assuming a component works.
 
 Git is initialized locally; no remote is configured yet. Container runtime is **Podman** (not Docker) — see the Design Brief and Implementation Plan.
 
@@ -22,7 +22,7 @@ Git is initialized locally; no remote is configured yet. Container runtime is **
 
 ## Structure
 
-- `Blueprints/` — numbered design docs for planned/completed work. `Design Brief #1.md` is the current source of truth for target architecture (principles, graph schema, MCP tool surface, roadmap phases). Check here before proposing new architecture; add new numbered briefs for major design changes rather than rewriting history in place.
+- `Blueprints/` — numbered design docs for planned/completed work. `Design Brief #1.md` is the current source of truth for target architecture (principles, graph schema, MCP tool surface, roadmap phases). `Design Brief #2.md` is a deliberately unbuilt sketch of Phase 4 (optional, enterprise federation) — do not implement against it without a fresh design pass informed by real multi-developer usage. Check here before proposing new architecture; add new numbered briefs for major design changes rather than rewriting history in place.
 - Root-level `CLAUDE.md` / `AGENTS.md` — working agreement and agent-facing instructions for this repo specifically.
 - `devgraph/` — Phase 1 + Phase 2 + Phase 3 implementation:
   - `config/` — Pydantic settings, all security defaults off (telemetry, cloud sync, cross-repo, run_cypher).
