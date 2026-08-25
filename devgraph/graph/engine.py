@@ -62,15 +62,26 @@ class GraphEngine:
         to_label: str,
         to_name: str,
         repo_id: str,
+        properties: dict[str, Any] | None = None,
     ) -> None:
+        """MERGE an edge into existence; only materializes when both endpoints
+        already exist as real nodes (MATCH-MATCH, not MERGE-MERGE).
+
+        `properties`, when given, is SET onto the relationship after the
+        MERGE (e.g. CALLS edges carry an optional `caller_class` property —
+        see indexer/python/extractor.py). Omitted (None) by every other
+        call site; behavior is unchanged for them.
+        """
         with self._driver.session() as session:
             session.run(
                 f"MATCH (a:{from_label} {{repo_id: $repo_id, name: $from_name}}) "
                 f"MATCH (b:{to_label} {{repo_id: $repo_id, name: $to_name}}) "
-                f"MERGE (a)-[:{rel_type}]->(b)",
+                f"MERGE (a)-[r:{rel_type}]->(b) "
+                "SET r += $properties",
                 repo_id=repo_id,
                 from_name=from_name,
                 to_name=to_name,
+                properties=properties or {},
             )
 
     def delete_nodes_by_source_file(self, repo_id: str, file_name: str) -> None:

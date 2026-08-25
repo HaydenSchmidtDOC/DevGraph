@@ -1,10 +1,20 @@
 # Using DevGraph from another repository
 
-This file is meant to be copied into (or pasted/summarized into) another
-repo's `CLAUDE.md`/`AGENTS.md`, or handed directly to a Claude Code instance
-working there, so it knows how to register that repo with DevGraph and use
-DevGraph's MCP tools as part of its normal workflow — instead of re-reading
-the whole repo from scratch on every architecture/dependency question.
+This file is also served live, once a client has connected to DevGraph's
+MCP server, as the `devgraph://client-guide` resource (and a machine-
+readable per-tool summary is separately available at
+`devgraph://tool-catalog`) — an already-connected client can
+`list_resources()`/`read_resource()` either one directly instead of relying
+on this file having been copied anywhere. This file still exists for the
+one thing a resource read can't do on its own: getting a *new* client
+connected in the first place (steps 1-3 below happen before any MCP call
+is possible), and as a copy-paste fallback for MCP clients that don't
+support resources. It's meant to be copied into (or pasted/summarized into)
+another repo's `CLAUDE.md`/`AGENTS.md`, or handed directly to a Claude Code
+instance working there, so it knows how to register that repo with
+DevGraph and use DevGraph's MCP tools as part of its normal workflow —
+instead of re-reading the whole repo from scratch on every architecture/
+dependency question.
 
 DevGraph itself lives wherever it's checked out on this machine — run
 `devgraph client-config` from that repo to get the exact paths/commands for
@@ -23,10 +33,10 @@ needs to know to use it.
 
 DevGraph builds a queryable graph of a repo's structure — modules, classes,
 functions, containers, API endpoints, datastores, design decisions,
-requirements, and git history — and exposes it through 17 MCP tools
+requirements, and git history — and exposes it through 18 MCP tools
 (`search_component`, `find_callers`, `impact_analysis`,
-`explain_architecture`, `blame_component`, `find_requirements_for`,
-`get_source`, etc.).
+`impact_analysis_for_diff`, `explain_architecture`, `blame_component`,
+`find_requirements_for`, `get_source`, etc.).
 Once a repo is registered and indexed, an AI assistant can answer questions
 like "what depends on this module" or "why was this decision made" by
 querying the graph directly, instead of grepping/reading the whole tree
@@ -157,7 +167,7 @@ depend on the Claude Code version in use — check `claude mcp add --help` if
 the printed command doesn't match; the important part is the command/args/cwd
 above, not the specific CLI invocation.
 
-Once connected, 17 tools become available, all scoped by a `repo_id`
+Once connected, 18 tools become available, all scoped by a `repo_id`
 argument. **Always pass this repo's `repo_id` from step 1.** Never pass
 `cross_repo: true` unless the user explicitly asks for a cross-repository
 answer — the default is (and must stay) scoped to this repo only.
@@ -170,6 +180,17 @@ that file, e.g. `batch_retrieve_payloads`, returns real results).
 name. `get_source` also takes a function/class **name**. Passing the wrong
 kind of identifier looks like an empty/broken result but is a usage
 mismatch, not a graph gap.
+
+**Response shape (`count`/`results`/`truncated`)**: `search_component`,
+`find_callers`, `list_services`, `find_related_prs`, `issue_history_for`
+return `{"count": N, "results": [...], "truncated": bool}` instead of a bare
+list — read the match set from `result["results"]`, and check `truncated`
+before assuming you've seen everything. `find_related_files` and
+`impact_analysis` apply the same envelope to each of their list-valued
+fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
+`max_results` (default 15) to widen the sample when you genuinely need more
+than the default. `search_component`'s `count` maxes out at 50 (its own
+Cypher cap) even if more matches exist beyond that.
 
 `run_cypher` will not appear unless DevGraph's own config has
 `enable_run_cypher=true` set. If it's missing and you need something the
@@ -185,7 +206,9 @@ Prefer these over re-reading files when the question is structural:
 |---|---|
 | "What is X / where is it?" | `search_component` |
 | "What calls X?" | `find_callers` (name, not path) |
+| "What calls X, but only from within class Y?" | `find_callers` with `scope_to_class=Y` (cuts noise from unrelated same-named methods elsewhere in the repo) |
 | "What breaks if I change X?" | `impact_analysis` (name, not path) |
+| "What breaks across this whole PR/diff?" | `impact_analysis_for_diff` (base_ref/head_ref, both must exist locally — never fetches) |
 | "What does X depend on?" | `get_service_dependencies`, `find_related_files` (name, not path) |
 | "What's the overall architecture?" | `explain_architecture`, `summarise_repository` |
 | "Why was X built this way?" | `explain_decision`, `trace_design_rationale` |
@@ -209,7 +232,11 @@ Two things worth knowing about how they work:
   named `foo` — there's no type inference, so same-named methods on
   unrelated classes will over-link rather than under-link. Treat
   `find_callers` results as "things that call something named X", not a
-  guaranteed-precise call graph.
+  guaranteed-precise call graph. When a call was made from inside a method
+  body, its `CALLS` edge records the caller's enclosing class as
+  `caller_class` — pass `find_callers(..., scope_to_class="ThatClass")` to
+  filter down to just that class's own callers when a common method name
+  (`get`, `run`, `close`) is otherwise drowning in unrelated matches.
 - **Service cross-linking depends on the compose file's `build`/`context`
   matching each service's actual source directory.** If a compose service
   has no `build:` key (image-only services like databases) or an

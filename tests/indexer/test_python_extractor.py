@@ -257,6 +257,31 @@ class Service:
     assert ("process", "helper") in calls
 
 
+def test_calls_edge_carries_caller_class_for_method_body_calls():
+    """CALLS edges emitted from inside a method body carry a caller_class
+    property (the enclosing class's name) so find_callers can optionally
+    narrow results via scope_to_class; edges from module-level/free-function
+    calls carry no such property (Implementation Plan #3, Item 2).
+    """
+    source_code = """
+def free_call():
+    helper()
+
+class Service:
+    def process(self):
+        self.helper()
+
+    def helper(self):
+        pass
+"""
+    result = extract_python_file(source_code, "x.py", "test_repo")
+    calls_by_pair = {
+        (r.from_name, r.to_name): r.properties for r in result.relationships if r.rel_type == "CALLS"
+    }
+    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service"}
+    assert calls_by_pair[("free_call", "helper")] is None
+
+
 def test_calls_edge_attributed_to_correct_nested_scope():
     """A call inside a nested function is attributed to the nested function,
     not hoisted to the enclosing one.

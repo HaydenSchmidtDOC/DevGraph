@@ -11,8 +11,21 @@ query strings.
 from pathlib import Path
 from typing import Any
 
+import git
+
 from devgraph.graph.engine import GraphEngine
 from devgraph.registry.store import RepoRegistry
+
+
+def _envelope(items: list[Any], max_results: int) -> dict[str, Any]:
+    """Wrap a list result with count/truncation metadata so callers can see
+    the full match count without paying token cost for every row.
+    """
+    return {
+        "count": len(items),
+        "results": items[:max_results],
+        "truncated": len(items) > max_results,
+    }
 
 
 def search_component(
@@ -20,7 +33,8 @@ def search_component(
     repo_id: str,
     query: str,
     cross_repo: bool = False,
-) -> list[dict[str, Any]]:
+    max_results: int = 15,
+) -> dict[str, Any]:
     """Search for components (modules, services, classes, functions) by name or description.
 
     Args:
@@ -28,9 +42,11 @@ def search_component(
         repo_id: Repository ID to search within (unless cross_repo=True)
         query: Search term (name substring or description keyword)
         cross_repo: If True, search across all repos; if False, limit to repo_id
+        max_results: Maximum number of results to return in the envelope
 
     Returns:
-        List of components with their basic properties
+        Dict with count, results, and truncated flag. Note: count maxes out at 50
+        (the Cypher LIMIT cap) even if more matches exist beyond that.
     """
     repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
     cypher = f"""
@@ -46,7 +62,7 @@ def search_component(
         params["repo_id"] = repo_id
 
     results = engine.run_cypher(cypher, params)
-    return results
+    return _envelope(results, max_results)
 
 
 def trace_request_flow(
@@ -135,32 +151,49 @@ def find_callers(
     repo_id: str,
     target_name: str,
     cross_repo: bool = False,
-) -> list[dict[str, Any]]:
+    max_results: int = 15,
+    scope_to_class: str | None = None,
+) -> dict[str, Any]:
     """Find all functions, services, or endpoints that call a given target.
+
+    CALLS edges are name-based, not type-resolved: a call to `target_name`
+    made from inside any class's method links to every Function node named
+    `target_name` repo-wide, which can surface unrelated same-named methods
+    as noise. When a method-body call's enclosing class is known at index
+    time, the edge carries a `caller_class` property recording it — pass
+    scope_to_class to narrow results to callers made from within a specific
+    class's own methods (opt-in; omitted, behavior is unchanged/repo-wide).
 
     Args:
         engine: GraphEngine instance
         repo_id: Repository ID
         target_name: Name of the function/service/endpoint being called
         cross_repo: If True, find callers across repos
+        max_results: Maximum number of results to return in the envelope
+        scope_to_class: If given, only return callers whose call to
+            target_name was made from within this class's own method bodies
 
     Returns:
-        List of callers with their types and locations
+        Dict with count, results, and truncated flag containing callers with their types and locations
     """
     repo_filter = "" if cross_repo else "AND target.repo_id = $repo_id"
+    class_filter = "AND rel.caller_class = $scope_to_class" if scope_to_class else ""
     cypher = f"""
-    MATCH (caller)-[:CALLS]->(target)
+    MATCH (caller)-[rel:CALLS]->(target)
     WHERE target.name = $target_name
     {repo_filter}
+    {class_filter}
     RETURN DISTINCT caller.name as name, labels(caller) as type, caller.repo_id as repo_id
     ORDER BY caller.name
     """
     params = {"target_name": target_name}
     if not cross_repo:
         params["repo_id"] = repo_id
+    if scope_to_class:
+        params["scope_to_class"] = scope_to_class
 
     results = engine.run_cypher(cypher, params)
-    return results
+    return _envelope(results, max_results)
 
 
 def find_related_files(
@@ -168,6 +201,7 @@ def find_related_files(
     repo_id: str,
     component_name: str,
     cross_repo: bool = False,
+    max_results: int = 15,
 ) -> dict[str, Any]:
     """Find all files related to a component (via CONTAINS, IMPORTS, CALLS relationships).
 
@@ -176,9 +210,11 @@ def find_related_files(
         repo_id: Repository ID
         component_name: Name of the component
         cross_repo: If True, include cross-repo relationships
+        max_results: Maximum number of results per list to return in the envelope
 
     Returns:
-        Dict with containing files, imported files, and related files
+        Dict with containing_modules, imported_modules, and related_components,
+        each wrapped as {count, results, truncated} envelope objects
     """
     repo_filter = "" if cross_repo else "WHERE n.repo_id = $repo_id"
     cypher = f"""
@@ -198,8 +234,17 @@ def find_related_files(
 
     results = engine.run_cypher(cypher, params)
     if results:
-        return results[0]
-    return {"containing_modules": [], "imported_modules": [], "related_components": []}
+        row = results[0]
+        return {
+            "containing_modules": _envelope(row["containing_modules"], max_results),
+            "imported_modules": _envelope(row["imported_modules"], max_results),
+            "related_components": _envelope(row["related_components"], max_results),
+        }
+    return {
+        "containing_modules": _envelope([], max_results),
+        "imported_modules": _envelope([], max_results),
+        "related_components": _envelope([], max_results),
+    }
 
 
 def summarise_repository(
@@ -285,6 +330,7 @@ def impact_analysis(
     repo_id: str,
     component_name: str,
     cross_repo: bool = False,
+    max_results: int = 15,
 ) -> dict[str, Any]:
     """Analyze the impact of changing a component on the rest of the system.
 
@@ -293,9 +339,11 @@ def impact_analysis(
         repo_id: Repository ID
         component_name: Name of the component to analyze
         cross_repo: If True, include cross-repo impacts
+        max_results: Maximum number of results per dependents list to return in the envelope
 
     Returns:
-        Dict with direct_dependents, transitive_dependents, and risk_level
+        Dict with direct_dependents and transitive_dependents wrapped as {count, results, truncated}
+        envelopes, plus risk_level (computed from true untruncated count)
     """
     repo_filter = "" if cross_repo else "WHERE n.repo_id = $repo_id"
     dependent_filter = (
@@ -326,11 +374,134 @@ def impact_analysis(
 
     results = engine.run_cypher(cypher, params)
     if results:
-        return results[0]
+        row = results[0]
+        return {
+            "direct_dependents": _envelope(row["direct_dependents"], max_results),
+            "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
+            "risk_level": row["risk_level"],
+        }
     return {
-        "direct_dependents": [],
-        "transitive_dependents": [],
+        "direct_dependents": _envelope([], max_results),
+        "transitive_dependents": _envelope([], max_results),
         "risk_level": "low",
+    }
+
+
+def impact_analysis_for_diff(
+    engine: GraphEngine,
+    registry: RepoRegistry,
+    repo_id: str,
+    base_ref: str,
+    head_ref: str,
+    cross_repo: bool = False,
+    max_results: int = 15,
+) -> dict[str, Any]:
+    """Analyze the combined impact of every component changed between two git refs.
+
+    Composes a local git diff (GitPython, no network — same constraint as
+    index-history) with the same dependent-tracing Cypher impact_analysis
+    uses, across every component touched by the diff at once, then unions
+    and deduplicates the result. Both refs must already exist locally —
+    this never fetches from a remote.
+
+    Args:
+        engine: GraphEngine instance
+        registry: RepoRegistry, used to resolve repo_id to its registered root path
+        repo_id: Repository ID
+        base_ref: Git ref (branch/tag/sha) to diff from; must resolve locally
+        head_ref: Git ref (branch/tag/sha) to diff to; must resolve locally
+        cross_repo: If True, include cross-repo impacts
+        max_results: Maximum number of results per dependents list to return in the envelope
+
+    Returns:
+        Dict with changed_files, changed_components, direct_dependents and
+        transitive_dependents (each {count, results, truncated} envelopes),
+        and risk_level. On an invalid ref or unregistered repo, returns an
+        empty result with an "error" key instead of raising.
+    """
+    empty = {
+        "changed_files": [],
+        "changed_components": [],
+        "direct_dependents": _envelope([], max_results),
+        "transitive_dependents": _envelope([], max_results),
+        "risk_level": "low",
+    }
+
+    repo = registry.get(repo_id)
+    if repo is None:
+        return {**empty, "error": f"no such repo_id: {repo_id}"}
+
+    git_repo = None
+    try:
+        git_repo = git.Repo(str(repo.path))
+        git_repo.commit(base_ref)
+        git_repo.commit(head_ref)
+        diff_output = git_repo.git.diff("--name-only", f"{base_ref}..{head_ref}")
+    except Exception as exc:
+        return {**empty, "error": f"could not diff {base_ref}..{head_ref}: {exc}"}
+    finally:
+        if git_repo is not None:
+            git_repo.close()
+
+    changed_files = [line for line in diff_output.splitlines() if line]
+    if not changed_files:
+        return empty
+
+    component_cypher = """
+    MATCH (m:Module {repo_id: $repo_id})
+    WHERE m.name IN $changed_files
+    OPTIONAL MATCH (m)-[:CONTAINS*1..2]->(comp)
+    WHERE comp:Function OR comp:Class
+    RETURN COLLECT(DISTINCT comp.name) as components
+    """
+    comp_results = engine.run_cypher(component_cypher, {"repo_id": repo_id, "changed_files": changed_files})
+    changed_components = [c for c in (comp_results[0]["components"] if comp_results else []) if c is not None]
+
+    if not changed_components:
+        return {**empty, "changed_files": changed_files}
+
+    repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
+    dependent_filter = (
+        "" if cross_repo else "WHERE dependent IS NULL OR dependent.repo_id = $repo_id"
+    )
+    transitive_filter = (
+        "" if cross_repo else "WHERE transitive IS NULL OR transitive.repo_id = $repo_id"
+    )
+    impact_cypher = f"""
+    MATCH (n)
+    WHERE n.name IN $changed_components
+    {repo_filter}
+    OPTIONAL MATCH (dependent)-[:CALLS|USES|DEPENDS_ON]->(n)
+    {dependent_filter}
+    OPTIONAL MATCH (transitive)-[:CALLS|USES|DEPENDS_ON*2..]->(n)
+    {transitive_filter}
+    RETURN
+        COLLECT(DISTINCT {{name: dependent.name, type: labels(dependent)[0]}}) as direct_dependents,
+        COLLECT(DISTINCT {{name: transitive.name, type: labels(transitive)[0]}}) as transitive_dependents,
+        COUNT(DISTINCT dependent) as direct_count
+    """
+    params = {"changed_components": changed_components}
+    if not cross_repo:
+        params["repo_id"] = repo_id
+
+    impact_results = engine.run_cypher(impact_cypher, params)
+    if not impact_results:
+        return {**empty, "changed_files": changed_files, "changed_components": changed_components}
+
+    row = impact_results[0]
+    direct_count = row["direct_count"]
+    risk_level = "high" if direct_count > 10 else "medium" if direct_count > 3 else "low"
+
+    return {
+        "changed_files": changed_files,
+        "changed_components": changed_components,
+        "direct_dependents": _envelope(
+            [d for d in row["direct_dependents"] if d.get("name") is not None], max_results
+        ),
+        "transitive_dependents": _envelope(
+            [t for t in row["transitive_dependents"] if t.get("name") is not None], max_results
+        ),
+        "risk_level": risk_level,
     }
 
 
@@ -371,16 +542,18 @@ def list_services(
     engine: GraphEngine,
     repo_id: str,
     cross_repo: bool = False,
-) -> list[dict[str, Any]]:
+    max_results: int = 15,
+) -> dict[str, Any]:
     """List all services in a repository (or across repos if cross_repo=True).
 
     Args:
         engine: GraphEngine instance
         repo_id: Repository ID (ignored if cross_repo=True)
         cross_repo: If True, list services from all repos
+        max_results: Maximum number of results to return in the envelope
 
     Returns:
-        List of services with their properties
+        Dict with count, results, and truncated flag containing services with their properties
     """
     repo_filter = "" if cross_repo else "WHERE s.repo_id = $repo_id"
     cypher = f"""
@@ -394,7 +567,7 @@ def list_services(
         params["repo_id"] = repo_id
 
     results = engine.run_cypher(cypher, params)
-    return results
+    return _envelope(results, max_results)
 
 
 def explain_decision(
@@ -549,7 +722,8 @@ def find_related_prs(
     repo_id: str,
     component_name: str,
     cross_repo: bool = False,
-) -> list[dict[str, Any]]:
+    max_results: int = 15,
+) -> dict[str, Any]:
     """Find pull requests related to a component via commits that resolved issues touching it.
 
     Args:
@@ -557,10 +731,12 @@ def find_related_prs(
         repo_id: Repository ID
         component_name: Name of the Module (file) to find related PRs for
         cross_repo: If True, search across repos
+        max_results: Maximum number of results to return in the envelope
 
     Returns:
-        List of PullRequests linked (via RESOLVES on an Issue referenced by
-        a commit that touched this component) to the component.
+        Dict with count, results, and truncated flag containing PullRequests linked
+        (via RESOLVES on an Issue referenced by a commit that touched this component)
+        to the component.
     """
     repo_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
     cypher = f"""
@@ -578,7 +754,7 @@ def find_related_prs(
         params["repo_id"] = repo_id
 
     results = engine.run_cypher(cypher, params)
-    return results
+    return _envelope(results, max_results)
 
 
 def issue_history_for(
@@ -586,7 +762,8 @@ def issue_history_for(
     repo_id: str,
     component_name: str,
     cross_repo: bool = False,
-) -> list[dict[str, Any]]:
+    max_results: int = 15,
+) -> dict[str, Any]:
     """Find issues referenced by commits that touched a component.
 
     Args:
@@ -594,9 +771,11 @@ def issue_history_for(
         repo_id: Repository ID
         component_name: Name of the Module (file) to find issue history for
         cross_repo: If True, search across repos
+        max_results: Maximum number of results to return in the envelope
 
     Returns:
-        List of Issues referenced by commits that modified this component.
+        Dict with count, results, and truncated flag containing Issues referenced
+        by commits that modified this component.
     """
     repo_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
     cypher = f"""
@@ -614,7 +793,7 @@ def issue_history_for(
         params["repo_id"] = repo_id
 
     results = engine.run_cypher(cypher, params)
-    return results
+    return _envelope(results, max_results)
 
 
 def get_source(

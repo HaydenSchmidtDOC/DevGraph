@@ -61,6 +61,7 @@ def seeded_graph(engine):
 class TestBlameComponent:
     def test_blame_returns_commits_most_recent_first(self, seeded_graph):
         result = blame_component(seeded_graph, "test_repo_a", "auth.py")
+        # blame_component is not changed (not in Item 1 scope), should still return list
         shas = [r["sha"] for r in result]
         assert shas == ["sha2", "sha1"]
 
@@ -77,16 +78,38 @@ class TestBlameComponent:
 class TestFindRelatedPrs:
     def test_find_related_prs_basic(self, seeded_graph):
         result = find_related_prs(seeded_graph, "test_repo_a", "auth.py")
-        numbers = {r["number"] for r in result}
+        assert "results" in result and "count" in result and "truncated" in result
+        numbers = {r["number"] for r in result["results"]}
         assert "7" in numbers
+
+    def test_find_related_prs_truncation(self, seeded_graph):
+        """Test that truncated flag is set when total count exceeds max_results."""
+        result = find_related_prs(seeded_graph, "test_repo_a", "auth.py", max_results=0)
+        assert "truncated" in result
+        assert "count" in result
+        # If count > max_results (0), truncated should be True
+        if result["count"] > 0:
+            assert result["truncated"] is True
+            assert len(result["results"]) == 0
 
 
 class TestIssueHistoryFor:
     def test_issue_history_basic(self, seeded_graph):
         result = issue_history_for(seeded_graph, "test_repo_a", "auth.py")
-        numbers = {r["number"] for r in result}
+        assert "results" in result and "count" in result and "truncated" in result
+        numbers = {r["number"] for r in result["results"]}
         assert "42" in numbers
 
     def test_issue_history_no_leakage(self, seeded_graph):
         result = issue_history_for(seeded_graph, "test_repo_b", "auth.py")
-        assert result == []
+        assert result["results"] == []
+
+    def test_issue_history_truncation(self, seeded_graph):
+        """Test that truncated flag is set when total count exceeds max_results."""
+        result = issue_history_for(seeded_graph, "test_repo_a", "auth.py", max_results=0)
+        assert "truncated" in result
+        assert "count" in result
+        # If count > max_results (0), truncated should be True
+        if result["count"] > 0:
+            assert result["truncated"] is True
+            assert len(result["results"]) == 0

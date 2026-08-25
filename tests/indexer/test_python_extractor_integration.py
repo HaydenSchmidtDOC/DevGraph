@@ -225,14 +225,14 @@ def test_calls_edges_make_find_callers_work_end_to_end(graph_engine):
         index_file(graph_engine, repo_id, file_path)
 
         callers = find_callers(graph_engine, repo_id, "helper")
-        caller_names = {c["name"] for c in callers}
+        caller_names = {c["name"] for c in callers["results"]}
         assert "caller_one" in caller_names
 
         callers_method = find_callers(graph_engine, repo_id, "helper_method")
-        assert any(c["name"] == "process" for c in callers_method)
+        assert any(c["name"] == "process" for c in callers_method["results"])
 
         impact = impact_analysis(graph_engine, repo_id, "helper")
-        dependent_names = {d["name"] for d in impact["direct_dependents"]}
+        dependent_names = {d["name"] for d in impact["direct_dependents"]["results"]}
         assert "caller_one" in dependent_names
     finally:
         graph_engine.delete_repository(repo_id)

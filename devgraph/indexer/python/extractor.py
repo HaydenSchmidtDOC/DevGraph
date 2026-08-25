@@ -63,6 +63,7 @@ class GraphRelationship:
     to_label: str
     to_name: str
     repo_id: str
+    properties: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -72,6 +73,7 @@ class GraphRelationship:
             "to_label": self.to_label,
             "to_name": self.to_name,
             "repo_id": self.repo_id,
+            "properties": self.properties,
         }
 
 
@@ -466,7 +468,17 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 )
             )
 
-    def _emit_call(caller_name: str, caller_label: str, target_name: str) -> None:
+    def _emit_call(
+        caller_name: str, caller_label: str, target_name: str, caller_class: str | None = None
+    ) -> None:
+        # caller_class records the enclosing class of a method-body call (None
+        # for module-level/free-function calls) so find_callers can optionally
+        # narrow results via scope_to_class — an opt-in query-time filter,
+        # not a change to which edges get emitted (see Implementation Plan #3,
+        # Item 2: a same-file MRO-suppression filter turned out to require a
+        # Function-node schema change to express, so this ships as query-time
+        # narrowing on data recorded at extraction time instead).
+        properties = {"caller_class": caller_class} if caller_class else None
         result.relationships.append(
             GraphRelationship(
                 from_label=caller_label,
@@ -475,6 +487,7 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 to_label="Function",
                 to_name=target_name,
                 repo_id=repo_id,
+                properties=properties,
             )
         )
 
@@ -497,8 +510,11 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 # Module/class-body-level statement (not a def) — attribute
                 # any call expressions in it to the enclosing scope (usually
                 # the Module, for top-level script code / constant setup).
+                caller_class = parent_name if parent_label == "Class" else None
                 for target in _extract_call_targets(node, source_bytes):
-                    _emit_call(parent_name if parent_name else file_path, parent_label, target)
+                    _emit_call(
+                        parent_name if parent_name else file_path, parent_label, target, caller_class
+                    )
 
     def _visit_class(
         node: Node,
@@ -620,8 +636,9 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         # stops descending at nested function/class scopes so those calls
         # get attributed to the nested function itself, not hoisted here).
         if body_node is not None:
+            caller_class = parent_name if parent_label == "Class" else None
             for target in _extract_call_targets(body_node, source_bytes):
-                _emit_call(func_name, "Function", target)
+                _emit_call(func_name, "Function", target, caller_class)
 
             for child in body_node.named_children:
                 if child.type == "function_definition":
@@ -696,4 +713,5 @@ def index_file(
             rel.to_label,
             rel.to_name,
             rel.repo_id,
+            properties=rel.properties,
         )

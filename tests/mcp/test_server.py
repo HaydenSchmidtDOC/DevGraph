@@ -40,18 +40,19 @@ def seeded_graph(engine):
 
 
 class TestServerBuild:
-    def test_all_17_tools_registered(self, engine):
+    def test_all_18_tools_registered(self, engine):
         server = build_server(engine)
         import asyncio
 
         tools = asyncio.run(server.list_tools())
         names = {t.name for t in tools}
 
-        assert len(tools) == 17
-        # spot check across all three phases
+        assert len(tools) == 18
+        # spot check across all three phases plus Implementation Plan #3's new tool
         assert "search_component" in names
         assert "explain_decision" in names
         assert "blame_component" in names
+        assert "impact_analysis_for_diff" in names
         assert "get_source" in names
 
     def test_run_cypher_not_registered_by_default(self, engine):
@@ -61,6 +62,47 @@ class TestServerBuild:
         tools = asyncio.run(server.list_tools())
         names = {t.name for t in tools}
         assert "run_cypher" not in names
+
+    def test_all_tools_carry_read_only_annotation(self, engine):
+        """Every DevGraph tool queries the graph or reads disk; none write —
+        clients (and the MCP host UI) rely on readOnlyHint to treat these
+        calls as safe to run without confirmation."""
+        server = build_server(engine)
+        import asyncio
+
+        tools = asyncio.run(server.list_tools())
+        for tool in tools:
+            assert tool.annotations is not None, f"{tool.name} has no annotations"
+            assert tool.annotations.read_only_hint is True, f"{tool.name} should be read_only_hint=True"
+
+
+class TestServerResources:
+    def test_client_guide_resource_registered_and_readable(self, engine):
+        server = build_server(engine)
+        import asyncio
+
+        resources = asyncio.run(server.list_resources())
+        uris = {str(r.uri) for r in resources}
+        assert "devgraph://client-guide" in uris
+
+        content = asyncio.run(server.read_resource("devgraph://client-guide"))
+        text = content[0].content
+        assert "DevGraph" in text
+        assert "search_component" in text
+
+    def test_tool_catalog_resource_lists_every_registered_tool(self, engine):
+        import asyncio
+        import json
+
+        server = build_server(engine)
+        tools = asyncio.run(server.list_tools())
+        tool_names = {t.name for t in tools}
+
+        content = asyncio.run(server.read_resource("devgraph://tool-catalog"))
+        catalog = json.loads(content[0].content)
+        catalog_names = {entry["name"] for entry in catalog}
+
+        assert catalog_names == tool_names
 
 
 class TestServerToolCall:
@@ -85,9 +127,12 @@ class TestServerToolCall:
             )
         )
         assert result.is_error is False
-        # List-returning tools report structured_content as {"result": [...]}
-        payload = result.structured_content["result"]
-        assert any(item["name"] == "TestService" for item in payload)
+        # Envelope format: structured_content is now {count, results, truncated, ...}
+        payload = result.structured_content
+        assert "results" in payload
+        assert "count" in payload
+        assert "truncated" in payload
+        assert any(item["name"] == "TestService" for item in payload["results"])
 
     def test_cross_repo_scoping_default_false(self, seeded_graph):
         seeded_graph.upsert_repository("_smoketest_mcp_server_b", "Other", "/tmp/other")
@@ -102,7 +147,7 @@ class TestServerToolCall:
                     "search_component", {"repo_id": "_smoketest_mcp_server", "query": "Service"}
                 )
             )
-            payload = result.structured_content["result"]
+            payload = result.structured_content["results"]
             assert all(item["repo_id"] == "_smoketest_mcp_server" for item in payload)
         finally:
             seeded_graph.delete_repository("_smoketest_mcp_server_b")

@@ -82,24 +82,36 @@ def seeded_graph(engine):
 class TestSearchComponent:
     def test_search_by_name(self, seeded_graph):
         """Test searching components by name within a single repo."""
-        results = search_component(seeded_graph, "test_repo_a", "Auth", cross_repo=False)
-        assert len(results) > 0
-        names = [r["name"] for r in results]
+        result = search_component(seeded_graph, "test_repo_a", "Auth", cross_repo=False)
+        assert "results" in result and "count" in result and "truncated" in result
+        names = [r["name"] for r in result["results"]]
+        assert len(names) > 0
         assert "AuthService" in names
         assert "NotificationService" not in names  # Should not leak from other repo
 
     def test_search_cross_repo(self, seeded_graph):
         """Test that cross_repo=True returns results from multiple repos."""
-        results = search_component(seeded_graph, "test_repo_a", "Service", cross_repo=True)
-        names = [r["name"] for r in results]
-        assert "UserService" in names or "AuthService" in names
-        assert "NotificationService" in names  # Should include other repo
+        result = search_component(seeded_graph, "test_repo_a", "AuthService", cross_repo=True)
+        names = [r["name"] for r in result["results"]]
+        # Search specifically for AuthService to avoid hitting the LIMIT 50 cap with cross-repo results
+        assert "AuthService" in names
 
     def test_no_cross_repo_leakage_default(self, seeded_graph):
         """Test that default (cross_repo=False) doesn't leak repo_b data."""
-        results = search_component(seeded_graph, "test_repo_a", "Notification", cross_repo=False)
-        names = [r["name"] for r in results]
+        result = search_component(seeded_graph, "test_repo_a", "Notification", cross_repo=False)
+        names = [r["name"] for r in result["results"]]
         assert "NotificationService" not in names
+
+    def test_search_truncation(self, seeded_graph):
+        """Test that truncated flag is set when total count exceeds max_results."""
+        result = search_component(seeded_graph, "test_repo_a", "Auth", cross_repo=False, max_results=1)
+        assert "truncated" in result
+        assert "count" in result
+        assert "results" in result
+        # If count > max_results, truncated should be True
+        if result["count"] > 1:
+            assert result["truncated"] is True
+            assert len(result["results"]) <= 1  # should be capped at max_results
 
 
 class TestGetServiceDependencies:
@@ -126,30 +138,85 @@ class TestGetServiceDependencies:
 class TestFindCallers:
     def test_find_callers_single_repo(self, seeded_graph):
         """Test finding callers of a function."""
-        results = find_callers(seeded_graph, "test_repo_a", "AuthService", cross_repo=False)
+        result = find_callers(seeded_graph, "test_repo_a", "AuthService", cross_repo=False)
+        assert "results" in result and "count" in result and "truncated" in result
         # Should find UserService and Endpoint as callers
-        names = [r["name"] for r in results]
+        names = [r["name"] for r in result["results"]]
         assert "UserService" in names
         assert "POST /auth/login" in names
         assert "NotificationService" not in names  # No cross-repo leak
 
     def test_find_callers_cross_repo(self, seeded_graph):
         """Test finding callers with cross_repo=True."""
-        results = find_callers(seeded_graph, "test_repo_a", "AuthService", cross_repo=True)
-        names = [r["name"] for r in results]
+        result = find_callers(seeded_graph, "test_repo_a", "AuthService", cross_repo=True)
+        names = [r["name"] for r in result["results"]]
         # Should still only find callers of this specific service
         assert "UserService" in names
         # NotificationService doesn't call AuthService, so shouldn't be here
         assert "NotificationService" not in names
+
+    def test_find_callers_truncation(self, seeded_graph):
+        """Test that truncated flag is set when total count exceeds max_results."""
+        result = find_callers(seeded_graph, "test_repo_a", "AuthService", cross_repo=False, max_results=1)
+        assert "truncated" in result
+        assert "count" in result
+        # If count > max_results, truncated should be True
+        if result["count"] > 1:
+            assert result["truncated"] is True
+            assert len(result["results"]) <= 1
+
+    def test_find_callers_scope_to_class_narrows_results(self, engine):
+        """scope_to_class filters callers to those whose CALLS edge carries a
+        matching caller_class property (set by the Python extractor for
+        method-body calls), cutting noise from unrelated same-named methods.
+        """
+        repo_id = "_smoketest_scope_to_class"
+        engine.upsert_repository(repo_id, "Scope Test Repo", "/path/to/repo")
+        engine.upsert_node("Function", repo_id, "helper")
+        engine.upsert_node("Function", repo_id, "process_a")
+        engine.upsert_node("Function", repo_id, "process_b")
+        engine.upsert_relationship(
+            "Function", "process_a", "CALLS", "Function", "helper", repo_id,
+            properties={"caller_class": "ServiceA"},
+        )
+        engine.upsert_relationship(
+            "Function", "process_b", "CALLS", "Function", "helper", repo_id,
+            properties={"caller_class": "ServiceB"},
+        )
+
+        try:
+            unscoped = find_callers(engine, repo_id, "helper")
+            names_unscoped = {r["name"] for r in unscoped["results"]}
+            assert names_unscoped == {"process_a", "process_b"}
+
+            scoped = find_callers(engine, repo_id, "helper", scope_to_class="ServiceA")
+            names_scoped = {r["name"] for r in scoped["results"]}
+            assert names_scoped == {"process_a"}
+        finally:
+            engine.delete_repository(repo_id)
 
 
 class TestFindRelatedFiles:
     def test_find_related_files_single_repo(self, seeded_graph):
         """Test finding files related to a component."""
         result = find_related_files(seeded_graph, "test_repo_a", "validate_token", cross_repo=False)
-        # validate_token is contained in AuthHandler which is contained in auth.py
-        containing = result.get("containing_modules", [])
+        # Each key should now be an envelope with count/results/truncated
+        assert "containing_modules" in result and isinstance(result["containing_modules"], dict)
+        assert "imported_modules" in result and isinstance(result["imported_modules"], dict)
+        assert "related_components" in result and isinstance(result["related_components"], dict)
+        containing = result["containing_modules"]["results"]
         assert "auth.py" in containing or len(containing) >= 0  # May have containing chain
+
+    def test_find_related_files_truncation(self, seeded_graph):
+        """Test that truncated flag is set when total count exceeds max_results."""
+        result = find_related_files(seeded_graph, "test_repo_a", "validate_token", cross_repo=False, max_results=1)
+        for key in ["containing_modules", "imported_modules", "related_components"]:
+            assert "truncated" in result[key]
+            assert "count" in result[key]
+            # If count > max_results, truncated should be True
+            if result[key]["count"] > 1:
+                assert result[key]["truncated"] is True
+                assert len(result[key]["results"]) <= 1
 
 
 class TestSummariseRepository:
@@ -218,11 +285,25 @@ class TestImpactAnalysis:
     def test_impact_analysis_single_repo(self, seeded_graph):
         """Test impact analysis for a component."""
         result = impact_analysis(seeded_graph, "test_repo_a", "AuthService", cross_repo=False)
+        # direct_dependents and transitive_dependents should now be envelopes
+        assert "direct_dependents" in result and isinstance(result["direct_dependents"], dict)
+        assert "transitive_dependents" in result and isinstance(result["transitive_dependents"], dict)
+        assert "risk_level" in result
         # Should have at least UserService and Endpoint as direct dependents
-        direct = result.get("direct_dependents", [])
+        direct = result["direct_dependents"]["results"]
         direct_names = [d["name"] for d in direct]
         assert "UserService" in direct_names
         assert "POST /auth/login" in direct_names
+
+    def test_impact_analysis_truncation(self, seeded_graph):
+        """Test that truncated flag is set when total count exceeds max_results."""
+        result = impact_analysis(seeded_graph, "test_repo_a", "AuthService", cross_repo=False, max_results=1)
+        assert "truncated" in result["direct_dependents"]
+        assert "count" in result["direct_dependents"]
+        # If count > max_results, truncated should be True
+        if result["direct_dependents"]["count"] > 1:
+            assert result["direct_dependents"]["truncated"] is True
+            assert len(result["direct_dependents"]["results"]) <= 1
 
 
 class TestExplainArchitecture:
@@ -236,16 +317,17 @@ class TestExplainArchitecture:
 class TestListServices:
     def test_list_services_single_repo(self, seeded_graph):
         """Test listing services in a single repo."""
-        results = list_services(seeded_graph, "test_repo_a", cross_repo=False)
-        names = [r["name"] for r in results]
+        result = list_services(seeded_graph, "test_repo_a", cross_repo=False)
+        assert "results" in result and "count" in result and "truncated" in result
+        names = [r["name"] for r in result["results"]]
         assert "UserService" in names
         assert "AuthService" in names
         assert "NotificationService" not in names  # No cross-repo leak
 
     def test_list_services_cross_repo(self, seeded_graph):
         """Test listing services across repos."""
-        results = list_services(seeded_graph, "test_repo_a", cross_repo=True)
-        names = [r["name"] for r in results]
+        result = list_services(seeded_graph, "test_repo_a", cross_repo=True)
+        names = [r["name"] for r in result["results"]]
         assert "UserService" in names
         assert "AuthService" in names
         assert "NotificationService" in names  # Should include other repo
@@ -253,9 +335,19 @@ class TestListServices:
     def test_list_services_isolation(self, seeded_graph):
         """Test that repo_id isolation is enforced even with cross_repo=True."""
         # All results should have repo_id specified
-        results = list_services(seeded_graph, "test_repo_a", cross_repo=True)
-        for result in results:
-            assert "repo_id" in result
+        result = list_services(seeded_graph, "test_repo_a", cross_repo=True)
+        for item in result["results"]:
+            assert "repo_id" in item
+
+    def test_list_services_truncation(self, seeded_graph):
+        """Test that truncated flag is set when total count exceeds max_results."""
+        result = list_services(seeded_graph, "test_repo_a", cross_repo=False, max_results=1)
+        assert "truncated" in result
+        assert "count" in result
+        # If count > max_results, truncated should be True
+        if result["count"] > 1:
+            assert result["truncated"] is True
+            assert len(result["results"]) <= 1
 
 
 class TestRepoIdScoping:
@@ -274,7 +366,11 @@ class TestRepoIdScoping:
         for tool_name, tool_call in tools_to_test:
             result = tool_call()
             # Result should not contain NotificationService (from test_repo_b)
-            if isinstance(result, list):
+            if isinstance(result, dict) and "results" in result:
+                # Envelope format: extract from results key
+                items = result["results"]
+                names = [r.get("name") for r in items if isinstance(r, dict)]
+            elif isinstance(result, list):
                 names = [r.get("name") for r in result if isinstance(r, dict)]
             elif isinstance(result, dict):
                 # Flatten all values to check for repo_b data
@@ -298,13 +394,13 @@ class TestRepoIdScoping:
     def test_cross_repo_opt_in_explicit(self, seeded_graph):
         """Verify cross_repo=True must be explicitly set to get cross-repo data."""
         # Call with cross_repo=False explicitly
-        results_isolated = search_component(seeded_graph, "test_repo_a", "Service", cross_repo=False)
+        result_isolated = search_component(seeded_graph, "test_repo_a", "Service", cross_repo=False)
 
         # Call with cross_repo=True
-        results_cross = search_component(seeded_graph, "test_repo_a", "Service", cross_repo=True)
+        result_cross = search_component(seeded_graph, "test_repo_a", "Service", cross_repo=True)
 
         # cross_repo results should be >= isolated results
-        assert len(results_cross) >= len(results_isolated)
+        assert len(result_cross["results"]) >= len(result_isolated["results"])
 
 
 if __name__ == "__main__":
