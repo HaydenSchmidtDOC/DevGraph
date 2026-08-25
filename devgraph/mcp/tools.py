@@ -8,9 +8,11 @@ All Cypher is parameterized — user input never concatenates directly into
 query strings.
 """
 
+from pathlib import Path
 from typing import Any
 
 from devgraph.graph.engine import GraphEngine
+from devgraph.registry.store import RepoRegistry
 
 
 def search_component(
@@ -613,6 +615,88 @@ def issue_history_for(
 
     results = engine.run_cypher(cypher, params)
     return results
+
+
+def get_source(
+    engine: GraphEngine,
+    registry: RepoRegistry,
+    repo_id: str,
+    component_name: str,
+    cross_repo: bool = False,
+) -> dict[str, Any]:
+    """Fetch a Function or Class's actual source text by reading its last-indexed line range.
+
+    Reads live from disk using the graph's last-indexed start_line/end_line —
+    a stale index could return the wrong lines; rescan first if freshness
+    matters, same caveat as every other tool here.
+
+    Args:
+        engine: GraphEngine instance
+        registry: RepoRegistry, used to resolve repo_id to its registered root path
+        repo_id: Repository ID
+        component_name: Name of the Function or Class to fetch source for
+        cross_repo: If True, search across repos (the file is still read from
+            whichever repo actually owns the matched node, via its own registry entry)
+
+    Returns:
+        Dict with name, label, file, start_line, end_line, source, and
+        docstring_full (when present). Empty/None fields if no match found.
+    """
+    repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
+    cypher = f"""
+    MATCH (n)
+    WHERE (n:Function OR n:Class) AND n.name = $component_name
+    {repo_filter}
+    RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
+           n.file as file, n.start_line as start_line, n.end_line as end_line,
+           n.docstring_full as docstring_full
+    LIMIT 1
+    """
+    params = {"component_name": component_name}
+    if not cross_repo:
+        params["repo_id"] = repo_id
+
+    results = engine.run_cypher(cypher, params)
+    empty = {
+        "name": component_name, "label": None, "file": None,
+        "start_line": None, "end_line": None, "source": None, "docstring_full": None,
+    }
+    if not results:
+        return empty
+
+    row = results[0]
+    node_repo_id = row["repo_id"]
+    file_rel_path = row["file"]
+    start_line = row["start_line"]
+    end_line = row["end_line"]
+    if not file_rel_path or start_line is None or end_line is None:
+        return empty
+
+    repo = registry.get(node_repo_id)
+    if repo is None:
+        return empty
+
+    file_path = (repo.path / file_rel_path).resolve()
+    if not str(file_path).startswith(str(repo.path.resolve())):
+        return empty  # never read outside the registered repo root
+
+    try:
+        lines = file_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return empty
+
+    source_text = "\n".join(lines[start_line - 1 : end_line])
+    label = next((l for l in row["labels"] if l in ("Function", "Class")), row["labels"][0])
+
+    return {
+        "name": row["name"],
+        "label": label,
+        "file": file_rel_path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "source": source_text,
+        "docstring_full": row.get("docstring_full"),
+    }
 
 
 def run_cypher(

@@ -19,11 +19,19 @@ from mcp.server.mcpserver import MCPServer
 from devgraph.config.settings import get_settings
 from devgraph.graph.engine import GraphEngine
 from devgraph.mcp import tools as devgraph_tools
+from devgraph.registry.store import RepoRegistry
 
 
-def build_server(engine: GraphEngine) -> MCPServer:
-    """Construct an MCPServer with every DevGraph tool registered against `engine`."""
+def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> MCPServer:
+    """Construct an MCPServer with every DevGraph tool registered against `engine`.
+
+    `registry` is required for `get_source` (it resolves a repo_id to its
+    registered root path to read source off disk); when omitted, a registry
+    is opened from settings so existing single-argument callers keep working.
+    """
     settings = get_settings()
+    if registry is None:
+        registry = RepoRegistry(settings.registry_db_path)
     server = MCPServer(
         name="devgraph",
         version="0.1.0",
@@ -55,12 +63,14 @@ def build_server(engine: GraphEngine) -> MCPServer:
 
     @server.tool()
     def find_callers(repo_id: str, target_name: str, cross_repo: bool = False) -> list[dict[str, Any]]:
-        """Find all functions, services, or endpoints that call a given target."""
+        """Find all functions, services, or endpoints that call a given target
+        (pass a function/class name, not a file path)."""
         return devgraph_tools.find_callers(engine, repo_id, target_name, cross_repo)
 
     @server.tool()
     def find_related_files(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
-        """Find all files related to a component (via CONTAINS, IMPORTS, CALLS relationships)."""
+        """Find all files related to a component via CONTAINS, IMPORTS, CALLS relationships
+        (pass a function/class name, not a file path)."""
         return devgraph_tools.find_related_files(engine, repo_id, component_name, cross_repo)
 
     @server.tool()
@@ -75,7 +85,8 @@ def build_server(engine: GraphEngine) -> MCPServer:
 
     @server.tool()
     def impact_analysis(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
-        """Analyze the impact of changing a component: direct/transitive dependents and risk level."""
+        """Analyze the impact of changing a component: direct/transitive dependents and risk level
+        (pass a function/class name, not a file path)."""
         return devgraph_tools.impact_analysis(engine, repo_id, component_name, cross_repo)
 
     @server.tool()
@@ -105,7 +116,8 @@ def build_server(engine: GraphEngine) -> MCPServer:
 
     @server.tool()
     def blame_component(repo_id: str, component_name: str, cross_repo: bool = False) -> list[dict[str, Any]]:
-        """Find commits that modified a component's file, most recent first."""
+        """Find commits that modified a component's file, most recent first
+        (pass a file path, not a function name)."""
         return devgraph_tools.blame_component(engine, repo_id, component_name, cross_repo)
 
     @server.tool()
@@ -117,6 +129,13 @@ def build_server(engine: GraphEngine) -> MCPServer:
     def issue_history_for(repo_id: str, component_name: str, cross_repo: bool = False) -> list[dict[str, Any]]:
         """Find issues referenced by commits that touched a component (requires PR/issue ingestion having been run)."""
         return devgraph_tools.issue_history_for(engine, repo_id, component_name, cross_repo)
+
+    @server.tool()
+    def get_source(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
+        """Fetch a Function or Class's actual source text and full docstring (when present),
+        using the graph's last-indexed line range. Reads live from disk — rescan first if
+        the file may have changed since the last index."""
+        return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo)
 
     if settings.enable_run_cypher:
 
@@ -139,12 +158,14 @@ def main() -> None:
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
     engine.verify_connectivity()
     engine.init_schema()
+    registry = RepoRegistry(settings.registry_db_path)
 
-    server = build_server(engine)
+    server = build_server(engine, registry)
     try:
         server.run("stdio")
     finally:
         engine.close()
+        registry.close()
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pystray
@@ -92,7 +93,20 @@ class TrayApp:
                 logger.warning("Neo4j health check failed", exc_info=True)
                 self._healthy = False
             self._refresh_icon()
+            self._write_heartbeat()
             self._stop_event.wait(self._settings.health_check_interval_s)
+
+    def _write_heartbeat(self) -> None:
+        """Write a UTC timestamp `status`/`doctor` read to report tray liveness.
+
+        Same directory as registry.sqlite3 — no new settings field needed.
+        """
+        heartbeat_path = self._settings.registry_db_path.parent / "tray_heartbeat.txt"
+        try:
+            heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+            heartbeat_path.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+        except OSError:
+            logger.warning("failed to write tray heartbeat file", exc_info=True)
 
     def _refresh_icon(self) -> None:
         if self._icon is None:

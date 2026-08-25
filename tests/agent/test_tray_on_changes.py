@@ -83,3 +83,17 @@ class TestOnChanges:
         with patch("devgraph.agent.tray.index_paths", side_effect=RuntimeError("boom")):
             # Should not raise — a failed reindex shouldn't crash the watcher thread.
             tray_app._on_changes(repo_id, {repo_path / "a.py"}, set())
+
+
+class TestHeartbeat:
+    def test_write_heartbeat_creates_timestamp_file(self, tray_app):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tray_app._settings.registry_db_path = Path(tmpdir) / "registry.sqlite3"
+            tray_app._write_heartbeat()
+
+            heartbeat_path = Path(tmpdir) / "tray_heartbeat.txt"
+            assert heartbeat_path.exists()
+            from datetime import datetime
+
+            # Should parse as a valid ISO timestamp.
+            datetime.fromisoformat(heartbeat_path.read_text(encoding="utf-8").strip())

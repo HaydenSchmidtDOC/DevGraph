@@ -40,18 +40,19 @@ def seeded_graph(engine):
 
 
 class TestServerBuild:
-    def test_all_16_tools_registered(self, engine):
+    def test_all_17_tools_registered(self, engine):
         server = build_server(engine)
         import asyncio
 
         tools = asyncio.run(server.list_tools())
         names = {t.name for t in tools}
 
-        assert len(tools) == 16
+        assert len(tools) == 17
         # spot check across all three phases
         assert "search_component" in names
         assert "explain_decision" in names
         assert "blame_component" in names
+        assert "get_source" in names
 
     def test_run_cypher_not_registered_by_default(self, engine):
         server = build_server(engine)

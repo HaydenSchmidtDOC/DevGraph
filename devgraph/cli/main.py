@@ -1,5 +1,10 @@
 """DevGraph CLI: register repositories, manage watch settings, check status."""
 
+import importlib.metadata
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -7,6 +12,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from devgraph.cli._env import resolve_podman, resolve_repo_root, resolve_venv_python
 from devgraph.config import get_settings
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.dispatch import full_scan
@@ -25,7 +31,12 @@ def _get_registry() -> RepoRegistry:
 
 
 @app.command()
-def add(path: str) -> None:
+def add(
+    path: str,
+    full: bool = typer.Option(
+        False, "--full", help="Also run incremental git-history indexing after the file scan (local-only, no network)."
+    ),
+) -> None:
     """Register a repository and run its initial full scan.
 
     Args:
@@ -48,6 +59,16 @@ def add(path: str) -> None:
                     count = full_scan(engine, record.repo_id, record.path, docs_path=record.docs_path)
                     registry.mark_indexed(record.repo_id)
                     console.print(f"[green][OK][/green] Indexed {count} file(s)")
+
+                    if full:
+                        try:
+                            history_count = index_repo_history(engine, registry, record.repo_id)
+                            console.print(f"[green][OK][/green] Indexed {history_count} commit(s)")
+                        except Exception as e:
+                            console.print(
+                                f"[yellow]Full scan complete but history indexing failed:[/yellow] {e}\n"
+                                f"  Run 'devgraph index-history {record.repo_id}' to retry."
+                            )
                 finally:
                     engine.close()
             except Exception as e:
@@ -129,7 +150,12 @@ def list() -> None:
 
 
 @app.command()
-def rescan(repo_id: str) -> None:
+def rescan(
+    repo_id: str,
+    full: bool = typer.Option(
+        False, "--full", help="Also run incremental git-history indexing after the file scan (local-only, no network)."
+    ),
+) -> None:
     """Run a full re-index of a registered repository.
 
     Walks every file under the repo's root and re-runs every extractor that
@@ -155,6 +181,16 @@ def rescan(repo_id: str) -> None:
                 count = full_scan(engine, repo_id, repo.path, docs_path=repo.docs_path)
                 registry.mark_indexed(repo_id)
                 console.print(f"[green][OK][/green] Rescanned {repo_id}: {count} file(s) indexed")
+
+                if full:
+                    try:
+                        history_count = index_repo_history(engine, registry, repo_id)
+                        console.print(f"[green][OK][/green] Indexed {history_count} commit(s)")
+                    except Exception as e:
+                        console.print(
+                            f"[yellow]Rescan complete but history indexing failed:[/yellow] {e}\n"
+                            f"  Run 'devgraph index-history {repo_id}' to retry."
+                        )
             finally:
                 engine.close()
         finally:
@@ -362,6 +398,26 @@ def _set_external_source_flag(repo_id: str, action: str, setter_flag: str, label
         raise typer.Exit(code=1)
 
 
+def _tray_liveness_text(settings) -> str:
+    """Read the tray heartbeat file (item 7) and classify liveness.
+
+    Returns one of "running" / "stale (process may have crashed)" / "not running".
+    Shared between `status` and `doctor` so the read/compare logic isn't duplicated.
+    """
+    heartbeat_path = settings.registry_db_path.parent / "tray_heartbeat.txt"
+    if not heartbeat_path.exists():
+        return "not running"
+    try:
+        raw = heartbeat_path.read_text(encoding="utf-8").strip()
+        last_beat = datetime.fromisoformat(raw)
+    except (ValueError, OSError):
+        return "not running"
+    age_s = (datetime.now(timezone.utc) - last_beat).total_seconds()
+    if age_s <= 2 * settings.health_check_interval_s:
+        return "running"
+    return "stale (process may have crashed)"
+
+
 @app.command()
 def status() -> None:
     """Check DevGraph status: Neo4j connectivity and repository counts."""
@@ -393,7 +449,170 @@ def status() -> None:
     except Exception as e:
         console.print(f"  [red]Error:[/red] {e}")
 
+    # Live watcher (tray app) liveness
+    console.print("[bold]Live Watcher[/bold]")
+    liveness = _tray_liveness_text(settings)
+    if liveness == "running":
+        console.print("  [green][OK] running[/green]")
+    elif liveness == "not running":
+        console.print("  [yellow]not running[/yellow] (no heartbeat file — start with 'python -m devgraph.agent.tray')")
+    else:
+        console.print(f"  [red]{liveness}[/red]")
+
     console.print()
+
+
+@app.command()
+def doctor() -> None:
+    """Run a heavier environment-drift diagnostic than `status`.
+
+    Checks Python version, the installed `mcp` package, MCP server
+    importability, Neo4j reachability + schema, Podman container state, the
+    repo registry, and tray liveness — continuing past non-fatal failures so
+    one run surfaces everything at once. Intended for bootstrap/troubleshooting
+    moments; `status` stays the fast/lightweight command for quick glances.
+    """
+    settings = get_settings()
+    any_failed = False
+    console.print()
+
+    # 1. Python version
+    console.print("[bold]Python[/bold]")
+    py_ok = sys.version_info >= (3, 13)
+    marker = "[green][OK][/green]" if py_ok else "[red][X][/red]"
+    console.print(f"  {marker} {sys.version.split()[0]} ({sys.executable})")
+    any_failed = any_failed or not py_ok
+
+    # 2. mcp package version
+    console.print("[bold]mcp package[/bold]")
+    try:
+        mcp_version = importlib.metadata.version("mcp")
+        console.print(f"  [green][OK][/green] mcp {mcp_version} (pyproject.toml requires >=2.0)")
+    except importlib.metadata.PackageNotFoundError:
+        console.print("  [red][X] Not installed[/red]")
+        any_failed = True
+
+    # 3. MCP server importability smoke check
+    console.print("[bold]MCP server import[/bold]")
+    try:
+        from devgraph.mcp.server import build_server  # noqa: F401
+
+        console.print("  [green][OK][/green] devgraph.mcp.server.build_server imports cleanly")
+    except Exception as e:
+        console.print(f"  [red][X] Import failed:[/red] {e}")
+        any_failed = True
+
+    # 4 & 5. Neo4j reachability + schema
+    console.print("[bold]Neo4j[/bold]")
+    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    try:
+        engine.verify_connectivity()
+        console.print(f"  [green][OK] Reachable[/green] at {settings.neo4j_uri}")
+        try:
+            engine.init_schema()
+            console.print("  [green][OK][/green] Schema present (init_schema is idempotent)")
+        except Exception as e:
+            console.print(f"  [red][X] Schema init failed:[/red] {e}")
+            any_failed = True
+    except Exception as e:
+        console.print(f"  [red][X] Not reachable:[/red] {e}")
+        any_failed = True
+    finally:
+        engine.close()
+
+    # 6. Podman container state
+    console.print("[bold]Podman[/bold]")
+    podman_path = resolve_podman()
+    if podman_path is None:
+        console.print("  [red][X] podman not found[/red] on PATH or %LOCALAPPDATA%\\Programs\\Podman")
+        any_failed = True
+    else:
+        try:
+            result = subprocess.run(
+                [str(podman_path), "ps", "-a", "--filter", "name=devgraph-neo4j", "--format", "{{.Names}}\t{{.State}}"],
+                capture_output=True, text=True, timeout=15,
+            )
+            output = result.stdout.strip()
+            if not output:
+                console.print("  [yellow]devgraph-neo4j container not found[/yellow]")
+            else:
+                console.print(f"  [green][OK][/green] {output}")
+        except Exception as e:
+            console.print(f"  [red][X] podman ps failed:[/red] {e}")
+            any_failed = True
+
+    # 7. Registry reachability
+    console.print("[bold]Registry[/bold]")
+    try:
+        registry = _get_registry()
+        try:
+            repos = registry.list_repos()
+            console.print(f"  [green][OK][/green] {len(repos)} repo(s) registered at {settings.registry_db_path}")
+        finally:
+            registry.close()
+    except Exception as e:
+        console.print(f"  [red][X] Registry error:[/red] {e}")
+        any_failed = True
+
+    # 8. Tray/watcher liveness
+    console.print("[bold]Live Watcher[/bold]")
+    liveness = _tray_liveness_text(settings)
+    if liveness == "running":
+        console.print("  [green][OK] running[/green]")
+    elif liveness == "not running":
+        console.print("  [yellow]not running[/yellow] (expected if the tray app isn't started)")
+    else:
+        console.print(f"  [red]{liveness}[/red]")
+
+    console.print()
+    if any_failed:
+        console.print("[red]doctor found one or more failing checks above.[/red]")
+        raise typer.Exit(code=1)
+    console.print("[green]All checks passed.[/green]")
+
+
+@app.command(name="client-config")
+def client_config(
+    claude_mcp_add_only: bool = typer.Option(
+        False, "--claude-mcp-add-only", help="Print just the 'claude mcp add' one-liner."
+    ),
+    run: bool = typer.Option(
+        False, "--run", help="Execute the constructed 'claude mcp add' command via the 'claude' CLI (opt-in; print-only is the default)."
+    ),
+) -> None:
+    """Print (or optionally run) the MCP registration command for this machine's checkout.
+
+    Resolves sys.executable and the repo root so the output is portable across
+    machines instead of hardcoding a literal path — copy/paste this into any
+    client repo's docs instead of a fixed path that only works on one machine.
+    """
+    python_path = resolve_venv_python()
+    repo_root = resolve_repo_root()
+    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" -m devgraph.mcp.server'
+
+    if claude_mcp_add_only:
+        console.print(mcp_add_line, soft_wrap=True)
+    else:
+        console.print("## Connect DevGraph as an MCP server\n")
+        console.print(f"- **command**: {python_path}")
+        console.print("- **args**: -m devgraph.mcp.server")
+        console.print(f"- **cwd**: {repo_root}\n")
+        console.print("```bash")
+        console.print(mcp_add_line, soft_wrap=True)
+        console.print("```")
+
+    if run:
+        claude_path = shutil.which("claude")
+        if claude_path is None:
+            console.print("[red][X] Error:[/red] 'claude' not found on PATH; cannot run --run")
+            raise typer.Exit(code=1)
+        console.print(f"\n[bold]Running:[/bold] {mcp_add_line}")
+        result = subprocess.run(
+            [claude_path, "mcp", "add", "devgraph", "--", str(python_path), "-m", "devgraph.mcp.server"],
+            cwd=str(repo_root),
+        )
+        if result.returncode != 0:
+            raise typer.Exit(code=result.returncode)
 
 
 if __name__ == "__main__":

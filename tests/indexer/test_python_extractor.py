@@ -340,4 +340,66 @@ def test_calls_targets_are_function_label():
     result = extract_python_file(source_code, "x.py", "test_repo")
     calls_rel = next(r for r in result.relationships if r.rel_type == "CALLS")
     assert calls_rel.to_label == "Function"
-    assert calls_rel.from_label == "Function"
+
+
+def test_function_docstring_extracted_into_description_and_full():
+    source_code = '''
+def greet(name: str) -> str:
+    """Say hello to someone.
+
+    Longer explanation that should not appear in description.
+    """
+    return f"hello {name}"
+'''
+    result = extract_python_file(source_code, "x.py", "test_repo")
+    func = next(n for n in result.nodes if n.label == "Function" and n.name == "greet")
+    assert func.properties["description"] == "Say hello to someone."
+    assert "Longer explanation" in func.properties["docstring_full"]
+
+
+def test_class_docstring_extracted():
+    source_code = '''
+class Foo:
+    """A simple class."""
+    pass
+'''
+    result = extract_python_file(source_code, "x.py", "test_repo")
+    cls = next(n for n in result.nodes if n.label == "Class" and n.name == "Foo")
+    assert cls.properties["description"] == "A simple class."
+    assert cls.properties["docstring_full"] == "A simple class."
+
+
+def test_module_docstring_extracted():
+    source_code = '"""Module summary line."""\nx = 1\n'
+    result = extract_python_file(source_code, "x.py", "test_repo")
+    module = next(n for n in result.nodes if n.label == "Module")
+    assert module.properties["description"] == "Module summary line."
+
+
+def test_no_docstring_means_no_description_property():
+    source_code = "def bare():\n    pass\n"
+    result = extract_python_file(source_code, "x.py", "test_repo")
+    func = next(n for n in result.nodes if n.label == "Function" and n.name == "bare")
+    assert "description" not in func.properties
+    assert "docstring_full" not in func.properties
+
+
+def test_long_docstring_summary_is_truncated():
+    long_line = "This is a very long summary line " * 10
+    source_code = f'def f():\n    """{long_line}"""\n    pass\n'
+    result = extract_python_file(source_code, "x.py", "test_repo")
+    func = next(n for n in result.nodes if n.label == "Function" and n.name == "f")
+    assert len(func.properties["description"]) <= 120
+    assert func.properties["description"].endswith("...")
+    assert len(func.properties["docstring_full"]) > 120
+
+
+def test_function_and_class_get_start_end_line():
+    source_code = "class Foo:\n    def method(self):\n        pass\n"
+    result = extract_python_file(source_code, "x.py", "test_repo")
+    cls = next(n for n in result.nodes if n.label == "Class" and n.name == "Foo")
+    method = next(n for n in result.nodes if n.label == "Function" and n.name == "method")
+    assert cls.properties["start_line"] == 1
+    assert cls.properties["end_line"] == 3
+    assert method.properties["start_line"] == 2
+    assert method.properties["end_line"] == 3

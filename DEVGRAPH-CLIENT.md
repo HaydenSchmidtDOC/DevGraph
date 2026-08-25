@@ -6,16 +6,16 @@ working there, so it knows how to register that repo with DevGraph and use
 DevGraph's MCP tools as part of its normal workflow — instead of re-reading
 the whole repo from scratch on every architecture/dependency question.
 
-DevGraph itself lives at:
-
-```
-C:\Daifuku RAG Dev\Neo4J CodeRag MCP
-```
+DevGraph itself lives wherever it's checked out on this machine — run
+`devgraph client-config` from that repo to get the exact paths/commands for
+this checkout; do not hardcode a path here, DevGraph's install location can
+differ machine to machine.
 
 Everything below assumes that repo's venv and Neo4j container already exist
 (they're a one-time setup — see that repo's own `README.md` if they don't
-yet). This file does not duplicate DevGraph's own internals; it only covers
-what a client repo needs to know to use it.
+yet; `.\scripts\bootstrap.ps1` there is the one-command path). This file does
+not duplicate DevGraph's own internals; it only covers what a client repo
+needs to know to use it.
 
 ---
 
@@ -23,9 +23,10 @@ what a client repo needs to know to use it.
 
 DevGraph builds a queryable graph of a repo's structure — modules, classes,
 functions, containers, API endpoints, datastores, design decisions,
-requirements, and git history — and exposes it through 16 MCP tools
+requirements, and git history — and exposes it through 17 MCP tools
 (`search_component`, `find_callers`, `impact_analysis`,
-`explain_architecture`, `blame_component`, `find_requirements_for`, etc.).
+`explain_architecture`, `blame_component`, `find_requirements_for`,
+`get_source`, etc.).
 Once a repo is registered and indexed, an AI assistant can answer questions
 like "what depends on this module" or "why was this decision made" by
 querying the graph directly, instead of grepping/reading the whole tree
@@ -54,10 +55,20 @@ of scope.
 ## 1. Register (and automatically index) this repo with DevGraph
 
 Run once per machine (DevGraph's registry is local to the machine, not per
-client-repo):
+client-repo). Run `devgraph client-config` from the DevGraph repo on this
+machine to get the exact resolved venv-python path for the commands below —
+do not hardcode a path here, DevGraph's install location can differ machine
+to machine:
 
 ```bash
-"C:\Daifuku RAG Dev\Neo4J CodeRag MCP\.venv\Scripts\python.exe" -m devgraph.cli.main add "<absolute path to this repo>"
+"<DevGraph repo's resolved venv python, from devgraph client-config>" -m devgraph.cli.main add "<absolute path to this repo>"
+```
+
+Add `--full` to also index git commit history in the same step (equivalent
+to a separate `index-history` call):
+
+```bash
+"<venv python>" -m devgraph.cli.main add "<absolute path to this repo>" --full
 ```
 
 This registers the repo **and runs a full initial scan** — Python source,
@@ -72,7 +83,7 @@ it. If Neo4j isn't reachable at registration time, `add` still succeeds
 Confirm registration:
 
 ```bash
-"C:\Daifuku RAG Dev\Neo4J CodeRag MCP\.venv\Scripts\python.exe" -m devgraph.cli.main list
+"<venv python>" -m devgraph.cli.main list
 ```
 
 Only paths registered this way are ever watched or indexed by DevGraph —
@@ -88,14 +99,15 @@ rather than duplicating. Use it any time you want the graph refreshed after
 a batch of changes:
 
 ```bash
-python -m devgraph.cli.main rescan <repo_id>
+"<venv python>" -m devgraph.cli.main rescan <repo_id>
 ```
 
 **Git history** (separate command — not part of the file-scan above;
-incremental, only walks new commits since the last run):
+incremental, only walks new commits since the last run — or fold it into
+`add`/`rescan` with `--full` instead of calling this separately):
 
 ```bash
-python -m devgraph.cli.main index-history <repo_id>
+"<venv python>" -m devgraph.cli.main index-history <repo_id>
 ```
 
 **Docs / design decisions** (optional — only if this repo has Markdown notes
@@ -103,16 +115,16 @@ with `type: requirement|design_decision|architecture_note` front-matter;
 `rescan` picks these up automatically too, once `--docs-path` is set):
 
 ```bash
-python -m devgraph.cli.main annotate <repo_id> --docs-path <repo-relative docs folder>
-python -m devgraph.cli.main annotate <repo_id> --note <repo-relative note file>   # index one note immediately
+"<venv python>" -m devgraph.cli.main annotate <repo_id> --docs-path <repo-relative docs folder>
+"<venv python>" -m devgraph.cli.main annotate <repo_id> --note <repo-relative note file>   # index one note immediately
 ```
 
 **PR/issue history** is opt-in and talks to an external service (GitHub,
 etc.) — do not enable it without the repo owner's explicit go-ahead:
 
 ```bash
-python -m devgraph.cli.main pr-source enable <repo_id>
-python -m devgraph.cli.main issue-source enable <repo_id>
+"<venv python>" -m devgraph.cli.main pr-source enable <repo_id>
+"<venv python>" -m devgraph.cli.main issue-source enable <repo_id>
 ```
 
 Enabling the flags above doesn't fetch anything by itself yet — actually
@@ -122,29 +134,46 @@ pulling PR/issue data currently requires a short Python script calling
 
 ## 3. Connect DevGraph as an MCP server
 
-Register DevGraph as an MCP server for this session/project, pointing at its
-stdio entry point:
+Run `devgraph client-config` from the DevGraph repo on this machine to get
+the exact paths/commands for this checkout — do not hardcode a path here,
+DevGraph's install location can differ machine to machine. Its default output
+is a ready-to-paste block shaped like this (example only — always use the
+actual output from running the command, not this literal text):
 
-- **command**: `C:\Daifuku RAG Dev\Neo4J CodeRag MCP\.venv\Scripts\python.exe`
-- **args**: `-m devgraph.mcp.server`
-- **cwd**: `C:\Daifuku RAG Dev\Neo4J CodeRag MCP` (required — that's where its config/`.env` resolve from)
+```
+## Connect DevGraph as an MCP server
 
-With Claude Code's CLI, something like:
+- **command**: <resolved path to DevGraph's venv python.exe>
+- **args**: -m devgraph.mcp.server
+- **cwd**: <resolved DevGraph repo root>
 
-```bash
-claude mcp add devgraph -- "C:\Daifuku RAG Dev\Neo4J CodeRag MCP\.venv\Scripts\python.exe" -m devgraph.mcp.server
+claude mcp add devgraph -- "<resolved venv python.exe>" -m devgraph.mcp.server
 ```
 
-(Exact flags depend on the Claude Code version in use — check `claude mcp add --help` if this doesn't match. The important part is the command/args/cwd above, not the specific CLI invocation.)
+`devgraph client-config --claude-mcp-add-only` prints just the one-liner;
+`devgraph client-config --run` also executes it via the `claude` CLI if one
+is on PATH (opt-in, print-only is the default). Exact `claude mcp add` flags
+depend on the Claude Code version in use — check `claude mcp add --help` if
+the printed command doesn't match; the important part is the command/args/cwd
+above, not the specific CLI invocation.
 
-Once connected, 16 tools become available, all scoped by a `repo_id`
+Once connected, 17 tools become available, all scoped by a `repo_id`
 argument. **Always pass this repo's `repo_id` from step 1.** Never pass
 `cross_repo: true` unless the user explicitly asks for a cross-repository
 answer — the default is (and must stay) scoped to this repo only.
 
+**Identifier-type nuance**: `find_callers`, `impact_analysis`, and
+`find_related_files` match against function/class **names** only (a file
+path like `shared/utils/x.py` returns empty; the function name defined in
+that file, e.g. `batch_retrieve_payloads`, returns real results).
+`blame_component` is the opposite — it wants a **file path**, not a function
+name. `get_source` also takes a function/class **name**. Passing the wrong
+kind of identifier looks like an empty/broken result but is a usage
+mismatch, not a graph gap.
+
 `run_cypher` will not appear unless DevGraph's own config has
 `enable_run_cypher=true` set. If it's missing and you need something the
-other 16 tools genuinely can't express, that's a signal a new high-level
+other 17 tools genuinely can't express, that's a signal a new high-level
 tool should be added to DevGraph — not that raw Cypher should be turned on
 as a workaround.
 
@@ -155,14 +184,15 @@ Prefer these over re-reading files when the question is structural:
 | Question shape | Tool |
 |---|---|
 | "What is X / where is it?" | `search_component` |
-| "What calls X?" | `find_callers` |
-| "What breaks if I change X?" | `impact_analysis` |
-| "What does X depend on?" | `get_service_dependencies`, `find_related_files` |
+| "What calls X?" | `find_callers` (name, not path) |
+| "What breaks if I change X?" | `impact_analysis` (name, not path) |
+| "What does X depend on?" | `get_service_dependencies`, `find_related_files` (name, not path) |
 | "What's the overall architecture?" | `explain_architecture`, `summarise_repository` |
 | "Why was X built this way?" | `explain_decision`, `trace_design_rationale` |
 | "What requirements does X satisfy?" | `find_requirements_for` |
-| "Who changed X and when?" | `blame_component` |
+| "Who changed X and when?" | `blame_component` (file path, not name) |
 | "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2) |
+| "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed) |
 
 If a tool returns empty/sparse results, check whether the repo has actually
 been scanned (step 1/2) before concluding the graph has nothing to say — an
@@ -186,6 +216,11 @@ Two things worth knowing about how they work:
   unconventional build layout DevGraph's heuristic doesn't recognize, its
   `uses`/`calls` data in `explain_architecture` will be sparse — that's a
   real limit of directory-based inference, not a sign indexing failed.
+- **`find_related_files`'s `imported_modules` can be sparse for repos that
+  resolve local imports via manual `sys.path` manipulation** rather than
+  dotted package imports (`from services.api.clients import X`) or standard
+  relative imports (`from .clients import X`) — a known, bounded gap, not a
+  sign indexing failed.
 
 ## 5. Keeping the graph current
 

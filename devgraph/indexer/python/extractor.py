@@ -175,6 +175,63 @@ def _callee_simple_name(func_node: Node, source: bytes) -> str | None:
     return None
 
 
+def _extract_docstring(body: Node, source: bytes) -> str | None:
+    """Extract a class/function/module's docstring, if its body's first
+    statement is Python's docstring convention: an expression_statement
+    wrapping a bare string node.
+    """
+    if not body.named_children:
+        return None
+    first = body.named_children[0]
+    if first.type != "expression_statement" or not first.named_children:
+        return None
+    string_node = first.named_children[0]
+    if string_node.type != "string":
+        return None
+    raw = _text(string_node, source)
+    return _clean_docstring(raw)
+
+
+def _clean_docstring(raw: str) -> str:
+    """Strip a string literal's quote characters and common leading indentation."""
+    text = raw.strip()
+    for prefix in ('"""', "'''"):
+        if text.startswith(prefix) and text.endswith(prefix) and len(text) >= 2 * len(prefix):
+            text = text[len(prefix) : -len(prefix)]
+            break
+    else:
+        for prefix in ('"', "'"):
+            if text.startswith(prefix) and text.endswith(prefix) and len(text) >= 2:
+                text = text[1:-1]
+                break
+
+    lines = text.split("\n")
+    # Dedent using the minimum indentation of non-blank lines after the first
+    # (PEP 257: the first line typically starts right after the opening quote).
+    non_first = [l for l in lines[1:] if l.strip()]
+    if non_first:
+        indent = min(len(l) - len(l.lstrip()) for l in non_first)
+        lines = [lines[0]] + [l[indent:] if len(l) >= indent else l for l in lines[1:]]
+    return "\n".join(lines).strip()
+
+
+def _docstring_summary(full_text: str, max_chars: int = 120) -> str:
+    """Compute a PEP-257 summary line: first line up to the first blank line
+    or terminating period, with a hard fallback truncation for docstrings
+    that don't follow that convention.
+    """
+    first_para = full_text.split("\n\n", 1)[0].strip()
+    first_line = first_para.split("\n", 1)[0].strip()
+
+    period_idx = first_line.find(". ")
+    if period_idx != -1:
+        first_line = first_line[: period_idx + 1]
+
+    if len(first_line) > max_chars:
+        first_line = first_line[: max_chars - 3].rstrip() + "..."
+    return first_line
+
+
 def _extract_base_class_names(superclasses_node: Node | None, source: bytes) -> list[str]:
     """Extract base class names from an `argument_list` node under class_definition."""
     if superclasses_node is None:
@@ -377,11 +434,16 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         logger.warning(f"Syntax errors while parsing {file_path}; extracting best-effort result")
 
     # Create a Module node for the file itself.
+    module_properties: dict = {"type": "module", "source_file": file_path}
+    module_docstring = _extract_docstring(root, source_bytes)
+    if module_docstring:
+        module_properties["description"] = _docstring_summary(module_docstring)
+        module_properties["docstring_full"] = module_docstring
     module_node = GraphNode(
         label="Module",
         repo_id=repo_id,
         name=file_path,
-        properties={"type": "module", "source_file": file_path},
+        properties=module_properties,
     )
     result.nodes.append(module_node)
 
@@ -455,12 +517,26 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         superclasses_node = node.child_by_field_name("superclasses")
         base_classes = _extract_base_class_names(superclasses_node, source_bytes)
 
+        class_properties: dict = {
+            "type": "class",
+            "decorators": decorators,
+            "file": file_path,
+            "start_line": node.start_point[0] + 1,
+            "end_line": node.end_point[0] + 1,
+        }
+        body_node = node.child_by_field_name("body")
+        if body_node is not None:
+            docstring = _extract_docstring(body_node, source_bytes)
+            if docstring:
+                class_properties["description"] = _docstring_summary(docstring)
+                class_properties["docstring_full"] = docstring
+
         result.nodes.append(
             GraphNode(
                 label="Class",
                 repo_id=repo_id,
                 name=class_name,
-                properties={"type": "class", "decorators": decorators, "file": file_path},
+                properties=class_properties,
             )
         )
 
@@ -487,9 +563,8 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 )
             )
 
-        body = node.child_by_field_name("body")
-        if body is not None:
-            visit_block(body, class_name, "Class")
+        if body_node is not None:
+            visit_block(body_node, class_name, "Class")
 
     def _visit_function(
         node: Node,
@@ -505,12 +580,26 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         decorator_nodes = extra_decorators or []
         decorators = _extract_decorator_names(decorator_nodes, source_bytes)
 
+        func_properties: dict = {
+            "type": "function",
+            "decorators": decorators,
+            "file": file_path,
+            "start_line": node.start_point[0] + 1,
+            "end_line": node.end_point[0] + 1,
+        }
+        body_node = node.child_by_field_name("body")
+        if body_node is not None:
+            docstring = _extract_docstring(body_node, source_bytes)
+            if docstring:
+                func_properties["description"] = _docstring_summary(docstring)
+                func_properties["docstring_full"] = docstring
+
         result.nodes.append(
             GraphNode(
                 label="Function",
                 repo_id=repo_id,
                 name=func_name,
-                properties={"type": "function", "decorators": decorators, "file": file_path},
+                properties=func_properties,
             )
         )
 
@@ -530,12 +619,11 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         # function's body (not inside a nested def — _extract_call_targets
         # stops descending at nested function/class scopes so those calls
         # get attributed to the nested function itself, not hoisted here).
-        body = node.child_by_field_name("body")
-        if body is not None:
-            for target in _extract_call_targets(body, source_bytes):
+        if body_node is not None:
+            for target in _extract_call_targets(body_node, source_bytes):
                 _emit_call(func_name, "Function", target)
 
-            for child in body.named_children:
+            for child in body_node.named_children:
                 if child.type == "function_definition":
                     _visit_function(child, func_name, "Function")
                 elif child.type == "decorated_definition":

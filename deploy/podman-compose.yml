@@ -2,6 +2,12 @@
 # Fully separate from any other project's containers on this machine —
 # distinct container/volume names and host ports to avoid collisions.
 # Local-first per the Design Brief: no external network exposure beyond localhost.
+#
+# This is an ALTERNATIVE for developers who already have a compose provider
+# installed. The supported/tested path is `scripts/bootstrap.ps1`, which uses
+# `podman run` directly and needs no compose provider. This file is untested/
+# best-effort — kept as a declarative mirror of what bootstrap.ps1 does, not
+# a parallel primary path.
 version: "3.8"
 
 services:

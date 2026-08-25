@@ -461,3 +461,97 @@ def test_cli_index_history_nonexistent_repo(runner, temp_registry_db):
         result = runner.invoke(app, ["index-history", "nonexistent"])
         assert result.exit_code == 1
         assert "Error" in result.stdout
+
+
+def test_cli_add_full_flag_also_indexes_history(runner, temp_registry_db, require_neo4j):
+    """Test 'devgraph add --full' runs both the file scan and history indexing."""
+    db_path, registry = temp_registry_db
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_path = Path(tmpdir)
+        subprocess.run(["git", "init"], cwd=str(repo_path), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(repo_path), capture_output=True, check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test Author"],
+            cwd=str(repo_path), capture_output=True, check=True,
+        )
+        (repo_path / "module.py").write_text("class Foo:\n    pass\n")
+        subprocess.run(["git", "add", "module.py"], cwd=str(repo_path), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Initial commit"],
+            cwd=str(repo_path), capture_output=True, check=True,
+        )
+
+        from devgraph.cli import main as cli_main
+
+        config_module.get_settings.cache_clear()
+        with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+             patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+            result = runner.invoke(app, ["add", str(repo_path), "--full"])
+            assert result.exit_code == 0, f"stdout: {result.stdout}"
+            assert "Indexed" in result.stdout
+            assert "commit(s)" in result.stdout
+
+        from devgraph.graph.engine import GraphEngine
+
+        verify_registry = RepoRegistry(db_path)
+        repo_id = verify_registry.list_repos()[0].repo_id
+        verify_registry.close()
+
+        engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
+        try:
+            found = engine.run_cypher(
+                "MATCH (c:Commit {repo_id: $repo_id}) RETURN COUNT(*) as c", {"repo_id": repo_id}
+            )
+            assert found[0]["c"] >= 1
+        finally:
+            engine.delete_repository(repo_id)
+            engine.close()
+
+
+def test_cli_doctor_runs_without_crashing(runner, temp_registry_db):
+    """Test 'devgraph doctor' runs all checks and reports pass/fail without crashing."""
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["doctor"])
+        assert "Python" in result.stdout
+        assert "Neo4j" in result.stdout
+        assert "Live Watcher" in result.stdout
+
+
+def test_cli_client_config_prints_resolved_paths(runner, temp_registry_db):
+    """Test 'devgraph client-config' prints a portable command, not a hardcoded path."""
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["client-config"])
+        assert result.exit_code == 0, f"stdout: {result.stdout}"
+        assert "devgraph.mcp.server" in result.stdout
+        assert "claude mcp add" in result.stdout
+
+
+def test_cli_client_config_mcp_add_only(runner, temp_registry_db):
+    """Test 'devgraph client-config --claude-mcp-add-only' prints just the one-liner."""
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["client-config", "--claude-mcp-add-only"])
+        assert result.exit_code == 0, f"stdout: {result.stdout}"
+        # Rich's console may soft-wrap a long line across multiple terminal
+        # rows — join before asserting on content rather than counting lines.
+        collapsed = " ".join(l.strip() for l in result.stdout.strip().splitlines())
+        assert collapsed.startswith("claude mcp add devgraph")
+        assert "devgraph.mcp.server" in collapsed
