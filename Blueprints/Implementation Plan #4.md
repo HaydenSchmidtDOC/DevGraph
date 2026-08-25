@@ -198,6 +198,53 @@ view.
 
 ---
 
+## Item 4 — Reconcile `DEVGRAPH-CLIENT.md`
+
+**Files:** `DEVGRAPH-CLIENT.md`.
+
+### Design
+
+`DEVGRAPH-CLIENT.md` is not made obsolete by this plan and should **not** be
+deleted — it solves a different problem than Items 1-3. This plan is about
+*installing DevGraph itself*; `DEVGRAPH-CLIENT.md` is a portable doc for
+*another repo's* coding assistant, already pointed at a running DevGraph
+instance, to learn how to register that repo and use the 18 MCP tools day to
+day (identifier-type nuances, response envelope shape, the tool
+cheat-sheet, non-negotiables). None of that content is touched by Items 1-3.
+
+Two sections do reference the exact mechanics this plan changes and need a
+follow-up edit once Items 1-3 land, so the doc doesn't drift into fiction
+per `CLAUDE.md`'s "keep docs current" rule:
+
+- **§0 ("confirm the DevGraph Neo4j container is running")** — currently
+  tells the reader to manually `podman ps --filter name=devgraph-neo4j` and
+  start it by hand if not running. Once Item 2's menu (and/or a `devgraph
+  setup`-style re-run) can bring the container up itself, update this
+  section to mention that path as the preferred fix, keeping the manual
+  `podman ps`/`podman run` instructions only as a fallback for a machine
+  where the interactive menu isn't being used.
+- **§3 ("Connect DevGraph as an MCP server")** — currently documents only
+  `devgraph client-config` / `--claude-mcp-add-only` / `--run` against
+  Claude Code. Once Item 3 lands, update this section to also mention
+  `--target vscode|both` and the fact that a fresh install's interactive
+  menu (Item 2) already offers this registration step, so a reader arriving
+  post-install doesn't re-run registration unnecessarily — this section then
+  mainly serves someone registering a *new client repo* against an
+  *already-installed* DevGraph, or re-registering after moving/reinstalling
+  a client.
+
+No other section changes — steps 1 (repo registration/indexing), 2
+(rescan/history/docs/PR-issue opt-ins), 4 (tool cheat-sheet), 5 (tray
+lifecycle), and the non-negotiables list all describe post-install,
+per-client-repo usage that Items 1-3 don't touch.
+
+**Verification:** after Items 1-3 are implemented and manually verified,
+re-read `DEVGRAPH-CLIENT.md` §0 and §3 end-to-end against the new actual
+behavior and confirm every command/flag mentioned still exists and behaves
+as described — same bar as any other doc-drift check, not a new process.
+
+---
+
 ## Sequencing
 
 1. Item 3 (VS Code registration) — independent, needed as a dependency of
@@ -207,6 +254,8 @@ view.
 3. Item 2 (interactive menu) — depends on both: needs Item 3's VS Code
    registration to offer as a menu option, and is invoked by Item 1's
    install script.
+4. Item 4 (`DEVGRAPH-CLIENT.md` reconciliation) — last, after Items 1-3 are
+   implemented and their actual behavior is known.
 
 ## Out of scope (explicit)
 
