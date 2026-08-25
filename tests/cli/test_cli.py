@@ -252,3 +252,113 @@ def test_cli_annotate_nonexistent_repo(runner, temp_registry_db):
         result = runner.invoke(app, ["annotate", "nonexistent", "--docs-path", "docs"])
         assert result.exit_code == 1
         assert "Error" in result.stdout
+
+
+def test_cli_pr_source_enable(runner, temp_git_repo, temp_registry_db):
+    """Test 'devgraph pr-source enable' command."""
+    db_path, registry = temp_registry_db
+
+    repo_record = registry.add_repo(temp_git_repo)
+    repo_id = repo_record.repo_id
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["pr-source", repo_id, "enable"])
+        assert result.exit_code == 0, f"stdout: {result.stdout}"
+        assert "enabled" in result.stdout
+
+        reg = RepoRegistry(db_path)
+        assert reg.get(repo_id).pr_source_enabled is True
+        reg.close()
+
+
+def test_cli_issue_source_disable_after_enable(runner, temp_git_repo, temp_registry_db):
+    """Test 'devgraph issue-source disable' command."""
+    db_path, registry = temp_registry_db
+
+    repo_record = registry.add_repo(temp_git_repo)
+    repo_id = repo_record.repo_id
+    registry.set_issue_source_enabled(repo_id, True)
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["issue-source", repo_id, "disable"])
+        assert result.exit_code == 0, f"stdout: {result.stdout}"
+        assert "disabled" in result.stdout
+
+        reg = RepoRegistry(db_path)
+        assert reg.get(repo_id).issue_source_enabled is False
+        reg.close()
+
+
+def test_cli_pr_source_invalid_action(runner, temp_git_repo, temp_registry_db):
+    """Test 'devgraph pr-source' rejects an invalid action."""
+    db_path, registry = temp_registry_db
+    repo_record = registry.add_repo(temp_git_repo)
+    repo_id = repo_record.repo_id
+    registry.close()
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["pr-source", repo_id, "maybe"])
+        assert result.exit_code == 1
+        assert "Error" in result.stdout
+
+
+def test_cli_index_history(runner, temp_git_repo, temp_registry_db):
+    """Test 'devgraph index-history' command against a real (throwaway) local repo."""
+    db_path, registry = temp_registry_db
+
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=str(temp_git_repo), capture_output=True, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test Author"],
+        cwd=str(temp_git_repo), capture_output=True, check=True,
+    )
+    (temp_git_repo / "file.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "file.py"], cwd=str(temp_git_repo), capture_output=True, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "Initial commit"],
+        cwd=str(temp_git_repo), capture_output=True, check=True,
+    )
+
+    repo_record = registry.add_repo(temp_git_repo)
+    repo_id = repo_record.repo_id
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    settings = _mock_settings(db_path)
+    settings.neo4j_uri = "bolt://127.0.0.1:9999"
+    settings.neo4j_user = "neo4j"
+    settings.neo4j_password = "wrong"
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=settings), \
+         patch.object(cli_main, "get_settings", return_value=settings):
+        result = runner.invoke(app, ["index-history", repo_id])
+        # Neo4j unreachable at this bogus URI -> should fail gracefully, not crash
+        assert result.exit_code == 1
+        assert "Error" in result.stdout
+
+
+def test_cli_index_history_nonexistent_repo(runner, temp_registry_db):
+    """Test 'devgraph index-history' with non-existent repo."""
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["index-history", "nonexistent"])
+        assert result.exit_code == 1
+        assert "Error" in result.stdout

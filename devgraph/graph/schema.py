@@ -22,6 +22,10 @@ NODE_LABELS: tuple[str, ...] = (
     "Requirement",
     "DesignDecision",
     "ArchitectureNote",
+    # Phase 3 — git history, PR/issue knowledge.
+    "Commit",
+    "PullRequest",
+    "Issue",
 )
 
 RELATIONSHIP_TYPES: tuple[str, ...] = (
@@ -40,6 +44,10 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
     "DOCUMENTED_BY",
     "DECIDED_BY",
     "SUPERSEDES",
+    # Phase 3
+    "MODIFIES",
+    "RESOLVES",
+    "REFERENCES",
 )
 
 # Labels other than Repository must be uniquely keyed on (repo_id, name)

@@ -507,6 +507,114 @@ def trace_design_rationale(
     return {"component": component_name, "requirements": [], "notes": []}
 
 
+def blame_component(
+    engine: GraphEngine,
+    repo_id: str,
+    component_name: str,
+    cross_repo: bool = False,
+) -> list[dict[str, Any]]:
+    """Find commits that modified a component's file, most recent first.
+
+    Args:
+        engine: GraphEngine instance
+        repo_id: Repository ID
+        component_name: Name of the Module (file) to look up commit history for
+        cross_repo: If True, search across repos
+
+    Returns:
+        List of commits (sha, message, author, authored_date) that modified
+        this component, ordered most-recent-first.
+    """
+    repo_filter = "" if cross_repo else "AND c.repo_id = $repo_id"
+    cypher = f"""
+    MATCH (c:Commit)-[:MODIFIES]->(m:Module {{name: $component_name}})
+    WHERE true
+    {repo_filter}
+    RETURN c.name as sha, c.message as message, c.author as author,
+           c.authored_date as authored_date
+    ORDER BY c.authored_date DESC
+    """
+    params = {"component_name": component_name}
+    if not cross_repo:
+        params["repo_id"] = repo_id
+
+    results = engine.run_cypher(cypher, params)
+    return results
+
+
+def find_related_prs(
+    engine: GraphEngine,
+    repo_id: str,
+    component_name: str,
+    cross_repo: bool = False,
+) -> list[dict[str, Any]]:
+    """Find pull requests related to a component via commits that resolved issues touching it.
+
+    Args:
+        engine: GraphEngine instance
+        repo_id: Repository ID
+        component_name: Name of the Module (file) to find related PRs for
+        cross_repo: If True, search across repos
+
+    Returns:
+        List of PullRequests linked (via RESOLVES on an Issue referenced by
+        a commit that touched this component) to the component.
+    """
+    repo_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
+    cypher = f"""
+    MATCH (m:Module {{name: $component_name}})
+    WHERE true
+    {repo_filter}
+    MATCH (c:Commit)-[:MODIFIES]->(m)
+    OPTIONAL MATCH (c)-[:REFERENCES]->(i:Issue)<-[:RESOLVES]-(pr:PullRequest)
+    WITH DISTINCT pr
+    WHERE pr IS NOT NULL
+    RETURN pr.name as number, pr.title as title, pr.state as state, pr.url as url
+    """
+    params = {"component_name": component_name}
+    if not cross_repo:
+        params["repo_id"] = repo_id
+
+    results = engine.run_cypher(cypher, params)
+    return results
+
+
+def issue_history_for(
+    engine: GraphEngine,
+    repo_id: str,
+    component_name: str,
+    cross_repo: bool = False,
+) -> list[dict[str, Any]]:
+    """Find issues referenced by commits that touched a component.
+
+    Args:
+        engine: GraphEngine instance
+        repo_id: Repository ID
+        component_name: Name of the Module (file) to find issue history for
+        cross_repo: If True, search across repos
+
+    Returns:
+        List of Issues referenced by commits that modified this component.
+    """
+    repo_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
+    cypher = f"""
+    MATCH (m:Module {{name: $component_name}})
+    WHERE true
+    {repo_filter}
+    MATCH (c:Commit)-[:MODIFIES]->(m)
+    OPTIONAL MATCH (c)-[:REFERENCES]->(i:Issue)
+    WITH DISTINCT i
+    WHERE i IS NOT NULL
+    RETURN i.name as number, i.title as title, i.state as state, i.url as url
+    """
+    params = {"component_name": component_name}
+    if not cross_repo:
+        params["repo_id"] = repo_id
+
+    results = engine.run_cypher(cypher, params)
+    return results
+
+
 def run_cypher(
     engine: GraphEngine,
     query: str,

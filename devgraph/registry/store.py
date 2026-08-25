@@ -21,13 +21,25 @@ CREATE TABLE IF NOT EXISTS repos (
     active INTEGER NOT NULL DEFAULT 1,
     watch_enabled INTEGER NOT NULL DEFAULT 1,
     last_indexed TEXT,
-    docs_path TEXT
+    docs_path TEXT,
+    pr_source_enabled INTEGER NOT NULL DEFAULT 0,
+    issue_source_enabled INTEGER NOT NULL DEFAULT 0,
+    last_indexed_commit TEXT
 );
 """
 
-# Added after the initial release; ALTER is a no-op once the column exists.
+# Added after the initial release; each ALTER is skipped once its column exists.
 _MIGRATIONS = (
-    "ALTER TABLE repos ADD COLUMN docs_path TEXT",
+    ("docs_path", "ALTER TABLE repos ADD COLUMN docs_path TEXT"),
+    (
+        "pr_source_enabled",
+        "ALTER TABLE repos ADD COLUMN pr_source_enabled INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "issue_source_enabled",
+        "ALTER TABLE repos ADD COLUMN issue_source_enabled INTEGER NOT NULL DEFAULT 0",
+    ),
+    ("last_indexed_commit", "ALTER TABLE repos ADD COLUMN last_indexed_commit TEXT"),
 )
 
 _SLUG_RE = re.compile(r"[^a-z0-9_-]+")
@@ -46,6 +58,9 @@ class RepoRecord:
     watch_enabled: bool
     last_indexed: str | None
     docs_path: str | None = None
+    pr_source_enabled: bool = False
+    issue_source_enabled: bool = False
+    last_indexed_commit: str | None = None
 
 
 class RepoRegistry:
@@ -58,8 +73,8 @@ class RepoRegistry:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         existing_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(repos)")}
-        for migration in _MIGRATIONS:
-            if "docs_path" not in existing_cols:
+        for column, migration in _MIGRATIONS:
+            if column not in existing_cols:
                 self._conn.execute(migration)
         self._conn.commit()
 
@@ -139,18 +154,38 @@ class RepoRegistry:
         )
         self._conn.commit()
 
+    def set_pr_source_enabled(self, repo_id: str, enabled: bool) -> None:
+        """Opt this repo in/out of PR ingestion (Phase 3). Default is off (Principle 2)."""
+        self._set_flag(repo_id, "pr_source_enabled", enabled)
+
+    def set_issue_source_enabled(self, repo_id: str, enabled: bool) -> None:
+        """Opt this repo in/out of issue ingestion (Phase 3). Default is off (Principle 2)."""
+        self._set_flag(repo_id, "issue_source_enabled", enabled)
+
+    def set_last_indexed_commit(self, repo_id: str, sha: str | None) -> None:
+        """Record the most recently walked commit SHA for incremental git history indexing."""
+        repo = self.get(repo_id)
+        if repo is None:
+            raise ValueError(f"no such repo_id: {repo_id}")
+        self._conn.execute(
+            "UPDATE repos SET last_indexed_commit = ? WHERE repo_id = ?", (sha, repo_id)
+        )
+        self._conn.commit()
+
+    _COLUMNS = (
+        "repo_id, path, active, watch_enabled, last_indexed, docs_path, "
+        "pr_source_enabled, issue_source_enabled, last_indexed_commit"
+    )
+
     def get(self, repo_id: str) -> RepoRecord | None:
         row = self._conn.execute(
-            "SELECT repo_id, path, active, watch_enabled, last_indexed, docs_path "
-            "FROM repos WHERE repo_id = ?",
+            f"SELECT {self._COLUMNS} FROM repos WHERE repo_id = ?",
             (repo_id,),
         ).fetchone()
         return self._row_to_record(row) if row else None
 
     def list_repos(self, active_only: bool = False) -> list[RepoRecord]:
-        query = (
-            "SELECT repo_id, path, active, watch_enabled, last_indexed, docs_path FROM repos"
-        )
+        query = f"SELECT {self._COLUMNS} FROM repos"
         if active_only:
             query += " WHERE active = 1"
         rows = self._conn.execute(query).fetchall()
@@ -158,7 +193,25 @@ class RepoRegistry:
 
     @staticmethod
     def _row_to_record(row: tuple) -> RepoRecord:
-        repo_id, path, active, watch_enabled, last_indexed, docs_path = row
+        (
+            repo_id,
+            path,
+            active,
+            watch_enabled,
+            last_indexed,
+            docs_path,
+            pr_source_enabled,
+            issue_source_enabled,
+            last_indexed_commit,
+        ) = row
         return RepoRecord(
-            repo_id, Path(path), bool(active), bool(watch_enabled), last_indexed, docs_path
+            repo_id,
+            Path(path),
+            bool(active),
+            bool(watch_enabled),
+            last_indexed,
+            docs_path,
+            bool(pr_source_enabled),
+            bool(issue_source_enabled),
+            last_indexed_commit,
         )

@@ -10,6 +10,7 @@ from rich.table import Table
 from devgraph.config import get_settings
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
+from devgraph.indexer.git_history.extractor import index_repo_history
 from devgraph.registry.store import RepoRegistry
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
@@ -226,6 +227,107 @@ def annotate(
         raise typer.Exit(code=1)
     except Exception as e:
         console.print(f"[red][X] Unexpected error:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+@app.command(name="index-history")
+def index_history(
+    repo_id: str,
+    max_count: Optional[int] = typer.Option(
+        None, "--max-count", help="Cap the number of commits walked (useful for a first scan of a large repo)."
+    ),
+) -> None:
+    """Incrementally index a repo's git commit history (Phase 3).
+
+    Purely local — reads the repo's own .git directory, no network calls.
+    Walks only commits newer than the last indexed one for this repo_id.
+
+    Args:
+        repo_id: The repository ID to index history for.
+    """
+    try:
+        registry = _get_registry()
+        try:
+            repo = registry.get(repo_id)
+            if not repo:
+                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                raise typer.Exit(code=1)
+
+            settings = get_settings()
+            engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+            try:
+                engine.init_schema()
+                count = index_repo_history(engine, registry, repo_id, max_count=max_count)
+                console.print(f"[green][OK][/green] Indexed {count} new commit(s) for {repo_id}")
+            finally:
+                engine.close()
+        finally:
+            registry.close()
+    except typer.Exit:
+        raise
+    except ValueError as e:
+        console.print(f"[red][X] Error:[/red] {e}")
+        raise typer.Exit(code=1)
+    except Exception as e:
+        console.print(f"[red][X] Unexpected error:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+@app.command(name="pr-source")
+def pr_source(repo_id: str, action: str) -> None:
+    """Enable or disable PR ingestion opt-in for a repository (Phase 3).
+
+    Off by default (Design Brief Principle 2). This command only flips the
+    registry flag — it does not itself contact GitHub/GitLab/etc.
+
+    Args:
+        repo_id: The repository ID.
+        action: 'enable' or 'disable'.
+    """
+    _set_external_source_flag(repo_id, action, "pr_source_enabled", "PR")
+
+
+@app.command(name="issue-source")
+def issue_source(repo_id: str, action: str) -> None:
+    """Enable or disable issue ingestion opt-in for a repository (Phase 3).
+
+    Off by default (Design Brief Principle 2). This command only flips the
+    registry flag — it does not itself contact GitHub/GitLab/etc.
+
+    Args:
+        repo_id: The repository ID.
+        action: 'enable' or 'disable'.
+    """
+    _set_external_source_flag(repo_id, action, "issue_source_enabled", "Issue")
+
+
+def _set_external_source_flag(repo_id: str, action: str, setter_flag: str, label: str) -> None:
+    if action not in ("enable", "disable"):
+        console.print("[red][X] Error:[/red] action must be 'enable' or 'disable'")
+        raise typer.Exit(code=1)
+
+    try:
+        registry = _get_registry()
+        try:
+            repo = registry.get(repo_id)
+            if not repo:
+                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                raise typer.Exit(code=1)
+
+            enabled = action == "enable"
+            if setter_flag == "pr_source_enabled":
+                registry.set_pr_source_enabled(repo_id, enabled)
+            else:
+                registry.set_issue_source_enabled(repo_id, enabled)
+
+            verb = "enabled" if enabled else "disabled"
+            console.print(f"[green][OK][/green] {label} source {verb} for {repo_id}")
+        finally:
+            registry.close()
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"[red][X] Error:[/red] {e}")
         raise typer.Exit(code=1)
 
 

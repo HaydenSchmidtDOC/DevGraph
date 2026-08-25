@@ -26,6 +26,9 @@ from devgraph.mcp.tools import (
     explain_decision,
     find_requirements_for,
     trace_design_rationale,
+    blame_component,
+    find_related_prs,
+    issue_history_for,
     run_cypher,
 )
 
@@ -308,6 +311,75 @@ TOOL_DEFINITIONS = [
             "required": ["repo_id", "component_name"],
         },
     ),
+    Tool(
+        name="blame_component",
+        description="Find commits that modified a component's file, most recent first (Phase 3)",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo_id": {
+                    "type": "string",
+                    "description": "Repository ID",
+                },
+                "component_name": {
+                    "type": "string",
+                    "description": "Name of the Module (file) to look up commit history for",
+                },
+                "cross_repo": {
+                    "type": "boolean",
+                    "description": "If true, search across repos (default: false)",
+                    "default": False,
+                },
+            },
+            "required": ["repo_id", "component_name"],
+        },
+    ),
+    Tool(
+        name="find_related_prs",
+        description="Find pull requests related to a component via commits/issues (Phase 3)",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo_id": {
+                    "type": "string",
+                    "description": "Repository ID",
+                },
+                "component_name": {
+                    "type": "string",
+                    "description": "Name of the Module (file) to find related PRs for",
+                },
+                "cross_repo": {
+                    "type": "boolean",
+                    "description": "If true, search across repos (default: false)",
+                    "default": False,
+                },
+            },
+            "required": ["repo_id", "component_name"],
+        },
+    ),
+    Tool(
+        name="issue_history_for",
+        description="Find issues referenced by commits that touched a component (Phase 3)",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo_id": {
+                    "type": "string",
+                    "description": "Repository ID",
+                },
+                "component_name": {
+                    "type": "string",
+                    "description": "Name of the Module (file) to find issue history for",
+                },
+                "cross_repo": {
+                    "type": "boolean",
+                    "description": "If true, search across repos (default: false)",
+                    "default": False,
+                },
+            },
+            "required": ["repo_id", "component_name"],
+        },
+    ),
 ]
 
 # run_cypher is only registered if enable_run_cypher is True
@@ -445,6 +517,27 @@ class DevGraphMCPServer:
                 )
             elif name == "trace_design_rationale":
                 result = trace_design_rationale(
+                    self.engine,
+                    arguments["repo_id"],
+                    arguments["component_name"],
+                    arguments.get("cross_repo", False),
+                )
+            elif name == "blame_component":
+                result = blame_component(
+                    self.engine,
+                    arguments["repo_id"],
+                    arguments["component_name"],
+                    arguments.get("cross_repo", False),
+                )
+            elif name == "find_related_prs":
+                result = find_related_prs(
+                    self.engine,
+                    arguments["repo_id"],
+                    arguments["component_name"],
+                    arguments.get("cross_repo", False),
+                )
+            elif name == "issue_history_for":
+                result = issue_history_for(
                     self.engine,
                     arguments["repo_id"],
                     arguments["component_name"],

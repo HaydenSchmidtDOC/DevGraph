@@ -4,7 +4,7 @@ Local-first developer knowledge graph platform. Builds and maintains a structure
 
 ## Status
 
-Phase 1 complete and verified (registry, graph engine, Tree-sitter Python indexer, container/API/datastore extractors, watcher, 10 MCP tools, CLI, tray app). Phase 2 (Requirements/DesignDecisions/ArchitectureNotes) implemented on top of it. Phases 3-4 remain design-only per the Implementation Plan. Treat claims about specific extractors/tools as complete only once their code and tests actually land — check `devgraph/` before assuming a component works.
+Phase 1 complete and verified (registry, graph engine, Tree-sitter Python indexer, container/API/datastore extractors, watcher, 10 MCP tools, CLI, tray app). Phase 2 (Requirements/DesignDecisions/ArchitectureNotes) and Phase 3 (git history + opt-in PR/issue ingestion) are implemented on top of it. Phase 4 (enterprise federation) remains design-only/optional per the Implementation Plan. Treat claims about specific extractors/tools as complete only once their code and tests actually land — check `devgraph/` before assuming a component works.
 
 Git is initialized locally; no remote is configured yet. Container runtime is **Podman** (not Docker) — see the Design Brief and Implementation Plan.
 
@@ -24,18 +24,20 @@ Git is initialized locally; no remote is configured yet. Container runtime is **
 
 - `Blueprints/` — numbered design docs for planned/completed work. `Design Brief #1.md` is the current source of truth for target architecture (principles, graph schema, MCP tool surface, roadmap phases). Check here before proposing new architecture; add new numbered briefs for major design changes rather than rewriting history in place.
 - Root-level `CLAUDE.md` / `AGENTS.md` — working agreement and agent-facing instructions for this repo specifically.
-- `devgraph/` — Phase 1 + Phase 2 implementation:
+- `devgraph/` — Phase 1 + Phase 2 + Phase 3 implementation:
   - `config/` — Pydantic settings, all security defaults off (telemetry, cloud sync, cross-repo, run_cypher).
-  - `registry/` — SQLite-backed repo allowlist (`RepoRegistry`). The only source of truth for which paths may be watched/indexed. Also stores each repo's optional `docs_path` (Phase 2).
-  - `graph/` — `GraphEngine` (Neo4j driver, idempotent MERGE upserts, schema constraints) and `schema.py` (canonical node labels / relationship types, including Phase 2's `Requirement`/`DesignDecision`/`ArchitectureNote` and `SATISFIES`/`DOCUMENTED_BY`/`DECIDED_BY`/`SUPERSEDES` — import from here, don't hardcode label strings elsewhere).
+  - `registry/` — SQLite-backed repo allowlist (`RepoRegistry`). The only source of truth for which paths may be watched/indexed. Also stores each repo's optional `docs_path` (Phase 2), `pr_source_enabled`/`issue_source_enabled` opt-in flags, and `last_indexed_commit` (Phase 3).
+  - `graph/` — `GraphEngine` (Neo4j driver, idempotent MERGE upserts, schema constraints) and `schema.py` (canonical node labels / relationship types, including Phase 2's `Requirement`/`DesignDecision`/`ArchitectureNote`/`SATISFIES`/`DOCUMENTED_BY`/`DECIDED_BY`/`SUPERSEDES` and Phase 3's `Commit`/`PullRequest`/`Issue`/`MODIFIES`/`RESOLVES`/`REFERENCES` — import from here, don't hardcode label strings elsewhere).
   - `indexer/python/` — Tree-sitter-based Python extractor (`tree-sitter` + `tree-sitter-python`), per the Implementation Plan.
   - `indexer/containers/`, `indexer/apis/`, `indexer/datastores/` — Podman Compose, FastAPI/Flask/Django route, and datastore-client-usage extractors.
   - `indexer/docs/` — Phase 2 Markdown/front-matter extractor (`DocsExtractor`, `index_file`). Parses `type: requirement|design_decision|architecture_note` notes under a repo's configured `docs_path`; links via `links:`/`supersedes:`/`decided_by:` front-matter fields.
+  - `indexer/git_history/` — Phase 3 `GitHistoryExtractor` (GitPython, purely local, no network) + `index_repo_history`. Incrementally walks commits newer than the registry's `last_indexed_commit`, creating `Commit` nodes and `MODIFIES` edges to `Module` nodes.
+  - `indexer/pr_issues/` — Phase 3's first external-network component. `PRIssueSource` protocol + `GitHubSource` implementation; `index_pr_issues` hard-gates on the repo's `pr_source_enabled`/`issue_source_enabled` registry flags (default off) — never wire this to run automatically.
   - `watcher/` — `WatcherManager`, registry-scoped-only file/git watching with debounce.
-  - `mcp/` — the 13 high-level MCP tools (`tools.py`, including Phase 2's `explain_decision`/`find_requirements_for`/`trace_design_rationale`) plus server wiring (`server.py`); `run_cypher` gated behind `enable_run_cypher` config.
-  - `cli/` — Typer CLI (`devgraph add/remove/list/watch/rescan/status/annotate`). `annotate` sets a repo's `docs_path` and/or indexes a single note file.
+  - `mcp/` — the 16 high-level MCP tools (`tools.py`, including Phase 2's `explain_decision`/`find_requirements_for`/`trace_design_rationale` and Phase 3's `blame_component`/`find_related_prs`/`issue_history_for`) plus server wiring (`server.py`); `run_cypher` gated behind `enable_run_cypher` config.
+  - `cli/` — Typer CLI (`devgraph add/remove/list/watch/rescan/status/annotate/index-history/pr-source/issue-source`). `annotate` sets a repo's `docs_path` and/or indexes a single note file; `index-history` walks git log incrementally; `pr-source`/`issue-source` flip the opt-in registry flags only (never make a network call themselves).
   - `agent/` — `TrayApp` (pystray), the thin shell wiring watcher + Neo4j health together.
-- `tests/` — mirrors `devgraph/` structure; 113 tests as of Phase 2, run via `.venv/Scripts/python -m pytest`.
+- `tests/` — mirrors `devgraph/` structure; 149 tests as of Phase 3, run via `.venv/Scripts/python -m pytest`.
 - `deploy/podman-compose.yml` — declarative form of DevGraph's isolated Neo4j container (needs a compose provider; `podman run` form in Commands above needs none).
 
 ## Core design principles (from the Design Brief — hold these as constraints, not suggestions)
