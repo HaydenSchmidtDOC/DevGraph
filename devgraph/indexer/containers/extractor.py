@@ -143,11 +143,19 @@ class ContainerExtractor:
                 if not isinstance(service_config, dict):
                     continue
 
-                # Create Service node
+                # Create Service node. build_context (when present) is the
+                # service's source directory relative to the compose file —
+                # used by devgraph/indexer/dispatch.py to link a Python
+                # file's Database/Endpoint nodes back to the Service that
+                # owns it, via directory containment.
+                build_context = self._extract_build_context(service_config.get("build"))
+                properties = {"source": filename}
+                if build_context is not None:
+                    properties["build_context"] = build_context
                 service = ServiceNode(
                     name=service_name,
                     repo_id=self.repo_id,
-                    properties={"source": filename},
+                    properties=properties,
                 )
                 result.services.append(service)
 
@@ -212,6 +220,63 @@ class ContainerExtractor:
                 result.volumes.append(volume)
 
         return result
+
+    @staticmethod
+    def _extract_build_context(build_config) -> Optional[str]:
+        """Normalize a compose service's `build` field to a relative directory.
+
+        Handles:
+        - shorthand ('build: ./services/api')
+        - long form with a real context ('build: {context: ./services/api}')
+        - long form where context is the repo root but dockerfile points
+          into a subdirectory ('build: {context: ., dockerfile:
+          services/ingestion/Dockerfile}') — a common compose pattern (single
+          shared build context, per-service Dockerfile) where the actual
+          service source lives at the Dockerfile's own directory, not at
+          context itself. Uses the Dockerfile's parent directory in that case.
+
+        Returns None for services with no `build` key (image-only services
+        like databases/brokers — those correctly have no source directory of
+        their own to attribute Python files to) or when nothing resolvable
+        is found.
+        """
+        if build_config is None:
+            return None
+
+        if isinstance(build_config, str):
+            return ContainerExtractor._normalize_build_dir(build_config)
+
+        if not isinstance(build_config, dict):
+            return None
+
+        context = build_config.get("context")
+        context_dir = (
+            ContainerExtractor._normalize_build_dir(context) if isinstance(context, str) else None
+        )
+        if context_dir is not None:
+            return context_dir
+
+        # context is repo-root (or absent) — fall back to the Dockerfile's
+        # own directory, which is where the actual per-service source lives
+        # in a single-shared-context layout.
+        dockerfile = build_config.get("dockerfile")
+        if isinstance(dockerfile, str):
+            dockerfile_dir = dockerfile.replace("\\", "/").rsplit("/", 1)
+            if len(dockerfile_dir) == 2:
+                return ContainerExtractor._normalize_build_dir(dockerfile_dir[0])
+
+        return None
+
+    @staticmethod
+    def _normalize_build_dir(raw: str) -> Optional[str]:
+        """Strip leading './', collapse to forward slashes, drop a bare '.'
+        (repo root — no meaningful subdirectory to attribute files to)."""
+        normalized = raw.replace("\\", "/").strip()
+        if normalized in (".", "./", ""):
+            return None
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized.rstrip("/") or None
 
     @staticmethod
     def _extract_image_name(image_ref: str) -> str:

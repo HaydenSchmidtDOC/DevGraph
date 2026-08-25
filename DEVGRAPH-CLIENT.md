@@ -167,27 +167,25 @@ Prefer these over re-reading files when the question is structural:
 If a tool returns empty/sparse results, check whether the repo has actually
 been scanned (step 1/2) before concluding the graph has nothing to say — an
 unindexed repo will legitimately return empty results, that's not a tool
-failure. Known real gaps below are a different thing: even a fully-indexed
-repo won't populate these.
+failure.
 
-**Known current gaps** (confirmed against a real ~1300-node repo, not just
-theoretical):
+All previously-documented gaps here (`find_callers`/`impact_analysis` seeing
+no call edges, `explain_architecture` returning no `uses`/`calls`, relative
+imports not resolving) are now fixed and verified against RAG4 directly.
+Two things worth knowing about how they work:
 
-- `find_callers`/`impact_analysis` only see `CONTAINS`/`IMPORTS`/`EXTENDS`/`USES`
-  relationships — the Python indexer doesn't yet extract actual call-site
-  (`CALLS`) edges. "What calls X" will come back empty even for code that
-  genuinely calls it.
-- `explain_architecture`'s `uses`/`calls` output stays empty even on a
-  fully-scanned repo: the container/API/datastore extractors run
-  independently per file and don't cross-link their output — a `Service`
-  node from a compose file and a `Database` node from Python source aren't
-  automatically connected. `list_services` and `summarise_repository` (raw
-  node counts) work correctly; the *relationship*-based architecture view
-  doesn't yet.
-- Multi-level relative imports (`from .sub.pkg import x`) don't resolve
-  correctly — `Module` nodes are keyed by bare filename with no package
-  path, so only single-level relative imports (`from . import x`,
-  `from .sibling import y`) resolve to the right node.
+- **Call graph is name-based, not type-resolved.** `self.foo()`,
+  `obj.foo()`, and a bare `foo()` all link to whichever `Function` node is
+  named `foo` — there's no type inference, so same-named methods on
+  unrelated classes will over-link rather than under-link. Treat
+  `find_callers` results as "things that call something named X", not a
+  guaranteed-precise call graph.
+- **Service cross-linking depends on the compose file's `build`/`context`
+  matching each service's actual source directory.** If a compose service
+  has no `build:` key (image-only services like databases) or an
+  unconventional build layout DevGraph's heuristic doesn't recognize, its
+  `uses`/`calls` data in `explain_architecture` will be sparse — that's a
+  real limit of directory-based inference, not a sign indexing failed.
 
 ## 5. Keeping the graph current
 

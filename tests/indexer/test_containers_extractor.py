@@ -238,3 +238,45 @@ networks:
         for full_ref, expected_name in test_cases:
             result = ContainerExtractor._extract_image_name(full_ref)
             assert result == expected_name
+
+    def test_build_context_shorthand_string(self):
+        """build: ./services/api (string shorthand) -> build_context 'services/api'."""
+        content = "services:\n  api:\n    build: ./services/api\n"
+        result = self.extractor.extract_from_compose_file(content)
+        assert result.services[0].properties["build_context"] == "services/api"
+
+    def test_build_context_long_form(self):
+        """build: {context: ./services/api} -> build_context 'services/api'."""
+        content = "services:\n  api:\n    build:\n      context: ./services/api\n"
+        result = self.extractor.extract_from_compose_file(content)
+        assert result.services[0].properties["build_context"] == "services/api"
+
+    def test_build_context_falls_back_to_dockerfile_directory(self):
+        """When context is repo root but dockerfile points into a
+        subdirectory (a common shared-build-context pattern), the service's
+        source directory is the Dockerfile's own directory.
+        """
+        content = (
+            "services:\n"
+            "  worker:\n"
+            "    build:\n"
+            "      context: .\n"
+            "      dockerfile: services/ingestion/Dockerfile\n"
+        )
+        result = self.extractor.extract_from_compose_file(content)
+        assert result.services[0].properties["build_context"] == "services/ingestion"
+
+    def test_no_build_context_for_image_only_service(self):
+        """A service with only `image:` (no `build:`) has no source
+        directory of its own — build_context should be absent, not empty.
+        """
+        content = "services:\n  db:\n    image: postgres:15\n"
+        result = self.extractor.extract_from_compose_file(content)
+        assert "build_context" not in result.services[0].properties
+
+    def test_build_context_at_repo_root_is_none(self):
+        """build: . (repo root) has no meaningful subdirectory to attribute
+        files to, so build_context should be absent."""
+        content = "services:\n  api:\n    build: .\n"
+        result = self.extractor.extract_from_compose_file(content)
+        assert "build_context" not in result.services[0].properties

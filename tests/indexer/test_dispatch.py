@@ -172,3 +172,82 @@ class TestFullScan:
             assert names == ["A", "B"]
         finally:
             engine.delete_repository(repo_id)
+
+
+class TestServiceCrossLinking:
+    """Previously the container extractor (compose-derived Service nodes)
+    and the datastore/API extractors (per-file Database/Endpoint nodes)
+    never cross-referenced each other — explain_architecture's Service
+    'uses'/'calls' output stayed empty even on a fully-scanned repo. Fixed
+    via build_context-based directory containment matching.
+    """
+
+    def test_full_scan_links_service_to_datastore_it_uses(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_service_link"
+        (temp_repo / "docker-compose.yml").write_text(
+            "services:\n"
+            "  api:\n"
+            "    build: ./services/api\n"
+        )
+        api_dir = temp_repo / "services" / "api"
+        api_dir.mkdir(parents=True)
+        (api_dir / "db.py").write_text("import redis\ncache = redis.Redis()\n")
+
+        try:
+            full_scan(engine, repo_id, temp_repo)
+
+            result = engine.run_cypher(
+                "MATCH (s:Service {repo_id: $repo_id, name: 'api'})-[:USES]->(d) "
+                "RETURN labels(d) as labels, d.name as name",
+                {"repo_id": repo_id},
+            )
+            assert any(r["name"] == "Redis" for r in result)
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_full_scan_links_endpoint_to_owning_service(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_endpoint_link"
+        (temp_repo / "docker-compose.yml").write_text(
+            "services:\n"
+            "  web:\n"
+            "    build: ./services/web\n"
+        )
+        web_dir = temp_repo / "services" / "web"
+        web_dir.mkdir(parents=True)
+        (web_dir / "app.py").write_text(
+            "from fastapi import FastAPI\napp = FastAPI()\n\n@app.get('/health')\ndef health():\n    pass\n"
+        )
+
+        try:
+            full_scan(engine, repo_id, temp_repo)
+
+            result = engine.run_cypher(
+                "MATCH (e:Endpoint {repo_id: $repo_id})-[:CALLS]->(s:Service {name: 'web'}) "
+                "RETURN e.name as name",
+                {"repo_id": repo_id},
+            )
+            assert any(r["name"] == "GET /health" for r in result)
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_file_outside_any_build_context_is_not_linked(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_no_link"
+        (temp_repo / "docker-compose.yml").write_text(
+            "services:\n"
+            "  api:\n"
+            "    build: ./services/api\n"
+        )
+        (temp_repo / "services" / "api").mkdir(parents=True)
+        # File lives outside the api service's build context (e.g. shared code).
+        (temp_repo / "shared_db.py").write_text("import redis\ncache = redis.Redis()\n")
+
+        try:
+            full_scan(engine, repo_id, temp_repo)
+
+            result = engine.run_cypher(
+                "MATCH (s:Service {repo_id: $repo_id})-[:USES]->(d:Cache) RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert result[0]["c"] == 0
+        finally:
+            engine.delete_repository(repo_id)
