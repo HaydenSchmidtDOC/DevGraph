@@ -51,17 +51,26 @@ current file content, correctness, or making actual edits.
 ## 0. One-time: confirm the DevGraph Neo4j container is running
 
 DevGraph's graph lives in an isolated Podman container, not in this repo.
-From any shell:
+If DevGraph was installed via its interactive setup (`.\scripts\install.ps1`
+or `.\scripts\setup-menu.ps1`), the container is already up — that flow
+brings up Neo4j, initializes its schema, and runs a health check as part of
+install, so this step is normally already satisfied by the time a client
+repo needs it.
+
+To confirm, from any shell:
 
 ```bash
 podman ps --filter name=devgraph-neo4j
 ```
 
-If it's not running, start it (see DevGraph's own `README.md` for the exact
-`podman run` command) — do this from the DevGraph repo, not from here.
-**Never** create or touch a container with a different name prefix; if you
-see other `podman ps` entries, they belong to unrelated projects and are out
-of scope.
+If it's not running, the quickest fix is re-running `.\scripts\setup-menu.ps1`
+from the DevGraph repo (idempotent — safe to re-run, brings the container
+back up without re-registering anything that's already registered). Falling
+back to a manual `podman run` (see DevGraph's own `README.md`) still works
+too, if you'd rather not run the interactive menu again — do this from the
+DevGraph repo, not from here. **Never** create or touch a container with a
+different name prefix; if you see other `podman ps` entries, they belong to
+unrelated projects and are out of scope.
 
 ## 1. Register (and automatically index) this repo with DevGraph
 
@@ -145,11 +154,20 @@ pulling PR/issue data currently requires a short Python script calling
 
 ## 3. Connect DevGraph as an MCP server
 
-Run `devgraph client-config` from the DevGraph repo on this machine to get
-the exact paths/commands for this checkout — do not hardcode a path here,
-DevGraph's install location can differ machine to machine. Its default output
-is a ready-to-paste block shaped like this (example only — always use the
-actual output from running the command, not this literal text):
+If DevGraph was installed via its interactive setup
+(`.\scripts\install.ps1` / `.\scripts\setup-menu.ps1`), this step is likely
+already done — that flow detects Claude Code and VS Code on the machine and
+registers DevGraph with whichever ones you selected. Re-running it is safe
+(idempotent) if you're not sure, or if you want to register a client that
+wasn't picked the first time.
+
+To register (or re-register) manually, run `devgraph client-config` from the
+DevGraph repo on this machine to get the exact paths/commands for this
+checkout — do not hardcode a path here, DevGraph's install location can
+differ machine to machine. It supports `--target claude|vscode|both`
+(default `both`). Its default output is a ready-to-paste block shaped like
+this (example only — always use the actual output from running the command,
+not this literal text):
 
 ```
 ## Connect DevGraph as an MCP server
@@ -159,14 +177,22 @@ actual output from running the command, not this literal text):
 - **cwd**: <resolved DevGraph repo root>
 
 claude mcp add devgraph -- "<resolved venv python.exe>" -m devgraph.mcp.server
+
+VS Code (user mcp.json at <resolved path>):
+{ "servers": { "devgraph": { "type": "stdio", "command": "...", "args": [...], "cwd": "..." } } }
 ```
 
-`devgraph client-config --claude-mcp-add-only` prints just the one-liner;
-`devgraph client-config --run` also executes it via the `claude` CLI if one
-is on PATH (opt-in, print-only is the default). Exact `claude mcp add` flags
-depend on the Claude Code version in use — check `claude mcp add --help` if
-the printed command doesn't match; the important part is the command/args/cwd
-above, not the specific CLI invocation.
+`devgraph client-config --claude-mcp-add-only` prints just the Claude Code
+one-liner; `devgraph client-config --run` also executes registration for the
+selected `--target`(s) — for Claude Code via the `claude` CLI if one is on
+PATH, for VS Code by merging the entry into VS Code's user-level `mcp.json`
+(opt-in, print-only is the default). Both are safe to re-run: an
+already-registered Claude Code entry is detected and skipped rather than
+erroring, and the VS Code entry is an upsert that never touches other
+servers already in that file. Exact `claude mcp add` flags depend on the
+Claude Code version in use — check `claude mcp add --help` if the printed
+command doesn't match; the important part is the command/args/cwd above, not
+the specific CLI invocation.
 
 Once connected, 18 tools become available, all scoped by a `repo_id`
 argument. **Always pass this repo's `repo_id` from step 1.** Never pass
