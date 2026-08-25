@@ -213,26 +213,26 @@ def summarise_repository(
     Returns:
         Summary with service count, module count, dependency graph stats
     """
+    # Each count runs as its own uncorrelated subquery (CALL {...}) rather
+    # than chaining OPTIONAL MATCHes in one query. Chained OPTIONAL MATCHes
+    # on independent label patterns force Neo4j to compute their cartesian
+    # product before COUNT(DISTINCT ...) collapses it back down — on a real
+    # repo with hundreds of Function/Class nodes that product explodes
+    # combinatorially and the query effectively hangs. Subqueries keep each
+    # count's cardinality independent.
     count_cypher = """
-    OPTIONAL MATCH (r:Repository {repo_id: $repo_id})
-    OPTIONAL MATCH (s:Service {repo_id: $repo_id})
-    OPTIONAL MATCH (m:Module {repo_id: $repo_id})
-    OPTIONAL MATCH (c:Class {repo_id: $repo_id})
-    OPTIONAL MATCH (f:Function {repo_id: $repo_id})
-    OPTIONAL MATCH (e:Endpoint {repo_id: $repo_id})
-    OPTIONAL MATCH (d:Database {repo_id: $repo_id})
-    OPTIONAL MATCH (v:VectorStore {repo_id: $repo_id})
-    OPTIONAL MATCH (q:Queue {repo_id: $repo_id})
+    CALL () { MATCH (s:Service {repo_id: $repo_id}) RETURN COUNT(s) as service_count }
+    CALL () { MATCH (m:Module {repo_id: $repo_id}) RETURN COUNT(m) as module_count }
+    CALL () { MATCH (c:Class {repo_id: $repo_id}) RETURN COUNT(c) as class_count }
+    CALL () { MATCH (f:Function {repo_id: $repo_id}) RETURN COUNT(f) as function_count }
+    CALL () { MATCH (e:Endpoint {repo_id: $repo_id}) RETURN COUNT(e) as endpoint_count }
+    CALL () { MATCH (d:Database {repo_id: $repo_id}) RETURN COUNT(d) as database_count }
+    CALL () { MATCH (v:VectorStore {repo_id: $repo_id}) RETURN COUNT(v) as vectorstore_count }
+    CALL () { MATCH (q:Queue {repo_id: $repo_id}) RETURN COUNT(q) as queue_count }
     RETURN
         $repo_id as repo_name,
-        COUNT(DISTINCT s) as service_count,
-        COUNT(DISTINCT m) as module_count,
-        COUNT(DISTINCT c) as class_count,
-        COUNT(DISTINCT f) as function_count,
-        COUNT(DISTINCT e) as endpoint_count,
-        COUNT(DISTINCT d) as database_count,
-        COUNT(DISTINCT v) as vectorstore_count,
-        COUNT(DISTINCT q) as queue_count
+        service_count, module_count, class_count, function_count,
+        endpoint_count, database_count, vectorstore_count, queue_count
     """
     results = engine.run_cypher(count_cypher, {"repo_id": repo_id})
     if results:

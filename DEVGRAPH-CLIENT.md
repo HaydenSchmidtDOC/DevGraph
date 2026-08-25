@@ -51,7 +51,7 @@ If it's not running, start it (see DevGraph's own `README.md` for the exact
 see other `podman ps` entries, they belong to unrelated projects and are out
 of scope.
 
-## 1. Register this repo with DevGraph
+## 1. Register (and automatically index) this repo with DevGraph
 
 Run once per machine (DevGraph's registry is local to the machine, not per
 client-repo):
@@ -60,9 +60,16 @@ client-repo):
 "C:\Daifuku RAG Dev\Neo4J CodeRag MCP\.venv\Scripts\python.exe" -m devgraph.cli.main add "<absolute path to this repo>"
 ```
 
-This prints the `repo_id` assigned (defaults to the folder name, deduped if
-already taken). **Record that `repo_id`** — every DevGraph MCP tool call
-needs it. Confirm registration:
+This registers the repo **and runs a full initial scan** — Python source,
+container/compose files, API routes, datastore usage all get indexed in one
+pass via `devgraph/indexer/dispatch.py`. It prints the `repo_id` assigned
+(defaults to the folder name, deduped if already taken) and how many files
+were indexed. **Record that `repo_id`** — every DevGraph MCP tool call needs
+it. If Neo4j isn't reachable at registration time, `add` still succeeds
+(registration and indexing are decoupled) and tells you to run
+`devgraph rescan <repo_id>` once it's up.
+
+Confirm registration:
 
 ```bash
 "C:\Daifuku RAG Dev\Neo4J CodeRag MCP\.venv\Scripts\python.exe" -m devgraph.cli.main list
@@ -73,39 +80,31 @@ there is no automatic or recursive discovery. Registering this repo does not
 expose it to any other repo's queries unless someone explicitly passes
 `cross_repo: true` on a tool call.
 
-## 2. Index this repo
+## 2. Re-index after changes, and index optional extras
 
-DevGraph has no single "index everything" command yet — each extractor is
-invoked separately. Run these from a shell with DevGraph's venv Python on
-`PATH`, or by full path as above.
+`devgraph rescan <repo_id>` re-runs the same full scan as `add` — idempotent
+(`MERGE`-based), safe to run repeatedly; existing nodes update in place
+rather than duplicating. Use it any time you want the graph refreshed after
+a batch of changes:
 
-**Python source** (repeat per changed file, or loop over the tree on first
-index):
-
-```python
-from devgraph.graph.engine import GraphEngine
-from devgraph.indexer.python.extractor import index_file
-from pathlib import Path
-
-engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
-engine.init_schema()
-for f in Path(".").rglob("*.py"):
-    index_file(engine, "<repo_id>", f)
-engine.close()
+```bash
+python -m devgraph.cli.main rescan <repo_id>
 ```
 
-**Git history** (incremental — safe to re-run, only walks new commits):
+**Git history** (separate command — not part of the file-scan above;
+incremental, only walks new commits since the last run):
 
 ```bash
 python -m devgraph.cli.main index-history <repo_id>
 ```
 
 **Docs / design decisions** (optional — only if this repo has Markdown notes
-with `type: requirement|design_decision|architecture_note` front-matter):
+with `type: requirement|design_decision|architecture_note` front-matter;
+`rescan` picks these up automatically too, once `--docs-path` is set):
 
 ```bash
 python -m devgraph.cli.main annotate <repo_id> --docs-path <repo-relative docs folder>
-python -m devgraph.cli.main annotate <repo_id> --note <repo-relative note file>   # per note
+python -m devgraph.cli.main annotate <repo_id> --note <repo-relative note file>   # index one note immediately
 ```
 
 **PR/issue history** is opt-in and talks to an external service (GitHub,
@@ -116,9 +115,10 @@ python -m devgraph.cli.main pr-source enable <repo_id>
 python -m devgraph.cli.main issue-source enable <repo_id>
 ```
 
-Re-indexing is idempotent (`MERGE`-based) — running any of the above again
-updates existing nodes in place rather than duplicating them, so it's safe
-to re-run after making changes in this repo.
+Enabling the flags above doesn't fetch anything by itself yet — actually
+pulling PR/issue data currently requires a short Python script calling
+`devgraph.indexer.pr_issues.extractor.index_pr_issues` with a configured
+`GitHubSource`; there's no CLI command that performs the fetch yet.
 
 ## 3. Connect DevGraph as an MCP server
 
@@ -164,26 +164,41 @@ Prefer these over re-reading files when the question is structural:
 | "Who changed X and when?" | `blame_component` |
 | "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2) |
 
-If a tool returns empty/sparse results, check whether the relevant extractor
-has actually been run (step 2) before concluding the graph has nothing to
-say — an unindexed repo (or one only partially indexed) will legitimately
-return empty results, that's not a tool failure.
+If a tool returns empty/sparse results, check whether the repo has actually
+been scanned (step 1/2) before concluding the graph has nothing to say — an
+unindexed repo will legitimately return empty results, that's not a tool
+failure. Known real gaps below are a different thing: even a fully-indexed
+repo won't populate these.
 
-**Known current gap**: `find_callers`/`impact_analysis` only see
-`CONTAINS`/`IMPORTS`/`EXTENDS`/`USES` relationships — the Python indexer
-doesn't yet extract actual call-site (`CALLS`) edges. Don't be surprised if
-"what calls X" comes back empty even for code you know calls it; that's a
-known limitation of the current indexer, not a sign this repo wasn't
-indexed.
+**Known current gaps** (confirmed against a real ~1300-node repo, not just
+theoretical):
+
+- `find_callers`/`impact_analysis` only see `CONTAINS`/`IMPORTS`/`EXTENDS`/`USES`
+  relationships — the Python indexer doesn't yet extract actual call-site
+  (`CALLS`) edges. "What calls X" will come back empty even for code that
+  genuinely calls it.
+- `explain_architecture`'s `uses`/`calls` output stays empty even on a
+  fully-scanned repo: the container/API/datastore extractors run
+  independently per file and don't cross-link their output — a `Service`
+  node from a compose file and a `Database` node from Python source aren't
+  automatically connected. `list_services` and `summarise_repository` (raw
+  node counts) work correctly; the *relationship*-based architecture view
+  doesn't yet.
+- Multi-level relative imports (`from .sub.pkg import x`) don't resolve
+  correctly — `Module` nodes are keyed by bare filename with no package
+  path, so only single-level relative imports (`from . import x`,
+  `from .sibling import y`) resolve to the right node.
 
 ## 5. Keeping the graph current
 
-There is no automatic re-indexing wired up yet (the watcher emits
-change events, but nothing currently consumes them to trigger a re-index).
-Re-run the relevant step-2 commands after a meaningful batch of changes —
-you don't need to do it after every single file edit, but a stale graph will
-give stale answers, so don't rely on it for anything time-sensitive without
-refreshing first.
+`devgraph add`/`rescan` do a full scan, and the watcher-to-indexer wiring
+now exists (`devgraph.agent.TrayApp`, `python -m devgraph.agent.tray`) — but
+the tray app is a separate always-on process most workflows won't have
+running, and there's no CLI subcommand for it yet (it's a standalone script
+entry point, not `devgraph <something>`). Without it running, nothing
+watches this repo live: re-run `devgraph rescan <repo_id>` after a
+meaningful batch of changes. A stale graph gives stale answers, so don't
+rely on it for anything time-sensitive without refreshing first.
 
 ## Non-negotiables when working with DevGraph from this repo
 

@@ -106,11 +106,13 @@ def process_batch(items: List[str]) -> None:
         )
         assert result[0]["count"] > 0, "DataService CONTAINS __init__ relationship not found"
 
-        # Note: IMPORTS relationships to external modules (like 'typing') won't appear
-        # in the graph query because the target Module node doesn't exist unless
-        # those modules are also indexed. The extractor correctly identifies imports,
-        # but GraphEngine.upsert_relationship requires both nodes to exist.
-        # This is the expected behavior for an incremental indexer.
+        # Note: IMPORTS relationships to external/stdlib modules (like 'typing')
+        # won't appear in the graph because no Module node exists for them
+        # (they aren't part of this repo). GraphEngine.upsert_relationship
+        # requires both endpoint nodes to exist. This is expected for
+        # absolute imports. Relative imports (from . import X) DO resolve to
+        # a same-repo Module node once that file is indexed too — see
+        # test_relative_import_edge_resolves_to_indexed_module below.
 
         print("Integration test passed: All nodes and relationships verified in Neo4j")
 
@@ -156,3 +158,38 @@ def test_index_file_creates_idempotent_nodes(graph_engine):
         # Cleanup
         graph_engine.delete_repository(repo_id)
         Path(file_path).unlink()
+
+
+def test_relative_import_edge_resolves_to_indexed_module(graph_engine):
+    """A relative import's IMPORTS edge must actually resolve to the sibling
+    Module node once both files are indexed — this is the fix for a bug
+    where relative-import targets (e.g. '.', '.helpers') never matched any
+    real Module node name, so find_related_files' imported_modules was
+    always empty regardless of what got indexed.
+    """
+    repo_id = "_smoketest_relative_imports"
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("from . import utils\n")
+        main_path = f.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def helper():\n    pass\n")
+        utils_path = f.name
+
+    try:
+        # Target node must exist before the IMPORTS edge is upserted —
+        # upsert_relationship MATCHes both endpoints rather than creating
+        # them, same as every other cross-file edge in this codebase.
+        graph_engine.upsert_node("Module", repo_id, "utils.py", {"type": "module"})
+        index_file(graph_engine, repo_id, main_path)
+
+        result = graph_engine.run_cypher(
+            "MATCH (m:Module {repo_id: $repo_id})-[:IMPORTS]->(u:Module {name: 'utils.py'}) "
+            "RETURN COUNT(*) as count",
+            {"repo_id": repo_id},
+        )
+        assert result[0]["count"] == 1, "Relative-import IMPORTS edge did not resolve to the sibling Module node"
+    finally:
+        graph_engine.delete_repository(repo_id)
+        Path(main_path).unlink()
+        Path(utils_path).unlink()

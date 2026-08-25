@@ -167,15 +167,40 @@ from ..parent import parent_module
 
     result = extract_python_file(source_code, "imports_module.py", "test_repo")
 
-    rel_tuples = {
-        (r.from_label, r.from_name, r.rel_type, r.to_label, r.to_name)
-        for r in result.relationships
-    }
-
     # Check that imports are captured (note: exact behavior depends on tree-sitter parsing)
     # We should have some IMPORTS relationships
     imports = [r for r in result.relationships if r.rel_type == "IMPORTS"]
     assert len(imports) > 0
+
+
+def test_relative_import_targets_resolve_to_module_filenames():
+    """IMPORTS targets for same-repo relative imports must match how Module
+    nodes are actually named (bare '<name>.py') so GraphEngine.upsert_relationship's
+    MATCH on both endpoints can find the target node — a prior version of
+    this extractor produced targets like '.' or '.helpers' that could never
+    match any Module node, so every same-repo IMPORTS edge silently failed
+    to materialize (find_related_files' imported_modules was always empty).
+    """
+    source_code = "from . import utils, helpers\nfrom .db import connect\n"
+    result = extract_python_file(source_code, "main.py", "test_repo")
+
+    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
+    assert "utils.py" in targets
+    assert "helpers.py" in targets
+    # 'connect' is a name inside db.py, not a module itself — target must be
+    # the sibling file db.py, not connect.py.
+    assert "db.py" in targets
+    assert "connect.py" not in targets
+
+
+def test_absolute_import_targets_are_bare_module_names():
+    """Absolute imports (stdlib/third-party/top-level) keep their bare name as
+    the target — they're expected not to resolve to a same-repo Module node,
+    unlike relative imports.
+    """
+    result = extract_python_file("import os\nimport requests\n", "main.py", "test_repo")
+    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
+    assert targets == {"os", "requests"}
 
 
 def test_all_nodes_scoped_to_repo():

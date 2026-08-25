@@ -139,9 +139,21 @@ def _extract_base_class_names(superclasses_node: Node | None, source: bytes) -> 
 def _extract_imports(root: Node, source: bytes) -> list[tuple[str, list[str]]]:
     """Extract import statements from the parse tree.
 
-    Returns a list of (module_name, [imported_names]) tuples.
-    For 'from X import Y', module_name='X' and imported_names=['Y'].
-    For 'import X', module_name='X' and imported_names=['X'].
+    Returns a list of (import_target, [imported_names]) tuples, where
+    import_target is the graph-node name IMPORTS should point at:
+
+    - 'import X' / 'import X as Y' -> target 'X' (bare module name; only
+      resolves to a same-repo Module node if some other file's Module node
+      happens to be named 'X' — usually it won't for a real package layout,
+      and that's correct: it genuinely isn't one of this repo's files).
+    - 'from X import Y' (X not relative) -> target 'X', same caveat as above.
+    - 'from . import Y' (bare relative, no named sibling module) -> target
+      is each imported name with '.py' appended: the imported names in this
+      form ARE the sibling module names (e.g. 'from . import utils' imports
+      the module 'utils', i.e. 'utils.py').
+    - 'from .pkg import Y' (relative with a named module) -> target is
+      'pkg.py': the module being imported from is the sibling file; Y is a
+      name *inside* it, not a module itself, so Y.py would be wrong.
     """
     imports: list[tuple[str, list[str]]] = []
 
@@ -163,6 +175,8 @@ def _extract_imports(root: Node, source: bytes) -> list[tuple[str, list[str]]]:
             # from X import Y [as Z][, ...] | from . import Y | from X import *
             module_node = node.child_by_field_name("module_name")
             module_name = _text(module_node, source) if module_node else ""
+            is_relative = module_name.startswith(".")
+
             imported_names: list[str] = []
             for child in node.named_children:
                 if child.type == "dotted_name" and child is not module_node:
@@ -171,11 +185,23 @@ def _extract_imports(root: Node, source: bytes) -> list[tuple[str, list[str]]]:
                     name_node = child.child_by_field_name("name")
                     alias_node = child.child_by_field_name("alias")
                     if name_node is not None:
-                        alias = _text(alias_node, source) if alias_node else _text(name_node, source)
-                        imported_names.append(alias)
+                        imported_names.append(_text(name_node, source))
                 elif child.type == "wildcard_import":
                     imported_names.append("*")
-            if module_name and imported_names:
+
+            if is_relative and module_name in (".", ""):
+                # 'from . import utils[, helpers]' — bare relative import:
+                # each imported name IS a sibling module (utils.py, helpers.py).
+                for name in imported_names:
+                    if name != "*":
+                        imports.append((f"{name}.py", [name]))
+            elif is_relative:
+                # 'from .pkg import Y[, Z]' — the sibling module is 'pkg'
+                # itself (Y/Z are names inside it, not modules).
+                sibling = module_name.lstrip(".")
+                if sibling:
+                    imports.append((f"{sibling}.py", imported_names))
+            elif module_name:
                 imports.append((module_name, imported_names))
 
         for child in node.children:

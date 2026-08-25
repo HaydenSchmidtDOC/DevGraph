@@ -173,6 +173,38 @@ class TestSummariseRepository:
         assert result["database_count"] >= 1  # MongoDb
         assert result["queue_count"] >= 1  # RabbitMQ
 
+    def test_summarise_repository_at_scale_does_not_hang(self, engine):
+        """Regression test: summarise_repository previously chained 9
+        OPTIONAL MATCHes on independent, unrelated label patterns in one
+        query. Neo4j computes their cartesian product before COUNT(DISTINCT)
+        collapses it — with hundreds of Function/Class nodes (a real repo's
+        scale, not this suite's tiny fixtures) that product exploded
+        combinatorially and the query genuinely hung indefinitely (confirmed
+        against a real ~1300-node repo). Seeds enough nodes here that the old
+        query would have taken far longer than this test's time budget.
+        """
+        import time
+
+        repo_id = "_smoketest_summarise_scale"
+        engine.upsert_repository(repo_id, "Scale Test", "/tmp/scale")
+        for i in range(150):
+            engine.upsert_node("Class", repo_id, f"Class{i}", {})
+        for i in range(300):
+            engine.upsert_node("Function", repo_id, f"func{i}", {})
+
+        try:
+            start = time.monotonic()
+            result = summarise_repository(engine, repo_id)
+            elapsed = time.monotonic() - start
+
+            assert result["class_count"] == 150
+            assert result["function_count"] == 300
+            # Generous bound: the cartesian-product version would take
+            # seconds-to-minutes at this scale; a correct query is near-instant.
+            assert elapsed < 5.0, f"summarise_repository took {elapsed:.2f}s — possible cartesian-product regression"
+        finally:
+            engine.delete_repository(repo_id)
+
 
 class TestCompareBranches:
     def test_compare_branches_stub(self, seeded_graph):
