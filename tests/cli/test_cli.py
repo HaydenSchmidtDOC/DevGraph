@@ -625,6 +625,32 @@ def test_cli_client_config_vscode_idempotent(runner, temp_registry_db, monkeypat
         assert first == second
 
 
+def test_cli_client_config_claude_skips_when_already_registered(runner, temp_registry_db):
+    """'client-config --target claude --run' must not fail when 'claude mcp add'
+    would error because the server is already registered (real observed
+    behavior: 'claude mcp add' exits 1, not 0, for an existing same-path
+    entry) -- check via 'claude mcp get' first and skip cleanly instead."""
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    def fake_run(cmd, **kwargs):
+        result = MagicMock()
+        if cmd[1:3] == ["mcp", "get"]:
+            result.returncode = 0  # already registered
+        else:
+            result.returncode = 1  # would fail if actually called
+        return result
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch("devgraph.cli.main.shutil.which", return_value="/usr/bin/claude"), \
+         patch("devgraph.cli.main.subprocess.run", side_effect=fake_run) as mock_run:
+        result = runner.invoke(app, ["client-config", "--target", "claude", "--run"])
+        assert result.exit_code == 0, f"stdout: {result.stdout}"
+        add_calls = [c for c in mock_run.call_args_list if "add" in c.args[0]]
+        assert not add_calls, "should not call 'claude mcp add' when already registered"
+
+
 def test_cli_client_config_invalid_target(runner, temp_registry_db):
     """An unrecognized --target value fails cleanly."""
     db_path, registry = temp_registry_db

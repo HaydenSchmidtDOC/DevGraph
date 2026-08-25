@@ -2,6 +2,34 @@
 
 DevGraph is a local-first developer knowledge graph platform. It builds and maintains a structured architecture graph (Neo4j) of explicitly-registered repositories — code structure, container/API/datastore topology, design intent, and git/PR/issue history — and exposes it to coding assistants through an MCP server. Instead of an AI re-reading source files on every request, it asks relationship/dependency/impact questions against a pre-built graph.
 
+## Quickstart
+
+Requires [Podman](https://podman.io/) and [Git](https://git-scm.com/) already
+installed (see your organization's software portal if Podman isn't
+approved/available yet). Run this from a PowerShell prompt:
+
+```powershell
+irm https://raw.githubusercontent.com/HaydenSchmidtDOC/DevGraph/master/scripts/install.ps1 | iex
+```
+
+This clones DevGraph, sets up its Python environment and Neo4j container,
+and walks you through an interactive menu to register it with whichever AI
+clients (Claude Code, VS Code) it finds on your machine. Nothing outside
+that one command is required to get a working MCP connection.
+
+Already have a local clone? Run `.\scripts\setup-menu.ps1` directly instead
+of the one-liner above — same result, no re-clone. `.\scripts\bootstrap.ps1`
+remains available for just the environment/Neo4j setup without the
+interactive client-registration menu.
+
+The one manual step the installer deliberately does not automate is
+registering a repository to index — DevGraph never scans anything you
+haven't explicitly pointed it at:
+
+```powershell
+devgraph add <path-to-a-git-repo>
+```
+
 ## Core design principles
 
 - **Explicit registration only.** DevGraph never scans, watches, or indexes a path that hasn't been explicitly registered (`devgraph add <path>`). No machine-wide or recursive discovery.

@@ -747,13 +747,21 @@ def client_config(
                 console.print("[red][X] Error:[/red] 'claude' not found on PATH; skipping Claude Code registration")
                 any_failed = True
             else:
-                console.print(f"\n[bold]Running:[/bold] {mcp_add_line}")
-                result = subprocess.run(
-                    [claude_path, "mcp", "add", "devgraph", "--", str(python_path), "-m", "devgraph.mcp.server"],
+                already_registered = subprocess.run(
+                    [claude_path, "mcp", "get", "devgraph"],
                     cwd=str(repo_root),
-                )
-                if result.returncode != 0:
-                    any_failed = True
+                    capture_output=True,
+                ).returncode == 0
+                if already_registered:
+                    console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
+                else:
+                    console.print(f"\n[bold]Running:[/bold] {mcp_add_line}")
+                    result = subprocess.run(
+                        [claude_path, "mcp", "add", "devgraph", "--", str(python_path), "-m", "devgraph.mcp.server"],
+                        cwd=str(repo_root),
+                    )
+                    if result.returncode != 0:
+                        any_failed = True
         if want_vscode:
             if not _register_vscode(python_path, repo_root):
                 any_failed = True
