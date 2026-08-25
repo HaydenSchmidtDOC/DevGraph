@@ -9,6 +9,7 @@ from rich.table import Table
 
 from devgraph.config import get_settings
 from devgraph.graph.engine import GraphEngine
+from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.registry.store import RepoRegistry
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
@@ -165,6 +166,66 @@ def watch(action: str, repo_id: str) -> None:
         raise
     except Exception as e:
         console.print(f"[red][X] Error:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def annotate(
+    repo_id: str,
+    docs_path: Optional[str] = typer.Option(
+        None, "--docs-path", help="Repo-relative path to the docs folder (e.g. 'devgraph/docs')."
+    ),
+    note: Optional[str] = typer.Option(
+        None, "--note", help="Index a single Markdown note file immediately (path relative to the repo root)."
+    ),
+) -> None:
+    """Configure or use Phase 2 doc annotations for a repository.
+
+    With --docs-path: register/update the repo's docs folder (registry-scoped
+    only — never a path outside the repo).
+    With --note: parse and upsert one Markdown note (Requirement /
+    DesignDecision / ArchitectureNote front-matter) into the graph immediately.
+    """
+    try:
+        registry = _get_registry()
+        try:
+            repo = registry.get(repo_id)
+            if not repo:
+                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                raise typer.Exit(code=1)
+
+            if docs_path is not None:
+                registry.set_docs_path(repo_id, docs_path)
+                console.print(f"[green][OK][/green] Docs path set for {repo_id}: {docs_path}")
+
+            if note is not None:
+                note_path = repo.path / note
+                if not str(note_path.resolve()).startswith(str(repo.path.resolve())):
+                    console.print("[red][X] Error:[/red] note path must be inside the repository")
+                    raise typer.Exit(code=1)
+
+                settings = get_settings()
+                engine = GraphEngine(
+                    settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password
+                )
+                try:
+                    engine.init_schema()
+                    index_doc_file(engine, repo_id, note_path)
+                    console.print(f"[green][OK][/green] Indexed note: {note}")
+                finally:
+                    engine.close()
+
+            if docs_path is None and note is None:
+                console.print(f"docs_path: {repo.docs_path or '(not set)'}")
+        finally:
+            registry.close()
+    except typer.Exit:
+        raise
+    except (ValueError, FileNotFoundError) as e:
+        console.print(f"[red][X] Error:[/red] {e}")
+        raise typer.Exit(code=1)
+    except Exception as e:
+        console.print(f"[red][X] Unexpected error:[/red] {e}")
         raise typer.Exit(code=1)
 
 

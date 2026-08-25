@@ -18,6 +18,10 @@ NODE_LABELS: tuple[str, ...] = (
     "Database",
     "VectorStore",
     "Queue",
+    # Phase 2 — human-authored intent, linked to the code graph.
+    "Requirement",
+    "DesignDecision",
+    "ArchitectureNote",
 )
 
 RELATIONSHIP_TYPES: tuple[str, ...] = (
@@ -31,6 +35,11 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
     "IMPLEMENTS",
     "DEPENDS_ON",
     "EXTENDS",
+    # Phase 2
+    "SATISFIES",
+    "DOCUMENTED_BY",
+    "DECIDED_BY",
+    "SUPERSEDES",
 )
 
 # Labels other than Repository must be uniquely keyed on (repo_id, name)

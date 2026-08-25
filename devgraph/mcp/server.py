@@ -23,6 +23,9 @@ from devgraph.mcp.tools import (
     impact_analysis,
     explain_architecture,
     list_services,
+    explain_decision,
+    find_requirements_for,
+    trace_design_rationale,
     run_cypher,
 )
 
@@ -236,6 +239,75 @@ TOOL_DEFINITIONS = [
             "required": ["repo_id"],
         },
     ),
+    Tool(
+        name="explain_decision",
+        description="Explain a design decision: its rationale, what it documents, and history (Phase 2)",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo_id": {
+                    "type": "string",
+                    "description": "Repository ID",
+                },
+                "decision_name": {
+                    "type": "string",
+                    "description": "Name (id) of the DesignDecision note",
+                },
+                "cross_repo": {
+                    "type": "boolean",
+                    "description": "If true, search across repos (default: false)",
+                    "default": False,
+                },
+            },
+            "required": ["repo_id", "decision_name"],
+        },
+    ),
+    Tool(
+        name="find_requirements_for",
+        description="Find requirements a component satisfies (Phase 2)",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo_id": {
+                    "type": "string",
+                    "description": "Repository ID",
+                },
+                "component_name": {
+                    "type": "string",
+                    "description": "Name of the component",
+                },
+                "cross_repo": {
+                    "type": "boolean",
+                    "description": "If true, search across repos (default: false)",
+                    "default": False,
+                },
+            },
+            "required": ["repo_id", "component_name"],
+        },
+    ),
+    Tool(
+        name="trace_design_rationale",
+        description="Trace the design rationale (decisions, notes, requirements) behind a component (Phase 2)",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo_id": {
+                    "type": "string",
+                    "description": "Repository ID",
+                },
+                "component_name": {
+                    "type": "string",
+                    "description": "Name of the component",
+                },
+                "cross_repo": {
+                    "type": "boolean",
+                    "description": "If true, search across repos (default: false)",
+                    "default": False,
+                },
+            },
+            "required": ["repo_id", "component_name"],
+        },
+    ),
 ]
 
 # run_cypher is only registered if enable_run_cypher is True
@@ -355,6 +427,27 @@ class DevGraphMCPServer:
                 result = list_services(
                     self.engine,
                     arguments["repo_id"],
+                    arguments.get("cross_repo", False),
+                )
+            elif name == "explain_decision":
+                result = explain_decision(
+                    self.engine,
+                    arguments["repo_id"],
+                    arguments["decision_name"],
+                    arguments.get("cross_repo", False),
+                )
+            elif name == "find_requirements_for":
+                result = find_requirements_for(
+                    self.engine,
+                    arguments["repo_id"],
+                    arguments["component_name"],
+                    arguments.get("cross_repo", False),
+                )
+            elif name == "trace_design_rationale":
+                result = trace_design_rationale(
+                    self.engine,
+                    arguments["repo_id"],
+                    arguments["component_name"],
                     arguments.get("cross_repo", False),
                 )
             elif name == "run_cypher":

@@ -218,3 +218,37 @@ def test_cli_status(runner, temp_registry_db, temp_git_repo):
         assert "Registered Repositories" in result.stdout
         # Just check that total is present (may vary due to other tests)
         assert "Total:" in result.stdout
+
+
+def test_cli_annotate_set_docs_path(runner, temp_git_repo, temp_registry_db):
+    """Test 'devgraph annotate --docs-path' command."""
+    db_path, registry = temp_registry_db
+
+    repo_record = registry.add_repo(temp_git_repo)
+    repo_id = repo_record.repo_id
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["annotate", repo_id, "--docs-path", "devgraph/docs"])
+        assert result.exit_code == 0, f"stdout: {result.stdout}"
+        assert "Docs path set" in result.stdout
+
+        result = runner.invoke(app, ["annotate", repo_id])
+        assert result.exit_code == 0
+        assert "devgraph/docs" in result.stdout
+
+
+def test_cli_annotate_nonexistent_repo(runner, temp_registry_db):
+    """Test 'devgraph annotate' with non-existent repo."""
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["annotate", "nonexistent", "--docs-path", "docs"])
+        assert result.exit_code == 1
+        assert "Error" in result.stdout

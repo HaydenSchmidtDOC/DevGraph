@@ -395,6 +395,118 @@ def list_services(
     return results
 
 
+def explain_decision(
+    engine: GraphEngine,
+    repo_id: str,
+    decision_name: str,
+    cross_repo: bool = False,
+) -> dict[str, Any]:
+    """Explain a design decision: its rationale, what it documents, and history.
+
+    Args:
+        engine: GraphEngine instance
+        repo_id: Repository ID
+        decision_name: Name (id) of the DesignDecision note
+        cross_repo: If True, search across repos
+
+    Returns:
+        Dict with the decision's properties, what it documents, what it
+        supersedes, and any ArchitectureNote it's backed by.
+    """
+    repo_filter = "" if cross_repo else "WHERE d.repo_id = $repo_id"
+    cypher = f"""
+    MATCH (d:DesignDecision {{name: $decision_name}})
+    {repo_filter}
+    OPTIONAL MATCH (doc)-[:DOCUMENTED_BY]->(d)
+    OPTIONAL MATCH (d)-[:SUPERSEDES]->(prior:DesignDecision)
+    OPTIONAL MATCH (d)-[:DECIDED_BY]->(note:ArchitectureNote)
+    RETURN d.name as name, d.title as title, d.body as body,
+           COLLECT(DISTINCT doc.name) as documents,
+           COLLECT(DISTINCT prior.name) as supersedes,
+           COLLECT(DISTINCT note.name) as backed_by
+    """
+    params = {"decision_name": decision_name}
+    if not cross_repo:
+        params["repo_id"] = repo_id
+
+    results = engine.run_cypher(cypher, params)
+    if results:
+        return results[0]
+    return {"name": decision_name, "title": None, "body": None, "documents": [], "supersedes": [], "backed_by": []}
+
+
+def find_requirements_for(
+    engine: GraphEngine,
+    repo_id: str,
+    component_name: str,
+    cross_repo: bool = False,
+) -> list[dict[str, Any]]:
+    """Find requirements a component (Module/Service/etc.) satisfies.
+
+    Args:
+        engine: GraphEngine instance
+        repo_id: Repository ID
+        component_name: Name of the component
+        cross_repo: If True, search across repos
+
+    Returns:
+        List of Requirement notes satisfied by this component
+    """
+    repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
+    cypher = f"""
+    MATCH (n {{name: $component_name}})-[:SATISFIES]->(r:Requirement)
+    WHERE true
+    {repo_filter}
+    RETURN r.name as name, r.title as title, r.body as body
+    ORDER BY r.name
+    """
+    params = {"component_name": component_name}
+    if not cross_repo:
+        params["repo_id"] = repo_id
+
+    results = engine.run_cypher(cypher, params)
+    return results
+
+
+def trace_design_rationale(
+    engine: GraphEngine,
+    repo_id: str,
+    component_name: str,
+    cross_repo: bool = False,
+) -> dict[str, Any]:
+    """Trace the design rationale (decisions, notes, requirements) behind a component.
+
+    Args:
+        engine: GraphEngine instance
+        repo_id: Repository ID
+        component_name: Name of the component (Module/Service/Class/etc.)
+        cross_repo: If True, search across repos
+
+    Returns:
+        Dict grouping every Requirement/DesignDecision/ArchitectureNote linked
+        to this component via SATISFIES or DOCUMENTED_BY.
+    """
+    repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
+    cypher = f"""
+    MATCH (n {{name: $component_name}})
+    WHERE true
+    {repo_filter}
+    OPTIONAL MATCH (n)-[:SATISFIES]->(req:Requirement)
+    OPTIONAL MATCH (n)-[:DOCUMENTED_BY]->(doc)
+    RETURN n.name as component,
+           COLLECT(DISTINCT {{name: req.name, title: req.title}}) as requirements,
+           COLLECT(DISTINCT {{name: doc.name, title: doc.title, type: labels(doc)[0]}}) as notes
+    """
+    params = {"component_name": component_name}
+    if not cross_repo:
+        params["repo_id"] = repo_id
+
+    results = engine.run_cypher(cypher, params)
+    if results:
+        return results[0]
+    return {"component": component_name, "requirements": [], "notes": []}
+
+
 def run_cypher(
     engine: GraphEngine,
     query: str,
