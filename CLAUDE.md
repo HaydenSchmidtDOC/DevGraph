@@ -24,6 +24,18 @@ Git is initialized locally; no remote is configured yet. Container runtime is **
 
 - `Blueprints/` — numbered design docs for planned/completed work. `Design Brief #1.md` is the current source of truth for target architecture (principles, graph schema, MCP tool surface, roadmap phases). Check here before proposing new architecture; add new numbered briefs for major design changes rather than rewriting history in place.
 - Root-level `CLAUDE.md` / `AGENTS.md` — working agreement and agent-facing instructions for this repo specifically.
+- `devgraph/` — the Phase 1 implementation:
+  - `config/` — Pydantic settings, all security defaults off (telemetry, cloud sync, cross-repo, run_cypher).
+  - `registry/` — SQLite-backed repo allowlist (`RepoRegistry`). The only source of truth for which paths may be watched/indexed.
+  - `graph/` — `GraphEngine` (Neo4j driver, idempotent MERGE upserts, schema constraints) and `schema.py` (canonical node labels / relationship types — import from here, don't hardcode label strings elsewhere).
+  - `indexer/python/` — AST-based Python extractor (**note**: uses stdlib `ast`, not Tree-sitter as the Implementation Plan specifies — open deviation, see git log on the Phase 1 commit).
+  - `indexer/containers/`, `indexer/apis/`, `indexer/datastores/` — Podman Compose, FastAPI/Flask/Django route, and datastore-client-usage extractors.
+  - `watcher/` — `WatcherManager`, registry-scoped-only file/git watching with debounce.
+  - `mcp/` — the 10 high-level MCP tools (`tools.py`) plus server wiring (`server.py`); `run_cypher` gated behind `enable_run_cypher` config.
+  - `cli/` — Typer CLI (`devgraph add/remove/list/watch/rescan/status`).
+  - `agent/` — `TrayApp` (pystray), the thin shell wiring watcher + Neo4j health together.
+- `tests/` — mirrors `devgraph/` structure; 88 tests as of Phase 1, run via `.venv/Scripts/python -m pytest`.
+- `deploy/podman-compose.yml` — declarative form of DevGraph's isolated Neo4j container (needs a compose provider; `podman run` form in Commands above needs none).
 
 ## Core design principles (from the Design Brief — hold these as constraints, not suggestions)
 
