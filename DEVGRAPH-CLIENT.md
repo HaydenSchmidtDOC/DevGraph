@@ -33,10 +33,11 @@ needs to know to use it.
 
 DevGraph builds a queryable graph of a repo's structure — modules, classes,
 functions, containers, API endpoints, datastores, design decisions,
-requirements, and git history — and exposes it through 18 MCP tools
+requirements, and git history — and exposes it through 18 always-on MCP tools
 (`search_component`, `find_callers`, `impact_analysis`,
 `impact_analysis_for_diff`, `explain_architecture`, `blame_component`,
-`find_requirements_for`, `get_source`, etc.).
+`find_requirements_for`, `get_source`, etc.), plus the opt-in `run_cypher`
+escape hatch (19 total when enabled).
 Once a repo is registered and indexed, an AI assistant can answer questions
 like "what depends on this module" or "why was this decision made" by
 querying the graph directly, instead of grepping/reading the whole tree
@@ -209,8 +210,10 @@ Prefer these over re-reading files when the question is structural:
 | "What calls X, but only from within class Y?" | `find_callers` with `scope_to_class=Y` (cuts noise from unrelated same-named methods elsewhere in the repo) |
 | "What breaks if I change X?" | `impact_analysis` (name, not path) |
 | "What breaks across this whole PR/diff?" | `impact_analysis_for_diff` (base_ref/head_ref, both must exist locally — never fetches) |
-| "What does X depend on?" | `get_service_dependencies`, `find_related_files` (name, not path) |
+| "What does X depend on?" | `get_service_dependencies` (service name), `find_related_files` (function/class name, not path) |
+| "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name) |
 | "What's the overall architecture?" | `explain_architecture`, `summarise_repository` |
+| "What changed between two branches?" | `compare_branches` — **stub**: registered and callable, but not yet fully wired to git metadata; treat results as unreliable until DevGraph's own docs say otherwise |
 | "Why was X built this way?" | `explain_decision`, `trace_design_rationale` |
 | "What requirements does X satisfy?" | `find_requirements_for` |
 | "Who changed X and when?" | `blame_component` (file path, not name) |
