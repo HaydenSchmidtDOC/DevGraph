@@ -4,7 +4,7 @@ Local-first developer knowledge graph platform. Builds and maintains a structure
 
 ## Status
 
-Phases 1-3 complete and verified: registry, graph engine, Tree-sitter Python indexer, container/API/datastore extractors, watcher, CLI, tray app (Phase 1); Requirements/DesignDecisions/ArchitectureNotes docs extractor (Phase 2); git history + opt-in PR/issue ingestion (Phase 3). 16 MCP tools total across the three phases. Phase 4 (enterprise federation) is intentionally design-only/optional — see `Blueprints/Design Brief #2.md` — and should not be implemented without a fresh design pass informed by real multi-developer usage. Treat claims about specific extractors/tools as complete only once their code and tests actually land — check `devgraph/` before assuming a component works.
+Phases 1-3 complete and verified: registry, graph engine, Tree-sitter Python indexer, container/API/datastore extractors, watcher, CLI, tray app (Phase 1); Requirements/DesignDecisions/ArchitectureNotes docs extractor (Phase 2); git history + opt-in PR/issue ingestion (Phase 3). 16 MCP tools total across the three phases, reachable over a real stdio transport (`devgraph/mcp/server.py`, built on `mcp.server.mcpserver.MCPServer`) — see [DEVGRAPH-CLIENT.md](DEVGRAPH-CLIENT.md) for how another repo's Claude Code instance connects to it and uses it day-to-day. Phase 4 (enterprise federation) is intentionally design-only/optional — see `Blueprints/Design Brief #2.md` — and should not be implemented without a fresh design pass informed by real multi-developer usage. Treat claims about specific extractors/tools as complete only once their code and tests actually land — check `devgraph/` before assuming a component works.
 
 Git is initialized locally; no remote is configured yet. Container runtime is **Podman** (not Docker) — see the Design Brief and Implementation Plan.
 
@@ -37,8 +37,9 @@ Git is initialized locally; no remote is configured yet. Container runtime is **
   - `mcp/` — the 16 high-level MCP tools (`tools.py`, including Phase 2's `explain_decision`/`find_requirements_for`/`trace_design_rationale` and Phase 3's `blame_component`/`find_related_prs`/`issue_history_for`) plus server wiring (`server.py`); `run_cypher` gated behind `enable_run_cypher` config.
   - `cli/` — Typer CLI (`devgraph add/remove/list/watch/rescan/status/annotate/index-history/pr-source/issue-source`). `annotate` sets a repo's `docs_path` and/or indexes a single note file; `index-history` walks git log incrementally; `pr-source`/`issue-source` flip the opt-in registry flags only (never make a network call themselves).
   - `agent/` — `TrayApp` (pystray), the thin shell wiring watcher + Neo4j health together.
-- `tests/` — mirrors `devgraph/` structure; 149 tests as of Phase 3, run via `.venv/Scripts/python -m pytest`.
+- `tests/` — mirrors `devgraph/` structure; 154 tests as of the MCP server rewrite, run via `.venv/Scripts/python -m pytest`.
 - `deploy/podman-compose.yml` — declarative form of DevGraph's isolated Neo4j container (needs a compose provider; `podman run` form in Commands above needs none).
+- `DEVGRAPH-CLIENT.md` — a portable doc meant to be copied into (or summarized into) *another* repo's own `CLAUDE.md`/`AGENTS.md`, so a Claude Code instance working there knows how to register that repo with this DevGraph instance and use its MCP tools. Keep it in sync when the CLI/MCP surface changes — it duplicates just enough (paths, commands, tool list) to be self-contained for a reader who has never seen this repo before.
 
 ## Core design principles (from the Design Brief — hold these as constraints, not suggestions)
 
