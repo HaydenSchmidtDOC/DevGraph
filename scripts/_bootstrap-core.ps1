@@ -25,7 +25,7 @@ function Invoke-BootstrapCore {
     if (Test-Path (Join-Path $RepoRoot ".venv")) {
         Write-Ok ".venv already exists, reusing"
     } else {
-        python -m venv (Join-Path $RepoRoot ".venv")
+        python -m venv (Join-Path $RepoRoot ".venv") | Out-Host
         if ($LASTEXITCODE -ne 0) { Write-Fail "python -m venv failed"; return $false }
         Write-Ok ".venv created"
     }
@@ -33,7 +33,7 @@ function Invoke-BootstrapCore {
 
     # Editable install
     Write-Step "Installing devgraph (editable, with dev deps)"
-    & $venvPython -m pip install -e "$RepoRoot[dev]"
+    & $venvPython -m pip install -e "$RepoRoot[dev]" | Out-Host
     if ($LASTEXITCODE -ne 0) { Write-Fail "pip install failed"; return $false }
     Write-Ok "install complete"
 
@@ -86,13 +86,13 @@ function Invoke-BootstrapCore {
 
     # Schema init
     Write-Step "Initializing schema"
-    & $venvPython -c "from devgraph.graph.engine import GraphEngine; e = GraphEngine('bolt://127.0.0.1:7687', 'neo4j', 'devgraph-local-dev'); e.init_schema(); e.close()"
+    & $venvPython -c "from devgraph.graph.engine import GraphEngine; e = GraphEngine('bolt://127.0.0.1:7687', 'neo4j', 'devgraph-local-dev'); e.init_schema(); e.close()" | Out-Host
     if ($LASTEXITCODE -ne 0) { Write-Fail "schema init failed"; return $false }
     Write-Ok "schema initialized"
 
     # Final verification
     Write-Step "Running devgraph doctor"
-    & $venvPython -m devgraph.cli.main doctor
+    & $venvPython -m devgraph.cli.main doctor | Out-Host
     $doctorExit = $LASTEXITCODE
 
     if ($doctorExit -ne 0) {
