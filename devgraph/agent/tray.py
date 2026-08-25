@@ -1,23 +1,30 @@
-"""DevGraph tray app: the always-on shell around watcher + Neo4j health.
+"""DevGraph tray app: the always-on shell around watcher + incremental indexing
++ Neo4j health.
 
 A thin shell per the Implementation Plan — it owns startup/shutdown wiring
-and surfaces health via the tray icon, but the registry/watcher/graph/MCP
+and surfaces health via the tray icon, but the registry/watcher/graph
 components underneath are what do the real work. No filesystem path is ever
 touched here directly; everything routes through RepoRegistry/WatcherManager.
+
+Does NOT run the MCP server: DevGraph's MCP server uses the stdio transport
+(devgraph/mcp/server.py), which is inherently 1:1 with a single client's
+stdin/stdout — an MCP client (e.g. Claude Code) spawns that process itself
+per DEVGRAPH-CLIENT.md, rather than the tray app hosting a shared server
+process. The tray app's job is keeping the graph itself current.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-import time
-from io import BytesIO
+from pathlib import Path
 
 import pystray
 from PIL import Image, ImageDraw
 
 from devgraph.config import get_settings
 from devgraph.graph.engine import GraphEngine
+from devgraph.indexer.dispatch import index_paths, remove_paths
 from devgraph.registry.store import RepoRegistry
 from devgraph.watcher.manager import WatcherManager
 
@@ -53,8 +60,28 @@ class TrayApp:
         self._stop_event = threading.Event()
         self._icon: pystray.Icon | None = None
 
-    def _on_changes(self, repo_id: str, changed_paths: set) -> None:
-        logger.info("changes detected for %s: %d file(s)", repo_id, len(changed_paths))
+    def _on_changes(self, repo_id: str, changed_paths: set[Path], deleted_paths: set[Path]) -> None:
+        """Route watcher events to the indexer. This is the piece that closes the
+        "developer saves file -> graph refreshed" loop from the Design Brief —
+        previously the watcher only logged changes and nothing consumed them.
+        """
+        logger.info(
+            "changes detected for %s: %d changed, %d deleted",
+            repo_id,
+            len(changed_paths),
+            len(deleted_paths),
+        )
+        repo = self._registry.get(repo_id)
+        if repo is None:
+            return  # repo was removed between the event firing and now
+        try:
+            if changed_paths:
+                index_paths(self._engine, repo_id, repo.path, changed_paths, docs_path=repo.docs_path)
+            if deleted_paths:
+                remove_paths(self._engine, repo_id, repo.path, deleted_paths)
+            self._registry.mark_indexed(repo_id)
+        except Exception:
+            logger.warning("incremental reindex failed for %s", repo_id, exc_info=True)
 
     def _health_check_loop(self) -> None:
         while not self._stop_event.is_set():

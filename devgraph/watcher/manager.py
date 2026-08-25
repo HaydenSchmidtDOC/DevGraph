@@ -13,7 +13,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable
 
-from watchdog.events import FileModifiedEvent, FileSystemEventHandler
+from watchdog.events import FileDeletedEvent, FileModifiedEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from devgraph.config import get_settings
@@ -26,20 +26,21 @@ class WatcherManager:
     """Manages file watchers for active, watch-enabled repositories.
 
     Only watches paths explicitly registered in RepoRegistry.
-    Collects file change events over a debounce window and invokes a callback
-    with the repo_id and set of changed paths.
+    Collects file change/deletion events over a debounce window and invokes
+    a callback with the repo_id, changed paths, and deleted paths.
     """
 
     def __init__(
         self,
         registry: RepoRegistry,
-        on_changes: Callable[[str, set[Path]], None],
+        on_changes: Callable[[str, set[Path], set[Path]], None],
     ) -> None:
         """Initialize the watcher manager.
 
         Args:
             registry: RepoRegistry instance to read allowed repos from.
-            on_changes: Callback(repo_id, changed_paths) invoked when debounce interval elapses.
+            on_changes: Callback(repo_id, changed_paths, deleted_paths)
+                invoked when the debounce interval elapses.
         """
         self._registry = registry
         self._on_changes = on_changes
@@ -127,13 +128,14 @@ class _RepoEventHandler(FileSystemEventHandler):
         repo_id: str,
         repo_root: Path,
         debounce_ms: int,
-        on_changes: Callable[[str, set[Path]], None],
+        on_changes: Callable[[str, set[Path], set[Path]], None],
     ) -> None:
         self._repo_id = repo_id
         self._repo_root = repo_root
         self._debounce_ms = debounce_ms
         self._on_changes = on_changes
         self._changed_paths: set[Path] = set()
+        self._deleted_paths: set[Path] = set()
         self._debounce_timer: threading.Timer | None = None
         self._lock = threading.Lock()
 
@@ -147,7 +149,19 @@ class _RepoEventHandler(FileSystemEventHandler):
         if self._is_tracked_path(event_path):
             with self._lock:
                 self._changed_paths.add(event_path)
+                self._deleted_paths.discard(event_path)
                 self._reset_debounce()
+
+    def on_deleted(self, event: FileDeletedEvent) -> None:
+        """Record file deletion and set debounce timer."""
+        if event.is_directory:
+            return
+
+        event_path = Path(event.src_path)
+        with self._lock:
+            self._deleted_paths.add(event_path)
+            self._changed_paths.discard(event_path)
+            self._reset_debounce()
 
     def _is_tracked_path(self, path: Path) -> bool:
         """Check if this path should be tracked.
@@ -175,11 +189,13 @@ class _RepoEventHandler(FileSystemEventHandler):
         self._debounce_timer.start()
 
     def _fire_changes(self) -> None:
-        """Invoke the callback with collected changes."""
+        """Invoke the callback with collected changes and deletions."""
         with self._lock:
-            if self._changed_paths:
-                paths_copy = self._changed_paths.copy()
+            if self._changed_paths or self._deleted_paths:
+                changed_copy = self._changed_paths.copy()
+                deleted_copy = self._deleted_paths.copy()
                 self._changed_paths.clear()
+                self._deleted_paths.clear()
                 self._debounce_timer = None
                 # Invoke callback outside lock to avoid deadlock
-                self._on_changes(self._repo_id, paths_copy)
+                self._on_changes(self._repo_id, changed_copy, deleted_copy)

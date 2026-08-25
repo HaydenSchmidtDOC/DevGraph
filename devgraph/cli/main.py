@@ -9,6 +9,7 @@ from rich.table import Table
 
 from devgraph.config import get_settings
 from devgraph.graph.engine import GraphEngine
+from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import index_repo_history
 from devgraph.registry.store import RepoRegistry
@@ -25,7 +26,7 @@ def _get_registry() -> RepoRegistry:
 
 @app.command()
 def add(path: str) -> None:
-    """Register a repository for DevGraph indexing.
+    """Register a repository and run its initial full scan.
 
     Args:
         path: Absolute or relative path to a git repository.
@@ -37,6 +38,26 @@ def add(path: str) -> None:
             console.print(
                 f"[green][OK][/green] Registered: {record.repo_id} at {record.path}"
             )
+
+            try:
+                settings = get_settings()
+                engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+                try:
+                    engine.init_schema()
+                    engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
+                    count = full_scan(engine, record.repo_id, record.path, docs_path=record.docs_path)
+                    registry.mark_indexed(record.repo_id)
+                    console.print(f"[green][OK][/green] Indexed {count} file(s)")
+                finally:
+                    engine.close()
+            except Exception as e:
+                # Registration already succeeded (SQLite committed above) — an
+                # indexing failure (e.g. Neo4j unreachable) shouldn't undo that.
+                # `devgraph rescan <repo_id>` retries the scan once Neo4j is up.
+                console.print(
+                    f"[yellow]Registered but initial scan failed:[/yellow] {e}\n"
+                    f"  Run 'devgraph rescan {record.repo_id}' once Neo4j is reachable."
+                )
         finally:
             registry.close()
     except ValueError as e:
@@ -109,9 +130,11 @@ def list() -> None:
 
 @app.command()
 def rescan(repo_id: str) -> None:
-    """Trigger a rescan of a repository.
+    """Run a full re-index of a registered repository.
 
-    This is a placeholder: the indexer wiring is handled separately.
+    Walks every file under the repo's root and re-runs every extractor that
+    recognizes it (Python, docs, containers, APIs, datastores). Idempotent —
+    safe to run repeatedly; existing nodes are updated in place via MERGE.
 
     Args:
         repo_id: The repository ID to rescan.
@@ -119,13 +142,21 @@ def rescan(repo_id: str) -> None:
     try:
         registry = _get_registry()
         try:
-            # Verify the repo exists
             repo = registry.get(repo_id)
             if not repo:
                 console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
                 raise typer.Exit(code=1)
 
-            console.print(f"[green][OK][/green] Rescan queued for {repo_id}")
+            settings = get_settings()
+            engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+            try:
+                engine.init_schema()
+                engine.upsert_repository(repo_id, repo_id, str(repo.path))
+                count = full_scan(engine, repo_id, repo.path, docs_path=repo.docs_path)
+                registry.mark_indexed(repo_id)
+                console.print(f"[green][OK][/green] Rescanned {repo_id}: {count} file(s) indexed")
+            finally:
+                engine.close()
         finally:
             registry.close()
     except typer.Exit:

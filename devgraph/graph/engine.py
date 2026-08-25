@@ -73,6 +73,24 @@ class GraphEngine:
                 to_name=to_name,
             )
 
+    def delete_nodes_by_source_file(self, repo_id: str, file_name: str) -> None:
+        """Remove every node whose provenance property names this file, scoped to repo_id.
+
+        Extractors record provenance under one of three property keys
+        depending on which one wrote the node (source_file/file/source —
+        an inconsistency inherited from how each extractor was built
+        independently; matching all three here rather than picking one is
+        the honest fix until they're unified onto a single property name).
+        """
+        with self._driver.session() as session:
+            session.run(
+                "MATCH (n {repo_id: $repo_id}) "
+                "WHERE n.source_file = $file_name OR n.file = $file_name OR n.source = $file_name "
+                "DETACH DELETE n",
+                repo_id=repo_id,
+                file_name=file_name,
+            )
+
     def delete_repository(self, repo_id: str) -> None:
         """Remove every node (and its relationships) scoped to this repo_id."""
         with self._driver.session() as session:

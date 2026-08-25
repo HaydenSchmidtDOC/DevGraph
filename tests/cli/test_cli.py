@@ -43,6 +43,23 @@ def runner():
     return CliRunner()
 
 
+@pytest.fixture
+def require_neo4j():
+    """Skip the test if the local devgraph-neo4j instance isn't reachable.
+
+    add/rescan now run a real indexing scan against Neo4j, unlike before.
+    """
+    from devgraph.graph.engine import GraphEngine
+
+    engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
+    try:
+        engine.verify_connectivity()
+    except Exception as e:
+        pytest.skip(f"Neo4j not available: {e}")
+    finally:
+        engine.close()
+
+
 @pytest.fixture(autouse=True)
 def _block_real_registry(monkeypatch, tmp_path):
     """Safety net: any CLI invocation that forgets to patch get_settings falls
@@ -73,15 +90,27 @@ def _block_real_registry(monkeypatch, tmp_path):
 
 
 def _mock_settings(db_path):
-    """Create a mock settings object."""
+    """Create a mock settings object pointed at the real test Neo4j instance.
+
+    add/rescan now run a real indexing scan, so they need a genuinely
+    reachable Neo4j — same instance every other live-Neo4j test in this repo
+    uses. Tests that want an unreachable instance (e.g. status's failure
+    path) override neo4j_uri/user/password after calling this.
+    """
     settings = MagicMock()
     settings.registry_db_path = db_path
+    settings.neo4j_uri = "bolt://127.0.0.1:7687"
+    settings.neo4j_user = "neo4j"
+    settings.neo4j_password = "devgraph-local-dev"
+    settings.enable_run_cypher = False
     return settings
 
 
-def test_cli_add_repo(runner, temp_git_repo, temp_registry_db):
-    """Test 'devgraph add' command."""
+def test_cli_add_repo(runner, temp_git_repo, temp_registry_db, require_neo4j):
+    """Test 'devgraph add' command — now runs a real initial scan."""
     db_path, registry = temp_registry_db
+
+    (temp_git_repo / "module.py").write_text("class Foo:\n    pass\n")
 
     from devgraph.cli import main as cli_main
 
@@ -91,6 +120,24 @@ def test_cli_add_repo(runner, temp_git_repo, temp_registry_db):
         result = runner.invoke(app, ["add", str(temp_git_repo)])
         assert result.exit_code == 0, f"stdout: {result.stdout}"
         assert "Registered" in result.stdout
+        assert "Indexed" in result.stdout
+
+    from devgraph.graph.engine import GraphEngine
+    from devgraph.registry.store import RepoRegistry
+
+    verify_registry = RepoRegistry(db_path)
+    repo_id = verify_registry.list_repos()[0].repo_id
+    verify_registry.close()
+
+    engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
+    try:
+        found = engine.run_cypher(
+            "MATCH (n {repo_id: $repo_id}) RETURN COUNT(*) as c", {"repo_id": repo_id}
+        )
+        assert found[0]["c"] > 0
+    finally:
+        engine.delete_repository(repo_id)
+        engine.close()
 
 
 def test_cli_add_nonexistent_path(runner, temp_registry_db):
@@ -204,9 +251,11 @@ def test_cli_watch_disable(runner, temp_git_repo, temp_registry_db):
         assert "Watch disabled" in result.stdout
 
 
-def test_cli_rescan_repo(runner, temp_git_repo, temp_registry_db):
-    """Test 'devgraph rescan' command."""
+def test_cli_rescan_repo(runner, temp_git_repo, temp_registry_db, require_neo4j):
+    """Test 'devgraph rescan' command — now runs a real full scan."""
     db_path, registry = temp_registry_db
+
+    (temp_git_repo / "module.py").write_text("class Bar:\n    pass\n")
 
     repo_record = registry.add_repo(temp_git_repo)
     repo_id = repo_record.repo_id
@@ -219,7 +268,19 @@ def test_cli_rescan_repo(runner, temp_git_repo, temp_registry_db):
          patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
         result = runner.invoke(app, ["rescan", repo_id])
         assert result.exit_code == 0, f"stdout: {result.stdout}"
-        assert "Rescan queued" in result.stdout
+        assert "Rescanned" in result.stdout
+
+    from devgraph.graph.engine import GraphEngine
+
+    engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
+    try:
+        found = engine.run_cypher(
+            "MATCH (c:Class {repo_id: $repo_id, name: 'Bar'}) RETURN COUNT(*) as c", {"repo_id": repo_id}
+        )
+        assert found[0]["c"] == 1
+    finally:
+        engine.delete_repository(repo_id)
+        engine.close()
 
 
 def test_cli_rescan_nonexistent_repo(runner, temp_registry_db):

@@ -48,7 +48,7 @@ def test_watcher_manager_collects_changes(temp_registry_db, temp_git_repo):
     # Set up callback collection
     changes_collected = {}
 
-    def on_changes(repo_id: str, paths: set[Path]) -> None:
+    def on_changes(repo_id: str, paths: set[Path], deleted: set[Path]) -> None:
         changes_collected[repo_id] = paths
 
     # Create watcher with short debounce
@@ -86,7 +86,7 @@ def test_watcher_manager_respects_watch_enabled(temp_registry_db, temp_git_repo)
 
     changes_collected = {}
 
-    def on_changes(repo_id: str, paths: set[Path]) -> None:
+    def on_changes(repo_id: str, paths: set[Path], deleted: set[Path]) -> None:
         changes_collected[repo_id] = paths
 
     watcher = WatcherManager(registry, on_changes)
@@ -115,7 +115,7 @@ def test_watcher_manager_refresh(temp_registry_db, temp_git_repo):
 
     changes_collected = {}
 
-    def on_changes(repo_id: str, paths: set[Path]) -> None:
+    def on_changes(repo_id: str, paths: set[Path], deleted: set[Path]) -> None:
         changes_collected[repo_id] = paths
 
     watcher = WatcherManager(registry, on_changes)
@@ -161,10 +161,39 @@ def test_watcher_manager_refresh(temp_registry_db, temp_git_repo):
         watcher.stop()
 
 
+def test_watcher_manager_collects_deletions(temp_registry_db, temp_git_repo):
+    """Test that WatcherManager reports deleted files separately from changed ones."""
+    registry = temp_registry_db
+    repo_record = registry.add_repo(temp_git_repo)
+
+    test_file = temp_git_repo / "to_delete.txt"
+    test_file.write_text("hello")
+
+    deletions_collected = {}
+
+    def on_changes(repo_id: str, paths: set[Path], deleted: set[Path]) -> None:
+        if deleted:
+            deletions_collected[repo_id] = deleted
+
+    watcher = WatcherManager(registry, on_changes)
+    watcher.start()
+
+    try:
+        time.sleep(0.5)  # let the initial create settle before deleting
+        test_file.unlink()
+        time.sleep(1.0)
+
+        assert repo_record.repo_id in deletions_collected
+        resolved_deleted = {p.resolve() for p in deletions_collected[repo_record.repo_id]}
+        assert test_file.resolve() in resolved_deleted
+    finally:
+        watcher.stop()
+
+
 def test_watcher_manager_never_accepts_raw_paths(temp_registry_db, temp_git_repo):
     """Security test: verify WatcherManager has no method accepting raw paths."""
 
-    def dummy_callback(repo_id: str, paths: set[Path]) -> None:
+    def dummy_callback(repo_id: str, paths: set[Path], deleted: set[Path]) -> None:
         pass
 
     watcher = WatcherManager(temp_registry_db, dummy_callback)
