@@ -28,7 +28,7 @@ Git is initialized locally; no remote is configured yet. Container runtime is **
   - `config/` — Pydantic settings, all security defaults off (telemetry, cloud sync, cross-repo, run_cypher).
   - `registry/` — SQLite-backed repo allowlist (`RepoRegistry`). The only source of truth for which paths may be watched/indexed.
   - `graph/` — `GraphEngine` (Neo4j driver, idempotent MERGE upserts, schema constraints) and `schema.py` (canonical node labels / relationship types — import from here, don't hardcode label strings elsewhere).
-  - `indexer/python/` — AST-based Python extractor (**note**: uses stdlib `ast`, not Tree-sitter as the Implementation Plan specifies — open deviation, see git log on the Phase 1 commit).
+  - `indexer/python/` — Tree-sitter-based Python extractor (`tree-sitter` + `tree-sitter-python`), per the Implementation Plan.
   - `indexer/containers/`, `indexer/apis/`, `indexer/datastores/` — Podman Compose, FastAPI/Flask/Django route, and datastore-client-usage extractors.
   - `watcher/` — `WatcherManager`, registry-scoped-only file/git watching with debounce.
   - `mcp/` — the 10 high-level MCP tools (`tools.py`) plus server wiring (`server.py`); `run_cypher` gated behind `enable_run_cypher` config.
