@@ -224,3 +224,120 @@ def my_function():
     # All relationships should have the provided repo_id
     for rel in result.relationships:
         assert rel.repo_id == repo_id
+
+
+def test_calls_edge_for_bare_function_call():
+    """A bare call inside a function body produces a CALLS edge to the target."""
+    source_code = """
+def helper():
+    pass
+
+def caller():
+    helper()
+"""
+    result = extract_python_file(source_code, "x.py", "test_repo")
+    calls = {(r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}
+    assert ("caller", "helper") in calls
+
+
+def test_calls_edge_for_method_call_via_self():
+    """self.method()/obj.method() resolves to the method's simple name — this
+    extractor has no type info, so it links by name, not by resolved type.
+    """
+    source_code = """
+class Service:
+    def process(self):
+        self.helper()
+
+    def helper(self):
+        pass
+"""
+    result = extract_python_file(source_code, "x.py", "test_repo")
+    calls = {(r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}
+    assert ("process", "helper") in calls
+
+
+def test_calls_edge_attributed_to_correct_nested_scope():
+    """A call inside a nested function is attributed to the nested function,
+    not hoisted to the enclosing one.
+    """
+    source_code = """
+def outer():
+    def inner():
+        deep_call()
+    outer_call()
+"""
+    result = extract_python_file(source_code, "x.py", "test_repo")
+    calls = {(r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}
+    assert ("inner", "deep_call") in calls
+    assert ("outer", "outer_call") in calls
+    assert ("outer", "deep_call") not in calls
+
+
+def test_calls_edge_at_module_level():
+    """A call made outside any function (top-level script code) is
+    attributed to the Module."""
+    source_code = """
+def setup():
+    pass
+
+setup()
+"""
+    result = extract_python_file(source_code, "script.py", "test_repo")
+    calls = {(r.from_label, r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}
+    assert ("Module", "script.py", "setup") in calls
+
+
+def test_from_import_names_exclude_the_module_name():
+    """Regression test: tree_sitter's Python bindings return a fresh Node
+    wrapper on every child_by_field_name() call, so `child is module_node`
+    never matches even for the same underlying tree node — this silently
+    corrupted every from-import's name list ('from typing import List'
+    produced imported_names=['typing', 'List'] instead of ['List']) since
+    the original Tree-sitter migration. Fixed by comparing byte spans.
+    """
+    result = extract_python_file("from typing import List\n", "x.py", "test_repo")
+    imports_rels = [r for r in result.relationships if r.rel_type == "IMPORTS"]
+    # Exactly one edge (one imported name), not two (module name duplicated in).
+    assert len(imports_rels) == 1
+
+
+def test_dotted_absolute_import_resolves_to_same_repo_file_path():
+    """'from services.api_gateway.clients import Foo' — a same-repo absolute
+    dotted import (the common real-world style, not dot-relative) — must
+    ALSO emit a same-repo-file-path target so it can resolve to the actual
+    Module node, alongside the original bare-dotted-name target kept for
+    compatibility. Confirmed necessary: RAG4 (a real ~1300-node repo) uses
+    this style exclusively and had zero resolvable same-repo IMPORTS edges
+    before this fix.
+    """
+    result = extract_python_file(
+        "from services.api_gateway.clients import Foo\n", "services/api_gateway/main.py", "test_repo"
+    )
+    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
+    assert "services.api_gateway.clients" in targets  # kept for compatibility
+    assert "services/api_gateway/clients.py" in targets  # new: resolvable target
+
+
+def test_dotted_import_statement_also_resolves():
+    """Same guess applies to bare 'import X.Y.Z' (not just from-imports)."""
+    result = extract_python_file("import shared.utils\n", "app.py", "test_repo")
+    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
+    assert "shared/utils.py" in targets
+
+
+def test_single_segment_import_has_no_extra_file_guess():
+    """A bare single-word import ('import os') shouldn't gain an extra
+    file-path guess — there's no dotted structure to reinterpret.
+    """
+    result = extract_python_file("import os\n", "app.py", "test_repo")
+    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
+    assert targets == {"os"}
+
+
+def test_calls_targets_are_function_label():
+    source_code = "def a():\n    b()\ndef b():\n    pass\n"
+    result = extract_python_file(source_code, "x.py", "test_repo")
+    calls_rel = next(r for r in result.relationships if r.rel_type == "CALLS")
+    assert calls_rel.to_label == "Function"
+    assert calls_rel.from_label == "Function"

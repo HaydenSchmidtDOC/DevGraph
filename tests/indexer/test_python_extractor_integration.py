@@ -193,3 +193,78 @@ def test_relative_import_edge_resolves_to_indexed_module(graph_engine):
         graph_engine.delete_repository(repo_id)
         Path(main_path).unlink()
         Path(utils_path).unlink()
+
+
+def test_calls_edges_make_find_callers_work_end_to_end(graph_engine):
+    """CALLS edges must actually resolve so find_callers/impact_analysis
+    (previously always empty — no CALLS extraction existed at all) work
+    against real indexed data, not just in extractor-unit isolation.
+    """
+    from devgraph.mcp.tools import find_callers, impact_analysis
+
+    repo_id = "_smoketest_calls_edges"
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(
+            "def helper():\n"
+            "    pass\n"
+            "\n"
+            "def caller_one():\n"
+            "    helper()\n"
+            "\n"
+            "class Service:\n"
+            "    def process(self):\n"
+            "        self.helper_method()\n"
+            "\n"
+            "    def helper_method(self):\n"
+            "        pass\n"
+        )
+        file_path = f.name
+
+    try:
+        index_file(graph_engine, repo_id, file_path)
+
+        callers = find_callers(graph_engine, repo_id, "helper")
+        caller_names = {c["name"] for c in callers}
+        assert "caller_one" in caller_names
+
+        callers_method = find_callers(graph_engine, repo_id, "helper_method")
+        assert any(c["name"] == "process" for c in callers_method)
+
+        impact = impact_analysis(graph_engine, repo_id, "helper")
+        dependent_names = {d["name"] for d in impact["direct_dependents"]}
+        assert "caller_one" in dependent_names
+    finally:
+        graph_engine.delete_repository(repo_id)
+        Path(file_path).unlink()
+
+
+def test_dotted_absolute_import_edge_resolves_end_to_end(graph_engine):
+    """A same-repo absolute dotted import ('from services.api_gateway.clients
+    import X') must actually link to the real Module node once both files
+    are indexed with repo_root-relative paths — this is the fix for RAG4
+    (real repo, absolute-dotted-import style exclusively) having zero
+    resolvable same-repo IMPORTS edges.
+    """
+    repo_id = "_smoketest_dotted_absolute_import"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_root = Path(tmpdir)
+        (repo_root / "services" / "api_gateway").mkdir(parents=True)
+        (repo_root / "services" / "api_gateway" / "clients.py").write_text("class Client:\n    pass\n")
+        main_path = repo_root / "services" / "api_gateway" / "main.py"
+        main_path.write_text("from services.api_gateway.clients import Client\n")
+
+        try:
+            index_file(graph_engine, repo_id, repo_root / "services" / "api_gateway" / "clients.py", repo_root=repo_root)
+            index_file(graph_engine, repo_id, main_path, repo_root=repo_root)
+
+            result = graph_engine.run_cypher(
+                "MATCH (m:Module {repo_id: $repo_id, name: 'services/api_gateway/main.py'})"
+                "-[:IMPORTS]->(t:Module {name: 'services/api_gateway/clients.py'}) "
+                "RETURN COUNT(*) as count",
+                {"repo_id": repo_id},
+            )
+            assert result[0]["count"] == 1
+        finally:
+            graph_engine.delete_repository(repo_id)

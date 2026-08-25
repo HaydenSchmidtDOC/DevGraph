@@ -85,3 +85,41 @@ def test_index_repo_history_end_to_end(graph_engine, temp_git_repo, registry):
 def test_index_repo_history_unknown_repo_raises(graph_engine, registry):
     with pytest.raises(ValueError):
         index_repo_history(graph_engine, registry, "nonexistent")
+
+
+def test_modifies_edge_resolves_for_nested_file(graph_engine, registry):
+    """MODIFIES targets must be the full repo-relative path (matching how
+    Module nodes are keyed since the multi-level relative-import fix), not
+    bare filename — otherwise a commit touching a nested file's MODIFIES
+    edge silently never resolves (blame_component would come back empty for
+    every file except ones at the repo root).
+    """
+    from devgraph.indexer.python.extractor import index_file
+
+    repo_id = "_smoketest_git_history_nested"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_path = Path(tmpdir)
+        _run_git(repo_path, "init")
+        _run_git(repo_path, "config", "user.email", "test@example.com")
+        _run_git(repo_path, "config", "user.name", "Test Author")
+
+        (repo_path / "services" / "api").mkdir(parents=True)
+        nested_file = repo_path / "services" / "api" / "main.py"
+        nested_file.write_text("x = 1\n")
+        _run_git(repo_path, "add", "services/api/main.py")
+        _run_git(repo_path, "commit", "-m", "Add nested main.py")
+
+        record = registry.add_repo(repo_path, repo_id=repo_id)
+
+        try:
+            index_file(graph_engine, record.repo_id, nested_file, repo_root=repo_path)
+            index_repo_history(graph_engine, registry, record.repo_id)
+
+            result = graph_engine.run_cypher(
+                "MATCH (c:Commit {repo_id: $repo_id})-[:MODIFIES]->"
+                "(m:Module {name: 'services/api/main.py'}) RETURN COUNT(*) as count",
+                {"repo_id": record.repo_id},
+            )
+            assert result[0]["count"] == 1
+        finally:
+            graph_engine.delete_repository(record.repo_id)

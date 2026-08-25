@@ -102,7 +102,12 @@ class GitHistoryExtractor:
                 )
 
                 for changed_path in _changed_paths(commit):
-                    module_name = Path(changed_path).name
+                    # git already reports paths relative to the repo root
+                    # with forward slashes — this must match how Module
+                    # nodes are keyed (python/extractor.py's index_file:
+                    # repo-relative path, not bare filename) or MODIFIES
+                    # edges silently fail to resolve for any nested file.
+                    module_name = changed_path
                     result.relationships.append(
                         Relationship(
                             source_label="Commit",
