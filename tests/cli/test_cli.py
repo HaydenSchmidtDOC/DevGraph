@@ -43,6 +43,35 @@ def runner():
     return CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _block_real_registry(monkeypatch, tmp_path):
+    """Safety net: any CLI invocation that forgets to patch get_settings falls
+    back to an empty throwaway registry instead of the developer's real
+    ~/.devgraph/registry.sqlite3. A previous version of this suite leaked
+    tmp* repo entries into the real registry because cli.main imports
+    get_settings directly (its own reference, separate from
+    devgraph.config.get_settings) — patching only the config module's copy
+    silently missed it.
+
+    Implemented as a default, not a hard replacement: tests still call
+    `patch.object(..., "get_settings", return_value=...)` to point at their
+    own temp registry, and unittest.mock.patch restores whatever was here
+    (including this fallback) on __exit__. So this only takes effect for a
+    test that forgets to patch entirely — it never fights a test's own patch.
+    """
+    fallback = _mock_settings(tmp_path / "unused-fallback-registry.db")
+
+    def _fallback_get_settings():
+        return fallback
+
+    _fallback_get_settings.cache_clear = lambda: None  # tests call this defensively
+
+    from devgraph.cli import main as cli_main
+
+    monkeypatch.setattr(cli_main, "get_settings", _fallback_get_settings)
+    monkeypatch.setattr(config_module, "get_settings", _fallback_get_settings)
+
+
 def _mock_settings(db_path):
     """Create a mock settings object."""
     settings = MagicMock()
@@ -54,8 +83,11 @@ def test_cli_add_repo(runner, temp_git_repo, temp_registry_db):
     """Test 'devgraph add' command."""
     db_path, registry = temp_registry_db
 
+    from devgraph.cli import main as cli_main
+
     config_module.get_settings.cache_clear()
-    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
         result = runner.invoke(app, ["add", str(temp_git_repo)])
         assert result.exit_code == 0, f"stdout: {result.stdout}"
         assert "Registered" in result.stdout
@@ -92,8 +124,11 @@ def test_cli_list_repos(runner, temp_git_repo, temp_registry_db):
     repo_id = repo_record.repo_id
     registry.close()  # Close so CLI can open its own connection
 
+    from devgraph.cli import main as cli_main
+
     config_module.get_settings.cache_clear()
-    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
         result = runner.invoke(app, ["list"])
         assert result.exit_code == 0
         # The table should contain our repo
@@ -205,13 +240,16 @@ def test_cli_status(runner, temp_registry_db, temp_git_repo):
     registry.add_repo(temp_git_repo)
     registry.close()
 
+    from devgraph.cli import main as cli_main
+
     config_module.get_settings.cache_clear()
     settings = _mock_settings(db_path)
     settings.neo4j_uri = "bolt://127.0.0.1:9999"
     settings.neo4j_user = "neo4j"
     settings.neo4j_password = "wrong"
 
-    with patch.object(config_module, "get_settings", return_value=settings):
+    with patch.object(config_module, "get_settings", return_value=settings), \
+         patch.object(cli_main, "get_settings", return_value=settings):
         result = runner.invoke(app, ["status"])
         # Should exit successfully even if Neo4j is unreachable
         assert result.exit_code == 0
