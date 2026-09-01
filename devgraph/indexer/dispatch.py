@@ -27,15 +27,16 @@ from devgraph.indexer.python.extractor import index_file as index_python_file
 _COMPOSE_NAMES = {"docker-compose.yml", "docker-compose.yaml", "podman-compose.yml", "podman-compose.yaml", "compose.yml", "compose.yaml"}
 _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
 
-# Mirrors this project's own .gitignore: directories no full_scan should ever
-# walk into. Without this, `devgraph add` on any Python repo with a local
-# venv indexes thousands of third-party dependency files from .venv/site-packages
-# alongside the repo's actual ~dozens of source files.
-_IGNORED_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "build", "dist", ".pytest_cache", ".devgraph"}
+# Mirrors this project's own .gitignore: directories no full_scan (and, via
+# devgraph.watcher.manager, no live watch) should ever walk into. Without
+# this, `devgraph add` on any Python repo with a local venv indexes thousands
+# of third-party dependency files from .venv/site-packages alongside the
+# repo's actual ~dozens of source files.
+IGNORED_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "build", "dist", ".pytest_cache", ".devgraph"}
 
 
-def _is_ignored(path: Path) -> bool:
-    return any(part in _IGNORED_DIR_NAMES or part.endswith(".egg-info") for part in path.parts)
+def is_ignored_path(path: Path) -> bool:
+    return any(part in IGNORED_DIR_NAMES or part.endswith(".egg-info") for part in path.parts)
 
 
 def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None) -> int:
@@ -215,7 +216,7 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
 
 def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str | None = None) -> int:
     """Walk every file under repo_root and index it, skipping VCS/build/venv noise. Used by `devgraph add`/`rescan`."""
-    all_files = {p for p in repo_root.rglob("*") if p.is_file() and not _is_ignored(p)}
+    all_files = {p for p in repo_root.rglob("*") if p.is_file() and not is_ignored_path(p)}
     return index_paths(engine, repo_id, repo_root, all_files, docs_path=docs_path)
 
 

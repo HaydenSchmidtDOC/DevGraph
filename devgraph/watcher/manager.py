@@ -23,6 +23,7 @@ from watchdog.events import (
 from watchdog.observers import Observer
 
 from devgraph.config import get_settings
+from devgraph.indexer.dispatch import is_ignored_path
 from devgraph.registry.store import RepoRegistry, RepoRecord
 
 logger = logging.getLogger(__name__)
@@ -105,7 +106,20 @@ class WatcherManager:
             self._on_changes,
         )
         observer = Observer()
-        observer.schedule(handler, str(repo.path), recursive=True)
+        # Don't hand watchdog a single recursive watch on repo.path: that
+        # puts every file under .venv/.git/build/etc under OS-level
+        # notification too, alongside the repo's actual (much smaller)
+        # source tree. On Windows in particular, a directory that busy can
+        # overflow ReadDirectoryChangesW's notification buffer, which
+        # silently drops ALL pending events for the watch -- including ones
+        # for real source edits -- so the graph looks "live" but quietly
+        # stops picking up changes. Watch the root non-recursively (for
+        # root-level files) plus each non-ignored top-level subdirectory
+        # recursively, mirroring full_scan's IGNORED_DIR_NAMES exclusions.
+        observer.schedule(handler, str(repo.path), recursive=False)
+        for child in repo.path.iterdir():
+            if child.is_dir() and not is_ignored_path(child.relative_to(repo.path)):
+                observer.schedule(handler, str(child), recursive=True)
         observer.start()
 
         self._observers[repo.repo_id] = observer
@@ -221,15 +235,23 @@ class _RepoEventHandler(FileSystemEventHandler):
     def _is_tracked_path(self, path: Path) -> bool:
         """Check if this path should be tracked.
 
-        Tracks regular files and git state indicators (.git/HEAD, .git/refs/...).
+        Tracks regular files, except those under an ignored directory
+        (.venv, __pycache__, build, ...) that nests inside an otherwise-
+        watched top-level directory -- the per-child exclusion in
+        WatcherManager._start_single only keeps top-level ignored dirs out
+        of the OS watch, so this is the backstop for ignored dirs deeper in
+        the tree (e.g. some_package/build/).
         """
         try:
-            # Always track regular files
-            if path.is_file():
-                return True
+            if not path.is_file():
+                return False
         except OSError:
-            pass
-        return False
+            return False
+        try:
+            rel = path.resolve().relative_to(self._repo_root.resolve())
+        except (OSError, ValueError):
+            return True
+        return not is_ignored_path(rel)
 
     def _reset_debounce(self) -> None:
         """Reset the debounce timer. Must hold _lock."""
