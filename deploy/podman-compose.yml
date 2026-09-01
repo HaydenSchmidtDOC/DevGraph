@@ -14,6 +14,7 @@ services:
   devgraph-neo4j:
     image: docker.io/library/neo4j:5.26-community
     container_name: devgraph-neo4j
+    restart: always
     ports:
       - "127.0.0.1:7474:7474" # HTTP browser UI
       - "127.0.0.1:7687:7687" # Bolt protocol

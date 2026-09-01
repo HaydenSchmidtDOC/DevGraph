@@ -51,7 +51,7 @@ function Invoke-BootstrapCore {
             Write-Ok "started"
         } else {
             Write-Host "  container does not exist, creating it"
-            & $PodmanPath run -d --name devgraph-neo4j `
+            & $PodmanPath run -d --name devgraph-neo4j --restart=always `
                 -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 `
                 -e NEO4J_AUTH=neo4j/devgraph-local-dev `
                 -v devgraph_neo4j_data:/data -v devgraph_neo4j_logs:/logs `
