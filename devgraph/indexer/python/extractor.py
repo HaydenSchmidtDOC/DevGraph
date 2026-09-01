@@ -700,18 +700,5 @@ def index_file(
 
     result = extract_python_file(source_code, module_name, repo_id)
 
-    # Upsert all nodes.
-    for node in result.nodes:
-        engine.upsert_node(node.label, node.repo_id, node.name, node.properties)
-
-    # Upsert all relationships.
-    for rel in result.relationships:
-        engine.upsert_relationship(
-            rel.from_label,
-            rel.from_name,
-            rel.rel_type,
-            rel.to_label,
-            rel.to_name,
-            rel.repo_id,
-            properties=rel.properties,
-        )
+    engine.upsert_nodes([node.to_dict() for node in result.nodes])
+    engine.upsert_relationships([rel.to_dict() for rel in result.relationships])

@@ -181,15 +181,20 @@ def index_file(engine, repo_id: str, file_path: str | Path) -> None:
     content = file_path.read_text(encoding="utf-8")
     result = DocsExtractor(repo_id).extract_from_source(content, file_path.name)
 
-    for doc in result.docs:
-        engine.upsert_node(doc.label, doc.repo_id, doc.name, doc.properties)
-
-    for rel in result.relationships:
-        engine.upsert_relationship(
-            rel.source_label,
-            rel.source_name,
-            rel.relationship_type,
-            rel.target_label,
-            rel.target_name,
-            repo_id,
-        )
+    engine.upsert_nodes(
+        [{"label": doc.label, "repo_id": doc.repo_id, "name": doc.name, "properties": doc.properties} for doc in result.docs]
+    )
+    engine.upsert_relationships(
+        [
+            {
+                "from_label": rel.source_label,
+                "from_name": rel.source_name,
+                "rel_type": rel.relationship_type,
+                "to_label": rel.target_label,
+                "to_name": rel.target_name,
+                "repo_id": repo_id,
+                "properties": {},
+            }
+            for rel in result.relationships
+        ]
+    )

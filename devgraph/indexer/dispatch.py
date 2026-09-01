@@ -22,7 +22,7 @@ from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.containers.extractor import ContainerExtractor
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
-from devgraph.indexer.python.extractor import index_file as index_python_file
+from devgraph.indexer.python.extractor import extract_python_file
 
 _COMPOSE_NAMES = {"docker-compose.yml", "docker-compose.yaml", "podman-compose.yml", "podman-compose.yaml", "compose.yml", "compose.yaml"}
 _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
@@ -59,6 +59,9 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     indexed = 0
     docs_root = (repo_root / docs_path).resolve() if docs_path else None
     py_files: list[tuple[str, str]] = []  # (rel_path, content), for the cross-link pass below
+    # (rel_path -> (node dicts, rel dicts)) from pass 1's extraction, reused
+    # by pass 2 so it re-upserts without re-parsing the file a second time.
+    py_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     paths = _expand_with_reverse_dependents(engine, repo_id, repo_root, paths)
 
@@ -77,17 +80,30 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         rel_path = resolved.relative_to(repo_root.resolve()).as_posix()
 
         if resolved.suffix == ".py":
-            # Prune this file's previously-indexed nodes before re-extracting,
-            # not just MERGE-upsert the current contents: a Function/Class
-            # removed from the file (edited, not deleted) would otherwise
-            # survive in the graph forever, since MERGE only ever adds/
-            # updates matching nodes, never removes ones the current source
-            # no longer produces. Safe to do unconditionally — index_python_file
-            # immediately re-upserts everything still present, including the
-            # Module node itself, via the same repo-relative key.
-            engine.delete_nodes_by_source_file(repo_id, rel_path)
-            index_python_file(engine, repo_id, resolved, repo_root=repo_root)
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+            result = extract_python_file(content, rel_path, repo_id)
+            nodes = [n.to_dict() for n in result.nodes]
+            rels = [r.to_dict() for r in result.relationships]
+            # Delete this file's previously-indexed nodes and write the
+            # freshly-extracted ones in one transaction, not just
+            # MERGE-upsert the current contents: a Function/Class removed
+            # from the file (edited, not deleted) would otherwise survive in
+            # the graph forever, since MERGE only ever adds/updates matching
+            # nodes, never removes ones the current source no longer
+            # produces. One transaction also means a reader never observes
+            # this file's nodes as gone-but-not-yet-rebuilt.
+            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
             indexed += 1
+
+            # Datastore/API extraction reads the same content, so it runs
+            # alongside the Python indexer rather than as a separate dispatch
+            # branch. Passed the repo-relative path (not bare filename) so
+            # their 'source'/'file' provenance properties match what
+            # delete_nodes_by_source_file looks up on file deletion.
+            _index_datastores(engine, repo_id, rel_path, content)
+            _index_apis(engine, repo_id, rel_path, content)
+            py_files.append((rel_path, content))
+            py_extractions[rel_path] = (nodes, rels)
         elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
             index_doc_file(engine, repo_id, resolved)
             indexed += 1
@@ -98,38 +114,37 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             _index_compose_file(engine, repo_id, resolved)
             indexed += 1
 
-        # Datastore/API extraction reads the same .py files already routed
-        # above, so it runs alongside the Python indexer rather than as a
-        # separate dispatch branch. Passed the repo-relative path (not bare
-        # filename) so their 'source'/'file' provenance properties match
-        # what delete_nodes_by_source_file looks up on file deletion.
-        if resolved.suffix == ".py":
-            content = resolved.read_text(encoding="utf-8", errors="replace")
-            _index_datastores(engine, repo_id, rel_path, content)
-            _index_apis(engine, repo_id, rel_path, content)
-            py_files.append((rel_path, content))
-
-    # Second pass: re-run the Python extractor (no re-prune) over every .py
-    # file in this batch. Batch iteration order is unspecified (paths is a
-    # set), so a CALLS/IMPORTS edge from file X to file Y within the SAME
-    # batch can silently fail to materialize on the first pass if X happens
-    # to be processed before Y — upsert_relationship only MATCH-MATCHes
-    # existing endpoint nodes, it doesn't create them, so Y's node isn't
-    # there yet when X's edges are upserted. Re-indexing (not re-pruning)
-    # every file a second time is idempotent (see
-    # test_index_file_creates_idempotent_nodes) and guarantees every node
-    # in the batch exists before every file's edges are attempted at least
-    # once, regardless of first-pass order.
+    # Second pass: re-upsert every .py file's already-extracted nodes/edges
+    # (no re-parse, no re-prune). Batch iteration order is unspecified (paths
+    # is a set), so a CALLS/IMPORTS edge from file X to file Y within the
+    # SAME batch can silently fail to materialize on the first pass if X
+    # happens to be processed before Y — upsert_relationships only
+    # MATCH-MATCHes existing endpoint nodes, it doesn't create them, so Y's
+    # node isn't there yet when X's edges are upserted. Re-upserting (not
+    # re-pruning) every file's cached extraction a second time is idempotent
+    # (see test_index_file_creates_idempotent_nodes) and guarantees every
+    # node in the batch exists before every file's edges are attempted at
+    # least once, regardless of first-pass order.
     for rel_path, _content in py_files:
-        index_python_file(engine, repo_id, repo_root / rel_path, repo_root=repo_root)
+        nodes, rels = py_extractions[rel_path]
+        engine.upsert_nodes(nodes)
+        engine.upsert_relationships(rels)
 
     # Service cross-linking runs as a final pass, after every file in this
     # batch (including any compose file) has been indexed — Service nodes'
     # build_context properties must already be in the graph for this to find
     # anything, and paths/a compose file can be indexed in any order within
-    # one batch (set iteration has no guaranteed order).
-    for rel_path, content in py_files:
-        _link_to_owning_service(engine, repo_id, rel_path, content)
+    # one batch (set iteration has no guaranteed order). The Service/
+    # build_context lookup is loaded once for the whole batch rather than
+    # once per file, since it can't have changed mid-batch (Services are
+    # only written by the Containerfile/compose branches above, already run
+    # by this point).
+    if py_files:
+        services = _load_services_with_build_context(engine, repo_id)
+        service_rels: list[dict] = []
+        for rel_path, content in py_files:
+            service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
+        engine.upsert_relationships(service_rels)
 
     return indexed
 
@@ -232,30 +247,78 @@ def _index_compose_file(engine: GraphEngine, repo_id: str, path: Path) -> None:
     _upsert_container_result(engine, repo_id, result)
 
 
+def _relationship_dict(rel, repo_id: str) -> dict:
+    """Canonical upsert_relationships dict from any extractor's
+    source_label/source_name/relationship_type/target_label/target_name
+    Relationship dataclass shape (docs/apis/containers/datastores all share
+    it, distinct from the python extractor's from_/to_/rel_type naming)."""
+    return {
+        "from_label": rel.source_label,
+        "from_name": rel.source_name,
+        "rel_type": rel.relationship_type,
+        "to_label": rel.target_label,
+        "to_name": rel.target_name,
+        "repo_id": repo_id,
+        "properties": getattr(rel, "properties", None) or {},
+    }
+
+
 def _upsert_container_result(engine: GraphEngine, repo_id: str, result) -> None:
-    for container in result.containers:
-        engine.upsert_node("Container", repo_id, container.name, {**container.properties, "image": container.image})
-    for service in result.services:
-        engine.upsert_node("Service", repo_id, service.name, service.properties)
-    for rel in result.relationships:
-        engine.upsert_relationship(
-            rel.source_label, rel.source_name, rel.relationship_type, rel.target_label, rel.target_name, repo_id
-        )
+    nodes = [
+        {"label": "Container", "repo_id": repo_id, "name": c.name, "properties": {**c.properties, "image": c.image}}
+        for c in result.containers
+    ] + [
+        {"label": "Service", "repo_id": repo_id, "name": s.name, "properties": s.properties}
+        for s in result.services
+    ]
+    engine.upsert_nodes(nodes)
+    engine.upsert_relationships([_relationship_dict(rel, repo_id) for rel in result.relationships])
 
 
 def _index_datastores(engine: GraphEngine, repo_id: str, rel_path: str, content: str) -> None:
     result = DatastoreExtractor(repo_id).extract_from_source(content, rel_path)
-    for ds in result.datastores:
-        engine.upsert_node(ds.datastore_type, repo_id, ds.name, ds.properties)
-    for rel in result.relationships:
-        engine.upsert_relationship(
-            rel.source_label, rel.source_name, rel.relationship_type, rel.target_label, rel.target_name, repo_id
-        )
+    nodes = [{"label": ds.datastore_type, "repo_id": repo_id, "name": ds.name, "properties": ds.properties} for ds in result.datastores]
+    engine.upsert_nodes(nodes)
+    engine.upsert_relationships([_relationship_dict(rel, repo_id) for rel in result.relationships])
 
 
-def _link_to_owning_service(engine: GraphEngine, repo_id: str, rel_path: str, content: str) -> None:
-    """Link this file's Database/VectorStore/Queue and Endpoint nodes back to
-    the compose Service that owns it, via directory containment.
+def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict[str, str]:
+    """{Service name -> build_context} for every repo Service that has one.
+
+    Loaded once per index_paths batch (not once per file) since Services are
+    only written earlier in the same batch by the Containerfile/compose
+    branches, so the set can't change again mid-batch.
+    """
+    results = engine.run_cypher(
+        "MATCH (s:Service {repo_id: $repo_id}) "
+        "WHERE s.build_context IS NOT NULL "
+        "RETURN s.name as name, s.build_context as build_context",
+        {"repo_id": repo_id},
+    )
+    return {row["name"]: row["build_context"] for row in results}
+
+
+def _match_owning_service(services: dict[str, str], rel_path: str) -> str | None:
+    """Find the Service whose build_context is the longest prefix of rel_path's directory."""
+    file_dir = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
+
+    best_match: str | None = None
+    best_match_len = -1
+    for name, context in services.items():
+        if file_dir == context or file_dir.startswith(context + "/"):
+            if len(context) > best_match_len:
+                best_match = name
+                best_match_len = len(context)
+
+    return best_match
+
+
+def _owning_service_relationships(
+    repo_id: str, rel_path: str, content: str, services: dict[str, str]
+) -> list[dict]:
+    """USES/CALLS relationship dicts linking this file's Database/
+    VectorStore/Queue and Endpoint nodes back to the compose Service that
+    owns it, via directory containment.
 
     Closes the previously-documented gap where the container extractor
     (compose-derived Service nodes) and the datastore/API extractors
@@ -267,51 +330,52 @@ def _link_to_owning_service(engine: GraphEngine, repo_id: str, rel_path: str, co
     prefix wins, so a service at 'services/api' isn't shadowed by an
     unrelated top-level Service with no build_context.
     """
-    owning_service = _find_owning_service(engine, repo_id, rel_path)
+    owning_service = _match_owning_service(services, rel_path)
     if owning_service is None:
-        return
+        return []
+
+    rels: list[dict] = []
 
     datastore_result = DatastoreExtractor(repo_id).extract_from_source(content, rel_path)
     for ds in datastore_result.datastores:
-        engine.upsert_relationship("Service", owning_service, "USES", ds.datastore_type, ds.name, repo_id)
+        rels.append(
+            {
+                "from_label": "Service",
+                "from_name": owning_service,
+                "rel_type": "USES",
+                "to_label": ds.datastore_type,
+                "to_name": ds.name,
+                "repo_id": repo_id,
+                "properties": {},
+            }
+        )
 
     api_result = APIExtractor(repo_id).extract_from_source(content, rel_path)
     for endpoint in api_result.endpoints:
         endpoint_id = f"{endpoint.method} {endpoint.path}"
-        engine.upsert_relationship("Endpoint", endpoint_id, "CALLS", "Service", owning_service, repo_id)
+        rels.append(
+            {
+                "from_label": "Endpoint",
+                "from_name": endpoint_id,
+                "rel_type": "CALLS",
+                "to_label": "Service",
+                "to_name": owning_service,
+                "repo_id": repo_id,
+                "properties": {},
+            }
+        )
 
-
-def _find_owning_service(engine: GraphEngine, repo_id: str, rel_path: str) -> str | None:
-    """Find the Service whose build_context is the longest prefix of rel_path's directory."""
-    file_dir = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
-
-    results = engine.run_cypher(
-        "MATCH (s:Service {repo_id: $repo_id}) "
-        "WHERE s.build_context IS NOT NULL "
-        "RETURN s.name as name, s.build_context as build_context",
-        {"repo_id": repo_id},
-    )
-
-    best_match: str | None = None
-    best_match_len = -1
-    for row in results:
-        context = row["build_context"]
-        if file_dir == context or file_dir.startswith(context + "/"):
-            if len(context) > best_match_len:
-                best_match = row["name"]
-                best_match_len = len(context)
-
-    return best_match
+    return rels
 
 
 def _index_apis(engine: GraphEngine, repo_id: str, rel_path: str, content: str) -> None:
     result = APIExtractor(repo_id).extract_from_source(content, rel_path)
-    for endpoint in result.endpoints:
-        endpoint_id = f"{endpoint.method} {endpoint.path}"
-        engine.upsert_node("Endpoint", repo_id, endpoint_id, endpoint.properties)
-    for func in result.functions:
-        engine.upsert_node("Function", repo_id, func.name, func.properties)
-    for rel in result.relationships:
-        engine.upsert_relationship(
-            rel.source_label, rel.source_name, rel.relationship_type, rel.target_label, rel.target_name, repo_id
-        )
+    nodes = [
+        {"label": "Endpoint", "repo_id": repo_id, "name": f"{e.method} {e.path}", "properties": e.properties}
+        for e in result.endpoints
+    ] + [
+        {"label": "Function", "repo_id": repo_id, "name": f.name, "properties": f.properties}
+        for f in result.functions
+    ]
+    engine.upsert_nodes(nodes)
+    engine.upsert_relationships([_relationship_dict(rel, repo_id) for rel in result.relationships])

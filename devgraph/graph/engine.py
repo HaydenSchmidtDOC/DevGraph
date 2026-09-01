@@ -14,6 +14,74 @@ from neo4j import Driver, GraphDatabase
 
 from devgraph.graph.schema import constraint_statements
 
+# Shared by delete_nodes_by_source_file and _replace_file_nodes_tx. See
+# delete_nodes_by_source_file's docstring for why three property keys.
+_DELETE_BY_SOURCE_FILE_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) "
+    "WHERE n.source_file = $file_name OR n.file = $file_name OR n.source = $file_name "
+    "DETACH DELETE n"
+)
+
+
+def _group_nodes_by_label(nodes: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for node in nodes:
+        groups.setdefault(node["label"], []).append(
+            {
+                "repo_id": node["repo_id"],
+                "name": node["name"],
+                "properties": node.get("properties") or {},
+            }
+        )
+    return groups
+
+
+def _group_rels_by_triple(
+    rels: list[dict[str, Any]],
+) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for rel in rels:
+        key = (rel["from_label"], rel["rel_type"], rel["to_label"])
+        groups.setdefault(key, []).append(
+            {
+                "repo_id": rel["repo_id"],
+                "from_name": rel["from_name"],
+                "to_name": rel["to_name"],
+                "properties": rel.get("properties") or {},
+            }
+        )
+    return groups
+
+
+def _upsert_nodes_tx(tx, nodes: list[dict[str, Any]]) -> None:
+    for label, rows in _group_nodes_by_label(nodes).items():
+        tx.run(
+            f"UNWIND $rows AS row "
+            f"MERGE (n:{label} {{repo_id: row.repo_id, name: row.name}}) "
+            "SET n += row.properties",
+            rows=rows,
+        )
+
+
+def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
+    for (from_label, rel_type, to_label), rows in _group_rels_by_triple(rels).items():
+        tx.run(
+            f"UNWIND $rows AS row "
+            f"MATCH (a:{from_label} {{repo_id: row.repo_id, name: row.from_name}}) "
+            f"MATCH (b:{to_label} {{repo_id: row.repo_id, name: row.to_name}}) "
+            f"MERGE (a)-[r:{rel_type}]->(b) "
+            "SET r += row.properties",
+            rows=rows,
+        )
+
+
+def _replace_file_nodes_tx(
+    tx, repo_id: str, file_name: str, nodes: list[dict[str, Any]], rels: list[dict[str, Any]]
+) -> None:
+    tx.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
+    _upsert_nodes_tx(tx, nodes)
+    _upsert_relationships_tx(tx, rels)
+
 
 class GraphEngine:
     def __init__(self, uri: str, user: str, password: str) -> None:
@@ -54,6 +122,20 @@ class GraphEngine:
                 properties=props,
             )
 
+    def upsert_nodes(self, nodes: list[dict[str, Any]]) -> None:
+        """Batched idempotent MERGE for many nodes in one transaction.
+
+        Each dict needs `label`/`repo_id`/`name`/`properties` (`properties`
+        optional, defaults to `{}`). Cypher can't parameterize a label, so
+        nodes are grouped by `label` and one `UNWIND` MERGE runs per group —
+        this is what turns "one round-trip per node" into "one round-trip
+        per distinct label in the batch".
+        """
+        if not nodes:
+            return
+        with self._driver.session() as session:
+            session.execute_write(_upsert_nodes_tx, nodes)
+
     def upsert_relationship(
         self,
         from_label: str,
@@ -83,6 +165,35 @@ class GraphEngine:
                 to_name=to_name,
                 properties=properties or {},
             )
+
+    def upsert_relationships(self, rels: list[dict[str, Any]]) -> None:
+        """Batched MATCH-MATCH-MERGE for many relationships in one transaction.
+
+        Each dict needs `from_label`/`from_name`/`rel_type`/`to_label`/
+        `to_name`/`repo_id` (`properties` optional). Grouped by
+        `(from_label, rel_type, to_label)` — same reasoning as `upsert_nodes`,
+        since label/rel-type can't be parameterized. An edge whose endpoint
+        doesn't exist yet is silently skipped, same as `upsert_relationship`.
+        """
+        if not rels:
+            return
+        with self._driver.session() as session:
+            session.execute_write(_upsert_relationships_tx, rels)
+
+    def replace_file_nodes(
+        self, repo_id: str, file_name: str, nodes: list[dict[str, Any]], rels: list[dict[str, Any]]
+    ) -> None:
+        """Atomically replace one file's provenance-tagged nodes: delete the
+        old ones and upsert the new nodes/rels in a single transaction.
+
+        Unlike calling `delete_nodes_by_source_file` followed by
+        `upsert_nodes`/`upsert_relationships` separately, a reader can never
+        observe the file's nodes as gone-but-not-yet-rebuilt — under
+        read-committed isolation it sees either the pre-reindex state or the
+        fully-rebuilt state, never in between.
+        """
+        with self._driver.session() as session:
+            session.execute_write(_replace_file_nodes_tx, repo_id, file_name, nodes, rels)
 
     def find_importing_modules(self, repo_id: str, module_name: str) -> list[str]:
         """Return the repo-relative paths of every Module with an IMPORTS edge
@@ -115,13 +226,7 @@ class GraphEngine:
         the honest fix until they're unified onto a single property name).
         """
         with self._driver.session() as session:
-            session.run(
-                "MATCH (n {repo_id: $repo_id}) "
-                "WHERE n.source_file = $file_name OR n.file = $file_name OR n.source = $file_name "
-                "DETACH DELETE n",
-                repo_id=repo_id,
-                file_name=file_name,
-            )
+            session.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
 
     def delete_repository(self, repo_id: str) -> None:
         """Remove every node (and its relationships) scoped to this repo_id."""
