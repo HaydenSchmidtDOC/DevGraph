@@ -41,6 +41,19 @@ devgraph add <path-to-a-git-repo>
 
 Coding assistants working in a registered repository can query DevGraph's MCP tools to understand call graphs, service dependencies, design rationale, git/PR history, and the blast radius of a proposed change — grounded in a graph built from the actual codebase rather than inferred from a limited context window.
 
+## Dashboard
+
+A live-updating web dashboard starts automatically with the tray app, at
+`http://127.0.0.1:8765` (loopback only — no auth, since this is a
+single-user local tool). It shows a sidebar of registered repos, an
+overview panel with node/relationship counts, a component search box, and
+an interactive graph canvas (Cytoscape.js) you can click through to explore
+neighbors. It updates itself over Server-Sent Events whenever the watcher
+reindexes a change or the repo registry changes — no manual refresh needed.
+Read-only; there's no way to edit the graph from the UI. Disable it by
+setting `DEVGRAPH_DASHBOARD_ENABLED=false`, or change the port with
+`DEVGRAPH_DASHBOARD_PORT`.
+
 ## Documentation
 
 - [Blueprints/](Blueprints/) — numbered design docs: target architecture, phased roadmap, and build plans.

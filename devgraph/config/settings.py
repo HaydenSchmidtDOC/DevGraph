@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     watch_debounce_ms: int = 500
     health_check_interval_s: int = 30
 
+    dashboard_enabled: bool = True
+    dashboard_host: str = "127.0.0.1"
+    dashboard_port: int = 8765
+
 
 @lru_cache
 def get_settings() -> Settings:

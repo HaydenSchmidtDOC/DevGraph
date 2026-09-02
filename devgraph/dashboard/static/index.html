@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DevGraph Dashboard</title>
+  <link rel="stylesheet" href="/static/css/tokens.css" />
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar__heading">Repositories</div>
+      <div id="repo-list"></div>
+    </aside>
+
+    <header class="topbar">
+      <input id="search-box" class="topbar__search" type="search" placeholder="Search components&hellip;" />
+      <div id="live-status" class="live-status">
+        <span class="live-status__dot"></span>
+        <span id="live-status-text">connecting&hellip;</span>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="panel">
+        <h2 class="panel__title">Overview</h2>
+        <div id="stat-grid" class="stat-grid">
+          <p class="empty-state">Select a repository from the sidebar.</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2 class="panel__title">Search results</h2>
+        <ul id="search-results" class="search-results"></ul>
+      </section>
+
+      <section class="panel">
+        <h2 class="panel__title">Graph</h2>
+        <div id="graph-canvas"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/vendor/cytoscape.min.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

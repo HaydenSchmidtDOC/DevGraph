@@ -1,10 +1,13 @@
 """DevGraph tray app: the always-on shell around watcher + incremental indexing
-+ Neo4j health.
++ Neo4j health + the live web dashboard.
 
 A thin shell per the Implementation Plan — it owns startup/shutdown wiring
 and surfaces health via the tray icon, but the registry/watcher/graph
 components underneath are what do the real work. No filesystem path is ever
 touched here directly; everything routes through RepoRegistry/WatcherManager.
+Also starts the dashboard (devgraph/dashboard/) on its own daemon thread, per
+Implementation Plan #5 — a second, independent read-only consumer of the
+same GraphEngine/RepoRegistry this app already owns.
 
 Does NOT run the MCP server: DevGraph's MCP server uses the stdio transport
 (devgraph/mcp/server.py), which is inherently 1:1 with a single client's
@@ -15,15 +18,19 @@ process. The tray app's job is keeping the graph itself current.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pystray
+import uvicorn
 from PIL import Image, ImageDraw
 
 from devgraph.config import get_settings
+from devgraph.dashboard.app import build_app
+from devgraph.dashboard.events import EventBroadcaster
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.dispatch import index_paths, remove_paths
 from devgraph.registry.store import RepoRegistry
@@ -61,6 +68,10 @@ class TrayApp:
         self._stop_event = threading.Event()
         self._icon: pystray.Icon | None = None
         self._last_seen_registry_change = self._registry.last_changed_at()
+        self._events = EventBroadcaster()
+        self._dashboard_loop: asyncio.AbstractEventLoop | None = None
+        self._dashboard_server: uvicorn.Server | None = None
+        self._dashboard_thread: threading.Thread | None = None
 
     def _on_changes(self, repo_id: str, changed_paths: set[Path], deleted_paths: set[Path]) -> None:
         """Route watcher events to the indexer. This is the piece that closes the
@@ -82,6 +93,14 @@ class TrayApp:
             if deleted_paths:
                 remove_paths(self._engine, repo_id, repo.path, deleted_paths)
             self._registry.mark_indexed(repo_id)
+            self._events.publish(
+                {
+                    "type": "reindexed",
+                    "repo_id": repo_id,
+                    "changed": len(changed_paths),
+                    "deleted": len(deleted_paths),
+                }
+            )
         except Exception:
             logger.warning("incremental reindex failed for %s", repo_id, exc_info=True)
 
@@ -119,6 +138,7 @@ class TrayApp:
             if not self._paused:
                 try:
                     self._watcher.refresh()
+                    self._events.publish({"type": "registry_changed"})
                 except Exception:
                     logger.warning("watcher refresh after registry change failed", exc_info=True)
 
@@ -153,9 +173,52 @@ class TrayApp:
             self._watcher.start()
         self._refresh_icon()
 
+    def _run_dashboard(self) -> None:
+        """Runs on its own daemon thread with its own asyncio loop, hosting
+        uvicorn.Server -- kept off the tray's pystray main loop (which
+        already owns the process's signal handling) and off the health
+        check thread. See Implementation Plan #5's dashboard architecture.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._dashboard_loop = loop
+        self._events.bind_loop(loop)
+
+        app = build_app(self._engine, self._registry, self._events)
+        # The tray's pystray main loop keeps owning the process's signal
+        # handling. uvicorn's Server.capture_signals() already detects it is
+        # not running on the main thread and skips installing its own
+        # handlers in that case (Server.run/serve does this automatically as
+        # of uvicorn>=0.32) -- so there is nothing to opt out of here.
+        config = uvicorn.Config(
+            app,
+            host=self._settings.dashboard_host,
+            port=self._settings.dashboard_port,
+            loop="asyncio",
+            log_level="warning",
+        )
+        server = uvicorn.Server(config)
+        self._dashboard_server = server
+        try:
+            logger.info(
+                "dashboard on http://%s:%d", self._settings.dashboard_host, self._settings.dashboard_port
+            )
+            loop.run_until_complete(server.serve())
+        except Exception:
+            # Additive feature: a bind failure (port already in use, another
+            # instance already running, etc.) must not take down the
+            # watcher/indexer loop, which is the tray's core job.
+            logger.warning("dashboard failed to start; continuing without it", exc_info=True)
+        finally:
+            loop.close()
+
     def _quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         self._stop_event.set()
         self._watcher.stop()
+        if self._dashboard_server is not None:
+            self._dashboard_server.should_exit = True
+            if self._dashboard_thread is not None:
+                self._dashboard_thread.join(timeout=5)
         self._engine.close()
         self._registry.close()
         icon.stop()
@@ -164,6 +227,10 @@ class TrayApp:
         self._watcher.start()
         health_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         health_thread.start()
+
+        if self._settings.dashboard_enabled:
+            self._dashboard_thread = threading.Thread(target=self._run_dashboard, daemon=True)
+            self._dashboard_thread.start()
 
         menu = pystray.Menu(
             pystray.MenuItem(lambda item: self._status_text(), None, enabled=False),

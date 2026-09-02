@@ -1,0 +1,59 @@
+/*
+ * Design tokens: numeric scale from GitHub Primer's published design
+ * tokens (primer.style/primitives) as the spacing/type-scale source, plus
+ * a dark, near-black surface direction referenced from Linear's published
+ * design-system analyses (restrained font weights, hairline borders instead
+ * of shadows, one accent color). See Implementation Plan #5's Context
+ * section for the full citation -- no package or file is pulled from
+ * either project, these are hand-written values informed by reading them.
+ */
+
+:root {
+  /* Spacing scale, 4px base (Primer's spacing scale). */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+
+  /* Type scale (Primer's type scale, trimmed to what this UI uses). */
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+
+  /* Font weights capped at 500 -- no bold anywhere in chrome text
+     (Linear-derived choice). */
+  --weight-normal: 400;
+  --weight-medium: 500;
+
+  --font-sans: -apple-system, "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+
+  /* Surface ramp: near-black canvas, slightly lifted panels, hairline
+     borders instead of box-shadow for separation. */
+  --color-canvas: #0b0c0d;
+  --color-surface: #121315;
+  --color-surface-raised: #17181b;
+  --color-border: #26282c;
+  --border-hairline: 0.5px solid var(--color-border);
+
+  --color-text: #eef0f2;
+  --color-text-secondary: rgba(238, 240, 242, 0.62);
+  --color-text-tertiary: rgba(238, 240, 242, 0.4);
+
+  /* Single accent color for interactive/active state. */
+  --color-accent: #5b8cff;
+  --color-accent-dim: rgba(91, 140, 255, 0.16);
+
+  --color-ok: #3fb950;
+  --color-warn: #d29922;
+  --color-danger: #e5534b;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+}
