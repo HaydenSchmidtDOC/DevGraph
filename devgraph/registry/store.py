@@ -69,6 +69,17 @@ class RepoRegistry:
 
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Marker file the long-lived tray process polls (see agent/tray.py's
+        # health-check loop) to notice registry mutations made by a *different*
+        # process -- e.g. `devgraph add`/`remove`/`watch enable|disable` run
+        # from a fresh CLI invocation while the tray's WatcherManager is
+        # already running in its own process with its own in-memory copy of
+        # "which repos to watch". Without this, WatcherManager.refresh() is
+        # unreachable from outside the tray process, so a repo added (or
+        # re-enabled) after the tray started never gets a live OS watch until
+        # the tray itself is restarted, even though `devgraph list`/`status`
+        # correctly show it registered and `rescan` can index it on demand.
+        self._change_marker_path = db_path.parent / "registry_changed.txt"
         # check_same_thread=False + an RLock: this registry is read/written
         # from multiple threads in practice (each registered repo's watcher
         # fires its debounce callback on its own threading.Timer thread, plus
@@ -97,6 +108,33 @@ class RepoRegistry:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def _touch_change_marker(self) -> None:
+        """Record that the registry's watch-relevant state changed just now.
+
+        Best-effort: a failure to write this marker shouldn't fail the
+        registry mutation that triggered it (the mutation already committed
+        to SQLite) -- it would just mean the running tray process picks up
+        the change a bit later, on its next poll, or not until restarted.
+        """
+        try:
+            self._change_marker_path.write_text(
+                datetime.now(timezone.utc).isoformat(), encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def last_changed_at(self) -> str | None:
+        """Timestamp of the most recent add/remove/watch-flag mutation, if any.
+
+        Read by the tray process's health-check loop to detect registry
+        changes made by other `devgraph` CLI invocations; see the marker
+        path comment in `__init__`.
+        """
+        try:
+            return self._change_marker_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
 
     def add_repo(self, path: str | Path, repo_id: str | None = None) -> RepoRecord:
         resolved = Path(path).resolve()
@@ -127,6 +165,7 @@ class RepoRegistry:
                 (final_id, str(resolved)),
             )
             self._conn.commit()
+        self._touch_change_marker()
         return RepoRecord(final_id, resolved, True, True, None)
 
     def remove_repo(self, repo_id: str) -> None:
@@ -135,6 +174,7 @@ class RepoRegistry:
             self._conn.commit()
         if cur.rowcount == 0:
             raise ValueError(f"no such repo_id: {repo_id}")
+        self._touch_change_marker()
 
     def enable_watch(self, repo_id: str) -> None:
         self._set_flag(repo_id, "watch_enabled", True)
@@ -150,6 +190,7 @@ class RepoRegistry:
             self._conn.commit()
         if cur.rowcount == 0:
             raise ValueError(f"no such repo_id: {repo_id}")
+        self._touch_change_marker()
 
     def mark_indexed(self, repo_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()

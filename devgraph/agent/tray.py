@@ -60,6 +60,7 @@ class TrayApp:
         self._healthy = True
         self._stop_event = threading.Event()
         self._icon: pystray.Icon | None = None
+        self._last_seen_registry_change = self._registry.last_changed_at()
 
     def _on_changes(self, repo_id: str, changed_paths: set[Path], deleted_paths: set[Path]) -> None:
         """Route watcher events to the indexer. This is the piece that closes the
@@ -92,9 +93,34 @@ class TrayApp:
             except Exception:
                 logger.warning("Neo4j health check failed", exc_info=True)
                 self._healthy = False
+            self._check_registry_changes()
             self._refresh_icon()
             self._write_heartbeat()
             self._stop_event.wait(self._settings.health_check_interval_s)
+
+    def _check_registry_changes(self) -> None:
+        """Pick up add/remove/watch-flag changes made by another `devgraph`
+        CLI invocation while this tray process has been running.
+
+        The tray owns the only live WatcherManager, but registry mutations
+        happen in whatever short-lived process ran the CLI command -- there
+        is no direct call path between them, only this shared SQLite file
+        plus the marker RepoRegistry touches on every such mutation (see
+        registry/store.py). Without this poll, a repo added or re-enabled
+        after the tray started stays fully unwatched (though still
+        indexable on demand via `rescan`) until the tray is restarted.
+        """
+        try:
+            current = self._registry.last_changed_at()
+        except Exception:
+            return
+        if current != self._last_seen_registry_change:
+            self._last_seen_registry_change = current
+            if not self._paused:
+                try:
+                    self._watcher.refresh()
+                except Exception:
+                    logger.warning("watcher refresh after registry change failed", exc_info=True)
 
     def _write_heartbeat(self) -> None:
         """Write a UTC timestamp `status`/`doctor` read to report tray liveness.
