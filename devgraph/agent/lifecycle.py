@@ -132,6 +132,60 @@ def clear_tray_holders() -> None:
         marker.unlink(missing_ok=True)
 
 
+def _start_lock_path() -> Path:
+    return tray_pid_path().parent / "tray_start.lock"
+
+
+def _acquire_start_lock():
+    """OS-held advisory lock serializing the check-then-spawn below.
+
+    Without this, two MCP server processes launched around the same time
+    (e.g. two Claude Code windows connecting within the same second) can
+    both pass the `read_tray_pid()`/`pid_is_running()` check before either
+    has written a PID file, each spawning its own tray -- observed in
+    practice as several duplicate tray icons. The lock is kernel-held
+    (`msvcrt.locking` / `fcntl.flock`), so it releases automatically if the
+    holding process dies mid-section -- no stale-lock cleanup needed, same
+    self-healing property `tray.pid`/`tray_holders` already rely on.
+    """
+    path = _start_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+b")
+    if sys.platform == "win32":
+        import msvcrt
+
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError:
+            # Another process has held it for >~10s (msvcrt's built-in retry
+            # budget) -- treat as "someone else is starting the tray" and
+            # bail out rather than blocking indefinitely.
+            handle.close()
+            return None
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
+
+
+def _release_start_lock(handle) -> None:
+    if handle is None:
+        return
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 def start_tray_if_not_running() -> Optional[int]:
     """Launch the tray app as a detached background process if not already running.
 
@@ -139,6 +193,16 @@ def start_tray_if_not_running() -> Optional[int]:
     live tray process was already running (no-op — safe to call from every
     MCP server process without spawning duplicates).
     """
+    lock = _acquire_start_lock()
+    if lock is None:
+        return None
+    try:
+        return _start_tray_if_not_running_locked()
+    finally:
+        _release_start_lock(lock)
+
+
+def _start_tray_if_not_running_locked() -> Optional[int]:
     existing_pid = read_tray_pid()
     if existing_pid is not None and pid_is_running(existing_pid):
         return None
