@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from devgraph.config import get_settings
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.containers.extractor import ContainerExtractor
@@ -110,7 +111,7 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             index_doc_file(engine, repo_id, resolved)
             indexed += 1
         if mentions_enabled and resolved.suffix in (".md", ".markdown"):
-            index_mentions_file(engine, repo_id, resolved, repo_root)
+            index_mentions_file(engine, repo_id, resolved, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode)
             indexed += 1
         if name_lower in _CONTAINERFILE_NAMES:
             _index_containerfile(engine, repo_id, resolved)
