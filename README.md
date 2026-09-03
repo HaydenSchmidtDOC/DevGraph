@@ -59,6 +59,10 @@ server itself still runs via stdio, spawned directly by your MCP client
 (Claude Code, VS Code) per [DEVGRAPH-CLIENT.md](DEVGRAPH-CLIENT.md) — it is
 not part of this stack.
 
+## Mentions
+
+A Markdown-mention detector extracts references between `@mention`-style links and arbitrary text patterns in Markdown files, creating `Document` nodes and `MENTIONS` edges to track cross-file relationships at the documentation level. Enable it per-repo via `devgraph mentions <repo_id> enable`, then configure its handling of ambiguous names (references that match multiple candidates) with the `mentions_ambiguous_mode` setting (`"all"` to keep all matches, or `"skip"` to exclude ambiguous ones). Query it with the `find_mentions` MCP tool.
+
 ## Dashboard
 
 A live-updating web dashboard starts automatically with the tray app, at
