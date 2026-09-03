@@ -250,10 +250,11 @@ def _find_matches(content: str, name: str, code_regions: list[tuple[int, int]]) 
     if re.search(call_pattern, content):
         return True
 
-    # Check declaration syntax: keyword\s+Name\b
+    # Check declaration syntax: keyword\s+Name\b (same line only, not across newlines)
     declaration_pattern = r"\b(" + "|".join(re.escape(kw) for kw in _DECLARATION_KEYWORDS) + r")\s+" + re.escape(name) + r"\b"
-    if re.search(declaration_pattern, content):
-        return True
+    for line in content.splitlines():
+        if re.search(declaration_pattern, line):
+            return True
 
     return False
 
@@ -274,13 +275,24 @@ def _find_in_code_regions(content: str, name: str, code_regions: list[tuple[int,
     return False
 
 
-def index_file(engine, repo_id: str, file_path: str | Path, ambiguous_mode: str = "all") -> None:
+def index_file(
+    engine,
+    repo_id: str,
+    file_path: str | Path,
+    repo_root: str | Path | None = None,
+    ambiguous_mode: str = "all",
+) -> None:
     """Extract a mentions file and upsert results into the graph.
 
     Args:
         engine: A GraphEngine instance.
         repo_id: Repository ID for scoping.
         file_path: Path to the Markdown file to index.
+        repo_root: The repository's root directory. When given, the Document node
+            is keyed by file_path's path relative to repo_root (forward slashes),
+            which prevents same-named files in different directories from colliding
+            into one Document node. When omitted, falls back to the bare filename
+            for backwards compatibility, but loses the collision-prevention benefit.
         ambiguous_mode: How to handle ambiguous names: "all" (link all) or "skip" (skip).
 
     Raises:
@@ -291,6 +303,17 @@ def index_file(engine, repo_id: str, file_path: str | Path, ambiguous_mode: str 
         raise FileNotFoundError(f"File not found: {file_path}")
 
     content = file_path.read_text(encoding="utf-8")
+
+    # Compute the document name (repo-relative path or bare filename)
+    if repo_root is not None:
+        try:
+            rel = file_path.resolve().relative_to(Path(repo_root).resolve())
+            doc_name = rel.as_posix()
+        except ValueError:
+            # file_path wasn't actually under repo_root, fall back to bare filename
+            doc_name = file_path.name
+    else:
+        doc_name = file_path.name
 
     # Query all entity names/labels in this repo
     query = """
@@ -303,7 +326,7 @@ def index_file(engine, repo_id: str, file_path: str | Path, ambiguous_mode: str 
 
     # Extract mentions
     extractor = MentionsExtractor(repo_id, ambiguous_mode=ambiguous_mode)
-    result = extractor.extract_from_source(content, str(file_path.name), known_entities)
+    result = extractor.extract_from_source(content, doc_name, known_entities)
 
     # Upsert Document node
     engine.upsert_nodes(
