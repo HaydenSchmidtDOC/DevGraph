@@ -230,7 +230,14 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             engine.delete_nodes_by_source_file(repo_id, module_name)
             cleaned += 1
         elif resolved.suffix in (".md", ".markdown"):
-            engine.delete_nodes_by_source_file(repo_id, resolved.name)
+            # Must match the same repo-relative key index_paths() writes
+            # (Document nodes are keyed by path relative to repo_root via
+            # mentions/extractor.py's index_file, not bare filename).
+            try:
+                rel_path = resolved.relative_to(repo_root.resolve()).as_posix()
+            except ValueError:
+                rel_path = resolved.name
+            engine.delete_nodes_by_source_file(repo_id, rel_path)
             cleaned += 1
     return cleaned
 

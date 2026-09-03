@@ -229,6 +229,52 @@ class TestRemovePaths:
         finally:
             engine.delete_repository(repo_id)
 
+    def test_removes_document_node_for_deleted_markdown_file_in_subdirectory(self, engine, temp_repo):
+        """Deleting a .md file in a subdirectory must clean up its Document node.
+
+        This tests the fix for the deletion bug where remove_paths() was using
+        bare filename instead of repo-relative path. Without the fix, Document
+        nodes keyed by repo-relative path (e.g., 'docs/guide.md') wouldn't be
+        found when deleting by bare filename ('guide.md').
+        """
+        repo_id = "_smoketest_dispatch_remove_md_subdir"
+
+        # Create a Python file with a known entity
+        py_file = temp_repo / "service.py"
+        py_file.write_text("def my_handler():\n    pass\n")
+
+        # Create Markdown file in a subdirectory mentioning that entity
+        docs_dir = temp_repo / "docs"
+        docs_dir.mkdir()
+        md_file = docs_dir / "guide.md"
+        md_file.write_text("# Guide\n\nThe `my_handler()` function is important.\n")
+
+        try:
+            # Index both files
+            index_paths(engine, repo_id, temp_repo, {py_file})
+            index_paths(engine, repo_id, temp_repo, {md_file}, mentions_enabled=True)
+
+            # Verify Document node was created with repo-relative path as key
+            result = engine.run_cypher(
+                "MATCH (d:Document {repo_id: $repo_id, name: 'docs/guide.md'}) RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert result[0]["c"] == 1, "Document node should exist with repo-relative path"
+
+            # Delete the file and clean up its provenance
+            md_file.unlink()
+            cleaned = remove_paths(engine, repo_id, temp_repo, {md_file})
+            assert cleaned == 1, "remove_paths should report 1 file cleaned"
+
+            # Verify Document node was actually deleted
+            result = engine.run_cypher(
+                "MATCH (d:Document {repo_id: $repo_id, name: 'docs/guide.md'}) RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert result[0]["c"] == 0, "Document node should be deleted"
+        finally:
+            engine.delete_repository(repo_id)
+
 
 class TestFullScan:
     def test_full_scan_indexes_multiple_files(self, engine, temp_repo):

@@ -256,3 +256,33 @@ The MyClass is defined elsewhere.
 
         assert len(result.documents) == 1
         assert len(result.relationships) == 0
+
+    def test_unrecognized_ambiguous_mode_falls_back_to_all(self):
+        """An unrecognized ambiguous_mode value should fall back to 'all' behavior.
+
+        This tests the fix for missing settings validation where an invalid
+        mode would fall through to an undocumented third behavior instead of
+        falling back to 'all' with a warning logged.
+        """
+        content = "`Helper` is mentioned in code."
+        known_entities = [("Helper", "Function"), ("Helper", "Class")]
+
+        # Create extractor with invalid ambiguous_mode
+        extractor_invalid = MentionsExtractor(self.repo_id, ambiguous_mode="invalid_mode")
+        result = extractor_invalid.extract_from_source(content, "test.md", known_entities)
+
+        # Should fall back to "all" behavior: create relationships for all labels
+        assert len(result.relationships) == 2
+        labels = {rel.target_label for rel in result.relationships}
+        assert labels == {"Function", "Class"}
+
+    def test_unrecognized_ambiguous_mode_logs_warning(self, caplog):
+        """An unrecognized ambiguous_mode should log a warning."""
+        content = "`Entity` is in code."
+        known_entities = [("Entity", "Class")]
+
+        extractor_invalid = MentionsExtractor(self.repo_id, ambiguous_mode="bogus")
+        result = extractor_invalid.extract_from_source(content, "test.md", known_entities)
+
+        # Check that warning was logged (caplog captures logging output)
+        assert any("bogus" in record.message for record in caplog.records if record.levelname == "WARNING")

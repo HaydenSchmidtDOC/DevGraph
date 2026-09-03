@@ -8,9 +8,12 @@ code-like contexts (inline code, fenced blocks, call syntax, declaration syntax)
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _DECLARATION_KEYWORDS = (
     "class",
@@ -75,6 +78,13 @@ class MentionsExtractor:
             known_entities: List of (name, label) tuples of entities to match.
             Returns: ExtractionResult with Document node and MENTIONS relationships.
         """
+        # Validate ambiguous_mode and fall back to "all" if unrecognized
+        if self.ambiguous_mode not in ("all", "skip"):
+            logger.warning(
+                f"unrecognized ambiguous_mode '{self.ambiguous_mode}', falling back to 'all'"
+            )
+            self.ambiguous_mode = "all"
+
         result = ExtractionResult()
 
         # Parse the title from the first H1 heading or use filename stem
