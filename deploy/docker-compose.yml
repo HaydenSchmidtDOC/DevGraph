@@ -1,0 +1,60 @@
+# Full DevGraph stack under plain Docker: Neo4j + the headless DevGraph agent
+# (watcher, incremental indexer, live dashboard). Local-first per the Design
+# Brief: no ports exposed beyond localhost, no external network calls.
+#
+# Repos to index are never picked up automatically — bind-mount each one
+# under /repos and register it from inside the container:
+#   docker compose -f deploy/docker-compose.yml exec devgraph devgraph add /repos/<name>
+#
+# The MCP server itself is NOT part of this stack: it uses the stdio
+# transport and is spawned directly by the MCP client (Claude Code, VS Code),
+# not hosted as a long-running service. See DEVGRAPH-CLIENT.md.
+
+services:
+  devgraph-neo4j:
+    image: docker.io/library/neo4j:5.26-community
+    container_name: devgraph-neo4j
+    restart: always
+    ports:
+      - "127.0.0.1:7474:7474" # HTTP browser UI
+      - "127.0.0.1:7687:7687" # Bolt protocol
+    environment:
+      NEO4J_AUTH: "neo4j/devgraph-local-dev"
+      NEO4J_PLUGINS: "[]"
+      NEO4J_dbms_usage__report_enabled: "false"
+    volumes:
+      - devgraph_neo4j_data:/data
+      - devgraph_neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  devgraph:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: devgraph-agent
+    restart: always
+    depends_on:
+      devgraph-neo4j:
+        condition: service_healthy
+    environment:
+      DEVGRAPH_NEO4J_URI: "bolt://devgraph-neo4j:7687"
+      DEVGRAPH_NEO4J_USER: "neo4j"
+      DEVGRAPH_NEO4J_PASSWORD: "devgraph-local-dev"
+    ports:
+      - "127.0.0.1:8765:8765" # dashboard
+    volumes:
+      - devgraph_registry:/root/.devgraph
+      # Mount each repo you want to register, e.g.:
+      # - C:\path\to\your\repo:/repos/your-repo
+
+volumes:
+  devgraph_neo4j_data:
+    name: devgraph_neo4j_data
+  devgraph_neo4j_logs:
+    name: devgraph_neo4j_logs
+  devgraph_registry:
+    name: devgraph_registry

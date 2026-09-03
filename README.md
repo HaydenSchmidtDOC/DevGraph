@@ -41,6 +41,24 @@ devgraph add <path-to-a-git-repo>
 
 Coding assistants working in a registered repository can query DevGraph's MCP tools to understand call graphs, service dependencies, design rationale, git/PR history, and the blast radius of a proposed change — grounded in a graph built from the actual codebase rather than inferred from a limited context window.
 
+## Docker
+
+Prefer plain Docker over Podman, or want the whole stack (Neo4j + the
+watcher/indexer/dashboard agent) in containers instead of a local Python
+venv? Use the compose file in [deploy/](deploy/):
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d --build
+docker compose -f deploy/docker-compose.yml exec devgraph devgraph add /repos/<name>
+```
+
+Bind-mount each repo you want indexed under `/repos` in
+`deploy/docker-compose.yml` first — DevGraph never scans a path it wasn't
+explicitly given. The dashboard is then at `http://127.0.0.1:8765`. The MCP
+server itself still runs via stdio, spawned directly by your MCP client
+(Claude Code, VS Code) per [DEVGRAPH-CLIENT.md](DEVGRAPH-CLIENT.md) — it is
+not part of this stack.
+
 ## Dashboard
 
 A live-updating web dashboard starts automatically with the tray app, at

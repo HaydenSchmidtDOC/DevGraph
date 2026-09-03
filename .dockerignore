@@ -1,0 +1,12 @@
+.git
+.venv
+.pytest_cache
+devgraph.egg-info
+tests
+Blueprints
+scripts
+*.md
+.env
+.env.example
+__pycache__
+*.pyc
