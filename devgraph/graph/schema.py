@@ -22,6 +22,7 @@ NODE_LABELS: tuple[str, ...] = (
     "Requirement",
     "DesignDecision",
     "ArchitectureNote",
+    "Document",
     # Phase 3 — git history, PR/issue knowledge.
     "Commit",
     "PullRequest",
@@ -44,6 +45,7 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
     "DOCUMENTED_BY",
     "DECIDED_BY",
     "SUPERSEDES",
+    "MENTIONS",
     # Phase 3
     "MODIFIES",
     "RESOLVES",
