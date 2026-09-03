@@ -901,7 +901,7 @@ def find_mentions(
         max_results: Maximum number of results to return in the envelope
 
     Returns:
-        Dict with count, results, and truncated flag containing nodes with name, label, and repo_id
+        Dict with count, results, and truncated flag containing nodes with name, type (labels), and repo_id
     """
     # Validate and reject unrecognized labels
     if label is not None and label not in schema.NODE_LABELS:
@@ -918,7 +918,7 @@ def find_mentions(
         WHERE true
         {repo_filter}
         {label_filter}
-        RETURN target.name as name, labels(target) as labels, target.repo_id as repo_id
+        RETURN target.name as name, labels(target) as type, target.repo_id as repo_id
         ORDER BY target.name
         """
     else:
@@ -929,7 +929,7 @@ def find_mentions(
         WHERE true
         {repo_filter}
         {label_filter}
-        RETURN d.name as name, labels(d) as labels, d.repo_id as repo_id
+        RETURN d.name as name, labels(d) as type, d.repo_id as repo_id
         ORDER BY d.name
         """
 
