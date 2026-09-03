@@ -4,7 +4,7 @@
 
 - Phases 1-3 complete and verified (registry, graph engine, Python indexer, container/API/datastore extractors, watcher, CLI, tray app, docs extractor, git/PR/issue history). Phase 4 (enterprise federation) is design-only, intentionally unbuilt.
 - Implementation Plan #5 (live web dashboard) shipped: a FastAPI+uvicorn server on its own daemon thread inside the tray process, serving a hand-written HTML/CSS/JS UI (Cytoscape.js vendored as a single pinned static file) at `http://127.0.0.1:8765` with live push over Server-Sent Events. Read-only, loopback-only, no auth (single-user local tool).
-- Implementation Plan #6 (Markdown mentions indexing) shipped: per-repo opt-in extraction of `@mention` links and text patterns in Markdown files, creating `Document` nodes and `MENTIONS` edges, queryable via `find_mentions` MCP tool; ambiguous-name handling configurable via `mentions_ambiguous_mode` setting.
+- Implementation Plan #6 (Markdown mentions indexing) shipped: per-repo opt-in detection of known entity references appearing in code-like contexts (inline code, fenced blocks, call syntax, declaration keywords) within Markdown files, creating `Document` nodes and `MENTIONS` edges, queryable via `find_mentions` MCP tool; ambiguous-name handling configurable via `mentions_ambiguous_mode` setting.
 - 19 MCP tools live over stdio (`devgraph/mcp/server.py`), including `impact_analysis_for_diff` from Implementation Plan #3 and `find_mentions` from Implementation Plan #6.
 - `devgraph add`/`rescan` run a real full scan via `devgraph/indexer/dispatch.py`; the watcher and tray app route live changes through the same dispatcher, including delete cleanup.
 - Known extraction gaps closed: `CALLS` edge extraction, Module nodes keyed by repo-relative path, absolute dotted intra-repo import resolution, a Tree-sitter node-identity bug, and service cross-linking (`Service -[:USES]->`, `Endpoint -[:CALLS]->`).
@@ -32,7 +32,7 @@
 - `devgraph/indexer/containers/`, `apis/`, `datastores/` — Podman Compose, route, and datastore-usage extractors. Container extractor captures `build_context` for service cross-linking.
 - `devgraph/indexer/dispatch.py` — routes changed/deleted files to the right extractor (`index_paths`, `remove_paths`, `full_scan`); called by CLI, watcher, and tray app. Prunes stale nodes on re-index; links services to owning code via `build_context`.
 - `devgraph/indexer/docs/` — Markdown front-matter extractor for `Requirement`/`DesignDecision`/`ArchitectureNote`.
-- `devgraph/indexer/mentions/` — Markdown mention extractor for `@mention`-style links and text patterns; creates `Document` nodes and `MENTIONS` edges; configurable ambiguous-name handling via `mentions_ambiguous_mode` setting (`"all"`/`"skip"`).
+- `devgraph/indexer/mentions/` — Markdown mention extractor detecting known entity references in code-like contexts (inline code, fenced blocks, call syntax `Name(`, declaration keywords); creates `Document` nodes and `MENTIONS` edges; configurable ambiguous-name handling via `mentions_ambiguous_mode` setting (`"all"`/`"skip"`).
 - `devgraph/indexer/git_history/` — incremental commit history via GitPython, local only.
 - `devgraph/indexer/pr_issues/` — opt-in GitHub PR/issue ingestion; hard-gated per-repo, off by default.
 - `devgraph/watcher/` — `WatcherManager`, registry-scoped file/git watching with debounce; handles atomic rename-saves correctly.
