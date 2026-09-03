@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     cloud_sync: bool = False
     enable_run_cypher: bool = False
 
+    mentions_ambiguous_mode: str = "all"
     registry_db_path: Path = Path.home() / ".devgraph" / "registry.sqlite3"
     watch_debounce_ms: int = 500
     health_check_interval_s: int = 30

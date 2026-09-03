@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS repos (
     docs_path TEXT,
     pr_source_enabled INTEGER NOT NULL DEFAULT 0,
     issue_source_enabled INTEGER NOT NULL DEFAULT 0,
-    last_indexed_commit TEXT
+    last_indexed_commit TEXT,
+    mentions_enabled INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -41,6 +42,10 @@ _MIGRATIONS = (
         "ALTER TABLE repos ADD COLUMN issue_source_enabled INTEGER NOT NULL DEFAULT 0",
     ),
     ("last_indexed_commit", "ALTER TABLE repos ADD COLUMN last_indexed_commit TEXT"),
+    (
+        "mentions_enabled",
+        "ALTER TABLE repos ADD COLUMN mentions_enabled INTEGER NOT NULL DEFAULT 0",
+    ),
 )
 
 _SLUG_RE = re.compile(r"[^a-z0-9_-]+")
@@ -62,6 +67,7 @@ class RepoRecord:
     pr_source_enabled: bool = False
     issue_source_enabled: bool = False
     last_indexed_commit: str | None = None
+    mentions_enabled: bool = False
 
 
 class RepoRegistry:
@@ -225,6 +231,10 @@ class RepoRegistry:
         """Opt this repo in/out of issue ingestion (Phase 3). Default is off (Principle 2)."""
         self._set_flag(repo_id, "issue_source_enabled", enabled)
 
+    def set_mentions_enabled(self, repo_id: str, enabled: bool) -> None:
+        """Opt this repo in/out of mentions indexing. Default is off (Principle 2)."""
+        self._set_flag(repo_id, "mentions_enabled", enabled)
+
     def set_last_indexed_commit(self, repo_id: str, sha: str | None) -> None:
         """Record the most recently walked commit SHA for incremental git history indexing."""
         with self._lock:
@@ -238,7 +248,7 @@ class RepoRegistry:
 
     _COLUMNS = (
         "repo_id, path, active, watch_enabled, last_indexed, docs_path, "
-        "pr_source_enabled, issue_source_enabled, last_indexed_commit"
+        "pr_source_enabled, issue_source_enabled, last_indexed_commit, mentions_enabled"
     )
 
     def get(self, repo_id: str) -> RepoRecord | None:
@@ -269,6 +279,7 @@ class RepoRegistry:
             pr_source_enabled,
             issue_source_enabled,
             last_indexed_commit,
+            mentions_enabled,
         ) = row
         return RepoRecord(
             repo_id,
@@ -280,4 +291,5 @@ class RepoRegistry:
             bool(pr_source_enabled),
             bool(issue_source_enabled),
             last_indexed_commit,
+            bool(mentions_enabled),
         )

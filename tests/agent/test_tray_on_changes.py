@@ -46,7 +46,7 @@ class TestOnChanges:
             tray_app._on_changes(repo_id, changed, set())
 
             mock_index_paths.assert_called_once_with(
-                tray_app._engine, repo_id, repo_path, changed, docs_path=None
+                tray_app._engine, repo_id, repo_path, changed, docs_path=None, mentions_enabled=False
             )
             mock_remove_paths.assert_not_called()
             tray_app._registry.mark_indexed.assert_called_once_with(repo_id)
