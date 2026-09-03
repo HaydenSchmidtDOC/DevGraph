@@ -29,12 +29,37 @@ def _envelope(items: list[Any], max_results: int) -> dict[str, Any]:
     }
 
 
+def _resolve_recency_cutoff(engine: GraphEngine, repo_id: str, modified_within_commits: int) -> Any:
+    """Resolve the `last_modified_at` cutoff timestamp for the last
+    `modified_within_commits` commits repo-wide.
+
+    Finds the authored_date of the Nth-most-recent commit (by SKIP/LIMIT over
+    commits ordered newest-first) and returns it as the cutoff: entities with
+    `last_modified_at >= cutoff` were touched within that commit window. If
+    fewer than `modified_within_commits` commits exist repo-wide, there is no
+    cutoff to resolve and this returns None (meaning: don't filter).
+    """
+    skip = modified_within_commits - 1
+    cypher = """
+    MATCH (c:Commit {repo_id: $repo_id})
+    RETURN c.authored_date AS d
+    ORDER BY d DESC
+    SKIP $skip
+    LIMIT 1
+    """
+    results = engine.run_cypher(cypher, {"repo_id": repo_id, "skip": skip})
+    if not results:
+        return None
+    return results[0]["d"]
+
+
 def search_component(
     engine: GraphEngine,
     repo_id: str,
     query: str,
     cross_repo: bool = False,
     max_results: int = 15,
+    modified_within_commits: int | None = None,
 ) -> dict[str, Any]:
     """Search for components (modules, services, classes, functions) by name or description.
 
@@ -44,23 +69,37 @@ def search_component(
         query: Search term (name substring or description keyword)
         cross_repo: If True, search across all repos; if False, limit to repo_id
         max_results: Maximum number of results to return in the envelope
+        modified_within_commits: If given, only return components touched within
+            the last N commits repo-wide (by `last_modified_at`, staged by git-history
+            recency indexing). An entity never touched by that staging has no
+            `last_modified_at` property and is excluded, never silently included.
+            If fewer than N commits exist repo-wide, no cutoff applies and this
+            filter is a no-op.
 
     Returns:
         Dict with count, results, and truncated flag. Note: count maxes out at 50
         (the Cypher LIMIT cap) even if more matches exist beyond that.
     """
+    cutoff = None
+    if modified_within_commits is not None:
+        cutoff = _resolve_recency_cutoff(engine, repo_id, modified_within_commits)
+
     repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
+    recency_filter = "AND n.last_modified_at >= $cutoff" if cutoff is not None else ""
     cypher = f"""
     MATCH (n)
     WHERE (n:Service OR n:Module OR n:Class OR n:Function OR n:Endpoint)
     AND (toLower(n.name) CONTAINS toLower($query) OR toLower(n.description) CONTAINS toLower($query))
     {repo_filter}
+    {recency_filter}
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
            n.description as description LIMIT 50
     """
     params = {"query": query}
     if not cross_repo:
         params["repo_id"] = repo_id
+    if cutoff is not None:
+        params["cutoff"] = cutoff
 
     results = engine.run_cypher(cypher, params)
     return _envelope(results, max_results)
@@ -154,6 +193,7 @@ def find_callers(
     cross_repo: bool = False,
     max_results: int = 15,
     scope_to_class: str | None = None,
+    modified_within_commits: int | None = None,
 ) -> dict[str, Any]:
     """Find all functions, services, or endpoints that call a given target.
 
@@ -173,17 +213,29 @@ def find_callers(
         max_results: Maximum number of results to return in the envelope
         scope_to_class: If given, only return callers whose call to
             target_name was made from within this class's own method bodies
+        modified_within_commits: If given, only return targets touched within
+            the last N commits repo-wide (by `last_modified_at`, staged by git-history
+            recency indexing). A target never touched by that staging has no
+            `last_modified_at` property and is excluded, never silently included.
+            If fewer than N commits exist repo-wide, no cutoff applies and this
+            filter is a no-op.
 
     Returns:
         Dict with count, results, and truncated flag containing callers with their types and locations
     """
+    cutoff = None
+    if modified_within_commits is not None:
+        cutoff = _resolve_recency_cutoff(engine, repo_id, modified_within_commits)
+
     repo_filter = "" if cross_repo else "AND target.repo_id = $repo_id"
     class_filter = "AND rel.caller_class = $scope_to_class" if scope_to_class else ""
+    recency_filter = "AND target.last_modified_at >= $cutoff" if cutoff is not None else ""
     cypher = f"""
     MATCH (caller)-[rel:CALLS]->(target)
     WHERE target.name = $target_name
     {repo_filter}
     {class_filter}
+    {recency_filter}
     RETURN DISTINCT caller.name as name, labels(caller) as type, caller.repo_id as repo_id
     ORDER BY caller.name
     """
@@ -192,6 +244,8 @@ def find_callers(
         params["repo_id"] = repo_id
     if scope_to_class:
         params["scope_to_class"] = scope_to_class
+    if cutoff is not None:
+        params["cutoff"] = cutoff
 
     results = engine.run_cypher(cypher, params)
     return _envelope(results, max_results)
@@ -938,6 +992,67 @@ def find_mentions(
         params["label"] = label
     if not cross_repo:
         params["repo_id"] = repo_id
+
+    results = engine.run_cypher(cypher, params)
+    return _envelope(results, max_results)
+
+
+def list_recent_changes(
+    engine: GraphEngine,
+    repo_id: str,
+    within_commits: int,
+    entity_type: str | None = None,
+    cross_repo: bool = False,
+    max_results: int = 15,
+) -> dict[str, Any]:
+    """List entities touched within the last N commits repo-wide, most-recently-modified first.
+
+    Entities are staged with a `last_modified_at` property by git-history
+    recency indexing; an entity never touched by that staging has no such
+    property and is excluded here, never silently included. If fewer than
+    within_commits commits exist repo-wide, there is no cutoff to resolve —
+    the whole repo history fits inside the requested window, so every entity
+    that was ever staged with a `last_modified_at` is returned (still ordered
+    most-recent-first), rather than nothing.
+
+    Args:
+        engine: GraphEngine instance
+        repo_id: Repository ID
+        within_commits: Only include entities modified within this many most-recent commits
+        entity_type: Optional node label filter (validates against NODE_LABELS)
+        cross_repo: If True, search across repos
+        max_results: Maximum number of results to return in the envelope
+
+    Returns:
+        Dict with count, results, and truncated flag containing entities with
+        name, type (labels), repo_id, and last_modified_at, ordered most-recently-modified first.
+    """
+    # Validate and reject unrecognized labels
+    if entity_type is not None and entity_type not in schema.NODE_LABELS:
+        return _envelope([], max_results)
+
+    cutoff = _resolve_recency_cutoff(engine, repo_id, within_commits)
+    recency_filter = "AND n.last_modified_at >= $cutoff" if cutoff is not None else "AND n.last_modified_at IS NOT NULL"
+
+    repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
+    label_filter = "AND $entity_type IN labels(n)" if entity_type else ""
+    cypher = f"""
+    MATCH (n)
+    WHERE true
+    {recency_filter}
+    {repo_filter}
+    {label_filter}
+    RETURN n.name as name, labels(n) as type, n.repo_id as repo_id,
+           n.last_modified_at as last_modified_at
+    ORDER BY n.last_modified_at DESC
+    """
+    params = {}
+    if cutoff is not None:
+        params["cutoff"] = cutoff
+    if not cross_repo:
+        params["repo_id"] = repo_id
+    if entity_type is not None:
+        params["entity_type"] = entity_type
 
     results = engine.run_cypher(cypher, params)
     return _envelope(results, max_results)

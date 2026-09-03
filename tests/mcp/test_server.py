@@ -40,14 +40,14 @@ def seeded_graph(engine):
 
 
 class TestServerBuild:
-    def test_all_18_tools_registered(self, engine):
+    def test_all_20_tools_registered(self, engine):
         server = build_server(engine)
         import asyncio
 
         tools = asyncio.run(server.list_tools())
         names = {t.name for t in tools}
 
-        assert len(tools) == 19
+        assert len(tools) == 20
         # spot check across all three phases plus Implementation Plan #3/6's new tools
         assert "search_component" in names
         assert "explain_decision" in names
@@ -55,6 +55,7 @@ class TestServerBuild:
         assert "impact_analysis_for_diff" in names
         assert "get_source" in names
         assert "find_mentions" in names
+        assert "list_recent_changes" in names
 
     def test_run_cypher_not_registered_by_default(self, engine):
         server = build_server(engine)
@@ -134,6 +135,25 @@ class TestServerToolCall:
         assert "count" in payload
         assert "truncated" in payload
         assert any(item["name"] == "TestService" for item in payload["results"])
+
+    def test_list_recent_changes_via_server(self, seeded_graph):
+        seeded_graph.upsert_node(
+            "Service", "_smoketest_mcp_server", "TestService", {"last_modified_at": "2026-01-01T00:00:00"}
+        )
+        server = build_server(seeded_graph)
+        import asyncio
+
+        result = asyncio.run(
+            server.call_tool(
+                "list_recent_changes",
+                {"repo_id": "_smoketest_mcp_server", "within_commits": 100},
+            )
+        )
+        assert result.is_error is False
+        payload = result.structured_content
+        assert "results" in payload
+        assert "count" in payload
+        assert "truncated" in payload
 
     def test_cross_repo_scoping_default_false(self, seeded_graph):
         seeded_graph.upsert_repository("_smoketest_mcp_server_b", "Other", "/tmp/other")
