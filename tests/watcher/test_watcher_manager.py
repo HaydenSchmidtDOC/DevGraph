@@ -258,3 +258,90 @@ def test_watcher_manager_never_accepts_raw_paths(temp_registry_db, temp_git_repo
     allowed_methods = {"start", "stop", "refresh"}
     extra_methods = public_methods - allowed_methods
     assert not extra_methods, f"Unexpected public methods: {extra_methods}"
+
+
+def test_watcher_manager_git_state_changed_callback(temp_registry_db, temp_git_repo):
+    """Test that git state changes trigger on_git_state_changed callback after debounce."""
+    registry = temp_registry_db
+    repo_record = registry.add_repo(temp_git_repo)
+
+    git_state_changes = {}
+
+    def on_changes(repo_id: str, paths: set[Path], deleted: set[Path]) -> None:
+        pass
+
+    def on_git_state_changed(repo_id: str) -> None:
+        git_state_changes[repo_id] = True
+
+    watcher = WatcherManager(registry, on_changes, on_git_state_changed)
+    watcher.start()
+
+    try:
+        time.sleep(0.2)
+
+        # Modify HEAD to simulate a git state change
+        head_file = temp_git_repo / ".git" / "HEAD"
+        if head_file.exists():
+            head_file.write_text("ref: refs/heads/main\n")
+
+            # Wait for debounce + callback
+            time.sleep(1.0)
+
+            # Verify callback was called
+            assert repo_record.repo_id in git_state_changes
+    finally:
+        watcher.stop()
+
+
+def test_watcher_manager_git_file_worktree_doesnt_crash(temp_registry_db):
+    """Test that a repo with .git as a file (linked worktree) doesn't crash on startup."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_path = Path(tmpdir)
+
+        # Initialize a git repo
+        import subprocess
+
+        subprocess.run(
+            ["git", "init"],
+            cwd=str(repo_path),
+            capture_output=True,
+            check=True,
+        )
+
+        # Replace .git directory with a file to simulate a linked worktree
+        git_dir = repo_path / ".git"
+        if git_dir.is_dir():
+            import shutil
+
+            shutil.rmtree(git_dir)
+        git_dir.write_text("gitdir: /some/other/path/.git\n")
+
+        # Register the repo and start watcher
+        registry = temp_registry_db
+        repo_record = registry.add_repo(repo_path)
+
+        git_state_changes = {}
+
+        def on_changes(repo_id: str, paths: set[Path], deleted: set[Path]) -> None:
+            pass
+
+        def on_git_state_changed(repo_id: str) -> None:
+            git_state_changes[repo_id] = True
+
+        # This should not crash even though .git is a file
+        watcher = WatcherManager(registry, on_changes, on_git_state_changed)
+        watcher.start()
+
+        try:
+            time.sleep(0.2)
+
+            # Create a file to ensure the watcher still works for normal file changes
+            test_file = repo_path / "test.txt"
+            test_file.write_text("hello")
+
+            time.sleep(1.0)
+
+            # Git state callback should not have been triggered (no .git directory)
+            assert repo_record.repo_id not in git_state_changes
+        finally:
+            watcher.stop()

@@ -29,6 +29,65 @@ from devgraph.registry.store import RepoRegistry, RepoRecord
 logger = logging.getLogger(__name__)
 
 
+class _GitStateEventHandler(FileSystemEventHandler):
+    """Handles git state changes (.git/HEAD, .git/refs) with debouncing."""
+
+    def __init__(
+        self,
+        repo_id: str,
+        debounce_ms: int,
+        on_git_state_changed: Callable[[str], None],
+    ) -> None:
+        self._repo_id = repo_id
+        self._debounce_ms = debounce_ms
+        self._on_git_state_changed = on_git_state_changed
+        self._debounce_timer: threading.Timer | None = None
+        self._lock = threading.Lock()
+
+    def on_modified(self, event: FileModifiedEvent) -> None:
+        """Record git state change and set debounce timer."""
+        if not event.is_directory:
+            with self._lock:
+                self._reset_debounce()
+
+    def on_created(self, event: FileCreatedEvent) -> None:
+        """Record git state change and set debounce timer."""
+        if not event.is_directory:
+            with self._lock:
+                self._reset_debounce()
+
+    def on_deleted(self, event: FileDeletedEvent) -> None:
+        """Record git state change and set debounce timer."""
+        if not event.is_directory:
+            with self._lock:
+                self._reset_debounce()
+
+    def on_moved(self, event: FileMovedEvent) -> None:
+        """Record git state change and set debounce timer."""
+        if not event.is_directory:
+            with self._lock:
+                self._reset_debounce()
+
+    def _reset_debounce(self) -> None:
+        """Reset the debounce timer. Must hold _lock."""
+        if self._debounce_timer:
+            self._debounce_timer.cancel()
+
+        self._debounce_timer = threading.Timer(
+            self._debounce_ms / 1000.0,
+            self._fire_change,
+        )
+        self._debounce_timer.daemon = True
+        self._debounce_timer.start()
+
+    def _fire_change(self) -> None:
+        """Invoke the callback with the repo_id."""
+        with self._lock:
+            self._debounce_timer = None
+        # Invoke callback outside lock to avoid deadlock
+        self._on_git_state_changed(self._repo_id)
+
+
 class WatcherManager:
     """Manages file watchers for active, watch-enabled repositories.
 
@@ -41,6 +100,7 @@ class WatcherManager:
         self,
         registry: RepoRegistry,
         on_changes: Callable[[str, set[Path], set[Path]], None],
+        on_git_state_changed: Callable[[str], None] | None = None,
     ) -> None:
         """Initialize the watcher manager.
 
@@ -48,11 +108,15 @@ class WatcherManager:
             registry: RepoRegistry instance to read allowed repos from.
             on_changes: Callback(repo_id, changed_paths, deleted_paths)
                 invoked when the debounce interval elapses.
+            on_git_state_changed: Optional callback(repo_id) invoked when git
+                state changes (.git/HEAD, .git/refs, etc.).
         """
         self._registry = registry
         self._on_changes = on_changes
+        self._on_git_state_changed = on_git_state_changed
         self._observers: dict[str, Observer] = {}
         self._handlers: dict[str, _RepoEventHandler] = {}
+        self._git_handlers: dict[str, _GitStateEventHandler] = {}
         self._debounce_ms = get_settings().watch_debounce_ms
         self._lock = threading.Lock()
 
@@ -120,6 +184,24 @@ class WatcherManager:
         for child in repo.path.iterdir():
             if child.is_dir() and not is_ignored_path(child.relative_to(repo.path)):
                 observer.schedule(handler, str(child), recursive=True)
+
+        # Watch git state changes (.git/HEAD, .git/refs) if .git exists as a directory.
+        # Skip if .git is a file (linked git worktree contains gitdir: ... pointer).
+        git_dir = repo.path / ".git"
+        if git_dir.is_dir() and self._on_git_state_changed:
+            git_handler = _GitStateEventHandler(
+                repo.repo_id,
+                self._debounce_ms,
+                self._on_git_state_changed,
+            )
+            # Non-recursive watch on .git itself (catches HEAD, packed-refs)
+            observer.schedule(git_handler, str(git_dir), recursive=False)
+            # Recursive watch on .git/refs/heads if it exists
+            refs_heads = git_dir / "refs" / "heads"
+            if refs_heads.is_dir():
+                observer.schedule(git_handler, str(refs_heads), recursive=True)
+            self._git_handlers[repo.repo_id] = git_handler
+
         observer.start()
 
         self._observers[repo.repo_id] = observer
@@ -133,6 +215,7 @@ class WatcherManager:
 
         observer = self._observers.pop(repo_id)
         self._handlers.pop(repo_id, None)
+        self._git_handlers.pop(repo_id, None)
 
         if observer.is_alive():
             observer.stop()

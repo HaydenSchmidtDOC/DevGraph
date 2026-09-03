@@ -59,6 +59,7 @@ _ESCAPE_HATCH = ToolAnnotations(readOnlyHint=False, openWorldHint=True)
 # call instead of relying on per-tool docstrings alone.
 _TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "search_component", "identifier_kind": "name/description substring", "envelope": True, "phase": 1},
+    {"name": "list_recent_changes", "identifier_kind": "commit-count window (within_commits), optional entity_type label", "envelope": True, "phase": 3},
     {"name": "trace_request_flow", "identifier_kind": "endpoint name", "envelope": False, "phase": 1},
     {"name": "get_service_dependencies", "identifier_kind": "service name", "envelope": False, "phase": 1},
     {"name": "find_callers", "identifier_kind": "function/class/service/endpoint name (not a file path)", "envelope": True, "phase": 1},
@@ -106,9 +107,36 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
     )
 
     @server.tool(annotations=_READ_ONLY)
-    def search_component(repo_id: str, query: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Search for components by name/description; returns {count, results, truncated}."""
-        return devgraph_tools.search_component(engine, repo_id, query, cross_repo, max_results)
+    def search_component(
+        repo_id: str,
+        query: str,
+        cross_repo: bool = False,
+        max_results: int = 15,
+        modified_within_commits: int | None = None,
+    ) -> dict[str, Any]:
+        """Search for components by name/description; returns {count, results, truncated}.
+        Pass modified_within_commits to restrict to components touched within the last
+        N commits repo-wide (requires git-history recency staging; entities never staged
+        are excluded, not silently included)."""
+        return devgraph_tools.search_component(
+            engine, repo_id, query, cross_repo, max_results, modified_within_commits
+        )
+
+    @server.tool(annotations=_READ_ONLY)
+    def list_recent_changes(
+        repo_id: str,
+        within_commits: int,
+        entity_type: str | None = None,
+        cross_repo: bool = False,
+        max_results: int = 15,
+    ) -> dict[str, Any]:
+        """List entities touched within the last N commits repo-wide, most-recently-modified
+        first; returns {count, results, truncated}. Requires git-history recency staging —
+        entities never staged with last_modified_at are excluded. entity_type optionally
+        restricts to one node label (validated against NODE_LABELS)."""
+        return devgraph_tools.list_recent_changes(
+            engine, repo_id, within_commits, entity_type, cross_repo, max_results
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def trace_request_flow(repo_id: str, start_endpoint: str, cross_repo: bool = False) -> dict[str, Any]:
@@ -127,12 +155,18 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
         cross_repo: bool = False,
         max_results: int = 15,
         scope_to_class: str | None = None,
+        modified_within_commits: int | None = None,
     ) -> dict[str, Any]:
         """Find all callers of a target; returns {count, results, truncated}. CALLS is
         name-based, not type-resolved — pass scope_to_class to narrow to callers made
         from within a specific class's own methods and cut noise from unrelated
-        same-named methods elsewhere in the repo."""
-        return devgraph_tools.find_callers(engine, repo_id, target_name, cross_repo, max_results, scope_to_class)
+        same-named methods elsewhere in the repo. Pass modified_within_commits to
+        restrict to targets touched within the last N commits repo-wide (requires
+        git-history recency staging; entities never staged are excluded, not silently
+        included)."""
+        return devgraph_tools.find_callers(
+            engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def find_related_files(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
@@ -271,7 +305,7 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
             "identifier it expects (a name vs. a file path vs. git refs — the most "
             "common usage mistake), whether its response uses the count/results/"
             "truncated envelope, and which build phase introduced it. Cheaper to "
-            "read once than to infer from trial and error across 18 tools."
+            "read once than to infer from trial and error across 20 tools."
         ),
         mime_type="application/json",
     )

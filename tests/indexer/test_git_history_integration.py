@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from devgraph.graph.engine import GraphEngine
-from devgraph.indexer.git_history.extractor import index_repo_history
+from devgraph.indexer.git_history.extractor import index_repo_history, sync_git_history
 from devgraph.registry.store import RepoRegistry
 
 
@@ -123,3 +123,95 @@ def test_modifies_edge_resolves_for_nested_file(graph_engine, registry):
             assert result[0]["count"] == 1
         finally:
             graph_engine.delete_repository(record.repo_id)
+
+
+def test_sync_git_history_initial_walk_stages_module_recency(graph_engine, temp_git_repo, registry):
+    repo_id = "_smoketest_sync_initial"
+    record = registry.add_repo(temp_git_repo, repo_id=repo_id)
+    graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
+
+    try:
+        outcome = sync_git_history(graph_engine, registry, record.repo_id)
+        assert outcome["mode"] == "initial"
+        assert outcome["commits_indexed"] == 1
+
+        result = graph_engine.run_cypher(
+            "MATCH (m:Module {repo_id: $repo_id, name: 'service.py'}) "
+            "RETURN m.created_at AS created_at, m.last_modified_at AS last_modified_at",
+            {"repo_id": record.repo_id},
+        )
+        assert result[0]["created_at"] is not None
+        assert result[0]["created_at"] == result[0]["last_modified_at"]
+
+        # HEAD unchanged -> no-op
+        outcome_again = sync_git_history(graph_engine, registry, record.repo_id)
+        assert outcome_again["mode"] == "noop"
+    finally:
+        graph_engine.delete_repository(record.repo_id)
+
+
+def test_sync_git_history_fast_path_advances_recency(graph_engine, temp_git_repo, registry):
+    repo_id = "_smoketest_sync_fast"
+    record = registry.add_repo(temp_git_repo, repo_id=repo_id)
+    graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
+
+    try:
+        sync_git_history(graph_engine, registry, record.repo_id)
+
+        (temp_git_repo / "service.py").write_text("x = 2\n")
+        _run_git(temp_git_repo, "add", "service.py")
+        _run_git(temp_git_repo, "commit", "-m", "Update service")
+
+        outcome = sync_git_history(graph_engine, registry, record.repo_id)
+        assert outcome["mode"] == "fast"
+        assert outcome["commits_indexed"] == 1
+
+        result = graph_engine.run_cypher(
+            "MATCH (c:Commit {repo_id: $repo_id}) RETURN COUNT(*) as count",
+            {"repo_id": record.repo_id},
+        )
+        assert result[0]["count"] == 2
+    finally:
+        graph_engine.delete_repository(record.repo_id)
+
+
+def test_sync_git_history_reconcile_deletes_orphans_and_resets_recency(
+    graph_engine, temp_git_repo, registry
+):
+    repo_id = "_smoketest_sync_reconcile"
+    record = registry.add_repo(temp_git_repo, repo_id=repo_id)
+    graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
+
+    try:
+        sync_git_history(graph_engine, registry, record.repo_id)
+
+        first_head = registry.get(record.repo_id).last_indexed_commit
+
+        # Simulate a rebase/reset: amend the last commit so the previously
+        # indexed SHA is no longer reachable from HEAD.
+        (temp_git_repo / "service.py").write_text("x = 3\n")
+        _run_git(temp_git_repo, "add", "service.py")
+        _run_git(temp_git_repo, "commit", "--amend", "-m", "Rewritten initial commit")
+
+        outcome = sync_git_history(graph_engine, registry, record.repo_id)
+        assert outcome["mode"] == "reconcile"
+        assert outcome["commits_deleted"] == 1
+
+        result = graph_engine.run_cypher(
+            "MATCH (c:Commit {repo_id: $repo_id, name: $sha}) RETURN COUNT(*) as count",
+            {"repo_id": record.repo_id, "sha": first_head},
+        )
+        assert result[0]["count"] == 0
+
+        result = graph_engine.run_cypher(
+            "MATCH (c:Commit {repo_id: $repo_id}) RETURN COUNT(*) as count",
+            {"repo_id": record.repo_id},
+        )
+        assert result[0]["count"] == 1
+    finally:
+        graph_engine.delete_repository(record.repo_id)
+
+
+def test_sync_git_history_unknown_repo_raises(graph_engine, registry):
+    with pytest.raises(ValueError):
+        sync_git_history(graph_engine, registry, "nonexistent")

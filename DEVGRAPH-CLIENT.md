@@ -33,11 +33,11 @@ needs to know to use it.
 
 DevGraph builds a queryable graph of a repo's structure — modules, classes,
 functions, containers, API endpoints, datastores, design decisions,
-requirements, mentions, and git history — and exposes it through 19 always-on MCP tools
+requirements, mentions, and git history — and exposes it through 20 always-on MCP tools
 (`search_component`, `find_callers`, `impact_analysis`,
 `impact_analysis_for_diff`, `explain_architecture`, `blame_component`,
-`find_requirements_for`, `find_mentions`, `get_source`, etc.), plus the opt-in `run_cypher`
-escape hatch (20 total when enabled).
+`find_requirements_for`, `find_mentions`, `list_recent_changes`, `get_source`, etc.), plus the opt-in `run_cypher`
+escape hatch (21 total when enabled).
 Once a repo is registered and indexed, an AI assistant can answer questions
 like "what depends on this module" or "why was this decision made" by
 querying the graph directly, instead of grepping/reading the whole tree
@@ -194,7 +194,7 @@ Claude Code version in use — check `claude mcp add --help` if the printed
 command doesn't match; the important part is the command/args/cwd above, not
 the specific CLI invocation.
 
-Once connected, 19 tools become available, all scoped by a `repo_id`
+Once connected, 20 tools become available, all scoped by a `repo_id`
 argument. **Always pass this repo's `repo_id` from step 1.** Never pass
 `cross_repo: true` unless the user explicitly asks for a cross-repository
 answer — the default is (and must stay) scoped to this repo only.
@@ -232,12 +232,15 @@ Prefer these over re-reading files when the question is structural:
 | Question shape | Tool |
 |---|---|
 | "What is X / where is it?" | `search_component` |
+| "What is X, but only recently modified?" | `search_component` with `modified_within_commits=N` (only matches entities touched in the last N commits) |
 | "What calls X?" | `find_callers` (name, not path) |
+| "What calls X, but only recently modified?" | `find_callers` with `modified_within_commits=N` (filters results to entities touched in the last N commits) |
 | "What calls X, but only from within class Y?" | `find_callers` with `scope_to_class=Y` (cuts noise from unrelated same-named methods elsewhere in the repo) |
 | "What breaks if I change X?" | `impact_analysis` (name, not path) |
 | "What breaks across this whole PR/diff?" | `impact_analysis_for_diff` (base_ref/head_ref, both must exist locally — never fetches) |
 | "What does X depend on?" | `get_service_dependencies` (service name), `find_related_files` (function/class name, not path) |
 | "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name) |
+| "What changed recently?" | `list_recent_changes` (lists entities touched in the last N commits, most-recent first; filters by optional entity type) |
 | "What's the overall architecture?" | `explain_architecture`, `summarise_repository` |
 | "What changed between two branches?" | `compare_branches` — **stub**: registered and callable, but not yet fully wired to git metadata; treat results as unreliable until DevGraph's own docs say otherwise |
 | "Why was X built this way?" | `explain_decision`, `trace_design_rationale` |
@@ -251,6 +254,16 @@ If a tool returns empty/sparse results, check whether the repo has actually
 been scanned (step 1/2) before concluding the graph has nothing to say — an
 unindexed repo will legitimately return empty results, that's not a tool
 failure.
+
+## Recency filtering and git-derived properties
+
+When you index a repo with `--full` (step 1), or run `index-history` separately (step 2), DevGraph stages git-derived recency properties on nodes:
+
+- **`Module` nodes** get `created_at` (earliest commit touching that file) and `last_modified_at` (most recent commit touching it). Both are aggregated from `Commit` nodes linked via `MODIFIES` edges.
+- **`Function` and `Class` nodes** get `last_modified_at` only — the commit whose changes most recently touched that function/class's source line range (via `git blame`). No `created_at` at this granularity — it would require `git log -L`, which is too fragile for practical use in an always-on indexer.
+- **Author tracking** (`last_modified_by`: the name of the author who last modified that entity) is opt-in and off by default. Enable it by setting `DEVGRAPH_GIT_RECENCY_TRACK_AUTHOR=true` in DevGraph's own environment, or via DevGraph's config.
+
+**Automatic sync**: Once a repo is indexed via `--full` or `index-history` at least once, its history is **automatically kept in sync** whenever `.git` changes (branch switches, rebases, resets, new commits). No manual command needed — the background watcher detects `.git` state changes and reconciles the graph correctly, including deletion of orphaned `Commit` nodes when history is rewritten. Use `modified_within_commits=N` on `find_callers`, `search_component`, or `list_recent_changes` to query only entities touched in the last N commits.
 
 All previously-documented gaps here (`find_callers`/`impact_analysis` seeing
 no call edges, `explain_architecture` returning no `uses`/`calls`, relative

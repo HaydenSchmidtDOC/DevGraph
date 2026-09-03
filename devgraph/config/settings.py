@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     allow_cross_repo: bool = False
     cloud_sync: bool = False
     enable_run_cypher: bool = False
+    git_recency_track_author: bool = False
 
     mentions_ambiguous_mode: str = "all"
     registry_db_path: Path = Path.home() / ".devgraph" / "registry.sqlite3"
