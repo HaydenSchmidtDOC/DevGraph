@@ -229,6 +229,52 @@ class TestRemovePaths:
         finally:
             engine.delete_repository(repo_id)
 
+    def test_removes_document_node_for_deleted_markdown_file_in_subdirectory(self, engine, temp_repo):
+        """Deleting a .md file in a subdirectory must clean up its Document node.
+
+        This tests the fix for the deletion bug where remove_paths() was using
+        bare filename instead of repo-relative path. Without the fix, Document
+        nodes keyed by repo-relative path (e.g., 'docs/guide.md') wouldn't be
+        found when deleting by bare filename ('guide.md').
+        """
+        repo_id = "_smoketest_dispatch_remove_md_subdir"
+
+        # Create a Python file with a known entity
+        py_file = temp_repo / "service.py"
+        py_file.write_text("def my_handler():\n    pass\n")
+
+        # Create Markdown file in a subdirectory mentioning that entity
+        docs_dir = temp_repo / "docs"
+        docs_dir.mkdir()
+        md_file = docs_dir / "guide.md"
+        md_file.write_text("# Guide\n\nThe `my_handler()` function is important.\n")
+
+        try:
+            # Index both files
+            index_paths(engine, repo_id, temp_repo, {py_file})
+            index_paths(engine, repo_id, temp_repo, {md_file}, mentions_enabled=True)
+
+            # Verify Document node was created with repo-relative path as key
+            result = engine.run_cypher(
+                "MATCH (d:Document {repo_id: $repo_id, name: 'docs/guide.md'}) RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert result[0]["c"] == 1, "Document node should exist with repo-relative path"
+
+            # Delete the file and clean up its provenance
+            md_file.unlink()
+            cleaned = remove_paths(engine, repo_id, temp_repo, {md_file})
+            assert cleaned == 1, "remove_paths should report 1 file cleaned"
+
+            # Verify Document node was actually deleted
+            result = engine.run_cypher(
+                "MATCH (d:Document {repo_id: $repo_id, name: 'docs/guide.md'}) RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert result[0]["c"] == 0, "Document node should be deleted"
+        finally:
+            engine.delete_repository(repo_id)
+
 
 class TestFullScan:
     def test_full_scan_indexes_multiple_files(self, engine, temp_repo):
@@ -327,5 +373,116 @@ class TestServiceCrossLinking:
                 {"repo_id": repo_id},
             )
             assert result[0]["c"] == 0
+        finally:
+            engine.delete_repository(repo_id)
+
+
+class TestMentionsIntegration:
+    def test_mentions_enabled_creates_document_and_edge(self, engine, temp_repo):
+        """With mentions_enabled=True, a .md file mentioning a known entity creates Document and MENTIONS edge."""
+        repo_id = "_smoketest_dispatch_mentions_enabled"
+
+        # First, create a Python file with a Function
+        py_file = temp_repo / "service.py"
+        py_file.write_text("def my_handler():\n    pass\n")
+
+        # Then, create a Markdown file mentioning that function
+        md_file = temp_repo / "README.md"
+        md_file.write_text("# API Guide\n\nThe `my_handler()` function processes requests.\n")
+
+        try:
+            # Index the Python file first so the Function exists
+            index_paths(engine, repo_id, temp_repo, {py_file})
+
+            # Index the Markdown file with mentions_enabled=True
+            index_paths(engine, repo_id, temp_repo, {md_file}, mentions_enabled=True)
+
+            # Check that a Document node was created
+            doc_result = engine.run_cypher(
+                "MATCH (d:Document {repo_id: $repo_id, name: 'README.md'}) RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert doc_result[0]["c"] == 1
+
+            # Check that a MENTIONS relationship exists
+            mentions_result = engine.run_cypher(
+                "MATCH (d:Document {repo_id: $repo_id, name: 'README.md'})"
+                "-[:MENTIONS]->(f:Function {repo_id: $repo_id, name: 'my_handler'}) "
+                "RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert mentions_result[0]["c"] == 1
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_mentions_disabled_skips_markdown_outside_docs_path(self, engine, temp_repo):
+        """With mentions_enabled=False (default), .md files outside docs_root are not scanned at all."""
+        repo_id = "_smoketest_dispatch_mentions_disabled"
+
+        # Create a Python file with a Function
+        py_file = temp_repo / "service.py"
+        py_file.write_text("def helper():\n    pass\n")
+
+        # Create a Markdown file at repo root (outside docs_path)
+        md_file = temp_repo / "README.md"
+        md_file.write_text("# Readme\n\nThe `helper()` function is important.\n")
+
+        try:
+            # Index Python file
+            index_paths(engine, repo_id, temp_repo, {py_file})
+
+            # Index Markdown file with mentions_enabled=False (default)
+            index_paths(engine, repo_id, temp_repo, {md_file}, mentions_enabled=False)
+
+            # Verify no Document node was created
+            doc_result = engine.run_cypher(
+                "MATCH (d:Document {repo_id: $repo_id, name: 'README.md'}) RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert doc_result[0]["c"] == 0
+
+            # Verify no MENTIONS relationship
+            mentions_result = engine.run_cypher(
+                "MATCH (d:Document)-[:MENTIONS]->(f:Function {repo_id: $repo_id, name: 'helper'}) "
+                "RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert mentions_result[0]["c"] == 0
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_mentions_integration_across_file_types(self, engine, temp_repo):
+        """Indexing Python files first, then Markdown files with mentions enabled."""
+        repo_id = "_smoketest_dispatch_mentions_integration"
+
+        # Create a Python file with classes and functions
+        py_file = temp_repo / "service.py"
+        py_file.write_text("class ApiHandler:\n    pass\n\ndef validate_input():\n    pass\n")
+
+        # Create a Markdown file that mentions those entities
+        guide = temp_repo / "ARCHITECTURE.md"
+        guide.write_text("# Architecture\n\nThe `ApiHandler` class and `validate_input()` function handle requests.\n")
+
+        try:
+            # Index Python file first so entities exist
+            index_paths(engine, repo_id, temp_repo, {py_file})
+
+            # Then index Markdown file with mentions enabled
+            index_paths(engine, repo_id, temp_repo, {guide}, mentions_enabled=True)
+
+            # Check that a Document node was created
+            doc_result = engine.run_cypher(
+                "MATCH (d:Document {repo_id: $repo_id, name: 'ARCHITECTURE.md'}) RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert doc_result[0]["c"] == 1
+
+            # Check that mentions were indexed for both entities
+            mentions_result = engine.run_cypher(
+                "MATCH (d:Document {repo_id: $repo_id})-[:MENTIONS]->(n) "
+                "RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert mentions_result[0]["c"] >= 2
         finally:
             engine.delete_repository(repo_id)

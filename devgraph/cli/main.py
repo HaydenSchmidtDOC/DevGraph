@@ -62,7 +62,7 @@ def add(
                 try:
                     engine.init_schema()
                     engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
-                    count = full_scan(engine, record.repo_id, record.path, docs_path=record.docs_path)
+                    count = full_scan(engine, record.repo_id, record.path, docs_path=record.docs_path, mentions_enabled=record.mentions_enabled)
                     registry.mark_indexed(record.repo_id)
                     console.print(f"[green][OK][/green] Indexed {count} file(s)")
 
@@ -184,7 +184,7 @@ def rescan(
             try:
                 engine.init_schema()
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
-                count = full_scan(engine, repo_id, repo.path, docs_path=repo.docs_path)
+                count = full_scan(engine, repo_id, repo.path, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled)
                 registry.mark_indexed(repo_id)
                 console.print(f"[green][OK][/green] Rescanned {repo_id}: {count} file(s) indexed")
 
@@ -433,6 +433,20 @@ def issue_source(repo_id: str, action: str) -> None:
     _set_external_source_flag(repo_id, action, "issue_source_enabled", "Issue")
 
 
+@app.command(name="mentions")
+def mentions(repo_id: str, action: str) -> None:
+    """Enable or disable mentions indexing for a repository.
+
+    Off by default (Design Brief Principle 2). When enabled, Markdown files
+    are scanned for references to entities in the graph.
+
+    Args:
+        repo_id: The repository ID.
+        action: 'enable' or 'disable'.
+    """
+    _set_external_source_flag(repo_id, action, "mentions_enabled", "Mentions")
+
+
 def _set_external_source_flag(repo_id: str, action: str, setter_flag: str, label: str) -> None:
     if action not in ("enable", "disable"):
         console.print("[red][X] Error:[/red] action must be 'enable' or 'disable'")
@@ -449,11 +463,13 @@ def _set_external_source_flag(repo_id: str, action: str, setter_flag: str, label
             enabled = action == "enable"
             if setter_flag == "pr_source_enabled":
                 registry.set_pr_source_enabled(repo_id, enabled)
-            else:
+            elif setter_flag == "issue_source_enabled":
                 registry.set_issue_source_enabled(repo_id, enabled)
+            elif setter_flag == "mentions_enabled":
+                registry.set_mentions_enabled(repo_id, enabled)
 
             verb = "enabled" if enabled else "disabled"
-            console.print(f"[green][OK][/green] {label} source {verb} for {repo_id}")
+            console.print(f"[green][OK][/green] {label} {verb} for {repo_id}")
         finally:
             registry.close()
     except typer.Exit:

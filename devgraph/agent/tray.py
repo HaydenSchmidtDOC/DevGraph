@@ -89,7 +89,7 @@ class TrayApp:
             if repo is None:
                 return  # repo was removed between the event firing and now
             if changed_paths:
-                index_paths(self._engine, repo_id, repo.path, changed_paths, docs_path=repo.docs_path)
+                index_paths(self._engine, repo_id, repo.path, changed_paths, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled)
             if deleted_paths:
                 remove_paths(self._engine, repo_id, repo.path, deleted_paths)
             self._registry.mark_indexed(repo_id)

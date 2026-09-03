@@ -17,11 +17,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from devgraph.config import get_settings
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.containers.extractor import ContainerExtractor
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
+from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
 from devgraph.indexer.python.extractor import extract_python_file
 
 _COMPOSE_NAMES = {"docker-compose.yml", "docker-compose.yaml", "podman-compose.yml", "podman-compose.yaml", "compose.yml", "compose.yaml"}
@@ -39,7 +41,7 @@ def is_ignored_path(path: Path) -> bool:
     return any(part in IGNORED_DIR_NAMES or part.endswith(".egg-info") for part in path.parts)
 
 
-def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None) -> int:
+def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None, mentions_enabled: bool = False) -> int:
     """Index a set of changed files, routing each to its extractor by name/extension.
 
     Args:
@@ -52,6 +54,7 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             explicitly hand it, but the extra check guards against a caller
             bug passing an unrelated path.
         docs_path: The repo's configured docs folder (repo-relative), if any.
+        mentions_enabled: Whether to index mentions in Markdown files.
 
     Returns:
         Number of files actually indexed (skipped/unrecognized files don't count).
@@ -107,7 +110,10 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
             index_doc_file(engine, repo_id, resolved)
             indexed += 1
-        elif name_lower in _CONTAINERFILE_NAMES:
+        if mentions_enabled and resolved.suffix in (".md", ".markdown"):
+            index_mentions_file(engine, repo_id, resolved, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode)
+            indexed += 1
+        if name_lower in _CONTAINERFILE_NAMES:
             _index_containerfile(engine, repo_id, resolved)
             indexed += 1
         elif name_lower in _COMPOSE_NAMES:
@@ -224,15 +230,22 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             engine.delete_nodes_by_source_file(repo_id, module_name)
             cleaned += 1
         elif resolved.suffix in (".md", ".markdown"):
-            engine.delete_nodes_by_source_file(repo_id, resolved.name)
+            # Must match the same repo-relative key index_paths() writes
+            # (Document nodes are keyed by path relative to repo_root via
+            # mentions/extractor.py's index_file, not bare filename).
+            try:
+                rel_path = resolved.relative_to(repo_root.resolve()).as_posix()
+            except ValueError:
+                rel_path = resolved.name
+            engine.delete_nodes_by_source_file(repo_id, rel_path)
             cleaned += 1
     return cleaned
 
 
-def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str | None = None) -> int:
+def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str | None = None, mentions_enabled: bool = False) -> int:
     """Walk every file under repo_root and index it, skipping VCS/build/venv noise. Used by `devgraph add`/`rescan`."""
     all_files = {p for p in repo_root.rglob("*") if p.is_file() and not is_ignored_path(p)}
-    return index_paths(engine, repo_id, repo_root, all_files, docs_path=docs_path)
+    return index_paths(engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled)
 
 
 def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path) -> None:

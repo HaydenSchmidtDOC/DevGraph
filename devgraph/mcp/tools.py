@@ -14,6 +14,7 @@ from typing import Any
 import git
 
 from devgraph.graph.engine import GraphEngine
+from devgraph.graph import schema
 from devgraph.registry.store import RepoRegistry
 
 
@@ -876,6 +877,70 @@ def get_source(
         "source": source_text,
         "docstring_full": row.get("docstring_full"),
     }
+
+
+def find_mentions(
+    engine: GraphEngine,
+    repo_id: str,
+    name: str,
+    label: str | None = None,
+    direction: str = "mentioned_by",
+    cross_repo: bool = False,
+    max_results: int = 15,
+) -> dict[str, Any]:
+    """Find Document nodes that mention an entity, or what a Document mentions.
+
+    Args:
+        engine: GraphEngine instance
+        repo_id: Repository ID
+        name: Entity name (for direction="mentioned_by") or Document repo-relative path (for direction="mentions")
+        label: Optional node label filter for the target entity (validates against NODE_LABELS)
+        direction: "mentioned_by" (default) to find Documents mentioning the entity, or
+                   "mentions" to find what a Document mentions
+        cross_repo: If True, search across repos
+        max_results: Maximum number of results to return in the envelope
+
+    Returns:
+        Dict with count, results, and truncated flag containing nodes with name, type (labels), and repo_id
+    """
+    # Validate and reject unrecognized labels
+    if label is not None and label not in schema.NODE_LABELS:
+        return _envelope([], max_results)
+
+    # Build label filter using node label check (not parameterized label in node pattern)
+    label_filter = f"AND $label IN labels(target)" if label else ""
+
+    if direction == "mentions":
+        # Document mentions target: (d:Document {name: $name})-[:MENTIONS]->(target)
+        repo_filter = "" if cross_repo else "AND d.repo_id = $repo_id"
+        cypher = f"""
+        MATCH (d:Document {{name: $name}})-[:MENTIONS]->(target)
+        WHERE true
+        {repo_filter}
+        {label_filter}
+        RETURN target.name as name, labels(target) as type, target.repo_id as repo_id
+        ORDER BY target.name
+        """
+    else:
+        # Mentioned by: (d:Document)-[:MENTIONS]->(target {name: $name})
+        repo_filter = "" if cross_repo else "AND target.repo_id = $repo_id"
+        cypher = f"""
+        MATCH (d:Document)-[:MENTIONS]->(target {{name: $name}})
+        WHERE true
+        {repo_filter}
+        {label_filter}
+        RETURN d.name as name, labels(d) as type, d.repo_id as repo_id
+        ORDER BY d.name
+        """
+
+    params = {"name": name}
+    if label is not None:
+        params["label"] = label
+    if not cross_repo:
+        params["repo_id"] = repo_id
+
+    results = engine.run_cypher(cypher, params)
+    return _envelope(results, max_results)
 
 
 def run_cypher(

@@ -47,13 +47,14 @@ class TestServerBuild:
         tools = asyncio.run(server.list_tools())
         names = {t.name for t in tools}
 
-        assert len(tools) == 18
-        # spot check across all three phases plus Implementation Plan #3's new tool
+        assert len(tools) == 19
+        # spot check across all three phases plus Implementation Plan #3/6's new tools
         assert "search_component" in names
         assert "explain_decision" in names
         assert "blame_component" in names
         assert "impact_analysis_for_diff" in names
         assert "get_source" in names
+        assert "find_mentions" in names
 
     def test_run_cypher_not_registered_by_default(self, engine):
         server = build_server(engine)

@@ -33,11 +33,11 @@ needs to know to use it.
 
 DevGraph builds a queryable graph of a repo's structure — modules, classes,
 functions, containers, API endpoints, datastores, design decisions,
-requirements, and git history — and exposes it through 18 always-on MCP tools
+requirements, mentions, and git history — and exposes it through 19 always-on MCP tools
 (`search_component`, `find_callers`, `impact_analysis`,
 `impact_analysis_for_diff`, `explain_architecture`, `blame_component`,
-`find_requirements_for`, `get_source`, etc.), plus the opt-in `run_cypher`
-escape hatch (19 total when enabled).
+`find_requirements_for`, `find_mentions`, `get_source`, etc.), plus the opt-in `run_cypher`
+escape hatch (20 total when enabled).
 Once a repo is registered and indexed, an AI assistant can answer questions
 like "what depends on this module" or "why was this decision made" by
 querying the graph directly, instead of grepping/reading the whole tree
@@ -194,7 +194,7 @@ Claude Code version in use — check `claude mcp add --help` if the printed
 command doesn't match; the important part is the command/args/cwd above, not
 the specific CLI invocation.
 
-Once connected, 18 tools become available, all scoped by a `repo_id`
+Once connected, 19 tools become available, all scoped by a `repo_id`
 argument. **Always pass this repo's `repo_id` from step 1.** Never pass
 `cross_repo: true` unless the user explicitly asks for a cross-repository
 answer — the default is (and must stay) scoped to this repo only.
@@ -221,7 +221,7 @@ Cypher cap) even if more matches exist beyond that.
 
 `run_cypher` will not appear unless DevGraph's own config has
 `enable_run_cypher=true` set. If it's missing and you need something the
-other 17 tools genuinely can't express, that's a signal a new high-level
+other 18 tools genuinely can't express, that's a signal a new high-level
 tool should be added to DevGraph — not that raw Cypher should be turned on
 as a workaround.
 
@@ -242,6 +242,7 @@ Prefer these over re-reading files when the question is structural:
 | "What changed between two branches?" | `compare_branches` — **stub**: registered and callable, but not yet fully wired to git metadata; treat results as unreliable until DevGraph's own docs say otherwise |
 | "Why was X built this way?" | `explain_decision`, `trace_design_rationale` |
 | "What requirements does X satisfy?" | `find_requirements_for` |
+| "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled) |
 | "Who changed X and when?" | `blame_component` (file path, not name) |
 | "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2) |
 | "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed) |
