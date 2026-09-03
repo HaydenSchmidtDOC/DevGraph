@@ -72,6 +72,7 @@ _TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "explain_decision", "identifier_kind": "DesignDecision name/id", "envelope": False, "phase": 2},
     {"name": "find_requirements_for", "identifier_kind": "component name", "envelope": False, "phase": 2},
     {"name": "trace_design_rationale", "identifier_kind": "component name", "envelope": False, "phase": 2},
+    {"name": "find_mentions", "identifier_kind": "entity name (mentioned_by) or Document repo-relative path (mentions)", "envelope": True, "phase": 2},
     {"name": "blame_component", "identifier_kind": "file path (not a function name)", "envelope": False, "phase": 3},
     {"name": "find_related_prs", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
     {"name": "issue_history_for", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
@@ -194,6 +195,20 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
     def trace_design_rationale(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
         """Trace the design rationale (requirements, decisions, notes) behind a component."""
         return devgraph_tools.trace_design_rationale(engine, repo_id, component_name, cross_repo)
+
+    @server.tool(annotations=_READ_ONLY)
+    def find_mentions(
+        repo_id: str,
+        name: str,
+        label: str | None = None,
+        direction: str = "mentioned_by",
+        cross_repo: bool = False,
+        max_results: int = 15,
+    ) -> dict[str, Any]:
+        """Find Documents mentioning an entity or what a Document mentions; returns {count, results, truncated}.
+        direction="mentioned_by" (default): find Documents mentioning the entity named name.
+        direction="mentions": find what the Document at repo-relative path name mentions."""
+        return devgraph_tools.find_mentions(engine, repo_id, name, label, direction, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
     def blame_component(repo_id: str, component_name: str, cross_repo: bool = False) -> list[dict[str, Any]]:
