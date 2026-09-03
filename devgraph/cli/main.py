@@ -21,7 +21,7 @@ from devgraph.config import get_settings
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
-from devgraph.indexer.git_history.extractor import index_repo_history
+from devgraph.indexer.git_history.extractor import sync_git_history
 from devgraph.registry.store import RepoRegistry
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
@@ -68,8 +68,8 @@ def add(
 
                     if full:
                         try:
-                            history_count = index_repo_history(engine, registry, record.repo_id)
-                            console.print(f"[green][OK][/green] Indexed {history_count} commit(s)")
+                            result = sync_git_history(engine, registry, record.repo_id)
+                            console.print(f"[green][OK][/green] Indexed {result['commits_indexed']} commit(s)")
                         except Exception as e:
                             console.print(
                                 f"[yellow]Full scan complete but history indexing failed:[/yellow] {e}\n"
@@ -190,8 +190,8 @@ def rescan(
 
                 if full:
                     try:
-                        history_count = index_repo_history(engine, registry, repo_id)
-                        console.print(f"[green][OK][/green] Indexed {history_count} commit(s)")
+                        result = sync_git_history(engine, registry, repo_id)
+                        console.print(f"[green][OK][/green] Indexed {result['commits_indexed']} commit(s)")
                     except Exception as e:
                         console.print(
                             f"[yellow]Rescan complete but history indexing failed:[/yellow] {e}\n"
@@ -389,8 +389,8 @@ def index_history(
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
             try:
                 engine.init_schema()
-                count = index_repo_history(engine, registry, repo_id, max_count=max_count)
-                console.print(f"[green][OK][/green] Indexed {count} new commit(s) for {repo_id}")
+                result = sync_git_history(engine, registry, repo_id, max_count=max_count)
+                console.print(f"[green][OK][/green] Indexed {result['commits_indexed']} new commit(s) for {repo_id}")
             finally:
                 engine.close()
         finally:

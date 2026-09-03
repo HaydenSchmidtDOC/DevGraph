@@ -24,6 +24,7 @@ from devgraph.dashboard.app import build_app
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.dispatch import index_paths, remove_paths
+from devgraph.indexer.git_history.extractor import sync_git_history
 from devgraph.registry.store import RepoRegistry
 from devgraph.watcher.manager import WatcherManager
 
@@ -39,7 +40,7 @@ class HeadlessAgent:
         self._engine = GraphEngine(
             self._settings.neo4j_uri, self._settings.neo4j_user, self._settings.neo4j_password
         )
-        self._watcher = WatcherManager(self._registry, on_changes=self._on_changes)
+        self._watcher = WatcherManager(self._registry, on_changes=self._on_changes, on_git_state_changed=self._on_git_state_changed)
         self._healthy = True
         self._stop_event = threading.Event()
         self._last_seen_registry_change = self._registry.last_changed_at()
@@ -73,6 +74,36 @@ class HeadlessAgent:
             )
         except Exception:
             logger.warning("incremental reindex failed for %s", repo_id, exc_info=True)
+
+    def _on_git_state_changed(self, repo_id: str) -> None:
+        """Route git state change events to the git history syncer.
+
+        Called when .git directory state changes (file save, branch switch, etc.),
+        debounced via WatcherManager. Syncs git history and updates recency
+        accordingly — handles append-only fast path as well as history rewrites
+        (rebase, reset, amend).
+        """
+        logger.info("git state changed for %s, syncing history", repo_id)
+        try:
+            result = sync_git_history(self._engine, self._registry, repo_id)
+            logger.info(
+                "git history synced for %s: mode=%s, indexed=%d, deleted=%d",
+                repo_id,
+                result.get("mode"),
+                result.get("commits_indexed", 0),
+                result.get("commits_deleted", 0),
+            )
+            self._events.publish(
+                {
+                    "type": "git_history_synced",
+                    "repo_id": repo_id,
+                    "mode": result.get("mode"),
+                    "commits_indexed": result.get("commits_indexed", 0),
+                    "commits_deleted": result.get("commits_deleted", 0),
+                }
+            )
+        except Exception:
+            logger.warning("git history sync failed for %s", repo_id, exc_info=True)
 
     def _health_check_loop(self) -> None:
         while not self._stop_event.is_set():
