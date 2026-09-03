@@ -228,6 +228,100 @@ class GraphEngine:
         with self._driver.session() as session:
             session.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
 
+    def stage_recency(
+        self,
+        label: str,
+        repo_id: str,
+        name: str,
+        created_at: str | None = None,
+        last_modified_at: str | None = None,
+        last_modified_by: str | None = None,
+    ) -> None:
+        """Ratchet-merge git-derived recency onto a node: `created_at` only
+        moves earlier and `last_modified_at` only moves later, so this is
+        safe to call repeatedly and out of chronological order (e.g. across
+        incremental batches). See `set_recency` for the plain-overwrite
+        variant used during reconciliation.
+
+        The `last_modified_by` CASE deliberately mirrors the
+        `last_modified_at` comparison rather than having its own condition —
+        that's what stops an out-of-order call from clobbering a newer
+        commit's author with an older one's.
+        """
+        with self._driver.session() as session:
+            session.run(
+                f"MERGE (n:{label} {{repo_id: $repo_id, name: $name}}) "
+                "SET n.created_at = CASE WHEN $created_at IS NULL THEN n.created_at "
+                "WHEN n.created_at IS NULL OR $created_at < n.created_at THEN $created_at "
+                "ELSE n.created_at END, "
+                "n.last_modified_at = CASE WHEN $last_modified_at IS NULL THEN n.last_modified_at "
+                "WHEN n.last_modified_at IS NULL OR $last_modified_at > n.last_modified_at THEN $last_modified_at "
+                "ELSE n.last_modified_at END, "
+                "n.last_modified_by = CASE "
+                "WHEN $last_modified_by IS NULL THEN n.last_modified_by "
+                "WHEN n.last_modified_at IS NULL OR $last_modified_at > n.last_modified_at THEN $last_modified_by "
+                "ELSE n.last_modified_by END",
+                repo_id=repo_id,
+                name=name,
+                created_at=created_at,
+                last_modified_at=last_modified_at,
+                last_modified_by=last_modified_by,
+            )
+
+    def set_recency(
+        self,
+        label: str,
+        repo_id: str,
+        name: str,
+        created_at: str | None = None,
+        last_modified_at: str | None = None,
+        last_modified_by: str | None = None,
+    ) -> None:
+        """Overwrite recency from scratch — used only by the reconcile path,
+        where the caller has just recomputed the authoritative value from a
+        fresh full walk and must be able to move a value backward, not just
+        forward (`stage_recency`'s ratchet deliberately can't).
+
+        `last_modified_by` is only included in the SET when not None, so a
+        caller running with `git_recency_track_author` off (always passing
+        `last_modified_by=None`) never nulls out a previously-tracked author.
+        """
+        set_clauses = ["n.created_at = $created_at", "n.last_modified_at = $last_modified_at"]
+        if last_modified_by is not None:
+            set_clauses.append("n.last_modified_by = $last_modified_by")
+        with self._driver.session() as session:
+            session.run(
+                f"MERGE (n:{label} {{repo_id: $repo_id, name: $name}}) "
+                f"SET {', '.join(set_clauses)}",
+                repo_id=repo_id,
+                name=name,
+                created_at=created_at,
+                last_modified_at=last_modified_at,
+                last_modified_by=last_modified_by,
+            )
+
+    def delete_commits(self, repo_id: str, shas: list[str]) -> None:
+        """Delete Commit nodes (and their relationships), scoped to repo_id.
+
+        Used by the reconcile path to drop Commit nodes that are no longer
+        reachable from HEAD after a rebase/reset/abandoned-branch switch.
+
+        Matches on `c.name`, not `c.sha`: Commit nodes are MERGE-keyed on
+        `(repo_id, name)` like every other repo-scoped label (see
+        `constraint_statements`), and `extract_new_commits` upserts each
+        commit's SHA into that `name` property (`upsert_node("Commit",
+        repo_id, commit_node.sha, ...)`) rather than a separate `sha`
+        property — there is no `sha` property on a Commit node to match on.
+        """
+        if not shas:
+            return
+        with self._driver.session() as session:
+            session.run(
+                "MATCH (c:Commit {repo_id: $repo_id}) WHERE c.name IN $shas DETACH DELETE c",
+                repo_id=repo_id,
+                shas=shas,
+            )
+
     def delete_repository(self, repo_id: str) -> None:
         """Remove every node (and its relationships) scoped to this repo_id."""
         with self._driver.session() as session:
