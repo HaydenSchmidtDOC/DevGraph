@@ -93,3 +93,54 @@ def test_docs_path_and_phase3_columns_coexist(registry, temp_git_repo):
     assert fetched.pr_source_enabled is True
     assert fetched.issue_source_enabled is True
     assert fetched.last_indexed_commit == "deadbeef"
+
+
+def test_mentions_enabled_defaults_to_false(registry, temp_git_repo):
+    """Fresh add_repo defaults mentions_enabled to False."""
+    record = registry.add_repo(temp_git_repo)
+    assert record.mentions_enabled is False
+
+
+def test_enable_mentions(registry, temp_git_repo):
+    """set_mentions_enabled can enable mentions indexing."""
+    record = registry.add_repo(temp_git_repo)
+    registry.set_mentions_enabled(record.repo_id, True)
+
+    fetched = registry.get(record.repo_id)
+    assert fetched.mentions_enabled is True
+
+
+def test_disable_mentions_after_enable(registry, temp_git_repo):
+    """set_mentions_enabled can disable mentions indexing after enabling."""
+    record = registry.add_repo(temp_git_repo)
+    registry.set_mentions_enabled(record.repo_id, True)
+    registry.set_mentions_enabled(record.repo_id, False)
+
+    fetched = registry.get(record.repo_id)
+    assert fetched.mentions_enabled is False
+
+
+def test_mentions_enabled_roundtrips(registry, temp_git_repo):
+    """mentions_enabled flag survives get() roundtrip."""
+    record = registry.add_repo(temp_git_repo)
+    registry.set_mentions_enabled(record.repo_id, True)
+
+    fetched = registry.get(record.repo_id)
+    assert fetched.mentions_enabled is True
+
+    # Verify it persists across multiple get() calls
+    fetched_again = registry.get(record.repo_id)
+    assert fetched_again.mentions_enabled is True
+
+
+def test_mentions_coexists_with_other_flags(registry, temp_git_repo):
+    """mentions_enabled flag can coexist with other Phase 3 flags."""
+    record = registry.add_repo(temp_git_repo)
+    registry.set_mentions_enabled(record.repo_id, True)
+    registry.set_pr_source_enabled(record.repo_id, True)
+    registry.set_issue_source_enabled(record.repo_id, True)
+
+    fetched = registry.get(record.repo_id)
+    assert fetched.mentions_enabled is True
+    assert fetched.pr_source_enabled is True
+    assert fetched.issue_source_enabled is True
