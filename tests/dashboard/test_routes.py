@@ -87,9 +87,12 @@ def client(seeded_graph, registry):
 def test_list_repos(client):
     res = client.get("/api/repos")
     assert res.status_code == 200
-    repo_ids = {r["repo_id"] for r in res.json()}
+    body = res.json()
+    assert "repos" in body
+    assert "issues" in body
+    repo_ids = {r["repo_id"] for r in body["repos"]}
     assert {"dash_repo_a", "dash_repo_b"} <= repo_ids
-    repo_a = next(r for r in res.json() if r["repo_id"] == "dash_repo_a")
+    repo_a = next(r for r in body["repos"] if r["repo_id"] == "dash_repo_a")
     assert repo_a["node_count"] >= 4  # 2 services + 1 module + 1 class
 
 

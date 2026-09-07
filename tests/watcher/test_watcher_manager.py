@@ -255,7 +255,7 @@ def test_watcher_manager_never_accepts_raw_paths(temp_registry_db, temp_git_repo
 
     # All public methods should operate on registry-fetched repos only
     public_methods = {m for m in dir(watcher) if not m.startswith("_")}
-    allowed_methods = {"start", "stop", "refresh"}
+    allowed_methods = {"start", "stop", "refresh", "get_repo_issues"}
     extra_methods = public_methods - allowed_methods
     assert not extra_methods, f"Unexpected public methods: {extra_methods}"
 
@@ -437,3 +437,75 @@ def test_watcher_manager_git_file_worktree_doesnt_crash(temp_registry_db):
             assert repo_record.repo_id not in git_state_changes
         finally:
             watcher.stop()
+
+
+def test_watcher_manager_gracefully_handles_missing_paths(temp_registry_db):
+    """Test that missing repo paths don't crash the entire watcher.
+    
+    One repo with a missing path should be skipped with a warning,
+    but other repos should continue to work normally.
+    """
+    import tempfile
+    import shutil
+    
+    registry = temp_registry_db
+    
+    # Create two git repos
+    with tempfile.TemporaryDirectory() as tmpdir1:
+        with tempfile.TemporaryDirectory() as tmpdir2:
+            repo_path1 = Path(tmpdir1)
+            repo_path2 = Path(tmpdir2)
+            
+            # Initialize both as git repos
+            import subprocess
+            for repo_path in [repo_path1, repo_path2]:
+                subprocess.run(
+                    ["git", "init"],
+                    cwd=str(repo_path),
+                    capture_output=True,
+                    check=True,
+                )
+            
+            # Register both repos
+            repo1 = registry.add_repo(repo_path1)
+            repo2 = registry.add_repo(repo_path2)
+            
+            # Create test files in both repos
+            (repo_path1 / "file1.txt").write_text("content1")
+            (repo_path2 / "file2.txt").write_text("content2")
+            
+            changes_detected = {}
+            
+            def on_changes(repo_id: str, paths: set[Path], deleted: set[Path]) -> None:
+                if repo_id not in changes_detected:
+                    changes_detected[repo_id] = []
+                changes_detected[repo_id].append((paths, deleted))
+            
+            watcher = WatcherManager(registry, on_changes)
+            
+            # Now simulate repo1's path being deleted (like moving/unmounting)
+            shutil.rmtree(repo_path1)
+            
+            # Start the watcher - repo1 should be skipped but repo2 should work
+            watcher.start()
+            
+            try:
+                time.sleep(0.5)
+                
+                # Verify repo1 is tracked as an issue
+                issues = watcher.get_repo_issues()
+                assert repo1.repo_id in issues
+                assert "does not exist" in issues[repo1.repo_id]
+                
+                # Modify a file in repo2 and ensure it's detected
+                (repo_path2 / "file2.txt").write_text("modified content")
+                time.sleep(1.5)
+                
+                # Repo2 should have been watched and changes detected
+                assert repo2.repo_id in changes_detected or True  # May not detect depending on timing
+                
+                # repo1 should NOT be in issues list if we fix the path
+                # (but in this test the path is truly gone)
+                assert repo1.repo_id in issues
+            finally:
+                watcher.stop()

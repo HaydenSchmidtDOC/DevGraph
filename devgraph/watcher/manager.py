@@ -138,9 +138,16 @@ class WatcherManager:
         self._git_handlers: dict[str, _GitStateEventHandler] = {}
         self._debounce_ms = get_settings().watch_debounce_ms
         self._lock = threading.Lock()
+        # Track repos with path issues (e.g. missing directory) so they don't
+        # crash the whole watcher. Maps repo_id -> error message.
+        self._repo_issues: dict[str, str] = {}
 
     def start(self) -> None:
-        """Start watchers for all active, watch-enabled repos."""
+        """Start watchers for all active, watch-enabled repos.
+        
+        Repos with invalid paths are logged as warnings and skipped;
+        other repos continue normally so one bad path doesn't crash the whole watcher.
+        """
         with self._lock:
             repos = self._registry.list_repos(active_only=True)
             repos_to_watch = [r for r in repos if r.watch_enabled]
@@ -161,6 +168,7 @@ class WatcherManager:
         """Rebuild watcher set by re-reading the registry.
 
         Called when the registry changes (add/remove/enable/disable).
+        Skips repos with invalid paths (already logged as warnings).
         """
         with self._lock:
             # Get current state
@@ -171,6 +179,7 @@ class WatcherManager:
             # Stop watchers for repos that are no longer active/watch-enabled
             for repo_id in current_ids - desired_ids:
                 self._stop_single(repo_id)
+                self._repo_issues.pop(repo_id, None)  # Clear any cached issues
 
             # Start watchers for new repos
             for repo in repos:
@@ -178,31 +187,52 @@ class WatcherManager:
                     self._start_single(repo)
 
     def _start_single(self, repo: RepoRecord) -> None:
-        """Start a watcher for a single repo. Must hold _lock."""
+        """Start a watcher for a single repo. Must hold _lock.
+        
+        Logs and caches errors for repos with invalid paths; does not raise.
+        This allows other repos to continue watching normally.
+        """
         if repo.repo_id in self._observers:
             return  # Already watching
 
-        handler = _RepoEventHandler(
-            repo.repo_id,
-            repo.path,
-            self._debounce_ms,
-            self._on_changes,
-        )
-        observer = Observer()
-        # Don't hand watchdog a single recursive watch on repo.path: that
-        # puts every file under .venv/.git/build/etc under OS-level
-        # notification too, alongside the repo's actual (much smaller)
-        # source tree. On Windows in particular, a directory that busy can
-        # overflow ReadDirectoryChangesW's notification buffer, which
-        # silently drops ALL pending events for the watch -- including ones
-        # for real source edits -- so the graph looks "live" but quietly
-        # stops picking up changes. Watch the root non-recursively (for
-        # root-level files) plus each non-ignored top-level subdirectory
-        # recursively, mirroring full_scan's IGNORED_DIR_NAMES exclusions.
-        observer.schedule(handler, str(repo.path), recursive=False)
-        for child in repo.path.iterdir():
-            if child.is_dir() and not is_ignored_path(child.relative_to(repo.path)):
-                observer.schedule(handler, str(child), recursive=True)
+        # Validate path exists before attempting to watch
+        if not repo.path.exists() or not repo.path.is_dir():
+            error_msg = f"path does not exist or is not a directory: {repo.path}"
+            self._repo_issues[repo.repo_id] = error_msg
+            logger.warning(
+                f"Skipping watcher for {repo.repo_id}: {error_msg}"
+            )
+            return
+
+        try:
+            handler = _RepoEventHandler(
+                repo.repo_id,
+                repo.path,
+                self._debounce_ms,
+                self._on_changes,
+            )
+            observer = Observer()
+            # Don't hand watchdog a single recursive watch on repo.path: that
+            # puts every file under .venv/.git/build/etc under OS-level
+            # notification too, alongside the repo's actual (much smaller)
+            # source tree. On Windows in particular, a directory that busy can
+            # overflow ReadDirectoryChangesW's notification buffer, which
+            # silently drops ALL pending events for the watch -- including ones
+            # for real source edits -- so the graph looks "live" but quietly
+            # stops picking up changes. Watch the root non-recursively (for
+            # root-level files) plus each non-ignored top-level subdirectory
+            # recursively, mirroring full_scan's IGNORED_DIR_NAMES exclusions.
+            observer.schedule(handler, str(repo.path), recursive=False)
+            for child in repo.path.iterdir():
+                if child.is_dir() and not is_ignored_path(child.relative_to(repo.path)):
+                    observer.schedule(handler, str(child), recursive=True)
+        except (FileNotFoundError, OSError) as e:
+            error_msg = f"failed to schedule watches: {e}"
+            self._repo_issues[repo.repo_id] = error_msg
+            logger.warning(
+                f"Skipping watcher for {repo.repo_id}: {error_msg}"
+            )
+            return
 
         # Watch git state changes (.git/HEAD, .git/refs) if .git exists as a directory.
         # Skip if .git is a file (linked git worktree contains gitdir: ... pointer).
@@ -221,11 +251,19 @@ class WatcherManager:
                 observer.schedule(git_handler, str(refs_heads), recursive=True)
             self._git_handlers[repo.repo_id] = git_handler
 
-        observer.start()
-
-        self._observers[repo.repo_id] = observer
-        self._handlers[repo.repo_id] = handler
-        logger.debug(f"Started watcher for {repo.repo_id} at {repo.path}")
+        try:
+            observer.start()
+            self._observers[repo.repo_id] = observer
+            self._handlers[repo.repo_id] = handler
+            # Clear any cached issues now that watch started successfully
+            self._repo_issues.pop(repo.repo_id, None)
+            logger.debug(f"Started watcher for {repo.repo_id} at {repo.path}")
+        except Exception as e:
+            error_msg = f"failed to start observer: {e}"
+            self._repo_issues[repo.repo_id] = error_msg
+            logger.warning(
+                f"Skipping watcher for {repo.repo_id}: {error_msg}"
+            )
 
     def _stop_single(self, repo_id: str) -> None:
         """Stop a watcher for a single repo. Must hold _lock."""
@@ -240,6 +278,15 @@ class WatcherManager:
             observer.stop()
             observer.join(timeout=5)
         logger.debug(f"Stopped watcher for {repo_id}")
+
+    def get_repo_issues(self) -> dict[str, str]:
+        """Return a copy of repos with path/watcher issues.
+        
+        Returns:
+            Dict mapping repo_id -> error message for repos that couldn't be watched.
+        """
+        with self._lock:
+            return dict(self._repo_issues)
 
 
 class _RepoEventHandler(FileSystemEventHandler):

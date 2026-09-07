@@ -19,6 +19,7 @@ process. The tray app's job is keeping the graph itself current.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 from datetime import datetime, timezone
@@ -159,6 +160,8 @@ class TrayApp:
         registry/store.py). Without this poll, a repo added or re-enabled
         after the tray started stays fully unwatched (though still
         indexable on demand via `rescan`) until the tray is restarted.
+        
+        Also publishes repo_issues event if any repos have path problems.
         """
         try:
             current = self._registry.last_changed_at()
@@ -172,11 +175,23 @@ class TrayApp:
                     self._events.publish({"type": "registry_changed"})
                 except Exception:
                     logger.warning("watcher refresh after registry change failed", exc_info=True)
+        
+        # Always check for repo issues and broadcast them
+        try:
+            repo_issues = self._watcher.get_repo_issues()
+            if repo_issues:
+                self._events.publish({
+                    "type": "repo_issues",
+                    "issues": repo_issues,
+                })
+        except Exception:
+            logger.warning("failed to check repo issues", exc_info=True)
 
     def _write_heartbeat(self) -> None:
         """Write a UTC timestamp `status`/`doctor` read to report tray liveness.
 
         Same directory as registry.sqlite3 — no new settings field needed.
+        Also write repo_issues.json with any repos that have path problems.
         """
         heartbeat_path = self._settings.registry_db_path.parent / "tray_heartbeat.txt"
         try:
@@ -184,6 +199,18 @@ class TrayApp:
             heartbeat_path.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
         except OSError:
             logger.warning("failed to write tray heartbeat file", exc_info=True)
+        
+        # Write repo issues to a JSON file for the CLI to read
+        issues_path = self._settings.registry_db_path.parent / "repo_issues.json"
+        try:
+            repo_issues = self._watcher.get_repo_issues()
+            if repo_issues:
+                issues_path.write_text(json.dumps(repo_issues), encoding="utf-8")
+            elif issues_path.exists():
+                # Clear the file if there are no more issues
+                issues_path.unlink()
+        except Exception:
+            logger.warning("failed to write repo_issues.json", exc_info=True)
 
     def _refresh_icon(self) -> None:
         if self._icon is None:

@@ -48,22 +48,42 @@ def build_router(
     query_log = query_log if query_log is not None else QueryLog()
 
     def _require_repo(repo_id: str) -> None:
+        """Ensure repo_id is registered. Raises 404 if not."""
+        if registry.get(repo_id) is None:
+            raise HTTPException(status_code=404, detail=f"unknown repo: {repo_id}")
+
+    # Load repo issues from file (written by tray app)
+    def _get_repo_issues() -> dict[str, str]:
+        """Load repo issues from the repo_issues.json file if it exists."""
+        settings = get_settings()
+        issues_path = settings.registry_db_path.parent / "repo_issues.json"
+        if issues_path.exists():
+            try:
+                return json.loads(issues_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {}
         if registry.get(repo_id) is None:
             raise HTTPException(status_code=404, detail=f"no such repo_id: {repo_id}")
 
     @router.get("/repos")
-    def list_repos() -> list[dict[str, Any]]:
-        return [
-            {
-                "repo_id": repo.repo_id,
-                "path": str(repo.path),
-                "active": repo.active,
-                "watch_enabled": repo.watch_enabled,
-                "last_indexed": repo.last_indexed,
-                "node_count": queries.count_nodes(engine, repo.repo_id),
-            }
-            for repo in registry.list_repos()
-        ]
+    def list_repos() -> dict[str, Any]:
+        repo_issues = _get_repo_issues()
+        return {
+            "repos": [
+                {
+                    "repo_id": repo.repo_id,
+                    "path": str(repo.path),
+                    "active": repo.active,
+                    "watch_enabled": repo.watch_enabled,
+                    "last_indexed": repo.last_indexed,
+                    "node_count": queries.count_nodes(engine, repo.repo_id),
+                    "issue": repo_issues.get(repo.repo_id),  # Include issue if any
+                }
+                for repo in registry.list_repos()
+            ],
+            "issues": repo_issues,  # Also return all issues as a summary
+        }
 
     @router.get("/repos/{repo_id}/summary")
     def repo_summary(repo_id: str) -> dict[str, Any]:

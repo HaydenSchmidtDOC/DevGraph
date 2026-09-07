@@ -135,6 +135,17 @@ def list() -> None:
             table.add_column("Watch", style="blue")
             table.add_column("Last Indexed", style="yellow")
 
+            # Load repo issues for display
+            settings = get_settings()
+            issues_path = settings.registry_db_path.parent / "repo_issues.json"
+            repo_issues = {}
+            if issues_path.exists():
+                try:
+                    import json
+                    repo_issues = json.loads(issues_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+
             for repo in repos:
                 active_str = "[OK]" if repo.active else "[X]"
                 watch_str = "[OK]" if repo.watch_enabled else "[X]"
@@ -148,6 +159,12 @@ def list() -> None:
                 )
 
             console.print(table)
+            
+            # Show any issues
+            if repo_issues:
+                console.print("\n[bold]⚠️  Repository Issues[/bold]")
+                for repo_id, error_msg in repo_issues.items():
+                    console.print(f"  [yellow]{repo_id}:[/yellow] {error_msg}")
         finally:
             registry.close()
     except Exception as e:
@@ -539,6 +556,19 @@ def status() -> None:
         console.print("  [yellow]not running[/yellow] (no heartbeat file — start with 'devgraph tray start')")
     else:
         console.print(f"  [red]{liveness}[/red]")
+
+    # Repo issues (missing paths, etc.)
+    issues_path = settings.registry_db_path.parent / "repo_issues.json"
+    if issues_path.exists():
+        try:
+            import json
+            issues = json.loads(issues_path.read_text(encoding="utf-8"))
+            if issues:
+                console.print("[bold]⚠️  Repository Issues[/bold]")
+                for repo_id, error_msg in issues.items():
+                    console.print(f"  [yellow]{repo_id}:[/yellow] {error_msg}")
+        except Exception:
+            pass
 
     console.print()
 
