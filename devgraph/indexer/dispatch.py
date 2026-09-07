@@ -25,6 +25,7 @@ from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
 from devgraph.indexer.python.extractor import extract_python_file
+from devgraph.indexer.csharp.extractor import extract_csharp_file
 
 _COMPOSE_NAMES = {"docker-compose.yml", "docker-compose.yaml", "podman-compose.yml", "podman-compose.yaml", "compose.yml", "compose.yaml"}
 _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
@@ -34,7 +35,7 @@ _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
 # this, `devgraph add` on any Python repo with a local venv indexes thousands
 # of third-party dependency files from .venv/site-packages alongside the
 # repo's actual ~dozens of source files.
-IGNORED_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "build", "dist", ".pytest_cache", ".devgraph"}
+IGNORED_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "build", "dist", ".pytest_cache", ".devgraph", "bin", "obj"}
 
 
 def is_ignored_path(path: Path) -> bool:
@@ -65,6 +66,14 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # (rel_path -> (node dicts, rel dicts)) from pass 1's extraction, reused
     # by pass 2 so it re-upserts without re-parsing the file a second time.
     py_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
+    # Parallel lists for C# files, same two-pass rationale as py_files/
+    # py_extractions below (a CALLS/IMPORTS edge from file X to file Y within
+    # the same batch can only materialize once Y's node exists too — see the
+    # second-pass comment). No cross-link pass: datastore/API extraction is
+    # Python-source-specific (regex over Python-shaped code) and out of
+    # scope for this language per Implementation Plan #8.
+    cs_files: list[str] = []
+    cs_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     paths = _expand_with_reverse_dependents(engine, repo_id, repo_root, paths)
 
@@ -107,7 +116,20 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             _index_apis(engine, repo_id, rel_path, content)
             py_files.append((rel_path, content))
             py_extractions[rel_path] = (nodes, rels)
-        elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
+        elif resolved.suffix == ".cs":
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+            result = extract_csharp_file(content, rel_path, repo_id)
+            nodes = [n.to_dict() for n in result.nodes]
+            rels = [r.to_dict() for r in result.relationships]
+            # Same replace-then-re-upsert rationale as the .py branch above:
+            # prune this file's stale nodes/edges in one transaction, then
+            # re-upsert in pass 2 once every file in the batch has a node.
+            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+            indexed += 1
+            cs_files.append(rel_path)
+            cs_extractions[rel_path] = (nodes, rels)
+
+        if docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
             index_doc_file(engine, repo_id, resolved)
             indexed += 1
         if mentions_enabled and resolved.suffix in (".md", ".markdown"):
@@ -133,6 +155,12 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # least once, regardless of first-pass order.
     for rel_path, _content in py_files:
         nodes, rels = py_extractions[rel_path]
+        engine.upsert_nodes(nodes)
+        engine.upsert_relationships(rels)
+
+    # Same re-upsert pass for C# files, same rationale as above.
+    for rel_path in cs_files:
+        nodes, rels = cs_extractions[rel_path]
         engine.upsert_nodes(nodes)
         engine.upsert_relationships(rels)
 
@@ -219,10 +247,11 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
         if not str(resolved).startswith(str(repo_root.resolve())):
             continue
 
-        if resolved.suffix == ".py":
+        if resolved.suffix in (".py", ".cs"):
             # Must match the same repo-relative key index_paths() writes
             # (Module nodes are keyed by path relative to repo_root, not
-            # bare filename — see python/extractor.py's index_file).
+            # bare filename — see python/extractor.py's / csharp/extractor.py's
+            # index_file).
             try:
                 module_name = resolved.relative_to(repo_root.resolve()).as_posix()
             except ValueError:
