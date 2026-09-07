@@ -1,9 +1,16 @@
 # DevGraph Dashboard Rebuild — Design
 
-Status: draft, in review with user. Covers hosting/lifecycle, graph
-rendering, and the full configuration surface for a from-scratch dashboard
-rebuild. UI visual design is being done separately in Claude Design — this
-doc scopes what the UI needs to expose and control, not what it looks like.
+Status: partially implemented. The graph-rendering fixes this doc scoped —
+diffed updates instead of destroy/rebuild, a real backend proxy instead of
+browser-held Neo4j credentials, real (not mock) data for git history/query
+telemetry/settings, and a highlight-only mode so a query dims non-matches
+instead of pruning the graph — have shipped; see `PROJECT_STATUS.md` for
+current state. Most of "Full configuration & feature surface" below (repo
+management, live config, MCP tool exposure from the dashboard) is still
+aspirational, not built. Covers hosting/lifecycle, graph rendering, and the
+full configuration surface for a from-scratch dashboard rebuild. UI visual
+design is being done separately in Claude Design — this doc scopes what the
+UI needs to expose and control, not what it looks like.
 
 ## Why rebuild
 
