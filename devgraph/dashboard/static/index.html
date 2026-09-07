@@ -449,6 +449,10 @@ table.dstable input[type="text"] { width: 100%; }
             <span class="lbl">Auto-refresh on reindex<span class="qmark" data-tip="Diffed updates only — adds/removes changed elements instead of rebuilding the whole graph, so the layout won't jump on every sync.">?</span></span>
             <label class="switch"><input type="checkbox" id="ctlLiveUpdate" checked /><span class="track"></span><span class="thumb"></span></label>
           </div>
+          <div class="toggle-row">
+            <span class="lbl">Highlight query matches only<span class="qmark" data-tip="On: the query never adds or removes nodes/relationships from the canvas or re-settles the layout — it only dims whatever the current query doesn't match. Off: the graph is rebuilt to exactly match each query's results (may add, remove, and re-settle).">?</span></span>
+            <label class="switch"><input type="checkbox" id="ctlHighlightMode" checked /><span class="track"></span><span class="thumb"></span></label>
+          </div>
         </div>
       </div>
       <div class="pull-tab" id="pullTab" title="Display controls"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></div>
@@ -819,7 +823,8 @@ function catColorBright(cat) {
    AND type(r)="X") instead of the old exclude-list (AND NOT ... IN [...]).
    Clicking the already-isolated one clears back to the whole graph. Entity
    and relationship isolation are independent of each other. */
-const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000 };
+const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000, highlightMode: true };
+document.getElementById("ctlHighlightMode").addEventListener("change", e => { state.highlightMode = e.target.checked; });
 
 const entityCounts = document.getElementById("entityCounts");
 let entityTotal = 0;
@@ -1226,10 +1231,12 @@ function forceDirectedSettle(onDone, mode) {
    right now — but it's the mechanism a real reindex hook should call:
    mode "light" for a small incremental change, "full" for a first load or
    a wholesale scope change like switching repos. */
-function mergeGraphElements(elements, mode) {
+function mergeGraphElements(elements, mode, opts) {
+  const remove = opts ? !!opts.remove : true;
+  const settle = opts ? !!opts.settle : true;
   const incoming = new Map(elements.map(el => [el.data.id, el]));
   const existingIds = new Set(cy.elements().map(e => e.id()));
-  const toRemove = cy.elements().filter(e => !incoming.has(e.id()));
+  const toRemove = remove ? cy.elements().filter(e => !incoming.has(e.id())) : cy.collection();
   const toAdd = [...incoming.values()].filter(el => !existingIds.has(el.data.id));
 
   /* A text-only file edit re-indexes the same nodes/edges under the same
@@ -1278,9 +1285,28 @@ function mergeGraphElements(elements, mode) {
   cy.add(newEdgeEls);
   newEdgeEls.forEach(el => cy.getElementById(el.data.id).data("glow", 0));
 
-  const touchedRatio = toAdd.length / Math.max(1, cy.elements().length);
-  forceDirectedSettle(() => focusRotation(null, 60, 1000), mode || (touchedRatio > 0.25 ? "full" : "light"));
+  if (settle) {
+    const touchedRatio = toAdd.length / Math.max(1, cy.elements().length);
+    forceDirectedSettle(() => focusRotation(null, 60, 1000), mode || (touchedRatio > 0.25 ? "full" : "light"));
+  }
   return true;
+}
+
+/* highlight-mode companion to mergeGraphElements: never removes an existing
+   element and never re-settles -- the query result only decides who's
+   ".excluded" (dimmed) right now, exactly like the pre-backend prototype's
+   query console did against its single static demo graph. New ids the graph
+   has genuinely never seen (a repo switched to for the first time, a real
+   reindex addition) still get added -- "never remove, only highlight" is
+   the ask, not "never learn about new data" -- they're just placed with no
+   settle pass, same positioning fallback mergeGraphElements uses. */
+function applyHighlightFromQuery(elements) {
+  mergeGraphElements(elements, undefined, { remove: false, settle: false });
+  const includedIds = new Set(elements.map(el => el.data.id));
+  cy.elements().forEach(e => e.toggleClass("excluded", !includedIds.has(e.id())));
+  document.getElementById("visibleCount").textContent =
+    cy.nodes().filter(n => !n.hasClass("excluded")).length + " nodes · " +
+    cy.edges().filter(e => !e.hasClass("excluded")).length + " edges";
 }
 
 /* graph stage height = 80% of the viewport below the topnav, kept in sync on resize
@@ -1639,8 +1665,11 @@ async function refreshGraph(mode, record) {
     if (!json.errors?.length) {
       const elements = mapGraphResultToElements(json.results[0].data);
       if (elements.length) {
-        mergeGraphElements(elements, mode);
-        applyState(true);
+        // An empty canvas (first load) always needs a real settle -- highlight
+        // mode's "leave the graph as is" only means something once there's a
+        // graph on screen to leave alone.
+        if (state.highlightMode && cy.elements().length > 0) applyHighlightFromQuery(elements);
+        else { mergeGraphElements(elements, mode); applyState(true); }
         ok = true;
       }
     }
