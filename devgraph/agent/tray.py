@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import threading
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -231,6 +232,10 @@ class TrayApp:
             self._watcher.start()
         self._refresh_icon()
 
+    def _open_dashboard(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        url = f"http://{self._settings.dashboard_host}:{self._settings.dashboard_port}"
+        webbrowser.open(url)
+
     def _run_dashboard(self) -> None:
         """Runs on its own daemon thread with its own asyncio loop, hosting
         uvicorn.Server -- kept off the tray's pystray main loop (which
@@ -293,6 +298,7 @@ class TrayApp:
 
         menu = pystray.Menu(
             pystray.MenuItem(lambda item: self._status_text(), None, enabled=False),
+            pystray.MenuItem("Open Dashboard", self._open_dashboard),
             pystray.MenuItem(
                 lambda item: "Resume watching" if self._paused else "Pause watching",
                 self._toggle_pause,
