@@ -23,6 +23,7 @@ from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.containers.extractor import ContainerExtractor
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
+from devgraph.indexer.csharp.extractor import extract_csharp_file
 from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
 from devgraph.indexer.python.extractor import extract_python_file
@@ -35,7 +36,7 @@ _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
 # this, `devgraph add` on any Python repo with a local venv indexes thousands
 # of third-party dependency files from .venv/site-packages alongside the
 # repo's actual ~dozens of source files.
-IGNORED_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "build", "dist", ".pytest_cache", ".devgraph", "node_modules"}
+IGNORED_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "build", "dist", ".pytest_cache", ".devgraph", "node_modules", "bin", "obj"}
 
 _JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
 
@@ -69,13 +70,16 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # by pass 2 so it re-upserts without re-parsing the file a second time.
     py_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     # Same two-pass cross-link machinery as py_files/py_extractions above,
-    # kept as a parallel list rather than merged with the Python one: JS/TS
-    # extraction (_index_datastores/_index_apis/_owning_service_relationships
-    # below) is still keyed to Python source conventions (e.g. regex/AST
-    # patterns tuned for Python), so JS files don't participate in those
-    # passes - only in their own node/edge re-upsert pass.
+    # kept as parallel lists rather than merged with the Python one:
+    # datastore/API extraction (_index_datastores/_index_apis/
+    # _owning_service_relationships below) is still keyed to Python source
+    # conventions (regex/AST patterns tuned for Python), so non-Python files
+    # don't participate in those passes — only in their own node/edge
+    # re-upsert pass.
     js_files: list[str] = []  # rel_path, for the cross-link pass below
     js_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
+    cs_files: list[str] = []
+    cs_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     paths = _expand_with_reverse_dependents(engine, repo_id, repo_root, paths)
 
@@ -130,6 +134,18 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             indexed += 1
             js_files.append(rel_path)
             js_extractions[rel_path] = (nodes, rels)
+        elif resolved.suffix == ".cs":
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+            result = extract_csharp_file(content, rel_path, repo_id)
+            nodes = [n.to_dict() for n in result.nodes]
+            rels = [r.to_dict() for r in result.relationships]
+            # Same replace-then-re-upsert rationale as the .py branch above:
+            # prune this file's stale nodes/edges in one transaction, then
+            # re-upsert in pass 2 once every file in the batch has a node.
+            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+            indexed += 1
+            cs_files.append(rel_path)
+            cs_extractions[rel_path] = (nodes, rels)
         elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
             index_doc_file(engine, repo_id, resolved)
             indexed += 1
@@ -163,6 +179,12 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # for JS/TS files.
     for rel_path in js_files:
         nodes, rels = js_extractions[rel_path]
+        engine.upsert_nodes(nodes)
+        engine.upsert_relationships(rels)
+
+    # Same re-upsert pass for C# files, same rationale as above.
+    for rel_path in cs_files:
+        nodes, rels = cs_extractions[rel_path]
         engine.upsert_nodes(nodes)
         engine.upsert_relationships(rels)
 
@@ -249,10 +271,11 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
         if not str(resolved).startswith(str(repo_root.resolve())):
             continue
 
-        if resolved.suffix == ".py":
+        if resolved.suffix in (".py", ".cs"):
             # Must match the same repo-relative key index_paths() writes
             # (Module nodes are keyed by path relative to repo_root, not
-            # bare filename — see python/extractor.py's index_file).
+            # bare filename — see python/extractor.py's / csharp/extractor.py's
+            # index_file).
             try:
                 module_name = resolved.relative_to(repo_root.resolve()).as_posix()
             except ValueError:
