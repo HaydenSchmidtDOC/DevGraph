@@ -955,8 +955,12 @@ const cy = cytoscape({
   autoungrabify: true, /* dragging nodes is off entirely — the graph only pans/zooms/rotates now */
 });
 cy.one("layoutstop", () => forceDirectedSettle(() => focusRotation(null, 60, 1000)));
-cy.on("mouseover", "node", e => e.target.addClass("show-label hover-hl"));
-cy.on("mouseout", "node", e => { e.target.removeClass("hover-hl"); if (!STRUCTURAL_CATS.has(e.target.data("cat"))) e.target.removeClass("show-label"); });
+cy.on("mouseover", "node", e => { e.target.addClass("show-label hover-hl"); setNodeGlowActive(e.target.id(), true); });
+cy.on("mouseout", "node", e => {
+  e.target.removeClass("hover-hl");
+  if (!STRUCTURAL_CATS.has(e.target.data("cat"))) e.target.removeClass("show-label");
+  setNodeGlowActive(e.target.id(), (e.target.data("glow")||0) > 0.02);
+});
 
 /* ── node/relationship inspector: tap an element for its real properties ──
    Cy elements only carry a curated {id, label, cat} — enough for the graph
@@ -1296,22 +1300,6 @@ function mergeGraphElements(elements, mode, opts) {
   return true;
 }
 
-/* highlight-mode companion to mergeGraphElements: never removes an existing
-   element and never re-settles -- the query result only decides who's
-   ".excluded" (dimmed) right now, exactly like the pre-backend prototype's
-   query console did against its single static demo graph. New ids the graph
-   has genuinely never seen (a repo switched to for the first time, a real
-   reindex addition) still get added -- "never remove, only highlight" is
-   the ask, not "never learn about new data" -- they're just placed with no
-   settle pass, same positioning fallback mergeGraphElements uses. */
-function applyHighlightFromQuery(elements) {
-  mergeGraphElements(elements, undefined, { remove: false, settle: false });
-  const includedIds = new Set(elements.map(el => el.data.id));
-  cy.elements().forEach(e => e.toggleClass("excluded", !includedIds.has(e.id())));
-  document.getElementById("visibleCount").textContent =
-    cy.nodes().filter(n => !n.hasClass("excluded")).length + " nodes · " +
-    cy.edges().filter(e => !e.hasClass("excluded")).length + " edges";
-}
 
 /* graph stage height = 80% of the viewport below the topnav, kept in sync on resize
    so cytoscape's internal render size and the fit/pan math stay correct */
@@ -1411,19 +1399,30 @@ requestAnimationFrame(rotationTick);
 
 /* ── glow layer: additive-blend radial gradients drawn behind cytoscape's own
    canvas, synced to real node screen positions. Only nodes with glow intensity
-   (query match, or hover) actually draw a bloom — everything else stays flat. */
+   (query match, or hover) actually draw a bloom — everything else stays flat.
+   activeGlowIds tracks just those nodes so this handler (which "render" fires
+   every frame, including every ambient-rotation tick) doesn't have to scan
+   the whole node set — mostly empty — 60 times a second. */
 const glowCanvas = document.getElementById("glowCanvas");
 const glowCtx = glowCanvas.getContext("2d");
 function hexToRgb(hex) { const n = parseInt(hex.slice(1),16); return [(n>>16)&255,(n>>8)&255,n&255]; }
+const activeGlowIds = new Set();
+function setNodeGlowActive(id, active) { if (active) activeGlowIds.add(id); else activeGlowIds.delete(id); }
+let glowCanvasHadContent = false;
 function renderGlow() {
   const rect = cy.container().getBoundingClientRect();
+  if (activeGlowIds.size === 0) {
+    if (glowCanvasHadContent) { glowCtx.clearRect(0, 0, rect.width, rect.height); glowCanvasHadContent = false; }
+    return;
+  }
   const dpr = 2;
   glowCanvas.width = rect.width * dpr; glowCanvas.height = rect.height * dpr;
   glowCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
   glowCtx.clearRect(0, 0, rect.width, rect.height);
   glowCtx.globalCompositeOperation = "lighter";
-  cy.nodes().forEach(n => {
-    if (n.hasClass("excluded") || n.style("display") === "none") return;
+  activeGlowIds.forEach(id => {
+    const n = cy.getElementById(id);
+    if (!n || n.empty() || n.hasClass("excluded") || n.style("display") === "none") return;
     const hovered = n.hasClass("hover-hl");
     const intensity = Math.max(n.data("glow")||0, hovered ? 1 : 0);
     if (intensity <= 0.02) return;
@@ -1440,10 +1439,13 @@ function renderGlow() {
     glowCtx.beginPath(); glowCtx.arc(p.x, p.y, radius, 0, Math.PI*2); glowCtx.fill();
   });
   glowCtx.globalCompositeOperation = "source-over";
+  glowCanvasHadContent = true;
 }
 cy.on("render", renderGlow);
 
-function highlightCat(cat, on) { cy.nodes(`[cat = "${cat}"]`).toggleClass("hover-hl", on); }
+function highlightCat(cat, on) {
+  cy.nodes(`[cat = "${cat}"]`).forEach(n => { n.toggleClass("hover-hl", on); setNodeGlowActive(n.id(), on || (n.data("glow")||0) > 0.02); });
+}
 function highlightRel(rel, on) { cy.edges(`[label = "${rel}"]`).toggleClass("hover-hl", on); }
 
 /* ── smooth glow/deglow: animate each node/edge's "glow" data value toward a
@@ -1463,7 +1465,9 @@ function animateGlowTo(targetIds) {
     eles.forEach(e => {
       const to = targets.has(e.id()) ? 1 : 0;
       const f = from.get(e.id()) || 0;
-      e.data("glow", f + (to - f) * eased);
+      const v = f + (to - f) * eased;
+      e.data("glow", v);
+      if (e.isNode()) setNodeGlowActive(e.id(), v > 0.02 || e.hasClass("hover-hl"));
     });
     if (t < 1) { glowAnimId = requestAnimationFrame(step); } else { glowAnimId = null; }
   }
@@ -1494,7 +1498,18 @@ function applyState(skipQueryBuild, runMode) {
     if (!on) nSeen--;
   });
   let rSeen = 0;
-  cy.edges().forEach(e => { const label = e.data("label"); const on = !state.isolatedRel || !label || label === state.isolatedRel; const within = on && ++rSeen <= state.relCeiling; e.toggleClass("excluded", !within); if (!on) rSeen--; });
+  cy.edges().forEach(e => {
+    const label = e.data("label");
+    const relOn = !state.isolatedRel || !label || label === state.isolatedRel;
+    // An isolated entity should glow along with its own relationships, not
+    // every edge in the graph -- an edge only qualifies if it actually
+    // touches an isolated-type node (its far endpoint doesn't have to).
+    const entityOn = !state.isolatedEntity || e.source().data("cat") === state.isolatedEntity || e.target().data("cat") === state.isolatedEntity;
+    const on = relOn && entityOn;
+    const within = on && ++rSeen <= state.relCeiling;
+    e.toggleClass("excluded", !within);
+    if (!on) rSeen--;
+  });
   document.getElementById("visibleCount").textContent = cy.nodes().filter(n=>!n.hasClass("excluded")).length + " nodes · " + cy.edges().filter(e=>!e.hasClass("excluded")).length + " edges";
   if (!skipQueryBuild) buildQueryFromState(runMode);
 }
@@ -1603,12 +1618,40 @@ function mapGraphResultToElements(results) {
   return [...nodeMap.values(), ...edges];
 }
 /* extracts just the matched node/edge ids from a graph-shaped result — used
-   for the glow-preview path, which never replaces the loaded graph */
+   for the glow-preview path, which never replaces the loaded graph. Every
+   node/relationship the query returned counts as a match here — correct for
+   an arbitrary hand-typed query, where "returned" IS "matched". */
 function extractGraphIds(results) {
   const nodeIds = new Set(), edgeIds = new Set();
   results.forEach(r => {
     (r.graph?.nodes || []).forEach(n => nodeIds.add("live:"+n.id));
     (r.graph?.relationships || []).forEach(rel => edgeIds.add("live-e:"+rel.id));
+  });
+  return { nodeIds, edgeIds };
+}
+/* companion to currentStateQuery(): that query returns `m` purely as edge
+   context (Cytoscape needs both endpoints to draw a line) alongside a
+   `matchedId` column that names the actual isolated node per row — this
+   pulls just that column out, so which nodes glow is driven entirely by
+   what the cypher itself marked as matched, not re-derived client-side.
+   Every relationship in the result already satisfies the query's WHERE, so
+   all of them count as matched, same as extractGraphIds.
+   Also used for hand-typed/history queries, not just the state-driven ones
+   that generate their own `matchedId` -- a query without that column (any
+   free-form query, or one written by hand rather than pasted from the
+   isolate controls) falls back to "everything returned is matched", same
+   as extractGraphIds. That means a query copy-pasted straight out of the
+   isolate controls and re-run by hand drives the same node/edge exclusion
+   it did the first time, instead of only glowing without ever dimming
+   anything else -- the two paths agree on what "matched" means. */
+function extractStateMatchedIds(json) {
+  const result = json.results[0];
+  const idx = result.columns.indexOf("matchedId");
+  const nodeIds = new Set(), edgeIds = new Set();
+  result.data.forEach(d => {
+    if (idx >= 0) { if (d.row[idx] != null) nodeIds.add("live:" + d.row[idx]); }
+    else (d.graph?.nodes || []).forEach(n => nodeIds.add("live:" + n.id));
+    (d.graph?.relationships || []).forEach(rel => edgeIds.add("live-e:" + rel.id));
   });
   return { nodeIds, edgeIds };
 }
@@ -1632,7 +1675,15 @@ function escapeCypherStr(s) { return String(s).replace(/["\\]/g, "\\$&"); }
    OPTIONAL MATCH keeps orphan nodes (no matching edges) visible instead of
    silently dropping them, and the post-OPTIONAL-MATCH WHERE nulls out a
    non-matching relationship rather than discarding the row, so isolating a
-   relationship type still shows every node while only that edge type glows. */
+   relationship type still shows every node while only that edge type glows.
+   `m` (the far end of the relationship) still has to come back -- Cytoscape
+   can't draw an edge to a node it's never seen -- but it's context, not a
+   match: `id(n) AS matchedId` is what actually says "this row's isolated
+   node is this one", as a plain integer the backend passes through
+   untouched, so the frontend can tell n from m without guessing from labels
+   or re-deriving the filter client-side. Every relationship this query
+   returns already satisfies WHERE, so it's a match by construction --
+   no separate edge-side check needed. */
 function currentStateQuery() {
   const repo = document.getElementById("repoSelect").value;
   const isolatedEntityId = state.isolatedEntity ? NODE_TYPES.find(t => t.cat === state.isolatedEntity)?.id : null;
@@ -1649,23 +1700,100 @@ function currentStateQuery() {
   const relLimited = state.relCeiling < +relSlider.max;
   let q = `MATCH (n)\nWHERE ${nodeWhere.join(" AND ")}`;
   if (nodeLimited) q += `\nWITH n LIMIT ${state.nodeCeiling}`;
-  q += `\nOPTIONAL MATCH (n)-[r]-(m)`;
-  if (state.isolatedRel) q += `\nWHERE type(r) = "${escapeCypherStr(state.isolatedRel)}" OR r IS NULL`;
-  q += `\nRETURN n, r, m`;
-  if (relLimited) q += `\nLIMIT ${state.relCeiling}`;
+  if (state.isolatedRel && !isolatedEntityId) {
+    // Isolating a relationship type with no entity isolated alongside it:
+    // OPTIONAL MATCH + "type(r) = X OR r IS NULL" (the branch below) only
+    // NULLs out a non-matching relationship on a node that has no OTHER
+    // relationships either -- a node with a mix of matching and
+    // non-matching edges still got a matchedId row from its matching edge,
+    // but a node with only non-matching edges kept slipping through the
+    // same way. A required match sidesteps that: only real endpoints of a
+    // type-X edge come back at all, and since the pattern is undirected,
+    // both endpoints of every matching edge each get their own row (and
+    // their own matchedId) here -- exactly "the nodes on either end of it".
+    // Node inclusion here IS the relationship, so a zero relationship
+    // ceiling correctly means zero nodes -- nothing to special-case below.
+    q += `\nMATCH (n)-[r]-(m)\nWHERE type(r) = "${escapeCypherStr(state.isolatedRel)}"`;
+    q += `\nRETURN n, r, m, id(n) AS matchedId`;
+    if (relLimited) q += `\nLIMIT ${state.relCeiling}`;
+  } else if (state.relCeiling === 0) {
+    // A relationship ceiling of zero -- dragged there, or (as for an entity
+    // type whose every instance is a true orphan, e.g. Database here) simply
+    // because this scope has none to offer -- previously still fell through
+    // to "OPTIONAL MATCH ... LIMIT 0", which caps the combined n/r/m ROW
+    // count, not the relationship count: for an all-orphan entity every row
+    // IS a node (r/m always null), so LIMIT 0 erased the nodes along with
+    // the relationships they never had. Skip the relationship expansion
+    // outright instead: the matched nodes still come back, just with
+    // nothing attached, which is what "zero relationship budget" should
+    // mean for entity/no isolation regardless of why it's zero.
+    q += `\nRETURN n, null AS r, null AS m, id(n) AS matchedId`;
+  } else {
+    q += `\nOPTIONAL MATCH (n)-[r]-(m)`;
+    if (state.isolatedRel) q += `\nWHERE type(r) = "${escapeCypherStr(state.isolatedRel)}" OR r IS NULL`;
+    q += `\nRETURN n, r, m, id(n) AS matchedId`;
+    if (relLimited) q += `\nLIMIT ${state.relCeiling}`;
+  }
   return q;
 }
 
-/* ── the one place that turns "state changed" into "graph on screen
-   changed": builds the query from state, writes it into the visible box
-   (so the box is always the truth, never a stale/different query than what
-   actually populated the canvas), runs it, merges the result in, and
-   refreshes the counts/slider-max panel against that same filter state.
-   Used by every state-driven control (repo select, entity/rel isolate
-   clicks, ceiling release, live reindex refresh) -- NOT by free-form typing
-   in the Cypher box or Run/history-row clicks, which stay the separate
-   non-destructive glow-preview path (previewQueryGlow/runCypherAndDisplay)
-   since an arbitrary typed query has nothing to do with this state. */
+/* ── the one place that turns a cypher query into what's on screen. Every
+   caller funnels through here -- the isolate/ceiling/repo controls (via
+   currentStateQuery(), below), the Run button, and history/sample rows all
+   call the exact same function with the exact same rules for what gets
+   added, what glows, and what's ".excluded". There used to be a second,
+   separate copy of this (applyHighlightFromQuery) that only the
+   state-driven controls went through, which is how they and the Run button
+   drifted apart in the first place -- pasting a state-generated query into
+   the box and running it by hand used to just glow on top of whatever was
+   already there instead of reproducing the same result. Not anymore: same
+   query text in, same graph out, no matter which control ran it.
+   `matchedId` (from currentStateQuery(), or copy-pasted from it) decides
+   who's ".excluded" -- see extractStateMatchedIds. A query without that
+   column (free-form/history) falls back to "everything returned is
+   matched", same as it always did. */
+async function runQueryAndUpdateGraph(query, opts) {
+  document.getElementById("cypherInput").value = query;
+  syncCypherHighlight();
+  const mySeq = ++glowRequestSeq;
+  const json = await runCypher(query, { record: !!opts?.record });
+  if (json.errors?.length) return { ok: false, json };
+  const result = json.results[0];
+  const elements = mapGraphResultToElements(result.data);
+  if (!elements.length) return { ok: false, json };
+  mergeGraphElements(elements, opts?.mode, { remove: !!opts?.replace, settle: !!opts?.replace });
+  if (mySeq !== glowRequestSeq) return { ok: true, json, superseded: true };
+  const matched = extractStateMatchedIds(json);
+  cy.nodes().forEach(n => n.toggleClass("excluded", !matched.nodeIds.has(n.id())));
+  cy.edges().forEach(e => e.toggleClass("excluded", !matched.edgeIds.has(e.id())));
+  document.getElementById("visibleCount").textContent =
+    cy.nodes().filter(n => !n.hasClass("excluded")).length + " nodes · " +
+    cy.edges().filter(e => !e.hasClass("excluded")).length + " edges";
+  animateGlowTo([...matched.nodeIds, ...matched.edgeIds]);
+  // Auto-zoom to the bounds of what the cypher actually matched -- every
+  // caller gets this, not just Run: isolating an entity or relationship,
+  // dragging a ceiling, or hand-running a query should all frame the same
+  // way. A structural replace (opts.replace) already gets its own
+  // whole-graph fit once the settle animation finishes (forceDirectedSettle
+  // below in mergeGraphElements) -- an immediate fit here to the narrower
+  // matched set first, then the wider settle fit after, is what "the
+  // camera already frames the right spot as nodes converge into it" means,
+  // not a conflict.
+  if (matched.nodeIds.size) {
+    const focusColl = cy.collection([...matched.nodeIds].map(id => cy.getElementById(id)).filter(e => e.length));
+    if (focusColl.length) focusRotation(focusColl, opts?.focusMargin ?? 90);
+  }
+  return { ok: true, json };
+}
+
+/* builds the query from state, then runs it through runQueryAndUpdateGraph
+   like anything else -- entity/rel isolate clicks, ceiling release, repo
+   select, live reindex refresh. structural = a genuine scope change (which
+   repo is selected, or the first load): the displayed set must actually be
+   capped to that scope, not just dimmed, so this replaces (remove + resettle)
+   regardless of highlight mode. Everything else stays within the current
+   repo's scope and respects highlight mode: replace only when it's off,
+   otherwise dim-only, matching what it always did. */
 async function refreshGraph(mode, record, structural) {
   // Resync ceiling/max/counts for the CURRENT filter BEFORE building the
   // query -- otherwise an un-isolate (or any change that should raise the
@@ -1673,26 +1801,11 @@ async function refreshGraph(mode, record, structural) {
   // ceiling, and the "real total" panels only catch up a step late.
   if (neo4jConnected) await loadTopologyCounts();
   const q = currentStateQuery();
-  document.getElementById("cypherInput").value = q;
-  syncCypherHighlight();
+  const replace = structural || !state.highlightMode;
   let ok = false;
   try {
-    const json = await runCypher(q, { record: !!record });
-    if (!json.errors?.length) {
-      const elements = mapGraphResultToElements(json.results[0].data);
-      if (elements.length) {
-        // structural = a genuine scope change (which repo is selected, or
-        // the first load) -- the displayed set must actually be capped to
-        // that scope, not just dimmed, so this always takes the
-        // add/remove/settle path regardless of highlight mode. Everything
-        // else (isolating a type, dragging a ceiling slider) stays within
-        // the current repo's scope and respects highlight mode: dim only,
-        // never remove, never re-settle.
-        if (state.highlightMode && !structural && cy.elements().length > 0) applyHighlightFromQuery(elements);
-        else { mergeGraphElements(elements, mode); applyState(true); }
-        ok = true;
-      }
-    }
+    const res = await runQueryAndUpdateGraph(q, { record, mode, replace });
+    ok = res.ok;
   } catch (e) { /* network hiccup -- leave whatever's on screen alone */ }
   return ok;
 }
@@ -1859,36 +1972,31 @@ btnToggleResults.addEventListener("click", () => {
   btnToggleResults.textContent = btnToggleResults.textContent.replace(/^(Show|Hide)/, open ? "Hide" : "Show");
 });
 const DESTRUCTIVE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP)\b/i;
-/* shared by the Run button, clicking an isolate row/chip, and clicking a
-   history row — all three should behave identically: execute, glow, focus,
-   and populate the (collapsed) results toggle. skipConfirm is used by the
-   non-button callers so a destructive-looking sample/history query doesn't
-   need a button in hand to trigger the same confirm() dialog Run would. */
+/* shared by the Run button and clicking a history/sample row. The actual
+   execute-and-update-the-graph work is runQueryAndUpdateGraph -- this is
+   just the button/results-panel chrome around it (running-state, error
+   banner, results table). skipConfirm is used by the non-button callers so
+   a destructive-looking sample/history query doesn't need a button in hand
+   to trigger the same confirm() dialog Run would. */
 async function runCypherAndDisplay(text, opts) {
   if (!text) return;
   if (!opts?.skipConfirm && DESTRUCTIVE_RE.test(text) && !confirm("This looks like a write query (CREATE/DELETE/SET/MERGE/REMOVE/DROP) against your real local Neo4j graph. Run it?")) return;
-  const mySeq = ++glowRequestSeq;
   btnRunCypher.disabled = true; btnRunCypher.textContent = "Running…";
   btnToggleResults.style.display = "none";
   cypherResultsWrap.classList.remove("open");
   cypherErrorEl.textContent = "";
   try {
-    const json = await runCypher(text, { record: true });
+    // replace:false -- Run/history/sample queries add to what's shown, they
+    // don't replace the graph -- same rule runQueryAndUpdateGraph's other
+    // caller (refreshGraph) uses for a non-structural, highlight-mode change.
+    const res = await runQueryAndUpdateGraph(text, { record: true, replace: false, focusMargin: 90 });
     refreshTelemetry();
-    if (json.errors?.length) {
-      cypherErrorEl.innerHTML = `<span style="color:var(--danger)">${escapeHtmlVal(json.errors[0].code)}: ${escapeHtmlVal(json.errors[0].message)}</span>`;
+    if (res.json?.errors?.length) {
+      cypherErrorEl.innerHTML = `<span style="color:var(--danger)">${escapeHtmlVal(res.json.errors[0].code)}: ${escapeHtmlVal(res.json.errors[0].message)}</span>`;
       return;
     }
-    const result = json.results[0];
+    const result = res.json.results[0];
     const rows = result.data.map(d => d.row);
-    const { nodeIds, edgeIds } = extractGraphIds(result.data);
-    if (mySeq === glowRequestSeq) {
-      animateGlowTo([...nodeIds, ...edgeIds]);
-      if (nodeIds.size) {
-        const matched = cy.collection([...nodeIds].map(id => cy.getElementById(id)).filter(e => e.length));
-        if (matched.length) focusRotation(matched, 90);
-      }
-    }
     cypherResultsEl.innerHTML = renderResultTable(result.columns, rows);
     btnToggleResults.textContent = `Show results (${rows.length})`;
     btnToggleResults.style.display = "inline-flex";
