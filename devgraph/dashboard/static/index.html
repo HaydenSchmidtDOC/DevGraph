@@ -1027,6 +1027,91 @@ document.getElementById("btnCloseDetails").addEventListener("click", () => detai
    nudges things into place without re-shuffling a graph that was already
    fine. mode:"full" (default) is for a first load or a materially different
    node set. */
+/* Barnes-Hut spatial partitioning for the repulsion phase below. Naive
+   repulsion is all-pairs (every node checks every other node), which is
+   O(n^2) per step -- fine at a few hundred nodes, but measured at ~360ms
+   per step at "All Repos" scale (~3300 nodes, ~5.3M pairs), meaning a full
+   settle blocked the main thread for over a second per animation frame,
+   repeated ~47 times. A quadtree groups nearby nodes into cells and lets a
+   node treat a whole distant cell as one point (its center of mass) instead
+   of visiting every node in it -- O(n log n) instead of O(n^2), the
+   standard fix for force-directed layouts at this scale (same technique
+   d3-force and sigma.js use). THETA controls the accuracy/speed tradeoff:
+   a cell is only approximated (rather than recursed into) once its size
+   relative to distance from the query point is below THETA -- 0.8 trades a
+   small amount of physical accuracy (repulsion is meant to look organic,
+   not exact) for a large speedup. */
+const QUAD_THETA = 0.8;
+function makeQuadNode(cx, cy, half) {
+  return { cx, cy, half, mass: 0, comX: 0, comY: 0, children: null, leafId: null };
+}
+function quadChildFor(node, p) {
+  const right = p.x >= node.cx, bottom = p.y >= node.cy;
+  return node.children[(bottom ? 2 : 0) + (right ? 1 : 0)];
+}
+function quadInsert(node, id, p, depth) {
+  if (node.mass === 0 && node.children === null) {
+    node.mass = 1; node.comX = p.x; node.comY = p.y; node.leafId = id;
+    return;
+  }
+  if (node.children === null) {
+    // was a leaf -- split into 4 quadrants and re-insert the point it held.
+    // Depth-capped: two nodes at (near-)identical positions would otherwise
+    // recurse forever trying to separate them into ever-smaller quadrants.
+    // Past depth 24 just let the cell hold multiple points (comX/comY
+    // becomes their shared centroid) rather than splitting further --
+    // negligible accuracy cost for what's already an approximation.
+    if (depth >= 24) { node.leafId = null; }
+    else {
+      const oldId = node.leafId, oldP = { x: node.comX, y: node.comY };
+      node.leafId = null;
+      const h = node.half / 2;
+      node.children = [
+        makeQuadNode(node.cx - h, node.cy - h, h),
+        makeQuadNode(node.cx + h, node.cy - h, h),
+        makeQuadNode(node.cx - h, node.cy + h, h),
+        makeQuadNode(node.cx + h, node.cy + h, h),
+      ];
+      quadInsert(quadChildFor(node, oldP), oldId, oldP, depth + 1);
+    }
+  }
+  if (node.children !== null) quadInsert(quadChildFor(node, p), id, p, depth + 1);
+  node.comX = (node.comX * node.mass + p.x) / (node.mass + 1);
+  node.comY = (node.comY * node.mass + p.y) / (node.mass + 1);
+  node.mass += 1;
+}
+function buildQuadTree(ids, positions) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  ids.forEach(id => {
+    const p = positions.get(id);
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  });
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  const half = Math.max(maxX - minX, maxY - minY, 1) / 2 * 1.01;
+  const root = makeQuadNode(cx, cy, half);
+  ids.forEach(id => quadInsert(root, id, positions.get(id), 0));
+  return root;
+}
+function quadRepulsion(node, id, p, idealLength2, out) {
+  if (node.mass === 0) return;
+  if (node.children === null) {
+    if (node.leafId === id) return; // self
+    let dx = p.x - node.comX, dy = p.y - node.comY;
+    const dist = Math.hypot(dx, dy) || 0.01;
+    const force = node.mass * idealLength2 / dist;
+    out.x += (dx / dist) * force; out.y += (dy / dist) * force;
+    return;
+  }
+  const dx = p.x - node.comX, dy = p.y - node.comY;
+  const dist = Math.hypot(dx, dy) || 0.01;
+  if ((node.half * 2) / dist < QUAD_THETA) {
+    const force = node.mass * idealLength2 / dist;
+    out.x += (dx / dist) * force; out.y += (dy / dist) * force;
+  } else {
+    for (const c of node.children) quadRepulsion(c, id, p, idealLength2, out);
+  }
+}
 function forceDirectedSettle(onDone, mode) {
   const nodes = cy.nodes();
   const ids = nodes.map(n => n.id());
@@ -1078,21 +1163,14 @@ function forceDirectedSettle(onDone, mode) {
   const COOLING_STEPS = light ? 35 : 140;
   let iter = 0;
 
+  const idealLength2 = idealLength * idealLength;
   function step() {
     const disp = new Map(ids.map(id => [id, { x: 0, y: 0 }]));
-    for (let i = 0; i < ids.length; i++) {
-      const a = positions.get(ids[i]);
-      for (let j = i + 1; j < ids.length; j++) {
-        const b = positions.get(ids[j]);
-        let dx = a.x - b.x, dy = a.y - b.y;
-        const dist = Math.hypot(dx, dy) || 0.01;
-        const force = (idealLength * idealLength) / dist;
-        dx = (dx / dist) * force; dy = (dy / dist) * force;
-        const da = disp.get(ids[i]), db = disp.get(ids[j]);
-        da.x += dx; da.y += dy;
-        db.x -= dx; db.y -= dy;
-      }
-    }
+    const tree = buildQuadTree(ids, positions);
+    ids.forEach(id => {
+      const p = positions.get(id), d = disp.get(id);
+      quadRepulsion(tree, id, p, idealLength2, d);
+    });
     edgePairs.forEach(([s, t]) => {
       const a = positions.get(s), b = positions.get(t);
       if (!a || !b) return;
