@@ -29,6 +29,7 @@ from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
 from devgraph.indexer.cpp.extractor import extract_cpp_file
 from devgraph.indexer.python.extractor import extract_python_file
+from devgraph.indexer.rust.extractor import extract_rust_file
 
 _CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 
@@ -52,6 +53,7 @@ IGNORED_DIR_NAMES = {
     "node_modules",
     "bin",
     "obj",
+    "target",
     # C++ build-directory conventions (Implementation Plan #8, C++ row):
     # CLion/CMake's default out-of-source build dir names.
     "cmake-build-debug",
@@ -104,6 +106,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     cpp_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     java_files: list[tuple[str, str]] = []
     java_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
+    rs_files: list[str] = []
+    rs_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     paths = _expand_with_reverse_dependents(engine, repo_id, repo_root, paths)
 
@@ -191,6 +195,19 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             indexed += 1
             java_files.append((rel_path, content))
             java_extractions[rel_path] = (nodes, rels)
+        elif resolved.suffix == ".rs":
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+            result = extract_rust_file(content, rel_path, repo_id)
+            nodes = [n.to_dict() for n in result.nodes]
+            rels = [r.to_dict() for r in result.relationships]
+            # Same replace-not-merely-upsert reasoning as the .py branch
+            # above: a removed Function/Class must not survive in the graph
+            # forever just because MERGE never deletes.
+            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+            indexed += 1
+
+            rs_files.append(rel_path)
+            rs_extractions[rel_path] = (nodes, rels)
         elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
             index_doc_file(engine, repo_id, resolved)
             indexed += 1
@@ -245,6 +262,12 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # Same cross-link re-upsert as above, for the Java files in this batch.
     for rel_path, _content in java_files:
         nodes, rels = java_extractions[rel_path]
+        engine.upsert_nodes(nodes)
+        engine.upsert_relationships(rels)
+
+    # Same second-pass re-upsert for Rust files, for the same reason.
+    for rel_path in rs_files:
+        nodes, rels = rs_extractions[rel_path]
         engine.upsert_nodes(nodes)
         engine.upsert_relationships(rels)
 
@@ -331,11 +354,11 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
         if not str(resolved).startswith(str(repo_root.resolve())):
             continue
 
-        if resolved.suffix in (".py", ".cs"):
+        if resolved.suffix in (".py", ".cs", ".java", ".rs"):
             # Must match the same repo-relative key index_paths() writes
             # (Module nodes are keyed by path relative to repo_root, not
-            # bare filename — see python/extractor.py's / csharp/extractor.py's
-            # index_file).
+            # bare filename — see the corresponding extractor's index_file
+            # for each language).
             try:
                 module_name = resolved.relative_to(repo_root.resolve()).as_posix()
             except ValueError:
@@ -355,16 +378,6 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             # Must match the same repo-relative key index_paths() writes
             # (Module nodes are keyed by path relative to repo_root — see
             # cpp/extractor.py's index_file).
-            try:
-                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
-            except ValueError:
-                module_name = resolved.name
-            engine.delete_nodes_by_source_file(repo_id, module_name)
-            cleaned += 1
-        elif resolved.suffix == ".java":
-            # Same repo-relative key as the .py branch above (see its
-            # comment) — java/extractor.py's index_file computes it the
-            # same way.
             try:
                 module_name = resolved.relative_to(repo_root.resolve()).as_posix()
             except ValueError:
