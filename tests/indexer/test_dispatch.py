@@ -297,6 +297,30 @@ class TestFullScan:
         finally:
             engine.delete_repository(repo_id)
 
+    def test_full_scan_skips_unstatable_file_instead_of_crashing(self, engine, temp_repo, monkeypatch):
+        """A file the OS refuses to stat (locked, broken symlink, Windows
+        reparse point) must be skipped, not abort the whole scan — this is
+        what WinError 1920 on a HuggingFace-cache symlink used to do."""
+        repo_id = "_smoketest_dispatch_unstatable"
+        (temp_repo / "a.py").write_text("class A:\n    pass\n")
+        cursed = temp_repo / "cursed.bin"
+        cursed.write_bytes(b"")
+
+        real_is_file = Path.is_file
+
+        def flaky_is_file(self, *args, **kwargs):
+            if self.name == "cursed.bin":
+                raise OSError("[WinError 1920] The file cannot be accessed by the system")
+            return real_is_file(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "is_file", flaky_is_file)
+
+        try:
+            count = full_scan(engine, repo_id, temp_repo)
+            assert count == 1
+        finally:
+            engine.delete_repository(repo_id)
+
 
 class TestServiceCrossLinking:
     """Previously the container extractor (compose-derived Service nodes)

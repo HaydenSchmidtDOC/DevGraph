@@ -189,7 +189,7 @@ def test_cli_list_repos(runner, temp_git_repo, temp_registry_db):
         assert repo_id in result.stdout or "Registered Repositories" in result.stdout
 
 
-def test_cli_remove_repo(runner, temp_git_repo, temp_registry_db):
+def test_cli_remove_repo(runner, temp_git_repo, temp_registry_db, require_neo4j):
     """Test 'devgraph remove' command."""
     db_path, registry = temp_registry_db
 
@@ -207,6 +207,38 @@ def test_cli_remove_repo(runner, temp_git_repo, temp_registry_db):
         assert result.exit_code == 0, f"stdout: {result.stdout}"
         assert "Removed" in result.stdout
         assert repo_id in result.stdout
+
+
+def test_cli_remove_repo_purges_graph_data(runner, temp_git_repo, temp_registry_db, require_neo4j):
+    """'devgraph remove' must delete the repo's Neo4j nodes, not just its registry row."""
+    from devgraph.graph.engine import GraphEngine
+
+    db_path, registry = temp_registry_db
+
+    repo_record = registry.add_repo(temp_git_repo)
+    repo_id = repo_record.repo_id
+    registry.close()
+
+    engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
+    try:
+        engine.init_schema()
+        engine.upsert_repository(repo_id, repo_id, str(temp_git_repo))
+
+        config_module.get_settings.cache_clear()
+        from devgraph.cli import main as cli_main
+
+        with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+             patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+            result = runner.invoke(app, ["remove", repo_id])
+            assert result.exit_code == 0, f"stdout: {result.stdout}"
+
+        remaining = engine.run_cypher(
+            "MATCH (n {repo_id: $repo_id}) RETURN count(n) AS c", {"repo_id": repo_id}
+        )
+        assert remaining[0]["c"] == 0
+    finally:
+        engine.delete_repository(repo_id)
+        engine.close()
 
 
 def test_cli_remove_nonexistent_repo(runner, temp_registry_db):

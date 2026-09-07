@@ -105,8 +105,18 @@ def remove(repo_id: str) -> None:
     try:
         registry = _get_registry()
         try:
+            if registry.get(repo_id) is None:
+                raise ValueError(f"no such repo_id: {repo_id}")
+
+            settings = get_settings()
+            engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+            try:
+                engine.delete_repository(repo_id)
+            finally:
+                engine.close()
+
             registry.remove_repo(repo_id)
-            console.print(f"[green][OK][/green] Removed: {repo_id}")
+            console.print(f"[green][OK][/green] Removed: {repo_id} (registry entry and graph data)")
         finally:
             registry.close()
     except ValueError as e:

@@ -1881,9 +1881,14 @@ cypherInput.addEventListener("input", () => {
 });
 
 async function populateRealRepos(fireChangeEvent) {
-  const json = await runCypher("MATCH (r:Repository) RETURN r.repo_id AS repo_id ORDER BY repo_id");
-  if (json.errors?.length) return;
-  const ids = json.results[0].data.map(d => d.row[0]).filter(Boolean);
+  // Registered repos (SQLite registry, via /api/repos) are the source of
+  // truth for what's selectable here -- not a direct Neo4j query, which
+  // would surface any :Repository node still in the graph (e.g. leftover
+  // from an unregistered repo, or a stray test run) as if it were active.
+  const resp = await fetch("/api/repos");
+  if (!resp.ok) return;
+  const json = await resp.json();
+  const ids = (json.repos || []).filter(r => r.active).map(r => r.repo_id).sort();
   if (!ids.length) return;
   const select = document.getElementById("repoSelect");
   const current = select.value;

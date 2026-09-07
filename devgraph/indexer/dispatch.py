@@ -423,9 +423,19 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     return cleaned
 
 
+def _is_indexable_file(path: Path) -> bool:
+    """p.is_file(), but a file the OS can't even stat (locked, broken
+    symlink, Windows reparse point) is skipped rather than aborting the
+    whole scan."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
 def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str | None = None, mentions_enabled: bool = False) -> int:
     """Walk every file under repo_root and index it, skipping VCS/build/venv noise. Used by `devgraph add`/`rescan`."""
-    all_files = {p for p in repo_root.rglob("*") if p.is_file() and not is_ignored_path(p)}
+    all_files = {p for p in repo_root.rglob("*") if _is_indexable_file(p) and not is_ignored_path(p)}
     return index_paths(engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled)
 
 
