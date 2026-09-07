@@ -1,5 +1,13 @@
 # DevGraph — Implementation Plan #8: Multi-language source extraction (JS/TS, C#, C++, Java, Rust, Go)
 
+**Status: shipped.** All six languages implemented, tested, golden-repo
+verified, and merged to master (commits `92b1c39`..`726d026`). Full
+regression suite: 479/480 passing (the 1 failure, `TestListServices::
+test_list_services_cross_repo`, is a pre-existing Neo4j test-fixture issue
+confirmed unrelated to this plan — reproduces identically on the pre-batch
+commit). See `.claude/skills/adding-a-language/SKILL.md` for the
+worktree+subagent process used, with real findings from this run.
+
 Build-ready plan to extend DevGraph's source-code indexing beyond Python to
 six more languages, one at a time, each shipped to parity with the existing
 Python extractor before the next language starts.
@@ -157,18 +165,14 @@ model than earlier ones). Two things keep the token cost down:
 
 ## Open Items
 
-1. **Shared dataclasses or per-language duplicates?** — `GraphNode`/
-   `GraphRelationship`/`ExtractionResult` currently live inside
-   `python/extractor.py`, not a shared module. Do this refactor
-   (`devgraph/indexer/common.py`) before starting JS/TS — small, and it's
-   also what makes the MCP-driven reference-lookup strategy above work
-   cleanly.
-2. **CALLS/IMPORTS heuristic disclosure to users** — Python's heuristics
-   are documented in code comments but not in user-facing docs. Add a
-   short "extraction is heuristic, not type-resolved" note to
-   README/`DEVGRAPH-CLIENT.md` before shipping the first new language,
-   since it now applies to 6 more languages on a tool with real external
-   users.
-3. **C++ scope commitment** — needs explicit sign-off that "structural
-   parity only, no real import graph" is acceptable to ship, given Open
-   Item 2's disclosure obligation. Decide before starting C++, not after.
+1. **Shared dataclasses or per-language duplicates?** — Resolved: extracted
+   to `devgraph/indexer/common.py` before any language worktree was
+   created (commit `45bbe10`). All six extractors import from it.
+2. **CALLS/IMPORTS heuristic disclosure to users** — Still open. Not done
+   as part of this batch (each extractor documents its own heuristics in
+   code, same as Python, but no README/`DEVGRAPH-CLIENT.md` user-facing
+   note went out). Worth doing as a small follow-up.
+3. **C++ scope commitment** — Resolved: shipped as structural-parity-only,
+   confirmed in the C++ extractor's own golden-repo check (thin IMPORTS
+   graph on `yaml-cpp`, as expected) and documented in its module
+   docstring.
