@@ -905,7 +905,11 @@ function buildElements() {
 const STRUCTURAL_CATS = new Set(["repo","service","database","vectorstore","queue","endpoint"]);
 const cy = cytoscape({
   container: document.getElementById("cy"),
-  elements: buildElements(),
+  /* starts empty, not seeded with the mock graph -- buildElements() is only
+     ever added if the boot check below finds Neo4j unreachable. Seeding it
+     here unconditionally meant every real load flashed ~20 fake nodes on
+     screen for the moment before the real fetch replaced them. */
+  elements: [],
   wheelSensitivity: 0.15,
   userZoomingEnabled: false, /* scroll-to-zoom stays off deliberately — use the +/- controls instead */
   style: [
@@ -1789,6 +1793,8 @@ const legendStatus = document.getElementById("neo4jStatusLegend");
     neo4jStatus.textContent = "Neo4j unreachable";
     neo4jStatus.style.color = "var(--danger)";
     legendStatus.textContent = "Neo4j unreachable — showing demo graph";
+    cy.add(buildElements());
+    forceDirectedSettle(() => focusRotation(null, 60));
   }
 })();
 
