@@ -300,7 +300,13 @@ class TrayApp:
             pystray.MenuItem("Quit", self._quit),
         )
         self._icon = pystray.Icon("devgraph", _make_icon(_OK_COLOR), "DevGraph", menu)
-        self._icon.run()
+        try:
+            self._icon.run()
+        except Exception:
+            logger.critical("pystray event loop crashed", exc_info=True)
+            self._watcher.stop()
+            self._engine.close()
+            self._registry.close()
 
 
 def main() -> None:
