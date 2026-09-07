@@ -23,6 +23,7 @@ from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.containers.extractor import ContainerExtractor
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
+from devgraph.indexer.go.extractor import _find_module_path, extract_go_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
 from devgraph.indexer.python.extractor import extract_python_file
 
@@ -34,7 +35,7 @@ _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
 # this, `devgraph add` on any Python repo with a local venv indexes thousands
 # of third-party dependency files from .venv/site-packages alongside the
 # repo's actual ~dozens of source files.
-IGNORED_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "build", "dist", ".pytest_cache", ".devgraph"}
+IGNORED_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "build", "dist", ".pytest_cache", ".devgraph", "vendor"}
 
 
 def is_ignored_path(path: Path) -> bool:
@@ -65,6 +66,13 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # (rel_path -> (node dicts, rel dicts)) from pass 1's extraction, reused
     # by pass 2 so it re-upserts without re-parsing the file a second time.
     py_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
+
+    # Same cross-link-on-second-pass pattern as the .py branch, kept as a
+    # parallel list rather than folded into py_files/py_extractions since Go
+    # extraction needs go.mod's module path (resolved once per batch, not
+    # per file) that the Python branch has no equivalent of.
+    go_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
+    module_path = _find_module_path(repo_root)
 
     paths = _expand_with_reverse_dependents(engine, repo_id, repo_root, paths)
 
@@ -107,6 +115,17 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             _index_apis(engine, repo_id, rel_path, content)
             py_files.append((rel_path, content))
             py_extractions[rel_path] = (nodes, rels)
+        elif resolved.suffix == ".go":
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+            result = extract_go_file(content, rel_path, repo_id, module_path)
+            nodes = [n.to_dict() for n in result.nodes]
+            rels = [r.to_dict() for r in result.relationships]
+            # Same replace-then-re-upsert rationale as the .py branch above:
+            # a struct/func/method removed from the file must not survive in
+            # the graph as a stale node.
+            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+            indexed += 1
+            go_extractions[rel_path] = (nodes, rels)
         elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
             index_doc_file(engine, repo_id, resolved)
             indexed += 1
@@ -133,6 +152,12 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # least once, regardless of first-pass order.
     for rel_path, _content in py_files:
         nodes, rels = py_extractions[rel_path]
+        engine.upsert_nodes(nodes)
+        engine.upsert_relationships(rels)
+
+    # Same second-pass rationale as the .py loop above, for Go's CALLS/
+    # IMPORTS edges within this batch.
+    for rel_path, (nodes, rels) in go_extractions.items():
         engine.upsert_nodes(nodes)
         engine.upsert_relationships(rels)
 
@@ -219,10 +244,11 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
         if not str(resolved).startswith(str(repo_root.resolve())):
             continue
 
-        if resolved.suffix == ".py":
+        if resolved.suffix in (".py", ".go"):
             # Must match the same repo-relative key index_paths() writes
             # (Module nodes are keyed by path relative to repo_root, not
-            # bare filename — see python/extractor.py's index_file).
+            # bare filename — see python/extractor.py's and go/extractor.py's
+            # index_file()).
             try:
                 module_name = resolved.relative_to(repo_root.resolve()).as_posix()
             except ValueError:
