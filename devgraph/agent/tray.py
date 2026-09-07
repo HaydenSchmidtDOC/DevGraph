@@ -297,8 +297,7 @@ class TrayApp:
             self._dashboard_thread.start()
 
         menu = pystray.Menu(
-            pystray.MenuItem(lambda item: self._status_text(), None, enabled=False),
-            pystray.MenuItem("Open Dashboard", self._open_dashboard),
+            pystray.MenuItem(lambda item: self._status_text(), self._open_dashboard),
             pystray.MenuItem(
                 lambda item: "Resume watching" if self._paused else "Pause watching",
                 self._toggle_pause,
