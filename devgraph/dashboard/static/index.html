@@ -1638,9 +1638,21 @@ function currentStateQuery() {
   const isolatedEntityId = state.isolatedEntity ? NODE_TYPES.find(t => t.cat === state.isolatedEntity)?.id : null;
   const nodeWhere = [repo === "__all__" ? "true" : `n.repo_id = "${escapeCypherStr(repo)}"`];
   if (isolatedEntityId) nodeWhere.push(`labels(n)[0] = "${isolatedEntityId}"`);
-  let q = `MATCH (n)\nWHERE ${nodeWhere.join(" AND ")}\nWITH n LIMIT ${state.nodeCeiling}\nOPTIONAL MATCH (n)-[r]-(m)`;
+  // A ceiling maxed out (the default) means "no cap" -- leave its LIMIT out
+  // of the query entirely rather than spelling out the current real total,
+  // so the query stays correct as the real total changes instead of
+  // silently going stale. Only a slider deliberately dragged below its max
+  // adds a LIMIT.
+  const nodeSlider = document.getElementById("ctlNodeCeiling");
+  const relSlider = document.getElementById("ctlRelCeiling");
+  const nodeLimited = state.nodeCeiling < +nodeSlider.max;
+  const relLimited = state.relCeiling < +relSlider.max;
+  let q = `MATCH (n)\nWHERE ${nodeWhere.join(" AND ")}`;
+  if (nodeLimited) q += `\nWITH n LIMIT ${state.nodeCeiling}`;
+  q += `\nOPTIONAL MATCH (n)-[r]-(m)`;
   if (state.isolatedRel) q += `\nWHERE type(r) = "${escapeCypherStr(state.isolatedRel)}" OR r IS NULL`;
-  q += `\nRETURN n, r, m\nLIMIT ${state.relCeiling}`;
+  q += `\nRETURN n, r, m`;
+  if (relLimited) q += `\nLIMIT ${state.relCeiling}`;
   return q;
 }
 
@@ -1717,30 +1729,35 @@ async function previewQueryGlow(text) {
    the relationship ceiling as the query's trailing "LIMIT N" -- if the text
    still matches that shape (typing a new number into an existing query,
    the common case), pull the numbers back out and update the sliders.
-   Silently does nothing for a query that doesn't match the shape (an
-   arbitrary hand-typed query) rather than guessing. Never rewrites the box
-   itself -- only mirrors into state + the slider DOM, so it can't clobber
-   whatever the user is mid-typing. */
+   currentStateQuery() now leaves a LIMIT out entirely when its slider is
+   maxed (no cap), so the absence of a match is itself meaningful here, not
+   just "nothing to update": it means the slider should snap back to max,
+   same as dragging it there would. Silently leaves state alone for a query
+   that doesn't match either shape at all (an arbitrary hand-typed query)
+   rather than guessing. Never rewrites the box itself -- only mirrors into
+   state + the slider DOM, so it can't clobber whatever the user is
+   mid-typing. */
 function syncSlidersFromCypherText(text) {
   const nodeSlider = document.getElementById("ctlNodeCeiling");
   const relSlider = document.getElementById("ctlRelCeiling");
   const nodeMatch = text.match(/WITH\s+n\s+LIMIT\s+(\d+)/i);
-  if (nodeMatch) {
-    const n = +nodeMatch[1];
-    if (n !== state.nodeCeiling) {
-      state.nodeCeiling = n;
-      nodeSlider.value = Math.min(n, +nodeSlider.max);
-      document.getElementById("valNodeCeiling").textContent = n;
-    }
+  const n = nodeMatch ? +nodeMatch[1] : +nodeSlider.max;
+  if (n !== state.nodeCeiling) {
+    state.nodeCeiling = n;
+    nodeSlider.value = Math.min(n, +nodeSlider.max);
+    document.getElementById("valNodeCeiling").textContent = n;
   }
+  // The "WITH n LIMIT" match (if any) always precedes the trailing LIMIT in
+  // our own query shape -- drop it from the candidates so a query with only
+  // a node limit (rel slider still maxed) doesn't misread that same number
+  // as the relationship ceiling too.
   const allLimits = [...text.matchAll(/\bLIMIT\s+(\d+)/gi)];
-  if (allLimits.length) {
-    const last = +allLimits[allLimits.length - 1][1];
-    if (last !== state.relCeiling) {
-      state.relCeiling = last;
-      relSlider.value = Math.min(last, +relSlider.max);
-      document.getElementById("valRelCeiling").textContent = last;
-    }
+  const trailingLimits = nodeMatch ? allLimits.slice(1) : allLimits;
+  const last = trailingLimits.length ? +trailingLimits[trailingLimits.length - 1][1] : +relSlider.max;
+  if (last !== state.relCeiling) {
+    state.relCeiling = last;
+    relSlider.value = Math.min(last, +relSlider.max);
+    document.getElementById("valRelCeiling").textContent = last;
   }
 }
 cypherInput.addEventListener("input", () => {
