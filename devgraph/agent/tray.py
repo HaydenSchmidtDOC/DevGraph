@@ -145,9 +145,23 @@ class TrayApp:
             except Exception:
                 logger.warning("Neo4j health check failed", exc_info=True)
                 self._healthy = False
-            self._check_registry_changes()
-            self._refresh_icon()
-            self._write_heartbeat()
+            # Each of these is individually guarded: a failure in any one
+            # (e.g. a registry read race, a watcher issue-scan error, or a
+            # pystray icon mutation) must not escape this daemon thread and
+            # take the whole tray process -- and with it the watcher and
+            # indexer -- down.
+            try:
+                self._check_registry_changes()
+            except Exception:
+                logger.warning("registry-change check failed", exc_info=True)
+            try:
+                self._refresh_icon()
+            except Exception:
+                logger.warning("tray icon refresh failed", exc_info=True)
+            try:
+                self._write_heartbeat()
+            except Exception:
+                logger.warning("heartbeat write failed", exc_info=True)
             self._stop_event.wait(self._settings.health_check_interval_s)
 
     def _check_registry_changes(self) -> None:
@@ -226,15 +240,25 @@ class TrayApp:
 
     def _toggle_pause(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         self._paused = not self._paused
-        if self._paused:
-            self._watcher.stop()
-        else:
-            self._watcher.start()
+        try:
+            if self._paused:
+                self._watcher.stop()
+            else:
+                self._watcher.start()
+        except Exception:
+            # A watcher start/stop failure (e.g. a repo path vanished) must
+            # not crash the pystray event loop; revert the flag so the menu
+            # state stays truthful.
+            logger.warning("watcher pause/resume failed", exc_info=True)
+            self._paused = not self._paused
         self._refresh_icon()
 
     def _open_dashboard(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         url = f"http://{self._settings.dashboard_host}:{self._settings.dashboard_port}"
-        webbrowser.open(url)
+        try:
+            webbrowser.open(url)
+        except Exception:
+            logger.warning("failed to open dashboard in browser", exc_info=True)
 
     def _run_dashboard(self) -> None:
         """Runs on its own daemon thread with its own asyncio loop, hosting
@@ -274,6 +298,11 @@ class TrayApp:
             # watcher/indexer loop, which is the tray's core job.
             logger.warning("dashboard failed to start; continuing without it", exc_info=True)
         finally:
+            # Drop the broadcaster's reference to this loop before closing
+            # it: otherwise a later publish() from the watcher/health-check
+            # threads would call_soon_threadsafe on a closed loop and raise
+            # RuntimeError in a background thread.
+            self._events.unbind_loop(loop)
             loop.close()
 
     def _quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
@@ -283,8 +312,18 @@ class TrayApp:
             self._dashboard_server.should_exit = True
             if self._dashboard_thread is not None:
                 self._dashboard_thread.join(timeout=5)
-        self._engine.close()
-        self._registry.close()
+        # Best-effort teardown: a failure closing the engine/registry must
+        # not prevent the tray icon from stopping (which would leave a
+        # zombie tray process the PID file still points at). Each close is
+        # guarded so one failure doesn't mask the others.
+        try:
+            self._engine.close()
+        except Exception:
+            logger.warning("error closing graph engine on quit", exc_info=True)
+        try:
+            self._registry.close()
+        except Exception:
+            logger.warning("error closing registry on quit", exc_info=True)
         icon.stop()
 
     def start(self) -> None:
@@ -310,13 +349,35 @@ class TrayApp:
         except Exception:
             logger.critical("pystray event loop crashed", exc_info=True)
             self._watcher.stop()
-            self._engine.close()
-            self._registry.close()
+            try:
+                self._engine.close()
+            except Exception:
+                logger.warning("error closing graph engine after crash", exc_info=True)
+            try:
+                self._registry.close()
+            except Exception:
+                logger.warning("error closing registry after crash", exc_info=True)
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, handlers=[])
-    TrayApp().start()
+    try:
+        TrayApp().start()
+    except Exception:
+        # Last line of defense: if the tray fails to start (or crashes out of
+        # pystray's loop before its own cleanup runs), log it and clear the
+        # PID file so a stale PID doesn't make `devgraph tray start`/the MCP
+        # auto-start think a dead tray is still running. Re-raise so the
+        # process exits non-zero and the failure is visible to whoever
+        # launched it.
+        logger.critical("tray app failed to start", exc_info=True)
+        try:
+            from devgraph.agent import lifecycle
+
+            lifecycle.tray_pid_path().unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":

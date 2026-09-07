@@ -15,6 +15,7 @@ repo's own `record.path`).
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from devgraph.config import get_settings
@@ -31,6 +32,8 @@ from devgraph.indexer.mentions.extractor import index_file as index_mentions_fil
 from devgraph.indexer.cpp.extractor import extract_cpp_file
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
+
+logger = logging.getLogger(__name__)
 
 _CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 
@@ -134,112 +137,23 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         name_lower = resolved.name.lower()
         rel_path = resolved.relative_to(repo_root.resolve()).as_posix()
 
-        if resolved.suffix == ".py":
-            content = resolved.read_text(encoding="utf-8", errors="replace")
-            result = extract_python_file(content, rel_path, repo_id)
-            nodes = [n.to_dict() for n in result.nodes]
-            rels = [r.to_dict() for r in result.relationships]
-            # Delete this file's previously-indexed nodes and write the
-            # freshly-extracted ones in one transaction, not just
-            # MERGE-upsert the current contents: a Function/Class removed
-            # from the file (edited, not deleted) would otherwise survive in
-            # the graph forever, since MERGE only ever adds/updates matching
-            # nodes, never removes ones the current source no longer
-            # produces. One transaction also means a reader never observes
-            # this file's nodes as gone-but-not-yet-rebuilt.
-            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
-            indexed += 1
-
-            # Datastore/API extraction reads the same content, so it runs
-            # alongside the Python indexer rather than as a separate dispatch
-            # branch. Passed the repo-relative path (not bare filename) so
-            # their 'source'/'file' provenance properties match what
-            # delete_nodes_by_source_file looks up on file deletion.
-            _index_datastores(engine, repo_id, rel_path, content)
-            _index_apis(engine, repo_id, rel_path, content)
-            py_files.append((rel_path, content))
-            py_extractions[rel_path] = (nodes, rels)
-        elif resolved.suffix in _JS_SUFFIXES:
-            content = resolved.read_text(encoding="utf-8", errors="replace")
-            result = extract_js_file(content, rel_path, repo_id)
-            nodes = [n.to_dict() for n in result.nodes]
-            rels = [r.to_dict() for r in result.relationships]
-            # Same replace-then-reupsert rationale as the .py branch above:
-            # prune this file's previously-indexed nodes/edges and write the
-            # freshly-extracted ones in one transaction.
-            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
-            indexed += 1
-            js_files.append(rel_path)
-            js_extractions[rel_path] = (nodes, rels)
-        elif resolved.suffix == ".cs":
-            content = resolved.read_text(encoding="utf-8", errors="replace")
-            result = extract_csharp_file(content, rel_path, repo_id)
-            nodes = [n.to_dict() for n in result.nodes]
-            rels = [r.to_dict() for r in result.relationships]
-            # Same replace-then-re-upsert rationale as the .py branch above:
-            # prune this file's stale nodes/edges in one transaction, then
-            # re-upsert in pass 2 once every file in the batch has a node.
-            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
-            indexed += 1
-            cs_files.append(rel_path)
-            cs_extractions[rel_path] = (nodes, rels)
-        elif resolved.suffix in _CPP_SUFFIXES:
-            content = resolved.read_text(encoding="utf-8", errors="replace")
-            result = extract_cpp_file(content, rel_path, repo_id)
-            nodes = [n.to_dict() for n in result.nodes]
-            rels = [r.to_dict() for r in result.relationships]
-            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
-            indexed += 1
-            cpp_files.append(rel_path)
-            cpp_extractions[rel_path] = (nodes, rels)
-        elif resolved.suffix == ".java":
-            content = resolved.read_text(encoding="utf-8", errors="replace")
-            result = extract_java_file(content, rel_path, repo_id)
-            nodes = [n.to_dict() for n in result.nodes]
-            rels = [r.to_dict() for r in result.relationships]
-            # Same replace-then-cross-link-reupsert pattern as the .py
-            # branch above (see its comment for why replace_file_nodes runs
-            # first, in one transaction, rather than plain upsert).
-            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
-            indexed += 1
-            java_files.append((rel_path, content))
-            java_extractions[rel_path] = (nodes, rels)
-        elif resolved.suffix == ".rs":
-            content = resolved.read_text(encoding="utf-8", errors="replace")
-            result = extract_rust_file(content, rel_path, repo_id)
-            nodes = [n.to_dict() for n in result.nodes]
-            rels = [r.to_dict() for r in result.relationships]
-            # Same replace-not-merely-upsert reasoning as the .py branch
-            # above: a removed Function/Class must not survive in the graph
-            # forever just because MERGE never deletes.
-            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
-            indexed += 1
-
-            rs_files.append(rel_path)
-            rs_extractions[rel_path] = (nodes, rels)
-        elif resolved.suffix == ".go":
-            content = resolved.read_text(encoding="utf-8", errors="replace")
-            result = extract_go_file(content, rel_path, repo_id, module_path)
-            nodes = [n.to_dict() for n in result.nodes]
-            rels = [r.to_dict() for r in result.relationships]
-            # Same replace-then-re-upsert rationale as the .py branch above:
-            # a struct/func/method removed from the file must not survive in
-            # the graph as a stale node.
-            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
-            indexed += 1
-            go_extractions[rel_path] = (nodes, rels)
-        elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
-            index_doc_file(engine, repo_id, resolved)
-            indexed += 1
-        if mentions_enabled and resolved.suffix in (".md", ".markdown"):
-            index_mentions_file(engine, repo_id, resolved, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode)
-            indexed += 1
-        if name_lower in _CONTAINERFILE_NAMES:
-            _index_containerfile(engine, repo_id, resolved)
-            indexed += 1
-        elif name_lower in _COMPOSE_NAMES:
-            _index_compose_file(engine, repo_id, resolved)
-            indexed += 1
+        # One unparseable/locked file (or a transient Neo4j error mid-batch)
+        # must not abort the whole batch: a full scan or watcher batch would
+        # otherwise silently lose every file after the failure point. Log and
+        # skip the offending file so the rest of the batch still indexes.
+        try:
+            indexed += _index_single_path(
+                engine, repo_id, repo_root, resolved, rel_path, name_lower,
+                docs_root, mentions_enabled, module_path,
+                py_files, py_extractions, js_files, js_extractions,
+                cs_files, cs_extractions, cpp_files, cpp_extractions,
+                java_files, java_extractions, rs_files, rs_extractions,
+                go_extractions,
+            )
+        except Exception:
+            logger.warning(
+                "indexing failed for %s (%s); skipping file", repo_id, rel_path, exc_info=True
+            )
 
     # Second pass: re-upsert every .py file's already-extracted nodes/edges
     # (no re-parse, no re-prune). Batch iteration order is unspecified (paths
@@ -313,6 +227,151 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
         engine.upsert_relationships(service_rels)
 
+    return indexed
+
+
+def _index_single_path(
+    engine: GraphEngine,
+    repo_id: str,
+    repo_root: Path,
+    resolved: Path,
+    rel_path: str,
+    name_lower: str,
+    docs_root: Path | None,
+    mentions_enabled: bool,
+    module_path: str | None,
+    py_files: list[tuple[str, str]],
+    py_extractions: dict[str, tuple[list[dict], list[dict]]],
+    js_files: list[str],
+    js_extractions: dict[str, tuple[list[dict], list[dict]]],
+    cs_files: list[str],
+    cs_extractions: dict[str, tuple[list[dict], list[dict]]],
+    cpp_files: list[str],
+    cpp_extractions: dict[str, tuple[list[dict], list[dict]]],
+    java_files: list[tuple[str, str]],
+    java_extractions: dict[str, tuple[list[dict], list[dict]]],
+    rs_files: list[str],
+    rs_extractions: dict[str, tuple[list[dict], list[dict]]],
+    go_extractions: dict[str, tuple[list[dict], list[dict]]],
+) -> int:
+    """Extract and upsert one file's graph output, routing by name/extension.
+
+    Extracted into its own function so `index_paths` can wrap each file in a
+    try/except: one unparseable/locked file (or a transient Neo4j error
+    mid-batch) must not abort the whole batch. The per-language accumulator
+    lists are passed in so the second-pass cross-linking below still sees
+    every file that *did* extract successfully.
+
+    Returns the number of indexing actions performed (0 for a file that
+    matched no extractor, e.g. a Markdown file outside docs_path with
+    mentions disabled) -- mirrors the original loop's `indexed += 1` count.
+    """
+    indexed = 0
+    if resolved.suffix == ".py":
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+        result = extract_python_file(content, rel_path, repo_id)
+        nodes = [n.to_dict() for n in result.nodes]
+        rels = [r.to_dict() for r in result.relationships]
+        # Delete this file's previously-indexed nodes and write the
+        # freshly-extracted ones in one transaction, not just
+        # MERGE-upsert the current contents: a Function/Class removed
+        # from the file (edited, not deleted) would otherwise survive in
+        # the graph forever, since MERGE only ever adds/updates matching
+        # nodes, never removes ones the current source no longer
+        # produces. One transaction also means a reader never observes
+        # this file's nodes as gone-but-not-yet-rebuilt.
+        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        indexed += 1
+
+        # Datastore/API extraction reads the same content, so it runs
+        # alongside the Python indexer rather than as a separate dispatch
+        # branch. Passed the repo-relative path (not bare filename) so
+        # their 'source'/'file' provenance properties match what
+        # delete_nodes_by_source_file looks up on file deletion.
+        _index_datastores(engine, repo_id, rel_path, content)
+        _index_apis(engine, repo_id, rel_path, content)
+        py_files.append((rel_path, content))
+        py_extractions[rel_path] = (nodes, rels)
+    elif resolved.suffix in _JS_SUFFIXES:
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+        result = extract_js_file(content, rel_path, repo_id)
+        nodes = [n.to_dict() for n in result.nodes]
+        rels = [r.to_dict() for r in result.relationships]
+        # Same replace-then-reupsert rationale as the .py branch above:
+        # prune this file's previously-indexed nodes/edges and write the
+        # freshly-extracted ones in one transaction.
+        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        indexed += 1
+        js_files.append(rel_path)
+        js_extractions[rel_path] = (nodes, rels)
+    elif resolved.suffix == ".cs":
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+        result = extract_csharp_file(content, rel_path, repo_id)
+        nodes = [n.to_dict() for n in result.nodes]
+        rels = [r.to_dict() for r in result.relationships]
+        # Same replace-then-re-upsert rationale as the .py branch above:
+        # prune this file's stale nodes/edges in one transaction, then
+        # re-upsert in pass 2 once every file in the batch has a node.
+        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        indexed += 1
+        cs_files.append(rel_path)
+        cs_extractions[rel_path] = (nodes, rels)
+    elif resolved.suffix in _CPP_SUFFIXES:
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+        result = extract_cpp_file(content, rel_path, repo_id)
+        nodes = [n.to_dict() for n in result.nodes]
+        rels = [r.to_dict() for r in result.relationships]
+        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        indexed += 1
+        cpp_files.append(rel_path)
+        cpp_extractions[rel_path] = (nodes, rels)
+    elif resolved.suffix == ".java":
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+        result = extract_java_file(content, rel_path, repo_id)
+        nodes = [n.to_dict() for n in result.nodes]
+        rels = [r.to_dict() for r in result.relationships]
+        # Same replace-then-cross-link-reupsert pattern as the .py
+        # branch above (see its comment for why replace_file_nodes runs
+        # first, in one transaction, rather than plain upsert).
+        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        indexed += 1
+        java_files.append((rel_path, content))
+        java_extractions[rel_path] = (nodes, rels)
+    elif resolved.suffix == ".rs":
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+        result = extract_rust_file(content, rel_path, repo_id)
+        nodes = [n.to_dict() for n in result.nodes]
+        rels = [r.to_dict() for r in result.relationships]
+        # Same replace-not-merely-upsert reasoning as the .py branch
+        # above: a removed Function/Class must not survive in the graph
+        # forever just because MERGE never deletes.
+        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        indexed += 1
+        rs_files.append(rel_path)
+        rs_extractions[rel_path] = (nodes, rels)
+    elif resolved.suffix == ".go":
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+        result = extract_go_file(content, rel_path, repo_id, module_path)
+        nodes = [n.to_dict() for n in result.nodes]
+        rels = [r.to_dict() for r in result.relationships]
+        # Same replace-then-re-upsert rationale as the .py branch above:
+        # a struct/func/method removed from the file must not survive in
+        # the graph as a stale node.
+        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        indexed += 1
+        go_extractions[rel_path] = (nodes, rels)
+    elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
+        index_doc_file(engine, repo_id, resolved)
+        indexed += 1
+    if mentions_enabled and resolved.suffix in (".md", ".markdown"):
+        index_mentions_file(engine, repo_id, resolved, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode)
+        indexed += 1
+    if name_lower in _CONTAINERFILE_NAMES:
+        _index_containerfile(engine, repo_id, resolved)
+        indexed += 1
+    elif name_lower in _COMPOSE_NAMES:
+        _index_compose_file(engine, repo_id, resolved)
+        indexed += 1
     return indexed
 
 

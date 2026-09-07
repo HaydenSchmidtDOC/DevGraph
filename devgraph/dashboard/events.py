@@ -42,6 +42,20 @@ class EventBroadcaster:
         with self._lock:
             self._loop = loop
 
+    def unbind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Drop the reference to a loop that is being torn down.
+
+        Called from the dashboard thread when the loop is about to close
+        (e.g. the dashboard failed to bind and is shutting down). Without
+        this, a later `publish()` from the watcher/health-check threads
+        would `call_soon_threadsafe` on a closed loop and raise
+        RuntimeError in a background thread. Only clears the reference if
+        it still points at `loop`, so a stale teardown can't clobber a
+        newer loop that has since been bound."""
+        with self._lock:
+            if self._loop is loop:
+                self._loop = None
+
     def subscribe(self) -> asyncio.Queue:
         """Register a new client queue. Must be called from the dashboard
         loop thread (i.e. from inside an `async def` request handler)."""

@@ -8,12 +8,17 @@ read, never an optional convenience — see Design Brief Principle 3.
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
 
 from neo4j import Driver, GraphDatabase
+from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
 from devgraph.graph.schema import constraint_statements
+
+logger = logging.getLogger(__name__)
 
 # Shared by delete_nodes_by_source_file and _replace_file_nodes_tx. See
 # delete_nodes_by_source_file's docstring for why three property keys.
@@ -22,6 +27,40 @@ _DELETE_BY_SOURCE_FILE_CYPHER = (
     "WHERE n.source_file = $file_name OR n.file = $file_name OR n.source = $file_name "
     "DETACH DELETE n"
 )
+
+# Transient Neo4j failures worth retrying: a connection blip, an expired
+# session, or a server-side transient error (e.g. a lock timeout). Permanent
+# errors (syntax, constraint violations, unknown labels) are NOT retried.
+_RETRYABLE_EXCEPTIONS = (ServiceUnavailable, SessionExpired, TransientError)
+_MAX_RETRIES = 3
+_BASE_DELAY_S = 0.5
+
+
+def _retry_transient(fn, *args, **kwargs):
+    """Run `fn` with bounded exponential-backoff retry on transient Neo4j errors.
+
+    The neo4j driver's `session.execute_write`/`execute_read` already retry
+    transient errors internally, but the autocommit `session.run` paths and
+    `verify_connectivity` do not — so a Neo4j blip mid-scan would otherwise
+    fail the whole operation. Every write here is an idempotent MERGE, so
+    re-running after a transient failure is always safe.
+    """
+    delay = _BASE_DELAY_S
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return fn(*args, **kwargs)
+        except _RETRYABLE_EXCEPTIONS:
+            if attempt >= _MAX_RETRIES:
+                raise
+            logger.warning(
+                "transient Neo4j error (attempt %d/%d); retrying in %.1fs",
+                attempt + 1,
+                _MAX_RETRIES,
+                delay,
+                exc_info=True,
+            )
+            time.sleep(delay)
+            delay *= 2
 
 
 def _group_nodes_by_label(nodes: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -92,16 +131,17 @@ class GraphEngine:
         self._driver.close()
 
     def verify_connectivity(self) -> None:
-        self._driver.verify_connectivity()
+        _retry_transient(self._driver.verify_connectivity)
 
     def init_schema(self) -> None:
         with self._driver.session() as session:
             for stmt in constraint_statements():
-                session.run(stmt)
+                _retry_transient(session.run, stmt)
 
     def upsert_repository(self, repo_id: str, name: str, path: str) -> None:
         with self._driver.session() as session:
-            session.run(
+            _retry_transient(
+                session.run,
                 "MERGE (r:Repository {repo_id: $repo_id}) "
                 "SET r.name = $name, r.path = $path",
                 repo_id=repo_id,
@@ -115,7 +155,8 @@ class GraphEngine:
         """Idempotent MERGE on (repo_id, name) for a repo-scoped node label."""
         props = properties or {}
         with self._driver.session() as session:
-            session.run(
+            _retry_transient(
+                session.run,
                 f"MERGE (n:{label} {{repo_id: $repo_id, name: $name}}) "
                 "SET n += $properties",
                 repo_id=repo_id,
@@ -156,7 +197,8 @@ class GraphEngine:
         call site; behavior is unchanged for them.
         """
         with self._driver.session() as session:
-            session.run(
+            _retry_transient(
+                session.run,
                 f"MATCH (a:{from_label} {{repo_id: $repo_id, name: $from_name}}) "
                 f"MATCH (b:{to_label} {{repo_id: $repo_id, name: $to_name}}) "
                 f"MERGE (a)-[r:{rel_type}]->(b) "
@@ -208,7 +250,8 @@ class GraphEngine:
         runs. See dispatch.py's index_paths.
         """
         with self._driver.session() as session:
-            result = session.run(
+            result = _retry_transient(
+                session.run,
                 "MATCH (m:Module {repo_id: $repo_id})-[:IMPORTS]->"
                 "(target:Module {repo_id: $repo_id, name: $module_name}) "
                 "RETURN m.name as name",
@@ -227,7 +270,7 @@ class GraphEngine:
         the honest fix until they're unified onto a single property name).
         """
         with self._driver.session() as session:
-            session.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
+            _retry_transient(session.run, _DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
 
     def stage_recency(
         self,
@@ -250,7 +293,8 @@ class GraphEngine:
         commit's author with an older one's.
         """
         with self._driver.session() as session:
-            session.run(
+            _retry_transient(
+                session.run,
                 f"MERGE (n:{label} {{repo_id: $repo_id, name: $name}}) "
                 "SET n.created_at = CASE WHEN $created_at IS NULL THEN n.created_at "
                 "WHEN n.created_at IS NULL OR $created_at < n.created_at THEN $created_at "
@@ -291,7 +335,8 @@ class GraphEngine:
         if last_modified_by is not None:
             set_clauses.append("n.last_modified_by = $last_modified_by")
         with self._driver.session() as session:
-            session.run(
+            _retry_transient(
+                session.run,
                 f"MERGE (n:{label} {{repo_id: $repo_id, name: $name}}) "
                 f"SET {', '.join(set_clauses)}",
                 repo_id=repo_id,
@@ -317,7 +362,8 @@ class GraphEngine:
         if not shas:
             return
         with self._driver.session() as session:
-            session.run(
+            _retry_transient(
+                session.run,
                 "MATCH (c:Commit {repo_id: $repo_id}) WHERE c.name IN $shas DETACH DELETE c",
                 repo_id=repo_id,
                 shas=shas,
@@ -326,8 +372,10 @@ class GraphEngine:
     def delete_repository(self, repo_id: str) -> None:
         """Remove every node (and its relationships) scoped to this repo_id."""
         with self._driver.session() as session:
-            session.run(
-                "MATCH (n {repo_id: $repo_id}) DETACH DELETE n", repo_id=repo_id
+            _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) DETACH DELETE n",
+                repo_id=repo_id,
             )
 
     def run_cypher(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict]:

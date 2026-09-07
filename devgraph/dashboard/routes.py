@@ -63,8 +63,6 @@ def build_router(
             except Exception:
                 pass
         return {}
-        if registry.get(repo_id) is None:
-            raise HTTPException(status_code=404, detail=f"no such repo_id: {repo_id}")
 
     @router.get("/repos")
     def list_repos() -> dict[str, Any]:

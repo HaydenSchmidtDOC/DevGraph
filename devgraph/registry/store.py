@@ -101,7 +101,19 @@ class RepoRegistry:
         # internally while already holding the lock.
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._lock = threading.RLock()
+        self._closed = False
         with self._lock:
+            # WAL journal mode: far more crash-safe than the default rollback
+            # journal (a crash mid-write can't corrupt the DB), and it lets
+            # concurrent readers keep working while a writer is active. This
+            # matters because the tray process and short-lived `devgraph`
+            # CLI invocations open the *same* registry file from different
+            # processes.
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            # Wait up to 5s for a lock held by another process (e.g. the tray
+            # writing while a CLI command reads) instead of immediately
+            # raising "database is locked".
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
@@ -112,7 +124,12 @@ class RepoRegistry:
             self._conn.commit()
 
     def close(self) -> None:
+        """Close the underlying connection. Idempotent — safe to call twice
+        (e.g. from a shutdown path that also runs a finally-block close)."""
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._conn.close()
 
     def _touch_change_marker(self) -> None:

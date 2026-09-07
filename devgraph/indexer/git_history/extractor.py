@@ -100,7 +100,7 @@ class GitHistoryExtractor:
                         sha=sha,
                         repo_id=self.repo_id,
                         properties={
-                            "message": commit.message.strip(),
+                            "message": (commit.message or "").strip(),
                             "author": commit.author.name if commit.author else None,
                             "authored_date": commit.authored_datetime.isoformat(),
                         },
@@ -134,8 +134,14 @@ def _changed_paths(commit) -> list[str]:
     if commit.parents:
         diffs = commit.parents[0].diff(commit)
     else:
-        diffs = commit.diff(None)  # root commit: diff against empty tree isn't directly exposed; fall back to tree walk
-        diffs = [d for d in commit.tree.traverse() if d.type == "blob"]
+        # Root commit: diff against the empty tree isn't directly exposed;
+        # fall back to a tree walk. A root commit with no tree (or a tree
+        # that fails to traverse) is treated as touching nothing rather than
+        # aborting the whole history sync.
+        try:
+            diffs = [d for d in commit.tree.traverse() if d.type == "blob"]
+        except Exception:
+            return []
         return [d.path for d in diffs]
 
     paths = set()
@@ -370,7 +376,12 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
 
     repo = Repo(str(repo_record.path))
     try:
-        head_sha = repo.head.commit.hexsha
+        try:
+            head_sha = repo.head.commit.hexsha
+        except (ValueError, TypeError):
+            # Empty repo (no commits yet, unborn HEAD) -- a normal state for
+            # a freshly-initialized repo, not an error. Nothing to sync.
+            return {"mode": "noop", "commits_indexed": 0, "commits_deleted": 0}
         last = repo_record.last_indexed_commit
 
         if last == head_sha:

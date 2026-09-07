@@ -61,7 +61,10 @@ def get_git_status(repo_path: Path) -> dict[str, Any]:
         try:
             branch = repo.active_branch.name
         except TypeError:
-            branch = f"detached@{repo.head.commit.hexsha[:7]}"
+            try:
+                branch = f"detached@{repo.head.commit.hexsha[:7]}"
+            except (ValueError, TypeError):
+                branch = "no commits yet"
 
         porcelain = repo.git.status("--porcelain")
         entries: list[dict[str, str]] = []
