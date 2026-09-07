@@ -1,48 +1,2421 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DevGraph Dashboard</title>
-  <link rel="stylesheet" href="/static/css/tokens.css" />
-  <link rel="stylesheet" href="/static/css/app.css" />
+<head><script type="application/json" data-od-external-dependencies>["https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"]</script>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DevGraph · Live Dashboard</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg:           #08090a;
+  --surface:      #191a1b;
+  --fg:   #f7f8f8;
+  --fg-2: #d0d6e0;
+  --muted: #8a8f98;
+  --meta:  #62666d;
+  --border:      rgba(255, 255, 255, 0.08);
+  --border-soft: rgba(255, 255, 255, 0.05);
+  --accent:        #5e6ad2;
+  --accent-on:     #ffffff;
+  --accent-hover:  #828fff;
+  --success: #27a644;
+  --warn:    #eab308;
+  --danger:  #dc2626;
+  --font-display: "Inter Variable", "Inter", "SF Pro Display", -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  --font-body:    "Inter Variable", "Inter", "SF Pro Display", -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  --font-mono:    "Berkeley Mono", ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+  --text-xl: 24px;
+  --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 20px; --space-6: 24px;
+  --radius-sm: 6px; --radius-md: 8px; --radius-lg: 12px; --radius-pill: 9999px;
+  --elev-raised: rgba(0,0,0,0.4) 0px 2px 4px, 0 0 0 1px rgba(255,255,255,0.05);
+  --focus-ring: 0 0 0 2px color-mix(in oklab, var(--accent), transparent 30%), 0 4px 12px rgba(0,0,0,0.1);
+  --motion-fast: 150ms; --motion-base: 200ms; --ease-standard: cubic-bezier(0.2,0,0,1);
+  --container-max: 1360px;
+  --topbar-h: 53px;
+}
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--font-body); font-feature-settings: "cv01","ss03"; font-size: 15px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+h1,h2,h3,h4 { font-family: var(--font-display); margin: 0; font-weight: 590; letter-spacing: -0.01em; }
+button { font: inherit; cursor: pointer; }
+input, select, textarea { font: inherit; }
+a { color: inherit; }
+:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
+code { font-family: var(--font-mono); }
+* { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.16) transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+*::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.24); background-clip: padding-box; }
+
+/* ── a hair of theme color, sprinkled — hairline tint, hover-only accents ── */
+.topnav { position: sticky; top: 0; z-index: 40; background: color-mix(in oklab, var(--bg) 92%, transparent); backdrop-filter: blur(12px); border-bottom: 1px solid color-mix(in oklab, var(--accent), var(--border-soft) 75%); height: var(--topbar-h); }
+.topnav-inner { display: flex; align-items: center; gap: var(--space-4); padding: 10px var(--space-6); max-width: var(--container-max); margin-inline: auto; }
+.icon-btn { display: grid; place-items: center; width: 32px; height: 32px; border-radius: var(--radius-sm); background: rgba(255,255,255,0.02); border: 1px solid var(--border); color: var(--fg-2); flex-shrink: 0; transition: background var(--motion-fast), color var(--motion-fast), border-color var(--motion-fast); }
+.icon-btn:hover { background: color-mix(in oklab, var(--accent), transparent 88%); color: var(--accent-hover); border-color: color-mix(in oklab, var(--accent), transparent 60%); }
+.icon-btn svg { width: 16px; height: 16px; }
+.brand { display: flex; align-items: baseline; gap: 9px; font-weight: 590; font-size: 15px; letter-spacing: -0.01em; white-space: nowrap; }
+.brand .mark { width: 20px; height: 20px; border-radius: 5px; background: var(--accent); display: inline-grid; place-items: center; color: var(--accent-on); font-family: var(--font-mono); font-size: 11px; font-weight: 700; align-self: center; }
+.brand .ver { font-family: var(--font-mono); font-size: 10px; font-weight: 400; color: var(--meta); }
+.brand .beta { font-family: var(--font-mono); font-size: 9px; font-weight: 510; letter-spacing: 0.05em; color: var(--meta); border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px; text-transform: uppercase; }
+.topnav-spacer { flex: 1; }
+.btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--fg-2); font-size: 13px; font-weight: 510; transition: background var(--motion-fast), color var(--motion-fast), border-color var(--motion-fast); }
+.btn:hover { background: rgba(255,255,255,0.06); color: var(--fg); border-color: rgba(255,255,255,0.14); }
+.btn-primary { background: var(--accent); color: var(--accent-on); border-color: var(--accent); }
+.btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-on); }
+.btn-sm { padding: 5px 10px; font-size: 12px; }
+
+/* ── themed custom select (replaces OS-default white dropdown lists) ── */
+.csel { position: relative; display: inline-block; }
+.csel-native { position: absolute; opacity: 0; pointer-events: none; width: 0; height: 0; }
+.csel-btn { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--fg); padding: 7px 30px 7px 12px; font-size: 13px; font-weight: 510; cursor: pointer; position: relative; text-align: left; }
+.csel-btn:hover { background: rgba(255,255,255,0.05); }
+.csel-btn::after { content: ''; position: absolute; right: 12px; top: 50%; width: 7px; height: 7px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); transform: translateY(-65%) rotate(45deg); }
+.csel-list { position: absolute; top: calc(100% + 4px); left: 0; right: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: var(--elev-raised); z-index: 50; display: none; max-height: 240px; overflow-y: auto; }
+.csel-list.show { display: block; }
+.csel-item { padding: 7px 12px; font-size: 13px; color: var(--fg-2); cursor: pointer; }
+.csel-item:hover, .csel-item.active { background: color-mix(in oklab, var(--accent), transparent 85%); color: var(--accent-hover); }
+.repo-select-wrap .csel { min-width: 180px; }
+.chart-controls .csel { flex: 1; }
+.chart-controls .csel-btn { font-size: 11px; padding: 4px 22px 4px 8px; }
+.chart-controls .csel-btn::after { right: 8px; width: 5px; height: 5px; }
+.control-panel-body .csel-btn { font-size: 11.5px; padding: 6px 24px 6px 8px; }
+.field .csel-btn { font-size: 13px; padding: 9px 30px 9px 11px; background: rgba(255,255,255,0.02); }
+
+/* ── graph stage: full-bleed, cardless, layered behind everything below the topnav ── */
+/* the graph itself is a single fixed full-viewport layer living behind the ENTIRE
+   page (header excluded) — it doesn't scroll, so nodes stay visible behind every
+   card for the whole scroll length, not just inside the stage box below. The
+   "graph-stage" box is only a framing/focus window: a light vignette + the search
+   and floating-rail chrome, sitting transparently over the same shared canvas. */
+#glowCanvas { position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 0; pointer-events: none; }
+/* pointer-events is inherited — .graph-stage above sets it to none so clicks pass
+   through to this fixed layer, but #cy itself must opt back in to receive them */
+#cy { position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 0; background: var(--bg); pointer-events: auto; }
+.graph-stage { position: relative; z-index: 1; width: 100%; height: min(80vh, calc((100vh - var(--topbar-h)) * 0.8)); min-height: 420px; background-image: radial-gradient(circle 1px, rgba(255,255,255,0.09) 1px, transparent 0); background-size: 24px 24px; box-shadow: inset 0 0 140px 40px rgba(0,0,0,0.4); overflow: hidden; border-bottom: 1px solid var(--border-soft); pointer-events: none; }
+.canvas-topbar { position: absolute; top: 0; left: 0; right: 0; z-index: 5; display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; gap: 12px; pointer-events: none; }
+.canvas-topbar > * { pointer-events: auto; }
+.search-box { display: flex; align-items: center; gap: 8px; background: color-mix(in oklab, var(--bg) 78%, transparent); backdrop-filter: blur(8px); border: 1px solid var(--border); border-radius: var(--radius-pill); padding: 7px 14px; min-width: 240px; }
+.search-box svg { width: 14px; height: 14px; color: var(--muted); flex-shrink: 0; }
+.search-box input { background: transparent; border: none; color: var(--fg); font-size: 13px; width: 100%; }
+.search-box input::placeholder { color: var(--meta); }
+.canvas-legend { background: color-mix(in oklab, var(--bg) 78%, transparent); backdrop-filter: blur(8px); border: 1px solid var(--border); border-radius: var(--radius-pill); padding: 7px 12px; font-size: 11px; color: var(--muted); font-family: var(--font-mono); display: flex; align-items: center; gap: 8px; }
+.canvas-legend .glow-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-hover); box-shadow: 0 0 6px 1px var(--accent-hover); }
+.zoom-controls { display: flex; align-items: center; gap: 2px; background: color-mix(in oklab, var(--bg) 78%, transparent); backdrop-filter: blur(8px); border: 1px solid var(--border); border-radius: var(--radius-pill); padding: 5px 6px 5px 10px; color: var(--muted); }
+.zoom-controls svg { width: 13px; height: 13px; flex-shrink: 0; margin-right: 2px; opacity: 0.7; }
+.zoom-controls button { width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; background: transparent; border: none; color: var(--muted); font-size: 15px; line-height: 1; font-family: var(--font-body); transition: background var(--motion-fast), color var(--motion-fast); }
+.zoom-controls button:hover { background: color-mix(in oklab, var(--accent), transparent 82%); color: var(--accent-hover); }
+
+/* entity/relationship menu — no card chrome at all now, just text floating
+   directly over the graph. Legibility against whatever's underneath comes
+   from text-shadow instead of a background plate; dimmed by default, full
+   opacity on hover. Narrower than before, and stretches to fill the full
+   height of the graph-stage (top/bottom match the stage's own inset). */
+/* Pinned to graph-stage's own right edge (graph-stage spans the full page
+   width, unlike the centered/max-width .below-layout grid below it) --
+   deliberately NOT tracking the aside column's width/position anymore, so
+   it stays put at the page's actual edge regardless of how that column's
+   fractional grid width happens to resize. */
+.floating-rail { position: absolute; top: 60px; right: 16px; bottom: 16px; z-index: 6; display: flex; flex-direction: column; gap: 14px; width: 260px; pointer-events: none; }
+.floating-rail > * { pointer-events: auto; }
+/* transparent + dimmed at rest (true floating text over the graph); hovering
+   brings in a dark backdrop so it stays readable over a busy/light patch of
+   the graph — padding/border stay constant so the panel doesn't jump size,
+   only the colors fade in */
+.floating-card { opacity: 0.4; padding: 10px 11px; border-radius: var(--radius-md); border: 1px solid transparent; background: transparent; transition: opacity var(--motion-base) var(--ease-standard), background var(--motion-base), border-color var(--motion-base), box-shadow var(--motion-base); min-height: 0; max-width: 100%; overflow-x: hidden; display: flex; flex-direction: column; text-shadow: 0 1px 3px rgba(0,0,0,0.95), 0 0 10px rgba(0,0,0,0.6); }
+.floating-rail:hover .floating-card, .floating-card:focus-within { opacity: 1; background: color-mix(in oklab, var(--bg) 80%, transparent); backdrop-filter: blur(12px); border-color: var(--border-soft); box-shadow: var(--elev-raised); }
+.floating-card .card-head { margin-bottom: 8px; }
+.floating-card .card-head h3 { font-size: 10.5px; }
+/* same overflow-x-computes-to-auto issue as the details card, plus .count-row
+   .name has no min-width, so a flex child with white-space:nowrap won't
+   actually shrink below its own text width — the row just grows past the
+   152px column and the (accidentally auto) horizontal scrollbar appears.
+   Force overflow-x off and let the name truly shrink so ellipsis does its job. */
+#entityCounts.floating-list, #relTypes.floating-list { overflow-y: auto; overflow-x: hidden; max-width: 100%; }
+/* the relationship card is short — its chip grid wraps to only a couple of
+   rows — so forcing it to an equal flex share left dead space below its own
+   content. Let it size to content instead, and give the entity card the
+   rest of the column's height; #entityCounts (the actual scroll list, not
+   the card) is what grows into that space so more rows are visible instead
+   of the extra height sitting empty below the god-nodes section. */
+.floating-card.fc-entity { flex: 1; min-height: 0; }
+.floating-card.fc-rel { flex: 0 0 auto; }
+#entityCounts.floating-list { flex: 1; min-height: 60px; }
+.fc-subsection { margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.14); flex-shrink: 0; }
+.fc-subhead { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 5px; display: flex; align-items: center; justify-content: space-between; }
+
+/* on-demand node/relationship inspector — opposite side from the entity menu,
+   solid (not dimmed) since it only appears when explicitly asked for */
+.details-card { display: none; position: absolute; top: 60px; left: 16px; bottom: 16px; width: 340px; z-index: 8; flex-direction: column; background: color-mix(in oklab, var(--surface) 92%, transparent); backdrop-filter: blur(14px); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; box-shadow: var(--elev-raised); pointer-events: auto; overflow: hidden; box-sizing: border-box; }
+.details-card.open { display: flex; }
+.details-card .card-head { margin-bottom: 8px; flex-shrink: 0; }
+.details-card .card-head h3 { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* overflow-y:auto alone leaves overflow-x computed to auto too (spec
+   behavior when only one axis is set), which is exactly what was causing
+   the side-scroll — force it off explicitly, wrap long values instead */
+#detailsBody { overflow-y: auto; overflow-x: hidden; min-height: 0; }
+#detailsBody .metric-row { gap: 10px; }
+#detailsBody .metric-label { flex-shrink: 0; }
+#detailsBody .metric-val { flex: 1; min-width: 0; }
+
+.control-flyout { position: absolute; top: 0; left: 0; height: 100%; z-index: 6; pointer-events: auto; }
+/* outer container translates and stays overflow:visible so the pull-tab
+   (positioned outside the 224px box) never gets clipped; only the INNER
+   div scrolls its own content — this is what fixed the flyout vanishing */
+.control-panel-body { position: absolute; top: 0; left: 0; width: 224px; height: 100%; overflow: visible; transform: translateX(-100%); transition: transform var(--motion-base) var(--ease-standard); }
+.control-flyout.open .control-panel-body { transform: translateX(0); }
+.control-panel-scroll { width: 100%; height: 100%; overflow-y: auto; overflow-x: hidden; background: color-mix(in oklab, var(--surface) 96%, transparent); backdrop-filter: blur(10px); border-right: 1px solid var(--border); padding: 14px 12px; }
+.pull-tab { position: absolute; top: 50%; right: -20px; transform: translateY(-50%); width: 20px; height: 60px; background: color-mix(in oklab, var(--surface) 95%, transparent); border: 1px solid var(--border); border-left: none; border-radius: 0 8px 8px 0; display: grid; place-items: center; color: var(--muted); }
+.pull-tab:hover { color: var(--accent-hover); border-color: color-mix(in oklab, var(--accent), var(--border) 60%); }
+.pull-tab svg { width: 12px; height: 12px; transition: transform var(--motion-base); }
+.control-flyout.open .pull-tab svg { transform: rotate(180deg); }
+.control-section { padding: 10px 0; border-top: 1px solid var(--border-soft); }
+.control-section:first-child { border-top: none; padding-top: 0; }
+.control-section h4 { font-size: 10px; font-weight: 590; text-transform: uppercase; letter-spacing: 0.04em; color: var(--meta); margin-bottom: 7px; display: flex; align-items: center; }
+.ctl-field { margin-bottom: 9px; }
+.ctl-field label { display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+.ctl-field label .val { font-family: var(--font-mono); color: var(--fg-2); }
+input[type="range"] { width: 100%; accent-color: var(--accent); height: 14px; }
+.toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 11.5px; color: var(--fg-2); padding: 4px 0; }
+.toggle-row .lbl { display: flex; align-items: center; }
+.switch { position: relative; width: 30px; height: 17px; flex-shrink: 0; display: inline-block; }
+.switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; z-index: 2; }
+.switch .track { position: absolute; inset: 0; background: rgba(255,255,255,0.12); border-radius: 999px; transition: background var(--motion-fast); pointer-events: none; }
+.switch .thumb { position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--muted); transition: transform var(--motion-fast), background var(--motion-fast); pointer-events: none; }
+.switch input:checked + .track { background: color-mix(in oklab, var(--accent), transparent 25%); }
+.switch input:checked + .track + .thumb { transform: translateX(13px); background: var(--accent); }
+
+.qmark { display: inline-flex; align-items: center; justify-content: center; width: 13px; height: 13px; border-radius: 50%; border: 1px solid var(--meta); color: var(--meta); font-size: 9px; font-family: var(--font-mono); cursor: help; margin-left: 6px; flex-shrink: 0; }
+.qmark:hover, .qmark:focus-visible { border-color: var(--accent-hover); color: var(--accent-hover); }
+#tooltipBubble { position: fixed; background: var(--surface); border: 1px solid var(--border); color: var(--fg-2); font-size: 11.5px; font-family: var(--font-body); padding: 9px 11px; border-radius: var(--radius-sm); width: 210px; box-shadow: var(--elev-raised); opacity: 0; pointer-events: none; transition: opacity var(--motion-fast); z-index: 200; line-height: 1.45; }
+#tooltipBubble.show { opacity: 1; }
+
+.page { position: relative; z-index: 1; max-width: var(--container-max); margin-inline: auto; padding: var(--space-5) var(--space-6) var(--space-6); }
+.below-layout { display: grid; grid-template-columns: minmax(0,2.1fr) minmax(260px, 0.9fr); gap: var(--space-5); align-items: start; }
+@media (max-width: 1100px) { .below-layout { grid-template-columns: 1fr; } .floating-rail { position: static; width: 100%; flex-direction: row; margin-top: 12px; } .floating-card { opacity: 1; transform: none; } }
+.canvas-col { display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+
+/* translucent + blurred rather than solid — the graph is a fixed full-page layer
+   behind everything now, so every card is a window onto it, not an opaque tile */
+.card { background: color-mix(in oklab, var(--surface) 84%, transparent); backdrop-filter: blur(16px); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 18px; }
+.card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; gap: 8px; flex-wrap: wrap; }
+.card-head h3 { font-size: 13px; font-weight: 590; text-transform: uppercase; letter-spacing: 0.03em; color: var(--fg-2); font-family: var(--font-body); display: flex; align-items: center; }
+.sample-pill { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--warn); border: 1px solid color-mix(in oklab, var(--warn), transparent 60%); background: color-mix(in oklab, var(--warn), transparent 90%); padding: 2px 7px; border-radius: var(--radius-pill); }
+.live-pill { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--success); border: 1px solid color-mix(in oklab, var(--success), transparent 60%); background: color-mix(in oklab, var(--success), transparent 90%); padding: 2px 7px; border-radius: var(--radius-pill); }
+.wired-pill { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--success); border: 1px solid color-mix(in oklab, var(--success), transparent 55%); background: color-mix(in oklab, var(--success), transparent 90%); padding: 2px 7px; border-radius: var(--radius-pill); }
+
+.cypher-wrap { position: relative; background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); transition: border-color var(--motion-fast); }
+.cypher-wrap:focus-within { border-color: var(--accent); }
+.cypher-highlight, textarea#cypherInput { margin: 0; padding: 10px 12px; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.5; width: 100%; min-height: 90px; border: none; background: transparent; }
+.cypher-highlight { position: absolute; inset: 0; white-space: pre-wrap; word-wrap: break-word; overflow: hidden; pointer-events: none; color: var(--fg-2); }
+/* auto-grows to fit the whole query via JS (height set inline on content
+   change) instead of scrolling internally -- max-height/overflow-y is just
+   a backstop for a pathologically long pasted query. */
+textarea#cypherInput { position: relative; z-index: 1; color: transparent; caret-color: var(--fg); resize: none; overflow-y: auto; max-height: 340px; }
+textarea#cypherInput:focus-visible { box-shadow: none; }
+.tok-kw { color: var(--accent-hover); font-weight: 510; }
+.tok-label { color: var(--success); }
+.tok-str { color: var(--warn); }
+.tok-num { color: var(--fg); }
+.tok-cm { color: var(--meta); font-style: italic; }
+.autocomplete { position: absolute; left: 0; right: 0; top: 100%; margin-top: 2px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: var(--elev-raised); z-index: 20; max-height: 180px; overflow-y: auto; display: none; }
+.autocomplete.show { display: block; }
+.autocomplete .ac-item { padding: 6px 11px; font-family: var(--font-mono); font-size: 12px; color: var(--fg-2); display: flex; justify-content: space-between; gap: 10px; }
+.autocomplete .ac-item .k { color: var(--meta); font-size: 10px; text-transform: uppercase; }
+.autocomplete .ac-item.active { background: color-mix(in oklab, var(--accent), transparent 82%); color: var(--accent-hover); }
+.cypher-foot { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; gap: 10px; flex-wrap: wrap; }
+.cypher-note { font-size: 11px; color: var(--meta); }
+/* collapsed to 0 by default — Run just reveals the toggle button; opening it
+   shows a fixed ~5-row-tall scrollable window rather than dumping the table
+   straight into the page (see truncateDeep too — that's the other half of
+   not flooding this card with output) */
+.cypher-results-wrap { max-height: 0; overflow: hidden; transition: max-height var(--motion-base) var(--ease-standard); }
+.cypher-results-wrap.open { max-height: 216px; overflow-y: auto; margin-top: 10px; border-top: 1px solid var(--border-soft); }
+.cypher-results { padding-top: 10px; font-family: var(--font-mono); font-size: 12px; color: var(--meta); }
+.cypher-error { font-family: var(--font-mono); font-size: 12px; margin-top: 8px; }
+.cypher-error:empty { display: none; margin-top: 0; }
+
+.seg { display: inline-flex; background: rgba(255,255,255,0.03); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: 2px; }
+.seg button { padding: 5px 11px; border-radius: 4px; font-size: 11.5px; font-weight: 510; color: var(--muted); background: transparent; border: none; }
+.seg button.active { color: var(--fg); background: rgba(255,255,255,0.07); }
+
+.git-scroll { max-height: 480px; overflow-y: auto; padding-right: 4px; }
+.commit-row { display: grid; grid-template-columns: 14px 1fr; gap: 10px; cursor: pointer; }
+.commit-rail { display: flex; flex-direction: column; align-items: center; }
+.commit-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-hover); margin-top: 5px; flex-shrink: 0; }
+.commit-dot.merge { background: var(--success); border-radius: 2px; transform: rotate(45deg); }
+.commit-dot.hollow { background: transparent; border: 1.5px solid var(--warn); }
+.commit-line { width: 1px; flex: 1; background: var(--border); margin-top: 2px; }
+.commit-body { padding-bottom: 14px; min-width: 0; }
+.commit-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.commit-hash { font-family: var(--font-mono); font-size: 11px; color: var(--accent-hover); }
+.commit-branch { font-family: var(--font-mono); font-size: 10px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+.commit-branch.merge-badge { color: var(--success); border-color: color-mix(in oklab, var(--success), transparent 55%); }
+.commit-branch.wip-badge { color: var(--warn); border-color: color-mix(in oklab, var(--warn), transparent 55%); }
+.commit-msg { font-size: 13px; color: var(--fg-2); margin-top: 3px; line-height: 1.4; }
+.commit-meta { font-size: 11px; color: var(--meta); margin-top: 3px; font-family: var(--font-mono); }
+.commit-detail { display: none; font-size: 11.5px; color: var(--muted); margin-top: 6px; padding: 8px 10px; background: rgba(255,255,255,0.02); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); font-family: var(--font-mono); line-height: 1.5; white-space: pre-wrap; }
+.commit-row.open .commit-detail { display: block; }
+
+.tree-wrap { overflow: auto; max-height: 480px; }
+.tree-legend { display: flex; gap: 12px; font-size: 10.5px; color: var(--muted); margin-top: 10px; flex-wrap: wrap; }
+.tree-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.tree-legend i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+#treeSvg .tree-hit { cursor: pointer; }
+#treeSvg .tree-node.glow { filter: drop-shadow(0 0 3px rgba(247,248,248,0.95)) drop-shadow(0 0 9px rgba(130,143,255,0.85)); }
+#gitHoverCard { position: fixed; width: 270px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: var(--elev-raised); padding: 11px 13px; font-size: 12px; z-index: 200; opacity: 0; pointer-events: none; transition: opacity var(--motion-fast); }
+#gitHoverCard.show { opacity: 1; pointer-events: auto; }
+#gitHoverCard .h-hash { font-family: var(--font-mono); font-size: 10.5px; color: var(--accent-hover); }
+#gitHoverCard .h-title { color: var(--fg); font-weight: 510; margin: 4px 0 6px; line-height: 1.4; }
+#gitHoverCard .h-body { color: var(--muted); font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; }
+#gitHoverCard .h-more { color: var(--accent-hover); font-size: 11px; cursor: pointer; margin-top: 5px; display: inline-block; }
+
+canvas#queryChart { width: 100%; height: 100px; display: block; }
+.chart-controls { display: flex; gap: 6px; }
+.chart-foot { display: flex; justify-content: space-between; font-size: 11px; color: var(--meta); font-family: var(--font-mono); margin: 6px 0 14px; }
+.log-search { display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 7px 10px; margin-bottom: 8px; }
+.log-search svg { width: 13px; height: 13px; color: var(--muted); flex-shrink: 0; }
+.log-search input { background: transparent; border: none; color: var(--fg); font-size: 12.5px; width: 100%; }
+.log-table-wrap { max-height: 220px; overflow-y: auto; }
+table.logtable { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.logtable th { text-align: left; padding: 7px 8px; color: var(--meta); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; position: sticky; top: 0; background: var(--surface); }
+table.logtable td { padding: 7px 8px; border-top: 1px solid var(--border-soft); color: var(--fg-2); }
+table.logtable td.mono { font-family: var(--font-mono); font-size: 11px; }
+table.logtable tbody tr { cursor: pointer; }
+table.logtable tbody tr:hover { background: color-mix(in oklab, var(--accent), transparent 90%); }
+
+.rail { display: flex; flex-direction: column; gap: var(--space-4); }
+.entity-total { display: flex; align-items: center; justify-content: space-between; font-size: 12.5px; color: var(--fg-2); padding-bottom: 9px; margin-bottom: 8px; border-bottom: 1px solid var(--border-soft); }
+.entity-total .n { font-family: var(--font-mono); color: var(--fg); font-weight: 510; }
+.count-list { display: flex; flex-direction: column; }
+.count-row { display: flex; align-items: center; gap: 8px; padding: 6px 4px; margin: 0 -4px; border-top: 1px solid var(--border-soft); font-size: 13px; cursor: pointer; border-radius: 4px; transition: background var(--motion-fast); max-width: 100%; }
+.floating-card .count-row { font-size: 11.5px; padding: 4px 3px; }
+.count-row:hover { background: color-mix(in oklab, var(--accent), transparent 93%); }
+.count-row:first-child { border-top: none; }
+.count-row .type-dot { width: 8px; height: 8px; border-radius: 2px; transition: background var(--motion-fast), border-color var(--motion-fast); flex-shrink: 0; }
+.count-row.isolated { background: color-mix(in oklab, var(--accent), transparent 84%); }
+.count-row.isolated .name { color: var(--fg); font-weight: 590; }
+.count-row.dimmed { opacity: 0.4; }
+.count-row .name { color: var(--fg-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1 1 auto; min-width: 0; }
+.count-row .val { margin-left: auto; font-family: var(--font-mono); font-size: 13px; color: var(--fg); flex-shrink: 0; }
+.floating-card .count-row .val { font-size: 11.5px; }
+.count-row .val.na { color: var(--meta); }
+.count-note { font-size: 10.5px; color: var(--meta); margin-top: 8px; line-height: 1.5; }
+.rel-grid { display: flex; flex-wrap: wrap; gap: 5px; overflow-y: auto; overflow-x: hidden; max-width: 100%; }
+.rel-chip { font-family: var(--font-mono); font-size: 10.5px; padding: 3px 7px; border-radius: var(--radius-pill); border: 1px solid var(--border); color: var(--muted); background: rgba(255,255,255,0.02); cursor: pointer; transition: background var(--motion-fast), color var(--motion-fast), border-color var(--motion-fast); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rel-chip:hover { background: color-mix(in oklab, var(--accent), transparent 88%); color: var(--accent-hover); border-color: color-mix(in oklab, var(--accent), transparent 55%); }
+.rel-chip.isolated { background: color-mix(in oklab, var(--accent), transparent 78%); color: var(--accent-hover); border-color: color-mix(in oklab, var(--accent), transparent 40%); }
+.rel-chip.dimmed { opacity: 0.4; }
+
+/* ── metric cards: JVM/pagecache/telemetry/topology ── */
+.metric-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 7px 0; border-top: 1px solid var(--border-soft); }
+.metric-row:first-child { border-top: none; }
+.metric-label { font-size: 12px; color: var(--fg-2); display: flex; align-items: center; }
+.metric-val { font-family: var(--font-mono); font-size: 13px; color: var(--fg); flex-shrink: 0; }
+.metric-val.dim { color: var(--meta); }
+.meter { height: 6px; border-radius: 999px; background: rgba(255,255,255,0.08); overflow: hidden; margin-top: 6px; }
+.meter > i { display: block; height: 100%; background: var(--accent); border-radius: inherit; transition: width var(--motion-base) var(--ease-standard); }
+.metric-block { padding: 9px 0; border-top: 1px solid var(--border-soft); }
+.metric-block:first-child { border-top: none; padding-top: 0; }
+.metric-block .metric-label { justify-content: space-between; margin-bottom: 2px; }
+.leaderboard-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-top: 1px solid var(--border-soft); font-size: 12px; }
+.leaderboard-row:first-child { border-top: none; }
+.leaderboard-row .lb-rank { font-family: var(--font-mono); font-size: 10.5px; color: var(--meta); width: 14px; flex-shrink: 0; }
+.leaderboard-row .lb-name { color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.leaderboard-row .lb-type { font-family: var(--font-mono); font-size: 9.5px; color: var(--meta); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; flex-shrink: 0; }
+.leaderboard-row .lb-val { font-family: var(--font-mono); font-size: 12px; color: var(--fg); flex-shrink: 0; }
+.topology-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+.placeholder-note { font-size: 11px; color: var(--meta); line-height: 1.5; margin-top: 6px; }
+
+.settings-overlay { position: fixed; inset: 0; z-index: 80; background: var(--bg); display: none; overflow-y: auto; }
+.settings-overlay.open { display: block; }
+.settings-topbar { position: sticky; top: 0; background: color-mix(in oklab, var(--bg) 92%, transparent); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border-soft); display: flex; align-items: center; gap: 12px; padding: 12px var(--space-6); max-width: var(--container-max); margin-inline: auto; }
+.settings-topbar h2 { font-size: 17px; }
+.settings-body { max-width: var(--container-max); margin-inline: auto; padding: var(--space-6); }
+.settings-layout { display: grid; grid-template-columns: 190px 1fr; gap: var(--space-6); }
+@media (max-width: 900px) { .settings-layout { grid-template-columns: 1fr; } }
+.settings-nav { display: flex; flex-direction: column; gap: 2px; position: sticky; top: 70px; }
+.settings-nav button { text-align: left; padding: 9px 12px; border-radius: var(--radius-sm); background: transparent; border: none; color: var(--muted); font-size: 13px; font-weight: 510; }
+.settings-nav button:hover { color: var(--fg); background: rgba(255,255,255,0.03); }
+.settings-nav button.active { color: var(--fg); background: rgba(255,255,255,0.06); }
+.settings-pane { display: none; flex-direction: column; gap: var(--space-4); }
+.settings-pane.active { display: flex; }
+.settings-pane h3.pane-title { font-size: var(--text-xl); margin-bottom: 4px; }
+.settings-pane .desc { color: var(--muted); font-size: 13px; max-width: 62ch; margin-bottom: 4px; }
+.banner { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: var(--radius-md); font-size: 12.5px; line-height: 1.5; }
+.banner.warn { background: color-mix(in oklab, var(--warn), transparent 90%); border: 1px solid color-mix(in oklab, var(--warn), transparent 65%); color: var(--fg-2); }
+.banner.info { background: rgba(255,255,255,0.03); border: 1px solid var(--border); color: var(--muted); }
+.banner svg { width: 15px; height: 15px; flex-shrink: 0; margin-top: 1px; color: var(--warn); }
+.banner.info svg { color: var(--muted); }
+.field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+@media (max-width: 700px) { .field-grid { grid-template-columns: 1fr; } }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field label { font-size: 12px; color: var(--muted); display: flex; align-items: center; justify-content: space-between; }
+.field label .lbl-txt { display: flex; align-items: center; }
+.field label .badge { font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--meta); border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px; }
+.field input, .field select { background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--fg); padding: 9px 11px; font-size: 13px; font-family: var(--font-mono); }
+.field input:disabled { color: var(--meta); background: rgba(255,255,255,0.015); cursor: not-allowed; }
+.field input:focus-visible { border-color: var(--accent); }
+.pending-badge { font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; color: var(--warn); border: 1px solid color-mix(in oklab, var(--warn), transparent 60%); padding: 1px 5px; border-radius: 4px; margin-left: 6px; }
+table.dstable { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.dstable th, table.dstable td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border-soft); }
+table.dstable th { color: var(--meta); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; font-weight: 400; }
+table.dstable td { color: var(--fg-2); }
+table.dstable td.mono { font-family: var(--font-mono); font-size: 12px; }
+table.dstable tbody tr:hover { background: rgba(255,255,255,0.02); }
+table.dstable input[type="text"] { width: 100%; }
+.env-badge { font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; color: var(--meta); border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px; }
+.status-live { color: var(--success); font-family: var(--font-mono); font-size: 11px; display: inline-flex; align-items: center; gap: 5px; }
+.status-live::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 3px color-mix(in oklab, var(--success), transparent 75%); }
+.tool-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 0; border-top: 1px solid var(--border-soft); }
+.tool-row:first-child { border-top: none; }
+.tool-name { font-family: var(--font-mono); font-size: 12px; color: var(--fg-2); flex-shrink: 0; }
+.tool-desc { font-size: 11.5px; color: var(--meta); flex: 1; margin: 0 14px; }
+.warn-note { display: flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--warn); margin-top: 3px; }
+.warn-note svg { width: 12px; height: 12px; flex-shrink: 0; }
+.snippet-box { background: #050506; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-2); line-height: 1.7; white-space: pre-wrap; word-break: break-all; }
+.snippet-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.copy-toast { font-size: 11px; color: var(--success); margin-left: 8px; opacity: 0; transition: opacity var(--motion-fast); }
+.copy-toast.show { opacity: 1; }
+
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 100; }
+.modal-overlay.open { display: flex; }
+.modal-box { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 22px; width: 360px; box-shadow: var(--elev-raised); }
+.modal-box h4 { font-size: 15px; margin-bottom: 8px; }
+.modal-box p { font-size: 13px; color: var(--muted); line-height: 1.55; margin: 0 0 18px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.pagefoot { position: relative; z-index: 1; border-top: 1px solid var(--border-soft); padding: 24px var(--space-6); color: var(--meta); font-size: 12px; max-width: var(--container-max); margin-inline: auto; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; background: color-mix(in oklab, var(--bg) 88%, transparent); }
+</style>
 </head>
 <body>
-  <div class="app-shell">
-    <aside class="sidebar">
-      <div class="sidebar__heading">Repositories</div>
-      <div id="repo-list"></div>
-    </aside>
 
-    <header class="topbar">
-      <input id="search-box" class="topbar__search" type="search" placeholder="Search components&hellip;" />
-      <div id="live-status" class="live-status">
-        <span class="live-status__dot"></span>
-        <span id="live-status-text">connecting&hellip;</span>
-      </div>
-    </header>
+<header class="topnav" data-od-id="topnav">
+  <div class="topnav-inner">
+    <button class="icon-btn" id="btnOpenSettings" title="Settings" data-od-id="btn-settings-cog">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
+    <div class="brand" data-od-id="brand"><span class="mark">DG</span>DevGraph<span class="ver" title="Read from pyproject.toml — wire to real build metadata later">v0.1.0</span><span class="beta">Beta</span></div>
+    <div class="topnav-spacer"></div>
+    <div class="repo-select-wrap">
+      <select id="repoSelect" data-od-id="repo-select">
+        <option value="__all__">All Repos</option>
+        <option value="devgraph" selected>devgraph</option>
+      </select>
+    </div>
+    <button class="btn btn-sm" id="btnRegister" title="Add a repo below in Settings → Repos">+ Register repo</button>
+  </div>
+</header>
 
-    <main class="main">
-      <section class="panel">
-        <h2 class="panel__title">Overview</h2>
-        <div id="stat-grid" class="stat-grid">
-          <p class="empty-state">Select a repository from the sidebar.</p>
+<section class="graph-stage" id="graphStage" data-od-id="graph-stage">
+  <div class="canvas-topbar">
+    <div class="search-box">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="graphSearch" type="text" placeholder="Search components, focus on match…" />
+    </div>
+    <div class="zoom-controls" data-od-id="graph-zoom-controls" title="Scroll-to-zoom is off — use these instead">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <button id="btnZoomOut" aria-label="Zoom out">−</button>
+      <button id="btnZoomIn" aria-label="Zoom in">+</button>
+    </div>
+    <div class="canvas-legend"><span class="glow-dot"></span><span id="neo4jStatusLegend">checking Neo4j…</span><span id="visibleCount">— nodes</span></div>
+  </div>
+  <canvas id="glowCanvas"></canvas>
+  <div id="cy"></div>
+  <div class="control-flyout" id="controlFlyout" data-od-id="graph-control-panel">
+    <div class="control-panel-body">
+      <div class="control-panel-scroll">
+        <div class="control-section">
+          <h4>Layout</h4>
+          <div class="ctl-field">
+            <label>Algorithm<span class="qmark" data-tip="Link distance and repulsion are pre-tuned per algorithm for this dataset size — not exposed as controls.">?</span></label>
+            <select id="layoutSelect">
+              <option value="cose">Force-directed</option>
+              <option value="breadthfirst">Hierarchical</option>
+              <option value="concentric">Radial</option>
+              <option value="grid">Grid</option>
+            </select>
+          </div>
+          <div class="ctl-field">
+            <label>Node ceiling <span class="val" id="valNodeCeiling">794</span><span class="qmark" data-tip="Caps the LIMIT in the graph query. Max is the real node count for the current repo/isolation filter -- drag to change it, or edit the query's WITH n LIMIT directly and this slider follows.">?</span></label>
+            <input type="range" id="ctlNodeCeiling" min="1" max="794" value="794" />
+          </div>
+          <div class="ctl-field" style="margin-bottom:0">
+            <label>Relationship ceiling <span class="val" id="valRelCeiling">2000</span><span class="qmark" data-tip="Caps the LIMIT in the graph query. Max is the real relationship count for the current repo/isolation filter -- drag to change it, or edit the query's final LIMIT directly and this slider follows.">?</span></label>
+            <input type="range" id="ctlRelCeiling" min="1" max="2000" value="2000" />
+          </div>
         </div>
-      </section>
-
-      <section class="panel">
-        <h2 class="panel__title">Search results</h2>
-        <ul id="search-results" class="search-results"></ul>
-      </section>
-
-      <section class="panel">
-        <h2 class="panel__title">Graph</h2>
-        <div id="graph-canvas"></div>
-      </section>
-    </main>
+        <div class="control-section" style="padding-bottom:2px">
+          <h4>Live behavior</h4>
+          <div class="toggle-row">
+            <span class="lbl">Auto-refresh on reindex<span class="qmark" data-tip="Diffed updates only — adds/removes changed elements instead of rebuilding the whole graph, so the layout won't jump on every sync.">?</span></span>
+            <label class="switch"><input type="checkbox" id="ctlLiveUpdate" checked /><span class="track"></span><span class="thumb"></span></label>
+          </div>
+        </div>
+      </div>
+      <div class="pull-tab" id="pullTab" title="Display controls"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></div>
+    </div>
   </div>
 
-  <script src="/static/vendor/cytoscape.min.js"></script>
-  <script src="/static/js/app.js"></script>
+  <div class="details-card" id="detailsCard" data-od-id="node-details-card">
+    <div class="card-head">
+      <h3 id="detailsTitle">Details</h3>
+      <button class="icon-btn" id="btnCloseDetails" title="Close" style="width:22px;height:22px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div id="detailsBody"></div>
+  </div>
+
+  <div class="floating-rail" data-od-id="floating-entity-rail">
+    <div class="floating-card fc-entity" data-od-id="entity-counts-card">
+      <div class="card-head"><h3>Entities</h3><span class="wired-pill" id="entityLivePill" style="display:none">Live</span></div>
+      <div class="entity-total">Total:<span class="n" id="entityTotal">—</span></div>
+      <div class="count-list floating-list" id="entityCounts"></div>
+      <div class="count-note">Document nodes: <span id="docCount" style="color:var(--fg-2)">—</span></div>
+      <div class="fc-subsection" data-od-id="god-nodes-section">
+        <div class="fc-subhead">Top god nodes<span class="qmark" data-tip="Ranked by real degree centrality — size((n)--()) — a plain Cypher query, no plugin required. PageRank would need GDS.">?</span></div>
+        <div id="godNodes"></div>
+      </div>
+    </div>
+    <div class="floating-card fc-rel" data-od-id="relationship-counts-card">
+      <div class="card-head"><h3>Relationships</h3><span class="sample-pill" id="relSamplePill">Not wired</span></div>
+      <div class="rel-grid floating-list" id="relTypes"></div>
+    </div>
+  </div>
+</section>
+
+<main class="page">
+  <div class="below-layout" data-od-id="view-graph">
+    <div class="canvas-col">
+      <div class="card" data-od-id="cypher-card">
+        <div class="card-head"><h3>Cypher query</h3></div>
+        <div class="cypher-wrap">
+          <pre class="cypher-highlight" id="cypherHighlight" aria-hidden="true"><code id="cypherHighlightCode"></code></pre>
+          <textarea id="cypherInput" spellcheck="false"></textarea>
+          <div class="autocomplete" id="autocomplete"></div>
+        </div>
+        <div class="cypher-foot">
+          <span class="cypher-note" id="cypherNote">Matches glow live as you type · MCP cypher access for AI agents toggles in <a href="#" id="linkOpenMcpSettings" style="color:var(--accent-hover)">Settings</a>.</span>
+          <button class="btn btn-sm" id="btnRunCypher">Run</button>
+        </div>
+        <div class="cypher-error" id="cypherError"></div>
+        <button class="btn btn-sm" id="btnToggleResults" style="display:none; margin-top:10px">Show results</button>
+        <div class="cypher-results-wrap" id="cypherResultsWrap">
+          <div class="cypher-results" id="cypherResults"></div>
+        </div>
+      </div>
+
+      <div class="card" data-od-id="query-log-card">
+        <div class="card-head"><h3>Cypher query rate</h3><span class="live-pill" title="Real counts of queries run through this dashboard's own Cypher console — not database-wide load, and not per-MCP-tool telemetry (that's still unwired, see the Query telemetry card).">Console queries</span></div>
+        <div class="chart-controls" style="margin-bottom:10px">
+          <select id="chartInterval"><option value="auto" selected>Auto interval</option><option value="60">1 min</option><option value="300">5 min</option><option value="3600">1 hr</option></select>
+          <select id="chartSpan"><option value="900">Last 15m</option><option value="3600" selected>Last 1h</option><option value="86400">Last 24h</option><option value="604800">Last 7d</option></select>
+        </div>
+        <canvas id="queryChart" width="700" height="100"></canvas>
+        <div class="chart-foot"><span id="chartFrom">—</span><span id="chartTo">now</span></div>
+        <div class="log-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><input id="logSearch" type="text" placeholder="Search query log by tool, repo, or cypher text…" /></div>
+        <div class="log-table-wrap"><table class="logtable"><thead><tr><th>Time</th><th>Tool</th><th>Repo</th><th>Cypher</th></tr></thead><tbody id="logTableBody"></tbody></table></div>
+      </div>
+    </div>
+
+    <aside class="rail" data-od-id="stats-rail">
+      <div class="card" data-od-id="git-history-card">
+        <div class="card-head">
+          <h3>Git history<span class="commit-branch" id="gitCurrentBranch" style="margin-left:8px; display:none"></span></h3>
+          <div class="seg" id="gitViewToggle"><button class="active" data-git-view="list">Readout</button><button data-git-view="tree">Tree</button></div>
+        </div>
+        <div id="gitList" class="git-scroll"><div class="placeholder-note">Loading…</div></div>
+        <div id="gitTree" class="tree-wrap" style="display:none">
+          <svg id="treeSvg"></svg>
+          <div class="tree-legend" id="gitTreeLegend"></div>
+        </div>
+      </div>
+
+      <div class="card" data-od-id="db-memory-card">
+        <div class="card-head"><h3>Database &amp; memory</h3><span class="sample-pill" id="memPill" title="Requires JVM/JMX or APOC access — attempted on connect, falls back if unavailable">Not wired</span></div>
+        <div class="metric-block">
+          <div class="metric-label"><span>JVM heap</span><span class="metric-val dim" id="heapVal">—</span></div>
+          <div class="meter"><i id="heapMeter" style="width:0%"></i></div>
+        </div>
+        <div class="metric-block">
+          <div class="metric-label"><span>Page cache hit ratio<span class="qmark" data-tip="Share of graph lookups served from RAM vs. disk reads. Healthy is generally >95%.">?</span></span><span class="metric-val dim" id="pageCacheVal">—</span></div>
+          <div class="meter"><i id="pageCacheMeter" style="width:0%"></i></div>
+        </div>
+        <div class="metric-row"><span class="metric-label">Store size on disk</span><span class="metric-val dim" id="storeSizeVal">—</span></div>
+        <div class="placeholder-note" id="memNote">Attempting <code>dbms.queryJmx</code> / store-file stat on connect. No APOC/JMX exposure confirmed yet on this build — values stay dashed until that's verified live, never fabricated.</div>
+      </div>
+
+      <div class="card" data-od-id="query-telemetry-card">
+        <div class="card-head"><h3>Query telemetry</h3><span class="sample-pill">Not wired</span></div>
+        <div class="metric-row"><span class="metric-label">Active queries</span><span class="metric-val dim" id="activeQVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">Queued transactions</span><span class="metric-val dim" id="queuedQVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">P50 / P99 latency</span><span class="metric-val dim" id="latencyVal">— / —</span></div>
+        <div class="metric-row"><span class="metric-label">Error rate</span><span class="metric-val dim" id="errRateVal">—</span></div>
+        <div class="placeholder-note">Needs a query-log store per the rebuild design doc §8 (MCP wrapper instrumentation) — not built yet. <code>dbms.listQueries()</code> attempted for active-count only.</div>
+      </div>
+
+      <div class="card" data-od-id="community-card">
+        <div class="card-head"><h3>Community partitions</h3><span class="sample-pill" id="communityPill">Checking…</span></div>
+        <div class="metric-row"><span class="metric-label">Partitions detected<span class="qmark" data-tip="Louvain modularity via Neo4j Graph Data Science. Attempted live; falls back if the GDS plugin isn't installed.">?</span></span><span class="metric-val dim" id="communityVal">—</span></div>
+        <div class="placeholder-note" id="communityNote">Checking for the GDS plugin…</div>
+      </div>
+    </aside>
+  </div>
+</main>
+
+<footer class="pagefoot" data-od-id="footer"><span>DevGraph dashboard prototype · design phase</span><span>Node/relationship taxonomy from <code>graph/schema.py</code> · git history is the real <code>devgraph</code> log</span></footer>
+
+<div class="settings-overlay" id="settingsOverlay" data-od-id="settings-overlay">
+  <div class="settings-topbar"><button class="icon-btn" id="btnCloseSettings" title="Back to graph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button><h2>Settings</h2></div>
+  <div class="settings-body">
+    <div class="settings-layout">
+      <nav class="settings-nav" data-od-id="settings-nav">
+        <button class="active" data-pane="repos">Repos</button>
+        <button data-pane="mcp">MCP tools</button>
+        <button data-pane="watcher">Watcher / tray</button>
+        <button data-pane="network">Network / access</button>
+        <button data-pane="neo4j">Neo4j</button>
+        <button data-pane="vector">Vector / embeddings</button>
+        <button data-pane="global">Global settings</button>
+      </nav>
+      <div>
+        <div class="settings-pane active" id="pane-repos" data-od-id="pane-repos">
+          <h3 class="pane-title">Repo management</h3>
+          <p class="desc">One registered repo on this machine today. Repo add/remove stays CLI-only for persistence this pass — the form below mirrors <code>devgraph add &lt;path&gt;</code> so it's ready to POST once the backend route exists.</p>
+          <div class="card">
+            <table class="dstable">
+              <thead><tr><th>repo_id</th><th>watch</th><th>mentions</th><th>PR / issue source</th><th>docs_path</th><th>last_indexed</th><th>last_indexed_commit</th><th></th></tr></thead>
+              <tbody>
+                <tr>
+                  <td class="mono">devgraph</td>
+                  <td><label class="switch"><input type="checkbox" checked /><span class="track"></span><span class="thumb"></span></label></td>
+                  <td><label class="switch"><input type="checkbox" checked /><span class="track"></span><span class="thumb"></span></label></td>
+                  <td><label class="switch"><input type="checkbox" /><span class="track"></span><span class="thumb"></span></label></td>
+                  <td><input type="text" placeholder="e.g. docs/" style="width:110px" /></td>
+                  <td class="mono">2026-09-04</td>
+                  <td class="mono">4806608</td>
+                  <td><button class="btn btn-sm">Rescan</button></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="card" data-od-id="repo-register-form">
+            <h4 style="font-size:13px;text-transform:uppercase;letter-spacing:.03em;color:var(--fg-2);margin-bottom:12px">Register a repo</h4>
+            <div class="field-grid">
+              <div class="field"><label>Target directory / git repo path</label><input type="text" id="regRepoPath" placeholder="C:\Dev\projects\active\rag4" /></div>
+              <div class="field"><label>repo_id</label><input type="text" id="regRepoId" placeholder="rag4" /></div>
+            </div>
+            <div class="field" style="margin-top:12px">
+              <label>Next ingestion run<span class="qmark" data-tip="Full parses the whole repo. Incremental targets only files changed since last_indexed_commit via git diff.">?</span></label>
+              <div class="seg" id="rebuildModeToggle"><button class="active" data-mode="incremental">Incremental</button><button data-mode="full">Full rebuild</button></div>
+            </div>
+            <div style="margin-top:14px"><button class="btn btn-sm btn-primary" id="btnRegisterRepo">Register repo</button><span class="copy-toast" id="registerToast">Queued — not yet persisted, see banner below.</span></div>
+          </div>
+          <div class="banner info"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg><span><code>docs_path</code> is a real, currently-unset repo field per the rebuild design doc §2. Both this table and the register form above are wired to hold values, ready to POST to the backend save route once it exists — nothing persists yet in this prototype. Add a repo for real today with <code>devgraph add &lt;path&gt;</code>.</span></div>
+        </div>
+
+        <div class="settings-pane" id="pane-mcp" data-od-id="pane-mcp">
+          <h3 class="pane-title">MCP tool exposure</h3>
+          <p class="desc">19 read tools registered today, plus the raw Cypher escape hatch below. Per-tool toggles gate registration in <code>mcp/server.py</code> — propagated via the shared config store, not a live push to running MCP processes.</p>
+          <div class="card">
+            <div class="tool-row" style="padding-bottom:10px; margin-bottom:6px; border-bottom:1px solid var(--border-soft); border-top:none; align-items:flex-start">
+              <div>
+                <span class="tool-name" style="color:var(--fg); font-weight:590">enable_run_cypher</span>
+                <div class="tool-desc" style="margin:2px 0 0">Raw Cypher access against Neo4j — global switch, off by default</div>
+                <div class="warn-note" id="cypherWarnNote" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg>MCP clients (Claude Code, IDEs, other AI agents) can now run arbitrary Cypher through this tool. The dashboard's own Cypher box on the Graph page is unaffected either way.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="toggleCypher" /><span class="track"></span><span class="thumb"></span></label>
+            </div>
+            <div id="mcpToolList"></div>
+          </div>
+          <div class="banner warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg>Per-model / per-client MCP access control is explicitly skipped this pass — the server is stdio-transport, 1:1 per client, with no allowlisting concept yet. Separate future spec.</div>
+        </div>
+
+        <div class="settings-pane" id="pane-watcher" data-od-id="pane-watcher">
+          <h3 class="pane-title">Watcher / tray</h3>
+          <p class="desc">Global start/stop calls the same path as <code>devgraph tray start/stop</code> — there's no separate global-watch flag independent of per-repo toggles.</p>
+          <div class="card" style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px"><div><div style="font-weight:510">Tray watcher</div><span class="status-live">running</span></div><button class="btn btn-sm">Stop</button></div>
+          <div class="card field-grid">
+            <div class="field"><label><span class="lbl-txt">watch_debounce_ms<span class="qmark" data-tip="Milliseconds the watcher waits after a filesystem event before triggering a re-index.">?</span></span></label><input type="number" value="500" /></div>
+            <div class="field"><label><span class="lbl-txt">health_check_interval_s<span class="qmark" data-tip="How often the tray checks that the watcher process is still alive and responsive.">?</span></span></label><input type="number" value="30" /></div>
+          </div>
+        </div>
+
+        <div class="settings-pane" id="pane-network" data-od-id="pane-network">
+          <h3 class="pane-title">Network / access</h3>
+          <div class="banner warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg>No authentication or IP allowlist. Loopback-only by design this pass — per the rebuild design doc §5, adding auth is only in scope if <code>dashboard_host</code> ever moves off <code>127.0.0.1</code>.</div>
+          <div class="card field-grid"><div class="field"><label>dashboard_host</label><input type="text" id="cfgDashboardHost" value="127.0.0.1" disabled /></div><div class="field"><label>dashboard_port</label><input type="text" id="cfgDashboardPort" value="8765" disabled /></div></div>
+        </div>
+
+        <div class="settings-pane" id="pane-neo4j" data-od-id="pane-neo4j">
+          <h3 class="pane-title">Neo4j</h3>
+          <p class="desc">Credentials live in <code>.env</code> only. Display-only here — a live-reconnect on the dashboard's driver wouldn't propagate to the tray, watcher, or spawned MCP processes anyway, each of which builds its own <code>GraphEngine</code> at construction.</p>
+          <div class="card field-grid">
+            <div class="field"><label><span class="lbl-txt">neo4j_uri</span><span class="badge">restart required</span></label><input type="text" id="cfgNeo4jUri" value="bolt://127.0.0.1:7687" disabled /></div>
+            <div class="field"><label><span class="lbl-txt">neo4j_user</span><span class="badge">restart required</span></label><input type="text" id="cfgNeo4jUser" value="neo4j" disabled /></div>
+            <div class="field"><label><span class="lbl-txt">neo4j_password</span><span class="badge">restart required</span></label><input type="password" value="••••••••••••" disabled /></div>
+          </div>
+          <div class="banner warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg>The Graph page's Cypher box no longer talks to Neo4j directly — it POSTs through this process's own <code>/api/cypher</code> endpoint (<code>dashboard/routes.py</code>), which runs the query server-side using this same config. The browser never sees a Neo4j credential.</div>
+
+          <h4 style="font-size:13px;text-transform:uppercase;letter-spacing:.03em;color:var(--fg-2);margin-top:6px">Engine configuration <span style="color:var(--meta);font-weight:400;text-transform:none;letter-spacing:0">(neo4j.conf)</span></h4>
+          <div class="banner warn" data-od-id="neoconf-handover-banner"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg><span><strong>Handover, not automation.</strong> These are JVM/engine flags in <code>neo4j.conf</code> — the dashboard has no process to hot-apply them (heap size specifically is a JVM startup flag, it cannot reload at runtime). Edit the fields below, then copy the generated snippet at the bottom into <code>neo4j.conf</code> and restart the container yourself: this instance runs under <strong>Podman</strong>, so that's <code>podman restart &lt;neo4j-container&gt;</code> (not <code>docker restart</code>). Nothing here is written automatically.</span></div>
+          <div class="card field-grid">
+            <div class="field"><label><span class="lbl-txt">dbms.memory.heap.max_size<span class="qmark" data-tip="JVM heap ceiling. JVM startup flag — changing it always needs a restart, on any database.">?</span></span><span class="badge">restart required</span></label><input type="text" class="neoconf" data-setting="dbms.memory.heap.max_size" value="1G" /></div>
+            <div class="field"><label><span class="lbl-txt">dbms.memory.pagecache.size<span class="qmark" data-tip="Off-heap RAM reserved to cache graph structures — the single biggest lever for page cache hit ratio.">?</span></span><span class="badge">restart required</span></label><input type="text" class="neoconf" data-setting="dbms.memory.pagecache.size" value="512m" /></div>
+            <div class="field"><label><span class="lbl-txt">dbms.transaction.timeout<span class="qmark" data-tip="Hard cap that kills a runaway multi-hop Cypher query — useful against loops an LLM agent can trigger. 0 = disabled.">?</span></span><span class="badge">restart required</span></label><input type="text" class="neoconf" data-setting="dbms.transaction.timeout" value="30s" /></div>
+            <div class="field"><label><span class="lbl-txt">dbms.security.procedures.unallowlist<span class="qmark" data-tip="Blocks specific procedure globs (e.g. advanced APOC/GDS write procedures) without hand-editing config text files.">?</span></span><span class="badge">restart required</span></label><input type="text" class="neoconf" data-setting="dbms.security.procedures.unallowlist" value="" placeholder="e.g. apoc.*,gds.*.write" /></div>
+          </div>
+          <div class="card" style="display:flex; align-items:center; justify-content:space-between">
+            <div><div style="font-weight:510; font-size:13px">Read-only mode<span class="qmark" data-tip="Locks the database to read-only — for system debugging or an agent-evaluation sweep where nothing should be able to write.">?</span></div><div class="tool-desc" style="margin-top:2px">Temporarily reject all writes, dashboard's own Cypher box included</div></div>
+            <label class="switch"><input type="checkbox" class="neoconf" data-setting="dbms.databases.default_to_read_only" id="ctlReadOnly" /><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="card" data-od-id="neoconf-snippet">
+            <div class="card-head"><h3 style="margin:0">Generated neo4j.conf snippet</h3><span id="neoconfPendingPill" class="pending-badge" style="display:none">unapplied</span></div>
+            <pre class="snippet-box" id="neoconfSnippet"></pre>
+            <div class="snippet-actions"><span class="copy-toast" id="neoconfCopyToast">Copied</span><button class="btn btn-sm" id="btnCopyNeoconf" style="margin-left:8px">Copy snippet</button></div>
+          </div>
+        </div>
+
+        <div class="settings-pane" id="pane-vector" data-od-id="pane-vector">
+          <h3 class="pane-title">Vector / embeddings</h3>
+          <p class="desc">Forward-looking. Devgraph has no embedding or vector-model configuration today — <code>config/settings.py</code> holds nothing for this. The control below is a placeholder for planned local-embedding support, not a working switch.</p>
+          <div class="banner info"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg><span>Nothing on this pane is wired to anything. It exists so the shape of the future setting is visible before the feature is built.</span></div>
+          <div class="card field-grid">
+            <div class="field">
+              <label><span class="lbl-txt">Embedding model<span class="qmark" data-tip="Which local Ollama model generates vectors during vector-graph ingestion. Not implemented — devgraph has no embedding step yet.">?</span></span><span class="badge">planned</span></label>
+              <select disabled>
+                <option>nomic-embed-text (Ollama)</option>
+                <option>mxbai-embed-large (Ollama)</option>
+                <option>all-minilm (Ollama)</option>
+              </select>
+            </div>
+            <div class="field"><label><span class="lbl-txt">Vector index dimensions</span><span class="badge">planned</span></label><input type="text" value="768" disabled /></div>
+          </div>
+        </div>
+
+        <div class="settings-pane" id="pane-global" data-od-id="pane-global">
+          <h3 class="pane-title">Global settings</h3>
+          <p class="desc">Env-var-only today. Editable here for convenience — any change asks to confirm first, since none of these take effect until the dashboard/tray/watcher processes restart.</p>
+          <div class="card">
+            <table class="dstable" id="globalTable">
+              <tbody>
+                <tr data-setting="telemetry_enabled" data-type="switch"><td>telemetry_enabled<span class="qmark" data-tip="Opt-in anonymous usage telemetry. Off by default — local-first.">?</span></td><td><label class="switch"><input type="checkbox" class="gset" /><span class="track"></span><span class="thumb"></span></label></td><td><span class="env-badge">env-var</span></td></tr>
+                <tr data-setting="cloud_sync" data-type="switch"><td>cloud_sync<span class="qmark" data-tip="Sync the local graph to a DevGraph cloud account. Off by default.">?</span></td><td><label class="switch"><input type="checkbox" class="gset" /><span class="track"></span><span class="thumb"></span></label></td><td><span class="env-badge">env-var</span></td></tr>
+                <tr data-setting="mentions_ambiguous_mode" data-type="text"><td>mentions_ambiguous_mode<span class="qmark" data-tip="How the Mentions extractor resolves a free-text reference that matches more than one entity — 'all' or 'skip'.">?</span></td><td><input type="text" class="gset" value="all" /></td><td><span class="env-badge">env-var</span></td></tr>
+                <tr data-setting="git_recency_track_author" data-type="switch"><td>git_recency_track_author<span class="qmark" data-tip="Also stage commit author alongside recency data when syncing git history.">?</span></td><td><label class="switch"><input type="checkbox" class="gset" checked /><span class="track"></span><span class="thumb"></span></label></td><td><span class="env-badge">env-var</span></td></tr>
+                <tr data-setting="registry_db_path" data-type="text"><td>registry_db_path<span class="qmark" data-tip="Where the shared repo/settings registry SQLite file lives. Rarely changed.">?</span></td><td><input type="text" class="gset" value="~/.devgraph/registry.sqlite3" /></td><td><span class="env-badge">env-var</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="restartModal"><div class="modal-box"><h4>Restart required</h4><p id="restartModalText"></p><div class="modal-actions"><button class="btn btn-sm" id="restartCancel">Cancel</button><button class="btn btn-sm btn-primary" id="restartConfirm">Confirm change</button></div></div></div>
+<div id="tooltipBubble"></div>
+<div id="gitHoverCard"></div>
+
+<script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<script>
+/* ── global fixed tooltip (not clipped by scroll containers) ─────── */
+const tip = document.getElementById("tooltipBubble");
+function wireTooltip(q) {
+  q.addEventListener("mouseenter", () => {
+    tip.textContent = q.dataset.tip;
+    const r = q.getBoundingClientRect();
+    tip.style.left = Math.min(r.left - 100, window.innerWidth - 226) + "px";
+    tip.style.top = (r.top - 10) + "px";
+    tip.style.transform = "translateY(-100%)";
+    tip.classList.add("show");
+  });
+  q.addEventListener("mouseleave", () => tip.classList.remove("show"));
+}
+document.querySelectorAll(".qmark").forEach(wireTooltip);
+
+/* ── themed custom <select> (replaces the OS-default white popup list) ── */
+function themeSelect(select) {
+  const wrap = document.createElement("div"); wrap.className = "csel";
+  select.parentNode.insertBefore(wrap, select);
+  wrap.appendChild(select);
+  select.classList.add("csel-native");
+  const btn = document.createElement("button"); btn.type = "button"; btn.className = "csel-btn";
+  const list = document.createElement("div"); list.className = "csel-list";
+  function labelFor(v) { const o = [...select.options].find(o => o.value === v); return o ? o.textContent : v; }
+  function renderList() {
+    list.innerHTML = "";
+    [...select.options].forEach(o => {
+      const item = document.createElement("div");
+      item.className = "csel-item" + (o.value === select.value ? " active" : "");
+      item.textContent = o.textContent;
+      item.addEventListener("mousedown", e => {
+        e.preventDefault();
+        select.value = o.value;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+        btn.textContent = o.textContent;
+        list.classList.remove("show");
+        renderList();
+      });
+      list.appendChild(item);
+    });
+  }
+  btn.textContent = labelFor(select.value);
+  renderList();
+  btn.addEventListener("click", () => { document.querySelectorAll(".csel-list.show").forEach(l => { if (l !== list) l.classList.remove("show"); }); list.classList.toggle("show"); });
+  document.addEventListener("click", e => { if (!wrap.contains(e.target)) list.classList.remove("show"); });
+  wrap.appendChild(btn);
+  wrap.appendChild(list);
+  select.themeRefresh = () => { btn.textContent = labelFor(select.value); renderList(); };
+}
+["repoSelect","layoutSelect","chartInterval","chartSpan"].forEach(id => themeSelect(document.getElementById(id)));
+
+const NODE_TYPES = [
+  { id:"Repository",       cat:"repo",        count:1 },
+  { id:"Service",          cat:"service",      count:2 },
+  { id:"Module",           cat:"module",       count:84 },
+  { id:"Class",            cat:"class",        count:82 },
+  { id:"Function",         cat:"function",     count:588 },
+  { id:"Endpoint",         cat:"endpoint",     count:26 },
+  { id:"Database",         cat:"database",     count:6 },
+  { id:"VectorStore",      cat:"vectorstore",  count:3 },
+  { id:"Queue",            cat:"queue",        count:2 },
+  { id:"Requirement",      cat:"phase2",       count:null },
+  { id:"DesignDecision",   cat:"phase2",       count:null },
+  { id:"ArchitectureNote", cat:"phase2",       count:null },
+  { id:"Document",         cat:"phase2",       count:null },
+  { id:"Commit",           cat:"phase3",       count:null },
+  { id:"PullRequest",      cat:"phase3",       count:null },
+  { id:"Issue",            cat:"phase3",       count:null },
+];
+const REL_TYPES = ["CONTAINS","CALLS","IMPORTS","USES","RUNS","WRITES_TO","READS_FROM","IMPLEMENTS","DEPENDS_ON","EXTENDS","SATISFIES","DOCUMENTED_BY","DECIDED_BY","SUPERSEDES","MENTIONS","MODIFIES","RESOLVES","REFERENCES"];
+
+/* plain literal hex colors, resolved once in JS — no CSS custom-property or
+   color-mix() indirection at all, since canvas fillStyle can't parse an
+   unresolved custom-property string from getComputedStyle. */
+const CAT_COLORS = {
+  repo:        "#b7b3ff",
+  service:     "#7c8dff",
+  module:      "#22c3e6",
+  class:       "#22c55e",
+  function:    "#a3e635",
+  endpoint:    "#fbbf24",
+  database:    "#f0813c",
+  vectorstore: "#dc2626",
+  queue:       "#e0559e",
+  phase2:      "#9299a6",
+  phase3:      "#6b7280",
+};
+function catColor(cat) { return CAT_COLORS[cat] || "#8a8f98"; }
+const brightCache = {};
+function catColorBright(cat) {
+  if (brightCache[cat]) return brightCache[cat];
+  const hex = CAT_COLORS[cat] || "#8a8f98";
+  const n = parseInt(hex.slice(1), 16);
+  let r = (n>>16)&255, g = (n>>8)&255, b = n&255;
+  const amt = 0.5;
+  r = Math.round(r + (255-r)*amt); g = Math.round(g + (255-g)*amt); b = Math.round(b + (255-b)*amt);
+  return brightCache[cat] = `rgb(${r},${g},${b})`;
+}
+
+/* isolate model: clicking a type shows ONLY that type (AND labels(n)[0]="X" /
+   AND type(r)="X") instead of the old exclude-list (AND NOT ... IN [...]).
+   Clicking the already-isolated one clears back to the whole graph. Entity
+   and relationship isolation are independent of each other. */
+const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000 };
+
+const entityCounts = document.getElementById("entityCounts");
+let entityTotal = 0;
+NODE_TYPES.forEach(t => {
+  if (t.count !== null) entityTotal += t.count;
+  const row = document.createElement("div");
+  row.className = "count-row";
+  row.dataset.cat = t.cat;
+  row.style.setProperty("--dotcolor", CAT_COLORS[t.cat]);
+  row.innerHTML = `<span class="type-dot" style="background:${CAT_COLORS[t.cat]}"></span><span class="name">${t.id}</span><span class="val ${t.count===null?'na':''}">${t.count===null ? "—" : t.count.toLocaleString()}</span>`;
+  row.addEventListener("mouseenter", () => highlightCat(t.cat, true));
+  row.addEventListener("mouseleave", () => highlightCat(t.cat, false));
+  row.addEventListener("click", () => { state.isolatedEntity = (state.isolatedEntity === t.cat) ? null : t.cat; isolateChanged(); });
+  entityCounts.appendChild(row);
+});
+document.getElementById("entityTotal").textContent = entityTotal.toLocaleString();
+document.getElementById("ctlNodeCeiling").max = entityTotal;
+document.getElementById("ctlNodeCeiling").value = entityTotal;
+document.getElementById("valNodeCeiling").textContent = entityTotal;
+state.nodeCeiling = entityTotal;
+
+const relTypes = document.getElementById("relTypes");
+REL_TYPES.forEach(r => {
+  const chip = document.createElement("span");
+  chip.className = "rel-chip"; chip.textContent = r; chip.dataset.rel = r;
+  chip.addEventListener("mouseenter", () => highlightRel(r, true));
+  chip.addEventListener("mouseleave", () => highlightRel(r, false));
+  chip.addEventListener("click", () => { state.isolatedRel = (state.isolatedRel === r) ? null : r; isolateChanged(); });
+  relTypes.appendChild(chip);
+});
+/* isolating a type is a state change like any other -- goes through the
+   same refreshGraph() the repo dropdown/ceiling sliders use, so the box,
+   graph, and counts all move together. Falls back to the old client-only
+   glow-filter when Neo4j isn't reachable (demo mode has nothing to fetch). */
+function isolateChanged() {
+  refreshIsolateUI();
+  if (neo4jConnected) refreshGraph("full", true);
+  else applyState(false, "full");
+}
+function refreshIsolateUI() {
+  entityCounts.querySelectorAll(".count-row").forEach(row => {
+    row.classList.toggle("isolated", state.isolatedEntity === row.dataset.cat);
+    row.classList.toggle("dimmed", state.isolatedEntity !== null && state.isolatedEntity !== row.dataset.cat);
+  });
+  relTypes.querySelectorAll(".rel-chip").forEach(chip => {
+    chip.classList.toggle("isolated", state.isolatedRel === chip.dataset.rel);
+    chip.classList.toggle("dimmed", state.isolatedRel !== null && state.isolatedRel !== chip.dataset.rel);
+  });
+}
+
+/* ── representative graph (mock fallback, used until/unless Neo4j is reachable) ─── */
+const REAL_MODULES = ["devgraph/graph/engine.py","devgraph/agent/tray.py","devgraph/agent/headless.py","devgraph/agent/lifecycle.py","devgraph/watcher/__init__.py","devgraph/dashboard/app.py","devgraph/dashboard/queries.py","devgraph/dashboard/routes.py","devgraph/dashboard/events.py","devgraph/dashboard/__init__.py"];
+const REAL_FUNCTIONS = ["stop","start","_on_changes","bind_loop","_run_dashboard"];
+function buildElements() {
+  const els = [];
+  els.push({ data:{ id:"repo:devgraph", label:"devgraph", cat:"repo" } });
+  els.push({ data:{ id:"svc:devgraph", label:"devgraph", cat:"service" } });
+  els.push({ data:{ id:"svc:neo4j", label:"devgraph-neo4j", cat:"service" } });
+  els.push({ data:{ source:"repo:devgraph", target:"svc:devgraph", label:"CONTAINS" } });
+  els.push({ data:{ source:"repo:devgraph", target:"svc:neo4j", label:"CONTAINS" } });
+  REAL_MODULES.forEach((m,i) => { const id = "mod:"+i; els.push({ data:{ id, label:m.split("/").pop(), cat:"module" } }); els.push({ data:{ source:"svc:devgraph", target:id, label:"CONTAINS" } }); });
+  REAL_FUNCTIONS.forEach((f,i) => { const id = "fn:"+i; const parent = "mod:"+(i%REAL_MODULES.length); els.push({ data:{ id, label:f+"()", cat:"function" } }); els.push({ data:{ source:parent, target:id, label:"CONTAINS" } }); });
+  els.push({ data:{ id:"db:neo4j", label:"neo4j", cat:"database" } });
+  els.push({ data:{ source:"svc:neo4j", target:"db:neo4j", label:"RUNS" } });
+  els.push({ data:{ id:"vs:1", label:"embeddings store", cat:"vectorstore" } });
+  els.push({ data:{ source:"svc:devgraph", target:"vs:1", label:"WRITES_TO" } });
+  els.push({ data:{ id:"q:1", label:"index queue", cat:"queue" } });
+  els.push({ data:{ source:"svc:devgraph", target:"q:1", label:"USES" } });
+  els.push({ data:{ id:"ep:1", label:"/api/graph", cat:"endpoint" } });
+  els.push({ data:{ source:"mod:5", target:"ep:1", label:"IMPLEMENTS" } });
+  els.push({ data:{ source:"mod:1", target:"mod:4", label:"IMPORTS" } });
+  els.push({ data:{ source:"mod:2", target:"mod:3", label:"IMPORTS" } });
+  els.push({ data:{ source:"mod:5", target:"mod:6", label:"CALLS" } });
+  els.push({ data:{ source:"mod:6", target:"mod:8", label:"CALLS" } });
+  els.push({ data:{ source:"mod:0", target:"db:neo4j", label:"READS_FROM" } });
+  return els;
+}
+const STRUCTURAL_CATS = new Set(["repo","service","database","vectorstore","queue","endpoint"]);
+const cy = cytoscape({
+  container: document.getElementById("cy"),
+  elements: buildElements(),
+  wheelSensitivity: 0.15,
+  userZoomingEnabled: false, /* scroll-to-zoom stays off deliberately — use the +/- controls instead */
+  style: [
+    { selector: "node", style: {
+        "background-color": ele => catColor(ele.data("cat")),
+        "label": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? ele.data("label") : "",
+        /* subtle by default — dim, small, low-opacity; hover brightens it, doesn't resize it */
+        "color": "#8a8f98", "font-size": 7.5, "font-family": "var(--font-mono)",
+        "text-valign": "center", "text-halign": "right", "text-margin-x": 8, "text-opacity": 0.55,
+        "text-outline-color": "#08090a", "text-outline-width": 1.5, "text-outline-opacity": 0.7,
+        "width": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? 15 : 9, "height": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? 15 : 9, "border-width": 0,
+        /* no default glow: shadow tracks a per-node "glow" data value (0 by default,
+           animated toward 1 on a query match) — this is what makes deglow/glow smooth */
+        "shadow-blur": ele => 4 + (ele.data("glow")||0) * 16, "shadow-color": ele => catColor(ele.data("cat")), "shadow-opacity": ele => (ele.data("glow")||0) * 0.9, "shadow-offset-x": 0, "shadow-offset-y": 0 } },
+    { selector: "node.show-label", style: { "label": "data(label)" } },
+    { selector: "node[cat='repo']", style: { "shape":"round-hexagon" } },
+    { selector: "node[cat='service']", style: { "shape":"round-diamond" } },
+    { selector: "node[id='svc:neo4j']", style: { "text-halign": "left", "text-margin-x": -8 } },
+    { selector: "node.excluded", style: { "background-opacity": 0, "border-width": 1.3, "border-color": ele => catColor(ele.data("cat")), "border-opacity": 0.9, "opacity": 0.45, "shadow-opacity": 0 } },
+    { selector: "edge", style: {
+        "width": 1,
+        "line-fill": "linear-gradient",
+        "line-gradient-stop-colors": ele => `${catColor(ele.source().data("cat"))} ${catColor(ele.target().data("cat"))}`,
+        "line-gradient-stop-positions": "0% 100%",
+        "curve-style": "unbundled-bezier", "control-point-distances": [16], "control-point-weights": [0.5],
+        "target-arrow-shape": "triangle", "target-arrow-color": ele => catColor(ele.target().data("cat")), "arrow-scale": 0.55,
+        "opacity": ele => 0.35 + (ele.data("glow")||0) * 0.55,
+        "shadow-blur": ele => (ele.data("glow")||0) * 16, "shadow-color": ele => catColor(ele.source().data("cat")), "shadow-opacity": ele => (ele.data("glow")||0) * 0.85, "shadow-offset-x": 0, "shadow-offset-y": 0,
+    } },
+    { selector: "edge.excluded", style: { "line-fill": "solid", "line-color": "var(--meta)", "line-style": "dashed", "opacity": 0.25, "shadow-opacity": 0, "target-arrow-color": "var(--meta)" } },
+    { selector: ".faded", style: { "opacity": 0.07 } },
+    { selector: "node.highlighted", style: { "border-width": 1.5, "border-color": "#7170ff", "border-opacity": 0.9, "z-index": 10 } },
+    { selector: "node.hover-hl", style: {
+        "background-color": ele => catColorBright(ele.data("cat")),
+        "color": "#ffffff", "text-opacity": 1, "text-outline-opacity": 0.9,
+        "shadow-blur": 20, "shadow-color": ele => catColor(ele.data("cat")), "shadow-opacity": 1, "shadow-offset-x": 0, "shadow-offset-y": 0,
+        "z-index": 20,
+    } },
+    { selector: "edge.hover-hl", style: { "width": 2.2, "opacity": 1, "shadow-blur": 30, "shadow-opacity": 1, "z-index": 15 } },
+  ],
+  layout: { name: "random" },
+  minZoom: 0.2, maxZoom: 3,
+  autoungrabify: true, /* dragging nodes is off entirely — the graph only pans/zooms/rotates now */
+});
+cy.one("layoutstop", () => forceDirectedSettle(() => focusRotation(null, 60, 1000)));
+cy.on("mouseover", "node", e => e.target.addClass("show-label hover-hl"));
+cy.on("mouseout", "node", e => { e.target.removeClass("hover-hl"); if (!STRUCTURAL_CATS.has(e.target.data("cat"))) e.target.removeClass("show-label"); });
+
+/* ── node/relationship inspector: tap an element for its real properties ──
+   Cy elements only carry a curated {id, label, cat} — enough for the graph
+   itself, not enough for an inspector — so a click fetches the full property
+   map live by internal id, the same "live:<id>" / "live-e:<id>" scheme
+   mapGraphResultToElements already uses. */
+const detailsCard = document.getElementById("detailsCard");
+const detailsTitle = document.getElementById("detailsTitle");
+const detailsBody = document.getElementById("detailsBody");
+function renderPropsRows(props) {
+  if (!props || !Object.keys(props).length) return `<div class="placeholder-note">No properties.</div>`;
+  return Object.entries(props).map(([k, v]) => `<div class="metric-row"><span class="metric-label">${escapeHtmlVal(k)}</span><span class="metric-val" style="overflow-wrap:anywhere;text-align:right;white-space:normal">${formatCell(v)}</span></div>`).join("");
+}
+function showDetailsCard(ele, isEdge) {
+  detailsCard.classList.add("open");
+  document.getElementById("controlFlyout").classList.remove("open"); // both dock to the left edge — don't let them overlap
+  detailsTitle.textContent = isEdge ? (ele.data("label") || "Relationship") : (ele.data("label") || ele.data("cat") || "Node");
+  detailsBody.innerHTML = `<div class="placeholder-note">Loading…</div>`;
+  const m = /^live(-e)?:(\d+)$/.exec(ele.id());
+  if (!m) {
+    detailsBody.innerHTML = `<div class="metric-row"><span class="metric-label">Type</span><span class="metric-val">${escapeHtmlVal(isEdge ? ele.data("label") : ele.data("cat"))}</span></div><div class="placeholder-note">Static demo element — connect to Neo4j to see real properties.</div>`;
+    return;
+  }
+  const numId = m[2];
+  const query = isEdge
+    ? `MATCH ()-[r]-() WHERE id(r) = ${numId} RETURN type(r) AS type, properties(r) AS props, startNode(r) AS s, endNode(r) AS t LIMIT 1`
+    : `MATCH (n) WHERE id(n) = ${numId} RETURN labels(n) AS labels, properties(n) AS props LIMIT 1`;
+  runCypher(query).then(json => {
+    if (!detailsCard.classList.contains("open")) return; // closed while the request was in flight
+    if (json.errors?.length || !json.results[0].data.length) { detailsBody.innerHTML = `<div class="placeholder-note">Could not load — element may no longer exist.</div>`; return; }
+    const row = json.results[0].data[0].row;
+    if (isEdge) {
+      const [type, props, s, t] = row;
+      detailsBody.innerHTML =
+        `<div class="metric-row"><span class="metric-label">Type</span><span class="metric-val">${escapeHtmlVal(type)}</span></div>` +
+        `<div class="metric-row"><span class="metric-label">From</span><span class="metric-val">${escapeHtmlVal(s?.name || s?.repo_id || "—")}</span></div>` +
+        `<div class="metric-row"><span class="metric-label">To</span><span class="metric-val">${escapeHtmlVal(t?.name || t?.repo_id || "—")}</span></div>` +
+        renderPropsRows(props);
+    } else {
+      const [labels, props] = row;
+      detailsBody.innerHTML =
+        `<div class="metric-row"><span class="metric-label">Label</span><span class="metric-val">${escapeHtmlVal((labels||[]).join(", "))}</span></div>` +
+        renderPropsRows(props);
+    }
+  }).catch(() => { if (detailsCard.classList.contains("open")) detailsBody.innerHTML = `<div class="placeholder-note">Request failed.</div>`; });
+}
+cy.on("tap", "node", e => showDetailsCard(e.target, false));
+cy.on("tap", "edge", e => showDetailsCard(e.target, true));
+cy.on("tap", e => { if (e.target === cy) detailsCard.classList.remove("open"); });
+document.getElementById("btnCloseDetails").addEventListener("click", () => detailsCard.classList.remove("open"));
+
+/* uniform Fruchterman-Reingold force settle — every node repels every other
+   node by the same rule and every real edge pulls its two ends together by
+   the same rule, with no notion of "connected component" anywhere in the
+   math. This is deliberately not cose: cose bins disconnected components
+   into their own separately-packed grid (the "islands line up outside the
+   cluster" bug, and tethering them in with a fake edge just hides them
+   instead of actually placing them well). Here an island is just a node (or
+   small group of nodes) with no springs pulling it — pure repulsion from
+   every other node plus mild centering gravity settles it into open space
+   around the main mass on its own, the same way it would for every other
+   node. Runs a few iterations per animation frame so it never blocks the
+   page even at several hundred nodes. */
+/* Repulsion and attraction are deliberately DIFFERENT strengths, not the
+   textbook symmetric Fruchterman-Reingold (repulsion = idealLength²/dist,
+   attraction = dist²/idealLength, same constant both ways) — pure FR at a
+   reasonable idealLength was pushing connected nodes apart almost as hard as
+   it pulled them together, which reads as "only repulsion" once several
+   hundred nodes are all pushing on each other at once. ATTRACTION_MULT makes
+   real edges pull noticeably harder than the symmetric baseline so connected
+   clusters actually pull tight, GRAVITY is much stronger so separate
+   clusters/islands (nothing but repulsion + gravity acting on them) get
+   pulled in close instead of drifting out to wherever repulsion alone would
+   put them, and idealLength itself is smaller so the whole graph sits
+   tighter overall. mode:"light" is for a future incremental reindex (a few
+   nodes added to an already-settled graph) — short, low-temperature run that
+   nudges things into place without re-shuffling a graph that was already
+   fine. mode:"full" (default) is for a first load or a materially different
+   node set. */
+function forceDirectedSettle(onDone, mode) {
+  const nodes = cy.nodes();
+  const ids = nodes.map(n => n.id());
+  if (!ids.length) { onDone && onDone(); return; }
+  const rect = cy.container().getBoundingClientRect();
+  const area = Math.max((rect.width || 900) * (rect.height || 600), 300000);
+  const idealLength = Math.sqrt(area / ids.length) * 0.5;
+  const ATTRACTION_MULT = 2.2;
+  const GRAVITY = 0.09;
+  const positions = new Map();
+  const spread = Math.sqrt(area) / 2;
+  nodes.forEach(n => {
+    const p = n.position();
+    positions.set(n.id(), (p.x || p.y) ? { x: p.x, y: p.y } : { x: (Math.random()-0.5)*spread, y: (Math.random()-0.5)*spread });
+  });
+
+  /* Center the camera on the gravity target RIGHT NOW, before a single
+     physics step has run -- previously the camera held still (wherever it
+     happened to be) for the whole settle, then jump-cut to a fit-to-circle
+     only once settling finished, which read as "nodes fly in, wait, then
+     the view suddenly snaps." Panning to the starting centroid immediately
+     means the camera is already framing the right spot as nodes converge
+     into it; the pan doesn't move again until the slower reveal below. */
+  let startCx = 0, startCy = 0;
+  positions.forEach(p => { startCx += p.x; startCy += p.y; });
+  startCx /= ids.length; startCy /= ids.length;
+  rotationPivot = { x: startCx, y: startCy };
+  if (rect.width && rect.height) {
+    const zoom = cy.zoom();
+    cy.pan({ x: rect.width / 2 - startCx * zoom, y: rect.height / 2 - startCy * zoom });
+  }
+
+  const edgePairs = [];
+  cy.edges().forEach(e => edgePairs.push([e.source().id(), e.target().id()]));
+  /* a connected node gets pulled toward the cluster TWICE — gravity, and the
+     spring on every one of its edges. An island has no edges, so gravity is
+     its only pull against the same repulsion everyone else feels — at equal
+     gravity it settles measurably farther out than a connected node would,
+     and the tighter attraction now pulling the main mass into a smaller
+     cluster only makes that gap look bigger. Scale gravity up for low-degree
+     nodes specifically so an island is held in about as tightly, relative to
+     the cluster, as a connected node is. */
+  const degree = new Map(ids.map(id => [id, 0]));
+  edgePairs.forEach(([s, t]) => { degree.set(s, (degree.get(s)||0) + 1); degree.set(t, (degree.get(t)||0) + 1); });
+  const ISLAND_GRAVITY_BOOST = 16;
+  const gravityMult = new Map(ids.map(id => [id, 1 + ISLAND_GRAVITY_BOOST / (1 + degree.get(id))]));
+  const light = mode === "light";
+  let temp = Math.sqrt(area) / (light ? 30 : 10);
+  const COOLING_STEPS = light ? 35 : 140;
+  let iter = 0;
+
+  function step() {
+    const disp = new Map(ids.map(id => [id, { x: 0, y: 0 }]));
+    for (let i = 0; i < ids.length; i++) {
+      const a = positions.get(ids[i]);
+      for (let j = i + 1; j < ids.length; j++) {
+        const b = positions.get(ids[j]);
+        let dx = a.x - b.x, dy = a.y - b.y;
+        const dist = Math.hypot(dx, dy) || 0.01;
+        const force = (idealLength * idealLength) / dist;
+        dx = (dx / dist) * force; dy = (dy / dist) * force;
+        const da = disp.get(ids[i]), db = disp.get(ids[j]);
+        da.x += dx; da.y += dy;
+        db.x -= dx; db.y -= dy;
+      }
+    }
+    edgePairs.forEach(([s, t]) => {
+      const a = positions.get(s), b = positions.get(t);
+      if (!a || !b) return;
+      let dx = a.x - b.x, dy = a.y - b.y;
+      const dist = Math.hypot(dx, dy) || 0.01;
+      const force = ATTRACTION_MULT * (dist * dist) / idealLength;
+      dx = (dx / dist) * force; dy = (dy / dist) * force;
+      disp.get(s).x -= dx; disp.get(s).y -= dy;
+      disp.get(t).x += dx; disp.get(t).y += dy;
+    });
+    let cx = 0, cyy = 0;
+    positions.forEach(p => { cx += p.x; cyy += p.y; });
+    cx /= ids.length; cyy /= ids.length;
+    ids.forEach(id => {
+      const p = positions.get(id), d = disp.get(id);
+      const g = GRAVITY * gravityMult.get(id);
+      d.x += (cx - p.x) * g;
+      d.y += (cyy - p.y) * g;
+    });
+    ids.forEach(id => {
+      const p = positions.get(id), d = disp.get(id);
+      const dlen = Math.hypot(d.x, d.y) || 0.01;
+      const capped = Math.min(dlen, temp);
+      p.x += (d.x / dlen) * capped;
+      p.y += (d.y / dlen) * capped;
+    });
+    temp *= 0.96;
+    iter++;
+  }
+  function frame() {
+    for (let i = 0; i < 3 && iter < COOLING_STEPS; i++) step();
+    cy.batch(() => { ids.forEach(id => { const ele = cy.getElementById(id); if (ele.length) ele.position(positions.get(id)); }); });
+    if (iter < COOLING_STEPS) requestAnimationFrame(frame);
+    else onDone && onDone();
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ── diff-merge instead of wipe-and-rebuild ─────────────────────────────
+   loadFullGraph used to do cy.elements().remove() + cy.add(elements) on
+   every call, which re-creates every node from scratch with no position
+   data at all — every existing node loses its place and the whole graph
+   re-randomizes and re-settles from zero, every time. That's the exact
+   "unwanted regeneration" the original dashboard rebuild doc called out as
+   a bug, just reproduced here. This keeps whatever already exists (same id
+   = same element, position untouched), only removes ids no longer present,
+   and only truly new nodes get positioned — near an already-placed
+   neighbor's real position if the incoming data connects them to one,
+   otherwise scattered near the current graph's center. There's no live
+   reindex event wired into this prototype yet (confirmed: no SSE/interval
+   anywhere in this file — "Auto-refresh on reindex" is a real control with
+   nothing behind it today), so in practice this only runs on manual loads
+   right now — but it's the mechanism a real reindex hook should call:
+   mode "light" for a small incremental change, "full" for a first load or
+   a wholesale scope change like switching repos. */
+function mergeGraphElements(elements, mode) {
+  const incoming = new Map(elements.map(el => [el.data.id, el]));
+  const existingIds = new Set(cy.elements().map(e => e.id()));
+  const toRemove = cy.elements().filter(e => !incoming.has(e.id()));
+  const toAdd = [...incoming.values()].filter(el => !existingIds.has(el.data.id));
+
+  /* A text-only file edit re-indexes the same nodes/edges under the same
+     ids -- a refetch after it returns an identical element set, nothing
+     added or removed. Previously this still fell through to
+     forceDirectedSettle()/focusRotation() below unconditionally, which
+     visibly jiggled the whole graph (repositioned nothing, but still ran a
+     settle pass and re-fit the camera) for a change that had zero actual
+     effect on the graph. Bail out before touching cy at all when nothing
+     is structurally different. */
+  if (!toAdd.length && toRemove.length === 0) return cy.elements().length > 0;
+
+  toRemove.remove();
+  if (!toAdd.length && !cy.elements().length) return false;
+
+  const newNodeEls = toAdd.filter(el => !el.data.source);
+  const newEdgeEls = toAdd.filter(el => el.data.source);
+  const hadExisting = cy.nodes().length > 0;
+  cy.add(newNodeEls);
+
+  const bb = hadExisting ? cy.nodes().boundingBox() : null;
+  const cx = bb ? (bb.x1 + bb.x2) / 2 : 0;
+  const cyy = bb ? (bb.y1 + bb.y2) / 2 : 0;
+  const rect = cy.container().getBoundingClientRect();
+  const bootstrapSpread = Math.sqrt(Math.max((rect.width||900)*(rect.height||600), 300000)) / 2;
+  const nearbySpread = bb ? Math.max(90, Math.hypot(bb.w, bb.h) / 8) : bootstrapSpread;
+  const allIncomingEdges = [...incoming.values()].filter(el => el.data.source);
+  newNodeEls.forEach(el => {
+    const node = cy.getElementById(el.data.id);
+    let px, py;
+    const link = allIncomingEdges.find(e => e.data.source === el.data.id || e.data.target === el.data.id);
+    const other = link && cy.getElementById(link.data.source === el.data.id ? link.data.target : link.data.source);
+    if (hadExisting && other && other.length && (other.position().x || other.position().y)) {
+      px = other.position().x + (Math.random()-0.5) * 50;
+      py = other.position().y + (Math.random()-0.5) * 50;
+    } else if (hadExisting) {
+      px = cx + (Math.random()-0.5) * nearbySpread;
+      py = cyy + (Math.random()-0.5) * nearbySpread;
+    } else {
+      px = (Math.random()-0.5) * bootstrapSpread;
+      py = (Math.random()-0.5) * bootstrapSpread;
+    }
+    node.position({ x: px, y: py });
+    node.data("glow", 0);
+  });
+  cy.add(newEdgeEls);
+  newEdgeEls.forEach(el => cy.getElementById(el.data.id).data("glow", 0));
+
+  const touchedRatio = toAdd.length / Math.max(1, cy.elements().length);
+  forceDirectedSettle(() => focusRotation(null, 60, 1000), mode || (touchedRatio > 0.25 ? "full" : "light"));
+  return true;
+}
+
+/* graph stage height = 80% of the viewport below the topnav, kept in sync on resize
+   so cytoscape's internal render size and the fit/pan math stay correct */
+const graphStage = document.getElementById("graphStage");
+
+function syncStageHeight() {
+  const topbarH = document.querySelector(".topnav").offsetHeight;
+  const h = Math.max(420, (window.innerHeight - topbarH) * 0.8);
+  graphStage.style.height = h + "px";
+  cy.resize();
+}
+window.addEventListener("resize", syncStageHeight);
+syncStageHeight();
+
+/* pan/zoom-linked faint grid on the focus-window frame — dot radius scales with
+   zoom too, not just spacing, otherwise dots stay a fixed 1px and look
+   artificially dense when zoomed out. The graph itself lives on the fixed
+   #cy/#glowCanvas layer behind the whole page now, not inside this box. */
+function syncGrid() {
+  const z = cy.zoom(), p = cy.pan();
+  const r = Math.max(0.4, 1 * z).toFixed(2);
+  const spacing = Math.max(4, 24 * z).toFixed(2);
+  graphStage.style.backgroundImage = `radial-gradient(circle ${r}px, rgba(255,255,255,0.09) ${r}px, transparent 0)`;
+  graphStage.style.backgroundSize = `${spacing}px ${spacing}px`;
+  graphStage.style.backgroundPosition = `${p.x}px ${p.y}px`;
+}
+cy.on("pan zoom", syncGrid); syncGrid();
+
+/* ── manual zoom controls — scroll-to-zoom is deliberately off (see cy init),
+   these two buttons are the only way to zoom now, centered on the viewport. */
+function zoomBy(factor) {
+  const rect = cy.container().getBoundingClientRect();
+  const level = Math.min(cy.maxZoom(), Math.max(cy.minZoom(), cy.zoom() * factor));
+  cy.animate({ zoom: { level, renderedPosition: { x: rect.width/2, y: rect.height/2 } } }, { duration: 150 });
+}
+document.getElementById("btnZoomIn").addEventListener("click", () => zoomBy(1.35));
+document.getElementById("btnZoomOut").addEventListener("click", () => zoomBy(1/1.35));
+
+/* ── slow ambient rotation: the whole graph spins around a fixed pivot — the
+   bounding-box center of the whole graph with no query active, or of the
+   current query's matched nodes when one is. Rotating rigidly around a fixed
+   pivot preserves every node's distance from it, so once the camera is framed
+   to cover the pivot's radius (+ margin) at fit time, the framed set can
+   never drift out of view no matter how long it spins — cheaper and more
+   robust than recomputing a fit every frame. Pauses while the user is
+   interacting so it never fights a drag. */
+let rotationPivot = null;
+let userInteracting = false, lastRotationTime = performance.now();
+cy.on("tapstart", () => { userInteracting = true; });
+cy.on("tapend", () => { userInteracting = false; lastRotationTime = performance.now(); });
+function boundingCircle(nodesColl) {
+  if (!nodesColl.length) return null;
+  const bb = nodesColl.boundingBox();
+  const cx = (bb.x1+bb.x2)/2, cy0 = (bb.y1+bb.y2)/2;
+  let maxDist = 0;
+  nodesColl.forEach(n => { const p = n.position(); const d = Math.hypot(p.x-cx, p.y-cy0); if (d > maxDist) maxDist = d; });
+  return { cx, cy: cy0, radius: maxDist };
+}
+function fitToCircle(cx, cy0, radiusWithMargin, duration) {
+  const rect = cy.container().getBoundingClientRect();
+  if (!rect.width || !rect.height || !radiusWithMargin) return;
+  const level = Math.min(cy.maxZoom(), Math.max(cy.minZoom(), Math.min(rect.width, rect.height) / (radiusWithMargin * 2)));
+  cy.animate({ zoom: level, pan: { x: rect.width/2 - cx*level, y: rect.height/2 - cy0*level } }, { duration: duration ?? 450, easing: "ease-out" });
+}
+/* nodesColl null/empty = whole-graph pivot; otherwise pivot on that set (a
+   cypher query match) — margin keeps the pivot's own set comfortably framed.
+   duration is left at fitToCircle's normal snappy default for search/isolate
+   focus jumps; forceDirectedSettle's post-settle reveal passes a slower one
+   explicitly (see its call sites) so the final zoom-out reads as a deliberate
+   pan-out rather than a snap-cut. */
+function focusRotation(nodesColl, margin, duration) {
+  const targets = (nodesColl && nodesColl.length) ? nodesColl : cy.nodes();
+  const circle = boundingCircle(targets);
+  if (!circle) { rotationPivot = null; return; }
+  rotationPivot = { x: circle.cx, y: circle.cy };
+  fitToCircle(circle.cx, circle.cy, circle.radius + margin, duration);
+}
+const ROTATION_DEG_PER_SEC = 0.3; /* ~20 minutes per revolution — meant to be almost imperceptible */
+function rotationTick(now) {
+  const dt = Math.min(0.25, (now - lastRotationTime) / 1000);
+  lastRotationTime = now;
+  if (!userInteracting && rotationPivot && cy.nodes().length) {
+    const angle = ROTATION_DEG_PER_SEC * dt * Math.PI / 180;
+    const cosA = Math.cos(angle), sinA = Math.sin(angle);
+    const { x: px, y: py } = rotationPivot;
+    cy.batch(() => {
+      cy.nodes().forEach(n => {
+        const p = n.position();
+        const dx = p.x - px, dy = p.y - py;
+        n.position({ x: px + dx*cosA - dy*sinA, y: py + dx*sinA + dy*cosA });
+      });
+    });
+  }
+  requestAnimationFrame(rotationTick);
+}
+requestAnimationFrame(rotationTick);
+
+/* ── glow layer: additive-blend radial gradients drawn behind cytoscape's own
+   canvas, synced to real node screen positions. Only nodes with glow intensity
+   (query match, or hover) actually draw a bloom — everything else stays flat. */
+const glowCanvas = document.getElementById("glowCanvas");
+const glowCtx = glowCanvas.getContext("2d");
+function hexToRgb(hex) { const n = parseInt(hex.slice(1),16); return [(n>>16)&255,(n>>8)&255,n&255]; }
+function renderGlow() {
+  const rect = cy.container().getBoundingClientRect();
+  const dpr = 2;
+  glowCanvas.width = rect.width * dpr; glowCanvas.height = rect.height * dpr;
+  glowCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  glowCtx.clearRect(0, 0, rect.width, rect.height);
+  glowCtx.globalCompositeOperation = "lighter";
+  cy.nodes().forEach(n => {
+    if (n.hasClass("excluded") || n.style("display") === "none") return;
+    const hovered = n.hasClass("hover-hl");
+    const intensity = Math.max(n.data("glow")||0, hovered ? 1 : 0);
+    if (intensity <= 0.02) return;
+    const [r,g,b] = hexToRgb(catColor(n.data("cat")));
+    const p = n.renderedPosition();
+    const baseR = (STRUCTURAL_CATS.has(n.data("cat")) ? 26 : 18) * cy.zoom();
+    const radius = baseR * (1 + intensity * (hovered ? 0.9 : 0.5));
+    const alpha = intensity * (hovered ? 0.85 : 0.6);
+    const grad = glowCtx.createRadialGradient(p.x, p.y, 0, p.x, p.y, radius);
+    grad.addColorStop(0, `rgba(${r},${g},${b},${alpha})`);
+    grad.addColorStop(0.4, `rgba(${r},${g},${b},${alpha*0.5})`);
+    grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+    glowCtx.fillStyle = grad;
+    glowCtx.beginPath(); glowCtx.arc(p.x, p.y, radius, 0, Math.PI*2); glowCtx.fill();
+  });
+  glowCtx.globalCompositeOperation = "source-over";
+}
+cy.on("render", renderGlow);
+
+function highlightCat(cat, on) { cy.nodes(`[cat = "${cat}"]`).toggleClass("hover-hl", on); }
+function highlightRel(rel, on) { cy.edges(`[label = "${rel}"]`).toggleClass("hover-hl", on); }
+
+/* ── smooth glow/deglow: animate each node/edge's "glow" data value toward a
+   target (1 = matched by the active cypher query, 0 = not) over ~420ms, driving
+   both the shadow style mappers above and the additive bloom canvas. ── */
+let glowAnimId = null;
+function animateGlowTo(targetIds) {
+  const targets = targetIds instanceof Set ? targetIds : new Set(targetIds);
+  const eles = cy.elements();
+  const from = new Map();
+  eles.forEach(e => from.set(e.id(), e.data("glow") || 0));
+  const start = performance.now(), duration = 420;
+  if (glowAnimId) cancelAnimationFrame(glowAnimId);
+  function step(now) {
+    const t = Math.min(1, (now - start) / duration);
+    const eased = 1 - Math.pow(1 - t, 3);
+    eles.forEach(e => {
+      const to = targets.has(e.id()) ? 1 : 0;
+      const f = from.get(e.id()) || 0;
+      e.data("glow", f + (to - f) * eased);
+    });
+    if (t < 1) { glowAnimId = requestAnimationFrame(step); } else { glowAnimId = null; }
+  }
+  glowAnimId = requestAnimationFrame(step);
+}
+
+/* ── single source of truth: entity/relationship toggles + ceilings → applied to graph + mirrored into the cypher box ─ */
+function applyState(skipQueryBuild, runMode) {
+  /* isolating a relationship type used to only affect EDGES — every node
+     stayed fully visible regardless, so the query's own glow (a handful of
+     nodes) got lost in ~800 other nodes rendered at full brightness right
+     alongside it, which read as "nothing got filtered." Isolating a
+     relationship now also computes which nodes are actually an endpoint of
+     a matching edge (client-side, off the graph already loaded — no round
+     trip needed) and excludes everyone else, same as isolating an entity
+     type does. Show relationships + only the nodes on either end of them. */
+  let relNodeIds = null;
+  if (state.isolatedRel) {
+    relNodeIds = new Set();
+    cy.edges(`[label = "${state.isolatedRel}"]`).forEach(e => { relNodeIds.add(e.source().id()); relNodeIds.add(e.target().id()); });
+  }
+  let nSeen = 0;
+  cy.nodes().forEach(n => {
+    let on = !state.isolatedEntity || n.data("cat") === state.isolatedEntity;
+    if (on && relNodeIds) on = relNodeIds.has(n.id());
+    const within = on && ++nSeen <= state.nodeCeiling;
+    n.toggleClass("excluded", !within);
+    if (!on) nSeen--;
+  });
+  let rSeen = 0;
+  cy.edges().forEach(e => { const label = e.data("label"); const on = !state.isolatedRel || !label || label === state.isolatedRel; const within = on && ++rSeen <= state.relCeiling; e.toggleClass("excluded", !within); if (!on) rSeen--; });
+  document.getElementById("visibleCount").textContent = cy.nodes().filter(n=>!n.hasClass("excluded")).length + " nodes · " + cy.edges().filter(e=>!e.hasClass("excluded")).length + " edges";
+  if (!skipQueryBuild) buildQueryFromState(runMode);
+}
+/* runMode "full" actually executes and populates the results panel (used by
+   the entity/relationship isolate clicks, so clicking one behaves like
+   pressing Run yourself); anything else stays a lightweight glow-only
+   preview (used by the ceiling sliders and repo switch, which would
+   otherwise fire a full run + table re-render on every drag tick). */
+function buildQueryFromState(runMode) {
+  // Same query-building logic refreshGraph()/currentStateQuery() uses, so
+  // the box never shows a differently-shaped query than what a real fetch
+  // would run -- this path just previews (or, in demo/disconnected mode,
+  // glow-runs) it instead of merging results into the graph.
+  const q = currentStateQuery();
+  document.getElementById("cypherInput").value = q;
+  syncCypherHighlight();
+  if (runMode === "full") runCypherAndDisplay(q, { skipConfirm: true });
+  else previewQueryGlow(q);
+}
+
+/* ── cypher syntax highlighting (overlay <pre> behind a transparent textarea) ── */
+function escapeHtml(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function highlightCypher(text) {
+  let t = escapeHtml(text);
+  t = t.replace(/(\/\/[^\n]*)/g, '<span class="tok-cm">$1</span>');
+  t = t.replace(/"([^"]*)"/g, '<span class="tok-str">"$1"</span>');
+  t = t.replace(/\b(MATCH|OPTIONAL MATCH|WHERE|RETURN|LIMIT|WITH|ORDER BY|AND|OR|NOT|AS|DISTINCT|COUNT|IN)\b/g, '<span class="tok-kw">$1</span>');
+  t = t.replace(/:(\w+)/g, ':<span class="tok-label">$1</span>');
+  t = t.replace(/\b(\d+)\b/g, '<span class="tok-num">$1</span>');
+  return t;
+}
+const cypherInput = document.getElementById("cypherInput");
+function syncCypherHighlight() {
+  document.getElementById("cypherHighlightCode").innerHTML = highlightCypher(cypherInput.value);
+  // Auto-grow to fit the whole query instead of scrolling internally --
+  // reset to "auto" first so shrinking (e.g. un-isolating to a shorter
+  // query) actually shrinks the box back down, not just grows it.
+  cypherInput.style.height = "auto";
+  cypherInput.style.height = cypherInput.scrollHeight + "px";
+}
+cypherInput.addEventListener("scroll", () => { const pre = document.getElementById("cypherHighlight"); pre.scrollTop = cypherInput.scrollTop; pre.scrollLeft = cypherInput.scrollLeft; });
+
+/* ── Cypher execution, proxied through the backend ───────────────────
+   The browser never holds Neo4j credentials or talks to Neo4j directly —
+   every query goes through POST /api/cypher, which runs it server-side via
+   the same GraphEngine the tray/watcher/MCP server use (routes.py). The
+   trust boundary is the dashboard's own loopback-only binding (see the
+   Network/access settings pane), same as the rest of the dashboard's API. */
+let neo4jConnected = false;
+const neo4jStatus = document.createElement("span");
+neo4jStatus.id = "neo4jStatus"; neo4jStatus.style.cssText = "margin-right:auto; font-family:var(--font-mono); font-size:11px;";
+document.querySelector(".cypher-foot").prepend(neo4jStatus);
+neo4jStatus.textContent = "checking…"; neo4jStatus.style.color = "var(--meta)";
+
+function escapeHtmlVal(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+/* RETURN n (a whole node/relationship) comes back with EVERY stored property —
+   for devgraph that includes docstring_full on Module/Class/Function nodes,
+   which can run to paragraphs of text per node. JSON.stringify-ing that raw
+   turned one row into what looked like "hundreds of lines" of output. This
+   walks the value and clips any long string/array so one property can't blow
+   up the table, while still showing real data (truncated, not hidden). */
+function truncateDeep(value, maxStrLen) {
+  if (typeof value === "string") return value.length > maxStrLen ? value.slice(0, maxStrLen) + `…(+${value.length - maxStrLen} chars)` : value;
+  if (Array.isArray(value)) {
+    const head = value.slice(0, 12).map(v => truncateDeep(v, maxStrLen));
+    return value.length > 12 ? [...head, `…(+${value.length - 12} more)`] : head;
+  }
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const k of Object.keys(value)) out[k] = truncateDeep(value[k], maxStrLen);
+    return out;
+  }
+  return value;
+}
+function formatCell(v) {
+  if (v === null || v === undefined) return '<span style="color:var(--meta)">null</span>';
+  if (typeof v === "object") return escapeHtmlVal(JSON.stringify(truncateDeep(v, 60)));
+  return escapeHtmlVal(String(v));
+}
+function renderResultTable(columns, rows) {
+  if (!rows.length) return `<div>0 rows.</div>`;
+  const shown = rows.slice(0, 25);
+  let html = `<table class="dstable" style="font-size:11px"><thead><tr>${columns.map(c=>`<th>${escapeHtmlVal(c)}</th>`).join("")}</tr></thead><tbody>`;
+  shown.forEach(row => { html += `<tr>${row.map(v=>`<td class="mono" style="max-width:280px;overflow-wrap:anywhere">${formatCell(v)}</td>`).join("")}</tr>`; });
+  html += `</tbody></table>`;
+  if (rows.length > 25) html += `<div style="margin-top:6px;color:var(--meta)">showing 25 of ${rows.length} rows — full node/relationship properties are truncated above 60 chars per field, not stripped</div>`;
+  return html;
+}
+/* maps Neo4j's HTTP "graph" result format (real node/relationship objects
+   with real labels + properties) into Cytoscape elements */
+function mapGraphResultToElements(results) {
+  const nodeMap = new Map(), edges = [];
+  results.forEach(r => {
+    (r.graph?.nodes || []).forEach(n => {
+      if (nodeMap.has(n.id)) return;
+      const realLabel = n.labels[0] || "Unknown";
+      const known = NODE_TYPES.find(t => t.id === realLabel);
+      const cat = known ? known.cat : "phase2";
+      const name = n.properties?.name || n.properties?.repo_id || realLabel;
+      nodeMap.set(n.id, { data: { id: "live:"+n.id, label: name, cat } });
+    });
+    (r.graph?.relationships || []).forEach(rel => {
+      edges.push({ data: { id: "live-e:"+rel.id, source: "live:"+rel.startNode, target: "live:"+rel.endNode, label: rel.type } });
+    });
+  });
+  return [...nodeMap.values(), ...edges];
+}
+/* extracts just the matched node/edge ids from a graph-shaped result — used
+   for the glow-preview path, which never replaces the loaded graph */
+function extractGraphIds(results) {
+  const nodeIds = new Set(), edgeIds = new Set();
+  results.forEach(r => {
+    (r.graph?.nodes || []).forEach(n => nodeIds.add("live:"+n.id));
+    (r.graph?.relationships || []).forEach(rel => edgeIds.add("live-e:"+rel.id));
+  });
+  return { nodeIds, edgeIds };
+}
+async function runCypher(statement, opts) {
+  const res = await fetch("/api/cypher", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query: statement,
+      repo_id: document.getElementById("repoSelect")?.value || null,
+      record: !!opts?.record,
+    }),
+  });
+  return res.json();
+}
+
+function escapeCypherStr(s) { return String(s).replace(/["\\]/g, "\\$&"); }
+
+/* ── single source of truth: state (repo, isolated entity/rel, ceilings) →
+   the exact Cypher text shown in the box AND the query that's actually run.
+   OPTIONAL MATCH keeps orphan nodes (no matching edges) visible instead of
+   silently dropping them, and the post-OPTIONAL-MATCH WHERE nulls out a
+   non-matching relationship rather than discarding the row, so isolating a
+   relationship type still shows every node while only that edge type glows. */
+function currentStateQuery() {
+  const repo = document.getElementById("repoSelect").value;
+  const isolatedEntityId = state.isolatedEntity ? NODE_TYPES.find(t => t.cat === state.isolatedEntity)?.id : null;
+  const nodeWhere = [repo === "__all__" ? "true" : `n.repo_id = "${escapeCypherStr(repo)}"`];
+  if (isolatedEntityId) nodeWhere.push(`labels(n)[0] = "${isolatedEntityId}"`);
+  let q = `MATCH (n)\nWHERE ${nodeWhere.join(" AND ")}\nWITH n LIMIT ${state.nodeCeiling}\nOPTIONAL MATCH (n)-[r]-(m)`;
+  if (state.isolatedRel) q += `\nWHERE type(r) = "${escapeCypherStr(state.isolatedRel)}" OR r IS NULL`;
+  q += `\nRETURN n, r, m\nLIMIT ${state.relCeiling}`;
+  return q;
+}
+
+/* ── the one place that turns "state changed" into "graph on screen
+   changed": builds the query from state, writes it into the visible box
+   (so the box is always the truth, never a stale/different query than what
+   actually populated the canvas), runs it, merges the result in, and
+   refreshes the counts/slider-max panel against that same filter state.
+   Used by every state-driven control (repo select, entity/rel isolate
+   clicks, ceiling release, live reindex refresh) -- NOT by free-form typing
+   in the Cypher box or Run/history-row clicks, which stay the separate
+   non-destructive glow-preview path (previewQueryGlow/runCypherAndDisplay)
+   since an arbitrary typed query has nothing to do with this state. */
+async function refreshGraph(mode, record) {
+  // Resync ceiling/max/counts for the CURRENT filter BEFORE building the
+  // query -- otherwise an un-isolate (or any change that should raise the
+  // ceiling back up) still builds its query with the OLD, now-too-low
+  // ceiling, and the "real total" panels only catch up a step late.
+  if (neo4jConnected) await loadTopologyCounts();
+  const q = currentStateQuery();
+  document.getElementById("cypherInput").value = q;
+  syncCypherHighlight();
+  let ok = false;
+  try {
+    const json = await runCypher(q, { record: !!record });
+    if (!json.errors?.length) {
+      const elements = mapGraphResultToElements(json.results[0].data);
+      if (elements.length) {
+        mergeGraphElements(elements, mode);
+        applyState(true);
+        ok = true;
+      }
+    }
+  } catch (e) { /* network hiccup -- leave whatever's on screen alone */ }
+  return ok;
+}
+
+/* ── live glow preview: runs on every keystroke (debounced) and on Run.
+   Matches glow in with a smooth transition, everything else deglows, and
+   the camera auto-fits to the bounding box of whatever is now glowing.
+   glowRequestSeq guards against out-of-order network replies: typing quickly
+   (or typing then hitting Run before the debounce fires) can have an EARLIER
+   fetch resolve AFTER a LATER one, which would silently re-apply a stale
+   highlight on top of the correct one — every caller bumps the counter
+   before awaiting, and only applies its result if it's still the latest. ── */
+let previewDebounce = null;
+let glowRequestSeq = 0;
+async function previewQueryGlow(text) {
+  if (!neo4jConnected) return;
+  const trimmed = (text||"").trim();
+  const mySeq = ++glowRequestSeq;
+  if (!trimmed) { animateGlowTo([]); focusRotation(null, 60); return; }
+  try {
+    const json = await runCypher(trimmed);
+    if (mySeq !== glowRequestSeq) return; // superseded by a newer query before this one came back
+    if (json.errors?.length) return; // mid-typing/invalid — leave current glow state alone
+    const { nodeIds, edgeIds } = extractGraphIds(json.results[0].data);
+    animateGlowTo([...nodeIds, ...edgeIds]);
+    if (nodeIds.size) {
+      const matched = cy.collection([...nodeIds].map(id => cy.getElementById(id)).filter(e => e.length));
+      if (matched.length) focusRotation(matched, 90);
+    }
+  } catch (e) { /* network hiccup mid-type — ignore, next keystroke retries */ }
+}
+/* editing the query by hand moves the sliders too, best-effort: our own
+   generated queries always shape the node ceiling as "WITH n LIMIT N" and
+   the relationship ceiling as the query's trailing "LIMIT N" -- if the text
+   still matches that shape (typing a new number into an existing query,
+   the common case), pull the numbers back out and update the sliders.
+   Silently does nothing for a query that doesn't match the shape (an
+   arbitrary hand-typed query) rather than guessing. Never rewrites the box
+   itself -- only mirrors into state + the slider DOM, so it can't clobber
+   whatever the user is mid-typing. */
+function syncSlidersFromCypherText(text) {
+  const nodeSlider = document.getElementById("ctlNodeCeiling");
+  const relSlider = document.getElementById("ctlRelCeiling");
+  const nodeMatch = text.match(/WITH\s+n\s+LIMIT\s+(\d+)/i);
+  if (nodeMatch) {
+    const n = +nodeMatch[1];
+    if (n !== state.nodeCeiling) {
+      state.nodeCeiling = n;
+      nodeSlider.value = Math.min(n, +nodeSlider.max);
+      document.getElementById("valNodeCeiling").textContent = n;
+    }
+  }
+  const allLimits = [...text.matchAll(/\bLIMIT\s+(\d+)/gi)];
+  if (allLimits.length) {
+    const last = +allLimits[allLimits.length - 1][1];
+    if (last !== state.relCeiling) {
+      state.relCeiling = last;
+      relSlider.value = Math.min(last, +relSlider.max);
+      document.getElementById("valRelCeiling").textContent = last;
+    }
+  }
+}
+cypherInput.addEventListener("input", () => {
+  syncCypherHighlight();
+  syncSlidersFromCypherText(cypherInput.value);
+  clearTimeout(previewDebounce);
+  previewDebounce = setTimeout(() => previewQueryGlow(cypherInput.value), 450);
+});
+
+async function populateRealRepos() {
+  const json = await runCypher("MATCH (r:Repository) RETURN r.repo_id AS repo_id ORDER BY repo_id");
+  if (json.errors?.length) return;
+  const ids = json.results[0].data.map(d => d.row[0]).filter(Boolean);
+  if (!ids.length) return;
+  const select = document.getElementById("repoSelect");
+  const current = select.value;
+  select.innerHTML = '<option value="__all__">All Repos</option>' + ids.map(id => `<option value="${escapeHtmlVal(id)}">${escapeHtmlVal(id)}</option>`).join("");
+  select.value = ids.includes(current) ? current : (ids.includes("devgraph") ? "devgraph" : ids[0]);
+  select.themeRefresh?.();
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+}
+const legendStatus = document.getElementById("neo4jStatusLegend");
+(async () => {
+  try {
+    const json = await runCypher("RETURN 1 AS ok");
+    if (json.errors?.length) throw new Error(json.errors[0].message);
+    neo4jConnected = true;
+    neo4jStatus.textContent = "● Neo4j connected (via dashboard proxy)";
+    neo4jStatus.style.color = "var(--success)";
+    legendStatus.textContent = "Neo4j connected (via dashboard proxy)";
+    await populateRealRepos();
+    // refreshGraph() resyncs the node-ceiling slider/total against real
+    // counts before it builds the query, so the first fetch isn't still
+    // capped at the static-demo default (794) for a repo with a different
+    // real node count.
+    await refreshGraph();
+    loadGitHistory(document.getElementById("repoSelect").value);
+    attemptMemoryMetrics();
+    attemptQueryTelemetry();
+    attemptCommunityDetection();
+  } catch (e) {
+    neo4jStatus.textContent = "Neo4j unreachable";
+    neo4jStatus.style.color = "var(--danger)";
+    legendStatus.textContent = "Neo4j unreachable — showing demo graph";
+  }
+})();
+
+/* ── live auto-refresh: consumes the backend's /api/events SSE stream
+   (agent/tray.py's watcher/reindex/git-sync code already publishes real
+   events into it -- this was the missing half; nothing in the frontend
+   ever listened, so the "Auto-refresh on reindex" toggle did nothing).
+   Independent of the Cypher console's Neo4j status -- this is the
+   dashboard's own event stream, not a proxied Neo4j call. Diffed rendering
+   is already handled by loadFullGraph/mergeGraphElements (it auto-picks a
+   "light", non-disruptive settle when only a small fraction of the graph
+   changed), so a reindex event just re-triggers a normal load. */
+function connectLiveEvents() {
+  const es = new EventSource("/api/events");
+  es.onmessage = (e) => {
+    if (!document.getElementById("ctlLiveUpdate").checked) return; // toggle pauses reacting, not the connection itself
+    let event;
+    try { event = JSON.parse(e.data); } catch { return; }
+    const repo = document.getElementById("repoSelect").value;
+    const matchesRepo = repo === "__all__" || !event.repo_id || event.repo_id === repo;
+    if (!matchesRepo) return;
+    /* the watcher can (and, as observed, sometimes does) publish a stream of
+       "nothing actually changed" events back-to-back -- react only to ones
+       that report a real diff, so a noisy/looping publisher on the backend
+       can't turn this into a client-side request storm. */
+    if (event.type === "reindexed" && (event.changed || event.deleted)) {
+      if (neo4jConnected) refreshGraph();
+    } else if (event.type === "git_history_synced" && event.mode !== "noop") {
+      loadGitHistory(repo);
+    } else if (event.type === "registry_changed" && neo4jConnected) {
+      populateRealRepos();
+    }
+  };
+  // EventSource reconnects on its own after a drop; nothing to do here.
+}
+connectLiveEvents();
+
+const btnRunCypher = document.getElementById("btnRunCypher");
+const cypherResultsEl = document.getElementById("cypherResults");
+const cypherResultsWrap = document.getElementById("cypherResultsWrap");
+const cypherErrorEl = document.getElementById("cypherError");
+const btnToggleResults = document.getElementById("btnToggleResults");
+btnToggleResults.addEventListener("click", () => {
+  const open = cypherResultsWrap.classList.toggle("open");
+  btnToggleResults.textContent = btnToggleResults.textContent.replace(/^(Show|Hide)/, open ? "Hide" : "Show");
+});
+const DESTRUCTIVE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP)\b/i;
+/* shared by the Run button, clicking an isolate row/chip, and clicking a
+   history row — all three should behave identically: execute, glow, focus,
+   and populate the (collapsed) results toggle. skipConfirm is used by the
+   non-button callers so a destructive-looking sample/history query doesn't
+   need a button in hand to trigger the same confirm() dialog Run would. */
+async function runCypherAndDisplay(text, opts) {
+  if (!text) return;
+  if (!opts?.skipConfirm && DESTRUCTIVE_RE.test(text) && !confirm("This looks like a write query (CREATE/DELETE/SET/MERGE/REMOVE/DROP) against your real local Neo4j graph. Run it?")) return;
+  const mySeq = ++glowRequestSeq;
+  btnRunCypher.disabled = true; btnRunCypher.textContent = "Running…";
+  btnToggleResults.style.display = "none";
+  cypherResultsWrap.classList.remove("open");
+  cypherErrorEl.textContent = "";
+  try {
+    const json = await runCypher(text, { record: true });
+    refreshTelemetry();
+    if (json.errors?.length) {
+      cypherErrorEl.innerHTML = `<span style="color:var(--danger)">${escapeHtmlVal(json.errors[0].code)}: ${escapeHtmlVal(json.errors[0].message)}</span>`;
+      return;
+    }
+    const result = json.results[0];
+    const rows = result.data.map(d => d.row);
+    const { nodeIds, edgeIds } = extractGraphIds(result.data);
+    if (mySeq === glowRequestSeq) {
+      animateGlowTo([...nodeIds, ...edgeIds]);
+      if (nodeIds.size) {
+        const matched = cy.collection([...nodeIds].map(id => cy.getElementById(id)).filter(e => e.length));
+        if (matched.length) focusRotation(matched, 90);
+      }
+    }
+    cypherResultsEl.innerHTML = renderResultTable(result.columns, rows);
+    btnToggleResults.textContent = `Show results (${rows.length})`;
+    btnToggleResults.style.display = "inline-flex";
+  } catch (e) {
+    cypherErrorEl.innerHTML = `<span style="color:var(--danger)">Request failed: ${escapeHtmlVal(e.message)}</span>`;
+  } finally {
+    btnRunCypher.disabled = false; btnRunCypher.textContent = "Run";
+  }
+}
+btnRunCypher.addEventListener("click", () => runCypherAndDisplay(cypherInput.value.trim()));
+document.querySelectorAll('#linkOpenMcpSettings').forEach(l => l.addEventListener("click", e => { e.preventDefault(); document.getElementById("settingsOverlay").classList.add("open"); document.querySelector('[data-pane="mcp"]').click(); }));
+
+/* "input" fires continuously while dragging -- cheap client-side filtering
+   of whatever's already loaded, no network call, so raising the slider
+   past the loaded set visibly does nothing until release. "change" fires
+   once on release/keyup-commit and re-fetches with the new ceiling, which
+   is the only way raising the ceiling can actually pull in more real nodes
+   from Neo4j instead of just un-hiding elements that were never fetched. */
+document.getElementById("ctlNodeCeiling").addEventListener("input", e => { state.nodeCeiling = +e.target.value; document.getElementById("valNodeCeiling").textContent = e.target.value; applyState(); });
+document.getElementById("ctlRelCeiling").addEventListener("input", e => { state.relCeiling = +e.target.value; document.getElementById("valRelCeiling").textContent = e.target.value; applyState(); });
+document.getElementById("ctlNodeCeiling").addEventListener("change", () => { if (neo4jConnected) refreshGraph(undefined, true); });
+document.getElementById("ctlRelCeiling").addEventListener("change", () => { if (neo4jConnected) refreshGraph(undefined, true); });
+
+document.getElementById("layoutSelect").addEventListener("change", () => {
+  const name = document.getElementById("layoutSelect").value;
+  if (name === "cose") { forceDirectedSettle(() => focusRotation(null, 60, 1000)); return; } /* "Force-directed" runs our own uniform settle, not cytoscape's cose */
+  const layout = cy.layout({ name, animate: true });
+  layout.one("layoutstop", () => focusRotation(null, 60));
+  layout.run();
+});
+
+document.getElementById("graphSearch").addEventListener("input", e => {
+  const q = e.target.value.trim().toLowerCase();
+  cy.nodes().removeClass("faded highlighted show-label");
+  cy.nodes().forEach(n => { if (STRUCTURAL_CATS.has(n.data("cat"))) n.addClass("show-label"); });
+  if (!q) return;
+  const matches = cy.nodes().filter(n => n.data("label").toLowerCase().includes(q));
+  if (matches.length) { cy.nodes().addClass("faded"); matches.removeClass("faded").addClass("highlighted show-label"); cy.animate({ fit: { eles: matches, padding: 80 } }, { duration: 300 }); }
+});
+document.getElementById("pullTab").addEventListener("click", () => document.getElementById("controlFlyout").classList.toggle("open"));
+document.getElementById("repoSelect").addEventListener("change", async e => {
+  const v = e.target.value;
+  const loaded = await refreshGraph("full", true); // switching repos is a deliberate scope change, not an incremental update
+  if (!loaded && !neo4jConnected) buildQueryFromState();
+  loadGitHistory(v);
+});
+
+/* ── settings overlay ──────────────────────────────────────────── */
+document.getElementById("btnOpenSettings").addEventListener("click", () => document.getElementById("settingsOverlay").classList.add("open"));
+document.getElementById("btnCloseSettings").addEventListener("click", () => document.getElementById("settingsOverlay").classList.remove("open"));
+document.querySelectorAll(".settings-nav button").forEach(btn => btn.addEventListener("click", () => {
+  document.querySelectorAll(".settings-nav button").forEach(b=>b.classList.remove("active")); btn.classList.add("active");
+  document.querySelectorAll(".settings-pane").forEach(p=>p.classList.remove("active")); document.getElementById("pane-"+btn.dataset.pane).classList.add("active");
+}));
+
+/* enable_run_cypher only gates MCP/AI-agent tool access — the dashboard's own
+   Cypher box always runs, so it never gets disabled or re-worded here. */
+const toggleCypher = document.getElementById("toggleCypher");
+const cypherWarnNote = document.getElementById("cypherWarnNote");
+toggleCypher.addEventListener("change", () => { cypherWarnNote.style.display = toggleCypher.checked ? "flex" : "none"; });
+
+/* ── register-repo mini form (Repos pane) ─────────────────────────── */
+document.querySelectorAll('#rebuildModeToggle button').forEach(btn => btn.addEventListener("click", () => {
+  document.querySelectorAll('#rebuildModeToggle button').forEach(b=>b.classList.remove("active")); btn.classList.add("active");
+}));
+const registerToast = document.getElementById("registerToast");
+document.getElementById("btnRegisterRepo").addEventListener("click", () => {
+  const path = document.getElementById("regRepoPath").value.trim();
+  const id = document.getElementById("regRepoId").value.trim();
+  if (!path || !id) { registerToast.textContent = "Fill in both a path and a repo_id first."; registerToast.style.color = "var(--warn)"; registerToast.classList.add("show"); return; }
+  const mode = document.querySelector('#rebuildModeToggle button.active').dataset.mode;
+  registerToast.style.color = "var(--success)";
+  registerToast.textContent = `Queued: devgraph add "${path}" --id ${id} (${mode}) — not yet persisted, see banner below.`;
+  registerToast.classList.add("show");
+});
+
+/* ── neo4j.conf engine settings: field changes queue a restart-required
+   confirm (shared modal below) and regenerate the copyable snippet ── */
+function renderNeoconfSnippet() {
+  const lines = [];
+  document.querySelectorAll(".neoconf").forEach(el => {
+    const key = el.dataset.setting;
+    if (el.type === "checkbox") { if (el.checked) lines.push(`${key}=true`); }
+    else if (el.value.trim()) lines.push(`${key}=${el.value.trim()}`);
+  });
+  document.getElementById("neoconfSnippet").textContent = lines.length
+    ? lines.join("\n") + "\n\n# then, from a shell on the host (this instance runs under Podman, not Docker):\n# podman restart <neo4j-container-name>"
+    : "# no changes yet — edit a field above";
+}
+document.getElementById("btnCopyNeoconf").addEventListener("click", async () => {
+  const text = document.getElementById("neoconfSnippet").textContent;
+  try { await navigator.clipboard.writeText(text); } catch (e) { /* clipboard permission denied — snippet is still selectable text */ }
+  const toast = document.getElementById("neoconfCopyToast");
+  toast.classList.add("show");
+  setTimeout(() => toast.classList.remove("show"), 1400);
+});
+renderNeoconfSnippet();
+
+/* ── autocomplete for the cypher box ──────────────────────────────── */
+const AC_CANDIDATES = [
+  ...NODE_TYPES.map(t => ({ text: t.id, kind: "label" })),
+  ...REL_TYPES.map(r => ({ text: r, kind: "rel" })),
+  ...["MATCH","OPTIONAL MATCH","WHERE","RETURN","LIMIT","WITH","ORDER BY","AND","OR","AS","COUNT","DISTINCT","CONTAINS"].map(k => ({ text: k, kind: "keyword" })),
+  ...["repo_id","name","type"].map(p => ({ text: p, kind: "prop" })),
+];
+const ac = document.getElementById("autocomplete");
+let acItems = [], acIndex = -1;
+function currentWordRange() {
+  const pos = cypherInput.selectionStart, val = cypherInput.value;
+  let start = pos; while (start > 0 && /[A-Za-z0-9_]/.test(val[start-1])) start--;
+  return { start, end: pos, word: val.slice(start, pos) };
+}
+function renderAC() {
+  ac.innerHTML = acItems.map((it,i) => `<div class="ac-item${i===acIndex?' active':''}" data-i="${i}"><span>${it.text}</span><span class="k">${it.kind}</span></div>`).join("");
+  ac.classList.toggle("show", acItems.length > 0);
+}
+function selectAC(i) {
+  const { start, end } = currentWordRange();
+  const val = cypherInput.value;
+  const insert = acItems[i].text;
+  cypherInput.value = val.slice(0, start) + insert + val.slice(end);
+  const caret = start + insert.length;
+  cypherInput.setSelectionRange(caret, caret);
+  acItems = []; acIndex = -1; renderAC();
+  syncCypherHighlight();
+}
+cypherInput.addEventListener("input", () => {
+  const { word } = currentWordRange();
+  if (word.length < 1) { acItems = []; acIndex = -1; renderAC(); return; }
+  acItems = AC_CANDIDATES.filter(c => c.text.toLowerCase().startsWith(word.toLowerCase())).slice(0, 8);
+  acIndex = acItems.length ? 0 : -1;
+  renderAC();
+});
+cypherInput.addEventListener("keydown", e => {
+  if (!ac.classList.contains("show")) return;
+  if (e.key === "ArrowDown") { e.preventDefault(); acIndex = Math.min(acIndex+1, acItems.length-1); renderAC(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); acIndex = Math.max(acIndex-1, 0); renderAC(); }
+  else if ((e.key === "Enter" || e.key === "Tab") && acIndex >= 0) { e.preventDefault(); selectAC(acIndex); }
+  else if (e.key === "Escape") { acItems = []; acIndex = -1; renderAC(); }
+});
+cypherInput.addEventListener("blur", () => setTimeout(() => { acItems = []; acIndex = -1; renderAC(); }, 150));
+ac.addEventListener("mousedown", e => { const item = e.target.closest(".ac-item"); if (item) selectAC(+item.dataset.i); });
+
+/* ── query-rate chart: real counts of Cypher the dashboard's own console
+   has run (see /api/query-rate, backed by dashboard/query_log.py). Only
+   console-issued queries are counted — background polling never records —
+   so this is a true, if narrow, "how much have I queried" readout, not a
+   simulation of database-wide load. ── */
+const chartCanvas = document.getElementById("queryChart");
+const chartCtx = chartCanvas.getContext("2d");
+let chart = { data: [], span: 3600, layout: null, hoverIdx: null };
+async function computeChartData() {
+  const span = +document.getElementById("chartSpan").value;
+  const intervalSel = document.getElementById("chartInterval").value;
+  const interval = intervalSel === "auto" ? Math.max(30, Math.floor(span/40)) : +intervalSel;
+  try {
+    const json = await fetch(`/api/query-rate?span=${span}&interval=${interval}`).then(r => r.json());
+    chart.data = json.buckets.map(b => b.count);
+  } catch (e) {
+    chart.data = Array(Math.max(8, Math.floor(span/interval))).fill(0);
+  }
+  chart.span = span;
+  document.getElementById("chartFrom").textContent = new Date(Date.now()-span*1000).toLocaleString(undefined,{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+}
+function renderChart() {
+  const { data } = chart;
+  const w = chartCanvas.width = chartCanvas.clientWidth * 2, h = chartCanvas.height = 100*2;
+  chartCtx.clearRect(0,0,w,h);
+  const max = Math.max(...data, 1), pad = 20, stepX = (w - pad*2) / (data.length-1);
+  const avg = data.reduce((a,b)=>a+b,0) / data.length;
+  const peakIdx = data.indexOf(Math.max(...data));
+  const xAt = i => pad + i*stepX, yAt = v => h - pad - (v/max)*(h-pad*2);
+  chart.layout = { pad, stepX, max, h, w };
+
+  chartCtx.beginPath();
+  data.forEach((v,i) => { const x = xAt(i), y = yAt(v); i===0?chartCtx.moveTo(x,y):chartCtx.lineTo(x,y); });
+  chartCtx.strokeStyle = "#7170ff"; chartCtx.lineWidth = 3; chartCtx.lineJoin = "round"; chartCtx.stroke();
+  chartCtx.lineTo(xAt(data.length-1), h-pad); chartCtx.lineTo(xAt(0), h-pad); chartCtx.closePath();
+  const grad = chartCtx.createLinearGradient(0,0,0,h);
+  grad.addColorStop(0,"rgba(113,112,255,0.28)"); grad.addColorStop(1,"rgba(113,112,255,0)");
+  chartCtx.fillStyle = grad; chartCtx.fill();
+
+  const avgY = yAt(avg);
+  chartCtx.beginPath();
+  chartCtx.setLineDash([5,5]);
+  chartCtx.moveTo(pad, avgY); chartCtx.lineTo(w-pad, avgY);
+  chartCtx.strokeStyle = "rgba(255,255,255,0.28)"; chartCtx.lineWidth = 1.4; chartCtx.stroke();
+  chartCtx.setLineDash([]);
+  chartCtx.fillStyle = "rgba(255,255,255,0.55)"; chartCtx.font = "20px var(--font-mono), monospace"; chartCtx.textBaseline = "bottom";
+  chartCtx.fillText(`avg ${avg.toFixed(1)}`, pad + 4, avgY - 4);
+
+  const px = xAt(peakIdx), py = yAt(data[peakIdx]);
+  chartCtx.beginPath(); chartCtx.arc(px, py, 6, 0, Math.PI*2);
+  chartCtx.fillStyle = "#eab308"; chartCtx.fill();
+  chartCtx.beginPath(); chartCtx.arc(px, py, 10, 0, Math.PI*2);
+  chartCtx.strokeStyle = "rgba(234,179,8,0.5)"; chartCtx.lineWidth = 2; chartCtx.stroke();
+  chartCtx.fillStyle = "#eab308"; chartCtx.font = "600 21px var(--font-mono), monospace"; chartCtx.textBaseline = "bottom"; chartCtx.textAlign = "center";
+  chartCtx.fillText(`peak ${data[peakIdx]}`, px, py - 14);
+  chartCtx.textAlign = "left";
+
+  if (chart.hoverIdx !== null) {
+    const i = chart.hoverIdx, hx = xAt(i), hy = yAt(data[i]);
+    chartCtx.beginPath(); chartCtx.moveTo(hx, pad*0.4); chartCtx.lineTo(hx, h-pad);
+    chartCtx.strokeStyle = "rgba(255,255,255,0.18)"; chartCtx.lineWidth = 1; chartCtx.stroke();
+    chartCtx.beginPath(); chartCtx.arc(hx, hy, 5, 0, Math.PI*2);
+    chartCtx.fillStyle = "#f7f8f8"; chartCtx.fill();
+    chartCtx.beginPath(); chartCtx.arc(hx, hy, 9, 0, Math.PI*2);
+    chartCtx.strokeStyle = "rgba(247,248,248,0.5)"; chartCtx.lineWidth = 2; chartCtx.stroke();
+    const label = `${data[i]} queries`;
+    chartCtx.font = "600 22px var(--font-mono), monospace";
+    const tw = chartCtx.measureText(label).width + 20;
+    const bx = Math.min(Math.max(hx - tw/2, pad), w - pad - tw);
+    const by = Math.max(hy - 46, 6);
+    chartCtx.fillStyle = "rgba(20,21,23,0.92)";
+    chartCtx.beginPath(); chartCtx.roundRect(bx, by, tw, 30, 6); chartCtx.fill();
+    chartCtx.fillStyle = "#f7f8f8"; chartCtx.textAlign = "center"; chartCtx.textBaseline = "middle";
+    chartCtx.fillText(label, bx + tw/2, by + 15);
+    chartCtx.textAlign = "left"; chartCtx.textBaseline = "alphabetic";
+  }
+}
+async function drawChart() { await computeChartData(); chart.hoverIdx = null; renderChart(); }
+chartCanvas.addEventListener("mousemove", e => {
+  if (!chart.layout) return;
+  const rect = chartCanvas.getBoundingClientRect();
+  const scale = chartCanvas.width / rect.width;
+  const mx = (e.clientX - rect.left) * scale;
+  const i = Math.round((mx - chart.layout.pad) / chart.layout.stepX);
+  chart.hoverIdx = Math.min(Math.max(i, 0), chart.data.length - 1);
+  renderChart();
+});
+chartCanvas.addEventListener("mouseleave", () => { chart.hoverIdx = null; renderChart(); });
+document.getElementById("chartInterval").addEventListener("change", drawChart);
+document.getElementById("chartSpan").addEventListener("change", drawChart);
+window.addEventListener("resize", drawChart);
+
+/* Real history of queries run through this console (see /api/query-log,
+   backed by dashboard/query_log.py) -- "Tool" is always "console" because
+   only the dashboard's own Cypher box is instrumented here, not per-MCP-tool
+   calls from other clients (that's separate, still-unwired telemetry — see
+   the Query telemetry card). */
+const logBody = document.getElementById("logTableBody");
+let logRows = [];
+async function loadQueryLog() {
+  try {
+    const json = await fetch("/api/query-log?limit=100").then(r => r.json());
+    logRows = json.entries.map(e => ({
+      t: new Date(e.ts*1000).toLocaleTimeString(),
+      tool: "console",
+      repo: e.repo_id || "—",
+      cypher: e.query,
+    }));
+  } catch (e) { logRows = []; }
+  renderLog(document.getElementById("logSearch").value.trim().toLowerCase());
+}
+/* clicking a history row now runs it immediately — same as an isolate click
+   in the entity/relationship menu, not just a silent glow preview */
+function loadQueryFromHistory(cypherText) {
+  cypherInput.value = cypherText;
+  syncCypherHighlight();
+  runCypherAndDisplay(cypherText, { skipConfirm: true });
+  cypherInput.focus();
+}
+function renderLog(filter) { logBody.innerHTML = ""; logRows.filter(r => !filter || (r.tool+r.repo+r.cypher).toLowerCase().includes(filter)).forEach(r => { const tr = document.createElement("tr"); tr.title = "Load this query into the Cypher box"; tr.innerHTML = `<td class="mono">${r.t}</td><td>${r.tool}</td><td class="mono">${escapeHtmlVal(r.repo)}</td><td class="mono">${escapeHtmlVal(r.cypher)}</td>`; tr.addEventListener("click", () => loadQueryFromHistory(r.cypher)); logBody.appendChild(tr); }); }
+document.getElementById("logSearch").addEventListener("input", e => renderLog(e.target.value.trim().toLowerCase()));
+async function refreshTelemetry() { await Promise.all([drawChart(), loadQueryLog()]); }
+refreshTelemetry();
+
+/* ── git history: real commits from /api/repos/{id}/git-log + real
+   uncommitted state from /api/repos/{id}/git-status. Git doesn't record a
+   durable "which branch is this commit on" fact once branches merge, so
+   rather than invent one, lanes for the Tree view are computed purely from
+   real parent-hash data below -- the same information `git log --graph`
+   itself uses. ── */
+let COMMITS = [];
+let UNCOMMITTED = [];
+let COMMITS_BY_HASH = {};
+let gitHistoryRepoId = null;
+const LANE_PALETTE = ["var(--fg-2)", "var(--accent-hover)", "var(--success)", "var(--warn)", "#c084fc", "#38bdf8"];
+let laneOf = {};       // hash -> lane index
+let laneColorOf = {};  // hash -> css color (cycles LANE_PALETTE by lane index)
+let treeConnectors = []; // {from, to} for parent edges that cross lanes (merges)
+
+/* Simplified `git log --graph` column assignment: walk commits newest-first
+   (git's own order, which is topological for a linear-ish history), track
+   which commit hash each open lane is "waiting for" next, and place each
+   commit in the lane that was waiting for it (or open a new lane if none
+   was). A commit's first parent continues its lane; any additional parent
+   (a merge) opens/continues a separate lane -- exactly how a real branch
+   merge shows up in the DAG, with no branch names involved at all. */
+function computeLanes(commits) {
+  const waitingFor = []; // lane index -> hash it expects next
+  const byHash = Object.fromEntries(commits.map(c => [c.hash, c]));
+  laneOf = {}; laneColorOf = {}; treeConnectors = [];
+  commits.forEach(c => {
+    let lane = waitingFor.indexOf(c.hash);
+    if (lane === -1) { lane = waitingFor.length; waitingFor.push(null); }
+    laneOf[c.hash] = lane;
+    laneColorOf[c.hash] = LANE_PALETTE[lane % LANE_PALETTE.length];
+    const [first, ...rest] = c.parents;
+    waitingFor[lane] = first ?? null;
+    rest.forEach(p => {
+      if (byHash[p] && !waitingFor.includes(p)) waitingFor.push(p);
+      if (byHash[p]) treeConnectors.push({ from: c.hash, to: p });
+    });
+  });
+}
+
+async function loadGitHistory(repoId) {
+  gitHistoryRepoId = repoId;
+  const wrap = document.getElementById("gitList");
+  const branchBadge = document.getElementById("gitCurrentBranch");
+  if (repoId === "__all__") {
+    COMMITS = []; UNCOMMITTED = []; COMMITS_BY_HASH = {};
+    wrap.innerHTML = `<div class="placeholder-note">Select a specific repo to see its git history — a combined view across repos has no single git history to show.</div>`;
+    branchBadge.style.display = "none";
+    return;
+  }
+  wrap.innerHTML = `<div class="placeholder-note">Loading…</div>`;
+  try {
+    const [log, status] = await Promise.all([
+      fetch(`/api/repos/${encodeURIComponent(repoId)}/git-log?limit=60`).then(r => r.json()),
+      fetch(`/api/repos/${encodeURIComponent(repoId)}/git-status`).then(r => r.json()),
+    ]);
+    if (gitHistoryRepoId !== repoId) return; // superseded by a later repo switch
+    COMMITS = log;
+    UNCOMMITTED = status.uncommitted || [];
+    COMMITS_BY_HASH = Object.fromEntries(COMMITS.map(c => [c.hash, c]));
+    computeLanes(COMMITS);
+    branchBadge.textContent = status.branch;
+    branchBadge.style.display = "inline-block";
+    renderGitList();
+    if (gitTreeEl.style.display !== "none") renderGitTree();
+  } catch (e) {
+    wrap.innerHTML = `<div class="placeholder-note">Could not load git history for this repo.</div>`;
+  }
+}
+
+function renderGitList() {
+  const wrap = document.getElementById("gitList"); wrap.innerHTML = "";
+  if (UNCOMMITTED.length) {
+    const uc = document.createElement("div"); uc.className = "commit-row";
+    uc.innerHTML = `<div class="commit-rail"><div class="commit-dot hollow"></div><div class="commit-line"></div></div><div class="commit-body"><div class="commit-top"><span class="commit-branch wip-badge">uncommitted</span></div><div class="commit-msg">${UNCOMMITTED.map(u=>`${escapeHtmlVal(u.path)} <span style="color:var(--meta)">(${escapeHtmlVal(u.state)})</span>`).join("<br>")}</div><div class="commit-meta">working tree · not yet committed</div></div>`;
+    wrap.appendChild(uc);
+  }
+  if (!COMMITS.length) { wrap.innerHTML += `<div class="placeholder-note">No commits yet.</div>`; return; }
+  COMMITS.forEach((c,i) => {
+    const row = document.createElement("div"); row.className = "commit-row";
+    const dateStr = new Date(c.date).toLocaleDateString(undefined, {year:"numeric",month:"short",day:"numeric"});
+    row.innerHTML = `<div class="commit-rail"><div class="commit-dot${c.merge?" merge":""}"></div>${i<COMMITS.length-1?'<div class="commit-line"></div>':''}</div><div class="commit-body"><div class="commit-top"><span class="commit-hash">${c.short_hash}</span>${c.merge?'<span class="commit-branch merge-badge">merge</span>':''}</div><div class="commit-msg">${escapeHtmlVal(c.title)}</div><div class="commit-meta">${escapeHtmlVal(c.author||"—")} · ${dateStr}</div><div class="commit-detail">commit ${c.hash}\nAuthor: ${c.author||"—"}\nDate: ${dateStr}\n\n${c.title}${c.body?'\n\n'+c.body:''}</div></div>`;
+    row.addEventListener("click", () => row.classList.toggle("open"));
+    wrap.appendChild(row);
+  });
+}
+let treeBaseW = 0, treeBaseH = 0;
+function renderTreeLegend() {
+  const laneCount = Math.max(1, ...Object.values(laneOf).map(l => l+1), 0);
+  const legend = document.getElementById("gitTreeLegend");
+  let html = "";
+  for (let i = 0; i < laneCount; i++) html += `<span><i style="background:${LANE_PALETTE[i % LANE_PALETTE.length]}"></i>lane ${i}</span>`;
+  html += `<span><i style="background:transparent;border:1.5px solid var(--warn)"></i>uncommitted</span>`;
+  legend.innerHTML = html;
+}
+/* rebuilt vertical: lanes run left→right as columns, time flows top→bottom —
+   fits the taller/narrower right-rail card instead of the old horizontal strip */
+function renderGitTree() {
+  renderTreeLegend();
+  const laneW = 46, rowH = 46, padTop = 20, padLeft = 40, labelW = 190;
+  const laneCount = Math.max(1, ...Object.values(laneOf).map(l => l+1), 0);
+  const all = [{ hash:"__wip__", merge:false, wip:true }, ...COMMITS];
+  const pos = {};
+  all.forEach((c,i) => { const y = padTop + i*rowH; const lane = c.wip ? 0 : laneOf[c.hash]; pos[c.hash] = { x: padLeft + lane*laneW, y }; });
+  const svg = document.getElementById("treeSvg");
+  treeBaseW = padLeft*2 + laneCount*laneW + labelW; treeBaseH = padTop*2 + all.length*rowH;
+  svg.setAttribute("viewBox", `0 0 ${treeBaseW} ${treeBaseH}`);
+  let parts = "";
+  for (let i=0;i<all.length-1;i++) { const a = all[i], b = all[i+1]; if (!a.wip && !b.wip && laneOf[a.hash] === laneOf[b.hash]) parts += `<line x1="${pos[a.hash].x}" y1="${pos[a.hash].y}" x2="${pos[b.hash].x}" y2="${pos[b.hash].y}" stroke="${laneColorOf[a.hash]}" stroke-width="1.5" opacity="0.55"/>`; }
+  treeConnectors.forEach(c => { const a = pos[c.from], b = pos[c.to]; if (a && b) parts += `<path d="M${a.x} ${a.y} C ${a.x} ${(a.y+b.y)/2}, ${b.x} ${(a.y+b.y)/2}, ${b.x} ${b.y}" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 2" opacity="0.5"/>`; });
+  all.forEach((c) => {
+    const p = pos[c.hash];
+    const labelX = padLeft + laneCount*laneW + 6;
+    if (c.wip) {
+      parts += `<circle cx="${p.x}" cy="${p.y}" r="4.5" fill="none" stroke="var(--warn)" stroke-width="1.5" class="tree-hit tree-node" data-hash="__wip__"/>`;
+      parts += `<text x="${labelX}" y="${p.y+3}" font-size="9" fill="var(--warn)" font-family="var(--font-mono)">uncommitted</text>`;
+      parts += `<circle cx="${p.x}" cy="${p.y}" r="10" fill="transparent" class="tree-hit" data-hash="__wip__"/>`;
+      return;
+    }
+    const title = c.title.length > 30 ? c.title.slice(0,30)+"…" : c.title;
+    if (c.merge) parts += `<rect x="${p.x-3.5}" y="${p.y-3.5}" width="7" height="7" fill="var(--success)" transform="rotate(45 ${p.x} ${p.y})" class="tree-hit tree-node" data-hash="${c.hash}"/>`;
+    else parts += `<circle cx="${p.x}" cy="${p.y}" r="3.5" fill="${laneColorOf[c.hash]}" class="tree-hit tree-node" data-hash="${c.hash}"/>`;
+    parts += `<text x="${labelX}" y="${p.y-2}" font-size="7.5" fill="var(--meta)" font-family="var(--font-mono)">${c.short_hash}</text>`;
+    parts += `<text x="${labelX}" y="${p.y+9}" font-size="8.5" fill="var(--fg-2)">${escapeHtmlVal(title)}</text>`;
+    parts += `<circle cx="${p.x}" cy="${p.y}" r="10" fill="transparent" class="tree-hit" data-hash="${c.hash}"/>`;
+  });
+  svg.innerHTML = parts;
+  svg.setAttribute("width", treeBaseW);
+  svg.setAttribute("height", treeBaseH);
+}
+const gitTreeEl = document.getElementById("gitTree");
+
+const gitHoverCard = document.getElementById("gitHoverCard");
+let gitCardHideTimer = null;
+function showGitCard(hash, x, y) {
+  clearTimeout(gitCardHideTimer);
+  const isWip = hash === "__wip__";
+  const c = isWip ? null : COMMITS_BY_HASH[hash];
+  const bodyLimit = 420;
+  let html;
+  if (isWip) {
+    html = `<div class="h-hash">uncommitted</div><div class="h-title">Working tree changes</div><div class="h-body">${UNCOMMITTED.map(u=>`${escapeHtmlVal(u.path)} (${escapeHtmlVal(u.state)})`).join("\n")}</div>`;
+  } else {
+    const full = c.body ? `${c.title}\n\n${c.body}` : c.title;
+    const truncated = full.length > bodyLimit;
+    html = `<div class="h-hash">${c.short_hash}</div><div class="h-title">${escapeHtmlVal(c.title)}</div>` + (c.body ? `<div class="h-body" data-full="${encodeURIComponent(full)}">${escapeHtmlVal(truncated ? full.slice(0,bodyLimit)+"…" : full)}</div>` + (truncated ? `<span class="h-more">show more</span>` : "") : "");
+  }
+  gitHoverCard.innerHTML = html;
+  const more = gitHoverCard.querySelector(".h-more");
+  if (more) more.addEventListener("click", () => { const b = gitHoverCard.querySelector(".h-body"); b.textContent = decodeURIComponent(b.dataset.full); more.remove(); });
+  gitHoverCard.style.left = Math.min(x + 12, window.innerWidth - 284) + "px";
+  gitHoverCard.style.top = Math.min(y + 12, window.innerHeight - 200) + "px";
+  gitHoverCard.classList.add("show");
+}
+function hideGitCard() { gitCardHideTimer = setTimeout(() => gitHoverCard.classList.remove("show"), 180); }
+document.getElementById("treeSvg").addEventListener("mouseover", e => {
+  const hit = e.target.closest(".tree-hit");
+  if (!hit) return;
+  showGitCard(hit.dataset.hash, e.clientX, e.clientY);
+  document.querySelectorAll(`#treeSvg [data-hash="${hit.dataset.hash}"]`).forEach(el => el.classList.add("glow"));
+});
+document.getElementById("treeSvg").addEventListener("mouseout", e => {
+  const hit = e.target.closest(".tree-hit");
+  if (!hit) return;
+  hideGitCard();
+  document.querySelectorAll(`#treeSvg [data-hash="${hit.dataset.hash}"]`).forEach(el => el.classList.remove("glow"));
+});
+gitHoverCard.addEventListener("mouseenter", () => clearTimeout(gitCardHideTimer));
+gitHoverCard.addEventListener("mouseleave", hideGitCard);
+
+document.querySelectorAll('#gitViewToggle button').forEach(btn => btn.addEventListener("click", () => {
+  document.querySelectorAll('#gitViewToggle button').forEach(b=>b.classList.remove("active")); btn.classList.add("active");
+  const isTree = btn.dataset.gitView === "tree";
+  document.getElementById("gitList").style.display = isTree ? "none" : "block";
+  document.getElementById("gitTree").style.display = isTree ? "block" : "none";
+  if (isTree) renderGitTree();
+}));
+
+/* ── Database & memory / Query telemetry / Community — attempted live,
+   graceful labeled fallback per the no-fabrication rule if the underlying
+   procedure isn't available on this Neo4j build. ── */
+function setMemNotWired(reason) {
+  document.getElementById("memNote").textContent = reason;
+}
+async function attemptMemoryMetrics() {
+  try {
+    const json = await runCypher('CALL dbms.queryJmx("java.lang:type=Memory") YIELD attributes RETURN attributes');
+    if (json.errors?.length) throw new Error("procedure unavailable");
+    const attrs = json.results[0].data[0]?.row[0];
+    const heapUsed = attrs?.HeapMemoryUsage?.value?.used, heapMax = attrs?.HeapMemoryUsage?.value?.max;
+    if (!heapUsed || !heapMax) throw new Error("unexpected shape");
+    const pct = Math.round((heapUsed/heapMax)*100);
+    document.getElementById("heapVal").textContent = `${(heapUsed/1e6).toFixed(0)}MB / ${(heapMax/1e6).toFixed(0)}MB`;
+    document.getElementById("heapVal").classList.remove("dim");
+    document.getElementById("heapMeter").style.width = pct + "%";
+    document.getElementById("memPill").textContent = "Live"; document.getElementById("memPill").className = "wired-pill";
+    setMemNotWired("Page cache hit ratio and store size still need APOC (apoc.monitor.store / apoc.monitor.pc) — not confirmed installed on this build.");
+  } catch (e) {
+    setMemNotWired("dbms.queryJmx is unavailable on this Neo4j build (removed/restricted in recent versions) — heap, page cache, and store size all need APOC or JMX exposure this dashboard doesn't have yet.");
+  }
+}
+async function attemptQueryTelemetry() {
+  try {
+    const json = await runCypher("SHOW TRANSACTIONS YIELD transactionId RETURN count(*) AS n");
+    if (json.errors?.length) throw new Error("procedure unavailable");
+    const n = json.results[0].data[0]?.row[0];
+    document.getElementById("activeQVal").textContent = String(n);
+    document.getElementById("activeQVal").classList.remove("dim");
+  } catch (e) { /* leave dashed — needs the query-log store per design doc §8 either way */ }
+}
+async function attemptCommunityDetection() {
+  const note = document.getElementById("communityNote");
+  const pill = document.getElementById("communityPill");
+  try {
+    const check = await runCypher("CALL gds.list() YIELD name RETURN count(*) AS n");
+    if (check.errors?.length) throw new Error("no gds");
+    pill.textContent = "GDS detected"; pill.className = "wired-pill";
+    note.textContent = "GDS detected — Louvain run not triggered automatically (can be expensive on a large graph). Run it from Settings when ready.";
+  } catch (e) {
+    pill.textContent = "Not wired"; pill.className = "sample-pill";
+    note.textContent = "GDS plugin not detected on this Neo4j instance — community partitioning stays a placeholder until it's installed.";
+    document.getElementById("communityVal").textContent = "—";
+  }
+}
+
+/* ── Graph topology: baked directly into the entity/relationship floating
+   panels rather than a separate card. Node/edge counts by label overwrite
+   the existing count rows/chips with real live numbers; the god-node
+   leaderboard is a real plain-Cypher degree count (no GDS needed for that
+   part — only Louvain/PageRank need the plugin, handled separately above). ── */
+async function loadTopologyCounts() {
+  const entityPill = document.getElementById("entityLivePill");
+  const relPill = document.getElementById("relSamplePill");
+  if (!neo4jConnected) { entityPill.style.display = "none"; relPill.textContent = "Not wired"; relPill.className = "sample-pill"; return; }
+  const repo = document.getElementById("repoSelect").value;
+  const isolatedEntityId = state.isolatedEntity ? NODE_TYPES.find(t => t.cat === state.isolatedEntity)?.id : null;
+  const nodeFilters = [];
+  if (repo !== "__all__") nodeFilters.push(`n.repo_id = "${escapeCypherStr(repo)}"`);
+  if (isolatedEntityId) nodeFilters.push(`labels(n)[0] = "${isolatedEntityId}"`);
+  const where = nodeFilters.length ? `WHERE ${nodeFilters.join(" AND ")} ` : "";
+  try {
+    /* filtered by whatever's currently isolated -- these panels describe
+       "what the current query would return", same state refreshGraph()
+       uses, not an independent always-repo-wide directory. */
+    const labelJson = await runCypher(`MATCH (n) ${where}RETURN labels(n)[0] AS label, count(*) AS n`);
+    if (!labelJson.errors?.length) {
+      const counts = Object.fromEntries(labelJson.results[0].data.map(d => [d.row[0], d.row[1]]));
+      NODE_TYPES.forEach(t => {
+        const row = entityCounts.querySelector(`.count-row[data-cat="${t.cat}"] .val`);
+        if (!row) return;
+        const n = counts[t.id];
+        if (n !== undefined) { row.textContent = n.toLocaleString(); row.classList.remove("na"); }
+        else if (isolatedEntityId) { row.textContent = "0"; row.classList.remove("na"); } // isolated to a different type -- 0 is a known fact here, not "unwired"
+      });
+      const docCount = counts["Document"] ?? (isolatedEntityId ? 0 : undefined);
+      if (docCount !== undefined) document.getElementById("docCount").textContent = docCount.toLocaleString();
+      entityPill.style.display = "inline-block";
+
+      /* real total (of whatever's currently isolated) replaces the
+         static-demo total (794) the Node ceiling slider was seeded with at
+         page load, and stays in sync with isolation -- the slider's LIMIT
+         caps this same filtered query, so its max should reflect what that
+         filter can actually return, not an unrelated repo-wide figure. */
+      const realTotal = Object.values(counts).reduce((a, b) => a + b, 0);
+      document.getElementById("entityTotal").textContent = realTotal.toLocaleString();
+      const nodeSlider = document.getElementById("ctlNodeCeiling");
+      const wasAtCeiling = +nodeSlider.value >= +nodeSlider.max;
+      nodeSlider.max = realTotal;
+      if (wasAtCeiling) {
+        nodeSlider.value = realTotal;
+        document.getElementById("valNodeCeiling").textContent = realTotal;
+        state.nodeCeiling = realTotal;
+      }
+    }
+    const relFilters = [];
+    if (repo !== "__all__") relFilters.push(`a.repo_id = "${escapeCypherStr(repo)}"`);
+    if (isolatedEntityId) relFilters.push(`labels(a)[0] = "${isolatedEntityId}"`);
+    const relWhere = relFilters.length ? `WHERE ${relFilters.join(" AND ")} ` : "";
+    const relJson = await runCypher(`MATCH (a)-[r]->() ${relWhere}RETURN type(r) AS t, count(*) AS n`);
+    if (!relJson.errors?.length) {
+      const counts = Object.fromEntries(relJson.results[0].data.map(d => [d.row[0], d.row[1]]));
+      relTypes.querySelectorAll(".rel-chip").forEach(chip => {
+        const n = counts[chip.dataset.rel];
+        chip.textContent = n !== undefined ? `${chip.dataset.rel} · ${n.toLocaleString()}` : (isolatedEntityId ? `${chip.dataset.rel} · 0` : chip.dataset.rel);
+      });
+      relPill.textContent = "Live query"; relPill.className = "wired-pill";
+
+      /* Relationship ceiling slider max -- was previously either a
+         hardcoded 2000, or (briefly) the *directed* relationship count
+         summed from `counts` above. Both undercount what the graph query
+         actually needs: currentStateQuery() matches `(n)-[r]-(m)`
+         UNDIRECTED, which produces a row for a relationship from BOTH
+         endpoints' OPTIONAL MATCH (~2x the directed count), and that
+         query's trailing LIMIT caps ROWS, not nodes -- if the row budget
+         runs out partway through the node stream, every node after that
+         point is silently dropped from the result entirely, even though it
+         passed the node-level LIMIT earlier in the same query. That's the
+         "all of rag4 but only part of devgraph" bug: the directed-count
+         estimate left the row ceiling under real demand, so it ran out
+         partway through the larger repo's nodes. Count the SAME undirected
+         pattern the real query uses so the max is never an undercount. */
+      const relRowFilters = [...nodeFilters];
+      if (state.isolatedRel) relRowFilters.push(`type(r) = "${escapeCypherStr(state.isolatedRel)}"`);
+      const relRowWhere = relRowFilters.length ? `WHERE ${relRowFilters.join(" AND ")} ` : "";
+      const relRowJson = await runCypher(`MATCH (n)-[r]-() ${relRowWhere}RETURN count(r) AS n`);
+      const relTotal = (!relRowJson.errors?.length && relRowJson.results[0].data.length)
+        ? relRowJson.results[0].data[0].row[0]
+        : Object.values(counts).reduce((a, b) => a + b, 0) * 2; // conservative fallback if the count query itself failed
+      const relSlider = document.getElementById("ctlRelCeiling");
+      const relWasAtCeiling = +relSlider.value >= +relSlider.max;
+      relSlider.max = Math.max(relTotal, 1);
+      if (relWasAtCeiling) {
+        relSlider.value = relTotal;
+        document.getElementById("valRelCeiling").textContent = relTotal;
+        state.relCeiling = relTotal;
+      }
+    }
+    const godJson = await runCypher(`MATCH (n) ${where}RETURN coalesce(n.name, n.repo_id, labels(n)[0]) AS name, labels(n)[0] AS label, size((n)--()) AS degree ORDER BY degree DESC LIMIT 6`);
+    const godEl = document.getElementById("godNodes");
+    if (!godJson.errors?.length && godJson.results[0].data.length) {
+      godEl.innerHTML = godJson.results[0].data.map((d,i) => `<div class="leaderboard-row"><span class="lb-rank">${i+1}</span><span class="lb-name">${escapeHtmlVal(d.row[0])}</span><span class="lb-type">${escapeHtmlVal(d.row[1]||"")}</span><span class="lb-val">${d.row[2]}</span></div>`).join("");
+    } else {
+      godEl.innerHTML = `<div class="count-note">No nodes for this scope yet.</div>`;
+    }
+  } catch (e) { /* left at static/sample values — next repo switch or reconnect retries */ }
+}
+
+const mcpToolList = document.getElementById("mcpToolList");
+async function loadMcpTools() {
+  try {
+    const tools = await fetch("/api/mcp-tools").then(r => r.json());
+    mcpToolList.innerHTML = "";
+    tools.forEach(t => { const row = document.createElement("div"); row.className = "tool-row"; row.innerHTML = `<span class="tool-name">${escapeHtmlVal(t.name)}</span><span class="tool-desc">${escapeHtmlVal(t.description || "")}</span><label class="switch"><input type="checkbox" checked/><span class="track"></span><span class="thumb"></span></label>`; mcpToolList.appendChild(row); });
+  } catch (e) { /* left empty — pane still usable, just no rows */ }
+}
+loadMcpTools();
+
+/* ── settings panes: display real current config (GET /api/settings) instead
+   of the literal values baked into the HTML. Every field here stays
+   disabled/queued-for-restart — see the panes' own banners for why nothing
+   actually persists yet. neo4j_password is deliberately never sent by the
+   backend or shown here; the masked dots are just a placeholder. ── */
+async function loadDashboardSettings() {
+  try {
+    const s = await fetch("/api/settings").then(r => r.json());
+    const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+    setVal("cfgNeo4jUri", s.neo4j_uri);
+    setVal("cfgNeo4jUser", s.neo4j_user);
+    setVal("cfgDashboardHost", s.dashboard_host);
+    setVal("cfgDashboardPort", s.dashboard_port);
+    const cypherToggle = document.getElementById("toggleCypher");
+    if (cypherToggle) cypherToggle.checked = !!s.enable_run_cypher;
+    const globalFields = {
+      telemetry_enabled: s.telemetry_enabled,
+      cloud_sync: s.cloud_sync,
+      mentions_ambiguous_mode: s.mentions_ambiguous_mode,
+      git_recency_track_author: s.git_recency_track_author,
+      registry_db_path: s.registry_db_path,
+    };
+    Object.entries(globalFields).forEach(([name, value]) => {
+      const row = document.querySelector(`#globalTable tr[data-setting="${name}"]`);
+      if (!row) return;
+      const input = row.querySelector("input");
+      if (!input) return;
+      if (input.type === "checkbox") input.checked = !!value; else input.value = value;
+    });
+  } catch (e) { /* panes fall back to their static placeholder values */ }
+}
+loadDashboardSettings();
+
+const restartModal = document.getElementById("restartModal"), restartModalText = document.getElementById("restartModalText");
+let pending = null;
+document.querySelectorAll(".gset, .neoconf").forEach(el => {
+  el.addEventListener("focus", function() { this._prevValue = this.type === "checkbox" ? this.checked : this.value; });
+  el.addEventListener("change", function() {
+    const isNeoconf = this.classList.contains("neoconf");
+    const name = isNeoconf ? this.dataset.setting : this.closest("tr").dataset.setting;
+    const isSwitch = this.type === "checkbox";
+    const oldVal = this._prevValue ?? (isSwitch ? !this.checked : "");
+    pending = { el: this, isSwitch, oldVal, name, isNeoconf };
+    restartModalText.textContent = isNeoconf
+      ? `${name} is a neo4j.conf / JVM engine setting. This dashboard cannot apply it — confirming queues it into the snippet below for you to copy into neo4j.conf and restart Neo4j yourself.`
+      : `Changing ${name} requires a dashboard restart to take effect. Continue?`;
+    restartModal.classList.add("open");
+  });
+});
+document.getElementById("restartCancel").addEventListener("click", () => { if (pending) { if (pending.isSwitch) pending.el.checked = pending.oldVal; else pending.el.value = pending.oldVal; } restartModal.classList.remove("open"); pending = null; });
+document.getElementById("restartConfirm").addEventListener("click", () => {
+  if (pending) {
+    pending.el._prevValue = pending.isSwitch ? pending.el.checked : pending.el.value;
+    if (pending.isNeoconf) {
+      renderNeoconfSnippet();
+      document.getElementById("neoconfPendingPill").style.display = "inline-block";
+    } else {
+      const row = pending.el.closest("tr");
+      if (!row.querySelector(".pending-badge")) { const b = document.createElement("span"); b.className = "pending-badge"; b.textContent = "restart pending"; row.cells[0].appendChild(b); }
+    }
+  }
+  restartModal.classList.remove("open"); pending = null;
+});
+
+applyState(false);
+</script>
 </body>
 </html>

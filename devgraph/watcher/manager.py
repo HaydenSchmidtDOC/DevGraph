@@ -29,6 +29,23 @@ from devgraph.registry.store import RepoRegistry, RepoRecord
 logger = logging.getLogger(__name__)
 
 
+def _is_relevant_git_state_path(path: Path) -> bool:
+    """Whether a path under `.git/` actually represents git *history* state.
+
+    The non-recursive watch on `.git/` itself (see `_start_single`) is
+    scheduled on the whole directory because watchdog can't filter by
+    filename at schedule time, so it delivers events for every direct child
+    -- not just `HEAD`/`packed-refs`. Files like `index`, `COMMIT_EDITMSG`,
+    or `FETCH_HEAD` churn on routine operations (`git status` rewrites
+    `index`'s stat-cache on essentially every call) without any history
+    actually changing; reacting to those was firing a full
+    `sync_git_history()` for no reason on every such call. `refs/heads/*`
+    (branch tips) come through the separate recursive watch on that
+    subdirectory and are always relevant.
+    """
+    return path.name in {"HEAD", "packed-refs"} or "refs" in path.parts
+
+
 class _GitStateEventHandler(FileSystemEventHandler):
     """Handles git state changes (.git/HEAD, .git/refs) with debouncing."""
 
@@ -46,25 +63,27 @@ class _GitStateEventHandler(FileSystemEventHandler):
 
     def on_modified(self, event: FileModifiedEvent) -> None:
         """Record git state change and set debounce timer."""
-        if not event.is_directory:
+        if not event.is_directory and _is_relevant_git_state_path(Path(event.src_path)):
             with self._lock:
                 self._reset_debounce()
 
     def on_created(self, event: FileCreatedEvent) -> None:
         """Record git state change and set debounce timer."""
-        if not event.is_directory:
+        if not event.is_directory and _is_relevant_git_state_path(Path(event.src_path)):
             with self._lock:
                 self._reset_debounce()
 
     def on_deleted(self, event: FileDeletedEvent) -> None:
         """Record git state change and set debounce timer."""
-        if not event.is_directory:
+        if not event.is_directory and _is_relevant_git_state_path(Path(event.src_path)):
             with self._lock:
                 self._reset_debounce()
 
     def on_moved(self, event: FileMovedEvent) -> None:
         """Record git state change and set debounce timer."""
-        if not event.is_directory:
+        if event.is_directory:
+            return
+        if _is_relevant_git_state_path(Path(event.src_path)) or _is_relevant_git_state_path(Path(event.dest_path)):
             with self._lock:
                 self._reset_debounce()
 
@@ -274,11 +293,20 @@ class _RepoEventHandler(FileSystemEventHandler):
                 self._reset_debounce()
 
     def on_deleted(self, event: FileDeletedEvent) -> None:
-        """Record file deletion and set debounce timer."""
+        """Record file deletion and set debounce timer.
+
+        Can't use `_is_tracked_path` here -- its `is_file()` check is always
+        False for a path that was just deleted, which would reject every
+        real deletion, not just ignored ones. `_is_ignored_repo_path` does
+        the same ignored-directory check without requiring the path to
+        still exist.
+        """
         if event.is_directory:
             return
 
         event_path = Path(event.src_path)
+        if self._is_ignored_repo_path(event_path):
+            return
         with self._lock:
             self._deleted_paths.add(event_path)
             self._changed_paths.discard(event_path)
@@ -307,13 +335,18 @@ class _RepoEventHandler(FileSystemEventHandler):
                 self._changed_paths.add(dest_path)
                 self._deleted_paths.discard(dest_path)
                 self._deleted_paths.discard(src_path)
-            else:
+                self._reset_debounce()
+            elif not self._is_ignored_repo_path(src_path):
                 # Destination isn't a file DevGraph tracks (e.g. moved out of
-                # the repo or into a non-file); treat it like a deletion of
-                # the original path.
+                # the repo or into a non-file) but the source WAS a real,
+                # non-ignored path -- treat it like a deletion of the
+                # original path. (If the source is also ignored -- e.g. a
+                # lockfile-then-rename inside .git/ -- nothing real happened
+                # on either end, so skip it entirely rather than record a
+                # phantom deletion of an ignored path.)
                 self._deleted_paths.add(src_path)
                 self._changed_paths.discard(src_path)
-            self._reset_debounce()
+                self._reset_debounce()
 
     def _is_tracked_path(self, path: Path) -> bool:
         """Check if this path should be tracked.
@@ -330,11 +363,17 @@ class _RepoEventHandler(FileSystemEventHandler):
                 return False
         except OSError:
             return False
+        return not self._is_ignored_repo_path(path)
+
+    def _is_ignored_repo_path(self, path: Path) -> bool:
+        """Shape-only ignored-directory check -- no existence check, so this
+        is safe to call on a path that no longer exists (a deletion) or
+        whose existence hasn't settled yet, unlike `_is_tracked_path`."""
         try:
             rel = path.resolve().relative_to(self._repo_root.resolve())
         except (OSError, ValueError):
-            return True
-        return not is_ignored_path(rel)
+            return False
+        return is_ignored_path(rel)
 
     def _reset_debounce(self) -> None:
         """Reset the debounce timer. Must hold _lock."""

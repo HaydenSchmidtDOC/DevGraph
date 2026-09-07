@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from neo4j import Driver, GraphDatabase
+from neo4j.graph import Node, Relationship
 
 from devgraph.graph.schema import constraint_statements
 
@@ -336,3 +337,64 @@ class GraphEngine:
         with self._driver.session() as session:
             result = session.run(query, parameters or {})
             return [record.data() for record in result]
+
+    def run_cypher_graph(self, query: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Same escape hatch as `run_cypher`, but preserves node/relationship
+        graph structure instead of flattening records with `.data()`.
+
+        Backs the dashboard's Cypher console (`dashboard/routes.py`'s
+        `/api/cypher`), which renders results onto the Cytoscape canvas the
+        same way Neo4j's HTTP transaction API's `resultDataContents:
+        ["row","graph"]` shape does -- this mirrors that shape so the
+        frontend needs no special-casing. Deliberately uses the *legacy*
+        integer `.id` (deprecated on the driver, but still the only id Cypher's
+        `id()` function returns) rather than `.element_id`: the frontend's
+        node/relationship inspector round-trips this id back through a
+        `WHERE id(n) = <id>` query, and Neo4j's HTTP API's own graph format
+        was always legacy integer ids, never `elementId()` strings -- using
+        `element_id` here would silently break that round trip. Same gating
+        rule as `run_cypher`: never wire this up as a default/unauthenticated
+        path.
+        """
+        with self._driver.session() as session:
+            result = session.run(query, parameters or {})
+            columns = list(result.keys())
+            data: list[dict[str, Any]] = []
+            for record in result:
+                nodes: dict[int, dict[str, Any]] = {}
+                rels: dict[int, dict[str, Any]] = {}
+
+                def collect(value: Any) -> None:
+                    if isinstance(value, Node):
+                        nodes[value.id] = {
+                            "id": value.id,
+                            "labels": list(value.labels),
+                            "properties": dict(value),
+                        }
+                    elif isinstance(value, Relationship):
+                        rels[value.id] = {
+                            "id": value.id,
+                            "type": value.type,
+                            "startNode": value.start_node.id,
+                            "endNode": value.end_node.id,
+                            "properties": dict(value),
+                        }
+                    elif isinstance(value, list):
+                        for item in value:
+                            collect(item)
+
+                row: list[Any] = []
+                for value in record.values():
+                    collect(value)
+                    if isinstance(value, (Node, Relationship)):
+                        row.append(dict(value))
+                    else:
+                        row.append(value)
+
+                data.append(
+                    {
+                        "row": row,
+                        "graph": {"nodes": list(nodes.values()), "relationships": list(rels.values())},
+                    }
+                )
+            return {"columns": columns, "data": data}

@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from devgraph.dashboard.events import EventBroadcaster
+from devgraph.dashboard.query_log import QueryLog
 from devgraph.dashboard.routes import build_router
 from devgraph.graph.engine import GraphEngine
 from devgraph.registry.store import RepoRegistry
@@ -24,7 +25,7 @@ _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 def build_app(engine: GraphEngine, registry: RepoRegistry, events: EventBroadcaster) -> FastAPI:
     app = FastAPI(title="DevGraph Dashboard")
-    app.include_router(build_router(engine, registry, events))
+    app.include_router(build_router(engine, registry, events, QueryLog()))
     # Hand-written HTML/CSS/JS, no build step -- StaticFiles serves them
     # as-is (see Implementation Plan #5: no frontend framework in v1).
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")

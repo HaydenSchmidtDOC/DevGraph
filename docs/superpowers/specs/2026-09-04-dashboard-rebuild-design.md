@@ -53,6 +53,18 @@ itself.
   cost/isolation ever justifies genuinely separate lifecycle management
   later, it's a one-line `docker-compose.yml` service pointing at the same
   entry point; nothing about this design blocks that.
+- **Within the container, the dashboard runs as its own OS process, not a
+  thread.** This was revisited once the Observability section (below) added
+  a write path into the dashboard: every MCP tool call now fire-and-forget
+  POSTs a query-event to it, which gets persisted to SQLite. The watcher is
+  load-bearing (every MCP query depends on the graph it keeps fresh); the
+  dashboard is not. A bug in the dashboard's event-ingestion or aggregation
+  path (an unhandled exception in the SQLite writer, a stuck query) must
+  not take the watcher down with it — sharing a thread inside the watcher's
+  process would let that happen. Two sibling processes in one container
+  (e.g. via a small supervisor or the entrypoint script backgrounding both)
+  gets independent crash isolation and separate log streams without any of
+  the overhead a whole new container would add.
 - Access model stays what it is today: bind to `dashboard_host:
   dashboard_port` (default `127.0.0.1:8765`), open that in a browser. No
   change to the fundamental "it's a local website" shape.
@@ -134,8 +146,8 @@ surfacing something that already exists CLI-side/env-var-side today.
 | Feature | Status |
 |---|---|
 | `enable_run_cypher` global toggle | Exists as a setting, never surfaced in any UI |
-| Per-tool enable/disable beyond `run_cypher` | Doesn't exist anywhere — every other tool is always registered; would be new capability if wanted, not just new UI |
-| Per-model/per-client MCP access control | **Does not exist at all.** The MCP server is stdio-transport, spawned 1:1 per connecting client, with no allowlisting concept anywhere in the codebase. This is net-new design work (see Open Questions), not a config value waiting to be surfaced. |
+| Per-tool enable/disable beyond `run_cypher` | **Decided: build it.** New capability — every tool beyond `run_cypher` is currently always-registered in `mcp/server.py`; add a per-tool boolean alongside `enable_run_cypher` and gate tool registration on it, surfaced as one row per tool in the dashboard. Propagation to already-running MCP processes is via the shared config/registry store each process already reads independently (same pattern as `watch_enabled` today) — not a live push from the dashboard, since there's no existing channel for the dashboard to reach into a running MCP process, and building one would be new complexity the shared-store read already avoids. |
+| Per-model/per-client MCP access control | **Skipped for this pass.** The MCP server is stdio-transport, spawned 1:1 per connecting client, with no allowlisting concept anywhere in the codebase — a real implementation needs a transport rethink first. Stays a separate, later spec; not folded into the dashboard rebuild. |
 
 ### 4. Watcher / tray
 
@@ -151,14 +163,14 @@ surfacing something that already exists CLI-side/env-var-side today.
 | Feature | Status |
 |---|---|
 | `dashboard_host` / `dashboard_port` | Exist as settings, never surfaced anywhere (including CLI) |
-| Password/auth on the dashboard | **Does not exist.** Zero auth middleware in `devgraph/dashboard/app.py` today. Net-new (see Open Questions). |
-| IP allowlist beyond the bind address | Doesn't exist; bind address itself (`127.0.0.1` by default) is the only current access control |
+| Password/auth on the dashboard | **Skipped for this pass.** Zero auth middleware exists in `devgraph/dashboard/app.py` today, and none is being added. Stays loopback-only (`127.0.0.1` default); if `dashboard_host` is ever changed to a non-loopback address, that's the trigger to revisit auth as its own piece of work — not before. |
+| IP allowlist beyond the bind address | Not being built this pass — same reasoning as auth above. |
 
 ### 6. Neo4j
 
 | Feature | Status |
 |---|---|
-| `neo4j_uri` / `neo4j_user` / `neo4j_password` | Exist as settings, env-var/`.env`-only; never surfaced in CLI or dashboard |
+| `neo4j_uri` / `neo4j_user` / `neo4j_password` | Exist as settings, env-var/`.env`-only; never surfaced in CLI or dashboard. **Decided: display-only, "restart required" to change.** Confirmed in code, not just inferred: `GraphEngine.__init__` (`graph/engine.py:87-88`) builds one `neo4j.Driver` at construction and never rebuilds it, and every process that touches the graph (dashboard, tray, headless watcher, each spawned MCP server) holds its own separate `GraphEngine` instance built from its own settings read. A live-reconnect on the dashboard's driver wouldn't propagate to the others regardless — a runtime edit can't actually take effect process-wide without a restart, so there's no safe editable path to build even if wanted. |
 
 ### 7. Global settings
 
@@ -170,37 +182,117 @@ surfacing something that already exists CLI-side/env-var-side today.
 | `git_recency_track_author` | Exists, env-var-only |
 | `registry_db_path` | Exists, env-var-only; likely display-only in any UI (changing it live is not a safe runtime operation) |
 
+### 8. Observability
+
+New section — none of this exists today. Motivation: watching what the AI
+is actually doing to the graph in real time (trust/debugging), not graph
+exploration.
+
+| Feature | Status |
+|---|---|
+| Git history timeline (commits/authors/timestamps per repo) | New UI — data already collected by the sync engine for Plan #7 recency tracking, no new collection needed |
+| Entity count readouts (per-label `COUNT`) | New UI — trivial query against the existing Neo4j connection |
+| Live query log (exact tool call + its Cypher, per invocation) | New capability — see below |
+| Node "light up" on query hit | New capability — depends on the same event source as the query log |
+| Cypher query count over time (line graph) | New UI — aggregation over the persisted query log |
+
+**Query log persistence.** Must survive dashboard restarts and back-date
+before "since dashboard started" — this is a durable log, not an in-memory
+buffer. Source: instrument the MCP tool wrapper layer in
+`mcp/server.py` (one choke point, all tools pass through it) to capture
+`{tool_name, repo_id, cypher_text, matched node ids/labels, timestamp}`
+per invocation, plus the same instrumentation on the dashboard's own
+internal queries (search, graph load) so the log is complete, not
+MCP-only.
+
+Two problems this creates that graph rendering doesn't have:
+
+1. **Cross-process delivery.** Each MCP client (Claude Code, an IDE, etc.)
+   spawns its own `mcp/server.py` process with its own `GraphEngine` —
+   separate from whatever process is running the dashboard. Query events
+   have to leave that process to reach the dashboard and get persisted.
+   Proposed: each `GraphEngine`/MCP process fire-and-forget POSTs the
+   event to the dashboard's HTTP API; the dashboard is the single writer
+   to the log store. If the dashboard isn't running, the event is dropped
+   (no local buffering/retry in the MCP process — keeps that side simple,
+   and a live dashboard is already required for the highlight feature to
+   mean anything).
+
+   **Transport: HTTP POST with a persistent keep-alive client, not
+   websocket.** Considered and rejected websocket for this link —
+   reasoning below, since it's not obvious given how much else in this
+   design is push-based:
+   - The traffic shape is one-shot, one-directional events (tool call
+     happened → notify), not a continuous stream — even a
+     high-frequency agentic session firing tool calls back-to-back is
+     bursts of a few events/second, not sustained throughput. That's
+     within reach of plain HTTP; it doesn't need a protocol built for
+     high-frequency framing.
+   - A websocket requires the connection to be *maintained* for the
+     MCP process's whole lifetime: reconnect/backoff logic if the
+     dashboard restarts mid-session, and a wait-and-retry story if the
+     dashboard isn't up yet when the MCP process starts. `mcp/server.py`
+     processes are spawned per-client and can be short-lived — that
+     lifecycle-management cost buys nothing here since events tolerate
+     being dropped anyway.
+   - Each MCP process holds one persistent HTTP client
+     (`requests.Session()`/`httpx.Client()`) for its lifetime and reuses
+     it across POSTs, so repeat calls aren't paying a fresh TCP+HTTP
+     handshake each time — this gets the same connection-reuse
+     efficiency a websocket would provide, on loopback, without any of
+     the reconnect complexity.
+   - Set a short client-side timeout (~200ms) on every POST so a slow or
+     unresponsive dashboard can never block or slow down the MCP tool
+     call the user is actually waiting on.
+   - This is a fully separate wire from MCP protocol itself. MCP
+     protocol exists only between an `mcp/server.py` process and its one
+     connected client, over stdio — the dashboard is never a party to
+     that. The query-event POST is the MCP process acting as an ordinary
+     HTTP client toward an internal service, as a side effect of
+     handling a tool call — the same pattern as a request handler that
+     also emits a metrics/webhook ping. It doesn't extend or dual-purpose
+     MCP itself.
+   - The dashboard's other two channels are unrelated to this one:
+     dashboard→browser stays SSE (unchanged, pre-existing), and
+     browser↔dashboard for settings/repo-management (section 2/3) is
+     ordinary request/response HTTP — a settings save has never needed a
+     push, so it was never a websocket candidate either. Four channels
+     total in this design (stdio MCP session, MCP→dashboard POST,
+     browser↔dashboard REST, dashboard→browser SSE), each doing exactly
+     one job, none of them crossed.
+2. **Storage.** This is telemetry, not graph structure — doesn't belong in
+   Neo4j as node data. Proposed: a local SQLite file alongside
+   `registry_db_path`, one row per query event, indexed by timestamp for
+   the line graph and by repo for filtering. Needs a retention policy
+   (row cap or age-based prune) so it doesn't grow unbounded.
+   **Decided: age-based prune, default 30 days, configurable via a
+   setting** (mirrors the `registry_db_path`-adjacent settings pattern —
+   env var, not a dashboard control in this pass). A background sweep on
+   dashboard startup (and periodically thereafter) deletes rows older
+   than the cutoff.
+
+Node highlighting and the log panel both read from this same store/stream;
+highlighting additionally requires the matched node to already be in the
+dashboard's currently-loaded graph slice (no live fetch-and-insert for
+off-screen nodes in this pass).
+
 ## Open questions
 
-1. **Auth mechanism.** If the dashboard gets a password, what's the
-   threat model? `127.0.0.1`-only binding already stops anything off-box.
-   Auth only starts to matter if `dashboard_host` is ever changed to
-   `0.0.0.0`/a LAN address — worth deciding whether to (a) add real auth
-   now, (b) refuse to bind to a non-loopback address without a password set
-   (fail closed), or (c) leave it loopback-only and drop the password idea
-   entirely until multi-machine access is an actual requirement.
-2. **Per-model/per-client MCP access control.** Needs its own design pass —
-   what does "which models can access MCP" even mean given the current
-   1:1 stdio-per-client architecture? Likely requires rethinking the
-   transport (stdio can't easily carry an identity to check against an
-   allowlist) before any UI for it makes sense. Recommend treating this as
-   a separate, later spec rather than folding it into the dashboard
-   rebuild.
-3. **Per-tool enable/disable.** Is this actually wanted, or does
-   `enable_run_cypher`-style handling (the one tool that's genuinely
-   dangerous) cover the real need? Enumerating this in the config surface
-   doesn't mean building a settings row per tool.
-4. **UI framework choice** — deferred until the Claude Design visual design
-   exists (see UI framework decision above).
-5. **Neo4j settings surfaced read-only vs. editable** — changing
-   `neo4j_uri`/credentials at runtime while the engine holds a live
-   connection isn't a simple form-save; likely display-only with a
-   "restart required" note, but worth confirming.
+1. **UI framework choice** — being decided directly in Open Design, working
+   from the codebase and this spec, in parallel with this doc. Not blocking
+   the rest of this spec; fold the outcome in once decided.
+
+All other previously-open items are resolved above: auth/per-model MCP
+access are skipped for this pass (see sections 3 and 5), per-tool
+enable/disable is being built (section 3), and Neo4j settings are
+display-only with a restart-required note, confirmed against the code
+(section 6).
 
 ## Explicitly out of scope for this pass
 
 - Building the per-model MCP access control system itself (design question
   only, implementation is a separate future spec).
-- Building per-tool enable/disable beyond the existing `enable_run_cypher`.
-- Any visual/layout decisions — owned by the Claude Design pass.
-- Changing where Neo4j credentials live (still `.env`/env vars).
+- Adding dashboard auth or an IP allowlist beyond the loopback bind address.
+- Any visual/layout decisions — owned by the Claude Design/Open Design pass.
+- Changing where Neo4j credentials live (still `.env`/env vars) or making
+  them live-editable.

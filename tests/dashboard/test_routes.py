@@ -157,3 +157,90 @@ def test_unknown_repo_id_404s(client):
     ):
         res = client.get(path)
         assert res.status_code == 404
+
+
+def test_cypher_endpoint_returns_neo4j_http_shaped_graph(client):
+    res = client.post(
+        "/api/cypher",
+        json={"query": "MATCH (n:Service {repo_id: 'dash_repo_a'}) RETURN n ORDER BY n.name"},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["errors"] == []
+    data = body["results"][0]["data"]
+    assert len(data) == 2
+    names = {n["properties"]["name"] for row in data for n in row["graph"]["nodes"]}
+    assert names == {"AuthService", "UserService"}
+
+
+def test_cypher_endpoint_reports_errors_without_raising(client):
+    res = client.post("/api/cypher", json={"query": "NOT VALID CYPHER"})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["results"] == []
+    assert body["errors"][0]["message"]
+
+
+def test_cypher_endpoint_rejects_empty_query(client):
+    res = client.post("/api/cypher", json={"query": "  "})
+    assert res.status_code == 400
+
+
+def test_cypher_endpoint_only_logs_when_record_true(client):
+    client.post("/api/cypher", json={"query": "RETURN 1", "record": False})
+    assert client.get("/api/query-log").json()["entries"] == []
+
+    client.post("/api/cypher", json={"query": "RETURN 1", "repo_id": "dash_repo_a", "record": True})
+    entries = client.get("/api/query-log").json()["entries"]
+    assert len(entries) == 1
+    assert entries[0]["query"] == "RETURN 1"
+    assert entries[0]["repo_id"] == "dash_repo_a"
+    assert entries[0]["ok"] is True
+
+
+def test_query_rate_endpoint_shape(client):
+    client.post("/api/cypher", json={"query": "RETURN 1", "record": True})
+    res = client.get("/api/query-rate", params={"span": 3600, "interval": 60})
+    assert res.status_code == 200
+    buckets = res.json()["buckets"]
+    assert len(buckets) >= 2
+    assert sum(b["count"] for b in buckets) == 1
+
+
+def test_mcp_tools_endpoint_has_real_descriptions(client):
+    res = client.get("/api/mcp-tools")
+    assert res.status_code == 200
+    tools = {t["name"]: t for t in res.json()}
+    assert "search_component" in tools
+    assert tools["search_component"]["description"]
+    # enable_run_cypher defaults to False -- the escape-hatch tool shouldn't
+    # be advertised unless it's actually registered on the MCP server.
+    assert "run_cypher" not in tools
+
+
+def test_git_log_endpoint_on_empty_repo_returns_empty_list(client):
+    # The client fixture's registered repos are `git init`-only, no commits.
+    res = client.get("/api/repos/dash_repo_a/git-log")
+    assert res.status_code == 200
+    assert res.json() == []
+
+
+def test_git_status_endpoint_shape(client):
+    res = client.get("/api/repos/dash_repo_a/git-status")
+    assert res.status_code == 200
+    body = res.json()
+    assert "branch" in body
+    assert body["uncommitted"] == []  # nothing was ever added/committed
+
+
+def test_git_endpoints_unknown_repo_404s(client):
+    assert client.get("/api/repos/does-not-exist/git-log").status_code == 404
+    assert client.get("/api/repos/does-not-exist/git-status").status_code == 404
+
+
+def test_settings_endpoint_never_exposes_password(client):
+    res = client.get("/api/settings")
+    assert res.status_code == 200
+    body = res.json()
+    assert "neo4j_password" not in body
+    assert body["neo4j_uri"] == "bolt://127.0.0.1:7687"

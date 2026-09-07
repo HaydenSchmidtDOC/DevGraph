@@ -293,6 +293,98 @@ def test_watcher_manager_git_state_changed_callback(temp_registry_db, temp_git_r
         watcher.stop()
 
 
+def test_watcher_manager_git_state_ignores_index_touch(temp_registry_db, temp_git_repo):
+    """`git status` (and anything else) touching `.git/index` must NOT fire
+    `on_git_state_changed` -- index is a stat-cache file, not history state.
+
+    Real bug: the non-recursive watch on `.git/` delivers events for every
+    direct child, and the handler used to react to all of them. That turned
+    "call git-status a few times" into a continuous stream of
+    `git_history_synced` events once something actually consumed them (the
+    dashboard's live-refresh SSE listener).
+    """
+    registry = temp_registry_db
+    repo_record = registry.add_repo(temp_git_repo)
+
+    git_state_changes = {}
+
+    def on_changes(repo_id: str, paths: set[Path], deleted: set[Path]) -> None:
+        pass
+
+    def on_git_state_changed(repo_id: str) -> None:
+        git_state_changes[repo_id] = git_state_changes.get(repo_id, 0) + 1
+
+    watcher = WatcherManager(registry, on_changes, on_git_state_changed)
+    watcher.start()
+
+    try:
+        time.sleep(0.2)
+
+        index_file = temp_git_repo / ".git" / "index"
+        index_file.write_text("not a real index, just touching the file")
+
+        time.sleep(1.0)
+
+        assert repo_record.repo_id not in git_state_changes, (
+            "touching .git/index fired on_git_state_changed -- it isn't git history state"
+        )
+
+        # Confirm the handler still works at all: HEAD must still trigger it.
+        head_file = temp_git_repo / ".git" / "HEAD"
+        if head_file.exists():
+            head_file.write_text("ref: refs/heads/main\n")
+            time.sleep(1.0)
+            assert repo_record.repo_id in git_state_changes
+    finally:
+        watcher.stop()
+
+
+def test_watcher_manager_content_ignores_deleted_git_internals(temp_registry_db, temp_git_repo):
+    """Deleting a file under `.git/` must not be reported as a real deletion.
+
+    Real bug: `on_deleted` had no ignored-path check at all (unlike
+    `on_modified`/`on_created`), because a naive check would reject every
+    real deletion too (the path no longer exists to call `is_file()` on).
+    """
+    registry = temp_registry_db
+    repo_record = registry.add_repo(temp_git_repo)
+
+    deletions_collected = {}
+
+    def on_changes(repo_id: str, paths: set[Path], deleted: set[Path]) -> None:
+        if deleted:
+            deletions_collected.setdefault(repo_id, set()).update(deleted)
+
+    watcher = WatcherManager(registry, on_changes)
+    watcher.start()
+
+    try:
+        time.sleep(0.2)
+
+        stray = temp_git_repo / ".git" / "devgraph_test_stray_file"
+        stray.write_text("x")
+        time.sleep(0.5)
+        stray.unlink()
+        time.sleep(1.0)
+
+        resolved_deleted = {p.resolve() for p in deletions_collected.get(repo_record.repo_id, set())}
+        assert stray.resolve() not in resolved_deleted, (
+            "a deletion under .git/ was reported as a real file deletion"
+        )
+
+        # Confirm the handler still works at all: a real deletion outside
+        # .git/ must still be reported.
+        real_file = temp_git_repo / "real_file.txt"
+        real_file.write_text("hello")
+        time.sleep(0.5)
+        real_file.unlink()
+        time.sleep(1.0)
+        resolved_deleted = {p.resolve() for p in deletions_collected.get(repo_record.repo_id, set())}
+        assert real_file.resolve() in resolved_deleted
+    finally:
+        watcher.stop()
+
+
 def test_watcher_manager_git_file_worktree_doesnt_crash(temp_registry_db):
     """Test that a repo with .git as a file (linked worktree) doesn't crash on startup."""
     with tempfile.TemporaryDirectory() as tmpdir:
