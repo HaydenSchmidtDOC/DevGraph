@@ -26,7 +26,10 @@ from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.csharp.extractor import extract_csharp_file
 from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
+from devgraph.indexer.cpp.extractor import extract_cpp_file
 from devgraph.indexer.python.extractor import extract_python_file
+
+_CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 
 _COMPOSE_NAMES = {"docker-compose.yml", "docker-compose.yaml", "podman-compose.yml", "podman-compose.yaml", "compose.yml", "compose.yaml"}
 _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
@@ -36,7 +39,23 @@ _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
 # this, `devgraph add` on any Python repo with a local venv indexes thousands
 # of third-party dependency files from .venv/site-packages alongside the
 # repo's actual ~dozens of source files.
-IGNORED_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "build", "dist", ".pytest_cache", ".devgraph", "node_modules", "bin", "obj"}
+IGNORED_DIR_NAMES = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "build",
+    "dist",
+    ".pytest_cache",
+    ".devgraph",
+    "node_modules",
+    "bin",
+    "obj",
+    # C++ build-directory conventions (Implementation Plan #8, C++ row):
+    # CLion/CMake's default out-of-source build dir names.
+    "cmake-build-debug",
+    "cmake-build-release",
+}
 
 _JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
 
@@ -80,6 +99,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     js_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     cs_files: list[str] = []
     cs_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
+    cpp_files: list[str] = []
+    cpp_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     paths = _expand_with_reverse_dependents(engine, repo_id, repo_root, paths)
 
@@ -146,6 +167,15 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             indexed += 1
             cs_files.append(rel_path)
             cs_extractions[rel_path] = (nodes, rels)
+        elif resolved.suffix in _CPP_SUFFIXES:
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+            result = extract_cpp_file(content, rel_path, repo_id)
+            nodes = [n.to_dict() for n in result.nodes]
+            rels = [r.to_dict() for r in result.relationships]
+            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+            indexed += 1
+            cpp_files.append(rel_path)
+            cpp_extractions[rel_path] = (nodes, rels)
         elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
             index_doc_file(engine, repo_id, resolved)
             indexed += 1
@@ -185,6 +215,15 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # Same re-upsert pass for C# files, same rationale as above.
     for rel_path in cs_files:
         nodes, rels = cs_extractions[rel_path]
+        engine.upsert_nodes(nodes)
+        engine.upsert_relationships(rels)
+
+    # Same second-pass re-upsert, for the same reason, for this batch's C++
+    # files (a stub Class node from an out-of-class method definition — see
+    # cpp/extractor.py — is exactly the kind of same-batch endpoint an
+    # IMPORTS/CONTAINS edge could otherwise miss on the first pass).
+    for rel_path in cpp_files:
+        nodes, rels = cpp_extractions[rel_path]
         engine.upsert_nodes(nodes)
         engine.upsert_relationships(rels)
 
@@ -285,6 +324,16 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
         elif resolved.suffix in _JS_SUFFIXES:
             # Same repo-relative-key rationale as the .py branch above,
             # matching what index_paths()/extract_js_file() writes.
+            try:
+                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
+            except ValueError:
+                module_name = resolved.name
+            engine.delete_nodes_by_source_file(repo_id, module_name)
+            cleaned += 1
+        elif resolved.suffix in _CPP_SUFFIXES:
+            # Must match the same repo-relative key index_paths() writes
+            # (Module nodes are keyed by path relative to repo_root — see
+            # cpp/extractor.py's index_file).
             try:
                 module_name = resolved.relative_to(repo_root.resolve()).as_posix()
             except ValueError:
