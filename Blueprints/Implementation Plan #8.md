@@ -168,10 +168,12 @@ model than earlier ones). Two things keep the token cost down:
 1. **Shared dataclasses or per-language duplicates?** — Resolved: extracted
    to `devgraph/indexer/common.py` before any language worktree was
    created (commit `45bbe10`). All six extractors import from it.
-2. **CALLS/IMPORTS heuristic disclosure to users** — Still open. Not done
-   as part of this batch (each extractor documents its own heuristics in
-   code, same as Python, but no README/`DEVGRAPH-CLIENT.md` user-facing
-   note went out). Worth doing as a small follow-up.
+2. **CALLS/IMPORTS heuristic disclosure to users** — Resolved as a
+   follow-up: `README.md` now states the heuristic nature of extraction up
+   front, and `DEVGRAPH-CLIENT.md`'s existing "name-based, not type-resolved"
+   section was extended to cover every language (not just Python) plus a
+   dedicated import-resolution paragraph explaining the per-language guess
+   pattern and calling out C++'s thin-by-design `IMPORTS` graph explicitly.
 3. **C++ scope commitment** — Resolved: shipped as structural-parity-only,
    confirmed in the C++ extractor's own golden-repo check (thin IMPORTS
    graph on `yaml-cpp`, as expected) and documented in its module

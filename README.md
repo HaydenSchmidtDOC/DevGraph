@@ -2,6 +2,8 @@
 
 DevGraph is a local-first developer knowledge graph platform. It builds and live-updates a structured architecture graph (Neo4j) of explicitly-registered repositories — code structure, container/API/datastore topology, design intent, and git/PR/issue history — and exposes it to coding assistants through an MCP server. A background watcher keeps the graph current as files change, so it stays in sync automatically instead of going stale between manual rescans. Instead of an AI re-reading source files on every request, it asks relationship/dependency/impact questions against a pre-built, always-current graph.
 
+Source extraction covers **Python, JavaScript/TypeScript, C#, C++, Java, Rust, and Go**, detected per file rather than per repo — a polyglot repo gets every file routed to the matching language's extractor automatically. Call-graph and import-resolution edges are heuristic (name-based `CALLS`, best-effort same-repo import guesses) rather than fully type-resolved in every language — see [DEVGRAPH-CLIENT.md](DEVGRAPH-CLIENT.md) for what that means for query results.
+
 ## Quickstart
 
 Requires [Podman](https://podman.io/) and [Git](https://git-scm.com/) already

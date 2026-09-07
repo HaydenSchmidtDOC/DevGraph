@@ -33,7 +33,10 @@ needs to know to use it.
 
 DevGraph builds a queryable graph of a repo's structure — modules, classes,
 functions, containers, API endpoints, datastores, design decisions,
-requirements, mentions, and git history — and exposes it through 20 always-on MCP tools
+requirements, mentions, and git history — for **Python, JavaScript/
+TypeScript, C#, C++, Java, Rust, and Go source**, detected per file by
+extension (a repo doesn't need to be single-language; each file is routed
+to the matching extractor automatically) — and exposes it through 20 always-on MCP tools
 (`search_component`, `find_callers`, `impact_analysis`,
 `impact_analysis_for_diff`, `explain_architecture`, `blame_component`,
 `find_requirements_for`, `find_mentions`, `list_recent_changes`, `get_source`, etc.), plus the opt-in `run_cypher`
@@ -270,16 +273,33 @@ no call edges, `explain_architecture` returning no `uses`/`calls`, relative
 imports not resolving) are now fixed and verified against RAG4 directly.
 Two things worth knowing about how they work:
 
-- **Call graph is name-based, not type-resolved.** `self.foo()`,
-  `obj.foo()`, and a bare `foo()` all link to whichever `Function` node is
-  named `foo` — there's no type inference, so same-named methods on
-  unrelated classes will over-link rather than under-link. Treat
-  `find_callers` results as "things that call something named X", not a
-  guaranteed-precise call graph. When a call was made from inside a method
-  body, its `CALLS` edge records the caller's enclosing class as
-  `caller_class` — pass `find_callers(..., scope_to_class="ThatClass")` to
-  filter down to just that class's own callers when a common method name
-  (`get`, `run`, `close`) is otherwise drowning in unrelated matches.
+- **Call graph is name-based, not type-resolved, in every language
+  DevGraph supports.** `self.foo()`, `this->foo()`, `obj.Foo()`, and a bare
+  `foo()` all link to whichever `Function` node is named `foo` — there's no
+  type inference, so same-named methods on unrelated classes/types will
+  over-link rather than under-link. Treat `find_callers` results as "things
+  that call something named X", not a guaranteed-precise call graph. When a
+  call was made from inside a method body, its `CALLS` edge records the
+  caller's enclosing class as `caller_class` — pass
+  `find_callers(..., scope_to_class="ThatClass")` to filter down to just
+  that class's own callers when a common method name (`get`, `run`,
+  `close`) is otherwise drowning in unrelated matches.
+- **Import/include resolution is a same-repo best-effort guess, per
+  language, and it fails silently by design.** Each language extractor
+  resolves its own dominant intra-repo import convention (Python's dotted
+  imports, JS/TS's relative paths and `node_modules`, C#'s namespace/folder
+  convention, Java's package/folder convention, Rust's `mod`/`use`, Go's
+  module-path convention) to a same-repo file guess. A wrong guess doesn't
+  corrupt the graph — it simply never becomes an edge (`IMPORTS` edges only
+  materialize when the guessed target actually exists as an indexed node) —
+  but it does mean `find_related_files`'s `imported_modules` can legitimately
+  under-report for any language, not just Python. **C++ is a special case:**
+  `#include` resolution has no build-system truth to lean on (no compiler
+  flags/include paths available to DevGraph), so only same-directory quoted
+  includes (`#include "local.h"`) get a guess at all — angle-bracket
+  includes (`#include <foo.h>`) are skipped entirely. Treat C++'s `IMPORTS`
+  graph as thin by design, not as a sign indexing failed; its
+  Module/Class/Function/CALLS/EXTENDS extraction is unaffected by this.
 - **Service cross-linking depends on the compose file's `build`/`context`
   matching each service's actual source directory.** If a compose service
   has no `build:` key (image-only services like databases) or an
