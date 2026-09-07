@@ -11,6 +11,7 @@ dependencies = [
     "tree-sitter-typescript>=0.23,<0.24",
     "tree-sitter-c-sharp>=0.21,<0.22",
     "tree-sitter-cpp>=0.23,<0.24",
+    "tree-sitter-java>=0.23,<0.24",
     "watchdog>=5.0",
     "typer>=0.13",
     "pydantic>=2.9",

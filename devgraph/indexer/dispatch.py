@@ -24,6 +24,7 @@ from devgraph.indexer.containers.extractor import ContainerExtractor
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.csharp.extractor import extract_csharp_file
+from devgraph.indexer.java.extractor import extract_java_file
 from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
 from devgraph.indexer.cpp.extractor import extract_cpp_file
@@ -101,6 +102,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     cs_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     cpp_files: list[str] = []
     cpp_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
+    java_files: list[tuple[str, str]] = []
+    java_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     paths = _expand_with_reverse_dependents(engine, repo_id, repo_root, paths)
 
@@ -176,6 +179,18 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             indexed += 1
             cpp_files.append(rel_path)
             cpp_extractions[rel_path] = (nodes, rels)
+        elif resolved.suffix == ".java":
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+            result = extract_java_file(content, rel_path, repo_id)
+            nodes = [n.to_dict() for n in result.nodes]
+            rels = [r.to_dict() for r in result.relationships]
+            # Same replace-then-cross-link-reupsert pattern as the .py
+            # branch above (see its comment for why replace_file_nodes runs
+            # first, in one transaction, rather than plain upsert).
+            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+            indexed += 1
+            java_files.append((rel_path, content))
+            java_extractions[rel_path] = (nodes, rels)
         elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
             index_doc_file(engine, repo_id, resolved)
             indexed += 1
@@ -227,6 +242,12 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         engine.upsert_nodes(nodes)
         engine.upsert_relationships(rels)
 
+    # Same cross-link re-upsert as above, for the Java files in this batch.
+    for rel_path, _content in java_files:
+        nodes, rels = java_extractions[rel_path]
+        engine.upsert_nodes(nodes)
+        engine.upsert_relationships(rels)
+
     # Service cross-linking runs as a final pass, after every file in this
     # batch (including any compose file) has been indexed — Service nodes'
     # build_context properties must already be in the graph for this to find
@@ -250,7 +271,7 @@ def _expand_with_reverse_dependents(
     engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path]
 ) -> set[Path]:
     """Widen a changed-files batch to also include direct importers of any
-    changed .py file already in the graph.
+    changed .py or .java file already in the graph.
 
     Without this, a CALLS/IMPORTS edge in some other file (e.g. a caller of
     a since-renamed/removed function) is only ever re-evaluated when that
@@ -263,23 +284,23 @@ def _expand_with_reverse_dependents(
     """
     root_resolved = repo_root.resolve()
     expanded = set(paths)
-    original_py_rel_paths = set()
+    original_rel_paths = set()
 
     for path in paths:
         try:
             resolved = Path(path).resolve()
         except OSError:
             continue
-        if resolved.suffix != ".py" or not str(resolved).startswith(str(root_resolved)):
+        if resolved.suffix not in (".py", ".java") or not str(resolved).startswith(str(root_resolved)):
             continue
         try:
-            original_py_rel_paths.add(resolved.relative_to(root_resolved).as_posix())
+            original_rel_paths.add(resolved.relative_to(root_resolved).as_posix())
         except ValueError:
             continue
 
-    for rel_path in original_py_rel_paths:
+    for rel_path in original_rel_paths:
         for importer_rel_path in engine.find_importing_modules(repo_id, rel_path):
-            if importer_rel_path in original_py_rel_paths:
+            if importer_rel_path in original_rel_paths:
                 continue
             importer_path = (root_resolved / importer_rel_path).resolve()
             if importer_path.exists():
@@ -334,6 +355,16 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             # Must match the same repo-relative key index_paths() writes
             # (Module nodes are keyed by path relative to repo_root — see
             # cpp/extractor.py's index_file).
+            try:
+                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
+            except ValueError:
+                module_name = resolved.name
+            engine.delete_nodes_by_source_file(repo_id, module_name)
+            cleaned += 1
+        elif resolved.suffix == ".java":
+            # Same repo-relative key as the .py branch above (see its
+            # comment) — java/extractor.py's index_file computes it the
+            # same way.
             try:
                 module_name = resolved.relative_to(repo_root.resolve()).as_posix()
             except ValueError:
