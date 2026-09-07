@@ -1650,7 +1650,7 @@ function currentStateQuery() {
    in the Cypher box or Run/history-row clicks, which stay the separate
    non-destructive glow-preview path (previewQueryGlow/runCypherAndDisplay)
    since an arbitrary typed query has nothing to do with this state. */
-async function refreshGraph(mode, record) {
+async function refreshGraph(mode, record, structural) {
   // Resync ceiling/max/counts for the CURRENT filter BEFORE building the
   // query -- otherwise an un-isolate (or any change that should raise the
   // ceiling back up) still builds its query with the OLD, now-too-low
@@ -1665,10 +1665,14 @@ async function refreshGraph(mode, record) {
     if (!json.errors?.length) {
       const elements = mapGraphResultToElements(json.results[0].data);
       if (elements.length) {
-        // An empty canvas (first load) always needs a real settle -- highlight
-        // mode's "leave the graph as is" only means something once there's a
-        // graph on screen to leave alone.
-        if (state.highlightMode && cy.elements().length > 0) applyHighlightFromQuery(elements);
+        // structural = a genuine scope change (which repo is selected, or
+        // the first load) -- the displayed set must actually be capped to
+        // that scope, not just dimmed, so this always takes the
+        // add/remove/settle path regardless of highlight mode. Everything
+        // else (isolating a type, dragging a ceiling slider) stays within
+        // the current repo's scope and respects highlight mode: dim only,
+        // never remove, never re-settle.
+        if (state.highlightMode && !structural && cy.elements().length > 0) applyHighlightFromQuery(elements);
         else { mergeGraphElements(elements, mode); applyState(true); }
         ok = true;
       }
@@ -1742,7 +1746,7 @@ cypherInput.addEventListener("input", () => {
   previewDebounce = setTimeout(() => previewQueryGlow(cypherInput.value), 450);
 });
 
-async function populateRealRepos() {
+async function populateRealRepos(fireChangeEvent) {
   const json = await runCypher("MATCH (r:Repository) RETURN r.repo_id AS repo_id ORDER BY repo_id");
   if (json.errors?.length) return;
   const ids = json.results[0].data.map(d => d.row[0]).filter(Boolean);
@@ -1752,7 +1756,15 @@ async function populateRealRepos() {
   select.innerHTML = '<option value="__all__">All Repos</option>' + ids.map(id => `<option value="${escapeHtmlVal(id)}">${escapeHtmlVal(id)}</option>`).join("");
   select.value = ids.includes(current) ? current : (ids.includes("devgraph") ? "devgraph" : ids[0]);
   select.themeRefresh?.();
-  select.dispatchEvent(new Event("change", { bubbles: true }));
+  // Boot passes fireChangeEvent:false and does its own explicit, awaited
+  // refreshGraph call right after (see below) -- dispatching here too used
+  // to fire a SECOND, un-awaited refreshGraph concurrently with that one,
+  // racing two independent settle passes against the same still-empty
+  // canvas and leaving stray nodes from whichever call lost the race
+  // dimmed instead of reconciled. The SSE registry_changed handler is the
+  // only other caller and still wants the dispatch -- nothing else reloads
+  // the graph after it changes the repo list.
+  if (fireChangeEvent !== false) select.dispatchEvent(new Event("change", { bubbles: true }));
 }
 const legendStatus = document.getElementById("neo4jStatusLegend");
 (async () => {
@@ -1763,12 +1775,12 @@ const legendStatus = document.getElementById("neo4jStatusLegend");
     neo4jStatus.textContent = "● Neo4j connected (via dashboard proxy)";
     neo4jStatus.style.color = "var(--success)";
     legendStatus.textContent = "Neo4j connected (via dashboard proxy)";
-    await populateRealRepos();
-    // refreshGraph() resyncs the node-ceiling slider/total against real
-    // counts before it builds the query, so the first fetch isn't still
-    // capped at the static-demo default (794) for a repo with a different
-    // real node count.
-    await refreshGraph();
+    await populateRealRepos(false);
+    // First load is always a structural (capped-to-repo) load, same as any
+    // other repo switch -- also resyncs the node-ceiling slider/total
+    // against real counts before it builds the query, so the first fetch
+    // isn't still capped at the static-demo default (794).
+    await refreshGraph("full", false, true);
     loadGitHistory(document.getElementById("repoSelect").value);
     attemptMemoryMetrics();
     attemptQueryTelemetry();
@@ -1896,7 +1908,7 @@ document.getElementById("graphSearch").addEventListener("input", e => {
 document.getElementById("pullTab").addEventListener("click", () => document.getElementById("controlFlyout").classList.toggle("open"));
 document.getElementById("repoSelect").addEventListener("change", async e => {
   const v = e.target.value;
-  const loaded = await refreshGraph("full", true); // switching repos is a deliberate scope change, not an incremental update
+  const loaded = await refreshGraph("full", true, true); // switching repos is a deliberate scope change, not an incremental update -- always caps the displayed set to it, even in highlight mode
   if (!loaded && !neo4jConnected) buildQueryFromState();
   loadGitHistory(v);
 });
