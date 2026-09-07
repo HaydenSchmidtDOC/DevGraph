@@ -149,7 +149,8 @@ class HeadlessAgent:
             host=self._settings.dashboard_host,
             port=self._settings.dashboard_port,
             loop="asyncio",
-            log_level="warning",
+            log_level="critical",
+            access_log=False,
         )
         server = uvicorn.Server(config)
         self._dashboard_server = server

@@ -253,7 +253,8 @@ class TrayApp:
             host=self._settings.dashboard_host,
             port=self._settings.dashboard_port,
             loop="asyncio",
-            log_level="warning",
+            log_level="critical",
+            access_log=False,
         )
         server = uvicorn.Server(config)
         self._dashboard_server = server
@@ -303,7 +304,7 @@ class TrayApp:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, handlers=[])
     TrayApp().start()
 
 
