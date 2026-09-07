@@ -24,7 +24,10 @@ from devgraph.indexer.containers.extractor import ContainerExtractor
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
+from devgraph.indexer.cpp.extractor import extract_cpp_file
 from devgraph.indexer.python.extractor import extract_python_file
+
+_CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 
 _COMPOSE_NAMES = {"docker-compose.yml", "docker-compose.yaml", "podman-compose.yml", "podman-compose.yaml", "compose.yml", "compose.yaml"}
 _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
@@ -34,7 +37,20 @@ _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
 # this, `devgraph add` on any Python repo with a local venv indexes thousands
 # of third-party dependency files from .venv/site-packages alongside the
 # repo's actual ~dozens of source files.
-IGNORED_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "build", "dist", ".pytest_cache", ".devgraph"}
+IGNORED_DIR_NAMES = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "build",
+    "dist",
+    ".pytest_cache",
+    ".devgraph",
+    # C++ build-directory conventions (Implementation Plan #8, C++ row):
+    # CLion/CMake's default out-of-source build dir names.
+    "cmake-build-debug",
+    "cmake-build-release",
+}
 
 
 def is_ignored_path(path: Path) -> bool:
@@ -65,6 +81,15 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # (rel_path -> (node dicts, rel dicts)) from pass 1's extraction, reused
     # by pass 2 so it re-upserts without re-parsing the file a second time.
     py_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
+    # Same same-batch-ordering problem as py_files/py_extractions above
+    # (a CALLS/IMPORTS edge from C++ file X to file Y in the same batch can
+    # miss Y's node if X is processed first) — kept as its own parallel list
+    # rather than folded into py_files/py_extractions, since the reverse-
+    # dependents expansion and datastore/API/service cross-linking below are
+    # Python-specific and out of this language's scope (Implementation Plan
+    # #8, C++ row: structural parity only).
+    cpp_files: list[str] = []
+    cpp_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     paths = _expand_with_reverse_dependents(engine, repo_id, repo_root, paths)
 
@@ -107,6 +132,15 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             _index_apis(engine, repo_id, rel_path, content)
             py_files.append((rel_path, content))
             py_extractions[rel_path] = (nodes, rels)
+        elif resolved.suffix in _CPP_SUFFIXES:
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+            result = extract_cpp_file(content, rel_path, repo_id)
+            nodes = [n.to_dict() for n in result.nodes]
+            rels = [r.to_dict() for r in result.relationships]
+            engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+            indexed += 1
+            cpp_files.append(rel_path)
+            cpp_extractions[rel_path] = (nodes, rels)
         elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
             index_doc_file(engine, repo_id, resolved)
             indexed += 1
@@ -133,6 +167,15 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # least once, regardless of first-pass order.
     for rel_path, _content in py_files:
         nodes, rels = py_extractions[rel_path]
+        engine.upsert_nodes(nodes)
+        engine.upsert_relationships(rels)
+
+    # Same second-pass re-upsert, for the same reason, for this batch's C++
+    # files (a stub Class node from an out-of-class method definition — see
+    # cpp/extractor.py — is exactly the kind of same-batch endpoint an
+    # IMPORTS/CONTAINS edge could otherwise miss on the first pass).
+    for rel_path in cpp_files:
+        nodes, rels = cpp_extractions[rel_path]
         engine.upsert_nodes(nodes)
         engine.upsert_relationships(rels)
 
@@ -223,6 +266,16 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             # Must match the same repo-relative key index_paths() writes
             # (Module nodes are keyed by path relative to repo_root, not
             # bare filename — see python/extractor.py's index_file).
+            try:
+                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
+            except ValueError:
+                module_name = resolved.name
+            engine.delete_nodes_by_source_file(repo_id, module_name)
+            cleaned += 1
+        elif resolved.suffix in _CPP_SUFFIXES:
+            # Must match the same repo-relative key index_paths() writes
+            # (Module nodes are keyed by path relative to repo_root — see
+            # cpp/extractor.py's index_file).
             try:
                 module_name = resolved.relative_to(repo_root.resolve()).as_posix()
             except ValueError:
