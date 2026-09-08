@@ -63,6 +63,10 @@ IGNORED_DIR_NAMES = {
     # CLion/CMake's default out-of-source build dir names.
     "cmake-build-debug",
     "cmake-build-release",
+    # Tool-generated scratch caches that can land inside a registered repo's
+    # working tree (e.g. a research skill's local cache dir) rather than a
+    # true temp directory. Never source, never worth graphing.
+    ".firecrawl",
 }
 
 _JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}

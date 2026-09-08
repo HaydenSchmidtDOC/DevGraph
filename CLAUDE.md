@@ -6,6 +6,6 @@ See [README.md](README.md) for what this project is and [PROJECT_STATUS.md](PROJ
 - Minimal diffs: prefer targeted edits over rewrites; don't refactor beyond the task.
 - No speculative abstraction, error handling, or config for cases that can't occur.
 - Match established conventions in the surrounding code; if none exist, choose deliberately — it sets the pattern.
-- Keep design docs and status docs current when behavior changes; don't let them drift into fiction.
+- Keep README.md, design docs, and status docs current when behavior changes; don't let them drift into fiction.
 - Never commit real names, personal paths, or identifying data — use fictional examples.
 - Never add a `Co-Authored-By: Claude` (or similar self-referencing) trailer to commit messages, and don't mention Claude/the assistant by name in commit messages, PR descriptions, or code comments unless the user explicitly asks for it.
