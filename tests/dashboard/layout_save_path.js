@@ -212,12 +212,12 @@ function runLabelChecks() {
   check("hovering a node adds show-label",
     /cy\.on\("mouseover", "node", e => \{ e\.target\.addClass\("show-label hover-hl"\)/.test(html),
     "node hover no longer labels");
-  check("hovering an entity type names that whole type",
-    /toggleClass\("hover-hl show-label", on\)/.test(html),
-    "highlightCat no longer toggles show-label, so type hover names nothing");
-  check("a node's own mouseout does not strip a label the type hover still wants",
-    /e\.target\.data\("cat"\) !== hoveredCat/.test(html),
-    "leaving a node while its type is hovered would blank that node's name");
+  check("hovering an entity type highlights without labelling the whole type",
+    /toggleClass\("hover-hl", on\)/.test(html) && !/toggleClass\("hover-hl show-label"/.test(html),
+    "highlightCat labels every node of a type, which is the mass of text the empty base label avoids");
+  check("mouseout releases the label unless a search is holding the node",
+    /if \(!e\.target\.hasClass\("highlighted"\)\) e\.target\.removeClass\("show-label"\);/.test(html),
+    "a hovered node's name would either stick after the pointer leaves, or be dropped mid-search");
   check("the search handler does not force-label every structural node",
     !/n\.addClass\("show-label"\); \}\);/.test(html),
     "a blanket addClass(show-label) is back and would relabel the whole graph");

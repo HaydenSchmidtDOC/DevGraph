@@ -988,11 +988,8 @@ cy.one("layoutstop", () => forceDirectedSettle(() => focusRotation(null, 60, 100
 cy.on("mouseover", "node", e => { e.target.addClass("show-label hover-hl"); setNodeGlowActive(e.target.id(), true); });
 cy.on("mouseout", "node", e => {
   e.target.removeClass("hover-hl");
-  /* Release the label unless something else still wants it: a search holding
-     this node highlighted, or a type hover naming this node's whole type. */
-  if (!e.target.hasClass("highlighted") && e.target.data("cat") !== hoveredCat) {
-    e.target.removeClass("show-label");
-  }
+  /* Release the label unless a search is holding this node highlighted. */
+  if (!e.target.hasClass("highlighted")) e.target.removeClass("show-label");
   setNodeGlowActive(e.target.id(), (e.target.data("glow")||0) > 0.02);
 });
 
@@ -1694,16 +1691,11 @@ function renderGlow() {
 }
 cy.on("render", renderGlow);
 
-/* Which entity type the pointer is currently over in the entity list, if
-   any. Held so a node's own mouseout doesn't strip the label a still-active
-   type hover is asking for. */
-let hoveredCat = null;
+/* Deliberately highlights without labelling: a type can cover most of the
+   graph, so naming all of it at once is the mass of text the empty base
+   label style exists to avoid. Names stay a single-node, on-demand thing. */
 function highlightCat(cat, on) {
-  hoveredCat = on ? cat : (hoveredCat === cat ? null : hoveredCat);
-  /* Hovering a type names every node of that type at once -- the other half
-     of "labels only on demand" (see the empty base label style), and the
-     only way to read a whole type's names without hovering each node. */
-  cy.nodes(`[cat = "${cat}"]`).forEach(n => { n.toggleClass("hover-hl show-label", on); setNodeGlowActive(n.id(), on || (n.data("glow")||0) > 0.02); });
+  cy.nodes(`[cat = "${cat}"]`).forEach(n => { n.toggleClass("hover-hl", on); setNodeGlowActive(n.id(), on || (n.data("glow")||0) > 0.02); });
 }
 function highlightRel(rel, on) { cy.edges(`[label = "${rel}"]`).toggleClass("hover-hl", on); }
 
