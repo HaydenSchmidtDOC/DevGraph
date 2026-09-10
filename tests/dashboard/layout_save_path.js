@@ -114,6 +114,79 @@ const settle = ms => new Promise(r => setTimeout(r, ms));
   await settle(1500);
   check("saves nothing when no node is server-keyed", calls.length === 0, JSON.stringify(calls));
 
-  console.log(failures ? `\n${failures} FAILED` : "\nall passed");
+  runSyncChecks();
+  console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);
 })();
+
+/* ---------------------------------------------------------------------
+   Query-driven highlighting and the node inspector both consume the same
+   identity key the layout cache does, and both silently degrade when they
+   fall out of step with it: highlighting stops matching any node (leaving
+   the query looking like it returned only relationships), and the
+   inspector reports a live node as a static demo element. Neither throws,
+   so both are invisible without a check like this. */
+const hl = (() => {
+  const src2 = [
+    grab(/^function stableNodeId\(n\)/m, "\n}"),
+    grab(/^function extractStateMatchedIds\(json\)/m, "\n}"),
+    grab(/^function edgeDetailsQuery\(ele\)/m, "\n}"),
+    grab(/^function nodeDetailsQuery\(ele\)/m, "\n}"),
+    grab(/^function escapeCypherStr\(s\)/m, "}"),
+  ].join("\n");
+  return new Function(src2 +
+    "\nreturn { stableNodeId, extractStateMatchedIds, edgeDetailsQuery, nodeDetailsQuery };")();
+})();
+
+const SEP = "\u001f";
+const node = (internalId, label, repo, name, file) => ({
+  id: internalId, labels: [label],
+  key: [label, repo, name].concat(file === undefined ? [] : [file]).join(SEP),
+  properties: { repo_id: repo, name, ...(file === undefined ? {} : { file }) },
+});
+const ele = data => ({ id: () => data.id, data: k => data[k] });
+
+function runSyncChecks() {
+  const a = node(11, "Function", "devgraph", "main", "a.py");
+  const b = node(22, "Function", "devgraph", "main", "b.py");
+  const json = { results: [{
+    columns: ["n", "r", "m", "matchedId"],
+    data: [
+      { row: [null, null, null, 11], graph: { nodes: [a, b], relationships: [{ id: 7 }] } },
+    ],
+  }] };
+
+  const m = hl.extractStateMatchedIds(json);
+  check("highlighting resolves matchedId to the element id actually on the canvas",
+    m.nodeIds.has(hl.stableNodeId(a)), [...m.nodeIds].join(","));
+  check("highlighting does not mark an unmatched same-named node",
+    !m.nodeIds.has(hl.stableNodeId(b)), [...m.nodeIds].join(","));
+  check("highlighting still resolves edges", m.edgeIds.has("live-e:7"), [...m.edgeIds].join(","));
+
+  // no matchedId column (free-form query) -> everything returned is matched
+  const free = { results: [{ columns: ["n"], data: [{ row: [null], graph: { nodes: [a, b], relationships: [] } }] }] };
+  const mf = hl.extractStateMatchedIds(free);
+  check("a query without matchedId marks everything it returned",
+    mf.nodeIds.has(hl.stableNodeId(a)) && mf.nodeIds.has(hl.stableNodeId(b)), [...mf.nodeIds].join(","));
+
+  // inspector
+  const qa = hl.nodeDetailsQuery(ele({ id: hl.stableNodeId(a), key: a.key }));
+  check("inspector builds a node query from the identity key, not an internal id",
+    qa && qa.includes("MATCH (n:Function)") && qa.includes('n.name = "main"'), qa);
+  check("inspector pins the file so same-named nodes don't collide",
+    qa && qa.includes('n.file = "a.py"'), qa);
+
+  const svc = node(33, "Service", "devgraph", "api");
+  const qs = hl.nodeDetailsQuery(ele({ id: hl.stableNodeId(svc), key: svc.key }));
+  check("inspector requires a null file for a non-file-scoped node",
+    qs && qs.includes("n.file IS NULL"), qs);
+
+  check("inspector rejects a key whose label is not a plain identifier",
+    hl.nodeDetailsQuery(ele({ id: "live:x", key: 'Foo) DETACH DELETE (n' + SEP + "r" + SEP + "n" })) === null,
+    "expected null");
+  check("inspector treats a demo element (no key) as unresolvable",
+    hl.nodeDetailsQuery(ele({ id: "repo:devgraph" })) === null, "expected null");
+  check("inspector still resolves an edge by its internal id",
+    (hl.edgeDetailsQuery(ele({ id: "live-e:7" })) || "").includes("id(r) = 7"),
+    hl.edgeDetailsQuery(ele({ id: "live-e:7" })));
+}

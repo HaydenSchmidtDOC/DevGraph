@@ -996,20 +996,51 @@ function renderPropsRows(props) {
   if (!props || !Object.keys(props).length) return `<div class="placeholder-note">No properties.</div>`;
   return Object.entries(props).map(([k, v]) => `<div class="metric-row"><span class="metric-label">${escapeHtmlVal(k)}</span><span class="metric-val" style="overflow-wrap:anywhere;text-align:right;white-space:normal">${formatCell(v)}</span></div>`).join("");
 }
+function edgeDetailsQuery(ele) {
+  const m = /^live-e:(\d+)$/.exec(ele.id());
+  if (!m) return null;
+  return `MATCH ()-[r]-() WHERE id(r) = ${m[1]} RETURN type(r) AS type, properties(r) AS props, startNode(r) AS s, endNode(r) AS t LIMIT 1`;
+}
+function nodeDetailsQuery(ele) {
+  const key = ele.data("key");
+  if (typeof key !== "string") return null; // demo element, or a node the server couldn't key
+  // \u001f is the separator identity_key joins on (engine.py) -- chosen
+  // because it cannot occur in a label, repo id, name or path. Written as an
+  // escape here rather than as the literal control character it is.
+  const [label, repoId, name, file] = key.split("\u001f");
+  // The label is interpolated, not matched as a value, so nothing but a plain
+  // identifier may reach the query. It always is one -- it comes from
+  // labels(n)[0] -- but a query built by concatenation shouldn't rely on that.
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(label || "")) return null;
+  const where = [
+    `n.repo_id = "${escapeCypherStr(repoId)}"`,
+    `n.name = "${escapeCypherStr(name)}"`,
+    // Present exactly when the key is file-scoped, and it has to be part of
+    // the match rather than ignored: without it, two same-named functions in
+    // different files both match and the inspector shows whichever comes back
+    // first -- the same collision the file-scoped key exists to prevent.
+    file === undefined ? "n.file IS NULL" : `n.file = "${escapeCypherStr(file)}"`,
+  ];
+  return `MATCH (n:${label}) WHERE ${where.join(" AND ")} RETURN labels(n) AS labels, properties(n) AS props LIMIT 1`;
+}
 function showDetailsCard(ele, isEdge) {
   detailsCard.classList.add("open");
   document.getElementById("controlFlyout").classList.remove("open"); // both dock to the left edge — don't let them overlap
   detailsTitle.textContent = isEdge ? (ele.data("label") || "Relationship") : (ele.data("label") || ele.data("cat") || "Node");
   detailsBody.innerHTML = `<div class="placeholder-note">Loading…</div>`;
-  const m = /^live(-e)?:(\d+)$/.exec(ele.id());
-  if (!m) {
+  /* Edges are still keyed on Cypher's id(r), so they look up by it directly.
+     Nodes are keyed by identity now, and deliberately can't go back through
+     id(n): a node's internal id is recreated whenever its file is reindexed,
+     while the element on the canvas is only replaced when the node itself
+     genuinely appears or disappears -- so an internal id captured at draw
+     time is stale by the next save, and the inspector would report a live
+     node as no longer existing. The identity key is what stays true, so the
+     lookup is rebuilt from its parts. */
+  const query = isEdge ? edgeDetailsQuery(ele) : nodeDetailsQuery(ele);
+  if (!query) {
     detailsBody.innerHTML = `<div class="metric-row"><span class="metric-label">Type</span><span class="metric-val">${escapeHtmlVal(isEdge ? ele.data("label") : ele.data("cat"))}</span></div><div class="placeholder-note">Static demo element — connect to Neo4j to see real properties.</div>`;
     return;
   }
-  const numId = m[2];
-  const query = isEdge
-    ? `MATCH ()-[r]-() WHERE id(r) = ${numId} RETURN type(r) AS type, properties(r) AS props, startNode(r) AS s, endNode(r) AS t LIMIT 1`
-    : `MATCH (n) WHERE id(n) = ${numId} RETURN labels(n) AS labels, properties(n) AS props LIMIT 1`;
   runCypher(query).then(json => {
     if (!detailsCard.classList.contains("open")) return; // closed while the request was in flight
     if (json.errors?.length || !json.results[0].data.length) { detailsBody.innerHTML = `<div class="placeholder-note">Could not load — element may no longer exist.</div>`; return; }
@@ -1905,7 +1936,10 @@ function mapGraphResultToElements(results) {
       const known = NODE_TYPES.find(t => t.id === realLabel);
       const cat = known ? known.cat : "phase2";
       const name = n.properties?.name || n.properties?.repo_id || realLabel;
-      nodeMap.set(stableId, { data: { id: stableId, label: name, cat } });
+      // `key` is carried on the element so the inspector can look the node
+      // back up by identity rather than by an internal id -- see
+      // showDetailsCard. Null for a node the server couldn't key.
+      nodeMap.set(stableId, { data: { id: stableId, key: n.key ?? null, label: name, cat } });
     });
     (r.graph?.relationships || []).forEach(rel => {
       const source = idByInternalId.get(rel.startNode), target = idByInternalId.get(rel.endNode);
@@ -1946,9 +1980,24 @@ function extractStateMatchedIds(json) {
   const result = json.results[0];
   const idx = result.columns.indexOf("matchedId");
   const nodeIds = new Set(), edgeIds = new Set();
+  /* `matchedId` is Cypher's id(n) -- an internal id, which is no longer what
+     an element on the canvas is keyed by (see stableNodeId). Resolving it
+     through the node objects in the same result is what keeps the two in
+     step: a raw "live:" + id(n) here matches nothing at all, so every node
+     ends up ".excluded" and the query appears to highlight only its
+     relationships. Edges are unaffected -- they are still keyed on rel.id --
+     which is exactly what makes that failure look like "the query returns
+     relationships but not nodes". */
+  const elementIdByInternalId = new Map();
+  result.data.forEach(d =>
+    (d.graph?.nodes || []).forEach(n => elementIdByInternalId.set(n.id, stableNodeId(n))));
   result.data.forEach(d => {
-    if (idx >= 0) { if (d.row[idx] != null) nodeIds.add("live:" + d.row[idx]); }
-    else (d.graph?.nodes || []).forEach(n => nodeIds.add("live:" + n.id));
+    if (idx >= 0) {
+      const elementId = elementIdByInternalId.get(d.row[idx]);
+      if (elementId) nodeIds.add(elementId);
+    } else {
+      (d.graph?.nodes || []).forEach(n => nodeIds.add(stableNodeId(n)));
+    }
     (d.graph?.relationships || []).forEach(rel => edgeIds.add("live-e:" + rel.id));
   });
   return { nodeIds, edgeIds };
