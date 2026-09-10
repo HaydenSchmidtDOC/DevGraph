@@ -529,10 +529,30 @@ class GraphEngine:
 
                 def collect(value: Any) -> None:
                     if isinstance(value, Node):
+                        properties = dict(value)
+                        labels = list(value.labels)
+                        # `key` alongside the legacy `id` above: the id is a
+                        # storage-slot pointer that churns whenever
+                        # _replace_file_nodes_tx recreates a changed file's
+                        # nodes, so the dashboard cannot use it to recognise
+                        # the same node across reindexes. Computed here rather
+                        # than in the browser so the "is this file-scoped"
+                        # rule lives in exactly one place (see identity_key).
+                        # Absent when a node has no name to key on — a
+                        # projection like `RETURN {x: 1}` never reaches this
+                        # branch, but an aggregate or a node written outside
+                        # the extractors might.
+                        name = properties.get("name")
                         nodes[value.id] = {
                             "id": value.id,
-                            "labels": list(value.labels),
-                            "properties": dict(value),
+                            "labels": labels,
+                            "properties": properties,
+                            "key": identity_key(
+                                labels[0] if labels else "Unknown",
+                                properties.get("repo_id") or "",
+                                name,
+                                properties.get("file"),
+                            ) if isinstance(name, str) else None,
                         }
                     elif isinstance(value, Relationship):
                         rels[value.id] = {

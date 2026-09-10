@@ -603,7 +603,8 @@ def list_services(
 
     Args:
         engine: GraphEngine instance
-        repo_id: Repository ID (ignored if cross_repo=True)
+        repo_id: Repository ID. Filters when cross_repo is False; when True it
+            only decides ordering (this repo's services first)
         cross_repo: If True, list services from all repos
         max_results: Maximum number of results to return in the envelope
 
@@ -611,15 +612,19 @@ def list_services(
         Dict with count, results, and truncated flag containing services with their properties
     """
     repo_filter = "" if cross_repo else "WHERE s.repo_id = $repo_id"
+    # `truncated` is applied to the ordered list, so ordering decides what
+    # survives max_results. Sorting by repo_id alone meant a cross-repo call
+    # could drop the caller's own repo entirely -- with enough registered
+    # repos sorting ahead of it alphabetically, "list services across repos"
+    # returned none of the services belonging to the repo that asked. The
+    # caller's repo comes first now; everything else keeps the old order.
     cypher = f"""
     MATCH (s:Service)
     {repo_filter}
     RETURN s.name as name, s.repo_id as repo_id, s.description as description
-    ORDER BY s.repo_id, s.name
+    ORDER BY (s.repo_id = $repo_id) DESC, s.repo_id, s.name
     """
-    params = {}
-    if not cross_repo:
-        params["repo_id"] = repo_id
+    params = {"repo_id": repo_id}
 
     results = engine.run_cypher(cypher, params)
     return _envelope(results, max_results)

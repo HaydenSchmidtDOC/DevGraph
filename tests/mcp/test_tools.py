@@ -329,7 +329,13 @@ class TestListServices:
 
     def test_list_services_cross_repo(self, seeded_graph):
         """Test listing services across repos."""
-        result = list_services(seeded_graph, "test_repo_a", cross_repo=True)
+        # max_results is raised past the default because this suite runs
+        # against a shared Neo4j that also holds whatever repos the developer
+        # has registered locally. The claim under test is "cross_repo reaches
+        # the other repo at all", not "it fits in the first 15 rows" -- with
+        # the default envelope, a machine with enough real repos truncates
+        # test_repo_b's services away and fails a tool that works correctly.
+        result = list_services(seeded_graph, "test_repo_a", cross_repo=True, max_results=500)
         names = [r["name"] for r in result["results"]]
         assert "UserService" in names
         assert "AuthService" in names

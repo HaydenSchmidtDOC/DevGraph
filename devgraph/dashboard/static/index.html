@@ -1278,6 +1278,66 @@ function forceDirectedSettle(onDone, mode) {
    right now — but it's the mechanism a real reindex hook should call:
    mode "light" for a small incremental change, "full" for a first load or
    a wholesale scope change like switching repos. */
+/* ── cross-session position cache ───────────────────────────────────────
+   Even with the settle bounded and the ambient rotation off the model, a
+   cold load still re-solves the whole layout from random positions -- and
+   solves it differently each time, so the graph a user learned the shape of
+   yesterday is a different picture today. Positions are cached per repo
+   view, keyed by the node's server-derived identity key (see stableNodeId),
+   which is exactly what survives the delete-and-recreate churn a reindex
+   puts every changed file's nodes through.
+   Only `live:` ids are persisted: the `live-anon:` fallback wraps Neo4j's
+   internal id for a node the server couldn't key, which is precisely the id
+   that does not survive a reindex, so caching a position under it would
+   restore stale coordinates onto an unrelated node. */
+let cachedPositions = new Map();
+let cachedLayoutScope = null;
+function layoutScopeId() { return document.getElementById("repoSelect")?.value || "__all__"; }
+async function loadCachedLayout() {
+  const scope = layoutScopeId();
+  try {
+    const res = await fetch(`/api/repos/${encodeURIComponent(scope)}/layout`);
+    const map = res.ok ? await res.json() : {};
+    cachedPositions = new Map(Object.entries(map).filter(([, p]) => Array.isArray(p) && p.length === 2));
+  } catch { cachedPositions = new Map(); }
+  return cachedPositions;
+}
+/* Debounced because a reindex burst fires several settles in a row, and the
+   whole point of the cache is to be cheap. Coordinates are rounded to whole
+   pixels: sub-pixel precision is noise at any zoom the canvas allows, and
+   dropping it roughly halves the file. */
+let saveLayoutTimer = null;
+function collectLayout() {
+  const out = {};
+  cy.nodes().forEach(n => {
+    const id = n.id();
+    if (!id.startsWith("live:")) return;
+    const p = n.position();
+    out[id] = [Math.round(p.x), Math.round(p.y)];
+  });
+  return out;
+}
+function saveCachedLayout(immediate) {
+  if (saveLayoutTimer) { clearTimeout(saveLayoutTimer); saveLayoutTimer = null; }
+  const scope = layoutScopeId();
+  const send = () => {
+    const positions = collectLayout();
+    if (!Object.keys(positions).length) return;
+    cachedPositions = new Map(Object.entries(positions));
+    const url = `/api/repos/${encodeURIComponent(scope)}/layout`;
+    const body = JSON.stringify(positions);
+    /* On unload only sendBeacon is guaranteed to survive the page going
+       away; a fetch() is free to be cancelled mid-flight. */
+    if (immediate && navigator.sendBeacon) {
+      navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
+      return;
+    }
+    fetch(url, { method: "PUT", headers: { "Content-Type": "application/json" }, body, keepalive: true }).catch(() => {});
+  };
+  if (immediate) send(); else saveLayoutTimer = setTimeout(send, 1200);
+}
+window.addEventListener("beforeunload", () => saveCachedLayout(true));
+
 function mergeGraphElements(elements, mode, opts) {
   const remove = opts ? !!opts.remove : true;
   const settle = opts ? !!opts.settle : true;
@@ -1321,9 +1381,21 @@ function mergeGraphElements(elements, mode, opts) {
   const bootstrapSpread = Math.sqrt(Math.max((rect.width||900)*(rect.height||600), 300000)) / 2;
   const nearbySpread = bb ? Math.max(90, Math.hypot(bb.w, bb.h) / 8) : bootstrapSpread;
   const allIncomingEdges = [...incoming.values()].filter(el => el.data.source);
+  let uncached = 0;
   newNodeEls.forEach(el => {
     const node = cy.getElementById(el.data.id);
     let px, py;
+    /* A cached position is the node's real, already-settled place, so it
+       wins over all three guesses below -- those exist to place a node
+       nothing knows anything about. Counting the ones that miss is what
+       decides whether a settle is needed at all (see below). */
+    const cached = cachedPositions.get(el.data.id);
+    if (cached) {
+      node.position({ x: cached[0], y: cached[1] });
+      node.data("glow", 0);
+      return;
+    }
+    uncached++;
     const link = allIncomingEdges.find(e => e.data.source === el.data.id || e.data.target === el.data.id);
     const other = link && cy.getElementById(link.data.source === el.data.id ? link.data.target : link.data.source);
     if (hadExisting && other && other.length && (other.position().x || other.position().y)) {
@@ -1344,8 +1416,20 @@ function mergeGraphElements(elements, mode, opts) {
 
   updateRenderQuality();
   if (settle) {
-    const touchedRatio = toAdd.length / Math.max(1, cy.elements().length);
-    forceDirectedSettle(() => focusRotation(null, 60, 1000), mode || (touchedRatio > 0.25 ? "full" : "light"));
+    /* Every new node came back with a cached position, so the layout on
+       screen is already the settled one -- running the solver over it would
+       only shuffle a correct picture. Frame it and stop. The ratio that
+       picks full vs light now counts only the nodes that actually need
+       solving rather than everything added, so restoring a saved layout
+       plus one genuinely new node is a light nudge, not a full re-solve. */
+    if (!uncached) {
+      graphSettled = true;
+      focusRotation(null, 60, 1000);
+    } else {
+      const touchedRatio = uncached / Math.max(1, cy.elements().length);
+      forceDirectedSettle(() => { focusRotation(null, 60, 1000); saveCachedLayout(); },
+        mode || (touchedRatio > 0.25 ? "full" : "light"));
+    }
   }
   return true;
 }
@@ -1779,16 +1863,18 @@ function renderResultTable(columns, rows) {
    re-added" on every edit -- full redraw/reposition of the file's nodes
    instead of an in-place update, and (for nodes with the same name in
    different files) a spurious id collision if Neo4j ever reused a freed
-   internal id. `file` is folded in whenever the node has one, mirroring
-   engine.py's _is_file_scoped -- Class/Function/Service nodes are keyed
-   (repo_id, label, name, file) on the backend since same-named symbols in
-   different files are otherwise indistinguishable, and this id has to agree
-   or two such nodes collapse into one on this canvas. */
+   internal id. The key itself comes from the server (`n.key`, built by
+   engine.py's identity_key on the way out of run_cypher_graph) rather than
+   being rebuilt here: whether `file` belongs in the key is decided per node
+   by _is_file_scoped, and a second copy of that rule living in this file
+   would be free to drift out of agreement with the MERGE the backend
+   actually writes -- at which point same-named symbols in different files
+   either collapse into one node on this canvas or split into two that the
+   graph considers one. Falls back to the internal id only for a node the
+   server could not key (no `name` property to key on), which still behaves
+   exactly as it did before any of this. */
 function stableNodeId(n) {
-  const realLabel = n.labels[0] || "Unknown";
-  const name = n.properties?.name || n.properties?.repo_id || realLabel;
-  const file = n.properties?.file;
-  return "live:" + (n.properties?.repo_id ?? "") + "::" + realLabel + "::" + name + (file != null ? "::" + file : "");
+  return n.key != null ? "live:" + n.key : "live-anon:" + n.id;
 }
 /* maps Neo4j's HTTP "graph" result format (real node/relationship objects
    with real labels + properties) into Cytoscape elements */
@@ -1996,6 +2082,15 @@ async function refreshGraph(mode, record, structural) {
   // ceiling back up) still builds its query with the OLD, now-too-low
   // ceiling, and the "real total" panels only catch up a step late.
   if (neo4jConnected) await loadTopologyCounts();
+  /* Fetch the saved layout before the query that will need it. Scoped per
+     repo view, so switching repos loads that view's own cache -- and the
+     outgoing view's positions are flushed first, since the switch replaces
+     every element on the canvas and the old positions are gone after it. */
+  if (cachedLayoutScope !== layoutScopeId()) {
+    if (cachedLayoutScope !== null) saveCachedLayout(true);
+    cachedLayoutScope = layoutScopeId();
+    await loadCachedLayout();
+  }
   const q = currentStateQuery();
   const replace = structural || !state.highlightMode;
   let ok = false;

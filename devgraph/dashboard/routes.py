@@ -132,14 +132,26 @@ def build_router(
         _require_repo(repo_id)
         return {"results": queries.search_components(engine, repo_id, q, max_results)}
 
+    # The canvas's repo selector has an "All Repos" option that is not a
+    # registered repo, and its layout is worth persisting like any other
+    # view's. `_require_repo` is what keeps a repo_id safe to use as a
+    # filename (it can only ever be an id the registry itself issued), so
+    # this reserved id is matched by exact equality rather than being folded
+    # into a pattern that would reopen that.
+    _ALL_REPOS_LAYOUT_ID = "__all__"
+
+    def _require_layout_scope(repo_id: str) -> None:
+        if repo_id != _ALL_REPOS_LAYOUT_ID:
+            _require_repo(repo_id)
+
     @router.get("/repos/{repo_id}/layout")
     def get_repo_layout(repo_id: str) -> dict[str, Any]:
-        _require_repo(repo_id)
+        _require_layout_scope(repo_id)
         return load_layout(repo_id)
 
     @router.put("/repos/{repo_id}/layout")
     async def put_repo_layout(repo_id: str, request: Request) -> dict[str, Any]:
-        _require_repo(repo_id)
+        _require_layout_scope(repo_id)
         # Declaring a `payload: dict[str, Any]` parameter (the previous
         # shape) makes Starlette buffer and json-decode the entire body
         # before this function ever runs, so the size check below couldn't

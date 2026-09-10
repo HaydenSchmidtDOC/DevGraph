@@ -176,6 +176,38 @@ def test_cypher_endpoint_returns_neo4j_http_shaped_graph(client):
     assert names == {"AuthService", "UserService"}
 
 
+def test_cypher_graph_nodes_carry_the_identity_key(client, seeded_graph):
+    """The canvas keys its Cytoscape elements on this, not on the internal
+    `id` beside it, so it has to survive the round trip. Also the only place
+    the file-scoped and non-file-scoped forms are exercised over real HTTP
+    against a real node rather than as a unit call."""
+    seeded_graph.upsert_node(
+        "Function", "dash_repo_a", "handler", {"file": "svc/api.py"}
+    )
+    res = client.post(
+        "/api/cypher",
+        json={"query": "MATCH (n {repo_id: 'dash_repo_a'}) WHERE n:Service OR n:Function RETURN n"},
+    )
+    keys = {n["key"] for row in res.json()["results"][0]["data"] for n in row["graph"]["nodes"]}
+    assert "Service\x1fdash_repo_a\x1fUserService" in keys
+    assert "Function\x1fdash_repo_a\x1fhandler\x1fsvc/api.py" in keys
+
+
+def test_cypher_graph_key_is_absent_for_an_unkeyable_node(client, seeded_graph):
+    """A node with no `name` cannot be keyed. It must come back as null
+    rather than as a key built from an empty string, which would collide
+    with every other nameless node of the same label."""
+    seeded_graph.run_cypher("CREATE (:Scratch {repo_id: 'dash_repo_a'})")
+    try:
+        res = client.post(
+            "/api/cypher", json={"query": "MATCH (n:Scratch) RETURN n"}
+        )
+        nodes = [n for row in res.json()["results"][0]["data"] for n in row["graph"]["nodes"]]
+        assert nodes and all(n["key"] is None for n in nodes)
+    finally:
+        seeded_graph.run_cypher("MATCH (n:Scratch) DETACH DELETE n")
+
+
 def test_cypher_endpoint_reports_errors_without_raising(client):
     res = client.post("/api/cypher", json={"query": "NOT VALID CYPHER"})
     assert res.status_code == 200
@@ -270,6 +302,22 @@ def test_layout_round_trips_through_put_and_get(client, fake_layout_settings):
 def test_layout_endpoints_unknown_repo_404s(client, fake_layout_settings):
     assert client.get("/api/repos/does-not-exist/layout").status_code == 404
     assert client.put("/api/repos/does-not-exist/layout", json={}).status_code == 404
+
+
+def test_all_repos_layout_scope_is_accepted(client, fake_layout_settings):
+    """The canvas's "All Repos" view is not a registered repo but still has a
+    layout worth persisting, so its reserved id bypasses the registry check
+    that every other id goes through."""
+    positions = {"Service\x1fdash_repo_a\x1fUserService": [3, 4]}
+    assert client.put("/api/repos/__all__/layout", json=positions).status_code == 200
+    assert client.get("/api/repos/__all__/layout").json() == positions
+
+
+def test_all_repos_layout_is_separate_from_a_real_repos(client, fake_layout_settings):
+    client.put("/api/repos/__all__/layout", json={"k": [1, 1]})
+    client.put("/api/repos/dash_repo_a/layout", json={"k": [2, 2]})
+    assert client.get("/api/repos/__all__/layout").json() == {"k": [1, 1]}
+    assert client.get("/api/repos/dash_repo_a/layout").json() == {"k": [2, 2]}
 
 
 def test_layout_put_rejects_oversized_payload(client, fake_layout_settings):
