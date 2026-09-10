@@ -1256,7 +1256,12 @@ function forceDirectedSettle(onDone, mode) {
     for (let i = 0; i < 3 && iter < COOLING_STEPS; i++) avgDisp = step();
     cy.batch(() => { ids.forEach(id => { const ele = cy.getElementById(id); if (ele.length) ele.position(positions.get(id)); }); });
     if (iter < COOLING_STEPS && avgDisp > convergeThreshold) requestAnimationFrame(frame);
-    else { graphSettled = true; onDone && onDone(); }
+    /* Persisting here rather than in any particular caller's onDone: this is
+       the single point every settle path converges on -- the boot layoutstop
+       hook, a structural reload through mergeGraphElements, and the layout
+       selector all end up here -- and a settled graph is exactly the state
+       worth remembering. Debounced inside saveCachedLayout. */
+    else { graphSettled = true; saveCachedLayout(); onDone && onDone(); }
   }
   requestAnimationFrame(frame);
 }
@@ -1326,17 +1331,28 @@ function saveCachedLayout(immediate) {
     cachedPositions = new Map(Object.entries(positions));
     const url = `/api/repos/${encodeURIComponent(scope)}/layout`;
     const body = JSON.stringify(positions);
-    /* On unload only sendBeacon is guaranteed to survive the page going
-       away; a fetch() is free to be cancelled mid-flight. */
-    if (immediate && navigator.sendBeacon) {
-      navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
-      return;
-    }
-    fetch(url, { method: "PUT", headers: { "Content-Type": "application/json" }, body, keepalive: true }).catch(() => {});
+    /* keepalive and sendBeacon both cap the body at 64KB, and a real layout
+       is well past that -- every key carries a full repo-relative file path,
+       so a few hundred nodes already exceed it. Over the cap the browser
+       rejects the request outright rather than truncating: sendBeacon
+       returns false, and keepalive fetch throws. Both fail before anything
+       reaches the network, which is invisible from the server side.
+       So they're only worth attempting on unload, where an ordinary fetch
+       may be cancelled by the page going away, and only for a payload small
+       enough to be accepted. Everywhere else -- including the settle-time
+       save that does the real work -- use a plain fetch with no cap. */
+    const BEACON_BODY_LIMIT = 64 * 1024;
+    if (immediate && body.length <= BEACON_BODY_LIMIT && navigator.sendBeacon
+        && navigator.sendBeacon(url, new Blob([body], { type: "application/json" }))) return;
+    fetch(url, { method: "PUT", headers: { "Content-Type": "application/json" }, body }).catch(() => {});
   };
   if (immediate) send(); else saveLayoutTimer = setTimeout(send, 1200);
 }
-window.addEventListener("beforeunload", () => saveCachedLayout(true));
+/* Closing the tab mid-settle would otherwise persist a half-solved layout as
+   if it were the finished one, and the next load would restore that and skip
+   settling — freezing the graph part-way through a solve, permanently. Only a
+   settled graph is worth remembering; an unsettled one is better re-solved. */
+window.addEventListener("beforeunload", () => { if (graphSettled) saveCachedLayout(true); });
 
 function mergeGraphElements(elements, mode, opts) {
   const remove = opts ? !!opts.remove : true;
@@ -1427,7 +1443,7 @@ function mergeGraphElements(elements, mode, opts) {
       focusRotation(null, 60, 1000);
     } else {
       const touchedRatio = uncached / Math.max(1, cy.elements().length);
-      forceDirectedSettle(() => { focusRotation(null, 60, 1000); saveCachedLayout(); },
+      forceDirectedSettle(() => focusRotation(null, 60, 1000),
         mode || (touchedRatio > 0.25 ? "full" : "light"));
     }
   }
