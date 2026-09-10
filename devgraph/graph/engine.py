@@ -20,11 +20,29 @@ from devgraph.graph.schema import constraint_statements
 
 logger = logging.getLogger(__name__)
 
-# Shared by delete_nodes_by_source_file and _replace_file_nodes_tx. See
-# delete_nodes_by_source_file's docstring for why three property keys.
+# Shared by delete_nodes_by_source_file and _replace_file_nodes_tx.
+#
+# `source_file` (Module) and `file` (Class/Function/...) both name exactly
+# one file per node by construction, so a direct delete is correct there.
+# `source` (Container/Service/Network/Volume/API/Database-ish nodes) is
+# different: several files can legitimately co-produce the same named node
+# (e.g. a Service defined in both docker-compose.yml and an override file),
+# so those nodes are never file-scoped and a blind delete on any one
+# producing file would destroy a node the other file still claims. For that
+# population we track every claiming file in `sources` and only delete once
+# the last one is unclaimed — see _UNCLAIM_SOURCE_CYPHER.
 _DELETE_BY_SOURCE_FILE_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) "
-    "WHERE n.source_file = $file_name OR n.file = $file_name OR n.source = $file_name "
+    "WHERE n.source_file = $file_name OR n.file = $file_name "
+    "DETACH DELETE n"
+)
+
+_UNCLAIM_SOURCE_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) "
+    "WHERE n.file IS NULL AND n.source_file IS NULL "
+    "  AND (n.source = $file_name OR $file_name IN coalesce(n.sources, [])) "
+    "SET n.sources = [s IN coalesce(n.sources, [n.source]) WHERE s <> $file_name] "
+    "WITH n WHERE size(n.sources) = 0 "
     "DETACH DELETE n"
 )
 
@@ -168,10 +186,22 @@ def _upsert_nodes_tx(tx, nodes: list[dict[str, Any]]) -> None:
             if file_scoped
             else "{repo_id: row.repo_id, name: row.name}"
         )
+        # Non-file-scoped nodes accumulate every claiming `source` into
+        # `sources` so delete_nodes_by_source_file can unclaim one producer
+        # without destroying a node another file still produces. A no-op
+        # when row.properties has no `source` (e.g. Module's `source_file`
+        # already uniquely identifies its one node).
+        sources_clause = (
+            ""
+            if file_scoped
+            else " SET n.sources = CASE WHEN row.properties.source IS NULL THEN n.sources "
+            "WHEN row.properties.source IN coalesce(n.sources, []) THEN n.sources "
+            "ELSE coalesce(n.sources, []) + row.properties.source END"
+        )
         tx.run(
             f"UNWIND $rows AS row "
             f"MERGE (n:{label} {merge_key}) "
-            "SET n += row.properties",
+            "SET n += row.properties" + sources_clause,
             rows=rows,
         )
 
@@ -202,6 +232,7 @@ def _replace_file_nodes_tx(
     tx, repo_id: str, file_name: str, nodes: list[dict[str, Any]], rels: list[dict[str, Any]]
 ) -> None:
     tx.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
+    tx.run(_UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name)
     _upsert_nodes_tx(tx, nodes)
     _upsert_relationships_tx(tx, rels)
 
@@ -245,16 +276,26 @@ class GraphEngine:
         """
         props = properties or {}
         file = props.get("file")
+        file_scoped = _is_file_scoped(file)
         merge_key = (
             "{repo_id: $repo_id, name: $name, file: $file}"
-            if _is_file_scoped(file)
+            if file_scoped
             else "{repo_id: $repo_id, name: $name}"
+        )
+        # See _upsert_nodes_tx for why non-file-scoped nodes accumulate
+        # `sources`.
+        sources_clause = (
+            ""
+            if file_scoped
+            else " SET n.sources = CASE WHEN $properties.source IS NULL THEN n.sources "
+            "WHEN $properties.source IN coalesce(n.sources, []) THEN n.sources "
+            "ELSE coalesce(n.sources, []) + $properties.source END"
         )
         with self._driver.session() as session:
             _retry_transient(
                 session.run,
                 f"MERGE (n:{label} {merge_key}) "
-                "SET n += $properties",
+                "SET n += $properties" + sources_clause,
                 repo_id=repo_id,
                 name=name,
                 file=file,
@@ -358,16 +399,20 @@ class GraphEngine:
             return [record["name"] for record in result]
 
     def delete_nodes_by_source_file(self, repo_id: str, file_name: str) -> None:
-        """Remove every node whose provenance property names this file, scoped to repo_id.
+        """Remove or unclaim every node whose provenance names this file, scoped to repo_id.
 
         Extractors record provenance under one of three property keys
-        depending on which one wrote the node (source_file/file/source —
-        an inconsistency inherited from how each extractor was built
-        independently; matching all three here rather than picking one is
-        the honest fix until they're unified onto a single property name).
+        depending on which one wrote the node (source_file/file/source — an
+        inconsistency inherited from how each extractor was built
+        independently). `source_file`/`file` nodes name exactly one file by
+        construction and are deleted outright; `source` nodes can be
+        co-produced by several files, so this file is unclaimed from
+        `sources` and the node is only deleted once no file claims it —
+        see _UNCLAIM_SOURCE_CYPHER.
         """
         with self._driver.session() as session:
             _retry_transient(session.run, _DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
+            _retry_transient(session.run, _UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name)
 
     def stage_recency(
         self,

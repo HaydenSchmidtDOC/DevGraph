@@ -219,10 +219,11 @@ class TestBatchingReducesRoundTrips:
 
         try:
             engine.replace_file_nodes(repo_id, "big.py", nodes, rels)
-            # 1 delete + 1 UNWIND per node label (just "Function") + 1 UNWIND
-            # per relationship (from_label, rel_type, to_label) triple (just
-            # one triple here) = 3 tx.run calls total, independent of the 20
-            # nodes / 19 edges — not the 39+ calls the old per-item loop cost.
-            assert call_count["n"] == 3
+            # 1 delete + 1 unclaim (source-tracked nodes) + 1 UNWIND per node
+            # label (just "Function") + 1 UNWIND per relationship
+            # (from_label, rel_type, to_label) triple (just one triple here)
+            # = 4 tx.run calls total, independent of the 20 nodes / 19 edges
+            # — not the 39+ calls the old per-item loop cost.
+            assert call_count["n"] == 4
         finally:
             engine.delete_repository(repo_id)
