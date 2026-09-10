@@ -200,29 +200,27 @@ function runSyncChecks() {
    degrades in both directions: too broad and every repaint pays for text
    nobody wants, too narrow and structural nodes go unnamed. */
 function runLabelChecks() {
-  const m = /"label": ele => \((.*?)\) \? ele\.data\("label"\) : "",/.exec(html);
-  check("the label mapper is still where this test thinks it is", !!m, "regex found nothing");
-  if (!m) return;
-  const STRUCTURAL = ["repo", "service", "database", "vectorstore", "queue", "endpoint"];
-  const label = new Function("STRUCTURAL_CATS", "ele",
-    'return (' + m[1] + ') ? ele.data("label") : "";');
-  const cats = new Set(STRUCTURAL);
-  const el = (cat, excluded) => ({ data: k => (k === "cat" ? cat : "NAME"), hasClass: c => c === "excluded" && excluded });
-
-  check("labels a matched structural node", label(cats, el("service", false)) === "NAME",
-    label(cats, el("service", false)));
-  check("drops the label on a structural node the query excluded",
-    label(cats, el("service", true)) === "", label(cats, el("service", true)));
-  check("still never labels a non-structural node by default",
-    label(cats, el("function", false)) === "", label(cats, el("function", false)));
-  check("drops the label on an excluded non-structural node too",
-    label(cats, el("function", true)) === "", label(cats, el("function", true)));
-  check("hover can still name anything (.show-label overrides the mapper)",
+  check("no node carries a label by default",
+    /"label": "",/.test(html),
+    "the base node style labels something; every repaint would pay for that text");
+  check("a permanent label mapper has not crept back in",
+    !/"label": ele =>/.test(html),
+    "the base label is computed again, so some nodes are labelled without being asked for");
+  check("hover names a node (.show-label is what turns a label on)",
     /selector: "node\.show-label", style: \{ "label": "data\(label\)" \}/.test(html),
-    "the .show-label rule is gone, so hovering an unlabelled node would name nothing");
-  check("the search handler no longer force-labels every structural node",
+    "the .show-label rule is gone, so nothing could ever be named");
+  check("hovering a node adds show-label",
+    /cy\.on\("mouseover", "node", e => \{ e\.target\.addClass\("show-label hover-hl"\)/.test(html),
+    "node hover no longer labels");
+  check("hovering an entity type names that whole type",
+    /toggleClass\("hover-hl show-label", on\)/.test(html),
+    "highlightCat no longer toggles show-label, so type hover names nothing");
+  check("a node's own mouseout does not strip a label the type hover still wants",
+    /e\.target\.data\("cat"\) !== hoveredCat/.test(html),
+    "leaving a node while its type is hovered would blank that node's name");
+  check("the search handler does not force-label every structural node",
     !/n\.addClass\("show-label"\); \}\);/.test(html),
-    "a blanket addClass(show-label) is back and would defeat the mapper");
+    "a blanket addClass(show-label) is back and would relabel the whole graph");
 }
 
 /* ---------------------------------------------------------------------
