@@ -67,6 +67,14 @@ IGNORED_DIR_NAMES = {
     # working tree (e.g. a research skill's local cache dir) rather than a
     # true temp directory. Never source, never worth graphing.
     ".firecrawl",
+    # Agent worktrees (.worktrees/ at the repo root, .claude/worktrees/ for
+    # ones a coding agent spawns). Each is a full checkout of the repo it
+    # lives inside, so walking them indexes the entire repo again per live
+    # worktree — the same function then legitimately exists at N paths and
+    # becomes N nodes under the file-scoped MERGE key, silently multiplying
+    # the graph by however many worktrees happen to be open at scan time.
+    ".worktrees",
+    "worktrees",
 }
 
 _JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
