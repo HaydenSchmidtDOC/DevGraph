@@ -1599,23 +1599,26 @@ function renderResultTable(columns, rows) {
   return html;
 }
 /* Identity key for a live Neo4j node, built from the same (repo_id, label,
-   name) triple the backend MERGEs nodes on (engine.py) instead of Neo4j's
-   own internal n.id/elementId. Those internal ids are NOT stable across a
-   reindex: _replace_file_nodes_tx DETACH DELETEs every node touched by a
-   changed file, then MERGE-recreates them, so even an untouched function in
-   that file gets a fresh internal id on every save. Keying Cytoscape
-   elements off that churned id made mergeGraphElements() (which is
+   name[, file]) tuple the backend MERGEs nodes on (engine.py) instead of
+   Neo4j's own internal n.id/elementId. Those internal ids are NOT stable
+   across a reindex: _replace_file_nodes_tx DETACH DELETEs every node touched
+   by a changed file, then MERGE-recreates them, so even an untouched
+   function in that file gets a fresh internal id on every save. Keying
+   Cytoscape elements off that churned id made mergeGraphElements() (which is
    otherwise a correct diff) see "everything in this file was removed and
    re-added" on every edit -- full redraw/reposition of the file's nodes
    instead of an in-place update, and (for nodes with the same name in
    different files) a spurious id collision if Neo4j ever reused a freed
-   internal id. The (repo_id, label, name) triple is exactly what the
-   backend already treats as this node's real identity, so it survives the
-   delete+recreate untouched. */
+   internal id. `file` is folded in whenever the node has one, mirroring
+   engine.py's _is_file_scoped -- Class/Function/Service nodes are keyed
+   (repo_id, label, name, file) on the backend since same-named symbols in
+   different files are otherwise indistinguishable, and this id has to agree
+   or two such nodes collapse into one on this canvas. */
 function stableNodeId(n) {
   const realLabel = n.labels[0] || "Unknown";
   const name = n.properties?.name || n.properties?.repo_id || realLabel;
-  return "live:" + (n.properties?.repo_id ?? "") + "::" + realLabel + "::" + name;
+  const file = n.properties?.file;
+  return "live:" + (n.properties?.repo_id ?? "") + "::" + realLabel + "::" + name + (file != null ? "::" + file : "");
 }
 /* maps Neo4j's HTTP "graph" result format (real node/relationship objects
    with real labels + properties) into Cytoscape elements */

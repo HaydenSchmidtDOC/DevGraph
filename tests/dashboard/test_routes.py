@@ -121,7 +121,7 @@ def test_graph_endpoint_shape(client):
     assert set(body.keys()) == {"nodes", "edges"}
     assert len(body["nodes"]) >= 4
     node = body["nodes"][0]
-    assert set(node["data"].keys()) == {"id", "label", "name"}
+    assert set(node["data"].keys()) == {"id", "label", "name", "key"}
     edge = body["edges"][0]
     assert set(edge["data"].keys()) == {"id", "source", "target", "type"}
 
@@ -239,6 +239,43 @@ def test_git_status_endpoint_shape(client):
 def test_git_endpoints_unknown_repo_404s(client):
     assert client.get("/api/repos/does-not-exist/git-log").status_code == 404
     assert client.get("/api/repos/does-not-exist/git-status").status_code == 404
+
+
+@pytest.fixture
+def fake_layout_settings(tmp_path, monkeypatch):
+    from devgraph.config.settings import Settings
+    from devgraph.dashboard import layout_store
+
+    settings = Settings(registry_db_path=tmp_path / "registry.sqlite3")
+    monkeypatch.setattr(layout_store, "get_settings", lambda: settings)
+    return settings
+
+
+def test_layout_endpoint_empty_when_unsaved(client, fake_layout_settings):
+    res = client.get("/api/repos/dash_repo_a/layout")
+    assert res.status_code == 200
+    assert res.json() == {}
+
+
+def test_layout_round_trips_through_put_and_get(client, fake_layout_settings):
+    positions = {"Service\x1fdash_repo_a\x1fUserService": [10, 20]}
+    put_res = client.put("/api/repos/dash_repo_a/layout", json=positions)
+    assert put_res.status_code == 200
+
+    get_res = client.get("/api/repos/dash_repo_a/layout")
+    assert get_res.status_code == 200
+    assert get_res.json() == positions
+
+
+def test_layout_endpoints_unknown_repo_404s(client, fake_layout_settings):
+    assert client.get("/api/repos/does-not-exist/layout").status_code == 404
+    assert client.put("/api/repos/does-not-exist/layout", json={}).status_code == 404
+
+
+def test_layout_put_rejects_oversized_payload(client, fake_layout_settings):
+    huge = {f"key-{i}": [0, 0] for i in range(200_000)}
+    res = client.put("/api/repos/dash_repo_a/layout", json=huge)
+    assert res.status_code == 413
 
 
 def test_settings_endpoint_never_exposes_password(client):

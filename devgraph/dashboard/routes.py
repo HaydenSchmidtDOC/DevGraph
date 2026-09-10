@@ -23,8 +23,9 @@ from devgraph.config.settings import get_settings
 from devgraph.dashboard import queries
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.dashboard.git_info import get_git_log, get_git_status
+from devgraph.dashboard.layout_store import load_layout, save_layout
 from devgraph.dashboard.query_log import QueryLog
-from devgraph.graph.engine import GraphEngine
+from devgraph.graph.engine import GraphEngine, identity_key
 from devgraph.graph.schema import NODE_LABELS
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.registry.store import RepoRegistry
@@ -35,6 +36,12 @@ _GRAPH_LIMIT_DEFAULT = 500
 # Hard ceiling so a large repo's full graph can't hang the browser tab, per
 # Implementation Plan #5 Item 1.
 _GRAPH_LIMIT_CEILING = 2000
+# A saved layout has at most one entry per node the canvas could ever have
+# fetched, i.e. _GRAPH_LIMIT_CEILING entries; budget generously per entry
+# (a long identity_key plus an [x, y] pair) and round up, so a legitimate
+# full-graph save never gets rejected while a malformed/hostile PUT still
+# can't write an unbounded file to disk.
+_LAYOUT_PAYLOAD_LIMIT_BYTES = _GRAPH_LIMIT_CEILING * 1024
 _SSE_KEEPALIVE_S = 15
 
 
@@ -97,7 +104,15 @@ def build_router(
         nodes, edges = queries.graph_slice(engine, repo_id, label, capped_limit)
         return {
             "nodes": [
-                {"data": {"id": n["id"], "label": n["label"], "name": n["name"]}} for n in nodes
+                {
+                    "data": {
+                        "id": n["id"],
+                        "label": n["label"],
+                        "name": n["name"],
+                        "key": identity_key(n["label"], repo_id, n["name"], n["file"]),
+                    }
+                }
+                for n in nodes
             ],
             "edges": [
                 {
@@ -116,6 +131,38 @@ def build_router(
     def repo_search(repo_id: str, q: str, max_results: int = 15) -> dict[str, Any]:
         _require_repo(repo_id)
         return {"results": queries.search_components(engine, repo_id, q, max_results)}
+
+    @router.get("/repos/{repo_id}/layout")
+    def get_repo_layout(repo_id: str) -> dict[str, Any]:
+        _require_repo(repo_id)
+        return load_layout(repo_id)
+
+    @router.put("/repos/{repo_id}/layout")
+    async def put_repo_layout(repo_id: str, request: Request) -> dict[str, Any]:
+        _require_repo(repo_id)
+        # Declaring a `payload: dict[str, Any]` parameter (the previous
+        # shape) makes Starlette buffer and json-decode the entire body
+        # before this function ever runs, so the size check below couldn't
+        # actually stop that work -- only the eventual write to disk. Taking
+        # the raw `Request` instead means the body is only read here, after
+        # Content-Length has already rejected an oversized request; a caller
+        # that omits or lies about the header (chunked transfer, no header at
+        # all) still hits the len(body) check right after the read, before
+        # any JSON parsing happens.
+        content_length = request.headers.get("content-length")
+        if content_length is not None and content_length.isdigit() and int(content_length) > _LAYOUT_PAYLOAD_LIMIT_BYTES:
+            raise HTTPException(status_code=413, detail="layout payload too large")
+        body = await request.body()
+        if len(body) > _LAYOUT_PAYLOAD_LIMIT_BYTES:
+            raise HTTPException(status_code=413, detail="layout payload too large")
+        try:
+            payload = json.loads(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="payload must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="payload must be a JSON object")
+        save_layout(repo_id, payload)
+        return {"ok": True}
 
     @router.post("/cypher")
     def run_cypher(payload: dict[str, Any]) -> dict[str, Any]:

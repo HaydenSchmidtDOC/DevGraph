@@ -63,6 +63,17 @@ def _retry_transient(fn, *args, **kwargs):
             delay *= 2
 
 
+def _is_file_scoped(file: str | None) -> bool:
+    """The single predicate for "does this node's MERGE key include `file`".
+
+    Shared by `_group_nodes_by_label` (which drives the Cypher MERGE key)
+    and `identity_key` (which the dashboard uses as its layout-cache key),
+    so the two can never drift apart into disagreeing about which nodes are
+    file-scoped.
+    """
+    return file is not None
+
+
 def _group_nodes_by_label(
     nodes: list[dict[str, Any]],
 ) -> dict[tuple[str, bool], list[dict[str, Any]]]:
@@ -83,7 +94,7 @@ def _group_nodes_by_label(
     for node in nodes:
         properties = node.get("properties") or {}
         file = properties.get("file")
-        groups.setdefault((node["label"], file is not None), []).append(
+        groups.setdefault((node["label"], _is_file_scoped(file)), []).append(
             {
                 "repo_id": node["repo_id"],
                 "name": node["name"],
@@ -92,6 +103,31 @@ def _group_nodes_by_label(
             }
         )
     return groups
+
+
+# Unit separator (0x1F): a control character that cannot occur in a label,
+# repo_id, name, or filesystem path, so it can never be produced by any
+# combination of those fields and then misparsed back apart. Chosen over a
+# printable delimiter like "|" or ":" because both appear legitimately in
+# Windows paths (drive letters) and could appear in a symbol name.
+_IDENTITY_KEY_SEP = "\x1f"
+
+
+def identity_key(label: str, repo_id: str, name: str, file: str | None) -> str:
+    """Stable, server-derived cache key for a node — independent of Neo4j's
+    internal elementId(), which is a storage-slot pointer that shifts on any
+    full re-index, restore, or delete/recreate and would silently invalidate
+    a client-side position cache keyed on it.
+
+    Mirrors the MERGE key `_upsert_nodes_tx` actually writes with: file is
+    folded in only when `_is_file_scoped` says this node's MERGE key includes
+    it, so the dashboard never has to reimplement that conditional itself
+    (and risk it drifting from the Cypher above).
+    """
+    parts = [label, repo_id, name]
+    if _is_file_scoped(file):
+        parts.append(file)
+    return _IDENTITY_KEY_SEP.join(parts)
 
 
 def _group_rels_by_triple(
@@ -199,15 +235,29 @@ class GraphEngine:
     def upsert_node(
         self, label: str, repo_id: str, name: str, properties: dict[str, Any] | None = None
     ) -> None:
-        """Idempotent MERGE on (repo_id, name) for a repo-scoped node label."""
+        """Idempotent MERGE on (repo_id, name[, file]) for a repo-scoped node label.
+
+        Routed through the same `_is_file_scoped` predicate `_upsert_nodes_tx`
+        uses, so a caller passing a `file` property for a Class/Function/
+        Service node gets the same collision-proof MERGE key the batched
+        indexer path does, instead of a second, un-unified implementation
+        that always MERGEs on bare (repo_id, name).
+        """
         props = properties or {}
+        file = props.get("file")
+        merge_key = (
+            "{repo_id: $repo_id, name: $name, file: $file}"
+            if _is_file_scoped(file)
+            else "{repo_id: $repo_id, name: $name}"
+        )
         with self._driver.session() as session:
             _retry_transient(
                 session.run,
-                f"MERGE (n:{label} {{repo_id: $repo_id, name: $name}}) "
+                f"MERGE (n:{label} {merge_key}) "
                 "SET n += $properties",
                 repo_id=repo_id,
                 name=name,
+                file=file,
                 properties=props,
             )
 

@@ -576,8 +576,14 @@ def _index_datastores(engine: GraphEngine, repo_id: str, rel_path: str, content:
     engine.upsert_relationships([_relationship_dict(rel, repo_id) for rel in result.relationships])
 
 
-def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict[str, str]:
-    """{Service name -> build_context} for every repo Service that has one.
+def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict[str, tuple[str, str]]:
+    """{Service name -> (build_context, file)} for every repo Service that has one.
+
+    `file` (the compose file the Service was declared in) is carried
+    alongside build_context so _owning_service_relationships can set
+    from_file/to_file on the edges it emits -- Service is now file-scoped
+    (see schema.py's _FILE_SCOPED_LABELS), so a MATCH by bare name alone
+    would hit every same-named Service across every compose file again.
 
     Loaded once per index_paths batch (not once per file) since Services are
     only written earlier in the same batch by the Containerfile/compose
@@ -586,19 +592,19 @@ def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict
     results = engine.run_cypher(
         "MATCH (s:Service {repo_id: $repo_id}) "
         "WHERE s.build_context IS NOT NULL "
-        "RETURN s.name as name, s.build_context as build_context",
+        "RETURN s.name as name, s.build_context as build_context, s.file as file",
         {"repo_id": repo_id},
     )
-    return {row["name"]: row["build_context"] for row in results}
+    return {row["name"]: (row["build_context"], row["file"]) for row in results}
 
 
-def _match_owning_service(services: dict[str, str], rel_path: str) -> str | None:
+def _match_owning_service(services: dict[str, tuple[str, str]], rel_path: str) -> str | None:
     """Find the Service whose build_context is the longest prefix of rel_path's directory."""
     file_dir = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
 
     best_match: str | None = None
     best_match_len = -1
-    for name, context in services.items():
+    for name, (context, _file) in services.items():
         if file_dir == context or file_dir.startswith(context + "/"):
             if len(context) > best_match_len:
                 best_match = name
@@ -608,7 +614,7 @@ def _match_owning_service(services: dict[str, str], rel_path: str) -> str | None
 
 
 def _owning_service_relationships(
-    repo_id: str, rel_path: str, content: str, services: dict[str, str]
+    repo_id: str, rel_path: str, content: str, services: dict[str, tuple[str, str]]
 ) -> list[dict]:
     """USES/CALLS relationship dicts linking this file's Database/
     VectorStore/Queue and Endpoint nodes back to the compose Service that
@@ -627,6 +633,7 @@ def _owning_service_relationships(
     owning_service = _match_owning_service(services, rel_path)
     if owning_service is None:
         return []
+    _owning_context, owning_service_file = services[owning_service]
 
     rels: list[dict] = []
 
@@ -636,6 +643,7 @@ def _owning_service_relationships(
             {
                 "from_label": "Service",
                 "from_name": owning_service,
+                "from_file": owning_service_file,
                 "rel_type": "USES",
                 "to_label": ds.datastore_type,
                 "to_name": ds.name,
@@ -654,6 +662,7 @@ def _owning_service_relationships(
                 "rel_type": "CALLS",
                 "to_label": "Service",
                 "to_name": owning_service,
+                "to_file": owning_service_file,
                 "repo_id": repo_id,
                 "properties": {},
             }

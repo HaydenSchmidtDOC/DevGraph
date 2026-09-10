@@ -71,7 +71,7 @@ def graph_slice(
     node_rows = engine.run_cypher(
         f"MATCH (n {{repo_id: $repo_id}}) "
         f"WHERE true {label_filter} "
-        "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name "
+        "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, n.file AS file "
         "LIMIT $limit",
         {"repo_id": repo_id, "limit": limit},
     )
