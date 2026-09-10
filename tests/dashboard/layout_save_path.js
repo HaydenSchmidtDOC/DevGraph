@@ -115,6 +115,7 @@ const settle = ms => new Promise(r => setTimeout(r, ms));
   check("saves nothing when no node is server-keyed", calls.length === 0, JSON.stringify(calls));
 
   runSyncChecks();
+  runLabelChecks();
   runRotationChecks();
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);
@@ -190,6 +191,38 @@ function runSyncChecks() {
   check("inspector still resolves an edge by its internal id",
     (hl.edgeDetailsQuery(ele({ id: "live-e:7" })) || "").includes("id(r) = 7"),
     hl.edgeDetailsQuery(ele({ id: "live-e:7" })));
+}
+
+/* ---------------------------------------------------------------------
+   Node labels. Text dominates the cost of a canvas repaint and the ambient
+   rotation repaints on a tick, so a label nothing is asking to read is pure
+   cost. The style mapper is the only thing deciding that, and it silently
+   degrades in both directions: too broad and every repaint pays for text
+   nobody wants, too narrow and structural nodes go unnamed. */
+function runLabelChecks() {
+  const m = /"label": ele => \((.*?)\) \? ele\.data\("label"\) : "",/.exec(html);
+  check("the label mapper is still where this test thinks it is", !!m, "regex found nothing");
+  if (!m) return;
+  const STRUCTURAL = ["repo", "service", "database", "vectorstore", "queue", "endpoint"];
+  const label = new Function("STRUCTURAL_CATS", "ele",
+    'return (' + m[1] + ') ? ele.data("label") : "";');
+  const cats = new Set(STRUCTURAL);
+  const el = (cat, excluded) => ({ data: k => (k === "cat" ? cat : "NAME"), hasClass: c => c === "excluded" && excluded });
+
+  check("labels a matched structural node", label(cats, el("service", false)) === "NAME",
+    label(cats, el("service", false)));
+  check("drops the label on a structural node the query excluded",
+    label(cats, el("service", true)) === "", label(cats, el("service", true)));
+  check("still never labels a non-structural node by default",
+    label(cats, el("function", false)) === "", label(cats, el("function", false)));
+  check("drops the label on an excluded non-structural node too",
+    label(cats, el("function", true)) === "", label(cats, el("function", true)));
+  check("hover can still name anything (.show-label overrides the mapper)",
+    /selector: "node\.show-label", style: \{ "label": "data\(label\)" \}/.test(html),
+    "the .show-label rule is gone, so hovering an unlabelled node would name nothing");
+  check("the search handler no longer force-labels every structural node",
+    !/n\.addClass\("show-label"\); \}\);/.test(html),
+    "a blanket addClass(show-label) is back and would defeat the mapper");
 }
 
 /* ---------------------------------------------------------------------

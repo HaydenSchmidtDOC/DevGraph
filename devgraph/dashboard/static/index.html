@@ -915,7 +915,13 @@ const cy = cytoscape({
   style: [
     { selector: "node", style: {
         "background-color": ele => catColor(ele.data("cat")),
-        "label": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? ele.data("label") : "",
+        /* Text is the most expensive thing in a canvas repaint, and the
+           ambient rotation repaints on every tick, so a label that nothing
+           is asking to read is pure cost. `.excluded` means "the current
+           query didn't match this" -- those drop their label and stay as
+           dimmed context. Hovering any node still names it (.show-label,
+           below), so nothing becomes unidentifiable. */
+        "label": ele => (STRUCTURAL_CATS.has(ele.data("cat")) && !ele.hasClass("excluded")) ? ele.data("label") : "",
         /* subtle by default — dim, small, low-opacity; hover brightens it, doesn't resize it */
         "color": "#8a8f98", "font-size": 7.5, "font-family": "var(--font-mono)",
         "text-valign": "center", "text-halign": "right", "text-margin-x": 8, "text-opacity": 0.55,
@@ -980,7 +986,11 @@ cy.one("layoutstop", () => forceDirectedSettle(() => focusRotation(null, 60, 100
 cy.on("mouseover", "node", e => { e.target.addClass("show-label hover-hl"); setNodeGlowActive(e.target.id(), true); });
 cy.on("mouseout", "node", e => {
   e.target.removeClass("hover-hl");
-  if (!STRUCTURAL_CATS.has(e.target.data("cat"))) e.target.removeClass("show-label");
+  /* Drop the hover label unless a search is holding this node highlighted.
+     Structural nodes used to keep it forever, which now double-labels the
+     ones the base style already covers and relabels the ones it
+     deliberately doesn't. */
+  if (!e.target.hasClass("highlighted")) e.target.removeClass("show-label");
   setNodeGlowActive(e.target.id(), (e.target.data("glow")||0) > 0.02);
 });
 
@@ -2334,8 +2344,10 @@ document.getElementById("layoutSelect").addEventListener("change", () => {
 
 document.getElementById("graphSearch").addEventListener("input", e => {
   const q = e.target.value.trim().toLowerCase();
+  /* No re-adding show-label to every structural node here: the base label
+     style already labels the structural nodes the current query matched, and
+     forcing the class back on would relabel the unmatched ones too. */
   cy.nodes().removeClass("faded highlighted show-label");
-  cy.nodes().forEach(n => { if (STRUCTURAL_CATS.has(n.data("cat"))) n.addClass("show-label"); });
   if (!q) return;
   const matches = cy.nodes().filter(n => n.data("label").toLowerCase().includes(q));
   if (matches.length) { cy.nodes().addClass("faded"); matches.removeClass("faded").addClass("highlighted show-label"); cy.animate({ fit: { eles: matches, padding: 80 } }, { duration: 300 }); }
