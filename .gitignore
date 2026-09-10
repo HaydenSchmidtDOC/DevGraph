@@ -14,3 +14,5 @@ dist/
 .env.*
 !.env.example
 .firecrawl/
+.claude/worktrees/
+.serena/
