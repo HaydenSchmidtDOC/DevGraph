@@ -63,14 +63,32 @@ def _retry_transient(fn, *args, **kwargs):
             delay *= 2
 
 
-def _group_nodes_by_label(nodes: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    groups: dict[str, list[dict[str, Any]]] = {}
+def _group_nodes_by_label(
+    nodes: list[dict[str, Any]],
+) -> dict[tuple[str, bool], list[dict[str, Any]]]:
+    """Group by (label, is_file_scoped).
+
+    Every language extractor's Class/Function nodes carry a `file` property
+    (the repo-relative path they're defined in); nothing else does — Module
+    uses `source_file` and already has a unique name (the file path itself),
+    Service/Endpoint/Database-ish nodes use `source` and are effectively
+    singleton per repo. `file`'s presence is therefore exactly the signal
+    for "this label can collide by bare name across files" (two files each
+    defining a function called `main`, previously MERGEd into one shared
+    node — see Design Brief follow-up on cross-file symbol collisions).
+    Folding `file` into the MERGE key for just that population fixes the
+    collision without touching the many labels that don't need it.
+    """
+    groups: dict[tuple[str, bool], list[dict[str, Any]]] = {}
     for node in nodes:
-        groups.setdefault(node["label"], []).append(
+        properties = node.get("properties") or {}
+        file = properties.get("file")
+        groups.setdefault((node["label"], file is not None), []).append(
             {
                 "repo_id": node["repo_id"],
                 "name": node["name"],
-                "properties": node.get("properties") or {},
+                "file": file,
+                "properties": properties,
             }
         )
     return groups
@@ -78,15 +96,29 @@ def _group_nodes_by_label(nodes: list[dict[str, Any]]) -> dict[str, list[dict[st
 
 def _group_rels_by_triple(
     rels: list[dict[str, Any]],
-) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
-    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+) -> dict[tuple[str, str, str, bool, bool], list[dict[str, Any]]]:
+    """Group by (from_label, rel_type, to_label, has_from_file, has_to_file).
+
+    from_file/to_file (see GraphRelationship) are only ever set by a caller
+    that knows an endpoint's exact file at extraction time (currently: only
+    CONTAINS, whose two ends are always the file just parsed). Grouping on
+    their presence, not just the label triple, means every other
+    relationship type keeps matching by bare name exactly as before —
+    genuinely ambiguous by nature (a CALLS target could live anywhere in the
+    repo) rather than a bug to paper over.
+    """
+    groups: dict[tuple[str, str, str, bool, bool], list[dict[str, Any]]] = {}
     for rel in rels:
-        key = (rel["from_label"], rel["rel_type"], rel["to_label"])
+        from_file = rel.get("from_file")
+        to_file = rel.get("to_file")
+        key = (rel["from_label"], rel["rel_type"], rel["to_label"], from_file is not None, to_file is not None)
         groups.setdefault(key, []).append(
             {
                 "repo_id": rel["repo_id"],
                 "from_name": rel["from_name"],
                 "to_name": rel["to_name"],
+                "from_file": from_file,
+                "to_file": to_file,
                 "properties": rel.get("properties") or {},
             }
         )
@@ -94,21 +126,36 @@ def _group_rels_by_triple(
 
 
 def _upsert_nodes_tx(tx, nodes: list[dict[str, Any]]) -> None:
-    for label, rows in _group_nodes_by_label(nodes).items():
+    for (label, file_scoped), rows in _group_nodes_by_label(nodes).items():
+        merge_key = (
+            "{repo_id: row.repo_id, name: row.name, file: row.file}"
+            if file_scoped
+            else "{repo_id: row.repo_id, name: row.name}"
+        )
         tx.run(
             f"UNWIND $rows AS row "
-            f"MERGE (n:{label} {{repo_id: row.repo_id, name: row.name}}) "
+            f"MERGE (n:{label} {merge_key}) "
             "SET n += row.properties",
             rows=rows,
         )
 
 
 def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
-    for (from_label, rel_type, to_label), rows in _group_rels_by_triple(rels).items():
+    for (from_label, rel_type, to_label, has_from_file, has_to_file), rows in _group_rels_by_triple(rels).items():
+        from_match = (
+            "{repo_id: row.repo_id, name: row.from_name, file: row.from_file}"
+            if has_from_file
+            else "{repo_id: row.repo_id, name: row.from_name}"
+        )
+        to_match = (
+            "{repo_id: row.repo_id, name: row.to_name, file: row.to_file}"
+            if has_to_file
+            else "{repo_id: row.repo_id, name: row.to_name}"
+        )
         tx.run(
             f"UNWIND $rows AS row "
-            f"MATCH (a:{from_label} {{repo_id: row.repo_id, name: row.from_name}}) "
-            f"MATCH (b:{to_label} {{repo_id: row.repo_id, name: row.to_name}}) "
+            f"MATCH (a:{from_label} {from_match}) "
+            f"MATCH (b:{to_label} {to_match}) "
             f"MERGE (a)-[r:{rel_type}]->(b) "
             "SET r += row.properties",
             rows=rows,
@@ -280,6 +327,7 @@ class GraphEngine:
         created_at: str | None = None,
         last_modified_at: str | None = None,
         last_modified_by: str | None = None,
+        file: str | None = None,
     ) -> None:
         """Ratchet-merge git-derived recency onto a node: `created_at` only
         moves earlier and `last_modified_at` only moves later, so this is
@@ -291,11 +339,20 @@ class GraphEngine:
         `last_modified_at` comparison rather than having its own condition —
         that's what stops an out-of-order call from clobbering a newer
         commit's author with an older one's.
+
+        Pass `file` for Function/Class labels (whose nodes are MERGE-keyed
+        on (repo_id, name, file) — see _group_nodes_by_label) so this
+        doesn't fall back to a bare-name match that could hit every
+        same-named function across every file in the repo at once. Omit it
+        for Module (whose `name` is already the unique file path).
         """
+        merge_key = (
+            "{repo_id: $repo_id, name: $name, file: $file}" if file is not None else "{repo_id: $repo_id, name: $name}"
+        )
         with self._driver.session() as session:
             _retry_transient(
                 session.run,
-                f"MERGE (n:{label} {{repo_id: $repo_id, name: $name}}) "
+                f"MERGE (n:{label} {merge_key}) "
                 "SET n.created_at = CASE WHEN $created_at IS NULL THEN n.created_at "
                 "WHEN n.created_at IS NULL OR $created_at < n.created_at THEN $created_at "
                 "ELSE n.created_at END, "
@@ -308,6 +365,7 @@ class GraphEngine:
                 "ELSE n.last_modified_by END",
                 repo_id=repo_id,
                 name=name,
+                file=file,
                 created_at=created_at,
                 last_modified_at=last_modified_at,
                 last_modified_by=last_modified_by,
@@ -321,6 +379,7 @@ class GraphEngine:
         created_at: str | None = None,
         last_modified_at: str | None = None,
         last_modified_by: str | None = None,
+        file: str | None = None,
     ) -> None:
         """Overwrite recency from scratch — used only by the reconcile path,
         where the caller has just recomputed the authoritative value from a
@@ -330,17 +389,23 @@ class GraphEngine:
         `last_modified_by` is only included in the SET when not None, so a
         caller running with `git_recency_track_author` off (always passing
         `last_modified_by=None`) never nulls out a previously-tracked author.
+
+        See `stage_recency` for why `file` matters for Function/Class labels.
         """
+        merge_key = (
+            "{repo_id: $repo_id, name: $name, file: $file}" if file is not None else "{repo_id: $repo_id, name: $name}"
+        )
         set_clauses = ["n.created_at = $created_at", "n.last_modified_at = $last_modified_at"]
         if last_modified_by is not None:
             set_clauses.append("n.last_modified_by = $last_modified_by")
         with self._driver.session() as session:
             _retry_transient(
                 session.run,
-                f"MERGE (n:{label} {{repo_id: $repo_id, name: $name}}) "
+                f"MERGE (n:{label} {merge_key}) "
                 f"SET {', '.join(set_clauses)}",
                 repo_id=repo_id,
                 name=name,
+                file=file,
                 created_at=created_at,
                 last_modified_at=last_modified_at,
                 last_modified_by=last_modified_by,

@@ -462,6 +462,8 @@ def extract_csharp_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 to_label="Class",
                 to_name=class_name,
                 repo_id=repo_id,
+                from_file=file_path if parent_label == "Class" else None,
+                to_file=file_path,
             )
         )
         for base_name in base_names:
@@ -515,6 +517,8 @@ def extract_csharp_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 to_label="Function",
                 to_name=func_name,
                 repo_id=repo_id,
+                from_file=file_path if parent_label == "Class" else None,
+                to_file=file_path,
             )
         )
 

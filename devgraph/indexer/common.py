@@ -30,7 +30,18 @@ class GraphNode:
 
 @dataclass
 class GraphRelationship:
-    """A relationship to be upserted into the graph."""
+    """A relationship to be upserted into the graph.
+
+    from_file/to_file are an opt-in exactness constraint: when an endpoint's
+    file is known for certain at extraction time (e.g. CONTAINS, where both
+    ends are always the file currently being parsed), setting it makes the
+    MATCH in engine.py require that node's `file` property too, instead of
+    matching by name alone. Leave it None for endpoints whose file genuinely
+    isn't knowable from syntax alone (e.g. a CALLS target, which could be
+    defined anywhere in the repo) -- that keeps today's bare-name matching,
+    ambiguity and all, since guessing wrong there would silently drop edges
+    rather than just being imprecise.
+    """
 
     from_label: str
     from_name: str
@@ -39,6 +50,8 @@ class GraphRelationship:
     to_name: str
     repo_id: str
     properties: dict | None = None
+    from_file: str | None = None
+    to_file: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -49,6 +62,8 @@ class GraphRelationship:
             "to_name": self.to_name,
             "repo_id": self.repo_id,
             "properties": self.properties,
+            "from_file": self.from_file,
+            "to_file": self.to_file,
         }
 
 

@@ -518,6 +518,8 @@ def extract_rust_file(source_code: str, file_path: str, repo_id: str) -> Extract
                 to_label="Class",
                 to_name=type_name,
                 repo_id=repo_id,
+                from_file=file_path if parent_label == "Class" else None,
+                to_file=file_path,
             )
         )
 
@@ -548,6 +550,8 @@ def extract_rust_file(source_code: str, file_path: str, repo_id: str) -> Extract
                 to_label="Class",
                 to_name=trait_name,
                 repo_id=repo_id,
+                from_file=file_path if parent_label == "Class" else None,
+                to_file=file_path,
             )
         )
 
@@ -612,6 +616,8 @@ def extract_rust_file(source_code: str, file_path: str, repo_id: str) -> Extract
                 to_label="Function",
                 to_name=func_name,
                 repo_id=repo_id,
+                from_file=file_path if parent_label == "Class" else None,
+                to_file=file_path,
             )
         )
 

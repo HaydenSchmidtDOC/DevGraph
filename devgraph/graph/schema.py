@@ -56,19 +56,43 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # so incremental MERGE writes update in place instead of duplicating.
 _REPO_SCOPED_LABELS = tuple(l for l in NODE_LABELS if l != "Repository")
 
+# Class/Function/Service are keyed on (repo_id, name, file) instead: a bare
+# name isn't unique across files (two files can each define a function
+# called `main`, or two compose files can each declare an unrelated service
+# called `api`), and a single (repo_id, name) constraint was silently
+# merging those into one shared node. Every other label's `name` is either
+# already a real file path (Module) or effectively singleton per repo
+# (Endpoint, Database, ...), so it doesn't need the extra key component —
+# and Container deliberately stays bare-name keyed too, since it represents
+# a shared base image, not a per-file entity (see
+# indexer/dispatch.py:_upsert_container_result).
+_FILE_SCOPED_LABELS = ("Class", "Function", "Service")
+
 
 def constraint_statements() -> list[str]:
     """Cypher to create uniqueness constraints for every node label.
 
     Idempotent — `IF NOT EXISTS` makes this safe to run on every startup.
+    Class/Function additionally DROP their old two-property constraint
+    first: changing a constraint's definition in place isn't something
+    `CREATE CONSTRAINT ... IF NOT EXISTS` can do (a same-named constraint
+    with a different definition is just left alone), so an explicit drop is
+    the only way an already-provisioned Neo4j instance picks up the new key.
     """
     statements = [
         "CREATE CONSTRAINT repository_id IF NOT EXISTS "
         "FOR (r:Repository) REQUIRE r.repo_id IS UNIQUE"
     ]
     for label in _REPO_SCOPED_LABELS:
-        statements.append(
-            f"CREATE CONSTRAINT {label.lower()}_repo_name IF NOT EXISTS "
-            f"FOR (n:{label}) REQUIRE (n.repo_id, n.name) IS UNIQUE"
-        )
+        if label in _FILE_SCOPED_LABELS:
+            statements.append(f"DROP CONSTRAINT {label.lower()}_repo_name IF EXISTS")
+            statements.append(
+                f"CREATE CONSTRAINT {label.lower()}_repo_name_file IF NOT EXISTS "
+                f"FOR (n:{label}) REQUIRE (n.repo_id, n.name, n.file) IS UNIQUE"
+            )
+        else:
+            statements.append(
+                f"CREATE CONSTRAINT {label.lower()}_repo_name IF NOT EXISTS "
+                f"FOR (n:{label}) REQUIRE (n.repo_id, n.name) IS UNIQUE"
+            )
     return statements

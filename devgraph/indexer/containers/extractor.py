@@ -46,7 +46,14 @@ class VolumeNode:
 
 @dataclass
 class Relationship:
-    """Represents a relationship between two nodes."""
+    """Represents a relationship between two nodes.
+
+    from_file: set when the source endpoint is a Service (now keyed on
+    (repo_id, name, file) — see ServiceNode) so the edge matches the exact
+    Service that declared it, not every same-named Service across every
+    compose file in the repo. Container/Volume stay bare-name matched
+    (deliberately not file-scoped -- see _upsert_container_result).
+    """
 
     source_label: str
     source_name: str
@@ -54,6 +61,8 @@ class Relationship:
     target_label: str
     target_name: str
     properties: dict = field(default_factory=dict)
+    from_file: Optional[str] = None
+    to_file: Optional[str] = None
 
 
 @dataclass
@@ -78,11 +87,16 @@ class ContainerExtractor:
         """
         self.repo_id = repo_id
 
-    def extract_from_containerfile(self, content: str) -> ExtractionResult:
+    def extract_from_containerfile(self, content: str, filename: str = "Containerfile") -> ExtractionResult:
         """Extract container information from a Containerfile/Dockerfile.
 
         Args:
             content: The raw Containerfile/Dockerfile content.
+            filename: The repo-relative path of this Containerfile, recorded
+                as provenance. Container nodes stay bare-name keyed
+                regardless (see _upsert_container_result) -- this only
+                matters if/when a Containerfile-only node type becomes
+                file-scoped in the future.
 
         Returns:
             ExtractionResult containing extracted Container nodes.
@@ -107,7 +121,7 @@ class ContainerExtractor:
                 name=self._extract_image_name(base_image),
                 image=base_image,
                 repo_id=self.repo_id,
-                properties={"source": "Containerfile"},
+                properties={"source": filename},
             )
             result.containers.append(container)
 
@@ -149,7 +163,13 @@ class ContainerExtractor:
                 # file's Database/Endpoint nodes back to the Service that
                 # owns it, via directory containment.
                 build_context = self._extract_build_context(service_config.get("build"))
-                properties = {"source": filename}
+                # `file` (in addition to `source`) is what makes
+                # _upsert_nodes_tx key this Service on (repo_id, name, file)
+                # instead of bare (repo_id, name) -- two compose files
+                # declaring a same-named but unrelated service (a common
+                # monorepo pattern) would otherwise silently merge into one
+                # node, same root cause as the Function/Class collision.
+                properties = {"source": filename, "file": filename}
                 if build_context is not None:
                     properties["build_context"] = build_context
                 service = ServiceNode(
@@ -170,13 +190,17 @@ class ContainerExtractor:
                     )
                     result.containers.append(container)
 
-                    # Service RUNS Container relationship
+                    # Service RUNS Container relationship. from_file pins
+                    # this to the exact Service that declared it (now
+                    # file-scoped); Container stays bare-name matched since
+                    # it deliberately isn't file-scoped (shared base image).
                     relationship = Relationship(
                         source_label="Service",
                         source_name=service_name,
                         relationship_type="RUNS",
                         target_label="Container",
                         target_name=self._extract_image_name(image),
+                        from_file=filename,
                     )
                     result.relationships.append(relationship)
 
@@ -194,6 +218,7 @@ class ContainerExtractor:
                                     relationship_type="USES",
                                     target_label="Volume",
                                     target_name=vol_name,
+                                    from_file=filename,
                                 )
                                 result.relationships.append(service_rel)
 

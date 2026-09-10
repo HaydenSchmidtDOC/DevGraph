@@ -333,6 +333,8 @@ def extract_go_file(
                 to_label=child_label,
                 to_name=child_name,
                 repo_id=repo_id,
+                from_file=file_path if parent_label == "Class" else None,
+                to_file=file_path,
             )
         )
 

@@ -343,6 +343,7 @@ def _apply_function_recency(
             entity["name"],
             last_modified_at=latest.last_modified_at,
             last_modified_by=latest.last_modified_by if track_author else None,
+            file=file_path,
         )
 
 

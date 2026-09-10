@@ -371,10 +371,10 @@ def _index_single_path(
         index_mentions_file(engine, repo_id, resolved, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode)
         indexed += 1
     if name_lower in _CONTAINERFILE_NAMES:
-        _index_containerfile(engine, repo_id, resolved)
+        _index_containerfile(engine, repo_id, resolved, rel_path)
         indexed += 1
     elif name_lower in _COMPOSE_NAMES:
-        _index_compose_file(engine, repo_id, resolved)
+        _index_compose_file(engine, repo_id, resolved, rel_path)
         indexed += 1
     return indexed
 
@@ -502,15 +502,15 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
     return index_paths(engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled)
 
 
-def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path) -> None:
+def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> None:
     content = path.read_text(encoding="utf-8", errors="replace")
-    result = ContainerExtractor(repo_id).extract_from_containerfile(content)
+    result = ContainerExtractor(repo_id).extract_from_containerfile(content, rel_path)
     _upsert_container_result(engine, repo_id, result)
 
 
-def _index_compose_file(engine: GraphEngine, repo_id: str, path: Path) -> None:
+def _index_compose_file(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> None:
     content = path.read_text(encoding="utf-8", errors="replace")
-    result = ContainerExtractor(repo_id).extract_from_compose_file(content)
+    result = ContainerExtractor(repo_id).extract_from_compose_file(content, rel_path)
     _upsert_container_result(engine, repo_id, result)
 
 
@@ -518,7 +518,13 @@ def _relationship_dict(rel, repo_id: str) -> dict:
     """Canonical upsert_relationships dict from any extractor's
     source_label/source_name/relationship_type/target_label/target_name
     Relationship dataclass shape (docs/apis/containers/datastores all share
-    it, distinct from the python extractor's from_/to_/rel_type naming)."""
+    it, distinct from the python extractor's from_/to_/rel_type naming).
+
+    from_file/to_file use getattr with a None default since only
+    containers/extractor.py's Relationship carries them (Service is the one
+    label from this family that's file-scoped) -- every other module's
+    Relationship dataclass predates that field and stays bare-name matched.
+    """
     return {
         "from_label": rel.source_label,
         "from_name": rel.source_name,
@@ -527,10 +533,23 @@ def _relationship_dict(rel, repo_id: str) -> dict:
         "to_name": rel.target_name,
         "repo_id": repo_id,
         "properties": getattr(rel, "properties", None) or {},
+        "from_file": getattr(rel, "from_file", None),
+        "to_file": getattr(rel, "to_file", None),
     }
 
 
 def _upsert_container_result(engine: GraphEngine, repo_id: str, result) -> None:
+    # Container nodes deliberately stay keyed on (repo_id, name) alone, no
+    # `file` -- a Container node represents a shared base image (e.g.
+    # "python"), and two compose/Containerfiles both building FROM the same
+    # image should merge into that one shared node. Service nodes are the
+    # opposite: two different compose files declaring a service named "api"
+    # are two distinct services that happen to share a name, and merging
+    # them today (both keyed on bare (repo_id, name)) is the same
+    # cross-file collision bug Function/Class nodes had -- ServiceNode
+    # already carries a `file` property (see ContainerExtractor), which
+    # _upsert_nodes_tx picks up automatically to key Service on
+    # (repo_id, name, file) instead.
     nodes = [
         {"label": "Container", "repo_id": repo_id, "name": c.name, "properties": {**c.properties, "image": c.image}}
         for c in result.containers

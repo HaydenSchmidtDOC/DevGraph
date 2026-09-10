@@ -1598,21 +1598,44 @@ function renderResultTable(columns, rows) {
   if (rows.length > 25) html += `<div style="margin-top:6px;color:var(--meta)">showing 25 of ${rows.length} rows — full node/relationship properties are truncated above 60 chars per field, not stripped</div>`;
   return html;
 }
+/* Identity key for a live Neo4j node, built from the same (repo_id, label,
+   name) triple the backend MERGEs nodes on (engine.py) instead of Neo4j's
+   own internal n.id/elementId. Those internal ids are NOT stable across a
+   reindex: _replace_file_nodes_tx DETACH DELETEs every node touched by a
+   changed file, then MERGE-recreates them, so even an untouched function in
+   that file gets a fresh internal id on every save. Keying Cytoscape
+   elements off that churned id made mergeGraphElements() (which is
+   otherwise a correct diff) see "everything in this file was removed and
+   re-added" on every edit -- full redraw/reposition of the file's nodes
+   instead of an in-place update, and (for nodes with the same name in
+   different files) a spurious id collision if Neo4j ever reused a freed
+   internal id. The (repo_id, label, name) triple is exactly what the
+   backend already treats as this node's real identity, so it survives the
+   delete+recreate untouched. */
+function stableNodeId(n) {
+  const realLabel = n.labels[0] || "Unknown";
+  const name = n.properties?.name || n.properties?.repo_id || realLabel;
+  return "live:" + (n.properties?.repo_id ?? "") + "::" + realLabel + "::" + name;
+}
 /* maps Neo4j's HTTP "graph" result format (real node/relationship objects
    with real labels + properties) into Cytoscape elements */
 function mapGraphResultToElements(results) {
-  const nodeMap = new Map(), edges = [];
+  const nodeMap = new Map(), edges = [], idByInternalId = new Map();
   results.forEach(r => {
     (r.graph?.nodes || []).forEach(n => {
-      if (nodeMap.has(n.id)) return;
+      const stableId = stableNodeId(n);
+      idByInternalId.set(n.id, stableId);
+      if (nodeMap.has(stableId)) return;
       const realLabel = n.labels[0] || "Unknown";
       const known = NODE_TYPES.find(t => t.id === realLabel);
       const cat = known ? known.cat : "phase2";
       const name = n.properties?.name || n.properties?.repo_id || realLabel;
-      nodeMap.set(n.id, { data: { id: "live:"+n.id, label: name, cat } });
+      nodeMap.set(stableId, { data: { id: stableId, label: name, cat } });
     });
     (r.graph?.relationships || []).forEach(rel => {
-      edges.push({ data: { id: "live-e:"+rel.id, source: "live:"+rel.startNode, target: "live:"+rel.endNode, label: rel.type } });
+      const source = idByInternalId.get(rel.startNode), target = idByInternalId.get(rel.endNode);
+      if (!source || !target) return; // endpoint wasn't in this result's node set
+      edges.push({ data: { id: "live-e:"+rel.id, source, target, label: rel.type } });
     });
   });
   return [...nodeMap.values(), ...edges];
@@ -1624,7 +1647,7 @@ function mapGraphResultToElements(results) {
 function extractGraphIds(results) {
   const nodeIds = new Set(), edgeIds = new Set();
   results.forEach(r => {
-    (r.graph?.nodes || []).forEach(n => nodeIds.add("live:"+n.id));
+    (r.graph?.nodes || []).forEach(n => nodeIds.add(stableNodeId(n)));
     (r.graph?.relationships || []).forEach(rel => edgeIds.add("live-e:"+rel.id));
   });
   return { nodeIds, edgeIds };
