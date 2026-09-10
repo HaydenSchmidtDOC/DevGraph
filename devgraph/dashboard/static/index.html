@@ -929,6 +929,10 @@ const cy = cytoscape({
     { selector: "node[cat='service']", style: { "shape":"round-diamond" } },
     { selector: "node[id='svc:neo4j']", style: { "text-halign": "left", "text-margin-x": -8 } },
     { selector: "node.excluded", style: { "background-opacity": 0, "border-width": 1.3, "border-color": ele => catColor(ele.data("cat")), "border-opacity": 0.9, "opacity": 0.45, "shadow-opacity": 0 } },
+    /* beyond-the-ceiling elements aren't dimmed context like .excluded -- they
+       shouldn't cost draw time every frame at all. display:none pulls them out
+       of cytoscape's paint pass entirely instead of just fading them. */
+    { selector: "node.culled, edge.culled", style: { "display": "none" } },
     { selector: "edge", style: {
         "width": 1,
         "line-fill": "linear-gradient",
@@ -953,7 +957,25 @@ const cy = cytoscape({
   layout: { name: "random" },
   minZoom: 0.2, maxZoom: 3,
   autoungrabify: true, /* dragging nodes is off entirely — the graph only pans/zooms/rotates now */
+  motionBlur: false, /* motion-blur trails are extra composited frames on top of a graph that's
+     already repainting every frame for the ambient rotation -- pure cost, no payoff here. */
+  pixelRatio: 1, /* retina displays otherwise render at 2-3x the canvas pixel count for zero
+     perceptible gain on a graph this dense -- cut it once, unconditionally, for every graph size. */
+  /* textureOnViewport/hideEdgesOnViewport start off so small graphs keep full fidelity while
+     panning; updateRenderQuality() (below) turns them on past RENDER_QUALITY_NODE_THRESHOLD
+     nodes, where per-frame paint cost is the actual bottleneck and the fidelity trade is worth it. */
+  textureOnViewport: false,
+  hideEdgesOnViewport: false,
 });
+const RENDER_QUALITY_NODE_THRESHOLD = 800;
+/* re-evaluated after every add/remove (mergeGraphElements calls this) rather than
+   computed once at boot, since a repo switch or incremental load can cross the
+   threshold in either direction after the graph is already up. */
+function updateRenderQuality() {
+  const heavy = cy.nodes().length > RENDER_QUALITY_NODE_THRESHOLD;
+  const renderer = cy.renderer();
+  if (renderer) { renderer.hideEdgesOnViewport = heavy; renderer.textureOnViewport = heavy; }
+}
 cy.one("layoutstop", () => forceDirectedSettle(() => focusRotation(null, 60, 1000)));
 cy.on("mouseover", "node", e => { e.target.addClass("show-label hover-hl"); setNodeGlowActive(e.target.id(), true); });
 cy.on("mouseout", "node", e => {
@@ -1125,6 +1147,12 @@ function quadRepulsion(node, id, p, idealLength2, out) {
     for (const c of node.children) quadRepulsion(c, id, p, idealLength2, out);
   }
 }
+/* true once the force-directed layout has stopped moving and stays true
+   until mergeGraphElements next changes the element set -- a static graph
+   with a settled flag is how the render-optimisation work above knows there's
+   nothing left to do after settle, not just "we happened to stop calling
+   forceDirectedSettle." */
+let graphSettled = false;
 function forceDirectedSettle(onDone, mode) {
   const nodes = cy.nodes();
   const ids = nodes.map(n => n.id());
@@ -1177,6 +1205,13 @@ function forceDirectedSettle(onDone, mode) {
   let iter = 0;
 
   const idealLength2 = idealLength * idealLength;
+  /* average per-node displacement below which the layout reads as stopped --
+     scaled off idealLength (which already scales with graph size/viewport
+     area, see above) rather than a bare pixel constant, so a small tight
+     graph and a large sparse one both stop at "no longer visibly moving"
+     instead of the large one either stopping too early or burning steps
+     it doesn't need. */
+  const convergeThreshold = idealLength * 0.004;
   function step() {
     const disp = new Map(ids.map(id => [id, { x: 0, y: 0 }]));
     const tree = buildQuadTree(ids, positions);
@@ -1203,21 +1238,25 @@ function forceDirectedSettle(onDone, mode) {
       d.x += (cx - p.x) * g;
       d.y += (cyy - p.y) * g;
     });
+    let totalDisp = 0;
     ids.forEach(id => {
       const p = positions.get(id), d = disp.get(id);
       const dlen = Math.hypot(d.x, d.y) || 0.01;
       const capped = Math.min(dlen, temp);
       p.x += (d.x / dlen) * capped;
       p.y += (d.y / dlen) * capped;
+      totalDisp += capped;
     });
     temp *= 0.96;
     iter++;
+    return totalDisp / ids.length;
   }
   function frame() {
-    for (let i = 0; i < 3 && iter < COOLING_STEPS; i++) step();
+    let avgDisp = convergeThreshold + 1; // stays above threshold if the loop below never runs a step
+    for (let i = 0; i < 3 && iter < COOLING_STEPS; i++) avgDisp = step();
     cy.batch(() => { ids.forEach(id => { const ele = cy.getElementById(id); if (ele.length) ele.position(positions.get(id)); }); });
-    if (iter < COOLING_STEPS) requestAnimationFrame(frame);
-    else onDone && onDone();
+    if (iter < COOLING_STEPS && avgDisp > convergeThreshold) requestAnimationFrame(frame);
+    else { graphSettled = true; onDone && onDone(); }
   }
   requestAnimationFrame(frame);
 }
@@ -1260,6 +1299,16 @@ function mergeGraphElements(elements, mode, opts) {
   toRemove.remove();
   if (!toAdd.length && !cy.elements().length) return false;
 
+  /* Removing nodes never requires re-solving positions for the survivors --
+     nobody moved, there's nothing to settle. Only clear the settled flag
+     (below) when there's actually new, unpositioned content that could need
+     it; a pure removal leaves whatever settled state already held. */
+  if (!toAdd.length) {
+    updateRenderQuality();
+    return true;
+  }
+  graphSettled = false;
+
   const newNodeEls = toAdd.filter(el => !el.data.source);
   const newEdgeEls = toAdd.filter(el => el.data.source);
   const hadExisting = cy.nodes().length > 0;
@@ -1293,6 +1342,7 @@ function mergeGraphElements(elements, mode, opts) {
   cy.add(newEdgeEls);
   newEdgeEls.forEach(el => cy.getElementById(el.data.id).data("glow", 0));
 
+  updateRenderQuality();
   if (settle) {
     const touchedRatio = toAdd.length / Math.max(1, cy.elements().length);
     forceDirectedSettle(() => focusRotation(null, 60, 1000), mode || (touchedRatio > 0.25 ? "full" : "light"));
@@ -1338,18 +1388,121 @@ function zoomBy(factor) {
 document.getElementById("btnZoomIn").addEventListener("click", () => zoomBy(1.35));
 document.getElementById("btnZoomOut").addEventListener("click", () => zoomBy(1/1.35));
 
-/* ── slow ambient rotation: the whole graph spins around a fixed pivot — the
-   bounding-box center of the whole graph with no query active, or of the
-   current query's matched nodes when one is. Rotating rigidly around a fixed
-   pivot preserves every node's distance from it, so once the camera is framed
-   to cover the pivot's radius (+ margin) at fit time, the framed set can
-   never drift out of view no matter how long it spins — cheaper and more
-   robust than recomputing a fit every frame. Pauses while the user is
-   interacting so it never fights a drag. */
+/* ── slow ambient rotation: the whole graph appears to spin around a fixed
+   pivot — the bounding-box center of the whole graph with no query active,
+   or of the current query's matched nodes when one is. This used to work by
+   rotating every node's model position every frame; that forced Cytoscape to
+   invalidate and repaint its whole canvas at 60fps forever, even long after
+   the layout had settled and nothing else was changing (the dominant cause
+   of the sustained main-thread saturation at scale). Cytoscape's pan/zoom
+   are pure translate+scale — there's no camera "roll" to animate — so the
+   camera is rotated instead by applying a CSS transform to the already-
+   rendered #cy/#glowCanvas layer, around the pivot's current on-screen
+   point, every frame. That's not an approximation: rotating the finished
+   picture by angle θ around a screen point produces exactly the same pixels
+   a fixed camera would see if every node had instead been rotated by θ
+   around that same point — so the visible result is the same "spin" as
+   before, just paid for by the compositor (GPU, no Cytoscape repaint) rather
+   than by rewriting 3300 positions into Cytoscape's own canvas every frame.
+   Node model positions are never touched by this.
+   Invariant carried over from the old approach: rotating rigidly around a
+   fixed pivot preserves every node's distance from it, so once the camera is
+   framed to cover the pivot's radius (+ margin) at fit time (fitToCircle,
+   unchanged below), the framed set can never drift out of view no matter how
+   long it spins. A CSS rotate() around a point preserves that the same way,
+   for a more basic reason: rotating a disk about its own center leaves the
+   disk unchanged, and the framed circle (pivot's radius + margin) already
+   fits inside the viewport at zero rotation — turning the whole picture in
+   place about that same center can't push any of that circle outside the
+   viewport at any angle.
+   The one cost of rotating the *interactive* layer visually is that
+   Cytoscape's own hit-testing (which reads raw mouse coordinates against
+   cy.container().getBoundingClientRect()) would otherwise get confused two
+   ways: the container's native getBoundingClientRect() balloons to the
+   rotated element's axis-aligned bounding box instead of its real fixed
+   inset:0 viewport-sized box (breaking every rect.width/height read
+   elsewhere in this file too -- forceDirectedSettle, fitToCircle, renderGlow,
+   mergeGraphElements all call it), and the raw cursor position no longer
+   lines up with the rotated picture under it. Both are fixed below: the
+   container's getBoundingClientRect is pinned to its true static box (which
+   a CSS transform never changes -- only where it *paints*), and every
+   pointer event Cytoscape's renderer reads clientX/clientY from -- mousemove
+   (node hover, since a canvas has no child elements to receive native
+   per-node mouseover), mousedown/mouseup (click/tap hit-testing, which
+   re-derives its own target from the raw event independently of whatever
+   mousemove last computed) and the touch equivalents -- is corrected by
+   rotating the raw cursor point by -angle around the same pivot screen point
+   before Cytoscape's own listener ever sees it.
+   Pauses while the user is interacting so it never fights a drag, and only
+   runs the rAF loop while rotation can actually do something (a pivot
+   exists and there are nodes) instead of forever — idle otherwise, and
+   fully stopped while the tab is hidden. */
 let rotationPivot = null;
+let rotationAngleRad = 0;
 let userInteracting = false, lastRotationTime = performance.now();
+let rotationLoopArmed = false;
+const cyContainer = cy.container();
+/* the container is `position:fixed; inset:0; width:100vw; height:100vh` (see
+   #cy in the stylesheet) -- that layout box never moves regardless of any
+   CSS transform painted on top of it, so this is always correct, not just a
+   snapshot taken once. */
+cyContainer.getBoundingClientRect = () => ({
+  left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight,
+  width: window.innerWidth, height: window.innerHeight, x: 0, y: 0,
+});
+function pivotScreenPos() {
+  if (!rotationPivot) return null;
+  const z = cy.zoom(), p = cy.pan();
+  return { x: rotationPivot.x * z + p.x, y: rotationPivot.y * z + p.y };
+}
+function applyCameraRotationCss() {
+  const origin = pivotScreenPos();
+  if (!origin || !rotationAngleRad) {
+    cyContainer.style.transform = ""; glowCanvas.style.transform = "";
+    return;
+  }
+  const deg = (rotationAngleRad * 180 / Math.PI) % 360;
+  const t = `rotate(${deg}deg)`;
+  cyContainer.style.transformOrigin = glowCanvas.style.transformOrigin = `${origin.x}px ${origin.y}px`;
+  cyContainer.style.transform = glowCanvas.style.transform = t;
+}
+/* Cytoscape's renderer has no per-element DOM events to hook (a canvas has
+   no children) -- it derives both "which node is the mouse over" (mousemove)
+   and "which node was clicked/tapped" (mousedown/mouseup re-derive their own
+   target from the raw event, independently of whatever mousemove last
+   computed) purely from clientX/clientY against cy.container()'s
+   (now-pinned) rect. Touch input reads the same coordinates off
+   touchstart/touchmove/touchend's first changedTouches entry. Correcting all
+   of these keeps hover *and* click/tap accurate under the visual rotation.
+   Listening on `document` with capture:true runs this before the event
+   reaches cy.container()'s own bubble-phase listener. */
+function correctRotatedPointerEvent(evt) {
+  if (!rotationAngleRad) return;
+  /* Only events actually headed for the graph layer. The correction rewrites
+     clientX/clientY in the capture phase, so every later listener on the page
+     sees the rotated coordinates too — and the graph is a fixed full-viewport
+     layer behind the whole UI, so an uncorrected filter here catches pointer
+     events over the panels on top of it as well. The query-rate chart's own
+     mousemove readout (`chartCanvas`) reads clientX to pick a hovered bar and
+     would silently track the wrong one at any nonzero rotation. */
+  if (!cyContainer.contains(evt.target)) return;
+  const origin = pivotScreenPos();
+  if (!origin) return;
+  const a = -rotationAngleRad;
+  const cosA = Math.cos(a), sinA = Math.sin(a);
+  const pts = evt.touches?.length ? evt.touches
+    : evt.changedTouches?.length ? evt.changedTouches : [evt];
+  pts.forEach(pt => {
+    const dx = pt.clientX - origin.x, dy = pt.clientY - origin.y;
+    Object.defineProperty(pt, "clientX", { value: origin.x + dx * cosA - dy * sinA, configurable: true });
+    Object.defineProperty(pt, "clientY", { value: origin.y + dx * sinA + dy * cosA, configurable: true });
+  });
+}
+["mousemove", "mousedown", "mouseup", "touchstart", "touchmove", "touchend"].forEach(type => {
+  document.addEventListener(type, correctRotatedPointerEvent, { capture: true });
+});
 cy.on("tapstart", () => { userInteracting = true; });
-cy.on("tapend", () => { userInteracting = false; lastRotationTime = performance.now(); });
+cy.on("tapend", () => { userInteracting = false; lastRotationTime = performance.now(); armRotationLoop(); });
 function boundingCircle(nodesColl) {
   if (!nodesColl.length) return null;
   const bb = nodesColl.boundingBox();
@@ -1376,26 +1529,30 @@ function focusRotation(nodesColl, margin, duration) {
   if (!circle) { rotationPivot = null; return; }
   rotationPivot = { x: circle.cx, y: circle.cy };
   fitToCircle(circle.cx, circle.cy, circle.radius + margin, duration);
+  armRotationLoop();
 }
 const ROTATION_DEG_PER_SEC = 0.3; /* ~20 minutes per revolution — meant to be almost imperceptible */
 function rotationTick(now) {
+  if (document.hidden) { rotationLoopArmed = false; return; } /* A3: stop entirely while backgrounded, resume via visibilitychange */
+  if (!rotationPivot || !cy.nodes().length) { rotationLoopArmed = false; return; } /* A2: nothing to do, idle instead of spinning the rAF loop forever */
   const dt = Math.min(0.25, (now - lastRotationTime) / 1000);
   lastRotationTime = now;
-  if (!userInteracting && rotationPivot && cy.nodes().length) {
-    const angle = ROTATION_DEG_PER_SEC * dt * Math.PI / 180;
-    const cosA = Math.cos(angle), sinA = Math.sin(angle);
-    const { x: px, y: py } = rotationPivot;
-    cy.batch(() => {
-      cy.nodes().forEach(n => {
-        const p = n.position();
-        const dx = p.x - px, dy = p.y - py;
-        n.position({ x: px + dx*cosA - dy*sinA, y: py + dx*sinA + dy*cosA });
-      });
-    });
+  if (!userInteracting) {
+    rotationAngleRad += ROTATION_DEG_PER_SEC * dt * Math.PI / 180;
+    applyCameraRotationCss();
   }
   requestAnimationFrame(rotationTick);
 }
-requestAnimationFrame(rotationTick);
+/* single entry point for (re-)starting the loop -- safe to call whenever a
+   precondition might have just become true (focusRotation, tapend, tab
+   becoming visible again); a no-op if it's already running. */
+function armRotationLoop() {
+  if (rotationLoopArmed || document.hidden || !rotationPivot || !cy.nodes().length) return;
+  rotationLoopArmed = true;
+  lastRotationTime = performance.now();
+  requestAnimationFrame(rotationTick);
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) armRotationLoop(); });
 
 /* ── glow layer: additive-blend radial gradients drawn behind cytoscape's own
    canvas, synced to real node screen positions. Only nodes with glow intensity
@@ -1409,15 +1566,23 @@ function hexToRgb(hex) { const n = parseInt(hex.slice(1),16); return [(n>>16)&25
 const activeGlowIds = new Set();
 function setNodeGlowActive(id, active) { if (active) activeGlowIds.add(id); else activeGlowIds.delete(id); }
 let glowCanvasHadContent = false;
+let glowCanvasRectW = 0, glowCanvasRectH = 0, glowCanvasDpr = 0;
 function renderGlow() {
   const rect = cy.container().getBoundingClientRect();
   if (activeGlowIds.size === 0) {
     if (glowCanvasHadContent) { glowCtx.clearRect(0, 0, rect.width, rect.height); glowCanvasHadContent = false; }
     return;
   }
-  const dpr = 2;
-  glowCanvas.width = rect.width * dpr; glowCanvas.height = rect.height * dpr;
-  glowCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const dpr = window.devicePixelRatio || 1;
+  /* backing-store allocation is expensive -- only touch width/height (which
+     clears the canvas as a side effect) when the container size or dpr
+     actually moved, not on every one of the 60 calls/sec this gets while
+     glow is active. */
+  if (rect.width !== glowCanvasRectW || rect.height !== glowCanvasRectH || dpr !== glowCanvasDpr) {
+    glowCanvas.width = rect.width * dpr; glowCanvas.height = rect.height * dpr;
+    glowCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    glowCanvasRectW = rect.width; glowCanvasRectH = rect.height; glowCanvasDpr = dpr;
+  }
   glowCtx.clearRect(0, 0, rect.width, rect.height);
   glowCtx.globalCompositeOperation = "lighter";
   activeGlowIds.forEach(id => {
@@ -1489,13 +1654,18 @@ function applyState(skipQueryBuild, runMode) {
     relNodeIds = new Set();
     cy.edges(`[label = "${state.isolatedRel}"]`).forEach(e => { relNodeIds.add(e.source().id()); relNodeIds.add(e.target().id()); });
   }
+  /* .excluded (dimmed, still drawn) is deliberate context -- filtered out by
+     type/relationship but left visible so the isolated set reads against the
+     rest of the graph. .culled (display:none, not drawn at all) is just
+     overflow past the ceiling -- there's no context value in a node nobody
+     asked to see and no reason to keep paying its draw cost every frame. */
   let nSeen = 0;
   cy.nodes().forEach(n => {
     let on = !state.isolatedEntity || n.data("cat") === state.isolatedEntity;
     if (on && relNodeIds) on = relNodeIds.has(n.id());
-    const within = on && ++nSeen <= state.nodeCeiling;
-    n.toggleClass("excluded", !within);
-    if (!on) nSeen--;
+    if (on) nSeen++;
+    n.toggleClass("excluded", !on);
+    n.toggleClass("culled", on && nSeen > state.nodeCeiling);
   });
   let rSeen = 0;
   cy.edges().forEach(e => {
@@ -1506,11 +1676,11 @@ function applyState(skipQueryBuild, runMode) {
     // touches an isolated-type node (its far endpoint doesn't have to).
     const entityOn = !state.isolatedEntity || e.source().data("cat") === state.isolatedEntity || e.target().data("cat") === state.isolatedEntity;
     const on = relOn && entityOn;
-    const within = on && ++rSeen <= state.relCeiling;
-    e.toggleClass("excluded", !within);
-    if (!on) rSeen--;
+    if (on) rSeen++;
+    e.toggleClass("excluded", !on);
+    e.toggleClass("culled", on && rSeen > state.relCeiling);
   });
-  document.getElementById("visibleCount").textContent = cy.nodes().filter(n=>!n.hasClass("excluded")).length + " nodes · " + cy.edges().filter(e=>!e.hasClass("excluded")).length + " edges";
+  document.getElementById("visibleCount").textContent = cy.nodes().filter(n=>!n.hasClass("excluded")&&!n.hasClass("culled")).length + " nodes · " + cy.edges().filter(e=>!e.hasClass("excluded")&&!e.hasClass("culled")).length + " edges";
   if (!skipQueryBuild) buildQueryFromState(runMode);
 }
 /* runMode "full" actually executes and populates the results panel (used by
