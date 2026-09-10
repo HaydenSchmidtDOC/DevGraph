@@ -115,6 +115,7 @@ const settle = ms => new Promise(r => setTimeout(r, ms));
   check("saves nothing when no node is server-keyed", calls.length === 0, JSON.stringify(calls));
 
   runSyncChecks();
+  runRotationChecks();
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);
 })();
@@ -189,4 +190,83 @@ function runSyncChecks() {
   check("inspector still resolves an edge by its internal id",
     (hl.edgeDetailsQuery(ele({ id: "live-e:7" })) || "").includes("id(r) = 7"),
     hl.edgeDetailsQuery(ele({ id: "live-e:7" })));
+}
+
+/* ---------------------------------------------------------------------
+   Ambient rotation. Driven by hand here (requestAnimationFrame stubbed to a
+   no-op, timestamps supplied) so the tick is just a function call.
+   Two things worth pinning down: that it rotates node MODEL positions --
+   rotating the rendered layer with a CSS transform is much cheaper but
+   turns the labels drawn into that layer, which is the regression this
+   replaced -- and that it does so at a bounded rate, which is what made the
+   per-frame version expensive in the first place. */
+function runRotationChecks() {
+  const nodeState = [];
+  const mkNode = (x, y) => {
+    const s = { x, y };
+    nodeState.push(s);
+    return { position: p => (p === undefined ? { x: s.x, y: s.y } : Object.assign(s, p)) };
+  };
+  const rotSrc = [
+    grab(/^const ROTATION_DEG_PER_SEC/m, "\n}"),   // constants + rotationTick
+  ].join("\n");
+  let styleWrites = 0;
+  const container = { style: new Proxy({}, { set: () => (styleWrites++, true) }) };
+  let pivot = { x: 100, y: 100 };
+  const stub = {
+    document: { hidden: false },
+    requestAnimationFrame: () => {},
+    performance,
+    Math,
+    get cy() { return cyStub; },
+  };
+  const cyStub = {
+    nodes: () => { const a = liveNodes; a.forEach = Array.prototype.forEach.bind(liveNodes); return a; },
+    batch: fn => fn(),
+    container: () => container,
+  };
+  /* 540 units from the pivot stands in for the worst on-screen case:
+     fitToCircle always frames the graph so the pivot's radius fits the
+     viewport, so a node can never be further from the pivot on screen than
+     half the viewport's smaller side -- ~540px on a 1080p display. Testing
+     at that radius is testing the largest step any node can actually take. */
+  let liveNodes = [mkNode(100 + 540, 100), mkNode(100, 100 + 540)];
+  const ctx = {
+    document: stub.document, requestAnimationFrame: stub.requestAnimationFrame,
+    cy: cyStub, rotationPivot: pivot, userInteracting: false,
+    lastRotationTime: 0, rotationLoopArmed: true,
+  };
+  const fn = new Function("document", "requestAnimationFrame", "cy",
+    "rotationPivot", "userInteracting", "lastRotationTime", "rotationLoopArmed",
+    "let __t = lastRotationTime;\n" +
+    rotSrc.replace(/lastRotationTime = now;/, "__t = now; lastRotationTime = now;")
+          .replace(/const elapsed = now - lastRotationTime;/, "const elapsed = now - __t;") +
+    "\nreturn { rotationTick, ROTATION_TICK_MS, ROTATION_DEG_PER_SEC };");
+  const rot = fn(ctx.document, ctx.requestAnimationFrame, ctx.cy, ctx.rotationPivot,
+    ctx.userInteracting, ctx.lastRotationTime, ctx.rotationLoopArmed);
+
+  const distTo = s => Math.hypot(s.x - pivot.x, s.y - pivot.y);
+  const before = nodeState.map(distTo);
+  const startX = nodeState[0].x, startY = nodeState[0].y;
+
+  rot.rotationTick(10); // well under one tick interval
+  check("does not rotate before a full tick interval has passed",
+    nodeState[0].x === startX && nodeState[0].y === startY,
+    JSON.stringify(nodeState[0]));
+
+  rot.rotationTick(rot.ROTATION_TICK_MS + 10);
+  const moved = nodeState[0].x !== startX || nodeState[0].y !== startY;
+  check("rotates node model positions once a tick interval has passed",
+    moved, JSON.stringify(nodeState[0]));
+  check("rotates positions rather than CSS-transforming the rendered layer, which would lean the labels",
+    styleWrites === 0, styleWrites + " style writes");
+
+  const after = nodeState.map(distTo);
+  check("rigid rotation preserves every node's distance from the pivot",
+    after.every((d, i) => Math.abs(d - before[i]) < 1e-6),
+    JSON.stringify({ before, after }));
+
+  const stepPx = Math.hypot(nodeState[0].x - startX, nodeState[0].y - startY);
+  check(`one tick moves the outermost on-screen node under a pixel (${stepPx.toFixed(3)}px at r=${before[0].toFixed(0)})`,
+    stepPx < 1, stepPx + "px");
 }

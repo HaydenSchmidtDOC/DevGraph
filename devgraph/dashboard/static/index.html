@@ -1519,119 +1519,39 @@ function zoomBy(factor) {
 document.getElementById("btnZoomIn").addEventListener("click", () => zoomBy(1.35));
 document.getElementById("btnZoomOut").addEventListener("click", () => zoomBy(1/1.35));
 
-/* ── slow ambient rotation: the whole graph appears to spin around a fixed
-   pivot — the bounding-box center of the whole graph with no query active,
-   or of the current query's matched nodes when one is. This used to work by
-   rotating every node's model position every frame; that forced Cytoscape to
-   invalidate and repaint its whole canvas at 60fps forever, even long after
-   the layout had settled and nothing else was changing (the dominant cause
-   of the sustained main-thread saturation at scale). Cytoscape's pan/zoom
-   are pure translate+scale — there's no camera "roll" to animate — so the
-   camera is rotated instead by applying a CSS transform to the already-
-   rendered #cy/#glowCanvas layer, around the pivot's current on-screen
-   point, every frame. That's not an approximation: rotating the finished
-   picture by angle θ around a screen point produces exactly the same pixels
-   a fixed camera would see if every node had instead been rotated by θ
-   around that same point — so the visible result is the same "spin" as
-   before, just paid for by the compositor (GPU, no Cytoscape repaint) rather
-   than by rewriting 3300 positions into Cytoscape's own canvas every frame.
-   Node model positions are never touched by this.
-   Invariant carried over from the old approach: rotating rigidly around a
-   fixed pivot preserves every node's distance from it, so once the camera is
-   framed to cover the pivot's radius (+ margin) at fit time (fitToCircle,
-   unchanged below), the framed set can never drift out of view no matter how
-   long it spins. A CSS rotate() around a point preserves that the same way,
-   for a more basic reason: rotating a disk about its own center leaves the
-   disk unchanged, and the framed circle (pivot's radius + margin) already
-   fits inside the viewport at zero rotation — turning the whole picture in
-   place about that same center can't push any of that circle outside the
-   viewport at any angle.
-   The one cost of rotating the *interactive* layer visually is that
-   Cytoscape's own hit-testing (which reads raw mouse coordinates against
-   cy.container().getBoundingClientRect()) would otherwise get confused two
-   ways: the container's native getBoundingClientRect() balloons to the
-   rotated element's axis-aligned bounding box instead of its real fixed
-   inset:0 viewport-sized box (breaking every rect.width/height read
-   elsewhere in this file too -- forceDirectedSettle, fitToCircle, renderGlow,
-   mergeGraphElements all call it), and the raw cursor position no longer
-   lines up with the rotated picture under it. Both are fixed below: the
-   container's getBoundingClientRect is pinned to its true static box (which
-   a CSS transform never changes -- only where it *paints*), and every
-   pointer event Cytoscape's renderer reads clientX/clientY from -- mousemove
-   (node hover, since a canvas has no child elements to receive native
-   per-node mouseover), mousedown/mouseup (click/tap hit-testing, which
-   re-derives its own target from the raw event independently of whatever
-   mousemove last computed) and the touch equivalents -- is corrected by
-   rotating the raw cursor point by -angle around the same pivot screen point
-   before Cytoscape's own listener ever sees it.
-   Pauses while the user is interacting so it never fights a drag, and only
-   runs the rAF loop while rotation can actually do something (a pivot
-   exists and there are nodes) instead of forever — idle otherwise, and
-   fully stopped while the tab is hidden. */
+/* ── slow ambient rotation: the whole graph spins around a fixed pivot — the
+   bounding-box center of the whole graph with no query active, or of the
+   current query's matched nodes when one is.
+
+   This rotates node model positions, so Cytoscape re-renders each label
+   axis-aligned afterwards and text stays upright. Rotating the rendered
+   layer instead (a CSS transform on #cy) is far cheaper — the compositor
+   does it, Cytoscape repaints nothing — but it turns the finished picture,
+   and node labels are drawn into that picture: every label ends up leaning
+   at the rotation angle. It also has to fight the renderer for pointer
+   coordinates, since Cytoscape hit-tests raw clientX/clientY against a
+   container whose paint no longer matches its layout box. Neither is worth
+   an effect this subtle.
+
+   What made the original version expensive was the rate, not the technique:
+   it rewrote every node's position on every animation frame, forcing a full
+   canvas repaint at 60fps forever, long after the layout had settled and
+   nothing else was changing. At ROTATION_DEG_PER_SEC that frame-by-frame
+   precision buys nothing — a frame's worth of rotation is 0.005°, far below
+   anything visible. Ticking a few times a second instead covers the same
+   angle in steps still well under a pixel at any zoom this canvas allows,
+   for a fraction of the repaints.
+
+   Invariant: rotating rigidly around a fixed pivot preserves every node's
+   distance from it, so once the camera is framed to cover the pivot's radius
+   (+ margin) at fit time, the framed set can never drift out of view no
+   matter how long it spins — cheaper and more robust than recomputing a fit
+   every tick. Pauses while the user is interacting so it never fights a
+   drag, only runs while rotation can actually do something (a pivot exists
+   and there are nodes), and stops entirely while the tab is hidden. */
 let rotationPivot = null;
-let rotationAngleRad = 0;
 let userInteracting = false, lastRotationTime = performance.now();
 let rotationLoopArmed = false;
-const cyContainer = cy.container();
-/* the container is `position:fixed; inset:0; width:100vw; height:100vh` (see
-   #cy in the stylesheet) -- that layout box never moves regardless of any
-   CSS transform painted on top of it, so this is always correct, not just a
-   snapshot taken once. */
-cyContainer.getBoundingClientRect = () => ({
-  left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight,
-  width: window.innerWidth, height: window.innerHeight, x: 0, y: 0,
-});
-function pivotScreenPos() {
-  if (!rotationPivot) return null;
-  const z = cy.zoom(), p = cy.pan();
-  return { x: rotationPivot.x * z + p.x, y: rotationPivot.y * z + p.y };
-}
-function applyCameraRotationCss() {
-  const origin = pivotScreenPos();
-  if (!origin || !rotationAngleRad) {
-    cyContainer.style.transform = ""; glowCanvas.style.transform = "";
-    return;
-  }
-  const deg = (rotationAngleRad * 180 / Math.PI) % 360;
-  const t = `rotate(${deg}deg)`;
-  cyContainer.style.transformOrigin = glowCanvas.style.transformOrigin = `${origin.x}px ${origin.y}px`;
-  cyContainer.style.transform = glowCanvas.style.transform = t;
-}
-/* Cytoscape's renderer has no per-element DOM events to hook (a canvas has
-   no children) -- it derives both "which node is the mouse over" (mousemove)
-   and "which node was clicked/tapped" (mousedown/mouseup re-derive their own
-   target from the raw event, independently of whatever mousemove last
-   computed) purely from clientX/clientY against cy.container()'s
-   (now-pinned) rect. Touch input reads the same coordinates off
-   touchstart/touchmove/touchend's first changedTouches entry. Correcting all
-   of these keeps hover *and* click/tap accurate under the visual rotation.
-   Listening on `document` with capture:true runs this before the event
-   reaches cy.container()'s own bubble-phase listener. */
-function correctRotatedPointerEvent(evt) {
-  if (!rotationAngleRad) return;
-  /* Only events actually headed for the graph layer. The correction rewrites
-     clientX/clientY in the capture phase, so every later listener on the page
-     sees the rotated coordinates too — and the graph is a fixed full-viewport
-     layer behind the whole UI, so an uncorrected filter here catches pointer
-     events over the panels on top of it as well. The query-rate chart's own
-     mousemove readout (`chartCanvas`) reads clientX to pick a hovered bar and
-     would silently track the wrong one at any nonzero rotation. */
-  if (!cyContainer.contains(evt.target)) return;
-  const origin = pivotScreenPos();
-  if (!origin) return;
-  const a = -rotationAngleRad;
-  const cosA = Math.cos(a), sinA = Math.sin(a);
-  const pts = evt.touches?.length ? evt.touches
-    : evt.changedTouches?.length ? evt.changedTouches : [evt];
-  pts.forEach(pt => {
-    const dx = pt.clientX - origin.x, dy = pt.clientY - origin.y;
-    Object.defineProperty(pt, "clientX", { value: origin.x + dx * cosA - dy * sinA, configurable: true });
-    Object.defineProperty(pt, "clientY", { value: origin.y + dx * sinA + dy * cosA, configurable: true });
-  });
-}
-["mousemove", "mousedown", "mouseup", "touchstart", "touchmove", "touchend"].forEach(type => {
-  document.addEventListener(type, correctRotatedPointerEvent, { capture: true });
-});
 cy.on("tapstart", () => { userInteracting = true; });
 cy.on("tapend", () => { userInteracting = false; lastRotationTime = performance.now(); armRotationLoop(); });
 function boundingCircle(nodesColl) {
@@ -1663,14 +1583,37 @@ function focusRotation(nodesColl, margin, duration) {
   armRotationLoop();
 }
 const ROTATION_DEG_PER_SEC = 0.3; /* ~20 minutes per revolution — meant to be almost imperceptible */
+/* One position rewrite (and so one canvas repaint) every this many ms rather
+   than one per animation frame. At ROTATION_DEG_PER_SEC a tick turns the
+   graph 0.075°. fitToCircle always frames the pivot's radius to the
+   viewport, so no node is ever further from the pivot on screen than half
+   the viewport's smaller side — roughly 540px on a 1080p display, where
+   0.075° works out to about 0.7px. The largest step any node can take is
+   therefore under a pixel, while there are ~15x fewer repaints than a
+   per-frame rotation. Still driven by
+   requestAnimationFrame rather than an interval so it inherits the
+   browser's own pause when the tab is backgrounded and stays aligned to a
+   real frame when it does move; the frames in between cost one timestamp
+   comparison. */
+const ROTATION_TICK_MS = 250;
 function rotationTick(now) {
   if (document.hidden) { rotationLoopArmed = false; return; } /* A3: stop entirely while backgrounded, resume via visibilitychange */
   if (!rotationPivot || !cy.nodes().length) { rotationLoopArmed = false; return; } /* A2: nothing to do, idle instead of spinning the rAF loop forever */
-  const dt = Math.min(0.25, (now - lastRotationTime) / 1000);
-  lastRotationTime = now;
-  if (!userInteracting) {
-    rotationAngleRad += ROTATION_DEG_PER_SEC * dt * Math.PI / 180;
-    applyCameraRotationCss();
+  const elapsed = now - lastRotationTime;
+  /* userInteracting also resets lastRotationTime on tapend, so a drag never
+     banks up rotation to apply in one jump when it ends. */
+  if (!userInteracting && elapsed >= ROTATION_TICK_MS) {
+    lastRotationTime = now;
+    const angle = ROTATION_DEG_PER_SEC * Math.min(1, elapsed / 1000) * Math.PI / 180;
+    const cosA = Math.cos(angle), sinA = Math.sin(angle);
+    const { x: px, y: py } = rotationPivot;
+    cy.batch(() => {
+      cy.nodes().forEach(n => {
+        const p = n.position();
+        const dx = p.x - px, dy = p.y - py;
+        n.position({ x: px + dx * cosA - dy * sinA, y: py + dx * sinA + dy * cosA });
+      });
+    });
   }
   requestAnimationFrame(rotationTick);
 }
