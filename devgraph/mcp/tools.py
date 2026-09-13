@@ -12,20 +12,108 @@ from pathlib import Path
 from typing import Any
 
 import git
+import json
+import subprocess
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
 from devgraph.registry.store import RepoRegistry
 
+import re
+import unicodedata
+
+_SEARCH_STOPWORDS = frozenset({
+    "how", "what", "why", "when", "where", "which", "who", "whom", "whose",
+    "does", "did", "is", "are", "was", "were", "be", "been", "being",
+    "can", "could", "should", "would", "will", "shall", "may", "might", "must",
+    "has", "have", "had", "the", "and", "but", "not", "for", "from", "with",
+    "without", "into", "onto", "off", "that", "this", "these", "those", "there",
+    "here", "its", "their", "them", "they", "about", "any", "all", "some",
+    "work", "works", "working", "do", "in", "of", "to", "a", "an",
+})
+
+def _search_tokens(query: str) -> list[str]:
+    """Lowercase word tokens from a search query, minus stopwords.
+    Falls back to the unfiltered token list if every token is a stopword
+    (so a query that's ALL stopwords still searches on something)."""
+    raw = re.findall(r"[a-z0-9]+", query.lower())
+    filtered = [t for t in raw if t not in _SEARCH_STOPWORDS and len(t) > 1]
+    return filtered or raw
+
+
+_MAX_LABEL_LEN = 500
+
+def _sanitize_value(value: Any) -> Any:
+    """Strip control characters and cap length on a single string value.
+    Non-strings pass through unchanged. Applied to every string field in
+    every tool result so a corpus string (commit message, PR title, node
+    description) cannot inject control sequences or oversized payloads
+    into the model's context."""
+    if not isinstance(value, str):
+        return value
+    cleaned = "".join(
+        ch for ch in value
+        if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\t")
+    )
+    return cleaned[:_MAX_LABEL_LEN]
+
+def _sanitize_row(row: dict) -> dict:
+    return {k: _sanitize_value(v) for k, v in row.items()}
+
+
+def _resolve_gh_repo(repo_path: str) -> str | None:
+    """Resolve a local repo path to its 'owner/name' GitHub slug via git remote.
+    Returns None if no 'origin' remote exists or parsing fails."""
+    try:
+        repo = git.Repo(repo_path)
+        remote_url = repo.remote("origin").url
+        repo.close()
+        if "github.com" not in remote_url:
+            return None
+        slug = remote_url.rstrip(".git").split("github.com")[-1].lstrip(":/")
+        return slug if "/" in slug else None
+    except Exception:
+        return None
+
+def _gh_pr_list(gh_repo: str, search: str, timeout: int = 10) -> list[dict]:
+    """Shell out to gh CLI to list PRs matching a search term.
+    Returns empty list on any failure (gh missing, not authenticated, timeout)."""
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "list", "--repo", gh_repo, "--json", "number,title,state,url", "--search", search],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            return []
+        return json.loads(result.stdout)
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def _gh_issue_list(gh_repo: str, search: str, timeout: int = 10) -> list[dict]:
+    """Shell out to gh CLI to list issues matching a search term.
+    Returns empty list on any failure."""
+    try:
+        result = subprocess.run(
+            ["gh", "issue", "list", "--repo", gh_repo, "--json", "number,title,state,url", "--search", search],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            return []
+        return json.loads(result.stdout)
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        return []
+
 
 def _envelope(items: list[Any], max_results: int) -> dict[str, Any]:
     """Wrap a list result with count/truncation metadata so callers can see
     the full match count without paying token cost for every row.
+    String values are sanitized (control chars stripped, length capped).
     """
+    sanitized = [_sanitize_row(item) if isinstance(item, dict) else item for item in items]
     return {
-        "count": len(items),
-        "results": items[:max_results],
-        "truncated": len(items) > max_results,
+        "count": len(sanitized),
+        "results": sanitized[:max_results],
+        "truncated": len(sanitized) > max_results,
     }
 
 
@@ -77,30 +165,84 @@ def search_component(
             filter is a no-op.
 
     Returns:
-        Dict with count, results, and truncated flag. Note: count maxes out at 50
-        (the Cypher LIMIT cap) even if more matches exist beyond that.
+        Dict with count, results, and truncated flag. Query is tokenized and
+        stopword-filtered — multi-word natural-language queries match any token,
+        not the whole phrase. Results are ranked: exact name match > name
+        starts-with > name contains > description contains.
     """
     cutoff = None
     if modified_within_commits is not None:
         cutoff = _resolve_recency_cutoff(engine, repo_id, modified_within_commits)
+
+    tokens = _search_tokens(query)
 
     repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
     recency_filter = "AND n.last_modified_at >= $cutoff" if cutoff is not None else ""
     cypher = f"""
     MATCH (n)
     WHERE (n:Service OR n:Module OR n:Class OR n:Function OR n:Endpoint)
-    AND (toLower(n.name) CONTAINS toLower($query) OR toLower(n.description) CONTAINS toLower($query))
+    AND ANY(t IN $tokens WHERE toLower(n.name) CONTAINS t OR toLower(n.description) CONTAINS t)
     {repo_filter}
     {recency_filter}
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
-           n.description as description LIMIT 50
+           n.description as description LIMIT 200
     """
-    params = {"query": query}
+    params = {"tokens": tokens}
     if not cross_repo:
         params["repo_id"] = repo_id
     if cutoff is not None:
         params["cutoff"] = cutoff
 
+    results = engine.run_cypher(cypher, params)
+    results = _rank_search_results(results, tokens)
+    return _envelope(results, max_results)
+
+
+def _rank_search_results(results: list[dict], tokens: list[str]) -> list[dict]:
+    """Sort search_component rows: exact name match first, then name
+    starts-with a token, then name contains a token, then description-only
+    matches last. Stable sort preserves Neo4j's original order within a tier."""
+    def tier(row: dict) -> int:
+        name = (row.get("name") or "").lower()
+        if name in tokens:
+            return 0
+        if any(name.startswith(t) for t in tokens):
+            return 1
+        if any(t in name for t in tokens):
+            return 2
+        return 3
+    return sorted(results, key=tier)
+
+
+def god_nodes(
+    engine: GraphEngine,
+    repo_id: str,
+    cross_repo: bool = False,
+    max_results: int = 10,
+) -> dict[str, Any]:
+    """Return the most-connected nodes in the graph — the core abstractions
+    a new agent should look at first to orient itself in an unfamiliar repo.
+
+    Args:
+        engine: GraphEngine instance
+        repo_id: Repository ID to search within (unless cross_repo=True)
+        cross_repo: If True, search across all repos
+        max_results: Maximum number of results to return
+
+    Returns:
+        Dict with count, results, and truncated flag. Each result has
+        name, labels, repo_id, and degree (number of direct relationships).
+    """
+    repo_filter = "" if cross_repo else "WHERE n.repo_id = $repo_id"
+    cypher = f"""
+    MATCH (n)
+    {repo_filter}
+    WITH n, size((n)--()) as degree
+    RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id, degree
+    ORDER BY degree DESC
+    LIMIT 50
+    """
+    params = {} if cross_repo else {"repo_id": repo_id}
     results = engine.run_cypher(cypher, params)
     return _envelope(results, max_results)
 
@@ -700,7 +842,7 @@ def find_requirements_for(
         params["repo_id"] = repo_id
 
     results = engine.run_cypher(cypher, params)
-    return results
+    return [_sanitize_row(r) for r in results]
 
 
 def trace_design_rationale(
@@ -738,7 +880,7 @@ def trace_design_rationale(
 
     results = engine.run_cypher(cypher, params)
     if results:
-        return results[0]
+        return _sanitize_row(results[0])
     return {"component": component_name, "requirements": [], "notes": []}
 
 
@@ -774,7 +916,7 @@ def blame_component(
         params["repo_id"] = repo_id
 
     results = engine.run_cypher(cypher, params)
-    return results
+    return [_sanitize_row(r) for r in results]
 
 
 def find_related_prs(
@@ -783,8 +925,13 @@ def find_related_prs(
     component_name: str,
     cross_repo: bool = False,
     max_results: int = 15,
+    registry: RepoRegistry | None = None,
 ) -> dict[str, Any]:
     """Find pull requests related to a component via commits that resolved issues touching it.
+
+    When the repo has PR ingestion enabled (pr_source_enabled=True), queries the
+    graph's PullRequest nodes. Otherwise, falls back to the local `gh` CLI
+    (requires `gh` on PATH and authenticated).
 
     Args:
         engine: GraphEngine instance
@@ -792,12 +939,23 @@ def find_related_prs(
         component_name: Name of the Module (file) to find related PRs for
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
+        registry: RepoRegistry, used to resolve repo_id for gh CLI fallback
 
     Returns:
         Dict with count, results, and truncated flag containing PullRequests linked
         (via RESOLVES on an Issue referenced by a commit that touched this component)
         to the component.
     """
+    # Try gh CLI fallback when PR ingestion is not enabled
+    if registry is not None:
+        repo = registry.get(repo_id)
+        if repo is not None and not repo.pr_source_enabled:
+            gh_repo = _resolve_gh_repo(str(repo.path))
+            if gh_repo is not None:
+                results = _gh_pr_list(gh_repo, component_name)
+                return _envelope(results, max_results)
+
+    # Existing Cypher path (for repos with PR ingestion enabled)
     repo_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
     cypher = f"""
     MATCH (m:Module {{name: $component_name}})
@@ -823,8 +981,13 @@ def issue_history_for(
     component_name: str,
     cross_repo: bool = False,
     max_results: int = 15,
+    registry: RepoRegistry | None = None,
 ) -> dict[str, Any]:
     """Find issues referenced by commits that touched a component.
+
+    When the repo has issue ingestion enabled (issue_source_enabled=True), queries
+    the graph's Issue nodes. Otherwise, falls back to the local `gh` CLI
+    (requires `gh` on PATH and authenticated).
 
     Args:
         engine: GraphEngine instance
@@ -832,11 +995,22 @@ def issue_history_for(
         component_name: Name of the Module (file) to find issue history for
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
+        registry: RepoRegistry, used to resolve repo_id for gh CLI fallback
 
     Returns:
         Dict with count, results, and truncated flag containing Issues referenced
         by commits that modified this component.
     """
+    # Try gh CLI fallback when issue ingestion is not enabled
+    if registry is not None:
+        repo = registry.get(repo_id)
+        if repo is not None and not repo.issue_source_enabled:
+            gh_repo = _resolve_gh_repo(str(repo.path))
+            if gh_repo is not None:
+                results = _gh_issue_list(gh_repo, component_name)
+                return _envelope(results, max_results)
+
+    # Existing Cypher path (for repos with issue ingestion enabled)
     repo_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
     cypher = f"""
     MATCH (m:Module {{name: $component_name}})

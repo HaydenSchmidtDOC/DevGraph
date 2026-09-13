@@ -76,6 +76,7 @@ _TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "find_mentions", "identifier_kind": "entity name (mentioned_by) or Document repo-relative path (mentions)", "envelope": True, "phase": 2},
     {"name": "blame_component", "identifier_kind": "file path (not a function name)", "envelope": False, "phase": 3},
     {"name": "find_related_prs", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
+    {"name": "god_nodes", "identifier_kind": None, "envelope": True, "phase": 3},
     {"name": "issue_history_for", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
     {"name": "get_source", "identifier_kind": "function/class name (not a file path)", "envelope": False, "phase": 2},
     {"name": "run_cypher", "identifier_kind": "raw Cypher", "envelope": False, "phase": None, "note": "only registered when enable_run_cypher=true; prefer the purpose-built tools above"},
@@ -121,6 +122,17 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
         return devgraph_tools.search_component(
             engine, repo_id, query, cross_repo, max_results, modified_within_commits
         )
+
+    @server.tool(annotations=_READ_ONLY)
+    def god_nodes(
+        repo_id: str,
+        cross_repo: bool = False,
+        max_results: int = 10,
+    ) -> dict[str, Any]:
+        """Return the most-connected nodes in the graph — the core abstractions
+        a new agent should look at first to orient itself in an unfamiliar repo.
+        Returns {count, results, truncated} with degree (number of direct relationships)."""
+        return devgraph_tools.god_nodes(engine, repo_id, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
     def list_recent_changes(
@@ -252,13 +264,15 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
 
     @server.tool(annotations=_READ_ONLY)
     def find_related_prs(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Find related PRs; returns {count, results, truncated}."""
-        return devgraph_tools.find_related_prs(engine, repo_id, component_name, cross_repo, max_results)
+        """Find related PRs; returns {count, results, truncated}. Falls back to gh CLI
+        when PR ingestion is not configured."""
+        return devgraph_tools.find_related_prs(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
     def issue_history_for(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Find issue history; returns {count, results, truncated}."""
-        return devgraph_tools.issue_history_for(engine, repo_id, component_name, cross_repo, max_results)
+        """Find issue history; returns {count, results, truncated}. Falls back to gh CLI
+        when issue ingestion is not configured."""
+        return devgraph_tools.issue_history_for(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
     def get_source(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:

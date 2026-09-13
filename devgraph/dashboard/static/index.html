@@ -443,6 +443,25 @@ table.dstable input[type="text"] { width: 100%; }
             <input type="range" id="ctlRelCeiling" min="1" max="2000" value="2000" />
           </div>
         </div>
+        <div class="control-section">
+          <h4>Performance</h4>
+          <div class="ctl-field">
+            <label>Render-quality threshold <span class="val" id="valRenderThreshold">1,600</span><span class="qmark" data-tip="Once more than this many nodes are actually on screen (after off-screen culling), the graph drops glow and switches relationship lines to flat/straight to keep panning, zooming and rotation smooth. Defaults to ~2x this repo's registered node count; saved on this device once you change it.">?</span></label>
+            <input type="range" id="ctlRenderThreshold" min="100" max="20000" step="100" value="1600" />
+          </div>
+          <div class="toggle-row">
+            <span class="lbl">Ambient rotation<span class="qmark" data-tip="Slowly spins the graph when idle. Off by default -- when off, nothing rotation-related runs at all, not even a paused loop.">?</span></span>
+            <label class="switch"><input type="checkbox" id="ctlRotationEnabled" /><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="toggle-row">
+            <span class="lbl">Node/edge shadows<span class="qmark" data-tip="Soft drop-shadow on nodes and relationship lines. Costs real canvas paint time (shadow blur isn't free), more so with a lot on screen -- turn off for a flatter look on a large graph.">?</span></span>
+            <label class="switch"><input type="checkbox" id="ctlShadowsEnabled" checked /><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="toggle-row" style="margin-bottom:0">
+            <span class="lbl">Node glow<span class="qmark" data-tip="A constant, faded halo just outside every on-screen node's circle, brightened further on hover or a query match. Drawn on its own overlay canvas; auto-suppressed once on-screen nodes pass the render-quality threshold above, regardless of this setting.">?</span></span>
+            <label class="switch"><input type="checkbox" id="ctlGlowEnabled" checked /><span class="track"></span><span class="thumb"></span></label>
+          </div>
+        </div>
         <div class="control-section" style="padding-bottom:2px">
           <h4>Live behavior</h4>
           <div class="toggle-row">
@@ -823,8 +842,67 @@ function catColorBright(cat) {
    AND type(r)="X") instead of the old exclude-list (AND NOT ... IN [...]).
    Clicking the already-isolated one clears back to the whole graph. Entity
    and relationship isolation are independent of each other. */
-const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000, highlightMode: true };
+const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000, highlightMode: true, renderThreshold: 1600, rotationEnabled: false, shadowsEnabled: true, glowEnabled: true };
+document.getElementById("ctlRotationEnabled").addEventListener("change", e => {
+  state.rotationEnabled = e.target.checked;
+  if (state.rotationEnabled) armRotationLoop();
+  /* Turning it off needs no explicit stop call: rotationTick's own guard
+     (see below) checks state.rotationEnabled on its very next tick and,
+     finding it false, sets rotationLoopArmed = false and returns WITHOUT
+     scheduling another requestAnimationFrame -- so the loop actually ends,
+     it doesn't just idle. */
+});
+document.getElementById("ctlShadowsEnabled").addEventListener("change", e => {
+  state.shadowsEnabled = e.target.checked;
+  cy.style().update(); // shadow-* below are function-valued styles gated on state.shadowsEnabled -- force Cytoscape to re-evaluate them on every element now, not just on the next unrelated restyle
+});
+document.getElementById("ctlGlowEnabled").addEventListener("change", e => {
+  state.glowEnabled = e.target.checked;
+  renderGlow(); // reflect immediately -- a idle graph with rotation off may not fire another "render" event on its own for a while
+});
 document.getElementById("ctlHighlightMode").addEventListener("change", e => { state.highlightMode = e.target.checked; });
+
+/* ── render-quality threshold: the only client-side setting in this file
+   that persists across reloads (localStorage) rather than resetting with
+   the rest of `state` -- it's a device-local performance preference, not
+   graph data, so it shouldn't reset just because the page reloaded or the
+   repo changed. `renderThresholdIsDefault` tracks whether the user has ever
+   touched it: while true, loadTopologyCounts() keeps recomputing "~2x the
+   live registered node count" as the graph's real size becomes known;
+   once the user drags/edits the control, their value sticks (mirrors the
+   nodeCeiling "wasAtCeiling" pattern) and is written to localStorage. */
+const RENDER_THRESHOLD_KEY = "devgraph.renderQualityThreshold";
+let renderThresholdIsDefault = true;
+{
+  const saved = localStorage.getItem(RENDER_THRESHOLD_KEY);
+  if (saved !== null && Number.isFinite(+saved) && +saved > 0) {
+    state.renderThreshold = +saved;
+    renderThresholdIsDefault = false;
+  }
+}
+function setRenderThresholdDefault(registeredNodeTotal) {
+  if (!renderThresholdIsDefault || !registeredNodeTotal) return;
+  state.renderThreshold = Math.max(100, Math.round((registeredNodeTotal * 2) / 100) * 100);
+  const input = document.getElementById("ctlRenderThreshold");
+  if (input) {
+    if (state.renderThreshold > +input.max) input.max = state.renderThreshold;
+    input.value = state.renderThreshold;
+    document.getElementById("valRenderThreshold").textContent = state.renderThreshold.toLocaleString();
+  }
+  updateHeavyMode();
+}
+document.getElementById("ctlRenderThreshold").addEventListener("input", e => {
+  const v = +e.target.value;
+  if (!Number.isFinite(v) || v <= 0) return;
+  state.renderThreshold = v;
+  renderThresholdIsDefault = false;
+  localStorage.setItem(RENDER_THRESHOLD_KEY, String(v));
+  document.getElementById("valRenderThreshold").textContent = v.toLocaleString();
+  updateHeavyMode();
+});
+
+document.getElementById("valRenderThreshold").textContent = state.renderThreshold.toLocaleString();
+document.getElementById("ctlRenderThreshold").value = state.renderThreshold;
 
 const entityCounts = document.getElementById("entityCounts");
 let entityTotal = 0;
@@ -928,19 +1006,36 @@ const cy = cytoscape({
         "color": "#8a8f98", "font-size": 7.5, "font-family": "var(--font-mono)",
         "text-valign": "center", "text-halign": "right", "text-margin-x": 8, "text-opacity": 0.55,
         "text-outline-color": "#08090a", "text-outline-width": 1.5, "text-outline-opacity": 0.7,
-        "width": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? 15 : 9, "height": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? 15 : 9, "border-width": 0,
-        /* no default glow: shadow tracks a per-node "glow" data value (0 by default,
-           animated toward 1 on a query match) — this is what makes deglow/glow smooth */
-        "shadow-blur": ele => 4 + (ele.data("glow")||0) * 16, "shadow-color": ele => catColor(ele.data("cat")), "shadow-opacity": ele => (ele.data("glow")||0) * 0.9, "shadow-offset-x": 0, "shadow-offset-y": 0 } },
+        "width": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? 15 : 9, "height": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? 15 : 9,
+        /* Glow (query match / hover bloom) is drawn separately on glowCanvas
+           via renderGlow() below -- it never used this node's own canvas
+           shadow. Cytoscape shadow-blur is real per-node paint cost (shadow
+           blur isn't free), which is why it's user-toggleable (default on)
+           rather than always-on -- shadow-blur is forced to 0 when off, not
+           just shadow-opacity, since blur is what actually triggers the
+           expensive convolution regardless of opacity. Toggling calls
+           cy.style().update() (see the ctlShadowsEnabled listener) to force
+           these function values to re-evaluate. */
+        "shadow-blur": ele => state.shadowsEnabled ? 4 + (ele.data("glow")||0) * 16 : 0,
+        "shadow-color": ele => catColor(ele.data("cat")),
+        "shadow-opacity": ele => state.shadowsEnabled ? (ele.data("glow")||0) * 0.9 : 0,
+        "shadow-offset-x": 0, "shadow-offset-y": 0,
+        /* A thin border in the exact canvas background color (#08090a,
+           same constant as text-outline-color above) helps separate
+           adjacent same-color nodes in a tight cluster independently of
+           the shadow toggle above: it reads as a gap rather than a ring,
+           for the flat cost of a stroke() call -- no blur convolution. */
+        "border-width": 1, "border-color": "#08090a", "border-opacity": 0.1,
+        } },
     { selector: "node.show-label", style: { "label": "data(label)" } },
     { selector: "node[cat='repo']", style: { "shape":"round-hexagon" } },
     { selector: "node[cat='service']", style: { "shape":"round-diamond" } },
     { selector: "node[id='svc:neo4j']", style: { "text-halign": "left", "text-margin-x": -8 } },
-    { selector: "node.excluded", style: { "background-opacity": 0, "border-width": 1.3, "border-color": ele => catColor(ele.data("cat")), "border-opacity": 0.9, "opacity": 0.45, "shadow-opacity": 0 } },
+    { selector: "node.excluded", style: { "background-opacity": 0, "border-width": 1.3, "border-color": ele => catColor(ele.data("cat")), "border-opacity": 0.9, "opacity": 0.45 } },
     /* beyond-the-ceiling elements aren't dimmed context like .excluded -- they
        shouldn't cost draw time every frame at all. display:none pulls them out
        of cytoscape's paint pass entirely instead of just fading them. */
-    { selector: "node.culled, edge.culled", style: { "display": "none" } },
+    { selector: "node.culled, edge.culled, node.offscreen, edge.offscreen", style: { "display": "none" } },
     { selector: "edge", style: {
         "width": 1,
         "line-fill": "linear-gradient",
@@ -949,18 +1044,30 @@ const cy = cytoscape({
         "curve-style": "unbundled-bezier", "control-point-distances": [16], "control-point-weights": [0.5],
         "target-arrow-shape": "triangle", "target-arrow-color": ele => catColor(ele.target().data("cat")), "arrow-scale": 0.55,
         "opacity": ele => 0.35 + (ele.data("glow")||0) * 0.55,
-        "shadow-blur": ele => (ele.data("glow")||0) * 16, "shadow-color": ele => catColor(ele.source().data("cat")), "shadow-opacity": ele => (ele.data("glow")||0) * 0.85, "shadow-offset-x": 0, "shadow-offset-y": 0,
+        "shadow-blur": ele => state.shadowsEnabled ? (ele.data("glow")||0) * 16 : 0,
+        "shadow-color": ele => catColor(ele.source().data("cat")),
+        "shadow-opacity": ele => state.shadowsEnabled ? (ele.data("glow")||0) * 0.85 : 0,
+        "shadow-offset-x": 0, "shadow-offset-y": 0,
     } },
-    { selector: "edge.excluded", style: { "line-fill": "solid", "line-color": "var(--meta)", "line-style": "dashed", "opacity": 0.25, "shadow-opacity": 0, "target-arrow-color": "var(--meta)" } },
+    { selector: "edge.excluded", style: { "line-fill": "solid", "line-color": "var(--meta)", "line-style": "dashed", "opacity": 0.25, "target-arrow-color": "var(--meta)" } },
+    /* heavy-mode: engaged only once the on-screen node count (post-culling)
+       crosses the user's render-quality threshold -- see updateHeavyMode().
+       Drops the per-edge gradient + bezier control points for a flat color
+       and a straight line, the two most expensive things left in an edge's
+       draw call once shadows are gone. */
+    { selector: "edge.heavy-mode", style: {
+        "line-fill": "solid", "line-color": ele => catColor(ele.target().data("cat")),
+        "curve-style": "straight",
+    } },
     { selector: ".faded", style: { "opacity": 0.07 } },
     { selector: "node.highlighted", style: { "border-width": 1.5, "border-color": "#7170ff", "border-opacity": 0.9, "z-index": 10 } },
     { selector: "node.hover-hl", style: {
         "background-color": ele => catColorBright(ele.data("cat")),
         "color": "#ffffff", "text-opacity": 1, "text-outline-opacity": 0.9,
-        "shadow-blur": 20, "shadow-color": ele => catColor(ele.data("cat")), "shadow-opacity": 1, "shadow-offset-x": 0, "shadow-offset-y": 0,
+        "shadow-blur": ele => state.shadowsEnabled ? 20 : 0, "shadow-color": ele => catColor(ele.data("cat")), "shadow-opacity": ele => state.shadowsEnabled ? 1 : 0,
         "z-index": 20,
     } },
-    { selector: "edge.hover-hl", style: { "width": 2.2, "opacity": 1, "shadow-blur": 30, "shadow-opacity": 1, "z-index": 15 } },
+    { selector: "edge.hover-hl", style: { "width": 2.2, "opacity": 1, "shadow-blur": ele => state.shadowsEnabled ? 30 : 0, "shadow-opacity": ele => state.shadowsEnabled ? 1 : 0, "z-index": 15 } },
   ],
   layout: { name: "random" },
   minZoom: 0.2, maxZoom: 3,
@@ -983,6 +1090,79 @@ function updateRenderQuality() {
   const heavy = cy.nodes().length > RENDER_QUALITY_NODE_THRESHOLD;
   const renderer = cy.renderer();
   if (renderer) { renderer.hideEdgesOnViewport = heavy; renderer.textureOnViewport = heavy; }
+}
+
+/* ── viewport culling ────────────────────────────────────────────────────
+   Cytoscape draws every non-culled, non-excluded element every repaint
+   regardless of whether it's actually inside the visible viewport -- a
+   graph loaded at 5000 nodes pays full paint cost for those 5000 nodes
+   even zoomed into a cluster of 20. This is the actual size-scaling
+   bottleneck behind both the zoom slowdown and the rotation stutter: every
+   rotation tick and every zoom-animation frame repaints the *whole* graph,
+   on-screen or not.
+
+   .offscreen (display:none, same "skip the paint pass entirely" mechanism
+   as .culled -- see the stylesheet) is kept in sync with the real viewport
+   here. A node is offscreen when it's outside the current extent plus a
+   margin (so a node near the edge doesn't pop in/out on every micro-pan);
+   an edge is offscreen only when BOTH endpoints are, so a relationship
+   crossing into view stays visible as long as either end is near/in frame.
+
+   Called wherever positions or the viewport can change: pan/zoom (debounced
+   -- see scheduleViewportCulling below), every rotation tick, every settle
+   animation frame, and after the graph is rebuilt/diffed. Returns the
+   resulting on-screen node count, which updateHeavyMode() below uses as the
+   "actually rendered" figure the user asked the render-quality threshold to
+   be judged against -- not the total loaded count. */
+const VIEWPORT_CULL_MARGIN_FRAC = 0.2;
+let lastOnscreenNodeCount = 0;
+/* Cache of the actual on-screen node elements (not just a count), rebuilt
+   every full culling pass -- rotationTick's per-frame path (see below)
+   iterates this directly instead of re-deriving it from Cytoscape each
+   frame, so the smooth path only ever touches what's actually visible. */
+let cachedOnscreenNodes = [];
+function updateViewportCulling(marginFrac) {
+  const nodes = cy.nodes();
+  if (!nodes.length) { lastOnscreenNodeCount = 0; cachedOnscreenNodes = []; updateHeavyMode(); return 0; }
+  const ext = cy.extent();
+  const frac = marginFrac ?? VIEWPORT_CULL_MARGIN_FRAC;
+  const marginX = ext.w * frac, marginY = ext.h * frac;
+  const x1 = ext.x1 - marginX, x2 = ext.x2 + marginX, y1 = ext.y1 - marginY, y2 = ext.y2 + marginY;
+  const offscreenIds = new Set();
+  const onscreenNodes = [];
+  cy.batch(() => {
+    nodes.forEach(n => {
+      const p = n.position();
+      const offscreen = p.x < x1 || p.x > x2 || p.y < y1 || p.y > y2;
+      if (offscreen) offscreenIds.add(n.id()); else onscreenNodes.push(n);
+      n.toggleClass("offscreen", offscreen);
+    });
+    cy.edges().forEach(e => {
+      e.toggleClass("offscreen", offscreenIds.has(e.source().id()) && offscreenIds.has(e.target().id()));
+    });
+  });
+  cachedOnscreenNodes = onscreenNodes;
+  lastOnscreenNodeCount = onscreenNodes.length;
+  updateHeavyMode();
+  return onscreenNodes.length;
+}
+
+/* ── heavy-mode: gated on the live on-screen count updateViewportCulling
+   maintains above (not total graph size) against the user-settable
+   state.renderThreshold -- reads the cached count rather than taking one as
+   an argument so a pure threshold-value change (no position/viewport change)
+   can re-evaluate it without re-running the O(n) culling pass. Toggling the
+   class on the whole element set is itself an O(n) pass, same order as
+   culling, but only actually runs on the rare tick the heavy/not-heavy state
+   flips -- everywhere else it's a no-op guard. Glow suppression is handled
+   separately inside renderGlow() so hover/query-match bookkeeping keeps
+   working underneath. */
+let graphHeavyMode = false;
+function updateHeavyMode() {
+  const heavy = lastOnscreenNodeCount > state.renderThreshold;
+  if (heavy === graphHeavyMode) return;
+  graphHeavyMode = heavy;
+  cy.batch(() => cy.elements().toggleClass("heavy-mode", heavy));
 }
 cy.one("layoutstop", () => forceDirectedSettle(() => focusRotation(null, 60, 1000)));
 cy.on("mouseover", "node", e => { e.target.addClass("show-label hover-hl"); setNodeGlowActive(e.target.id(), true); });
@@ -1193,10 +1373,25 @@ function quadRepulsion(node, id, p, idealLength2, out) {
    nothing left to do after settle, not just "we happened to stop calling
    forceDirectedSettle." */
 let graphSettled = false;
+/* True for the whole duration of a settle run. Rotation can already be
+   armed and running when a new settle starts -- the graph was sitting there
+   rotating and a query/isolate/reindex change just triggered a re-settle --
+   and rotationTick writes node positions from its own snapshot every frame,
+   completely independently of this function's physics loop. Without this
+   guard the two fight over the same positions every frame: the settle's
+   physics result gets immediately clobbered by a rotation write computed
+   from a stale, unrelated base, and vice versa, which is both visibly janky
+   and doubles the per-frame position-write/repaint cost. rotationTick checks
+   this and skips its own write while true; the settle's own onDone always
+   calls focusRotation() afterward (every call site does), which re-captures
+   a fresh base and re-arms rotation correctly once the real layout is
+   final -- so simply pausing here needs no separate resume logic. */
+let graphSettling = false;
 function forceDirectedSettle(onDone, mode) {
   const nodes = cy.nodes();
   const ids = nodes.map(n => n.id());
   if (!ids.length) { onDone && onDone(); return; }
+  graphSettling = true;
   const rect = cy.container().getBoundingClientRect();
   const area = Math.max((rect.width || 900) * (rect.height || 600), 300000);
   const idealLength = Math.sqrt(area / ids.length) * 0.5;
@@ -1295,13 +1490,14 @@ function forceDirectedSettle(onDone, mode) {
     let avgDisp = convergeThreshold + 1; // stays above threshold if the loop below never runs a step
     for (let i = 0; i < 3 && iter < COOLING_STEPS; i++) avgDisp = step();
     cy.batch(() => { ids.forEach(id => { const ele = cy.getElementById(id); if (ele.length) ele.position(positions.get(id)); }); });
+    updateViewportCulling();
     if (iter < COOLING_STEPS && avgDisp > convergeThreshold) requestAnimationFrame(frame);
     /* Persisting here rather than in any particular caller's onDone: this is
        the single point every settle path converges on -- the boot layoutstop
        hook, a structural reload through mergeGraphElements, and the layout
        selector all end up here -- and a settled graph is exactly the state
        worth remembering. Debounced inside saveCachedLayout. */
-    else { graphSettled = true; saveCachedLayout(); onDone && onDone(); }
+    else { graphSettled = true; graphSettling = false; saveCachedLayout(); onDone && onDone(); }
   }
   requestAnimationFrame(frame);
 }
@@ -1421,6 +1617,7 @@ function mergeGraphElements(elements, mode, opts) {
      it; a pure removal leaves whatever settled state already held. */
   if (!toAdd.length) {
     updateRenderQuality();
+    updateViewportCulling();
     return true;
   }
   graphSettled = false;
@@ -1471,6 +1668,7 @@ function mergeGraphElements(elements, mode, opts) {
   newEdgeEls.forEach(el => cy.getElementById(el.data.id).data("glow", 0));
 
   updateRenderQuality();
+  updateViewportCulling();
   if (settle) {
     /* Every new node came back with a cached position, so the layout on
        screen is already the settled one -- running the solver over it would
@@ -1517,12 +1715,37 @@ function syncGrid() {
   graphStage.style.backgroundPosition = `${p.x}px ${p.y}px`;
 }
 cy.on("pan zoom", syncGrid); syncGrid();
+/* Culling itself used to run synchronously on every "pan zoom" event -- for
+   an animated zoom (cy.animate fires one per frame) that's an O(n) culling
+   pass stacked on top of the zoom animation's own repaint, every frame, for
+   the whole 150ms+ duration -- exactly when the graph is already busiest.
+   Debounced instead: the real recompute only runs once events go quiet
+   (zoom/pan has actually stopped), so the animation itself pays nothing
+   extra. zoomBy() below covers the resulting staleness during the
+   transition with a one-off, generously-margined cull computed up front. */
+const CULL_DEBOUNCE_MS = 150;
+let cullDebounceTimer = null;
+function scheduleViewportCulling() {
+  if (cullDebounceTimer) clearTimeout(cullDebounceTimer);
+  cullDebounceTimer = setTimeout(() => { cullDebounceTimer = null; updateViewportCulling(); }, CULL_DEBOUNCE_MS);
+}
+cy.on("pan zoom", scheduleViewportCulling); updateViewportCulling();
 
 /* ── manual zoom controls — scroll-to-zoom is deliberately off (see cy init),
    these two buttons are the only way to zoom now, centered on the viewport. */
+/* Margin used for the one immediate, pre-animation cull below -- sized to
+   comfortably cover a single zoomBy() step (1.35x) in either direction, so
+   nothing that will end up on screen after the animation is hidden partway
+   through it, and nothing about to leave view pops out mid-transition.
+   Bigger than the steady-state VIEWPORT_CULL_MARGIN_FRAC on purpose: this
+   one has to hold for the whole animation, not just settle noise. The
+   debounced scheduleViewportCulling() above tightens it back to the normal
+   margin once the animation actually stops. */
+const ZOOM_TRANSIT_CULL_MARGIN_FRAC = 0.4;
 function zoomBy(factor) {
   const rect = cy.container().getBoundingClientRect();
   const level = Math.min(cy.maxZoom(), Math.max(cy.minZoom(), cy.zoom() * factor));
+  updateViewportCulling(ZOOM_TRANSIT_CULL_MARGIN_FRAC);
   cy.animate({ zoom: { level, renderedPosition: { x: rect.width/2, y: rect.height/2 } } }, { duration: 150 });
 }
 document.getElementById("btnZoomIn").addEventListener("click", () => zoomBy(1.35));
@@ -1559,7 +1782,11 @@ document.getElementById("btnZoomOut").addEventListener("click", () => zoomBy(1/1
    drag, only runs while rotation can actually do something (a pivot exists
    and there are nodes), and stops entirely while the tab is hidden. */
 let rotationPivot = null;
+let rotationBasePositions = new Map(); // node id -> position at the moment the current pivot was set
+let rotationAngle = 0; // radians turned since rotationBasePositions was captured
 let userInteracting = false, lastRotationTime = performance.now();
+const ROTATION_CULL_INTERVAL_MS = 250; /* how often rotation re-checks on/off-screen membership -- see rotationTick */
+let lastRotationCullTime = 0;
 let rotationLoopArmed = false;
 cy.on("tapstart", () => { userInteracting = true; });
 cy.on("tapend", () => { userInteracting = false; lastRotationTime = performance.now(); armRotationLoop(); });
@@ -1588,41 +1815,70 @@ function focusRotation(nodesColl, margin, duration) {
   const circle = boundingCircle(targets);
   if (!circle) { rotationPivot = null; return; }
   rotationPivot = { x: circle.cx, y: circle.cy };
+  /* Absolute-angle rotation model: every node's position is derived fresh
+     each tick from its position right now (the base) plus the total angle
+     turned since this pivot was set, rather than compounding small
+     relative rotations onto whatever the last tick left behind. That's
+     what lets rotationTick below update only the on-screen subset most
+     frames (recomputing from a stale base would drift) while still
+     catching every node up to the exact correct angle on the periodic full
+     pass -- see rotationTick. */
+  rotationBasePositions = new Map();
+  cy.nodes().forEach(n => { const p = n.position(); rotationBasePositions.set(n.id(), { x: p.x, y: p.y }); });
+  rotationAngle = 0;
+  lastRotationTime = performance.now(); // don't let time paused/spent settling count as elapsed rotation
+  lastRotationCullTime = 0; // force a full pass (and a fresh on-screen cache) on the very next tick
   fitToCircle(circle.cx, circle.cy, circle.radius + margin, duration);
   armRotationLoop();
 }
 const ROTATION_DEG_PER_SEC = 0.3; /* ~20 minutes per revolution — meant to be almost imperceptible */
-/* One position rewrite (and so one canvas repaint) every this many ms rather
-   than one per animation frame. At ROTATION_DEG_PER_SEC a tick turns the
-   graph 0.075°. fitToCircle always frames the pivot's radius to the
-   viewport, so no node is ever further from the pivot on screen than half
-   the viewport's smaller side — roughly 540px on a 1080p display, where
-   0.075° works out to about 0.7px. The largest step any node can take is
-   therefore under a pixel, while there are ~15x fewer repaints than a
-   per-frame rotation. Still driven by
-   requestAnimationFrame rather than an interval so it inherits the
-   browser's own pause when the tab is backgrounded and stays aligned to a
-   real frame when it does move; the frames in between cost one timestamp
-   comparison. */
-const ROTATION_TICK_MS = 250;
+/* Position rewrite (and so canvas repaint) runs every animation frame, not
+   throttled to a fixed tick -- a fixed tick banks up rotation and applies
+   it in one visible jump once the tick lands. But rewriting EVERY loaded
+   node's position every frame is an O(total graph size) JS loop -- on a
+   large graph that alone can blow the 16ms frame budget well before any
+   canvas paint even starts, which is what was still making rotation
+   jittery: the per-frame work scaled with total nodes, not with what's
+   actually visible.
+   Fixed by splitting the work into two passes against a single absolute
+   rotationAngle (see focusRotation, which resets it and captures each
+   node's base position whenever the pivot changes):
+     - most frames: recompute + repaint only cachedOnscreenNodes (the
+       culling pass's own on-screen list, already O(visible) and already
+       being maintained) -- this is the frame that has to be fast, and now
+       its cost tracks what's on screen, not the graph's total size.
+     - every ROTATION_CULL_INTERVAL_MS: recompute ALL nodes (so off-screen
+       ones stay correctly positioned for whenever they come back into
+       view) and re-run updateViewportCulling to refresh cachedOnscreenNodes
+       -- this is the one O(total) pass, same cadence as before, unchanged.
+   Positions are always derived from the fixed base + the total angle
+   turned (not compounded frame-to-frame), so alternating between the two
+   passes never drifts or double-applies rotation. */
 function rotationTick(now) {
+  if (!state.rotationEnabled) { rotationLoopArmed = false; return; } /* A1: off means off -- no further requestAnimationFrame, the loop actually ends here rather than idling */
   if (document.hidden) { rotationLoopArmed = false; return; } /* A3: stop entirely while backgrounded, resume via visibilitychange */
   if (!rotationPivot || !cy.nodes().length) { rotationLoopArmed = false; return; } /* A2: nothing to do, idle instead of spinning the rAF loop forever */
   const elapsed = now - lastRotationTime;
   /* userInteracting also resets lastRotationTime on tapend, so a drag never
-     banks up rotation to apply in one jump when it ends. */
-  if (!userInteracting && elapsed >= ROTATION_TICK_MS) {
+     banks up rotation to apply in one jump when it ends. graphSettling
+     pauses the same way while a settle's own physics loop owns positions --
+     see forceDirectedSettle. */
+  if (!userInteracting && !graphSettling) {
     lastRotationTime = now;
-    const angle = ROTATION_DEG_PER_SEC * Math.min(1, elapsed / 1000) * Math.PI / 180;
-    const cosA = Math.cos(angle), sinA = Math.sin(angle);
+    rotationAngle += ROTATION_DEG_PER_SEC * Math.min(1, elapsed / 1000) * Math.PI / 180;
+    const cosA = Math.cos(rotationAngle), sinA = Math.sin(rotationAngle);
     const { x: px, y: py } = rotationPivot;
+    const doFullPass = now - lastRotationCullTime >= ROTATION_CULL_INTERVAL_MS;
+    const targets = doFullPass ? cy.nodes() : cachedOnscreenNodes;
     cy.batch(() => {
-      cy.nodes().forEach(n => {
-        const p = n.position();
-        const dx = p.x - px, dy = p.y - py;
+      targets.forEach(n => {
+        const base = rotationBasePositions.get(n.id());
+        if (!base) return; // a node added after this pivot was set -- picked up on the next focusRotation()
+        const dx = base.x - px, dy = base.y - py;
         n.position({ x: px + dx * cosA - dy * sinA, y: py + dx * sinA + dy * cosA });
       });
     });
+    if (doFullPass) { lastRotationCullTime = now; updateViewportCulling(); }
   }
   requestAnimationFrame(rotationTick);
 }
@@ -1630,7 +1886,7 @@ function rotationTick(now) {
    precondition might have just become true (focusRotation, tapend, tab
    becoming visible again); a no-op if it's already running. */
 function armRotationLoop() {
-  if (rotationLoopArmed || document.hidden || !rotationPivot || !cy.nodes().length) return;
+  if (!state.rotationEnabled || rotationLoopArmed || document.hidden || !rotationPivot || !cy.nodes().length) return;
   rotationLoopArmed = true;
   lastRotationTime = performance.now();
   requestAnimationFrame(rotationTick);
@@ -1638,11 +1894,16 @@ function armRotationLoop() {
 document.addEventListener("visibilitychange", () => { if (!document.hidden) armRotationLoop(); });
 
 /* ── glow layer: additive-blend radial gradients drawn behind cytoscape's own
-   canvas, synced to real node screen positions. Only nodes with glow intensity
-   (query match, or hover) actually draw a bloom — everything else stays flat.
-   activeGlowIds tracks just those nodes so this handler (which "render" fires
-   every frame, including every ambient-rotation tick) doesn't have to scan
-   the whole node set — mostly empty — 60 times a second. */
+   canvas, synced to real node screen positions. Two intensities share one
+   draw pass: AMBIENT_GLOW_INTENSITY is a constant, low, faded halo drawn
+   outside every on-screen node's circle at all times (this is the effect
+   ctlGlowEnabled turns fully off); a per-node "glow" data value (animated
+   toward 1 on a query match) or the hover-hl class boost a specific node's
+   intensity above that floor for its bloom. Iterates cachedOnscreenNodes
+   (the same on-screen list viewport culling already maintains) rather than
+   the whole node set, so cost tracks what's visible, not total graph size --
+   this handler runs on every "render" event, including every rotation tick. */
+const AMBIENT_GLOW_INTENSITY = 0.12;
 const glowCanvas = document.getElementById("glowCanvas");
 const glowCtx = glowCanvas.getContext("2d");
 function hexToRgb(hex) { const n = parseInt(hex.slice(1),16); return [(n>>16)&255,(n>>8)&255,n&255]; }
@@ -1652,7 +1913,11 @@ let glowCanvasHadContent = false;
 let glowCanvasRectW = 0, glowCanvasRectH = 0, glowCanvasDpr = 0;
 function renderGlow() {
   const rect = cy.container().getBoundingClientRect();
-  if (activeGlowIds.size === 0) {
+  /* Heavy-mode suppresses the glow paint step only -- setNodeGlowActive/
+     animateGlowTo above keep tracking hover/query-match state normally, so
+     glow picks back up correctly the moment the on-screen count drops back
+     under the threshold (or the user re-enables it via ctlGlowEnabled). */
+  if (!cachedOnscreenNodes.length || graphHeavyMode || !state.glowEnabled) {
     if (glowCanvasHadContent) { glowCtx.clearRect(0, 0, rect.width, rect.height); glowCanvasHadContent = false; }
     return;
   }
@@ -1668,12 +1933,10 @@ function renderGlow() {
   }
   glowCtx.clearRect(0, 0, rect.width, rect.height);
   glowCtx.globalCompositeOperation = "lighter";
-  activeGlowIds.forEach(id => {
-    const n = cy.getElementById(id);
-    if (!n || n.empty() || n.hasClass("excluded") || n.style("display") === "none") return;
+  cachedOnscreenNodes.forEach(n => {
+    if (n.hasClass("excluded") || n.hasClass("culled")) return;
     const hovered = n.hasClass("hover-hl");
-    const intensity = Math.max(n.data("glow")||0, hovered ? 1 : 0);
-    if (intensity <= 0.02) return;
+    const intensity = Math.max(AMBIENT_GLOW_INTENSITY, n.data("glow")||0, hovered ? 1 : 0);
     const [r,g,b] = hexToRgb(catColor(n.data("cat")));
     const p = n.renderedPosition();
     const baseR = (STRUCTURAL_CATS.has(n.data("cat")) ? 26 : 18) * cy.zoom();
@@ -2847,6 +3110,7 @@ async function loadTopologyCounts() {
          filter can actually return, not an unrelated repo-wide figure. */
       const realTotal = Object.values(counts).reduce((a, b) => a + b, 0);
       document.getElementById("entityTotal").textContent = realTotal.toLocaleString();
+      setRenderThresholdDefault(realTotal);
       const nodeSlider = document.getElementById("ctlNodeCeiling");
       const wasAtCeiling = +nodeSlider.value >= +nodeSlider.max;
       nodeSlider.max = realTotal;

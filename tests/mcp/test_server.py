@@ -40,15 +40,15 @@ def seeded_graph(engine):
 
 
 class TestServerBuild:
-    def test_all_20_tools_registered(self, engine):
+    def test_all_21_tools_registered(self, engine):
         server = build_server(engine)
         import asyncio
 
         tools = asyncio.run(server.list_tools())
         names = {t.name for t in tools}
 
-        assert len(tools) == 20
-        # spot check across all three phases plus Implementation Plan #3/6's new tools
+        assert len(tools) == 21
+        # spot check across all three phases plus Implementation Plan #3/6/10's new tools
         assert "search_component" in names
         assert "explain_decision" in names
         assert "blame_component" in names
@@ -56,6 +56,7 @@ class TestServerBuild:
         assert "get_source" in names
         assert "find_mentions" in names
         assert "list_recent_changes" in names
+        assert "god_nodes" in names
 
     def test_run_cypher_not_registered_by_default(self, engine):
         server = build_server(engine)
