@@ -53,6 +53,19 @@ code { font-family: var(--font-mono); }
 .icon-btn { display: grid; place-items: center; width: 32px; height: 32px; border-radius: var(--radius-sm); background: rgba(255,255,255,0.02); border: 1px solid var(--border); color: var(--fg-2); flex-shrink: 0; transition: background var(--motion-fast), color var(--motion-fast), border-color var(--motion-fast); }
 .icon-btn:hover { background: color-mix(in oklab, var(--accent), transparent 88%); color: var(--accent-hover); border-color: color-mix(in oklab, var(--accent), transparent 60%); }
 .icon-btn svg { width: 16px; height: 16px; }
+/* Sits over the graph canvas, not the card below it -- a zero-height wrapper
+   right before the cypher card in the same flex column, so the button
+   (absolutely positioned out of flow) lands just above-left of that card's
+   corner and scrolls with it, without adding any layout gap of its own.
+   Kept dim until hovered -- this is a re-run/re-settle shortcut, not a
+   primary control, and shouldn't compete with the graph behind it. */
+.graph-reload-wrap { position: relative; height: 0; }
+.graph-reload-btn { position: absolute; left: 0; bottom: 8px; opacity: 0.55; }
+.graph-reload-btn:hover { opacity: 1; }
+/* Green = the physics have actually stopped (graphSettled), not just "no
+   settle currently running" -- toggled by setGraphSettled(), the only place
+   that flag ever changes, so this can't drift out of sync with it. */
+.graph-reload-btn.settled { color: var(--success); border-color: color-mix(in oklab, var(--success), transparent 60%); }
 .brand { display: flex; align-items: baseline; gap: 9px; font-weight: 590; font-size: 15px; letter-spacing: -0.01em; white-space: nowrap; }
 .brand .mark { width: 20px; height: 20px; border-radius: 5px; background: var(--accent); display: inline-grid; place-items: center; color: var(--accent-on); font-family: var(--font-mono); font-size: 11px; font-weight: 700; align-self: center; }
 .brand .ver { font-family: var(--font-mono); font-size: 10px; font-weight: 400; color: var(--meta); }
@@ -472,6 +485,10 @@ table.dstable input[type="text"] { width: 100%; }
             <span class="lbl">Highlight query matches only<span class="qmark" data-tip="On: the query never adds or removes nodes/relationships from the canvas or re-settles the layout — it only dims whatever the current query doesn't match. Off: the graph is rebuilt to exactly match each query's results (may add, remove, and re-settle).">?</span></span>
             <label class="switch"><input type="checkbox" id="ctlHighlightMode" checked /><span class="track"></span><span class="thumb"></span></label>
           </div>
+          <div class="toggle-row" style="margin-bottom:0">
+            <span class="lbl">Settle on addition/subtraction<span class="qmark" data-tip="Re-runs the force-directed settle whenever a node or relationship is actually added or removed from the canvas — not on updates that touch the same node/relationship count.">?</span></span>
+            <label class="switch"><input type="checkbox" id="ctlSettleOnChange" checked /><span class="track"></span><span class="thumb"></span></label>
+          </div>
         </div>
       </div>
       <div class="pull-tab" id="pullTab" title="Display controls"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></div>
@@ -507,6 +524,9 @@ table.dstable input[type="text"] { width: 100%; }
 <main class="page">
   <div class="below-layout" data-od-id="view-graph">
     <div class="canvas-col">
+      <div class="graph-reload-wrap">
+        <button class="icon-btn graph-reload-btn" id="btnGraphReload" title="Re-settle the graph from its current layout" data-od-id="graph-reload-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button>
+      </div>
       <div class="card" data-od-id="cypher-card">
         <div class="card-head"><h3>Cypher query</h3></div>
         <div class="cypher-wrap">
@@ -842,7 +862,7 @@ function catColorBright(cat) {
    AND type(r)="X") instead of the old exclude-list (AND NOT ... IN [...]).
    Clicking the already-isolated one clears back to the whole graph. Entity
    and relationship isolation are independent of each other. */
-const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000, highlightMode: true, renderThreshold: 1600, rotationEnabled: false, shadowsEnabled: true, glowEnabled: true };
+const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000, highlightMode: true, renderThreshold: 1600, rotationEnabled: false, shadowsEnabled: true, glowEnabled: true, settleOnChange: true };
 document.getElementById("ctlRotationEnabled").addEventListener("change", e => {
   state.rotationEnabled = e.target.checked;
   if (state.rotationEnabled) armRotationLoop();
@@ -861,6 +881,7 @@ document.getElementById("ctlGlowEnabled").addEventListener("change", e => {
   renderGlow(); // reflect immediately -- a idle graph with rotation off may not fire another "render" event on its own for a while
 });
 document.getElementById("ctlHighlightMode").addEventListener("change", e => { state.highlightMode = e.target.checked; });
+document.getElementById("ctlSettleOnChange").addEventListener("change", e => { state.settleOnChange = e.target.checked; });
 
 /* ── render-quality threshold: the only client-side setting in this file
    that persists across reloads (localStorage) rather than resetting with
@@ -872,6 +893,7 @@ document.getElementById("ctlHighlightMode").addEventListener("change", e => { st
    once the user drags/edits the control, their value sticks (mirrors the
    nodeCeiling "wasAtCeiling" pattern) and is written to localStorage. */
 const RENDER_THRESHOLD_KEY = "devgraph.renderQualityThreshold";
+const SELECTED_REPO_KEY = "devgraph.selectedRepo";
 let renderThresholdIsDefault = true;
 {
   const saved = localStorage.getItem(RENDER_THRESHOLD_KEY);
@@ -1371,8 +1393,14 @@ function quadRepulsion(node, id, p, idealLength2, out) {
    until mergeGraphElements next changes the element set -- a static graph
    with a settled flag is how the render-optimisation work above knows there's
    nothing left to do after settle, not just "we happened to stop calling
-   forceDirectedSettle." */
+   forceDirectedSettle." Always set through setGraphSettled() rather than
+   assigned directly, so the reload button's "settled" indicator (see below)
+   never drifts out of sync with the flag it's supposed to reflect. */
 let graphSettled = false;
+function setGraphSettled(v) {
+  graphSettled = v;
+  document.getElementById("btnGraphReload")?.classList.toggle("settled", v);
+}
 /* True for the whole duration of a settle run. Rotation can already be
    armed and running when a new settle starts -- the graph was sitting there
    rotating and a query/isolate/reindex change just triggered a re-settle --
@@ -1392,6 +1420,11 @@ function forceDirectedSettle(onDone, mode) {
   const ids = nodes.map(n => n.id());
   if (!ids.length) { onDone && onDone(); return; }
   graphSettling = true;
+  // Every call site is about to actually move nodes -- flip the indicator
+  // here once, rather than relying on each of the several call sites (layout
+  // switch, the demo fallback, every mergeGraphElements path) to remember to
+  // do it themselves before calling in.
+  setGraphSettled(false);
   const rect = cy.container().getBoundingClientRect();
   const area = Math.max((rect.width || 900) * (rect.height || 600), 300000);
   const idealLength = Math.sqrt(area / ids.length) * 0.5;
@@ -1436,17 +1469,50 @@ function forceDirectedSettle(onDone, mode) {
   const gravityMult = new Map(ids.map(id => [id, 1 + ISLAND_GRAVITY_BOOST / (1 + degree.get(id))]));
   const light = mode === "light";
   let temp = Math.sqrt(area) / (light ? 30 : 10);
-  const COOLING_STEPS = light ? 35 : 140;
+  /* A hard step budget, not the thing that decides when settling is done --
+     see convergeThreshold below for that. This is only a safety net against
+     a graph that genuinely never quiets down (or the theta-approximated
+     repulsion oscillating forever), so it's set generously high rather than
+     tuned to "how many steps a typical graph needs": a graph the size of
+     devgraph converges in well under this on its own; a much larger one
+     (RAG4's scale) gets the room to actually finish instead of getting cut
+     off mid-motion, which is what a low fixed cap here used to do -- the
+     cooldown schedule below still drives temp near zero by the time this
+     many steps run, so it was quietly masquerading as "converged" while
+     really just "out of steps." */
+  const COOLING_STEPS = light ? 30 : 180;
   let iter = 0;
 
   const idealLength2 = idealLength * idealLength;
-  /* average per-node displacement below which the layout reads as stopped --
+  /* Average per-node displacement below which the layout reads as stopped --
      scaled off idealLength (which already scales with graph size/viewport
      area, see above) rather than a bare pixel constant, so a small tight
      graph and a large sparse one both stop at "no longer visibly moving"
-     instead of the large one either stopping too early or burning steps
-     it doesn't need. */
-  const convergeThreshold = idealLength * 0.004;
+     instead of the large one either stopping too early or burning steps it
+     doesn't need. Measured against the UNCAPPED force displacement computed
+     in step() below (dlen, before it's clamped to the current `temp`), not
+     the clamped movement actually applied to positions -- `temp` decays every
+     step regardless of whether the layout is anywhere near equilibrium, so
+     capped movement shrinks toward zero on its own late in a run even while
+     the real forces (and so the true, still-wanted displacement) stay large.
+     Checking the capped value read that shrinkage as "settled" and froze the
+     frame mid-motion on anything that didn't fully resolve within the old,
+     much lower step cap -- most visibly on a bigger graph like RAG4.
+     idealLength itself is sqrt(area/n) * 0.5 -- it shrinks as node count n
+     grows, since the same viewport area has to fit more nodes. Multiplying
+     the tolerance by idealLength alone therefore made the threshold get
+     STRICTER on a bigger graph (a smaller and smaller average displacement
+     required to call it settled) at exactly the point where there's more
+     going on to average over -- more repulsion pairs, more Barnes-Hut
+     approximation error -- so a big graph's residual jitter had a harder
+     bar to clear, not an easier one. Multiplying back in sqrt(ids.length)
+     cancels that shrinkage (idealLength * sqrt(n) is flat in n, since
+     idealLength itself is proportional to 1/sqrt(n)), so the tolerance is a
+     roughly constant number of screen pixels of average residual pull
+     regardless of graph size, instead of one that keeps getting harder to
+     hit as the graph grows. The 0.01 constant (was 0.004) is the actual
+     "how close to zero counts as zero" tolerance increase. */
+  const convergeThreshold = idealLength * Math.sqrt(ids.length) * 0.04;
   function step() {
     const disp = new Map(ids.map(id => [id, { x: 0, y: 0 }]));
     const tree = buildQuadTree(ids, positions);
@@ -1473,18 +1539,18 @@ function forceDirectedSettle(onDone, mode) {
       d.x += (cx - p.x) * g;
       d.y += (cyy - p.y) * g;
     });
-    let totalDisp = 0;
+    let totalForceDisp = 0;
     ids.forEach(id => {
       const p = positions.get(id), d = disp.get(id);
       const dlen = Math.hypot(d.x, d.y) || 0.01;
       const capped = Math.min(dlen, temp);
       p.x += (d.x / dlen) * capped;
       p.y += (d.y / dlen) * capped;
-      totalDisp += capped;
+      totalForceDisp += dlen; // uncapped -- see convergeThreshold comment above
     });
     temp *= 0.96;
     iter++;
-    return totalDisp / ids.length;
+    return totalForceDisp / ids.length;
   }
   function frame() {
     let avgDisp = convergeThreshold + 1; // stays above threshold if the loop below never runs a step
@@ -1497,7 +1563,7 @@ function forceDirectedSettle(onDone, mode) {
        hook, a structural reload through mergeGraphElements, and the layout
        selector all end up here -- and a settled graph is exactly the state
        worth remembering. Debounced inside saveCachedLayout. */
-    else { graphSettled = true; graphSettling = false; saveCachedLayout(); onDone && onDone(); }
+    else { setGraphSettled(true); graphSettling = false; saveCachedLayout(); onDone && onDone(); }
   }
   requestAnimationFrame(frame);
 }
@@ -1611,50 +1677,76 @@ function mergeGraphElements(elements, mode, opts) {
   toRemove.remove();
   if (!toAdd.length && !cy.elements().length) return false;
 
+  // "Settle on addition/subtraction" -- when on, a real structural change
+  // (something just added or removed, never a same-count update, which
+  // bails out above before reaching here) re-settles regardless of what the
+  // caller asked for; when off, fall back to whatever the caller requested.
+  const settleOnStructuralChange = settle || (document.getElementById("ctlSettleOnChange")?.checked ?? true);
+
   /* Removing nodes never requires re-solving positions for the survivors --
-     nobody moved, there's nothing to settle. Only clear the settled flag
-     (below) when there's actually new, unpositioned content that could need
-     it; a pure removal leaves whatever settled state already held. */
+     nobody moved, there's nothing to settle by default. The setting above
+     opts back in: a removal still shrinks the graph, and re-centering it is
+     what "settle on subtraction" means. */
   if (!toAdd.length) {
     updateRenderQuality();
     updateViewportCulling();
+    if (settleOnStructuralChange) {
+      setGraphSettled(false);
+      forceDirectedSettle(() => focusRotation(null, 60, 1000), mode || "light");
+    }
     return true;
   }
-  graphSettled = false;
+  setGraphSettled(false);
 
   const newNodeEls = toAdd.filter(el => !el.data.source);
   const newEdgeEls = toAdd.filter(el => el.data.source);
-  const hadExisting = cy.nodes().length > 0;
   cy.add(newNodeEls);
 
-  const bb = hadExisting ? cy.nodes().boundingBox() : null;
-  const cx = bb ? (bb.x1 + bb.x2) / 2 : 0;
-  const cyy = bb ? (bb.y1 + bb.y2) / 2 : 0;
   const rect = cy.container().getBoundingClientRect();
   const bootstrapSpread = Math.sqrt(Math.max((rect.width||900)*(rect.height||600), 300000)) / 2;
-  const nearbySpread = bb ? Math.max(90, Math.hypot(bb.w, bb.h) / 8) : bootstrapSpread;
   const allIncomingEdges = [...incoming.values()].filter(el => el.data.source);
-  let uncached = 0;
+
+  /* Pass 1: place every node that has a saved position first, before any
+     neighbor lookup runs. A cold page reload starts this cy instance with
+     zero nodes even when the repo has a full saved layout -- gating "is
+     there something real to anchor near" on cy.nodes().length before this
+     add (as this used to) reads that as a from-scratch bootstrap and
+     scatters every genuinely-new node from the origin instead of next to
+     its already-cached neighbor. Doing the cached placements in their own
+     pass first means pass 2 below can check each neighbor's actual current
+     position, cached or pre-existing, without caring which one it was. */
+  let uncachedEls = [];
   newNodeEls.forEach(el => {
     const node = cy.getElementById(el.data.id);
-    let px, py;
-    /* A cached position is the node's real, already-settled place, so it
-       wins over all three guesses below -- those exist to place a node
-       nothing knows anything about. Counting the ones that miss is what
-       decides whether a settle is needed at all (see below). */
     const cached = cachedPositions.get(el.data.id);
     if (cached) {
       node.position({ x: cached[0], y: cached[1] });
       node.data("glow", 0);
-      return;
+    } else {
+      uncachedEls.push(el);
     }
-    uncached++;
+  });
+  const uncached = uncachedEls.length;
+
+  /* Pass 2: anything left has no saved position at all. Anchor it near a
+     connected neighbor's real position (cached or pre-existing) if it has
+     one, else near the center of whatever's already really positioned,
+     else scatter from the origin -- a true from-scratch bootstrap, nothing
+     positioned anywhere yet. */
+  const anchored = cy.nodes().some(n => n.position().x || n.position().y);
+  const bb = anchored ? cy.nodes().filter(n => n.position().x || n.position().y).boundingBox() : null;
+  const cx = bb ? (bb.x1 + bb.x2) / 2 : 0;
+  const cyy = bb ? (bb.y1 + bb.y2) / 2 : 0;
+  const nearbySpread = bb ? Math.max(90, Math.hypot(bb.w, bb.h) / 8) : bootstrapSpread;
+  uncachedEls.forEach(el => {
+    const node = cy.getElementById(el.data.id);
+    let px, py;
     const link = allIncomingEdges.find(e => e.data.source === el.data.id || e.data.target === el.data.id);
     const other = link && cy.getElementById(link.data.source === el.data.id ? link.data.target : link.data.source);
-    if (hadExisting && other && other.length && (other.position().x || other.position().y)) {
+    if (anchored && other && other.length && (other.position().x || other.position().y)) {
       px = other.position().x + (Math.random()-0.5) * 50;
       py = other.position().y + (Math.random()-0.5) * 50;
-    } else if (hadExisting) {
+    } else if (anchored) {
       px = cx + (Math.random()-0.5) * nearbySpread;
       py = cyy + (Math.random()-0.5) * nearbySpread;
     } else {
@@ -1669,7 +1761,7 @@ function mergeGraphElements(elements, mode, opts) {
 
   updateRenderQuality();
   updateViewportCulling();
-  if (settle) {
+  if (settleOnStructuralChange) {
     /* Every new node came back with a cached position, so the layout on
        screen is already the settled one -- running the solver over it would
        only shuffle a correct picture. Frame it and stop. The ratio that
@@ -1677,7 +1769,7 @@ function mergeGraphElements(elements, mode, opts) {
        solving rather than everything added, so restoring a saved layout
        plus one genuinely new node is a light nudge, not a full re-solve. */
     if (!uncached) {
-      graphSettled = true;
+      setGraphSettled(true);
       focusRotation(null, 60, 1000);
     } else {
       const touchedRatio = uncached / Math.max(1, cy.elements().length);
@@ -2465,9 +2557,13 @@ async function populateRealRepos(fireChangeEvent) {
   const ids = (json.repos || []).filter(r => r.active).map(r => r.repo_id).sort();
   if (!ids.length) return;
   const select = document.getElementById("repoSelect");
-  const current = select.value;
+  // A saved repo (from a prior reload) wins over whatever the select's
+  // current value happens to be -- on first boot that's just the static
+  // markup's default option, not a real user choice.
+  const saved = localStorage.getItem(SELECTED_REPO_KEY);
+  const current = saved || select.value;
   select.innerHTML = '<option value="__all__">All Repos</option>' + ids.map(id => `<option value="${escapeHtmlVal(id)}">${escapeHtmlVal(id)}</option>`).join("");
-  select.value = ids.includes(current) ? current : (ids.includes("devgraph") ? "devgraph" : ids[0]);
+  select.value = (current === "__all__" || ids.includes(current)) ? current : (ids.includes("devgraph") ? "devgraph" : ids[0]);
   select.themeRefresh?.();
   // Boot passes fireChangeEvent:false and does its own explicit, awaited
   // refreshGraph call right after (see below) -- dispatching here too used
@@ -2586,6 +2682,15 @@ async function runCypherAndDisplay(text, opts) {
   }
 }
 btnRunCypher.addEventListener("click", () => runCypherAndDisplay(cypherInput.value.trim()));
+
+/* Subtle re-settle shortcut over the graph itself -- re-runs the physics
+   solve from wherever nodes currently sit, no query re-fetch involved, so it
+   can't add, remove, or reposition anything server data didn't already put
+   there. Always runs regardless of the "Settle on addition/subtraction"
+   toggle, since clicking this IS the explicit ask for one. */
+document.getElementById("btnGraphReload").addEventListener("click", () => {
+  if (cy.elements().length) forceDirectedSettle(() => focusRotation(null, 60, 1000), "full");
+});
 document.querySelectorAll('#linkOpenMcpSettings').forEach(l => l.addEventListener("click", e => { e.preventDefault(); document.getElementById("settingsOverlay").classList.add("open"); document.querySelector('[data-pane="mcp"]').click(); }));
 
 /* "input" fires continuously while dragging -- cheap client-side filtering
@@ -2620,6 +2725,7 @@ document.getElementById("graphSearch").addEventListener("input", e => {
 document.getElementById("pullTab").addEventListener("click", () => document.getElementById("controlFlyout").classList.toggle("open"));
 document.getElementById("repoSelect").addEventListener("change", async e => {
   const v = e.target.value;
+  localStorage.setItem(SELECTED_REPO_KEY, v);
   const loaded = await refreshGraph("full", true, true); // switching repos is a deliberate scope change, not an incremental update -- always caps the displayed set to it, even in highlight mode
   if (!loaded && !neo4jConnected) buildQueryFromState();
   loadGitHistory(v);
