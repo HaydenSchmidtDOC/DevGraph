@@ -1,203 +1,314 @@
-# DevGraph — Implementation Plan #10: Closing the gap with Graphify, phased
+# Implementation Plan #10: CLI Command Expansion
 
-**Status: planning — no code written yet.** This plan came out of a comparison
-audit against Graphify (an external, much larger open-source code-graph tool)
-run to answer one question: is DevGraph worth continuing to build on top of,
-or should we adopt/fork something else instead? Conclusion of that audit:
-keep building DevGraph. Its two structural advantages over Graphify —
-(1) a real live Neo4j backend instead of a static JSON file re-parsed on every
-query, and (2) being self-authored, already-known code rather than a 300K+
-line external dependency needing a full security sign-off — matter more for
-this environment (anti-MCP, security-cautious office) than Graphify's larger
-feature surface. This plan is the list of what to build to close that feature
-gap without giving up either advantage.
-
-Every item below is something Graphify already does that DevGraph doesn't.
-Where the note says "port the idea," that means: reimplement the concept
-against our own architecture (Neo4j-backed, MCP *and* CLI), not adapt or copy
-their code. Graphify is Apache-2.0 licensed, so copying would be legally fine,
-but their implementation is JSON-graph-shaped (NetworkX in memory) and ours is
-Neo4j-shaped (Cypher) — a direct port wouldn't compile against our engine
-regardless of license.
-
-## How to read the three phases
-
-- **Phase 1 — easy levers.** Small, self-contained, no open design questions.
-  Buildable in one pass without checking back in. Do these first regardless
-  of what happens with Phase 2/3.
-- **Phase 2 — the big stuff.** Each item needs a short scoping conversation
-  before starting (confirm priority, confirm approach) because the change
-  touches core extraction/graph-write paths and is expensive to redo if the
-  first attempt guesses wrong. Heavier diffs, real test-suite impact.
-- **Phase 3 — gated.** Each item requires a decision that isn't really an
-  engineering decision — it's a policy/architecture call (bring in an LLM?
-  support a second storage backend? open a network listener?) that changes
-  what DevGraph *is*, not just what it does. Don't start any of these without
-  an explicit go-ahead, even if the engineering itself would be easy.
+**Status**: Draft  
+**Date**: 2026-09-15  
+**Supersedes**: N/A  
+**Design Brief**: #1 (architecture), #3 (response envelopes)
 
 ---
 
-## Phase 1 — Easy levers to pull
+## 1. Motivation
 
-One-shot, no back-and-forth needed. Ordered roughly by value first.
+The current CLI (`devgraph/cli/main.py`) has 13 commands covering repo lifecycle, indexing, and diagnostics. Several obvious gaps remain:
 
-1. **CLI query commands wrapping the existing MCP tools.**
-   `devgraph query find-callers <name>`, `devgraph query impact <name>`,
-   `devgraph query explain <name>`, etc. — one subcommand per tool already
-   implemented in `devgraph/mcp/tools.py`. This is the actual fix for
-   "anti-MCP company can't use this tool at all" — everything else in this
-   plan is quality, this one is the adoption blocker. No new query logic,
-   just a thin CLI wrapper around functions that already exist.
-
-2. **PreToolUse-style hook nudging toward the new CLI query commands**,
-   mirroring Graphify's pattern (soft nudge by default, an opt-in strict
-   mode that blocks the first raw file read once per session and redirects
-   to `devgraph query`). Depends on #1 existing first. Zero MCP involved —
-   this is a pure CLI + hook feature.
-
-3. **Graph integrity validation**, extending the existing `doctor` command:
-   orphaned nodes, dangling edges, entities claimed by extraction but never
-   resolved. Graphify has a dedicated `validate` command; ours can just be a
-   new check inside `doctor` rather than a whole new command.
-
-4. **God-node analysis** (most-connected entities in a repo). Trivial once
-   the graph is already in Neo4j — a degree-count Cypher query exposed as a
-   new MCP tool + CLI query subcommand. Half a day, not a project.
-
-5. **GraphML export.** Standard format (opens in Gephi/yEd). One export
-   function reading straight from the existing graph.
-
-6. **SVG export** of the dependency/architecture graph, same category as
-   GraphML — an export format, not a new capability.
-
-7. **Token-reduction self-measurement command** (`devgraph benchmark` or
-   similar) — runs a query against DevGraph vs. a baseline (grep/full-file
-   read) and reports the token delta. Useful for internal sign-off: answers
-   "does this actually save tokens" with a number instead of a claim. Pairs
-   with item #8.
-
-8. **Office-safety sign-off doc.** Not code — a short markdown artifact
-   stating what's already true: no outbound network calls by default, full
-   dependency list, what data (if any) ever leaves the machine (answer:
-   nothing, in the default configuration). Cheap now, avoids a scramble
-   later when someone in security asks.
-
-9. **Manifest ingestion** (package.json / requirements.txt / pyproject.toml
-   / Cargo.toml, etc. → dependency nodes with version info, queryable).
-   Same node/edge shape as our existing extractors, no architecture change.
-
-10. **SCIP ingestion** — read an existing SCIP index (a standard code-
-    intelligence format some language servers/tools already produce) into
-    the graph, as an alternative or supplement to our own Tree-sitter
-    extraction for a given file. This is an *ingest* path, not a new
-    extractor — cheap to add, and gives free precision wherever a SCIP
-    producer already exists for a language.
+- No `devgraph update` — the update logic lives in a PowerShell script (`scripts/update.ps1`) that only Windows users can run, and it's not discoverable from the CLI itself.
+- No `devgraph stats` — the dashboard has summary counts (`/api/repos/{id}/summary`) but there's no CLI path to get them.
+- No `devgraph dashboard` — the dashboard URL is buried in `PROJECT_STATUS.md`; users have to know it's at `[IP_ADDRESS]:8765`.
+- No `devgraph version` — no way to check the installed package version.
+- No `devgraph config` — settings are environment-variable-only; no CLI surface to view or validate them.
+- `--help` is auto-generated by Typer but some commands have sparse docstrings or missing `--help` text on options.
+- No `devgraph logs` — tray/dashboard logs go to stdout/stderr with no CLI reader.
+- No `devgraph info <repo_id>` — detailed per-repo info requires `list` + grepping.
 
 ---
 
-## Phase 2 — The big stuff (item by item, confirm approach first)
+## 2. Proposed Commands
 
-Each of these gets a short check-in before work starts — not because the
-work itself is unclear, but because the *first* implementation choice is
-expensive to undo (schema shape, which stage owns the logic, etc).
+### 2.1 `devgraph update`
 
-1. **Fix the node-identity collision.**
-   `upsert_node` currently MERGEs `Function`/`Class` nodes on `(repo_id,
-   name)` only, so two files defining a same-named function collapse into
-   one graph node — already scoped in `HANDOVER_node_identity.md`. Fix is a
-   compound-key MERGE on `(repo_id, file, name)`, extended to `containers`
-   (`Service`/`Container`/`Volume` have the same collision across two
-   compose files). This is a correctness bug affecting `get_source` and
-   `find_callers` today, not a nice-to-have — should be near the front of
-   this phase. Touches every extractor's write path; needs a full
-   482-test rerun after, and the open sub-question (does a same-file
-   sibling-class collision also need closing?) needs a decision before
-   the schema change lands, not after.
+Pull latest from `origin/master`, reinstall the editable package, re-verify with `doctor`, restart tray if it was running.
 
-2. **Edge confidence tagging** (`EXTRACTED` vs `INFERRED`, Graphify's
-   concept). We already know which of our own edges are heuristic
-   guesses — the whole "name-based, not type-resolved" call-graph caveat
-   documented in `DEVGRAPH-CLIENT.md` — we just don't surface it. Adds a
-   property to `CALLS`/`IMPORTS` edges and a backfill pass per language
-   extractor. Directly answers the "graph transparency" goal from the
-   original audit.
+```
+devgraph update [--force] [--branch <name>]
+```
 
-3. **Symbol-resolution as its own stage**, replacing the current per-
-   extractor "guess a same-repo file, silently drop the edge if wrong"
-   approach baked into each language module. Pulling this into a shared
-   post-extraction resolver stage means accuracy improvements apply to
-   every language at once instead of one extractor at a time. Bigger
-   refactor than it sounds — touches the dispatch/extraction pipeline,
-   not just one file.
+- `--force`: allow update even with a dirty working tree (stash first).
+- `--branch`: pull from a branch other than `master` (default: `origin/master`).
 
-4. **Type-aware call-graph resolution**, to cut the documented false-
-   positive over-linking on common method names (`get`, `run`, `close`
-   all resolving to the same node regardless of which class they're on).
-   Currently mitigated with `scope_to_class` as a query-time filter;
-   this item is about fixing it at index time instead. Real design
-   question: how much type inference is worth doing without a full
-   compiler front-end per language — needs a scoping conversation before
-   starting, likely one language at a time rather than all at once.
+**Implementation**: Port the logic from `scripts/update.ps1` into Python using `subprocess` for `git pull --ff-only`, `pip install -e ".[dev]"`, and `devgraph doctor`. The PowerShell script stays as a wrapper for users who prefer it; the CLI command becomes the canonical path.
 
-5. **Community detection** (Leiden or equivalent), reusing an existing
-   graph library rather than writing clustering from scratch — this is a
-   solved-algorithm problem, not something to reimplement. Writes a
-   `community` property onto nodes, exposed via a new MCP tool/CLI query.
-   Prerequisite for Phase-2 item #8 (wiki export) below.
+**Files touched**:
+- `devgraph/cli/main.py` — new `update` command
+- `devgraph/cli/_env.py` — may need a `resolve_pip()` helper
 
-6. **Batched Cypher writes** for large-repo indexing performance. Current
-   write path is per-node/per-edge `session.run` calls in a loop (same
-   pattern Graphify's Neo4j push uses, and it's slow for the same
-   reason). Batching writes would matter once indexing a genuinely large
-   monorepo becomes a real scenario — confirm that's an actual near-term
-   need before prioritizing this over the correctness items above it.
+### 2.2 `devgraph stats`
 
-7. **PR/issue ingestion — actually implement the fetch.** Currently the
-   opt-in flags exist (`pr-source enable`, `issue-source enable`) but
-   there's no CLI command that performs the fetch — it requires a short
-   hand-written Python script today. Build the real fetch path
-   (`devgraph pr-source fetch <repo_id>` or similar) using the existing
-   `GitHubSource`/`index_pr_issues` machinery. **Do not enable or run
-   this against any repo without the repo owner's explicit go-ahead** —
-   this is the one part of DevGraph that makes outbound network calls,
-   per the existing non-negotiables in `DEVGRAPH-CLIENT.md`. Building
-   the command is a dev task; using it needs a human decision every time,
-   not just once.
+Print summary statistics for one or all registered repositories.
 
-8. **Agent-crawlable markdown wiki export** (index.md + one article per
-   community — a zero-tool-call consumption mode, good fit for an
-   anti-MCP shop since nothing needs to be invoked at all, just read).
-   Depends on #5 (community detection) existing first.
+```
+devgraph stats [<repo_id>] [--json]
+```
 
-9. **Work-memory / reflection feedback loop.** Graphify's `save-result` /
-   `reflect` idea: record how a past query's answer actually turned out
-   (`useful` / `dead_end` / `corrected`), aggregate that into a recency-
-   weighted "preferred/tentative/contested" hint attached to graph nodes,
-   and surface it on future queries with a "code changed since — re-
-   verify" flag when the underlying source has moved. No code to port
-   here — it's a feedback-loop design, not a language-specific
-   implementation — but it's a genuinely new subsystem (a small side
-   store plus a query-result annotation step), not a small patch.
-   Highest-differentiation item in this phase: nothing else here makes
-   the graph get smarter from actual use.
+- Without `repo_id`: aggregate across all registered repos.
+- `--json`: machine-readable JSON output instead of the Rich table.
 
-10. **Finish or drop `compare_branches`.** Currently registered and
-    callable but explicitly documented as a stub not wired to real git
-    metadata. Pick one — either finish it properly or remove it so it
-    stops returning unreliable results silently.
+**Data shown**:
+- Total node count
+- Node counts by label (Module, Class, Function, Service, Container, Commit, etc.)
+- Relationship counts by type (CONTAINS, CALLS, IMPORTS, MODIFIES, etc.)
+- Commit count (if git history indexed)
+- Last indexed timestamp
+- Graph database size (approximate)
+
+**Implementation**: Reuses `queries.summary_counts()` from the dashboard, plus a new `queries.total_counts()` for the aggregate view. The `--json` flag uses `console.print_json()` from Rich.
+
+**Files touched**:
+- `devgraph/cli/main.py` — new `stats` command
+- `devgraph/dashboard/queries.py` — may add a `total_counts()` helper
+
+### 2.3 `devgraph dashboard`
+
+Open the dashboard in the default browser, or print its URL.
+
+```
+devgraph dashboard [--open] [--url-only]
+```
+
+- `--open` (default): open `http://[IP_ADDRESS]:8765` in the default browser via `webbrowser.open()`.
+- `--url-only`: just print the URL, don't open.
+- If the tray/dashboard isn't running, print a message and offer to start it (`devgraph tray start`).
+
+**Implementation**: Uses Python's `webbrowser` module. Checks tray liveness first via `_tray_liveness_text()`; if not running, prints the start command and exits.
+
+**Files touched**:
+- `devgraph/cli/main.py` — new `dashboard` command
+
+### 2.4 `devgraph version`
+
+Print the installed DevGraph version.
+
+```
+devgraph version
+```
+
+**Implementation**: Reads from `importlib.metadata.version("devgraph")` (same pattern as `doctor`'s `mcp` version check). Falls back to reading `pyproject.toml` if the package metadata is unavailable.
+
+**Files touched**:
+- `devgraph/cli/main.py` — new `version` command
+
+### 2.5 `devgraph config`
+
+View or validate the current configuration.
+
+```
+devgraph config [<key>] [--show-defaults] [--json]
+```
+
+- Without `<key>`: print all settings.
+- With `<key>`: print just that setting's value (e.g. `devgraph config neo4j_uri`).
+- `--show-defaults`: also show the default value for each setting (useful to see what changed).
+- `--json`: machine-readable JSON.
+
+**Implementation**: Reads from `get_settings()` (Pydantic `Settings` model). Iterates over model fields, prints name + value + source (env var / default). Masks passwords.
+
+**Files touched**:
+- `devgraph/cli/main.py` — new `config` command
+
+### 2.6 `devgraph info`
+
+Detailed information about a single registered repository.
+
+```
+devgraph info <repo_id> [--json]
+```
+
+**Data shown**:
+- Path, active/watch status
+- Last indexed timestamp + commit SHA
+- Docs path, mentions enabled
+- PR/issue source enabled
+- Node count (from Neo4j)
+- Git branch + status (from `git_info.py`)
+- Any issues from `repo_issues.json`
+
+**Implementation**: Combines `registry.get()` data with `queries.count_nodes()` and `git_info.get_git_status()`. Reuses the existing `_get_repo_issues()` pattern from `routes.py`.
+
+**Files touched**:
+- `devgraph/cli/main.py` — new `info` command
+
+### 2.7 `devgraph logs`
+
+Tail or dump the tray/dashboard log output.
+
+```
+devgraph logs [--lines <N>] [--follow] [--level <LEVEL>]
+```
+
+- `--lines`: number of recent lines to show (default: 50).
+- `--follow`: `tail -f` style follow mode.
+- `--level`: filter by log level (DEBUG, INFO, WARNING, ERROR).
+
+**Implementation**: The tray app currently logs to stdout/stderr (no file). This command would either:
+1. (Phase A) Read from a log file if one is configured — add a `DEVGRAPH_LOG_FILE` setting.
+2. (Phase B) Attach to the tray's stdout via a named pipe / log file.
+
+Phase A is the minimal viable approach: add a `log_file` setting (default: `~/.devgraph/devgraph.log`), configure Python logging to write there, and have `devgraph logs` read it.
+
+**Files touched**:
+- `devgraph/config/settings.py` — add `log_file` setting
+- `devgraph/cli/main.py` — new `logs` command
+- `devgraph/agent/tray.py` — configure file logging
+
+### 2.8 `devgraph prune`
+
+Clean up orphaned graph data (repos removed from registry but still in Neo4j).
+
+```
+devgraph prune [--dry-run]
+```
+
+- `--dry-run`: show what would be deleted without actually deleting.
+
+**Implementation**: Queries Neo4j for all `:Repository` nodes, cross-references against the registry, and deletes any whose `repo_id` is no longer registered. Uses `engine.delete_repository()`.
+
+**Files touched**:
+- `devgraph/cli/main.py` — new `prune` command
+
+### 2.9 `devgraph self-test`
+
+Run internal consistency checks against the graph.
+
+```
+devgraph self-test [<repo_id>]
+```
+
+**Checks**:
+- Every `Module` node has a `file` property.
+- Every `CONTAINS` edge points to an existing node.
+- No dangling `CALLS` edges (target node exists).
+- No duplicate `(repo_id, name, file)` identity collisions.
+- Registry ↔ Neo4j repo list consistency.
+
+**Implementation**: Runs a series of Cypher queries, reports pass/fail per check. Similar structure to `doctor` but focused on data integrity rather than environment.
+
+**Files touched**:
+- `devgraph/cli/main.py` — new `self-test` command
+
+### 2.10 `devgraph export`
+
+Export graph data to a portable format.
+
+```
+devgraph export <repo_id> [--format json|cypher|dot] [--output <path>]
+```
+
+- `--format json`: Neo4j JSON (default).
+- `--format cypher`: `CREATE` statements.
+- `--format dot`: Graphviz DOT for visualization.
+- `--output`: file path (default: stdout).
+
+**Implementation**: Queries all nodes + relationships for a repo, serializes in the requested format. JSON format reuses the dashboard's `graph_slice()` query shape. Cypher format generates `CREATE (n:Label {props})` statements. DOT format generates a Graphviz digraph.
+
+**Files touched**:
+- `devgraph/cli/main.py` — new `export` command
+- `devgraph/cli/exporters.py` — new file for format serializers
 
 ---
 
-## Phase 3 — Gated behind a user or architectural decision
+## 3. Help-Text Audit
 
-None of these should be started on engineering judgment alone — each one
-changes a property of the system (what data can leave the machine, whether
-a second backend exists, whether a network listener runs) that needs an
-explicit decision first.
+Typer auto-generates `--help` from function docstrings and `typer.Option(... help=...)` text. The audit found:
 
-1. **Alternative JSON/flat-file storage backend, alongside Neo4j.**
-   Architectural decision: introduce a `GraphEngine` interface with two
-   implementations (Neo4j, JSON/NetworkX-backed), rather than assuming
+| Command | Docstring | Option help text | Status |
+|---------|-----------|-----------------|--------|
+| `add` | ✅ Full | ✅ `--full` has help | OK |
+| `remove` | ✅ Full | N/A | OK |
+| `list` | ✅ Full | N/A | OK |
+| `rescan` | ✅ Full | ✅ `--full` has help | OK |
+| `watch` | ✅ Full | N/A (positional) | OK |
+| `tray start` | ✅ Full | N/A | OK |
+| `tray stop` | ✅ Full | N/A | OK |
+| `tray status` | ✅ Full | N/A | OK |
+| `annotate` | ✅ Full | ✅ `--docs-path`, `--note` | OK |
+| `index-history` | ✅ Full | ✅ `--max-count` | OK |
+| `pr-source` | ✅ Full | N/A (positional) | OK |
+| `issue-source` | ✅ Full | N/A (positional) | OK |
+| `mentions` | ✅ Full | N/A (positional) | OK |
+| `status` | ✅ Full | N/A | OK |
+| `doctor` | ✅ Full | N/A | OK |
+| `client-config` | ✅ Full | ✅ `--claude-mcp-add-only`, `--run`, `--target` | OK |
+
+All existing commands already have proper docstrings and option help text. The new commands (above) must follow the same standard.
+
+---
+
+## 4. Implementation Order
+
+| Priority | Command | Effort | Dependencies | Rationale |
+|----------|---------|--------|-------------|-----------|
+| P0 | `version` | 1 file, ~15 lines | None | Trivial, high-visibility gap |
+| P0 | `dashboard` | 1 file, ~30 lines | None | Users need to find the dashboard |
+| P0 | `stats` | 2 files, ~60 lines | `queries.py` helpers | Reuses existing dashboard code |
+| P0 | `info` | 1 file, ~40 lines | None | Combines existing registry + git data |
+| P1 | `update` | 2 files, ~80 lines | `_env.py` | Ports PowerShell logic to Python |
+| P1 | `config` | 1 file, ~50 lines | None | Settings introspection |
+| P1 | `logs` | 3 files, ~60 lines | `settings.py` + tray logging | Needs log-file plumbing |
+| P2 | `prune` | 1 file, ~40 lines | None | Cleanup utility |
+| P2 | `self-test` | 1 file, ~60 lines | None | Data integrity checks |
+| P3 | `export` | 2 files, ~100 lines | `exporters.py` | Nice-to-have format conversion |
+
+---
+
+## 5. Testing Plan
+
+Each new command gets a test in `tests/cli/test_cli.py`:
+
+| Command | Test approach |
+|---------|--------------|
+| `version` | `CliRunner` invoke, assert output contains version string |
+| `dashboard` | Patch `webbrowser.open`, assert it's called with correct URL |
+| `stats` | Mock `queries.summary_counts()`, assert table output |
+| `info` | Add a temp repo to registry, assert output fields |
+| `update` | Mock `subprocess.run` for git/pip calls, assert success path |
+| `config` | Patch `get_settings()`, assert key/value output |
+| `logs` | Write a temp log file, assert line count and filtering |
+| `prune` | Mock `engine.run_cypher` to return orphaned repo IDs |
+| `self-test` | Mock `engine.run_cypher` for each consistency check |
+| `export` | Mock `engine.run_cypher_graph`, assert output format |
+
+---
+
+## 6. Files Changed
+
+```
+devgraph/
+├── cli/
+│   ├── __init__.py          # unchanged
+│   ├── _env.py              # +resolve_pip() helper
+│   ├── exporters.py         # NEW: JSON/Cypher/DOT serializers
+│   └── main.py              # +10 new commands
+├── config/
+│   └── settings.py          # +log_file setting
+├── dashboard/
+│   └── queries.py           # +total_counts() helper (optional)
+└── agent/
+    └── tray.py              # +file logging configuration
+tests/
+└── cli/
+    └── test_cli.py          # +tests for each new command
+```
+
+---
+
+## 7. Open Questions
+
+1. **`devgraph update` and `pip`**: Should the update command use `subprocess` to call `pip` (same venv), or shell out to `python -m pip`? The latter is more portable. **Decision**: Use `sys.executable -m pip install -e ".[dev]"` — same pattern as `_env.py`'s `resolve_venv_python()`.
+
+2. **`devgraph logs` file path**: Default to `~/.devgraph/devgraph.log` or `~/.devgraph/logs/`? **Decision**: `~/.devgraph/devgraph.log` — flat, consistent with `registry.sqlite3` and `tray_heartbeat.txt` already in that directory.
+
+3. **`devgraph export --format dot`**: Graphviz DOT is useful for sharing visualizations with non-DevGraph users. Is this worth the extra serializer? **Decision**: Include as a stretch goal (P3); the JSON format alone covers the primary use case.
+
+4. **`devgraph self-test` vs extending `doctor`**: `doctor` checks environment (Neo4j reachable, Podman installed, etc.). `self-test` checks data integrity (no dangling edges, no duplicate nodes). They serve different purposes — keep them separate.
    Neo4j everywhere. This is the single biggest remaining adoption-
    friction item after the MCP problem — day one currently requires
    Podman + a running Neo4j container, which is exactly the kind of new-
