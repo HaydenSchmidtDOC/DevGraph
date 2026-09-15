@@ -10,6 +10,7 @@ it was first written).
 
 from __future__ import annotations
 
+import git
 from dataclasses import dataclass
 
 from git import Repo
@@ -35,9 +36,17 @@ def compute_function_recency(repo: Repo, file_path: str) -> list[FunctionRecency
     `start_line`/`end_line` (see `indexer/python/extractor.py`).
     """
     hunks = repo.blame("HEAD", file_path)
+    if hunks is None:
+        return []
     recency: list[FunctionRecency] = []
     line_no = 1
-    for commit, lines in hunks:
+    for item in hunks:
+        if not isinstance(item, tuple) or len(item) < 2:
+            continue
+        commit = item[0]
+        lines = item[1]
+        if not isinstance(commit, git.Commit):
+            continue
         start_line = line_no
         end_line = line_no + len(lines) - 1
         recency.append(

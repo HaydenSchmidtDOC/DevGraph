@@ -214,7 +214,10 @@ def _is_ancestor(repo: Repo, candidate_sha: str, rev_sha: str) -> bool:
     reconcile path — never mistaken for the fast path.
     """
     try:
-        return repo.is_ancestor(candidate_sha, rev_sha)
+        return repo.is_ancestor(
+            repo.commit(candidate_sha),
+            repo.commit(rev_sha),
+        )
     except Exception:
         return False
 

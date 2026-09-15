@@ -187,7 +187,7 @@ def search_component(
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
            n.description as description LIMIT 200
     """
-    params = {"tokens": tokens}
+    params: dict[str, Any] = {"tokens": tokens}
     if not cross_repo:
         params["repo_id"] = repo_id
     if cutoff is not None:
@@ -677,7 +677,7 @@ def impact_analysis_for_diff(
         COLLECT(DISTINCT {{name: transitive.name, type: labels(transitive)[0]}}) as transitive_dependents,
         COUNT(DISTINCT dependent) as direct_count
     """
-    params = {"changed_components": changed_components}
+    params: dict[str, Any] = {"changed_components": changed_components}
     if not cross_repo:
         params["repo_id"] = repo_id
 

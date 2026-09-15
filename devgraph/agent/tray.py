@@ -69,7 +69,7 @@ class TrayApp:
         self._paused = False
         self._healthy = True
         self._stop_event = threading.Event()
-        self._icon: pystray.Icon | None = None
+        self._icon: pystray.Icon | None = None  # type: ignore[valid-type]
         self._last_seen_registry_change = self._registry.last_changed_at()
         self._events = EventBroadcaster()
         self._dashboard_loop: asyncio.AbstractEventLoop | None = None
@@ -238,7 +238,7 @@ class TrayApp:
         state = "paused" if self._paused else ("ok" if self._healthy else "warning")
         return f"DevGraph ({state})"
 
-    def _toggle_pause(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+    def _toggle_pause(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
         self._paused = not self._paused
         try:
             if self._paused:
@@ -253,7 +253,7 @@ class TrayApp:
             self._paused = not self._paused
         self._refresh_icon()
 
-    def _open_dashboard(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+    def _open_dashboard(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
         url = f"http://{self._settings.dashboard_host}:{self._settings.dashboard_port}"
         try:
             webbrowser.open(url)
@@ -305,7 +305,7 @@ class TrayApp:
             self._events.unbind_loop(loop)
             loop.close()
 
-    def _quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+    def _quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
         self._stop_event.set()
         self._watcher.stop()
         if self._dashboard_server is not None:
@@ -345,7 +345,8 @@ class TrayApp:
         )
         self._icon = pystray.Icon("devgraph", _make_icon(_OK_COLOR), "DevGraph", menu)
         try:
-            self._icon.run()
+            if self._icon:
+                self._icon.run()
         except Exception:
             logger.critical("pystray event loop crashed", exc_info=True)
             self._watcher.stop()

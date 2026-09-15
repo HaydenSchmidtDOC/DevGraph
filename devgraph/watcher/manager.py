@@ -61,29 +61,29 @@ class _GitStateEventHandler(FileSystemEventHandler):
         self._debounce_timer: threading.Timer | None = None
         self._lock = threading.Lock()
 
-    def on_modified(self, event: FileModifiedEvent) -> None:
+    def on_modified(self, event: FileModifiedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
-        if not event.is_directory and _is_relevant_git_state_path(Path(event.src_path)):
+        if not event.is_directory and _is_relevant_git_state_path(Path(str(event.src_path))):
             with self._lock:
                 self._reset_debounce()
 
-    def on_created(self, event: FileCreatedEvent) -> None:
+    def on_created(self, event: FileCreatedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
-        if not event.is_directory and _is_relevant_git_state_path(Path(event.src_path)):
+        if not event.is_directory and _is_relevant_git_state_path(Path(str(event.src_path))):
             with self._lock:
                 self._reset_debounce()
 
-    def on_deleted(self, event: FileDeletedEvent) -> None:
+    def on_deleted(self, event: FileDeletedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
-        if not event.is_directory and _is_relevant_git_state_path(Path(event.src_path)):
+        if not event.is_directory and _is_relevant_git_state_path(Path(str(event.src_path))):
             with self._lock:
                 self._reset_debounce()
 
-    def on_moved(self, event: FileMovedEvent) -> None:
+    def on_moved(self, event: FileMovedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
         if event.is_directory:
             return
-        if _is_relevant_git_state_path(Path(event.src_path)) or _is_relevant_git_state_path(Path(event.dest_path)):
+        if _is_relevant_git_state_path(Path(str(event.src_path))) or _is_relevant_git_state_path(Path(str(event.dest_path))):
             with self._lock:
                 self._reset_debounce()
 
@@ -133,7 +133,7 @@ class WatcherManager:
         self._registry = registry
         self._on_changes = on_changes
         self._on_git_state_changed = on_git_state_changed
-        self._observers: dict[str, Observer] = {}
+        self._observers: dict[str, Observer] = {}  # type: ignore[valid-type]
         self._handlers: dict[str, _RepoEventHandler] = {}
         self._git_handlers: dict[str, _GitStateEventHandler] = {}
         self._debounce_ms = get_settings().watch_debounce_ms
@@ -286,7 +286,7 @@ class WatcherManager:
             Dict mapping repo_id -> error message for repos that couldn't be watched.
         """
         with self._lock:
-            return dict(self._repo_issues)
+            return dict(self._repo_issues.items())
 
 
 class _RepoEventHandler(FileSystemEventHandler):
@@ -308,20 +308,20 @@ class _RepoEventHandler(FileSystemEventHandler):
         self._debounce_timer: threading.Timer | None = None
         self._lock = threading.Lock()
 
-    def on_modified(self, event: FileModifiedEvent) -> None:
+    def on_modified(self, event: FileModifiedEvent) -> None:  # type: ignore[override]
         """Record file modification and set debounce timer."""
         if event.is_directory:
             return
 
         # Track git state changes (.git/HEAD, .git/refs)
-        event_path = Path(event.src_path)
+        event_path = Path(str(event.src_path))
         if self._is_tracked_path(event_path):
             with self._lock:
                 self._changed_paths.add(event_path)
                 self._deleted_paths.discard(event_path)
                 self._reset_debounce()
 
-    def on_created(self, event: FileCreatedEvent) -> None:
+    def on_created(self, event: FileCreatedEvent) -> None:  # type: ignore[override]
         """Record file creation and set debounce timer.
 
         Also covers the "write to a temp file, then create the real path"
@@ -332,14 +332,14 @@ class _RepoEventHandler(FileSystemEventHandler):
         if event.is_directory:
             return
 
-        event_path = Path(event.src_path)
+        event_path = Path(str(event.src_path))
         if self._is_tracked_path(event_path):
             with self._lock:
                 self._changed_paths.add(event_path)
                 self._deleted_paths.discard(event_path)
                 self._reset_debounce()
 
-    def on_deleted(self, event: FileDeletedEvent) -> None:
+    def on_deleted(self, event: FileDeletedEvent) -> None:  # type: ignore[override]
         """Record file deletion and set debounce timer.
 
         Can't use `_is_tracked_path` here -- its `is_file()` check is always
@@ -351,7 +351,7 @@ class _RepoEventHandler(FileSystemEventHandler):
         if event.is_directory:
             return
 
-        event_path = Path(event.src_path)
+        event_path = Path(str(event.src_path))
         if self._is_ignored_repo_path(event_path):
             return
         with self._lock:
@@ -359,7 +359,7 @@ class _RepoEventHandler(FileSystemEventHandler):
             self._changed_paths.discard(event_path)
             self._reset_debounce()
 
-    def on_moved(self, event: FileMovedEvent) -> None:
+    def on_moved(self, event: FileMovedEvent) -> None:  # type: ignore[override]
         """Record an atomic-save rename (temp-file -> real path) as a change.
 
         Some editors/tools save by writing a temp file then renaming it onto
@@ -375,8 +375,8 @@ class _RepoEventHandler(FileSystemEventHandler):
         if event.is_directory:
             return
 
-        dest_path = Path(event.dest_path)
-        src_path = Path(event.src_path)
+        dest_path = Path(str(event.dest_path))
+        src_path = Path(str(event.src_path))
         with self._lock:
             if self._is_tracked_path(dest_path):
                 self._changed_paths.add(dest_path)

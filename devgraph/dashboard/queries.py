@@ -109,3 +109,22 @@ def search_components(
         {"repo_id": repo_id, "query": query, "limit": max_results},
     )
     return rows
+
+
+def total_counts(engine: GraphEngine) -> dict[str, Any]:
+    """Aggregate node and relationship counts across all repos.
+
+    Returns the same shape as summary_counts but without a repo_id filter.
+    """
+    node_rows = engine.run_cypher(
+        "MATCH (n) UNWIND labels(n) AS label "
+        "RETURN label, count(*) AS count ORDER BY label"
+    )
+    rel_rows = engine.run_cypher(
+        "MATCH (a)-[r]->(b) "
+        "RETURN type(r) AS type, count(*) AS count ORDER BY type"
+    )
+    return {
+        "nodes_by_label": {row["label"]: row["count"] for row in node_rows},
+        "relationships_by_type": {row["type"]: row["count"] for row in rel_rows},
+    }

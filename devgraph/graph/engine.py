@@ -143,7 +143,7 @@ def identity_key(label: str, repo_id: str, name: str, file: str | None) -> str:
     (and risk it drifting from the Cypher above).
     """
     parts = [label, repo_id, name]
-    if _is_file_scoped(file):
+    if _is_file_scoped(file) and file is not None:
         parts.append(file)
     return _IDENTITY_KEY_SEP.join(parts)
 
@@ -396,7 +396,8 @@ class GraphEngine:
                 repo_id=repo_id,
                 module_name=module_name,
             )
-            return [record["name"] for record in result]
+            records = result or []
+            return [record["name"] for record in records]
 
     def delete_nodes_by_source_file(self, repo_id: str, file_name: str) -> None:
         """Remove or unclaim every node whose provenance names this file, scoped to repo_id.
@@ -543,7 +544,7 @@ class GraphEngine:
         (see `Settings.enable_run_cypher`) — never wire it up as the default path.
         """
         with self._driver.session() as session:
-            result = session.run(query, parameters or {})
+            result = session.run(query, parameters or {})  # type: ignore[arg-type]
             return [record.data() for record in result]
 
     def run_cypher_graph(self, query: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -565,7 +566,7 @@ class GraphEngine:
         path.
         """
         with self._driver.session() as session:
-            result = session.run(query, parameters or {})
+            result = session.run(query, parameters or {})  # type: ignore[arg-type]
             columns = list(result.keys())
             data: list[dict[str, Any]] = []
             for record in result:
@@ -603,8 +604,8 @@ class GraphEngine:
                         rels[value.id] = {
                             "id": value.id,
                             "type": value.type,
-                            "startNode": value.start_node.id,
-                            "endNode": value.end_node.id,
+                            "startNode": value.start_node.id if value.start_node else None,
+                            "endNode": value.end_node.id if value.end_node else None,
                             "properties": dict(value),
                         }
                     elif isinstance(value, list):

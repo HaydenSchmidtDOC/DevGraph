@@ -85,6 +85,8 @@ class DocsExtractor:
             return result
 
         doc_type = meta.get("type")
+        if not isinstance(doc_type, str):
+            return result
         label = _TYPE_TO_LABEL.get(doc_type)
         if label is None:
             return result

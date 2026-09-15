@@ -50,8 +50,8 @@ _CLIENT_GUIDE_PATH = Path(__file__).resolve().parent.parent.parent / "DEVGRAPH-C
 # through mcp/tools.py) — so every tool gets the same read-only annotation.
 # run_cypher is the one exception: it's an arbitrary-query escape hatch, so it
 # can't be vouched for as read-only in the general case.
-_READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
-_ESCAPE_HATCH = ToolAnnotations(readOnlyHint=False, openWorldHint=True)
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)  # type: ignore[call-arg]
+_ESCAPE_HATCH = ToolAnnotations(readOnlyHint=False, openWorldHint=True)  # type: ignore[call-arg]
 
 # Machine-readable catalog backing the devgraph://tool-catalog resource, kept
 # next to the @server.tool() registrations below so it can't silently drift

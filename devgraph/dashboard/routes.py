@@ -264,7 +264,10 @@ def build_router(
     @router.get("/repos/{repo_id}/git-log")
     def repo_git_log(repo_id: str, limit: int = 60) -> list[dict[str, Any]]:
         _require_repo(repo_id)
-        repo_path = registry.get(repo_id).path
+        rec = registry.get(repo_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"unknown repo: {repo_id}")
+        repo_path = rec.path
         try:
             return get_git_log(repo_path, max(1, min(limit, 300)))
         except Exception as exc:
@@ -273,7 +276,10 @@ def build_router(
     @router.get("/repos/{repo_id}/git-status")
     def repo_git_status(repo_id: str) -> dict[str, Any]:
         _require_repo(repo_id)
-        repo_path = registry.get(repo_id).path
+        rec = registry.get(repo_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"unknown repo: {repo_id}")
+        repo_path = rec.path
         try:
             return get_git_status(repo_path)
         except Exception as exc:

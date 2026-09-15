@@ -2,14 +2,16 @@
 
 import importlib.metadata
 import json
+import logging
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 from rich.console import Console
@@ -17,7 +19,9 @@ from rich.table import Table
 
 from devgraph.agent import lifecycle
 from devgraph.cli._env import resolve_podman, resolve_repo_root, resolve_venv_python
+from devgraph.cli.exporters import export_cypher, export_dot, export_json
 from devgraph.config import get_settings
+from devgraph.dashboard import queries as dashboard_queries
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
@@ -127,8 +131,8 @@ def remove(repo_id: str) -> None:
         raise typer.Exit(code=1)
 
 
-@app.command()
-def list() -> None:
+@app.command(name="list")
+def list_repos() -> None:
     """List all registered repositories and their status."""
     try:
         registry = _get_registry()
@@ -823,6 +827,617 @@ def client_config(
                 any_failed = True
         if any_failed:
             raise typer.Exit(code=1)
+
+
+@app.command()
+def version() -> None:
+    """Print the installed DevGraph version."""
+    try:
+        ver = importlib.metadata.version("devgraph")
+    except importlib.metadata.PackageNotFoundError:
+        # Fallback: read pyproject.toml
+        try:
+            repo_root = resolve_repo_root()
+            pyproject = repo_root / "pyproject.toml"
+            if pyproject.exists():
+                import tomllib
+                data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+                ver = data.get("project", {}).get("version", "unknown")
+            else:
+                ver = "unknown"
+        except Exception:
+            ver = "unknown"
+    console.print(ver)
+
+
+@app.command()
+def dashboard(
+    open_browser: bool = typer.Option(
+        True, "--open/--no-open", help="Open the dashboard in the default browser."
+    ),
+    url_only: bool = typer.Option(
+        False, "--url-only", help="Just print the dashboard URL, don't open."
+    ),
+) -> None:
+    """Open the DevGraph dashboard in the default browser, or print its URL."""
+    settings = get_settings()
+    url = f"http://{settings.dashboard_host}:{settings.dashboard_port}"
+
+    # Check tray liveness
+    liveness = _tray_liveness_text(settings)
+    if liveness != "running":
+        console.print("[yellow]Dashboard may not be running[/yellow] (tray app is not alive)")
+        console.print("  Start it with: devgraph tray start")
+
+    if url_only:
+        console.print(url)
+    elif open_browser:
+        console.print(f"Opening {url} ...")
+        webbrowser.open(url)
+    else:
+        console.print(url)
+
+
+@app.command()
+def stats(
+    repo_id: Optional[str] = typer.Argument(
+        None, help="Repository ID. Omit for aggregate stats across all repos."
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Output as JSON instead of a table."
+    ),
+) -> None:
+    """Print summary statistics for one or all registered repositories."""
+    settings = get_settings()
+    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    try:
+        engine.verify_connectivity()
+    except Exception as e:
+        console.print(f"[red][X] Neo4j not reachable:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    try:
+        if repo_id:
+            registry = _get_registry()
+            try:
+                if registry.get(repo_id) is None:
+                    console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                    raise typer.Exit(code=1)
+            finally:
+                registry.close()
+
+            data = dashboard_queries.summary_counts(engine, repo_id)
+            total_nodes = sum(data["nodes_by_label"].values())
+            total_rels = sum(data["relationships_by_type"].values())
+        else:
+            data = dashboard_queries.total_counts(engine)
+            total_nodes = sum(data["nodes_by_label"].values())
+            total_rels = sum(data["relationships_by_type"].values())
+
+        if as_json:
+            console.print_json(json.dumps({
+                "total_nodes": total_nodes,
+                "total_relationships": total_rels,
+                **data,
+            }))
+        else:
+            console.print(f"\n[bold]Stats{' for ' + repo_id if repo_id else ''}[/bold]")
+            console.print(f"  Total nodes: {total_nodes}")
+            console.print(f"  Total relationships: {total_rels}")
+
+            if data["nodes_by_label"]:
+                node_table = Table(title="Nodes by Label")
+                node_table.add_column("Label", style="cyan")
+                node_table.add_column("Count", style="green")
+                for label, count in sorted(data["nodes_by_label"].items()):
+                    node_table.add_row(label, str(count))
+                console.print(node_table)
+
+            if data["relationships_by_type"]:
+                rel_table = Table(title="Relationships by Type")
+                rel_table.add_column("Type", style="cyan")
+                rel_table.add_column("Count", style="green")
+                for rtype, count in sorted(data["relationships_by_type"].items()):
+                    rel_table.add_row(rtype, str(count))
+                console.print(rel_table)
+    finally:
+        engine.close()
+
+
+@app.command()
+def info(
+    repo_id: str,
+    as_json: bool = typer.Option(
+        False, "--json", help="Output as JSON instead of a table."
+    ),
+) -> None:
+    """Show detailed information about a registered repository."""
+    settings = get_settings()
+    registry = _get_registry()
+    try:
+        repo = registry.get(repo_id)
+        if not repo:
+            console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+            raise typer.Exit(code=1)
+
+        # Node count from Neo4j
+        node_count = 0
+        engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+        try:
+            node_count = dashboard_queries.count_nodes(engine, repo_id)
+        except Exception:
+            pass
+        finally:
+            engine.close()
+
+        # Git status
+        git_status: dict[str, Any] = {}
+        try:
+            from devgraph.dashboard.git_info import get_git_status
+            git_status = get_git_status(repo.path)
+        except Exception:
+            pass
+
+        # Issues
+        issues_path = settings.registry_db_path.parent / "repo_issues.json"
+        repo_issues: dict[str, str] = {}
+        if issues_path.exists():
+            try:
+                repo_issues = json.loads(issues_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        if as_json:
+            console.print_json(json.dumps({
+                "repo_id": repo.repo_id,
+                "path": str(repo.path),
+                "active": repo.active,
+                "watch_enabled": repo.watch_enabled,
+                "last_indexed": repo.last_indexed,
+                "last_indexed_commit": repo.last_indexed_commit,
+                "docs_path": repo.docs_path,
+                "mentions_enabled": repo.mentions_enabled,
+                "pr_source_enabled": repo.pr_source_enabled,
+                "issue_source_enabled": repo.issue_source_enabled,
+                "node_count": node_count,
+                "git_branch": git_status.get("branch"),
+                "uncommitted_changes": len(git_status.get("uncommitted", [])),
+                "issue": repo_issues.get(repo_id),
+            }, default=str))
+        else:
+            console.print(f"\n[bold]Repository: {repo.repo_id}[/bold]")
+            console.print(f"  Path: {repo.path}")
+            console.print(f"  Active: {'[OK]' if repo.active else '[X]'}")
+            console.print(f"  Watch: {'[OK]' if repo.watch_enabled else '[X]'}")
+            console.print(f"  Last indexed: {repo.last_indexed or '-'}")
+            console.print(f"  Last indexed commit: {repo.last_indexed_commit or '-'}")
+            console.print(f"  Docs path: {repo.docs_path or '(not set)'}")
+            console.print(f"  Mentions: {'[OK]' if repo.mentions_enabled else '[X]'}")
+            console.print(f"  PR source: {'[OK]' if repo.pr_source_enabled else '[X]'}")
+            console.print(f"  Issue source: {'[OK]' if repo.issue_source_enabled else '[X]'}")
+            console.print(f"  Nodes in graph: {node_count}")
+            console.print(f"  Git branch: {git_status.get('branch', '-')}")
+            uncommitted = git_status.get("uncommitted", [])
+            console.print(f"  Uncommitted changes: {len(uncommitted)}")
+            if uncommitted:
+                for entry in uncommitted[:10]:
+                    console.print(f"    {entry['state']:>10}  {entry['path']}")
+                if len(uncommitted) > 10:
+                    console.print(f"    ... and {len(uncommitted) - 10} more")
+            issue = repo_issues.get(repo_id)
+            if issue:
+                console.print(f"  [yellow]Issue:[/yellow] {issue}")
+    finally:
+        registry.close()
+
+
+@app.command()
+def update(
+    force: bool = typer.Option(
+        False, "--force", help="Allow update with a dirty working tree (stash first)."
+    ),
+    branch: str = typer.Option(
+        "origin/master", "--branch", help="Remote branch to pull from."
+    ),
+) -> None:
+    """Pull latest from git, reinstall dependencies, and verify.
+
+    Port of scripts/update.ps1 into Python. Runs git pull --ff-only,
+    reinstalls the editable package, runs doctor, and restarts the tray
+    if it was running.
+    """
+    repo_root = resolve_repo_root()
+    python_path = resolve_venv_python()
+
+    # 1. Check working tree
+    if not force:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(repo_root), capture_output=True, text=True,
+        )
+        if result.stdout.strip():
+            console.print("[red][X] Local changes present[/red] — commit, stash, or use --force.")
+            console.print(result.stdout)
+            raise typer.Exit(code=1)
+
+    # 2. Check tray liveness
+    settings = get_settings()
+    was_running = _tray_liveness_text(settings) == "running"
+    if was_running:
+        console.print("[yellow]Tray app is running — will restart after update.[/yellow]")
+
+    # 3. Pull
+    console.print("[bold]Pulling latest...[/bold]")
+    result = subprocess.run(
+        ["git", "pull", "--ff-only", branch],
+        cwd=str(repo_root), capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        console.print(f"[red][X] git pull failed:[/red] {result.stderr.strip()}")
+        raise typer.Exit(code=1)
+    console.print(f"[green][OK][/green] {result.stdout.strip()}")
+
+    # 4. Stop tray if running
+    if was_running:
+        console.print("[bold]Stopping tray app...[/bold]")
+        subprocess.run(
+            [str(python_path), "-m", "devgraph.cli.main", "tray", "stop"],
+            cwd=str(repo_root),
+        )
+
+    # 5. Reinstall
+    console.print("[bold]Reinstalling dependencies...[/bold]")
+    result = subprocess.run(
+        [str(python_path), "-m", "pip", "install", "-e", ".[dev]"],
+        cwd=str(repo_root), capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        console.print(f"[red][X] pip install failed:[/red] {result.stderr.strip()}")
+        raise typer.Exit(code=1)
+    console.print("[green][OK][/green] Dependencies reinstalled.")
+
+    # 6. Doctor
+    console.print("[bold]Verifying environment...[/bold]")
+    result = subprocess.run(
+        [str(python_path), "-m", "devgraph.cli.main", "doctor"],
+        cwd=str(repo_root), capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        console.print("[red]doctor reported issues:[/red]")
+        console.print(result.stdout)
+        raise typer.Exit(code=1)
+    console.print("[green][OK][/green] All checks passed.")
+
+    # 7. Restart tray
+    if was_running:
+        console.print("[bold]Restarting tray app...[/bold]")
+        subprocess.run(
+            [str(python_path), "-m", "devgraph.cli.main", "tray", "start"],
+            cwd=str(repo_root),
+        )
+
+    console.print("[green]Update complete.[/green]")
+
+
+@app.command()
+def config(
+    key: Optional[str] = typer.Argument(
+        None, help="Setting key to show (e.g. 'neo4j_uri'). Omit to show all."
+    ),
+    show_defaults: bool = typer.Option(
+        False, "--show-defaults", help="Also show the default value for each setting."
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Output as JSON."
+    ),
+) -> None:
+    """View or validate the current DevGraph configuration."""
+    settings = get_settings()
+
+    # Build a list of (field_name, value, default) tuples
+    fields: list[tuple[str, Any, Any]] = []
+    for field_name in settings.model_fields:
+        field_info = settings.model_fields[field_name]
+        value = getattr(settings, field_name)
+        default = field_info.default
+        fields.append((field_name, value, default))
+
+    if key:
+        matched = [(n, v, d) for n, v, d in fields if n == key]
+        if not matched:
+            console.print(f"[red][X] Unknown setting:[/red] {key}")
+            raise typer.Exit(code=1)
+        fields = matched
+
+    # Mask passwords
+    def _display_value(v: Any) -> str:
+        if isinstance(v, str) and any(kw in (key or "").lower() or kw in str(key).lower() for kw in ("password", "secret", "token")):
+            return "****" if v else "(empty)"
+        return str(v)
+
+    if as_json:
+        data = {n: getattr(settings, n) for n, _, _ in fields}
+        console.print_json(json.dumps(data, default=str))
+    else:
+        table = Table(title="DevGraph Configuration")
+        table.add_column("Key", style="cyan")
+        table.add_column("Value", style="green")
+        if show_defaults:
+            table.add_column("Default", style="yellow")
+        for field_name, value, default in fields:
+            display = _display_value(value)
+            if show_defaults:
+                table.add_row(field_name, display, str(default))
+            else:
+                table.add_row(field_name, display)
+        console.print(table)
+
+
+@app.command()
+def logs(
+    lines: int = typer.Option(
+        50, "--lines", "-n", help="Number of recent lines to show."
+    ),
+    level: str = typer.Option(
+        "INFO", "--level", "-l", help="Minimum log level filter (DEBUG, INFO, WARNING, ERROR)."
+    ),
+) -> None:
+    """Show recent log output from the DevGraph tray/dashboard process."""
+    settings = get_settings()
+    log_path = settings.log_file
+    if not log_path or not log_path.exists():
+        console.print("[yellow]No log file found.[/yellow]")
+        console.print(f"  Expected at: {log_path}")
+        console.print("  The tray app must be started with file logging enabled.")
+        return
+
+    level_map = {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+    }
+    min_level = level_map.get(level.upper(), logging.INFO)
+
+    try:
+        text = log_path.read_text(encoding="utf-8")
+    except OSError as e:
+        console.print(f"[red][X] Error reading log file:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    # Parse log lines, filter by level, take last N
+    filtered: list[str] = []
+    for line in text.splitlines():
+        # Simple level detection from common log formats
+        line_upper = line.upper()
+        line_level = logging.INFO
+        if "ERROR" in line_upper:
+            line_level = logging.ERROR
+        elif "WARNING" in line_upper or "WARN" in line_upper:
+            line_level = logging.WARNING
+        elif "DEBUG" in line_upper:
+            line_level = logging.DEBUG
+        if line_level >= min_level:
+            filtered.append(line)
+
+    tail = filtered[-lines:] if lines > 0 else filtered
+    for line in tail:
+        console.print(line)
+
+
+@app.command()
+def prune(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be deleted without actually deleting."
+    ),
+) -> None:
+    """Remove orphaned graph data for repos no longer in the registry."""
+    settings = get_settings()
+    registry = _get_registry()
+    try:
+        registered_ids = {r.repo_id for r in registry.list_repos()}
+    finally:
+        registry.close()
+
+    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    try:
+        engine.verify_connectivity()
+    except Exception as e:
+        console.print(f"[red][X] Neo4j not reachable:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    try:
+        # Find all Repository nodes in Neo4j
+        repo_rows = engine.run_cypher(
+            "MATCH (n:Repository) RETURN n.repo_id AS repo_id"
+        )
+        neo4j_ids = {row["repo_id"] for row in repo_rows if row.get("repo_id")}
+        orphaned = neo4j_ids - registered_ids
+
+        if not orphaned:
+            console.print("[green]No orphaned repos found.[/green]")
+            return
+
+        console.print(f"Found {len(orphaned)} orphaned repo(s):")
+        for rid in sorted(orphaned):
+            console.print(f"  {rid}")
+
+        if dry_run:
+            console.print("[yellow]Dry run — no data deleted.[/yellow]")
+            return
+
+        for rid in sorted(orphaned):
+            engine.delete_repository(rid)
+            console.print(f"[green][OK][/green] Deleted: {rid}")
+    finally:
+        engine.close()
+
+
+@app.command(name="self-test")
+def self_test(
+    repo_id: Optional[str] = typer.Argument(
+        None, help="Repository ID to test. Omit to test all registered repos."
+    ),
+) -> None:
+    """Run internal consistency checks against the graph data."""
+    settings = get_settings()
+    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    try:
+        engine.verify_connectivity()
+    except Exception as e:
+        console.print(f"[red][X] Neo4j not reachable:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    registry = _get_registry()
+    try:
+        if repo_id:
+            if registry.get(repo_id) is None:
+                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                raise typer.Exit(code=1)
+            repo_ids = [repo_id]
+        else:
+            repo_ids = [r.repo_id for r in registry.list_repos()]
+    finally:
+        registry.close()
+
+    all_passed = True
+
+    for rid in repo_ids:
+        console.print(f"\n[bold]Checking: {rid}[/bold]")
+
+        # 1. Every Module node has a file property
+        try:
+            bad = engine.run_cypher(
+                "MATCH (n:Module {repo_id: $rid}) WHERE n.file IS NULL "
+                "RETURN count(*) AS c", {"rid": rid}
+            )
+            count = bad[0]["c"] if bad else 0
+            if count:
+                console.print(f"  [red][X] {count} Module(s) missing 'file' property[/red]")
+                all_passed = False
+            else:
+                console.print(f"  [green][OK][/green] All Module nodes have 'file'")
+        except Exception as e:
+            console.print(f"  [red][X] Check failed:[/red] {e}")
+            all_passed = False
+
+        # 2. No dangling CONTAINS edges
+        try:
+            bad = engine.run_cypher(
+                "MATCH (a {repo_id: $rid})-[r:CONTAINS]->(b) "
+                "WHERE b.repo_id <> $rid OR b IS NULL "
+                "RETURN count(*) AS c", {"rid": rid}
+            )
+            count = bad[0]["c"] if bad else 0
+            if count:
+                console.print(f"  [red][X] {count} dangling CONTAINS edge(s)[/red]")
+                all_passed = False
+            else:
+                console.print(f"  [green][OK][/green] All CONTAINS edges valid")
+        except Exception as e:
+            console.print(f"  [red][X] Check failed:[/red] {e}")
+            all_passed = False
+
+        # 3. No dangling CALLS edges
+        try:
+            bad = engine.run_cypher(
+                "MATCH (a {repo_id: $rid})-[r:CALLS]->(b) "
+                "WHERE b.repo_id <> $rid OR b IS NULL "
+                "RETURN count(*) AS c", {"rid": rid}
+            )
+            count = bad[0]["c"] if bad else 0
+            if count:
+                console.print(f"  [red][X] {count} dangling CALLS edge(s)[/red]")
+                all_passed = False
+            else:
+                console.print(f"  [green][OK][/green] All CALLS edges valid")
+        except Exception as e:
+            console.print(f"  [red][X] Check failed:[/red] {e}")
+            all_passed = False
+
+        # 4. Registry ↔ Neo4j consistency
+        try:
+            repo_nodes = engine.run_cypher(
+                "MATCH (n:Repository) RETURN n.repo_id AS rid"
+            )
+            neo4j_ids = {r["rid"] for r in repo_nodes if r.get("rid")}
+            registry = _get_registry()
+            try:
+                reg_ids = {r.repo_id for r in registry.list_repos()}
+            finally:
+                registry.close()
+            orphaned = neo4j_ids - reg_ids
+            missing = reg_ids - neo4j_ids
+            if orphaned:
+                console.print(f"  [red][X] {len(orphaned)} orphaned repo(s) in Neo4j: {', '.join(sorted(orphaned))}[/red]")
+                all_passed = False
+            if missing:
+                console.print(f"  [yellow]{len(missing)} repo(s) in registry but not in Neo4j: {', '.join(sorted(missing))}[/yellow]")
+            if not orphaned and not missing:
+                console.print(f"  [green][OK][/green] Registry ↔ Neo4j consistent")
+        except Exception as e:
+            console.print(f"  [red][X] Check failed:[/red] {e}")
+            all_passed = False
+
+    console.print()
+    if all_passed:
+        console.print("[green]All checks passed.[/green]")
+    else:
+        console.print("[red]One or more checks failed.[/red]")
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def export(
+    repo_id: str,
+    fmt: str = typer.Option(
+        "json", "--format", "-f", help="Output format: json, cypher, or dot."
+    ),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o", help="File path to write to (default: stdout)."
+    ),
+    limit: int = typer.Option(
+        500, "--limit", "-n", help="Maximum number of nodes to export."
+    ),
+) -> None:
+    """Export graph data for a repository in a portable format."""
+    if fmt not in ("json", "cypher", "dot"):
+        console.print("[red][X] Error:[/red] --format must be 'json', 'cypher', or 'dot'")
+        raise typer.Exit(code=1)
+
+    settings = get_settings()
+    registry = _get_registry()
+    try:
+        if registry.get(repo_id) is None:
+            console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+            raise typer.Exit(code=1)
+    finally:
+        registry.close()
+
+    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    try:
+        engine.verify_connectivity()
+    except Exception as e:
+        console.print(f"[red][X] Neo4j not reachable:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    try:
+        nodes, edges = dashboard_queries.graph_slice(engine, repo_id, None, limit)
+
+        if fmt == "json":
+            result = export_json(nodes, edges)
+        elif fmt == "cypher":
+            result = export_cypher(nodes, edges)
+        else:
+            result = export_dot(nodes, edges)
+
+        if output:
+            Path(output).write_text(result, encoding="utf-8")
+            console.print(f"[green][OK][/green] Exported {len(nodes)} nodes, {len(edges)} edges to {output}")
+        else:
+            console.print(result)
+    finally:
+        engine.close()
 
 
 if __name__ == "__main__":
