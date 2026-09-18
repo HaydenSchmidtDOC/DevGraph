@@ -565,6 +565,7 @@ def test_cli_doctor_runs_without_crashing(runner, temp_registry_db):
         assert "Python" in result.stdout
         assert "Neo4j" in result.stdout
         assert "Live Watcher" in result.stdout
+        assert "Indexer extractors" in result.stdout
 
 
 def test_cli_client_config_prints_resolved_paths(runner, temp_registry_db):

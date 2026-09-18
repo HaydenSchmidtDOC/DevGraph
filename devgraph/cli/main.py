@@ -41,13 +41,16 @@ def _get_registry() -> RepoRegistry:
 
 
 @app.command()
+@app.command(name="register")
 def add(
-    path: str,
+    path: str = typer.Argument(".", help="Path to a git repository (defaults to the current directory)."),
     full: bool = typer.Option(
         False, "--full", help="Also run incremental git-history indexing after the file scan (local-only, no network)."
     ),
 ) -> None:
     """Register a repository and run its initial full scan.
+
+    No-op (with a status message) if this path is already registered.
 
     Args:
         path: Absolute or relative path to a git repository.
@@ -55,6 +58,11 @@ def add(
     try:
         registry = _get_registry()
         try:
+            resolved = Path(path).resolve()
+            existing = next((r for r in registry.list_repos() if r.path == resolved), None)
+            if existing is not None:
+                console.print(f"[green][OK][/green] Already registered: {existing.repo_id} at {existing.path}")
+                return
             record = registry.add_repo(path)
             console.print(
                 f"[green][OK][/green] Registered: {record.repo_id} at {record.path}"
@@ -190,7 +198,7 @@ def list_repos() -> None:
 def rescan(
     repo_id: str,
     full: bool = typer.Option(
-        False, "--full", help="Also run incremental git-history indexing after the file scan (local-only, no network)."
+        False, "--full", help="Also run git-history indexing after the file scan, forcing a full re-sync even if HEAD hasn't moved (local-only, no network)."
     ),
 ) -> None:
     """Run a full re-index of a registered repository.
@@ -198,6 +206,13 @@ def rescan(
     Walks every file under the repo's root and re-runs every extractor that
     recognizes it (Python, docs, containers, APIs, datastores). Idempotent —
     safe to run repeatedly; existing nodes are updated in place via MERGE.
+
+    Reconciles the graph to disk: file nodes whose source file no longer
+    exists are pruned, and git history is always re-synced (cheap no-op when
+    HEAD hasn't moved; full reconcile when history was rewritten, e.g. a
+    force-push or pruned branch). With --full, git history is force
+    re-synced even when HEAD hasn't moved — the escape hatch for repairing
+    a graph whose MODIFIES edges were destroyed by a bug.
 
     Args:
         repo_id: The repository ID to rescan.
@@ -219,15 +234,26 @@ def rescan(
                 registry.mark_indexed(repo_id)
                 console.print(f"[green][OK][/green] Rescanned {repo_id}: {count} file(s) indexed")
 
-                if full:
-                    try:
-                        result = sync_git_history(engine, registry, repo_id)
-                        console.print(f"[green][OK][/green] Indexed {result['commits_indexed']} commit(s)")
-                    except Exception as e:
+                # Always reconcile git history on a rescan — not just with
+                # --full. sync_git_history is a cheap no-op when HEAD hasn't
+                # moved, and it's the only path that heals a rewritten
+                # history (force-push, pruned branch): without it, orphaned
+                # Commit nodes linger forever. --full additionally forces a
+                # full re-sync even when HEAD hasn't moved, repairing
+                # MODIFIES edges destroyed by the old replace_file_nodes
+                # blanket-delete bug.
+                try:
+                    result = sync_git_history(engine, registry, repo_id, force=full)
+                    if result["commits_indexed"] or result["commits_deleted"]:
                         console.print(
-                            f"[yellow]Rescan complete but history indexing failed:[/yellow] {e}\n"
-                            f"  Run 'devgraph index-history {repo_id}' to retry."
+                            f"[green][OK][/green] History: {result['commits_indexed']} commit(s) indexed, "
+                            f"{result['commits_deleted']} pruned"
                         )
+                except Exception as e:
+                    console.print(
+                        f"[yellow]Rescan complete but history indexing failed:[/yellow] {e}\n"
+                        f"  Run 'devgraph index-history {repo_id}' to retry."
+                    )
             finally:
                 engine.close()
         finally:
@@ -627,6 +653,20 @@ def doctor() -> None:
         console.print(f"  [red][X] Import failed:[/red] {e}")
         any_failed = True
 
+    # 3b. Indexer extractors importability smoke check
+    console.print("[bold]Indexer extractors[/bold]")
+    try:
+        import devgraph.indexer.dispatch  # noqa: F401  # eagerly imports every language extractor
+
+        console.print("  [green][OK][/green] devgraph.indexer.dispatch imports cleanly (all language extractors)")
+    except ModuleNotFoundError as e:
+        console.print(f"  [red][X] Missing dependency:[/red] {e}")
+        console.print("       Run `pip install -e '.[dev]'` to install all declared grammars.")
+        any_failed = True
+    except Exception as e:
+        console.print(f"  [red][X] Import failed:[/red] {e}")
+        any_failed = True
+
     # 4 & 5. Neo4j reachability + schema
     console.print("[bold]Neo4j[/bold]")
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
@@ -746,6 +786,87 @@ def _register_vscode(python_path: Path, repo_root: Path) -> bool:
     return True
 
 
+def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path) -> bool:
+    """Register 'devgraph' with Claude Code via `claude mcp add`, skipping if already registered."""
+    already_registered = subprocess.run(
+        [claude_path, "mcp", "get", "devgraph"],
+        cwd=str(repo_root),
+        capture_output=True,
+    ).returncode == 0
+    if already_registered:
+        console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
+        return True
+    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" -m devgraph.mcp.server'
+    console.print(f"\n[bold]Running:[/bold] {mcp_add_line}")
+    result = subprocess.run(
+        [claude_path, "mcp", "add", "devgraph", "--", str(python_path), "-m", "devgraph.mcp.server"],
+        cwd=str(repo_root),
+    )
+    return result.returncode == 0
+
+
+mcp_app = typer.Typer(help="Manage DevGraph's MCP registration with Claude Code.")
+app.add_typer(mcp_app, name="mcp")
+
+
+@mcp_app.command(name="add")
+def mcp_add() -> None:
+    """Register DevGraph as an MCP server with Claude Code (runs 'claude mcp add')."""
+    claude_path = shutil.which("claude")
+    if claude_path is None:
+        console.print("[red][X] Error:[/red] 'claude' not found on PATH")
+        raise typer.Exit(code=1)
+    if not _run_claude_mcp_add(claude_path, resolve_venv_python(), resolve_repo_root()):
+        raise typer.Exit(code=1)
+
+
+@mcp_app.command(name="remove")
+def mcp_remove() -> None:
+    """Unregister DevGraph's MCP server from Claude Code (runs 'claude mcp remove')."""
+    claude_path = shutil.which("claude")
+    if claude_path is None:
+        console.print("[red][X] Error:[/red] 'claude' not found on PATH")
+        raise typer.Exit(code=1)
+    result = subprocess.run([claude_path, "mcp", "remove", "devgraph"])
+    if result.returncode != 0:
+        raise typer.Exit(code=1)
+    console.print("[green][OK][/green] Removed 'devgraph' from Claude Code")
+
+
+@mcp_app.command(name="doctor")
+def mcp_doctor() -> None:
+    """Diagnose the DevGraph <-> Claude Code MCP registration."""
+    any_failed = False
+
+    claude_path = shutil.which("claude")
+    if claude_path is None:
+        console.print("[red][X][/red] 'claude' CLI not found on PATH")
+        any_failed = True
+    else:
+        console.print(f"[green][OK][/green] claude CLI at {claude_path}")
+        result = subprocess.run(
+            [claude_path, "mcp", "get", "devgraph"], capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            console.print("[green][OK][/green] 'devgraph' registered")
+            console.print(result.stdout.strip())
+        else:
+            console.print("[red][X][/red] 'devgraph' not registered (run 'devgraph mcp add')")
+            any_failed = True
+
+    try:
+        from devgraph.mcp.server import build_server  # noqa: F401
+
+        console.print("[green][OK][/green] devgraph.mcp.server imports cleanly")
+    except Exception as e:
+        console.print(f"[red][X] Import failed:[/red] {e}")
+        any_failed = True
+
+    if any_failed:
+        raise typer.Exit(code=1)
+    console.print("[green]All checks passed.[/green]")
+
+
 @app.command(name="client-config")
 def client_config(
     claude_mcp_add_only: bool = typer.Option(
@@ -806,22 +927,8 @@ def client_config(
             if claude_path is None:
                 console.print("[red][X] Error:[/red] 'claude' not found on PATH; skipping Claude Code registration")
                 any_failed = True
-            else:
-                already_registered = subprocess.run(
-                    [claude_path, "mcp", "get", "devgraph"],
-                    cwd=str(repo_root),
-                    capture_output=True,
-                ).returncode == 0
-                if already_registered:
-                    console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
-                else:
-                    console.print(f"\n[bold]Running:[/bold] {mcp_add_line}")
-                    result = subprocess.run(
-                        [claude_path, "mcp", "add", "devgraph", "--", str(python_path), "-m", "devgraph.mcp.server"],
-                        cwd=str(repo_root),
-                    )
-                    if result.returncode != 0:
-                        any_failed = True
+            elif not _run_claude_mcp_add(claude_path, python_path, repo_root):
+                any_failed = True
         if want_vscode:
             if not _register_vscode(python_path, repo_root):
                 any_failed = True

@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     log_file: Path | None = None
 
     dashboard_enabled: bool = True
-    dashboard_host: str = "[IP_ADDRESS]"
+    dashboard_host: str = "127.0.0.1"
     dashboard_port: int = 8765
 
 

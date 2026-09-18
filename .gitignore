@@ -13,6 +13,9 @@ dist/
 .env
 .env.*
 !.env.example
+
+# Local MCP server config (machine-specific paths, never repo material)
+.mcp.json
 .firecrawl/
 .claude/worktrees/
 .serena/

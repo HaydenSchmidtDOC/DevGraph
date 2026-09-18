@@ -322,6 +322,16 @@ def _apply_function_recency(
     if not entities:
         return
 
+    # Skip files git doesn't track (untracked/new files not yet committed):
+    # `git blame` on them fails with "no such path in HEAD", which is noise
+    # and, on the reconcile path, would otherwise log a warning per file.
+    # There's no commit history to attribute recency from anyway.
+    try:
+        if not repo.git.ls_files("--error-unmatch", "--", file_path):
+            return
+    except Exception:
+        return
+
     try:
         hunks = compute_function_recency(repo, file_path)
     except Exception as exc:
@@ -350,7 +360,7 @@ def _apply_function_recency(
         )
 
 
-def sync_git_history(engine, registry, repo_id: str, max_count: int | None = None) -> dict:
+def sync_git_history(engine, registry, repo_id: str, max_count: int | None = None, force: bool = False) -> dict:
     """Bring a repo's Commit graph and staged recency up to date with HEAD.
 
     Unlike `index_repo_history`, this is safe to call after history has been
@@ -366,6 +376,11 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
             only (mirrors `extract_new_commits`'s `max_count`); ignored on
             the fast path and never applied during reconciliation, since an
             incomplete reconcile could leave real orphans undetected.
+        force: When True, always do a full re-walk and reconcile, even if
+            HEAD hasn't moved since the last sync. This is the escape hatch
+            for repairing a graph whose MODIFIES edges were destroyed by a
+            bug (e.g. the old replace_file_nodes blanket-delete) — the
+            normal fast/noop path would otherwise never re-create them.
 
     Returns:
         A dict with `mode` (`"noop"`, `"initial"`, `"fast"`, or
@@ -388,15 +403,15 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
             return {"mode": "noop", "commits_indexed": 0, "commits_deleted": 0}
         last = repo_record.last_indexed_commit
 
-        if last == head_sha:
+        if last == head_sha and not force:
             return {"mode": "noop", "commits_indexed": 0, "commits_deleted": 0}
 
         if last is None:
             mode = "initial"
-        elif _is_ancestor(repo, last, head_sha):
-            mode = "fast"
-        else:
+        elif force or not _is_ancestor(repo, last, head_sha):
             mode = "reconcile"
+        else:
+            mode = "fast"
 
         extractor = GitHistoryExtractor(repo_id, repo_record.path)
 

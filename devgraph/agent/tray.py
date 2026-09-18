@@ -45,6 +45,29 @@ _OK_COLOR = (46, 160, 67)
 _WARN_COLOR = (200, 60, 60)
 
 
+def _configure_logging() -> None:
+    """Wire Python logging to a file handler at `settings.log_file`.
+
+    The tray runs detached (pythonw.exe, stdout/stderr = DEVNULL), so a
+    failure inside a background thread — e.g. the dashboard failing to bind
+    its port — is otherwise invisible. A `basicConfig(..., handlers=[])`
+    (the prior behavior) disables logging outright, which made exactly that
+    dashboard failure undiagnosable: `devgraph logs` reported "no log file"
+    and the tray reported "running" while the dashboard thread had silently
+    died. Write to the configured file so `devgraph logs` can actually read
+    what happened.
+    """
+    log_path = get_settings().log_file
+    if log_path is None:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+    )
+
+
 def _make_icon(color: tuple[int, int, int]) -> Image.Image:
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -361,7 +384,7 @@ class TrayApp:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, handlers=[])
+    _configure_logging()
     try:
         TrayApp().start()
     except Exception:

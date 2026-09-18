@@ -229,6 +229,37 @@ class TestRemovePaths:
         finally:
             engine.delete_repository(repo_id)
 
+    def test_removes_nodes_for_deleted_kotlin_file(self, engine, temp_repo):
+        """Deleting a .kt file must clean up its nodes.
+
+        Regression for the Kotlin-support change: `.kt` was added to the
+        indexing side (_index_single_path) but not to remove_paths, so a
+        deleted Kotlin file left stale nodes in the graph forever.
+        """
+        repo_id = "_smoketest_dispatch_remove_kt"
+        kt_file = temp_repo / "Gone.kt"
+        kt_file.write_text("class Gone {\n    fun gone() {}\n}\n")
+
+        try:
+            index_paths(engine, repo_id, temp_repo, {kt_file})
+            result = engine.run_cypher(
+                "MATCH (c:Class {repo_id: $repo_id, name: 'Gone'}) RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert result[0]["c"] == 1
+
+            kt_file.unlink()
+            cleaned = remove_paths(engine, repo_id, temp_repo, {kt_file})
+            assert cleaned == 1
+
+            result = engine.run_cypher(
+                "MATCH (c:Class {repo_id: $repo_id, name: 'Gone'}) RETURN COUNT(*) as c",
+                {"repo_id": repo_id},
+            )
+            assert result[0]["c"] == 0
+        finally:
+            engine.delete_repository(repo_id)
+
     def test_removes_document_node_for_deleted_markdown_file_in_subdirectory(self, engine, temp_repo):
         """Deleting a .md file in a subdirectory must clean up its Document node.
 
@@ -318,6 +349,75 @@ class TestFullScan:
         try:
             count = full_scan(engine, repo_id, temp_repo)
             assert count == 1
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_full_scan_prunes_nodes_for_file_deleted_since_last_index(self, engine, temp_repo):
+        """A file deleted while the watcher was down must have its nodes
+        pruned by the next full_scan — a rescan reconciles the graph to
+        disk, it doesn't just add/update what's current."""
+        repo_id = "_smoketest_dispatch_prune"
+        py_file = temp_repo / "gone.py"
+        py_file.write_text("class Gone:\n    pass\n")
+        keep_file = temp_repo / "keep.py"
+        keep_file.write_text("class Keep:\n    pass\n")
+
+        try:
+            full_scan(engine, repo_id, temp_repo)
+            result = engine.run_cypher(
+                "MATCH (c:Class {repo_id: $repo_id}) RETURN c.name as name ORDER BY c.name",
+                {"repo_id": repo_id},
+            )
+            assert [r["name"] for r in result] == ["Gone", "Keep"]
+
+            # Delete the file behind 'Gone' — no watcher running, so nothing
+            # cleans it up until the next full_scan.
+            py_file.unlink()
+            full_scan(engine, repo_id, temp_repo)
+
+            result = engine.run_cypher(
+                "MATCH (c:Class {repo_id: $repo_id}) RETURN c.name as name ORDER BY c.name",
+                {"repo_id": repo_id},
+            )
+            assert [r["name"] for r in result] == ["Keep"], "stale node for deleted file should be pruned"
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_full_scan_prunes_ignored_dir_files_indexed_before_ignore(self, engine, temp_repo):
+        """Files under a now-ignored directory (e.g. .playwright-mcp) must be
+        pruned by a rescan even though they were indexed before the ignore
+        rule existed — the disk-vs-graph diff uses the same ignore filter as
+        the index walk."""
+        repo_id = "_smoketest_dispatch_prune_ignored"
+        scratch = temp_repo / ".playwright-mcp"
+        scratch.mkdir()
+        scratch_file = scratch / "dump.txt"
+        scratch_file.write_text("scratch")
+        (temp_repo / "keep.py").write_text("class Keep:\n    pass\n")
+
+        try:
+            # Simulate a bare Module node keyed on the repo-relative path —
+            # the shape the docs/mentions extractors write, and what a file
+            # indexed before .playwright-mcp was ignored would look like.
+            engine.upsert_node(
+                "Module",
+                repo_id,
+                ".playwright-mcp/dump.txt",
+                {"type": "module", "source_file": ".playwright-mcp/dump.txt"},
+            )
+            result = engine.run_cypher(
+                "MATCH (m:Module {repo_id: $repo_id}) RETURN m.name as name",
+                {"repo_id": repo_id},
+            )
+            assert any("dump.txt" in r["name"] for r in result), "scratch file should be in graph"
+
+            # A rescan must prune it: it's not an indexable file anymore.
+            full_scan(engine, repo_id, temp_repo)
+            result = engine.run_cypher(
+                "MATCH (m:Module {repo_id: $repo_id}) RETURN m.name as name",
+                {"repo_id": repo_id},
+            )
+            assert not any("dump.txt" in r["name"] for r in result), "ignored-dir file should be pruned"
         finally:
             engine.delete_repository(repo_id)
 

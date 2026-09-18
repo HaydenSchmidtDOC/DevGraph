@@ -28,6 +28,7 @@ from devgraph.indexer.csharp.extractor import extract_csharp_file
 from devgraph.indexer.go.extractor import _find_module_path, extract_go_file
 from devgraph.indexer.java.extractor import extract_java_file
 from devgraph.indexer.jsts.extractor import extract_js_file
+from devgraph.indexer.kotlin.extractor import extract_kotlin_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
 from devgraph.indexer.cpp.extractor import extract_cpp_file
 from devgraph.indexer.python.extractor import extract_python_file
@@ -59,6 +60,15 @@ IGNORED_DIR_NAMES = {
     "obj",
     "target",
     "vendor",
+    # Kotlin/Gradle build + tool scratch (Kotlin extractor, "motonav" plan):
+    # .gradle is the venv-equivalent (build cache + expanded AAR dependency
+    # sources); .kotlin is the compiler session cache; the rest are IDE/MCP
+    # tool scratch that's never source.
+    ".gradle",
+    ".kotlin",
+    ".idea",
+    ".serena",
+    ".playwright-mcp",
     # C++ build-directory conventions (Implementation Plan #8, C++ row):
     # CLion/CMake's default out-of-source build dir names.
     "cmake-build-debug",
@@ -125,6 +135,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     java_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     rs_files: list[str] = []
     rs_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
+    kt_files: list[str] = []
+    kt_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     # Same cross-link-on-second-pass pattern as the .py branch, kept as a
     # parallel list rather than folded into py_files/py_extractions since Go
@@ -160,7 +172,7 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
                 py_files, py_extractions, js_files, js_extractions,
                 cs_files, cs_extractions, cpp_files, cpp_extractions,
                 java_files, java_extractions, rs_files, rs_extractions,
-                go_extractions,
+                kt_files, kt_extractions, go_extractions,
             )
         except Exception:
             logger.warning(
@@ -217,6 +229,12 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         engine.upsert_nodes(nodes)
         engine.upsert_relationships(rels)
 
+    # Same second-pass re-upsert for Kotlin files, for the same reason.
+    for rel_path in kt_files:
+        nodes, rels = kt_extractions[rel_path]
+        engine.upsert_nodes(nodes)
+        engine.upsert_relationships(rels)
+
     # Same second-pass rationale as the .py loop above, for Go's CALLS/
     # IMPORTS edges within this batch.
     for rel_path, (nodes, rels) in go_extractions.items():
@@ -264,6 +282,8 @@ def _index_single_path(
     java_extractions: dict[str, tuple[list[dict], list[dict]]],
     rs_files: list[str],
     rs_extractions: dict[str, tuple[list[dict], list[dict]]],
+    kt_files: list[str],
+    kt_extractions: dict[str, tuple[list[dict], list[dict]]],
     go_extractions: dict[str, tuple[list[dict], list[dict]]],
 ) -> int:
     """Extract and upsert one file's graph output, routing by name/extension.
@@ -361,6 +381,18 @@ def _index_single_path(
         indexed += 1
         rs_files.append(rel_path)
         rs_extractions[rel_path] = (nodes, rels)
+    elif resolved.suffix == ".kt":
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+        result = extract_kotlin_file(content, rel_path, repo_id)
+        nodes = [n.to_dict() for n in result.nodes]
+        rels = [r.to_dict() for r in result.relationships]
+        # Same replace-then-re-upsert rationale as the .py branch above: a
+        # class/function removed from the file must not survive in the graph
+        # as a stale node.
+        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        indexed += 1
+        kt_files.append(rel_path)
+        kt_extractions[rel_path] = (nodes, rels)
     elif resolved.suffix == ".go":
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_go_file(content, rel_path, repo_id, module_path)
@@ -451,7 +483,7 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
         if not str(resolved).startswith(str(repo_root.resolve())):
             continue
 
-        if resolved.suffix in (".py", ".cs", ".java", ".rs", ".go"):
+        if resolved.suffix in (".py", ".cs", ".java", ".rs", ".go", ".kt"):
             # Must match the same repo-relative key index_paths() writes
             # (Module nodes are keyed by path relative to repo_root, not
             # bare filename — see the corresponding extractor's index_file
@@ -491,6 +523,18 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
                 rel_path = resolved.name
             engine.delete_nodes_by_source_file(repo_id, rel_path)
             cleaned += 1
+        else:
+            # Any other file that has a bare Module node keyed on its
+            # repo-relative path (docs/mentions extractors' shape, or a
+            # file indexed before its extension was routed). The delete
+            # Cypher matches Module.name == path, so no extension routing
+            # is needed here — just clean up whatever names this path.
+            try:
+                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
+            except ValueError:
+                module_name = resolved.name
+            engine.delete_nodes_by_source_file(repo_id, module_name)
+            cleaned += 1
     return cleaned
 
 
@@ -504,9 +548,56 @@ def _is_indexable_file(path: Path) -> bool:
         return False
 
 
+def _indexable_paths(repo_root: Path) -> set[Path]:
+    """Every file under repo_root that a full scan would index: a regular
+    file, not under an ignored directory. Shared by full_scan (which indexes
+    them) and prune_stale_files (which diffs them against the graph)."""
+    return {p for p in repo_root.rglob("*") if _is_indexable_file(p) and not is_ignored_path(p)}
+
+
+def prune_stale_files(
+    engine: GraphEngine,
+    repo_id: str,
+    repo_root: Path,
+    docs_path: str | None = None,
+    mentions_enabled: bool = False,
+) -> int:
+    """Delete graph nodes whose file no longer exists on disk.
+
+    The reconcile half of a rescan: full_scan re-indexes everything that's
+    currently on disk, but nothing ever removed nodes for files that were
+    deleted while the watcher was down (or that a watcher event missed).
+    Without this, a rescan is additive-only and stale nodes linger forever.
+
+    Conservative by construction: only file-provenance nodes
+    (`source_file`/`file` keys) are reconciled — `Commit`/`Repository` nodes
+    and `source`-keyed nodes (Container/Service/API, co-produced by several
+    files) are never touched here. The diff is disk-vs-graph: every path the
+    graph believes it has indexed that is no longer an indexable file on
+    disk is routed through remove_paths, which handles the
+    delete-vs-unclaim distinction per node.
+
+    Returns the number of files pruned.
+    """
+    on_disk = {p.resolve().relative_to(repo_root.resolve()).as_posix() for p in _indexable_paths(repo_root)}
+    in_graph = engine.list_indexed_files(repo_id)
+    stale = in_graph - on_disk
+    if not stale:
+        return 0
+    stale_paths = {repo_root / p for p in stale}
+    return remove_paths(engine, repo_id, repo_root, stale_paths)
+
+
 def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str | None = None, mentions_enabled: bool = False) -> int:
-    """Walk every file under repo_root and index it, skipping VCS/build/venv noise. Used by `devgraph add`/`rescan`."""
-    all_files = {p for p in repo_root.rglob("*") if _is_indexable_file(p) and not is_ignored_path(p)}
+    """Walk every file under repo_root and index it, skipping VCS/build/venv noise. Used by `devgraph add`/`rescan`.
+
+    Reconciles the graph to disk before indexing: any file the graph has
+    nodes for that no longer exists on disk is pruned first (see
+    prune_stale_files), so a rescan heals stale nodes left by a watcher
+    that was down or missed events — not just adds/updates what's current.
+    """
+    prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
+    all_files = _indexable_paths(repo_root)
     return index_paths(engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled)
 
 

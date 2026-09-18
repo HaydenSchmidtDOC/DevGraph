@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 _DELETE_BY_SOURCE_FILE_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) "
     "WHERE n.source_file = $file_name OR n.file = $file_name "
+    "   OR (n:Module AND n.name = $file_name) "
     "DETACH DELETE n"
 )
 
@@ -43,6 +44,24 @@ _UNCLAIM_SOURCE_CYPHER = (
     "  AND (n.source = $file_name OR $file_name IN coalesce(n.sources, [])) "
     "SET n.sources = [s IN coalesce(n.sources, [n.source]) WHERE s <> $file_name] "
     "WITH n WHERE size(n.sources) = 0 "
+    "DETACH DELETE n"
+)
+
+# Used by _replace_file_nodes_tx: delete only the file-scoped symbol nodes
+# (Class/Function) whose symbol no longer exists in the file's current
+# extraction. Unlike _DELETE_BY_SOURCE_FILE_CYPHER, this does NOT DETACH
+# DELETE every node with the file's provenance — surviving nodes keep their
+# incoming edges (MODIFIES from git history, MENTIONS from docs, cross-file
+# CALLS/IMPORTS), which a blanket delete-then-recreate silently destroyed.
+# The Module node (the file itself) is always excluded and MERGEd in place.
+# `keep` is a list of [label, name] pairs for the file-scoped nodes the
+# current extraction still produces; an empty list (file now has no
+# classes/functions) correctly deletes them all.
+_DELETE_STALE_FILE_NODES_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) "
+    "WHERE NOT n:Module "
+    "  AND (n.file = $file_name OR n.source_file = $file_name) "
+    "  AND NOT any(pair IN $keep WHERE labels(n)[0] = pair[0] AND n.name = pair[1]) "
     "DETACH DELETE n"
 )
 
@@ -231,7 +250,25 @@ def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
 def _replace_file_nodes_tx(
     tx, repo_id: str, file_name: str, nodes: list[dict[str, Any]], rels: list[dict[str, Any]]
 ) -> None:
-    tx.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
+    # Delete only the file-scoped nodes (Class/Function, keyed on `file`)
+    # whose symbol is no longer in the file's current extraction. The Module
+    # node (keyed on `source_file`) and any surviving Class/Function nodes
+    # are MERGEd in place below, so their incoming edges — MODIFIES from git
+    # history, MENTIONS from docs, cross-file CALLS/IMPORTS — are preserved.
+    # A blanket DETACH DELETE of every node with this file's provenance (the
+    # old behavior) destroyed those edges on every reindex, which is why
+    # git-history MODIFIES edges silently vanished for any file re-indexed
+    # after history was synced.
+    keep = [
+        [node["label"], node["name"]]
+        for node in nodes
+        if node["label"] != "Module"
+        and (
+            (node.get("properties") or {}).get("file") == file_name
+            or (node.get("properties") or {}).get("source_file") == file_name
+        )
+    ]
+    tx.run(_DELETE_STALE_FILE_NODES_CYPHER, repo_id=repo_id, file_name=file_name, keep=keep)
     tx.run(_UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name)
     _upsert_nodes_tx(tx, nodes)
     _upsert_relationships_tx(tx, rels)
@@ -414,6 +451,32 @@ class GraphEngine:
         with self._driver.session() as session:
             _retry_transient(session.run, _DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
             _retry_transient(session.run, _UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name)
+
+    def list_indexed_files(self, repo_id: str) -> set[str]:
+        """Return every repo-relative path that currently backs file-provenance
+        nodes for this repo.
+
+        The "what's in the graph" side of full_scan's reconcile diff: a
+        rescan must prune nodes whose file no longer exists on disk, and
+        this is the authoritative list of files the graph believes it has
+        indexed. Covers both provenance styles: `source_file`/`file`
+        properties, and bare `Module` nodes whose `name` *is* the file path
+        (the docs/mentions extractors' shape). `Commit`/`Repository` nodes
+        and `source`-keyed nodes (Container/Service/API, co-produced by
+        several files) are deliberately excluded — they're not keyed to a
+        single file, so they can't be reconciled against the disk walk.
+        """
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) "
+                "WHERE n.source_file IS NOT NULL OR n.file IS NOT NULL "
+                "   OR (n:Module AND n.name IS NOT NULL) "
+                "RETURN DISTINCT coalesce(n.source_file, n.file, n.name) AS path",
+                repo_id=repo_id,
+            )
+            records = result or []
+            return {record["path"] for record in records if record["path"]}
 
     def stage_recency(
         self,

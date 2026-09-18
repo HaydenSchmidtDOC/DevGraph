@@ -125,6 +125,55 @@ def test_modifies_edge_resolves_for_nested_file(graph_engine, registry):
             graph_engine.delete_repository(record.repo_id)
 
 
+def test_reindex_preserves_modifies_edges(graph_engine, registry):
+    """Re-indexing a file must NOT destroy its git-history MODIFIES edges.
+
+    Regression for the bug where replace_file_nodes DETACH-DELETEd every
+    node with the file's provenance on each reindex, silently destroying
+    the Commit -> Module MODIFIES edges created by a prior history sync.
+    The Module node must be MERGEd in place (keeping its incoming edges),
+    and only stale Class/Function nodes pruned.
+    """
+    from devgraph.indexer.python.extractor import index_file
+
+    repo_id = "_smoketest_git_history_reindex_preserves"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_path = Path(tmpdir)
+        _run_git(repo_path, "init")
+        _run_git(repo_path, "config", "user.email", "test@example.com")
+        _run_git(repo_path, "config", "user.name", "Test Author")
+
+        py_file = repo_path / "service.py"
+        py_file.write_text("class Service:\n    pass\n")
+        _run_git(repo_path, "add", "service.py")
+        _run_git(repo_path, "commit", "-m", "Add service")
+
+        record = registry.add_repo(repo_path, repo_id=repo_id)
+
+        try:
+            # Index the file, then sync history so the MODIFIES edge exists.
+            index_file(graph_engine, record.repo_id, py_file, repo_root=repo_path)
+            index_repo_history(graph_engine, registry, record.repo_id)
+            result = graph_engine.run_cypher(
+                "MATCH (c:Commit {repo_id: $repo_id})-[:MODIFIES]->"
+                "(m:Module {name: 'service.py'}) RETURN COUNT(*) as count",
+                {"repo_id": record.repo_id},
+            )
+            assert result[0]["count"] == 1, "MODIFIES edge should exist after history sync"
+
+            # Re-index the same file (as a watcher/rescan would). The
+            # MODIFIES edge must survive.
+            index_file(graph_engine, record.repo_id, py_file, repo_root=repo_path)
+            result = graph_engine.run_cypher(
+                "MATCH (c:Commit {repo_id: $repo_id})-[:MODIFIES]->"
+                "(m:Module {name: 'service.py'}) RETURN COUNT(*) as count",
+                {"repo_id": record.repo_id},
+            )
+            assert result[0]["count"] == 1, "MODIFIES edge must survive a reindex"
+        finally:
+            graph_engine.delete_repository(record.repo_id)
+
+
 def test_sync_git_history_initial_walk_stages_module_recency(graph_engine, temp_git_repo, registry):
     repo_id = "_smoketest_sync_initial"
     record = registry.add_repo(temp_git_repo, repo_id=repo_id)
@@ -208,6 +257,58 @@ def test_sync_git_history_reconcile_deletes_orphans_and_resets_recency(
             {"repo_id": record.repo_id},
         )
         assert result[0]["count"] == 1
+    finally:
+        graph_engine.delete_repository(record.repo_id)
+
+
+def test_sync_git_history_force_resyncs_even_when_head_unchanged(graph_engine, temp_git_repo, registry):
+    """force=True must do a full re-walk even when HEAD hasn't moved.
+
+    Regression for the repair path: a normal sync is a noop when
+    last_indexed_commit == HEAD, so MODIFIES edges destroyed by a bug (the
+    old replace_file_nodes blanket-delete) would never be re-created.
+    force=True routes to the reconcile path regardless, re-creating them.
+    """
+    from devgraph.indexer.python.extractor import index_file
+
+    repo_id = "_smoketest_sync_force"
+    record = registry.add_repo(temp_git_repo, repo_id=repo_id)
+    py_file = temp_git_repo / "service.py"
+
+    try:
+        # Index the file, sync history (MODIFIES edge created).
+        index_file(graph_engine, record.repo_id, py_file, repo_root=temp_git_repo)
+        sync_git_history(graph_engine, registry, record.repo_id)
+        result = graph_engine.run_cypher(
+            "MATCH (c:Commit {repo_id: $repo_id})-[:MODIFIES]->(m:Module {name: 'service.py'}) RETURN COUNT(*) as count",
+            {"repo_id": record.repo_id},
+        )
+        assert result[0]["count"] == 1
+
+        # HEAD unchanged: a normal sync is a noop.
+        outcome = sync_git_history(graph_engine, registry, record.repo_id)
+        assert outcome["mode"] == "noop"
+
+        # Simulate the bug: destroy the MODIFIES edge (as the old
+        # replace_file_nodes blanket-delete did).
+        graph_engine.run_cypher(
+            "MATCH (c:Commit {repo_id: $repo_id})-[r:MODIFIES]->(m:Module {name: 'service.py'}) DELETE r",
+            {"repo_id": record.repo_id},
+        )
+        result = graph_engine.run_cypher(
+            "MATCH (c:Commit {repo_id: $repo_id})-[:MODIFIES]->(m:Module {name: 'service.py'}) RETURN COUNT(*) as count",
+            {"repo_id": record.repo_id},
+        )
+        assert result[0]["count"] == 0
+
+        # force=True must re-create it even though HEAD hasn't moved.
+        outcome = sync_git_history(graph_engine, registry, record.repo_id, force=True)
+        assert outcome["mode"] == "reconcile"
+        result = graph_engine.run_cypher(
+            "MATCH (c:Commit {repo_id: $repo_id})-[:MODIFIES]->(m:Module {name: 'service.py'}) RETURN COUNT(*) as count",
+            {"repo_id": record.repo_id},
+        )
+        assert result[0]["count"] == 1, "force=True must re-create destroyed MODIFIES edges"
     finally:
         graph_engine.delete_repository(record.repo_id)
 
