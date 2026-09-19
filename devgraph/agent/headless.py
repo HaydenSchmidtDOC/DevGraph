@@ -31,6 +31,26 @@ from devgraph.watcher.manager import WatcherManager
 logger = logging.getLogger(__name__)
 
 
+def _configure_logging() -> None:
+    """Wire Python logging to a file handler at `settings.log_file`.
+
+    Mirrors `devgraph.agent.tray._configure_logging` — same level, format and
+    destination — so `devgraph logs` reads the same records whether the tray
+    app runs with its tray UI or as `HeadlessAgent`. The prior
+    `basicConfig(level=logging.INFO)` here left records on stderr only, so
+    `devgraph logs` reported no log file for a container deployment.
+    """
+    log_path = get_settings().log_file
+    if log_path is None:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+    )
+
+
 class HeadlessAgent:
     """Same responsibilities as `devgraph.agent.tray.TrayApp`, minus the icon."""
 
@@ -187,7 +207,7 @@ class HeadlessAgent:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    _configure_logging()
     agent = HeadlessAgent()
 
     def _handle_signal(signum, frame) -> None:
