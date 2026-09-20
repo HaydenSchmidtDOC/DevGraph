@@ -224,80 +224,112 @@ function runLabelChecks() {
 }
 
 /* ---------------------------------------------------------------------
-   Ambient rotation. Driven by hand here (requestAnimationFrame stubbed to a
-   no-op, timestamps supplied) so the tick is just a function call.
-   Two things worth pinning down: that it rotates node MODEL positions --
-   rotating the rendered layer with a CSS transform is much cheaper but
-   turns the labels drawn into that layer, which is the regression this
-   replaced -- and that it does so at a bounded rate, which is what made the
-   per-frame version expensive in the first place. */
+   Exercise the real rotation loop with a deterministic animation-frame queue.
+   Frames update visible nodes; periodic full passes catch off-screen nodes up
+   from their fixed base positions. Visibility changes stop and re-arm the loop. */
 function runRotationChecks() {
+  const pivot = { x: 100, y: 100 };
   const nodeState = [];
-  const mkNode = (x, y) => {
-    const s = { x, y };
-    nodeState.push(s);
-    return { position: p => (p === undefined ? { x: s.x, y: s.y } : Object.assign(s, p)) };
+  const mkNode = (id, x, y) => {
+    const pos = { x, y };
+    nodeState.push(pos);
+    return { id: () => id, position: p => p === undefined ? { ...pos } : Object.assign(pos, p) };
+  };
+  const liveNodes = [mkNode("visible", 640, 100), mkNode("offscreen", 100, 640)];
+  const bases = new Map(liveNodes.map(n => [n.id(), n.position()]));
+  let styleWrites = 0, cullPasses = 0, now = 0;
+  const pending = [];
+  const listeners = {};
+  const context = {
+    document: { hidden: false, addEventListener: (event, fn) => { listeners[event] = fn; } },
+    requestAnimationFrame: fn => pending.push(fn),
+    performance: { now: () => now },
+    cy: {
+      nodes: () => liveNodes,
+      batch: fn => fn(),
+      container: () => ({ style: new Proxy({}, { set: () => (styleWrites++, true) }) }),
+    },
+    state: { rotationEnabled: true },
+    rotationPivot: pivot, rotationBasePositions: bases, rotationAngle: 0,
+    userInteracting: false, graphSettling: false,
+    lastRotationTime: 0, lastRotationCullTime: 0, rotationLoopArmed: false,
+    cachedOnscreenNodes: [liveNodes[0]],
+    updateViewportCulling: () => cullPasses++,
   };
   const rotSrc = [
-    grab(/^const ROTATION_DEG_PER_SEC/m, "\n}"),   // constants + rotationTick
+    grab(/^const ROTATION_CULL_INTERVAL_MS/m, ";"),
+    grab(/^const ROTATION_DEG_PER_SEC/m, "\n}"),
+    grab(/^function armRotationLoop\(\)/m, "\n}"),
+    grab(/^document.addEventListener\("visibilitychange"/m, "});"),
   ].join("\n");
-  let styleWrites = 0;
-  const container = { style: new Proxy({}, { set: () => (styleWrites++, true) }) };
-  let pivot = { x: 100, y: 100 };
-  const stub = {
-    document: { hidden: false },
-    requestAnimationFrame: () => {},
-    performance,
-    Math,
-    get cy() { return cyStub; },
+  const vm = require("vm");
+  vm.createContext(context);
+  vm.runInContext(rotSrc, context);
+  const frame = timestamp => {
+    now = timestamp;
+    const callback = pending.shift();
+    if (!callback) throw new Error("expected one scheduled animation frame");
+    callback(now);
   };
-  const cyStub = {
-    nodes: () => { const a = liveNodes; a.forEach = Array.prototype.forEach.bind(liveNodes); return a; },
-    batch: fn => fn(),
-    container: () => container,
+  const snapshot = () => JSON.stringify(nodeState);
+  const expected = (index, elapsedMs) => {
+    const base = bases.get(liveNodes[index].id());
+    const angle = 0.3 * elapsedMs / 1000 * Math.PI / 180;
+    return { x: pivot.x + (base.x - pivot.x) * Math.cos(angle) - (base.y - pivot.y) * Math.sin(angle),
+      y: pivot.y + (base.x - pivot.x) * Math.sin(angle) + (base.y - pivot.y) * Math.cos(angle) };
   };
-  /* 540 units from the pivot stands in for the worst on-screen case:
-     fitToCircle always frames the graph so the pivot's radius fits the
-     viewport, so a node can never be further from the pivot on screen than
-     half the viewport's smaller side -- ~540px on a 1080p display. Testing
-     at that radius is testing the largest step any node can actually take. */
-  let liveNodes = [mkNode(100 + 540, 100), mkNode(100, 100 + 540)];
-  const ctx = {
-    document: stub.document, requestAnimationFrame: stub.requestAnimationFrame,
-    cy: cyStub, rotationPivot: pivot, userInteracting: false,
-    lastRotationTime: 0, rotationLoopArmed: true,
+  const matches = (index, elapsedMs) => {
+    const want = expected(index, elapsedMs), got = nodeState[index];
+    return Math.hypot(got.x - want.x, got.y - want.y) < 1e-8;
   };
-  const fn = new Function("document", "requestAnimationFrame", "cy",
-    "rotationPivot", "userInteracting", "lastRotationTime", "rotationLoopArmed",
-    "let __t = lastRotationTime;\n" +
-    rotSrc.replace(/lastRotationTime = now;/, "__t = now; lastRotationTime = now;")
-          .replace(/const elapsed = now - lastRotationTime;/, "const elapsed = now - __t;") +
-    "\nreturn { rotationTick, ROTATION_TICK_MS, ROTATION_DEG_PER_SEC };");
-  const rot = fn(ctx.document, ctx.requestAnimationFrame, ctx.cy, ctx.rotationPivot,
-    ctx.userInteracting, ctx.lastRotationTime, ctx.rotationLoopArmed);
 
-  const distTo = s => Math.hypot(s.x - pivot.x, s.y - pivot.y);
-  const before = nodeState.map(distTo);
-  const startX = nodeState[0].x, startY = nodeState[0].y;
-
-  rot.rotationTick(10); // well under one tick interval
-  check("does not rotate before a full tick interval has passed",
-    nodeState[0].x === startX && nodeState[0].y === startY,
-    JSON.stringify(nodeState[0]));
-
-  rot.rotationTick(rot.ROTATION_TICK_MS + 10);
-  const moved = nodeState[0].x !== startX || nodeState[0].y !== startY;
-  check("rotates node model positions once a tick interval has passed",
-    moved, JSON.stringify(nodeState[0]));
-  check("rotates positions rather than CSS-transforming the rendered layer, which would lean the labels",
-    styleWrites === 0, styleWrites + " style writes");
-
-  const after = nodeState.map(distTo);
+  context.armRotationLoop();
+  context.armRotationLoop();
+  check("repeated arming schedules only one rotation loop", pending.length === 1, pending.length);
+  frame(10);
+  check("visible nodes rotate on the first animation frame", matches(0, 10) && nodeState[0].y > 100, snapshot());
+  check("off-screen nodes wait for a full culling pass", nodeState[1].x === 100 && cullPasses === 0, snapshot());
+  frame(26);
+  check("successive visible frames use the fixed base without compounding rotation", matches(0, 26), snapshot());
+  check("normal frames move the outermost visible node under one pixel",
+    Math.hypot(nodeState[0].x - 640, nodeState[0].y - 100) < 1, snapshot());
+  const interval = vm.runInContext("ROTATION_CULL_INTERVAL_MS", context);
+  frame(interval);
+  check("periodic full pass catches all nodes up to the same absolute angle",
+    matches(0, interval) && matches(1, interval) && cullPasses === 1, snapshot());
   check("rigid rotation preserves every node's distance from the pivot",
-    after.every((d, i) => Math.abs(d - before[i]) < 1e-6),
-    JSON.stringify({ before, after }));
+    nodeState.every(p => Math.abs(Math.hypot(p.x - pivot.x, p.y - pivot.y) - 540) < 1e-8), snapshot());
+  check("rotation never CSS-transforms the rendered labels", styleWrites === 0, styleWrites);
 
-  const stepPx = Math.hypot(nodeState[0].x - startX, nodeState[0].y - startY);
-  check(`one tick moves the outermost on-screen node under a pixel (${stepPx.toFixed(3)}px at r=${before[0].toFixed(0)})`,
-    stepPx < 1, stepPx + "px");
+  const beforeHidden = snapshot();
+  context.document.hidden = true;
+  listeners.visibilitychange();
+  frame(interval + 16);
+  check("hidden tab stops rotation and leaves no animation callback pending",
+    snapshot() === beforeHidden && !context.rotationLoopArmed && pending.length === 0, snapshot());
+  now = 60000;
+  context.document.hidden = false;
+  listeners.visibilitychange();
+  listeners.visibilitychange();
+  check("visibility resume arms exactly one callback and resets elapsed time",
+    pending.length === 1 && context.lastRotationTime === now, pending.length);
+  frame(now + 16);
+  check("resume excludes time spent hidden from rotation",
+    matches(0, interval + 16) && matches(1, interval + 16), snapshot());
+
+  for (const flag of ["userInteracting", "graphSettling"]) {
+    const beforePause = snapshot();
+    context[flag] = true;
+    frame(now + 16);
+    check(`${flag} pauses position updates while retaining one loop`,
+      snapshot() === beforePause && pending.length === 1, snapshot());
+    context[flag] = false;
+  }
+  const beforeDisabled = snapshot();
+  context.state.rotationEnabled = false;
+  frame(now + 16);
+  check("disabled rotation stops scheduling and preserves positions",
+    snapshot() === beforeDisabled && pending.length === 0 && !context.rotationLoopArmed, snapshot());
+  context.armRotationLoop();
+  check("disabled rotation cannot re-arm", pending.length === 0, pending.length);
 }
