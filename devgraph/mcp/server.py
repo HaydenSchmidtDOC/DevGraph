@@ -24,13 +24,24 @@ a human copy-pasting a doc into another repo's CLAUDE.md/AGENTS.md:
     it can never drift out of sync with the actual tool surface since it's
     served from the same process that registers the tools.
 
+Every tool call is recorded, metadata only (timestamp, tool name, repo_id,
+duration, success), to a local JSONL store in the DevGraph state directory —
+see `record_tool_call` below. It exists because this process is short-lived
+and separate from the dashboard's, and the dashboard reads it back over
+`GET /api/mcp-telemetry`. Nothing about it leaves the machine.
+
 Run directly: `.venv/Scripts/python -m devgraph.mcp.server`
 """
 
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 import logging
+import os
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +54,23 @@ from devgraph.graph.engine import GraphEngine
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.registry.store import RepoRegistry
 
+logger = logging.getLogger(__name__)
+
 _CLIENT_GUIDE_PATH = Path(__file__).resolve().parent.parent.parent / "DEVGRAPH-CLIENT.md"
+
+# Tool-call telemetry. Deliberately a file rather than an in-process buffer
+# like dashboard/query_log.py's: an MCP client spawns its own short-lived
+# server process per connection (see this module's docstring), so a record
+# that dies with the process would be unreadable by the dashboard running in
+# a different one, and several connected clients record at the same time.
+_TELEMETRY_FILENAME = "mcp_telemetry.jsonl"
+# Kept in step with QueryLog's own ring-buffer size, so the two telemetry
+# sources the dashboard reads hold a comparable amount of history.
+_TELEMETRY_MAX_ENTRIES = 500
+# Trimming rewrites the whole file, so it's amortised: append freely until
+# the store is comfortably past the cap's worth of ~120-byte records, then
+# cut back to the newest _TELEMETRY_MAX_ENTRIES.
+_TELEMETRY_TRIM_AT_BYTES = 256 * 1024
 
 # Every DevGraph tool queries the graph or reads a file off disk; none of them
 # ever write to Neo4j (writes only happen through the indexer/watcher/CLI, not
@@ -83,6 +110,123 @@ _TOOL_CATALOG: list[dict[str, Any]] = [
 ]
 
 
+def telemetry_path() -> Path:
+    """Local JSONL store of MCP tool calls.
+
+    Lives in the existing DevGraph state directory next to registry.sqlite3
+    and devgraph.log (RepoRegistry already creates that directory). Local
+    file only — nothing here is ever sent anywhere, and this is unrelated to
+    `Settings.telemetry_enabled`, which governs outbound telemetry.
+    """
+    return get_settings().registry_db_path.parent / _TELEMETRY_FILENAME
+
+
+def record_tool_call(*, tool: str, repo_id: str | None, duration_ms: float, ok: bool) -> None:
+    """Append one metadata-only record of a tool call.
+
+    Records *that* a tool ran, never *what* was asked or answered: no
+    arguments, no Cypher, no results — only the five fields written below.
+
+    Append-safe across the concurrently-connected clients' separate server
+    processes: a single O_APPEND write of one line well under PIPE_BUF, which
+    the OS will not interleave with another process's. Never raises and never
+    blocks on a lock — telemetry must not be able to fail a tool call.
+    """
+    path = telemetry_path()
+    line = json.dumps(
+        {"ts": time.time(), "tool": tool, "repo_id": repo_id, "duration_ms": duration_ms, "ok": ok},
+        separators=(",", ":"),
+    )
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, (line + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        if path.stat().st_size > _TELEMETRY_TRIM_AT_BYTES:
+            _trim_telemetry(path)
+    except Exception:
+        logger.debug("failed to record MCP tool telemetry", exc_info=True)
+
+
+def _trim_telemetry(path: Path) -> None:
+    """Cut the store back to its newest `_TELEMETRY_MAX_ENTRIES` records.
+
+    Bounded by rewriting rather than by locking: the replacement is built in
+    a PID-suffixed temp file and swapped in with an atomic os.replace, so a
+    reader never observes a half-written store, and two server processes
+    trimming at the same moment can at worst drop each other's newest few
+    records instead of corrupting the file.
+    """
+    lines = path.read_bytes().splitlines(keepends=True)[-_TELEMETRY_MAX_ENTRIES:]
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_bytes(b"".join(lines))
+    os.replace(tmp, path)
+
+
+def read_tool_telemetry(limit: int) -> list[dict[str, Any]]:
+    """Return up to `limit` recorded tool calls, newest first.
+
+    Read-only and never raises: a missing store reads as no records, and an
+    unparseable line is skipped rather than failing the whole read, so a
+    corrupt file costs the dashboard some history instead of an error.
+    """
+    try:
+        raw = telemetry_path().read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in raw.splitlines()[-limit:]:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    entries.reverse()
+    return entries
+
+
+def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap one tool function so that every call to it is recorded.
+
+    `functools.wraps` carries over __name__/__doc__/__annotations__ and sets
+    __wrapped__, so the SDK derives the same tool name, description and
+    argument schema from the wrapper as it did from the function — the tool
+    surface a client sees is unchanged.
+
+    The result and any exception pass through untouched: the record is
+    written from a `finally`, so a failing call is recorded as failed and
+    then keeps propagating as the exact exception the tool raised.
+    """
+    params = list(inspect.signature(fn).parameters)
+    repo_id_at = params.index("repo_id") if "repo_id" in params else None
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if repo_id_at is None:
+            repo_id = None
+        elif len(args) > repo_id_at:
+            repo_id = args[repo_id_at]
+        else:
+            repo_id = kwargs.get("repo_id")
+        start = time.monotonic()
+        ok = False
+        try:
+            result = fn(*args, **kwargs)
+            ok = True
+            return result
+        finally:
+            record_tool_call(
+                tool=fn.__name__,
+                repo_id=repo_id if isinstance(repo_id, str) else None,
+                duration_ms=(time.monotonic() - start) * 1000,
+                ok=ok,
+            )
+
+    return wrapper
+
+
 def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> MCPServer:
     """Construct an MCPServer with every DevGraph tool registered against `engine`.
 
@@ -106,6 +250,18 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
             "multiple registered repositories."
         ),
     )
+
+    # Single chokepoint for tool-call telemetry: every `@server.tool(...)`
+    # registration below goes through this rebound decorator, including any
+    # tool added later, so instrumentation can't be forgotten on a new tool
+    # the way a per-tool wrapper would be.
+    _register_tool = server.tool
+
+    def _instrumented_tool(*args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Any]:
+        register = _register_tool(*args, **kwargs)
+        return lambda fn: register(_instrument(fn))
+
+    server.tool = _instrumented_tool  # type: ignore[method-assign]
 
     @server.tool(annotations=_READ_ONLY)
     def search_component(
@@ -361,7 +517,6 @@ def main() -> None:
     engine.init_schema()
     registry = RepoRegistry(settings.registry_db_path)
 
-    logger = logging.getLogger(__name__)
     try:
         lifecycle.start_tray_if_not_running()
         lifecycle.register_tray_holder()
