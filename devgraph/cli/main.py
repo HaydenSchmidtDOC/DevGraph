@@ -737,15 +737,19 @@ def doctor() -> None:
 
 
 def _vscode_mcp_config_path() -> Path:
-    """User-level VS Code MCP config path.
-
-    Windows only today (matches the rest of the CLI's Windows-first scope);
-    `%APPDATA%` is always set in a normal Windows user session.
-    """
-    appdata = os.environ.get("APPDATA")
-    if not appdata:
-        raise RuntimeError("%APPDATA% is not set; cannot locate VS Code's user config directory")
-    return Path(appdata) / "Code" / "User" / "mcp.json"
+    """Default user-level VS Code MCP config path for the current platform."""
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            raise RuntimeError("%APPDATA% is not set; cannot locate VS Code's user config directory")
+        config_home = Path(appdata)
+    elif sys.platform == "darwin":
+        config_home = Path.home() / "Library" / "Application Support"
+    elif sys.platform == "linux":
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    else:
+        raise RuntimeError(f"VS Code config location is unsupported on {sys.platform}")
+    return config_home / "Code" / "User" / "mcp.json"
 
 
 def _register_vscode(python_path: Path, repo_root: Path) -> bool:
