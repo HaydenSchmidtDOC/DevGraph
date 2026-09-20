@@ -1979,7 +1979,16 @@ function armRotationLoop() {
   lastRotationTime = performance.now();
   requestAnimationFrame(rotationTick);
 }
-document.addEventListener("visibilitychange", () => { if (!document.hidden) armRotationLoop(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  /* Chrome normally suspends rAF entirely in a background tab, so the
+     already-queued callback can remain armed without ever reaching
+     rotationTick's hidden guard. Reset the clock unconditionally on resume:
+     armRotationLoop may correctly decline to queue a duplicate callback, but
+     time spent backgrounded must never become catch-up model movement. */
+  lastRotationTime = performance.now();
+  armRotationLoop();
+});
 
 /* ── glow layer: additive-blend radial gradients drawn behind cytoscape's own
    canvas, synced to real node screen positions. Two intensities share one

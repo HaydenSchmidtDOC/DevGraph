@@ -301,21 +301,35 @@ function runRotationChecks() {
     nodeState.every(p => Math.abs(Math.hypot(p.x - pivot.x, p.y - pivot.y) - 540) < 1e-8), snapshot());
   check("rotation never CSS-transforms the rendered labels", styleWrites === 0, styleWrites);
 
-  const beforeHidden = snapshot();
+  /* Chrome suspends requestAnimationFrame in a background tab, so model the
+     normal case where the already-queued callback does not run while hidden.
+     Resuming must reset the clock even though the loop still says it is armed. */
   context.document.hidden = true;
   listeners.visibilitychange();
-  frame(interval + 16);
-  check("hidden tab stops rotation and leaves no animation callback pending",
-    snapshot() === beforeHidden && !context.rotationLoopArmed && pending.length === 0, snapshot());
   now = 60000;
   context.document.hidden = false;
   listeners.visibilitychange();
   listeners.visibilitychange();
-  check("visibility resume arms exactly one callback and resets elapsed time",
+  check("visibility resume keeps one suspended callback and resets elapsed time",
+    pending.length === 1 && context.lastRotationTime === now,
+    JSON.stringify({ pending: pending.length, lastRotationTime: context.lastRotationTime, now }));
+  frame(now + 16);
+  check("resume excludes time spent suspended in the background",
+    matches(0, interval + 16) && matches(1, interval + 16), snapshot());
+
+  /* Also retain coverage for engines that do deliver one frame after hiding. */
+  const beforeHidden = snapshot();
+  context.document.hidden = true;
+  listeners.visibilitychange();
+  frame(now + 32);
+  check("a frame delivered while hidden stops rotation and leaves no callback pending",
+    snapshot() === beforeHidden && !context.rotationLoopArmed && pending.length === 0, snapshot());
+  now += 1000;
+  context.document.hidden = false;
+  listeners.visibilitychange();
+  check("a stopped hidden loop re-arms exactly one callback",
     pending.length === 1 && context.lastRotationTime === now, pending.length);
   frame(now + 16);
-  check("resume excludes time spent hidden from rotation",
-    matches(0, interval + 16) && matches(1, interval + 16), snapshot());
 
   for (const flag of ["userInteracting", "graphSettling"]) {
     const beforePause = snapshot();
