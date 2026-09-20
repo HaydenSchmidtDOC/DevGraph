@@ -1,97 +1,113 @@
 # DevGraph
 
-A local-first knowledge graph for your codebase — built for AI coding assistants to query instead of re-reading source files on every request.
+A local-first, live-updating knowledge graph for codebases. DevGraph indexes explicitly registered repositories into Neo4j so coding assistants can query structure, dependencies, history, and design context without repeatedly scanning the whole tree.
 
-DevGraph builds and live-updates a structured graph (Neo4j) of explicitly-registered repositories: code structure, container/API/datastore topology, design intent, and git/PR/issue history. It exposes that graph to coding assistants through an MCP server, and to you through a live web dashboard. A background watcher keeps everything current as files change — no manual rescans, no stale answers.
+It provides:
+
+- purpose-built MCP tools for callers, impact, architecture, source, recency, requirements, mentions, and repository history;
+- a CLI for setup, repository management, diagnostics, export, and MCP registration;
+- a loopback-only dashboard for exploring the graph, git history, query results, and saved layouts; and
+- a background watcher that keeps registered repositories current as files and git state change.
 
 ![DevGraph dashboard — a live graph of this repository](docs/dashboard.png)
 
-## Why this exists
-
-Ask a coding assistant "what calls this function" or "what breaks if I change this interface," and it either greps blindly or reasons from a context window that doesn't fit your codebase. DevGraph answers those questions from a pre-built graph instead: `find_callers`, `impact_analysis`, `explain_architecture`, `trace_request_flow`, and 16 other purpose-built MCP tools, all grounded in the actual repository rather than inferred from whatever fit in context.
-
-Source extraction covers **Python, JavaScript/TypeScript, C#, C++, Java, Rust, and Go**, detected per file rather than per repo — a polyglot repo gets every file routed to the matching extractor automatically.
+Source extraction is selected per file, so one repository can mix **Python, JavaScript/TypeScript, C#, C++, Java, Kotlin, Rust, and Go**. DevGraph also recognizes container/compose files, API routes, datastore usage, Markdown annotations and mentions, and local git history.
 
 ## Quickstart
 
-Requires [Podman](https://podman.io/) and [Git](https://git-scm.com/). Run from PowerShell:
+The interactive installer currently targets Windows PowerShell and requires Python 3.13 or newer, Git, and [Podman](https://podman.io/):
 
 ```powershell
 irm https://raw.githubusercontent.com/HaydenSchmidtDOC/DevGraph/master/scripts/install.ps1 | iex
 ```
 
-This clones DevGraph, sets up its Python environment and Neo4j container, and walks you through registering it with whichever AI clients (Claude Code, VS Code) it finds on your machine. That's the whole install.
+It clones DevGraph, creates its Python environment, starts Neo4j, verifies the installation, and offers to register DevGraph with detected Claude Code and VS Code clients.
 
-Already have a clone? Skip the one-liner:
+From an existing clone, run:
 
 ```powershell
 .\scripts\setup-menu.ps1
 ```
 
-The one thing the installer deliberately won't do for you is point DevGraph at a repo — it never scans anything you haven't explicitly registered:
+DevGraph never discovers repositories automatically. Register each repository explicitly; `register` defaults to the current directory and `add` remains an alias:
 
 ```powershell
-devgraph add <path-to-a-git-repo>
+devgraph register C:\path\to\repo --full
+devgraph list
+devgraph dashboard
 ```
 
-### Updating
+Registration runs the initial source scan. `--full` also indexes local git history so recency queries work immediately.
 
-```powershell
-.\scripts\update.ps1
-```
+## Common commands
 
-Pulls the latest `master`, reinstalls dependencies, re-verifies the environment (`devgraph doctor`), and restarts the tray app if it was running. Refuses to run over a dirty working tree rather than guessing what you want to keep.
+Run `devgraph --help` or `devgraph <command> --help` for the complete, current interface.
 
-## Core principles
+| Task | Command |
+|---|---|
+| Register and initially index a repository | `devgraph register [path] [--full]` |
+| Refresh source and reconcile git history | `devgraph rescan <repo_id> [--full]` |
+| Inspect registered repositories | `devgraph list`, `devgraph info <repo_id>`, `devgraph stats [repo_id]` |
+| Check installation and graph health | `devgraph status`, `devgraph doctor`, `devgraph self-test [repo_id]` |
+| Open the dashboard | `devgraph dashboard` |
+| Configure an MCP client | `devgraph client-config`, `devgraph mcp add`, `devgraph mcp doctor` |
+| View configuration or tray logs | `devgraph config`, `devgraph logs` |
+| Export a repository graph | `devgraph export <repo_id> --format json|cypher|dot` |
+| Update DevGraph | `devgraph update` |
 
-- **Explicit registration only.** DevGraph never scans, watches, or indexes a path you haven't run `devgraph add` on. No machine-wide or recursive discovery.
-- **Local-first.** No cloud dependencies, no telemetry, no external API calls by default.
-- **Repository isolation.** Every graph object is scoped to a `repo_id`; queries default to the current repo and never leak cross-repo results unless explicitly opted into.
-- **AI-optimized surface.** The MCP layer exposes high-level tools (`find_callers`, `impact_analysis`, `explain_architecture`) instead of requiring raw Cypher from the client.
-- **Idempotent everything.** Setup, updates, and re-indexing are all safe to re-run — nothing here assumes it's the first time.
+`devgraph update` is the normal update path. It fast-forwards the configured branch, reinstalls DevGraph, runs `doctor`, and restarts the tray app if it was running. Commit or stash local changes first; `--force` only suppresses the dirty-tree guard. The older `scripts/update.ps1` entry point remains available for existing Windows installations.
+
+## Operating model
+
+- **Explicit registration.** DevGraph scans and watches only paths added with `devgraph register` or `devgraph add`.
+- **Local-first.** Neo4j, the registry, source reads, and git history stay on the local machine. Telemetry, cloud sync, cross-repository queries, and raw Cypher are off by default.
+- **Repository isolation.** Every graph object carries a `repo_id`. MCP queries stay within that repository unless the caller explicitly opts into a cross-repository query.
+- **Live updates.** Connecting an MCP client starts the tray app when needed. The watcher reindexes file and git-state changes; manual rescans remain safe and idempotent.
+- **Purpose-built queries.** MCP clients should use the registered tools and the live `devgraph://tool-catalog` resource rather than relying on a hand-maintained tool count.
 
 ## Dashboard
 
-A live-updating dashboard starts automatically with the tray app at `http://127.0.0.1:8765` (loopback only, no auth — this is a single-user local tool). It shows registered repos, entity/relationship counts, a searchable component index, git history, and an interactive graph canvas you can click through to explore neighbors. It updates itself over Server-Sent Events whenever the watcher reindexes a change — no manual refresh. Read-only by design; there's no way to edit the graph from the UI.
+The tray app serves the dashboard at `http://127.0.0.1:8765`. It shows registered repositories, graph and git information, query telemetry, an interactive graph canvas, query-driven highlighting, and saved per-repository layouts. Server-Sent Events refresh the view after indexing changes.
 
-Disable it with `DEVGRAPH_DASHBOARD_ENABLED=false`, or move it off the default port with `DEVGRAPH_DASHBOARD_PORT`.
+The service binds to loopback and has no authentication because it is intended as a single-user local tool. The browser never receives Neo4j credentials; graph queries run through the FastAPI backend. Use `DEVGRAPH_DASHBOARD_ENABLED=false` to disable it or `DEVGRAPH_DASHBOARD_PORT` to choose another port.
 
-## Docker
+## Optional indexing
 
-Prefer Docker over Podman, or want the whole stack (Neo4j + watcher/indexer/dashboard) containerized instead of running in a local venv? A compose file exists at [deploy/docker-compose.yml](deploy/docker-compose.yml):
+- `devgraph annotate` configures Markdown requirements, design decisions, and architecture notes.
+- `devgraph mentions <repo_id> enable` opts a repository into Markdown-to-entity mention indexing.
+- `devgraph pr-source` and `devgraph issue-source` control the explicit opt-ins for external PR and issue ingestion.
+- `devgraph index-history` initializes or manually refreshes local commit history; after initialization, the watcher reconciles history automatically when git state changes.
+
+External PR and issue ingestion remains opt-in and requires a configured source. Enabling its registry flag does not itself contact a remote service.
+
+## Containerized deployment
+
+The day-to-day path uses Podman for Neo4j and runs DevGraph from its local Python environment. A full Docker Compose deployment is also defined in [deploy/docker-compose.yml](deploy/docker-compose.yml):
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d --build
-docker compose -f deploy/docker-compose.yml exec devgraph devgraph add /repos/<name>
+docker compose -f deploy/docker-compose.yml exec devgraph devgraph register /repos/<name>
 ```
 
-**This path is currently untested** — Podman + the local venv is what's actually exercised day to day. Bind-mount each repo you want indexed under `/repos` first (same explicit-registration rule applies). The MCP server itself still runs via stdio, spawned directly by your client per [DEVGRAPH-CLIENT.md](DEVGRAPH-CLIENT.md) — it's not part of this stack either way.
+Bind-mount each allowed repository under `/repos` before registering it. The local Python environment with Podman-hosted Neo4j is the regularly exercised path; treat the full Compose deployment as an alternative that still needs validation in your environment. The MCP server uses stdio and is spawned by each client; see [DEVGRAPH-CLIENT.md](DEVGRAPH-CLIENT.md).
 
-## Where this is headed
+## Current limitations
 
-DevGraph is under active development. Roughly, in order of what's next:
-
-- **Broader language coverage.** Seven languages are extracted today; more Tree-sitter grammars are a template away (see [Adding a language](.claude/skills/adding-a-language/SKILL.md)) — Ruby, PHP, Kotlin, and Swift are reasonable next candidates.
-- **Better call-graph resolution.** Today's `CALLS`/`IMPORTS` edges are name-based heuristics, not fully type-resolved. Tightening that per language (starting wherever false-positive edges hurt query quality most) is worth more than adding new tools.
-- **Semantic/embedding search** over the graph, as a complement to the existing structural queries — flagged but deliberately deferred in [Implementation Plan #3](Blueprints/Implementation%20Plan%20%233.md).
-- **Enterprise federation** (Phase 4, cross-team/cross-repo graph sharing) — currently design-only and intentionally unbuilt; see [Design Brief #2](Blueprints/Design%20Brief%20%232.md).
-
-None of this is a fixed roadmap — it's a starting point for where contributions are most useful.
+- Call edges are name-based rather than fully type-resolved, so common method names can over-link.
+- Import resolution is a best-effort same-repository guess. C++ extraction is intentionally structural because reliable include resolution needs build-system context.
+- `compare_branches` is registered but remains a stub; use `impact_analysis_for_diff` for local-ref impact analysis.
+- Enterprise federation and semantic search are design directions rather than shipped capabilities.
 
 ## Contributing
 
-Issues and PRs are welcome. If you're picking this up cold:
+Read [CLAUDE.md](CLAUDE.md) for the working agreement and [PROJECT_STATUS.md](PROJECT_STATUS.md) for implementation details and known gaps. Numbered design documents live under [Blueprints/](Blueprints/).
 
-1. Read [CLAUDE.md](CLAUDE.md) for the working agreement (minimal diffs, no speculative abstraction, keep docs current).
-2. Check [PROJECT_STATUS.md](PROJECT_STATUS.md) for what's actually built vs. designed, and [Blueprints/](Blueprints/) for the design docs behind it.
-3. Work in a branch, open a PR against `master`. Golden-repo verification (run the extractor against a real open-source project in that language) is the bar for anything touching an indexer — see the multi-language skill above for the pattern.
-4. For anything speculative — a new language, a new extraction heuristic, a new MCP tool — open an issue first. Cheaper to align on scope before the diff exists than after.
-
-Bug reports, gaps in extraction accuracy, and "this MCP tool returned something wrong" reports are all fair game for issues, not just feature work.
+Keep changes focused, update documentation when behavior changes, and open an issue before building a speculative extractor, heuristic, or MCP tool. Indexer changes should be checked against a real public repository in the target language as well as the automated tests.
 
 ## Documentation
 
-- [Blueprints/](Blueprints/) — numbered design docs: target architecture, phased roadmap, and build plans.
-- [DEVGRAPH-CLIENT.md](DEVGRAPH-CLIENT.md) — how another repo's coding assistant connects to and uses a running DevGraph instance.
-- [PROJECT_STATUS.md](PROJECT_STATUS.md) — current implementation state, commands, and structure.
-- [CLAUDE.md](CLAUDE.md) — working agreement for AI agents contributing to this repo.
+- [DEVGRAPH-CLIENT.md](DEVGRAPH-CLIENT.md) — connecting another repository and using DevGraph from an AI assistant.
+- [PROJECT_STATUS.md](PROJECT_STATUS.md) — current implementation, commands, structure, and limitations.
+- [Blueprints/](Blueprints/) — design briefs and implementation plans; some describe future work.
+- `devgraph --help` — the authoritative CLI surface.
+- `devgraph://tool-catalog` — the authoritative MCP tool catalog once connected.

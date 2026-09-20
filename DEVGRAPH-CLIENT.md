@@ -21,9 +21,9 @@ DevGraph itself lives wherever it's checked out on this machine — run
 this checkout; do not hardcode a path here, DevGraph's install location can
 differ machine to machine.
 
-Everything below assumes that repo's venv and Neo4j container already exist
+Everything below assumes that repo's Python environment and Neo4j container already exist
 (they're a one-time setup — see that repo's own `README.md` if they don't
-yet; `.\scripts\bootstrap.ps1` there is the one-command path). This file does
+yet; the interactive installer is the normal setup path). This file does
 not duplicate DevGraph's own internals; it only covers what a client repo
 needs to know to use it.
 
@@ -34,13 +34,14 @@ needs to know to use it.
 DevGraph builds a queryable graph of a repo's structure — modules, classes,
 functions, containers, API endpoints, datastores, design decisions,
 requirements, mentions, and git history — for **Python, JavaScript/
-TypeScript, C#, C++, Java, Rust, and Go source**, detected per file by
+TypeScript, C#, C++, Java, Kotlin, Rust, and Go source**, detected per file by
 extension (a repo doesn't need to be single-language; each file is routed
-to the matching extractor automatically) — and exposes it through 20 always-on MCP tools
+to the matching extractor automatically) — and exposes it through purpose-built MCP tools
 (`search_component`, `find_callers`, `impact_analysis`,
 `impact_analysis_for_diff`, `explain_architecture`, `blame_component`,
-`find_requirements_for`, `find_mentions`, `list_recent_changes`, `get_source`, etc.), plus the opt-in `run_cypher`
-escape hatch (21 total when enabled).
+`find_requirements_for`, `find_mentions`, `list_recent_changes`, `god_nodes`,
+`get_source`, and others), plus the opt-in `run_cypher` escape hatch. Read
+`devgraph://tool-catalog` for the live tool list and identifier expectations.
 Once a repo is registered and indexed, an AI assistant can answer questions
 like "what depends on this module" or "why was this decision made" by
 querying the graph directly, instead of grepping/reading the whole tree
@@ -84,14 +85,14 @@ do not hardcode a path here, DevGraph's install location can differ machine
 to machine:
 
 ```bash
-"<DevGraph repo's resolved venv python, from devgraph client-config>" -m devgraph.cli.main add "<absolute path to this repo>"
+"<DevGraph repo's resolved venv python, from devgraph client-config>" -m devgraph.cli.main register "<absolute path to this repo>"
 ```
 
 Add `--full` to also index git commit history in the same step (equivalent
 to a separate `index-history` call):
 
 ```bash
-"<venv python>" -m devgraph.cli.main add "<absolute path to this repo>" --full
+"<venv python>" -m devgraph.cli.main register "<absolute path to this repo>" --full
 ```
 
 This registers the repo **and runs a full initial scan** — Python source,
@@ -99,7 +100,7 @@ container/compose files, API routes, datastore usage all get indexed in one
 pass via `devgraph/indexer/dispatch.py`. It prints the `repo_id` assigned
 (defaults to the folder name, deduped if already taken) and how many files
 were indexed. **Record that `repo_id`** — every DevGraph MCP tool call needs
-it. If Neo4j isn't reachable at registration time, `add` still succeeds
+it. If Neo4j isn't reachable at registration time, `register` still succeeds
 (registration and indexing are decoupled) and tells you to run
 `devgraph rescan <repo_id>` once it's up.
 
@@ -116,7 +117,7 @@ expose it to any other repo's queries unless someone explicitly passes
 
 ## 2. Re-index after changes, and index optional extras
 
-`devgraph rescan <repo_id>` re-runs the same full scan as `add` — idempotent
+`devgraph rescan <repo_id>` re-runs the same full scan as `register` — idempotent
 (`MERGE`-based), safe to run repeatedly; existing nodes update in place
 rather than duplicating. Use it any time you want the graph refreshed after
 a batch of changes:
@@ -127,7 +128,7 @@ a batch of changes:
 
 **Git history** (separate command — not part of the file-scan above;
 incremental, only walks new commits since the last run — or fold it into
-`add`/`rescan` with `--full` instead of calling this separately):
+`register`/`rescan` with `--full` instead of calling this separately):
 
 ```bash
 "<venv python>" -m devgraph.cli.main index-history <repo_id>
@@ -197,8 +198,9 @@ Claude Code version in use — check `claude mcp add --help` if the printed
 command doesn't match; the important part is the command/args/cwd above, not
 the specific CLI invocation.
 
-Once connected, 20 tools become available, all scoped by a `repo_id`
-argument. **Always pass this repo's `repo_id` from step 1.** Never pass
+Once connected, the registered tools are scoped by a `repo_id` argument.
+Read `devgraph://tool-catalog` instead of relying on a copied tool list.
+**Always pass this repo's `repo_id` from step 1.** Never pass
 `cross_repo: true` unless the user explicitly asks for a cross-repository
 answer — the default is (and must stay) scoped to this repo only.
 
@@ -224,7 +226,7 @@ Cypher cap) even if more matches exist beyond that.
 
 `run_cypher` will not appear unless DevGraph's own config has
 `enable_run_cypher=true` set. If it's missing and you need something the
-other 18 tools genuinely can't express, that's a signal a new high-level
+purpose-built tools genuinely can't express, that's a signal a new high-level
 tool should be added to DevGraph — not that raw Cypher should be turned on
 as a workaround.
 
@@ -268,9 +270,9 @@ When you index a repo with `--full` (step 1), or run `index-history` separately 
 
 **Automatic sync**: Once a repo is indexed via `--full` or `index-history` at least once, its history is **automatically kept in sync** whenever `.git` changes (branch switches, rebases, resets, new commits). No manual command needed — the background watcher detects `.git` state changes and reconciles the graph correctly, including deletion of orphaned `Commit` nodes when history is rewritten. Use `modified_within_commits=N` on `find_callers`, `search_component`, or `list_recent_changes` to query only entities touched in the last N commits.
 
-All previously-documented gaps here (`find_callers`/`impact_analysis` seeing
-no call edges, `explain_architecture` returning no `uses`/`calls`, relative
-imports not resolving) are now fixed and verified against RAG4 directly.
+Previously documented gaps here (`find_callers`/`impact_analysis` seeing no
+call edges, `explain_architecture` returning no `uses`/`calls`, and relative
+imports not resolving) have been fixed and checked against a reference repository.
 Two things worth knowing about how they work:
 
 - **Call graph is name-based, not type-resolved, in every language
@@ -314,7 +316,7 @@ Two things worth knowing about how they work:
 
 ## 5. Keeping the graph current
 
-`devgraph add`/`rescan` do a full scan. For ongoing changes, connecting an
+`devgraph register`/`rescan` do a full scan. For ongoing changes, connecting an
 MCP client (Claude Code, etc.) auto-starts the tray app (watcher +
 incremental indexer, `devgraph.agent.TrayApp`) as a detached background
 process if one isn't already running — no manual step needed in the common
@@ -336,6 +338,12 @@ rescan <repo_id>` after a meaningful batch of changes, or check `devgraph
 status`/`devgraph tray status` to see whether it's already running. A stale
 graph gives stale answers, so don't rely on it for anything time-sensitive
 without confirming liveness or refreshing first.
+
+For diagnosis, use `devgraph status` for a quick connectivity and repository
+check, `devgraph doctor` for environment drift, and `devgraph mcp doctor` for
+Claude Code registration problems. `devgraph info <repo_id>` and
+`devgraph stats [repo_id]` inspect indexed state; `devgraph logs` shows recent
+tray/dashboard output.
 
 ## Non-negotiables when working with DevGraph from this repo
 
