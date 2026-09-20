@@ -1142,6 +1142,14 @@ def info(
         registry.close()
 
 
+def _git_pull_command(remote_branch: str) -> list[str]:
+    """Build a pull command from the CLI's REMOTE/BRANCH value."""
+    remote, separator, branch = remote_branch.partition("/")
+    if not separator or not remote or not branch:
+        raise ValueError("update branch must use REMOTE/BRANCH format")
+    return ["git", "pull", "--ff-only", remote, branch]
+
+
 @app.command()
 def update(
     force: bool = typer.Option(
@@ -1179,9 +1187,13 @@ def update(
 
     # 3. Pull
     console.print("[bold]Pulling latest...[/bold]")
+    try:
+        pull_command = _git_pull_command(branch)
+    except ValueError as exc:
+        console.print(f"[red][X] {exc}[/red]")
+        raise typer.Exit(code=2) from exc
     result = subprocess.run(
-        ["git", "pull", "--ff-only", branch],
-        cwd=str(repo_root), capture_output=True, text=True,
+        pull_command, cwd=str(repo_root), capture_output=True, text=True,
     )
     if result.returncode != 0:
         console.print(f"[red][X] git pull failed:[/red] {result.stderr.strip()}")
