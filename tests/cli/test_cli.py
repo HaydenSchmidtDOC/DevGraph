@@ -485,9 +485,13 @@ def test_cli_index_history(runner, temp_git_repo, temp_registry_db):
     with patch.object(config_module, "get_settings", return_value=settings), \
          patch.object(cli_main, "get_settings", return_value=settings):
         result = runner.invoke(app, ["index-history", repo_id])
-        # Neo4j unreachable at this bogus URI -> should fail gracefully, not crash
+        # Neo4j unreachable at this bogus URI -> handled failure, not a crash.
         assert result.exit_code == 1
-        assert "Error" in result.stdout
+        assert isinstance(result.exception, SystemExit)
+        assert "[X] Unexpected error:" in result.stdout
+        assert "127.0.0.1:9999" in result.stdout
+        assert "[OK]" not in result.stdout
+        assert "Traceback" not in result.stdout
 
 
 def test_cli_index_history_nonexistent_repo(runner, temp_registry_db):
@@ -603,7 +607,9 @@ def test_cli_client_config_vscode_creates_new_mcp_json(runner, temp_registry_db,
     registry.close()
 
     with tempfile.TemporaryDirectory() as appdata_dir:
-        monkeypatch.setenv("APPDATA", appdata_dir)
+        # These tests exercise merging/writing, independently of the host OS.
+        monkeypatch.setattr("devgraph.cli.main._vscode_mcp_config_path",
+                            lambda: Path(appdata_dir) / "Code" / "User" / "mcp.json")
 
         config_module.get_settings.cache_clear()
         with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
@@ -623,7 +629,9 @@ def test_cli_client_config_vscode_preserves_existing_servers(runner, temp_regist
     registry.close()
 
     with tempfile.TemporaryDirectory() as appdata_dir:
-        monkeypatch.setenv("APPDATA", appdata_dir)
+        # These tests exercise merging/writing, independently of the host OS.
+        monkeypatch.setattr("devgraph.cli.main._vscode_mcp_config_path",
+                            lambda: Path(appdata_dir) / "Code" / "User" / "mcp.json")
         mcp_dir = Path(appdata_dir) / "Code" / "User"
         mcp_dir.mkdir(parents=True)
         existing = {"servers": {"other-server": {"type": "stdio", "command": "other.exe", "args": []}}}
@@ -646,7 +654,9 @@ def test_cli_client_config_vscode_idempotent(runner, temp_registry_db, monkeypat
     registry.close()
 
     with tempfile.TemporaryDirectory() as appdata_dir:
-        monkeypatch.setenv("APPDATA", appdata_dir)
+        # These tests exercise merging/writing, independently of the host OS.
+        monkeypatch.setattr("devgraph.cli.main._vscode_mcp_config_path",
+                            lambda: Path(appdata_dir) / "Code" / "User" / "mcp.json")
 
         config_module.get_settings.cache_clear()
         with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)):
@@ -759,3 +769,33 @@ def test_cli_tray_start_then_status_then_stop(runner, temp_registry_db):
 
         final_status = runner.invoke(app, ["tray", "status"])
         assert "not running" in final_status.stdout
+
+
+@pytest.mark.parametrize("platform, environment, relative", [
+    ("win32", {"APPDATA": "roaming"}, "roaming/Code/User/mcp.json"),
+    ("darwin", {}, "home/Library/Application Support/Code/User/mcp.json"),
+    ("linux", {}, "home/.config/Code/User/mcp.json"),
+    ("linux", {"XDG_CONFIG_HOME": "xdg"}, "xdg/Code/User/mcp.json"),
+    ("linux", {"XDG_CONFIG_HOME": ""}, "home/.config/Code/User/mcp.json"),
+])
+def test_vscode_mcp_config_path_by_platform(monkeypatch, tmp_path, platform, environment, relative):
+    from types import SimpleNamespace
+    from devgraph.cli import main as cli_main
+
+    monkeypatch.setattr(cli_main, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    for name in ("APPDATA", "XDG_CONFIG_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, str(tmp_path / value) if value else "")
+    assert cli_main._vscode_mcp_config_path() == tmp_path / relative
+
+
+def test_vscode_mcp_config_path_windows_requires_appdata(monkeypatch):
+    from types import SimpleNamespace
+    from devgraph.cli import main as cli_main
+
+    monkeypatch.setattr(cli_main, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.delenv("APPDATA", raising=False)
+    with pytest.raises(RuntimeError, match="APPDATA"):
+        cli_main._vscode_mcp_config_path()
