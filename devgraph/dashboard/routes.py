@@ -1,10 +1,14 @@
-"""The dashboard's `/api/*` read endpoints.
+"""The dashboard's `/api/*` endpoints.
 
 Every repo-scoped handler validates `repo_id` against the registry first and
 404s if unknown -- the same allowlist discipline `mcp/server.py` applies,
 since this is a second entry point into the same engine/registry the tray
 already owns (see Implementation Plan #5's "Data comes from GraphEngine
 directly" decision).
+
+Read-only apart from two writes: the canvas layout (`PUT .../layout`) and
+repository registration (`POST /repos`), which is the same add-then-initial-
+scan sequence `devgraph add <path>` runs, against the same services.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from devgraph.config.settings import get_settings
 from devgraph.dashboard import queries
@@ -27,6 +32,7 @@ from devgraph.dashboard.layout_store import load_layout, save_layout
 from devgraph.dashboard.query_log import QueryLog
 from devgraph.graph.engine import GraphEngine, identity_key
 from devgraph.graph.schema import NODE_LABELS
+from devgraph.indexer.dispatch import full_scan
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.registry.store import RepoRegistry
 
@@ -43,6 +49,27 @@ _GRAPH_LIMIT_CEILING = 2000
 # can't write an unbounded file to disk.
 _LAYOUT_PAYLOAD_LIMIT_BYTES = _GRAPH_LIMIT_CEILING * 1024
 _SSE_KEEPALIVE_S = 15
+
+
+def _reject_cross_site(request: Request) -> None:
+    """Refuse a state-changing request that another site's page initiated.
+
+    The dashboard binds to loopback with no auth, so any page in the same
+    browser can reach it; without this, a visited site could POST a path of
+    its choosing into the registry (the browser attaches no credentials, but
+    none are required here). Both signals are browser-supplied and only
+    present on browser traffic: `Sec-Fetch-Site` (absent on older browsers)
+    and `Origin` (sent on every cross-origin request, and on same-origin
+    POSTs). A client that sends neither -- curl, the CLI, a test -- is not a
+    browser being driven by a third-party page and is left alone; this is a
+    browser-confused-deputy guard, not an authentication check.
+    """
+    site = request.headers.get("sec-fetch-site")
+    if site is not None and site not in ("same-origin", "none"):
+        raise HTTPException(status_code=403, detail="cross-site request rejected")
+    origin = request.headers.get("origin")
+    if origin is not None and origin != f"{request.url.scheme}://{request.url.netloc}":
+        raise HTTPException(status_code=403, detail="cross-origin request rejected")
 
 
 def build_router(
@@ -89,6 +116,94 @@ def build_router(
             ],
             "issues": repo_issues,  # Also return all issues as a summary
         }
+
+    def _register_repo(path: str, repo_id: str | None) -> dict[str, Any]:
+        """Register + initially scan, exactly as `devgraph add <path>` does.
+
+        Blocking (SQLite write, Neo4j round trips, a full file walk), so it
+        runs in a threadpool -- the event loop also serves the SSE stream the
+        dashboard is watching while this runs.
+        """
+        try:
+            record = registry.add_repo(path, repo_id)
+        except ValueError as exc:
+            # add_repo's own message names the actual problem (missing path,
+            # not a git repo, already registered) and contains nothing the
+            # caller didn't just supply.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("repo registration failed for %s", path)
+            raise HTTPException(status_code=500, detail="registration failed") from exc
+
+        indexed = False
+        files_indexed: int | None = None
+        warning: str | None = None
+        try:
+            engine.init_schema()
+            engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
+            files_indexed = full_scan(
+                engine,
+                record.repo_id,
+                record.path,
+                docs_path=record.docs_path,
+                mentions_enabled=record.mentions_enabled,
+            )
+            registry.mark_indexed(record.repo_id)
+            indexed = True
+        except Exception as exc:
+            # Registration already committed to SQLite; an indexing failure
+            # (e.g. Neo4j down) must not undo it -- same call as the CLI's,
+            # and `devgraph rescan <repo_id>` is the same retry.
+            logger.warning("registered %s but the initial scan failed: %s", record.repo_id, exc)
+            warning = (
+                f"Registered, but the initial scan failed: {exc}. "
+                f"Run 'devgraph rescan {record.repo_id}' once Neo4j is reachable."
+            )
+
+        # Report what was persisted, not what was asked for: add_repo
+        # slugifies the id and can suffix it on collision, and mark_indexed
+        # just wrote last_indexed.
+        persisted = registry.get(record.repo_id)
+        return {
+            "repo_id": persisted.repo_id,
+            "path": str(persisted.path),
+            "active": persisted.active,
+            "watch_enabled": persisted.watch_enabled,
+            "last_indexed": persisted.last_indexed,
+            "registered": True,
+            "indexed": indexed,
+            "files_indexed": files_indexed,
+            "warning": warning,
+        }
+
+    @router.post("/repos", status_code=201)
+    async def register_repo(request: Request) -> dict[str, Any]:
+        _reject_cross_site(request)
+        # Strict media type: a browser form post (or a text/plain body) is
+        # what a cross-site page can send without a preflight, so anything
+        # but JSON is refused before the body is even read.
+        media_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if media_type != "application/json":
+            raise HTTPException(status_code=415, detail="content-type must be application/json")
+        try:
+            payload = json.loads(await request.body())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="payload must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="payload must be a JSON object")
+
+        raw_path = payload.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise HTTPException(status_code=400, detail="path is required")
+        raw_repo_id = payload.get("repo_id")
+        if raw_repo_id is not None and (not isinstance(raw_repo_id, str) or not raw_repo_id.strip()):
+            raise HTTPException(status_code=400, detail="repo_id must be a non-empty string")
+
+        return await run_in_threadpool(
+            _register_repo,
+            raw_path.strip(),
+            raw_repo_id.strip() if isinstance(raw_repo_id, str) else None,
+        )
 
     @router.get("/repos/{repo_id}/summary")
     def repo_summary(repo_id: str) -> dict[str, Any]:

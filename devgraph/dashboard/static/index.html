@@ -621,7 +621,7 @@ table.dstable input[type="text"] { width: 100%; }
       <div>
         <div class="settings-pane active" id="pane-repos" data-od-id="pane-repos">
           <h3 class="pane-title">Repo management</h3>
-          <p class="desc">One registered repo on this machine today. Repo add/remove stays CLI-only for persistence this pass — the form below mirrors <code>devgraph add &lt;path&gt;</code> so it's ready to POST once the backend route exists.</p>
+          <p class="desc">Registering a repo below is live: it goes through the same registry and initial file scan as <code>devgraph add &lt;path&gt;</code>. The table below is still prototype markup — its toggles and <code>docs_path</code> field don't persist yet, and removal stays CLI-only.</p>
           <div class="card">
             <table class="dstable">
               <thead><tr><th>repo_id</th><th>watch</th><th>mentions</th><th>PR / issue source</th><th>docs_path</th><th>last_indexed</th><th>last_indexed_commit</th><th></th></tr></thead>
@@ -643,15 +643,11 @@ table.dstable input[type="text"] { width: 100%; }
             <h4 style="font-size:13px;text-transform:uppercase;letter-spacing:.03em;color:var(--fg-2);margin-bottom:12px">Register a repo</h4>
             <div class="field-grid">
               <div class="field"><label>Target directory / git repo path</label><input type="text" id="regRepoPath" placeholder="C:\Dev\projects\active\rag4" /></div>
-              <div class="field"><label>repo_id</label><input type="text" id="regRepoId" placeholder="rag4" /></div>
+              <div class="field"><label>repo_id <span style="color:var(--fg-2);font-weight:400">(optional — derived from the folder name)</span></label><input type="text" id="regRepoId" placeholder="rag4" /></div>
             </div>
-            <div class="field" style="margin-top:12px">
-              <label>Next ingestion run<span class="qmark" data-tip="Full parses the whole repo. Incremental targets only files changed since last_indexed_commit via git diff.">?</span></label>
-              <div class="seg" id="rebuildModeToggle"><button class="active" data-mode="incremental">Incremental</button><button data-mode="full">Full rebuild</button></div>
-            </div>
-            <div style="margin-top:14px"><button class="btn btn-sm btn-primary" id="btnRegisterRepo">Register repo</button><span class="copy-toast" id="registerToast">Queued — not yet persisted, see banner below.</span></div>
+            <div style="margin-top:14px"><button class="btn btn-sm btn-primary" id="btnRegisterRepo">Register repo</button><span class="copy-toast" id="registerToast"></span></div>
           </div>
-          <div class="banner info"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg><span><code>docs_path</code> is a real, currently-unset repo field per the rebuild design doc §2. Both this table and the register form above are wired to hold values, ready to POST to the backend save route once it exists — nothing persists yet in this prototype. Add a repo for real today with <code>devgraph add &lt;path&gt;</code>.</span></div>
+          <div class="banner info"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg><span>Registering runs the initial file scan only, exactly like <code>devgraph add &lt;path&gt;</code>; git-history indexing is separate (<code>devgraph index-history &lt;repo_id&gt;</code>). <code>docs_path</code> is a real, currently-unset repo field per the rebuild design doc §2 — the table above is wired to hold values, ready to POST to a backend save route once it exists, so its edits don't persist yet.</span></div>
         </div>
 
         <div class="settings-pane" id="pane-mcp" data-od-id="pane-mcp">
@@ -2745,20 +2741,61 @@ const toggleCypher = document.getElementById("toggleCypher");
 const cypherWarnNote = document.getElementById("cypherWarnNote");
 toggleCypher.addEventListener("change", () => { cypherWarnNote.style.display = toggleCypher.checked ? "flex" : "none"; });
 
-/* ── register-repo mini form (Repos pane) ─────────────────────────── */
-document.querySelectorAll('#rebuildModeToggle button').forEach(btn => btn.addEventListener("click", () => {
-  document.querySelectorAll('#rebuildModeToggle button').forEach(b=>b.classList.remove("active")); btn.classList.add("active");
-}));
+/* ── register-repo form (Repos pane) ──────────────────────────────────
+   POSTs to /api/repos, which runs the same add-then-initial-scan the CLI's
+   `devgraph add <path>` does. Everything shown afterwards comes from the
+   response, never from what was typed: the registry slugifies the id and
+   suffixes it on collision, and the scan can fail after the repo is already
+   registered (registered: true, indexed: false), which the user has to be
+   told rather than shown as a plain success. */
 const registerToast = document.getElementById("registerToast");
-document.getElementById("btnRegisterRepo").addEventListener("click", () => {
-  const path = document.getElementById("regRepoPath").value.trim();
-  const id = document.getElementById("regRepoId").value.trim();
-  if (!path || !id) { registerToast.textContent = "Fill in both a path and a repo_id first."; registerToast.style.color = "var(--warn)"; registerToast.classList.add("show"); return; }
-  const mode = document.querySelector('#rebuildModeToggle button.active').dataset.mode;
-  registerToast.style.color = "var(--success)";
-  registerToast.textContent = `Queued: devgraph add "${path}" --id ${id} (${mode}) — not yet persisted, see banner below.`;
+const btnRegisterRepo = document.getElementById("btnRegisterRepo");
+let registerInFlight = false;
+function showRegisterToast(text, color) {
+  registerToast.textContent = text; // textContent, never innerHTML: this text is server-supplied
+  registerToast.style.color = color;
   registerToast.classList.add("show");
-});
+}
+async function submitRegisterRepo() {
+  if (registerInFlight) return; // a second click must not register a second time
+  const pathInput = document.getElementById("regRepoPath");
+  const idInput = document.getElementById("regRepoId");
+  const path = pathInput.value.trim();
+  if (!path) { showRegisterToast("Enter the path to a git repository first.", "var(--warn)"); return; }
+  const body = { path };
+  const repoId = idInput.value.trim();
+  if (repoId) body.repo_id = repoId; // blank means "let the registry derive it"
+  registerInFlight = true;
+  btnRegisterRepo.disabled = true;
+  try {
+    const resp = await fetch("/api/repos", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    let json = null;
+    try { json = await resp.json(); } catch (e) { /* non-JSON error body (proxy/HTML error page) */ }
+    if (!resp.ok) {
+      // Input is deliberately left as typed so a rejected path can be fixed.
+      showRegisterToast((json && json.detail) || `Registration failed (HTTP ${resp.status}).`, "var(--danger)");
+      return;
+    }
+    pathInput.value = "";
+    idInput.value = "";
+    if (json.indexed) {
+      showRegisterToast(`Registered ${json.repo_id} — indexed ${json.files_indexed} file(s).`, "var(--success)");
+    } else {
+      showRegisterToast(json.warning || `Registered ${json.repo_id}, but the initial scan did not run.`, "var(--warn)");
+    }
+    await populateRealRepos(); // the repo IS registered either way -- show it in the selector
+  } catch (e) {
+    showRegisterToast(`Registration failed: ${e.message}`, "var(--danger)");
+  } finally {
+    registerInFlight = false;
+    btnRegisterRepo.disabled = false;
+  }
+}
+btnRegisterRepo.addEventListener("click", submitRegisterRepo);
 
 /* ── neo4j.conf engine settings: field changes queue a restart-required
    confirm (shared modal below) and regenerate the copyable snippet ── */
