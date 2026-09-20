@@ -52,7 +52,7 @@ Pulls the latest `master`, reinstalls dependencies, re-verifies the environment 
 
 ## Dashboard
 
-A live-updating dashboard starts automatically with the tray app at `http://127.0.0.1:8765` (loopback only, no auth — this is a single-user local tool). It shows registered repos, entity/relationship counts, a searchable component index, git history, and an interactive graph canvas you can click through to explore neighbors. It updates itself over Server-Sent Events whenever the watcher reindexes a change — no manual refresh. Read-only by design; there's no way to edit the graph from the UI.
+A live-updating dashboard starts automatically with the tray app at `http://127.0.0.1:8765` (loopback only, no auth — this is a single-user local tool). It shows registered repos, entity/relationship counts, a searchable component index, git history, and an interactive graph canvas you can click through to explore neighbors. It updates itself over Server-Sent Events whenever the watcher reindexes a change — no manual refresh. The graph itself is read-only; there's no way to edit it from the UI. The one write is Settings → Repos → *Register a repo*, which registers a local git repository and runs its initial file scan, the same as `devgraph add <path>` (git-history indexing stays a separate command).
 
 Disable it with `DEVGRAPH_DASHBOARD_ENABLED=false`, or move it off the default port with `DEVGRAPH_DASHBOARD_PORT`.
 
