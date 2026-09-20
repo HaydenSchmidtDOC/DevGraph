@@ -161,7 +161,8 @@ const ok = body => async () => ({ ok: true, status: 201, json: async () => body 
   check("a later submit is allowed again", els.btnRegisterRepo.disabled === false, els.btnRegisterRepo.disabled);
 
   // 9. server text is never rendered as markup
-  check("the register path never assigns innerHTML", !/innerHTML/.test(src),
+  // the assignment, not the bare word -- the source comment naming innerHTML is not a defect
+  check("the register path never assigns innerHTML", !/\.innerHTML\s*\+?=/.test(src),
     "server-supplied text reaching innerHTML would be parsed as HTML");
   check("the toast is written through textContent", /textContent/.test(src), src);
 

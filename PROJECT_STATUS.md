@@ -25,7 +25,7 @@
 - Manual equivalent: `python -m venv .venv` → `.venv/Scripts/python -m pip install -e ".[dev]"` → start Neo4j:
   `podman run -d --name devgraph-neo4j -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 -e NEO4J_AUTH=neo4j/devgraph-local-dev -v devgraph_neo4j_data:/data -v devgraph_neo4j_logs:/logs docker.io/library/neo4j:5.26-community`
   (`deploy/podman-compose.yml` is an untested alternative for compose-provider setups.)
-- Tests: `.venv/Scripts/python -m pytest` (503 tests)
+- Tests: `.venv/Scripts/python -m pytest` (510 tests)
 - CLI: `devgraph add <path> [--full]`, `list`, `status`, `doctor`, `client-config`, `rescan --full`, `annotate`, `index-history`, `pr-source`/`issue-source`, `tray start/stop/status`
 
 **Podman note**: `podman.exe` may not be on PATH by default even when installed — check `%LOCALAPPDATA%\Programs\Podman` first. Never install software to the host; dependencies live in `.venv/` and containers. Never touch containers/volumes not prefixed `devgraph-`.
@@ -51,6 +51,6 @@
 - `devgraph/cli/` — Typer CLI; see Commands above.
 - `devgraph/agent/` — `lifecycle.py`: PID-file/liveness/holder-refcounting for the tray app, shared by CLI and MCP server. `tray.py`: pystray shell wiring watcher + indexer + Neo4j health check + heartbeat file + the dashboard's own daemon thread.
 - `devgraph/dashboard/` — FastAPI app (`app.py`: `build_app()`), `/api/*` read + Cypher-proxy routes plus `POST /api/repos` registration (`routes.py`, backed by `GraphEngine.run_cypher_graph`), dashboard-shaped Cypher helpers (`queries.py`), real git log/status (`git_info.py`), in-memory query telemetry (`query_log.py`), SSE pub/sub (`events.py`: `EventBroadcaster`), and `static/index.html` (single hand-written file, no build step, Cytoscape.js from CDN). A second, independent consumer of the same `GraphEngine`/`RepoRegistry` the tray owns (read-only apart from saved canvas layouts and repo registration) — never routes through the MCP stdio server.
-- `tests/` — mirrors `devgraph/`; 503 tests.
+- `tests/` — mirrors `devgraph/`; 510 tests.
 - `deploy/podman-compose.yml` — declarative alternative to the `podman run` setup command.
 - `DEVGRAPH-CLIENT.md` — portable doc for another repo's coding assistant to connect to this DevGraph instance.
