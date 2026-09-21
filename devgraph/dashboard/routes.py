@@ -357,6 +357,21 @@ def build_router(
             for tool in catalog
         ]
 
+    @router.get("/mcp-telemetry")
+    def get_mcp_telemetry(limit: int = 100) -> dict[str, Any]:
+        """Metadata-only record of MCP tool calls, newest first.
+
+        Distinct from `/query-log`, which is this dashboard's own Cypher
+        console and nothing else: this reads back what connected MCP clients
+        ran in their own separate server processes, from the local store
+        those processes append to (devgraph/mcp/server.py). Same `{entries:
+        [...]}` shape and `limit` capping as `/query-log`.
+        """
+        # Imported lazily, for the same import cycle as /mcp-tools above.
+        from devgraph.mcp.server import read_tool_telemetry
+
+        return {"entries": read_tool_telemetry(max(1, min(limit, 500)))}
+
     @router.get("/settings")
     def get_dashboard_settings() -> dict[str, Any]:
         s = get_settings()
