@@ -572,7 +572,7 @@ table.dstable input[type="text"] { width: 100%; }
       </div>
 
       <div class="card" data-od-id="db-memory-card">
-        <div class="card-head"><h3>Database &amp; memory</h3><span class="sample-pill" id="memPill" title="Requires JVM/JMX or APOC access — attempted on connect, falls back if unavailable">Not wired</span></div>
+        <div class="card-head"><h3>Database &amp; memory</h3><span class="sample-pill" id="memPill" title="JVM heap is read from the server's java.lang:type=Memory JMX bean on connect; stays dashed if this build doesn't expose it">Checking…</span></div>
         <div class="metric-block">
           <div class="metric-label"><span>JVM heap</span><span class="metric-val dim" id="heapVal">—</span></div>
           <div class="meter"><i id="heapMeter" style="width:0%"></i></div>
@@ -582,7 +582,7 @@ table.dstable input[type="text"] { width: 100%; }
           <div class="meter"><i id="pageCacheMeter" style="width:0%"></i></div>
         </div>
         <div class="metric-row"><span class="metric-label">Store size on disk</span><span class="metric-val dim" id="storeSizeVal">—</span></div>
-        <div class="placeholder-note" id="memNote">Attempting <code>dbms.queryJmx</code> / store-file stat on connect. No APOC/JMX exposure confirmed yet on this build — values stay dashed until that's verified live, never fabricated.</div>
+        <div class="placeholder-note" id="memNote">JVM heap is read live from the server on connect. Page cache hit ratio and store size still need APOC (<code>apoc.monitor.pc</code> / <code>apoc.monitor.store</code>), not confirmed installed on this build — those stay dashed, never fabricated.</div>
       </div>
 
       <div class="card" data-od-id="query-telemetry-card">
@@ -2591,7 +2591,11 @@ async function populateRealRepos(fireChangeEvent) {
   if (fireChangeEvent !== false) select.dispatchEvent(new Event("change", { bubbles: true }));
 }
 const legendStatus = document.getElementById("neo4jStatusLegend");
-(async () => {
+/* Named rather than an inline IIFE so the boot path -- including the
+   unreachable branch, where the heap card must still end up in its labelled
+   unavailable state rather than stuck on "Checking…" -- is reachable from
+   tests. */
+async function bootConnect() {
   try {
     const json = await runCypher("RETURN 1 AS ok");
     if (json.errors?.length) throw new Error(json.errors[0].message);
@@ -2613,10 +2617,15 @@ const legendStatus = document.getElementById("neo4jStatusLegend");
     neo4jStatus.textContent = "Neo4j unreachable";
     neo4jStatus.style.color = "var(--danger)";
     legendStatus.textContent = "Neo4j unreachable — showing demo graph";
+    /* The heap reading is never attempted on this branch, so say so: left
+       alone the card would sit on its initial "Checking…" pill forever,
+       which reads as "still loading" rather than "no reading exists". */
+    setHeapUnavailable("Neo4j is unreachable");
     cy.add(buildElements());
     forceDirectedSettle(() => focusRotation(null, 60));
   }
-})();
+}
+bootConnect();
 
 /* ── live auto-refresh: consumes the backend's /api/events SSE stream
    (agent/tray.py's watcher/reindex/git-sync code already publishes real
@@ -3193,24 +3202,50 @@ document.querySelectorAll('#gitViewToggle button').forEach(btn => btn.addEventLi
 /* ── Database & memory / Query telemetry / Community — attempted live,
    graceful labeled fallback per the no-fabrication rule if the underlying
    procedure isn't available on this Neo4j build. ── */
-function setMemNotWired(reason) {
+function setMemNote(reason) {
   document.getElementById("memNote").textContent = reason;
+}
+/* The card must never show a number it can't stand behind, so every way the
+   reading can be missing -- server says unavailable, HTTP error, network
+   failure, unparseable body, values that can't form a meter, or a boot that
+   never got as far as asking -- lands here, dashed and labelled, rather than
+   on a partly-filled bar or a stuck "Checking…". `reason` names which one,
+   in the card's own words; it is never backend error text. */
+function setHeapUnavailable(reason) {
+  const why = reason || "the server returned no usable java.lang:type=Memory reading";
+  const val = document.getElementById("heapVal");
+  val.textContent = "—";
+  val.classList.add("dim");
+  document.getElementById("heapMeter").style.width = "0%";
+  const pill = document.getElementById("memPill");
+  pill.textContent = "Unavailable";
+  pill.className = "sample-pill";
+  pill.title = "JVM heap unavailable — " + why;
+  setMemNote(`JVM heap unavailable — ${why}, so heap stays dashed rather than estimated. Page cache hit ratio and store size need APOC and are not wired.`);
 }
 async function attemptMemoryMetrics() {
   try {
-    const json = await runCypher('CALL dbms.queryJmx("java.lang:type=Memory") YIELD attributes RETURN attributes');
-    if (json.errors?.length) throw new Error("procedure unavailable");
-    const attrs = json.results[0].data[0]?.row[0];
-    const heapUsed = attrs?.HeapMemoryUsage?.value?.used, heapMax = attrs?.HeapMemoryUsage?.value?.max;
-    if (!heapUsed || !heapMax) throw new Error("unexpected shape");
-    const pct = Math.round((heapUsed/heapMax)*100);
-    document.getElementById("heapVal").textContent = `${(heapUsed/1e6).toFixed(0)}MB / ${(heapMax/1e6).toFixed(0)}MB`;
+    /* /api/database-stats, not the Cypher console endpoint: the JMX result
+       shape is the server's problem, and the browser gets plain numbers. */
+    const res = await fetch("/api/database-stats");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const heap = (await res.json())?.heap;
+    if (!heap?.available) throw new Error("heap unavailable");
+    /* Number.isFinite, not Number(): a string or null from an unexpected
+       server build must read as no value, not coerce into one. */
+    const used = heap.used_bytes, heapMax = heap.max_bytes, percent = heap.used_percent;
+    if (!Number.isFinite(used) || !Number.isFinite(heapMax) || !Number.isFinite(percent)) throw new Error("non-numeric heap values");
+    if (used <= 0 || heapMax <= 0 || used > heapMax) throw new Error("inconsistent heap values");
+    const pct = Math.min(100, Math.max(0, percent));
+    document.getElementById("heapVal").textContent = `${(used/1e6).toFixed(0)}MB / ${(heapMax/1e6).toFixed(0)}MB`;
     document.getElementById("heapVal").classList.remove("dim");
     document.getElementById("heapMeter").style.width = pct + "%";
-    document.getElementById("memPill").textContent = "Live"; document.getElementById("memPill").className = "wired-pill";
-    setMemNotWired("Page cache hit ratio and store size still need APOC (apoc.monitor.store / apoc.monitor.pc) — not confirmed installed on this build.");
+    const pill = document.getElementById("memPill");
+    pill.textContent = "Live"; pill.className = "wired-pill";
+    pill.title = "JVM heap read live from the server's java.lang:type=Memory JMX bean";
+    setMemNote("JVM heap is live. Page cache hit ratio and store size still need APOC (apoc.monitor.pc / apoc.monitor.store) — not confirmed installed on this build.");
   } catch (e) {
-    setMemNotWired("dbms.queryJmx is unavailable on this Neo4j build (removed/restricted in recent versions) — heap, page cache, and store size all need APOC or JMX exposure this dashboard doesn't have yet.");
+    setHeapUnavailable();
   }
 }
 async function attemptQueryTelemetry() {
