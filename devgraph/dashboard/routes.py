@@ -17,6 +17,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import time
 from typing import Any
 
@@ -49,6 +50,75 @@ _GRAPH_LIMIT_CEILING = 2000
 # can't write an unbounded file to disk.
 _LAYOUT_PAYLOAD_LIMIT_BYTES = _GRAPH_LIMIT_CEILING * 1024
 _SSE_KEEPALIVE_S = 15
+
+# Fixed, parameterless query behind `GET /database-stats`. The JVM's own
+# java.lang:type=Memory MBean is the one heap source available on a stock
+# Neo4j 5.26 Community container (no APOC, no metrics endpoint), and
+# `dbms.queryJmx` is a read-only procedure. Held here as a literal so the
+# endpoint can never be steered by caller input.
+_JMX_MEMORY_QUERY = 'CALL dbms.queryJmx("java.lang:type=Memory") YIELD attributes RETURN attributes'
+
+
+def _heap_unavailable() -> dict[str, Any]:
+    """The one shape the card renders as dashed/"unavailable"."""
+    return {"available": False, "used_bytes": None, "max_bytes": None, "used_percent": None}
+
+
+def _jmx_number(value: Any) -> float | None:
+    """A JMX attribute as a real number, or None if it isn't usable.
+
+    `bool` is an `int` in Python, and a JSON `true` reaching an arithmetic
+    path would silently become 1 byte, so it is rejected explicitly.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _heap_from_jmx_rows(rows: Any) -> dict[str, Any]:
+    """Heap used/max out of `_JMX_MEMORY_QUERY`'s rows, or the unavailable shape.
+
+    Neo4j 5.26 returns each JMX composite attribute nested as
+    `attributes.HeapMemoryUsage.value.properties.{used,max}` -- the flat
+    `...value.used` shape the dashboard used to read never matches, which is
+    why the card never went live. Anything that isn't that exact shape with
+    two usable numbers (denied procedure, empty result, a future/other
+    layout, a non-numeric or non-finite value) is reported as unavailable
+    rather than guessed at.
+
+    Zero is treated as unusable, not as a value: a running JVM reports
+    neither zero heap used nor zero heap max, so a zero here means the
+    attribute wasn't populated. `used > max` is likewise rejected -- a meter
+    past 100% is a misread, not a reading. Because both are rejected,
+    `used_percent` is always within 0-100 by construction.
+    """
+    if not isinstance(rows, list) or not rows:
+        return _heap_unavailable()
+    row = rows[0]
+    if not isinstance(row, dict):
+        return _heap_unavailable()
+    node: Any = row
+    for key in ("attributes", "HeapMemoryUsage", "value", "properties"):
+        if not isinstance(node, dict):
+            return _heap_unavailable()
+        node = node.get(key)
+    if not isinstance(node, dict):
+        return _heap_unavailable()
+
+    used = _jmx_number(node.get("used"))
+    heap_max = _jmx_number(node.get("max"))
+    if used is None or heap_max is None:
+        return _heap_unavailable()
+    if used <= 0 or heap_max <= 0 or used > heap_max:
+        return _heap_unavailable()
+    return {
+        "available": True,
+        "used_bytes": int(used),
+        "max_bytes": int(heap_max),
+        "used_percent": round(used / heap_max * 100, 1),
+    }
 
 
 def _reject_cross_site(request: Request) -> None:
@@ -331,6 +401,28 @@ def build_router(
                 repo_id=repo_id, query=query, duration_ms=(time.monotonic() - start) * 1000, ok=True
             )
         return {"results": [result], "errors": []}
+
+    @router.get("/database-stats")
+    def database_stats() -> dict[str, Any]:
+        """Live JVM heap for the dashboard's Database & memory card.
+
+        Read-only and fixed-query: the browser used to send the JMX call
+        through `/api/cypher` and parse driver records itself, which coupled
+        a visible card to Neo4j's result shape (and broke on 5.26). This
+        returns only the numbers the card renders plus whether they're real.
+
+        Always 200, never the driver's error text: an unreachable database,
+        a build without `dbms.queryJmx`, or a role that isn't allowed to
+        call it are all the same thing to the card -- no reading -- and the
+        browser has no use for a stack-shaped message it would have to
+        decide not to display.
+        """
+        try:
+            rows = engine.run_cypher(_JMX_MEMORY_QUERY)
+        except Exception as exc:  # neo4j driver raises its own exception hierarchy
+            logger.debug("JMX heap query unavailable: %s", exc)
+            return {"heap": _heap_unavailable()}
+        return {"heap": _heap_from_jmx_rows(rows)}
 
     @router.get("/query-log")
     def get_query_log(limit: int = 100) -> dict[str, Any]:
