@@ -2739,6 +2739,11 @@ document.getElementById("repoSelect").addEventListener("change", async e => {
 /* ── settings overlay ──────────────────────────────────────────── */
 document.getElementById("btnOpenSettings").addEventListener("click", () => document.getElementById("settingsOverlay").classList.add("open"));
 document.getElementById("btnCloseSettings").addEventListener("click", () => document.getElementById("settingsOverlay").classList.remove("open"));
+/* The header's "+ Register repo" button is a shortcut to where registration
+   actually lives, same shape as #linkOpenMcpSettings: open the overlay, then
+   click the nav button so the settings-nav handler below does the pane swap --
+   there stays exactly one place that knows how to switch panes. */
+document.getElementById("btnRegister").addEventListener("click", () => { document.getElementById("settingsOverlay").classList.add("open"); document.querySelector('[data-pane="repos"]').click(); });
 document.querySelectorAll(".settings-nav button").forEach(btn => btn.addEventListener("click", () => {
   document.querySelectorAll(".settings-nav button").forEach(b=>b.classList.remove("active")); btn.classList.add("active");
   document.querySelectorAll(".settings-pane").forEach(p=>p.classList.remove("active")); document.getElementById("pane-"+btn.dataset.pane).classList.add("active");
