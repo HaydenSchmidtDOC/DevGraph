@@ -2423,8 +2423,18 @@ async function runQueryAndUpdateGraph(query, opts) {
   const result = json.results[0];
   const elements = mapGraphResultToElements(result.data);
   if (!elements.length) return { ok: false, json };
-  mergeGraphElements(elements, opts?.mode, { remove: !!opts?.replace, settle: !!opts?.replace });
+  /* Supersession has to be decided BEFORE anything touches cy, not after.
+     This check used to sit below the merge, which meant a stale reply still
+     got to mutate the canvas first: in replace mode ({remove, settle}) it
+     removed every element the NEWER request had just added and re-settled
+     the layout to the old scope, and even in additive mode it put the stale
+     scope's nodes on screen. Rapid repo switches and entity quick-selects
+     then converged on whichever reply happened to land last, not the last
+     one asked for. Everything above this line is read-only (the early
+     returns and mapGraphResultToElements are pure), so bailing here is
+     genuinely a no-op, and the returned shape is unchanged for callers. */
   if (mySeq !== glowRequestSeq) return { ok: true, json, superseded: true };
+  mergeGraphElements(elements, opts?.mode, { remove: !!opts?.replace, settle: !!opts?.replace });
   const matched = extractStateMatchedIds(json);
   cy.nodes().forEach(n => n.toggleClass("excluded", !matched.nodeIds.has(n.id())));
   cy.edges().forEach(e => e.toggleClass("excluded", !matched.edgeIds.has(e.id())));
