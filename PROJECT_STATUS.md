@@ -32,7 +32,7 @@
 ## Structure
 
 - `Blueprints/` — numbered design docs. `Design Brief #1.md` is the architecture source of truth. `Design Brief #2.md` is an unbuilt Phase 4 sketch. `Implementation Plan #2.md` covers rollout readiness + extraction quality (implemented). `Design Brief #3.md` and `Implementation Plan #3.md` cover response envelopes, `CALLS` scope narrowing, `impact_analysis_for_diff`, and a deferred embedding-search item (implemented except the deferred item). `Implementation Plan #5.md` covers the live dashboard (implemented).
-- `devgraph/config/` — Pydantic settings; all security-sensitive defaults off (telemetry, cloud sync, cross-repo, `run_cypher`).
+- `devgraph/config/` — Pydantic settings; all security-sensitive defaults off (telemetry, cloud sync, cross-repo, `run_cypher`). `project_schema.py` loads and fail-closed-validates an optional repository-root `devgraph.schema.yaml` declaring extra node types/relationships — loader only, so nothing in indexing reads it yet, no custom provider is loaded or run, and a repository without the file resolves to exactly the built-in labels, relationship types, and constraints.
 - `devgraph/registry/` — SQLite-backed repo allowlist (`RepoRegistry`), thread-safe via `RLock`. Stores `docs_path`, `mentions_enabled`, PR/issue opt-in flags, `last_indexed_commit`.
 - `devgraph/graph/` — `GraphEngine` (Neo4j driver, idempotent MERGE, schema constraints, per-file delete cleanup) and `schema.py` (canonical labels/relationship types — import from here, don't hardcode strings).
 - `devgraph/indexer/common.py` — `GraphNode`/`GraphRelationship`/`ExtractionResult`, shared by every language extractor below.

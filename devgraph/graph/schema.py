@@ -52,6 +52,16 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
     "REFERENCES",
 )
 
+# Node property names DevGraph itself owns. `repo_id`/`name`/`file` are the
+# identity key components (see graph/engine.py `identity_key`), and
+# `source_file`/`source`/`sources` are the provenance properties per-file
+# delete cleanup keys off. A per-project schema may not redeclare any of
+# them: a user-defined field of the same name would silently collide with
+# the value the pipeline writes.
+RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset(
+    {"repo_id", "name", "file", "source_file", "source", "sources"}
+)
+
 # Labels other than Repository must be uniquely keyed on (repo_id, name)
 # so incremental MERGE writes update in place instead of duplicating.
 _REPO_SCOPED_LABELS = tuple(l for l in NODE_LABELS if l != "Repository")
