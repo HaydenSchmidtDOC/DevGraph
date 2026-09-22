@@ -546,7 +546,7 @@ table.dstable input[type="text"] { width: 100%; }
       </div>
 
       <div class="card" data-od-id="query-log-card">
-        <div class="card-head"><h3>Cypher query rate</h3><span class="live-pill" title="Real counts of queries run through this dashboard's own Cypher console — not database-wide load, and not per-MCP-tool telemetry (that's still unwired, see the Query telemetry card).">Console queries</span></div>
+        <div class="card-head"><h3>Cypher query rate</h3><span class="live-pill" title="Real counts of queries run through this dashboard's own Cypher console — not database-wide load, and not per-MCP-tool telemetry (MCP tool calls are counted separately in the Query telemetry card).">Console queries</span></div>
         <div class="chart-controls" style="margin-bottom:10px">
           <select id="chartInterval"><option value="auto" selected>Auto interval</option><option value="60">1 min</option><option value="300">5 min</option><option value="3600">1 hr</option></select>
           <select id="chartSpan"><option value="900">Last 15m</option><option value="3600" selected>Last 1h</option><option value="86400">Last 24h</option><option value="604800">Last 7d</option></select>
@@ -586,12 +586,15 @@ table.dstable input[type="text"] { width: 100%; }
       </div>
 
       <div class="card" data-od-id="query-telemetry-card">
-        <div class="card-head"><h3>Query telemetry</h3><span class="sample-pill">Not wired</span></div>
-        <div class="metric-row"><span class="metric-label">Active queries</span><span class="metric-val dim" id="activeQVal">—</span></div>
-        <div class="metric-row"><span class="metric-label">Queued transactions</span><span class="metric-val dim" id="queuedQVal">—</span></div>
-        <div class="metric-row"><span class="metric-label">P50 / P99 latency</span><span class="metric-val dim" id="latencyVal">— / —</span></div>
-        <div class="metric-row"><span class="metric-label">Error rate</span><span class="metric-val dim" id="errRateVal">—</span></div>
-        <div class="placeholder-note">Needs a query-log store per the rebuild design doc §8 (MCP wrapper instrumentation) — not built yet. <code>dbms.listQueries()</code> attempted for active-count only.</div>
+        <div class="card-head"><h3>Query telemetry</h3><span class="sample-pill" id="mcpPill">Checking…</span></div>
+        <div class="metric-row"><span class="metric-label">Tool calls (MCP, last 500)<span class="qmark" data-tip="MCP tool calls recorded by connected MCP clients (devgraph/mcp/server.py), metadata only — no query text, arguments, or repository. The store keeps the newest 500 records.">?</span></span><span class="metric-val dim" id="mcpCallsVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">Top tools (MCP)</span><span class="metric-val dim" id="mcpTopToolsVal" style="flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</span></div>
+        <div class="metric-row"><span class="metric-label">P50 / P95 / P99 latency (MCP)</span><span class="metric-val dim" id="latencyVal">— / — / —</span></div>
+        <div class="metric-row"><span class="metric-label">Error rate (MCP)</span><span class="metric-val dim" id="errRateVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">Active queries (Neo4j)</span><span class="metric-val dim" id="activeQVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">Queued transactions (Neo4j)</span><span class="metric-val dim" id="queuedQVal">—</span></div>
+        <div class="placeholder-note" id="neo4jQNote">Active queries (Neo4j) is attempted live on connect via <code>SHOW TRANSACTIONS</code> and stays dashed if this build refuses it. Queued transactions (Neo4j) has no source on this build and is never estimated.</div>
+        <div class="placeholder-note" id="mcpNote">Reading MCP tool-call telemetry…</div>
       </div>
 
       <div class="card" data-od-id="community-card">
@@ -2992,8 +2995,8 @@ window.addEventListener("resize", drawChart);
 /* Real history of queries run through this console (see /api/query-log,
    backed by dashboard/query_log.py) -- "Tool" is always "console" because
    only the dashboard's own Cypher box is instrumented here, not per-MCP-tool
-   calls from other clients (that's separate, still-unwired telemetry — see
-   the Query telemetry card). */
+   calls from other clients (that's separate telemetry, read from the MCP
+   store and shown in the Query telemetry card). */
 const logBody = document.getElementById("logTableBody");
 let logRows = [];
 async function loadQueryLog() {
@@ -3018,7 +3021,13 @@ function loadQueryFromHistory(cypherText) {
 }
 function renderLog(filter) { logBody.innerHTML = ""; logRows.filter(r => !filter || (r.tool+r.repo+r.cypher).toLowerCase().includes(filter)).forEach(r => { const tr = document.createElement("tr"); tr.title = "Load this query into the Cypher box"; tr.innerHTML = `<td class="mono">${r.t}</td><td>${r.tool}</td><td class="mono">${escapeHtmlVal(r.repo)}</td><td class="mono">${escapeHtmlVal(r.cypher)}</td>`; tr.addEventListener("click", () => loadQueryFromHistory(r.cypher)); logBody.appendChild(tr); }); }
 document.getElementById("logSearch").addEventListener("input", e => renderLog(e.target.value.trim().toLowerCase()));
-async function refreshTelemetry() { await Promise.all([drawChart(), loadQueryLog()]); }
+/* The card reads its two independent sources together: the chart/console log
+   below, and the MCP tool-call telemetry the endpoint serves from the local
+   store. Called once here at boot and again after a console query -- there is
+   deliberately no polling timer. */
+async function refreshTelemetry() {
+  await Promise.all([drawChart(), loadQueryLog(), attemptMcpTelemetry()]);
+}
 refreshTelemetry();
 
 /* ── git history: real commits from /api/repos/{id}/git-log + real
@@ -3255,7 +3264,151 @@ async function attemptQueryTelemetry() {
     const n = json.results[0].data[0]?.row[0];
     document.getElementById("activeQVal").textContent = String(n);
     document.getElementById("activeQVal").classList.remove("dim");
-  } catch (e) { /* leave dashed — needs the query-log store per design doc §8 either way */ }
+  } catch (e) { /* leave dashed — this build may refuse SHOW TRANSACTIONS; never estimated */ }
+}
+/* ── the MCP half of the Query telemetry card ───────────────────────────
+   Reads GET /api/mcp-telemetry, the dashboard's view of what connected MCP
+   clients ran in their own server processes (metadata only: timestamp, tool
+   name, duration, outcome -- no query text, arguments or repository). This
+   source is a local file the endpoint reads, so it works with the database
+   down; nothing below touches the graph.
+
+   Two honesty rules shape all of it. First, that endpoint cannot tell "no
+   client has run a tool" apart from "the store is missing or unreadable" --
+   both arrive as an empty list -- so the card names both possibilities and
+   shows no number for either, rather than a zero it can't stand behind.
+   Second, every figure is derived from the same set of usable records, and
+   each field is admitted only if it is really the type it claims: a store
+   rebuilt field-by-field on the server can hand over a missing, null or
+   string value, and that must read as no value instead of coercing into one. */
+function formatMcpMs(ms) {
+  // One decimal below 10ms so a genuinely sub-millisecond call can't round
+  // down into a fake "0ms".
+  if (ms < 10) return ms.toFixed(1) + "ms";
+  if (ms < 1000) return Math.round(ms) + "ms";
+  return (ms / 1000).toFixed(1) + "s";
+}
+/* Nearest-rank on the ascending sample, no interpolation: every latency shown
+   is a duration some recorded call actually took. */
+function mcpPercentile(sorted, p) {
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(p / 100 * sorted.length) - 1))];
+}
+/* Pure: entries in, figures out, no DOM. Returns null only when the payload
+   isn't a record list at all. A record counts as a call only if it names a
+   tool; its duration and outcome each join their own sample only if usable,
+   so both samples are subsets of the call count and can be disclosed as
+   such instead of silently standing in for it. */
+function summarizeMcpTelemetry(entries) {
+  if (!Array.isArray(entries)) return null;
+  const counts = new Map();
+  const durations = [];
+  let calls = 0, skipped = 0, errors = 0, okSample = 0;
+  for (const e of entries) {
+    const tool = (e && typeof e.tool === "string") ? e.tool.trim() : "";
+    if (!tool) { skipped++; continue; }
+    calls++;
+    counts.set(tool, (counts.get(tool) || 0) + 1);
+    if (Number.isFinite(e.duration_ms) && e.duration_ms >= 0) durations.push(e.duration_ms);
+    if (typeof e.ok === "boolean") { okSample++; if (!e.ok) errors++; }
+  }
+  durations.sort((a, b) => a - b);
+  // ties broken by name so the same store always renders the same list
+  const top = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .slice(0, 3)
+    .map(([tool, n]) => `${tool.slice(0, 32)} ×${n}`);
+  return {
+    calls,
+    skipped,
+    top,
+    latency: durations.length ? [50, 95, 99].map(p => formatMcpMs(mcpPercentile(durations, p))).join(" / ") : null,
+    latencySample: durations.length,
+    errorRate: okSample ? (errors / okSample * 100).toFixed(1) + "%" : null,
+    errors,
+    okSample,
+  };
+}
+/* Every MCP row back to the dashed, dimmed state it is served in. Classes are
+   toggled individually rather than by rewriting className, and text is always
+   written as text -- tool names come from a local file, and this card never
+   builds markup out of them. */
+function dashMcpRows() {
+  for (const [id, placeholder] of [["mcpCallsVal", "—"], ["mcpTopToolsVal", "—"], ["latencyVal", "— / — / —"], ["errRateVal", "—"]]) {
+    const el = document.getElementById(id);
+    el.textContent = placeholder;
+    el.title = "";
+    el.classList.add("dim");
+  }
+}
+/* The transport/shape failures the endpoint does distinguish: the request
+   never completed, it answered with an error status, or its body wasn't the
+   record list this card expects. `reason` is always the card's own words. */
+function setMcpTelemetryUnavailable(reason) {
+  dashMcpRows();
+  const pill = document.getElementById("mcpPill");
+  pill.textContent = "MCP unavailable";
+  pill.className = "sample-pill";
+  pill.title = "MCP tool-call telemetry unavailable — " + reason;
+  document.getElementById("mcpNote").textContent =
+    `MCP tool-call telemetry unavailable — ${reason}, so these rows stay dashed rather than shown as zero.`;
+}
+function renderMcpTelemetry(summary) {
+  if (!summary) { setMcpTelemetryUnavailable("the telemetry endpoint did not return a readable record list"); return; }
+  const skippedClause = summary.skipped
+    ? ` ${summary.skipped} record(s) in the store could not be read and were skipped.`
+    : "";
+  const pill = document.getElementById("mcpPill");
+  const note = document.getElementById("mcpNote");
+  dashMcpRows();
+  if (!summary.calls) {
+    /* Empty store and unreadable store are rendered identically because they
+       are identical on the wire -- see the rule above. */
+    pill.textContent = "MCP: no records";
+    pill.className = "sample-pill";
+    pill.title = "No readable MCP tool-call records — nothing here is shown as zero";
+    note.textContent = "No readable MCP tool-call records. Either no connected MCP client has run a DevGraph tool yet, or the local store is missing or unreadable — the dashboard cannot tell these apart, so nothing here is shown as zero." + skippedClause;
+    return;
+  }
+  const callsEl = document.getElementById("mcpCallsVal");
+  callsEl.textContent = summary.calls.toLocaleString();
+  callsEl.classList.remove("dim");
+  const topEl = document.getElementById("mcpTopToolsVal");
+  const topText = summary.top.join(" · ");
+  topEl.textContent = topText;
+  topEl.title = topText; // the row can ellipsise; the hover carries it whole
+  topEl.classList.remove("dim");
+  // Per-metric independence: a populated card still dashes a metric whose own
+  // sample is empty, instead of borrowing the call count for it.
+  if (summary.latency) {
+    const latEl = document.getElementById("latencyVal");
+    latEl.textContent = summary.latency;
+    latEl.title = `Nearest-rank percentiles over the ${summary.latencySample} recorded call(s) that reported a usable duration`;
+    latEl.classList.remove("dim");
+  }
+  if (summary.errorRate) {
+    const errEl = document.getElementById("errRateVal");
+    errEl.textContent = summary.errorRate;
+    errEl.title = `${summary.errors} of ${summary.okSample} recorded call(s) that reported an outcome failed`;
+    errEl.classList.remove("dim");
+  }
+  pill.textContent = "MCP live";
+  pill.className = "wired-pill";
+  pill.title = "MCP tool-call metadata read live from the local telemetry store";
+  note.textContent = `Live MCP tool-call metadata — ${summary.calls} of up to the last 500 recorded calls, metadata only: no query text, arguments, or repository. Latency percentiles cover ${summary.latencySample} of those ${summary.calls} calls that recorded a usable duration; error rate covers ${summary.okSample} that recorded a usable outcome.` + skippedClause;
+}
+async function attemptMcpTelemetry() {
+  /* Pre-set per step so the rendered reason is this card's description of how
+     far the read got -- never a relayed error string from anywhere else. */
+  let reason = "the request for the telemetry endpoint did not complete";
+  try {
+    const res = await fetch("/api/mcp-telemetry?limit=500");
+    if (!res.ok) { reason = "the telemetry endpoint answered with HTTP " + res.status; throw new Error(reason); }
+    reason = "the telemetry endpoint's response was not a readable record list";
+    const json = await res.json();
+    renderMcpTelemetry(summarizeMcpTelemetry(json?.entries));
+  } catch (e) {
+    setMcpTelemetryUnavailable(reason);
+  }
 }
 async function attemptCommunityDetection() {
   const note = document.getElementById("communityNote");
