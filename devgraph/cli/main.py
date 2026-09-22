@@ -22,7 +22,7 @@ from devgraph.cli._env import resolve_podman, resolve_repo_root, resolve_venv_py
 from devgraph.cli.exporters import export_cypher, export_dot, export_json
 from devgraph.config import get_settings
 from devgraph.dashboard import queries as dashboard_queries
-from devgraph.graph.engine import GraphEngine
+from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
@@ -72,7 +72,7 @@ def add(
                 settings = get_settings()
                 engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
                 try:
-                    engine.init_schema()
+                    provision_repository_schema(engine, record.path)
                     engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
                     count = full_scan(engine, record.repo_id, record.path, docs_path=record.docs_path, mentions_enabled=record.mentions_enabled)
                     registry.mark_indexed(record.repo_id)
@@ -228,7 +228,7 @@ def rescan(
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
             try:
-                engine.init_schema()
+                provision_repository_schema(engine, repo.path)
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
                 count = full_scan(engine, repo_id, repo.path, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled)
                 registry.mark_indexed(repo_id)
@@ -613,15 +613,116 @@ def status() -> None:
     console.print()
 
 
+def _project_schema_findings(repos: list[Any]) -> list[dict[str, Any]]:
+    """Per-repository project schema state, plus cross-repository conflicts.
+
+    Reads each registered repository's optional `devgraph.schema.yaml` and
+    nothing else: no graph connection, no registry write, no cached or
+    persisted schema state. Every finding carries an explicit `failed` flag
+    rather than leaving the caller to infer severity from the rendered text.
+
+    Each repository reports `absent` (no file — the built-in schema, exactly
+    as before), `valid`, or `invalid` (the loader's own message). A final
+    `conflict` finding is emitted per label that two or more repositories
+    declare incompatibly. Labels are grouped case-insensitively because the
+    generated constraint names are lower-cased: `Widget` and `widget` would
+    generate one constraint name, and the loser's
+    `CREATE CONSTRAINT ... IF NOT EXISTS` would silently no-op, shipping a
+    label with no uniqueness constraint at all. Identical `(label, key)`
+    declarations are not a conflict — they provision the same constraint, and
+    registered repositories deliberately share one database.
+    """
+    from devgraph.config.project_schema import (
+        SCHEMA_FILENAME,
+        ProjectSchemaError,
+        load_project_schema,
+        project_schema_path,
+        resolve_declaration,
+    )
+
+    findings: list[dict[str, Any]] = []
+    # Case-folded label -> the (repo_id, label, key) triples declaring it.
+    declared: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {}
+
+    for repo in sorted(repos, key=lambda r: r.repo_id):
+        try:
+            # `load_project_schema` returns None if and only if the file is
+            # absent, and raises for every unreadable/malformed/invalid one,
+            # so absent-vs-invalid is the loader's own distinction, not a
+            # second `exists()` check that could disagree with it.
+            declaration = load_project_schema(repo.path)
+            if declaration is None:
+                findings.append(
+                    {
+                        "repo_id": repo.repo_id,
+                        "status": "absent",
+                        "detail": f"no {SCHEMA_FILENAME} (built-in schema)",
+                        "failed": False,
+                    }
+                )
+                continue
+            effective = resolve_declaration(
+                declaration, origin=str(project_schema_path(repo.path))
+            )
+        except ProjectSchemaError as exc:
+            findings.append(
+                {
+                    "repo_id": repo.repo_id,
+                    "status": "invalid",
+                    "detail": str(exc),
+                    "failed": True,
+                }
+            )
+            continue
+
+        labels = ", ".join(node_type.label for node_type in effective.node_types)
+        findings.append(
+            {
+                "repo_id": repo.repo_id,
+                "status": "valid",
+                "detail": f"extends: {effective.extends}; node types: {labels or 'none'}",
+                "failed": False,
+            }
+        )
+        for node_type in effective.node_types:
+            declared.setdefault(node_type.label.casefold(), []).append(
+                (repo.repo_id, node_type.label, tuple(node_type.key))
+            )
+
+    for folded, entries in sorted(declared.items()):
+        if len({(label, key) for _repo_id, label, key in entries}) < 2:
+            continue
+        described = "; ".join(
+            f"{repo_id} declares {label} keyed on ({', '.join(key)})"
+            for repo_id, label, key in sorted(entries)
+        )
+        findings.append(
+            {
+                "repo_id": None,
+                "status": "conflict",
+                "label": folded,
+                "detail": (
+                    f"incompatible declarations of label {folded!r} in one shared "
+                    f"database: {described}. Only the first provisioned constraint "
+                    f"takes effect; align the key or rename one label."
+                ),
+                "failed": True,
+            }
+        )
+
+    return findings
+
+
 @app.command()
 def doctor() -> None:
     """Run a heavier environment-drift diagnostic than `status`.
 
     Checks Python version, the installed `mcp` package, MCP server
     importability, Neo4j reachability + schema, Podman container state, the
-    repo registry, and tray liveness — continuing past non-fatal failures so
-    one run surfaces everything at once. Intended for bootstrap/troubleshooting
-    moments; `status` stays the fast/lightweight command for quick glances.
+    repo registry, each repository's optional `devgraph.schema.yaml`, and tray
+    liveness — continuing past non-fatal failures so one run surfaces
+    everything at once. Intended for bootstrap/troubleshooting moments;
+    `status` stays the fast/lightweight command for quick glances.
     """
     settings = get_settings()
     any_failed = False
@@ -708,16 +809,32 @@ def doctor() -> None:
 
     # 7. Registry reachability
     console.print("[bold]Registry[/bold]")
+    registered_repos: list[Any] = []
     try:
         registry = _get_registry()
         try:
-            repos = registry.list_repos()
-            console.print(f"  [green][OK][/green] {len(repos)} repo(s) registered at {settings.registry_db_path}")
+            registered_repos = registry.list_repos()
+            console.print(f"  [green][OK][/green] {len(registered_repos)} repo(s) registered at {settings.registry_db_path}")
         finally:
             registry.close()
     except Exception as e:
         console.print(f"  [red][X] Registry error:[/red] {e}")
         any_failed = True
+
+    # 7b. Per-repository project schemas. Filesystem-only, and reuses the list
+    # section 7 already read: an unreadable registry is reported once, there,
+    # and leaves this section with nothing to check rather than crashing.
+    console.print("[bold]Project schemas[/bold]")
+    schema_findings = _project_schema_findings(registered_repos)
+    if not schema_findings:
+        console.print("  [green][OK][/green] no registered repositories to check")
+    for finding in schema_findings:
+        subject = finding["repo_id"] or "conflict"
+        if finding["failed"]:
+            console.print(f"  [red][X] {subject}:[/red] {finding['detail']}")
+            any_failed = True
+        else:
+            console.print(f"  [green][OK][/green] {subject}: {finding['detail']}")
 
     # 8. Tray/watcher liveness
     console.print("[bold]Live Watcher[/bold]")
