@@ -247,6 +247,168 @@ def god_nodes(
     return _envelope(results, max_results)
 
 
+# Dependency-edge types find_dependency_cycles is allowed to traverse. A
+# strict subset of schema.RELATIONSHIP_TYPES: containment (CONTAINS, RUNS),
+# provenance (MODIFIES, RESOLVES, REFERENCES) and intent (SATISFIES,
+# DOCUMENTED_BY, DECIDED_BY, SUPERSEDES, MENTIONS) edges are not dependencies
+# and a "cycle" over them means nothing. This is an allow-list, not a filter:
+# it is the only thing besides a clamped integer ever interpolated into the
+# cycle query's Cypher, so an unlisted value can never reach the graph.
+_CYCLE_RELATIONSHIPS: tuple[str, ...] = ("CALLS", "DEPENDS_ON", "EXTENDS", "IMPORTS", "USES")
+# Cycle length in edges. The floor of 2 excludes single-edge self-loops; the
+# ceiling bounds a variable-length expansion that is exponential in practice.
+_CYCLE_MIN_LENGTH = 2
+_CYCLE_MAX_LENGTH = 8
+# Raw paths pulled back before deduplication. One cycle of length L is found
+# L times (once per rotation), and a dense component yields far more paths
+# than distinct cycles, so this caps the expansion rather than the answer.
+_CYCLE_RAW_PATH_LIMIT = 500
+
+
+def _cycle_node_key(node: dict[str, Any]) -> tuple[str, str, str, tuple[str, ...]]:
+    """Total, null-safe ordering key identifying one node inside a cycle.
+
+    Null-safe because it is used to rotate and sort: `file` is absent on
+    Module/Endpoint nodes and `repo_id`/`name` can be missing on a partially
+    indexed node, and a None would make the tuple uncomparable at that
+    position. Labels are sorted because Neo4j's `labels()` ordering is not
+    guaranteed stable across calls, and an unstable key would make the
+    canonical rotation (and therefore deduplication) non-deterministic.
+    """
+    return (
+        node.get("repo_id") or "",
+        node.get("name") or "",
+        node.get("file") or "",
+        tuple(sorted(node.get("labels") or [])),
+    )
+
+
+def find_dependency_cycles(
+    engine: GraphEngine,
+    repo_id: str,
+    relationship: str = "IMPORTS",
+    max_length: int = 5,
+    cross_repo: bool = False,
+    max_results: int = 15,
+) -> dict[str, Any]:
+    """Find circular dependency chains over one already-indexed relationship type.
+
+    Plain read-only Cypher over the existing graph — no GDS, no projection, no
+    writes. A cycle is reported once regardless of which of its nodes the
+    traversal started from: every rotation of the same node ring collapses to
+    a single canonical result. Two cycles over the same nodes in opposite
+    directions are genuinely different dependency chains and are both reported.
+
+    Args:
+        engine: GraphEngine instance
+        repo_id: Repository ID to search within (unless cross_repo=True)
+        relationship: Dependency edge type to traverse; case-insensitive, one of
+            CALLS, DEPENDS_ON, EXTENDS, IMPORTS, USES
+        max_length: Longest cycle to look for, in edges; clamped to 2..8
+        cross_repo: If True, allow cycles that cross repository boundaries
+        max_results: Maximum number of cycles to return in the envelope
+
+    Returns:
+        Dict with count, results, and truncated flag. Each result is
+        {length, nodes}, where `nodes` lists the cycle's members in traversal
+        order starting from its canonical member (each with name, labels,
+        repo_id, file) and the closing repeat of the first node is dropped.
+        Acyclic data returns an empty envelope.
+
+        `count` is a lower bound rather than an exact total whenever
+        `truncated` is True: the underlying traversal stops at
+        `_CYCLE_RAW_PATH_LIMIT` raw paths, so cycles beyond that clip were
+        never seen and cannot be counted. `truncated` is therefore True when
+        that clip is hit even if fewer than `max_results` cycles came back.
+
+    Raises:
+        ValueError: if `relationship` is not one of the supported types. This
+            fails loudly rather than returning an empty envelope, because an
+            empty envelope from a cycle search reads as "no cycles here" — a
+            false clean bill of health on a typo'd argument.
+    """
+    validated = str(relationship).strip().upper()
+    if validated not in _CYCLE_RELATIONSHIPS:
+        # Deliberately does not echo the input back: the message reaches a
+        # model's context, and the argument is caller-controlled and unbounded.
+        raise ValueError(
+            "unsupported relationship for cycle detection; supported types are: "
+            + ", ".join(_CYCLE_RELATIONSHIPS)
+        )
+
+    length = max(_CYCLE_MIN_LENGTH, min(_CYCLE_MAX_LENGTH, int(max_length)))
+    limit = max(1, int(max_results))
+
+    # `start.repo_id` is repeated here rather than left to the ALL(...)
+    # predicate below: ALL(nodes(path)) can only be evaluated once a whole
+    # path exists, so without this the planner would expand from every node in
+    # the database and discard the out-of-repo paths afterwards.
+    start_scope = "" if cross_repo else "AND start.repo_id = $repo_id"
+    path_scope = "" if cross_repo else "WHERE ALL(n IN nodes(path) WHERE n.repo_id = $repo_id)"
+    # Lossless prefilter: every node on a cycle of this type necessarily has
+    # both an outgoing and an incoming edge of it, so this can only remove
+    # nodes that could not have started a cycle — it narrows the scan without
+    # narrowing the answer.
+    # Only `validated` (an allow-list member) and `length` (a clamped int) are
+    # interpolated; every caller-supplied value stays in $repo_id. Node fields
+    # are projected explicitly rather than returning whole nodes, so an
+    # arbitrary indexed property can never ride out past the sanitizer below.
+    cypher = f"""
+    MATCH (start)
+    WHERE (start)-[:{validated}]->() AND ()-[:{validated}]->(start)
+    {start_scope}
+    MATCH path = (start)-[:{validated}*{_CYCLE_MIN_LENGTH}..{length}]->(start)
+    {path_scope}
+    RETURN [n IN nodes(path) | {{name: n.name, labels: labels(n),
+                                 repo_id: n.repo_id, file: n.file}}] as nodes
+    ORDER BY [n IN nodes(path) | elementId(n)],
+             [r IN relationships(path) | elementId(r)]
+    LIMIT {_CYCLE_RAW_PATH_LIMIT}
+    """
+    params = {} if cross_repo else {"repo_id": repo_id}
+
+    results = engine.run_cypher(cypher, params)
+
+    cycles: dict[tuple, dict[str, Any]] = {}
+    for row in results:
+        raw_nodes = row.get("nodes") or []
+        # A closed path repeats its start node at the end; drop that repeat.
+        # Fewer than three entries means the ring collapses to a single node
+        # (a self-loop), which is not a dependency cycle between components.
+        if len(raw_nodes) < 3:
+            continue
+        nodes = raw_nodes[:-1]
+        keys = [_cycle_node_key(n) for n in nodes]
+        # Neo4j's variable-length expansion uses trail semantics: it forbids
+        # repeating a *relationship*, not a *node*. A path that revisits a node
+        # (a figure-eight, or a parallel self-loop traversed twice) is not a
+        # simple cycle, and it has no unique smallest member to rotate to.
+        if len(set(keys)) != len(keys):
+            continue
+        offset = keys.index(min(keys))
+        canonical = tuple(keys[offset:] + keys[:offset])
+        if canonical in cycles:
+            continue
+        rotated = nodes[offset:] + nodes[:offset]
+        cycles[canonical] = {
+            "length": len(rotated),
+            # _envelope's sanitizer only reaches an item's own string values,
+            # never a nested list of dicts, so the nodes are sanitized here.
+            "nodes": [_sanitize_row(n) for n in rotated],
+        }
+
+    rows = [cycles[key] for key in sorted(cycles)]
+    rows.sort(key=lambda row: row["length"])
+
+    envelope = _envelope(rows, limit)
+    if len(results) >= _CYCLE_RAW_PATH_LIMIT:
+        # The raw expansion was clipped, so there may be cycles neither
+        # `count` nor `results` reflects. _envelope compares against
+        # max_results alone and cannot see that.
+        envelope["truncated"] = True
+    return envelope
+
+
 def trace_request_flow(
     engine: GraphEngine,
     repo_id: str,

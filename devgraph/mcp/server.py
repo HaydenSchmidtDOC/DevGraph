@@ -110,6 +110,7 @@ _TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "blame_component", "identifier_kind": "file path (not a function name)", "envelope": False, "phase": 3},
     {"name": "find_related_prs", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
     {"name": "god_nodes", "identifier_kind": None, "envelope": True, "phase": 3},
+    {"name": "find_dependency_cycles", "identifier_kind": "dependency relationship type (CALLS/DEPENDS_ON/EXTENDS/IMPORTS/USES), not a component name", "envelope": True, "phase": 3},
     {"name": "issue_history_for", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
     {"name": "get_source", "identifier_kind": "function/class name (not a file path)", "envelope": False, "phase": 2},
     {"name": "run_cypher", "identifier_kind": "raw Cypher", "envelope": False, "phase": None, "note": "only registered when enable_run_cypher=true; prefer the purpose-built tools above"},
@@ -313,6 +314,24 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
         a new agent should look at first to orient itself in an unfamiliar repo.
         Returns {count, results, truncated} with degree (number of direct relationships)."""
         return devgraph_tools.god_nodes(engine, repo_id, cross_repo, max_results)
+
+    @server.tool(annotations=_READ_ONLY)
+    def find_dependency_cycles(
+        repo_id: str,
+        relationship: str = "IMPORTS",
+        max_length: int = 5,
+        cross_repo: bool = False,
+        max_results: int = 15,
+    ) -> dict[str, Any]:
+        """Find circular dependency chains over one already-indexed relationship type
+        (CALLS, DEPENDS_ON, EXTENDS, IMPORTS or USES — anything else is rejected);
+        returns {count, results, truncated} of {length, nodes} rows. Each cycle is
+        reported once whatever node it was found from; opposite-direction cycles over
+        the same nodes are distinct and both reported. max_length is in edges and is
+        clamped to 2..8. count is a lower bound when truncated is true."""
+        return devgraph_tools.find_dependency_cycles(
+            engine, repo_id, relationship, max_length, cross_repo, max_results
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def list_recent_changes(
