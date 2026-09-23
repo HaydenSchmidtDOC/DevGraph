@@ -13,13 +13,17 @@ the point: the happy-path test reopens the database with a second
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from devgraph.config.project_schema import SCHEMA_FILENAME
 from devgraph.dashboard import routes
 from devgraph.dashboard.events import EventBroadcaster
+from devgraph.graph.engine import repository_constraint_statements
+from devgraph.graph.schema import constraint_statements
 from devgraph.registry.store import RepoRegistry
 
 
@@ -32,9 +36,15 @@ class StubEngine:
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+        self.effective_schemas: list[Any] = []
         self.fail_on: str | None = None
 
-    def init_schema(self) -> None:
+    def init_schema(self, effective: Any = None) -> None:
+        # The route provisions through `provision_repository_schema`, which
+        # resolves the repository's optional schema file and passes the result
+        # here; kept out of `calls` so the ordering assertions stay about the
+        # sequence of operations rather than their arguments.
+        self.effective_schemas.append(effective)
         self._record(("init_schema",))
 
     def upsert_repository(self, repo_id: str, name: str, path: str) -> None:
@@ -362,6 +372,80 @@ def test_indexing_failure_keeps_the_repo_registered(
     record = registry.get("sample-repo")
     assert record is not None
     assert record.last_indexed is None
+
+    reopened = RepoRegistry(registry_path)
+    try:
+        assert reopened.get("sample-repo") is not None
+    finally:
+        reopened.close()
+
+
+def test_register_repo_provisions_the_repositorys_declared_constraints(
+    client, engine, tmp_path
+):
+    """Same provisioning seam as `devgraph add`, driven by the repo's own file."""
+    repo = _make_git_repo(tmp_path)
+    (repo / SCHEMA_FILENAME).write_text(
+        "version: 1\n"
+        "node_types:\n"
+        "  - label: Widget\n"
+        "    key: [slug]\n"
+        "    metadata:\n"
+        "      - name: slug\n",
+        encoding="utf-8",
+    )
+
+    res = client.post("/api/repos", json={"path": str(repo)})
+
+    assert res.status_code == 201, res.text
+    assert res.json()["indexed"] is True
+    statements = repository_constraint_statements(engine.effective_schemas[0])
+    builtins = constraint_statements()
+    assert statements[: len(builtins)] == builtins
+    assert statements[len(builtins) :] == [
+        "CREATE CONSTRAINT widget_repo_key IF NOT EXISTS "
+        "FOR (n:Widget) REQUIRE (n.repo_id, n.slug) IS UNIQUE"
+    ]
+
+
+def test_register_repo_with_no_schema_file_provisions_only_the_builtins(client, engine, tmp_path):
+    repo = _make_git_repo(tmp_path)
+
+    res = client.post("/api/repos", json={"path": str(repo)})
+
+    assert res.status_code == 201, res.text
+    # Resolution still runs -- it is how "no schema file" is established -- and
+    # resolves to exactly the built-in statements, statement for statement.
+    assert len(engine.effective_schemas) == 1
+    assert repository_constraint_statements(engine.effective_schemas[0]) == constraint_statements()
+
+
+def test_register_repo_with_an_invalid_schema_stays_registered_and_warns(
+    client, registry, registry_path, engine, scan_calls, tmp_path
+):
+    """Same registered-with-warning contract as an unreachable Neo4j.
+
+    The schema resolves before any session is opened, so an invalid file must
+    abort the initial scan *before* a single constraint, upsert or scanned file
+    -- while leaving the committed registry row alone.
+    """
+    repo = _make_git_repo(tmp_path)
+    (repo / SCHEMA_FILENAME).write_text("version: 1\nnode_types:\n  - label: Widget\n", encoding="utf-8")
+
+    res = client.post("/api/repos", json={"path": str(repo)})
+
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["registered"] is True
+    assert body["indexed"] is False
+    assert body["files_indexed"] is None
+    assert body["last_indexed"] is None
+    assert "invalid project schema" in body["warning"]
+    assert "devgraph rescan sample-repo" in body["warning"]
+
+    # Nothing was written to the graph and nothing was scanned.
+    assert engine.calls == []
+    assert scan_calls == []
 
     reopened = RepoRegistry(registry_path)
     try:

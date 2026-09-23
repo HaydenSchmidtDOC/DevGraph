@@ -10,13 +10,21 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from neo4j import Driver, GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
 from devgraph.graph.schema import constraint_statements
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # Imported for annotations only: `devgraph.config.project_schema` imports
+    # `devgraph.graph.schema`, and `devgraph.graph.__init__` imports this
+    # module, so a module-level import here would be a real cycle. The
+    # runtime import lives inside `provision_repository_schema`.
+    from devgraph.config.project_schema import EffectiveSchema
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +282,39 @@ def _replace_file_nodes_tx(
     _upsert_relationships_tx(tx, rels)
 
 
+def repository_constraint_statements(effective: EffectiveSchema | None = None) -> list[str]:
+    """Constraint Cypher to provision for one repository.
+
+    The built-in statements always come first and in full, byte-identically
+    to `devgraph.graph.schema.constraint_statements()`, followed by whatever
+    the repository's own schema declares. `effective is None` (no project
+    file, or any caller that isn't repository-scoped) is therefore exactly
+    today's statement list.
+
+    This deliberately diverges from `EffectiveSchema.constraint_statements()`,
+    which omits the built-ins under `extends: none` (project_schema.py, pinned
+    by tests/config/test_project_schema.py::test_extends_none_inherits_nothing).
+    That is the right answer for describing one project's declaration, but the
+    wrong one to provision from: every registered repository shares a single
+    Neo4j database and the indexer keeps writing built-in labels regardless of
+    what any one project declares, so dropping the built-in constraints for a
+    repository that opted out would leave the whole database unconstrained.
+    Hence the built-ins are sourced here, never from that method; its output is
+    only appended, through an order-preserving dedupe that collapses the
+    built-ins it already replayed under `extends: default`.
+    """
+    statements = list(constraint_statements())
+    if effective is None:
+        return statements
+
+    seen = set(statements)
+    for statement in effective.constraint_statements():
+        if statement not in seen:
+            seen.add(statement)
+            statements.append(statement)
+    return statements
+
+
 class GraphEngine:
     def __init__(self, uri: str, user: str, password: str) -> None:
         self._driver: Driver = GraphDatabase.driver(uri, auth=(user, password))
@@ -284,9 +325,18 @@ class GraphEngine:
     def verify_connectivity(self) -> None:
         _retry_transient(self._driver.verify_connectivity)
 
-    def init_schema(self) -> None:
+    def init_schema(self, effective: EffectiveSchema | None = None) -> None:
+        """Provision the built-in constraints, plus a repository's declared ones.
+
+        Idempotent (every statement is `IF NOT EXISTS`/`IF EXISTS` guarded), so
+        re-running it on an already-provisioned database is a no-op. Callers
+        that aren't scoped to one repository omit `effective` and get exactly
+        the built-in statements. Statements always come from
+        `repository_constraint_statements`, never from
+        `EffectiveSchema.constraint_statements()` directly.
+        """
         with self._driver.session() as session:
-            for stmt in constraint_statements():
+            for stmt in repository_constraint_statements(effective):
                 _retry_transient(session.run, stmt)
 
     def upsert_repository(self, repo_id: str, name: str, path: str) -> None:
@@ -690,3 +740,25 @@ class GraphEngine:
                     }
                 )
             return {"columns": columns, "data": data}
+
+
+def provision_repository_schema(engine: GraphEngine, repo_root: Path | str) -> None:
+    """Resolve a repository's optional schema file, then provision constraints.
+
+    The single seam registration and rescan use in place of a bare
+    `engine.init_schema()`, so both entry points provision the same statements
+    from the same resolution.
+
+    Resolution is pure filesystem work and happens *before* any session is
+    opened, so an invalid `devgraph.schema.yaml` raises `ProjectSchemaError`
+    with the loader's own message while the graph is still untouched: no
+    constraint, no `upsert_repository`, no scan. Callers decide what that means
+    — `devgraph rescan` exits non-zero, while `devgraph add` and
+    `POST /api/repos` keep the repository registered and report a warning,
+    exactly as they already do for an unreachable Neo4j.
+    """
+    # Function-local: see the TYPE_CHECKING note at the top of this module.
+    from devgraph.config.project_schema import resolve_effective_schema
+
+    effective = resolve_effective_schema(Path(repo_root))
+    engine.init_schema(effective)

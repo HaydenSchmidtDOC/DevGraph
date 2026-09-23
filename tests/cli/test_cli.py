@@ -799,3 +799,313 @@ def test_vscode_mcp_config_path_windows_requires_appdata(monkeypatch):
     monkeypatch.delenv("APPDATA", raising=False)
     with pytest.raises(RuntimeError, match="APPDATA"):
         cli_main._vscode_mcp_config_path()
+
+
+# --- Project schema constraint provisioning ---------------------------------
+#
+# These are Neo4j-free on purpose: they pin *when* a repository's optional
+# `devgraph.schema.yaml` is resolved relative to the first graph write, which a
+# live database can't show as precisely. A stub engine stands in for
+# GraphEngine so an invalid file can be planted on demand.
+
+WIDGET_SCHEMA = """\
+version: 1
+node_types:
+  - label: Widget
+    key: [slug]
+    metadata:
+      - name: slug
+"""
+
+# `key` is required, so this loads and then fails validation.
+INVALID_SCHEMA = "version: 1\nnode_types:\n  - label: Widget\n"
+
+WIDGET_CONSTRAINT = (
+    "CREATE CONSTRAINT widget_repo_key IF NOT EXISTS "
+    "FOR (n:Widget) REQUIRE (n.repo_id, n.slug) IS UNIQUE"
+)
+
+
+class _StubEngine:
+    """Records provisioning and writes, in order, without touching Neo4j."""
+
+    def __init__(self):
+        self.calls = []
+        self.effective_schemas = []
+
+    def init_schema(self, effective=None):
+        self.effective_schemas.append(effective)
+        self.calls.append("init_schema")
+
+    def upsert_repository(self, repo_id, name, path):
+        self.calls.append("upsert_repository")
+
+    def close(self):
+        self.calls.append("close")
+
+
+def _repo_with_schema(tmp_path, name, schema=None):
+    """A directory `add_repo` accepts, optionally carrying a schema file.
+
+    `add_repo` gates on a `.git` entry existing and nothing more, and the scan
+    is stubbed here, so no `git init` subprocess is needed.
+    """
+    from devgraph.config.project_schema import SCHEMA_FILENAME
+
+    repo = tmp_path / name
+    (repo / ".git").mkdir(parents=True)
+    if schema is not None:
+        (repo / SCHEMA_FILENAME).write_text(schema, encoding="utf-8")
+    return repo
+
+
+def _collapsed(stdout):
+    """Rich soft-wraps long lines; join before asserting on a phrase."""
+    return " ".join(line.strip() for line in stdout.splitlines())
+
+
+def test_cli_rescan_provisions_the_repositorys_declared_constraints(
+    runner, temp_registry_db, tmp_path
+):
+    db_path, registry = temp_registry_db
+    repo = _repo_with_schema(tmp_path, "widgets", WIDGET_SCHEMA)
+    repo_id = registry.add_repo(repo).repo_id
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+    from devgraph.graph.engine import repository_constraint_statements
+    from devgraph.graph.schema import constraint_statements
+
+    engine = _StubEngine()
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", lambda *a, **k: engine), \
+         patch.object(cli_main, "full_scan", lambda *a, **k: 3), \
+         patch.object(cli_main, "sync_git_history",
+                      lambda *a, **k: {"commits_indexed": 0, "commits_deleted": 0}):
+        result = runner.invoke(app, ["rescan", repo_id])
+
+    assert result.exit_code == 0, f"stdout: {result.stdout}"
+    assert engine.calls == ["init_schema", "upsert_repository", "close"]
+    statements = repository_constraint_statements(engine.effective_schemas[0])
+    builtins = constraint_statements()
+    assert statements[: len(builtins)] == builtins
+    assert statements[len(builtins):] == [WIDGET_CONSTRAINT]
+
+
+def test_cli_rescan_without_a_schema_file_provisions_only_the_builtins(
+    runner, temp_registry_db, tmp_path
+):
+    """An already-registered repository with no configuration is unchanged."""
+    db_path, registry = temp_registry_db
+    repo = _repo_with_schema(tmp_path, "plain")
+    repo_id = registry.add_repo(repo).repo_id
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+    from devgraph.graph.engine import repository_constraint_statements
+    from devgraph.graph.schema import constraint_statements
+
+    engine = _StubEngine()
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", lambda *a, **k: engine), \
+         patch.object(cli_main, "full_scan", lambda *a, **k: 0), \
+         patch.object(cli_main, "sync_git_history",
+                      lambda *a, **k: {"commits_indexed": 0, "commits_deleted": 0}):
+        result = runner.invoke(app, ["rescan", repo_id])
+
+    assert result.exit_code == 0, f"stdout: {result.stdout}"
+    # Resolution still happens (it is how "no file" is established), and it
+    # resolves to exactly the built-in statements -- statement for statement.
+    assert engine.calls == ["init_schema", "upsert_repository", "close"]
+    assert repository_constraint_statements(engine.effective_schemas[0]) == constraint_statements()
+
+
+def test_cli_rescan_with_an_invalid_schema_fails_before_any_graph_write(
+    runner, temp_registry_db, tmp_path
+):
+    db_path, registry = temp_registry_db
+    repo = _repo_with_schema(tmp_path, "broken", INVALID_SCHEMA)
+    repo_id = registry.add_repo(repo).repo_id
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    engine = _StubEngine()
+    scans = []
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", lambda *a, **k: engine), \
+         patch.object(cli_main, "full_scan", lambda *a, **k: scans.append(a)):
+        result = runner.invoke(app, ["rescan", repo_id])
+
+    assert result.exit_code == 1, f"stdout: {result.stdout}"
+    assert "invalid project schema" in _collapsed(result.stdout)
+    # Nothing was provisioned, nothing was upserted, nothing was scanned --
+    # the engine was only ever closed.
+    assert engine.calls == ["close"]
+    assert scans == []
+
+    verify = RepoRegistry(db_path)
+    try:
+        assert verify.get(repo_id).last_indexed is None
+    finally:
+        verify.close()
+
+
+def test_cli_add_with_an_invalid_schema_keeps_the_repo_registered(
+    runner, temp_registry_db, tmp_path
+):
+    """Same registered-with-warning contract `add` already has for a down Neo4j."""
+    db_path, registry = temp_registry_db
+    registry.close()
+    repo = _repo_with_schema(tmp_path, "broken", INVALID_SCHEMA)
+
+    from devgraph.cli import main as cli_main
+
+    engine = _StubEngine()
+    scans = []
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", lambda *a, **k: engine), \
+         patch.object(cli_main, "full_scan", lambda *a, **k: scans.append(a)):
+        result = runner.invoke(app, ["add", str(repo)])
+
+    assert result.exit_code == 0, f"stdout: {result.stdout}"
+    collapsed = _collapsed(result.stdout)
+    assert "Registered but initial scan failed" in collapsed
+    assert "invalid project schema" in collapsed
+    assert engine.calls == ["close"]
+    assert scans == []
+
+    verify = RepoRegistry(db_path)
+    try:
+        record = verify.get("broken")
+        assert record is not None
+        assert record.last_indexed is None
+    finally:
+        verify.close()
+
+
+def test_project_schema_findings_report_absent_valid_and_invalid(temp_registry_db, tmp_path):
+    from devgraph.cli.main import _project_schema_findings
+
+    db_path, registry = temp_registry_db
+    registry.add_repo(_repo_with_schema(tmp_path, "plain"))
+    registry.add_repo(_repo_with_schema(tmp_path, "widgets", WIDGET_SCHEMA))
+    registry.add_repo(_repo_with_schema(tmp_path, "broken", INVALID_SCHEMA))
+
+    findings = _project_schema_findings(registry.list_repos())
+
+    by_repo = {f["repo_id"]: f for f in findings}
+    assert by_repo["plain"]["status"] == "absent"
+    assert by_repo["plain"]["failed"] is False
+    assert by_repo["widgets"]["status"] == "valid"
+    assert by_repo["widgets"]["failed"] is False
+    assert "Widget" in by_repo["widgets"]["detail"]
+    assert by_repo["broken"]["status"] == "invalid"
+    assert by_repo["broken"]["failed"] is True
+    assert "invalid project schema" in by_repo["broken"]["detail"]
+    # Deterministic order, and no conflict between unrelated declarations.
+    assert [f["repo_id"] for f in findings] == ["broken", "plain", "widgets"]
+
+
+def test_project_schema_findings_are_empty_without_repositories():
+    """An unreadable registry degrades to this too, rather than crashing."""
+    from devgraph.cli.main import _project_schema_findings
+
+    assert _project_schema_findings([]) == []
+
+
+def test_project_schema_findings_flag_incompatible_same_label_keys(temp_registry_db, tmp_path):
+    """Two repositories, one shared database, one constraint name."""
+    from devgraph.cli.main import _project_schema_findings
+
+    db_path, registry = temp_registry_db
+    registry.add_repo(_repo_with_schema(tmp_path, "first", WIDGET_SCHEMA))
+    registry.add_repo(
+        _repo_with_schema(
+            tmp_path,
+            "second",
+            "version: 1\n"
+            "node_types:\n"
+            "  - label: Widget\n"
+            "    key: [code]\n"
+            "    metadata:\n"
+            "      - name: code\n",
+        )
+    )
+
+    conflicts = [f for f in _project_schema_findings(registry.list_repos()) if f["status"] == "conflict"]
+
+    assert len(conflicts) == 1
+    assert conflicts[0]["failed"] is True
+    assert conflicts[0]["label"] == "widget"
+    assert "first declares Widget keyed on (slug)" in conflicts[0]["detail"]
+    assert "second declares Widget keyed on (code)" in conflicts[0]["detail"]
+
+
+def test_project_schema_findings_allow_an_identical_shared_declaration(temp_registry_db, tmp_path):
+    """The same label with the same key provisions one identical constraint."""
+    from devgraph.cli.main import _project_schema_findings
+
+    db_path, registry = temp_registry_db
+    registry.add_repo(_repo_with_schema(tmp_path, "first", WIDGET_SCHEMA))
+    registry.add_repo(_repo_with_schema(tmp_path, "second", WIDGET_SCHEMA))
+
+    findings = _project_schema_findings(registry.list_repos())
+
+    assert [f["status"] for f in findings] == ["valid", "valid"]
+    assert not any(f["failed"] for f in findings)
+
+
+def test_project_schema_findings_flag_a_case_only_label_difference(temp_registry_db, tmp_path):
+    """Constraint names are lower-cased, so `widget` would silently no-op."""
+    from devgraph.cli.main import _project_schema_findings
+
+    db_path, registry = temp_registry_db
+    registry.add_repo(_repo_with_schema(tmp_path, "first", WIDGET_SCHEMA))
+    registry.add_repo(
+        _repo_with_schema(
+            tmp_path,
+            "second",
+            "version: 1\n"
+            "node_types:\n"
+            "  - label: widget\n"
+            "    key: [slug]\n"
+            "    metadata:\n"
+            "      - name: slug\n",
+        )
+    )
+
+    conflicts = [f for f in _project_schema_findings(registry.list_repos()) if f["status"] == "conflict"]
+
+    assert len(conflicts) == 1
+    assert conflicts[0]["failed"] is True
+
+
+def test_cli_doctor_reports_an_invalid_project_schema(runner, temp_registry_db, tmp_path):
+    db_path, registry = temp_registry_db
+    registry.add_repo(_repo_with_schema(tmp_path, "plain"))
+    registry.add_repo(_repo_with_schema(tmp_path, "broken", INVALID_SCHEMA))
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["doctor"])
+
+    collapsed = _collapsed(result.stdout)
+    assert "Project schemas" in collapsed
+    assert "built-in schema" in collapsed  # the repository with no file
+    assert "invalid project schema" in collapsed
+    # An invalid configuration is a failing check, whatever else this
+    # environment reports (Podman, Neo4j and the tray are all independent).
+    assert "doctor found one or more failing checks above." in collapsed

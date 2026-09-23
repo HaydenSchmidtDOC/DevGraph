@@ -31,7 +31,7 @@ from devgraph.dashboard.events import EventBroadcaster
 from devgraph.dashboard.git_info import get_git_log, get_git_status
 from devgraph.dashboard.layout_store import load_layout, save_layout
 from devgraph.dashboard.query_log import QueryLog
-from devgraph.graph.engine import GraphEngine, identity_key
+from devgraph.graph.engine import GraphEngine, identity_key, provision_repository_schema
 from devgraph.graph.schema import NODE_LABELS
 from devgraph.indexer.dispatch import full_scan
 from devgraph.mcp import tools as devgraph_tools
@@ -209,7 +209,7 @@ def build_router(
         files_indexed: int | None = None
         warning: str | None = None
         try:
-            engine.init_schema()
+            provision_repository_schema(engine, record.path)
             engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
             files_indexed = full_scan(
                 engine,
