@@ -13,8 +13,17 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from devgraph.config.settings import Settings, get_settings
+from devgraph.dashboard.app import build_app
+from devgraph.dashboard.db_metrics import (
+    JMX_GC_QUERY,
+    JMX_MEMORY_QUERY,
+    JMX_OS_QUERY,
+    PAGECACHE_CONFIG_QUERY,
+    heap_from_jmx_rows,
+)
 from devgraph.dashboard.events import EventBroadcaster
-from devgraph.dashboard.routes import _JMX_MEMORY_QUERY, _heap_from_jmx_rows, build_router
+from devgraph.dashboard.routes import build_router
 
 # The literal shape Neo4j 5.26 Community returns for
 # CALL dbms.queryJmx("java.lang:type=Memory") YIELD attributes RETURN attributes
@@ -88,11 +97,16 @@ def test_flat_value_shape_is_not_accepted_as_a_reading():
     assert get_heap(StubEngine(rows=rows))["available"] is False
 
 
-def test_query_is_fixed_and_takes_no_parameters():
+def test_queries_are_fixed_and_take_no_parameters():
     engine = StubEngine(rows=NESTED_5_26_ROWS)
     get_heap(engine)
-    assert engine.calls == [(_JMX_MEMORY_QUERY, None)]
-    assert _JMX_MEMORY_QUERY == (
+    assert engine.calls == [
+        (JMX_MEMORY_QUERY, None),
+        (JMX_OS_QUERY, None),
+        (JMX_GC_QUERY, None),
+        (PAGECACHE_CONFIG_QUERY, None),
+    ]
+    assert JMX_MEMORY_QUERY == (
         'CALL dbms.queryJmx("java.lang:type=Memory") YIELD attributes RETURN attributes'
     )
 
@@ -115,9 +129,9 @@ def test_driver_failure_is_unavailable_and_leaks_no_error_text():
     engine = StubEngine(error=RuntimeError("Neo4jError: Unsupported administration command SECRET"))
     response = make_client(engine).get("/api/database-stats")
     assert response.status_code == 200
-    assert response.json() == {
-        "heap": {"available": False, "used_bytes": None, "max_bytes": None, "used_percent": None}
-    }
+    body = response.json()
+    assert body["heap"] == {"available": False, "used_bytes": None, "max_bytes": None, "used_percent": None}
+    assert not any(body[k]["available"] for k in ("system", "gc", "pagecache"))
     assert "Neo4jError" not in response.text and "SECRET" not in response.text
 
 
@@ -187,5 +201,70 @@ def test_unusable_jmx_values_report_unavailable(rows):
 
 
 def test_parser_is_usable_without_the_http_layer():
-    assert _heap_from_jmx_rows(NESTED_5_26_ROWS)["used_bytes"] == 536870912
-    assert _heap_from_jmx_rows([])["available"] is False
+    assert heap_from_jmx_rows(NESTED_5_26_ROWS)["used_bytes"] == 536870912
+    assert heap_from_jmx_rows([])["available"] is False
+
+
+def test_snapshot_has_every_group_and_store_is_unconfigured_by_default():
+    body = make_client(StubEngine(rows=NESTED_5_26_ROWS)).get("/api/database-stats").json()
+    assert set(body) == {"ts", "heap", "system", "gc", "pagecache", "store"}
+    assert body["store"]["reason"] == "not_configured"
+    assert body["pagecache"]["hit_ratio_available"] is False
+
+
+class RecordingHistory:
+    interval_s = 15.0
+
+    def __init__(self):
+        self.asked = []
+
+    def since(self, seconds, now=None):
+        self.asked.append(seconds)
+        return [{"ts": 1.0, "heap_used_bytes": 5, "ram_used_bytes": 6, "process_cpu_load": 0.1, "store_total_bytes": 7}]
+
+    def latest(self):
+        raise AssertionError("not used here")
+
+
+def history_client(history):
+    app = FastAPI()
+    app.include_router(build_router(StubEngine(rows=[]), registry=object(), events=EventBroadcaster(), metrics=history))
+    return TestClient(app)
+
+
+@pytest.mark.parametrize(("asked", "used"), [(None, 3600), (5, 60), (600, 600), (99999, 3600)])
+def test_history_window_is_clamped(asked, used):
+    history = RecordingHistory()
+    url = "/api/database-stats/history" + ("" if asked is None else f"?seconds={asked}")
+    response = history_client(history).get(url)
+    assert response.status_code == 200
+    assert response.json()["interval_s"] == 15.0
+    assert len(response.json()["samples"]) == 1
+    assert history.asked == [used]
+
+
+def test_history_endpoint_is_read_only():
+    assert history_client(RecordingHistory()).post("/api/database-stats/history").status_code == 405
+
+
+def test_blank_data_dir_setting_means_unset():
+    assert Settings(_env_file=None, neo4j_data_dir="").neo4j_data_dir is None
+    assert Settings(_env_file=None, neo4j_data_dir="  ").neo4j_data_dir is None
+    assert str(Settings(_env_file=None, neo4j_data_dir="/srv/neo4j").neo4j_data_dir) == "/srv/neo4j"
+
+
+def test_app_lifespan_runs_the_sampler_with_the_configured_data_dir(tmp_path, monkeypatch):
+    (tmp_path / "databases").mkdir()
+    (tmp_path / "transactions").mkdir()
+    (tmp_path / "databases" / "store").write_bytes(b"x" * 10)
+    monkeypatch.setenv("DEVGRAPH_NEO4J_DATA_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    try:
+        app = build_app(StubEngine(rows=NESTED_5_26_ROWS), registry=object(), events=EventBroadcaster())
+        with TestClient(app) as client:
+            assert app.state.metrics.running
+            body = client.get("/api/database-stats").json()
+            assert body["store"]["total_bytes"] == 10
+        assert not app.state.metrics.running
+    finally:
+        get_settings.cache_clear()

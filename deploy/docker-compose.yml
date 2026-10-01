@@ -44,10 +44,13 @@ services:
       DEVGRAPH_NEO4J_URI: "bolt://devgraph-neo4j:7687"
       DEVGRAPH_NEO4J_USER: "neo4j"
       DEVGRAPH_NEO4J_PASSWORD: "devgraph-local-dev"
+      # Read-only view of Neo4j's data volume, for the dashboard's store-size reading.
+      DEVGRAPH_NEO4J_DATA_DIR: "/neo4j-data"
     ports:
       - "127.0.0.1:8765:8765" # dashboard
     volumes:
       - devgraph_registry:/root/.devgraph
+      - devgraph_neo4j_data:/neo4j-data:ro
       # Mount each repo you want to register, e.g.:
       # - C:\path\to\your\repo:/repos/your-repo
 
