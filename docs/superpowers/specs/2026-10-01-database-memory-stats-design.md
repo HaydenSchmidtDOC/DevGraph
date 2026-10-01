@@ -84,9 +84,12 @@ headless agent get sampling with no changes of their own.
 
 ### Deploy
 
-Both `deploy/docker-compose.yml` and `deploy/podman-compose.yml` mount the Neo4j
-data volume read-only into the agent at `/neo4j-data` and set
-`DEVGRAPH_NEO4J_DATA_DIR=/neo4j-data`. No image changes.
+`deploy/docker-compose.yml` mounts the Neo4j data volume read-only into the
+agent at `/neo4j-data` and sets `DEVGRAPH_NEO4J_DATA_DIR=/neo4j-data`. No image
+changes. `deploy/podman-compose.yml` runs only Neo4j (the agent is the host tray
+app), so it gets a comment pointing `DEVGRAPH_NEO4J_DATA_DIR` at the volume's
+host path (`podman volume inspect devgraph_neo4j_data --format '{{.Mountpoint}}'`);
+the README documents the same.
 
 ## Dashboard (`static/index.html`)
 
@@ -110,6 +113,13 @@ chart — no new library.
 
 - Neo4j unreachable: every Neo4j-backed group is unavailable; store size can
   still be live (it reads the filesystem).
+- If the first (heap) query raises, the remaining Neo4j queries in that
+  snapshot are skipped, so an unreachable database costs one driver timeout per
+  snapshot, not four.
+- A file that disappears during the store walk (Neo4j rotates transaction logs)
+  is skipped; any other walk error makes store size unavailable rather than
+  reporting an undercount.
+- A blank `DEVGRAPH_NEO4J_DATA_DIR` is treated as unset.
 - Sampler exceptions are logged at debug and the sample is skipped; the thread
   never dies on a bad read.
 
