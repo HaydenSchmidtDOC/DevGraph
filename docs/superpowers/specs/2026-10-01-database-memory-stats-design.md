@@ -88,8 +88,11 @@ headless agent get sampling with no changes of their own.
 agent at `/neo4j-data` and sets `DEVGRAPH_NEO4J_DATA_DIR=/neo4j-data`. No image
 changes. `deploy/podman-compose.yml` runs only Neo4j (the agent is the host tray
 app), so it gets a comment pointing `DEVGRAPH_NEO4J_DATA_DIR` at the volume's
-host path (`podman volume inspect devgraph_neo4j_data --format '{{.Mountpoint}}'`);
-the README documents the same.
+host path (`podman volume inspect devgraph_neo4j_data --format '{{.Mountpoint}}'`),
+which applies only when Podman runs natively on Linux. Under `podman machine`
+(Windows/macOS) the volume is inside the VM and not on the host filesystem, so
+store size stays unavailable (the card says so) and the other readings are
+unaffected. The README documents the same.
 
 ## Dashboard (`static/index.html`)
 

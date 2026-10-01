@@ -10,8 +10,12 @@
 # a parallel primary path.
 #
 # The DevGraph agent runs on the host (tray app), not in this file. To show
-# store size on the dashboard, point it at this volume's host path:
+# store size on the dashboard with Podman running natively on Linux, point it
+# at this volume's host path:
 #   DEVGRAPH_NEO4J_DATA_DIR=$(podman volume inspect devgraph_neo4j_data --format '{{.Mountpoint}}')
+# Under `podman machine` (Windows/macOS) the volume is inside the VM and not on
+# the host filesystem, so store size stays unavailable; other readings are
+# unaffected.
 version: "3.8"
 
 services:

@@ -55,6 +55,7 @@ _SSE_KEEPALIVE_S = 15
 _HISTORY_SECONDS_MIN = 60
 _HISTORY_SECONDS_MAX = 3600
 
+
 def _reject_cross_site(request: Request) -> None:
     """Refuse a state-changing request that another site's page initiated.
 

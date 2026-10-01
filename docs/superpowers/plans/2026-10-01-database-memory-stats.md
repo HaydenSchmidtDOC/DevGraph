@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-01-database-memory-stats-design.md`
 
-**Working directory for every command:** `/home/monkeygerbil222/Projects/DevGraph-db-stats` (branch `feat/db-memory-stats`, cut from `upstream/master`). Run tests with `uv run pytest ...`.
+**Working directory for every command:** the repository root (branch `feat/db-memory-stats`, cut from `upstream/master`). Run tests with `uv run pytest ...`.
 
 ## Global Constraints
 
@@ -70,7 +70,7 @@
 
 - [ ] **Step 1: Confirm the driver-side row shapes against the live container**
 
-Neo4j must be running locally (the dev container is `devgraph-neo4j-trial`; check with `podman ps`). Run:
+Neo4j must be running locally (the dev container is `devgraph-neo4j`; check with `podman ps`). Run:
 
 ```bash
 uv run python -c "
@@ -1891,7 +1891,7 @@ app = build_app(GraphEngine(s.neo4j_uri, s.neo4j_user, s.neo4j_password),
 uvicorn.run(app, host="127.0.0.1", port=8799, log_level="warning")
 EOF
 DEVGRAPH_REGISTRY_DB_PATH=<scratch>/registry.sqlite3 \
-DEVGRAPH_NEO4J_DATA_DIR=$(podman volume inspect devgraph_trial_data --format '{{.Mountpoint}}') \
+DEVGRAPH_NEO4J_DATA_DIR=$(podman volume inspect devgraph_neo4j_data --format '{{.Mountpoint}}') \
   uv run python <scratch>/serve_dashboard.py
 ```
 
@@ -1924,7 +1924,7 @@ Expected: all pass (live-Neo4j tests need the container up; display-bound tests 
 
 ```bash
 git push -u origin feat/db-memory-stats
-gh pr create -R HaydenSchmidtDOC/DevGraph --base master --head monkeygerbil222:feat/db-memory-stats \
+gh pr create -R HaydenSchmidtDOC/DevGraph --base master --head <fork-owner>:feat/db-memory-stats \
   --title "Live database and memory stats with sampled history" --body-file /tmp/pr-body.md
 ```
 
