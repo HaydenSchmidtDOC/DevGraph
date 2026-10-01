@@ -330,6 +330,8 @@ table.logtable tbody tr:hover { background: color-mix(in oklab, var(--accent), t
 .metric-block { padding: 9px 0; border-top: 1px solid var(--border-soft); }
 .metric-block:first-child { border-top: none; padding-top: 0; }
 .metric-block .metric-label { justify-content: space-between; margin-bottom: 2px; }
+.spark { display: block; width: 100%; height: 28px; margin-top: 6px; }
+.metric-sub { font-family: var(--font-mono); font-size: 11px; color: var(--meta); margin-top: 2px; }
 .leaderboard-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-top: 1px solid var(--border-soft); font-size: 12px; }
 .leaderboard-row:first-child { border-top: none; }
 .leaderboard-row .lb-rank { font-family: var(--font-mono); font-size: 10.5px; color: var(--meta); width: 14px; flex-shrink: 0; }
@@ -572,18 +574,29 @@ table.dstable input[type="text"] { width: 100%; }
       </div>
 
       <div class="card" data-od-id="db-memory-card">
-        <div class="card-head"><h3>Database &amp; memory</h3><span class="sample-pill" id="memPill" title="JVM heap is read from the server's java.lang:type=Memory JMX bean on connect; stays dashed if this build doesn't expose it">Checking…</span></div>
+        <div class="card-head"><h3>Database &amp; memory</h3><span class="sample-pill" id="memPill" title="Sampled every 15 s from Neo4j's JMX beans and config, and from its data directory; anything without a usable reading stays dashed">Checking…</span></div>
         <div class="metric-block">
           <div class="metric-label"><span>JVM heap</span><span class="metric-val dim" id="heapVal">—</span></div>
           <div class="meter"><i id="heapMeter" style="width:0%"></i></div>
+          <canvas class="spark" id="heapSpark" height="56"></canvas>
         </div>
         <div class="metric-block">
-          <div class="metric-label"><span>Page cache hit ratio<span class="qmark" data-tip="Share of graph lookups served from RAM vs. disk reads. Healthy is generally >95%.">?</span></span><span class="metric-val dim" id="pageCacheVal">—</span></div>
-          <div class="meter"><i id="pageCacheMeter" style="width:0%"></i></div>
+          <div class="metric-label"><span>System RAM<span class="qmark" data-tip="Physical memory as the Neo4j JVM sees it: the host's RAM, or the container's memory limit if one is set.">?</span></span><span class="metric-val dim" id="ramVal">—</span></div>
+          <div class="meter"><i id="ramMeter" style="width:0%"></i></div>
+          <canvas class="spark" id="ramSpark" height="56"></canvas>
         </div>
-        <div class="metric-row"><span class="metric-label">Store size on disk</span><span class="metric-val dim" id="storeSizeVal">—</span></div>
-        <div class="placeholder-note" id="memNote">JVM heap is read live from the server on connect. Page cache hit ratio and store size still need APOC (<code>apoc.monitor.pc</code> / <code>apoc.monitor.store</code>), not confirmed installed on this build — those stay dashed, never fabricated.</div>
+        <div class="metric-row"><span class="metric-label">Swap used</span><span class="metric-val dim" id="swapVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">CPU (Neo4j / system)</span><span class="metric-val dim" id="cpuVal">— / —</span></div>
+        <div class="metric-row"><span class="metric-label">GC collections / time<span class="qmark" data-tip="Totals since Neo4j started, summed across the JVM's garbage collectors.">?</span></span><span class="metric-val dim" id="gcVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">Page cache (configured)<span class="qmark" data-tip="server.memory.pagecache.size as Neo4j reports it. Hit ratio needs Neo4j Enterprise metrics and has no source on Community.">?</span></span><span class="metric-val dim" id="pageCacheVal">—</span></div>
+        <div class="metric-block">
+          <div class="metric-label"><span>Store size on disk</span><span class="metric-val dim" id="storeSizeVal">—</span></div>
+          <div class="metric-sub" id="storeSplitVal"></div>
+          <canvas class="spark" id="storeSpark" height="56"></canvas>
+        </div>
+        <div class="placeholder-note" id="memNote">Reading database and memory stats…</div>
       </div>
+```
 
       <div class="card" data-od-id="query-telemetry-card">
         <div class="card-head"><h3>Query telemetry</h3><span class="sample-pill" id="mcpPill">Checking…</span></div>
@@ -2614,16 +2627,18 @@ async function bootConnect() {
     await refreshGraph("full", false, true);
     loadGitHistory(document.getElementById("repoSelect").value);
     attemptMemoryMetrics();
+    startMemoryPolling();
     attemptQueryTelemetry();
     attemptCommunityDetection();
   } catch (e) {
     neo4jStatus.textContent = "Neo4j unreachable";
     neo4jStatus.style.color = "var(--danger)";
     legendStatus.textContent = "Neo4j unreachable — showing demo graph";
-    /* The heap reading is never attempted on this branch, so say so: left
-       alone the card would sit on its initial "Checking…" pill forever,
-       which reads as "still loading" rather than "no reading exists". */
-    setHeapUnavailable("Neo4j is unreachable");
+    /* Neo4j didn't answer, so the card shows its Neo4j rows as unreachable
+       instead of sitting on "Checking…"; store size is read from disk and
+       can still be live. Polling picks Neo4j back up if it returns. */
+    attemptMemoryMetrics({ neo4jDown: true });
+    startMemoryPolling();
     cy.add(buildElements());
     forceDirectedSettle(() => focusRotation(null, 60));
   }
@@ -3211,51 +3226,163 @@ document.querySelectorAll('#gitViewToggle button').forEach(btn => btn.addEventLi
 /* ── Database & memory / Query telemetry / Community — attempted live,
    graceful labeled fallback per the no-fabrication rule if the underlying
    procedure isn't available on this Neo4j build. ── */
-function setMemNote(reason) {
-  document.getElementById("memNote").textContent = reason;
+const MEM_POLL_MS = 15000;
+let memPollTimer = null;
+/* Card-side wording for the server's store `reason` codes. */
+const STORE_REASONS = {
+  not_configured: "it needs DEVGRAPH_NEO4J_DATA_DIR pointing at Neo4j's data directory",
+  unreadable: "the Neo4j data directory could not be read",
+};
+function formatMemBytes(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "GB";
+  if (n >= 1e6) return (n / 1e6).toFixed(0) + "MB";
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + "KB";
+  return n + "B";
 }
-/* The card must never show a number it can't stand behind, so every way the
-   reading can be missing -- server says unavailable, HTTP error, network
-   failure, unparseable body, values that can't form a meter, or a boot that
-   never got as far as asking -- lands here, dashed and labelled, rather than
-   on a partly-filled bar or a stuck "Checking…". `reason` names which one,
-   in the card's own words; it is never backend error text. */
-function setHeapUnavailable(reason) {
-  const why = reason || "the server returned no usable java.lang:type=Memory reading";
-  const val = document.getElementById("heapVal");
-  val.textContent = "—";
-  val.classList.add("dim");
-  document.getElementById("heapMeter").style.width = "0%";
+function setMemNote(text) {
+  document.getElementById("memNote").textContent = text;
+}
+/* One value cell: real text undims it, null puts the dash back. */
+function memVal(id, text, dash = "—") {
+  const el = document.getElementById(id);
+  if (text === null) { el.textContent = dash; el.classList.add("dim"); }
+  else { el.textContent = text; el.classList.remove("dim"); }
+}
+/* Each render* takes one group of the server's snapshot and returns whether
+   it went live. Number.isFinite, not Number(): a string or null from an
+   unexpected server build must read as no value, not coerce into one. */
+function renderHeap(heap) {
+  const used = heap?.used_bytes, heapMax = heap?.max_bytes, percent = heap?.used_percent;
+  const ok = heap?.available === true && Number.isFinite(used) && Number.isFinite(heapMax) &&
+    Number.isFinite(percent) && used > 0 && heapMax > 0 && used <= heapMax;
+  memVal("heapVal", ok ? `${(used/1e6).toFixed(0)}MB / ${(heapMax/1e6).toFixed(0)}MB` : null);
+  document.getElementById("heapMeter").style.width = ok ? Math.min(100, Math.max(0, percent)) + "%" : "0%";
+  return ok;
+}
+function renderSystem(sys) {
+  const total = sys?.ram_total_bytes, free = sys?.ram_free_bytes;
+  const ok = sys?.available === true && Number.isFinite(total) && Number.isFinite(free) &&
+    total > 0 && free >= 0 && free <= total;
+  memVal("ramVal", ok ? `${formatMemBytes(total - free)} / ${formatMemBytes(total)}` : null);
+  document.getElementById("ramMeter").style.width = ok ? Math.round((total - free) / total * 1000) / 10 + "%" : "0%";
+  const st = sys?.swap_total_bytes, sf = sys?.swap_free_bytes;
+  const swapOk = ok && Number.isFinite(st) && Number.isFinite(sf) && st >= 0 && sf >= 0 && sf <= st;
+  memVal("swapVal", !swapOk ? null : st === 0 ? "no swap" : `${formatMemBytes(st - sf)} / ${formatMemBytes(st)}`);
+  const pct = v => (Number.isFinite(v) && v >= 0 && v <= 1) ? (v * 100).toFixed(0) + "%" : null;
+  const p = pct(sys?.process_cpu_load), s = pct(sys?.system_cpu_load);
+  memVal("cpuVal", ok && (p || s) ? `${p ?? "—"} / ${s ?? "—"}` : null, "— / —");
+  return ok;
+}
+function renderGc(gc) {
+  const n = gc?.collection_count, ms = gc?.collection_time_ms;
+  const ok = gc?.available === true && Number.isFinite(n) && Number.isFinite(ms) && n >= 0 && ms >= 0;
+  memVal("gcVal", ok ? `${n} / ${(ms / 1000).toFixed(1)}s` : null);
+  return ok;
+}
+function renderPagecache(pc) {
+  const v = pc?.configured;
+  const ok = pc?.available === true && typeof v === "string" && v.trim() !== "";
+  memVal("pageCacheVal", ok ? v : null);
+  return ok;
+}
+function renderStore(store) {
+  const g = store?.graph_bytes, t = store?.tx_log_bytes, total = store?.total_bytes;
+  const ok = store?.available === true && Number.isFinite(g) && Number.isFinite(t) &&
+    Number.isFinite(total) && g >= 0 && t >= 0 && total === g + t;
+  memVal("storeSizeVal", ok ? formatMemBytes(total) : null);
+  document.getElementById("storeSplitVal").textContent =
+    ok ? `graph ${formatMemBytes(g)} · transaction logs ${formatMemBytes(t)}` : "";
+  return ok;
+}
+/* The whole request failed: nothing on the card can be stood behind. `why`
+   is the card's own wording, never backend error text. */
+function setMemUnavailable(why) {
+  for (const render of [renderHeap, renderSystem, renderGc, renderPagecache, renderStore]) render(null);
   const pill = document.getElementById("memPill");
   pill.textContent = "Unavailable";
   pill.className = "sample-pill";
-  pill.title = "JVM heap unavailable — " + why;
-  setMemNote(`JVM heap unavailable — ${why}, so heap stays dashed rather than estimated. Page cache hit ratio and store size need APOC and are not wired.`);
+  pill.title = "Database and memory stats unavailable — " + why;
+  setMemNote(`Database and memory stats unavailable — ${why}, so every value stays dashed rather than estimated.`);
 }
-async function attemptMemoryMetrics() {
+/* opts.neo4jDown: boot already knows Neo4j didn't answer, so the Neo4j
+   groups are shown as unreachable whatever the server sent; store size is
+   read from disk and can still be live. Later polls trust the server. */
+async function attemptMemoryMetrics(opts = {}) {
+  const down = opts.neo4jDown === true;
+  let stats;
   try {
-    /* /api/database-stats, not the Cypher console endpoint: the JMX result
-       shape is the server's problem, and the browser gets plain numbers. */
     const res = await fetch("/api/database-stats");
     if (!res.ok) throw new Error("HTTP " + res.status);
-    const heap = (await res.json())?.heap;
-    if (!heap?.available) throw new Error("heap unavailable");
-    /* Number.isFinite, not Number(): a string or null from an unexpected
-       server build must read as no value, not coerce into one. */
-    const used = heap.used_bytes, heapMax = heap.max_bytes, percent = heap.used_percent;
-    if (!Number.isFinite(used) || !Number.isFinite(heapMax) || !Number.isFinite(percent)) throw new Error("non-numeric heap values");
-    if (used <= 0 || heapMax <= 0 || used > heapMax) throw new Error("inconsistent heap values");
-    const pct = Math.min(100, Math.max(0, percent));
-    document.getElementById("heapVal").textContent = `${(used/1e6).toFixed(0)}MB / ${(heapMax/1e6).toFixed(0)}MB`;
-    document.getElementById("heapVal").classList.remove("dim");
-    document.getElementById("heapMeter").style.width = pct + "%";
-    const pill = document.getElementById("memPill");
-    pill.textContent = "Live"; pill.className = "wired-pill";
-    pill.title = "JVM heap read live from the server's java.lang:type=Memory JMX bean";
-    setMemNote("JVM heap is live. Page cache hit ratio and store size still need APOC (apoc.monitor.pc / apoc.monitor.store) — not confirmed installed on this build.");
+    stats = await res.json();
+    if (!stats || typeof stats !== "object") throw new Error("empty body");
   } catch (e) {
-    setHeapUnavailable();
+    setMemUnavailable(down ? "Neo4j is unreachable" : "the dashboard server returned no usable reading");
+    return;
   }
+  const live = {
+    "JVM heap": renderHeap(down ? null : stats.heap),
+    "system RAM, swap and CPU": renderSystem(down ? null : stats.system),
+    "GC": renderGc(down ? null : stats.gc),
+    "page cache size": renderPagecache(down ? null : stats.pagecache),
+  };
+  const storeLive = renderStore(stats.store);
+  const missing = Object.keys(live).filter(k => !live[k]);
+  const notes = [];
+  if (missing.length) {
+    notes.push(`${missing.join(", ")} unavailable — ${down ? "Neo4j is unreachable" : "this Neo4j returned no usable reading"}, so they stay dashed rather than estimated.`);
+  }
+  if (!storeLive) notes.push(`Store size unavailable — ${STORE_REASONS[stats.store?.reason] || "no usable reading"}.`);
+  if (!notes.length) notes.push("All readings are live, sampled every 15 s.");
+  notes.push("Page cache hit ratio needs Neo4j Enterprise metrics and has no source on Community.");
+  setMemNote(notes.join(" "));
+  const anyLive = storeLive || missing.length < Object.keys(live).length;
+  const pill = document.getElementById("memPill");
+  pill.textContent = anyLive ? "Live" : "Unavailable";
+  pill.className = anyLive ? "wired-pill" : "sample-pill";
+  pill.title = anyLive
+    ? "Read live from Neo4j's JMX beans and config, and from its data directory"
+    : "No database or memory reading is available";
+}
+/* Draws one sparkline. Non-finite samples are gaps: the path is broken
+   there rather than bridged, so a stretch with Neo4j down never reads as a
+   smooth trend. Fewer than two points draws nothing. */
+function renderSpark(id, values) {
+  const canvas = document.getElementById(id);
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width = (canvas.clientWidth || 200) * 2, h = canvas.height = 56;
+  ctx.clearRect(0, 0, w, h);
+  const pts = values.map((v, i) => [i, v]).filter(([, v]) => Number.isFinite(v));
+  if (pts.length < 2) return;
+  const vs = pts.map(p => p[1]);
+  const min = Math.min(...vs), range = (Math.max(...vs) - min) || 1;
+  const span = Math.max(values.length - 1, 1), pad = 3;
+  ctx.beginPath();
+  let prev = -2;
+  for (const [i, v] of pts) {
+    const x = pad + (i / span) * (w - pad * 2), y = h - pad - ((v - min) / range) * (h - pad * 2);
+    if (i === prev + 1) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+    prev = i;
+  }
+  ctx.strokeStyle = "#7170ff"; ctx.lineWidth = 2; ctx.lineJoin = "round";
+  ctx.stroke();
+}
+async function attemptMemoryHistory() {
+  let samples = [];
+  try {
+    const res = await fetch("/api/database-stats/history?seconds=3600");
+    if (res.ok) {
+      const body = await res.json();
+      if (Array.isArray(body?.samples)) samples = body.samples;
+    }
+  } catch (e) { /* no history: sparklines stay empty, never invented */ }
+  renderSpark("heapSpark", samples.map(s => s?.heap_used_bytes));
+  renderSpark("ramSpark", samples.map(s => s?.ram_used_bytes));
+  renderSpark("storeSpark", samples.map(s => s?.store_total_bytes));
+}
+function startMemoryPolling() {
+  attemptMemoryHistory();
+  if (memPollTimer !== null) return;
+  memPollTimer = setInterval(() => { attemptMemoryMetrics(); attemptMemoryHistory(); }, MEM_POLL_MS);
 }
 async function attemptQueryTelemetry() {
   try {
