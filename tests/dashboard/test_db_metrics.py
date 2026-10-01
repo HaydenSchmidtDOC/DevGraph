@@ -9,6 +9,8 @@ malformed paths are deterministic.
 
 import os
 import stat
+import threading
+import time
 
 import pytest
 
@@ -18,6 +20,7 @@ from devgraph.dashboard.db_metrics import (
     JMX_MEMORY_QUERY,
     JMX_OS_QUERY,
     PAGECACHE_CONFIG_QUERY,
+    MetricsHistory,
     collect_snapshot,
     gc_from_jmx_rows,
     pagecache_from_config_rows,
@@ -293,3 +296,89 @@ def test_unreachable_neo4j_costs_one_failed_query_and_store_stays_live(tmp_path)
     assert engine.calls == [(JMX_MEMORY_QUERY, None)]
     assert not any(snapshot[k]["available"] for k in ("heap", "system", "gc", "pagecache"))
     assert snapshot["store"]["available"] is True
+
+
+# ── history ───────────────────────────────────────────────────────────────
+
+
+def fake_collect(ts_values):
+    """A collect() that returns full snapshots with the given timestamps in order."""
+    it = iter(ts_values)
+
+    def collect(engine, data_dir):
+        snap = collect_snapshot(QueryStub(responses=ALL_ROWS), None)
+        snap["ts"] = next(it)
+        return snap
+
+    return collect
+
+
+def test_samples_are_compact_and_derive_ram_used():
+    history = MetricsHistory(None, None, collect=fake_collect([1000.0]))
+    history.sample_once()
+    assert history.since(60, now=1000.0) == [
+        {
+            "ts": 1000.0,
+            "heap_used_bytes": 536870912,
+            "ram_used_bytes": 12_000_000_000,
+            "process_cpu_load": 0.05,
+            "store_total_bytes": None,
+        }
+    ]
+
+
+def test_since_returns_only_samples_inside_the_window_oldest_first():
+    history = MetricsHistory(None, None, collect=fake_collect([100.0, 500.0, 900.0]))
+    for _ in range(3):
+        history.sample_once()
+    assert [s["ts"] for s in history.since(500, now=1000.0)] == [500.0, 900.0]
+
+
+def test_ring_buffer_keeps_only_the_newest_samples():
+    history = MetricsHistory(None, None, max_samples=3, collect=fake_collect([1.0, 2.0, 3.0, 4.0, 5.0]))
+    for _ in range(5):
+        history.sample_once()
+    assert [s["ts"] for s in history.since(10, now=5.0)] == [3.0, 4.0, 5.0]
+
+
+def test_unavailable_groups_become_none_in_the_compact_sample():
+    def collect(engine, data_dir):
+        return collect_snapshot(QueryStub(errors={JMX_MEMORY_QUERY: ConnectionError()}), None)
+
+    history = MetricsHistory(None, None, collect=collect)
+    history.sample_once()
+    (sample,) = history.since(60)
+    assert sample["heap_used_bytes"] is None and sample["ram_used_bytes"] is None
+    assert sample["process_cpu_load"] is None and sample["store_total_bytes"] is None
+
+
+def test_latest_samples_fresh_on_every_call_when_the_sampler_is_not_running():
+    history = MetricsHistory(None, None, collect=fake_collect([1.0, 2.0]))
+    assert history.latest()["ts"] == 1.0
+    assert history.latest()["ts"] == 2.0
+
+
+def test_sampler_thread_samples_survives_a_failing_read_and_stops():
+    calls = []
+    sampled = threading.Event()
+
+    def collect(engine, data_dir):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("transient")
+        if len(calls) >= 3:
+            sampled.set()
+        return collect_snapshot(QueryStub(responses=ALL_ROWS), None)
+
+    history = MetricsHistory(None, None, interval_s=0.01, collect=collect)
+    history.start()
+    try:
+        assert history.running
+        assert sampled.wait(2), "sampler never recovered from the failing read"
+        assert history.latest()["heap"]["available"] is True
+    finally:
+        history.stop()
+    assert not history.running
+    settled = len(calls)
+    time.sleep(0.05)
+    assert len(calls) == settled, "sampler kept running after stop()"

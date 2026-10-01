@@ -17,7 +17,9 @@ import logging
 import math
 import os
 import stat
+import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -305,3 +307,97 @@ def _rows_or_none(engine: Any, query: str) -> Any:
     except Exception as exc:  # neo4j driver raises its own exception hierarchy
         logger.debug("database stats query unavailable (%s): %s", query, exc)
         return None
+
+
+# ── history ──────────────────────────────────────────────────────────────
+
+_HISTORY_INTERVAL_S = 15.0
+_HISTORY_MAX_SAMPLES = 240  # one hour at the default interval
+
+
+def _compact(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """The few numbers the sparklines plot, None where a group is unavailable."""
+    system = snapshot["system"]
+    ram_used = system["ram_total_bytes"] - system["ram_free_bytes"] if system["available"] else None
+    return {
+        "ts": snapshot["ts"],
+        "heap_used_bytes": snapshot["heap"]["used_bytes"],
+        "ram_used_bytes": ram_used,
+        "process_cpu_load": system["process_cpu_load"],
+        "store_total_bytes": snapshot["store"]["total_bytes"],
+    }
+
+
+class MetricsHistory:
+    """In-memory ring buffer of snapshots, filled by a daemon sampler thread.
+
+    Process-local and lost on restart by design, like query_log.py. While the
+    sampler isn't running (tests, or before the app's lifespan starts it),
+    `latest()` takes a fresh reading on every call rather than serving a
+    cached one that would never update.
+    """
+
+    def __init__(
+        self,
+        engine: Any,
+        data_dir: Path | None,
+        *,
+        interval_s: float = _HISTORY_INTERVAL_S,
+        max_samples: int = _HISTORY_MAX_SAMPLES,
+        collect=collect_snapshot,
+    ) -> None:
+        self.interval_s = interval_s
+        self._engine = engine
+        self._data_dir = data_dir
+        self._collect = collect
+        self._samples: deque[dict[str, Any]] = deque(maxlen=max_samples)
+        self._latest: dict[str, Any] | None = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None
+
+    def sample_once(self) -> dict[str, Any]:
+        snapshot = self._collect(self._engine, self._data_dir)
+        with self._lock:
+            self._latest = snapshot
+            self._samples.append(_compact(snapshot))
+        return snapshot
+
+    def latest(self) -> dict[str, Any]:
+        with self._lock:
+            latest = self._latest
+        if latest is None or not self.running:
+            return self.sample_once()
+        return latest
+
+    def since(self, seconds: float, now: float | None = None) -> list[dict[str, Any]]:
+        cutoff = (time.time() if now is None else now) - seconds
+        with self._lock:
+            return [s for s in self._samples if s["ts"] >= cutoff]
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="devgraph-db-metrics", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            # A sample blocked on an unreachable database can outlast this;
+            # the thread is a daemon, so shutdown is never held hostage.
+            thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.sample_once()
+            except Exception:
+                logger.debug("database stats sample failed", exc_info=True)
+            self._stop.wait(self.interval_s)
