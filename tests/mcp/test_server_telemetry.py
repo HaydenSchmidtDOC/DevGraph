@@ -35,6 +35,9 @@ class _StubEngine:
 class _StubRegistry:
     """build_server only stows the registry away for tools needing a repo root."""
 
+    def get(self, repo_id):
+        return None
+
 
 @pytest.fixture
 def settings(tmp_path, monkeypatch):

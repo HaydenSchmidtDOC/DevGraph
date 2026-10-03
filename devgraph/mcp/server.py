@@ -299,9 +299,12 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
         """Search for components by name/description; returns {count, results, truncated}.
         Pass modified_within_commits to restrict to components touched within the last
         N commits repo-wide (requires git-history recency staging; entities never staged
-        are excluded, not silently included)."""
+        are excluded, not silently included).
+        Also searches node types the repository's devgraph.schema.yaml declares (for
+        example File/Folder from the filesystem provider)."""
         return devgraph_tools.search_component(
-            engine, repo_id, query, cross_repo, max_results, modified_within_commits
+            engine, repo_id, query, cross_repo, max_results, modified_within_commits,
+            extra_labels=devgraph_tools.declared_node_labels(registry, repo_id),
         )
 
     @server.tool(annotations=_READ_ONLY)

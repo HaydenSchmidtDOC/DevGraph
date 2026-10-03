@@ -15,6 +15,7 @@ import git
 import json
 import subprocess
 
+from devgraph.config.project_schema import LABEL_PATTERN, ProjectSchemaError, resolve_effective_schema
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
 from devgraph.registry.store import RepoRegistry
@@ -141,6 +142,11 @@ def _resolve_recency_cutoff(engine: GraphEngine, repo_id: str, modified_within_c
     return results[0]["d"]
 
 
+# Labels search_component always covers. A repository's schema-declared
+# labels are appended per call (see declared_node_labels).
+_SEARCH_LABELS: tuple[str, ...] = ("Service", "Module", "Class", "Function", "Endpoint")
+
+
 def search_component(
     engine: GraphEngine,
     repo_id: str,
@@ -148,6 +154,7 @@ def search_component(
     cross_repo: bool = False,
     max_results: int = 15,
     modified_within_commits: int | None = None,
+    extra_labels: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Search for components (modules, services, classes, functions) by name or description.
 
@@ -163,6 +170,8 @@ def search_component(
             `last_modified_at` property and is excluded, never silently included.
             If fewer than N commits exist repo-wide, no cutoff applies and this
             filter is a no-op.
+        extra_labels: Schema-declared labels of this repository to search as well;
+            anything that isn't a valid label identifier is ignored.
 
     Returns:
         Dict with count, results, and truncated flag. Query is tokenized and
@@ -176,11 +185,15 @@ def search_component(
 
     tokens = _search_tokens(query)
 
+    labels = _SEARCH_LABELS + tuple(
+        label for label in extra_labels if LABEL_PATTERN.fullmatch(label) and label not in _SEARCH_LABELS
+    )
+    label_predicate = " OR ".join(f"n:{label}" for label in labels)
     repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
     recency_filter = "AND n.last_modified_at >= $cutoff" if cutoff is not None else ""
     cypher = f"""
     MATCH (n)
-    WHERE (n:Service OR n:Module OR n:Class OR n:Function OR n:Endpoint)
+    WHERE ({label_predicate})
     AND ANY(t IN $tokens WHERE toLower(n.name) CONTAINS t OR toLower(n.description) CONTAINS t)
     {repo_filter}
     {recency_filter}
@@ -196,6 +209,22 @@ def search_component(
     results = engine.run_cypher(cypher, params)
     results = _rank_search_results(results, tokens)
     return _envelope(results, max_results)
+
+
+def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[str, ...]:
+    """Node labels a repository's devgraph.schema.yaml declares; () if none.
+
+    A missing or invalid schema declares nothing -- searching just the
+    built-in labels is the safe fallback, not an error for the agent.
+    """
+    repo = registry.get(repo_id) if registry is not None else None
+    if repo is None:
+        return ()
+    try:
+        effective = resolve_effective_schema(repo.path)
+    except ProjectSchemaError:
+        return ()
+    return tuple(node_type.label for node_type in effective.node_types)
 
 
 def _rank_search_results(results: list[dict], tokens: list[str]) -> list[dict]:
