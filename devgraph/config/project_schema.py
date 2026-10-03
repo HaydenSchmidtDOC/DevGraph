@@ -632,3 +632,56 @@ def project_schema_json_schema() -> dict[str, Any]:
     file as loader-valid; call `load_project_schema`.
     """
     return ProjectSchema.model_json_schema()
+
+
+_STARTER_TEMPLATE = """\
+# DevGraph project schema ({filename})
+#
+# Declares extra node types and relationships for this repository on top of
+# DevGraph's built-in schema. Check it with `devgraph config validate`, see
+# the effective schema with `devgraph config show`, and apply it with
+# `devgraph rescan <repo_id>`. Today a declared node type gets a uniqueness
+# constraint on its key; extraction of user-defined types comes later.
+#
+# Built-in node labels (inherited with `extends: default`; never redeclare one):
+{labels}
+#
+# Built-in relationship types (reuse one between your own types with
+# `provider: builtin`):
+{relationships}
+
+version: {version}
+extends: default
+
+# node_types:
+#   - label: Runbook
+#     key: [slug]
+#     metadata:
+#       - name: slug
+#         type: string
+#         required: true
+#       - name: owner
+#
+# relationships:
+#   - type: DOCUMENTS
+#     provider: custom
+#     custom: {{name: runbook_links}}
+#     from: Runbook
+#     to: Service
+"""
+
+
+def starter_schema_text() -> str:
+    """A valid, commented starter `devgraph.schema.yaml` for `devgraph config eject`.
+
+    The built-in labels and relationship types are rendered from
+    `devgraph.graph.schema`, so the comments can't drift from the code. The
+    commented example validates once uncommented. Built-ins are listed, not
+    redeclared: the loader rejects a project file that redeclares one.
+    """
+    return _STARTER_TEMPLATE.format(
+        filename=SCHEMA_FILENAME,
+        labels="\n".join(f"#   {label}" for label in NODE_LABELS),
+        relationships="\n".join(f"#   {rel}" for rel in RELATIONSHIP_TYPES),
+        version=SCHEMA_VERSION,
+    )

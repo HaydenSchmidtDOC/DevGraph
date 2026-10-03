@@ -51,7 +51,7 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 | Check installation and graph health | `devgraph status`, `devgraph doctor`, `devgraph self-test [repo_id]` |
 | Open the dashboard | `devgraph dashboard` |
 | Configure an MCP client | `devgraph client-config`, `devgraph mcp add`, `devgraph mcp doctor` |
-| View configuration or tray logs | `devgraph config`, `devgraph logs` |
+| View settings, project schema, or tray logs | `devgraph config`, `devgraph config show / validate / eject`, `devgraph logs` |
 | Export a repository graph | `devgraph export <repo_id> --format json|cypher|dot` |
 | Update DevGraph | `devgraph update` |
 
@@ -99,6 +99,8 @@ Every indexable file becomes a `File` node and every directory containing one a 
   - `search_component` can return both a `Module` and a `File` for the same path; with `cross_repo=True` only the calling repository's declared labels are searched.
   - On the dashboard, filesystem nodes share the unfiltered canvas with code nodes, and the `?label=` filter accepts built-in labels only.
   - A symlinked file is represented at its target's path.
+- `devgraph config validate` checks the file (or every registered repository's with `--all`) and exits non-zero on an invalid schema or a cross-repository conflict; `devgraph config show` prints the effective schema and where each entry comes from; `devgraph config eject` writes a commented starter file and never overwrites an existing one.
+- `devgraph config` alone still shows DevGraph's settings; a single setting is now `devgraph config settings <key>`, and secret settings are masked.
 
 ## Dashboard
 

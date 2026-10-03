@@ -101,11 +101,13 @@ devgraph version
 View or validate the current configuration.
 
 ```
-devgraph config [<key>] [--show-defaults] [--json]
+devgraph config settings [<key>] [--show-defaults] [--json]
 ```
 
+> Note: `config` later became a command group (#1). Bare `devgraph config` still prints all settings; a single setting is `devgraph config settings <key>`.
+
 - Without `<key>`: print all settings.
-- With `<key>`: print just that setting's value (e.g. `devgraph config neo4j_uri`).
+- With `<key>`: print just that setting's value (e.g. `devgraph config settings neo4j_uri`).
 - `--show-defaults`: also show the default value for each setting (useful to see what changed).
 - `--json`: machine-readable JSON.
 

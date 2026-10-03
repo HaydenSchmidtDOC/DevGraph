@@ -15,7 +15,9 @@ from typing import Any, Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
+from typer.core import TyperGroup
 
 from devgraph.agent import lifecycle
 from devgraph.cli._env import resolve_podman, resolve_repo_root, resolve_venv_python
@@ -831,10 +833,10 @@ def doctor() -> None:
     for finding in schema_findings:
         subject = finding["repo_id"] or "conflict"
         if finding["failed"]:
-            console.print(f"  [red][X] {subject}:[/red] {finding['detail']}")
+            console.print(f"  [red][X] {escape(str(subject))}:[/red] {escape(finding['detail'])}")
             any_failed = True
         else:
-            console.print(f"  [green][OK][/green] {subject}: {finding['detail']}")
+            console.print(f"  [green][OK][/green] {escape(str(subject))}: {escape(finding['detail'])}")
 
     # 8. Tray/watcher liveness
     console.print("[bold]Live Watcher[/bold]")
@@ -1359,58 +1361,263 @@ def update(
     console.print("[green]Update complete.[/green]")
 
 
-@app.command()
-def config(
-    key: Optional[str] = typer.Argument(
-        None, help="Setting key to show (e.g. 'neo4j_uri'). Omit to show all."
-    ),
-    show_defaults: bool = typer.Option(
-        False, "--show-defaults", help="Also show the default value for each setting."
-    ),
-    as_json: bool = typer.Option(
-        False, "--json", help="Output as JSON."
-    ),
-) -> None:
-    """View or validate the current DevGraph configuration."""
+class _ConfigGroup(TyperGroup):
+    """`devgraph config` once took a setting name positionally; point that
+    old form at `config settings` instead of a bare "No such command"."""
+
+    def resolve_command(self, ctx: typer.Context, args: list[str]):  # type: ignore[override]
+        if args and args[0] not in self.commands and not args[0].startswith("-"):
+            from devgraph.config.settings import Settings
+
+            if args[0] in Settings.model_fields:
+                ctx.fail(
+                    f"'{args[0]}' is a setting, not a subcommand: use "
+                    f"`devgraph config settings {args[0]}`"
+                )
+        return super().resolve_command(ctx, args)
+
+
+config_app = typer.Typer(
+    cls=_ConfigGroup,
+    invoke_without_command=True,
+    help="View DevGraph settings, or inspect and scaffold a repository's devgraph.schema.yaml.",
+)
+app.add_typer(config_app, name="config")
+
+# Substrings that mark a setting as secret: masked wherever settings are shown.
+_SECRET_MARKERS = ("password", "secret", "token")
+
+
+def _is_secret_setting(name: str) -> bool:
+    return any(marker in name.lower() for marker in _SECRET_MARKERS)
+
+
+def _shown_value(name: str, value: Any) -> Any:
+    if _is_secret_setting(name):
+        return "****" if value else "(empty)"
+    return value
+
+
+def _show_settings(key: str | None, show_defaults: bool, as_json: bool) -> None:
+    """The settings view behind `devgraph config` and `devgraph config settings`."""
     settings = get_settings()
 
-    # Build a list of (field_name, value, default) tuples
     fields: list[tuple[str, Any, Any]] = []
-    for field_name in settings.model_fields:
-        field_info = settings.model_fields[field_name]
-        value = getattr(settings, field_name)
-        default = field_info.default
-        fields.append((field_name, value, default))
+    model_fields = type(settings).model_fields
+    for field_name in model_fields:
+        field_info = model_fields[field_name]
+        fields.append((field_name, getattr(settings, field_name), field_info.default))
 
     if key:
-        matched = [(n, v, d) for n, v, d in fields if n == key]
-        if not matched:
+        fields = [(n, v, d) for n, v, d in fields if n == key]
+        if not fields:
             console.print(f"[red][X] Unknown setting:[/red] {key}")
             raise typer.Exit(code=1)
-        fields = matched
-
-    # Mask passwords
-    def _display_value(v: Any) -> str:
-        if isinstance(v, str) and any(kw in (key or "").lower() or kw in str(key).lower() for kw in ("password", "secret", "token")):
-            return "****" if v else "(empty)"
-        return str(v)
 
     if as_json:
-        data = {n: getattr(settings, n) for n, _, _ in fields}
+        data = {n: _shown_value(n, v) for n, v, _ in fields}
         console.print_json(json.dumps(data, default=str))
-    else:
-        table = Table(title="DevGraph Configuration")
-        table.add_column("Key", style="cyan")
-        table.add_column("Value", style="green")
+        return
+
+    table = Table(title="DevGraph Configuration")
+    table.add_column("Key", style="cyan")
+    table.add_column("Value", style="green")
+    if show_defaults:
+        table.add_column("Default", style="yellow")
+    for field_name, value, default in fields:
+        row = [field_name, str(_shown_value(field_name, value))]
         if show_defaults:
-            table.add_column("Default", style="yellow")
-        for field_name, value, default in fields:
-            display = _display_value(value)
-            if show_defaults:
-                table.add_row(field_name, display, str(default))
-            else:
-                table.add_row(field_name, display)
-        console.print(table)
+            row.append(str(_shown_value(field_name, default)))
+        table.add_row(*row)
+    console.print(table)
+
+
+@config_app.callback()
+def config(
+    ctx: typer.Context,
+    show_defaults: bool = typer.Option(False, "--show-defaults", help="Also show the default value for each setting."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """With no subcommand, show DevGraph's settings (same as `config settings`)."""
+    if ctx.invoked_subcommand is not None:
+        if as_json or show_defaults:
+            ctx.fail("--json/--show-defaults go after the subcommand, e.g. `devgraph config show --json`")
+        return
+    _show_settings(None, show_defaults, as_json)
+
+
+@config_app.command("settings")
+def config_settings(
+    key: Optional[str] = typer.Argument(None, help="Setting key to show (e.g. 'neo4j_uri'). Omit to show all."),
+    show_defaults: bool = typer.Option(False, "--show-defaults", help="Also show the default value for each setting."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Show DevGraph's settings, or one setting. Secrets are masked."""
+    _show_settings(key, show_defaults, as_json)
+
+
+def _repo_dir(repo: Path) -> Path:
+    """`--repo` as an absolute directory, or exit 1 with a plain message."""
+    root = repo.expanduser().resolve()
+    if not root.is_dir():
+        console.print(f"[red][X] Error:[/red] {escape(str(root))} is not a directory")
+        raise typer.Exit(code=1)
+    return root
+
+
+@config_app.command("eject")
+def config_eject(
+    repo: Path = typer.Option(Path("."), "--repo", help="Repository root (default: current directory)."),
+) -> None:
+    """Write a commented starter devgraph.schema.yaml. Never overwrites an existing file."""
+    from devgraph.config.project_schema import project_schema_path, starter_schema_text
+
+    path = project_schema_path(_repo_dir(repo))
+    try:
+        # Exclusive create: also refuses a symlink or a file that appeared
+        # after any check we could have made.
+        with open(path, "x", encoding="utf-8") as handle:
+            handle.write(starter_schema_text())
+    except FileExistsError:
+        console.print(
+            f"[red][X] Error:[/red] {escape(str(path))} already exists; eject never overwrites a "
+            f"project schema. Edit it, or move it aside and eject again."
+        )
+        raise typer.Exit(code=1)
+    console.print(f"[green][OK][/green] Wrote {escape(str(path))}")
+    console.print("  Edit it, then run `devgraph config validate` and `devgraph rescan <repo_id>`.")
+
+
+def _schema_report(repo_root: Path | None) -> dict[str, Any]:
+    """The effective schema and where each entry comes from.
+
+    `repo_root=None` reports the built-in schema alone. Raises
+    ProjectSchemaError for an unreadable or invalid project file.
+    """
+    from devgraph.config.project_schema import (
+        SCHEMA_FILENAME,
+        load_project_schema,
+        project_schema_path,
+        resolve_declaration,
+    )
+    from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+
+    declaration = None if repo_root is None else load_project_schema(repo_root)
+    origin = None if repo_root is None else str(project_schema_path(repo_root))
+    effective = resolve_declaration(declaration, origin=origin or SCHEMA_FILENAME)
+    inherits = effective.extends == "default"
+
+    node_types: list[dict[str, Any]] = [
+        {"label": label, "origin": "built-in", "key": None} for label in (NODE_LABELS if inherits else ())
+    ]
+    node_types += [
+        {"label": n.label, "origin": SCHEMA_FILENAME, "key": list(n.key)} for n in effective.node_types
+    ]
+    relationships: list[dict[str, Any]] = [
+        {"type": rel, "origin": "built-in", "from": None, "to": None, "provider": "builtin"}
+        for rel in (RELATIONSHIP_TYPES if inherits else ())
+    ]
+    relationships += [
+        {"type": r.type, "origin": SCHEMA_FILENAME, "from": r.from_, "to": r.to, "provider": r.provider}
+        for r in effective.relationships
+    ]
+    if repo_root is None:
+        status = "global"
+    else:
+        status = "absent" if declaration is None else "valid"
+    return {
+        "repo": None if repo_root is None else str(repo_root),
+        "schema_file": origin if declaration is not None else None,
+        "status": status,
+        "extends": effective.extends,
+        "node_types": node_types,
+        "relationships": relationships,
+    }
+
+
+@config_app.command("show")
+def config_show(
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    global_only: bool = typer.Option(False, "--global", help="Show only DevGraph's built-in schema."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Show the effective graph schema for a repository and where each entry comes from.
+
+    Built-in node types are keyed by DevGraph's own identity rules (JSON `key: null`).
+    """
+    from devgraph.config.project_schema import SCHEMA_FILENAME, ProjectSchemaError
+
+    if global_only and repo is not None:
+        ctx.fail("use either --global or --repo, not both")
+    root = None if global_only else _repo_dir(repo or Path("."))
+    try:
+        report = _schema_report(root)
+    except ProjectSchemaError as exc:
+        console.print(f"[red][X] Invalid project schema:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=1)
+
+    if as_json:
+        typer.echo(json.dumps(report, indent=2))
+        return
+
+    if report["status"] == "global":
+        console.print("Built-in schema (no global config file yet)")
+    elif report["status"] == "absent":
+        console.print(f"{escape(report['repo'])}: no {SCHEMA_FILENAME} — built-in schema")
+    else:
+        console.print(f"{escape(report['repo'])}: {escape(report['schema_file'])} (valid, extends: {report['extends']})")
+
+    nodes = Table(title="Node types")
+    nodes.add_column("Label", style="cyan")
+    nodes.add_column("Origin")
+    nodes.add_column("Key")
+    for node in report["node_types"]:
+        nodes.add_row(node["label"], node["origin"], ", ".join(node["key"]) if node["key"] else "built-in identity")
+    console.print(nodes)
+
+    rels = Table(title="Relationships")
+    rels.add_column("Type", style="cyan")
+    rels.add_column("From")
+    rels.add_column("To")
+    rels.add_column("Provider")
+    rels.add_column("Origin")
+    for rel in report["relationships"]:
+        rels.add_row(rel["type"], rel["from"] or "any", rel["to"] or "any", rel["provider"], rel["origin"])
+    console.print(rels)
+
+
+@config_app.command("validate")
+def config_validate(
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    all_repos: bool = typer.Option(False, "--all", help="Check every registered repository, and conflicts between them."),
+) -> None:
+    """Fail-closed check of devgraph.schema.yaml. Exits 1 if anything is invalid or conflicting."""
+    from types import SimpleNamespace
+
+    if all_repos and repo is not None:
+        ctx.fail("use either --repo or --all, not both")
+    if all_repos:
+        registry = _get_registry()
+        try:
+            repos = registry.list_repos()
+        finally:
+            registry.close()
+        if not repos:
+            console.print("No registered repositories.")
+            return
+    else:
+        root = _repo_dir(repo or Path("."))
+        repos = [SimpleNamespace(repo_id=str(root), path=root)]
+
+    findings = _project_schema_findings(repos)
+    for finding in findings:
+        colour = "red" if finding["failed"] else "green"
+        subject = finding["repo_id"] or "cross-repository"
+        console.print(f"[{colour}]{finding['status']}[/{colour}] {escape(str(subject))}: {escape(finding['detail'])}")
+    if any(finding["failed"] for finding in findings):
+        raise typer.Exit(code=1)
 
 
 @app.command()
