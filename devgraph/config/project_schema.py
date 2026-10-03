@@ -3,9 +3,11 @@
 A repository may place a `devgraph.schema.yaml` file at its root to declare
 extra node types and relationships on top of — or instead of — DevGraph's
 built-in labels. This module is that file's format, loader and fail-closed
-validator, and nothing more: resolving a project schema changes no indexing
-behaviour, opens no file the declaration names, and runs no code. A custom
-provider declaration is validated as inert data only.
+validator, and nothing more: resolving a project schema itself changes no
+indexing behaviour, opens no file the declaration names, and runs no code.
+Only the filesystem provider (devgraph/indexer/providers/filesystem.py) turns
+filesystem-sourced declarations into indexing; a custom provider declaration
+is validated as inert data only.
 
 Built-in labels, relationship types and constraint statements are always
 imported from `devgraph.graph.schema`, never restated here, so a repository
