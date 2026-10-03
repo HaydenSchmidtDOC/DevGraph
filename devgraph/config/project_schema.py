@@ -23,6 +23,7 @@ the loader there would pull `devgraph.graph` — and with it the Neo4j driver
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -490,6 +491,27 @@ def _builtin_constraint_names() -> set[str]:
 def project_schema_path(repo_root: Path) -> Path:
     """Where a repository's optional schema file lives."""
     return Path(repo_root) / SCHEMA_FILENAME
+
+
+#: `schema_file_hash` of a repository with no schema file.
+ABSENT_SCHEMA_HASH = "absent"
+
+
+def schema_file_hash(repo_root: Path) -> str:
+    """Fingerprint of the schema file's bytes: `sha256:<hex>`, or `absent`.
+
+    An unreadable path (a directory, a permission error) gets a distinct
+    `unreadable:<error>` value so it never equals a hash the graph was
+    actually built with.
+    """
+    path = project_schema_path(repo_root)
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return ABSENT_SCHEMA_HASH
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}"
+    return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
 def load_project_schema(repo_root: Path) -> ProjectSchema | None:
