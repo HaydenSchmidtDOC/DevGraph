@@ -358,6 +358,8 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
         abstractions everything leans on) or by betweenness (bridges between subsystems,
         where a change ripples furthest); returns {count, results, truncated} of
         {name, labels, file, score, community}. metric is pagerank or betweenness.
+        CALLS edges are resolved by name, so widely used generic method names (such as get or
+        close) can rank high.
         Errors if graph insights have never been computed for the repository."""
         return devgraph_tools.key_nodes(engine, repo_id, metric, max_results)
 

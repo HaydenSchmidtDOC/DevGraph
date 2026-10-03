@@ -467,6 +467,9 @@ def key_nodes(
     community}. `metric` is "pagerank" or "betweenness"; the property it
     selects comes from an allow-list, never from the argument itself.
 
+    CALLS edges are resolved by name, so widely used generic method names
+    (such as get or close) can rank high.
+
     Raises:
         ValueError: unknown metric, or insights never computed.
     """

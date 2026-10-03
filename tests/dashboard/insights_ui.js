@@ -26,6 +26,7 @@ const src = [
   grab(/^async function loadInsights\(/m, "\n}"),
   grab(/^async function recomputeInsights\(/m, "\n}"),
   grab(/^function mapGraphResultToElements\(/m, "\n}"),
+  grab(/^function mergeGraphElements\(/m, "\n}"),
 ].join("\n");
 
 const mkEl = initialClass => {
@@ -51,10 +52,13 @@ const globals = {
   fetch: fetchStub,
   NODE_TYPES: [{ id: "Function", cat: "code" }],
   stableNodeId: n => "s:" + n.id,
+  state: { isolatedEntity: null },
+  cy: new Proxy({}, { get: (_, k) => cyStub[k] }),
   console,
 };
+let cyStub = null;
 const api = new Function(...Object.keys(globals), src +
-  "\nreturn { communityColor, COMMUNITY_PALETTE, loadInsights, recomputeInsights, mapGraphResultToElements, renderInsights };")(
+  "\nreturn { communityColor, COMMUNITY_PALETTE, loadInsights, recomputeInsights, mapGraphResultToElements, renderInsights, mergeGraphElements };")(
   ...Object.values(globals));
 
 let failures = 0;
@@ -125,9 +129,23 @@ const COMPUTED = {
   check("modularity to two places", els.modularityVal.textContent === "0.36", els.modularityVal.textContent);
   check("last computed is filled", els.insightsAtVal.textContent !== "—" && els.insightsAtVal.textContent !== "", els.insightsAtVal.textContent);
   check("community labels are escaped", els.communityList.innerHTML.includes("&lt;b&gt;auth&lt;/b&gt;") && !els.communityList.innerHTML.includes("<b>auth"), els.communityList.innerHTML);
+  check("key-node rows show the file basename and full path title", els.godNodes.innerHTML.includes("a.py") && els.godNodes.innerHTML.includes('title="a.py"'), els.godNodes.innerHTML);
+  check("bridge rows show the file basename", els.bridgeList.innerHTML.includes("b.py"), els.bridgeList.innerHTML);
   check("bridges are listed with their score", els.bridgeList.innerHTML.includes("Bridge") && els.bridgeList.innerHTML.includes("0.600"), els.bridgeList.innerHTML);
   check("leaderboard switches to PageRank", els.godNodes.innerHTML.includes("Hub") && els.godNodesBasis.textContent === "PageRank", els.godNodesBasis.textContent);
   check("pill is live", els.communityPill.textContent === "Live" && els.communityPill.className === "wired-pill", els.communityPill.className);
+
+  // 5b. file names are escaped; an isolated entity type keeps the degree list
+  reset("demo");
+  routes["GET /api/repos/demo/insights"] = json({ ...COMPUTED, key_nodes: [{ name: "K", labels: ["Class"], file: "x/<img>.py", score: 0.5 }] });
+  await api.loadInsights();
+  check("file names are escaped", els.godNodes.innerHTML.includes("&lt;img&gt;.py") && !els.godNodes.innerHTML.includes("<img>"), els.godNodes.innerHTML);
+  reset("demo");
+  globals.state.isolatedEntity = "code";
+  routes["GET /api/repos/demo/insights"] = json(COMPUTED);
+  await api.loadInsights();
+  globals.state.isolatedEntity = null;
+  check("an isolated entity type keeps the degree list", els.godNodes.innerHTML === "DEGREE-LIST" && els.godNodesBasis.textContent === "degree", els.godNodesBasis.textContent);
 
   // 6. computed with no structure
   reset("demo");
@@ -170,6 +188,18 @@ const COMPUTED = {
   await api.recomputeInsights();
   check("a failed recompute says so", /failed/i.test(els.communityNote.textContent) && els.btnRecomputeInsights.disabled === false, els.communityNote.textContent);
 
+  // 9b. community colours on nodes already on the canvas stay current
+  const mkNode = (id, community) => ({
+    id: () => id, nonempty: () => true,
+    data(k, v) { if (v !== undefined) this._d[k] = v; return this._d[k]; }, _d: { community },
+  });
+  const existing = mkNode("n1", null);
+  const list = [existing];
+  list.map = Array.prototype.map; list.filter = Array.prototype.filter;
+  cyStub = { elements: () => list, collection: () => [], getElementById: id => (id === "n1" ? existing : { nonempty: () => false }) };
+  api.mergeGraphElements([{ data: { id: "n1", community: 4 } }], "light", { remove: false, settle: false });
+  check("mergeGraphElements updates community on an existing node", existing.data("community") === 4, String(existing.data("community")));
+
   // 10. the GDS placeholder is gone
   check("no GDS probe remains", !/gds\.list/.test(html) && !/attemptCommunityDetection/.test(html), "index.html still probes for GDS");
 
@@ -179,6 +209,8 @@ const COMPUTED = {
   check("connectLiveEvents handles insights_refreshed", liveBody.includes("insights_refreshed"), "missing from connectLiveEvents");
   check("loadTopologyCounts does not reference an event", !topoBody.includes("insights_refreshed") && !/\bevent\./.test(topoBody), "event handling leaked into loadTopologyCounts");
   check("loadTopologyCounts resets the basis label to degree", topoBody.includes('godNodesBasis").textContent = "degree"'), "missing from loadTopologyCounts");
+  check("insights_refreshed refreshes the graph when colouring by community", /insights_refreshed[\s\S]{0,200}state\.colorByCommunity[\s\S]{0,80}refreshGraph\(\)/.test(liveBody), "missing refreshGraph under colorByCommunity");
+  check("loadTopologyCounts resets the basis in the empty branch too", /No nodes for this scope yet[\s\S]{0,120}godNodesBasis"\)\.textContent = "degree"/.test(topoBody), "empty branch does not reset the basis");
   check("connectLiveEvents does not touch the basis label", !liveBody.includes("godNodesBasis"), "misplaced in connectLiveEvents");
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");

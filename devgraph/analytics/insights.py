@@ -178,11 +178,13 @@ def refresh_insights(engine: Any, repo_id: str, *, blocking: bool = True) -> dic
     if not lock.acquire(blocking=blocking):
         return None
     try:
+        # Stamped before loading so an index finishing mid-run is not marked covered.
+        started = datetime.now(timezone.utc).isoformat()
         nodes, edges = engine.load_insight_graph(repo_id, COMMUNITY_RELATIONSHIPS)
         result = compute_insights(nodes, edges)
         stored = result.communities[:_MAX_STORED_COMMUNITIES]
         summary = {
-            "computed_at": datetime.now(timezone.utc).isoformat(),
+            "computed_at": started,
             "node_count": result.node_count,
             "community_count": len(result.communities),
             "modularity": result.modularity,

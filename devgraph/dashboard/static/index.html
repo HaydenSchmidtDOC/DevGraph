@@ -514,7 +514,7 @@ table.dstable input[type="text"] { width: 100%; }
       <div class="count-list floating-list" id="entityCounts"></div>
       <div class="count-note">Document nodes: <span id="docCount" style="color:var(--fg-2)">—</span></div>
       <div class="fc-subsection" data-od-id="god-nodes-section">
-        <div class="fc-subhead">Top god nodes <span class="lb-type" id="godNodesBasis">degree</span><span class="qmark" data-tip="PageRank over dependency edges (calls, imports, extends, implements, uses, depends-on) once graph insights are computed; until then, raw degree — size((n)--()) — which containment and history edges inflate.">?</span></div>
+        <div class="fc-subhead">Top god nodes <span class="lb-type" id="godNodesBasis">degree</span><span class="qmark" data-tip="PageRank over dependency edges (calls, imports, extends, implements, uses, depends-on) once graph insights are computed; until then, raw degree — size((n)--()) — which containment and history edges inflate. CALLS edges are resolved by name, so widely used generic method names (such as get or close) can rank high.">?</span></div>
         <div id="godNodes"></div>
       </div>
     </div>
@@ -1684,6 +1684,16 @@ function mergeGraphElements(elements, mode, opts) {
   const toRemove = remove ? cy.elements().filter(e => !incoming.has(e.id())) : cy.collection();
   const toAdd = [...incoming.values()].filter(el => !existingIds.has(el.data.id));
 
+  /* Insights are recomputed independently of the structure, so a node already
+     on the canvas can carry a new community under the same id. Update it
+     before the identical-refetch bail-out below. */
+  incoming.forEach((el, id) => {
+    if (!el.data.source) {
+      const n = cy.getElementById(id);
+      if (n.nonempty() && n.data("community") !== el.data.community) n.data("community", el.data.community);
+    }
+  });
+
   /* A text-only file edit re-indexes the same nodes/edges under the same
      ids -- a refetch after it returns an identical element set, nothing
      added or removed. Previously this still fell through to
@@ -2679,7 +2689,8 @@ function connectLiveEvents() {
     } else if (event.type === "git_history_synced" && event.mode !== "noop") {
       loadGitHistory(repo);
     } else if (event.type === "insights_refreshed" && neo4jConnected) {
-      loadInsights(); // node colours pick the new communities up on the next graph load
+      // Refetching the graph also reloads insights and re-stamps community colours on existing nodes.
+      if (state.colorByCommunity) refreshGraph(); else loadInsights();
     } else if (event.type === "registry_changed" && neo4jConnected) {
       populateRealRepos();
     }
@@ -3438,7 +3449,7 @@ async function attemptMcpTelemetry() {
    Backed by /api/repos/{id}/insights, which the agent keeps current after
    indexing (devgraph/analytics/insights.py). Per repository only. ── */
 function insightRowsHtml(rows) {
-  return rows.map((r, i) => `<div class="leaderboard-row"><span class="lb-rank">${i + 1}</span><span class="lb-name">${escapeHtmlVal(r.name ?? "")}</span><span class="lb-type">${escapeHtmlVal(r.tag ?? "")}</span><span class="lb-val">${escapeHtmlVal(r.value ?? "")}</span></div>`).join("");
+  return rows.map((r, i) => `<div class="leaderboard-row"${r.title ? ` title="${escapeHtmlVal(r.title)}"` : ""}><span class="lb-rank">${i + 1}</span><span class="lb-name">${escapeHtmlVal(r.name ?? "")}${r.file ? ` <span style="color:var(--meta)">· ${escapeHtmlVal(r.file.split("/").pop())}</span>` : ""}</span><span class="lb-type">${escapeHtmlVal(r.tag ?? "")}</span><span class="lb-val">${escapeHtmlVal(r.value ?? "")}</span></div>`).join("");
 }
 function formatScore(v) {
   return Number.isFinite(v) ? v.toFixed(3) : "—";
@@ -3475,12 +3486,12 @@ function renderInsights(body) {
     insightRowsHtml(communities.map(c => ({ name: c.label, tag: "#" + c.community, value: c.size })));
   const bridges = Array.isArray(body.bridges) ? body.bridges : [];
   document.getElementById("bridgeList").innerHTML = bridges.length
-    ? insightRowsHtml(bridges.map(b => ({ name: b.name, tag: (b.labels || [])[0] || "", value: formatScore(b.score) })))
+    ? insightRowsHtml(bridges.map(b => ({ name: b.name, tag: (b.labels || [])[0] || "", value: formatScore(b.score), file: b.file, title: b.file })))
     : `<div class="count-note">No dependency edges to rank.</div>`;
   const keyNodes = Array.isArray(body.key_nodes) ? body.key_nodes : [];
-  if (keyNodes.length) {
+  if (keyNodes.length && !state.isolatedEntity) {
     document.getElementById("godNodes").innerHTML =
-      insightRowsHtml(keyNodes.map(k => ({ name: k.name, tag: (k.labels || [])[0] || "", value: formatScore(k.score) })));
+      insightRowsHtml(keyNodes.map(k => ({ name: k.name, tag: (k.labels || [])[0] || "", value: formatScore(k.score), file: k.file, title: k.file })));
     document.getElementById("godNodesBasis").textContent = "PageRank";
   }
   const pill = document.getElementById("communityPill");
@@ -3636,6 +3647,7 @@ async function loadTopologyCounts() {
       document.getElementById("godNodesBasis").textContent = "degree";
     } else {
       godEl.innerHTML = `<div class="count-note">No nodes for this scope yet.</div>`;
+      document.getElementById("godNodesBasis").textContent = "degree";
     }
   } catch (e) { /* left at static/sample values — next repo switch or reconnect retries */ }
 }

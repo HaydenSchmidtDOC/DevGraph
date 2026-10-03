@@ -141,3 +141,23 @@ def test_read_insights_tolerates_a_corrupt_communities_value():
                     "modularity": 0.0, "communities": "{not json"}
 
     assert insights.read_insights(Stub(), "r")["communities"] == []
+
+
+def test_computed_at_is_stamped_before_the_graph_is_loaded():
+    from datetime import datetime, timezone
+    import time
+
+    class Engine:
+        loaded_at = None
+        summary = None
+
+        def load_insight_graph(self, repo_id, relationships):
+            Engine.loaded_at = datetime.now(timezone.utc).isoformat()
+            time.sleep(0.01)
+            return TWO_SUBSYSTEMS_NODES, TWO_SUBSYSTEMS_EDGES
+
+        def write_insights(self, repo_id, rows, summary):
+            Engine.summary = summary
+
+    insights.refresh_insights(Engine(), "stamp-repo")
+    assert Engine.summary["computed_at"] <= Engine.loaded_at
