@@ -1109,3 +1109,8 @@ def test_cli_doctor_reports_an_invalid_project_schema(runner, temp_registry_db, 
     # An invalid configuration is a failing check, whatever else this
     # environment reports (Podman, Neo4j and the tray are all independent).
     assert "doctor found one or more failing checks above." in collapsed
+
+
+def test_rescan_accepts_now(runner):
+    result = runner.invoke(app, ["rescan", "--help"])
+    assert result.exit_code == 0 and "--now" in result.output

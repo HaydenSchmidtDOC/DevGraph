@@ -30,6 +30,7 @@ import pystray
 import uvicorn
 from PIL import Image, ImageDraw
 
+from devgraph.agent.schema_rescan import SchemaRescanScheduler
 from devgraph.config import get_settings
 from devgraph.dashboard.app import build_app
 from devgraph.dashboard.events import EventBroadcaster
@@ -95,9 +96,13 @@ class TrayApp:
         self._icon: pystray.Icon | None = None  # type: ignore[valid-type]
         self._last_seen_registry_change = self._registry.last_changed_at()
         self._events = EventBroadcaster()
+        self._schema_rescans = SchemaRescanScheduler(self._engine, self._registry, on_rescanned=self._on_schema_rescanned)
         self._dashboard_loop: asyncio.AbstractEventLoop | None = None
         self._dashboard_server: uvicorn.Server | None = None
         self._dashboard_thread: threading.Thread | None = None
+
+    def _on_schema_rescanned(self, repo_id: str, files: int) -> None:
+        self._events.publish({"type": "reindexed", "repo_id": repo_id, "changed": files, "deleted": 0})
 
     def _on_changes(self, repo_id: str, changed_paths: set[Path], deleted_paths: set[Path]) -> None:
         """Route watcher events to the indexer. This is the piece that closes the
@@ -331,6 +336,7 @@ class TrayApp:
     def _quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
         self._stop_event.set()
         self._watcher.stop()
+        self._schema_rescans.stop()
         if self._dashboard_server is not None:
             self._dashboard_server.should_exit = True
             if self._dashboard_thread is not None:
@@ -351,6 +357,7 @@ class TrayApp:
 
     def start(self) -> None:
         self._watcher.start()
+        self._schema_rescans.start()
         health_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         health_thread.start()
 
@@ -373,6 +380,7 @@ class TrayApp:
         except Exception:
             logger.critical("pystray event loop crashed", exc_info=True)
             self._watcher.stop()
+            self._schema_rescans.stop()
             try:
                 self._engine.close()
             except Exception:
