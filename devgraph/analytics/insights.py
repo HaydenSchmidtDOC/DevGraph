@@ -17,6 +17,7 @@ import logging
 import posixpath
 import threading
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -238,3 +239,89 @@ def community_members(
         {"repo_id": repo_id, "communities": communities, "k": per_community},
     )
     return {row["community"]: row["members"] for row in rows}
+
+
+# ── scheduling ───────────────────────────────────────────────────────────
+
+_SCHEDULER_INTERVAL_S = 30.0
+
+
+class InsightsScheduler:
+    """Keeps every active repository's insights no older than its last index.
+
+    One rule covers every way a repository gets indexed -- watcher batches in
+    this agent, CLI rescans, dashboard registrations -- because they all
+    stamp `last_indexed` in the registry. The first pass runs as soon as the
+    thread starts, which also backfills repositories never computed.
+    """
+
+    def __init__(
+        self,
+        engine: Any,
+        registry: Any,
+        on_refreshed: Callable[[str], None] | None = None,
+        *,
+        interval_s: float = _SCHEDULER_INTERVAL_S,
+    ) -> None:
+        self._engine = engine
+        self._registry = registry
+        self._on_refreshed = on_refreshed
+        self._interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None
+
+    def is_stale(self, repo: Any) -> bool:
+        if not repo.last_indexed:
+            return False
+        summary = self._engine.read_insights_summary(repo.repo_id)
+        # Both are UTC ISO-8601 strings from datetime.isoformat(), so they
+        # order correctly as strings.
+        return summary is None or (summary.get("computed_at") or "") < repo.last_indexed
+
+    def run_once(self) -> list[str]:
+        refreshed: list[str] = []
+        for repo in self._registry.list_repos(active_only=True):
+            if self._stop.is_set():
+                break
+            try:
+                if not self.is_stale(repo):
+                    continue
+                if refresh_insights(self._engine, repo.repo_id, blocking=False) is None:
+                    continue  # another caller is computing it right now
+            except Exception:
+                logger.warning("graph insights refresh failed for %s", repo.repo_id, exc_info=True)
+                continue
+            refreshed.append(repo.repo_id)
+            if self._on_refreshed is not None:
+                try:
+                    self._on_refreshed(repo.repo_id)
+                except Exception:
+                    logger.debug("insights_refreshed callback failed for %s", repo.repo_id, exc_info=True)
+        return refreshed
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="devgraph-insights", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            # A refresh blocked on a slow database can outlast this; the
+            # thread is a daemon, so shutdown is never held hostage.
+            thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.run_once()
+            except Exception:
+                logger.warning("graph insights pass failed", exc_info=True)
+            self._stop.wait(self._interval_s)

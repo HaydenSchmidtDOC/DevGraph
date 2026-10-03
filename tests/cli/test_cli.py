@@ -1109,3 +1109,41 @@ def test_cli_doctor_reports_an_invalid_project_schema(runner, temp_registry_db, 
     # An invalid configuration is a failing check, whatever else this
     # environment reports (Podman, Neo4j and the tray are all independent).
     assert "doctor found one or more failing checks above." in collapsed
+
+
+def test_cli_insights_unknown_repo(runner, temp_registry_db):
+    db_path, _ = temp_registry_db
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["insights", "no-such-repo"])
+    assert result.exit_code == 1
+    assert "no such repo_id" in result.stdout
+
+
+def test_cli_insights_computes_for_a_registered_repo(runner, temp_git_repo, temp_registry_db, require_neo4j):
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    from devgraph.cli import main as cli_main
+    from devgraph.graph.engine import GraphEngine
+
+    engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
+    try:
+        engine.upsert_repository(repo_id, repo_id, str(temp_git_repo))
+        engine.run_cypher(
+            "CREATE (:Function {repo_id: $r, name: 'a', file: 'x/a.py'})-[:CALLS]->"
+            "(:Function {repo_id: $r, name: 'b', file: 'x/b.py'})",
+            {"r": repo_id},
+        )
+        config_module.get_settings.cache_clear()
+        with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+             patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+            result = runner.invoke(app, ["insights", repo_id])
+        assert result.exit_code == 0, result.stdout
+        output = " ".join(result.stdout.split())  # Rich may wrap the line at the runner's width
+        assert "1 communities" in output and "2 nodes" in output
+    finally:
+        engine.delete_repository(repo_id)
+        engine.close()

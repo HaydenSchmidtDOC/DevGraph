@@ -30,6 +30,7 @@ import pystray
 import uvicorn
 from PIL import Image, ImageDraw
 
+from devgraph.analytics.insights import InsightsScheduler
 from devgraph.config import get_settings
 from devgraph.dashboard.app import build_app
 from devgraph.dashboard.events import EventBroadcaster
@@ -95,6 +96,7 @@ class TrayApp:
         self._icon: pystray.Icon | None = None  # type: ignore[valid-type]
         self._last_seen_registry_change = self._registry.last_changed_at()
         self._events = EventBroadcaster()
+        self._insights = InsightsScheduler(self._engine, self._registry, on_refreshed=self._on_insights_refreshed)
         self._dashboard_loop: asyncio.AbstractEventLoop | None = None
         self._dashboard_server: uvicorn.Server | None = None
         self._dashboard_thread: threading.Thread | None = None
@@ -129,6 +131,9 @@ class TrayApp:
             )
         except Exception:
             logger.warning("incremental reindex failed for %s", repo_id, exc_info=True)
+
+    def _on_insights_refreshed(self, repo_id: str) -> None:
+        self._events.publish({"type": "insights_refreshed", "repo_id": repo_id})
 
     def _on_git_state_changed(self, repo_id: str) -> None:
         """Route git state change events to the git history syncer.
@@ -331,6 +336,7 @@ class TrayApp:
     def _quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
         self._stop_event.set()
         self._watcher.stop()
+        self._insights.stop()
         if self._dashboard_server is not None:
             self._dashboard_server.should_exit = True
             if self._dashboard_thread is not None:
@@ -351,6 +357,7 @@ class TrayApp:
 
     def start(self) -> None:
         self._watcher.start()
+        self._insights.start()
         health_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         health_thread.start()
 
@@ -373,6 +380,7 @@ class TrayApp:
         except Exception:
             logger.critical("pystray event loop crashed", exc_info=True)
             self._watcher.stop()
+            self._insights.stop()
             try:
                 self._engine.close()
             except Exception:
