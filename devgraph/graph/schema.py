@@ -57,9 +57,10 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # `source_file`/`source`/`sources` are the provenance properties per-file
 # delete cleanup keys off. A per-project schema may not redeclare any of
 # them: a user-defined field of the same name would silently collide with
-# the value the pipeline writes.
+# the value the pipeline writes. `extractor` marks nodes a schema-declared
+# provider owns (see devgraph/indexer/providers/).
 RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset(
-    {"repo_id", "name", "file", "source_file", "source", "sources"}
+    {"repo_id", "name", "file", "source_file", "source", "sources", "extractor"}
 )
 
 # Labels other than Repository must be uniquely keyed on (repo_id, name)

@@ -53,8 +53,19 @@ EXTENDS_MODES: tuple[str, ...] = ("default", "none")
 
 #: Who produces a declared relationship. "builtin" reuses one of DevGraph's
 #: own relationship types; "custom" names an out-of-tree provider that this
-#: unit records as data and never loads.
-PROVIDER_KINDS: tuple[str, ...] = ("builtin", "custom")
+#: module records as data and never loads; "filesystem" links each
+#: filesystem node to its parent folder (devgraph/indexer/providers/).
+PROVIDER_KINDS: tuple[str, ...] = ("builtin", "custom", "filesystem")
+
+#: Where a user-declared node type's nodes come from. Built-in labels are
+#: produced by DevGraph's own extractors and never declare a source.
+NODE_SOURCE_PROVIDERS: tuple[str, ...] = ("filesystem",)
+
+#: What a filesystem-sourced node type represents.
+FILESYSTEM_KINDS: tuple[str, ...] = ("file", "folder")
+
+#: The one key every filesystem node type must declare: its repo-relative path.
+FILESYSTEM_KEY: tuple[str, ...] = ("path",)
 
 #: Value types a declared metadata field may hold.
 METADATA_TYPES: tuple[str, ...] = ("string", "integer", "float", "boolean")
@@ -83,6 +94,8 @@ _CONSTRAINT_NAME_PATTERN = re.compile(r"^(?:CREATE|DROP) CONSTRAINT (\w+) ")
 SchemaVersion = Literal[SCHEMA_VERSION]
 ExtendsMode = Literal[EXTENDS_MODES]
 ProviderKind = Literal[PROVIDER_KINDS]
+NodeSourceProvider = Literal[NODE_SOURCE_PROVIDERS]
+FilesystemKind = Literal[FILESYSTEM_KINDS]
 MetadataType = Literal[METADATA_TYPES]
 
 ScalarParam = str | int | float | bool | None
@@ -128,6 +141,15 @@ class MetadataField(BaseModel):
         return value
 
 
+class NodeSource(BaseModel):
+    """Where a user-declared node type's nodes are extracted from."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    provider: NodeSourceProvider
+    kind: FilesystemKind
+
+
 class NodeTypeDecl(BaseModel):
     """A user-declared node label with a stable key and metadata fields."""
 
@@ -137,6 +159,7 @@ class NodeTypeDecl(BaseModel):
     key: tuple[str, ...]
     metadata: tuple[MetadataField, ...] = ()
     description: str | None = None
+    source: NodeSource | None = None
 
     @field_validator("label")
     @classmethod
@@ -188,6 +211,18 @@ class NodeTypeDecl(BaseModel):
                     f"node type {self.label!r} key component {component!r} is "
                     f"not a declared metadata field"
                 )
+        if self.source is not None:
+            if self.key != FILESYSTEM_KEY:
+                raise ValueError(
+                    f"node type {self.label!r} is sourced from the filesystem, so "
+                    f"its key must be exactly [path]: the provider writes one node "
+                    f"per repo-relative path"
+                )
+            if by_name["path"].type != "string":
+                raise ValueError(
+                    f"node type {self.label!r} is sourced from the filesystem, so "
+                    f"its path metadata field must be a string"
+                )
         return self
 
 
@@ -222,7 +257,7 @@ class RelationshipDecl(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     type: str
-    from_: str = Field(alias="from")
+    from_: str | tuple[str, ...] = Field(alias="from")
     to: str
     provider: ProviderKind = "builtin"
     custom: CustomProvider | None = None
@@ -232,10 +267,27 @@ class RelationshipDecl(BaseModel):
     def _check_type(cls, value: str) -> str:
         return _require_identifier(value, RELATIONSHIP_TYPE_PATTERN, "relationship type")
 
-    @field_validator("from_", "to")
+    @field_validator("to")
     @classmethod
     def _check_endpoint(cls, value: str) -> str:
         return _require_identifier(value, LABEL_PATTERN, "relationship endpoint label")
+
+    @field_validator("from_")
+    @classmethod
+    def _check_from(cls, value: str | tuple[str, ...]) -> str | tuple[str, ...]:
+        labels = (value,) if isinstance(value, str) else value
+        if not labels:
+            raise ValueError("relationship 'from' must name at least one label")
+        if len(set(labels)) != len(labels):
+            raise ValueError("relationship 'from' lists a label more than once")
+        for label in labels:
+            _require_identifier(label, LABEL_PATTERN, "relationship endpoint label")
+        return value
+
+    @property
+    def from_labels(self) -> tuple[str, ...]:
+        """`from` as a tuple, whether it was written as one label or a list."""
+        return (self.from_,) if isinstance(self.from_, str) else tuple(self.from_)
 
     @model_validator(mode="after")
     def _check_provider(self) -> RelationshipDecl:
@@ -251,7 +303,7 @@ class RelationshipDecl(BaseModel):
                     f"not a built-in relationship type; known types are "
                     f"{', '.join(RELATIONSHIP_TYPES)}"
                 )
-        else:
+        elif self.provider == "custom":
             if self.custom is None:
                 raise ValueError(
                     f"relationship {self.type!r} uses the custom provider, which "
@@ -261,6 +313,17 @@ class RelationshipDecl(BaseModel):
                 raise ValueError(
                     f"relationship type {self.type!r} is built-in and cannot be "
                     f"redeclared by a custom provider"
+                )
+        else:
+            if self.custom is not None:
+                raise ValueError(
+                    f"relationship {self.type!r} uses the filesystem provider, "
+                    f"which must not declare a custom block"
+                )
+            if self.type in RELATIONSHIP_TYPES:
+                raise ValueError(
+                    f"relationship type {self.type!r} is built-in and cannot be "
+                    f"redeclared by the filesystem provider"
                 )
         return self
 
@@ -309,6 +372,43 @@ class ProjectSchema(BaseModel):
                 "extends: none inherits no built-in labels, so at least one "
                 "node type must be declared"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_filesystem(self) -> ProjectSchema:
+        by_kind: dict[str, str] = {}
+        for node_type in self.node_types:
+            if node_type.source is None:
+                continue
+            kind = node_type.source.kind
+            if kind in by_kind:
+                raise ValueError(
+                    f"node types {by_kind[kind]!r} and {node_type.label!r} are both "
+                    f"filesystem {kind} types; declare at most one"
+                )
+            by_kind[kind] = node_type.label
+
+        filesystem_relationships = [r for r in self.relationships if r.provider == "filesystem"]
+        if len(filesystem_relationships) > 1:
+            raise ValueError(
+                "at most one filesystem relationship may be declared; found "
+                + ", ".join(repr(r.type) for r in filesystem_relationships)
+            )
+        filesystem_labels = set(by_kind.values())
+        folder = by_kind.get("folder")
+        for relationship in filesystem_relationships:
+            if folder is None or relationship.to != folder:
+                where = f" {folder!r}" if folder else ", and none is declared"
+                raise ValueError(
+                    f"filesystem relationship {relationship.type!r} must point to "
+                    f"the filesystem folder node type{where}"
+                )
+            for label in relationship.from_labels:
+                if label not in filesystem_labels:
+                    raise ValueError(
+                        f"filesystem relationship {relationship.type!r} from label "
+                        f"{label!r} is not a filesystem node type"
+                    )
         return self
 
 
@@ -446,7 +546,8 @@ def resolve_declaration(
 
     known_labels = set(node_labels)
     for relationship in declaration.relationships:
-        for role, label in (("from", relationship.from_), ("to", relationship.to)):
+        endpoints = [("from", label) for label in relationship.from_labels] + [("to", relationship.to)]
+        for role, label in endpoints:
             if label not in known_labels:
                 raise ProjectSchemaError(
                     f"{origin}: relationship {relationship.type!r} {role} endpoint "

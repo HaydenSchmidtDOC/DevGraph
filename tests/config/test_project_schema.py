@@ -1078,3 +1078,173 @@ def test_builtin_constraint_names_are_all_recoverable():
     names = project_schema._builtin_constraint_names()
 
     assert len(names) == len(constraint_statements())
+
+
+# --- Filesystem provider (worktree example) --------------------------------
+
+WORKTREE = """
+    version: 1
+    node_types:
+      - label: File
+        key: [path]
+        metadata: [{name: path}]
+        source: {provider: filesystem, kind: file}
+      - label: Folder
+        key: [path]
+        metadata: [{name: path}]
+        source: {provider: filesystem, kind: folder}
+    relationships:
+      - type: IS_CHILD_OF
+        provider: filesystem
+        from: [File, Folder]
+        to: Folder
+"""
+
+
+def test_worktree_example_loads_and_resolves(tmp_path):
+    effective = resolve_effective_schema(write_schema(tmp_path, WORKTREE))
+    assert {"File", "Folder"} <= set(effective.node_labels)
+    assert "IS_CHILD_OF" in effective.relationship_types
+    (relationship,) = effective.relationships
+    assert relationship.provider == "filesystem"
+    assert relationship.from_labels == ("File", "Folder")
+    kinds = {n.label: (n.source.provider, n.source.kind) for n in effective.node_types}
+    assert kinds == {"File": ("filesystem", "file"), "Folder": ("filesystem", "folder")}
+
+
+def test_a_single_from_label_is_still_accepted(tmp_path):
+    effective = resolve_effective_schema(write_schema(tmp_path, WORKTREE.replace("from: [File, Folder]", "from: File")))
+    assert effective.relationships[0].from_labels == ("File",)
+
+
+def test_filesystem_node_types_must_be_keyed_on_path(tmp_path):
+    text = WORKTREE.replace(
+        "      - label: File\n        key: [path]\n        metadata: [{name: path}]",
+        "      - label: File\n        key: [slug]\n        metadata: [{name: slug}]",
+    )
+    with pytest.raises(ProjectSchemaError, match=r"key must be exactly \[path\]"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_filesystem_path_must_be_a_string(tmp_path):
+    text = WORKTREE.replace(
+        "      - label: File\n        key: [path]\n        metadata: [{name: path}]",
+        "      - label: File\n        key: [path]\n        metadata: [{name: path, type: integer}]",
+    )
+    with pytest.raises(ProjectSchemaError, match="must be a string"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_at_most_one_node_type_per_filesystem_kind(tmp_path):
+    text = WORKTREE.replace(
+        "    relationships:",
+        "      - label: Doc\n        key: [path]\n        metadata: [{name: path}]\n"
+        "        source: {provider: filesystem, kind: file}\n    relationships:",
+    )
+    with pytest.raises(ProjectSchemaError, match="both filesystem file types"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_filesystem_relationship_must_point_to_the_folder_type(tmp_path):
+    with pytest.raises(ProjectSchemaError, match="must point to the filesystem folder node type"):
+        load_project_schema(write_schema(tmp_path, WORKTREE.replace("to: Folder", "to: File")))
+
+
+def test_filesystem_relationship_needs_a_folder_type(tmp_path):
+    text = """
+        version: 1
+        node_types:
+          - label: File
+            key: [path]
+            metadata: [{name: path}]
+            source: {provider: filesystem, kind: file}
+        relationships:
+          - type: IS_CHILD_OF
+            provider: filesystem
+            from: File
+            to: File
+    """
+    with pytest.raises(ProjectSchemaError, match="none is declared"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_filesystem_relationship_children_must_be_filesystem_types(tmp_path):
+    text = WORKTREE.replace("from: [File, Folder]", "from: [File, Widget]").replace(
+        "    relationships:",
+        "      - label: Widget\n        key: [slug]\n        metadata: [{name: slug}]\n    relationships:",
+    )
+    with pytest.raises(ProjectSchemaError, match="'Widget' is not a filesystem node type"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_filesystem_relationship_rejects_a_custom_block(tmp_path):
+    text = WORKTREE.replace("        to: Folder", "        to: Folder\n        custom: {name: tree}")
+    with pytest.raises(ProjectSchemaError, match="filesystem provider, which must not declare a custom block"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_filesystem_relationship_cannot_reuse_a_builtin_type(tmp_path):
+    with pytest.raises(ProjectSchemaError, match="cannot be redeclared by the filesystem provider"):
+        load_project_schema(write_schema(tmp_path, WORKTREE.replace("type: IS_CHILD_OF", "type: CONTAINS")))
+
+
+def test_at_most_one_filesystem_relationship(tmp_path):
+    # Same indentation as WORKTREE's own relationship items (6 spaces).
+    text = WORKTREE + (
+        "      - type: IN_FOLDER\n"
+        "        provider: filesystem\n"
+        "        from: File\n"
+        "        to: Folder\n"
+    )
+    with pytest.raises(ProjectSchemaError, match="at most one filesystem relationship"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+@pytest.mark.parametrize("from_value", ["[]", "[File, File]"])
+def test_relationship_from_list_must_be_non_empty_and_unique(tmp_path, from_value):
+    with pytest.raises(ProjectSchemaError):
+        load_project_schema(write_schema(tmp_path, WORKTREE.replace("[File, Folder]", from_value)))
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["{provider: git, kind: file}", "{provider: filesystem, kind: symlink}", "{provider: filesystem}"],
+)
+def test_unknown_node_sources_are_rejected(tmp_path, source):
+    text = WORKTREE.replace("{provider: filesystem, kind: file}", source)
+    with pytest.raises(ProjectSchemaError):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_extractor_is_a_reserved_property(tmp_path):
+    assert "extractor" in RESERVED_NODE_PROPERTIES
+    # WIDGET's metadata list items sit at 10 spaces; this adds a second one.
+    text = WIDGET + "          - name: extractor\n"
+    with pytest.raises(ProjectSchemaError, match="reserved"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_every_label_in_a_from_list_must_resolve(tmp_path):
+    text = """
+        version: 1
+        node_types:
+          - label: Widget
+            key: [slug]
+            metadata: [{name: slug}]
+        relationships:
+          - type: LINKS
+            provider: custom
+            custom: {name: linker}
+            from: [Widget, Gadget]
+            to: Widget
+    """
+    with pytest.raises(ProjectSchemaError, match="'Gadget' is not a node label"):
+        resolve_effective_schema(write_schema(tmp_path, text))
+
+
+def test_json_schema_describes_node_sources_and_list_from():
+    defs = project_schema_json_schema()["$defs"]
+    assert defs["NodeSource"]["properties"]["kind"]["enum"] == ["file", "folder"]
+    assert "source" in defs["NodeTypeDecl"]["properties"]
+    from_schema = defs["RelationshipDecl"]["properties"]["from"]
+    assert {variant.get("type") for variant in from_schema["anyOf"]} == {"string", "array"}
