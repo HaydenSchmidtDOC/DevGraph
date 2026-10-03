@@ -18,6 +18,7 @@ import subprocess
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
 from devgraph.registry.store import RepoRegistry
+from devgraph.analytics.insights import INSIGHT_METRICS, community_members, read_insights, top_nodes
 
 import re
 import unicodedata
@@ -407,6 +408,74 @@ def find_dependency_cycles(
         # max_results alone and cannot see that.
         envelope["truncated"] = True
     return envelope
+
+
+_INSIGHTS_NOT_COMPUTED = (
+    "graph insights have not been computed for this repository yet; the DevGraph agent "
+    "computes them after indexing, or run `devgraph insights <repo_id>`"
+)
+_MAX_MEMBERS_PER_COMMUNITY = 20
+# Rows pulled for key_nodes before the envelope trims to max_results.
+_KEY_NODES_LIMIT = 50
+
+
+def find_communities(
+    engine: GraphEngine,
+    repo_id: str,
+    max_results: int = 10,
+    members_per_community: int = 5,
+) -> dict[str, Any]:
+    """Return the repository's communities (Louvain over dependency and
+    containment edges), largest first.
+
+    Each result is {community, label, size, top_members}; `top_members`
+    (highest PageRank first, each {name, labels, file, pagerank}) is filled
+    for the communities inside max_results. `count` covers the largest 50
+    communities the repository stores.
+
+    Raises:
+        ValueError: insights have never been computed for this repository.
+    """
+    summary = read_insights(engine, repo_id)
+    if summary is None:
+        raise ValueError(_INSIGHTS_NOT_COMPUTED)
+    communities = summary["communities"]
+    shown = [c["community"] for c in communities[:max(0, max_results)]]
+    k = max(1, min(members_per_community, _MAX_MEMBERS_PER_COMMUNITY))
+    members = community_members(engine, repo_id, shown, k) if shown else {}
+    # Members are nested dicts, which _envelope's per-row sanitizing doesn't
+    # reach, so they are sanitized here.
+    rows = [
+        {**c, "top_members": [_sanitize_row(m) for m in members.get(c["community"], [])]}
+        if c["community"] in shown
+        else c
+        for c in communities
+    ]
+    return _envelope(rows, max_results)
+
+
+def key_nodes(
+    engine: GraphEngine,
+    repo_id: str,
+    metric: str = "pagerank",
+    max_results: int = 10,
+) -> dict[str, Any]:
+    """Rank the repository's entities by PageRank over dependency edges (core
+    abstractions) or betweenness (bridges between subsystems).
+
+    Returns {count, results, truncated} of {name, labels, file, score,
+    community}. `metric` is "pagerank" or "betweenness"; the property it
+    selects comes from an allow-list, never from the argument itself.
+
+    Raises:
+        ValueError: unknown metric, or insights never computed.
+    """
+    metric_key = metric.strip().lower() if isinstance(metric, str) else ""
+    if metric_key not in INSIGHT_METRICS:
+        raise ValueError(f"metric must be one of: {', '.join(INSIGHT_METRICS)}")
+    if read_insights(engine, repo_id) is None:
+        raise ValueError(_INSIGHTS_NOT_COMPUTED)
+    return _envelope(top_nodes(engine, repo_id, metric_key, _KEY_NODES_LIMIT), max_results)
 
 
 def trace_request_flow(

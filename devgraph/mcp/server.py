@@ -111,6 +111,8 @@ _TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "find_related_prs", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
     {"name": "god_nodes", "identifier_kind": None, "envelope": True, "phase": 3},
     {"name": "find_dependency_cycles", "identifier_kind": "dependency relationship type (CALLS/DEPENDS_ON/EXTENDS/IMPORTS/USES), not a component name", "envelope": True, "phase": 3},
+    {"name": "find_communities", "identifier_kind": None, "envelope": True, "phase": 3, "note": "requires computed graph insights (automatic after indexing, or `devgraph insights`)"},
+    {"name": "key_nodes", "identifier_kind": "metric (pagerank/betweenness), not a component name", "envelope": True, "phase": 3, "note": "requires computed graph insights (automatic after indexing, or `devgraph insights`)"},
     {"name": "issue_history_for", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
     {"name": "get_source", "identifier_kind": "function/class name (not a file path)", "envelope": False, "phase": 2},
     {"name": "run_cypher", "identifier_kind": "raw Cypher", "envelope": False, "phase": None, "note": "only registered when enable_run_cypher=true; prefer the purpose-built tools above"},
@@ -332,6 +334,32 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
         return devgraph_tools.find_dependency_cycles(
             engine, repo_id, relationship, max_length, cross_repo, max_results
         )
+
+    @server.tool(annotations=_READ_ONLY)
+    def find_communities(
+        repo_id: str,
+        max_results: int = 10,
+        members_per_community: int = 5,
+    ) -> dict[str, Any]:
+        """Return the repository's subsystems: Louvain communities over dependency and
+        containment edges, largest first, as {count, results, truncated} of
+        {community, label, size, top_members}. top_members (highest PageRank first) is
+        filled for the communities within max_results. Errors if graph insights have
+        never been computed for the repository (the agent computes them after indexing)."""
+        return devgraph_tools.find_communities(engine, repo_id, max_results, members_per_community)
+
+    @server.tool(annotations=_READ_ONLY)
+    def key_nodes(
+        repo_id: str,
+        metric: str = "pagerank",
+        max_results: int = 10,
+    ) -> dict[str, Any]:
+        """Rank the repository's entities by PageRank over dependency edges (the core
+        abstractions everything leans on) or by betweenness (bridges between subsystems,
+        where a change ripples furthest); returns {count, results, truncated} of
+        {name, labels, file, score, community}. metric is pagerank or betweenness.
+        Errors if graph insights have never been computed for the repository."""
+        return devgraph_tools.key_nodes(engine, repo_id, metric, max_results)
 
     @server.tool(annotations=_READ_ONLY)
     def list_recent_changes(

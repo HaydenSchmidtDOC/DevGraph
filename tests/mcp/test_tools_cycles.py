@@ -383,11 +383,11 @@ class TestServerRegistration:
         monkeypatch.setattr(mcp_server, "get_settings", lambda: fake)
         return mcp_server.build_server(_StubEngine(), _StubRegistry())
 
-    def test_the_tool_is_registered_as_the_twenty_second_tool(self, server):
+    def test_the_tool_is_registered(self, server):
         tools = asyncio.run(server.list_tools())
         names = {t.name for t in tools}
 
-        assert len(tools) == 22
+        assert len(tools) == 24
         assert "find_dependency_cycles" in names
 
     def test_every_registered_tool_still_carries_the_read_only_annotation(self, server):
