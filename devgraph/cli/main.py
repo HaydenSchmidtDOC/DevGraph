@@ -1452,6 +1452,38 @@ def config_settings(
     _show_settings(key, show_defaults, as_json)
 
 
+def _repo_dir(repo: Path) -> Path:
+    """`--repo` as an absolute directory, or exit 1 with a plain message."""
+    root = repo.expanduser().resolve()
+    if not root.is_dir():
+        console.print(f"[red][X] Error:[/red] {root} is not a directory")
+        raise typer.Exit(code=1)
+    return root
+
+
+@config_app.command("eject")
+def config_eject(
+    repo: Path = typer.Option(Path("."), "--repo", help="Repository root (default: current directory)."),
+) -> None:
+    """Write a commented starter devgraph.schema.yaml. Never overwrites an existing file."""
+    from devgraph.config.project_schema import project_schema_path, starter_schema_text
+
+    path = project_schema_path(_repo_dir(repo))
+    try:
+        # Exclusive create: also refuses a symlink or a file that appeared
+        # after any check we could have made.
+        with open(path, "x", encoding="utf-8") as handle:
+            handle.write(starter_schema_text())
+    except FileExistsError:
+        console.print(
+            f"[red][X] Error:[/red] {path} already exists; eject never overwrites a "
+            f"project schema. Edit it, or move it aside and eject again."
+        )
+        raise typer.Exit(code=1)
+    console.print(f"[green][OK][/green] Wrote {path}")
+    console.print("  Edit it, then run `devgraph config validate` and `devgraph rescan <repo_id>`.")
+
+
 @app.command()
 def logs(
     lines: int = typer.Option(
