@@ -51,7 +51,7 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 | Check installation and graph health | `devgraph status`, `devgraph doctor`, `devgraph self-test [repo_id]` |
 | Open the dashboard | `devgraph dashboard` |
 | Configure an MCP client | `devgraph client-config`, `devgraph mcp add`, `devgraph mcp doctor` |
-| View configuration or tray logs | `devgraph config`, `devgraph logs` |
+| View settings, project schema, or tray logs | `devgraph config`, `devgraph config show / validate / eject`, `devgraph logs` |
 | Export a repository graph | `devgraph export <repo_id> --format json|cypher|dot` |
 | Update DevGraph | `devgraph update` |
 
@@ -73,6 +73,8 @@ A repository may declare extra node types in an optional `devgraph.schema.yaml` 
 - DevGraph's built-in constraints are always provisioned, including under `extends: none`, because every registered repository shares one Neo4j database.
 - An invalid file fails before any graph write: `devgraph rescan` exits non-zero, while registration keeps the repository and reports a warning, the same way it already does when Neo4j is unreachable.
 - `devgraph doctor` reports each repository's schema as absent, valid, or invalid, and flags two repositories that declare the same label with incompatible keys — a conflict that would otherwise leave one of them with no constraint at all.
+- `devgraph config validate` checks the file (or every registered repository's with `--all`) and exits non-zero on an invalid schema or a cross-repository conflict; `devgraph config show` prints the effective schema and where each entry comes from; `devgraph config eject` writes a commented starter file and never overwrites an existing one.
+- `devgraph config` alone still shows DevGraph's settings; a single setting is now `devgraph config settings <key>`, and secret settings are masked.
 
 ## Dashboard
 
