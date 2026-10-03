@@ -6,9 +6,11 @@ since this is a second entry point into the same engine/registry the tray
 already owns (see Implementation Plan #5's "Data comes from GraphEngine
 directly" decision).
 
-Read-only apart from two writes: the canvas layout (`PUT .../layout`) and
-repository registration (`POST /repos`), which is the same add-then-initial-
-scan sequence `devgraph add <path>` runs, against the same services.
+Read-only apart from three writes: the canvas layout (`PUT .../layout`),
+repository registration (`POST /repos`) which is the same add-then-initial-
+scan sequence `devgraph add <path>` runs against the same services, and
+recomputing graph insights (`POST .../insights`), which replaces only derived
+properties.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+from devgraph.analytics.insights import read_insights, refresh_insights, top_nodes
 from devgraph.config.settings import get_settings
 from devgraph.dashboard import queries
 from devgraph.dashboard.events import EventBroadcaster
@@ -50,6 +53,9 @@ _GRAPH_LIMIT_CEILING = 2000
 # can't write an unbounded file to disk.
 _LAYOUT_PAYLOAD_LIMIT_BYTES = _GRAPH_LIMIT_CEILING * 1024
 _SSE_KEEPALIVE_S = 15
+# How much of the graph-insights summary the Community card shows.
+_INSIGHT_COMMUNITY_LIMIT = 8
+_INSIGHT_LIST_LIMIT = 6
 
 # Fixed, parameterless query behind `GET /database-stats`. The JVM's own
 # java.lang:type=Memory MBean is the one heap source available on a stock
@@ -311,6 +317,48 @@ def build_router(
                 for e in edges
             ],
         }
+
+    def _insights_payload(repo_id: str) -> dict[str, Any]:
+        summary = read_insights(engine, repo_id)
+        if summary is None:
+            return {"computed": False}
+        return {
+            "computed": True,
+            "computed_at": summary.get("computed_at"),
+            "node_count": summary.get("node_count"),
+            "community_count": summary.get("community_count"),
+            "modularity": summary.get("modularity"),
+            "communities": summary["communities"][:_INSIGHT_COMMUNITY_LIMIT],
+            "key_nodes": top_nodes(engine, repo_id, "pagerank", _INSIGHT_LIST_LIMIT),
+            "bridges": top_nodes(engine, repo_id, "betweenness", _INSIGHT_LIST_LIMIT),
+        }
+
+    @router.get("/repos/{repo_id}/insights")
+    def repo_insights(repo_id: str) -> dict[str, Any]:
+        _require_repo(repo_id)
+        try:
+            return _insights_payload(repo_id)
+        except Exception as exc:  # neo4j driver raises its own exception hierarchy
+            logger.debug("graph insights unavailable for %s: %s", repo_id, exc)
+            raise HTTPException(status_code=503, detail="graph unavailable") from exc
+
+    @router.post("/repos/{repo_id}/insights")
+    async def recompute_repo_insights(request: Request, repo_id: str) -> dict[str, Any]:
+        """Recompute now. The only other write the dashboard makes besides the
+        layout and registration, and it only replaces derived properties."""
+        _reject_cross_site(request)
+        _require_repo(repo_id)
+        try:
+            summary = await run_in_threadpool(refresh_insights, engine, repo_id, blocking=False)
+            if summary is None:
+                raise HTTPException(status_code=409, detail="insights are already being computed for this repository")
+            events.publish({"type": "insights_refreshed", "repo_id": repo_id})
+            return await run_in_threadpool(_insights_payload, repo_id)
+        except HTTPException:
+            raise
+        except Exception as exc:  # neo4j driver raises its own exception hierarchy
+            logger.warning("graph insights recompute failed for %s", repo_id, exc_info=True)
+            raise HTTPException(status_code=503, detail="graph unavailable") from exc
 
     @router.get("/repos/{repo_id}/search")
     def repo_search(repo_id: str, q: str, max_results: int = 15) -> dict[str, Any]:
