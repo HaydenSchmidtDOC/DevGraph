@@ -121,3 +121,23 @@ def test_betweenness_is_sampled_only_above_256_nodes(monkeypatch):
     compute_insights(*chain(10))
     compute_insights(*chain(300))
     assert seen == [None, 256]
+
+
+def test_non_blocking_refresh_skips_while_a_run_holds_the_repo_lock():
+    class NeverCalled:
+        def load_insight_graph(self, *args):
+            raise AssertionError("must not load while another run holds the lock")
+
+    lock = insights._repo_lock("busy-repo")
+    with lock:
+        assert insights.refresh_insights(NeverCalled(), "busy-repo", blocking=False) is None
+    assert insights._repo_lock("busy-repo") is lock
+
+
+def test_read_insights_tolerates_a_corrupt_communities_value():
+    class Stub:
+        def read_insights_summary(self, repo_id):
+            return {"computed_at": "2026-01-01T00:00:00+00:00", "node_count": 1, "community_count": 1,
+                    "modularity": 0.0, "communities": "{not json"}
+
+    assert insights.read_insights(Stub(), "r")["communities"] == []

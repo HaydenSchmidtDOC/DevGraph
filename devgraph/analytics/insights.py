@@ -12,12 +12,18 @@ process already read.
 
 from __future__ import annotations
 
+import json
+import logging
 import posixpath
+import threading
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import networkx as nx
+
+logger = logging.getLogger(__name__)
 
 # Edges that mean "A depends on B", directed as stored: A CALLS B gives B
 # importance. The cycle finder's dependency set plus IMPLEMENTS (an
@@ -141,3 +147,94 @@ def compute_insights(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -
         for nid in scored
     ]
     return InsightResult(node_rows, communities, modularity, len(scored))
+
+
+# ── storage ──────────────────────────────────────────────────────────────
+
+# The Repository node keeps the largest communities for listing; every node
+# still carries its own community number.
+_MAX_STORED_COMMUNITIES = 50
+
+INSIGHT_METRICS: dict[str, str] = {"pagerank": "insight_pagerank", "betweenness": "insight_betweenness"}
+
+_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _repo_lock(repo_id: str) -> threading.Lock:
+    with _locks_guard:
+        return _locks.setdefault(repo_id, threading.Lock())
+
+
+def refresh_insights(engine: Any, repo_id: str, *, blocking: bool = True) -> dict[str, Any] | None:
+    """Load, compute and store one repository's insights.
+
+    Serialized per repository within this process (the agent's scheduler and
+    the dashboard share one). With `blocking=False`, returns None instead of
+    waiting when a run is already in progress.
+    """
+    lock = _repo_lock(repo_id)
+    if not lock.acquire(blocking=blocking):
+        return None
+    try:
+        nodes, edges = engine.load_insight_graph(repo_id, COMMUNITY_RELATIONSHIPS)
+        result = compute_insights(nodes, edges)
+        stored = result.communities[:_MAX_STORED_COMMUNITIES]
+        summary = {
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+            "node_count": result.node_count,
+            "community_count": len(result.communities),
+            "modularity": result.modularity,
+            "communities": json.dumps(stored),
+        }
+        engine.write_insights(repo_id, result.node_rows, summary)
+        logger.info(
+            "graph insights for %s: %d communities over %d nodes", repo_id, len(result.communities), result.node_count
+        )
+        return {**summary, "communities": stored}
+    finally:
+        lock.release()
+
+
+def read_insights(engine: Any, repo_id: str) -> dict[str, Any] | None:
+    """The stored summary with `communities` decoded, or None if never computed."""
+    raw = engine.read_insights_summary(repo_id)
+    if raw is None:
+        return None
+    try:
+        communities = json.loads(raw.get("communities") or "[]")
+    except ValueError:
+        communities = []
+    if not isinstance(communities, list):
+        communities = []
+    return {**raw, "communities": communities}
+
+
+def top_nodes(engine: Any, repo_id: str, metric: str, limit: int) -> list[dict[str, Any]]:
+    """Highest-scoring nodes for one of INSIGHT_METRICS (validated by callers).
+
+    The property name comes from the INSIGHT_METRICS allow-list, never from
+    caller input, so it is the only thing interpolated into the query.
+    """
+    prop = INSIGHT_METRICS[metric]
+    return engine.run_cypher(
+        f"MATCH (n {{repo_id: $repo_id}}) WHERE n.{prop} IS NOT NULL "
+        f"RETURN n.name AS name, labels(n) AS labels, n.file AS file, n.{prop} AS score, "
+        f"n.insight_community AS community ORDER BY score DESC, name LIMIT $limit",
+        {"repo_id": repo_id, "limit": limit},
+    )
+
+
+def community_members(
+    engine: Any, repo_id: str, communities: list[int], per_community: int
+) -> dict[int, list[dict[str, Any]]]:
+    """Each community's top members by PageRank (containers without a score last)."""
+    rows = engine.run_cypher(
+        "MATCH (n {repo_id: $repo_id}) WHERE n.insight_community IN $communities "
+        "WITH n ORDER BY coalesce(n.insight_pagerank, -1.0) DESC, n.name "
+        "WITH n.insight_community AS community, "
+        "collect({name: n.name, labels: labels(n), file: n.file, pagerank: n.insight_pagerank})[..$k] AS members "
+        "RETURN community, members",
+        {"repo_id": repo_id, "communities": communities, "k": per_community},
+    )
+    return {row["community"]: row["members"] for row in rows}
