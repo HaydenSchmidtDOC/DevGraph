@@ -16,6 +16,7 @@ from typing import Any, Optional
 import typer
 from rich.console import Console
 from rich.table import Table
+from typer.core import TyperGroup
 
 from devgraph.agent import lifecycle
 from devgraph.cli._env import resolve_podman, resolve_repo_root, resolve_venv_python
@@ -1359,58 +1360,96 @@ def update(
     console.print("[green]Update complete.[/green]")
 
 
-@app.command()
-def config(
-    key: Optional[str] = typer.Argument(
-        None, help="Setting key to show (e.g. 'neo4j_uri'). Omit to show all."
-    ),
-    show_defaults: bool = typer.Option(
-        False, "--show-defaults", help="Also show the default value for each setting."
-    ),
-    as_json: bool = typer.Option(
-        False, "--json", help="Output as JSON."
-    ),
-) -> None:
-    """View or validate the current DevGraph configuration."""
+class _ConfigGroup(TyperGroup):
+    """`devgraph config` once took a setting name positionally; point that
+    old form at `config settings` instead of a bare "No such command"."""
+
+    def resolve_command(self, ctx: typer.Context, args: list[str]):  # type: ignore[override]
+        if args and args[0] not in self.commands and not args[0].startswith("-"):
+            from devgraph.config.settings import Settings
+
+            if args[0] in Settings.model_fields:
+                raise typer.BadParameter(
+                    f"'{args[0]}' is a setting, not a subcommand: use "
+                    f"`devgraph config settings {args[0]}`",
+                    ctx=ctx,
+                )
+        return super().resolve_command(ctx, args)
+
+
+config_app = typer.Typer(
+    cls=_ConfigGroup,
+    invoke_without_command=True,
+    help="View DevGraph settings, or inspect and scaffold a repository's devgraph.schema.yaml.",
+)
+app.add_typer(config_app, name="config")
+
+# Substrings that mark a setting as secret: masked wherever settings are shown.
+_SECRET_MARKERS = ("password", "secret", "token")
+
+
+def _is_secret_setting(name: str) -> bool:
+    return any(marker in name.lower() for marker in _SECRET_MARKERS)
+
+
+def _shown_value(name: str, value: Any) -> Any:
+    if _is_secret_setting(name):
+        return "****" if value else "(empty)"
+    return value
+
+
+def _show_settings(key: str | None, show_defaults: bool, as_json: bool) -> None:
+    """The settings view behind `devgraph config` and `devgraph config settings`."""
     settings = get_settings()
 
-    # Build a list of (field_name, value, default) tuples
     fields: list[tuple[str, Any, Any]] = []
     for field_name in settings.model_fields:
         field_info = settings.model_fields[field_name]
-        value = getattr(settings, field_name)
-        default = field_info.default
-        fields.append((field_name, value, default))
+        fields.append((field_name, getattr(settings, field_name), field_info.default))
 
     if key:
-        matched = [(n, v, d) for n, v, d in fields if n == key]
-        if not matched:
+        fields = [(n, v, d) for n, v, d in fields if n == key]
+        if not fields:
             console.print(f"[red][X] Unknown setting:[/red] {key}")
             raise typer.Exit(code=1)
-        fields = matched
-
-    # Mask passwords
-    def _display_value(v: Any) -> str:
-        if isinstance(v, str) and any(kw in (key or "").lower() or kw in str(key).lower() for kw in ("password", "secret", "token")):
-            return "****" if v else "(empty)"
-        return str(v)
 
     if as_json:
-        data = {n: getattr(settings, n) for n, _, _ in fields}
+        data = {n: _shown_value(n, v) for n, v, _ in fields}
         console.print_json(json.dumps(data, default=str))
-    else:
-        table = Table(title="DevGraph Configuration")
-        table.add_column("Key", style="cyan")
-        table.add_column("Value", style="green")
+        return
+
+    table = Table(title="DevGraph Configuration")
+    table.add_column("Key", style="cyan")
+    table.add_column("Value", style="green")
+    if show_defaults:
+        table.add_column("Default", style="yellow")
+    for field_name, value, default in fields:
+        row = [field_name, str(_shown_value(field_name, value))]
         if show_defaults:
-            table.add_column("Default", style="yellow")
-        for field_name, value, default in fields:
-            display = _display_value(value)
-            if show_defaults:
-                table.add_row(field_name, display, str(default))
-            else:
-                table.add_row(field_name, display)
-        console.print(table)
+            row.append(str(_shown_value(field_name, default)))
+        table.add_row(*row)
+    console.print(table)
+
+
+@config_app.callback()
+def config(
+    ctx: typer.Context,
+    show_defaults: bool = typer.Option(False, "--show-defaults", help="Also show the default value for each setting."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """With no subcommand, show DevGraph's settings (same as `config settings`)."""
+    if ctx.invoked_subcommand is None:
+        _show_settings(None, show_defaults, as_json)
+
+
+@config_app.command("settings")
+def config_settings(
+    key: Optional[str] = typer.Argument(None, help="Setting key to show (e.g. 'neo4j_uri'). Omit to show all."),
+    show_defaults: bool = typer.Option(False, "--show-defaults", help="Also show the default value for each setting."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Show DevGraph's settings, or one setting. Secrets are masked."""
+    _show_settings(key, show_defaults, as_json)
 
 
 @app.command()
