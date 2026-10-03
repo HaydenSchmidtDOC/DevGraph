@@ -1484,6 +1484,131 @@ def config_eject(
     console.print("  Edit it, then run `devgraph config validate` and `devgraph rescan <repo_id>`.")
 
 
+def _schema_report(repo_root: Path | None) -> dict[str, Any]:
+    """The effective schema and where each entry comes from.
+
+    `repo_root=None` reports the built-in schema alone. Raises
+    ProjectSchemaError for an unreadable or invalid project file.
+    """
+    from devgraph.config.project_schema import (
+        SCHEMA_FILENAME,
+        load_project_schema,
+        project_schema_path,
+        resolve_declaration,
+    )
+    from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+
+    declaration = None if repo_root is None else load_project_schema(repo_root)
+    origin = None if repo_root is None else str(project_schema_path(repo_root))
+    effective = resolve_declaration(declaration, origin=origin or SCHEMA_FILENAME)
+    inherits = effective.extends == "default"
+
+    node_types: list[dict[str, Any]] = [
+        {"label": label, "origin": "built-in", "key": None} for label in (NODE_LABELS if inherits else ())
+    ]
+    node_types += [
+        {"label": n.label, "origin": SCHEMA_FILENAME, "key": list(n.key)} for n in effective.node_types
+    ]
+    relationships: list[dict[str, Any]] = [
+        {"type": rel, "origin": "built-in", "from": None, "to": None, "provider": "builtin"}
+        for rel in (RELATIONSHIP_TYPES if inherits else ())
+    ]
+    relationships += [
+        {"type": r.type, "origin": SCHEMA_FILENAME, "from": r.from_, "to": r.to, "provider": r.provider}
+        for r in effective.relationships
+    ]
+    if repo_root is None:
+        status = "global"
+    else:
+        status = "absent" if declaration is None else "valid"
+    return {
+        "repo": None if repo_root is None else str(repo_root),
+        "schema_file": origin if declaration is not None else None,
+        "status": status,
+        "extends": effective.extends,
+        "node_types": node_types,
+        "relationships": relationships,
+    }
+
+
+@config_app.command("show")
+def config_show(
+    repo: Path = typer.Option(Path("."), "--repo", help="Repository root (default: current directory)."),
+    global_only: bool = typer.Option(False, "--global", help="Show only DevGraph's built-in schema."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Show the effective graph schema for a repository and where each entry comes from."""
+    from devgraph.config.project_schema import SCHEMA_FILENAME, ProjectSchemaError
+
+    root = None if global_only else _repo_dir(repo)
+    try:
+        report = _schema_report(root)
+    except ProjectSchemaError as exc:
+        console.print(f"[red][X] Invalid project schema:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    if as_json:
+        typer.echo(json.dumps(report, indent=2))
+        return
+
+    if report["status"] == "global":
+        console.print("Built-in schema (no global config file yet)")
+    elif report["status"] == "absent":
+        console.print(f"{report['repo']}: no {SCHEMA_FILENAME} — built-in schema")
+    else:
+        console.print(f"{report['repo']}: {report['schema_file']} (valid, extends: {report['extends']})")
+
+    nodes = Table(title="Node types")
+    nodes.add_column("Label", style="cyan")
+    nodes.add_column("Origin")
+    nodes.add_column("Key")
+    for node in report["node_types"]:
+        nodes.add_row(node["label"], node["origin"], ", ".join(node["key"]) if node["key"] else "—")
+    console.print(nodes)
+
+    rels = Table(title="Relationships")
+    rels.add_column("Type", style="cyan")
+    rels.add_column("From")
+    rels.add_column("To")
+    rels.add_column("Provider")
+    rels.add_column("Origin")
+    for rel in report["relationships"]:
+        rels.add_row(rel["type"], rel["from"] or "any", rel["to"] or "any", rel["provider"], rel["origin"])
+    console.print(rels)
+
+
+@config_app.command("validate")
+def config_validate(
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    all_repos: bool = typer.Option(False, "--all", help="Check every registered repository, and conflicts between them."),
+) -> None:
+    """Fail-closed check of devgraph.schema.yaml. Exits 1 if anything is invalid or conflicting."""
+    from types import SimpleNamespace
+
+    if all_repos and repo is not None:
+        raise typer.BadParameter("use either --repo or --all, not both")
+    if all_repos:
+        registry = _get_registry()
+        try:
+            repos = registry.list_repos()
+        finally:
+            registry.close()
+        if not repos:
+            console.print("No registered repositories.")
+            return
+    else:
+        root = _repo_dir(repo or Path("."))
+        repos = [SimpleNamespace(repo_id=str(root), path=root)]
+
+    findings = _project_schema_findings(repos)
+    for finding in findings:
+        colour = "red" if finding["failed"] else "green"
+        subject = finding["repo_id"] or "cross-repository"
+        console.print(f"[{colour}]{finding['status']}[/{colour}] {subject}: {finding['detail']}")
+    if any(finding["failed"] for finding in findings):
+        raise typer.Exit(code=1)
+
+
 @app.command()
 def logs(
     lines: int = typer.Option(

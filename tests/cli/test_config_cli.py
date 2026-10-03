@@ -1,13 +1,18 @@
 """`devgraph config` group: settings view, schema show/validate, eject."""
 
 import json
+import subprocess
+import textwrap
 
 import pytest
 from typer.testing import CliRunner
 
 from devgraph.cli import main as cli_main
 from devgraph.cli.main import app
+from devgraph.config.project_schema import SCHEMA_FILENAME, load_project_schema, starter_schema_text
 from devgraph.config.settings import Settings
+from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+from devgraph.registry.store import RepoRegistry
 
 
 @pytest.fixture
@@ -88,9 +93,6 @@ def test_group_help_lists_the_subcommands(runner, settings):
 
 # ── eject ─────────────────────────────────────────────────────────────────
 
-from devgraph.config.project_schema import SCHEMA_FILENAME, load_project_schema, starter_schema_text
-from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
-
 
 def uncommented_example(text):
     """The starter with its commented example switched on: every line after
@@ -151,3 +153,126 @@ def test_eject_needs_an_existing_directory(runner, settings, tmp_path, make):
     result = runner.invoke(app, ["config", "eject", "--repo", str(repo)])
     assert result.exit_code == 1 and "not a directory" in result.output
     assert "Traceback" not in result.output
+
+
+# ── show / validate ───────────────────────────────────────────────────────
+
+WIDGET = """
+    version: 1
+    node_types:
+      - label: Widget
+        key: [slug]
+        metadata: [{name: slug}]
+    relationships:
+      - type: LINKS
+        provider: custom
+        custom: {name: linker}
+        from: Widget
+        to: Module
+"""
+WIDGET_ONLY = """
+    version: 1
+    extends: none
+    node_types:
+      - label: Widget
+        key: [slug]
+        metadata: [{name: slug}]
+"""
+
+
+def write(repo, text):
+    (repo / SCHEMA_FILENAME).write_text(textwrap.dedent(text))
+    return repo
+
+
+def show_json(runner, *args):
+    result = runner.invoke(app, ["config", "show", "--json", *args])
+    assert result.exit_code == 0, result.output
+    return json.loads(result.stdout)
+
+
+def test_show_without_a_file_is_the_builtin_schema(runner, settings, tmp_path):
+    data = show_json(runner, "--repo", str(tmp_path))
+    assert data["status"] == "absent" and data["extends"] == "default"
+    assert [n["label"] for n in data["node_types"]] == list(NODE_LABELS)
+    assert {n["origin"] for n in data["node_types"]} == {"built-in"}
+    assert [r["type"] for r in data["relationships"]] == list(RELATIONSHIP_TYPES)
+
+
+def test_show_marks_where_each_entry_comes_from(runner, settings, tmp_path):
+    data = show_json(runner, "--repo", str(write(tmp_path, WIDGET)))
+    assert data["status"] == "valid" and data["schema_file"].endswith(SCHEMA_FILENAME)
+    widget = next(n for n in data["node_types"] if n["label"] == "Widget")
+    assert widget == {"label": "Widget", "origin": SCHEMA_FILENAME, "key": ["slug"]}
+    links = next(r for r in data["relationships"] if r["type"] == "LINKS")
+    assert links == {"type": "LINKS", "origin": SCHEMA_FILENAME, "from": "Widget", "to": "Module", "provider": "custom"}
+    module = next(n for n in data["node_types"] if n["label"] == "Module")
+    assert module == {"label": "Module", "origin": "built-in", "key": None}
+
+
+def test_show_with_extends_none_has_no_builtins(runner, settings, tmp_path):
+    data = show_json(runner, "--repo", str(write(tmp_path, WIDGET_ONLY)))
+    assert data["extends"] == "none"
+    assert [n["label"] for n in data["node_types"]] == ["Widget"]
+    assert data["relationships"] == []
+
+
+def test_show_global_ignores_the_repo_file(runner, settings, tmp_path):
+    data = show_json(runner, "--global", "--repo", str(write(tmp_path, WIDGET)))
+    assert data["status"] == "global" and data["schema_file"] is None
+    assert "Widget" not in [n["label"] for n in data["node_types"]]
+
+
+def test_show_human_output_names_the_file_and_origins(runner, settings, tmp_path):
+    result = runner.invoke(app, ["config", "show", "--repo", str(write(tmp_path, WIDGET))])
+    assert result.exit_code == 0, result.output
+    assert "Widget" in result.output and "built-in" in result.output and SCHEMA_FILENAME in result.output
+
+
+def test_show_reports_an_invalid_schema(runner, settings, tmp_path):
+    write(tmp_path, "version: 1\nnode_types: [oops\n")
+    result = runner.invoke(app, ["config", "show", "--repo", str(tmp_path)])
+    assert result.exit_code == 1 and "malformed YAML" in result.output
+
+
+def test_show_needs_a_directory(runner, settings, tmp_path):
+    result = runner.invoke(app, ["config", "show", "--repo", str(tmp_path / "missing")])
+    assert result.exit_code == 1 and "not a directory" in result.output
+
+
+def test_validate_one_repo(runner, settings, tmp_path):
+    absent = runner.invoke(app, ["config", "validate", "--repo", str(tmp_path)])
+    assert absent.exit_code == 0 and "absent" in absent.output
+    valid = runner.invoke(app, ["config", "validate", "--repo", str(write(tmp_path, WIDGET))])
+    assert valid.exit_code == 0 and "valid" in valid.output
+    write(tmp_path, "version: 2\n")
+    invalid = runner.invoke(app, ["config", "validate", "--repo", str(tmp_path)])
+    assert invalid.exit_code == 1 and "invalid" in invalid.output
+
+
+def test_validate_all_checks_every_registered_repo_and_conflicts(runner, settings, tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    for d in (a, b):
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+    write(a, WIDGET)
+    write(b, WIDGET.replace("key: [slug]", "key: [code]").replace("{name: slug}", "{name: code}"))
+    registry = RepoRegistry(settings.registry_db_path)
+    try:
+        registry.add_repo(a, repo_id="repo-a")
+        registry.add_repo(b, repo_id="repo-b")
+    finally:
+        registry.close()
+    result = runner.invoke(app, ["config", "validate", "--all"])
+    assert result.exit_code == 1, result.output
+    assert "repo-a" in result.output and "repo-b" in result.output and "conflict" in result.output
+
+
+def test_validate_all_with_no_repos(runner, settings):
+    result = runner.invoke(app, ["config", "validate", "--all"])
+    assert result.exit_code == 0 and "No registered repositories" in result.output
+
+
+def test_validate_rejects_repo_and_all_together(runner, settings, tmp_path):
+    result = runner.invoke(app, ["config", "validate", "--all", "--repo", str(tmp_path)])
+    assert result.exit_code == 2
