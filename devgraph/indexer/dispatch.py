@@ -19,8 +19,8 @@ import logging
 from pathlib import Path
 
 from devgraph.config import get_settings
-from devgraph.config.project_schema import ProjectSchemaError
-from devgraph.graph.engine import GraphEngine
+from devgraph.config.project_schema import ProjectSchemaError, project_schema_path
+from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.containers.extractor import ContainerExtractor
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
@@ -92,8 +92,12 @@ IGNORED_DIR_NAMES = {
 _JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
 
 
+def is_ignored_dir_name(name: str) -> bool:
+    return name in IGNORED_DIR_NAMES or name.endswith(".egg-info")
+
+
 def is_ignored_path(path: Path) -> bool:
-    return any(part in IGNORED_DIR_NAMES or part.endswith(".egg-info") for part in path.parts)
+    return any(is_ignored_dir_name(part) for part in path.parts)
 
 
 def _filesystem_spec(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | None]:
@@ -104,6 +108,45 @@ def _filesystem_spec(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec |
     except ProjectSchemaError as exc:
         logger.warning("project schema for %s is invalid; filesystem provider skipped: %s", repo_root, exc)
         return False, None
+
+
+def _touches_schema_file(repo_root: Path, paths: set[Path]) -> bool:
+    schema = project_schema_path(repo_root)
+    try:
+        schema = schema.resolve()
+    except OSError:
+        pass
+    for p in paths:
+        try:
+            if Path(p).resolve() == schema:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _resync_filesystem_provider(engine: GraphEngine, repo_id: str, repo_root: Path) -> None:
+    """Re-provision and fully re-sync the filesystem provider after the schema file changed.
+
+    Per-file provider writes would build a partial graph (and leave nodes of a
+    renamed label behind), so a schema change is handled as a provider-only
+    rescan instead: provision constraints/indexes, prune what the new schema
+    and disk no longer produce, and upsert everything present. A deleted
+    schema resolves to no spec, which prunes every filesystem node. Built-in
+    extractors are not re-run. An invalid schema leaves the graph alone.
+    """
+    ok, spec = _filesystem_spec(repo_root)
+    if not ok:
+        return
+    try:
+        provision_repository_schema(engine, repo_root)
+    except Exception as exc:
+        logger.warning("could not provision the project schema for %s; filesystem provider skipped: %s", repo_root, exc)
+        return
+    on_disk = {rel for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
+    filesystem.reconcile(engine, repo_id, spec, on_disk)
+    if spec is not None:
+        filesystem.sync_present(engine, repo_id, spec, on_disk)
 
 
 def _repo_relative(repo_root: Path, path: Path) -> str | None:
@@ -120,7 +163,7 @@ def _is_provider_file(repo_root: Path, path: Path) -> bool:
     return rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel))
 
 
-def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None, mentions_enabled: bool = False) -> int:
+def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None, mentions_enabled: bool = False, resync_on_schema_change: bool = True) -> int:
     """Index a set of changed files, routing each to its extractor by name/extension.
 
     Args:
@@ -134,6 +177,10 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             bug passing an unrelated path.
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
+        resync_on_schema_change: If `paths` includes the repo's schema file,
+            re-sync the filesystem provider as a whole instead of per file
+            (see `_resync_filesystem_provider`). `full_scan` turns this off
+            because it has already reconciled the provider.
 
     Returns:
         Number of files actually indexed (skipped/unrecognized files don't count).
@@ -282,6 +329,10 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         for rel_path, content in py_files:
             service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
         engine.upsert_relationships(service_rels)
+
+    if resync_on_schema_change and _touches_schema_file(repo_root, paths):
+        _resync_filesystem_provider(engine, repo_id, repo_root)
+        return indexed
 
     ok, spec = _filesystem_spec(repo_root)
     if ok and spec is not None:
@@ -570,12 +621,17 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             engine.delete_nodes_by_source_file(repo_id, module_name)
             cleaned += 1
 
+    if _touches_schema_file(repo_root, paths):
+        _resync_filesystem_provider(engine, repo_id, repo_root)
+        return cleaned
+
     ok, spec = _filesystem_spec(repo_root)
     if ok and spec is not None:
         gone = {rel for p in paths if (rel := _repo_relative(repo_root, Path(p))) is not None and rel != "."}
         filesystem.sync_absent(
             engine, repo_id, repo_root, spec, gone,
             is_indexable=lambda p: _is_provider_file(repo_root, p),
+            is_ignored_dir=is_ignored_dir_name,
         )
 
     return cleaned
@@ -647,7 +703,10 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
     if ok:
         on_disk = {rel for p in all_files if (rel := _repo_relative(repo_root, p)) is not None}
         filesystem.reconcile(engine, repo_id, spec, on_disk)
-    return index_paths(engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled)
+    return index_paths(
+        engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
+        resync_on_schema_change=False,  # reconciled just above
+    )
 
 
 def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> None:

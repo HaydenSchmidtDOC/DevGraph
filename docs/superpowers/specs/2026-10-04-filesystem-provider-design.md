@@ -52,6 +52,9 @@ relationships:
   "filesystem"`. Because `name` equals the declared key, the engine's existing
   `(repo_id, name)` MERGE behaves exactly as a merge on `(repo_id, path)`, and
   the `(repo_id, path)` uniqueness constraint #23 provisions always holds.
+  The provider writes by `name`, so each filesystem-sourced type also gets a
+  `(repo_id, name)` index (`<label>_repo_name`) provisioned with its
+  constraint; without it every MERGE/MATCH is a label scan across all repos.
   General declared-key MERGE is left for a later slice.
 - Edges: each file (if its label is in `from`) and each non-root folder (if
   its label is in `from`) to its parent folder.
@@ -89,9 +92,18 @@ signatures are unchanged.
 
 ## Known limits (documented)
 
-- A new or edited schema takes effect on the next `devgraph rescan`
+- While the agent runs, saving the schema re-syncs filesystem nodes
+  immediately: `index_paths`/`remove_paths` see the schema file in the batch
+  and, if it resolves, provision constraints/indexes and run a provider-only
+  reconcile plus full upsert (no built-in rescan). Otherwise a new or edited
+  schema applies on the next `devgraph rescan` or registration
   (hash-triggered rescans are the next slice). File edits update filesystem
   nodes live once the schema is in place.
+- A folder moved or trashed out of the repository as a whole may leave stale
+  nodes until `devgraph rescan` (the watcher ignores directory events);
+  `search_component` can return both a `Module` and a `File` for one path;
+  filesystem nodes share the unfiltered dashboard canvas; a symlinked file is
+  represented at its target's path.
 - The dashboard's `?label=` graph filter still only accepts built-in labels
   (UI slice).
 

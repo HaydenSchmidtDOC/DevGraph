@@ -1248,3 +1248,44 @@ def test_json_schema_describes_node_sources_and_list_from():
     assert "source" in defs["NodeTypeDecl"]["properties"]
     from_schema = defs["RelationshipDecl"]["properties"]["from"]
     assert {variant.get("type") for variant in from_schema["anyOf"]} == {"string", "array"}
+
+
+def test_filesystem_types_get_a_repo_name_index_beside_their_key_constraint(tmp_path):
+    effective = resolve_effective_schema(write_schema(tmp_path, WORKTREE))
+    statements = effective.constraint_statements()
+    builtin = constraint_statements()
+
+    assert statements[: len(builtin)] == builtin
+    assert statements[len(builtin) :] == [
+        "CREATE CONSTRAINT file_repo_key IF NOT EXISTS "
+        "FOR (n:File) REQUIRE (n.repo_id, n.path) IS UNIQUE",
+        "CREATE INDEX file_repo_name IF NOT EXISTS FOR (n:File) ON (n.repo_id, n.name)",
+        "CREATE CONSTRAINT folder_repo_key IF NOT EXISTS "
+        "FOR (n:Folder) REQUIRE (n.repo_id, n.path) IS UNIQUE",
+        "CREATE INDEX folder_repo_name IF NOT EXISTS FOR (n:Folder) ON (n.repo_id, n.name)",
+    ]
+
+
+def test_types_without_a_source_get_no_index(tmp_path):
+    effective = resolve_effective_schema(write_schema(tmp_path, WORKTREE))
+    plain = resolve_effective_schema(
+        write_schema(
+            tmp_path,
+            """
+            version: 1
+            node_types:
+              - label: Widget
+                key: [slug]
+                metadata: [{name: slug}]
+            """,
+        )
+    )
+
+    assert not any("CREATE INDEX" in s for s in plain.constraint_statements())
+    assert any("CREATE INDEX" in s for s in effective.constraint_statements())
+
+
+def test_a_generated_index_name_may_not_collide_with_an_existing_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(project_schema, "_builtin_constraint_names", lambda: {"file_repo_name"})
+    with pytest.raises(ProjectSchemaError, match="file_repo_name"):
+        resolve_effective_schema(write_schema(tmp_path, WORKTREE))

@@ -21,7 +21,7 @@
 - `extractor` is a reserved node property name.
 - An invalid schema never deletes or rewrites provider nodes: the provider is skipped (logged at warning) and built-in indexing proceeds.
 - Labels and relationship types reach Cypher only after the schema's identifier-pattern validation; paths are always parameters.
-- Commit messages: plain imperative summary; no `Co-Authored-By` trailer, no mention of Claude/the assistant. Never commit `uv.lock` (untracked), real names or personal paths.
+- Commit messages: plain imperative summary; no `Co-Authored-By` trailer, no AI attribution. Never commit `uv.lock` (untracked), real names or personal paths.
 
 ## Review Focus
 
@@ -1370,4 +1370,4 @@ gh pr create -R HaydenSchmidtDOC/DevGraph --base master --head <fork-owner>:feat
   --title "Index filesystem-sourced node types (worktree example)" --body-file <scratch>/pr-body.md
 ```
 
-Body: what changed (schema format, provider, dispatch hooks, engine methods, MCP search), backward compatibility evidence, known limits (rescan needed after schema edits; general declared-key MERGE, config CLI, tool plane, UI still open), validation, and `Part of #1.` No mention of Claude/the assistant.
+Body: what changed (schema format, provider, dispatch hooks, engine methods, MCP search), backward compatibility evidence, known limits (rescan needed after schema edits; general declared-key MERGE, config CLI, tool plane, UI still open), validation, and `Part of #1.` No AI attribution.

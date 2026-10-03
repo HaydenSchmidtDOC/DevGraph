@@ -86,7 +86,7 @@ def test_sync_absent_deletes_paths_then_folders_left_empty_on_disk(tmp_path):
     (tmp_path / "keep" / "x.py").write_text("")
     engine = Recorder()
     filesystem.sync_absent(engine, "demo", tmp_path, SPEC, {"gone/sub/y.py", "keep/z.py"},
-                           is_indexable=lambda p: p.is_file())
+                           is_indexable=lambda p: p.is_file(), is_ignored_dir=lambda name: False)
     assert engine.deleted[0] == ("demo", "filesystem", ["gone/sub/y.py", "keep/z.py"])
     # `gone` and `gone/sub` no longer hold any file; `keep` and the root still do.
     assert engine.deleted[1] == ("demo", "filesystem", ["gone", "gone/sub"])
@@ -95,8 +95,39 @@ def test_sync_absent_deletes_paths_then_folders_left_empty_on_disk(tmp_path):
 def test_sync_absent_without_a_folder_type_only_deletes_paths(tmp_path):
     engine = Recorder()
     filesystem.sync_absent(engine, "demo", tmp_path, FilesystemSpec("File", None, None, frozenset()),
-                           {"a/b.py"}, is_indexable=lambda p: p.is_file())
+                           {"a/b.py"}, is_indexable=lambda p: p.is_file(), is_ignored_dir=lambda name: False)
     assert engine.deleted == [("demo", "filesystem", ["a/b.py"])]
+
+
+def test_holding_check_never_walks_an_ignored_subtree(tmp_path):
+    (tmp_path / "pkg" / "node_modules" / "dep").mkdir(parents=True)
+    (tmp_path / "pkg" / "node_modules" / "dep" / "x.js").write_text("")
+    seen = []
+
+    def is_indexable(path):
+        seen.append(path)
+        return path.is_file()
+
+    held = filesystem._holds_indexable_file(
+        tmp_path / "pkg", is_indexable, lambda name: name == "node_modules"
+    )
+
+    assert held is False
+    assert not [p for p in seen if "node_modules" in p.parts]
+
+
+def test_holding_check_exits_early_on_the_first_indexable_file(tmp_path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text("")
+    (tmp_path / "pkg" / "b.py").write_text("")
+    seen = []
+
+    def is_indexable(path):
+        seen.append(path)
+        return True
+
+    assert filesystem._holds_indexable_file(tmp_path / "pkg", is_indexable, lambda name: False)
+    assert len(seen) == 1
 
 
 def test_reconcile_keeps_exactly_the_desired_nodes():

@@ -7,7 +7,6 @@ from pathlib import Path
 
 from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
-from devgraph.mcp import tools
 from devgraph.mcp.tools import declared_node_labels, search_component
 
 BUILTIN_PREDICATE = "(n:Service OR n:Module OR n:Class OR n:Function OR n:Endpoint)"

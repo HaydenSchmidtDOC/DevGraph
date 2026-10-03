@@ -88,6 +88,12 @@ PROPERTY_NAME_PATTERN = re.compile(rf"[a-z][a-z0-9_]{{0,{_BOUND}}}")
 #: suffixes, because a user key is not necessarily `name`.
 USER_CONSTRAINT_SUFFIX = "_repo_key"
 
+#: Suffix for the lookup index generated for a filesystem-sourced node type.
+#: The provider MERGEs and MATCHes on (repo_id, name) while the declared key
+#: constraint covers (repo_id, path), so without this every write is a label
+#: scan across all repositories. Indexes share a name space with constraints.
+FILESYSTEM_INDEX_SUFFIX = "_repo_name"
+
 _CONSTRAINT_NAME_PATTERN = re.compile(r"^(?:CREATE|DROP) CONSTRAINT (\w+) ")
 
 # Literal aliases are derived from the constants above rather than
@@ -434,12 +440,26 @@ class EffectiveSchema:
         statements = (
             list(builtin_constraint_statements()) if self.extends == "default" else []
         )
-        statements.extend(_user_constraint_statement(n) for n in self.node_types)
+        for node_type in self.node_types:
+            statements.append(_user_constraint_statement(node_type))
+            if node_type.source is not None:
+                statements.append(_filesystem_index_statement(node_type))
         return statements
 
 
 def _user_constraint_name(label: str) -> str:
     return f"{label.lower()}{USER_CONSTRAINT_SUFFIX}"
+
+
+def _filesystem_index_name(label: str) -> str:
+    return f"{label.lower()}{FILESYSTEM_INDEX_SUFFIX}"
+
+
+def _filesystem_index_statement(node_type: NodeTypeDecl) -> str:
+    return (
+        f"CREATE INDEX {_filesystem_index_name(node_type.label)} IF NOT EXISTS "
+        f"FOR (n:{node_type.label}) ON (n.repo_id, n.name)"
+    )
 
 
 def _user_constraint_statement(node_type: NodeTypeDecl) -> str:
@@ -571,6 +591,15 @@ def resolve_declaration(
                 f"lower-cased, so labels must not differ only by case"
             )
         used_names.add(name)
+        if node_type.source is not None:
+            index_name = _filesystem_index_name(node_type.label)
+            if index_name in used_names:
+                raise ProjectSchemaError(
+                    f"{origin}: node type {node_type.label!r} generates the index "
+                    f"name {index_name!r}, which is already in use; index and "
+                    f"constraint names share one name space"
+                )
+            used_names.add(index_name)
 
     return EffectiveSchema(
         extends=declaration.extends,

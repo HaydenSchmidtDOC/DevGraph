@@ -301,7 +301,8 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
         N commits repo-wide (requires git-history recency staging; entities never staged
         are excluded, not silently included).
         Also searches node types the repository's devgraph.schema.yaml declares (for
-        example File/Folder from the filesystem provider)."""
+        example File/Folder from the filesystem provider); with cross_repo=True only the
+        calling repository's declared labels are added."""
         return devgraph_tools.search_component(
             engine, repo_id, query, cross_repo, max_results, modified_within_commits,
             extra_labels=devgraph_tools.declared_node_labels(registry, repo_id),

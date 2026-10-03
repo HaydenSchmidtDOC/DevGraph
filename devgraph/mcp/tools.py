@@ -171,7 +171,8 @@ def search_component(
             If fewer than N commits exist repo-wide, no cutoff applies and this
             filter is a no-op.
         extra_labels: Schema-declared labels of this repository to search as well;
-            anything that isn't a valid label identifier is ignored.
+            anything that isn't a valid label identifier is ignored. With
+            cross_repo=True only the calling repository's declared labels are added.
 
     Returns:
         Dict with count, results, and truncated flag. Query is tokenized and

@@ -172,3 +172,83 @@ def test_without_a_schema_file_the_graph_is_unchanged(engine, repo, monkeypatch)
     monkeypatch.setattr(filesystem, "reconcile", lambda *a, **k: 0)
     scan(engine, repo)
     assert snapshot(engine) == with_provider
+
+
+def _plan_operators(plan):
+    ops = [plan["operatorType"]]
+    for child in plan.get("children", []):
+        ops += _plan_operators(child)
+    return ops
+
+
+def test_provider_writes_are_served_by_a_repo_name_index(engine, repo):
+    provision_repository_schema(engine, with_schema(repo))
+
+    for label in ("File", "Folder"):
+        with engine._driver.session() as session:
+            # A freshly created index is not planned against until it is online.
+            session.run("CALL db.awaitIndexes(60)").consume()
+            plan = session.run(
+                f"EXPLAIN MERGE (n:{label} {{repo_id: $r, name: $n}}) RETURN n", r=REPO, n="x"
+            ).consume().plan
+        operators = _plan_operators(plan)
+        assert any("IndexSeek" in op for op in operators), operators
+        assert not any("NodeByLabelScan" in op for op in operators), operators
+
+
+def _index_names(engine):
+    return {r["name"] for r in engine.run_cypher("SHOW INDEXES YIELD name RETURN name")}
+
+
+def test_saving_a_new_schema_syncs_the_whole_worktree(engine, repo):
+    scan(engine, repo)  # registered with no schema
+    assert fs_nodes(engine) == []
+    schema = with_schema(repo) / "devgraph.schema.yaml"
+
+    index_paths(engine, REPO, repo, {schema})  # the watcher's event for the save
+
+    assert fs_nodes(engine) == [
+        "File:README.md", "File:devgraph.schema.yaml", "File:pkg/mod.py", "File:pkg/sub/util.py",
+        "Folder:.", "Folder:pkg", "Folder:pkg/sub",
+    ]
+    assert {"file_repo_name", "folder_repo_name"} <= _index_names(engine)
+
+
+def test_renaming_a_label_in_the_schema_leaves_no_old_label_nodes(engine, repo):
+    scan(engine, with_schema(repo))
+    schema = repo / "devgraph.schema.yaml"
+    schema.write_text(textwrap.dedent(WORKTREE).replace("File", "Entry"))
+
+    index_paths(engine, REPO, repo, {schema})
+
+    nodes = fs_nodes(engine)
+    assert not [k for k in nodes if k.startswith("File:")]
+    assert "Entry:pkg/mod.py" in nodes and "Folder:pkg" in nodes
+    assert "pkg/mod.py>pkg" in fs_edges(engine)
+
+
+def test_deleting_the_schema_prunes_every_filesystem_node(engine, repo):
+    scan(engine, with_schema(repo))
+    schema = repo / "devgraph.schema.yaml"
+    schema.unlink()
+
+    remove_paths(engine, REPO, repo, {schema})
+
+    assert fs_nodes(engine) == []
+    modules = engine.run_cypher("MATCH (m:Module {repo_id: $r}) RETURN m.name AS n", {"r": REPO})
+    assert "pkg/mod.py" in {m["n"] for m in modules}  # built-in nodes untouched
+
+
+def test_moving_a_file_in_one_batch_keeps_only_the_destination(engine, repo):
+    scan(engine, with_schema(repo))
+    (repo / "lib").mkdir()
+    (repo / "pkg" / "mod.py").rename(repo / "lib" / "mod.py")
+
+    # The watcher's order: the destination is indexed, then the source removed.
+    index_paths(engine, REPO, repo, {repo / "lib" / "mod.py"})
+    remove_paths(engine, REPO, repo, {repo / "pkg" / "mod.py"})
+
+    nodes = fs_nodes(engine)
+    assert "File:lib/mod.py" in nodes and "Folder:lib" in nodes
+    assert "File:pkg/mod.py" not in nodes
+    assert "Folder:pkg" in nodes and "File:pkg/sub/util.py" in nodes

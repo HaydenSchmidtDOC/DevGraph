@@ -15,6 +15,7 @@ provenance properties, so this module alone decides when they go away.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -121,6 +122,7 @@ def sync_absent(
     spec: FilesystemSpec,
     paths: set[str],
     is_indexable: Callable[[Path], bool],
+    is_ignored_dir: Callable[[str], bool],
 ) -> None:
     """Remove nodes at (or below) deleted paths, then folders now empty on disk.
 
@@ -134,15 +136,22 @@ def sync_absent(
     if not spec.folder_label:
         return
     candidates = {folder for path in paths for folder in ancestors(path) if folder != ROOT_PATH}
-    dead = sorted(f for f in candidates if not _holds_indexable_file(repo_root / f, is_indexable))
+    dead = sorted(f for f in candidates if not _holds_indexable_file(repo_root / f, is_indexable, is_ignored_dir))
     if dead:
         engine.delete_extracted_nodes(repo_id, EXTRACTOR, dead)
 
 
-def _holds_indexable_file(folder: Path, is_indexable: Callable[[Path], bool]) -> bool:
+def _holds_indexable_file(
+    folder: Path, is_indexable: Callable[[Path], bool], is_ignored_dir: Callable[[str], bool]
+) -> bool:
+    """Whether any indexable file lives below `folder`, never descending into ignored directories."""
     if not folder.is_dir():
         return False
-    return any(is_indexable(p) for p in folder.rglob("*"))
+    for dirpath, dirnames, filenames in os.walk(folder):
+        dirnames[:] = [d for d in dirnames if not is_ignored_dir(d)]
+        if any(is_indexable(Path(dirpath) / name) for name in filenames):
+            return True
+    return False
 
 
 def reconcile(engine: Any, repo_id: str, spec: FilesystemSpec | None, files: set[str]) -> int:
