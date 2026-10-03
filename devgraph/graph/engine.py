@@ -73,6 +73,23 @@ _DELETE_STALE_FILE_NODES_CYPHER = (
     "DETACH DELETE n"
 )
 
+# Nodes a schema-declared provider owns (devgraph/indexer/providers/) are
+# tagged with `extractor` and keyed by repo-relative path in `name`; they
+# never carry `file`/`source_file`/`source`, so the built-in per-file cleanup
+# above never touches them and these two queries are their whole lifecycle.
+# A path deletes its own node and, as a directory, everything below it --
+# the trailing '/' keeps `src` from matching `src2/...`.
+_DELETE_EXTRACTED_PATHS_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
+    "AND (n.name IN $paths OR any(p IN $paths WHERE n.name STARTS WITH p + '/')) "
+    "DETACH DELETE n"
+)
+_PRUNE_EXTRACTED_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
+    "AND NOT (labels(n)[0] + ':' + n.name) IN $keep "
+    "DETACH DELETE n RETURN count(n) AS pruned"
+)
+
 # Transient Neo4j failures worth retrying: a connection blip, an expired
 # session, or a server-side transient error (e.g. a lock timeout). Permanent
 # errors (syntax, constraint violations, unknown labels) are NOT retried.
@@ -501,6 +518,28 @@ class GraphEngine:
         with self._driver.session() as session:
             _retry_transient(session.run, _DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
             _retry_transient(session.run, _UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name)
+
+    def delete_extracted_nodes(self, repo_id: str, extractor: str, paths: list[str]) -> None:
+        """Delete one provider's nodes at these repo-relative paths, or below them."""
+        if not paths:
+            return
+        with self._driver.session() as session:
+            _retry_transient(
+                session.run, _DELETE_EXTRACTED_PATHS_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
+            )
+
+    def prune_extracted_nodes(self, repo_id: str, extractor: str, keep: list[str]) -> int:
+        """Delete every node of one provider in a repo except `keep` ("Label:name").
+
+        The full-scan reconcile for provider-owned nodes: it also removes nodes
+        of a label the schema no longer declares.
+        """
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run, _PRUNE_EXTRACTED_CYPHER, repo_id=repo_id, extractor=extractor, keep=keep
+            )
+            records = [record.data() for record in result or []]
+        return records[0]["pruned"] if records else 0
 
     def list_indexed_files(self, repo_id: str) -> set[str]:
         """Return every repo-relative path that currently backs file-provenance
