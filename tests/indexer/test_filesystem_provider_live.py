@@ -7,7 +7,7 @@ import pytest
 
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer import dispatch
-from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
+from devgraph.indexer.dispatch import apply_project_schema, full_scan, index_paths, remove_paths, schema_pending
 from devgraph.indexer.providers import filesystem
 
 REPO = "_smoketest_fs_provider"
@@ -200,12 +200,17 @@ def _index_names(engine):
     return {r["name"] for r in engine.run_cypher("SHOW INDEXES YIELD name RETURN name")}
 
 
-def test_saving_a_new_schema_syncs_the_whole_worktree(engine, repo):
+def test_saving_a_new_schema_waits_to_be_applied_then_syncs_the_whole_worktree(engine, repo):
     scan(engine, repo)  # registered with no schema
     assert fs_nodes(engine) == []
     schema = with_schema(repo) / "devgraph.schema.yaml"
 
     index_paths(engine, REPO, repo, {schema})  # the watcher's event for the save
+
+    assert fs_nodes(engine) == []
+    assert schema_pending(engine, REPO, repo)
+
+    assert apply_project_schema(engine, REPO, repo)
 
     assert fs_nodes(engine) == [
         "File:README.md", "File:devgraph.schema.yaml", "File:pkg/mod.py", "File:pkg/sub/util.py",
@@ -214,12 +219,16 @@ def test_saving_a_new_schema_syncs_the_whole_worktree(engine, repo):
     assert {"file_repo_name", "folder_repo_name"} <= _index_names(engine)
 
 
-def test_renaming_a_label_in_the_schema_leaves_no_old_label_nodes(engine, repo):
+def test_renaming_a_label_in_the_schema_leaves_no_old_label_nodes_once_applied(engine, repo):
     scan(engine, with_schema(repo))
     schema = repo / "devgraph.schema.yaml"
     schema.write_text(textwrap.dedent(WORKTREE).replace("File", "Entry"))
+    before = fs_nodes(engine)
 
     index_paths(engine, REPO, repo, {schema})
+    assert fs_nodes(engine) == before  # pending: nothing changes
+
+    assert apply_project_schema(engine, REPO, repo)
 
     nodes = fs_nodes(engine)
     assert not [k for k in nodes if k.startswith("File:")]
@@ -227,12 +236,15 @@ def test_renaming_a_label_in_the_schema_leaves_no_old_label_nodes(engine, repo):
     assert "pkg/mod.py>pkg" in fs_edges(engine)
 
 
-def test_deleting_the_schema_prunes_every_filesystem_node(engine, repo):
+def test_deleting_the_schema_prunes_every_filesystem_node_once_applied(engine, repo):
     scan(engine, with_schema(repo))
     schema = repo / "devgraph.schema.yaml"
     schema.unlink()
 
     remove_paths(engine, REPO, repo, {schema})
+    assert fs_nodes(engine)  # pending: nodes still there
+
+    assert apply_project_schema(engine, REPO, repo)
 
     assert fs_nodes(engine) == []
     modules = engine.run_cypher("MATCH (m:Module {repo_id: $r}) RETURN m.name AS n", {"r": REPO})
