@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 from typer.core import TyperGroup
 
@@ -832,10 +833,10 @@ def doctor() -> None:
     for finding in schema_findings:
         subject = finding["repo_id"] or "conflict"
         if finding["failed"]:
-            console.print(f"  [red][X] {subject}:[/red] {finding['detail']}")
+            console.print(f"  [red][X] {escape(str(subject))}:[/red] {escape(finding['detail'])}")
             any_failed = True
         else:
-            console.print(f"  [green][OK][/green] {subject}: {finding['detail']}")
+            console.print(f"  [green][OK][/green] {escape(str(subject))}: {escape(finding['detail'])}")
 
     # 8. Tray/watcher liveness
     console.print("[bold]Live Watcher[/bold]")
@@ -1369,10 +1370,9 @@ class _ConfigGroup(TyperGroup):
             from devgraph.config.settings import Settings
 
             if args[0] in Settings.model_fields:
-                raise typer.BadParameter(
+                ctx.fail(
                     f"'{args[0]}' is a setting, not a subcommand: use "
-                    f"`devgraph config settings {args[0]}`",
-                    ctx=ctx,
+                    f"`devgraph config settings {args[0]}`"
                 )
         return super().resolve_command(ctx, args)
 
@@ -1403,8 +1403,9 @@ def _show_settings(key: str | None, show_defaults: bool, as_json: bool) -> None:
     settings = get_settings()
 
     fields: list[tuple[str, Any, Any]] = []
-    for field_name in settings.model_fields:
-        field_info = settings.model_fields[field_name]
+    model_fields = type(settings).model_fields
+    for field_name in model_fields:
+        field_info = model_fields[field_name]
         fields.append((field_name, getattr(settings, field_name), field_info.default))
 
     if key:
@@ -1438,8 +1439,11 @@ def config(
     as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """With no subcommand, show DevGraph's settings (same as `config settings`)."""
-    if ctx.invoked_subcommand is None:
-        _show_settings(None, show_defaults, as_json)
+    if ctx.invoked_subcommand is not None:
+        if as_json or show_defaults:
+            ctx.fail("--json/--show-defaults go after the subcommand, e.g. `devgraph config show --json`")
+        return
+    _show_settings(None, show_defaults, as_json)
 
 
 @config_app.command("settings")
@@ -1456,7 +1460,7 @@ def _repo_dir(repo: Path) -> Path:
     """`--repo` as an absolute directory, or exit 1 with a plain message."""
     root = repo.expanduser().resolve()
     if not root.is_dir():
-        console.print(f"[red][X] Error:[/red] {root} is not a directory")
+        console.print(f"[red][X] Error:[/red] {escape(str(root))} is not a directory")
         raise typer.Exit(code=1)
     return root
 
@@ -1476,11 +1480,11 @@ def config_eject(
             handle.write(starter_schema_text())
     except FileExistsError:
         console.print(
-            f"[red][X] Error:[/red] {path} already exists; eject never overwrites a "
+            f"[red][X] Error:[/red] {escape(str(path))} already exists; eject never overwrites a "
             f"project schema. Edit it, or move it aside and eject again."
         )
         raise typer.Exit(code=1)
-    console.print(f"[green][OK][/green] Wrote {path}")
+    console.print(f"[green][OK][/green] Wrote {escape(str(path))}")
     console.print("  Edit it, then run `devgraph config validate` and `devgraph rescan <repo_id>`.")
 
 
@@ -1533,18 +1537,24 @@ def _schema_report(repo_root: Path | None) -> dict[str, Any]:
 
 @config_app.command("show")
 def config_show(
-    repo: Path = typer.Option(Path("."), "--repo", help="Repository root (default: current directory)."),
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
     global_only: bool = typer.Option(False, "--global", help="Show only DevGraph's built-in schema."),
     as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
-    """Show the effective graph schema for a repository and where each entry comes from."""
+    """Show the effective graph schema for a repository and where each entry comes from.
+
+    Built-in node types are keyed by DevGraph's own identity rules (JSON `key: null`).
+    """
     from devgraph.config.project_schema import SCHEMA_FILENAME, ProjectSchemaError
 
-    root = None if global_only else _repo_dir(repo)
+    if global_only and repo is not None:
+        ctx.fail("use either --global or --repo, not both")
+    root = None if global_only else _repo_dir(repo or Path("."))
     try:
         report = _schema_report(root)
     except ProjectSchemaError as exc:
-        console.print(f"[red][X] Invalid project schema:[/red] {exc}")
+        console.print(f"[red][X] Invalid project schema:[/red] {escape(str(exc))}")
         raise typer.Exit(code=1)
 
     if as_json:
@@ -1554,16 +1564,16 @@ def config_show(
     if report["status"] == "global":
         console.print("Built-in schema (no global config file yet)")
     elif report["status"] == "absent":
-        console.print(f"{report['repo']}: no {SCHEMA_FILENAME} — built-in schema")
+        console.print(f"{escape(report['repo'])}: no {SCHEMA_FILENAME} — built-in schema")
     else:
-        console.print(f"{report['repo']}: {report['schema_file']} (valid, extends: {report['extends']})")
+        console.print(f"{escape(report['repo'])}: {escape(report['schema_file'])} (valid, extends: {report['extends']})")
 
     nodes = Table(title="Node types")
     nodes.add_column("Label", style="cyan")
     nodes.add_column("Origin")
     nodes.add_column("Key")
     for node in report["node_types"]:
-        nodes.add_row(node["label"], node["origin"], ", ".join(node["key"]) if node["key"] else "—")
+        nodes.add_row(node["label"], node["origin"], ", ".join(node["key"]) if node["key"] else "built-in identity")
     console.print(nodes)
 
     rels = Table(title="Relationships")
@@ -1579,6 +1589,7 @@ def config_show(
 
 @config_app.command("validate")
 def config_validate(
+    ctx: typer.Context,
     repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
     all_repos: bool = typer.Option(False, "--all", help="Check every registered repository, and conflicts between them."),
 ) -> None:
@@ -1586,7 +1597,7 @@ def config_validate(
     from types import SimpleNamespace
 
     if all_repos and repo is not None:
-        raise typer.BadParameter("use either --repo or --all, not both")
+        ctx.fail("use either --repo or --all, not both")
     if all_repos:
         registry = _get_registry()
         try:
@@ -1604,7 +1615,7 @@ def config_validate(
     for finding in findings:
         colour = "red" if finding["failed"] else "green"
         subject = finding["repo_id"] or "cross-repository"
-        console.print(f"[{colour}]{finding['status']}[/{colour}] {subject}: {finding['detail']}")
+        console.print(f"[{colour}]{finding['status']}[/{colour}] {escape(str(subject))}: {escape(finding['detail'])}")
     if any(finding["failed"] for finding in findings):
         raise typer.Exit(code=1)
 

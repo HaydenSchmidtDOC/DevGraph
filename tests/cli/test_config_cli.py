@@ -77,6 +77,7 @@ def test_the_old_positional_form_points_at_settings(runner, settings):
     result = runner.invoke(app, ["config", "neo4j_uri"])
     assert result.exit_code == 2
     assert "devgraph config settings neo4j_uri" in result.output
+    assert "Invalid value" not in result.output
 
 
 def test_an_unknown_word_is_still_no_such_command(runner, settings):
@@ -218,9 +219,21 @@ def test_show_with_extends_none_has_no_builtins(runner, settings, tmp_path):
 
 
 def test_show_global_ignores_the_repo_file(runner, settings, tmp_path):
-    data = show_json(runner, "--global", "--repo", str(write(tmp_path, WIDGET)))
+    write(tmp_path, WIDGET)
+    data = show_json(runner, "--global")
     assert data["status"] == "global" and data["schema_file"] is None
     assert "Widget" not in [n["label"] for n in data["node_types"]]
+
+
+def test_show_rejects_global_and_repo_together(runner, settings, tmp_path):
+    result = runner.invoke(app, ["config", "show", "--global", "--repo", str(tmp_path)])
+    assert result.exit_code == 2
+    assert "Invalid value" not in result.output
+
+
+def test_show_labels_builtin_keys_in_the_table(runner, settings, tmp_path):
+    result = runner.invoke(app, ["config", "show", "--repo", str(tmp_path)])
+    assert result.exit_code == 0 and "built-in identity" in result.output
 
 
 def test_show_human_output_names_the_file_and_origins(runner, settings, tmp_path):
@@ -276,3 +289,43 @@ def test_validate_all_with_no_repos(runner, settings):
 def test_validate_rejects_repo_and_all_together(runner, settings, tmp_path):
     result = runner.invoke(app, ["config", "validate", "--all", "--repo", str(tmp_path)])
     assert result.exit_code == 2
+    assert "Invalid value" not in result.output
+
+
+# ── output hardening ──────────────────────────────────────────────────────
+
+BAD_LABEL = 'version: 1\nnode_types:\n  - label: "[/bad]"\n    key: [slug]\n'
+
+
+def test_validate_survives_markup_in_a_schema_error(runner, settings, tmp_path):
+    write(tmp_path, BAD_LABEL)
+    result = runner.invoke(app, ["config", "validate", "--repo", str(tmp_path)])
+    assert result.exit_code == 1, result.output
+    assert "[/bad]" in result.output
+    assert "Traceback" not in result.output and "MarkupError" not in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_show_survives_markup_in_a_schema_error(runner, settings, tmp_path):
+    write(tmp_path, BAD_LABEL)
+    result = runner.invoke(app, ["config", "show", "--repo", str(tmp_path)])
+    assert result.exit_code == 1, result.output
+    assert "[/bad]" in result.output
+    assert "MarkupError" not in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_validate_survives_markup_in_the_repo_path(runner, settings, tmp_path):
+    repo = tmp_path / "[x]" / "[/x]"
+    repo.mkdir(parents=True)
+    result = runner.invoke(app, ["config", "validate", "--repo", str(repo)])
+    assert result.exit_code == 0, result.output
+    assert "[/x]" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_group_json_before_a_subcommand_is_rejected(runner, settings):
+    result = runner.invoke(app, ["config", "--json", "show"])
+    assert result.exit_code == 2
+    assert "devgraph config show --json" in result.output
+    assert runner.invoke(app, ["config", "--json"]).exit_code == 0
