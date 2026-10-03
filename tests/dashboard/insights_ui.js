@@ -173,6 +173,14 @@ const COMPUTED = {
   // 10. the GDS placeholder is gone
   check("no GDS probe remains", !/gds\.list/.test(html) && !/attemptCommunityDetection/.test(html), "index.html still probes for GDS");
 
+  // 11. the wiring sits in the right functions
+  const liveBody = grab(/^function connectLiveEvents\(/m, "\n}");
+  const topoBody = grab(/^async function loadTopologyCounts\(/m, "\n}");
+  check("connectLiveEvents handles insights_refreshed", liveBody.includes("insights_refreshed"), "missing from connectLiveEvents");
+  check("loadTopologyCounts does not reference an event", !topoBody.includes("insights_refreshed") && !/\bevent\./.test(topoBody), "event handling leaked into loadTopologyCounts");
+  check("loadTopologyCounts resets the basis label to degree", topoBody.includes('godNodesBasis").textContent = "degree"'), "missing from loadTopologyCounts");
+  check("connectLiveEvents does not touch the basis label", !liveBody.includes("godNodesBasis"), "misplaced in connectLiveEvents");
+
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);
 })();

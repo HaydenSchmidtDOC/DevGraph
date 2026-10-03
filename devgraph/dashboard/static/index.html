@@ -2678,7 +2678,8 @@ function connectLiveEvents() {
       if (neo4jConnected) refreshGraph();
     } else if (event.type === "git_history_synced" && event.mode !== "noop") {
       loadGitHistory(repo);
-      document.getElementById("godNodesBasis").textContent = "degree";
+    } else if (event.type === "insights_refreshed" && neo4jConnected) {
+      loadInsights(); // node colours pick the new communities up on the next graph load
     } else if (event.type === "registry_changed" && neo4jConnected) {
       populateRealRepos();
     }
@@ -3632,8 +3633,7 @@ async function loadTopologyCounts() {
     const godEl = document.getElementById("godNodes");
     if (!godJson.errors?.length && godJson.results[0].data.length) {
       godEl.innerHTML = godJson.results[0].data.map((d,i) => `<div class="leaderboard-row"><span class="lb-rank">${i+1}</span><span class="lb-name">${escapeHtmlVal(d.row[0])}</span><span class="lb-type">${escapeHtmlVal(d.row[1]||"")}</span><span class="lb-val">${d.row[2]}</span></div>`).join("");
-    } else if (event.type === "insights_refreshed" && neo4jConnected) {
-      loadInsights(); // node colours pick the new communities up on the next graph load
+      document.getElementById("godNodesBasis").textContent = "degree";
     } else {
       godEl.innerHTML = `<div class="count-note">No nodes for this scope yet.</div>`;
     }
