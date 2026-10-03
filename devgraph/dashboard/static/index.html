@@ -467,6 +467,10 @@ table.dstable input[type="text"] { width: 100%; }
             <label class="switch"><input type="checkbox" id="ctlRotationEnabled" /><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="toggle-row">
+            <span class="lbl">Color by community<span class="qmark" data-tip="Colors nodes by their graph-insights community instead of entity type. Grey nodes have no community: no dependency or containment edges, or insights not computed yet.">?</span></span>
+            <label class="switch"><input type="checkbox" id="ctlCommunityColors" /><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="toggle-row">
             <span class="lbl">Node/edge shadows<span class="qmark" data-tip="Soft drop-shadow on nodes and relationship lines. Costs real canvas paint time (shadow blur isn't free), more so with a lot on screen -- turn off for a flatter look on a large graph.">?</span></span>
             <label class="switch"><input type="checkbox" id="ctlShadowsEnabled" checked /><span class="track"></span><span class="thumb"></span></label>
           </div>
@@ -510,7 +514,7 @@ table.dstable input[type="text"] { width: 100%; }
       <div class="count-list floating-list" id="entityCounts"></div>
       <div class="count-note">Document nodes: <span id="docCount" style="color:var(--fg-2)">—</span></div>
       <div class="fc-subsection" data-od-id="god-nodes-section">
-        <div class="fc-subhead">Top god nodes<span class="qmark" data-tip="Ranked by real degree centrality — size((n)--()) — a plain Cypher query, no plugin required. PageRank would need GDS.">?</span></div>
+        <div class="fc-subhead">Top god nodes <span class="lb-type" id="godNodesBasis">degree</span><span class="qmark" data-tip="PageRank over dependency edges (calls, imports, extends, implements, uses, depends-on) once graph insights are computed; until then, raw degree — size((n)--()) — which containment and history edges inflate.">?</span></div>
         <div id="godNodes"></div>
       </div>
     </div>
@@ -598,9 +602,15 @@ table.dstable input[type="text"] { width: 100%; }
       </div>
 
       <div class="card" data-od-id="community-card">
-        <div class="card-head"><h3>Community partitions</h3><span class="sample-pill" id="communityPill">Checking…</span></div>
-        <div class="metric-row"><span class="metric-label">Partitions detected<span class="qmark" data-tip="Louvain modularity via Neo4j Graph Data Science. Attempted live; falls back if the GDS plugin isn't installed.">?</span></span><span class="metric-val dim" id="communityVal">—</span></div>
-        <div class="placeholder-note" id="communityNote">Checking for the GDS plugin…</div>
+        <div class="card-head"><h3>Communities</h3><span class="sample-pill" id="communityPill">Checking…</span></div>
+        <div class="metric-row"><span class="metric-label">Communities<span class="qmark" data-tip="Louvain clusters over this repository's dependency and containment edges, computed by DevGraph itself (no Neo4j plugin) and refreshed automatically after indexing.">?</span></span><span class="metric-val dim" id="communityVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">Modularity<span class="qmark" data-tip="How cleanly the graph splits into these communities: near 0 means no real structure, above about 0.3 a clear split.">?</span></span><span class="metric-val dim" id="modularityVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">Last computed</span><span class="metric-val dim" id="insightsAtVal">—</span></div>
+        <div id="communityList"></div>
+        <div class="metric-label" style="margin-top:10px">Bridges<span class="qmark" data-tip="Highest betweenness over dependency edges: entities that sit between subsystems, where a change ripples furthest.">?</span></div>
+        <div id="bridgeList"></div>
+        <div class="placeholder-note" id="communityNote">Reading graph insights…</div>
+        <button class="btn btn-sm" id="btnRecomputeInsights" style="margin-top:8px">Recompute</button>
       </div>
     </aside>
   </div>
@@ -846,6 +856,13 @@ const CAT_COLORS = {
   phase3:      "#6b7280",
 };
 function catColor(cat) { return CAT_COLORS[cat] || "#8a8f98"; }
+/* Community colours for the "Color by community" toggle. Defined here, ahead
+   of the Cytoscape style that calls communityColor, and cycled when a
+   repository has more communities than colours. */
+const COMMUNITY_PALETTE = ["#5e6ad2", "#26b5ce", "#4cb782", "#f2c94c", "#f2994a", "#eb5757", "#bb87fc", "#ff7eb6", "#6fcf97", "#56ccf2", "#c9a227", "#9b8afb"];
+function communityColor(c) {
+  return Number.isInteger(c) && c >= 0 ? COMMUNITY_PALETTE[c % COMMUNITY_PALETTE.length] : "#5a5f68";
+}
 const brightCache = {};
 function catColorBright(cat) {
   if (brightCache[cat]) return brightCache[cat];
@@ -861,7 +878,7 @@ function catColorBright(cat) {
    AND type(r)="X") instead of the old exclude-list (AND NOT ... IN [...]).
    Clicking the already-isolated one clears back to the whole graph. Entity
    and relationship isolation are independent of each other. */
-const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000, highlightMode: true, renderThreshold: 1600, rotationEnabled: false, shadowsEnabled: true, glowEnabled: true, settleOnChange: true };
+const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000, highlightMode: true, renderThreshold: 1600, rotationEnabled: false, shadowsEnabled: true, glowEnabled: true, settleOnChange: true, colorByCommunity: false };
 document.getElementById("ctlRotationEnabled").addEventListener("change", e => {
   state.rotationEnabled = e.target.checked;
   if (state.rotationEnabled) armRotationLoop();
@@ -874,6 +891,10 @@ document.getElementById("ctlRotationEnabled").addEventListener("change", e => {
 document.getElementById("ctlShadowsEnabled").addEventListener("change", e => {
   state.shadowsEnabled = e.target.checked;
   cy.style().update(); // shadow-* below are function-valued styles gated on state.shadowsEnabled -- force Cytoscape to re-evaluate them on every element now, not just on the next unrelated restyle
+});
+document.getElementById("ctlCommunityColors").addEventListener("change", e => {
+  state.colorByCommunity = e.target.checked;
+  cy.style().update(); // background-color below is function-valued on state.colorByCommunity
 });
 document.getElementById("ctlGlowEnabled").addEventListener("change", e => {
   state.glowEnabled = e.target.checked;
@@ -1013,7 +1034,7 @@ const cy = cytoscape({
   userZoomingEnabled: false, /* scroll-to-zoom stays off deliberately — use the +/- controls instead */
   style: [
     { selector: "node", style: {
-        "background-color": ele => catColor(ele.data("cat")),
+        "background-color": ele => state.colorByCommunity ? communityColor(ele.data("community")) : catColor(ele.data("cat")),
         /* No label unless something is asking to read one. Text is the most
            expensive thing in a canvas repaint and the ambient rotation
            repaints on a tick, so a permanent label is paid for over and over
@@ -2257,7 +2278,8 @@ function mapGraphResultToElements(results) {
       // `key` is carried on the element so the inspector can look the node
       // back up by identity rather than by an internal id -- see
       // showDetailsCard. Null for a node the server couldn't key.
-      nodeMap.set(stableId, { data: { id: stableId, key: n.key ?? null, label: name, cat } });
+      const community = Number.isInteger(n.properties?.insight_community) ? n.properties.insight_community : null;
+      nodeMap.set(stableId, { data: { id: stableId, key: n.key ?? null, label: name, cat, community } });
     });
     (r.graph?.relationships || []).forEach(rel => {
       const source = idByInternalId.get(rel.startNode), target = idByInternalId.get(rel.endNode);
@@ -2475,6 +2497,7 @@ async function refreshGraph(mode, record, structural) {
   // ceiling back up) still builds its query with the OLD, now-too-low
   // ceiling, and the "real total" panels only catch up a step late.
   if (neo4jConnected) await loadTopologyCounts();
+  if (neo4jConnected) loadInsights(); // after the degree leaderboard, which it replaces with PageRank when computed
   /* Fetch the saved layout before the query that will need it. Scoped per
      repo view, so switching repos loads that view's own cache -- and the
      outgoing view's positions are flushed first, since the switch replaces
@@ -2615,7 +2638,6 @@ async function bootConnect() {
     loadGitHistory(document.getElementById("repoSelect").value);
     attemptMemoryMetrics();
     attemptQueryTelemetry();
-    attemptCommunityDetection();
   } catch (e) {
     neo4jStatus.textContent = "Neo4j unreachable";
     neo4jStatus.style.color = "var(--danger)";
@@ -2656,6 +2678,7 @@ function connectLiveEvents() {
       if (neo4jConnected) refreshGraph();
     } else if (event.type === "git_history_synced" && event.mode !== "noop") {
       loadGitHistory(repo);
+      document.getElementById("godNodesBasis").textContent = "degree";
     } else if (event.type === "registry_changed" && neo4jConnected) {
       populateRealRepos();
     }
@@ -3208,7 +3231,7 @@ document.querySelectorAll('#gitViewToggle button').forEach(btn => btn.addEventLi
   if (isTree) renderGitTree();
 }));
 
-/* ── Database & memory / Query telemetry / Community — attempted live,
+/* ── Database & memory / Query telemetry — attempted live,
    graceful labeled fallback per the no-fabrication rule if the underlying
    procedure isn't available on this Neo4j build. ── */
 function setMemNote(reason) {
@@ -3410,26 +3433,113 @@ async function attemptMcpTelemetry() {
     setMcpTelemetryUnavailable(reason);
   }
 }
-async function attemptCommunityDetection() {
-  const note = document.getElementById("communityNote");
+/* ── Graph insights: Communities card, Bridges, and the PageRank leaderboard.
+   Backed by /api/repos/{id}/insights, which the agent keeps current after
+   indexing (devgraph/analytics/insights.py). Per repository only. ── */
+function insightRowsHtml(rows) {
+  return rows.map((r, i) => `<div class="leaderboard-row"><span class="lb-rank">${i + 1}</span><span class="lb-name">${escapeHtmlVal(r.name ?? "")}</span><span class="lb-type">${escapeHtmlVal(r.tag ?? "")}</span><span class="lb-val">${escapeHtmlVal(r.value ?? "")}</span></div>`).join("");
+}
+function formatScore(v) {
+  return Number.isFinite(v) ? v.toFixed(3) : "—";
+}
+let insightsRequest = 0;
+function clearInsights(note, pillText) {
+  for (const id of ["communityVal", "modularityVal", "insightsAtVal"]) {
+    const el = document.getElementById(id);
+    el.textContent = "—";
+    el.classList.add("dim");
+  }
+  document.getElementById("communityList").innerHTML = "";
+  document.getElementById("bridgeList").innerHTML = "";
   const pill = document.getElementById("communityPill");
+  pill.textContent = pillText;
+  pill.className = "sample-pill";
+  document.getElementById("communityNote").textContent = note;
+}
+function renderInsights(body) {
+  if (!body?.computed) {
+    clearInsights("Not computed yet — the DevGraph agent computes insights after indexing, or press Recompute.", "Not computed");
+    return;
+  }
+  const set = (id, text) => {
+    const el = document.getElementById(id);
+    el.textContent = text;
+    el.classList.remove("dim");
+  };
+  set("communityVal", Number.isFinite(body.community_count) ? String(body.community_count) : "—");
+  set("modularityVal", Number.isFinite(body.modularity) ? body.modularity.toFixed(2) : "—");
+  set("insightsAtVal", body.computed_at ? new Date(body.computed_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—");
+  const communities = Array.isArray(body.communities) ? body.communities : [];
+  document.getElementById("communityList").innerHTML =
+    insightRowsHtml(communities.map(c => ({ name: c.label, tag: "#" + c.community, value: c.size })));
+  const bridges = Array.isArray(body.bridges) ? body.bridges : [];
+  document.getElementById("bridgeList").innerHTML = bridges.length
+    ? insightRowsHtml(bridges.map(b => ({ name: b.name, tag: (b.labels || [])[0] || "", value: formatScore(b.score) })))
+    : `<div class="count-note">No dependency edges to rank.</div>`;
+  const keyNodes = Array.isArray(body.key_nodes) ? body.key_nodes : [];
+  if (keyNodes.length) {
+    document.getElementById("godNodes").innerHTML =
+      insightRowsHtml(keyNodes.map(k => ({ name: k.name, tag: (k.labels || [])[0] || "", value: formatScore(k.score) })));
+    document.getElementById("godNodesBasis").textContent = "PageRank";
+  }
+  const pill = document.getElementById("communityPill");
+  pill.textContent = "Live";
+  pill.className = "wired-pill";
+  document.getElementById("communityNote").textContent = communities.length
+    ? `Louvain over dependency and containment edges across ${body.node_count} nodes.`
+    : "No dependency structure found in this repository yet.";
+}
+async function loadInsights() {
+  const repo = document.getElementById("repoSelect").value;
+  const btn = document.getElementById("btnRecomputeInsights");
+  const ticket = ++insightsRequest;
+  if (!repo || repo === "__all__") {
+    btn.disabled = true;
+    clearInsights("Select a single repository to see its communities, key nodes and bridges.", "All repos");
+    return;
+  }
+  btn.disabled = false;
+  let body;
   try {
-    const check = await runCypher("CALL gds.list() YIELD name RETURN count(*) AS n");
-    if (check.errors?.length) throw new Error("no gds");
-    pill.textContent = "GDS detected"; pill.className = "wired-pill";
-    note.textContent = "GDS detected — Louvain run not triggered automatically (can be expensive on a large graph). Run it from Settings when ready.";
+    const res = await fetch(`/api/repos/${encodeURIComponent(repo)}/insights`);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    body = await res.json();
   } catch (e) {
-    pill.textContent = "Not wired"; pill.className = "sample-pill";
-    note.textContent = "GDS plugin not detected on this Neo4j instance — community partitioning stays a placeholder until it's installed.";
-    document.getElementById("communityVal").textContent = "—";
+    if (ticket === insightsRequest) clearInsights("Graph insights are unavailable right now — the graph could not be read.", "Unavailable");
+    return;
+  }
+  if (ticket !== insightsRequest) return; // a newer repo switch superseded this one
+  renderInsights(body);
+}
+async function recomputeInsights() {
+  const repo = document.getElementById("repoSelect").value;
+  if (!repo || repo === "__all__") return;
+  const btn = document.getElementById("btnRecomputeInsights");
+  const note = document.getElementById("communityNote");
+  btn.disabled = true;
+  note.textContent = "Recomputing…";
+  try {
+    const res = await fetch(`/api/repos/${encodeURIComponent(repo)}/insights`, { method: "POST" });
+    if (res.status === 409) {
+      note.textContent = "Already being computed — the result appears when it finishes.";
+      return;
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const body = await res.json();
+    if (document.getElementById("repoSelect").value === repo) renderInsights(body);
+  } catch (e) {
+    note.textContent = "Recompute failed — the graph could not be read.";
+  } finally {
+    btn.disabled = false;
   }
 }
+document.getElementById("btnRecomputeInsights").addEventListener("click", recomputeInsights);
 
 /* ── Graph topology: baked directly into the entity/relationship floating
    panels rather than a separate card. Node/edge counts by label overwrite
    the existing count rows/chips with real live numbers; the god-node
-   leaderboard is a real plain-Cypher degree count (no GDS needed for that
-   part — only Louvain/PageRank need the plugin, handled separately above). ── */
+   leaderboard starts as a plain-Cypher degree count; loadInsights swaps in
+   PageRank when graph insights are computed. ── */
 async function loadTopologyCounts() {
   const entityPill = document.getElementById("entityLivePill");
   const relPill = document.getElementById("relSamplePill");
@@ -3522,6 +3632,8 @@ async function loadTopologyCounts() {
     const godEl = document.getElementById("godNodes");
     if (!godJson.errors?.length && godJson.results[0].data.length) {
       godEl.innerHTML = godJson.results[0].data.map((d,i) => `<div class="leaderboard-row"><span class="lb-rank">${i+1}</span><span class="lb-name">${escapeHtmlVal(d.row[0])}</span><span class="lb-type">${escapeHtmlVal(d.row[1]||"")}</span><span class="lb-val">${d.row[2]}</span></div>`).join("");
+    } else if (event.type === "insights_refreshed" && neo4jConnected) {
+      loadInsights(); // node colours pick the new communities up on the next graph load
     } else {
       godEl.innerHTML = `<div class="count-note">No nodes for this scope yet.</div>`;
     }

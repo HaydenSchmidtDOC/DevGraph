@@ -49,6 +49,7 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 | Refresh source and reconcile git history | `devgraph rescan <repo_id> [--full]` |
 | Inspect registered repositories | `devgraph list`, `devgraph info <repo_id>`, `devgraph stats [repo_id]` |
 | Check installation and graph health | `devgraph status`, `devgraph doctor`, `devgraph self-test [repo_id]` |
+| Recompute communities, key nodes and bridges | `devgraph insights <repo_id>` |
 | Open the dashboard | `devgraph dashboard` |
 | Configure an MCP client | `devgraph client-config`, `devgraph mcp add`, `devgraph mcp doctor` |
 | View configuration or tray logs | `devgraph config`, `devgraph logs` |
@@ -77,6 +78,8 @@ A repository may declare extra node types in an optional `devgraph.schema.yaml` 
 ## Dashboard
 
 The tray app serves the dashboard at `http://127.0.0.1:8765`. It shows registered repositories, graph and git information, query telemetry, an interactive graph canvas, query-driven highlighting, and saved per-repository layouts. The repository picker can register a local path and run its initial scan; if indexing fails, the registration remains available for retry. Server-Sent Events refresh the view after indexing changes.
+
+The Communities card shows each repository's subsystems (Louvain communities over dependency and containment edges), with modularity and the bridges between them; the god-node list ranks by PageRank over dependency edges once these are computed. A canvas toggle colors nodes by community. DevGraph computes all of this itself — no Neo4j plugin — and the agent refreshes it after indexing; `devgraph insights <repo_id>` recomputes on demand.
 
 The service binds to loopback and has no authentication because it is intended as a single-user local tool. The browser never receives Neo4j credentials; graph queries run through the FastAPI backend. Use `DEVGRAPH_DASHBOARD_ENABLED=false` to disable it or `DEVGRAPH_DASHBOARD_PORT` to choose another port.
 
