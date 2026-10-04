@@ -361,3 +361,14 @@ def test_catalog_module_does_not_import_mcp():
 
     code = "import sys, devgraph.mcp.catalog as c; assert 'mcp' not in sys.modules; assert 'search_component' in c.builtin_tool_names()"
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+@pytest.mark.parametrize("name, why", [("from", "Python keyword"), ("in", "Python keyword"), ("model_config", "model_")])
+def test_reserved_parameter_names_are_rejected(tmp_path, name, why):
+    text = tool_text(
+        f"MATCH (n {{repo_id: $repo_id}}) RETURN ${name}",
+        params=f"- name: {name}\n  description: x",
+    )
+    with pytest.raises(ProjectToolsError) as err:
+        load_text(tmp_path, text)
+    assert name in str(err.value) and why in str(err.value)

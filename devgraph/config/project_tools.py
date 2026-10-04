@@ -15,6 +15,7 @@ Import this module directly, like `devgraph.config.project_schema`.
 
 from __future__ import annotations
 
+import keyword
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -28,6 +29,9 @@ TOOLS_VERSION = 1
 #: The parameter the server always supplies; never declared, never overridable.
 #: See module docstring for the presence-only guarantee.
 INJECTED_PARAMETER = "repo_id"
+
+#: Names starting with this collide with pydantic model internals when a tool schema is built.
+RESERVED_PARAMETER_PREFIX = "model_"
 
 PARAMETER_TYPES: tuple[str, ...] = ("string", "integer", "float", "boolean")
 NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -139,6 +143,13 @@ class ToolParameter(BaseModel):
     @classmethod
     def _valid_name(cls, value: str) -> str:
         _check_name(value, "parameter name")
+        if keyword.iskeyword(value):
+            raise ValueError(f"parameter name {value!r} is a Python keyword and cannot be used")
+        if value.startswith(RESERVED_PARAMETER_PREFIX):
+            raise ValueError(
+                f"parameter name {value!r} starts with {RESERVED_PARAMETER_PREFIX!r}, which is reserved "
+                f"for the tool schema model, and cannot be used"
+            )
         if value == INJECTED_PARAMETER:
             raise ValueError(
                 f"parameter {INJECTED_PARAMETER!r} is supplied by DevGraph for the "

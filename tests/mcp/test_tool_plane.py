@@ -40,6 +40,7 @@ TOOLS = """
 class Repo:
     repo_id: str
     path: Path
+    active: bool = True
 
 
 class Registry:
@@ -203,26 +204,34 @@ def test_an_unmatched_relative_env_value_never_resolves_against_cwd(tmp_path, mo
 
 
 def test_a_tool_that_cannot_register_does_not_take_the_server_down(tmp_path, monkeypatch):
+    from mcp.server.mcpserver import MCPServer
+
     tools = """
         version: 1
         tools:
           - name: bad_tool
-            description: Has a parameter pydantic reserves.
+            description: Registration fails.
             cypher: |
-              MATCH (n {repo_id: $repo_id}) RETURN n.name AS name, $model_config AS m
-            parameters:
-              - name: model_config
-                description: Reserved.
+              MATCH (n {repo_id: $repo_id}) RETURN n.name AS name
           - name: fine_tool
             description: Works.
             cypher: |
               MATCH (n {repo_id: $repo_id}) RETURN n.name AS name
     """
+    original = MCPServer.add_tool
+
+    def flaky(self, fn, *args, **kwargs):
+        if getattr(fn, "__name__", "") == "bad_tool":
+            raise ValueError("boom: cannot build schema\nsecond line")
+        return original(self, fn, *args, **kwargs)
+
+    monkeypatch.setattr(MCPServer, "add_tool", flaky)
     server, _ = build(tmp_path, monkeypatch, Engine(), tools=tools)
     names = tool_names(server)
     assert "find_callers" in names and "fine_tool" in names and "bad_tool" not in names
     status = json.loads(asyncio.run(server.read_resource("devgraph://project-tools"))[0].content)
-    assert any("bad_tool" in n and "could not be served" in n for n in status["notices"])
+    notice = next(n for n in status["notices"] if "bad_tool" in n and "could not be served" in n)
+    assert "ValueError" in notice and "boom: cannot build schema" in notice and "second line" not in notice
 
 
 def test_nested_results_are_sanitized(tmp_path, monkeypatch):
@@ -276,3 +285,60 @@ def test_an_explicit_null_uses_the_default(tmp_path, monkeypatch):
     server, _ = build(tmp_path, monkeypatch, engine)
     asyncio.run(server.call_tool("list_folder", {"folder": "x", "limit_hint": None}))
     assert engine.calls[0][1]["limit_hint"] == 5
+
+
+# ── final-review fixes ─────────────────────────────────────────────────────
+
+
+def test_a_call_envelope_carries_no_file_level_notices(tmp_path, monkeypatch):
+    server, _ = build(tmp_path, monkeypatch, Engine(rows=[{"path": "a.py"}]))  # TOOLS also shadows a built-in
+    result = asyncio.run(server.call_tool("list_folder", {"folder": "src"}))
+    assert set(result.structured_content) == {"count", "results", "truncated"}
+
+
+class InactiveRegistry(Registry):
+    def list_repos(self, active_only=False):
+        return [r for r in self.repos if r.active or not active_only]
+
+
+def pinned_status(registry, value, tmp_path, monkeypatch):
+    from devgraph.mcp.tool_plane import register_project_tools
+
+    repo, source = resolve_session_repo(registry, {SESSION_REPO_ENV: value}, tmp_path)
+    assert repo is None and source == "env"
+    server = mcp_server.MCPServer("t")
+    return register_project_tools(
+        server, Engine(), repo, source, instrument=lambda f: f, annotations=None, pinned=value, registry=registry
+    )
+
+
+def test_a_pinned_inactive_repo_is_reported_as_inactive(tmp_path, monkeypatch):
+    gone = Repo("gone", tmp_path / "gone", active=False)
+    gone.path.mkdir()
+    status = pinned_status(InactiveRegistry([gone]), "gone", tmp_path, monkeypatch)
+    assert any("'gone'" in n and "is registered but inactive" in n for n in status.notices)
+    status = pinned_status(InactiveRegistry([gone]), str(gone.path), tmp_path, monkeypatch)
+    assert any("is registered but inactive" in n for n in status.notices)
+
+
+def test_an_unregistered_pin_keeps_the_no_match_notice(tmp_path, monkeypatch):
+    status = pinned_status(InactiveRegistry([]), "nope", tmp_path, monkeypatch)
+    assert any("matches no registered repository" in n for n in status.notices)
+
+
+def test_a_pinned_repo_whose_root_is_missing_says_so(tmp_path, monkeypatch):
+    from devgraph.mcp.tool_plane import register_project_tools
+
+    ghost = Repo("ghost", tmp_path / "does-not-exist")
+    status = register_project_tools(
+        mcp_server.MCPServer("t"), Engine(), ghost, "env", instrument=lambda f: f, annotations=None, pinned="ghost"
+    )
+    assert any("root" in n and "does not exist" in n for n in status.notices)
+
+
+def test_the_catalog_lists_project_tool_parameter_names(tmp_path, monkeypatch):
+    server, _ = build(tmp_path, monkeypatch, Engine())
+    catalog = json.loads(asyncio.run(server.read_resource("devgraph://tool-catalog"))[0].content)
+    entry = next(e for e in catalog if e["name"] == "list_folder")
+    assert entry["identifier_kind"] == "parameters: folder, limit_hint"
+    assert set(entry) >= {"name", "identifier_kind", "envelope", "phase", "note"}

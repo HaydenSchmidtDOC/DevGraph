@@ -10,6 +10,7 @@ read-only, bounded by the tool's timeout and row cap
 
 from __future__ import annotations
 
+import datetime
 import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -27,6 +28,8 @@ from devgraph.config.project_tools import (
 from devgraph.mcp.catalog import builtin_tool_names
 
 from mcp.server.mcpserver.exceptions import ToolError
+from neo4j import time as neo4j_time
+from neo4j.spatial import Point
 
 SESSION_REPO_ENV = "DEVGRAPH_MCP_REPO"
 
@@ -71,12 +74,24 @@ def resolve_session_repo(registry: Any, env: Mapping[str, str], cwd: Path) -> tu
     return (match, "cwd") if match is not None else (None, "none")
 
 
+def _inactive_match(registry: Any | None, pinned: str) -> Any | None:
+    """The inactive registered repository a pin names (by id or absolute path), if any."""
+    if registry is None or not pinned:
+        return None
+    inactive = [r for r in registry.list_repos(active_only=False) if not r.active]
+    found = next((r for r in inactive if r.repo_id == pinned), None)
+    if found is None and Path(pinned).expanduser().is_absolute():
+        found = _deepest_containing(inactive, Path(pinned))
+    return found
+
+
 @dataclass
 class ToolPlaneStatus:
     repo_id: str | None
     source: str
     tools_file: str | None = None
     served: list[str] = field(default_factory=list)
+    parameter_names: dict[str, list[str]] = field(default_factory=dict)  # served tool -> declared parameters
     notices: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -93,6 +108,18 @@ def _sanitize_deep(value: Any) -> Any:
 
     if isinstance(value, dict):
         return {k: _sanitize_deep(v) for k, v in value.items()}
+    # Duration and Point are tuple subclasses: match them before the generic sequence case.
+    if isinstance(value, (neo4j_time.Date, neo4j_time.DateTime, neo4j_time.Time, neo4j_time.Duration)):
+        return value.iso_format()
+    if isinstance(value, (datetime.date, datetime.time)):  # datetime is a date
+        return value.isoformat()
+    if isinstance(value, datetime.timedelta):
+        return str(value)
+    if isinstance(value, Point):
+        point = {"srid": value.srid, "x": value.x, "y": value.y}
+        if len(value) > 2:
+            point["z"] = value.z
+        return point
     if isinstance(value, (list, tuple)):
         return [_sanitize_deep(v) for v in value]
     return _sanitize_value(value)
@@ -112,7 +139,7 @@ def _failure(tool: CypherTool, exc: Exception) -> ToolError:
     return ToolError(f"project tool {tool.name!r} failed")
 
 
-def make_tool_function(tool: CypherTool, engine: Any, repo_id: str, notices: list[str]) -> Callable[..., dict[str, Any]]:
+def make_tool_function(tool: CypherTool, engine: Any, repo_id: str) -> Callable[..., dict[str, Any]]:
     """A function the SDK can register: its signature is the tool's parameters."""
     def call(**kwargs: Any) -> dict[str, Any]:
         params = {
@@ -126,10 +153,7 @@ def make_tool_function(tool: CypherTool, engine: Any, repo_id: str, notices: lis
         except Exception as exc:  # the driver raises its own hierarchy
             raise _failure(tool, exc) from exc
         results = [_sanitize_deep(row) for row in rows]
-        envelope: dict[str, Any] = {"count": len(results), "results": results, "truncated": truncated}
-        if notices:
-            envelope["notices"] = list(notices)
-        return envelope
+        return {"count": len(results), "results": results, "truncated": truncated}
 
     parameters = []
     for p in tool.parameters:
@@ -157,18 +181,29 @@ def register_project_tools(
     instrument: Callable[[Callable[..., Any]], Callable[..., Any]],
     annotations: Any,
     pinned: str | None = None,
+    registry: Any | None = None,
 ) -> ToolPlaneStatus:
     """Register the session repository's tools on `server`; report what happened."""
     if repo is None:
         status = ToolPlaneStatus(repo_id=None, source=source)
         if source == "env":
-            status.notices.append(
-                f"{SESSION_REPO_ENV}={pinned or ''!r} matches no registered repository; "
-                f"no project tools are served"
-            )
+            inactive = _inactive_match(registry, pinned or "")
+            if inactive is not None:
+                status.notices.append(
+                    f"{SESSION_REPO_ENV}={pinned!r} names repository {inactive.repo_id!r}, which is "
+                    f"registered but inactive; no project tools are served"
+                )
+            else:
+                status.notices.append(
+                    f"{SESSION_REPO_ENV}={pinned or ''!r} matches no registered repository; "
+                    f"no project tools are served"
+                )
         return status
 
     status = ToolPlaneStatus(repo_id=repo.repo_id, source=source)
+    if not Path(repo.path).is_dir():
+        status.notices.append(f"the root of repository {repo.repo_id!r} ({repo.path}) does not exist; no project tools are served")
+        return status
     try:
         declared = load_project_tools(repo.path)
     except ProjectToolsError as exc:
@@ -188,10 +223,13 @@ def register_project_tools(
         if tool.name in builtin:
             continue
         try:
-            fn = instrument(make_tool_function(tool, engine, repo.repo_id, status.notices))
+            fn = instrument(make_tool_function(tool, engine, repo.repo_id))
             server.add_tool(fn, name=tool.name, description=tool.description, annotations=annotations)
         except Exception as exc:
-            status.notices.append(f"project tool {tool.name!r} could not be served: {type(exc).__name__}")
+            status.notices.append(f"project tool {tool.name!r} could not be served: "
+                f"{type(exc).__name__}: {(str(exc).splitlines() or [''])[0]}"
+            )
             continue
         status.served.append(tool.name)
+        status.parameter_names[tool.name] = [p.name for p in tool.parameters]
     return status

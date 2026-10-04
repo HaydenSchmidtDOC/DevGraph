@@ -482,7 +482,8 @@ def build_server(
             return devgraph_tools.run_cypher(engine, query, parameters)
 
     status = register_project_tools(
-        server, engine, session_repo, session_source, instrument=_instrument, annotations=_READ_ONLY, pinned=session_pinned
+        server, engine, session_repo, session_source, instrument=_instrument, annotations=_READ_ONLY, pinned=session_pinned,
+        registry=registry,
     )
 
     @server.resource(
@@ -540,12 +541,12 @@ def build_server(
             *(
                 {
                     "name": n,
-                    "identifier_kind": "project tool parameters",
+                    "identifier_kind": "parameters: " + (", ".join(params) or "none"),
                     "envelope": True,
                     "phase": None,
                     "note": f"from {TOOLS_FILENAME} in {status.repo_id}",
                 }
-                for n in status.served
+                for n, params in status.parameter_names.items()
             ),
         ]
         return json.dumps(catalog, indent=2)
@@ -592,15 +593,15 @@ def main() -> None:
             exc_info=True,
         )
 
-    session_repo, source = resolve_session_repo(registry, os.environ, Path.cwd())
-    server = build_server(
-        engine,
-        registry,
-        session_repo=session_repo,
-        session_source=source,
-        session_pinned=os.environ.get(SESSION_REPO_ENV),
-    )
     try:
+        session_repo, source = resolve_session_repo(registry, os.environ, Path.cwd())
+        server = build_server(
+            engine,
+            registry,
+            session_repo=session_repo,
+            session_source=source,
+            session_pinned=os.environ.get(SESSION_REPO_ENV),
+        )
         server.run("stdio")
     finally:
         engine.close()
