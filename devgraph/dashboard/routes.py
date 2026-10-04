@@ -14,6 +14,8 @@ scan sequence `devgraph add <path>` runs, against the same services.
 from __future__ import annotations
 
 import asyncio
+import colorsys
+import hashlib
 import inspect
 import json
 import logging
@@ -25,6 +27,12 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+from devgraph.config.project_schema import (
+    ABSENT_SCHEMA_HASH,
+    ProjectSchemaError,
+    load_project_schema,
+    schema_file_hash,
+)
 from devgraph.config.settings import get_settings
 from devgraph.dashboard import queries
 from devgraph.dashboard.events import EventBroadcaster
@@ -32,7 +40,7 @@ from devgraph.dashboard.git_info import get_git_log, get_git_status
 from devgraph.dashboard.layout_store import load_layout, save_layout
 from devgraph.dashboard.query_log import QueryLog
 from devgraph.graph.engine import GraphEngine, identity_key, provision_repository_schema
-from devgraph.graph.schema import NODE_LABELS
+from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.indexer.dispatch import full_scan
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.registry.store import RepoRegistry
@@ -140,6 +148,19 @@ def _reject_cross_site(request: Request) -> None:
     origin = request.headers.get("origin")
     if origin is not None and origin != f"{request.url.scheme}://{request.url.netloc}":
         raise HTTPException(status_code=403, detail="cross-origin request rejected")
+
+
+_ALL_REPOS_SCOPE = "__all__"
+
+# Worst state wins when the all-repos view merges several repositories.
+_SCHEMA_STATE_RANK = ("absent", "disabled", "applied", "never", "pending", "invalid")
+
+
+def _hash_color(name: str) -> str:
+    """A stable `#rrggbb` for a user-declared type with no colour of its own."""
+    hue = int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:2], "big") % 360
+    r, g, b = colorsys.hls_to_rgb(hue / 360, 0.55, 0.65)
+    return f"#{round(r * 255):02x}{round(g * 255):02x}{round(b * 255):02x}"
 
 
 def build_router(
@@ -312,6 +333,97 @@ def build_router(
             ],
         }
 
+    def _repo_schema(record: Any) -> dict[str, Any]:
+        """One repository's applied project types, colours and schema state."""
+        project_labels: list[str] = []
+        project_rels: list[str] = []
+        colors: dict[str, str] = {}
+        notices: list[str] = []
+        if not record.project_config_enabled:
+            return {"labels": [], "rels": [], "colors": colors, "state": "disabled", "notices": notices}
+
+        applied = engine.read_applied_schema(record.repo_id)
+        current = schema_file_hash(record.path)
+        if applied is not None:
+            project_labels = list(applied["labels"])
+            project_rels = list(applied["relationship_types"])
+        if current == ABSENT_SCHEMA_HASH and (applied is None or applied["hash"] == ABSENT_SCHEMA_HASH):
+            state = "absent"
+        elif applied is None:
+            state = "never"
+        elif current == applied["hash"]:
+            state = "applied"
+        else:
+            state = "pending"
+
+        try:
+            declaration = load_project_schema(record.path, respect_switch=False)
+        except ProjectSchemaError as exc:
+            state = "invalid"
+            notices.append(f"{record.repo_id}: schema file is invalid: {exc}")
+            declaration = None
+        if declaration is not None:
+            for node_type in declaration.node_types:
+                if node_type.color:
+                    colors[node_type.label] = node_type.color
+            for relationship in declaration.relationships:
+                if relationship.color:
+                    colors[relationship.type] = relationship.color
+        if state == "pending":
+            notices.append(f"{record.repo_id}: schema file changed since it was applied; rescan to apply it")
+        return {"labels": project_labels, "rels": project_rels, "colors": colors, "state": state, "notices": notices}
+
+    @router.get("/repos/{repo_id}/schema")
+    def repo_schema(repo_id: str) -> dict[str, Any]:
+        if repo_id == _ALL_REPOS_SCOPE:
+            records = registry.list_repos()
+        else:
+            _require_repo(repo_id)
+            records = [registry.get(repo_id)]
+
+        counts: dict[str, int] = {}
+        project_labels: list[str] = []
+        project_rels: list[str] = []
+        colors: dict[str, str] = {}
+        notices: list[str] = []
+        state = "absent"
+        for record in records:
+            for label, count in queries.summary_counts(engine, record.repo_id)["nodes_by_label"].items():
+                counts[label] = counts.get(label, 0) + count
+            info = _repo_schema(record)
+            project_labels += [x for x in info["labels"] if x not in project_labels]
+            project_rels += [x for x in info["rels"] if x not in project_rels]
+            for name, color in info["colors"].items():
+                colors.setdefault(name, color)  # first registered repo wins
+            notices += info["notices"]
+            if _SCHEMA_STATE_RANK.index(info["state"]) > _SCHEMA_STATE_RANK.index(state):
+                state = info["state"]
+
+        builtin_labels = set(NODE_LABELS)
+        builtin_rels = set(RELATIONSHIP_TYPES)
+        node_types = [
+            {"label": label, "origin": "builtin", "color": None, "count": counts.get(label, 0)}
+            for label in NODE_LABELS
+        ] + [
+            {"label": label, "origin": "project", "color": colors.get(label) or _hash_color(label),
+             "count": counts.get(label, 0)}
+            for label in project_labels
+            if label not in builtin_labels
+        ]
+        relationship_types = [
+            {"type": rel, "origin": "builtin", "color": None} for rel in RELATIONSHIP_TYPES
+        ] + [
+            {"type": rel, "origin": "project", "color": colors.get(rel) or _hash_color(rel)}
+            for rel in project_rels
+            if rel not in builtin_rels
+        ]
+        return {
+            "node_types": node_types,
+            "relationship_types": relationship_types,
+            "schema_state": state,
+            "notices": notices,
+        }
+
     @router.get("/repos/{repo_id}/search")
     def repo_search(repo_id: str, q: str, max_results: int = 15) -> dict[str, Any]:
         _require_repo(repo_id)
@@ -323,7 +435,7 @@ def build_router(
     # filename (it can only ever be an id the registry itself issued), so
     # this reserved id is matched by exact equality rather than being folded
     # into a pattern that would reopen that.
-    _ALL_REPOS_LAYOUT_ID = "__all__"
+    _ALL_REPOS_LAYOUT_ID = _ALL_REPOS_SCOPE
 
     def _require_layout_scope(repo_id: str) -> None:
         if repo_id != _ALL_REPOS_LAYOUT_ID:

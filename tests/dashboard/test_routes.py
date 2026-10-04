@@ -332,3 +332,139 @@ def test_settings_endpoint_never_exposes_password(client):
     body = res.json()
     assert "neo4j_password" not in body
     assert body["neo4j_uri"] == "bolt://127.0.0.1:7687"
+
+
+# --- GET /api/repos/{repo_id}/schema ---------------------------------------
+
+_FS_SCHEMA = """\
+version: 1
+node_types:
+  - label: File
+    key: [path]
+    metadata: [{name: path}]
+    source: {provider: filesystem, kind: file}
+    color: "#112233"
+  - label: Folder
+    key: [path]
+    metadata: [{name: path}]
+    source: {provider: filesystem, kind: folder}
+relationships:
+  - type: IS_CHILD_OF
+    provider: filesystem
+    from: [File, Folder]
+    to: Folder
+"""
+
+
+@pytest.fixture
+def schema_repo(engine, registry, tmp_path):
+    """A registered, scanned repo whose schema file declares File/Folder/IS_CHILD_OF."""
+    from devgraph.indexer.dispatch import full_scan
+
+    root = tmp_path / "schema_repo"
+    root.mkdir()
+    _init_git_repo(root)
+    (root / "a.txt").write_text("x")
+    (root / "devgraph.schema.yaml").write_text(_FS_SCHEMA)
+    record = registry.add_repo(str(root), repo_id="dash_schema")
+    try:
+        engine.upsert_repository("dash_schema", "Dash Schema", str(root))
+        full_scan(engine, "dash_schema", root)
+        client = TestClient(build_app(engine, registry, EventBroadcaster()))
+        yield client, root, record
+    finally:
+        engine.delete_repository("dash_schema")
+
+
+def test_schema_unknown_repo_404s(client):
+    assert client.get("/api/repos/nope/schema").status_code == 404
+
+
+def test_schema_without_a_file_is_the_builtins(client):
+    from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+
+    body = client.get("/api/repos/dash_repo_a/schema").json()
+    assert [t["label"] for t in body["node_types"]] == list(NODE_LABELS)
+    assert all(t["origin"] == "builtin" and t["color"] is None for t in body["node_types"])
+    assert [t["type"] for t in body["relationship_types"]] == list(RELATIONSHIP_TYPES)
+    assert all(t["origin"] == "builtin" and t["color"] is None for t in body["relationship_types"])
+    assert body["schema_state"] == "absent"
+    assert body["notices"] == []
+    counts = {t["label"]: t["count"] for t in body["node_types"]}
+    assert counts["Service"] == 2 and counts["Module"] == 1
+
+
+def test_schema_applied_lists_project_types_with_colours_and_counts(schema_repo):
+    client, _, _ = schema_repo
+    body = client.get("/api/repos/dash_schema/schema").json()
+    assert body["schema_state"] == "applied" and body["notices"] == []
+    project = {t["label"]: t for t in body["node_types"] if t["origin"] == "project"}
+    assert set(project) == {"File", "Folder"}
+    assert project["File"]["color"] == "#112233"
+    assert project["File"]["count"] == 2  # a.txt and the schema file itself
+    assert project["Folder"]["count"] >= 1
+    import re
+    assert re.fullmatch(r"#[0-9a-f]{6}", project["Folder"]["color"])
+    rels = {t["type"]: t for t in body["relationship_types"] if t["origin"] == "project"}
+    assert set(rels) == {"IS_CHILD_OF"} and rels["IS_CHILD_OF"]["color"]
+    # Deterministic: asking again gives the same colours.
+    again = client.get("/api/repos/dash_schema/schema").json()
+    assert again == body
+
+
+def test_schema_changed_after_apply_is_pending_and_hides_new_labels(schema_repo):
+    client, root, _ = schema_repo
+    (root / "devgraph.schema.yaml").write_text(
+        _FS_SCHEMA.replace(
+            "relationships:",
+            "  - label: Widget\n    key: [sku]\n    metadata: [{name: sku}]\nrelationships:",
+        )
+    )
+    body = client.get("/api/repos/dash_schema/schema").json()
+    assert body["schema_state"] == "pending"
+    labels = {t["label"] for t in body["node_types"]}
+    assert "Widget" not in labels and {"File", "Folder"} <= labels
+    assert body["notices"]
+
+
+def test_schema_invalid_file_reports_invalid_with_notice(schema_repo):
+    client, root, _ = schema_repo
+    (root / "devgraph.schema.yaml").write_text("version: [unclosed")
+    body = client.get("/api/repos/dash_schema/schema").json()
+    assert body["schema_state"] == "invalid"
+    assert body["notices"] and "invalid" in body["notices"][0].lower()
+    assert {"File", "Folder"} <= {t["label"] for t in body["node_types"]}
+
+
+def test_schema_disabled_repo_shows_builtins_only(schema_repo, registry):
+    client, _, _ = schema_repo
+    registry.set_project_config_enabled("dash_schema", False)
+    body = client.get("/api/repos/dash_schema/schema").json()
+    assert body["schema_state"] == "disabled"
+    assert all(t["origin"] == "builtin" for t in body["node_types"])
+    assert all(t["origin"] == "builtin" for t in body["relationship_types"])
+
+
+def test_schema_never_applied_file_shows_builtins(engine, registry, tmp_path):
+    root = tmp_path / "never"
+    root.mkdir()
+    _init_git_repo(root)
+    (root / "devgraph.schema.yaml").write_text(_FS_SCHEMA)
+    registry.add_repo(str(root), repo_id="dash_never")
+    try:
+        engine.upsert_repository("dash_never", "Dash Never", str(root))
+        c = TestClient(build_app(engine, registry, EventBroadcaster()))
+        body = c.get("/api/repos/dash_never/schema").json()
+        assert body["schema_state"] == "never"
+        assert all(t["origin"] == "builtin" for t in body["node_types"])
+    finally:
+        engine.delete_repository("dash_never")
+
+
+def test_schema_all_repos_is_the_union(schema_repo):
+    client, _, _ = schema_repo
+    body = client.get("/api/repos/__all__/schema").json()
+    project = {t["label"] for t in body["node_types"] if t["origin"] == "project"}
+    assert project == {"File", "Folder"}
+    assert {t["type"] for t in body["relationship_types"] if t["origin"] == "project"} == {"IS_CHILD_OF"}
+    assert body["schema_state"] == "applied"
