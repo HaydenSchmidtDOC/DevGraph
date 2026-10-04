@@ -217,6 +217,55 @@ def test_a_global_tool_with_a_builtin_name_is_ignored(tmp_path, monkeypatch):
     assert any(n.startswith("ignored: global tool 'search_component'") for n in current["notices"])
 
 
+SHADOW_PROJECT = PROJECT.replace("list_files", "search_component")
+PROJECT_SHADOW_NOTICE = "ignored: project tool 'search_component' shadows a locked tool; using the fixed implementation"
+GLOBAL_SHADOW_NOTICE = "ignored: global tool 'search_component' shadows a locked tool; using the fixed implementation"
+
+
+def search(server):
+    return asyncio.run(server.call_tool("search_component", {"repo_id": "demo", "query": "x"})).structured_content
+
+
+def test_a_shadowed_builtin_says_so_in_its_response(tmp_path, monkeypatch):
+    server, _ = build(tmp_path, monkeypatch, project=SHADOW_PROJECT)
+    result = search(server)
+    assert {"count", "results", "truncated"} <= set(result)
+    assert result["notices"] == [PROJECT_SHADOW_NOTICE]
+
+
+def test_a_builtin_shadowed_by_a_global_tool_says_so_in_its_response(tmp_path, monkeypatch):
+    store(tmp_path, monkeypatch, [{**G_COUNT, "name": "search_component"}])
+    server, _ = build(tmp_path, monkeypatch, project=SHADOW_PROJECT)
+    assert sorted(search(server)["notices"]) == sorted([GLOBAL_SHADOW_NOTICE, PROJECT_SHADOW_NOTICE])
+
+
+def test_the_shadow_notice_follows_a_reload(tmp_path, monkeypatch):
+    path = store(tmp_path, monkeypatch, [{**G_COUNT, "name": "search_component"}])
+    server, _ = build(tmp_path, monkeypatch)
+    assert search(server)["notices"] == [GLOBAL_SHADOW_NOTICE]
+    save_global_tools([G_COUNT], path)
+    assert server.devgraph_tool_plane.reload_if_changed() is True
+    assert "notices" not in search(server)
+
+
+def test_an_unshadowed_builtin_response_is_unchanged(tmp_path, monkeypatch):
+    for scoped in (True, False):
+        server, _ = build(tmp_path, monkeypatch, project=PROJECT, scoped=scoped)
+        assert set(search(server)) == {"count", "results", "truncated"}
+
+
+def test_an_unscoped_session_reports_no_shadowing(tmp_path, monkeypatch):
+    store(tmp_path, monkeypatch, [{**G_COUNT, "name": "search_component"}])
+    server, _ = build(tmp_path, monkeypatch, scoped=False)
+    assert set(search(server)) == {"count", "results", "truncated"}
+
+
+def test_a_shadowed_builtin_without_an_envelope_is_unchanged(tmp_path, monkeypatch):
+    server, _ = build(tmp_path, monkeypatch, project=PROJECT.replace("list_files", "explain_architecture"))
+    result = asyncio.run(server.call_tool("explain_architecture", {"repo_id": "demo"})).structured_content
+    assert "notices" not in result
+
+
 def test_disabling_the_project_config_keeps_the_global_tools(tmp_path, monkeypatch):
     from devgraph.config import project_switch
     from devgraph.registry.store import RepoRegistry

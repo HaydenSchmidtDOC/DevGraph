@@ -234,6 +234,26 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def _with_shadow_notices(fn: Callable[..., Any], shadowed: Callable[[], dict[str, list[str]]]) -> Callable[..., Any]:
+    """Wrap a built-in tool so its envelope carries the notices for declared tools its name shadows.
+
+    `shadowed()` is read on every call, so a tools-file reload is reflected at once.
+    Only a `{count, results, truncated}` envelope gets them: a list can't carry a key,
+    and adding one to another shape would change a result whose keys a client reads as
+    data. The result passes through untouched when nothing shadows the tool.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        result = fn(*args, **kwargs)
+        notices = shadowed().get(fn.__name__)
+        if notices and isinstance(result, dict) and {"count", "results", "truncated"} <= result.keys():
+            result = {**result, "notices": [*result.get("notices", []), *notices]}
+        return result
+
+    return wrapper
+
+
 def build_server(
     engine: GraphEngine,
     registry: RepoRegistry | None = None,
@@ -281,7 +301,8 @@ def build_server(
 
     def _instrumented_tool(*args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Any]:
         register = _register_tool(*args, **kwargs)
-        return lambda fn: register(_instrument(fn))
+        # `status` (the tool plane's, assigned below) is looked up at call time.
+        return lambda fn: register(_instrument(_with_shadow_notices(fn, lambda: status.shadowed)))
 
     server.tool = _instrumented_tool  # type: ignore[method-assign]
 

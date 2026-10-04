@@ -242,7 +242,11 @@ serves none). Built-in tools win, then project tools, then global tools. Two
 notices can appear in a tool's response envelope: `resolved: project override
 of global tool '<name>'` (the project's tool replaced a global one) and `used
 global tool '<name>': <reason>` (the global tool is served because the project
-tool of that name could not be). `devgraph://project-tools` lists each served
+tool of that name could not be). A built-in tool whose name a project or global
+tool also uses says so in its own `{count, results, truncated}` envelope:
+`ignored: project tool '<name>' shadows a locked tool; using the fixed
+implementation` (or `global tool`); built-ins that return another shape carry
+no notice. `devgraph://project-tools` lists each served
 tool's origin and the global tools file.
 
 `run_cypher` will not appear unless DevGraph's own config has

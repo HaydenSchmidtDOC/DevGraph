@@ -108,6 +108,8 @@ class ToolPlaneStatus:
     global_tools_file: str | None = None
     origins: dict[str, str] = field(default_factory=dict)  # served tool -> "global" | "project" | "project (overrides global)"
     functions: dict[str, Callable[..., Any]] = field(default_factory=dict, repr=False)  # served tool -> registered function
+    # built-in tool -> the response notices saying which declared tools of its name were ignored
+    shadowed: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -365,6 +367,7 @@ def _register_layers(
             status.notices.append(
                 f"ignored: global tool {tool.name!r} has the name of a built-in tool; using the built-in"
             )
+            _shadows(status, tool.name, "global")
         else:
             globals_by_name[tool.name] = tool
     project_tools = project.declared.tools if project.declared else ()
@@ -373,6 +376,7 @@ def _register_layers(
             status.notices.append(
                 f"ignored: project tool {tool.name!r} has the name of a built-in tool; using the built-in"
             )
+            _shadows(status, tool.name, "project")
 
     def register(tool: CypherTool, origin: str, notices: list[str]) -> str | None:
         """Serve `tool`; on failure record a status notice and return it."""
@@ -415,6 +419,12 @@ def _register_layers(
         else:
             reason = None
         register(tool, "global", [f"used global tool {name!r}: {reason}"] if reason else [])
+
+
+def _shadows(status: ToolPlaneStatus, name: str, layer: str) -> None:
+    """Record that a `layer` tool named `name` was ignored for the built-in, for that built-in's responses."""
+    notice = f"ignored: {layer} tool {name!r} shadows a locked tool; using the fixed implementation"
+    status.shadowed.setdefault(name, []).append(notice)
 
 
 def _parse_fingerprint(repo: Any, fingerprint: bytes | str) -> ProjectTools:
@@ -517,7 +527,7 @@ class ProjectToolPlane:
     def _adopt(self, new: ToolPlaneStatus) -> None:
         """Make `new` the session's status, in place (the status resource holds this object)."""
         for name in ("tools_file", "global_tools_file", "served", "parameter_names", "notices",
-                     "definitions", "origins", "functions"):
+                     "definitions", "origins", "functions", "shadowed"):
             setattr(self.status, name, getattr(new, name))
 
     def _restore_served(self, partial: ToolPlaneStatus, removed: list[str]) -> None:
