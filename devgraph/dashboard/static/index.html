@@ -799,7 +799,7 @@ table.dstable input[type="text"] { width: 100%; }
 <div class="modal-overlay" id="configModal"><div class="modal-box cfg-modal-box">
   <h4 id="configModalTitle"></h4>
   <div class="banner warn" id="configModalWarn" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg><span id="configModalWarnText"></span></div>
-  <div class="field" id="configDestField" style="display:none"><label for="configDest">Save to</label><select id="configDest"></select></div>
+  <div class="field" id="configDestField" style="display:none"><label for="configDest" id="configDestLabel">Save to</label><select id="configDest"></select></div>
   <textarea class="cfg-yaml" id="configYaml" spellcheck="false" aria-label="Entry YAML"></textarea>
   <div class="cfg-confirm" id="configModalConfirm" style="display:none"></div>
   <div class="cfg-error" id="configModalError" style="display:none"></div>
@@ -3017,6 +3017,20 @@ function configSection(title, file, badges, onAdd, body, onReset) {
   sec.appendChild(body);
   return sec;
 }
+/* where a project entry can be copied: every other listed (active) repository,
+   plus the global store for a tool (there is no global schema store) */
+function configCopyDestinations(model, scope, section) {
+  const repos = model.projects.filter(p => p.repo_id !== scope).map(p => ({ value: p.repo_id, label: p.repo_id }));
+  return section === "tools" ? [...repos, { value: CONFIG_GLOBAL, label: "Global store" }] : repos;
+}
+/* Copy to… is offered on a project entry that is unambiguous (editable), is not
+   a tool the destination would refuse as shadowing a locked one, and has
+   somewhere to go. A global tool's editor already offers "Save to" a repo. */
+function configCanCopy(model, scope, section, item) {
+  if (scope === CONFIG_GLOBAL || item.editable === false) return false;
+  if (section === "tools" && (item.badges || []).some(b => b.kind === "locked-shadow")) return false;
+  return configCopyDestinations(model, scope, section).length > 0;
+}
 /* the editable entries' rows, appended to box (a global entry carries the GLOBAL flag) */
 function configEntryRows(box, scope, section, items, nameKey) {
   items.forEach(item => {
@@ -3027,6 +3041,8 @@ function configEntryRows(box, scope, section, items, nameKey) {
       configButton(item.origin === "project (overrides global)" ? "Remove override" : "Delete",
         () => openConfigEditor({ scope, section, op: "delete", name, yaml: item.yaml })),
     ];
+    if (configCanCopy(configModel, scope, section, item))
+      actions.push(configButton("Copy to…", () => openConfigEditor({ scope, section, op: "copy", name, yaml: item.yaml })));
     box.appendChild(configRow(name, item.tool_id || "", extras, actions));
   });
   return box;
@@ -3123,28 +3139,49 @@ async function configSend(req) {
 /* where the open editor writes. A rename (PUT of the old name) happens only
    within the entry's own scope. A global tool saved to a repo is a POST of the
    YAML's own name there; only when that comes back 409 exists (the server
-   names the taken entry, `crossName`) does it become a PUT of that name. */
+   names the taken entry, `crossName`) does it become a PUT of that name.
+   A copy is the same cross-scope write, always to the chosen destination. */
 function configEditTarget(edit = configEdit) {
+  if (edit.op === "copy") return edit.crossName ? { scope: edit.dest, op: "replace", name: edit.crossName } : { scope: edit.dest, op: "add", name: null };
   if (edit.op !== "replace" || edit.dest === edit.scope) return { scope: edit.scope, op: edit.op, name: edit.name };
   return edit.crossName ? { scope: edit.dest, op: "replace", name: edit.crossName } : { scope: edit.dest, op: "add", name: null };
 }
+/* a copy's "Replaces …" line: names the destination's own entry the write would replace */
+function configCopyReplaces(edit) {
+  return "Replaces " + (edit.dest === CONFIG_GLOBAL ? "the global store" : edit.dest) + "'s own " +
+    CONFIG_SECTIONS[edit.section].noun + " " + edit.crossName + ".";
+}
+function configGlobalReach(name) {
+  const n = configModel.projects.length;
+  const over = configModel.projects
+    .filter(p => p.tools.entries.some(e => e.name === name && e.origin === "project (overrides global)"))
+    .map(p => p.repo_id);
+  return "Global tools are served in every registered repository's MCP sessions (" + n + " repo" + (n === 1 ? "" : "s") + ")." +
+    (over.length ? " Overridden in: " + over.join(", ") + "." : "");
+}
 function configWarningText(edit) {
+  if (edit.op === "copy") {
+    const replaces = edit.crossName ? " " + configCopyReplaces(edit) : "";
+    if (edit.dest === CONFIG_GLOBAL) {
+      return configGlobalReach(edit.name) + " Copying adds it there; " + edit.scope + "'s own " + edit.name +
+        " keeps overriding it in " + edit.scope + "." + replaces;
+    }
+    const block = configScopeBlock(edit.dest);
+    const file = edit.section === "tools" ? block.tools.file : block.schema.file;
+    return "Writes to " + edit.dest + "/" + file + "; " + edit.scope + " is unchanged." + replaces;
+  }
   if (edit.scope !== CONFIG_GLOBAL || edit.op === "add") return "";
   if (edit.dest !== CONFIG_GLOBAL) {
     return "Writes a project override to " + edit.dest + "/devgraph.tools.yaml; the global tool is unchanged." +
       (edit.crossName ? " Replaces " + edit.dest + "'s own " + edit.crossName + "." : "");
   }
-  const n = configModel.projects.length;
-  const over = configModel.projects
-    .filter(p => p.tools.entries.some(e => e.name === edit.name && e.origin === "project (overrides global)"))
-    .map(p => p.repo_id);
-  return "Global tools are served in every registered repository's MCP sessions (" + n + " repo" + (n === 1 ? "" : "s") + ")." +
-    (over.length ? " Overridden in: " + over.join(", ") + "." : "");
+  return configGlobalReach(edit.name);
 }
 function configModalTitle(edit) {
   const noun = CONFIG_SECTIONS[edit.section].noun;
   const where = edit.scope === CONFIG_GLOBAL ? "global store" : edit.scope;
   if (edit.op === "add") return "Add a " + noun + " (" + where + ")";
+  if (edit.op === "copy") return "Copy " + noun + " " + edit.name + " from " + edit.scope;
   if (edit.op === "replace" && edit.dest !== edit.scope) return "Save global tool " + edit.name + " to " + edit.dest;
   return (edit.op === "delete" ? "Delete " : "Edit ") + noun + " " + edit.name + " (" + where + ")";
 }
@@ -3156,16 +3193,17 @@ const CONFIG_ARM_MS = 400;
 function renderConfigModal() {
   const edit = configEdit;
   const warn = configWarningText(edit);
-  const verb = edit.op === "delete" ? "Delete" : "Save";
+  const verb = edit.op === "delete" ? "Delete" : edit.op === "copy" ? "Copy" : "Save";
   document.getElementById("configModalTitle").textContent = configModalTitle(edit);
   document.getElementById("configModalWarnText").textContent = warn;
   configShow("configModalWarn", !!warn);
-  configShow("configDestField", edit.step === "edit" && edit.scope === CONFIG_GLOBAL && edit.section === "tools" && edit.op === "replace");
+  configShow("configDestField", edit.step === "edit" &&
+    (edit.op === "copy" || (edit.scope === CONFIG_GLOBAL && edit.section === "tools" && edit.op === "replace")));
   configShow("configYaml", edit.step === "edit");
   const confirm = document.getElementById("configModalConfirm");
   confirm.replaceChildren();
   if (edit.confirmed) {
-    confirm.appendChild(configEl("div", "", "Check before " + (edit.op === "delete" ? "deleting" : "saving") + ":"));
+    confirm.appendChild(configEl("div", "", "Check before " + (edit.op === "delete" ? "deleting" : edit.op === "copy" ? "copying" : "saving") + ":"));
     const list = configEl("ul", "");
     edit.warnings.forEach(w => list.appendChild(configEl("li", "", w)));
     confirm.appendChild(list);
@@ -3206,27 +3244,33 @@ function configSetError(text, reload) {
   configShow("configModalError", !!text);
   configShow("configModalReload", !!reload);
 }
-/* opts: { scope, section, op: add|replace|delete, name, yaml } */
+/* opts: { scope, section, op: add|replace|delete|copy, name, yaml } */
 function openConfigEditor(opts) {
   const isGlobal = opts.scope === CONFIG_GLOBAL;
+  const copy = opts.op === "copy";
+  /* a copy goes to another scope: its choices, never the source (which it only reads) */
+  const choices = copy ? configCopyDestinations(configModel, opts.scope, opts.section)
+    : [{ value: CONFIG_GLOBAL, label: "Global store" }, ...configModel.projects.map(p => ({ value: p.repo_id, label: p.repo_id }))];
   const fps = {};
   [CONFIG_GLOBAL, ...configModel.projects.map(p => p.repo_id)].forEach(s => {
-    if (s === opts.scope || (isGlobal && opts.section === "tools")) fps[s] = configFingerprint(s, opts.section);
+    if (copy ? choices.some(c => c.value === s) : s === opts.scope || (isGlobal && opts.section === "tools")) fps[s] = configFingerprint(s, opts.section);
   });
-  configEdit = { ...opts, dest: opts.scope, step: isGlobal && opts.op !== "add" ? "warn" : "edit", fps,
+  configEdit = { ...opts, dest: copy ? choices[0].value : opts.scope, step: isGlobal && opts.op !== "add" ? "warn" : "edit", fps,
     confirmed: false, warnings: [], crossName: null, busy: "", label: null, armedAt: 0 };
+  document.getElementById("configDestLabel").textContent = copy ? "Copy to" : "Save to";
   const dest = document.getElementById("configDest");
   dest.replaceChildren();
-  [[CONFIG_GLOBAL, "Global store"], ...configModel.projects.map(p => [p.repo_id, p.repo_id])].forEach(([value, label]) => {
+  choices.forEach(({ value, label }) => {
     const o = configEl("option", "", label);
     o.value = value;
     dest.appendChild(o);
   });
-  dest.value = CONFIG_GLOBAL;
+  dest.value = copy ? choices[0].value : CONFIG_GLOBAL;
   dest.onchange = () => { configEdit.dest = dest.value; configEdit.crossName = null; configEdit.confirmed = false; renderConfigModal(); };
   const yaml = document.getElementById("configYaml");
   yaml.value = opts.yaml || "";
-  yaml.readOnly = opts.op === "delete";
+  /* a copy is the entry as shown; edit it in the destination afterwards */
+  yaml.readOnly = opts.op === "delete" || copy;
   /* the text decides the name, so a known-taken name and any confirm are stale */
   yaml.oninput = () => { configEdit.crossName = null; if (configEdit.confirmed) { configEdit.confirmed = false; renderConfigModal(); } };
   document.getElementById("configModalSave").onclick = configSave;
@@ -3246,7 +3290,7 @@ async function configSave(ev) {
   const edit = configEdit;
   if (!edit || edit.busy || (ev && ev.detail > 1) || Date.now() - edit.armedAt < CONFIG_ARM_MS) return;
   if (edit.step === "warn") { edit.step = "edit"; renderConfigModal(); return; }
-  const yaml = document.getElementById("configYaml").value;
+  const yaml = edit.op === "copy" ? edit.yaml : document.getElementById("configYaml").value;
   const send = (t, dry) => configSend(configWriteRequest(t.op, t.scope, edit.section, t.name, yaml, edit.fps[t.scope], dry));
   const busy = text => { edit.busy = text; renderConfigModal(); };
   try {
@@ -3261,7 +3305,7 @@ async function configSave(ev) {
       if (dry.status === 409 && t.op === "add" && t.scope !== edit.scope && detail && detail.code === "exists" && detail.name) {
         edit.crossName = String(detail.name);
         t = configEditTarget(edit);
-        warnings.push("Replaces " + t.scope + "'s own " + t.name + ".");
+        warnings.push(edit.op === "copy" ? configCopyReplaces(edit) : "Replaces " + t.scope + "'s own " + t.name + ".");
         dry = await send(t, true);
         if (configEdit !== edit) return;
       }
@@ -3273,7 +3317,7 @@ async function configSave(ev) {
       warnings.push(...((dry.body && dry.body.warnings) || []).map(String));
       if (warnings.length) { edit.confirmed = true; edit.warnings = warnings; return; }
     }
-    busy(edit.op === "delete" ? "Deleting…" : "Saving…");
+    busy(edit.op === "delete" ? "Deleting…" : edit.op === "copy" ? "Copying…" : "Saving…");
     const t = configEditTarget(edit);
     const res = await send(t, false);
     const mine = configEdit === edit;
@@ -3288,9 +3332,10 @@ async function configSave(ev) {
     /* written even if the editor was cancelled meanwhile: the page shows what is on disk */
     configSetStatus([...(res.body.warnings || []), ...(res.body.notes || [])].map(String));
     applyConfigScope(t.scope, res.body.scope);
-    /* tool resolution crosses scopes (a global tool's "overridden in" badge,
-       a project tool's "overrides global"), so refresh the rest quietly */
-    if (edit.section === "tools") await loadConfigPage(true);
+    /* badges cross scopes (a global tool's "overridden in", a project tool's
+       "overrides global", a schema conflict naming another repo), so after
+       every write refresh the rest quietly */
+    await loadConfigPage(true);
   } finally {
     edit.busy = "";
     if (configEdit === edit) renderConfigModal();

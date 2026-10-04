@@ -60,7 +60,7 @@ const mkEl = tag => {
   return el;
 };
 const ids = ["configScopes", "configStatus", "configModal", "configModalTitle", "configModalWarn", "configModalWarnText",
-  "configDestField", "configDest", "configYaml", "configModalConfirm", "configModalError", "configModalReload",
+  "configDestField", "configDestLabel", "configDest", "configYaml", "configModalConfirm", "configModalError", "configModalReload",
   "configModalCancel", "configModalSave", "pane-config",
   "configResetModal", "configResetTitle", "configResetList", "configResetPhraseField", "configResetPhraseLabel", "configResetTyped",
   "configResetError", "configResetRecheck", "configResetCancel", "configResetConfirm"];
@@ -76,6 +76,8 @@ let focused = null;
 let clock = 1e6;
 /* when set, every fetch waits on it -- a request still in flight */
 let gate = null;
+/* when set, only a full GET /api/config waits on it (the refresh after a write) */
+let reloadGate = null;
 let fetchCalls = [];
 let respond = () => ({ status: 500, body: { detail: "no handler" } });
 /* what a full GET /api/config returns (the page refreshes after a tool write) */
@@ -88,12 +90,13 @@ const globals = {
     /* the answer is what the server held when the request arrived, however late it lands */
     const { status, body } = url === "/api/config" && configPayload ? { status: 200, body: configPayload } : respond(url, init || {});
     if (gate) await gate;
+    if (url === "/api/config" && reloadGate) await reloadGate;
     return { ok: status >= 200 && status < 300, status, json: async () => JSON.parse(JSON.stringify(body)) };
   },
 };
 const api = new Function(...Object.keys(globals),
   configSrc + "\nreturn { CONFIG_GLOBAL, renderConfigPage, renderConfigScope, configWriteRequest, describeConfigError," +
-  " openConfigEditor, configEditTarget, loadConfigPage, applyConfigScope, configModalKey, CONFIG_SECTIONS," +
+  " openConfigEditor, configEditTarget, configCopyDestinations, configCanCopy, loadConfigPage, applyConfigScope, configModalKey, CONFIG_SECTIONS," +
   " configResetRequest, configResetPhrase, configResetReady, describeConfigReset, configToggleRequest," +
   " get model() { return configModel; }, get edit() { return configEdit; }, get reset() { return configReset; } };")(...Object.values(globals));
 
@@ -232,14 +235,21 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("a project entry skips the global warning step", !shown(els.configModalWarn) && shown(els.configYaml), els.configModalWarn.style.display);
   els.configYaml.value = "label: Runbook\nkey: [id]\n";
   await els.configYaml.fire("input");
-  await press(els.configModalSave);
+  let releaseReload;
+  reloadGate = new Promise(r => { releaseReload = r; });
+  clock += 1000;
+  let saving = els.configModalSave.fire("click");
+  for (let i = 0; i < 20 && lastCall().url !== "/api/config"; i++) await new Promise(r => setTimeout(r, 0));
+  check("...the scope block is re-rendered from the response", !!rowFor(card("repo-a"), "fresh_tool"), card("repo-a").textContent);
+  check("...and then the whole page refreshes, after a schema write too (conflict badges cross repos)",
+    lastCall().url === "/api/config", lastCall().url);
+  reloadGate = null; releaseReload(); await saving;
   check("Save sends a dry run first, then the write",
     fetchCalls.length >= 2 && body(fetchCalls[0]).dry_run === true && body(fetchCalls[1]).dry_run === false, JSON.stringify(fetchCalls));
   check("...both PUT to the entry with the schema file's fingerprint",
     fetchCalls.slice(0, 2).every(c => c.url === "/api/config/repo-a/schema/node_types/Runbook" && c.init.method === "PUT" &&
       ifMatch(c) === '"sha256:repo-a-schema"' && body(c).yaml === "label: Runbook\nkey: [id]\n"), JSON.stringify(fetchCalls));
   check("on success the modal closes", !els.configModal.classList.contains("open"), els.configModal.className);
-  check("...the scope block is re-rendered from the response", !!rowFor(card("repo-a"), "fresh_tool"), card("repo-a").textContent);
   check("...and the notes are shown as text", els.configStatus.textContent.includes("not committed"), els.configStatus.textContent);
   api.renderConfigPage(MODEL());
 
@@ -291,7 +301,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("...and asks for a second click", els.configModalSave.textContent === "Delete anyway", els.configModalSave.textContent);
   check("...with the modal still open", els.configModal.classList.contains("open"), els.configModal.className);
   await press(els.configModalSave);
-  check("the second click deletes for real", fetchCalls.length === 2 &&
+  check("the second click deletes for real", writes().length === 2 &&
     fetchCalls[1].url === "/api/config/repo-a/schema/node_types/Runbook" && fetchCalls[1].init.method === "DELETE" &&
     ifMatch(fetchCalls[1]) === '"sha256:repo-a-schema"', JSON.stringify(fetchCalls));
   api.renderConfigPage(MODEL());
@@ -444,7 +454,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     fetchCalls.length === 1 && fetchCalls[0].url.endsWith("?dry_run=1"), JSON.stringify(fetchCalls));
   check("...focus is off the confirm button", focused === els.configYaml, focused && focused.tagName);
   await press(els.configModalSave);
-  check("a deliberate click later still confirms", fetchCalls.length === 2 && fetchCalls[1].init.method === "DELETE" &&
+  check("a deliberate click later still confirms", writes().length === 2 && fetchCalls[1].init.method === "DELETE" &&
     !fetchCalls[1].url.includes("dry_run"), JSON.stringify(fetchCalls));
 
   // 13b. Save is disabled and says so while busy
@@ -952,6 +962,231 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     fetchCalls.length === 2 && switchOf("repo-a").checked === true && switchOf("repo-a").disabled === false &&
     card("repo-a").textContent.includes("could not update the registry"), card("repo-a").textContent);
   toggleFail = null;
+
+  // 25. Copy to…: which rows offer it, and where to
+  configPayload = MODEL();
+  const CONFLICT = { level: "error", kind: "schema-conflict", text: "Key conflict with repo-b",
+    detail: "incompatible declarations of label 'runbook' in one shared database: repo-a declares Runbook keyed on (slug); repo-b declares Runbook keyed on (id)." };
+  const COPY_MODEL = () => {
+    const a = project("repo-a", [
+      { name: "hot_paths", tool_id: "repo-a_hot_paths", yaml: "name: hot_paths\n", origin: "project (overrides global)",
+        badges: [{ level: "info", kind: "overrides-global", text: "Overrides global tool", detail: "wins" }] },
+      { name: "mine", tool_id: "repo-a_mine", yaml: "name: mine\ndescription: d\ncypher: x\n", origin: "project", badges: [] },
+      { name: "find_callers", tool_id: "repo-a_find_callers", yaml: "name: find_callers\n", origin: "project",
+        badges: [{ level: "warn", kind: "locked-shadow", text: "Ignored: shadows a locked tool", detail: "" }] },
+    ]);
+    a.schema.node_types = [{ label: "Runbook", yaml: "label: Runbook\nkey: [slug]\n", editable: true, badges: [CONFLICT] },
+      { label: HOSTILE, yaml: "label: '" + HOSTILE + "'\n", editable: true, badges: [] }];
+    a.schema.relationships = [{ type: "DOCUMENTS", yaml: "type: DOCUMENTS\nfrom: Runbook\nto: Service\n", editable: true, badges: [] },
+      { type: "OWNS", yaml: "type: OWNS\n", editable: false, badges: [{ level: "warn", kind: "ambiguous", text: "Declared more than once", detail: "" }] }];
+    return { global: globalBlock(), projects: [a, project("repo-b"), project(HOSTILE)] };
+  };
+  api.renderConfigPage(COPY_MODEL());
+  let ca = card("repo-a");
+  const copyBtn = (scope, name) => buttons(rowFor(card(scope), name), "Copy to…");
+  check("Copy to… is on project node types, relationships and tools",
+    copyBtn("repo-a", "Runbook").length === 1 && copyBtn("repo-a", "DOCUMENTS").length === 1 && copyBtn("repo-a", "mine").length === 1 &&
+    copyBtn("repo-a", "hot_paths").length === 1, ca.textContent);
+  check("...not on an ambiguous relationship", copyBtn("repo-a", "OWNS").length === 0, rowFor(ca, "OWNS").textContent);
+  check("...not on a tool that shadows a locked one", copyBtn("repo-a", "find_callers").length === 0, rowFor(ca, "find_callers").textContent);
+  check("...and not on global tools (their editor's Save to does that)",
+    find(card("__global__"), e => e.tagName === "BUTTON" && e.textContent === "Copy to…").length === 0, card("__global__").textContent);
+  {
+    const solo = { global: globalBlock(), projects: [COPY_MODEL().projects[0]] };
+    check("with one repository a schema entry has nowhere to go, a tool still has the global store",
+      !api.configCanCopy(solo, "repo-a", "node_types", solo.projects[0].schema.node_types[0]) &&
+      !api.configCanCopy(solo, "repo-a", "relationships", solo.projects[0].schema.relationships[0]) &&
+      api.configCanCopy(solo, "repo-a", "tools", solo.projects[0].tools.entries[1]), "wrong visibility with one repo");
+    api.renderConfigPage(solo);
+    check("...and the rendered rows agree", copyBtn("repo-a", "Runbook").length === 0 && copyBtn("repo-a", "mine").length === 1,
+      card("repo-a").textContent);
+    api.renderConfigPage(COPY_MODEL());
+  }
+  const destsOf = (scope, section) => JSON.stringify(api.configCopyDestinations(api.model, scope, section).map(d => d.value));
+  check("schema destinations are the other repositories, never the source or the global store",
+    destsOf("repo-a", "node_types") === JSON.stringify(["repo-b", HOSTILE]) && destsOf("repo-b", "relationships") === JSON.stringify(["repo-a", HOSTILE]),
+    destsOf("repo-a", "node_types"));
+  check("tool destinations add the global store", destsOf("repo-a", "tools") === JSON.stringify(["repo-b", HOSTILE, "__global__"]),
+    destsOf("repo-a", "tools"));
+  const conflictBadge = byClass(rowFor(card("repo-a"), "Runbook"), "cfg-badge")[0];
+  check("a schema conflict badge shows its text as an error, with the detail on hover",
+    conflictBadge && conflictBadge.textContent === "Key conflict with repo-b" && conflictBadge.classList.contains("error") &&
+    conflictBadge.dataset.tip === CONFLICT.detail && tooltips.includes(conflictBadge), conflictBadge && conflictBadge.className);
+
+  // 26. the copy dialog: read-only, titled, a destination other than the source
+  fetchCalls = [];
+  await copyBtn("repo-a", "Runbook")[0].fire("click");
+  check("Copy opens the editor titled 'Copy node type Runbook from repo-a'",
+    els.configModal.classList.contains("open") && els.configModalTitle.textContent === "Copy node type Runbook from repo-a",
+    els.configModalTitle.textContent);
+  check("...with the source entry's YAML, read-only", els.configYaml.value === "label: Runbook\nkey: [slug]\n" && els.configYaml.readOnly === true &&
+    shown(els.configYaml), String(els.configYaml.readOnly));
+  check("...a 'Copy to' list without the source, defaulting to the first other repo",
+    shown(els.configDestField) && els.configDestLabel.textContent === "Copy to" &&
+    JSON.stringify(els.configDest.children.map(o => o.value)) === JSON.stringify(["repo-b", HOSTILE]) && els.configDest.value === "repo-b" &&
+    api.edit.dest === "repo-b", JSON.stringify(els.configDest.children.map(o => o.value)));
+  check("...saying where it writes and that the source is unchanged",
+    els.configModalWarnText.textContent === "Writes to repo-b/devgraph.schema.yaml; repo-a is unchanged." && shown(els.configModalWarn),
+    els.configModalWarnText.textContent);
+  check("...a Copy button, nothing sent yet", els.configModalSave.textContent === "Copy" && fetchCalls.length === 0, els.configModalSave.textContent);
+  t = api.configEditTarget();
+  check("the target is an add in the destination", t.scope === "repo-b" && t.op === "add" && t.name === null, JSON.stringify(t));
+  for (let i = 0; i < 5; i++) { clock += 30; await els.configModalSave.fire("click", 0); }
+  check("held Enter right as the dialog opens sends nothing", fetchCalls.length === 0, JSON.stringify(fetchCalls));
+
+  // 27. absent in the destination: dry-run POST, then the POST, same If-Match; the page reloads
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [],
+    notes: ["Written to devgraph.schema.yaml; not committed.", "Applied after the next rescan."], scope: project("repo-b") } });
+  await press(els.configModalSave);
+  check("an absent entry is dry-run then written as a POST to the destination with its fingerprint and the source YAML",
+    writes().length === 2 && writes().every(c => c.url === "/api/config/repo-b/schema/node_types" && c.init.method === "POST" &&
+      ifMatch(c) === '"sha256:repo-b-schema"' && body(c).yaml === "label: Runbook\nkey: [slug]\n") &&
+    body(writes()[0]).dry_run === true && body(writes()[1]).dry_run === false, JSON.stringify(writes()));
+  check("...never touching the source", !fetchCalls.some(c => c.url.includes("repo-a")), JSON.stringify(fetchCalls));
+  check("...closes the dialog, shows the notes and reloads the whole page",
+    !els.configModal.classList.contains("open") && els.configStatus.textContent.includes("not committed") && lastCall().url === "/api/config",
+    JSON.stringify([els.configStatus.textContent, lastCall().url]));
+
+  // 28. exists in the destination: confirm 'Replaces …', then PUT with the dry run's If-Match
+  api.renderConfigPage(COPY_MODEL());
+  fetchCalls = [];
+  respond = (url, init) => {
+    const b = JSON.parse(init.body);
+    if (init.method === "POST") return { status: 409, body: { detail: { code: "exists", name: "Runbook", message: "node type 'Runbook' already exists" } } };
+    return { status: 200, body: { ok: true, written: !b.dry_run, warnings: [], notes: [], scope: project("repo-b") } };
+  };
+  await copyBtn("repo-a", "Runbook")[0].fire("click");
+  await press(els.configModalSave);
+  check("a taken name: the dry-run POST finds it, then the PUT is dry-run",
+    writes().length === 2 && writes()[0].init.method === "POST" && writes()[1].init.method === "PUT" &&
+    writes()[1].url === "/api/config/repo-b/schema/node_types/Runbook" && writes().every(c => body(c).dry_run === true &&
+    ifMatch(c) === '"sha256:repo-b-schema"'), JSON.stringify(writes()));
+  check("...and asks to confirm 'Replaces repo-b's own node type Runbook.'",
+    els.configModalSave.textContent === "Copy anyway" && els.configModalConfirm.textContent.includes("Replaces repo-b's own node type Runbook.") &&
+    els.configModalWarnText.textContent.includes("Replaces repo-b's own node type Runbook."), els.configModalConfirm.textContent);
+  t = api.configEditTarget();
+  check("...the target is now a replace of that name", t.scope === "repo-b" && t.op === "replace" && t.name === "Runbook", JSON.stringify(t));
+  await els.configModalSave.fire("click", 2);
+  for (let i = 0; i < 5; i++) { clock += 30; await els.configModalSave.fire("click", 0); }
+  check("a double-click or held Enter cannot reach the replace", writes().length === 2, JSON.stringify(writes()));
+  /* a refresh lands meanwhile with a newer destination fingerprint: the write
+     still carries the one the dry run was reviewed against (so it 412s, never overwrites unseen) */
+  { const newer = project("repo-b"); newer.schema.fingerprint = "sha256:repo-b-schema-newer"; api.applyConfigScope("repo-b", newer); }
+  await press(els.configModalSave);
+  check("the confirmed write PUTs with the dry run's If-Match",
+    writes().length === 3 && writes()[2].init.method === "PUT" && writes()[2].url === "/api/config/repo-b/schema/node_types/Runbook" &&
+    body(writes()[2]).dry_run === false && ifMatch(writes()[2]) === '"sha256:repo-b-schema"', JSON.stringify(writes()));
+  check("...and reloads the page", lastCall().url === "/api/config", lastCall().url);
+
+  // 29. dry-run warnings (a conflict the copy would create) need a confirm; a new destination withdraws it
+  api.renderConfigPage(COPY_MODEL());
+  fetchCalls = [];
+  const CWARN = "Creates a schema conflict: incompatible declarations of label 'runbook' <b>x</b>";
+  respond = (url, init) => {
+    const b = JSON.parse(init.body);
+    return { status: 200, body: { ok: true, written: !b.dry_run, warnings: b.dry_run ? [CWARN] : [], notes: [], scope: project("repo-b") } };
+  };
+  await copyBtn("repo-a", "Runbook")[0].fire("click");
+  await press(els.configModalSave);
+  check("a dry run that warns stops for a confirm, listing the warning as text",
+    writes().length === 1 && els.configModalSave.textContent === "Copy anyway" && els.configModalConfirm.textContent.includes(CWARN) &&
+    !els.configModalConfirm._html.includes("<b>") && els.configModalConfirm.textContent.includes("Check before copying:"),
+    els.configModalConfirm.textContent);
+  els.configDest.value = HOSTILE;
+  await els.configDest.fire("change");
+  check("changing the destination withdraws the confirm", els.configModalSave.textContent === "Copy" && !shown(els.configModalConfirm) &&
+    api.edit.crossName === null, els.configModalSave.textContent);
+  await press(els.configModalSave);
+  check("...so the next click dry-runs the new destination (its id encoded, its fingerprint)",
+    writes().length === 2 && body(writes()[1]).dry_run === true &&
+    writes()[1].url === "/api/config/" + encodeURIComponent(HOSTILE) + "/schema/node_types" && ifMatch(writes()[1]) === '"sha256:' + HOSTILE + '-schema"',
+    JSON.stringify(writes()));
+  await press(els.configModalSave);
+  check("...and the confirm writes there", writes().length === 3 && body(writes()[2]).dry_run === false &&
+    writes()[2].url === "/api/config/" + encodeURIComponent(HOSTILE) + "/schema/node_types", JSON.stringify(writes()));
+
+  // 30. an identical relationship: 409 exists without a name -> a message, no write
+  api.renderConfigPage(COPY_MODEL());
+  fetchCalls = [];
+  const SAME = "repo-b already declares this identical relationship; nothing to copy.";
+  respond = () => ({ status: 409, body: { detail: { code: "exists", message: SAME } } });
+  await copyBtn("repo-a", "DOCUMENTS")[0].fire("click");
+  check("copying a relationship is titled for it", els.configModalTitle.textContent === "Copy relationship DOCUMENTS from repo-a",
+    els.configModalTitle.textContent);
+  await press(els.configModalSave);
+  check("an identical relationship in the destination shows the server's message and writes nothing",
+    writes().length === 1 && body(writes()[0]).dry_run === true && writes()[0].init.method === "POST" &&
+    writes()[0].url === "/api/config/repo-b/schema/relationships" && els.configModalError.textContent === SAME && shown(els.configModalError) &&
+    !shown(els.configModalReload) && els.configModal.classList.contains("open") && els.configModalSave.textContent === "Copy",
+    JSON.stringify([writes(), els.configModalError.textContent]));
+  els.configModalCancel.fire("click");
+
+  // 31. 412 from the destination: Reload fetches the destination, keeps the dialog, the next try carries its fingerprint
+  api.renderConfigPage(COPY_MODEL());
+  fetchCalls = [];
+  const freshDest = project("repo-b"); freshDest.schema.fingerprint = "sha256:repo-b-schema-2";
+  respond = (url, init) => {
+    if (!init.method) return { status: 200, body: freshDest };
+    return ifMatch({ init }) === '"sha256:repo-b-schema"'
+      ? { status: 412, body: { detail: { code: "stale", message: "changed on disk" } } }
+      : { status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: freshDest } };
+  };
+  await copyBtn("repo-a", "Runbook")[0].fire("click");
+  await press(els.configModalSave);
+  check("a stale destination keeps the dialog and offers Reload, writing nothing",
+    els.configModal.classList.contains("open") && shown(els.configModalReload) && writes().length === 1 && body(writes()[0]).dry_run === true,
+    JSON.stringify(writes()));
+  await els.configModalReload.fire("click");
+  check("Reload fetches the destination, not the source", lastCall().url === "/api/config/repo-b" &&
+    els.configYaml.value === "label: Runbook\nkey: [slug]\n" && els.configModal.classList.contains("open"), lastCall().url);
+  await press(els.configModalSave);
+  check("...and the copy then goes through with the reloaded fingerprint",
+    writes().length === 3 && writes().slice(1).every(c => ifMatch(c) === '"sha256:repo-b-schema-2"' && c.url === "/api/config/repo-b/schema/node_types"),
+    JSON.stringify(writes()));
+
+  // 32. a project tool to the global store
+  api.renderConfigPage(COPY_MODEL());
+  fetchCalls = [];
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: globalBlock() } });
+  await copyBtn("repo-a", "mine")[0].fire("click");
+  check("a tool's destinations include the global store", JSON.stringify(els.configDest.children.map(o => [o.value, o.textContent])) ===
+    JSON.stringify([["repo-b", "repo-b"], [HOSTILE, HOSTILE], ["__global__", "Global store"]]),
+    JSON.stringify(els.configDest.children.map(o => o.value)));
+  els.configDest.value = "__global__";
+  await els.configDest.fire("change");
+  check("...the global store's warning says it is served everywhere and the source keeps overriding it",
+    els.configModalWarnText.textContent === "Global tools are served in every registered repository's MCP sessions (3 repos). " +
+      "Copying adds it there; repo-a's own mine keeps overriding it in repo-a.", els.configModalWarnText.textContent);
+  await press(els.configModalSave);
+  check("...and the copy POSTs /api/config/__global__/tools with the global fingerprint",
+    writes().length === 2 && writes().every(c => c.url === "/api/config/__global__/tools" && c.init.method === "POST" && ifMatch(c) === '"sha256:g1"' &&
+      body(c).yaml === "name: mine\ndescription: d\ncypher: x\n"), JSON.stringify(writes()));
+  check("...then reloads the page", lastCall().url === "/api/config", lastCall().url);
+
+  // 33. Cancel while a copy is in flight: no write
+  api.renderConfigPage(COPY_MODEL());
+  fetchCalls = [];
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: project("repo-b") } });
+  gate = new Promise(r => { release = r; });
+  await copyBtn("repo-a", "Runbook")[0].fire("click");
+  clock += 1000;
+  pending = els.configModalSave.fire("click");
+  await Promise.resolve();
+  check("Copy is disabled with busy text during the dry run", els.configModalSave.disabled === true &&
+    els.configModalSave.textContent === "Checking…", els.configModalSave.textContent);
+  els.configModalCancel.fire("click");
+  gate = null; release(); await pending;
+  check("Cancel during a copy's dry run: no write", writes().length === 1 && body(writes()[0]).dry_run === true &&
+    !els.configModal.classList.contains("open"), JSON.stringify(writes()));
+
+  // 34. hostile names stay text in the copy dialog
+  api.renderConfigPage(COPY_MODEL());
+  await copyBtn("repo-a", HOSTILE)[0].fire("click");
+  check("a hostile node type and repository id are text in the copy dialog",
+    els.configModalTitle.textContent === "Copy node type " + HOSTILE + " from repo-a" &&
+    els.configDest.children.some(o => o.textContent === HOSTILE) &&
+    allEls.every(e => !e._html.includes("<img") && !e._html.includes("onerror")), els.configModalTitle.textContent);
+  els.configModalCancel.fire("click");
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);
