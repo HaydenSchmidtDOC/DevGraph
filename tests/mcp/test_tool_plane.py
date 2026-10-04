@@ -6,6 +6,8 @@ import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
@@ -185,3 +187,92 @@ def test_without_a_session_repo_nothing_changes(tmp_path, monkeypatch):
     assert "list_folder" not in tool_names(plain)
     status = json.loads(asyncio.run(plain.read_resource("devgraph://project-tools"))[0].content)
     assert status["scope"] == {"repo_id": None, "source": "none"} and status["served"] == []
+
+
+# ── hardening ──────────────────────────────────────────────────────────────
+
+
+def test_an_unmatched_relative_env_value_never_resolves_against_cwd(tmp_path, monkeypatch):
+    a = Repo("a", tmp_path / "a")
+    (a.path / "sub").mkdir(parents=True)
+    monkeypatch.chdir(a.path)
+    registry = Registry([a])
+    for value in ("nope", ".", "sub"):
+        assert resolve_session_repo(registry, {SESSION_REPO_ENV: value}, Path.cwd()) == (None, "env")
+    assert resolve_session_repo(registry, {SESSION_REPO_ENV: str(a.path / "sub")}, Path.cwd()) == (a, "env")
+
+
+def test_a_tool_that_cannot_register_does_not_take_the_server_down(tmp_path, monkeypatch):
+    tools = """
+        version: 1
+        tools:
+          - name: bad_tool
+            description: Has a parameter pydantic reserves.
+            cypher: |
+              MATCH (n {repo_id: $repo_id}) RETURN n.name AS name, $model_config AS m
+            parameters:
+              - name: model_config
+                description: Reserved.
+          - name: fine_tool
+            description: Works.
+            cypher: |
+              MATCH (n {repo_id: $repo_id}) RETURN n.name AS name
+    """
+    server, _ = build(tmp_path, monkeypatch, Engine(), tools=tools)
+    names = tool_names(server)
+    assert "find_callers" in names and "fine_tool" in names and "bad_tool" not in names
+    status = json.loads(asyncio.run(server.read_resource("devgraph://project-tools"))[0].content)
+    assert any("bad_tool" in n and "could not be served" in n for n in status["notices"])
+
+
+def test_nested_results_are_sanitized(tmp_path, monkeypatch):
+    rows = [{"f": {"name": "a\x1b[31mX"}, "l": ["b\x07", ("c\x07",)]}]
+    server, _ = build(tmp_path, monkeypatch, Engine(rows=rows))
+    result = asyncio.run(server.call_tool("list_folder", {"folder": "x"}))
+    text = json.dumps(result.structured_content)
+    assert "\\u001b" not in text and "\\u0007" not in text and "aX" in text.replace("[31m", "")
+
+
+def _client_error(code, message):
+    from neo4j.exceptions import ClientError
+
+    return ClientError._hydrate_neo4j(code=code, message=message)
+
+
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        ("Neo.ClientError.Transaction.TransactionTimedOut", "timed out after 7s"),
+        ("Neo.ClientError.Request.AccessMode", "read-only"),
+        ("Neo.ClientError.Statement.SyntaxError", "SyntaxError"),
+    ],
+)
+def test_neo4j_errors_get_curated_messages_without_the_raw_text(tmp_path, monkeypatch, code, expected):
+    server, _ = build(tmp_path, monkeypatch, Engine(error=_client_error(code, "secret-host:7687 param=hunter2")))
+    try:
+        result = asyncio.run(server.call_tool("list_folder", {"folder": "x"}))
+    except Exception as exc:
+        text = str(exc)
+    else:
+        assert result.is_error is True
+        text = json.dumps([getattr(c, "text", str(c)) for c in result.content])
+    assert "list_folder" in text and expected in text
+    assert "secret-host" not in text and "hunter2" not in text
+
+
+def test_a_non_neo4j_failure_is_generic(tmp_path, monkeypatch):
+    server, _ = build(tmp_path, monkeypatch, Engine(error=RuntimeError("secret detail")))
+    try:
+        result = asyncio.run(server.call_tool("list_folder", {"folder": "x"}))
+    except Exception as exc:
+        text = str(exc)
+    else:
+        text = json.dumps([getattr(c, "text", str(c)) for c in result.content])
+    assert "list_folder" in text and "secret detail" not in text
+
+
+def test_an_explicit_null_uses_the_default(tmp_path, monkeypatch):
+    engine = Engine()
+    server, _ = build(tmp_path, monkeypatch, engine)
+    asyncio.run(server.call_tool("list_folder", {"folder": "x", "limit_hint": None}))
+    assert engine.calls[0][1]["limit_hint"] == 5

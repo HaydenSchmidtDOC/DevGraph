@@ -11,9 +11,8 @@ read-only, bounded by the tool's timeout and row cap
 from __future__ import annotations
 
 import inspect
-import os
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +25,8 @@ from devgraph.config.project_tools import (
     tools_file_path,
 )
 from devgraph.mcp.catalog import builtin_tool_names
+
+from mcp.server.mcpserver.exceptions import ToolError
 
 SESSION_REPO_ENV = "DEVGRAPH_MCP_REPO"
 
@@ -54,8 +55,8 @@ def _deepest_containing(repos: list[Any], target: Path) -> Any | None:
 def resolve_session_repo(registry: Any, env: Mapping[str, str], cwd: Path) -> tuple[Any | None, str]:
     """The repository this MCP session serves project tools for, and how it was chosen.
 
-    `DEVGRAPH_MCP_REPO` (a repo id, or a path inside a registered repository)
-    wins; a value that matches nothing yields no scope rather than falling
+    `DEVGRAPH_MCP_REPO` (a repo id, or an absolute path inside a registered
+    repository; a relative value is only ever an id) wins; a value that matches nothing yields no scope rather than falling
     back. Otherwise the process's working directory, if it lies inside a
     registered repository (the deepest one). Otherwise none.
     """
@@ -63,7 +64,9 @@ def resolve_session_repo(registry: Any, env: Mapping[str, str], cwd: Path) -> tu
     pinned = (env.get(SESSION_REPO_ENV) or "").strip()
     if pinned:
         by_id = next((r for r in repos if r.repo_id == pinned), None)
-        return (by_id or _deepest_containing(repos, Path(pinned))), "env"
+        if by_id is None and Path(pinned).expanduser().is_absolute():
+            by_id = _deepest_containing(repos, Path(pinned))
+        return by_id, "env"
     match = _deepest_containing(repos, cwd)
     return (match, "cwd") if match is not None else (None, "none")
 
@@ -85,20 +88,44 @@ class ToolPlaneStatus:
         }
 
 
+def _sanitize_deep(value: Any) -> Any:
+    from devgraph.mcp.tools import _sanitize_value
+
+    if isinstance(value, dict):
+        return {k: _sanitize_deep(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_deep(v) for v in value]
+    return _sanitize_value(value)
+
+
+def _failure(tool: CypherTool, exc: Exception) -> ToolError:
+    """A client-safe error: the Neo4j status code only, never the raw message."""
+    from neo4j.exceptions import Neo4jError
+
+    if isinstance(exc, Neo4jError):
+        code = str(getattr(exc, "code", None) or "unknown")
+        if "TransactionTimedOut" in code:
+            return ToolError(f"project tool {tool.name!r} timed out after {tool.timeout_s}s")
+        if "AccessMode" in code:
+            return ToolError(f"project tool {tool.name!r} tried to write; project tools are read-only")
+        return ToolError(f"project tool {tool.name!r} failed: {code}")
+    return ToolError(f"project tool {tool.name!r} failed")
+
+
 def make_tool_function(tool: CypherTool, engine: Any, repo_id: str, notices: list[str]) -> Callable[..., dict[str, Any]]:
     """A function the SDK can register: its signature is the tool's parameters."""
-    from devgraph.mcp.tools import _sanitize_row
-
     def call(**kwargs: Any) -> dict[str, Any]:
-        params = {p.name: kwargs.get(p.name, p.default) for p in tool.parameters}
+        params = {
+            p.name: p.default if kwargs.get(p.name) is None else kwargs[p.name] for p in tool.parameters
+        }
         params[INJECTED_PARAMETER] = repo_id  # always the session's repository
         try:
             rows, truncated = engine.run_read_cypher(
                 tool.cypher, params, timeout_s=tool.timeout_s, max_rows=tool.max_rows
             )
         except Exception as exc:  # the driver raises its own hierarchy
-            raise RuntimeError(f"project tool {tool.name!r} failed: {exc}") from exc
-        results = [_sanitize_row(row) if isinstance(row, dict) else row for row in rows]
+            raise _failure(tool, exc) from exc
+        results = [_sanitize_deep(row) for row in rows]
         envelope: dict[str, Any] = {"count": len(results), "results": results, "truncated": truncated}
         if notices:
             envelope["notices"] = list(notices)
@@ -129,13 +156,14 @@ def register_project_tools(
     *,
     instrument: Callable[[Callable[..., Any]], Callable[..., Any]],
     annotations: Any,
+    pinned: str | None = None,
 ) -> ToolPlaneStatus:
     """Register the session repository's tools on `server`; report what happened."""
     if repo is None:
         status = ToolPlaneStatus(repo_id=None, source=source)
         if source == "env":
             status.notices.append(
-                f"{SESSION_REPO_ENV}={os.environ.get(SESSION_REPO_ENV, '')!r} matches no registered repository; "
+                f"{SESSION_REPO_ENV}={pinned or ''!r} matches no registered repository; "
                 f"no project tools are served"
             )
         return status
@@ -159,7 +187,11 @@ def register_project_tools(
     for tool in declared.tools:
         if tool.name in builtin:
             continue
-        fn = instrument(make_tool_function(tool, engine, repo.repo_id, status.notices))
-        server.add_tool(fn, name=tool.name, description=tool.description, annotations=annotations)
+        try:
+            fn = instrument(make_tool_function(tool, engine, repo.repo_id, status.notices))
+            server.add_tool(fn, name=tool.name, description=tool.description, annotations=annotations)
+        except Exception as exc:
+            status.notices.append(f"project tool {tool.name!r} could not be served: {type(exc).__name__}")
+            continue
         status.served.append(tool.name)
     return status

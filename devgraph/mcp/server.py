@@ -49,13 +49,13 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
 from devgraph.agent import lifecycle
+from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.config.settings import get_settings
 from devgraph.graph.engine import GraphEngine
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.mcp.catalog import TOOL_CATALOG as _TOOL_CATALOG
 from devgraph.mcp.catalog import builtin_tool_names  # noqa: F401  (re-exported)
-from devgraph.config.project_tools import TOOLS_FILENAME
-from devgraph.mcp.tool_plane import register_project_tools, resolve_session_repo
+from devgraph.mcp.tool_plane import SESSION_REPO_ENV, register_project_tools, resolve_session_repo
 from devgraph.registry.store import RepoRegistry
 
 logger = logging.getLogger(__name__)
@@ -231,6 +231,7 @@ def build_server(
     *,
     session_repo: Any | None = None,
     session_source: str = "none",
+    session_pinned: str | None = None,
 ) -> MCPServer:
     """Construct an MCPServer with every DevGraph tool registered against `engine`.
 
@@ -241,7 +242,8 @@ def build_server(
     `session_repo` is the registered repository this session serves
     `devgraph.tools.yaml` tools for (None serves none); `session_source` says
     how it was chosen ("env", "cwd" or "none") and is reported by the
-    `devgraph://project-tools` resource.
+    `devgraph://project-tools` resource. `session_pinned` is the raw
+    DEVGRAPH_MCP_REPO value, used only in the unmatched-value notice.
     """
     settings = get_settings()
     if registry is None:
@@ -253,10 +255,12 @@ def build_server(
             "DevGraph: a local architecture knowledge graph for explicitly-registered "
             "repositories. Prefer these tools over reading source files directly when "
             "answering structural/dependency/history questions — they query a "
-            "pre-built graph instead of re-scanning the repo. Every tool takes a "
+            "pre-built graph instead of re-scanning the repo. Every built-in tool takes a "
             "repo_id (the id shown by `devgraph list`) and defaults to that repo only; "
             "pass cross_repo=true only when the user explicitly wants results across "
-            "multiple registered repositories."
+            "multiple registered repositories. Project-specific tools declared in a "
+            "repository's devgraph.tools.yaml are scoped to this session's repository "
+            "and take no repo_id; see devgraph://project-tools."
         ),
     )
 
@@ -478,7 +482,7 @@ def build_server(
             return devgraph_tools.run_cypher(engine, query, parameters)
 
     status = register_project_tools(
-        server, engine, session_repo, session_source, instrument=_instrument, annotations=_READ_ONLY
+        server, engine, session_repo, session_source, instrument=_instrument, annotations=_READ_ONLY, pinned=session_pinned
     )
 
     @server.resource(
@@ -589,7 +593,13 @@ def main() -> None:
         )
 
     session_repo, source = resolve_session_repo(registry, os.environ, Path.cwd())
-    server = build_server(engine, registry, session_repo=session_repo, session_source=source)
+    server = build_server(
+        engine,
+        registry,
+        session_repo=session_repo,
+        session_source=source,
+        session_pinned=os.environ.get(SESSION_REPO_ENV),
+    )
     try:
         server.run("stdio")
     finally:
