@@ -107,6 +107,7 @@ class ToolPlaneStatus:
     definitions: dict[str, CypherTool] = field(default_factory=dict, repr=False)  # served tool -> its declaration
     global_tools_file: str | None = None
     origins: dict[str, str] = field(default_factory=dict)  # served tool -> "global" | "project" | "project (overrides global)"
+    functions: dict[str, Callable[..., Any]] = field(default_factory=dict, repr=False)  # served tool -> registered function
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -341,7 +342,22 @@ def _serve_repository(
         global_fingerprint = global_tools_fingerprint()
     project = _project_layer(repo, fingerprint, last_good, status)
     global_ = _global_layer(global_fingerprint, global_last_good, status)
+    _register_layers(server, engine, repo, status, project, global_, instrument=instrument, annotations=annotations)
+    return project.declared, global_.declared
 
+
+def _register_layers(
+    server: Any,
+    engine: Any,
+    repo: Any,
+    status: ToolPlaneStatus,
+    project: _Resolved,
+    global_: _Resolved,
+    *,
+    instrument: Callable[[Callable[..., Any]], Callable[..., Any]],
+    annotations: Any,
+) -> None:
+    """Register the resolved layers' tools on `server`, recording each on `status`."""
     builtin = builtin_tool_names()
     globals_by_name: dict[str, CypherTool] = {}
     for tool in global_.declared.tools if global_.declared else ():
@@ -373,6 +389,7 @@ def _serve_repository(
         status.parameter_names[tool.name] = [p.name for p in tool.parameters]
         status.definitions[tool.name] = tool
         status.origins[tool.name] = origin
+        status.functions[tool.name] = fn
         return None
 
     fallback_reasons: dict[str, str] = {}  # global tool -> why the project tool of its name isn't served
@@ -398,7 +415,6 @@ def _serve_repository(
         else:
             reason = None
         register(tool, "global", [f"used global tool {name!r}: {reason}"] if reason else [])
-    return project.declared, global_.declared
 
 
 def _parse_fingerprint(repo: Any, fingerprint: bytes | str) -> ProjectTools:
@@ -457,7 +473,12 @@ class ProjectToolPlane:
         return {name: (self.status.origins[name], self.status.definitions[name]) for name in self.status.served}
 
     def reload_if_changed(self) -> bool:
-        """Re-resolve the tools if either file's bytes changed. True when the served tools changed."""
+        """Re-resolve the tools if either file's bytes changed. True when the served tools changed.
+
+        Both files are parsed before any served tool is removed. If anything fails
+        unexpectedly, the tools served before stay served (with a notice and a
+        warning) and the reload is retried at the next poll.
+        """
         if self.repo is None:
             return False
         fingerprint, global_fingerprint = tools_fingerprint(self.repo.path), global_tools_fingerprint()
@@ -466,23 +487,59 @@ class ProjectToolPlane:
         # Until the reload succeeds, so a failure is retried.
         self._fingerprint = self._global_fingerprint = None
         before = self._resolved()
-        for name in self.status.served:
-            self.server.remove_tool(name)
-        self.status.tools_file = self.status.global_tools_file = None
-        self.status.served.clear()
-        self.status.parameter_names.clear()
-        self.status.definitions.clear()
-        self.status.origins.clear()
-        self.status.notices.clear()
-        self._last_good, self._global_last_good = _serve_repository(
-            self.server, self.engine, self.repo, self.status,
-            instrument=self._instrument, annotations=self._annotations,
-            fingerprint=fingerprint, global_fingerprint=global_fingerprint,
-            last_good=self._last_good, global_last_good=self._global_last_good,
-        )
+        new = ToolPlaneStatus(repo_id=self.status.repo_id, source=self.status.source)
+        try:
+            project = _project_layer(self.repo, fingerprint, self._last_good, new)
+            global_ = _global_layer(global_fingerprint, self._global_last_good, new)
+        except Exception as exc:
+            self._keep_served(exc)
+            return False
+        removed: list[str] = []
+        try:
+            for name in self.status.served:
+                self.server.remove_tool(name)
+                removed.append(name)
+            _register_layers(self.server, self.engine, self.repo, new, project, global_,
+                             instrument=self._instrument, annotations=self._annotations)
+        except Exception as exc:
+            self._restore_served(new, removed)
+            self._keep_served(exc)
+            return False
+        self._adopt(new)
+        self._last_good, self._global_last_good = project.declared, global_.declared
         # The reload parsed exactly these bytes.
         self._fingerprint, self._global_fingerprint = fingerprint, global_fingerprint
         if self.status.notices:
             logger.warning("reloaded the tools for repository %r with problems: %s",
                            self.repo.repo_id, self.status.notices[0])
         return self._resolved() != before
+
+    def _adopt(self, new: ToolPlaneStatus) -> None:
+        """Make `new` the session's status, in place (the status resource holds this object)."""
+        for name in ("tools_file", "global_tools_file", "served", "parameter_names", "notices",
+                     "definitions", "origins", "functions"):
+            setattr(self.status, name, getattr(new, name))
+
+    def _restore_served(self, partial: ToolPlaneStatus, removed: list[str]) -> None:
+        """Undo a half-done swap: drop what `partial` registered, re-register what was `removed`."""
+        for name in partial.served:
+            try:
+                self.server.remove_tool(name)
+            except Exception:
+                pass
+        for name in removed:
+            try:
+                self.server.add_tool(self.status.functions[name], name=name,
+                                     description=self.status.definitions[name].description,
+                                     annotations=self._annotations)
+            except Exception:
+                logger.exception("could not restore tool %r after a failed reload", name)
+
+    def _keep_served(self, exc: Exception) -> None:
+        notice = (f"reloading the tools failed ({type(exc).__name__}: {(str(exc).splitlines() or [''])[0]}); "
+                  "keeping the tools served before; retrying at the next change check")
+        if notice in self.status.notices:  # the same failure on a retry: already reported
+            logger.debug("repository %r: %s", self.repo.repo_id, notice)
+            return
+        self.status.notices.append(notice)
+        logger.warning("repository %r: %s", self.repo.repo_id, notice, exc_info=True)

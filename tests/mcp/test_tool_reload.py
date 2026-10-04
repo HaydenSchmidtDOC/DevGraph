@@ -384,10 +384,10 @@ def test_a_root_missing_at_startup_is_cleared_when_it_returns(tmp_path, monkeypa
     assert status(server)["notices"] == []
 
 
-def test_a_failed_reload_is_retried(tmp_path, monkeypatch):
+def test_a_failed_reload_keeps_the_served_tools_and_is_retried(tmp_path, monkeypatch, caplog):
     server, repo = build(tmp_path, monkeypatch)
     plane = server.devgraph_tool_plane
-    real = tool_plane._serve_repository
+    real = tool_plane.parse_project_tools
     attempts = []
 
     def flaky(*args, **kwargs):
@@ -397,15 +397,44 @@ def test_a_failed_reload_is_retried(tmp_path, monkeypatch):
         return real(*args, **kwargs)
 
     write(repo, TWO)
-    monkeypatch.setattr(tool_plane, "_serve_repository", flaky)
-    try:
-        plane.reload_if_changed()
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("the failure should propagate")
+    monkeypatch.setattr(tool_plane, "parse_project_tools", flaky)
+    with caplog.at_level(logging.WARNING):
+        assert plane.reload_if_changed() is False
+    assert "list_files" in tools(server) and "count_files" not in tools(server)
+    current = status(server)
+    assert current["served"] == ["list_files"]
+    assert any("RuntimeError: boom" in n and "keeping" in n for n in current["notices"])
+    assert any("boom" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
     assert plane.reload_if_changed() is True
-    assert "count_files" in tools(server)
+    assert {"list_files", "count_files"} <= set(tools(server))
+    assert status(server)["notices"] == []
+
+
+def test_a_failure_while_swapping_tools_restores_the_previous_set(tmp_path, monkeypatch):
+    server, repo = build(tmp_path, monkeypatch, tools=TWO)
+    plane = server.devgraph_tool_plane
+    real = server.remove_tool
+    calls = []
+
+    def remove_then_fail(name):
+        calls.append(name)
+        if len(calls) == 2:
+            raise RuntimeError("remove failed")
+        return real(name)
+
+    write(repo, ONE.replace("list_files", "file_list"))
+    monkeypatch.setattr(server, "remove_tool", remove_then_fail)
+    assert plane.reload_if_changed() is False
+    listed = tools(server)
+    assert {"list_files", "count_files"} <= set(listed) and "file_list" not in listed
+    assert listed["list_files"].description == "List files, changed."
+    current = status(server)
+    assert current["served"] == ["list_files", "count_files"]
+    assert any("remove failed" in n for n in current["notices"])
+    monkeypatch.setattr(server, "remove_tool", real)
+    assert plane.reload_if_changed() is True
+    listed = tools(server)
+    assert "file_list" in listed and "list_files" not in listed and "count_files" not in listed
 
 
 def test_a_reload_with_file_notices_warns(tmp_path, monkeypatch, caplog):
