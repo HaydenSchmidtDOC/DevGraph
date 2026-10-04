@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from neo4j import Driver, GraphDatabase
+from neo4j import Driver, GraphDatabase, READ_ACCESS, unit_of_work
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
@@ -698,6 +698,29 @@ class GraphEngine:
         with self._driver.session() as session:
             result = session.run(query, parameters or {})  # type: ignore[arg-type]
             return [record.data() for record in result]
+
+    def run_read_cypher(
+        self, query: str, parameters: dict[str, Any], *, timeout_s: float, max_rows: int
+    ) -> tuple[list[dict], bool]:
+        """Run one user-declared query read-only, bounded in time and rows.
+
+        Read access mode makes the server refuse any write; the transaction
+        timeout bounds the time; rows stop being pulled after `max_rows`, and
+        the second value says whether more existed. Used by the MCP tool
+        plane for `devgraph.tools.yaml` tools.
+        """
+
+        @unit_of_work(timeout=timeout_s)
+        def work(tx):
+            rows: list[dict] = []
+            for record in tx.run(query, parameters):
+                if len(rows) == max_rows:
+                    return rows, True
+                rows.append(record.data())
+            return rows, False
+
+        with self._driver.session(default_access_mode=READ_ACCESS) as session:
+            return session.execute_read(work)
 
     def run_cypher_graph(self, query: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
         """Same escape hatch as `run_cypher`, but preserves node/relationship
