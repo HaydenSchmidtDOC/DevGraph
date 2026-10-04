@@ -166,6 +166,28 @@ The service binds to loopback and has no authentication because it is intended a
 
 Because there is no authentication, the dashboard answers only requests addressed to the local machine: the `Host` header must name `127.0.0.1`, `localhost`, `[::1]`, or the configured `DEVGRAPH_DASHBOARD_HOST`; anything else gets `403 host not allowed`. This stops a web page from reaching the dashboard through DNS rebinding (re-pointing its own domain at 127.0.0.1). A wildcard bind (`0.0.0.0` or `::`) does not widen this list; to reach the dashboard by a LAN address, set `DEVGRAPH_DASHBOARD_HOST` to that address rather than a wildcard. Registering a repository, saving a layout, and running console Cypher additionally refuse cross-origin browser requests. The tray menu and `devgraph dashboard` link a wildcard bind to its loopback address (`http://127.0.0.1:<port>`, or `http://[::1]:<port>` for `::`, which binds IPv6-only).
 
+### Config page
+
+Settings > Config shows the configuration the MCP tool plane and the indexer actually use: the global scope first (built-in node types, relationship types and tools, locked, plus the global tools, flagged GLOBAL), then one block per active registered repository (project tools, node types and relationships from `devgraph.tools.yaml` and `devgraph.schema.yaml`). Tools show their display id (`gl_<name>` for global, `<repo_id>_<name>` for project, the bare name for built-ins); the ids are display-only and are not recorded in telemetry.
+
+Badges use the same resolution rules as an MCP session, with the detail on hover:
+
+| Badge | MCP behaviour |
+|---|---|
+| Ignored: shadows a locked tool | a project or global tool named like a built-in is not served; the built-in runs |
+| Overrides global tool | the project tool is served instead of the global one |
+| Overridden in `<repos>` | a global tool that some repositories replace |
+| Not served: using the global tool | the project tool is unusable, so the global one answers |
+| Not served | the tool's file is invalid; none of its tools are served |
+| Not served / Project config disabled | project config is switched off for the repository |
+| Schema change pending / never applied / invalid | the schema file differs from the applied one, was never scanned, or does not validate |
+
+Each tool, node type and relationship can be added, edited or deleted from a YAML editor modal that holds the same text `devgraph config tools edit` and `devgraph config schema edit` show. Editing or deleting a global entry first shows a warning step. A global tool can be saved to a repository (destination dropdown), which writes a project override. Every save runs a dry run first (schema changes that delete nodes, change a key or drop a source are listed as warnings) and then needs a confirmation. Writes use the CLI's validate-then-atomic-write code, replace only the affected entry so comments elsewhere survive, and write the file only: **the dashboard never stages or commits**, so `git status` shows the change and you commit it yourself. Each write carries the fingerprint of the file you saw (`If-Match`); if the file changed since, the save is refused with 412 and the editor offers to reload.
+
+The API behind it is `GET /api/config` and `GET /api/config/{scope}` (scope is `__global__` or a repo id), plus `POST`/`PUT`/`DELETE` on `/api/config/{scope}/tools[/{name}]` and `/api/config/{scope}/schema/{section}[/{name}]`. Writes are refused when `Origin`/`Sec-Fetch-Site` mark the request cross-site (403).
+
+Not in this page yet: copying entries between repositories, whole-file reset and the project-config enable/disable toggle, a structured form editor, cross-repository schema conflict badges, recording scoped tool ids in telemetry, and retiring the prototype "MCP tools" pane.
+
 ## Optional indexing
 
 - `devgraph annotate` configures Markdown requirements, design decisions, and architecture notes.
