@@ -140,7 +140,9 @@ def _reject_cross_site(request: Request) -> None:
     if site is not None and site not in ("same-origin", "none"):
         raise HTTPException(status_code=403, detail="cross-site request rejected")
     origin = request.headers.get("origin")
-    if origin is not None and origin != f"{request.url.scheme}://{request.url.netloc}":
+    # Lowercased both sides: hostnames are case-insensitive, and the Host
+    # guard in app.py already accepted this Host case-insensitively.
+    if origin is not None and origin.lower() != f"{request.url.scheme}://{request.url.netloc}".lower():
         raise HTTPException(status_code=403, detail="cross-origin request rejected")
 
 

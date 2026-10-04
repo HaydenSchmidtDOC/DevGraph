@@ -295,7 +295,7 @@ class TrayApp:
         self._dashboard_loop = loop
         self._events.bind_loop(loop)
 
-        app = build_app(self._engine, self._registry, self._events)
+        app = build_app(self._engine, self._registry, self._events, self._settings.dashboard_host)
         # The tray's pystray main loop keeps owning the process's signal
         # handling. uvicorn's Server.capture_signals() already detects it is
         # not running on the main thread and skips installing its own

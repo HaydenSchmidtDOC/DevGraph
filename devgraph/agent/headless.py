@@ -164,7 +164,7 @@ class HeadlessAgent:
         asyncio.set_event_loop(loop)
         self._events.bind_loop(loop)
 
-        app = build_app(self._engine, self._registry, self._events)
+        app = build_app(self._engine, self._registry, self._events, self._settings.dashboard_host)
         config = uvicorn.Config(
             app,
             host=self._settings.dashboard_host,

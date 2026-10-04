@@ -34,13 +34,13 @@ def make_client(tmp_path, monkeypatch):
     registries = []
 
     def _make(dashboard_host="127.0.0.1"):
-        settings = Settings(registry_db_path=tmp_path / "registry.sqlite3", dashboard_host=dashboard_host)
-        monkeypatch.setattr(dashboard_app, "get_settings", lambda: settings)
+        settings = Settings(registry_db_path=tmp_path / "registry.sqlite3")
         monkeypatch.setattr(layout_store, "get_settings", lambda: settings)
         registry = RepoRegistry(settings.registry_db_path)
         registries.append(registry)
         engine = _StubEngine()
-        return TestClient(build_app(engine, registry, EventBroadcaster())), engine, registry
+        app = build_app(engine, registry, EventBroadcaster(), dashboard_host=dashboard_host)
+        return TestClient(app), engine, registry
 
     yield _make
     for registry in registries:
@@ -85,10 +85,22 @@ def test_a_configured_ipv6_dashboard_host_is_served_bracketed(make_client):
 )
 def test_other_hosts_are_rejected_on_every_route(make_client, host):
     client, _, _ = make_client()
-    for path in ("/", "/static/index.html", "/api/repos", "/api/settings", "/api/query-log"):
+    for path in ("/", "/static/index.html", "/api/repos", "/api/settings", "/api/query-log", "/api/events"):
         res = client.get(path, headers={"host": host})
         assert res.status_code == 403, (path, host)
         assert res.text == "host not allowed"
+
+
+def test_the_allowed_host_defaults_to_the_configured_setting(tmp_path, monkeypatch):
+    settings = Settings(registry_db_path=tmp_path / "registry.sqlite3", dashboard_host="192.168.1.20")
+    monkeypatch.setattr(dashboard_app, "get_settings", lambda: settings)
+    registry = RepoRegistry(settings.registry_db_path)
+    try:
+        client = TestClient(build_app(_StubEngine(), registry, EventBroadcaster()))
+        assert client.get("/api/query-log", headers={"host": "192.168.1.20:8765"}).status_code == 200
+        assert client.get("/api/query-log", headers={"host": "evil.test:8765"}).status_code == 403
+    finally:
+        registry.close()
 
 
 @pytest.mark.parametrize("dashboard_host", ["0.0.0.0", "::"])
@@ -125,13 +137,16 @@ def test_rebound_cypher_is_rejected_before_running(make_client):
     assert engine.queries == []
 
 
-def test_layout_write_rejects_a_cross_origin_request(make_client, tmp_path):
+_CROSS_SITE = [
+    {"host": "127.0.0.1:8765", "origin": "http://evil.test"},
+    {"host": "127.0.0.1:8765", "sec-fetch-site": "cross-site"},
+]
+
+
+@pytest.mark.parametrize("headers", _CROSS_SITE, ids=["cross-origin", "cross-site"])
+def test_layout_write_rejects_a_cross_site_request(make_client, tmp_path, headers):
     client, _, _ = make_client()
-    res = client.put(
-        "/api/repos/__all__/layout",
-        json={"positions": {}},
-        headers={"host": "127.0.0.1:8765", "origin": "http://evil.test"},
-    )
+    res = client.put("/api/repos/__all__/layout", json={"positions": {}}, headers=headers)
     assert res.status_code == 403
     assert not any(tmp_path.rglob("*.json"))
 
@@ -147,13 +162,10 @@ def test_layout_write_allows_a_same_origin_request(make_client, tmp_path):
     assert any(tmp_path.rglob("*.json"))
 
 
-def test_cypher_rejects_a_cross_origin_request(make_client):
+@pytest.mark.parametrize("headers", _CROSS_SITE, ids=["cross-origin", "cross-site"])
+def test_cypher_rejects_a_cross_site_request(make_client, headers):
     client, engine, _ = make_client()
-    res = client.post(
-        "/api/cypher",
-        json={"query": "RETURN 1"},
-        headers={"host": "127.0.0.1:8765", "origin": "http://evil.test"},
-    )
+    res = client.post("/api/cypher", json={"query": "RETURN 1"}, headers=headers)
     assert res.status_code == 403
     assert engine.queries == []
 
@@ -164,6 +176,19 @@ def test_cypher_allows_a_same_origin_request(make_client):
         "/api/cypher",
         json={"query": "RETURN 1"},
         headers={"host": "127.0.0.1:8765", "origin": "http://127.0.0.1:8765", "sec-fetch-site": "same-origin"},
+    )
+    assert res.status_code == 200
+    assert engine.queries == ["RETURN 1"]
+
+
+def test_origin_matches_host_case_insensitively(make_client):
+    # Hostnames are case-insensitive; the Host guard already lowercases, so
+    # the same-origin check must not refuse what the guard let through.
+    client, engine, _ = make_client()
+    res = client.post(
+        "/api/cypher",
+        json={"query": "RETURN 1"},
+        headers={"host": "LocalHost:8765", "origin": "http://localhost:8765"},
     )
     assert res.status_code == 200
     assert engine.queries == ["RETURN 1"]
