@@ -78,10 +78,10 @@ def _tool_entries(text: str) -> list[dict]:
     return [e for e in found if isinstance(e, dict) and isinstance(e.get("name"), str)]
 
 
-def _read(path: Path) -> tuple[str, str | None]:
-    """The file's text ("" when absent) and a read error, if any."""
+def _read(path: Path, root: Path | None = None) -> tuple[str, str | None]:
+    """The file's text ("" when absent) and a read error, if any; with `root`, see `edits.read_text`."""
     try:
-        return edits.read_text(path), None
+        return edits.read_text(path, root), None
     except edits.ConfigEditError as exc:
         return "", scrub(exc.message, path)
 
@@ -317,7 +317,7 @@ def build_project(
     root = Path(record.path)
     status = status if status is not None else resolve_tools(record)
     path = edits.tools_path(root)
-    text, read_error = _read(path)
+    text, read_error = _read(path, root)
     if not record.project_config_enabled:
         state, error = "disabled", None
     elif status.project_invalid is not None:

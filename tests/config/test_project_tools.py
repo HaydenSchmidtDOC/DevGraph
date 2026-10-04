@@ -387,3 +387,45 @@ NON_YAMLERROR_INPUTS = {
 def test_any_yaml_load_failure_is_a_tools_error(tmp_path, text):
     with pytest.raises(ProjectToolsError, match="malformed YAML"):
         load_text(tmp_path, text)
+
+
+# What the trust prompt shows must be what runs: a terminal escape could redraw the
+# shown query. \e[1A\e[2K moves up a line and erases it.
+_ESC = r"\e[1A\e[2K"
+
+
+@pytest.mark.parametrize("field, entry", [
+    ("cypher", f'    cypher: "MATCH (n {{repo_id: $repo_id}}) RETURN n {_ESC}MATCH (m) RETURN m"\n'),
+    ("description", f'    description: "Harmless.{_ESC}"\n'),
+    ("description", '    description: "abc\\u202Edef"\n'),  # a bidi override (category Cf)
+    ("name", '    name: "t\\x9b"\n'),  # a C1 control (CSI)
+    ("parameters.0.description", '    parameters:\n      - name: p\n        description: "x\\x1b]0;t\\x07"\n'),
+    ("parameters.0.default", '    parameters:\n      - name: p\n        required: false\n        default: "\\x1b[2J"\n'),
+])
+def test_control_and_format_characters_are_refused(tmp_path, field, entry):
+    base = {
+        "name": '    name: t\n',
+        "description": '    description: d\n',
+        "cypher": '    cypher: "MATCH (n {repo_id: $repo_id}) RETURN n"\n',
+    }
+    key = field.split(".")[0]
+    if key == "parameters":
+        base["cypher"] = '    cypher: "MATCH (n {repo_id: $repo_id, x: $p}) RETURN n"\n'
+        body = base["name"] + base["description"] + base["cypher"] + entry
+    else:
+        base[key] = entry
+        body = base["name"] + base["description"] + base["cypher"]
+    (tmp_path / TOOLS_FILENAME).write_text("version: 1\ntools:\n  - " + body[4:])
+    with pytest.raises(ProjectToolsError) as exc:
+        load_project_tools(tmp_path)
+    message = str(exc.value)
+    assert f"tools.0.{field}" in message and "control or format character" in message
+    assert "\x1b" not in message and "\u202e" not in message
+
+
+def test_newlines_and_tabs_stay_allowed(tmp_path):
+    (tmp_path / TOOLS_FILENAME).write_text(
+        'version: 1\ntools:\n  - name: t\n    description: "two\\n\\tlines"\n'
+        '    cypher: "MATCH (n {repo_id: $repo_id})\\n\\tRETURN n"\n'
+    )
+    assert load_project_tools(tmp_path).tools[0].description == "two\n\tlines"

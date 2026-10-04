@@ -34,6 +34,7 @@ from devgraph.config.project_tools import (
     YAML_LOAD_ERRORS,
     ProjectToolsError,
     parse_project_tools,
+    tools_file_outside,
     tools_file_path,
 )
 from devgraph.mcp.catalog import builtin_tool_names, scoped_tool_id
@@ -61,6 +62,8 @@ def _deepest_containing(repos: list[Any], target: Path) -> Any | None:
     target = _resolved(target)
     best, best_depth = None, -1
     for repo in repos:
+        if not Path(repo.path).is_absolute():  # would resolve against the working directory
+            continue
         root = _resolved(repo.path)
         if target == root or target.is_relative_to(root):
             depth = len(root.parts)
@@ -327,7 +330,7 @@ class _Resolved:
     declared: ProjectTools | None = None
     invalid: str | None = None
     invalid_names: set[str] | None = None
-    untrusted: str | None = None  # why an unapproved file serves none of its tools
+    untrusted: str | None = None  # why an unapproved file serves none of its tools, worded for the model
 
 
 def _declared_names(fingerprint: bytes | str) -> set[str] | None:
@@ -345,9 +348,11 @@ def _declared_names(fingerprint: bytes | str) -> set[str] | None:
 
 def _project_layer(repo: Any, fingerprint: bytes | str | UntrustedTools, last_good: ProjectTools | None,
                    status: ToolPlaneStatus) -> _Resolved:
-    """The project file's tools; an invalid file keeps `last_good` when there is one.
+    """The project file's tools; trusted bytes that fail to parse keep `last_good` when there is one.
 
-    An untrusted file serves none and keeps nothing: `last_good` only ever holds trusted content.
+    An untrusted or unreadable file serves none and keeps nothing: `last_good` only ever
+    holds trusted content, and only trusted bytes can fall back to it (an unreadable file
+    can't be checked against its approval, so a revoke must not leave the old tools served).
     """
     if fingerprint == "root-missing":
         status.notices.append(f"the root of repository {repo.repo_id!r} ({repo.path}) does not exist; no project tools are served")
@@ -363,18 +368,19 @@ def _project_layer(repo: Any, fingerprint: bytes | str | UntrustedTools, last_go
     if isinstance(fingerprint, UntrustedTools):  # never parsed for serving, and never the last good
         status.project_trust = fingerprint.state
         reason = project_trust.untrusted_reason(repo.repo_id, fingerprint.state)
-        status.notices.append(f"{reason}; no project tools are served")
+        to_model = project_trust.untrusted_reason(repo.repo_id, fingerprint.state, to_model=True)
+        status.notices.append(f"{to_model}; no project tools are served")
         builtin = builtin_tool_names()
         for name in sorted((_declared_names(fingerprint.data) or set()) - builtin):
             status.fallback_reasons[name] = reason
-        return _Resolved(untrusted=reason)
+        return _Resolved(untrusted=to_model)
     if isinstance(fingerprint, bytes):
         status.project_trust = "trusted"
     try:
         declared = _parse_fingerprint(repo, fingerprint)
     except ProjectToolsError as exc:
         reason = str(exc).splitlines()[0]
-        if last_good is None:
+        if last_good is None or not isinstance(fingerprint, bytes):
             status.notices.append(f"invalid {TOOLS_FILENAME}; no project tools are served: {reason}")
             short = reason.replace(str(tools_file_path(repo.path)), TOOLS_FILENAME)
             status.project_invalid, status.project_invalid_names = short, _declared_names(fingerprint)
@@ -491,7 +497,9 @@ def _register_layers(
         elif overrides:
             del globals_by_name[tool.name]
     for name, tool in globals_by_name.items():
-        if name in fallback_reasons:
+        if project.untrusted is not None and name in fallback_reasons:
+            reason = project.untrusted  # worded for the model reading the response
+        elif name in fallback_reasons:
             reason = fallback_reasons[name]
         elif project.invalid and project.invalid_names is None:
             reason = f"{TOOLS_FILENAME} is invalid, so a project tool of this name (if any) can't be served: {project.invalid}"
@@ -527,13 +535,16 @@ def _parse_bytes(path: Path, fingerprint: bytes | str) -> ProjectTools:
 
 def tools_fingerprint(repo_path: Path | str) -> bytes | str | UntrustedTools:
     """What the tools file looks like now: its bytes when trusted, `UntrustedTools` when not,
-    'root-missing', 'disabled', 'absent', or 'unreadable:<error>'."""
+    'root-missing', 'disabled', 'absent', or 'unreadable:<error>' (including a file that
+    resolves outside the repository)."""
     if not Path(repo_path).is_dir():
         return "root-missing"
     if not project_config_enabled(repo_path):
         return "disabled"
     path = tools_file_path(Path(repo_path))
     try:
+        if tools_file_outside(Path(repo_path)):
+            return "unreadable:outside_repository"
         if not stat.S_ISREG(os.stat(path).st_mode):
             return "unreadable:not_regular"  # never open a FIFO or device: the read would block
         data = path.read_bytes()

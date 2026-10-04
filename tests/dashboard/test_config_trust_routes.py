@@ -132,3 +132,65 @@ def test_the_dashboard_cannot_grant_trust(client, registry, tmp_path):
         assert response.status_code == 405
     assert registry.get("repo-a").project_tools_sha256 is None
     assert _tools(client)["trust"]["state"] == "untrusted"
+
+
+def test_a_tools_file_outside_the_repository_is_not_shown(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    outside = tmp_path / "elsewhere.yaml"
+    outside.write_text(TOOL.format(name="outside_secret"))
+    (record.path / TOOLS_FILENAME).symlink_to(outside)
+
+    response = client.get("/api/config/repo-a")
+    assert response.status_code == 200
+    assert "outside_secret" not in response.text and "elsewhere" not in response.text
+    assert response.json()["tools"]["state"] == "invalid"
+
+
+def _api_routes(routes_):
+    """Every APIRoute, including those inside included routers."""
+    from fastapi.routing import APIRoute
+
+    for route in routes_:
+        if isinstance(route, APIRoute):
+            yield route
+        nested = getattr(route, "routes", None) or getattr(getattr(route, "original_router", None), "routes", None)
+        if nested:
+            yield from _api_routes(nested)
+
+
+def test_no_write_route_can_set_a_trust_value(registry, engine, global_store, tmp_path, monkeypatch):
+    """Walk every route of the real app; the registry's trust setter may only ever be given None."""
+    from fastapi.testclient import TestClient
+
+    from devgraph.dashboard.app import build_app
+    from devgraph.dashboard.events import EventBroadcaster
+    from devgraph.registry.store import RepoRegistry
+
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="hot_paths"))
+    digest = tools_sha256((record.path / TOOLS_FILENAME).read_bytes())
+    registry.set_project_tools_sha256("repo-a", "0" * 64)  # so the revoke route has something to clear
+    calls = []
+    real_setter = RepoRegistry.set_project_tools_sha256
+
+    def spy(self, repo_id, sha256):
+        calls.append(sha256)
+        return real_setter(self, repo_id, sha256)
+
+    monkeypatch.setattr(RepoRegistry, "set_project_tools_sha256", spy)
+    app = build_app(engine, registry, EventBroadcaster(), dashboard_host="127.0.0.1")
+    client = TestClient(app, base_url="http://127.0.0.1", raise_server_exceptions=False)
+    values = {"repo_id": "repo-a", "scope": "repo-a", "name": "hot_paths", "section": "node_types"}
+    body = {"sha256": digest, "project_tools_sha256": digest, "trusted": True, "trust": True,
+            "enabled": True, "path": str(record.path), "yaml": TOOL.format(name="hot_paths")}
+    writes = 0
+    for route in _api_routes(app.routes):
+        for method in sorted(route.methods - {"GET", "HEAD", "OPTIONS"}):
+            url = route.path.format(**{k: values.get(k, "x") for k in route.param_convertors})
+            for scope in ("repo-a", "__global__"):
+                client.request(method, url.replace("repo-a", scope), json=body,
+                               params={"sha256": digest, "confirm": "true"})
+                writes += 1
+    assert writes >= 20  # every write route was exercised
+    assert None in calls  # the revoke route reached the setter: the spy is live
+    assert all(value is None for value in calls), calls

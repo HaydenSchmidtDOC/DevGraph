@@ -88,7 +88,8 @@ def test_trust_by_path_and_from_inside_the_repository(runner, trust, repo, setti
 def test_trust_with_a_wrong_sha256_is_refused(runner, trust, repo, settings):
     result = runner.invoke(app, ["config", "tools", "trust", "demo", "--sha256", "0" * 64])
     assert result.exit_code == 1
-    assert "does not match" in result.output and sha(repo) in result.output
+    assert "does not match" in result.output
+    assert result.output.count(sha(repo)) == 1  # in the listing, not repeated by the error
     assert recorded(settings) is None
 
 
@@ -96,7 +97,7 @@ def test_trust_without_a_tty_or_sha256_is_refused(runner, trust, repo, settings,
     monkeypatch.setattr(cli_main, "_stdin_is_tty", lambda: False)
     result = runner.invoke(app, ["config", "tools", "trust", "demo"], input="y\n")
     assert result.exit_code == 1
-    assert "--sha256" in result.output
+    assert "--sha256" not in result.output and "terminal" in result.output
     assert recorded(settings) is None
 
 
@@ -163,3 +164,43 @@ def test_doctor_reports_untrusted_and_changed_files(trust, repo, settings):
     (repo / TOOLS_FILENAME).write_text(TOOLS + "# edited\n")
     changed = finding()
     assert changed["status"] == "warning" and "changed since it was trusted" in changed["detail"]
+
+
+SECRET_TOOLS = TOOLS.replace("count_nodes", "outside_secret_tool")
+
+
+def test_trust_refuses_a_tools_file_outside_the_repository(runner, trust, repo, settings, tmp_path):
+    outside = tmp_path / "elsewhere.yaml"
+    outside.write_text(SECRET_TOOLS)
+    (repo / TOOLS_FILENAME).unlink()
+    (repo / TOOLS_FILENAME).symlink_to(outside)
+    result = runner.invoke(app, ["config", "tools", "trust", "demo", "--sha256", sha(repo)])
+    assert result.exit_code != 0
+    assert "outside the repository" in result.output
+    assert "outside_secret_tool" not in result.output and "elsewhere" not in result.output
+    assert recorded(settings) is None
+
+
+def test_trust_shows_descriptions_parameters_and_global_overrides(runner, trust, repo, settings):
+    from devgraph.config.global_tools import save_global_tools
+
+    (repo / TOOLS_FILENAME).write_text(textwrap.dedent("""\
+        version: 1
+        tools:
+          - name: count_nodes
+            description: Count this repository's nodes.
+            cypher: |
+              MATCH (n {repo_id: $repo_id, kind: $kind}) RETURN count(n) AS n
+            parameters:
+              - name: kind
+                type: string
+                description: Which kind of node to count.
+    """))
+    save_global_tools([{"name": "count_nodes", "description": "Global count.",
+                        "cypher": "MATCH (n {repo_id: $repo_id}) RETURN count(n) AS n"}])
+    result = runner.invoke(app, ["config", "tools", "trust", "demo", "--sha256", sha(repo)])
+    assert result.exit_code == 0, result.output
+    out = " ".join(result.output.split())
+    assert "Count this repository's nodes." in out
+    assert "kind" in out and "Which kind of node to count." in out
+    assert "overrides the global tool 'count_nodes'" in out

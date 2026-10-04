@@ -1126,6 +1126,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
       { label: HOSTILE, yaml: "label: '" + HOSTILE + "'\n", editable: true, badges: [] }];
     a.schema.relationships = [{ type: "DOCUMENTS", yaml: "type: DOCUMENTS\nfrom: Runbook\nto: Service\n", editable: true, badges: [] },
       { type: "OWNS", yaml: "type: OWNS\n", editable: false, badges: [{ level: "warn", kind: "ambiguous", text: "Declared more than once", detail: "" }] }];
+    a.tools.trust = { state: "trusted", command: "devgraph config tools trust repo-a", revocable: true };
     return { global: globalBlock(), projects: [a, project("repo-b"), project(HOSTILE)] };
   };
   api.renderConfigPage(COPY_MODEL());
@@ -1314,6 +1315,20 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     writes().length === 2 && writes().every(c => c.url === "/api/config/__global__/tools" && c.init.method === "POST" && ifMatch(c) === '"sha256:g1"' &&
       body(c).yaml === "name: mine\ndescription: d\ncypher: x\n"), JSON.stringify(writes()));
   check("...then reloads the page", lastCall().url === "/api/config", lastCall().url);
+  for (const state of ["untrusted", "changed"]) {
+    const m = COPY_MODEL();
+    m.projects[0].tools.trust = { state, command: "devgraph config tools trust repo-a", revocable: state === "changed" };
+    api.renderConfigPage(m);
+    await copyBtn("repo-a", "mine")[0].fire("click");
+    els.configDest.value = "__global__";
+    await els.configDest.fire("change");
+    const text = els.configModalWarnText.textContent;
+    check("copying an untrusted (" + state + ") repo's tool to the global store warns it is served in every repo without trust",
+      text.includes("repo-a's devgraph.tools.yaml is not trusted") &&
+      text.includes("the global store serves this tool in every repository without any trust approval") &&
+      text.includes("can read the whole graph") && text.includes("convention, not a sandbox"), text);
+    els.configModalCancel.fire("click");
+  }
 
   // 33. Cancel while a copy is in flight: no write
   api.renderConfigPage(COPY_MODEL());

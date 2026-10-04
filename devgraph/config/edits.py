@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from devgraph.paths import is_within
+
 SCHEMA_SECTIONS = {
     "node_types": ("label", "node type"),
     "relationships": ("type", "relationship"),
@@ -144,11 +146,16 @@ def _check_fingerprint(path: Path, expected: str | None) -> None:
         raise ConfigEditError(f"{path} changed since it was loaded; reload and try again", "stale")
 
 
-def read_text(path: Path) -> str:
-    """The file's text, or "" when absent; a directory, FIFO or device is `not_regular` and never opened."""
+def read_text(path: Path, root: Path | None = None) -> str:
+    """The file's text, or "" when absent; a directory, FIFO or device is `not_regular` and never opened.
+
+    With `root`, a file that resolves outside that repository is `not_regular` and never opened.
+    """
     try:
         if not path.exists():
             return ""
+        if root is not None and not is_within(path.resolve(), Path(root)):
+            raise ConfigEditError(f"{path.name} resolves outside the repository; it is not read", "not_regular")
         if not stat.S_ISREG(os.stat(path).st_mode):
             raise _not_regular(path)
         return path.read_text(encoding="utf-8")
@@ -233,7 +240,7 @@ def tool_entries(root: Path | None) -> list[dict]:
     from devgraph.config.tools_edit import ToolsEditError, tool_mappings
 
     try:
-        return tool_mappings(read_text(tools_path(root)))
+        return tool_mappings(read_text(tools_path(root), root))
     except ToolsEditError as exc:
         raise _splice_error(exc)
 
@@ -818,7 +825,7 @@ def project_config_change(record: Any, enabled: bool) -> tuple[list[str], list[s
     tools_file = tools_file_path(root)
     if not enabled and tools_file.is_file():
         try:
-            names = sorted({t.name for t in parse_project_tools(read_text(tools_file), tools_file).tools} - builtin_tool_names())
+            names = sorted({t.name for t in parse_project_tools(read_text(tools_file, root), tools_file).tools} - builtin_tool_names())
         except (ConfigEditError, ProjectToolsError):
             warnings.append(
                 f"{tools_file.name} is invalid; project tools may still be served from the last good file "

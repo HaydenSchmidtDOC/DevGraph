@@ -3227,6 +3227,14 @@ function configGlobalReach(name) {
     (over.length ? " Overridden in: " + over.join(", ") + "." : "");
 }
 const configSameTarget = (a, b) => !!a && !!b && a.scope === b.scope && a.op === b.op && a.name === b.name;
+/* copying from a repo whose tools file is not trusted: the global store needs no trust,
+   so the copy would be served everywhere without the approval the source lacks */
+function configUntrustedCopyNote(src) {
+  const trust = configScopeBlock(src).tools.trust;
+  if (trust && trust.state === "trusted") return "";
+  return " " + src + "'s devgraph.tools.yaml is not trusted: copying to the global store serves this tool in every " +
+    "repository without any trust approval. An enabled tool can read the whole graph: the $repo_id rule is a convention, not a sandbox.";
+}
 function configWarningText(edit) {
   if (edit.op === "copy") {
     const replaces = edit.crossName ? " " + configCopyReplaces(edit) : "";
@@ -3238,7 +3246,7 @@ function configWarningText(edit) {
         ? "Replaces the global tool " + edit.crossName + " with " + src + "'s version: served in every repo without its own " +
           edit.crossName + "; " + src + "'s own copy keeps overriding it there."
         : "Adds " + edit.name + " to the global store; " + src + "'s own " + edit.name + " will override it in " + src + ".") +
-        (others.length ? " Will also be overridden in: " + others.join(", ") + "." : "");
+        (others.length ? " Will also be overridden in: " + others.join(", ") + "." : "") + configUntrustedCopyNote(src);
     }
     const block = configScopeBlock(edit.dest);
     const file = edit.section === "tools" ? block.tools.file : block.schema.file;

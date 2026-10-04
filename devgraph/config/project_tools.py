@@ -16,12 +16,16 @@ Import this module directly, like `devgraph.config.project_schema`.
 from __future__ import annotations
 
 import keyword
+import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
+
+from devgraph.paths import is_within
 
 TOOLS_FILENAME = "devgraph.tools.yaml"
 TOOLS_VERSION = 1
@@ -121,6 +125,22 @@ def has_apoc(query: str) -> bool:
     return bool(_APOC.search(blanked))
 
 
+def _check_plain_text(value: Any, info: ValidationInfo) -> Any:
+    """Refuse control characters (other than newline and tab) and Unicode format characters.
+
+    The trust prompt shows these fields; a terminal escape or bidi control could make
+    what it shows differ from what runs.
+    """
+    if isinstance(value, str):
+        for offset, char in enumerate(value):
+            if char not in "\n\t" and unicodedata.category(char) in ("Cc", "Cf"):
+                raise ValueError(
+                    f"{info.field_name} contains a control or format character "
+                    f"(U+{ord(char):04X} at offset {offset}); remove it"
+                )
+    return value
+
+
 def _check_name(value: str, kind: str) -> str:
     if not NAME_PATTERN.fullmatch(value):
         raise ValueError(f"{kind} {value!r} must fullmatch {NAME_PATTERN.pattern}")
@@ -137,6 +157,8 @@ class ToolParameter(BaseModel):
     required: bool = Field(True, strict=True)
     default: ScalarDefault = None
     description: str | None = None
+
+    _plain_text = field_validator("name", "description", "default", mode="before")(_check_plain_text)
 
     @field_validator("description")
     @classmethod
@@ -192,6 +214,8 @@ class CypherTool(BaseModel):
     parameters: tuple[ToolParameter, ...] = ()
     max_rows: int = Field(DEFAULT_MAX_ROWS, ge=1, le=MAX_ROWS_LIMIT, strict=True)
     timeout_s: int = Field(DEFAULT_TIMEOUT_S, ge=1, le=MAX_TIMEOUT_S, strict=True)
+
+    _plain_text = field_validator("name", "description", "cypher", mode="before")(_check_plain_text)
 
     @field_validator("name")
     @classmethod
@@ -275,12 +299,26 @@ def tools_file_path(repo_root: Path) -> Path:
     return Path(repo_root) / TOOLS_FILENAME
 
 
+def tools_file_outside(repo_root: Path) -> bool:
+    """True when the tools file exists but resolves outside the repository (e.g. a symlink out).
+
+    Such a file is treated as unreadable: never served, trusted or shown.
+    """
+    path = tools_file_path(repo_root)
+    try:
+        return os.path.lexists(path) and not is_within(path.resolve(), Path(repo_root))
+    except (OSError, RuntimeError):
+        return True
+
+
 def load_project_tools(repo_root: Path) -> ProjectTools | None:
     """Load and validate `devgraph.tools.yaml`; None if and only if it is absent."""
     path = tools_file_path(repo_root)
     try:
         if not path.exists():
             return None
+        if tools_file_outside(repo_root):
+            raise ProjectToolsError(f"{path}: tools file must be inside the repository")
         if not path.is_file():
             raise ProjectToolsError(f"{path}: tools file is not a regular file")
         text = path.read_text(encoding="utf-8")

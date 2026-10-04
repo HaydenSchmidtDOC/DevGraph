@@ -2174,16 +2174,28 @@ def config_tools_list(
 def _trust_state(root: Path) -> str | None:
     """The trust state of the repository's tools file as it is now (see `project_trust`); None without a regular file."""
     from devgraph.config import project_trust
-    from devgraph.config.project_tools import tools_file_path
+    from devgraph.config.project_tools import tools_file_outside, tools_file_path
 
     path = tools_file_path(Path(root))
     try:
-        if not path.is_file():
+        if tools_file_outside(Path(root)) or not path.is_file():
             return None
         data = path.read_bytes()
     except OSError:
         return None
     return project_trust.project_tools_trust(root, data)
+
+
+def _global_tool_names() -> set[str]:
+    """Names in the global tools store; empty when it is absent or invalid."""
+    from devgraph.config.global_tools import load_global_tools
+    from devgraph.config.project_tools import ProjectToolsError
+
+    try:
+        store = load_global_tools()
+    except ProjectToolsError:
+        return set()
+    return {t.name for t in store.tools} if store is not None else set()
 
 
 def _stdin_is_tty() -> bool:
@@ -2209,17 +2221,19 @@ def _trust_target(repo: Optional[str]) -> Any:
 @tools_app.command("trust")
 def config_tools_trust(
     repo: Optional[str] = typer.Argument(None, help="Registered repo id or path (default: the repository containing the current directory)."),
-    sha256: Optional[str] = typer.Option(None, "--sha256", help="Approve without asking, only if this is the file's sha256 (hex)."),
+    sha256: Optional[str] = typer.Option(None, "--sha256", help="For CI: approve without asking, only if this is the file's sha256 (hex)."),
 ) -> None:
     """Serve a repository's devgraph.tools.yaml: shows its tools and sha256, then approves exactly those bytes.
 
     Project tools are off until trusted, and any change to the file needs trusting again.
     """
-    from devgraph.config.project_tools import ProjectToolsError, parse_project_tools, tools_file_path
+    from devgraph.config.project_tools import ProjectToolsError, parse_project_tools, tools_file_outside, tools_file_path
     from devgraph.config.project_trust import tools_sha256
 
     record = _trust_target(repo)
     path = tools_file_path(Path(record.path))
+    if tools_file_outside(Path(record.path)):
+        raise _tools_fail(f"{path.name} in {record.path} resolves outside the repository; nothing was trusted")
     try:
         if not path.is_file():
             raise _tools_fail(f"no {path.name} in {record.path}; nothing to trust")
@@ -2231,9 +2245,17 @@ def config_tools_trust(
     except (UnicodeDecodeError, ProjectToolsError) as exc:
         raise _tools_fail(f"{path.name} is invalid; fix it before trusting it: {str(exc).splitlines()[0]}")
     digest = tools_sha256(data)
+    global_names = _global_tool_names()
     console.print(f"Tools in {escape(str(path))}:", soft_wrap=True)
     for tool in declared.tools:
         console.print(f"\n[cyan]{escape(tool.name)}[/cyan]")
+        if tool.name in global_names:
+            console.print(f"  overrides the global tool {escape(repr(tool.name))} in this repository", soft_wrap=True)
+        console.print(f"  description: {escape(tool.description)}", highlight=False, soft_wrap=True)
+        for p in tool.parameters:
+            detail = f"{p.type}, " + ("required" if p.required else f"optional, default {p.default!r}")
+            line = f"  parameter {p.name} ({detail})" + (f": {p.description}" if p.description else "")
+            console.print(escape(line), highlight=False, soft_wrap=True)
         console.print(escape(tool.cypher.rstrip()), highlight=False, soft_wrap=True)
     if not declared.tools:
         console.print("(no tools)")
@@ -2244,9 +2266,10 @@ def config_tools_trust(
     )
     if sha256 is not None:
         if sha256.strip().lower() != digest:
-            raise _tools_fail(f"--sha256 does not match {path.name}, whose sha256 is {digest}; nothing was trusted")
+            raise _tools_fail(f"--sha256 does not match {path.name}; nothing was trusted")
     elif not _stdin_is_tty():
-        raise _tools_fail("no terminal to confirm on: review the tools above, then pass --sha256 with the sha256 shown")
+        raise _tools_fail("no terminal to confirm on: approving project tools needs the user at a terminal "
+                          f"to review them and run `devgraph config tools trust {record.repo_id}`")
     elif not typer.confirm(f"Trust these tools for {record.repo_id}?", default=False):
         console.print("Not trusted.")
         raise typer.Exit(code=1)

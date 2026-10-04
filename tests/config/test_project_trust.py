@@ -97,3 +97,44 @@ def test_a_registry_without_the_column_fails_closed(trust, tmp_path):
 def test_sha256_is_of_the_exact_bytes(trust):
     assert trust.tools_sha256(b"a") != trust.tools_sha256(b"a\n")
     assert len(trust.tools_sha256(TOOLS)) == 64
+
+
+def _set_path(db, repo_id, path):
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE repos SET path = ? WHERE repo_id = ?", (path, repo_id))
+    conn.commit()
+    conn.close()
+
+
+def test_a_row_with_a_relative_path_is_ignored(trust, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo_id = _register(trust.db, repo)
+    _set(trust.db, repo_id, trust.tools_sha256(TOOLS))
+    _set_path(trust.db, repo_id, "repo")  # resolves to the repository only from tmp_path
+    monkeypatch.chdir(tmp_path)
+    assert trust.project_tools_trust(repo, TOOLS) == "untrusted"
+
+
+def test_a_registry_inside_the_repository_is_not_trusted(real_project_trust, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    db = repo / ".devgraph" / "registry.sqlite3"
+    db.parent.mkdir(parents=True)
+    monkeypatch.setattr(real_project_trust, "_registry_db_path", lambda: db)
+    repo_id = _register(db, repo)
+    _set(db, repo_id, real_project_trust.tools_sha256(TOOLS))
+    assert real_project_trust.project_tools_trust(repo, TOOLS) != "trusted"
+
+
+def test_an_exact_path_match_wins_over_a_resolved_one(trust, tmp_path):
+    repo = tmp_path / "repo"
+    link = tmp_path / "link"
+    link.symlink_to(repo, target_is_directory=True)
+    repo_id = _register(trust.db, repo)
+    _set(trust.db, repo_id, trust.tools_sha256(TOOLS))
+    # A second, untrusted row stored under a symlink to the same directory.
+    conn = sqlite3.connect(trust.db)
+    conn.execute("INSERT INTO repos (repo_id, path) VALUES ('linked', ?)", (str(link),))
+    conn.commit()
+    conn.close()
+    assert trust.project_tools_trust(str(link), TOOLS) == "untrusted"
+    assert trust.project_tools_trust(repo.resolve(), TOOLS) == "trusted"
