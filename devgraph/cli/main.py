@@ -2069,12 +2069,11 @@ def _read_tool_source(source: str) -> dict:
 
 
 def _parse_tool_text(text: str, label: str, what: str = "one tool") -> dict:
-    import yaml
-
     from devgraph.config.project_tools import YAML_LOAD_ERRORS
+    from devgraph.config.yaml_bound import bounded_safe_load
 
     try:
-        tool = yaml.safe_load(text)
+        tool = bounded_safe_load(text)
     except YAML_LOAD_ERRORS as exc:
         raise _tools_fail(f"{label}: malformed YAML: {exc}")
     if not isinstance(tool, dict):

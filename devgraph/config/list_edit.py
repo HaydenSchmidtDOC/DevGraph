@@ -14,6 +14,7 @@ import re
 import yaml
 
 from devgraph.config.project_tools import YAML_LOAD_ERRORS
+from devgraph.config.yaml_bound import bounded_safe_load
 
 
 def _a(noun: str) -> str:
@@ -62,7 +63,7 @@ def dump_entry(entry: dict) -> str:
 
 def _load(text: str) -> object:
     try:
-        return yaml.safe_load(text)
+        return bounded_safe_load(text)
     except YAML_LOAD_ERRORS as exc:
         raise ListEditError(f"malformed YAML: {exc}", "malformed") from exc
 

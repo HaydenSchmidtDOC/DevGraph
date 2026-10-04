@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
 from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, global_tools_fingerprint, global_tools_path
 from devgraph.config.project_switch import project_config_enabled
 from devgraph.config.project_tools import (
@@ -35,6 +34,7 @@ from devgraph.config.project_tools import (
     parse_project_tools,
     tools_file_path,
 )
+from devgraph.config.yaml_bound import bounded_safe_load
 from devgraph.mcp.catalog import builtin_tool_names, scoped_tool_id
 
 from mcp.server.mcpserver.exceptions import ToolError
@@ -317,7 +317,7 @@ def _declared_names(fingerprint: bytes | str) -> set[str] | None:
     if not isinstance(fingerprint, bytes):
         return None
     try:
-        data = yaml.safe_load(fingerprint.decode("utf-8"))
+        data = bounded_safe_load(fingerprint.decode("utf-8"))
     except (UnicodeDecodeError, *YAML_LOAD_ERRORS):
         return None
     tools = data.get("tools") if isinstance(data, dict) else None

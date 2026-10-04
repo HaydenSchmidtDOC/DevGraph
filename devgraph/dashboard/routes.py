@@ -47,6 +47,7 @@ from devgraph.config.project_schema import (
 )
 from devgraph.config.schema_findings import introduced_conflicts, schema_conflicts
 from devgraph.config.settings import get_settings
+from devgraph.config.yaml_bound import bounded_safe_load
 from devgraph.dashboard import queries
 from devgraph.dashboard.config_model import GLOBAL_SCOPE, build_config, build_global, build_project, scrub
 from devgraph.dashboard.events import EventBroadcaster
@@ -263,14 +264,14 @@ def _body_dry_run(payload: dict) -> bool:
 
 
 async def _config_body(request: Request) -> tuple[dict, bool]:
-    """The entry mapping and `dry_run` flag of a Config entry write body (entry parsed with `yaml.safe_load` only)."""
+    """The entry mapping and `dry_run` flag of a Config entry write body (entry parsed with `bounded_safe_load` only)."""
     payload = await _json_payload(request)
     text = payload.get("yaml")
     if not isinstance(text, str):
         raise _config_error(400, "bad_request", "yaml must be a string")
     dry_run = _body_dry_run(payload)
     try:
-        entry = yaml.safe_load(text)
+        entry = bounded_safe_load(text)
     except yaml.YAMLError as exc:
         raise _config_error(400, "bad_request", f"malformed YAML: {exc}") from exc
     if not isinstance(entry, dict):

@@ -23,6 +23,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from devgraph.config.yaml_bound import bounded_safe_load
+
 TOOLS_FILENAME = "devgraph.tools.yaml"
 TOOLS_VERSION = 1
 
@@ -294,7 +296,7 @@ def load_project_tools(repo_root: Path) -> ProjectTools | None:
 def parse_project_tools(text: str, path: Path) -> ProjectTools:
     """Parse and validate the text of a tools file; `path` only labels errors."""
     try:
-        document = yaml.safe_load(text)
+        document = bounded_safe_load(text)
     except YAML_LOAD_ERRORS as exc:
         raise ProjectToolsError(f"{path}: malformed YAML: {exc}") from exc
     if document is None:

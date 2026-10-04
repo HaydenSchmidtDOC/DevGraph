@@ -1753,3 +1753,25 @@ def test_integral_float_values_make_the_row_yaml_only(client, registry, tmp_path
     entries = client.get("/api/config/repo-a").json()["tools"]["entries"]
 
     assert {e["name"]: e["entry"] is None for e in entries} == {"rows": True, "defaulted": True, "fine": False}
+
+
+def test_alias_bomb_in_schema_file_is_refused_quickly(client, registry, tmp_path):
+    import time
+
+    record = _repo(tmp_path, registry)
+    laughs = "[&l0 [lol, lol, lol, lol, lol, lol, lol, lol, lol, lol]" + "".join(
+        f", &l{i} [" + ", ".join([f"*l{i - 1}"] * 10) + "]" for i in range(1, 10)
+    ) + "]"
+    (record.path / SCHEMA_FILENAME).write_text(
+        "version: 1\nnode_types:\n  - label: Ticket\n    key: [id]\n"
+        f"    metadata:\n      - name: id\n        type: string\n    description: {laughs}\n"
+    )
+
+    start = time.monotonic()
+    body = client.get("/api/config")
+    assert time.monotonic() - start < 2
+
+    [project] = body.json()["projects"]
+    block = project["schema"]
+    assert block["state"] == "invalid" and block["node_types"] == []
+    assert "more than 10000" in block["error"]
