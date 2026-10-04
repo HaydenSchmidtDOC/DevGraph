@@ -160,7 +160,7 @@ def test_legacy_lines_are_normalised_on_read(settings):
         {"ts": 2, "tool": "my_declared_tool", "duration_ms": 1, "ok": True},
         {"ts": 3, "tool": "list_services", "tool_id": 5, "origin": "bogus", "duration_ms": 1, "ok": True, "extra": "x"},
     ]
-    mcp_server.telemetry_path().write_text("".join(json.dumps(l) + "\n" for l in lines), encoding="utf-8")
+    mcp_server.telemetry_path().write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
 
     got = list(reversed(mcp_server.read_tool_telemetry(100)))
     assert [(e["tool_id"], e["origin"]) for e in got] == [

@@ -7,7 +7,6 @@ import uuid
 import pytest
 
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
-from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import apply_project_schema, full_scan, index_paths, remove_paths, schema_pending
 from devgraph.indexer.providers import filesystem
 

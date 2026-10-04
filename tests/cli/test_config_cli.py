@@ -266,7 +266,8 @@ def test_validate_one_repo(runner, settings, tmp_path):
 
 def test_validate_all_checks_every_registered_repo_and_conflicts(runner, settings, tmp_path):
     a, b = tmp_path / "a", tmp_path / "b"
-    a.mkdir(); b.mkdir()
+    a.mkdir()
+    b.mkdir()
     for d in (a, b):
         subprocess.run(["git", "init", "-q"], cwd=d, check=True)
     write(a, WIDGET)

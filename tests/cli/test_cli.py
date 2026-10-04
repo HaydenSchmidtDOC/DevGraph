@@ -1411,7 +1411,7 @@ def test_cli_doctor_reports_a_missing_or_blocked_generated_constraint(runner, te
     finally:
         engine.delete_repository(blocked)
         engine.delete_repository(missing)
-    assert f"key change blocked by duplicate nodes" in doctor and label in doctor
+    assert "key change blocked by duplicate nodes" in doctor and label in doctor
     assert f"devgraph rescan {missing} --now" in doctor
 
 
