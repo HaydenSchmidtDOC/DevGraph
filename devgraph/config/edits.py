@@ -28,6 +28,12 @@ SCHEMA_SECTIONS = {
 }
 
 TOOLS_RELOAD_NOTE = "Running MCP sessions pick this up within 2 seconds."
+
+
+def tools_trust_note(repo_id: str) -> str:
+    """What any write to a repository's tools file means: its sha256 changes, so it needs approving again."""
+    return (f"Saving stops {repo_id}'s project tools being served until you run "
+            f"`devgraph config tools trust {repo_id}`; running MCP sessions pick that up within 2 seconds.")
 GLOBAL_TOOLS_NOTE = (
     "Global tools are served only in MCP sessions scoped to a registered repository; "
     "running sessions there pick up changes within 2 seconds."
@@ -200,6 +206,7 @@ def tools_effect_note(root: Path | None, record: Any) -> str:
     """Whether running MCP sessions will serve what is in this scope's file.
 
     `record` is the registered repository record for `root` (None when not registered).
+    A registered repository's write always needs re-trusting: it changes the file's sha256.
     """
     if root is None:
         return GLOBAL_TOOLS_NOTE
@@ -209,7 +216,7 @@ def tools_effect_note(root: Path | None, record: Any) -> str:
     if not record.project_config_enabled:
         return (f"project config is disabled for {record.repo_id}, so MCP sessions won't serve its tools; "
                 f"enable it with `devgraph config enable {record.repo_id}`.")
-    return TOOLS_RELOAD_NOTE
+    return tools_trust_note(record.repo_id)
 
 
 def refuse_builtin(name: Any) -> None:

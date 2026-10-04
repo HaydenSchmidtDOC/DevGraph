@@ -27,7 +27,6 @@ from devgraph.cli.exporters import export_cypher, export_dot, export_json
 from devgraph.config import get_settings
 from devgraph.config.edits import GLOBAL_TOOLS_NOTE as _GLOBAL_TOOLS_NOTE
 from devgraph.config.edits import SCHEMA_SECTIONS as _SCHEMA_SECTIONS
-from devgraph.config.edits import TOOLS_RELOAD_NOTE as _TOOLS_RELOAD_NOTE
 from devgraph.config.edits import project_config_notes as _project_config_notes
 from devgraph.config.edits import removed_types as _removed_types  # noqa: F401  (kept importable from here)
 from devgraph.config.schema_findings import project_schema_findings as _project_schema_findings
@@ -667,6 +666,7 @@ def _project_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
     warning: the built-in is always used, as the tool plane will report."""
     from devgraph.config.project_switch import project_config_enabled
     from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError, load_project_tools
+    from devgraph.config.project_trust import untrusted_reason
     from devgraph.mcp.catalog import builtin_tool_names
 
     builtin = builtin_tool_names()
@@ -681,8 +681,16 @@ def _project_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
             findings.append({"repo_id": repo.repo_id, "status": "absent", "detail": f"no {TOOLS_FILENAME}", "failed": False})
             continue
         names = ", ".join(tool.name for tool in declared.tools)
-        if project_config_enabled(repo.path):
+        trust = _trust_state(repo.path)
+        if project_config_enabled(repo.path) and trust == "trusted":
             findings.append({"repo_id": repo.repo_id, "status": "valid", "detail": f"tools: {names or 'none'}", "failed": False})
+        elif project_config_enabled(repo.path):
+            findings.append({
+                "repo_id": repo.repo_id,
+                "status": "warning",
+                "detail": f"tools: {names or 'none'} (not served: {untrusted_reason(repo.repo_id, trust or 'untrusted')})",
+                "failed": False,
+            })
         else:
             # The file is checked, but the MCP tool plane serves none of it.
             findings.append({
@@ -2128,8 +2136,11 @@ def config_tools_list(
         rows += [{"name": n, "origin": "global", "locked": False, **ignored} for n in global_tools if n in builtin]
         rows += [{"name": n, "origin": "project", "locked": False, **ignored} for n in project_names if n in builtin]
 
+    record = None if root is None else _scope_record(root)
+    serves = record is not None and record.active and record.project_config_enabled
+    trust = _trust_state(root) if serves else None
     if as_json:
-        typer.echo(json.dumps({"tools": rows}, indent=2))
+        typer.echo(json.dumps({"tools": rows, **({"trust": trust} if root is not None else {})}, indent=2))
         return
     table = Table(title="Global tools" if root is None else escape(f"Tools for {root}"))
     table.add_column("Name", style="cyan")
@@ -2140,13 +2151,127 @@ def config_tools_list(
             origin += f" — ignored: {row['ignored']}"
         table.add_row(escape(row["name"]), origin)
     console.print(table)
-    note = _tools_scope_note(root)
-    if note != _TOOLS_RELOAD_NOTE:  # unregistered or disabled; or the global note for --global
-        console.print(escape(note), soft_wrap=True)
+    if not serves:  # unregistered or disabled; or the global note for --global
+        console.print(escape(_tools_scope_note(root)), soft_wrap=True)
     elif not project_config_enabled(root):
         console.print("Project config disabled: project tools are not served")
+    elif trust == "trusted":
+        console.print("Project tools: trusted (devgraph.tools.yaml matches the approved sha256)", soft_wrap=True)
+    elif trust is not None:
+        from devgraph.config.project_trust import untrusted_reason
+
+        console.print(escape(f"Project tools are not served: {untrusted_reason(record.repo_id, trust)}"), soft_wrap=True)
     if root is not None:
         console.print(_GLOBAL_TOOLS_NOTE, soft_wrap=True)
+
+
+def _trust_state(root: Path) -> str | None:
+    """The trust state of the repository's tools file as it is now (see `project_trust`); None without a regular file."""
+    from devgraph.config import project_trust
+    from devgraph.config.project_tools import tools_file_path
+
+    path = tools_file_path(Path(root))
+    try:
+        if not path.is_file():
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    return project_trust.project_tools_trust(root, data)
+
+
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty()
+
+
+def _trust_target(repo: Optional[str]) -> Any:
+    """The registered repository `repo` names (a repo id, or a path inside one), else the one containing the current directory."""
+    repos = _registered_repos()
+    if repo is not None:
+        match = next((r for r in repos if r.repo_id == repo), None)
+        target = Path(repo).expanduser()
+        if match is None and target.is_dir():
+            match = _containing_repo(repos, target.resolve())
+    else:
+        match = _containing_repo([r for r in repos if r.active], _repo_dir(Path(".")))
+    if match is None:
+        raise _tools_fail(f"{repo or 'the current directory'} is not a registered repository (nor inside one); "
+                          "register it with `devgraph add`")
+    return match
+
+
+@tools_app.command("trust")
+def config_tools_trust(
+    repo: Optional[str] = typer.Argument(None, help="Registered repo id or path (default: the repository containing the current directory)."),
+    sha256: Optional[str] = typer.Option(None, "--sha256", help="Approve without asking, only if this is the file's sha256 (hex)."),
+) -> None:
+    """Serve a repository's devgraph.tools.yaml: shows its tools and sha256, then approves exactly those bytes.
+
+    Project tools are off until trusted, and any change to the file needs trusting again.
+    """
+    from devgraph.config.project_tools import ProjectToolsError, parse_project_tools, tools_file_path
+    from devgraph.config.project_trust import tools_sha256
+
+    record = _trust_target(repo)
+    path = tools_file_path(Path(record.path))
+    try:
+        if not path.is_file():
+            raise _tools_fail(f"no {path.name} in {record.path}; nothing to trust")
+        data = path.read_bytes()
+    except OSError as exc:
+        raise _tools_fail(f"cannot read {path}: {exc}")
+    try:
+        declared = parse_project_tools(data.decode("utf-8"), path)
+    except (UnicodeDecodeError, ProjectToolsError) as exc:
+        raise _tools_fail(f"{path.name} is invalid; fix it before trusting it: {str(exc).splitlines()[0]}")
+    digest = tools_sha256(data)
+    console.print(f"Tools in {escape(str(path))}:", soft_wrap=True)
+    for tool in declared.tools:
+        console.print(f"\n[cyan]{escape(tool.name)}[/cyan]")
+        console.print(escape(tool.cypher.rstrip()), highlight=False, soft_wrap=True)
+    if not declared.tools:
+        console.print("(no tools)")
+    console.print(f"\nsha256: {digest}")
+    console.print(
+        "An enabled project tool can read the whole graph, every registered repository's data and not only this "
+        "one's: the $repo_id rule is a convention, not a sandbox.", soft_wrap=True,
+    )
+    if sha256 is not None:
+        if sha256.strip().lower() != digest:
+            raise _tools_fail(f"--sha256 does not match {path.name}, whose sha256 is {digest}; nothing was trusted")
+    elif not _stdin_is_tty():
+        raise _tools_fail("no terminal to confirm on: review the tools above, then pass --sha256 with the sha256 shown")
+    elif not typer.confirm(f"Trust these tools for {record.repo_id}?", default=False):
+        console.print("Not trusted.")
+        raise typer.Exit(code=1)
+    registry = _get_registry()
+    try:
+        registry.set_project_tools_sha256(record.repo_id, digest)
+    finally:
+        registry.close()
+    console.print(f"[green][OK][/green] Trusted {escape(path.name)} for {escape(record.repo_id)}; "
+                  "running MCP sessions serve its tools within 2 seconds.", soft_wrap=True)
+    if not record.project_config_enabled:
+        console.print(f"Project config is disabled for {escape(record.repo_id)}, so its tools are still not served; "
+                      f"enable it with `devgraph config enable {escape(record.repo_id)}`.", soft_wrap=True)
+
+
+@tools_app.command("untrust")
+def config_tools_untrust(
+    repo: Optional[str] = typer.Argument(None, help="Registered repo id or path (default: the repository containing the current directory)."),
+) -> None:
+    """Stop serving a repository's project tools until they are trusted again."""
+    record = _trust_target(repo)
+    if record.project_tools_sha256 is None:
+        console.print(f"Project tools for {escape(record.repo_id)} are not trusted; nothing to do.")
+        return
+    registry = _get_registry()
+    try:
+        registry.set_project_tools_sha256(record.repo_id, None)
+    finally:
+        registry.close()
+    console.print(f"[green][OK][/green] Revoked trust in {escape(record.repo_id)}'s project tools; "
+                  "running MCP sessions stop serving them within 2 seconds.", soft_wrap=True)
 
 
 @tools_app.command("add")
