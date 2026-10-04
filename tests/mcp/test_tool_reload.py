@@ -6,9 +6,13 @@ import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
+import anyio
+from mcp.client import Client
+
 from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
+from devgraph.mcp.tool_reload import ToolListNotifier, initialization_options, poll_tool_reloads
 
 ONE = """
     version: 1
@@ -157,3 +161,84 @@ def test_without_a_scope_there_is_nothing_to_reload(tmp_path, monkeypatch):
     server, _ = build(tmp_path, monkeypatch, scoped=False)
     assert server.devgraph_tool_plane.repo is None
     assert server.devgraph_tool_plane.reload_if_changed() is False
+
+
+def test_listchanged_is_advertised_only_with_a_scope(tmp_path, monkeypatch):
+    server, _ = build(tmp_path, monkeypatch)
+    assert initialization_options(server, tools_changed=True).capabilities.tools.list_changed is True
+    assert not initialization_options(server, tools_changed=False).capabilities.tools.list_changed
+
+
+def test_a_legacy_client_is_told_and_relists(tmp_path, monkeypatch):
+    server, repo = build(tmp_path, monkeypatch)
+    notifier = ToolListNotifier(server)
+    received = []
+
+    async def handler(message):
+        received.append(type(message).__name__)
+
+    async def scenario():
+        async with Client(server, mode="legacy", message_handler=handler) as client:
+            assert "count_files" not in {t.name for t in (await client.list_tools()).tools}
+            write(repo, TWO)
+            assert server.devgraph_tool_plane.reload_if_changed() is True
+            await notifier.notify()
+            await anyio.sleep(0.2)
+            assert any("ToolListChanged" in name for name in received)
+            assert "count_files" in {t.name for t in (await client.list_tools()).tools}
+
+    anyio.run(scenario)
+
+
+def test_a_modern_listener_is_told(tmp_path, monkeypatch):
+    server, repo = build(tmp_path, monkeypatch)
+    notifier = ToolListNotifier(server)
+
+    async def scenario():
+        async with Client(server, mode="auto") as client:
+            async with client.listen(tools_list_changed=True) as events:
+                write(repo, TWO)
+                server.devgraph_tool_plane.reload_if_changed()
+                await notifier.notify()
+                with anyio.fail_after(3):
+                    async for event in events:
+                        assert "ToolsListChanged" in type(event).__name__
+                        break
+
+    anyio.run(scenario)
+
+
+def test_the_poller_notifies_only_on_change_and_survives_errors(tmp_path, monkeypatch):
+    server, _ = build(tmp_path, monkeypatch)
+    plane = server.devgraph_tool_plane
+    outcomes = iter([False, RuntimeError("boom"), True])
+
+    def step():
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(plane, "reload_if_changed", step)
+    notified = []
+
+    class Notifier:
+        async def notify(self):
+            notified.append(1)
+
+    async def scenario():
+        with anyio.CancelScope() as scope:
+            ticks = 0
+
+            async def sleep(_):
+                nonlocal ticks
+                ticks += 1
+                if ticks > 3:
+                    scope.cancel()
+                await anyio.sleep(0)
+
+            await poll_tool_reloads(plane, Notifier(), sleep=sleep)
+        assert ticks == 4
+
+    anyio.run(scenario)
+    assert notified == [1]

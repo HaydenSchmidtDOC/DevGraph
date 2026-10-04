@@ -45,6 +45,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import anyio
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
@@ -61,6 +62,7 @@ from devgraph.mcp.tool_plane import (
     register_project_tools,
     resolve_session_repo,
 )
+from devgraph.mcp.tool_reload import run_stdio
 from devgraph.registry.store import RepoRegistry
 
 logger = logging.getLogger(__name__)
@@ -611,7 +613,7 @@ def main() -> None:
             session_source=source,
             session_pinned=os.environ.get(SESSION_REPO_ENV),
         )
-        server.run("stdio")
+        anyio.run(run_stdio, server)
     finally:
         engine.close()
         registry.close()
