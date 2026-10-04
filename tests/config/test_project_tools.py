@@ -305,3 +305,59 @@ def test_json_schema_describes_the_file():
     schema = project_tools_json_schema()
     assert "tools" in schema["properties"]
     assert "ToolParameter" in schema["$defs"] and "CypherTool" in schema["$defs"]
+
+
+@pytest.mark.parametrize(
+    "clause",
+    [
+        "SHOW TRANSACTIONS YIELD * WHERE $repo_id IS NOT NULL",
+        "SHOW SETTINGS WHERE $repo_id IS NOT NULL",
+        "TERMINATE TRANSACTIONS 'x' WHERE $repo_id IS NOT NULL",
+        "GRANT ROLE r TO u WHERE $repo_id IS NOT NULL",
+        "ALTER DATABASE d SET ACCESS READ ONLY WHERE $repo_id IS NOT NULL",
+        "DENY MATCH {*} ON GRAPH g TO r WHERE $repo_id IS NOT NULL",
+        "REVOKE ROLE r FROM u WHERE $repo_id IS NOT NULL",
+        "RENAME ROLE a TO b WHERE $repo_id IS NOT NULL",
+    ],
+)
+def test_administration_clauses_are_rejected(tmp_path, clause):
+    with pytest.raises(ProjectToolsError, match="read-only"):
+        load_text(tmp_path, tool_text(clause + " RETURN 1"))
+
+
+def test_keywords_after_dot_or_dollar_are_fine(tmp_path):
+    cypher = "MATCH (a {repo_id: $repo_id}) RETURN a.set, a {.set} AS m, $create AS c"
+    tool = load_text(tmp_path, tool_text(cypher, params="- {name: create}")).tools[0]
+    assert tool.parameters[0].name == "create"
+
+
+def test_set_clause_and_digit_prefixed_set_still_rejected(tmp_path):
+    for cypher in ("MATCH (n {repo_id: $repo_id}) SET n.x = 1", "RETURN 1SET n.x = 1 MATCH (m {repo_id: $repo_id})"):
+        with pytest.raises(ProjectToolsError, match="read-only"):
+            load_text(tmp_path, tool_text(cypher))
+
+
+@pytest.mark.parametrize("text", ["version: true\ntools: []\n", "version: 1.0\ntools: []\n", 'version: "1"\ntools: []\n'])
+def test_version_must_be_the_integer_one(tmp_path, text):
+    with pytest.raises(ProjectToolsError):
+        load_text(tmp_path, text)
+
+
+@pytest.mark.parametrize("required", ['"yes"', "1", '"true"'])
+def test_required_must_be_a_boolean(tmp_path, required):
+    with pytest.raises(ProjectToolsError):
+        load_text(tmp_path, tool_text("MATCH (n {repo_id: $repo_id, x: $p}) RETURN n", params=f"- {{name: p, required: {required}}}"))
+
+
+def test_parameter_description_is_capped(tmp_path):
+    long = "x" * 1025
+    with pytest.raises(ProjectToolsError):
+        load_text(tmp_path, tool_text("MATCH (n {repo_id: $repo_id, x: $p}) RETURN n", params=f"- {{name: p, description: {long}}}"))
+
+
+def test_catalog_module_does_not_import_mcp():
+    import subprocess
+    import sys
+
+    code = "import sys, devgraph.mcp.catalog as c; assert 'mcp' not in sys.modules; assert 'search_component' in c.builtin_tool_names()"
+    subprocess.run([sys.executable, "-c", code], check=True)

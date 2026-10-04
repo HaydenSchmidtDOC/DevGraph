@@ -720,7 +720,7 @@ def _project_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
     `_project_schema_findings`. A tool named like a built-in is a non-failing
     warning: the built-in is always used, as the tool plane will report."""
     from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError, load_project_tools
-    from devgraph.mcp.server import builtin_tool_names
+    from devgraph.mcp.catalog import builtin_tool_names
 
     builtin = builtin_tool_names()
     findings: list[dict[str, Any]] = []

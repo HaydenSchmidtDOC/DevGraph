@@ -37,22 +37,24 @@ MAX_ROWS_LIMIT = 1000
 DEFAULT_TIMEOUT_S = 10
 MAX_TIMEOUT_S = 60
 
-#: Clauses a read-only tool may not contain. CALL is refused outright
-#: (procedures and subqueries alike) to keep the rule simple to audit.
+#: Write, procedure and administration keywords a read-only tool may not
+#: contain. CALL is refused outright (procedures and subqueries alike) to keep
+#: the rule simple to audit; SHOW/TERMINATE would reach other sessions' queries.
 WRITE_KEYWORDS: tuple[str, ...] = (
     "CREATE", "INSERT", "MERGE", "SET", "DELETE", "DETACH", "REMOVE", "DROP", "FOREACH", "CALL", "USE",
+    "SHOW", "TERMINATE", "ALTER", "GRANT", "DENY", "REVOKE", "RENAME",
 )
 
-ToolsVersion = Literal[TOOLS_VERSION]
+ToolsVersion = Literal[TOOLS_VERSION]  # Literal matches True/1.0 too; see ProjectTools._strict_version
 ParameterType = Literal[PARAMETER_TYPES]
 ScalarDefault = str | int | float | bool | None
 
 # String literals, backtick-quoted names and comments: blanked before any
 # keyword or parameter scan, so text inside them never counts.
 _LITERALS = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`|//[^\n]*|/\*.*?\*/", re.S)
-# Lookarounds for keyword boundaries: not preceded by letter/underscore, not followed by letter/digit/underscore.
+# Lookarounds for keyword boundaries: not preceded by letter/underscore/dot/dollar (a property, projection or parameter), not followed by letter/digit/underscore.
 _WRITES = re.compile(
-    r"(?<![A-Za-z_])(?:LOAD\s+CSV)(?![A-Za-z0-9_])|(?<![A-Za-z_])(?:" + "|".join(WRITE_KEYWORDS) + r")(?![A-Za-z0-9_])",
+    r"(?<![A-Za-z_.$])(?:LOAD\s+CSV)(?![A-Za-z0-9_])|(?<![A-Za-z_.$])(?:" + "|".join(WRITE_KEYWORDS) + r")(?![A-Za-z0-9_])",
     re.I
 )
 # Parameters: one comprehensive pattern to extract parameters without counting $ inside backtick identifiers.
@@ -122,9 +124,16 @@ class ToolParameter(BaseModel):
 
     name: str
     type: ParameterType = "string"
-    required: bool = True
+    required: bool = Field(True, strict=True)
     default: ScalarDefault = None
     description: str | None = None
+
+    @field_validator("description")
+    @classmethod
+    def _capped_description(cls, value: str | None) -> str | None:
+        if value is not None and len(value) > MAX_DESCRIPTION_LENGTH:
+            raise ValueError(f"description must be at most {MAX_DESCRIPTION_LENGTH} characters")
+        return value
 
     @field_validator("name")
     @classmethod
@@ -227,6 +236,13 @@ class ProjectTools(BaseModel):
 
     version: ToolsVersion
     tools: tuple[CypherTool, ...] = ()
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def _strict_version(cls, value: Any) -> Any:
+        if type(value) is not int:
+            raise ValueError(f"version must be the integer {TOOLS_VERSION}")
+        return value
 
     @model_validator(mode="after")
     def _unique_names(self) -> ProjectTools:

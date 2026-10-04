@@ -25,7 +25,7 @@ tools:
     timeout_s: 10
 ```
 
-- `version: 1`; unknown keys rejected everywhere.
+- `version: 1` (the integer; `true` or `1.0` are rejected); unknown keys rejected everywhere.
 - `name`: `[a-z][a-z0-9_]{0,63}`, unique in the file.
 - `description`: required, non-blank, at most 1024 characters (it is what an
   agent reads to decide whether to call the tool).
@@ -33,8 +33,8 @@ tools:
   and the author cannot override; must pass a static read-only check.
 - `parameters`: `name` (`[a-z][a-z0-9_]{0,63}`, not `repo_id`, unique),
   `type` (`string | integer | float | boolean`, default `string`),
-  `required` (default `true`), optional `default` (must match the type; only
-  allowed when `required: false`), optional `description`.
+  `required` (default `true`, a real boolean), optional `description` (at most 1024 characters), optional `default` (must match the type; only
+  allowed when `required: false`).
 - Every `$name` or `$`name`` the query uses (other than `$repo_id`) is a declared
   parameter, and every declared parameter is used.
 - `max_rows`: 1–1000 (default 100). `timeout_s`: 1–60 (default 10).
@@ -46,7 +46,11 @@ tools:
 String literals, backtick-quoted identifiers and comments are blanked out, then
 the query is scanned (case-insensitively, with lookaround boundaries that treat
 digits as separators) for `CREATE`, `INSERT`, `MERGE`, `SET`, `DELETE`,
-`DETACH`, `REMOVE`, `DROP`, `FOREACH`, `LOAD CSV`, `CALL` and `USE`. Any hit
+`DETACH`, `REMOVE`, `DROP`, `FOREACH`, `LOAD CSV`, `CALL`, `USE`, `SHOW`,
+`TERMINATE`, `ALTER`, `GRANT`, `DENY`, `REVOKE` and `RENAME` (write, procedure and
+administration keywords; `SHOW`/`TERMINATE` would reach other sessions' queries).
+A keyword directly after `.` or `$` (property, projection, parameter) is not a
+clause and is allowed. Any hit
 rejects the file. APOC references (case-insensitive `apoc.` outside strings) are
 also rejected. This is defence in depth: when the tool plane serves these tools
 it will also run them in a read transaction. `CALL` is rejected outright
@@ -54,7 +58,8 @@ it will also run them in a read transaction. `CALL` is rejected outright
 
 The `$repo_id` requirement proves the query *references* the injected parameter,
 not that it *scopes* every match — the tool plane's runtime (read transaction,
-injected repo_id) remains the real gate.
+injected repo_id) remains the real gate: scoping is enforced at runtime by the
+tool plane.
 
 ## Built-in names
 

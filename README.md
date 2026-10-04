@@ -124,7 +124,7 @@ tools:
 ```
 
 - **DevGraph does not serve these tools yet.** This release only validates and reports the file; exposing the tools to MCP clients is the next piece of work.
-- Each query must be read-only (no `CREATE`, `MERGE`, `SET`, `DELETE`, `CALL`, `apoc.` and the like) and must reference `$repo_id`, which DevGraph will inject. Every other `$name` it uses must be a declared parameter (`string`, `integer`, `float` or `boolean`), and every declared parameter must be used. `max_rows` is 1-1000 (default 100) and `timeout_s` is 1-60 (default 10).
+- Each query must be read-only (no `CREATE`, `INSERT`, `MERGE`, `SET`, `DELETE`, `DETACH`, `REMOVE`, `DROP`, `FOREACH`, `LOAD CSV`, `CALL`, `USE`, `SHOW`, `TERMINATE`, `ALTER`, `GRANT`, `DENY`, `REVOKE` or `RENAME`, and no `apoc` reference) and must reference `$repo_id`, which DevGraph will inject. That check only confirms the query references `$repo_id`; scoping to the calling repository is enforced at runtime by the tool plane. Every other `$name` it uses must be a declared parameter (`string`, `integer`, `float` or `boolean`), and every declared parameter must be used. `max_rows` is 1-1000 (default 100) and `timeout_s` is 1-60 (default 10).
 - An invalid file is rejected as a whole. `devgraph config validate` (or `--all`) exits non-zero on it, `devgraph config show` prints the declared tools and fails on an invalid file, and `devgraph doctor` reports each repository's tools as absent, valid or invalid.
 - A tool named like one of DevGraph's built-in tools is reported as a warning, not an error; the built-in always wins.
 
