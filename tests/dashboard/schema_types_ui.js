@@ -44,11 +44,13 @@ const bootSrc = grab(/^async function bootConnect\(\)/m, "\n}");
 const renderAcSrc = grab(/^function renderAC\(/m, "\n}");
 const topologySrc = grab(/^async function loadTopologyCounts\(/m, "\n}");
 
-/* Today's hardcoded lists, frozen here as the snapshot a repo with no schema
+/* Today's built-in lists, frozen here as the snapshot a repo with no schema
    file must still reproduce: same labels in the same order, same categories,
-   same colours, same 18 relationship types. */
+   same colours, same 18 relationship types. Container (graph/schema.py's
+   second label) shares the repo category, after Repository, so a demo node
+   that only carries a category still resolves to Repository. */
 const SNAPSHOT_NODES = [
-  ["Repository", "repo"], ["Service", "service"], ["Module", "module"], ["Class", "class"],
+  ["Repository", "repo"], ["Container", "repo"], ["Service", "service"], ["Module", "module"], ["Class", "class"],
   ["Function", "function"], ["Endpoint", "endpoint"], ["Database", "database"],
   ["VectorStore", "vectorstore"], ["Queue", "queue"], ["Requirement", "phase2"],
   ["DesignDecision", "phase2"], ["ArchitectureNote", "phase2"], ["Document", "phase2"],
@@ -63,8 +65,7 @@ const SNAPSHOT_RELS = ["CONTAINS", "CALLS", "IMPORTS", "USES", "RUNS", "WRITES_T
   "IMPLEMENTS", "DEPENDS_ON", "EXTENDS", "SATISFIES", "DOCUMENTED_BY", "DECIDED_BY", "SUPERSEDES",
   "MENTIONS", "MODIFIES", "RESOLVES", "REFERENCES"];
 
-// What the backend actually serves for built-ins: graph/schema.py's order,
-// which includes Container (a label the old hardcoded list never showed).
+// What the backend actually serves for built-ins: graph/schema.py's order.
 const BACKEND_LABELS = ["Repository", "Container", "Service", "Module", "Class", "Function", "Endpoint",
   "Database", "VectorStore", "Queue", "Requirement", "DesignDecision", "ArchitectureNote", "Document",
   "Commit", "PullRequest", "Issue"];
@@ -185,7 +186,7 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
 (async () => {
   // 0. before any schema arrives the page renders today's lists (demo mode)
   api.renderTypeLists();
-  check("before any schema loads the rows are today's 16 labels",
+  check("before any schema loads the rows are today's 17 labels",
     JSON.stringify(rowLabels()) === JSON.stringify(SNAPSHOT_NODES.map(n => n[0])), JSON.stringify(rowLabels()));
   check("...and today's 18 relationship chips",
     JSON.stringify(chipTypes()) === JSON.stringify(SNAPSHOT_RELS), JSON.stringify(chipTypes()));
@@ -290,7 +291,7 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
 
   // 5. a repo with no schema file looks exactly like the hardcoded lists did
   await switchTo("plain");
-  check("a no-file payload renders exactly today's 16 labels",
+  check("a no-file payload renders exactly today's 17 labels",
     JSON.stringify(rowLabels()) === JSON.stringify(SNAPSHOT_NODES.map(n => n[0])), JSON.stringify(rowLabels()));
   check("...with today's categories and colours",
     SNAPSHOT_NODES.every(([label, cat]) => rowFor(label).dataset.cat === cat &&
