@@ -342,3 +342,116 @@ def test_the_catalog_lists_project_tool_parameter_names(tmp_path, monkeypatch):
     entry = next(e for e in catalog if e["name"] == "list_folder")
     assert entry["identifier_kind"] == "parameters: folder, limit_hint"
     assert set(entry) >= {"name", "identifier_kind", "envelope", "phase", "note"}
+
+
+# ── dry resolution parity ──────────────────────────────────────────────────
+
+
+def _tool(name, extra=""):
+    return f"""
+      - name: {name}
+        description: Tool {name}.
+        cypher: |
+          MATCH (n {{repo_id: $repo_id}}) RETURN n.name AS name{extra}
+"""
+
+
+def _tools_yaml(*names):
+    return "version: 1\ntools:" + "".join(_tool(n) for n in names)
+
+
+def _global_json(*names):
+    return json.dumps({"version": 1, "tools": [
+        {"name": n, "description": f"Global {n}.", "cypher": "MATCH (n {repo_id: $repo_id}) RETURN n.name AS name"}
+        for n in names]})
+
+
+class Recorder:
+    def __init__(self):
+        self.added = {}
+
+    def add_tool(self, fn, name, description, annotations):
+        self.added[name] = fn
+
+
+def _status_view(status):
+    return {
+        "repo_id": status.repo_id, "served": status.served, "origins": status.origins,
+        "notices": status.notices, "shadowed": status.shadowed,
+        "parameter_names": status.parameter_names, "tools_file": status.tools_file,
+        "global_tools_file": status.global_tools_file, "project_invalid": status.project_invalid,
+        "project_invalid_names": status.project_invalid_names,
+        "definitions": {n: d for n, d in status.definitions.items()},
+    }
+
+
+CASES = {
+    "project only": (_tools_yaml("alpha", "beta"), None, True),
+    "global only": (None, _global_json("gamma"), True),
+    "project overrides global": (_tools_yaml("alpha"), _global_json("alpha", "gamma"), True),
+    "builtin name in project": (_tools_yaml("search_component", "alpha"), None, True),
+    "builtin name in global": (None, _global_json("search_component", "gamma"), True),
+    "invalid project, global stands in": ("version: 1\ntools: [oops\n", _global_json("alpha"), True),
+    "invalid project, names readable": (
+        "version: 1\ntools:\n  - name: alpha\n    description: x\n    cypher: DELETE\n", _global_json("alpha", "gamma"), True),
+    "invalid global": (_tools_yaml("alpha"), "{not json", True),
+    "disabled project": (_tools_yaml("alpha"), _global_json("gamma"), False),
+    "nothing": (None, None, True),
+}
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_dry_resolution_matches_what_a_real_server_serves(tmp_path, monkeypatch, case):
+    from devgraph.config import global_tools
+    from devgraph.mcp import tool_plane
+
+    project, global_, enabled = CASES[case]
+    repo_dir = tmp_path / "demo"
+    repo_dir.mkdir()
+    if project is not None:
+        (repo_dir / TOOLS_FILENAME).write_text(project)
+    if global_ is not None:
+        store = tmp_path / "store" / global_tools.GLOBAL_TOOLS_FILENAME
+        store.parent.mkdir()
+        store.write_text(global_)
+        monkeypatch.setattr(global_tools, "_default_path", lambda: store)
+    monkeypatch.setattr(tool_plane, "project_config_enabled", lambda _path: enabled)
+    record = Repo("demo", repo_dir)
+
+    dry = tool_plane.resolve_tools(record, "env")
+    recorder = Recorder()
+    real = tool_plane.register_project_tools(
+        recorder, Engine(), record, "env", instrument=lambda f: f, annotations=None)
+    assert _status_view(dry) == _status_view(real)
+
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3"))
+    server = mcp_server.build_server(Engine(), Registry([record]), session_repo=record, session_source="env")
+    resource = json.loads(asyncio.run(server.read_resource("devgraph://project-tools"))[0].content)
+    assert resource == dry.to_dict()
+    assert set(dry.served) <= tool_names(server) and set(recorder.added) == set(dry.served)
+
+
+def test_dry_resolution_of_an_unscoped_session_matches(tmp_path, monkeypatch):
+    from devgraph.config import global_tools
+    from devgraph.mcp import tool_plane
+
+    store = tmp_path / "store" / global_tools.GLOBAL_TOOLS_FILENAME
+    store.parent.mkdir()
+    store.write_text(_global_json("gamma"))
+    monkeypatch.setattr(global_tools, "_default_path", lambda: store)
+    dry = tool_plane.resolve_tools(None, "none")
+    real = tool_plane.register_project_tools(
+        Recorder(), Engine(), None, "none", instrument=lambda f: f, annotations=None)
+    assert _status_view(dry) == _status_view(real)
+    assert dry.served == [] and any("only in sessions scoped" in n for n in dry.notices)
+
+
+def test_dry_resolution_touches_no_engine(tmp_path, monkeypatch):
+    from devgraph.mcp import tool_plane
+
+    repo_dir = tmp_path / "demo"
+    repo_dir.mkdir()
+    (repo_dir / TOOLS_FILENAME).write_text(_tools_yaml("alpha"))
+    status = tool_plane.resolve_tools(Repo("demo", repo_dir))
+    assert status.served == ["alpha"] and status.origins == {"alpha": "project"}
+    assert status.source == "dashboard"
