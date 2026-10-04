@@ -229,14 +229,69 @@ def test_backtick_quoted_parameters_are_used(tmp_path):
     assert tool.parameters[0].name == "folder"
 
 
-def test_unicode_parameters_are_declared_and_used(tmp_path):
-    tool = load_text(tmp_path, tool_text("MATCH (m {repo_id: $repo_id, x: $éx}) RETURN m", params="- name: éx")).tools[0]
-    assert tool.parameters[0].name == "éx"
-
-
 def test_unicode_parameter_undeclared_is_rejected(tmp_path):
     with pytest.raises(ProjectToolsError, match="éx"):
         load_text(tmp_path, tool_text("MATCH (m {repo_id: $repo_id, x: $éx}) RETURN m"))
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    ["bad name", "", "é", "1x"],
+)
+def test_parameter_names_must_be_identifiers(tmp_path, bad_name):
+    with pytest.raises(ProjectToolsError):
+        load_text(tmp_path, tool_text("MATCH (m {repo_id: $repo_id, x: $p}) RETURN m", params=f"- name: {bad_name!r}"))
+
+
+def test_dollar_in_backtick_identifier_does_not_count_as_parameter(tmp_path):
+    """Backtick-quoted identifiers can contain $ but should not be treated as parameters."""
+    with pytest.raises(ProjectToolsError, match=r"\$repo_id"):
+        load_text(tmp_path, tool_text("RETURN n.`$repo_id`"))
+
+
+def test_dollar_in_backtick_label_does_not_count_as_parameter(tmp_path):
+    with pytest.raises(ProjectToolsError, match=r"\$repo_id"):
+        load_text(tmp_path, tool_text("MATCH (n:`$repo_id`) RETURN n"))
+
+
+def test_dollar_in_backtick_prefix_does_not_count_as_parameter(tmp_path):
+    with pytest.raises(ProjectToolsError, match=r"\$repo_id"):
+        load_text(tmp_path, tool_text("RETURN `a$repo_id`"))
+
+
+def test_apoc_with_space_before_dot_is_rejected(tmp_path):
+    with pytest.raises(ProjectToolsError, match="apoc"):
+        load_text(tmp_path, tool_text("MATCH (m {repo_id: $repo_id}) RETURN apoc .x()"))
+
+
+def test_apoc_with_newline_before_dot_is_rejected(tmp_path):
+    with pytest.raises(ProjectToolsError, match="apoc"):
+        load_text(tmp_path, tool_text("MATCH (m {repo_id: $repo_id}) RETURN apoc\n.x()"))
+
+
+def test_apoc_with_comment_before_dot_is_rejected(tmp_path):
+    with pytest.raises(ProjectToolsError, match="apoc"):
+        load_text(tmp_path, tool_text("MATCH (m {repo_id: $repo_id}) RETURN apoc /*comment*/ .x()"))
+
+
+def test_backtick_quoted_apoc_is_rejected(tmp_path):
+    with pytest.raises(ProjectToolsError, match="apoc"):
+        load_text(tmp_path, tool_text("MATCH (m {repo_id: $repo_id}) RETURN `apoc`.x()"))
+
+
+@pytest.mark.parametrize(
+    "benign",
+    ["apocalypse", "apoc_count", "n.apoc.y"],
+)
+def test_apoc_lookalikes_are_fine(tmp_path, benign):
+    cypher = f"MATCH (m {{repo_id: $repo_id}}) RETURN {benign}"
+    assert load_text(tmp_path, tool_text(cypher)).tools[0].name == "t"
+
+
+def test_backtick_quoted_parameter_still_works(tmp_path):
+    """$`repo_id` (backtick-quoted parameter) should still satisfy the repo_id requirement."""
+    tool = load_text(tmp_path, tool_text("MATCH (m {repo_id: $`repo_id`}) RETURN m")).tools[0]
+    assert tool.name == "t"
 
 
 def test_helpers_ignore_literals():

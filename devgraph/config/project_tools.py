@@ -26,8 +26,7 @@ TOOLS_FILENAME = "devgraph.tools.yaml"
 TOOLS_VERSION = 1
 
 #: The parameter the server always supplies; never declared, never overridable.
-#: The check here proves the query references it, not that it scopes every match —
-#: the tool plane's runtime (read transaction, injected repo_id) remains the real gate.
+#: See module docstring for the presence-only guarantee.
 INJECTED_PARAMETER = "repo_id"
 
 PARAMETER_TYPES: tuple[str, ...] = ("string", "integer", "float", "boolean")
@@ -56,10 +55,17 @@ _WRITES = re.compile(
     r"(?<![A-Za-z_])(?:LOAD\s+CSV)(?![A-Za-z0-9_])|(?<![A-Za-z_])(?:" + "|".join(WRITE_KEYWORDS) + r")(?![A-Za-z0-9_])",
     re.I
 )
-# Parameters: $identifier or $`backtick-quoted identifier`. Unicode-aware.
-_PARAMETERS = re.compile(r"\$(?:`([^`]+)`|([^\W\d]\w*))", re.UNICODE)
-# APOC references: apoc followed by . outside strings/comments (case-insensitive).
-_APOC = re.compile(r"(?<![A-Za-z_])apoc(?=[.\w])", re.I)
+# Parameters: one comprehensive pattern to extract parameters without counting $ inside backtick identifiers.
+# Alternatives in order: $`param` (captures param), $param (captures param), then non-capturing literals.
+_PARAM_AND_LITERALS = re.compile(
+    r"\$`([^`]*)`"  # backtick-quoted parameter: capture inside backticks
+    r"|\$([^\W\d]\w*)"  # regular parameter: capture identifier (Unicode-aware)
+    r"|" + _LITERALS.pattern,  # reuse literal pattern (matched but not captured)
+    re.UNICODE | re.S  # Unicode-aware and DOTALL
+)
+# APOC references: apoc followed by optional whitespace and dot.
+# Pattern checks negative lookbehind to avoid matching word characters, dots, or dollar.
+_APOC = re.compile(r"(?<![A-Za-z_.$])apoc\s*\.", re.I)
 
 
 class ProjectToolsError(Exception):
@@ -81,19 +87,10 @@ def write_clauses(query: str) -> list[str]:
 
 
 def query_parameters(query: str) -> set[str]:
-    """`$name` or `$`name`` parameters a query uses, ignoring strings and comments.
-
-    Note: we scan the ORIGINAL query for parameters (before blanking backticks),
-    because backtick-quoted parameters like $`folder` need the backticks intact.
-    We then blank string literals and comments, but backtick-identifiers are fine
-    in parameter names.
-    """
+    """Extract `$name` and `$`name`` parameters, ignoring strings and comments."""
     result = set()
-    # Blank only string literals and comments, NOT backticks (which are used in $`param`)
-    blanked = re.sub(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|//[^\n]*|/\*.*?\*/",
-                     lambda m: " " * len(m.group(0)), query, flags=re.S)
-    for match in _PARAMETERS.finditer(blanked):
-        # Group 1 is backtick-quoted, group 2 is regular identifier
+    for match in _PARAM_AND_LITERALS.finditer(query):
+        # Groups 1 and 2 are parameter captures; remaining groups are from literal alternatives
         param = match.group(1) or match.group(2)
         if param:
             result.add(param)
@@ -101,14 +98,18 @@ def query_parameters(query: str) -> set[str]:
 
 
 def has_apoc(query: str) -> bool:
-    """True if the query references apoc, ignoring strings and comments."""
-    return bool(_APOC.search(_blank_literals(query)))
+    """True if the query references apoc, ignoring strings and comments.
+
+    Backticks are removed (not blanked) so `apoc` reads as apoc.
+    """
+    # Blank string literals and comments, but remove backtick characters
+    blanked = re.sub(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|//[^\n]*|/\*.*?\*/",
+                     lambda m: " " * len(m.group(0)), query, flags=re.S)
+    blanked = blanked.replace("`", "")
+    return bool(_APOC.search(blanked))
 
 
-def _check_name(value: str, kind: str, allow_unicode: bool = False) -> str:
-    if kind == "parameter name" and allow_unicode:
-        # Parameter names can be unicode identifiers
-        return value
+def _check_name(value: str, kind: str) -> str:
     if not NAME_PATTERN.fullmatch(value):
         raise ValueError(f"{kind} {value!r} must fullmatch {NAME_PATTERN.pattern}")
     return value
@@ -128,7 +129,7 @@ class ToolParameter(BaseModel):
     @field_validator("name")
     @classmethod
     def _valid_name(cls, value: str) -> str:
-        _check_name(value, "parameter name", allow_unicode=True)
+        _check_name(value, "parameter name")
         if value == INJECTED_PARAMETER:
             raise ValueError(
                 f"parameter {INJECTED_PARAMETER!r} is supplied by DevGraph for the "
