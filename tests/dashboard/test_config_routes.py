@@ -1609,7 +1609,54 @@ def test_tool_and_node_type_rows_carry_the_files_mapping_in_key_order(client, re
     [node] = project["schema"]["node_types"]
     assert node["entry"]["label"] == "Widget"
     [rel] = project["schema"]["relationships"]
-    assert "entry" not in rel
+    assert rel["entry"] == {"type": "HAS_PART", "provider": "custom", "custom": {"name": "widget_parts"},
+                            "from": "Widget", "to": "Widget"}
+
+
+def test_relationship_rows_carry_the_files_mapping_in_key_order(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    _write(record.path, SCHEMA_FILENAME, """
+        version: 1
+        relationships:
+          - to: Service
+            type: DOCUMENTS
+            from: Runbook
+            provider: filesystem
+          - type: OWNS
+            from: [Team, Group]
+            to: Service
+          - type: LINKS
+            provider: custom
+            custom: {name: links, params: {}}
+            from: Doc
+            to: Doc
+          - type: TWICE
+            from: A
+            to: B
+          - type: TWICE
+            from: A
+            to: C
+        """)
+    rows = client.get("/api/config/repo-a").json()["schema"]["relationships"]
+    first, owns, links, twice, _ = rows
+    assert list(first["entry"]) == ["to", "type", "from", "provider"] and first["entry"]["from"] == "Runbook"
+    assert owns["entry"]["from"] == ["Team", "Group"]
+    assert links["entry"]["custom"] == {"name": "links", "params": {}}
+    assert twice["editable"] is False and twice["entry"] == {"type": "TWICE", "from": "A", "to": "B"}
+
+
+def test_a_relationship_with_a_date_color_has_a_null_entry(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    _write(record.path, SCHEMA_FILENAME, """
+        version: 1
+        relationships:
+          - type: DOCUMENTS
+            from: Runbook
+            to: Service
+            color: 2020-01-01
+        """)
+    [rel] = client.get("/api/config/repo-a").json()["schema"]["relationships"]
+    assert rel["entry"] is None
 
 
 def test_entries_json_cannot_carry_are_null(client, registry, tmp_path):

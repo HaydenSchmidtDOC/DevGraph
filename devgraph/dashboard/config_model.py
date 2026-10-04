@@ -268,6 +268,7 @@ def _schema_block(record: Any, root: Path, info: dict[str, Any], conflicts: list
         relationships.append({
             "type": entry["type"],
             "yaml": dump_entry(entry),
+            "entry": form_entry(entry),
             "editable": not repeated,
             "badges": [badge("warn", "ambiguous", "Declared more than once",
                              "Edit the file by hand.")] if repeated else [],
