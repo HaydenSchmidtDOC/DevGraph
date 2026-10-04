@@ -92,7 +92,7 @@ function Invoke-BootstrapCore {
 
     # Final verification
     Write-Step "Running devgraph doctor"
-    & $venvPython -m devgraph.cli.main doctor | Out-Host
+    & $venvPython -P -m devgraph.cli.main doctor | Out-Host
     $doctorExit = $LASTEXITCODE
 
     if ($doctorExit -ne 0) {
