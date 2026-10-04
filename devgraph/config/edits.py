@@ -1,0 +1,580 @@
+"""The validated write path for `devgraph.tools.yaml`, the global tools store and `devgraph.schema.yaml`.
+
+UI-independent: the CLI (`devgraph config tools|schema`) and the dashboard both call
+these functions. They return structured results (new text, warnings, notes) and raise
+`ConfigEditError` with a machine-readable `code`; nothing here prints or exits.
+
+Every mutating function reads the current text, optionally compares a fingerprint
+(`stale`), computes the new text with the comment-preserving splicers, validates the
+whole resulting document, and only then writes it atomically. `dry_run=True` stops
+before the write. Import this module directly, like `devgraph.config.project_tools`.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tempfile
+import threading
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+from devgraph.config.project_tools import TOOLS_VERSION
+
+SCHEMA_SECTIONS = {
+    "node_types": ("label", "node type"),
+    "relationships": ("type", "relationship"),
+}
+
+TOOLS_RELOAD_NOTE = "Running MCP sessions pick this up within 2 seconds."
+GLOBAL_TOOLS_NOTE = (
+    "Global tools are served only in MCP sessions scoped to a registered repository; "
+    "running sessions there pick up changes within 2 seconds."
+)
+
+
+class ConfigEditError(Exception):
+    """A config edit was refused. `code` is one of: locked, exists, not_found, ambiguous,
+    invalid, stale, not_regular, unreadable, io."""
+
+    def __init__(self, message: str, code: str = "invalid") -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+@dataclass
+class EditResult:
+    """What a mutation did (or, for `dry_run`, would do)."""
+
+    path: Path
+    text: str  # the new file contents
+    written: bool
+    before: Any = None  # schema edits: declaration before / after (None when empty or invalid)
+    after: Any = None
+    warnings: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+# --- files -----------------------------------------------------------------------------------------
+
+_locks: dict[Path, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _target_lock(path: Path) -> threading.Lock:
+    """One lock per resolved target path, serialising read-compare-write within this process."""
+    key = path.resolve()
+    with _locks_guard:
+        return _locks.setdefault(key, threading.Lock())
+
+
+def file_fingerprint(path: Path) -> str:
+    """`absent`, or `sha256:<hex>` of the file's bytes (same scheme as `schema_file_hash`, switch-independent)."""
+    try:
+        return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return "absent"
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}"
+
+
+def _check_target(path: Path) -> None:
+    """Refuse a symlink or non-file target: `os.replace` would swap the link for a file."""
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ConfigEditError(f"{path}: is not a regular file (or is a symlink); edit it by hand", "not_regular")
+
+
+def _check_fingerprint(path: Path, expected: str | None) -> None:
+    if expected is not None and file_fingerprint(path) != expected:
+        raise ConfigEditError(f"{path} changed since it was loaded; reload and try again", "stale")
+
+
+def read_text(path: Path) -> str:
+    """The file's text, or "" when absent."""
+    try:
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigEditError(f"{path}: cannot be read: {exc}", "unreadable")
+
+
+def write_atomically(path: Path, text: str) -> None:
+    """Replace `path` with `text` via a temporary file in the same directory, keeping its mode."""
+    mode = path.stat().st_mode & 0o7777 if path.exists() else None
+    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        if mode is not None:
+            os.chmod(temp, mode)
+        else:
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(temp, 0o666 & ~umask)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def _splice_error(exc: Exception) -> ConfigEditError:
+    """A splicer (`ListEditError`) or validator error as a coded `ConfigEditError`."""
+    message = str(exc)
+    if message.startswith("no ") and " named " in message:
+        code = "not_found"
+    elif message.endswith("already exists"):
+        code = "exists"
+    elif "times; edit the file by hand" in message:
+        code = "ambiguous"
+    else:
+        code = "invalid"
+    return ConfigEditError(message, code)
+
+
+# --- tools -----------------------------------------------------------------------------------------
+
+
+def tools_path(root: Path | None) -> Path:
+    """The scope's tools file: the repository's `devgraph.tools.yaml`, or the global store for `None`."""
+    from devgraph.config.global_tools import global_tools_path
+    from devgraph.config.project_tools import tools_file_path
+
+    return global_tools_path() if root is None else tools_file_path(root)
+
+
+def tools_effect_note(root: Path | None, record: Any) -> str:
+    """Whether running MCP sessions will serve what is in this scope's file.
+
+    `record` is the registered repository record for `root` (None when not registered).
+    """
+    if root is None:
+        return GLOBAL_TOOLS_NOTE
+    if record is None or not record.active:
+        return (f"{root} is not a registered repository, so MCP sessions won't serve its tools; "
+                "register it with `devgraph add`.")
+    if not record.project_config_enabled:
+        return (f"project config is disabled for {record.repo_id}, so MCP sessions won't serve its tools; "
+                f"enable it with `devgraph config enable {record.repo_id}`.")
+    return TOOLS_RELOAD_NOTE
+
+
+def refuse_builtin(name: Any) -> None:
+    from devgraph.mcp.catalog import builtin_tool_names
+
+    if isinstance(name, str) and name in builtin_tool_names():
+        raise ConfigEditError(
+            f"{name!r} is the name of a built-in tool; built-in tools are locked, choose another name", "locked"
+        )
+
+
+def tool_entries(root: Path | None) -> list[dict]:
+    """The raw tool mappings in the scope's file."""
+    from devgraph.config.tools_edit import ToolsEditError, tool_mappings
+
+    try:
+        return tool_mappings(read_text(tools_path(root)))
+    except ToolsEditError as exc:
+        raise _splice_error(exc)
+
+
+def find_tool(root: Path | None, name: str) -> dict:
+    """The tool named `name` in the scope; `not_found` if there is none."""
+    current = next((m for m in tool_entries(root) if isinstance(m, dict) and m.get("name") == name), None)
+    if current is None:
+        raise ConfigEditError(f"no tool named {name!r} in this scope", "not_found")
+    return current
+
+
+def write_tools(
+    root: Path | None,
+    edit: Callable[[str], str],
+    *,
+    expected_fingerprint: str | None = None,
+    dry_run: bool = False,
+) -> EditResult:
+    """Apply `edit(text) -> new text` to the scope's file, validate the whole result, then write.
+
+    Nothing is written unless the resulting file is valid. Raises `ConfigEditError`.
+    """
+    from devgraph.config.global_tools import save_global_tools
+    from devgraph.config.project_tools import (
+        ProjectToolsError,
+        parse_project_tools,
+        validate_project_tools,
+    )
+    from devgraph.config.tools_edit import ToolsEditError, tool_mappings
+
+    path = tools_path(root)
+    with _target_lock(path):
+        _check_target(path)
+        _check_fingerprint(path, expected_fingerprint)
+        text = read_text(path)
+        try:
+            if root is None:
+                # The store is JSON: edit the mapping list (as one-per-line text), re-serialised by the store.
+                import yaml
+
+                mappings = tool_mappings(text)
+                new_mappings = tool_mappings(
+                    edit(yaml.safe_dump({"tools": mappings}, sort_keys=False) if mappings else "")
+                )
+                document = {"version": TOOLS_VERSION, "tools": new_mappings}
+                validate_project_tools(document, path)
+                new_text = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+                if not dry_run:
+                    save_global_tools(new_mappings)
+            else:
+                new_text = edit(text)
+                parse_project_tools(new_text, path)
+                if not dry_run:
+                    write_atomically(path, new_text)
+        except ToolsEditError as exc:
+            raise _splice_error(exc)
+        except ProjectToolsError as exc:
+            raise ConfigEditError(str(exc), "invalid")
+        except (OSError, TypeError, ValueError) as exc:
+            raise ConfigEditError(str(exc), "io")
+    return EditResult(path=path, text=new_text, written=not dry_run)
+
+
+def add_tool(root: Path | None, entry: dict, **options) -> EditResult:
+    """Add one tool. `locked` for a built-in name, `exists` for a duplicate."""
+    from devgraph.config.tools_edit import add_tool_text
+
+    name = entry.get("name")
+    refuse_builtin(name)
+    if any(isinstance(m, dict) and m.get("name") == name for m in tool_entries(root)):
+        raise ConfigEditError(
+            f"a tool named {name!r} already exists in this scope; use `devgraph config tools edit {name}`", "exists"
+        )
+    return write_tools(root, lambda text: add_tool_text(text, entry), **options)
+
+
+def replace_tool(root: Path | None, name: str, entry: dict, **options) -> EditResult:
+    """Replace the tool `name`; `not_found` if absent, `locked` if renamed to a built-in name."""
+    from devgraph.config.tools_edit import replace_tool_text
+
+    find_tool(root, name)
+    if entry.get("name") != name:
+        refuse_builtin(entry.get("name"))
+    return write_tools(root, lambda text: replace_tool_text(text, name, entry), **options)
+
+
+def delete_tool(root: Path | None, name: str, **options) -> EditResult:
+    """Remove the tool `name`; `not_found` if absent."""
+    from devgraph.config.tools_edit import delete_tool_text
+
+    return write_tools(root, lambda text: delete_tool_text(text, name), **options)
+
+
+# --- schema ----------------------------------------------------------------------------------------
+
+
+def schema_effect_note(root: Path, record: Any) -> str:
+    """When a schema change takes effect. `record` is the registered repository record for `root` (or None)."""
+    from devgraph.agent.schema_rescan import QUIET_PERIOD_S
+
+    if record is not None and not record.active:
+        record = None
+    if record is None:
+        return f"{root} is not a registered repository, so DevGraph does not index it; register it with `devgraph add`."
+    if not record.project_config_enabled:
+        return (f"Not applied while the project config is disabled for {record.repo_id}; "
+                f"enable it with `devgraph config enable {record.repo_id}`.")
+    if record.watch_enabled:
+        minutes = round(QUIET_PERIOD_S / 60)
+        return (f"The change is applied about {minutes} minutes after the last edit while the DevGraph agent (tray or headless) "
+                f"is running, or now with `devgraph rescan {record.repo_id} --now`.")
+    return f"Not watched: run `devgraph rescan {record.repo_id} --now` to apply it."
+
+
+def schema_declaration(text: str, path: Path):
+    """The parsed declaration, or None when the text is empty or invalid."""
+    from devgraph.config.project_schema import ProjectSchemaError, parse_project_schema
+
+    try:
+        return parse_project_schema(text, path)
+    except ProjectSchemaError:
+        return None
+
+
+def entry_section(entry: dict) -> str:
+    """`node_types` or `relationships`, from whether the mapping has `label` or `type`."""
+    if ("label" in entry) == ("type" in entry):
+        raise ConfigEditError(
+            "a schema entry needs exactly one of `label` (a node type) or `type` (a relationship)", "invalid"
+        )
+    return "node_types" if "label" in entry else "relationships"
+
+
+def locate_entry(text: str, name: str, node_type: bool = False, relationship: bool = False) -> str:
+    """The section (`node_types`/`relationships`) that `name` addresses."""
+    from devgraph.config.list_edit import ListEditError, entries
+    from devgraph.config.project_schema import SCHEMA_FILENAME
+    from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+
+    if node_type and relationship:
+        raise ConfigEditError("use either --node-type or --relationship, not both", "invalid")
+    try:
+        found = [
+            section for section, (ident, _) in SCHEMA_SECTIONS.items()
+            if any(isinstance(e, dict) and e.get(ident) == name for e in entries(text, key=section))
+        ]
+    except ListEditError as exc:
+        raise _splice_error(exc)
+    chosen = [s for s, flag in (("node_types", node_type), ("relationships", relationship)) if flag]
+    if chosen:
+        if chosen[0] not in found:
+            raise ConfigEditError(f"no {SCHEMA_SECTIONS[chosen[0]][1]} named {name!r} in {SCHEMA_FILENAME}", "not_found")
+        return chosen[0]
+    if len(found) > 1:
+        raise ConfigEditError(
+            f"{name!r} is both a node type and a relationship type; pass --node-type or --relationship", "ambiguous"
+        )
+    if not found:
+        hint = "; built-in schema entries cannot be changed" if name in NODE_LABELS + RELATIONSHIP_TYPES else ""
+        raise ConfigEditError(f"no node type or relationship named {name!r} in {SCHEMA_FILENAME}{hint}", "not_found")
+    return found[0]
+
+
+def find_schema_entry(text: str, name: str, section: str) -> dict:
+    """The one entry of `section` named `name`; `ambiguous` when it is declared more than once."""
+    from devgraph.config.list_edit import ListEditError, entries
+
+    ident, noun = SCHEMA_SECTIONS[section]
+    try:
+        matches = [e for e in entries(text, key=section) if isinstance(e, dict) and e.get(ident) == name]
+    except ListEditError as exc:
+        raise _splice_error(exc)
+    if len(matches) > 1:
+        raise ConfigEditError(f"{noun} {name!r} is declared {len(matches)} times; edit the file by hand", "ambiguous")
+    return matches[0]
+
+
+def duplicate_relationship(entry: dict, existing: list) -> bool:
+    """Whether `entry` equals an existing relationship once both are validated (`from: X` == `from: [X]`)."""
+    from pydantic import ValidationError
+
+    from devgraph.config.project_schema import RelationshipDecl
+
+    def normal(raw):
+        decl = RelationshipDecl.model_validate(raw)
+        return (decl.type, decl.from_labels, decl.to, decl.provider, decl.custom)
+
+    try:
+        new = normal(entry)
+    except ValidationError:
+        return False  # invalid entries are reported by the write's own validation
+    for other in existing:
+        try:
+            if normal(other) == new:
+                return True
+        except ValidationError:
+            continue
+    return False
+
+
+def schema_edit(
+    path: Path,
+    edit: Callable[[str], str],
+    *,
+    invalid_prefix: str = "",
+    invalid_hint: str = "",
+    expected_fingerprint: str | None = None,
+    dry_run: bool = False,
+) -> tuple[str, str]:
+    """Apply `edit(text) -> new text`, validate the whole result as the indexer would, then write it atomically.
+
+    Returns (old text, new text).
+    """
+    from devgraph.config.list_edit import ListEditError
+    from devgraph.config.project_schema import ProjectSchemaError, parse_project_schema, resolve_declaration
+
+    with _target_lock(path):
+        _check_target(path)
+        _check_fingerprint(path, expected_fingerprint)
+        old_text = read_text(path)
+        try:
+            new_text = edit(old_text)
+            try:
+                resolve_declaration(parse_project_schema(new_text, path), origin=str(path))
+            except ProjectSchemaError as exc:
+                raise ConfigEditError(f"{invalid_prefix}{exc}{invalid_hint}", "invalid")
+            if not dry_run:
+                write_atomically(path, new_text)
+        except ListEditError as exc:
+            raise _splice_error(exc)
+        except OSError as exc:
+            raise ConfigEditError(str(exc), "io")
+    return old_text, new_text
+
+
+def removed_types(before, after) -> tuple[list[str], list[str]]:
+    """Declared node labels and relationship types in `before` but not `after` (None counts as empty).
+
+    Built-in relationship types are never deleted by the indexer, so they are not reported.
+    """
+    from devgraph.graph.schema import RELATIONSHIP_TYPES
+
+    def names(declaration):
+        if declaration is None:
+            return set(), set()
+        return (
+            {n.label for n in declaration.node_types},
+            {r.type for r in declaration.relationships if r.type not in RELATIONSHIP_TYPES},
+        )
+
+    old_labels, old_types = names(before)
+    new_labels, new_types = names(after)
+    return sorted(old_labels - new_labels), sorted(old_types - new_types)
+
+
+def pruned_types(before, after) -> list[str]:
+    """Labels kept in `after` whose filesystem-sourced nodes the next apply deletes: source dropped or kind changed."""
+    if before is None or after is None:
+        return []
+    now = {n.label: n for n in after.node_types}
+    pruned = []
+    for old in before.node_types:
+        new = now.get(old.label)
+        if new is None or old.source is None:
+            continue
+        if new.source is None:
+            pruned.append(f"{old.label} (source removed)")
+        elif new.source.kind != old.source.kind:
+            pruned.append(f"{old.label} (kind {old.source.kind} -> {new.source.kind})")
+    return sorted(pruned)
+
+
+def changed_keys(before, after) -> list[tuple[str, tuple[str, ...]]]:
+    """(label, old key) for node types present in both whose key changed."""
+    if before is None or after is None:
+        return []
+    now = {n.label: n for n in after.node_types}
+    return [(o.label, tuple(o.key)) for o in before.node_types if o.label in now and tuple(now[o.label].key) != tuple(o.key)]
+
+
+def schema_change_warnings(before, after, record: Any = None) -> list[str]:
+    """Plain-text warnings for a schema change: lost nodes and relationships, key changes.
+
+    `record` (the registered repository record, or None) only chooses the wording of when they apply.
+    """
+    labels, types = removed_types(before, after)
+    pruned = pruned_types(before, after)
+    enabled = record is not None and record.active and record.project_config_enabled
+    when = "the next rescan" if enabled else "applying this schema"
+    warnings = []
+    if labels:
+        warnings.append(f"{when} deletes the nodes of the removed node type(s): {', '.join(labels)}.")
+    if pruned:
+        warnings.append(f"{when} deletes the nodes of node type(s) whose filesystem source changed: {', '.join(pruned)}.")
+    if types:
+        warnings.append(f"{when} removes the relationships of the removed relationship type(s): {', '.join(types)}.")
+    for label, old_key in changed_keys(before, after):
+        warnings.append(
+            f"the uniqueness constraint on {label} keeps the old key ({', '.join(old_key)}) until this schema is "
+            f"applied and every repository declaring {label} uses the new key; it also stays if existing nodes "
+            f"violate the new key."
+        )
+    return warnings
+
+
+def schema_entry_notes(entry: dict | None) -> list[str]:
+    """Notes about a just-written entry: a node type with no source is never populated."""
+    if entry is not None and "label" in entry and entry.get("source") is None:
+        return [
+            f"Note: no provider produces {entry['label']} nodes yet; only node types with "
+            f"`source: {{provider: filesystem}}` are populated."
+        ]
+    return []
+
+
+def _schema_result(path: Path, old_text: str, new_text: str, entry: dict | None, record: Any, dry_run: bool) -> EditResult:
+    before = schema_declaration(old_text, path)
+    after = schema_declaration(new_text, path)
+    return EditResult(
+        path=path,
+        text=new_text,
+        written=not dry_run,
+        before=before,
+        after=after,
+        warnings=schema_change_warnings(before, after, record),
+        notes=schema_entry_notes(entry),
+    )
+
+
+def add_schema_entry(root: Path, entry: dict, *, record: Any = None, **options) -> EditResult:
+    """Add a node type (`label`) or relationship (`type`) to the repository's schema file."""
+    from devgraph.config.list_edit import ListEditError, add_entry_text, entries
+    from devgraph.config.project_schema import SCHEMA_VERSION, project_schema_path
+
+    path = project_schema_path(root)
+    section = entry_section(entry)
+    ident, noun = SCHEMA_SECTIONS[section]
+    try:
+        existing = entries(read_text(path), key=section)
+    except ListEditError as exc:
+        raise _splice_error(exc)
+    name = entry[ident]
+    if section == "node_types" and any(isinstance(e, dict) and e.get(ident) == name for e in existing):
+        raise ConfigEditError(
+            f"a node type named {name!r} already exists; use `devgraph config schema edit {name}`", "exists"
+        )
+    if section == "relationships" and duplicate_relationship(entry, existing):
+        raise ConfigEditError(f"an identical relationship {name!r} already exists", "exists")
+    # Relationships may share a type with different endpoints; only node type labels are unique.
+    old_text, new_text = schema_edit(
+        path,
+        lambda text: add_entry_text(
+            text, entry, key=section, ident=ident, version=SCHEMA_VERSION, noun=noun, unique=section == "node_types"
+        ),
+        invalid_prefix="the new entry is invalid: ",
+        **options,
+    )
+    return _schema_result(path, old_text, new_text, entry, record, options.get("dry_run", False))
+
+
+def replace_schema_entry(
+    root: Path, name: str, entry: dict, *, node_type: bool = False, relationship: bool = False, record: Any = None, **options
+) -> EditResult:
+    """Replace one entry; the new entry must stay in the same section."""
+    from devgraph.config.list_edit import replace_entry_text
+    from devgraph.config.project_schema import project_schema_path
+
+    path = project_schema_path(root)
+    section = locate_entry(read_text(path), name, node_type, relationship)
+    ident, noun = SCHEMA_SECTIONS[section]
+    find_schema_entry(read_text(path), name, section)
+    if entry_section(entry) != section:
+        raise ConfigEditError(f"the new entry must be a {noun} (with `{ident}`)", "invalid")
+    old_text, new_text = schema_edit(
+        path,
+        lambda current: replace_entry_text(current, name, entry, key=section, ident=ident, noun=noun),
+        invalid_prefix="the new entry is invalid: ",
+        **options,
+    )
+    return _schema_result(path, old_text, new_text, entry, record, options.get("dry_run", False))
+
+
+def delete_schema_entry(
+    root: Path, name: str, *, node_type: bool = False, relationship: bool = False, record: Any = None, **options
+) -> EditResult:
+    """Remove one entry from the repository's schema file."""
+    from devgraph.config.list_edit import delete_entry_text
+    from devgraph.config.project_schema import project_schema_path
+
+    path = project_schema_path(root)
+    section = locate_entry(read_text(path), name, node_type, relationship)
+    ident, noun = SCHEMA_SECTIONS[section]
+    old_text, new_text = schema_edit(
+        path,
+        lambda current: delete_entry_text(current, name, key=section, ident=ident, noun=noun),
+        invalid_hint="; delete or edit the relationships that use it first" if section == "node_types" else "",
+        **options,
+    )
+    return _schema_result(path, old_text, new_text, None, record, options.get("dry_run", False))
