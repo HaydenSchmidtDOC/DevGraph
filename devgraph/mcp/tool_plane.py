@@ -32,6 +32,7 @@ from neo4j import time as neo4j_time
 from neo4j.spatial import Point
 
 SESSION_REPO_ENV = "DEVGRAPH_MCP_REPO"
+RELOAD_INTERVAL_S = 2.0
 
 _PYTHON_TYPES: dict[str, type] = {"string": str, "integer": int, "float": float, "boolean": bool}
 
@@ -93,6 +94,7 @@ class ToolPlaneStatus:
     served: list[str] = field(default_factory=list)
     parameter_names: dict[str, list[str]] = field(default_factory=dict)  # served tool -> declared parameters
     notices: list[str] = field(default_factory=list)
+    definitions: dict[str, CypherTool] = field(default_factory=dict, repr=False)  # served tool -> its declaration
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -201,16 +203,30 @@ def register_project_tools(
         return status
 
     status = ToolPlaneStatus(repo_id=repo.repo_id, source=source)
+    _serve_repository(server, engine, repo, status, instrument=instrument, annotations=annotations)
+    return status
+
+
+def _serve_repository(
+    server: Any,
+    engine: Any,
+    repo: Any,
+    status: ToolPlaneStatus,
+    *,
+    instrument: Callable[[Callable[..., Any]], Callable[..., Any]],
+    annotations: Any,
+) -> None:
+    """Read the repository's tools file and register its tools, recording the outcome on `status`."""
     if not Path(repo.path).is_dir():
         status.notices.append(f"the root of repository {repo.repo_id!r} ({repo.path}) does not exist; no project tools are served")
-        return status
+        return
     try:
         declared = load_project_tools(repo.path)
     except ProjectToolsError as exc:
         status.notices.append(f"invalid {TOOLS_FILENAME}; no project tools are served: {str(exc).splitlines()[0]}")
-        return status
+        return
     if declared is None:
-        return status
+        return
 
     status.tools_file = str(tools_file_path(repo.path))
     builtin = builtin_tool_names()
@@ -232,4 +248,48 @@ def register_project_tools(
             continue
         status.served.append(tool.name)
         status.parameter_names[tool.name] = [p.name for p in tool.parameters]
-    return status
+        status.definitions[tool.name] = tool
+
+
+def tools_fingerprint(repo_path: Path | str) -> bytes | str:
+    """What the tools file looks like now: its bytes, 'absent', or 'unreadable:<error>'."""
+    try:
+        return tools_file_path(Path(repo_path)).read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}"
+
+
+class ProjectToolPlane:
+    """The session's served project tools, reloadable when the tools file changes.
+
+    The scope (`repo`) never changes; only the tools file is re-read, under the
+    same rules as at startup.
+    """
+
+    def __init__(self, server: Any, engine: Any, repo: Any | None, status: ToolPlaneStatus, *,
+                 instrument: Callable[[Callable[..., Any]], Callable[..., Any]], annotations: Any) -> None:
+        self.server, self.engine, self.repo, self.status = server, engine, repo, status
+        self._instrument, self._annotations = instrument, annotations
+        self._fingerprint = tools_fingerprint(repo.path) if repo is not None else None
+
+    def reload_if_changed(self) -> bool:
+        """Re-serve the tools file if its bytes changed. True when the served tools changed."""
+        if self.repo is None:
+            return False
+        fingerprint = tools_fingerprint(self.repo.path)
+        if fingerprint == self._fingerprint:
+            return False
+        self._fingerprint = fingerprint
+        before = dict(self.status.definitions)
+        for name in self.status.served:
+            self.server.remove_tool(name)
+        self.status.tools_file = None
+        self.status.served.clear()
+        self.status.parameter_names.clear()
+        self.status.definitions.clear()
+        self.status.notices.clear()
+        _serve_repository(self.server, self.engine, self.repo, self.status,
+                          instrument=self._instrument, annotations=self._annotations)
+        return self.status.definitions != before

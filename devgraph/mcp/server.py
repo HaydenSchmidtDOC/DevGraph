@@ -55,7 +55,12 @@ from devgraph.graph.engine import GraphEngine
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.mcp.catalog import TOOL_CATALOG as _TOOL_CATALOG
 from devgraph.mcp.catalog import builtin_tool_names  # noqa: F401  (re-exported)
-from devgraph.mcp.tool_plane import SESSION_REPO_ENV, register_project_tools, resolve_session_repo
+from devgraph.mcp.tool_plane import (
+    SESSION_REPO_ENV,
+    ProjectToolPlane,
+    register_project_tools,
+    resolve_session_repo,
+)
 from devgraph.registry.store import RepoRegistry
 
 logger = logging.getLogger(__name__)
@@ -484,6 +489,10 @@ def build_server(
     status = register_project_tools(
         server, engine, session_repo, session_source, instrument=_instrument, annotations=_READ_ONLY, pinned=session_pinned,
         registry=registry,
+    )
+    # main() polls this for tools-file reloads.
+    server.devgraph_tool_plane = ProjectToolPlane(  # type: ignore[attr-defined]
+        server, engine, session_repo, status, instrument=_instrument, annotations=_READ_ONLY
     )
 
     @server.resource(
