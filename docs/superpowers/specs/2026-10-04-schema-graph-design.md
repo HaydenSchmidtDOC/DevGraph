@@ -11,7 +11,7 @@ cleanly. A repo with no schema file looks exactly as it does today.
 
 ## In scope
 - New read-only route `GET /api/repos/{repo_id}/schema` that returns
-  `{node_types:[{label, origin: builtin|project, color, count}], relationship_types:[{type, origin, color}], schema_state: applied|pending|never|absent|invalid, notices:[]}`.
+  `{node_types:[{label, origin: builtin|project, color, count}], relationship_types:[{type, origin, color}], schema_state: applied|pending|never|absent|invalid|disabled, notices:[]}`. For `__all__` the state is the most attention-needing one across repositories (invalid, pending, never, applied, disabled, absent).
 - An optional display-only `color` field (`#rrggbb`) on `NodeTypeDecl` and `RelationshipDecl`, validated by
   pattern and included in the JSON Schema. It flows through `config schema add/edit --from` and `config show`
   unchanged.
