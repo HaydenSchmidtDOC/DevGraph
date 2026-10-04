@@ -61,6 +61,7 @@ from devgraph.mcp.tool_plane import (
     ProjectToolPlane,
     register_project_tools,
     resolve_session_repo,
+    tools_fingerprint,
 )
 from devgraph.mcp.tool_reload import run_stdio
 from devgraph.registry.store import RepoRegistry
@@ -488,13 +489,15 @@ def build_server(
             the purpose-built tools above whenever one of them fits."""
             return devgraph_tools.run_cypher(engine, query, parameters)
 
+    fingerprint = tools_fingerprint(session_repo.path) if session_repo is not None else None  # before the load
     status = register_project_tools(
         server, engine, session_repo, session_source, instrument=_instrument, annotations=_READ_ONLY, pinned=session_pinned,
         registry=registry,
     )
     # main() polls this for tools-file reloads.
     server.devgraph_tool_plane = ProjectToolPlane(  # type: ignore[attr-defined]
-        server, engine, session_repo, status, instrument=_instrument, annotations=_READ_ONLY
+        server, engine, session_repo, status, instrument=_instrument, annotations=_READ_ONLY,
+        fingerprint=fingerprint,
     )
 
     @server.resource(

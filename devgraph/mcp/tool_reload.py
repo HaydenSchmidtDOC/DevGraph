@@ -4,8 +4,9 @@
 module polls it and notifies clients: `notifications/tools/list_changed` to
 legacy-protocol clients (whose connection is captured by a middleware, since
 it is only reachable from a request) and `ToolsListChanged` on the
-subscription bus for `subscriptions/listen` clients. Both are sent; each is a
-no-op for the other kind of client.
+subscription bus for `subscriptions/listen` clients. Both are sent; the bus is
+a no-op for legacy clients, and modern clients are never captured (their
+connections are per-request, so capturing them would leak and duplicate).
 
 Relies on mcp 2.3.0 internals (`_lowlevel_server`, `_subscriptions`,
 `ctx.session._connection`); tests exercise each against the real SDK.
@@ -33,13 +34,16 @@ class ToolListNotifier:
     def __init__(self, server: Any) -> None:
         self._server = server
         self._connections: dict[int, Any] = {}
-        server._lowlevel_server.middleware.append(self._capture)
+        server.middleware.append(self._capture)
 
     async def _capture(self, ctx: Any, call_next: Callable[[Any], Awaitable[Any]]) -> Any:
-        # One connection per client; the per-request session would duplicate notifications.
-        connection = getattr(getattr(ctx, "session", None), "_connection", None)
-        if connection is not None:
-            self._connections[id(connection)] = connection
+        # Only legacy clients send `initialize`, and each has one long-lived connection.
+        # On 2026-07-28 every request gets a new connection: capturing those would grow
+        # without bound and double-notify, since modern clients listen on the bus.
+        if ctx.method == "initialize":
+            connection = getattr(getattr(ctx, "session", None), "_connection", None)
+            if connection is not None:
+                self._connections[id(connection)] = connection
         return await call_next(ctx)
 
     async def notify(self) -> None:
@@ -64,7 +68,10 @@ async def poll_tool_reloads(
         try:
             changed = plane.reload_if_changed()
         except Exception:
-            logger.warning("reloading project tools failed; keeping the current tools", exc_info=True)
+            logger.warning(
+                "reloading project tools failed; project tools may be unavailable until the next successful reload",
+                exc_info=True,
+            )
             continue
         if changed:
             await notifier.notify()

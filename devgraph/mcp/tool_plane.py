@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime
 import inspect
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,8 @@ from devgraph.mcp.catalog import builtin_tool_names
 from mcp.server.mcpserver.exceptions import ToolError
 from neo4j import time as neo4j_time
 from neo4j.spatial import Point
+
+logger = logging.getLogger(__name__)
 
 SESSION_REPO_ENV = "DEVGRAPH_MCP_REPO"
 RELOAD_INTERVAL_S = 2.0
@@ -252,7 +255,9 @@ def _serve_repository(
 
 
 def tools_fingerprint(repo_path: Path | str) -> bytes | str:
-    """What the tools file looks like now: its bytes, 'absent', or 'unreadable:<error>'."""
+    """What the tools file looks like now: its bytes, 'root-missing', 'absent', or 'unreadable:<error>'."""
+    if not Path(repo_path).is_dir():
+        return "root-missing"
     try:
         return tools_file_path(Path(repo_path)).read_bytes()
     except (FileNotFoundError, NotADirectoryError):
@@ -269,10 +274,14 @@ class ProjectToolPlane:
     """
 
     def __init__(self, server: Any, engine: Any, repo: Any | None, status: ToolPlaneStatus, *,
-                 instrument: Callable[[Callable[..., Any]], Callable[..., Any]], annotations: Any) -> None:
+                 instrument: Callable[[Callable[..., Any]], Callable[..., Any]], annotations: Any,
+                 fingerprint: bytes | str | None = None) -> None:
+        """`fingerprint` is the tools file as it was *before* the initial load, so a save during the load is noticed."""
         self.server, self.engine, self.repo, self.status = server, engine, repo, status
         self._instrument, self._annotations = instrument, annotations
-        self._fingerprint = tools_fingerprint(repo.path) if repo is not None else None
+        self._fingerprint = fingerprint
+        if repo is not None and fingerprint is not None and tools_fingerprint(repo.path) != fingerprint:
+            self._fingerprint = None  # changed during the initial load: reload on the next poll
 
     def reload_if_changed(self) -> bool:
         """Re-serve the tools file if its bytes changed. True when the served tools changed."""
@@ -281,7 +290,7 @@ class ProjectToolPlane:
         fingerprint = tools_fingerprint(self.repo.path)
         if fingerprint == self._fingerprint:
             return False
-        self._fingerprint = fingerprint
+        self._fingerprint = None  # until the reload succeeds, so a failure is retried
         before = dict(self.status.definitions)
         for name in self.status.served:
             self.server.remove_tool(name)
@@ -292,4 +301,8 @@ class ProjectToolPlane:
         self.status.notices.clear()
         _serve_repository(self.server, self.engine, self.repo, self.status,
                           instrument=self._instrument, annotations=self._annotations)
+        # Only trust the fingerprint if the file did not change while it was being read.
+        self._fingerprint = fingerprint if tools_fingerprint(self.repo.path) == fingerprint else None
+        if self.status.notices:
+            logger.warning("reloaded %s with problems: %s", tools_file_path(self.repo.path), self.status.notices[0])
         return self.status.definitions != before

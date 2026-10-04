@@ -2,17 +2,22 @@
 
 import asyncio
 import json
+import logging
+import shutil
 import textwrap
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import anyio
 from mcp.client import Client
+from mcp.shared.memory import create_client_server_memory_streams
 
 from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
-from devgraph.mcp.tool_reload import ToolListNotifier, initialization_options, poll_tool_reloads
+from devgraph.mcp import tool_plane, tool_reload
+from devgraph.mcp.tool_reload import ToolListNotifier, initialization_options, poll_tool_reloads, run_stdio
 
 ONE = """
     version: 1
@@ -242,3 +247,211 @@ def test_the_poller_notifies_only_on_change_and_survives_errors(tmp_path, monkey
 
     anyio.run(scenario)
     assert notified == [1]
+
+
+def test_a_modern_client_is_not_captured_or_sent_a_legacy_notification(tmp_path, monkeypatch):
+    server, repo = build(tmp_path, monkeypatch)
+    notifier = ToolListNotifier(server)
+    received = []
+
+    async def handler(message):
+        received.append(type(message).__name__)
+
+    async def scenario():
+        async with Client(server, mode="auto", message_handler=handler) as client:
+            for _ in range(3):
+                await client.list_tools()
+            write(repo, TWO)
+            server.devgraph_tool_plane.reload_if_changed()
+            await notifier.notify()
+            await anyio.sleep(0.2)
+
+    anyio.run(scenario)
+    assert notifier._connections == {}
+    assert not any("ToolListChanged" in name for name in received)
+
+
+def test_a_legacy_client_is_captured_once(tmp_path, monkeypatch):
+    server, _ = build(tmp_path, monkeypatch)
+    notifier = ToolListNotifier(server)
+
+    async def scenario():
+        async with Client(server, mode="legacy") as client:
+            await client.list_tools()
+            await client.list_tools()
+            assert len(notifier._connections) == 1
+
+    anyio.run(scenario)
+
+
+def test_a_change_during_a_reload_is_reloaded_again(tmp_path, monkeypatch):
+    server, repo = build(tmp_path, monkeypatch)
+    plane = server.devgraph_tool_plane
+    real = tool_plane.load_project_tools
+    calls = []
+
+    def racing(path):
+        loaded = real(path)
+        if not calls:
+            write(repo, ONE)  # saved again after we read it
+        calls.append(1)
+        return loaded
+
+    write(repo, TWO)
+    monkeypatch.setattr(tool_plane, "load_project_tools", racing)
+    assert plane.reload_if_changed() is True
+    assert "count_files" in tools(server)
+    assert plane.reload_if_changed() is True
+    assert "count_files" not in tools(server)
+    assert plane.reload_if_changed() is False
+
+
+def test_a_change_during_the_startup_load_is_reloaded(tmp_path, monkeypatch):
+    repo = tmp_path / "demo"
+    repo.mkdir()
+    write(repo, ONE)
+    real = tool_plane.load_project_tools
+
+    def racing(path):
+        loaded = real(path)
+        write(repo, TWO)
+        return loaded
+
+    monkeypatch.setattr(tool_plane, "load_project_tools", racing)
+    server, _ = build(tmp_path, monkeypatch)
+    monkeypatch.setattr(tool_plane, "load_project_tools", real)
+    assert "count_files" not in tools(server)
+    assert server.devgraph_tool_plane.reload_if_changed() is True
+    assert "count_files" in tools(server)
+
+
+def test_a_root_that_goes_missing_is_noticed_and_cleared_when_it_returns(tmp_path, monkeypatch):
+    server, repo = build(tmp_path, monkeypatch, tools=None)
+    plane = server.devgraph_tool_plane
+    shutil.rmtree(repo)
+    assert plane.reload_if_changed() is False
+    assert any("does not exist" in n for n in status(server)["notices"])
+    repo.mkdir()
+    plane.reload_if_changed()
+    assert status(server)["notices"] == []
+
+
+def test_a_root_missing_at_startup_is_cleared_when_it_returns(tmp_path, monkeypatch):
+    repo = tmp_path / "demo"
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3"))
+    record = Repo("demo", repo)
+    server = mcp_server.build_server(Engine(), Registry([record]), session_repo=record, session_source="env")
+    assert any("does not exist" in n for n in status(server)["notices"])
+    repo.mkdir()
+    server.devgraph_tool_plane.reload_if_changed()
+    assert status(server)["notices"] == []
+
+
+def test_a_failed_reload_is_retried(tmp_path, monkeypatch):
+    server, repo = build(tmp_path, monkeypatch)
+    plane = server.devgraph_tool_plane
+    real = tool_plane._serve_repository
+    attempts = []
+
+    def flaky(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("boom")
+        return real(*args, **kwargs)
+
+    write(repo, TWO)
+    monkeypatch.setattr(tool_plane, "_serve_repository", flaky)
+    try:
+        plane.reload_if_changed()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the failure should propagate")
+    assert plane.reload_if_changed() is True
+    assert "count_files" in tools(server)
+
+
+def test_a_reload_with_file_notices_warns(tmp_path, monkeypatch, caplog):
+    server, repo = build(tmp_path, monkeypatch)
+    (repo / TOOLS_FILENAME).write_text("version: 1\ntools: [oops\n")
+    with caplog.at_level(logging.WARNING):
+        server.devgraph_tool_plane.reload_if_changed()
+    assert any(TOOLS_FILENAME in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+
+
+async def _poll_once(server):
+    class Notifier:
+        async def notify(self):
+            pass
+
+    plane = server.devgraph_tool_plane
+    plane._fingerprint = None  # force a reload on the first tick
+    with anyio.CancelScope() as scope:
+        async def sleep(_):
+            if getattr(sleep, "done", False):
+                scope.cancel()
+            sleep.done = True
+            await anyio.sleep(0)
+
+        await poll_tool_reloads(plane, Notifier(), sleep=sleep)
+
+
+def test_a_failed_poll_says_tools_may_be_unavailable(tmp_path, monkeypatch, caplog):
+    server, _ = build(tmp_path, monkeypatch)
+    plane = server.devgraph_tool_plane
+
+    def boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(plane, "reload_if_changed", boom)
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(_poll_once(server))
+    assert any("unavailable" in r.getMessage() for r in caplog.records)
+
+
+class _MemoryTransport:
+    def __init__(self, streams):
+        self._streams = streams
+
+    async def __aenter__(self):
+        return self._streams
+
+    async def __aexit__(self, *exc):
+        return None
+
+
+async def _run_stdio_handshake(server, monkeypatch):
+    """Serve `run_stdio` over memory streams; return (initialize capabilities, whether run_stdio ended)."""
+    finished = anyio.Event()
+    async with create_client_server_memory_streams() as (client_streams, server_streams):
+
+        @asynccontextmanager
+        async def fake_stdio_server():
+            yield server_streams
+
+        monkeypatch.setattr(tool_reload, "stdio_server", fake_stdio_server)
+
+        async def serve():
+            await run_stdio(server)
+            finished.set()
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(serve)
+            async with Client(_MemoryTransport(client_streams), mode="legacy") as client:
+                capabilities = client.server_capabilities
+            await client_streams[1].aclose()
+            with anyio.fail_after(5):
+                await finished.wait()
+    return capabilities
+
+
+def test_run_stdio_advertises_listchanged_for_a_scoped_server_and_ends_with_the_client(tmp_path, monkeypatch):
+    server, _ = build(tmp_path, monkeypatch)
+    capabilities = anyio.run(_run_stdio_handshake, server, monkeypatch)
+    assert capabilities.tools.list_changed is True
+
+
+def test_run_stdio_does_not_advertise_listchanged_without_a_scope(tmp_path, monkeypatch):
+    server, _ = build(tmp_path, monkeypatch, scoped=False)
+    capabilities = anyio.run(_run_stdio_handshake, server, monkeypatch)
+    assert not capabilities.tools.list_changed
