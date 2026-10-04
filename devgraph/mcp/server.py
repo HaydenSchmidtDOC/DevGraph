@@ -321,8 +321,8 @@ def build_server(
             "repo_id (the id shown by `devgraph list`) and defaults to that repo only; "
             "pass cross_repo=true only when the user explicitly wants results across "
             "multiple registered repositories. Project-specific tools declared in a "
-            "repository's devgraph.tools.yaml are scoped to this session's repository "
-            "and take no repo_id; see devgraph://project-tools."
+            "repository's devgraph.tools.yaml (served only once the user trusts the file) are "
+            "scoped to this session's repository and take no repo_id; see devgraph://project-tools."
         ),
     )
 
@@ -564,7 +564,8 @@ def build_server(
         description=(
             f"Which repository this session serves {TOOLS_FILENAME} and global tools for, how it was "
             "chosen, which tools are served and where each comes from (global, project, or a "
-            "project override of a global tool), and notices about ignored or invalid declarations."
+            "project override of a global tool), whether the user trusts the project tools file, and "
+            "notices about ignored, invalid or untrusted declarations."
         ),
         mime_type="application/json",
     )
