@@ -161,6 +161,17 @@ A tools file that declares the same tool name twice is refused by every `config 
 
 `devgraph.tools.yaml` is edited as text, splicing only the affected tool's lines, so comments and formatting elsewhere survive (comments inside an edited tool are lost). Both files are replaced atomically, but there is no locking: two `config tools` writes to the same file at once are last-writer-wins, so one of the edits can be lost. A file whose `tools` value is not a block sequence (for example a flow list) is refused rather than rewritten. The CLI never stages or commits. `config show`, `config validate` and `doctor` also report the global store and which project tools override global ones.
 
+## Configuration
+
+Settings come from `DEVGRAPH_*` environment variables (see `.env.example`). A `.env` file is read only from two fixed places, never from the directory a command starts in:
+
+1. `~/.devgraph/.env` (or the directory of `DEVGRAPH_REGISTRY_DB_PATH`, when that is exported as an absolute or `~`-prefixed path; a relative value is ignored here with a warning), which takes precedence;
+2. the root of the DevGraph checkout, when DevGraph runs from a source checkout.
+
+Exported environment variables override both files.
+
+**Migrating:** earlier versions also read `.env` from the current working directory. If you kept a `.env` anywhere other than the two places above, move it to `~/.devgraph/.env` or export the variables instead.
+
 ## Dashboard
 
 The tray app serves the dashboard at `http://127.0.0.1:8765`. It shows registered repositories, graph and git information, query telemetry, an interactive graph canvas, query-driven highlighting, and saved per-repository layouts. The repository picker can register a local path and run its initial scan; if indexing fails, the registration remains available for retry. Server-Sent Events refresh the view after indexing changes.
