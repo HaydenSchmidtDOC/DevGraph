@@ -82,3 +82,12 @@ def test_load_project_schema_and_hash_honour_the_switch(tmp_path, monkeypatch):
     assert load_project_schema(repo) is None
     assert load_project_schema(repo, respect_switch=False) is not None
     assert schema_file_hash(repo) == ABSENT_SCHEMA_HASH
+
+
+def test_a_registry_path_with_uri_special_characters_still_applies(tmp_path, monkeypatch):
+    odd = tmp_path / "a#b ?c%20"
+    odd.mkdir()
+    db = odd / "r.sqlite3"
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db)
+    _register(db, tmp_path / "repo", enabled=False)
+    assert project_config_enabled(tmp_path / "repo") is False

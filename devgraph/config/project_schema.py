@@ -39,12 +39,12 @@ from pydantic import (
     model_validator,
 )
 
+from devgraph.config.project_switch import project_config_enabled
 from devgraph.graph.schema import (
     NODE_LABELS,
     RELATIONSHIP_TYPES,
     RESERVED_NODE_PROPERTIES,
 )
-from devgraph.config.project_switch import project_config_enabled
 from devgraph.graph.schema import constraint_statements as builtin_constraint_statements
 
 SCHEMA_FILENAME = "devgraph.schema.yaml"
@@ -523,8 +523,8 @@ def load_project_schema(repo_root: Path, *, respect_switch: bool = True) -> Proj
 
     Returns `None` if and only if the file is absent or the repository's
     project config is switched off (unless `respect_switch` is False). An
-    empty, malformed, non-mapping or invalid file raises `ProjectSchemaError`; no partial
-    schema is ever returned.
+    empty, malformed, non-mapping or invalid file raises `ProjectSchemaError`;
+    no partial schema is ever returned.
     """
     if respect_switch and not project_config_enabled(repo_root):
         return None

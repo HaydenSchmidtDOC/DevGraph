@@ -17,12 +17,13 @@ def _registry_db_path() -> Path:
 
 
 def project_config_enabled(repo_root: Path | str) -> bool:
+    """True unless the registry has `repo_root` registered with its project config off."""
     db = _registry_db_path()
     if not db.exists():
         return True
     target = Path(repo_root).expanduser().resolve()
     try:
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
     except sqlite3.Error:
         return True
     try:
