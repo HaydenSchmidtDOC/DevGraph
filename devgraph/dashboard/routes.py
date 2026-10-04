@@ -29,6 +29,8 @@ from starlette.concurrency import run_in_threadpool
 
 from devgraph.config.project_schema import (
     ABSENT_SCHEMA_HASH,
+    LABEL_PATTERN,
+    RELATIONSHIP_TYPE_PATTERN,
     ProjectSchemaError,
     load_project_schema,
     schema_file_hash,
@@ -333,10 +335,25 @@ def build_router(
             ],
         }
 
+    def _applied_labels(record: Any) -> tuple[list[str], list[str]]:
+        """The applied project labels and relationship types of one repo.
+
+        Reads only the applied schema (never the schema file), honours the
+        repo's project-config switch, and re-checks every name against the
+        identifier patterns as defence in depth before it can reach Cypher.
+        """
+        if not record.project_config_enabled:
+            return [], []
+        applied = engine.read_applied_schema(record.repo_id)
+        if applied is None:
+            return [], []
+        return (
+            [x for x in applied["labels"] if LABEL_PATTERN.fullmatch(x)],
+            [x for x in applied["relationship_types"] if RELATIONSHIP_TYPE_PATTERN.fullmatch(x)],
+        )
+
     def _repo_schema(record: Any) -> dict[str, Any]:
         """One repository's applied project types, colours and schema state."""
-        project_labels: list[str] = []
-        project_rels: list[str] = []
         colors: dict[str, str] = {}
         notices: list[str] = []
         if not record.project_config_enabled:
@@ -344,9 +361,7 @@ def build_router(
 
         applied = engine.read_applied_schema(record.repo_id)
         current = schema_file_hash(record.path)
-        if applied is not None:
-            project_labels = list(applied["labels"])
-            project_rels = list(applied["relationship_types"])
+        project_labels, project_rels = _applied_labels(record)
         if current == ABSENT_SCHEMA_HASH and (applied is None or applied["hash"] == ABSENT_SCHEMA_HASH):
             state = "absent"
         elif applied is None:
@@ -388,22 +403,20 @@ def build_router(
         """
         labels = list(NODE_LABELS)
         for record in _scope_records(repo_id):
-            labels += [x for x in _repo_schema(record)["labels"] if x not in labels]
+            labels += [x for x in _applied_labels(record)[0] if x not in labels]
         return labels
 
     @router.get("/repos/{repo_id}/schema")
     def repo_schema(repo_id: str) -> dict[str, Any]:
         records = _scope_records(repo_id)
 
-        counts: dict[str, int] = {}
         project_labels: list[str] = []
         project_rels: list[str] = []
         colors: dict[str, str] = {}
         notices: list[str] = []
         state = "absent"
+        counts = queries.node_counts_by_label(engine, [r.repo_id for r in records])
         for record in records:
-            for label, count in queries.summary_counts(engine, record.repo_id)["nodes_by_label"].items():
-                counts[label] = counts.get(label, 0) + count
             info = _repo_schema(record)
             project_labels += [x for x in info["labels"] if x not in project_labels]
             project_rels += [x for x in info["rels"] if x not in project_rels]
@@ -440,7 +453,8 @@ def build_router(
 
     @router.get("/repos/{repo_id}/search")
     def repo_search(repo_id: str, q: str, max_results: int = 15) -> dict[str, Any]:
-        _require_repo(repo_id)
+        if repo_id == _ALL_REPOS_SCOPE:  # search is per-repo; `_scope_records` below does the one lookup
+            raise HTTPException(status_code=404, detail=f"unknown repo: {repo_id}")
         project_labels = [x for x in _allowed_labels(repo_id) if x not in NODE_LABELS]
         return {"results": queries.search_components(engine, repo_id, q, max_results, project_labels)}
 

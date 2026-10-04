@@ -55,6 +55,17 @@ def summary_counts(engine: GraphEngine, repo_id: str) -> dict[str, Any]:
     }
 
 
+def node_counts_by_label(engine: GraphEngine, repo_ids: list[str]) -> dict[str, int]:
+    """Node counts grouped by label across `repo_ids`; scans nodes only."""
+    rows = engine.run_cypher(
+        "MATCH (n) WHERE n.repo_id IN $ids "
+        "UNWIND labels(n) AS label "
+        "RETURN label, count(*) AS count",
+        {"ids": repo_ids},
+    )
+    return {row["label"]: row["count"] for row in rows}
+
+
 def graph_slice(
     engine: GraphEngine, repo_id: str, label: str | None, limit: int
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:

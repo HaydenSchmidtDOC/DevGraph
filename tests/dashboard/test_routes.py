@@ -491,3 +491,76 @@ def test_search_finds_a_declared_label_node_by_name(schema_repo):
     client, _, _ = schema_repo
     results = client.get("/api/repos/dash_schema/search", params={"q": "a.txt"}).json()["results"]
     assert any(r["label"] == "File" and r["name"] == "a.txt" for r in results)
+
+
+# --- node-only counts, applied-schema gating --------------------------------
+
+
+def test_schema_counts_do_not_scan_relationships(schema_repo, monkeypatch):
+    from devgraph.dashboard import queries
+
+    def boom(*_a, **_k):
+        raise AssertionError("summary_counts scans relationships")
+
+    monkeypatch.setattr(queries, "summary_counts", boom)
+    client, _, _ = schema_repo
+    body = client.get("/api/repos/dash_schema/schema").json()
+    assert {t["label"]: t["count"] for t in body["node_types"]}["File"] == 2
+
+
+def test_schema_all_repos_sums_counts_across_two_repos(schema_repo, client):
+    one = client.get("/api/repos/dash_repo_a/schema").json()
+    two = schema_repo[0].get("/api/repos/dash_schema/schema").json()
+    both = schema_repo[0].get("/api/repos/__all__/schema").json()
+    count = lambda b: {t["label"]: t["count"] for t in b["node_types"]}  # noqa: E731
+    expected = {k: count(one).get(k, 0) + count(two).get(k, 0) for k in count(both)}
+    # __all__ also covers other registered repos; each label is at least the two summed.
+    assert all(count(both)[k] >= v for k, v in expected.items())
+    assert count(both)["File"] == 2 and count(both)["Service"] >= 2
+
+
+def test_node_counts_by_label_counts_only_nodes(engine, schema_repo):
+    from devgraph.dashboard import queries
+
+    counts = queries.node_counts_by_label(engine, ["dash_schema"])
+    assert counts["File"] == 2
+    assert queries.node_counts_by_label(engine, []) == {}
+
+
+def test_unsafe_applied_label_is_filtered(schema_repo, engine):
+    client, _, _ = schema_repo
+    from devgraph.indexer.dispatch import full_scan  # noqa: F401
+
+    applied = engine.read_applied_schema("dash_schema")
+    engine.record_applied_schema(
+        "dash_schema", applied["hash"], ["File", "Bad`Label"], ["IS_CHILD_OF", "bad-rel"]
+    )
+    body = client.get("/api/repos/dash_schema/schema").json()
+    assert "Bad`Label" not in {t["label"] for t in body["node_types"]}
+    assert "bad-rel" not in {t["type"] for t in body["relationship_types"]}
+    assert client.get("/api/repos/dash_schema/graph", params={"label": "Bad`Label"}).status_code == 400
+
+
+def test_pending_only_label_is_gated_until_rescanned(schema_repo, engine):
+    from devgraph.indexer.dispatch import full_scan
+
+    client, root, _ = schema_repo
+    (root / "devgraph.schema.yaml").write_text(
+        _FS_SCHEMA.replace(
+            "relationships:",
+            "  - label: Widget\n    key: [sku]\n    metadata: [{name: sku}]\nrelationships:",
+        )
+    )
+    assert client.get("/api/repos/dash_schema/graph", params={"label": "Widget"}).status_code == 400
+    engine.run_cypher(
+        "CREATE (:Widget {repo_id: 'dash_schema', name: 'sprocket', file: 'w'})", {}
+    )
+    results = client.get("/api/repos/dash_schema/search", params={"q": "sprocket"}).json()["results"]
+    assert not any(r["label"] == "Widget" for r in results)
+    full_scan(engine, "dash_schema", root)
+    assert client.get("/api/repos/dash_schema/graph", params={"label": "Widget"}).status_code == 200
+
+
+def test_search_is_not_available_for_the_all_scope(client):
+    assert client.get("/api/repos/__all__/search", params={"q": "x"}).status_code == 404
+    assert client.get("/api/repos/nope/search", params={"q": "x"}).status_code == 404
