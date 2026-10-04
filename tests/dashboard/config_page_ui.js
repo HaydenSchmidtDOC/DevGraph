@@ -526,6 +526,54 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     String(els.configModalSave.disabled));
   els.configModalCancel.fire("click");
 
+  // 13c. the text is locked while it is checked, and a confirm covers only the text it checked
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  respond = (url, init) => JSON.parse(init.body).dry_run
+    ? { status: 200, body: { ok: true, written: false, warnings: ["Changing the key keeps the old constraint."], notes: [], scope: project("repo-a") } }
+    : ok(project("repo-a"));
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
+  const reviewed = els.configYaml.value;
+  gate = new Promise(r => { release = r; });
+  clock += 1000;
+  pending = els.configModalSave.fire("click");
+  await Promise.resolve();
+  check("the YAML is read-only while its dry run is out", els.configYaml.readOnly === true, String(els.configYaml.readOnly));
+  /* text that lands anyway (a stale input event, a script) */
+  els.configYaml.value = "label: Runbook\nkey: [sneaky]\n";
+  await els.configYaml.fire("input");
+  gate = null; release(); await pending;
+  check("...editable again once the check is back", els.configYaml.readOnly === false && els.configModalSave.textContent === "Save anyway",
+    JSON.stringify([els.configYaml.readOnly, els.configModalSave.textContent]));
+  await press(els.configModalSave);
+  check("a confirm never writes text its dry run did not check: the click dry-runs the new text",
+    writes().length === 2 && writes().every(c => body(c).dry_run === true) && body(writes()[0]).yaml === reviewed &&
+    body(writes()[1]).yaml === "label: Runbook\nkey: [sneaky]\n" && els.configModalSave.textContent === "Save anyway",
+    JSON.stringify([els.configModalSave.textContent, writes()]));
+  await press(els.configModalSave);
+  check("...and the next confirm writes exactly the text it reviewed",
+    writes().length === 3 && body(writes()[2]).dry_run === false && body(writes()[2]).yaml === "label: Runbook\nkey: [sneaky]\n",
+    JSON.stringify(writes()));
+
+  // no warnings: the editor closes after writing, so nothing may be typed during the check
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: project("repo-a") } });
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
+  gate = new Promise(r => { release = r; });
+  clock += 1000;
+  pending = els.configModalSave.fire("click");
+  await Promise.resolve();
+  check("a warning-free save locks the YAML during its dry run too", els.configYaml.readOnly === true, String(els.configYaml.readOnly));
+  els.configYaml.value = "label: Runbook\nkey: [typed]\n";
+  await els.configYaml.fire("input");
+  gate = null; release(); await pending;
+  check("...and text that changed anyway is neither written unchecked nor thrown away",
+    writes().length === 1 && body(writes()[0]).dry_run === true && els.configModal.classList.contains("open") &&
+    els.configYaml.value === "label: Runbook\nkey: [typed]\n" && els.configYaml.readOnly === false && shown(els.configModalError),
+    JSON.stringify([writes(), els.configModal.className, els.configModalError.textContent]));
+  els.configModalCancel.fire("click");
+
   // 14. Cancel while a save is in flight
   api.renderConfigPage(MODEL());
   fetchCalls = [];
