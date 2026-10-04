@@ -30,6 +30,7 @@ from devgraph.indexer.java.extractor import extract_java_file
 from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.kotlin.extractor import extract_kotlin_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
+from devgraph.indexer.mentions.extractor import upsert_document_node
 from devgraph.indexer.cpp.extractor import extract_cpp_file
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
@@ -144,16 +145,19 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # per file) that the Python branch has no equivalent of.
     go_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     module_path = _find_module_path(repo_root)
+    # Markdown files whose cross-file edges are resolved after every other
+    # node in the batch exists (see the docs/mentions passes below).
+    docs_files: list[Path] = []
+    mention_files: list[Path] = []
 
-    # Process files in a fixed order, not set order. Several edges are
-    # MATCH-then-MATCH (IMPLEMENTS, MENTIONS, SUPERSEDES) and only form if
-    # the other endpoint's file was indexed earlier, and shared nodes
+    # Process files in a fixed order, not set order. Shared nodes
     # (Datastore/Endpoint) keep the last writer's `source`/`library` and
     # accumulate `sources` in claim order -- so iterating the set directly
-    # made the graph depend on PYTHONHASHSEED. Each path is resolved once
-    # and the batch is sorted by its repo-relative POSIX path, so the order
-    # is the same however the caller spelled a path (relative, absolute,
-    # through a symlink).
+    # made the graph depend on PYTHONHASHSEED. (Cross-file edges no longer
+    # depend on order: they are re-resolved in the passes after this loop.)
+    # Each path is resolved once and the batch is sorted by its
+    # repo-relative POSIX path, so the order is the same however the caller
+    # spelled a path (relative, absolute, through a symlink).
     root_resolved = repo_root.resolve()
     by_rel_path: dict[str, Path] = {}
     for path in _expand_with_reverse_dependents(engine, repo_id, repo_root, paths):
@@ -183,6 +187,7 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
                 cs_files, cs_extractions, cpp_files, cpp_extractions,
                 java_files, java_extractions, rs_files, rs_extractions,
                 kt_files, kt_extractions, go_extractions,
+                docs_files, mention_files,
             )
         except Exception:
             logger.warning(
@@ -267,6 +272,28 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
         engine.upsert_relationships(service_rels)
 
+    # Docs notes get the same node-then-edge treatment as the source files
+    # above: pass 1 (in the loop) created every note's node, but a note's
+    # SUPERSEDES/DECIDED_BY target note or `links` Module may come from a
+    # file that sorted after it. Re-indexing the (tiny) note now that every
+    # node in the batch exists materializes those edges.
+    for path in docs_files:
+        try:
+            index_doc_file(engine, repo_id, path)
+        except Exception:
+            logger.warning("docs edge pass failed for %s (%s); skipping file", repo_id, path, exc_info=True)
+
+    # Mentions run last: unlike every other extractor, mention extraction
+    # reads the graph (the set of known entity names) to decide what a
+    # Markdown file mentions, so it needs every node from this batch --
+    # code symbols, docs notes, and the Document nodes pass 1 created --
+    # to already exist.
+    for path in mention_files:
+        try:
+            index_mentions_file(engine, repo_id, path, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode)
+        except Exception:
+            logger.warning("mentions pass failed for %s (%s); skipping file", repo_id, path, exc_info=True)
+
     return indexed
 
 
@@ -295,6 +322,8 @@ def _index_single_path(
     kt_files: list[str],
     kt_extractions: dict[str, tuple[list[dict], list[dict]]],
     go_extractions: dict[str, tuple[list[dict], list[dict]]],
+    docs_files: list[Path],
+    mention_files: list[Path],
 ) -> int:
     """Extract and upsert one file's graph output, routing by name/extension.
 
@@ -331,9 +360,12 @@ def _index_single_path(
         # their 'source'/'file' provenance properties match what
         # delete_nodes_by_source_file looks up on file deletion.
         _index_datastores(engine, repo_id, rel_path, content)
-        _index_apis(engine, repo_id, rel_path, content)
+        api_rels = _index_apis(engine, repo_id, rel_path, content)
         py_files.append((rel_path, content))
-        py_extractions[rel_path] = (nodes, rels)
+        # API edges ride along in the re-upsert pass: an Endpoint's
+        # IMPLEMENTS target can be a handler defined in a later file (e.g.
+        # a Django urls.py naming a view from views.py).
+        py_extractions[rel_path] = (nodes, rels + api_rels)
     elif resolved.suffix in _JS_SUFFIXES:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_js_file(content, rel_path, repo_id)
@@ -417,9 +449,13 @@ def _index_single_path(
     elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
         index_doc_file(engine, repo_id, resolved)
         indexed += 1
+        docs_files.append(resolved)
     if mentions_enabled and resolved.suffix in (".md", ".markdown"):
-        index_mentions_file(engine, repo_id, resolved, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode)
+        # Only the Document node here; its MENTIONS edges are resolved in
+        # index_paths' final pass, once every node in the batch exists.
+        upsert_document_node(engine, repo_id, resolved, repo_root)
         indexed += 1
+        mention_files.append(resolved)
     if name_lower in _CONTAINERFILE_NAMES:
         _index_containerfile(engine, repo_id, resolved, rel_path)
         indexed += 1
@@ -443,6 +479,14 @@ def _expand_with_reverse_dependents(
     fan-out only (direct importers, not transitive) to keep this a cheap
     per-change lookup rather than a repo walk; transitive staleness is rare
     enough that `--full` remains the intended escape hatch for it.
+
+    Known gap: this finds referrers only through edges that already exist.
+    A referrer indexed before its target existed (a doc mentioning or a
+    note superseding/linking it, a route naming a handler in it, a class
+    extending it) has no edge to follow, so adding the target alone leaves
+    those edges missing until the referrer is re-indexed or a full scan
+    runs. Within a single batch this doesn't arise: index_paths resolves
+    cross-file edges after every node in the batch exists.
     """
     root_resolved = repo_root.resolve()
     expanded = set(paths)
@@ -776,7 +820,7 @@ def _owning_service_relationships(
     return rels
 
 
-def _index_apis(engine: GraphEngine, repo_id: str, rel_path: str, content: str) -> None:
+def _index_apis(engine: GraphEngine, repo_id: str, rel_path: str, content: str) -> list[dict]:
     result = APIExtractor(repo_id).extract_from_source(content, rel_path)
     nodes = [
         {"label": "Endpoint", "repo_id": repo_id, "name": f"{e.method} {e.path}", "properties": e.properties}
@@ -786,4 +830,6 @@ def _index_apis(engine: GraphEngine, repo_id: str, rel_path: str, content: str) 
         for f in result.functions
     ]
     engine.upsert_nodes(nodes)
-    engine.upsert_relationships([_relationship_dict(rel, repo_id) for rel in result.relationships])
+    rels = [_relationship_dict(rel, repo_id) for rel in result.relationships]
+    engine.upsert_relationships(rels)
+    return rels

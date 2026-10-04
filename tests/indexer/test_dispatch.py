@@ -778,3 +778,102 @@ class TestOwningServiceTieBreak:
             for order in (rows, rows[::-1])
         }
         assert owners == {"api"}
+
+
+# Every referrer here sorts BEFORE the file whose node its edge targets, so
+# an edge only forms on a first scan if index_paths resolves cross-file edges
+# after every node in the batch exists.
+_REFERRER_FIRST_FIXTURE = {
+    # Mentions: a doc mentioning a later file's class, a later design
+    # decision, and a later doc.
+    "a.md": "# Guide\n\n`Zebra` is decided in `b-old`; see `notes/z.md`.\n",
+    # Docs: a decision superseding / decided by later notes, linking a later module.
+    "docs/a-new.md": (
+        "---\ntype: design_decision\nid: a-new\nsupersedes: b-old\n"
+        "decided_by: c-arch\nlinks: [src/z.py]\n---\n# New\n"
+    ),
+    "docs/b-old.md": "---\ntype: design_decision\nid: b-old\n---\n# Old\n",
+    "docs/c-arch.md": "---\ntype: architecture_note\nid: c-arch\n---\n# Arch\n",
+    "notes/z.md": "# Z notes\n",
+    # Django route (urls.py) implemented by a view in a later file.
+    "api/urls.py": "urlpatterns = [path('items/', item_list)]\n",
+    "api/views.py": "def item_list(request):\n    pass\n",
+    # Java implementation before its interface.
+    "store/ASqlStore.java": "package store;\n\npublic class ASqlStore implements Store {\n    public void save() {}\n}\n",
+    "store/Store.java": "package store;\n\npublic interface Store {\n    void save();\n}\n",
+    "src/z.py": "class Zebra:\n    pass\n",
+}
+
+_CROSS_FILE_EDGES = {
+    "mentions class": (
+        "MATCH (:Document {repo_id: $repo_id, name: 'a.md'})-[:MENTIONS]->(:Class {name: 'Zebra'}) RETURN count(*) AS c"
+    ),
+    "mentions decision": (
+        "MATCH (:Document {repo_id: $repo_id, name: 'a.md'})-[:MENTIONS]->(:DesignDecision {name: 'b-old'}) "
+        "RETURN count(*) AS c"
+    ),
+    "mentions document": (
+        "MATCH (:Document {repo_id: $repo_id, name: 'a.md'})-[:MENTIONS]->(:Document {name: 'notes/z.md'}) "
+        "RETURN count(*) AS c"
+    ),
+    "supersedes": (
+        "MATCH (:DesignDecision {repo_id: $repo_id, name: 'a-new'})-[:SUPERSEDES]->(:DesignDecision {name: 'b-old'}) "
+        "RETURN count(*) AS c"
+    ),
+    "decided by": (
+        "MATCH (:DesignDecision {repo_id: $repo_id, name: 'a-new'})-[:DECIDED_BY]->(:ArchitectureNote {name: 'c-arch'}) "
+        "RETURN count(*) AS c"
+    ),
+    "documented by": (
+        "MATCH (:Module {repo_id: $repo_id, name: 'src/z.py'})-[:DOCUMENTED_BY]->(:DesignDecision {name: 'a-new'}) "
+        "RETURN count(*) AS c"
+    ),
+    "implements": (
+        "MATCH (:Endpoint {repo_id: $repo_id, name: '* items/'})-[:IMPLEMENTS]->"
+        "(:Function {name: 'item_list', file: 'api/views.py'}) RETURN count(*) AS c"
+    ),
+    "extends": (
+        "MATCH (:Class {repo_id: $repo_id, name: 'ASqlStore'})-[:EXTENDS]->(:Class {name: 'Store'}) RETURN count(*) AS c"
+    ),
+}
+
+
+def _write_fixture(root: Path, fixture: dict[str, str]) -> None:
+    for rel, content in fixture.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(content)
+
+
+def _missing_edges(engine, repo_id: str) -> list[str]:
+    return [name for name, query in _CROSS_FILE_EDGES.items() if engine.run_cypher(query, {"repo_id": repo_id})[0]["c"] == 0]
+
+
+class TestCrossFileEdgesIndependentOfOrder:
+    def test_full_scan_creates_edges_whose_referrer_sorts_before_its_target(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_referrer_first_full"
+        _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
+        try:
+            full_scan(engine, repo_id, temp_repo, docs_path="docs", mentions_enabled=True)
+            assert _missing_edges(engine, repo_id) == []
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_adding_a_target_later_does_not_relink_existing_referrers(self, engine, temp_repo):
+        """Known limitation: an incremental batch that adds only a target file
+        does not re-resolve edges from referrers indexed earlier -- nothing in
+        the graph points from a referrer to a node that didn't exist yet, so
+        there is no reverse-dependent to find. Re-indexing the referrer (or a
+        full rescan) links it."""
+        repo_id = "_smoketest_dispatch_referrer_first_incremental"
+        _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
+        referrers = {"a.md", "docs/a-new.md", "api/urls.py", "store/ASqlStore.java"}
+        try:
+            index_paths(engine, repo_id, temp_repo, {temp_repo / r for r in referrers}, docs_path="docs", mentions_enabled=True)
+            targets = set(_REFERRER_FIRST_FIXTURE) - referrers
+            index_paths(engine, repo_id, temp_repo, {temp_repo / t for t in targets}, docs_path="docs", mentions_enabled=True)
+            assert set(_missing_edges(engine, repo_id)) == set(_CROSS_FILE_EDGES)
+
+            index_paths(engine, repo_id, temp_repo, {temp_repo / r for r in referrers}, docs_path="docs", mentions_enabled=True)
+            assert _missing_edges(engine, repo_id) == []
+        finally:
+            engine.delete_repository(repo_id)

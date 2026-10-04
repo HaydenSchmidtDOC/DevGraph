@@ -285,6 +285,46 @@ def _find_in_code_regions(content: str, name: str, code_regions: list[tuple[int,
     return False
 
 
+def _document_name(file_path: Path, repo_root: str | Path | None) -> str:
+    """The Document node's name: file_path relative to repo_root (forward
+    slashes), or the bare filename when repo_root is omitted or doesn't
+    contain file_path."""
+    if repo_root is not None:
+        try:
+            return file_path.resolve().relative_to(Path(repo_root).resolve()).as_posix()
+        except ValueError:
+            pass
+    return file_path.name
+
+
+def _upsert_documents(engine, result: ExtractionResult) -> None:
+    engine.upsert_nodes(
+        [
+            {
+                "label": doc.label,
+                "repo_id": doc.repo_id,
+                "name": doc.name,
+                "properties": doc.properties,
+            }
+            for doc in result.documents
+        ]
+    )
+
+
+def upsert_document_node(engine, repo_id: str, file_path: str | Path, repo_root: str | Path | None = None) -> None:
+    """Upsert only a Markdown file's Document node, without MENTIONS edges.
+
+    Lets a batch create every Document node before any file's mentions are
+    resolved, so a file mentioning a Document (or anything else) indexed
+    later in the same batch still gets its edge. index_file then adds the
+    edges (and re-upserts the same node idempotently).
+    """
+    file_path = Path(file_path)
+    content = file_path.read_text(encoding="utf-8")
+    result = MentionsExtractor(repo_id).extract_from_source(content, _document_name(file_path, repo_root), [])
+    _upsert_documents(engine, result)
+
+
 def index_file(
     engine,
     repo_id: str,
@@ -313,17 +353,7 @@ def index_file(
         raise FileNotFoundError(f"File not found: {file_path}")
 
     content = file_path.read_text(encoding="utf-8")
-
-    # Compute the document name (repo-relative path or bare filename)
-    if repo_root is not None:
-        try:
-            rel = file_path.resolve().relative_to(Path(repo_root).resolve())
-            doc_name = rel.as_posix()
-        except ValueError:
-            # file_path wasn't actually under repo_root, fall back to bare filename
-            doc_name = file_path.name
-    else:
-        doc_name = file_path.name
+    doc_name = _document_name(file_path, repo_root)
 
     # Query all entity names/labels in this repo
     query = """
@@ -338,18 +368,7 @@ def index_file(
     extractor = MentionsExtractor(repo_id, ambiguous_mode=ambiguous_mode)
     result = extractor.extract_from_source(content, doc_name, known_entities)
 
-    # Upsert Document node
-    engine.upsert_nodes(
-        [
-            {
-                "label": doc.label,
-                "repo_id": doc.repo_id,
-                "name": doc.name,
-                "properties": doc.properties,
-            }
-            for doc in result.documents
-        ]
-    )
+    _upsert_documents(engine, result)
 
     # Upsert relationships
     engine.upsert_relationships(

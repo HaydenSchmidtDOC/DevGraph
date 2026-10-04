@@ -104,6 +104,7 @@ Bind-mount each allowed repository under `/repos` before registering it. The loc
 
 - Call edges are name-based rather than fully type-resolved, so common method names can over-link.
 - Import resolution is a best-effort same-repository guess. C++ extraction is intentionally structural because reliable include resolution needs build-system context.
+- Live (watcher) indexing of a newly added file does not re-link files that already referred to it — a doc mentioning it, a note superseding it, a class extending it — until those files change or `devgraph rescan` runs. Full scans are complete in one pass.
 - `compare_branches` is registered but remains a stub; use `impact_analysis_for_diff` for local-ref impact analysis.
 - Enterprise federation and semantic search are design directions rather than shipped capabilities.
 
