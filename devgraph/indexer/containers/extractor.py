@@ -6,6 +6,7 @@ import re
 
 import yaml
 
+from devgraph.config.yaml_bound import YAML_MAX_NODES, bounded_safe_load
 
 @dataclass
 class ContainerNode:
@@ -142,7 +143,7 @@ class ContainerExtractor:
         result = ExtractionResult()
 
         try:
-            compose_data = yaml.safe_load(content)
+            compose_data = bounded_safe_load(content, YAML_MAX_NODES)
         except yaml.YAMLError:
             # Return empty result if YAML is malformed
             return result

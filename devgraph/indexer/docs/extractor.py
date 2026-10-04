@@ -25,6 +25,7 @@ from pathlib import Path
 
 import yaml
 
+from devgraph.config.yaml_bound import YAML_MAX_NODES, bounded_safe_load
 _TYPE_TO_LABEL = {
     "requirement": "Requirement",
     "design_decision": "DesignDecision",
@@ -78,7 +79,7 @@ class DocsExtractor:
             return result
 
         try:
-            meta = yaml.safe_load(match.group(1)) or {}
+            meta = bounded_safe_load(match.group(1), YAML_MAX_NODES) or {}
         except yaml.YAMLError:
             return result
         if not isinstance(meta, dict):

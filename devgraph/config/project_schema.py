@@ -36,6 +36,7 @@ from pydantic import (
     model_validator,
 )
 
+from devgraph.config.yaml_bound import YAML_MAX_NODES, bounded_safe_load
 from devgraph.graph.schema import (
     NODE_LABELS,
     RELATIONSHIP_TYPES,
@@ -390,7 +391,7 @@ def load_project_schema(repo_root: Path) -> ProjectSchema | None:
         raise ProjectSchemaError(f"{path}: is not valid UTF-8: {exc}") from exc
 
     try:
-        document = yaml.safe_load(text)
+        document = bounded_safe_load(text, YAML_MAX_NODES)
     except yaml.YAMLError as exc:
         raise ProjectSchemaError(f"{path}: malformed YAML: {exc}") from exc
 
