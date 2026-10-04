@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from devgraph.config.project_schema import NodeTypeDecl
+from devgraph.config.project_schema import NodeTypeDecl, RelationshipDecl
 from devgraph.config.project_tools import CypherTool
 
 pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
@@ -111,6 +111,21 @@ VALID_NODE_TYPES = [
     {"metadata": [{"name": "id", "required": True}], "key": ["id"], "label": "Reordered"},
 ]
 
+VALID_RELATIONSHIPS = [
+    {"type": "CALLS", "from": "Function", "to": "Function"},
+    {
+        "type": "DOCUMENTS",
+        "from": "Runbook",
+        "to": "Service",
+        "provider": "custom",
+        "custom": {"name": "runbook_links", "params": {}},
+        "color": "#1f77b4",
+    },
+    {"type": "IS_CHILD_OF", "from": ["File", "Folder"], "to": "Folder", "provider": "filesystem"},
+    {"type": "OWNS", "from": ["Team"], "to": "Service", "provider": "custom", "custom": {"name": "owners"}},
+    {"to": "Function", "provider": "builtin", "from": ["Function", "Service"], "type": "USES", "custom": None, "color": None},
+]
+
 HOSTILE_STRINGS = [
     "", "yes", "No", "ON", "off", "y", "n", "null", "Null", "~", "true", "False",
     "123", "-1", "0x1F", "0o17", "017", "1_000", "1e3", "1.5", ".5", ".inf", ".NaN", "1:20", "2026-10-05",
@@ -139,6 +154,14 @@ def _hostile_fixtures() -> list[dict]:
         # only the textarea-backed fields, so line breaks still go through the form
         fixtures.append({"section": "tools", "mapping": {"name": "t", "description": text, "cypher": text}})
         fixtures.append({"section": "node_types", "mapping": {"label": "N", "description": text}})
+        fixtures.append({"section": "relationships", "mapping": {
+            "type": text, "from": text, "to": text, "provider": "custom", "custom": {"name": text}, "color": text,
+        }})
+        fixtures.append({"section": "relationships", "mapping": {"type": "T", "from": ["A", text], "to": "B"}})
+        fixtures.append({"section": "relationships", "mapping": {
+            "type": "T", "from": "A", "to": "B", "provider": "custom", "custom": {"name": text, "params": {}}, "color": text,
+        }})
+        fixtures.append({"section": "relationships", "mapping": {"type": "T", "from": text, "to": "B"}})
     return fixtures
 
 
@@ -150,16 +173,55 @@ _SINGLE_LINE = {
     "node_types": (["label", "color"], "metadata", ["name", "description"]),
 }
 _TEXTAREA = {"tools": ["description", "cypher"], "node_types": ["description"]}
+# what JavaScript's String.prototype.trim() strips (not Python's str.strip())
+_JS_SPACE = "\t\n\v\f\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+_FIELD = "This entry has a field the form doesn't edit: `{}`. Edit it as YAML."
+_FROM_LIST = (
+    "This entry's `from` can't be shown as comma-separated labels exactly (a label with a comma, "
+    "surrounding spaces or a non-text value). Edit it as YAML."
+)
 
 
-def _form_refuses(fixture: dict) -> bool:
+def _broken(value) -> bool:
+    return isinstance(value, str) and any(c in value for c in _LINE_BREAKS)
+
+
+def _from_refused(value) -> bool:
+    """True unless `from` survives the form's split on commas and trim."""
+    labels = [value] if isinstance(value, str) else value
+    if not isinstance(labels, list) or not labels:
+        return True
+    return any(
+        not isinstance(label, str) or _broken(label) or "," in label or label != label.strip(_JS_SPACE)
+        or (label == "" and not isinstance(value, str))
+        for label in labels
+    )
+
+
+def _relationship_refusal(mapping: dict) -> str | None:
+    """The reason the form gives for the first field (in key order) it can't show."""
+    for key, value in mapping.items():
+        if key == "from" and _from_refused(value):
+            return _FROM_LIST
+        if key == "custom" and isinstance(value, dict) and _broken(value.get("name")):
+            return _FIELD.format("custom.name")
+        if key in ("type", "to", "color") and _broken(value):
+            return _FIELD.format(key)
+    return None
+
+
+def _form_refuses(fixture: dict) -> str | None:
+    """The reason the form refuses the fixture with, or None when it shows it."""
     mapping = fixture["mapping"]
+    if fixture["section"] == "relationships":
+        return _relationship_refusal(mapping)
     top, rows, row_fields = _SINGLE_LINE[fixture["section"]]
     single = [mapping.get(k) for k in top] + [r.get(k) for r in mapping.get(rows) or [] for k in row_fields]
     area = [mapping.get(k) for k in _TEXTAREA[fixture["section"]]]
-    return any(isinstance(v, str) and any(c in v for c in _LINE_BREAKS) for v in single) or any(
-        isinstance(v, str) and "\r" in v for v in area
-    )
+    if any(_broken(v) for v in single) or any(isinstance(v, str) and "\r" in v for v in area):
+        # which field comes first depends on the walk; the reason is the field one
+        return _FIELD.format("")
+    return None
 
 
 NUMBER_FIXTURES = [
@@ -186,6 +248,7 @@ def _fixtures() -> list[dict]:
     return (
         [{"section": "tools", "mapping": m} for m in VALID_TOOLS]
         + [{"section": "node_types", "mapping": m} for m in VALID_NODE_TYPES]
+        + [{"section": "relationships", "mapping": m} for m in VALID_RELATIONSHIPS]
         + _hostile_fixtures()
         + NUMBER_FIXTURES
     )
@@ -203,17 +266,22 @@ def test_serialised_yaml_parses_back_to_the_mapping(dumped):
 
 
 def test_every_fixture_survives_a_trip_through_the_form(dumped):
-    refused = 0
+    refused = set()
     for fixture, result in zip(_fixtures(), dumped["results"]):
-        if _form_refuses(fixture):
-            refused += 1
+        reason = _form_refuses(fixture)
+        if reason:
+            refused.add(reason)
             assert result["form_yaml"] is None, fixture
-            assert result["reason"].startswith("This entry has a field the form doesn't edit: `"), result["reason"]
+            if fixture["section"] == "relationships":
+                assert result["reason"] == reason, (fixture, result["reason"])
+            else:
+                assert result["reason"].startswith(reason[: reason.index("`") + 1]), result["reason"]
             continue
         assert result["form_yaml"] is not None, (fixture, result["reason"])
         text = result["form_yaml"]
         assert _ordered(yaml.safe_load(text)) == _ordered(fixture["mapping"]), text
-    assert refused, "no fixture exercised the line-break refusal"
+    for reason in (_FROM_LIST, _FIELD.format("type"), _FIELD.format("custom.name")):
+        assert reason in refused, f"no fixture exercised the refusal {reason!r}"
 
 
 def test_valid_fixtures_pass_the_real_models(dumped):
@@ -225,6 +293,11 @@ def test_valid_fixtures_pass_the_real_models(dumped):
     for i, mapping in enumerate(VALID_NODE_TYPES):
         for key in ("yaml", "form_yaml"):
             NodeTypeDecl.model_validate(yaml.safe_load(results[offset + i][key]))
+    offset += len(VALID_NODE_TYPES)
+    for i, mapping in enumerate(VALID_RELATIONSHIPS):
+        RelationshipDecl.model_validate(mapping)
+        for key in ("yaml", "form_yaml"):
+            RelationshipDecl.model_validate(yaml.safe_load(results[offset + i][key]))
 
 
 def test_multiline_cypher_is_a_literal_block(dumped):
@@ -234,6 +307,7 @@ def test_multiline_cypher_is_a_literal_block(dumped):
 
 
 def test_each_template_entry_is_its_template_parsed(dumped):
+    assert sorted(dumped["templates"]) == ["node_types", "relationships", "tools"]
     for section, template in dumped["templates"].items():
         assert template["entry"] is not None, section
         assert _ordered(yaml.safe_load(template["template"])) == _ordered(template["entry"]), section

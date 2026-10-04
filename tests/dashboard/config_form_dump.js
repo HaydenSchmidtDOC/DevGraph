@@ -2,7 +2,7 @@
    index.html, for the Python round-trip and drift tests
    (test_config_form_roundtrip.py, test_config_form_drift.py).
 
-   stdin: {"fixtures": [{"section": "tools" | "node_types", "mapping": {...}}]}
+   stdin: {"fixtures": [{"section": "tools" | "node_types" | "relationships", "mapping": {...}}]}
    stdout: {"fields", "limits", "templates": {section: {template, entry}},
             "results": [{"yaml", "form_yaml", "reason"}]}
    `yaml` serialises the mapping directly; `form_yaml` takes it through the
@@ -30,7 +30,7 @@ const results = fixtures.map(({ section, mapping }) => {
     reason: rep.ok ? null : rep.reason,
   };
 });
-const templates = Object.fromEntries(["tools", "node_types"].map(s =>
+const templates = Object.fromEntries(["tools", "node_types", "relationships"].map(s =>
   [s, { template: api.CONFIG_SECTIONS[s].template, entry: api.CONFIG_SECTIONS[s].entry }]));
 process.stdout.write(JSON.stringify({
   fields: api.CONFIG_FORM_FIELDS, limits: api.CONFIG_FORM_LIMITS, templates, results,

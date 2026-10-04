@@ -2,7 +2,8 @@
 
 The form is written by hand (spec G2b-3 §2.9), so nothing ties it to the
 models except this test: a field or enum value added to `CypherTool`,
-`ToolParameter`, `NodeTypeDecl`, `MetadataField` or `NodeSource` fails here
+`ToolParameter`, `NodeTypeDecl`, `MetadataField`, `NodeSource`,
+`RelationshipDecl` or `CustomProvider` fails here
 until the form models it (or such entries are made to open as YAML), and the
 patterns and limits behind the form's advisory hints must be the validators'
 own. The JS constants come straight out of index.html via config_form_dump.js.
@@ -18,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from devgraph.config import project_schema, project_tools
-from devgraph.config.project_schema import MetadataField, NodeSource, NodeTypeDecl
+from devgraph.config.project_schema import CustomProvider, MetadataField, NodeSource, NodeTypeDecl, RelationshipDecl
 from devgraph.config.project_tools import CypherTool, ToolParameter
 
 pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
@@ -47,6 +48,8 @@ def dumped() -> dict:
         ("node_type", NodeTypeDecl),
         ("metadata", MetadataField),
         ("source", NodeSource),
+        ("relationship", RelationshipDecl),
+        ("custom", CustomProvider),
     ],
 )
 def test_form_fields_are_the_model_properties(dumped, form_key, model):
@@ -60,6 +63,7 @@ def test_form_enums_are_the_model_enums(dumped):
     assert fields["metadata_types"] == list(project_schema.METADATA_TYPES)
     assert fields["filesystem_kinds"] == list(project_schema.FILESYSTEM_KINDS)
     assert fields["source_providers"] == list(project_schema.NODE_SOURCE_PROVIDERS)
+    assert fields["relationship_providers"] == list(project_schema.PROVIDER_KINDS)
 
 
 def test_form_limits_are_the_validators_limits(dumped):
@@ -67,6 +71,7 @@ def test_form_limits_are_the_validators_limits(dumped):
         "NAME_PATTERN": project_tools.NAME_PATTERN.pattern,
         "LABEL_PATTERN": project_schema.LABEL_PATTERN.pattern,
         "PROPERTY_NAME_PATTERN": project_schema.PROPERTY_NAME_PATTERN.pattern,
+        "RELATIONSHIP_TYPE_PATTERN": project_schema.RELATIONSHIP_TYPE_PATTERN.pattern,
         "COLOR_PATTERN": project_schema.COLOR_PATTERN,
         "MAX_DESCRIPTION_LENGTH": project_tools.MAX_DESCRIPTION_LENGTH,
         "MAX_ROWS_LIMIT": project_tools.MAX_ROWS_LIMIT,

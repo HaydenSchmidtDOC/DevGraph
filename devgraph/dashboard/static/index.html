@@ -434,7 +434,6 @@ table.dstable input[type="text"] { width: 100%; }
 .cfg-switch button[aria-pressed="true"] { border-color: var(--accent); color: var(--fg); }
 .cfg-switch button[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
 .cfg-form-notice { font-size: 12.5px; color: var(--warn); line-height: 1.5; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.cfg-form-notice.quiet { color: var(--meta); font-size: 12px; }
 #configFormHelp { font-size: 11.5px; color: var(--meta); }
 /* the scroller is a div: Chrome lets a scrolling fieldset's content overflow its parent */
 .cfg-modal-box > .cfg-form-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
@@ -2950,7 +2949,8 @@ const CONFIG_SECTIONS = {
     entry: { name: "my_tool", description: "What this tool answers, in one line an agent can choose it by.", cypher: "MATCH (n:Function {repo_id: $repo_id})\nRETURN n.name AS name\nLIMIT 25\n" } },
   node_types: { title: "Nodes", noun: "node type", template: "label: Runbook\nkey: [slug]\nmetadata:\n  - name: slug\n    type: string\n    required: true\n",
     entry: { label: "Runbook", key: ["slug"], metadata: [{ name: "slug", type: "string", required: true }] } },
-  relationships: { title: "Relationships", noun: "relationship", template: "# from and to must name node types that already exist: built-in, or declared in this file\ntype: DOCUMENTS\nprovider: custom\ncustom: {name: runbook_links}\nfrom: Runbook\nto: Service\n" },
+  relationships: { title: "Relationships", noun: "relationship", template: "# from and to must name node types that already exist: built-in, or declared in this file\ntype: DOCUMENTS\nprovider: custom\ncustom: {name: runbook_links}\nfrom: Runbook\nto: Service\n",
+    entry: { type: "DOCUMENTS", provider: "custom", custom: { name: "runbook_links" }, from: "Runbook", to: "Service" } },
 };
 /* the last /api/config payload; null until the pane is first opened */
 let configModel = null;
@@ -3280,10 +3280,7 @@ function renderConfigModal() {
   configShow("configEditorSwitch", edit.step === "edit" && !!sw);
   configShow("configFormHelp", edit.step === "edit" && form);
   const notice = edit.step === "edit" && !!sw && !form && !sw.available;
-  /* relationships simply have no form yet: a quiet note, not a problem with the entry */
-  const quiet = notice && sw.reason === CONFIG_FORM_REASONS.section;
-  document.getElementById("configFormNoticeText").textContent = !notice ? "" : quiet ? "Form: tools and node types only" : sw.reason;
-  document.getElementById("configFormNotice").classList.toggle("quiet", quiet);
+  document.getElementById("configFormNoticeText").textContent = notice ? sw.reason : "";
   configShow("configFormNotice", notice);
   configShow("configFormDiscard", notice && sw.reason === CONFIG_FORM_REASONS.handEdit);
   const formBtn = document.getElementById("configModeForm");
@@ -3806,15 +3803,18 @@ const CONFIG_FORM_FIELDS = {
   node_type: ["label", "key", "description", "color", "source", "metadata"],
   metadata: ["name", "type", "required", "description"],
   source: ["provider", "kind"],
+  relationship: ["type", "from", "to", "provider", "custom", "color"],
+  custom: ["name", "params"],
   parameter_types: ["string", "integer", "float", "boolean"],
   metadata_types: ["string", "integer", "float", "boolean"],
   filesystem_kinds: ["file", "folder"],
   source_providers: ["filesystem"],
+  relationship_providers: ["builtin", "custom", "filesystem"],
 };
 /* the validators' patterns (used as fullmatch) and limits, for advisory hints only */
 const CONFIG_FORM_LIMITS = {
   NAME_PATTERN: "[a-z][a-z0-9_]{0,63}", LABEL_PATTERN: "[A-Za-z][A-Za-z0-9_]{0,63}",
-  PROPERTY_NAME_PATTERN: "[a-z][a-z0-9_]{0,63}", COLOR_PATTERN: "^#[0-9a-fA-F]{6}$",
+  PROPERTY_NAME_PATTERN: "[a-z][a-z0-9_]{0,63}", RELATIONSHIP_TYPE_PATTERN: "[A-Z][A-Z0-9_]{0,63}", COLOR_PATTERN: "^#[0-9a-fA-F]{6}$",
   MAX_DESCRIPTION_LENGTH: 1024, MAX_ROWS_LIMIT: 1000, MAX_TIMEOUT_S: 60, DEFAULT_MAX_ROWS: 100, DEFAULT_TIMEOUT_S: 10,
 };
 const CONFIG_FORM_REASONS = {
@@ -3823,7 +3823,8 @@ const CONFIG_FORM_REASONS = {
   keyName: name => "This entry's key names `" + name + "`, which is not one of its metadata fields; the form can't show that. Edit it as YAML.",
   twice: name => "This entry declares metadata field `" + name + "` more than once; the form can't show that. Edit it as YAML.",
   value: "This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML.",
-  section: "The form covers tools and node types; edit relationships as YAML.",
+  fromList: "This entry's `from` can't be shown as comma-separated labels exactly (a label with a comma, surrounding spaces or a non-text value). Edit it as YAML.",
+  customProvider: "This entry has a `custom` block but its provider isn't custom; the form can't show that. Edit it as YAML.",
   handEdit: "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form.",
 };
 const configIsMap = v => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -3849,7 +3850,20 @@ const CONFIG_FORM_CHECKS = {
   metadata: { name: configFormLine, type: v => CONFIG_FORM_FIELDS.metadata_types.includes(v),
     required: v => typeof v === "boolean", description: v => v === null || configFormLine(v) },
   source: { provider: v => CONFIG_FORM_FIELDS.source_providers.includes(v), kind: v => CONFIG_FORM_FIELDS.filesystem_kinds.includes(v) },
+  relationship: { type: configFormLine, from: configFormLabels, to: configFormLine,
+    provider: v => CONFIG_FORM_FIELDS.relationship_providers.includes(v), custom: v => v === null || configIsMap(v),
+    color: v => v === null || configFormLine(v) },
+  custom: { name: configFormLine, params: v => configIsMap(v) && !Object.keys(v).length },
 };
+/* `from` as the form shows it: a string, or a list joined with ", " */
+const configFormFromText = v => typeof v === "string" ? v : v.join(", ");
+/* can `from` come back unchanged from its text, split on commas and trimmed?
+   A string or a non-empty list of single-line labels, each without a comma or
+   surrounding space; inside a list, also non-empty */
+function configFormLabels(v) {
+  const list = typeof v === "string" ? [v] : Array.isArray(v) && v.length ? v : null;
+  return !!list && list.every(l => configFormLine(l) && !l.includes(",") && l === l.trim() && (l !== "" || typeof v === "string"));
+}
 /* the path of the first field of `map` the form can't show, or null */
 function configFormBadField(map, kind, prefix) {
   for (const [k, v] of Object.entries(map)) {
@@ -3869,9 +3883,21 @@ function configFormBadRows(rows, kind, prefix) {
 }
 /* {ok: true, form} when the form can show `entry` exactly, else {ok: false, reason} */
 function configFormFromEntry(section, entry) {
-  if (section !== "tools" && section !== "node_types") return { ok: false, reason: CONFIG_FORM_REASONS.section };
   if (!configIsMap(entry)) return { ok: false, reason: CONFIG_FORM_REASONS.value };
   const t = configFormText;
+  if (section === "relationships") {
+    /* the walk follows the entry's key order, so the reason names its first problem */
+    for (const k of Object.keys(entry)) {
+      const bad = configFormBadField({ [k]: entry[k] }, "relationship", "") ||
+        (k === "custom" && configIsMap(entry.custom) ? configFormBadField(entry.custom, "custom", "custom.") : null);
+      if (bad) return { ok: false, reason: bad === "from" ? CONFIG_FORM_REASONS.fromList : CONFIG_FORM_REASONS.field(bad) };
+    }
+    if (configIsMap(entry.custom) && entry.provider !== "custom") return { ok: false, reason: CONFIG_FORM_REASONS.customProvider };
+    return { ok: true, form: {
+      type: t(entry.type), from: "from" in entry ? configFormFromText(entry.from) : "", to: t(entry.to),
+      provider: entry.provider || "builtin", custom: t(configIsMap(entry.custom) ? entry.custom.name : null), color: t(entry.color),
+      open: entry } };
+  }
   if (section === "tools") {
     const bad = configFormBadField(entry, "tool", "") || configFormBadRows(entry.parameters || [], "parameter", "parameters.");
     if (bad) return { ok: false, reason: CONFIG_FORM_REASONS.field(bad) };
@@ -3949,6 +3975,30 @@ function configEntryFromForm(section, form, order) {
     configFormPut(vals, open, "timeout_s", form.timeout_s, configFormInt);
     return configFormOrdered(vals, order, CONFIG_FORM_FIELDS.tool);
   }
+  if (section === "relationships") {
+    configFormPut(vals, open, "type", form.type, id);
+    if ("from" in open && configFormFromText(open.from) === form.from) vals.from = open.from;
+    else {
+      const labels = form.from.split(",").map(l => l.trim()).filter(Boolean);
+      /* one label stays a list when the entry wrote a list */
+      if (labels.length > 1 || (labels.length && Array.isArray(open.from))) vals.from = labels;
+      else if (labels.length) vals.from = labels[0];
+    }
+    configFormPut(vals, open, "to", form.to, id);
+    configFormPutChoice(vals, open, "provider", form.provider, "builtin");
+    /* the custom name is only written for the custom provider, so switching
+       away and back keeps it; an opened `custom: null` stays while no name is typed */
+    const block = configIsMap(open.custom) ? open.custom : null;
+    if ("custom" in open && open.custom === null && form.custom === "") vals.custom = null;
+    else if (form.provider === "custom" && (block || form.custom !== "")) {
+      const c = {};
+      configFormPut(c, block || {}, "name", form.custom, id);
+      if (block && "params" in block) c.params = block.params;
+      vals.custom = configFormOrdered(c, Object.keys(block || {}), CONFIG_FORM_FIELDS.custom);
+    }
+    configFormPut(vals, open, "color", form.color, id);
+    return configFormOrdered(vals, order, CONFIG_FORM_FIELDS.relationship);
+  }
   configFormPut(vals, open, "label", form.label, id);
   const key = form.metadata.filter(m => m.key).map(m => m.name);
   if (key.length || "key" in open) vals.key = key;
@@ -4018,13 +4068,30 @@ function configYamlLines(map, keys, indent) {
   return lines;
 }
 /* the YAML text for one entry mapping: keys in `order`, then model order */
+const CONFIG_FORM_SECTION_FIELDS = { tools: "tool", node_types: "node_type", relationships: "relationship" };
 function configEntryYaml(section, mapping, order) {
-  const model = section === "tools" ? CONFIG_FORM_FIELDS.tool : CONFIG_FORM_FIELDS.node_type;
+  const model = CONFIG_FORM_FIELDS[CONFIG_FORM_SECTION_FIELDS[section]];
   const keys = Object.keys(configFormOrdered(mapping, order || [], model.concat(Object.keys(mapping))));
   return configYamlLines(mapping, keys, "").join("\n") + "\n";
 }
-/* advisory hints [{field, text}]: cheap structural checks that never block Save */
-function configFormHints(section, form) {
+/* what relationship hints check labels and types against, from the loaded page
+   model (never a JS copy of the server's lists): the labels the repository has
+   (built-ins unless `extends: none`, plus this file's node types as last
+   loaded), the built-in relationship types, and the filesystem node types */
+function configFormContext(model, scope) {
+  const project = model.projects.find(p => p.repo_id === scope);
+  const schema = project ? project.schema : null;
+  const rows = schema ? schema.node_types : [];
+  const kind = k => (rows.find(r => configIsMap(r.entry) && configIsMap(r.entry.source) && r.entry.source.kind === k) || {}).label || null;
+  return {
+    labels: (schema && schema.extends === "none" ? [] : model.global.node_types.map(n => n.label)).concat(rows.map(r => r.label)),
+    relationship_types: model.global.relationship_types.map(r => r.type),
+    filesystem: { file: kind("file"), folder: kind("folder") },
+  };
+}
+/* advisory hints [{field, text}]: cheap structural checks that never block Save;
+   `ctx` (configFormContext) adds the relationship checks against the page model */
+function configFormHints(section, form, ctx) {
   const L = CONFIG_FORM_LIMITS, out = [];
   const hint = (field, text) => out.push({ field, text });
   const intIn = (text, max) => /^-?\d+$/.test(text) && Number(text) >= 1 && Number(text) <= max;
@@ -4058,13 +4125,54 @@ function configFormHints(section, form) {
     if (form.timeout_s && !intIn(form.timeout_s, L.MAX_TIMEOUT_S)) hint("timeout_s", "The timeout must be a whole number of seconds from 1 to " + L.MAX_TIMEOUT_S + ".");
     return out;
   }
+  const colorHint = () => {
+    if (form.color && !configFullMatch(L.COLOR_PATTERN, form.color)) hint("color", "A colour is written as #rrggbb.");
+  };
+  if (section === "relationships") {
+    const LABEL_RULE = "a label must start with a letter and use only letters, digits and underscores (at most 64 characters).";
+    const typeOk = configFullMatch(L.RELATIONSHIP_TYPE_PATTERN, form.type);
+    if (!typeOk) hint("type", "A relationship type is uppercase letters, digits and underscores, starting with a letter (at most 64 characters).");
+    if (ctx && typeOk) {
+      const builtin = ctx.relationship_types.includes(form.type);
+      if (form.provider === "builtin" && !builtin) {
+        hint("provider", "The builtin provider reuses one of DevGraph's relationship types; pick Custom or Filesystem to declare a new one.");
+      } else if (form.provider !== "builtin" && builtin) hint("provider", "`" + form.type + "` is built in: use the builtin provider to reuse it.");
+    }
+    if (form.provider === "custom") nameHint("custom", form.custom, L.PROPERTY_NAME_PATTERN, "A custom provider name");
+    const known = (field, label) => {
+      if (ctx && !ctx.labels.includes(label)) {
+        hint(field, "`" + label + "` isn't a node type this repository has (built-in, or declared in this file as last loaded).");
+      }
+    };
+    const from = form.from.split(",").map(l => l.trim()).filter(Boolean);
+    if (!from.length) hint("from", "Name at least one node label.");
+    from.forEach((label, i) => {
+      if (!configFullMatch(L.LABEL_PATTERN, label)) hint("from", "`" + label + "` isn't a valid label: " + LABEL_RULE);
+      else if (from.indexOf(label) < i) hint("from", "`" + label + "` is listed more than once.");
+      else known("from", label);
+    });
+    if (!form.to) hint("to", "A target label is required.");
+    else if (!configFullMatch(L.LABEL_PATTERN, form.to)) hint("to", "`" + form.to + "` isn't a valid label: " + LABEL_RULE);
+    else known("to", form.to);
+    if (ctx && form.provider === "filesystem") {
+      const fs = ctx.filesystem;
+      if (form.to !== fs.folder) {
+        hint("to", fs.folder ? "A filesystem relationship points to the filesystem folder node type (`" + fs.folder + "`)."
+          : "A filesystem relationship points to the filesystem folder node type, and this file declares none.");
+      }
+      from.filter((l, i) => from.indexOf(l) === i && l !== fs.file && l !== fs.folder)
+        .forEach(l => hint("from", "`" + l + "` is not a filesystem node type."));
+    }
+    colorHint();
+    return out;
+  }
   if (!form.label) hint("label", "A label is required.");
   else if (!configFullMatch(L.LABEL_PATTERN, form.label)) hint("label", "A label must start with a letter and use only letters, digits and underscores (at most 64 characters).");
   const key = form.metadata.filter(m => m.key);
   if (!key.length) hint("key", "Tick Key on at least one metadata field: it is what identifies each node.");
   form.metadata.forEach((m, i) => nameHint("metadata." + i + ".name", m.name, L.PROPERTY_NAME_PATTERN, "A field name"));
   dupes(form.metadata, "metadata.", "field");
-  if (form.color && !configFullMatch(L.COLOR_PATTERN, form.color)) hint("color", "A colour is written as #rrggbb.");
+  colorHint();
   if (form.source && !(key.length === 1 && key[0].name === "path" && key[0].type === "string")) {
     hint("source", "A filesystem node type's key must be exactly one string field named path.");
   }
@@ -4090,7 +4198,9 @@ let configFormSeq = 0;
 /* the rendered form: controls and hint boxes by field path, every focusable
    control, per-render updaters (legends, counts), and the first control */
 let configFormEls = { controls: {}, hints: {}, all: [], refresh: [], first: null };
-const configFormOp = edit => edit.op === "add" || edit.op === "replace";
+/* relationships have the pure form functions but no form view yet: until they
+   do, they open like a delete or copy, as YAML with no switch */
+const configFormOp = edit => (edit.op === "add" || edit.op === "replace") && edit.section !== "relationships";
 /* null when the op has no form (delete, copy); else configFormSwitch for the textarea's text */
 function configFormAvailability(edit) {
   if (!configFormOp(edit)) return null;
