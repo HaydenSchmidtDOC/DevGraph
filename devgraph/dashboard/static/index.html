@@ -508,6 +508,7 @@ table.dstable input[type="text"] { width: 100%; }
       <div class="card-head"><h3>Entities</h3><span class="wired-pill" id="entityLivePill" style="display:none">Live</span></div>
       <div class="entity-total">Total:<span class="n" id="entityTotal">—</span></div>
       <div class="count-list floating-list" id="entityCounts"></div>
+      <div class="count-note" id="schemaPendingHint" style="display:none">Schema change pending — rescan to apply it. Types shown are the last applied schema's.</div>
       <div class="count-note">Document nodes: <span id="docCount" style="color:var(--fg-2)">—</span></div>
       <div class="fc-subsection" data-od-id="god-nodes-section">
         <div class="fc-subhead">Top god nodes<span class="qmark" data-tip="Ranked by real degree centrality — size((n)--()) — a plain Cypher query, no plugin required. PageRank would need GDS.">?</span></div>
@@ -606,7 +607,7 @@ table.dstable input[type="text"] { width: 100%; }
   </div>
 </main>
 
-<footer class="pagefoot" data-od-id="footer"><span>DevGraph dashboard prototype · design phase</span><span>Node/relationship taxonomy from <code>graph/schema.py</code> · git history is the real <code>devgraph</code> log</span></footer>
+<footer class="pagefoot" data-od-id="footer"><span>DevGraph dashboard prototype · design phase</span><span>Node/relationship types from each repository's schema · git history is the real <code>devgraph</code> log</span></footer>
 
 <div class="settings-overlay" id="settingsOverlay" data-od-id="settings-overlay">
   <div class="settings-topbar"><button class="icon-btn" id="btnCloseSettings" title="Back to graph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button><h2>Settings</h2></div>
@@ -809,7 +810,11 @@ function themeSelect(select) {
 }
 ["repoSelect","layoutSelect","chartInterval","chartSpan"].forEach(id => themeSelect(document.getElementById(id)));
 
-const NODE_TYPES = [
+/* The built-in types as the dashboard has always drawn them: the order,
+   category and colour of each row a repository with no schema file shows.
+   NODE_TYPES/REL_TYPES start as copies and are rebuilt in place from each
+   repository's /schema (applySchemaTypes, below); these never change. */
+const BUILTIN_NODE_TYPES = [
   { id:"Repository",       cat:"repo",        count:1 },
   { id:"Service",          cat:"service",      count:2 },
   { id:"Module",           cat:"module",       count:84 },
@@ -827,7 +832,11 @@ const NODE_TYPES = [
   { id:"PullRequest",      cat:"phase3",       count:null },
   { id:"Issue",            cat:"phase3",       count:null },
 ];
-const REL_TYPES = ["CONTAINS","CALLS","IMPORTS","USES","RUNS","WRITES_TO","READS_FROM","IMPLEMENTS","DEPENDS_ON","EXTENDS","SATISFIES","DOCUMENTED_BY","DECIDED_BY","SUPERSEDES","MENTIONS","MODIFIES","RESOLVES","REFERENCES"];
+const BUILTIN_REL_TYPES = ["CONTAINS","CALLS","IMPORTS","USES","RUNS","WRITES_TO","READS_FROM","IMPLEMENTS","DEPENDS_ON","EXTENDS","SATISFIES","DOCUMENTED_BY","DECIDED_BY","SUPERSEDES","MENTIONS","MODIFIES","RESOLVES","REFERENCES"];
+const NODE_TYPES = BUILTIN_NODE_TYPES.map(t => ({ ...t }));
+const REL_TYPES = [...BUILTIN_REL_TYPES];
+/* project relationship type -> its display colour, from the same payload */
+const REL_COLORS = {};
 
 /* plain literal hex colors, resolved once in JS — no CSS custom-property or
    color-mix() indirection at all, since canvas fillStyle can't parse an
@@ -926,34 +935,92 @@ document.getElementById("valRenderThreshold").textContent = state.renderThreshol
 document.getElementById("ctlRenderThreshold").value = state.renderThreshold;
 
 const entityCounts = document.getElementById("entityCounts");
+const relTypes = document.getElementById("relTypes");
 let entityTotal = 0;
-NODE_TYPES.forEach(t => {
-  if (t.count !== null) entityTotal += t.count;
-  const row = document.createElement("div");
-  row.className = "count-row";
-  row.dataset.cat = t.cat;
-  row.style.setProperty("--dotcolor", CAT_COLORS[t.cat]);
-  row.innerHTML = `<span class="type-dot" style="background:${CAT_COLORS[t.cat]}"></span><span class="name">${t.id}</span><span class="val ${t.count===null?'na':''}">${t.count===null ? "—" : t.count.toLocaleString()}</span>`;
-  row.addEventListener("mouseenter", () => highlightCat(t.cat, true));
-  row.addEventListener("mouseleave", () => highlightCat(t.cat, false));
-  row.addEventListener("click", () => { state.isolatedEntity = (state.isolatedEntity === t.cat) ? null : t.cat; isolateChanged(); });
-  entityCounts.appendChild(row);
-});
+NODE_TYPES.forEach(t => { if (t.count !== null) entityTotal += t.count; });
 document.getElementById("entityTotal").textContent = entityTotal.toLocaleString();
 document.getElementById("ctlNodeCeiling").max = entityTotal;
 document.getElementById("ctlNodeCeiling").value = entityTotal;
 document.getElementById("valNodeCeiling").textContent = entityTotal;
 state.nodeCeiling = entityTotal;
 
-const relTypes = document.getElementById("relTypes");
-REL_TYPES.forEach(r => {
-  const chip = document.createElement("span");
-  chip.className = "rel-chip"; chip.textContent = r; chip.dataset.rel = r;
-  chip.addEventListener("mouseenter", () => highlightRel(r, true));
-  chip.addEventListener("mouseleave", () => highlightRel(r, false));
-  chip.addEventListener("click", () => { state.isolatedRel = (state.isolatedRel === r) ? null : r; isolateChanged(); });
-  relTypes.appendChild(chip);
-});
+/* The label a canvas node stands for. Live nodes carry it (mapGraphResultToElements);
+   the demo graph's nodes only carry a built-in category, each of which it
+   uses for exactly one label. */
+function nodeType(n) {
+  return n.data("ntype") || BUILTIN_NODE_TYPES.find(t => t.cat === n.data("cat"))?.id;
+}
+/* (Re)builds the Entities rows and Relationships chips from NODE_TYPES/REL_TYPES.
+   Rows are keyed by label (data-label): several built-ins share a category,
+   so a category can't say which one was clicked. */
+function renderTypeLists() {
+  entityCounts.replaceChildren();
+  NODE_TYPES.forEach(t => {
+    const row = document.createElement("div");
+    row.className = "count-row";
+    row.dataset.cat = t.cat;
+    row.dataset.label = t.id;
+    row.style.setProperty("--dotcolor", catColor(t.cat));
+    row.innerHTML = `<span class="type-dot"></span><span class="name">${escapeHtmlVal(t.id)}</span><span class="val ${t.count===null?'na':''}">${t.count===null ? "—" : t.count.toLocaleString()}</span>`;
+    row.querySelector(".type-dot").style.background = catColor(t.cat);
+    row.addEventListener("mouseenter", () => highlightType(t.id, true));
+    row.addEventListener("mouseleave", () => highlightType(t.id, false));
+    row.addEventListener("click", () => { state.isolatedEntity = (state.isolatedEntity === t.id) ? null : t.id; isolateChanged(); });
+    entityCounts.appendChild(row);
+  });
+  relTypes.replaceChildren();
+  REL_TYPES.forEach(r => {
+    const chip = document.createElement("span");
+    chip.className = "rel-chip"; chip.textContent = r; chip.dataset.rel = r;
+    if (REL_COLORS[r]) chip.style.borderColor = REL_COLORS[r];
+    chip.addEventListener("mouseenter", () => highlightRel(r, true));
+    chip.addEventListener("mouseleave", () => highlightRel(r, false));
+    chip.addEventListener("click", () => { state.isolatedRel = (state.isolatedRel === r) ? null : r; isolateChanged(); });
+    relTypes.appendChild(chip);
+  });
+  refreshIsolateUI();
+}
+renderTypeLists();
+/* Takes a repository's /schema payload (node_types, relationship_types,
+   schema_state) and rebuilds the type lists from it. Built-ins keep their
+   category and colour from BUILTIN_NODE_TYPES/CAT_COLORS -- the payload's own
+   order and set of built-ins is not used, so a repo with no schema file
+   renders exactly the rows above. Each project label gets its own category,
+   "user:" + label, coloured from the payload, so it isolates, highlights and
+   colours on its own. Nothing of the previous repo's survives the swap. */
+function applySchemaTypes(schema) {
+  const counts = Object.fromEntries((schema.node_types || []).map(t => [t.label, t.count]));
+  Object.keys(CAT_COLORS).filter(k => k.startsWith("user:")).forEach(k => { delete CAT_COLORS[k]; delete brightCache[k]; });
+  Object.keys(REL_COLORS).forEach(k => delete REL_COLORS[k]);
+  NODE_TYPES.length = 0;
+  BUILTIN_NODE_TYPES.forEach(t => NODE_TYPES.push({ ...t, count: counts[t.id] ?? t.count }));
+  (schema.node_types || []).filter(t => t.origin === "project").forEach(t => {
+    const cat = "user:" + t.label;
+    CAT_COLORS[cat] = t.color;
+    NODE_TYPES.push({ id: t.label, cat, count: t.count ?? null });
+  });
+  REL_TYPES.length = 0;
+  REL_TYPES.push(...BUILTIN_REL_TYPES);
+  (schema.relationship_types || []).filter(r => r.origin === "project").forEach(r => {
+    REL_TYPES.push(r.type);
+    if (r.color) REL_COLORS[r.type] = r.color;
+  });
+  if (state.isolatedEntity && !NODE_TYPES.some(t => t.id === state.isolatedEntity)) state.isolatedEntity = null;
+  if (state.isolatedRel && !REL_TYPES.includes(state.isolatedRel)) state.isolatedRel = null;
+  renderTypeLists();
+  const hint = document.getElementById("schemaPendingHint");
+  hint.style.display = schema.schema_state === "pending" ? "" : "none";
+  cy.style().update(); // nodes already on the canvas re-read catColor
+}
+/* Fetches the selected repository's types (the union of every repo's for
+   __all__). A failed read leaves the current lists as they are. */
+async function loadSchemaTypes(repo) {
+  try {
+    const resp = await fetch(`/api/repos/${encodeURIComponent(repo)}/schema`);
+    if (!resp.ok) return;
+    applySchemaTypes(await resp.json());
+  } catch (e) { /* network hiccup -- the next repo switch or reconnect retries */ }
+}
 /* isolating a type is a state change like any other -- goes through the
    same refreshGraph() the repo dropdown/ceiling sliders use, so the box,
    graph, and counts all move together. Falls back to the old client-only
@@ -965,8 +1032,8 @@ function isolateChanged() {
 }
 function refreshIsolateUI() {
   entityCounts.querySelectorAll(".count-row").forEach(row => {
-    row.classList.toggle("isolated", state.isolatedEntity === row.dataset.cat);
-    row.classList.toggle("dimmed", state.isolatedEntity !== null && state.isolatedEntity !== row.dataset.cat);
+    row.classList.toggle("isolated", state.isolatedEntity === row.dataset.label);
+    row.classList.toggle("dimmed", state.isolatedEntity !== null && state.isolatedEntity !== row.dataset.label);
   });
   relTypes.querySelectorAll(".rel-chip").forEach(chip => {
     chip.classList.toggle("isolated", state.isolatedRel === chip.dataset.rel);
@@ -2057,8 +2124,8 @@ cy.on("render", renderGlow);
 /* Deliberately highlights without labelling: a type can cover most of the
    graph, so naming all of it at once is the mass of text the empty base
    label style exists to avoid. Names stay a single-node, on-demand thing. */
-function highlightCat(cat, on) {
-  cy.nodes(`[cat = "${cat}"]`).forEach(n => { n.toggleClass("hover-hl", on); setNodeGlowActive(n.id(), on || (n.data("glow")||0) > 0.02); });
+function highlightType(label, on) {
+  cy.nodes().filter(n => nodeType(n) === label).forEach(n => { n.toggleClass("hover-hl", on); setNodeGlowActive(n.id(), on || (n.data("glow")||0) > 0.02); });
 }
 function highlightRel(rel, on) { cy.edges(`[label = "${rel}"]`).toggleClass("hover-hl", on); }
 
@@ -2110,7 +2177,7 @@ function applyState(skipQueryBuild, runMode) {
      asked to see and no reason to keep paying its draw cost every frame. */
   let nSeen = 0;
   cy.nodes().forEach(n => {
-    let on = !state.isolatedEntity || n.data("cat") === state.isolatedEntity;
+    let on = !state.isolatedEntity || nodeType(n) === state.isolatedEntity;
     if (on && relNodeIds) on = relNodeIds.has(n.id());
     if (on) nSeen++;
     n.toggleClass("excluded", !on);
@@ -2123,7 +2190,7 @@ function applyState(skipQueryBuild, runMode) {
     // An isolated entity should glow along with its own relationships, not
     // every edge in the graph -- an edge only qualifies if it actually
     // touches an isolated-type node (its far endpoint doesn't have to).
-    const entityOn = !state.isolatedEntity || e.source().data("cat") === state.isolatedEntity || e.target().data("cat") === state.isolatedEntity;
+    const entityOn = !state.isolatedEntity || nodeType(e.source()) === state.isolatedEntity || nodeType(e.target()) === state.isolatedEntity;
     const on = relOn && entityOn;
     if (on) rSeen++;
     e.toggleClass("excluded", !on);
@@ -2257,7 +2324,7 @@ function mapGraphResultToElements(results) {
       // `key` is carried on the element so the inspector can look the node
       // back up by identity rather than by an internal id -- see
       // showDetailsCard. Null for a node the server couldn't key.
-      nodeMap.set(stableId, { data: { id: stableId, key: n.key ?? null, label: name, cat } });
+      nodeMap.set(stableId, { data: { id: stableId, key: n.key ?? null, label: name, cat, ntype: realLabel } });
     });
     (r.graph?.relationships || []).forEach(rel => {
       const source = idByInternalId.get(rel.startNode), target = idByInternalId.get(rel.endNode);
@@ -2351,9 +2418,9 @@ function escapeCypherStr(s) { return String(s).replace(/["\\]/g, "\\$&"); }
    no separate edge-side check needed. */
 function currentStateQuery() {
   const repo = document.getElementById("repoSelect").value;
-  const isolatedEntityId = state.isolatedEntity ? NODE_TYPES.find(t => t.cat === state.isolatedEntity)?.id : null;
+  const isolatedEntityId = state.isolatedEntity;
   const nodeWhere = [repo === "__all__" ? "true" : `n.repo_id = "${escapeCypherStr(repo)}"`];
-  if (isolatedEntityId) nodeWhere.push(`labels(n)[0] = "${isolatedEntityId}"`);
+  if (isolatedEntityId) nodeWhere.push(`labels(n)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
   // A ceiling maxed out (the default) means "no cap" -- leave its LIMIT out
   // of the query entirely rather than spelling out the current real total,
   // so the query stays correct as the real total changes instead of
@@ -2607,6 +2674,7 @@ async function bootConnect() {
     neo4jStatus.style.color = "var(--success)";
     legendStatus.textContent = "Neo4j connected (via dashboard proxy)";
     await populateRealRepos(false);
+    await loadSchemaTypes(document.getElementById("repoSelect").value);
     // First load is always a structural (capped-to-repo) load, same as any
     // other repo switch -- also resyncs the node-ceiling slider/total
     // against real counts before it builds the query, so the first fetch
@@ -2750,13 +2818,15 @@ document.getElementById("graphSearch").addEventListener("input", e => {
   if (matches.length) { cy.nodes().addClass("faded"); matches.removeClass("faded").addClass("highlighted show-label"); cy.animate({ fit: { eles: matches, padding: 80 } }, { duration: 300 }); }
 });
 document.getElementById("pullTab").addEventListener("click", () => document.getElementById("controlFlyout").classList.toggle("open"));
-document.getElementById("repoSelect").addEventListener("change", async e => {
+async function onRepoSelectChange(e) {
   const v = e.target.value;
   localStorage.setItem(SELECTED_REPO_KEY, v);
+  if (neo4jConnected) await loadSchemaTypes(v); // before the graph fetch, so a type the new repo lacks is no longer isolated
   const loaded = await refreshGraph("full", true, true); // switching repos is a deliberate scope change, not an incremental update -- always caps the displayed set to it, even in highlight mode
   if (!loaded && !neo4jConnected) buildQueryFromState();
   loadGitHistory(v);
-});
+}
+document.getElementById("repoSelect").addEventListener("change", onRepoSelectChange);
 
 /* ── settings overlay ──────────────────────────────────────────── */
 document.getElementById("btnOpenSettings").addEventListener("click", () => document.getElementById("settingsOverlay").classList.add("open"));
@@ -2856,12 +2926,16 @@ document.getElementById("btnCopyNeoconf").addEventListener("click", async () => 
 renderNeoconfSnippet();
 
 /* ── autocomplete for the cypher box ──────────────────────────────── */
-const AC_CANDIDATES = [
+/* a function, not a constant: the label/relationship half follows the
+   selected repository's schema */
+function acCandidates() {
+  return [
   ...NODE_TYPES.map(t => ({ text: t.id, kind: "label" })),
   ...REL_TYPES.map(r => ({ text: r, kind: "rel" })),
   ...["MATCH","OPTIONAL MATCH","WHERE","RETURN","LIMIT","WITH","ORDER BY","AND","OR","AS","COUNT","DISTINCT","CONTAINS"].map(k => ({ text: k, kind: "keyword" })),
   ...["repo_id","name","type"].map(p => ({ text: p, kind: "prop" })),
-];
+  ];
+}
 const ac = document.getElementById("autocomplete");
 let acItems = [], acIndex = -1;
 function currentWordRange() {
@@ -2886,7 +2960,7 @@ function selectAC(i) {
 cypherInput.addEventListener("input", () => {
   const { word } = currentWordRange();
   if (word.length < 1) { acItems = []; acIndex = -1; renderAC(); return; }
-  acItems = AC_CANDIDATES.filter(c => c.text.toLowerCase().startsWith(word.toLowerCase())).slice(0, 8);
+  acItems = acCandidates().filter(c => c.text.toLowerCase().startsWith(word.toLowerCase())).slice(0, 8);
   acIndex = acItems.length ? 0 : -1;
   renderAC();
 });
@@ -3435,10 +3509,10 @@ async function loadTopologyCounts() {
   const relPill = document.getElementById("relSamplePill");
   if (!neo4jConnected) { entityPill.style.display = "none"; relPill.textContent = "Not wired"; relPill.className = "sample-pill"; return; }
   const repo = document.getElementById("repoSelect").value;
-  const isolatedEntityId = state.isolatedEntity ? NODE_TYPES.find(t => t.cat === state.isolatedEntity)?.id : null;
+  const isolatedEntityId = state.isolatedEntity;
   const nodeFilters = [];
   if (repo !== "__all__") nodeFilters.push(`n.repo_id = "${escapeCypherStr(repo)}"`);
-  if (isolatedEntityId) nodeFilters.push(`labels(n)[0] = "${isolatedEntityId}"`);
+  if (isolatedEntityId) nodeFilters.push(`labels(n)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
   const where = nodeFilters.length ? `WHERE ${nodeFilters.join(" AND ")} ` : "";
   try {
     /* filtered by whatever's currently isolated -- these panels describe
@@ -3448,7 +3522,7 @@ async function loadTopologyCounts() {
     if (!labelJson.errors?.length) {
       const counts = Object.fromEntries(labelJson.results[0].data.map(d => [d.row[0], d.row[1]]));
       NODE_TYPES.forEach(t => {
-        const row = entityCounts.querySelector(`.count-row[data-cat="${t.cat}"] .val`);
+        const row = entityCounts.querySelector(`.count-row[data-label="${t.id}"] .val`);
         if (!row) return;
         const n = counts[t.id];
         if (n !== undefined) { row.textContent = n.toLocaleString(); row.classList.remove("na"); }
@@ -3477,7 +3551,7 @@ async function loadTopologyCounts() {
     }
     const relFilters = [];
     if (repo !== "__all__") relFilters.push(`a.repo_id = "${escapeCypherStr(repo)}"`);
-    if (isolatedEntityId) relFilters.push(`labels(a)[0] = "${isolatedEntityId}"`);
+    if (isolatedEntityId) relFilters.push(`labels(a)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
     const relWhere = relFilters.length ? `WHERE ${relFilters.join(" AND ")} ` : "";
     const relJson = await runCypher(`MATCH (a)-[r]->() ${relWhere}RETURN type(r) AS t, count(*) AS n`);
     if (!relJson.errors?.length) {
