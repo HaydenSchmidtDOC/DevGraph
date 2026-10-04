@@ -4480,6 +4480,8 @@ function renderConfigForm(edit) {
       delete configFormEls.hints.custom;
       holder.replaceChildren();
       custom = null;
+      /* empty, the holder would still take a flex gap */
+      holder.style.display = f.provider === "custom" ? "" : "none";
       if (f.provider !== "custom") return;
       custom = configFormText_("input", f.custom, v => { f.custom = v; });
       configFormField(holder, "custom", "Custom provider name", custom, "Recorded as data; DevGraph does not run it.");

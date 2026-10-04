@@ -2291,10 +2291,13 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     nameGone &&
     formCtl("Provider") === prov && focused === prov && !formCtl("Custom provider name") &&
     !find(els.configForm, e => e.tagName === "LABEL" && e.textContent === "Custom provider name").length, focused && focused.tagName);
+  const emptyHolders = els.configForm.children.filter(e => e.tagName === "DIV" && !e.children.length && e.style.display !== "none");
+  check("...and the empty holder is out of the layout (no doubled flex gap)", !emptyHolders.length, String(emptyHolders.length));
   check("...and the YAML drops the custom block", /^provider: builtin$/m.test(els.configYaml.value) && !/custom:|owners/.test(els.configYaml.value),
     els.configYaml.value);
   prov.value = "custom";
   await prov.fire("change");
+  check("...the holder is shown again for the custom name", !els.configForm.children.some(e => e.tagName === "DIV" && e.style.display === "none" && !e.children.length), "");
   check("switching back shows the custom name again with its value, focus still on the select",
     formCtl("Custom provider name") && formCtl("Custom provider name").value === "owners" && focused === prov &&
     /custom:\n  name: owners\n  params: \{\}/.test(els.configYaml.value), els.configYaml.value);
