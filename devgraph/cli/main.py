@@ -157,6 +157,7 @@ def list_repos() -> None:
             table.add_column("Path", style="magenta")
             table.add_column("Active", style="green")
             table.add_column("Watch", style="blue")
+            table.add_column("Config", style="blue")
             table.add_column("Last Indexed", style="yellow")
 
             # Load repo issues for display
@@ -179,6 +180,7 @@ def list_repos() -> None:
                     str(repo.path),
                     active_str,
                     watch_str,
+                    "[OK]" if repo.project_config_enabled else "[X]",
                     last_indexed,
                 )
 
@@ -649,18 +651,33 @@ def _project_schema_findings(repos: list[Any]) -> list[dict[str, Any]]:
         project_schema_path,
         resolve_declaration,
     )
+    from devgraph.config.project_switch import project_config_enabled
 
     findings: list[dict[str, Any]] = []
     # Case-folded label -> the (repo_id, label, key) triples declaring it.
     declared: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {}
 
     for repo in sorted(repos, key=lambda r: r.repo_id):
+        if not project_config_enabled(repo.path):
+            findings.append(
+                {
+                    "repo_id": repo.repo_id,
+                    "status": "disabled",
+                    "detail": (
+                        "project config disabled: devgraph.schema.yaml and devgraph.tools.yaml are "
+                        "ignored (`devgraph config enable <repo_id>` to turn them on)"
+                    ),
+                    "failed": False,
+                }
+            )
         try:
             # `load_project_schema` returns None if and only if the file is
             # absent, and raises for every unreadable/malformed/invalid one,
             # so absent-vs-invalid is the loader's own distinction, not a
             # second `exists()` check that could disagree with it.
-            declaration = load_project_schema(repo.path)
+            # The file is checked even while the repository's project config
+            # is switched off; the switch is reported separately above.
+            declaration = load_project_schema(repo.path, respect_switch=False)
             if declaration is None:
                 findings.append(
                     {
@@ -754,6 +771,40 @@ def _project_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
     return findings
 
 
+def _schema_drift_findings(engine: Any, repos: list[Any]) -> list[dict[str, Any]]:
+    """Per active repository: is the graph built with the schema the file hashes to?
+
+    `applied`, `pending` (a warning, fixed by the next rescan) or `never
+    applied` (a schema exists but no rescan recorded one). Mirrors
+    `schema_pending`: no recorded state and no schema is in sync.
+    """
+    from devgraph.config.project_schema import ABSENT_SCHEMA_HASH, schema_file_hash
+
+    findings: list[dict[str, Any]] = []
+    for repo in sorted(repos, key=lambda r: r.repo_id):
+        if not repo.active:
+            continue
+        current = schema_file_hash(repo.path)
+        try:
+            recorded = engine.read_applied_schema(repo.repo_id)
+        except Exception as exc:
+            findings.append({"repo_id": repo.repo_id, "status": "error", "detail": f"could not read the applied schema: {exc}"})
+            continue
+        if recorded is None and current == ABSENT_SCHEMA_HASH:
+            status, detail = "applied", "no schema; graph is in sync"
+        elif recorded is None:
+            status, detail = "never applied", f"a schema exists but no rescan has applied one; run `devgraph rescan {repo.repo_id} --now`"
+        elif current == recorded["hash"]:
+            status, detail = "applied", "graph is in sync with the schema file"
+        else:
+            status, detail = "pending", (
+                f"the schema changed since the graph was built; applied at the next rescan, "
+                f"or `devgraph rescan {repo.repo_id} --now`"
+            )
+        findings.append({"repo_id": repo.repo_id, "status": status, "detail": detail})
+    return findings
+
+
 @app.command()
 def doctor() -> None:
     """Run a heavier environment-drift diagnostic than `status`.
@@ -811,9 +862,11 @@ def doctor() -> None:
 
     # 4 & 5. Neo4j reachability + schema
     console.print("[bold]Neo4j[/bold]")
+    neo4j_reachable = False
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
     try:
         engine.verify_connectivity()
+        neo4j_reachable = True
         console.print(f"  [green][OK] Reachable[/green] at {settings.neo4j_uri}")
         try:
             engine.init_schema()
@@ -871,7 +924,9 @@ def doctor() -> None:
         console.print("  [green][OK][/green] no registered repositories to check")
     for finding in schema_findings:
         subject = finding["repo_id"] or "conflict"
-        if finding["failed"]:
+        if finding["status"] == "disabled":
+            console.print(f"  [yellow][!] {escape(str(subject))}:[/yellow] {escape(finding['detail'])}")
+        elif finding["failed"]:
             console.print(f"  [red][X] {escape(str(subject))}:[/red] {escape(finding['detail'])}")
             any_failed = True
         else:
@@ -890,6 +945,25 @@ def doctor() -> None:
             console.print(f"  [yellow][!] {subject}:[/yellow] {escape(finding['detail'])}")
         else:
             console.print(f"  [green][OK][/green] {subject}: {escape(finding['detail'])}")
+
+    # 7c. Schema drift: needs the graph, so it is skipped when Neo4j is down.
+    console.print("[bold]Schema drift[/bold]")
+    if not neo4j_reachable:
+        console.print("  [yellow]skipped[/yellow]: Neo4j is not reachable")
+    else:
+        drift_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+        try:
+            drift = _schema_drift_findings(drift_engine, registered_repos)
+        finally:
+            drift_engine.close()
+        if not drift:
+            console.print("  [green][OK][/green] no active repositories to check")
+        for finding in drift:
+            subject = escape(str(finding["repo_id"]))
+            if finding["status"] == "applied":
+                console.print(f"  [green][OK][/green] {subject}: applied ({escape(finding['detail'])})")
+            else:
+                console.print(f"  [yellow][!] {subject}:[/yellow] {finding['status']}: {escape(finding['detail'])}")
 
     # 8. Tray/watcher liveness
     console.print("[bold]Live Watcher[/bold]")
@@ -1433,7 +1507,7 @@ class _ConfigGroup(TyperGroup):
 config_app = typer.Typer(
     cls=_ConfigGroup,
     invoke_without_command=True,
-    help="View DevGraph settings, or inspect and scaffold a repository's devgraph.schema.yaml.",
+    help="View DevGraph settings, inspect and scaffold a repository's devgraph.schema.yaml, or enable/disable a repository's project config.",
 )
 app.add_typer(config_app, name="config")
 
@@ -1541,6 +1615,42 @@ def config_eject(
     console.print("  Edit it, then run `devgraph config validate` and `devgraph rescan <repo_id>`.")
 
 
+def _set_project_config(repo_id: str, enabled: bool) -> None:
+    word = "enabled" if enabled else "disabled"
+    registry = _get_registry()
+    try:
+        repo = registry.get(repo_id)
+        if repo is None:
+            console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
+            raise typer.Exit(code=1)
+        if repo.project_config_enabled == enabled:
+            console.print(f"Project config for {escape(repo_id)} is already {word}.")
+            return
+        registry.set_project_config_enabled(repo_id, enabled)
+    finally:
+        registry.close()
+    console.print(f"[green][OK][/green] Project config {word} for {escape(repo_id)}.")
+    console.print(
+        f"  schema: applied at the next rescan (`devgraph rescan {escape(repo_id)} --now` to apply now)"
+    )
+    console.print("  project tools: picked up by running MCP sessions within 2 s")
+
+
+@config_app.command("enable")
+def config_enable(repo_id: str = typer.Argument(..., help="Registered repo id.")) -> None:
+    """Use the repository's devgraph.schema.yaml and devgraph.tools.yaml (the default)."""
+    _set_project_config(repo_id, True)
+
+
+@config_app.command("disable")
+def config_disable(repo_id: str = typer.Argument(..., help="Registered repo id.")) -> None:
+    """Ignore the repository's devgraph.schema.yaml and devgraph.tools.yaml, as if they did not exist.
+
+    The files stay on disk. Use it to compare behaviour with and without them.
+    """
+    _set_project_config(repo_id, False)
+
+
 def _schema_report(repo_root: Path | None) -> dict[str, Any]:
     """The effective schema and where each entry comes from.
 
@@ -1553,8 +1663,10 @@ def _schema_report(repo_root: Path | None) -> dict[str, Any]:
         project_schema_path,
         resolve_declaration,
     )
+    from devgraph.config.project_switch import project_config_enabled
     from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
 
+    enabled = True if repo_root is None else project_config_enabled(repo_root)
     declaration = None if repo_root is None else load_project_schema(repo_root)
     origin = None if repo_root is None else str(project_schema_path(repo_root))
     effective = resolve_declaration(declaration, origin=origin or SCHEMA_FILENAME)
@@ -1576,10 +1688,13 @@ def _schema_report(repo_root: Path | None) -> dict[str, Any]:
     ]
     if repo_root is None:
         status = "global"
+    elif not enabled:
+        status = "disabled"
     else:
         status = "absent" if declaration is None else "valid"
     return {
         "repo": None if repo_root is None else str(repo_root),
+        "project_config": None if repo_root is None else ("enabled" if enabled else "disabled"),
         "schema_file": origin if declaration is not None else None,
         "status": status,
         "extends": effective.extends,
@@ -1592,6 +1707,10 @@ def _tools_report(repo_root: Path) -> dict[str, Any]:
     """A repository's project tools for `config show`. Raises ProjectToolsError."""
     from devgraph.config.project_tools import load_project_tools, tools_file_path
 
+    from devgraph.config.project_switch import project_config_enabled
+
+    if not project_config_enabled(repo_root):
+        return {"status": "disabled", "tools_file": None, "tools": []}
     declared = load_project_tools(repo_root)
     if declared is None:
         return {"status": "absent", "tools_file": None, "tools": []}
@@ -1653,6 +1772,11 @@ def config_show(
 
     if report["status"] == "global":
         console.print("Built-in schema (no global config file yet)")
+    elif report["status"] == "disabled":
+        console.print(
+            f"{escape(report['repo'])}: project config disabled — built-in schema "
+            f"(`devgraph config enable <repo_id>` to use {SCHEMA_FILENAME})"
+        )
     elif report["status"] == "absent":
         console.print(f"{escape(report['repo'])}: no {SCHEMA_FILENAME} — built-in schema")
     else:
@@ -1678,7 +1802,9 @@ def config_show(
 
     tools = report["tools"]
     if tools is not None:
-        if tools["status"] == "absent":
+        if tools["status"] == "disabled":
+            console.print("Project config disabled — no project tools")
+        elif tools["status"] == "absent":
             console.print(f"No {TOOLS_FILENAME} — no project tools")
         else:
             table = Table(title=f"Project tools ({escape(tools['tools_file'])})")
@@ -1718,7 +1844,7 @@ def config_validate(
 
     findings = _project_schema_findings(repos) + _project_tools_findings(repos)
     for finding in findings:
-        colour = "red" if finding["failed"] else ("yellow" if finding["status"] == "warning" else "green")
+        colour = "red" if finding["failed"] else ("yellow" if finding["status"] in ("warning", "disabled") else "green")
         subject = finding["repo_id"] or "cross-repository"
         console.print(f"[{colour}]{finding['status']}[/{colour}] {escape(str(subject))}: {escape(finding['detail'])}")
     if any(finding["failed"] for finding in findings):
