@@ -29,13 +29,22 @@ const configSrc = grab(/^\/\* ── Config page/m, "/* ── end Config page �
 
 // --- a very small DOM ----------------------------------------------------
 const allEls = [];
+const docRoot = {};
+const inTree = (root, e) => { for (; e; e = e.parentNode) if (e === root) return true; return false; };
 const mkEl = tag => {
   const classes = new Set();
   const listeners = {};
   const attrs = {};
   const el = {
     tagName: tag.toUpperCase(), children: [], dataset: {}, style: { display: "" }, title: "", type: "",
-    value: "", disabled: false, readOnly: false, parentNode: null, _text: "", _html: "",
+    value: "", readOnly: false, parentNode: null, _text: "", _html: "",
+    /* as in a browser: disabling the focused control (or its fieldset) drops focus to <body> */
+    get disabled() { return el._dis === true; },
+    set disabled(v) {
+      el._dis = !!v;
+      if (v && focused && (focused === el || (el.tagName === "FIELDSET" && inTree(el, focused)))) focused = null;
+    },
+    get isConnected() { let e = el; while (e.parentNode) e = e.parentNode; return e === docRoot || Object.values(els).includes(e); },
     get textContent() { return el._text + el.children.map(c => c.textContent).join(""); },
     set textContent(v) { el._text = String(v); el.children = []; },
     get innerHTML() { return el._html; },
@@ -47,8 +56,8 @@ const mkEl = tag => {
     get className() { return [...classes].join(" "); },
     set className(v) { classes.clear(); String(v).split(" ").filter(Boolean).forEach(c => classes.add(c)); },
     appendChild(c) { c.parentNode = el; el.children.push(c); return c; },
-    replaceChildren(...cs) { el.children = []; el._text = ""; cs.forEach(c => el.appendChild(c)); },
-    replaceWith(n) { const p = el.parentNode; p.children[p.children.indexOf(el)] = n; n.parentNode = p; },
+    replaceChildren(...cs) { el.children.forEach(c => { c.parentNode = null; }); el.children = []; el._text = ""; cs.forEach(c => el.appendChild(c)); },
+    replaceWith(n) { const p = el.parentNode; p.children[p.children.indexOf(el)] = n; n.parentNode = p; el.parentNode = null; },
     addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
     async fire(type, detail = 1) {
       const ev = { target: el, detail, preventDefault() {} };
@@ -786,8 +795,8 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     };
     check("Add relationship opens the template in the form, From and To carrying its guidance as help text",
       shown(els.configForm) && !shown(els.configYaml) && els.configYaml.value === api.CONFIG_SECTIONS.relationships.template &&
-      helpOf("From") === "One or more node labels, separated by commas. Each must be a built-in node type or one declared in this file." &&
-      helpOf("To") === "One node label: built-in, or declared in this file.", JSON.stringify([els.configForm.style.display, helpOf("From"), helpOf("To")]));
+      helpOf("From") === "One or more node labels, separated by commas. Each must be a node type declared in this file (or a built-in one when the file uses `extends: default`)." &&
+      helpOf("To") === "One node label: a node type declared in this file (or a built-in one when the file uses `extends: default`).", JSON.stringify([els.configForm.style.display, helpOf("From"), helpOf("To")]));
   }
   els.configModalCancel.fire("click");
 
@@ -2524,6 +2533,58 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await press(els.configResetConfirm);
   check("after resetting the global store focus is on a control in the re-rendered global card, not the removed opener", api.reset === null &&
     focused !== old && inside(focused, card("__global__")), desc());
+
+  // 46. focus stays in the dialogs after failed saves and resets
+  check("the editor's error line is an alert", /id="configModalError"[^>]*role="alert"|role="alert"[^>]*id="configModalError"/.test(html));
+  api.renderConfigPage(FM());
+  configPayload = FM();
+  respond = (url, init) => ({ status: 422, body: { detail: { code: "invalid", message: "bad tool" } } });
+  await press(editBtn("repo-b", "hot_paths"));
+  await press(els.configModalSave);
+  check("a failed dry run leaves focus in the editor, not the body", api.edit !== null && shown(els.configModalError) &&
+    focused === formCtl("Name"), desc());
+  api.configModalKey({ key: "Escape" });
+  respond = (url, init) => JSON.parse(init.body).dry_run ? { status: 200, body: { ok: true, warnings: [], notes: [], scope: FM().projects[1] } }
+    : { status: 500, body: { detail: { code: "boom", message: "disk full" } } };
+  await press(editBtn("repo-b", "hot_paths"));
+  await press(els.configModalSave);
+  check("a failed write leaves focus in the editor, not the body", api.edit !== null && shown(els.configModalError) &&
+    focused === formCtl("Name"), desc());
+  api.configModalKey({ key: "Escape" });
+  // Reload re-renders the card; Cancel then falls back to the redrawn Edit button
+  const fresh46 = FM().projects[1];
+  respond = (url, init) => !init.method ? { status: 200, body: fresh46 }
+    : { status: 412, body: { detail: { code: "stale", message: "changed on disk", scope: fresh46 } } };
+  old = editBtn("repo-b", "hot_paths");
+  await press(old);
+  await press(els.configModalSave);
+  await press(els.configModalReload);
+  check("(setup) Reload redrew the card, so the opener is gone", old.isConnected === false && api.edit !== null);
+  els.configModalCancel.focus();
+  await els.configModalCancel.fire("click");
+  check("Cancel after a Reload focuses the redrawn Edit button, not the detached opener", api.edit === null &&
+    focused === editBtn("repo-b", "hot_paths"), desc());
+  // reset: a 412 lands on Re-check
+  api.renderConfigPage(MODEL());
+  const freshB46 = project("repo-b"); freshB46.schema.fingerprint = "sha256:repo-b-schema-3";
+  respond = (url, init) => {
+    if (!init.method) return { status: 200, body: freshB46 };
+    return JSON.parse(init.body).dry_run
+      ? { status: 200, body: { ok: true, written: false, fingerprint: ifMatch({ init }).slice(1, -1), removed: { node_types: ["Runbook"], relationships: [] }, warnings: [], notes: [], scope: project("repo-b") } }
+      : { status: 412, body: { detail: { code: "stale", message: "changed" } } };
+  };
+  old = buttons(card("repo-b"), "Reset devgraph.schema.yaml…")[0];
+  await press(old);
+  els.configResetTyped.value = "repo-b";
+  await els.configResetTyped.fire("input");
+  await press(els.configResetConfirm);
+  check("a 412 on Reset moves focus to Re-check", focused === els.configResetRecheck, desc());
+  await press(els.configResetRecheck);
+  await new Promise(r => setTimeout(r, 0));
+  check("(setup) Re-check redrew the card, so the opener is gone", old.isConnected === false && api.reset !== null);
+  await press(els.configResetCancel);
+  check("Cancel after a Re-check focuses a control in the redrawn card, not the detached opener", api.reset === null &&
+    focused !== old && inside(focused, card("repo-b")), desc());
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);

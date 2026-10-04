@@ -809,7 +809,7 @@ table.dstable input[type="text"] { width: 100%; }
   <div class="cfg-form-scroll" id="configFormScroll" style="display:none"><fieldset class="cfg-form" id="configForm" style="display:none"></fieldset></div>
   <textarea class="cfg-yaml" id="configYaml" spellcheck="false" aria-label="Entry YAML"></textarea>
   <div class="cfg-confirm" id="configModalConfirm" style="display:none"></div>
-  <div class="cfg-error" id="configModalError" style="display:none"></div>
+  <div class="cfg-error" id="configModalError" role="alert" style="display:none"></div>
   <div class="modal-actions"><button class="btn btn-sm" id="configModalReload" style="display:none">Reload</button><button class="btn btn-sm" id="configModalCancel">Cancel</button><button class="btn btn-sm btn-primary" id="configModalSave">Save</button></div>
 </div></div>
 <div class="modal-overlay" id="configResetModal"><div class="modal-box cfg-modal-box" role="dialog" aria-modal="true" aria-labelledby="configResetTitle">
@@ -3337,7 +3337,13 @@ function configCloseEditor() {
   document.getElementById("configModal").classList.remove("open");
   const opener = configEdit && configEdit.opener;
   configEdit = null;
-  if (opener) opener.focus();
+  configFocusOpener(opener);
+}
+/* a re-render (Reload, Re-check) can replace the opener: then its stand-in takes the focus */
+function configFocusOpener(opener) {
+  if (!opener) return;
+  if (opener.isConnected) opener.focus();
+  else configRestoreFocus(configOpenerSpot(opener));
 }
 /* a modal's enabled, visible controls in tab order (a hidden step or a locked fieldset has none) */
 function configModalFocusable(modal) {
@@ -3429,6 +3435,7 @@ function openConfigEditor(opts) {
 async function configSave(ev) {
   const edit = configEdit;
   if (!edit || edit.busy || (ev && ev.detail > 1) || Date.now() - edit.armedAt < CONFIG_ARM_MS) return;
+  const pressed = document.activeElement;
   if (edit.step === "warn") { edit.step = "edit"; renderConfigModal(); return; }
   const yaml = edit.op === "copy" ? edit.yaml : document.getElementById("configYaml").value;
   const send = (t, dry) => configSend(configWriteRequest(t.op, t.scope, edit.section, t.name, yaml, edit.fps[t.scope], dry));
@@ -3503,7 +3510,11 @@ async function configSave(ev) {
     if (configFocusLost(redrawn)) configRestoreFocus(spot);
   } finally {
     edit.busy = "";
-    if (configEdit === edit) renderConfigModal();
+    if (configEdit === edit) {
+      renderConfigModal();
+      /* a failed check or write locked the form while it ran, which drops focus to <body> */
+      if (configFocusLost(pressed)) configEditorFocusTarget().focus();
+    }
   }
 }
 /* after a 412: pick up the file's current fingerprint, keep the user's text */
@@ -3596,7 +3607,7 @@ function configCloseReset() {
   document.getElementById("configResetModal").classList.remove("open");
   const opener = configReset && configReset.opener;
   configReset = null;
-  if (opener) opener.focus();
+  configFocusOpener(opener);
 }
 /* a 412 at any step: the list is out of date, so it and the typed name go */
 function configResetFailed(rs, res) {
@@ -3606,6 +3617,7 @@ function configResetFailed(rs, res) {
     rs.review = null;
     document.getElementById("configResetTyped").value = "";
     configResetSetError("The file changed since this list was made; nothing was reset. Re-check to see what it holds now.");
+    document.getElementById("configResetRecheck").focus();
   } else {
     configResetSetError(describeConfigError(res.status, detail));
   }
@@ -4467,8 +4479,8 @@ function renderConfigForm(edit) {
   if (edit.section === "relationships") {
     text(box, "type", "Type", "type", f, "Uppercase letters, digits and underscores." +
       (edit.op === "replace" ? " Changing it renames the relationship." : ""));
-    text(box, "from", "From", "from", f, "One or more node labels, separated by commas. Each must be a built-in node type or one declared in this file.");
-    text(box, "to", "To", "to", f, "One node label: built-in, or declared in this file.");
+    text(box, "from", "From", "from", f, "One or more node labels, separated by commas. Each must be a node type declared in this file (or a built-in one when the file uses `extends: default`).");
+    text(box, "to", "To", "to", f, "One node label: a node type declared in this file (or a built-in one when the file uses `extends: default`).");
     const names = { builtin: "Built-in type", custom: "Custom provider", filesystem: "Filesystem (file → parent folder)" };
     /* Provider changes only the custom name field, in place: the select keeps
        focus while arrow keys step through the providers */

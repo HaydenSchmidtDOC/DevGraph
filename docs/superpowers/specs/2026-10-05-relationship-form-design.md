@@ -98,6 +98,10 @@ Hints for relationships:
 - `from`: no labels; a label not matching `LABEL_PATTERN`; a label listed twice.
 - `to`: empty, or not matching `LABEL_PATTERN`.
 - **labels that must exist:** a `from` or `to` label not in `ctx.labels`: "`Runbok` isn't a node type this repository has (built-in, or declared in this file as last loaded)." This is advisory only: the list is the last loaded file, and the server's `resolve_declaration` endpoint check decides.
+
+Two known gaps in the hints, both advisory (the server stays authoritative in each):
+- A filesystem node type whose `entry` is null isn't recognised as a filesystem type by the hint, so `ctx.filesystem` can miss it.
+- An unparseable file is treated as `extends: default` when the hints build `ctx.labels`.
 - **filesystem:** `to` other than `ctx.filesystem.folder`: "A filesystem relationship points to the filesystem folder node type (`Folder`)." or "…, and this file declares none." A valid `from` label that is neither filesystem type: "`X` is not a filesystem node type." When the file declares neither filesystem type, `from` gets one hint instead of one per label: "A filesystem relationship starts from the filesystem node types (file or folder), and this file declares none."
 - `color`: as for node types.
 
