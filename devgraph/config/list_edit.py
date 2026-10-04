@@ -16,6 +16,11 @@ import yaml
 from devgraph.config.project_tools import YAML_LOAD_ERRORS
 
 
+def _a(noun: str) -> str:
+    """`noun` with its indefinite article."""
+    return f"{'an' if noun[:1].lower() in 'aeiou' else 'a'} {noun}"
+
+
 class ListEditError(Exception):
     """A list document cannot be edited as asked."""
 
@@ -125,7 +130,7 @@ class _Doc:
         if not before.endswith("-") and line != node.start_mark.line:
             before = self.lines[line].split("-", 1)[0] + "-"
         if not before.endswith("-"):
-            raise ListEditError(f"a {self.noun} entry does not start on its '- ' line; edit the file by hand")
+            raise ListEditError(f"{_a(self.noun)} entry does not start on its '- ' line; edit the file by hand")
         return len(before) - 1
 
     def span(self, position: int) -> tuple[int, int]:
@@ -192,7 +197,7 @@ def add_entry_text(
     """
     doc = _Doc(text, key, ident, noun)
     if unique and doc.has(entry.get(ident)):
-        raise ListEditError(f"a {noun} named {entry.get(ident)!r} already exists")
+        raise ListEditError(f"{_a(noun)} named {entry.get(ident)!r} already exists")
     if not doc.lines:
         doc.lines = [f"version: {version}", f"{key}:"] + doc.render(entry, 0)
     elif doc.key_node is None:

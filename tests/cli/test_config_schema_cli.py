@@ -248,6 +248,29 @@ def test_edit_duplicated_relationship_type_refused(runner, repo, tmp_path):
     assert result.exit_code == 1 and "edit the file by hand" in flat(result.output)
 
 
+def test_edit_rename_warns_about_removed_type(runner, repo, tmp_path):
+    schema_file(repo).write_text(SCHEMA.split("relationships:")[0])
+    result = run(runner, "edit", "Ticket", "--from", src(tmp_path, TICKET.replace("Ticket", "Story")), "--repo", str(repo))
+    assert result.exit_code == 0, result.output
+    assert "next rescan deletes" in flat(result.output) and "Ticket" in result.output
+
+
+def test_edit_rename_in_editor_warns(runner, repo, monkeypatch):
+    schema_file(repo).write_text(SCHEMA.split("relationships:")[0])
+    monkeypatch.setattr(click, "edit", lambda text, **kw: text.replace("Ticket", "Story"))
+    result = run(runner, "edit", "Ticket", "--repo", str(repo))
+    assert result.exit_code == 0, result.output
+    assert "next rescan deletes" in flat(result.output)
+
+
+def test_edit_description_only_does_not_warn(runner, repo, tmp_path):
+    schema_file(repo).write_text(SCHEMA)
+    new = TICKET + "description: Work item\n"
+    result = run(runner, "edit", "Ticket", "--from", src(tmp_path, new), "--repo", str(repo))
+    assert result.exit_code == 0, result.output
+    assert "next rescan" not in flat(result.output).replace("Applied at the next rescan", "")
+
+
 # -- delete ------------------------------------------------------------------
 
 

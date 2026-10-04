@@ -2632,6 +2632,7 @@ def config_schema_edit(
         path,
     )
     _schema_done("Updated", section, name, path, root)
+    _warn_removed(*_removed_types(_schema_declaration(text, path), _schema_declaration(_schema_text(path), path)))
 
 
 @schema_app.command("delete")

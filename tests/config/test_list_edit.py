@@ -124,3 +124,34 @@ def test_noun_in_messages():
 
 def test_dump_entry_block_scalars():
     assert dump_entry({"a": "x\ny"}) == "a: |-\n  x\n  y\n"
+
+
+def test_default_noun_reads_with_an_article():
+    with pytest.raises(ListEditError, match="an entry named 'Widget' already exists"):
+        add_entry_text(DOC, {"label": "Widget"}, version=1, **NODE)
+
+
+def test_nested_node_types_key_in_a_relationship_is_ignored():
+    text = "version: 1\nrelationships:\n  - type: USES\n    from: A\n    to: B\n    node_types:\n      - label: Ghost\n"
+    assert entries(text, key="node_types") == []
+    out = add_entry_text(text, {"label": "Real"}, version=1, **NODE)
+    assert out.startswith(text) and out.endswith("node_types:\n- label: Real\n")
+
+
+def test_unique_relationship_edit_leaves_node_types_byte_identical():
+    head = split(DOC, "# Header", "relationships:")
+    added = add_entry_text(DOC, {"type": "NEW", "from": "A", "to": "B"}, version=1, **REL)
+    assert added.startswith(head)
+    replaced = replace_entry_text(DOC, "OWNS", {"type": "OWNS", "from": "A", "to": "B"}, **REL)
+    assert replaced.startswith(head)
+
+
+@pytest.mark.parametrize("op", ["replace", "delete"])
+def test_tools_duplicate_name_refused(op):
+    text = "version: 1\ntools:\n  - name: t\n    cypher: a\n  - name: t\n    cypher: b\n"
+    kw = {"key": "tools", "ident": "name"}
+    with pytest.raises(ListEditError, match="declared 2 times"):
+        if op == "replace":
+            replace_entry_text(text, "t", {"name": "t"}, **kw)
+        else:
+            delete_entry_text(text, "t", **kw)
