@@ -784,18 +784,20 @@ def build_router(
             # The fingerprint edits.py took under the lock, of exactly what was written: if the file
             # changed again since, the client's next write is a 412 rather than a blind overwrite.
             part["fingerprint"] = result.fingerprint
-        return JSONResponse(
-            status_code=201 if created and result.written else 200,
-            content={
-                "ok": True,
-                "written": result.written,
-                "file": path.name,
-                "fingerprint": part["fingerprint"],
-                "warnings": [scrub(w, path, root) for w in result.warnings],
-                "notes": [scrub(n, path, root) for n in notes],
-                "scope": block,
-            },
-        )
+        content: dict[str, Any] = {
+            "ok": True,
+            "written": result.written,
+            "file": path.name,
+            "fingerprint": part["fingerprint"],
+            "warnings": [scrub(w, path, root) for w in result.warnings],
+            "notes": [scrub(n, path, root) for n in notes],
+            "scope": block,
+        }
+        if result.removed is not None:
+            content["removed"] = result.removed
+        if kind == "tools":  # a tools write can change other scopes' badges ("Overridden in")
+            content["global"] = block if scope == GLOBAL_SCOPE else _config_scope(GLOBAL_SCOPE)
+        return JSONResponse(status_code=201 if created and result.written else 200, content=content)
 
     @router.post("/config/{scope}/tools")
     async def add_config_tool(scope: str, request: Request) -> JSONResponse:
@@ -828,6 +830,28 @@ def build_router(
         return await run_in_threadpool(
             _apply_edit, scope, record, "tools",
             lambda root: edits.delete_tool(root, name, expected_fingerprint=expected, dry_run=dry), False,
+        )
+
+    @router.delete("/config/{scope}/tools")
+    async def reset_config_tools(scope: str, request: Request, dry_run: str | None = None) -> JSONResponse:
+        _reject_cross_site_config(request)
+        record = _write_record(scope)
+        expected = _if_match(request)
+        dry = _dry_run_flag(dry_run)
+        return await run_in_threadpool(
+            _apply_edit, scope, record, "tools",
+            lambda root: edits.reset_tools(root, record=record, expected_fingerprint=expected, dry_run=dry), False,
+        )
+
+    @router.delete("/config/{scope}/schema")
+    async def reset_config_schema(scope: str, request: Request, dry_run: str | None = None) -> JSONResponse:
+        _reject_cross_site_config(request)
+        record = _write_record(scope, schema=True)
+        expected = _if_match(request)
+        dry = _dry_run_flag(dry_run)
+        return await run_in_threadpool(
+            _apply_edit, scope, record, "schema",
+            lambda root: edits.reset_schema(root, record=record, expected_fingerprint=expected, dry_run=dry), False,
         )
 
     @router.post("/config/{scope}/schema/{section}")

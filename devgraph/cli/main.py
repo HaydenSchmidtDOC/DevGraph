@@ -2353,24 +2353,17 @@ def config_tools_reset(
     yes: bool = typer.Option(False, "--yes", help="Do not ask for confirmation."),
 ) -> None:
     """Remove every tool in the scope: delete devgraph.tools.yaml, or empty the global store."""
-    from devgraph.config.global_tools import save_global_tools
-
-    from devgraph.config.edits import tools_path
+    from devgraph.config.edits import reset_tools, tools_path
 
     root = _tools_scope(ctx, repo, global_)
     path = tools_path(root)
-    if not path.exists():
+    if not os.path.lexists(path):
         console.print(f"Nothing to reset: {escape(str(path))} does not exist.", soft_wrap=True)
         return
     if not yes:
         typer.confirm(f"Remove every tool in {path}?", abort=True)
-    try:
-        if root is None:
-            save_global_tools([])
-        else:
-            path.unlink()
-    except OSError as exc:
-        raise _tools_fail(str(exc))
+    with _edit_errors():
+        reset_tools(root)
     console.print(f"[green]Reset[/green] {escape(str(path))}", soft_wrap=True)
     console.print(escape(_tools_scope_note(root)), soft_wrap=True)
 
@@ -2631,29 +2624,21 @@ def config_schema_reset(
     yes: bool = typer.Option(False, "--yes", help="Do not ask for confirmation."),
 ) -> None:
     """Delete devgraph.schema.yaml, returning the repository to the built-in schema."""
-    from devgraph.config.edits import EditResult, schema_change_warnings, schema_declaration
+    from devgraph.config.edits import reset_schema
     from devgraph.config.project_schema import project_schema_path
 
     root = _schema_scope(ctx, repo)
     path = project_schema_path(root)
-    if not path.exists():
+    if not os.path.lexists(path):
         console.print(f"Nothing to reset: {escape(str(path))} does not exist.", soft_wrap=True)
         return
     if not yes:
         typer.confirm(f"Delete {path} and return to the built-in schema?", abort=True)
-    before = schema_declaration(_schema_text(path), path)
-    try:
-        path.unlink()
-    except OSError as exc:
-        raise _tools_fail(str(exc))
+    with _edit_errors():
+        result = reset_schema(root, record=_schema_record(root))
     console.print(f"[green]Reset[/green] {escape(str(path))}", soft_wrap=True)
     console.print(escape(_schema_effect_note(root)), soft_wrap=True)
-    _schema_follow_up(
-        root,
-        EditResult(
-            path, "", True, before=before, warnings=schema_change_warnings(before, None, _schema_record(root))
-        ),
-    )
+    _schema_follow_up(root, result)
 
 
 @app.command()

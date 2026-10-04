@@ -63,6 +63,7 @@ class EditResult:
     after: Any = None
     warnings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    removed: dict[str, list[str] | None] | None = None  # resets: names the file declared; None = not readable
 
 
 # --- files -----------------------------------------------------------------------------------------
@@ -655,3 +656,115 @@ def delete_schema_entry(
             dry_run=dry_run,
         )
         return _schema_result(path, old_text, new_text, None, record, dry_run)
+
+
+# --- whole-file reset ------------------------------------------------------------------------------
+
+
+def _loaded_yaml(path: Path) -> tuple[bool, Any]:
+    """(readable, data) of a file as `yaml.safe_load` sees it. Never raises: reset must work on a broken file."""
+    import yaml
+
+    from devgraph.config.project_tools import YAML_LOAD_ERRORS
+
+    try:
+        return True, yaml.safe_load(path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, *YAML_LOAD_ERRORS):
+        return False, None
+
+
+def _names(data: Any, key: str, ident: str) -> list[str]:
+    entries = data.get(key) if isinstance(data, dict) else None
+    return [e[ident] for e in entries if isinstance(e, dict) and isinstance(e.get(ident), str)] if isinstance(entries, list) else []
+
+
+def _nothing_to_reset(path: Path, removed: dict[str, list[str] | None]) -> EditResult:
+    return EditResult(path, "", False, "absent", notes=[f"Nothing to reset: {path} does not exist."], removed=removed)
+
+
+def reset_tools(
+    root: Path | None,
+    *,
+    record: Any = None,
+    expected_fingerprint: str | None = None,
+    dry_run: bool = False,
+) -> EditResult:
+    """Remove every tool in the scope: delete `devgraph.tools.yaml`, or empty the global store.
+
+    The `removed` listing is best effort and never blocks the reset (it is the way out of a broken file).
+    A dry run changes nothing and reports the file's current fingerprint.
+    """
+    from devgraph.config.global_tools import ProjectToolsError, load_global_tools, save_global_tools
+
+    path = tools_path(root)
+    with _guard(path, expected_fingerprint):
+        if not path.exists():
+            return _nothing_to_reset(path, {"tools": []})
+        readable, data = _loaded_yaml(path)
+        names = _names(data, "tools", "name") if readable else None
+        notes: list[str] = []
+        if root is None:
+            if names:
+                notes.append(
+                    f"Removes {len(names)} global tool(s) from every repository's MCP sessions; "
+                    "repositories with a project tool of the same name keep theirs."
+                )
+        elif names:
+            try:
+                store = load_global_tools()
+            except ProjectToolsError:
+                store = None
+            served = {t.name for t in store.tools} if store is not None else set()
+            where = record.repo_id if record is not None else path.parent.name
+            notes += [f"After the reset, global tool {n} is served in {where}." for n in names if n in served]
+        if dry_run:
+            return EditResult(path, "", False, file_fingerprint(path), notes=notes, removed={"tools": names})
+        try:
+            if root is None:
+                save_global_tools([])
+            else:
+                path.unlink()
+        except (OSError, ProjectToolsError) as exc:
+            raise ConfigEditError(str(exc), "io")
+        return EditResult(path, "", True, file_fingerprint(path), notes=notes, removed={"tools": names})
+
+
+def reset_schema(
+    root: Path, *, record: Any = None, expected_fingerprint: str | None = None, dry_run: bool = False
+) -> EditResult:
+    """Delete `devgraph.schema.yaml`, returning the repository to the built-in schema."""
+    from devgraph.config.project_schema import project_schema_path
+
+    path = project_schema_path(root)
+    with _guard(path, expected_fingerprint):
+        if not path.exists():
+            return _nothing_to_reset(path, {"node_types": [], "relationships": []})
+        readable, data = _loaded_yaml(path)
+        removed = {
+            "node_types": _names(data, "node_types", "label") if readable else None,
+            "relationships": _names(data, "relationships", "type") if readable else None,
+        }
+        before = schema_declaration(read_text_lossy(path), path)
+        if before is None and not (readable and data is None):
+            warnings = [
+                "The file is invalid, so what it declared can't be listed; the next rescan returns this repository "
+                "to the built-in schema and deletes the nodes of any project type applied earlier."
+            ]
+        else:
+            warnings = schema_change_warnings(before, None, record)
+        if not dry_run:
+            try:
+                path.unlink()
+            except OSError as exc:
+                raise ConfigEditError(str(exc), "io")
+        return EditResult(
+            path, "", not dry_run, file_fingerprint(path), before=before, warnings=warnings, removed=removed
+        )
+
+
+def read_text_lossy(path: Path) -> str:
+    """The file's text, or "" when it cannot be read (a reset must not be blocked by a broken file)."""
+    try:
+        return read_text(path)
+    except ConfigEditError:
+        return ""

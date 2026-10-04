@@ -741,6 +741,8 @@ def test_path_like_entry_names_are_only_names(client, registry, tmp_path, name):
         ("DELETE", f"/api/config/repo-a/schema/node_types/{name}", fp_schema, None),
         ("DELETE", f"/api/config/{name}/tools/find_parents", fp_tools, None),
     ):
+        if name == ".." and method == "DELETE" and url.endswith("/.."):
+            continue  # the client collapses `/tools/..` to `/tools`: the (If-Match guarded) whole-file reset route
         response = _send(client, method, url, fp, body)
         assert response.status_code in (404, 405), (method, url, response.status_code, response.text)
     assert _snapshot(tmp_path) == before
@@ -1158,3 +1160,124 @@ def test_exists_messages_say_edit_it_instead_without_cli_commands(client, regist
         message = response.json()["detail"]["message"]
         assert "already exists" in message and message.endswith("— edit it instead")
         assert "devgraph config" not in message
+
+
+# --- whole-file reset ----------------------------------------------------------------------------
+
+BAD_HEADERS = [{"origin": "http://evil.test"}, {"sec-fetch-site": "cross-site"}]
+
+
+def test_reset_project_tools_dry_run_then_delete(client, registry, tmp_path, global_store):
+    record = _repo(tmp_path, registry)
+    path = _write(record.path, TOOLS_FILENAME, TOOL.format(name="hot_paths"))
+    _global_store(global_store, "hot_paths")
+    before = _snapshot(tmp_path)
+    fp = _fp(client, "repo-a")
+
+    dry = _send(client, "DELETE", "/api/config/repo-a/tools?dry_run=1", fp)
+    assert dry.status_code == 200, dry.text
+    body = dry.json()
+    assert body["written"] is False and body["removed"] == {"tools": ["hot_paths"]} and body["fingerprint"] == fp
+    assert "After the reset, global tool hot_paths is served in repo-a." in body["notes"]
+    assert _snapshot(tmp_path) == before
+
+    done = _send(client, "DELETE", "/api/config/repo-a/tools", body["fingerprint"])
+    assert done.status_code == 200, done.text
+    assert not path.exists() and done.json()["written"] is True and done.json()["fingerprint"] == "absent"
+    assert done.json()["scope"]["tools"]["state"] == "absent"
+    assert "global" in done.json() and f"Written to {TOOLS_FILENAME}; not committed." in done.json()["notes"]
+
+
+def test_reset_global_tools_empties_the_store(client, global_store):
+    _global_store(global_store, "hot_paths", "other")
+    fp = _fp(client, "__global__")
+    dry = _send(client, "DELETE", "/api/config/__global__/tools?dry_run=true", fp)
+    assert dry.json()["removed"] == {"tools": ["hot_paths", "other"]} and len(json.loads(global_store.read_text())["tools"]) == 2
+    done = _send(client, "DELETE", "/api/config/__global__/tools", fp)
+    assert done.status_code == 200 and json.loads(global_store.read_text())["tools"] == []
+    assert done.json()["scope"]["tools"]["entries"] == [] and done.json()["global"]["tools"]["entries"] == []
+
+
+def test_reset_schema_dry_run_then_delete(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    path = _write(record.path, SCHEMA_FILENAME, SCHEMA)
+    fp = _fp(client, "repo-a", "schema")
+    dry = _send(client, "DELETE", "/api/config/repo-a/schema?dry_run=1", fp)
+    assert dry.status_code == 200, dry.text
+    assert dry.json()["removed"] == {"node_types": ["Widget"], "relationships": ["HAS_PART"]}
+    assert any("Widget" in w for w in dry.json()["warnings"]) and path.exists()
+    done = _send(client, "DELETE", "/api/config/repo-a/schema", fp)
+    assert done.status_code == 200 and not path.exists()
+    assert done.json()["scope"]["schema"]["state"] == "absent" and "global" not in done.json()
+
+
+@pytest.mark.parametrize("headers", BAD_HEADERS)
+def test_reset_cross_site_is_403(client, registry, tmp_path, headers):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="a_tool"))
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+    before = _snapshot(tmp_path)
+    for url in ("/api/config/repo-a/tools", "/api/config/__global__/tools", "/api/config/repo-a/schema"):
+        assert _send(client, "DELETE", url, "absent", headers=headers).status_code == 403
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("url", [
+    "/api/config/nope/tools", "/api/config/nope/schema", "/api/config/__global__/schema",
+])
+def test_reset_unknown_scope_is_404(client, url):
+    assert _send(client, "DELETE", url, "absent").status_code == 404
+
+
+def test_reset_inactive_repo_is_404(client, registry, tmp_path):
+    _repo(tmp_path, registry)
+    registry.remove_repo("repo-a")
+    assert _send(client, "DELETE", "/api/config/repo-a/tools", "absent").status_code == 404
+
+
+@pytest.mark.parametrize("url,name", [("/api/config/repo-a/tools", TOOLS_FILENAME), ("/api/config/repo-a/schema", SCHEMA_FILENAME)])
+def test_reset_requires_if_match_and_rejects_stale(client, registry, tmp_path, url, name):
+    record = _repo(tmp_path, registry)
+    path = _write(record.path, name, TOOL.format(name="a_tool") if name == TOOLS_FILENAME else SCHEMA)
+    assert _send(client, "DELETE", url, None).status_code == 428
+    stale = _send(client, "DELETE", url, "sha256:stale")
+    assert stale.status_code == 412 and stale.json()["detail"]["code"] == "stale" and "scope" in stale.json()["detail"]
+    assert path.exists()
+
+
+def test_reset_bad_dry_run_value_is_400(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="a_tool"))
+    assert _send(client, "DELETE", "/api/config/repo-a/tools?dry_run=maybe", _fp(client, "repo-a")).status_code == 400
+
+
+@pytest.mark.parametrize("url,name", [("/api/config/repo-a/tools", TOOLS_FILENAME), ("/api/config/repo-a/schema", SCHEMA_FILENAME)])
+def test_reset_symlinked_file_is_409(client, registry, tmp_path, url, name):
+    record = _repo(tmp_path, registry)
+    real = tmp_path / "real.yaml"
+    real.write_text(textwrap.dedent(TOOL.format(name="a_tool") if name == TOOLS_FILENAME else SCHEMA))
+    (record.path / name).symlink_to(real)
+    from devgraph.config.edits import file_fingerprint
+
+    response = _send(client, "DELETE", url, file_fingerprint(record.path / name))
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "not_regular"
+    assert (record.path / name).is_symlink() and real.exists()
+
+
+def test_reset_absent_file_is_a_no_op(client, registry, tmp_path):
+    _repo(tmp_path, registry)
+    response = _send(client, "DELETE", "/api/config/repo-a/tools", "absent")
+    assert response.status_code == 200 and response.json()["written"] is False
+    assert any(n.startswith("Nothing to reset") for n in response.json()["notes"])
+
+
+def test_reset_touches_no_git_state(client, registry, tmp_path):
+    import subprocess
+
+    record = _repo(tmp_path, registry)
+    subprocess.run(["git", "init", "-q"], cwd=record.path, check=True)
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="a_tool"))
+    subprocess.run(["git", "add", TOOLS_FILENAME], cwd=record.path, check=True)
+    staged = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=record.path, capture_output=True, text=True).stdout
+    _send(client, "DELETE", "/api/config/repo-a/tools", _fp(client, "repo-a")).raise_for_status()
+    assert subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=record.path, capture_output=True, text=True).stdout == staged

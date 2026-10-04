@@ -524,3 +524,12 @@ def test_add_global_value_json_cannot_store_is_a_friendly_error(runner, tmp_path
     assert result.exit_code == 1, result.output
     assert "a tool holds a value JSON cannot store" in flat(result.output)
     assert not store.exists()
+
+
+def test_reset_refuses_a_symlinked_project_file(runner, repo, tmp_path):
+    real = tmp_path / "real.yaml"
+    real.write_text(tool_yaml("count_nodes"))
+    (repo / TOOLS_FILENAME).symlink_to(real)
+    result = runner.invoke(app, ["config", "tools", "reset", "--repo", str(repo), "--yes"])
+    assert result.exit_code == 1 and "symlink" in " ".join(result.output.split())
+    assert (repo / TOOLS_FILENAME).is_symlink() and real.exists()

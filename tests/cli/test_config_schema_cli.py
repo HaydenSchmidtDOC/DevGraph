@@ -562,3 +562,12 @@ def test_symlinked_schema_file_is_refused_untouched(runner, settings, repo, tmp_
     result = runner.invoke(app, ["config", "schema", "add", "--from", src(tmp_path, EPIC), "--repo", str(repo)])
     assert result.exit_code == 1 and "is a symlink to" in flat(result.output)
     assert link.is_symlink() and real.read_text() == SCHEMA
+
+
+def test_reset_refuses_a_symlinked_file(runner, repo, tmp_path):
+    real = tmp_path / "real.yaml"
+    real.write_text(SCHEMA)
+    schema_file(repo).symlink_to(real)
+    result = run(runner, "reset", "--yes", "--repo", str(repo))
+    assert result.exit_code == 1 and "symlink" in flat(result.output)
+    assert schema_file(repo).is_symlink() and real.read_text() == SCHEMA
