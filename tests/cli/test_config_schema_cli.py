@@ -34,7 +34,7 @@ def repo(tmp_path):
     return root
 
 
-def register(settings, root, repo_id="demo", *, enabled=True):
+def register(settings, root, repo_id="demo", *, enabled=True, watched=True):
     from devgraph.registry.store import RepoRegistry
 
     (root / ".git").mkdir(exist_ok=True)
@@ -43,6 +43,8 @@ def register(settings, root, repo_id="demo", *, enabled=True):
         registry.add_repo(root, repo_id=repo_id)
         if not enabled:
             registry.set_project_config_enabled(repo_id, False)
+        if not watched:
+            registry.disable_watch(repo_id)
     finally:
         registry.close()
 
@@ -113,7 +115,7 @@ def test_list_json_shape(runner, settings, repo):
     assert result.exit_code == 0, result.output
     data = json.loads(result.output)
     ticket = next(n for n in data["node_types"] if n["label"] == "Ticket")
-    assert ticket == {"label": "Ticket", "origin": "project", "key": ["id"]}
+    assert ticket == {"label": "Ticket", "origin": "project", "key": ["id"], "source": None}
     assert any(n["label"] == "Function" and n["origin"] == "built-in" for n in data["node_types"])
     rel = next(r for r in data["relationships"] if r["origin"] == "project")
     assert rel == {"type": "USES", "from": ["Ticket"], "to": "Function", "provider": "builtin", "origin": "project"}
@@ -248,14 +250,16 @@ def test_edit_duplicated_relationship_type_refused(runner, repo, tmp_path):
     assert result.exit_code == 1 and "edit the file by hand" in flat(result.output)
 
 
-def test_edit_rename_warns_about_removed_type(runner, repo, tmp_path):
+def test_edit_rename_warns_about_removed_type(runner, settings, repo, tmp_path):
+    register(settings, repo)
     schema_file(repo).write_text(SCHEMA.split("relationships:")[0])
     result = run(runner, "edit", "Ticket", "--from", src(tmp_path, TICKET.replace("Ticket", "Story")), "--repo", str(repo))
     assert result.exit_code == 0, result.output
     assert "next rescan deletes" in flat(result.output) and "Ticket" in result.output
 
 
-def test_edit_rename_in_editor_warns(runner, repo, monkeypatch):
+def test_edit_rename_in_editor_warns(runner, settings, repo, monkeypatch):
+    register(settings, repo)
     schema_file(repo).write_text(SCHEMA.split("relationships:")[0])
     monkeypatch.setattr(click, "edit", lambda text, **kw: text.replace("Ticket", "Story"))
     result = run(runner, "edit", "Ticket", "--repo", str(repo))
@@ -268,7 +272,7 @@ def test_edit_description_only_does_not_warn(runner, repo, tmp_path):
     new = TICKET + "description: Work item\n"
     result = run(runner, "edit", "Ticket", "--from", src(tmp_path, new), "--repo", str(repo))
     assert result.exit_code == 0, result.output
-    assert "next rescan" not in flat(result.output).replace("Applied at the next rescan", "")
+    assert "Warning" not in result.output
 
 
 # -- delete ------------------------------------------------------------------
@@ -282,7 +286,8 @@ def test_delete_relationship(runner, repo):
     assert "relationship" in flat(result.output) and "USES" in result.output
 
 
-def test_delete_node_type_warns_about_rescan(runner, repo):
+def test_delete_node_type_warns_about_rescan(runner, settings, repo):
+    register(settings, repo)
     schema_file(repo).write_text(SCHEMA.split("relationships:")[0])
     result = run(runner, "delete", "Ticket", "--repo", str(repo))
     assert result.exit_code == 0, result.output
@@ -322,7 +327,8 @@ def test_ambiguous_name_needs_a_flag(runner, repo):
 # -- reset -------------------------------------------------------------------
 
 
-def test_reset_yes_deletes_and_warns(runner, repo):
+def test_reset_yes_deletes_and_warns(runner, settings, repo):
+    register(settings, repo)
     schema_file(repo).write_text(SCHEMA)
     result = run(runner, "reset", "--yes", "--repo", str(repo))
     assert result.exit_code == 0, result.output
@@ -367,3 +373,166 @@ def test_default_scope_from_subdirectory(runner, settings, repo, tmp_path, monke
     result = run(runner, "add", "--from", src(tmp_path, TICKET))
     assert result.exit_code == 0, result.output
     assert schema_file(repo).exists() and not (sub / SCHEMA_FILENAME).exists()
+
+
+# -- accurate warnings (final review) ----------------------------------------
+
+FS_DOC = "label: Doc\nkey: [path]\nmetadata:\n  - name: path\n    type: string\nsource:\n  provider: filesystem\n  kind: file\n"
+FS_DOC_NO_SOURCE = FS_DOC.split("source:")[0]
+FS_DOC_FOLDER = FS_DOC.replace("kind: file", "kind: folder")
+FS_SCHEMA = "version: 1\nnode_types:\n  - " + FS_DOC.replace("\n", "\n    ").rstrip(" ")
+
+
+def test_removed_types_ignores_builtin_relationship_types():
+    from devgraph.cli.main import _removed_types
+    from devgraph.config.project_schema import parse_project_schema
+    from pathlib import Path
+
+    text = SCHEMA + "  - type: CONTAINS\n    from: Ticket\n    to: Function\n"
+    before = parse_project_schema(text, Path("x"))
+    after = parse_project_schema(SCHEMA, Path("x"))
+    assert _removed_types(before, after) == ([], [])
+
+
+def test_delete_builtin_relationship_type_does_not_warn(runner, repo):
+    schema_file(repo).write_text(SCHEMA + "  - type: CONTAINS\n    from: Ticket\n    to: Function\n")
+    result = run(runner, "delete", "CONTAINS", "--repo", str(repo))
+    assert result.exit_code == 0, result.output
+    assert "Warning" not in result.output
+
+
+def test_edit_dropping_source_warns_nodes_pruned(runner, settings, repo, tmp_path):
+    register(settings, repo)
+    schema_file(repo).write_text(FS_SCHEMA)
+    result = run(runner, "edit", "Doc", "--from", src(tmp_path, FS_DOC_NO_SOURCE), "--repo", str(repo))
+    assert result.exit_code == 0, result.output
+    out = flat(result.output)
+    assert "next rescan deletes the nodes of node type(s) whose filesystem source changed: Doc (source removed)" in out
+
+
+def test_edit_changing_kind_warns_nodes_pruned(runner, settings, repo, tmp_path):
+    register(settings, repo)
+    schema_file(repo).write_text(FS_SCHEMA)
+    result = run(runner, "edit", "Doc", "--from", src(tmp_path, FS_DOC_FOLDER), "--repo", str(repo))
+    assert result.exit_code == 0, result.output
+    assert "Doc (kind file -> folder)" in flat(result.output)
+
+
+def test_edit_description_only_on_filesystem_type_does_not_warn(runner, repo, tmp_path):
+    schema_file(repo).write_text(FS_SCHEMA)
+    result = run(runner, "edit", "Doc", "--from", src(tmp_path, FS_DOC + "description: d\n"), "--repo", str(repo))
+    assert result.exit_code == 0, result.output
+    assert "Warning" not in result.output and "no provider" not in result.output
+
+
+def test_add_and_edit_without_source_note_nothing_populates_it(runner, repo, tmp_path):
+    result = run(runner, "add", "--from", src(tmp_path, TICKET), "--repo", str(repo))
+    assert result.exit_code == 0, result.output
+    out = flat(result.output)
+    assert "no provider produces Ticket nodes yet" in out and "source: {provider: filesystem}" in out
+    result = run(runner, "edit", "Ticket", "--from", src(tmp_path, TICKET + "description: d\n"), "--repo", str(repo))
+    assert "no provider produces Ticket nodes yet" in flat(result.output)
+
+
+def test_add_with_source_has_no_source_note(runner, repo, tmp_path):
+    result = run(runner, "add", "--from", src(tmp_path, FS_DOC), "--repo", str(repo))
+    assert result.exit_code == 0, result.output
+    assert "no provider" not in result.output
+
+
+def test_effect_note_watched_repo(runner, settings, repo, tmp_path):
+    register(settings, repo)
+    result = run(runner, "add", "--from", src(tmp_path, TICKET), "--repo", str(repo))
+    out = flat(result.output)
+    assert (
+        "is applied about 5 minutes after the last edit while the DevGraph agent (tray or headless) is running, "
+        "or now with `devgraph rescan demo --now`"
+    ) in out
+
+
+def test_effect_note_unwatched_repo(runner, settings, repo, tmp_path):
+    register(settings, repo, watched=False)
+    result = run(runner, "add", "--from", src(tmp_path, TICKET), "--repo", str(repo))
+    out = flat(result.output)
+    assert "run `devgraph rescan demo --now` to apply it" in out and "5 minutes" not in out
+
+
+def test_conflict_with_another_registered_repo_warns(runner, settings, repo, tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    register(settings, repo, "demo")
+    register(settings, other, "other")
+    other_text = "version: 1\nnode_types:\n  - label: Ticket\n    key: [code]\n    metadata:\n      - name: code\n        type: string\n"
+    (other / SCHEMA_FILENAME).write_text(other_text)
+    result = run(runner, "add", "--from", src(tmp_path, TICKET), "--repo", str(repo))
+    assert result.exit_code == 0, result.output
+    out = flat(result.output)
+    assert "Warning" in out and "incompatible declarations of label 'ticket'" in out
+    assert "demo declares Ticket keyed on (id)" in out and "other declares Ticket keyed on (code)" in out
+
+
+def test_no_conflict_warning_for_unrelated_repos(runner, settings, repo, tmp_path):
+    register(settings, repo)
+    result = run(runner, "add", "--from", src(tmp_path, TICKET), "--repo", str(repo))
+    assert "incompatible" not in result.output
+
+
+def test_removal_warning_when_unregistered_says_when_applied(runner, repo):
+    schema_file(repo).write_text(SCHEMA.split("relationships:")[0])
+    result = run(runner, "delete", "Ticket", "--repo", str(repo))
+    out = flat(result.output)
+    assert "applying this schema deletes the nodes of the removed node type(s): Ticket" in out
+    assert "next rescan deletes" not in out
+
+
+def test_removal_warning_when_disabled_says_when_applied(runner, settings, repo):
+    register(settings, repo, enabled=False)
+    schema_file(repo).write_text(SCHEMA.split("relationships:")[0])
+    result = run(runner, "reset", "--yes", "--repo", str(repo))
+    out = flat(result.output)
+    assert "applying this schema deletes" in out and "next rescan deletes" not in out
+
+
+def test_add_invalid_entry_prefixed(runner, repo, tmp_path):
+    result = run(runner, "add", "--from", src(tmp_path, EPIC.replace("key: [id]", "key: [nope]")), "--repo", str(repo))
+    assert result.exit_code == 1 and "the new entry is invalid:" in flat(result.output)
+
+
+def test_edit_invalid_entry_prefixed(runner, repo, tmp_path):
+    schema_file(repo).write_text(SCHEMA)
+    result = run(runner, "edit", "Ticket", "--from", src(tmp_path, TICKET.replace("[id]", "[zzz]")), "--repo", str(repo))
+    assert result.exit_code == 1 and "the new entry is invalid:" in flat(result.output)
+
+
+def test_delete_referenced_node_type_hints(runner, repo):
+    schema_file(repo).write_text(SCHEMA)
+    result = run(runner, "delete", "Ticket", "--repo", str(repo))
+    out = flat(result.output)
+    assert result.exit_code == 1 and "delete or edit the relationships that use it first" in out
+    assert "the new entry is invalid" not in out
+
+
+def test_list_shows_source(runner, settings, repo):
+    register(settings, repo)
+    schema_file(repo).write_text(FS_SCHEMA)
+    data = json.loads(run(runner, "list", "--repo", str(repo), "--json").output)
+    doc = next(n for n in data["node_types"] if n["label"] == "Doc")
+    assert doc["source"] == {"provider": "filesystem", "kind": "file"}
+    assert next(n for n in data["node_types"] if n["label"] == "Function")["source"] is None
+    out = flat(run(runner, "list", "--repo", str(repo)).output)
+    assert "Source" in out and "filesystem (file)" in out and "\u2014" in out
+
+
+def test_edit_changing_key_warns_constraint_keeps_old_key(runner, repo, tmp_path):
+    schema_file(repo).write_text(SCHEMA.split("relationships:")[0])
+    new = "label: Ticket\nkey: [code]\nmetadata:\n  - name: code\n    type: string\n"
+    result = run(runner, "edit", "Ticket", "--from", src(tmp_path, new), "--repo", str(repo))
+    assert result.exit_code == 0, result.output
+    out = flat(result.output)
+    assert "uniqueness constraint on Ticket keeps the old key (id)" in out and "dropping constraints" in out
+
+
+def test_add_duplicate_relationship_compares_validated_form(runner, repo, tmp_path):
+    schema_file(repo).write_text(SCHEMA)
+    result = run(runner, "add", "--from", src(tmp_path, "type: USES\nfrom: [Ticket]\nto: Function\n"), "--repo", str(repo))
+    assert result.exit_code == 1 and "already exists" in result.output

@@ -757,6 +757,7 @@ def _project_schema_findings(repos: list[Any]) -> list[dict[str, Any]]:
                 "repo_id": None,
                 "status": "conflict",
                 "label": folded,
+                "repo_ids": sorted({repo_id for repo_id, _label, _key in entries}),
                 "detail": (
                     f"incompatible declarations of label {folded!r} in one shared "
                     f"database: {described}. Only the first provisioned constraint "
@@ -2380,16 +2381,27 @@ def _schema_scope(ctx: typer.Context, repo: Optional[Path]) -> Path:
     return _tools_scope(ctx, repo, False, "DevGraph does not index it")
 
 
+def _schema_record(root: Path):
+    """The registered, active repository record for `root`, else None."""
+    record = next((r for r in _registered_repos() if Path(r.path).expanduser().resolve() == root), None)
+    return record if record is not None and record.active else None
+
+
 def _schema_effect_note(root: Path) -> str:
     """When a schema change takes effect for this repository."""
-    record = next((r for r in _registered_repos() if Path(r.path).expanduser().resolve() == root), None)
-    if record is None or not record.active:
+    from devgraph.agent.schema_rescan import QUIET_PERIOD_S
+
+    record = _schema_record(root)
+    if record is None:
         return f"{root} is not a registered repository, so DevGraph does not index it; register it with `devgraph add`."
     if not record.project_config_enabled:
         return (f"Not applied while the project config is disabled for {record.repo_id}; "
                 f"enable it with `devgraph config enable {record.repo_id}`.")
-    return (f"Applied at the next rescan (watched repositories; otherwise "
-            f"`devgraph rescan {record.repo_id} --now`).")
+    if record.watch_enabled:
+        minutes = round(QUIET_PERIOD_S / 60)
+        return (f"The change is applied about {minutes} minutes after the last edit while the DevGraph agent (tray or headless) "
+                f"is running, or now with `devgraph rescan {record.repo_id} --now`.")
+    return f"Not watched: run `devgraph rescan {record.repo_id} --now` to apply it."
 
 
 def _schema_text(path: Path) -> str:
@@ -2454,16 +2466,19 @@ def _locate_entry(text: str, name: str, node_type: bool, relationship: bool) -> 
     return found[0]
 
 
-def _schema_edit(edit, path: Path) -> None:
+def _schema_edit(edit, path: Path, *, invalid_prefix: str = "", invalid_hint: str = "") -> None:
     """Apply `edit(text) -> new text`, validate the whole result as the indexer would, then write it atomically."""
     from devgraph.config.list_edit import ListEditError
     from devgraph.config.project_schema import ProjectSchemaError, parse_project_schema, resolve_declaration
 
     try:
         new_text = edit(_schema_text(path))
-        resolve_declaration(parse_project_schema(new_text, path), origin=str(path))
+        try:
+            resolve_declaration(parse_project_schema(new_text, path), origin=str(path))
+        except ProjectSchemaError as exc:
+            raise _tools_fail(f"{invalid_prefix}{exc}{invalid_hint}")
         _write_atomically(path, new_text)
-    except (ListEditError, ProjectSchemaError, OSError) as exc:
+    except (ListEditError, OSError) as exc:
         raise _tools_fail(str(exc))
 
 
@@ -2474,30 +2489,94 @@ def _schema_done(verb: str, section: str, name: str, path: Path, root: Path) -> 
 
 
 def _removed_types(before, after) -> tuple[list[str], list[str]]:
-    """Declared node labels and relationship types in `before` but not `after` (None counts as empty)."""
+    """Declared node labels and relationship types in `before` but not `after` (None counts as empty).
+
+    Built-in relationship types are never deleted by the indexer, so they are not reported.
+    """
+    from devgraph.graph.schema import RELATIONSHIP_TYPES
+
     def names(declaration):
         if declaration is None:
             return set(), set()
-        return {n.label for n in declaration.node_types}, {r.type for r in declaration.relationships}
+        return (
+            {n.label for n in declaration.node_types},
+            {r.type for r in declaration.relationships if r.type not in RELATIONSHIP_TYPES},
+        )
 
     old_labels, old_types = names(before)
     new_labels, new_types = names(after)
     return sorted(old_labels - new_labels), sorted(old_types - new_types)
 
 
-def _warn_removed(labels: list[str], types: list[str]) -> None:
+def _pruned_types(before, after) -> list[str]:
+    """Labels kept in `after` whose filesystem-sourced nodes the next apply deletes: source dropped or kind changed."""
+    if before is None or after is None:
+        return []
+    now = {n.label: n for n in after.node_types}
+    pruned = []
+    for old in before.node_types:
+        new = now.get(old.label)
+        if new is None or old.source is None:
+            continue
+        if new.source is None:
+            pruned.append(f"{old.label} (source removed)")
+        elif new.source.kind != old.source.kind:
+            pruned.append(f"{old.label} (kind {old.source.kind} -> {new.source.kind})")
+    return sorted(pruned)
+
+
+def _changed_keys(before, after) -> list[tuple[str, tuple[str, ...]]]:
+    """(label, old key) for node types present in both whose key changed."""
+    if before is None or after is None:
+        return []
+    now = {n.label: n for n in after.node_types}
+    return [(o.label, tuple(o.key)) for o in before.node_types if o.label in now and tuple(now[o.label].key) != tuple(o.key)]
+
+
+def _warn_removed(labels: list[str], types: list[str], pruned: list[str] = (), *, root: Path) -> None:
+    when = "the next rescan" if _schema_record(root) and _schema_record(root).project_config_enabled else "applying this schema"
     if labels:
         console.print(
-            f"[yellow]Warning:[/yellow] the next rescan deletes the nodes of the removed node type(s): "
+            f"[yellow]Warning:[/yellow] {when} deletes the nodes of the removed node type(s): "
             f"{escape(', '.join(labels))}.",
+            soft_wrap=True,
+        )
+    if pruned:
+        console.print(
+            f"[yellow]Warning:[/yellow] {when} deletes the nodes of node type(s) whose filesystem source "
+            f"changed: {escape(', '.join(pruned))}.",
             soft_wrap=True,
         )
     if types:
         console.print(
-            f"[yellow]Warning:[/yellow] the next rescan removes the relationships of the removed "
+            f"[yellow]Warning:[/yellow] {when} removes the relationships of the removed "
             f"relationship type(s): {escape(', '.join(types))}.",
             soft_wrap=True,
         )
+
+
+def _schema_follow_up(root: Path, before, after, entry: dict | None = None) -> None:
+    """Warnings and notes after a successful write: lost nodes, unpopulated types, key changes, conflicts."""
+    _warn_removed(*_removed_types(before, after), _pruned_types(before, after), root=root)
+    for label, old_key in _changed_keys(before, after):
+        console.print(
+            f"[yellow]Warning:[/yellow] the existing uniqueness constraint on {escape(label)} keeps the old key "
+            f"({escape(', '.join(old_key))}) until constraints are dropped (dropping constraints/indexes for "
+            f"removed labels is still open; see PROJECT_STATUS.md).",
+            soft_wrap=True,
+        )
+    if entry is not None and "label" in entry and entry.get("source") is None:
+        console.print(
+            f"Note: no provider produces {escape(str(entry['label']))} nodes yet; only node types with "
+            f"`source: {{provider: filesystem}}` are populated.",
+            soft_wrap=True,
+        )
+    record = _schema_record(root)
+    if record is None or after is None:
+        return
+    for finding in _project_schema_findings(_registered_repos()):
+        if finding["status"] == "conflict" and record.repo_id in finding.get("repo_ids", ()):
+            console.print(f"[yellow]Warning:[/yellow] {escape(finding['detail'])}", soft_wrap=True)
 
 
 @schema_app.command("list")
@@ -2521,12 +2600,20 @@ def config_schema_list(
     node_types: list[dict[str, Any]] = []
     relationships: list[dict[str, Any]] = []
     if declaration is None or declaration.extends == "default":
-        node_types += [{"label": n, "origin": "built-in", "key": None} for n in NODE_LABELS]
+        node_types += [{"label": n, "origin": "built-in", "key": None, "source": None} for n in NODE_LABELS]
         relationships += [
             {"type": t, "from": None, "to": None, "provider": "builtin", "origin": "built-in"}
             for t in RELATIONSHIP_TYPES
         ]
-    node_types += [{"label": n.label, "origin": "project", "key": list(n.key)} for n in effective.node_types]
+    node_types += [
+        {
+            "label": n.label,
+            "origin": "project",
+            "key": list(n.key),
+            "source": {"provider": n.source.provider, "kind": n.source.kind} if n.source else None,
+        }
+        for n in effective.node_types
+    ]
     relationships += [
         {"type": r.type, "from": list(r.from_labels), "to": r.to, "provider": r.provider, "origin": "project"}
         for r in effective.relationships
@@ -2539,8 +2626,13 @@ def config_schema_list(
     nodes.add_column("Label", style="cyan")
     nodes.add_column("Origin")
     nodes.add_column("Key")
+    nodes.add_column("Source")
     for row in node_types:
-        nodes.add_row(escape(row["label"]), row["origin"], escape(", ".join(row["key"] or ())))
+        source = row["source"]
+        nodes.add_row(
+            escape(row["label"]), row["origin"], escape(", ".join(row["key"] or ())),
+            f"{source['provider']} ({source['kind']})" if source else "\u2014",
+        )
     console.print(nodes)
     rels = Table(title="Relationships")
     for column in ("Type", "Origin", "From", "To", "Provider"):
@@ -2552,6 +2644,29 @@ def config_schema_list(
     console.print(rels)
     if not project_config_enabled(root):
         console.print("Project config is disabled: only the built-in schema is in effect.")
+
+
+def _duplicate_relationship(entry: dict, existing: list) -> bool:
+    """Whether `entry` equals an existing relationship once both are validated (`from: X` == `from: [X]`)."""
+    from pydantic import ValidationError
+
+    from devgraph.config.project_schema import RelationshipDecl
+
+    def normal(raw):
+        decl = RelationshipDecl.model_validate(raw)
+        return (decl.type, decl.from_labels, decl.to, decl.provider, decl.custom)
+
+    try:
+        new = normal(entry)
+    except ValidationError:
+        return False  # invalid entries are reported by the write's own validation
+    for other in existing:
+        try:
+            if normal(other) == new:
+                return True
+        except ValidationError:
+            continue
+    return False
 
 
 @schema_app.command("add")
@@ -2576,16 +2691,19 @@ def config_schema_add(
     name = entry[ident]
     if section == "node_types" and any(isinstance(e, dict) and e.get(ident) == name for e in existing):
         raise _tools_fail(f"a node type named {name!r} already exists; use `devgraph config schema edit {name}`")
-    if section == "relationships" and entry in existing:
+    if section == "relationships" and _duplicate_relationship(entry, existing):
         raise _tools_fail(f"an identical relationship {name!r} already exists")
+    before = _schema_declaration(_schema_text(path), path)
     # Relationships may share a type with different endpoints; only node type labels are unique.
     _schema_edit(
         lambda text: add_entry_text(
             text, entry, key=section, ident=ident, version=SCHEMA_VERSION, noun=noun, unique=section == "node_types"
         ),
         path,
+        invalid_prefix="the new entry is invalid: ",
     )
     _schema_done("Added", section, str(name), path, root)
+    _schema_follow_up(root, before, _schema_declaration(_schema_text(path), path), entry)
 
 
 @schema_app.command("edit")
@@ -2630,9 +2748,10 @@ def config_schema_edit(
     _schema_edit(
         lambda current_text: replace_entry_text(current_text, name, entry, key=section, ident=ident, noun=noun),
         path,
+        invalid_prefix="the new entry is invalid: ",
     )
     _schema_done("Updated", section, name, path, root)
-    _warn_removed(*_removed_types(_schema_declaration(text, path), _schema_declaration(_schema_text(path), path)))
+    _schema_follow_up(root, _schema_declaration(text, path), _schema_declaration(_schema_text(path), path), entry)
 
 
 @schema_app.command("delete")
@@ -2653,9 +2772,13 @@ def config_schema_delete(
     section = _locate_entry(text, name, node_type, relationship)
     ident, noun = _SCHEMA_SECTIONS[section]
     before = _schema_declaration(text, path)
-    _schema_edit(lambda current: delete_entry_text(current, name, key=section, ident=ident, noun=noun), path)
+    _schema_edit(
+        lambda current: delete_entry_text(current, name, key=section, ident=ident, noun=noun),
+        path,
+        invalid_hint="; delete or edit the relationships that use it first" if section == "node_types" else "",
+    )
     _schema_done("Deleted", section, name, path, root)
-    _warn_removed(*_removed_types(before, _schema_declaration(_schema_text(path), path)))
+    _schema_follow_up(root, before, _schema_declaration(_schema_text(path), path))
 
 
 @schema_app.command("reset")
@@ -2681,7 +2804,7 @@ def config_schema_reset(
         raise _tools_fail(str(exc))
     console.print(f"[green]Reset[/green] {escape(str(path))}", soft_wrap=True)
     console.print(escape(_schema_effect_note(root)), soft_wrap=True)
-    _warn_removed(*_removed_types(before, None))
+    _schema_follow_up(root, before, None)
 
 
 @app.command()
