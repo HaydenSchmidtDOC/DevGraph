@@ -1814,17 +1814,17 @@ def _schema_report(repo_root: Path | None) -> dict[str, Any]:
     inherits = effective.extends == "default"
 
     node_types: list[dict[str, Any]] = [
-        {"label": label, "origin": "built-in", "key": None} for label in (NODE_LABELS if inherits else ())
+        {"label": label, "origin": "built-in", "key": None, "color": None} for label in (NODE_LABELS if inherits else ())
     ]
     node_types += [
-        {"label": n.label, "origin": SCHEMA_FILENAME, "key": list(n.key)} for n in effective.node_types
+        {"label": n.label, "origin": SCHEMA_FILENAME, "key": list(n.key), "color": n.color} for n in effective.node_types
     ]
     relationships: list[dict[str, Any]] = [
-        {"type": rel, "origin": "built-in", "from": None, "to": None, "provider": "builtin"}
+        {"type": rel, "origin": "built-in", "from": None, "to": None, "provider": "builtin", "color": None}
         for rel in (RELATIONSHIP_TYPES if inherits else ())
     ]
     relationships += [
-        {"type": r.type, "origin": SCHEMA_FILENAME, "from": r.from_, "to": r.to, "provider": r.provider}
+        {"type": r.type, "origin": SCHEMA_FILENAME, "from": r.from_, "to": r.to, "provider": r.provider, "color": r.color}
         for r in effective.relationships
     ]
     if repo_root is None:
@@ -2600,9 +2600,9 @@ def config_schema_list(
     node_types: list[dict[str, Any]] = []
     relationships: list[dict[str, Any]] = []
     if declaration is None or declaration.extends == "default":
-        node_types += [{"label": n, "origin": "built-in", "key": None, "source": None} for n in NODE_LABELS]
+        node_types += [{"label": n, "origin": "built-in", "key": None, "source": None, "color": None} for n in NODE_LABELS]
         relationships += [
-            {"type": t, "from": None, "to": None, "provider": "builtin", "origin": "built-in"}
+            {"type": t, "from": None, "to": None, "provider": "builtin", "origin": "built-in", "color": None}
             for t in RELATIONSHIP_TYPES
         ]
     node_types += [
@@ -2611,11 +2611,12 @@ def config_schema_list(
             "origin": "project",
             "key": list(n.key),
             "source": {"provider": n.source.provider, "kind": n.source.kind} if n.source else None,
+            "color": n.color,
         }
         for n in effective.node_types
     ]
     relationships += [
-        {"type": r.type, "from": list(r.from_labels), "to": r.to, "provider": r.provider, "origin": "project"}
+        {"type": r.type, "from": list(r.from_labels), "to": r.to, "provider": r.provider, "origin": "project", "color": r.color}
         for r in effective.relationships
     ]
 
@@ -2627,19 +2628,21 @@ def config_schema_list(
     nodes.add_column("Origin")
     nodes.add_column("Key")
     nodes.add_column("Source")
+    nodes.add_column("Colour")
     for row in node_types:
         source = row["source"]
         nodes.add_row(
             escape(row["label"]), row["origin"], escape(", ".join(row["key"] or ())),
             f"{source['provider']} ({source['kind']})" if source else "\u2014",
+            row["color"] or "\u2014",
         )
     console.print(nodes)
     rels = Table(title="Relationships")
-    for column in ("Type", "Origin", "From", "To", "Provider"):
+    for column in ("Type", "Origin", "From", "To", "Provider", "Colour"):
         rels.add_column(column, style="cyan" if column == "Type" else None)
     for row in relationships:
         rels.add_row(
-            escape(row["type"]), row["origin"], escape(", ".join(row["from"] or ())), escape(row["to"] or ""), row["provider"]
+            escape(row["type"]), row["origin"], escape(", ".join(row["from"] or ())), escape(row["to"] or ""), row["provider"], row["color"] or "\u2014"
         )
     console.print(rels)
     if not project_config_enabled(root):

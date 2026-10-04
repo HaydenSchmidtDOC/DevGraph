@@ -205,11 +205,11 @@ def test_show_marks_where_each_entry_comes_from(runner, settings, tmp_path):
     data = show_json(runner, "--repo", str(write(tmp_path, WIDGET)))
     assert data["status"] == "valid" and data["schema_file"].endswith(SCHEMA_FILENAME)
     widget = next(n for n in data["node_types"] if n["label"] == "Widget")
-    assert widget == {"label": "Widget", "origin": SCHEMA_FILENAME, "key": ["slug"]}
+    assert widget == {"label": "Widget", "origin": SCHEMA_FILENAME, "key": ["slug"], "color": None}
     links = next(r for r in data["relationships"] if r["type"] == "LINKS")
-    assert links == {"type": "LINKS", "origin": SCHEMA_FILENAME, "from": "Widget", "to": "Module", "provider": "custom"}
+    assert links == {"type": "LINKS", "origin": SCHEMA_FILENAME, "from": "Widget", "to": "Module", "provider": "custom", "color": None}
     module = next(n for n in data["node_types"] if n["label"] == "Module")
-    assert module == {"label": "Module", "origin": "built-in", "key": None}
+    assert module == {"label": "Module", "origin": "built-in", "key": None, "color": None}
 
 
 def test_show_with_extends_none_has_no_builtins(runner, settings, tmp_path):
@@ -548,3 +548,10 @@ def test_validate_all_marks_a_disabled_repo_in_a_conflict(runner, settings, tmp_
     assert result.exit_code == 1, result.output
     text = " ".join(result.output.split())
     assert "repo-b (disabled) declares" in text and "repo-a (disabled)" not in text
+
+
+def test_show_json_includes_colour(runner, settings, tmp_path):
+    text = WIDGET.replace("- label: Widget", "- label: Widget\n        color: \"#1f77b4\"")
+    data = show_json(runner, "--repo", str(write(tmp_path, text)))
+    assert next(n for n in data["node_types"] if n["label"] == "Widget")["color"] == "#1f77b4"
+    assert next(r for r in data["relationships"] if r["type"] == "LINKS")["color"] is None

@@ -152,6 +152,15 @@ class MetadataField(BaseModel):
         return value
 
 
+COLOR_PATTERN = r"^#[0-9a-fA-F]{6}$"
+
+
+def _check_color(value: object) -> object:
+    if isinstance(value, str) and not re.fullmatch(COLOR_PATTERN, value):
+        raise ValueError(f"color {value!r} must be a hex colour written as #rrggbb")
+    return value
+
+
 class NodeSource(BaseModel):
     """Where a user-declared node type's nodes are extracted from."""
 
@@ -171,6 +180,9 @@ class NodeTypeDecl(BaseModel):
     metadata: tuple[MetadataField, ...] = ()
     description: str | None = None
     source: NodeSource | None = None
+    color: str | None = Field(default=None, pattern=COLOR_PATTERN)
+
+    _check_color = field_validator("color", mode="before")(_check_color)
 
     @field_validator("label")
     @classmethod
@@ -272,6 +284,9 @@ class RelationshipDecl(BaseModel):
     to: str
     provider: ProviderKind = "builtin"
     custom: CustomProvider | None = None
+    color: str | None = Field(default=None, pattern=COLOR_PATTERN)
+
+    _check_color = field_validator("color", mode="before")(_check_color)
 
     @field_validator("type")
     @classmethod
@@ -696,6 +711,7 @@ extends: default
 #         type: string
 #         required: true
 #       - name: owner
+#     color: "#1f77b4"   # optional #rrggbb display colour (also valid on relationships)
 #
 # relationships:
 #   - type: DOCUMENTS

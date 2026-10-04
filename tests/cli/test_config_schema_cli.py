@@ -115,10 +115,10 @@ def test_list_json_shape(runner, settings, repo):
     assert result.exit_code == 0, result.output
     data = json.loads(result.output)
     ticket = next(n for n in data["node_types"] if n["label"] == "Ticket")
-    assert ticket == {"label": "Ticket", "origin": "project", "key": ["id"], "source": None}
+    assert ticket == {"label": "Ticket", "origin": "project", "key": ["id"], "source": None, "color": None}
     assert any(n["label"] == "Function" and n["origin"] == "built-in" for n in data["node_types"])
     rel = next(r for r in data["relationships"] if r["origin"] == "project")
-    assert rel == {"type": "USES", "from": ["Ticket"], "to": "Function", "provider": "builtin", "origin": "project"}
+    assert rel == {"type": "USES", "from": ["Ticket"], "to": "Function", "provider": "builtin", "origin": "project", "color": None}
 
 
 def test_list_disabled_repo_says_so(runner, settings, repo):
@@ -128,6 +128,21 @@ def test_list_disabled_repo_says_so(runner, settings, repo):
     assert result.exit_code == 0, result.output
     out = flat(result.output)
     assert "disabled" in out and "Function" in out and "Ticket" not in out
+
+
+def test_list_json_and_table_include_colour(runner, settings, repo):
+    register(settings, repo)
+    schema_file(repo).write_text(
+        SCHEMA.replace("- label: Ticket", '- label: Ticket\n    color: "#1f77b4"').replace(
+            "- type: USES", '- type: USES\n    color: "#FF0000"'
+        )
+    )
+    data = json.loads(run(runner, "list", "--repo", str(repo), "--json").output)
+    assert next(n for n in data["node_types"] if n["label"] == "Ticket")["color"] == "#1f77b4"
+    assert next(r for r in data["relationships"] if r["origin"] == "project")["color"] == "#FF0000"
+    assert next(n for n in data["node_types"] if n["label"] == "Function")["color"] is None
+    out = flat(run(runner, "list", "--repo", str(repo)).output)
+    assert "Colour" in out and "#1f77b4" in out
 
 
 # -- add ---------------------------------------------------------------------

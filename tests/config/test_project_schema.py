@@ -1331,3 +1331,56 @@ def test_parse_project_schema_matches_loader_errors(tmp_path):
     assert str(via_parse.value) == str(via_loader.value)
     assert "malformed YAML" in str(via_parse.value)
     assert project_schema.parse_project_schema(textwrap.dedent(WIDGET), path).node_types[0].label == "Widget"
+
+
+# --- Display colour -------------------------------------------------------
+
+COLOURED = """
+    version: 1
+    node_types:
+      - label: Widget
+        color: "{node}"
+        key: [slug]
+        metadata:
+          - name: slug
+    relationships:
+      - type: USES
+        color: "{rel}"
+        from: Widget
+        to: Module
+"""
+
+
+def test_colour_is_accepted_on_node_type_and_relationship(tmp_path):
+    repo = write_schema(tmp_path, COLOURED.format(node="#1f77b4", rel="#AbCdEf"))
+    declaration = load_project_schema(repo)
+    assert declaration.node_types[0].color == "#1f77b4"
+    assert declaration.relationships[0].color == "#AbCdEf"
+
+
+def test_colour_defaults_to_none(tmp_path):
+    declaration = load_project_schema(write_schema(tmp_path, WIDGET))
+    assert declaration.node_types[0].color is None
+
+
+@pytest.mark.parametrize("bad", ["blue", "#12345", "#gggggg", "#1234567"])
+@pytest.mark.parametrize("where", ["node", "rel"])
+def test_bad_colour_is_rejected_naming_field_and_format(tmp_path, bad, where):
+    good = "#1f77b4"
+    repo = write_schema(
+        tmp_path,
+        COLOURED.format(node=bad if where == "node" else good, rel=bad if where == "rel" else good),
+    )
+    with pytest.raises(ProjectSchemaError, match=r"color: .*#rrggbb"):
+        load_project_schema(repo)
+
+
+def test_json_schema_documents_colour_pattern():
+    defs = project_schema_json_schema()["$defs"]
+    for name in ("NodeTypeDecl", "RelationshipDecl"):
+        branches = defs[name]["properties"]["color"]["anyOf"]
+        assert any(b.get("pattern") == "^#[0-9a-fA-F]{6}$" for b in branches)
+
+
+def test_starter_template_mentions_colour():
+    assert 'color: "#1f77b4"' in project_schema.starter_schema_text()
