@@ -18,3 +18,11 @@ def _isolate_project_switch_registry(tmp_path, monkeypatch):
 
     missing = tmp_path / "no-registry" / "registry.db"
     monkeypatch.setattr(project_switch, "_registry_db_path", lambda: missing)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_global_tools_store(tmp_path, monkeypatch):
+    """Keep the global tools store away from the user's real ~/.devgraph."""
+    from devgraph.config import global_tools
+
+    monkeypatch.setattr(global_tools, "_default_path", lambda: tmp_path / "no-global" / global_tools.GLOBAL_TOOLS_FILENAME)
