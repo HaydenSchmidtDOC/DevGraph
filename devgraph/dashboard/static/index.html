@@ -570,7 +570,7 @@ table.dstable input[type="text"] { width: 100%; }
           <div class="autocomplete" id="autocomplete"></div>
         </div>
         <div class="cypher-foot">
-          <span class="cypher-note" id="cypherNote">Matches glow live as you type · MCP cypher access for AI agents toggles in <a href="#" id="linkOpenMcpSettings" style="color:var(--accent-hover)">Settings</a>.</span>
+          <span class="cypher-note" id="cypherNote">Matches glow live as you type · MCP clients' raw Cypher access (<code>run_cypher</code>) is shown in <a href="#" id="linkOpenConfig" style="color:var(--accent-hover)">Settings → Config</a>.</span>
           <button class="btn btn-sm" id="btnRunCypher">Run</button>
         </div>
         <div class="cypher-error" id="cypherError"></div>
@@ -650,7 +650,6 @@ table.dstable input[type="text"] { width: 100%; }
       <nav class="settings-nav" data-od-id="settings-nav">
         <button class="active" data-pane="repos">Repos</button>
         <button data-pane="config">Config</button>
-        <button data-pane="mcp">MCP tools</button>
         <button data-pane="watcher">Watcher / tray</button>
         <button data-pane="network">Network / access</button>
         <button data-pane="neo4j">Neo4j</button>
@@ -694,23 +693,6 @@ table.dstable input[type="text"] { width: 100%; }
           <p class="desc">Node types, relationship types and MCP tools: DevGraph's built-ins and the global tools store, then each registered repository's own <code>devgraph.schema.yaml</code> and <code>devgraph.tools.yaml</code>. Edits are validated exactly like <code>devgraph config</code> and written to the file — nothing is committed.</p>
           <div class="cfg-toolbar"><button class="btn btn-sm" id="btnConfigReload">Reload</button><div class="cfg-status" id="configStatus"></div></div>
           <div class="cfg-scopes" id="configScopes"></div>
-        </div>
-
-        <div class="settings-pane" id="pane-mcp" data-od-id="pane-mcp">
-          <h3 class="pane-title">MCP tool exposure</h3>
-          <p class="desc">19 read tools registered today, plus the raw Cypher escape hatch below. Per-tool toggles gate registration in <code>mcp/server.py</code> — propagated via the shared config store, not a live push to running MCP processes.</p>
-          <div class="card">
-            <div class="tool-row" style="padding-bottom:10px; margin-bottom:6px; border-bottom:1px solid var(--border-soft); border-top:none; align-items:flex-start">
-              <div>
-                <span class="tool-name" style="color:var(--fg); font-weight:590">enable_run_cypher</span>
-                <div class="tool-desc" style="margin:2px 0 0">Raw Cypher access against Neo4j — global switch, off by default</div>
-                <div class="warn-note" id="cypherWarnNote" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg>MCP clients (Claude Code, IDEs, other AI agents) can now run arbitrary Cypher through this tool. The dashboard's own Cypher box on the Graph page is unaffected either way.</div>
-              </div>
-              <label class="switch"><input type="checkbox" id="toggleCypher" /><span class="track"></span><span class="thumb"></span></label>
-            </div>
-            <div id="mcpToolList"></div>
-          </div>
-          <div class="banner warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg>Per-model / per-client MCP access control is explicitly skipped this pass — the server is stdio-transport, 1:1 per client, with no allowlisting concept yet. Separate future spec.</div>
         </div>
 
         <div class="settings-pane" id="pane-watcher" data-od-id="pane-watcher">
@@ -2870,7 +2852,7 @@ btnRunCypher.addEventListener("click", () => runCypherAndDisplay(cypherInput.val
 document.getElementById("btnGraphReload").addEventListener("click", () => {
   if (cy.elements().length) forceDirectedSettle(() => focusRotation(null, 60, 1000), "full");
 });
-document.querySelectorAll('#linkOpenMcpSettings').forEach(l => l.addEventListener("click", e => { e.preventDefault(); document.getElementById("settingsOverlay").classList.add("open"); document.querySelector('[data-pane="mcp"]').click(); }));
+document.querySelectorAll('#linkOpenConfig').forEach(l => l.addEventListener("click", e => { e.preventDefault(); document.getElementById("settingsOverlay").classList.add("open"); document.querySelector('[data-pane="config"]').click(); }));
 
 /* "input" fires continuously while dragging -- cheap client-side filtering
    of whatever's already loaded, no network call, so raising the slider
@@ -2916,7 +2898,7 @@ document.getElementById("repoSelect").addEventListener("change", onRepoSelectCha
 document.getElementById("btnOpenSettings").addEventListener("click", () => document.getElementById("settingsOverlay").classList.add("open"));
 document.getElementById("btnCloseSettings").addEventListener("click", () => document.getElementById("settingsOverlay").classList.remove("open"));
 /* The header's "+ Register repo" button is a shortcut to where registration
-   actually lives, same shape as #linkOpenMcpSettings: open the overlay, then
+   actually lives, same shape as #linkOpenConfig: open the overlay, then
    click the nav button so the settings-nav handler below does the pane swap --
    there stays exactly one place that knows how to switch panes. */
 document.getElementById("btnRegister").addEventListener("click", () => { document.getElementById("settingsOverlay").classList.add("open"); document.querySelector('[data-pane="repos"]').click(); });
@@ -3073,7 +3055,15 @@ function renderConfigScope(scope, block) {
     card.appendChild(configSection("Nodes", null, [], null, configLockedChips(block.node_types.map(t => t.label))));
     card.appendChild(configSection("Relationships", null, [], null, configLockedChips(block.relationship_types.map(r => r.type))));
     const box = configEl("div", "");
-    tools.builtin.forEach(t => box.appendChild(configRow(t.name, "", [configEl("span", "tool-desc", t.description || "")], [configLockEl()])));
+    tools.builtin.forEach(t => {
+      const extras = [configEl("span", "tool-desc", t.description || "")];
+      if (t.name === "run_cypher") extras.push(configBadgeEl({ level: "warn", text: "Raw Cypher enabled",
+        detail: "MCP clients can run arbitrary Cypher against the graph. The dashboard's own Cypher box is unaffected." }));
+      box.appendChild(configRow(t.name, "", extras, [configLockEl()]));
+    });
+    if (!tools.run_cypher_enabled) box.appendChild(configRow("run_cypher", "",
+      [configEl("span", "tool-desc", "off: raw Cypher for MCP clients. Set DEVGRAPH_ENABLE_RUN_CYPHER=true and restart MCP sessions to serve it.")],
+      [configLockEl()]));
     configEntryRows(box, scope, "tools", tools.entries, "name");
     card.appendChild(configSection("Tools", tools.file, tools.badges, add("tools"), box, reset(tools, "tools")));
   } else {
@@ -3618,12 +3608,6 @@ async function loadConfigPage(quiet) {
 /* ── end Config page ── */
 document.getElementById("btnConfigReload").addEventListener("click", () => loadConfigPage());
 document.addEventListener("keydown", configModalKey);
-
-/* enable_run_cypher only gates MCP/AI-agent tool access — the dashboard's own
-   Cypher box always runs, so it never gets disabled or re-worded here. */
-const toggleCypher = document.getElementById("toggleCypher");
-const cypherWarnNote = document.getElementById("cypherWarnNote");
-toggleCypher.addEventListener("change", () => { cypherWarnNote.style.display = toggleCypher.checked ? "flex" : "none"; });
 
 /* ── register-repo form (Repos pane) ──────────────────────────────────
    POSTs to /api/repos, which runs the same add-then-initial-scan the CLI's
@@ -4392,16 +4376,6 @@ async function loadTopologyCounts() {
   } catch (e) { /* left at static/sample values — next repo switch or reconnect retries */ }
 }
 
-const mcpToolList = document.getElementById("mcpToolList");
-async function loadMcpTools() {
-  try {
-    const tools = await fetch("/api/mcp-tools").then(r => r.json());
-    mcpToolList.innerHTML = "";
-    tools.forEach(t => { const row = document.createElement("div"); row.className = "tool-row"; row.innerHTML = `<span class="tool-name">${escapeHtmlVal(t.name)}</span><span class="tool-desc">${escapeHtmlVal(t.description || "")}</span><label class="switch"><input type="checkbox" checked/><span class="track"></span><span class="thumb"></span></label>`; mcpToolList.appendChild(row); });
-  } catch (e) { /* left empty — pane still usable, just no rows */ }
-}
-loadMcpTools();
-
 /* ── settings panes: display real current config (GET /api/settings) instead
    of the literal values baked into the HTML. Every field here stays
    disabled/queued-for-restart — see the panes' own banners for why nothing
@@ -4415,8 +4389,6 @@ async function loadDashboardSettings() {
     setVal("cfgNeo4jUser", s.neo4j_user);
     setVal("cfgDashboardHost", s.dashboard_host);
     setVal("cfgDashboardPort", s.dashboard_port);
-    const cypherToggle = document.getElementById("toggleCypher");
-    if (cypherToggle) cypherToggle.checked = !!s.enable_run_cypher;
     const globalFields = {
       telemetry_enabled: s.telemetry_enabled,
       cloud_sync: s.cloud_sync,

@@ -192,7 +192,7 @@ Each section also has a **Reset** button that empties a whole file: `devgraph.to
 
 Each repository card has a **Project config** switch, the dashboard form of `devgraph config enable|disable`: switching it off serves no project tools and gives the repository the built-in schema at the next rescan (a dry run shows any warnings first). It is `PUT /api/config/{repo_id}/project-config` with `{"enabled": true|false}` (naming the end state, so no `If-Match`).
 
-Not in this page yet: copying entries between repositories, a structured form editor, cross-repository schema conflict badges, and retiring the prototype "MCP tools" pane.
+The prototype "MCP tools" pane is gone: the Global card now shows `run_cypher` read-only (off, with the `DEVGRAPH_ENABLE_RUN_CYPHER=true` setting that turns it on, or a "Raw Cypher enabled" badge when it is on). Not in this page yet: copying entries between repositories, a structured form editor, and cross-repository schema conflict badges.
 
 ## Optional indexing
 

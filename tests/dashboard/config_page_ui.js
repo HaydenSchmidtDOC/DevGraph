@@ -1188,6 +1188,25 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     allEls.every(e => !e._html.includes("<img") && !e._html.includes("onerror")), els.configModalTitle.textContent);
   els.configModalCancel.fire("click");
 
+  // 35. run_cypher's real state is read-only on the Global card
+  const cypherModel = enabled => {
+    const m = MODEL();
+    m.global.tools.run_cypher_enabled = enabled;
+    if (enabled) m.global.tools.builtin.push({ name: "run_cypher", tool_id: "run_cypher", locked: true, description: "Raw Cypher." });
+    return m;
+  };
+  api.renderConfigPage(cypherModel(false));
+  let cypherRow = rowFor(card("__global__"), "run_cypher");
+  check("run_cypher off: a locked line names DEVGRAPH_ENABLE_RUN_CYPHER and has no control",
+    cypherRow && /DEVGRAPH_ENABLE_RUN_CYPHER=true/.test(cypherRow.textContent) && byClass(cypherRow, "cfg-lock").length === 1 &&
+    find(cypherRow, e => e.tagName === "BUTTON" || e.tagName === "INPUT").length === 0 && byClass(cypherRow, "cfg-badge").length === 0,
+    cypherRow && cypherRow.textContent);
+  api.renderConfigPage(cypherModel(true));
+  const onRows = byClass(card("__global__"), "tool-row").filter(r => byClass(r, "tool-name")[0].textContent === "run_cypher");
+  check("run_cypher on: one built-in row with a warn badge and no off line",
+    onRows.length === 1 && byClass(onRows[0], "cfg-badge").some(b => b.textContent === "Raw Cypher enabled" && b.classList.contains("warn")) &&
+    !/DEVGRAPH_ENABLE_RUN_CYPHER/.test(onRows[0].textContent), JSON.stringify(onRows.map(r => r.textContent)));
+
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);
 })().catch(e => { console.error(e); process.exit(1); });
