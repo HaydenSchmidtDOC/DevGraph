@@ -555,3 +555,13 @@ def test_a_bad_date_or_deep_nesting_save_keeps_the_last_good_tools(tmp_path, mon
         current = status(server)
         assert current["served"] == ["list_files"]
         assert any("keeping the last good tools" in n for n in current["notices"])
+
+
+def test_a_fifo_tools_file_is_never_opened(tmp_path):
+    import os
+
+    from devgraph.mcp import tool_plane
+
+    (tmp_path / ".git").mkdir()
+    os.mkfifo(tmp_path / "devgraph.tools.yaml")  # reading it would block forever
+    assert tool_plane.tools_fingerprint(tmp_path) == "unreadable:not_regular"

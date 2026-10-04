@@ -37,7 +37,7 @@ def _display_path(path: Path) -> str:
         return str(path)
 
 
-def _scrub(message: str, path: Path, root: Path | None = None) -> str:
+def scrub(message: str, path: Path, root: Path | None = None) -> str:
     """The message with absolute paths replaced by the file name (no host paths in the browser)."""
     for prefix, label in ((str(path), path.name), (str(root) if root else None, "")):
         if prefix:
@@ -59,7 +59,7 @@ def _read(path: Path) -> tuple[str, str | None]:
     try:
         return edits.read_text(path), None
     except edits.ConfigEditError as exc:
-        return "", _scrub(exc.message, path)
+        return "", scrub(exc.message, path)
 
 
 def _tools_file_state(path: Path, text: str, read_error: str | None) -> tuple[str, str | None]:
@@ -70,7 +70,7 @@ def _tools_file_state(path: Path, text: str, read_error: str | None) -> tuple[st
     try:
         parse_project_tools(text, path)
     except ProjectToolsError as exc:
-        return "invalid", _scrub(str(exc), path)
+        return "invalid", scrub(str(exc), path)
     return "valid", None
 
 
@@ -159,7 +159,7 @@ def _project_tool_entry(record: Any, status: Any, entry: dict, tools_path: Path,
     elif origin == "global":
         if status.project_invalid is not None:
             reason = (f"{TOOLS_FILENAME} is invalid, so the project tool of this name can't be served: "
-                      f"{_scrub(status.project_invalid, tools_path, root)}")
+                      f"{scrub(status.project_invalid, tools_path, root)}")
         else:
             reason = next((n for n in status.notices if n.startswith(f"project tool {name!r} could not")), "")
         badges.append(badge("warn", "fallback-global", "Not served: using the global tool", reason))
@@ -198,7 +198,7 @@ def _schema_block(record: Any, root: Path, info: dict[str, Any]) -> dict[str, An
     if read_error and state != "disabled":
         state = "invalid"
     if error:
-        error = _scrub(error, path, root)
+        error = scrub(error, path, root)
 
     node_entries: list[dict] = []
     rel_entries: list[dict] = []
@@ -252,7 +252,7 @@ def build_project(record: Any, schema_info: Callable[[Any], dict[str, Any]], sta
     if not record.project_config_enabled:
         state, error = "disabled", None
     elif status.project_invalid is not None:
-        state, error = "invalid", _scrub(status.project_invalid, path, root)
+        state, error = "invalid", scrub(status.project_invalid, path, root)
     else:
         state, error = _tools_file_state(path, text, read_error)
     badges = _file_badges(state, error, TOOLS_FILENAME)

@@ -16,6 +16,7 @@ import contextlib
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import threading
 from dataclasses import dataclass, field
@@ -91,8 +92,13 @@ def _after_fingerprint(path: Path, text: str, written: bool) -> str:
 
 
 def file_fingerprint(path: Path) -> str:
-    """`absent`, or `sha256:<hex>` of the file's bytes (same scheme as `schema_file_hash`, switch-independent)."""
+    """`absent`, or `sha256:<hex>` of the file's bytes (same scheme as `schema_file_hash`, switch-independent).
+
+    `not_regular` for a directory, FIFO or device, which is never opened (a FIFO would block the read).
+    """
     try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return "not_regular"
         return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
     except FileNotFoundError:
         return "absent"
@@ -100,14 +106,24 @@ def file_fingerprint(path: Path) -> str:
         return f"unreadable:{type(exc).__name__}"
 
 
+def _not_regular(path: Path) -> ConfigEditError:
+    return ConfigEditError(f"{path.name} cannot be read: not a regular file; fix or remove it by hand", "not_regular")
+
+
 def _check_target(path: Path) -> None:
-    """Refuse a symlink target: `os.replace` would swap the link for a file (a directory fails on read).
+    """Refuse a symlink target (`os.replace` would swap the link for a file) and any non-regular file.
 
     Only the final component is checked; a symlinked parent directory is followed as the OS does.
     """
     if path.is_symlink():
         target = path.resolve()
         raise ConfigEditError(f"{path.name} is a symlink to {target}; edit {target} directly", "not_regular")
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(mode):
+        raise _not_regular(path)
 
 
 def _check_fingerprint(path: Path, expected: str | None) -> None:
@@ -116,9 +132,13 @@ def _check_fingerprint(path: Path, expected: str | None) -> None:
 
 
 def read_text(path: Path) -> str:
-    """The file's text, or "" when absent."""
+    """The file's text, or "" when absent; a directory, FIFO or device is `not_regular` and never opened."""
     try:
-        return path.read_text(encoding="utf-8") if path.exists() else ""
+        if not path.exists():
+            return ""
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            raise _not_regular(path)
+        return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise ConfigEditError(f"{path}: cannot be read: {exc}", "unreadable")
 
@@ -365,6 +385,16 @@ def locate_entry(text: str, name: str, node_type: bool = False, relationship: bo
     return found[0]
 
 
+def _section_entries(text: str, section: str) -> list:
+    """The raw entries of one schema section."""
+    from devgraph.config.list_edit import ListEditError, entries
+
+    try:
+        return entries(text, key=section)
+    except ListEditError as exc:
+        raise _splice_error(exc)
+
+
 def find_schema_entry(text: str, name: str, section: str) -> dict:
     """The one entry of `section` named `name`; `ambiguous` when it is declared more than once."""
     from devgraph.config.list_edit import ListEditError, entries
@@ -586,6 +616,11 @@ def replace_schema_entry(
         find_schema_entry(read_text(path), name, section)
         if entry_section(entry) != section:
             raise ConfigEditError(f"the new entry must be a {noun} (with `{ident}`)", "invalid")
+        new_name = entry.get(ident)
+        if section == "node_types" and new_name != name and any(
+            isinstance(e, dict) and e.get(ident) == new_name for e in _section_entries(read_text(path), section)
+        ):
+            raise ConfigEditError(f"a node type named {new_name!r} already exists", "exists")
         old_text, new_text = schema_edit(
             path,
             lambda current: replace_entry_text(current, name, entry, key=section, ident=ident, noun=noun),

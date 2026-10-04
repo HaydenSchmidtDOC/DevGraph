@@ -46,7 +46,7 @@ from devgraph.config.project_schema import (
 from devgraph.config import edits
 from devgraph.config.settings import get_settings
 from devgraph.dashboard import queries
-from devgraph.dashboard.config_model import GLOBAL_SCOPE, _scrub, build_config, build_global, build_project
+from devgraph.dashboard.config_model import GLOBAL_SCOPE, build_config, build_global, build_project, scrub
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.dashboard.git_info import get_git_log, get_git_status
 from devgraph.dashboard.layout_store import load_layout, save_layout
@@ -205,6 +205,18 @@ def _if_match(request: Request) -> str:
     if len(value) >= 2 and value[0] == value[-1] == '"':
         value = value[1:-1]
     return value
+
+
+def _dry_run_flag(value: str | None) -> bool:
+    """`?dry_run=` on DELETE: 1/true/0/false (any case); anything else is refused rather than guessed."""
+    if value is None:
+        return False
+    flag = value.strip().lower()
+    if flag in ("1", "true"):
+        return True
+    if flag in ("0", "false"):
+        return False
+    raise _config_error(400, "bad_request", "dry_run must be 1, true, 0 or false")
 
 
 async def _config_body(request: Request) -> tuple[dict, bool]:
@@ -708,7 +720,10 @@ def build_router(
         record = None if scope == GLOBAL_SCOPE else registry.get(scope)
         if record is None or not record.active:
             raise _config_error(404, "not_found", f"unknown scope: {scope}")
-        if not Path(record.path).resolve().is_dir():
+        root = Path(record.path)
+        if root.resolve() != root:  # the registered directory was replaced by (or moved under) a symlink
+            raise _config_error(409, "not_regular", f"the registered path of {scope} is now a symlink; re-register it")
+        if not root.is_dir():
             raise _config_error(404, "not_found", f"repository directory for {scope} is missing")
         return record
 
@@ -734,22 +749,28 @@ def build_router(
                 logger.warning("config write to %s failed: %s", path, exc.message)
                 raise _config_error(500, "io", f"could not write {path.name}") from exc
             code = exc.code if status != 422 else "invalid"
-            message = _scrub(exc.message, path, root)
-            if code == "not_regular":  # the edits message names the link target, which can be outside the repo
-                message = f"{path.name} is a symlink; edit the file it points to directly"
+            message = scrub(exc.message, path, root)
+            if code == "not_regular":  # a symlink message names the link target, which can be outside the repo
+                message = f"{path.name} is a symlink or not a regular file; fix it by hand"
             raise _config_error(status, code, message, _config_scope(scope)) from exc
         notes = [*result.notes, effect]
+        block = _config_scope(scope)
+        part = block["tools"] if kind == "tools" else block["schema"]
         if result.written:
             notes.append(f"Written to {path.name}; not committed.")
+            # The fingerprint edits.py took under the lock, of exactly what was written: if the file
+            # changed again since, the client's next write is a 412 rather than a blind overwrite.
+            part["fingerprint"] = result.fingerprint
         return JSONResponse(
             status_code=201 if created and result.written else 200,
             content={
                 "ok": True,
                 "written": result.written,
                 "file": path.name,
-                "warnings": [_scrub(w, path, root) for w in result.warnings],
-                "notes": [_scrub(n, path, root) for n in notes],
-                "scope": _config_scope(scope),
+                "fingerprint": part["fingerprint"],
+                "warnings": [scrub(w, path, root) for w in result.warnings],
+                "notes": [scrub(n, path, root) for n in notes],
+                "scope": block,
             },
         )
 
@@ -780,7 +801,7 @@ def build_router(
         _reject_cross_site_config(request)
         record = _write_record(scope)
         expected = _if_match(request)
-        dry = dry_run in ("1", "true")
+        dry = _dry_run_flag(dry_run)
         return await run_in_threadpool(
             _apply_edit, scope, record, "tools",
             lambda root: edits.delete_tool(root, name, expected_fingerprint=expected, dry_run=dry), False,
@@ -825,7 +846,7 @@ def build_router(
         record = _write_record(scope, schema=True)
         _require_section(section)
         expected = _if_match(request)
-        dry = dry_run in ("1", "true")
+        dry = _dry_run_flag(dry_run)
         return await run_in_threadpool(
             _apply_edit, scope, record, "schema",
             lambda root: edits.delete_schema_entry(

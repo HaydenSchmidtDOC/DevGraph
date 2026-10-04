@@ -5,6 +5,7 @@ temporary SQLite file; the global store is redirected to tmp.
 """
 
 import hashlib
+import os
 import json
 import textwrap
 from pathlib import Path
@@ -824,3 +825,135 @@ def test_writes_never_touch_git(client, registry, tmp_path, monkeypatch):
     staged = subprocess.run([*git, "diff", "--cached", "--name-only"], capture_output=True, text=True, check=True).stdout
     assert staged == ""
     assert "label: Gadget" in schema.read_text()
+
+
+# --- hardening -----------------------------------------------------------------------------------
+
+
+def test_unicode_line_breaks_in_values_cannot_inject_keys(client, registry, tmp_path):
+    import yaml
+
+    record = _repo(tmp_path, registry)
+    entry = {"name": "find_parents", "description": "a\nb     max_rows: 7",
+             "cypher": "MATCH (n {repo_id: $repo_id}) RETURN n LIMIT 1"}
+
+    response = _send(client, "POST", "/api/config/repo-a/tools", "absent", {"yaml": yaml.safe_dump(entry)})
+
+    assert response.status_code == 201, response.text
+    [written] = yaml.safe_load((record.path / TOOLS_FILENAME).read_text())["tools"]
+    assert written == entry
+
+
+def test_a_splice_that_diverges_from_the_submitted_entry_is_422(client, registry, tmp_path, monkeypatch):
+    import devgraph.config.list_edit as list_edit
+
+    record = _repo(tmp_path, registry)
+    path = _write(record.path, TOOLS_FILENAME, TOOL.format(name="find_parents"))
+    before = path.read_bytes()
+    monkeypatch.setattr(list_edit, "dump_entry", lambda e: NEW_TOOL.replace("find_parents", "other") + "max_rows: 7\n")
+
+    response = _send(client, "POST", "/api/config/repo-a/tools", _fp(client, "repo-a"), {"yaml": _tool_yaml("other")})
+
+    assert response.status_code == 422 and response.json()["detail"]["code"] == "invalid"
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("yaml_text", [
+    "name: !!binary aGk=\ndescription: x\ncypher: RETURN 1\n",
+    "name: 12\ndescription: x\ncypher: RETURN 1\n",
+])
+def test_non_string_identity_is_422(client, registry, tmp_path, yaml_text):
+    record = _repo(tmp_path, registry)
+
+    response = _send(client, "POST", "/api/config/repo-a/tools", "absent", {"yaml": yaml_text})
+
+    assert response.status_code == 422 and response.json()["detail"]["code"] == "invalid"
+    assert not (record.path / TOOLS_FILENAME).exists()
+
+
+def test_repo_root_replaced_by_a_symlink_is_409(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    real = tmp_path / "moved"
+    record.path.rename(real)
+    record.path.symlink_to(real, target_is_directory=True)
+
+    response = _send(client, "POST", "/api/config/repo-a/tools", "absent", {"yaml": NEW_TOOL})
+
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "not_regular"
+    assert not (real / TOOLS_FILENAME).exists()
+
+
+@pytest.mark.parametrize("kind", ["dir", "fifo"])
+def test_non_regular_target_is_409(client, registry, tmp_path, kind):
+    record = _repo(tmp_path, registry)
+    target = record.path / TOOLS_FILENAME
+    target.mkdir() if kind == "dir" else os.mkfifo(target)
+    fp = _fp(client, "repo-a")  # the read model must not block on a FIFO either
+
+    response = _send(client, "POST", "/api/config/repo-a/tools", fp, {"yaml": NEW_TOOL})
+
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "not_regular"
+
+
+@pytest.mark.parametrize("value,status", [("yes", 400), ("", 400), ("TRUE", 200), ("1", 200), ("0", 200), ("False", 200)])
+def test_delete_dry_run_flag_values(client, registry, tmp_path, value, status):
+    record = _repo(tmp_path, registry)
+    path = _write(record.path, TOOLS_FILENAME, TOOL.format(name="find_parents"))
+    before = path.read_bytes()
+
+    response = _send(client, "DELETE", f"/api/config/repo-a/tools/find_parents?dry_run={value}", _fp(client, "repo-a"))
+
+    assert response.status_code == status, response.text
+    if status == 400:
+        assert response.json()["detail"]["code"] == "bad_request"
+    if status == 400 or value.lower() in ("1", "true"):
+        assert path.read_bytes() == before
+    else:
+        assert "find_parents" not in path.read_text()
+
+
+def test_response_fingerprint_is_the_written_files(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+
+    body = _send(client, "POST", "/api/config/repo-a/tools", "absent", {"yaml": NEW_TOOL}).json()
+
+    expected = "sha256:" + hashlib.sha256((record.path / TOOLS_FILENAME).read_bytes()).hexdigest()
+    assert body["fingerprint"] == expected == body["scope"]["tools"]["fingerprint"]
+    follow_up = _send(client, "PUT", "/api/config/repo-a/tools/find_parents", body["fingerprint"],
+                      {"yaml": _tool_yaml("find_parents", "Again.")})
+    assert follow_up.status_code == 200
+
+
+def test_concurrent_writers_with_the_same_if_match_one_wins(client, registry, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    record = _repo(tmp_path, registry)
+
+    def write(i: int) -> int:
+        return _send(client, "POST", "/api/config/repo-a/tools", "absent", {"yaml": _tool_yaml(f"tool_{i}")}).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        statuses = sorted(pool.map(write, range(8)))
+
+    assert statuses == [201] + [412] * 7
+    assert len(yaml_tools(record.path)) == 1
+
+
+def yaml_tools(root: Path) -> list:
+    import yaml
+
+    return yaml.safe_load((root / TOOLS_FILENAME).read_text())["tools"]
+
+
+def test_node_type_rename_to_a_taken_label_is_409(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+    assert _send(client, "POST", "/api/config/repo-a/schema/node_types", _fp(client, "repo-a", "schema"),
+                 {"yaml": WIDGET}).status_code == 201
+    before = (record.path / SCHEMA_FILENAME).read_bytes()
+
+    response = _send(client, "PUT", "/api/config/repo-a/schema/node_types/Gadget", _fp(client, "repo-a", "schema"),
+                     {"yaml": WIDGET.replace("Gadget", "Widget")})
+
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "exists"
+    assert (record.path / SCHEMA_FILENAME).read_bytes() == before

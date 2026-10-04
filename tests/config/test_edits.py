@@ -329,3 +329,30 @@ def test_splice_error_codes_come_from_the_splicer(tmp_path):
     with pytest.raises(list_edit.ListEditError) as exc2:
         list_edit.replace_entry_text("tools:\n  - name: b\n    v: &x 1\n  - name: c\n    w: *x\n", "b", {"name": "b"}, key="tools", ident="name")
     assert exc2.value.code == "anchor"
+
+
+def test_node_type_rename_to_a_taken_label_is_refused(tmp_path):
+    (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
+    edits.add_schema_entry(tmp_path, STORY)
+    before = (tmp_path / "devgraph.schema.yaml").read_bytes()
+    with pytest.raises(ConfigEditError) as exc:
+        edits.replace_schema_entry(tmp_path, "Story", {**STORY, "label": "Ticket"})
+    assert code(exc) == "exists"
+    assert (tmp_path / "devgraph.schema.yaml").read_bytes() == before
+
+
+@pytest.mark.parametrize("kind", ["dir", "fifo"])
+def test_non_regular_target_is_refused_without_opening_it(tmp_path, kind):
+    target = tmp_path / "devgraph.tools.yaml"
+    if kind == "dir":
+        target.mkdir()
+    else:
+        os.mkfifo(target)  # opening a FIFO for reading would block forever
+    fingerprint = edits.file_fingerprint(target)
+    assert fingerprint == "not_regular"
+    with pytest.raises(ConfigEditError) as exc:
+        edits.read_text(target)
+    assert code(exc) == "not_regular"
+    with pytest.raises(ConfigEditError) as exc:
+        edits.add_tool(tmp_path, TOOL, expected_fingerprint=fingerprint)
+    assert code(exc) == "not_regular"

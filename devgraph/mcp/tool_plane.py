@@ -15,6 +15,8 @@ from __future__ import annotations
 import datetime
 import inspect
 import logging
+import os
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -485,8 +487,11 @@ def tools_fingerprint(repo_path: Path | str) -> bytes | str:
         return "root-missing"
     if not project_config_enabled(repo_path):
         return "disabled"
+    path = tools_file_path(Path(repo_path))
     try:
-        return tools_file_path(Path(repo_path)).read_bytes()
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return "unreadable:not_regular"  # never open a FIFO or device: the read would block
+        return path.read_bytes()
     except (FileNotFoundError, NotADirectoryError):
         return "absent"
     except OSError as exc:

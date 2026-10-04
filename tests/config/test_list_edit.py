@@ -155,3 +155,52 @@ def test_tools_duplicate_name_refused(op):
             replace_entry_text(text, "t", {"name": "t"}, **kw)
         else:
             delete_entry_text(text, "t", **kw)
+
+
+TOOLS = {"key": "tools", "ident": "name"}
+TOOL_DOC = "version: 1\ntools:\n  - name: one\n    cypher: RETURN 1\n"
+
+
+@pytest.mark.parametrize("sep", [" ", " ", "\x85", "\r"])
+def test_unicode_line_breaks_cannot_inject_keys(sep):
+    # YAML reads these as line breaks; a `|` block would let the text after them
+    # land at mapping level once the entry is indented into the list.
+    entry = {"name": "two", "description": f"a\nb{sep}    max_rows: 7", "cypher": "RETURN 1"}
+
+    for text in (add_entry_text(TOOL_DOC, entry, version=1, **TOOLS),
+                 replace_entry_text(TOOL_DOC, "one", entry, **TOOLS)):
+        assert entries(text, key="tools")[-1] == entry
+    assert dump_entry({"d": f"x{sep}y"}).startswith('d: "')
+
+
+def test_splice_that_diverges_from_the_entry_is_refused(monkeypatch):
+    import devgraph.config.list_edit as list_edit
+
+    entry = {"name": "two", "description": "a", "cypher": "RETURN 1"}
+    monkeypatch.setattr(list_edit, "dump_entry", lambda e: "name: two\ndescription: a\ncypher: RETURN 1\nmax_rows: 7\n")
+    for call in (lambda: add_entry_text(TOOL_DOC, entry, version=1, **TOOLS),
+                 lambda: replace_entry_text(TOOL_DOC, "one", entry, **TOOLS)):
+        with pytest.raises(ListEditError) as exc:
+            call()
+        assert exc.value.code == "invalid"
+
+
+def test_delete_that_touches_other_entries_is_refused(monkeypatch):
+    import devgraph.config.list_edit as list_edit
+
+    real = list_edit._Doc.span
+    monkeypatch.setattr(list_edit._Doc, "span", lambda self, position: (real(self, position)[0], len(self.lines)))
+    doc = TOOL_DOC + "  - name: two\n    cypher: RETURN 2\n"
+    with pytest.raises(ListEditError) as exc:
+        delete_entry_text(doc, "one", **TOOLS)
+    assert exc.value.code == "invalid"
+
+
+@pytest.mark.parametrize("ident", [b"bin", 3, None, ["x"]])
+def test_identity_must_be_a_plain_string(ident):
+    entry = {"name": ident, "cypher": "RETURN 1"}
+    for call in (lambda: add_entry_text(TOOL_DOC, entry, version=1, **TOOLS),
+                 lambda: replace_entry_text(TOOL_DOC, "one", entry, **TOOLS)):
+        with pytest.raises(ListEditError) as exc:
+            call()
+        assert exc.value.code == "invalid"
