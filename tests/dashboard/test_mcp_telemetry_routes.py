@@ -33,7 +33,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_server, "get_settings", lambda: fake)
     registry = RepoRegistry(fake.registry_db_path)
     try:
-        yield TestClient(build_app(_StubEngine(), registry, EventBroadcaster()))
+        yield TestClient(build_app(_StubEngine(), registry, EventBroadcaster()), base_url="http://127.0.0.1")
     finally:
         registry.close()
 

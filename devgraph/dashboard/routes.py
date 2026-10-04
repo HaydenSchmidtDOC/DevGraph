@@ -362,7 +362,7 @@ def build_router(
         return {"ok": True}
 
     @router.post("/cypher")
-    def run_cypher(payload: dict[str, Any]) -> dict[str, Any]:
+    def run_cypher(payload: dict[str, Any], request: Request) -> dict[str, Any]:
         """Server-side Cypher execution for the dashboard's Cypher console.
 
         Replaces the prototype's direct browser->Neo4j HTTP connection (see
@@ -378,7 +378,11 @@ def build_router(
         only the console's own explicit Run/isolate/history actions set it,
         so background polling (repo list, topology counts, live glow preview
         on every keystroke) doesn't flood the log.
+
+        The query is arbitrary Cypher, writes included, so this gets the same
+        cross-site check as the other state-changing routes.
         """
+        _reject_cross_site(request)
         query = (payload.get("query") or "").strip()
         if not query:
             raise HTTPException(status_code=400, detail="query is required")
