@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS repos (
     pr_source_enabled INTEGER NOT NULL DEFAULT 0,
     issue_source_enabled INTEGER NOT NULL DEFAULT 0,
     last_indexed_commit TEXT,
-    mentions_enabled INTEGER NOT NULL DEFAULT 0
+    mentions_enabled INTEGER NOT NULL DEFAULT 0,
+    project_config_enabled INTEGER NOT NULL DEFAULT 1
 );
 """
 
@@ -45,6 +46,10 @@ _MIGRATIONS = (
     (
         "mentions_enabled",
         "ALTER TABLE repos ADD COLUMN mentions_enabled INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "project_config_enabled",
+        "ALTER TABLE repos ADD COLUMN project_config_enabled INTEGER NOT NULL DEFAULT 1",
     ),
 )
 
@@ -68,6 +73,7 @@ class RepoRecord:
     issue_source_enabled: bool = False
     last_indexed_commit: str | None = None
     mentions_enabled: bool = False
+    project_config_enabled: bool = True
 
 
 class RepoRegistry:
@@ -252,6 +258,10 @@ class RepoRegistry:
         """Opt this repo in/out of mentions indexing. Default is off (Principle 2)."""
         self._set_flag(repo_id, "mentions_enabled", enabled)
 
+    def set_project_config_enabled(self, repo_id: str, enabled: bool) -> None:
+        """Switch this repo's project config files (schema, tools) on or off. Default is on."""
+        self._set_flag(repo_id, "project_config_enabled", enabled)
+
     def set_last_indexed_commit(self, repo_id: str, sha: str | None) -> None:
         """Record the most recently walked commit SHA for incremental git history indexing."""
         with self._lock:
@@ -265,7 +275,8 @@ class RepoRegistry:
 
     _COLUMNS = (
         "repo_id, path, active, watch_enabled, last_indexed, docs_path, "
-        "pr_source_enabled, issue_source_enabled, last_indexed_commit, mentions_enabled"
+        "pr_source_enabled, issue_source_enabled, last_indexed_commit, mentions_enabled, "
+        "project_config_enabled"
     )
 
     def get(self, repo_id: str) -> RepoRecord | None:
@@ -297,6 +308,7 @@ class RepoRegistry:
             issue_source_enabled,
             last_indexed_commit,
             mentions_enabled,
+            project_config_enabled,
         ) = row
         return RepoRecord(
             repo_id,
@@ -309,4 +321,5 @@ class RepoRegistry:
             bool(issue_source_enabled),
             last_indexed_commit,
             bool(mentions_enabled),
+            bool(project_config_enabled),
         )

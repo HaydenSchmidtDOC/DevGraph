@@ -44,6 +44,7 @@ from devgraph.graph.schema import (
     RELATIONSHIP_TYPES,
     RESERVED_NODE_PROPERTIES,
 )
+from devgraph.config.project_switch import project_config_enabled
 from devgraph.graph.schema import constraint_statements as builtin_constraint_statements
 
 SCHEMA_FILENAME = "devgraph.schema.yaml"
@@ -502,8 +503,11 @@ def schema_file_hash(repo_root: Path) -> str:
 
     An unreadable path (a directory, a permission error) gets a distinct
     `unreadable:<error>` value so it never equals a hash the graph was
-    actually built with.
+    actually built with. A repository whose project config is switched off
+    reports `absent`.
     """
+    if not project_config_enabled(repo_root):
+        return ABSENT_SCHEMA_HASH
     path = project_schema_path(repo_root)
     try:
         data = path.read_bytes()
@@ -514,13 +518,16 @@ def schema_file_hash(repo_root: Path) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def load_project_schema(repo_root: Path) -> ProjectSchema | None:
+def load_project_schema(repo_root: Path, *, respect_switch: bool = True) -> ProjectSchema | None:
     """Load and validate `devgraph.schema.yaml`, if the repository has one.
 
-    Returns `None` if and only if the file is absent. An empty, malformed,
-    non-mapping or invalid file raises `ProjectSchemaError`; no partial
+    Returns `None` if and only if the file is absent or the repository's
+    project config is switched off (unless `respect_switch` is False). An
+    empty, malformed, non-mapping or invalid file raises `ProjectSchemaError`; no partial
     schema is ever returned.
     """
+    if respect_switch and not project_config_enabled(repo_root):
+        return None
     path = project_schema_path(repo_root)
     try:
         if not path.exists():
