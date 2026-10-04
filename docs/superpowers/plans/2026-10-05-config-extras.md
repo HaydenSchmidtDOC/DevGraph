@@ -29,8 +29,8 @@
 
 **Files:** `devgraph/config/edits.py`, `devgraph/cli/main.py` (`config tools reset`, `config schema reset` become wrappers), `devgraph/dashboard/routes.py`, `tests/config/test_edits.py`, `tests/cli/` (one symlink-refusal test), `tests/dashboard/test_config_routes.py`.
 
-- [ ] Write failing tests (spec §4, edits + reset routes): `reset_tools` (project, global) and `reset_schema` dry run / write / stale / symlink / invalid file / absent file; `removed` listing and reset notes; schema warnings equal the CLI's; `DELETE /api/config/{scope}/tools` and `DELETE /api/config/{repo_id}/schema` happy path, `?dry_run=1`, 403/404/409/412/428, `global` block in the response, no git.
-- [ ] Implement spec §2.2: `EditResult.removed`; `reset_tools`, `reset_schema`; CLI wrappers keep prompts and output; the two `DELETE` routes through `_write_record`, `_if_match`, `_dry_run_flag`, `_apply_edit` (extended to return `removed` and, for tools writes, the refreshed `global` block). Existing CLI suites green with no edits except the new test.
+- [ ] Write failing tests (spec §4, edits + reset routes): `reset_tools` (project, global) and `reset_schema` dry run / write / stale / symlink / invalid file / absent file; `removed` listing and reset notes; schema warnings equal the CLI's; `POST /api/config/{scope}/reset/tools` and `POST /api/config/{repo_id}/reset/schema` happy path, `{"dry_run": true}`, 403/404/409/412/428, `global` block in the response, no git.
+- [ ] Implement spec §2.2: `EditResult.removed`; `reset_tools`, `reset_schema`; CLI wrappers keep prompts and output; the two `POST …/reset/{kind}` routes through `_write_record`, `_if_match`, the body `dry_run`, `_apply_edit` (extended to return `removed` and, for tools writes, the refreshed `global` block). Existing CLI suites green with no edits except the new test.
 - [ ] `uv run pytest -q`; commit with a plain message describing the task.
 
 ### Task 3: Project-config toggle route

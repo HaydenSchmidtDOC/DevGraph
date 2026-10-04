@@ -224,13 +224,13 @@ def _dry_run_flag(value: str | None) -> bool:
     raise _config_error(400, "bad_request", "dry_run must be 1, true, 0 or false")
 
 
-async def _config_body(request: Request) -> tuple[dict, bool]:
-    """The entry mapping and `dry_run` flag of a Config write body.
+async def _json_payload(request: Request) -> dict:
+    """A Config write's JSON object body.
 
     Strict `application/json` (what a cross-site page can't send without a
     preflight), at most `_CONFIG_PAYLOAD_LIMIT_BYTES` (checked on
     Content-Length, then while reading), and the entry parsed with
-    `yaml.safe_load` only.
+    object.
     """
     media_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
     if media_type != "application/json":
@@ -250,12 +250,23 @@ async def _config_body(request: Request) -> tuple[dict, bool]:
         raise _config_error(400, "bad_request", "payload must be valid JSON") from exc
     if not isinstance(payload, dict):
         raise _config_error(400, "bad_request", "payload must be a JSON object")
-    text = payload.get("yaml")
-    if not isinstance(text, str):
-        raise _config_error(400, "bad_request", "yaml must be a string")
+    return payload
+
+
+def _body_dry_run(payload: dict) -> bool:
     dry_run = payload.get("dry_run", False)
     if not isinstance(dry_run, bool):
         raise _config_error(400, "bad_request", "dry_run must be true or false")
+    return dry_run
+
+
+async def _config_body(request: Request) -> tuple[dict, bool]:
+    """The entry mapping and `dry_run` flag of a Config entry write body (entry parsed with `yaml.safe_load` only)."""
+    payload = await _json_payload(request)
+    text = payload.get("yaml")
+    if not isinstance(text, str):
+        raise _config_error(400, "bad_request", "yaml must be a string")
+    dry_run = _body_dry_run(payload)
     try:
         entry = yaml.safe_load(text)
     except yaml.YAMLError as exc:
@@ -832,23 +843,25 @@ def build_router(
             lambda root: edits.delete_tool(root, name, expected_fingerprint=expected, dry_run=dry), False,
         )
 
-    @router.delete("/config/{scope}/tools")
-    async def reset_config_tools(scope: str, request: Request, dry_run: str | None = None) -> JSONResponse:
+    @router.post("/config/{scope}/reset/tools")
+    async def reset_config_tools(scope: str, request: Request) -> JSONResponse:
         _reject_cross_site_config(request)
         record = _write_record(scope)
+        payload = await _json_payload(request)
         expected = _if_match(request)
-        dry = _dry_run_flag(dry_run)
+        dry = _body_dry_run(payload)
         return await run_in_threadpool(
             _apply_edit, scope, record, "tools",
             lambda root: edits.reset_tools(root, record=record, expected_fingerprint=expected, dry_run=dry), False,
         )
 
-    @router.delete("/config/{scope}/schema")
-    async def reset_config_schema(scope: str, request: Request, dry_run: str | None = None) -> JSONResponse:
+    @router.post("/config/{scope}/reset/schema")
+    async def reset_config_schema(scope: str, request: Request) -> JSONResponse:
         _reject_cross_site_config(request)
         record = _write_record(scope, schema=True)
+        payload = await _json_payload(request)
         expected = _if_match(request)
-        dry = _dry_run_flag(dry_run)
+        dry = _body_dry_run(payload)
         return await run_in_threadpool(
             _apply_edit, scope, record, "schema",
             lambda root: edits.reset_schema(root, record=record, expected_fingerprint=expected, dry_run=dry), False,
