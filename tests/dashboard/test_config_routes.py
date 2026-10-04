@@ -1565,3 +1565,80 @@ def test_global_block_run_cypher_enabled_follows_the_setting(client, monkeypatch
     assert client.get("/api/config").json()["global"]["tools"]["run_cypher_enabled"] is False
     monkeypatch.setattr(settings, "enable_run_cypher", True, raising=False)
     assert client.get("/api/config").json()["global"]["tools"]["run_cypher_enabled"] is True
+
+
+# --- parsed entries for the form editor -------------------------------------
+
+def test_form_entry_keeps_plain_data_and_refuses_what_json_cannot_carry():
+    import datetime
+
+    from devgraph.dashboard.config_model import form_entry
+
+    plain = {"name": "t", "n": 5, "f": 1.5, "b": True, "z": None, "l": [1, {"a": ["x", False]}], "d": {"k": "v"}}
+    assert form_entry(plain) == plain
+    assert form_entry({"b": True})["b"] is True
+    limit = 2**53 - 1
+    assert form_entry({"n": limit, "m": -limit}) == {"n": limit, "m": -limit}
+    for bad in (
+        {1: "x"}, {"d": datetime.date(2020, 1, 1)}, {"f": float("nan")}, {"f": float("inf")},
+        {"n": limit + 1}, {"n": -limit - 1}, {"l": [{2: 1}]}, {"s": {"a", "b"}}, {"b": b"x"},
+    ):
+        assert form_entry(bad) is None
+
+
+def test_tool_and_node_type_rows_carry_the_files_mapping_in_key_order(client, registry, tmp_path, global_store):
+    _global_store(global_store, "hot_paths")
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, """
+        version: 1
+        tools:
+          - description: Counts things.
+            max_rows: 7
+            name: counter
+            cypher: "MATCH (n {repo_id: $repo_id}) RETURN count(n) AS c"
+        """)
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+
+    [g] = client.get("/api/config/__global__").json()["tools"]["entries"]
+    assert g["entry"] == {"name": "hot_paths", "description": "G.",
+                          "cypher": "MATCH (n {repo_id: $repo_id}) RETURN n LIMIT 1"}
+    project = client.get("/api/config/repo-a").json()
+    [tool] = project["tools"]["entries"]
+    assert list(tool["entry"]) == ["description", "max_rows", "name", "cypher"] and tool["entry"]["max_rows"] == 7
+    [node] = project["schema"]["node_types"]
+    assert node["entry"]["label"] == "Widget"
+    [rel] = project["schema"]["relationships"]
+    assert "entry" not in rel
+
+
+def test_entries_json_cannot_carry_are_null(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, """
+        version: 1
+        tools:
+          - name: dated
+            description: 2020-01-01
+            cypher: RETURN 1
+          - name: big
+            description: Big.
+            cypher: RETURN 1
+            max_rows: 1152921504606846976
+          - name: fine
+            description: Fine.
+            cypher: RETURN 1
+        """)
+    _write(record.path, SCHEMA_FILENAME, """
+        version: 1
+        node_types:
+          - label: Widget
+            key: [slug]
+            metadata:
+              - {name: slug, type: string, description: .nan}
+        """)
+
+    project = client.get("/api/config/repo-a").json()
+
+    assert {e["name"]: e["entry"] is None for e in project["tools"]["entries"]} == {
+        "dated": True, "big": True, "fine": False}
+    [node] = project["schema"]["node_types"]
+    assert node["entry"] is None and "yaml" in node

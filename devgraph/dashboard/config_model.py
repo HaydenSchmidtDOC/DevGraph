@@ -9,6 +9,7 @@ the schema state (`schema_info`) computed from the applied schema.
 from __future__ import annotations
 
 import inspect
+import math
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,7 +23,26 @@ from devgraph.mcp.catalog import TOOL_CATALOG, builtin_tool_names, scoped_tool_i
 
 GLOBAL_SCOPE = "__global__"
 GLOBAL_TOOLS_FILENAME = "global-tools.json"
+_MAX_SAFE_INT = 2**53 - 1  # the largest integer a JavaScript number carries exactly
 
+
+def _plain(value: Any) -> bool:
+    if value is None or isinstance(value, (str, bool)):
+        return True
+    if isinstance(value, int):
+        return abs(value) <= _MAX_SAFE_INT
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_plain(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _plain(v) for k, v in value.items())
+    return False
+
+
+def form_entry(entry: dict) -> dict | None:
+    """The entry mapping when JSON carries it into the browser unchanged, else `None` (YAML-only)."""
+    return entry if _plain(entry) else None
 
 
 def badge(level: str, kind: str, text: str, detail: str = "") -> dict[str, str]:
@@ -114,7 +134,8 @@ def _global_entry(entry: dict, overridden_in: list[str]) -> dict[str, Any]:
     if overridden_in:
         badges.append(badge("info", "overridden", f"Overridden in {', '.join(overridden_in)}",
                             "These repositories' own tools of this name win over the global one."))
-    return {"name": name, "tool_id": scoped_tool_id(name, "global"), "yaml": dump_entry(entry), "badges": badges}
+    return {"name": name, "tool_id": scoped_tool_id(name, "global"), "yaml": dump_entry(entry),
+            "entry": form_entry(entry), "badges": badges}
 
 
 def build_global(records: list[Any], resolutions: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -171,6 +192,7 @@ def _project_tool_entry(record: Any, status: Any, entry: dict, tools_path: Path,
         "name": name,
         "tool_id": scoped_tool_id(name, "project", record.repo_id),
         "yaml": dump_entry(entry),
+        "entry": form_entry(entry),
         "origin": origin,
         "badges": badges,
     }
@@ -255,7 +277,7 @@ def _schema_block(record: Any, root: Path, info: dict[str, Any], conflicts: list
         "extends": extends,
         "badges": _schema_badges(state, error),
         "node_types": [
-            {"label": e["label"], "yaml": dump_entry(e), "editable": True,
+            {"label": e["label"], "yaml": dump_entry(e), "entry": form_entry(e), "editable": True,
              "badges": _conflict_badges(e["label"], record.repo_id, conflicts)}
             for e in node_entries
         ],
