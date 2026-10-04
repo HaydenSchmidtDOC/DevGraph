@@ -98,7 +98,7 @@ Hints for relationships:
 - `from`: no labels; a label not matching `LABEL_PATTERN`; a label listed twice.
 - `to`: empty, or not matching `LABEL_PATTERN`.
 - **labels that must exist:** a `from` or `to` label not in `ctx.labels`: "`Runbok` isn't a node type this repository has (built-in, or declared in this file as last loaded)." This is advisory only: the list is the last loaded file, and the server's `resolve_declaration` endpoint check decides.
-- **filesystem:** `to` other than `ctx.filesystem.folder`: "A filesystem relationship points to the filesystem folder node type (`Folder`)." or "…, and this file declares none." A `from` label that is neither filesystem type: "`X` is not a filesystem node type."
+- **filesystem:** `to` other than `ctx.filesystem.folder`: "A filesystem relationship points to the filesystem folder node type (`Folder`)." or "…, and this file declares none." A valid `from` label that is neither filesystem type: "`X` is not a filesystem node type." When the file declares neither filesystem type, `from` gets one hint instead of one per label: "A filesystem relationship starts from the filesystem node types (file or folder), and this file declares none."
 - `color`: as for node types.
 
 The label and filesystem hints are skipped when `ctx` is absent. `CONFIG_FORM_LIMITS` gains `RELATIONSHIP_TYPE_PATTERN`, and the drift test checks it against the Python constant.

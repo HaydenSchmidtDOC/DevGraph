@@ -9,12 +9,14 @@ global warning step, the destination dropdown, the dry-run confirm, the
 run's fingerprint, Re-check after a 412), the project-config switch and
 Copy to… (which rows offer it, destinations without the source, the read-only
 dialog, add vs confirmed replace with the dry run's If-Match, the full reload
-after every write) and the form view (which entries open in the form and which
+after every write) and the form view for tools, node types and relationships
+(which entries open in the form and which
 stay YAML with the reason, delete/copy never showing it; a form edit writing
 the serialised YAML into the textarea, dropping a confirm and going through
 the same dry run; untouched saves sending the server's text byte for byte;
 the form locked while busy; Discard after a hand edit; labels, legends, named
-row buttons and focus; selects and typed text never rewriting a value). The
+row buttons and focus; selects and typed text never rewriting a value; the
+relationship provider showing the custom name in place). The
 JS file drives the real functions out of index.html
 against stubbed responses, so it runs without a browser.
 

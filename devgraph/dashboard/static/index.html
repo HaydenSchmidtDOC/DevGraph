@@ -3635,7 +3635,9 @@ async function configResetCheck(rs, fresh) {
     rs.busy = "";
     if (configReset === rs) {
       renderConfigReset();
-      if (rs.review) document.getElementById("configResetTyped").focus();
+      /* a failed check leaves no list to type under, and Re-check may have
+         been hidden under the focus: Cancel is the one control always there */
+      document.getElementById(rs.review ? "configResetTyped" : "configResetCancel").focus();
     }
   }
 }
@@ -3987,10 +3989,12 @@ function configEntryFromForm(section, form, order) {
     configFormPut(vals, open, "to", form.to, id);
     configFormPutChoice(vals, open, "provider", form.provider, "builtin");
     /* the custom name is only written for the custom provider, so switching
-       away and back keeps it; an opened `custom: null` stays while no name is typed */
+       away and back keeps it; an opened `custom: null` stays unless the form
+       ends with a name under the custom provider */
     const block = configIsMap(open.custom) ? open.custom : null;
-    if ("custom" in open && open.custom === null && form.custom === "") vals.custom = null;
-    else if (form.provider === "custom" && (block || form.custom !== "")) {
+    const named = form.provider === "custom" && form.custom !== "";
+    if ("custom" in open && open.custom === null && !named) vals.custom = null;
+    else if (form.provider === "custom" && (block || named)) {
       const c = {};
       configFormPut(c, block || {}, "name", form.custom, id);
       if (block && "params" in block) c.params = block.params;
@@ -4067,8 +4071,8 @@ function configYamlLines(map, keys, indent) {
   }
   return lines;
 }
-/* the YAML text for one entry mapping: keys in `order`, then model order */
 const CONFIG_FORM_SECTION_FIELDS = { tools: "tool", node_types: "node_type", relationships: "relationship" };
+/* the YAML text for one entry mapping: keys in `order`, then model order */
 function configEntryYaml(section, mapping, order) {
   const model = CONFIG_FORM_FIELDS[CONFIG_FORM_SECTION_FIELDS[section]];
   const keys = Object.keys(configFormOrdered(mapping, order || [], model.concat(Object.keys(mapping))));
@@ -4160,8 +4164,13 @@ function configFormHints(section, form, ctx) {
         hint("to", fs.folder ? "A filesystem relationship points to the filesystem folder node type (`" + fs.folder + "`)."
           : "A filesystem relationship points to the filesystem folder node type, and this file declares none.");
       }
-      from.filter((l, i) => from.indexOf(l) === i && l !== fs.file && l !== fs.folder)
-        .forEach(l => hint("from", "`" + l + "` is not a filesystem node type."));
+      /* advisory: one hint when the file has no filesystem types, and none on a label already refused */
+      if (!fs.file && !fs.folder) {
+        if (from.length) hint("from", "A filesystem relationship starts from the filesystem node types (file or folder), and this file declares none.");
+      } else {
+        from.filter((l, i) => from.indexOf(l) === i && configFullMatch(L.LABEL_PATTERN, l) && l !== fs.file && l !== fs.folder)
+          .forEach(l => hint("from", "`" + l + "` is not a filesystem node type."));
+      }
     }
     colorHint();
     return out;
@@ -4198,9 +4207,8 @@ let configFormSeq = 0;
 /* the rendered form: controls and hint boxes by field path, every focusable
    control, per-render updaters (legends, counts), and the first control */
 let configFormEls = { controls: {}, hints: {}, all: [], refresh: [], first: null };
-/* relationships have the pure form functions but no form view yet: until they
-   do, they open like a delete or copy, as YAML with no switch */
-const configFormOp = edit => (edit.op === "add" || edit.op === "replace") && edit.section !== "relationships";
+/* add and replace have a form in every section; delete and copy are the read-only YAML */
+const configFormOp = edit => edit.op === "add" || edit.op === "replace";
 /* null when the op has no form (delete, copy); else configFormSwitch for the textarea's text */
 function configFormAvailability(edit) {
   if (!configFormOp(edit)) return null;
@@ -4264,7 +4272,7 @@ function configEditorFocusTarget() {
 }
 /* hints, legends and counts follow the state without rebuilding (focus stays put) */
 function configFormRefresh(edit) {
-  const hints = configFormHints(edit.section, edit.formState);
+  const hints = configFormHints(edit.section, edit.formState, configFormContext(configModel, edit.scope));
   for (const [path, box] of Object.entries(configFormEls.hints)) {
     const text = hints.filter(h => h.field === path).map(h => h.text).join(" ");
     box.textContent = text;
@@ -4337,11 +4345,32 @@ function configFormRebuild(edit, focusPath) {
   if (el) el.focus();
   configFormChanged();
 }
+/* the colour field (node types and relationships): the text is the value; a
+   native swatch follows it and can set it; Clear empties it */
+function configFormColour(box, f) {
+  const colour = configFormField(box, "color", "Colour", configFormText_("input", f.color, v => { f.color = v; }), "#rrggbb, or empty for the default colour.");
+  const [colourLabel, colourText, ...colourRest] = [...colour.children];
+  const line = configEl("div", "cfg-inline");
+  colour.replaceChildren(colourLabel, line, ...colourRest);
+  line.appendChild(colourText);
+  const swatch = configEl("input", "");
+  swatch.type = "color";
+  swatch.setAttribute("aria-label", "Pick a colour");
+  const follow = () => { if (configFullMatch(CONFIG_FORM_LIMITS.COLOR_PATTERN, f.color)) swatch.value = f.color.toLowerCase(); };
+  follow();
+  configFormEls.refresh.push(follow);
+  swatch.addEventListener("input", () => { if (configFormLocked()) return; f.color = swatch.value; colourText.value = f.color; configFormChanged(); });
+  const clear = configButton("Clear", () => { if (configFormLocked()) return; f.color = ""; colourText.value = ""; configFormChanged(); });
+  clear.setAttribute("aria-label", "Clear colour");
+  line.appendChild(swatch);
+  line.appendChild(clear);
+  configFormEls.all.push(swatch, clear);
+}
 function renderConfigForm(edit) {
   const box = document.getElementById("configForm");
   const f = edit.formState;
   configFormEls = { controls: {}, hints: {}, all: [], refresh: [], first: null };
-  box.replaceChildren(configEl("legend", "", edit.section === "tools" ? "Tool" : "Node type"));
+  box.replaceChildren(configEl("legend", "", { tools: "Tool", node_types: "Node type", relationships: "Relationship" }[edit.section]));
   const text = (parent, path, label, key, obj, help, tag = "input") =>
     configFormField(parent, path, label, configFormText_(tag, obj[key], v => { obj[key] = v; }), help);
   const rows = (title, list, noun, addLabel, fresh, fill) => {
@@ -4435,26 +4464,38 @@ function renderConfigForm(edit) {
     configFormRefresh(edit);
     return;
   }
+  if (edit.section === "relationships") {
+    text(box, "type", "Type", "type", f, "Uppercase letters, digits and underscores." +
+      (edit.op === "replace" ? " Changing it renames the relationship." : ""));
+    text(box, "from", "From", "from", f, "One or more node labels, separated by commas. Each must be a built-in node type or one declared in this file.");
+    text(box, "to", "To", "to", f, "One node label: built-in, or declared in this file.");
+    const names = { builtin: "Built-in type", custom: "Custom provider", filesystem: "Filesystem (file → parent folder)" };
+    /* Provider changes only the custom name field, in place: the select keeps
+       focus while arrow keys step through the providers */
+    const holder = configEl("div", "");
+    let custom = null;
+    const fillCustom = () => {
+      if (custom) configFormEls.all.splice(configFormEls.all.indexOf(custom), 1);
+      delete configFormEls.controls.custom;
+      delete configFormEls.hints.custom;
+      holder.replaceChildren();
+      custom = null;
+      if (f.provider !== "custom") return;
+      custom = configFormText_("input", f.custom, v => { f.custom = v; });
+      configFormField(holder, "custom", "Custom provider name", custom, "Recorded as data; DevGraph does not run it.");
+    };
+    configFormField(box, "provider", "Provider", configFormSelect(CONFIG_FORM_FIELDS.relationship_providers.map(p => [p, names[p]]), f.provider, [],
+      v => { f.provider = v; fillCustom(); configFormChanged(); }));
+    box.appendChild(holder);
+    fillCustom();
+    configFormColour(box, f);
+    configFormRefresh(edit);
+    return;
+  }
   text(box, "label", "Label", "label", f, "Letters, digits and underscores, starting with a letter; built-in labels are refused.");
   const desc = text(box, "description", "Description", "description", f, undefined, "textarea");
   desc.children[1].rows = 2;
-  const colour = text(box, "color", "Colour", "color", f, "#rrggbb, or empty for the default colour.");
-  const [colourLabel, colourText, ...colourRest] = [...colour.children];
-  const line = configEl("div", "cfg-inline");
-  colour.replaceChildren(colourLabel, line, ...colourRest);
-  line.appendChild(colourText);
-  const swatch = configEl("input", "");
-  swatch.type = "color";
-  swatch.setAttribute("aria-label", "Pick a colour");
-  const follow = () => { if (configFullMatch(CONFIG_FORM_LIMITS.COLOR_PATTERN, f.color)) swatch.value = f.color.toLowerCase(); };
-  follow();
-  configFormEls.refresh.push(follow);
-  swatch.addEventListener("input", () => { if (configFormLocked()) return; f.color = swatch.value; colourText.value = f.color; configFormChanged(); });
-  const clear = configButton("Clear", () => { if (configFormLocked()) return; f.color = ""; colourText.value = ""; configFormChanged(); });
-  clear.setAttribute("aria-label", "Clear colour");
-  line.appendChild(swatch);
-  line.appendChild(clear);
-  configFormEls.all.push(swatch, clear);
+  configFormColour(box, f);
   const kinds = [["", "None (declared only)"], ...CONFIG_FORM_FIELDS.filesystem_kinds.map(k => [k, "Filesystem — " + k])];
   configFormField(box, "source", "Source", configFormSelect(kinds, f.source, [], v => { f.source = v; configFormChanged(); }));
   const M = CONFIG_FORM_FIELDS.metadata_types.map(t => [t, t]);
