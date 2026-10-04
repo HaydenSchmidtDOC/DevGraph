@@ -17,6 +17,7 @@ from devgraph.config import edits
 from devgraph.config.list_edit import ListEditError, dump_entry, entries
 from devgraph.config.project_schema import SCHEMA_FILENAME
 from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError, parse_project_tools
+from devgraph.config.project_trust import trust_command, untrusted_reason
 from devgraph.config.settings import get_settings
 from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.mcp.catalog import TOOL_CATALOG, builtin_tool_names, scoped_tool_id
@@ -189,6 +190,9 @@ def _project_tool_entry(record: Any, status: Any, entry: dict, tools_path: Path,
         else:
             reason = status.fallback_reasons.get(name, "")
         badges.append(badge("warn", "fallback-global", "Not served: using the global tool", reason))
+    elif origin is None and status.project_trust not in (None, "trusted"):
+        badges.append(badge("warn", "not-trusted", "Not served: not trusted",
+                            status.fallback_reasons.get(name) or untrusted_reason(record.repo_id, status.project_trust)))
     elif origin is None and name in status.fallback_reasons:
         badges.append(badge("error", "not-served", "Not served", status.fallback_reasons[name]))
     return {
@@ -199,6 +203,22 @@ def _project_tool_entry(record: Any, status: Any, entry: dict, tools_path: Path,
         "origin": origin,
         "badges": badges,
     }
+
+
+_WHOLE_GRAPH = "An enabled project tool can read the whole graph: the $repo_id rule is a convention, not a sandbox."
+
+
+def _trust_badges(repo_id: str, trust: str | None) -> list[dict[str, str]]:
+    """The tools file's trust badge; none without a file to trust. Trusting is CLI-only."""
+    if trust is None:
+        return []
+    if trust == "trusted":
+        return [badge("info", "trusted", "Trusted",
+                      f"Served: {TOOLS_FILENAME} matches the sha256 approved with `{trust_command(repo_id)}`. "
+                      f"Any change to the file needs approving again. {_WHOLE_GRAPH}")]
+    text = {"changed": "Changed since trusted", "error": "Trust state unreadable"}.get(trust, "Not trusted")
+    return [badge("error" if trust == "error" else "warn", "not-trusted", text,
+                  f"{untrusted_reason(repo_id, trust)}. Review the file, then run that in a terminal. {_WHOLE_GRAPH}")]
 
 
 def _schema_badges(state: str, error: str | None) -> list[dict[str, str]]:
@@ -308,6 +328,8 @@ def build_project(
     if state == "disabled":
         badges.append(badge("muted", "not-served", "Project config disabled",
                             "Project tools are not served until it is enabled."))
+    elif not (state == "invalid" and status.project_trust == "trusted"):  # an invalid file serves nothing new
+        badges += _trust_badges(record.repo_id, status.project_trust)
     return {
         "repo_id": record.repo_id,
         "display_path": _display_path(root),
@@ -323,6 +345,11 @@ def build_project(
             "error": error,
             "fingerprint": edits.file_fingerprint(path),
             "badges": badges,
+            "trust": {
+                "state": status.project_trust,
+                "command": trust_command(record.repo_id),
+                "revocable": getattr(record, "project_tools_sha256", None) is not None,
+            },
             "entries": [_project_tool_entry(record, status, e, path, root) for e in _tool_entries(text)],
         },
     }

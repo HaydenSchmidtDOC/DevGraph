@@ -45,6 +45,7 @@ from devgraph.config.project_schema import (
     load_project_schema,
     schema_file_hash,
 )
+from devgraph.config.project_trust import trust_command
 from devgraph.config.schema_findings import introduced_conflicts, schema_conflicts
 from devgraph.config.settings import get_settings
 from devgraph.dashboard import queries
@@ -881,6 +882,37 @@ def build_router(
             _apply_edit, scope, record, "schema",
             lambda root: edits.reset_schema(root, record=record, expected_fingerprint=expected, dry_run=dry), False,
         )
+
+    @router.delete("/config/{scope}/trust/tools")
+    async def revoke_config_tools_trust(scope: str, request: Request) -> JSONResponse:
+        """Revoke trust in a repository's project tools. There is deliberately no route that grants it:
+        approving a tools file (`devgraph config tools trust`) is CLI-only."""
+        _reject_cross_site_config(request)
+        record = _write_record(scope, schema=True)  # a repository; never the global store
+
+        def apply() -> JSONResponse:
+            revoked = record.project_tools_sha256 is not None
+            if revoked:
+                try:
+                    registry.set_project_tools_sha256(scope, None)
+                except ValueError as exc:  # removed since the scope check
+                    raise _config_error(404, "not_found", f"unknown scope: {scope}") from exc
+                except sqlite3.Error as exc:
+                    logger.warning("revoking project tools trust for %s failed: %s", scope, exc)
+                    raise _config_error(500, "io", "could not update the registry") from exc
+                notes = [f"Revoked trust in {scope}'s project tools; running MCP sessions stop serving them within 2 seconds."]
+            else:
+                notes = [f"Project tools for {scope} are not trusted; nothing to revoke."]
+            notes.append(f"Trusting them again is done in a terminal: `{trust_command(scope)}`.")
+            return JSONResponse(content={
+                "ok": True,
+                "written": revoked,
+                "notes": notes,
+                "scope": _config_scope(scope),
+                "global": _config_scope(GLOBAL_SCOPE),
+            })
+
+        return await run_in_threadpool(apply)
 
     @router.put("/config/{scope}/project-config")
     async def set_config_project_config(scope: str, request: Request) -> JSONResponse:
