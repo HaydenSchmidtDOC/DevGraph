@@ -2947,7 +2947,7 @@ let configModel = null;
 /* bumped by every page load and every block a write returns: a load answered
    after either is stale and dropped, so an older fingerprint never comes back */
 let configLoadSeq = 0;
-/* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, busy, label, armedAt } */
+/* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, dryTarget, busy, label, armedAt } */
 let configEdit = null;
 /* the open reset dialog: { scope, kind, phrase, fingerprint, review, stale, busy, ready, armedAt } */
 let configReset = null;
@@ -3128,6 +3128,7 @@ function configEditTarget(edit = configEdit) {
   if (edit.op !== "replace" || edit.dest === edit.scope) return { scope: edit.scope, op: edit.op, name: edit.name };
   return edit.crossName ? { scope: edit.dest, op: "replace", name: edit.crossName } : { scope: edit.dest, op: "add", name: null };
 }
+const configSameTarget = (a, b) => !!a && !!b && a.scope === b.scope && a.op === b.op && a.name === b.name;
 function configWarningText(edit) {
   if (edit.scope !== CONFIG_GLOBAL || edit.op === "add") return "";
   if (edit.dest !== CONFIG_GLOBAL) {
@@ -3179,6 +3180,8 @@ function renderConfigModal() {
        then types into (or does nothing in) the textarea instead of confirming */
     if (edit.step === "edit") document.getElementById("configYaml").focus();
   }
+  /* the destination is what the dry run checked: it cannot change under a request */
+  document.getElementById("configDest").disabled = !!edit.busy;
   const save = document.getElementById("configModalSave");
   save.disabled = !!edit.busy;
   save.textContent = edit.busy || label;
@@ -3214,7 +3217,7 @@ function openConfigEditor(opts) {
     if (s === opts.scope || (isGlobal && opts.section === "tools")) fps[s] = configFingerprint(s, opts.section);
   });
   configEdit = { ...opts, dest: opts.scope, step: isGlobal && opts.op !== "add" ? "warn" : "edit", fps,
-    confirmed: false, warnings: [], crossName: null, busy: "", label: null, armedAt: 0 };
+    confirmed: false, warnings: [], crossName: null, dryTarget: null, busy: "", label: null, armedAt: 0 };
   const dest = document.getElementById("configDest");
   dest.replaceChildren();
   [[CONFIG_GLOBAL, "Global store"], ...configModel.projects.map(p => [p.repo_id, p.repo_id])].forEach(([value, label]) => {
@@ -3249,13 +3252,21 @@ async function configSave(ev) {
   const yaml = document.getElementById("configYaml").value;
   const send = (t, dry) => configSend(configWriteRequest(t.op, t.scope, edit.section, t.name, yaml, edit.fps[t.scope], dry));
   const busy = text => { edit.busy = text; renderConfigModal(); };
+  /* the target moved (another destination, a cleared name) since the dry run
+     was sent: what it checked is not what would be written, so stop */
+  const moved = t => {
+    if (configSameTarget(configEditTarget(edit), t)) return false;
+    edit.confirmed = false;
+    configSetError("The destination changed while checking; save again to check the new one.");
+    return true;
+  };
   try {
     configSetError("");
     if (!edit.confirmed) {
       busy("Checking…");
       let t = configEditTarget(edit);
       let dry = await send(t, true);
-      if (configEdit !== edit) return;
+      if (configEdit !== edit || moved(t)) return;
       const warnings = [];
       const detail = dry.body && dry.body.detail;
       if (dry.status === 409 && t.op === "add" && t.scope !== edit.scope && detail && detail.code === "exists" && detail.name) {
@@ -3263,7 +3274,7 @@ async function configSave(ev) {
         t = configEditTarget(edit);
         warnings.push("Replaces " + t.scope + "'s own " + t.name + ".");
         dry = await send(t, true);
-        if (configEdit !== edit) return;
+        if (configEdit !== edit || moved(t)) return;
       }
       if (!dry.ok) {
         edit.crossName = null;
@@ -3271,15 +3282,19 @@ async function configSave(ev) {
         return;
       }
       warnings.push(...((dry.body && dry.body.warnings) || []).map(String));
+      edit.dryTarget = t;
       if (warnings.length) { edit.confirmed = true; edit.warnings = warnings; return; }
     }
-    busy(edit.op === "delete" ? "Deleting…" : "Saving…");
     const t = configEditTarget(edit);
+    if (moved(edit.dryTarget)) return;
+    busy(edit.op === "delete" ? "Deleting…" : "Saving…");
     const res = await send(t, false);
     const mine = configEdit === edit;
     if (!res.ok) {
       if (mine) {
         edit.confirmed = false;
+        /* rediscover a cross-repo replace (POST -> 409) so it is confirmed again */
+        edit.crossName = null;
         configSetError(describeConfigError(res.status, res.body && res.body.detail), res.status === 412);
       }
       return;
