@@ -25,6 +25,7 @@ from devgraph.agent import lifecycle
 from devgraph.cli._env import resolve_podman, resolve_repo_root, resolve_venv_python
 from devgraph.cli.exporters import export_cypher, export_dot, export_json
 from devgraph.config import get_settings
+from devgraph.config.edits import project_config_notes as _project_config_notes
 from devgraph.config.edits import GLOBAL_TOOLS_NOTE as _GLOBAL_TOOLS_NOTE
 from devgraph.config.edits import SCHEMA_SECTIONS as _SCHEMA_SECTIONS
 from devgraph.config.edits import TOOLS_RELOAD_NOTE as _TOOLS_RELOAD_NOTE
@@ -1847,10 +1848,8 @@ def _set_project_config(repo_id: str, enabled: bool) -> None:
     finally:
         registry.close()
     console.print(f"[green][OK][/green] Project config {word} for {escape(repo_id)}.")
-    console.print(
-        f"  schema: applied at the next rescan (`devgraph rescan {escape(repo_id)} --now` to apply now)"
-    )
-    console.print("  project tools: picked up by running MCP sessions within 2 s")
+    for note in _project_config_notes(repo_id):
+        console.print(f"  {escape(note)}")
 
 
 @config_app.command("enable")

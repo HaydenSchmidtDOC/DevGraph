@@ -466,3 +466,37 @@ def test_reset_schema_stale_symlink_absent(tmp_path):
     with pytest.raises(ConfigEditError) as exc:
         edits.reset_schema(tmp_path)
     assert code(exc) == "not_regular" and path.is_symlink()
+
+
+# --- project config switch -------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_registry(monkeypatch, tmp_path):
+    from devgraph.config import project_switch
+
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: tmp_path / "absent.sqlite3")
+
+
+def test_project_config_notes_match_the_cli_wording():
+    assert edits.project_config_notes("demo") == [
+        "schema: applied at the next rescan (`devgraph rescan demo --now` to apply now)",
+        "project tools: picked up by running MCP sessions within 2 s",
+    ]
+
+
+def test_disabling_warns_about_project_node_types_and_unserved_tools(tmp_path, no_registry):
+    (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
+    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
+
+    warnings, notes = edits.project_config_change(record(path=tmp_path), False)
+
+    assert any("Ticket" in w and "next rescan" in w for w in warnings)
+    assert "Project tools no longer served in repo-a: count_things" in warnings
+    assert notes == edits.project_config_notes("repo-a")
+
+
+def test_enabling_and_bare_repos_have_no_warnings(tmp_path, no_registry):
+    assert edits.project_config_change(record(path=tmp_path), False)[0] == []
+    (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
+    assert edits.project_config_change(record(path=tmp_path, project_config_enabled=False), True)[0] == []

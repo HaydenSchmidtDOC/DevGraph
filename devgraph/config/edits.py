@@ -762,6 +762,30 @@ def reset_schema(
         )
 
 
+def project_config_notes(repo_id: str) -> list[str]:
+    """When flipping a repository's project-config switch takes effect (both directions; shared by the CLI and the dashboard)."""
+    return [
+        f"schema: applied at the next rescan (`devgraph rescan {repo_id} --now` to apply now)",
+        "project tools: picked up by running MCP sessions within 2 s",
+    ]
+
+
+def project_config_change(record: Any, enabled: bool) -> tuple[list[str], list[str]]:
+    """(warnings, notes) of switching `record`'s project config on or off. Pure; nothing is written."""
+    from devgraph.config.project_schema import project_schema_path
+    from devgraph.mcp.tool_plane import resolve_tools
+
+    path = project_schema_path(Path(record.path))
+    decl = schema_declaration(read_text_lossy(path), path) if path.is_file() else None
+    warnings = schema_change_warnings(None, decl, record) if enabled else schema_change_warnings(decl, None, record)
+    if not enabled:
+        origins = resolve_tools(record).origins
+        names = sorted(n for n, origin in origins.items() if origin.startswith("project"))
+        if names:
+            warnings.append(f"Project tools no longer served in {record.repo_id}: {', '.join(names)}")
+    return warnings, project_config_notes(record.repo_id)
+
+
 def read_text_lossy(path: Path) -> str:
     """The file's text, or "" when it cannot be read (a reset must not be blocked by a broken file)."""
     try:

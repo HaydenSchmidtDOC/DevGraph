@@ -23,6 +23,7 @@ import colorsys
 import hashlib
 import inspect
 import json
+import sqlite3
 import logging
 import math
 import time
@@ -866,6 +867,44 @@ def build_router(
             _apply_edit, scope, record, "schema",
             lambda root: edits.reset_schema(root, record=record, expected_fingerprint=expected, dry_run=dry), False,
         )
+
+    @router.put("/config/{scope}/project-config")
+    async def set_config_project_config(scope: str, request: Request) -> JSONResponse:
+        """Switch a repository's project config on or off. Names the end state, so it is idempotent: no If-Match."""
+        _reject_cross_site_config(request)
+        record = _write_record(scope, schema=True)
+        payload = await _json_payload(request)
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise _config_error(400, "bad_request", "enabled must be true or false")
+        dry = _body_dry_run(payload)
+        word = "enabled" if enabled else "disabled"
+
+        def apply() -> JSONResponse:
+            changed = record.project_config_enabled != enabled
+            warnings, notes = edits.project_config_change(record, enabled) if changed else ([], [])
+            if not changed:
+                notes = [f"Project config for {scope} is already {word}."]
+            elif not dry:
+                try:
+                    registry.set_project_config_enabled(scope, enabled)
+                except ValueError as exc:  # removed since the scope check
+                    raise _config_error(404, "not_found", f"unknown scope: {scope}") from exc
+                except sqlite3.Error as exc:
+                    logger.warning("project config switch for %s failed: %s", scope, exc)
+                    raise _config_error(500, "io", "could not update the registry") from exc
+            return JSONResponse(content={
+                "ok": True,
+                "written": changed and not dry,
+                "changed": changed,
+                "enabled": enabled,
+                "warnings": warnings,
+                "notes": notes,
+                "scope": _config_scope(scope),
+                "global": _config_scope(GLOBAL_SCOPE),
+            })
+
+        return await run_in_threadpool(apply)
 
     @router.post("/config/{scope}/schema/{section}")
     async def add_config_schema_entry(scope: str, section: str, request: Request) -> JSONResponse:

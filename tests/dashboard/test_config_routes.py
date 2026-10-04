@@ -14,7 +14,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from devgraph.config import global_tools, project_switch
+from devgraph.config import edits, global_tools, project_switch
 from devgraph.config.project_schema import SCHEMA_FILENAME, schema_file_hash
 from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.dashboard import routes
@@ -1310,3 +1310,102 @@ def test_reset_touches_no_git_state(client, registry, tmp_path):
     staged = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=record.path, capture_output=True, text=True).stdout
     _send(client, "POST", "/api/config/repo-a/reset/tools", _fp(client, "repo-a"), {}).raise_for_status()
     assert subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=record.path, capture_output=True, text=True).stdout == staged
+
+
+# --- project-config toggle ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def switch_db(registry, tmp_path, monkeypatch):
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: tmp_path / "registry.sqlite3")
+
+
+def _toggle(client, scope, body, **kw):
+    return client.put(f"/api/config/{scope}/project-config", json=body, **kw)
+
+
+def test_toggle_disables_and_enables_and_refreshes_badges(client, registry, tmp_path, global_store, switch_db):
+    record = _repo(tmp_path, registry)
+    _global_store(global_store, "hot_paths")
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="hot_paths"))
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+
+    response = _toggle(client, "repo-a", {"enabled": False})
+
+    body = response.json()
+    assert response.status_code == 200 and body["ok"] and body["written"] and body["changed"]
+    assert body["enabled"] is False and registry.get("repo-a").project_config_enabled is False
+    assert any("Widget" in w for w in body["warnings"])
+    assert body["notes"] == edits.project_config_notes("repo-a")
+    assert body["scope"]["project_config_enabled"] is False
+    assert _kinds(body["scope"]["tools"]["entries"][0]["badges"]) == ["not-served"]
+    assert body["scope"]["schema"]["state"] == "disabled"
+    assert all(e["badges"] == [] for e in body["global"]["tools"]["entries"])  # no longer "Overridden in"
+
+    response = _toggle(client, "repo-a", {"enabled": True})
+    assert response.json()["changed"] and registry.get("repo-a").project_config_enabled is True
+    assert response.json()["warnings"] == []
+    assert _kinds(response.json()["scope"]["tools"]["entries"][0]["badges"]) == ["overrides-global"]
+
+
+def test_toggle_is_idempotent_and_needs_no_if_match(client, registry, tmp_path, switch_db):
+    _repo(tmp_path, registry)
+
+    response = _toggle(client, "repo-a", {"enabled": True})
+
+    body = response.json()
+    assert response.status_code == 200 and body["changed"] is False and body["written"] is False
+    assert body["notes"] == ["Project config for repo-a is already enabled."]
+    assert _toggle(client, "repo-a", {"enabled": False}).json()["changed"] is True
+    again = _toggle(client, "repo-a", {"enabled": False}).json()
+    assert again["changed"] is False and again["notes"] == ["Project config for repo-a is already disabled."]
+
+
+def test_toggle_dry_run_reports_warnings_and_changes_nothing(client, registry, tmp_path, switch_db):
+    record = _repo(tmp_path, registry)
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+    before = _snapshot(tmp_path)
+
+    body = _toggle(client, "repo-a", {"enabled": False, "dry_run": True}).json()
+
+    assert body["written"] is False and body["changed"] is True and body["enabled"] is False
+    assert any("Widget" in w for w in body["warnings"])
+    assert registry.get("repo-a").project_config_enabled is True
+    assert body["scope"]["project_config_enabled"] is True
+    assert _snapshot(tmp_path) == before
+
+
+def test_toggle_cross_site_is_403(client, registry, tmp_path, switch_db):
+    _repo(tmp_path, registry)
+    for headers in ({"Origin": "http://evil.test"}, {"Sec-Fetch-Site": "cross-site"}):
+        response = _toggle(client, "repo-a", {"enabled": False}, headers=headers)
+        assert response.status_code == 403 and response.json()["detail"]["code"] == "forbidden"
+    assert registry.get("repo-a").project_config_enabled is True
+
+
+def test_toggle_unknown_inactive_and_global_scopes_are_404(client, registry, tmp_path, switch_db):
+    _repo(tmp_path, registry, "repo-b")
+    registry._set_flag("repo-b", "active", False)
+    for scope in ("nope", "repo-b", "__global__", "__all__"):
+        response = _toggle(client, scope, {"enabled": False})
+        assert response.status_code == 404 and response.json()["detail"]["code"] == "not_found", scope
+
+
+@pytest.mark.parametrize("body", [{}, {"enabled": "yes"}, {"enabled": 1}, {"enabled": None}, {"enabled": True, "dry_run": "no"}, [True]])
+def test_toggle_bad_bodies_are_400(client, registry, tmp_path, body, switch_db):
+    _repo(tmp_path, registry)
+    response = _toggle(client, "repo-a", body)
+    assert response.status_code == 400 and response.json()["detail"]["code"] == "bad_request"
+    assert registry.get("repo-a").project_config_enabled is True
+
+
+def test_toggle_non_json_is_415_and_oversized_is_413(client, registry, tmp_path, switch_db):
+    _repo(tmp_path, registry)
+    response = client.put("/api/config/repo-a/project-config", content='{"enabled": false}', headers={"content-type": "text/plain"})
+    assert response.status_code == 415
+    response = client.put(
+        "/api/config/repo-a/project-config", content=b'{"enabled": false, "x": "' + b"a" * 70000 + b'"}',
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert registry.get("repo-a").project_config_enabled is True
