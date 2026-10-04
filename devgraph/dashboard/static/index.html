@@ -426,6 +426,22 @@ table.dstable input[type="text"] { width: 100%; }
 .modal-box.cfg-modal-box { width: min(720px, 92vw); display: flex; flex-direction: column; gap: 12px; }
 .cfg-yaml { width: 100%; min-height: 260px; resize: vertical; background: #050506; border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--fg); padding: 10px 12px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; }
 .cfg-confirm { font-size: 12.5px; color: var(--warn); line-height: 1.5; }
+.cfg-switch { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.cfg-switch button[aria-pressed="true"] { border-color: var(--accent); color: var(--fg); }
+.cfg-switch button[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
+.cfg-form-notice { font-size: 12.5px; color: var(--muted); line-height: 1.5; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.cfg-form { margin: 0; min-width: 0; max-height: 60vh; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+.cfg-form legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
+.cfg-form fieldset { margin: 0; min-width: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: 8px 10px; display: flex; flex-direction: column; gap: 8px; }
+.cfg-form textarea:not(.cfg-yaml) { background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--fg); padding: 9px 11px; font-size: 13px; font-family: var(--font-body); resize: vertical; }
+.cfg-form textarea.cfg-yaml { min-height: 0; }
+.cfg-form .field.cfg-check { flex-direction: row; align-items: center; gap: 8px; }
+.cfg-form .field.cfg-check input { padding: 0; }
+.cfg-form .cfg-inline { display: flex; align-items: center; gap: 8px; }
+.cfg-form .cfg-inline input[type="text"] { flex: 1; }
+.cfg-form .cfg-help { font-size: 11.5px; color: var(--meta); }
+.cfg-form .cfg-hint { font-size: 11.5px; color: var(--warn); }
+.cfg-form .cfg-row-actions { display: flex; gap: 8px; }
 .cfg-confirm ul { margin: 4px 0 0 18px; }
 .cfg-error { font-size: 12.5px; color: var(--danger); white-space: pre-wrap; line-height: 1.5; }
 .pagefoot { position: relative; z-index: 1; border-top: 1px solid var(--border-soft); padding: 24px var(--space-6); color: var(--meta); font-size: 12px; max-width: var(--container-max); margin-inline: auto; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; background: color-mix(in oklab, var(--bg) 88%, transparent); }
@@ -780,6 +796,9 @@ table.dstable input[type="text"] { width: 100%; }
   <h4 id="configModalTitle"></h4>
   <div class="banner warn" id="configModalWarn" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg><span id="configModalWarnText"></span></div>
   <div class="field" id="configDestField" style="display:none"><label for="configDest" id="configDestLabel">Save to</label><select id="configDest"></select></div>
+  <div class="cfg-switch" id="configEditorSwitch" role="group" aria-labelledby="configEditorLabel" style="display:none"><span id="configEditorLabel">Editor</span><button type="button" class="btn btn-sm" id="configModeForm" aria-pressed="false">Form</button><button type="button" class="btn btn-sm" id="configModeYaml" aria-pressed="true">YAML</button></div>
+  <div class="cfg-form-notice" id="configFormNotice" style="display:none"><span id="configFormNoticeText"></span><button type="button" class="btn btn-sm" id="configFormDiscard" style="display:none">Discard YAML edits</button></div>
+  <fieldset class="cfg-form" id="configForm" style="display:none"></fieldset>
   <textarea class="cfg-yaml" id="configYaml" spellcheck="false" aria-label="Entry YAML"></textarea>
   <div class="cfg-confirm" id="configModalConfirm" style="display:none"></div>
   <div class="cfg-error" id="configModalError" style="display:none"></div>
@@ -2929,7 +2948,8 @@ let configModel = null;
 /* bumped by every page load and every block a write returns: a load answered
    after either is stale and dropped, so an older fingerprint never comes back */
 let configLoadSeq = 0;
-/* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, dryTarget, dryYaml, busy, label, armedAt } */
+/* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, dryTarget, dryYaml, busy, label, armedAt,
+   mode (form|yaml), formState, formText, openText, openEntry, order } */
 let configEdit = null;
 /* the open reset dialog: { scope, kind, phrase, fingerprint, review, stale, busy, ready, armedAt } */
 let configReset = null;
@@ -3019,7 +3039,7 @@ function configEntryRows(box, scope, section, items, nameKey) {
     const name = item[nameKey];
     const extras = (scope === CONFIG_GLOBAL ? [configEl("span", "cfg-global", "GLOBAL")] : []).concat((item.badges || []).map(configBadgeEl));
     const actions = item.editable === false ? [] : [
-      configButton("Edit", () => openConfigEditor({ scope, section, op: "replace", name, yaml: item.yaml })),
+      configButton("Edit", () => openConfigEditor({ scope, section, op: "replace", name, yaml: item.yaml, entry: item.entry })),
       configButton(item.origin === "project (overrides global)" ? "Remove override" : "Delete",
         () => openConfigEditor({ scope, section, op: "delete", name, yaml: item.yaml })),
     ];
@@ -3047,7 +3067,7 @@ function renderConfigScope(scope, block) {
     card.appendChild(box);
   }
   const add = section => ({ noun: CONFIG_SECTIONS[section].noun,
-    fn: () => openConfigEditor({ scope, section, op: "add", name: null, yaml: CONFIG_SECTIONS[section].template }) });
+    fn: () => openConfigEditor({ scope, section, op: "add", name: null, yaml: CONFIG_SECTIONS[section].template, entry: CONFIG_SECTIONS[section].entry }) });
   /* a file that is not there has nothing to reset; an invalid one is when Reset matters most */
   const reset = (part, kind) => part.state === "absent" || part.fingerprint === "absent" ? null : () => openConfigReset(scope, kind);
   const tools = block.tools;
@@ -3202,7 +3222,25 @@ function renderConfigModal() {
   configShow("configModalWarn", !!warn);
   configShow("configDestField", edit.step === "edit" &&
     (edit.op === "copy" || (edit.scope === CONFIG_GLOBAL && edit.section === "tools" && edit.op === "replace")));
-  configShow("configYaml", edit.step === "edit");
+  /* Form | YAML: offered by op first (delete and copy are the read-only YAML),
+     then by the text: the form shows only text it produced */
+  const sw = configFormAvailability(edit);
+  if (edit.mode === "form" && !(sw && sw.available)) edit.mode = "yaml";
+  const form = edit.mode === "form";
+  configShow("configYaml", edit.step === "edit" && !form);
+  configShow("configForm", edit.step === "edit" && form);
+  configShow("configEditorSwitch", edit.step === "edit" && !!sw);
+  const notice = edit.step === "edit" && !!sw && !form && !sw.available;
+  document.getElementById("configFormNoticeText").textContent = notice ? sw.reason : "";
+  configShow("configFormNotice", notice);
+  configShow("configFormDiscard", notice && sw.reason === CONFIG_FORM_REASONS.handEdit);
+  const formBtn = document.getElementById("configModeForm");
+  formBtn.setAttribute("aria-pressed", String(form));
+  document.getElementById("configModeYaml").setAttribute("aria-pressed", String(!form));
+  /* unavailable, the Form button stays focusable so its reason can be read */
+  formBtn.setAttribute("aria-disabled", String(!(sw && sw.available)));
+  if (sw && !sw.available) formBtn.setAttribute("aria-describedby", "configFormNoticeText");
+  else formBtn.removeAttribute("aria-describedby");
   const confirm = document.getElementById("configModalConfirm");
   confirm.replaceChildren();
   if (edit.confirmed) {
@@ -3217,14 +3255,20 @@ function renderConfigModal() {
     edit.label = label;
     edit.armedAt = Date.now();
     /* keyboard focus leaves the button whose meaning changed: a held Enter
-       then types into (or does nothing in) the textarea instead of confirming */
-    if (edit.step === "edit") document.getElementById("configYaml").focus();
+       then types into (or does nothing in) the editor instead of confirming.
+       Someone typing in the form keeps their place. */
+    if (edit.step === "edit" && !(form && configFormEls.all.includes(document.activeElement))) configEditorFocusTarget().focus();
   }
   /* the destination is what the dry run checked: it cannot change under a request */
   document.getElementById("configDest").disabled = !!edit.busy;
   /* ...and neither can the text: typed meanwhile, it would be written unreviewed or lost on close */
   /* a copy is the entry as shown; edit it in the destination afterwards */
   document.getElementById("configYaml").readOnly = edit.op === "delete" || edit.op === "copy" || !!edit.busy;
+  /* the form edits that same text, so it is locked the same way, and so is switching */
+  document.getElementById("configForm").disabled = !!edit.busy;
+  formBtn.disabled = !!edit.busy;
+  document.getElementById("configModeYaml").disabled = !!edit.busy;
+  document.getElementById("configFormDiscard").disabled = !!edit.busy;
   const save = document.getElementById("configModalSave");
   save.disabled = !!edit.busy;
   save.textContent = edit.busy || label;
@@ -3252,7 +3296,8 @@ function configSetError(text, reload) {
   configShow("configModalError", !!text);
   configShow("configModalReload", !!reload);
 }
-/* opts: { scope, section, op: add|replace|delete|copy, name, yaml } */
+/* opts: { scope, section, op: add|replace|delete|copy, name, yaml, entry } (entry: the
+   parsed mapping the form starts from, or null/absent: YAML only) */
 function openConfigEditor(opts) {
   const isGlobal = opts.scope === CONFIG_GLOBAL;
   const copy = opts.op === "copy";
@@ -3265,6 +3310,15 @@ function openConfigEditor(opts) {
   });
   configEdit = { ...opts, dest: copy ? choices[0].value : opts.scope, step: isGlobal && opts.op !== "add" ? "warn" : "edit", fps,
     confirmed: false, warnings: [], crossName: null, dryTarget: null, dryYaml: null, busy: "", label: null, armedAt: 0 };
+  /* the textarea keeps the server's text until the first form change, so an
+     untouched save sends exactly what was opened */
+  const rep = configFormFromEntry(opts.section, opts.entry);
+  Object.assign(configEdit, { openText: opts.yaml || "", openEntry: opts.entry, formText: opts.yaml || "",
+    formState: rep.ok ? rep.form : null, order: configIsMap(opts.entry) ? Object.keys(opts.entry) : [] });
+  configEdit.mode = configFormOp(opts) && rep.ok && configEditorPref !== "yaml" ? "form" : "yaml";
+  configFormSeq = 0;
+  if (configEdit.mode === "form") renderConfigForm(configEdit);
+  else { document.getElementById("configForm").replaceChildren(); configFormEls = { controls: {}, hints: {}, all: [], refresh: [], first: null }; }
   document.getElementById("configDestLabel").textContent = copy ? "Copy to" : "Save to";
   const dest = document.getElementById("configDest");
   dest.replaceChildren();
@@ -3277,8 +3331,10 @@ function openConfigEditor(opts) {
   dest.onchange = () => { configEdit.dest = dest.value; configEdit.crossName = null; configEdit.confirmed = false; renderConfigModal(); };
   const yaml = document.getElementById("configYaml");
   yaml.value = opts.yaml || "";
-  /* the text decides the name, so a known-taken name and any confirm are stale */
-  yaml.oninput = () => { configEdit.crossName = null; if (configEdit.confirmed) { configEdit.confirmed = false; renderConfigModal(); } };
+  yaml.oninput = configTextChanged;
+  document.getElementById("configModeForm").onclick = () => configSetEditorMode("form");
+  document.getElementById("configModeYaml").onclick = () => configSetEditorMode("yaml");
+  document.getElementById("configFormDiscard").onclick = configFormDiscard;
   document.getElementById("configModalSave").onclick = configSave;
   /* Cancel works mid-request too: configSave checks it still owns the editor after every await */
   document.getElementById("configModalCancel").onclick = configCloseEditor;
@@ -3924,6 +3980,272 @@ function configFormSwitch(edit, text) {
   if (edit.formState && text === edit.formText) return { available: true, restore: "state", reason: null };
   if (text === edit.openText) return { available: true, restore: "open", reason: null };
   return { available: false, restore: null, reason: CONFIG_FORM_REASONS.handEdit };
+}
+/* ── the form view (DOM). The form is a view over #configYaml: every change
+   re-serialises the entry into the textarea and runs the textarea's own reset,
+   so Save, the dry run and the confirm binding see only that text. ── */
+/* the editor the user last picked, for this page session; it wins when available */
+let configEditorPref = null;
+/* ids for form controls: a per-editor counter, never entry data */
+let configFormSeq = 0;
+/* the rendered form: controls and hint boxes by field path, every focusable
+   control, per-render updaters (legends, counts), and the first control */
+let configFormEls = { controls: {}, hints: {}, all: [], refresh: [], first: null };
+const configFormOp = edit => edit.op === "add" || edit.op === "replace";
+/* null when the op has no form (delete, copy); else configFormSwitch for the textarea's text */
+function configFormAvailability(edit) {
+  if (!configFormOp(edit)) return null;
+  return configFormSwitch(edit, document.getElementById("configYaml").value);
+}
+/* the textarea's input handler, shared with the form: the text decides the
+   name, so a known-taken name and any confirm are stale */
+function configTextChanged() {
+  const edit = configEdit;
+  if (!edit) return;
+  edit.crossName = null;
+  edit.confirmed = false;
+  renderConfigModal();
+}
+function configFormChanged() {
+  const edit = configEdit;
+  if (!edit || !edit.formState) return;
+  const text = configEntryYaml(edit.section, configEntryFromForm(edit.section, edit.formState, edit.order), edit.order);
+  edit.formText = text;
+  document.getElementById("configYaml").value = text;
+  configFormRefresh(edit);
+  configTextChanged();
+}
+function configSetEditorMode(mode) {
+  const edit = configEdit;
+  if (!edit || edit.busy || mode === edit.mode) return;
+  if (mode === "form") {
+    const sw = configFormAvailability(edit);
+    if (!sw || !sw.available) return;
+    if (sw.restore === "open") {
+      edit.formState = configFormFromEntry(edit.section, edit.openEntry).form;
+      edit.formText = edit.openText;
+    }
+    renderConfigForm(edit);
+  }
+  edit.mode = mode;
+  configEditorPref = mode;
+  renderConfigModal();
+}
+/* back to the form's last text (through the textarea's reset, so a confirm is dropped) */
+function configFormDiscard() {
+  const edit = configEdit;
+  if (!edit || edit.busy) return;
+  document.getElementById("configYaml").value = edit.formText;
+  configTextChanged();
+  configSetEditorMode("form");
+  configEditorFocusTarget().focus();
+}
+function configEditorFocusTarget() {
+  return configEdit && configEdit.mode === "form" && configFormEls.first ? configFormEls.first : document.getElementById("configYaml");
+}
+/* hints, legends and counts follow the state without rebuilding (focus stays put) */
+function configFormRefresh(edit) {
+  const hints = configFormHints(edit.section, edit.formState);
+  for (const [path, box] of Object.entries(configFormEls.hints)) {
+    const text = hints.filter(h => h.field === path).map(h => h.text).join(" ");
+    box.textContent = text;
+    box.style.display = text ? "" : "none";
+  }
+  configFormEls.refresh.forEach(fn => fn());
+}
+/* one labelled control; `path` names it for hints and for focus after a rebuild */
+function configFormField(parent, path, labelText, control, help, cls) {
+  const wrap = configEl("div", "field" + (cls ? " " + cls : ""));
+  const id = "cfgf-" + (++configFormSeq);
+  control.id = id;
+  const label = configEl("label", "", labelText);
+  label.htmlFor = id;
+  if (cls === "cfg-check") { wrap.appendChild(control); wrap.appendChild(label); }
+  else { wrap.appendChild(label); wrap.appendChild(control); }
+  const described = [];
+  if (help !== undefined) {
+    const h = configEl("div", "cfg-help", help);
+    h.id = id + "-help";
+    wrap.appendChild(h);
+    described.push(h.id);
+  }
+  if (path) {
+    const hint = configEl("div", "cfg-hint");
+    hint.id = id + "-hint";
+    hint.style.display = "none";
+    wrap.appendChild(hint);
+    described.push(hint.id);
+    configFormEls.controls[path] = control;
+    configFormEls.hints[path] = hint;
+  }
+  if (described.length) control.setAttribute("aria-describedby", described.join(" "));
+  configFormEls.all.push(control);
+  if (!configFormEls.first) configFormEls.first = control;
+  parent.appendChild(wrap);
+  return wrap;
+}
+/* text controls write the state and re-serialise; nothing is ever read back
+   through a control that could have rewritten it */
+function configFormText_(tag, value, set) {
+  const el = configEl(tag, "");
+  if (tag === "input") { el.type = "text"; el.autocomplete = "off"; el.spellcheck = false; }
+  el.value = value;
+  el.addEventListener("input", () => { set(el.value); configFormChanged(); });
+  return el;
+}
+/* a select whose options come from constants, plus one for any current value
+   they don't hold (so the select never reads back "" for a value it can't show) */
+function configFormSelect(options, value, extra, set) {
+  const el = configEl("select", "");
+  const all = options.slice();
+  extra.filter(v => !all.some(([o]) => o === v)).forEach(v => all.push([v, v + " (current value)"]));
+  all.forEach(([v, text]) => { const o = configEl("option", "", text); o.value = v; el.appendChild(o); });
+  el.value = value;
+  el.addEventListener("change", () => set(el.value));
+  return el;
+}
+function configFormCheck(checked, set) {
+  const el = configEl("input", "");
+  el.type = "checkbox";
+  el.checked = !!checked;
+  el.addEventListener("change", () => set(el.checked));
+  return el;
+}
+/* a structural change (a row, a type, Required): rebuild, refocus, re-serialise */
+function configFormRebuild(edit, focusPath) {
+  renderConfigForm(edit);
+  const el = configFormEls.controls[focusPath];
+  if (el) el.focus();
+  configFormChanged();
+}
+function renderConfigForm(edit) {
+  const box = document.getElementById("configForm");
+  const f = edit.formState;
+  configFormEls = { controls: {}, hints: {}, all: [], refresh: [], first: null };
+  box.replaceChildren(configEl("legend", "", edit.section === "tools" ? "Tool" : "Node type"));
+  const text = (parent, path, label, key, obj, help, tag = "input") =>
+    configFormField(parent, path, label, configFormText_(tag, obj[key], v => { obj[key] = v; }), help);
+  const rows = (title, list, noun, addLabel, fresh, fill) => {
+    const group = configEl("fieldset", "");
+    const legend = configEl("legend", "", title);
+    group.appendChild(legend);
+    const prefix = edit.section === "tools" ? "parameters." : "metadata.";
+    list.forEach((row, i) => {
+      const set = configEl("fieldset", "");
+      const lg = configEl("legend", "");
+      set.appendChild(lg);
+      fill(set, row, prefix + i + ".");
+      const remove = configButton("Remove", () => {
+        list.splice(i, 1);
+        configFormRebuild(edit, i < list.length ? prefix + i + ".name" : prefix + "add");
+      });
+      configFormEls.all.push(remove);
+      const named = () => {
+        lg.textContent = noun[0].toUpperCase() + noun.slice(1) + " " + (i + 1) + (row.name ? ": " + row.name : "");
+        remove.setAttribute("aria-label", "Remove " + noun + " " + (row.name || i + 1));
+      };
+      named();
+      configFormEls.refresh.push(named);
+      const actions = configEl("div", "cfg-row-actions");
+      actions.appendChild(remove);
+      set.appendChild(actions);
+      group.appendChild(set);
+    });
+    const add = configButton(addLabel, () => {
+      list.push(fresh());
+      configFormRebuild(edit, prefix + (list.length - 1) + ".name");
+    });
+    configFormEls.controls[prefix + "add"] = add;
+    configFormEls.all.push(add);
+    group.appendChild(add);
+    return group;
+  };
+  if (edit.section === "tools") {
+    text(box, "name", "Name", "name", f, "Lowercase letters, digits and underscores, starting with a letter." +
+      (edit.op === "replace" ? " Changing it renames the tool." : ""));
+    const desc = text(box, "description", "Description", "description", f, "", "textarea");
+    desc.children[1].rows = 3;
+    const count = desc.children[2];
+    const counted = () => { count.textContent = [...f.description.trim()].length + " / " + CONFIG_FORM_LIMITS.MAX_DESCRIPTION_LENGTH + " characters"; };
+    counted();
+    configFormEls.refresh.push(counted);
+    const cy = text(box, "cypher", "Cypher", "cypher", f, "Must filter on $repo_id; DevGraph supplies it. Read-only clauses only.", "textarea");
+    cy.children[1].className = "cfg-yaml";
+    cy.children[1].spellcheck = false;
+    cy.children[1].rows = 10;
+    const P = CONFIG_FORM_FIELDS.parameter_types.map(t => [t, t]);
+    box.appendChild(rows("Parameters", f.parameters, "parameter", "Add parameter",
+      () => ({ name: "", type: "string", required: true, default: "", description: "", open: {} }),
+      (set, p, path) => {
+        text(set, path + "name", "Name", "name", p);
+        configFormField(set, path + "type", "Type", configFormSelect(P, p.type, [], v => { p.type = v; configFormRebuild(edit, path + "type"); }));
+        configFormField(set, path + "required", "Required", configFormCheck(p.required, v => { p.required = v; configFormRebuild(edit, path + "required"); }),
+          undefined, "cfg-check");
+        /* typed defaults are text, kept as typed (a number input would read "" for "12abc") */
+        const open = p.open && "default" in p.open ? [configFormText(p.open.default)] : [];
+        const dflt = p.type === "boolean"
+          ? configFormSelect([["", "(none)"], ["true", "true"], ["false", "false"]], p.default, open.concat(p.default).filter(v => v !== ""),
+            v => { p.default = v; configFormChanged(); })
+          : configFormText_("input", p.default, v => { p.default = v; });
+        if (p.type === "integer") dflt.inputMode = "numeric";
+        if (p.type === "float") dflt.inputMode = "decimal";
+        dflt.disabled = !!p.required;
+        configFormField(set, path + "default", "Default", dflt, "A default makes the parameter optional.");
+        text(set, path + "description", "Description", "description", p);
+      }));
+    const num = (key, label, dflt) => {
+      const wrap = text(box, key, label, key, f, "");
+      const el = wrap.children[1];
+      el.inputMode = "numeric";
+      el.placeholder = dflt + " (default)";
+    };
+    num("max_rows", "Max rows", CONFIG_FORM_LIMITS.DEFAULT_MAX_ROWS);
+    num("timeout_s", "Timeout (s)", CONFIG_FORM_LIMITS.DEFAULT_TIMEOUT_S);
+    configFormRefresh(edit);
+    return;
+  }
+  text(box, "label", "Label", "label", f, "Letters, digits and underscores, starting with a letter; built-in labels are refused.");
+  const desc = text(box, "description", "Description", "description", f, undefined, "textarea");
+  desc.children[1].rows = 2;
+  const colour = text(box, "color", "Colour", "color", f, "#rrggbb, or empty for the default colour.");
+  const [colourLabel, colourText, ...colourRest] = [...colour.children];
+  const line = configEl("div", "cfg-inline");
+  colour.replaceChildren(colourLabel, line, ...colourRest);
+  line.appendChild(colourText);
+  const swatch = configEl("input", "");
+  swatch.type = "color";
+  swatch.setAttribute("aria-label", "Pick a colour");
+  const follow = () => { if (configFullMatch(CONFIG_FORM_LIMITS.COLOR_PATTERN, f.color)) swatch.value = f.color.toLowerCase(); };
+  follow();
+  configFormEls.refresh.push(follow);
+  swatch.addEventListener("input", () => { f.color = swatch.value; colourText.value = f.color; configFormChanged(); });
+  const clear = configButton("Clear", () => { f.color = ""; colourText.value = ""; configFormChanged(); });
+  clear.setAttribute("aria-label", "Clear colour");
+  line.appendChild(swatch);
+  line.appendChild(clear);
+  configFormEls.all.push(swatch, clear);
+  const kinds = [["", "None (declared only)"], ...CONFIG_FORM_FIELDS.filesystem_kinds.map(k => [k, "Filesystem — " + k])];
+  configFormField(box, "source", "Source", configFormSelect(kinds, f.source, [], v => { f.source = v; configFormChanged(); }));
+  const M = CONFIG_FORM_FIELDS.metadata_types.map(t => [t, t]);
+  const meta = rows("Metadata", f.metadata, "field", "Add field",
+    () => ({ name: "", type: "string", required: false, key: false, description: "", open: {} }),
+    (set, m, path) => {
+      text(set, path + "name", "Name", "name", m);
+      configFormField(set, path + "type", "Type", configFormSelect(M, m.type, [], v => { m.type = v; configFormChanged(); }));
+      configFormField(set, path + "required", "Required", configFormCheck(m.required, v => { m.required = v; configFormChanged(); }),
+        undefined, "cfg-check");
+      const key = configFormCheck(m.key, v => { m.key = v; configFormChanged(); });
+      configFormField(set, path + "key", "Key", key, "The key is the ticked fields, in this order.", "cfg-check");
+      key.setAttribute("aria-describedby", key.getAttribute("aria-describedby") + " configFormKeyHint");
+      text(set, path + "description", "Description", "description", m);
+    });
+  const keyHint = configEl("div", "cfg-hint");
+  keyHint.id = "configFormKeyHint";
+  keyHint.style.display = "none";
+  meta.appendChild(keyHint);
+  configFormEls.hints.key = keyHint;
+  box.appendChild(meta);
+  configFormRefresh(edit);
 }
 /* ── end Config page ── */
 document.getElementById("btnConfigReload").addEventListener("click", () => loadConfigPage());
