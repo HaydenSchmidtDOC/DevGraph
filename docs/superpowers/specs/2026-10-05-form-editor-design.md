@@ -66,6 +66,7 @@ Reason texts (shown as the notice; all `textContent`): "This entry has a field t
 
 - **Form → YAML**: always allowed. The textarea already holds the form's serialisation (or the untouched opening text). The editor remembers `edit.formText` (the last text the form produced, or the opening text) and `edit.formState`.
 - **YAML → Form**: allowed only when the textarea still holds text whose mapping is known: `edit.formText` (restore `edit.formState`) or the opening text (rebuild from the opening `entry`). Otherwise the Form button is disabled and the panel says: "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form." with a **Discard YAML edits** button that puts `edit.formText` back into the textarea (through `configTextChanged()`, so a pending confirmation is dropped) and switches to the form.
+- **Confirmation across a switch**: a plain Form ↔ YAML switch with unchanged text keeps an existing warning confirmation. That is safe: the text is the same, and Save re-checks the text against the dry run's text before it writes. A hand edit of the textarea, or **Discard YAML edits**, goes through `configTextChanged()` and drops the confirmation.
 - The opening mode is Form when the section has a form, the op is add or replace, and the entry is representable; otherwise YAML. The last mode the user picked is remembered for the page session (a module variable, not storage) and wins when it is available.
 - Delete and Copy keep the read-only YAML view (G2b-2: a copy is the entry as shown). The global warning step (`edit.step === "warn"`) shows no editor at all, as today.
 
@@ -99,8 +100,8 @@ Builds the mapping from the form state. Typed fields:
 | Description | textarea (3 rows) | character count against 1024 |
 | Cypher | textarea, monospace (`.cfg-yaml` style), `spellcheck=false`, 10 rows, resizable | Tab is **not** captured (keyboard users must be able to leave the field); help text: "Must filter on `$repo_id`; DevGraph supplies it. Read-only clauses only." |
 | Parameters | one fieldset per parameter: Name, Type (select string/integer/float/boolean), Required (checkbox, default ticked), Default (input by type; disabled while Required is ticked, with help "A default makes the parameter optional"), Description; **Remove** per row; **Add parameter** after the list | the legend reads "Parameter 2: limit" |
-| Max rows | number input, `min=1 max=1000`, placeholder "100 (default)" | empty = omitted |
-| Timeout (s) | number input, `min=1 max=60`, placeholder "10 (default)" | empty = omitted |
+| Max rows | text input (`inputmode=numeric`), kept as typed, placeholder "100 (default)" | empty = omitted |
+| Timeout (s) | text input (`inputmode=numeric`), kept as typed, placeholder "10 (default)" | empty = omitted |
 
 **Node type**
 | Field | Control | Notes |

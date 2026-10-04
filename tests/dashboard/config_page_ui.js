@@ -60,7 +60,11 @@ const mkEl = tag => {
     removeAttribute(k) { delete attrs[k]; },
     /* as in a browser: a disabled control, or one inside a disabled fieldset, can't take focus */
     focus() {
-      for (let e = el; e; e = e.parentNode) if (e.disabled && (e === el || e.tagName === "FIELDSET")) return;
+      for (let e = el; e; e = e.parentNode) {
+        if (e.disabled && (e === el || e.tagName === "FIELDSET")) return;
+        /* ...and nothing inside a modal that isn't open yet */
+        if (e === els.configModal && !e.classList.contains("open")) return;
+      }
       focused = el;
     },
   };
@@ -83,9 +87,18 @@ const ids = ["configScopes", "configStatus", "configModal", "configModalTitle", 
   "configResetModal", "configResetTitle", "configResetList", "configResetPhraseField", "configResetPhraseLabel", "configResetTyped",
   "configResetError", "configResetRecheck", "configResetCancel", "configResetConfirm"];
 const tagFor = id => id === "configYaml" ? "textarea" : id === "configDest" ? "select" : id === "configResetTyped" ? "input" :
-  id === "configForm" ? "fieldset" : /^configReset(Recheck|Cancel|Confirm)$|^configMode|^configFormDiscard$/.test(id) ? "button" : "div";
+  id === "configForm" ? "fieldset" : /^configReset(Recheck|Cancel|Confirm)$|^configModal(Reload|Cancel|Save)$|^configMode|^configFormDiscard$/.test(id) ? "button" : "div";
 const els = Object.fromEntries(ids.map(id => [id, mkEl(tagFor(id))]));
 els["pane-config"].classList.add("active");
+/* the modal's own controls sit inside it, in the page's order (the page's other ids don't) */
+const nest = (parent, kids) => kids.forEach(k => { els[k].parentNode = els[parent]; els[parent].children.push(els[k]); });
+nest("configDestField", ["configDestLabel", "configDest"]);
+nest("configFormNotice", ["configFormNoticeText", "configFormDiscard"]);
+nest("configFormScroll", ["configForm"]);
+nest("configModalWarn", ["configModalWarnText"]);
+nest("configModal", ["configModalTitle", "configModalWarn", "configDestField", "configEditorSwitch", "configFormHelp", "configFormNotice",
+  "configFormScroll", "configYaml", "configModalConfirm", "configModalError", "configModalReload", "configModalCancel", "configModalSave"]);
+nest("configEditorSwitch", ["configModeForm", "configModeYaml"]);
 const document = { getElementById: id => els[id] || null, createElement: mkEl, get activeElement() { return focused; } };
 
 let tooltips = [];
@@ -1980,6 +1993,72 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await typeIn(formCtl("Name"), HOSTILE + "2");
   check("...and nothing reaches innerHTML", allEls.every(e => !e._html.includes("<img") && !e._html.includes("onerror")),
     JSON.stringify(allEls.filter(e => e._html.includes("<img")).map(e => e._html)));
+  els.configModalCancel.fire("click");
+
+  // 42. the editor is a dialog: focus lands inside once it is open, Tab wraps, focus goes back to the opener
+  api.renderConfigPage(FM());
+  fetchCalls = [];
+  const dlg = html.slice(html.indexOf('id="configModal"') - 40, html.indexOf('id="configModalWarn"'));
+  check("the Config modal is a labelled modal dialog", /role="dialog"/.test(dlg) && /aria-modal="true"/.test(dlg) &&
+    /aria-labelledby="configModalTitle"/.test(dlg), dlg);
+  check("the hand-edit notice is a polite live region", /id="configFormNotice"[^>]*aria-live="polite"/.test(html), "");
+  const opener = buttons(rowFor(card("repo-b"), "hot_paths"), "Edit")[0];
+  await press(opener);
+  check("opening the editor focuses its first control once the modal is open (form mode)", focused === formCtl("Name"), focused && focused.tagName);
+  const tab = (shift = false) => { const ev = { key: "Tab", shiftKey: shift, defaultPrevented: false, preventDefault() { ev.defaultPrevented = true; } }; api.configModalKey(ev); return ev; };
+  focused = els.configModalSave;
+  check("Tab from Save wraps to the first control (the Form switch)", tab().defaultPrevented && focused === els.configModeForm, focused && focused.id);
+  check("Shift+Tab from the first control wraps to Save", tab(true).defaultPrevented && focused === els.configModalSave, focused && focused.id);
+  focused = formCtl("Name");
+  check("Tab in the middle is left to the browser", !tab().defaultPrevented && !tab(true).defaultPrevented && focused === formCtl("Name"), "");
+  focused = opener;
+  check("Tab from outside the modal pulls focus in", tab().defaultPrevented && focused === els.configModeForm, focused && focused.id);
+  els.configModalSave.disabled = true;
+  focused = els.configModalCancel;
+  check("a disabled last control is skipped: Tab from Cancel wraps", tab().defaultPrevented && focused === els.configModeForm, focused && focused.id);
+  els.configModalSave.disabled = false;
+  await els.configModalCancel.fire("click");
+  check("Cancel returns focus to the Edit button that opened it", focused === opener && api.edit === null, focused && focused.tagName);
+  await press(opener);
+  api.configModalKey({ key: "Escape" });
+  check("Escape returns focus to the opener too", focused === opener && !els.configModal.classList.contains("open"), focused && focused.tagName);
+  await press(opener);
+  await els.configModal.onclick({ target: els.configModal });
+  check("an overlay click returns focus to the opener too", focused === opener, focused && focused.tagName);
+  api.renderConfigPage(MODEL());
+  await press(buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0]);
+  check("a YAML-only entry focuses the textarea", focused === els.configYaml, focused && focused.id);
+  focused = els.configModalSave;
+  const firstCtl = shown(els.configEditorSwitch) ? els.configModeForm : els.configYaml;
+  check("in YAML mode Tab from Save wraps to the first visible control; Shift+Tab back", tab().defaultPrevented && focused === firstCtl && tab(true).defaultPrevented && focused === els.configModalSave, focused && focused.id);
+  els.configModalCancel.fire("click");
+  respond = () => ok(globalBlock());
+  await press(buttons(rowFor(card("__global__"), "hot_paths"), "Delete")[0]);
+  check("the global warning step focuses its Continue button (no editor yet)", focused === els.configModalSave && els.configModalSave.textContent === "Continue", focused && focused.id);
+  els.configModalCancel.fire("click");
+  // the arming focus move after a warned dry run is unchanged: off Save, onto the editor
+  api.renderConfigPage(FM());
+  respond = warnDry;
+  await editRow("repo-b", "hot_paths");
+  await press(els.configModalSave);
+  check("after a warned dry run focus is still off Save, on the form's first control", els.configModalSave.textContent === "Save anyway" &&
+    focused === formCtl("Name"), focused && focused.tagName);
+  els.configModalCancel.fire("click");
+
+  // 43. the description count is the server's: stripped (Python's whitespace), then code points
+  const descCount = () => find(els.configForm, e => /characters$/.test(e.textContent) && e.children.length === 0)[0].textContent;
+  const hintFor = d => { const f = api.configFormFromEntry("tools", TOOL_ENTRY).form; f.description = d; return api.configFormHints("tools", f).filter(h => h.field === "description"); };
+  const A = n => "a".repeat(n);
+  check("1024 characters padded with spaces is within the limit", hintFor("  " + A(1024) + "\n").length === 0, "");
+  check("1025 characters is over, and says so", /1025 characters; the limit is 1024/.test((hintFor(A(1025))[0] || {}).text || ""), JSON.stringify(hintFor(A(1025))));
+  check("1024 astral characters count as 1024 (code points, not UTF-16 units)", hintFor("\u{1F600}".repeat(1024)).length === 0 && hintFor("\u{1F600}".repeat(1025)).length === 1, "");
+  check("Python's str.strip removes NEL and the separator controls, so they pad for free", hintFor(A(1024) + "\x85\x1c").length === 0 && hintFor("\x1f" + A(1024)).length === 0, "");
+  check("...and keeps a BOM, which it does not strip", hintFor(A(1024) + "\uFEFF").length === 1, "");
+  await editRow("repo-b", "hot_paths");
+  await typeIn(formCtl("Description"), A(1024) + "\x85");
+  check("the live count agrees: 1024 / 1024", descCount() === "1024 / 1024 characters", descCount());
+  await typeIn(formCtl("Description"), A(1024) + "\uFEFF");
+  check("...and a BOM counts: 1025 / 1024", descCount() === "1025 / 1024 characters", descCount());
   els.configModalCancel.fire("click");
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");

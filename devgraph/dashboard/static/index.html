@@ -800,13 +800,13 @@ table.dstable input[type="text"] { width: 100%; }
 </div>
 
 <div class="modal-overlay" id="restartModal"><div class="modal-box"><h4>Restart required</h4><p id="restartModalText"></p><div class="modal-actions"><button class="btn btn-sm" id="restartCancel">Cancel</button><button class="btn btn-sm btn-primary" id="restartConfirm">Confirm change</button></div></div></div>
-<div class="modal-overlay" id="configModal"><div class="modal-box cfg-modal-box">
+<div class="modal-overlay" id="configModal"><div class="modal-box cfg-modal-box" role="dialog" aria-modal="true" aria-labelledby="configModalTitle">
   <h4 id="configModalTitle"></h4>
   <div class="banner warn" id="configModalWarn" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg><span id="configModalWarnText"></span></div>
   <div class="field" id="configDestField" style="display:none"><label for="configDest" id="configDestLabel">Save to</label><select id="configDest"></select></div>
   <div class="cfg-switch" id="configEditorSwitch" role="group" aria-labelledby="configEditorLabel" style="display:none"><span id="configEditorLabel">Editor</span><button type="button" class="btn btn-sm" id="configModeForm" aria-pressed="false">Form</button><button type="button" class="btn btn-sm" id="configModeYaml" aria-pressed="true">YAML</button></div>
   <div class="cfg-help" id="configFormHelp" style="display:none">The form writes the YAML; Save checks it first, as before.</div>
-  <div class="cfg-form-notice" id="configFormNotice" style="display:none"><span id="configFormNoticeText"></span><button type="button" class="btn btn-sm" id="configFormDiscard" style="display:none">Discard YAML edits</button></div>
+  <div class="cfg-form-notice" id="configFormNotice" aria-live="polite" style="display:none"><span id="configFormNoticeText"></span><button type="button" class="btn btn-sm" id="configFormDiscard" style="display:none">Discard YAML edits</button></div>
   <div class="cfg-form-scroll" id="configFormScroll" style="display:none"><fieldset class="cfg-form" id="configForm" style="display:none"></fieldset></div>
   <textarea class="cfg-yaml" id="configYaml" spellcheck="false" aria-label="Entry YAML"></textarea>
   <div class="cfg-confirm" id="configModalConfirm" style="display:none"></div>
@@ -3300,9 +3300,34 @@ function configSetStatus(items) {
    sees it no longer owns the editor after its next await and stops there. */
 function configCloseEditor() {
   document.getElementById("configModal").classList.remove("open");
+  const opener = configEdit && configEdit.opener;
   configEdit = null;
+  if (opener) opener.focus();
+}
+/* the modal's enabled, visible controls in tab order (a hidden step or a locked fieldset has none) */
+function configModalFocusable() {
+  const out = [];
+  const walk = (el, locked) => {
+    if (el.style && el.style.display === "none") return;
+    const off = locked || (el.tagName === "FIELDSET" && el.disabled);
+    if (/^(BUTTON|TEXTAREA|SELECT|INPUT)$/.test(el.tagName) && !el.disabled && !locked && el.type !== "hidden") out.push(el);
+    [...el.children].forEach(c => walk(c, off));
+  };
+  [...document.getElementById("configModal").children].forEach(c => walk(c, false));
+  return out;
+}
+/* Tab and Shift+Tab wrap inside the open editor instead of reaching the page behind it */
+function configTrapTab(ev) {
+  const items = configModalFocusable();
+  if (!items.length) return;
+  const at = items.indexOf(document.activeElement);
+  const wrap = ev.shiftKey ? at <= 0 : at === items.length - 1 || at < 0;
+  if (!wrap) return;
+  ev.preventDefault();
+  items[ev.shiftKey ? items.length - 1 : 0].focus();
 }
 function configModalKey(ev) {
+  if (ev.key === "Tab" && configEdit) configTrapTab(ev);
   if (ev.key === "Escape" && configEdit) configCloseEditor();
   if (ev.key === "Escape" && configReset) configCloseReset();
 }
@@ -3323,7 +3348,7 @@ function openConfigEditor(opts) {
   [CONFIG_GLOBAL, ...configModel.projects.map(p => p.repo_id)].forEach(s => {
     if (copy ? choices.some(c => c.value === s) : s === opts.scope || (isGlobal && opts.section === "tools")) fps[s] = configFingerprint(s, opts.section);
   });
-  configEdit = { ...opts, dest: copy ? choices[0].value : opts.scope, step: isGlobal && opts.op !== "add" ? "warn" : "edit", fps,
+  configEdit = { ...opts, opener: document.activeElement, dest: copy ? choices[0].value : opts.scope, step: isGlobal && opts.op !== "add" ? "warn" : "edit", fps,
     confirmed: false, warnings: [], crossName: null, dryTarget: null, dryYaml: null, busy: "", label: null, armedAt: 0 };
   /* the textarea keeps the server's text until the first form change, so an
      untouched save sends exactly what was opened */
@@ -3359,7 +3384,9 @@ function openConfigEditor(opts) {
   configSetError("");
   configSetStatus("");
   renderConfigModal();
-  document.getElementById("configModal").classList.add("open");
+  modal.classList.add("open");
+  /* only now can the modal take focus: the warning step has no editor, so Continue gets it */
+  (configEdit.step === "warn" ? document.getElementById("configModalSave") : configEditorFocusTarget()).focus();
 }
 /* Save: a dry run first; its warnings (and a repo override replacing that
    repo's own tool) need a second click; then the write itself */
@@ -3959,7 +3986,7 @@ function configFormHints(section, form) {
   };
   if (section === "tools") {
     nameHint("name", form.name, L.NAME_PATTERN, "Name");
-    const description = form.description.trim();
+    const description = configPyStrip(form.description);
     if (!description) hint("description", "A description is required: it is what an agent reads to choose the tool.");
     else if ([...description].length > L.MAX_DESCRIPTION_LENGTH) {
       hint("description", "The description is " + [...description].length + " characters; the limit is " + L.MAX_DESCRIPTION_LENGTH + ".");
@@ -4065,6 +4092,11 @@ function configFormDiscard() {
   configTextChanged();
   configSetEditorMode("form");
   configEditorFocusTarget().focus();
+}
+/* the server's description check is `value.strip()` then `len()`: Python's whitespace (it
+   includes \x1c-\x1f and \x85 but not the BOM, unlike JS trim()), counted in code points */
+function configPyStrip(text) {
+  return text.replace(/^[\t-\r\x1c-\x20\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t-\r\x1c-\x20\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g, "");
 }
 function configEditorFocusTarget() {
   return configEdit && configEdit.mode === "form" && configFormEls.first ? configFormEls.first : document.getElementById("configYaml");
@@ -4194,7 +4226,7 @@ function renderConfigForm(edit) {
     const desc = text(box, "description", "Description", "description", f, "", "textarea");
     desc.children[1].rows = 3;
     const count = desc.children[2];
-    const counted = () => { count.textContent = [...f.description.trim()].length + " / " + CONFIG_FORM_LIMITS.MAX_DESCRIPTION_LENGTH + " characters"; };
+    const counted = () => { count.textContent = [...configPyStrip(f.description)].length + " / " + CONFIG_FORM_LIMITS.MAX_DESCRIPTION_LENGTH + " characters"; };
     counted();
     configFormEls.refresh.push(counted);
     const cy = text(box, "cypher", "Cypher", "cypher", f, "Must filter on $repo_id; DevGraph supplies it. Read-only clauses only.", "textarea");
