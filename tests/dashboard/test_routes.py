@@ -370,7 +370,7 @@ def schema_repo(engine, registry, tmp_path):
     try:
         engine.upsert_repository("dash_schema", "Dash Schema", str(root))
         full_scan(engine, "dash_schema", root)
-        client = TestClient(build_app(engine, registry, EventBroadcaster()))
+        client = TestClient(build_app(engine, registry, EventBroadcaster()), base_url="http://127.0.0.1")
         yield client, root, record
     finally:
         engine.delete_repository("dash_schema")
@@ -453,7 +453,7 @@ def test_schema_never_applied_file_shows_builtins(engine, registry, tmp_path):
     registry.add_repo(str(root), repo_id="dash_never")
     try:
         engine.upsert_repository("dash_never", "Dash Never", str(root))
-        c = TestClient(build_app(engine, registry, EventBroadcaster()))
+        c = TestClient(build_app(engine, registry, EventBroadcaster()), base_url="http://127.0.0.1")
         body = c.get("/api/repos/dash_never/schema").json()
         assert body["schema_state"] == "never"
         assert all(t["origin"] == "builtin" for t in body["node_types"])
