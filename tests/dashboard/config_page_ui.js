@@ -1244,6 +1244,79 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("Cancel during a copy's dry run: no write", writes().length === 1 && body(writes()[0]).dry_run === true &&
     !els.configModal.classList.contains("open"), JSON.stringify(writes()));
 
+  // 33b. a copy's destination is locked while its dry run is out; one that changes anyway is never written
+  api.renderConfigPage(COPY_MODEL());
+  fetchCalls = [];
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: project("repo-b") } });
+  gate = new Promise(r => { release = r; });
+  await copyBtn("repo-a", "Runbook")[0].fire("click");
+  clock += 1000;
+  pending = els.configModalSave.fire("click");
+  await Promise.resolve();
+  check("the Copy to list is disabled during the copy's dry run", els.configDest.disabled === true, String(els.configDest.disabled));
+  els.configDest.value = HOSTILE;
+  await els.configDest.fire("change");
+  gate = null; release(); await pending;
+  check("switching destination mid-dry-run copies nowhere",
+    writes().length === 1 && body(writes()[0]).dry_run === true && writes()[0].url === "/api/config/repo-b/schema/node_types",
+    JSON.stringify(writes()));
+  check("...and keeps the dialog on Copy, asking to check the new destination",
+    els.configModal.classList.contains("open") && els.configModalSave.textContent === "Copy" && els.configDest.disabled === false &&
+    /destination changed.*copy again/i.test(els.configModalError.textContent), els.configModalError.textContent);
+  els.configModalCancel.fire("click");
+
+  // 33c. a confirmed replace-copy that fails 412: after Reload the next Copy stops at 'Copy anyway' again
+  api.renderConfigPage(COPY_MODEL());
+  fetchCalls = [];
+  const replB = project("repo-b"); replB.schema.fingerprint = "sha256:repo-b-schema-2";
+  respond = (url, init) => {
+    if (!init.method) return { status: 200, body: replB };
+    const b = JSON.parse(init.body);
+    if (init.method === "POST") return { status: 409, body: { detail: { code: "exists", name: "Runbook", message: "node type 'Runbook' already exists" } } };
+    if (!b.dry_run && ifMatch({ init }) === '"sha256:repo-b-schema"') return { status: 412, body: { detail: { code: "stale", message: "changed on disk" } } };
+    return { status: 200, body: { ok: true, written: !b.dry_run, warnings: [], notes: [], scope: replB } };
+  };
+  await copyBtn("repo-a", "Runbook")[0].fire("click");
+  await press(els.configModalSave);
+  await press(els.configModalSave);
+  check("a confirmed replace-copy that 412s offers Reload", shown(els.configModalReload) &&
+    writes().filter(c => body(c).dry_run === false).length === 1, JSON.stringify(writes()));
+  await els.configModalReload.fire("click");
+  fetchCalls = [];
+  await press(els.configModalSave);
+  check("after Reload, Copy stops at 'Copy anyway' with the Replaces line", els.configModalSave.textContent === "Copy anyway" &&
+    els.configModalConfirm.textContent.includes("Replaces repo-b's own node type Runbook.") && writes().every(c => body(c).dry_run === true),
+    JSON.stringify([els.configModalSave.textContent, writes()]));
+  await press(els.configModalSave);
+  check("...then the confirmed copy PUTs Runbook with the reloaded fingerprint",
+    writes().filter(c => body(c).dry_run === false).length === 1 && writes().some(c => body(c).dry_run === false && c.init.method === "PUT" &&
+      c.url === "/api/config/repo-b/schema/node_types/Runbook" && ifMatch(c) === '"sha256:repo-b-schema-2"'), JSON.stringify(writes()));
+
+  // 33d. a tool copied to the global store where the name exists: confirm, then PUT the global entry
+  api.renderConfigPage(COPY_MODEL());
+  fetchCalls = [];
+  respond = (url, init) => {
+    const b = JSON.parse(init.body);
+    if (init.method === "POST" && url === "/api/config/__global__/tools")
+      return { status: 409, body: { detail: { code: "exists", name: "mine", message: "a tool named 'mine' already exists in this scope" } } };
+    return { status: 200, body: { ok: true, written: !b.dry_run, warnings: [], notes: [], scope: globalBlock() } };
+  };
+  await copyBtn("repo-a", "mine")[0].fire("click");
+  els.configDest.value = "__global__";
+  await els.configDest.fire("change");
+  await press(els.configModalSave);
+  check("a tool already in the global store asks 'Copy anyway', naming the global store's own tool",
+    els.configModalSave.textContent === "Copy anyway" &&
+    els.configModalConfirm.textContent.includes("Replaces the global store's own tool mine.") &&
+    els.configModalWarnText.textContent.includes("Replaces the global store's own tool mine.") &&
+    writes().length === 2 && writes()[1].init.method === "PUT" && writes()[1].url === "/api/config/__global__/tools/mine" &&
+    writes().every(c => body(c).dry_run === true), JSON.stringify([els.configModalConfirm.textContent, writes()]));
+  { const newer = globalBlock(); newer.tools.fingerprint = "sha256:g-newer"; api.applyConfigScope("__global__", newer); }
+  await press(els.configModalSave);
+  check("...then PUTs /api/config/__global__/tools/mine with the dry run's fingerprint",
+    writes().length === 3 && writes()[2].init.method === "PUT" && writes()[2].url === "/api/config/__global__/tools/mine" &&
+    body(writes()[2]).dry_run === false && ifMatch(writes()[2]) === '"sha256:g1"', JSON.stringify(writes()));
+
   // 34. hostile names stay text in the copy dialog
   api.renderConfigPage(COPY_MODEL());
   await copyBtn("repo-a", HOSTILE)[0].fire("click");

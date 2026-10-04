@@ -3291,7 +3291,7 @@ async function configSave(ev) {
   const moved = t => {
     if (configSameTarget(configEditTarget(edit), t)) return false;
     edit.confirmed = false;
-    configSetError("The destination changed while checking; save again to check the new one.");
+    configSetError("The destination changed while checking; " + (edit.op === "copy" ? "copy" : "save") + " again to check the new one.");
     return true;
   };
   try {
