@@ -1,11 +1,13 @@
-"""Serving a repository's `devgraph.tools.yaml` tools over MCP.
+"""Serving a repository's `devgraph.tools.yaml` tools, and the user's global tools, over MCP.
 
 The session's repository is resolved once at startup (see
 `resolve_session_repo`) and never changes, so a session pinned to one
 repository can't reach another's tools. Each valid tool becomes an MCP tool
 with a typed input schema; a call injects the session's `repo_id` and runs
 read-only, bounded by the tool's timeout and row cap
-(`GraphEngine.run_read_cypher`).
+(`GraphEngine.run_read_cypher`). Global tools (`global-tools.json`) are served
+only in a scoped session; a project tool replaces a global one of the same name,
+and a global one stands in when that project tool can't be served.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, global_tools_fingerprint, global_tools_path
 from devgraph.config.project_switch import project_config_enabled
 from devgraph.config.project_tools import (
     INJECTED_PARAMETER,
@@ -100,12 +103,16 @@ class ToolPlaneStatus:
     parameter_names: dict[str, list[str]] = field(default_factory=dict)  # served tool -> declared parameters
     notices: list[str] = field(default_factory=list)
     definitions: dict[str, CypherTool] = field(default_factory=dict, repr=False)  # served tool -> its declaration
+    global_tools_file: str | None = None
+    origins: dict[str, str] = field(default_factory=dict)  # served tool -> "global" | "project" | "project (overrides global)"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "scope": {"repo_id": self.repo_id, "source": self.source},
             "tools_file": self.tools_file,
+            "global_tools_file": self.global_tools_file,
             "served": list(self.served),
+            "origins": dict(self.origins),
             "notices": list(self.notices),
         }
 
@@ -146,8 +153,15 @@ def _failure(tool: CypherTool, exc: Exception) -> ToolError:
     return ToolError(f"project tool {tool.name!r} failed")
 
 
-def make_tool_function(tool: CypherTool, engine: Any, repo_id: str) -> Callable[..., dict[str, Any]]:
-    """A function the SDK can register: its signature is the tool's parameters."""
+def make_tool_function(
+    tool: CypherTool, engine: Any, repo_id: str, notices: list[str] | None = None
+) -> Callable[..., dict[str, Any]]:
+    """A function the SDK can register: its signature is the tool's parameters.
+
+    `notices` (how this tool was resolved) go in every response's envelope when non-empty.
+    """
+    notices = list(notices or [])
+
     def call(**kwargs: Any) -> dict[str, Any]:
         params = {
             p.name: p.default if kwargs.get(p.name) is None else kwargs[p.name] for p in tool.parameters
@@ -160,7 +174,10 @@ def make_tool_function(tool: CypherTool, engine: Any, repo_id: str) -> Callable[
         except Exception as exc:  # the driver raises its own hierarchy
             raise _failure(tool, exc) from exc
         results = [_sanitize_deep(row) for row in rows]
-        return {"count": len(results), "results": results, "truncated": truncated}
+        envelope: dict[str, Any] = {"count": len(results), "results": results, "truncated": truncated}
+        if notices:
+            envelope["notices"] = list(notices)
+        return envelope
 
     parameters = []
     for p in tool.parameters:
@@ -190,8 +207,9 @@ def register_project_tools(
     pinned: str | None = None,
     registry: Any | None = None,
     fingerprint: bytes | str | None = None,
+    global_fingerprint: bytes | str | None = None,
 ) -> ToolPlaneStatus:
-    """Register the session repository's tools on `server`; report what happened."""
+    """Register the session repository's project and global tools on `server`; report what happened."""
     if repo is None:
         status = ToolPlaneStatus(repo_id=None, source=source)
         if source == "env":
@@ -206,12 +224,70 @@ def register_project_tools(
                     f"{SESSION_REPO_ENV}={pinned or ''!r} matches no registered repository; "
                     f"no project tools are served"
                 )
+        if (global_fingerprint or global_tools_fingerprint()) != "absent":
+            status.notices.append(
+                "global tools are served only in sessions scoped to a repository (they need one for $repo_id); "
+                "this session has none"
+            )
         return status
 
     status = ToolPlaneStatus(repo_id=repo.repo_id, source=source)
     _serve_repository(server, engine, repo, status, instrument=instrument, annotations=annotations,
-                      fingerprint=fingerprint)
+                      fingerprint=fingerprint, global_fingerprint=global_fingerprint)
     return status
+
+
+@dataclass
+class _Resolved:
+    """What one layer's file contributes: its tools (None for none), and why a project file served none."""
+
+    declared: ProjectTools | None = None
+    invalid: str | None = None
+
+
+def _project_layer(repo: Any, fingerprint: bytes | str, last_good: ProjectTools | None,
+                   status: ToolPlaneStatus) -> _Resolved:
+    """The project file's tools; an invalid file keeps `last_good` when there is one."""
+    if fingerprint == "root-missing":
+        status.notices.append(f"the root of repository {repo.repo_id!r} ({repo.path}) does not exist; no project tools are served")
+        return _Resolved()
+    if fingerprint == "disabled":
+        status.notices.append(
+            f"project config is disabled for repository {repo.repo_id!r}; "
+            f"enable it with 'devgraph config enable {repo.repo_id}'"
+        )
+        return _Resolved()
+    if fingerprint == "absent":
+        return _Resolved()
+    try:
+        declared = _parse_fingerprint(repo, fingerprint)
+    except ProjectToolsError as exc:
+        reason = str(exc).splitlines()[0]
+        if last_good is None:
+            status.notices.append(f"invalid {TOOLS_FILENAME}; no project tools are served: {reason}")
+            return _Resolved(invalid=f"{TOOLS_FILENAME} is invalid, so no project tool is served: {reason}")
+        status.notices.append(f"invalid {TOOLS_FILENAME}; keeping the last good tools: {reason}")
+        declared = last_good
+    status.tools_file = str(tools_file_path(repo.path))
+    return _Resolved(declared)
+
+
+def _global_layer(fingerprint: bytes | str, last_good: ProjectTools | None, status: ToolPlaneStatus) -> _Resolved:
+    """The global store's tools; an invalid store keeps `last_good` when there is one."""
+    if fingerprint == "absent":
+        return _Resolved()
+    path = global_tools_path()
+    try:
+        declared = _parse_bytes(path, fingerprint)
+    except ProjectToolsError as exc:
+        reason = str(exc).splitlines()[0]
+        if last_good is None:
+            status.notices.append(f"invalid {GLOBAL_TOOLS_FILENAME}; no global tools are served: {reason}")
+            return _Resolved()
+        status.notices.append(f"invalid {GLOBAL_TOOLS_FILENAME}; keeping the last good global tools: {reason}")
+        declared = last_good
+    status.global_tools_file = str(path)
+    return _Resolved(declared)
 
 
 def _serve_repository(
@@ -223,59 +299,83 @@ def _serve_repository(
     instrument: Callable[[Callable[..., Any]], Callable[..., Any]],
     annotations: Any,
     fingerprint: bytes | str | None = None,
-    declared: ProjectTools | None = None,
-) -> None:
-    """Parse the repository's tools file and register its tools, recording the outcome on `status`.
+    global_fingerprint: bytes | str | None = None,
+    last_good: ProjectTools | None = None,
+    global_last_good: ProjectTools | None = None,
+) -> tuple[ProjectTools | None, ProjectTools | None]:
+    """Resolve the project and global tools files and register the result, recording the outcome on `status`.
 
-    The file is read once, as `fingerprint` (its bytes); the tools served are exactly
-    the ones those bytes declare. Without a `fingerprint` it is read now.
+    Each file is read once, as its fingerprint (its bytes); the tools served are exactly
+    the ones those bytes declare (or the layer's `last_good`, when the bytes are invalid).
+    Without a fingerprint the file is read now. Built-in names are refused in both
+    layers; a project tool replaces a global one of the same name, and a global tool
+    stands in for a project tool that can't be served. Returns each layer's tools in use.
     """
     if fingerprint is None:
         fingerprint = tools_fingerprint(repo.path)
-    if fingerprint == "root-missing":
-        status.notices.append(f"the root of repository {repo.repo_id!r} ({repo.path}) does not exist; no project tools are served")
-        return
-    if fingerprint == "disabled":
-        status.notices.append(
-            f"project config is disabled for repository {repo.repo_id!r}; "
-            f"enable it with 'devgraph config enable {repo.repo_id}'"
-        )
-        return
-    if fingerprint == "absent":
-        return
-    if declared is None:
-        try:
-            declared = _parse_fingerprint(repo, fingerprint)
-        except ProjectToolsError as exc:
-            status.notices.append(f"invalid {TOOLS_FILENAME}; no project tools are served: {str(exc).splitlines()[0]}")
-            return
+    if global_fingerprint is None:
+        global_fingerprint = global_tools_fingerprint()
+    project = _project_layer(repo, fingerprint, last_good, status)
+    global_ = _global_layer(global_fingerprint, global_last_good, status)
 
-    status.tools_file = str(tools_file_path(repo.path))
     builtin = builtin_tool_names()
-    for tool in declared.tools:
+    globals_by_name: dict[str, CypherTool] = {}
+    for tool in global_.declared.tools if global_.declared else ():
+        if tool.name in builtin:
+            status.notices.append(
+                f"ignored: global tool {tool.name!r} has the name of a built-in tool; using the built-in"
+            )
+        else:
+            globals_by_name[tool.name] = tool
+    project_tools = project.declared.tools if project.declared else ()
+    for tool in project_tools:
         if tool.name in builtin:
             status.notices.append(
                 f"ignored: project tool {tool.name!r} has the name of a built-in tool; using the built-in"
             )
-    for tool in declared.tools:
-        if tool.name in builtin:
-            continue
+
+    def register(tool: CypherTool, origin: str, notices: list[str]) -> str | None:
+        """Serve `tool`; on failure record a status notice and return it."""
         try:
-            fn = instrument(make_tool_function(tool, engine, repo.repo_id))
+            fn = instrument(make_tool_function(tool, engine, repo.repo_id, notices))
             server.add_tool(fn, name=tool.name, description=tool.description, annotations=annotations)
         except Exception as exc:
-            status.notices.append(f"project tool {tool.name!r} could not be served: "
-                f"{type(exc).__name__}: {(str(exc).splitlines() or [''])[0]}"
-            )
-            continue
+            failure = (f"{origin.split()[0]} tool {tool.name!r} could not be served: "
+                       f"{type(exc).__name__}: {(str(exc).splitlines() or [''])[0]}")
+            status.notices.append(failure)
+            return failure
         status.served.append(tool.name)
         status.parameter_names[tool.name] = [p.name for p in tool.parameters]
         status.definitions[tool.name] = tool
+        status.origins[tool.name] = origin
+        return None
+
+    fallback_reasons: dict[str, str] = {}  # global tool -> why the project tool of its name isn't served
+    for tool in project_tools:
+        if tool.name in builtin:
+            continue
+        if tool.name not in globals_by_name:
+            register(tool, "project", [])
+            continue
+        failure = register(tool, "project (overrides global)",
+                           [f"resolved: project override of global tool {tool.name!r}"])
+        if failure is None:
+            del globals_by_name[tool.name]
+        else:
+            fallback_reasons[tool.name] = failure
+    for name, tool in globals_by_name.items():
+        reason = fallback_reasons.get(name, project.invalid)
+        register(tool, "global", [f"used global tool {name!r}: {reason}"] if reason else [])
+    return project.declared, global_.declared
 
 
 def _parse_fingerprint(repo: Any, fingerprint: bytes | str) -> ProjectTools:
     """The tools declared by `fingerprint` (file bytes or 'unreadable:<error>'); raises ProjectToolsError."""
-    path = tools_file_path(repo.path)
+    return _parse_bytes(tools_file_path(repo.path), fingerprint)
+
+
+def _parse_bytes(path: Path, fingerprint: bytes | str) -> ProjectTools:
+    """The tools a tools file at `path` declares, given its fingerprint; raises ProjectToolsError."""
     if not isinstance(fingerprint, bytes):
         raise ProjectToolsError(f"{path}: cannot be read: {fingerprint.partition(':')[2]}")
     try:
@@ -300,52 +400,57 @@ def tools_fingerprint(repo_path: Path | str) -> bytes | str:
 
 
 class ProjectToolPlane:
-    """The session's served project tools, reloadable when the tools file changes.
+    """The session's served project and global tools, reloadable when either file changes.
 
-    The scope (`repo`) never changes; only the tools file is re-read, under the
-    same rules as at startup.
+    The scope (`repo`) never changes; only the project tools file and the global
+    store are re-read, under the same rules as at startup.
     """
 
     def __init__(self, server: Any, engine: Any, repo: Any | None, status: ToolPlaneStatus, *,
                  instrument: Callable[[Callable[..., Any]], Callable[..., Any]], annotations: Any,
-                 fingerprint: bytes | str | None = None) -> None:
-        """`fingerprint` is the tools file as the initial load read it (see `register_project_tools`)."""
+                 fingerprint: bytes | str | None = None, global_fingerprint: bytes | str | None = None) -> None:
+        """The fingerprints are the files as the initial load read them (see `register_project_tools`)."""
         self.server, self.engine, self.repo, self.status = server, engine, repo, status
         self._instrument, self._annotations = instrument, annotations
-        self._fingerprint = fingerprint
+        self._fingerprint, self._global_fingerprint = fingerprint, global_fingerprint
+        # The tools the initial load served from each file (re-parsed from the same bytes),
+        # kept if a later save is invalid.
+        self._last_good = self._global_last_good = None
+        if repo is not None and status.tools_file is not None and fingerprint is not None:
+            self._last_good = _parse_fingerprint(repo, fingerprint)
+        if status.global_tools_file is not None and global_fingerprint is not None:
+            self._global_last_good = _parse_bytes(global_tools_path(), global_fingerprint)
+
+    def _resolved(self) -> dict[str, tuple[str, CypherTool]]:
+        return {name: (self.status.origins[name], self.status.definitions[name]) for name in self.status.served}
 
     def reload_if_changed(self) -> bool:
-        """Re-serve the tools file if its bytes changed. True when the served tools changed."""
+        """Re-resolve the tools if either file's bytes changed. True when the served tools changed."""
         if self.repo is None:
             return False
-        fingerprint = tools_fingerprint(self.repo.path)
-        if fingerprint == self._fingerprint:
+        fingerprint, global_fingerprint = tools_fingerprint(self.repo.path), global_tools_fingerprint()
+        if (fingerprint, global_fingerprint) == (self._fingerprint, self._global_fingerprint):
             return False
-        declared = None
-        if fingerprint not in ("absent", "root-missing", "disabled") and self.status.tools_file is not None:
-            # A good file is being served: an invalid save keeps it rather than dropping the tools.
-            try:
-                declared = _parse_fingerprint(self.repo, fingerprint)
-            except ProjectToolsError as exc:
-                self._fingerprint = fingerprint
-                notice = f"invalid {TOOLS_FILENAME}; keeping the last good tools: {str(exc).splitlines()[0]}"
-                self.status.notices[:] = [n for n in self.status.notices if not n.startswith(f"invalid {TOOLS_FILENAME}")]
-                self.status.notices.append(notice)
-                logger.warning("%s", notice)
-                return False
-        self._fingerprint = None  # until the reload succeeds, so a failure is retried
-        before = dict(self.status.definitions)
+        # Until the reload succeeds, so a failure is retried.
+        self._fingerprint = self._global_fingerprint = None
+        before = self._resolved()
         for name in self.status.served:
             self.server.remove_tool(name)
-        self.status.tools_file = None
+        self.status.tools_file = self.status.global_tools_file = None
         self.status.served.clear()
         self.status.parameter_names.clear()
         self.status.definitions.clear()
+        self.status.origins.clear()
         self.status.notices.clear()
-        _serve_repository(self.server, self.engine, self.repo, self.status,
-                          instrument=self._instrument, annotations=self._annotations, fingerprint=fingerprint,
-                          declared=declared)
-        self._fingerprint = fingerprint  # the reload parsed exactly these bytes
+        self._last_good, self._global_last_good = _serve_repository(
+            self.server, self.engine, self.repo, self.status,
+            instrument=self._instrument, annotations=self._annotations,
+            fingerprint=fingerprint, global_fingerprint=global_fingerprint,
+            last_good=self._last_good, global_last_good=self._global_last_good,
+        )
+        # The reload parsed exactly these bytes.
+        self._fingerprint, self._global_fingerprint = fingerprint, global_fingerprint
         if self.status.notices:
-            logger.warning("reloaded %s with problems: %s", tools_file_path(self.repo.path), self.status.notices[0])
-        return self.status.definitions != before
+            logger.warning("reloaded the tools for repository %r with problems: %s",
+                           self.repo.repo_id, self.status.notices[0])
+        return self._resolved() != before

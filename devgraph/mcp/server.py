@@ -50,6 +50,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
 from devgraph.agent import lifecycle
+from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, global_tools_fingerprint
 from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.config.settings import get_settings
 from devgraph.graph.engine import GraphEngine
@@ -489,15 +490,17 @@ def build_server(
             the purpose-built tools above whenever one of them fits."""
             return devgraph_tools.run_cypher(engine, query, parameters)
 
-    fingerprint = tools_fingerprint(session_repo.path) if session_repo is not None else None  # the load parses these bytes
+    # The load parses exactly these bytes.
+    fingerprint = tools_fingerprint(session_repo.path) if session_repo is not None else None
+    global_fingerprint = global_tools_fingerprint()
     status = register_project_tools(
         server, engine, session_repo, session_source, instrument=_instrument, annotations=_READ_ONLY, pinned=session_pinned,
-        registry=registry, fingerprint=fingerprint,
+        registry=registry, fingerprint=fingerprint, global_fingerprint=global_fingerprint,
     )
-    # main() polls this for tools-file reloads.
+    # main() polls this for tools-file and global-store reloads.
     server.devgraph_tool_plane = ProjectToolPlane(  # type: ignore[attr-defined]
         server, engine, session_repo, status, instrument=_instrument, annotations=_READ_ONLY,
-        fingerprint=fingerprint,
+        fingerprint=fingerprint, global_fingerprint=global_fingerprint,
     )
 
     @server.resource(
@@ -505,8 +508,9 @@ def build_server(
         name="devgraph-project-tools",
         title="DevGraph project tools",
         description=(
-            f"Which repository this session serves {TOOLS_FILENAME} tools for, how it was "
-            "chosen, which tools are served, and notices about ignored or invalid declarations."
+            f"Which repository this session serves {TOOLS_FILENAME} and global tools for, how it was "
+            "chosen, which tools are served and where each comes from (global, project, or a "
+            "project override of a global tool), and notices about ignored or invalid declarations."
         ),
         mime_type="application/json",
     )
@@ -558,7 +562,10 @@ def build_server(
                     "identifier_kind": "parameters: " + (", ".join(params) or "none"),
                     "envelope": True,
                     "phase": None,
-                    "note": f"from {TOOLS_FILENAME} in {status.repo_id}",
+                    "note": (
+                        f"global tool from {GLOBAL_TOOLS_FILENAME}" if status.origins.get(n) == "global"
+                        else f"from {TOOLS_FILENAME} in {status.repo_id}"
+                    ),
                 }
                 for n, params in status.parameter_names.items()
             ),

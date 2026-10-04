@@ -1,0 +1,235 @@
+"""Resolving built-in, global and project tools in one MCP session. Stub engine."""
+
+import asyncio
+import json
+import textwrap
+from dataclasses import dataclass
+from pathlib import Path
+
+from devgraph.config import global_tools
+from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, save_global_tools
+from devgraph.config.project_tools import TOOLS_FILENAME
+from devgraph.config.settings import Settings
+from devgraph.mcp import server as mcp_server
+
+PROJECT = """
+    version: 1
+    tools:
+      - name: list_files
+        description: Project list.
+        cypher: |
+          MATCH (f:File {repo_id: $repo_id}) RETURN f.path AS path
+"""
+
+G_COUNT = {
+    "name": "g_count",
+    "description": "Global count.",
+    "cypher": "MATCH (f:File {repo_id: $repo_id}) RETURN count(f) AS n",
+}
+G_LIST = {
+    "name": "list_files",
+    "description": "Global list.",
+    "cypher": "MATCH (f:File {repo_id: $repo_id}) RETURN f.path AS path",
+}
+
+
+@dataclass
+class Repo:
+    repo_id: str
+    path: Path
+    active: bool = True
+
+
+class Registry:
+    def __init__(self, repos):
+        self.repos = repos
+
+    def list_repos(self, active_only=False):
+        return list(self.repos)
+
+    def get(self, repo_id):
+        return next((r for r in self.repos if r.repo_id == repo_id), None)
+
+
+class Engine:
+    def run_cypher(self, query, params=None):
+        return []
+
+    def run_read_cypher(self, query, parameters, *, timeout_s, max_rows):
+        return [], False
+
+
+def store(tmp_path, monkeypatch, tools):
+    """Point the global store at tmp_path and write `tools` to it; return its path."""
+    path = tmp_path / "home" / GLOBAL_TOOLS_FILENAME
+    monkeypatch.setattr(global_tools, "_default_path", lambda: path)
+    save_global_tools(tools)
+    return path
+
+
+def build(tmp_path, monkeypatch, project=None, scoped=True):
+    repo = tmp_path / "demo"
+    repo.mkdir(exist_ok=True)
+    if project is not None:
+        (repo / TOOLS_FILENAME).write_text(textwrap.dedent(project))
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3"))
+    record = Repo("demo", repo)
+    server = mcp_server.build_server(
+        Engine(), Registry([record]), session_repo=record if scoped else None, session_source="env" if scoped else "none"
+    )
+    return server, repo
+
+
+def tools(server):
+    return {t.name: t for t in asyncio.run(server.list_tools())}
+
+
+def status(server):
+    return json.loads(asyncio.run(server.read_resource("devgraph://project-tools"))[0].content)
+
+
+def call(server, name):
+    return asyncio.run(server.call_tool(name, {})).structured_content
+
+
+def test_a_global_tool_is_served_in_a_scoped_session(tmp_path, monkeypatch):
+    path = store(tmp_path, monkeypatch, [G_COUNT])
+    server, _ = build(tmp_path, monkeypatch)
+    assert "g_count" in tools(server)
+    current = status(server)
+    assert current["origins"] == {"g_count": "global"}
+    assert current["global_tools_file"] == str(path)
+    assert set(call(server, "g_count")) == {"count", "results", "truncated"}
+    catalog = json.loads(asyncio.run(server.read_resource("devgraph://tool-catalog"))[0].content)
+    assert GLOBAL_TOOLS_FILENAME in next(e for e in catalog if e["name"] == "g_count")["note"]
+
+
+def test_an_unscoped_session_serves_no_global_tools_and_says_why(tmp_path, monkeypatch):
+    store(tmp_path, monkeypatch, [G_COUNT])
+    server, _ = build(tmp_path, monkeypatch, scoped=False)
+    assert "g_count" not in tools(server)
+    current = status(server)
+    assert current["served"] == [] and current["global_tools_file"] is None
+    assert any("global tools" in n and "repository" in n for n in current["notices"])
+
+
+def test_no_global_store_adds_nothing(tmp_path, monkeypatch):
+    server, _ = build(tmp_path, monkeypatch, project=PROJECT)
+    current = status(server)
+    assert current["origins"] == {"list_files": "project"}
+    assert current["global_tools_file"] is None and current["notices"] == []
+
+
+def test_a_project_tool_overrides_a_global_one(tmp_path, monkeypatch):
+    store(tmp_path, monkeypatch, [G_LIST, G_COUNT])
+    server, _ = build(tmp_path, monkeypatch, project=PROJECT)
+    assert tools(server)["list_files"].description == "Project list."
+    current = status(server)
+    assert current["origins"] == {"list_files": "project (overrides global)", "g_count": "global"}
+    assert call(server, "list_files")["notices"] == ["resolved: project override of global tool 'list_files'"]
+    assert "notices" not in call(server, "g_count")
+
+
+def test_a_project_tool_that_cannot_register_falls_back_to_the_global(tmp_path, monkeypatch):
+    from mcp.server.mcpserver import MCPServer
+
+    original = MCPServer.add_tool
+
+    def flaky(self, fn, *args, **kwargs):
+        if kwargs.get("description") == "Project list.":
+            raise ValueError("boom: cannot build schema")
+        return original(self, fn, *args, **kwargs)
+
+    monkeypatch.setattr(MCPServer, "add_tool", flaky)
+    store(tmp_path, monkeypatch, [G_LIST])
+    server, _ = build(tmp_path, monkeypatch, project=PROJECT)
+    assert tools(server)["list_files"].description == "Global list."
+    current = status(server)
+    assert current["origins"] == {"list_files": "global"}
+    assert any("could not be served" in n for n in current["notices"])
+    (notice,) = call(server, "list_files")["notices"]
+    assert notice.startswith("used global tool 'list_files':") and "boom" in notice
+
+
+def test_an_invalid_project_file_at_startup_falls_back_to_the_global(tmp_path, monkeypatch):
+    store(tmp_path, monkeypatch, [G_LIST])
+    server, _ = build(tmp_path, monkeypatch, project="version: 1\ntools: [oops\n")
+    assert tools(server)["list_files"].description == "Global list."
+    (notice,) = call(server, "list_files")["notices"]
+    assert notice.startswith("used global tool 'list_files':") and TOOLS_FILENAME in notice
+
+
+def test_a_global_tool_with_a_builtin_name_is_ignored(tmp_path, monkeypatch):
+    store(tmp_path, monkeypatch, [{**G_COUNT, "name": "search_component", "description": "Shadow."}])
+    server, _ = build(tmp_path, monkeypatch)
+    assert tools(server)["search_component"].description != "Shadow."
+    current = status(server)
+    assert "search_component" not in current["served"]
+    assert any(n.startswith("ignored: global tool 'search_component'") for n in current["notices"])
+
+
+def test_disabling_the_project_config_keeps_the_global_tools(tmp_path, monkeypatch):
+    from devgraph.config import project_switch
+    from devgraph.registry.store import RepoRegistry
+
+    store(tmp_path, monkeypatch, [G_LIST, G_COUNT])
+    server, repo = build(tmp_path, monkeypatch, project=PROJECT)
+    (repo / ".git").mkdir()
+    registry = RepoRegistry(tmp_path / "r.sqlite3")
+    registry.add_repo(repo, repo_id="demo")
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: tmp_path / "r.sqlite3")
+
+    registry.set_project_config_enabled("demo", False)
+    assert server.devgraph_tool_plane.reload_if_changed() is True
+    assert tools(server)["list_files"].description == "Global list."
+    assert status(server)["origins"] == {"list_files": "global", "g_count": "global"}
+    assert "notices" not in call(server, "list_files")
+
+
+def test_changing_the_global_store_reloads(tmp_path, monkeypatch):
+    path = store(tmp_path, monkeypatch, [G_COUNT])
+    server, _ = build(tmp_path, monkeypatch)
+    plane = server.devgraph_tool_plane
+    assert plane.reload_if_changed() is False
+    save_global_tools([G_COUNT, G_LIST], path)
+    assert plane.reload_if_changed() is True
+    assert {"g_count", "list_files"} <= set(tools(server))
+    assert status(server)["served"] == ["g_count", "list_files"]
+
+
+def test_an_invalid_global_store_keeps_the_last_good_global_tools(tmp_path, monkeypatch):
+    path = store(tmp_path, monkeypatch, [G_COUNT])
+    server, _ = build(tmp_path, monkeypatch)
+    plane = server.devgraph_tool_plane
+    path.write_text('{"version": 1, "tools": [oops')
+    assert plane.reload_if_changed() is False
+    assert "g_count" in tools(server)
+    current = status(server)
+    assert current["served"] == ["g_count"]
+    assert any(GLOBAL_TOOLS_FILENAME in n and "last good" in n for n in current["notices"])
+
+
+def test_an_invalid_global_store_at_startup_serves_none(tmp_path, monkeypatch):
+    path = store(tmp_path, monkeypatch, [G_COUNT])
+    path.write_text("not: [valid")
+    server, _ = build(tmp_path, monkeypatch)
+    assert "g_count" not in tools(server)
+    assert any(GLOBAL_TOOLS_FILENAME in n for n in status(server)["notices"])
+
+
+def test_removing_the_global_store_drops_the_global_tools(tmp_path, monkeypatch):
+    path = store(tmp_path, monkeypatch, [G_COUNT])
+    server, _ = build(tmp_path, monkeypatch)
+    path.unlink()
+    assert server.devgraph_tool_plane.reload_if_changed() is True
+    assert "g_count" not in tools(server)
+    assert status(server)["global_tools_file"] is None
+
+
+def test_a_project_change_keeps_the_global_tools(tmp_path, monkeypatch):
+    store(tmp_path, monkeypatch, [G_LIST])
+    server, repo = build(tmp_path, monkeypatch, project=PROJECT)
+    (repo / TOOLS_FILENAME).unlink()
+    assert server.devgraph_tool_plane.reload_if_changed() is True
+    assert tools(server)["list_files"].description == "Global list."
+    assert status(server)["origins"] == {"list_files": "global"}
