@@ -492,3 +492,26 @@ def test_run_stdio_does_not_advertise_listchanged_without_a_scope(tmp_path, monk
     server, _ = build(tmp_path, monkeypatch, scoped=False)
     capabilities = anyio.run(_run_stdio_handshake, server, monkeypatch)
     assert not capabilities.tools.list_changed
+
+
+def test_switching_the_project_config_off_and_on_drops_and_restores_the_tools(tmp_path, monkeypatch):
+    from devgraph.config import project_switch
+    from devgraph.registry.store import RepoRegistry
+
+    server, repo = build(tmp_path, monkeypatch)
+    (repo / ".git").mkdir()
+    registry = RepoRegistry(tmp_path / "r.sqlite3")
+    registry.add_repo(repo, repo_id="demo")
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: tmp_path / "r.sqlite3")
+    plane = server.devgraph_tool_plane
+    assert "list_files" in tools(server)
+
+    registry.set_project_config_enabled("demo", False)
+    assert plane.reload_if_changed() is True
+    assert "list_files" not in tools(server)
+    assert any("devgraph config enable demo" in n for n in status(server)["notices"])
+
+    registry.set_project_config_enabled("demo", True)
+    assert plane.reload_if_changed() is True
+    assert "list_files" in tools(server)
+    assert status(server)["notices"] == []

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from devgraph.config.project_switch import project_config_enabled
 from devgraph.config.project_tools import (
     INJECTED_PARAMETER,
     TOOLS_FILENAME,
@@ -234,6 +235,12 @@ def _serve_repository(
     if fingerprint == "root-missing":
         status.notices.append(f"the root of repository {repo.repo_id!r} ({repo.path}) does not exist; no project tools are served")
         return
+    if fingerprint == "disabled":
+        status.notices.append(
+            f"project config is disabled for repository {repo.repo_id!r}; "
+            f"enable it with 'devgraph config enable {repo.repo_id}'"
+        )
+        return
     if fingerprint == "absent":
         return
     if declared is None:
@@ -279,9 +286,11 @@ def _parse_fingerprint(repo: Any, fingerprint: bytes | str) -> ProjectTools:
 
 
 def tools_fingerprint(repo_path: Path | str) -> bytes | str:
-    """What the tools file looks like now: its bytes, 'root-missing', 'absent', or 'unreadable:<error>'."""
+    """What the tools file looks like now: its bytes, 'root-missing', 'disabled', 'absent', or 'unreadable:<error>'."""
     if not Path(repo_path).is_dir():
         return "root-missing"
+    if not project_config_enabled(repo_path):
+        return "disabled"
     try:
         return tools_file_path(Path(repo_path)).read_bytes()
     except (FileNotFoundError, NotADirectoryError):
@@ -313,7 +322,7 @@ class ProjectToolPlane:
         if fingerprint == self._fingerprint:
             return False
         declared = None
-        if fingerprint not in ("absent", "root-missing") and self.status.tools_file is not None:
+        if fingerprint not in ("absent", "root-missing", "disabled") and self.status.tools_file is not None:
             # A good file is being served: an invalid save keeps it rather than dropping the tools.
             try:
                 declared = _parse_fingerprint(self.repo, fingerprint)

@@ -155,3 +155,30 @@ def test_a_tampered_label_list_never_reaches_cypher(engine, repo):
     engine.record_applied_schema(REPO, "sha256:old", ["File", "Folder", "Bad`) DETACH DELETE n //"], ["NOT VALID"])
     assert apply_project_schema(engine, REPO, repo)  # skips the invalid names, no Cypher error
     assert "File:pkg/mod.py" in fs_nodes(engine)
+
+
+def test_switching_the_project_config_off_removes_user_nodes_on_rescan(engine, repo, tmp_path, monkeypatch):
+    from devgraph.config import project_switch
+    from devgraph.registry.store import RepoRegistry
+
+    (repo / ".git").mkdir()
+    registry = RepoRegistry(tmp_path / "switch.sqlite3")
+    registry.add_repo(repo, repo_id=REPO)
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: tmp_path / "switch.sqlite3")
+
+    write_schema(repo, WORKTREE)
+    scan(engine, repo)
+    assert "File:pkg/mod.py" in fs_nodes(engine)
+    assert not schema_pending(engine, REPO, repo)
+
+    registry.set_project_config_enabled(REPO, False)
+    assert schema_pending(engine, REPO, repo)
+    full_scan(engine, REPO, repo)
+    assert fs_nodes(engine) == []
+    assert engine.read_applied_schema(REPO)["hash"] == ABSENT_SCHEMA_HASH
+    assert not schema_pending(engine, REPO, repo)
+
+    registry.set_project_config_enabled(REPO, True)
+    assert schema_pending(engine, REPO, repo)
+    full_scan(engine, REPO, repo)
+    assert "File:pkg/mod.py" in fs_nodes(engine)
