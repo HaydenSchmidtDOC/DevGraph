@@ -26,3 +26,13 @@ def _isolate_global_tools_store(tmp_path, monkeypatch):
     from devgraph.config import global_tools
 
     monkeypatch.setattr(global_tools, "_default_path", lambda: tmp_path / "no-global" / global_tools.GLOBAL_TOOLS_FILENAME)
+
+
+@pytest.fixture(autouse=True)
+def _wide_cli_console(monkeypatch):
+    """Keep Rich output from wrapping at the terminal width (e.g. long tmp paths)."""
+    monkeypatch.setenv("COLUMNS", "1000")
+    from devgraph.cli import main
+
+    # The CLI console is created at import time, so it has already read COLUMNS.
+    monkeypatch.setattr(main.console, "_width", 1000)
