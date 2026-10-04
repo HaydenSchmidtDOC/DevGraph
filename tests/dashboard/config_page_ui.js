@@ -58,7 +58,11 @@ const mkEl = tag => {
     setAttribute(k, v) { attrs[k] = String(v); },
     getAttribute(k) { return k in attrs ? attrs[k] : null; },
     removeAttribute(k) { delete attrs[k]; },
-    focus() { focused = el; },
+    /* as in a browser: a disabled control, or one inside a disabled fieldset, can't take focus */
+    focus() {
+      for (let e = el; e; e = e.parentNode) if (e.disabled && (e === el || e.tagName === "FIELDSET")) return;
+      focused = el;
+    },
   };
   /* like a browser's: a select reads back only a value one of its options has */
   if (tag === "select") {
@@ -75,6 +79,7 @@ const ids = ["configScopes", "configStatus", "configModal", "configModalTitle", 
   "configDestField", "configDestLabel", "configDest", "configYaml", "configModalConfirm", "configModalError", "configModalReload",
   "configModalCancel", "configModalSave", "pane-config",
   "configEditorSwitch", "configModeForm", "configModeYaml", "configFormNotice", "configFormNoticeText", "configFormDiscard", "configForm",
+  "configFormHelp", "configFormScroll",
   "configResetModal", "configResetTitle", "configResetList", "configResetPhraseField", "configResetPhraseLabel", "configResetTyped",
   "configResetError", "configResetRecheck", "configResetCancel", "configResetConfirm"];
 const tagFor = id => id === "configYaml" ? "textarea" : id === "configDest" ? "select" : id === "configResetTyped" ? "input" :
@@ -166,7 +171,7 @@ const card = scope => els.configScopes.children.find(c => c.dataset.scope === sc
 const shown = el => el.style.display !== "none";
 const lastCall = () => fetchCalls[fetchCalls.length - 1];
 /* a deliberate click: well after the button last changed meaning */
-const press = async (el, detail = 1) => { clock += 1000; await el.fire("click", detail); };
+const press = async (el, detail = 1) => { clock += 1000; el.focus(); await el.fire("click", detail); };
 const yamlName = text => (/^name:\s*(\S+)/m.exec(text || "") || [])[1];
 const writes = () => fetchCalls.filter(c => c.init.method && c.init.method !== "GET");
 const body = call => JSON.parse(call.init.body);
@@ -1430,7 +1435,9 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     ["node_types", NODE_OK()], ["node_types", { ...NODE_OK(), source: null }],
     ["node_types", { label: "Doc", key: ["path"], source: { provider: "filesystem", kind: "file" }, metadata: [{ name: "path" }] }],
     ["node_types", { label: "Dir", source: { kind: "folder", provider: "filesystem" }, key: ["path"], metadata: [{ name: "path" }] }],
-    ["node_types", api.CONFIG_SECTIONS.node_types.entry], ["tools", api.CONFIG_SECTIONS.tools.entry]];
+    ["node_types", api.CONFIG_SECTIONS.node_types.entry], ["tools", api.CONFIG_SECTIONS.tools.entry],
+    /* textareas carry line feeds */
+    ["tools", { name: "x", description: "two\nlines", cypher: "a\nb\n" }], ["node_types", { label: "X", description: "two\nlines" }]];
   okEntries.forEach(([section, e], i) => {
     const rep = api.configFormFromEntry(section, e);
     check("the form can show representable " + section + " entry #" + i, rep.ok && rep.form, j(rep));
@@ -1463,6 +1470,18 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     ["a metadata field declared twice", "node_types", { label: "X", key: ["a"], metadata: [{ name: "a" }, { name: "a" }] },
       "This entry declares metadata field `a` more than once; the form can't show that. Edit it as YAML."],
     ["a relationship", "relationships", { type: "DOCUMENTS" }, "The form covers tools and node types; edit relationships as YAML."],
+    /* a single-line input can't hold a line break; a textarea turns CR / CRLF into LF */
+    ["a line feed in a tool name", "tools", { ...TOOL_OK(), name: "a\nb" }, FIELD("name")],
+    ["a CR in a parameter name", "tools", { ...TOOL_OK(), parameters: [{ name: "a\rb" }] }, FIELD("parameters.0.name")],
+    ["a line separator in a parameter default", "tools", { ...TOOL_OK(), parameters: [{ name: "x", default: "a\u2028b" }] }, FIELD("parameters.0.default")],
+    ["a NEL in a parameter description", "tools", { ...TOOL_OK(), parameters: [{ name: "x", description: "a\x85b" }] }, FIELD("parameters.0.description")],
+    ["a paragraph separator in a node label", "node_types", { ...NODE_OK(), label: "a\u2029b" }, FIELD("label")],
+    ["a line feed in a colour", "node_types", { ...NODE_OK(), color: "#1f77b4\n" }, FIELD("color")],
+    ["a line feed in a metadata name", "node_types", { label: "X", metadata: [{ name: "a\nb" }] }, FIELD("metadata.0.name")],
+    ["a line feed in a metadata description", "node_types", { ...NODE_OK(), metadata: [{ name: "slug", description: "a\nb" }], key: ["slug"] }, FIELD("metadata.0.description")],
+    ["a CRLF in a tool description", "tools", { ...TOOL_OK(), description: "a\r\nb" }, FIELD("description")],
+    ["a CR in Cypher", "tools", { ...TOOL_OK(), cypher: "MATCH (n)\rRETURN n" }, FIELD("cypher")],
+    ["a CR in a node description", "node_types", { ...NODE_OK(), description: "a\rb" }, FIELD("description")],
   ];
   refusals.forEach(([what, section, e, reason]) => {
     const rep = api.configFormFromEntry(section, e);
@@ -1649,6 +1668,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
       { name: "dated", tool_id: "repo-b_dated", yaml: "name: dated\nsince: 2024-01-01\n", entry: null, origin: "project", badges: [] },
       { name: "extra", tool_id: "repo-b_extra", yaml: "name: extra\nversion: 2\n", entry: { name: "extra", version: 2 }, origin: "project", badges: [] },
       { name: "hostile", tool_id: "repo-b_hostile", yaml: "name: hostile\n", entry: { name: HOSTILE, description: HOSTILE, cypher: HOSTILE }, origin: "project", badges: [] },
+      { name: "multi", tool_id: "repo-b_multi", yaml: "name: multi\n", entry: { name: "multi", parameters: [{ name: "x", description: "line one\nline two" }] }, origin: "project", badges: [] },
     ];
     b.schema.node_types = [{ label: "Runbook", yaml: "label: Runbook\nkey: [slug]\n", entry: RUNBOOK, editable: true, badges: [] }];
     b.schema.relationships = [{ type: "OWNS", yaml: "type: OWNS\n", editable: true, badges: [] }];
@@ -1684,6 +1704,8 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     formCtl("Description").value === "Hot paths.", formCtl("Name").value);
   check("...the textarea keeps the server's text untouched", els.configYaml.value === TOOL_YAML, els.configYaml.value);
   check("...and focus is on the form's first control", focused === formCtl("Name"), focused && focused.tagName);
+  check("...with one help line under the switch", shown(els.configFormHelp) &&
+    html.includes('id="configFormHelp" style="display:none">The form writes the YAML; Save checks it first, as before.</div>'), els.configFormHelp.style.display);
   await press(els.configModalSave);
   check("open then save without changes sends the model's yaml byte for byte, dry run then write",
     writes().length === 2 && body(writes()[0]).dry_run === true && body(writes()[1]).dry_run === false &&
@@ -1714,7 +1736,8 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await press(els.configModalSave);
   check("a dry run with warnings asks for 'Save anyway' in form mode too", els.configModalSave.textContent === "Save anyway" &&
     shown(els.configModalConfirm), els.configModalSave.textContent);
-  check("...moving focus off the button to the form's first control", focused === formCtl("Name"), focused && focused.tagName);
+  check("...moving focus off the button to the form's first control (not left on Save once the form unlocks)",
+    focused === formCtl("Name") && focused !== els.configModalSave, focused && focused.tagName);
   const cy = formCtl("Cypher");
   cy.focus();
   await typeIn(cy, TOOL_ENTRY.cypher + "LIMIT 5\n");
@@ -1725,6 +1748,9 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("...so the next click dry-runs the new text instead of writing it",
     writes().length === 2 && writes().every(c => body(c).dry_run === true) && body(writes()[1]).yaml === els.configYaml.value &&
     /LIMIT 5/.test(body(writes()[1]).yaml) && els.configModalSave.textContent === "Save anyway", JSON.stringify(writes()));
+  await typeIn(formCtl("Description"), formCtl("Description").value);
+  check("an input event that leaves the text as it was keeps the confirm", els.configModalSave.textContent === "Save anyway" &&
+    api.edit.confirmed === true, els.configModalSave.textContent);
   /* a confirm bound to text the form then changed (an edit landing after the click) re-dry-runs too */
   api.edit.confirmed = true;
   await typeIn(cy, TOOL_ENTRY.cypher + "LIMIT 6\n");
@@ -1747,6 +1773,11 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("while a dry run is out the form fieldset and both switch buttons are disabled",
     els.configForm.disabled === true && els.configModeForm.disabled === true && els.configModeYaml.disabled === true,
     JSON.stringify([els.configForm.disabled, els.configModeForm.disabled, els.configModeYaml.disabled]));
+  const busyText = els.configYaml.value;
+  await typeIn(formCtl("Description"), "typed while busy");
+  await press(find(els.configForm, e => e.tagName === "BUTTON" && e.textContent === "Add parameter")[0]);
+  check("...a form event that lands anyway changes neither the text nor the rows", els.configYaml.value === busyText &&
+    rowsOf("Parameters").length === 2 && api.edit.formState.description === "Hot paths.", els.configYaml.value);
   await press(els.configModeYaml);
   check("...and switching to YAML meanwhile does nothing", shown(els.configForm) && !shown(els.configYaml), els.configForm.style.display);
   gate = null; release(); await pending;
@@ -1767,9 +1798,14 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("...and pressing Form does nothing", !shown(els.configForm) && shown(els.configYaml), els.configForm.style.display);
   await editRow("repo-b", "extra");
   check("an entry with a field the form doesn't edit names it", formOff(FIELD("version")), els.configFormNoticeText.textContent);
+  await editRow("repo-b", "multi");
+  check("a line break in a single-line field opens in YAML, naming the field", formOff(FIELD("parameters.0.description")),
+    els.configFormNoticeText.textContent);
   await editRow("repo-b", "OWNS");
-  check("a relationship opens in YAML, saying the form covers tools and node types",
-    formOff("The form covers tools and node types; edit relationships as YAML."), els.configFormNoticeText.textContent);
+  check("a relationship opens in YAML with a quiet note that the form covers tools and node types",
+    formOff("Form: tools and node types only") && els.configFormNotice.classList.contains("quiet"), els.configFormNoticeText.textContent);
+  await editRow("repo-b", "dated");
+  check("...other reasons are not quiet", !els.configFormNotice.classList.contains("quiet"), els.configFormNotice.className);
   els.configModalCancel.fire("click");
 
   // 41f. delete and copy never show the form: the read-only YAML, no switch, no notice
@@ -1802,7 +1838,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await press(els.configModeYaml);
   check("Form -> YAML shows the form's own text", shown(els.configYaml) && !shown(els.configForm) && els.configYaml.value === formText &&
     els.configModeYaml.getAttribute("aria-pressed") === "true" && els.configModeForm.getAttribute("aria-disabled") === "false" &&
-    !shown(els.configFormNotice), els.configYaml.value);
+    !shown(els.configFormNotice) && !shown(els.configFormHelp), els.configYaml.value);
   els.configYaml.value = formText + "# mine\n";
   await els.configYaml.fire("input");
   check("after a hand edit Form is unavailable, with the reason and a Discard button",
@@ -1895,7 +1931,20 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("...keeping what was typed", /max_rows: "12abc"/.test(els.configYaml.value), els.configYaml.value);
   await typeIn(maxRows, "50");
   check("...or the number", /max_rows: 50\n/.test(els.configYaml.value), els.configYaml.value);
+  const typeSel = formCtl("Type", 0);
+  typeSel.focus();
+  typeSel.value = "float";
+  await typeSel.fire("change");
+  check("changing a parameter's type keeps the same select, focused (arrow keys don't churn)", formCtl("Type", 0) === typeSel &&
+    focused === typeSel && /type: float/.test(els.configYaml.value), focused && focused.tagName);
+  typeSel.value = "boolean";
+  await typeSel.fire("change");
+  check("...and swaps the default control for the type", formCtl("Default", 0).tagName === "SELECT" && focused === typeSel,
+    formCtl("Default", 0).tagName);
+  typeSel.value = "integer";
+  await typeSel.fire("change");
   const req = formCtl("Required", 0);
+  req.focus();
   req.checked = true;
   await req.fire("change");
   check("ticking Required disables the default and keeps focus on the box", formCtl("Default", 0).disabled === true &&

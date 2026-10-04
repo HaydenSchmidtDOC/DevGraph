@@ -87,11 +87,11 @@ VALID_NODE_TYPES = [
     {
         "label": "Runbook",
         "key": ["slug"],
-        "description": "Ops runbooks.",
+        "description": "Ops\nrunbooks.",
         "color": "#1f77b4",
         "metadata": [
             {"name": "slug", "type": "string", "required": True},
-            {"name": "owner", "description": "Team\nname"},
+            {"name": "owner", "description": "Team name"},
         ],
     },
     {
@@ -136,7 +136,30 @@ def _hostile_fixtures() -> list[dict]:
             "label": text, "key": [text], "color": text, "description": text,
             "metadata": [{"name": text, "description": text}],
         }})
+        # only the textarea-backed fields, so line breaks still go through the form
+        fixtures.append({"section": "tools", "mapping": {"name": "t", "description": text, "cypher": text}})
+        fixtures.append({"section": "node_types", "mapping": {"label": "N", "description": text}})
     return fixtures
+
+
+# A single-line input can't hold these, and a textarea turns CR into LF: the
+# form refuses such entries (they open in YAML) rather than rewrite them.
+_LINE_BREAKS = "\n\r\x85\u2028\u2029"
+_SINGLE_LINE = {
+    "tools": (["name"], "parameters", ["name", "default", "description"]),
+    "node_types": (["label", "color"], "metadata", ["name", "description"]),
+}
+_TEXTAREA = {"tools": ["description", "cypher"], "node_types": ["description"]}
+
+
+def _form_refuses(fixture: dict) -> bool:
+    mapping = fixture["mapping"]
+    top, rows, row_fields = _SINGLE_LINE[fixture["section"]]
+    single = [mapping.get(k) for k in top] + [r.get(k) for r in mapping.get(rows) or [] for k in row_fields]
+    area = [mapping.get(k) for k in _TEXTAREA[fixture["section"]]]
+    return any(isinstance(v, str) and any(c in v for c in _LINE_BREAKS) for v in single) or any(
+        isinstance(v, str) and "\r" in v for v in area
+    )
 
 
 NUMBER_FIXTURES = [
@@ -180,10 +203,17 @@ def test_serialised_yaml_parses_back_to_the_mapping(dumped):
 
 
 def test_every_fixture_survives_a_trip_through_the_form(dumped):
+    refused = 0
     for fixture, result in zip(_fixtures(), dumped["results"]):
+        if _form_refuses(fixture):
+            refused += 1
+            assert result["form_yaml"] is None, fixture
+            assert result["reason"].startswith("This entry has a field the form doesn't edit: `"), result["reason"]
+            continue
         assert result["form_yaml"] is not None, (fixture, result["reason"])
         text = result["form_yaml"]
         assert _ordered(yaml.safe_load(text)) == _ordered(fixture["mapping"]), text
+    assert refused, "no fixture exercised the line-break refusal"
 
 
 def test_valid_fixtures_pass_the_real_models(dumped):

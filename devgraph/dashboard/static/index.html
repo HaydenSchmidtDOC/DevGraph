@@ -423,14 +423,22 @@ table.dstable input[type="text"] { width: 100%; }
 .cfg-badge.info, .cfg-global { color: var(--accent); border-color: color-mix(in oklab, var(--accent), transparent 60%); }
 .cfg-badge.warn { color: var(--warn); border-color: color-mix(in oklab, var(--warn), transparent 60%); }
 .cfg-badge.error { color: var(--danger); border-color: color-mix(in oklab, var(--danger), transparent 60%); }
-.modal-box.cfg-modal-box { width: min(720px, 92vw); display: flex; flex-direction: column; gap: 12px; }
+.modal-box.cfg-modal-box { width: min(720px, 92vw); display: flex; flex-direction: column; gap: 12px; max-height: calc(100vh - 32px); overflow-y: auto; }
+/* the heading, banners and buttons keep their height; only the form shrinks (and scrolls) to fit */
+.cfg-modal-box > * { flex-shrink: 0; }
+/* the YAML keeps its 260px where there is room, and gives way before the buttons do */
+.cfg-modal-box > textarea.cfg-yaml { flex-shrink: 1; height: 260px; min-height: 120px; }
 .cfg-yaml { width: 100%; min-height: 260px; resize: vertical; background: #050506; border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--fg); padding: 10px 12px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; }
 .cfg-confirm { font-size: 12.5px; color: var(--warn); line-height: 1.5; }
 .cfg-switch { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 .cfg-switch button[aria-pressed="true"] { border-color: var(--accent); color: var(--fg); }
 .cfg-switch button[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
-.cfg-form-notice { font-size: 12.5px; color: var(--muted); line-height: 1.5; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.cfg-form { margin: 0; min-width: 0; max-height: 60vh; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+.cfg-form-notice { font-size: 12.5px; color: var(--warn); line-height: 1.5; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.cfg-form-notice.quiet { color: var(--meta); font-size: 12px; }
+#configFormHelp { font-size: 11.5px; color: var(--meta); }
+/* the scroller is a div: Chrome lets a scrolling fieldset's content overflow its parent */
+.cfg-modal-box > .cfg-form-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.cfg-form { margin: 0; min-width: 0; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
 .cfg-form legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
 .cfg-form fieldset { margin: 0; min-width: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: 8px 10px; display: flex; flex-direction: column; gap: 8px; }
 .cfg-form textarea:not(.cfg-yaml) { background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--fg); padding: 9px 11px; font-size: 13px; font-family: var(--font-body); resize: vertical; }
@@ -797,8 +805,9 @@ table.dstable input[type="text"] { width: 100%; }
   <div class="banner warn" id="configModalWarn" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg><span id="configModalWarnText"></span></div>
   <div class="field" id="configDestField" style="display:none"><label for="configDest" id="configDestLabel">Save to</label><select id="configDest"></select></div>
   <div class="cfg-switch" id="configEditorSwitch" role="group" aria-labelledby="configEditorLabel" style="display:none"><span id="configEditorLabel">Editor</span><button type="button" class="btn btn-sm" id="configModeForm" aria-pressed="false">Form</button><button type="button" class="btn btn-sm" id="configModeYaml" aria-pressed="true">YAML</button></div>
+  <div class="cfg-help" id="configFormHelp" style="display:none">The form writes the YAML; Save checks it first, as before.</div>
   <div class="cfg-form-notice" id="configFormNotice" style="display:none"><span id="configFormNoticeText"></span><button type="button" class="btn btn-sm" id="configFormDiscard" style="display:none">Discard YAML edits</button></div>
-  <fieldset class="cfg-form" id="configForm" style="display:none"></fieldset>
+  <div class="cfg-form-scroll" id="configFormScroll" style="display:none"><fieldset class="cfg-form" id="configForm" style="display:none"></fieldset></div>
   <textarea class="cfg-yaml" id="configYaml" spellcheck="false" aria-label="Entry YAML"></textarea>
   <div class="cfg-confirm" id="configModalConfirm" style="display:none"></div>
   <div class="cfg-error" id="configModalError" style="display:none"></div>
@@ -3228,10 +3237,15 @@ function renderConfigModal() {
   if (edit.mode === "form" && !(sw && sw.available)) edit.mode = "yaml";
   const form = edit.mode === "form";
   configShow("configYaml", edit.step === "edit" && !form);
+  configShow("configFormScroll", edit.step === "edit" && form);
   configShow("configForm", edit.step === "edit" && form);
   configShow("configEditorSwitch", edit.step === "edit" && !!sw);
+  configShow("configFormHelp", edit.step === "edit" && form);
   const notice = edit.step === "edit" && !!sw && !form && !sw.available;
-  document.getElementById("configFormNoticeText").textContent = notice ? sw.reason : "";
+  /* relationships simply have no form yet: a quiet note, not a problem with the entry */
+  const quiet = notice && sw.reason === CONFIG_FORM_REASONS.section;
+  document.getElementById("configFormNoticeText").textContent = !notice ? "" : quiet ? "Form: tools and node types only" : sw.reason;
+  document.getElementById("configFormNotice").classList.toggle("quiet", quiet);
   configShow("configFormNotice", notice);
   configShow("configFormDiscard", notice && sw.reason === CONFIG_FORM_REASONS.handEdit);
   const formBtn = document.getElementById("configModeForm");
@@ -3251,14 +3265,6 @@ function renderConfigModal() {
   }
   configShow("configModalConfirm", edit.confirmed);
   const label = edit.step === "warn" ? "Continue" : edit.confirmed ? verb + " anyway" : verb;
-  if (label !== edit.label) {
-    edit.label = label;
-    edit.armedAt = Date.now();
-    /* keyboard focus leaves the button whose meaning changed: a held Enter
-       then types into (or does nothing in) the editor instead of confirming.
-       Someone typing in the form keeps their place. */
-    if (edit.step === "edit" && !(form && configFormEls.all.includes(document.activeElement))) configEditorFocusTarget().focus();
-  }
   /* the destination is what the dry run checked: it cannot change under a request */
   document.getElementById("configDest").disabled = !!edit.busy;
   /* ...and neither can the text: typed meanwhile, it would be written unreviewed or lost on close */
@@ -3272,6 +3278,15 @@ function renderConfigModal() {
   const save = document.getElementById("configModalSave");
   save.disabled = !!edit.busy;
   save.textContent = edit.busy || label;
+  /* last, once the locks above are off (a disabled fieldset's controls can't take focus) */
+  if (label !== edit.label) {
+    edit.label = label;
+    edit.armedAt = Date.now();
+    /* keyboard focus leaves the button whose meaning changed: a held Enter
+       then types into (or does nothing in) the editor instead of confirming.
+       Someone typing in the form keeps their place. */
+    if (edit.step === "edit" && !(form && configFormEls.all.includes(document.activeElement))) configEditorFocusTarget().focus();
+  }
 }
 /* the toolbar's status line: one message as text, or a write's warnings and notes as a list */
 function configSetStatus(items) {
@@ -3738,17 +3753,23 @@ const configIsScalar = v => v === null || ["string", "number", "boolean"].includ
 const configFullMatch = (pattern, text) => new RegExp("^(?:" + pattern + ")$").test(text);
 /* the text a form control shows for a value */
 const configFormText = v => v === null || v === undefined ? "" : String(v);
+/* a single-line input can't show a line break, and a textarea turns CR and
+   CRLF into LF: text either would rewrite opens in YAML instead */
+const CONFIG_FORM_LINE_BREAK = /[\n\r\x85\u2028\u2029]/;
+const configFormLine = v => typeof v === "string" && !CONFIG_FORM_LINE_BREAK.test(v);
+const configFormArea = v => typeof v === "string" && !v.includes("\r");
 /* per field: what a value must be for the form to show it exactly */
 const CONFIG_FORM_CHECKS = {
-  tool: { name: v => typeof v === "string", description: v => typeof v === "string", cypher: v => typeof v === "string",
+  tool: { name: configFormLine, description: configFormArea, cypher: configFormArea,
     parameters: Array.isArray, max_rows: Number.isInteger, timeout_s: Number.isInteger },
-  parameter: { name: v => typeof v === "string", type: v => CONFIG_FORM_FIELDS.parameter_types.includes(v),
-    required: v => typeof v === "boolean", default: configIsScalar, description: v => v === null || typeof v === "string" },
-  node_type: { label: v => typeof v === "string", key: v => Array.isArray(v) && v.every(k => typeof k === "string"),
-    description: v => v === null || typeof v === "string", color: v => v === null || typeof v === "string",
+  parameter: { name: configFormLine, type: v => CONFIG_FORM_FIELDS.parameter_types.includes(v),
+    required: v => typeof v === "boolean", default: v => configIsScalar(v) && (typeof v !== "string" || configFormLine(v)),
+    description: v => v === null || configFormLine(v) },
+  node_type: { label: configFormLine, key: v => Array.isArray(v) && v.every(k => typeof k === "string"),
+    description: v => v === null || configFormArea(v), color: v => v === null || configFormLine(v),
     source: v => v === null || configIsMap(v), metadata: Array.isArray },
-  metadata: { name: v => typeof v === "string", type: v => CONFIG_FORM_FIELDS.metadata_types.includes(v),
-    required: v => typeof v === "boolean", description: v => v === null || typeof v === "string" },
+  metadata: { name: configFormLine, type: v => CONFIG_FORM_FIELDS.metadata_types.includes(v),
+    required: v => typeof v === "boolean", description: v => v === null || configFormLine(v) },
   source: { provider: v => CONFIG_FORM_FIELDS.source_providers.includes(v), kind: v => CONFIG_FORM_FIELDS.filesystem_kinds.includes(v) },
 };
 /* the path of the first field of `map` the form can't show, or null */
@@ -4011,10 +4032,15 @@ function configFormChanged() {
   if (!edit || !edit.formState) return;
   const text = configEntryYaml(edit.section, configEntryFromForm(edit.section, edit.formState, edit.order), edit.order);
   edit.formText = text;
-  document.getElementById("configYaml").value = text;
   configFormRefresh(edit);
+  const yaml = document.getElementById("configYaml");
+  /* the same text is the same request: a confirm still covers it */
+  if (yaml.value === text) return;
+  yaml.value = text;
   configTextChanged();
 }
+/* the form is locked while a request is out; an event that lands anyway changes nothing */
+const configFormLocked = () => !configEdit || !!configEdit.busy;
 function configSetEditorMode(mode) {
   const edit = configEdit;
   if (!edit || edit.busy || mode === edit.mode) return;
@@ -4090,7 +4116,7 @@ function configFormText_(tag, value, set) {
   const el = configEl(tag, "");
   if (tag === "input") { el.type = "text"; el.autocomplete = "off"; el.spellcheck = false; }
   el.value = value;
-  el.addEventListener("input", () => { set(el.value); configFormChanged(); });
+  el.addEventListener("input", () => { if (configFormLocked()) return; set(el.value); configFormChanged(); });
   return el;
 }
 /* a select whose options come from constants, plus one for any current value
@@ -4101,14 +4127,14 @@ function configFormSelect(options, value, extra, set) {
   extra.filter(v => !all.some(([o]) => o === v)).forEach(v => all.push([v, v + " (current value)"]));
   all.forEach(([v, text]) => { const o = configEl("option", "", text); o.value = v; el.appendChild(o); });
   el.value = value;
-  el.addEventListener("change", () => set(el.value));
+  el.addEventListener("change", () => { if (!configFormLocked()) set(el.value); });
   return el;
 }
 function configFormCheck(checked, set) {
   const el = configEl("input", "");
   el.type = "checkbox";
   el.checked = !!checked;
-  el.addEventListener("change", () => set(el.checked));
+  el.addEventListener("change", () => { if (!configFormLocked()) set(el.checked); });
   return el;
 }
 /* a structural change (a row, a type, Required): rebuild, refocus, re-serialise */
@@ -4136,6 +4162,7 @@ function renderConfigForm(edit) {
       set.appendChild(lg);
       fill(set, row, prefix + i + ".");
       const remove = configButton("Remove", () => {
+        if (configFormLocked()) return;
         list.splice(i, 1);
         configFormRebuild(edit, i < list.length ? prefix + i + ".name" : prefix + "add");
       });
@@ -4152,6 +4179,7 @@ function renderConfigForm(edit) {
       group.appendChild(set);
     });
     const add = configButton(addLabel, () => {
+      if (configFormLocked()) return;
       list.push(fresh());
       configFormRebuild(edit, prefix + (list.length - 1) + ".name");
     });
@@ -4178,19 +4206,29 @@ function renderConfigForm(edit) {
       () => ({ name: "", type: "string", required: true, default: "", description: "", open: {} }),
       (set, p, path) => {
         text(set, path + "name", "Name", "name", p);
-        configFormField(set, path + "type", "Type", configFormSelect(P, p.type, [], v => { p.type = v; configFormRebuild(edit, path + "type"); }));
-        configFormField(set, path + "required", "Required", configFormCheck(p.required, v => { p.required = v; configFormRebuild(edit, path + "required"); }),
+        /* Type and Required change only the Default control, in place: the
+           select keeps focus while arrow keys step through the types */
+        const holder = configEl("div", "");
+        let dflt = null;
+        const fillDefault = () => {
+          if (dflt) configFormEls.all.splice(configFormEls.all.indexOf(dflt), 1);
+          holder.replaceChildren();
+          /* typed defaults are text, kept as typed (a number input would read "" for "12abc") */
+          const open = p.open && "default" in p.open ? [configFormText(p.open.default)] : [];
+          dflt = p.type === "boolean"
+            ? configFormSelect([["", "(none)"], ["true", "true"], ["false", "false"]], p.default, open.concat(p.default).filter(v => v !== ""),
+              v => { p.default = v; configFormChanged(); })
+            : configFormText_("input", p.default, v => { p.default = v; });
+          if (p.type === "integer") dflt.inputMode = "numeric";
+          if (p.type === "float") dflt.inputMode = "decimal";
+          dflt.disabled = !!p.required;
+          configFormField(holder, path + "default", "Default", dflt, "A default makes the parameter optional.");
+        };
+        configFormField(set, path + "type", "Type", configFormSelect(P, p.type, [], v => { p.type = v; fillDefault(); configFormChanged(); }));
+        configFormField(set, path + "required", "Required", configFormCheck(p.required, v => { p.required = v; dflt.disabled = !!v; configFormChanged(); }),
           undefined, "cfg-check");
-        /* typed defaults are text, kept as typed (a number input would read "" for "12abc") */
-        const open = p.open && "default" in p.open ? [configFormText(p.open.default)] : [];
-        const dflt = p.type === "boolean"
-          ? configFormSelect([["", "(none)"], ["true", "true"], ["false", "false"]], p.default, open.concat(p.default).filter(v => v !== ""),
-            v => { p.default = v; configFormChanged(); })
-          : configFormText_("input", p.default, v => { p.default = v; });
-        if (p.type === "integer") dflt.inputMode = "numeric";
-        if (p.type === "float") dflt.inputMode = "decimal";
-        dflt.disabled = !!p.required;
-        configFormField(set, path + "default", "Default", dflt, "A default makes the parameter optional.");
+        fillDefault();
+        set.appendChild(holder);
         text(set, path + "description", "Description", "description", p);
       }));
     const num = (key, label, dflt) => {
@@ -4218,8 +4256,8 @@ function renderConfigForm(edit) {
   const follow = () => { if (configFullMatch(CONFIG_FORM_LIMITS.COLOR_PATTERN, f.color)) swatch.value = f.color.toLowerCase(); };
   follow();
   configFormEls.refresh.push(follow);
-  swatch.addEventListener("input", () => { f.color = swatch.value; colourText.value = f.color; configFormChanged(); });
-  const clear = configButton("Clear", () => { f.color = ""; colourText.value = ""; configFormChanged(); });
+  swatch.addEventListener("input", () => { if (configFormLocked()) return; f.color = swatch.value; colourText.value = f.color; configFormChanged(); });
+  const clear = configButton("Clear", () => { if (configFormLocked()) return; f.color = ""; colourText.value = ""; configFormChanged(); });
   clear.setAttribute("aria-label", "Clear colour");
   line.appendChild(swatch);
   line.appendChild(clear);
