@@ -261,7 +261,7 @@ def test_app_lifespan_runs_the_sampler_with_the_configured_data_dir(tmp_path, mo
     get_settings.cache_clear()
     try:
         app = build_app(StubEngine(rows=NESTED_5_26_ROWS), registry=object(), events=EventBroadcaster())
-        with TestClient(app) as client:
+        with TestClient(app, base_url="http://127.0.0.1") as client:
             assert app.state.metrics.running
             body = client.get("/api/database-stats").json()
             assert body["store"]["total_bytes"] == 10
