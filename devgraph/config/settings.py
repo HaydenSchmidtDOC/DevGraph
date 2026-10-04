@@ -5,23 +5,34 @@ Every default here is deliberately the safe/off value per the Design Brief
 Nothing in this module should silently enable outbound network calls.
 """
 
+import logging
 import os
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 def devgraph_home() -> Path:
     """Directory holding DevGraph's per-user state (registry, logs, .env).
 
     Follows an exported DEVGRAPH_REGISTRY_DB_PATH so the home moves with the
-    registry; otherwise ~/.devgraph.
+    registry; otherwise ~/.devgraph. ``~`` is expanded the same way as for the
+    registry_db_path setting. A value that is still relative after expansion
+    is ignored, since its parent would be the working directory.
     """
     registry = os.environ.get("DEVGRAPH_REGISTRY_DB_PATH")
     if registry:
-        return Path(registry).expanduser().parent
+        path = Path(registry).expanduser()
+        if path.is_absolute():
+            return path.parent
+        logger.warning(
+            "Ignoring relative DEVGRAPH_REGISTRY_DB_PATH %r when locating the settings home; using ~/.devgraph",
+            registry,
+        )
     return Path.home() / ".devgraph"
 
 
@@ -60,6 +71,12 @@ class Settings(BaseSettings):
 
     mentions_ambiguous_mode: str = "all"
     registry_db_path: Path = Path.home() / ".devgraph" / "registry.sqlite3"
+
+    @field_validator("registry_db_path")
+    @classmethod
+    def _expand_registry_home(cls, value: Path) -> Path:
+        return value.expanduser()
+
     watch_debounce_ms: int = 500
     health_check_interval_s: int = 30
 

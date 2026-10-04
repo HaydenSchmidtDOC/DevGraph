@@ -78,7 +78,7 @@ A repository may declare extra node types in an optional `devgraph.schema.yaml` 
 
 Settings come from `DEVGRAPH_*` environment variables (see `.env.example`). A `.env` file is read only from two fixed places, never from the directory a command starts in:
 
-1. `~/.devgraph/.env` (or the directory of `DEVGRAPH_REGISTRY_DB_PATH`, when that is exported), which takes precedence;
+1. `~/.devgraph/.env` (or the directory of `DEVGRAPH_REGISTRY_DB_PATH`, when that is exported as an absolute or `~`-prefixed path; a relative value is ignored here with a warning), which takes precedence;
 2. the root of the DevGraph checkout, when DevGraph runs from a source checkout.
 
 Exported environment variables override both files.
