@@ -183,10 +183,15 @@ class _Doc:
         return eol.join(self.lines) + eol
 
 
-def add_entry_text(text: str, entry: dict, *, key: str, ident: str, version: int, noun: str = "entry") -> str:
-    """Append an entry to the document, creating `version`/`key` as needed."""
+def add_entry_text(
+    text: str, entry: dict, *, key: str, ident: str, version: int, noun: str = "entry", unique: bool = True
+) -> str:
+    """Append an entry to the document, creating `version`/`key` as needed.
+
+    `unique=False` skips the same-identity refusal, for lists whose identity may repeat.
+    """
     doc = _Doc(text, key, ident, noun)
-    if doc.has(entry.get(ident)):
+    if unique and doc.has(entry.get(ident)):
         raise ListEditError(f"a {noun} named {entry.get(ident)!r} already exists")
     if not doc.lines:
         doc.lines = [f"version: {version}", f"{key}:"] + doc.render(entry, 0)
