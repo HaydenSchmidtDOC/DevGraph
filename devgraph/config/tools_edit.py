@@ -9,6 +9,8 @@ with `parse_project_tools`.
 
 from __future__ import annotations
 
+import re
+
 import yaml
 
 from devgraph.config.project_tools import TOOLS_VERSION
@@ -96,36 +98,75 @@ class _Doc:
     def has(self, name: str) -> bool:
         return any(isinstance(m, dict) and m.get("name") == name for m in self.mappings)
 
+    def dash_line(self, position: int) -> int:
+        """Line of the item's `- `; an anchor/tag alone after the dash puts the mapping on the next line."""
+        node = self.items[position]
+        line = node.start_mark.line
+        if not self.lines[line][: node.start_mark.column].strip() and line > 0:
+            if re.fullmatch(r"\s*-\s+[&!]\S+\s*", self.lines[line - 1]):
+                return line - 1
+        return line
+
     def dash_column(self, position: int) -> int:
         node = self.items[position]
-        before = self.lines[node.start_mark.line][: node.start_mark.column].rstrip()
+        line = self.dash_line(position)
+        column = node.start_mark.column if line == node.start_mark.line else len(self.lines[line])
+        before = self.lines[line][:column].rstrip()
+        if not before.endswith("-") and line != node.start_mark.line:
+            before = self.lines[line].split("-", 1)[0] + "-"
         if not before.endswith("-"):
             raise ToolsEditError("a tool entry does not start on its '- ' line; edit the file by hand")
         return len(before) - 1
 
     def span(self, position: int) -> tuple[int, int]:
-        """Line range [start, end) of one tool, without trailing blank lines or comments at or left of its dash."""
-        start = self.items[position].start_mark.line
-        if position + 1 < len(self.items):
-            end = self.items[position + 1].start_mark.line
-        else:
+        """Line range [start, end) of one tool.
+
+        Trailing comment lines that are not clearly the tool's own are left
+        out: before the next tool, any comment run (it introduces that tool);
+        after the last tool, comments at or left of its dash. Blank lines are
+        never moved on their own (they can belong to a keep-chomped scalar);
+        they are excluded only together with a comment run that follows them.
+        """
+        start = self.dash_line(position)
+        last = position + 1 >= len(self.items)
+        if last:
             seq = self.value
             end = seq.end_mark.line + (1 if seq.end_mark.column > 0 else 0)
+        else:
+            end = self.dash_line(position + 1)
         end = min(end, len(self.lines))
         dash = self.dash_column(position)
-        while end > start + 1:
-            line = self.lines[end - 1]
+        first_comment = None
+        probe = end
+        while probe > start + 1:
+            line = self.lines[probe - 1]
             stripped = line.strip()
-            if not stripped or (stripped.startswith("#") and len(line) - len(line.lstrip()) <= dash):
-                end -= 1
+            if not stripped:
+                probe -= 1
+            elif stripped.startswith("#") and (not last or len(line) - len(line.lstrip()) <= dash):
+                first_comment = probe - 1
+                probe -= 1
             else:
                 break
-        return start, end
+        return start, first_comment if first_comment is not None else end
 
     def render(self, tool: dict, dash: int) -> list[str]:
         body = dump_tool(tool).rstrip("\n").split("\n")
         pad = " " * dash
         return [pad + "- " + body[0]] + [pad + "  " + line if line else line for line in body[1:]]
+
+    def check_anchors(self, removed: list[str], name: str) -> None:
+        """Refuse an edit that leaves an alias without its anchor."""
+        try:
+            yaml.compose("\n".join(self.lines) + "\n")
+        except yaml.YAMLError as exc:
+            anchors = sorted(set(re.findall(r"undefined alias '([^']+)'", str(exc))))
+            if anchors:
+                raise ToolsEditError(
+                    f"tool {name!r} defines an anchor used elsewhere ({', '.join(repr('&' + a) for a in anchors)}); "
+                    "edit the file by hand"
+                ) from exc
+            raise ToolsEditError(f"the edit would produce malformed YAML: {exc}") from exc
 
     def result(self) -> str:
         eol = "\r\n" if self.crlf else "\n"
@@ -167,7 +208,9 @@ def replace_tool_text(text: str, name: str, tool: dict) -> str:
     doc = _Doc(text)
     position = doc.index(name)
     start, end = doc.span(position)
+    removed = doc.lines[start:end]
     doc.lines[start:end] = doc.render(tool, doc.dash_column(position))
+    doc.check_anchors(removed, name)
     return doc.result()
 
 
@@ -176,8 +219,12 @@ def delete_tool_text(text: str, name: str) -> str:
     doc = _Doc(text)
     position = doc.index(name)
     start, end = doc.span(position)
+    removed = doc.lines[start:end]
     del doc.lines[start:end]
     if len(doc.items) == 1:
         line_no = doc.key.start_mark.line
-        doc.lines[line_no] = doc.lines[line_no][: doc.key.end_mark.column + 1] + " []"
+        line = doc.lines[line_no]
+        colon = line.index(":", doc.key.end_mark.column)
+        doc.lines[line_no] = line[: colon + 1] + " []" + line[colon + 1 :].rstrip()
+    doc.check_anchors(removed, name)
     return doc.result()

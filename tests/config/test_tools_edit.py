@@ -169,3 +169,75 @@ def test_dump_tool_block_scalar_and_key_order():
     text = dump_tool({"name": "a", "description": "d", "cypher": "MATCH 1\nRETURN 2"})
     assert text == "name: a\ndescription: d\ncypher: |-\n  MATCH 1\n  RETURN 2\n"
     assert yaml.safe_load(text)["cypher"] == "MATCH 1\nRETURN 2"
+
+
+NEXT_COMMENT_DOC = """\
+version: 1
+tools:
+  - name: a
+    description: A.
+    cypher: 'MATCH ($repo_id)'
+    # introduces b
+  - name: b
+    description: B.
+    cypher: 'MATCH ($repo_id)'
+"""
+
+
+def test_deeper_comment_before_next_tool_survives_delete_and_replace():
+    deleted = delete_tool_text(NEXT_COMMENT_DOC, "a")
+    assert "    # introduces b" in deleted and names(deleted) == ["b"]
+    replaced = replace_tool_text(NEXT_COMMENT_DOC, "a", tool("a2"))
+    assert "    # introduces b" in replaced and names(replaced) == ["a2", "b"]
+
+
+def test_comment_then_blank_before_next_tool_survives():
+    doc = NEXT_COMMENT_DOC.replace("    # introduces b\n", "    # introduces b\n\n")
+    assert "# introduces b" in delete_tool_text(doc, "a")
+
+
+@pytest.mark.parametrize("head", ["tools:  # my tools", "tools :", "tools:"])
+def test_delete_only_tool_keeps_key_line_text(head):
+    doc = f"version: 1\n{head}\n- name: a\n  description: A.\n  cypher: 'MATCH ($repo_id)'\n"
+    result = delete_tool_text(doc, "a")
+    assert parse_project_tools(result, "x").tools == ()
+    first = result.splitlines()[1]
+    assert first.startswith(head.split(":")[0]) and first.replace(" ", "").startswith("tools:[]")
+    assert ("# my tools" in first) == ("# my tools" in head)
+
+
+KEEP_DOC = """\
+version: 1
+tools:
+  - name: a
+    description: A.
+    cypher: |+
+      MATCH ($repo_id)
+
+
+  - name: b
+    description: B.
+    cypher: |+
+      MATCH ($repo_id)
+
+"""
+
+
+def test_keep_chomped_scalars_unchanged():
+    before = {m["name"]: m["cypher"] for m in tool_mappings(KEEP_DOC)}
+    added = {m["name"]: m["cypher"] for m in tool_mappings(add_tool_text(KEEP_DOC, tool("c")))}
+    assert added["a"] == before["a"] and added["b"] == before["b"]
+    deleted = {m["name"]: m["cypher"] for m in tool_mappings(delete_tool_text(KEEP_DOC, "a"))}
+    assert deleted["b"] == before["b"]
+    kept_a = {m["name"]: m["cypher"] for m in tool_mappings(delete_tool_text(KEEP_DOC, "b"))}
+    assert kept_a["a"] == before["a"]
+
+
+def test_delete_anchor_used_elsewhere_refused():
+    doc = (
+        "version: 1\ntools:\n"
+        "  - &base\n    name: a\n    description: A.\n    cypher: 'MATCH ($repo_id)'\n"
+        "  - <<: *base\n    name: b\n"
+    )
+    with pytest.raises(ToolsEditError, match=r"anchor used elsewhere \('&base'\)"):
+        delete_tool_text(doc, "a")
