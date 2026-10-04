@@ -25,6 +25,8 @@ from pathlib import Path
 
 import yaml
 
+from devgraph.config.project_tools import YAML_LOAD_ERRORS
+
 _TYPE_TO_LABEL = {
     "requirement": "Requirement",
     "design_decision": "DesignDecision",
@@ -79,7 +81,7 @@ class DocsExtractor:
 
         try:
             meta = yaml.safe_load(match.group(1)) or {}
-        except yaml.YAMLError:
+        except YAML_LOAD_ERRORS:
             return result
         if not isinstance(meta, dict):
             return result
