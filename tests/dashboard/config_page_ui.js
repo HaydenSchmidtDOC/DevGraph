@@ -98,7 +98,7 @@ const api = new Function(...Object.keys(globals),
   configSrc + "\nreturn { CONFIG_GLOBAL, renderConfigPage, renderConfigScope, configWriteRequest, describeConfigError," +
   " openConfigEditor, configEditTarget, configCopyDestinations, configCanCopy, loadConfigPage, applyConfigScope, configModalKey, CONFIG_SECTIONS," +
   " configResetRequest, configResetPhrase, configResetReady, describeConfigReset, configToggleRequest," +
-  " configFormFromEntry, configEntryFromForm, configYamlScalar, configEntryYaml, configFormHints, configFormSwitch," +
+  " CONFIG_FORM_FIELDS, configFormFromEntry, configEntryFromForm, configYamlScalar, configEntryYaml, configFormHints, configFormSwitch," +
   " get model() { return configModel; }, get edit() { return configEdit; }, get reset() { return configReset; } };")(...Object.values(globals));
 
 // --- fixtures -----------------------------------------------------------
@@ -1455,6 +1455,12 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     const rep = api.configFormFromEntry(section, e);
     check("the form refuses " + what + ", saying why", !rep.ok && rep.reason === reason, j(rep));
   });
+  api.CONFIG_FORM_FIELDS.tool.push("version");
+  const yamlOnly = api.configFormFromEntry("tools", { ...TOOL_OK(), version: 1 });
+  const plainOk = api.configFormFromEntry("tools", TOOL_OK()).ok;
+  api.CONFIG_FORM_FIELDS.tool.pop();
+  check("a model field the form lists but has no check for opens as YAML, naming the field (no TypeError)",
+    !yamlOnly.ok && yamlOnly.reason === FIELD("version") && plainOk, j(yamlOnly));
 
   // 37. form state -> mapping
   const back = (section, e) => api.configEntryFromForm(section, api.configFormFromEntry(section, e).form, Object.keys(e));
@@ -1534,10 +1540,12 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     ["123", '"123"'], ["a: b", '"a: b"'], [" lead", '" lead"'], ["", '""'], ["2026-10-05", '"2026-10-05"'],
     ["two words", '"two words"'], ["say \"hi\"", '"say \\"hi\\""'],
     ["a\u2028b", '"a\\u2028b"'], ["a\u2029b\x85c", '"a\\u2029b\\u0085c"'], ["del\x7f", '"del\\u007f"'],
-    ["a\r\nb\r\n", '"a\\r\\nb\\r\\n"'], ["x\n\n", '"x\\n\\n"'], ["  lead\nx", '"  lead\\nx"'], ["\n", '"\\n"'],
+    ["a\r\nb\r\n", '"a\\r\\nb\\r\\n"'], ["lone\ud800\nx\n", '"lone\\ud800\\nx\\n"'], ["lo\nne\udc00", '"lo\\nne\\udc00"'], ["x\n\n", '"x\\n\\n"'], ["  lead\nx", '"  lead\\nx"'], ["\n", '"\\n"'],
     [true, "true"], [false, "false"], [12, "12"], [-3, "-3"], [0.5, "0.5"], [1e-7, "1.0e-7"], [1e21, "1.0e+21"], [null, "null"]]
     .forEach(([v, want]) => check("scalar " + j(v) + " -> " + want, sc(v) === want, sc(v)));
   check("text ending in one line break is a | block", api.configYamlScalar("A\nB\n", "  ") === "|\n  A\n  B", j(api.configYamlScalar("A\nB\n", "  ")));
+  check("a surrogate pair stays in a block", api.configYamlScalar("a \ud83d\ude42\nb\n", "  ") === "|\n  a \ud83d\ude42\n  b",
+    j(api.configYamlScalar("a \ud83d\ude42\nb\n", "  ")));
   check("text ending in none is a |- block", api.configYamlScalar("A\n\nB", "    ") === "|-\n    A\n\n    B", j(api.configYamlScalar("A\n\nB", "    ")));
   check("the node type template serialises to its own text",
     api.configEntryYaml("node_types", api.CONFIG_SECTIONS.node_types.entry, ["label", "key", "metadata"]) === api.CONFIG_SECTIONS.node_types.template,

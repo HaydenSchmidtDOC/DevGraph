@@ -41,12 +41,13 @@ def _dump(fixtures: list[dict]) -> dict:
 
 
 def _ordered(value):
-    """Mappings as (key, value) pairs, so equality also checks key order."""
+    """Mappings as (key, value) pairs, so equality also checks key order, and
+    leaves paired with their type, so 3 != 3.0 and True != 1."""
     if isinstance(value, dict):
         return [(k, _ordered(v)) for k, v in value.items()]
     if isinstance(value, list):
         return [_ordered(v) for v in value]
-    return value
+    return (type(value), value)
 
 
 CYPHER = "MATCH (f:Function {repo_id: $repo_id})\nWHERE f.calls > $min\nRETURN f.name AS name\nLIMIT $limit\n"
@@ -120,6 +121,7 @@ HOSTILE_STRINGS = [
     "\n  indented after a newline\n", "  indented\nsecond", "\ttab first\nx", "x\n  ", "x\n  \n", "x\n\ty",
     "\n", "\n\n", " ", "ctrl\x01char", "del\x7fchar", "c1\x9bchar", "\ufeffbom", "nonchar\ufffe",
     "<img src=x onerror=alert(1)>", "x\n---\ny", "x\n...\n", 'quote"in\\back', "# comment\nx", "key: |\n  y",
+    "lone\ud800\nx\n", "lo\nne\udc00",
 ]
 
 
@@ -144,8 +146,10 @@ NUMBER_FIXTURES = [
         {"name": "a", "type": "float", "default": 1e-7},
         {"name": "b", "type": "float", "default": 1e21},
         {"name": "c", "type": "float", "default": -1.5e-300},
-        {"name": "d", "type": "float", "default": 3.0},
+        {"name": "d", "type": "float", "default": 2.5},
         {"name": "e", "type": "boolean", "default": True},
+        {"name": "i", "type": "integer", "default": 3},
+        {"name": "j", "type": "boolean", "default": False},
         {"name": "f", "type": "integer", "default": "12"},
         {"name": "g", "default": None, "description": None},
         {"name": "h", "type": "string", "default": 1.25},

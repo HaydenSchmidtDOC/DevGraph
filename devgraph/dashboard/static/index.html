@@ -3698,7 +3698,10 @@ const CONFIG_FORM_CHECKS = {
 /* the path of the first field of `map` the form can't show, or null */
 function configFormBadField(map, kind, prefix) {
   for (const [k, v] of Object.entries(map)) {
-    if (!CONFIG_FORM_FIELDS[kind].includes(k) || !CONFIG_FORM_CHECKS[kind][k](v)) return prefix + k;
+    /* a field listed in CONFIG_FORM_FIELDS with no check here is the spec's
+       "explicitly YAML-only" field (G2b-3 §2.9): entries that use it open as YAML */
+    const check = CONFIG_FORM_CHECKS[kind][k];
+    if (!CONFIG_FORM_FIELDS[kind].includes(k) || !check || !check(v)) return prefix + k;
   }
   return null;
 }
@@ -3813,6 +3816,8 @@ function configEntryFromForm(section, form, order) {
    \u2028/\u2029, reads them as line breaks), so a quoted string escapes them */
 const CONFIG_YAML_UNSAFE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029\ufffe\uffff]/;
 const CONFIG_YAML_ESCAPE = /[\x7f-\x9f\u2028\u2029\ufffe\uffff]/g;
+/* a lone UTF-16 surrogate is unwritable raw; JSON.stringify escapes it, so such text is quoted */
+const CONFIG_YAML_LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 /* one scalar as YAML; `indent` is a literal block's content indent; `flow`
    rules a block out (inside [ ]) */
 function configYamlScalar(value, indent = "  ", flow = false) {
@@ -3828,7 +3833,7 @@ function configYamlScalar(value, indent = "  ", flow = false) {
   const body = s.endsWith("\n") ? s.slice(0, -1) : s;
   const first = body.split("\n").find(l => l) || "";
   if (!flow && body.includes("\n") && !body.endsWith("\n") && first && !/^[ \t]/.test(first) &&
-      !s.includes("\r") && !CONFIG_YAML_UNSAFE.test(s)) {
+      !s.includes("\r") && !CONFIG_YAML_UNSAFE.test(s) && !CONFIG_YAML_LONE_SURROGATE.test(s)) {
     return (s.endsWith("\n") ? "|" : "|-") + "\n" + body.split("\n").map(l => l ? indent + l : "").join("\n");
   }
   /* a JSON string literal is a valid YAML double-quoted scalar */
