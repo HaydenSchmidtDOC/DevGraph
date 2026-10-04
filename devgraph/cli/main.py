@@ -29,6 +29,11 @@ from devgraph.indexer.git_history.extractor import sync_git_history
 from devgraph.registry.store import RepoRegistry
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
+
+# Arguments for launching the MCP server with the venv python. -P keeps the
+# working directory off sys.path, so a `devgraph/` directory in the repo the
+# client starts in cannot shadow the installed package.
+MCP_SERVER_ARGS = ("-P", "-m", "devgraph.mcp.server")
 tray_app = typer.Typer(help="Manage the DevGraph tray app (live watcher + incremental indexer) as a background process.")
 app.add_typer(tray_app, name="tray")
 console = Console()
@@ -892,7 +897,7 @@ def _register_vscode(python_path: Path, repo_root: Path) -> bool:
     data["servers"]["devgraph"] = {
         "type": "stdio",
         "command": str(python_path),
-        "args": ["-m", "devgraph.mcp.server"],
+        "args": list(MCP_SERVER_ARGS),
         "cwd": str(repo_root),
     }
 
@@ -917,10 +922,10 @@ def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path) ->
     if already_registered:
         console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
         return True
-    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" -m devgraph.mcp.server'
+    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
     console.print(f"\n[bold]Running:[/bold] {mcp_add_line}")
     result = subprocess.run(
-        [claude_path, "mcp", "add", "devgraph", "--", str(python_path), "-m", "devgraph.mcp.server"],
+        [claude_path, "mcp", "add", "devgraph", "--", str(python_path), *MCP_SERVER_ARGS],
         cwd=str(repo_root),
     )
     return result.returncode == 0
@@ -1012,7 +1017,7 @@ def client_config(
 
     python_path = resolve_venv_python()
     repo_root = resolve_repo_root()
-    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" -m devgraph.mcp.server'
+    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
     want_claude = target in ("claude", "both")
     want_vscode = target in ("vscode", "both")
 
@@ -1021,7 +1026,7 @@ def client_config(
     else:
         console.print("## Connect DevGraph as an MCP server\n")
         console.print(f"- **command**: {python_path}")
-        console.print("- **args**: -m devgraph.mcp.server")
+        console.print(f"- **args**: {' '.join(MCP_SERVER_ARGS)}")
         console.print(f"- **cwd**: {repo_root}\n")
         if want_claude:
             console.print("```bash")
@@ -1034,7 +1039,7 @@ def client_config(
                 {"servers": {"devgraph": {
                     "type": "stdio",
                     "command": str(python_path),
-                    "args": ["-m", "devgraph.mcp.server"],
+                    "args": list(MCP_SERVER_ARGS),
                     "cwd": str(repo_root),
                 }}},
                 indent=2,
@@ -1321,7 +1326,7 @@ def update(
     if was_running:
         console.print("[bold]Stopping tray app...[/bold]")
         subprocess.run(
-            [str(python_path), "-m", "devgraph.cli.main", "tray", "stop"],
+            [str(python_path), "-P", "-m", "devgraph.cli.main", "tray", "stop"],
             cwd=str(repo_root),
         )
 
@@ -1339,7 +1344,7 @@ def update(
     # 6. Doctor
     console.print("[bold]Verifying environment...[/bold]")
     result = subprocess.run(
-        [str(python_path), "-m", "devgraph.cli.main", "doctor"],
+        [str(python_path), "-P", "-m", "devgraph.cli.main", "doctor"],
         cwd=str(repo_root), capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -1352,7 +1357,7 @@ def update(
     if was_running:
         console.print("[bold]Restarting tray app...[/bold]")
         subprocess.run(
-            [str(python_path), "-m", "devgraph.cli.main", "tray", "start"],
+            [str(python_path), "-P", "-m", "devgraph.cli.main", "tray", "start"],
             cwd=str(repo_root),
         )
 
