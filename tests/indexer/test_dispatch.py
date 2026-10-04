@@ -863,7 +863,8 @@ class TestCrossFileEdgesIndependentOfOrder:
         does not re-resolve edges from referrers indexed earlier -- nothing in
         the graph points from a referrer to a node that didn't exist yet, so
         there is no reverse-dependent to find. Re-indexing the referrer (or a
-        full rescan) links it."""
+        full rescan) links it. Update this test when the incremental gap is
+        closed."""
         repo_id = "_smoketest_dispatch_referrer_first_incremental"
         _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
         referrers = {"a.md", "docs/a-new.md", "api/urls.py", "store/ASqlStore.java"}
