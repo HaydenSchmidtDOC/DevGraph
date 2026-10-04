@@ -101,7 +101,7 @@ def client(registry, engine, scan_calls, monkeypatch):
     monkeypatch.setattr(routes, "full_scan", fake_full_scan)
     app = FastAPI()
     app.include_router(routes.build_router(engine, registry, EventBroadcaster()))
-    return TestClient(app)
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 def _make_git_repo(tmp_path: Path, name: str = "sample-repo") -> Path:
@@ -282,7 +282,7 @@ def test_register_repo_does_not_leak_internals_on_an_unexpected_registry_failure
     "headers",
     [
         {"origin": "http://evil.example"},
-        {"origin": "https://testserver"},
+        {"origin": "https://127.0.0.1"},
         {"sec-fetch-site": "cross-site"},
         {"sec-fetch-site": "same-site"},
     ],
@@ -303,7 +303,7 @@ def test_register_repo_rejects_a_cross_origin_request_before_writing(
 @pytest.mark.parametrize(
     "headers",
     [
-        {"origin": "http://testserver", "sec-fetch-site": "same-origin"},
+        {"origin": "http://127.0.0.1", "sec-fetch-site": "same-origin"},
         {"sec-fetch-site": "none"},
         {},  # non-browser client (curl, the CLI): no Origin, no Fetch Metadata
     ],

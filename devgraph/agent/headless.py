@@ -23,6 +23,7 @@ from devgraph.agent.schema_rescan import SchemaRescanScheduler
 from devgraph.config import get_settings
 from devgraph.dashboard.app import build_app
 from devgraph.dashboard.events import EventBroadcaster
+from devgraph.dashboard.url import dashboard_url
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.dispatch import index_paths, remove_paths
 from devgraph.indexer.git_history.extractor import sync_git_history
@@ -168,7 +169,7 @@ class HeadlessAgent:
         asyncio.set_event_loop(loop)
         self._events.bind_loop(loop)
 
-        app = build_app(self._engine, self._registry, self._events)
+        app = build_app(self._engine, self._registry, self._events, self._settings.dashboard_host)
         config = uvicorn.Config(
             app,
             host=self._settings.dashboard_host,
@@ -180,9 +181,7 @@ class HeadlessAgent:
         server = uvicorn.Server(config)
         self._dashboard_server = server
         try:
-            logger.info(
-                "dashboard on http://%s:%d", self._settings.dashboard_host, self._settings.dashboard_port
-            )
+            logger.info("dashboard on %s", dashboard_url(self._settings))
             loop.run_until_complete(server.serve())
         except Exception:
             logger.warning("dashboard failed to start; continuing without it", exc_info=True)

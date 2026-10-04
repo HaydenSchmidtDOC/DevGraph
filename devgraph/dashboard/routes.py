@@ -8,7 +8,9 @@ directly" decision).
 
 Read-only apart from two writes: the canvas layout (`PUT .../layout`) and
 repository registration (`POST /repos`), which is the same add-then-initial-
-scan sequence `devgraph add <path>` runs, against the same services.
+scan sequence `devgraph add <path>` runs, against the same services -- plus
+the Cypher console (`POST /cypher`), which runs whatever it is given. All
+three refuse cross-site browser requests (`_reject_cross_site`).
 """
 
 from __future__ import annotations
@@ -148,7 +150,9 @@ def _reject_cross_site(request: Request) -> None:
     if site is not None and site not in ("same-origin", "none"):
         raise HTTPException(status_code=403, detail="cross-site request rejected")
     origin = request.headers.get("origin")
-    if origin is not None and origin != f"{request.url.scheme}://{request.url.netloc}":
+    # Lowercased both sides: hostnames are case-insensitive, and the Host
+    # guard in app.py already accepted this Host case-insensitively.
+    if origin is not None and origin.lower() != f"{request.url.scheme}://{request.url.netloc}".lower():
         raise HTTPException(status_code=403, detail="cross-origin request rejected")
 
 
@@ -477,6 +481,7 @@ def build_router(
 
     @router.put("/repos/{repo_id}/layout")
     async def put_repo_layout(repo_id: str, request: Request) -> dict[str, Any]:
+        _reject_cross_site(request)
         _require_layout_scope(repo_id)
         # Declaring a `payload: dict[str, Any]` parameter (the previous
         # shape) makes Starlette buffer and json-decode the entire body
@@ -503,7 +508,7 @@ def build_router(
         return {"ok": True}
 
     @router.post("/cypher")
-    def run_cypher(payload: dict[str, Any]) -> dict[str, Any]:
+    def run_cypher(payload: dict[str, Any], request: Request) -> dict[str, Any]:
         """Server-side Cypher execution for the dashboard's Cypher console.
 
         Replaces the prototype's direct browser->Neo4j HTTP connection (see
@@ -519,7 +524,11 @@ def build_router(
         only the console's own explicit Run/isolate/history actions set it,
         so background polling (repo list, topology counts, live glow preview
         on every keystroke) doesn't flood the log.
+
+        The query is arbitrary Cypher, writes included, so this gets the same
+        cross-site check as the other state-changing routes.
         """
+        _reject_cross_site(request)
         query = (payload.get("query") or "").strip()
         if not query:
             raise HTTPException(status_code=400, detail="query is required")

@@ -25,6 +25,7 @@ from devgraph.cli._env import resolve_podman, resolve_repo_root, resolve_venv_py
 from devgraph.cli.exporters import export_cypher, export_dot, export_json
 from devgraph.config import get_settings
 from devgraph.dashboard import queries as dashboard_queries
+from devgraph.dashboard.url import dashboard_url
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
@@ -1399,7 +1400,7 @@ def dashboard(
 ) -> None:
     """Open the DevGraph dashboard in the default browser, or print its URL."""
     settings = get_settings()
-    url = f"http://{settings.dashboard_host}:{settings.dashboard_port}"
+    url = dashboard_url(settings)
 
     # Check tray liveness
     liveness = _tray_liveness_text(settings)

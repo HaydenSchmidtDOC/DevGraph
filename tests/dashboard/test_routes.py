@@ -81,7 +81,7 @@ def client(seeded_graph, registry):
 
         events = EventBroadcaster()
         app = build_app(seeded_graph, registry, events)
-        yield TestClient(app)
+        yield TestClient(app, base_url="http://127.0.0.1")
 
 
 def test_list_repos(client):

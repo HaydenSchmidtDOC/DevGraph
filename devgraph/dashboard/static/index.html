@@ -683,7 +683,7 @@ table.dstable input[type="text"] { width: 100%; }
 
         <div class="settings-pane" id="pane-network" data-od-id="pane-network">
           <h3 class="pane-title">Network / access</h3>
-          <div class="banner warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg>No authentication or IP allowlist. Loopback-only by design this pass — per the rebuild design doc §5, adding auth is only in scope if <code>dashboard_host</code> ever moves off <code>127.0.0.1</code>.</div>
+          <div class="banner warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg>No authentication. Loopback-only by design this pass — per the rebuild design doc §5, adding auth is only in scope if <code>dashboard_host</code> ever moves off <code>127.0.0.1</code>. Requests are answered only when their Host is <code>127.0.0.1</code>, <code>localhost</code>, <code>[::1]</code> or <code>dashboard_host</code> (a wildcard bind adds nothing), which blocks DNS-rebinding pages; writes also refuse cross-origin requests.</div>
           <div class="card field-grid"><div class="field"><label>dashboard_host</label><input type="text" id="cfgDashboardHost" value="127.0.0.1" disabled /></div><div class="field"><label>dashboard_port</label><input type="text" id="cfgDashboardPort" value="8765" disabled /></div></div>
         </div>
 
