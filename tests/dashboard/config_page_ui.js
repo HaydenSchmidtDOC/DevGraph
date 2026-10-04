@@ -9,7 +9,9 @@
    errors) only ever land as text; every write sends the fingerprint the user
    saw as If-Match and a JSON body; a changed file keeps the user's text and
    offers a reload; destructive schema changes and global edits need a second,
-   informed click. */
+   informed click; a whole-file reset needs the scope's name typed exactly and
+   confirms with the dry run's fingerprint; the project-config switch shows the
+   server's state and asks only when disabling warns. */
 const fs = require("fs");
 const path = require("path");
 
@@ -59,8 +61,12 @@ const mkEl = tag => {
 };
 const ids = ["configScopes", "configStatus", "configModal", "configModalTitle", "configModalWarn", "configModalWarnText",
   "configDestField", "configDest", "configYaml", "configModalConfirm", "configModalError", "configModalReload",
-  "configModalCancel", "configModalSave", "pane-config"];
-const els = Object.fromEntries(ids.map(id => [id, mkEl(id === "configYaml" ? "textarea" : id === "configDest" ? "select" : "div")]));
+  "configModalCancel", "configModalSave", "pane-config",
+  "configResetModal", "configResetTitle", "configResetList", "configResetPhraseField", "configResetPhraseLabel", "configResetTyped",
+  "configResetError", "configResetRecheck", "configResetCancel", "configResetConfirm"];
+const tagFor = id => id === "configYaml" ? "textarea" : id === "configDest" ? "select" : id === "configResetTyped" ? "input" :
+  /^configReset(Recheck|Cancel|Confirm)$/.test(id) ? "button" : "div";
+const els = Object.fromEntries(ids.map(id => [id, mkEl(tagFor(id))]));
 els["pane-config"].classList.add("active");
 const document = { getElementById: id => els[id] || null, createElement: mkEl };
 
@@ -88,7 +94,8 @@ const globals = {
 const api = new Function(...Object.keys(globals),
   configSrc + "\nreturn { CONFIG_GLOBAL, renderConfigPage, renderConfigScope, configWriteRequest, describeConfigError," +
   " openConfigEditor, configEditTarget, loadConfigPage, applyConfigScope, configModalKey, CONFIG_SECTIONS," +
-  " get model() { return configModel; }, get edit() { return configEdit; } };")(...Object.values(globals));
+  " configResetRequest, configResetPhrase, configResetReady, describeConfigReset, configToggleRequest," +
+  " get model() { return configModel; }, get edit() { return configEdit; }, get reset() { return configReset; } };")(...Object.values(globals));
 
 // --- fixtures -----------------------------------------------------------
 const HOSTILE = '<img src=x onerror=alert(1)>';
@@ -616,6 +623,253 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("the Add relationship template says its endpoints must exist",
     /^#.*must name node types that already exist/m.test(els.configYaml.value) && /^from: /m.test(els.configYaml.value), els.configYaml.value);
   els.configModalCancel.fire("click");
+
+  // 18. whole-file reset: buttons per file state
+  api.renderConfigPage(MODEL());
+  check("each existing file gets a Reset button: global store, project schema (once, on Nodes) and project tools",
+    buttons(card("__global__"), "Reset global-tools.json…").length === 1 &&
+    buttons(card("repo-a"), "Reset devgraph.schema.yaml…").length === 1 &&
+    buttons(card("repo-a"), "Reset devgraph.tools.yaml…").length === 1,
+    JSON.stringify(find(els.configScopes, e => e.tagName === "BUTTON" && e.textContent.startsWith("Reset")).map(b => b.textContent)));
+  {
+    const m = MODEL();
+    m.projects[0].tools.state = "absent"; m.projects[0].tools.fingerprint = "absent";
+    m.projects[1].tools.state = "invalid"; m.projects[1].tools.error = "tools: not a list";
+    api.renderConfigPage(m);
+    check("an absent file has no Reset button", buttons(card("repo-a"), "Reset devgraph.tools.yaml…").length === 0, card("repo-a").textContent);
+    check("an invalid file keeps it (that is when it matters)", buttons(card("repo-b"), "Reset devgraph.tools.yaml…").length === 1,
+      card("repo-b").textContent);
+  }
+
+  // 19. reset: the pure helpers
+  r = api.configResetRequest("repo-a", "tools", "sha256:x", true);
+  check("configResetRequest -> POST /api/config/<scope>/reset/<kind> with If-Match and a JSON {dry_run} body",
+    r.url === "/api/config/repo-a/reset/tools" && r.init.method === "POST" && r.init.headers["If-Match"] === '"sha256:x"' &&
+    r.init.headers["Content-Type"] === "application/json" && r.init.body === JSON.stringify({ dry_run: true }), JSON.stringify(r));
+  r = api.configResetRequest("__global__", "tools", "sha256:g", false);
+  check("...the global store's URL, a real reset", r.url === "/api/config/__global__/reset/tools" && JSON.parse(r.init.body).dry_run === false,
+    JSON.stringify(r));
+  check("the phrase is the repo id, or 'global' for the global store",
+    api.configResetPhrase("repo-a") === "repo-a" && api.configResetPhrase("__global__") === "global",
+    api.configResetPhrase("__global__"));
+  check("configResetReady is an exact match only (case, whitespace, empty)",
+    api.configResetReady("repo-a", "repo-a") && !api.configResetReady("Repo-a", "repo-a") && !api.configResetReady(" repo-a", "repo-a") &&
+    !api.configResetReady("repo-a ", "repo-a") && !api.configResetReady("", "") && !api.configResetReady("__global__", "global"),
+    "loose match accepted");
+  let d = api.describeConfigReset({ removed: { tools: null }, warnings: [], notes: [] });
+  check("an unreadable file says its whole contents go", d.removed.length === 1 && /not valid YAML/.test(d.removed[0]), JSON.stringify(d));
+  d = api.describeConfigReset({ removed: { node_types: ["Runbook"], relationships: ["DOCUMENTS"] }, warnings: ["w"], notes: ["n"] });
+  check("a schema listing names node types and relationships",
+    JSON.stringify(d) === JSON.stringify({ removed: ["Node type Runbook", "Relationship DOCUMENTS"], warnings: ["w"], notes: ["n"] }), JSON.stringify(d));
+
+  // 20. reset flow: dry run, list, typed name, armed Reset with the dry run's fingerprint
+  api.renderConfigPage(MODEL());
+  const RWARN = "<b>bold</b> warning";
+  const afterA = project("repo-a"); afterA.tools.state = "absent"; afterA.tools.fingerprint = "absent";
+  const afterG = globalBlock(); afterG.tools.entries.push({ name: "after_reset_marker", tool_id: "gl_after_reset_marker", yaml: "", badges: [] });
+  fetchCalls = [];
+  respond = (url, init) => JSON.parse(init.body).dry_run
+    ? { status: 200, body: { ok: true, written: false, file: "devgraph.tools.yaml", fingerprint: "sha256:dry-fp",
+        removed: { tools: [HOSTILE, "hot_paths"] }, warnings: [RWARN], notes: ["After the reset, global tool hot_paths is served in repo-a."],
+        scope: project("repo-a"), global: globalBlock() } }
+    : { status: 200, body: { ok: true, written: true, file: "devgraph.tools.yaml", fingerprint: "absent", removed: { tools: [HOSTILE, "hot_paths"] },
+        warnings: [], notes: ["Written to devgraph.tools.yaml; not committed."], scope: afterA, global: afterG } };
+  await buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0].fire("click");
+  check("Reset opens the dialog and sends only a dry run, with the page's fingerprint",
+    els.configResetModal.classList.contains("open") && fetchCalls.length === 1 && fetchCalls[0].url === "/api/config/repo-a/reset/tools" &&
+    body(fetchCalls[0]).dry_run === true && ifMatch(fetchCalls[0]) === '"sha256:repo-a-tools"', JSON.stringify(fetchCalls));
+  check("...titled with the file and scope", els.configResetTitle.textContent === "Reset devgraph.tools.yaml (repo-a)", els.configResetTitle.textContent);
+  check("...lists what is removed, warnings and notes as text",
+    els.configResetList.textContent.includes("Tool " + HOSTILE) && els.configResetList.textContent.includes(RWARN) &&
+    els.configResetList.textContent.includes("global tool hot_paths is served in repo-a") &&
+    allEls.every(e => !e._html.includes("<img") && !e._html.includes("<b>")), els.configResetList.textContent);
+  check("...the dry run's list comes before the phrase input",
+    html.indexOf('id="configResetList"') < html.indexOf('id="configResetPhraseField"') && shown(els.configResetPhraseField),
+    "phrase input before the list");
+  check("...which asks for the repo id", els.configResetPhraseLabel.textContent === "Type repo-a to reset", els.configResetPhraseLabel.textContent);
+  check("Reset is disabled before the name is typed", els.configResetConfirm.disabled === true, String(els.configResetConfirm.disabled));
+  els.configResetTyped.value = "Repo-a";
+  await els.configResetTyped.fire("input");
+  await press(els.configResetConfirm);
+  check("a wrong name keeps it disabled and sends nothing", els.configResetConfirm.disabled === true && fetchCalls.length === 1,
+    JSON.stringify(fetchCalls));
+  els.configResetTyped.value = "repo-a";
+  await els.configResetTyped.fire("input");
+  check("the exact name enables Reset", els.configResetConfirm.disabled === false && els.configResetConfirm.textContent === "Reset",
+    els.configResetConfirm.textContent);
+  for (let i = 0; i < 5; i++) { clock += 30; await els.configResetConfirm.fire("click", 0); }
+  await els.configResetConfirm.fire("click", 2);
+  check("held Enter or a double-click right after it arms sends nothing", fetchCalls.length === 1, JSON.stringify(fetchCalls));
+  await press(els.configResetConfirm);
+  check("a deliberate click resets with the dry run's fingerprint as If-Match",
+    fetchCalls.length === 2 && fetchCalls[1].url === "/api/config/repo-a/reset/tools" && body(fetchCalls[1]).dry_run === false &&
+    ifMatch(fetchCalls[1]) === '"sha256:dry-fp"', JSON.stringify(fetchCalls));
+  check("...closes the dialog", !els.configResetModal.classList.contains("open") && api.reset === null, els.configResetModal.className);
+  check("...re-renders the repo's card from the response (no file, so no Reset)",
+    buttons(card("repo-a"), "Reset devgraph.tools.yaml…").length === 0, card("repo-a").textContent);
+  check("...and the global card from its block", !!rowFor(card("__global__"), "after_reset_marker"), card("__global__").textContent);
+  check("...the status says what was written and that git is the only way back",
+    els.configStatus.textContent.includes("not committed") && els.configStatus.textContent.includes("Git can restore a tracked file"),
+    els.configStatus.textContent);
+
+  // 21. reset: 412 clears the name and offers Re-check; nothing is deleted
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  const freshB = project("repo-b"); freshB.schema.fingerprint = "sha256:repo-b-schema-2";
+  respond = (url, init) => {
+    if (!init.method) return { status: 200, body: freshB };
+    const fp = ifMatch({ init });
+    if (JSON.parse(init.body).dry_run)
+      return { status: 200, body: { ok: true, written: false, fingerprint: fp.slice(1, -1), removed: { node_types: ["Runbook"], relationships: [] },
+        warnings: ["Removing node type Runbook deletes its nodes on the next rescan."], notes: [], scope: project("repo-b") } };
+    return { status: 412, body: { detail: { code: "stale", message: "devgraph.schema.yaml changed on disk", scope: freshB } } };
+  };
+  await buttons(card("repo-b"), "Reset devgraph.schema.yaml…")[0].fire("click");
+  check("a schema reset dry-runs /reset/schema", fetchCalls[0].url === "/api/config/repo-b/reset/schema" &&
+    els.configResetList.textContent.includes("Node type Runbook"), JSON.stringify(fetchCalls));
+  els.configResetTyped.value = "repo-b";
+  await els.configResetTyped.fire("input");
+  await press(els.configResetConfirm);
+  check("a 412 keeps the dialog open and says the file changed",
+    els.configResetModal.classList.contains("open") && /changed since this list was made/.test(els.configResetError.textContent) &&
+    shown(els.configResetError), els.configResetError.textContent);
+  check("...clears the typed name and the stale list", els.configResetTyped.value === "" && els.configResetList.children.length === 0 &&
+    !shown(els.configResetPhraseField) && els.configResetConfirm.disabled === true, els.configResetList.textContent);
+  check("...and offers Re-check", shown(els.configResetRecheck), els.configResetRecheck.style.display);
+  fetchCalls = [];
+  await els.configResetRecheck.fire("click");
+  await new Promise(r => setTimeout(r, 0));
+  check("Re-check fetches the scope, then dry-runs again with its current fingerprint",
+    fetchCalls.length === 2 && fetchCalls[0].url === "/api/config/repo-b" && body(fetchCalls[1]).dry_run === true &&
+    ifMatch(fetchCalls[1]) === '"sha256:repo-b-schema-2"', JSON.stringify(fetchCalls));
+  check("...shows the list again and hides itself", els.configResetList.textContent.includes("Node type Runbook") &&
+    !shown(els.configResetRecheck) && !shown(els.configResetError), els.configResetList.textContent);
+  api.configModalKey({ key: "Escape" });
+  check("Escape closes the reset dialog", !els.configResetModal.classList.contains("open") && api.reset === null, els.configResetModal.className);
+
+  // 22. the global store asks for 'global', not the scope token
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, fingerprint: "sha256:g1",
+    removed: { tools: ["hot_paths"] }, warnings: [], notes: ["Removes 1 global tool(s) from every repository's MCP sessions."], scope: globalBlock(), global: globalBlock() } });
+  await buttons(card("__global__"), "Reset global-tools.json…")[0].fire("click");
+  check("a global reset asks for 'global'", els.configResetPhraseLabel.textContent === "Type global to reset" &&
+    els.configResetTitle.textContent === "Reset the global tools store", els.configResetPhraseLabel.textContent);
+  els.configResetTyped.value = "__global__";
+  await els.configResetTyped.fire("input");
+  check("...the scope token is not accepted", els.configResetConfirm.disabled === true, String(els.configResetConfirm.disabled));
+  els.configResetTyped.value = "global";
+  await els.configResetTyped.fire("input");
+  await press(els.configResetConfirm);
+  check("...'global' resets the store, then the page refreshes (every repo's override badges move)",
+    writes().length === 2 && writes()[1].url === "/api/config/__global__/reset/tools" && body(writes()[1]).dry_run === false &&
+    lastCall().url === "/api/config", JSON.stringify(fetchCalls));
+
+  // 23. reset: cancel while a request is in flight
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, fingerprint: "sha256:repo-a-tools",
+    removed: { tools: [] }, warnings: [], notes: [], scope: afterA, global: globalBlock() } });
+  gate = new Promise(r => { release = r; });
+  pending = buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0].fire("click");
+  await Promise.resolve();
+  els.configResetCancel.fire("click");
+  gate = null; release();
+  threw = null;
+  try { await pending; } catch (e) { threw = e; }
+  check("Cancel during the dry run: no error, no reset, dialog stays closed",
+    threw === null && fetchCalls.length === 1 && body(fetchCalls[0]).dry_run === true && !els.configResetModal.classList.contains("open"),
+    String(threw) + JSON.stringify(fetchCalls));
+  fetchCalls = [];
+  await buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0].fire("click");
+  els.configResetTyped.value = "repo-a";
+  await els.configResetTyped.fire("input");
+  clock += 1000;
+  gate = new Promise(r => { release = r; });
+  pending = els.configResetConfirm.fire("click");
+  await Promise.resolve();
+  check("Reset is disabled with busy text while it runs", els.configResetConfirm.disabled === true &&
+    els.configResetConfirm.textContent === "Resetting…", els.configResetConfirm.textContent);
+  els.configResetCancel.fire("click");
+  gate = null; release(); await pending;
+  check("Cancel during the reset itself: the dialog stays closed, the page still shows what is on disk",
+    !els.configResetModal.classList.contains("open") && fetchCalls.length === 2 &&
+    buttons(card("repo-a"), "Reset devgraph.tools.yaml…").length === 0, JSON.stringify(fetchCalls));
+
+  // 24. project-config switch
+  r = api.configToggleRequest("repo a", false, true);
+  check("configToggleRequest -> PUT /api/config/<repo>/project-config, JSON {enabled, dry_run}, no If-Match",
+    r.url === "/api/config/repo%20a/project-config" && r.init.method === "PUT" && r.init.headers["Content-Type"] === "application/json" &&
+    r.init.body === JSON.stringify({ enabled: false, dry_run: true }) && !("If-Match" in r.init.headers), JSON.stringify(r));
+  const switchOf = scope => find(card(scope), e => e.tagName === "INPUT" && e.type === "checkbox")[0];
+  const disabledA = () => {
+    const p = project("repo-a"); p.project_config_enabled = false; p.tools.state = "disabled";
+    p.tools.badges = [{ level: "muted", kind: "not-served", text: "Project config disabled", detail: "" }];
+    return p;
+  };
+  const NOTES = ["schema: applied at the next rescan (`devgraph rescan repo-a --now` to apply now)", "project tools: picked up by running MCP sessions within 2 s"];
+  let toggleWarnings = [];
+  let toggleFail = null;
+  respond = (url, init) => {
+    const b = JSON.parse(init.body);
+    if (!b.dry_run && toggleFail) return toggleFail;
+    const after = b.dry_run || b.enabled ? project("repo-a") : disabledA();
+    return { status: 200, body: { ok: true, written: !b.dry_run, changed: true, enabled: b.enabled,
+      warnings: b.dry_run ? toggleWarnings : [], notes: NOTES, scope: after, global: afterG } };
+  };
+  api.renderConfigPage(MODEL());
+  check("each project card has a Project config switch showing its state",
+    switchOf("repo-a") && switchOf("repo-a").checked === true && card("repo-a").textContent.includes("Project config") &&
+    find(card("__global__"), e => e.tagName === "INPUT").length === 0, card("repo-a").textContent);
+  fetchCalls = [];
+  let sw = switchOf("repo-a"); sw.checked = false; await sw.fire("change");
+  check("disabling without warnings: a dry run, then the write at once",
+    fetchCalls.length === 2 && body(fetchCalls[0]).dry_run === true && body(fetchCalls[1]).dry_run === false &&
+    body(fetchCalls[1]).enabled === false && fetchCalls.every(c => c.url === "/api/config/repo-a/project-config"), JSON.stringify(fetchCalls));
+  check("...the card re-renders off, with the disabled badge and the effect notes",
+    switchOf("repo-a").checked === false && card("repo-a").textContent.includes("Project config disabled") &&
+    NOTES.every(n => card("repo-a").textContent.includes(n)), card("repo-a").textContent);
+  check("...and the global card from its block", !!rowFor(card("__global__"), "after_reset_marker"), card("__global__").textContent);
+
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  sw = switchOf("repo-a"); sw.checked = true; await sw.fire("change");
+  check("enabling applies at once, no dry run", fetchCalls.length === 1 && body(fetchCalls[0]).enabled === true &&
+    body(fetchCalls[0]).dry_run === false, JSON.stringify(fetchCalls));
+
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  toggleWarnings = [HOSTILE + " no longer served", "Removing node type Runbook deletes its nodes on the next rescan."];
+  sw = switchOf("repo-a"); sw.checked = false; await sw.fire("change");
+  check("disabling with warnings stops after the dry run", fetchCalls.length === 1 && body(fetchCalls[0]).dry_run === true, JSON.stringify(fetchCalls));
+  check("...the switch still shows the server's state (on), held while the confirm is open",
+    switchOf("repo-a").checked === true && switchOf("repo-a").disabled === true, String(switchOf("repo-a").checked));
+  check("...and lists the warnings as text with 'Disable anyway'",
+    card("repo-a").textContent.includes(HOSTILE + " no longer served") && buttons(card("repo-a"), "Disable anyway").length === 1 &&
+    allEls.every(e => !e._html.includes("<img")), card("repo-a").textContent);
+  await buttons(card("repo-a"), "Disable anyway")[0].fire("click", 2);
+  for (let i = 0; i < 5; i++) { clock += 30; await buttons(card("repo-a"), "Disable anyway")[0].fire("click", 0); }
+  check("a double-click or held Enter cannot confirm before it arms", fetchCalls.length === 1, JSON.stringify(fetchCalls));
+  await press(buttons(card("repo-a"), "Disable anyway")[0]);
+  check("'Disable anyway' writes", fetchCalls.length === 2 && body(fetchCalls[1]).dry_run === false && body(fetchCalls[1]).enabled === false &&
+    switchOf("repo-a").checked === false, JSON.stringify(fetchCalls));
+
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  sw = switchOf("repo-a"); sw.checked = false; await sw.fire("change");
+  await press(buttons(card("repo-a"), "Cancel")[0]);
+  check("Cancel on the confirm: nothing written, the switch stays on and usable",
+    fetchCalls.length === 1 && switchOf("repo-a").checked === true && switchOf("repo-a").disabled === false &&
+    buttons(card("repo-a"), "Disable anyway").length === 0, JSON.stringify(fetchCalls));
+
+  toggleWarnings = [];
+  toggleFail = { status: 500, body: { detail: { code: "io", message: "could not update the registry" } } };
+  fetchCalls = [];
+  sw = switchOf("repo-a"); sw.checked = false; await sw.fire("change");
+  check("after an error the switch snaps back to the server's state and shows the error",
+    fetchCalls.length === 2 && switchOf("repo-a").checked === true && switchOf("repo-a").disabled === false &&
+    card("repo-a").textContent.includes("could not update the registry"), card("repo-a").textContent);
+  toggleFail = null;
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);

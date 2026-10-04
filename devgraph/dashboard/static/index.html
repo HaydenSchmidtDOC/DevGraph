@@ -403,7 +403,14 @@ table.dstable input[type="text"] { width: 100%; }
 .cfg-scope .card-head h3 { margin: 0; }
 .cfg-section { margin-top: 14px; }
 .cfg-section-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; color: var(--fg-2); margin-bottom: 6px; }
-.cfg-section-head .btn { margin-left: auto; text-transform: none; letter-spacing: 0; }
+.cfg-section-head .cfg-actions { margin-left: auto; text-transform: none; letter-spacing: 0; }
+.cfg-toggle { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.cfg-toggle-msg { font-size: 12px; line-height: 1.5; color: var(--muted); }
+.cfg-toggle-msg ul { margin: 2px 0 0 18px; }
+.cfg-toggle-msg .modal-actions { justify-content: flex-start; margin-top: 6px; }
+.cfg-reset-list { font-size: 12.5px; line-height: 1.5; }
+.cfg-reset-list ul { margin: 4px 0 8px 18px; }
+.cfg-reset-list .cfg-sub { font-size: 11.5px; }
 .cfg-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .cfg-chip { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-2); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; }
 .cfg-row-main { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
@@ -794,6 +801,13 @@ table.dstable input[type="text"] { width: 100%; }
   <div class="cfg-confirm" id="configModalConfirm" style="display:none"></div>
   <div class="cfg-error" id="configModalError" style="display:none"></div>
   <div class="modal-actions"><button class="btn btn-sm" id="configModalReload" style="display:none">Reload</button><button class="btn btn-sm" id="configModalCancel">Cancel</button><button class="btn btn-sm btn-primary" id="configModalSave">Save</button></div>
+</div></div>
+<div class="modal-overlay" id="configResetModal"><div class="modal-box cfg-modal-box">
+  <h4 id="configResetTitle"></h4>
+  <div class="cfg-reset-list" id="configResetList"></div>
+  <div class="field" id="configResetPhraseField" style="display:none"><label for="configResetTyped" id="configResetPhraseLabel"></label><input type="text" id="configResetTyped" autocomplete="off" spellcheck="false" /></div>
+  <div class="cfg-error" id="configResetError" style="display:none"></div>
+  <div class="modal-actions"><button class="btn btn-sm" id="configResetRecheck" style="display:none">Re-check</button><button class="btn btn-sm" id="configResetCancel">Cancel</button><button class="btn btn-sm btn-primary" id="configResetConfirm" disabled>Reset</button></div>
 </div></div>
 <div id="tooltipBubble"></div>
 <div id="gitHoverCard"></div>
@@ -2932,6 +2946,10 @@ let configModel = null;
 let configLoadSeq = 0;
 /* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, busy, label, armedAt } */
 let configEdit = null;
+/* the open reset dialog: { scope, kind, phrase, fingerprint, review, stale, busy, ready, armedAt } */
+let configReset = null;
+/* per repo: the project-config switch's last action { busy, confirm, error, notes, armedAt }; survives re-renders */
+const configToggles = {};
 
 function configEl(tag, cls, text) {
   const el = document.createElement(tag);
@@ -2979,14 +2997,17 @@ function configLockedChips(names) {
   });
   return box;
 }
-/* one sub-list: heading (title, file, file-level badges, Add), then its rows */
-function configSection(title, file, badges, onAdd, body) {
+/* one sub-list: heading (title, file, file-level badges, Reset, Add), then its rows */
+function configSection(title, file, badges, onAdd, body, onReset) {
   const sec = configEl("div", "cfg-section");
   const head = configEl("div", "cfg-section-head");
   head.appendChild(configEl("span", "", title));
   if (file) head.appendChild(configEl("span", "cfg-sub", file));
   (badges || []).forEach(b => head.appendChild(configBadgeEl(b)));
-  if (onAdd) head.appendChild(configButton("Add " + onAdd.noun, onAdd.fn));
+  const actions = configEl("div", "cfg-actions");
+  if (onReset) actions.appendChild(configButton("Reset " + file + "…", onReset));
+  if (onAdd) actions.appendChild(configButton("Add " + onAdd.noun, onAdd.fn));
+  if (actions.children.length) head.appendChild(actions);
   sec.appendChild(head);
   sec.appendChild(body);
   return sec;
@@ -3012,9 +3033,13 @@ function renderConfigScope(scope, block) {
   const head = configEl("div", "card-head");
   head.appendChild(configEl("h3", "", isGlobal ? "Global" : block.repo_id));
   if (!isGlobal) head.appendChild(configEl("span", "cfg-sub", block.display_path));
+  if (!isGlobal) head.appendChild(configToggleEl(block));
   card.appendChild(head);
+  if (!isGlobal && configToggles[scope]) card.appendChild(configToggleMsgEl(scope, configToggles[scope]));
   const add = section => ({ noun: CONFIG_SECTIONS[section].noun,
     fn: () => openConfigEditor({ scope, section, op: "add", name: null, yaml: CONFIG_SECTIONS[section].template }) });
+  /* a file that is not there has nothing to reset; an invalid one is when Reset matters most */
+  const reset = (part, kind) => part.state === "absent" || part.fingerprint === "absent" ? null : () => openConfigReset(scope, kind);
   const tools = block.tools;
   if (isGlobal) {
     card.appendChild(configSection("Nodes", null, [], null, configLockedChips(block.node_types.map(t => t.label))));
@@ -3022,15 +3047,15 @@ function renderConfigScope(scope, block) {
     const box = configEl("div", "");
     tools.builtin.forEach(t => box.appendChild(configRow(t.name, "", [configEl("span", "tool-desc", t.description || "")], [configLockEl()])));
     configEntryRows(box, scope, "tools", tools.entries, "name");
-    card.appendChild(configSection("Tools", tools.file, tools.badges, add("tools"), box));
+    card.appendChild(configSection("Tools", tools.file, tools.badges, add("tools"), box, reset(tools, "tools")));
   } else {
     const schema = block.schema;
     card.appendChild(configSection("Nodes", schema.file, schema.badges, add("node_types"),
-      configEntryRows(configEl("div", ""), scope, "node_types", schema.node_types, "label")));
+      configEntryRows(configEl("div", ""), scope, "node_types", schema.node_types, "label"), reset(schema, "schema")));
     card.appendChild(configSection("Relationships", schema.file, [], add("relationships"),
       configEntryRows(configEl("div", ""), scope, "relationships", schema.relationships, "type")));
     card.appendChild(configSection("Tools", tools.file, tools.badges, add("tools"),
-      configEntryRows(configEl("div", ""), scope, "tools", tools.entries, "name")));
+      configEntryRows(configEl("div", ""), scope, "tools", tools.entries, "name"), reset(tools, "tools")));
   }
   return card;
 }
@@ -3052,9 +3077,14 @@ function applyConfigScope(scope, block) {
   configLoadSeq++;
   if (scope === CONFIG_GLOBAL) configModel.global = block;
   else configModel.projects = configModel.projects.map(p => p.repo_id === scope ? block : p);
+  configRerender(scope);
+}
+/* redraw one card from the model (its toggle state changed, not its block) */
+function configRerender(scope) {
   const box = document.getElementById("configScopes");
   const old = [...box.children].find(c => c.dataset.scope === scope);
-  if (old) old.replaceWith(renderConfigScope(scope, block));
+  const block = configScopeBlock(scope);
+  if (old && block) old.replaceWith(renderConfigScope(scope, block));
 }
 /* op: add|replace|delete; section: tools|node_types|relationships */
 function configWriteRequest(op, scope, section, name, yaml, fingerprint, dryRun) {
@@ -3157,6 +3187,7 @@ function configCloseEditor() {
 }
 function configModalKey(ev) {
   if (ev.key === "Escape" && configEdit) configCloseEditor();
+  if (ev.key === "Escape" && configReset) configCloseReset();
 }
 function configSetError(text, reload) {
   document.getElementById("configModalError").textContent = text || "";
@@ -3266,6 +3297,238 @@ async function configReload() {
   edit.confirmed = false;
   renderConfigModal();
   configSetError("Reloaded the current file; your text is kept. Review it and save again.");
+}
+/* ── whole-file reset: a dry run lists what goes, then the scope's name typed
+   in full and an armed Reset; the confirm carries the dry run's fingerprint,
+   so a file that changed after it was listed is a 412 and nothing is deleted ── */
+/* kind: tools|schema */
+function configResetRequest(scope, kind, fingerprint, dryRun) {
+  return { url: "/api/config/" + encodeURIComponent(scope) + "/reset/" + encodeURIComponent(kind),
+    init: { method: "POST", headers: { "If-Match": '"' + fingerprint + '"', "Content-Type": "application/json" },
+      body: JSON.stringify({ dry_run: !!dryRun }) } };
+}
+/* what to type: the repo id, or "global" (nobody should have to type the __global__ token) */
+function configResetPhrase(scope) {
+  return scope === CONFIG_GLOBAL ? "global" : String(scope);
+}
+/* exact match only: no trimming, no case folding */
+function configResetReady(typed, phrase) {
+  return typeof typed === "string" && typed.length > 0 && typed === phrase;
+}
+const CONFIG_RESET_UNREADABLE = "The file is not valid YAML; its whole contents are removed.";
+function describeConfigReset(response) {
+  const r = (response && response.removed) || {};
+  const removed = [];
+  const list = (names, noun) => (names || []).forEach(n => removed.push(noun + " " + String(n)));
+  if ("tools" in r) {
+    if (r.tools === null) removed.push(CONFIG_RESET_UNREADABLE);
+    else list(r.tools, "Tool");
+  }
+  if ("node_types" in r || "relationships" in r) {
+    if (r.node_types === null || r.relationships === null) removed.push(CONFIG_RESET_UNREADABLE);
+    else { list(r.node_types, "Node type"); list(r.relationships, "Relationship"); }
+  }
+  return { removed, warnings: ((response && response.warnings) || []).map(String), notes: ((response && response.notes) || []).map(String) };
+}
+function configResetTitle(rs) {
+  if (rs.scope === CONFIG_GLOBAL) return "Reset the global tools store";
+  return "Reset " + (rs.kind === "tools" ? "devgraph.tools.yaml" : "devgraph.schema.yaml") + " (" + rs.scope + ")";
+}
+function configResetSetError(text) {
+  document.getElementById("configResetError").textContent = text || "";
+  configShow("configResetError", !!text);
+}
+function renderConfigReset() {
+  const rs = configReset;
+  document.getElementById("configResetTitle").textContent = configResetTitle(rs);
+  const box = document.getElementById("configResetList");
+  box.replaceChildren();
+  const section = (heading, items, cls) => {
+    if (!items.length) return;
+    box.appendChild(configEl("div", cls || "", heading));
+    const ul = configEl("ul", cls || "");
+    items.forEach(t => ul.appendChild(configEl("li", "", t)));
+    box.appendChild(ul);
+  };
+  if (rs.review) {
+    if (rs.review.removed.length) section("This removes:", rs.review.removed);
+    else box.appendChild(configEl("div", "", "Nothing is declared in this file."));
+    section("Check before resetting:", rs.review.warnings, "cfg-confirm");
+    section("After the reset:", rs.review.notes, "cfg-sub");
+  }
+  configShow("configResetPhraseField", !!rs.review);
+  document.getElementById("configResetPhraseLabel").textContent = "Type " + rs.phrase + " to reset";
+  const ready = !!rs.review && configResetReady(document.getElementById("configResetTyped").value, rs.phrase);
+  /* the button arms only a moment after it becomes pressable, like every changed confirm */
+  if (ready && !rs.ready) rs.armedAt = Date.now();
+  rs.ready = ready;
+  configShow("configResetRecheck", rs.stale);
+  const btn = document.getElementById("configResetConfirm");
+  btn.disabled = !ready || !!rs.busy;
+  btn.textContent = rs.busy || "Reset";
+}
+function configCloseReset() {
+  document.getElementById("configResetModal").classList.remove("open");
+  configReset = null;
+}
+/* a 412 at any step: the list is out of date, so it and the typed name go */
+function configResetFailed(rs, res) {
+  const detail = res.body && res.body.detail;
+  if (res.status === 412) {
+    rs.stale = true;
+    rs.review = null;
+    document.getElementById("configResetTyped").value = "";
+    configResetSetError("The file changed since this list was made; nothing was reset. Re-check to see what it holds now.");
+  } else {
+    configResetSetError(describeConfigError(res.status, detail));
+  }
+}
+/* the dry run; fresh: fetch the scope first (after a 412 the page's fingerprint is the stale one) */
+async function configResetCheck(rs, fresh) {
+  rs.review = null;
+  rs.stale = false;
+  document.getElementById("configResetTyped").value = "";
+  configResetSetError("");
+  rs.busy = "Checking…";
+  renderConfigReset();
+  try {
+    if (fresh) {
+      const cur = await configSend({ url: "/api/config/" + encodeURIComponent(rs.scope), init: {} });
+      if (configReset !== rs) return;
+      if (!cur.ok) { configResetSetError(describeConfigError(cur.status, cur.body && cur.body.detail)); return; }
+      applyConfigScope(rs.scope, cur.body);
+    }
+    const fp = configFingerprint(rs.scope, rs.kind);
+    const res = await configSend(configResetRequest(rs.scope, rs.kind, fp, true));
+    if (configReset !== rs) return;
+    if (!res.ok) { configResetFailed(rs, res); return; }
+    rs.fingerprint = String(res.body.fingerprint);
+    rs.review = describeConfigReset(res.body);
+  } finally {
+    rs.busy = "";
+    if (configReset === rs) renderConfigReset();
+  }
+}
+async function configResetConfirm(ev) {
+  const rs = configReset;
+  if (!rs || rs.busy || !rs.review || (ev && ev.detail > 1) || Date.now() - rs.armedAt < CONFIG_ARM_MS) return;
+  if (!configResetReady(document.getElementById("configResetTyped").value, rs.phrase)) return;
+  configResetSetError("");
+  rs.busy = "Resetting…";
+  renderConfigReset();
+  let res;
+  try {
+    res = await configSend(configResetRequest(rs.scope, rs.kind, rs.fingerprint, false));
+  } finally {
+    rs.busy = "";
+  }
+  const mine = configReset === rs;
+  if (!res.ok) {
+    if (mine) { configResetFailed(rs, res); renderConfigReset(); }
+    return;
+  }
+  if (mine) configCloseReset();
+  /* reset even if the dialog was cancelled meanwhile: the page shows what is on disk */
+  configSetStatus([...(res.body.warnings || []), ...(res.body.notes || [])].map(String)
+    .concat("Git can restore a tracked file; an untracked file or the global store cannot be restored."));
+  applyConfigScope(rs.scope, res.body.scope);
+  if (res.body.global && rs.scope !== CONFIG_GLOBAL) applyConfigScope(CONFIG_GLOBAL, res.body.global);
+  /* emptying the global store changes every repo's "overrides global" badges */
+  if (rs.scope === CONFIG_GLOBAL) await loadConfigPage(true);
+}
+/* kind: tools|schema */
+function openConfigReset(scope, kind) {
+  const rs = { scope, kind, phrase: configResetPhrase(scope), fingerprint: null, review: null, stale: false, busy: "", ready: false, armedAt: 0 };
+  configReset = rs;
+  const typed = document.getElementById("configResetTyped");
+  typed.value = "";
+  typed.oninput = () => { if (configReset) renderConfigReset(); };
+  document.getElementById("configResetConfirm").onclick = configResetConfirm;
+  document.getElementById("configResetRecheck").onclick = () => { if (configReset && !configReset.busy) configResetCheck(configReset, true); };
+  /* Cancel works mid-request too: each step checks it still owns the dialog after every await */
+  document.getElementById("configResetCancel").onclick = configCloseReset;
+  const modal = document.getElementById("configResetModal");
+  modal.onclick = ev => { if (ev.target === modal) configCloseReset(); };
+  configSetStatus("");
+  modal.classList.add("open");
+  return configResetCheck(rs, false);
+}
+/* ── project-config switch: the request names the end state (idempotent, no
+   If-Match). Turning it off dry-runs first and asks only when that warns; the
+   switch always shows the server's state, never the click's. ── */
+function configToggleRequest(repoId, enabled, dryRun) {
+  return { url: "/api/config/" + encodeURIComponent(repoId) + "/project-config",
+    init: { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: !!enabled, dry_run: !!dryRun }) } };
+}
+function configToggleEl(block) {
+  const st = configToggles[block.repo_id];
+  const wrap = configEl("label", "cfg-toggle");
+  wrap.appendChild(configEl("span", "cfg-sub", "Project config"));
+  const sw = configEl("span", "switch");
+  const input = configEl("input");
+  input.type = "checkbox";
+  input.checked = !!block.project_config_enabled;
+  input.disabled = !!(st && (st.busy || st.confirm));
+  input.addEventListener("change", () => toggleProjectConfig(block.repo_id, input.checked));
+  sw.appendChild(input);
+  sw.appendChild(configEl("span", "track"));
+  sw.appendChild(configEl("span", "thumb"));
+  wrap.appendChild(sw);
+  return wrap;
+}
+function configToggleMsgEl(repoId, st) {
+  const box = configEl("div", "cfg-toggle-msg");
+  const list = (items, cls) => {
+    const ul = configEl("ul", cls || "");
+    items.forEach(t => ul.appendChild(configEl("li", "", t)));
+    return ul;
+  };
+  if (st.busy) box.appendChild(configEl("div", "", st.busy));
+  if (st.error) box.appendChild(configEl("div", "cfg-error", st.error));
+  if (st.confirm) {
+    const panel = configEl("div", "cfg-confirm");
+    panel.appendChild(configEl("div", "", "Disabling project config for " + repoId + ":"));
+    panel.appendChild(list(st.confirm));
+    const actions = configEl("div", "modal-actions");
+    actions.appendChild(configButton("Cancel", () => { delete configToggles[repoId]; configRerender(repoId); }));
+    actions.appendChild(configButton("Disable anyway", ev => {
+      if (configToggles[repoId] !== st || (ev && ev.detail > 1) || Date.now() - st.armedAt < CONFIG_ARM_MS) return;
+      return toggleProjectConfig(repoId, false, true);
+    }));
+    panel.appendChild(actions);
+    box.appendChild(panel);
+  }
+  if (st.notes && st.notes.length) box.appendChild(list(st.notes));
+  return box;
+}
+async function toggleProjectConfig(repoId, enabled, confirmed) {
+  const st = { busy: enabled ? "Enabling…" : "Checking…", confirm: null, error: "", notes: [], armedAt: 0 };
+  configToggles[repoId] = st;
+  configRerender(repoId);
+  try {
+    if (!enabled && !confirmed) {
+      const dry = await configSend(configToggleRequest(repoId, false, true));
+      if (configToggles[repoId] !== st) return;
+      if (!dry.ok) { st.error = describeConfigError(dry.status, dry.body && dry.body.detail); return; }
+      const warnings = ((dry.body && dry.body.warnings) || []).map(String);
+      if (warnings.length) { st.confirm = warnings; st.armedAt = Date.now(); return; }
+    }
+    st.busy = enabled ? "Enabling…" : "Disabling…";
+    configRerender(repoId);
+    const res = await configSend(configToggleRequest(repoId, enabled, false));
+    if (!res.ok) {
+      if (configToggles[repoId] === st) st.error = describeConfigError(res.status, res.body && res.body.detail);
+      return;
+    }
+    if (configToggles[repoId] === st) st.notes = [...(res.body.warnings || []), ...(res.body.notes || [])].map(String);
+    st.busy = "";
+    applyConfigScope(repoId, res.body.scope);
+    /* the global card's "Overridden in" badges depend on which repos serve project tools */
+    if (res.body.global) applyConfigScope(CONFIG_GLOBAL, res.body.global);
+  } finally {
+    st.busy = "";
+    if (configToggles[repoId] === st) configRerender(repoId);
+  }
 }
 /* quiet: a background refresh (live event, after a write, pane activation).
    One while the pane is hidden is skipped: activating the pane reloads it. */
