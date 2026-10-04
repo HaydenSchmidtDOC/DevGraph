@@ -6,6 +6,10 @@ the MCP tool plane that will is a later unit. Every check here is static and
 defence in depth: when tools are served they also run in a read transaction
 with the server injecting `$repo_id`.
 
+Note: the $repo_id check proves the query references the injected parameter,
+not that it scopes every match — the tool plane's runtime (read transaction,
+injected repo_id) remains the real gate.
+
 Import this module directly, like `devgraph.config.project_schema`.
 """
 
@@ -22,6 +26,8 @@ TOOLS_FILENAME = "devgraph.tools.yaml"
 TOOLS_VERSION = 1
 
 #: The parameter the server always supplies; never declared, never overridable.
+#: The check here proves the query references it, not that it scopes every match —
+#: the tool plane's runtime (read transaction, injected repo_id) remains the real gate.
 INJECTED_PARAMETER = "repo_id"
 
 PARAMETER_TYPES: tuple[str, ...] = ("string", "integer", "float", "boolean")
@@ -35,7 +41,7 @@ MAX_TIMEOUT_S = 60
 #: Clauses a read-only tool may not contain. CALL is refused outright
 #: (procedures and subqueries alike) to keep the rule simple to audit.
 WRITE_KEYWORDS: tuple[str, ...] = (
-    "CREATE", "MERGE", "SET", "DELETE", "DETACH", "REMOVE", "DROP", "FOREACH", "CALL", "USE",
+    "CREATE", "INSERT", "MERGE", "SET", "DELETE", "DETACH", "REMOVE", "DROP", "FOREACH", "CALL", "USE",
 )
 
 ToolsVersion = Literal[TOOLS_VERSION]
@@ -45,8 +51,15 @@ ScalarDefault = str | int | float | bool | None
 # String literals, backtick-quoted names and comments: blanked before any
 # keyword or parameter scan, so text inside them never counts.
 _LITERALS = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`|//[^\n]*|/\*.*?\*/", re.S)
-_WRITES = re.compile(r"\bLOAD\s+CSV\b|\b(?:" + "|".join(WRITE_KEYWORDS) + r")\b", re.I)
-_PARAMETERS = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+# Lookarounds for keyword boundaries: not preceded by letter/underscore, not followed by letter/digit/underscore.
+_WRITES = re.compile(
+    r"(?<![A-Za-z_])(?:LOAD\s+CSV)(?![A-Za-z0-9_])|(?<![A-Za-z_])(?:" + "|".join(WRITE_KEYWORDS) + r")(?![A-Za-z0-9_])",
+    re.I
+)
+# Parameters: $identifier or $`backtick-quoted identifier`. Unicode-aware.
+_PARAMETERS = re.compile(r"\$(?:`([^`]+)`|([^\W\d]\w*))", re.UNICODE)
+# APOC references: apoc followed by . outside strings/comments (case-insensitive).
+_APOC = re.compile(r"(?<![A-Za-z_])apoc(?=[.\w])", re.I)
 
 
 class ProjectToolsError(Exception):
@@ -68,11 +81,34 @@ def write_clauses(query: str) -> list[str]:
 
 
 def query_parameters(query: str) -> set[str]:
-    """`$name` parameters a query uses, ignoring strings and comments."""
-    return set(_PARAMETERS.findall(_blank_literals(query)))
+    """`$name` or `$`name`` parameters a query uses, ignoring strings and comments.
+
+    Note: we scan the ORIGINAL query for parameters (before blanking backticks),
+    because backtick-quoted parameters like $`folder` need the backticks intact.
+    We then blank string literals and comments, but backtick-identifiers are fine
+    in parameter names.
+    """
+    result = set()
+    # Blank only string literals and comments, NOT backticks (which are used in $`param`)
+    blanked = re.sub(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|//[^\n]*|/\*.*?\*/",
+                     lambda m: " " * len(m.group(0)), query, flags=re.S)
+    for match in _PARAMETERS.finditer(blanked):
+        # Group 1 is backtick-quoted, group 2 is regular identifier
+        param = match.group(1) or match.group(2)
+        if param:
+            result.add(param)
+    return result
 
 
-def _check_name(value: str, kind: str) -> str:
+def has_apoc(query: str) -> bool:
+    """True if the query references apoc, ignoring strings and comments."""
+    return bool(_APOC.search(_blank_literals(query)))
+
+
+def _check_name(value: str, kind: str, allow_unicode: bool = False) -> str:
+    if kind == "parameter name" and allow_unicode:
+        # Parameter names can be unicode identifiers
+        return value
     if not NAME_PATTERN.fullmatch(value):
         raise ValueError(f"{kind} {value!r} must fullmatch {NAME_PATTERN.pattern}")
     return value
@@ -92,7 +128,7 @@ class ToolParameter(BaseModel):
     @field_validator("name")
     @classmethod
     def _valid_name(cls, value: str) -> str:
-        _check_name(value, "parameter name")
+        _check_name(value, "parameter name", allow_unicode=True)
         if value == INJECTED_PARAMETER:
             raise ValueError(
                 f"parameter {INJECTED_PARAMETER!r} is supplied by DevGraph for the "
@@ -154,6 +190,10 @@ class CypherTool(BaseModel):
 
     @model_validator(mode="after")
     def _valid_query(self) -> CypherTool:
+        if has_apoc(self.cypher):
+            raise ValueError(
+                f"tool {self.name!r} must be read-only; apoc references are not allowed"
+            )
         writes = write_clauses(self.cypher)
         if writes:
             raise ValueError(

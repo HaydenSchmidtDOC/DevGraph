@@ -180,6 +180,65 @@ def test_an_integer_default_is_a_valid_float(tmp_path):
     assert tool.parameters[0].default == 2
 
 
+def test_insert_is_a_write_keyword(tmp_path):
+    with pytest.raises(ProjectToolsError, match="read-only"):
+        load_text(tmp_path, tool_text("INSERT (m:X {repo_id: $repo_id}) RETURN 1"))
+
+
+def test_keyword_boundaries_digits_before(tmp_path):
+    with pytest.raises(ProjectToolsError, match="read-only"):
+        load_text(tmp_path, tool_text("RETURN 1CREATE (m:X {repo_id: $repo_id})"))
+
+
+def test_keyword_boundaries_digits_after(tmp_path):
+    with pytest.raises(ProjectToolsError, match="read-only"):
+        load_text(tmp_path, tool_text("WHERE n.x = 1SET n.y = 2 MATCH (m {repo_id: $repo_id}) RETURN m"))
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    ["n.created", "dataset", "settings", "callCount", ":CALLS", "_SET"],
+)
+def test_keyword_lookalikes_in_identifiers_are_fine(tmp_path, identifier):
+    cypher = f"MATCH (m {{repo_id: $repo_id}}) WHERE m.x = {identifier} RETURN m"
+    assert load_text(tmp_path, tool_text(cypher)).tools[0].name == "t"
+
+
+def test_apoc_references_are_rejected(tmp_path):
+    with pytest.raises(ProjectToolsError, match="apoc"):
+        load_text(tmp_path, tool_text("RETURN apoc.cypher.runFirstColumnSingle('CREATE (x)', {}) MATCH (m {repo_id: $repo_id}) RETURN m"))
+
+
+def test_apoc_in_string_is_fine(tmp_path):
+    cypher = "MATCH (m {repo_id: $repo_id}) WHERE m.note = 'apoc.x' RETURN m"
+    assert load_text(tmp_path, tool_text(cypher)).tools[0].name == "t"
+
+
+def test_apoc_case_insensitive(tmp_path):
+    with pytest.raises(ProjectToolsError, match="apoc"):
+        load_text(tmp_path, tool_text("RETURN APOC.x(123) MATCH (m {repo_id: $repo_id}) RETURN m"))
+
+
+def test_unicode_parameters_not_satisfied_by_repo_id(tmp_path):
+    with pytest.raises(ProjectToolsError, match=r"\$repo_id"):
+        load_text(tmp_path, tool_text("MATCH (m {repo_id: $repo_idé}) RETURN m"))
+
+
+def test_backtick_quoted_parameters_are_used(tmp_path):
+    tool = load_text(tmp_path, tool_text("MATCH (m {repo_id: $repo_id, x: $`folder`}) RETURN m", params="- name: folder")).tools[0]
+    assert tool.parameters[0].name == "folder"
+
+
+def test_unicode_parameters_are_declared_and_used(tmp_path):
+    tool = load_text(tmp_path, tool_text("MATCH (m {repo_id: $repo_id, x: $éx}) RETURN m", params="- name: éx")).tools[0]
+    assert tool.parameters[0].name == "éx"
+
+
+def test_unicode_parameter_undeclared_is_rejected(tmp_path):
+    with pytest.raises(ProjectToolsError, match="éx"):
+        load_text(tmp_path, tool_text("MATCH (m {repo_id: $repo_id, x: $éx}) RETURN m"))
+
+
 def test_helpers_ignore_literals():
     assert write_clauses("MATCH (n) WHERE n.x = 'CREATE' RETURN n") == []
     assert write_clauses("MATCH (n) DETACH DELETE n") == ["DETACH", "DELETE"]
