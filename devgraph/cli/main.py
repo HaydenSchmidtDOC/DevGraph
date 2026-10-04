@@ -36,6 +36,7 @@ from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
+from devgraph.paths import is_within
 from devgraph.registry.store import RepoRegistry
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
@@ -424,7 +425,7 @@ def annotate(
 
             if note is not None:
                 note_path = repo.path / note
-                if not str(note_path.resolve()).startswith(str(repo.path.resolve())):
+                if not is_within(note_path.resolve(), repo.path):
                     console.print("[red][X] Error:[/red] note path must be inside the repository")
                     raise typer.Exit(code=1)
 
