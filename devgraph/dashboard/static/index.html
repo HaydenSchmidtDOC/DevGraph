@@ -2918,8 +2918,10 @@ document.querySelectorAll(".settings-nav button").forEach(btn => btn.addEventLis
 const CONFIG_GLOBAL = "__global__";
 const CONFIG_LOCK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
 const CONFIG_SECTIONS = {
-  tools: { title: "Tools", noun: "tool", template: "name: my_tool\ndescription: What this tool answers, in one line an agent can choose it by.\ncypher: |\n  MATCH (n:Function {repo_id: $repo_id})\n  RETURN n.name AS name\n  LIMIT 25\n" },
-  node_types: { title: "Nodes", noun: "node type", template: "label: Runbook\nkey: [slug]\nmetadata:\n  - name: slug\n    type: string\n    required: true\n" },
+  tools: { title: "Tools", noun: "tool", template: "name: my_tool\ndescription: What this tool answers, in one line an agent can choose it by.\ncypher: |\n  MATCH (n:Function {repo_id: $repo_id})\n  RETURN n.name AS name\n  LIMIT 25\n",
+    entry: { name: "my_tool", description: "What this tool answers, in one line an agent can choose it by.", cypher: "MATCH (n:Function {repo_id: $repo_id})\nRETURN n.name AS name\nLIMIT 25\n" } },
+  node_types: { title: "Nodes", noun: "node type", template: "label: Runbook\nkey: [slug]\nmetadata:\n  - name: slug\n    type: string\n    required: true\n",
+    entry: { label: "Runbook", key: ["slug"], metadata: [{ name: "slug", type: "string", required: true }] } },
   relationships: { title: "Relationships", noun: "relationship", template: "# from and to must name node types that already exist: built-in, or declared in this file\ntype: DOCUMENTS\nprovider: custom\ncustom: {name: runbook_links}\nfrom: Runbook\nto: Service\n" },
 };
 /* the last /api/config payload; null until the pane is first opened */
@@ -3639,6 +3641,284 @@ async function loadConfigPage(quiet) {
   Object.values(configToggles).forEach(t => { t.notes = []; });
   for (const k of Object.keys(configOutcomes)) delete configOutcomes[k];
   renderConfigPage(res.body);
+}
+/* ── Config form editor: pure functions ──
+   The form is a view over the YAML textarea: it is built from the server's
+   parsed `entry` (the browser never parses YAML), turned back into a mapping,
+   and serialised into the textarea, which Save reads exactly as before.
+   CONFIG_FORM_FIELDS and CONFIG_FORM_LIMITS are checked against the models'
+   JSON Schema and the validators' constants by test_config_form_drift.py;
+   the serialiser is checked against yaml.safe_load by
+   test_config_form_roundtrip.py. Field lists are in model order, which is
+   also the order new keys are written in. */
+const CONFIG_FORM_FIELDS = {
+  tool: ["name", "description", "cypher", "parameters", "max_rows", "timeout_s"],
+  parameter: ["name", "type", "required", "default", "description"],
+  node_type: ["label", "key", "description", "color", "source", "metadata"],
+  metadata: ["name", "type", "required", "description"],
+  source: ["provider", "kind"],
+  parameter_types: ["string", "integer", "float", "boolean"],
+  metadata_types: ["string", "integer", "float", "boolean"],
+  filesystem_kinds: ["file", "folder"],
+  source_providers: ["filesystem"],
+};
+/* the validators' patterns (used as fullmatch) and limits, for advisory hints only */
+const CONFIG_FORM_LIMITS = {
+  NAME_PATTERN: "[a-z][a-z0-9_]{0,63}", LABEL_PATTERN: "[A-Za-z][A-Za-z0-9_]{0,63}",
+  PROPERTY_NAME_PATTERN: "[a-z][a-z0-9_]{0,63}", COLOR_PATTERN: "^#[0-9a-fA-F]{6}$",
+  MAX_DESCRIPTION_LENGTH: 1024, MAX_ROWS_LIMIT: 1000, MAX_TIMEOUT_S: 60, DEFAULT_MAX_ROWS: 100, DEFAULT_TIMEOUT_S: 10,
+};
+const CONFIG_FORM_REASONS = {
+  field: path => "This entry has a field the form doesn't edit: `" + path + "`. Edit it as YAML.",
+  keyOrder: "This entry's key order differs from its metadata order; the form can't show that. Edit it as YAML.",
+  keyName: name => "This entry's key names `" + name + "`, which is not one of its metadata fields; the form can't show that. Edit it as YAML.",
+  twice: name => "This entry declares metadata field `" + name + "` more than once; the form can't show that. Edit it as YAML.",
+  value: "This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML.",
+  section: "The form covers tools and node types; edit relationships as YAML.",
+  handEdit: "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form.",
+};
+const configIsMap = v => v !== null && typeof v === "object" && !Array.isArray(v);
+const configIsScalar = v => v === null || ["string", "number", "boolean"].includes(typeof v);
+const configFullMatch = (pattern, text) => new RegExp("^(?:" + pattern + ")$").test(text);
+/* the text a form control shows for a value */
+const configFormText = v => v === null || v === undefined ? "" : String(v);
+/* per field: what a value must be for the form to show it exactly */
+const CONFIG_FORM_CHECKS = {
+  tool: { name: v => typeof v === "string", description: v => typeof v === "string", cypher: v => typeof v === "string",
+    parameters: Array.isArray, max_rows: Number.isInteger, timeout_s: Number.isInteger },
+  parameter: { name: v => typeof v === "string", type: v => CONFIG_FORM_FIELDS.parameter_types.includes(v),
+    required: v => typeof v === "boolean", default: configIsScalar, description: v => v === null || typeof v === "string" },
+  node_type: { label: v => typeof v === "string", key: v => Array.isArray(v) && v.every(k => typeof k === "string"),
+    description: v => v === null || typeof v === "string", color: v => v === null || typeof v === "string",
+    source: v => v === null || configIsMap(v), metadata: Array.isArray },
+  metadata: { name: v => typeof v === "string", type: v => CONFIG_FORM_FIELDS.metadata_types.includes(v),
+    required: v => typeof v === "boolean", description: v => v === null || typeof v === "string" },
+  source: { provider: v => CONFIG_FORM_FIELDS.source_providers.includes(v), kind: v => CONFIG_FORM_FIELDS.filesystem_kinds.includes(v) },
+};
+/* the path of the first field of `map` the form can't show, or null */
+function configFormBadField(map, kind, prefix) {
+  for (const [k, v] of Object.entries(map)) {
+    if (!CONFIG_FORM_FIELDS[kind].includes(k) || !CONFIG_FORM_CHECKS[kind][k](v)) return prefix + k;
+  }
+  return null;
+}
+function configFormBadRows(rows, kind, prefix) {
+  for (let i = 0; i < rows.length; i++) {
+    const bad = configIsMap(rows[i]) ? configFormBadField(rows[i], kind, prefix + i + ".") : prefix + i;
+    if (bad) return bad;
+  }
+  return null;
+}
+/* {ok: true, form} when the form can show `entry` exactly, else {ok: false, reason} */
+function configFormFromEntry(section, entry) {
+  if (section !== "tools" && section !== "node_types") return { ok: false, reason: CONFIG_FORM_REASONS.section };
+  if (!configIsMap(entry)) return { ok: false, reason: CONFIG_FORM_REASONS.value };
+  const t = configFormText;
+  if (section === "tools") {
+    const bad = configFormBadField(entry, "tool", "") || configFormBadRows(entry.parameters || [], "parameter", "parameters.");
+    if (bad) return { ok: false, reason: CONFIG_FORM_REASONS.field(bad) };
+    return { ok: true, form: {
+      name: t(entry.name), description: t(entry.description), cypher: t(entry.cypher),
+      max_rows: t(entry.max_rows), timeout_s: t(entry.timeout_s),
+      parameters: (entry.parameters || []).map(p => ({ name: t(p.name), type: p.type || "string",
+        required: "required" in p ? p.required : true, default: t(p.default), description: t(p.description), open: p })),
+      open: entry } };
+  }
+  const metadata = entry.metadata || [];
+  let bad = configFormBadField(entry, "node_type", "") || configFormBadRows(metadata, "metadata", "metadata.");
+  if (!bad && configIsMap(entry.source)) {
+    bad = configFormBadField(entry.source, "source", "source.") ||
+      CONFIG_FORM_FIELDS.source.map(k => "source." + k).find(k => !(k.slice(7) in entry.source)) || null;
+  }
+  if (bad) return { ok: false, reason: CONFIG_FORM_REASONS.field(bad) };
+  const names = metadata.map(m => m.name);
+  const twice = names.find((n, i) => names.indexOf(n) !== i);
+  if (twice !== undefined) return { ok: false, reason: CONFIG_FORM_REASONS.twice(twice) };
+  const key = entry.key || [];
+  const missing = key.find(k => !names.includes(k));
+  if (missing !== undefined) return { ok: false, reason: CONFIG_FORM_REASONS.keyName(missing) };
+  if (key.some((k, i) => i && names.indexOf(k) <= names.indexOf(key[i - 1]))) return { ok: false, reason: CONFIG_FORM_REASONS.keyOrder };
+  return { ok: true, form: {
+    label: t(entry.label), description: t(entry.description), color: t(entry.color),
+    source: entry.source ? entry.source.kind : "",
+    metadata: metadata.map(m => ({ name: t(m.name), type: m.type || "string", required: m.required === true,
+      key: key.includes(m.name), description: t(m.description), open: m })),
+    open: entry } };
+}
+/* The rules that keep a form edit from rewriting what it didn't touch: a field
+   whose control still shows the opened value keeps that exact value (so null,
+   "", "12" for an integer stay as they were); an emptied field is omitted. */
+function configFormPut(vals, open, key, text, coerce, same = true) {
+  if (same && key in open && configFormText(open[key]) === text) vals[key] = open[key];
+  else if (text !== "") vals[key] = coerce(text);
+}
+/* a choice with a model default: written when the entry had it or it differs from the default */
+function configFormPutChoice(vals, open, key, value, dflt) {
+  if (key in open || value !== dflt) vals[key] = value;
+}
+function configFormOrdered(vals, order, model) {
+  const out = {};
+  for (const k of order.concat(model)) if (k in vals && !(k in out)) out[k] = vals[k];
+  return out;
+}
+const configFormInt = text => /^-?\d+$/.test(text) && Number.isSafeInteger(Number(text)) ? Number(text) : text;
+const configFormFloat = text => /^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(text) && Number.isFinite(Number(text)) ? Number(text) : text;
+const CONFIG_FORM_DEFAULTS = {
+  integer: configFormInt, float: configFormFloat, string: text => text,
+  boolean: text => text === "true" ? true : text === "false" ? false : text,
+};
+/* the mapping the form state stands for; `order` is the opened entry's key order */
+function configEntryFromForm(section, form, order) {
+  const open = form.open || {};
+  order = order || Object.keys(open);
+  const id = text => text;
+  const vals = {};
+  if (section === "tools") {
+    configFormPut(vals, open, "name", form.name, id);
+    configFormPut(vals, open, "description", form.description, id);
+    configFormPut(vals, open, "cypher", form.cypher, id);
+    const rows = form.parameters.map(p => {
+      const o = p.open || {}, v = {};
+      configFormPut(v, o, "name", p.name, id);
+      configFormPutChoice(v, o, "type", p.type, "string");
+      configFormPutChoice(v, o, "required", p.required, true);
+      configFormPut(v, o, "default", p.default, CONFIG_FORM_DEFAULTS[p.type] || id, p.type === (o.type || "string"));
+      configFormPut(v, o, "description", p.description, id);
+      return configFormOrdered(v, Object.keys(o), CONFIG_FORM_FIELDS.parameter);
+    });
+    if (rows.length || "parameters" in open) vals.parameters = rows;
+    configFormPut(vals, open, "max_rows", form.max_rows, configFormInt);
+    configFormPut(vals, open, "timeout_s", form.timeout_s, configFormInt);
+    return configFormOrdered(vals, order, CONFIG_FORM_FIELDS.tool);
+  }
+  configFormPut(vals, open, "label", form.label, id);
+  const key = form.metadata.filter(m => m.key).map(m => m.name);
+  if (key.length || "key" in open) vals.key = key;
+  configFormPut(vals, open, "description", form.description, id);
+  configFormPut(vals, open, "color", form.color, id);
+  if ("source" in open && (open.source ? open.source.kind : "") === form.source) vals.source = open.source;
+  else if (form.source) vals.source = { provider: "filesystem", kind: form.source };
+  const rows = form.metadata.map(m => {
+    const o = m.open || {}, v = {};
+    configFormPut(v, o, "name", m.name, id);
+    configFormPutChoice(v, o, "type", m.type, "string");
+    configFormPutChoice(v, o, "required", m.required, false);
+    configFormPut(v, o, "description", m.description, id);
+    return configFormOrdered(v, Object.keys(o), CONFIG_FORM_FIELDS.metadata);
+  });
+  if (rows.length || "metadata" in open) vals.metadata = rows;
+  return configFormOrdered(vals, order, CONFIG_FORM_FIELDS.node_type);
+}
+/* PyYAML refuses these characters anywhere in a stream (or, for \x85 and
+   \u2028/\u2029, reads them as line breaks), so a quoted string escapes them */
+const CONFIG_YAML_UNSAFE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029\ufffe\uffff]/;
+const CONFIG_YAML_ESCAPE = /[\x7f-\x9f\u2028\u2029\ufffe\uffff]/g;
+/* one scalar as YAML; `indent` is a literal block's content indent; `flow`
+   rules a block out (inside [ ]) */
+function configYamlScalar(value, indent = "  ", flow = false) {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    /* YAML 1.1 reads 1e-7 as a string: a float needs a dot */
+    const s = String(value);
+    return /[.]|^-?\d+$/.test(s) ? s : s.replace("e", ".0e");
+  }
+  const s = String(value);
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(s) && !/^(y|n|yes|no|on|off|true|false|null)$/i.test(s)) return s;
+  const body = s.endsWith("\n") ? s.slice(0, -1) : s;
+  const first = body.split("\n").find(l => l) || "";
+  if (!flow && body.includes("\n") && !body.endsWith("\n") && first && !/^[ \t]/.test(first) &&
+      !s.includes("\r") && !CONFIG_YAML_UNSAFE.test(s)) {
+    return (s.endsWith("\n") ? "|" : "|-") + "\n" + body.split("\n").map(l => l ? indent + l : "").join("\n");
+  }
+  /* a JSON string literal is a valid YAML double-quoted scalar */
+  return JSON.stringify(s).replace(CONFIG_YAML_ESCAPE, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+}
+function configYamlLines(map, keys, indent) {
+  const lines = [];
+  for (const k of keys) {
+    const v = map[k];
+    if (Array.isArray(v) && v.length && v.every(configIsMap)) {
+      lines.push(indent + k + ":");
+      for (const item of v) {
+        const sub = configYamlLines(item, Object.keys(item), indent + "    ");
+        if (!sub.length) { lines.push(indent + "  - {}"); continue; }
+        sub[0] = indent + "  - " + sub[0].slice(indent.length + 4);
+        lines.push(...sub);
+      }
+    } else if (Array.isArray(v)) {
+      lines.push(indent + k + ": [" + v.map(x => configYamlScalar(x, "", true)).join(", ") + "]");
+    } else if (configIsMap(v)) {
+      const sub = configYamlLines(v, Object.keys(v), indent + "  ");
+      lines.push(indent + k + ":" + (sub.length ? "" : " {}"), ...sub);
+    } else {
+      lines.push(indent + k + ": " + configYamlScalar(v, indent + "  "));
+    }
+  }
+  return lines;
+}
+/* the YAML text for one entry mapping: keys in `order`, then model order */
+function configEntryYaml(section, mapping, order) {
+  const model = section === "tools" ? CONFIG_FORM_FIELDS.tool : CONFIG_FORM_FIELDS.node_type;
+  const keys = Object.keys(configFormOrdered(mapping, order || [], model.concat(Object.keys(mapping))));
+  return configYamlLines(mapping, keys, "").join("\n") + "\n";
+}
+/* advisory hints [{field, text}]: cheap structural checks that never block Save */
+function configFormHints(section, form) {
+  const L = CONFIG_FORM_LIMITS, out = [];
+  const hint = (field, text) => out.push({ field, text });
+  const intIn = (text, max) => /^-?\d+$/.test(text) && Number(text) >= 1 && Number(text) <= max;
+  const dupes = (rows, prefix, noun) => rows.forEach((r, i) => {
+    if (r.name && rows.findIndex(o => o.name === r.name) < i) hint(prefix + i + ".name", "Another " + noun + " is also named " + r.name + ".");
+  });
+  const nameHint = (field, text, pattern, noun) => {
+    if (!text) hint(field, noun + " is required.");
+    else if (!configFullMatch(pattern, text)) hint(field, noun + " must be lowercase letters, digits and underscores, starting with a letter (at most 64 characters).");
+  };
+  if (section === "tools") {
+    nameHint("name", form.name, L.NAME_PATTERN, "Name");
+    const description = form.description.trim();
+    if (!description) hint("description", "A description is required: it is what an agent reads to choose the tool.");
+    else if ([...description].length > L.MAX_DESCRIPTION_LENGTH) {
+      hint("description", "The description is " + [...description].length + " characters; the limit is " + L.MAX_DESCRIPTION_LENGTH + ".");
+    }
+    if (!form.cypher.trim()) hint("cypher", "A Cypher query is required.");
+    else if (!/\$(repo_id\b|`repo_id`)/.test(form.cypher)) hint("cypher", "The query doesn't appear to filter on `$repo_id`; DevGraph supplies it and every tool must use it.");
+    form.parameters.forEach((p, i) => {
+      if (!p.name) hint("parameters." + i + ".name", "A parameter name is required.");
+      if (p.default === "") return;
+      if (p.required) hint("parameters." + i + ".default", "A default makes the parameter optional: untick Required.");
+      const coerce = CONFIG_FORM_DEFAULTS[p.type];
+      if (coerce && typeof coerce(p.default) === "string" && p.type !== "string") {
+        hint("parameters." + i + ".default", p.default + " doesn't read as " + (p.type === "integer" ? "an " : "a ") + p.type + ".");
+      }
+    });
+    dupes(form.parameters, "parameters.", "parameter");
+    if (form.max_rows && !intIn(form.max_rows, L.MAX_ROWS_LIMIT)) hint("max_rows", "Max rows must be a whole number from 1 to " + L.MAX_ROWS_LIMIT + ".");
+    if (form.timeout_s && !intIn(form.timeout_s, L.MAX_TIMEOUT_S)) hint("timeout_s", "The timeout must be a whole number of seconds from 1 to " + L.MAX_TIMEOUT_S + ".");
+    return out;
+  }
+  if (!form.label) hint("label", "A label is required.");
+  else if (!configFullMatch(L.LABEL_PATTERN, form.label)) hint("label", "A label must start with a letter and use only letters, digits and underscores (at most 64 characters).");
+  const key = form.metadata.filter(m => m.key);
+  if (!key.length) hint("key", "Tick Key on at least one metadata field: it is what identifies each node.");
+  form.metadata.forEach((m, i) => nameHint("metadata." + i + ".name", m.name, L.PROPERTY_NAME_PATTERN, "A field name"));
+  dupes(form.metadata, "metadata.", "field");
+  if (form.color && !configFullMatch(L.COLOR_PATTERN, form.color)) hint("color", "A colour is written as #rrggbb.");
+  if (form.source && !(key.length === 1 && key[0].name === "path" && key[0].type === "string")) {
+    hint("source", "A filesystem node type's key must be exactly one string field named path.");
+  }
+  return out;
+}
+/* Can the editor (back) in YAML mode show the form for `text`? Only for text
+   whose mapping is known: the form's own last output (restore its state) or
+   the opening text (rebuild from the opening entry). */
+function configFormSwitch(edit, text) {
+  const rep = configFormFromEntry(edit.section, edit.openEntry);
+  if (!rep.ok) return { available: false, restore: null, reason: rep.reason };
+  if (edit.formState && text === edit.formText) return { available: true, restore: "state", reason: null };
+  if (text === edit.openText) return { available: true, restore: "open", reason: null };
+  return { available: false, restore: null, reason: CONFIG_FORM_REASONS.handEdit };
 }
 /* ── end Config page ── */
 document.getElementById("btnConfigReload").addEventListener("click", () => loadConfigPage());

@@ -98,6 +98,7 @@ const api = new Function(...Object.keys(globals),
   configSrc + "\nreturn { CONFIG_GLOBAL, renderConfigPage, renderConfigScope, configWriteRequest, describeConfigError," +
   " openConfigEditor, configEditTarget, configCopyDestinations, configCanCopy, loadConfigPage, applyConfigScope, configModalKey, CONFIG_SECTIONS," +
   " configResetRequest, configResetPhrase, configResetReady, describeConfigReset, configToggleRequest," +
+  " configFormFromEntry, configEntryFromForm, configYamlScalar, configEntryYaml, configFormHints, configFormSwitch," +
   " get model() { return configModel; }, get edit() { return configEdit; }, get reset() { return configReset; } };")(...Object.values(globals));
 
 // --- fixtures -----------------------------------------------------------
@@ -1402,6 +1403,215 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   cypherRow = rowFor(card("__global__"), "run_cypher");
   check("run_cypher's state is the dashboard process's environment, not every MCP session's",
     /off for MCP sessions started with this environment/.test(cypherRow.textContent), cypherRow.textContent);
+
+  // 36. the form shows only entries it can carry exactly
+  const j = v => JSON.stringify(v);
+  const CY = "MATCH (n {repo_id: $repo_id})\nRETURN n\n";
+  const TOOL_OK = () => ({ name: "hot_paths", description: "d", cypher: CY, parameters: [
+    { name: "s" }, { name: "i", type: "integer", required: false, default: 3 },
+    { name: "f", type: "float", required: false, default: 0.5, description: "Rows." },
+    { name: "b", type: "boolean", required: false, default: true, description: null }], max_rows: 200, timeout_s: 5 });
+  const NODE_OK = () => ({ label: "Runbook", key: ["slug", "team"], description: null, color: "#1f77b4", metadata: [
+    { name: "slug", type: "string", required: true }, { name: "owner", description: "Who" }, { name: "team", type: "integer" }] });
+  const okEntries = [["tools", TOOL_OK()], ["tools", { name: "x" }], ["tools", { description: "only" }],
+    ["node_types", NODE_OK()], ["node_types", { ...NODE_OK(), source: null }],
+    ["node_types", { label: "Doc", key: ["path"], source: { provider: "filesystem", kind: "file" }, metadata: [{ name: "path" }] }],
+    ["node_types", { label: "Dir", source: { kind: "folder", provider: "filesystem" }, key: ["path"], metadata: [{ name: "path" }] }],
+    ["node_types", api.CONFIG_SECTIONS.node_types.entry], ["tools", api.CONFIG_SECTIONS.tools.entry]];
+  okEntries.forEach(([section, e], i) => {
+    const rep = api.configFormFromEntry(section, e);
+    check("the form can show representable " + section + " entry #" + i, rep.ok && rep.form, j(rep));
+  });
+  const FIELD = p => "This entry has a field the form doesn't edit: `" + p + "`. Edit it as YAML.";
+  const ORDER = "This entry's key order differs from its metadata order; the form can't show that. Edit it as YAML.";
+  const VALUE = "This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML.";
+  const refusals = [
+    ["an unknown tool key", "tools", { ...TOOL_OK(), version: 1 }, FIELD("version")],
+    ["an unknown parameter key", "tools", { ...TOOL_OK(), parameters: [{ name: "x", kind: "y" }] }, FIELD("parameters.0.kind")],
+    ["a parameter type outside the enum", "tools", { ...TOOL_OK(), parameters: [{ name: "x" }, { name: "y", type: "text" }] }, FIELD("parameters.1.type")],
+    ["a non-boolean required", "tools", { ...TOOL_OK(), parameters: [{ name: "x", required: "yes" }] }, FIELD("parameters.0.required")],
+    ["a list default", "tools", { ...TOOL_OK(), parameters: [{ name: "x", default: [1] }] }, FIELD("parameters.0.default")],
+    ["a boolean max_rows", "tools", { ...TOOL_OK(), max_rows: true }, FIELD("max_rows")],
+    ["a fractional timeout", "tools", { ...TOOL_OK(), timeout_s: 1.5 }, FIELD("timeout_s")],
+    ["a null description", "tools", { ...TOOL_OK(), description: null }, FIELD("description")],
+    ["parameters that are not a list", "tools", { ...TOOL_OK(), parameters: { name: "x" } }, FIELD("parameters")],
+    ["an entry JSON couldn't carry", "tools", null, VALUE],
+    ["an unknown node type key", "node_types", { ...NODE_OK(), extends: "x" }, FIELD("extends")],
+    ["a key order differing from metadata order", "node_types", { ...NODE_OK(), key: ["team", "slug"] }, ORDER],
+    ["a repeated key component", "node_types", { ...NODE_OK(), key: ["slug", "slug"] }, ORDER],
+    ["a key naming no metadata row", "node_types", { ...NODE_OK(), key: ["slug", "nope"] },
+      "This entry's key names `nope`, which is not one of its metadata fields; the form can't show that. Edit it as YAML."],
+    ["a string key", "node_types", { ...NODE_OK(), key: "slug" }, FIELD("key")],
+    ["a source with an extra key", "node_types", { ...NODE_OK(), source: { provider: "filesystem", kind: "file", glob: "*" } }, FIELD("source.glob")],
+    ["a source with another provider", "node_types", { ...NODE_OK(), source: { provider: "git", kind: "file" } }, FIELD("source.provider")],
+    ["a source with no kind", "node_types", { ...NODE_OK(), source: { provider: "filesystem" } }, FIELD("source.kind")],
+    ["an unknown metadata key", "node_types", { ...NODE_OK(), metadata: [{ name: "slug", unique: true }] }, FIELD("metadata.0.unique")],
+    ["a metadata type outside the enum", "node_types", { ...NODE_OK(), metadata: [{ name: "slug", type: "date" }] }, FIELD("metadata.0.type")],
+    ["a metadata field declared twice", "node_types", { label: "X", key: ["a"], metadata: [{ name: "a" }, { name: "a" }] },
+      "This entry declares metadata field `a` more than once; the form can't show that. Edit it as YAML."],
+    ["a relationship", "relationships", { type: "DOCUMENTS" }, "The form covers tools and node types; edit relationships as YAML."],
+  ];
+  refusals.forEach(([what, section, e, reason]) => {
+    const rep = api.configFormFromEntry(section, e);
+    check("the form refuses " + what + ", saying why", !rep.ok && rep.reason === reason, j(rep));
+  });
+
+  // 37. form state -> mapping
+  const back = (section, e) => api.configEntryFromForm(section, api.configFormFromEntry(section, e).form, Object.keys(e));
+  okEntries.concat([["tools", { cypher: CY, name: "n", description: "", parameters: [], max_rows: 100 }],
+    ["tools", { name: "n", parameters: [{ name: "p", type: "string", required: true, default: null, description: "" }] }],
+    ["tools", { name: "n", parameters: [{ name: "p", type: "integer", default: "12" }, { name: "q", type: "boolean", default: "yes" },
+      { name: "r", type: "float", default: 1e21 }, { name: "s", default: "" }] }],
+    ["node_types", { label: "N", key: [], metadata: [], description: "", color: null, source: null }],
+    ["node_types", { metadata: [{ description: null, required: false, name: "a", type: "string" }], key: ["a"], label: "N" }]])
+    .forEach(([section, e], i) => {
+      check("mapping -> form -> mapping is the identity, key order included (" + section + " #" + i + ")", j(back(section, e)) === j(e), j(back(section, e)));
+    });
+  const toolForm = e => api.configFormFromEntry("tools", e).form;
+  let tf = toolForm(api.CONFIG_SECTIONS.tools.entry);
+  tf.max_rows = "250"; tf.timeout_s = "abc"; tf.description = "";
+  tf.parameters.push({ name: "i", type: "integer", required: false, default: "12", description: "" },
+    { name: "f", type: "float", required: false, default: "2.5", description: "" },
+    { name: "g", type: "float", required: false, default: "0x10", description: "" },
+    { name: "h", type: "integer", required: false, default: "1.5", description: "" },
+    { name: "b", type: "boolean", required: false, default: "false", description: "" },
+    { name: "s", type: "string", required: false, default: "12", description: "" },
+    { name: "r", type: "string", required: true, default: "", description: "Plain." });
+  let m = api.configEntryFromForm("tools", tf, ["name", "description", "cypher"]);
+  check("integer text becomes a number, other text stays the string typed",
+    m.max_rows === 250 && m.timeout_s === "abc", j(m));
+  check("typed defaults: integer and float text become numbers, a boolean select a boolean, the rest stays text",
+    j(m.parameters.map(p => p.default)) === j([12, 2.5, "0x10", "1.5", false, "12", undefined]), j(m.parameters));
+  check("an emptied description is omitted", !("description" in m), j(m));
+  check("model defaults are not written into new rows (type string, required true)",
+    j(m.parameters[6]) === j({ name: "r", description: "Plain." }), j(m.parameters[6]));
+  check("a new row's keys come in model order", j(Object.keys(m.parameters[0])) === j(["name", "type", "required", "default"]),
+    j(m.parameters[0]));
+  check("new keys follow the opened ones in model order",
+    j(Object.keys(m)) === j(["name", "cypher", "parameters", "max_rows", "timeout_s"]), j(Object.keys(m)));
+  tf = toolForm({ cypher: CY, name: "n", description: "d", parameters: [{ required: true, type: "string", name: "p" }] });
+  tf.max_rows = "5";
+  m = api.configEntryFromForm("tools", tf, ["cypher", "name", "description", "parameters"]);
+  check("a hand-ordered entry keeps its order; a new key goes last",
+    j(Object.keys(m)) === j(["cypher", "name", "description", "parameters", "max_rows"]), j(m));
+  check("defaults the opened entry spelled out are kept", j(m.parameters[0]) === j({ required: true, type: "string", name: "p" }), j(m));
+  tf.parameters[0].required = false; tf.parameters[0].type = "integer"; tf.parameters[0].default = "3";
+  m = api.configEntryFromForm("tools", tf, ["cypher", "name", "description", "parameters"]);
+  check("a changed row keeps its own key order", j(m.parameters[0]) === j({ required: false, type: "integer", name: "p", default: 3 }), j(m));
+  tf = toolForm({ name: "n", parameters: [{ name: "p", type: "string", required: false, default: "5" }] });
+  tf.parameters[0].type = "integer";
+  m = api.configEntryFromForm("tools", tf, ["name", "parameters"]);
+  check("a default re-reads as its new type when the type changes", m.parameters[0].default === 5, j(m));
+  tf = toolForm({ name: "n", description: "d", max_rows: 7 });
+  tf.description = ""; tf.max_rows = "";
+  m = api.configEntryFromForm("tools", tf, ["name", "description", "max_rows"]);
+  check("clearing optional fields removes them", j(m) === j({ name: "n" }), j(m));
+  tf = toolForm({ name: "n", parameters: [{ name: "p" }] });
+  tf.parameters = [];
+  m = api.configEntryFromForm("tools", tf, ["name", "parameters"]);
+  check("an emptied list the entry had stays as an empty list", j(m) === j({ name: "n", parameters: [] }), j(m));
+  const nodeForm = e => api.configFormFromEntry("node_types", e).form;
+  let nf = nodeForm(api.CONFIG_SECTIONS.node_types.entry);
+  check("key components are ticks on metadata rows", nf.metadata[0].key === true, j(nf));
+  nf.metadata.push({ name: "path", type: "string", required: false, key: true, description: "" },
+    { name: "owner", type: "string", required: true, key: false, description: "" });
+  nf.description = "Runbooks."; nf.color = "#00ff00"; nf.source = "folder";
+  m = api.configEntryFromForm("node_types", nf, ["label", "key", "metadata"]);
+  check("the key is the ticked rows' names in row order", j(m.key) === j(["slug", "path"]), j(m));
+  check("a new metadata row omits model defaults", j(m.metadata.slice(1)) === j([{ name: "path" }, { name: "owner", required: true }]), j(m));
+  check("a filesystem source is {provider, kind}", j(m.source) === j({ provider: "filesystem", kind: "folder" }), j(m));
+  check("node type keys: opened order, then model order",
+    j(Object.keys(m)) === j(["label", "key", "metadata", "description", "color", "source"]), j(Object.keys(m)));
+  nf = nodeForm({ label: "N", key: ["a"], metadata: [{ name: "a" }], source: { provider: "filesystem", kind: "file" }, color: "#000000" });
+  nf.source = ""; nf.color = "";
+  m = api.configEntryFromForm("node_types", nf, ["label", "key", "metadata", "source", "color"]);
+  check("choosing no source and clearing the colour removes them", j(m) === j({ label: "N", key: ["a"], metadata: [{ name: "a" }] }), j(m));
+
+  // 38. the serialiser
+  const sc = v => api.configYamlScalar(v);
+  check("identifiers are plain", sc("hot_paths") === "hot_paths" && sc("Runbook") === "Runbook", sc("hot_paths"));
+  [["yes", '"yes"'], ["No", '"No"'], ["null", '"null"'], ["Y", '"Y"'], ["off", '"off"'], ["#1f77b4", '"#1f77b4"'], ["1e3", '"1e3"'],
+    ["123", '"123"'], ["a: b", '"a: b"'], [" lead", '" lead"'], ["", '""'], ["2026-10-05", '"2026-10-05"'],
+    ["two words", '"two words"'], ["say \"hi\"", '"say \\"hi\\""'],
+    ["a\u2028b", '"a\\u2028b"'], ["a\u2029b\x85c", '"a\\u2029b\\u0085c"'], ["del\x7f", '"del\\u007f"'],
+    ["a\r\nb\r\n", '"a\\r\\nb\\r\\n"'], ["x\n\n", '"x\\n\\n"'], ["  lead\nx", '"  lead\\nx"'], ["\n", '"\\n"'],
+    [true, "true"], [false, "false"], [12, "12"], [-3, "-3"], [0.5, "0.5"], [1e-7, "1.0e-7"], [1e21, "1.0e+21"], [null, "null"]]
+    .forEach(([v, want]) => check("scalar " + j(v) + " -> " + want, sc(v) === want, sc(v)));
+  check("text ending in one line break is a | block", api.configYamlScalar("A\nB\n", "  ") === "|\n  A\n  B", j(api.configYamlScalar("A\nB\n", "  ")));
+  check("text ending in none is a |- block", api.configYamlScalar("A\n\nB", "    ") === "|-\n    A\n\n    B", j(api.configYamlScalar("A\n\nB", "    ")));
+  check("the node type template serialises to its own text",
+    api.configEntryYaml("node_types", api.CONFIG_SECTIONS.node_types.entry, ["label", "key", "metadata"]) === api.CONFIG_SECTIONS.node_types.template,
+    j(api.configEntryYaml("node_types", api.CONFIG_SECTIONS.node_types.entry, ["label", "key", "metadata"])));
+  const toolYaml = api.configEntryYaml("tools", TOOL_OK(), Object.keys(TOOL_OK()));
+  check("a tool serialises as block YAML with a | Cypher block and a parameter sequence", toolYaml ===
+    "name: hot_paths\ndescription: d\ncypher: |\n  MATCH (n {repo_id: $repo_id})\n  RETURN n\nparameters:\n  - name: s\n" +
+    "  - name: i\n    type: integer\n    required: false\n    default: 3\n" +
+    "  - name: f\n    type: float\n    required: false\n    default: 0.5\n    description: \"Rows.\"\n" +
+    "  - name: b\n    type: boolean\n    required: false\n    default: true\n    description: null\nmax_rows: 200\ntimeout_s: 5\n", toolYaml);
+  check("keys follow the given order, then model order",
+    api.configEntryYaml("tools", { cypher: "c", name: "nm", max_rows: 1, description: "d" }, ["cypher"]) ===
+    "cypher: c\nname: nm\ndescription: d\nmax_rows: 1\n", api.configEntryYaml("tools", { cypher: "c", name: "nm", max_rows: 1, description: "d" }, ["cypher"]));
+  check("key is a flow list, quoting what needs it; source a nested mapping; empty lists are []",
+    api.configEntryYaml("node_types", { label: "Nd", key: ["path", "a b"], source: { provider: "filesystem", kind: "file" }, metadata: [] }, []) ===
+    'label: Nd\nkey: [path, "a b"]\nsource:\n  provider: filesystem\n  kind: file\nmetadata: []\n',
+    api.configEntryYaml("node_types", { label: "Nd", key: ["path", "a b"], source: { provider: "filesystem", kind: "file" }, metadata: [] }, []));
+  const nested = api.configEntryYaml("node_types", { label: "Nd", metadata: [{ name: "a", description: "two\nlines\n" }] }, []);
+  check("a block inside a sequence item is indented under its key", nested ===
+    "label: Nd\nmetadata:\n  - name: a\n    description: |\n      two\n      lines\n", nested);
+
+  // 39. advisory hints
+  const hints = (section, e, edit) => {
+    const f = api.configFormFromEntry(section, e).form;
+    if (edit) edit(f);
+    return api.configFormHints(section, f);
+  };
+  const VALID_TOOL = { name: "hot_paths", description: "d", cypher: "MATCH (n {repo_id: $repo_id}) WHERE n.x = $p RETURN n",
+    parameters: [{ name: "p", type: "integer", required: false, default: 3 }], max_rows: 10, timeout_s: 60 };
+  check("no hints for a valid tool", j(hints("tools", VALID_TOOL)) === "[]", j(hints("tools", VALID_TOOL)));
+  const VALID_NODE = { label: "Doc", key: ["path"], color: "#A0b0C0", source: { provider: "filesystem", kind: "file" },
+    metadata: [{ name: "path", type: "string" }, { name: "title" }] };
+  check("no hints for a valid node type", j(hints("node_types", VALID_NODE)) === "[]", j(hints("node_types", VALID_NODE)));
+  const hintCases = [
+    ["tools", "an empty tool name", f => { f.name = ""; }, "name", /required/],
+    ["tools", "a tool name off the pattern", f => { f.name = "Hot"; }, "name", /lowercase/],
+    ["tools", "a blank description", f => { f.description = "  "; }, "description", /agent reads/],
+    ["tools", "a description over the limit", f => { f.description = "x".repeat(1025); }, "description", /1025 characters.*1024/],
+    ["tools", "a blank cypher", f => { f.cypher = " \n"; }, "cypher", /required/],
+    ["tools", "cypher without $repo_id", f => { f.cypher = "MATCH (n) WHERE n.x = $p RETURN n"; }, "cypher", /doesn't appear to filter on `\$repo_id`/],
+    ["tools", "duplicate parameter names", f => { f.parameters.push({ ...f.parameters[0], open: {} }); }, "parameters.1.name", /Another parameter is also named p/],
+    ["tools", "an empty parameter name", f => { f.parameters[0].name = ""; }, "parameters.0.name", /required/],
+    ["tools", "a default on a required parameter", f => { f.parameters[0].required = true; }, "parameters.0.default", /optional/],
+    ["tools", "a default not reading as its type", f => { f.parameters[0].default = "3.5"; }, "parameters.0.default", /doesn't read as an integer/],
+    ["tools", "a float default not reading as a float", f => { f.parameters[0].type = "float"; f.parameters[0].default = "x"; }, "parameters.0.default", /doesn't read as a float/],
+    ["tools", "max_rows out of range", f => { f.max_rows = "1001"; }, "max_rows", /1 to 1000/],
+    ["tools", "timeout_s not an integer", f => { f.timeout_s = "2.5"; }, "timeout_s", /1 to 60/],
+    ["node_types", "an empty label", f => { f.label = ""; }, "label", /required/],
+    ["node_types", "a label off the pattern", f => { f.label = "1Doc"; }, "label", /letter/],
+    ["node_types", "no key ticked", f => { f.source = ""; f.metadata[0].key = false; }, "key", /Tick Key/],
+    ["node_types", "a metadata name off the pattern", f => { f.metadata[1].name = "Title"; }, "metadata.1.name", /lowercase/],
+    ["node_types", "duplicate metadata names", f => { f.metadata[1].name = "path"; }, "metadata.1.name", /Another field is also named path/],
+    ["node_types", "a colour that isn't #rrggbb", f => { f.color = "red"; }, "color", /#rrggbb/],
+    ["node_types", "a filesystem source without a string path key", f => { f.metadata[0].type = "integer"; }, "source", /path/],
+    ["node_types", "a filesystem source keyed on more than path", f => { f.metadata[1].key = true; }, "source", /path/],
+  ];
+  hintCases.forEach(([section, what, edit, field, re]) => {
+    const got = hints(section, section === "tools" ? VALID_TOOL : VALID_NODE, edit);
+    check("a hint for " + what, got.some(h => h.field === field && re.test(h.text)), j(got));
+  });
+
+  // 40. switching back to the form
+  const openText = "name: hot_paths\n";
+  const swEdit = { section: "tools", openEntry: { name: "hot_paths" }, openText, formText: openText, formState: null };
+  let s = api.configFormSwitch(swEdit, openText);
+  check("the opening text can go back to the form, rebuilt from the opening entry", s.available && s.restore === "open" && !s.reason, j(s));
+  swEdit.formState = toolForm({ name: "renamed" }); swEdit.formText = "name: renamed\n";
+  s = api.configFormSwitch(swEdit, "name: renamed\n");
+  check("the form's last text restores the form state", s.available && s.restore === "state", j(s));
+  s = api.configFormSwitch(swEdit, "name: renamed\n# mine\n");
+  check("hand-edited text can't go back to the form, saying why", !s.available && s.restore === null &&
+    s.reason === "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form.", j(s));
+  s = api.configFormSwitch({ ...swEdit, openEntry: { name: "x", extra: 1 }, formState: null }, openText);
+  check("an entry the form can't show never switches to it", !s.available && s.reason === FIELD("extra"), j(s));
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);
