@@ -224,6 +224,13 @@ fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
 than the default. `search_component`'s `count` maxes out at 50 (its own
 Cypher cap) even if more matches exist beyond that.
 
+**Project tools**: if this repo has a `devgraph.tools.yaml`, the MCP session
+also serves its tools for the session's repository (`DEVGRAPH_MCP_REPO`, else
+the server's working directory). Read `devgraph://project-tools` for what is
+served; the file is read at session start, so restart the MCP session after
+editing it. Pin a project with
+`claude mcp add devgraph -e DEVGRAPH_MCP_REPO=<repo_id> -- "<venv python>" -m devgraph.mcp.server`.
+
 `run_cypher` will not appear unless DevGraph's own config has
 `enable_run_cypher=true` set. If it's missing and you need something the
 purpose-built tools genuinely can't express, that's a signal a new high-level
