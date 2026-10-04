@@ -61,6 +61,29 @@ def require_neo4j():
         engine.close()
 
 
+@pytest.fixture
+def purge_registered_repos(temp_registry_db, require_neo4j):
+    """Delete from live Neo4j every repo this test registered, even if it failed.
+
+    Yields a list; a test that removes its registry row itself should append
+    the repo_id so teardown still purges the graph data.
+    """
+    extra_ids = []
+    yield extra_ids
+    from devgraph.graph.engine import GraphEngine
+
+    db_path, _ = temp_registry_db
+    reg = RepoRegistry(db_path)
+    ids = {r.repo_id for r in reg.list_repos()} | set(extra_ids)
+    reg.close()
+    engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
+    try:
+        for repo_id in ids:
+            engine.delete_repository(repo_id)
+    finally:
+        engine.close()
+
+
 @pytest.fixture(autouse=True)
 def _block_real_registry(monkeypatch, tmp_path):
     """Safety net: any CLI invocation that forgets to patch get_settings falls
@@ -113,7 +136,7 @@ def _mock_settings(db_path):
     return settings
 
 
-def test_cli_add_repo(runner, temp_git_repo, temp_registry_db, require_neo4j):
+def test_cli_add_repo(runner, temp_git_repo, temp_registry_db, purge_registered_repos):
     """Test 'devgraph add' command — now runs a real initial scan."""
     db_path, registry = temp_registry_db
 
@@ -143,7 +166,6 @@ def test_cli_add_repo(runner, temp_git_repo, temp_registry_db, require_neo4j):
         )
         assert found[0]["c"] > 0
     finally:
-        engine.delete_repository(repo_id)
         engine.close()
 
 
@@ -209,7 +231,7 @@ def test_cli_remove_repo(runner, temp_git_repo, temp_registry_db, require_neo4j)
         assert repo_id in result.stdout
 
 
-def test_cli_remove_repo_purges_graph_data(runner, temp_git_repo, temp_registry_db, require_neo4j):
+def test_cli_remove_repo_purges_graph_data(runner, temp_git_repo, temp_registry_db, purge_registered_repos):
     """'devgraph remove' must delete the repo's Neo4j nodes, not just its registry row."""
     from devgraph.graph.engine import GraphEngine
 
@@ -217,6 +239,7 @@ def test_cli_remove_repo_purges_graph_data(runner, temp_git_repo, temp_registry_
 
     repo_record = registry.add_repo(temp_git_repo)
     repo_id = repo_record.repo_id
+    purge_registered_repos.append(repo_id)  # `remove` deletes the registry row
     registry.close()
 
     engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
@@ -237,7 +260,6 @@ def test_cli_remove_repo_purges_graph_data(runner, temp_git_repo, temp_registry_
         )
         assert remaining[0]["c"] == 0
     finally:
-        engine.delete_repository(repo_id)
         engine.close()
 
 
@@ -290,7 +312,7 @@ def test_cli_watch_disable(runner, temp_git_repo, temp_registry_db):
         assert "Watch disabled" in result.stdout
 
 
-def test_cli_rescan_repo(runner, temp_git_repo, temp_registry_db, require_neo4j):
+def test_cli_rescan_repo(runner, temp_git_repo, temp_registry_db, purge_registered_repos):
     """Test 'devgraph rescan' command — now runs a real full scan."""
     db_path, registry = temp_registry_db
 
@@ -318,7 +340,6 @@ def test_cli_rescan_repo(runner, temp_git_repo, temp_registry_db, require_neo4j)
         )
         assert found[0]["c"] == 1
     finally:
-        engine.delete_repository(repo_id)
         engine.close()
 
 
@@ -506,7 +527,7 @@ def test_cli_index_history_nonexistent_repo(runner, temp_registry_db):
         assert "Error" in result.stdout
 
 
-def test_cli_add_full_flag_also_indexes_history(runner, temp_registry_db, require_neo4j):
+def test_cli_add_full_flag_also_indexes_history(runner, temp_registry_db, purge_registered_repos):
     """Test 'devgraph add --full' runs both the file scan and history indexing."""
     db_path, registry = temp_registry_db
 
@@ -551,7 +572,6 @@ def test_cli_add_full_flag_also_indexes_history(runner, temp_registry_db, requir
             )
             assert found[0]["c"] >= 1
         finally:
-            engine.delete_repository(repo_id)
             engine.close()
 
 
