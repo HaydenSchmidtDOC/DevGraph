@@ -6,8 +6,11 @@ the registry read-only and never creates it; anything unknown is "enabled".
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _registry_db_path() -> Path:
@@ -23,12 +26,14 @@ def project_config_enabled(repo_root: Path | str) -> bool:
         return True
     target = Path(repo_root).expanduser().resolve()
     try:
-        conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
-    except sqlite3.Error:
+        conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=0.5)
+    except sqlite3.Error as exc:
+        logger.debug("project config switch unreadable (%s); treating %s as enabled", exc, target)
         return True
     try:
         rows = conn.execute("SELECT path, project_config_enabled FROM repos").fetchall()
-    except sqlite3.Error:  # no table or no column yet
+    except sqlite3.Error as exc:  # no table or no column yet, or locked
+        logger.debug("project config switch unreadable (%s); treating %s as enabled", exc, target)
         return True
     finally:
         conn.close()

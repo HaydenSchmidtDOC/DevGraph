@@ -1,5 +1,7 @@
 """Tests for the per-repository project config switch lookup."""
 
+import logging
+import sqlite3
 import subprocess
 
 from devgraph.config import project_switch
@@ -91,3 +93,31 @@ def test_a_registry_path_with_uri_special_characters_still_applies(tmp_path, mon
     monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db)
     _register(db, tmp_path / "repo", enabled=False)
     assert project_config_enabled(tmp_path / "repo") is False
+
+
+def test_the_lookup_gives_up_quickly_on_a_locked_registry(tmp_path, monkeypatch):
+    db = _use_db(monkeypatch, tmp_path)
+    _register(db, tmp_path / "repo", enabled=False)
+    seen = {}
+    real_connect = sqlite3.connect
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(project_switch.sqlite3, "connect", spy)
+    assert project_config_enabled(tmp_path / "repo") is False
+    assert seen["timeout"] == 0.5
+
+
+def test_an_sqlite_error_falls_back_to_enabled_and_is_logged(tmp_path, monkeypatch, caplog):
+    db = _use_db(monkeypatch, tmp_path)
+    _register(db, tmp_path / "repo", enabled=False)
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(project_switch.sqlite3, "connect", locked)
+    with caplog.at_level(logging.DEBUG, logger=project_switch.logger.name):
+        assert project_config_enabled(tmp_path / "repo") is True
+    assert "database is locked" in caplog.text

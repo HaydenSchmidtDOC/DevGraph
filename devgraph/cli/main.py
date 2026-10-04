@@ -157,7 +157,7 @@ def list_repos() -> None:
             table.add_column("Path", style="magenta")
             table.add_column("Active", style="green")
             table.add_column("Watch", style="blue")
-            table.add_column("Config", style="blue")
+            table.add_column("Project config", style="blue")
             table.add_column("Last Indexed", style="yellow")
 
             # Load repo issues for display
@@ -180,7 +180,7 @@ def list_repos() -> None:
                     str(repo.path),
                     active_str,
                     watch_str,
-                    "[OK]" if repo.project_config_enabled else "[X]",
+                    "on" if repo.project_config_enabled else "off",
                     last_indexed,
                 )
 
@@ -625,6 +625,28 @@ def status() -> None:
     console.print()
 
 
+def _enable_hint_id(repo: Any) -> str:
+    """The repo id to show in `devgraph config enable <id>` hints.
+
+    Registered repositories carry it as `repo_id`; a path-only stand-in
+    (`config validate --repo`) supplies `hint_id` instead.
+    """
+    return getattr(repo, "hint_id", repo.repo_id)
+
+
+def _registered_repo_id(root: Path) -> str:
+    """The registry id of the repository at `root`, or the `<repo_id>` placeholder."""
+    target = root.resolve()
+    registry = _get_registry()
+    try:
+        for repo in registry.list_repos():
+            if Path(repo.path).expanduser().resolve() == target:
+                return repo.repo_id
+    finally:
+        registry.close()
+    return "<repo_id>"
+
+
 def _project_schema_findings(repos: list[Any]) -> list[dict[str, Any]]:
     """Per-repository project schema state, plus cross-repository conflicts.
 
@@ -656,16 +678,19 @@ def _project_schema_findings(repos: list[Any]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     # Case-folded label -> the (repo_id, label, key) triples declaring it.
     declared: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {}
+    disabled_ids: set[str] = set()
 
     for repo in sorted(repos, key=lambda r: r.repo_id):
-        if not project_config_enabled(repo.path):
+        disabled = not project_config_enabled(repo.path)
+        if disabled:
+            disabled_ids.add(repo.repo_id)
             findings.append(
                 {
                     "repo_id": repo.repo_id,
                     "status": "disabled",
                     "detail": (
                         "project config disabled: devgraph.schema.yaml and devgraph.tools.yaml are "
-                        "ignored (`devgraph config enable <repo_id>` to turn them on)"
+                        f"ignored (`devgraph config enable {_enable_hint_id(repo)}` to turn them on)"
                     ),
                     "failed": False,
                 }
@@ -719,8 +744,11 @@ def _project_schema_findings(repos: list[Any]) -> list[dict[str, Any]]:
     for folded, entries in sorted(declared.items()):
         if len({(label, key) for _repo_id, label, key in entries}) < 2:
             continue
+        # A disabled repo stays in conflict detection: its constraints are
+        # still in the shared database until constraint drop ships.
         described = "; ".join(
-            f"{repo_id} declares {label} keyed on ({', '.join(key)})"
+            f"{repo_id}{' (disabled)' if repo_id in disabled_ids else ''} "
+            f"declares {label} keyed on ({', '.join(key)})"
             for repo_id, label, key in sorted(entries)
         )
         findings.append(
@@ -744,6 +772,7 @@ def _project_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
     """Per-repository `devgraph.tools.yaml` state, in the same shape as
     `_project_schema_findings`. A tool named like a built-in is a non-failing
     warning: the built-in is always used, as the tool plane will report."""
+    from devgraph.config.project_switch import project_config_enabled
     from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError, load_project_tools
     from devgraph.mcp.catalog import builtin_tool_names
 
@@ -759,7 +788,16 @@ def _project_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
             findings.append({"repo_id": repo.repo_id, "status": "absent", "detail": f"no {TOOLS_FILENAME}", "failed": False})
             continue
         names = ", ".join(tool.name for tool in declared.tools)
-        findings.append({"repo_id": repo.repo_id, "status": "valid", "detail": f"tools: {names or 'none'}", "failed": False})
+        if project_config_enabled(repo.path):
+            findings.append({"repo_id": repo.repo_id, "status": "valid", "detail": f"tools: {names or 'none'}", "failed": False})
+        else:
+            # The file is checked, but the MCP tool plane serves none of it.
+            findings.append({
+                "repo_id": repo.repo_id,
+                "status": "disabled",
+                "detail": f"tools: {names or 'none'} (not served: project config disabled)",
+                "failed": False,
+            })
         for tool in declared.tools:
             if tool.name in builtin:
                 findings.append({
@@ -779,6 +817,7 @@ def _schema_drift_findings(engine: Any, repos: list[Any]) -> list[dict[str, Any]
     `schema_pending`: no recorded state and no schema is in sync.
     """
     from devgraph.config.project_schema import ABSENT_SCHEMA_HASH, schema_file_hash
+    from devgraph.config.project_switch import project_config_enabled
 
     findings: list[dict[str, Any]] = []
     for repo in sorted(repos, key=lambda r: r.repo_id):
@@ -790,10 +829,20 @@ def _schema_drift_findings(engine: Any, repos: list[Any]) -> list[dict[str, Any]
         except Exception as exc:
             findings.append({"repo_id": repo.repo_id, "status": "error", "detail": f"could not read the applied schema: {exc}"})
             continue
-        if recorded is None and current == ABSENT_SCHEMA_HASH:
+        disabled = not project_config_enabled(repo.path)
+        if current.startswith("unreadable:"):
+            status, detail = "unreadable", "schema file unreadable"
+        elif recorded is None and current == ABSENT_SCHEMA_HASH:
             status, detail = "applied", "no schema; graph is in sync"
         elif recorded is None:
             status, detail = "never applied", f"a schema exists but no rescan has applied one; run `devgraph rescan {repo.repo_id} --now`"
+        elif disabled and current == recorded["hash"]:
+            status, detail = "applied", "project config disabled; built-in schema applied"
+        elif disabled:
+            status, detail = "pending", (
+                f"project config disabled; built-in schema applied at the next rescan "
+                f"(devgraph rescan {repo.repo_id} --now)"
+            )
         elif current == recorded["hash"]:
             status, detail = "applied", "graph is in sync with the schema file"
         else:
@@ -941,7 +990,7 @@ def doctor() -> None:
         if finding["failed"]:
             console.print(f"  [red][X] {subject}:[/red] {escape(finding['detail'])}")
             any_failed = True
-        elif finding["status"] == "warning":
+        elif finding["status"] in ("warning", "disabled"):
             console.print(f"  [yellow][!] {subject}:[/yellow] {escape(finding['detail'])}")
         else:
             console.print(f"  [green][OK][/green] {subject}: {escape(finding['detail'])}")
@@ -1705,9 +1754,8 @@ def _schema_report(repo_root: Path | None) -> dict[str, Any]:
 
 def _tools_report(repo_root: Path) -> dict[str, Any]:
     """A repository's project tools for `config show`. Raises ProjectToolsError."""
-    from devgraph.config.project_tools import load_project_tools, tools_file_path
-
     from devgraph.config.project_switch import project_config_enabled
+    from devgraph.config.project_tools import load_project_tools, tools_file_path
 
     if not project_config_enabled(repo_root):
         return {"status": "disabled", "tools_file": None, "tools": []}
@@ -1775,7 +1823,7 @@ def config_show(
     elif report["status"] == "disabled":
         console.print(
             f"{escape(report['repo'])}: project config disabled — built-in schema "
-            f"(`devgraph config enable <repo_id>` to use {SCHEMA_FILENAME})"
+            f"(`devgraph config enable {escape(_registered_repo_id(root))}` to use {SCHEMA_FILENAME})"
         )
     elif report["status"] == "absent":
         console.print(f"{escape(report['repo'])}: no {SCHEMA_FILENAME} — built-in schema")
@@ -1827,6 +1875,8 @@ def config_validate(
     """Fail-closed check of devgraph.schema.yaml and devgraph.tools.yaml. Exits 1 if anything is invalid or conflicting."""
     from types import SimpleNamespace
 
+    from devgraph.config.project_switch import project_config_enabled
+
     if all_repos and repo is not None:
         ctx.fail("use either --repo or --all, not both")
     if all_repos:
@@ -1840,7 +1890,10 @@ def config_validate(
             return
     else:
         root = _repo_dir(repo or Path("."))
-        repos = [SimpleNamespace(repo_id=str(root), path=root)]
+        # `hint_id` is only needed (and the registry only opened) for a disabled repo,
+        # which is necessarily registered.
+        hint_id = "<repo_id>" if project_config_enabled(root) else _registered_repo_id(root)
+        repos = [SimpleNamespace(repo_id=str(root), path=root, hint_id=hint_id)]
 
     findings = _project_schema_findings(repos) + _project_tools_findings(repos)
     for finding in findings:
