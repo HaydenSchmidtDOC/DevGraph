@@ -29,54 +29,81 @@ Only objects matching its generated naming, never a built-in:
 - in both cases the label is not a built-in label (case-insensitively) and the
   name is not one of the built-in constraint names.
 
+A constraint a user created by hand in exactly this shape is
+indistinguishable from DevGraph's and is treated as DevGraph's.
+
 ## Automatic cleanup on apply
 
+The logic lives in `devgraph/indexer/schema_constraints.py`.
 `apply_project_schema` (the one seam every full scan goes through: CLI
-`add`/`rescan`, the agent's `SchemaRescanScheduler`, the dashboard) runs
-`reconcile_generated_constraints` after it records the applied state. It never
-fails the apply: a Neo4j error is logged as a warning.
+`add`/`rescan`, the agent's `SchemaRescanScheduler`, the dashboard) records the
+applied state (labels plus `schema_keys`), then runs, in order:
 
-1. **Removed labels.** Candidates are only the labels this repository's
-   previous applied state declared and its new one doesn't. A candidate's
-   constraint and index are dropped when no `Repository` node in the graph
-   records a label with the same lower-cased name (the generated name is
-   lower-cased) and no node of that label remains. Restricting candidates to
-   labels this apply removed (rather than every unused generated constraint in
-   the database) avoids a race with another process that has provisioned a
-   new label but not yet recorded it.
-2. **Changed keys.** For each label this repository now declares, the
-   existing same-named constraint is compared with the declaration: label and
-   properties `(repo_id, *key)`. If they differ, it is replaced (drop, create)
-   only when every `Repository` node that records a label with that lower-cased
-   name records exactly this label and key. A repository recorded without keys
-   (state written before this slice) counts as disagreeing until it is
-   rescanned. A disagreement leaves the constraint untouched and logs a warning
-   naming the repositories; `config validate`/`doctor` already report the
-   conflict. If the new constraint cannot be created (existing nodes violate
-   it), the old definition is recreated and a warning is logged. The filesystem
-   lookup index is compared the same way (its label only; its properties are
-   fixed).
+1. **Re-provisioning.** `engine.init_schema(effective)` again (every statement
+   is `IF NOT EXISTS`). Another repository's apply can release a label between
+   this repository's provisioning and its record. Nothing else would re-create
+   that constraint, because the schema is no longer pending, so the
+   repository's own apply closes the race.
+2. **`release_labels(engine, removed_labels)`.** The only candidates are the
+   labels this repository's previous applied state declared and its new one
+   doesn't. A candidate's constraint and index are dropped when no
+   `Repository` node in the graph records a label with the same case-folded
+   name (the generated name is lower-cased) and no node of that label remains.
+   Restricting candidates to labels this apply removed, rather than every
+   unused generated constraint in the database, keeps the sweep away from
+   labels another process has provisioned but not yet recorded.
+3. **`realign_keys(engine, node_types)`.** For each label this repository now
+   declares, the existing same-named constraint is compared with the
+   declaration: label and properties `(repo_id, *key)`. When they differ, the
+   constraint is replaced only if every `Repository` node recording a label
+   with that case-folded name records exactly this label and key. A repository
+   recorded without keys (state written before this slice) counts as
+   disagreeing until it is rescanned. A disagreement leaves the constraint
+   untouched and logs a warning naming the repositories; `config
+   validate`/`doctor` already report the conflict. Before anything is dropped,
+   a grouped count looks for two nodes sharing a `(repo_id, *key)` value. If
+   any exist, the replacement is skipped with a warning, so bad data never
+   opens an unconstrained window and is not retried destructively on every
+   apply. On clean data the old constraint is dropped and the new one created.
+   If the create still fails (a node written since the check), the old
+   definition is recreated. After creating, the definition is read back before
+   the replacement is logged as done. The filesystem lookup index is compared
+   the same way, on its label only; its properties are fixed. Labels that
+   differ only by case across repositories (`Widget` in one, `widget` in the
+   other) share one generated name. Once every repository records the same
+   spelling, the next apply converges the constraint on it.
+
+Steps 1–3 never fail the apply: a Neo4j error is logged as a warning.
 
 ## Removing a repository
 
 `devgraph remove` and `devgraph prune` delete a repository's graph data,
 including its `Repository` node. Both read its recorded labels first and run
-step 1 for them afterwards, so the last repository declaring a label releases
-its constraint.
+`release_labels` for them afterwards, so the last repository declaring a label
+releases its constraint.
 
-## Stale objects: doctor and `prune-constraints`
+## Doctor and `prune-constraints`
 
 A generated object is **stale** when no `Repository` node records its label,
 no registered repository's effective schema (project config switch respected)
-declares it, and no node of that label exists. Stale objects come from labels
-removed before this slice shipped or from repositories deleted outside the CLI.
+declares it, and no node of that label exists (`stale_generated_objects`).
+Stale objects come from labels removed before this slice shipped or from
+repositories deleted outside the CLI.
 
-- `devgraph doctor` gains a "Schema constraints" section (skipped when Neo4j is
-  down) listing stale objects as warnings, with the command that removes them.
-- `devgraph config schema prune-constraints [--label L ...] [--dry-run]` drops
-  stale objects, optionally only those for the given labels, and prints each.
-  It is never run automatically: a full sweep can race another process that has
-  provisioned but not yet recorded a label, so it is a deliberate user action.
+`devgraph doctor` gains a "Schema constraints" section, skipped when Neo4j is
+down, with these warnings:
+
+- each stale object, with the command that removes it;
+- from `constraint_drift`, each recorded label of a repository whose generated
+  constraint is **missing** (fix: `devgraph rescan <repo_id> --now`);
+- from `constraint_drift`, each recorded label whose **key change is blocked by
+  duplicate nodes** (fix: remove the duplicates, then rescan).
+
+`devgraph config schema prune-constraints [--label L ...] [--dry-run]` drops
+stale objects, optionally only those for the given labels, and prints each.
+It is never run automatically: a full sweep can race another process that has
+provisioned a label but not yet recorded it, so it is a deliberate user
+action.
 
 ## Not covered
 

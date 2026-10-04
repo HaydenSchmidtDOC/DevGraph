@@ -143,7 +143,7 @@ def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> 
     every repository's recorded state (see schema_constraints). An invalid
     schema or a provisioning failure returns False with the graph untouched;
     errors from the deletion or reconcile steps propagate, while a failed
-    constraint reconcile is only logged.
+    constraint reconcile (or the re-provisioning after the record) is only logged.
     """
     current_hash = schema_file_hash(repo_root)
     try:
@@ -178,8 +178,12 @@ def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> 
         filesystem.sync_present(engine, repo_id, spec, on_disk)
     engine.record_applied_schema(repo_id, current_hash, labels, rel_types, encode_keys(effective.node_types))
     # After recording, so this repository's new state is part of what every
-    # other repository's declarations are weighed against.
+    # other repository's declarations are weighed against. Provisioning is
+    # re-run first: another repository's apply may have released a label
+    # between this one's provisioning and its record, and nothing else would
+    # re-create the constraint (the schema is no longer pending).
     try:
+        engine.init_schema(effective)
         release_labels(engine, removed_labels)
         realign_keys(engine, effective.node_types)
     except Exception as exc:

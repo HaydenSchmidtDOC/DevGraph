@@ -1111,22 +1111,40 @@ def doctor() -> None:
     if not neo4j_reachable:
         console.print("  [yellow]skipped[/yellow]: Neo4j is not reachable")
     else:
+        from devgraph.indexer.schema_constraints import constraint_drift
+
         constraint_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
         try:
             stale = _stale_schema_objects(constraint_engine, registered_repos)
+            drift = constraint_drift(constraint_engine)
         except Exception as e:
-            stale = None
+            stale = drift = None
             console.print(f"  [yellow][!][/yellow] could not check: {escape(str(e))}")
         finally:
             constraint_engine.close()
-        if stale == []:
-            console.print("  [green][OK][/green] no stale generated constraints or indexes")
+        if stale == [] and drift == []:
+            console.print("  [green][OK][/green] generated constraints and indexes match the applied schemas")
         for obj in stale or []:
             console.print(
                 f"  [yellow][!] {escape(obj.name)}:[/yellow] stale {obj.kind} on {escape(obj.label)} "
                 f"(no repository declares it); remove with `devgraph config schema prune-constraints`",
                 soft_wrap=True,
             )
+        for finding in drift or []:
+            subject, label = escape(finding["repo_id"]), escape(finding["label"])
+            key = escape(", ".join(finding["key"]))
+            if finding["status"] == "missing":
+                detail = (
+                    f"applied {label} has no uniqueness constraint; re-provision with "
+                    f"`devgraph rescan {finding['repo_id']} --now`"
+                )
+            else:
+                detail = (
+                    f"key change blocked by duplicate nodes: {label} nodes share a (repo_id, {key}) value, "
+                    f"so the constraint keeps its old key; remove the duplicates, then "
+                    f"`devgraph rescan {finding['repo_id']} --now`"
+                )
+            console.print(f"  [yellow][!] {subject}:[/yellow] {detail}", soft_wrap=True)
 
     # 8. Tray/watcher liveness
     console.print("[bold]Live Watcher[/bold]")

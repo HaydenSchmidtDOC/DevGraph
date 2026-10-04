@@ -181,19 +181,66 @@ def realign_keys(engine: GraphEngine, node_types: Iterable[NodeTypeDecl]) -> lis
             continue
 
         for old, create in wanted:
+            # Checked before dropping, so data the new key rejects never costs
+            # an unconstrained window (and is not retried on every apply).
+            if old.kind == "constraint" and engine.has_duplicate_keys(node_type.label, ("repo_id", *node_type.key)):
+                logger.warning(
+                    "not replacing %s %s: duplicate nodes of %s share a (repo_id, %s) value; "
+                    "remove the duplicates and rescan",
+                    old.name, old.kind, node_type.label, ", ".join(node_type.key),
+                )
+                continue
+            new = GeneratedObject(
+                old.kind, old.name, node_type.label,
+                ("repo_id", *node_type.key) if old.kind == "constraint" else _INDEX_PROPERTIES,
+            )
             engine.run_schema_statement(old.drop_statement())
             try:
                 engine.run_schema_statement(create)
-            except Exception as exc:
+            except Exception as exc:  # e.g. a node written since the duplicate check
                 engine.run_schema_statement(old.create_statement())
                 logger.warning(
                     "could not replace %s %s for %s keyed on (%s); kept the old definition: %s",
                     old.kind, old.name, node_type.label, ", ".join(node_type.key), exc,
                 )
                 continue
+            if generated_objects(engine).get(old.name) != new:
+                logger.warning("replaced %s %s but it does not read back as %s keyed on (%s)",
+                               old.kind, old.name, node_type.label, ", ".join(node_type.key))
+                continue
             logger.info("replaced %s %s to match %s keyed on (%s)", old.kind, old.name, node_type.label, ", ".join(node_type.key))
             replaced.append(old.name)
     return replaced
+
+
+def constraint_drift(engine: GraphEngine) -> list[dict]:
+    """Applied declarations the database does not enforce, for `devgraph doctor`.
+
+    Per repository and recorded label (with a recorded key): `missing` when
+    the generated constraint does not exist (a rescan re-provisions it), and
+    `blocked` when it has another definition and duplicate nodes stop the new
+    key from being created. A differing definition without duplicates is
+    either replaced on the next apply or a cross-repository conflict, which
+    `devgraph config validate` reports.
+    """
+    existing = generated_objects(engine)
+    drift: list[dict] = []
+    for entries in recorded_declarations(engine).values():
+        for repo_id, label, key in entries:
+            if key is None:
+                continue
+            obj = existing.get(_user_constraint_name(label))
+            wanted = ("repo_id", *key)
+            if obj is None:
+                status = "missing"
+            elif (obj.label, obj.properties) != (label, wanted) and all(
+                PROPERTY_NAME_PATTERN.fullmatch(p) for p in key
+            ) and engine.has_duplicate_keys(label, wanted):
+                status = "blocked"
+            else:
+                continue
+            drift.append({"repo_id": repo_id, "label": label, "status": status, "key": key})
+    return sorted(drift, key=lambda d: (d["repo_id"], d["label"]))
 
 
 def stale_generated_objects(engine: GraphEngine, declared: set[str]) -> list[GeneratedObject]:

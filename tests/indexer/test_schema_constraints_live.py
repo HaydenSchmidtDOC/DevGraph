@@ -12,8 +12,9 @@ import pytest
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph.schema import constraint_statements
+from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import apply_project_schema
-from devgraph.indexer.schema_constraints import release_labels, stale_generated_objects
+from devgraph.indexer.schema_constraints import constraint_drift, release_labels, stale_generated_objects
 
 
 def _token():
@@ -167,7 +168,7 @@ def test_a_key_change_waits_until_every_repo_agrees(engine, repos, label, caplog
     assert constraint(engine, label) == ([label], ["repo_id", "code"])
 
 
-def test_a_key_the_existing_nodes_violate_restores_the_old_constraint(engine, repos, label, caplog):
+def test_a_key_change_blocked_by_duplicate_nodes_never_drops_the_constraint(engine, repos, label, caplog, monkeypatch):
     repo_id, root = repos()
     declare(root, label, key="slug")
     assert apply_project_schema(engine, repo_id, root)
@@ -175,11 +176,52 @@ def test_a_key_the_existing_nodes_violate_restores_the_old_constraint(engine, re
         f"CREATE (:{label} {{repo_id: $r, slug: 'a', code: 'same'}}), (:{label} {{repo_id: $r, slug: 'b', code: 'same'}})",
         {"r": repo_id},
     )
+    statements = []
+    run = engine.run_schema_statement
+    monkeypatch.setattr(engine, "run_schema_statement", lambda stmt: (statements.append(stmt), run(stmt))[1])
+
     declare(root, label, key="code")
     with caplog.at_level(logging.WARNING, logger="devgraph.indexer.schema_constraints"):
         assert apply_project_schema(engine, repo_id, root)
+        assert apply_project_schema(engine, repo_id, root)
     assert constraint(engine, label) == ([label], ["repo_id", "slug"])
-    assert any(label in r.getMessage() for r in caplog.records)
+    assert not [s for s in statements if s.startswith("DROP")]
+    assert any(label in r.getMessage() and "duplicate" in r.getMessage() for r in caplog.records)
+    assert {"repo_id": repo_id, "label": label, "status": "blocked", "key": ("code",)} in constraint_drift(engine)
+
+
+def test_a_release_racing_another_repos_apply_is_reprovisioned(engine, repos, label, monkeypatch):
+    """A drops X after B provisioned it but before B recorded it; B's apply must still end with X constrained."""
+    a_id, a_root = repos()
+    b_id, b_root = repos()
+    declare(a_root, label)
+    assert apply_project_schema(engine, a_id, a_root)
+    declare(b_root, label)
+    undeclare(a_root)
+
+    reconcile = dispatch.filesystem.reconcile
+    raced = []
+
+    def interleave(*args, **kwargs):  # runs between B's provisioning and B's record
+        if not raced:
+            raced.append(True)
+            assert apply_project_schema(engine, a_id, a_root)
+            assert constraint(engine, label) is None  # A saw nobody else recording X
+        return reconcile(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch.filesystem, "reconcile", interleave)
+    assert apply_project_schema(engine, b_id, b_root)
+    assert raced
+    assert constraint(engine, label) == ([label], ["repo_id", "slug"])
+
+
+def test_drift_reports_an_applied_label_without_its_constraint(engine, repos, label):
+    repo_id, root = repos()
+    declare(root, label)
+    assert apply_project_schema(engine, repo_id, root)
+    assert not [d for d in constraint_drift(engine) if d["label"] == label]
+    engine.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_key")
+    assert {"repo_id": repo_id, "label": label, "status": "missing", "key": ("slug",)} in constraint_drift(engine)
 
 
 def builtin_constraints(engine):

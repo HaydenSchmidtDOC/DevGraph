@@ -617,6 +617,19 @@ class GraphEngine:
         with self._driver.session() as session:
             _retry_transient(session.run, statement).consume()
 
+    def has_duplicate_keys(self, label: str, properties: tuple[str, ...]) -> bool:
+        """Whether two `label` nodes share every one of `properties` (all non-null), i.e. a
+        uniqueness constraint on them could not be created. The caller validates the names."""
+        values = ", ".join(f"n.`{p}` AS `{p}`" for p in properties)
+        present = " AND ".join(f"n.`{p}` IS NOT NULL" for p in properties)
+        query = (
+            f"MATCH (n:`{label}`) WHERE {present} WITH {values}, count(*) AS c "
+            "WHERE c > 1 RETURN 1 AS dup LIMIT 1"
+        )
+        with self._driver.session() as session:
+            result = _retry_transient(session.run, query)
+            return bool([record for record in result or []])
+
     def label_has_nodes(self, label: str) -> bool:
         """Whether any node, in any repository, carries `label`. The caller validates `label`."""
         with self._driver.session() as session:

@@ -2,6 +2,7 @@
 
 import shutil
 import textwrap
+import uuid
 
 import pytest
 
@@ -28,6 +29,34 @@ WORKTREE = """
         from: [File, Folder]
         to: Folder
 """
+
+# Unique per run: these tests drop and re-create the labels' generated
+# constraints, which are database-wide and shared with real repositories.
+_TOKEN = uuid.uuid4().hex[:8]
+FILE, FOLDER, ENTRY = (f"ZzFile{_TOKEN}", f"ZzFolder{_TOKEN}", f"ZzEntry{_TOKEN}")
+_SHOWN = {FILE: "File", FOLDER: "Folder", ENTRY: "Entry"}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _drop_generated_constraints():
+    yield
+    cleanup = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
+    try:
+        for label in (FILE, FOLDER, ENTRY):
+            cleanup.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_key IF EXISTS")
+            cleanup.run_cypher(f"DROP INDEX {label.lower()}_repo_name IF EXISTS")
+    except Exception:
+        pass  # Neo4j unavailable: the tests were skipped
+    finally:
+        cleanup.close()
+
+
+def _shown(key):
+    """`Label:name` with the per-run label shown as the plain name the assertions use."""
+    label, _, name = key.partition(":")
+    return f"{_SHOWN.get(label, label)}:{name}"
+
+WORKTREE = WORKTREE.replace("File", FILE).replace("Folder", FOLDER)
 
 
 @pytest.fixture
@@ -65,7 +94,7 @@ def fs_nodes(engine):
         "MATCH (n {repo_id: $r}) WHERE n.extractor = 'filesystem' RETURN labels(n)[0] + ':' + n.name AS k",
         {"r": REPO},
     )
-    return sorted(r["k"] for r in rows)
+    return sorted(_shown(r["k"]) for r in rows)
 
 
 def fs_edges(engine):
@@ -184,7 +213,7 @@ def _plan_operators(plan):
 def test_provider_writes_are_served_by_a_repo_name_index(engine, repo):
     provision_repository_schema(engine, with_schema(repo))
 
-    for label in ("File", "Folder"):
+    for label in (FILE, FOLDER):
         with engine._driver.session() as session:
             # A freshly created index is not planned against until it is online.
             session.run("CALL db.awaitIndexes(60)").consume()
@@ -216,13 +245,13 @@ def test_saving_a_new_schema_waits_to_be_applied_then_syncs_the_whole_worktree(e
         "File:README.md", "File:devgraph.schema.yaml", "File:pkg/mod.py", "File:pkg/sub/util.py",
         "Folder:.", "Folder:pkg", "Folder:pkg/sub",
     ]
-    assert {"file_repo_name", "folder_repo_name"} <= _index_names(engine)
+    assert {f"{FILE.lower()}_repo_name", f"{FOLDER.lower()}_repo_name"} <= _index_names(engine)
 
 
 def test_renaming_a_label_in_the_schema_leaves_no_old_label_nodes_once_applied(engine, repo):
     scan(engine, with_schema(repo))
     schema = repo / "devgraph.schema.yaml"
-    schema.write_text(textwrap.dedent(WORKTREE).replace("File", "Entry"))
+    schema.write_text(textwrap.dedent(WORKTREE).replace(FILE, ENTRY))
     before = fs_nodes(engine)
 
     index_paths(engine, REPO, repo, {schema})

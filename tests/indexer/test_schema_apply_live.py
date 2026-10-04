@@ -1,6 +1,7 @@
 """Applying a project schema: recorded state, pending pause, removed-type cleanup."""
 
 import textwrap
+import uuid
 
 import pytest
 
@@ -26,6 +27,35 @@ WORKTREE = """
         from: [File, Folder]
         to: Folder
 """
+
+# Unique per run: these tests drop and re-create the labels' generated
+# constraints, which are database-wide and shared with real repositories.
+_TOKEN = uuid.uuid4().hex[:8]
+FILE, FOLDER, ENTRY = (f"ZzFile{_TOKEN}", f"ZzFolder{_TOKEN}", f"ZzEntry{_TOKEN}")
+GADGET = f"ZzGadget{_TOKEN}"
+_SHOWN = {FILE: "File", FOLDER: "Folder", ENTRY: "Entry"}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _drop_generated_constraints():
+    yield
+    cleanup = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
+    try:
+        for label in (FILE, FOLDER, ENTRY, GADGET):
+            cleanup.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_key IF EXISTS")
+            cleanup.run_cypher(f"DROP INDEX {label.lower()}_repo_name IF EXISTS")
+    except Exception:
+        pass  # Neo4j unavailable: the tests were skipped
+    finally:
+        cleanup.close()
+
+
+def _shown(key):
+    """`Label:name` with the per-run label shown as the plain name the assertions use."""
+    label, _, name = key.partition(":")
+    return f"{_SHOWN.get(label, label)}:{name}"
+
+WORKTREE = WORKTREE.replace("File", FILE).replace("Folder", FOLDER)
 WIDGETS = """
       - label: ZzGadget
         key: [slug]
@@ -38,6 +68,8 @@ LINKS = """
         from: ZzGadget
         to: ZzGadget
 """
+WIDGETS = WIDGETS.replace("ZzGadget", GADGET)
+LINKS = LINKS.replace("ZzGadget", GADGET)
 
 
 @pytest.fixture
@@ -74,7 +106,7 @@ def fs_nodes(engine):
     rows = engine.run_cypher(
         "MATCH (n {repo_id: $r}) WHERE n.extractor = 'filesystem' RETURN labels(n)[0] + ':' + n.name AS k", {"r": REPO}
     )
-    return sorted(r["k"] for r in rows)
+    return sorted(_shown(r["k"]) for r in rows)
 
 
 def scan(engine, root):
@@ -95,7 +127,7 @@ def test_full_scan_applies_and_records_the_schema(engine, repo):
     scan(engine, repo)
     state = engine.read_applied_schema(REPO)
     assert state["hash"] == schema_file_hash(repo)
-    assert state["labels"] == ["File", "Folder", "ZzGadget"]
+    assert state["labels"] == [FILE, FOLDER, GADGET]
     assert state["relationship_types"] == ["IS_CHILD_OF", "ZZ_LINKS"]
     assert not schema_pending(engine, REPO, repo)
     assert "File:pkg/mod.py" in fs_nodes(engine)
@@ -121,17 +153,17 @@ def test_removed_user_types_are_deleted_and_others_kept(engine, repo):
     write_schema(repo, worktree_with_gadgets())
     scan(engine, repo)
     engine.run_cypher(
-        "CREATE (a:ZzGadget {repo_id: $r, slug: 'a', name: 'a'})-[:ZZ_LINKS]->(b:ZzGadget {repo_id: $r, slug: 'b', name: 'b'})",
+        f"CREATE (a:{GADGET} {{repo_id: $r, slug: 'a', name: 'a'}})-[:ZZ_LINKS]->(b:{GADGET} {{repo_id: $r, slug: 'b', name: 'b'}})",
         {"r": REPO},
     )
     write_schema(repo, worktree_with_gadgets(links=False))  # drop the relationship type only
     assert apply_project_schema(engine, REPO, repo)
     assert engine.run_cypher("MATCH ({repo_id: $r})-[x:ZZ_LINKS]->() RETURN count(x) AS n", {"r": REPO}) == [{"n": 0}]
-    assert engine.run_cypher("MATCH (n:ZzGadget {repo_id: $r}) RETURN count(n) AS n", {"r": REPO}) == [{"n": 2}]
+    assert engine.run_cypher(f"MATCH (n:{GADGET} {{repo_id: $r}}) RETURN count(n) AS n", {"r": REPO}) == [{"n": 2}]
 
     write_schema(repo, WORKTREE)  # now drop the node type too
     assert apply_project_schema(engine, REPO, repo)
-    assert engine.run_cypher("MATCH (n:ZzGadget {repo_id: $r}) RETURN count(n) AS n", {"r": REPO}) == [{"n": 0}]
+    assert engine.run_cypher(f"MATCH (n:{GADGET} {{repo_id: $r}}) RETURN count(n) AS n", {"r": REPO}) == [{"n": 0}]
     assert "File:pkg/mod.py" in fs_nodes(engine)
     assert engine.run_cypher("MATCH (m:Module {repo_id: $r}) RETURN count(m) AS n", {"r": REPO})[0]["n"] > 0
 
@@ -152,7 +184,7 @@ def test_an_invalid_schema_changes_nothing(engine, repo):
 def test_a_tampered_label_list_never_reaches_cypher(engine, repo):
     write_schema(repo, WORKTREE)
     scan(engine, repo)
-    engine.record_applied_schema(REPO, "sha256:old", ["File", "Folder", "Bad`) DETACH DELETE n //"], ["NOT VALID"])
+    engine.record_applied_schema(REPO, "sha256:old", [FILE, FOLDER, "Bad`) DETACH DELETE n //"], ["NOT VALID"])
     assert apply_project_schema(engine, REPO, repo)  # skips the invalid names, no Cypher error
     assert "File:pkg/mod.py" in fs_nodes(engine)
 

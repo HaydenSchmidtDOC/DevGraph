@@ -1390,3 +1390,26 @@ def test_cli_remove_releases_the_constraints_of_the_repos_labels(runner, temp_re
         engine.delete_repository(repo_id)
     assert result.exit_code == 0, result.stdout
     assert not _has_constraint(engine, name)
+
+
+def test_cli_doctor_reports_a_missing_or_blocked_generated_constraint(runner, temp_registry_db, stale_label):
+    engine, label, name = stale_label  # constraint on (repo_id, slug)
+    db_path, registry = temp_registry_db
+    registry.close()
+    blocked, missing = f"_smoketest_blocked_{label.lower()}", f"_smoketest_missing_{label.lower()}"
+    other = f"{label}b"
+    try:
+        engine.upsert_repository(blocked, blocked, "/tmp/blocked")
+        engine.record_applied_schema(blocked, "sha256:x", [label], [], [f"{label}:code"])
+        engine.run_cypher(
+            f"CREATE (:{label} {{repo_id: $r, slug: 'a', code: 'same'}}), (:{label} {{repo_id: $r, slug: 'b', code: 'same'}})",
+            {"r": blocked},
+        )
+        engine.upsert_repository(missing, missing, "/tmp/missing")
+        engine.record_applied_schema(missing, "sha256:x", [other], [], [f"{other}:slug"])
+        doctor = _collapsed(_invoke_live(runner, db_path, ["doctor"]).stdout)
+    finally:
+        engine.delete_repository(blocked)
+        engine.delete_repository(missing)
+    assert f"key change blocked by duplicate nodes" in doctor and label in doctor
+    assert f"devgraph rescan {missing} --now" in doctor
