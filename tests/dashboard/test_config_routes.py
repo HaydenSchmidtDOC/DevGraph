@@ -1642,3 +1642,66 @@ def test_entries_json_cannot_carry_are_null(client, registry, tmp_path):
         "dated": True, "big": True, "fine": False}
     [node] = project["schema"]["node_types"]
     assert node["entry"] is None and "yaml" in node
+
+
+def test_form_entry_refuses_self_referencing_data_but_keeps_shared_data():
+    from devgraph.dashboard.config_model import form_entry
+
+    cyclic_list: list = []
+    cyclic_list.append(cyclic_list)
+    cyclic_dict: dict = {}
+    cyclic_dict["self"] = cyclic_dict
+    assert form_entry({"parameters": cyclic_list}) is None
+    assert form_entry(cyclic_dict) is None
+    shared = ["x"]
+    assert form_entry({"a": shared, "b": shared}) == {"a": ["x"], "b": ["x"]}
+
+
+def test_self_referencing_yaml_does_not_break_the_page(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, """
+        version: 1
+        tools:
+          - name: loopy
+            description: Loops.
+            cypher: RETURN 1
+            parameters: &a [*a]
+        """)
+
+    response = client.get("/api/config/repo-a")
+
+    assert response.status_code == 200
+    assert all(e["entry"] is None for e in response.json()["tools"]["entries"])
+
+
+def test_form_entry_refuses_integral_floats_the_browser_cannot_tell_from_ints():
+    from devgraph.dashboard.config_model import form_entry
+
+    for bad in (3.0, -0.0, 1e16):
+        assert form_entry({"default": bad}) is None
+        assert form_entry({"parameters": [{"default": bad}]}) is None
+    assert form_entry({"default": 2.5}) == {"default": 2.5}
+
+
+def test_integral_float_values_make_the_row_yaml_only(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, """
+        version: 1
+        tools:
+          - name: rows
+            description: Rows.
+            cypher: RETURN 1
+            max_rows: 5.0
+          - name: defaulted
+            description: Defaulted.
+            cypher: RETURN 1
+            parameters:
+              - {name: n, type: float, required: false, default: 3.0}
+          - name: fine
+            description: Fine.
+            cypher: RETURN 1
+        """)
+
+    entries = client.get("/api/config/repo-a").json()["tools"]["entries"]
+
+    assert {e["name"]: e["entry"] is None for e in entries} == {"rows": True, "defaulted": True, "fine": False}

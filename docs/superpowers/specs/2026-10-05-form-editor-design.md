@@ -44,7 +44,7 @@ The browser has no YAML parser (index.html loads only cytoscape; there is no bui
 "entry": form_entry(entry)   # the mapping, or None when JSON can't carry it faithfully
 ```
 
-`form_entry(entry) -> dict | None` (new, `devgraph/dashboard/config_model.py`) returns the mapping only when it is plain JSON data that survives a trip into JavaScript unchanged: keys are strings; values are `str`, `bool`, `None`, `int` within ±(2^53 − 1), finite `float`, or lists/dicts of those. Anything else (a YAML date, `.nan`, a huge integer, a non-string key) gives `None`, and the editor opens that entry in YAML only. Relationship rows get no `entry` in this PR.
+`form_entry(entry) -> dict | None` (new, `devgraph/dashboard/config_model.py`) returns the mapping only when it is plain JSON data that survives a trip into JavaScript unchanged: keys are strings; values are `str`, `bool`, `None`, `int` within ±(2^53 − 1), finite non-integral `float`, or lists/dicts of those. Anything else (a YAML date, `.nan`, a huge integer, a non-string key) gives `None`, and the editor opens that entry in YAML only. Relationship rows get no `entry` in this PR.
 
 For **Add**, `CONFIG_SECTIONS.tools` and `.node_types` (index.html:2920) gain an `entry` mapping equal to `yaml.safe_load` of their existing `template` text (a Python test asserts the equality, §4). The relationships template is unchanged.
 
@@ -57,6 +57,8 @@ For **Add**, `CONFIG_SECTIONS.tools` and `.node_types` (index.html:2920) gain an
 **Node types** (`NodeTypeDecl`, devgraph/config/project_schema.py:173): keys a subset of `label, key, metadata, description, source, color`; `label`/`description`/`color` strings (or null for the optional two); `metadata` a list of mappings with keys a subset of `name, type, required, description`, `type` one of `METADATA_TYPES`, names unique; `key` a list of strings, each naming a metadata row, **in the same order as those rows appear in `metadata`** (the form expresses the key as ticks on metadata rows, Q7); `source` absent, null, or exactly `{provider: filesystem, kind: file|folder}`.
 
 Values out of range (a `max_rows` of 5000, a bad label) are representable: the form shows them and the server's validator rejects them. Representability is about not losing data, not about validity.
+
+An integral float (e.g. `3.0`) opens in YAML only, because the browser can't tell it from an integer. Anchors, aliases and merge keys are written out expanded when the form saves. A self-referencing anchor gives `entry: null` (YAML only).
 
 Reason texts (shown as the notice; all `textContent`): "This entry has a field the form doesn't edit: `<path>`. Edit it as YAML." / "This entry's key order differs from its metadata order; the form can't show that. Edit it as YAML." / "This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML."
 

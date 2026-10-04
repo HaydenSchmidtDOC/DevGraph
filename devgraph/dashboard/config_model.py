@@ -26,17 +26,20 @@ GLOBAL_TOOLS_FILENAME = "global-tools.json"
 _MAX_SAFE_INT = 2**53 - 1  # the largest integer a JavaScript number carries exactly
 
 
-def _plain(value: Any) -> bool:
+def _plain(value: Any, ancestors: frozenset[int] = frozenset()) -> bool:
     if value is None or isinstance(value, (str, bool)):
         return True
     if isinstance(value, int):
         return abs(value) <= _MAX_SAFE_INT
     if isinstance(value, float):
-        return math.isfinite(value)
-    if isinstance(value, list):
-        return all(_plain(v) for v in value)
-    if isinstance(value, dict):
-        return all(isinstance(k, str) and _plain(v) for k, v in value.items())
+        return math.isfinite(value) and not value.is_integer()  # JSON cannot tell 3.0 from 3
+    if isinstance(value, (list, dict)):
+        if id(value) in ancestors:  # a self-referencing YAML anchor
+            return False
+        inside = ancestors | {id(value)}
+        if isinstance(value, list):
+            return all(_plain(v, inside) for v in value)
+        return all(isinstance(k, str) and _plain(v, inside) for k, v in value.items())
     return False
 
 
