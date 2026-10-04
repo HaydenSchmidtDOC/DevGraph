@@ -16,6 +16,7 @@ repo's own `record.path`).
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from devgraph.config import get_settings
@@ -23,6 +24,7 @@ from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.containers.extractor import ContainerExtractor
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
+from devgraph.indexer.docs.extractor import DocsExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.csharp.extractor import extract_csharp_file
 from devgraph.indexer.go.extractor import _find_module_path, extract_go_file
@@ -30,7 +32,7 @@ from devgraph.indexer.java.extractor import extract_java_file
 from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.kotlin.extractor import extract_kotlin_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
-from devgraph.indexer.mentions.extractor import upsert_document_node
+from devgraph.indexer.mentions.extractor import mentions_any, upsert_document_node
 from devgraph.indexer.cpp.extractor import extract_cpp_file
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
@@ -168,20 +170,17 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             continue
         by_rel_path[rel_path] = resolved
 
-    for rel_path in sorted(by_rel_path):
-        resolved = by_rel_path[rel_path]
+    def index_one(rel_path: str, resolved: Path) -> None:
+        nonlocal indexed
         if not resolved.exists() or not resolved.is_file():
-            continue
-
-        name_lower = resolved.name.lower()
-
+            return
         # One unparseable/locked file (or a transient Neo4j error mid-batch)
         # must not abort the whole batch: a full scan or watcher batch would
         # otherwise silently lose every file after the failure point. Log and
         # skip the offending file so the rest of the batch still indexes.
         try:
             indexed += _index_single_path(
-                engine, repo_id, repo_root, resolved, rel_path, name_lower,
+                engine, repo_id, repo_root, resolved, rel_path, resolved.name.lower(),
                 docs_root, mentions_enabled, module_path,
                 py_files, py_extractions, js_files, js_extractions,
                 cs_files, cs_extractions, cpp_files, cpp_extractions,
@@ -193,6 +192,33 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             logger.warning(
                 "indexing failed for %s (%s); skipping file", repo_id, rel_path, exc_info=True
             )
+
+    # What the batch's files produced before this run, so the referrer step
+    # below can tell which nodes the batch adds. Docs notes record a bare
+    # filename as their source_file, hence the extra keys.
+    provenance_keys = set(by_rel_path)
+    if docs_root is not None:
+        provenance_keys |= {p.name for p in by_rel_path.values() if p.is_relative_to(docs_root)}
+    previous_nodes = engine.list_file_nodes(repo_id, sorted(provenance_keys))
+
+    for rel_path in sorted(by_rel_path):
+        index_one(rel_path, by_rel_path[rel_path])
+
+    # Files outside the batch that refer by name to a node the batch just
+    # added were indexed before that node existed, so their edge to it was
+    # skipped. Index them now as part of this batch (one level, no
+    # recursion); the passes below then link them like any batch file.
+    code_extractions = [
+        py_extractions, js_extractions, cs_extractions, cpp_extractions,
+        java_extractions, rs_extractions, kt_extractions, go_extractions,
+    ]
+    added_nodes = _batch_nodes(repo_id, root_resolved, code_extractions, docs_files, mention_files) - previous_nodes
+    referrers = _find_referrers(
+        engine, repo_id, root_resolved, docs_root, mentions_enabled, added_nodes, set(by_rel_path),
+        {**java_extractions, **kt_extractions},
+    )
+    for rel_path in sorted(referrers):
+        index_one(rel_path, root_resolved / rel_path)
 
     # Second pass: re-upsert every .py file's already-extracted nodes/edges
     # (no re-parse, no re-prune). Batch order is path order, not dependency
@@ -480,13 +506,9 @@ def _expand_with_reverse_dependents(
     per-change lookup rather than a repo walk; transitive staleness is rare
     enough that `--full` remains the intended escape hatch for it.
 
-    Known gap: this finds referrers only through edges that already exist.
-    A referrer indexed before its target existed (a doc mentioning or a
-    note superseding/linking it, a route naming a handler in it, a class
-    extending it) has no edge to follow, so adding the target alone leaves
-    those edges missing until the referrer is re-indexed or a full scan
-    runs. Within a single batch this doesn't arise: index_paths resolves
-    cross-file edges after every node in the batch exists.
+    This finds referrers only through edges that already exist. A referrer
+    indexed before its target existed has no edge to follow; index_paths
+    finds those separately, after pass 1, via _find_referrers.
     """
     root_resolved = repo_root.resolve()
     expanded = set(paths)
@@ -513,6 +535,150 @@ def _expand_with_reverse_dependents(
                 expanded.add(importer_path)
 
     return expanded
+
+
+def _batch_nodes(
+    repo_id: str,
+    root: Path,
+    code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
+    docs_files: list[Path],
+    mention_files: list[Path],
+) -> set[tuple[str, str]]:
+    """(label, name) of every file-provenance node this batch wrote: code
+    symbols and Modules, docs notes, and Markdown Document nodes. (API
+    handler stubs and other `source`-keyed nodes are not included -- no
+    referrer lookup targets them.)"""
+    nodes = {
+        (node["label"], node["name"])
+        for extractions in code_extractions
+        for file_nodes, _rels in extractions.values()
+        for node in file_nodes
+    }
+    for path in docs_files:
+        result = DocsExtractor(repo_id).extract_from_source(_read_text(path), path.name)
+        nodes |= {(doc.label, doc.name) for doc in result.docs}
+    nodes |= {("Document", path.relative_to(root).as_posix()) for path in mention_files}
+    return nodes
+
+
+def _find_referrers(
+    engine: GraphEngine,
+    repo_id: str,
+    root: Path,
+    docs_root: Path | None,
+    mentions_enabled: bool,
+    added: set[tuple[str, str]],
+    batch: set[str],
+    jvm_extractions: dict[str, tuple[list[dict], list[dict]]],
+) -> set[str]:
+    """Repo-relative paths outside `batch` whose by-name edges can target a
+    node in `added` -- files indexed before that node existed, so their edge
+    to it was skipped (an edge whose endpoint is missing is never created).
+
+    Unlike _expand_with_reverse_dependents, nothing in the graph points from
+    these files to the new node, so each kind is found by its own lookup,
+    and each is bounded to stay cheap: it only runs when the batch added a
+    node of a label it can target, and it only reads files outside the
+    batch. A full scan has no files outside the batch, and a batch that
+    only re-saves files adds no nodes, so either way this is close to free.
+    """
+    if not added:
+        return set()
+    names = {name for _label, name in added}
+    found = _docs_note_referrers(repo_id, root, docs_root, added, batch)
+    found |= _handler_stub_referrers(engine, repo_id, added)
+    if mentions_enabled:
+        found |= _mention_referrers(engine, repo_id, root, names, batch)
+    found |= _same_package_subtype_referrers(root, added, batch, jvm_extractions)
+    return found - batch
+
+
+# Labels a docs note's SUPERSEDES/DECIDED_BY/`links` edges can point at.
+_DOCS_NOTE_TARGET_LABELS = {"DesignDecision", "ArchitectureNote", "Module"}
+
+
+def _docs_note_referrers(
+    repo_id: str, root: Path, docs_root: Path | None, added: set[tuple[str, str]], batch: set[str]
+) -> set[str]:
+    """Docs notes whose SUPERSEDES/DECIDED_BY/`links` edge names an added
+    note or Module. Re-parses each note outside the batch (docs folders are
+    small; no graph access) and keeps only those with an edge endpoint in
+    `added`."""
+    if docs_root is None or not any(label in _DOCS_NOTE_TARGET_LABELS for label, _name in added):
+        return set()
+    found = set()
+    for path in sorted(docs_root.rglob("*")):
+        if path.suffix not in (".md", ".markdown") or not _is_indexable_file(path) or is_ignored_path(path):
+            continue
+        rel_path = path.relative_to(root).as_posix()
+        if rel_path in batch:
+            continue
+        result = DocsExtractor(repo_id).extract_from_source(_read_text(path), path.name)
+        if any(
+            (rel.source_label, rel.source_name) in added or (rel.target_label, rel.target_name) in added
+            for rel in result.relationships
+        ):
+            found.add(rel_path)
+    return found
+
+
+def _handler_stub_referrers(engine: GraphEngine, repo_id: str, added: set[tuple[str, str]]) -> set[str]:
+    """Route files whose Endpoint IMPLEMENTS a handler that only existed as
+    a file-less stub until the batch added a real Function of that name.
+    One graph lookup, only when the batch added Functions."""
+    functions = sorted(name for label, name in added if label == "Function")
+    if not functions:
+        return set()
+    return engine.find_handler_stub_sources(repo_id, functions)
+
+
+def _mention_referrers(engine: GraphEngine, repo_id: str, root: Path, names: set[str], batch: set[str]) -> set[str]:
+    """Markdown files (already indexed for mentions) that mention an added
+    node's name the way the mentions extractor matches it. A plain text
+    check per file; only matching files are re-indexed."""
+    found = set()
+    for rel_path in sorted(engine.list_indexed_files(repo_id)):
+        if not rel_path.endswith((".md", ".markdown")) or rel_path in batch:
+            continue
+        path = root / rel_path
+        if _is_indexable_file(path) and mentions_any(_read_text(path), names):
+            found.add(rel_path)
+    return found
+
+
+def _same_package_subtype_referrers(
+    root: Path,
+    added: set[tuple[str, str]],
+    batch: set[str],
+    jvm_extractions: dict[str, tuple[list[dict], list[dict]]],
+) -> set[str]:
+    """Java/Kotlin files in the same directory (package) as an added Class
+    that name it -- a same-package subtype needs no import, so there is no
+    IMPORTS edge for _expand_with_reverse_dependents to follow. A word
+    match over sibling files with the same extension."""
+    found = set()
+    for rel_path, (nodes, _rels) in jvm_extractions.items():
+        classes = {node["name"] for node in nodes if node["label"] == "Class" and ("Class", node["name"]) in added}
+        if not classes:
+            continue
+        pattern = re.compile(r"\b(?:" + "|".join(re.escape(name) for name in sorted(classes)) + r")\b")
+        source = root / rel_path
+        for sibling in sorted(source.parent.iterdir()):
+            sibling_rel = sibling.relative_to(root).as_posix()
+            if sibling.suffix != source.suffix or sibling_rel in batch or not _is_indexable_file(sibling):
+                continue
+            if pattern.search(_read_text(sibling)):
+                found.add(sibling_rel)
+    return found
+
+
+def _read_text(path: Path) -> str:
+    """A referrer candidate's text, or "" if it can't be read (it is then
+    simply not a referrer)."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path]) -> int:

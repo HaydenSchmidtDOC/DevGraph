@@ -631,6 +631,9 @@ _ORDER_FIXTURE = {
     "api/handlers.py": "def list_items():\n    pass\n\ndef fetch_items():\n    pass\n",
     "worker.py": "import psycopg2\nimport redis\n\nclass Worker:\n    def run(self):\n        fetch_items()\n",
     "store/Store.java": "package store;\n\npublic interface Store {\n    void save();\n}\n",
+    # Kotlin implementation before its same-package interface.
+    "repo/ASqlRepo.kt": "package repo\n\nclass ASqlRepo : Repo {\n    override fun save() {}\n}\n",
+    "repo/Repo.kt": "package repo\n\ninterface Repo {\n    fun save()\n}\n",
     "store/SqlStore.java": (
         "package store;\n\npublic class SqlStore implements Store {\n    public void save() {}\n}\n"
     ),
@@ -691,6 +694,9 @@ _SCAN_AND_EXPORT = textwrap.dedent(
 class _NoImportersEngine:
     def find_importing_modules(self, repo_id, module_name):
         return []
+
+    def list_file_nodes(self, repo_id, files):
+        return set()
 
 
 class TestDeterministicIndexOrder:
@@ -801,6 +807,9 @@ _REFERRER_FIRST_FIXTURE = {
     # Java implementation before its interface.
     "store/ASqlStore.java": "package store;\n\npublic class ASqlStore implements Store {\n    public void save() {}\n}\n",
     "store/Store.java": "package store;\n\npublic interface Store {\n    void save();\n}\n",
+    # Kotlin implementation before its same-package interface.
+    "repo/ASqlRepo.kt": "package repo\n\nclass ASqlRepo : Repo {\n    override fun save() {}\n}\n",
+    "repo/Repo.kt": "package repo\n\ninterface Repo {\n    fun save()\n}\n",
     "src/z.py": "class Zebra:\n    pass\n",
 }
 
@@ -835,7 +844,30 @@ _CROSS_FILE_EDGES = {
     "extends": (
         "MATCH (:Class {repo_id: $repo_id, name: 'ASqlStore'})-[:EXTENDS]->(:Class {name: 'Store'}) RETURN count(*) AS c"
     ),
+    "kotlin extends": (
+        "MATCH (:Class {repo_id: $repo_id, name: 'ASqlRepo'})-[:EXTENDS]->(:Class {name: 'Repo'}) RETURN count(*) AS c"
+    ),
 }
+
+# Per lookup kind: the referrer files, the target files added in a later
+# batch, and the edges that batch must create from the referrers.
+_RELINK_KINDS = {
+    "docs notes": (
+        {"docs/a-new.md"},
+        {"docs/b-old.md", "docs/c-arch.md", "src/z.py"},
+        {"supersedes", "decided by", "documented by"},
+    ),
+    "api handler stubs": ({"api/urls.py"}, {"api/views.py"}, {"implements"}),
+    "mentions": (
+        {"a.md"},
+        {"src/z.py", "docs/b-old.md", "notes/z.md"},
+        {"mentions class", "mentions decision", "mentions document"},
+    ),
+    "java same-package extends": ({"store/ASqlStore.java"}, {"store/Store.java"}, {"extends"}),
+    "kotlin same-package extends": ({"repo/ASqlRepo.kt"}, {"repo/Repo.kt"}, {"kotlin extends"}),
+}
+
+_REFERRERS = set().union(*(referrers for referrers, _, _ in _RELINK_KINDS.values()))
 
 
 def _write_fixture(root: Path, fixture: dict[str, str]) -> None:
@@ -858,23 +890,56 @@ class TestCrossFileEdgesIndependentOfOrder:
         finally:
             engine.delete_repository(repo_id)
 
-    def test_adding_a_target_later_does_not_relink_existing_referrers(self, engine, temp_repo):
-        """Known limitation: an incremental batch that adds only a target file
-        does not re-resolve edges from referrers indexed earlier -- nothing in
-        the graph points from a referrer to a node that didn't exist yet, so
-        there is no reverse-dependent to find. Re-indexing the referrer (or a
-        full rescan) links it. Update this test when the incremental gap is
-        closed."""
+    def test_adding_a_target_later_relinks_existing_referrers(self, engine, temp_repo):
+        """An incremental batch that adds only target files re-indexes the
+        referrers indexed earlier, so their edges form without the referrer
+        changing or a full rescan."""
         repo_id = "_smoketest_dispatch_referrer_first_incremental"
         _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
-        referrers = {"a.md", "docs/a-new.md", "api/urls.py", "store/ASqlStore.java"}
         try:
-            index_paths(engine, repo_id, temp_repo, {temp_repo / r for r in referrers}, docs_path="docs", mentions_enabled=True)
-            targets = set(_REFERRER_FIRST_FIXTURE) - referrers
-            index_paths(engine, repo_id, temp_repo, {temp_repo / t for t in targets}, docs_path="docs", mentions_enabled=True)
+            index_paths(engine, repo_id, temp_repo, {temp_repo / r for r in _REFERRERS}, docs_path="docs", mentions_enabled=True)
             assert set(_missing_edges(engine, repo_id)) == set(_CROSS_FILE_EDGES)
 
-            index_paths(engine, repo_id, temp_repo, {temp_repo / r for r in referrers}, docs_path="docs", mentions_enabled=True)
+            targets = set(_REFERRER_FIRST_FIXTURE) - _REFERRERS
+            index_paths(engine, repo_id, temp_repo, {temp_repo / t for t in targets}, docs_path="docs", mentions_enabled=True)
+            assert _missing_edges(engine, repo_id) == []
+        finally:
+            engine.delete_repository(repo_id)
+
+    @pytest.mark.parametrize("kind", sorted(_RELINK_KINDS))
+    def test_each_lookup_kind_relinks_its_referrers(self, engine, temp_repo, kind):
+        referrers, targets, edges = _RELINK_KINDS[kind]
+        repo_id = "_smoketest_dispatch_relink_" + kind.replace(" ", "_")
+        _write_fixture(temp_repo, {rel: _REFERRER_FIRST_FIXTURE[rel] for rel in referrers | targets})
+        mentions_enabled = kind == "mentions"
+        try:
+            index_paths(engine, repo_id, temp_repo, {temp_repo / r for r in referrers}, docs_path="docs", mentions_enabled=mentions_enabled)
+            index_paths(engine, repo_id, temp_repo, {temp_repo / t for t in targets}, docs_path="docs", mentions_enabled=mentions_enabled)
+            assert edges.isdisjoint(_missing_edges(engine, repo_id))
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_batches_that_add_no_targets_index_no_extra_files(self, engine, temp_repo, monkeypatch):
+        """Cost guard: a full scan indexes each file once, and re-indexing
+        unchanged target files (they add no new nodes) pulls in no referrers."""
+        repo_id = "_smoketest_dispatch_relink_cost"
+        _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
+        seen: list[str] = []
+        original = dispatch._index_single_path
+
+        def record(engine, repo_id, repo_root, resolved, rel_path, *args):
+            seen.append(rel_path)
+            return original(engine, repo_id, repo_root, resolved, rel_path, *args)
+
+        monkeypatch.setattr(dispatch, "_index_single_path", record)
+        try:
+            full_scan(engine, repo_id, temp_repo, docs_path="docs", mentions_enabled=True)
+            assert sorted(seen) == sorted(_REFERRER_FIRST_FIXTURE)
+
+            seen.clear()
+            targets = set(_REFERRER_FIRST_FIXTURE) - _REFERRERS
+            index_paths(engine, repo_id, temp_repo, {temp_repo / t for t in targets}, docs_path="docs", mentions_enabled=True)
+            assert sorted(seen) == sorted(targets)
             assert _missing_edges(engine, repo_id) == []
         finally:
             engine.delete_repository(repo_id)

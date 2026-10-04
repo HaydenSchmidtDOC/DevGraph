@@ -285,6 +285,18 @@ def _find_in_code_regions(content: str, name: str, code_regions: list[tuple[int,
     return False
 
 
+def mentions_any(content: str, names: set[str]) -> bool:
+    """Whether `content` mentions any of `names` the way extract_from_source
+    would match it (code span, call or declaration syntax). A cheap
+    pre-check: lets a caller skip re-indexing a file that can't gain an
+    edge to any of these names."""
+    candidates = [name for name in names if name in content]
+    if not candidates:
+        return False
+    code_regions = _parse_code_regions(content)
+    return any(_find_matches(content, name, code_regions) for name in candidates)
+
+
 def _document_name(file_path: Path, repo_root: str | Path | None) -> str:
     """The Document node's name: file_path relative to repo_root (forward
     slashes), or the bare filename when repo_root is omitted or doesn't
