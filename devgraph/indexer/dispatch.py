@@ -145,7 +145,18 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     go_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     module_path = _find_module_path(repo_root)
 
-    paths = _expand_with_reverse_dependents(engine, repo_id, repo_root, paths)
+    # Process files in a fixed order, not set order. Several edges are
+    # MATCH-then-MATCH (IMPLEMENTS, MENTIONS, SUPERSEDES) and only form if
+    # the other endpoint's file was indexed earlier, and shared nodes
+    # (Datastore/Endpoint) keep the last writer's `source`/`library` and
+    # accumulate `sources` in claim order -- so iterating the set directly
+    # made the graph depend on PYTHONHASHSEED. Sorting by POSIX path (every
+    # path here is under repo_root, so this is repo-relative order) makes a
+    # scan of the same tree produce the same graph every run.
+    paths = sorted(
+        _expand_with_reverse_dependents(engine, repo_id, repo_root, paths),
+        key=lambda p: Path(p).as_posix(),
+    )
 
     for path in paths:
         path = Path(path)
@@ -180,10 +191,10 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             )
 
     # Second pass: re-upsert every .py file's already-extracted nodes/edges
-    # (no re-parse, no re-prune). Batch iteration order is unspecified (paths
-    # is a set), so a CALLS/IMPORTS edge from file X to file Y within the
+    # (no re-parse, no re-prune). Batch order is path order, not dependency
+    # order, so a CALLS/IMPORTS edge from file X to file Y within the
     # SAME batch can silently fail to materialize on the first pass if X
-    # happens to be processed before Y — upsert_relationships only
+    # happens to sort before Y — upsert_relationships only
     # MATCH-MATCHes existing endpoint nodes, it doesn't create them, so Y's
     # node isn't there yet when X's edges are upserted. Re-upserting (not
     # re-pruning) every file's cached extraction a second time is idempotent
@@ -244,8 +255,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # Service cross-linking runs as a final pass, after every file in this
     # batch (including any compose file) has been indexed — Service nodes'
     # build_context properties must already be in the graph for this to find
-    # anything, and paths/a compose file can be indexed in any order within
-    # one batch (set iteration has no guaranteed order). The Service/
+    # anything, and a compose file can sort after the files it owns within
+    # one batch. The Service/
     # build_context lookup is loaded once for the whole batch rather than
     # once per file, since it can't have changed mid-batch (Services are
     # only written by the Containerfile/compose branches above, already run

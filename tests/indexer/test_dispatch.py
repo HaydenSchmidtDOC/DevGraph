@@ -4,12 +4,18 @@ that was previously missing entirely: extractors existed but nothing called
 them from add/rescan/watch.
 """
 
+import json
+import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 from pathlib import Path
 
 import pytest
 
 from devgraph.graph.engine import GraphEngine
+from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 
 
@@ -610,3 +616,123 @@ class TestMentionsIntegration:
             assert mentions_result[0]["c"] >= 2
         finally:
             engine.delete_repository(repo_id)
+
+
+# A small repo whose graph depends on file order if indexing follows set
+# order: an Endpoint IMPLEMENTS edge to a same-named handler in another file,
+# a Java interface/implementation pair, a Markdown doc mentioning code
+# symbols, a SUPERSEDES chain of design decisions, and a Datastore node two
+# files (and two libraries in one file) both claim.
+_ORDER_FIXTURE = {
+    "api/routes.py": (
+        "import psycopg2\nimport psycopg\n\n"
+        "@app.get('/items')\ndef list_items():\n    return fetch_items()\n"
+    ),
+    "api/handlers.py": "def list_items():\n    pass\n\ndef fetch_items():\n    pass\n",
+    "worker.py": "import psycopg2\nimport redis\n\nclass Worker:\n    def run(self):\n        fetch_items()\n",
+    "store/Store.java": "package store;\n\npublic interface Store {\n    void save();\n}\n",
+    "store/SqlStore.java": (
+        "package store;\n\npublic class SqlStore implements Store {\n    public void save() {}\n}\n"
+    ),
+    "NOTES.md": "# Notes\n\n`list_items()` is served by `SqlStore` and `Worker`.\n",
+    "docs/adr-0001.md": "---\ntype: design_decision\nid: adr-0001\n---\n# Use Postgres\n",
+    "docs/adr-0002.md": (
+        "---\ntype: design_decision\nid: adr-0002\nsupersedes: adr-0001\n---\n# Use `SqlStore`\n"
+    ),
+    "docs/adr-0003.md": (
+        "---\ntype: design_decision\nid: adr-0003\nsupersedes: adr-0002\n---\n# Keep `Worker`\n"
+    ),
+}
+
+# Runs one full scan in a fresh interpreter (so PYTHONHASHSEED takes effect)
+# and prints the resulting graph with the per-run repo_id stripped.
+_SCAN_AND_EXPORT = textwrap.dedent(
+    """
+    import json, sys
+    from pathlib import Path
+    from devgraph.graph.engine import GraphEngine
+    from devgraph.indexer.dispatch import full_scan
+
+    repo_root, repo_id = Path(sys.argv[1]), sys.argv[2]
+    engine = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
+    try:
+        full_scan(engine, repo_id, repo_root, docs_path="docs", mentions_enabled=True)
+
+        def ident(labels, props):
+            return [sorted(labels), props.get("name"), props.get("file"), props.get("source_file")]
+
+        nodes = sorted(
+            json.dumps([sorted(r["labels"]), {k: v for k, v in r["props"].items() if k != "repo_id"}], sort_keys=True)
+            for r in engine.run_cypher(
+                "MATCH (n {repo_id: $repo_id}) RETURN labels(n) AS labels, properties(n) AS props",
+                {"repo_id": repo_id},
+            )
+        )
+        rels = sorted(
+            json.dumps(
+                [ident(r["a_labels"], r["a"]), r["type"], r["props"], ident(r["b_labels"], r["b"])],
+                sort_keys=True,
+            )
+            for r in engine.run_cypher(
+                "MATCH (a {repo_id: $repo_id})-[rel]->(b {repo_id: $repo_id}) "
+                "RETURN labels(a) AS a_labels, properties(a) AS a, type(rel) AS type, "
+                "properties(rel) AS props, labels(b) AS b_labels, properties(b) AS b",
+                {"repo_id": repo_id},
+            )
+        )
+        print(json.dumps({"nodes": nodes, "rels": rels}))
+    finally:
+        engine.delete_repository(repo_id)
+        engine.close()
+    """
+)
+
+
+class _NoImportersEngine:
+    def find_importing_modules(self, repo_id, module_name):
+        return []
+
+
+class TestDeterministicIndexOrder:
+    def test_index_paths_processes_files_in_sorted_path_order(self, temp_repo, monkeypatch):
+        """Files are indexed in repo-relative path order, whatever order the
+        caller's set happens to iterate in."""
+        for rel in _ORDER_FIXTURE:
+            (temp_repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (temp_repo / rel).write_text(_ORDER_FIXTURE[rel])
+
+        seen: list[str] = []
+
+        def record(engine, repo_id, repo_root, resolved, rel_path, *args):
+            seen.append(rel_path)
+            return 1
+
+        monkeypatch.setattr(dispatch, "_index_single_path", record)
+        index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {temp_repo / rel for rel in _ORDER_FIXTURE})
+
+        assert seen == sorted(_ORDER_FIXTURE)
+
+    def test_full_scan_graph_is_identical_across_hash_seeds(self, engine, temp_repo):
+        """Two full scans of the same tree under different PYTHONHASHSEEDs
+        must produce the same nodes, properties and edges."""
+        for rel in _ORDER_FIXTURE:
+            (temp_repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (temp_repo / rel).write_text(_ORDER_FIXTURE[rel])
+
+        exports = []
+        for seed in ("1", "2", "3"):
+            repo_id = f"_smoketest_dispatch_hashseed_{seed}"
+            proc = subprocess.run(
+                [sys.executable, "-c", _SCAN_AND_EXPORT, str(temp_repo), repo_id],
+                env={**os.environ, "PYTHONHASHSEED": seed},
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            engine.delete_repository(repo_id)
+            assert proc.returncode == 0, proc.stderr
+            exports.append(json.loads(proc.stdout.strip().splitlines()[-1]))
+
+        assert exports[0]["rels"], "fixture should produce edges"
+        for other in exports[1:]:
+            assert other == exports[0]
