@@ -33,9 +33,11 @@ restart, then tells the client its tool list changed.
 - **Mid-save states.** A save can be seen half-done (an empty file caught
   mid-write, or delete-then-recreate), which can produce two notifications
   about 2 seconds apart. Accepted: the second poll corrects the tool set.
-- **Failed and racy reloads.** The fingerprint is taken before each load
-  (including the startup one) and checked again after; if the file changed
-  meanwhile, or the reload raised, the next poll reloads again. A missing
+- **Failed and racy reloads.** The file is read once per load, as its
+  fingerprint, and the reload (startup included) parses exactly those bytes,
+  so a save landing mid-load cannot make the served tools differ from the
+  fingerprint; a later save changes the fingerprint and is picked up on the
+  next poll. A reload that raised is retried on the next poll. A missing
   repository root has its own fingerprint (`root-missing`), so its notice is
   cleared when the root returns. A reload that ends with file-level notices
   is logged as a warning on stderr.

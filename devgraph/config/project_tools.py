@@ -282,6 +282,11 @@ def load_project_tools(repo_root: Path) -> ProjectTools | None:
         raise ProjectToolsError(f"{path}: cannot be read: {exc}") from exc
     except UnicodeDecodeError as exc:
         raise ProjectToolsError(f"{path}: is not valid UTF-8: {exc}") from exc
+    return parse_project_tools(text, path)
+
+
+def parse_project_tools(text: str, path: Path) -> ProjectTools:
+    """Parse and validate the text of a tools file; `path` only labels errors."""
     try:
         document = yaml.safe_load(text)
     except yaml.YAMLError as exc:

@@ -23,7 +23,7 @@ from devgraph.config.project_tools import (
     TOOLS_FILENAME,
     CypherTool,
     ProjectToolsError,
-    load_project_tools,
+    parse_project_tools,
     tools_file_path,
 )
 from devgraph.mcp.catalog import builtin_tool_names
@@ -187,6 +187,7 @@ def register_project_tools(
     annotations: Any,
     pinned: str | None = None,
     registry: Any | None = None,
+    fingerprint: bytes | str | None = None,
 ) -> ToolPlaneStatus:
     """Register the session repository's tools on `server`; report what happened."""
     if repo is None:
@@ -206,7 +207,8 @@ def register_project_tools(
         return status
 
     status = ToolPlaneStatus(repo_id=repo.repo_id, source=source)
-    _serve_repository(server, engine, repo, status, instrument=instrument, annotations=annotations)
+    _serve_repository(server, engine, repo, status, instrument=instrument, annotations=annotations,
+                      fingerprint=fingerprint)
     return status
 
 
@@ -218,17 +220,31 @@ def _serve_repository(
     *,
     instrument: Callable[[Callable[..., Any]], Callable[..., Any]],
     annotations: Any,
+    fingerprint: bytes | str | None = None,
 ) -> None:
-    """Read the repository's tools file and register its tools, recording the outcome on `status`."""
-    if not Path(repo.path).is_dir():
+    """Parse the repository's tools file and register its tools, recording the outcome on `status`.
+
+    The file is read once, as `fingerprint` (its bytes); the tools served are exactly
+    the ones those bytes declare. Without a `fingerprint` it is read now.
+    """
+    if fingerprint is None:
+        fingerprint = tools_fingerprint(repo.path)
+    if fingerprint == "root-missing":
         status.notices.append(f"the root of repository {repo.repo_id!r} ({repo.path}) does not exist; no project tools are served")
         return
+    if fingerprint == "absent":
+        return
+    path = tools_file_path(repo.path)
     try:
-        declared = load_project_tools(repo.path)
+        if not isinstance(fingerprint, bytes):
+            raise ProjectToolsError(f"{path}: cannot be read: {fingerprint.partition(':')[2]}")
+        try:
+            text = fingerprint.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProjectToolsError(f"{path}: is not valid UTF-8: {exc}") from exc
+        declared = parse_project_tools(text, path)
     except ProjectToolsError as exc:
         status.notices.append(f"invalid {TOOLS_FILENAME}; no project tools are served: {str(exc).splitlines()[0]}")
-        return
-    if declared is None:
         return
 
     status.tools_file = str(tools_file_path(repo.path))
@@ -276,12 +292,10 @@ class ProjectToolPlane:
     def __init__(self, server: Any, engine: Any, repo: Any | None, status: ToolPlaneStatus, *,
                  instrument: Callable[[Callable[..., Any]], Callable[..., Any]], annotations: Any,
                  fingerprint: bytes | str | None = None) -> None:
-        """`fingerprint` is the tools file as it was *before* the initial load, so a save during the load is noticed."""
+        """`fingerprint` is the tools file as the initial load read it (see `register_project_tools`)."""
         self.server, self.engine, self.repo, self.status = server, engine, repo, status
         self._instrument, self._annotations = instrument, annotations
         self._fingerprint = fingerprint
-        if repo is not None and fingerprint is not None and tools_fingerprint(repo.path) != fingerprint:
-            self._fingerprint = None  # changed during the initial load: reload on the next poll
 
     def reload_if_changed(self) -> bool:
         """Re-serve the tools file if its bytes changed. True when the served tools changed."""
@@ -300,9 +314,8 @@ class ProjectToolPlane:
         self.status.definitions.clear()
         self.status.notices.clear()
         _serve_repository(self.server, self.engine, self.repo, self.status,
-                          instrument=self._instrument, annotations=self._annotations)
-        # Only trust the fingerprint if the file did not change while it was being read.
-        self._fingerprint = fingerprint if tools_fingerprint(self.repo.path) == fingerprint else None
+                          instrument=self._instrument, annotations=self._annotations, fingerprint=fingerprint)
+        self._fingerprint = fingerprint  # the reload parsed exactly these bytes
         if self.status.notices:
             logger.warning("reloaded %s with problems: %s", tools_file_path(self.repo.path), self.status.notices[0])
         return self.status.definitions != before

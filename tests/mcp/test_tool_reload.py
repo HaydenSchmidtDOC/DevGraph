@@ -284,45 +284,61 @@ def test_a_legacy_client_is_captured_once(tmp_path, monkeypatch):
     anyio.run(scenario)
 
 
-def test_a_change_during_a_reload_is_reloaded_again(tmp_path, monkeypatch):
-    server, repo = build(tmp_path, monkeypatch)
-    plane = server.devgraph_tool_plane
-    real = tool_plane.load_project_tools
-    calls = []
+def _emptied_after_the_first_read(module, repo, monkeypatch):
+    """Make a truncate-then-write save land right after the fingerprint read (identical bytes follow)."""
+    real = module.tools_fingerprint
+    reads = []
 
     def racing(path):
-        loaded = real(path)
-        if not calls:
-            write(repo, ONE)  # saved again after we read it
-        calls.append(1)
-        return loaded
+        fingerprint = real(path)
+        if not reads:
+            reads.append(1)
+            (repo / TOOLS_FILENAME).write_text("")
+        return fingerprint
 
+    monkeypatch.setattr(module, "tools_fingerprint", racing)
+
+
+def test_a_reload_parses_the_bytes_it_fingerprinted(tmp_path, monkeypatch):
+    server, repo = build(tmp_path, monkeypatch)
+    plane = server.devgraph_tool_plane
     write(repo, TWO)
-    monkeypatch.setattr(tool_plane, "load_project_tools", racing)
+    _emptied_after_the_first_read(tool_plane, repo, monkeypatch)
     assert plane.reload_if_changed() is True
     assert "count_files" in tools(server)
+    write(repo, TWO)  # the save completes with identical bytes
+    assert plane.reload_if_changed() is False
+    assert "count_files" in tools(server)
+
+
+def test_a_save_during_a_reload_is_reloaded_next(tmp_path, monkeypatch):
+    server, repo = build(tmp_path, monkeypatch)
+    plane = server.devgraph_tool_plane
+    real = tool_plane.tools_fingerprint
+
+    def racing(path):
+        fingerprint = real(path)
+        write(repo, ONE)  # saved again right after the read
+        return fingerprint
+
+    write(repo, TWO)
+    monkeypatch.setattr(tool_plane, "tools_fingerprint", racing)
+    assert plane.reload_if_changed() is True
+    monkeypatch.setattr(tool_plane, "tools_fingerprint", real)
     assert plane.reload_if_changed() is True
     assert "count_files" not in tools(server)
-    assert plane.reload_if_changed() is False
 
 
-def test_a_change_during_the_startup_load_is_reloaded(tmp_path, monkeypatch):
+def test_the_startup_load_parses_the_bytes_it_fingerprinted(tmp_path, monkeypatch):
     repo = tmp_path / "demo"
     repo.mkdir()
     write(repo, ONE)
-    real = tool_plane.load_project_tools
-
-    def racing(path):
-        loaded = real(path)
-        write(repo, TWO)
-        return loaded
-
-    monkeypatch.setattr(tool_plane, "load_project_tools", racing)
-    server, _ = build(tmp_path, monkeypatch)
-    monkeypatch.setattr(tool_plane, "load_project_tools", real)
-    assert "count_files" not in tools(server)
-    assert server.devgraph_tool_plane.reload_if_changed() is True
-    assert "count_files" in tools(server)
+    _emptied_after_the_first_read(mcp_server, repo, monkeypatch)
+    server, _ = build(tmp_path, monkeypatch, tools=None)
+    assert "list_files" in tools(server)
+    assert status(server)["notices"] == []
+    write(repo, ONE)
+    assert server.devgraph_tool_plane.reload_if_changed() is False
 
 
 def test_a_root_that_goes_missing_is_noticed_and_cleared_when_it_returns(tmp_path, monkeypatch):
