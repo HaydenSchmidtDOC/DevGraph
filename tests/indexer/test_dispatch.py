@@ -692,6 +692,9 @@ class _NoImportersEngine:
     def find_importing_modules(self, repo_id, module_name):
         return []
 
+    def read_applied_schema(self, repo_id):
+        return None
+
 
 class TestDeterministicIndexOrder:
     def test_index_paths_processes_files_in_sorted_path_order(self, temp_repo, monkeypatch):
