@@ -31,10 +31,13 @@ def test_no_state_until_recorded(engine):
 
 def test_record_and_read_back(engine):
     engine.upsert_repository(REPO, REPO, "/tmp/demo")
-    engine.record_applied_schema(REPO, "sha256:abc", ["Widget"], ["LINKS"])
-    assert engine.read_applied_schema(REPO) == {"hash": "sha256:abc", "labels": ["Widget"], "relationship_types": ["LINKS"]}
+    engine.record_applied_schema(REPO, "sha256:abc", ["Widget"], ["LINKS"], ["Widget:sku"])
+    assert engine.read_applied_schema(REPO) == {
+        "hash": "sha256:abc", "labels": ["Widget"], "relationship_types": ["LINKS"], "keys": ["Widget:sku"]
+    }
+    assert {"repo_id": REPO, "labels": ["Widget"], "keys": ["Widget:sku"]} in engine.read_all_applied_schemas()
     engine.record_applied_schema(REPO, "absent", [], [])
-    assert engine.read_applied_schema(REPO) == {"hash": "absent", "labels": [], "relationship_types": []}
+    assert engine.read_applied_schema(REPO) == {"hash": "absent", "labels": [], "relationship_types": [], "keys": []}
 
 
 def test_delete_label_nodes_is_scoped_to_the_repo(engine):

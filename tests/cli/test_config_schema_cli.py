@@ -544,7 +544,8 @@ def test_edit_changing_key_warns_constraint_keeps_old_key(runner, repo, tmp_path
     result = run(runner, "edit", "Ticket", "--from", src(tmp_path, new), "--repo", str(repo))
     assert result.exit_code == 0, result.output
     out = flat(result.output)
-    assert "uniqueness constraint on Ticket keeps the old key (id)" in out and "dropping constraints" in out
+    assert "uniqueness constraint on Ticket keeps the old key (id) until this schema is applied" in out
+    assert "every repository declaring Ticket uses the new key" in out
 
 
 def test_add_duplicate_relationship_compares_validated_form(runner, repo, tmp_path):

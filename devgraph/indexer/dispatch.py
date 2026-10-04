@@ -43,6 +43,7 @@ from devgraph.indexer.cpp.extractor import extract_cpp_file
 from devgraph.indexer.providers import filesystem
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
+from devgraph.indexer.schema_constraints import encode_keys, realign_keys, release_labels
 
 logger = logging.getLogger(__name__)
 
@@ -137,10 +138,12 @@ def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> 
 
     Provisions constraints/indexes, deletes nodes and relationships of user
     types the previously applied schema declared but this one doesn't
-    (built-ins are never touched), re-syncs the filesystem provider, and
-    records the applied state. An invalid schema or a provisioning failure
-    returns False with the graph untouched; errors from the deletion or
-    reconcile steps propagate.
+    (built-ins are never touched), re-syncs the filesystem provider, records
+    the applied state, then reconciles the generated constraints/indexes with
+    every repository's recorded state (see schema_constraints). An invalid
+    schema or a provisioning failure returns False with the graph untouched;
+    errors from the deletion or reconcile steps propagate, while a failed
+    constraint reconcile is only logged.
     """
     current_hash = schema_file_hash(repo_root)
     try:
@@ -158,9 +161,12 @@ def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> 
     rel_types = list(dict.fromkeys(r.type for r in effective.relationships if r.type not in RELATIONSHIP_TYPES))
     previous = engine.read_applied_schema(repo_id) or {}
     # Re-validated: these names come back from the graph and are interpolated.
-    for label in previous.get("labels") or []:
-        if label not in labels and label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or ""):
-            engine.delete_label_nodes(repo_id, label)
+    removed_labels = [
+        label for label in previous.get("labels") or []
+        if label not in labels and label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or "")
+    ]
+    for label in removed_labels:
+        engine.delete_label_nodes(repo_id, label)
     for rel_type in previous.get("relationship_types") or []:
         if rel_type not in rel_types and rel_type not in RELATIONSHIP_TYPES and RELATIONSHIP_TYPE_PATTERN.fullmatch(rel_type or ""):
             engine.delete_relationship_type(repo_id, rel_type)
@@ -170,7 +176,14 @@ def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> 
     filesystem.reconcile(engine, repo_id, spec, on_disk)
     if spec is not None:
         filesystem.sync_present(engine, repo_id, spec, on_disk)
-    engine.record_applied_schema(repo_id, current_hash, labels, rel_types)
+    engine.record_applied_schema(repo_id, current_hash, labels, rel_types, encode_keys(effective.node_types))
+    # After recording, so this repository's new state is part of what every
+    # other repository's declarations are weighed against.
+    try:
+        release_labels(engine, removed_labels)
+        realign_keys(engine, effective.node_types)
+    except Exception as exc:
+        logger.warning("could not reconcile generated constraints/indexes for %s: %s", repo_id, exc)
     return True
 
 
