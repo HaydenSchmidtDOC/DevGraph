@@ -18,7 +18,7 @@ from devgraph.config.project_schema import SCHEMA_FILENAME
 from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError, parse_project_tools
 from devgraph.config.settings import get_settings
 from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
-from devgraph.mcp.catalog import TOOL_CATALOG, builtin_tool_names
+from devgraph.mcp.catalog import TOOL_CATALOG, builtin_tool_names, scoped_tool_id
 
 GLOBAL_SCOPE = "__global__"
 GLOBAL_TOOLS_FILENAME = "global-tools.json"
@@ -81,7 +81,7 @@ def _builtin_tools() -> list[dict[str, Any]]:
     return [
         {
             "name": tool["name"],
-            "tool_id": tool["name"],
+            "tool_id": scoped_tool_id(tool["name"], "builtin"),
             "locked": True,
             "description": (inspect.getdoc(getattr(devgraph_tools, tool["name"], None)) or "").split("\n")[0],
         }
@@ -114,7 +114,7 @@ def _global_entry(entry: dict, overridden_in: list[str]) -> dict[str, Any]:
     if overridden_in:
         badges.append(badge("info", "overridden", f"Overridden in {', '.join(overridden_in)}",
                             "These repositories' own tools of this name win over the global one."))
-    return {"name": name, "tool_id": f"gl_{name}", "yaml": dump_entry(entry), "badges": badges}
+    return {"name": name, "tool_id": scoped_tool_id(name, "global"), "yaml": dump_entry(entry), "badges": badges}
 
 
 def build_global(records: list[Any], resolutions: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -168,7 +168,7 @@ def _project_tool_entry(record: Any, status: Any, entry: dict, tools_path: Path,
         badges.append(badge("error", "not-served", "Not served", status.fallback_reasons[name]))
     return {
         "name": name,
-        "tool_id": f"{record.repo_id}_{name}",
+        "tool_id": scoped_tool_id(name, "project", record.repo_id),
         "yaml": dump_entry(entry),
         "origin": origin,
         "badges": badges,

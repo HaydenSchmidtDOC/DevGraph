@@ -612,7 +612,7 @@ table.dstable input[type="text"] { width: 100%; }
 
       <div class="card" data-od-id="query-telemetry-card">
         <div class="card-head"><h3>Query telemetry</h3><span class="sample-pill" id="mcpPill">Checking…</span></div>
-        <div class="metric-row"><span class="metric-label">Tool calls (MCP, last 500)<span class="qmark" data-tip="MCP tool calls recorded by connected MCP clients (devgraph/mcp/server.py), metadata only — no query text, arguments, or repository. The store keeps the newest 500 records.">?</span></span><span class="metric-val dim" id="mcpCallsVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">Tool calls (MCP, last 500)<span class="qmark" data-tip="MCP tool calls recorded by connected MCP clients (devgraph/mcp/server.py), metadata only — no query text or arguments; a project tool's id names the repository its session is scoped to. The store keeps the newest 500 records.">?</span></span><span class="metric-val dim" id="mcpCallsVal">—</span></div>
         <div class="metric-row"><span class="metric-label">Top tools (MCP)</span><span class="metric-val dim" id="mcpTopToolsVal" style="flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</span></div>
         <div class="metric-row"><span class="metric-label">P50 / P95 / P99 latency (MCP)</span><span class="metric-val dim" id="latencyVal">— / — / —</span></div>
         <div class="metric-row"><span class="metric-label">Error rate (MCP)</span><span class="metric-val dim" id="errRateVal">—</span></div>
@@ -3785,7 +3785,9 @@ async function attemptQueryTelemetry() {
 /* ── the MCP half of the Query telemetry card ───────────────────────────
    Reads GET /api/mcp-telemetry, the dashboard's view of what connected MCP
    clients ran in their own server processes (metadata only: timestamp, tool
-   name, duration, outcome -- no query text, arguments or repository). This
+   name, scoped tool id, origin, duration, outcome -- no query text or
+   arguments; a project tool's id names the repository its session is scoped
+   to, taken from the server's configuration, never from a call). This
    source is a local file the endpoint reads, so it works with the database
    down; nothing below touches the graph.
 
@@ -3816,27 +3818,37 @@ function mcpPercentile(sorted, p) {
    such instead of silently standing in for it. */
 function summarizeMcpTelemetry(entries) {
   if (!Array.isArray(entries)) return null;
-  const counts = new Map();
+  const counts = new Map(); // key "origin\u0000id" -> { id, tool, origin, n }
   const durations = [];
   let calls = 0, skipped = 0, errors = 0, okSample = 0;
   for (const e of entries) {
     const tool = (e && typeof e.tool === "string") ? e.tool.trim() : "";
     if (!tool) { skipped++; continue; }
     calls++;
-    counts.set(tool, (counts.get(tool) || 0) + 1);
+    const id = (typeof e.tool_id === "string" && e.tool_id.trim()) ? e.tool_id.trim() : tool;
+    const origin = typeof e.origin === "string" ? e.origin : "";
+    const key = origin + "\u0000" + id;
+    const row = counts.get(key) || { id, tool, origin, n: 0 };
+    row.n++;
+    counts.set(key, row);
     if (Number.isFinite(e.duration_ms) && e.duration_ms >= 0) durations.push(e.duration_ms);
     if (typeof e.ok === "boolean") { okSample++; if (!e.ok) errors++; }
   }
   durations.sort((a, b) => a - b);
   // ties broken by name so the same store always renders the same list
-  const top = [...counts.entries()]
-    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-    .slice(0, 3)
-    .map(([tool, n]) => `${tool.slice(0, 32)} ×${n}`);
+  const ranked = [...counts.values()]
+    .sort((a, b) => b.n - a.n || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0) || (a.origin < b.origin ? -1 : a.origin > b.origin ? 1 : 0))
+    .slice(0, 3);
+  const top = ranked.map(r => `${r.id.slice(0, 48)} ×${r.n}`);
+  const topTitles = ranked.map(r => {
+    const origin = r.origin === "unscoped" ? "(recorded before scoped ids)" : (r.origin || "unknown origin");
+    return `${r.id} ×${r.n} — wire name ${r.tool}, origin ${origin}`;
+  });
   return {
     calls,
     skipped,
     top,
+    topTitles,
     latency: durations.length ? [50, 95, 99].map(p => formatMcpMs(mcpPercentile(durations, p))).join(" / ") : null,
     latencySample: durations.length,
     errorRate: okSample ? (errors / okSample * 100).toFixed(1) + "%" : null,
@@ -3891,7 +3903,7 @@ function renderMcpTelemetry(summary) {
   const topEl = document.getElementById("mcpTopToolsVal");
   const topText = summary.top.join(" · ");
   topEl.textContent = topText;
-  topEl.title = topText; // the row can ellipsise; the hover carries it whole
+  topEl.title = summary.topTitles.join("\n"); // the row can ellipsise; the hover carries each id whole, with wire name and origin
   topEl.classList.remove("dim");
   // Per-metric independence: a populated card still dashes a metric whose own
   // sample is empty, instead of borrowing the call count for it.
@@ -3910,7 +3922,7 @@ function renderMcpTelemetry(summary) {
   pill.textContent = "MCP live";
   pill.className = "wired-pill";
   pill.title = "MCP tool-call metadata read live from the local telemetry store";
-  note.textContent = `Live MCP tool-call metadata — ${summary.calls} of up to the last 500 recorded calls, metadata only: no query text, arguments, or repository. Latency percentiles cover ${summary.latencySample} of those ${summary.calls} calls that recorded a usable duration; error rate covers ${summary.okSample} that recorded a usable outcome.` + skippedClause;
+  note.textContent = `Live MCP tool-call metadata — ${summary.calls} of up to the last 500 recorded calls, metadata only: no query text or arguments (a project tool's id names the repository its session is scoped to). Latency percentiles cover ${summary.latencySample} of those ${summary.calls} calls that recorded a usable duration; error rate covers ${summary.okSample} that recorded a usable outcome.` + skippedClause;
 }
 async function attemptMcpTelemetry() {
   /* Pre-set per step so the rendered reason is this card's description of how

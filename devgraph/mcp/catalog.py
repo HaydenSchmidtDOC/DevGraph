@@ -40,3 +40,17 @@ TOOL_CATALOG: list[dict[str, Any]] = [
 def builtin_tool_names() -> frozenset[str]:
     """Names of DevGraph's own MCP tools: a project tool may not take one over."""
     return frozenset(entry["name"] for entry in TOOL_CATALOG)
+
+
+def scoped_tool_id(name: str, origin: str, repo_id: str | None = None) -> str:
+    """The identity a tool carries in telemetry and on the Config page.
+
+    Built-ins keep their bare name, a global tool is `gl_<name>`, a project tool
+    `<repo_id>_<name>`. Not reversible (a repo id may itself be `gl`), so telemetry
+    stores the origin beside it.
+    """
+    if origin == "global":
+        return f"gl_{name}"
+    if origin == "project":
+        return f"{repo_id}_{name}"
+    return name

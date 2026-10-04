@@ -168,7 +168,7 @@ Because there is no authentication, the dashboard answers only requests addresse
 
 ### Config page
 
-Settings > Config shows the configuration the MCP tool plane and the indexer actually use: the global scope first (built-in node types, relationship types and tools, locked, plus the global tools, flagged GLOBAL), then one block per active registered repository (project tools, node types and relationships from `devgraph.tools.yaml` and `devgraph.schema.yaml`). Tools show their display id (`gl_<name>` for global, `<repo_id>_<name>` for project, the bare name for built-ins); the ids are display-only and are not recorded in telemetry.
+Settings > Config shows the configuration the MCP tool plane and the indexer actually use: the global scope first (built-in node types, relationship types and tools, locked, plus the global tools, flagged GLOBAL), then one block per active registered repository (project tools, node types and relationships from `devgraph.tools.yaml` and `devgraph.schema.yaml`). Tools show their display id (`gl_<name>` for global, `<repo_id>_<name>` for project, the bare name for built-ins); MCP telemetry records the same ids (plus the wire name and origin) for each tool call.
 
 Badges use the same resolution rules as an MCP session, with the detail on hover:
 
@@ -188,7 +188,7 @@ Each tool, node type and relationship can be added, edited or deleted from a YAM
 
 The API behind it is `GET /api/config` and `GET /api/config/{scope}` (scope is `__global__` or a repo id), plus `POST`/`PUT`/`DELETE` on `/api/config/{scope}/tools[/{name}]` and `/api/config/{scope}/schema/{section}[/{name}]`. Writes are refused when `Origin`/`Sec-Fetch-Site` mark the request cross-site or cross-origin (403), on top of the `Host` check above. There is no authentication: if you set `DEVGRAPH_DASHBOARD_HOST` to a LAN address, anyone on that network can use these routes to write tool Cypher into your registered repositories and the global tools store.
 
-Not in this page yet: copying entries between repositories, whole-file reset and the project-config enable/disable toggle, a structured form editor, cross-repository schema conflict badges, recording scoped tool ids in telemetry, and retiring the prototype "MCP tools" pane.
+Not in this page yet: copying entries between repositories, whole-file reset and the project-config enable/disable toggle, a structured form editor, cross-repository schema conflict badges, and retiring the prototype "MCP tools" pane.
 
 ## Optional indexing
 

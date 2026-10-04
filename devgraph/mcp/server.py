@@ -24,8 +24,8 @@ a human copy-pasting a doc into another repo's CLAUDE.md/AGENTS.md:
     it can never drift out of sync with the actual tool surface since it's
     served from the same process that registers the tools.
 
-Every tool call is recorded, metadata only (timestamp, tool name, duration,
-success), to a local JSONL store in the DevGraph state directory —
+Every tool call is recorded, metadata only (timestamp, tool name, scoped tool
+id, origin, duration, success), to a local JSONL store in the DevGraph state directory —
 see `record_tool_call` below. It exists because this process is short-lived
 and separate from the dashboard's, and the dashboard reads it back over
 `GET /api/mcp-telemetry`. Nothing about it leaves the machine.
@@ -78,11 +78,14 @@ _CLIENT_GUIDE_PATH = Path(__file__).resolve().parent.parent.parent / "DEVGRAPH-C
 # a different one, and several connected clients record at the same time.
 _TELEMETRY_FILENAME = "mcp_telemetry.jsonl"
 # The whole of a record: metadata about the call, never anything drawn from
-# the call itself. Nothing derived from a tool's arguments belongs here — a
-# repo_id in particular is caller-supplied data, not metadata. Written by
+# the call itself. Nothing derived from a tool's arguments belongs here — the
+# built-ins' repo_id argument in particular is caller-supplied data. The one
+# repository name that appears is inside a project tool's tool_id, and it comes
+# from the server's own session configuration, not from the call. Written by
 # record_tool_call and re-applied as an allow-list by read_tool_telemetry, so
 # the guarantee holds at both ends of the store.
-_TELEMETRY_FIELDS = ("ts", "tool", "duration_ms", "ok")
+_TELEMETRY_FIELDS = ("ts", "tool", "tool_id", "origin", "duration_ms", "ok")
+_TELEMETRY_ORIGINS = ("builtin", "global", "project", "unscoped")
 # Kept in step with QueryLog's own ring-buffer size, so the two telemetry
 # sources the dashboard reads hold a comparable amount of history.
 _TELEMETRY_MAX_ENTRIES = 500
@@ -110,12 +113,17 @@ def telemetry_path() -> Path:
     return get_settings().registry_db_path.parent / _TELEMETRY_FILENAME
 
 
-def record_tool_call(*, tool: str, duration_ms: float, ok: bool) -> None:
+def record_tool_call(
+    *, tool: str, duration_ms: float, ok: bool, tool_id: str | None = None, origin: str = "builtin"
+) -> None:
     """Append one metadata-only record of a tool call.
 
     Records *that* a tool ran, never *what* was asked or answered: no
-    arguments — not even the repo_id every tool takes — no Cypher and no
-    results, only the four `_TELEMETRY_FIELDS` written below.
+    arguments — not even the repo_id the built-ins take — no Cypher and no
+    results, only the six `_TELEMETRY_FIELDS` written below. `tool` is the wire
+    name, `tool_id` the scoped id (a project tool's names its session's
+    repository, taken from server configuration) and `origin` is
+    builtin | global | project.
 
     Append-safe across the concurrently-connected clients' separate server
     processes: a single O_APPEND write of one line well under PIPE_BUF, which
@@ -132,7 +140,14 @@ def record_tool_call(*, tool: str, duration_ms: float, ok: bool) -> None:
     try:
         path = telemetry_path()
         line = json.dumps(
-            {"ts": time.time(), "tool": tool, "duration_ms": duration_ms, "ok": ok},
+            {
+                "ts": time.time(),
+                "tool": tool,
+                "tool_id": tool if tool_id is None else tool_id,
+                "origin": origin,
+                "duration_ms": duration_ms,
+                "ok": ok,
+            },
             separators=(",", ":"),
         )
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -180,7 +195,10 @@ def read_tool_telemetry(limit: int) -> list[dict[str, Any]]:
     Each record is rebuilt from `_TELEMETRY_FIELDS` alone rather than passed
     through as parsed, so a line that is valid JSON but carries extra keys —
     a store corrupted or hand-edited outside this module — can never relay
-    anything beyond the four allowed fields to the API.
+    anything beyond the six allowed fields to the API. Records written before
+    scoped ids are normalised here, not migrated: a missing or non-string
+    `tool_id` becomes `tool`, and a missing or unknown `origin` becomes
+    `builtin` for a built-in name and `unscoped` otherwise.
     """
     try:
         raw = telemetry_path().read_text(encoding="utf-8", errors="replace")
@@ -194,7 +212,13 @@ def read_tool_telemetry(limit: int) -> list[dict[str, Any]]:
         except ValueError:
             continue
         if isinstance(entry, dict):
-            entries.append({field: entry[field] for field in _TELEMETRY_FIELDS if field in entry})
+            record = {field: entry[field] for field in _TELEMETRY_FIELDS if field in entry}
+            if "tool" in record:
+                if not isinstance(record.get("tool_id"), str):
+                    record["tool_id"] = record["tool"]
+                if record.get("origin") not in _TELEMETRY_ORIGINS:
+                    record["origin"] = "builtin" if record["tool"] in builtin_tool_names() else "unscoped"
+            entries.append(record)
     entries.reverse()
     return entries
 
@@ -213,7 +237,9 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     The call's arguments are never inspected: the wrapper passes *args and
     **kwargs straight through and records only the tool's name, how long it
-    took and whether it succeeded.
+    took and whether it succeeded. A declared tool's function carries its
+    scoped id and origin (stamped by the tool plane); a built-in carries
+    neither and records its bare name as origin `builtin`.
     """
 
     @functools.wraps(fn)
@@ -227,6 +253,8 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
         finally:
             record_tool_call(
                 tool=fn.__name__,
+                tool_id=getattr(fn, "devgraph_tool_id", fn.__name__),
+                origin=getattr(fn, "devgraph_tool_origin", "builtin"),
                 duration_ms=(time.monotonic() - start) * 1000,
                 ok=ok,
             )

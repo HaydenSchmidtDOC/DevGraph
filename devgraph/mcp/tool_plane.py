@@ -35,7 +35,7 @@ from devgraph.config.project_tools import (
     parse_project_tools,
     tools_file_path,
 )
-from devgraph.mcp.catalog import builtin_tool_names
+from devgraph.mcp.catalog import builtin_tool_names, scoped_tool_id
 
 from mcp.server.mcpserver.exceptions import ToolError
 from neo4j import time as neo4j_time
@@ -203,6 +203,9 @@ def make_tool_function(
             )
     call.__name__ = tool.name
     call.__qualname__ = tool.name
+    # Read by the server's telemetry wrapper; from this function's own resolution, never from a call.
+    call.devgraph_tool_origin = layer  # type: ignore[attr-defined]
+    call.devgraph_tool_id = scoped_tool_id(tool.name, layer, repo_id)  # type: ignore[attr-defined]
     call.__doc__ = tool.description
     call.__signature__ = inspect.Signature(parameters, return_annotation=dict[str, Any])  # type: ignore[attr-defined]
     call.__annotations__ = {**{p.name: p.annotation for p in parameters}, "return": dict[str, Any]}

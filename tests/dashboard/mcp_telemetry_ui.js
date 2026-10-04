@@ -193,7 +193,9 @@ const populated = () =>
   check("the note states the window and both sample sizes, and that it is metadata only",
     /8 of up to the last 500 recorded calls/.test(els.mcpNote.textContent) &&
     /metadata only/.test(els.mcpNote.textContent) &&
-    /no query text, arguments, or repository/.test(els.mcpNote.textContent) &&
+    /no query text or arguments/.test(els.mcpNote.textContent) &&
+    /project tool's id names the repository its session is scoped to/.test(els.mcpNote.textContent) &&
+    !/arguments, or repository/.test(els.mcpNote.textContent) &&
     /cover 8 of those 8 calls/.test(els.mcpNote.textContent) &&
     /error rate covers 8/.test(els.mcpNote.textContent),
     els.mcpNote.textContent);
@@ -204,6 +206,49 @@ const populated = () =>
   check("the MCP half never writes the Neo4j rows",
     els.activeQVal.textContent === "—" && els.queuedQVal.textContent === "—",
     els.activeQVal.textContent + "|" + els.queuedQVal.textContent);
+
+  // 1b. scoped ids: grouped by (origin, tool_id), shown whole up to 48 chars, wire name and origin in the hover
+  reset();
+  const LONG = "r".repeat(60) + "_find_parents";
+  respond = serves({ entries: [
+    { ts: 1, tool: "find_parents", tool_id: "repo-a_find_parents", origin: "project", duration_ms: 5, ok: true },
+    { ts: 2, tool: "find_parents", tool_id: "repo-a_find_parents", origin: "project", duration_ms: 5, ok: true },
+    { ts: 3, tool: "find_parents", tool_id: "repo-b_find_parents", origin: "project", duration_ms: 5, ok: true },
+    { ts: 4, tool: "x", tool_id: "gl_x", origin: "global", duration_ms: 5, ok: true },
+    { ts: 5, tool: "x", tool_id: "gl_x", origin: "project", duration_ms: 5, ok: true },   // repo "gl", tool "x"
+    { ts: 6, tool: "legacy_tool", tool_id: "legacy_tool", origin: "unscoped", duration_ms: 5, ok: true },
+    { ts: 7, tool: "get_source", duration_ms: 5, ok: true },                              // bare legacy entry
+  ] });
+  await api.attemptMcpTelemetry();
+  const sc = api.summarizeMcpTelemetry([
+    { tool: "find_parents", tool_id: "repo-a_find_parents", origin: "project" },
+    { tool: "find_parents", tool_id: "repo-b_find_parents", origin: "project" },
+    { tool: "x", tool_id: "gl_x", origin: "global" },
+    { tool: "x", tool_id: "gl_x", origin: "project" },
+    { tool: "get_source" }, { tool: "get_source", tool_id: 7 },
+    { tool: "p", tool_id: LONG, origin: "project" },
+  ]);
+  check("two repos' same-named tools are two rows; a repo named gl stays apart from a global tool",
+    sc.top.length === 3 && sc.top[0] === "get_source ×2" &&
+    api.summarizeMcpTelemetry([{ tool: "x", tool_id: "gl_x", origin: "global" }, { tool: "x", tool_id: "gl_x", origin: "project" }]).top.length === 2 &&
+    api.summarizeMcpTelemetry([{ tool: "f", tool_id: "a_f", origin: "project" }, { tool: "f", tool_id: "b_f", origin: "project" }]).top.length === 2,
+    JSON.stringify(sc.top));
+  check("legacy bare entries group by tool", sc.top[0] === "get_source ×2", JSON.stringify(sc.top));
+  check("ids are shown up to 48 characters",
+    api.summarizeMcpTelemetry([{ tool: "p", tool_id: LONG, origin: "project" }]).top[0] === LONG.slice(0, 48) + " ×1",
+    "");
+  check("the top row's hover names the id, wire name and origin",
+    /repo-a_find_parents ×2 — wire name find_parents, origin project/.test(els.mcpTopToolsVal.title) &&
+    /gl_x ×1 — wire name x, origin global/.test(els.mcpTopToolsVal.title),
+    els.mcpTopToolsVal.title);
+  check("legacy unscoped entries are labelled in the hover",
+    /\(recorded before scoped ids\)/.test(api.summarizeMcpTelemetry([{ tool: "t", tool_id: "t", origin: "unscoped" }]).topTitles[0]), "");
+  reset();
+  respond = serves({ entries: [{ ts: 1, tool: "<img src=x onerror=alert(1)>", tool_id: "<b>r</b>_<img>", origin: "project", duration_ms: 1, ok: true }] });
+  await api.attemptMcpTelemetry();
+  check("hostile ids are rendered as text",
+    els.mcpTopToolsVal.textContent === "<b>r</b>_<img> ×1" && els.mcpTopToolsVal.title.includes("<img src=x onerror=alert(1)>"),
+    els.mcpTopToolsVal.textContent);
 
   // 2. latency formatting: sub-millisecond must not round into a fake 0ms
   for (const [ms, want] of [[0, "0.0ms"], [0.42, "0.4ms"], [9.96, "10.0ms"], [10, "10ms"],

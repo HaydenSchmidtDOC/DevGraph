@@ -492,3 +492,54 @@ def test_registration_failures_are_seen_only_by_the_live_path(tmp_path, monkeypa
     assert set(live.fallback_reasons) == {"alpha", "beta"}
     assert all("could not be served" in r and "cannot build an input schema" in r for r in live.fallback_reasons.values())
     assert "registration" in tool_plane.resolve_tools.__doc__
+
+
+# ── scoped tool ids ────────────────────────────────────────────────────────
+
+
+def test_scoped_tool_id_cases():
+    from devgraph.mcp.catalog import scoped_tool_id
+
+    assert scoped_tool_id("list_services", "builtin") == "list_services"
+    assert scoped_tool_id("x", "global") == "gl_x"
+    assert scoped_tool_id("x", "project", "demo") == "demo_x"
+    assert scoped_tool_id("x", "project", "gl") == scoped_tool_id("x", "global")
+
+
+def test_make_tool_function_stamps_id_and_origin(tmp_path, monkeypatch):
+    _, record = build(tmp_path, monkeypatch, Engine())
+    from devgraph.config.project_tools import load_project_tools
+    from devgraph.mcp.tool_plane import make_tool_function
+
+    tool = load_project_tools(record.path).tools[0]
+    for layer, want in (("project", "demo_list_folder"), ("global", "gl_list_folder")):
+        fn = make_tool_function(tool, Engine(), "demo", None, layer)
+        assert (fn.devgraph_tool_id, fn.devgraph_tool_origin) == (want, layer)
+
+
+def _telemetry(tmp_path):
+    return [(e["tool"], e["tool_id"], e["origin"]) for e in reversed(mcp_server.read_tool_telemetry(10))]
+
+
+def test_project_and_global_calls_record_scoped_ids_and_survive_reload(tmp_path, monkeypatch):
+    from devgraph.config import global_tools
+
+    store = tmp_path / "store" / global_tools.GLOBAL_TOOLS_FILENAME
+    store.parent.mkdir()
+    store.write_text(_global_json("gtool"))
+    monkeypatch.setattr(global_tools, "_default_path", lambda: store)
+    server, record = build(tmp_path, monkeypatch, Engine())
+
+    asyncio.run(server.call_tool("list_folder", {"folder": "a", "repo_id": "zz-argument-zz"}))
+    asyncio.run(server.call_tool("gtool", {}))
+    (record.path / TOOLS_FILENAME).write_text(textwrap.dedent(TOOLS).replace("Folder path.", "Changed."))
+    assert server.devgraph_tool_plane.reload_if_changed() is True
+    asyncio.run(server.call_tool("list_folder", {"folder": "a"}))
+
+    assert _telemetry(tmp_path) == [
+        ("list_folder", "demo_list_folder", "project"),
+        ("gtool", "gl_gtool", "global"),
+        ("list_folder", "demo_list_folder", "project"),
+    ]
+    raw = mcp_server.telemetry_path().read_text(encoding="utf-8")
+    assert "zz-argument-zz" not in raw
