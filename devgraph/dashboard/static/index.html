@@ -3056,11 +3056,12 @@ function renderConfigScope(scope, block) {
     tools.builtin.forEach(t => {
       const extras = [configEl("span", "tool-desc", t.description || "")];
       if (t.name === "run_cypher") extras.push(configBadgeEl({ level: "warn", text: "Raw Cypher enabled",
-        detail: "MCP clients can run arbitrary Cypher against the graph. The dashboard's own Cypher box is unaffected." }));
+        detail: "MCP sessions started with this environment (the dashboard process's settings) can run arbitrary Cypher against the graph. The dashboard's own Cypher box is unaffected." }));
       box.appendChild(configRow(t.name, "", extras, [configLockEl()]));
     });
     if (!tools.run_cypher_enabled) box.appendChild(configRow("run_cypher", "",
-      [configEl("span", "tool-desc", "off: raw Cypher for MCP clients. Set DEVGRAPH_ENABLE_RUN_CYPHER=true and restart MCP sessions to serve it.")],
+      [configEl("span", "tool-desc", "off for MCP sessions started with this environment (the dashboard process's settings): raw Cypher for MCP clients. " +
+        "Set DEVGRAPH_ENABLE_RUN_CYPHER=true where an MCP session starts, then restart it, to serve it there.")],
       [configLockEl()]));
     configEntryRows(box, scope, "tools", tools.entries, "name");
     card.appendChild(configSection("Tools", tools.file, tools.badges, add("tools"), box, reset(tools, "tools")));
@@ -3139,11 +3140,16 @@ function configCopyReplaces(edit) {
   return "Replaces " + (edit.dest === CONFIG_GLOBAL ? "the global store" : edit.dest) + "'s own " +
     CONFIG_SECTIONS[edit.section].noun + " " + edit.crossName + ".";
 }
+/* the repos whose own tool `name` overrides the global one; anyOrigin: also
+   those that will once it exists (a copy to the global store) */
+function configGlobalOverrides(name, anyOrigin) {
+  return configModel.projects
+    .filter(p => p.tools.entries.some(e => e.name === name && (anyOrigin || e.origin === "project (overrides global)")))
+    .map(p => p.repo_id);
+}
 function configGlobalReach(name) {
   const n = configModel.projects.length;
-  const over = configModel.projects
-    .filter(p => p.tools.entries.some(e => e.name === name && e.origin === "project (overrides global)"))
-    .map(p => p.repo_id);
+  const over = configGlobalOverrides(name, false);
   return "Global tools are served in every registered repository's MCP sessions (" + n + " repo" + (n === 1 ? "" : "s") + ")." +
     (over.length ? " Overridden in: " + over.join(", ") + "." : "");
 }
@@ -3152,8 +3158,14 @@ function configWarningText(edit) {
   if (edit.op === "copy") {
     const replaces = edit.crossName ? " " + configCopyReplaces(edit) : "";
     if (edit.dest === CONFIG_GLOBAL) {
-      return configGlobalReach(edit.name) + " Copying adds it there; " + edit.scope + "'s own " + edit.name +
-        " keeps overriding it in " + edit.scope + "." + replaces;
+      /* the confirm list carries the separate "Replaces …" line */
+      const src = edit.scope;
+      const others = configGlobalOverrides(edit.crossName || edit.name, true).filter(r => r !== src);
+      return (edit.crossName
+        ? "Replaces the global tool " + edit.crossName + " with " + src + "'s version: served in every repo without its own " +
+          edit.crossName + "; " + src + "'s own copy keeps overriding it there."
+        : "Adds " + edit.name + " to the global store; " + src + "'s own " + edit.name + " will override it in " + src + ".") +
+        (others.length ? " Will also be overridden in: " + others.join(", ") + "." : "");
     }
     const block = configScopeBlock(edit.dest);
     const file = edit.section === "tools" ? block.tools.file : block.schema.file;

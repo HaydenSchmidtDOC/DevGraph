@@ -1474,12 +1474,15 @@ def test_identical_declarations_have_no_badge(client, registry, tmp_path):
     assert _widget_badges(client, "repo-a") == []
 
 
-def test_disabled_and_inactive_repos_still_conflict(client, registry, tmp_path):
+def test_disabled_and_inactive_repos_still_conflict(client, registry, tmp_path, monkeypatch):
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: tmp_path / "registry.sqlite3")
     a, b = _repo(tmp_path, registry, "repo-a"), _repo(tmp_path, registry, "repo-b")
     _write(a.path, SCHEMA_FILENAME, _widget_schema("slug"))
     _write(b.path, SCHEMA_FILENAME, _widget_schema("code"))
     registry.set_project_config_enabled("repo-b", False)
-    assert [x["kind"] for x in _widget_badges(client, "repo-a")] == ["schema-conflict"]
+    assert [(x["kind"], x["text"]) for x in _widget_badges(client, "repo-a")] == [
+        ("schema-conflict", "Key conflict with repo-b (disabled)")]
+    assert [x["text"] for x in _widget_badges(client, "repo-b")] == ["Key conflict with repo-a"]
     registry._set_flag("repo-b", "active", False)  # inactive: not listed on the page, still in the database
     assert [r["repo_id"] for r in client.get("/api/config").json()["projects"]] == ["repo-a"]
     assert [x["kind"] for x in _widget_badges(client, "repo-a")] == ["schema-conflict"]

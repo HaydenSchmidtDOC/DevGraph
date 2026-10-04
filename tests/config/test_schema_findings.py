@@ -45,7 +45,7 @@ def test_absent_valid_invalid_and_disabled(tmp_path, monkeypatch):
     assert by_repo["widgets"]["status"] == "valid"
     assert by_repo["broken"]["status"] == "invalid" and by_repo["broken"]["failed"]
 
-    monkeypatch.setattr("devgraph.config.project_switch.project_config_enabled", lambda _path: False)
+    monkeypatch.setattr("devgraph.config.project_switch.project_config_switches", lambda: lambda _path: False)
     disabled = project_schema_findings([plain])
     assert [f["status"] for f in disabled] == ["disabled", "absent"]
     assert "devgraph config enable plain" in disabled[0]["detail"]
@@ -71,7 +71,7 @@ def test_declarations_flag_disabled_repos(tmp_path, monkeypatch):
     a = _repo(tmp_path, "a", _schema("Widget", "slug"))
     b = _repo(tmp_path, "b", _schema("Widget", "code"))
     monkeypatch.setattr(
-        "devgraph.config.project_switch.project_config_enabled", lambda path: Path(path).name != "b"
+        "devgraph.config.project_switch.project_config_switches", lambda: lambda path: Path(path).name != "b"
     )
     declarations = schema_conflicts([a, b])[0]["declarations"]
     assert [(d["repo_id"], d["disabled"]) for d in declarations] == [("a", False), ("b", True)]
@@ -114,3 +114,47 @@ def test_introduced_conflicts_reports_only_new_ones(tmp_path):
     assert introduced_conflicts([a, b], "b", after, after) == []
     # Dropping the label creates nothing.
     assert introduced_conflicts([a, b], "b", after, None) == []
+
+
+def test_introduced_conflicts_says_when_it_joins_an_existing_conflict(tmp_path):
+    a = _repo(tmp_path, "a", _schema("Widget", "slug"))
+    b = _repo(tmp_path, "b", _schema("Widget", "code"))
+    c = _repo(tmp_path, "c")
+
+    # Matches one side of a's and b's conflict: it joins it.
+    joins = introduced_conflicts([a, b, c], "c", None, _decl(_schema("Widget", "slug")))
+    assert len(joins) == 1 and joins[0].startswith("Joins an existing schema conflict: ")
+    # A third key matches neither side: a conflict of its own making.
+    creates = introduced_conflicts([a, b, c], "c", None, _decl(_schema("Widget", "other")))
+    assert len(creates) == 1 and creates[0].startswith("Creates a schema conflict: ")
+
+
+def test_introduced_conflicts_reads_each_file_and_the_switch_once(tmp_path, monkeypatch):
+    import devgraph.config.project_schema as project_schema
+    import devgraph.config.project_switch as project_switch
+
+    repos = [_repo(tmp_path, f"r{i}", _schema("Widget", "slug")) for i in range(4)]
+    repos.append(_repo(tmp_path, "broken", "not: [valid"))
+    target = _repo(tmp_path, "t")
+    loads: list[str] = []
+    real_load = project_schema.load_project_schema
+
+    def counting_load(root, **kwargs):
+        loads.append(Path(root).name)
+        return real_load(root, **kwargs)
+
+    switch_reads: list[int] = []
+    real_switches = project_switch.project_config_switches
+
+    def counting_switches():
+        switch_reads.append(1)
+        return real_switches()
+
+    monkeypatch.setattr(project_schema, "load_project_schema", counting_load)
+    monkeypatch.setattr(project_switch, "project_config_switches", counting_switches)
+
+    messages = introduced_conflicts([*repos, target], "t", None, _decl(_schema("Widget", "code")))
+
+    assert len(messages) == 1 and messages[0].startswith("Creates a schema conflict: ")
+    assert sorted(loads) == ["broken", "r0", "r1", "r2", "r3"]
+    assert len(switch_reads) == 1

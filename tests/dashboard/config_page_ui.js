@@ -1258,7 +1258,12 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     JSON.stringify(writes()));
 
   // 32. a project tool to the global store
-  api.renderConfigPage(COPY_MODEL());
+  {
+    /* repo-b has its own mine (not overriding anything yet): it will override the copy there */
+    const m = COPY_MODEL();
+    m.projects[1].tools.entries = [{ name: "mine", tool_id: "repo-b_mine", yaml: "name: mine\n", origin: "project", badges: [] }];
+    api.renderConfigPage(m);
+  }
   fetchCalls = [];
   respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: globalBlock() } });
   await copyBtn("repo-a", "mine")[0].fire("click");
@@ -1267,9 +1272,9 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     JSON.stringify(els.configDest.children.map(o => o.value)));
   els.configDest.value = "__global__";
   await els.configDest.fire("change");
-  check("...the global store's warning says it is served everywhere and the source keeps overriding it",
-    els.configModalWarnText.textContent === "Global tools are served in every registered repository's MCP sessions (3 repos). " +
-      "Copying adds it there; repo-a's own mine keeps overriding it in repo-a.", els.configModalWarnText.textContent);
+  check("...the global store's warning says it adds the tool, the source overrides it, and where else it will be overridden",
+    els.configModalWarnText.textContent === "Adds mine to the global store; repo-a's own mine will override it in repo-a. " +
+      "Will also be overridden in: repo-b.", els.configModalWarnText.textContent);
   await press(els.configModalSave);
   check("...and the copy POSTs /api/config/__global__/tools with the global fingerprint",
     writes().length === 2 && writes().every(c => c.url === "/api/config/__global__/tools" && c.init.method === "POST" && ifMatch(c) === '"sha256:g1"' &&
@@ -1356,7 +1361,8 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("a tool already in the global store asks 'Copy anyway', naming the global store's own tool",
     els.configModalSave.textContent === "Copy anyway" &&
     els.configModalConfirm.textContent.includes("Replaces the global store's own tool mine.") &&
-    els.configModalWarnText.textContent.includes("Replaces the global store's own tool mine.") &&
+    els.configModalWarnText.textContent === "Replaces the global tool mine with repo-a's version: served in every repo without its own mine; " +
+      "repo-a's own copy keeps overriding it there." &&
     writes().length === 2 && writes()[1].init.method === "PUT" && writes()[1].url === "/api/config/__global__/tools/mine" &&
     writes().every(c => body(c).dry_run === true), JSON.stringify([els.configModalConfirm.textContent, writes()]));
   { const newer = globalBlock(); newer.tools.fingerprint = "sha256:g-newer"; api.applyConfigScope("__global__", newer); }
@@ -1392,6 +1398,10 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("run_cypher on: one built-in row with a warn badge and no off line",
     onRows.length === 1 && byClass(onRows[0], "cfg-badge").some(b => b.textContent === "Raw Cypher enabled" && b.classList.contains("warn")) &&
     !/DEVGRAPH_ENABLE_RUN_CYPHER/.test(onRows[0].textContent), JSON.stringify(onRows.map(r => r.textContent)));
+  api.renderConfigPage(cypherModel(false));
+  cypherRow = rowFor(card("__global__"), "run_cypher");
+  check("run_cypher's state is the dashboard process's environment, not every MCP session's",
+    /off for MCP sessions started with this environment/.test(cypherRow.textContent), cypherRow.textContent);
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);

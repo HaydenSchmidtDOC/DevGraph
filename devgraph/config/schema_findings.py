@@ -6,6 +6,7 @@ No Rich, no Typer, no graph connection, no registry write.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 
@@ -19,7 +20,10 @@ def enable_hint_id(repo: Any) -> str:
 
 
 def project_schema_findings(
-    repos: list[Any], *, overrides: dict[str, Any] | None = None
+    repos: list[Any],
+    *,
+    overrides: dict[str, Any] | None = None,
+    switches: Callable[[Any], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Per-repository project schema state, plus cross-repository conflicts.
 
@@ -40,7 +44,9 @@ def project_schema_findings(
     registered repositories deliberately share one database.
 
     `overrides` maps a repo id to a parsed declaration (or `None` for "no
-    file") that is used instead of reading that repository's file.
+    file", or the `ProjectSchemaError` reading it raised) that is used instead
+    of reading that repository's file. `switches` is a
+    `project_config_switches()` lookup already read for this pass.
     """
     from devgraph.config.project_schema import (
         SCHEMA_FILENAME,
@@ -49,15 +55,17 @@ def project_schema_findings(
         project_schema_path,
         resolve_declaration,
     )
-    from devgraph.config.project_switch import project_config_enabled
+    from devgraph.config import project_switch
 
     findings: list[dict[str, Any]] = []
     # Case-folded label -> the (repo_id, label, key) triples declaring it.
     declared: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {}
     disabled_ids: set[str] = set()
+    # One registry read for the whole pass, not one per repository.
+    enabled = switches or project_switch.project_config_switches()
 
     for repo in sorted(repos, key=lambda r: r.repo_id):
-        disabled = not project_config_enabled(repo.path)
+        disabled = not enabled(repo.path)
         if disabled:
             disabled_ids.add(repo.repo_id)
             findings.append(
@@ -80,6 +88,8 @@ def project_schema_findings(
             # is switched off; the switch is reported separately above.
             if overrides is not None and repo.repo_id in overrides:
                 declaration = overrides[repo.repo_id]
+                if isinstance(declaration, ProjectSchemaError):
+                    raise declaration
             else:
                 declaration = load_project_schema(repo.path, respect_switch=False)
             if declaration is None:
@@ -158,10 +168,17 @@ def project_schema_findings(
 
 
 def schema_conflicts(
-    repos: list[Any], *, overrides: dict[str, Any] | None = None
+    repos: list[Any],
+    *,
+    overrides: dict[str, Any] | None = None,
+    switches: Callable[[Any], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Only the cross-repository `conflict` findings."""
-    return [f for f in project_schema_findings(repos, overrides=overrides) if f["status"] == "conflict"]
+    return [
+        f
+        for f in project_schema_findings(repos, overrides=overrides, switches=switches)
+        if f["status"] == "conflict"
+    ]
 
 
 def introduced_conflicts(repos: list[Any], repo_id: str, before: Any, after: Any) -> list[str]:
@@ -169,15 +186,36 @@ def introduced_conflicts(repos: list[Any], repo_id: str, before: Any, after: Any
 
     `before` and `after` are `repo_id`'s parsed declaration (or `None`) either
     side of an edit. A label that already conflicted for `repo_id` is not new.
+    A new one whose declaration matches one side of a conflict the other
+    repositories already had "joins" it; any other "creates" one. Every other
+    repository's file and the switches are read once, for both sides.
     """
+    from devgraph.config import project_schema, project_switch
 
-    def conflicted(declaration: Any) -> dict[str, str]:
-        found = schema_conflicts(repos, overrides={repo_id: declaration})
-        return {f["label"]: f["detail"] for f in found if repo_id in f["repo_ids"]}
+    loaded: dict[str, Any] = {}
+    for repo in repos:
+        if repo.repo_id == repo_id:
+            continue
+        try:
+            loaded[repo.repo_id] = project_schema.load_project_schema(repo.path, respect_switch=False)
+        except project_schema.ProjectSchemaError as exc:
+            loaded[repo.repo_id] = exc
+    switches = project_switch.project_config_switches()
 
-    existing = conflicted(before)
-    return [
-        f"Creates a schema conflict: {detail}"
-        for label, detail in conflicted(after).items()
-        if label not in existing
-    ]
+    def conflicts(declaration: Any) -> dict[str, dict[str, Any]]:
+        found = schema_conflicts(repos, overrides={**loaded, repo_id: declaration}, switches=switches)
+        return {f["label"]: f for f in found}
+
+    existing = conflicts(before)
+    messages = []
+    for label, finding in conflicts(after).items():
+        if repo_id not in finding["repo_ids"]:
+            continue
+        if label in existing and repo_id in existing[label]["repo_ids"]:
+            continue
+        sides = {(d["label"], tuple(d["key"])) for d in finding["declarations"] if d["repo_id"] != repo_id}
+        mine = {(d["label"], tuple(d["key"])) for d in finding["declarations"] if d["repo_id"] == repo_id}
+        joins = label in existing and bool(mine & sides)
+        prefix = "Joins an existing schema conflict" if joins else "Creates a schema conflict"
+        messages.append(f"{prefix}: {finding['detail']}")
+    return messages

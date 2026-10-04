@@ -198,10 +198,12 @@ def _conflict_badges(label: str, repo_id: str, conflicts: list[dict]) -> list[di
         if mine is None:
             continue
         others = sorted({
-            d["repo_id"] for d in finding["declarations"]
+            (d["repo_id"], d["disabled"]) for d in finding["declarations"]
             if d["repo_id"] != repo_id and (d["label"], d["key"]) != (mine["label"], mine["key"])
         })
-        return [badge("error", "schema-conflict", f"Key conflict with {', '.join(others)}", finding["detail"])]
+        # a disabled peer still holds its constraint until its next rescan, so it is named, and marked
+        names = ", ".join(f"{other}{' (disabled)' if disabled else ''}" for other, disabled in others)
+        return [badge("error", "schema-conflict", f"Key conflict with {names}", finding["detail"])]
     return []
 
 
