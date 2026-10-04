@@ -249,3 +249,73 @@ def test_duplicate_relationship_normalises_from():
     assert edits.duplicate_relationship(
         {"type": "USES", "from": "Ticket", "to": "Function"}, [{"type": "USES", "from": ["Ticket"], "to": "Function"}]
     )
+
+
+# --- fingerprint first, fingerprints returned, splice error codes ----------------------------------
+
+
+def test_symlink_message_names_the_target(tmp_path):
+    real = tmp_path / "real.yaml"
+    real.write_text(TOOLS_FILE)
+    (tmp_path / "devgraph.tools.yaml").symlink_to(real)
+    with pytest.raises(ConfigEditError) as exc:
+        edits.delete_tool(tmp_path, "count_things")
+    assert exc.value.message == f"devgraph.tools.yaml is a symlink to {real.resolve()}; edit {real.resolve()} directly"
+
+
+def test_stale_wins_over_missing_name_and_duplicates(tmp_path):
+    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
+    (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
+    calls = [
+        lambda: edits.replace_tool(tmp_path, "nope", TOOL, expected_fingerprint="sha256:00"),
+        lambda: edits.delete_tool(tmp_path, "nope", expected_fingerprint="sha256:00"),
+        lambda: edits.add_tool(tmp_path, TOOL, expected_fingerprint="sha256:00"),
+        lambda: edits.add_schema_entry(tmp_path, TICKET, expected_fingerprint="sha256:00"),
+        lambda: edits.replace_schema_entry(tmp_path, "Nope", TICKET, expected_fingerprint="sha256:00"),
+        lambda: edits.delete_schema_entry(tmp_path, "Nope", expected_fingerprint="sha256:00"),
+    ]
+    for call in calls:
+        with pytest.raises(ConfigEditError) as exc:
+            call()
+        assert code(exc) == "stale"
+
+
+def test_result_fingerprint(tmp_path):
+    path = tmp_path / "devgraph.tools.yaml"
+    written = edits.add_tool(tmp_path, TOOL)
+    assert written.fingerprint == edits.file_fingerprint(path)
+    dry = edits.add_tool(tmp_path, {**TOOL, "name": "other"}, dry_run=True)
+    assert dry.fingerprint.startswith("sha256:") and dry.fingerprint != written.fingerprint
+    after = edits.add_tool(tmp_path, {**TOOL, "name": "other"})
+    assert after.fingerprint == dry.fingerprint  # a dry run predicts the written file
+
+
+def test_splice_error_codes_come_from_the_splicer(tmp_path):
+    from devgraph.config import list_edit
+
+    path = tmp_path / "devgraph.tools.yaml"
+    path.write_text("tools: [{name: a}]\n")
+    with pytest.raises(ConfigEditError) as exc:
+        edits.add_tool(tmp_path, TOOL)
+    assert code(exc) == "flow_list"
+    path.write_text("tools: [\n")
+    with pytest.raises(ConfigEditError) as exc:
+        edits.add_tool(tmp_path, TOOL)
+    assert code(exc) == "malformed"
+    path.write_text("- not a mapping\n")
+    with pytest.raises(ConfigEditError) as exc:
+        edits.add_tool(tmp_path, TOOL)
+    assert code(exc) == "invalid"
+    path.write_text("version: 1\ntools:\n  - name: a\n  - name: a\n")
+    with pytest.raises(ConfigEditError) as exc:
+        edits.delete_tool(tmp_path, "a")
+    assert code(exc) == "ambiguous"
+    with pytest.raises(list_edit.ListEditError) as exc2:
+        list_edit.add_entry_text("tools:\n  - name: a\n", {"name": "a"}, key="tools", ident="name", version=1)
+    assert exc2.value.code == "exists"
+    with pytest.raises(list_edit.ListEditError) as exc2:
+        list_edit.delete_entry_text("tools:\n  - name: a\n", "b", key="tools", ident="name")
+    assert exc2.value.code == "not_found"
+    with pytest.raises(list_edit.ListEditError) as exc2:
+        list_edit.replace_entry_text("tools:\n  - name: b\n    v: &x 1\n  - name: c\n    w: *x\n", "b", {"name": "b"}, key="tools", ident="name")
+    assert exc2.value.code == "anchor"

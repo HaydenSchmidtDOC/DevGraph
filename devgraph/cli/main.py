@@ -25,6 +25,10 @@ from devgraph.agent import lifecycle
 from devgraph.cli._env import resolve_podman, resolve_repo_root, resolve_venv_python
 from devgraph.cli.exporters import export_cypher, export_dot, export_json
 from devgraph.config import get_settings
+from devgraph.config.edits import GLOBAL_TOOLS_NOTE as _GLOBAL_TOOLS_NOTE
+from devgraph.config.edits import SCHEMA_SECTIONS as _SCHEMA_SECTIONS
+from devgraph.config.edits import TOOLS_RELOAD_NOTE as _TOOLS_RELOAD_NOTE
+from devgraph.config.edits import removed_types as _removed_types  # noqa: F401  (kept importable from here)
 from devgraph.dashboard import queries as dashboard_queries
 from devgraph.dashboard.url import dashboard_url
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
@@ -2370,12 +2374,6 @@ schema_app = typer.Typer(
 )
 config_app.add_typer(schema_app, name="schema")
 
-from devgraph.config.edits import GLOBAL_TOOLS_NOTE as _GLOBAL_TOOLS_NOTE  # noqa: E402
-from devgraph.config.edits import SCHEMA_SECTIONS as _SCHEMA_SECTIONS  # noqa: E402
-from devgraph.config.edits import TOOLS_RELOAD_NOTE as _TOOLS_RELOAD_NOTE  # noqa: E402
-from devgraph.config.edits import removed_types as _removed_types  # noqa: E402,F401  (kept importable from here)
-
-
 def _schema_scope(ctx: typer.Context, repo: Optional[Path]) -> Path:
     return _tools_scope(ctx, repo, False, "DevGraph does not index it")
 
@@ -2644,7 +2642,10 @@ def config_schema_reset(
     console.print(f"[green]Reset[/green] {escape(str(path))}", soft_wrap=True)
     console.print(escape(_schema_effect_note(root)), soft_wrap=True)
     _schema_follow_up(
-        root, EditResult(path, "", True, before, None, schema_change_warnings(before, None, _schema_record(root)))
+        root,
+        EditResult(
+            path, "", True, before=before, warnings=schema_change_warnings(before, None, _schema_record(root))
+        ),
     )
 
 

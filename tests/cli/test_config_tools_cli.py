@@ -493,3 +493,26 @@ def test_project_write_is_atomic_and_keeps_the_mode(runner, repo, tmp_path, monk
     assert result.exit_code == 1 and "disk gone" in result.output
     assert path.read_bytes() == before
     assert sorted(p.name for p in repo.iterdir()) == [TOOLS_FILENAME]
+
+
+# -- symlinked targets ---------------------------------------------------------
+
+
+def test_symlinked_project_file_is_refused_untouched(runner, repo, tmp_path):
+    real = tmp_path / "real.yaml"
+    real.write_text("version: 1\ntools: []\n")
+    link = repo / TOOLS_FILENAME
+    link.symlink_to(real)
+    result = add(runner, tmp_path, ["--repo", str(repo)])
+    assert result.exit_code == 1 and "is a symlink to" in flat(result.output) and str(real.resolve()) in flat(result.output)
+    assert link.is_symlink() and real.read_text() == "version: 1\ntools: []\n"
+
+
+def test_symlinked_global_store_is_refused_untouched(runner, tmp_path, store):
+    real = tmp_path / "real.json"
+    real.write_text('{"version": 1, "tools": []}')
+    store.parent.mkdir(exist_ok=True)
+    store.symlink_to(real)
+    result = add(runner, tmp_path, ["--global"])
+    assert result.exit_code == 1 and "is a symlink to" in flat(result.output)
+    assert store.is_symlink() and real.read_text() == '{"version": 1, "tools": []}'

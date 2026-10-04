@@ -552,3 +552,13 @@ def test_add_duplicate_relationship_compares_validated_form(runner, repo, tmp_pa
     schema_file(repo).write_text(SCHEMA)
     result = run(runner, "add", "--from", src(tmp_path, "type: USES\nfrom: [Ticket]\nto: Function\n"), "--repo", str(repo))
     assert result.exit_code == 1 and "already exists" in result.output
+
+
+def test_symlinked_schema_file_is_refused_untouched(runner, settings, repo, tmp_path):
+    real = tmp_path / "real.yaml"
+    real.write_text(SCHEMA)
+    link = repo / SCHEMA_FILENAME
+    link.symlink_to(real)
+    result = runner.invoke(app, ["config", "schema", "add", "--from", src(tmp_path, EPIC), "--repo", str(repo)])
+    assert result.exit_code == 1 and "is a symlink to" in flat(result.output)
+    assert link.is_symlink() and real.read_text() == SCHEMA

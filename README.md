@@ -152,6 +152,8 @@ Every subcommand takes `--repo <path>` or `--global`, and validates the whole re
 - `delete <name>` removes one tool (unknown names exit 1).
 - `reset [--yes]` removes every tool in the scope (deletes `devgraph.tools.yaml`, or empties the global store) and asks for confirmation unless `--yes`.
 
+`config tools` and `config schema` writes refuse a symlinked `devgraph.tools.yaml`, `devgraph.schema.yaml` or global store (the atomic replace would swap the link for a plain file): the error names the link's target; edit that file directly.
+
 A tools file that declares the same tool name twice is refused by every `config tools` write (`edit` and `delete` cannot tell which entry you mean), so fix the duplicate by hand in the file.
 
 `devgraph.tools.yaml` is edited as text, splicing only the affected tool's lines, so comments and formatting elsewhere survive (comments inside an edited tool are lost). Both files are replaced atomically, but there is no locking: two `config tools` writes to the same file at once are last-writer-wins, so one of the edits can be lost. A file whose `tools` value is not a block sequence (for example a flow list) is refused rather than rewritten. The CLI never stages or commits. `config show`, `config validate` and `doctor` also report the global store and which project tools override global ones.

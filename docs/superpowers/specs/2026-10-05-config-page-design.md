@@ -43,11 +43,11 @@ The CLI helpers raise `typer.Exit` and print with Rich, so the dashboard cannot 
 | Move from devgraph/cli/main.py | To edits.py as | Notes |
 |---|---|---|
 | `_write_atomically` (2243) | `write_atomically(path, text)` | CLI imports it |
-| `_tools_store_path` (2172), `_tools_text` (2207), `_write_tools` (2215) | `tools_path(root)`, `read_text(path)`, `write_tools(root, edit) -> Path` | root `None` = global store (JSON, via `save_global_tools`, devgraph/config/global_tools.py:68) |
+| `_tools_store_path` (2172), `_tools_text` (2207), `_write_tools` (2215) | `tools_path(root)`, `read_text(path)`, `write_tools(root, edit, *, expected_fingerprint, dry_run) -> EditResult` (`EditResult` also carries the written file's `fingerprint`) | root `None` = global store (JSON, via `save_global_tools`, devgraph/config/global_tools.py:68) |
 | `_refuse_builtin` (2267) | `refuse_builtin(name)` | code `locked` |
 | add/edit/delete bodies (2341–2416) | `add_tool(root, entry)`, `replace_tool(root, name, entry)`, `delete_tool(root, name)` | existence checks: code `exists` / `not_found` |
-| `_schema_text` (2485), `_schema_declaration` (2492), `_entry_section` (2512), `_locate_entry` (2519), `_schema_edit` (2547), `_duplicate_relationship` (2769) | same names, public | `_schema_edit` keeps "validate whole doc with `parse_project_schema` + `resolve_declaration` before write" |
-| `_removed_types` (2569), `_pruned_types` (2589), `_changed_keys` (2606) and the strings in `_warn_removed` (2614) / `_schema_follow_up` (2636) | `schema_change_warnings(before, after, entry, *, applied_when) -> list[str]` | CLI prints them as today; dashboard returns them. Conflict findings stay CLI-only in G2a |
+| `_schema_text` (2485), `_schema_declaration` (2492), `_entry_section` (2512), `_locate_entry` (2519), `_schema_edit` (2547), `_duplicate_relationship` (2769) | same names, public | `schema_edit(path, edit, ...) -> (old text, new text)` keeps "validate whole doc with `parse_project_schema` + `resolve_declaration` before write" |
+| `_removed_types` (2569), `_pruned_types` (2589), `_changed_keys` (2606) and the strings in `_warn_removed` (2614) / `_schema_follow_up` (2636) | `schema_change_warnings(before, after, record) -> list[str]` (plus `schema_entry_notes(entry)`; `record` only chooses the wording) | CLI prints them as today; dashboard returns them. Conflict findings stay CLI-only in G2a |
 | new | `file_fingerprint(path) -> str` | `"absent"` or `"sha256:<hex>"`; same scheme as `schema_file_hash` (project_schema.py:517) but switch-independent |
 
 Each mutate function takes `expected_fingerprint: str | None` and `dry_run: bool`: it reads the text, compares fingerprint (code `stale`), computes the new text, validates the whole document, and only then writes. Dry run returns the would-be warnings without writing. A module-level `threading.Lock` keyed by resolved target path serialises the read-compare-write within the dashboard process.

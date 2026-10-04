@@ -12,6 +12,7 @@ before the write. Import this module directly, like `devgraph.config.project_too
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -20,8 +21,6 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-
-from devgraph.config.project_tools import TOOLS_VERSION
 
 SCHEMA_SECTIONS = {
     "node_types": ("label", "node type"),
@@ -52,6 +51,7 @@ class EditResult:
     path: Path
     text: str  # the new file contents
     written: bool
+    fingerprint: str = ""  # of the file after the write (of `text` for a dry run); computed under the lock
     before: Any = None  # schema edits: declaration before / after (None when empty or invalid)
     after: Any = None
     warnings: list[str] = field(default_factory=list)
@@ -60,15 +60,34 @@ class EditResult:
 
 # --- files -----------------------------------------------------------------------------------------
 
-_locks: dict[Path, threading.Lock] = {}
+_locks: dict[Path, threading.RLock] = {}
 _locks_guard = threading.Lock()
 
 
-def _target_lock(path: Path) -> threading.Lock:
-    """One lock per resolved target path, serialising read-compare-write within this process."""
+def _target_lock(path: Path) -> threading.RLock:
+    """One re-entrant lock per resolved target path, serialising read-compare-write within this process."""
     key = path.resolve()
     with _locks_guard:
-        return _locks.setdefault(key, threading.Lock())
+        return _locks.setdefault(key, threading.RLock())
+
+
+@contextlib.contextmanager
+def _guard(path: Path, expected_fingerprint: str | None):
+    """Hold the path's lock, then refuse a stale fingerprint and an unsafe target, in that order.
+
+    Public mutators enter this before any existence/duplicate/locate check, so a stale
+    `expected_fingerprint` is always `stale` and those checks run under the lock.
+    """
+    with _target_lock(path):
+        _check_fingerprint(path, expected_fingerprint)
+        _check_target(path)
+        yield
+
+
+def _after_fingerprint(path: Path, text: str, written: bool) -> str:
+    if written:
+        return file_fingerprint(path)
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def file_fingerprint(path: Path) -> str:
@@ -82,9 +101,13 @@ def file_fingerprint(path: Path) -> str:
 
 
 def _check_target(path: Path) -> None:
-    """Refuse a symlink or non-file target: `os.replace` would swap the link for a file."""
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise ConfigEditError(f"{path}: is not a regular file (or is a symlink); edit it by hand", "not_regular")
+    """Refuse a symlink target: `os.replace` would swap the link for a file (a directory fails on read).
+
+    Only the final component is checked; a symlinked parent directory is followed as the OS does.
+    """
+    if path.is_symlink():
+        target = path.resolve()
+        raise ConfigEditError(f"{path.name} is a symlink to {target}; edit {target} directly", "not_regular")
 
 
 def _check_fingerprint(path: Path, expected: str | None) -> None:
@@ -123,17 +146,8 @@ def write_atomically(path: Path, text: str) -> None:
 
 
 def _splice_error(exc: Exception) -> ConfigEditError:
-    """A splicer (`ListEditError`) or validator error as a coded `ConfigEditError`."""
-    message = str(exc)
-    if message.startswith("no ") and " named " in message:
-        code = "not_found"
-    elif message.endswith("already exists"):
-        code = "exists"
-    elif "times; edit the file by hand" in message:
-        code = "ambiguous"
-    else:
-        code = "invalid"
-    return ConfigEditError(message, code)
+    """A splicer (`ListEditError`) error as a `ConfigEditError` carrying the splicer's code."""
+    return ConfigEditError(str(exc), getattr(exc, "code", "invalid"))
 
 
 # --- tools -----------------------------------------------------------------------------------------
@@ -203,6 +217,7 @@ def write_tools(
     """
     from devgraph.config.global_tools import save_global_tools
     from devgraph.config.project_tools import (
+        TOOLS_VERSION,
         ProjectToolsError,
         parse_project_tools,
         validate_project_tools,
@@ -210,9 +225,7 @@ def write_tools(
     from devgraph.config.tools_edit import ToolsEditError, tool_mappings
 
     path = tools_path(root)
-    with _target_lock(path):
-        _check_target(path)
-        _check_fingerprint(path, expected_fingerprint)
+    with _guard(path, expected_fingerprint):
         text = read_text(path)
         try:
             if root is None:
@@ -239,37 +252,44 @@ def write_tools(
             raise ConfigEditError(str(exc), "invalid")
         except (OSError, TypeError, ValueError) as exc:
             raise ConfigEditError(str(exc), "io")
-    return EditResult(path=path, text=new_text, written=not dry_run)
+        return EditResult(path, new_text, not dry_run, _after_fingerprint(path, new_text, not dry_run))
 
 
-def add_tool(root: Path | None, entry: dict, **options) -> EditResult:
+def add_tool(root: Path | None, entry: dict, *, expected_fingerprint: str | None = None, dry_run: bool = False) -> EditResult:
     """Add one tool. `locked` for a built-in name, `exists` for a duplicate."""
     from devgraph.config.tools_edit import add_tool_text
 
-    name = entry.get("name")
-    refuse_builtin(name)
-    if any(isinstance(m, dict) and m.get("name") == name for m in tool_entries(root)):
-        raise ConfigEditError(
-            f"a tool named {name!r} already exists in this scope; use `devgraph config tools edit {name}`", "exists"
-        )
-    return write_tools(root, lambda text: add_tool_text(text, entry), **options)
+    with _guard(tools_path(root), expected_fingerprint):
+        name = entry.get("name")
+        refuse_builtin(name)
+        if any(isinstance(m, dict) and m.get("name") == name for m in tool_entries(root)):
+            raise ConfigEditError(
+                f"a tool named {name!r} already exists in this scope; use `devgraph config tools edit {name}`", "exists"
+            )
+        return write_tools(root, lambda text: add_tool_text(text, entry), dry_run=dry_run)
 
 
-def replace_tool(root: Path | None, name: str, entry: dict, **options) -> EditResult:
+def replace_tool(
+    root: Path | None, name: str, entry: dict, *, expected_fingerprint: str | None = None, dry_run: bool = False
+) -> EditResult:
     """Replace the tool `name`; `not_found` if absent, `locked` if renamed to a built-in name."""
     from devgraph.config.tools_edit import replace_tool_text
 
-    find_tool(root, name)
-    if entry.get("name") != name:
-        refuse_builtin(entry.get("name"))
-    return write_tools(root, lambda text: replace_tool_text(text, name, entry), **options)
+    with _guard(tools_path(root), expected_fingerprint):
+        find_tool(root, name)
+        if entry.get("name") != name:
+            refuse_builtin(entry.get("name"))
+        return write_tools(root, lambda text: replace_tool_text(text, name, entry), dry_run=dry_run)
 
 
-def delete_tool(root: Path | None, name: str, **options) -> EditResult:
+def delete_tool(
+    root: Path | None, name: str, *, expected_fingerprint: str | None = None, dry_run: bool = False
+) -> EditResult:
     """Remove the tool `name`; `not_found` if absent."""
     from devgraph.config.tools_edit import delete_tool_text
 
-    return write_tools(root, lambda text: delete_tool_text(text, name), **options)
+    with _guard(tools_path(root), expected_fingerprint):
+        return write_tools(root, lambda text: delete_tool_text(text, name), dry_run=dry_run)
 
 
 # --- schema ----------------------------------------------------------------------------------------
@@ -395,9 +415,7 @@ def schema_edit(
     from devgraph.config.list_edit import ListEditError
     from devgraph.config.project_schema import ProjectSchemaError, parse_project_schema, resolve_declaration
 
-    with _target_lock(path):
-        _check_target(path)
-        _check_fingerprint(path, expected_fingerprint)
+    with _guard(path, expected_fingerprint):
         old_text = read_text(path)
         try:
             new_text = edit(old_text)
@@ -501,6 +519,7 @@ def _schema_result(path: Path, old_text: str, new_text: str, entry: dict | None,
         path=path,
         text=new_text,
         written=not dry_run,
+        fingerprint=_after_fingerprint(path, new_text, not dry_run),
         before=before,
         after=after,
         warnings=schema_change_warnings(before, after, record),
@@ -508,73 +527,93 @@ def _schema_result(path: Path, old_text: str, new_text: str, entry: dict | None,
     )
 
 
-def add_schema_entry(root: Path, entry: dict, *, record: Any = None, **options) -> EditResult:
+def add_schema_entry(
+    root: Path, entry: dict, *, record: Any = None, expected_fingerprint: str | None = None, dry_run: bool = False
+) -> EditResult:
     """Add a node type (`label`) or relationship (`type`) to the repository's schema file."""
     from devgraph.config.list_edit import ListEditError, add_entry_text, entries
     from devgraph.config.project_schema import SCHEMA_VERSION, project_schema_path
 
     path = project_schema_path(root)
-    section = entry_section(entry)
-    ident, noun = SCHEMA_SECTIONS[section]
-    try:
-        existing = entries(read_text(path), key=section)
-    except ListEditError as exc:
-        raise _splice_error(exc)
-    name = entry[ident]
-    if section == "node_types" and any(isinstance(e, dict) and e.get(ident) == name for e in existing):
-        raise ConfigEditError(
-            f"a node type named {name!r} already exists; use `devgraph config schema edit {name}`", "exists"
+    with _guard(path, expected_fingerprint):
+        section = entry_section(entry)
+        ident, noun = SCHEMA_SECTIONS[section]
+        try:
+            existing = entries(read_text(path), key=section)
+        except ListEditError as exc:
+            raise _splice_error(exc)
+        name = entry[ident]
+        if section == "node_types" and any(isinstance(e, dict) and e.get(ident) == name for e in existing):
+            raise ConfigEditError(
+                f"a node type named {name!r} already exists; use `devgraph config schema edit {name}`", "exists"
+            )
+        if section == "relationships" and duplicate_relationship(entry, existing):
+            raise ConfigEditError(f"an identical relationship {name!r} already exists", "exists")
+        # Relationships may share a type with different endpoints; only node type labels are unique.
+        old_text, new_text = schema_edit(
+            path,
+            lambda text: add_entry_text(
+                text, entry, key=section, ident=ident, version=SCHEMA_VERSION, noun=noun, unique=section == "node_types"
+            ),
+            invalid_prefix="the new entry is invalid: ",
+            dry_run=dry_run,
         )
-    if section == "relationships" and duplicate_relationship(entry, existing):
-        raise ConfigEditError(f"an identical relationship {name!r} already exists", "exists")
-    # Relationships may share a type with different endpoints; only node type labels are unique.
-    old_text, new_text = schema_edit(
-        path,
-        lambda text: add_entry_text(
-            text, entry, key=section, ident=ident, version=SCHEMA_VERSION, noun=noun, unique=section == "node_types"
-        ),
-        invalid_prefix="the new entry is invalid: ",
-        **options,
-    )
-    return _schema_result(path, old_text, new_text, entry, record, options.get("dry_run", False))
+        return _schema_result(path, old_text, new_text, entry, record, dry_run)
 
 
 def replace_schema_entry(
-    root: Path, name: str, entry: dict, *, node_type: bool = False, relationship: bool = False, record: Any = None, **options
+    root: Path,
+    name: str,
+    entry: dict,
+    *,
+    node_type: bool = False,
+    relationship: bool = False,
+    record: Any = None,
+    expected_fingerprint: str | None = None,
+    dry_run: bool = False,
 ) -> EditResult:
     """Replace one entry; the new entry must stay in the same section."""
     from devgraph.config.list_edit import replace_entry_text
     from devgraph.config.project_schema import project_schema_path
 
     path = project_schema_path(root)
-    section = locate_entry(read_text(path), name, node_type, relationship)
-    ident, noun = SCHEMA_SECTIONS[section]
-    find_schema_entry(read_text(path), name, section)
-    if entry_section(entry) != section:
-        raise ConfigEditError(f"the new entry must be a {noun} (with `{ident}`)", "invalid")
-    old_text, new_text = schema_edit(
-        path,
-        lambda current: replace_entry_text(current, name, entry, key=section, ident=ident, noun=noun),
-        invalid_prefix="the new entry is invalid: ",
-        **options,
-    )
-    return _schema_result(path, old_text, new_text, entry, record, options.get("dry_run", False))
+    with _guard(path, expected_fingerprint):
+        section = locate_entry(read_text(path), name, node_type, relationship)
+        ident, noun = SCHEMA_SECTIONS[section]
+        find_schema_entry(read_text(path), name, section)
+        if entry_section(entry) != section:
+            raise ConfigEditError(f"the new entry must be a {noun} (with `{ident}`)", "invalid")
+        old_text, new_text = schema_edit(
+            path,
+            lambda current: replace_entry_text(current, name, entry, key=section, ident=ident, noun=noun),
+            invalid_prefix="the new entry is invalid: ",
+            dry_run=dry_run,
+        )
+        return _schema_result(path, old_text, new_text, entry, record, dry_run)
 
 
 def delete_schema_entry(
-    root: Path, name: str, *, node_type: bool = False, relationship: bool = False, record: Any = None, **options
+    root: Path,
+    name: str,
+    *,
+    node_type: bool = False,
+    relationship: bool = False,
+    record: Any = None,
+    expected_fingerprint: str | None = None,
+    dry_run: bool = False,
 ) -> EditResult:
     """Remove one entry from the repository's schema file."""
     from devgraph.config.list_edit import delete_entry_text
     from devgraph.config.project_schema import project_schema_path
 
     path = project_schema_path(root)
-    section = locate_entry(read_text(path), name, node_type, relationship)
-    ident, noun = SCHEMA_SECTIONS[section]
-    old_text, new_text = schema_edit(
-        path,
-        lambda current: delete_entry_text(current, name, key=section, ident=ident, noun=noun),
-        invalid_hint="; delete or edit the relationships that use it first" if section == "node_types" else "",
-        **options,
-    )
-    return _schema_result(path, old_text, new_text, None, record, options.get("dry_run", False))
+    with _guard(path, expected_fingerprint):
+        section = locate_entry(read_text(path), name, node_type, relationship)
+        ident, noun = SCHEMA_SECTIONS[section]
+        old_text, new_text = schema_edit(
+            path,
+            lambda current: delete_entry_text(current, name, key=section, ident=ident, noun=noun),
+            invalid_hint="; delete or edit the relationships that use it first" if section == "node_types" else "",
+            dry_run=dry_run,
+        )
+        return _schema_result(path, old_text, new_text, None, record, dry_run)
