@@ -402,6 +402,71 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   els.configDest.value = "__global__";
   api.renderConfigPage(MODEL());
 
+  // 8d. the destination is locked while a dry run is out, and a write never
+  //     goes anywhere the dry run did not check
+  fetchCalls = [];
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [],
+    scope: url.includes("repo-a") ? project("repo-a") : project("repo-b") } });
+  await buttons(rowFor(card("__global__"), "hot_paths"), "Edit")[0].fire("click");
+  await press(els.configModalSave);
+  els.configDest.value = "repo-b";
+  await els.configDest.fire("change");
+  let releaseDest;
+  gate = new Promise(r => { releaseDest = r; });
+  clock += 1000;
+  let pendingDest = els.configModalSave.fire("click");
+  await Promise.resolve();
+  check("the destination dropdown is disabled while the dry run is out", els.configDest.disabled === true, String(els.configDest.disabled));
+  /* a change that lands anyway (a stale event, a script) */
+  els.configDest.value = "repo-a";
+  await els.configDest.fire("change");
+  gate = null; releaseDest(); await pendingDest;
+  check("switching destination mid-dry-run writes nowhere for real",
+    writes().length === 1 && body(writes()[0]).dry_run === true && writes()[0].url === "/api/config/repo-b/tools", JSON.stringify(writes()));
+  check("...leaves the editor open on Save, the dropdown enabled again",
+    els.configModal.classList.contains("open") && els.configModalSave.textContent === "Save" && els.configDest.disabled === false,
+    JSON.stringify([els.configModalSave.textContent, els.configDest.disabled]));
+  check("...and says to check the new destination", /destination changed/i.test(els.configModalError.textContent) && shown(els.configModalError),
+    els.configModalError.textContent);
+  els.configModalCancel.fire("click");
+  els.configDest.value = "__global__";
+
+  // 8e. a cross-repo replace whose real write failed asks for the replace confirm again
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  const freshA = project("repo-a", MODEL().projects[0].tools.entries);
+  freshA.tools.fingerprint = "sha256:repo-a-tools-2";
+  respond = (url, init) => {
+    if (init.method === undefined || init.method === "GET") return { status: 200, body: freshA };
+    const b = JSON.parse(init.body);
+    if (init.method === "POST" && yamlName(b.yaml) === "hot_paths")
+      return { status: 409, body: { detail: { code: "exists", name: "hot_paths", message: "a tool named 'hot_paths' already exists in this scope" } } };
+    if (!b.dry_run && ifMatch({ init }) === '"sha256:repo-a-tools"')
+      return { status: 412, body: { detail: { code: "stale", message: "devgraph.tools.yaml changed on disk", scope: freshA } } };
+    return { status: 200, body: { ok: true, written: !b.dry_run, warnings: [], notes: [], scope: freshA } };
+  };
+  await buttons(rowFor(card("__global__"), "hot_paths"), "Edit")[0].fire("click");
+  await press(els.configModalSave);
+  els.configDest.value = "repo-a";
+  await els.configDest.fire("change");
+  await press(els.configModalSave);
+  await press(els.configModalSave);
+  check("a confirmed replace that comes back 412 offers Reload", shown(els.configModalReload) &&
+    writes().filter(c => body(c).dry_run === false).length === 1, JSON.stringify(writes()));
+  await els.configModalReload.fire("click");
+  fetchCalls = [];
+  await press(els.configModalSave);
+  check("after Reload, Save stops at the replace confirm again", els.configModalSave.textContent === "Save anyway" &&
+    els.configModalConfirm.textContent.includes("Replaces repo-a's own hot_paths.") && writes().every(c => body(c).dry_run === true),
+    JSON.stringify([els.configModalSave.textContent, writes()]));
+  await press(els.configModalSave);
+  check("...and the confirmed write PUTs repo-a's hot_paths with the reloaded fingerprint",
+    lastCall().url === "/api/config" && writes().filter(c => body(c).dry_run === false).length === 1 &&
+    writes().some(c => body(c).dry_run === false && c.init.method === "PUT" && c.url === "/api/config/repo-a/tools/hot_paths" &&
+      ifMatch(c) === '"sha256:repo-a-tools-2"'), JSON.stringify(writes()));
+  els.configDest.value = "__global__";
+  api.renderConfigPage(MODEL());
+
   // 9. deleting a global tool warns too, and has no destination
   await buttons(rowFor(card("__global__"), "hot_paths"), "Delete")[0].fire("click");
   check("deleting a global tool warns first", shown(els.configModalWarn) && els.configModalWarnText.textContent.startsWith("Global tools are served"),
