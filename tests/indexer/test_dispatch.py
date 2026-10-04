@@ -736,3 +736,45 @@ class TestDeterministicIndexOrder:
         assert exports[0]["rels"], "fixture should produce edges"
         for other in exports[1:]:
             assert other == exports[0]
+
+    def test_index_paths_orders_mixed_relative_and_absolute_paths_by_repo_path(self, temp_repo, monkeypatch):
+        """A relative path and an absolute path are ordered by where they sit
+        in the repo, not by how the caller spelled them."""
+        (temp_repo / "a.py").write_text("def a():\n    pass\n")
+        (temp_repo / "b.py").write_text("def b():\n    pass\n")
+        monkeypatch.chdir(temp_repo)
+
+        seen: list[str] = []
+
+        def record(engine, repo_id, repo_root, resolved, rel_path, *args):
+            seen.append(rel_path)
+            return 1
+
+        monkeypatch.setattr(dispatch, "_index_single_path", record)
+        # As raw strings "/tmp/.../b.py" sorts before "a.py".
+        index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {Path("a.py"), (temp_repo / "b.py").resolve()})
+
+        assert seen == ["a.py", "b.py"]
+
+
+class _RowsEngine:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def run_cypher(self, query, params):
+        return list(self.rows)
+
+
+class TestOwningServiceTieBreak:
+    def test_services_sharing_a_build_context_resolve_the_same_way_in_any_row_order(self):
+        rows = [
+            {"name": "web", "build_context": "app", "file": "compose.yml"},
+            {"name": "api", "build_context": "app", "file": "compose.yml"},
+        ]
+        owners = {
+            dispatch._match_owning_service(
+                dispatch._load_services_with_build_context(_RowsEngine(order), "_unit_services"), "app/main.py"
+            )
+            for order in (rows, rows[::-1])
+        }
+        assert owners == {"api"}

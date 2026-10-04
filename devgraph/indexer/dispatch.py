@@ -150,27 +150,26 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # the other endpoint's file was indexed earlier, and shared nodes
     # (Datastore/Endpoint) keep the last writer's `source`/`library` and
     # accumulate `sources` in claim order -- so iterating the set directly
-    # made the graph depend on PYTHONHASHSEED. Sorting by POSIX path (every
-    # path here is under repo_root, so this is repo-relative order) makes a
-    # scan of the same tree produce the same graph every run.
-    paths = sorted(
-        _expand_with_reverse_dependents(engine, repo_id, repo_root, paths),
-        key=lambda p: Path(p).as_posix(),
-    )
-
-    for path in paths:
-        path = Path(path)
+    # made the graph depend on PYTHONHASHSEED. Each path is resolved once
+    # and the batch is sorted by its repo-relative POSIX path, so the order
+    # is the same however the caller spelled a path (relative, absolute,
+    # through a symlink).
+    root_resolved = repo_root.resolve()
+    by_rel_path: dict[str, Path] = {}
+    for path in _expand_with_reverse_dependents(engine, repo_id, repo_root, paths):
         try:
-            resolved = path.resolve()
-        except OSError:
+            resolved = Path(path).resolve()
+            rel_path = resolved.relative_to(root_resolved).as_posix()
+        except (OSError, ValueError):
             continue
-        if not str(resolved).startswith(str(repo_root.resolve())):
-            continue
+        by_rel_path[rel_path] = resolved
+
+    for rel_path in sorted(by_rel_path):
+        resolved = by_rel_path[rel_path]
         if not resolved.exists() or not resolved.is_file():
             continue
 
         name_lower = resolved.name.lower()
-        rel_path = resolved.relative_to(repo_root.resolve()).as_posix()
 
         # One unparseable/locked file (or a transient Neo4j error mid-batch)
         # must not abort the whole batch: a full scan or watcher batch would
@@ -697,6 +696,10 @@ def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict
         "RETURN s.name as name, s.build_context as build_context, s.file as file",
         {"repo_id": repo_id},
     )
+    # Sorted so the result doesn't depend on the order Neo4j returns rows:
+    # _match_owning_service keeps the first of several Services sharing a
+    # build_context, and a name declared in two compose files keeps the last.
+    results = sorted(results, key=lambda row: (row["name"], row["file"] or ""))
     return {row["name"]: (row["build_context"], row["file"]) for row in results}
 
 
