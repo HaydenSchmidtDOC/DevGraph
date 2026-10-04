@@ -13,8 +13,8 @@ checkout as its working directory (`devgraph mcp add` and the client-config
 snippets set it), and MCP roots are deprecated in the SDK in use. So the scope
 is resolved, once at startup, as:
 
-1. `DEVGRAPH_MCP_REPO` — a registered repo id, or a path inside a registered
-   repository — if set. A value that matches nothing serves no project tools
+1. `DEVGRAPH_MCP_REPO` — a registered repo id, or an absolute path inside a registered
+   repository (a relative value is only ever an id) — if set. A value that matches nothing serves no project tools
    (never a guess).
 2. Otherwise the server process's working directory, if it lies inside a
    registered repository (the deepest match wins).
@@ -49,8 +49,10 @@ A call:
   and a notice records it.
 - An invalid tools file serves no project tools; a notice records it.
 - Notices and the scope are published in a new `devgraph://project-tools`
-  resource (`{scope: {repo_id, source}, tools_file, served, notices}`), and
-  project-tool responses carry a `notices` list when there are any. `config
+  resource (`{scope: {repo_id, source}, tools_file, served, notices}`); a
+  pinned id that is registered but inactive, or a pinned repository whose root
+  is missing, is reported there. Project-tool responses carry no file-level
+  notices. `config
   validate` and `doctor` already report both conditions.
 - `devgraph://tool-catalog` lists served project tools alongside built-ins.
 

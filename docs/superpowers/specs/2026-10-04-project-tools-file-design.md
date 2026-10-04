@@ -31,7 +31,7 @@ tools:
   agent reads to decide whether to call the tool).
 - `cypher`: required; must reference `$repo_id`, which the server will inject
   and the author cannot override; must pass a static read-only check.
-- `parameters`: `name` (`[a-z][a-z0-9_]{0,63}`, not `repo_id`, unique),
+- `parameters`: `name` (`[a-z][a-z0-9_]{0,63}`, not `repo_id`, not a Python keyword, not starting with `model_`, unique),
   `type` (`string | integer | float | boolean`, default `string`),
   `required` (default `true`, a real boolean), optional `description` (at most 1024 characters), optional `default` (must match the type; only
   allowed when `required: false`).

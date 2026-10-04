@@ -230,6 +230,9 @@ the server's working directory). Read `devgraph://project-tools` for what is
 served; the file is read at session start, so restart the MCP session after
 editing it. Pin a project with
 `claude mcp add devgraph -e DEVGRAPH_MCP_REPO=<repo_id> -- "<venv python>" -m devgraph.mcp.server`.
+A path value must be absolute (a relative value is read as a repo id), and a value
+that matches no active registered repository serves nothing. If `devgraph` is already
+registered in that project, run `claude mcp remove devgraph` first.
 
 `run_cypher` will not appear unless DevGraph's own config has
 `enable_run_cypher=true` set. If it's missing and you need something the
