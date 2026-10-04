@@ -90,7 +90,7 @@ _TELEMETRY_ORIGINS = ("builtin", "global", "project", "unscoped")
 # sources the dashboard reads hold a comparable amount of history.
 _TELEMETRY_MAX_ENTRIES = 500
 # Trimming rewrites the whole file, so it's amortised: append freely until
-# the store is comfortably past the cap's worth of ~120-byte records, then
+# the store is comfortably past the cap's worth of ~150-byte records, then
 # cut back to the newest _TELEMETRY_MAX_ENTRIES.
 _TELEMETRY_TRIM_AT_BYTES = 256 * 1024
 

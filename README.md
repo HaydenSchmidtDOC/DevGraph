@@ -168,7 +168,7 @@ Because there is no authentication, the dashboard answers only requests addresse
 
 ### Config page
 
-Settings > Config shows the configuration the MCP tool plane and the indexer actually use: the global scope first (built-in node types, relationship types and tools, locked, plus the global tools, flagged GLOBAL), then one block per active registered repository (project tools, node types and relationships from `devgraph.tools.yaml` and `devgraph.schema.yaml`). Tools show their display id (`gl_<name>` for global, `<repo_id>_<name>` for project, the bare name for built-ins); MCP telemetry records the same ids (plus the wire name and origin) for each tool call.
+Settings > Config shows the configuration the MCP tool plane and the indexer actually use: the global scope first (built-in node types, relationship types and tools, locked, plus the global tools, flagged GLOBAL), then one block per active registered repository (project tools, node types and relationships from `devgraph.tools.yaml` and `devgraph.schema.yaml`). Tools show their display id (`gl_<name>` for global, `<repo_id>_<name>` for project, the bare name for built-ins); MCP telemetry records the same ids for each tool call, with the wire name and an origin (`builtin`, `global`, `project`); it never records arguments, query text or results.
 
 Badges use the same resolution rules as an MCP session, with the detail on hover:
 
@@ -188,7 +188,11 @@ Each tool, node type and relationship can be added, edited or deleted from a YAM
 
 The API behind it is `GET /api/config` and `GET /api/config/{scope}` (scope is `__global__` or a repo id), plus `POST`/`PUT`/`DELETE` on `/api/config/{scope}/tools[/{name}]` and `/api/config/{scope}/schema/{section}[/{name}]`. Writes are refused when `Origin`/`Sec-Fetch-Site` mark the request cross-site or cross-origin (403), on top of the `Host` check above. There is no authentication: if you set `DEVGRAPH_DASHBOARD_HOST` to a LAN address, anyone on that network can use these routes to write tool Cypher into your registered repositories and the global tools store.
 
-Not in this page yet: copying entries between repositories, whole-file reset and the project-config enable/disable toggle, a structured form editor, cross-repository schema conflict badges, and retiring the prototype "MCP tools" pane.
+Each section also has a **Reset** button that empties a whole file: `devgraph.tools.yaml` or `devgraph.schema.yaml` of a repository, or the global tools store. It lists what would be removed first (a dry run), then asks you to type the repository id (`global` for the global store) before the button arms. The reset is bound to the fingerprint of the dry run, so a file that changed after it was listed is refused with 412 and the dialog offers to re-check. A tracked file shows up in `git status` as deleted or modified and is never staged or committed; an untracked file or the global store cannot be restored. The routes are `POST /api/config/{scope}/reset/tools` and `POST /api/config/{repo_id}/reset/schema` (body `{"dry_run": true|false}`, `If-Match` required). The CLI's `config ... reset` refuses a symlinked file.
+
+Each repository card has a **Project config** switch, the dashboard form of `devgraph config enable|disable`: switching it off serves no project tools and gives the repository the built-in schema at the next rescan (a dry run shows any warnings first). It is `PUT /api/config/{repo_id}/project-config` with `{"enabled": true|false}` (naming the end state, so no `If-Match`).
+
+Not in this page yet: copying entries between repositories, a structured form editor, cross-repository schema conflict badges, and retiring the prototype "MCP tools" pane.
 
 ## Optional indexing
 
