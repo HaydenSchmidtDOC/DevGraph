@@ -27,7 +27,18 @@ restart, then tells the client its tool list changed.
   served tool's definition, the server sends `notifications/tools/list_changed`
   to legacy-protocol clients and publishes `ToolsListChanged` to modern
   (`subscriptions/listen`) clients. The server advertises
-  `tools.listChanged: true` in its initialize result.
+  `tools.listChanged: true` in its initialize result. On 2026-07-28
+  connections the SDK advertises `listChanged` whenever `subscriptions/listen`
+  is served, so an unscoped server advertises it there too; this is harmless.
+- **Mid-save states.** A save can be seen half-done (an empty file caught
+  mid-write, or delete-then-recreate), which can produce two notifications
+  about 2 seconds apart. Accepted: the second poll corrects the tool set.
+- **Failed and racy reloads.** The fingerprint is taken before each load
+  (including the startup one) and checked again after; if the file changed
+  meanwhile, or the reload raised, the next poll reloads again. A missing
+  repository root has its own fingerprint (`root-missing`), so its notice is
+  cleared when the root returns. A reload that ends with file-level notices
+  is logged as a warning on stderr.
 - **Status.** `devgraph://project-tools` and `devgraph://tool-catalog` reflect
   the reloaded state.
 - **No scope, no polling.** A server without a session repository behaves
@@ -44,17 +55,19 @@ subprocess client:
   create_initialization_options(NotificationOptions(tools_changed=True)))`,
   with the reload poller in the same task group.
 - Legacy notifications need the connection, which is only reachable from a
-  request context: a middleware on `server._lowlevel_server.middleware`
-  records `ctx.session._connection` (one per client; recording the per-request
-  session duplicates notifications), and the poller calls
-  `send_tool_list_changed()` on each.
+  request context: a middleware on `server.middleware`
+  records `ctx.session._connection` on `initialize` requests only (legacy
+  clients: one long-lived connection each; 2026-07-28 clients never send
+  `initialize` and get a new connection per request, which must not be
+  captured), and the poller calls `send_tool_list_changed()` on each.
 - Modern notifications: `server._subscriptions.publish(ToolsListChanged())`;
   a no-op without listeners and on legacy connections, so both are always sent.
 - `add_tool` / `remove_tool` are synchronous dict mutations, safe from a task
   on the server's loop.
 
-These are private attributes; the SDK version is pinned, and a test exercises
-each against the real SDK so an upgrade that moves them fails loudly.
+These are private attributes; the SDK version is pinned, and tests exercise
+each against the real SDK (including `run_stdio` over memory streams) so an
+upgrade that moves them fails loudly.
 
 ## Out of scope
 
@@ -68,5 +81,7 @@ serves nothing with a notice, then a fix restores the tools; deleted file
 serves nothing; built-in names still refused; the status resource and catalog
 follow. Notification: an in-process legacy client receives
 `tools/list_changed` and re-lists the new set; a modern listener receives
-`ToolsListChanged`; the initialize result advertises `listChanged: true`; no
+`ToolsListChanged` and modern clients are never captured for legacy
+notifications; `run_stdio` advertises `listChanged` for a scoped server only
+and ends when the client closes; the initialize result advertises `listChanged: true`; no
 notification when nothing served changed.
