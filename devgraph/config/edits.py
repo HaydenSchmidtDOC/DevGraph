@@ -37,12 +37,14 @@ GLOBAL_TOOLS_NOTE = (
 
 class ConfigEditError(Exception):
     """A config edit was refused. `code` is one of: locked, exists, not_found, ambiguous,
-    invalid, stale, not_regular, unreadable, io."""
+    invalid, stale, not_regular, unreadable, io. `name` is the taken entry name on a
+    tool `exists`, so a caller can offer to replace that entry instead."""
 
-    def __init__(self, message: str, code: str = "invalid") -> None:
+    def __init__(self, message: str, code: str = "invalid", name: str | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.code = code
+        self.name = name
 
 
 @dataclass
@@ -284,7 +286,8 @@ def add_tool(root: Path | None, entry: dict, *, expected_fingerprint: str | None
         refuse_builtin(name)
         if any(isinstance(m, dict) and m.get("name") == name for m in tool_entries(root)):
             raise ConfigEditError(
-                f"a tool named {name!r} already exists in this scope; use `devgraph config tools edit {name}`", "exists"
+                f"a tool named {name!r} already exists in this scope; use `devgraph config tools edit {name}`", "exists",
+                name=name,
             )
         return write_tools(root, lambda text: add_tool_text(text, entry), dry_run=dry_run)
 
@@ -301,7 +304,7 @@ def replace_tool(
         if new_name != name:
             refuse_builtin(new_name)
             if any(isinstance(m, dict) and m.get("name") == new_name for m in tool_entries(root)):
-                raise ConfigEditError(f"a tool named {new_name!r} already exists in this scope", "exists")
+                raise ConfigEditError(f"a tool named {new_name!r} already exists in this scope", "exists", name=new_name)
         return write_tools(root, lambda text: replace_tool_text(text, name, entry), dry_run=dry_run)
 
 

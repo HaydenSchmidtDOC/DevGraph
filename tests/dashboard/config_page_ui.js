@@ -47,12 +47,12 @@ const mkEl = tag => {
     replaceChildren(...cs) { el.children = []; el._text = ""; cs.forEach(c => el.appendChild(c)); },
     replaceWith(n) { const p = el.parentNode; p.children[p.children.indexOf(el)] = n; n.parentNode = p; },
     addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
-    async fire(type) {
-      const ev = { target: el, preventDefault() {} };
+    async fire(type, detail = 1) {
+      const ev = { target: el, detail, preventDefault() {} };
       for (const fn of listeners[type] || []) await fn(ev);
       if (el["on" + type]) await el["on" + type](ev);
     },
-    focus() {},
+    focus() { focused = el; },
   };
   allEls.push(el);
   return el;
@@ -64,15 +64,21 @@ const els = Object.fromEntries(ids.map(id => [id, mkEl(id === "configYaml" ? "te
 const document = { getElementById: id => els[id] || null, createElement: mkEl };
 
 let tooltips = [];
+let focused = null;
+/* the page's clock (Date.now): a changed confirm button only arms after a pause */
+let clock = 1e6;
+/* when set, every fetch waits on it -- a request still in flight */
+let gate = null;
 let fetchCalls = [];
 let respond = () => ({ status: 500, body: { detail: "no handler" } });
 /* what a full GET /api/config returns (the page refreshes after a tool write) */
 let configPayload = null;
 const globals = {
-  document, console,
+  document, console, Date: { now: () => clock },
   wireTooltip: el => tooltips.push(el),
   fetch: async (url, init) => {
     fetchCalls.push({ url, init: init || {} });
+    if (gate) await gate;
     const { status, body } = url === "/api/config" && configPayload ? { status: 200, body: configPayload } : respond(url, init || {});
     return { ok: status >= 200 && status < 300, status, json: async () => JSON.parse(JSON.stringify(body)) };
   },
@@ -132,6 +138,9 @@ const buttons = (root, label) => find(root, e => e.tagName === "BUTTON" && e.tex
 const card = scope => els.configScopes.children.find(c => c.dataset.scope === scope);
 const shown = el => el.style.display !== "none";
 const lastCall = () => fetchCalls[fetchCalls.length - 1];
+/* a deliberate click: well after the button last changed meaning */
+const press = async (el, detail = 1) => { clock += 1000; await el.fire("click", detail); };
+const yamlName = text => (/^name:\s*(\S+)/m.exec(text || "") || [])[1];
 const writes = () => fetchCalls.filter(c => c.init.method && c.init.method !== "GET");
 const body = call => JSON.parse(call.init.body);
 const ifMatch = call => call.init.headers && call.init.headers["If-Match"];
@@ -213,7 +222,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("a project entry skips the global warning step", !shown(els.configModalWarn) && shown(els.configYaml), els.configModalWarn.style.display);
   els.configYaml.value = "label: Runbook\nkey: [id]\n";
   await els.configYaml.fire("input");
-  await els.configModalSave.fire("click");
+  await press(els.configModalSave);
   check("Save sends a dry run first, then the write",
     fetchCalls.length >= 2 && body(fetchCalls[0]).dry_run === true && body(fetchCalls[1]).dry_run === false, JSON.stringify(fetchCalls));
   check("...both PUT to the entry with the schema file's fingerprint",
@@ -239,7 +248,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     els.configYaml.value);
   els.configYaml.value = "name: mine\n# my unsaved work\n";
   await els.configYaml.fire("input");
-  await els.configModalSave.fire("click");
+  await press(els.configModalSave);
   check("a stale fingerprint keeps the modal open", els.configModal.classList.contains("open"), els.configModal.className);
   check("...keeps the user's text", els.configYaml.value === "name: mine\n# my unsaved work\n", els.configYaml.value);
   check("...says the file changed on disk", /changed on disk/i.test(els.configModalError.textContent) && shown(els.configModalError),
@@ -251,7 +260,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("...keeps the textarea", els.configYaml.value === "name: mine\n# my unsaved work\n", els.configYaml.value);
   check("...and hides itself", !shown(els.configModalReload), els.configModalReload.style.display);
   fetchCalls = [];
-  await els.configModalSave.fire("click");
+  await press(els.configModalSave);
   check("the next save carries the reloaded fingerprint",
     writes().length === 2 && writes().every(c => ifMatch(c) === '"sha256:repo-b-tools-2"' && c.init.method === "POST" &&
       c.url === "/api/config/repo-b/tools"), JSON.stringify(fetchCalls));
@@ -264,14 +273,14 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     ? { status: 200, body: { ok: true, written: false, warnings: [WARN], notes: [], scope: project("repo-a") } }
     : ok(project("repo-a"));
   await buttons(rowFor(card("repo-a"), "Runbook"), "Delete")[0].fire("click");
-  await els.configModalSave.fire("click");
+  await press(els.configModalSave);
   check("a delete with warnings stops after the dry run", fetchCalls.length === 1 && fetchCalls[0].url.endsWith("?dry_run=1"),
     JSON.stringify(fetchCalls));
   check("...shows the warnings as text", els.configModalConfirm.textContent.includes(WARN) && shown(els.configModalConfirm) &&
     !els.configModalConfirm._html.includes("<b>"), els.configModalConfirm.textContent);
   check("...and asks for a second click", els.configModalSave.textContent === "Delete anyway", els.configModalSave.textContent);
   check("...with the modal still open", els.configModal.classList.contains("open"), els.configModal.className);
-  await els.configModalSave.fire("click");
+  await press(els.configModalSave);
   check("the second click deletes for real", fetchCalls.length === 2 &&
     fetchCalls[1].url === "/api/config/repo-a/schema/node_types/Runbook" && fetchCalls[1].init.method === "DELETE" &&
     ifMatch(fetchCalls[1]) === '"sha256:repo-a-schema"', JSON.stringify(fetchCalls));
@@ -283,14 +292,14 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     ? { status: 200, body: { ok: true, written: false, warnings: ["Changing the key keeps the old constraint."], notes: [], scope: project("repo-a") } }
     : ok(project("repo-a"));
   await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
-  await els.configModalSave.fire("click");
+  await press(els.configModalSave);
   check("an edit with warnings asks for 'Save anyway'", els.configModalSave.textContent === "Save anyway" && fetchCalls.length === 1,
     els.configModalSave.textContent);
   els.configYaml.value = "label: Runbook\nkey: [other]\n";
   await els.configYaml.fire("input");
   check("changing the text withdraws the confirm", els.configModalSave.textContent === "Save" && !shown(els.configModalConfirm),
     els.configModalSave.textContent);
-  await els.configModalSave.fire("click");
+  await press(els.configModalSave);
   check("...so the next click dry-runs again", fetchCalls.length === 2 && body(fetchCalls[1]).dry_run === true, JSON.stringify(fetchCalls));
   els.configModalCancel.fire("click");
   check("Cancel closes the modal", !els.configModal.classList.contains("open"), els.configModal.className);
@@ -305,7 +314,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     els.configModalWarnText.textContent);
   check("...with a Continue button and nothing sent", els.configModalSave.textContent === "Continue" && fetchCalls.length === 0,
     els.configModalSave.textContent);
-  await els.configModalSave.fire("click");
+  await press(els.configModalSave);
   check("Continue shows the editor", shown(els.configYaml) && els.configModalSave.textContent === "Save" && fetchCalls.length === 0,
     els.configModalSave.textContent);
   check("the destination dropdown lists the global store, then each repo",
@@ -323,30 +332,70 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   let t = api.configEditTarget();
   check("a repo without the tool gets a POST to its tools", t.scope === "repo-b" && t.op === "add", JSON.stringify(t));
   respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: project("repo-b") } });
-  await els.configModalSave.fire("click");
+  await press(els.configModalSave);
   check("...sent with that repo's tools fingerprint", writes().length === 2 && writes().every(c =>
     c.url === "/api/config/repo-b/tools" && c.init.method === "POST" && ifMatch(c) === '"sha256:repo-b-tools"'),
     JSON.stringify(fetchCalls));
   api.renderConfigPage(MODEL());
   fetchCalls = [];
+  /* the destination's existing names are the server's to say: a POST that
+     comes back 409 exists names the taken entry, and only then is it a PUT */
+  respond = (url, init) => {
+    const b = JSON.parse(init.body);
+    if (init.method === "POST" && url === "/api/config/repo-a/tools" && yamlName(b.yaml) === "hot_paths")
+      return { status: 409, body: { detail: { code: "exists", name: "hot_paths", message: "a tool named 'hot_paths' already exists in this scope" } } };
+    return { status: 200, body: { ok: true, written: !b.dry_run, warnings: [], notes: [], scope: project("repo-a") } };
+  };
   await buttons(rowFor(card("__global__"), "hot_paths"), "Edit")[0].fire("click");
-  await els.configModalSave.fire("click");
+  await press(els.configModalSave);
   els.configDest.value = "repo-a";
   await els.configDest.fire("change");
+  check("the title follows the destination", els.configModalTitle.textContent === "Save global tool hot_paths to repo-a",
+    els.configModalTitle.textContent);
   t = api.configEditTarget();
-  check("a repo that already has the tool gets a PUT to that entry", t.scope === "repo-a" && t.op === "replace" && t.name === "hot_paths",
-    JSON.stringify(t));
-  check("...and the warning says it replaces the repo's own tool",
-    els.configModalWarnText.textContent.includes("Replaces repo-a's own hot_paths."), els.configModalWarnText.textContent);
-  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: project("repo-a") } });
-  await els.configModalSave.fire("click");
-  check("replacing a repo's own tool needs a confirm", fetchCalls.length === 1 && els.configModalSave.textContent === "Save anyway" &&
-    els.configModalConfirm.textContent.includes("Replaces repo-a's own hot_paths."), JSON.stringify(fetchCalls));
-  await els.configModalSave.fire("click");
-  check("...then PUTs /api/config/repo-a/tools/hot_paths with repo-a's fingerprint", writes().length === 2 &&
-    writes()[1].url === "/api/config/repo-a/tools/hot_paths" && writes()[1].init.method === "PUT" &&
-    ifMatch(writes()[1]) === '"sha256:repo-a-tools"' && body(writes()[1]).dry_run === false, JSON.stringify(fetchCalls));
+  check("before asking, a repo destination is an add", t.scope === "repo-a" && t.op === "add", JSON.stringify(t));
+  await press(els.configModalSave);
+  check("a taken name is found by the dry-run POST, then dry-run as a PUT to that entry",
+    writes().length === 2 && writes()[0].init.method === "POST" && writes()[1].init.method === "PUT" &&
+    writes()[1].url === "/api/config/repo-a/tools/hot_paths" && writes().every(c => body(c).dry_run === true &&
+    ifMatch(c) === '"sha256:repo-a-tools"'), JSON.stringify(writes()));
+  check("replacing a repo's own tool needs a confirm", els.configModalSave.textContent === "Save anyway" &&
+    els.configModalConfirm.textContent.includes("Replaces repo-a's own hot_paths."), els.configModalConfirm.textContent);
+  check("...and the warning says so", els.configModalWarnText.textContent.includes("Replaces repo-a's own hot_paths."),
+    els.configModalWarnText.textContent);
+  await press(els.configModalSave);
+  check("...then PUTs /api/config/repo-a/tools/hot_paths with repo-a's fingerprint", writes().length === 3 &&
+    writes()[2].url === "/api/config/repo-a/tools/hot_paths" && writes()[2].init.method === "PUT" &&
+    ifMatch(writes()[2]) === '"sha256:repo-a-tools"' && body(writes()[2]).dry_run === false, JSON.stringify(fetchCalls));
   check("...and refreshes the whole page, since tool resolution crosses scopes", lastCall().url === "/api/config", lastCall().url);
+
+  // 8b. renamed in the YAML: across scopes the new name is what gets written
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  await buttons(rowFor(card("__global__"), "hot_paths"), "Edit")[0].fire("click");
+  await press(els.configModalSave);
+  els.configYaml.value = "name: hot_paths_v2\ndescription: d\ncypher: x\n";
+  await els.configYaml.fire("input");
+  els.configDest.value = "repo-a";
+  await els.configDest.fire("change");
+  await press(els.configModalSave);
+  check("a renamed global tool saved to a repo is a POST of the new name, never a PUT over the old one",
+    writes().length === 2 && writes().every(c => c.init.method === "POST" && c.url === "/api/config/repo-a/tools"),
+    JSON.stringify(writes()));
+  check("...and repo-a's own hot_paths is left alone", !writes().some(c => c.url.endsWith("/tools/hot_paths")), JSON.stringify(writes()));
+
+  // 8c. renamed within the same scope: a PUT of the old name (a rename)
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: globalBlock() } });
+  await buttons(rowFor(card("__global__"), "hot_paths"), "Edit")[0].fire("click");
+  await press(els.configModalSave);
+  els.configYaml.value = "name: hot_paths_v2\ndescription: d\ncypher: x\n";
+  await els.configYaml.fire("input");
+  await press(els.configModalSave);
+  check("a rename in the same scope PUTs the old name", writes().length === 2 && writes().every(c =>
+    c.init.method === "PUT" && c.url === "/api/config/__global__/tools/hot_paths" && ifMatch(c) === '"sha256:g1"'),
+    JSON.stringify(writes()));
   els.configDest.value = "__global__";
   api.renderConfigPage(MODEL());
 
@@ -354,8 +403,91 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await buttons(rowFor(card("__global__"), "hot_paths"), "Delete")[0].fire("click");
   check("deleting a global tool warns first", shown(els.configModalWarn) && els.configModalWarnText.textContent.startsWith("Global tools are served"),
     els.configModalWarnText.textContent);
-  await els.configModalSave.fire("click");
+  await press(els.configModalSave);
   check("...and offers no destination", !shown(els.configDestField), els.configDestField.style.display);
+  els.configModalCancel.fire("click");
+
+  // 13. double submits and held Enter never skip a step
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  respond = () => ok(globalBlock());
+  await buttons(rowFor(card("__global__"), "hot_paths"), "Delete")[0].fire("click");
+  await press(els.configModalSave);           // Continue past the global warning
+  await els.configModalSave.fire("click", 2);  // the double-click's second click lands on "Delete"
+  check("a double-click on Continue does not also press Delete", fetchCalls.length === 0, JSON.stringify(fetchCalls));
+  check("entering the edit step moves focus to the textarea, off the button", focused === els.configYaml, focused && focused.tagName);
+  for (let i = 0; i < 5; i++) { clock += 30; await els.configModalSave.fire("click", 0); }  // held Enter: keyboard clicks, detail 0
+  check("held Enter right after the button changes meaning sends nothing", fetchCalls.length === 0, JSON.stringify(fetchCalls));
+  els.configModalCancel.fire("click");
+
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  respond = (url, init) => url.includes("dry_run=1")
+    ? { status: 200, body: { ok: true, written: false, warnings: ["Removing node type Runbook deletes its nodes."], notes: [], scope: project("repo-a") } }
+    : ok(project("repo-a"));
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Delete")[0].fire("click");
+  await press(els.configModalSave);           // first click: the dry run
+  check("the dry run asks for 'Delete anyway'", els.configModalSave.textContent === "Delete anyway", els.configModalSave.textContent);
+  await els.configModalSave.fire("click", 2);  // second click of a double-click
+  for (let i = 0; i < 5; i++) { clock += 30; await els.configModalSave.fire("click", 0); }
+  check("a double-click or held Enter cannot reach the real delete before the warnings can be read",
+    fetchCalls.length === 1 && fetchCalls[0].url.endsWith("?dry_run=1"), JSON.stringify(fetchCalls));
+  check("...focus is off the confirm button", focused === els.configYaml, focused && focused.tagName);
+  await press(els.configModalSave);
+  check("a deliberate click later still confirms", fetchCalls.length === 2 && fetchCalls[1].init.method === "DELETE" &&
+    !fetchCalls[1].url.includes("dry_run"), JSON.stringify(fetchCalls));
+
+  // 13b. Save is disabled and says so while busy
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  let release;
+  gate = new Promise(r => { release = r; });
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: project("repo-a") } });
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
+  clock += 1000;
+  let pending = els.configModalSave.fire("click");
+  await Promise.resolve();
+  check("Save is disabled with busy text during the request",
+    els.configModalSave.disabled === true && els.configModalSave.textContent === "Checking…", els.configModalSave.textContent);
+  clock += 1000;
+  await els.configModalSave.fire("click");
+  check("...and a click meanwhile sends nothing more", fetchCalls.length === 1, JSON.stringify(fetchCalls));
+  gate = null; release(); await pending;
+  check("...then the save completes", writes().length === 2 && !els.configModal.classList.contains("open"), JSON.stringify(writes()));
+  check("Save is enabled again for the next editor", (await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click"), els.configModalSave.disabled === false),
+    String(els.configModalSave.disabled));
+  els.configModalCancel.fire("click");
+
+  // 14. Cancel while a save is in flight
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  gate = new Promise(r => { release = r; });
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
+  clock += 1000;
+  pending = els.configModalSave.fire("click");
+  await Promise.resolve();
+  els.configModalCancel.fire("click");
+  gate = null; release();
+  let threw = null;
+  try { await pending; } catch (e) { threw = e; }
+  check("Cancel during the dry run: no error", threw === null, String(threw));
+  check("...and no real write", writes().length === 1 && body(writes()[0]).dry_run === true, JSON.stringify(writes()));
+  check("...and the modal stays closed", !els.configModal.classList.contains("open"), els.configModal.className);
+
+  fetchCalls = [];
+  gate = new Promise(r => { release = r; });
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
+  clock += 1000;
+  pending = els.configModalSave.fire("click");
+  await Promise.resolve();
+  els.configModalCancel.fire("click");
+  await buttons(card("repo-b"), "Add tool")[0].fire("click");
+  els.configYaml.value = "name: second\n";
+  gate = null; release(); await pending;
+  check("an editor opened meanwhile is untouched by the old save",
+    els.configModal.classList.contains("open") && els.configModalTitle.textContent === "Add a tool (repo-b)" &&
+    els.configYaml.value === "name: second\n" && els.configModalSave.textContent === "Save" && writes().length === 1,
+    JSON.stringify([els.configModalTitle.textContent, els.configModalSave.textContent, writes().length]));
   els.configModalCancel.fire("click");
 
   // 10. error wording
@@ -375,8 +507,31 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("the Config nav button follows Repos", /data-pane="repos">Repos<\/button>\s*<button data-pane="config">Config<\/button>/.test(html),
     "no Config nav button after Repos");
   check("there is a Config pane", /<div class="settings-pane" id="pane-config"/.test(html), "no #pane-config");
-  check("the pane loads lazily on first activation", /dataset\.pane === "config"[^\n]*loadConfigPage\(\)/.test(html),
-    "nav handler does not load the Config page");
+  check("the pane loads on activation, quietly once it has a model",
+    /dataset\.pane === "config"\) loadConfigPage\(!!configModel\)/.test(html), "nav handler does not (re)load the Config page");
+
+  // 15. live events refresh a loaded Config page, whatever repo the graph shows
+  const liveSrc = grab(/^function connectLiveEvents\(/m, "\n}");
+  const live = { es: null, model: null, loads: [] };
+  const liveEls = { ctlLiveUpdate: { checked: false }, repoSelect: { value: "repo-a" } };
+  const connect = new Function("document", "EventSource", "loadConfigPage", "neo4jConnected", "loadSchemaTypes", "refreshGraph",
+    "loadGitHistory", "populateRealRepos", "live",
+    "const self = { get configModel() { return live.model; } };\n" +
+    liveSrc.replace(/\bconfigModel\b/g, "self.configModel") + "\nreturn connectLiveEvents;")(
+    { getElementById: id => liveEls[id] }, class { constructor() { live.es = this; } }, quiet => live.loads.push(quiet),
+    false, async () => {}, () => {}, () => {}, () => {}, live);
+  connect();
+  const send = async ev => live.es.onmessage({ data: JSON.stringify(ev) });
+  await send({ type: "registry_changed" });
+  check("before the pane is opened, events load nothing", live.loads.length === 0, JSON.stringify(live.loads));
+  live.model = {};
+  await send({ type: "registry_changed" });
+  await send({ type: "reindexed", repo_id: "other-repo", changed: 1, deleted: 0 });
+  check("registry_changed and a real reindex (any repo, live updates paused) refresh it quietly",
+    JSON.stringify(live.loads) === "[true,true]", JSON.stringify(live.loads));
+  await send({ type: "reindexed", repo_id: "repo-a", changed: 0, deleted: 0 });
+  await send({ type: "git_history_synced", mode: "full" });
+  check("a no-op reindex or other events do not", live.loads.length === 2, JSON.stringify(live.loads));
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);

@@ -161,6 +161,7 @@ const globals = {
   highlightType: () => {}, highlightRel: () => {},
   isolateChanged: () => { isolations++; },
   cy: { style: () => ({ update: () => { styleUpdates++; } }) },
+  configModel: null, loadConfigPage: () => {},  // the Config page's live refresh, idle until it is opened
 };
 const api = new Function(...Object.keys(globals),
   tablesSrc + "\n" + fnSrc +

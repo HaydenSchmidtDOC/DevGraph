@@ -2770,9 +2770,12 @@ bootConnect();
 function connectLiveEvents() {
   const es = new EventSource("/api/events");
   es.onmessage = async (e) => {
-    if (!document.getElementById("ctlLiveUpdate").checked) return; // toggle pauses reacting, not the connection itself
     let event;
     try { event = JSON.parse(e.data); } catch { return; }
+    /* the Config page lists every repo whatever the graph shows: once opened,
+       a registry change or a real rescan (schema state, badges) refreshes it */
+    if (configModel && (event.type === "registry_changed" || (event.type === "reindexed" && (event.changed || event.deleted)))) loadConfigPage(true);
+    if (!document.getElementById("ctlLiveUpdate").checked) return; // toggle pauses reacting, not the connection itself
     const repo = document.getElementById("repoSelect").value;
     const matchesRepo = repo === "__all__" || !event.repo_id || event.repo_id === repo;
     if (!matchesRepo) return;
@@ -2902,7 +2905,7 @@ document.getElementById("btnRegister").addEventListener("click", () => { documen
 document.querySelectorAll(".settings-nav button").forEach(btn => btn.addEventListener("click", () => {
   document.querySelectorAll(".settings-nav button").forEach(b=>b.classList.remove("active")); btn.classList.add("active");
   document.querySelectorAll(".settings-pane").forEach(p=>p.classList.remove("active")); document.getElementById("pane-"+btn.dataset.pane).classList.add("active");
-  if (btn.dataset.pane === "config" && !configModel) loadConfigPage();
+  if (btn.dataset.pane === "config") loadConfigPage(!!configModel);
 }));
 
 /* ── Config page (Settings → Config) ─────────────────────────────────
@@ -2923,7 +2926,7 @@ const CONFIG_SECTIONS = {
 };
 /* the last /api/config payload; null until the pane is first opened */
 let configModel = null;
-/* the open editor: { scope, section, op, name, dest, step, fps, confirmed, busy } */
+/* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, busy, label, armedAt } */
 let configEdit = null;
 
 function configEl(tag, cls, text) {
@@ -3070,19 +3073,19 @@ async function configSend(req) {
   try { body = await res.json(); } catch (e) { /* no JSON body */ }
   return { ok: res.ok, status: res.status, body };
 }
-/* where the open editor writes: a global tool saved to a repo becomes a POST
-   there, or a PUT when that repo already has a tool of the same name */
+/* where the open editor writes. A rename (PUT of the old name) happens only
+   within the entry's own scope. A global tool saved to a repo is a POST of the
+   YAML's own name there; only when that comes back 409 exists (the server
+   names the taken entry, `crossName`) does it become a PUT of that name. */
 function configEditTarget(edit = configEdit) {
   if (edit.op !== "replace" || edit.dest === edit.scope) return { scope: edit.scope, op: edit.op, name: edit.name };
-  const exists = configScopeBlock(edit.dest).tools.entries.some(e => e.name === edit.name);
-  return { scope: edit.dest, op: exists ? "replace" : "add", name: exists ? edit.name : null };
+  return edit.crossName ? { scope: edit.dest, op: "replace", name: edit.crossName } : { scope: edit.dest, op: "add", name: null };
 }
 function configWarningText(edit) {
   if (edit.scope !== CONFIG_GLOBAL || edit.op === "add") return "";
   if (edit.dest !== CONFIG_GLOBAL) {
-    const t = configEditTarget(edit);
     return "Writes a project override to " + edit.dest + "/devgraph.tools.yaml; the global tool is unchanged." +
-      (t.op === "replace" ? " Replaces " + edit.dest + "'s own " + edit.name + "." : "");
+      (edit.crossName ? " Replaces " + edit.dest + "'s own " + edit.crossName + "." : "");
   }
   const n = configModel.projects.length;
   const over = configModel.projects
@@ -3091,11 +3094,23 @@ function configWarningText(edit) {
   return "Global tools are served in every registered repository's MCP sessions (" + n + " repo" + (n === 1 ? "" : "s") + ")." +
     (over.length ? " Overridden in: " + over.join(", ") + "." : "");
 }
+function configModalTitle(edit) {
+  const noun = CONFIG_SECTIONS[edit.section].noun;
+  const where = edit.scope === CONFIG_GLOBAL ? "global store" : edit.scope;
+  if (edit.op === "add") return "Add a " + noun + " (" + where + ")";
+  if (edit.op === "replace" && edit.dest !== edit.scope) return "Save global tool " + edit.name + " to " + edit.dest;
+  return (edit.op === "delete" ? "Delete " : "Edit ") + noun + " " + edit.name + " (" + where + ")";
+}
 function configShow(id, on) { document.getElementById(id).style.display = on ? "" : "none"; }
+/* A confirm button that just changed meaning (Continue -> Save, Save -> Save
+   anyway) ignores clicks for this long, so the second click of a double-click
+   or a held Enter can't press the step it only just revealed. */
+const CONFIG_ARM_MS = 400;
 function renderConfigModal() {
   const edit = configEdit;
   const warn = configWarningText(edit);
   const verb = edit.op === "delete" ? "Delete" : "Save";
+  document.getElementById("configModalTitle").textContent = configModalTitle(edit);
   document.getElementById("configModalWarnText").textContent = warn;
   configShow("configModalWarn", !!warn);
   configShow("configDestField", edit.step === "edit" && edit.scope === CONFIG_GLOBAL && edit.section === "tools" && edit.op === "replace");
@@ -3109,7 +3124,17 @@ function renderConfigModal() {
     confirm.appendChild(list);
   }
   configShow("configModalConfirm", edit.confirmed);
-  document.getElementById("configModalSave").textContent = edit.step === "warn" ? "Continue" : edit.confirmed ? verb + " anyway" : verb;
+  const label = edit.step === "warn" ? "Continue" : edit.confirmed ? verb + " anyway" : verb;
+  if (label !== edit.label) {
+    edit.label = label;
+    edit.armedAt = Date.now();
+    /* keyboard focus leaves the button whose meaning changed: a held Enter
+       then types into (or does nothing in) the textarea instead of confirming */
+    if (edit.step === "edit") document.getElementById("configYaml").focus();
+  }
+  const save = document.getElementById("configModalSave");
+  save.disabled = !!edit.busy;
+  save.textContent = edit.busy || label;
 }
 function configSetError(text, reload) {
   document.getElementById("configModalError").textContent = text || "";
@@ -3123,11 +3148,8 @@ function openConfigEditor(opts) {
   [CONFIG_GLOBAL, ...configModel.projects.map(p => p.repo_id)].forEach(s => {
     if (s === opts.scope || (isGlobal && opts.section === "tools")) fps[s] = configFingerprint(s, opts.section);
   });
-  configEdit = { ...opts, dest: opts.scope, step: isGlobal && opts.op !== "add" ? "warn" : "edit", fps, confirmed: false, warnings: [], busy: false };
-  const noun = CONFIG_SECTIONS[opts.section].noun;
-  const where = isGlobal ? "global store" : opts.scope;
-  document.getElementById("configModalTitle").textContent =
-    opts.op === "add" ? "Add a " + noun + " (" + where + ")" : (opts.op === "delete" ? "Delete " : "Edit ") + noun + " " + opts.name + " (" + where + ")";
+  configEdit = { ...opts, dest: opts.scope, step: isGlobal && opts.op !== "add" ? "warn" : "edit", fps,
+    confirmed: false, warnings: [], crossName: null, busy: "", label: null, armedAt: 0 };
   const dest = document.getElementById("configDest");
   dest.replaceChildren();
   [[CONFIG_GLOBAL, "Global store"], ...configModel.projects.map(p => [p.repo_id, p.repo_id])].forEach(([value, label]) => {
@@ -3136,12 +3158,14 @@ function openConfigEditor(opts) {
     dest.appendChild(o);
   });
   dest.value = CONFIG_GLOBAL;
-  dest.onchange = () => { configEdit.dest = dest.value; configEdit.confirmed = false; renderConfigModal(); };
+  dest.onchange = () => { configEdit.dest = dest.value; configEdit.crossName = null; configEdit.confirmed = false; renderConfigModal(); };
   const yaml = document.getElementById("configYaml");
   yaml.value = opts.yaml || "";
   yaml.readOnly = opts.op === "delete";
-  yaml.oninput = () => { if (configEdit.confirmed) { configEdit.confirmed = false; renderConfigModal(); } };
+  /* the text decides the name, so a known-taken name and any confirm are stale */
+  yaml.oninput = () => { configEdit.crossName = null; if (configEdit.confirmed) { configEdit.confirmed = false; renderConfigModal(); } };
   document.getElementById("configModalSave").onclick = configSave;
+  /* Cancel works mid-request too: configSave checks it still owns the editor after every await */
   document.getElementById("configModalCancel").onclick = () => { document.getElementById("configModal").classList.remove("open"); configEdit = null; };
   document.getElementById("configModalReload").onclick = configReload;
   configSetError("");
@@ -3150,41 +3174,58 @@ function openConfigEditor(opts) {
 }
 /* Save: a dry run first; its warnings (and a repo override replacing that
    repo's own tool) need a second click; then the write itself */
-async function configSave() {
+async function configSave(ev) {
   const edit = configEdit;
-  if (!edit || edit.busy) return;
+  if (!edit || edit.busy || (ev && ev.detail > 1) || Date.now() - edit.armedAt < CONFIG_ARM_MS) return;
   if (edit.step === "warn") { edit.step = "edit"; renderConfigModal(); return; }
-  const t = configEditTarget(edit);
   const yaml = document.getElementById("configYaml").value;
-  const send = dry => configSend(configWriteRequest(t.op, t.scope, edit.section, t.name, yaml, edit.fps[t.scope], dry));
-  edit.busy = true;
+  const send = (t, dry) => configSend(configWriteRequest(t.op, t.scope, edit.section, t.name, yaml, edit.fps[t.scope], dry));
+  const busy = text => { edit.busy = text; renderConfigModal(); };
   try {
     configSetError("");
     if (!edit.confirmed) {
-      const dry = await send(true);
-      if (!dry.ok) { configSetError(describeConfigError(dry.status, dry.body && dry.body.detail), dry.status === 412); return; }
-      const warnings = [
-        ...(t.scope !== edit.scope && t.op === "replace" ? ["Replaces " + t.scope + "'s own " + t.name + "."] : []),
-        ...((dry.body && dry.body.warnings) || []),
-      ];
-      if (warnings.length) { edit.confirmed = true; edit.warnings = warnings.map(String); renderConfigModal(); return; }
+      busy("Checking…");
+      let t = configEditTarget(edit);
+      let dry = await send(t, true);
+      if (configEdit !== edit) return;
+      const warnings = [];
+      const detail = dry.body && dry.body.detail;
+      if (dry.status === 409 && t.op === "add" && t.scope !== edit.scope && detail && detail.code === "exists" && detail.name) {
+        edit.crossName = String(detail.name);
+        t = configEditTarget(edit);
+        warnings.push("Replaces " + t.scope + "'s own " + t.name + ".");
+        dry = await send(t, true);
+        if (configEdit !== edit) return;
+      }
+      if (!dry.ok) {
+        edit.crossName = null;
+        configSetError(describeConfigError(dry.status, dry.body && dry.body.detail), dry.status === 412);
+        return;
+      }
+      warnings.push(...((dry.body && dry.body.warnings) || []).map(String));
+      if (warnings.length) { edit.confirmed = true; edit.warnings = warnings; return; }
     }
-    const res = await send(false);
+    busy(edit.op === "delete" ? "Deleting…" : "Saving…");
+    const t = configEditTarget(edit);
+    const res = await send(t, false);
+    const mine = configEdit === edit;
     if (!res.ok) {
-      edit.confirmed = false;
-      renderConfigModal();
-      configSetError(describeConfigError(res.status, res.body && res.body.detail), res.status === 412);
+      if (mine) {
+        edit.confirmed = false;
+        configSetError(describeConfigError(res.status, res.body && res.body.detail), res.status === 412);
+      }
       return;
     }
-    document.getElementById("configModal").classList.remove("open");
-    configEdit = null;
+    if (mine) { document.getElementById("configModal").classList.remove("open"); configEdit = null; }
+    /* written even if the editor was cancelled meanwhile: the page shows what is on disk */
     document.getElementById("configStatus").textContent = [...(res.body.warnings || []), ...(res.body.notes || [])].join(" ");
     applyConfigScope(t.scope, res.body.scope);
     /* tool resolution crosses scopes (a global tool's "overridden in" badge,
        a project tool's "overrides global"), so refresh the rest quietly */
     if (edit.section === "tools") await loadConfigPage(true);
   } finally {
-    edit.busy = false;
+    edit.busy = "";
+    if (configEdit === edit) renderConfigModal();
   }
 }
 /* after a 412: pick up the file's current fingerprint, keep the user's text */
@@ -3193,6 +3234,7 @@ async function configReload() {
   if (!edit) return;
   const scope = configEditTarget(edit).scope;
   const res = await configSend({ url: "/api/config/" + encodeURIComponent(scope), init: {} });
+  if (configEdit !== edit) return;
   if (!res.ok) { configSetError(describeConfigError(res.status, res.body && res.body.detail), true); return; }
   applyConfigScope(scope, res.body);
   edit.fps[scope] = configFingerprint(scope, edit.section);

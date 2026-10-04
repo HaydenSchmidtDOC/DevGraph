@@ -179,11 +179,16 @@ def _reject_cross_site(request: Request) -> None:
         raise HTTPException(status_code=403, detail="cross-origin request rejected")
 
 
-def _config_error(status: int, code: str, message: str, scope: dict[str, Any] | None = None) -> HTTPException:
-    """A Config write refusal: `detail` is an object so the page can branch on `code`."""
+def _config_error(
+    status: int, code: str, message: str, scope: dict[str, Any] | None = None, name: str | None = None
+) -> HTTPException:
+    """A Config write refusal: `detail` is an object so the page can branch on `code`
+    (and, on a tool `exists`, offer to replace the taken `name`)."""
     detail: dict[str, Any] = {"code": code, "message": message}
     if scope is not None:
         detail["scope"] = scope
+    if name is not None:
+        detail["name"] = name
     return HTTPException(status_code=status, detail=detail)
 
 
@@ -752,7 +757,7 @@ def build_router(
             message = scrub(exc.message, path, root)
             if code == "not_regular":  # a symlink message names the link target, which can be outside the repo
                 message = f"{path.name} is a symlink or not a regular file; fix it by hand"
-            raise _config_error(status, code, message, _config_scope(scope)) from exc
+            raise _config_error(status, code, message, _config_scope(scope), exc.name) from exc
         notes = [*result.notes, effect]
         block = _config_scope(scope)
         part = block["tools"] if kind == "tools" else block["schema"]

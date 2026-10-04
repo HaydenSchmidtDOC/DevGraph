@@ -620,8 +620,11 @@ def test_conflicts_are_409(client, registry, tmp_path):
 
     exists = _send(client, "POST", "/api/config/repo-a/tools", fp, {"yaml": NEW_TOOL})
     assert exists.status_code == 409 and exists.json()["detail"]["code"] == "exists"
+    # the taken name, so the page can offer to replace that entry instead
+    assert exists.json()["detail"]["name"] == "find_parents"
     taken = _send(client, "PUT", "/api/config/repo-a/tools/find_kids", fp, {"yaml": NEW_TOOL})
     assert taken.status_code == 409 and taken.json()["detail"]["code"] == "exists"
+    assert taken.json()["detail"]["name"] == "find_parents"
     locked = _send(client, "POST", "/api/config/repo-a/tools", fp, {"yaml": _tool_yaml("find_callers")})
     assert locked.status_code == 409 and locked.json()["detail"]["code"] == "locked"
     renamed = _send(client, "PUT", "/api/config/repo-a/tools/find_kids", fp, {"yaml": _tool_yaml("find_callers")})
