@@ -1318,3 +1318,16 @@ def test_any_yaml_load_failure_is_a_schema_error(tmp_path, text):
     (tmp_path / SCHEMA_FILENAME).write_text(text, encoding="utf-8")
     with pytest.raises(ProjectSchemaError, match="malformed YAML"):
         load_project_schema(tmp_path)
+
+
+def test_parse_project_schema_matches_loader_errors(tmp_path):
+    path = tmp_path / SCHEMA_FILENAME
+    text = "version: [unclosed\n"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ProjectSchemaError) as via_loader:
+        load_project_schema(tmp_path)
+    with pytest.raises(ProjectSchemaError) as via_parse:
+        project_schema.parse_project_schema(text, path)
+    assert str(via_parse.value) == str(via_loader.value)
+    assert "malformed YAML" in str(via_parse.value)
+    assert project_schema.parse_project_schema(textwrap.dedent(WIDGET), path).node_types[0].label == "Widget"
