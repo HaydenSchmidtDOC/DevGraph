@@ -22,6 +22,7 @@ from devgraph.config.project_tools import (
     INJECTED_PARAMETER,
     TOOLS_FILENAME,
     CypherTool,
+    ProjectTools,
     ProjectToolsError,
     parse_project_tools,
     tools_file_path,
@@ -221,6 +222,7 @@ def _serve_repository(
     instrument: Callable[[Callable[..., Any]], Callable[..., Any]],
     annotations: Any,
     fingerprint: bytes | str | None = None,
+    declared: ProjectTools | None = None,
 ) -> None:
     """Parse the repository's tools file and register its tools, recording the outcome on `status`.
 
@@ -234,18 +236,12 @@ def _serve_repository(
         return
     if fingerprint == "absent":
         return
-    path = tools_file_path(repo.path)
-    try:
-        if not isinstance(fingerprint, bytes):
-            raise ProjectToolsError(f"{path}: cannot be read: {fingerprint.partition(':')[2]}")
+    if declared is None:
         try:
-            text = fingerprint.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ProjectToolsError(f"{path}: is not valid UTF-8: {exc}") from exc
-        declared = parse_project_tools(text, path)
-    except ProjectToolsError as exc:
-        status.notices.append(f"invalid {TOOLS_FILENAME}; no project tools are served: {str(exc).splitlines()[0]}")
-        return
+            declared = _parse_fingerprint(repo, fingerprint)
+        except ProjectToolsError as exc:
+            status.notices.append(f"invalid {TOOLS_FILENAME}; no project tools are served: {str(exc).splitlines()[0]}")
+            return
 
     status.tools_file = str(tools_file_path(repo.path))
     builtin = builtin_tool_names()
@@ -268,6 +264,18 @@ def _serve_repository(
         status.served.append(tool.name)
         status.parameter_names[tool.name] = [p.name for p in tool.parameters]
         status.definitions[tool.name] = tool
+
+
+def _parse_fingerprint(repo: Any, fingerprint: bytes | str) -> ProjectTools:
+    """The tools declared by `fingerprint` (file bytes or 'unreadable:<error>'); raises ProjectToolsError."""
+    path = tools_file_path(repo.path)
+    if not isinstance(fingerprint, bytes):
+        raise ProjectToolsError(f"{path}: cannot be read: {fingerprint.partition(':')[2]}")
+    try:
+        text = fingerprint.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProjectToolsError(f"{path}: is not valid UTF-8: {exc}") from exc
+    return parse_project_tools(text, path)
 
 
 def tools_fingerprint(repo_path: Path | str) -> bytes | str:
@@ -304,6 +312,18 @@ class ProjectToolPlane:
         fingerprint = tools_fingerprint(self.repo.path)
         if fingerprint == self._fingerprint:
             return False
+        declared = None
+        if fingerprint not in ("absent", "root-missing") and self.status.tools_file is not None:
+            # A good file is being served: an invalid save keeps it rather than dropping the tools.
+            try:
+                declared = _parse_fingerprint(self.repo, fingerprint)
+            except ProjectToolsError as exc:
+                self._fingerprint = fingerprint
+                notice = f"invalid {TOOLS_FILENAME}; keeping the last good tools: {str(exc).splitlines()[0]}"
+                self.status.notices[:] = [n for n in self.status.notices if not n.startswith(f"invalid {TOOLS_FILENAME}")]
+                self.status.notices.append(notice)
+                logger.warning("%s", notice)
+                return False
         self._fingerprint = None  # until the reload succeeds, so a failure is retried
         before = dict(self.status.definitions)
         for name in self.status.served:
@@ -314,7 +334,8 @@ class ProjectToolPlane:
         self.status.definitions.clear()
         self.status.notices.clear()
         _serve_repository(self.server, self.engine, self.repo, self.status,
-                          instrument=self._instrument, annotations=self._annotations, fingerprint=fingerprint)
+                          instrument=self._instrument, annotations=self._annotations, fingerprint=fingerprint,
+                          declared=declared)
         self._fingerprint = fingerprint  # the reload parsed exactly these bytes
         if self.status.notices:
             logger.warning("reloaded %s with problems: %s", tools_file_path(self.repo.path), self.status.notices[0])

@@ -17,12 +17,16 @@ restart, then tells the client its tool list changed.
   tiny.
 - **Reload.** When the fingerprint changes, every project tool the session
   served is removed and the file is loaded again under the startup rules:
-  valid tools are served, built-in names are refused, an invalid or absent
-  file serves nothing, a tool that fails to register is skipped — each with
-  the same notices. File-level notices are replaced, not accumulated; scope
-  notices are untouched (the scope never changes).
-- **An invalid save serves nothing until fixed.** Same rule as startup
-  (fail-closed). An editor's half-written save is corrected by the next poll.
+  valid tools are served, built-in names are refused, an absent file serves
+  nothing, a tool that fails to register is skipped — each with the same
+  notices. File-level notices are replaced, not accumulated; scope notices are
+  untouched (the scope never changes).
+- **An invalid save keeps the last good tools** (epic §9: fail closed by
+  keeping the last good config, never dropping the tool surface). The tools
+  stay served, a notice says the file is invalid and the last good tools are
+  kept, and a warning goes to stderr; the next valid save reloads. A file that
+  is invalid when the session starts has no last good state, so it serves
+  nothing until fixed. Deleting the file removes the tools (deliberate).
 - **Notification.** After a reload that changes the served tool set or any
   served tool's definition, the server sends `notifications/tools/list_changed`
   to legacy-protocol clients and publishes `ToolsListChanged` to modern

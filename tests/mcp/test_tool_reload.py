@@ -119,13 +119,34 @@ def test_a_renamed_tool_replaces_the_old_name(tmp_path, monkeypatch):
     assert "file_list" in listed and "list_files" not in listed
 
 
-def test_an_invalid_save_serves_nothing_until_fixed(tmp_path, monkeypatch):
+def test_an_invalid_save_keeps_the_last_good_tools(tmp_path, monkeypatch):
     server, repo = build(tmp_path, monkeypatch)
     (repo / TOOLS_FILENAME).write_text("version: 1\ntools: [oops\n")
-    assert server.devgraph_tool_plane.reload_if_changed() is True
-    assert "list_files" not in tools(server)
+    assert server.devgraph_tool_plane.reload_if_changed() is False
+    assert "list_files" in tools(server)
     current = status(server)
-    assert current["served"] == [] and any(TOOLS_FILENAME in n for n in current["notices"])
+    assert current["served"] == ["list_files"]
+    assert any("keeping the last good tools" in n for n in current["notices"])
+    write(repo, ONE)
+    assert server.devgraph_tool_plane.reload_if_changed() is False  # same tools as the last good
+    assert "list_files" in tools(server)
+    assert status(server)["notices"] == []
+
+
+def test_a_fix_after_an_invalid_save_serves_the_new_tools(tmp_path, monkeypatch):
+    server, repo = build(tmp_path, monkeypatch)
+    (repo / TOOLS_FILENAME).write_text("version: 1\ntools: [oops\n")
+    server.devgraph_tool_plane.reload_if_changed()
+    write(repo, TWO)
+    assert server.devgraph_tool_plane.reload_if_changed() is True
+    assert {"list_files", "count_files"} <= set(tools(server))
+    assert status(server)["notices"] == []
+
+
+def test_an_invalid_file_at_startup_serves_nothing_until_fixed(tmp_path, monkeypatch):
+    server, repo = build(tmp_path, monkeypatch, tools="version: 1\ntools: [oops\n")
+    assert "list_files" not in tools(server)
+    assert any(TOOLS_FILENAME in n for n in status(server)["notices"])
     write(repo, ONE)
     assert server.devgraph_tool_plane.reload_if_changed() is True
     assert "list_files" in tools(server)
