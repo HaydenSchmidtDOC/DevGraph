@@ -555,3 +555,11 @@ def test_show_json_includes_colour(runner, settings, tmp_path):
     data = show_json(runner, "--repo", str(write(tmp_path, text)))
     assert next(n for n in data["node_types"] if n["label"] == "Widget")["color"] == "#1f77b4"
     assert next(r for r in data["relationships"] if r["type"] == "LINKS")["color"] is None
+
+
+def test_show_text_tables_have_a_colour_column(runner, settings, tmp_path):
+    text = WIDGET.replace("- label: Widget", "- label: Widget\n        color: \"#1f77b4\"")
+    result = runner.invoke(app, ["config", "show", "--repo", str(write(tmp_path, text))])
+    assert result.exit_code == 0, result.output
+    assert result.output.count("Colour") == 2
+    assert "#1f77b4" in result.output

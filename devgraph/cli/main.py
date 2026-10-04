@@ -1955,8 +1955,12 @@ def config_show(
     nodes.add_column("Label", style="cyan")
     nodes.add_column("Origin")
     nodes.add_column("Key")
+    nodes.add_column("Colour")
     for node in report["node_types"]:
-        nodes.add_row(node["label"], node["origin"], ", ".join(node["key"]) if node["key"] else "built-in identity")
+        nodes.add_row(
+            node["label"], node["origin"], ", ".join(node["key"]) if node["key"] else "built-in identity",
+            node["color"] or "\u2014",
+        )
     console.print(nodes)
 
     rels = Table(title="Relationships")
@@ -1965,8 +1969,12 @@ def config_show(
     rels.add_column("To")
     rels.add_column("Provider")
     rels.add_column("Origin")
+    rels.add_column("Colour")
     for rel in report["relationships"]:
-        rels.add_row(rel["type"], rel["from"] or "any", rel["to"] or "any", rel["provider"], rel["origin"])
+        rels.add_row(
+            rel["type"], rel["from"] or "any", rel["to"] or "any", rel["provider"], rel["origin"],
+            rel["color"] or "\u2014",
+        )
     console.print(rels)
 
     tools = report["tools"]

@@ -28,6 +28,7 @@ const fnSrc = [
   grab(/^function nodeType\(/m, "\n}"),
   grab(/^function renderTypeLists\(/m, "\n}"),
   grab(/^function applySchemaTypes\(/m, "\n}"),
+  grab(/^function relSelector\(/m, "\n}"),
   grab(/^let schemaRequestSeq = 0;/m, "\n}"),   // the sequence counter and loadSchemaTypes
   grab(/^function connectLiveEvents\(/m, "\n}"),
   grab(/^function refreshIsolateUI\(/m, "\n}"),
@@ -83,6 +84,14 @@ const SCHEMAS = {
   waiting: payload([], [], "pending"),
   broken: payload([], [], "invalid"),
   fresh: payload([], [], "never"),
+  counted: (() => {
+    const p = payload([], [], "absent");
+    p.node_types.find(t => t.label === "Requirement").count = 0;
+    p.node_types.find(t => t.label === "Commit").count = 3;
+    p.node_types.find(t => t.label === "Service").count = 0;
+    return p;
+  })(),
+  multiline: Object.assign(payload([], [], "invalid"), { notices: ["multi: schema file is invalid: bad\n  line 3, column 1\n  more"] }),
   off: payload([], [], "disabled"),
 };
 
@@ -156,7 +165,7 @@ const api = new Function(...Object.keys(globals),
   tablesSrc + "\n" + fnSrc +
   "\nreturn { NODE_TYPES, REL_TYPES, CAT_COLORS, BUILTIN_NODE_TYPES, renderTypeLists, applySchemaTypes," +
   " loadSchemaTypes, currentStateQuery, mapGraphResultToElements, acCandidates, onRepoSelectChange, refreshIsolateUI," +
-  " connectLiveEvents };")(
+  " connectLiveEvents, relSelector };")(
   ...Object.values(globals));
 
 // --- helpers ------------------------------------------------------------
@@ -200,6 +209,15 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
   check("relationship chips are today's 18 plus the repo's own",
     JSON.stringify(chipTypes()) === JSON.stringify([...SNAPSHOT_RELS, "IS_CHILD_OF"]), JSON.stringify(chipTypes()));
 
+  // 1b. count merge: a not-wired built-in keeps its dash on a zero count
+  await api.loadSchemaTypes("counted");
+  const valOf = label => /class="val[^"]*">([^<]*)</.exec(rowFor(label).innerHTML)[1];
+  check("a built-in with no wired count keeps the dash when the payload says 0",
+    valOf("Requirement") === "—", rowFor("Requirement").innerHTML);
+  check("...and shows the payload count once it is non-zero", valOf("Commit") === "3", rowFor("Commit").innerHTML);
+  check("a wired built-in shows the payload's 0", valOf("Service") === "0", rowFor("Service").innerHTML);
+  await api.loadSchemaTypes("alpha");
+
   // 2. user labels: their own category and the payload's colour
   check("a user label gets its own category, keyed by label",
     rowFor("File")?.dataset.cat === "user:File" && rowFor("Folder")?.dataset.cat === "user:Folder",
@@ -212,8 +230,13 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
     api.CAT_COLORS["user:File"] === "#ff8800", JSON.stringify(api.CAT_COLORS));
   check("a user row shows the payload count", /12/.test(rowFor("File").innerHTML), rowFor("File").innerHTML);
   check("a user relationship chip carries the payload colour",
-    chips().find(c => c.dataset.rel === "IS_CHILD_OF").style.borderColor === "#123456",
+    chips().find(c => c.dataset.rel === "IS_CHILD_OF").style._props["--relcolor"] === "#123456",
     JSON.stringify(chips().find(c => c.dataset.rel === "IS_CHILD_OF").style));
+  check("...set as a custom property, never an inline border (hover/isolated accents must win)",
+    chips().every(c => c.style.borderColor === undefined) &&
+    /\.rel-chip \{[^}]*border: 1px solid var\(--relcolor, var\(--border\)\)/.test(html) &&
+    !/\.rel-chip(:hover|\.isolated)[^{]*\{[^}]*--relcolor/.test(html),
+    "inline border or css wiring wrong");
   check("the canvas is restyled so already-drawn nodes pick up the colours", styleUpdates > 0, String(styleUpdates));
   check("autocomplete offers the repo's labels and relationship types",
     api.acCandidates().some(c => c.text === "File" && c.kind === "label") &&
@@ -282,7 +305,8 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
   await switchTo("waiting");
   check("a pending schema shows the pending hint", hintShown(), els.schemaPendingHint.style.display);
   check("the pending hint says a rescan is needed and what is shown meanwhile",
-    els.schemaPendingHint.textContent === "Schema file changed — rescan to apply it. Showing the types from the last scan.",
+    els.schemaPendingHint.textContent ===
+      "Schema file changed — new types and removals apply after a rescan (colour changes show now).",
     els.schemaPendingHint.textContent);
   await switchTo("broken");
   check("an invalid schema shows the hint too", hintShown(), els.schemaPendingHint.style.display);
@@ -291,7 +315,15 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
       "Schema file is invalid — showing the types from the last scan. broken: schema file is invalid: <b>node_types</b> must be a list",
     els.schemaPendingHint.textContent);
   check("...never as markup", !els.schemaPendingHint.innerHTML, els.schemaPendingHint.innerHTML);
-  for (const repo of ["fresh", "off", "alpha"]) {
+  await switchTo("multiline");
+  check("an invalid notice is cut to its first line",
+    els.schemaPendingHint.textContent ===
+      "Schema file is invalid — showing the types from the last scan. multi: schema file is invalid: bad",
+    els.schemaPendingHint.textContent);
+  await switchTo("fresh");
+  check("a never-applied schema shows its own hint", hintShown() &&
+    els.schemaPendingHint.textContent === "Schema file not applied yet — run a rescan.", els.schemaPendingHint.textContent);
+  for (const repo of ["off", "alpha"]) {
     await switchTo(repo);
     check(`the hint is hidden for a ${SCHEMAS[repo].schema_state} schema`, !hintShown(), els.schemaPendingHint.style.display);
   }
@@ -334,6 +366,12 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
   check("autocomplete escapes candidate text into its markup", /escapeHtmlVal\(it\.text\)/.test(renderAcSrc), renderAcSrc);
   check("the count-row lookup escapes the label in its selector",
     /data-label="\$\{CSS\.escape\(t\.id\)\}"/.test(topologySrc), "loadTopologyCounts selector not escaped");
+
+  // 10b. relationship types are escaped into the Cytoscape selector
+  check("the relationship selector escapes quotes and backslashes",
+    api.relSelector('A"] , node[x = "\\') === '[label = "A\\"] , node[x = \\"\\\\"]', api.relSelector('A"] , node[x = "\\'));
+  check("the hover and isolate paths use the escaped selector",
+    !/\[label = "\$\{(?!String\(rel)/.test(html), "a raw [label = \"${...}\"] selector remains in index.html");
 
   // 11. wiring: boot loads the schema before the first graph fetch
   check("boot loads the selected repo's schema before the first graph fetch",

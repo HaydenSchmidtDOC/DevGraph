@@ -314,7 +314,7 @@ table.logtable tbody tr:hover { background: color-mix(in oklab, var(--accent), t
 .count-row .val.na { color: var(--meta); }
 .count-note { font-size: 10.5px; color: var(--meta); margin-top: 8px; line-height: 1.5; }
 .rel-grid { display: flex; flex-wrap: wrap; gap: 5px; overflow-y: auto; overflow-x: hidden; max-width: 100%; }
-.rel-chip { font-family: var(--font-mono); font-size: 10.5px; padding: 3px 7px; border-radius: var(--radius-pill); border: 1px solid var(--border); color: var(--muted); background: rgba(255,255,255,0.02); cursor: pointer; transition: background var(--motion-fast), color var(--motion-fast), border-color var(--motion-fast); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rel-chip { font-family: var(--font-mono); font-size: 10.5px; padding: 3px 7px; border-radius: var(--radius-pill); border: 1px solid var(--relcolor, var(--border)); color: var(--muted); background: rgba(255,255,255,0.02); cursor: pointer; transition: background var(--motion-fast), color var(--motion-fast), border-color var(--motion-fast); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rel-chip:hover { background: color-mix(in oklab, var(--accent), transparent 88%); color: var(--accent-hover); border-color: color-mix(in oklab, var(--accent), transparent 55%); }
 .rel-chip.isolated { background: color-mix(in oklab, var(--accent), transparent 78%); color: var(--accent-hover); border-color: color-mix(in oklab, var(--accent), transparent 40%); }
 .rel-chip.dimmed { opacity: 0.4; }
@@ -972,7 +972,7 @@ function renderTypeLists() {
   REL_TYPES.forEach(r => {
     const chip = document.createElement("span");
     chip.className = "rel-chip"; chip.textContent = r; chip.dataset.rel = r;
-    if (REL_COLORS[r]) chip.style.borderColor = REL_COLORS[r];
+    if (REL_COLORS[r]) chip.style.setProperty("--relcolor", REL_COLORS[r]);
     chip.addEventListener("mouseenter", () => highlightRel(r, true));
     chip.addEventListener("mouseleave", () => highlightRel(r, false));
     chip.addEventListener("click", () => { state.isolatedRel = (state.isolatedRel === r) ? null : r; isolateChanged(); });
@@ -993,7 +993,7 @@ function applySchemaTypes(schema) {
   Object.keys(CAT_COLORS).filter(k => k.startsWith("user:")).forEach(k => { delete CAT_COLORS[k]; delete brightCache[k]; });
   Object.keys(REL_COLORS).forEach(k => delete REL_COLORS[k]);
   NODE_TYPES.length = 0;
-  BUILTIN_NODE_TYPES.forEach(t => NODE_TYPES.push({ ...t, count: counts[t.id] ?? t.count }));
+  BUILTIN_NODE_TYPES.forEach(t => NODE_TYPES.push({ ...t, count: (counts[t.id] === undefined || (t.count === null && counts[t.id] === 0)) ? t.count : counts[t.id] }));
   (schema.node_types || []).filter(t => t.origin === "project").forEach(t => {
     const cat = "user:" + t.label;
     CAT_COLORS[cat] = t.color;
@@ -1011,9 +1011,10 @@ function applySchemaTypes(schema) {
   /* a schema file the graph doesn't reflect yet: changed since the last scan,
      or unreadable. textContent, never innerHTML: the notice is server text. */
   const hint = document.getElementById("schemaPendingHint");
-  const notice = (schema.notices || [])[0];
+  const notice = ((schema.notices || [])[0] || "").split("\n")[0];
   hint.textContent =
-    schema.schema_state === "pending" ? "Schema file changed — rescan to apply it. Showing the types from the last scan." :
+    schema.schema_state === "pending" ? "Schema file changed — new types and removals apply after a rescan (colour changes show now)." :
+    schema.schema_state === "never" ? "Schema file not applied yet — run a rescan." :
     schema.schema_state === "invalid" ? "Schema file is invalid — showing the types from the last scan." + (notice ? " " + notice : "") : "";
   hint.style.display = hint.textContent ? "" : "none";
   cy.style().update(); // nodes already on the canvas re-read catColor
@@ -2142,7 +2143,10 @@ cy.on("render", renderGlow);
 function highlightType(label, on) {
   cy.nodes().filter(n => nodeType(n) === label).forEach(n => { n.toggleClass("hover-hl", on); setNodeGlowActive(n.id(), on || (n.data("glow")||0) > 0.02); });
 }
-function highlightRel(rel, on) { cy.edges(`[label = "${rel}"]`).toggleClass("hover-hl", on); }
+/* A relationship type is server text (a project schema can declare it), so it
+   is escaped into the Cytoscape selector rather than interpolated raw. */
+function relSelector(rel) { return `[label = "${String(rel).replace(/["\\]/g, "\\$&")}"]`; }
+function highlightRel(rel, on) { cy.edges(relSelector(rel)).toggleClass("hover-hl", on); }
 
 /* ── smooth glow/deglow: animate each node/edge's "glow" data value toward a
    target (1 = matched by the active cypher query, 0 = not) over ~420ms, driving
@@ -2183,7 +2187,7 @@ function applyState(skipQueryBuild, runMode) {
   let relNodeIds = null;
   if (state.isolatedRel) {
     relNodeIds = new Set();
-    cy.edges(`[label = "${state.isolatedRel}"]`).forEach(e => { relNodeIds.add(e.source().id()); relNodeIds.add(e.target().id()); });
+    cy.edges(relSelector(state.isolatedRel)).forEach(e => { relNodeIds.add(e.source().id()); relNodeIds.add(e.target().id()); });
   }
   /* .excluded (dimmed, still drawn) is deliberate context -- filtered out by
      type/relationship but left visible so the isolated set reads against the
