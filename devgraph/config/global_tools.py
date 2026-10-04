@@ -24,6 +24,7 @@ from devgraph.config.project_tools import (
     validate_project_tools,
 )
 from devgraph.config.settings import get_settings
+from devgraph.paths import read_bounded
 
 GLOBAL_TOOLS_FILENAME = "global-tools.json"
 
@@ -45,7 +46,7 @@ def load_global_tools(path: Path | None = None) -> ProjectTools | None:
             return None
         if not path.is_file():
             raise ProjectToolsError(f"{path}: global tools store is not a regular file")
-        text = path.read_text(encoding="utf-8")
+        text = read_bounded(path).decode("utf-8")
     except OSError as exc:
         raise ProjectToolsError(f"{path}: cannot be read: {exc}") from exc
     except UnicodeDecodeError as exc:
@@ -59,7 +60,7 @@ def global_tools_fingerprint(path: Path | None = None) -> bytes | str:
     try:
         if not path.exists():
             return "absent"
-        return path.read_bytes()
+        return read_bounded(path)
     except OSError as exc:
         return f"unreadable:{type(exc).__name__}"
 

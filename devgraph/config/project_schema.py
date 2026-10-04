@@ -24,6 +24,7 @@ the loader there would pull `devgraph.graph` — and with it the Neo4j driver
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,7 +48,7 @@ from devgraph.graph.schema import (
     RESERVED_NODE_PROPERTIES,
 )
 from devgraph.graph.schema import constraint_statements as builtin_constraint_statements
-from devgraph.paths import is_within
+from devgraph.paths import is_within, read_bounded
 
 SCHEMA_FILENAME = "devgraph.schema.yaml"
 SCHEMA_VERSION = 1
@@ -521,13 +522,17 @@ def schema_file_hash(repo_root: Path) -> str:
     An unreadable path (a directory, a permission error) gets a distinct
     `unreadable:<error>` value so it never equals a hash the graph was
     actually built with. A repository whose project config is switched off
-    reports `absent`.
+    reports `absent`. A file that resolves outside the repository, is not a
+    regular file (a FIFO, or a symlink to a device) or is larger than
+    `MAX_CONFIG_BYTES` is unreadable and never read.
     """
     if not project_config_enabled(repo_root):
         return ABSENT_SCHEMA_HASH
     path = project_schema_path(repo_root)
     try:
-        data = path.read_bytes()
+        if os.path.lexists(path) and not is_within(path.resolve(), repo_root):
+            return "unreadable:outside_repository"
+        data = read_bounded(path)
     except FileNotFoundError:
         return ABSENT_SCHEMA_HASH
     except OSError as exc:
@@ -554,7 +559,7 @@ def load_project_schema(repo_root: Path, *, respect_switch: bool = True) -> Proj
             raise ProjectSchemaError(f"{path}: project schema is not a regular file")
         if not is_within(path.resolve(), repo_root):
             raise ProjectSchemaError(f"{path}: project schema must be inside the repository")
-        text = path.read_text(encoding="utf-8")
+        text = read_bounded(path).decode("utf-8")
     except OSError as exc:
         raise ProjectSchemaError(f"{path}: cannot be read: {exc}") from exc
     except UnicodeDecodeError as exc:

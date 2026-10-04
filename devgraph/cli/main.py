@@ -36,7 +36,7 @@ from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
-from devgraph.paths import is_within
+from devgraph.paths import is_within, read_bounded
 from devgraph.registry.store import RepoRegistry
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
@@ -2180,7 +2180,7 @@ def _trust_state(root: Path) -> str | None:
     try:
         if tools_file_outside(Path(root)) or not path.is_file():
             return None
-        data = path.read_bytes()
+        data = read_bounded(path)
     except OSError:
         return None
     return project_trust.project_tools_trust(root, data)
@@ -2237,7 +2237,7 @@ def config_tools_trust(
     try:
         if not path.is_file():
             raise _tools_fail(f"no {path.name} in {record.path}; nothing to trust")
-        data = path.read_bytes()
+        data = read_bounded(path)
     except OSError as exc:
         raise _tools_fail(f"cannot read {path}: {exc}")
     try:

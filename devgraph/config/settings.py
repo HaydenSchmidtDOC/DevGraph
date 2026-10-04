@@ -75,7 +75,14 @@ class Settings(BaseSettings):
     @field_validator("registry_db_path")
     @classmethod
     def _expand_registry_home(cls, value: Path) -> Path:
-        return value.expanduser()
+        """Expand ``~``; a value still relative after that falls back to the default, as in `devgraph_home`."""
+        path = value.expanduser()
+        if path.is_absolute():
+            return path
+        logger.warning(
+            "Ignoring relative DEVGRAPH_REGISTRY_DB_PATH %r; using ~/.devgraph/registry.sqlite3", str(value)
+        )
+        return Path.home() / ".devgraph" / "registry.sqlite3"
 
     watch_debounce_ms: int = 500
     health_check_interval_s: int = 30

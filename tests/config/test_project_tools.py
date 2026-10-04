@@ -423,6 +423,27 @@ def test_control_and_format_characters_are_refused(tmp_path, field, entry):
     assert "\x1b" not in message and "\u202e" not in message
 
 
+@pytest.mark.parametrize("field, value", [
+    ("description", "\\ud800"),  # a lone surrogate (Cs): encoding it for the terminal fails
+    ("name", "t\\ud800"),
+    ("description", "\\ue000"),  # private use (Co)
+    ("cypher", "MATCH (n {repo_id: $repo_id}) RETURN n // \\U000E0080"),  # unassigned (Cn)
+])
+def test_surrogate_private_use_and_unassigned_characters_are_refused(tmp_path, field, value):
+    entry = {"name": "t", "description": "d", "cypher": "MATCH (n {repo_id: $repo_id}) RETURN n"}
+    entry[field] = value
+    (tmp_path / TOOLS_FILENAME).write_text(
+        "version: 1\ntools:\n" + "".join(
+            f'  {"-" if i == 0 else " "} {k}: "{v}"\n' for i, (k, v) in enumerate(entry.items())
+        )
+    )
+    with pytest.raises(ProjectToolsError) as exc:
+        load_project_tools(tmp_path)
+    message = str(exc.value)
+    assert f"tools.0.{field}" in message and "surrogate, private-use or unassigned character" in message
+    message.encode("utf-8")  # the message itself carries no lone surrogate
+
+
 def test_newlines_and_tabs_stay_allowed(tmp_path):
     (tmp_path / TOOLS_FILENAME).write_text(
         'version: 1\ntools:\n  - name: t\n    description: "two\\n\\tlines"\n'

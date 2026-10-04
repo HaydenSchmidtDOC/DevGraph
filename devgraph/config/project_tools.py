@@ -25,7 +25,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
 
-from devgraph.paths import is_within
+from devgraph.paths import is_within, read_bounded
 
 TOOLS_FILENAME = "devgraph.tools.yaml"
 TOOLS_VERSION = 1
@@ -126,18 +126,22 @@ def has_apoc(query: str) -> bool:
 
 
 def _check_plain_text(value: Any, info: ValidationInfo) -> Any:
-    """Refuse control characters (other than newline and tab) and Unicode format characters.
+    """Refuse control characters (other than newline and tab), Unicode format characters,
+    lone surrogates, and private-use or unassigned code points.
 
     The trust prompt shows these fields; a terminal escape or bidi control could make
-    what it shows differ from what runs.
+    what it shows differ from what runs, and a lone surrogate can't be printed at all.
     """
     if isinstance(value, str):
         for offset, char in enumerate(value):
-            if char not in "\n\t" and unicodedata.category(char) in ("Cc", "Cf"):
-                raise ValueError(
-                    f"{info.field_name} contains a control or format character "
-                    f"(U+{ord(char):04X} at offset {offset}); remove it"
-                )
+            category = unicodedata.category(char)
+            if char not in "\n\t" and category in ("Cc", "Cf"):
+                kind = "control or format character"
+            elif category in ("Cs", "Co", "Cn"):
+                kind = "surrogate, private-use or unassigned character"
+            else:
+                continue
+            raise ValueError(f"{info.field_name} contains a {kind} (U+{ord(char):04X} at offset {offset}); remove it")
     return value
 
 
@@ -321,7 +325,7 @@ def load_project_tools(repo_root: Path) -> ProjectTools | None:
             raise ProjectToolsError(f"{path}: tools file must be inside the repository")
         if not path.is_file():
             raise ProjectToolsError(f"{path}: tools file is not a regular file")
-        text = path.read_text(encoding="utf-8")
+        text = read_bounded(path).decode("utf-8")
     except OSError as exc:
         raise ProjectToolsError(f"{path}: cannot be read: {exc}") from exc
     except UnicodeDecodeError as exc:

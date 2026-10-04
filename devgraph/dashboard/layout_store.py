@@ -17,8 +17,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from devgraph.config.settings import get_settings
+from devgraph.paths import read_bounded
 
 _LAYOUT_VERSION = 1
+# Above the dashboard's PUT limit (2000 nodes x 1 KiB) plus JSON framing, so a saved layout always reads back.
+_LAYOUT_READ_LIMIT_BYTES = 4 * 1024 * 1024
 
 
 def _layout_path(repo_id: str) -> Path:
@@ -35,7 +38,7 @@ def load_layout(repo_id: str) -> dict[str, list[float]]:
     """
     path = _layout_path(repo_id)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_bounded(path, _LAYOUT_READ_LIMIT_BYTES).decode("utf-8"))
     except (OSError, ValueError):
         return {}
     positions = raw.get("positions") if isinstance(raw, dict) else None

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from devgraph.paths import is_within
+from devgraph.paths import is_within, read_bounded
 
 SCHEMA_SECTIONS = {
     "node_types": ("label", "node type"),
@@ -114,7 +114,7 @@ def file_fingerprint(path: Path) -> str:
     try:
         if not stat.S_ISREG(os.stat(path).st_mode):
             return "not_regular"
-        return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        return "sha256:" + hashlib.sha256(read_bounded(Path(path))).hexdigest()
     except FileNotFoundError:
         return "absent"
     except OSError as exc:
@@ -158,7 +158,7 @@ def read_text(path: Path, root: Path | None = None) -> str:
             raise ConfigEditError(f"{path.name} resolves outside the repository; it is not read", "not_regular")
         if not stat.S_ISREG(os.stat(path).st_mode):
             raise _not_regular(path)
-        return path.read_text(encoding="utf-8")
+        return read_bounded(path).decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise ConfigEditError(f"{path}: cannot be read: {exc}", "unreadable")
 
@@ -692,7 +692,7 @@ def _reset_snapshot(path: Path) -> tuple[str, bool, Any, str]:
     from devgraph.config.project_tools import YAML_LOAD_ERRORS
 
     try:
-        raw = path.read_bytes()
+        raw = read_bounded(path)
     except OSError:
         return file_fingerprint(path), False, None, ""
     fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest()

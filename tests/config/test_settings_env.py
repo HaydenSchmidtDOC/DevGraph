@@ -97,3 +97,14 @@ def test_tilde_in_registry_path_expands_the_same_for_home_and_setting(clean_env,
 
     assert devgraph_home() == clean_env / "state"
     assert Settings().registry_db_path == clean_env / "state" / "registry.sqlite3"
+
+
+def test_relative_registry_path_setting_falls_back_to_the_home_default(clean_env, tmp_path, monkeypatch, caplog):
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    monkeypatch.setenv("DEVGRAPH_REGISTRY_DB_PATH", "reg.sqlite3")
+
+    with caplog.at_level("WARNING", logger="devgraph.config.settings"):
+        assert Settings().registry_db_path == clean_env / ".devgraph" / "registry.sqlite3"
+    assert "relative DEVGRAPH_REGISTRY_DB_PATH" in caplog.text

@@ -237,8 +237,9 @@ also serves its tools for the session's repository (`DEVGRAPH_MCP_REPO`, else
 the server's working directory). Read `devgraph://project-tools` for what is
 served. The server checks the file every 2 seconds and serves the new set
 without a restart, telling the client its tool list changed (clients that
-support `tools/list_changed` re-list automatically); an invalid save keeps the
-last good tools and records a notice (see `devgraph://project-tools`). Pin a project with
+support `tools/list_changed` re-list automatically). Any edit changes the file's
+bytes, so it stops serving project tools until re-trusted; only trusted bytes that
+fail to parse keep the last good tools, with a notice (see `devgraph://project-tools`). Pin a project with
 `claude mcp add devgraph -e DEVGRAPH_MCP_REPO=<repo_id> -- "<venv python>" -P -m devgraph.mcp.server`.
 A path value must be absolute (a relative value is read as a repo id), and a value
 that matches no active registered repository serves nothing. A repository whose project config is disabled (`devgraph config disable`) serves no project tools; `devgraph://project-tools` says so. If `devgraph` is already

@@ -38,6 +38,7 @@ from devgraph.config.project_tools import (
     tools_file_path,
 )
 from devgraph.mcp.catalog import builtin_tool_names, scoped_tool_id
+from devgraph.paths import is_within, read_bounded
 
 from mcp.server.mcpserver.exceptions import ToolError
 from neo4j import time as neo4j_time
@@ -391,11 +392,22 @@ def _project_layer(repo: Any, fingerprint: bytes | str | UntrustedTools, last_go
     return _Resolved(declared)
 
 
-def _global_layer(fingerprint: bytes | str, last_good: ProjectTools | None, status: ToolPlaneStatus) -> _Resolved:
-    """The global store's tools; an invalid store keeps `last_good` when there is one."""
+def _global_layer(repo: Any, fingerprint: bytes | str, last_good: ProjectTools | None,
+                  status: ToolPlaneStatus) -> _Resolved:
+    """The global store's tools; an invalid store keeps `last_good` when there is one.
+
+    A store that lies inside the session's repository serves nothing, as for trust: a
+    repository cannot supply its own global tools.
+    """
     if fingerprint == "absent":
         return _Resolved()
     path = global_tools_path()
+    if _global_store_inside(repo, path):
+        logger.warning("the global tools store %s lies inside repository %s; not serving it", path, repo.path)
+        status.notices.append(
+            f"{GLOBAL_TOOLS_FILENAME} lies inside repository {repo.repo_id!r}; no global tools are served"
+        )
+        return _Resolved()
     try:
         declared = _parse_bytes(path, fingerprint)
     except ProjectToolsError as exc:
@@ -407,6 +419,14 @@ def _global_layer(fingerprint: bytes | str, last_good: ProjectTools | None, stat
         declared = last_good
     status.global_tools_file = str(path)
     return _Resolved(declared)
+
+
+def _global_store_inside(repo: Any, path: Path) -> bool:
+    """True when the global store resolves into the session's repository (or can't be resolved)."""
+    try:
+        return is_within(Path(path).expanduser().resolve(), Path(repo.path).expanduser())
+    except (OSError, RuntimeError):
+        return True
 
 
 def _serve_repository(
@@ -435,7 +455,7 @@ def _serve_repository(
     if global_fingerprint is None:
         global_fingerprint = global_tools_fingerprint()
     project = _project_layer(repo, fingerprint, last_good, status)
-    global_ = _global_layer(global_fingerprint, global_last_good, status)
+    global_ = _global_layer(repo, global_fingerprint, global_last_good, status)
     _register_layers(server, engine, repo, status, project, global_, instrument=instrument, annotations=annotations)
     return project.declared, global_.declared
 
@@ -547,7 +567,7 @@ def tools_fingerprint(repo_path: Path | str) -> bytes | str | UntrustedTools:
             return "unreadable:outside_repository"
         if not stat.S_ISREG(os.stat(path).st_mode):
             return "unreadable:not_regular"  # never open a FIFO or device: the read would block
-        data = path.read_bytes()
+        data = read_bounded(path)
     except (FileNotFoundError, NotADirectoryError):
         return "absent"
     except OSError as exc:
@@ -603,7 +623,7 @@ class ProjectToolPlane:
         new = ToolPlaneStatus(repo_id=self.status.repo_id, source=self.status.source)
         try:
             project = _project_layer(self.repo, fingerprint, self._last_good, new)
-            global_ = _global_layer(global_fingerprint, self._global_last_good, new)
+            global_ = _global_layer(self.repo, global_fingerprint, self._global_last_good, new)
         except Exception as exc:
             self._keep_served(exc)
             return False
