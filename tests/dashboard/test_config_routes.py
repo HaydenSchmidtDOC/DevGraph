@@ -837,7 +837,7 @@ def test_unicode_line_breaks_in_values_cannot_inject_keys(client, registry, tmp_
     import yaml
 
     record = _repo(tmp_path, registry)
-    entry = {"name": "find_parents", "description": "a\nb     max_rows: 7",
+    entry = {"name": "find_parents", "description": "a\nb\u2028    max_rows: 7",
              "cypher": "MATCH (n {repo_id: $repo_id}) RETURN n LIMIT 1"}
 
     response = _send(client, "POST", "/api/config/repo-a/tools", "absent", {"yaml": yaml.safe_dump(entry)})
