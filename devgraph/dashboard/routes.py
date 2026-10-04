@@ -6,11 +6,14 @@ since this is a second entry point into the same engine/registry the tray
 already owns (see Implementation Plan #5's "Data comes from GraphEngine
 directly" decision).
 
-Read-only apart from two writes: the canvas layout (`PUT .../layout`) and
+Read-only apart from these writes: the canvas layout (`PUT .../layout`),
 repository registration (`POST /repos`), which is the same add-then-initial-
-scan sequence `devgraph add <path>` runs, against the same services -- plus
-the Cypher console (`POST /cypher`), which runs whatever it is given. All
-three refuse cross-site browser requests (`_reject_cross_site`).
+scan sequence `devgraph add <path>` runs, against the same services, the
+Cypher console (`POST /cypher`), which runs whatever it is given, and the
+Config page's entry edits (`POST|PUT|DELETE /config/...`), which write only
+a registered repo's `devgraph.tools.yaml`/`devgraph.schema.yaml` or the
+global tools store through `devgraph.config.edits`, and never touch git. All
+of them refuse cross-site browser requests (`_reject_cross_site`).
 """
 
 from __future__ import annotations
@@ -23,23 +26,27 @@ import json
 import logging
 import math
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
+import yaml
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from devgraph.config.project_schema import (
     ABSENT_SCHEMA_HASH,
     LABEL_PATTERN,
     RELATIONSHIP_TYPE_PATTERN,
+    SCHEMA_FILENAME,
     ProjectSchemaError,
     load_project_schema,
     schema_file_hash,
 )
+from devgraph.config import edits
 from devgraph.config.settings import get_settings
 from devgraph.dashboard import queries
-from devgraph.dashboard.config_model import GLOBAL_SCOPE, build_config, build_global, build_project
+from devgraph.dashboard.config_model import GLOBAL_SCOPE, _scrub, build_config, build_global, build_project
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.dashboard.git_info import get_git_log, get_git_status
 from devgraph.dashboard.layout_store import load_layout, save_layout
@@ -63,6 +70,21 @@ _GRAPH_LIMIT_CEILING = 2000
 # can't write an unbounded file to disk.
 _LAYOUT_PAYLOAD_LIMIT_BYTES = _GRAPH_LIMIT_CEILING * 1024
 _SSE_KEEPALIVE_S = 15
+# One config entry's YAML is a few hundred bytes; 64 KiB leaves room for long
+# Cypher while keeping a hostile body from being buffered or parsed.
+_CONFIG_PAYLOAD_LIMIT_BYTES = 64 * 1024
+# `ConfigEditError.code` -> HTTP status. Every other code (invalid, malformed,
+# flow_list, unsupported, anchor, unreadable) means the resulting document
+# can't be validated or spliced: 422 `invalid`.
+_CONFIG_ERROR_STATUS = {
+    "not_found": 404,
+    "exists": 409,
+    "ambiguous": 409,
+    "locked": 409,
+    "not_regular": 409,
+    "stale": 412,
+    "io": 500,
+}
 
 # Fixed, parameterless query behind `GET /database-stats`. The JVM's own
 # java.lang:type=Memory MBean is the one heap source available on a stock
@@ -155,6 +177,75 @@ def _reject_cross_site(request: Request) -> None:
     # guard in app.py already accepted this Host case-insensitively.
     if origin is not None and origin.lower() != f"{request.url.scheme}://{request.url.netloc}".lower():
         raise HTTPException(status_code=403, detail="cross-origin request rejected")
+
+
+def _config_error(status: int, code: str, message: str, scope: dict[str, Any] | None = None) -> HTTPException:
+    """A Config write refusal: `detail` is an object so the page can branch on `code`."""
+    detail: dict[str, Any] = {"code": code, "message": message}
+    if scope is not None:
+        detail["scope"] = scope
+    return HTTPException(status_code=status, detail=detail)
+
+
+def _reject_cross_site_config(request: Request) -> None:
+    try:
+        _reject_cross_site(request)
+    except HTTPException as exc:
+        raise _config_error(403, "forbidden", exc.detail) from exc
+
+
+def _if_match(request: Request) -> str:
+    """The fingerprint the client last saw (`If-Match: "<fingerprint>"`); 428 when missing."""
+    value = request.headers.get("if-match")
+    if value is None or not value.strip():
+        raise _config_error(428, "precondition_required", "If-Match with the file's fingerprint is required")
+    value = value.strip()
+    if value.startswith("W/"):
+        value = value[2:]
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    return value
+
+
+async def _config_body(request: Request) -> tuple[dict, bool]:
+    """The entry mapping and `dry_run` flag of a Config write body.
+
+    Strict `application/json` (what a cross-site page can't send without a
+    preflight), at most `_CONFIG_PAYLOAD_LIMIT_BYTES` (checked on
+    Content-Length, then while reading), and the entry parsed with
+    `yaml.safe_load` only.
+    """
+    media_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if media_type != "application/json":
+        raise _config_error(415, "media_type", "content-type must be application/json")
+    content_length = request.headers.get("content-length")
+    too_large = _config_error(413, "too_large", "request body is too large")
+    if content_length is not None and content_length.isdigit() and int(content_length) > _CONFIG_PAYLOAD_LIMIT_BYTES:
+        raise too_large
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > _CONFIG_PAYLOAD_LIMIT_BYTES:
+            raise too_large
+    try:
+        payload = json.loads(body)
+    except ValueError as exc:
+        raise _config_error(400, "bad_request", "payload must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise _config_error(400, "bad_request", "payload must be a JSON object")
+    text = payload.get("yaml")
+    if not isinstance(text, str):
+        raise _config_error(400, "bad_request", "yaml must be a string")
+    dry_run = payload.get("dry_run", False)
+    if not isinstance(dry_run, bool):
+        raise _config_error(400, "bad_request", "dry_run must be true or false")
+    try:
+        entry = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise _config_error(400, "bad_request", f"malformed YAML: {exc}") from exc
+    if not isinstance(entry, dict):
+        raise _config_error(400, "bad_request", "yaml must be one mapping (a single entry)")
+    return entry, dry_run
 
 
 _ALL_REPOS_SCOPE = "__all__"
@@ -603,6 +694,146 @@ def build_router(
     @router.get("/config/{scope}")
     def get_config_scope(scope: str) -> dict[str, Any]:
         return _config_scope(scope)
+
+    # --- Config page writes ------------------------------------------------------------------
+    # Every write: cross-site refusal, then the scope (only `__global__` or an
+    # active registered repo -- never a path), then the body, then If-Match,
+    # then `devgraph.config.edits` (fingerprint CAS under a per-path lock,
+    # whole-document validation, symlink refusal, atomic write). No git.
+
+    def _write_record(scope: str, schema: bool = False) -> Any:
+        """The target repo record (None for the global store); 404 for anything else."""
+        if scope == GLOBAL_SCOPE and not schema:
+            return None
+        record = None if scope == GLOBAL_SCOPE else registry.get(scope)
+        if record is None or not record.active:
+            raise _config_error(404, "not_found", f"unknown scope: {scope}")
+        if not Path(record.path).resolve().is_dir():
+            raise _config_error(404, "not_found", f"repository directory for {scope} is missing")
+        return record
+
+    def _require_section(section: str) -> None:
+        if section not in edits.SCHEMA_SECTIONS:
+            raise _config_error(404, "not_found", f"unknown schema section: {section}")
+
+    def _apply_edit(
+        scope: str, record: Any, kind: str, op: Callable[[Path | None], edits.EditResult], created: bool
+    ) -> JSONResponse:
+        root = None if record is None else Path(record.path).resolve()
+        if kind == "tools":
+            path = edits.tools_path(root)
+            effect = edits.tools_effect_note(root, record)
+        else:
+            path = root / SCHEMA_FILENAME
+            effect = edits.schema_effect_note(root, record)
+        try:
+            result = op(root)
+        except edits.ConfigEditError as exc:
+            status = _CONFIG_ERROR_STATUS.get(exc.code, 422)
+            if status == 500:
+                logger.warning("config write to %s failed: %s", path, exc.message)
+                raise _config_error(500, "io", f"could not write {path.name}") from exc
+            code = exc.code if status != 422 else "invalid"
+            message = _scrub(exc.message, path, root)
+            if code == "not_regular":  # the edits message names the link target, which can be outside the repo
+                message = f"{path.name} is a symlink; edit the file it points to directly"
+            raise _config_error(status, code, message, _config_scope(scope)) from exc
+        notes = [*result.notes, effect]
+        if result.written:
+            notes.append(f"Written to {path.name}; not committed.")
+        return JSONResponse(
+            status_code=201 if created and result.written else 200,
+            content={
+                "ok": True,
+                "written": result.written,
+                "file": path.name,
+                "warnings": [_scrub(w, path, root) for w in result.warnings],
+                "notes": [_scrub(n, path, root) for n in notes],
+                "scope": _config_scope(scope),
+            },
+        )
+
+    @router.post("/config/{scope}/tools")
+    async def add_config_tool(scope: str, request: Request) -> JSONResponse:
+        _reject_cross_site_config(request)
+        record = _write_record(scope)
+        entry, dry_run = await _config_body(request)
+        expected = _if_match(request)
+        return await run_in_threadpool(
+            _apply_edit, scope, record, "tools",
+            lambda root: edits.add_tool(root, entry, expected_fingerprint=expected, dry_run=dry_run), True,
+        )
+
+    @router.put("/config/{scope}/tools/{name}")
+    async def replace_config_tool(scope: str, name: str, request: Request) -> JSONResponse:
+        _reject_cross_site_config(request)
+        record = _write_record(scope)
+        entry, dry_run = await _config_body(request)
+        expected = _if_match(request)
+        return await run_in_threadpool(
+            _apply_edit, scope, record, "tools",
+            lambda root: edits.replace_tool(root, name, entry, expected_fingerprint=expected, dry_run=dry_run), False,
+        )
+
+    @router.delete("/config/{scope}/tools/{name}")
+    async def delete_config_tool(scope: str, name: str, request: Request, dry_run: str | None = None) -> JSONResponse:
+        _reject_cross_site_config(request)
+        record = _write_record(scope)
+        expected = _if_match(request)
+        dry = dry_run in ("1", "true")
+        return await run_in_threadpool(
+            _apply_edit, scope, record, "tools",
+            lambda root: edits.delete_tool(root, name, expected_fingerprint=expected, dry_run=dry), False,
+        )
+
+    @router.post("/config/{scope}/schema/{section}")
+    async def add_config_schema_entry(scope: str, section: str, request: Request) -> JSONResponse:
+        _reject_cross_site_config(request)
+        record = _write_record(scope, schema=True)
+        _require_section(section)
+        entry, dry_run = await _config_body(request)
+        expected = _if_match(request)
+
+        def op(root: Path) -> edits.EditResult:
+            if edits.entry_section(entry) != section:
+                raise edits.ConfigEditError(f"the new entry must be a {edits.SCHEMA_SECTIONS[section][1]}", "invalid")
+            return edits.add_schema_entry(root, entry, record=record, expected_fingerprint=expected, dry_run=dry_run)
+
+        return await run_in_threadpool(_apply_edit, scope, record, "schema", op, True)
+
+    @router.put("/config/{scope}/schema/{section}/{name}")
+    async def replace_config_schema_entry(scope: str, section: str, name: str, request: Request) -> JSONResponse:
+        _reject_cross_site_config(request)
+        record = _write_record(scope, schema=True)
+        _require_section(section)
+        entry, dry_run = await _config_body(request)
+        expected = _if_match(request)
+        return await run_in_threadpool(
+            _apply_edit, scope, record, "schema",
+            lambda root: edits.replace_schema_entry(
+                root, name, entry, node_type=section == "node_types", relationship=section == "relationships",
+                record=record, expected_fingerprint=expected, dry_run=dry_run,
+            ),
+            False,
+        )
+
+    @router.delete("/config/{scope}/schema/{section}/{name}")
+    async def delete_config_schema_entry(
+        scope: str, section: str, name: str, request: Request, dry_run: str | None = None
+    ) -> JSONResponse:
+        _reject_cross_site_config(request)
+        record = _write_record(scope, schema=True)
+        _require_section(section)
+        expected = _if_match(request)
+        dry = dry_run in ("1", "true")
+        return await run_in_threadpool(
+            _apply_edit, scope, record, "schema",
+            lambda root: edits.delete_schema_entry(
+                root, name, node_type=section == "node_types", relationship=section == "relationships",
+                record=record, expected_fingerprint=expected, dry_run=dry,
+            ),
+            False,
+        )
 
     @router.get("/mcp-tools")
     def get_mcp_tools() -> list[dict[str, Any]]:

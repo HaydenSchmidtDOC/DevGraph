@@ -82,6 +82,16 @@ def test_replace_and_delete_tool(tmp_path):
     assert "name: count_things" not in (tmp_path / "devgraph.tools.yaml").read_text()
 
 
+def test_rename_to_a_taken_name_is_refused(tmp_path):
+    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
+    edits.add_tool(tmp_path, {**TOOL, "name": "other"})
+    before = (tmp_path / "devgraph.tools.yaml").read_bytes()
+    with pytest.raises(ConfigEditError) as exc:
+        edits.replace_tool(tmp_path, "other", TOOL)
+    assert code(exc) == "exists"
+    assert (tmp_path / "devgraph.tools.yaml").read_bytes() == before
+
+
 def test_replace_and_delete_unknown_tool(tmp_path):
     (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
     for call in (lambda: edits.replace_tool(tmp_path, "nope", TOOL), lambda: edits.delete_tool(tmp_path, "nope")):

@@ -272,13 +272,16 @@ def add_tool(root: Path | None, entry: dict, *, expected_fingerprint: str | None
 def replace_tool(
     root: Path | None, name: str, entry: dict, *, expected_fingerprint: str | None = None, dry_run: bool = False
 ) -> EditResult:
-    """Replace the tool `name`; `not_found` if absent, `locked` if renamed to a built-in name."""
+    """Replace the tool `name`; `not_found` if absent, `locked`/`exists` if renamed to a built-in or taken name."""
     from devgraph.config.tools_edit import replace_tool_text
 
     with _guard(tools_path(root), expected_fingerprint):
         find_tool(root, name)
-        if entry.get("name") != name:
-            refuse_builtin(entry.get("name"))
+        new_name = entry.get("name")
+        if new_name != name:
+            refuse_builtin(new_name)
+            if any(isinstance(m, dict) and m.get("name") == new_name for m in tool_entries(root)):
+                raise ConfigEditError(f"a tool named {new_name!r} already exists in this scope", "exists")
         return write_tools(root, lambda text: replace_tool_text(text, name, entry), dry_run=dry_run)
 
 
