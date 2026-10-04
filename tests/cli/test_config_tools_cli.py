@@ -19,8 +19,9 @@ def runner():
     return CliRunner(env={"COLUMNS": "200"})
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def settings(monkeypatch, tmp_path):
+    """Every test here: the CLI's registry lives in tmp_path (never the user's ~/.devgraph)."""
     fake = Settings(_env_file=None, neo4j_password="x", registry_db_path=tmp_path / "registry.sqlite3")
     monkeypatch.setattr(cli_main, "get_settings", lambda: fake)
     return fake
@@ -65,10 +66,28 @@ def add(runner, tmp_path, scope, text=None, name="count_nodes"):
     return runner.invoke(app, ["config", "tools", "add", "--from", src(tmp_path, text or tool_yaml(name), name + ".yaml"), *scope])
 
 
+def register(settings, root, repo_id="demo", *, enabled=True):
+    from devgraph.registry.store import RepoRegistry
+
+    (root / ".git").mkdir(exist_ok=True)
+    registry = RepoRegistry(settings.registry_db_path)
+    try:
+        registry.add_repo(root, repo_id=repo_id)
+        if not enabled:
+            registry.set_project_config_enabled(repo_id, False)
+    finally:
+        registry.close()
+
+
+def flat(output):
+    return " ".join(output.split())  # Rich wraps long lines
+
+
 # -- add ---------------------------------------------------------------------
 
 
-def test_add_appends_to_the_project_file_keeping_comments(runner, repo, tmp_path):
+def test_add_appends_to_the_project_file_keeping_comments(runner, settings, repo, tmp_path):
+    register(settings, repo)
     (repo / TOOLS_FILENAME).write_text(
         "# my tools\nversion: 1\ntools:\n  # first\n  - name: a_tool\n    description: A.\n    cypher: |\n      MATCH (n {repo_id: $repo_id}) RETURN n\n"
     )
@@ -321,3 +340,156 @@ def test_add_global_with_a_date_value_is_a_clean_error(runner, tmp_path, store):
     assert result.exit_code == 1, result.output
     assert not isinstance(result.exception, TypeError) and "description" in result.output
     assert not store.exists()
+
+
+# -- default scope -----------------------------------------------------------
+
+
+def test_default_scope_is_the_registered_repo_containing_the_cwd(runner, settings, repo, tmp_path, monkeypatch):
+    register(settings, repo)
+    sub = repo / "src" / "pkg"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+    result = add(runner, tmp_path, [])
+    assert result.exit_code == 0, result.output
+    assert names(repo / TOOLS_FILENAME) == ["count_nodes"] and not (sub / TOOLS_FILENAME).exists()
+    assert "not a registered repository" not in result.output
+
+
+def test_default_scope_picks_the_deepest_registered_repo(runner, settings, repo, tmp_path, monkeypatch):
+    inner = repo / "vendor" / "inner"
+    inner.mkdir(parents=True)
+    register(settings, repo, "outer")
+    register(settings, inner, "inner")
+    (inner / "lib").mkdir()
+    monkeypatch.chdir(inner / "lib")
+    assert add(runner, tmp_path, []).exit_code == 0
+    assert (inner / TOOLS_FILENAME).exists() and not (repo / TOOLS_FILENAME).exists()
+
+
+def test_default_scope_outside_a_registered_repo_uses_the_cwd_and_warns(runner, tmp_path, monkeypatch):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.chdir(plain)
+    result = add(runner, tmp_path, [])
+    assert result.exit_code == 0, result.output
+    assert (plain / TOOLS_FILENAME).exists()
+    assert "not a registered repository" in flat(result.output) and "won't serve" in flat(result.output)
+    listed = runner.invoke(app, ["config", "tools", "list", "--json"])
+    assert listed.exit_code == 0 and "count_nodes" in [t["name"] for t in json.loads(listed.stdout)["tools"]]
+    assert "not a registered repository" in flat(listed.stderr)
+
+
+def test_show_and_validate_default_to_the_containing_registered_repo(runner, settings, repo, monkeypatch):
+    register(settings, repo)
+    sub = repo / "src"
+    sub.mkdir()
+    monkeypatch.chdir(sub)
+    shown = runner.invoke(app, ["config", "show", "--json"])
+    assert shown.exit_code == 0, shown.output
+    assert json.loads(shown.stdout)["repo"] == str(repo.resolve())
+    (repo / TOOLS_FILENAME).write_text(BAD_DATE)
+    assert runner.invoke(app, ["config", "validate"]).exit_code == 1
+
+
+# -- reload notes ------------------------------------------------------------
+
+
+def test_a_global_write_says_where_global_tools_are_served(runner, tmp_path, store):
+    output = flat(add(runner, tmp_path, ["--global"]).output)
+    assert "only in MCP sessions scoped to a registered repository" in output and "2 seconds" in output
+
+
+def test_an_unregistered_repo_write_says_it_is_not_served(runner, repo, tmp_path):
+    output = flat(add(runner, tmp_path, ["--repo", str(repo)]).output)
+    assert "not a registered repository" in output and "2 seconds" not in output
+
+
+def test_a_disabled_repo_write_says_it_is_not_served(runner, settings, repo, tmp_path):
+    register(settings, repo, enabled=False)
+    output = flat(add(runner, tmp_path, ["--repo", str(repo)]).output)
+    assert "project config is disabled" in output and "devgraph config enable demo" in output
+    assert "2 seconds" not in output
+
+
+def test_list_explains_where_global_tools_are_served(runner, tmp_path, store):
+    add(runner, tmp_path, ["--global"])
+    for flags in (["--global"], []):
+        output = flat(runner.invoke(app, ["config", "tools", "list", *flags]).output)
+        assert "only in MCP sessions scoped to a registered repository" in output
+
+
+# -- minor -------------------------------------------------------------------
+
+
+def test_add_reports_an_unreadable_file_once(runner, repo, tmp_path):
+    (repo / TOOLS_FILENAME).mkdir()
+    result = add(runner, tmp_path, ["--repo", str(repo)])
+    assert result.exit_code == 1 and result.output.count("Error:") == 1 and "cannot be read" in result.output
+
+
+def test_list_title_is_escaped(runner, tmp_path):
+    odd = tmp_path / "re[b]po"
+    odd.mkdir()
+    output = flat(runner.invoke(app, ["config", "tools", "list", "--repo", str(odd)]).output)
+    assert "re[b]po" in output
+
+
+def test_global_tool_keys_keep_their_order(runner, tmp_path, store):
+    add(runner, tmp_path, ["--global"], name="first_tool")
+    add(runner, tmp_path, ["--global"], name="second_tool")
+    tools = json.loads(store.read_text())["tools"]
+    assert [list(t) for t in tools] == [["name", "description", "cypher"]] * 2
+
+
+def test_list_shows_run_cypher_only_when_it_is_served(runner, repo, monkeypatch, tmp_path):
+    def rows():
+        result = runner.invoke(app, ["config", "tools", "list", "--repo", str(repo), "--json"])
+        return {t["name"]: t for t in json.loads(result.stdout)["tools"]}
+
+    assert "run_cypher" not in rows()
+    fake = Settings(_env_file=None, neo4j_password="x", registry_db_path=tmp_path / "registry.sqlite3", enable_run_cypher=True)
+    monkeypatch.setattr(cli_main, "get_settings", lambda: fake)
+    assert rows()["run_cypher"]["origin"] == "built-in"
+
+
+def test_list_shows_builtin_named_tools_as_ignored(runner, repo, store):
+    global_tools.save_global_tools([{"name": "search_component", "description": "Mine.", "cypher": "MATCH (n {repo_id: $repo_id}) RETURN n"}])
+    (repo / TOOLS_FILENAME).write_text(textwrap.dedent("""\
+        version: 1
+        tools:
+          - name: run_cypher
+            description: Mine.
+            cypher: "MATCH (n {repo_id: $repo_id}) RETURN n"
+        """))
+    result = runner.invoke(app, ["config", "tools", "list", "--repo", str(repo), "--json"])
+    rows = json.loads(result.stdout)["tools"]
+    ignored = [r for r in rows if r.get("ignored")]
+    assert {(r["name"], r["origin"], r["ignored"]) for r in ignored} == {
+        ("search_component", "global", "built-in name"),
+        ("run_cypher", "project", "built-in name"),
+    }
+    assert "ignored: built-in name" in flat(runner.invoke(app, ["config", "tools", "list", "--repo", str(repo)]).output)
+    only_global = json.loads(runner.invoke(app, ["config", "tools", "list", "--global", "--json"]).stdout)["tools"]
+    assert only_global == [{"name": "search_component", "origin": "global", "locked": False, "ignored": "built-in name"}]
+
+
+def test_project_write_is_atomic_and_keeps_the_mode(runner, repo, tmp_path, monkeypatch):
+    import os
+    import stat
+
+    add(runner, tmp_path, ["--repo", str(repo)], name="first_tool")
+    path = repo / TOOLS_FILENAME
+    path.chmod(0o640)
+    assert add(runner, tmp_path, ["--repo", str(repo)], name="second_tool").exit_code == 0
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    before = path.read_bytes()
+
+    def boom(*args):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(os, "replace", boom)
+    result = add(runner, tmp_path, ["--repo", str(repo)], name="third_tool")
+    assert result.exit_code == 1 and "disk gone" in result.output
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in repo.iterdir()) == [TOOLS_FILENAME]

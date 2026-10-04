@@ -1702,6 +1702,36 @@ def _repo_dir(repo: Path) -> Path:
     return root
 
 
+def _registered_repos() -> list[Any]:
+    """Every registered repository; [] when there is no registry yet (it is not created)."""
+    if not get_settings().registry_db_path.exists():
+        return []
+    registry = _get_registry()
+    try:
+        return registry.list_repos()
+    finally:
+        registry.close()
+
+
+def _containing_repo(repos: list[Any], target: Path) -> Any | None:
+    """The deepest of `repos` whose root contains `target` (as the MCP session scope is chosen)."""
+    best = None
+    for repo in repos:
+        root = Path(repo.path).expanduser().resolve()
+        if target == root or target.is_relative_to(root):
+            if best is None or len(root.parts) > len(Path(best.path).expanduser().resolve().parts):
+                best = repo
+    return best
+
+
+def _default_repo_root() -> tuple[Path, bool]:
+    """The scope when no `--repo` is given: the deepest active registered repository
+    containing the current directory, else the current directory. Also: was one found."""
+    cwd = _repo_dir(Path("."))
+    match = _containing_repo([r for r in _registered_repos() if r.active], cwd)
+    return (_repo_dir(Path(match.path)), True) if match is not None else (cwd, False)
+
+
 @config_app.command("eject")
 def config_eject(
     repo: Path = typer.Option(Path("."), "--repo", help="Repository root (default: current directory)."),
@@ -1882,7 +1912,7 @@ def config_show(
 
     if global_only and repo is not None:
         ctx.fail("use either --global or --repo, not both")
-    root = None if global_only else _repo_dir(repo or Path("."))
+    root = None if global_only else (_repo_dir(repo) if repo is not None else _default_repo_root()[0])
     try:
         report = _schema_report(root)
     except ProjectSchemaError as exc:
@@ -1991,7 +2021,7 @@ def config_validate(
             console.print("No registered repositories.")
             return
     else:
-        root = _repo_dir(repo or Path("."))
+        root = _repo_dir(repo) if repo is not None else _default_repo_root()[0]
         # `hint_id` is only needed (and the registry only opened) for a disabled repo,
         # which is necessarily registered.
         hint_id = "<repo_id>" if project_config_enabled(root) else _registered_repo_id(root)
@@ -2013,13 +2043,46 @@ tools_app = typer.Typer(
 config_app.add_typer(tools_app, name="tools")
 
 _TOOLS_RELOAD_NOTE = "Running MCP sessions pick this up within 2 seconds."
+_GLOBAL_TOOLS_NOTE = (
+    "Global tools are served only in MCP sessions scoped to a registered repository; "
+    "running sessions there pick up changes within 2 seconds."
+)
 
 
 def _tools_scope(ctx: typer.Context, repo: Optional[Path], global_: bool) -> Path | None:
-    """The repository root for a `config tools` command, or None for the global store."""
+    """The repository root for a `config tools` command, or None for the global store.
+
+    Without `--repo`: the registered repository containing the current directory, else
+    the current directory itself (with a warning on stderr).
+    """
     if global_ and repo is not None:
         ctx.fail("use either --global or --repo, not both")
-    return None if global_ else _repo_dir(repo or Path("."))
+    if global_:
+        return None
+    if repo is not None:
+        return _repo_dir(repo)
+    root, registered = _default_repo_root()
+    if not registered:
+        Console(stderr=True).print(
+            f"[yellow]Warning:[/yellow] {escape(str(root))} is not a registered repository (nor inside one), "
+            "so MCP sessions won't serve its tools; register it with `devgraph add`.",
+            soft_wrap=True,
+        )
+    return root
+
+
+def _tools_scope_note(root: Path | None) -> str:
+    """Whether running MCP sessions will serve what is in this scope's file."""
+    if root is None:
+        return _GLOBAL_TOOLS_NOTE
+    record = next((r for r in _registered_repos() if Path(r.path).expanduser().resolve() == root), None)
+    if record is None or not record.active:
+        return (f"{root} is not a registered repository, so MCP sessions won't serve its tools; "
+                "register it with `devgraph add`.")
+    if not record.project_config_enabled:
+        return (f"project config is disabled for {record.repo_id}, so MCP sessions won't serve its tools; "
+                f"enable it with `devgraph config enable {record.repo_id}`.")
+    return _TOOLS_RELOAD_NOTE
 
 
 def _tools_store_path(root: Path | None) -> Path:
@@ -2082,15 +2145,39 @@ def _write_tools(root: Path | None, edit) -> Path:
             import yaml
 
             mappings = tool_mappings(text)
-            new_mappings = tool_mappings(edit(yaml.safe_dump({"tools": mappings}) if mappings else ""))
+            new_mappings = tool_mappings(edit(yaml.safe_dump({"tools": mappings}, sort_keys=False) if mappings else ""))
             save_global_tools(new_mappings)
         else:
             new_text = edit(text)
             parse_project_tools(new_text, path)
-            path.write_text(new_text, encoding="utf-8", newline="")
+            _write_atomically(path, new_text)
     except (ToolsEditError, ProjectToolsError, OSError) as exc:
         raise _tools_fail(str(exc))
     return path
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    """Replace `path` with `text` via a temporary file in the same directory, keeping its mode."""
+    import tempfile
+
+    mode = path.stat().st_mode & 0o7777 if path.exists() else None
+    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        if mode is not None:
+            os.chmod(temp, mode)
+        else:
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(temp, 0o666 & ~umask)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
 
 
 def _refuse_builtin(name: Any) -> None:
@@ -2100,9 +2187,9 @@ def _refuse_builtin(name: Any) -> None:
         raise _tools_fail(f"{name!r} is the name of a built-in tool; built-in tools are locked, choose another name")
 
 
-def _tools_done(verb: str, name: str, path: Path) -> None:
+def _tools_done(verb: str, name: str, path: Path, root: Path | None) -> None:
     console.print(f"[green]{verb}[/green] tool {escape(repr(name))}: {escape(str(path))}", soft_wrap=True)
-    console.print(_TOOLS_RELOAD_NOTE)
+    console.print(escape(_tools_scope_note(root)), soft_wrap=True)
 
 
 @tools_app.command("list")
@@ -2126,31 +2213,45 @@ def config_tools_list(
     except ProjectToolsError as exc:
         raise _tools_fail(str(exc))
     global_tools = {t.name: t for t in (declared_global.tools if declared_global else ())}
+    project_names = [t.name for t in (declared_project.tools if declared_project else ())]
+    ignored = {"ignored": "built-in name"}  # a built-in name in a tools file: MCP serves the built-in
 
     rows: list[dict[str, Any]] = []
     if root is None:
-        rows = [{"name": name, "origin": "global", "locked": False} for name in global_tools]
+        rows = [{"name": name, "origin": "global", "locked": False, **(ignored if name in builtin else {})}
+                for name in global_tools]
     else:
-        rows = [{"name": name, "origin": "built-in", "locked": True} for name in sorted(builtin)]
-        project_names = {t.name for t in (declared_project.tools if declared_project else ())}
+        # run_cypher is served (and so in effect) only with enable_run_cypher.
+        served_builtin = builtin if get_settings().enable_run_cypher else builtin - {"run_cypher"}
+        rows = [{"name": name, "origin": "built-in", "locked": True} for name in sorted(served_builtin)]
         rows += [{"name": n, "origin": "global", "locked": False} for n in global_tools if n not in project_names and n not in builtin]
-        for tool in declared_project.tools if declared_project else ():
-            if tool.name in builtin:
+        for name in project_names:
+            if name in builtin:
                 continue
-            origin = "project (overrides global)" if tool.name in global_tools else "project"
-            rows.append({"name": tool.name, "origin": origin, "locked": False})
+            origin = "project (overrides global)" if name in global_tools else "project"
+            rows.append({"name": name, "origin": origin, "locked": False})
+        rows += [{"name": n, "origin": "global", "locked": False, **ignored} for n in global_tools if n in builtin]
+        rows += [{"name": n, "origin": "project", "locked": False, **ignored} for n in project_names if n in builtin]
 
     if as_json:
         typer.echo(json.dumps({"tools": rows}, indent=2))
         return
-    table = Table(title="Global tools" if root is None else f"Tools for {root}")
+    table = Table(title="Global tools" if root is None else escape(f"Tools for {root}"))
     table.add_column("Name", style="cyan")
     table.add_column("Origin")
     for row in rows:
-        table.add_row(escape(row["name"]), row["origin"] + (" (locked)" if row["locked"] else ""))
+        origin = row["origin"] + (" (locked)" if row["locked"] else "")
+        if row.get("ignored"):
+            origin += f" — ignored: {row['ignored']}"
+        table.add_row(escape(row["name"]), origin)
     console.print(table)
-    if root is not None and not project_config_enabled(root):
+    note = _tools_scope_note(root)
+    if note != _TOOLS_RELOAD_NOTE:  # unregistered or disabled; or the global note for --global
+        console.print(escape(note), soft_wrap=True)
+    elif not project_config_enabled(root):
         console.print("Project config disabled: project tools are not served")
+    if root is not None:
+        console.print(_GLOBAL_TOOLS_NOTE, soft_wrap=True)
 
 
 @tools_app.command("add")
@@ -2167,16 +2268,16 @@ def config_tools_add(
     tool = _read_tool_source(source)
     name = tool.get("name")
     _refuse_builtin(name)
-    from devgraph.config.tools_edit import tool_mappings
+    from devgraph.config.tools_edit import ToolsEditError, tool_mappings
 
     try:
         existing = tool_mappings(_tools_text(root))
-    except Exception as exc:
+    except ToolsEditError as exc:
         raise _tools_fail(str(exc))
     if any(isinstance(m, dict) and m.get("name") == name for m in existing):
         raise _tools_fail(f"a tool named {name!r} already exists in this scope; use `devgraph config tools edit {name}`")
     path = _write_tools(root, lambda text: add_tool_text(text, tool))
-    _tools_done("Added", str(name), path)
+    _tools_done("Added", str(name), path, root)
 
 
 @tools_app.command("edit")
@@ -2212,7 +2313,7 @@ def config_tools_edit(
     if tool.get("name") != name:
         _refuse_builtin(tool.get("name"))
     path = _write_tools(root, lambda text: replace_tool_text(text, name, tool))
-    _tools_done("Updated", name, path)
+    _tools_done("Updated", name, path, root)
 
 
 @tools_app.command("delete")
@@ -2227,7 +2328,7 @@ def config_tools_delete(
 
     root = _tools_scope(ctx, repo, global_)
     path = _write_tools(root, lambda text: delete_tool_text(text, name))
-    _tools_done("Deleted", name, path)
+    _tools_done("Deleted", name, path, root)
 
 
 @tools_app.command("reset")
@@ -2255,7 +2356,7 @@ def config_tools_reset(
     except OSError as exc:
         raise _tools_fail(str(exc))
     console.print(f"[green]Reset[/green] {escape(str(path))}", soft_wrap=True)
-    console.print(_TOOLS_RELOAD_NOTE)
+    console.print(escape(_tools_scope_note(root)), soft_wrap=True)
 
 
 @app.command()
