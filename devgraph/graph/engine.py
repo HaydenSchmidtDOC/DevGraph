@@ -90,6 +90,20 @@ _PRUNE_EXTRACTED_CYPHER = (
     "DETACH DELETE n RETURN count(n) AS pruned"
 )
 
+# Which project schema the repository's graph was last built with (see
+# dispatch.apply_project_schema). Kept on the Repository node so every
+# process -- CLI, agent, dashboard -- reads the same state.
+_READ_APPLIED_SCHEMA_CYPHER = (
+    "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.schema_hash IS NOT NULL "
+    "RETURN r.schema_hash AS hash, coalesce(r.schema_labels, []) AS labels, "
+    "coalesce(r.schema_relationship_types, []) AS relationship_types"
+)
+_RECORD_APPLIED_SCHEMA_CYPHER = (
+    "MERGE (r:Repository {repo_id: $repo_id}) "
+    "SET r.schema_hash = $hash, r.schema_labels = $labels, "
+    "r.schema_relationship_types = $relationship_types"
+)
+
 # Transient Neo4j failures worth retrying: a connection blip, an expired
 # session, or a server-side transient error (e.g. a lock timeout). Permanent
 # errors (syntax, constraint violations, unknown labels) are NOT retried.
@@ -540,6 +554,44 @@ class GraphEngine:
             )
             records = [record.data() for record in result or []]
         return records[0]["pruned"] if records else 0
+
+    def read_applied_schema(self, repo_id: str) -> dict[str, Any] | None:
+        """The schema state the repo's graph was last built with, or None."""
+        with self._driver.session() as session:
+            result = _retry_transient(session.run, _READ_APPLIED_SCHEMA_CYPHER, repo_id=repo_id)
+            records = [record.data() for record in result or []]
+        return records[0] if records else None
+
+    def record_applied_schema(
+        self, repo_id: str, schema_hash: str, labels: list[str], relationship_types: list[str]
+    ) -> None:
+        """Record the schema hash and user labels/relationship types the repo's graph was last built with."""
+        with self._driver.session() as session:
+            _retry_transient(
+                session.run, _RECORD_APPLIED_SCHEMA_CYPHER, repo_id=repo_id, hash=schema_hash,
+                labels=labels, relationship_types=relationship_types,
+            )
+
+    def delete_label_nodes(self, repo_id: str, label: str) -> int:
+        """Delete one repo's nodes of a user label. The caller validates `label`."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run, f"MATCH (n:`{label}` {{repo_id: $repo_id}}) DETACH DELETE n RETURN count(n) AS n",
+                repo_id=repo_id,
+            )
+            records = [record.data() for record in result or []]
+        return records[0]["n"] if records else 0
+
+    def delete_relationship_type(self, repo_id: str, rel_type: str) -> int:
+        """Delete one repo's relationships of a user type. The caller validates `rel_type`."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                f"MATCH (a {{repo_id: $repo_id}})-[r:`{rel_type}`]->() DELETE r RETURN count(r) AS n",
+                repo_id=repo_id,
+            )
+            records = [record.data() for record in result or []]
+        return records[0]["n"] if records else 0
 
     def list_indexed_files(self, repo_id: str) -> set[str]:
         """Return every repo-relative path that currently backs file-provenance

@@ -22,6 +22,7 @@ import pytest
 
 from devgraph.config import project_schema
 from devgraph.config.project_schema import (
+    ABSENT_SCHEMA_HASH,
     EXTENDS_MODES,
     LABEL_PATTERN,
     MAX_IDENTIFIER_LENGTH,
@@ -37,6 +38,7 @@ from devgraph.config.project_schema import (
     project_schema_path,
     resolve_declaration,
     resolve_effective_schema,
+    schema_file_hash,
 )
 from devgraph.graph.schema import (
     NODE_LABELS,
@@ -1289,3 +1291,19 @@ def test_a_generated_index_name_may_not_collide_with_an_existing_name(tmp_path, 
     monkeypatch.setattr(project_schema, "_builtin_constraint_names", lambda: {"file_repo_name"})
     with pytest.raises(ProjectSchemaError, match="file_repo_name"):
         resolve_effective_schema(write_schema(tmp_path, WORKTREE))
+
+
+def test_schema_file_hash_tracks_content(tmp_path):
+    assert schema_file_hash(tmp_path) == ABSENT_SCHEMA_HASH
+    write_schema(tmp_path, WIDGET)
+    first = schema_file_hash(tmp_path)
+    assert first.startswith("sha256:") and len(first) == len("sha256:") + 64
+    assert schema_file_hash(tmp_path) == first
+    (tmp_path / SCHEMA_FILENAME).write_text("version: 1\n")
+    assert schema_file_hash(tmp_path) != first
+
+
+def test_an_unreadable_schema_never_hashes_like_a_real_one(tmp_path):
+    (tmp_path / SCHEMA_FILENAME).mkdir()
+    value = schema_file_hash(tmp_path)
+    assert value.startswith("unreadable:") and value != ABSENT_SCHEMA_HASH

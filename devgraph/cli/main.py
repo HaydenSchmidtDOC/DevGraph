@@ -202,6 +202,11 @@ def rescan(
     full: bool = typer.Option(
         False, "--full", help="Also run git-history indexing after the file scan, forcing a full re-sync even if HEAD hasn't moved (local-only, no network)."
     ),
+    now: bool = typer.Option(
+        False, "--now",
+        help="Apply a changed devgraph.schema.yaml right away instead of waiting for the agent's "
+        "5-minute quiet period. A CLI rescan always applies immediately; this states it explicitly.",
+    ),
 ) -> None:
     """Run a full re-index of a registered repository.
 
@@ -215,6 +220,9 @@ def rescan(
     force-push or pruned branch). With --full, git history is force
     re-synced even when HEAD hasn't moved — the escape hatch for repairing
     a graph whose MODIFIES edges were destroyed by a bug.
+
+    A changed devgraph.schema.yaml is applied by this command immediately;
+    --now says so explicitly (the agent applies it only after a quiet period).
 
     Args:
         repo_id: The repository ID to rescan.

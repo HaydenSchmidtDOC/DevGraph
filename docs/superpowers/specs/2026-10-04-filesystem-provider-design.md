@@ -92,6 +92,7 @@ signatures are unchanged.
 
 ## Known limits (documented)
 
+- Superseded: schema changes no longer re-sync immediately; see `2026-10-04-schema-rescan-design.md`.
 - While the agent runs, saving the schema re-syncs filesystem nodes
   immediately: `index_paths`/`remove_paths` see the schema file in the batch
   and, if it resolves, provision constraints/indexes and run a provider-only
