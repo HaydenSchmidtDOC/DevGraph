@@ -28,7 +28,8 @@ const fnSrc = [
   grab(/^function nodeType\(/m, "\n}"),
   grab(/^function renderTypeLists\(/m, "\n}"),
   grab(/^function applySchemaTypes\(/m, "\n}"),
-  grab(/^async function loadSchemaTypes\(/m, "\n}"),
+  grab(/^let schemaRequestSeq = 0;/m, "\n}"),   // the sequence counter and loadSchemaTypes
+  grab(/^function connectLiveEvents\(/m, "\n}"),
   grab(/^function refreshIsolateUI\(/m, "\n}"),
   grab(/^function escapeCypherStr\(/m, "\n"),
   grab(/^function escapeHtmlVal\(/m, "\n"),
@@ -39,6 +40,8 @@ const fnSrc = [
   grab(/^async function onRepoSelectChange\(/m, "\n}"),
 ].join("\n");
 const bootSrc = grab(/^async function bootConnect\(\)/m, "\n}");
+const renderAcSrc = grab(/^function renderAC\(/m, "\n}");
+const topologySrc = grab(/^async function loadTopologyCounts\(/m, "\n}");
 
 /* Today's hardcoded lists, frozen here as the snapshot a repo with no schema
    file must still reproduce: same labels in the same order, same categories,
@@ -70,13 +73,17 @@ const payload = (extraNodes, extraRels, state) => ({
   node_types: [...builtins(), ...extraNodes.map(([label, color, count]) => ({ label, origin: "project", color, count }))],
   relationship_types: [...builtinRels(), ...extraRels.map(([type, color]) => ({ type, origin: "project", color }))],
   schema_state: state,
-  notices: state === "pending" ? ["alpha: schema file changed since it was applied; rescan to apply it"] : [],
+  notices: state === "pending" ? ["alpha: schema file changed since it was applied; rescan to apply it"]
+    : state === "invalid" ? ["broken: schema file is invalid: <b>node_types</b> must be a list"] : [],
 });
 const SCHEMAS = {
   alpha: payload([["File", "#ff8800", 12], ["Folder", "#0088ff", 3]], [["IS_CHILD_OF", "#123456"]], "applied"),
   beta: payload([["Ticket", "#abcdef", 5]], [], "applied"),
   plain: payload([], [], "absent"),
   waiting: payload([], [], "pending"),
+  broken: payload([], [], "invalid"),
+  fresh: payload([], [], "never"),
+  off: payload([], [], "disabled"),
 };
 
 // --- a very small DOM ----------------------------------------------------
@@ -108,13 +115,18 @@ const mkEl = tag => {
 };
 const els = {
   entityCounts: mkEl("div"), relTypes: mkEl("div"), schemaPendingHint: mkEl("div"),
-  repoSelect: mkEl("select"),
+  repoSelect: mkEl("select"), ctlLiveUpdate: Object.assign(mkEl("input"), { checked: true }),
   ctlNodeCeiling: Object.assign(mkEl("input"), { max: 100 }),
   ctlRelCeiling: Object.assign(mkEl("input"), { max: 100 }),
 };
 els.schemaPendingHint.style.display = "none";
 const document = { getElementById: id => els[id] || null, createElement: mkEl };
 let fetchCalls = [];
+/* url -> a promise the stubbed fetch waits on before answering, so two
+   requests can be made to resolve out of order */
+const fetchGates = {};
+let eventSource = null;
+let order = [];
 let refreshes = 0, isolations = 0, styleUpdates = 0;
 const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 100, relCeiling: 100 };
 const globals = {
@@ -122,6 +134,7 @@ const globals = {
   entityCounts: els.entityCounts, relTypes: els.relTypes,
   fetch: async url => {
     fetchCalls.push(url);
+    if (fetchGates[url]) await fetchGates[url];
     const m = /^\/api\/repos\/([^/]+)\/schema$/.exec(url);
     const body = m && SCHEMAS[decodeURIComponent(m[1])];
     return body ? { ok: true, status: 200, json: async () => body }
@@ -130,7 +143,9 @@ const globals = {
   localStorage: { setItem: () => {} },
   SELECTED_REPO_KEY: "k",
   neo4jConnected: true,
-  refreshGraph: async () => { refreshes++; return true; },
+  refreshGraph: async () => { refreshes++; order.push("refreshGraph"); return true; },
+  populateRealRepos: async () => {},
+  EventSource: class { constructor(url) { this.url = url; eventSource = this; } },
   buildQueryFromState: () => {},
   loadGitHistory: () => {},
   highlightType: () => {}, highlightRel: () => {},
@@ -140,7 +155,8 @@ const globals = {
 const api = new Function(...Object.keys(globals),
   tablesSrc + "\n" + fnSrc +
   "\nreturn { NODE_TYPES, REL_TYPES, CAT_COLORS, BUILTIN_NODE_TYPES, renderTypeLists, applySchemaTypes," +
-  " loadSchemaTypes, currentStateQuery, mapGraphResultToElements, acCandidates, onRepoSelectChange, refreshIsolateUI };")(
+  " loadSchemaTypes, currentStateQuery, mapGraphResultToElements, acCandidates, onRepoSelectChange, refreshIsolateUI," +
+  " connectLiveEvents };")(
   ...Object.values(globals));
 
 // --- helpers ------------------------------------------------------------
@@ -265,8 +281,20 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
   // 6. a pending schema says so
   await switchTo("waiting");
   check("a pending schema shows the pending hint", hintShown(), els.schemaPendingHint.style.display);
-  check("the hint says a rescan is needed", /id="schemaPendingHint"[^>]*>[^<]*rescan/i.test(html),
-    "the served #schemaPendingHint does not mention a rescan");
+  check("the pending hint says a rescan is needed and what is shown meanwhile",
+    els.schemaPendingHint.textContent === "Schema file changed — rescan to apply it. Showing the types from the last scan.",
+    els.schemaPendingHint.textContent);
+  await switchTo("broken");
+  check("an invalid schema shows the hint too", hintShown(), els.schemaPendingHint.style.display);
+  check("...saying the file is invalid, with the first notice as text",
+    els.schemaPendingHint.textContent ===
+      "Schema file is invalid — showing the types from the last scan. broken: schema file is invalid: <b>node_types</b> must be a list",
+    els.schemaPendingHint.textContent);
+  check("...never as markup", !els.schemaPendingHint.innerHTML, els.schemaPendingHint.innerHTML);
+  for (const repo of ["fresh", "off", "alpha"]) {
+    await switchTo(repo);
+    check(`the hint is hidden for a ${SCHEMAS[repo].schema_state} schema`, !hintShown(), els.schemaPendingHint.style.display);
+  }
   await switchTo("plain");
   check("the hint goes away again for a repo without a pending change", !hintShown(), els.schemaPendingHint.style.display);
 
@@ -275,7 +303,39 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
   await api.loadSchemaTypes("nope");
   check("a failed schema read keeps the current rows", JSON.stringify(rowLabels()) === before, JSON.stringify(rowLabels()));
 
-  // 8. wiring: boot loads the schema before the first graph fetch
+  // 8. a superseded reply never lands: switch alpha -> beta with alpha's reply arriving last
+  let releaseAlpha;
+  fetchGates["/api/repos/alpha/schema"] = new Promise(r => { releaseAlpha = r; });
+  const slow = api.loadSchemaTypes("alpha");
+  await api.loadSchemaTypes("beta");
+  releaseAlpha();
+  await slow;
+  delete fetchGates["/api/repos/alpha/schema"];
+  check("a late reply for the previous repo does not replace the current repo's rows",
+    JSON.stringify(rowLabels()) === JSON.stringify([...SNAPSHOT_NODES.map(n => n[0]), "Ticket"]), JSON.stringify(rowLabels()));
+  check("...nor its colours", !("user:File" in api.CAT_COLORS) && api.CAT_COLORS["user:Ticket"] === "#abcdef",
+    JSON.stringify(api.CAT_COLORS));
+  check("...nor its autocomplete entries", !api.acCandidates().some(c => c.text === "File"), "File offered after a stale reply");
+
+  // 9. a rescan reloads the schema before the graph, so the hint clears and new labels get rows
+  await switchTo("waiting");
+  SCHEMAS.waiting = payload([["Folder", "#0088ff", 4]], [], "applied");
+  api.connectLiveEvents();
+  order = [];
+  const fetchesBefore = fetchCalls.length;
+  await eventSource.onmessage({ data: JSON.stringify({ type: "reindexed", repo_id: "waiting", changed: 2, deleted: 0 }) });
+  check("a reindex event reloads the current repo's schema",
+    fetchCalls.slice(fetchesBefore).includes("/api/repos/waiting/schema"), JSON.stringify(fetchCalls.slice(fetchesBefore)));
+  check("...and then refreshes the graph", order.join() === "refreshGraph", order.join());
+  check("...so the pending hint clears", !hintShown(), els.schemaPendingHint.style.display);
+  check("...and the newly applied label gets its row", rowLabels().includes("Folder"), JSON.stringify(rowLabels()));
+
+  // 10. remaining interpolations of labels
+  check("autocomplete escapes candidate text into its markup", /escapeHtmlVal\(it\.text\)/.test(renderAcSrc), renderAcSrc);
+  check("the count-row lookup escapes the label in its selector",
+    /data-label="\$\{CSS\.escape\(t\.id\)\}"/.test(topologySrc), "loadTopologyCounts selector not escaped");
+
+  // 11. wiring: boot loads the schema before the first graph fetch
   check("boot loads the selected repo's schema before the first graph fetch",
     /await loadSchemaTypes\(.*\);[\s\S]*await refreshGraph\(/.test(bootSrc), bootSrc);
   check("the repo dropdown is wired to the named handler",

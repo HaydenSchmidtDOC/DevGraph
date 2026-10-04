@@ -508,7 +508,7 @@ table.dstable input[type="text"] { width: 100%; }
       <div class="card-head"><h3>Entities</h3><span class="wired-pill" id="entityLivePill" style="display:none">Live</span></div>
       <div class="entity-total">Total:<span class="n" id="entityTotal">—</span></div>
       <div class="count-list floating-list" id="entityCounts"></div>
-      <div class="count-note" id="schemaPendingHint" style="display:none">Schema change pending — rescan to apply it. Types shown are the last applied schema's.</div>
+      <div class="count-note" id="schemaPendingHint" style="display:none"></div>
       <div class="count-note">Document nodes: <span id="docCount" style="color:var(--fg-2)">—</span></div>
       <div class="fc-subsection" data-od-id="god-nodes-section">
         <div class="fc-subhead">Top god nodes<span class="qmark" data-tip="Ranked by real degree centrality — size((n)--()) — a plain Cypher query, no plugin required. PageRank would need GDS.">?</span></div>
@@ -1008,17 +1008,32 @@ function applySchemaTypes(schema) {
   if (state.isolatedEntity && !NODE_TYPES.some(t => t.id === state.isolatedEntity)) state.isolatedEntity = null;
   if (state.isolatedRel && !REL_TYPES.includes(state.isolatedRel)) state.isolatedRel = null;
   renderTypeLists();
+  /* a schema file the graph doesn't reflect yet: changed since the last scan,
+     or unreadable. textContent, never innerHTML: the notice is server text. */
   const hint = document.getElementById("schemaPendingHint");
-  hint.style.display = schema.schema_state === "pending" ? "" : "none";
+  const notice = (schema.notices || [])[0];
+  hint.textContent =
+    schema.schema_state === "pending" ? "Schema file changed — rescan to apply it. Showing the types from the last scan." :
+    schema.schema_state === "invalid" ? "Schema file is invalid — showing the types from the last scan." + (notice ? " " + notice : "") : "";
+  hint.style.display = hint.textContent ? "" : "none";
   cy.style().update(); // nodes already on the canvas re-read catColor
 }
 /* Fetches the selected repository's types (the union of every repo's for
-   __all__). A failed read leaves the current lists as they are. */
+   __all__). A failed read leaves the current lists as they are.
+   schemaRequestSeq guards against out-of-order replies, same as
+   glowRequestSeq: switching repos quickly can have the previous repo's
+   reply arrive after the current one's, and installing it would leave the
+   previous repo's rows and colours on screen -- every call bumps the
+   counter, and only the latest one applies its result. */
+let schemaRequestSeq = 0;
 async function loadSchemaTypes(repo) {
+  const mySeq = ++schemaRequestSeq;
   try {
     const resp = await fetch(`/api/repos/${encodeURIComponent(repo)}/schema`);
     if (!resp.ok) return;
-    applySchemaTypes(await resp.json());
+    const schema = await resp.json();
+    if (mySeq !== schemaRequestSeq) return; // superseded by a newer repo's request
+    applySchemaTypes(schema);
   } catch (e) { /* network hiccup -- the next repo switch or reconnect retries */ }
 }
 /* isolating a type is a state change like any other -- goes through the
@@ -2709,7 +2724,7 @@ bootConnect();
    changed), so a reindex event just re-triggers a normal load. */
 function connectLiveEvents() {
   const es = new EventSource("/api/events");
-  es.onmessage = (e) => {
+  es.onmessage = async (e) => {
     if (!document.getElementById("ctlLiveUpdate").checked) return; // toggle pauses reacting, not the connection itself
     let event;
     try { event = JSON.parse(e.data); } catch { return; }
@@ -2721,7 +2736,10 @@ function connectLiveEvents() {
        that report a real diff, so a noisy/looping publisher on the backend
        can't turn this into a client-side request storm. */
     if (event.type === "reindexed" && (event.changed || event.deleted)) {
-      if (neo4jConnected) refreshGraph();
+      /* a rescan is also what applies a changed schema file, so reload the
+         types first: the pending hint clears and new labels get their rows
+         and colours before the graph that contains them is drawn. */
+      if (neo4jConnected) { await loadSchemaTypes(repo); refreshGraph(); }
     } else if (event.type === "git_history_synced" && event.mode !== "noop") {
       loadGitHistory(repo);
     } else if (event.type === "registry_changed" && neo4jConnected) {
@@ -2944,7 +2962,7 @@ function currentWordRange() {
   return { start, end: pos, word: val.slice(start, pos) };
 }
 function renderAC() {
-  ac.innerHTML = acItems.map((it,i) => `<div class="ac-item${i===acIndex?' active':''}" data-i="${i}"><span>${it.text}</span><span class="k">${it.kind}</span></div>`).join("");
+  ac.innerHTML = acItems.map((it,i) => `<div class="ac-item${i===acIndex?' active':''}" data-i="${i}"><span>${escapeHtmlVal(it.text)}</span><span class="k">${it.kind}</span></div>`).join("");
   ac.classList.toggle("show", acItems.length > 0);
 }
 function selectAC(i) {
@@ -3522,7 +3540,7 @@ async function loadTopologyCounts() {
     if (!labelJson.errors?.length) {
       const counts = Object.fromEntries(labelJson.results[0].data.map(d => [d.row[0], d.row[1]]));
       NODE_TYPES.forEach(t => {
-        const row = entityCounts.querySelector(`.count-row[data-label="${t.id}"] .val`);
+        const row = entityCounts.querySelector(`.count-row[data-label="${CSS.escape(t.id)}"] .val`);
         if (!row) return;
         const n = counts[t.id];
         if (n !== undefined) { row.textContent = n.toLocaleString(); row.classList.remove("na"); }
