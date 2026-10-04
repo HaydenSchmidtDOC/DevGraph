@@ -468,3 +468,26 @@ def test_schema_all_repos_is_the_union(schema_repo):
     assert project == {"File", "Folder"}
     assert {t["type"] for t in body["relationship_types"] if t["origin"] == "project"} == {"IS_CHILD_OF"}
     assert body["schema_state"] == "applied"
+
+
+# --- declared labels in graph and search -----------------------------------
+
+
+def test_graph_accepts_a_declared_label(schema_repo):
+    client, _, _ = schema_repo
+    res = client.get("/api/repos/dash_schema/graph", params={"label": "File"})
+    assert res.status_code == 200
+    nodes = res.json()["nodes"]
+    assert nodes and all(n["data"]["label"] == "File" for n in nodes)
+    assert client.get("/api/repos/dash_schema/graph", params={"label": "Service"}).status_code == 200
+    assert client.get("/api/repos/dash_schema/graph", params={"label": "Nope`"}).status_code == 400
+
+
+def test_graph_rejects_a_label_the_repo_did_not_declare(client):
+    assert client.get("/api/repos/dash_repo_a/graph", params={"label": "File"}).status_code == 400
+
+
+def test_search_finds_a_declared_label_node_by_name(schema_repo):
+    client, _, _ = schema_repo
+    results = client.get("/api/repos/dash_schema/search", params={"q": "a.txt"}).json()["results"]
+    assert any(r["label"] == "File" and r["name"] == "a.txt" for r in results)

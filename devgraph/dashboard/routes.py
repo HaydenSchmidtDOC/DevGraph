@@ -304,7 +304,7 @@ def build_router(
     @router.get("/repos/{repo_id}/graph")
     def repo_graph(repo_id: str, label: str | None = None, limit: int = _GRAPH_LIMIT_DEFAULT) -> dict[str, Any]:
         _require_repo(repo_id)
-        if label is not None and label not in NODE_LABELS:
+        if label is not None and label not in _allowed_labels(repo_id):
             raise HTTPException(status_code=400, detail=f"unknown label: {label}")
         capped_limit = max(1, min(limit, _GRAPH_LIMIT_CEILING))
         nodes, edges = queries.graph_slice(engine, repo_id, label, capped_limit)
@@ -373,13 +373,27 @@ def build_router(
             notices.append(f"{record.repo_id}: schema file changed since it was applied; rescan to apply it")
         return {"labels": project_labels, "rels": project_rels, "colors": colors, "state": state, "notices": notices}
 
+    def _scope_records(repo_id: str) -> list[Any]:
+        """The registered repos a scope covers: every repo for `__all__`, else one."""
+        if repo_id == _ALL_REPOS_SCOPE:
+            return registry.list_repos()
+        _require_repo(repo_id)
+        return [registry.get(repo_id)]
+
+    def _allowed_labels(repo_id: str) -> list[str]:
+        """Built-in labels plus the applied project labels of every repo in scope.
+
+        The one source of truth the schema, graph and search routes share; only
+        labels in this list may be interpolated into Cypher.
+        """
+        labels = list(NODE_LABELS)
+        for record in _scope_records(repo_id):
+            labels += [x for x in _repo_schema(record)["labels"] if x not in labels]
+        return labels
+
     @router.get("/repos/{repo_id}/schema")
     def repo_schema(repo_id: str) -> dict[str, Any]:
-        if repo_id == _ALL_REPOS_SCOPE:
-            records = registry.list_repos()
-        else:
-            _require_repo(repo_id)
-            records = [registry.get(repo_id)]
+        records = _scope_records(repo_id)
 
         counts: dict[str, int] = {}
         project_labels: list[str] = []
@@ -427,7 +441,8 @@ def build_router(
     @router.get("/repos/{repo_id}/search")
     def repo_search(repo_id: str, q: str, max_results: int = 15) -> dict[str, Any]:
         _require_repo(repo_id)
-        return {"results": queries.search_components(engine, repo_id, q, max_results)}
+        project_labels = [x for x in _allowed_labels(repo_id) if x not in NODE_LABELS]
+        return {"results": queries.search_components(engine, repo_id, q, max_results, project_labels)}
 
     # The canvas's repo selector has an "All Repos" option that is not a
     # registered repo, and its layout is worth persisting like any other

@@ -67,7 +67,7 @@ def graph_slice(
     Cypher can't parameterize a label, so an unvalidated value must never be
     interpolated into the query string.
     """
-    label_filter = f"AND n:{label}" if label else ""
+    label_filter = f"AND n:`{label}`" if label else ""
     node_rows = engine.run_cypher(
         f"MATCH (n {{repo_id: $repo_id}}) "
         f"WHERE true {label_filter} "
@@ -90,17 +90,25 @@ def graph_slice(
 
 
 def search_components(
-    engine: GraphEngine, repo_id: str, query: str, max_results: int
+    engine: GraphEngine,
+    repo_id: str,
+    query: str,
+    max_results: int,
+    project_labels: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Lightweight rows for the node browser's search box.
 
     Same match logic `mcp.tools.search_component` uses (name/description
     substring over the same label set), trimmed to the {id, name, label,
-    file} shape the dashboard actually renders.
+    file} shape the dashboard actually renders. `project_labels` are a repo's
+    applied schema labels, searched in addition to the built-in set; the caller
+    must take them from the applied schema (never from user input) since a
+    label cannot be parameterized.
     """
+    searchable = _SEARCHABLE_LABELS + "".join(f" OR n:`{label}`" for label in project_labels or [])
     rows = engine.run_cypher(
         f"MATCH (n {{repo_id: $repo_id}}) "
-        f"WHERE ({_SEARCHABLE_LABELS}) "
+        f"WHERE ({searchable}) "
         "AND (toLower(n.name) CONTAINS toLower($query) "
         "OR toLower(n.description) CONTAINS toLower($query)) "
         "RETURN elementId(n) AS id, n.name AS name, labels(n)[0] AS label, "
