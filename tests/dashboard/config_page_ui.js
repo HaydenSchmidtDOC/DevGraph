@@ -796,6 +796,72 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     !els.configResetModal.classList.contains("open") && fetchCalls.length === 2 &&
     buttons(card("repo-a"), "Reset devgraph.tools.yaml…").length === 0, JSON.stringify(fetchCalls));
 
+  // 23b. a cancelled reset's late answers never touch the dialog opened after it
+  api.renderConfigPage(MODEL());
+  const staleOn = new Set();
+  respond = (url, init) => {
+    if (!init.method) return { status: 200, body: project("repo-a") };
+    if (staleOn.has(url)) return { status: 412, body: { detail: { code: "stale", message: "changed", scope: project("repo-a") } } };
+    return { status: 200, body: { ok: true, written: false, fingerprint: "sha256:fp", removed: { tools: ["kept_listing"] }, warnings: [], notes: [], scope: project("repo-a") } };
+  };
+  staleOn.add("/api/config/repo-a/reset/tools");
+  gate = new Promise(r => { release = r; });
+  pending = buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0].fire("click");
+  await Promise.resolve();
+  els.configResetCancel.fire("click");
+  gate = null;
+  await buttons(card("repo-a"), "Reset devgraph.schema.yaml…")[0].fire("click");
+  els.configResetTyped.value = "repo-a";
+  await els.configResetTyped.fire("input");
+  release(); await pending;
+  check("reset A's 412, arriving after B opened, leaves B's dialog alone",
+    els.configResetTitle.textContent === "Reset devgraph.schema.yaml (repo-a)" && els.configResetTyped.value === "repo-a" &&
+    els.configResetList.textContent.includes("kept_listing") && !shown(els.configResetError) && !shown(els.configResetRecheck),
+    JSON.stringify([els.configResetTyped.value, els.configResetError.textContent, els.configResetList.textContent]));
+  check("the review moves focus to the name input", focused === els.configResetTyped, focused && focused.tagName);
+  els.configResetCancel.fire("click");
+  /* the same after Re-check's fetch of the scope */
+  await buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0].fire("click");
+  check("(A is now stale)", shown(els.configResetRecheck), els.configResetError.textContent);
+  staleOn.clear();
+  gate = new Promise(r => { release = r; });
+  fetchCalls = [];
+  pending = els.configResetRecheck.fire("click");
+  await Promise.resolve();
+  els.configResetCancel.fire("click");
+  gate = null;
+  await buttons(card("repo-a"), "Reset devgraph.schema.yaml…")[0].fire("click");
+  els.configResetTyped.value = "repo-a";
+  await els.configResetTyped.fire("input");
+  const before = fetchCalls.length;
+  release(); await pending;
+  await new Promise(r => setTimeout(r, 0));
+  check("a cancelled Re-check stops after its fetch: no dry run of A, B untouched",
+    fetchCalls.length === before && els.configResetTitle.textContent === "Reset devgraph.schema.yaml (repo-a)" &&
+    els.configResetTyped.value === "repo-a", JSON.stringify(fetchCalls.slice(before)));
+  els.configResetCancel.fire("click");
+
+  // 23c. a reset that fails after its dialog was cancelled still says so; opening the dialog keeps earlier notes
+  configPayload = MODEL();
+  api.renderConfigPage(MODEL());
+  els.configStatus.textContent = "Written to devgraph.tools.yaml; not committed.";
+  respond = (url, init) => JSON.parse(init.body).dry_run
+    ? { status: 200, body: { ok: true, written: false, fingerprint: "sha256:fp", removed: { tools: [] }, warnings: [], notes: [], scope: project("repo-a") } }
+    : { status: 500, body: { detail: { code: "io", message: "could not write devgraph.tools.yaml" } } };
+  await buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0].fire("click");
+  check("opening the reset dialog keeps the previous write's notes", els.configStatus.textContent === "Written to devgraph.tools.yaml; not committed.",
+    els.configStatus.textContent);
+  els.configResetTyped.value = "repo-a";
+  await els.configResetTyped.fire("input");
+  clock += 1000;
+  gate = new Promise(r => { release = r; });
+  pending = els.configResetConfirm.fire("click");
+  await Promise.resolve();
+  els.configResetCancel.fire("click");
+  gate = null; release(); await pending;
+  check("a reset that fails after Cancel reports the error on the status line",
+    els.configStatus.textContent.includes("could not write devgraph.tools.yaml"), els.configStatus.textContent);
+
   // 24. project-config switch
   r = api.configToggleRequest("repo a", false, true);
   check("configToggleRequest -> PUT /api/config/<repo>/project-config, JSON {enabled, dry_run}, no If-Match",

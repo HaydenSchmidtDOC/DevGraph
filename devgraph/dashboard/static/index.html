@@ -3406,7 +3406,10 @@ async function configResetCheck(rs, fresh) {
     rs.review = describeConfigReset(res.body);
   } finally {
     rs.busy = "";
-    if (configReset === rs) renderConfigReset();
+    if (configReset === rs) {
+      renderConfigReset();
+      if (rs.review) document.getElementById("configResetTyped").focus();
+    }
   }
 }
 async function configResetConfirm(ev) {
@@ -3425,6 +3428,8 @@ async function configResetConfirm(ev) {
   const mine = configReset === rs;
   if (!res.ok) {
     if (mine) { configResetFailed(rs, res); renderConfigReset(); }
+    /* cancelled meanwhile: the dialog is gone, so the status line says it did not happen */
+    else configSetStatus("Reset failed: " + describeConfigError(res.status, res.body && res.body.detail));
     return;
   }
   if (mine) configCloseReset();
@@ -3449,7 +3454,6 @@ function openConfigReset(scope, kind) {
   document.getElementById("configResetCancel").onclick = configCloseReset;
   const modal = document.getElementById("configResetModal");
   modal.onclick = ev => { if (ev.target === modal) configCloseReset(); };
-  configSetStatus("");
   modal.classList.add("open");
   return configResetCheck(rs, false);
 }

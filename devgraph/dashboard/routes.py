@@ -796,11 +796,15 @@ def build_router(
             # The fingerprint edits.py took under the lock, of exactly what was written: if the file
             # changed again since, the client's next write is a 412 rather than a blind overwrite.
             part["fingerprint"] = result.fingerprint
+        # A reset's dry run reports the fingerprint of the bytes it listed, taken in the same read under
+        # the lock, not the scope re-read below: the confirm sends it back, so a file that changed after
+        # it was listed is a 412 rather than a reset of content nobody saw.
+        fingerprint = result.fingerprint if result.removed is not None else part["fingerprint"]
         content: dict[str, Any] = {
             "ok": True,
             "written": result.written,
             "file": path.name,
-            "fingerprint": part["fingerprint"],
+            "fingerprint": fingerprint,
             "warnings": [scrub(w, path, root) for w in result.warnings],
             "notes": [scrub(n, path, root) for n in notes],
             "scope": block,

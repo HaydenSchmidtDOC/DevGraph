@@ -661,16 +661,27 @@ def delete_schema_entry(
 # --- whole-file reset ------------------------------------------------------------------------------
 
 
-def _loaded_yaml(path: Path) -> tuple[bool, Any]:
-    """(readable, data) of a file as `yaml.safe_load` sees it. Never raises: reset must work on a broken file."""
+def _reset_snapshot(path: Path) -> tuple[str, bool, Any, str]:
+    """(fingerprint, readable, data, text) of one read of the file, so a reset's listing, its warnings
+    and the fingerprint its confirm must match all describe the same bytes. Never raises: reset must
+    work on a broken file."""
     import yaml
 
     from devgraph.config.project_tools import YAML_LOAD_ERRORS
 
     try:
-        return True, yaml.safe_load(path.read_bytes().decode("utf-8"))
-    except (OSError, UnicodeDecodeError, *YAML_LOAD_ERRORS):
-        return False, None
+        raw = path.read_bytes()
+    except OSError:
+        return file_fingerprint(path), False, None, ""
+    fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return fingerprint, False, None, ""
+    try:
+        return fingerprint, True, yaml.safe_load(text), text
+    except YAML_LOAD_ERRORS:
+        return fingerprint, False, None, text
 
 
 def _names(data: Any, key: str, ident: str) -> list[str]:
@@ -692,7 +703,7 @@ def reset_tools(
     """Remove every tool in the scope: delete `devgraph.tools.yaml`, or empty the global store.
 
     The `removed` listing is best effort and never blocks the reset (it is the way out of a broken file).
-    A dry run changes nothing and reports the file's current fingerprint.
+    A dry run changes nothing and reports the fingerprint of the exact bytes it listed (what a confirm must match).
     """
     from devgraph.config.global_tools import ProjectToolsError, load_global_tools, save_global_tools
 
@@ -700,7 +711,7 @@ def reset_tools(
     with _guard(path, expected_fingerprint):
         if not path.exists():
             return _nothing_to_reset(path, {"tools": []})
-        readable, data = _loaded_yaml(path)
+        fingerprint, readable, data, _ = _reset_snapshot(path)
         names = _names(data, "tools", "name") if readable else None
         notes: list[str] = []
         if root is None:
@@ -718,7 +729,7 @@ def reset_tools(
             where = record.repo_id if record is not None else path.parent.name
             notes += [f"After the reset, global tool {n} is served in {where}." for n in names if n in served]
         if dry_run:
-            return EditResult(path, "", False, file_fingerprint(path), notes=notes, removed={"tools": names})
+            return EditResult(path, "", False, fingerprint, notes=notes, removed={"tools": names})
         try:
             if root is None:
                 save_global_tools([])
@@ -739,12 +750,12 @@ def reset_schema(
     with _guard(path, expected_fingerprint):
         if not path.exists():
             return _nothing_to_reset(path, {"node_types": [], "relationships": []})
-        readable, data = _loaded_yaml(path)
+        fingerprint, readable, data, text = _reset_snapshot(path)
         removed = {
             "node_types": _names(data, "node_types", "label") if readable else None,
             "relationships": _names(data, "relationships", "type") if readable else None,
         }
-        before = schema_declaration(read_text_lossy(path), path)
+        before = schema_declaration(text, path)
         if before is None and not (readable and data is None):
             warnings = [
                 "The file is invalid, so what it declared can't be listed; the next rescan returns this repository "
@@ -758,7 +769,8 @@ def reset_schema(
             except OSError as exc:
                 raise ConfigEditError(str(exc), "io")
         return EditResult(
-            path, "", not dry_run, file_fingerprint(path), before=before, warnings=warnings, removed=removed
+            path, "", not dry_run, file_fingerprint(path) if not dry_run else fingerprint,
+            before=before, warnings=warnings, removed=removed,
         )
 
 

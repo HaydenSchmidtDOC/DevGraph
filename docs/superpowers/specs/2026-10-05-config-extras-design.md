@@ -87,7 +87,7 @@ Success body = the G2a envelope plus `removed` and, for any tools write that can
  "scope": {…}, "global": {…}}
 ```
 
-**Binding the confirm to what was reviewed.** The dry run returns the current `fingerprint`; the confirming request sends that value in `If-Match`. If the file changed between review and confirm, the reset is a 412 and nothing is deleted.
+**Binding the confirm to what was reviewed.** The dry run returns the fingerprint of the exact bytes it listed (one read under the lock, not a later re-read of the scope); the confirming request sends that value in `If-Match`. If the file changed between review and confirm, the reset is a 412 and nothing is deleted.
 
 ### 2.3 Project-config toggle
 
@@ -113,7 +113,7 @@ Also `edits.project_config_change(record, enabled) -> (warnings, notes)`: the sc
 
 - **Reset button** in the section header of each file-backed section (`configSection`, near index.html:3008): global Tools, project Nodes (the schema file — shown once, on Nodes, labelled "Reset devgraph.schema.yaml"), project Tools. Hidden when the file state is `absent`; shown for `invalid` (that is when it is most useful).
 - **Reset modal** `#configResetModal` (reuses `.modal-overlay`/`.modal-box`): opening it runs the dry run; it lists `removed` (as text), warnings and notes, then a text input "Type <phrase> to reset". The phrase is the repo id for project files and `global` for the global store (the scope token `__global__` is not something to ask a person to type). The Reset button is disabled until the input equals the phrase exactly, and keeps the existing `CONFIG_ARM_MS` arming delay. Confirm sends `POST …/reset/{kind}` with `If-Match` = the dry run's fingerprint. On 412: "The file changed since this list was made" + Re-check (re-runs the dry run, clears the typed phrase). The success note always includes the server's "Written to <file>; not committed." plus "Git can restore a tracked file; an untracked file or the global store cannot be restored."
-- **Toggle**: a `.switch` labelled "Project config" in each project card header. Flipping it runs the dry run; with no warnings it applies at once; with warnings (disabling a repo with project node types), an inline confirm panel lists them with "Disable anyway" / Cancel (the G2a rule: confirm only when the dry run warns). The switch shows the server's state after the response, never the optimistic one; on error it snaps back and shows the error text. The two effect notes render under the card header.
+- **Toggle**: a `.switch` labelled "Project config" in each project card header. Turning it off runs the dry run (turning it on applies directly); with no warnings it applies at once; with warnings (disabling a repo with project node types or project tools, 2.3), an inline confirm panel lists them with "Disable anyway" / Cancel (the G2a rule: confirm only when the dry run warns). The switch shows the server's state after the response, never the optimistic one; on error it snaps back and shows the error text. The two effect notes render under the card header.
 - Pure functions (test harness grabs them by regex): `configResetRequest(scope, kind, fingerprint, dryRun) -> {url, init}`, `configResetPhrase(scope) -> string`, `configResetReady(typed, phrase) -> bool`, `configToggleRequest(repoId, enabled, dryRun) -> {url, init}`, `describeConfigReset(response) -> {removed: string[], warnings, notes}`; plus `openConfigReset(...)` and `toggleProjectConfig(...)` for DOM wiring. `applyConfigScope` is reused for `scope`, and for `global` when present.
 - Every name, path and message rendered with `textContent`.
 
@@ -131,7 +131,7 @@ Also `edits.project_config_change(record, enabled) -> (warnings, notes)`: the sc
 8. **Global reset: delete the store or empty it?** Empty it (`save_global_tools([])`) — CLI parity.
 9. **Strong confirmation?** Typed phrase (repo id, or `global`) plus the arming delay; the dry run's fingerprint binds the confirm to what was shown. The armed-confirm pattern alone is for per-entry edits; a whole-file reset can drop an untracked file or the global store irrecoverably.
 10. **`If-Match` on the toggle?** No: idempotent end-state on a registry flag (2.3).
-11. **Confirm when disabling?** Only when the dry run warns (project node types whose nodes the next rescan deletes), matching G2a's dry-run rule; enabling and warning-free disabling apply directly.
+11. **Confirm when disabling?** Only when the dry run warns, matching G2a's dry-run rule. Disabling warns when the repo has project node types (the next rescan deletes their nodes) or serves project tools ("Project tools no longer served in <repo_id>: …", 2.3), so either one asks for confirmation; enabling, and disabling a repo with neither, apply directly.
 12. **Toggle for inactive repos?** No; the page lists active repos only (G2a Q8). The CLI still works for them.
 13. **Logs carry the id?** The telemetry store is the tool-call log; notices and warnings keep wire names (agent-facing).
 

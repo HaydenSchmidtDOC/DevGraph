@@ -1233,6 +1233,31 @@ def test_reset_inactive_repo_is_404(client, registry, tmp_path):
     assert _send(client, "POST", "/api/config/repo-a/reset/tools", "absent", {}).status_code == 404
 
 
+@pytest.mark.parametrize("kind,name", [("tools", TOOLS_FILENAME), ("schema", SCHEMA_FILENAME)])
+def test_reset_dry_run_fingerprint_is_of_the_listed_bytes(client, registry, tmp_path, monkeypatch, kind, name):
+    """A file changed after the dry run evaluated it, but before the response re-reads the scope:
+    the response carries the fingerprint of what it listed, so a confirm with it is a 412."""
+    record = _repo(tmp_path, registry)
+    v1 = TOOL.format(name="listed_tool") if kind == "tools" else SCHEMA
+    path = _write(record.path, name, v1)
+    fp = _fp(client, "repo-a", kind)
+    v1_fp = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    real = getattr(edits, "reset_" + kind)
+
+    def then_change(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if kwargs.get("dry_run"):
+            path.write_text(TOOL.format(name="unseen_tool") if kind == "tools" else SCHEMA.replace("Widget", "Unseen"))
+        return result
+
+    monkeypatch.setattr(edits, "reset_" + kind, then_change)
+    dry = _send(client, "POST", f"/api/config/repo-a/reset/{kind}", fp, {"dry_run": True})
+    assert dry.status_code == 200, dry.text
+    assert dry.json()["fingerprint"] == v1_fp == fp
+    confirm = _send(client, "POST", f"/api/config/repo-a/reset/{kind}", dry.json()["fingerprint"], {})
+    assert confirm.status_code == 412 and path.exists() and "unseen" in path.read_text().lower()
+
+
 @pytest.mark.parametrize("url,name", [("/api/config/repo-a/reset/tools", TOOLS_FILENAME), ("/api/config/repo-a/reset/schema", SCHEMA_FILENAME)])
 def test_reset_requires_if_match_and_rejects_stale(client, registry, tmp_path, url, name):
     record = _repo(tmp_path, registry)
