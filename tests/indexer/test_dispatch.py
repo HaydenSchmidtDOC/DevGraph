@@ -876,6 +876,19 @@ def _write_fixture(root: Path, fixture: dict[str, str]) -> None:
         (root / rel).write_text(content)
 
 
+def _record_indexed(monkeypatch) -> list[str]:
+    """Record the repo-relative path of every file index_paths indexes."""
+    seen: list[str] = []
+    original = dispatch._index_single_path
+
+    def record(engine, repo_id, repo_root, resolved, rel_path, *args):
+        seen.append(rel_path)
+        return original(engine, repo_id, repo_root, resolved, rel_path, *args)
+
+    monkeypatch.setattr(dispatch, "_index_single_path", record)
+    return seen
+
+
 def _missing_edges(engine, repo_id: str) -> list[str]:
     return [name for name, query in _CROSS_FILE_EDGES.items() if engine.run_cypher(query, {"repo_id": repo_id})[0]["c"] == 0]
 
@@ -924,14 +937,7 @@ class TestCrossFileEdgesIndependentOfOrder:
         unchanged target files (they add no new nodes) pulls in no referrers."""
         repo_id = "_smoketest_dispatch_relink_cost"
         _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
-        seen: list[str] = []
-        original = dispatch._index_single_path
-
-        def record(engine, repo_id, repo_root, resolved, rel_path, *args):
-            seen.append(rel_path)
-            return original(engine, repo_id, repo_root, resolved, rel_path, *args)
-
-        monkeypatch.setattr(dispatch, "_index_single_path", record)
+        seen = _record_indexed(monkeypatch)
         try:
             full_scan(engine, repo_id, temp_repo, docs_path="docs", mentions_enabled=True)
             assert sorted(seen) == sorted(_REFERRER_FIRST_FIXTURE)
@@ -941,5 +947,115 @@ class TestCrossFileEdgesIndependentOfOrder:
             index_paths(engine, repo_id, temp_repo, {temp_repo / t for t in targets}, docs_path="docs", mentions_enabled=True)
             assert sorted(seen) == sorted(targets)
             assert _missing_edges(engine, repo_id) == []
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_resaving_a_file_with_a_file_less_stub_indexes_no_extra_files(self, engine, temp_repo, monkeypatch):
+        """Cost guard: a C++ out-of-class method definition emits a Class stub
+        with no file provenance; re-saving the file unchanged must not count
+        it as an added node and re-index the docs that mention it."""
+        repo_id = "_smoketest_dispatch_relink_cost_cpp"
+        _write_fixture(temp_repo, {
+            "w/widget.cpp": '#include "widget.h"\nvoid Widget::draw() {}\n',
+            "README.md": "# Readme\n\nUses `Widget`.\n",
+        })
+        seen = _record_indexed(monkeypatch)
+        try:
+            full_scan(engine, repo_id, temp_repo, mentions_enabled=True)
+            seen.clear()
+            index_paths(engine, repo_id, temp_repo, {temp_repo / "w/widget.cpp"}, mentions_enabled=True)
+            assert seen == ["w/widget.cpp"]
+        finally:
+            engine.delete_repository(repo_id)
+
+    @pytest.mark.parametrize(
+        ("target", "before", "edge"),
+        [
+            ("src/z.py", "class Other:\n    pass\n", "mentions class"),
+            ("api/views.py", "def other(request):\n    pass\n", "implements"),
+            ("store/Store.java", "package store;\n\npublic interface Other {\n    void save();\n}\n", "extends"),
+        ],
+    )
+    def test_an_existing_file_gaining_a_symbol_relinks_its_referrers(self, engine, temp_repo, target, before, edge):
+        """The watcher's common case: the target file is already indexed and an
+        edit adds (or renames to) the symbol a referrer names."""
+        repo_id = "_smoketest_dispatch_relink_gain_" + Path(target).stem
+        _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
+        (temp_repo / target).write_text(before)
+        try:
+            full_scan(engine, repo_id, temp_repo, docs_path="docs", mentions_enabled=True)
+            assert edge in _missing_edges(engine, repo_id)
+
+            (temp_repo / target).write_text(_REFERRER_FIRST_FIXTURE[target])
+            index_paths(engine, repo_id, temp_repo, {temp_repo / target}, docs_path="docs", mentions_enabled=True)
+            assert edge not in _missing_edges(engine, repo_id)
+        finally:
+            engine.delete_repository(repo_id)
+
+
+class TestMentionRelinkBound:
+    """Adding a common name (`get`, `run`) must not re-index (or relink)
+    every Markdown file that mentions it on a watcher save."""
+
+    def _repo(self, root: Path) -> None:
+        _write_fixture(root, {"a.py": "def alpha():\n    pass\n", "b.py": "def get():\n    pass\n"})
+        for i in range(6):
+            _write_fixture(root, {f"docs/d{i}.md": f"# Doc {i}\n\n```python\nget()\nput()\n```\n"})
+
+    def _record_relinks(self, monkeypatch) -> list[str]:
+        relinked: list[str] = []
+        original = dispatch.index_mentions_file
+
+        def record(engine, repo_id, path, repo_root, **kwargs):
+            if kwargs.get("names") is not None:
+                relinked.append(Path(path).name)
+            return original(engine, repo_id, path, repo_root, **kwargs)
+
+        monkeypatch.setattr(dispatch, "index_mentions_file", record)
+        return relinked
+
+    def _mentioning(self, engine, repo_id: str, name: str) -> int:
+        return engine.run_cypher(
+            "MATCH (:Document {repo_id: $repo_id})-[:MENTIONS]->(:Function {name: $name, file: 'a.py'}) RETURN count(*) AS c",
+            {"repo_id": repo_id, "name": name},
+        )[0]["c"]
+
+    def test_a_name_that_already_exists_finds_referrers_in_the_graph(self, engine, temp_repo, monkeypatch):
+        repo_id = "_smoketest_dispatch_relink_bound_existing"
+        self._repo(temp_repo)
+        monkeypatch.setattr(dispatch, "_MAX_MENTION_RELINKS", 3)
+        text_scans: list[set[str]] = []
+        original = dispatch.mentions_any
+        monkeypatch.setattr(dispatch, "mentions_any", lambda content, names: text_scans.append(names) or original(content, names))
+        try:
+            full_scan(engine, repo_id, temp_repo, mentions_enabled=True)
+            seen = _record_indexed(monkeypatch)
+            relinked = self._record_relinks(monkeypatch)
+            text_scans.clear()
+            (temp_repo / "a.py").write_text("def alpha():\n    pass\n\ndef get():\n    pass\n")
+            index_paths(engine, repo_id, temp_repo, {temp_repo / "a.py"}, mentions_enabled=True)
+
+            assert text_scans == []
+            assert seen == ["a.py"]
+            assert len(relinked) == 3
+            assert self._mentioning(engine, repo_id, "get") == 3
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_a_name_new_to_the_graph_is_text_scanned_up_to_the_cap(self, engine, temp_repo, monkeypatch, caplog):
+        repo_id = "_smoketest_dispatch_relink_bound_new"
+        self._repo(temp_repo)
+        monkeypatch.setattr(dispatch, "_MAX_MENTION_RELINKS", 3)
+        try:
+            full_scan(engine, repo_id, temp_repo, mentions_enabled=True)
+            seen = _record_indexed(monkeypatch)
+            relinked = self._record_relinks(monkeypatch)
+            (temp_repo / "a.py").write_text("def alpha():\n    pass\n\ndef put():\n    pass\n")
+            index_paths(engine, repo_id, temp_repo, {temp_repo / "a.py"}, mentions_enabled=True)
+
+            assert seen == ["a.py"]
+            assert len(relinked) == 3
+            assert self._mentioning(engine, repo_id, "put") == 3
+            assert "rescan" in caplog.text
         finally:
             engine.delete_repository(repo_id)

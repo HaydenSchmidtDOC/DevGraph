@@ -106,14 +106,17 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         repo_root: The repo's root path, used to resolve docs_path and to
             compute relative paths for provenance.
         paths: Files to (re)index. Paths outside repo_root are silently
-            skipped — this function never indexes anything the caller didn't
-            explicitly hand it, but the extra check guards against a caller
-            bug passing an unrelated path.
+            skipped. Besides these, the batch also re-indexes files that
+            refer to what these files contain: direct importers (see
+            _expand_with_reverse_dependents) and files whose by-name edges
+            target a node the batch adds (see _find_referrers), and relinks
+            Markdown mentioning an added name (see _mention_referrers).
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
 
     Returns:
-        Number of files actually indexed (skipped/unrecognized files don't count).
+        Number of files actually indexed, including those referrers
+        (skipped/unrecognized files and Markdown relinks don't count).
     """
     indexed = 0
     docs_root = (repo_root / docs_path).resolve() if docs_path else None
@@ -199,7 +202,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     provenance_keys = set(by_rel_path)
     if docs_root is not None:
         provenance_keys |= {p.name for p in by_rel_path.values() if p.is_relative_to(docs_root)}
-    previous_nodes = engine.list_file_nodes(repo_id, sorted(provenance_keys))
+    batch_keys = sorted(provenance_keys)
+    previous_nodes = engine.list_file_nodes(repo_id, batch_keys)
 
     for rel_path in sorted(by_rel_path):
         index_one(rel_path, by_rel_path[rel_path])
@@ -214,11 +218,22 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     ]
     added_nodes = _batch_nodes(repo_id, root_resolved, code_extractions, docs_files, mention_files) - previous_nodes
     referrers = _find_referrers(
-        engine, repo_id, root_resolved, docs_root, mentions_enabled, added_nodes, set(by_rel_path),
+        engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path),
         {**java_extractions, **kt_extractions},
     )
     for rel_path in sorted(referrers):
         index_one(rel_path, root_resolved / rel_path)
+    # Markdown that only mentions an added name is unchanged itself, so it
+    # just gains edges to the added names (in the mentions pass below)
+    # instead of a full re-index that re-matches every name in the repo.
+    mention_relinks: list[Path] = []
+    if mentions_enabled and added_nodes:
+        mention_relinks = [
+            root_resolved / rel_path
+            for rel_path in sorted(
+                _mention_referrers(engine, repo_id, root_resolved, added_nodes, set(by_rel_path) | referrers, batch_keys)
+            )
+        ]
 
     # Second pass: re-upsert every .py file's already-extracted nodes/edges
     # (no re-parse, no re-prune). Batch order is path order, not dependency
@@ -319,6 +334,14 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             index_mentions_file(engine, repo_id, path, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode)
         except Exception:
             logger.warning("mentions pass failed for %s (%s); skipping file", repo_id, path, exc_info=True)
+    added_names = {name for _label, name in added_nodes}
+    for path in mention_relinks:
+        try:
+            index_mentions_file(
+                engine, repo_id, path, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode, names=added_names
+            )
+        except Exception:
+            logger.warning("mentions relink failed for %s (%s); skipping file", repo_id, path, exc_info=True)
 
     return indexed
 
@@ -545,14 +568,17 @@ def _batch_nodes(
     mention_files: list[Path],
 ) -> set[tuple[str, str]]:
     """(label, name) of every file-provenance node this batch wrote: code
-    symbols and Modules, docs notes, and Markdown Document nodes. (API
-    handler stubs and other `source`-keyed nodes are not included -- no
-    referrer lookup targets them.)"""
+    symbols and Modules, docs notes, and Markdown Document nodes -- the same
+    provenance list_file_nodes snapshots. File-less nodes (a C++ out-of-class
+    method's Class stub, API handler stubs, other `source`-keyed nodes) are
+    left out: they have no provenance to compare against, so they would
+    look newly added on every save."""
     nodes = {
         (node["label"], node["name"])
         for extractions in code_extractions
         for file_nodes, _rels in extractions.values()
         for node in file_nodes
+        if node["label"] == "Module" or node["properties"].get("file")
     }
     for path in docs_files:
         result = DocsExtractor(repo_id).extract_from_source(_read_text(path), path.name)
@@ -566,7 +592,6 @@ def _find_referrers(
     repo_id: str,
     root: Path,
     docs_root: Path | None,
-    mentions_enabled: bool,
     added: set[tuple[str, str]],
     batch: set[str],
     jvm_extractions: dict[str, tuple[list[dict], list[dict]]],
@@ -581,14 +606,12 @@ def _find_referrers(
     node of a label it can target, and it only reads files outside the
     batch. A full scan has no files outside the batch, and a batch that
     only re-saves files adds no nodes, so either way this is close to free.
+    (Markdown mentions are found separately, by _mention_referrers.)
     """
     if not added:
         return set()
-    names = {name for _label, name in added}
     found = _docs_note_referrers(repo_id, root, docs_root, added, batch)
     found |= _handler_stub_referrers(engine, repo_id, added)
-    if mentions_enabled:
-        found |= _mention_referrers(engine, repo_id, root, names, batch)
     found |= _same_package_subtype_referrers(root, added, batch, jvm_extractions)
     return found - batch
 
@@ -632,17 +655,54 @@ def _handler_stub_referrers(engine: GraphEngine, repo_id: str, added: set[tuple[
     return engine.find_handler_stub_sources(repo_id, functions)
 
 
-def _mention_referrers(engine: GraphEngine, repo_id: str, root: Path, names: set[str], batch: set[str]) -> set[str]:
+# At most this many Markdown files are relinked per batch to pick up
+# mentions of the batch's new names, so adding a common name (`get`, `run`)
+# mentioned across a large docs tree can't stall a watcher save. The rest
+# wait for the next rescan.
+_MAX_MENTION_RELINKS = 25
+
+
+def _mention_referrers(
+    engine: GraphEngine,
+    repo_id: str,
+    root: Path,
+    added: set[tuple[str, str]],
+    batch: set[str],
+    batch_keys: list[str],
+) -> set[str]:
     """Markdown files (already indexed for mentions) that mention an added
-    node's name the way the mentions extractor matches it. A plain text
-    check per file; only matching files are re-indexed."""
-    found = set()
-    for rel_path in sorted(engine.list_indexed_files(repo_id)):
-        if not rel_path.endswith((".md", ".markdown")) or rel_path in batch:
-            continue
-        path = root / rel_path
-        if _is_indexable_file(path) and mentions_any(_read_text(path), names):
-            found.add(rel_path)
+    node's name, at most _MAX_MENTION_RELINKS of them.
+
+    A name some node outside the batch already has is answered from the
+    graph: the Documents already MENTIONing that (label, name) are exactly
+    the ones that mention it. Only names new to the whole graph need a text
+    check of each Markdown file (the extractor's own matching), which stops
+    once the cap is exceeded.
+    """
+    candidates = [
+        rel_path
+        for rel_path in sorted(engine.list_indexed_files(repo_id))
+        if rel_path.endswith((".md", ".markdown")) and rel_path not in batch
+    ]
+    if not candidates:
+        return set()
+    existing = engine.find_mentioning_documents(repo_id, sorted(added), batch_keys)
+    found = {doc for docs in existing.values() for doc in docs} & set(candidates)
+    new_names = {name for label, name in added if (label, name) not in existing}
+    if new_names:
+        for rel_path in candidates:
+            if len(found) > _MAX_MENTION_RELINKS:
+                break
+            path = root / rel_path
+            if rel_path not in found and _is_indexable_file(path) and mentions_any(_read_text(path), new_names):
+                found.add(rel_path)
+    if len(found) > _MAX_MENTION_RELINKS:
+        logger.warning(
+            "%s: more than %d Markdown files mention names this batch added; relinking the first %d, "
+            "the rest link on the next rescan",
+            repo_id, _MAX_MENTION_RELINKS, _MAX_MENTION_RELINKS,
+        )
+        found = set(sorted(found)[:_MAX_MENTION_RELINKS])
     return found
 
 

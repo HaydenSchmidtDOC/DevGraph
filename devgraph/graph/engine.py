@@ -550,6 +550,37 @@ class GraphEngine:
             records = result or []
             return {(record["label"], record["name"]) for record in records}
 
+    def find_mentioning_documents(
+        self, repo_id: str, pairs: list[tuple[str, str]], batch_keys: list[str]
+    ) -> dict[tuple[str, str], set[str]]:
+        """For each (label, name) in `pairs` that some node outside the batch
+        (provenance not in `batch_keys`) already has, the Documents that
+        MENTION a node of that label and name.
+
+        Mention edges resolve by name, so a Document that mentions an
+        existing `get` is exactly the set that should also link a newly added
+        `get`; pairs absent from the result are new to the whole graph.
+        """
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) "
+                "WHERE n.name IN $names "
+                "  AND NOT coalesce(n.file, n.source_file, '') IN $batch_keys "
+                "  AND NOT (n:Module AND n.name IN $batch_keys) "
+                "WITH DISTINCT labels(n)[0] AS label, n.name AS name "
+                "WHERE [label, name] IN $pairs "
+                "OPTIONAL MATCH (d:Document {repo_id: $repo_id})-[:MENTIONS]->(m {repo_id: $repo_id, name: name}) "
+                "WHERE label IN labels(m) "
+                "RETURN label, name, collect(DISTINCT d.name) AS docs",
+                repo_id=repo_id,
+                names=sorted({name for _label, name in pairs}),
+                pairs=[[label, name] for label, name in pairs],
+                batch_keys=batch_keys,
+            )
+            records = result or []
+            return {(record["label"], record["name"]): set(record["docs"]) for record in records}
+
     def find_handler_stub_sources(self, repo_id: str, names: list[str]) -> set[str]:
         """Return the route files that left a file-less handler stub
         `Function` named one of `names` (see apis/extractor.py): the files

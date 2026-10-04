@@ -343,6 +343,7 @@ def index_file(
     file_path: str | Path,
     repo_root: str | Path | None = None,
     ambiguous_mode: str = "all",
+    names: set[str] | None = None,
 ) -> None:
     """Extract a mentions file and upsert results into the graph.
 
@@ -356,6 +357,9 @@ def index_file(
             into one Document node. When omitted, falls back to the bare filename
             for backwards compatibility, but loses the collision-prevention benefit.
         ambiguous_mode: How to handle ambiguous names: "all" (link all) or "skip" (skip).
+        names: When given, only match entities with one of these names -- for
+            linking an unchanged file to newly added entities without
+            re-matching every name in the repo. Existing edges are kept.
 
     Raises:
         FileNotFoundError: If the file does not exist.
@@ -367,13 +371,13 @@ def index_file(
     content = file_path.read_text(encoding="utf-8")
     doc_name = _document_name(file_path, repo_root)
 
-    # Query all entity names/labels in this repo
+    # Query all entity names/labels in this repo (or just `names`)
     query = """
     MATCH (n {repo_id: $repo_id})
-    WHERE n.name IS NOT NULL
+    WHERE n.name IS NOT NULL AND ($names IS NULL OR n.name IN $names)
     RETURN DISTINCT n.name as name, labels(n)[0] as label
     """
-    results = engine.run_cypher(query, {"repo_id": repo_id})
+    results = engine.run_cypher(query, {"repo_id": repo_id, "names": sorted(names) if names is not None else None})
     known_entities = [(row["name"], row["label"]) for row in results]
 
     # Extract mentions
