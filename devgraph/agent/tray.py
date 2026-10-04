@@ -96,7 +96,7 @@ class TrayApp:
         self._icon: pystray.Icon | None = None  # type: ignore[valid-type]
         self._last_seen_registry_change = self._registry.last_changed_at()
         self._events = EventBroadcaster()
-        self._schema_rescans = SchemaRescanScheduler(self._engine, self._registry, on_rescanned=self._on_schema_rescanned)
+        self._schema_rescans = SchemaRescanScheduler(self._engine, self._registry, on_rescanned=self._on_schema_rescanned, is_paused=lambda: self._paused)
         self._dashboard_loop: asyncio.AbstractEventLoop | None = None
         self._dashboard_server: uvicorn.Server | None = None
         self._dashboard_thread: threading.Thread | None = None

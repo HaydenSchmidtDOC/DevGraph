@@ -34,6 +34,7 @@ class SchemaRescanScheduler:
         quiet_s: float = QUIET_PERIOD_S,
         interval_s: float = CHECK_INTERVAL_S,
         clock: Callable[[], float] = time.monotonic,
+        is_paused: Callable[[], bool] | None = None,
     ) -> None:
         self._engine = engine
         self._registry = registry
@@ -41,10 +42,13 @@ class SchemaRescanScheduler:
         self._quiet_s = quiet_s
         self._interval_s = interval_s
         self._clock = clock
+        self._is_paused = is_paused
         # repo_id -> (pending hash, when it was first seen)
         self._seen: dict[str, tuple[str, float]] = {}
         # repo_id -> hash that failed to resolve; skipped until the file changes
         self._invalid: dict[str, str] = {}
+        # repos whose last check raised; warn once per streak
+        self._failing: set[str] = set()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -54,14 +58,19 @@ class SchemaRescanScheduler:
 
     def run_once(self) -> list[str]:
         rescanned: list[str] = []
+        if self._is_paused is not None and self._is_paused():
+            return rescanned
         now = self._clock()
         for repo in self._registry.list_repos(active_only=True):
             if self._stop.is_set():
                 break
+            if not repo.watch_enabled:
+                continue
             try:
                 if not schema_pending(self._engine, repo.repo_id, repo.path):
                     self._seen.pop(repo.repo_id, None)
                     self._invalid.pop(repo.repo_id, None)
+                    self._failing.discard(repo.repo_id)
                     continue
                 current = schema_file_hash(repo.path)
                 seen = self._seen.get(repo.repo_id)
@@ -80,6 +89,13 @@ class SchemaRescanScheduler:
                     self._engine, repo.repo_id, repo.path,
                     docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
                 )
+                self._failing.discard(repo.repo_id)
+                if schema_pending(self._engine, repo.repo_id, repo.path):
+                    self._invalid[repo.repo_id] = current
+                    logger.warning(
+                        "project schema for %s could not be applied; not retried until the file changes", repo.repo_id
+                    )
+                    continue
                 self._registry.mark_indexed(repo.repo_id)
                 self._seen.pop(repo.repo_id, None)
                 rescanned.append(repo.repo_id)
@@ -90,7 +106,12 @@ class SchemaRescanScheduler:
                     except Exception:
                         logger.debug("schema rescan callback failed for %s", repo.repo_id, exc_info=True)
             except Exception:
-                logger.warning("schema rescan check failed for %s", repo.repo_id, exc_info=True)
+                first = repo.repo_id not in self._failing
+                self._failing.add(repo.repo_id)
+                logger.log(
+                    logging.WARNING if first else logging.DEBUG,
+                    "schema rescan check failed for %s", repo.repo_id, exc_info=True,
+                )
         return rescanned
 
     def start(self) -> None:

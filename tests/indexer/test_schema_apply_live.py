@@ -5,8 +5,8 @@ import textwrap
 import pytest
 
 from devgraph.config.project_schema import ABSENT_SCHEMA_HASH, schema_file_hash
-from devgraph.graph.engine import GraphEngine, provision_repository_schema
-from devgraph.indexer.dispatch import apply_project_schema, full_scan, index_paths, remove_paths, schema_pending
+from devgraph.graph.engine import GraphEngine
+from devgraph.indexer.dispatch import apply_project_schema, full_scan, index_paths, schema_pending
 
 REPO = "_smoketest_schema_apply"
 WORKTREE = """

@@ -565,6 +565,7 @@ class GraphEngine:
     def record_applied_schema(
         self, repo_id: str, schema_hash: str, labels: list[str], relationship_types: list[str]
     ) -> None:
+        """Record the schema hash and user labels/relationship types the repo's graph was last built with."""
         with self._driver.session() as session:
             _retry_transient(
                 session.run, _RECORD_APPLIED_SCHEMA_CYPHER, repo_id=repo_id, hash=schema_hash,

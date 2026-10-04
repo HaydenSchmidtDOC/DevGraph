@@ -139,7 +139,8 @@ def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> 
     types the previously applied schema declared but this one doesn't
     (built-ins are never touched), re-syncs the filesystem provider, and
     records the applied state. An invalid schema or a provisioning failure
-    returns False with the graph untouched.
+    returns False with the graph untouched; errors from the deletion or
+    reconcile steps propagate.
     """
     current_hash = schema_file_hash(repo_root)
     try:
@@ -713,6 +714,8 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
     that was down or missed events — not just adds/updates what's current.
     A full scan also applies the project schema (see apply_project_schema),
     which reconciles filesystem-provider nodes (see providers/filesystem.py).
+    A schema that cannot be applied leaves the repository pending; callers
+    that care check schema_pending afterwards.
     """
     prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
     all_files = _indexable_paths(repo_root)
