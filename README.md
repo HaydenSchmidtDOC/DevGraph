@@ -51,7 +51,7 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 | Check installation and graph health | `devgraph status`, `devgraph doctor`, `devgraph self-test [repo_id]` |
 | Open the dashboard | `devgraph dashboard` |
 | Configure an MCP client | `devgraph client-config`, `devgraph mcp add`, `devgraph mcp doctor` |
-| View settings, project schema, or tray logs | `devgraph config`, `devgraph config show / validate / eject`, `devgraph logs` |
+| View settings, project schema, or tray logs | `devgraph config`, `devgraph config show / validate / eject / enable / disable`, `devgraph logs` |
 | Export a repository graph | `devgraph export <repo_id> --format json|cypher|dot` |
 | Update DevGraph | `devgraph update` |
 
@@ -92,7 +92,7 @@ Every indexable file becomes a `File` node and every directory containing one a 
 - A repository without the file behaves exactly as before.
 - DevGraph's built-in constraints are always provisioned, including under `extends: none`, because every registered repository shares one Neo4j database.
 - An invalid file fails before any graph write: `devgraph rescan` exits non-zero, while registration keeps the repository and reports a warning, the same way it already does when Neo4j is unreachable.
-- `devgraph doctor` reports each repository's schema as absent, valid, or invalid, and flags two repositories that declare the same label with incompatible keys — a conflict that would otherwise leave one of them with no constraint at all.
+- `devgraph doctor` reports each repository's schema as absent, valid, or invalid, and flags two repositories that declare the same label with incompatible keys — a conflict that would otherwise leave one of them with no constraint at all. It also marks disabled repositories and has a "Schema drift" section: for each repository, whether the applied schema matches the file (applied), a change is waiting for a rescan (pending, a warning), or it was never applied. The section is skipped when Neo4j is down.
 - An invalid file never removes filesystem nodes: indexing skips the provider and carries on with the built-in extractors.
 - Known limits of the filesystem provider:
   - A folder moved or trashed out of the repository as a whole may leave stale nodes until `devgraph rescan`, because the watcher ignores directory events.
@@ -100,6 +100,7 @@ Every indexable file becomes a `File` node and every directory containing one a 
   - On the dashboard, filesystem nodes share the unfiltered canvas with code nodes, and the `?label=` filter accepts built-in labels only.
   - A symlinked file is represented at its target's path.
 - `devgraph config validate` checks the file (or every registered repository's with `--all`) and exits non-zero on an invalid schema or a cross-repository conflict; `devgraph config show` prints the effective schema and where each entry comes from; `devgraph config eject` writes a commented starter file and never overwrites an existing one.
+- `devgraph config disable <repo_id>` switches a repository's project config off: its `devgraph.schema.yaml` and `devgraph.tools.yaml` are ignored, so it gets the built-in schema and serves no project tools (`devgraph://project-tools` says so). `devgraph config enable <repo_id>` switches it back on. The switch is stored in the registry and shown in the `Config` column of `devgraph list`; the schema change applies at the next rescan (`devgraph rescan <repo_id> --now` to apply immediately), while MCP sessions drop or regain project tools within 2 seconds. `config validate` still checks a disabled repository's files and reports it as disabled; `config show` says disabled and prints the built-in schema (`project_config: disabled` in JSON).
 - `devgraph config` alone still shows DevGraph's settings; a single setting is now `devgraph config settings <key>`, and secret settings are masked.
 
 ## Project tools (preview)
