@@ -2927,7 +2927,7 @@ let configModel = null;
 /* bumped by every page load and every block a write returns: a load answered
    after either is stale and dropped, so an older fingerprint never comes back */
 let configLoadSeq = 0;
-/* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, dryTarget, busy, label, armedAt } */
+/* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, dryTarget, dryYaml, busy, label, armedAt } */
 let configEdit = null;
 /* the open reset dialog: { scope, kind, phrase, fingerprint, review, stale, busy, ready, armedAt } */
 let configReset = null;
@@ -3208,6 +3208,9 @@ function renderConfigModal() {
   }
   /* the destination is what the dry run checked: it cannot change under a request */
   document.getElementById("configDest").disabled = !!edit.busy;
+  /* ...and neither can the text: typed meanwhile, it would be written unreviewed or lost on close */
+  /* a copy is the entry as shown; edit it in the destination afterwards */
+  document.getElementById("configYaml").readOnly = edit.op === "delete" || edit.op === "copy" || !!edit.busy;
   const save = document.getElementById("configModalSave");
   save.disabled = !!edit.busy;
   save.textContent = edit.busy || label;
@@ -3247,7 +3250,7 @@ function openConfigEditor(opts) {
     if (copy ? choices.some(c => c.value === s) : s === opts.scope || (isGlobal && opts.section === "tools")) fps[s] = configFingerprint(s, opts.section);
   });
   configEdit = { ...opts, dest: copy ? choices[0].value : opts.scope, step: isGlobal && opts.op !== "add" ? "warn" : "edit", fps,
-    confirmed: false, warnings: [], crossName: null, dryTarget: null, busy: "", label: null, armedAt: 0 };
+    confirmed: false, warnings: [], crossName: null, dryTarget: null, dryYaml: null, busy: "", label: null, armedAt: 0 };
   document.getElementById("configDestLabel").textContent = copy ? "Copy to" : "Save to";
   const dest = document.getElementById("configDest");
   dest.replaceChildren();
@@ -3260,8 +3263,6 @@ function openConfigEditor(opts) {
   dest.onchange = () => { configEdit.dest = dest.value; configEdit.crossName = null; configEdit.confirmed = false; renderConfigModal(); };
   const yaml = document.getElementById("configYaml");
   yaml.value = opts.yaml || "";
-  /* a copy is the entry as shown; edit it in the destination afterwards */
-  yaml.readOnly = opts.op === "delete" || copy;
   /* the text decides the name, so a known-taken name and any confirm are stale */
   yaml.oninput = () => { configEdit.crossName = null; if (configEdit.confirmed) { configEdit.confirmed = false; renderConfigModal(); } };
   document.getElementById("configModalSave").onclick = configSave;
@@ -3292,10 +3293,14 @@ async function configSave(ev) {
     configSetError("The destination changed while checking; " + (edit.op === "copy" ? "copy" : "save") + " again to check the new one.");
     return true;
   };
+  /* a confirm covers only the text its dry run checked: changed text (and the
+     name it may carry) is checked again before anything is written */
+  if (edit.confirmed && yaml !== edit.dryYaml) { edit.confirmed = false; edit.crossName = null; }
   try {
     configSetError("");
     if (!edit.confirmed) {
       busy("Checking…");
+      edit.dryYaml = yaml;
       let t = configEditTarget(edit);
       let dry = await send(t, true);
       if (configEdit !== edit || moved(t)) return;
@@ -3316,6 +3321,11 @@ async function configSave(ev) {
       warnings.push(...((dry.body && dry.body.warnings) || []).map(String));
       edit.dryTarget = t;
       if (warnings.length) { edit.confirmed = true; edit.warnings = warnings; return; }
+      /* no confirm step: write only the text just checked, and never close over text it did not */
+      if (document.getElementById("configYaml").value !== yaml) {
+        configSetError("The text changed while checking; save again to check it.");
+        return;
+      }
     }
     const t = configEditTarget(edit);
     if (moved(edit.dryTarget)) return;
