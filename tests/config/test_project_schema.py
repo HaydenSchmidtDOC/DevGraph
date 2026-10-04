@@ -104,6 +104,27 @@ def test_project_schema_path_is_the_repo_root_file(tmp_path):
     assert SCHEMA_FILENAME == "devgraph.schema.yaml"
 
 
+def test_schema_file_symlinked_outside_the_repo_is_refused(tmp_path):
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("version: 1\nmarker_outside_content: true\n", encoding="utf-8")
+    (repo / SCHEMA_FILENAME).symlink_to(outside)
+
+    with pytest.raises(ProjectSchemaError, match="must be inside the repository") as excinfo:
+        load_project_schema(repo)
+    assert "marker_outside_content" not in str(excinfo.value)
+    assert str(outside) not in str(excinfo.value)
+
+
+def test_schema_file_symlinked_within_the_repo_loads(tmp_path):
+    (tmp_path / "config").mkdir()
+    write_schema(tmp_path / "config", WIDGET)
+    (tmp_path / SCHEMA_FILENAME).symlink_to(tmp_path / "config" / SCHEMA_FILENAME)
+
+    assert load_project_schema(tmp_path) is not None
+
+
 # --- Acceptance 2: extends resolution ------------------------------------
 
 

@@ -42,6 +42,7 @@ from devgraph.graph.schema import (
     RESERVED_NODE_PROPERTIES,
 )
 from devgraph.graph.schema import constraint_statements as builtin_constraint_statements
+from devgraph.paths import is_within
 
 SCHEMA_FILENAME = "devgraph.schema.yaml"
 SCHEMA_VERSION = 1
@@ -374,8 +375,9 @@ def load_project_schema(repo_root: Path) -> ProjectSchema | None:
     """Load and validate `devgraph.schema.yaml`, if the repository has one.
 
     Returns `None` if and only if the file is absent. An empty, malformed,
-    non-mapping or invalid file raises `ProjectSchemaError`; no partial
-    schema is ever returned.
+    non-mapping or invalid file, or one that resolves outside the
+    repository, raises `ProjectSchemaError`; no partial schema is ever
+    returned.
     """
     path = project_schema_path(repo_root)
     try:
@@ -383,6 +385,8 @@ def load_project_schema(repo_root: Path) -> ProjectSchema | None:
             return None
         if not path.is_file():
             raise ProjectSchemaError(f"{path}: project schema is not a regular file")
+        if not is_within(path.resolve(), repo_root):
+            raise ProjectSchemaError(f"{path}: project schema must be inside the repository")
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ProjectSchemaError(f"{path}: cannot be read: {exc}") from exc

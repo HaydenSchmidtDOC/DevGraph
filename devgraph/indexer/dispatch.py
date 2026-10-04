@@ -560,7 +560,11 @@ def _indexable_paths(repo_root: Path) -> set[Path]:
 
 
 def _links_outside(path: Path, repo_root: Path) -> bool:
-    """True for a symlink whose target resolves outside repo_root."""
+    """True for a symlink whose target resolves outside repo_root.
+
+    A symlink whose target cannot be resolved (OSError, e.g. a loop) is also
+    treated as outside, so it is skipped rather than followed.
+    """
     try:
         if not path.is_symlink() or is_within(path.resolve(), repo_root):
             return False

@@ -209,6 +209,19 @@ class TestIndexPaths:
         finally:
             engine.delete_repository(repo_id)
 
+    def test_markdown_in_sibling_of_docs_path_is_skipped(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_docs_sibling_prefix"
+        (temp_repo / "docs").mkdir()
+        (temp_repo / "docs-private").mkdir()
+        note = temp_repo / "docs-private" / "note.md"
+        note.write_text("---\ntype: requirement\nid: req-sibling\n---\n# Should not be indexed\n")
+
+        try:
+            count = index_paths(engine, repo_id, temp_repo, {note}, docs_path="docs")
+            assert count == 0
+        finally:
+            engine.delete_repository(repo_id)
+
     def test_path_outside_repo_root_is_skipped(self, engine, temp_repo):
         repo_id = "_smoketest_dispatch_outside"
         with tempfile.TemporaryDirectory() as other_dir:
@@ -226,6 +239,28 @@ class TestIndexPaths:
 
 
 class TestRemovePaths:
+    def test_sibling_directory_sharing_the_repo_name_prefix_is_skipped(self, engine):
+        repo_id = "_smoketest_dispatch_remove_sibling_prefix"
+        with tempfile.TemporaryDirectory() as parent:
+            repo_root = Path(parent) / "proj"
+            repo_root.mkdir()
+            (repo_root / "a.py").write_text("class KeepMe:\n    pass\n")
+            sibling = Path(parent) / "proj-private"
+            sibling.mkdir()
+
+            try:
+                index_paths(engine, repo_id, repo_root, {repo_root / "a.py"})
+                cleaned = remove_paths(engine, repo_id, repo_root, {sibling / "a.py"})
+                assert cleaned == 0
+
+                result = engine.run_cypher(
+                    "MATCH (c:Class {repo_id: $repo_id, name: 'KeepMe'}) RETURN COUNT(*) as c",
+                    {"repo_id": repo_id},
+                )
+                assert result[0]["c"] == 1
+            finally:
+                engine.delete_repository(repo_id)
+
     def test_removes_nodes_for_deleted_python_file(self, engine, temp_repo):
         repo_id = "_smoketest_dispatch_remove"
         py_file = temp_repo / "gone.py"

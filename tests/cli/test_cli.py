@@ -380,6 +380,33 @@ def test_cli_annotate_set_docs_path(runner, temp_git_repo, temp_registry_db):
         assert "devgraph/docs" in result.stdout
 
 
+def test_cli_annotate_note_refuses_sibling_prefix_path(runner, temp_registry_db, tmp_path):
+    """A note in a sibling directory that shares the repo's name prefix is
+    outside the repository and must be refused before anything is indexed."""
+    db_path, registry = temp_registry_db
+    repo_path = tmp_path / "proj"
+    repo_path.mkdir()
+    subprocess.run(["git", "init"], cwd=str(repo_path), capture_output=True, check=True)
+    sibling = tmp_path / "proj-private"
+    sibling.mkdir()
+    (sibling / "note.md").write_text("---\ntype: requirement\nid: req-x\n---\n# Note\n")
+
+    repo_id = registry.add_repo(repo_path).repo_id
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "index_doc_file") as index_doc_file:
+        result = runner.invoke(app, ["annotate", repo_id, "--note", "../proj-private/note.md"])
+
+    assert result.exit_code == 1
+    assert "note path must be inside the repository" in result.stdout
+    index_doc_file.assert_not_called()
+
+
 def test_cli_annotate_nonexistent_repo(runner, temp_registry_db):
     """Test 'devgraph annotate' with non-existent repo."""
     db_path, registry = temp_registry_db
