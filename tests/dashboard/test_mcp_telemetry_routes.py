@@ -70,6 +70,21 @@ def test_endpoint_carries_scoped_ids_and_normalises_legacy_lines(client):
         ("old_declared", "unscoped"), ("search_component", "builtin"), ("repo-a_f", "project")]
 
 
+def test_lines_with_a_non_string_tool_or_tool_id_are_skipped_not_a_500(client):
+    _record("search_component")
+    with mcp_server.telemetry_path().open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": 1, "tool": ["x"], "duration_ms": 1, "ok": True}) + "\n")
+        f.write(json.dumps({"ts": 2, "tool": {"a": 1}, "tool_id": "x", "duration_ms": 1, "ok": True}) + "\n")
+        f.write(json.dumps({"ts": 3, "tool": "t", "tool_id": ["y"], "origin": "project", "duration_ms": 1, "ok": True}) + "\n")
+    _record("impact_analysis")
+
+    res = client.get("/api/mcp-telemetry")
+
+    assert res.status_code == 200
+    assert [e["tool"] for e in res.json()["entries"]] == ["impact_analysis", "t", "search_component"]
+    assert all(isinstance(e["tool_id"], str) for e in res.json()["entries"])
+
+
 def test_endpoint_is_empty_when_nothing_has_been_recorded(client):
     res = client.get("/api/mcp-telemetry")
     assert res.status_code == 200

@@ -23,9 +23,9 @@ import colorsys
 import hashlib
 import inspect
 import json
-import sqlite3
 import logging
 import math
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -35,6 +35,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+from devgraph.config import edits
 from devgraph.config.project_schema import (
     ABSENT_SCHEMA_HASH,
     LABEL_PATTERN,
@@ -44,7 +45,6 @@ from devgraph.config.project_schema import (
     load_project_schema,
     schema_file_hash,
 )
-from devgraph.config import edits
 from devgraph.config.settings import get_settings
 from devgraph.dashboard import queries
 from devgraph.dashboard.config_model import GLOBAL_SCOPE, build_config, build_global, build_project, scrub
@@ -230,7 +230,7 @@ async def _json_payload(request: Request) -> dict:
 
     Strict `application/json` (what a cross-site page can't send without a
     preflight), at most `_CONFIG_PAYLOAD_LIMIT_BYTES` (checked on
-    Content-Length, then while reading), and the entry parsed with
+    Content-Length, then while reading), and the parsed body must be a JSON
     object.
     """
     media_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
@@ -792,7 +792,12 @@ def build_router(
         block = _config_scope(scope)
         part = block["tools"] if kind == "tools" else block["schema"]
         if result.written:
-            notes.append(f"Written to {path.name}; not committed.")
+            if result.removed is None:
+                notes.append(f"Written to {path.name}; not committed.")
+            elif root is None:
+                notes.append("Emptied the global tools store.")
+            else:
+                notes.append(f"Deleted {path.name}; not staged or committed.")
             # The fingerprint edits.py took under the lock, of exactly what was written: if the file
             # changed again since, the client's next write is a 412 rather than a blind overwrite.
             part["fingerprint"] = result.fingerprint
@@ -852,9 +857,8 @@ def build_router(
     async def reset_config_tools(scope: str, request: Request) -> JSONResponse:
         _reject_cross_site_config(request)
         record = _write_record(scope)
-        payload = await _json_payload(request)
+        dry = _body_dry_run(await _json_payload(request))
         expected = _if_match(request)
-        dry = _body_dry_run(payload)
         return await run_in_threadpool(
             _apply_edit, scope, record, "tools",
             lambda root: edits.reset_tools(root, record=record, expected_fingerprint=expected, dry_run=dry), False,
@@ -864,9 +868,8 @@ def build_router(
     async def reset_config_schema(scope: str, request: Request) -> JSONResponse:
         _reject_cross_site_config(request)
         record = _write_record(scope, schema=True)
-        payload = await _json_payload(request)
+        dry = _body_dry_run(await _json_payload(request))
         expected = _if_match(request)
-        dry = _body_dry_run(payload)
         return await run_in_threadpool(
             _apply_edit, scope, record, "schema",
             lambda root: edits.reset_schema(root, record=record, expected_fingerprint=expected, dry_run=dry), False,

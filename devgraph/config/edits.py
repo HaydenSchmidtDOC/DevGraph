@@ -150,6 +150,14 @@ def read_text(path: Path) -> str:
         raise ConfigEditError(f"{path}: cannot be read: {exc}", "unreadable")
 
 
+def read_text_lossy(path: Path) -> str:
+    """Like `read_text`, but "" when the file cannot be read: the project-config toggle only warns, so a broken file must not block it."""
+    try:
+        return read_text(path)
+    except ConfigEditError:
+        return ""
+
+
 def write_atomically(path: Path, text: str) -> None:
     """Replace `path` with `text` via a temporary file in the same directory, keeping its mode."""
     mode = path.stat().st_mode & 0o7777 if path.exists() else None
@@ -706,6 +714,7 @@ def reset_tools(
     A dry run changes nothing and reports the fingerprint of the exact bytes it listed (what a confirm must match).
     """
     from devgraph.config.global_tools import ProjectToolsError, load_global_tools, save_global_tools
+    from devgraph.mcp.catalog import builtin_tool_names
 
     path = tools_path(root)
     with _guard(path, expected_fingerprint):
@@ -725,7 +734,9 @@ def reset_tools(
                 store = load_global_tools()
             except ProjectToolsError:
                 store = None
-            served = {t.name for t in store.tools} if store is not None else set()
+            builtin = builtin_tool_names()
+            serves_project = record is None or record.project_config_enabled
+            served = {t.name for t in store.tools if t.name not in builtin} if store is not None and serves_project else set()
             where = record.repo_id if record is not None else path.parent.name
             notes += [f"After the reset, global tool {n} is served in {where}." for n in names if n in served]
         if dry_run:
@@ -783,24 +794,37 @@ def project_config_notes(repo_id: str) -> list[str]:
 
 
 def project_config_change(record: Any, enabled: bool) -> tuple[list[str], list[str]]:
-    """(warnings, notes) of switching `record`'s project config on or off. Pure; nothing is written."""
-    from devgraph.config.project_schema import project_schema_path
-    from devgraph.mcp.tool_plane import resolve_tools
+    """(warnings, notes) of switching `record`'s project config on or off. Pure; nothing is written.
 
-    path = project_schema_path(Path(record.path))
+    The project tools that stop being served are read from the tools file itself, not from what the
+    tool plane resolves now, so the answer does not depend on the switch's current position.
+    """
+    from devgraph.config.global_tools import ProjectToolsError, load_global_tools
+    from devgraph.config.project_schema import project_schema_path
+    from devgraph.config.project_tools import parse_project_tools, tools_file_path
+    from devgraph.mcp.catalog import builtin_tool_names
+
+    root = Path(record.path)
+    path = project_schema_path(root)
     decl = schema_declaration(read_text_lossy(path), path) if path.is_file() else None
     warnings = schema_change_warnings(None, decl, record) if enabled else schema_change_warnings(decl, None, record)
-    if not enabled:
-        origins = resolve_tools(record).origins
-        names = sorted(n for n, origin in origins.items() if origin.startswith("project"))
+    tools_file = tools_file_path(root)
+    if not enabled and tools_file.is_file():
+        try:
+            names = sorted({t.name for t in parse_project_tools(read_text(tools_file), tools_file).tools} - builtin_tool_names())
+        except (ConfigEditError, ProjectToolsError):
+            warnings.append(
+                f"{tools_file.name} is invalid; project tools may still be served from the last good file "
+                f"until the session restarts."
+            )
+            names = []
         if names:
             warnings.append(f"Project tools no longer served in {record.repo_id}: {', '.join(names)}")
+            try:
+                store = load_global_tools()
+            except ProjectToolsError:
+                store = None
+            takeover = [n for n in names if store is not None and any(t.name == n for t in store.tools)]
+            if takeover:
+                warnings.append(f"Global tools of the same name take over in {record.repo_id}: {', '.join(takeover)}")
     return warnings, project_config_notes(record.repo_id)
-
-
-def read_text_lossy(path: Path) -> str:
-    """The file's text, or "" when it cannot be read (a reset must not be blocked by a broken file)."""
-    try:
-        return read_text(path)
-    except ConfigEditError:
-        return ""

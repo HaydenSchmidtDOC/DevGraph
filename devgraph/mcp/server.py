@@ -198,7 +198,8 @@ def read_tool_telemetry(limit: int) -> list[dict[str, Any]]:
     anything beyond the six allowed fields to the API. Records written before
     scoped ids are normalised here, not migrated: a missing or non-string
     `tool_id` becomes `tool`, and a missing or unknown `origin` becomes
-    `builtin` for a built-in name and `unscoped` otherwise.
+    `builtin` for a built-in name and `unscoped` otherwise. A line whose `tool` is present but not a string is
+    skipped like any other unreadable line.
     """
     try:
         raw = telemetry_path().read_text(encoding="utf-8", errors="replace")
@@ -214,6 +215,8 @@ def read_tool_telemetry(limit: int) -> list[dict[str, Any]]:
         if isinstance(entry, dict):
             record = {field: entry[field] for field in _TELEMETRY_FIELDS if field in entry}
             if "tool" in record:
+                if not isinstance(record["tool"], str):
+                    continue
                 if not isinstance(record.get("tool_id"), str):
                     record["tool_id"] = record["tool"]
                 if record.get("origin") not in _TELEMETRY_ORIGINS:

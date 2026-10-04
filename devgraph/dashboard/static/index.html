@@ -75,6 +75,9 @@ code { font-family: var(--font-mono); }
 .btn:hover { background: rgba(255,255,255,0.06); color: var(--fg); border-color: rgba(255,255,255,0.14); }
 .btn-primary { background: var(--accent); color: var(--accent-on); border-color: var(--accent); }
 .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-on); }
+.btn-danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+.btn-danger:hover { background: color-mix(in oklab, var(--danger), black 15%); border-color: color-mix(in oklab, var(--danger), black 15%); color: #fff; }
+.btn-danger:disabled { opacity: 0.45; }
 .btn-sm { padding: 5px 10px; font-size: 12px; }
 
 /* ── themed custom select (replaces OS-default white dropdown lists) ── */
@@ -807,7 +810,7 @@ table.dstable input[type="text"] { width: 100%; }
   <div class="cfg-reset-list" id="configResetList"></div>
   <div class="field" id="configResetPhraseField" style="display:none"><label for="configResetTyped" id="configResetPhraseLabel"></label><input type="text" id="configResetTyped" autocomplete="off" spellcheck="false" /></div>
   <div class="cfg-error" id="configResetError" style="display:none"></div>
-  <div class="modal-actions"><button class="btn btn-sm" id="configResetRecheck" style="display:none">Re-check</button><button class="btn btn-sm" id="configResetCancel">Cancel</button><button class="btn btn-sm btn-primary" id="configResetConfirm" disabled>Reset</button></div>
+  <div class="modal-actions"><button class="btn btn-sm" id="configResetRecheck" style="display:none">Re-check</button><button class="btn btn-sm" id="configResetCancel">Cancel</button><button class="btn btn-sm btn-danger" id="configResetConfirm" disabled>Reset</button></div>
 </div></div>
 <div id="tooltipBubble"></div>
 <div id="gitHoverCard"></div>
@@ -2950,6 +2953,8 @@ let configEdit = null;
 let configReset = null;
 /* per repo: the project-config switch's last action { busy, confirm, error, notes, armedAt }; survives re-renders */
 const configToggles = {};
+/* per scope: what its last reset reported, shown under the card header until the next config reload */
+const configOutcomes = {};
 
 function configEl(tag, cls, text) {
   const el = document.createElement(tag);
@@ -3036,6 +3041,13 @@ function renderConfigScope(scope, block) {
   if (!isGlobal) head.appendChild(configToggleEl(block));
   card.appendChild(head);
   if (!isGlobal && configToggles[scope]) card.appendChild(configToggleMsgEl(scope, configToggles[scope]));
+  if (configOutcomes[scope]) {
+    const box = configEl("div", "cfg-toggle-msg");
+    const ul = configEl("ul", "");
+    configOutcomes[scope].forEach(t => ul.appendChild(configEl("li", "", t)));
+    box.appendChild(ul);
+    card.appendChild(box);
+  }
   const add = section => ({ noun: CONFIG_SECTIONS[section].noun,
     fn: () => openConfigEditor({ scope, section, op: "add", name: null, yaml: CONFIG_SECTIONS[section].template }) });
   /* a file that is not there has nothing to reset; an invalid one is when Reset matters most */
@@ -3315,6 +3327,8 @@ function configResetPhrase(scope) {
 function configResetReady(typed, phrase) {
   return typeof typed === "string" && typed.length > 0 && typed === phrase;
 }
+const CONFIG_RESET_RECOVERY = "Git can restore a tracked file; an untracked file or the global store cannot be restored.";
+const CONFIG_RESET_UNRECOVERABLE_GLOBAL = "The global tools store cannot be restored: it is not tracked by git, so emptying it is permanent.";
 const CONFIG_RESET_UNREADABLE = "The file is not valid YAML; its whole contents are removed.";
 function describeConfigReset(response) {
   const r = (response && response.removed) || {};
@@ -3355,6 +3369,7 @@ function renderConfigReset() {
     else box.appendChild(configEl("div", "", "Nothing is declared in this file."));
     section("Check before resetting:", rs.review.warnings, "cfg-confirm");
     section("After the reset:", rs.review.notes, "cfg-sub");
+    box.appendChild(configEl("div", "cfg-confirm", rs.scope === CONFIG_GLOBAL ? CONFIG_RESET_UNRECOVERABLE_GLOBAL : CONFIG_RESET_RECOVERY));
   }
   configShow("configResetPhraseField", !!rs.review);
   document.getElementById("configResetPhraseLabel").textContent = "Type " + rs.phrase + " to reset";
@@ -3434,12 +3449,17 @@ async function configResetConfirm(ev) {
   }
   if (mine) configCloseReset();
   /* reset even if the dialog was cancelled meanwhile: the page shows what is on disk */
-  configSetStatus([...(res.body.warnings || []), ...(res.body.notes || [])].map(String)
-    .concat("Git can restore a tracked file; an untracked file or the global store cannot be restored."));
+  const outcome = [...(res.body.warnings || []), ...(res.body.notes || [])].map(String);
+  configSetStatus(outcome);
+  configOutcomes[rs.scope] = outcome;
   applyConfigScope(rs.scope, res.body.scope);
   if (res.body.global && rs.scope !== CONFIG_GLOBAL) applyConfigScope(CONFIG_GLOBAL, res.body.global);
   /* emptying the global store changes every repo's "overrides global" badges */
-  if (rs.scope === CONFIG_GLOBAL) await loadConfigPage(true);
+  if (rs.scope === CONFIG_GLOBAL) {
+    await loadConfigPage(true);
+    configOutcomes[rs.scope] = outcome;
+    configRerender(rs.scope);
+  }
 }
 /* kind: tools|schema */
 function openConfigReset(scope, kind) {
@@ -3524,7 +3544,9 @@ async function toggleProjectConfig(repoId, enabled, confirmed) {
       if (configToggles[repoId] === st) st.error = describeConfigError(res.status, res.body && res.body.detail);
       return;
     }
-    if (configToggles[repoId] === st) st.notes = [...(res.body.warnings || []), ...(res.body.notes || [])].map(String);
+    const outcome = [...(res.body.warnings || []), ...(res.body.notes || [])].map(String);
+    if (configToggles[repoId] === st) st.notes = outcome;
+    configSetStatus(outcome);
     st.busy = "";
     applyConfigScope(repoId, res.body.scope);
     /* the global card's "Overridden in" badges depend on which repos serve project tools */
@@ -3544,6 +3566,8 @@ async function loadConfigPage(quiet) {
   if (seq !== configLoadSeq) return;
   if (!res.ok) { configSetStatus("Could not load config: " + describeConfigError(res.status, res.body && res.body.detail)); return; }
   if (!quiet) configSetStatus("");
+  Object.values(configToggles).forEach(t => { t.notes = []; });
+  for (const k of Object.keys(configOutcomes)) delete configOutcomes[k];
   renderConfigPage(res.body);
 }
 /* ── end Config page ── */

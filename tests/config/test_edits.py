@@ -394,6 +394,17 @@ def test_reset_tools_project_notes_global_takeover(tmp_path, store):
     assert result.notes == ["After the reset, global tool count_things is served in repo-a."]
 
 
+def test_reset_tools_takeover_note_only_when_the_global_tool_is_served(tmp_path, store, monkeypatch):
+    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
+    edits.add_tool(None, TOOL)
+    off = edits.reset_tools(tmp_path, record=record(project_config_enabled=False), dry_run=True)
+    assert off.notes == []
+    from devgraph.mcp import catalog
+
+    monkeypatch.setattr(catalog, "builtin_tool_names", lambda: frozenset({"count_things"}))
+    assert edits.reset_tools(tmp_path, record=record(), dry_run=True).notes == []
+
+
 def test_reset_tools_global_empties_the_store(store):
     edits.add_tool(None, TOOL)
     dry = edits.reset_tools(None, dry_run=True)
@@ -485,7 +496,7 @@ def test_project_config_notes_match_the_cli_wording():
     ]
 
 
-def test_disabling_warns_about_project_node_types_and_unserved_tools(tmp_path, no_registry):
+def test_disabling_warns_about_project_node_types_and_unserved_tools(tmp_path, no_registry, store):
     (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
     (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
 
@@ -496,7 +507,26 @@ def test_disabling_warns_about_project_node_types_and_unserved_tools(tmp_path, n
     assert notes == edits.project_config_notes("repo-a")
 
 
-def test_enabling_and_bare_repos_have_no_warnings(tmp_path, no_registry):
+def test_disabling_reads_the_tools_file_whatever_the_switch_says_and_names_global_takeovers(tmp_path, no_registry, store):
+    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
+    edits.add_tool(None, TOOL)
+
+    warnings, _ = edits.project_config_change(record(path=tmp_path, project_config_enabled=False), False)
+
+    assert "Project tools no longer served in repo-a: count_things" in warnings
+    assert "Global tools of the same name take over in repo-a: count_things" in warnings
+
+
+def test_disabling_with_an_invalid_tools_file_says_the_last_good_file_may_still_be_served(tmp_path, no_registry, store):
+    (tmp_path / "devgraph.tools.yaml").write_text("tools: [unclosed")
+
+    warnings, _ = edits.project_config_change(record(path=tmp_path), False)
+
+    assert any("invalid" in w and "may still be served from the last good file until the session restarts" in w for w in warnings)
+    assert not any("no longer served" in w for w in warnings)
+
+
+def test_enabling_and_bare_repos_have_no_warnings(tmp_path, no_registry, store):
     assert edits.project_config_change(record(path=tmp_path), False)[0] == []
     (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
     assert edits.project_config_change(record(path=tmp_path, project_config_enabled=False), True)[0] == []

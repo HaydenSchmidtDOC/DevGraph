@@ -25,10 +25,10 @@ from devgraph.agent import lifecycle
 from devgraph.cli._env import resolve_podman, resolve_repo_root, resolve_venv_python
 from devgraph.cli.exporters import export_cypher, export_dot, export_json
 from devgraph.config import get_settings
-from devgraph.config.edits import project_config_notes as _project_config_notes
 from devgraph.config.edits import GLOBAL_TOOLS_NOTE as _GLOBAL_TOOLS_NOTE
 from devgraph.config.edits import SCHEMA_SECTIONS as _SCHEMA_SECTIONS
 from devgraph.config.edits import TOOLS_RELOAD_NOTE as _TOOLS_RELOAD_NOTE
+from devgraph.config.edits import project_config_notes as _project_config_notes
 from devgraph.config.edits import removed_types as _removed_types  # noqa: F401  (kept importable from here)
 from devgraph.dashboard import queries as dashboard_queries
 from devgraph.dashboard.url import dashboard_url

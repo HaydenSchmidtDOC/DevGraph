@@ -1183,7 +1183,9 @@ def test_reset_project_tools_dry_run_then_delete(client, registry, tmp_path, glo
     assert done.status_code == 200, done.text
     assert not path.exists() and done.json()["written"] is True and done.json()["fingerprint"] == "absent"
     assert done.json()["scope"]["tools"]["state"] == "absent"
-    assert "global" in done.json() and f"Written to {TOOLS_FILENAME}; not committed." in done.json()["notes"]
+    assert "global" in done.json()
+    assert f"Deleted {TOOLS_FILENAME}; not staged or committed." in done.json()["notes"]
+    assert not any("Written to" in n for n in done.json()["notes"])
 
 
 def test_reset_global_tools_empties_the_store(client, global_store):
@@ -1193,6 +1195,8 @@ def test_reset_global_tools_empties_the_store(client, global_store):
     assert dry.json()["removed"] == {"tools": ["hot_paths", "other"]} and len(json.loads(global_store.read_text())["tools"]) == 2
     done = _send(client, "POST", "/api/config/__global__/reset/tools", fp, {})
     assert done.status_code == 200 and json.loads(global_store.read_text())["tools"] == []
+    assert "Emptied the global tools store." in done.json()["notes"]
+    assert not any("Written to" in n or "Deleted" in n for n in done.json()["notes"])
     assert done.json()["scope"]["tools"]["entries"] == [] and done.json()["global"]["tools"]["entries"] == []
 
 
@@ -1206,6 +1210,7 @@ def test_reset_schema_dry_run_then_delete(client, registry, tmp_path):
     assert any("Widget" in w for w in dry.json()["warnings"]) and path.exists()
     done = _send(client, "POST", "/api/config/repo-a/reset/schema", fp, {})
     assert done.status_code == 200 and not path.exists()
+    assert f"Deleted {SCHEMA_FILENAME}; not staged or committed." in done.json()["notes"]
     assert done.json()["scope"]["schema"]["state"] == "absent" and "global" not in done.json()
 
 

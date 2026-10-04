@@ -673,7 +673,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
         removed: { tools: [HOSTILE, "hot_paths"] }, warnings: [RWARN], notes: ["After the reset, global tool hot_paths is served in repo-a."],
         scope: project("repo-a"), global: globalBlock() } }
     : { status: 200, body: { ok: true, written: true, file: "devgraph.tools.yaml", fingerprint: "absent", removed: { tools: [HOSTILE, "hot_paths"] },
-        warnings: [], notes: ["Written to devgraph.tools.yaml; not committed."], scope: afterA, global: afterG } };
+        warnings: [], notes: ["Deleted devgraph.tools.yaml; not staged or committed."], scope: afterA, global: afterG } };
   await buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0].fire("click");
   check("Reset opens the dialog and sends only a dry run, with the page's fingerprint",
     els.configResetModal.classList.contains("open") && fetchCalls.length === 1 && fetchCalls[0].url === "/api/config/repo-a/reset/tools" &&
@@ -686,6 +686,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("...the dry run's list comes before the phrase input",
     html.indexOf('id="configResetList"') < html.indexOf('id="configResetPhraseField"') && shown(els.configResetPhraseField),
     "phrase input before the list");
+  const recoverText = els.configResetList.textContent;
   check("...which asks for the repo id", els.configResetPhraseLabel.textContent === "Type repo-a to reset", els.configResetPhraseLabel.textContent);
   check("Reset is disabled before the name is typed", els.configResetConfirm.disabled === true, String(els.configResetConfirm.disabled));
   els.configResetTyped.value = "Repo-a";
@@ -708,9 +709,16 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("...re-renders the repo's card from the response (no file, so no Reset)",
     buttons(card("repo-a"), "Reset devgraph.tools.yaml…").length === 0, card("repo-a").textContent);
   check("...and the global card from its block", !!rowFor(card("__global__"), "after_reset_marker"), card("__global__").textContent);
-  check("...the status says what was written and that git is the only way back",
-    els.configStatus.textContent.includes("not committed") && els.configStatus.textContent.includes("Git can restore a tracked file"),
-    els.configStatus.textContent);
+  check("...the status says what was deleted, not 'written', and the card carries the same outcome",
+    els.configStatus.textContent.includes("Deleted devgraph.tools.yaml; not staged or committed.") && !els.configStatus.textContent.includes("Written") &&
+    card("repo-a").textContent.includes("Deleted devgraph.tools.yaml; not staged or committed."), els.configStatus.textContent);
+  check("...the recoverability sentence was shown in the dialog, before the typed phrase (it is in the list above the phrase field)",
+    recoverText.includes("Git can restore a tracked file; an untracked file or the global store cannot be restored."), recoverText);
+  check("the dialog's Reset button is styled as destructive", /class="[^"]*btn-danger[^"]*" id="configResetConfirm"/.test(html), "no btn-danger");
+  configPayload = MODEL();
+  await api.loadConfigPage();
+  configPayload = null;
+  check("a config reload clears the card's reset outcome", !card("repo-a").textContent.includes("Deleted devgraph.tools.yaml"), card("repo-a").textContent);
 
   // 21. reset: 412 clears the name and offers Re-check; nothing is deleted
   api.renderConfigPage(MODEL());
@@ -758,6 +766,9 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   els.configResetTyped.value = "__global__";
   await els.configResetTyped.fire("input");
   check("...the scope token is not accepted", els.configResetConfirm.disabled === true, String(els.configResetConfirm.disabled));
+  check("...and the dialog says plainly the global store cannot be restored",
+    els.configResetList.textContent.includes("cannot be restored") && !els.configResetList.textContent.includes("Git can restore"),
+    els.configResetList.textContent);
   els.configResetTyped.value = "global";
   await els.configResetTyped.fire("input");
   await press(els.configResetConfirm);
@@ -896,6 +907,11 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     switchOf("repo-a").checked === false && card("repo-a").textContent.includes("Project config disabled") &&
     NOTES.every(n => card("repo-a").textContent.includes(n)), card("repo-a").textContent);
   check("...and the global card from its block", !!rowFor(card("__global__"), "after_reset_marker"), card("__global__").textContent);
+  check("...the notes also show in the top status", NOTES.every(n => els.configStatus.textContent.includes(n)), els.configStatus.textContent);
+  configPayload = MODEL();
+  await api.loadConfigPage();
+  check("...and the card's toggle notes are gone after the next config reload", !card("repo-a").textContent.includes(NOTES[0]), card("repo-a").textContent);
+  configPayload = null;
 
   api.renderConfigPage(MODEL());
   fetchCalls = [];
