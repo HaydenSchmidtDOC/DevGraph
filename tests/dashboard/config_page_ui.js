@@ -63,7 +63,7 @@ const mkEl = tag => {
       for (let e = el; e; e = e.parentNode) {
         if (e.disabled && (e === el || e.tagName === "FIELDSET")) return;
         /* ...and nothing inside a modal that isn't open yet */
-        if (e === els.configModal && !e.classList.contains("open")) return;
+        if ((e === els.configModal || e === els.configResetModal) && !e.classList.contains("open")) return;
       }
       focused = el;
     },
@@ -99,6 +99,8 @@ nest("configModalWarn", ["configModalWarnText"]);
 nest("configModal", ["configModalTitle", "configModalWarn", "configDestField", "configEditorSwitch", "configFormHelp", "configFormNotice",
   "configFormScroll", "configYaml", "configModalConfirm", "configModalError", "configModalReload", "configModalCancel", "configModalSave"]);
 nest("configEditorSwitch", ["configModeForm", "configModeYaml"]);
+nest("configResetPhraseField", ["configResetPhraseLabel", "configResetTyped"]);
+nest("configResetModal", ["configResetTitle", "configResetList", "configResetPhraseField", "configResetError", "configResetRecheck", "configResetCancel", "configResetConfirm"]);
 const document = { getElementById: id => els[id] || null, createElement: mkEl, get activeElement() { return focused; } };
 
 let tooltips = [];
@@ -2060,6 +2062,103 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await typeIn(formCtl("Description"), A(1024) + "\uFEFF");
   check("...and a BOM counts: 1025 / 1024", descCount() === "1025 / 1024 characters", descCount());
   els.configModalCancel.fire("click");
+
+  // 44. the Reset dialog gets the editor's dialog handling
+  const rdlg = html.slice(html.indexOf('id="configResetModal"') - 40, html.indexOf('id="configResetTitle"'));
+  check("the Reset modal is a labelled modal dialog", /role="dialog"/.test(rdlg) && /aria-modal="true"/.test(rdlg) &&
+    /aria-labelledby="configResetTitle"/.test(rdlg), rdlg);
+  const inside = (el, root) => { for (let e = el; e; e = e.parentNode) if (e === root) return true; return false; };
+  const tickOnce = () => new Promise(r => setImmediate(r));
+  const rdry = { status: 200, body: { ok: true, written: false, file: "devgraph.tools.yaml", fingerprint: "sha256:dry-fp",
+    removed: { tools: ["hot_paths"] }, warnings: [], notes: [], scope: project("repo-a"), global: globalBlock() } };
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  respond = () => rdry;
+  const ropener = buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0];
+  let openGate;
+  gate = new Promise(r => { openGate = r; });
+  const opening = press(ropener);
+  await tickOnce();
+  check("opening Reset moves focus inside the dialog before the dry run answers", focused === els.configResetCancel, focused && focused.id);
+  openGate(); gate = null;
+  await opening;
+  check("...and onto the phrase input once the list is shown", focused === els.configResetTyped, focused && focused.id);
+  const rtab = (shift = false) => { const ev = { key: "Tab", shiftKey: shift, defaultPrevented: false, preventDefault() { ev.defaultPrevented = true; } }; api.configModalKey(ev); return ev; };
+  focused = els.configResetCancel;
+  check("Tab from Cancel wraps to the phrase input (the disabled Reset is skipped)", rtab().defaultPrevented && focused === els.configResetTyped, focused && focused.id);
+  check("Shift+Tab from the phrase input wraps to Cancel", rtab(true).defaultPrevented && focused === els.configResetCancel, focused && focused.id);
+  focused = els.configResetTyped;
+  check("Tab from the phrase input is left to the browser", !rtab().defaultPrevented && focused === els.configResetTyped, "");
+  focused = ropener;
+  check("Tab from outside the dialog pulls focus in", rtab().defaultPrevented && focused === els.configResetTyped, focused && focused.id);
+  els.configResetTyped.value = "repo-a";
+  await els.configResetTyped.fire("input");
+  clock += 1000;
+  api.configModalKey({ key: "Escape" });
+  check("Escape closes the dialog, returns focus to the opener and sends no reset", !els.configResetModal.classList.contains("open") &&
+    api.reset === null && focused === ropener && fetchCalls.length === 1 && body(fetchCalls[0]).dry_run === true, JSON.stringify(fetchCalls));
+  await press(ropener);
+  await els.configResetCancel.fire("click");
+  check("Cancel returns focus to the opener", focused === ropener && api.reset === null, focused && focused.id);
+  await press(ropener);
+  await els.configResetModal.onclick({ target: els.configResetModal });
+  check("an overlay click returns focus to the opener", focused === ropener && api.reset === null, focused && focused.id);
+
+  // 45. after a save or reset re-renders the card, focus lands on the same entry's Edit button, else its section's Add button
+  const FMNamed = (from, to) => { const m = FM(); m.projects[1].tools.entries.find(e => e.name === from).name = to; return m; };
+  const FMWithout = name => { const m = FM(); m.projects[1].tools.entries = m.projects[1].tools.entries.filter(e => e.name !== name); return m; };
+  const editBtn = (scope, name) => buttons(rowFor(card(scope), name), "Edit")[0];
+  const addBtn = (scope, section) => buttons(card(scope), "Add " + api.CONFIG_SECTIONS[section].noun)[0];
+  const answer = model => (url, init) => ({ status: 200, body: { ok: true, written: !(init.body && JSON.parse(init.body).dry_run), warnings: [], notes: [], scope: model.projects[1] } });
+  const desc = () => focused && focused.tagName + " " + focused.textContent;
+  api.renderConfigPage(FM());
+  configPayload = FM();
+  respond = answer(FM());
+  let old = editBtn("repo-b", "hot_paths");
+  await press(old);
+  await press(els.configModalSave);
+  check("a saved edit re-renders the card and focuses the same entry's new Edit button", api.edit === null && editBtn("repo-b", "hot_paths") !== old &&
+    focused === editBtn("repo-b", "hot_paths"), desc());
+  api.renderConfigPage(FM());
+  configPayload = FMNamed("hot_paths", "renamed");
+  respond = answer(configPayload);
+  await press(editBtn("repo-b", "hot_paths"));
+  await typeIn(formCtl("Name"), "renamed");
+  await press(els.configModalSave);
+  check("a renamed entry has no old-name Edit button, so focus goes to its section's Add button",
+    !rowFor(card("repo-b"), "hot_paths") && focused === addBtn("repo-b", "tools"), desc());
+  api.renderConfigPage(FM());
+  configPayload = FMWithout("hot_paths");
+  respond = answer(configPayload);
+  old = buttons(rowFor(card("repo-b"), "hot_paths"), "Delete")[0];
+  await press(old);
+  await press(els.configModalSave);
+  check("a deleted entry: focus goes to its section's Add button, not the removed opener", !rowFor(card("repo-b"), "hot_paths") &&
+    focused === addBtn("repo-b", "tools") && focused !== old, desc());
+  check("the card heading can take focus by script (the last resort)", find(card("repo-b"), e => e.tagName === "H3")[0].getAttribute("tabindex") === "-1", "no tabindex on the card heading");
+  // a reset: the file is gone, so its Reset button is too
+  api.renderConfigPage(MODEL());
+  const afterA2 = project("repo-a"); afterA2.tools.state = "absent"; afterA2.tools.fingerprint = "absent";
+  respond = (url, init) => JSON.parse(init.body).dry_run ? rdry
+    : { status: 200, body: { ok: true, written: true, file: "devgraph.tools.yaml", fingerprint: "absent", removed: { tools: ["hot_paths"] }, warnings: [], notes: [], scope: afterA2, global: globalBlock() } };
+  configPayload = MODEL();
+  await press(buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0]);
+  els.configResetTyped.value = "repo-a";
+  await els.configResetTyped.fire("input");
+  await press(els.configResetConfirm);
+  check("after a reset focus goes to the card's Add button for that file, not the body", api.reset === null && focused === addBtn("repo-a", "tools") &&
+    buttons(card("repo-a"), "Reset devgraph.tools.yaml…").length === 0, desc());
+  // the global store: the whole page reloads after it
+  api.renderConfigPage(MODEL());
+  respond = (url, init) => JSON.parse(init.body).dry_run ? { status: 200, body: { ...rdry.body, scope: globalBlock() } }
+    : { status: 200, body: { ok: true, written: true, file: "global-tools.json", fingerprint: "sha256:g2", removed: { tools: ["hot_paths"] }, warnings: [], notes: [], scope: globalBlock() } };
+  old = buttons(card("__global__"), "Reset global-tools.json…")[0];
+  await press(old);
+  els.configResetTyped.value = "global";
+  await els.configResetTyped.fire("input");
+  await press(els.configResetConfirm);
+  check("after resetting the global store focus is on a control in the re-rendered global card, not the removed opener", api.reset === null &&
+    focused !== old && inside(focused, card("__global__")), desc());
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);

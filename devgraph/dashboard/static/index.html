@@ -813,7 +813,7 @@ table.dstable input[type="text"] { width: 100%; }
   <div class="cfg-error" id="configModalError" style="display:none"></div>
   <div class="modal-actions"><button class="btn btn-sm" id="configModalReload" style="display:none">Reload</button><button class="btn btn-sm" id="configModalCancel">Cancel</button><button class="btn btn-sm btn-primary" id="configModalSave">Save</button></div>
 </div></div>
-<div class="modal-overlay" id="configResetModal"><div class="modal-box cfg-modal-box">
+<div class="modal-overlay" id="configResetModal"><div class="modal-box cfg-modal-box" role="dialog" aria-modal="true" aria-labelledby="configResetTitle">
   <h4 id="configResetTitle"></h4>
   <div class="cfg-reset-list" id="configResetList"></div>
   <div class="field" id="configResetPhraseField" style="display:none"><label for="configResetTyped" id="configResetPhraseLabel"></label><input type="text" id="configResetTyped" autocomplete="off" spellcheck="false" /></div>
@@ -2960,7 +2960,7 @@ let configLoadSeq = 0;
 /* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, dryTarget, dryYaml, busy, label, armedAt,
    mode (form|yaml), formState, formText, openText, openEntry, order } */
 let configEdit = null;
-/* the open reset dialog: { scope, kind, phrase, fingerprint, review, stale, busy, ready, armedAt } */
+/* the open reset dialog: { scope, kind, opener, phrase, fingerprint, review, stale, busy, ready, armedAt } */
 let configReset = null;
 /* per repo: the project-config switch's last action { busy, confirm, error, notes, armedAt }; survives re-renders */
 const configToggles = {};
@@ -2973,10 +2973,12 @@ function configEl(tag, cls, text) {
   if (text !== undefined) el.textContent = String(text);
   return el;
 }
-function configButton(label, onClick) {
+function configButton(label, onClick, where) {
   const b = configEl("button", "btn btn-sm", label);
   b.type = "button";
   b.addEventListener("click", onClick);
+  /* where: { scope, action, section, name } -- what a re-render looks the button up by to give focus back */
+  if (where) Object.assign(b.dataset, { cfgScope: where.scope, cfgAction: where.action, cfgSection: where.section, cfgName: where.name === undefined ? "" : where.name });
   return b;
 }
 function configLockEl() {
@@ -3021,8 +3023,8 @@ function configSection(title, file, badges, onAdd, body, onReset) {
   if (file) head.appendChild(configEl("span", "cfg-sub", file));
   (badges || []).forEach(b => head.appendChild(configBadgeEl(b)));
   const actions = configEl("div", "cfg-actions");
-  if (onReset) actions.appendChild(configButton("Reset " + file + "…", onReset));
-  if (onAdd) actions.appendChild(configButton("Add " + onAdd.noun, onAdd.fn));
+  if (onReset) actions.appendChild(configButton("Reset " + file + "…", onReset.fn, onReset.where));
+  if (onAdd) actions.appendChild(configButton("Add " + onAdd.noun, onAdd.fn, onAdd.where));
   if (actions.children.length) head.appendChild(actions);
   sec.appendChild(head);
   sec.appendChild(body);
@@ -3048,12 +3050,12 @@ function configEntryRows(box, scope, section, items, nameKey) {
     const name = item[nameKey];
     const extras = (scope === CONFIG_GLOBAL ? [configEl("span", "cfg-global", "GLOBAL")] : []).concat((item.badges || []).map(configBadgeEl));
     const actions = item.editable === false ? [] : [
-      configButton("Edit", () => openConfigEditor({ scope, section, op: "replace", name, yaml: item.yaml, entry: item.entry })),
+      configButton("Edit", () => openConfigEditor({ scope, section, op: "replace", name, yaml: item.yaml, entry: item.entry }), { scope, action: "edit", section, name }),
       configButton(item.origin === "project (overrides global)" ? "Remove override" : "Delete",
-        () => openConfigEditor({ scope, section, op: "delete", name, yaml: item.yaml })),
+        () => openConfigEditor({ scope, section, op: "delete", name, yaml: item.yaml }), { scope, action: "delete", section, name }),
     ];
     if (configCanCopy(configModel, scope, section, item))
-      actions.push(configButton("Copy to…", () => openConfigEditor({ scope, section, op: "copy", name, yaml: item.yaml })));
+      actions.push(configButton("Copy to…", () => openConfigEditor({ scope, section, op: "copy", name, yaml: item.yaml }), { scope, action: "copy", section, name }));
     box.appendChild(configRow(name, item.tool_id || "", extras, actions));
   });
   return box;
@@ -3063,7 +3065,9 @@ function renderConfigScope(scope, block) {
   const card = configEl("div", "card cfg-scope");
   card.dataset.scope = scope;
   const head = configEl("div", "card-head");
-  head.appendChild(configEl("h3", "", isGlobal ? "Global" : block.repo_id));
+  const heading = configEl("h3", "", isGlobal ? "Global" : block.repo_id);
+  heading.setAttribute("tabindex", "-1");
+  head.appendChild(heading);
   if (!isGlobal) head.appendChild(configEl("span", "cfg-sub", block.display_path));
   if (!isGlobal) head.appendChild(configToggleEl(block));
   card.appendChild(head);
@@ -3076,9 +3080,11 @@ function renderConfigScope(scope, block) {
     card.appendChild(box);
   }
   const add = section => ({ noun: CONFIG_SECTIONS[section].noun,
-    fn: () => openConfigEditor({ scope, section, op: "add", name: null, yaml: CONFIG_SECTIONS[section].template, entry: CONFIG_SECTIONS[section].entry }) });
+    fn: () => openConfigEditor({ scope, section, op: "add", name: null, yaml: CONFIG_SECTIONS[section].template, entry: CONFIG_SECTIONS[section].entry }),
+    where: { scope, action: "add", section } });
   /* a file that is not there has nothing to reset; an invalid one is when Reset matters most */
-  const reset = (part, kind) => part.state === "absent" || part.fingerprint === "absent" ? null : () => openConfigReset(scope, kind);
+  const reset = (part, kind) => part.state === "absent" || part.fingerprint === "absent" ? null
+    : { fn: () => openConfigReset(scope, kind), where: { scope, action: "reset", section: kind } };
   const tools = block.tools;
   if (isGlobal) {
     card.appendChild(configSection("Nodes", null, [], null, configLockedChips(block.node_types.map(t => t.label))));
@@ -3133,6 +3139,38 @@ function configRerender(scope) {
   const old = [...box.children].find(c => c.dataset.scope === scope);
   const block = configScopeBlock(scope);
   if (old && block) old.replaceWith(renderConfigScope(scope, block));
+}
+/* A save or reset redraws its card, so the button that opened the dialog is gone
+   and focus would fall to <body>. Find its stand-in: the same button (scope,
+   action, section, name), else the same entry's Edit button, else the section's
+   Add button, else the card heading. */
+function configOpenerSpot(opener) {
+  const d = opener && opener.dataset;
+  return d && d.cfgAction ? { scope: d.cfgScope, action: d.cfgAction, section: d.cfgSection, name: d.cfgName } : null;
+}
+function configFindIn(root, pred) {
+  for (const c of root.children) {
+    if (pred(c)) return c;
+    const hit = configFindIn(c, pred);
+    if (hit) return hit;
+  }
+  return null;
+}
+function configRestoreFocus(spot) {
+  if (!spot) return;
+  const card = [...document.getElementById("configScopes").children].find(c => c.dataset.scope === spot.scope);
+  if (!card) return;
+  const tagged = (action, section, name) => configFindIn(card, e => e.dataset && e.dataset.cfgAction === action && e.dataset.cfgSection === section &&
+    (name === undefined || e.dataset.cfgName === name));
+  const addSection = spot.action === "reset" && spot.section === "schema" ? "node_types" : spot.section;
+  const target = tagged(spot.action, spot.section, spot.name) || (spot.name ? tagged("edit", spot.section, spot.name) : null) ||
+    tagged("add", addSection) || configFindIn(card, e => e.tagName === "H3");
+  if (target) target.focus();
+}
+/* true while focus is nowhere in particular: <body>, or the control that was just redrawn away */
+function configFocusLost(prev) {
+  const a = document.activeElement;
+  return !a || a === prev || a === document.body;
 }
 /* op: add|replace|delete; section: tools|node_types|relationships */
 function configWriteRequest(op, scope, section, name, yaml, fingerprint, dryRun) {
@@ -3304,8 +3342,8 @@ function configCloseEditor() {
   configEdit = null;
   if (opener) opener.focus();
 }
-/* the modal's enabled, visible controls in tab order (a hidden step or a locked fieldset has none) */
-function configModalFocusable() {
+/* a modal's enabled, visible controls in tab order (a hidden step or a locked fieldset has none) */
+function configModalFocusable(modal) {
   const out = [];
   const walk = (el, locked) => {
     if (el.style && el.style.display === "none") return;
@@ -3313,12 +3351,12 @@ function configModalFocusable() {
     if (/^(BUTTON|TEXTAREA|SELECT|INPUT)$/.test(el.tagName) && !el.disabled && !locked && el.type !== "hidden") out.push(el);
     [...el.children].forEach(c => walk(c, off));
   };
-  [...document.getElementById("configModal").children].forEach(c => walk(c, false));
+  [...modal.children].forEach(c => walk(c, false));
   return out;
 }
-/* Tab and Shift+Tab wrap inside the open editor instead of reaching the page behind it */
-function configTrapTab(ev) {
-  const items = configModalFocusable();
+/* Tab and Shift+Tab wrap inside the open dialog (editor or reset) instead of reaching the page behind it */
+function configTrapTab(ev, modal) {
+  const items = configModalFocusable(modal);
   if (!items.length) return;
   const at = items.indexOf(document.activeElement);
   const wrap = ev.shiftKey ? at <= 0 : at === items.length - 1 || at < 0;
@@ -3327,7 +3365,8 @@ function configTrapTab(ev) {
   items[ev.shiftKey ? items.length - 1 : 0].focus();
 }
 function configModalKey(ev) {
-  if (ev.key === "Tab" && configEdit) configTrapTab(ev);
+  if (ev.key === "Tab" && configEdit) configTrapTab(ev, document.getElementById("configModal"));
+  if (ev.key === "Tab" && configReset) configTrapTab(ev, document.getElementById("configResetModal"));
   if (ev.key === "Escape" && configEdit) configCloseEditor();
   if (ev.key === "Escape" && configReset) configCloseReset();
 }
@@ -3453,14 +3492,18 @@ async function configSave(ev) {
       }
       return;
     }
+    const spot = mine ? configOpenerSpot(edit.opener) : null;
     if (mine) configCloseEditor();
     /* written even if the editor was cancelled meanwhile: the page shows what is on disk */
     configSetStatus([...(res.body.warnings || []), ...(res.body.notes || [])].map(String));
     applyConfigScope(t.scope, res.body.scope);
+    configRestoreFocus(spot);
     /* badges cross scopes (a global tool's "overridden in", a project tool's
        "overrides global", a schema conflict naming another repo), so after
        every write refresh the rest quietly */
+    const redrawn = document.activeElement;
     await loadConfigPage(true);
+    if (configFocusLost(redrawn)) configRestoreFocus(spot);
   } finally {
     edit.busy = "";
     if (configEdit === edit) renderConfigModal();
@@ -3554,7 +3597,9 @@ function renderConfigReset() {
 }
 function configCloseReset() {
   document.getElementById("configResetModal").classList.remove("open");
+  const opener = configReset && configReset.opener;
   configReset = null;
+  if (opener) opener.focus();
 }
 /* a 412 at any step: the list is out of date, so it and the typed name go */
 function configResetFailed(rs, res) {
@@ -3617,6 +3662,7 @@ async function configResetConfirm(ev) {
     else configSetStatus("Reset failed: " + describeConfigError(res.status, res.body && res.body.detail));
     return;
   }
+  const spot = mine ? configOpenerSpot(rs.opener) : null;
   if (mine) configCloseReset();
   /* reset even if the dialog was cancelled meanwhile: the page shows what is on disk */
   const outcome = [...(res.body.warnings || []), ...(res.body.notes || [])].map(String);
@@ -3624,16 +3670,19 @@ async function configResetConfirm(ev) {
   configOutcomes[rs.scope] = outcome;
   applyConfigScope(rs.scope, res.body.scope);
   if (res.body.global && rs.scope !== CONFIG_GLOBAL) applyConfigScope(CONFIG_GLOBAL, res.body.global);
+  configRestoreFocus(spot);
   /* emptying the global store changes every repo's "overrides global" badges */
   if (rs.scope === CONFIG_GLOBAL) {
+    const redrawn = document.activeElement;
     await loadConfigPage(true);
     configOutcomes[rs.scope] = outcome;
     configRerender(rs.scope);
+    if (configFocusLost(redrawn)) configRestoreFocus(spot);
   }
 }
 /* kind: tools|schema */
 function openConfigReset(scope, kind) {
-  const rs = { scope, kind, phrase: configResetPhrase(scope), fingerprint: null, review: null, stale: false, busy: "", ready: false, armedAt: 0 };
+  const rs = { scope, kind, opener: document.activeElement, phrase: configResetPhrase(scope), fingerprint: null, review: null, stale: false, busy: "", ready: false, armedAt: 0 };
   configReset = rs;
   const typed = document.getElementById("configResetTyped");
   typed.value = "";
@@ -3645,6 +3694,8 @@ function openConfigReset(scope, kind) {
   const modal = document.getElementById("configResetModal");
   modal.onclick = ev => { if (ev.target === modal) configCloseReset(); };
   modal.classList.add("open");
+  /* only now can the modal take focus; Cancel is the one control that is always enabled */
+  document.getElementById("configResetCancel").focus();
   return configResetCheck(rs, false);
 }
 /* ── project-config switch: the request names the end state (idempotent, no
