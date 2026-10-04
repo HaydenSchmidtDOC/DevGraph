@@ -398,6 +398,7 @@ table.dstable input[type="text"] { width: 100%; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .cfg-toolbar { display: flex; align-items: center; gap: 10px; }
 .cfg-status { font-size: 12px; color: var(--muted); }
+.cfg-status ul { margin: 0; padding-left: 16px; }
 .cfg-scopes { display: flex; flex-direction: column; gap: var(--space-4); }
 .cfg-scope .card-head h3 { margin: 0; }
 .cfg-section { margin-top: 14px; }
@@ -681,7 +682,7 @@ table.dstable input[type="text"] { width: 100%; }
         <div class="settings-pane" id="pane-config" data-od-id="pane-config">
           <h3 class="pane-title">Config</h3>
           <p class="desc">Node types, relationship types and MCP tools: DevGraph's built-ins and the global tools store, then each registered repository's own <code>devgraph.schema.yaml</code> and <code>devgraph.tools.yaml</code>. Edits are validated exactly like <code>devgraph config</code> and written to the file — nothing is committed.</p>
-          <div class="cfg-toolbar"><button class="btn btn-sm" id="btnConfigReload">Reload</button><span class="cfg-status" id="configStatus"></span></div>
+          <div class="cfg-toolbar"><button class="btn btn-sm" id="btnConfigReload">Reload</button><div class="cfg-status" id="configStatus"></div></div>
           <div class="cfg-scopes" id="configScopes"></div>
         </div>
 
@@ -2922,10 +2923,13 @@ const CONFIG_LOCK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentCol
 const CONFIG_SECTIONS = {
   tools: { title: "Tools", noun: "tool", template: "name: my_tool\ndescription: What this tool answers, in one line an agent can choose it by.\ncypher: |\n  MATCH (n:Function {repo_id: $repo_id})\n  RETURN n.name AS name\n  LIMIT 25\n" },
   node_types: { title: "Nodes", noun: "node type", template: "label: Runbook\nkey: [slug]\nmetadata:\n  - name: slug\n    type: string\n    required: true\n" },
-  relationships: { title: "Relationships", noun: "relationship", template: "type: DOCUMENTS\nprovider: custom\ncustom: {name: runbook_links}\nfrom: Runbook\nto: Service\n" },
+  relationships: { title: "Relationships", noun: "relationship", template: "# from and to must name node types that already exist: built-in, or declared in this file\ntype: DOCUMENTS\nprovider: custom\ncustom: {name: runbook_links}\nfrom: Runbook\nto: Service\n" },
 };
 /* the last /api/config payload; null until the pane is first opened */
 let configModel = null;
+/* bumped by every page load and every block a write returns: a load answered
+   after either is stale and dropped, so an older fingerprint never comes back */
+let configLoadSeq = 0;
 /* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, busy, label, armedAt } */
 let configEdit = null;
 
@@ -3045,6 +3049,7 @@ function configFingerprint(scope, section) {
 }
 /* swap one scope's block into the model and its card on the page */
 function applyConfigScope(scope, block) {
+  configLoadSeq++;
   if (scope === CONFIG_GLOBAL) configModel.global = block;
   else configModel.projects = configModel.projects.map(p => p.repo_id === scope ? block : p);
   const box = document.getElementById("configScopes");
@@ -3136,6 +3141,23 @@ function renderConfigModal() {
   save.disabled = !!edit.busy;
   save.textContent = edit.busy || label;
 }
+/* the toolbar's status line: one message as text, or a write's warnings and notes as a list */
+function configSetStatus(items) {
+  const status = document.getElementById("configStatus");
+  if (!Array.isArray(items)) { status.textContent = items || ""; return; }
+  const list = configEl("ul", "");
+  items.forEach(t => list.appendChild(configEl("li", "", t)));
+  status.replaceChildren(...(items.length ? [list] : []));
+}
+/* Cancel, Escape and an overlay click: close the editor. A save still in flight
+   sees it no longer owns the editor after its next await and stops there. */
+function configCloseEditor() {
+  document.getElementById("configModal").classList.remove("open");
+  configEdit = null;
+}
+function configModalKey(ev) {
+  if (ev.key === "Escape" && configEdit) configCloseEditor();
+}
 function configSetError(text, reload) {
   document.getElementById("configModalError").textContent = text || "";
   configShow("configModalError", !!text);
@@ -3166,9 +3188,12 @@ function openConfigEditor(opts) {
   yaml.oninput = () => { configEdit.crossName = null; if (configEdit.confirmed) { configEdit.confirmed = false; renderConfigModal(); } };
   document.getElementById("configModalSave").onclick = configSave;
   /* Cancel works mid-request too: configSave checks it still owns the editor after every await */
-  document.getElementById("configModalCancel").onclick = () => { document.getElementById("configModal").classList.remove("open"); configEdit = null; };
+  document.getElementById("configModalCancel").onclick = configCloseEditor;
+  const modal = document.getElementById("configModal");
+  modal.onclick = ev => { if (ev.target === modal) configCloseEditor(); };
   document.getElementById("configModalReload").onclick = configReload;
   configSetError("");
+  configSetStatus("");
   renderConfigModal();
   document.getElementById("configModal").classList.add("open");
 }
@@ -3216,9 +3241,9 @@ async function configSave(ev) {
       }
       return;
     }
-    if (mine) { document.getElementById("configModal").classList.remove("open"); configEdit = null; }
+    if (mine) configCloseEditor();
     /* written even if the editor was cancelled meanwhile: the page shows what is on disk */
-    document.getElementById("configStatus").textContent = [...(res.body.warnings || []), ...(res.body.notes || [])].join(" ");
+    configSetStatus([...(res.body.warnings || []), ...(res.body.notes || [])].map(String));
     applyConfigScope(t.scope, res.body.scope);
     /* tool resolution crosses scopes (a global tool's "overridden in" badge,
        a project tool's "overrides global"), so refresh the rest quietly */
@@ -3242,16 +3267,21 @@ async function configReload() {
   renderConfigModal();
   configSetError("Reloaded the current file; your text is kept. Review it and save again.");
 }
+/* quiet: a background refresh (live event, after a write, pane activation).
+   One while the pane is hidden is skipped: activating the pane reloads it. */
 async function loadConfigPage(quiet) {
-  const status = document.getElementById("configStatus");
-  if (!quiet) status.textContent = "Loading…";
+  if (quiet && !document.getElementById("pane-config").classList.contains("active")) return;
+  const seq = ++configLoadSeq;
+  if (!quiet) configSetStatus("Loading…");
   const res = await configSend({ url: "/api/config", init: {} });
-  if (!res.ok) { status.textContent = "Could not load config: " + describeConfigError(res.status, res.body && res.body.detail); return; }
-  if (!quiet) status.textContent = "";
+  if (seq !== configLoadSeq) return;
+  if (!res.ok) { configSetStatus("Could not load config: " + describeConfigError(res.status, res.body && res.body.detail)); return; }
+  if (!quiet) configSetStatus("");
   renderConfigPage(res.body);
 }
 /* ── end Config page ── */
 document.getElementById("btnConfigReload").addEventListener("click", () => loadConfigPage());
+document.addEventListener("keydown", configModalKey);
 
 /* enable_run_cypher only gates MCP/AI-agent tool access — the dashboard's own
    Cypher box always runs, so it never gets disabled or re-worded here. */

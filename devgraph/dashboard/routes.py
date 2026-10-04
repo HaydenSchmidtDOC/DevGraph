@@ -504,6 +504,24 @@ def build_router(
         return {"labels": project_labels, "rels": project_rels, "colors": colors, "state": state, "notices": notices,
                 "error": error}
 
+    def _config_schema_info(record: Any) -> dict[str, Any]:
+        """`_repo_schema` for the Config page, which must render (and answer writes) with Neo4j down.
+
+        Only the driver's own errors are tolerated: the applied state is then
+        `unknown`, while what the file alone decides (invalid) still shows.
+        """
+        from neo4j.exceptions import DriverError, Neo4jError
+
+        try:
+            return _repo_schema(record)
+        except (DriverError, Neo4jError) as exc:
+            logger.debug("schema state of %s unavailable: %s", record.repo_id, exc)
+        try:
+            load_project_schema(record.path, respect_switch=False)
+        except ProjectSchemaError as exc:
+            return {"state": "invalid", "error": str(exc)}
+        return {"state": "unknown", "error": None}
+
     def _scope_records(repo_id: str) -> list[Any]:
         """The registered repos a scope covers: every repo for `__all__`, else one."""
         if repo_id == _ALL_REPOS_SCOPE:
@@ -702,11 +720,11 @@ def build_router(
         record = next((r for r in records if r.repo_id == scope), None)
         if record is None:
             raise HTTPException(status_code=404, detail=f"unknown repo: {scope}")
-        return build_project(record, _repo_schema)
+        return build_project(record, _config_schema_info)
 
     @router.get("/config")
     def get_config() -> dict[str, Any]:
-        return build_config(registry.list_repos(active_only=True), _repo_schema)
+        return build_config(registry.list_repos(active_only=True), _config_schema_info)
 
     @router.get("/config/{scope}")
     def get_config_scope(scope: str) -> dict[str, Any]:

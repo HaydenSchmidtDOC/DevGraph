@@ -960,3 +960,201 @@ def test_node_type_rename_to_a_taken_label_is_409(client, registry, tmp_path):
 
     assert response.status_code == 409 and response.json()["detail"]["code"] == "exists"
     assert (record.path / SCHEMA_FILENAME).read_bytes() == before
+
+
+# --- final-review fixes ------------------------------------------------------------------------
+
+
+class DownEngine(StubEngine):
+    """Neo4j unreachable: every applied-schema read raises the driver's own error."""
+
+    def read_applied_schema(self, repo_id: str):
+        from neo4j.exceptions import ServiceUnavailable
+
+        raise ServiceUnavailable("Couldn't connect to localhost:7687")
+
+
+@pytest.fixture
+def down_client(registry, global_store):
+    app = FastAPI()
+    app.include_router(routes.build_router(DownEngine(), registry, EventBroadcaster()))
+    return TestClient(app, base_url="http://127.0.0.1")
+
+
+def test_neo4j_down_model_marks_schema_state_unknown(down_client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+    _repo(tmp_path, registry, "repo-b")
+    _write(tmp_path / "repo-b", SCHEMA_FILENAME, "version: 1\nnode_types: [oops")
+
+    response = down_client.get("/api/config")
+
+    assert response.status_code == 200, response.text
+    a, b = response.json()["projects"]
+    assert a["schema"]["state"] == "unknown"
+    [graph] = a["schema"]["badges"]
+    assert graph["kind"] == "graph-unavailable" and graph["level"] == "muted"
+    assert "graph unavailable" in graph["text"].lower()
+    assert [n["label"] for n in a["schema"]["node_types"]] == ["Widget"]
+    # a file-derived state does not need the graph
+    assert b["schema"]["state"] == "invalid" and _kinds(b["schema"]["badges"]) == ["schema-invalid"]
+    assert down_client.get("/api/config/repo-a").json()["schema"]["state"] == "unknown"
+
+
+def test_neo4j_down_writes_still_answer_normally(down_client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+
+    tool = _send(down_client, "POST", "/api/config/repo-a/tools", "absent", {"yaml": NEW_TOOL})
+    assert tool.status_code == 201, tool.text
+    assert "name: find_parents" in (record.path / TOOLS_FILENAME).read_text()
+    assert tool.json()["scope"]["schema"]["state"] == "unknown"
+
+    node = _send(down_client, "POST", "/api/config/repo-a/schema/node_types", "absent", {"yaml": WIDGET})
+    assert node.status_code == 201, node.text
+    assert "label: Gadget" in (record.path / SCHEMA_FILENAME).read_text()
+
+    stale = _send(down_client, "DELETE", "/api/config/repo-a/tools/find_parents", "absent")
+    assert stale.status_code == 412 and stale.json()["detail"]["scope"]["schema"]["state"] == "unknown"
+
+
+def test_only_driver_errors_are_tolerated(registry, global_store, tmp_path):
+    class Broken(StubEngine):
+        def read_applied_schema(self, repo_id):
+            raise RuntimeError("a bug, not an outage")
+
+    app = FastAPI()
+    app.include_router(routes.build_router(Broken(), registry, EventBroadcaster()))
+    _repo(tmp_path, registry)
+
+    with pytest.raises(RuntimeError):
+        TestClient(app, base_url="http://127.0.0.1").get("/api/config")
+
+
+def test_get_config_resolves_each_repo_once(client, registry, tmp_path, global_store, monkeypatch):
+    from devgraph.mcp import tool_plane
+
+    _repo(tmp_path, registry, "repo-a")
+    _repo(tmp_path, registry, "repo-b")
+    _global_store(global_store, "hot_paths")
+    calls: list[str] = []
+    real = tool_plane.resolve_tools
+
+    def spy(repo, *args, **kwargs):
+        calls.append(repo.repo_id)
+        return real(repo, *args, **kwargs)
+
+    monkeypatch.setattr(tool_plane, "resolve_tools", spy)
+
+    assert client.get("/api/config").status_code == 200
+    assert sorted(calls) == ["repo-a", "repo-b"]
+
+
+class _RefusingServer:
+    """A live server whose SDK refuses some tools at registration (add_tool raises)."""
+
+    def __init__(self, refuse: set[str]) -> None:
+        self.refuse = refuse
+
+    def add_tool(self, fn, name, description, annotations):
+        if description in self.refuse:
+            raise ValueError("cannot build an input schema")
+
+
+def test_registration_failures_give_fallback_and_not_served_badges(registry, tmp_path, global_store):
+    from devgraph.dashboard import config_model
+    from devgraph.mcp.tool_plane import resolve_tools
+
+    record = _repo(tmp_path, registry)
+    _global_store(global_store, "hot_paths")
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="hot_paths") + "      - name: lonely\n"
+           "        description: L.\n        cypher: \"MATCH (n {repo_id: $repo_id}) RETURN n LIMIT 1\"\n")
+    live = resolve_tools(record, server=_RefusingServer({"A tool.", "L."}))
+    schema_info = lambda r: {"state": "absent", "error": None}
+
+    block = config_model.build_project(record, schema_info, status=live)
+
+    entries = {e["name"]: e for e in block["tools"]["entries"]}
+    assert entries["hot_paths"]["origin"] == "global"
+    [fallback] = entries["hot_paths"]["badges"]
+    assert fallback["kind"] == "fallback-global" and "could not be served" in fallback["detail"]
+    assert "cannot build an input schema" in fallback["detail"]
+    [missing] = entries["lonely"]["badges"]
+    assert missing["kind"] == "not-served" and missing["level"] == "error"
+    assert "could not be served" in missing["detail"]
+    # the dry resolution the page uses cannot see a registration failure
+    dry = config_model.build_project(record, schema_info)
+    assert [_kinds(e["badges"]) for e in dry["tools"]["entries"]] == [["overrides-global"], []]
+
+
+def test_builtin_name_shadowed_in_both_layers(client, registry, tmp_path, global_store):
+    from devgraph.mcp.tool_plane import resolve_tools
+
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="find_callers"))
+    _global_store(global_store, "find_callers")
+
+    shadowed = resolve_tools(record).shadowed["find_callers"]
+    assert len(shadowed) == 2
+    assert any("global tool 'find_callers'" in n for n in shadowed)
+    assert any("project tool 'find_callers'" in n for n in shadowed)
+    model = client.get("/api/config").json()
+    [project_entry] = model["projects"][0]["tools"]["entries"]
+    [global_entry] = model["global"]["tools"]["entries"]
+    assert _kinds(project_entry["badges"]) == ["locked-shadow"]
+    assert _kinds(global_entry["badges"]) == ["locked-shadow"]
+
+
+def test_invalid_project_and_invalid_global_together(client, registry, tmp_path, global_store):
+    record = _repo(tmp_path, registry)
+    global_store.parent.mkdir(parents=True)
+    global_store.write_text("{not json")
+    _write(record.path, TOOLS_FILENAME, "version: 1\ntools: [oops\n")
+
+    response = client.get("/api/config")
+
+    assert response.status_code == 200
+    model = response.json()
+    assert model["global"]["tools"]["state"] == "invalid"
+    assert _kinds(model["global"]["tools"]["badges"]) == ["file-invalid"]
+    project_tools = model["projects"][0]["tools"]
+    assert project_tools["state"] == "invalid" and _kinds(project_tools["badges"]) == ["file-invalid"]
+    assert str(record.path) not in project_tools["error"] and str(global_store.parent) not in model["global"]["tools"]["error"]
+
+
+def test_reserved_repo_ids_do_not_collide_with_config_scopes(client, registry, tmp_path):
+    root = tmp_path / "__global__"
+    (root / ".git").mkdir(parents=True)
+    record = registry.add_repo(root)
+    assert record.repo_id != "__global__"
+
+    model = client.get("/api/config").json()
+    assert [p["repo_id"] for p in model["projects"]] == [record.repo_id]
+    assert "repo_id" not in client.get("/api/config/__global__").json()
+    assert client.get(f"/api/config/{record.repo_id}").json()["repo_id"] == record.repo_id
+
+
+def test_global_value_json_cannot_store_is_422(client, global_store):
+    text = "name: blob\ndescription: !!binary aGk=\ncypher: |\n  MATCH (n {repo_id: $repo_id}) RETURN n LIMIT 1\n"
+
+    response = _send(client, "POST", "/api/config/__global__/tools", "absent", {"yaml": text})
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "invalid"
+    assert "JSON cannot store" in response.json()["detail"]["message"]
+    assert not global_store.exists()
+
+
+def test_exists_messages_say_edit_it_instead_without_cli_commands(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="find_parents"))
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+
+    tool = _send(client, "POST", "/api/config/repo-a/tools", _fp(client, "repo-a"), {"yaml": NEW_TOOL})
+    node = _send(client, "POST", "/api/config/repo-a/schema/node_types", _fp(client, "repo-a", "schema"),
+                 {"yaml": WIDGET.replace("Gadget", "Widget")})
+
+    for response in (tool, node):
+        assert response.status_code == 409
+        message = response.json()["detail"]["message"]
+        assert "already exists" in message and message.endswith("— edit it instead")
+        assert "devgraph config" not in message

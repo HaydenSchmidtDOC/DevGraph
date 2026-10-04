@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import json
 import os
 import stat
 import tempfile
@@ -33,6 +32,11 @@ GLOBAL_TOOLS_NOTE = (
     "Global tools are served only in MCP sessions scoped to a registered repository; "
     "running sessions there pick up changes within 2 seconds."
 )
+
+
+# Ends the message of an add refused because the name is taken; the CLI swaps it
+# for the `devgraph config ... edit <name>` command (see `_edit_errors`).
+EDIT_INSTEAD = " — edit it instead"
 
 
 class ConfigEditError(Exception):
@@ -237,13 +241,8 @@ def write_tools(
 
     Nothing is written unless the resulting file is valid. Raises `ConfigEditError`.
     """
-    from devgraph.config.global_tools import save_global_tools
-    from devgraph.config.project_tools import (
-        TOOLS_VERSION,
-        ProjectToolsError,
-        parse_project_tools,
-        validate_project_tools,
-    )
+    from devgraph.config.global_tools import global_tools_text, save_global_tools
+    from devgraph.config.project_tools import ProjectToolsError, parse_project_tools
     from devgraph.config.tools_edit import ToolsEditError, tool_mappings
 
     path = tools_path(root)
@@ -258,9 +257,7 @@ def write_tools(
                 new_mappings = tool_mappings(
                     edit(yaml.safe_dump({"tools": mappings}, sort_keys=False) if mappings else "")
                 )
-                document = {"version": TOOLS_VERSION, "tools": new_mappings}
-                validate_project_tools(document, path)
-                new_text = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+                new_text = global_tools_text(new_mappings, path)
                 if not dry_run:
                     save_global_tools(new_mappings)
             else:
@@ -286,7 +283,7 @@ def add_tool(root: Path | None, entry: dict, *, expected_fingerprint: str | None
         refuse_builtin(name)
         if any(isinstance(m, dict) and m.get("name") == name for m in tool_entries(root)):
             raise ConfigEditError(
-                f"a tool named {name!r} already exists in this scope; use `devgraph config tools edit {name}`", "exists",
+                f"a tool named {name!r} already exists in this scope{EDIT_INSTEAD}", "exists",
                 name=name,
             )
         return write_tools(root, lambda text: add_tool_text(text, entry), dry_run=dry_run)
@@ -581,7 +578,7 @@ def add_schema_entry(
         name = entry[ident]
         if section == "node_types" and any(isinstance(e, dict) and e.get(ident) == name for e in existing):
             raise ConfigEditError(
-                f"a node type named {name!r} already exists; use `devgraph config schema edit {name}`", "exists"
+                f"a node type named {name!r} already exists{EDIT_INSTEAD}", "exists"
             )
         if section == "relationships" and duplicate_relationship(entry, existing):
             raise ConfigEditError(f"an identical relationship {name!r} already exists", "exists")

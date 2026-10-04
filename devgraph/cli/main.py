@@ -2168,14 +2168,21 @@ def _tools_scope_note(root: Path | None) -> str:
 
 
 @contextlib.contextmanager
-def _edit_errors():
-    """Report a refused config edit as the CLI's error line and exit 1."""
-    from devgraph.config.edits import ConfigEditError
+def _edit_errors(edit_command: str | None = None):
+    """Report a refused config edit as the CLI's error line and exit 1.
+
+    `edit_command` (e.g. "devgraph config tools edit x") replaces a taken-name
+    refusal's generic "edit it instead" with the command that does it.
+    """
+    from devgraph.config.edits import EDIT_INSTEAD, ConfigEditError
 
     try:
         yield
     except ConfigEditError as exc:
-        raise _tools_fail(exc.message) from None
+        message = exc.message
+        if edit_command and message.endswith(EDIT_INSTEAD):
+            message = message[: -len(EDIT_INSTEAD)] + f"; use `{edit_command}`"
+        raise _tools_fail(message) from None
 
 
 def _tools_fail(message: str) -> typer.Exit:
@@ -2285,7 +2292,7 @@ def config_tools_add(
 
     root = _tools_scope(ctx, repo, global_)
     tool = _read_tool_source(source)
-    with _edit_errors():
+    with _edit_errors(f"devgraph config tools edit {tool.get('name')}"):
         result = add_tool(root, tool)
     _tools_done("Added", str(tool.get("name")), result.path, root)
 
@@ -2548,7 +2555,7 @@ def config_schema_add(
 
     root = _schema_scope(ctx, repo)
     entry = _read_schema_entry(source)
-    with _edit_errors():
+    with _edit_errors(f"devgraph config schema edit {entry.get('label')}"):
         section = entry_section(entry)
         result = add_schema_entry(root, entry, record=_schema_record(root))
     _schema_done("Added", section, str(entry[_SCHEMA_SECTIONS[section][0]]), result.path, root)

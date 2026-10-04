@@ -356,3 +356,18 @@ def test_non_regular_target_is_refused_without_opening_it(tmp_path, kind):
     with pytest.raises(ConfigEditError) as exc:
         edits.add_tool(tmp_path, TOOL, expected_fingerprint=fingerprint)
     assert code(exc) == "not_regular"
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_global_value_json_cannot_store_is_invalid(store, dry_run):
+    with pytest.raises(ConfigEditError) as exc:
+        edits.add_tool(None, {**TOOL, "description": b"hi"}, dry_run=dry_run)
+    assert code(exc) == "invalid" and "JSON cannot store" in exc.value.message
+    assert not store.exists()
+
+
+def test_exists_says_edit_it_instead(tmp_path):
+    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
+    with pytest.raises(ConfigEditError) as exc:
+        edits.add_tool(tmp_path, TOOL)
+    assert exc.value.message.endswith("already exists in this scope — edit it instead")

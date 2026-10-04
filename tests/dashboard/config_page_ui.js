@@ -59,8 +59,9 @@ const mkEl = tag => {
 };
 const ids = ["configScopes", "configStatus", "configModal", "configModalTitle", "configModalWarn", "configModalWarnText",
   "configDestField", "configDest", "configYaml", "configModalConfirm", "configModalError", "configModalReload",
-  "configModalCancel", "configModalSave"];
+  "configModalCancel", "configModalSave", "pane-config"];
 const els = Object.fromEntries(ids.map(id => [id, mkEl(id === "configYaml" ? "textarea" : id === "configDest" ? "select" : "div")]));
+els["pane-config"].classList.add("active");
 const document = { getElementById: id => els[id] || null, createElement: mkEl };
 
 let tooltips = [];
@@ -78,14 +79,16 @@ const globals = {
   wireTooltip: el => tooltips.push(el),
   fetch: async (url, init) => {
     fetchCalls.push({ url, init: init || {} });
-    if (gate) await gate;
+    /* the answer is what the server held when the request arrived, however late it lands */
     const { status, body } = url === "/api/config" && configPayload ? { status: 200, body: configPayload } : respond(url, init || {});
+    if (gate) await gate;
     return { ok: status >= 200 && status < 300, status, json: async () => JSON.parse(JSON.stringify(body)) };
   },
 };
 const api = new Function(...Object.keys(globals),
   configSrc + "\nreturn { CONFIG_GLOBAL, renderConfigPage, renderConfigScope, configWriteRequest, describeConfigError," +
-  " openConfigEditor, configEditTarget, loadConfigPage, get model() { return configModel; } };")(...Object.values(globals));
+  " openConfigEditor, configEditTarget, loadConfigPage, applyConfigScope, configModalKey, CONFIG_SECTIONS," +
+  " get model() { return configModel; }, get edit() { return configEdit; } };")(...Object.values(globals));
 
 // --- fixtures -----------------------------------------------------------
 const HOSTILE = '<img src=x onerror=alert(1)>';
@@ -532,6 +535,87 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await send({ type: "reindexed", repo_id: "repo-a", changed: 0, deleted: 0 });
   await send({ type: "git_history_synced", mode: "full" });
   check("a no-op reindex or other events do not", live.loads.length === 2, JSON.stringify(live.loads));
+
+  // 16. refreshes: a stale response never overwrites a newer one; quiet refreshes wait for the pane
+  const withFp = fp => { const m = MODEL(); m.global.tools.fingerprint = fp; return m; };
+  api.renderConfigPage(withFp("sha256:g1"));
+  let releaseOld, releaseNew;
+  configPayload = withFp("sha256:old");
+  gate = new Promise(r => { releaseOld = r; });
+  const older = api.loadConfigPage(true);
+  configPayload = withFp("sha256:new");
+  gate = new Promise(r => { releaseNew = r; });
+  const newer = api.loadConfigPage(true);
+  gate = null;
+  releaseNew(); await newer;
+  releaseOld(); await older;
+  check("a refresh answered out of order never overwrites a newer fingerprint",
+    api.model.global.tools.fingerprint === "sha256:new", api.model.global.tools.fingerprint);
+  configPayload = withFp("sha256:before-write");
+  gate = new Promise(r => { releaseOld = r; });
+  const inFlight = api.loadConfigPage(true);
+  gate = null;
+  const written = globalBlock();
+  written.tools.fingerprint = "sha256:written";
+  api.applyConfigScope("__global__", written);
+  releaseOld(); await inFlight;
+  check("...nor does a refresh that started before a write's block arrived",
+    api.model.global.tools.fingerprint === "sha256:written", api.model.global.tools.fingerprint);
+  configPayload = MODEL();
+  els["pane-config"].classList.remove("active");
+  fetchCalls = [];
+  await api.loadConfigPage(true);
+  check("a quiet refresh while the Config pane is hidden fetches nothing", fetchCalls.length === 0, JSON.stringify(fetchCalls));
+  await api.loadConfigPage();
+  check("...an explicit Reload still does", fetchCalls.length === 1 && fetchCalls[0].url === "/api/config", JSON.stringify(fetchCalls));
+  els["pane-config"].classList.add("active");
+  check("activating the pane reloads it (what a skipped refresh missed)",
+    /classList\.add\("active"\);\s*if \(btn\.dataset\.pane === "config"\) loadConfigPage\(/.test(html), "activation does not reload");
+
+  // 17. the modal: Escape and an overlay click close it like Cancel; the status line is a list
+  api.renderConfigPage(MODEL());
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
+  api.configModalKey({ key: "Enter" });
+  check("other keys leave the modal open", els.configModal.classList.contains("open"), els.configModal.className);
+  api.configModalKey({ key: "Escape" });
+  check("Escape closes the modal", !els.configModal.classList.contains("open") && api.edit === null, els.configModal.className);
+  let threwKey = null;
+  try { api.configModalKey({ key: "Escape" }); } catch (e) { threwKey = e; }
+  check("...and is harmless with no modal open", threwKey === null, String(threwKey));
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
+  await els.configModal.onclick({ target: els.configYaml });
+  check("a click inside the box keeps the modal open", els.configModal.classList.contains("open"), els.configModal.className);
+  await els.configModal.onclick({ target: els.configModal });
+  check("a click on the overlay closes it", !els.configModal.classList.contains("open") && api.edit === null, els.configModal.className);
+  fetchCalls = [];
+  gate = new Promise(r => { release = r; });
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: project("repo-a") } });
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
+  clock += 1000;
+  pending = els.configModalSave.fire("click");
+  await Promise.resolve();
+  api.configModalKey({ key: "Escape" });
+  gate = null; release(); await pending;
+  check("Escape during the dry run cancels like Cancel: no real write",
+    writes().length === 1 && body(writes()[0]).dry_run === true && !els.configModal.classList.contains("open"), JSON.stringify(writes()));
+  fetchCalls = [];
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run,
+    warnings: JSON.parse(init.body).dry_run ? [] : ["Key change keeps the old constraint."],
+    notes: ["Written to devgraph.schema.yaml; not committed.", "Applied after the next rescan."], scope: project("repo-a") } });
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
+  await press(els.configModalSave);
+  const items = find(els.configStatus, e => e.tagName === "LI").map(e => e.textContent);
+  check("after a save the status line lists each warning and note",
+    JSON.stringify(items) === JSON.stringify(["Key change keeps the old constraint.", "Written to devgraph.schema.yaml; not committed.", "Applied after the next rescan."]),
+    JSON.stringify(items));
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
+  check("...and opening the editor again clears it", els.configStatus.textContent === "" && els.configStatus.children.length === 0,
+    els.configStatus.textContent);
+  els.configModalCancel.fire("click");
+  await buttons(card("repo-a"), "Add relationship")[0].fire("click");
+  check("the Add relationship template says its endpoints must exist",
+    /^#.*must name node types that already exist/m.test(els.configYaml.value) && /^from: /m.test(els.configYaml.value), els.configYaml.value);
+  els.configModalCancel.fire("click");
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);

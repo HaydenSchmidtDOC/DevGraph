@@ -380,7 +380,7 @@ def _status_view(status):
         "notices": status.notices, "shadowed": status.shadowed,
         "parameter_names": status.parameter_names, "tools_file": status.tools_file,
         "global_tools_file": status.global_tools_file, "project_invalid": status.project_invalid,
-        "project_invalid_names": status.project_invalid_names,
+        "project_invalid_names": status.project_invalid_names, "fallback_reasons": status.fallback_reasons,
         "definitions": {n: d for n, d in status.definitions.items()},
     }
 
@@ -455,3 +455,40 @@ def test_dry_resolution_touches_no_engine(tmp_path, monkeypatch):
     status = tool_plane.resolve_tools(Repo("demo", repo_dir))
     assert status.served == ["alpha"] and status.origins == {"alpha": "project"}
     assert status.source == "dashboard"
+
+
+class Refusing(Recorder):
+    """A live server whose SDK refuses the tools with these descriptions (add_tool raises)."""
+
+    def __init__(self, refuse):
+        super().__init__()
+        self.refuse = refuse
+
+    def add_tool(self, fn, name, description, annotations):
+        if description in self.refuse:
+            raise ValueError("cannot build an input schema")
+        super().add_tool(fn, name, description, annotations)
+
+
+def test_registration_failures_are_seen_only_by_the_live_path(tmp_path, monkeypatch):
+    from devgraph.config import global_tools
+    from devgraph.mcp import tool_plane
+
+    repo_dir = tmp_path / "demo"
+    repo_dir.mkdir()
+    (repo_dir / TOOLS_FILENAME).write_text(_tools_yaml("alpha", "beta"))
+    store = tmp_path / "store" / global_tools.GLOBAL_TOOLS_FILENAME
+    store.parent.mkdir()
+    store.write_text(_global_json("alpha"))
+    monkeypatch.setattr(global_tools, "_default_path", lambda: store)
+    record = Repo("demo", repo_dir)
+
+    dry = tool_plane.resolve_tools(record)
+    live = tool_plane.resolve_tools(record, server=Refusing({"Tool alpha.", "Tool beta."}))
+
+    assert dry.origins == {"alpha": "project (overrides global)", "beta": "project"}
+    assert dry.fallback_reasons == {}
+    assert live.origins == {"alpha": "global"}
+    assert set(live.fallback_reasons) == {"alpha", "beta"}
+    assert all("could not be served" in r and "cannot build an input schema" in r for r in live.fallback_reasons.values())
+    assert "registration" in tool_plane.resolve_tools.__doc__

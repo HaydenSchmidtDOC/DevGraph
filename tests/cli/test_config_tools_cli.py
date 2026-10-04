@@ -516,3 +516,11 @@ def test_symlinked_global_store_is_refused_untouched(runner, tmp_path, store):
     result = add(runner, tmp_path, ["--global"])
     assert result.exit_code == 1 and "is a symlink to" in flat(result.output)
     assert store.is_symlink() and real.read_text() == '{"version": 1, "tools": []}'
+
+
+def test_add_global_value_json_cannot_store_is_a_friendly_error(runner, tmp_path, store):
+    text = tool_yaml().replace("description: Count this repository's nodes.", "description: !!binary aGk=")
+    result = add(runner, tmp_path, ["--global"], text=text)
+    assert result.exit_code == 1, result.output
+    assert "a tool holds a value JSON cannot store" in flat(result.output)
+    assert not store.exists()

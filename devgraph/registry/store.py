@@ -56,6 +56,12 @@ _MIGRATIONS = (
 _SLUG_RE = re.compile(r"[^a-z0-9_-]+")
 
 
+# Scope tokens the dashboard matches by exact equality before any registry
+# lookup (the Config page's global store, the canvas's "All Repos"): never
+# issued as a repo id, so a repository can't be shadowed by one.
+RESERVED_REPO_IDS = frozenset({"__global__", "__all__"})
+
+
 def _slugify(name: str) -> str:
     slug = _SLUG_RE.sub("-", name.lower()).strip("-")
     return slug or "repo"
@@ -182,7 +188,7 @@ class RepoRegistry:
             candidate = _slugify(repo_id or resolved.name)
             final_id = candidate
             suffix = 2
-            while self._conn.execute(
+            while final_id in RESERVED_REPO_IDS or self._conn.execute(
                 "SELECT 1 FROM repos WHERE repo_id = ?", (final_id,)
             ).fetchone():
                 final_id = f"{candidate}-{suffix}"

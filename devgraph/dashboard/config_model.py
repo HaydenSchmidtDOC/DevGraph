@@ -117,8 +117,9 @@ def _global_entry(entry: dict, overridden_in: list[str]) -> dict[str, Any]:
     return {"name": name, "tool_id": f"gl_{name}", "yaml": dump_entry(entry), "badges": badges}
 
 
-def build_global(records: list[Any]) -> dict[str, Any]:
-    resolutions = _resolutions(records)
+def build_global(records: list[Any], resolutions: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The global block; `resolutions` (repo id -> resolved status) saves resolving each repo again."""
+    resolutions = resolutions if resolutions is not None else _resolutions(records)
     path = edits.tools_path(None)
     text, read_error = _read(path)
     state, error = _tools_file_state(path, text, read_error)
@@ -150,7 +151,7 @@ def _project_tool_entry(record: Any, status: Any, entry: dict, tools_path: Path,
     if not record.project_config_enabled:
         badges.append(badge("muted", "not-served", "Not served: project config disabled",
                             f"Enable it with `devgraph config enable {record.repo_id}`."))
-    elif name in builtin_tool_names():
+    elif name in status.shadowed and status.project_invalid is None:  # a valid file: the project layer shadowed it
         badges.append(badge("warn", "locked-shadow", "Ignored: shadows a locked tool",
                             "The fixed built-in implementation is used instead."))
     elif origin == "project (overrides global)":
@@ -161,12 +162,10 @@ def _project_tool_entry(record: Any, status: Any, entry: dict, tools_path: Path,
             reason = (f"{TOOLS_FILENAME} is invalid, so the project tool of this name can't be served: "
                       f"{scrub(status.project_invalid, tools_path, root)}")
         else:
-            reason = next((n for n in status.notices if n.startswith(f"project tool {name!r} could not")), "")
+            reason = status.fallback_reasons.get(name, "")
         badges.append(badge("warn", "fallback-global", "Not served: using the global tool", reason))
-    elif origin is None and status.project_invalid is None:
-        reason = next((n for n in status.notices if n.startswith(f"project tool {name!r} could not")), "")
-        if reason:
-            badges.append(badge("error", "not-served", "Not served", reason))
+    elif origin is None and name in status.fallback_reasons:
+        badges.append(badge("error", "not-served", "Not served", status.fallback_reasons[name]))
     return {
         "name": name,
         "tool_id": f"{record.repo_id}_{name}",
@@ -185,6 +184,8 @@ def _schema_badges(state: str, error: str | None) -> list[dict[str, str]]:
         "invalid": [badge("error", "schema-invalid", f"{SCHEMA_FILENAME} is invalid", error or "")],
         "disabled": [badge("muted", "not-served", "Project config disabled",
                            "The schema file is not applied while project config is disabled.")],
+        "unknown": [badge("muted", "graph-unavailable", "Graph unavailable",
+                          "Neo4j could not be reached, so whether the schema file is applied is unknown.")],
     }.get(state, [])
 
 
@@ -280,7 +281,8 @@ def build_project(record: Any, schema_info: Callable[[Any], dict[str, Any]], sta
 
 
 def build_config(records: list[Any], schema_info: Callable[[Any], dict[str, Any]]) -> dict[str, Any]:
+    resolutions = _resolutions(records)  # each repo once, shared by the global and project blocks
     return {
-        "global": build_global(records),
-        "projects": [build_project(r, schema_info) for r in records],
+        "global": build_global(records, resolutions),
+        "projects": [build_project(r, schema_info, status=resolutions[r.repo_id]) for r in records],
     }

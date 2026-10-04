@@ -115,6 +115,8 @@ class ToolPlaneStatus:
     # why the project file served none of its tools because it is invalid (None otherwise), and the names it declares as far as readable
     project_invalid: str | None = None
     project_invalid_names: set[str] | None = None
+    # project tool -> why registering it failed (the global tool of its name, if any, is served instead)
+    fallback_reasons: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -237,6 +239,13 @@ def resolve_tools(
     dashboard) nothing is registered and no engine is touched, but `served`, `origins`,
     `notices`, `shadowed`, `definitions` and `project_invalid` are exactly what a
     session would report. `pinned`/`registry` only refine the unscoped notice.
+
+    One thing the dry path cannot predict: a tool the live server refuses at
+    registration (`server.add_tool` raising, e.g. a parameter schema the SDK
+    can't build). Live, that project tool is not served -- the global tool of its
+    name stands in if there is one -- and the reason lands in `fallback_reasons`
+    and `notices`; dry, the null server accepts everything, so `fallback_reasons`
+    stays empty and the tool is reported as served.
     """
     if repo is None:
         status = ToolPlaneStatus(repo_id=None, source=source)
@@ -433,19 +442,20 @@ def _register_layers(
         status.functions[tool.name] = fn
         return None
 
-    fallback_reasons: dict[str, str] = {}  # global tool -> why the project tool of its name isn't served
+    fallback_reasons = status.fallback_reasons  # project tool -> why it isn't served
     for tool in project_tools:
         if tool.name in builtin:
             continue
-        if tool.name not in globals_by_name:
-            register(tool, "project", [])
-            continue
-        failure = register(tool, "project (overrides global)",
-                           [f"resolved: project override of global tool {tool.name!r}"])
-        if failure is None:
-            del globals_by_name[tool.name]
+        overrides = tool.name in globals_by_name
+        if overrides:
+            failure = register(tool, "project (overrides global)",
+                               [f"resolved: project override of global tool {tool.name!r}"])
         else:
+            failure = register(tool, "project", [])
+        if failure is not None:
             fallback_reasons[tool.name] = failure
+        elif overrides:
+            del globals_by_name[tool.name]
     for name, tool in globals_by_name.items():
         if name in fallback_reasons:
             reason = fallback_reasons[name]
@@ -569,7 +579,7 @@ class ProjectToolPlane:
         """Make `new` the session's status, in place (the status resource holds this object)."""
         for name in ("tools_file", "global_tools_file", "served", "parameter_names", "notices",
                      "definitions", "origins", "functions", "shadowed",
-                     "project_invalid", "project_invalid_names"):
+                     "project_invalid", "project_invalid_names", "fallback_reasons"):
             setattr(self.status, name, getattr(new, name))
 
     def _restore_served(self, partial: ToolPlaneStatus, removed: list[str]) -> None:

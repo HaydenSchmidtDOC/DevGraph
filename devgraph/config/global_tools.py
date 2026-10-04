@@ -64,8 +64,8 @@ def global_tools_fingerprint(path: Path | None = None) -> bytes | str:
         return f"unreadable:{type(exc).__name__}"
 
 
-def save_global_tools(tool_mappings: list[dict], path: Path | None = None) -> None:
-    """Validate and atomically write the store; the existing file is untouched on any failure."""
+def global_tools_text(tool_mappings: list[dict], path: Path | None = None) -> str:
+    """The store's file text for these tools, validated; raises ProjectToolsError. Writes nothing."""
     path = path or global_tools_path()
     document = {"version": TOOLS_VERSION, "tools": tool_mappings}
     # Validate the mappings first: a YAML-sourced value (a date, say) is refused
@@ -76,6 +76,13 @@ def save_global_tools(tool_mappings: list[dict], path: Path | None = None) -> No
     except (TypeError, ValueError) as exc:  # a value the schema coerces but JSON can't hold (bytes)
         raise ProjectToolsError(f"{path}: a tool holds a value JSON cannot store: {exc}") from exc
     parse_project_tools(text, path)
+    return text
+
+
+def save_global_tools(tool_mappings: list[dict], path: Path | None = None) -> None:
+    """Validate and atomically write the store; the existing file is untouched on any failure."""
+    path = path or global_tools_path()
+    text = global_tools_text(tool_mappings, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
