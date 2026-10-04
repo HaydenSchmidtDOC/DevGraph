@@ -125,6 +125,28 @@ def test_rebound_cypher_is_rejected_before_running(make_client):
     assert engine.queries == []
 
 
+def test_layout_write_rejects_a_cross_origin_request(make_client, tmp_path):
+    client, _, _ = make_client()
+    res = client.put(
+        "/api/repos/__all__/layout",
+        json={"positions": {}},
+        headers={"host": "127.0.0.1:8765", "origin": "http://evil.test"},
+    )
+    assert res.status_code == 403
+    assert not any(tmp_path.rglob("*.json"))
+
+
+def test_layout_write_allows_a_same_origin_request(make_client, tmp_path):
+    client, _, _ = make_client()
+    res = client.put(
+        "/api/repos/__all__/layout",
+        json={"positions": {}},
+        headers={"host": "127.0.0.1:8765", "origin": "http://127.0.0.1:8765", "sec-fetch-site": "same-origin"},
+    )
+    assert res.status_code == 200
+    assert any(tmp_path.rglob("*.json"))
+
+
 def test_cypher_rejects_a_cross_origin_request(make_client):
     client, engine, _ = make_client()
     res = client.post(

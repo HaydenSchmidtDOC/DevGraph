@@ -97,3 +97,14 @@ class TestHeartbeat:
 
             # Should parse as a valid ISO timestamp.
             datetime.fromisoformat(heartbeat_path.read_text(encoding="utf-8").strip())
+
+
+class TestOpenDashboard:
+    def test_wildcard_bind_opens_the_loopback_address(self, tray_app):
+        """The Host guard refuses `0.0.0.0`; the menu must open an address it accepts."""
+        from devgraph.config.settings import Settings
+
+        tray_app._settings = Settings(dashboard_host="0.0.0.0", dashboard_port=8765)
+        with patch("devgraph.agent.tray.webbrowser.open") as mock_open:
+            tray_app._open_dashboard(MagicMock(), MagicMock())
+        mock_open.assert_called_once_with("http://127.0.0.1:8765")

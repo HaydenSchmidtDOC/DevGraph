@@ -8,7 +8,9 @@ directly" decision).
 
 Read-only apart from two writes: the canvas layout (`PUT .../layout`) and
 repository registration (`POST /repos`), which is the same add-then-initial-
-scan sequence `devgraph add <path>` runs, against the same services.
+scan sequence `devgraph add <path>` runs, against the same services -- plus
+the Cypher console (`POST /cypher`), which runs whatever it is given. All
+three refuse cross-site browser requests (`_reject_cross_site`).
 """
 
 from __future__ import annotations
@@ -336,6 +338,7 @@ def build_router(
 
     @router.put("/repos/{repo_id}/layout")
     async def put_repo_layout(repo_id: str, request: Request) -> dict[str, Any]:
+        _reject_cross_site(request)
         _require_layout_scope(repo_id)
         # Declaring a `payload: dict[str, Any]` parameter (the previous
         # shape) makes Starlette buffer and json-decode the entire body

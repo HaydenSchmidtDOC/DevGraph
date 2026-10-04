@@ -21,15 +21,13 @@ from devgraph.config.settings import get_settings
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.dashboard.query_log import QueryLog
 from devgraph.dashboard.routes import build_router
+from devgraph.dashboard.url import WILDCARD_HOSTNAMES
 from devgraph.graph.engine import GraphEngine
 from devgraph.registry.store import RepoRegistry
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 _LOOPBACK_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
-# Bind-to-everything addresses: meaningful to listen on, never a name a
-# browser should be addressing the dashboard by.
-_WILDCARD_HOSTNAMES = frozenset({"", "0.0.0.0", "::"})
 
 
 def _allowed_hostnames(dashboard_host: str) -> frozenset[str]:
@@ -41,7 +39,7 @@ def _allowed_hostnames(dashboard_host: str) -> frozenset[str]:
     dashboard by a LAN address, bind to that address instead.
     """
     configured = dashboard_host.strip().strip("[]").lower()
-    if configured in _WILDCARD_HOSTNAMES:
+    if configured in WILDCARD_HOSTNAMES:
         return _LOOPBACK_HOSTNAMES
     return _LOOPBACK_HOSTNAMES | {configured}
 
