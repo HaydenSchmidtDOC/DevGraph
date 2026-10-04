@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import anyio
+import pytest
 from mcp.client import Client
 from mcp.shared.memory import create_client_server_memory_streams
 
@@ -18,6 +19,9 @@ from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
 from devgraph.mcp import tool_plane, tool_reload
 from devgraph.mcp.tool_reload import ToolListNotifier, initialization_options, poll_tool_reloads, run_stdio
+
+# Written before the per-repository opt-in: these tests assume project tools are served.
+pytestmark = pytest.mark.usefixtures("trusted_project_tools")
 
 ONE = """
     version: 1

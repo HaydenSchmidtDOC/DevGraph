@@ -28,28 +28,29 @@ def _isolate_global_tools_store(tmp_path, monkeypatch):
     monkeypatch.setattr(global_tools, "_default_path", lambda: tmp_path / "no-global" / global_tools.GLOBAL_TOOLS_FILENAME)
 
 
-_REAL_PROJECT_TOOLS_TRUST = None
-
-
 @pytest.fixture(autouse=True)
-def _trust_project_tools_by_default(tmp_path, monkeypatch):
-    """Treat every project tools file as trusted, so tests written before the
-    per-repository opt-in keep exercising serving. Tests of the opt-in itself
-    use `real_project_trust`. The registry lookup stays away from ~/.devgraph."""
-    global _REAL_PROJECT_TOOLS_TRUST
+def _isolate_project_trust_registry(tmp_path, monkeypatch):
+    """The real trust lookup, against an empty registry in tmp: every project tools
+    file is untrusted unless a test approves it or asks for `trusted_project_tools`.
+    Keeps the lookup away from ~/.devgraph."""
     from devgraph.config import project_trust
 
-    if _REAL_PROJECT_TOOLS_TRUST is None:
-        _REAL_PROJECT_TOOLS_TRUST = project_trust.project_tools_trust
     monkeypatch.setattr(project_trust, "_registry_db_path", lambda: tmp_path / "no-registry" / "registry.db")
+
+
+@pytest.fixture
+def trusted_project_tools(monkeypatch):
+    """Treat every project tools file as trusted. For tests of serving that predate
+    the per-repository opt-in; apply it with `pytestmark = pytest.mark.usefixtures(...)`."""
+    from devgraph.config import project_trust
+
     monkeypatch.setattr(project_trust, "project_tools_trust", lambda repo_root, data: "trusted")
 
 
 @pytest.fixture
-def real_project_trust(monkeypatch):
-    """The real trust lookup (undoing `_trust_project_tools_by_default`); returns the module
-    so a test can point `_registry_db_path` at its own registry."""
+def real_project_trust():
+    """The trust module, with the real lookup (the default); a test points
+    `_registry_db_path` at its own registry."""
     from devgraph.config import project_trust
 
-    monkeypatch.setattr(project_trust, "project_tools_trust", _REAL_PROJECT_TOOLS_TRUST)
     return project_trust

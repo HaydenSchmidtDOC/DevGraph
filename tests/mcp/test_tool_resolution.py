@@ -6,11 +6,16 @@ import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from devgraph.config import global_tools
 from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, save_global_tools
 from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
+
+# Written before the per-repository opt-in: these tests assume project tools are served.
+pytestmark = pytest.mark.usefixtures("trusted_project_tools")
 
 PROJECT = """
     version: 1

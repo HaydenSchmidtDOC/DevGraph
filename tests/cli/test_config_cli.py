@@ -15,6 +15,9 @@ from devgraph.config.settings import Settings
 from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.registry.store import RepoRegistry
 
+# Written before the per-repository opt-in: these tests assume project tools are served.
+pytestmark = pytest.mark.usefixtures("trusted_project_tools")
+
 
 @pytest.fixture
 def runner():
