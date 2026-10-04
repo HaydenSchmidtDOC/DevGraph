@@ -466,12 +466,12 @@ def test_list_shows_builtin_named_tools_as_ignored(runner, repo, store):
     rows = json.loads(result.stdout)["tools"]
     ignored = [r for r in rows if r.get("ignored")]
     assert {(r["name"], r["origin"], r["ignored"]) for r in ignored} == {
-        ("search_component", "global", "built-in name"),
-        ("run_cypher", "project", "built-in name"),
+        ("search_component", "global", "shadows a locked tool"),
+        ("run_cypher", "project", "shadows a locked tool"),
     }
-    assert "ignored: built-in name" in flat(runner.invoke(app, ["config", "tools", "list", "--repo", str(repo)]).output)
+    assert "ignored: shadows a locked tool" in flat(runner.invoke(app, ["config", "tools", "list", "--repo", str(repo)]).output)
     only_global = json.loads(runner.invoke(app, ["config", "tools", "list", "--global", "--json"]).stdout)["tools"]
-    assert only_global == [{"name": "search_component", "origin": "global", "locked": False, "ignored": "built-in name"}]
+    assert only_global == [{"name": "search_component", "origin": "global", "locked": False, "ignored": "shadows a locked tool"}]
 
 
 def test_project_write_is_atomic_and_keeps_the_mode(runner, repo, tmp_path, monkeypatch):

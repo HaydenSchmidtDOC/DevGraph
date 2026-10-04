@@ -364,18 +364,12 @@ def _register_layers(
     globals_by_name: dict[str, CypherTool] = {}
     for tool in global_.declared.tools if global_.declared else ():
         if tool.name in builtin:
-            status.notices.append(
-                f"ignored: global tool {tool.name!r} has the name of a built-in tool; using the built-in"
-            )
             _shadows(status, tool.name, "global")
         else:
             globals_by_name[tool.name] = tool
     project_tools = project.declared.tools if project.declared else ()
     for tool in project_tools:
         if tool.name in builtin:
-            status.notices.append(
-                f"ignored: project tool {tool.name!r} has the name of a built-in tool; using the built-in"
-            )
             _shadows(status, tool.name, "project")
 
     def register(tool: CypherTool, origin: str, notices: list[str]) -> str | None:
@@ -422,8 +416,9 @@ def _register_layers(
 
 
 def _shadows(status: ToolPlaneStatus, name: str, layer: str) -> None:
-    """Record that a `layer` tool named `name` was ignored for the built-in, for that built-in's responses."""
+    """Record that a `layer` tool named `name` was ignored for the built-in: in the status and the built-in's responses."""
     notice = f"ignored: {layer} tool {name!r} shadows a locked tool; using the fixed implementation"
+    status.notices.append(notice)
     status.shadowed.setdefault(name, []).append(notice)
 
 

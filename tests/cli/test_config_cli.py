@@ -367,7 +367,7 @@ def test_validate_fails_on_an_invalid_tools_file_even_with_a_valid_schema(runner
 def test_validate_warns_when_a_tool_shadows_a_builtin(runner, settings, tmp_path):
     result = runner.invoke(app, ["config", "validate", "--repo", str(write_tools(tmp_path, SHADOWING_TOOLS))])
     assert result.exit_code == 0
-    assert "warning" in result.output and "built-in" in result.output
+    assert "warning" in result.output and "shadows a locked tool" in result.output
 
 
 def test_show_json_includes_tools(runner, settings, tmp_path):

@@ -172,7 +172,7 @@ def test_builtin_names_are_still_refused_after_a_reload(tmp_path, monkeypatch):
     server, repo = build(tmp_path, monkeypatch)
     write(repo, ONE.replace("list_files", "search_component"))
     server.devgraph_tool_plane.reload_if_changed()
-    assert any("search_component" in n and "built-in" in n for n in status(server)["notices"])
+    assert any("search_component" in n and "shadows a locked tool" in n for n in status(server)["notices"])
 
 
 def test_the_catalog_follows_a_reload(tmp_path, monkeypatch):

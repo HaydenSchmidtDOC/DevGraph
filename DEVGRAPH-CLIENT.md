@@ -243,10 +243,11 @@ notices can appear in a tool's response envelope: `resolved: project override
 of global tool '<name>'` (the project's tool replaced a global one) and `used
 global tool '<name>': <reason>` (the global tool is served because the project
 tool of that name could not be). A built-in tool whose name a project or global
-tool also uses says so in its own `{count, results, truncated}` envelope:
+tool also uses says so in a `notices` list in each response:
 `ignored: project tool '<name>' shadows a locked tool; using the fixed
-implementation` (or `global tool`); built-ins that return another shape carry
-no notice. `devgraph://project-tools` lists each served
+implementation` (or `global tool`). Built-ins that return a list
+(`find_requirements_for`, `blame_component`, `run_cypher`) can't carry it;
+`devgraph://project-tools` reports it for them. `devgraph://project-tools` lists each served
 tool's origin and the global tools file.
 
 `run_cypher` will not appear unless DevGraph's own config has

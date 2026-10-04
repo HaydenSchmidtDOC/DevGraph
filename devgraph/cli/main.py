@@ -805,7 +805,7 @@ def _project_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
                 findings.append({
                     "repo_id": repo.repo_id,
                     "status": "warning",
-                    "detail": f"{TOOLS_FILENAME}: tool {tool.name!r} has the name of a built-in tool; the built-in will be used",
+                    "detail": f"{TOOLS_FILENAME}: tool {tool.name!r} shadows a locked tool; the fixed implementation is used",
                     "failed": False,
                 })
     return findings
@@ -838,7 +838,7 @@ def _global_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
             findings.append({
                 "repo_id": "global",
                 "status": "warning",
-                "detail": f"{GLOBAL_TOOLS_FILENAME}: tool {tool.name!r} has the name of a built-in tool; the built-in will be used",
+                "detail": f"{GLOBAL_TOOLS_FILENAME}: tool {tool.name!r} shadows a locked tool; the fixed implementation is used",
                 "failed": False,
             })
     for repo in sorted(repos, key=lambda r: r.repo_id):
@@ -2228,7 +2228,7 @@ def config_tools_list(
         raise _tools_fail(str(exc))
     global_tools = {t.name: t for t in (declared_global.tools if declared_global else ())}
     project_names = [t.name for t in (declared_project.tools if declared_project else ())]
-    ignored = {"ignored": "built-in name"}  # a built-in name in a tools file: MCP serves the built-in
+    ignored = {"ignored": "shadows a locked tool"}  # a built-in name in a tools file: MCP serves the built-in
 
     rows: list[dict[str, Any]] = []
     if root is None:

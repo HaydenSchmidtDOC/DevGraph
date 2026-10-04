@@ -153,7 +153,7 @@ def test_a_builtin_name_is_not_taken_over(tmp_path, monkeypatch):
     server, _ = build(tmp_path, monkeypatch, Engine())
     status = json.loads(asyncio.run(server.read_resource("devgraph://project-tools"))[0].content)
     assert "search_component" not in status["served"]
-    assert any("search_component" in n and "built-in" in n for n in status["notices"])
+    assert "ignored: project tool 'search_component' shadows a locked tool; using the fixed implementation" in status["notices"]
     assert status["scope"] == {"repo_id": "demo", "source": "env"}
 
 

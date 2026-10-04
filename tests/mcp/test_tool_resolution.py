@@ -214,7 +214,7 @@ def test_a_global_tool_with_a_builtin_name_is_ignored(tmp_path, monkeypatch):
     assert tools(server)["search_component"].description != "Shadow."
     current = status(server)
     assert "search_component" not in current["served"]
-    assert any(n.startswith("ignored: global tool 'search_component'") for n in current["notices"])
+    assert GLOBAL_SHADOW_NOTICE in current["notices"]
 
 
 SHADOW_PROJECT = PROJECT.replace("list_files", "search_component")
@@ -236,7 +236,16 @@ def test_a_shadowed_builtin_says_so_in_its_response(tmp_path, monkeypatch):
 def test_a_builtin_shadowed_by_a_global_tool_says_so_in_its_response(tmp_path, monkeypatch):
     store(tmp_path, monkeypatch, [{**G_COUNT, "name": "search_component"}])
     server, _ = build(tmp_path, monkeypatch, project=SHADOW_PROJECT)
-    assert sorted(search(server)["notices"]) == sorted([GLOBAL_SHADOW_NOTICE, PROJECT_SHADOW_NOTICE])
+    assert search(server)["notices"] == [GLOBAL_SHADOW_NOTICE, PROJECT_SHADOW_NOTICE]
+    assert [n for n in status(server)["notices"] if "shadows" in n] == [GLOBAL_SHADOW_NOTICE, PROJECT_SHADOW_NOTICE]
+
+
+def test_an_invalid_save_keeps_the_shadow_notice(tmp_path, monkeypatch):
+    server, repo = build(tmp_path, monkeypatch, project=SHADOW_PROJECT)
+    (repo / TOOLS_FILENAME).write_text("version: 1\ntools: [oops\n")
+    server.devgraph_tool_plane.reload_if_changed()
+    assert any("last good" in n for n in status(server)["notices"])
+    assert search(server)["notices"] == [PROJECT_SHADOW_NOTICE]
 
 
 def test_the_shadow_notice_follows_a_reload(tmp_path, monkeypatch):
@@ -260,10 +269,20 @@ def test_an_unscoped_session_reports_no_shadowing(tmp_path, monkeypatch):
     assert set(search(server)) == {"count", "results", "truncated"}
 
 
-def test_a_shadowed_builtin_without_an_envelope_is_unchanged(tmp_path, monkeypatch):
+def test_a_shadowed_builtin_with_another_dict_shape_carries_the_notice(tmp_path, monkeypatch):
     server, _ = build(tmp_path, monkeypatch, project=PROJECT.replace("list_files", "explain_architecture"))
     result = asyncio.run(server.call_tool("explain_architecture", {"repo_id": "demo"})).structured_content
-    assert "notices" not in result
+    assert {"services_and_datastores", "endpoints"} <= set(result)
+    assert result["notices"] == [
+        "ignored: project tool 'explain_architecture' shadows a locked tool; using the fixed implementation"
+    ]
+
+
+def test_a_shadowed_builtin_returning_a_list_is_unchanged(tmp_path, monkeypatch):
+    server, _ = build(tmp_path, monkeypatch, project=PROJECT.replace("list_files", "find_requirements_for"))
+    args = {"repo_id": "demo", "component_name": "x"}
+    result = asyncio.run(server.call_tool("find_requirements_for", args)).structured_content
+    assert result == {"result": []}
 
 
 def test_disabling_the_project_config_keeps_the_global_tools(tmp_path, monkeypatch):
