@@ -33,6 +33,7 @@ from devgraph.indexer.mentions.extractor import index_file as index_mentions_fil
 from devgraph.indexer.cpp.extractor import extract_cpp_file
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
+from devgraph.paths import is_within
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +154,7 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             resolved = path.resolve()
         except OSError:
             continue
-        if not str(resolved).startswith(str(repo_root.resolve())):
+        if not is_within(resolved, repo_root):
             continue
         if not resolved.exists() or not resolved.is_file():
             continue
@@ -404,7 +405,7 @@ def _index_single_path(
         engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
         indexed += 1
         go_extractions[rel_path] = (nodes, rels)
-    elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
+    elif docs_root is not None and resolved.suffix in (".md", ".markdown") and is_within(resolved, docs_root):
         index_doc_file(engine, repo_id, resolved)
         indexed += 1
     if mentions_enabled and resolved.suffix in (".md", ".markdown"):
@@ -443,7 +444,7 @@ def _expand_with_reverse_dependents(
             resolved = Path(path).resolve()
         except OSError:
             continue
-        if resolved.suffix not in (".py", ".java") or not str(resolved).startswith(str(root_resolved)):
+        if resolved.suffix not in (".py", ".java") or not is_within(resolved, root_resolved):
             continue
         try:
             original_rel_paths.add(resolved.relative_to(root_resolved).as_posix())
@@ -480,7 +481,7 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             resolved = path.resolve()
         except OSError:
             resolved = path
-        if not str(resolved).startswith(str(repo_root.resolve())):
+        if not is_within(resolved, repo_root):
             continue
 
         if resolved.suffix in (".py", ".cs", ".java", ".rs", ".go", ".kt"):
@@ -552,7 +553,21 @@ def _indexable_paths(repo_root: Path) -> set[Path]:
     """Every file under repo_root that a full scan would index: a regular
     file, not under an ignored directory. Shared by full_scan (which indexes
     them) and prune_stale_files (which diffs them against the graph)."""
-    return {p for p in repo_root.rglob("*") if _is_indexable_file(p) and not is_ignored_path(p)}
+    return {
+        p for p in repo_root.rglob("*")
+        if _is_indexable_file(p) and not is_ignored_path(p) and not _links_outside(p, repo_root)
+    }
+
+
+def _links_outside(path: Path, repo_root: Path) -> bool:
+    """True for a symlink whose target resolves outside repo_root."""
+    try:
+        if not path.is_symlink() or is_within(path.resolve(), repo_root):
+            return False
+    except OSError:
+        pass
+    logger.debug("skipping %s: symlink target is outside %s", path, repo_root)
+    return True
 
 
 def prune_stale_files(

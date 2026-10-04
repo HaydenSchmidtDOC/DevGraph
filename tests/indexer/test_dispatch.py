@@ -176,6 +176,28 @@ class TestIndexPaths:
         finally:
             engine.delete_repository(repo_id)
 
+    def test_sibling_directory_sharing_the_repo_name_prefix_is_skipped(self, engine):
+        repo_id = "_smoketest_dispatch_sibling_prefix"
+        with tempfile.TemporaryDirectory() as parent:
+            repo_root = Path(parent) / "proj"
+            repo_root.mkdir()
+            sibling = Path(parent) / "proj-private"
+            sibling.mkdir()
+            sibling_file = sibling / "secret.py"
+            sibling_file.write_text("class ShouldNotAppear:\n    pass\n")
+
+            try:
+                count = index_paths(engine, repo_id, repo_root, {sibling_file})
+                assert count == 0
+
+                result = engine.run_cypher(
+                    "MATCH (c:Class {repo_id: $repo_id, name: 'ShouldNotAppear'}) RETURN COUNT(*) as c",
+                    {"repo_id": repo_id},
+                )
+                assert result[0]["c"] == 0
+            finally:
+                engine.delete_repository(repo_id)
+
     def test_markdown_outside_docs_path_is_skipped(self, engine, temp_repo):
         repo_id = "_smoketest_dispatch_docs_skip"
         note = temp_repo / "README.md"
@@ -349,6 +371,43 @@ class TestFullScan:
         try:
             count = full_scan(engine, repo_id, temp_repo)
             assert count == 1
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_full_scan_skips_symlink_pointing_outside_the_repo(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_symlink_out"
+        (temp_repo / "a.py").write_text("class A:\n    pass\n")
+        with tempfile.TemporaryDirectory() as other_dir:
+            outside_file = Path(other_dir) / "outside.py"
+            outside_file.write_text("class Outside:\n    pass\n")
+            (temp_repo / "link.py").symlink_to(outside_file)
+
+            try:
+                count = full_scan(engine, repo_id, temp_repo)
+                assert count == 1
+
+                result = engine.run_cypher(
+                    "MATCH (c:Class {repo_id: $repo_id}) RETURN c.name as name ORDER BY c.name",
+                    {"repo_id": repo_id},
+                )
+                assert [r["name"] for r in result] == ["A"]
+            finally:
+                engine.delete_repository(repo_id)
+
+    def test_full_scan_follows_symlink_within_the_repo(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_symlink_in"
+        (temp_repo / "pkg").mkdir()
+        (temp_repo / "pkg" / "a.py").write_text("class A:\n    pass\n")
+        (temp_repo / "alias.py").symlink_to(temp_repo / "pkg" / "a.py")
+
+        try:
+            full_scan(engine, repo_id, temp_repo)
+
+            result = engine.run_cypher(
+                "MATCH (c:Class {repo_id: $repo_id}) RETURN c.name as name, c.file as file",
+                {"repo_id": repo_id},
+            )
+            assert [(r["name"], r["file"]) for r in result] == [("A", "pkg/a.py")]
         finally:
             engine.delete_repository(repo_id)
 

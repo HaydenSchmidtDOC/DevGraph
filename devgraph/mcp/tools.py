@@ -17,6 +17,7 @@ import subprocess
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
+from devgraph.paths import is_within
 from devgraph.registry.store import RepoRegistry
 
 import re
@@ -1252,7 +1253,7 @@ def get_source(
         return empty
 
     file_path = (repo.path / file_rel_path).resolve()
-    if not str(file_path).startswith(str(repo.path.resolve())):
+    if not is_within(file_path, repo.path):
         return empty  # never read outside the registered repo root
 
     try:
