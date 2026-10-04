@@ -54,6 +54,8 @@ from devgraph.graph.engine import GraphEngine
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.mcp.catalog import TOOL_CATALOG as _TOOL_CATALOG
 from devgraph.mcp.catalog import builtin_tool_names  # noqa: F401  (re-exported)
+from devgraph.config.project_tools import TOOLS_FILENAME
+from devgraph.mcp.tool_plane import register_project_tools, resolve_session_repo
 from devgraph.registry.store import RepoRegistry
 
 logger = logging.getLogger(__name__)
@@ -223,12 +225,23 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
-def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> MCPServer:
+def build_server(
+    engine: GraphEngine,
+    registry: RepoRegistry | None = None,
+    *,
+    session_repo: Any | None = None,
+    session_source: str = "none",
+) -> MCPServer:
     """Construct an MCPServer with every DevGraph tool registered against `engine`.
 
     `registry` is required for `get_source` (it resolves a repo_id to its
     registered root path to read source off disk); when omitted, a registry
     is opened from settings so existing single-argument callers keep working.
+
+    `session_repo` is the registered repository this session serves
+    `devgraph.tools.yaml` tools for (None serves none); `session_source` says
+    how it was chosen ("env", "cwd" or "none") and is reported by the
+    `devgraph://project-tools` resource.
     """
     settings = get_settings()
     if registry is None:
@@ -464,6 +477,23 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
             the purpose-built tools above whenever one of them fits."""
             return devgraph_tools.run_cypher(engine, query, parameters)
 
+    status = register_project_tools(
+        server, engine, session_repo, session_source, instrument=_instrument, annotations=_READ_ONLY
+    )
+
+    @server.resource(
+        "devgraph://project-tools",
+        name="devgraph-project-tools",
+        title="DevGraph project tools",
+        description=(
+            f"Which repository this session serves {TOOLS_FILENAME} tools for, how it was "
+            "chosen, which tools are served, and notices about ignored or invalid declarations."
+        ),
+        mime_type="application/json",
+    )
+    def project_tools() -> str:
+        return json.dumps(status.to_dict(), indent=2)
+
     @server.resource(
         "devgraph://client-guide",
         name="devgraph-client-guide",
@@ -500,6 +530,19 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
     def tool_catalog() -> str:
         catalog = _TOOL_CATALOG if settings.enable_run_cypher else [
             t for t in _TOOL_CATALOG if t["name"] != "run_cypher"
+        ]
+        catalog = [
+            *catalog,
+            *(
+                {
+                    "name": n,
+                    "identifier_kind": "project tool parameters",
+                    "envelope": True,
+                    "phase": None,
+                    "note": f"from {TOOLS_FILENAME} in {status.repo_id}",
+                }
+                for n in status.served
+            ),
         ]
         return json.dumps(catalog, indent=2)
 
@@ -545,7 +588,8 @@ def main() -> None:
             exc_info=True,
         )
 
-    server = build_server(engine, registry)
+    session_repo, source = resolve_session_repo(registry, os.environ, Path.cwd())
+    server = build_server(engine, registry, session_repo=session_repo, session_source=source)
     try:
         server.run("stdio")
     finally:
