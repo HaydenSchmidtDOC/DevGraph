@@ -31,12 +31,12 @@ tools:
   agent reads to decide whether to call the tool).
 - `cypher`: required; must reference `$repo_id`, which the server will inject
   and the author cannot override; must pass a static read-only check.
-- `parameters`: `name` (`[a-z][a-z0-9_]{0,63}`, not `repo_id`, unique),
+- `parameters`: `name` (Unicode identifier, not `repo_id`, unique),
   `type` (`string | integer | float | boolean`, default `string`),
   `required` (default `true`), optional `default` (must match the type; only
   allowed when `required: false`), optional `description`.
-- Every `$name` the query uses (other than `$repo_id`) is a declared parameter,
-  and every declared parameter is used.
+- Every `$name` or `$`name`` the query uses (other than `$repo_id`) is a declared 
+  parameter, and every declared parameter is used.
 - `max_rows`: 1–1000 (default 100). `timeout_s`: 1–60 (default 10).
 - Only Cypher tools. The epic's script and composition tools need the sandbox
   and the tool plane respectively and arrive with them.
@@ -44,12 +44,17 @@ tools:
 ## Read-only check
 
 String literals, backtick-quoted identifiers and comments are blanked out, then
-the query is scanned (case-insensitively, on word boundaries) for `CREATE`,
-`MERGE`, `SET`, `DELETE`, `DETACH`, `REMOVE`, `DROP`, `FOREACH`, `LOAD CSV`,
-`CALL` and `USE`. Any hit rejects the file. This is defence in depth: when the
-tool plane serves these tools it will also run them in a read transaction.
-`CALL` is rejected outright (procedures and subqueries alike) to keep the rule
-simple and auditable.
+the query is scanned (case-insensitively, with lookaround boundaries that treat
+digits as separators) for `CREATE`, `INSERT`, `MERGE`, `SET`, `DELETE`, 
+`DETACH`, `REMOVE`, `DROP`, `FOREACH`, `LOAD CSV`, `CALL` and `USE`. Any hit 
+rejects the file. APOC references (case-insensitive `apoc.` outside strings) are 
+also rejected. This is defence in depth: when the tool plane serves these tools 
+it will also run them in a read transaction. `CALL` is rejected outright 
+(procedures and subqueries alike) to keep the rule simple and auditable.
+
+The `$repo_id` requirement proves the query *references* the injected parameter, 
+not that it *scopes* every match — the tool plane's runtime (read transaction, 
+injected repo_id) remains the real gate.
 
 ## Built-in names
 
