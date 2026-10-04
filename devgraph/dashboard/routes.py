@@ -39,6 +39,7 @@ from devgraph.config.project_schema import (
 )
 from devgraph.config.settings import get_settings
 from devgraph.dashboard import queries
+from devgraph.dashboard.config_model import GLOBAL_SCOPE, build_config, build_global, build_project
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.dashboard.git_info import get_git_log, get_git_status
 from devgraph.dashboard.layout_store import load_layout, save_layout
@@ -361,7 +362,7 @@ def build_router(
         colors: dict[str, str] = {}
         notices: list[str] = []
         if not record.project_config_enabled:
-            return {"labels": [], "rels": [], "colors": colors, "state": "disabled", "notices": notices}
+            return {"labels": [], "rels": [], "colors": colors, "state": "disabled", "notices": notices, "error": None}
 
         applied = engine.read_applied_schema(record.repo_id)
         current = schema_file_hash(record.path)
@@ -375,10 +376,12 @@ def build_router(
         else:
             state = "pending"
 
+        error = None
         try:
             declaration = load_project_schema(record.path, respect_switch=False)
         except ProjectSchemaError as exc:
             state = "invalid"
+            error = str(exc)
             notices.append(f"{record.repo_id}: schema file is invalid: {exc}")
             declaration = None
         if declaration is not None:
@@ -390,7 +393,8 @@ def build_router(
                     colors[relationship.type] = relationship.color
         if state == "pending":
             notices.append(f"{record.repo_id}: schema file changed since it was applied; rescan to apply it")
-        return {"labels": project_labels, "rels": project_rels, "colors": colors, "state": state, "notices": notices}
+        return {"labels": project_labels, "rels": project_rels, "colors": colors, "state": state, "notices": notices,
+                "error": error}
 
     def _scope_records(repo_id: str) -> list[Any]:
         """The registered repos a scope covers: every repo for `__all__`, else one."""
@@ -581,6 +585,24 @@ def build_router(
     @router.get("/query-rate")
     def get_query_rate(span: int = 3600, interval: int = 60) -> dict[str, Any]:
         return {"buckets": query_log.rate(max(1, span), max(1, interval))}
+
+    def _config_scope(scope: str) -> dict[str, Any]:
+        """One Config page block: the global store (`__global__`) or one active registered repo."""
+        records = registry.list_repos(active_only=True)
+        if scope == GLOBAL_SCOPE:
+            return build_global(records)
+        record = next((r for r in records if r.repo_id == scope), None)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"unknown repo: {scope}")
+        return build_project(record, _repo_schema)
+
+    @router.get("/config")
+    def get_config() -> dict[str, Any]:
+        return build_config(registry.list_repos(active_only=True), _repo_schema)
+
+    @router.get("/config/{scope}")
+    def get_config_scope(scope: str) -> dict[str, Any]:
+        return _config_scope(scope)
 
     @router.get("/mcp-tools")
     def get_mcp_tools() -> list[dict[str, Any]]:
