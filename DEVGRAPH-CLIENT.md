@@ -236,6 +236,15 @@ A path value must be absolute (a relative value is read as a repo id), and a val
 that matches no active registered repository serves nothing. A repository whose project config is disabled (`devgraph config disable`) serves no project tools; `devgraph://project-tools` says so. If `devgraph` is already
 registered in that project, run `claude mcp remove devgraph` first.
 
+**Global tools**: tools defined once with `devgraph config tools ... --global`
+are also served in every session scoped to a repository (an unscoped session
+serves none). Built-in tools win, then project tools, then global tools. Two
+notices can appear in a tool's response envelope: `resolved: project override
+of global tool '<name>'` (the project's tool replaced a global one) and `used
+global tool '<name>': <reason>` (the global tool is served because the project
+tool of that name could not be). `devgraph://project-tools` lists each served
+tool's origin and the global tools file.
+
 `run_cypher` will not appear unless DevGraph's own config has
 `enable_run_cypher=true` set. If it's missing and you need something the
 purpose-built tools genuinely can't express, that's a signal a new high-level

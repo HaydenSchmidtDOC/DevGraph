@@ -51,7 +51,7 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 | Check installation and graph health | `devgraph status`, `devgraph doctor`, `devgraph self-test [repo_id]` |
 | Open the dashboard | `devgraph dashboard` |
 | Configure an MCP client | `devgraph client-config`, `devgraph mcp add`, `devgraph mcp doctor` |
-| View settings, project schema, or tray logs | `devgraph config`, `devgraph config show / validate / eject / enable / disable`, `devgraph logs` |
+| View settings, project schema, or tray logs | `devgraph config`, `devgraph config show / validate / eject / enable / disable`, `devgraph config tools list / add / edit / delete / reset`, `devgraph logs` |
 | Export a repository graph | `devgraph export <repo_id> --format json|cypher|dot` |
 | Update DevGraph | `devgraph update` |
 
@@ -131,6 +131,25 @@ tools:
 - Each query must be read-only (no `CREATE`, `INSERT`, `MERGE`, `SET`, `DELETE`, `DETACH`, `REMOVE`, `DROP`, `FOREACH`, `LOAD CSV`, `CALL`, `USE`, `SHOW`, `TERMINATE`, `ALTER`, `GRANT`, `DENY`, `REVOKE` or `RENAME`, and no `apoc` reference) and must reference `$repo_id`, which DevGraph injects. That check only confirms the query references `$repo_id`; see the scope caveat above. Parameter names may not be Python keywords (`from`, `in`, `class`, ...) or start with `model_`. Every other `$name` it uses must be a declared parameter (`string`, `integer`, `float` or `boolean`), and every declared parameter must be used. `max_rows` is 1-1000 (default 100) and `timeout_s` is 1-60 (default 10).
 - An invalid file is rejected as a whole. `devgraph config validate` (or `--all`) exits non-zero on it, `devgraph config show` prints the declared tools and fails on an invalid file, and `devgraph doctor` reports each repository's tools as absent, valid or invalid.
 - A tool named like one of DevGraph's built-in tools is reported as a warning, not an error; the built-in always wins.
+
+### Global tools
+
+Tools you want in every repository live in a global store, `global-tools.json`, in your DevGraph directory (next to the registry database, never the install location). It uses the same tool format and validation as `devgraph.tools.yaml` and is written atomically; manage it with `devgraph config tools ... --global` rather than by hand.
+
+- **Scoped sessions only.** A Cypher tool needs a repository to inject as `$repo_id`, so global tools are served only in an MCP session scoped to a repository; an unscoped session serves none (`devgraph://project-tools` says so). `devgraph config disable` hides a repository's project tools, not global ones.
+- **Precedence.** Built-in tools always win, then a project tool, then a global tool of the same name. When a project tool replaces a global one its responses carry the notice `resolved: project override of global tool '<name>'`; when a global tool is served in place of a project tool that failed to register (or whose file is invalid at startup), the response carries `used global tool '<name>': <reason>`. `devgraph://project-tools` reports `global_tools_file` and each served tool's `origins` (`global`, `project`, `project (overrides global)`). Edits to either file reload within 2 seconds; an invalid global file keeps the last good global tools.
+
+### Managing tools: `devgraph config tools`
+
+Every subcommand takes `--repo <path>` (default: the current directory's repository) or `--global`, and validates the whole resulting file before writing; nothing invalid is written.
+
+- `list [--json]` shows the tools in effect: built-in (locked), global, and project, with overrides marked (`--global` lists only the store).
+- `add --from <file|->` adds one tool from a YAML or JSON mapping (or stdin). It fails if the name exists in that scope (use `edit`) or is a built-in name.
+- `edit <name> [--from <file|->]` replaces one tool, opening it in `$EDITOR` without `--from`. An unchanged or invalid result writes nothing.
+- `delete <name>` removes one tool (unknown names exit 1).
+- `reset [--yes]` removes every tool in the scope (deletes `devgraph.tools.yaml`, or empties the global store) and asks for confirmation unless `--yes`.
+
+`devgraph.tools.yaml` is edited as text, splicing only the affected tool's lines, so comments and formatting elsewhere survive (comments inside an edited tool are lost). A file whose `tools` value is not a block sequence (for example a flow list) is refused rather than rewritten. The CLI never stages or commits. `config show`, `config validate` and `doctor` also report the global store and which project tools override global ones.
 
 ## Dashboard
 
