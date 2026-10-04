@@ -28,6 +28,7 @@ from devgraph.config.project_tools import (
     TOOLS_FILENAME,
     CypherTool,
     ProjectTools,
+    YAML_LOAD_ERRORS,
     ProjectToolsError,
     parse_project_tools,
     tools_file_path,
@@ -260,7 +261,7 @@ def _declared_names(fingerprint: bytes | str) -> set[str] | None:
         return None
     try:
         data = yaml.safe_load(fingerprint.decode("utf-8"))
-    except (UnicodeDecodeError, yaml.YAMLError):
+    except (UnicodeDecodeError, *YAML_LOAD_ERRORS):
         return None
     tools = data.get("tools") if isinstance(data, dict) else None
     entries = tools if isinstance(tools, list) else []

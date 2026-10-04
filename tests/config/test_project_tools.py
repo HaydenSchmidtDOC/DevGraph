@@ -372,3 +372,18 @@ def test_reserved_parameter_names_are_rejected(tmp_path, name, why):
     with pytest.raises(ProjectToolsError) as err:
         load_text(tmp_path, text)
     assert name in str(err.value) and why in str(err.value)
+
+
+# Inputs on which yaml.safe_load raises something other than yaml.YAMLError.
+NON_YAMLERROR_INPUTS = {
+    "bad date": "version: 1\ntools:\n  - name: t\n    description: 2001-13-45\n",
+    "bad hex int": "version: 1\ntools:\n  - name: t\n    description: !!int 0x\n",
+    "bad timestamp": "version: 1\ntools:\n  - name: t\n    description: !!timestamp nope\n",
+    "deep nesting": "version: 1\ntools: " + "[" * 5000 + "\n",
+}
+
+
+@pytest.mark.parametrize("text", NON_YAMLERROR_INPUTS.values(), ids=NON_YAMLERROR_INPUTS.keys())
+def test_any_yaml_load_failure_is_a_tools_error(tmp_path, text):
+    with pytest.raises(ProjectToolsError, match="malformed YAML"):
+        load_text(tmp_path, text)

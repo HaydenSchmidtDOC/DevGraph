@@ -2046,9 +2046,11 @@ def _read_tool_source(source: str) -> dict:
 def _parse_tool_text(text: str, label: str) -> dict:
     import yaml
 
+    from devgraph.config.project_tools import YAML_LOAD_ERRORS
+
     try:
         tool = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
+    except YAML_LOAD_ERRORS as exc:
         raise _tools_fail(f"{label}: malformed YAML: {exc}")
     if not isinstance(tool, dict):
         raise _tools_fail(f"{label}: expected one tool as a YAML mapping")

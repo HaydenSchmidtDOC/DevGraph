@@ -292,3 +292,49 @@ def test_an_unscoped_load_uses_the_global_fingerprint_it_was_given(tmp_path):
         global_fingerprint=b"",
     )
     assert any("global tools" in n for n in status.notices)
+
+
+BAD_DATE_PROJECT = "version: 1\ntools:\n  - name: list_files\n    description: 2001-13-45\n"
+DEEP = "version: 1\ntools: " + "[" * 5000 + "\n"
+
+
+def test_a_project_file_with_a_bad_date_does_not_stop_the_server(tmp_path, monkeypatch):
+    store(tmp_path, monkeypatch, [G_COUNT, G_LIST])
+    repo = tmp_path / "demo"
+    repo.mkdir()
+    (repo / TOOLS_FILENAME).write_text(BAD_DATE_PROJECT)
+    server, _ = build(tmp_path, monkeypatch)
+    listed = tools(server)
+    assert "search_component" in listed and {"g_count", "list_files"} <= set(listed)
+    current = status(server)
+    assert any(TOOLS_FILENAME in n and "malformed YAML" in n for n in current["notices"])
+    # The bad file still names list_files, so its global stand-in says why.
+    assert call(server, "list_files")["notices"][0].startswith("used global tool 'list_files'")
+
+
+def test_a_global_store_with_a_bad_date_does_not_stop_the_server(tmp_path, monkeypatch):
+    path = store(tmp_path, monkeypatch, [G_COUNT])
+    path.write_text('{"version": 1, "tools": [{"name": "g_count", "description": 2001-13-45}]}')
+    server, _ = build(tmp_path, monkeypatch, project=PROJECT)
+    listed = tools(server)
+    assert "search_component" in listed and "list_files" in listed and "g_count" not in listed
+    assert any(GLOBAL_TOOLS_FILENAME in n and "malformed YAML" in n for n in status(server)["notices"])
+
+
+def test_declared_names_never_raises():
+    from devgraph.mcp.tool_plane import _declared_names
+
+    assert _declared_names(DEEP.encode()) is None
+    assert _declared_names(BAD_DATE_PROJECT.encode()) is None
+
+
+def test_a_bad_global_store_reload_keeps_the_previous_global_tools(tmp_path, monkeypatch):
+    for bad in ('{"version": 1, "tools": [{"name": "g_count", "description": 2001-13-45}]}', DEEP):
+        path = store(tmp_path, monkeypatch, [G_COUNT])
+        server, _ = build(tmp_path, monkeypatch)
+        path.write_text(bad)
+        assert server.devgraph_tool_plane.reload_if_changed() is False
+        assert "g_count" in tools(server)
+        current = status(server)
+        assert current["served"] == ["g_count"]
+        assert any("last good" in n for n in current["notices"])

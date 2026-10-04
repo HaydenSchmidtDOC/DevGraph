@@ -1307,3 +1307,14 @@ def test_an_unreadable_schema_never_hashes_like_a_real_one(tmp_path):
     (tmp_path / SCHEMA_FILENAME).mkdir()
     value = schema_file_hash(tmp_path)
     assert value.startswith("unreadable:") and value != ABSENT_SCHEMA_HASH
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["version: 1\nnode_types:\n  - label: X\n    description: 2001-13-45\n", "version: 1\nnode_types: " + "[" * 5000 + "\n"],
+    ids=["bad date", "deep nesting"],
+)
+def test_any_yaml_load_failure_is_a_schema_error(tmp_path, text):
+    (tmp_path / SCHEMA_FILENAME).write_text(text, encoding="utf-8")
+    with pytest.raises(ProjectSchemaError, match="malformed YAML"):
+        load_project_schema(tmp_path)

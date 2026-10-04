@@ -241,3 +241,15 @@ def test_delete_anchor_used_elsewhere_refused():
     )
     with pytest.raises(ToolsEditError, match=r"anchor used elsewhere \('&base'\)"):
         delete_tool_text(doc, "a")
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["version: 1\ntools:\n  - name: t\n    description: 2001-13-45\n", "version: 1\ntools: " + "[" * 5000 + "\n"],
+    ids=["bad date", "deep nesting"],
+)
+def test_any_yaml_load_failure_is_an_edit_error(text):
+    with pytest.raises(ToolsEditError, match="malformed YAML"):
+        tool_mappings(text)
+    with pytest.raises(ToolsEditError, match="malformed YAML"):
+        add_tool_text(text, {"name": "x"})

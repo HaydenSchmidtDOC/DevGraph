@@ -273,3 +273,51 @@ def test_global_findings_for_doctor(settings, repo, tmp_path, store, runner):
     store.write_text("{not valid")
     findings = cli_main._global_tools_findings([])
     assert findings[0]["failed"] and findings[0]["status"] == "invalid"
+
+
+# -- malformed YAML beyond yaml.YAMLError ------------------------------------
+
+BAD_DATE = "version: 1\ntools:\n  - name: t\n    description: 2001-13-45\n"
+
+
+@pytest.mark.parametrize("command", [["config", "validate"], ["config", "show"], ["config", "tools", "list"]])
+@pytest.mark.parametrize("where", ["project", "global"])
+def test_a_bad_date_is_a_clean_error(runner, settings, repo, store, command, where):
+    if where == "project":
+        (repo / TOOLS_FILENAME).write_text(BAD_DATE)
+    else:
+        store.parent.mkdir(parents=True)
+        store.write_text('{"version": 1, "tools": [{"name": "t", "description": 2001-13-45}]}')
+    result = runner.invoke(app, [*command, "--repo", str(repo)])
+    assert result.exit_code == 1, result.output
+    output = " ".join(result.output.split())  # Rich wraps long paths
+    assert "malformed YAML" in output and "Traceback" not in output
+    assert not isinstance(result.exception, ValueError)
+
+
+def test_a_bad_schema_date_is_a_clean_validate_error(runner, settings, repo):
+    (repo / "devgraph.schema.yaml").write_text("version: 1\nnode_types:\n  - label: X\n    description: 2001-13-45\n")
+    result = runner.invoke(app, ["config", "validate", "--repo", str(repo)])
+    assert result.exit_code == 1 and "malformed YAML" in " ".join(result.output.split())
+    assert not isinstance(result.exception, ValueError)
+
+
+@pytest.mark.parametrize("text", ["name: t\ndescription: 2001-13-45\n", "name: " + "[" * 5000 + "\n"], ids=["date", "deep"])
+def test_add_with_an_unloadable_tool_is_a_clean_error(runner, repo, tmp_path, text):
+    result = add(runner, tmp_path, ["--repo", str(repo)], text=text)
+    assert result.exit_code == 1 and "malformed YAML" in result.output
+    assert not (repo / TOOLS_FILENAME).exists()
+
+
+def test_add_with_an_unloadable_existing_file_is_a_clean_error(runner, repo, tmp_path):
+    (repo / TOOLS_FILENAME).write_text(BAD_DATE)
+    result = add(runner, tmp_path, ["--repo", str(repo)])
+    assert result.exit_code == 1 and "malformed YAML" in result.output
+    assert (repo / TOOLS_FILENAME).read_text() == BAD_DATE
+
+
+def test_add_global_with_a_date_value_is_a_clean_error(runner, tmp_path, store):
+    result = add(runner, tmp_path, ["--global"], text=tool_yaml(extra="").replace("Count this repository's nodes.", "2001-01-02"))
+    assert result.exit_code == 1, result.output
+    assert not isinstance(result.exception, TypeError) and "description" in result.output
+    assert not store.exists()

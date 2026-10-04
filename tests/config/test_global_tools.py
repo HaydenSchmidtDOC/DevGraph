@@ -84,3 +84,18 @@ def test_save_is_atomic(tmp_path, monkeypatch):
         save_global_tools([{**TOOL, "name": "other"}], path)
     assert path.read_bytes() == before
     assert os.listdir(tmp_path) == ["g.json"]
+
+
+def test_a_bad_date_in_the_store_is_a_tools_error(tmp_path):
+    path = tmp_path / "g.json"
+    path.write_text('{"version": 1, "tools": [{"name": "t", "description": 2001-13-45}]}')
+    with pytest.raises(ProjectToolsError, match="malformed YAML"):
+        load_global_tools(path)
+
+
+@pytest.mark.parametrize("value", [__import__("datetime").date(2001, 1, 2), b"\xc7,"], ids=["date", "bytes"])
+def test_save_refuses_values_json_cannot_hold(tmp_path, value):
+    path = tmp_path / "g.json"
+    with pytest.raises(ProjectToolsError):
+        save_global_tools([{**TOOL, "description": value}], path)
+    assert not path.exists()

@@ -515,3 +515,14 @@ def test_switching_the_project_config_off_and_on_drops_and_restores_the_tools(tm
     assert plane.reload_if_changed() is True
     assert "list_files" in tools(server)
     assert status(server)["notices"] == []
+
+
+def test_a_bad_date_or_deep_nesting_save_keeps_the_last_good_tools(tmp_path, monkeypatch):
+    for bad in ("version: 1\ntools:\n  - name: x\n    description: 2001-13-45\n", "version: 1\ntools: " + "[" * 5000 + "\n"):
+        server, repo = build(tmp_path, monkeypatch)
+        (repo / TOOLS_FILENAME).write_text(bad)
+        assert server.devgraph_tool_plane.reload_if_changed() is False
+        assert "list_files" in tools(server)
+        current = status(server)
+        assert current["served"] == ["list_files"]
+        assert any("keeping the last good tools" in n for n in current["notices"])

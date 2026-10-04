@@ -13,7 +13,7 @@ import re
 
 import yaml
 
-from devgraph.config.project_tools import TOOLS_VERSION
+from devgraph.config.project_tools import TOOLS_VERSION, YAML_LOAD_ERRORS
 
 
 class ToolsEditError(Exception):
@@ -42,7 +42,7 @@ def dump_tool(tool: dict) -> str:
 def _load(text: str) -> object:
     try:
         return yaml.safe_load(text)
-    except yaml.YAMLError as exc:
+    except YAML_LOAD_ERRORS as exc:
         raise ToolsEditError(f"malformed YAML: {exc}") from exc
 
 
@@ -75,7 +75,7 @@ class _Doc:
         self.items: list[yaml.Node] = []
         try:
             root = yaml.compose(normalized)
-        except yaml.YAMLError as exc:
+        except YAML_LOAD_ERRORS as exc:
             raise ToolsEditError(f"malformed YAML: {exc}") from exc
         if root is None:
             return
@@ -159,7 +159,7 @@ class _Doc:
         """Refuse an edit that leaves an alias without its anchor."""
         try:
             yaml.compose("\n".join(self.lines) + "\n")
-        except yaml.YAMLError as exc:
+        except YAML_LOAD_ERRORS as exc:
             anchors = sorted(set(re.findall(r"undefined alias '([^']+)'", str(exc))))
             if anchors:
                 raise ToolsEditError(

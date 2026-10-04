@@ -40,6 +40,7 @@ from pydantic import (
 )
 
 from devgraph.config.project_switch import project_config_enabled
+from devgraph.config.project_tools import YAML_LOAD_ERRORS
 from devgraph.graph.schema import (
     NODE_LABELS,
     RELATIONSHIP_TYPES,
@@ -542,7 +543,7 @@ def load_project_schema(repo_root: Path, *, respect_switch: bool = True) -> Proj
 
     try:
         document = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
+    except YAML_LOAD_ERRORS as exc:
         raise ProjectSchemaError(f"{path}: malformed YAML: {exc}") from exc
 
     if document is None:

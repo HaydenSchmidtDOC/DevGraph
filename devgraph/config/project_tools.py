@@ -74,6 +74,12 @@ _PARAM_AND_LITERALS = re.compile(
 _APOC = re.compile(r"(?<![A-Za-z_.$])apoc\s*\.", re.I)
 
 
+# What `yaml.safe_load` can raise on bad input: besides yaml.YAMLError, a constructor
+# raises ValueError/TypeError/AttributeError (e.g. `2001-13-45`, `!!int 0x`) and deep
+# nesting raises RecursionError. Every one of them means "this file is malformed".
+YAML_LOAD_ERRORS: tuple[type[BaseException], ...] = (yaml.YAMLError, ValueError, TypeError, AttributeError, RecursionError)
+
+
 class ProjectToolsError(Exception):
     """A tools file is unreadable, malformed or invalid. Fail-closed."""
 
@@ -289,12 +295,17 @@ def parse_project_tools(text: str, path: Path) -> ProjectTools:
     """Parse and validate the text of a tools file; `path` only labels errors."""
     try:
         document = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
+    except YAML_LOAD_ERRORS as exc:
         raise ProjectToolsError(f"{path}: malformed YAML: {exc}") from exc
     if document is None:
         raise ProjectToolsError(f"{path}: the file is empty; delete it, or declare 'version: {TOOLS_VERSION}'")
     if not isinstance(document, dict):
         raise ProjectToolsError(f"{path}: expected a YAML mapping at the document root, found {type(document).__name__}")
+    return validate_project_tools(document, path)
+
+
+def validate_project_tools(document: dict, path: Path) -> ProjectTools:
+    """Validate an already-loaded tools document; `path` only labels errors."""
     try:
         return ProjectTools.model_validate(document)
     except ValidationError as exc:
