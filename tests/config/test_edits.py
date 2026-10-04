@@ -205,6 +205,18 @@ def test_schema_add_duplicate_and_wrong_shape(tmp_path):
     assert code(exc) == "invalid"
 
 
+def test_schema_exists_carries_the_name_for_node_types_only(tmp_path):
+    (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
+    with pytest.raises(ConfigEditError) as exc:
+        edits.add_schema_entry(tmp_path, TICKET)
+    assert exc.value.name == "Ticket"
+    rel = {"type": "FEEDS", "provider": "custom", "custom": {"name": "f"}, "from": "Ticket", "to": "Ticket"}
+    edits.add_schema_entry(tmp_path, rel)
+    with pytest.raises(ConfigEditError) as exc:
+        edits.add_schema_entry(tmp_path, rel)
+    assert code(exc) == "exists" and exc.value.name is None
+
+
 def test_schema_invalid_result_writes_nothing(tmp_path):
     path = tmp_path / "devgraph.schema.yaml"
     path.write_text(SCHEMA_FILE)

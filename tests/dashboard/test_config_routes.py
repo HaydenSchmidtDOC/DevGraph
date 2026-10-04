@@ -1439,3 +1439,126 @@ def test_toggle_non_json_is_415_and_oversized_is_413(client, registry, tmp_path,
     )
     assert response.status_code == 413
     assert registry.get("repo-a").project_config_enabled is True
+
+
+# --- conflicts and copy-shaped sequences --------------------------------------------------------
+
+def _widget_schema(key: str) -> str:
+    return (f"version: 1\nnode_types:\n  - label: Widget\n    key: [{key}]\n    metadata:\n"
+            f"      - name: {key}\n        type: string\n        required: true\n")
+
+
+def _widget_badges(client, scope: str) -> list[dict]:
+    block = client.get(f"/api/config/{scope}").json()
+    return [b for n in block["schema"]["node_types"] if n["label"] == "Widget" for b in n["badges"]]
+
+
+def test_differently_keyed_labels_badge_each_repo_with_the_cli_text(client, registry, tmp_path):
+    from devgraph.config.schema_findings import schema_conflicts
+
+    a, b = _repo(tmp_path, registry, "repo-a"), _repo(tmp_path, registry, "repo-b")
+    _write(a.path, SCHEMA_FILENAME, _widget_schema("slug"))
+    _write(b.path, SCHEMA_FILENAME, _widget_schema("code"))
+    detail = schema_conflicts(registry.list_repos())[0]["detail"]
+    models = {p["repo_id"]: p for p in client.get("/api/config").json()["projects"]}
+    for repo, other in (("repo-a", "repo-b"), ("repo-b", "repo-a")):
+        found = [x for n in models[repo]["schema"]["node_types"] for x in n["badges"]]
+        assert [(x["level"], x["kind"], x["text"], x["detail"]) for x in found] == [
+            ("error", "schema-conflict", f"Key conflict with {other}", detail)]
+    assert _widget_badges(client, "repo-a")[0]["kind"] == "schema-conflict"  # single-scope GET
+
+
+def test_identical_declarations_have_no_badge(client, registry, tmp_path):
+    for name in ("repo-a", "repo-b"):
+        _write(_repo(tmp_path, registry, name).path, SCHEMA_FILENAME, _widget_schema("slug"))
+    assert _widget_badges(client, "repo-a") == []
+
+
+def test_disabled_and_inactive_repos_still_conflict(client, registry, tmp_path):
+    a, b = _repo(tmp_path, registry, "repo-a"), _repo(tmp_path, registry, "repo-b")
+    _write(a.path, SCHEMA_FILENAME, _widget_schema("slug"))
+    _write(b.path, SCHEMA_FILENAME, _widget_schema("code"))
+    registry.set_project_config_enabled("repo-b", False)
+    assert [x["kind"] for x in _widget_badges(client, "repo-a")] == ["schema-conflict"]
+    registry._set_flag("repo-b", "active", False)  # inactive: not listed on the page, still in the database
+    assert [r["repo_id"] for r in client.get("/api/config").json()["projects"]] == ["repo-a"]
+    assert [x["kind"] for x in _widget_badges(client, "repo-a")] == ["schema-conflict"]
+
+
+def test_schema_add_dry_run_warns_about_a_new_conflict_and_writes_nothing(client, registry, tmp_path):
+    a, b = _repo(tmp_path, registry, "repo-a"), _repo(tmp_path, registry, "repo-b")
+    _write(a.path, SCHEMA_FILENAME, _widget_schema("slug"))
+    schema = _write(b.path, SCHEMA_FILENAME, "version: 1\nnode_types: []\n")
+    before = schema.read_bytes()
+    body = {"yaml": _widget_schema("code").split("node_types:\n")[1].replace("  - ", "", 1).replace("\n    ", "\n"),
+            "dry_run": True}
+    res = _send(client, "POST", "/api/config/repo-b/schema/node_types", _fp(client, "repo-b", "schema"), body)
+    assert res.status_code == 200, res.text
+    assert any(w.startswith("Creates a schema conflict:") for w in res.json()["warnings"])
+    assert schema.read_bytes() == before
+
+
+def test_an_edit_keeping_an_existing_conflict_does_not_repeat_it(client, registry, tmp_path):
+    a, b = _repo(tmp_path, registry, "repo-a"), _repo(tmp_path, registry, "repo-b")
+    _write(a.path, SCHEMA_FILENAME, _widget_schema("slug"))
+    _write(b.path, SCHEMA_FILENAME, _widget_schema("code"))
+    entry = "label: Widget\nkey: [code]\nmetadata:\n  - name: code\n    type: string\n    required: true\n    description: x\n"
+    res = _send(client, "PUT", "/api/config/repo-b/schema/node_types/Widget", _fp(client, "repo-b", "schema"),
+                {"yaml": entry, "dry_run": True})
+    assert res.status_code == 200, res.text
+    assert not any("Creates a schema conflict" in w for w in res.json()["warnings"])
+
+
+def test_node_type_copy_sequence_409_name_then_replace_dry_run_and_write(client, registry, tmp_path):
+    a, b = _repo(tmp_path, registry, "repo-a"), _repo(tmp_path, registry, "repo-b")
+    _write(a.path, SCHEMA_FILENAME, SCHEMA)
+    dest = _write(b.path, SCHEMA_FILENAME, SCHEMA)
+    source_yaml = client.get("/api/config/repo-a").json()["schema"]["node_types"][0]["yaml"]
+    fp = _fp(client, "repo-b", "schema")
+    taken = _send(client, "POST", "/api/config/repo-b/schema/node_types", fp, {"yaml": source_yaml, "dry_run": True})
+    assert taken.status_code == 409 and taken.json()["detail"]["name"] == "Widget"
+    dry = _send(client, "PUT", "/api/config/repo-b/schema/node_types/Widget", fp, {"yaml": source_yaml, "dry_run": True})
+    assert dry.status_code == 200 and dry.json()["written"] is False
+    done = _send(client, "PUT", "/api/config/repo-b/schema/node_types/Widget", fp, {"yaml": source_yaml})
+    assert done.status_code == 200 and done.json()["written"] is True
+    assert dest.exists()
+    assert not (b.path / ".git" / "index").exists()
+
+
+def test_project_tool_copies_to_the_global_store(client, registry, tmp_path, global_store):
+    a = _repo(tmp_path, registry)
+    _write(a.path, TOOLS_FILENAME, TOOL.format(name="finder"))
+    yaml_text = client.get("/api/config/repo-a").json()["tools"]["entries"][0]["yaml"]
+    res = _send(client, "POST", "/api/config/__global__/tools", _fp(client, "__global__"), {"yaml": yaml_text})
+    assert res.status_code == 201, res.text
+    assert [e["name"] for e in client.get("/api/config/__global__").json()["tools"]["entries"]] == ["finder"]
+
+
+def test_relationship_copy_with_a_missing_endpoint_is_422(client, registry, tmp_path):
+    _repo(tmp_path, registry, "repo-a")
+    b = _repo(tmp_path, registry, "repo-b")
+    _write(b.path, SCHEMA_FILENAME, "version: 1\nnode_types: []\n")
+    rel = "type: FEEDS\nprovider: custom\ncustom: {name: f}\nfrom: Widget\nto: Widget\n"
+    res = _send(client, "POST", "/api/config/repo-b/schema/relationships", _fp(client, "repo-b", "schema"),
+                {"yaml": rel, "dry_run": True})
+    assert res.status_code == 422
+    assert res.json()["detail"]["code"] == "invalid"
+
+
+def test_copy_to_a_stale_destination_is_412_and_leaves_bytes_alone(client, registry, tmp_path):
+    b = _repo(tmp_path, registry, "repo-b")
+    schema = _write(b.path, SCHEMA_FILENAME, SCHEMA)
+    before = schema.read_bytes()
+    res = _send(client, "POST", "/api/config/repo-b/schema/node_types", "0" * 64, {"yaml": WIDGET})
+    assert res.status_code == 412
+    assert schema.read_bytes() == before
+
+
+def test_global_block_run_cypher_enabled_follows_the_setting(client, monkeypatch):
+    from devgraph.config.settings import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "enable_run_cypher", False, raising=False)
+    assert client.get("/api/config").json()["global"]["tools"]["run_cypher_enabled"] is False
+    monkeypatch.setattr(settings, "enable_run_cypher", True, raising=False)
+    assert client.get("/api/config").json()["global"]["tools"]["run_cypher_enabled"] is True

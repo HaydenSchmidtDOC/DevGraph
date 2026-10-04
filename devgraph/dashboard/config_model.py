@@ -139,6 +139,7 @@ def build_global(records: list[Any], resolutions: dict[str, Any] | None = None) 
             "badges": _file_badges(state, error, GLOBAL_TOOLS_FILENAME),
             "effect_note": edits.tools_effect_note(None, None),
             "builtin": _builtin_tools(),
+            "run_cypher_enabled": get_settings().enable_run_cypher,
             "entries": [_global_entry(e, overridden.get(e["name"], [])) for e in _tool_entries(text)],
         },
     }
@@ -189,7 +190,22 @@ def _schema_badges(state: str, error: str | None) -> list[dict[str, str]]:
     }.get(state, [])
 
 
-def _schema_block(record: Any, root: Path, info: dict[str, Any]) -> dict[str, Any]:
+def _conflict_badges(label: str, repo_id: str, conflicts: list[dict]) -> list[dict[str, str]]:
+    for finding in conflicts:
+        if finding["label"] != label.casefold() or repo_id not in finding["repo_ids"]:
+            continue
+        mine = next((d for d in finding["declarations"] if d["repo_id"] == repo_id), None)
+        if mine is None:
+            continue
+        others = sorted({
+            d["repo_id"] for d in finding["declarations"]
+            if d["repo_id"] != repo_id and (d["label"], d["key"]) != (mine["label"], mine["key"])
+        })
+        return [badge("error", "schema-conflict", f"Key conflict with {', '.join(others)}", finding["detail"])]
+    return []
+
+
+def _schema_block(record: Any, root: Path, info: dict[str, Any], conflicts: list[dict]) -> dict[str, Any]:
     from devgraph.config.project_schema import ProjectSchemaError, parse_project_schema
 
     path = root / SCHEMA_FILENAME
@@ -237,13 +253,18 @@ def _schema_block(record: Any, root: Path, info: dict[str, Any]) -> dict[str, An
         "extends": extends,
         "badges": _schema_badges(state, error),
         "node_types": [
-            {"label": e["label"], "yaml": dump_entry(e), "editable": True, "badges": []} for e in node_entries
+            {"label": e["label"], "yaml": dump_entry(e), "editable": True,
+             "badges": _conflict_badges(e["label"], record.repo_id, conflicts)}
+            for e in node_entries
         ],
         "relationships": relationships,
     }
 
 
-def build_project(record: Any, schema_info: Callable[[Any], dict[str, Any]], status: Any | None = None) -> dict[str, Any]:
+def build_project(
+    record: Any, schema_info: Callable[[Any], dict[str, Any]], status: Any | None = None,
+    conflicts: list[dict] | None = None,
+) -> dict[str, Any]:
     from devgraph.mcp.tool_plane import resolve_tools
 
     root = Path(record.path)
@@ -268,7 +289,7 @@ def build_project(record: Any, schema_info: Callable[[Any], dict[str, Any]], sta
             "tools": edits.tools_effect_note(root, record),
             "schema": edits.schema_effect_note(root, record),
         },
-        "schema": _schema_block(record, root, schema_info(record)),
+        "schema": _schema_block(record, root, schema_info(record), conflicts or []),
         "tools": {
             "file": TOOLS_FILENAME,
             "state": state,
@@ -280,9 +301,11 @@ def build_project(record: Any, schema_info: Callable[[Any], dict[str, Any]], sta
     }
 
 
-def build_config(records: list[Any], schema_info: Callable[[Any], dict[str, Any]]) -> dict[str, Any]:
+def build_config(
+    records: list[Any], schema_info: Callable[[Any], dict[str, Any]], conflicts: list[dict] | None = None
+) -> dict[str, Any]:
     resolutions = _resolutions(records)  # each repo once, shared by the global and project blocks
     return {
         "global": build_global(records, resolutions),
-        "projects": [build_project(r, schema_info, status=resolutions[r.repo_id]) for r in records],
+        "projects": [build_project(r, schema_info, status=resolutions[r.repo_id], conflicts=conflicts) for r in records],
     }

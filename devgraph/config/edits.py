@@ -42,7 +42,7 @@ EDIT_INSTEAD = " — edit it instead"
 class ConfigEditError(Exception):
     """A config edit was refused. `code` is one of: locked, exists, not_found, ambiguous,
     invalid, stale, not_regular, unreadable, io. `name` is the taken entry name on a
-    tool `exists`, so a caller can offer to replace that entry instead."""
+    tool or node type `exists`, so a caller can offer to replace that entry instead."""
 
     def __init__(self, message: str, code: str = "invalid", name: str | None = None) -> None:
         super().__init__(message)
@@ -587,7 +587,7 @@ def add_schema_entry(
         name = entry[ident]
         if section == "node_types" and any(isinstance(e, dict) and e.get(ident) == name for e in existing):
             raise ConfigEditError(
-                f"a node type named {name!r} already exists{EDIT_INSTEAD}", "exists"
+                f"a node type named {name!r} already exists{EDIT_INSTEAD}", "exists", name=name
             )
         if section == "relationships" and duplicate_relationship(entry, existing):
             raise ConfigEditError(f"an identical relationship {name!r} already exists", "exists")

@@ -45,6 +45,7 @@ from devgraph.config.project_schema import (
     load_project_schema,
     schema_file_hash,
 )
+from devgraph.config.schema_findings import introduced_conflicts, schema_conflicts
 from devgraph.config.settings import get_settings
 from devgraph.dashboard import queries
 from devgraph.dashboard.config_model import GLOBAL_SCOPE, build_config, build_global, build_project, scrub
@@ -732,11 +733,14 @@ def build_router(
         record = next((r for r in records if r.repo_id == scope), None)
         if record is None:
             raise HTTPException(status_code=404, detail=f"unknown repo: {scope}")
-        return build_project(record, _config_schema_info)
+        return build_project(record, _config_schema_info, conflicts=schema_conflicts(registry.list_repos()))
 
     @router.get("/config")
     def get_config() -> dict[str, Any]:
-        return build_config(registry.list_repos(active_only=True), _config_schema_info)
+        return build_config(
+            registry.list_repos(active_only=True), _config_schema_info,
+            conflicts=schema_conflicts(registry.list_repos()),
+        )
 
     @router.get("/config/{scope}")
     def get_config_scope(scope: str) -> dict[str, Any]:
@@ -789,6 +793,9 @@ def build_router(
                 message = f"{path.name} is a symlink or not a regular file; fix it by hand"
             raise _config_error(status, code, message, _config_scope(scope), exc.name) from exc
         notes = [*result.notes, effect]
+        warnings = list(result.warnings)
+        if kind == "schema":  # reads other repositories' files only; deletes and resets introduce none
+            warnings += introduced_conflicts(registry.list_repos(), scope, result.before, result.after)
         block = _config_scope(scope)
         part = block["tools"] if kind == "tools" else block["schema"]
         if result.written:
@@ -810,7 +817,7 @@ def build_router(
             "written": result.written,
             "file": path.name,
             "fingerprint": fingerprint,
-            "warnings": [scrub(w, path, root) for w in result.warnings],
+            "warnings": [scrub(w, path, root) for w in warnings],
             "notes": [scrub(n, path, root) for n in notes],
             "scope": block,
         }
