@@ -117,6 +117,11 @@ _TOOL_CATALOG: list[dict[str, Any]] = [
 ]
 
 
+def builtin_tool_names() -> frozenset[str]:
+    """Names of DevGraph's own MCP tools: a project tool may not take one over."""
+    return frozenset(entry["name"] for entry in _TOOL_CATALOG)
+
+
 def telemetry_path() -> Path:
     """Local JSONL store of MCP tool calls.
 

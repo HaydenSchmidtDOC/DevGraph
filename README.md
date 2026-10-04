@@ -102,6 +102,32 @@ Every indexable file becomes a `File` node and every directory containing one a 
 - `devgraph config validate` checks the file (or every registered repository's with `--all`) and exits non-zero on an invalid schema or a cross-repository conflict; `devgraph config show` prints the effective schema and where each entry comes from; `devgraph config eject` writes a commented starter file and never overwrites an existing one.
 - `devgraph config` alone still shows DevGraph's settings; a single setting is now `devgraph config settings <key>`, and secret settings are masked.
 
+## Project tools (preview)
+
+A repository may declare read-only Cypher tools in an optional `devgraph.tools.yaml` at its root:
+
+```yaml
+version: 1
+tools:
+  - name: list_folder
+    description: List the files directly inside a folder.
+    cypher: |
+      MATCH (f:File {repo_id: $repo_id})-[:IS_CHILD_OF]->(:Folder {repo_id: $repo_id, path: $folder})
+      RETURN f.path AS path ORDER BY path
+    parameters:
+      - name: folder
+        type: string
+        required: true
+        description: Repo-relative folder path ("." for the root).
+    max_rows: 100
+    timeout_s: 10
+```
+
+- **DevGraph does not serve these tools yet.** This release only validates and reports the file; exposing the tools to MCP clients is the next piece of work.
+- Each query must be read-only (no `CREATE`, `MERGE`, `SET`, `DELETE`, `CALL`, `apoc.` and the like) and must reference `$repo_id`, which DevGraph will inject. Every other `$name` it uses must be a declared parameter (`string`, `integer`, `float` or `boolean`), and every declared parameter must be used. `max_rows` is 1-1000 (default 100) and `timeout_s` is 1-60 (default 10).
+- An invalid file is rejected as a whole. `devgraph config validate` (or `--all`) exits non-zero on it, `devgraph config show` prints the declared tools and fails on an invalid file, and `devgraph doctor` reports each repository's tools as absent, valid or invalid.
+- A tool named like one of DevGraph's built-in tools is reported as a warning, not an error; the built-in always wins.
+
 ## Dashboard
 
 The tray app serves the dashboard at `http://127.0.0.1:8765`. It shows registered repositories, graph and git information, query telemetry, an interactive graph canvas, query-driven highlighting, and saved per-repository layouts. The repository picker can register a local path and run its initial scan; if indexing fails, the registration remains available for retry. Server-Sent Events refresh the view after indexing changes.

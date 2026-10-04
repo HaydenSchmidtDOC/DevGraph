@@ -715,6 +715,37 @@ def _project_schema_findings(repos: list[Any]) -> list[dict[str, Any]]:
     return findings
 
 
+def _project_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
+    """Per-repository `devgraph.tools.yaml` state, in the same shape as
+    `_project_schema_findings`. A tool named like a built-in is a non-failing
+    warning: the built-in is always used, as the tool plane will report."""
+    from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError, load_project_tools
+    from devgraph.mcp.server import builtin_tool_names
+
+    builtin = builtin_tool_names()
+    findings: list[dict[str, Any]] = []
+    for repo in sorted(repos, key=lambda r: r.repo_id):
+        try:
+            declared = load_project_tools(repo.path)
+        except ProjectToolsError as exc:
+            findings.append({"repo_id": repo.repo_id, "status": "invalid", "detail": str(exc), "failed": True})
+            continue
+        if declared is None:
+            findings.append({"repo_id": repo.repo_id, "status": "absent", "detail": f"no {TOOLS_FILENAME}", "failed": False})
+            continue
+        names = ", ".join(tool.name for tool in declared.tools)
+        findings.append({"repo_id": repo.repo_id, "status": "valid", "detail": f"tools: {names or 'none'}", "failed": False})
+        for tool in declared.tools:
+            if tool.name in builtin:
+                findings.append({
+                    "repo_id": repo.repo_id,
+                    "status": "warning",
+                    "detail": f"{TOOLS_FILENAME}: tool {tool.name!r} has the name of a built-in tool; the built-in will be used",
+                    "failed": False,
+                })
+    return findings
+
+
 @app.command()
 def doctor() -> None:
     """Run a heavier environment-drift diagnostic than `status`.
@@ -837,6 +868,20 @@ def doctor() -> None:
             any_failed = True
         else:
             console.print(f"  [green][OK][/green] {escape(str(subject))}: {escape(finding['detail'])}")
+
+    console.print("[bold]Project tools[/bold]")
+    tools_findings = _project_tools_findings(registered_repos)
+    if not tools_findings:
+        console.print("  [green][OK][/green] no registered repositories to check")
+    for finding in tools_findings:
+        subject = escape(str(finding["repo_id"]))
+        if finding["failed"]:
+            console.print(f"  [red][X] {subject}:[/red] {escape(finding['detail'])}")
+            any_failed = True
+        elif finding["status"] == "warning":
+            console.print(f"  [yellow][!] {subject}:[/yellow] {escape(finding['detail'])}")
+        else:
+            console.print(f"  [green][OK][/green] {subject}: {escape(finding['detail'])}")
 
     # 8. Tray/watcher liveness
     console.print("[bold]Live Watcher[/bold]")
@@ -1535,6 +1580,32 @@ def _schema_report(repo_root: Path | None) -> dict[str, Any]:
     }
 
 
+def _tools_report(repo_root: Path) -> dict[str, Any]:
+    """A repository's project tools for `config show`. Raises ProjectToolsError."""
+    from devgraph.config.project_tools import load_project_tools, tools_file_path
+
+    declared = load_project_tools(repo_root)
+    if declared is None:
+        return {"status": "absent", "tools_file": None, "tools": []}
+    return {
+        "status": "valid",
+        "tools_file": str(tools_file_path(repo_root)),
+        "tools": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": [
+                    {"name": p.name, "type": p.type, "required": p.required, "default": p.default}
+                    for p in tool.parameters
+                ],
+                "max_rows": tool.max_rows,
+                "timeout_s": tool.timeout_s,
+            }
+            for tool in declared.tools
+        ],
+    }
+
+
 @config_app.command("show")
 def config_show(
     ctx: typer.Context,
@@ -1545,8 +1616,10 @@ def config_show(
     """Show the effective graph schema for a repository and where each entry comes from.
 
     Built-in node types are keyed by DevGraph's own identity rules (JSON `key: null`).
+    Also shows the repository's project tools.
     """
     from devgraph.config.project_schema import SCHEMA_FILENAME, ProjectSchemaError
+    from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError
 
     if global_only and repo is not None:
         ctx.fail("use either --global or --repo, not both")
@@ -1556,6 +1629,15 @@ def config_show(
     except ProjectSchemaError as exc:
         console.print(f"[red][X] Invalid project schema:[/red] {escape(str(exc))}")
         raise typer.Exit(code=1)
+
+    if root is None:
+        report["tools"] = None
+    else:
+        try:
+            report["tools"] = _tools_report(root)
+        except ProjectToolsError as exc:
+            console.print(f"[red][X] Invalid project tools:[/red] {escape(str(exc))}")
+            raise typer.Exit(code=1)
 
     if as_json:
         typer.echo(json.dumps(report, indent=2))
@@ -1586,6 +1668,21 @@ def config_show(
         rels.add_row(rel["type"], rel["from"] or "any", rel["to"] or "any", rel["provider"], rel["origin"])
     console.print(rels)
 
+    tools = report["tools"]
+    if tools is not None:
+        if tools["status"] == "absent":
+            console.print(f"No {TOOLS_FILENAME} — no project tools")
+        else:
+            table = Table(title=f"Project tools ({escape(tools['tools_file'])})")
+            table.add_column("Name", style="cyan")
+            table.add_column("Parameters")
+            table.add_column("Max rows")
+            table.add_column("Timeout")
+            for tool in tools["tools"]:
+                params = ", ".join(p["name"] + ("" if p["required"] else "?") for p in tool["parameters"]) or "—"
+                table.add_row(tool["name"], params, str(tool["max_rows"]), f"{tool['timeout_s']}s")
+            console.print(table)
+
 
 @config_app.command("validate")
 def config_validate(
@@ -1593,7 +1690,7 @@ def config_validate(
     repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
     all_repos: bool = typer.Option(False, "--all", help="Check every registered repository, and conflicts between them."),
 ) -> None:
-    """Fail-closed check of devgraph.schema.yaml. Exits 1 if anything is invalid or conflicting."""
+    """Fail-closed check of devgraph.schema.yaml and devgraph.tools.yaml. Exits 1 if anything is invalid or conflicting."""
     from types import SimpleNamespace
 
     if all_repos and repo is not None:
@@ -1611,9 +1708,9 @@ def config_validate(
         root = _repo_dir(repo or Path("."))
         repos = [SimpleNamespace(repo_id=str(root), path=root)]
 
-    findings = _project_schema_findings(repos)
+    findings = _project_schema_findings(repos) + _project_tools_findings(repos)
     for finding in findings:
-        colour = "red" if finding["failed"] else "green"
+        colour = "red" if finding["failed"] else ("yellow" if finding["status"] == "warning" else "green")
         subject = finding["repo_id"] or "cross-repository"
         console.print(f"[{colour}]{finding['status']}[/{colour}] {escape(str(subject))}: {escape(finding['detail'])}")
     if any(finding["failed"] for finding in findings):

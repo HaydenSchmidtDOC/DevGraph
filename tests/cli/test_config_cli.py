@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 from devgraph.cli import main as cli_main
 from devgraph.cli.main import app
 from devgraph.config.project_schema import SCHEMA_FILENAME, load_project_schema, starter_schema_text
+from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.config.settings import Settings
 from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.registry.store import RepoRegistry
@@ -329,3 +330,81 @@ def test_group_json_before_a_subcommand_is_rejected(runner, settings):
     assert result.exit_code == 2
     assert "devgraph config show --json" in result.output
     assert runner.invoke(app, ["config", "--json"]).exit_code == 0
+
+
+# ── project tools ─────────────────────────────────────────────────────────
+
+TOOLS = """
+    version: 1
+    tools:
+      - name: count_nodes
+        description: Count this repository's nodes.
+        cypher: |
+          MATCH (n {repo_id: $repo_id}) RETURN count(n) AS n
+"""
+SHADOWING_TOOLS = TOOLS.replace("count_nodes", "search_component")
+
+
+def write_tools(repo, text):
+    (repo / TOOLS_FILENAME).write_text(textwrap.dedent(text))
+    return repo
+
+
+def test_validate_reports_tools_valid(runner, settings, tmp_path):
+    result = runner.invoke(app, ["config", "validate", "--repo", str(write_tools(tmp_path, TOOLS))])
+    assert result.exit_code == 0, result.output
+    assert "count_nodes" in result.output
+
+
+def test_validate_fails_on_an_invalid_tools_file_even_with_a_valid_schema(runner, settings, tmp_path):
+    write(tmp_path, WIDGET)
+    write_tools(tmp_path, TOOLS.replace("RETURN count(n) AS n", "SET n.x = 1 RETURN n"))
+    result = runner.invoke(app, ["config", "validate", "--repo", str(tmp_path)])
+    assert result.exit_code == 1
+    assert TOOLS_FILENAME in result.output and "read-only" in result.output
+
+
+def test_validate_warns_when_a_tool_shadows_a_builtin(runner, settings, tmp_path):
+    result = runner.invoke(app, ["config", "validate", "--repo", str(write_tools(tmp_path, SHADOWING_TOOLS))])
+    assert result.exit_code == 0
+    assert "warning" in result.output and "built-in" in result.output
+
+
+def test_show_json_includes_tools(runner, settings, tmp_path):
+    data = show_json(runner, "--repo", str(write_tools(tmp_path, TOOLS)))
+    assert data["tools"]["status"] == "valid"
+    assert [t["name"] for t in data["tools"]["tools"]] == ["count_nodes"]
+    assert data["tools"]["tools"][0]["max_rows"] == 100
+
+
+def test_show_without_a_tools_file(runner, settings, tmp_path):
+    data = show_json(runner, "--repo", str(tmp_path))
+    assert data["tools"] == {"status": "absent", "tools_file": None, "tools": []}
+
+
+def test_show_global_has_no_tools_section(runner, settings, tmp_path):
+    data = show_json(runner, "--global")
+    assert data["tools"] is None
+
+
+def test_show_fails_on_an_invalid_tools_file(runner, settings, tmp_path):
+    write_tools(tmp_path, "version: 1\ntools: [oops\n")
+    result = runner.invoke(app, ["config", "show", "--repo", str(tmp_path)])
+    assert result.exit_code == 1 and "Invalid project tools" in result.output
+
+
+def test_tools_findings_cover_absent_valid_invalid_and_warning(tmp_path):
+    from types import SimpleNamespace
+
+    a, b, c, d = (tmp_path / n for n in "abcd")
+    for p in (a, b, c, d):
+        p.mkdir()
+    write_tools(b, TOOLS)
+    write_tools(c, "version: 1\ntools: [oops\n")
+    write_tools(d, SHADOWING_TOOLS)
+    repos = [SimpleNamespace(repo_id=p.name, path=p) for p in (a, b, c, d)]
+    findings = cli_main._project_tools_findings(repos)
+    by_status = {(f["repo_id"], f["status"]) for f in findings}
+    assert {("a", "absent"), ("b", "valid"), ("c", "invalid"), ("d", "valid"), ("d", "warning")} == by_status
+    assert [f["failed"] for f in findings if f["status"] == "invalid"] == [True]
+    assert not any(f["failed"] for f in findings if f["status"] == "warning")
