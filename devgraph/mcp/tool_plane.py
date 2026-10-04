@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import yaml
 from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, global_tools_fingerprint, global_tools_path
 from devgraph.config.project_switch import project_config_enabled
 from devgraph.config.project_tools import (
@@ -139,26 +140,27 @@ def _sanitize_deep(value: Any) -> Any:
     return _sanitize_value(value)
 
 
-def _failure(tool: CypherTool, exc: Exception) -> ToolError:
-    """A client-safe error: the Neo4j status code only, never the raw message."""
+def _failure(tool: CypherTool, exc: Exception, layer: str = "project") -> ToolError:
+    """A client-safe error: the Neo4j status code only, never the raw message. `layer` is "project" or "global"."""
     from neo4j.exceptions import Neo4jError
 
     if isinstance(exc, Neo4jError):
         code = str(getattr(exc, "code", None) or "unknown")
         if "TransactionTimedOut" in code:
-            return ToolError(f"project tool {tool.name!r} timed out after {tool.timeout_s}s")
+            return ToolError(f"{layer} tool {tool.name!r} timed out after {tool.timeout_s}s")
         if "AccessMode" in code:
-            return ToolError(f"project tool {tool.name!r} tried to write; project tools are read-only")
-        return ToolError(f"project tool {tool.name!r} failed: {code}")
-    return ToolError(f"project tool {tool.name!r} failed")
+            return ToolError(f"{layer} tool {tool.name!r} tried to write; {layer} tools are read-only")
+        return ToolError(f"{layer} tool {tool.name!r} failed: {code}")
+    return ToolError(f"{layer} tool {tool.name!r} failed")
 
 
 def make_tool_function(
-    tool: CypherTool, engine: Any, repo_id: str, notices: list[str] | None = None
+    tool: CypherTool, engine: Any, repo_id: str, notices: list[str] | None = None, layer: str = "project"
 ) -> Callable[..., dict[str, Any]]:
     """A function the SDK can register: its signature is the tool's parameters.
 
-    `notices` (how this tool was resolved) go in every response's envelope when non-empty.
+    `notices` (how this tool was resolved) go in every response's envelope when non-empty;
+    `layer` ("project" or "global") names where the tool came from in its errors.
     """
     notices = list(notices or [])
 
@@ -172,7 +174,7 @@ def make_tool_function(
                 tool.cypher, params, timeout_s=tool.timeout_s, max_rows=tool.max_rows
             )
         except Exception as exc:  # the driver raises its own hierarchy
-            raise _failure(tool, exc) from exc
+            raise _failure(tool, exc, layer) from exc
         results = [_sanitize_deep(row) for row in rows]
         envelope: dict[str, Any] = {"count": len(results), "results": results, "truncated": truncated}
         if notices:
@@ -224,7 +226,9 @@ def register_project_tools(
                     f"{SESSION_REPO_ENV}={pinned or ''!r} matches no registered repository; "
                     f"no project tools are served"
                 )
-        if (global_fingerprint or global_tools_fingerprint()) != "absent":
+        if global_fingerprint is None:
+            global_fingerprint = global_tools_fingerprint()
+        if global_fingerprint != "absent":
             status.notices.append(
                 "global tools are served only in sessions scoped to a repository (they need one for $repo_id); "
                 "this session has none"
@@ -239,10 +243,28 @@ def register_project_tools(
 
 @dataclass
 class _Resolved:
-    """What one layer's file contributes: its tools (None for none), and why a project file served none."""
+    """What one layer's file contributes: its tools (None for none).
+
+    For a project file that served none because it is invalid: why (`invalid`), and the
+    tool names it declares as far as they can be read (`invalid_names`, None if unknown).
+    """
 
     declared: ProjectTools | None = None
     invalid: str | None = None
+    invalid_names: set[str] | None = None
+
+
+def _declared_names(fingerprint: bytes | str) -> set[str] | None:
+    """Best effort: the tool names an invalid tools file declares; None if it isn't YAML at all."""
+    if not isinstance(fingerprint, bytes):
+        return None
+    try:
+        data = yaml.safe_load(fingerprint.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError):
+        return None
+    tools = data.get("tools") if isinstance(data, dict) else None
+    entries = tools if isinstance(tools, list) else []
+    return {e["name"] for e in entries if isinstance(e, dict) and isinstance(e.get("name"), str)}
 
 
 def _project_layer(repo: Any, fingerprint: bytes | str, last_good: ProjectTools | None,
@@ -265,7 +287,8 @@ def _project_layer(repo: Any, fingerprint: bytes | str, last_good: ProjectTools 
         reason = str(exc).splitlines()[0]
         if last_good is None:
             status.notices.append(f"invalid {TOOLS_FILENAME}; no project tools are served: {reason}")
-            return _Resolved(invalid=f"{TOOLS_FILENAME} is invalid, so no project tool is served: {reason}")
+            short = reason.replace(str(tools_file_path(repo.path)), TOOLS_FILENAME)
+            return _Resolved(invalid=short, invalid_names=_declared_names(fingerprint))
         status.notices.append(f"invalid {TOOLS_FILENAME}; keeping the last good tools: {reason}")
         declared = last_good
     status.tools_file = str(tools_file_path(repo.path))
@@ -336,11 +359,12 @@ def _serve_repository(
 
     def register(tool: CypherTool, origin: str, notices: list[str]) -> str | None:
         """Serve `tool`; on failure record a status notice and return it."""
+        layer = origin.split()[0]  # "project" or "global"
         try:
-            fn = instrument(make_tool_function(tool, engine, repo.repo_id, notices))
+            fn = instrument(make_tool_function(tool, engine, repo.repo_id, notices, layer))
             server.add_tool(fn, name=tool.name, description=tool.description, annotations=annotations)
         except Exception as exc:
-            failure = (f"{origin.split()[0]} tool {tool.name!r} could not be served: "
+            failure = (f"{layer} tool {tool.name!r} could not be served: "
                        f"{type(exc).__name__}: {(str(exc).splitlines() or [''])[0]}")
             status.notices.append(failure)
             return failure
@@ -364,7 +388,14 @@ def _serve_repository(
         else:
             fallback_reasons[tool.name] = failure
     for name, tool in globals_by_name.items():
-        reason = fallback_reasons.get(name, project.invalid)
+        if name in fallback_reasons:
+            reason = fallback_reasons[name]
+        elif project.invalid and project.invalid_names is None:
+            reason = f"{TOOLS_FILENAME} is invalid, so a project tool of this name (if any) can't be served: {project.invalid}"
+        elif project.invalid and name in project.invalid_names:
+            reason = f"{TOOLS_FILENAME} is invalid, so the project tool of this name can't be served: {project.invalid}"
+        else:
+            reason = None
         register(tool, "global", [f"used global tool {name!r}: {reason}"] if reason else [])
     return project.declared, global_.declared
 

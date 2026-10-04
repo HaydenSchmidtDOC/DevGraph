@@ -52,10 +52,15 @@ class Registry:
 
 
 class Engine:
+    def __init__(self, error=None):
+        self.error = error
+
     def run_cypher(self, query, params=None):
         return []
 
     def run_read_cypher(self, query, parameters, *, timeout_s, max_rows):
+        if self.error:
+            raise self.error
         return [], False
 
 
@@ -67,7 +72,7 @@ def store(tmp_path, monkeypatch, tools):
     return path
 
 
-def build(tmp_path, monkeypatch, project=None, scoped=True):
+def build(tmp_path, monkeypatch, project=None, scoped=True, engine=None):
     repo = tmp_path / "demo"
     repo.mkdir(exist_ok=True)
     if project is not None:
@@ -75,7 +80,7 @@ def build(tmp_path, monkeypatch, project=None, scoped=True):
     monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3"))
     record = Repo("demo", repo)
     server = mcp_server.build_server(
-        Engine(), Registry([record]), session_repo=record if scoped else None, session_source="env" if scoped else "none"
+        engine or Engine(), Registry([record]), session_repo=record if scoped else None, session_source="env" if scoped else "none"
     )
     return server, repo
 
@@ -151,12 +156,56 @@ def test_a_project_tool_that_cannot_register_falls_back_to_the_global(tmp_path, 
     assert notice.startswith("used global tool 'list_files':") and "boom" in notice
 
 
-def test_an_invalid_project_file_at_startup_falls_back_to_the_global(tmp_path, monkeypatch):
-    store(tmp_path, monkeypatch, [G_LIST])
+def test_a_project_file_that_is_not_yaml_marks_every_global_tool(tmp_path, monkeypatch):
+    store(tmp_path, monkeypatch, [G_LIST, G_COUNT])
     server, _ = build(tmp_path, monkeypatch, project="version: 1\ntools: [oops\n")
     assert tools(server)["list_files"].description == "Global list."
+    for name in ("list_files", "g_count"):
+        (notice,) = call(server, name)["notices"]
+        assert notice.startswith(f"used global tool '{name}': {TOOLS_FILENAME} is invalid")
+        assert "a project tool of this name (if any) can't be served" in notice
+        assert str(tmp_path) not in notice
+
+
+def test_an_invalid_project_file_marks_only_the_global_tools_it_names(tmp_path, monkeypatch):
+    store(tmp_path, monkeypatch, [G_LIST, G_COUNT])
+    invalid = "version: 1\ntools:\n  - name: list_files\n    description: No cypher.\n"
+    server, _ = build(tmp_path, monkeypatch, project=invalid)
+    assert tools(server)["list_files"].description == "Global list."
     (notice,) = call(server, "list_files")["notices"]
-    assert notice.startswith("used global tool 'list_files':") and TOOLS_FILENAME in notice
+    assert notice.startswith(f"used global tool 'list_files': {TOOLS_FILENAME} is invalid")
+    assert str(tmp_path) not in notice
+    assert "notices" not in call(server, "g_count")
+
+
+def _client_error(code):
+    from neo4j.exceptions import ClientError
+
+    return ClientError._hydrate_neo4j(code=code, message="secret-host:7687")
+
+
+def _error_text(server, name):
+    try:
+        result = asyncio.run(server.call_tool(name, {}))
+    except Exception as exc:
+        return str(exc)
+    assert result.is_error is True
+    return json.dumps([getattr(c, "text", str(c)) for c in result.content])
+
+
+def test_a_global_tool_timeout_names_a_global_tool(tmp_path, monkeypatch):
+    store(tmp_path, monkeypatch, [G_COUNT])
+    engine = Engine(error=_client_error("Neo.ClientError.Transaction.TransactionTimedOut"))
+    server, _ = build(tmp_path, monkeypatch, engine=engine)
+    text = _error_text(server, "g_count")
+    assert "global tool 'g_count' timed out after" in text and "project" not in text
+
+
+def test_a_global_tool_write_names_global_tools_read_only(tmp_path, monkeypatch):
+    store(tmp_path, monkeypatch, [G_COUNT])
+    server, _ = build(tmp_path, monkeypatch, engine=Engine(error=_client_error("Neo.ClientError.Request.AccessMode")))
+    text = _error_text(server, "g_count")
+    assert "global tool 'g_count' tried to write; global tools are read-only" in text and "project" not in text
 
 
 def test_a_global_tool_with_a_builtin_name_is_ignored(tmp_path, monkeypatch):
@@ -233,3 +282,13 @@ def test_a_project_change_keeps_the_global_tools(tmp_path, monkeypatch):
     assert server.devgraph_tool_plane.reload_if_changed() is True
     assert tools(server)["list_files"].description == "Global list."
     assert status(server)["origins"] == {"list_files": "global"}
+
+
+def test_an_unscoped_load_uses_the_global_fingerprint_it_was_given(tmp_path):
+    from devgraph.mcp.tool_plane import register_project_tools
+
+    status = register_project_tools(  # the store is absent now; an empty one was read before
+        mcp_server.MCPServer("t"), Engine(), None, "none", instrument=lambda f: f, annotations=None,
+        global_fingerprint=b"",
+    )
+    assert any("global tools" in n for n in status.notices)
