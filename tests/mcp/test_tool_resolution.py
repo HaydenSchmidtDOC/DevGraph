@@ -6,6 +6,8 @@ import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from devgraph.config import global_tools
 from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, save_global_tools
 from devgraph.config.project_tools import TOOLS_FILENAME
@@ -231,6 +233,14 @@ def test_a_shadowed_builtin_says_so_in_its_response(tmp_path, monkeypatch):
     result = search(server)
     assert {"count", "results", "truncated"} <= set(result)
     assert result["notices"] == [PROJECT_SHADOW_NOTICE]
+
+
+@pytest.mark.parametrize("name", ["find_communities", "key_nodes"])
+def test_the_graph_insight_tools_are_locked(tmp_path, monkeypatch, name):
+    server, _ = build(tmp_path, monkeypatch, project=PROJECT.replace("list_files", name))
+    notice = f"ignored: project tool {name!r} shadows a locked tool; using the fixed implementation"
+    assert name not in status(server)["served"]
+    assert notice in status(server)["notices"]
 
 
 def test_a_builtin_shadowed_by_a_global_tool_says_so_in_its_response(tmp_path, monkeypatch):

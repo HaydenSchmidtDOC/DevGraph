@@ -12,8 +12,10 @@ scan sequence `devgraph add <path>` runs, against the same services, the
 Cypher console (`POST /cypher`), which runs whatever it is given, and the
 Config page's entry edits (`POST|PUT|DELETE /config/...`), which write only
 a registered repo's `devgraph.tools.yaml`/`devgraph.schema.yaml` or the
-global tools store through `devgraph.config.edits`, and never touch git. All
-of them refuse cross-site browser requests (`_reject_cross_site`).
+global tools store through `devgraph.config.edits`, and never touch git, and
+recomputing graph insights (`POST .../insights`), which replaces only derived
+properties. All of them refuse cross-site browser requests
+(`_reject_cross_site`).
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+from devgraph.analytics.insights import read_insights, refresh_insights, top_nodes
 from devgraph.config import edits
 from devgraph.config.project_schema import (
     ABSENT_SCHEMA_HASH,
@@ -92,6 +95,9 @@ _CONFIG_ERROR_STATUS = {
     "stale": 412,
     "io": 500,
 }
+# How much of the graph-insights summary the Community card shows.
+_INSIGHT_COMMUNITY_LIMIT = 8
+_INSIGHT_LIST_LIMIT = 6
 
 
 def _reject_cross_site(request: Request) -> None:
@@ -537,6 +543,48 @@ def build_router(
             "schema_state": state,
             "notices": notices,
         }
+
+    def _insights_payload(repo_id: str) -> dict[str, Any]:
+        summary = read_insights(engine, repo_id)
+        if summary is None:
+            return {"computed": False}
+        return {
+            "computed": True,
+            "computed_at": summary.get("computed_at"),
+            "node_count": summary.get("node_count"),
+            "community_count": summary.get("community_count"),
+            "modularity": summary.get("modularity"),
+            "communities": summary["communities"][:_INSIGHT_COMMUNITY_LIMIT],
+            "key_nodes": top_nodes(engine, repo_id, "pagerank", _INSIGHT_LIST_LIMIT),
+            "bridges": top_nodes(engine, repo_id, "betweenness", _INSIGHT_LIST_LIMIT),
+        }
+
+    @router.get("/repos/{repo_id}/insights")
+    def repo_insights(repo_id: str) -> dict[str, Any]:
+        _require_repo(repo_id)
+        try:
+            return _insights_payload(repo_id)
+        except Exception as exc:  # neo4j driver raises its own exception hierarchy
+            logger.debug("graph insights unavailable for %s: %s", repo_id, exc)
+            raise HTTPException(status_code=503, detail="graph unavailable") from exc
+
+    @router.post("/repos/{repo_id}/insights")
+    async def recompute_repo_insights(request: Request, repo_id: str) -> dict[str, Any]:
+        """Recompute now. The only other write the dashboard makes besides the
+        layout and registration, and it only replaces derived properties."""
+        _reject_cross_site(request)
+        _require_repo(repo_id)
+        try:
+            summary = await run_in_threadpool(refresh_insights, engine, repo_id, blocking=False)
+            if summary is None:
+                raise HTTPException(status_code=409, detail="insights are already being computed for this repository")
+            events.publish({"type": "insights_refreshed", "repo_id": repo_id})
+            return await run_in_threadpool(_insights_payload, repo_id)
+        except HTTPException:
+            raise
+        except Exception as exc:  # neo4j driver raises its own exception hierarchy
+            logger.warning("graph insights recompute failed for %s", repo_id, exc_info=True)
+            raise HTTPException(status_code=503, detail="graph unavailable") from exc
 
     @router.get("/repos/{repo_id}/search")
     def repo_search(repo_id: str, q: str, max_results: int = 15) -> dict[str, Any]:

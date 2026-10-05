@@ -116,6 +116,40 @@ _SHOW_INDEXES_CYPHER = (
     "SHOW INDEXES YIELD name, type, entityType, labelsOrTypes, properties, owningConstraint "
     "WHERE owningConstraint IS NULL RETURN name, type, entityType, labelsOrTypes, properties"
 )
+# Graph insights (devgraph/analytics/insights.py). The Repository node is the
+# scoping root, not code, so it never takes part in the graph that's analysed.
+_LOAD_INSIGHT_EDGES_CYPHER = (
+    "MATCH (a {repo_id: $repo_id})-[r]->(b {repo_id: $repo_id}) "
+    "WHERE type(r) IN $types AND NOT a:Repository AND NOT b:Repository "
+    "RETURN elementId(a) AS source, elementId(b) AS target, type(r) AS type"
+)
+_LOAD_INSIGHT_NODES_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) WHERE elementId(n) IN $ids "
+    "RETURN elementId(n) AS id, n.name AS name, labels(n) AS labels, n.file AS file"
+)
+_CLEAR_INSIGHTS_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) "
+    "WHERE n.insight_community IS NOT NULL OR n.insight_pagerank IS NOT NULL "
+    "OR n.insight_betweenness IS NOT NULL "
+    "REMOVE n.insight_community, n.insight_pagerank, n.insight_betweenness"
+)
+_WRITE_INSIGHTS_CYPHER = (
+    "UNWIND $rows AS row MATCH (n) WHERE elementId(n) = row.id AND n.repo_id = $repo_id "
+    "SET n.insight_community = row.community, n.insight_pagerank = row.pagerank, "
+    "n.insight_betweenness = row.betweenness"
+)
+_WRITE_INSIGHTS_SUMMARY_CYPHER = (
+    "MERGE (r:Repository {repo_id: $repo_id}) "
+    "SET r.insights_computed_at = $computed_at, r.insights_node_count = $node_count, "
+    "r.insights_community_count = $community_count, r.insights_modularity = $modularity, "
+    "r.insights_communities = $communities"
+)
+_READ_INSIGHTS_SUMMARY_CYPHER = (
+    "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.insights_computed_at IS NOT NULL "
+    "RETURN r.insights_computed_at AS computed_at, r.insights_node_count AS node_count, "
+    "r.insights_community_count AS community_count, r.insights_modularity AS modularity, "
+    "r.insights_communities AS communities"
+)
 
 # Transient Neo4j failures worth retrying: a connection blip, an expired
 # session, or a server-side transient error (e.g. a lock timeout). Permanent
@@ -297,6 +331,15 @@ def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
             "SET r += row.properties",
             rows=rows,
         )
+
+
+def _write_insights_tx(tx, repo_id: str, rows: list[dict[str, Any]], summary: dict[str, Any]) -> None:
+    """Clear-then-write in one transaction, so a reader never sees a repo
+    half old and half new, and a node that lost its edges loses its scores."""
+    tx.run(_CLEAR_INSIGHTS_CYPHER, repo_id=repo_id)
+    if rows:
+        tx.run(_WRITE_INSIGHTS_CYPHER, repo_id=repo_id, rows=rows)
+    tx.run(_WRITE_INSIGHTS_SUMMARY_CYPHER, repo_id=repo_id, **summary)
 
 
 def _replace_file_nodes_tx(
@@ -877,6 +920,37 @@ class GraphEngine:
                 "MATCH (n {repo_id: $repo_id}) DETACH DELETE n",
                 repo_id=repo_id,
             )
+
+    def load_insight_graph(
+        self, repo_id: str, relationship_types: tuple[str, ...]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """One repository's edges of `relationship_types` and the nodes they touch.
+
+        Identity is `elementId`, which is only promised stable within a
+        transaction; it is used for the `write_insights` that immediately
+        follows, and a node deleted in between is simply not matched there.
+        """
+        with self._driver.session() as session:
+            edge_result = _retry_transient(
+                session.run, _LOAD_INSIGHT_EDGES_CYPHER, repo_id=repo_id, types=list(relationship_types)
+            )
+            edges = [record.data() for record in edge_result or []]
+            ids = sorted({e["source"] for e in edges} | {e["target"] for e in edges})
+            node_result = _retry_transient(session.run, _LOAD_INSIGHT_NODES_CYPHER, repo_id=repo_id, ids=ids)
+            nodes = [record.data() for record in node_result or []]
+        return nodes, edges
+
+    def write_insights(self, repo_id: str, rows: list[dict[str, Any]], summary: dict[str, Any]) -> None:
+        """Replace a repository's insight properties (see `_write_insights_tx`)."""
+        with self._driver.session() as session:
+            session.execute_write(_write_insights_tx, repo_id, rows, summary)
+
+    def read_insights_summary(self, repo_id: str) -> dict[str, Any] | None:
+        """The Repository node's insight summary, or None if never computed."""
+        with self._driver.session() as session:
+            result = _retry_transient(session.run, _READ_INSIGHTS_SUMMARY_CYPHER, repo_id=repo_id)
+            records = [record.data() for record in result or []]
+        return records[0] if records else None
 
     def run_cypher(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict]:
         """Advanced escape hatch. Callers must gate this behind explicit config

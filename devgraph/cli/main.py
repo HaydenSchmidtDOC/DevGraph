@@ -301,6 +301,44 @@ def rescan(
 
 
 @app.command()
+def insights(repo_id: str) -> None:
+    """Compute graph insights (communities, PageRank, betweenness) for a repository now.
+
+    The DevGraph agent recomputes them automatically after indexing; this
+    runs the same computation on demand, with or without the agent.
+
+    Args:
+        repo_id: The repository ID.
+    """
+    # Imported here so networkx only loads for this command, not every CLI call.
+    from devgraph.analytics.insights import refresh_insights
+
+    try:
+        registry = _get_registry()
+        try:
+            if registry.get(repo_id) is None:
+                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                raise typer.Exit(code=1)
+            settings = get_settings()
+            engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+            try:
+                summary = refresh_insights(engine, repo_id)
+            finally:
+                engine.close()
+        finally:
+            registry.close()
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"[red][X] Error:[/red] {e}")
+        raise typer.Exit(code=1)
+    console.print(
+        f"[green][OK][/green] Insights for {repo_id}: {summary['community_count']} communities "
+        f"(modularity {summary['modularity']:.2f}) over {summary['node_count']} nodes"
+    )
+
+
+@app.command()
 def watch(action: str, repo_id: str) -> None:
     """Enable or disable file watching for a repository.
 

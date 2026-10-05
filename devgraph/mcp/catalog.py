@@ -31,6 +31,8 @@ TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "find_related_prs", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
     {"name": "god_nodes", "identifier_kind": None, "envelope": True, "phase": 3},
     {"name": "find_dependency_cycles", "identifier_kind": "dependency relationship type (CALLS/DEPENDS_ON/EXTENDS/IMPORTS/USES), not a component name", "envelope": True, "phase": 3},
+    {"name": "find_communities", "identifier_kind": None, "envelope": True, "phase": 3, "note": "requires computed graph insights (automatic after indexing, or `devgraph insights`)"},
+    {"name": "key_nodes", "identifier_kind": "metric (pagerank/betweenness), not a component name", "envelope": True, "phase": 3, "note": "requires computed graph insights (automatic after indexing, or `devgraph insights`)"},
     {"name": "issue_history_for", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
     {"name": "get_source", "identifier_kind": "function/class name (not a file path)", "envelope": False, "phase": 2},
     {"name": "run_cypher", "identifier_kind": "raw Cypher", "envelope": False, "phase": None, "note": "only registered when enable_run_cypher=true; prefer the purpose-built tools above"},

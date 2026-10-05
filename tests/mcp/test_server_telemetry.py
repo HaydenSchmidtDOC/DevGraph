@@ -310,7 +310,7 @@ def test_instrumentation_leaves_the_registered_tool_surface_unchanged(settings):
 
     tools = asyncio.run(server.list_tools())
 
-    assert len(tools) == 22
+    assert len(tools) == 24
     search = next(t for t in tools if t.name == "search_component")
     assert search.description.startswith("Search for components")
     assert search.annotations.read_only_hint is True
