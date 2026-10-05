@@ -22,7 +22,7 @@ In:
 
 Deferred:
 - **`custom.params` editing.** A relationship whose `custom.params` is non-empty opens in YAML (Q11). An empty `params: {}` is shown, because it has nothing to edit, and kept as it was.
-- Reading hand-edited YAML back into the form (form spec Q3, unchanged).
+- Reading hand-edited YAML back into the form (form spec Q3, unchanged; since added by the form spec's §5).
 - Client-side mirrors of the document-level checks: "at most one filesystem relationship", duplicate relationship declarations, `extends: none` effects beyond the label list. The dry run reports them.
 
 ---

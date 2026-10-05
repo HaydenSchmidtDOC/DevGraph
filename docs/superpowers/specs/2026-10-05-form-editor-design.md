@@ -19,7 +19,7 @@ In:
 
 Deferred (recorded so they are not mistaken for gaps):
 - **Relationships** keep the YAML editor. Their form needs `custom.params` (a free mapping of scalars) and the `provider`/`custom` coupling; the decisions for it are recorded in §3 Q11 so the follow-up starts from them.
-- **Reading hand-edited YAML back into the form** (§2.4, Q3). It needs a YAML parser in the browser or a parse route; neither is in this PR.
+- **Reading hand-edited YAML back into the form** (§2.4, Q3). It needs a YAML parser in the browser or a parse route; neither is in this PR. *(Since added through a parse-only route: §5.)*
 - Reordering parameter / metadata rows (add and remove only).
 - Client-side mirrors of the server's deeper checks (read-only Cypher keywords, `$name` usage vs declared parameters, generated constraint names, cross-repository conflicts). The server's dry run already reports them with the CLI's text.
 
@@ -146,7 +146,7 @@ DOM: `renderConfigForm(edit)` (builds the fieldset from `edit.formState`), `conf
 
 1. **Which entry kinds first?** Tools (global and project) and node types. Tools are the most edited and the most error-prone in YAML (multi-line Cypher, the parameter list); node types are next (the key/metadata coupling is easier with ticks). Relationships stay YAML (Q11).
 2. **Where does the form's data come from?** An `entry` mapping in the page model, produced by the server from the mapping it already dumps (§2.2). No browser YAML parser, no new route.
-3. **Can hand-edited YAML go back to the form?** Not in this PR. YAML → Form is allowed only for text whose mapping is known (the opening text or the form's own last output); otherwise the user keeps editing YAML or discards the hand edits (§2.4). Supporting it needs either a vendored YAML parser (a new static file and a second YAML dialect next to PyYAML) or a parse-only route; both are larger than the rest of this PR and can follow if people miss it.
+3. **Can hand-edited YAML go back to the form?** Not in this PR (later added by §5, which supersedes this answer). YAML → Form is allowed only for text whose mapping is known (the opening text or the form's own last output); otherwise the user keeps editing YAML or discards the hand edits (§2.4). Supporting it needs either a vendored YAML parser (a new static file and a second YAML dialect next to PyYAML) or a parse-only route; both are larger than the rest of this PR and can follow if people miss it.
 4. **Unknown fields: preserve or refuse?** Refuse to show them in the form: the entry opens in YAML with a notice naming the field. All models are `extra="forbid"`, so such a field is invalid anyway, and carrying keys the form does not show would mean a form save silently writes things the user cannot see.
 5. **Opening mode?** Form for representable tool / node-type entries on add and edit; YAML otherwise; the user's last choice wins for the page session.
 6. **Parameter list editing?** One fieldset per parameter, Add/Remove, no reordering (order is cosmetic for tools). Default input typed by the parameter's type and disabled while Required is ticked, matching the validator ("a default … must be required: false").
@@ -187,3 +187,41 @@ DOM: `renderConfigForm(edit)` (builds the fieldset from `edit.formState`), `conf
 **Live checks (before PR)**: headless agent + dev Neo4j, a throwaway registered repo: add a project tool through the form with two parameters → `devgraph config tools list --repo` shows it and a `devgraph mcp` session serves it within 2 s, `git status` shows the file unstaged; edit a node type's key through the ticks → the dry run's "key change" warning appears and needs the second click; open an entry with a hand-added unknown key → YAML mode with the notice; switch Form → YAML → edit → the Form button explains and Discard returns; keyboard-only pass through the tool form (Tab order, Add/Remove, Save). Screenshot for the PR.
 
 Docs: README (Config page: the Form/YAML switch, which entries have a form, that the form writes the same YAML and goes through the same dry run; drop "Not in this page yet: a structured form editor", add relationships' form and hand-edit read-back as not yet), PROJECT_STATUS (G2b-3 done; relationship form and YAML read-back open).
+
+---
+
+## 5. Addendum: reading hand-edited YAML back into the form
+
+This supersedes §2.4's "YAML → Form only for text whose mapping is known" and §3 Q3, for tools, node types and relationships alike (the relationship addendum's deferral of the same item is closed too). Everything else in §2 stands: the browser still never parses YAML, and the textarea stays the source of truth.
+
+### 5.1 The parse route
+
+`POST /api/config/parse`, body `{"kind": "tool" | "node_type" | "relationship", "yaml": "<text>"}`, answers `200 {"entry": <mapping> | null, "error"?: "<text>"}`.
+
+- It parses with `bounded_safe_load` and returns `form_entry(mapping)`: the same nulling rules as the page model (dates, integral floats, huge integers, non-string keys and cycles give `entry: null` with no `error`).
+- Malformed YAML, an alias bomb and a document that isn't one mapping give `entry: null` with `error` set to the same text a write would report (`malformed YAML: …`, `yaml must be one mapping (a single entry)`).
+- `kind` must be one of the three values. It is not used for validation: the route doesn't check the mapping against any model. The form's own `configFormFromEntry` decides what it can show, and the server stays authoritative at save time (dry run and write).
+- Read-only: no file, registry or global store access, no fingerprint, no `If-Match`.
+- The same guards as every Config write: `_reject_cross_site_config` (403), the app's Host guard, strict `application/json` (415), the 64 KiB cap (413, on Content-Length and while reading) and a JSON-object body (400). A missing `yaml` string or bad `kind` is a 400.
+
+### 5.2 The Form button after a hand edit
+
+`configFormSwitch(edit, text)` gains a third way to the form: text that is neither the form's last text nor the opening text returns `{available: true, restore: "parse"}`, unless the last read-back of **this exact text** was refused, which returns `{available: false, reason}` with that refusal. The notice under the switch still shows in YAML mode after a hand edit ("The YAML was edited by hand. Form reads it back if the form can show it exactly, or discard the hand edits to return to the form's last text."), with **Discard YAML edits**, which is unchanged.
+
+Pressing Form with `restore: "parse"`:
+1. Locks the editor as every request does (`edit.busy = "Reading…"`: textarea read-only, switch, form, Discard and Save disabled).
+2. Sends the textarea's text to the parse route.
+3. On return, it does nothing unless the same editor is still open (`configEdit === edit`), it is still in YAML mode, and the textarea still holds the text it sent. A reply after Cancel, or for an editor opened since, is dropped.
+4. If `entry` is non-null and `configFormFromEntry` accepts it, the form is rebuilt from it and the editor switches to Form. Otherwise the editor stays in YAML and the notice shows the reason: the server's `error`, the form's refusal reason, `CONFIG_FORM_REASONS.value` for `entry: null` without an error, or `describeConfigError` for an HTTP failure. Editing the text clears that refusal (it is keyed by the text).
+
+### 5.3 The text-preservation rule
+
+**The switch never writes the textarea.** On a successful read-back the form takes the parsed mapping as its state, `edit.formText` becomes the typed text and `edit.order` becomes the parsed entry's key order; the textarea keeps the typed text byte for byte, comments and layout included. The first form-control edit serialises as usual (`configFormChanged`): if the result differs from the textarea it replaces it and runs `configTextChanged()`, dropping any confirmation; if it is identical nothing changes.
+
+So the confirmation binding is the §2.4 one: a read-back switch leaves the text as it was, and keeps an existing warning confirmation (it still covers exactly that text, and Save re-checks `dryYaml` anyway); any change to the text, by hand, by the form or by Discard, drops it.
+
+After a read-back, **Discard YAML edits** returns to the read-back text (the form's last known text), not to the text the editor opened with. A later return to the untouched opening text rebuilds from the opening entry and restores its key order.
+
+### 5.4 Tests
+
+Route (`tests/dashboard/test_config_routes.py`): a mapping comes back as `entry`; cross-site is 403; a bad Host is 403 through the full app; non-JSON is 415, oversize is 413, a non-object or a bad `kind` is 400; an alias bomb comes back quickly as an error; dates, integral floats and cycles come back as `entry: null`; nothing on disk changes. Harness (`tests/dashboard/config_page_ui.js`): `configFormSwitch` returns `parse` for hand-edited text and the remembered refusal for that text only; a hand edit then Form rebuilds the form without touching the text; an unrepresentable edit stays in YAML with the reason; a parse error shows the error; a reply after Cancel is ignored; controls are locked while the request is out; a confirmation survives the read-back switch and is dropped by the first form edit that changes the text.
