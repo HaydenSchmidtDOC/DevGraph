@@ -10,6 +10,8 @@ from devgraph.config.list_edit import ListEditError, entries
 from devgraph.config.project_schema import SCHEMA_FILENAME, ProjectSchemaError, parse_project_schema
 from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError, load_project_tools
 from devgraph.config.yaml_bound import YAML_MAX_NODES, YAMLBoundError, bounded_safe_load
+from devgraph.indexer.containers.extractor import ContainerExtractor
+from devgraph.indexer.docs.extractor import DocsExtractor
 
 
 def _laughs(depth: int = 9) -> str:
@@ -42,6 +44,10 @@ def _tools_doc(expanded: int) -> str:
     m, r = divmod(expanded - 18, 10)
     items = ["&u [x, x, x, x, x, x, x, x, x]"] + ["*u"] * m + ["y"] * r
     return "tools:\n  - name: t\n    pad: [" + ", ".join(items) + "]\n"
+
+
+DOC_BOMB = f"---\ntype: requirement\nid: r1\nextra: {_laughs()}\n---\n# Title\nBody\n"
+COMPOSE_BOMB = f"services:\n  web:\n    image: nginx\nx-bomb: {_laughs()}\n"
 
 
 def _quick(fn, *args, **kwargs):
@@ -178,3 +184,31 @@ def test_multi_document_and_unsafe_tags_are_refused_like_safe_load(text):
         yaml.safe_load(text)
     with pytest.raises(yaml.YAMLError):
         bounded_safe_load(text)
+
+
+def test_docs_frontmatter_bomb_is_skipped_quickly():
+    result = _quick(DocsExtractor("r").extract_from_source, DOC_BOMB, "r1.md")
+    assert result.docs == []
+
+
+def test_docs_frontmatter_with_anchors_and_merge_keys_still_parses():
+    content = (
+        "---\ntype: requirement\nid: r1\nbase: &b {links: [Auth]}\nmore:\n  <<: *b\n"
+        "links: [Auth, Billing]\n---\n# Title\nBody\n"
+    )
+    [doc] = DocsExtractor("r").extract_from_source(content, "r1.md").docs
+    assert doc.name == "r1"
+
+
+def test_compose_bomb_is_skipped_quickly():
+    result = _quick(ContainerExtractor("r").extract_from_compose_file, COMPOSE_BOMB, "docker-compose.yml")
+    assert result.services == []
+
+
+def test_compose_with_anchors_and_merge_keys_still_parses():
+    content = (
+        "x-common: &common\n  image: nginx\n  restart: always\n"
+        "services:\n  web:\n    <<: *common\n  worker:\n    <<: *common\n"
+    )
+    result = ContainerExtractor("r").extract_from_compose_file(content, "docker-compose.yml")
+    assert sorted(s.name for s in result.services) == ["web", "worker"]
