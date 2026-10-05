@@ -1540,7 +1540,8 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     ["a key naming no metadata row", "node_types", { ...NODE_OK(), key: ["slug", "nope"] },
       "This entry's key names `nope`, which is not one of its metadata fields; the form can't show that. Edit it as YAML."],
     ["a string key", "node_types", { ...NODE_OK(), key: "slug" }, FIELD("key")],
-    ["a source with an extra key", "node_types", { ...NODE_OK(), source: { provider: "filesystem", kind: "file", glob: "*" } }, FIELD("source.glob")],
+    ["a source with an extra key", "node_types", { ...NODE_OK(), source: { provider: "filesystem", kind: "file", glob: "*" } },
+      "This entry's source has a setting the form doesn't edit: `glob`. Edit it as YAML."],
     ["a source with another provider", "node_types", { ...NODE_OK(), source: { provider: "git", kind: "file" } }, FIELD("source.provider")],
     ["a source with no kind", "node_types", { ...NODE_OK(), source: { provider: "filesystem" } }, FIELD("source.kind")],
     ["an unknown metadata key", "node_types", { ...NODE_OK(), metadata: [{ name: "slug", unique: true }] }, FIELD("metadata.0.unique")],
@@ -1852,7 +1853,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   let ctx = api.configFormContext(CTX_MODEL(), "repo-a");
   check("the context lists built-in labels then this file's, the built-in relationship types, and the filesystem labels",
     j(ctx) === j({ labels: ["Function", "Service", "Runbook", "File", "Folder", "Dated"], relationship_types: ["CALLS", "USES"],
-      filesystem: { file: "File", folder: "Folder" } }), j(ctx));
+      filesystem: { file: "File", folder: "Folder" }, docs: [] }), j(ctx));
   const noneModel = CTX_MODEL();
   noneModel.projects[0].schema.extends = "none";
   const ctxNone = api.configFormContext(noneModel, "repo-a");
@@ -1871,7 +1872,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   [["an empty type", R_OK, f => { f.type = ""; }, "type", /^A relationship type is uppercase letters, digits and underscores, starting with a letter \(at most 64 characters\)\.$/],
     ["a lowercase type", R_OK, f => { f.type = "documents"; }, "type", /uppercase letters/],
     ["a builtin provider with a new type", R_OK, f => { f.provider = "builtin"; }, "provider",
-      /^The builtin provider reuses one of DevGraph's relationship types; pick Custom or Filesystem to declare a new one\.$/],
+      /^The builtin provider reuses one of DevGraph's relationship types; pick Custom, Filesystem or Markdown front matter to declare a new one\.$/],
     ["a custom provider with a built-in type", R_OK, f => { f.type = "USES"; }, "provider", /^`USES` is built in: use the builtin provider to reuse it\.$/],
     ["a filesystem provider with a built-in type", FS_OK, f => { f.type = "CALLS"; }, "provider", /^`CALLS` is built in/],
     ["an empty custom name", R_OK, f => { f.custom = ""; }, "custom", /required/],
@@ -2287,7 +2288,8 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("...Type's help says an edit renames it", /Changing it renames the relationship\./.test(
     find(els.configForm, e => e.id === formCtl("Type").getAttribute("aria-describedby").split(" ")[0])[0].textContent), "");
   check("...the provider options name what each does", JSON.stringify(formCtl("Provider").children.map(o => [o.value, o.textContent])) ===
-    JSON.stringify([["builtin", "Built-in type"], ["custom", "Custom provider"], ["filesystem", "Filesystem (file → parent folder)"]]),
+    JSON.stringify([["builtin", "Built-in type"], ["custom", "Custom provider"], ["filesystem", "Filesystem (file → parent folder)"],
+      ["docs", "Markdown front matter"]]),
     JSON.stringify(formCtl("Provider").children.map(o => [o.value, o.textContent])));
   check("...the textarea keeps the server's text, focus on the first control", els.configYaml.value === REL_YAML && focused === formCtl("Type"),
     focused && focused.tagName);
@@ -2646,6 +2648,248 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await press(els.configResetCancel);
   check("Cancel after a Re-check focuses a control in the redrawn card, not the detached opener", api.reset === null &&
     focused !== old && inside(focused, card("repo-b")), desc());
+
+
+  // 47. Markdown front matter (docs) sources and relationships
+  const DOCS_NODE = () => ({ label: "Runbook", key: ["path"], metadata: [
+    { name: "path" }, { name: "owner", required: true }, { name: "severity", type: "integer" }, { name: "on_call" }],
+    source: { provider: "docs", paths: ["runbooks/**/*.md"],
+      where: [{ field: "type", is: "runbook" }, { starts_with: "RB-", field: "title" }, { field: "version", is: 1 }, { field: "draft", like: false }],
+      fields: { severity: "sev", on_call: "on-call-team" } } });
+  const DOCS_REL = () => ({ type: "RUNBOOK_FOR", provider: "docs", from: "Runbook", to: "Service", field: "service" });
+  [["a docs source with where and fields", "node_types", DOCS_NODE()],
+    ["a docs source without where or fields", "node_types", { label: "Adr", key: ["path"], source: { provider: "docs", paths: ["adr/*.md"] }, metadata: [{ name: "path" }] }],
+    ["empty where and fields, keys reordered", "node_types", { label: "N", key: ["path"], metadata: [{ name: "path" }],
+      source: { fields: {}, paths: ["*.md"], where: [], provider: "docs" } }],
+    ["a condition with no field", "node_types", { label: "N", key: ["path"], metadata: [{ name: "path" }], source: { provider: "docs", paths: ["*.md"], where: [{ is: "x" }] } }],
+    ["a docs relationship", "relationships", DOCS_REL()],
+    ["a docs relationship, keys reordered", "relationships", { field: "svc", to: "Service", from: ["Runbook"], type: "R", provider: "docs" }],
+    ["a builtin relationship with field: null", "relationships", { type: "CALLS", from: "A", to: "B", field: null }],
+  ].forEach(([what, section, e]) => {
+    const rep = api.configFormFromEntry(section, e);
+    check("the form can show " + what, rep.ok && rep.form, j(rep));
+    check("...and mapping -> form -> mapping is the identity (" + what + ")", rep.ok && j(api.configEntryFromForm(section, rep.form, Object.keys(e))) === j(e),
+      rep.ok && j(api.configEntryFromForm(section, rep.form, Object.keys(e))));
+  });
+  const docsForm = api.configFormFromEntry("node_types", DOCS_NODE()).form;
+  check("docs form state: the source choice, paths as rows, conditions as field/test/value text, a front-matter key per metadata row",
+    docsForm.source === "docs" && j(docsForm.paths.map(p => p.glob)) === j(["runbooks/**/*.md"]) &&
+    j(docsForm.where.map(c => [c.field, c.op, c.value])) === j([["type", "is", "runbook"], ["title", "starts_with", "RB-"], ["version", "is", "1"], ["draft", "like", "false"]]) &&
+    j(docsForm.metadata.map(m => m.fm_key)) === j(["", "", "sev", "on-call-team"]), j(docsForm));
+  const SOURCE_KEY = k => "This entry's source has a setting the form doesn't edit: `" + k + "`. Edit it as YAML.";
+  const FIELDS_ORDER = "This entry lists its front-matter keys (`fields`) in a different order from its metadata fields; the form would reorder them. Edit it as YAML.";
+  const CONDITION = n => "Condition " + n + " doesn't use exactly one test (is, starts_with, contains or like); the form can't show that. Edit it as YAML.";
+  const withSource = src => ({ ...DOCS_NODE(), source: { ...DOCS_NODE().source, ...src } });
+  [["an unknown docs source key", withSource({ glob: "*" }), SOURCE_KEY("glob")],
+    ["a filesystem key on a docs source", withSource({ kind: "file" }), SOURCE_KEY("kind")],
+    ["a docs key on a filesystem source", { ...NODE_OK(), source: { provider: "filesystem", kind: "file", paths: ["*.md"] } }, SOURCE_KEY("paths")],
+    ["fields in a different order from the metadata", withSource({ fields: { on_call: "on-call-team", severity: "sev" } }), FIELDS_ORDER],
+    ["fields naming no metadata field", withSource({ fields: { team: "x" } }),
+      "This entry's front-matter keys (`fields`) name `team`, which is not one of its metadata fields; the form can't show that. Edit it as YAML."],
+    ["a blank front-matter key", withSource({ fields: { owner: "" } }), FIELD("source.fields")],
+    ["a non-text front-matter key", withSource({ fields: { owner: 3 } }), FIELD("source.fields")],
+    ["a docs source with no paths", { ...DOCS_NODE(), source: { provider: "docs" } }, FIELD("source.paths")],
+    ["a path that is not text", withSource({ paths: [1] }), FIELD("source.paths")],
+    ["paths that are not a list", withSource({ paths: "*.md" }), FIELD("source.paths")],
+    ["a line break in a path", withSource({ paths: ["a\nb"] }), FIELD("source.paths")],
+    ["where that is not a list", withSource({ where: { field: "a", is: "b" } }), FIELD("source.where")],
+    ["a condition that is not a mapping", withSource({ where: ["x"] }), FIELD("source.where.0")],
+    ["an unknown condition key", withSource({ where: [{ field: "a", is: "b", regex: "c" }] }), FIELD("source.where.0.regex")],
+    ["a fractional condition value", withSource({ where: [{ field: "a", is: 1.5 }] }), FIELD("source.where.0.is")],
+    ["a null condition value", withSource({ where: [{ field: "a", is: null }] }), FIELD("source.where.0.is")],
+    ["a list condition value", withSource({ where: [{ field: "a", is: ["b"] }] }), FIELD("source.where.0.is")],
+    ["a line break in a condition value", withSource({ where: [{ field: "a", contains: "b\nc" }] }), FIELD("source.where.0.contains")],
+    ["a condition with two tests", withSource({ where: [{ field: "a", is: "b" }, { field: "a", is: "b", like: "c" }] }), CONDITION(2)],
+    ["a condition with no test", withSource({ where: [{ field: "a" }] }), CONDITION(1)],
+    ["a field on a builtin relationship", { type: "CALLS", from: "A", to: "B", field: "x" },
+      "This entry has a `field` but its provider isn't Markdown front matter; the form can't show that. Edit it as YAML."],
+    ["a line break in a relationship field", { ...DOCS_REL(), field: "a\nb" }, FIELD("field")],
+  ].forEach(([what, e, reason]) => {
+    const rep = api.configFormFromEntry(e.label ? "node_types" : "relationships", e);
+    check("the form refuses " + what + ", saying why", !rep.ok && (reason.endsWith("Edit it as YAML.") && rep.reason === reason), j(rep));
+  });
+  // values compare as text: a typed 1 is written as text, an untouched 1 stays a number
+  let dm = api.configFormFromEntry("node_types", DOCS_NODE()).form;
+  dm.where[0].value = "1"; dm.where[1].op = "contains";
+  let dmOut = api.configEntryFromForm("node_types", dm, Object.keys(DOCS_NODE()));
+  check("an edited condition value is written as typed text; an untouched number or boolean is written back unchanged",
+    j(dmOut.source.where) === j([{ field: "type", is: "1" }, { contains: "RB-", field: "title" }, { field: "version", is: 1 }, { field: "draft", like: false }]),
+    j(dmOut.source.where));
+  dm = api.configFormFromEntry("node_types", DOCS_NODE()).form;
+  dm.metadata[3].name = "rota";
+  dmOut = api.configEntryFromForm("node_types", dm, Object.keys(DOCS_NODE()));
+  check("renaming a metadata row carries its front-matter key", j(dmOut.source.fields) === j({ severity: "sev", rota: "on-call-team" }), j(dmOut.source.fields));
+  dm.metadata[3].fm_key = "";
+  dm.metadata[1].fm_key = "team";
+  dmOut = api.configEntryFromForm("node_types", dm, Object.keys(DOCS_NODE()));
+  check("a blanked front-matter key leaves fields; a new one joins in metadata order", j(dmOut.source.fields) === j({ owner: "team", severity: "sev" }), j(dmOut.source.fields));
+  dm.paths.push({ glob: "" });
+  dmOut = api.configEntryFromForm("node_types", dm, Object.keys(DOCS_NODE()));
+  check("an empty path row is not written", j(dmOut.source.paths) === j(["runbooks/**/*.md"]), j(dmOut.source.paths));
+  dm.source = "file";
+  dmOut = api.configEntryFromForm("node_types", dm, Object.keys(DOCS_NODE()));
+  check("switching a docs source to the filesystem writes no docs keys", j(dmOut.source) === j({ provider: "filesystem", kind: "file" }), j(dmOut.source));
+  dm.source = "";
+  dmOut = api.configEntryFromForm("node_types", dm, Object.keys(DOCS_NODE()));
+  check("...and to none writes no source", !("source" in dmOut), j(dmOut));
+  dm = nodeForm({ label: "N", key: ["path"], metadata: [{ name: "path" }], source: { provider: "filesystem", kind: "file" } });
+  dm.source = "docs";
+  dmOut = api.configEntryFromForm("node_types", dm, ["label", "key", "metadata", "source"]);
+  check("switching a filesystem source to docs writes {provider: docs, paths} from the rows", j(dmOut.source) === j({ provider: "docs", paths: [] }), j(dmOut.source));
+  let drf = relForm(DOCS_REL());
+  check("docs relationship form state carries the field", drf.provider === "docs" && drf.field === "service", j(drf));
+  drf.provider = "custom";
+  let drm = api.configEntryFromForm("relationships", drf, Object.keys(DOCS_REL()));
+  check("switching a docs relationship away writes no field", !("field" in drm), j(drm));
+  drf.provider = "docs";
+  drm = api.configEntryFromForm("relationships", drf, Object.keys(DOCS_REL()));
+  check("...and back writes it again", j(drm) === j(DOCS_REL()), j(drm));
+  check("a front-matter key that YAML 1.1 would read as a boolean is quoted",
+    api.configEntryYaml("node_types", { label: "Nt", source: { provider: "docs", paths: ["*.md"], fields: { on: "yes", "a: b": "x" } } }, []) ===
+    'label: Nt\nsource:\n  provider: docs\n  paths: ["*.md"]\n  fields:\n    "on": "yes"\n    "a: b": x\n',
+    api.configEntryYaml("node_types", { label: "Nt", source: { provider: "docs", paths: ["*.md"], fields: { on: "yes", "a: b": "x" } } }, []));
+  const docsHints = (edit, e = DOCS_NODE()) => { const f = api.configFormFromEntry("node_types", e).form; edit(f); return api.configFormHints("node_types", f); };
+  check("no hints for a valid docs node type", j(docsHints(() => {})) === "[]", j(docsHints(() => {})));
+  [["no paths", f => { f.paths = []; }, "paths", /Add at least one path, for example runbooks\/\*\*\/\*\.md\./],
+    ["a path starting with /", f => { f.paths[0].glob = "/runbooks/*.md"; }, "paths.0.glob", /from the repository root/],
+    ["a ./ path", f => { f.paths[0].glob = "./runbooks/*.md"; }, "paths.0.glob", /without \.\/ or \.\.\//],
+    ["a backslash", f => { f.paths[0].glob = "runbooks\\*.md"; }, "paths.0.glob", /Separate folders with \//],
+    ["a doubled slash", f => { f.paths[0].glob = "runbooks//*.md"; }, "paths.0.glob", /single \//],
+    ["three **", f => { f.paths[0].glob = "**/a/**/b/**/*.md"; }, "paths.0.glob", /\*\* at most 2 times/],
+    ["a condition with no field", f => { f.where[0].field = ""; }, "where.0.field", /Name the front-matter field/],
+    ["a long condition value", f => { f.where[0].value = "x".repeat(201); }, "where.0.value", /200 characters/],
+    ["a front-matter key on path", f => { f.metadata[0].fm_key = "file"; }, "metadata.0.fm_key", /path is the file's own location/],
+    ["a docs key other than path", f => { f.metadata[0].key = false; f.metadata[1].key = true; }, "source", /Markdown front matter must be keyed on exactly one string field named path/],
+  ].forEach(([what, edit, field, re]) => {
+    const got = docsHints(edit);
+    check("a docs hint for " + what, got.some(h => h.field === field && re.test(h.text)), j(got));
+  });
+  const docsRelHints = edit => { const f = relForm(DOCS_REL()); edit(f); return api.configFormHints("relationships", f, ctxDocs); };
+  const ctxDocs = { labels: ["Service", "Runbook", "Team"], relationship_types: ["CALLS"], filesystem: { file: null, folder: null }, docs: ["Runbook"] };
+  check("no hints for a valid docs relationship", j(docsRelHints(() => {})) === "[]", j(docsRelHints(() => {})));
+  let gotd = docsRelHints(f => { f.field = ""; });
+  check("a docs relationship without a field says what it is for", gotd.some(h => h.field === "field" && /Name the front-matter key whose value names the target/.test(h.text)), j(gotd));
+  gotd = docsRelHints(f => { f.from = "Runbook, Team"; });
+  check("a docs relationship from a type not sourced from front matter says so", gotd.some(h => h.field === "from" && /`Team` is not sourced from Markdown front matter/.test(h.text)), j(gotd));
+
+  // 47b. the docs controls in the editor (DOM)
+  const DM = () => {
+    const m = FM();
+    const b = m.projects[1];
+    b.schema.node_types.push({ label: "Ops", yaml: "label: Ops\n", entry: DOCS_NODE(), editable: true, badges: [] },
+      { label: "Hostile", yaml: "label: Hostile\n", editable: true, badges: [], entry: { label: "Hostile", key: ["path"],
+        metadata: [{ name: "path" }, { name: "owner" }],
+        source: { provider: "docs", paths: [HOSTILE], where: [{ field: HOSTILE, is: HOSTILE }], fields: { owner: HOSTILE } } } });
+    b.schema.relationships.push({ type: "RUNBOOK_FOR", yaml: "type: RUNBOOK_FOR\n", entry: DOCS_REL(), editable: true, badges: [] },
+      { type: "HOSTILE_DOCS", yaml: "type: HOSTILE_DOCS\n", entry: { ...DOCS_REL(), field: HOSTILE }, editable: true, badges: [] });
+    return m;
+  };
+  api.renderConfigPage(DM());
+  configPayload = DM();
+  fetchCalls = [];
+  respond = quiet;
+  await editRow("repo-b", "Ops");
+  check("a docs node type opens in the form with Markdown front matter picked", shown(els.configForm) && formCtl("Source").value === "docs" &&
+    formCtl("Source").children.some(o => o.value === "docs" && o.textContent === "Markdown front matter"), formCtl("Source") && formCtl("Source").value);
+  check("...paths as rows with the placeholder and the case-sensitivity hint",
+    rowsOf("Paths").length === 1 && formCtl("Path").value === "runbooks/**/*.md" && formCtl("Path").placeholder === "runbooks/**/*.md" &&
+    find(els.configForm, e => e.id === formCtl("Path").getAttribute("aria-describedby").split(" ")[0])[0].textContent ===
+      "Use **/*.md for all folders; matching is case-sensitive.", formCtl("Path").placeholder);
+  check("...conditions as rows of Field, Test and Value, the test in plain words",
+    rowsOf("Conditions").length === 4 && formCtl("Field", 0, rowsOf("Conditions")[1]).value === "title" &&
+    formCtl("Test", 0, rowsOf("Conditions")[1]).value === "starts_with" && formCtl("Value", 0, rowsOf("Conditions")[2]).value === "1" &&
+    j(formCtl("Test").children.map(o => o.textContent)) === j(["is", "starts with", "contains", "matches pattern (use * as a wildcard)"]),
+    j(formCtl("Test").children.map(o => o.textContent)));
+  const fmHelp = find(els.configForm, e => e.id === formCtl("Front-matter key", 3).getAttribute("aria-describedby").split(" ")[0])[0];
+  check("...and a Front-matter key on each metadata row, with its help",
+    formCtl("Front-matter key", 3).value === "on-call-team" && formCtl("Front-matter key", 1).value === "" &&
+    fmHelp.textContent === "The name before the colon at the top of the file; leave blank if it's the same as the field name.", fmHelp && fmHelp.textContent);
+  check("every docs node type control has a label", labelled(els.configForm).length === 0, j(labelled(els.configForm).map(c => c.id)));
+  check("every button in the docs form has a name", find(els.configForm, e => e.tagName === "BUTTON").every(b => b.textContent || b.getAttribute("aria-label")), "");
+  check("condition rows are legended with position and field", j(rowsOf("Conditions").map(legendOf).slice(0, 2)) === j(["Condition 1: type", "Condition 2: title"]),
+    j(rowsOf("Conditions").map(legendOf)));
+  await typeIn(formCtl("Name", 0, rowsOf("Metadata")[3]), "rota");
+  check("renaming a metadata row moves its fields entry in the YAML", /fields:\n    severity: sev\n    rota: "on-call-team"/.test(els.configYaml.value) &&
+    !/on_call/.test(els.configYaml.value), els.configYaml.value);
+  const testSel = formCtl("Test", 0, rowsOf("Conditions")[0]);
+  testSel.focus();
+  testSel.value = "like";
+  await testSel.fire("change");
+  check("changing a test keeps the select focused and rewrites the condition", focused === testSel && /- field: type\n {6}like: runbook/.test(els.configYaml.value),
+    els.configYaml.value);
+  const srcSel = formCtl("Source");
+  srcSel.focus();
+  srcSel.value = "file";
+  await srcSel.fire("change");
+  check("switching the source to the filesystem hides the docs controls in place, keeping the select focused",
+    formCtl("Source") === srcSel && focused === srcSel && !formCtl("Path") && !formCtl("Front-matter key") && !group("Paths") && !group("Conditions") &&
+    !api.formEls.all.some(c => c.placeholder === "runbooks/**/*.md" || !inTree(els.configForm, c)), focused && focused.tagName);
+  check("...and never writes the hidden keys", /source:\n  provider: filesystem\n  kind: file/.test(els.configYaml.value) &&
+    !/paths|where|fields|on-call|runbook/.test(els.configYaml.value), els.configYaml.value);
+  srcSel.value = "docs";
+  await srcSel.fire("change");
+  check("switching back shows them again with their values, focus still on the select",
+    focused === srcSel && formCtl("Path").value === "runbooks/**/*.md" && formCtl("Front-matter key", 3).value === "on-call-team" &&
+    /fields:\n    severity: sev\n    rota: "on-call-team"/.test(els.configYaml.value) && /like: runbook/.test(els.configYaml.value), els.configYaml.value);
+  await press(find(els.configForm, e => e.tagName === "BUTTON" && e.textContent === "Add path")[0]);
+  check("Add path adds a row and focuses it", rowsOf("Paths").length === 2 && focused === formCtl("Path", 1), focused && focused.tagName);
+  await typeIn(formCtl("Path", 1), "ops/*.md");
+  check("...writing it into paths", /paths: \["runbooks\/\*\*\/\*\.md", "ops\/\*\.md"\]/.test(els.configYaml.value), els.configYaml.value);
+  await press(find(els.configForm, e => e.tagName === "BUTTON" && e.textContent === "Add condition")[0]);
+  check("Add condition adds a row and focuses its Field", rowsOf("Conditions").length === 5 && focused === formCtl("Field", 0, rowsOf("Conditions")[4]),
+    focused && focused.tagName);
+  await press(removeOf(rowsOf("Conditions")[4]));
+  await press(removeOf(rowsOf("Paths")[1]));
+  check("Remove takes the rows out of the YAML again", !/ops\//.test(els.configYaml.value) && (els.configYaml.value.match(/- field:|- starts_with:/g) || []).length === 4,
+    els.configYaml.value);
+  await press(els.configModalSave);
+  check("a docs node type form edit saves through the same dry run", writes().length === 2 && body(writes()[0]).dry_run === true &&
+    body(writes()[0]).yaml === els.configYaml.value, j(writes()));
+  els.configModalCancel.fire("click");
+  // busy: a source change that lands while a request is out changes nothing
+  respond = quiet;
+  await editRow("repo-b", "Ops");
+  gate = new Promise(r => { release = r; });
+  clock += 1000;
+  pending = els.configModalSave.fire("click");
+  await Promise.resolve();
+  const docsBusy = els.configYaml.value;
+  formCtl("Source").value = "file";
+  await formCtl("Source").fire("change");
+  await press(find(els.configForm, e => e.tagName === "BUTTON" && e.textContent === "Add path")[0]);
+  check("while a docs dry run is out, a source change or Add path changes nothing", els.configForm.disabled === true &&
+    els.configYaml.value === docsBusy && api.edit.formState.source === "docs" && api.edit.formState.paths.length === 1, els.configYaml.value);
+  gate = null; release(); await pending;
+  els.configModalCancel.fire("click");
+  // the docs relationship
+  await editRow("repo-b", "RUNBOOK_FOR");
+  check("a docs relationship opens in the form with its Field shown", formCtl("Provider").value === "docs" && formCtl("Field").value === "service" &&
+    /the name before the colon at the top of each file/i.test(find(els.configForm, e => e.id === formCtl("Field").getAttribute("aria-describedby").split(" ")[0])[0].textContent),
+    formCtl("Field") && formCtl("Field").value);
+  check("every docs relationship control has a label", labelled(els.configForm).length === 0, j(labelled(els.configForm).map(c => c.id)));
+  const dprov = formCtl("Provider");
+  dprov.focus();
+  dprov.value = "custom";
+  await dprov.fire("change");
+  check("switching away from Markdown front matter hides Field in place and drops it from the YAML", focused === dprov && !formCtl("Field") &&
+    !/field:/.test(els.configYaml.value) && !!formCtl("Custom provider name"), els.configYaml.value);
+  dprov.value = "docs";
+  await dprov.fire("change");
+  check("...and back shows it with its value", focused === dprov && formCtl("Field").value === "service" && /^field: service$/m.test(els.configYaml.value) &&
+    !formCtl("Custom provider name"), els.configYaml.value);
+  els.configModalCancel.fire("click");
+  // hostile docs values land only in .value / textContent
+  await editRow("repo-b", "Hostile");
+  check("hostile path, condition and front-matter key are control values",
+    formCtl("Path").value === HOSTILE && formCtl("Field").value === HOSTILE && formCtl("Value").value === HOSTILE && formCtl("Front-matter key", 1).value === HOSTILE,
+    formCtl("Path").value);
+  await typeIn(formCtl("Path"), HOSTILE + "/x");
+  els.configModalCancel.fire("click");
+  await editRow("repo-b", "HOSTILE_DOCS");
+  check("a hostile relationship field is a control value", formCtl("Field").value === HOSTILE, formCtl("Field").value);
+  check("...and nothing docs-sourced reaches innerHTML", allEls.every(e => !e._html.includes("<img") && !e._html.includes("onerror")),
+    j(allEls.filter(e => e._html.includes("<img")).map(e => e._html)));
+  els.configModalCancel.fire("click");
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);

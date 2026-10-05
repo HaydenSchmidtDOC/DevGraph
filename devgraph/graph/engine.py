@@ -761,6 +761,19 @@ class GraphEngine:
             result = _retry_transient(session.run, f"MATCH (n:`{label}`) RETURN n LIMIT 1")
             return bool([record for record in result or []])
 
+    def existing_node_names(self, repo_id: str, label: str, names: list[str]) -> set[str]:
+        """Which of `names` one repo's `label` nodes carry. The caller validates `label`."""
+        if not names:
+            return set()
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                f"MATCH (n:`{label}` {{repo_id: $repo_id}}) WHERE n.name IN $names RETURN DISTINCT n.name AS name",
+                repo_id=repo_id,
+                names=names,
+            )
+            return {record["name"] for record in result or []}
+
     def delete_label_nodes(self, repo_id: str, label: str) -> int:
         """Delete one repo's nodes of a user label. The caller validates `label`."""
         with self._driver.session() as session:

@@ -861,6 +861,52 @@ def _schema_drift_findings(engine: Any, repos: list[Any]) -> list[dict[str, Any]
     return findings
 
 
+def _docs_source_findings(repos: list[Any], engine: Any) -> list[dict[str, Any]]:
+    """Doctor lines for each repository's node types sourced from Markdown front matter.
+
+    Per repository whose valid, enabled schema has docs sources: how many
+    files match and become entries, and which files have problems
+    (`docs.source_report`). Front-matter values that name no node are a graph
+    question: they are checked when `engine` is given, else reported skipped.
+    """
+    from devgraph.config.project_schema import ProjectSchemaError, resolve_effective_schema
+    from devgraph.indexer import walk
+    from devgraph.indexer.providers import docs
+
+    findings: list[dict[str, Any]] = []
+    for repo in sorted(repos, key=lambda r: r.repo_id):
+        try:
+            effective = resolve_effective_schema(repo.path)
+        except ProjectSchemaError:
+            continue  # reported above as invalid
+        spec = docs.docs_spec(effective)
+        if spec is None:
+            continue
+
+        def add(status: str, detail: str, repo_id: str = repo.repo_id) -> None:
+            findings.append({"repo_id": repo_id, "status": status, "detail": detail})
+
+        try:
+            files = walk.indexable_paths(repo.path)
+            for line in docs.source_report(repo.path, effective, files):
+                add(line["status"], line["detail"])
+            if not spec.relationships:
+                continue
+            if engine is None:
+                add("skipped", "links named in front matter not checked: Neo4j is not reachable")
+                continue
+            edges = docs.build_edges(spec, repo.repo_id, docs.read_selected(spec, docs.files_by_rel(repo.path, files)))
+            present = {
+                label: engine.existing_node_names(repo.repo_id, label, names)
+                for label, names in docs.edge_targets(edges).items()
+            }
+            for line in docs.unmatched_report(spec, edges, present):
+                add(line["status"], line["detail"])
+        except Exception as exc:
+            add("warning", f"could not check the Markdown front-matter sources: {exc}")
+    return findings
+
+
 @app.command()
 def doctor() -> None:
     """Run a heavier environment-drift diagnostic than `status`.
@@ -987,6 +1033,21 @@ def doctor() -> None:
             any_failed = True
         else:
             console.print(f"  [green][OK][/green] {escape(str(subject))}: {escape(finding['detail'])}")
+    # Markdown front-matter sources: links are checked against the graph only when it is up.
+    docs_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password) if neo4j_reachable else None
+    try:
+        docs_findings = _docs_source_findings(registered_repos, docs_engine)
+    finally:
+        if docs_engine is not None:
+            docs_engine.close()
+    for finding in docs_findings:
+        subject, detail = escape(str(finding["repo_id"])), escape(finding["detail"])
+        if finding["status"] == "ok":
+            console.print(f"  [green][OK][/green] {subject}: {detail}", soft_wrap=True)
+        elif finding["status"] == "skipped":
+            console.print(f"  [yellow]skipped[/yellow] {subject}: {detail}", soft_wrap=True)
+        else:
+            console.print(f"  [yellow][!] {subject}:[/yellow] {detail}", soft_wrap=True)
 
     console.print("[bold]Project tools[/bold]")
     tools_findings = _project_tools_findings(registered_repos)

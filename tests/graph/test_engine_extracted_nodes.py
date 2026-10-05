@@ -231,3 +231,11 @@ def test_empty_inputs_make_no_call():
     offline._driver = _NoDriver()
     assert offline.prune_extracted_at(REPO, "docs", [], ["Runbook:a.md"]) == 0
     assert offline.delete_extracted_edges(REPO, "docs", []) == 0
+
+
+def test_existing_node_names_returns_only_names_this_repo_has_under_the_label(engine):
+    seed(engine, REPO, "Service", ["api", "worker"], extractor="other")
+    seed(engine, REPO, "Module", ["db"])
+    seed(engine, OTHER, "Service", ["db"])
+    assert engine.existing_node_names(REPO, "Service", ["api", "db", "nope"]) == {"api"}
+    assert engine.existing_node_names(REPO, "Service", []) == set()

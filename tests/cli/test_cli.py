@@ -1251,6 +1251,152 @@ def test_cli_doctor_skips_drift_when_neo4j_is_unreachable(runner, temp_registry_
     assert "pending" not in collapsed
 
 
+RUNBOOK_SCHEMA = """\
+version: 1
+node_types:
+  - label: Runbook
+    key: [path]
+    metadata:
+      - {name: path}
+      - {name: owner, required: true}
+      - {name: severity, type: integer}
+    source:
+      provider: docs
+      paths: ["runbooks/**/*.md"]
+relationships:
+  - type: RUNBOOK_FOR
+    provider: docs
+    from: Runbook
+    to: Service
+    field: service
+"""
+
+
+def _runbook_repo(tmp_path, files, schema=RUNBOOK_SCHEMA):
+    root = _repo_with_schema(tmp_path, "ops", schema)
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return root
+
+
+def _docs_doctor(runner, temp_registry_db, monkeypatch, root, engine_cls):
+    from devgraph.config import project_switch
+
+    db_path, registry = temp_registry_db
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db_path)
+    registry.add_repo(root)
+    registry.close()
+    return _doctor_with_engine(runner, db_path, engine_cls)
+
+
+def _graph_with(present):
+    """A reachable stub engine whose graph holds `present`: {label: {name, ...}}."""
+    stub = _stub_engine(None)
+
+    class Graph(stub):
+        asked = []
+
+        def existing_node_names(self, repo_id, label, names):
+            Graph.asked.append((label, sorted(names)))
+            return set(names) & present.get(label, set())
+
+    return Graph
+
+
+def _project_schemas_section(stdout):
+    collapsed = _collapsed(stdout)
+    return collapsed[collapsed.index("Project schemas"):collapsed.index("Project tools")]
+
+
+def test_cli_doctor_reports_docs_sources_and_names_problem_files(runner, temp_registry_db, tmp_path, monkeypatch):
+    files = {"runbooks/ok.md": "---\nowner: ops\nservice: api\n---\n"}
+    # seven files with problems: five named, then "and 2 more"
+    for name in "abcdefg":
+        files[f"runbooks/{name}.md"] = "---\nseverity: 1\n---\n"
+    files["runbooks/aa-sev.md"] = "---\nowner: ops\nseverity: high\n---\n"
+    files["runbooks/bad.md"] = "---\nowner: [unclosed\n---\n"
+    files["notes/other.md"] = "---\nowner: ops\n---\n"
+    root = _runbook_repo(tmp_path, files)
+
+    section = _project_schemas_section(
+        _docs_doctor(runner, temp_registry_db, monkeypatch, root, _graph_with({"Service": {"api"}})).stdout
+    )
+
+    assert "Runbook: 10 files match, 2 Runbook entries" in section
+    assert "runbooks/a.md: missing required 'owner'" in section
+    assert "runbooks/bad.md: front matter is not valid YAML" in section
+    # coercion failures are reported too
+    assert "runbooks/aa-sev.md: 'severity' is not a whole number, left blank" in section
+    named = [f"runbooks/{n}.md:" for n in ("a", "aa-sev", "b", "bad", "c", "d", "e", "f", "g")]
+    assert sum(1 for n in named if n in section) == 5
+    assert "and 4 more files with problems" in section
+    assert "notes/other.md" not in section
+    # every value matched a Service, so there is no unmatched-link line
+    assert "matches no" not in section
+
+
+def test_cli_doctor_says_when_no_docs_file_matches(runner, temp_registry_db, tmp_path, monkeypatch):
+    root = _runbook_repo(tmp_path, {"Runbooks/a.md": "---\nowner: ops\n---\n"})
+    section = _project_schemas_section(_docs_doctor(runner, temp_registry_db, monkeypatch, root, _graph_with({})).stdout)
+    assert (
+        "Runbook: no file matches runbooks/**/*.md (matching is case-sensitive; use **/*.md for every folder)"
+        in section
+    )
+
+
+def test_cli_doctor_names_front_matter_values_that_match_no_node(runner, temp_registry_db, tmp_path, monkeypatch):
+    files = {
+        "runbooks/x.md": "---\nowner: ops\nservice: apii\n---\n",
+        "runbooks/y.md": "---\nowner: ops\nservice: [api, worker]\n---\n",
+    }
+    for i in range(6):
+        files[f"runbooks/zz{i}.md"] = f"---\nowner: ops\nservice: gone{i}\n---\n"
+    root = _runbook_repo(tmp_path, files)
+    graph = _graph_with({"Service": {"api"}})
+
+    section = _project_schemas_section(_docs_doctor(runner, temp_registry_db, monkeypatch, root, graph).stdout)
+
+    assert "Runbook: service 'apii' in runbooks/x.md matches no Service" in section
+    assert "Runbook: service 'worker' in runbooks/y.md matches no Service" in section
+    assert "service 'api' in" not in section
+    assert section.count("matches no Service") == 5  # then "and 3 more"
+    assert "Runbook: and 3 more service values that match no Service" in section
+    assert graph.asked and all(label == "Service" for label, _names in graph.asked)
+
+
+def test_cli_doctor_skips_the_link_check_when_neo4j_is_unreachable(runner, temp_registry_db, tmp_path, monkeypatch):
+    root = _runbook_repo(tmp_path, {"runbooks/x.md": "---\nowner: ops\nservice: apii\n---\n"})
+
+    class Down(_graph_with({})):
+        def verify_connectivity(self):
+            raise RuntimeError("connection refused")
+
+        def existing_node_names(self, repo_id, label, names):
+            raise AssertionError("the graph must not be asked")
+
+    section = _project_schemas_section(_docs_doctor(runner, temp_registry_db, monkeypatch, root, Down).stdout)
+    assert "Runbook: 1 file matches, 1 Runbook entry" in section
+    assert "skipped" in section and "Neo4j is not reachable" in section
+    assert "matches no" not in section
+
+
+def test_cli_doctor_prints_no_docs_lines_without_docs_sources(runner, temp_registry_db, tmp_path, monkeypatch):
+    root = _runbook_repo(tmp_path, {"runbooks/x.md": "---\nowner: ops\n---\n"}, schema=WIDGET_SCHEMA)
+    section = _project_schemas_section(
+        _docs_doctor(runner, temp_registry_db, monkeypatch, root, _graph_with({})).stdout
+    )
+    assert "files match" not in section and "no file matches" not in section
+    assert "skipped" not in section and "Runbook" not in section
+
+
+def test_cli_doctor_escapes_repository_file_names(runner, temp_registry_db, tmp_path, monkeypatch):
+    root = _runbook_repo(tmp_path, {"runbooks/[red]x[/red].md": "---\nseverity: 1\n---\n"})
+    section = _project_schemas_section(_docs_doctor(runner, temp_registry_db, monkeypatch, root, _graph_with({})).stdout)
+    assert "runbooks/[red]x[/red].md: missing required 'owner'" in section
+
+
 def test_cli_list_shows_the_project_config_switch(runner, temp_registry_db, tmp_path):
     db_path, registry = temp_registry_db
     on = registry.add_repo(_repo_with_schema(tmp_path, "on")).repo_id

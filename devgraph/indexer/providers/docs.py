@@ -410,6 +410,17 @@ def _plural(count: int, one: str, many: str) -> str:
     return f"{count} {one if count == 1 else many}"
 
 
+def files_by_rel(repo_root: Path, files: Iterable[Path]) -> dict[str, Path]:
+    """`files` keyed by their repo-relative POSIX path, as `read_selected` takes them."""
+    by_rel: dict[str, Path] = {}
+    for path in files:
+        try:
+            by_rel[path.relative_to(repo_root).as_posix()] = path
+        except ValueError:
+            continue
+    return by_rel
+
+
 def source_report(repo_root: Path, effective: EffectiveSchema, files: Iterable[Path]) -> list[dict[str, str]]:
     """Doctor lines for each docs-sourced type: {"status": "ok" | "warning", "detail": ...}.
 
@@ -420,12 +431,7 @@ def source_report(repo_root: Path, effective: EffectiveSchema, files: Iterable[P
     spec = docs_spec(effective)
     if spec is None:
         return []
-    by_rel: dict[str, Path] = {}
-    for path in files:
-        try:
-            by_rel[path.relative_to(repo_root).as_posix()] = path
-        except ValueError:
-            continue
+    by_rel = files_by_rel(repo_root, files)
     nodes, problems = build_nodes(spec, "", read_selected(spec, by_rel))
     lines: list[dict[str, str]] = []
     for docs_type in spec.types:
@@ -456,5 +462,46 @@ def source_report(repo_root: Path, effective: EffectiveSchema, files: Iterable[P
             lines.append({
                 "status": "warning",
                 "detail": f"{label}: and {len(named) - REPORT_FILE_LIMIT} more files with problems",
+            })
+    return lines
+
+
+def edge_targets(edges: Iterable[dict]) -> dict[str, list[str]]:
+    """The target names `build_edges` produced, per target label, sorted."""
+    targets: dict[str, set[str]] = {}
+    for edge in edges:
+        targets.setdefault(edge["to_label"], set()).add(edge["to_name"])
+    return {label: sorted(names) for label, names in targets.items()}
+
+
+def unmatched_report(spec: DocsSpec, edges: list[dict], present: Mapping[str, set[str]]) -> list[dict[str, str]]:
+    """Doctor lines for front-matter values that name no node, per docs relationship.
+
+    `edges` come from `build_edges`; `present` maps a target label to the
+    names the graph holds (the caller asks the graph, this module never
+    does). Names up to `REPORT_FILE_LIMIT` values per relationship, then
+    how many more.
+    """
+    lines: list[dict[str, str]] = []
+    for relationship in spec.relationships:
+        missing = sorted(
+            {
+                (edge["from_name"], edge["to_name"], edge["from_label"])
+                for edge in edges
+                if edge["rel_type"] == relationship.type
+                and edge["to_name"] not in present.get(relationship.to_label, set())
+            }
+        )
+        for path, value, label in missing[:REPORT_FILE_LIMIT]:
+            lines.append({
+                "status": "warning",
+                "detail": f"{label}: {_printable(relationship.field)} '{_printable(value)}' in "
+                          f"{_printable(path)} matches no {relationship.to_label}",
+            })
+        if len(missing) > REPORT_FILE_LIMIT:
+            lines.append({
+                "status": "warning",
+                "detail": f"{', '.join(relationship.from_labels)}: and {len(missing) - REPORT_FILE_LIMIT} more "
+                          f"{_printable(relationship.field)} values that match no {relationship.to_label}",
             })
     return lines

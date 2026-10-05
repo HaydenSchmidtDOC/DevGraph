@@ -109,6 +109,40 @@ VALID_NODE_TYPES = [
         "metadata": [{"name": "a"}, {"name": "b", "type": "integer", "required": False, "description": None}],
     },
     {"metadata": [{"name": "id", "required": True}], "key": ["id"], "label": "Reordered"},
+    # Markdown front matter: conditions in any key order, integer and boolean
+    # values kept as written, and front-matter keys in metadata order
+    {
+        "label": "Runbook",
+        "key": ["path"],
+        "metadata": [
+            {"name": "path"},
+            {"name": "owner", "required": True},
+            {"name": "severity", "type": "integer"},
+            {"name": "on_call"},
+        ],
+        "source": {
+            "provider": "docs",
+            "paths": ["runbooks/**/*.md", "ops/*.markdown"],
+            "where": [
+                {"field": "type", "is": "runbook"},
+                {"starts_with": "RB-", "field": "title"},
+                {"field": "version", "is": 1},
+                {"field": "draft", "is": False},
+                {"field": "tags", "contains": "oncall"},
+                {"field": "slug", "like": "db-*"},
+            ],
+            "fields": {"severity": "sev", "on_call": "on-call-team"},
+        },
+    },
+    # no where or fields
+    {"label": "Adr", "key": ["path"], "source": {"provider": "docs", "paths": ["docs/adr/*.md"]}, "metadata": [{"name": "path"}]},
+    # empty where and fields, keys reordered, and a field named like a YAML 1.1 boolean
+    {
+        "label": "Note",
+        "key": ["path"],
+        "source": {"paths": ["**/*.md"], "provider": "docs", "fields": {"on": "yes"}, "where": []},
+        "metadata": [{"name": "path"}, {"name": "on", "type": "boolean"}],
+    },
 ]
 
 VALID_RELATIONSHIPS = [
@@ -124,6 +158,8 @@ VALID_RELATIONSHIPS = [
     {"type": "IS_CHILD_OF", "from": ["File", "Folder"], "to": "Folder", "provider": "filesystem"},
     {"type": "OWNS", "from": ["Team"], "to": "Service", "provider": "custom", "custom": {"name": "owners"}},
     {"to": "Function", "provider": "builtin", "from": ["Function", "Service"], "type": "USES", "custom": None, "color": None},
+    {"type": "RUNBOOK_FOR", "provider": "docs", "from": "Runbook", "to": "Service", "field": "service"},
+    {"field": "see also", "type": "SEE_ALSO", "from": ["Runbook"], "to": "Runbook", "provider": "docs", "color": "#1f77b4"},
 ]
 
 HOSTILE_STRINGS = [
@@ -162,6 +198,16 @@ def _hostile_fixtures() -> list[dict]:
             "type": "T", "from": "A", "to": "B", "provider": "custom", "custom": {"name": text, "params": {}}, "color": text,
         }})
         fixtures.append({"section": "relationships", "mapping": {"type": "T", "from": text, "to": "B"}})
+        fixtures.append({"section": "relationships", "mapping": {"type": "T", "from": "A", "to": "B", "provider": "docs", "field": text}})
+        fixtures.append({"section": "node_types", "mapping": {
+            "label": "N", "key": ["path"],
+            "source": {"provider": "docs", "paths": [text], "where": [{"field": text, "contains": text}], "fields": {"owner": text}},
+            "metadata": [{"name": "path"}, {"name": "owner"}],
+        }})
+        # the text as a front-matter key's metadata name: keys are quoted like values
+        fixtures.append({"section": "node_types", "mapping": {
+            "label": "N", "metadata": [{"name": text}], "source": {"provider": "docs", "paths": ["*.md"], "fields": {text: "fm"}},
+        }})
     return fixtures
 
 
@@ -205,7 +251,7 @@ def _relationship_refusal(mapping: dict) -> str | None:
             return _FROM_LIST
         if key == "custom" and isinstance(value, dict) and _broken(value.get("name")):
             return _FIELD.format("custom.name")
-        if key in ("type", "to", "color") and _broken(value):
+        if key in ("type", "to", "color", "field") and _broken(value):
             return _FIELD.format(key)
     return None
 
@@ -217,6 +263,12 @@ def _form_refuses(fixture: dict) -> str | None:
         return _relationship_refusal(mapping)
     top, rows, row_fields = _SINGLE_LINE[fixture["section"]]
     single = [mapping.get(k) for k in top] + [r.get(k) for r in mapping.get(rows) or [] for k in row_fields]
+    source = mapping.get("source") or {}
+    if source.get("provider") == "docs":
+        fields = source.get("fields", {})
+        single += list(source["paths"]) + [v for c in source.get("where", []) for v in c.values()] + list(fields.values())
+        if "" in fields.values():  # a blank front-matter key reads as "same as the field name"
+            return _FIELD.format("")
     area = [mapping.get(k) for k in _TEXTAREA[fixture["section"]]]
     if any(_broken(v) for v in single) or any(isinstance(v, str) and "\r" in v for v in area):
         # which field comes first depends on the walk; the reason is the field one
@@ -241,6 +293,11 @@ NUMBER_FIXTURES = [
     ]}},
     {"section": "tools", "mapping": {"name": "n", "parameters": []}},
     {"section": "node_types", "mapping": {"label": "N", "key": [], "metadata": []}},
+    # condition values compare as text, but an untouched number or boolean comes back as written
+    {"section": "node_types", "mapping": {"label": "N", "key": ["path"], "metadata": [{"name": "path"}], "source": {
+        "provider": "docs", "paths": ["*.md"],
+        "where": [{"field": "v", "is": 1}, {"field": "d", "like": True}, {"field": "n", "contains": -(2**53 - 1)}],
+    }}},
 ]
 
 
