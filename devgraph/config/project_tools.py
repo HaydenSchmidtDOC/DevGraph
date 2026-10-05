@@ -81,9 +81,12 @@ _APOC = re.compile(r"(?<![A-Za-z_.$])apoc\s*\.", re.I)
 
 
 # What `yaml.safe_load` can raise on bad input: besides yaml.YAMLError, a constructor
-# raises ValueError/TypeError/AttributeError (e.g. `2001-13-45`, `!!int 0x`) and deep
-# nesting raises RecursionError. Every one of them means "this file is malformed".
-YAML_LOAD_ERRORS: tuple[type[BaseException], ...] = (yaml.YAMLError, ValueError, TypeError, AttributeError, RecursionError)
+# raises ValueError/TypeError/AttributeError/KeyError (e.g. `2001-13-45`, `!!int 0x`,
+# `!!bool maybe`) and deep nesting raises RecursionError. Every one of them means "this
+# file is malformed". `bounded_safe_load` already reports all of them as yaml.YAMLError.
+YAML_LOAD_ERRORS: tuple[type[BaseException], ...] = (
+    yaml.YAMLError, ValueError, TypeError, AttributeError, KeyError, RecursionError,
+)
 
 
 class ProjectToolsError(Exception):
