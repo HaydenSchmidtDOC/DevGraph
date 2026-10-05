@@ -1609,6 +1609,40 @@ def test_an_unquoted_yaml_boolean_word_gets_a_plain_hint(tmp_path, old, new):
         load_project_schema(write_schema(tmp_path, text))
 
 
+@pytest.mark.parametrize(
+    "old, new, message",
+    [
+        ('paths: ["runbooks/**/*.md"]', 'paths: ["runbooks/\\ud800/*.md"]', r"paths\[0\] of 'Runbook' contains a lone surrogate"),
+        ("- {field: type, is: runbook}", '- {field: "ty\\ud800pe", is: runbook}', r"where\[0\] of 'Runbook' names a front-matter key with a lone surrogate"),
+        ("- {field: type, is: runbook}", '- {field: type, is: "run\\ud800"}', r"where\[0\] of 'Runbook' compares with text that has a lone surrogate"),
+        ("- {field: type, is: runbook}", '- {field: type, starts_with: "run\\ud800"}', r"where\[0\] of 'Runbook' compares with text that has a lone surrogate"),
+        ("- {field: type, is: runbook}", '- {field: type, contains: "\\udfff"}', r"where\[0\] of 'Runbook' compares with text that has a lone surrogate"),
+        ("- {field: type, is: runbook}", '- {field: type, like: "*\\ud800*"}', r"where\[0\] of 'Runbook' compares with text that has a lone surrogate"),
+        ("fields: {on_call: on-call-team}", 'fields: {on_call: "on\\ud800call"}', r"fields of 'Runbook' maps 'on_call' to a front-matter key with a lone surrogate"),
+        ("        field: service\n", '        field: "serv\\ud800ice"\n', r"relationship 'RUNBOOK_FOR' field .*lone surrogate"),
+    ],
+    ids=["glob", "where field", "is", "starts_with", "contains", "like", "fields key", "relationship field"],
+)
+def test_lone_surrogates_are_refused(tmp_path, old, new, message):
+    text = runbook_with(old, new)
+    with pytest.raises(ProjectSchemaError, match=message) as caught:
+        load_project_schema(write_schema(tmp_path, text))
+    assert all(not "\ud800" <= c <= "\udfff" for c in str(caught.value))
+
+
+@pytest.mark.parametrize(
+    "provider",
+    ["0x" + "f" * 5000, "1", "[docs]", "{a: b}", "true", "null"],
+    ids=["huge int", "int", "list", "map", "bool", "null"],
+)
+def test_a_non_text_source_provider_gets_a_plain_message(tmp_path, capfd, provider):
+    text = runbook_with("          provider: docs\n", f"          provider: {provider}\n")
+    with pytest.raises(ProjectSchemaError, match=r"source provider must be one of filesystem, docs") as caught:
+        load_project_schema(write_schema(tmp_path, text))
+    assert "Exceeds the limit" not in str(caught.value)
+    assert capfd.readouterr().err == ""
+
+
 def test_docs_node_types_must_be_keyed_on_path(tmp_path):
     text = runbook_with("key: [path]", "key: [owner]")
     with pytest.raises(

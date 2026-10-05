@@ -288,3 +288,18 @@ def test_raw_keys_refuse_a_non_scalar_key():
 
 def test_default_loading_still_resolves_keys():
     assert bounded_safe_load("on: a\n") == {True: "a"}
+
+
+def test_raw_keys_let_the_last_duplicate_win():
+    assert bounded_safe_load("a: 1\na: 2\n", raw_keys=True) == {"a": 2}
+
+
+def test_raw_keys_let_an_explicit_key_beat_a_merged_one():
+    loaded = bounded_safe_load("b: &b {x: 1}\nc: {x: 9, <<: *b}\nd: {<<: *b, x: 8}\n", raw_keys=True)
+    assert loaded["c"] == {"x": 9} and loaded["d"] == {"x": 8}
+
+
+def test_raw_keys_keep_the_depth_bound():
+    deep = "a:\n" + "".join("  " * level + "a:\n" for level in range(1, 70)) + "  " * 70 + "x"
+    with pytest.raises(YAMLBoundError, match="nests more than"):
+        bounded_safe_load(deep, raw_keys=True)

@@ -112,18 +112,54 @@ def glob_matches(glob: str, rel: str) -> bool:
 
     The glob and the path are split on "/". A `**` segment matches zero or
     more whole folders; every other segment is matched against one path
-    segment with `fnmatch.fnmatchcase`. Walking the glob once over the set
-    of reachable path positions costs at most (glob segments x path
-    segments) segment matches, so no glob can backtrack the way
-    `PurePosixPath.full_match` does on `*a*a*a...` or repeated `**/*/`.
+    segment with `fnmatch.fnmatchcase`. The segments before the first `**`
+    are matched against the start of the path and those after the last
+    `**` against its end, each in one pass. Only what lies between (nothing,
+    once validation caps `**` at two) is walked as a set of reachable path
+    positions, so no glob can backtrack the way `PurePosixPath.full_match`
+    does on `*a*a*a...` or repeated `**/*/`.
     """
     parts = rel.split("/")
+    segments = glob.split("/")
+    if "**" not in segments:
+        return len(segments) == len(parts) and _segments_match(segments, parts)
+    first = segments.index("**")
+    last = len(segments) - 1 - segments[::-1].index("**")
+    head, middle, tail = segments[:first], segments[first:last + 1], segments[last + 1:]
+    if len(head) + len(tail) > len(parts):
+        return False
+    end = len(parts) - len(tail)
+    return (
+        _segments_match(head, parts[:first])
+        and _segments_match(tail, parts[end:])
+        and _walk(middle, parts[first:end])
+    )
+
+
+def _segments_match(segments: list[str], parts: list[str]) -> bool:
+    return all(fnmatch.fnmatchcase(part, segment) for part, segment in zip(parts, segments, strict=True))
+
+
+def _walk(segments: list[str], parts: list[str]) -> bool:
+    """Whether `segments` (which may hold `**`) match all of `parts`.
+
+    Tracks the set of reachable path positions, dropping any from which
+    fewer path segments remain than non-`**` segments are left to match.
+    """
+    still_needed = [0] * (len(segments) + 1)
+    for index in range(len(segments) - 1, -1, -1):
+        still_needed[index] = still_needed[index + 1] + (segments[index] != "**")
     reachable = {0}
-    for segment in glob.split("/"):
+    for index, segment in enumerate(segments):
+        limit = len(parts) - still_needed[index + 1]
         if segment == "**":
-            reachable = set(range(min(reachable), len(parts) + 1))
+            reachable = set(range(min(reachable), limit + 1))
         else:
-            reachable = {i + 1 for i in reachable if i < len(parts) and fnmatch.fnmatchcase(parts[i], segment)}
+            reachable = {
+                i + 1 for i in reachable
+                if i < len(parts) and fnmatch.fnmatchcase(parts[i], segment)
+            }
+        reachable = {i for i in reachable if i <= limit}
         if not reachable:
             return False
     return len(parts) in reachable
@@ -361,6 +397,15 @@ def build_edges(
     return rels
 
 
+def _printable(text: str) -> str:
+    """`text` with every unprintable character (control, format, lone surrogate...) escaped.
+
+    File names come from the repository, and a lone surrogate stands for an
+    undecodable byte, so a report line could otherwise reach a terminal raw.
+    """
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
+
+
 def _plural(count: int, one: str, many: str) -> str:
     return f"{count} {one if count == 1 else many}"
 
@@ -389,7 +434,7 @@ def source_report(repo_root: Path, effective: EffectiveSchema, files: Iterable[P
         if not matched:
             lines.append({
                 "status": "warning",
-                "detail": f"{label}: no file matches {', '.join(docs_type.paths)} "
+                "detail": f"{label}: no file matches {_printable(', '.join(docs_type.paths))} "
                           f"(matching is case-sensitive; use **/*.md for every folder)",
             })
             continue
@@ -405,7 +450,8 @@ def source_report(repo_root: Path, effective: EffectiveSchema, files: Iterable[P
                 reasons.setdefault(problem.path, []).append(problem.reason)
         named = sorted(reasons)
         for rel in named[:REPORT_FILE_LIMIT]:
-            lines.append({"status": "warning", "detail": f"{label}: {rel}: {'; '.join(reasons[rel])}"})
+            detail = f"{label}: {_printable(rel)}: {_printable('; '.join(reasons[rel]))}"
+            lines.append({"status": "warning", "detail": detail})
         if len(named) > REPORT_FILE_LIMIT:
             lines.append({
                 "status": "warning",

@@ -69,7 +69,7 @@ relationships:
 - **`paths`** holds 1 to 20 globs. A glob is rejected when it:
   - is empty or longer than 200 characters;
   - has a `..` or `.` segment (including a leading `./`), an empty segment (`a//b`, a trailing `/`), a leading `/`, or a backslash;
-  - has a control character (C0, DEL or C1);
+  - has a control character (C0, DEL or C1) or a lone surrogate (a YAML `"\ud800"` escape). Front-matter keys and condition text refuse lone surrogates too;
   - uses `**` as a segment more than twice.
 
   Matching splits the glob and the repo-relative path on `/`. A `**` segment matches zero or more whole folders, and every other segment is matched against one path segment with `fnmatch.fnmatchcase`. It is case-sensitive, and only `**` spans folders. The form hints "use `**/*.md` for every folder". Only `.md` and `.markdown` files are considered.
@@ -118,7 +118,7 @@ relationships:
 
 ## 3. Safety properties
 
-1. **No repository code runs, and no user-supplied pattern engine runs.** The provider reads bytes and parses YAML with `bounded_safe_load`. It applies four plain text operators. `like` uses `fnmatch.fnmatchcase`, whose translation has avoided catastrophic backtracking on `*` since Python 3.9. Globs are matched one segment at a time with the same `fnmatchcase`, walking the set of reachable path positions once, so a glob costs at most (glob segments × path segments) segment matches, and `**` is capped at two per glob. `PurePosixPath.full_match` is **not** used: it compiles a whole glob into one regex that backtracks catastrophically (`'*a'*7 + '*.md'` takes about 27 s on a 64-character name, and `'**/*/'*30 + 'x'` does not finish). There are no regexes, because a cloned repository controls the schema (see the threat model at the top) and Python's `re` has no timeout. One crafted pattern could stall the watcher or doctor for hours.
+1. **No repository code runs, and no user-supplied pattern engine runs.** The provider reads bytes and parses YAML with `bounded_safe_load`. It applies four plain text operators. `like` uses `fnmatch.fnmatchcase`, whose translation has avoided catastrophic backtracking on `*` since Python 3.9. Globs are matched one segment at a time with the same `fnmatchcase`. The segments before the first `**` are matched against the start of the path and those after the last `**` against its end, and only what lies between is walked as a set of reachable path positions (pruned when too few path segments remain), so a glob costs at most (glob segments × path segments) segment matches, and `**` is capped at two per glob. `PurePosixPath.full_match` is **not** used: it compiles a whole glob into one regex that backtracks catastrophically (`'*a'*7 + '*.md'` takes about 27 s on a 64-character name, and `'**/*/'*30 + 'x'` does not finish). There are no regexes, because a cloned repository controls the schema (see the threat model at the top) and Python's `re` has no timeout. One crafted pattern could stall the watcher or doctor for hours.
 2. **Reads are bounded.** A file is read with `read_bounded` (default cap `MAX_CONFIG_BYTES`, 1 MiB), so a FIFO, a device or an oversized file is never read. Front matter goes through `bounded_safe_load` with `YAML_MAX_NODES`. Limits:
    - globs, conditions and `fields` entries are counted and length-capped (§2);
    - edge lists hold at most 100 items;

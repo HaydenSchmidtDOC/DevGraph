@@ -214,6 +214,45 @@ def test_matching_never_backtracks(glob, rel):
     assert time.perf_counter() - started < 0.1
 
 
+REVIEW_GLOB = "*a" * 7 + "*.md"
+# PurePosixPath.full_match takes about 0.8 s on this path; the segment matcher is instant.
+REVIEW_PATH = "a" * 40 + "/b.md"
+
+
+def test_selection_is_wired_to_the_segment_matcher():
+    docs_type = one_type(paths=(REVIEW_GLOB,)).types[0]
+    started = time.perf_counter()
+    assert docs.selects(docs_type, REVIEW_PATH) is False
+    assert time.perf_counter() - started < 0.1
+
+
+def test_reading_and_building_are_wired_to_the_segment_matcher(tmp_path):
+    spec = one_type(paths=(REVIEW_GLOB,))
+    files = write(tmp_path, {REVIEW_PATH: fm("value: x")})
+    started = time.perf_counter()
+    assert read_selected(spec, files) == {}
+    assert build_nodes(spec, "demo", read_selected(spec, files)) == ([], [])
+    assert time.perf_counter() - started < 0.1
+
+
+@pytest.mark.parametrize("last", ["a", "x"], ids=["no match", "match"])
+def test_a_long_run_after_a_globstar_stays_fast_on_a_deep_path(last):
+    glob = "**/" + "*/" * 98 + "x"
+    rel = "/".join(["a"] * 2047 + [last])
+    started = time.perf_counter()
+    assert glob_matches(glob, rel) is (last == "x")
+    assert time.perf_counter() - started < 0.02
+
+
+def test_globstars_with_fixed_folders_between_them():
+    assert glob_matches("a/**/b/c/**/*.md", "a/x/b/c/y/z.md")
+    assert glob_matches("a/**/b/c/**/*.md", "a/b/c/z.md")
+    assert not glob_matches("a/**/b/c/**/*.md", "a/b/x/c/z.md")
+    assert not glob_matches("a/**/b/**/b", "a/b")
+    assert glob_matches("a/**/b/**/b", "a/b/b")
+    assert glob_matches("**/**", "x")
+
+
 # --- conditions ---------------------------------------------------------------------------
 
 
@@ -718,6 +757,22 @@ def test_report_survives_huge_ints_and_surrogates(tmp_path):
         "status": "warning",
         "detail": "Runbook: runbooks/x.md: 'owner' does not fit in 64 bits; it is required, so the file is skipped",
     }]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file names")
+def test_report_never_echoes_an_unprintable_path(tmp_path):
+    (tmp_path / "runbooks").mkdir()
+    escape = tmp_path / "runbooks" / "a\x1b[31m.md"
+    escape.write_text(fm("severity: 2"))
+    undecodable = os.fsencode(tmp_path / "runbooks") + b"/\xff.md"
+    with open(undecodable, "w") as handle:
+        handle.write(fm("severity: 2"))
+    files = {escape, Path(os.fsdecode(undecodable))}
+    lines = source_report(tmp_path, effective(RUNBOOK), files)
+    details = [line["detail"] for line in lines]
+    assert all(detail.isprintable() for detail in details)
+    assert "Runbook: runbooks/a\\x1b[31m.md: missing required 'owner'" in details
+    assert "Runbook: runbooks/\\udcff.md: missing required 'owner'" in details
 
 
 def test_report_is_empty_without_docs_sources(tmp_path):

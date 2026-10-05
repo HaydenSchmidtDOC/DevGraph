@@ -188,6 +188,11 @@ def _has_control_character(text: str) -> bool:
     return any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in text)
 
 
+def _has_lone_surrogate(text: str) -> bool:
+    """Whether `text` holds a lone surrogate (from a YAML "\\ud800" escape), which can't be printed or encoded."""
+    return any(0xD800 <= ord(c) <= 0xDFFF for c in text)
+
+
 def _front_matter_key_problem(key: str) -> str | None:
     """Why `key` can't name a front-matter key, in plain words, or None.
 
@@ -199,6 +204,8 @@ def _front_matter_key_problem(key: str) -> str | None:
         return f"a front-matter key longer than {MAX_FRONT_MATTER_KEY_LENGTH} characters"
     if _has_control_character(key):
         return f"a front-matter key with a control character ({key!r})"
+    if _has_lone_surrogate(key):
+        return "a front-matter key with a lone surrogate"
     return None
 
 
@@ -214,6 +221,8 @@ def _glob_problem(glob: str) -> str | None:
         return f"is longer than {MAX_GLOB_LENGTH} characters"
     if _has_control_character(glob):
         return "contains a control character"
+    if _has_lone_surrogate(glob):
+        return "contains a lone surrogate"
     if "\\" in glob:
         return f"({glob!r}) contains a backslash; separate folders with /"
     if glob.startswith("/"):
@@ -334,6 +343,15 @@ class NodeTypeDecl(BaseModel):
     def _check_label(cls, value: str) -> str:
         return _require_identifier(value, LABEL_PATTERN, "node type label")
 
+    @field_validator("source", mode="before")
+    @classmethod
+    def _check_source_provider(cls, value: object) -> object:
+        # Before the discriminator sees it: pydantic's own message formats the
+        # tag, which for a huge YAML integer fails with a stderr traceback.
+        if isinstance(value, dict) and "provider" in value and value["provider"] not in NODE_SOURCE_PROVIDERS:
+            raise ValueError(f"source provider must be one of {', '.join(NODE_SOURCE_PROVIDERS)}")
+        return value
+
     @property
     def metadata_by_name(self) -> dict[str, MetadataField]:
         """Declared fields by name, with exact duplicates collapsed.
@@ -428,6 +446,8 @@ class NodeTypeDecl(BaseModel):
                     f"where[{index}] of {label!r} compares with text longer than "
                     f"{MAX_CONDITION_TEXT} characters"
                 )
+            if _has_lone_surrogate(condition.text):
+                raise ValueError(f"where[{index}] of {label!r} compares with text that has a lone surrogate")
             problem = _front_matter_key_problem(condition.field)
             if problem is not None:
                 raise ValueError(f"where[{index}] of {label!r} names {problem}")
