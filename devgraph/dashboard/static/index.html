@@ -3007,7 +3007,7 @@ let configModel = null;
    after either is stale and dropped, so an older fingerprint never comes back */
 let configLoadSeq = 0;
 /* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, dryTarget, dryYaml, busy, label, armedAt,
-   mode (form|yaml), formState, formText, openText, openEntry, order } */
+   mode (form|yaml), formState, formText, openText, openEntry, order, parseRefused } */
 let configEdit = null;
 /* the open reset dialog: { scope, kind, opener, phrase, fingerprint, review, stale, busy, ready, armedAt } */
 let configReset = null;
@@ -3331,7 +3331,8 @@ function renderConfigModal() {
   configShow("configDestField", edit.step === "edit" &&
     (edit.op === "copy" || (edit.scope === CONFIG_GLOBAL && edit.section === "tools" && edit.op === "replace")));
   /* Form | YAML: offered by op first (delete and copy are the read-only YAML),
-     then by the text: the form shows only text it produced */
+     then by the text: the form's own text, the opening text, or hand-edited
+     text the server reads back (configFormReadBack) */
   const sw = configFormAvailability(edit);
   if (edit.mode === "form" && !(sw && sw.available)) edit.mode = "yaml";
   const form = edit.mode === "form";
@@ -3340,16 +3341,16 @@ function renderConfigModal() {
   configShow("configForm", edit.step === "edit" && form);
   configShow("configEditorSwitch", edit.step === "edit" && !!sw);
   configShow("configFormHelp", edit.step === "edit" && form);
-  const notice = edit.step === "edit" && !!sw && !form && !sw.available;
+  const notice = edit.step === "edit" && !!sw && !form && !!sw.reason;
   document.getElementById("configFormNoticeText").textContent = notice ? sw.reason : "";
   configShow("configFormNotice", notice);
-  configShow("configFormDiscard", notice && sw.reason === CONFIG_FORM_REASONS.handEdit);
+  configShow("configFormDiscard", notice && !!sw.handEdit && !!edit.formState);
   const formBtn = document.getElementById("configModeForm");
   formBtn.setAttribute("aria-pressed", String(form));
   document.getElementById("configModeYaml").setAttribute("aria-pressed", String(!form));
   /* unavailable, the Form button stays focusable so its reason can be read */
   formBtn.setAttribute("aria-disabled", String(!(sw && sw.available)));
-  if (sw && !sw.available) formBtn.setAttribute("aria-describedby", "configFormNoticeText");
+  if (sw && sw.reason) formBtn.setAttribute("aria-describedby", "configFormNoticeText");
   else formBtn.removeAttribute("aria-describedby");
   const confirm = document.getElementById("configModalConfirm");
   confirm.replaceChildren();
@@ -3457,7 +3458,7 @@ function openConfigEditor(opts) {
      untouched save sends exactly what was opened */
   const rep = configFormFromEntry(opts.section, opts.entry);
   Object.assign(configEdit, { openText: opts.yaml || "", openEntry: opts.entry, formText: opts.yaml || "",
-    formState: rep.ok ? rep.form : null, order: configIsMap(opts.entry) ? Object.keys(opts.entry) : [] });
+    formState: rep.ok ? rep.form : null, order: configIsMap(opts.entry) ? Object.keys(opts.entry) : [], parseRefused: null });
   configEdit.mode = configFormOp(opts) && rep.ok && configEditorPref !== "yaml" ? "form" : "yaml";
   configFormSeq = 0;
   if (configEdit.mode === "form") renderConfigForm(configEdit);
@@ -3917,7 +3918,7 @@ const CONFIG_FORM_REASONS = {
   value: "This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML.",
   fromList: "This entry's `from` can't be shown as comma-separated labels exactly (a label with a comma, surrounding spaces or a non-text value). Edit it as YAML.",
   customProvider: "This entry has a `custom` block but its provider isn't custom; the form can't show that. Edit it as YAML.",
-  handEdit: "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form.",
+  handEdit: "The YAML was edited by hand. Form reads it back if the form can show it exactly, or discard the hand edits to return to the form's last text.",
 };
 const configIsMap = v => v !== null && typeof v === "object" && !Array.isArray(v);
 const configIsScalar = v => v === null || ["string", "number", "boolean"].includes(typeof v);
@@ -4277,15 +4278,27 @@ function configFormHints(section, form, ctx) {
   }
   return out;
 }
-/* Can the editor (back) in YAML mode show the form for `text`? Only for text
-   whose mapping is known: the form's own last output (restore its state) or
-   the opening text (rebuild from the opening entry). */
+/* Can the editor (back) in YAML mode show the form for `text`? The form's own
+   last output restores its state; the opening text rebuilds from the opening
+   entry; any other (hand-edited) text is read back by the server ("parse"),
+   unless reading back this exact text was already refused (a failed request
+   may be retried). */
 function configFormSwitch(edit, text) {
-  const rep = configFormFromEntry(edit.section, edit.openEntry);
-  if (!rep.ok) return { available: false, restore: null, reason: rep.reason };
   if (edit.formState && text === edit.formText) return { available: true, restore: "state", reason: null };
-  if (text === edit.openText) return { available: true, restore: "open", reason: null };
-  return { available: false, restore: null, reason: CONFIG_FORM_REASONS.handEdit };
+  if (text === edit.openText) {
+    const rep = configFormFromEntry(edit.section, edit.openEntry);
+    return rep.ok ? { available: true, restore: "open", reason: null } : { available: false, restore: null, reason: rep.reason };
+  }
+  const refused = edit.parseRefused && edit.parseRefused.text === text ? edit.parseRefused : null;
+  if (refused && !refused.retry) return { available: false, restore: null, reason: refused.reason, handEdit: true };
+  return { available: true, restore: "parse", reason: refused ? refused.reason : CONFIG_FORM_REASONS.handEdit, handEdit: true };
+}
+/* the parse route's entry kind for each editor section */
+const CONFIG_PARSE_KINDS = { tools: "tool", node_types: "node_type", relationships: "relationship" };
+/* read-only: the server parses the text (the browser never parses YAML) and returns the mapping or null */
+function configParseRequest(section, yaml) {
+  return { url: "/api/config/parse", init: { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind: CONFIG_PARSE_KINDS[section], yaml }) } };
 }
 /* ── the form view (DOM). The form is a view over #configYaml: every change
    re-serialises the entry into the textarea and runs the textarea's own reset,
@@ -4333,15 +4346,47 @@ function configSetEditorMode(mode) {
   if (mode === "form") {
     const sw = configFormAvailability(edit);
     if (!sw || !sw.available) return;
+    if (sw.restore === "parse") return configFormReadBack(edit);
     if (sw.restore === "open") {
       edit.formState = configFormFromEntry(edit.section, edit.openEntry).form;
       edit.formText = edit.openText;
+      edit.order = Object.keys(edit.openEntry);
     }
     renderConfigForm(edit);
   }
   edit.mode = mode;
   configEditorPref = mode;
   renderConfigModal();
+}
+/* Form after a hand edit: the server reads the text back. The switch never
+   writes the textarea: the form takes the mapping as its state and the typed
+   text as its own, so the text (and a confirm covering it) is kept until a
+   form control changes it. A reply for an editor that was closed, switched or
+   retyped meanwhile is dropped. */
+async function configFormReadBack(edit) {
+  const yaml = document.getElementById("configYaml");
+  const text = yaml.value;
+  const pressed = document.activeElement;
+  edit.busy = "Reading…";
+  renderConfigModal();
+  const res = await configSend(configParseRequest(edit.section, text));
+  edit.busy = "";
+  if (configEdit !== edit) return;
+  if (edit.mode === "yaml" && yaml.value === text) {
+    const entry = res.ok && res.body ? res.body.entry : null;
+    const rep = configIsMap(entry) ? configFormFromEntry(edit.section, entry) : null;
+    if (rep && rep.ok) {
+      Object.assign(edit, { formState: rep.form, formText: text, order: Object.keys(entry), parseRefused: null, mode: "form" });
+      configEditorPref = "form";
+      renderConfigForm(edit);
+    } else if (!res.ok) {
+      edit.parseRefused = { text, retry: true, reason: describeConfigError(res.status, res.body && res.body.detail) };
+    } else {
+      edit.parseRefused = { text, reason: res.body && res.body.error ? String(res.body.error) : rep ? rep.reason : CONFIG_FORM_REASONS.value };
+    }
+  }
+  renderConfigModal();
+  if (configFocusLost(pressed)) (edit.mode === "form" ? configEditorFocusTarget() : pressed).focus();
 }
 /* back to the form's last text (through the textarea's reset, so a confirm is dropped) */
 function configFormDiscard() {

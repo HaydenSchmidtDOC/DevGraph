@@ -1778,3 +1778,121 @@ def test_alias_bomb_in_schema_file_is_refused_quickly(client, registry, tmp_path
     block = project["schema"]
     assert block["state"] == "invalid" and block["node_types"] == []
     assert "more than 10000" in block["error"]
+
+
+# --- POST /api/config/parse: read hand-edited YAML back for the form ------------------------------
+
+PARSE = "/api/config/parse"
+
+
+def _parse(client, body, headers=None):
+    return _send(client, "POST", PARSE, None, body, headers=headers)
+
+
+def test_parse_returns_the_mapping_and_writes_nothing(client, registry, tmp_path, global_store):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="find_parents"))
+    _global_store(global_store, "hot_paths")
+    before = _snapshot(tmp_path)
+
+    for kind, text, entry in (
+        ("tool", NEW_TOOL, {"name": "find_parents", "description": "Parents.",
+                            "cypher": "MATCH (n {repo_id: $repo_id}) RETURN n LIMIT 1\n"}),
+        ("node_type", "label: Widget\nkey: [slug]\nmetadata:\n- {name: slug, type: string}\n",
+         {"label": "Widget", "key": ["slug"], "metadata": [{"name": "slug", "type": "string"}]}),
+        # Not validated: an unknown field and a bad type still come back for the form to judge.
+        ("relationship", "type: OWNS\nfrom: Team\nto: 7\nextra: true\n",
+         {"type": "OWNS", "from": "Team", "to": 7, "extra": True}),
+    ):
+        response = _parse(client, {"kind": kind, "yaml": text})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"entry": entry}
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("text,error", [
+    ("name: [unclosed\n", "malformed YAML"),
+    ("- a\n- b\n", "yaml must be one mapping (a single entry)"),
+    ("", "yaml must be one mapping (a single entry)"),
+])
+def test_parse_errors_come_back_as_error_with_a_null_entry(client, text, error):
+    response = _parse(client, {"kind": "tool", "yaml": text})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["entry"] is None and body["error"].startswith(error)
+
+
+@pytest.mark.parametrize("text", [
+    "name: dated\ndescription: 2020-01-01\n",
+    "name: rows\nmax_rows: 5.0\n",
+    "name: big\nmax_rows: 1152921504606846976\n",
+    "name: nan\ndescription: .nan\n",
+    "1: one\n",
+])
+def test_parse_nulls_what_json_cannot_carry(client, text):
+    response = _parse(client, {"kind": "tool", "yaml": text})
+
+    assert response.status_code == 200
+    assert response.json() == {"entry": None}
+
+
+def test_parse_nulls_a_cycle_with_the_loader_s_error(client):
+    # `bounded_safe_load` refuses a self-referencing anchor before `form_entry` sees it.
+    response = _parse(client, {"kind": "tool", "yaml": "name: loopy\nparameters: &a [*a]\n"})
+
+    assert response.status_code == 200
+    assert response.json()["entry"] is None and "refers to itself" in response.json()["error"]
+
+
+def test_parse_refuses_an_alias_bomb_quickly(client):
+    import time
+
+    laughs = "[&l0 [lol, lol, lol, lol, lol, lol, lol, lol, lol, lol]" + "".join(
+        f", &l{i} [" + ", ".join([f"*l{i - 1}"] * 10) + "]" for i in range(1, 10)
+    ) + "]"
+
+    start = time.monotonic()
+    response = _parse(client, {"kind": "tool", "yaml": f"name: lol\ndescription: {laughs}\n"})
+    assert time.monotonic() - start < 2
+
+    assert response.status_code == 200
+    assert response.json()["entry"] is None and "more than 10000" in response.json()["error"]
+
+
+@pytest.mark.parametrize("headers", [
+    {"origin": "http://evil.test"},
+    {"sec-fetch-site": "cross-site"},
+    {"sec-fetch-site": "same-site"},
+])
+def test_parse_cross_site_is_403(client, headers):
+    response = _parse(client, {"kind": "tool", "yaml": NEW_TOOL}, headers=headers)
+
+    assert response.status_code == 403 and response.json()["detail"]["code"] == "forbidden"
+
+
+def test_parse_is_behind_the_host_guard(registry, engine, global_store):
+    client = TestClient(build_app(engine, registry, EventBroadcaster(), dashboard_host="127.0.0.1"), base_url="http://127.0.0.1")
+    rebinding = {"host": "evil.test:8765", "origin": "http://evil.test:8765"}
+
+    assert _parse(client, {"kind": "tool", "yaml": NEW_TOOL}, headers=rebinding).status_code == 403
+    ok = _parse(client, {"kind": "tool", "yaml": NEW_TOOL}, headers={"origin": "http://127.0.0.1", "sec-fetch-site": "same-origin"})
+    assert ok.status_code == 200 and ok.json()["entry"]["name"] == "find_parents"
+
+
+def test_parse_bad_bodies_are_refused(client):
+    form = client.post(PARSE, content=b"yaml=x", headers={"content-type": "application/x-www-form-urlencoded"})
+    assert form.status_code == 415 and form.json()["detail"]["code"] == "media_type"
+
+    big = json.dumps({"kind": "tool", "yaml": NEW_TOOL + "# " + "x" * 70_000 + "\n"})
+    assert _parse(client, big).status_code == 413
+
+    def chunks():
+        yield big.encode()
+
+    streamed = client.post(PARSE, content=chunks(), headers={"content-type": "application/json"})
+    assert streamed.status_code == 413
+
+    for body in ("not json", "[]", {"kind": "tool"}, {"kind": "tool", "yaml": 3}, {"kind": "file", "yaml": NEW_TOOL}, {"yaml": NEW_TOOL}):
+        response = _parse(client, body)
+        assert response.status_code == 400 and response.json()["detail"]["code"] == "bad_request", body

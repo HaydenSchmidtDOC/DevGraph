@@ -1920,8 +1920,17 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   s = api.configFormSwitch(swEdit, "name: renamed\n");
   check("the form's last text restores the form state", s.available && s.restore === "state", j(s));
   s = api.configFormSwitch(swEdit, "name: renamed\n# mine\n");
-  check("hand-edited text can't go back to the form, saying why", !s.available && s.restore === null &&
-    s.reason === "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form.", j(s));
+  check("hand-edited text goes back to the form through the server's read-back, saying so", s.available && s.restore === "parse" &&
+    s.handEdit === true && s.reason === "The YAML was edited by hand. Form reads it back if the form can show it exactly, or discard the hand edits to return to the form's last text.", j(s));
+  s = api.configFormSwitch({ ...swEdit, parseRefused: { text: "name: renamed\n# mine\n", reason: "no" } }, "name: renamed\n# mine\n");
+  check("...unless reading back that exact text was refused: unavailable with the refusal", !s.available && s.restore === null &&
+    s.reason === "no" && s.handEdit === true, j(s));
+  s = api.configFormSwitch({ ...swEdit, parseRefused: { text: "name: renamed\n# mine\n", reason: "no" } }, "name: renamed\n# other\n");
+  check("...a refusal covers only the text it was for", s.available && s.restore === "parse", j(s));
+  s = api.configFormSwitch({ ...swEdit, parseRefused: { text: "name: renamed\n# mine\n", reason: "HTTP 500", retry: true } }, "name: renamed\n# mine\n");
+  check("...and a failed request can be retried, showing why it failed", s.available && s.restore === "parse" && s.reason === "HTTP 500", j(s));
+  s = api.configFormSwitch({ ...swEdit, openEntry: null, formState: null }, "name: fixed\n");
+  check("hand edits to an entry that opened YAML-only can be read back too", s.available && s.restore === "parse", j(s));
   s = api.configFormSwitch({ ...swEdit, openEntry: { name: "x", extra: 1 }, formState: null }, openText);
   check("an entry the form can't show never switches to it", !s.available && s.reason === FIELD("extra"), j(s));
 
@@ -2127,12 +2136,10 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     !shown(els.configFormNotice) && !shown(els.configFormHelp), els.configYaml.value);
   els.configYaml.value = formText + "# mine\n";
   await els.configYaml.fire("input");
-  check("after a hand edit Form is unavailable, with the reason and a Discard button",
-    els.configModeForm.getAttribute("aria-disabled") === "true" && els.configModeForm.getAttribute("aria-describedby") === "configFormNoticeText" &&
-    els.configFormNoticeText.textContent === "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form." &&
+  check("after a hand edit Form stays available (it reads the text back), with a note and a Discard button",
+    els.configModeForm.getAttribute("aria-disabled") === "false" && els.configModeForm.getAttribute("aria-describedby") === "configFormNoticeText" &&
+    els.configFormNoticeText.textContent === "The YAML was edited by hand. Form reads it back if the form can show it exactly, or discard the hand edits to return to the form's last text." &&
     shown(els.configFormNotice) && shown(els.configFormDiscard), els.configFormNoticeText.textContent);
-  await press(els.configModeForm);
-  check("...pressing Form keeps the hand edit in YAML", shown(els.configYaml) && els.configYaml.value === formText + "# mine\n", els.configYaml.value);
   await press(els.configModalSave);
   check("...the hand edit is what gets dry-run", writes().length === 1 && body(writes()[0]).yaml === formText + "# mine\n" &&
     els.configModalSave.textContent === "Save anyway", JSON.stringify(writes()));
@@ -2146,6 +2153,124 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("...so the next Save dry-runs the form's text", writes().length === 2 && body(writes()[1]).dry_run === true &&
     body(writes()[1]).yaml === formText, JSON.stringify(writes()));
   els.configModalCancel.fire("click");
+
+  // 41j. Form after a hand edit: the server reads the text back; the textarea keeps the typed text
+  const parses = () => fetchCalls.filter(c => c.url === "/api/config/parse");
+  const HAND = "The YAML was edited by hand. Form reads it back if the form can show it exactly, or discard the hand edits to return to the form's last text.";
+  let parseRes = null;
+  const withParse = other => (url, init) => url === "/api/config/parse" ? parseRes(JSON.parse(init.body)) : other(url, init);
+  const toYaml = async () => { await editRow("repo-b", "hot_paths"); await press(els.configModeYaml); };
+  const handEdit = async text => { els.configYaml.value = text; await els.configYaml.fire("input"); };
+  const HAND_TEXT = "# kept\nname: hot_paths\ndescription: Typed by hand.\ncypher: |\n  MATCH (f:Function {repo_id: $repo_id})\n  RETURN f.name AS name\n";
+  const HAND_ENTRY = { name: "hot_paths", description: "Typed by hand.", cypher: "MATCH (f:Function {repo_id: $repo_id})\nRETURN f.name AS name\n" };
+  fetchCalls = [];
+  respond = withParse(warnDry);
+  parseRes = () => ({ status: 200, body: { entry: HAND_ENTRY } });
+  await toYaml();
+  await handEdit(HAND_TEXT);
+  await press(els.configModalSave);
+  check("(setup) the hand edit is dry-run and needs a confirm", api.edit.confirmed === true && els.configModalSave.textContent === "Save anyway",
+    els.configModalSave.textContent);
+  await press(els.configModeForm);
+  check("a hand edit then Form sends the textarea's text and the entry kind to the parse route",
+    parses().length === 1 && parses()[0].init.method === "POST" && parses()[0].init.headers["Content-Type"] === "application/json" &&
+    j(body(parses()[0])) === j({ kind: "tool", yaml: HAND_TEXT }), j(parses()));
+  check("...the form is rebuilt from the server's mapping", shown(els.configForm) && !shown(els.configYaml) &&
+    formCtl("Description").value === "Typed by hand." && rowsOf("Parameters").length === 0 && !shown(els.configFormNotice), formCtl("Description").value);
+  check("...the switch leaves the typed text alone, comment included", els.configYaml.value === HAND_TEXT, els.configYaml.value);
+  check("...and the confirm still covers that unchanged text", api.edit.confirmed === true && els.configModalSave.textContent === "Save anyway",
+    els.configModalSave.textContent);
+  await press(els.configModeYaml);
+  check("...back to YAML shows the same typed text, with no notice", els.configYaml.value === HAND_TEXT && !shown(els.configFormNotice) &&
+    els.configModeForm.getAttribute("aria-disabled") === "false", els.configYaml.value);
+  await press(els.configModeForm);
+  check("...and Form again restores the state without asking the server", parses().length === 1 && shown(els.configForm), j(parses().length));
+  await typeIn(formCtl("Description"), "Then in the form.");
+  check("the first form edit serialises the entry over the typed text and drops the confirm",
+    !/# kept/.test(els.configYaml.value) && /Then in the form\./.test(els.configYaml.value) && api.edit.confirmed === false &&
+    els.configModalSave.textContent === "Save", els.configYaml.value);
+  check("...keeping the read-back entry's key order", /^name: hot_paths\ndescription: /.test(els.configYaml.value), els.configYaml.value);
+  els.configModalCancel.fire("click");
+
+  // ...an entry the form can't show stays YAML, with the form's reason; editing the text again re-offers Form
+  fetchCalls = [];
+  respond = withParse(quiet);
+  parseRes = () => ({ status: 200, body: { entry: { ...HAND_ENTRY, version: 2 } } });
+  await toYaml();
+  await handEdit(HAND_TEXT + "version: 2\n");
+  await press(els.configModeForm);
+  const handOff = (reason, text = HAND_TEXT + "version: 2\n") => shown(els.configYaml) && !shown(els.configForm) && els.configYaml.value === text &&
+    els.configFormNoticeText.textContent === reason && els.configModeForm.getAttribute("aria-disabled") === "true" &&
+    els.configModeForm.getAttribute("aria-describedby") === "configFormNoticeText" && shown(els.configFormDiscard) && focused === els.configModeForm;
+  check("an unrepresentable hand edit stays in YAML with the form's reason, Discard offered, focus on Form", handOff(FIELD("version")),
+    els.configFormNoticeText.textContent);
+  await press(els.configModeForm);
+  check("...pressing Form again asks the server nothing", parses().length === 1, j(parses().length));
+  parseRes = () => ({ status: 200, body: { entry: null } });
+  await handEdit(HAND_TEXT + "version: 2\n# again\n");
+  check("...editing the text offers Form again", els.configModeForm.getAttribute("aria-disabled") === "false" &&
+    els.configFormNoticeText.textContent === HAND, els.configFormNoticeText.textContent);
+  await press(els.configModeForm);
+  check("a value JSON can't carry (entry: null) stays in YAML with that reason",
+    handOff("This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML.",
+      HAND_TEXT + "version: 2\n# again\n") && parses().length === 2,
+    els.configFormNoticeText.textContent);
+  await press(els.configFormDiscard);
+  check("...Discard still returns to the form's last text", shown(els.configForm) && els.configYaml.value === TOOL_YAML, els.configYaml.value);
+  els.configModalCancel.fire("click");
+
+  // ...a parse error shows the server's error; a failed request shows why and can be retried
+  fetchCalls = [];
+  parseRes = () => ({ status: 200, body: { entry: null, error: "malformed YAML: " + HOSTILE } });
+  await toYaml();
+  await handEdit(HAND_TEXT + "version: 2\n");
+  await press(els.configModeForm);
+  check("a parse error stays in YAML and shows the server's error as text", handOff("malformed YAML: " + HOSTILE) &&
+    els.configFormNoticeText.children.length === 0, els.configFormNoticeText.textContent);
+  parseRes = () => ({ status: 413, body: { detail: { code: "too_large", message: "request body is too large" } } });
+  await handEdit(HAND_TEXT + "version: 2\n# big\n");
+  await press(els.configModeForm);
+  check("a refused request stays in YAML with its message, Form still available to retry",
+    shown(els.configYaml) && els.configFormNoticeText.textContent === "request body is too large" &&
+    els.configModeForm.getAttribute("aria-disabled") === "false", els.configFormNoticeText.textContent);
+  parseRes = () => ({ status: 200, body: { entry: HAND_ENTRY } });
+  await press(els.configModeForm);
+  check("...and the retry reads it back", parses().length === 3 && shown(els.configForm) && formCtl("Description").value === "Typed by hand.",
+    j(parses().length));
+  els.configModalCancel.fire("click");
+
+  // ...busy while the request is out; a reply after Cancel is dropped
+  fetchCalls = [];
+  await toYaml();
+  await handEdit(HAND_TEXT);
+  gate = new Promise(r => { release = r; });
+  pending = press(els.configModeForm);
+  await Promise.resolve();
+  check("while the read-back is out the textarea, switch, Discard and Save are locked",
+    els.configYaml.readOnly === true && els.configModeForm.disabled === true && els.configModeYaml.disabled === true &&
+    els.configFormDiscard.disabled === true && els.configModalSave.disabled === true && els.configModalSave.textContent === "Reading…",
+    els.configModalSave.textContent);
+  await press(els.configModalSave);
+  await press(els.configModeYaml);
+  check("...Save and the switch do nothing meanwhile", writes().filter(c => c.url !== "/api/config/parse").length === 0 &&
+    shown(els.configYaml), j(writes()));
+  els.configModalCancel.fire("click");
+  await editRow("repo-b", "Runbook");
+  const untouched = [api.edit.mode, els.configYaml.value, j(api.edit.formState)];
+  gate = null; release(); await pending;
+  check("a reply after Cancel is ignored: the editor opened since is untouched", api.edit.section === "node_types" &&
+    j([api.edit.mode, els.configYaml.value, j(api.edit.formState)]) === j(untouched) && api.edit.parseRefused === null &&
+    !api.edit.busy && !shown(els.configFormNotice) && !formCtl("Cypher"), j([api.edit.mode, untouched]));
+  els.configModalCancel.fire("click");
+  await editRow("repo-b", "OWNS");
+  await press(els.configModeYaml);
+  await handEdit(REL_YAML + "# mine\n");
+  parseRes = () => ({ status: 200, body: { entry: REL_ENTRY } });
+  await press(els.configModeForm);
+  check("relationships read back with their kind", j(body(parses()[parses().length - 1])) === j({ kind: "relationship", yaml: REL_YAML + "# mine\n" }) &&
+    shown(els.configForm) && els.configYaml.value === REL_YAML + "# mine\n", j(parses()));
+  els.configModalCancel.fire("click");
+  respond = quiet;
 
   // 41i. the last picked editor wins for the page session, when it is available
   await editRow("repo-b", "hot_paths");
