@@ -8,6 +8,8 @@ stdin/stdout (see `mcp/server.py`'s module docstring).
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -18,6 +20,7 @@ from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from devgraph.config.settings import get_settings
+from devgraph.dashboard.db_metrics import MetricsHistory
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.dashboard.query_log import QueryLog
 from devgraph.dashboard.routes import build_router
@@ -101,11 +104,25 @@ def build_app(
     """`dashboard_host` is the address the server binds to (default: the
     `dashboard_host` setting); it joins the loopback names in the Host
     allowlist unless it is a wildcard."""
+    settings = get_settings()
     if dashboard_host is None:
-        dashboard_host = get_settings().dashboard_host
-    app = FastAPI(title="DevGraph Dashboard")
+        dashboard_host = settings.dashboard_host
+    metrics = MetricsHistory(engine, settings.neo4j_data_dir)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # Sampling lives exactly as long as the server, for the tray and the
+        # headless agent alike.
+        metrics.start()
+        try:
+            yield
+        finally:
+            metrics.stop()
+
+    app = FastAPI(title="DevGraph Dashboard", lifespan=lifespan)
+    app.state.metrics = metrics
     app.add_middleware(_LocalHostOnlyMiddleware, allowed_hostnames=_allowed_hostnames(dashboard_host))
-    app.include_router(build_router(engine, registry, events, QueryLog()))
+    app.include_router(build_router(engine, registry, events, QueryLog(), metrics))
     # Hand-written HTML/CSS/JS, no build step -- StaticFiles serves them
     # as-is (see Implementation Plan #5: no frontend framework in v1).
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")

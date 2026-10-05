@@ -84,7 +84,7 @@ const bootGlobals = {
   loadSchemaTypes: async () => {},
   refreshGraph: async () => {},
   loadGitHistory: () => {},
-  setHeapUnavailable: () => {},
+  startMemoryPolling: () => {},
   attemptMemoryMetrics: async () => {},
   attemptQueryTelemetry: async () => {},
   attemptCommunityDetection: async () => {},
@@ -401,8 +401,8 @@ const populated = () =>
     "index.html no longer calls refreshTelemetry at script scope");
   check("...and again after a console query, through the same shared refresh",
     /refreshTelemetry\(\);/.test(consoleSrc), consoleSrc);
-  check("nothing polls it on a timer", !/setInterval/.test(html),
-    "index.html now contains a setInterval");
+  check("nothing polls it on a timer", !/setInterval/.test(src),
+    "the MCP telemetry path now contains a setInterval");
 
   // 9. the MCP path is independent of the graph, by construction
   check("the MCP path never reaches for Neo4j",
