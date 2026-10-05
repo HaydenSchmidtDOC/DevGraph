@@ -10,16 +10,23 @@ reads. Configuration selects and maps that data. Nothing is executed. The
 whole feature is configured with YAML or with the dashboard Config page form,
 never with code.
 
+The threat model matters here. `devgraph.schema.yaml` ships inside the
+repository, project config is on by default, and the schema is not
+trust-gated. A cloned repository therefore controls every value in this
+mapping language, and nothing in it may be able to hang, crash or escape the
+indexer.
+
 ## 1. Decisions
 
 | # | Decision |
 | --- | --- |
 | D1 | A declarative provider is a `source` on a node type (which files become nodes, and which values become properties) plus relationships with the same `provider` (which value names the target node). No other shape. |
 | D2 | **The first slice is `docs`: Markdown front matter.** `git` and `ast` come later, in the same mapping language. |
-| D3 | The mapping language has four parts: path globs, `equals`/`matches` conditions on front-matter fields, a property-to-field map, and relationships found by key lookup. No expressions, no templating and no computed values. |
-| D4 | A docs-sourced node type is keyed `[path]`, as a filesystem type is. Keys taken from a front-matter field (an `id` such as `ADR-012`) are deferred to a later slice. |
-| D5 | The provider owns its nodes by `extractor = "docs"`. Its lifecycle reuses the filesystem provider's engine calls, plus two new path-scoped calls. |
+| D3 | The mapping language has four parts: path globs, plain text conditions on front-matter fields (`is`, `starts_with`, `contains`, `like`), a property-to-field map, and relationships found by key lookup. There are no regexes, no expressions, no templating and no computed values. |
+| D4 | A docs-sourced node type is keyed `[path]`, as a filesystem type is. Keys taken from a front-matter field (an `id` such as `ADR-012`) are the next slice. Until then, a docs→docs edge value is the target file's repo-relative path. |
+| D5 | The provider owns its nodes by `extractor = "docs"`. Its lifecycle reuses the filesystem provider's engine calls, plus path-scoped prune, edge-delete and property-clear calls. |
 | D6 | Schema changes reuse the applied-schema hash, the debounced rescan and the removed-type cleanup unchanged. |
+| D7 | Lookups into Service, Class and Function **fan out**. These labels are keyed `(repo_id, name, file)`, so `service: api` links to every Service named `api` (one per compose file that declares it). This is documented and tested, not refused, because Service is the headline target. |
 
 ### Why `docs` first (D2)
 
@@ -44,9 +51,9 @@ node_types:
     source:
       provider: docs
       paths: ["runbooks/**/*.md"]          # 1–20 repo-relative globs
-      where:                               # optional; all must hold
-        - {field: type, equals: runbook}
-        - {field: title, matches: "^RB-"}
+      where:                               # optional, at most 20; all must hold
+        - {field: type, is: runbook}
+        - {field: title, starts_with: "RB-"}
       fields: {on_call: on-call-team}      # optional; metadata name -> front-matter key
 relationships:
   - type: RUNBOOK_FOR
@@ -58,83 +65,143 @@ relationships:
 
 ### `source` (provider `docs`)
 
-- `NodeSource` becomes a union, discriminated on `provider`: the existing filesystem form `{provider: filesystem, kind}` or the docs form `{provider: docs, paths, where?, fields?}`. `NODE_SOURCE_PROVIDERS` gains `docs`.
-- **`paths`** holds 1 to 20 globs. Each glob is relative, POSIX, at most 200 characters, with no `..` segment and no leading `/`. It is matched against the repo-relative path with `PurePosixPath.full_match`, so `**` works. Only `.md` and `.markdown` files are considered.
-- **`where`** lists conditions, all of which must hold. Each is `{field, equals}` or `{field, matches}`, never both:
-  - `equals` takes a string, integer or boolean. It holds when the field's value equals it, or when the value is a list and one item equals it (`tags: [runbook, oncall]`).
-  - `matches` takes a Python regex of at most 200 characters, compiled during validation, so a bad pattern is a validation error. It is applied with `re.search` to string values (or list items) of at most 1,000 characters.
+- `NodeSource` becomes `FilesystemSource | DocsSource`, discriminated on `provider`. The filesystem form is unchanged; the docs form is `{provider: docs, paths, where?, fields?}`. `NODE_SOURCE_PROVIDERS` gains `docs`.
+- **`paths`** holds 1 to 20 globs. A glob is rejected when it:
+  - is empty or longer than 200 characters;
+  - has a `..` segment, a leading `/`, or a backslash.
+
+  Matching uses `PurePosixPath.full_match` on the repo-relative path. It is case-sensitive, and `**` spans folders. The form hints "use `**/*.md` for every folder". Only `.md` and `.markdown` files are considered.
+- **`where`** lists at most 20 conditions, all of which must hold. Each is `{field, <operator>: text}` with exactly one operator. The text is at most 200 characters.
+
+  | Operator | Holds when the value… | Form wording |
+  | --- | --- | --- |
+  | `is` | equals the text | "is" |
+  | `starts_with` | begins with the text | "starts with" |
+  | `contains` | contains the text | "contains" |
+  | `like` | matches the text, where `*` is any run of characters (`fnmatch.fnmatchcase`) | "looks like (use * as a wildcard)" |
+
+  - **Values are compared as text on both sides, case-sensitively.** A string is itself, an integer is written in decimal, and a boolean is written `true`/`false`. So `is: 1` and `is: "1"` both match `version: 1`. The schema accepts a string, integer or boolean after an operator and stores its canonical text.
+  - A list value holds when any item holds (`tags: [runbook, oncall]`). Floats, dates, maps and values longer than 4 KiB never hold.
   - Without a `where`, every file matching `paths` becomes a node, with or without front matter.
-- **`fields`** renames. A metadata field is filled from the front-matter key of the same name unless `fields` maps it to another key. Every key in `fields` must be a declared metadata field other than `path`. Front-matter key names are 1 to 64 characters and contain no control characters.
-- **Key.** The key must be exactly `[path]`, with `path` a string field. This is the rule filesystem types already follow, so the existing validator applies unchanged.
-- **Limits.** The current "at most one type per kind" rule applies to filesystem types only. Any number of node types may be sourced from docs, and one file may become a node of several of them.
+- **`fields`** renames, with at most 50 entries. A metadata field is filled from the front-matter key of the same name unless `fields` maps it to another key. Every key in `fields` must be a declared metadata field other than `path`. Front-matter key names are 1 to 64 characters with no control characters. Nested paths (`a.b`) are not supported.
+- **Key.** The key must be exactly `[path]`, with `path` a string field. The `_check_key_and_metadata` message names the provider: "…is sourced from Markdown front matter, so its key must be exactly [path]".
+- **Limits.** The current "at most one type per kind" rule (`_check_filesystem`) applies to filesystem sources only. Any number of node types may be sourced from docs, and one file may become a node of several docs types and also be a filesystem `File`.
 
 ### Relationships (provider `docs`)
 
-- `PROVIDER_KINDS` gains `docs`. A docs relationship needs `field`, has no `custom` block, and its type is not built in.
-- Every `from` label must be a docs-sourced node type. `to` may be any label in the effective schema, built-in or declared; the existing endpoint check enforces this.
-- `field` is allowed only on docs relationships.
-- **Key lookup.** The field's value is a string, an integer, or a list of at most 100 of these. Each value names one target: one edge to the `to` node whose `name` equals it. For every node DevGraph writes, `name` is the key: a Service's name, a Module's repo-relative path, a declared type's `path`. An edge whose target does not exist is skipped, as every cross-extractor edge already is.
+- `PROVIDER_KINDS` gains `docs`, and `RelationshipDecl` gains `field`. A docs relationship needs `field`, has no `custom` block, and its type is not built in. `field` is allowed only on docs relationships. These are per-relationship checks in `_check_provider`.
+- A new `ProjectSchema` model validator, `_check_docs`, requires every `from` label to be a docs-sourced node type. `to` may be any label in the effective schema; the existing endpoint check enforces this.
+- **Key lookup.** The field's value is a string, an integer, or a list of at most 100 of these, each at most 4 KiB. Values of exactly type `str` or `int` count; a boolean never counts as an integer. A leading `./` is removed. Each value names one target: one edge to every `to` node whose `name` equals it. For every node DevGraph writes, `name` is the key:
+  - a Service's name (fan-out, D7);
+  - a Module's repo-relative path;
+  - a docs or filesystem type's repo-relative `path`.
+
+  An edge whose target does not exist is skipped, as every cross-extractor edge already is.
 
 ### Property values
 
-- A declared metadata type is honoured or the property is left unset. A `string` field takes a string, integer, float or boolean, written as text. An `integer`, `float` or `boolean` field takes a value of exactly that YAML type. Lists, maps and dates never become properties.
-- A document missing a `required` field is skipped. Doctor reports it (§5).
-- Every node carries `name = path = <repo-relative path>` and `extractor = "docs"`. Nothing else is written. Reserved properties cannot be declared, as today.
+`build_nodes` emits every declared metadata field. A field whose value is absent or can't be coerced is written as `None`, so `SET n += …` removes a stale property. Coercion uses exact type checks (`type(v) is int`):
+
+| Declared type | Accepts | Unset when |
+| --- | --- | --- |
+| `string` | `str`, `int` (decimal), `bool` (`true`/`false`), `float` | longer than 4 KiB |
+| `integer` | `int` that is not a bool | outside int64 |
+| `float` | `float`, or `int` within int64 | — |
+| `boolean` | `bool` | — |
+
+- YAML 1.1 parsing means `yes`, `no`, `on` and `off` are booleans. In a `string` field they are written `true`/`false`, and the README says so.
+- Lists, maps and dates never become properties.
+- A document missing a `required` field is skipped. Doctor names it (§5).
+- Every node carries `name = path = <repo-relative path>`, `extractor = "docs"` and the declared fields. Nothing else is written. Reserved properties cannot be declared, as today.
 
 ## 3. Safety properties
 
-1. **No repository code runs, ever.** The provider reads bytes, parses YAML with `bounded_safe_load`, and compares strings. Regexes run in Python's `re` module, never in a shell.
-2. **Reads are bounded.** A file is read with `read_bounded` (default cap `MAX_CONFIG_BYTES`, 1 MiB), so a FIFO, a device or an oversized file is never read. Front matter goes through `bounded_safe_load` with `YAML_MAX_NODES`. List fields are capped at 100 items, and regex input at 1,000 characters.
-3. **Files are scoped exactly like the existing extractors.** The candidate set is `_indexable_paths`: regular files outside `IGNORED_DIR_NAMES`, with symlinks resolving outside the repository skipped (`is_within`). DevGraph has no separate `.gitignore` or tracked-file logic, and this provider adds none, so it sees exactly the files every other extractor sees.
-4. **Only declared names are written.** Labels, relationship types and property names come only from the validated schema. Each one fullmatches its identifier pattern before it reaches Cypher. Front-matter keys and values only ever travel as query parameters.
+1. **No repository code runs, and no user-supplied pattern engine runs.** The provider reads bytes and parses YAML with `bounded_safe_load`. It applies four plain text operators. `like` uses `fnmatch.fnmatchcase`, whose translation has avoided catastrophic backtracking on `*` since Python 3.9. Globs use `PurePosixPath.full_match`. There are no regexes, because a cloned repository controls the schema (see the threat model at the top) and Python's `re` has no timeout. One crafted pattern could stall the watcher or doctor for hours.
+2. **Reads are bounded.** A file is read with `read_bounded` (default cap `MAX_CONFIG_BYTES`, 1 MiB), so a FIFO, a device or an oversized file is never read. Front matter goes through `bounded_safe_load` with `YAML_MAX_NODES`. Limits:
+   - globs, conditions and `fields` entries are counted and length-capped (§2);
+   - edge lists hold at most 100 items;
+   - compared or written strings are at most 4 KiB;
+   - integers must fit int64.
+3. **Files are scoped exactly like the existing extractors.** The candidate set is `indexable_paths`: regular files outside `IGNORED_DIR_NAMES`, with symlinks resolving outside the repository skipped (`is_within`). DevGraph has no separate `.gitignore` or tracked-file logic, and this provider adds none. These helpers move from `dispatch.py` to a new `devgraph/indexer/walk.py`, which `dispatch` re-exports, so the provider and doctor don't import the dispatcher (§5).
+4. **Only declared names are written.** Labels, relationship types and property names come only from the validated schema. Each one fullmatches its identifier pattern before it reaches Cypher. Property names read back from the graph for clearing (§4) are re-validated the same way. Front-matter keys and values only ever travel as query parameters.
 5. **Writes MERGE on the declared key.** Nodes MERGE on `(repo_id, name)`, where `name` is the declared key `path`. The `(repo_id, path)` uniqueness constraint and the `(repo_id, name)` index are provisioned as for filesystem types.
-6. **The provider never touches other nodes.** It deletes only nodes tagged `extractor = "docs"` and only edges of docs relationship types leaving them. Built-in nodes and filesystem nodes are never touched.
-7. **The provider fails closed.** An invalid schema skips the provider entirely, prune included, so a bad edit never deletes good nodes (the `_filesystem_spec` rule). A malformed file is skipped and the rest of the batch continues.
+6. **The provider never touches other nodes.** It deletes only nodes tagged `extractor = "docs"`, and only outgoing non-built-in edges from them. Built-in nodes and filesystem nodes are never touched, including filesystem nodes at the same path.
+7. **The provider fails closed.** Each of the following skips every docs write and delete, including prune, the final `sync_edges` and relink:
+   - an invalid schema;
+   - a pending schema (outside `apply_project_schema`);
+   - `apply_project_schema` returning False.
 
-ReDoS from a user's own pattern against their own repository is accepted. Python's `re` has no timeout, and the length caps keep the input small.
+   A bad file or value is skipped and counted. The docs node pass, edge pass and relink are each wrapped in `try/except` with a warning, like the docs-notes and mentions passes, so one failure never aborts a batch.
 
 ## 4. Lifecycle and rescan
 
-- **Schema edits (D6).** A changed `devgraph.schema.yaml` changes `schema_file_hash`. The repository goes pending and the debounced schema rescan runs `full_scan`. Inside it, `apply_project_schema` runs as follows:
+- **One resolve per batch.** `index_paths` resolves the schema once per batch for both providers (`_provider_specs(repo_root) -> (ok, filesystem_spec, docs_spec)`).
+- **Schema edits (D6).** A changed `devgraph.schema.yaml` changes `schema_file_hash`. The repository goes pending and the debounced schema rescan runs `full_scan`. Inside it, `apply_project_schema` runs:
   1. Delete the labels and relationship types the schema no longer declares (existing step).
-  2. Delete every docs edge leaving a docs node.
-  3. `prune_extracted_nodes(extractor="docs", keep=…)` with the nodes the new mapping produces.
-  4. Upsert those nodes.
-- **Edges come after the built-ins.** Edges are written after `index_paths`, so built-in targets (Service, Module) exist by then. `full_scan` gains one final `docs.sync_edges` over every matched file.
-- **Edits and creates, from the watcher's `index_paths`, when the schema is not pending.** For the changed Markdown paths, the provider:
-  1. deletes docs edges leaving nodes at those paths (`delete_extracted_edges`);
-  2. upserts the produced nodes;
-  3. prunes docs nodes at those paths that are no longer produced (`prune_extracted_at`, for example when a `where` no longer holds);
-  4. upserts edges.
+  2. Delete every outgoing non-built-in edge from docs nodes, of any type, current or former (`delete_extracted_edges(…, paths=None)`).
+  3. Clear properties the schema no longer declares on each docs label: every property except declared fields, reserved names and `insight_*`, re-validated against `PROPERTY_NAME_PATTERN`.
+  4. Run `prune_extracted_nodes(extractor="docs", keep=…)` with the nodes the new mapping produces.
+  5. Upsert those nodes.
 
-  Nodes MERGE in place, so edges coming in from other docs nodes survive.
-- **Relink.** Built-in per-file replacement DETACH DELETEs and recreates a code file's nodes, which removes docs edges pointing at them. When an `index_paths` batch wrote nodes of a label that some docs relationship targets, the provider re-derives edges for all matched docs files and upserts the ones whose target is in the batch. This is the same idea as `_docs_note_referrers`: it re-reads glob-limited files and never reads the graph.
-- **Deletes, from `remove_paths`.** `delete_extracted_nodes(repo_id, "docs", paths)` removes the deleted paths' nodes and their edges, including everything below a deleted directory.
-- **Known limit.** An edge whose target first appears in a later batch (a Service added after the runbook) is made on the next save of the source file or at the next rescan.
+  After `index_paths`, `full_scan` runs one final `docs.sync_edges` over every matched file, so built-in targets exist first. It runs only when apply returned True.
+- **Edits and creates, from the watcher's `index_paths`, when the schema is valid and not pending.** For the changed Markdown paths, the provider:
+  1. deletes outgoing docs edges at those paths (`delete_extracted_edges`);
+  2. upserts the produced nodes, all declared fields included;
+  3. prunes docs nodes at those paths that are no longer produced (`prune_extracted_at`);
+  4. upserts their edges.
+
+  Nodes MERGE in place, so incoming edges survive.
+- **Relink, on added nodes only.** Built-in re-indexing MERGEs in place (`_replace_file_nodes_tx`, `_upsert_container_result`), so a re-indexed target keeps its incoming docs edges. Only a node that is new to the graph needs linking.
+  - `_batch_nodes` is extended with the batch's compose and Containerfile Service nodes and its docs-provider nodes. `previous_nodes` is snapshotted the same way.
+  - When `added_nodes` holds a label that some docs relationship targets, the provider re-derives edges for all matched docs files and upserts those whose target was added.
+  - The relink re-reads the glob-limited files, as `_docs_note_referrers` does, and never reads the graph.
+  - This covers a Service added after the runbook that names it, a docs→docs target created later, and a target deleted and then recreated.
+- **Deletes, from `remove_paths`.** `delete_extracted_nodes(repo_id, "docs", paths)` removes the deleted paths' docs nodes and their edges, including everything below a deleted directory.
+- **Known limit.** A target that appears without passing through `index_paths` gets its edge at the next rescan. Today that means git-history Commits, which no docs relationship is likely to target.
 
 ## 5. How it shows up
 
 - **Validation.** `devgraph config validate`, the Config page dry run and `devgraph config schema add/edit` all use the loader, so they report the new rules automatically. Messages are in plain words. Examples:
-  - "node type 'Runbook' reads Markdown front matter, so its key must be exactly [path]";
-  - "where[1] of 'Runbook': 'matches' is not a valid pattern: …";
+  - "node type 'Runbook' is sourced from Markdown front matter, so its key must be exactly [path]";
+  - "where[1] of 'Runbook' must use exactly one of is, starts_with, contains, like";
   - "fields of 'Runbook' maps 'owner', which is not a declared metadata field";
   - "relationship 'RUNBOOK_FOR' uses the docs provider, so it needs a 'field'".
-- **`devgraph doctor`.** The Project schemas section gains one line per docs-sourced type, from a pure `docs.source_report(repo_root, effective)`. It touches no graph. Examples:
-  - OK: "Runbook: 12 files match, 10 nodes".
-  - Warning: "Runbook: 2 skipped (1 malformed front matter, 1 missing required owner)".
-  - Warning: "Runbook: no file matches runbooks/**/*.md".
-- **The Config page form.** The node-type Source select gains "Docs front matter". When it is picked, the form shows:
-  - Paths, as rows with "Add path";
-  - Conditions, as rows of Field, Test (equals or matches) and Value;
-  - a "Front-matter key" input on each metadata row, blank meaning the same name.
+- **Callers that read `source.kind`** become provider-aware:
+  - `edits.pruned_types`/`schema_change_warnings` warn on a source removed, a provider changed (filesystem↔docs), a filesystem kind changed, or docs `paths`/`where` changed. Example: "the next rescan rebuilds Runbook entries from Markdown front matter".
+  - `edits.schema_entry_notes` names both providers in its note.
+  - `devgraph config schema list` shows `docs (runbooks/**/*.md)` or `filesystem (file)` in the Source column, and the docs fields in `--json`.
+- **`devgraph doctor`.** The Project schemas section gains lines per docs-sourced type, from `docs.source_report(repo_root, effective, files)`. Doctor passes in `walk.indexable_paths(repo_root)`. The report touches no graph and imports no dispatcher. Examples:
+  - OK: "Runbook: 12 files match, 10 Runbook entries".
+  - Warning: "Runbook: no file matches runbooks/**/*.md (matching is case-sensitive; use **/*.md for every folder)".
+  - Warning, naming up to 5 files with the reason and then "and N more":
+    - "runbooks/db.md: missing required 'owner'";
+    - "runbooks/x.md: front matter is not valid YAML";
+    - "runbooks/y.md: 'severity' is not a whole number, left blank".
+  - Edge values that match no target are a graph question, so `source_report` defers them explicitly. When Neo4j is reachable, doctor adds "Runbook → Service: 'paymnts' (runbooks/pay.md) matches no Service" for up to 5 values. Otherwise it prints "skipped: Neo4j is not reachable", as the drift section does.
+- **The Config page form.** The node-type Source select gains "Markdown front matter". When it is picked, the form shows:
+  - Paths, as rows with "Add path" and placeholder `runbooks/**/*.md`;
+  - Conditions, as rows of Field, a Test select in plain words (§2 table) and Value;
+  - a "Front-matter key" input on each metadata row, with help text "the name before the colon at the top of the file; leave blank if it's the same as the field name".
 
-  The relationship Provider select gains "Docs front matter", which shows a Field input. Entries the form can't show exactly open in YAML with a reason, as today. One example is an `equals` value that is not a string, because its type would be lost in a text input. The drift guard covers the new models and constants.
+  Renaming a metadata row carries its `fields` entry. The relationship Provider select gains "Markdown front matter", which shows a Field input with the same help text.
+  - A condition value from YAML that is an integer or boolean is shown as its canonical text and written back unchanged unless edited. It is not refused.
+  - These entries open in YAML with a reason: unknown source keys, and a `fields` map whose key order differs from the metadata order (the form could not keep it).
+  - `where` and `fields` are optional, so the `configFormFromEntry` all-fields-present check becomes provider-specific.
+  - The drift guard covers `FilesystemSource`, `DocsSource`, `Condition` and the new constants.
 - **Graph view and MCP.** Declared labels are already rendered with their `color`, and `search_component` already matches a repository's declared labels. No change.
-- **Starter template.** The commented example in `starter_schema_text` becomes the Runbook example above, replacing the `custom` relationship.
+- **Starter template.** The header no longer says extraction comes later: it says filesystem and Markdown front-matter sources are indexed. The commented example becomes the Runbook example above, replacing the `custom` relationship.
+- **README.** Covers:
+  - the four mapping parts;
+  - that matching is case-sensitive;
+  - the boolean wording;
+  - the Service fan-out;
+  - that docs→docs edge values are file paths for now, with front-matter keys the next slice.
+- **CONTEXT.md.** Gains **Declarative provider** and **Docs source**. Today the glossary exists only on the coordinator branch; Task 6 adds the terms wherever it lives once merged, or creates it at the repo root in that format.
 
 ## 6. Out of scope
 
 - `git` and `ast` providers, and keys from front-matter fields (D4).
+- Regexes, which are refused for the safety reason in §3.1.
 - Body or heading extraction (title, sections).
 - Nested front-matter paths (`a.b`).
 - Composite keys, and edges whose source is not a docs node.
@@ -142,9 +209,23 @@ ReDoS from a user's own pattern against their own repository is accepted. Python
 
 ## 7. Testing
 
-- Loader tests for every rule in §2.
-- Pure provider tests: globs, conditions, coercion, required fields, relationship values, bounds and hostile files (FIFO, oversized, outside symlink, YAML bomb).
-- Live Neo4j tests for the two new engine calls.
-- End-to-end live tests on a temporary repository: full scan; edit, un-match, delete and directory delete; schema edit, removal and an invalid schema; relink after a code file is re-indexed; a repository without docs sources produces an identical graph.
+- Loader tests for every rule in §2, including the `_check_docs` model validator.
+- Provider-aware tests for `pruned_types`, `schema_entry_notes` and `config schema list`, including filesystem↔docs transitions.
+- Pure provider tests:
+  - each operator and the text canonicalisation;
+  - every coercion row, including bool-is-not-int, int64 overflow and 4 KiB strings;
+  - `None` for absent fields;
+  - `./` normalisation;
+  - hostile files: FIFO, oversized, outside symlink and YAML bomb.
+- Live Neo4j tests for the three new engine calls.
+- End-to-end live tests on a temporary repository:
+  - full scan;
+  - edit, field removal, un-match, delete and directory delete;
+  - schema edit, removal (stale property cleared) and an invalid schema;
+  - relink when a compose file is added in a later batch, and on delete-then-recreate;
+  - Service fan-out;
+  - a bad value in one file does not stop the batch;
+  - a filesystem `File` and a docs `Runbook` on the same path (each survives the other's un-match, delete, type removal and invalid schema);
+  - a repository without docs sources produces an identical graph.
 - Doctor output tests.
 - Config form round-trip and drift tests.
