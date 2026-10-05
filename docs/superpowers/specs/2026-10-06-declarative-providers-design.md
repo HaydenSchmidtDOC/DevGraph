@@ -68,9 +68,11 @@ relationships:
 - `NodeSource` becomes `FilesystemSource | DocsSource`, discriminated on `provider`. The filesystem form is unchanged; the docs form is `{provider: docs, paths, where?, fields?}`. `NODE_SOURCE_PROVIDERS` gains `docs`.
 - **`paths`** holds 1 to 20 globs. A glob is rejected when it:
   - is empty or longer than 200 characters;
-  - has a `..` segment, a leading `/`, or a backslash.
+  - has a `..` or `.` segment (including a leading `./`), an empty segment (`a//b`, a trailing `/`), a leading `/`, or a backslash;
+  - has a control character (C0, DEL or C1);
+  - uses `**` as a segment more than twice.
 
-  Matching uses `PurePosixPath.full_match` on the repo-relative path. It is case-sensitive, and `**` spans folders. The form hints "use `**/*.md` for every folder". Only `.md` and `.markdown` files are considered.
+  Matching splits the glob and the repo-relative path on `/`. A `**` segment matches zero or more whole folders, and every other segment is matched against one path segment with `fnmatch.fnmatchcase`. It is case-sensitive, and only `**` spans folders. The form hints "use `**/*.md` for every folder". Only `.md` and `.markdown` files are considered.
 - **`where`** lists at most 20 conditions, all of which must hold. Each is `{field, <operator>: text}` with exactly one operator. The text is at most 200 characters.
 
   | Operator | Holds when the value… | Form wording |
@@ -78,7 +80,7 @@ relationships:
   | `is` | equals the text | "is" |
   | `starts_with` | begins with the text | "starts with" |
   | `contains` | contains the text | "contains" |
-  | `like` | matches the text, where `*` is any run of characters (`fnmatch.fnmatchcase`) | "looks like (use * as a wildcard)" |
+  | `like` | matches the text, where `*` is any run of characters and nothing else is special (`fnmatch.fnmatchcase`, with `?` and `[` escaped) | "looks like (use * as a wildcard)" |
 
   - **Values are compared as text on both sides, case-sensitively.** A string is itself, an integer is written in decimal, and a boolean is written `true`/`false`. So `is: 1` and `is: "1"` both match `version: 1`. The schema accepts a string, integer or boolean after an operator and stores its canonical text.
   - A list value holds when any item holds (`tags: [runbook, oncall]`). Floats, dates, maps and values longer than 4 KiB never hold.
@@ -116,12 +118,15 @@ relationships:
 
 ## 3. Safety properties
 
-1. **No repository code runs, and no user-supplied pattern engine runs.** The provider reads bytes and parses YAML with `bounded_safe_load`. It applies four plain text operators. `like` uses `fnmatch.fnmatchcase`, whose translation has avoided catastrophic backtracking on `*` since Python 3.9. Globs use `PurePosixPath.full_match`. There are no regexes, because a cloned repository controls the schema (see the threat model at the top) and Python's `re` has no timeout. One crafted pattern could stall the watcher or doctor for hours.
+1. **No repository code runs, and no user-supplied pattern engine runs.** The provider reads bytes and parses YAML with `bounded_safe_load`. It applies four plain text operators. `like` uses `fnmatch.fnmatchcase`, whose translation has avoided catastrophic backtracking on `*` since Python 3.9. Globs are matched one segment at a time with the same `fnmatchcase`, walking the set of reachable path positions once, so a glob costs at most (glob segments × path segments) segment matches, and `**` is capped at two per glob. `PurePosixPath.full_match` is **not** used: it compiles a whole glob into one regex that backtracks catastrophically (`'*a'*7 + '*.md'` takes about 27 s on a 64-character name, and `'**/*/'*30 + 'x'` does not finish). There are no regexes, because a cloned repository controls the schema (see the threat model at the top) and Python's `re` has no timeout. One crafted pattern could stall the watcher or doctor for hours.
 2. **Reads are bounded.** A file is read with `read_bounded` (default cap `MAX_CONFIG_BYTES`, 1 MiB), so a FIFO, a device or an oversized file is never read. Front matter goes through `bounded_safe_load` with `YAML_MAX_NODES`. Limits:
    - globs, conditions and `fields` entries are counted and length-capped (§2);
    - edge lists hold at most 100 items;
    - compared or written strings are at most 4 KiB;
-   - integers must fit int64.
+   - integers must fit int64, checked before any is written as text (YAML 1.1 hex, binary and sexagesimal integers are unbounded, and `str()` refuses one over 4300 digits);
+  - a string with a lone surrogate never matches and is left blank ("is not valid text").
+
+  Front matter is loaded with mapping keys kept as the author wrote them (`raw_keys`), so a field named `on` or `yes` is found and `on:` and `yes:` never collide; values keep YAML 1.1 resolution.
 3. **Files are scoped exactly like the existing extractors.** The candidate set is `indexable_paths`: regular files outside `IGNORED_DIR_NAMES`, with symlinks resolving outside the repository skipped (`is_within`). DevGraph has no separate `.gitignore` or tracked-file logic, and this provider adds none. These helpers move from `dispatch.py` to a new `devgraph/indexer/walk.py`, which `dispatch` re-exports, so the provider and doctor don't import the dispatcher (§5).
 4. **Only declared names are written.** Labels, relationship types and property names come only from the validated schema. Each one fullmatches its identifier pattern before it reaches Cypher. Property names read back from the graph for clearing (§4) are re-validated the same way. Front-matter keys and values only ever travel as query parameters.
 5. **Writes MERGE on the declared key.** Nodes MERGE on `(repo_id, name)`, where `name` is the declared key `path`. The `(repo_id, path)` uniqueness constraint and the `(repo_id, name)` index are provisioned as for filesystem types.

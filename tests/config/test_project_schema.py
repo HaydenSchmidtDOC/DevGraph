@@ -1484,8 +1484,19 @@ def test_where_and_fields_are_optional(tmp_path):
         ('["docs\\\\*.md"]', r"paths\[0\] of 'Runbook' .*backslash"),
         ('[""]', r"paths\[0\] of 'Runbook' is empty"),
         ('["ok.md", "' + "a" * 201 + '"]', r"paths\[1\] of 'Runbook' is longer than 200 characters"),
+        ('["./runbooks/*.md"]', r"paths\[0\] of 'Runbook' .*has a '\.' segment; write it relative to the repository root without '\./' \(e\.g\. runbooks/\*\*/\*\.md\)"),
+        ('["runbooks/./x.md"]', r"paths\[0\] of 'Runbook' .*has a '\.' segment"),
+        ('["runbooks//x.md"]', r"paths\[0\] of 'Runbook' .*has an empty folder name"),
+        ('["runbooks/"]', r"paths\[0\] of 'Runbook' .*has an empty folder name"),
+        ('["a/**/b/**/c/**/*.md"]', r"paths\[0\] of 'Runbook' .*uses \*\* more than 2 times"),
+        ('["' + "**/*/" * 30 + 'x"]', r"paths\[0\] of 'Runbook' .*uses \*\* more than 2 times"),
+        ('["run\\tbooks/*.md"]', r"paths\[0\] of 'Runbook' contains a control character"),
+        ('["run\\x7fbooks/*.md"]', r"paths\[0\] of 'Runbook' contains a control character"),
+        ('["run\\x85books/*.md"]', r"paths\[0\] of 'Runbook' contains a control character"),
     ],
-    ids=["empty", "21", "absolute", "dotdot", "bare dotdot", "backslash", "empty glob", "long"],
+    ids=["empty", "21", "absolute", "dotdot", "bare dotdot", "backslash", "empty glob", "long",
+         "dot slash", "dot segment", "double slash", "trailing slash", "three globstars", "thirty globstars",
+         "tab", "DEL", "C1"],
 )
 def test_docs_paths_rules(tmp_path, paths, message):
     text = runbook_with('paths: ["runbooks/**/*.md"]', f"paths: {paths}")
@@ -1505,10 +1516,17 @@ def test_a_glob_of_exactly_200_characters_and_20_globs_are_accepted(tmp_path):
         ("{field: type}", r"where\[0\] of 'Runbook' must use exactly one of is, starts_with, contains, like"),
         ("{field: type, is: a, contains: b}", r"where\[0\] of 'Runbook' must use exactly one of is, starts_with, contains, like"),
         ("{field: type, like: " + "a" * 201 + "}", r"where\[0\] of 'Runbook' compares with text longer than 200 characters"),
-        ('{field: "", is: a}', r"where\[0\] of 'Runbook' names the front-matter key '', which must be 1 to 64 characters"),
+        ('{field: "", is: a}', r"where\[0\] of 'Runbook' names an empty front-matter key"),
+        ("{field: " + "k" * 65 + ", is: a}", r"where\[0\] of 'Runbook' names a front-matter key longer than 64 characters$"),
         ('{field: "ty\\tpe", is: a}', r"where\[0\] of 'Runbook' .*control character"),
+        ('{field: "ty\\x7fpe", is: a}', r"where\[0\] of 'Runbook' names a front-matter key with a control character"),
+        ('{field: "ty\\x85pe", is: a}', r"where\[0\] of 'Runbook' names a front-matter key with a control character"),
+        ("{field: type, is: null, like: a}", r"where\[0\] of 'Runbook' gives 'is' no value; give it text or remove it"),
+        ("{field: type, starts_with: null}", r"where\[0\] of 'Runbook' gives 'starts_with' no value"),
+        ("{field: type, is: 0x" + "f" * 5000 + "}", r"a whole number in a condition must fit in 64 bits"),
     ],
-    ids=["no operator", "two operators", "long text", "empty field", "control char"],
+    ids=["no operator", "two operators", "long text", "empty field", "long field", "control char", "DEL", "C1",
+         "null beside another", "null alone", "huge int"],
 )
 def test_docs_condition_rules(tmp_path, condition, message):
     text = runbook_with("- {field: type, is: runbook}", f"- {condition}")
@@ -1565,14 +1583,29 @@ def test_fields_holds_at_most_50_entries(tmp_path):
         ("{owner_name: owner}", r"fields of 'Runbook' maps 'owner_name', which is not a declared metadata field"),
         ("{path: file}", r"fields of 'Runbook' maps 'path', which is always the file's repo-relative path"),
         ('{owner: "own\\u0007er"}', r"fields of 'Runbook' maps 'owner' to a front-matter key with a control character"),
-        ('{owner: ""}', r"fields of 'Runbook' maps 'owner' to the front-matter key '', which must be 1 to 64 characters"),
-        ("{owner: " + "k" * 65 + "}", r"fields of 'Runbook' maps 'owner' to the front-matter key '" + "k" * 65 + "', which must be 1 to 64"),
+        ('{owner: ""}', r"fields of 'Runbook' maps 'owner' to an empty front-matter key"),
+        ("{owner: " + "k" * 65 + "}", r"fields of 'Runbook' maps 'owner' to a front-matter key longer than 64 characters$"),
     ],
     ids=["undeclared", "path", "control char", "empty key", "long key"],
 )
 def test_docs_fields_rules(tmp_path, mapping, message):
     text = runbook_with("fields: {on_call: on-call-team}", f"fields: {mapping}")
     with pytest.raises(ProjectSchemaError, match=message):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("fields: {on_call: on-call-team}", "fields: {on_call: on}"),
+        ("          - {name: on_call}", "          - {name: on_call}\n          - {name: on}"),
+        ("        field: service\n", "        field: yes\n"),
+    ],
+    ids=["fields value", "metadata name", "relationship field"],
+)
+def test_an_unquoted_yaml_boolean_word_gets_a_plain_hint(tmp_path, old, new):
+    text = runbook_with(old, new)
+    with pytest.raises(ProjectSchemaError, match=r"YAML reads an unquoted on, off, yes or no as true or false; to mean the word, quote it: 'on'"):
         load_project_schema(write_schema(tmp_path, text))
 
 

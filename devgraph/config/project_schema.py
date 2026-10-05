@@ -86,10 +86,14 @@ CONDITION_OPERATORS: tuple[str, ...] = ("is", "starts_with", "contains", "like")
 #: Bounds on a docs source, so a hostile schema can't make matching costly.
 MAX_DOCS_PATHS = 20
 MAX_GLOB_LENGTH = 200
+MAX_GLOBSTARS = 2
 MAX_CONDITIONS = 20
 MAX_CONDITION_TEXT = 200
 MAX_FIELD_MAP = 50
 MAX_FRONT_MATTER_KEY_LENGTH = 64
+
+#: The whole-number range Neo4j stores, and the range docs values are compared and written in.
+INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
 
 #: Value types a declared metadata field may hold.
 METADATA_TYPES: tuple[str, ...] = ("string", "integer", "float", "boolean")
@@ -179,27 +183,53 @@ def _check_color(value: object) -> object:
     return value
 
 
+def _has_control_character(text: str) -> bool:
+    """Whether `text` holds a C0, DEL or C1 control character."""
+    return any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in text)
+
+
 def _front_matter_key_problem(key: str) -> str | None:
-    """Why `key` can't name a front-matter key, in plain words, or None."""
-    if not 1 <= len(key) <= MAX_FRONT_MATTER_KEY_LENGTH:
-        return f"the front-matter key {key!r}, which must be 1 to {MAX_FRONT_MATTER_KEY_LENGTH} characters"
-    if any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in key):
+    """Why `key` can't name a front-matter key, in plain words, or None.
+
+    A key that is too long is not echoed, so the message stays short.
+    """
+    if not key:
+        return "an empty front-matter key"
+    if len(key) > MAX_FRONT_MATTER_KEY_LENGTH:
+        return f"a front-matter key longer than {MAX_FRONT_MATTER_KEY_LENGTH} characters"
+    if _has_control_character(key):
         return f"a front-matter key with a control character ({key!r})"
     return None
 
 
 def _glob_problem(glob: str) -> str | None:
-    """Why `glob` can't be a docs `paths` entry, in plain words, or None."""
+    """Why `glob` can't be a docs `paths` entry, in plain words, or None.
+
+    Globs are matched one folder at a time (devgraph/indexer/providers/docs.py),
+    so `**` is capped: each one multiplies the folder positions tried.
+    """
     if not glob:
         return "is empty"
     if len(glob) > MAX_GLOB_LENGTH:
         return f"is longer than {MAX_GLOB_LENGTH} characters"
+    if _has_control_character(glob):
+        return "contains a control character"
     if "\\" in glob:
         return f"({glob!r}) contains a backslash; separate folders with /"
     if glob.startswith("/"):
         return f"({glob!r}) must be repo-relative: it may not start with /"
-    if ".." in glob.split("/"):
+    segments = glob.split("/")
+    if ".." in segments:
         return f"({glob!r}) may not contain a '..' folder"
+    if "." in segments:
+        return (
+            f"({glob!r}) has a '.' segment; write it relative to the repository root "
+            f"without './' (e.g. runbooks/**/*.md)"
+        )
+    if "" in segments:
+        return f"({glob!r}) has an empty folder name; separate folders with a single / and don't end with /"
+    if segments.count("**") > MAX_GLOBSTARS:
+        return f"({glob!r}) uses ** more than {MAX_GLOBSTARS} times"
     return None
 
 
@@ -216,8 +246,11 @@ class Condition(BaseModel):
     """One docs `where` test: a front-matter field compared with plain text.
 
     Exactly one operator is set (checked with the node type's label in
-    `NodeTypeDecl`). An integer or boolean operand is stored as its
-    canonical text, because values are compared as text on both sides.
+    `NodeTypeDecl`), and an operator written with no value (`is: null`) is
+    refused there too rather than ignored. An integer or boolean operand is
+    stored as its canonical text, because values are compared as text on
+    both sides. `is` is a Python keyword, so its attribute is `is_` with
+    the YAML name `is` as its alias.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", populate_by_name=True)
@@ -234,6 +267,10 @@ class Condition(BaseModel):
         if type(value) is bool:
             return "true" if value else "false"
         if type(value) is int:
+            # Checked before str(): YAML 1.1 hex, binary and sexagesimal
+            # integers have no size limit, but str() refuses huge ones.
+            if not INT64_MIN <= value <= INT64_MAX:
+                raise ValueError("a whole number in a condition must fit in 64 bits")
             return str(value)
         return value
 
@@ -376,6 +413,11 @@ class NodeTypeDecl(BaseModel):
                 f"where of {label!r} lists {len(source.where)} conditions; at most {MAX_CONDITIONS}"
             )
         for index, condition in enumerate(source.where):
+            for operator, attribute in zip(CONDITION_OPERATORS, ("is_", "starts_with", "contains", "like")):
+                if attribute in condition.model_fields_set and getattr(condition, attribute) is None:
+                    raise ValueError(
+                        f"where[{index}] of {label!r} gives {operator!r} no value; give it text or remove it"
+                    )
             if len(condition.operators) != 1:
                 raise ValueError(
                     f"where[{index}] of {label!r} must use exactly one of "
@@ -779,11 +821,20 @@ def parse_project_schema(text: str, path: Path) -> ProjectSchema:
         raise ProjectSchemaError(_format_validation_error(path, exc)) from exc
 
 
+#: Added where a name was expected but YAML 1.1 read an unquoted word as a boolean.
+_BOOLEAN_WORD_HINT = (
+    "YAML reads an unquoted on, off, yes or no as true or false; to mean the word, quote it: 'on'"
+)
+
+
 def _format_validation_error(path: Path, exc: ValidationError) -> str:
     lines = [f"{path}: invalid project schema"]
     for error in exc.errors():
         location = ".".join(str(part) for part in error["loc"]) or "<document>"
-        lines.append(f"  {location}: {error['msg']}")
+        message = error["msg"]
+        if error["type"] == "string_type" and type(error.get("input")) is bool:
+            message = f"{message}; {_BOOLEAN_WORD_HINT}"
+        lines.append(f"  {location}: {message}")
     return "\n".join(lines)
 
 

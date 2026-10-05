@@ -8,7 +8,8 @@ import os
 import subprocess
 import sys
 import textwrap
-from pathlib import Path, PurePosixPath
+import time
+from pathlib import Path
 
 import pytest
 
@@ -18,7 +19,9 @@ from devgraph.indexer.providers.docs import (
     build_edges,
     build_nodes,
     docs_spec,
+    glob_matches,
     read_front_matter,
+    read_selected,
     source_report,
 )
 
@@ -90,6 +93,14 @@ def fm(body: str) -> str:
     return f"---\n{textwrap.dedent(body).strip()}\n---\n# Title\n"
 
 
+def nodes_of(spec, files):
+    return build_nodes(spec, "demo", read_selected(spec, files))
+
+
+def edges_of(spec, files, targets=None):
+    return build_edges(spec, "demo", read_selected(spec, files), targets)
+
+
 def names(nodes):
     return sorted(n["name"] for n in nodes)
 
@@ -148,20 +159,59 @@ def test_file_selection(globs, rel, selected):
     assert docs.selects(spec.types[0], rel) is selected
 
 
+@pytest.mark.parametrize(
+    ("glob", "rel", "matched"),
+    [
+        ("a/*.md", "a/x.md", True),
+        ("a/*.md", "a/b/x.md", False),  # * stays inside one folder
+        ("*.md", "a/x.md", False),
+        ("a/**/x.md", "a/x.md", True),  # ** may be no folders
+        ("a/**/x.md", "a/b/c/x.md", True),
+        ("**", "a/b/x.md", True),
+        ("**/b/**/*.md", "b/x.md", True),
+        ("**/b/**/*.md", "a/b/c/x.md", True),
+        ("**/b/**/*.md", "a/c/x.md", False),
+        ("a/x?.md", "a/x1.md", True),
+        ("a/[xy].md", "a/y.md", True),
+        ("a/[!xy].md", "a/y.md", False),
+        ("a/*.md", "a/.hidden.md", True),
+        ("A/*.md", "a/x.md", False),
+        ("a/b", "a/b/c", False),
+        ("a/b/c", "a/b", False),
+    ],
+)
+def test_glob_matches_one_folder_at_a_time(glob, rel, matched):
+    assert glob_matches(glob, rel) is matched
+
+
 def test_no_malformed_glob_raises_when_matched():
-    # Validation only checks length, backslashes, '/' and '..'; anything else
-    # must be safe to hand to full_match.
     alphabet = "[]!*?-/a."
     for size in range(1, 5):
         for chars in itertools.product(alphabet, repeat=size):
             glob = "".join(chars)
             for rel in ("a", "a/b.md", "[a].md", "a/.md"):
-                PurePosixPath(rel).full_match(glob)
+                glob_matches(glob, rel)
 
 
 def test_a_malformed_glob_validates_and_matches_nothing(tmp_path):
     spec = one_type(paths=("[", "a/[!]", "[a-"))
     assert not docs.selects(spec.types[0], "a/b.md")
+
+
+@pytest.mark.parametrize(
+    ("glob", "rel"),
+    [
+        ("*a" * 7 + "*.md", "a" * 61 + ".mx"),
+        ("*a" * 30 + "*.md", "a" * 200 + ".mx"),
+        ("**/*/" * 30 + "x", "a/" * 60 + "y"),  # refused by validation; still fast when matched
+        ("**/" + "*a" * 20 + "/**/" + "*a" * 20 + "/x", "/".join(["a" * 50] * 60) + "/y"),
+    ],
+    ids=["review name", "longer name", "thirty globstars", "deep path"],
+)
+def test_matching_never_backtracks(glob, rel):
+    started = time.perf_counter()
+    assert glob_matches(glob, rel) is False
+    assert time.perf_counter() - started < 0.1
 
 
 # --- conditions ---------------------------------------------------------------------------
@@ -184,11 +234,25 @@ def test_a_malformed_glob_validates_and_matches_nothing(tmp_path):
         ("{field: tags, is: other}", "tags: [runbook, oncall]", False),
         ("{field: title, starts_with: RB-}", "title: RB-12 db", True),
         ("{field: title, starts_with: RB-}", "title: rb-12", False),
+        ("{field: title, starts_with: RB-}", "title: XRB-1", False),  # contains would hold
         ("{field: id, starts_with: 12}", "id: 1234", True),
         ("{field: title, contains: db}", "title: RB-12 db failover", True),
         ("{field: title, contains: DB}", "title: RB-12 db failover", False),
         ("{field: title, like: 'RB-*-db'}", "title: RB-12-db", True),
         ("{field: title, like: 'RB-*'}", "title: XRB-12", False),
+        ("{field: title, like: 'rb-*'}", "title: RB-1", False),  # case-sensitive
+        ("{field: title, like: 'a?c'}", "title: abc", False),  # only * is a wildcard
+        ("{field: title, like: 'a?c'}", "title: a?c", True),
+        ("{field: title, like: '[ab]*'}", "title: a1", False),
+        ("{field: title, like: '[ab]*'}", "title: '[ab]1'", True),
+        ("{field: title, like: 'a]*'}", "title: a]1", True),
+        ("{field: v, is: 1}", "v: 0x" + "f" * 5000, False),  # huge ints never hold
+        ("{field: v, like: '*'}", "v: 0b" + "1" * 70, False),
+        ("{field: v, like: '*'}", "v: [0x" + "f" * 5000 + ", ok]", True),
+        ("{field: v, like: '*'}", 'v: "\\ud800"', False),  # a lone surrogate never holds
+        ("{field: 'on', is: x}", "on: x", True),  # keys are kept as written
+        ("{field: 'yes', is: b}", "on: a\nyes: b", True),
+        ("{field: '1', is: one}", "1: one", True),
         ("{field: tags, like: 'on*'}", "tags: [runbook, oncall]", True),
         ("{field: score, is: '1.5'}", "score: 1.5", False),  # floats never hold
         ("{field: when, is: '2026-01-01'}", "when: 2026-01-01", False),  # dates never hold
@@ -201,14 +265,14 @@ def test_a_malformed_glob_validates_and_matches_nothing(tmp_path):
 def test_each_operator(tmp_path, condition, front_matter, holds):
     spec = one_type(where=condition)
     files = write(tmp_path, {"a.md": fm(front_matter)})
-    nodes, _ = build_nodes(spec, "demo", files)
+    nodes, _ = nodes_of(spec, files)
     assert bool(nodes) is holds
 
 
 def test_a_value_over_4_kib_never_holds(tmp_path):
     spec = one_type(where="{field: body, like: '*'}")
     files = write(tmp_path, {"a.md": fm("body: " + "x" * 4097), "b.md": fm("body: " + "x" * 4096)})
-    nodes, _ = build_nodes(spec, "demo", files)
+    nodes, _ = nodes_of(spec, files)
     assert names(nodes) == ["b.md"]
 
 
@@ -218,26 +282,31 @@ def test_all_conditions_must_hold(tmp_path):
         "both.md": fm("kind: runbook\ntitle: RB-1"),
         "one.md": fm("kind: runbook\ntitle: other"),
     })
-    nodes, problems = build_nodes(spec, "demo", files)
+    nodes, problems = nodes_of(spec, files)
     assert names(nodes) == ["both.md"]
     assert problems == []
 
 
 def test_no_front_matter_is_a_node_without_where_and_none_with_it(tmp_path):
     files = write(tmp_path, {"plain.md": "# Just a heading\n", "empty.md": ""})
-    nodes, problems = build_nodes(one_type(), "demo", files)
+    nodes, problems = nodes_of(one_type(), files)
     assert names(nodes) == ["empty.md", "plain.md"] and problems == []
-    nodes, problems = build_nodes(one_type(where="{field: kind, is: x}"), "demo", files)
+    nodes, problems = nodes_of(one_type(where="{field: kind, is: x}"), files)
     assert nodes == [] and problems == []
 
 
-def test_files_outside_the_globs_are_never_read(tmp_path, monkeypatch):
-    files = write(tmp_path, {"runbooks/a.md": fm("owner: ops"), "other/b.md": fm("owner: ops")})
+def test_each_selected_file_is_read_once_and_others_never(tmp_path, monkeypatch):
+    files = write(tmp_path, {"runbooks/a.md": fm("owner: ops\nservice: api"), "other/b.md": fm("owner: ops")})
     seen = []
     real = docs.read_front_matter
     monkeypatch.setattr(docs, "read_front_matter", lambda p: (seen.append(p), real(p))[1])
-    build_nodes(spec_of(RUNBOOK), "demo", files)
+    spec = spec_of(RUNBOOK)
+    selected = read_selected(spec, files)
+    nodes, _ = build_nodes(spec, "demo", selected)
+    rels = build_edges(spec, "demo", selected)
     assert seen == [files["runbooks/a.md"]]
+    assert list(selected) == ["runbooks/a.md"] and selected["runbooks/a.md"][1] is None
+    assert names(nodes) == ["runbooks/a.md"] and len(rels) == 1
 
 
 # --- fields and coercion ------------------------------------------------------------------
@@ -245,7 +314,7 @@ def test_files_outside_the_globs_are_never_read(tmp_path, monkeypatch):
 
 def test_fields_rename_and_the_same_name_default(tmp_path):
     files = write(tmp_path, {"runbooks/a.md": fm("owner: ops\non-call-team: dba\non_call: ignored")})
-    (node,), problems = build_nodes(spec_of(RUNBOOK), "demo", files)
+    (node,), problems = nodes_of(spec_of(RUNBOOK), files)
     assert node["properties"]["owner"] == "ops"
     assert node["properties"]["on_call"] == "dba"
     assert problems == []
@@ -253,7 +322,7 @@ def test_fields_rename_and_the_same_name_default(tmp_path):
 
 def test_node_shape_is_name_path_extractor_and_declared_fields(tmp_path):
     files = write(tmp_path, {"runbooks/a.md": fm("owner: ops\nextra: x\nname: spoof\nextractor: spoof")})
-    (node,), _ = build_nodes(spec_of(RUNBOOK), "demo", files)
+    (node,), _ = nodes_of(spec_of(RUNBOOK), files)
     assert node == {
         "label": "Runbook",
         "repo_id": "demo",
@@ -270,7 +339,7 @@ def test_node_shape_is_name_path_extractor_and_declared_fields(tmp_path):
 
 def test_path_always_comes_from_the_file_not_the_front_matter(tmp_path):
     files = write(tmp_path, {"a.md": fm("path: elsewhere.md")})
-    (node,), _ = build_nodes(one_type(), "demo", files)
+    (node,), _ = nodes_of(one_type(), files)
     assert node["properties"]["path"] == "a.md"
 
 
@@ -293,6 +362,12 @@ INT64_MAX = 2**63 - 1
         ("string", "{a: 1}", None),
         ("string", "2026-01-01", None),
         ("string", "null", None),
+        ("string", "0x" + "f" * 5000, None),
+        ("string", "0b" + "1" * 70, None),
+        ("string", "0x7fffffffffffffff", str(INT64_MAX)),
+        ("string", '"\\ud800"', None),
+        ("integer", "0x" + "f" * 5000, None),
+        ("float", "0b" + "1" * 70, None),
         ("integer", "3", 3),
         ("integer", str(INT64_MAX), INT64_MAX),
         ("integer", str(-(2**63)), -(2**63)),
@@ -315,15 +390,40 @@ INT64_MAX = 2**63 - 1
 def test_coercion(tmp_path, declared, yaml_value, expected):
     spec = one_type(metadata=f"[{{name: path}}, {{name: value, type: {declared}}}]")
     files = write(tmp_path, {"a.md": fm(f"value: {yaml_value}")})
-    (node,), _ = build_nodes(spec, "demo", files)
+    (node,), _ = nodes_of(spec, files)
     value = node["properties"]["value"]
     assert value == expected and type(value) is type(expected)
+
+
+@pytest.mark.parametrize(
+    ("declared", "yaml_value", "reason"),
+    [
+        ("string", "0x" + "f" * 5000, "'value' does not fit in 64 bits, left blank"),
+        ("string", '"\\ud800"', "'value' is not valid text, left blank"),
+        ("string", "'" + "x" * 4097 + "'", "'value' is longer than 4 KiB, left blank"),
+        ("integer", "0b" + "1" * 70, "'value' does not fit in 64 bits, left blank"),
+    ],
+)
+def test_blank_reasons(tmp_path, declared, yaml_value, reason):
+    spec = one_type(metadata=f"[{{name: path}}, {{name: value, type: {declared}}}]")
+    files = write(tmp_path, {"a.md": fm(f"value: {yaml_value}")})
+    _, problems = nodes_of(spec, files)
+    assert [p.reason for p in problems] == [reason]
+
+
+def test_a_field_named_like_a_yaml_boolean_is_found(tmp_path):
+    spec = one_type(metadata="[{name: path}, {name: on}, {name: off, type: boolean}]".replace(
+        "{name: on}", "{name: 'on'}").replace("{name: off,", "{name: 'off',"))
+    files = write(tmp_path, {"a.md": fm("on: duty\noff: yes\nyes: other")})
+    (node,), problems = nodes_of(spec, files)
+    assert node["properties"]["on"] == "duty" and node["properties"]["off"] is True
+    assert problems == []
 
 
 def test_every_declared_field_is_emitted_even_when_absent(tmp_path):
     spec = one_type(metadata="[{name: path}, {name: a}, {name: b, type: integer}, {name: c, type: boolean}]")
     files = write(tmp_path, {"x.md": fm("b: not-a-number")})
-    (node,), problems = build_nodes(spec, "demo", files)
+    (node,), problems = nodes_of(spec, files)
     assert node["properties"] == {"path": "x.md", "extractor": "docs", "a": None, "b": None, "c": None}
     assert [(p.label, p.path, p.reason) for p in problems] == [
         ("Note", "x.md", "'b' is not a whole number, left blank")
@@ -336,7 +436,7 @@ def test_a_missing_required_field_skips_the_file_with_its_reason(tmp_path):
         "runbooks/db.md": fm("severity: 2"),
         "runbooks/blank.md": fm("owner:"),
     })
-    nodes, problems = build_nodes(spec_of(RUNBOOK), "demo", files)
+    nodes, problems = nodes_of(spec_of(RUNBOOK), files)
     assert names(nodes) == ["runbooks/ok.md"]
     assert sorted((p.path, p.reason) for p in problems) == [
         ("runbooks/blank.md", "missing required 'owner'"),
@@ -347,14 +447,14 @@ def test_a_missing_required_field_skips_the_file_with_its_reason(tmp_path):
 def test_a_required_field_that_cannot_be_coerced_skips_the_file(tmp_path):
     spec = one_type(metadata="[{name: path}, {name: value, type: integer, required: true}]")
     files = write(tmp_path, {"a.md": fm("value: lots")})
-    nodes, problems = build_nodes(spec, "demo", files)
+    nodes, problems = nodes_of(spec, files)
     assert nodes == []
     assert [p.reason for p in problems] == ["'value' is not a whole number; it is required, so the file is skipped"]
 
 
 def test_problems_name_the_front_matter_key(tmp_path):
     files = write(tmp_path, {"runbooks/a.md": fm("owner: ops\non-call-team: [a]\nseverity: " + str(2**64))})
-    _, problems = build_nodes(spec_of(RUNBOOK), "demo", files)
+    _, problems = nodes_of(spec_of(RUNBOOK), files)
     assert sorted(p.reason for p in problems) == [
         "'on-call-team' is not text, left blank",
         "'severity' does not fit in 64 bits, left blank",
@@ -375,7 +475,7 @@ def test_a_file_can_be_a_node_of_several_types(tmp_path):
             source: {provider: docs, paths: ["x/*.md"]}
     """)
     files = write(tmp_path, {"x/a.md": "", "y/b.md": ""})
-    nodes, _ = build_nodes(spec, "demo", files)
+    nodes, _ = nodes_of(spec, files)
     assert sorted((n["label"], n["name"]) for n in nodes) == [("A", "x/a.md"), ("A", "y/b.md"), ("B", "x/a.md")]
 
 
@@ -384,7 +484,7 @@ def test_a_file_can_be_a_node_of_several_types(tmp_path):
 
 def test_malformed_front_matter_is_skipped_with_its_reason(tmp_path):
     files = write(tmp_path, {"bad.md": "---\nkey: [unclosed\n---\n", "list.md": "---\n- a\n- b\n---\n"})
-    nodes, problems = build_nodes(one_type(), "demo", files)
+    nodes, problems = nodes_of(one_type(), files)
     assert nodes == []
     assert sorted((p.path, p.reason) for p in problems) == [
         ("bad.md", "front matter is not valid YAML"),
@@ -399,13 +499,13 @@ def test_an_alias_bomb_is_skipped(tmp_path):
         name = chr(ord("a") + level)
         bomb.append(f"{name}: &{name} [{', '.join('*' + prev for _ in range(10))}]")
     files = write(tmp_path, {"bomb.md": "---\n" + "\n".join(bomb) + "\n---\n"})
-    nodes, problems = build_nodes(one_type(), "demo", files)
+    nodes, problems = nodes_of(one_type(), files)
     assert nodes == [] and [p.reason for p in problems] == ["front matter is not valid YAML"]
 
 
 def test_an_oversized_file_is_never_read(tmp_path):
     files = write(tmp_path, {"big.md": fm("value: x") + "x" * (1024 * 1024)})
-    nodes, problems = build_nodes(one_type(), "demo", files)
+    nodes, problems = nodes_of(one_type(), files)
     assert nodes == [] and [p.reason for p in problems] == ["is larger than 1 MiB, not read"]
 
 
@@ -413,12 +513,12 @@ def test_an_oversized_file_is_never_read(tmp_path):
 def test_a_fifo_is_never_read(tmp_path):
     fifo = tmp_path / "pipe.md"
     os.mkfifo(fifo)
-    nodes, problems = build_nodes(one_type(), "demo", {"pipe.md": fifo})
+    nodes, problems = nodes_of(one_type(), {"pipe.md": fifo})
     assert nodes == [] and [p.reason for p in problems] == ["is not a regular file, not read"]
 
 
 def test_a_vanished_file_is_skipped(tmp_path):
-    nodes, problems = build_nodes(one_type(), "demo", {"gone.md": tmp_path / "gone.md"})
+    nodes, problems = nodes_of(one_type(), {"gone.md": tmp_path / "gone.md"})
     assert nodes == [] and [p.reason for p in problems] == ["could not be read"]
 
 
@@ -434,6 +534,12 @@ def test_read_front_matter(tmp_path):
     assert read_front_matter(files["none.md"]) == ({}, None)
     assert read_front_matter(files["empty.md"]) == ({}, None)
     assert read_front_matter(files["crlf.md"]) == ({"owner": "ops"}, None)
+    assert read_front_matter(write(tmp_path, {"keys.md": fm("on: a\nyes: b\n1: c")})["keys.md"]) == (
+        {"on": "a", "yes": "b", "1": "c"}, None
+    )
+    assert read_front_matter(write(tmp_path, {"seq.md": "---\n? [a]\n: b\n---\n"})["seq.md"]) == (
+        None, "front matter is not valid YAML"
+    )
     (tmp_path / "bytes.md").write_bytes(b"---\nowner: \xff\n---\n")
     values, problem = read_front_matter(tmp_path / "bytes.md")
     assert problem is None and values["owner"] == "�"
@@ -471,7 +577,7 @@ def test_edge_values_str_and_int_count_bool_does_not(tmp_path):
         "runbooks/l.md": fm("kind: runbook\nowner: o\nservice: [api, 7, true, 1.5, [x], {a: b}, api]"),
         "runbooks/f.md": fm("kind: runbook\nowner: o\nservice: 1.5"),
     })
-    rels = build_edges(edge_spec(), "demo", files)
+    rels = edges_of(edge_spec(), files)
     assert targets_of(rels) == [
         ("runbooks/i.md", "42"), ("runbooks/l.md", "7"), ("runbooks/l.md", "api"), ("runbooks/s.md", "api"),
     ]
@@ -488,19 +594,32 @@ def test_edge_values_str_and_int_count_bool_does_not(tmp_path):
 
 def test_edge_values_drop_a_leading_dot_slash(tmp_path):
     files = write(tmp_path, {"runbooks/a.md": fm("kind: runbook\nowner: o\nservice: [./adr/1.md, ./, '']")})
-    assert targets_of(build_edges(edge_spec("Runbook"), "demo", files)) == [("runbooks/a.md", "adr/1.md")]
+    assert targets_of(edges_of(edge_spec("Runbook"), files)) == [("runbooks/a.md", "adr/1.md")]
+
+
+def test_edge_values_drop_every_leading_dot_slash(tmp_path):
+    files = write(tmp_path, {"runbooks/a.md": fm("kind: runbook\nowner: o\nservice: [././adr/1.md, ././]")})
+    assert targets_of(edges_of(edge_spec("Runbook"), files)) == [("runbooks/a.md", "adr/1.md")]
+
+
+def test_huge_ints_and_lone_surrogates_are_never_edge_values(tmp_path):
+    files = write(tmp_path, {
+        "runbooks/a.md": fm("kind: runbook\nowner: o\nservice: [0x" + "f" * 5000 + ', 0b' + "1" * 70 + ', "\\ud800", ok]'),
+        "runbooks/b.md": fm("kind: runbook\nowner: o\nservice: 0x" + "f" * 5000),
+    })
+    assert targets_of(edges_of(edge_spec(), files)) == [("runbooks/a.md", "ok")]
 
 
 def test_edge_lists_are_capped_at_100(tmp_path):
     values = ", ".join(f"s{i}" for i in range(150))
     files = write(tmp_path, {"runbooks/a.md": fm(f"kind: runbook\nowner: o\nservice: [{values}]")})
-    rels = build_edges(edge_spec(), "demo", files)
+    rels = edges_of(edge_spec(), files)
     assert len(rels) == 100 and rels[-1]["to_name"] == "s99"
 
 
 def test_edge_values_over_4_kib_are_dropped(tmp_path):
     files = write(tmp_path, {"runbooks/a.md": fm("kind: runbook\nowner: o\nservice: [" + "x" * 4097 + ", ok]")})
-    assert targets_of(build_edges(edge_spec(), "demo", files)) == [("runbooks/a.md", "ok")]
+    assert targets_of(edges_of(edge_spec(), files)) == [("runbooks/a.md", "ok")]
 
 
 def test_edges_only_leave_files_that_became_nodes(tmp_path):
@@ -510,7 +629,7 @@ def test_edges_only_leave_files_that_became_nodes(tmp_path):
         "runbooks/skipped.md": fm("kind: runbook\nservice: api"),
         "elsewhere/x.md": fm("kind: runbook\nowner: o\nservice: api"),
     })
-    assert targets_of(build_edges(edge_spec(), "demo", files)) == [("runbooks/node.md", "api")]
+    assert targets_of(edges_of(edge_spec(), files)) == [("runbooks/node.md", "api")]
 
 
 def test_edges_can_be_filtered_to_targets(tmp_path):
@@ -518,14 +637,14 @@ def test_edges_can_be_filtered_to_targets(tmp_path):
         "runbooks/a.md": fm("kind: runbook\nowner: o\nservice: [api, web]"),
         "runbooks/b.md": fm("kind: runbook\nowner: o\nservice: db"),
     })
-    rels = build_edges(edge_spec(), "demo", files, targets={("Service", "web"), ("Service", "db"), ("Module", "api")})
+    rels = edges_of(edge_spec(), files, targets={("Service", "web"), ("Service", "db"), ("Module", "api")})
     assert targets_of(rels) == [("runbooks/a.md", "web"), ("runbooks/b.md", "db")]
-    assert build_edges(edge_spec(), "demo", files, targets=set()) == []
+    assert edges_of(edge_spec(), files, targets=set()) == []
 
 
 def test_no_relationships_means_no_edges(tmp_path):
     files = write(tmp_path, {"a.md": fm("value: x")})
-    assert build_edges(one_type(), "demo", files) == []
+    assert edges_of(one_type(), files) == []
 
 
 # --- doctor report ------------------------------------------------------------------------
@@ -591,6 +710,14 @@ def test_report_wording_for_a_bad_file(tmp_path):
         {"status": "ok", "detail": "Runbook: 1 file matches, 0 Runbook entries"},
         {"status": "warning", "detail": "Runbook: runbooks/x.md: front matter is not valid YAML"},
     ]
+
+
+def test_report_survives_huge_ints_and_surrogates(tmp_path):
+    lines = report(tmp_path, {"runbooks/x.md": fm("owner: 0x" + "f" * 5000 + '\nservice: 0b' + "1" * 70)})
+    assert lines[1:] == [{
+        "status": "warning",
+        "detail": "Runbook: runbooks/x.md: 'owner' does not fit in 64 bits; it is required, so the file is skipped",
+    }]
 
 
 def test_report_is_empty_without_docs_sources(tmp_path):

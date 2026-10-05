@@ -9,7 +9,8 @@ relationship's front-matter `field` names.
 The schema ships inside the repository, so everything here treats it and
 the files as hostile. Files are read with `read_bounded` and front matter
 with `bounded_safe_load`; conditions are four plain text tests (`like` is
-`fnmatch.fnmatchcase`), globs are `PurePosixPath.full_match`, and nothing
+`fnmatch.fnmatchcase` with only `*` as a wildcard), and globs are matched
+one folder at a time with `fnmatchcase` (see `glob_matches`). Nothing
 compiles a user-supplied regex or runs repository code. Compared and written
 strings are capped at 4 KiB, integers at int64 and edge lists at 100 items.
 
@@ -26,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple
 
-from devgraph.config.project_schema import Condition, DocsSource, EffectiveSchema
+from devgraph.config.project_schema import INT64_MAX, INT64_MIN, Condition, DocsSource, EffectiveSchema
 from devgraph.config.project_tools import YAML_LOAD_ERRORS
 from devgraph.config.yaml_bound import YAML_MAX_NODES, bounded_safe_load
 from devgraph.indexer.docs.extractor import _FRONTMATTER_RE
@@ -39,7 +40,6 @@ MARKDOWN_SUFFIXES = (".md", ".markdown")
 MAX_VALUE_BYTES = 4096
 #: Most items of a list-valued relationship field that become edges.
 MAX_EDGE_VALUES = 100
-INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
 #: Most files `source_report` names before summarising the rest.
 REPORT_FILE_LIMIT = 5
 
@@ -107,16 +107,38 @@ def docs_spec(effective: EffectiveSchema) -> DocsSpec | None:
     return DocsSpec(tuple(types), relationships)
 
 
+def glob_matches(glob: str, rel: str) -> bool:
+    """Whether a repo-relative POSIX path matches a glob, case-sensitively.
+
+    The glob and the path are split on "/". A `**` segment matches zero or
+    more whole folders; every other segment is matched against one path
+    segment with `fnmatch.fnmatchcase`. Walking the glob once over the set
+    of reachable path positions costs at most (glob segments x path
+    segments) segment matches, so no glob can backtrack the way
+    `PurePosixPath.full_match` does on `*a*a*a...` or repeated `**/*/`.
+    """
+    parts = rel.split("/")
+    reachable = {0}
+    for segment in glob.split("/"):
+        if segment == "**":
+            reachable = set(range(min(reachable), len(parts) + 1))
+        else:
+            reachable = {i + 1 for i in reachable if i < len(parts) and fnmatch.fnmatchcase(parts[i], segment)}
+        if not reachable:
+            return False
+    return len(parts) in reachable
+
+
 def selects(docs_type: DocsType, rel: str) -> bool:
     """Whether a repo-relative POSIX path is a Markdown file one of the type's globs matches."""
-    path = PurePosixPath(rel)
-    return path.suffix in MARKDOWN_SUFFIXES and any(path.full_match(glob) for glob in docs_type.paths)
+    return PurePosixPath(rel).suffix in MARKDOWN_SUFFIXES and any(glob_matches(g, rel) for g in docs_type.paths)
 
 
 def read_front_matter(path: Path) -> tuple[dict[Any, Any] | None, str | None]:
     """(front matter, None), or (None, why the file can't be used).
 
-    A file without front matter gives an empty mapping.
+    A file without front matter gives an empty mapping. Keys are kept as
+    written (`on:` is the key "on"); values keep YAML 1.1 resolution.
     """
     try:
         text = read_bounded(path).decode("utf-8", errors="replace")
@@ -130,7 +152,7 @@ def read_front_matter(path: Path) -> tuple[dict[Any, Any] | None, str | None]:
     if not match:
         return {}, None
     try:
-        values = bounded_safe_load(match.group(1), YAML_MAX_NODES)
+        values = bounded_safe_load(match.group(1), YAML_MAX_NODES, raw_keys=True)
     except YAML_LOAD_ERRORS:
         return None, "front matter is not valid YAML"
     if values is None:
@@ -140,21 +162,35 @@ def read_front_matter(path: Path) -> tuple[dict[Any, Any] | None, str | None]:
     return values, None
 
 
-def _fits(text: str) -> bool:
-    return len(text.encode("utf-8", errors="surrogatepass")) <= MAX_VALUE_BYTES
+def _text_problem(text: str) -> str | None:
+    """Why a string can't be compared or written, or None."""
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeEncodeError:  # a lone surrogate, from a YAML "\ud800" escape
+        return "is not valid text"
+    return f"is longer than {MAX_VALUE_BYTES // 1024} KiB" if size > MAX_VALUE_BYTES else None
+
+
+def _in_int64(value: int) -> bool:
+    # Checked before str(): YAML 1.1 hex, binary and sexagesimal integers
+    # have no size limit, but str() refuses one over 4300 digits.
+    return INT64_MIN <= value <= INT64_MAX
 
 
 def _as_text(value: Any) -> str | None:
-    """A scalar's comparison text (bool as true/false, int in decimal), or None."""
+    """A scalar's comparison text (bool as true/false, int64 in decimal), or None."""
     if type(value) is bool:
         return "true" if value else "false"
     if type(value) is int:
-        text = str(value)
-    elif type(value) is str:
-        text = value
-    else:
-        return None
-    return text if _fits(text) else None
+        return str(value) if _in_int64(value) else None
+    if type(value) is str and _text_problem(value) is None:
+        return value
+    return None
+
+
+def _star_only(pattern: str) -> str:
+    """A `like` text as an fnmatch pattern in which only `*` is a wildcard."""
+    return "".join({"?": "[?]", "[": "[[]"}.get(c, c) for c in pattern)
 
 
 def _test(condition: Condition, text: str) -> bool:
@@ -167,7 +203,7 @@ def _test(condition: Condition, text: str) -> bool:
         case "contains":
             return operand in text
         case _:
-            return fnmatch.fnmatchcase(text, operand)
+            return fnmatch.fnmatchcase(text, _star_only(operand))
 
 
 def _holds(condition: Condition, values: Mapping[Any, Any]) -> bool:
@@ -182,20 +218,23 @@ _TYPE_WORDS = {"integer": "a whole number", "float": "a number", "boolean": "tru
 def _coerce(value: Any, declared: str) -> tuple[Any, str | None]:
     """(property value, None), or (None, why the value can't be written)."""
     kind = type(value)
+    if kind is int and declared != "boolean" and not _in_int64(value):
+        return None, "does not fit in 64 bits"
     if declared == "string":
         if kind is bool:
             return ("true" if value else "false"), None
         if kind in (str, int, float):
             text = str(value)
-            return (text, None) if _fits(text) else (None, f"is longer than {MAX_VALUE_BYTES // 1024} KiB")
+            problem = _text_problem(text)
+            return (None, problem) if problem else (text, None)
     elif declared == "integer":
         if kind is int:
-            return (value, None) if INT64_MIN <= value <= INT64_MAX else (None, "does not fit in 64 bits")
+            return value, None
     elif declared == "float":
         if kind is float:
             return value, None
         if kind is int:
-            return (float(value), None) if INT64_MIN <= value <= INT64_MAX else (None, "does not fit in 64 bits")
+            return float(value), None
     elif kind is bool:
         return value, None
     return None, f"is not {_TYPE_WORDS[declared]}"
@@ -221,17 +260,31 @@ def _node(docs_type: DocsType, repo_id: str, rel: str, values: Mapping[Any, Any]
     return {"label": docs_type.label, "repo_id": repo_id, "name": rel, "properties": properties}, reasons
 
 
-def _evaluate(spec: DocsSpec, repo_id: str, files: Mapping[str, Path]):
-    """Yield (node or None, problems, front matter) per selected (type, file).
+#: What `read_selected` gives per file: (front matter, None) or (None, why it is skipped).
+Selected = Mapping[str, tuple[dict[Any, Any] | None, str | None]]
 
-    Each file is read once, and only if some type's globs select it.
+
+def read_selected(spec: DocsSpec, files: Mapping[str, Path]) -> dict[str, tuple[dict[Any, Any] | None, str | None]]:
+    """Front matter of the files some docs type selects, each read once.
+
+    `files` maps a repo-relative POSIX path to the file on disk. Files no
+    type's globs select are never read. Pass the result to `build_nodes`
+    and `build_edges`.
     """
-    for rel in sorted(files):
-        chosen = [t for t in spec.types if selects(t, rel)]
-        if not chosen:
-            continue
-        values, problem = read_front_matter(files[rel])
-        for docs_type in chosen:
+    return {
+        rel: read_front_matter(files[rel])
+        for rel in sorted(files)
+        if any(selects(docs_type, rel) for docs_type in spec.types)
+    }
+
+
+def _evaluate(spec: DocsSpec, repo_id: str, selected: Selected):
+    """Yield (node or None, problems, front matter) per selected (type, file)."""
+    for rel in sorted(selected):
+        values, problem = selected[rel]
+        for docs_type in spec.types:
+            if not selects(docs_type, rel):
+                continue
             if values is None:
                 yield None, [Problem(docs_type.label, rel, problem)], None
                 continue
@@ -241,14 +294,14 @@ def _evaluate(spec: DocsSpec, repo_id: str, files: Mapping[str, Path]):
             yield node, [Problem(docs_type.label, rel, reason) for reason in reasons], values
 
 
-def build_nodes(spec: DocsSpec, repo_id: str, files: Mapping[str, Path]) -> tuple[list[dict], list[Problem]]:
-    """Nodes for these files (repo-relative POSIX path -> path on disk), and the problems met.
+def build_nodes(spec: DocsSpec, repo_id: str, selected: Selected) -> tuple[list[dict], list[Problem]]:
+    """Nodes for the files `read_selected` read, and the problems met.
 
     A problem either skipped the file for that type or left a value blank.
     """
     nodes: list[dict] = []
     problems: list[Problem] = []
-    for node, found, _values in _evaluate(spec, repo_id, files):
+    for node, found, _values in _evaluate(spec, repo_id, selected):
         problems += found
         if node is not None:
             nodes.append(node)
@@ -256,7 +309,7 @@ def build_nodes(spec: DocsSpec, repo_id: str, files: Mapping[str, Path]) -> tupl
 
 
 def _edge_values(value: Any) -> list[str]:
-    """Target names: str or int (never bool) scalars or list items, `./` removed, deduplicated."""
+    """Target names: str or int (never bool) scalars or list items, leading `./`s removed, deduplicated."""
     items = value[:MAX_EDGE_VALUES] if type(value) is list else [value]
     out: list[str] = []
     for item in items:
@@ -265,7 +318,8 @@ def _edge_values(value: Any) -> list[str]:
         text = _as_text(item)
         if text is None:
             continue
-        text = text.removeprefix("./")
+        while text.startswith("./"):
+            text = text[2:]
         if text and text not in out:
             out.append(text)
     return out
@@ -274,10 +328,10 @@ def _edge_values(value: Any) -> list[str]:
 def build_edges(
     spec: DocsSpec,
     repo_id: str,
-    files: Mapping[str, Path],
+    selected: Selected,
     targets: set[tuple[str, str]] | None = None,
 ) -> list[dict]:
-    """Edges from these files' docs nodes to the nodes their front matter names.
+    """Edges from the docs nodes of the files `read_selected` read to the nodes their front matter names.
 
     With `targets`, only edges to those (label, name) pairs are returned.
     Whether a target exists is the graph's business: an edge to a missing
@@ -286,7 +340,7 @@ def build_edges(
     if not spec.relationships:
         return []
     rels: list[dict] = []
-    for node, _problems, values in _evaluate(spec, repo_id, files):
+    for node, _problems, values in _evaluate(spec, repo_id, selected):
         if node is None:
             continue
         for relationship in spec.relationships:
@@ -327,7 +381,7 @@ def source_report(repo_root: Path, effective: EffectiveSchema, files: Iterable[P
             by_rel[path.relative_to(repo_root).as_posix()] = path
         except ValueError:
             continue
-    nodes, problems = build_nodes(spec, "", by_rel)
+    nodes, problems = build_nodes(spec, "", read_selected(spec, by_rel))
     lines: list[dict[str, str]] = []
     for docs_type in spec.types:
         label = docs_type.label

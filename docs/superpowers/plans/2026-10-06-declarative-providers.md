@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- **Nothing executes.** No `re` on user-supplied patterns, and no `eval`, `exec`, subprocess, import, template engine or format-string expansion of user data. The only interpreters are `bounded_safe_load`, `fnmatch.fnmatchcase` and `PurePosixPath.full_match`. The schema is untrusted: it ships inside the repository and is not trust-gated.
+- **Nothing executes.** No `re` on user-supplied patterns, and no `eval`, `exec`, subprocess, import, template engine or format-string expansion of user data. The only interpreters are `bounded_safe_load` and `fnmatch.fnmatchcase` (globs are matched segment by segment; `PurePosixPath.full_match` backtracks catastrophically and is not used). The schema is untrusted: it ships inside the repository and is not trust-gated.
 - **Everything is bounded** (spec §3.2):
   - every file read goes through `read_bounded`;
   - every front-matter parse goes through `bounded_safe_load(..., YAML_MAX_NODES)` with `YAML_LOAD_ERRORS` caught;

@@ -269,3 +269,22 @@ def test_aliases_cannot_stack_nesting_past_the_bound():
     text = "[" + ", ".join(items) + "]"
     with pytest.raises(YAMLBoundError, match="levels deep"):
         bounded_safe_load(text)
+
+
+def test_raw_keys_keep_mapping_keys_as_written():
+    loaded = bounded_safe_load("on: a\nyes: b\nno: c\n1: d\nnull: e\ndraft: yes\n", raw_keys=True)
+    assert loaded == {"on": "a", "yes": "b", "no": "c", "1": "d", "null": "e", "draft": True}
+
+
+def test_raw_keys_apply_to_nested_and_merged_mappings():
+    loaded = bounded_safe_load("base: &b {on: 1}\nchild:\n  <<: *b\n  off: 2\n", raw_keys=True)
+    assert loaded["child"] == {"on": 1, "off": 2}
+
+
+def test_raw_keys_refuse_a_non_scalar_key():
+    with pytest.raises(YAMLBoundError, match="mapping key"):
+        bounded_safe_load("? [a, b]\n: c\n", raw_keys=True)
+
+
+def test_default_loading_still_resolves_keys():
+    assert bounded_safe_load("on: a\n") == {True: "a"}
