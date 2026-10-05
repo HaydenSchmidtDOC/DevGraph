@@ -148,7 +148,7 @@ relationships:
   4. Run `prune_extracted_nodes(extractor="docs", keep=…)` with the nodes the new mapping produces.
   5. Upsert those nodes.
 
-  After `index_paths`, `full_scan` runs one final `docs.sync_edges` over every matched file, so built-in targets exist first. It runs only when apply returned True.
+  After `index_paths`, `full_scan` runs one final `docs.sync_edges` over every matched file, so built-in targets exist first. It reuses the front matter apply read, so each file is read once per scan. It runs only when apply returned True.
 - **Edits and creates, from the watcher's `index_paths`, when the schema is valid and not pending.** For the changed Markdown paths, the provider:
   1. deletes outgoing docs edges at those paths (`delete_extracted_edges`);
   2. upserts the produced nodes, all declared fields included;
@@ -157,10 +157,10 @@ relationships:
 
   Nodes MERGE in place, so incoming edges survive.
 - **Relink, on added nodes only.** Built-in re-indexing MERGEs in place (`_replace_file_nodes_tx`, `_upsert_container_result`), so a re-indexed target keeps its incoming docs edges. Only a node that is new to the graph needs linking.
-  - `_batch_nodes` is extended with the batch's compose and Containerfile Service nodes and its docs-provider nodes. `previous_nodes` is snapshotted the same way.
+  - `_batch_nodes` is extended with the batch's compose and Containerfile Service nodes, its docs-provider nodes and its filesystem `file`-kind nodes. `previous_nodes` is snapshotted the same way. Filesystem folders are left out: a folder is not one of the batch's files, so the snapshot cannot tell a new folder from an existing one, and a docs edge to a folder created later waits for the next rescan.
   - When `added_nodes` holds a label that some docs relationship targets, the provider re-derives edges for all matched docs files and upserts those whose target was added.
-  - The relink re-reads the glob-limited files, as `_docs_note_referrers` does, and never reads the graph.
-  - This covers a Service added after the runbook that names it, a docs→docs target created later, and a target deleted and then recreated.
+  - The relink re-reads the glob-limited files, as `_docs_note_referrers` does, and never reads the graph. So a batch that creates a node some docs relationship targets (a docs→docs target, a Service, a filesystem file) re-reads every matched docs file outside the batch: O(matched files) per such batch.
+  - This covers a Service added after the runbook that names it, a docs→docs target created later, a filesystem file created later, and a target deleted and then recreated.
 - **Deletes, from `remove_paths`.** `delete_extracted_nodes(repo_id, "docs", paths)` removes the deleted paths' docs nodes and their edges, including everything below a deleted directory.
 - **Known limit.** A target that appears without passing through `index_paths` gets its edge at the next rescan. Today that means git-history Commits, which no docs relationship is likely to target.
 

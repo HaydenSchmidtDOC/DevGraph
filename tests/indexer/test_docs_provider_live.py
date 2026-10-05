@@ -560,6 +560,50 @@ def test_removing_the_file_type_leaves_the_runbook_and_its_edges(engine, shared)
     assert edges(engine) == before
 
 
+ABOUT = f"""
+      - type: ZZ_ABOUT
+        provider: docs
+        from: Runbook
+        to: {FILE}
+        field: about
+"""
+
+
+def test_a_filesystem_target_created_or_recreated_later_gets_the_edge(engine, repo, relinks):
+    with_schema(repo, shared_schema() + ABOUT)
+    md(repo, "runbooks/api.md", "type: runbook\nservice: api\nabout: notes/later.txt")
+    scan(engine, repo)
+    assert edges(engine, "ZZ_ABOUT") == []
+
+    later = repo / "notes" / "later.txt"
+    later.parent.mkdir()
+    later.write_text("hello\n")
+    index_paths(engine, REPO, repo, {later})
+    assert edges(engine, "ZZ_ABOUT") == [("runbooks/api.md", "notes/later.txt", "")]
+
+    later.unlink()
+    remove_paths(engine, REPO, repo, {later})
+    assert edges(engine, "ZZ_ABOUT") == []
+    later.write_text("again\n")
+    index_paths(engine, REPO, repo, {later})
+    assert edges(engine, "ZZ_ABOUT") == [("runbooks/api.md", "notes/later.txt", "")]
+
+    relinks.clear()
+    later.write_text("edited\n")
+    index_paths(engine, REPO, repo, {later})
+    assert relinks == []  # the File node already existed
+
+
+def test_a_full_scan_reads_each_docs_file_once(engine, repo, monkeypatch):
+    read = []
+    real = docs.read_front_matter
+    monkeypatch.setattr(docs, "read_front_matter", lambda path: read.append(path) or real(path))
+    scan(engine, repo)
+    assert edges(engine)  # the edges were still written
+    assert sorted(read) == sorted(set(read))
+    assert len(read) == 4  # runbooks/api.md, db.md, draft.md and adr/0001.md
+
+
 # --- scope -------------------------------------------------------------------
 
 

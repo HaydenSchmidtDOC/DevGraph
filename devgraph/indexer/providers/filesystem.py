@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from devgraph.config.project_schema import EffectiveSchema, resolve_effective_schema
+from devgraph.config.project_schema import EffectiveSchema
 
 EXTRACTOR = "filesystem"
 ROOT_PATH = "."
@@ -54,11 +54,6 @@ def filesystem_spec(effective: EffectiveSchema) -> FilesystemSpec | None:
         relationship=relationship.type if relationship else None,
         child_labels=frozenset(relationship.from_labels) if relationship else frozenset(),
     )
-
-
-def load_filesystem_spec(repo_root: Path) -> FilesystemSpec | None:
-    """Resolve the repository's schema; raises ProjectSchemaError if invalid."""
-    return filesystem_spec(resolve_effective_schema(repo_root))
 
 
 def ancestors(path: str) -> list[str]:
