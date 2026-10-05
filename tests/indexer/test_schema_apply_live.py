@@ -33,6 +33,7 @@ WORKTREE = """
 _TOKEN = uuid.uuid4().hex[:8]
 FILE, FOLDER, ENTRY = (f"ZzFile{_TOKEN}", f"ZzFolder{_TOKEN}", f"ZzEntry{_TOKEN}")
 GADGET = f"ZzGadget{_TOKEN}"
+NOTE = f"ZzNote{_TOKEN}"
 _SHOWN = {FILE: "File", FOLDER: "Folder", ENTRY: "Entry"}
 
 
@@ -41,7 +42,7 @@ def _drop_generated_constraints():
     yield
     cleanup = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
     try:
-        for label in (FILE, FOLDER, ENTRY, GADGET):
+        for label in (FILE, FOLDER, ENTRY, GADGET, NOTE):
             cleanup.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_key IF EXISTS")
             cleanup.run_cypher(f"DROP INDEX {label.lower()}_repo_name IF EXISTS")
     except Exception:
@@ -214,3 +215,61 @@ def test_switching_the_project_config_off_removes_user_nodes_on_rescan(engine, r
     assert schema_pending(engine, REPO, repo)
     full_scan(engine, REPO, repo)
     assert "File:pkg/mod.py" in fs_nodes(engine)
+
+
+NOTES = f"""
+    version: 1
+    node_types:
+      - label: {NOTE}
+        key: [path]
+        metadata: [{{name: path}}, {{name: owner}}]
+        source: {{provider: docs, paths: ["notes/*.md"]}}
+    relationships:
+      - type: ZZ_ABOUT
+        provider: docs
+        from: {NOTE}
+        to: Module
+        field: about
+"""
+
+
+def note_edges(engine):
+    rows = engine.run_cypher("MATCH (a {repo_id: $r})-[:ZZ_ABOUT]->(b) RETURN a.name + '>' + b.name AS e", {"r": REPO})
+    return sorted(r["e"] for r in rows)
+
+
+@pytest.fixture
+def noted(repo):
+    (repo / "notes").mkdir()
+    (repo / "notes" / "run.md").write_text("---\nowner: team-a\nabout: pkg/mod.py\n---\n# Run\n")
+    write_schema(repo, NOTES)
+    return repo
+
+
+def test_apply_writes_docs_nodes_and_full_scan_their_edges(engine, noted):
+    engine.upsert_repository(REPO, REPO, str(noted))
+    assert apply_project_schema(engine, REPO, noted)
+    rows = engine.run_cypher(f"MATCH (n:{NOTE} {{repo_id: $r}}) RETURN n.owner AS o", {"r": REPO})
+    assert rows == [{"o": "team-a"}]
+    assert note_edges(engine) == []  # the Module does not exist yet
+
+    scan(engine, noted)
+    assert note_edges(engine) == ["notes/run.md>pkg/mod.py"]
+
+    assert apply_project_schema(engine, REPO, noted)
+    assert note_edges(engine) == []  # every docs edge goes; full_scan's last step rebuilds them
+
+
+def test_a_failed_apply_writes_no_docs_edges(engine, noted, monkeypatch):
+    from devgraph.indexer import dispatch
+
+    scan(engine, noted)
+    engine.run_cypher("MATCH ({repo_id: $r})-[x:ZZ_ABOUT]->() DELETE x", {"r": REPO})
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("provisioning refused")
+
+    monkeypatch.setattr(dispatch, "provision_repository_schema", refuse)
+    full_scan(engine, REPO, noted)
+    assert not schema_pending(engine, REPO, noted)  # still the applied schema: only apply's result gates it
+    assert note_edges(engine) == []

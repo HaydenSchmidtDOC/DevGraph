@@ -810,8 +810,8 @@ class GraphEngine:
 
     def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str]]:
         """Return (label, name) for every node whose file provenance
-        (`source_file`/`file`, or a `Module` named by its path) is one of
-        `files`.
+        (`source_file`/`file`, a `Module` named by its path, or a schema
+        provider's node, which is keyed by its path) is one of `files`.
 
         index_paths snapshots this before re-indexing a batch so it can tell
         which nodes the batch *adds* -- only those can be the missing
@@ -823,6 +823,7 @@ class GraphEngine:
                 "MATCH (n {repo_id: $repo_id}) "
                 "WHERE n.source_file IN $files OR n.file IN $files "
                 "   OR (n:Module AND n.name IN $files) "
+                "   OR (n.extractor IS NOT NULL AND n.name IN $files) "
                 "RETURN DISTINCT labels(n)[0] AS label, n.name AS name",
                 repo_id=repo_id,
                 files=files,

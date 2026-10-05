@@ -31,7 +31,7 @@ from devgraph.config.project_schema import (
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.indexer.apis.extractor import APIExtractor
-from devgraph.indexer.containers.extractor import ContainerExtractor
+from devgraph.indexer.containers.extractor import ContainerExtractor, ExtractionResult
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import DocsExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
@@ -43,7 +43,7 @@ from devgraph.indexer.kotlin.extractor import extract_kotlin_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
 from devgraph.indexer.mentions.extractor import mentions_any, upsert_document_node
 from devgraph.indexer.cpp.extractor import extract_cpp_file
-from devgraph.indexer.providers import filesystem
+from devgraph.indexer.providers import docs, filesystem
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
 from devgraph.indexer.schema_constraints import encode_keys, realign_keys, release_labels
@@ -66,14 +66,18 @@ _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
 _JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
 
 
-def _filesystem_spec(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | None]:
-    """(schema usable, spec). An invalid schema disables the provider for this
-    call -- including any prune -- so a bad edit never deletes good nodes."""
+def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | None, docs.DocsSpec | None]:
+    """(schema usable, filesystem spec, docs spec), from one schema resolve.
+
+    An invalid schema disables both providers for this call -- including any
+    prune, edge write or relink -- so a bad edit never deletes good nodes.
+    """
     try:
-        return True, filesystem.load_filesystem_spec(repo_root)
+        effective = resolve_effective_schema(repo_root)
     except ProjectSchemaError as exc:
-        logger.warning("project schema for %s is invalid; filesystem provider skipped: %s", repo_root, exc)
-        return False, None
+        logger.warning("project schema for %s is invalid; schema providers skipped: %s", repo_root, exc)
+        return False, None, None
+    return True, filesystem.filesystem_spec(effective), docs.docs_spec(effective)
 
 
 def schema_pending(engine: GraphEngine, repo_id: str, repo_root: Path) -> bool:
@@ -95,7 +99,8 @@ def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> 
 
     Provisions constraints/indexes, deletes nodes and relationships of user
     types the previously applied schema declared but this one doesn't
-    (built-ins are never touched), re-syncs the filesystem provider, records
+    (built-ins are never touched), re-syncs the filesystem and docs providers
+    (docs edges are rebuilt by full_scan once every node exists), records
     the applied state, then reconciles the generated constraints/indexes with
     every repository's recorded state (see schema_constraints). An invalid
     schema or a provisioning failure returns False with the graph untouched;
@@ -129,10 +134,12 @@ def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> 
             engine.delete_relationship_type(repo_id, rel_type)
 
     spec = filesystem.filesystem_spec(effective)
-    on_disk = {rel for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
+    disk = {rel: p for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
+    on_disk = set(disk)
     filesystem.reconcile(engine, repo_id, spec, on_disk)
     if spec is not None:
         filesystem.sync_present(engine, repo_id, spec, on_disk)
+    _apply_docs(engine, repo_id, docs.docs_spec(effective), disk)
     engine.record_applied_schema(repo_id, current_hash, labels, rel_types, encode_keys(effective.node_types))
     # After recording, so this repository's new state is part of what every
     # other repository's declarations are weighed against. Provisioning is
@@ -162,6 +169,115 @@ def _is_provider_file(repo_root: Path, path: Path) -> bool:
     return rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel))
 
 
+def _apply_docs(engine: GraphEngine, repo_id: str, spec: docs.DocsSpec | None, files: dict[str, Path]) -> None:
+    """Rebuild the docs provider's nodes from the whole repository (spec §4).
+
+    Every docs edge goes first, of any type, current or former: full_scan's
+    final pass rebuilds them once every target exists. Then properties the
+    schema no longer declares are cleared, nodes the mapping no longer
+    produces are pruned (all of them when no type is docs-sourced) and the
+    rest upserted.
+    """
+    engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, None)
+    nodes: list[dict] = []
+    if spec is not None:
+        for docs_type in spec.types:
+            engine.clear_extracted_properties(
+                repo_id, docs.EXTRACTOR, docs_type.label, [field.name for field in docs_type.fields]
+            )
+        nodes, problems = docs.build_nodes(spec, repo_id, docs.read_selected(spec, files))
+        _log_docs_problems(repo_id, problems)
+    engine.prune_extracted_nodes(repo_id, docs.EXTRACTOR, [f"{n['label']}:{n['name']}" for n in nodes])
+    engine.upsert_nodes(nodes)
+
+
+def _log_docs_problems(repo_id: str, problems: list[docs.Problem]) -> None:
+    """One warning per pass, naming the first problem (repr: file names are untrusted)."""
+    if problems:
+        first = problems[0]
+        logger.warning(
+            "%s: %d Markdown front-matter problem(s), first %r for %s: %r; `devgraph doctor` lists them",
+            repo_id, len(problems), first.path, first.label, first.reason,
+        )
+
+
+def _read_docs_batch(
+    repo_id: str, spec: docs.DocsSpec, files: dict[str, Path]
+) -> tuple[docs.Selected, list[dict]] | None:
+    """The batch's selected front matter and the docs nodes it produces, or
+    None if reading failed (the docs pass is then skipped for this batch)."""
+    try:
+        selected = docs.read_selected(spec, files)
+        nodes, problems = docs.build_nodes(spec, repo_id, selected)
+    except Exception:
+        logger.warning("docs node pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
+        return None
+    _log_docs_problems(repo_id, problems)
+    return selected, nodes
+
+
+def _sync_docs(
+    engine: GraphEngine, repo_id: str, spec: docs.DocsSpec, selected: docs.Selected, nodes: list[dict]
+) -> None:
+    """Rewrite the docs nodes and outgoing edges of the batch's selected files.
+
+    Nodes MERGE in place, so edges into them from other docs files survive.
+    """
+    paths = sorted(selected)
+    try:
+        engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, paths)
+        engine.upsert_nodes(nodes)
+        engine.prune_extracted_at(repo_id, docs.EXTRACTOR, paths, [f"{n['label']}:{n['name']}" for n in nodes])
+    except Exception:
+        logger.warning("docs node pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
+        return
+    try:
+        engine.upsert_relationships(docs.build_edges(spec, repo_id, selected))
+    except Exception:
+        logger.warning("docs edge pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
+
+
+def _relink_docs(
+    engine: GraphEngine, repo_id: str, repo_root: Path, spec: docs.DocsSpec,
+    added: set[tuple[str, str]], batch: set[str],
+) -> None:
+    """Link docs files outside the batch to the nodes the batch added.
+
+    A docs edge to a node that didn't exist yet was skipped when its file was
+    indexed. Only added nodes can be such a target: a re-indexed node MERGEs
+    in place and keeps its incoming edges. Re-reads the files the docs types
+    select (never the graph), and only when a docs relationship targets an
+    added node's label.
+    """
+    target_labels = {relationship.to_label for relationship in spec.relationships}
+    targets = {(label, name) for label, name in added if label in target_labels}
+    if not targets:
+        return
+    try:
+        files = {
+            rel: p for p in _indexable_paths(repo_root)
+            if (rel := _repo_relative(repo_root, p)) is not None and rel not in batch
+        }
+        engine.upsert_relationships(docs.build_edges(spec, repo_id, docs.read_selected(spec, files), targets))
+    except Exception:
+        logger.warning("docs relink failed for %s; the next rescan links them", repo_id, exc_info=True)
+
+
+def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path) -> None:
+    """Write every docs edge in the repository: full_scan's last step, once
+    every target node exists. Skipped unless the schema is valid and applied."""
+    if schema_pending(engine, repo_id, repo_root):
+        return
+    ok, _filesystem, spec = _provider_specs(repo_root)
+    if not ok or spec is None:
+        return
+    try:
+        files = {rel: p for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
+        engine.upsert_relationships(docs.build_edges(spec, repo_id, docs.read_selected(spec, files)))
+    except Exception:
+        logger.warning("docs edge pass failed for %s; the next rescan retries it", repo_id, exc_info=True)
+
+
 def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None, mentions_enabled: bool = False, sync_provider: bool = True) -> int:
     """Index a set of changed files, routing each to its extractor by name/extension.
 
@@ -178,9 +294,10 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             Markdown mentioning an added name (see _mention_referrers).
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
-        sync_provider: Write filesystem-provider nodes for `paths` (skipped
-            while the schema is pending). False when the caller has just
-            applied the schema.
+        sync_provider: Write schema-provider nodes and edges for `paths`
+            and relink docs edges to added nodes (skipped while the schema
+            is pending or invalid). False when the caller has just applied
+            the schema.
 
     Returns:
         Number of files actually indexed, including those referrers
@@ -222,6 +339,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # node in the batch exists (see the docs/mentions passes below).
     docs_files: list[Path] = []
     mention_files: list[Path] = []
+    # (label, name) of the Service nodes the batch's compose files wrote.
+    services: set[tuple[str, str]] = set()
 
     # Process files in a fixed order, not set order. Shared nodes
     # (Datastore/Endpoint) keep the last writer's `source`/`library` and
@@ -258,7 +377,7 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
                 cs_files, cs_extractions, cpp_files, cpp_extractions,
                 java_files, java_extractions, rs_files, rs_extractions,
                 kt_files, kt_extractions, go_extractions,
-                docs_files, mention_files,
+                docs_files, mention_files, services,
             )
         except Exception:
             logger.warning(
@@ -274,6 +393,18 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     batch_keys = sorted(provenance_keys)
     previous_nodes = engine.list_file_nodes(repo_id, batch_keys)
 
+    # The schema providers' specs, resolved once for the batch. The docs
+    # nodes are read now, so the relink below can tell which ones are new;
+    # they are written after the filesystem sync.
+    providers_ok, fs_spec, docs_spec = (False, None, None)
+    if sync_provider and not schema_pending(engine, repo_id, repo_root):
+        providers_ok, fs_spec, docs_spec = _provider_specs(repo_root)
+    docs_batch = None
+    if providers_ok and docs_spec is not None:
+        docs_batch = _read_docs_batch(
+            repo_id, docs_spec, {rel: p for rel, p in by_rel_path.items() if _is_provider_file(repo_root, p)}
+        )
+
     for rel_path in sorted(by_rel_path):
         index_one(rel_path, by_rel_path[rel_path])
 
@@ -285,7 +416,10 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         py_extractions, js_extractions, cs_extractions, cpp_extractions,
         java_extractions, rs_extractions, kt_extractions, go_extractions,
     ]
-    added_nodes = _batch_nodes(repo_id, root_resolved, code_extractions, docs_files, mention_files) - previous_nodes
+    added_nodes = _batch_nodes(
+        repo_id, root_resolved, code_extractions, docs_files, mention_files, services,
+        docs_batch[1] if docs_batch else [],
+    ) - previous_nodes
     referrers = _find_referrers(
         engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path),
         {**java_extractions, **kt_extractions},
@@ -382,14 +516,15 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
         engine.upsert_relationships(service_rels)
 
-    if sync_provider and not schema_pending(engine, repo_id, repo_root):
-        ok, spec = _filesystem_spec(repo_root)
-        if ok and spec is not None:
-            present = {
-                rel for p in paths
-                if _is_provider_file(repo_root, Path(p)) and (rel := _repo_relative(repo_root, Path(p))) is not None
-            }
-            filesystem.sync_present(engine, repo_id, spec, present)
+    if providers_ok and fs_spec is not None:
+        present = {
+            rel for p in paths
+            if _is_provider_file(repo_root, Path(p)) and (rel := _repo_relative(repo_root, Path(p))) is not None
+        }
+        filesystem.sync_present(engine, repo_id, fs_spec, present)
+    if docs_batch:
+        _sync_docs(engine, repo_id, docs_spec, *docs_batch)
+        _relink_docs(engine, repo_id, repo_root, docs_spec, added_nodes, set(docs_batch[0]))
 
     # Docs notes get the same node-then-edge treatment as the source files
     # above: pass 1 (in the loop) created every note's node, but a note's
@@ -451,6 +586,7 @@ def _index_single_path(
     go_extractions: dict[str, tuple[list[dict], list[dict]]],
     docs_files: list[Path],
     mention_files: list[Path],
+    services: set[tuple[str, str]],
 ) -> int:
     """Extract and upsert one file's graph output, routing by name/extension.
 
@@ -584,10 +720,12 @@ def _index_single_path(
         indexed += 1
         mention_files.append(resolved)
     if name_lower in _CONTAINERFILE_NAMES:
-        _index_containerfile(engine, repo_id, resolved, rel_path)
+        result = _index_containerfile(engine, repo_id, resolved, rel_path)
+        services |= {("Service", service.name) for service in result.services}
         indexed += 1
     elif name_lower in _COMPOSE_NAMES:
-        _index_compose_file(engine, repo_id, resolved, rel_path)
+        result = _index_compose_file(engine, repo_id, resolved, rel_path)
+        services |= {("Service", service.name) for service in result.services}
         indexed += 1
     return indexed
 
@@ -644,10 +782,13 @@ def _batch_nodes(
     code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
     docs_files: list[Path],
     mention_files: list[Path],
+    services: set[tuple[str, str]],
+    docs_nodes: list[dict],
 ) -> set[tuple[str, str]]:
     """(label, name) of every file-provenance node this batch wrote: code
-    symbols and Modules, docs notes, and Markdown Document nodes -- the same
-    provenance list_file_nodes snapshots. File-less nodes (a C++ out-of-class
+    symbols and Modules, docs notes, Markdown Document nodes, compose
+    Services and docs-provider nodes -- the same provenance list_file_nodes
+    snapshots. File-less nodes (a C++ out-of-class
     method's Class stub, API handler stubs, other `source`-keyed nodes) are
     left out: they have no provenance to compare against, so they would
     look newly added on every save."""
@@ -662,6 +803,8 @@ def _batch_nodes(
         result = DocsExtractor(repo_id).extract_from_source(_read_text(path), path.name)
         nodes |= {(doc.label, doc.name) for doc in result.docs}
     nodes |= {("Document", path.relative_to(root).as_posix()) for path in mention_files}
+    nodes |= services
+    nodes |= {(node["label"], node["name"]) for node in docs_nodes}
     return nodes
 
 
@@ -895,14 +1038,17 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             cleaned += 1
 
     if not schema_pending(engine, repo_id, repo_root):
-        ok, spec = _filesystem_spec(repo_root)
-        if ok and spec is not None:
-            gone = {rel for p in paths if (rel := _repo_relative(repo_root, Path(p))) is not None and rel != "."}
+        ok, fs_spec, docs_spec = _provider_specs(repo_root)
+        gone = {rel for p in paths if (rel := _repo_relative(repo_root, Path(p))) is not None and rel != "."}
+        if ok and fs_spec is not None:
             filesystem.sync_absent(
-                engine, repo_id, repo_root, spec, gone,
+                engine, repo_id, repo_root, fs_spec, gone,
                 is_indexable=lambda p: _is_provider_file(repo_root, p),
                 is_ignored_dir=is_ignored_dir_name,
             )
+        if ok and docs_spec is not None:
+            # Nodes at or below the deleted paths, with all their edges.
+            engine.delete_extracted_nodes(repo_id, docs.EXTRACTOR, sorted(gone))
 
     return cleaned
 
@@ -948,29 +1094,35 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
     prune_stale_files), so a rescan heals stale nodes left by a watcher
     that was down or missed events — not just adds/updates what's current.
     A full scan also applies the project schema (see apply_project_schema),
-    which reconciles filesystem-provider nodes (see providers/filesystem.py).
-    A schema that cannot be applied leaves the repository pending; callers
-    that care check schema_pending afterwards.
+    which reconciles filesystem- and docs-provider nodes (see providers/),
+    and then writes every docs edge once every target node exists. A schema
+    that cannot be applied leaves the repository pending, with no docs edge
+    written; callers that care check schema_pending afterwards.
     """
     prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
     all_files = _indexable_paths(repo_root)
-    apply_project_schema(engine, repo_id, repo_root)
-    return index_paths(
+    applied = apply_project_schema(engine, repo_id, repo_root)
+    indexed = index_paths(
         engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
         sync_provider=False,  # applied just above
     )
+    if applied:
+        _sync_docs_edges(engine, repo_id, repo_root)
+    return indexed
 
 
-def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> None:
+def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> ExtractionResult:
     content = path.read_text(encoding="utf-8", errors="replace")
     result = ContainerExtractor(repo_id).extract_from_containerfile(content, rel_path)
     _upsert_container_result(engine, repo_id, result)
+    return result
 
 
-def _index_compose_file(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> None:
+def _index_compose_file(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> ExtractionResult:
     content = path.read_text(encoding="utf-8", errors="replace")
     result = ContainerExtractor(repo_id).extract_from_compose_file(content, rel_path)
     _upsert_container_result(engine, repo_id, result)
+    return result
 
 
 def _relationship_dict(rel, repo_id: str) -> dict:
