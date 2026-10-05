@@ -1109,3 +1109,18 @@ def test_cli_doctor_reports_an_invalid_project_schema(runner, temp_registry_db, 
     # An invalid configuration is a failing check, whatever else this
     # environment reports (Podman, Neo4j and the tray are all independent).
     assert "doctor found one or more failing checks above." in collapsed
+
+
+def test_cli_dashboard_url_points_a_wildcard_bind_at_loopback(runner, temp_registry_db):
+    """A wildcard bind address is refused by the dashboard's Host guard, so
+    the printed URL must be the loopback address the server listens on."""
+    db_path, _ = temp_registry_db
+    from devgraph.cli import main as cli_main
+    from devgraph.config.settings import Settings
+
+    settings = Settings(registry_db_path=db_path, dashboard_host="0.0.0.0", dashboard_port=8765)
+    with patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "_tray_liveness_text", return_value="running"):
+        result = runner.invoke(app, ["dashboard", "--url-only"])
+    assert result.exit_code == 0, result.stdout
+    assert result.stdout.strip() == "http://127.0.0.1:8765"

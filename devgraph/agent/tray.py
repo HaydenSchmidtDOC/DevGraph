@@ -32,6 +32,7 @@ from PIL import Image, ImageDraw
 
 from devgraph.config import get_settings
 from devgraph.dashboard.app import build_app
+from devgraph.dashboard.url import dashboard_url
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.dispatch import index_paths, remove_paths
@@ -277,7 +278,7 @@ class TrayApp:
         self._refresh_icon()
 
     def _open_dashboard(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
-        url = f"http://{self._settings.dashboard_host}:{self._settings.dashboard_port}"
+        url = dashboard_url(self._settings)
         try:
             webbrowser.open(url)
         except Exception:
@@ -294,7 +295,7 @@ class TrayApp:
         self._dashboard_loop = loop
         self._events.bind_loop(loop)
 
-        app = build_app(self._engine, self._registry, self._events)
+        app = build_app(self._engine, self._registry, self._events, self._settings.dashboard_host)
         # The tray's pystray main loop keeps owning the process's signal
         # handling. uvicorn's Server.capture_signals() already detects it is
         # not running on the main thread and skips installing its own
@@ -311,9 +312,7 @@ class TrayApp:
         server = uvicorn.Server(config)
         self._dashboard_server = server
         try:
-            logger.info(
-                "dashboard on http://%s:%d", self._settings.dashboard_host, self._settings.dashboard_port
-            )
+            logger.info("dashboard on %s", dashboard_url(self._settings))
             loop.run_until_complete(server.serve())
         except Exception:
             # Additive feature: a bind failure (port already in use, another

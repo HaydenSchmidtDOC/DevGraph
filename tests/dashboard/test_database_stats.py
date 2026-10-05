@@ -62,7 +62,7 @@ class StubEngine:
 def make_client(engine):
     app = FastAPI()
     app.include_router(build_router(engine, registry=object(), events=EventBroadcaster()))
-    return TestClient(app)
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 def get_heap(engine):
