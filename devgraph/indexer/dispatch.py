@@ -47,6 +47,13 @@ from devgraph.indexer.providers import filesystem
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
 from devgraph.indexer.schema_constraints import encode_keys, realign_keys, release_labels
+# Re-exported under their pre-walk.py names for the watcher and existing callers.
+from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
+from devgraph.indexer.walk import indexable_paths as _indexable_paths
+from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
+from devgraph.indexer.walk import is_ignored_path as is_ignored_path
+from devgraph.indexer.walk import is_indexable_file as _is_indexable_file
+from devgraph.indexer.walk import links_outside as _links_outside  # noqa: F401
 from devgraph.paths import is_within
 
 logger = logging.getLogger(__name__)
@@ -56,61 +63,7 @@ _CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 _COMPOSE_NAMES = {"docker-compose.yml", "docker-compose.yaml", "podman-compose.yml", "podman-compose.yaml", "compose.yml", "compose.yaml"}
 _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
 
-# Mirrors this project's own .gitignore: directories no full_scan (and, via
-# devgraph.watcher.manager, no live watch) should ever walk into. Without
-# this, `devgraph add` on any Python repo with a local venv indexes thousands
-# of third-party dependency files from .venv/site-packages alongside the
-# repo's actual ~dozens of source files.
-IGNORED_DIR_NAMES = {
-    ".git",
-    ".venv",
-    "venv",
-    "__pycache__",
-    "build",
-    "dist",
-    ".pytest_cache",
-    ".devgraph",
-    "node_modules",
-    "bin",
-    "obj",
-    "target",
-    "vendor",
-    # Kotlin/Gradle build + tool scratch (Kotlin extractor, "motonav" plan):
-    # .gradle is the venv-equivalent (build cache + expanded AAR dependency
-    # sources); .kotlin is the compiler session cache; the rest are IDE/MCP
-    # tool scratch that's never source.
-    ".gradle",
-    ".kotlin",
-    ".idea",
-    ".serena",
-    ".playwright-mcp",
-    # C++ build-directory conventions (Implementation Plan #8, C++ row):
-    # CLion/CMake's default out-of-source build dir names.
-    "cmake-build-debug",
-    "cmake-build-release",
-    # Tool-generated scratch caches that can land inside a registered repo's
-    # working tree (e.g. a research skill's local cache dir) rather than a
-    # true temp directory. Never source, never worth graphing.
-    ".firecrawl",
-    # Agent worktrees (.worktrees/ at the repo root, .claude/worktrees/ for
-    # ones a coding agent spawns). Each is a full checkout of the repo it
-    # lives inside, so walking them indexes the entire repo again per live
-    # worktree — the same function then legitimately exists at N paths and
-    # becomes N nodes under the file-scoped MERGE key, silently multiplying
-    # the graph by however many worktrees happen to be open at scan time.
-    ".worktrees",
-    "worktrees",
-}
-
 _JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
-
-
-def is_ignored_dir_name(name: str) -> bool:
-    return name in IGNORED_DIR_NAMES or name.endswith(".egg-info")
-
-
-def is_ignored_path(path: Path) -> bool:
-    return any(is_ignored_dir_name(part) for part in path.parts)
 
 
 def _filesystem_spec(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | None]:
@@ -952,41 +905,6 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             )
 
     return cleaned
-
-
-def _is_indexable_file(path: Path) -> bool:
-    """p.is_file(), but a file the OS can't even stat (locked, broken
-    symlink, Windows reparse point) is skipped rather than aborting the
-    whole scan."""
-    try:
-        return path.is_file()
-    except OSError:
-        return False
-
-
-def _indexable_paths(repo_root: Path) -> set[Path]:
-    """Every file under repo_root that a full scan would index: a regular
-    file, not under an ignored directory. Shared by full_scan (which indexes
-    them) and prune_stale_files (which diffs them against the graph)."""
-    return {
-        p for p in repo_root.rglob("*")
-        if _is_indexable_file(p) and not is_ignored_path(p) and not _links_outside(p, repo_root)
-    }
-
-
-def _links_outside(path: Path, repo_root: Path) -> bool:
-    """True for a symlink whose target resolves outside repo_root.
-
-    A symlink whose target cannot be resolved (OSError, e.g. a loop) is also
-    treated as outside, so it is skipped rather than followed.
-    """
-    try:
-        if not path.is_symlink() or is_within(path.resolve(), repo_root):
-            return False
-    except OSError:
-        pass
-    logger.debug("skipping %s: symlink target is outside %s", path, repo_root)
-    return True
 
 
 def prune_stale_files(
