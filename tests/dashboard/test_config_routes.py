@@ -1778,3 +1778,51 @@ def test_alias_bomb_in_schema_file_is_refused_quickly(client, registry, tmp_path
     block = project["schema"]
     assert block["state"] == "invalid" and block["node_types"] == []
     assert "more than 10000" in block["error"]
+
+
+MALFORMED_ENTRIES = ["[" * 30_000, "description: 2020-02-30", "a: !!bool maybe", "a: !!timestamp foo"]
+WRITE_ROUTES = [
+    ("POST", "/api/config/repo-a/tools"),
+    ("PUT", "/api/config/repo-a/tools/find_parents"),
+    ("POST", "/api/config/repo-a/schema/node_types"),
+    ("PUT", "/api/config/repo-a/schema/node_types/Gadget"),
+]
+
+
+@pytest.mark.parametrize("method, url", WRITE_ROUTES)
+@pytest.mark.parametrize("text", MALFORMED_ENTRIES, ids=["deep", "bad-date", "bad-bool", "bad-timestamp"])
+def test_malformed_entry_yaml_is_400_on_every_write_route(client, registry, tmp_path, method, url, text):
+    record = _repo(tmp_path, registry)
+
+    response = _send(client, method, url, "absent", {"yaml": text})
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"]["code"] == "bad_request"
+    assert "malformed YAML" in response.json()["detail"]["message"]
+    assert not (record.path / TOOLS_FILENAME).exists()
+    assert not (record.path / SCHEMA_FILENAME).exists()
+
+
+def _tools_with_params(client, registry, tmp_path, params: str) -> dict:
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="find_parents") + f"        params: {params}\n")
+    response = client.get("/api/config")
+    assert response.status_code == 200, response.text
+    [project] = response.json()["projects"]
+    return project["tools"]
+
+
+def test_deeply_nested_registered_tools_file_is_reported_unreadable_not_a_500(client, registry, tmp_path):
+    tools = _tools_with_params(client, registry, tmp_path, "[" * 300 + "]" * 300)
+
+    assert tools["state"] == "invalid"
+    assert "malformed YAML" in tools["error"] and "levels deep" in tools["error"]
+    assert tools["entries"] == []
+
+
+def test_lone_surrogate_in_a_registered_tools_file_is_a_null_entry_not_a_500(client, registry, tmp_path):
+    tools = _tools_with_params(client, registry, tmp_path, '"\\ud800"')
+
+    [entry] = tools["entries"]
+    assert entry["name"] == "find_parents"
+    assert entry["entry"] is None  # YAML-only: JSON can't carry the lone surrogate

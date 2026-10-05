@@ -27,8 +27,19 @@ GLOBAL_TOOLS_FILENAME = "global-tools.json"
 _MAX_SAFE_INT = 2**53 - 1  # the largest integer a JavaScript number carries exactly
 
 
+def _utf8(value: str) -> bool:
+    """False for a string JSON can't carry as UTF-8, e.g. a lone surrogate from a `"\\ud800"` escape."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _plain(value: Any, ancestors: frozenset[int] = frozenset()) -> bool:
-    if value is None or isinstance(value, (str, bool)):
+    if isinstance(value, str):
+        return _utf8(value)
+    if value is None or isinstance(value, bool):
         return True
     if isinstance(value, int):
         return abs(value) <= _MAX_SAFE_INT
@@ -40,7 +51,7 @@ def _plain(value: Any, ancestors: frozenset[int] = frozenset()) -> bool:
         inside = ancestors | {id(value)}
         if isinstance(value, list):
             return all(_plain(v, inside) for v in value)
-        return all(isinstance(k, str) and _plain(v, inside) for k, v in value.items())
+        return all(isinstance(k, str) and _utf8(k) and _plain(v, inside) for k, v in value.items())
     return False
 
 

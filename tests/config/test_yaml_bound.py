@@ -9,7 +9,7 @@ from devgraph.config import edits, global_tools
 from devgraph.config.list_edit import ListEditError, entries
 from devgraph.config.project_schema import SCHEMA_FILENAME, ProjectSchemaError, parse_project_schema
 from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError, load_project_tools
-from devgraph.config.yaml_bound import YAML_MAX_NODES, YAMLBoundError, bounded_safe_load
+from devgraph.config.yaml_bound import YAML_MAX_DEPTH, YAML_MAX_NODES, YAMLBoundError, bounded_safe_load
 from devgraph.indexer.containers.extractor import ContainerExtractor
 from devgraph.indexer.docs.extractor import DocsExtractor
 
@@ -212,3 +212,60 @@ def test_compose_with_anchors_and_merge_keys_still_parses():
     )
     result = ContainerExtractor("r").extract_from_compose_file(content, "docker-compose.yml")
     assert sorted(s.name for s in result.services) == ["web", "worker"]
+
+
+# --- nesting depth and constructor errors ------------------------------------------------------
+
+def _nested(depth: int) -> str:
+    """A flow sequence nested `depth` levels deep (the root sequence is level 1)."""
+    return "[" * depth + "]" * depth
+
+
+def test_depth_bound_is_sixty_four():
+    assert YAML_MAX_DEPTH == 64
+
+
+def test_exactly_the_depth_bound_loads_and_one_more_is_refused():
+    assert bounded_safe_load(_nested(YAML_MAX_DEPTH)) == yaml.safe_load(_nested(YAML_MAX_DEPTH))
+    with pytest.raises(YAMLBoundError, match=f"more than {YAML_MAX_DEPTH} levels deep"):
+        bounded_safe_load(_nested(YAML_MAX_DEPTH + 1))
+
+
+def test_realistic_deep_document_under_the_bound_loads_identically():
+    text = "".join("  " * i + f"k{i}:\n" for i in range(59)) + "  " * 59 + "leaf: [1, {a: b}]\n"
+    assert bounded_safe_load(text) == yaml.safe_load(text)
+
+
+@pytest.mark.parametrize("text", [_nested(30_000), "a: " + _nested(300), "{a: " * 5000 + "}" * 5000])
+def test_pathological_nesting_is_a_bound_error_not_a_recursion_error(text):
+    with pytest.raises(YAMLBoundError, match="levels deep"):
+        bounded_safe_load(text)
+
+
+@pytest.mark.parametrize("text", [
+    "description: 2020-02-30",
+    "a: !!int abc",
+    "a: !!float abc",
+    "a: !!timestamp foo",
+    "a: !!bool maybe",
+    "a: !!int " + "9" * 5000,
+    "a: " + "9" * 5000,
+])
+def test_constructor_errors_are_bound_errors(text):
+    with pytest.raises(YAMLBoundError) as excinfo:
+        bounded_safe_load(text)
+    assert excinfo.value.__cause__ is not None
+
+
+def test_every_constructor_error_is_malformed_for_list_edit():
+    with pytest.raises(ListEditError) as excinfo:
+        entries("tools:\n  - name: t\n    when: 2020-02-30\n", key="tools")
+    assert excinfo.value.code == "malformed"
+
+
+def test_aliases_cannot_stack_nesting_past_the_bound():
+    """Each anchor wraps the previous one ten levels deeper: shallow as written, 101 deep once expanded."""
+    items = ["&a0 x"] + [f"&a{i} " + "[" * 10 + f"*a{i - 1}" + "]" * 10 for i in range(1, 11)]
+    text = "[" + ", ".join(items) + "]"
+    with pytest.raises(YAMLBoundError, match="levels deep"):
+        bounded_safe_load(text)
