@@ -285,12 +285,65 @@ def _find_in_code_regions(content: str, name: str, code_regions: list[tuple[int,
     return False
 
 
+def mentions_any(content: str, names: set[str]) -> bool:
+    """Whether `content` mentions any of `names` the way extract_from_source
+    would match it (code span, call or declaration syntax). A cheap
+    pre-check: lets a caller skip re-indexing a file that can't gain an
+    edge to any of these names."""
+    candidates = [name for name in names if name in content]
+    if not candidates:
+        return False
+    code_regions = _parse_code_regions(content)
+    return any(_find_matches(content, name, code_regions) for name in candidates)
+
+
+def _document_name(file_path: Path, repo_root: str | Path | None) -> str:
+    """The Document node's name: file_path relative to repo_root (forward
+    slashes), or the bare filename when repo_root is omitted or doesn't
+    contain file_path."""
+    if repo_root is not None:
+        try:
+            return file_path.resolve().relative_to(Path(repo_root).resolve()).as_posix()
+        except ValueError:
+            pass
+    return file_path.name
+
+
+def _upsert_documents(engine, result: ExtractionResult) -> None:
+    engine.upsert_nodes(
+        [
+            {
+                "label": doc.label,
+                "repo_id": doc.repo_id,
+                "name": doc.name,
+                "properties": doc.properties,
+            }
+            for doc in result.documents
+        ]
+    )
+
+
+def upsert_document_node(engine, repo_id: str, file_path: str | Path, repo_root: str | Path | None = None) -> None:
+    """Upsert only a Markdown file's Document node, without MENTIONS edges.
+
+    Lets a batch create every Document node before any file's mentions are
+    resolved, so a file mentioning a Document (or anything else) indexed
+    later in the same batch still gets its edge. index_file then adds the
+    edges (and re-upserts the same node idempotently).
+    """
+    file_path = Path(file_path)
+    content = file_path.read_text(encoding="utf-8")
+    result = MentionsExtractor(repo_id).extract_from_source(content, _document_name(file_path, repo_root), [])
+    _upsert_documents(engine, result)
+
+
 def index_file(
     engine,
     repo_id: str,
     file_path: str | Path,
     repo_root: str | Path | None = None,
     ambiguous_mode: str = "all",
+    names: set[str] | None = None,
 ) -> None:
     """Extract a mentions file and upsert results into the graph.
 
@@ -304,6 +357,9 @@ def index_file(
             into one Document node. When omitted, falls back to the bare filename
             for backwards compatibility, but loses the collision-prevention benefit.
         ambiguous_mode: How to handle ambiguous names: "all" (link all) or "skip" (skip).
+        names: When given, only match entities with one of these names -- for
+            linking an unchanged file to newly added entities without
+            re-matching every name in the repo. Existing edges are kept.
 
     Raises:
         FileNotFoundError: If the file does not exist.
@@ -313,43 +369,22 @@ def index_file(
         raise FileNotFoundError(f"File not found: {file_path}")
 
     content = file_path.read_text(encoding="utf-8")
+    doc_name = _document_name(file_path, repo_root)
 
-    # Compute the document name (repo-relative path or bare filename)
-    if repo_root is not None:
-        try:
-            rel = file_path.resolve().relative_to(Path(repo_root).resolve())
-            doc_name = rel.as_posix()
-        except ValueError:
-            # file_path wasn't actually under repo_root, fall back to bare filename
-            doc_name = file_path.name
-    else:
-        doc_name = file_path.name
-
-    # Query all entity names/labels in this repo
+    # Query all entity names/labels in this repo (or just `names`)
     query = """
     MATCH (n {repo_id: $repo_id})
-    WHERE n.name IS NOT NULL
+    WHERE n.name IS NOT NULL AND ($names IS NULL OR n.name IN $names)
     RETURN DISTINCT n.name as name, labels(n)[0] as label
     """
-    results = engine.run_cypher(query, {"repo_id": repo_id})
+    results = engine.run_cypher(query, {"repo_id": repo_id, "names": sorted(names) if names is not None else None})
     known_entities = [(row["name"], row["label"]) for row in results]
 
     # Extract mentions
     extractor = MentionsExtractor(repo_id, ambiguous_mode=ambiguous_mode)
     result = extractor.extract_from_source(content, doc_name, known_entities)
 
-    # Upsert Document node
-    engine.upsert_nodes(
-        [
-            {
-                "label": doc.label,
-                "repo_id": doc.repo_id,
-                "name": doc.name,
-                "properties": doc.properties,
-            }
-            for doc in result.documents
-        ]
-    )
+    _upsert_documents(engine, result)
 
     # Upsert relationships
     engine.upsert_relationships(

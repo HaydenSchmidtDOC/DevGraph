@@ -108,8 +108,11 @@ class DatastoreExtractor:
         # Extract from connection string patterns and client instantiations
         self._extract_from_usage(content, detected_datastores)
 
-        # Convert detected datastores to nodes
-        for provider, ds_type, library in detected_datastores:
+        # Convert detected datastores to nodes. Sorted, not set order: two
+        # libraries for the same provider in one file (e.g. psycopg2 and
+        # psycopg) MERGE into one node, and the last one written wins its
+        # `library` property.
+        for provider, ds_type, library in sorted(detected_datastores):
             datastore = DatastoreNode(
                 name=provider,
                 datastore_type=ds_type,
