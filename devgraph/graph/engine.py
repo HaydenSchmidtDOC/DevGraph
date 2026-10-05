@@ -17,7 +17,7 @@ from neo4j import Driver, GraphDatabase, READ_ACCESS, unit_of_work
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
-from devgraph.graph.schema import constraint_statements
+from devgraph.graph.schema import RELATIONSHIP_TYPES, RESERVED_NODE_PROPERTIES, constraint_statements
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Imported for annotations only: `devgraph.config.project_schema` imports
@@ -88,6 +88,27 @@ _PRUNE_EXTRACTED_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
     "AND NOT (labels(n)[0] + ':' + n.name) IN $keep "
     "DETACH DELETE n RETURN count(n) AS pruned"
+)
+# The incremental reconcile for provider-owned nodes: only nodes at these
+# exact paths are candidates (never anything below them), so a batch of
+# changed files can't prune the rest of the provider's nodes.
+_PRUNE_EXTRACTED_AT_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND n.name IN $paths "
+    "AND NOT (labels(n)[0] + ':' + n.name) IN $keep "
+    "DETACH DELETE n RETURN count(n) AS pruned"
+)
+# A provider's own edges are the outgoing ones of a non-built-in type; incoming
+# edges belong to whoever wrote them. A null $paths means the whole repo.
+_DELETE_EXTRACTED_EDGES_CYPHER = (
+    "MATCH (a {repo_id: $repo_id})-[r]->() WHERE a.extractor = $extractor "
+    "AND ($paths IS NULL OR a.name IN $paths) AND NOT type(r) IN $builtin_types "
+    "DELETE r RETURN count(r) AS deleted"
+)
+# Property keys present on one provider label, for clearing the ones the
+# schema no longer declares (see GraphEngine.clear_extracted_properties).
+_EXTRACTED_PROPERTY_KEYS_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] = $label "
+    "UNWIND keys(n) AS key RETURN DISTINCT key"
 )
 
 # Which project schema the repository's graph was last built with (see
@@ -610,6 +631,62 @@ class GraphEngine:
             )
             records = [record.data() for record in result or []]
         return records[0]["pruned"] if records else 0
+
+    def prune_extracted_at(self, repo_id: str, extractor: str, paths: list[str], keep: list[str]) -> int:
+        """Delete one provider's nodes at exactly these paths, except `keep` ("Label:name")."""
+        if not paths:
+            return 0
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run, _PRUNE_EXTRACTED_AT_CYPHER,
+                repo_id=repo_id, extractor=extractor, paths=paths, keep=keep,
+            )
+            records = [record.data() for record in result or []]
+        return records[0]["pruned"] if records else 0
+
+    def delete_extracted_edges(self, repo_id: str, extractor: str, paths: list[str] | None) -> int:
+        """Delete the outgoing non-built-in edges of one provider's nodes at these paths,
+        or across the whole repo when `paths` is None."""
+        if paths is not None and not paths:
+            return 0
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run, _DELETE_EXTRACTED_EDGES_CYPHER, repo_id=repo_id, extractor=extractor,
+                paths=paths, builtin_types=list(RELATIONSHIP_TYPES),
+            )
+            records = [record.data() for record in result or []]
+        return records[0]["deleted"] if records else 0
+
+    def clear_extracted_properties(self, repo_id: str, extractor: str, label: str, keep: list[str]) -> list[str]:
+        """Remove every property of one provider label's nodes that is not in `keep`,
+        not reserved and not `insight_*`. Returns the removed names, sorted.
+
+        The names come from the graph, so each one must fullmatch the property-name
+        pattern before it is interpolated; anything else is left in place.
+        """
+        # Runtime import: see the TYPE_CHECKING note at the top of this module.
+        from devgraph.config.project_schema import PROPERTY_NAME_PATTERN
+
+        params = {"repo_id": repo_id, "extractor": extractor, "label": label}
+        with self._driver.session() as session:
+            result = _retry_transient(session.run, _EXTRACTED_PROPERTY_KEYS_CYPHER, **params)
+            present = [record["key"] for record in result or []]
+            stale = sorted(
+                key for key in present
+                if key not in keep
+                and key not in RESERVED_NODE_PROPERTIES
+                and not key.startswith("insight_")
+                and PROPERTY_NAME_PATTERN.fullmatch(key)
+            )
+            if stale:
+                removals = ", ".join(f"n.`{key}`" for key in stale)
+                _retry_transient(
+                    session.run,
+                    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] = $label "
+                    f"REMOVE {removals}",
+                    **params,
+                ).consume()
+        return stale
 
     def read_applied_schema(self, repo_id: str) -> dict[str, Any] | None:
         """The schema state the repo's graph was last built with, or None."""
