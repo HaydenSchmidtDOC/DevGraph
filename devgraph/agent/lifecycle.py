@@ -223,7 +223,7 @@ def _start_tray_if_not_running_locked() -> Optional[int]:
         creationflags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
 
     process = subprocess.Popen(
-        [str(python_path), "-m", "devgraph.agent.tray"],
+        [str(python_path), "-P", "-m", "devgraph.agent.tray"],
         cwd=repo_root,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,

@@ -13,11 +13,13 @@ from typing import Any
 
 import git
 import json
+import os
 import subprocess
 
 from devgraph.config.project_schema import LABEL_PATTERN, ProjectSchemaError, resolve_effective_schema
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
+from devgraph.paths import is_within
 from devgraph.registry.store import RepoRegistry
 from devgraph.analytics.insights import INSIGHT_METRICS, community_members, read_insights, top_nodes
 
@@ -1354,11 +1356,15 @@ def get_source(
         return empty
 
     file_path = (repo.path / file_rel_path).resolve()
-    if not str(file_path).startswith(str(repo.path.resolve())):
+    if not is_within(file_path, repo.path):
         return empty  # never read outside the registered repo root
 
+    # O_NOFOLLOW refuses a final component swapped for a symlink after the
+    # check above; platforms without it fall back to a plain open.
     try:
-        lines = file_path.read_text(encoding="utf-8").splitlines()
+        fd = os.open(file_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with open(fd, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
     except OSError:
         return empty
 

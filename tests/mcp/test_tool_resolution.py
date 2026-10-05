@@ -14,6 +14,9 @@ from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
 
+# Written before the per-repository opt-in: these tests assume project tools are served.
+pytestmark = pytest.mark.usefixtures("trusted_project_tools")
+
 PROJECT = """
     version: 1
     tools:
@@ -416,3 +419,18 @@ def test_a_bad_global_store_reload_keeps_the_previous_global_tools(tmp_path, mon
         current = status(server)
         assert current["served"] == ["g_count"]
         assert any("last good" in n for n in current["notices"])
+
+
+def test_a_global_store_inside_the_session_repository_is_not_served(tmp_path, monkeypatch, caplog):
+    repo = tmp_path / "demo"
+    repo.mkdir()
+    path = repo / ".devgraph" / GLOBAL_TOOLS_FILENAME
+    monkeypatch.setattr(global_tools, "_default_path", lambda: path)
+    save_global_tools([G_COUNT])
+    with caplog.at_level("WARNING", logger="devgraph.mcp.tool_plane"):
+        server, _ = build(tmp_path, monkeypatch)
+    assert "g_count" not in tools(server)
+    current = status(server)
+    assert current["served"] == [] and current["global_tools_file"] is None
+    assert any("inside" in n and GLOBAL_TOOLS_FILENAME in n for n in current["notices"])
+    assert "inside repository" in caplog.text

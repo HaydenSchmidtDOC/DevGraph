@@ -22,6 +22,9 @@ from devgraph.dashboard.app import build_app
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.registry.store import RepoRegistry
 
+# Written before the per-repository opt-in: these tests assume project tools are served.
+pytestmark = pytest.mark.usefixtures("trusted_project_tools")
+
 TOOL = """
     version: 1
     tools:

@@ -22,12 +22,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from devgraph.paths import is_within, read_bounded
+
 SCHEMA_SECTIONS = {
     "node_types": ("label", "node type"),
     "relationships": ("type", "relationship"),
 }
 
 TOOLS_RELOAD_NOTE = "Running MCP sessions pick this up within 2 seconds."
+
+
+def tools_trust_note(repo_id: str) -> str:
+    """What any write to a repository's tools file means: its sha256 changes, so it needs approving again."""
+    return (f"Saving stops {repo_id}'s project tools being served until you run "
+            f"`devgraph config tools trust {repo_id}`; running MCP sessions pick that up within 2 seconds.")
 GLOBAL_TOOLS_NOTE = (
     "Global tools are served only in MCP sessions scoped to a registered repository; "
     "running sessions there pick up changes within 2 seconds."
@@ -106,7 +114,7 @@ def file_fingerprint(path: Path) -> str:
     try:
         if not stat.S_ISREG(os.stat(path).st_mode):
             return "not_regular"
-        return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        return "sha256:" + hashlib.sha256(read_bounded(Path(path))).hexdigest()
     except FileNotFoundError:
         return "absent"
     except OSError as exc:
@@ -138,14 +146,19 @@ def _check_fingerprint(path: Path, expected: str | None) -> None:
         raise ConfigEditError(f"{path} changed since it was loaded; reload and try again", "stale")
 
 
-def read_text(path: Path) -> str:
-    """The file's text, or "" when absent; a directory, FIFO or device is `not_regular` and never opened."""
+def read_text(path: Path, root: Path | None = None) -> str:
+    """The file's text, or "" when absent; a directory, FIFO or device is `not_regular` and never opened.
+
+    With `root`, a file that resolves outside that repository is `not_regular` and never opened.
+    """
     try:
         if not path.exists():
             return ""
+        if root is not None and not is_within(path.resolve(), Path(root)):
+            raise ConfigEditError(f"{path.name} resolves outside the repository; it is not read", "not_regular")
         if not stat.S_ISREG(os.stat(path).st_mode):
             raise _not_regular(path)
-        return path.read_text(encoding="utf-8")
+        return read_bounded(path).decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise ConfigEditError(f"{path}: cannot be read: {exc}", "unreadable")
 
@@ -200,6 +213,7 @@ def tools_effect_note(root: Path | None, record: Any) -> str:
     """Whether running MCP sessions will serve what is in this scope's file.
 
     `record` is the registered repository record for `root` (None when not registered).
+    A registered repository's write always needs re-trusting: it changes the file's sha256.
     """
     if root is None:
         return GLOBAL_TOOLS_NOTE
@@ -209,7 +223,7 @@ def tools_effect_note(root: Path | None, record: Any) -> str:
     if not record.project_config_enabled:
         return (f"project config is disabled for {record.repo_id}, so MCP sessions won't serve its tools; "
                 f"enable it with `devgraph config enable {record.repo_id}`.")
-    return TOOLS_RELOAD_NOTE
+    return tools_trust_note(record.repo_id)
 
 
 def refuse_builtin(name: Any) -> None:
@@ -226,7 +240,7 @@ def tool_entries(root: Path | None) -> list[dict]:
     from devgraph.config.tools_edit import ToolsEditError, tool_mappings
 
     try:
-        return tool_mappings(read_text(tools_path(root)))
+        return tool_mappings(read_text(tools_path(root), root))
     except ToolsEditError as exc:
         raise _splice_error(exc)
 
@@ -677,7 +691,7 @@ def _reset_snapshot(path: Path) -> tuple[str, bool, Any, str]:
     from devgraph.config.yaml_bound import bounded_safe_load
 
     try:
-        raw = path.read_bytes()
+        raw = read_bounded(path)
     except OSError:
         return file_fingerprint(path), False, None, ""
     fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest()
@@ -810,7 +824,7 @@ def project_config_change(record: Any, enabled: bool) -> tuple[list[str], list[s
     tools_file = tools_file_path(root)
     if not enabled and tools_file.is_file():
         try:
-            names = sorted({t.name for t in parse_project_tools(read_text(tools_file), tools_file).tools} - builtin_tool_names())
+            names = sorted({t.name for t in parse_project_tools(read_text(tools_file, root), tools_file).tools} - builtin_tool_names())
         except (ConfigEditError, ProjectToolsError):
             warnings.append(
                 f"{tools_file.name} is invalid; project tools may still be served from the last good file "

@@ -139,7 +139,7 @@ const globals = {
 const api = new Function(...Object.keys(globals),
   configSrc + "\nreturn { CONFIG_GLOBAL, renderConfigPage, renderConfigScope, configWriteRequest, describeConfigError," +
   " openConfigEditor, configEditTarget, configCopyDestinations, configCanCopy, loadConfigPage, applyConfigScope, configModalKey, CONFIG_SECTIONS," +
-  " configResetRequest, configResetPhrase, configResetReady, describeConfigReset, configToggleRequest," +
+  " configResetRequest, configResetPhrase, configResetReady, describeConfigReset, configToggleRequest, configRevokeTrustRequest," +
   " CONFIG_FORM_FIELDS, configFormFromEntry, configEntryFromForm, configYamlScalar, configEntryYaml, configFormHints, configFormSwitch, configFormContext," +
   " get model() { return configModel; }, get formEls() { return configFormEls; }, get edit() { return configEdit; }, get reset() { return configReset; } };")(...Object.values(globals));
 
@@ -1174,6 +1174,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
       { label: HOSTILE, yaml: "label: '" + HOSTILE + "'\n", editable: true, badges: [] }];
     a.schema.relationships = [{ type: "DOCUMENTS", yaml: "type: DOCUMENTS\nfrom: Runbook\nto: Service\n", editable: true, badges: [] },
       { type: "OWNS", yaml: "type: OWNS\n", editable: false, badges: [{ level: "warn", kind: "ambiguous", text: "Declared more than once", detail: "" }] }];
+    a.tools.trust = { state: "trusted", command: "devgraph config tools trust repo-a", revocable: true };
     return { global: globalBlock(), projects: [a, project("repo-b"), project(HOSTILE)] };
   };
   api.renderConfigPage(COPY_MODEL());
@@ -1362,6 +1363,20 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     writes().length === 2 && writes().every(c => c.url === "/api/config/__global__/tools" && c.init.method === "POST" && ifMatch(c) === '"sha256:g1"' &&
       body(c).yaml === "name: mine\ndescription: d\ncypher: x\n"), JSON.stringify(writes()));
   check("...then reloads the page", lastCall().url === "/api/config", lastCall().url);
+  for (const state of ["untrusted", "changed"]) {
+    const m = COPY_MODEL();
+    m.projects[0].tools.trust = { state, command: "devgraph config tools trust repo-a", revocable: state === "changed" };
+    api.renderConfigPage(m);
+    await copyBtn("repo-a", "mine")[0].fire("click");
+    els.configDest.value = "__global__";
+    await els.configDest.fire("change");
+    const text = els.configModalWarnText.textContent;
+    check("copying an untrusted (" + state + ") repo's tool to the global store warns it is served in every repo without trust",
+      text.includes("repo-a's devgraph.tools.yaml is not trusted") &&
+      text.includes("the global store serves this tool in every repository without any trust approval") &&
+      text.includes("can read the whole graph") && text.includes("convention, not a sandbox"), text);
+    els.configModalCancel.fire("click");
+  }
 
   // 33. Cancel while a copy is in flight: no write
   api.renderConfigPage(COPY_MODEL());
@@ -2533,6 +2548,52 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await press(els.configResetConfirm);
   check("after resetting the global store focus is on a control in the re-rendered global card, not the removed opener", api.reset === null &&
     focused !== old && inside(focused, card("__global__")), desc());
+
+  // project tools trust: a badge, and Revoke only -- the page can never trust
+  const trusting = (repo, state, revocable) => {
+    const p = project(repo, [{ name: "hot_paths", tool_id: repo + "_hot_paths", yaml: "name: hot_paths\n", origin: state === "trusted" ? "project" : null,
+      badges: state === "trusted" ? [] : [{ level: "warn", kind: "not-trusted", text: "Not served: not trusted", detail: "project tools not trusted (run devgraph config tools trust " + repo + ")" }] }]);
+    p.tools.trust = { state, command: "devgraph config tools trust " + repo, revocable };
+    p.tools.badges = [state === "trusted"
+      ? { level: "info", kind: "trusted", text: "Trusted", detail: "Served." }
+      : { level: "warn", kind: "not-trusted", text: state === "changed" ? "Changed since trusted" : "Not trusted", detail: "project tools not trusted (run devgraph config tools trust " + repo + ")." }];
+    return p;
+  };
+  const sectionHead = (scope, title) => byClass(card(scope), "cfg-section-head").find(h => h.children[0].textContent === title);
+  api.renderConfigPage({ global: globalBlock(), projects: [trusting("repo-a", "trusted", true), trusting("repo-b", "untrusted", false)] });
+  check("a trusted repository's Tools heading shows the Trusted badge",
+    byClass(sectionHead("repo-a", "Tools"), "cfg-badge").some(b => b.textContent === "Trusted" && b.classList.contains("info")), sectionHead("repo-a", "Tools").textContent);
+  check("an untrusted one shows Not trusted, naming the command on hover",
+    byClass(sectionHead("repo-b", "Tools"), "cfg-badge").some(b => b.textContent === "Not trusted" && b.dataset.tip.includes("devgraph config tools trust repo-b")),
+    sectionHead("repo-b", "Tools").textContent);
+  check("...and its tool row says it is not served", rowFor(card("repo-b"), "hot_paths").textContent.includes("Not served: not trusted"),
+    rowFor(card("repo-b"), "hot_paths").textContent);
+  check("Revoke trust is offered only where an approval is recorded",
+    buttons(card("repo-a"), "Revoke trust").length === 1 && buttons(card("repo-b"), "Revoke trust").length === 0, card("repo-b").textContent);
+  check("no control anywhere grants trust",
+    find(els.configScopes, e => e.tagName === "BUTTON" && /^trust|approve/i.test(e.textContent)).length === 0,
+    JSON.stringify(find(els.configScopes, e => e.tagName === "BUTTON").map(b => b.textContent)));
+  r = api.configRevokeTrustRequest("repo a");
+  check("configRevokeTrustRequest -> DELETE /api/config/<repo>/trust/tools, no body or If-Match",
+    r.url === "/api/config/repo%20a/trust/tools" && r.init.method === "DELETE" && r.init.body === undefined && !r.init.headers, JSON.stringify(r));
+  fetchCalls = [];
+  const revokedNote = "Revoked trust in repo-a's project tools; running MCP sessions stop serving them within 2 seconds.";
+  respond = () => ({ status: 200, body: { ok: true, written: true, notes: [revokedNote, "Trusting them again is done in a terminal: `devgraph config tools trust repo-a`."],
+    scope: trusting("repo-a", "untrusted", false), global: globalBlock() } });
+  await press(buttons(card("repo-a"), "Revoke trust")[0]);
+  check("Revoke sends exactly one DELETE to the trust route", writes().length === 1 && writes()[0].url === "/api/config/repo-a/trust/tools" &&
+    writes()[0].init.method === "DELETE", JSON.stringify(fetchCalls));
+  check("...redraws the card from the response (Not trusted, no Revoke)",
+    byClass(sectionHead("repo-a", "Tools"), "cfg-badge").some(b => b.textContent === "Not trusted") && buttons(card("repo-a"), "Revoke trust").length === 0,
+    card("repo-a").textContent);
+  check("...shows the notes, naming the CLI command to trust again",
+    els.configStatus.textContent.includes(revokedNote) && card("repo-a").textContent.includes("devgraph config tools trust repo-a"), els.configStatus.textContent);
+  check("...and keeps focus on the card", inside(focused, card("repo-a")), desc());
+  respond = () => ({ status: 403, body: { detail: { code: "forbidden", message: "cross-site request refused" } } });
+  api.renderConfigPage({ global: globalBlock(), projects: [trusting("repo-a", "trusted", true)] });
+  await press(buttons(card("repo-a"), "Revoke trust")[0]);
+  check("a refused revoke says so and leaves the badge", els.configStatus.textContent.includes("Revoke failed: cross-site request refused") &&
+    buttons(card("repo-a"), "Revoke trust").length === 1, els.configStatus.textContent);
 
   // 46. focus stays in the dialogs after failed saves and resets
   check("the editor's error line is an alert", /id="configModalError"[^>]*role="alert"|role="alert"[^>]*id="configModalError"/.test(html));

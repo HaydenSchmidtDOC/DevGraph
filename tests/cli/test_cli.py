@@ -401,6 +401,33 @@ def test_cli_annotate_set_docs_path(runner, temp_git_repo, temp_registry_db):
         assert "devgraph/docs" in result.stdout
 
 
+def test_cli_annotate_note_refuses_sibling_prefix_path(runner, temp_registry_db, tmp_path):
+    """A note in a sibling directory that shares the repo's name prefix is
+    outside the repository and must be refused before anything is indexed."""
+    db_path, registry = temp_registry_db
+    repo_path = tmp_path / "proj"
+    repo_path.mkdir()
+    subprocess.run(["git", "init"], cwd=str(repo_path), capture_output=True, check=True)
+    sibling = tmp_path / "proj-private"
+    sibling.mkdir()
+    (sibling / "note.md").write_text("---\ntype: requirement\nid: req-x\n---\n# Note\n")
+
+    repo_id = registry.add_repo(repo_path).repo_id
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "index_doc_file") as index_doc_file:
+        result = runner.invoke(app, ["annotate", repo_id, "--note", "../proj-private/note.md"])
+
+    assert result.exit_code == 1
+    assert "note path must be inside the repository" in result.stdout
+    index_doc_file.assert_not_called()
+
+
 def test_cli_annotate_nonexistent_repo(runner, temp_registry_db):
     """Test 'devgraph annotate' with non-existent repo."""
     db_path, registry = temp_registry_db
@@ -603,6 +630,8 @@ def test_cli_client_config_prints_resolved_paths(runner, temp_registry_db):
         assert result.exit_code == 0, f"stdout: {result.stdout}"
         assert "devgraph.mcp.server" in result.stdout
         assert "claude mcp add" in result.stdout
+        assert "-m devgraph.mcp.server" not in result.stdout.replace("-P -m devgraph.mcp.server", "")
+        assert '"-P",' in result.stdout
 
 
 def test_cli_client_config_mcp_add_only(runner, temp_registry_db):
@@ -618,7 +647,7 @@ def test_cli_client_config_mcp_add_only(runner, temp_registry_db):
         # rows — join before asserting on content rather than counting lines.
         collapsed = " ".join(l.strip() for l in result.stdout.strip().splitlines())
         assert collapsed.startswith("claude mcp add devgraph")
-        assert "devgraph.mcp.server" in collapsed
+        assert collapsed.endswith('" -P -m devgraph.mcp.server')
 
 
 def test_cli_client_config_vscode_creates_new_mcp_json(runner, temp_registry_db, monkeypatch):
@@ -639,8 +668,9 @@ def test_cli_client_config_vscode_creates_new_mcp_json(runner, temp_registry_db,
         mcp_json = Path(appdata_dir) / "Code" / "User" / "mcp.json"
         assert mcp_json.exists()
         data = json.loads(mcp_json.read_text(encoding="utf-8"))
-        assert data["servers"]["devgraph"]["args"] == ["-m", "devgraph.mcp.server"]
+        assert data["servers"]["devgraph"]["args"] == ["-P", "-m", "devgraph.mcp.server"]
         assert data["servers"]["devgraph"]["type"] == "stdio"
+        assert Path(data["servers"]["devgraph"]["cwd"]).is_absolute()
 
 
 def test_cli_client_config_vscode_preserves_existing_servers(runner, temp_registry_db, monkeypatch):
@@ -1466,3 +1496,70 @@ def test_cli_insights_computes_for_a_registered_repo(runner, temp_git_repo, temp
     finally:
         engine.delete_repository(repo_id)
         engine.close()
+
+
+def test_claude_mcp_add_passes_safe_path_flag(tmp_path):
+    from devgraph.cli import main as cli_main
+
+    def fake_run(cmd, *args, **kwargs):
+        result = MagicMock()
+        result.returncode = 1 if cmd[1:3] == ["mcp", "get"] else 0
+        return result
+
+    with patch("devgraph.cli.main.subprocess.run", side_effect=fake_run) as mock_run:
+        assert cli_main._run_claude_mcp_add("/usr/bin/claude", Path("/venv/bin/python"), tmp_path)
+
+    add_cmd = mock_run.call_args_list[-1].args[0]
+    assert add_cmd[add_cmd.index("--") + 1:] == ["/venv/bin/python", "-P", "-m", "devgraph.mcp.server"]
+
+
+def _write_shadow_package(workdir: Path, marker: str) -> None:
+    pkg = workdir / "devgraph" / "mcp"
+    pkg.mkdir(parents=True)
+    (workdir / "devgraph" / "__init__.py").write_text("")
+    (pkg / "__init__.py").write_text("")
+    (pkg / "server.py").write_text(f"print({marker!r})\n")
+
+
+def test_generated_mcp_command_ignores_devgraph_package_in_working_directory(tmp_path):
+    """The generated server command must import the installed DevGraph even
+    when started from a directory that contains its own `devgraph/` package."""
+    import os
+    import sys
+
+    from devgraph.cli.main import MCP_SERVER_ARGS
+
+    marker = "SHADOW_PACKAGE_LOADED"
+    workdir = tmp_path / "client-repo"
+    workdir.mkdir()
+    _write_shadow_package(workdir, marker)
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("DEVGRAPH_") and key != "PYTHONPATH"
+    }
+    env.update({
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "DEVGRAPH_REGISTRY_DB_PATH": str(home / ".devgraph" / "registry.sqlite3"),
+        # Unreachable, so the real server exits at its connectivity check
+        # before starting anything else.
+        "DEVGRAPH_NEO4J_URI": "bolt://127.0.0.1:1",
+    })
+
+    def run(args):
+        return subprocess.run(
+            [sys.executable, *args], cwd=str(workdir), env=env,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120,
+        )
+
+    # Control: without -P the working directory's package wins.
+    unsafe = run(["-m", "devgraph.mcp.server"])
+    assert marker in unsafe.stdout
+
+    safe = run(list(MCP_SERVER_ARGS))
+    assert marker not in safe.stdout
+    assert safe.returncode != 0
+    assert "ServiceUnavailable" in safe.stderr  # reached the real server
+    assert str(workdir) not in safe.stderr

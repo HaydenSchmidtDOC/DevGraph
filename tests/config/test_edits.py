@@ -173,7 +173,10 @@ def test_global_store_invalid_and_dry_run(store):
 
 
 def test_tools_effect_notes(tmp_path):
-    assert "within 2 seconds" in edits.tools_effect_note(tmp_path, record())
+    note = edits.tools_effect_note(tmp_path, record())
+    assert note.startswith("Saving stops repo-a's project tools being served until you run "
+                           "`devgraph config tools trust repo-a`")
+    assert "sha256" not in note and "--sha256" not in note
     assert "not a registered repository" in edits.tools_effect_note(tmp_path, None)
     assert "not a registered repository" in edits.tools_effect_note(tmp_path, record(active=False))
     assert "devgraph config enable repo-a" in edits.tools_effect_note(tmp_path, record(project_config_enabled=False))

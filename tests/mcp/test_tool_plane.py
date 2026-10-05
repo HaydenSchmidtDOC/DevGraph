@@ -13,6 +13,9 @@ from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
 from devgraph.mcp.tool_plane import SESSION_REPO_ENV, resolve_session_repo
 
+# Written before the per-repository opt-in: these tests assume project tools are served.
+pytestmark = pytest.mark.usefixtures("trusted_project_tools")
+
 TOOLS = """
     version: 1
     tools:

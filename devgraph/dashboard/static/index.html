@@ -3064,14 +3064,15 @@ function configLockedChips(names) {
   });
   return box;
 }
-/* one sub-list: heading (title, file, file-level badges, Reset, Add), then its rows */
-function configSection(title, file, badges, onAdd, body, onReset) {
+/* one sub-list: heading (title, file, file-level badges, extra buttons, Reset, Add), then its rows */
+function configSection(title, file, badges, onAdd, body, onReset, extra) {
   const sec = configEl("div", "cfg-section");
   const head = configEl("div", "cfg-section-head");
   head.appendChild(configEl("span", "", title));
   if (file) head.appendChild(configEl("span", "cfg-sub", file));
   (badges || []).forEach(b => head.appendChild(configBadgeEl(b)));
   const actions = configEl("div", "cfg-actions");
+  (extra || []).forEach(b => actions.appendChild(b));
   if (onReset) actions.appendChild(configButton("Reset " + file + "…", onReset.fn, onReset.where));
   if (onAdd) actions.appendChild(configButton("Add " + onAdd.noun, onAdd.fn, onAdd.where));
   if (actions.children.length) head.appendChild(actions);
@@ -3157,8 +3158,11 @@ function renderConfigScope(scope, block) {
       configEntryRows(configEl("div", ""), scope, "node_types", schema.node_types, "label"), reset(schema, "schema")));
     card.appendChild(configSection("Relationships", schema.file, [], add("relationships"),
       configEntryRows(configEl("div", ""), scope, "relationships", schema.relationships, "type")));
+    /* revoking is the only trust control here: approving a tools file is CLI-only (the badge names the command) */
+    const revoke = tools.trust && tools.trust.revocable
+      ? [configButton("Revoke trust", () => revokeConfigTrust(scope), { scope, action: "revoke", section: "tools" })] : [];
     card.appendChild(configSection("Tools", tools.file, tools.badges, add("tools"),
-      configEntryRows(configEl("div", ""), scope, "tools", tools.entries, "name"), reset(tools, "tools")));
+      configEntryRows(configEl("div", ""), scope, "tools", tools.entries, "name"), reset(tools, "tools"), revoke));
   }
   return card;
 }
@@ -3272,6 +3276,14 @@ function configGlobalReach(name) {
     (over.length ? " Overridden in: " + over.join(", ") + "." : "");
 }
 const configSameTarget = (a, b) => !!a && !!b && a.scope === b.scope && a.op === b.op && a.name === b.name;
+/* copying from a repo whose tools file is not trusted: the global store needs no trust,
+   so the copy would be served everywhere without the approval the source lacks */
+function configUntrustedCopyNote(src) {
+  const trust = configScopeBlock(src).tools.trust;
+  if (trust && trust.state === "trusted") return "";
+  return " " + src + "'s devgraph.tools.yaml is not trusted: copying to the global store serves this tool in every " +
+    "repository without any trust approval. An enabled tool can read the whole graph: the $repo_id rule is a convention, not a sandbox.";
+}
 function configWarningText(edit) {
   if (edit.op === "copy") {
     const replaces = edit.crossName ? " " + configCopyReplaces(edit) : "";
@@ -3283,7 +3295,7 @@ function configWarningText(edit) {
         ? "Replaces the global tool " + edit.crossName + " with " + src + "'s version: served in every repo without its own " +
           edit.crossName + "; " + src + "'s own copy keeps overriding it there."
         : "Adds " + edit.name + " to the global store; " + src + "'s own " + edit.name + " will override it in " + src + ".") +
-        (others.length ? " Will also be overridden in: " + others.join(", ") + "." : "");
+        (others.length ? " Will also be overridden in: " + others.join(", ") + "." : "") + configUntrustedCopyNote(src);
     }
     const block = configScopeBlock(edit.dest);
     const file = edit.section === "tools" ? block.tools.file : block.schema.file;
@@ -3836,6 +3848,23 @@ async function toggleProjectConfig(repoId, enabled, confirmed) {
     st.busy = "";
     if (configToggles[repoId] === st) configRerender(repoId);
   }
+}
+/* ── project tools trust: the page can only revoke it (DELETE, idempotent, no If-Match);
+   trusting a tools file is `devgraph config tools trust` in a terminal. ── */
+function configRevokeTrustRequest(repoId) {
+  return { url: "/api/config/" + encodeURIComponent(repoId) + "/trust/tools", init: { method: "DELETE" } };
+}
+async function revokeConfigTrust(repoId) {
+  configSetStatus("Revoking trust…");
+  const res = await configSend(configRevokeTrustRequest(repoId));
+  if (!res.ok) { configSetStatus("Revoke failed: " + describeConfigError(res.status, res.body && res.body.detail)); return; }
+  const outcome = ((res.body && res.body.notes) || []).map(String);
+  configSetStatus(outcome);
+  configOutcomes[repoId] = outcome;
+  applyConfigScope(repoId, res.body.scope);
+  /* the global card's "Overridden in" badges depend on which repos serve project tools */
+  if (res.body.global) applyConfigScope(CONFIG_GLOBAL, res.body.global);
+  configRestoreFocus({ scope: repoId, action: "add", section: "tools" });
 }
 /* quiet: a background refresh (live event, after a write, pane activation).
    One while the pane is hidden is skipped: activating the pane reloads it. */

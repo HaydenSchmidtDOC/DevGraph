@@ -78,3 +78,45 @@ def test_get_source_unknown_component_returns_empty(repo_with_indexed_file):
     result = get_source(engine, registry, repo_id, "does_not_exist")
     assert result["source"] is None
     assert result["file"] is None
+
+
+@pytest.fixture
+def repo_with_sibling(engine):
+    """A registered repo `proj` next to an unregistered `proj-private`."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_root = Path(tmpdir) / "proj"
+        repo_root.mkdir()
+        (repo_root / ".git").mkdir()
+        sibling = Path(tmpdir) / "proj-private"
+        sibling.mkdir()
+        (sibling / "x.py").write_text("SIBLING_CONTENT = 1\n", encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as regdir:
+            registry = RepoRegistry(Path(regdir) / "registry.db")
+            record = registry.add_repo(repo_root, repo_id="_smoketest_get_source_sibling")
+            engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
+            try:
+                yield engine, registry, record.repo_id
+            finally:
+                engine.delete_repository(record.repo_id)
+                registry.close()
+
+
+@pytest.mark.parametrize(
+    "file_value",
+    ["../proj-private/x.py", "{sibling}/x.py"],
+    ids=["relative-escape", "absolute-sibling-prefix"],
+)
+def test_get_source_refuses_file_outside_the_repo(repo_with_sibling, file_value):
+    engine, registry, repo_id = repo_with_sibling
+    repo_root = registry.get(repo_id).path
+    file_value = file_value.format(sibling=str(repo_root.resolve()) + "-private")
+    engine.run_cypher(
+        "CREATE (:Function {repo_id: $repo_id, name: 'escaper', file: $file, start_line: 1, end_line: 1})",
+        {"repo_id": repo_id, "file": file_value},
+    )
+
+    result = get_source(engine, registry, repo_id, "escaper")
+
+    assert result["source"] is None
+    assert result["file"] is None

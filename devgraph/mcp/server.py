@@ -30,7 +30,7 @@ see `record_tool_call` below. It exists because this process is short-lived
 and separate from the dashboard's, and the dashboard reads it back over
 `GET /api/mcp-telemetry`. Nothing about it leaves the machine.
 
-Run directly: `.venv/Scripts/python -m devgraph.mcp.server`
+Run directly: `.venv/Scripts/python -P -m devgraph.mcp.server`
 """
 
 from __future__ import annotations
@@ -321,8 +321,8 @@ def build_server(
             "repo_id (the id shown by `devgraph list`) and defaults to that repo only; "
             "pass cross_repo=true only when the user explicitly wants results across "
             "multiple registered repositories. Project-specific tools declared in a "
-            "repository's devgraph.tools.yaml are scoped to this session's repository "
-            "and take no repo_id; see devgraph://project-tools."
+            "repository's devgraph.tools.yaml (served only once the user trusts the file) are "
+            "scoped to this session's repository and take no repo_id; see devgraph://project-tools."
         ),
     )
 
@@ -592,7 +592,8 @@ def build_server(
         description=(
             f"Which repository this session serves {TOOLS_FILENAME} and global tools for, how it was "
             "chosen, which tools are served and where each comes from (global, project, or a "
-            "project override of a global tool), and notices about ignored or invalid declarations."
+            "project override of a global tool), whether the user trusts the project tools file, and "
+            "notices about ignored, invalid or untrusted declarations."
         ),
         mime_type="application/json",
     )
@@ -663,7 +664,7 @@ def main() -> None:
     Also starts the tray app (watcher + incremental indexer) as a detached
     background process if one isn't already running, so a registered repo's
     saved changes get reindexed without anyone manually running
-    `devgraph tray start` or `python -m devgraph.agent.tray` first. This is a
+    `devgraph tray start` or `python -P -m devgraph.agent.tray` first. This is a
     no-op when a tray process is already alive (per its PID file) — safe to
     call from every concurrently-connected MCP client's own server process,
     since an MCP client spawns one of these per connection (see this
@@ -678,7 +679,7 @@ def main() -> None:
     shutdown is refcounted across all of them instead. `devgraph tray stop`
     remains available to force a stop regardless of holders.
 
-    Run with: `.venv/Scripts/python -m devgraph.mcp.server`
+    Run with: `.venv/Scripts/python -P -m devgraph.mcp.server`
     """
     settings = get_settings()
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
