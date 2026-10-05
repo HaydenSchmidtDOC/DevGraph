@@ -121,8 +121,9 @@ def test_starter_lists_every_builtin_and_loads(tmp_path):
 def test_the_uncommented_example_is_valid(tmp_path):
     (tmp_path / SCHEMA_FILENAME).write_text(uncommented_example(starter_schema_text()))
     declaration = load_project_schema(tmp_path)
-    assert [n.label for n in declaration.node_types] == ["Runbook"]
-    assert [r.type for r in declaration.relationships] == ["DOCUMENTS"]
+    (runbook,) = declaration.node_types
+    assert runbook.label == "Runbook" and runbook.source.provider == "docs"
+    assert [(r.type, r.provider, r.field) for r in declaration.relationships] == [("RUNBOOK_FOR", "docs", "service")]
 
 
 def test_eject_writes_the_starter(runner, settings, tmp_path):

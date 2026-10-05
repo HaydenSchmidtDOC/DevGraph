@@ -5,9 +5,11 @@ extra node types and relationships on top of — or instead of — DevGraph's
 built-in labels. This module is that file's format, loader and fail-closed
 validator, and nothing more: resolving a project schema itself changes no
 indexing behaviour, opens no file the declaration names, and runs no code.
-Only the filesystem provider (devgraph/indexer/providers/filesystem.py) turns
-filesystem-sourced declarations into indexing; a custom provider declaration
-is validated as inert data only.
+Only the providers in devgraph/indexer/providers/ turn filesystem- and
+docs-sourced declarations into indexing; a docs source is plain data (globs,
+text conditions and a field map), never a pattern engine, because the file
+ships inside the repository and is not trust-gated. A custom provider
+declaration is validated as inert data only.
 
 Built-in labels, relationship types and constraint statements are always
 imported from `devgraph.graph.schema`, never restated here, so a repository
@@ -28,7 +30,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -61,18 +63,33 @@ EXTENDS_MODES: tuple[str, ...] = ("default", "none")
 #: Who produces a declared relationship. "builtin" reuses one of DevGraph's
 #: own relationship types; "custom" names an out-of-tree provider that this
 #: module records as data and never loads; "filesystem" links each
-#: filesystem node to its parent folder (devgraph/indexer/providers/).
-PROVIDER_KINDS: tuple[str, ...] = ("builtin", "custom", "filesystem")
+#: filesystem node to its parent folder; "docs" links a docs node to the
+#: nodes a front-matter field names (devgraph/indexer/providers/).
+PROVIDER_KINDS: tuple[str, ...] = ("builtin", "custom", "filesystem", "docs")
 
-#: Where a user-declared node type's nodes come from. Built-in labels are
-#: produced by DevGraph's own extractors and never declare a source.
-NODE_SOURCE_PROVIDERS: tuple[str, ...] = ("filesystem",)
+#: Where a user-declared node type's nodes come from: "filesystem" (one node
+#: per file or folder) or "docs" (one node per matching Markdown file, filled
+#: from its front matter). Built-in labels are produced by DevGraph's own
+#: extractors and never declare a source.
+NODE_SOURCE_PROVIDERS: tuple[str, ...] = ("filesystem", "docs")
 
 #: What a filesystem-sourced node type represents.
 FILESYSTEM_KINDS: tuple[str, ...] = ("file", "folder")
 
 #: The one key every filesystem node type must declare: its repo-relative path.
 FILESYSTEM_KEY: tuple[str, ...] = ("path",)
+
+#: The plain text tests a docs `where` condition may use. There is
+#: deliberately no regex: the schema is untrusted and `re` has no timeout.
+CONDITION_OPERATORS: tuple[str, ...] = ("is", "starts_with", "contains", "like")
+
+#: Bounds on a docs source, so a hostile schema can't make matching costly.
+MAX_DOCS_PATHS = 20
+MAX_GLOB_LENGTH = 200
+MAX_CONDITIONS = 20
+MAX_CONDITION_TEXT = 200
+MAX_FIELD_MAP = 50
+MAX_FRONT_MATTER_KEY_LENGTH = 64
 
 #: Value types a declared metadata field may hold.
 METADATA_TYPES: tuple[str, ...] = ("string", "integer", "float", "boolean")
@@ -107,7 +124,6 @@ _CONSTRAINT_NAME_PATTERN = re.compile(r"^(?:CREATE|DROP) CONSTRAINT (\w+) ")
 SchemaVersion = Literal[SCHEMA_VERSION]
 ExtendsMode = Literal[EXTENDS_MODES]
 ProviderKind = Literal[PROVIDER_KINDS]
-NodeSourceProvider = Literal[NODE_SOURCE_PROVIDERS]
 FilesystemKind = Literal[FILESYSTEM_KINDS]
 MetadataType = Literal[METADATA_TYPES]
 
@@ -163,13 +179,103 @@ def _check_color(value: object) -> object:
     return value
 
 
-class NodeSource(BaseModel):
-    """Where a user-declared node type's nodes are extracted from."""
+def _front_matter_key_problem(key: str) -> str | None:
+    """Why `key` can't name a front-matter key, in plain words, or None."""
+    if not 1 <= len(key) <= MAX_FRONT_MATTER_KEY_LENGTH:
+        return f"the front-matter key {key!r}, which must be 1 to {MAX_FRONT_MATTER_KEY_LENGTH} characters"
+    if any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in key):
+        return f"a front-matter key with a control character ({key!r})"
+    return None
+
+
+def _glob_problem(glob: str) -> str | None:
+    """Why `glob` can't be a docs `paths` entry, in plain words, or None."""
+    if not glob:
+        return "is empty"
+    if len(glob) > MAX_GLOB_LENGTH:
+        return f"is longer than {MAX_GLOB_LENGTH} characters"
+    if "\\" in glob:
+        return f"({glob!r}) contains a backslash; separate folders with /"
+    if glob.startswith("/"):
+        return f"({glob!r}) must be repo-relative: it may not start with /"
+    if ".." in glob.split("/"):
+        return f"({glob!r}) may not contain a '..' folder"
+    return None
+
+
+class FilesystemSource(BaseModel):
+    """A node type with one node per repository file or folder."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    provider: NodeSourceProvider
+    provider: Literal["filesystem"]
     kind: FilesystemKind
+
+
+class Condition(BaseModel):
+    """One docs `where` test: a front-matter field compared with plain text.
+
+    Exactly one operator is set (checked with the node type's label in
+    `NodeTypeDecl`). An integer or boolean operand is stored as its
+    canonical text, because values are compared as text on both sides.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", populate_by_name=True)
+
+    field: str
+    is_: str | None = Field(default=None, alias="is")
+    starts_with: str | None = None
+    contains: str | None = None
+    like: str | None = None
+
+    @field_validator("is_", "starts_with", "contains", "like", mode="before")
+    @classmethod
+    def _canonical_text(cls, value: object) -> object:
+        if type(value) is bool:
+            return "true" if value else "false"
+        if type(value) is int:
+            return str(value)
+        return value
+
+    @property
+    def operators(self) -> tuple[str, ...]:
+        """The operators set on this condition (exactly one once validated)."""
+        values = (self.is_, self.starts_with, self.contains, self.like)
+        return tuple(op for op, value in zip(CONDITION_OPERATORS, values) if value is not None)
+
+    @property
+    def operator(self) -> str:
+        return self.operators[0]
+
+    @property
+    def text(self) -> str:
+        return {"is": self.is_, "starts_with": self.starts_with, "contains": self.contains, "like": self.like}[
+            self.operator
+        ]
+
+
+class DocsSource(BaseModel):
+    """A node type with one node per matching Markdown file, from its front matter.
+
+    `paths` selects files by glob, `where` filters them on front-matter
+    values, and `fields` maps a metadata field to a differently named
+    front-matter key. The bounds are checked, with the label in the message,
+    by `NodeTypeDecl`.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    provider: Literal["docs"]
+    paths: tuple[str, ...]
+    where: tuple[Condition, ...] = ()
+    fields: dict[str, str] = Field(default_factory=dict)
+
+
+#: Where a user-declared node type's nodes are extracted from.
+NodeSource = Annotated[FilesystemSource | DocsSource, Field(discriminator="provider")]
+
+#: How each source provider is named in messages.
+_SOURCE_WORDS = {"filesystem": "the filesystem", "docs": "Markdown front matter"}
 
 
 class NodeTypeDecl(BaseModel):
@@ -237,18 +343,70 @@ class NodeTypeDecl(BaseModel):
                     f"not a declared metadata field"
                 )
         if self.source is not None:
+            origin = _SOURCE_WORDS[self.source.provider]
             if self.key != FILESYSTEM_KEY:
                 raise ValueError(
-                    f"node type {self.label!r} is sourced from the filesystem, so "
+                    f"node type {self.label!r} is sourced from {origin}, so "
                     f"its key must be exactly [path]: the provider writes one node "
                     f"per repo-relative path"
                 )
             if by_name["path"].type != "string":
                 raise ValueError(
-                    f"node type {self.label!r} is sourced from the filesystem, so "
+                    f"node type {self.label!r} is sourced from {origin}, so "
                     f"its path metadata field must be a string"
                 )
+        if isinstance(self.source, DocsSource):
+            self._check_docs_source(self.source, by_name)
         return self
+
+    def _check_docs_source(self, source: DocsSource, by_name: dict[str, MetadataField]) -> None:
+        label = self.label
+        if not 1 <= len(source.paths) <= MAX_DOCS_PATHS:
+            raise ValueError(
+                f"paths of {label!r} must list 1 to {MAX_DOCS_PATHS} globs; found "
+                f"{len(source.paths)} (use **/*.md for every folder)"
+            )
+        for index, glob in enumerate(source.paths):
+            problem = _glob_problem(glob)
+            if problem is not None:
+                raise ValueError(f"paths[{index}] of {label!r} {problem}")
+
+        if len(source.where) > MAX_CONDITIONS:
+            raise ValueError(
+                f"where of {label!r} lists {len(source.where)} conditions; at most {MAX_CONDITIONS}"
+            )
+        for index, condition in enumerate(source.where):
+            if len(condition.operators) != 1:
+                raise ValueError(
+                    f"where[{index}] of {label!r} must use exactly one of "
+                    f"{', '.join(CONDITION_OPERATORS)}"
+                )
+            if len(condition.text) > MAX_CONDITION_TEXT:
+                raise ValueError(
+                    f"where[{index}] of {label!r} compares with text longer than "
+                    f"{MAX_CONDITION_TEXT} characters"
+                )
+            problem = _front_matter_key_problem(condition.field)
+            if problem is not None:
+                raise ValueError(f"where[{index}] of {label!r} names {problem}")
+
+        if len(source.fields) > MAX_FIELD_MAP:
+            raise ValueError(
+                f"fields of {label!r} maps {len(source.fields)} fields; at most {MAX_FIELD_MAP}"
+            )
+        for name, key in source.fields.items():
+            if name == "path":
+                raise ValueError(
+                    f"fields of {label!r} maps 'path', which is always the file's "
+                    f"repo-relative path"
+                )
+            if name not in by_name:
+                raise ValueError(
+                    f"fields of {label!r} maps {name!r}, which is not a declared metadata field"
+                )
+            problem = _front_matter_key_problem(key)
+            if problem is not None:
+                raise ValueError(f"fields of {label!r} maps {name!r} to {problem}")
 
 
 class CustomProvider(BaseModel):
@@ -286,6 +444,7 @@ class RelationshipDecl(BaseModel):
     to: str
     provider: ProviderKind = "builtin"
     custom: CustomProvider | None = None
+    field: str | None = None
     color: str | None = Field(default=None, pattern=COLOR_PATTERN)
 
     _check_color = field_validator("color", mode="before")(_check_color)
@@ -319,6 +478,11 @@ class RelationshipDecl(BaseModel):
 
     @model_validator(mode="after")
     def _check_provider(self) -> RelationshipDecl:
+        if self.provider != "docs" and self.field is not None:
+            raise ValueError(
+                f"relationship {self.type!r} uses the {self.provider} provider; "
+                f"only docs relationships take a 'field'"
+            )
         if self.provider == "builtin":
             if self.custom is not None:
                 raise ValueError(
@@ -345,14 +509,23 @@ class RelationshipDecl(BaseModel):
         else:
             if self.custom is not None:
                 raise ValueError(
-                    f"relationship {self.type!r} uses the filesystem provider, "
+                    f"relationship {self.type!r} uses the {self.provider} provider, "
                     f"which must not declare a custom block"
                 )
             if self.type in RELATIONSHIP_TYPES:
                 raise ValueError(
                     f"relationship type {self.type!r} is built-in and cannot be "
-                    f"redeclared by the filesystem provider"
+                    f"redeclared by the {self.provider} provider"
                 )
+            if self.provider == "docs":
+                if self.field is None:
+                    raise ValueError(
+                        f"relationship {self.type!r} uses the docs provider, so it "
+                        f"needs a 'field': the front-matter key naming the target"
+                    )
+                problem = _front_matter_key_problem(self.field)
+                if problem is not None:
+                    raise ValueError(f"relationship {self.type!r} field is {problem}")
         return self
 
 
@@ -406,7 +579,7 @@ class ProjectSchema(BaseModel):
     def _check_filesystem(self) -> ProjectSchema:
         by_kind: dict[str, str] = {}
         for node_type in self.node_types:
-            if node_type.source is None:
+            if not isinstance(node_type.source, FilesystemSource):
                 continue
             kind = node_type.source.kind
             if kind in by_kind:
@@ -436,6 +609,20 @@ class ProjectSchema(BaseModel):
                     raise ValueError(
                         f"filesystem relationship {relationship.type!r} from label "
                         f"{label!r} is not a filesystem node type"
+                    )
+        return self
+
+    @model_validator(mode="after")
+    def _check_docs(self) -> ProjectSchema:
+        docs_labels = {n.label for n in self.node_types if isinstance(n.source, DocsSource)}
+        for relationship in self.relationships:
+            if relationship.provider != "docs":
+                continue
+            for label in relationship.from_labels:
+                if label not in docs_labels:
+                    raise ValueError(
+                        f"docs relationship {relationship.type!r} from label {label!r} "
+                        f"is not a node type sourced from Markdown front matter"
                     )
         return self
 
@@ -699,8 +886,11 @@ _STARTER_TEMPLATE = """\
 # Declares extra node types and relationships for this repository on top of
 # DevGraph's built-in schema. Check it with `devgraph config validate`, see
 # the effective schema with `devgraph config show`, and apply it with
-# `devgraph rescan <repo_id>`. Today a declared node type gets a uniqueness
-# constraint on its key; extraction of user-defined types comes later.
+# `devgraph rescan <repo_id>`. A declared node type gets a uniqueness
+# constraint on its key. Node types with a `source` are indexed:
+# `provider: filesystem` makes one node per file or folder, and
+# `provider: docs` makes one node per matching Markdown file, filled from its
+# Markdown front matter. Nothing in this file is ever run as code.
 #
 # Built-in node labels (inherited with `extends: default`; never redeclare one):
 {labels}
@@ -714,20 +904,27 @@ extends: default
 
 # node_types:
 #   - label: Runbook
-#     key: [slug]
+#     key: [path]
 #     metadata:
-#       - name: slug
-#         type: string
-#         required: true
-#       - name: owner
+#       - {{name: path}}
+#       - {{name: owner, required: true}}
+#       - {{name: severity, type: integer}}
+#       - {{name: on_call}}
 #     color: "#1f77b4"   # optional #rrggbb display colour (also valid on relationships)
+#     source:
+#       provider: docs
+#       paths: ["runbooks/**/*.md"]          # 1-20 repo-relative globs; **/*.md for every folder
+#       where:                               # optional, at most 20; all must hold
+#         - {{field: type, is: runbook}}       # also starts_with, contains, like (* wildcard)
+#         - {{field: title, starts_with: "RB-"}}
+#       fields: {{on_call: on-call-team}}      # optional; metadata name -> front-matter key
 #
 # relationships:
-#   - type: DOCUMENTS
-#     provider: custom
-#     custom: {{name: runbook_links}}
+#   - type: RUNBOOK_FOR
+#     provider: docs
 #     from: Runbook
 #     to: Service
+#     field: service                         # front-matter key naming the target
 """
 
 

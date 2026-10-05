@@ -2,7 +2,7 @@
 
 The form is written by hand (spec G2b-3 §2.9), so nothing ties it to the
 models except this test: a field or enum value added to `CypherTool`,
-`ToolParameter`, `NodeTypeDecl`, `MetadataField`, `NodeSource`,
+`ToolParameter`, `NodeTypeDecl`, `MetadataField`, `FilesystemSource`,
 `RelationshipDecl` or `CustomProvider` fails here
 until the form models it (or such entries are made to open as YAML), and the
 patterns and limits behind the form's advisory hints must be the validators'
@@ -19,12 +19,17 @@ from pathlib import Path
 import pytest
 
 from devgraph.config import project_schema, project_tools
-from devgraph.config.project_schema import CustomProvider, MetadataField, NodeSource, NodeTypeDecl, RelationshipDecl
+from devgraph.config.project_schema import CustomProvider, FilesystemSource, MetadataField, NodeTypeDecl, RelationshipDecl
 from devgraph.config.project_tools import CypherTool, ToolParameter
 
 pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 
 _SCRIPT = Path(__file__).with_name("config_form_dump.js")
+
+# The form doesn't edit docs sources or docs relationships yet: their
+# `provider` value is outside the form's lists, so such entries refuse into
+# YAML. These exclusions go when the form models them.
+_NOT_YET_IN_FORM = {"relationship": {"field"}}
 
 
 @pytest.fixture(scope="module")
@@ -47,13 +52,13 @@ def dumped() -> dict:
         ("parameter", ToolParameter),
         ("node_type", NodeTypeDecl),
         ("metadata", MetadataField),
-        ("source", NodeSource),
+        ("source", FilesystemSource),
         ("relationship", RelationshipDecl),
         ("custom", CustomProvider),
     ],
 )
 def test_form_fields_are_the_model_properties(dumped, form_key, model):
-    properties = model.model_json_schema(by_alias=True)["properties"]
+    properties = set(model.model_json_schema(by_alias=True)["properties"]) - _NOT_YET_IN_FORM.get(form_key, set())
     assert sorted(dumped["fields"][form_key]) == sorted(properties)
 
 
@@ -62,8 +67,8 @@ def test_form_enums_are_the_model_enums(dumped):
     assert fields["parameter_types"] == list(project_tools.PARAMETER_TYPES)
     assert fields["metadata_types"] == list(project_schema.METADATA_TYPES)
     assert fields["filesystem_kinds"] == list(project_schema.FILESYSTEM_KINDS)
-    assert fields["source_providers"] == list(project_schema.NODE_SOURCE_PROVIDERS)
-    assert fields["relationship_providers"] == list(project_schema.PROVIDER_KINDS)
+    assert fields["source_providers"] == [p for p in project_schema.NODE_SOURCE_PROVIDERS if p != "docs"]
+    assert fields["relationship_providers"] == [p for p in project_schema.PROVIDER_KINDS if p != "docs"]
 
 
 def test_form_limits_are_the_validators_limits(dumped):

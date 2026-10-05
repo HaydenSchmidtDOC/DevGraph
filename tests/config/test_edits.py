@@ -545,3 +545,74 @@ def test_enabling_and_bare_repos_have_no_warnings(tmp_path, no_registry, store):
     assert edits.project_config_change(record(path=tmp_path), False)[0] == []
     (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
     assert edits.project_config_change(record(path=tmp_path, project_config_enabled=False), True)[0] == []
+
+
+# --- provider-aware source change warnings ---------------------------------
+
+FS_FILE = {"provider": "filesystem", "kind": "file"}
+DOCS_SRC = {"provider": "docs", "paths": ["runbooks/**/*.md"], "where": [{"field": "type", "is": "runbook"}]}
+
+
+def sourced(source):
+    from devgraph.config.project_schema import ProjectSchema
+
+    node = {"label": "Runbook", "key": ["path"], "metadata": [{"name": "path"}]}
+    if source is not None:
+        node["source"] = source
+    return ProjectSchema.model_validate({"version": 1, "node_types": [node]})
+
+
+@pytest.mark.parametrize(
+    "before, after, expected",
+    [
+        (FS_FILE, DOCS_SRC, "Runbook (filesystem -> docs)"),
+        (DOCS_SRC, FS_FILE, "Runbook (docs -> filesystem)"),
+        (DOCS_SRC, None, "Runbook (source removed)"),
+        (DOCS_SRC, {**DOCS_SRC, "paths": ["**/*.md"]}, "Runbook (paths changed)"),
+        (DOCS_SRC, {**DOCS_SRC, "where": [{"field": "type", "is": "policy"}]}, "Runbook (conditions changed)"),
+        (DOCS_SRC, {"provider": "docs", "paths": ["**/*.md"]}, "Runbook (paths and conditions changed)"),
+        (FS_FILE, {**FS_FILE, "kind": "folder"}, "Runbook (kind file -> folder)"),
+        (FS_FILE, None, "Runbook (source removed)"),
+    ],
+    ids=["fs->docs", "docs->fs", "docs->none", "docs paths", "docs where", "docs both", "fs kind", "fs->none"],
+)
+def test_pruned_types_covers_every_source_transition(before, after, expected):
+    assert edits.pruned_types(sourced(before), sourced(after)) == [expected]
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        DOCS_SRC,
+        {**DOCS_SRC, "fields": {}},
+        {**DOCS_SRC, "where": [{"field": "type", "is": "runbook"}]},
+    ],
+)
+def test_pruned_types_ignores_unchanged_docs_sources(after):
+    assert edits.pruned_types(sourced(DOCS_SRC), sourced(after)) == []
+
+
+def test_canonical_condition_text_is_not_a_change():
+    one = {**DOCS_SRC, "where": [{"field": "version", "is": 1}]}
+    assert edits.pruned_types(sourced(one), sourced({**one, "where": [{"field": "version", "is": "1"}]})) == []
+
+
+def test_source_change_warnings_name_the_provider():
+    fs_to_docs = edits.schema_change_warnings(sourced(FS_FILE), sourced(DOCS_SRC), record())
+    assert any("whose filesystem source changed: Runbook (filesystem -> docs)" in w for w in fs_to_docs)
+    assert any("the next rescan rebuilds Runbook entries from Markdown front matter" in w for w in fs_to_docs)
+
+    narrowed = edits.schema_change_warnings(sourced(DOCS_SRC), sourced({**DOCS_SRC, "paths": ["x/*.md"]}), None)
+    assert any("whose Markdown front-matter source changed: Runbook (paths changed)" in w for w in narrowed)
+    assert any("applying this schema rebuilds Runbook entries from Markdown front matter" in w for w in narrowed)
+
+    removed = edits.schema_change_warnings(sourced(DOCS_SRC), sourced(None), record())
+    assert any("whose Markdown front-matter source changed: Runbook (source removed)" in w for w in removed)
+    assert not any("rebuilds" in w for w in removed)
+
+
+def test_schema_entry_notes_name_both_providers():
+    (note,) = edits.schema_entry_notes({"label": "Ticket"})
+    assert "no provider produces Ticket nodes yet" in note
+    assert "provider: filesystem" in note and "provider: docs" in note and "Markdown front matter" in note
+    assert edits.schema_entry_notes({"label": "Runbook", "source": DOCS_SRC}) == []

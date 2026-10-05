@@ -118,7 +118,7 @@ def test_list_json_shape(runner, settings, repo):
     assert ticket == {"label": "Ticket", "origin": "project", "key": ["id"], "source": None, "color": None}
     assert any(n["label"] == "Function" and n["origin"] == "built-in" for n in data["node_types"])
     rel = next(r for r in data["relationships"] if r["origin"] == "project")
-    assert rel == {"type": "USES", "from": ["Ticket"], "to": "Function", "provider": "builtin", "origin": "project", "color": None}
+    assert rel == {"type": "USES", "from": ["Ticket"], "to": "Function", "provider": "builtin", "field": None, "origin": "project", "color": None}
 
 
 def test_list_disabled_repo_says_so(runner, settings, repo):
@@ -571,3 +571,63 @@ def test_reset_refuses_a_symlinked_file(runner, repo, tmp_path):
     result = run(runner, "reset", "--yes", "--repo", str(repo))
     assert result.exit_code == 1 and "symlink" in flat(result.output)
     assert schema_file(repo).is_symlink() and real.read_text() == SCHEMA
+
+
+DOCS_SCHEMA = textwrap.dedent("""\
+    version: 1
+    node_types:
+      - label: Runbook
+        key: [path]
+        metadata:
+          - {name: path}
+          - {name: on_call}
+        source:
+          provider: docs
+          paths: ["runbooks/**/*.md", "ops/*.md"]
+          where:
+            - {field: version, is: 1}
+          fields: {on_call: on-call-team}
+    relationships:
+      - type: RUNBOOK_FOR
+        provider: docs
+        from: Runbook
+        to: Service
+        field: service
+""")
+
+
+def test_list_shows_a_docs_source(runner, settings, repo):
+    register(settings, repo)
+    schema_file(repo).write_text(DOCS_SCHEMA)
+    data = json.loads(run(runner, "list", "--repo", str(repo), "--json").output)
+    runbook = next(n for n in data["node_types"] if n["label"] == "Runbook")
+    assert runbook["source"] == {
+        "provider": "docs",
+        "paths": ["runbooks/**/*.md", "ops/*.md"],
+        "where": [{"field": "version", "is": "1"}],
+        "fields": {"on_call": "on-call-team"},
+    }
+    rel = next(r for r in data["relationships"] if r["type"] == "RUNBOOK_FOR")
+    assert rel["provider"] == "docs" and rel["field"] == "service"
+    assert all(r["field"] is None for r in data["relationships"] if r["type"] != "RUNBOOK_FOR")
+    out = flat(run(runner, "list", "--repo", str(repo)).output)
+    assert "docs (runbooks/**/*.md, ops/*.md)" in out
+    assert "docs (service)" in out
+
+
+def test_edit_moving_a_type_to_docs_warns_it_is_rebuilt(runner, settings, repo, tmp_path):
+    register(settings, repo)
+    schema_file(repo).write_text(FS_SCHEMA)
+    docs_doc = FS_DOC.split("source:")[0] + "source:\n  provider: docs\n  paths: ['**/*.md']\n"
+    result = run(runner, "edit", "Doc", "--from", src(tmp_path, docs_doc), "--repo", str(repo))
+    assert result.exit_code == 0, result.output
+    out = flat(result.output)
+    assert "whose filesystem source changed: Doc (filesystem -> docs)" in out
+    assert "the next rescan rebuilds Doc entries from Markdown front matter" in out
+
+
+def test_list_escapes_markup_in_docs_globs(runner, settings, repo):
+    register(settings, repo)
+    schema_file(repo).write_text(DOCS_SCHEMA.replace('"ops/*.md"', '"[red]ops[/red]/*.md"'))
+    out = flat(run(runner, "list", "--repo", str(repo)).output)
+    assert "[red]ops[/red]/*.md" in out

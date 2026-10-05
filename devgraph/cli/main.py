@@ -2550,7 +2550,7 @@ def config_schema_list(
     if declaration is None or declaration.extends == "default":
         node_types += [{"label": n, "origin": "built-in", "key": None, "source": None, "color": None} for n in NODE_LABELS]
         relationships += [
-            {"type": t, "from": None, "to": None, "provider": "builtin", "origin": "built-in", "color": None}
+            {"type": t, "from": None, "to": None, "provider": "builtin", "field": None, "origin": "built-in", "color": None}
             for t in RELATIONSHIP_TYPES
         ]
     node_types += [
@@ -2558,13 +2558,16 @@ def config_schema_list(
             "label": n.label,
             "origin": "project",
             "key": list(n.key),
-            "source": {"provider": n.source.provider, "kind": n.source.kind} if n.source else None,
+            "source": n.source.model_dump(mode="json", by_alias=True, exclude_none=True) if n.source else None,
             "color": n.color,
         }
         for n in effective.node_types
     ]
     relationships += [
-        {"type": r.type, "from": list(r.from_labels), "to": r.to, "provider": r.provider, "origin": "project", "color": r.color}
+        {
+            "type": r.type, "from": list(r.from_labels), "to": r.to, "provider": r.provider, "field": r.field,
+            "origin": "project", "color": r.color,
+        }
         for r in effective.relationships
     ]
 
@@ -2581,7 +2584,7 @@ def config_schema_list(
         source = row["source"]
         nodes.add_row(
             escape(row["label"]), row["origin"], escape(", ".join(row["key"] or ())),
-            f"{source['provider']} ({source['kind']})" if source else "\u2014",
+            escape(f"{source['provider']} ({source.get('kind') or ', '.join(source.get('paths', ()))})") if source else "\u2014",
             row["color"] or "\u2014",
         )
     console.print(nodes)
@@ -2590,7 +2593,8 @@ def config_schema_list(
         rels.add_column(column, style="cyan" if column == "Type" else None)
     for row in relationships:
         rels.add_row(
-            escape(row["type"]), row["origin"], escape(", ".join(row["from"] or ())), escape(row["to"] or ""), row["provider"], row["color"] or "\u2014"
+            escape(row["type"]), row["origin"], escape(", ".join(row["from"] or ())), escape(row["to"] or ""),
+            escape(f"{row['provider']} ({row['field']})" if row["field"] else row["provider"]), row["color"] or "\u2014"
         )
     console.print(rels)
     if not project_config_enabled(root):
