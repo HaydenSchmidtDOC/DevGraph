@@ -1,6 +1,5 @@
 """Unit tests for API extractor."""
 
-import pytest
 
 from devgraph.indexer.apis.extractor import APIExtractor
 

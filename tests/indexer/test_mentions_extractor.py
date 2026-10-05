@@ -51,7 +51,7 @@ The MyClass is defined elsewhere.
         assert "call_helper" in names
 
     def test_call_syntax_match(self):
-        """Detect a name used in call syntax (Name\s*\()."""
+        r"""Detect a name used in call syntax (Name\s*\()."""
         content = "You can call process_data() directly in your code."
         known_entities = [("process_data", "Function")]
 
@@ -282,7 +282,7 @@ The MyClass is defined elsewhere.
         known_entities = [("Entity", "Class")]
 
         extractor_invalid = MentionsExtractor(self.repo_id, ambiguous_mode="bogus")
-        result = extractor_invalid.extract_from_source(content, "test.md", known_entities)
+        extractor_invalid.extract_from_source(content, "test.md", known_entities)
 
         # Check that warning was logged (caplog captures logging output)
         assert any("bogus" in record.message for record in caplog.records if record.levelname == "WARNING")

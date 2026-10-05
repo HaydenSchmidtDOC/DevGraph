@@ -8,7 +8,6 @@ All Cypher is parameterized — user input never concatenates directly into
 query strings.
 """
 
-from pathlib import Path
 from typing import Any
 
 import git
@@ -1411,7 +1410,7 @@ def find_mentions(
         return _envelope([], max_results)
 
     # Build label filter using node label check (not parameterized label in node pattern)
-    label_filter = f"AND $label IN labels(target)" if label else ""
+    label_filter = "AND $label IN labels(target)" if label else ""
 
     if direction == "mentions":
         # Document mentions target: (d:Document {name: $name})-[:MENTIONS]->(target)

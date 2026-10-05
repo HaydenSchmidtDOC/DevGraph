@@ -3,7 +3,7 @@
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Set
+from typing import List, Set
 
 
 class DatastoreType(str, Enum):

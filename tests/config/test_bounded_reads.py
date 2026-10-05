@@ -11,7 +11,7 @@ from contextlib import contextmanager
 import pytest
 
 from devgraph import paths
-from devgraph.config import global_tools, project_schema, project_tools
+from devgraph.config import global_tools
 from devgraph.config.project_schema import SCHEMA_FILENAME, ProjectSchemaError, load_project_schema, schema_file_hash
 from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError, load_project_tools
 from devgraph.mcp.tool_plane import tools_fingerprint

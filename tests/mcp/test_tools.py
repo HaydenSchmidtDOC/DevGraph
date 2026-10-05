@@ -13,7 +13,6 @@ import pytest
 from devgraph.graph.engine import GraphEngine
 from devgraph.mcp.tools import (
     search_component,
-    trace_request_flow,
     get_service_dependencies,
     find_callers,
     find_related_files,
