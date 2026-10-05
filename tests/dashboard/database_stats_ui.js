@@ -63,6 +63,7 @@ const bootGlobals = {
   neo4jStatus: mkEl(""),
   legendStatus: mkEl(""),
   populateRealRepos: async () => {},
+  loadSchemaTypes: async () => {},
   refreshGraph: async () => {},
   loadGitHistory: () => {},
   attemptQueryTelemetry: async () => {},

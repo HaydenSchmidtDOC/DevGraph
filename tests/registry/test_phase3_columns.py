@@ -144,3 +144,38 @@ def test_mentions_coexists_with_other_flags(registry, temp_git_repo):
     assert fetched.mentions_enabled is True
     assert fetched.pr_source_enabled is True
     assert fetched.issue_source_enabled is True
+
+
+def test_project_config_enabled_defaults_on_and_persists(temp_git_repo):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Path(tmpdir) / "registry.db"
+        reg = RepoRegistry(db)
+        record = reg.add_repo(temp_git_repo)
+        assert record.project_config_enabled is True
+        assert reg.get(record.repo_id).project_config_enabled is True
+        reg.set_project_config_enabled(record.repo_id, False)
+        reg.close()
+
+        reopened = RepoRegistry(db)
+        assert reopened.get(record.repo_id).project_config_enabled is False
+        reopened.close()
+
+
+def test_pre_migration_db_gains_project_config_enabled_default_true():
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Path(tmpdir) / "registry.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE repos (repo_id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, "
+            "active INTEGER NOT NULL DEFAULT 1, watch_enabled INTEGER NOT NULL DEFAULT 1, "
+            "last_indexed TEXT)"
+        )
+        conn.execute("INSERT INTO repos (repo_id, path) VALUES ('old', '/x/old')")
+        conn.commit()
+        conn.close()
+
+        reg = RepoRegistry(db)
+        assert reg.get("old").project_config_enabled is True
+        reg.close()

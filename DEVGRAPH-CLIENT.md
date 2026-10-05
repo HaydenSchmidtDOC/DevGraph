@@ -224,6 +224,32 @@ fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
 than the default. `search_component`'s `count` maxes out at 50 (its own
 Cypher cap) even if more matches exist beyond that.
 
+**Project tools**: if this repo has a `devgraph.tools.yaml`, the MCP session
+also serves its tools for the session's repository (`DEVGRAPH_MCP_REPO`, else
+the server's working directory). Read `devgraph://project-tools` for what is
+served. The server checks the file every 2 seconds and serves the new set
+without a restart, telling the client its tool list changed (clients that
+support `tools/list_changed` re-list automatically); an invalid save keeps the
+last good tools and records a notice (see `devgraph://project-tools`). Pin a project with
+`claude mcp add devgraph -e DEVGRAPH_MCP_REPO=<repo_id> -- "<venv python>" -m devgraph.mcp.server`.
+A path value must be absolute (a relative value is read as a repo id), and a value
+that matches no active registered repository serves nothing. A repository whose project config is disabled (`devgraph config disable`) serves no project tools; `devgraph://project-tools` says so. If `devgraph` is already
+registered in that project, run `claude mcp remove devgraph` first.
+
+**Global tools**: tools defined once with `devgraph config tools ... --global`
+are also served in every session scoped to a repository (an unscoped session
+serves none). Built-in tools win, then project tools, then global tools. Two
+notices can appear in a tool's response envelope: `resolved: project override
+of global tool '<name>'` (the project's tool replaced a global one) and `used
+global tool '<name>': <reason>` (the global tool is served because the project
+tool of that name could not be). A built-in tool whose name a project or global
+tool also uses says so in a `notices` list in each response:
+`ignored: project tool '<name>' shadows a locked tool; using the fixed
+implementation` (or `global tool`). Built-ins that return a list
+(`find_requirements_for`, `blame_component`, `run_cypher`) can't carry it;
+`devgraph://project-tools` reports it for them. `devgraph://project-tools` lists each served
+tool's origin and the global tools file.
+
 `run_cypher` will not appear unless DevGraph's own config has
 `enable_run_cypher=true` set. If it's missing and you need something the
 purpose-built tools genuinely can't express, that's a signal a new high-level

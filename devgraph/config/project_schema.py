@@ -3,9 +3,11 @@
 A repository may place a `devgraph.schema.yaml` file at its root to declare
 extra node types and relationships on top of — or instead of — DevGraph's
 built-in labels. This module is that file's format, loader and fail-closed
-validator, and nothing more: resolving a project schema changes no indexing
-behaviour, opens no file the declaration names, and runs no code. A custom
-provider declaration is validated as inert data only.
+validator, and nothing more: resolving a project schema itself changes no
+indexing behaviour, opens no file the declaration names, and runs no code.
+Only the filesystem provider (devgraph/indexer/providers/filesystem.py) turns
+filesystem-sourced declarations into indexing; a custom provider declaration
+is validated as inert data only.
 
 Built-in labels, relationship types and constraint statements are always
 imported from `devgraph.graph.schema`, never restated here, so a repository
@@ -21,12 +23,12 @@ the loader there would pull `devgraph.graph` — and with it the Neo4j driver
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -36,6 +38,9 @@ from pydantic import (
     model_validator,
 )
 
+from devgraph.config.project_switch import project_config_enabled
+from devgraph.config.project_tools import YAML_LOAD_ERRORS
+from devgraph.config.yaml_bound import bounded_safe_load
 from devgraph.graph.schema import (
     NODE_LABELS,
     RELATIONSHIP_TYPES,
@@ -53,8 +58,19 @@ EXTENDS_MODES: tuple[str, ...] = ("default", "none")
 
 #: Who produces a declared relationship. "builtin" reuses one of DevGraph's
 #: own relationship types; "custom" names an out-of-tree provider that this
-#: unit records as data and never loads.
-PROVIDER_KINDS: tuple[str, ...] = ("builtin", "custom")
+#: module records as data and never loads; "filesystem" links each
+#: filesystem node to its parent folder (devgraph/indexer/providers/).
+PROVIDER_KINDS: tuple[str, ...] = ("builtin", "custom", "filesystem")
+
+#: Where a user-declared node type's nodes come from. Built-in labels are
+#: produced by DevGraph's own extractors and never declare a source.
+NODE_SOURCE_PROVIDERS: tuple[str, ...] = ("filesystem",)
+
+#: What a filesystem-sourced node type represents.
+FILESYSTEM_KINDS: tuple[str, ...] = ("file", "folder")
+
+#: The one key every filesystem node type must declare: its repo-relative path.
+FILESYSTEM_KEY: tuple[str, ...] = ("path",)
 
 #: Value types a declared metadata field may hold.
 METADATA_TYPES: tuple[str, ...] = ("string", "integer", "float", "boolean")
@@ -75,6 +91,12 @@ PROPERTY_NAME_PATTERN = re.compile(rf"[a-z][a-z0-9_]{{0,{_BOUND}}}")
 #: suffixes, because a user key is not necessarily `name`.
 USER_CONSTRAINT_SUFFIX = "_repo_key"
 
+#: Suffix for the lookup index generated for a filesystem-sourced node type.
+#: The provider MERGEs and MATCHes on (repo_id, name) while the declared key
+#: constraint covers (repo_id, path), so without this every write is a label
+#: scan across all repositories. Indexes share a name space with constraints.
+FILESYSTEM_INDEX_SUFFIX = "_repo_name"
+
 _CONSTRAINT_NAME_PATTERN = re.compile(r"^(?:CREATE|DROP) CONSTRAINT (\w+) ")
 
 # Literal aliases are derived from the constants above rather than
@@ -83,6 +105,8 @@ _CONSTRAINT_NAME_PATTERN = re.compile(r"^(?:CREATE|DROP) CONSTRAINT (\w+) ")
 SchemaVersion = Literal[SCHEMA_VERSION]
 ExtendsMode = Literal[EXTENDS_MODES]
 ProviderKind = Literal[PROVIDER_KINDS]
+NodeSourceProvider = Literal[NODE_SOURCE_PROVIDERS]
+FilesystemKind = Literal[FILESYSTEM_KINDS]
 MetadataType = Literal[METADATA_TYPES]
 
 ScalarParam = str | int | float | bool | None
@@ -128,6 +152,24 @@ class MetadataField(BaseModel):
         return value
 
 
+COLOR_PATTERN = r"^#[0-9a-fA-F]{6}$"
+
+
+def _check_color(value: object) -> object:
+    if isinstance(value, str) and not re.fullmatch(COLOR_PATTERN, value):
+        raise ValueError(f"color {value!r} must be a hex colour written as #rrggbb")
+    return value
+
+
+class NodeSource(BaseModel):
+    """Where a user-declared node type's nodes are extracted from."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    provider: NodeSourceProvider
+    kind: FilesystemKind
+
+
 class NodeTypeDecl(BaseModel):
     """A user-declared node label with a stable key and metadata fields."""
 
@@ -137,6 +179,10 @@ class NodeTypeDecl(BaseModel):
     key: tuple[str, ...]
     metadata: tuple[MetadataField, ...] = ()
     description: str | None = None
+    source: NodeSource | None = None
+    color: str | None = Field(default=None, pattern=COLOR_PATTERN)
+
+    _check_color = field_validator("color", mode="before")(_check_color)
 
     @field_validator("label")
     @classmethod
@@ -188,6 +234,18 @@ class NodeTypeDecl(BaseModel):
                     f"node type {self.label!r} key component {component!r} is "
                     f"not a declared metadata field"
                 )
+        if self.source is not None:
+            if self.key != FILESYSTEM_KEY:
+                raise ValueError(
+                    f"node type {self.label!r} is sourced from the filesystem, so "
+                    f"its key must be exactly [path]: the provider writes one node "
+                    f"per repo-relative path"
+                )
+            if by_name["path"].type != "string":
+                raise ValueError(
+                    f"node type {self.label!r} is sourced from the filesystem, so "
+                    f"its path metadata field must be a string"
+                )
         return self
 
 
@@ -222,20 +280,40 @@ class RelationshipDecl(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     type: str
-    from_: str = Field(alias="from")
+    from_: str | tuple[str, ...] = Field(alias="from")
     to: str
     provider: ProviderKind = "builtin"
     custom: CustomProvider | None = None
+    color: str | None = Field(default=None, pattern=COLOR_PATTERN)
+
+    _check_color = field_validator("color", mode="before")(_check_color)
 
     @field_validator("type")
     @classmethod
     def _check_type(cls, value: str) -> str:
         return _require_identifier(value, RELATIONSHIP_TYPE_PATTERN, "relationship type")
 
-    @field_validator("from_", "to")
+    @field_validator("to")
     @classmethod
     def _check_endpoint(cls, value: str) -> str:
         return _require_identifier(value, LABEL_PATTERN, "relationship endpoint label")
+
+    @field_validator("from_")
+    @classmethod
+    def _check_from(cls, value: str | tuple[str, ...]) -> str | tuple[str, ...]:
+        labels = (value,) if isinstance(value, str) else value
+        if not labels:
+            raise ValueError("relationship 'from' must name at least one label")
+        if len(set(labels)) != len(labels):
+            raise ValueError("relationship 'from' lists a label more than once")
+        for label in labels:
+            _require_identifier(label, LABEL_PATTERN, "relationship endpoint label")
+        return value
+
+    @property
+    def from_labels(self) -> tuple[str, ...]:
+        """`from` as a tuple, whether it was written as one label or a list."""
+        return (self.from_,) if isinstance(self.from_, str) else tuple(self.from_)
 
     @model_validator(mode="after")
     def _check_provider(self) -> RelationshipDecl:
@@ -251,7 +329,7 @@ class RelationshipDecl(BaseModel):
                     f"not a built-in relationship type; known types are "
                     f"{', '.join(RELATIONSHIP_TYPES)}"
                 )
-        else:
+        elif self.provider == "custom":
             if self.custom is None:
                 raise ValueError(
                     f"relationship {self.type!r} uses the custom provider, which "
@@ -261,6 +339,17 @@ class RelationshipDecl(BaseModel):
                 raise ValueError(
                     f"relationship type {self.type!r} is built-in and cannot be "
                     f"redeclared by a custom provider"
+                )
+        else:
+            if self.custom is not None:
+                raise ValueError(
+                    f"relationship {self.type!r} uses the filesystem provider, "
+                    f"which must not declare a custom block"
+                )
+            if self.type in RELATIONSHIP_TYPES:
+                raise ValueError(
+                    f"relationship type {self.type!r} is built-in and cannot be "
+                    f"redeclared by the filesystem provider"
                 )
         return self
 
@@ -311,6 +400,43 @@ class ProjectSchema(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_filesystem(self) -> ProjectSchema:
+        by_kind: dict[str, str] = {}
+        for node_type in self.node_types:
+            if node_type.source is None:
+                continue
+            kind = node_type.source.kind
+            if kind in by_kind:
+                raise ValueError(
+                    f"node types {by_kind[kind]!r} and {node_type.label!r} are both "
+                    f"filesystem {kind} types; declare at most one"
+                )
+            by_kind[kind] = node_type.label
+
+        filesystem_relationships = [r for r in self.relationships if r.provider == "filesystem"]
+        if len(filesystem_relationships) > 1:
+            raise ValueError(
+                "at most one filesystem relationship may be declared; found "
+                + ", ".join(repr(r.type) for r in filesystem_relationships)
+            )
+        filesystem_labels = set(by_kind.values())
+        folder = by_kind.get("folder")
+        for relationship in filesystem_relationships:
+            if folder is None or relationship.to != folder:
+                where = f" {folder!r}" if folder else ", and none is declared"
+                raise ValueError(
+                    f"filesystem relationship {relationship.type!r} must point to "
+                    f"the filesystem folder node type{where}"
+                )
+            for label in relationship.from_labels:
+                if label not in filesystem_labels:
+                    raise ValueError(
+                        f"filesystem relationship {relationship.type!r} from label "
+                        f"{label!r} is not a filesystem node type"
+                    )
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class EffectiveSchema:
@@ -332,12 +458,26 @@ class EffectiveSchema:
         statements = (
             list(builtin_constraint_statements()) if self.extends == "default" else []
         )
-        statements.extend(_user_constraint_statement(n) for n in self.node_types)
+        for node_type in self.node_types:
+            statements.append(_user_constraint_statement(node_type))
+            if node_type.source is not None:
+                statements.append(_filesystem_index_statement(node_type))
         return statements
 
 
 def _user_constraint_name(label: str) -> str:
     return f"{label.lower()}{USER_CONSTRAINT_SUFFIX}"
+
+
+def _filesystem_index_name(label: str) -> str:
+    return f"{label.lower()}{FILESYSTEM_INDEX_SUFFIX}"
+
+
+def _filesystem_index_statement(node_type: NodeTypeDecl) -> str:
+    return (
+        f"CREATE INDEX {_filesystem_index_name(node_type.label)} IF NOT EXISTS "
+        f"FOR (n:{node_type.label}) ON (n.repo_id, n.name)"
+    )
 
 
 def _user_constraint_statement(node_type: NodeTypeDecl) -> str:
@@ -370,13 +510,40 @@ def project_schema_path(repo_root: Path) -> Path:
     return Path(repo_root) / SCHEMA_FILENAME
 
 
-def load_project_schema(repo_root: Path) -> ProjectSchema | None:
+#: `schema_file_hash` of a repository with no schema file.
+ABSENT_SCHEMA_HASH = "absent"
+
+
+def schema_file_hash(repo_root: Path) -> str:
+    """Fingerprint of the schema file's bytes: `sha256:<hex>`, or `absent`.
+
+    An unreadable path (a directory, a permission error) gets a distinct
+    `unreadable:<error>` value so it never equals a hash the graph was
+    actually built with. A repository whose project config is switched off
+    reports `absent`.
+    """
+    if not project_config_enabled(repo_root):
+        return ABSENT_SCHEMA_HASH
+    path = project_schema_path(repo_root)
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return ABSENT_SCHEMA_HASH
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}"
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def load_project_schema(repo_root: Path, *, respect_switch: bool = True) -> ProjectSchema | None:
     """Load and validate `devgraph.schema.yaml`, if the repository has one.
 
-    Returns `None` if and only if the file is absent. An empty, malformed,
-    non-mapping or invalid file raises `ProjectSchemaError`; no partial
-    schema is ever returned.
+    Returns `None` if and only if the file is absent or the repository's
+    project config is switched off (unless `respect_switch` is False). An
+    empty, malformed, non-mapping or invalid file raises `ProjectSchemaError`;
+    no partial schema is ever returned.
     """
+    if respect_switch and not project_config_enabled(repo_root):
+        return None
     path = project_schema_path(repo_root)
     try:
         if not path.exists():
@@ -389,9 +556,14 @@ def load_project_schema(repo_root: Path) -> ProjectSchema | None:
     except UnicodeDecodeError as exc:
         raise ProjectSchemaError(f"{path}: is not valid UTF-8: {exc}") from exc
 
+    return parse_project_schema(text, path)
+
+
+def parse_project_schema(text: str, path: Path) -> ProjectSchema:
+    """Parse and validate the text of a schema file; `path` only labels errors."""
     try:
-        document = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
+        document = bounded_safe_load(text)
+    except YAML_LOAD_ERRORS as exc:
         raise ProjectSchemaError(f"{path}: malformed YAML: {exc}") from exc
 
     if document is None:
@@ -446,7 +618,8 @@ def resolve_declaration(
 
     known_labels = set(node_labels)
     for relationship in declaration.relationships:
-        for role, label in (("from", relationship.from_), ("to", relationship.to)):
+        endpoints = [("from", label) for label in relationship.from_labels] + [("to", relationship.to)]
+        for role, label in endpoints:
             if label not in known_labels:
                 raise ProjectSchemaError(
                     f"{origin}: relationship {relationship.type!r} {role} endpoint "
@@ -468,6 +641,15 @@ def resolve_declaration(
                 f"lower-cased, so labels must not differ only by case"
             )
         used_names.add(name)
+        if node_type.source is not None:
+            index_name = _filesystem_index_name(node_type.label)
+            if index_name in used_names:
+                raise ProjectSchemaError(
+                    f"{origin}: node type {node_type.label!r} generates the index "
+                    f"name {index_name!r}, which is already in use; index and "
+                    f"constraint names share one name space"
+                )
+            used_names.add(index_name)
 
     return EffectiveSchema(
         extends=declaration.extends,
@@ -500,3 +682,57 @@ def project_schema_json_schema() -> dict[str, Any]:
     file as loader-valid; call `load_project_schema`.
     """
     return ProjectSchema.model_json_schema()
+
+
+_STARTER_TEMPLATE = """\
+# DevGraph project schema ({filename})
+#
+# Declares extra node types and relationships for this repository on top of
+# DevGraph's built-in schema. Check it with `devgraph config validate`, see
+# the effective schema with `devgraph config show`, and apply it with
+# `devgraph rescan <repo_id>`. Today a declared node type gets a uniqueness
+# constraint on its key; extraction of user-defined types comes later.
+#
+# Built-in node labels (inherited with `extends: default`; never redeclare one):
+{labels}
+#
+# Built-in relationship types (reuse one between your own types with
+# `provider: builtin`):
+{relationships}
+
+version: {version}
+extends: default
+
+# node_types:
+#   - label: Runbook
+#     key: [slug]
+#     metadata:
+#       - name: slug
+#         type: string
+#         required: true
+#       - name: owner
+#     color: "#1f77b4"   # optional #rrggbb display colour (also valid on relationships)
+#
+# relationships:
+#   - type: DOCUMENTS
+#     provider: custom
+#     custom: {{name: runbook_links}}
+#     from: Runbook
+#     to: Service
+"""
+
+
+def starter_schema_text() -> str:
+    """A valid, commented starter `devgraph.schema.yaml` for `devgraph config eject`.
+
+    The built-in labels and relationship types are rendered from
+    `devgraph.graph.schema`, so the comments can't drift from the code. The
+    commented example validates once uncommented. Built-ins are listed, not
+    redeclared: the loader rejects a project file that redeclares one.
+    """
+    return _STARTER_TEMPLATE.format(
+        filename=SCHEMA_FILENAME,
+        labels="\n".join(f"#   {label}" for label in NODE_LABELS),
+        relationships="\n".join(f"#   {rel}" for rel in RELATIONSHIP_TYPES),
+        version=SCHEMA_VERSION,
+    )

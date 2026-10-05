@@ -19,6 +19,7 @@ from pathlib import Path
 
 import uvicorn
 
+from devgraph.agent.schema_rescan import SchemaRescanScheduler
 from devgraph.config import get_settings
 from devgraph.dashboard.app import build_app
 from devgraph.dashboard.events import EventBroadcaster
@@ -66,8 +67,12 @@ class HeadlessAgent:
         self._stop_event = threading.Event()
         self._last_seen_registry_change = self._registry.last_changed_at()
         self._events = EventBroadcaster()
+        self._schema_rescans = SchemaRescanScheduler(self._engine, self._registry, on_rescanned=self._on_schema_rescanned)
         self._dashboard_server: uvicorn.Server | None = None
         self._dashboard_thread: threading.Thread | None = None
+
+    def _on_schema_rescanned(self, repo_id: str, files: int) -> None:
+        self._events.publish({"type": "reindexed", "repo_id": repo_id, "changed": files, "deleted": 0})
 
     def _on_changes(self, repo_id: str, changed_paths: set[Path], deleted_paths: set[Path]) -> None:
         logger.info(
@@ -186,6 +191,7 @@ class HeadlessAgent:
     def stop(self) -> None:
         self._stop_event.set()
         self._watcher.stop()
+        self._schema_rescans.stop()
         if self._dashboard_server is not None:
             self._dashboard_server.should_exit = True
             if self._dashboard_thread is not None:
@@ -195,6 +201,7 @@ class HeadlessAgent:
 
     def start(self) -> None:
         self._watcher.start()
+        self._schema_rescans.start()
         health_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         health_thread.start()
 

@@ -19,7 +19,16 @@ import logging
 from pathlib import Path
 
 from devgraph.config import get_settings
-from devgraph.graph.engine import GraphEngine
+from devgraph.config.project_schema import (
+    ABSENT_SCHEMA_HASH,
+    LABEL_PATTERN,
+    RELATIONSHIP_TYPE_PATTERN,
+    ProjectSchemaError,
+    resolve_effective_schema,
+    schema_file_hash,
+)
+from devgraph.graph.engine import GraphEngine, provision_repository_schema
+from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.containers.extractor import ContainerExtractor
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
@@ -31,8 +40,10 @@ from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.kotlin.extractor import extract_kotlin_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
 from devgraph.indexer.cpp.extractor import extract_cpp_file
+from devgraph.indexer.providers import filesystem
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
+from devgraph.indexer.schema_constraints import encode_keys, realign_keys, release_labels
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +101,111 @@ IGNORED_DIR_NAMES = {
 _JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
 
 
+def is_ignored_dir_name(name: str) -> bool:
+    return name in IGNORED_DIR_NAMES or name.endswith(".egg-info")
+
+
 def is_ignored_path(path: Path) -> bool:
-    return any(part in IGNORED_DIR_NAMES or part.endswith(".egg-info") for part in path.parts)
+    return any(is_ignored_dir_name(part) for part in path.parts)
 
 
-def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None, mentions_enabled: bool = False) -> int:
+def _filesystem_spec(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | None]:
+    """(schema usable, spec). An invalid schema disables the provider for this
+    call -- including any prune -- so a bad edit never deletes good nodes."""
+    try:
+        return True, filesystem.load_filesystem_spec(repo_root)
+    except ProjectSchemaError as exc:
+        logger.warning("project schema for %s is invalid; filesystem provider skipped: %s", repo_root, exc)
+        return False, None
+
+
+def schema_pending(engine: GraphEngine, repo_id: str, repo_root: Path) -> bool:
+    """True when the schema file differs from the one the graph was built with.
+
+    A repository with no recorded state and no schema file has nothing to
+    apply, so repositories registered before schema tracking are never
+    pending just for lacking state.
+    """
+    current = schema_file_hash(repo_root)
+    applied = engine.read_applied_schema(repo_id)
+    if applied is None:
+        return current != ABSENT_SCHEMA_HASH
+    return current != applied["hash"]
+
+
+def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> bool:
+    """Bring the graph in line with the repository's current schema file.
+
+    Provisions constraints/indexes, deletes nodes and relationships of user
+    types the previously applied schema declared but this one doesn't
+    (built-ins are never touched), re-syncs the filesystem provider, records
+    the applied state, then reconciles the generated constraints/indexes with
+    every repository's recorded state (see schema_constraints). An invalid
+    schema or a provisioning failure returns False with the graph untouched;
+    errors from the deletion or reconcile steps propagate, while a failed
+    constraint reconcile (or the re-provisioning after the record) is only logged.
+    """
+    current_hash = schema_file_hash(repo_root)
+    try:
+        effective = resolve_effective_schema(repo_root)
+    except ProjectSchemaError as exc:
+        logger.warning("project schema for %s is invalid; not applied: %s", repo_root, exc)
+        return False
+    try:
+        provision_repository_schema(engine, repo_root)
+    except Exception as exc:
+        logger.warning("could not provision the project schema for %s; not applied: %s", repo_root, exc)
+        return False
+
+    labels = [node_type.label for node_type in effective.node_types]
+    rel_types = list(dict.fromkeys(r.type for r in effective.relationships if r.type not in RELATIONSHIP_TYPES))
+    previous = engine.read_applied_schema(repo_id) or {}
+    # Re-validated: these names come back from the graph and are interpolated.
+    removed_labels = [
+        label for label in previous.get("labels") or []
+        if label not in labels and label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or "")
+    ]
+    for label in removed_labels:
+        engine.delete_label_nodes(repo_id, label)
+    for rel_type in previous.get("relationship_types") or []:
+        if rel_type not in rel_types and rel_type not in RELATIONSHIP_TYPES and RELATIONSHIP_TYPE_PATTERN.fullmatch(rel_type or ""):
+            engine.delete_relationship_type(repo_id, rel_type)
+
+    spec = filesystem.filesystem_spec(effective)
+    on_disk = {rel for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
+    filesystem.reconcile(engine, repo_id, spec, on_disk)
+    if spec is not None:
+        filesystem.sync_present(engine, repo_id, spec, on_disk)
+    engine.record_applied_schema(repo_id, current_hash, labels, rel_types, encode_keys(effective.node_types))
+    # After recording, so this repository's new state is part of what every
+    # other repository's declarations are weighed against. Provisioning is
+    # re-run first: another repository's apply may have released a label
+    # between this one's provisioning and its record, and nothing else would
+    # re-create the constraint (the schema is no longer pending).
+    try:
+        engine.init_schema(effective)
+        release_labels(engine, removed_labels)
+        realign_keys(engine, effective.node_types)
+    except Exception as exc:
+        logger.warning("could not reconcile generated constraints/indexes for %s: %s", repo_id, exc)
+    return True
+
+
+def _repo_relative(repo_root: Path, path: Path) -> str | None:
+    """Repo-relative POSIX path, or None for a path outside the repository."""
+    try:
+        return Path(path).resolve().relative_to(repo_root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return None
+
+
+def _is_provider_file(repo_root: Path, path: Path) -> bool:
+    """A file the filesystem provider represents: what a full scan would index."""
+    rel = _repo_relative(repo_root, path)
+    return rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel))
+
+
+def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None, mentions_enabled: bool = False, sync_provider: bool = True) -> int:
     """Index a set of changed files, routing each to its extractor by name/extension.
 
     Args:
@@ -108,6 +219,9 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             bug passing an unrelated path.
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
+        sync_provider: Write filesystem-provider nodes for `paths` (skipped
+            while the schema is pending). False when the caller has just
+            applied the schema.
 
     Returns:
         Number of files actually indexed (skipped/unrecognized files don't count).
@@ -256,6 +370,15 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         for rel_path, content in py_files:
             service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
         engine.upsert_relationships(service_rels)
+
+    if sync_provider and not schema_pending(engine, repo_id, repo_root):
+        ok, spec = _filesystem_spec(repo_root)
+        if ok and spec is not None:
+            present = {
+                rel for p in paths
+                if _is_provider_file(repo_root, Path(p)) and (rel := _repo_relative(repo_root, Path(p))) is not None
+            }
+            filesystem.sync_present(engine, repo_id, spec, present)
 
     return indexed
 
@@ -535,6 +658,17 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
                 module_name = resolved.name
             engine.delete_nodes_by_source_file(repo_id, module_name)
             cleaned += 1
+
+    if not schema_pending(engine, repo_id, repo_root):
+        ok, spec = _filesystem_spec(repo_root)
+        if ok and spec is not None:
+            gone = {rel for p in paths if (rel := _repo_relative(repo_root, Path(p))) is not None and rel != "."}
+            filesystem.sync_absent(
+                engine, repo_id, repo_root, spec, gone,
+                is_indexable=lambda p: _is_provider_file(repo_root, p),
+                is_ignored_dir=is_ignored_dir_name,
+            )
+
     return cleaned
 
 
@@ -595,10 +729,18 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
     nodes for that no longer exists on disk is pruned first (see
     prune_stale_files), so a rescan heals stale nodes left by a watcher
     that was down or missed events — not just adds/updates what's current.
+    A full scan also applies the project schema (see apply_project_schema),
+    which reconciles filesystem-provider nodes (see providers/filesystem.py).
+    A schema that cannot be applied leaves the repository pending; callers
+    that care check schema_pending afterwards.
     """
     prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
     all_files = _indexable_paths(repo_root)
-    return index_paths(engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled)
+    apply_project_schema(engine, repo_id, repo_root)
+    return index_paths(
+        engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
+        sync_provider=False,  # applied just above
+    )
 
 
 def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> None:
