@@ -88,7 +88,7 @@ relationships:
     to: Folder
 ```
 
-Every indexable file becomes a `File` node and every directory containing one a `Folder` node (`.` is the repository root), keyed by repo-relative path, with an `IS_CHILD_OF` edge to the parent folder. The watcher keeps them current; `search_component` finds them. A changed `devgraph.schema.yaml` is applied by a full rescan: the DevGraph agent runs it once the file has gone 5 minutes without further edits, and `devgraph rescan <repo_id>` (or `--now`) applies it immediately. The agent's automatic apply honours "Pause watching" and per-repo `devgraph watch disable` (`devgraph rescan` still applies immediately), and a schema that cannot be applied (invalid, or a constraint that cannot be created) is reported in the agent log and retried only after the file changes. Until then filesystem nodes stay as last applied. Applying also removes nodes and relationships of user types dropped from the schema; built-in types are never touched. It also keeps the generated constraints and indexes in step: once no repository's applied schema declares a label any more (and no node carries it), its `<label>_repo_key` constraint and `<label>_repo_name` index are dropped — a label two repositories share keeps them until the last one drops it — and a changed `key` replaces the constraint once every repository declaring the label uses the new key (a disagreement is left alone and logged; so is a new key that duplicate nodes would violate, which is checked before anything is dropped). Labels that differ only by case across repositories share one constraint name and converge on the next apply once every repository spells the label the same way. A constraint you create by hand with exactly DevGraph's generated name and shape (`<label>_repo_key` on `repo_id` plus properties, or a `<label>_repo_name` index on `(repo_id, name)`) is treated as DevGraph's. `devgraph remove` and `devgraph prune` release the labels of the repositories they delete the same way. Other user-declared node types are still constraint-only: nothing extracts them yet.
+Every indexable file becomes a `File` node and every directory containing one a `Folder` node (`.` is the repository root), keyed by repo-relative path, with an `IS_CHILD_OF` edge to the parent folder. The watcher keeps them current; `search_component` finds them. A changed `devgraph.schema.yaml` is applied by a full rescan: the DevGraph agent runs it once the file has gone 5 minutes without further edits, and `devgraph rescan <repo_id>` (or `--now`) applies it immediately. The agent's automatic apply honours "Pause watching" and per-repo `devgraph watch disable` (`devgraph rescan` still applies immediately), and a schema that cannot be applied (invalid, or a constraint that cannot be created) is reported in the agent log and retried only after the file changes. Until then filesystem nodes stay as last applied. Applying also removes nodes and relationships of user types dropped from the schema; built-in types are never touched. It also keeps the generated constraints and indexes in step: once no repository's applied schema declares a label any more (and no node carries it), its `<label>_repo_key` constraint and `<label>_repo_name` index are dropped — a label two repositories share keeps them until the last one drops it — and a changed `key` replaces the constraint once every repository declaring the label uses the new key (a disagreement is left alone and logged; so is a new key that duplicate nodes would violate, which is checked before anything is dropped). Labels that differ only by case across repositories share one constraint name and converge on the next apply once every repository spells the label the same way. A constraint you create by hand with exactly DevGraph's generated name and shape (`<label>_repo_key` on `repo_id` plus properties, or a `<label>_repo_name` index on `(repo_id, name)`) is treated as DevGraph's. `devgraph remove` and `devgraph prune` release the labels of the repositories they delete the same way. Node types can also be filled from the YAML block at the top of Markdown files: see [Markdown front matter (docs) source](#markdown-front-matter-docs-source) below. Node types with no `source` are still constraint-only: nothing extracts them.
 
 - A repository without the file behaves exactly as before.
 - DevGraph's built-in constraints are always provisioned, including under `extends: none`, because every registered repository shares one Neo4j database.
@@ -104,8 +104,86 @@ Every indexable file becomes a `File` node and every directory containing one a 
   - A symlinked file is represented at its target's path.
 - `devgraph config validate` checks the file (or every registered repository's with `--all`) and exits non-zero on an invalid schema or a cross-repository conflict; `devgraph config show` prints the effective schema and where each entry comes from; `devgraph config eject` writes a commented starter file and never overwrites an existing one.
 - `devgraph config disable <repo_id>` switches a repository's project config off: its `devgraph.schema.yaml` and `devgraph.tools.yaml` are ignored, so it gets the built-in schema and serves no project tools (`devgraph://project-tools` says so). `devgraph config enable <repo_id>` switches it back on. The switch is stored in the registry and shown in the `Project config` column of `devgraph list` (`on`/`off`); the schema change applies at the next rescan (watched repositories; otherwise `devgraph rescan <repo_id>`; `devgraph rescan <repo_id> --now` to apply immediately), while MCP sessions drop or regain project tools within 2 seconds. `config validate` still checks a disabled repository's files and reports it as disabled; `config show` says disabled and prints the built-in schema (`project_config: disabled` in JSON).
-- `devgraph config schema list|add|edit|delete|reset` edits the repository's `devgraph.schema.yaml` from the command line. All take `--repo <path>` (default: the deepest registered repository containing the current directory). `list [--json]` shows the effective schema, each entry marked built-in or project. `add --from <file|->` adds one node type (a mapping with `label`) or relationship (a mapping with `type`) given as YAML or JSON; an existing label is refused (use `edit`). `edit <name> [--from <file|->]` replaces one entry by label or relationship type, opening it in `$EDITOR` without `--from`; an unchanged or invalid result writes nothing. `delete <name>` removes one entry and `reset [--yes]` deletes the file, returning the repository to the built-in schema. A name that is both a node type and a relationship type needs `--node-type` or `--relationship`; a relationship type declared more than once cannot be addressed by name (edit the file by hand). Every write is validated exactly as the indexer would validate it, is atomic, and splices only that entry's lines so comments elsewhere survive; the CLI never stages or commits. Edits apply like any other schema change, and the command says when: for a watched, enabled repository about 5 minutes after the last edit while the DevGraph agent (tray or headless) is running (the quiet period), or now with `devgraph rescan <repo_id> --now`; for an unwatched one only by running that rescan; not while the project config is disabled; an unregistered directory is not indexed. Applying a schema deletes nodes, so `delete`, `reset` and `edit` warn when they remove a node type, remove a user relationship type (built-in relationship types are never deleted), drop a type's `source`, or change its filesystem `kind`; for a disabled or unregistered repository the warning says "applying this schema" instead of "the next rescan". `add` and `edit` also note when a node type has no `source`: only `source: {provider: filesystem}` types are populated today, so no provider produces its nodes yet. Changing a type's `key` warns that the existing uniqueness constraint keeps the old key until the schema is applied and every repository declaring the label uses the new key. After a write the CLI also checks the other registered repositories and warns (without refusing) if this repository's label now conflicts with another's key. Validation failures from `add` and `edit` are prefixed "the new entry is invalid:", and `list` shows each node type's source (`filesystem (folder)` or `—`; `source` in JSON).
+- `devgraph config schema list|add|edit|delete|reset` edits the repository's `devgraph.schema.yaml` from the command line. All take `--repo <path>` (default: the deepest registered repository containing the current directory). `list [--json]` shows the effective schema, each entry marked built-in or project. `add --from <file|->` adds one node type (a mapping with `label`) or relationship (a mapping with `type`) given as YAML or JSON; an existing label is refused (use `edit`). `edit <name> [--from <file|->]` replaces one entry by label or relationship type, opening it in `$EDITOR` without `--from`; an unchanged or invalid result writes nothing. `delete <name>` removes one entry and `reset [--yes]` deletes the file, returning the repository to the built-in schema. A name that is both a node type and a relationship type needs `--node-type` or `--relationship`; a relationship type declared more than once cannot be addressed by name (edit the file by hand). Every write is validated exactly as the indexer would validate it, is atomic, and splices only that entry's lines so comments elsewhere survive; the CLI never stages or commits. Edits apply like any other schema change, and the command says when: for a watched, enabled repository about 5 minutes after the last edit while the DevGraph agent (tray or headless) is running (the quiet period), or now with `devgraph rescan <repo_id> --now`; for an unwatched one only by running that rescan; not while the project config is disabled; an unregistered directory is not indexed. Applying a schema deletes nodes, so `delete`, `reset` and `edit` warn when they remove a node type, remove a user relationship type (built-in relationship types are never deleted), drop a type's `source`, change its filesystem `kind`, or change a Markdown front matter source's provider, paths or conditions; for a disabled or unregistered repository the warning says "applying this schema" instead of "the next rescan". `add` and `edit` also note when a node type has no `source`: only types with a filesystem or Markdown front matter (`docs`) source are populated, so no provider produces its nodes yet. Changing a type's `key` warns that the existing uniqueness constraint keeps the old key until the schema is applied and every repository declaring the label uses the new key. After a write the CLI also checks the other registered repositories and warns (without refusing) if this repository's label now conflicts with another's key. Validation failures from `add` and `edit` are prefixed "the new entry is invalid:", and `list` shows each node type's source (`filesystem (folder)`, `docs (runbooks/**/*.md)` or `—`; `source` in JSON).
 - `devgraph config` alone still shows DevGraph's settings; a single setting is now `devgraph config settings <key>`, and secret settings are masked.
+
+### Markdown front matter (docs) source
+
+Two terms first:
+
+- **Declarative provider**: a way to fill a node type from data DevGraph already reads, described entirely in `devgraph.schema.yaml` (or the Config page form). You say which files to look at and which values to copy; DevGraph never runs code from the repository to do it. The filesystem provider above is one; the docs source is the second.
+- **Docs source**: a node type with `source: {provider: docs, ...}`. Each matching Markdown file becomes one node, filled from its *front matter*: the block between two `---` lines at the very top of the file.
+
+#### Example: runbooks linked to the services they cover
+
+Say the repository has a compose file declaring the services `api` and `payments`, and runbooks like this one in `runbooks/api-outage.md`:
+
+```markdown
+---
+type: runbook
+service: api
+owner: platform-team
+on-call-team: api-oncall
+---
+# API outage
+
+Restart the api service.
+```
+
+This schema turns every runbook into a `Runbook` node and links it to its service:
+
+```yaml
+version: 1
+node_types:
+  - label: Runbook
+    key: [path]
+    metadata:
+      - {name: path}
+      - {name: owner, required: true}
+      - {name: on_call}
+    source:
+      provider: docs
+      paths: ["runbooks/**/*.md"]
+      where:
+        - {field: type, is: runbook}
+      fields: {on_call: on-call-team}
+relationships:
+  - type: RUNBOOK_FOR
+    provider: docs
+    from: Runbook
+    to: Service
+    field: service
+```
+
+After the next rescan the graph has a `Runbook` node for `runbooks/api-outage.md` with `owner = platform-team` and `on_call = api-oncall`, and a `RUNBOOK_FOR` edge to the `api` Service. A file in `runbooks/` whose front matter says `type: note` is left out. You can build the same entries on the Config page: pick **Markdown front matter** as a node type's Source, or as a relationship's Provider.
+
+The source has four parts:
+
+1. **Which files (`paths`).** One to 20 globs, relative to the repository root. `*` matches any name within one folder and `**` matches any number of folders, so `runbooks/**/*.md` reads every `.md` file anywhere under `runbooks/`, and `**/*.md` every Markdown file in the repository. Only `.md` and `.markdown` files are read. Upper and lower case must match: `Runbooks/**/*.md` does not find `runbooks/`.
+2. **Which of those files count (`where`, optional).** Up to 20 conditions, and a file must pass all of them. Without `where`, every matching file becomes a node, even one with no front matter. Each condition names a front-matter key and one way to compare it:
+
+   | Condition | Passes when the value… | Example |
+   | --- | --- | --- |
+   | `is` | is exactly the text | `{field: type, is: runbook}` |
+   | `starts_with` | begins with the text | `{field: title, starts_with: "RB-"}` |
+   | `contains` | has the text somewhere in it | `{field: owner, contains: platform}` |
+   | `like` | fits a pattern where `*` stands for any run of characters (nothing else is special) | `{field: title, like: "RB-*-db"}` |
+
+   Values are compared as text, and capital letters must match. A number is compared as its digits, so `is: 1` and `is: "1"` both match `version: 1`. A true/false value is compared as the words `true` and `false`; YAML also reads `yes`, `no`, `on` and `off` as true/false, so write `is: true` to match `draft: yes`. When the value is a list (`tags: [runbook, oncall]`), the condition passes if any item does. Dates, decimals and nested blocks never pass.
+3. **Which values to copy (`metadata` and `fields`).** Every metadata field except `path` is copied from the front-matter key of the same name. When the key in the files is spelled differently, map it in `fields`: `{on_call: on-call-team}` fills `on_call` from `on-call-team:`. On the form this is the **Front-matter key** box on each metadata row, left blank when the names are the same. A value that doesn't fit the field's type (text in an `integer` field, say) is left blank, and a file missing a `required` field is skipped. A `string` field writes true/false values as `true`/`false`. Lists, dates and nested blocks are never copied. The key must be exactly `[path]`: each node is named by its file's path from the repository root.
+4. **What to link (`relationships`).** A relationship with `provider: docs` reads one front-matter key (`field`) and links the node to every `to` node whose name is that value. The value can be one name or a list of up to 100. The name is a Service's name, a Module's path, or a docs or filesystem node's path (such as `runbooks/db.md`; a leading `./` is ignored). A value that names nothing is skipped, and `devgraph doctor` lists it.
+
+Changing the source is a schema change, applied by a rescan like any other. After that, the watcher keeps the nodes current as you edit, add and delete Markdown files.
+
+Safety: a cloned repository controls this file, so nothing in it can run code or hang the indexer. There are no regular expressions, scripts or templates; only the four plain comparisons above. Files are read with a size cap, front matter is parsed safely with a limit on its size, and lists and text are length-limited. The provider reads the same files the other extractors do: ignored folders are skipped, and so is a symlink pointing outside the repository. Only the labels, relationship types and field names declared in the schema are ever written, and only nodes this provider created are ever changed or deleted. If the schema is invalid or waiting for a rescan, the provider writes nothing and leaves the last applied nodes alone. One bad file is skipped and counted; it never stops the rest.
+
+What it doesn't do yet:
+
+- A link from one docs node to another uses the target's file path (`decided_by: decisions/adr-012.md`). Naming the target by a front-matter key (`decided_by: ADR-012`) comes next.
+- A link fans out to every Service with that name. A Service is identified by its name and the compose file that declares it, so `service: api` links to each `api` declared in each compose file.
+- A link to a Folder created after the file that names it appears after the next rescan. Links to other new targets (a Service, a File, another docs node) appear as soon as the watcher indexes the new target.
+- Creating a docs node that another docs type links to re-reads every file of that type, to find the links waiting for it. In a repository with thousands of such files that save takes longer.
+- Only front matter is read: not the title, headings or body text.
 
 ## Project tools (preview)
 

@@ -961,7 +961,8 @@ _STARTER_TEMPLATE = """\
 # constraint on its key. Node types with a `source` are indexed:
 # `provider: filesystem` makes one node per file or folder, and
 # `provider: docs` makes one node per matching Markdown file, filled from its
-# Markdown front matter. Nothing in this file is ever run as code.
+# Markdown front matter (the `---` block at the top of the file). Nothing in
+# this file is ever run as code.
 #
 # Built-in node labels (inherited with `extends: default`; never redeclare one):
 {labels}
@@ -995,7 +996,8 @@ extends: default
 #     provider: docs
 #     from: Runbook
 #     to: Service
-#     field: service                         # front-matter key naming the target
+#     field: service                         # front-matter key naming the target; links every
+#                                            # Service of that name (one per compose file)
 """
 
 
