@@ -2262,6 +2262,44 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     j([api.edit.mode, els.configYaml.value, j(api.edit.formState)]) === j(untouched) && api.edit.parseRefused === null &&
     !api.edit.busy && !shown(els.configFormNotice) && !formCtl("Cypher"), j([api.edit.mode, untouched]));
   els.configModalCancel.fire("click");
+
+  // ...a reply is dropped if the editor left YAML mode, or the textarea was changed from script, meanwhile
+  parseRes = () => ({ status: 200, body: { entry: HAND_ENTRY } });
+  await toYaml();
+  await handEdit(HAND_TEXT);
+  gate = new Promise(r => { release = r; });
+  pending = press(els.configModeForm);
+  await Promise.resolve();
+  api.edit.mode = "form";
+  gate = null; release(); await pending;
+  check("a reply that arrives once the editor is no longer in YAML mode is dropped",
+    api.edit.formText === TOOL_YAML && api.edit.parseRefused === null && !j(api.edit.formState).includes("Typed by hand") && !api.edit.busy,
+    j([api.edit.formText, api.edit.parseRefused]));
+  els.configModalCancel.fire("click");
+  await toYaml();
+  await handEdit(HAND_TEXT);
+  gate = new Promise(r => { release = r; });
+  pending = press(els.configModeForm);
+  await Promise.resolve();
+  els.configYaml.value = HAND_TEXT + "# from script\n";
+  gate = null; release(); await pending;
+  check("a reply for text the textarea no longer holds is dropped: still YAML, no refusal recorded",
+    api.edit.mode === "yaml" && shown(els.configYaml) && !shown(els.configForm) && api.edit.formText === TOOL_YAML &&
+    api.edit.parseRefused === null && els.configYaml.value === HAND_TEXT + "# from script\n" && !api.edit.busy,
+    j([api.edit.mode, api.edit.formText, api.edit.parseRefused]));
+  els.configModalCancel.fire("click");
+
+  // ...Discard after a successful read-back returns to the read-back text, not the opening text
+  await toYaml();
+  await handEdit(HAND_TEXT);
+  await press(els.configModeForm);
+  await press(els.configModeYaml);
+  await handEdit(HAND_TEXT + "# later\n");
+  await press(els.configFormDiscard);
+  check("Discard after a read-back puts back the read-back text, not the opening text",
+    els.configYaml.value === HAND_TEXT && els.configYaml.value !== TOOL_YAML && shown(els.configForm) &&
+    formCtl("Description").value === "Typed by hand.", els.configYaml.value);
+  els.configModalCancel.fire("click");
   await editRow("repo-b", "OWNS");
   await press(els.configModeYaml);
   await handEdit(REL_YAML + "# mine\n");

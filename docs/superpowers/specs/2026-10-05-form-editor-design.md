@@ -206,7 +206,7 @@ This supersedes §2.4's "YAML → Form only for text whose mapping is known" and
 
 ### 5.2 The Form button after a hand edit
 
-`configFormSwitch(edit, text)` gains a third way to the form: text that is neither the form's last text nor the opening text returns `{available: true, restore: "parse"}`, unless the last read-back of **this exact text** was refused, which returns `{available: false, reason}` with that refusal. The notice under the switch still shows in YAML mode after a hand edit ("The YAML was edited by hand. Form reads it back if the form can show it exactly, or discard the hand edits to return to the form's last text."), with **Discard YAML edits**, which is unchanged.
+`configFormSwitch(edit, text)` gains a third way to the form: text that is neither the form's last text nor the opening text returns `{available: true, restore: "parse"}`, unless the last read-back of **this exact text** was refused, which returns `{available: false, reason}` with that refusal. The notice under the switch still shows in YAML mode after a hand edit ("The YAML was edited by hand. Form reads it back if the form can show it exactly, or discard the hand edits to return to the form's last text."), with **Discard YAML edits**, which is shown only when the editor has a form state (`edit.formState`), so an entry that opened YAML-only has none; otherwise its behaviour is unchanged.
 
 Pressing Form with `restore: "parse"`:
 1. Locks the editor as every request does (`edit.busy = "Reading…"`: textarea read-only, switch, form, Discard and Save disabled).
