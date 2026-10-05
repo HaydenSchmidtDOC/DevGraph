@@ -353,7 +353,7 @@ def watch(action: str, repo_id: str) -> None:
     """
     try:
         if action not in ("enable", "disable"):
-            console.print(f"[red][X] Error:[/red] action must be 'enable' or 'disable'")
+            console.print("[red][X] Error:[/red] action must be 'enable' or 'disable'")
             raise typer.Exit(code=1)
 
         registry = _get_registry()
@@ -2846,7 +2846,7 @@ def self_test(
                 console.print(f"  [red][X] {count} Module(s) missing 'file' property[/red]")
                 all_passed = False
             else:
-                console.print(f"  [green][OK][/green] All Module nodes have 'file'")
+                console.print("  [green][OK][/green] All Module nodes have 'file'")
         except Exception as e:
             console.print(f"  [red][X] Check failed:[/red] {e}")
             all_passed = False
@@ -2863,7 +2863,7 @@ def self_test(
                 console.print(f"  [red][X] {count} dangling CONTAINS edge(s)[/red]")
                 all_passed = False
             else:
-                console.print(f"  [green][OK][/green] All CONTAINS edges valid")
+                console.print("  [green][OK][/green] All CONTAINS edges valid")
         except Exception as e:
             console.print(f"  [red][X] Check failed:[/red] {e}")
             all_passed = False
@@ -2880,7 +2880,7 @@ def self_test(
                 console.print(f"  [red][X] {count} dangling CALLS edge(s)[/red]")
                 all_passed = False
             else:
-                console.print(f"  [green][OK][/green] All CALLS edges valid")
+                console.print("  [green][OK][/green] All CALLS edges valid")
         except Exception as e:
             console.print(f"  [red][X] Check failed:[/red] {e}")
             all_passed = False
@@ -2904,7 +2904,7 @@ def self_test(
             if missing:
                 console.print(f"  [yellow]{len(missing)} repo(s) in registry but not in Neo4j: {', '.join(sorted(missing))}[/yellow]")
             if not orphaned and not missing:
-                console.print(f"  [green][OK][/green] Registry ↔ Neo4j consistent")
+                console.print("  [green][OK][/green] Registry ↔ Neo4j consistent")
         except Exception as e:
             console.print(f"  [red][X] Check failed:[/red] {e}")
             all_passed = False

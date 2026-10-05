@@ -1,6 +1,5 @@
 """Unit tests for container extractor."""
 
-import pytest
 
 from devgraph.indexer.containers.extractor import ContainerExtractor
 
