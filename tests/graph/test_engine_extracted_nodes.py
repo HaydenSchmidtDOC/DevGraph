@@ -178,6 +178,7 @@ def test_clear_properties_removes_undeclared_and_keeps_declared_reserved_and_ins
         }},
         {"label": "Runbook", "repo_id": REPO, "name": "fs.md", "properties": {
             "path": "fs.md", "extractor": "filesystem", "old_field": "other extractor",
+            "only_on_filesystem": "x",
         }},
     ])
     engine.upsert_nodes([{"label": "Runbook", "repo_id": OTHER, "name": "rb/a.md", "properties": {
@@ -185,11 +186,13 @@ def test_clear_properties_removes_undeclared_and_keeps_declared_reserved_and_ins
     }}])
     removed = engine.clear_extracted_properties(REPO, "docs", "Runbook", ["path", "owner"])
     assert removed == ["old_field", "severity"]
+    assert "only_on_filesystem" not in removed
     assert keys_of(engine, REPO, "Runbook", "rb/a.md") == [
         "extractor", "insight_pagerank", "name", "owner", "path", "repo_id", "source", "sources",
     ]
     assert "old_field" in keys_of(engine, REPO, "Guide", "g.md")
     assert "old_field" in keys_of(engine, REPO, "Runbook", "fs.md")
+    assert "only_on_filesystem" in keys_of(engine, REPO, "Runbook", "fs.md")
     assert "old_field" in keys_of(engine, OTHER, "Runbook", "rb/a.md")
 
 
@@ -208,6 +211,14 @@ def test_clear_properties_with_nothing_to_clear_removes_nothing(engine):
     seed(engine, REPO, "Runbook", ["rb/a.md"], extractor="docs")
     assert engine.clear_extracted_properties(REPO, "docs", "Runbook", ["path"]) == []
     assert engine.clear_extracted_properties(REPO, "docs", "Absent", []) == []
+
+
+def test_clear_properties_with_empty_keep_leaves_node_identity_intact(engine):
+    engine.upsert_nodes([{"label": "Runbook", "repo_id": REPO, "name": "rb/a.md", "properties": {
+        "path": "rb/a.md", "extractor": "docs", "owner": "ops",
+    }}])
+    assert engine.clear_extracted_properties(REPO, "docs", "Runbook", []) == ["owner"]
+    assert keys_of(engine, REPO, "Runbook", "rb/a.md") == ["extractor", "name", "path", "repo_id"]
 
 
 class _NoDriver:

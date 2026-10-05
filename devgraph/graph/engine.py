@@ -28,6 +28,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
+# What identifies a provider-owned node: never cleared, whatever the schema keeps.
+_EXTRACTED_IDENTITY_PROPERTIES = RESERVED_NODE_PROPERTIES | {"path"}
+
 # Shared by delete_nodes_by_source_file and _replace_file_nodes_tx.
 #
 # `source_file` (Module) and `file` (Class/Function/...) both name exactly
@@ -659,7 +662,9 @@ class GraphEngine:
 
     def clear_extracted_properties(self, repo_id: str, extractor: str, label: str, keep: list[str]) -> list[str]:
         """Remove every property of one provider label's nodes that is not in `keep`,
-        not reserved and not `insight_*`. Returns the removed names, sorted.
+        not an identity property (reserved names and `path`) and not `insight_*`.
+        An empty `keep` clears every non-identity property. Returns the removed
+        names, sorted.
 
         The names come from the graph, so each one must fullmatch the property-name
         pattern before it is interpolated; anything else is left in place.
@@ -674,7 +679,7 @@ class GraphEngine:
             stale = sorted(
                 key for key in present
                 if key not in keep
-                and key not in RESERVED_NODE_PROPERTIES
+                and key not in _EXTRACTED_IDENTITY_PROPERTIES
                 and not key.startswith("insight_")
                 and PROPERTY_NAME_PATTERN.fullmatch(key)
             )
