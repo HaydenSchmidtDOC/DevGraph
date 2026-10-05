@@ -746,9 +746,36 @@ def test_report_joins_several_reasons_for_one_file(tmp_path):
 def test_report_wording_for_a_bad_file(tmp_path):
     lines = report(tmp_path, {"runbooks/x.md": "---\nkey: [unclosed\n---\n"})
     assert lines == [
-        {"status": "ok", "detail": "Runbook: 1 file matches, 0 Runbook entries"},
+        {"status": "warning", "detail": "Runbook: 1 file matches, 0 Runbook entries"},
         {"status": "warning", "detail": "Runbook: runbooks/x.md: front matter is not valid YAML"},
     ]
+
+
+def test_report_counts_files_left_out_by_conditions(tmp_path):
+    schema = RUNBOOK.replace("          fields:", "          where: [{field: kind, is: runbook}]\n          fields:")
+    lines = report(tmp_path, {
+        "runbooks/a.md": fm("kind: runbook\nowner: ops"),
+        "runbooks/b.md": fm("kind: runbook\nowner: ops"),
+        "runbooks/c.md": fm("kind: note\nowner: ops"),
+        "runbooks/d.md": fm("owner: ops"),
+    }, schema)
+    assert lines == [{"status": "ok", "detail": "Runbook: 4 files match the paths; 2 left out by conditions; 2 Runbook entries"}]
+
+
+def test_report_warns_when_conditions_leave_no_entry(tmp_path):
+    schema = RUNBOOK.replace("          fields:", "          where: [{field: kind, is: runbook}]\n          fields:")
+    lines = report(tmp_path, {"runbooks/a.md": fm("kind: note\nowner: ops")}, schema)
+    assert lines == [{"status": "warning", "detail": "Runbook: 1 file matches the paths; 1 left out by conditions; 0 Runbook entries"}]
+
+
+def test_report_uses_front_matter_already_read(tmp_path, monkeypatch):
+    written = write(tmp_path, {"runbooks/a.md": fm("owner: ops"), "runbooks/b.md": fm("severity: 1")})
+    spec = docs.docs_spec(effective(RUNBOOK))
+    selected = docs.read_selected(spec, docs.files_by_rel(tmp_path, written.values()))
+    monkeypatch.setattr(docs, "read_front_matter", lambda path: pytest.fail("read again"))
+    lines = source_report(tmp_path, effective(RUNBOOK), set(written.values()), selected=selected)
+    assert lines[0] == {"status": "ok", "detail": "Runbook: 2 files match, 1 Runbook entry"}
+    assert lines[1]["detail"] == "Runbook: runbooks/b.md: missing required 'owner'"
 
 
 def test_report_survives_huge_ints_and_surrogates(tmp_path):

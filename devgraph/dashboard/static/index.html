@@ -3925,6 +3925,7 @@ const CONFIG_FORM_REASONS = {
   fieldProvider: "This entry has a `field` but its provider isn't Markdown front matter; the form can't show that. Edit it as YAML.",
   sourceKey: name => "This entry's source has a setting the form doesn't edit: `" + name + "`. Edit it as YAML.",
   fieldsName: name => "This entry's front-matter keys (`fields`) name `" + name + "`, which is not one of its metadata fields; the form can't show that. Edit it as YAML.",
+  fieldsPath: "This entry reads `path` from front matter, but path is always the file's own location; the form can't show that. Edit it as YAML.",
   fieldsOrder: "This entry lists its front-matter keys (`fields`) in a different order from its metadata fields; the form would reorder them. Edit it as YAML.",
   condition: n => "Condition " + n + " doesn't use exactly one test (is, starts_with, contains or like); the form can't show that. Edit it as YAML.",
   handEdit: "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form.",
@@ -4052,6 +4053,7 @@ function configFormFromEntry(section, entry) {
   const docs = src && src.provider === "docs" ? src : null;
   const fields = docs && docs.fields ? docs.fields : {};
   const mapped = Object.keys(fields);
+  if (mapped.includes("path")) return { ok: false, reason: CONFIG_FORM_REASONS.fieldsPath };
   const unknown = mapped.find(k => !names.includes(k));
   if (unknown !== undefined) return { ok: false, reason: CONFIG_FORM_REASONS.fieldsName(unknown) };
   if (mapped.some((k, i) => i && names.indexOf(k) <= names.indexOf(mapped[i - 1]))) return { ok: false, reason: CONFIG_FORM_REASONS.fieldsOrder };
@@ -4181,7 +4183,8 @@ function configFormDocsSource(form, o) {
   });
   if (where.length || "where" in o) v.where = where;
   /* fromEntries: a key is always the entry's own, whatever its name */
-  const fields = Object.fromEntries(form.metadata.filter(m => m.fm_key !== "").map(m => [m.name, m.fm_key]));
+  /* path is the file's own location: its row shows no front-matter key, so none is written */
+  const fields = Object.fromEntries(form.metadata.filter(m => m.fm_key !== "" && m.name !== "path").map(m => [m.name, m.fm_key]));
   if (Object.keys(fields).length || "fields" in o) v.fields = fields;
   return configFormOrdered(v, Object.keys(o), CONFIG_FORM_FIELDS.docs_source);
 }
@@ -4388,8 +4391,7 @@ function configFormHints(section, form, ctx) {
     if ([...c.value].length > L.MAX_CONDITION_TEXT) hint("where." + i + ".value", "The value is longer than " + L.MAX_CONDITION_TEXT + " characters.");
   });
   form.metadata.forEach((m, i) => {
-    if (m.fm_key && m.name === "path") hint("metadata." + i + ".fm_key", "path is the file's own location, so it isn't read from front matter: leave this blank.");
-    else if ([...m.fm_key].length > L.MAX_FRONT_MATTER_KEY_LENGTH) hint("metadata." + i + ".fm_key", keyTooLong);
+    if (m.name !== "path" && [...m.fm_key].length > L.MAX_FRONT_MATTER_KEY_LENGTH) hint("metadata." + i + ".fm_key", keyTooLong);
   });
   return out;
 }
@@ -4702,7 +4704,7 @@ function renderConfigForm(edit) {
         configFormField(holder, "custom", "Custom provider name", configFormText_("input", f.custom, v => { f.custom = v; }),
           "Recorded as data; DevGraph does not run it.");
       } else if (f.provider === "docs") {
-        configFormField(holder, "field", "Field", configFormText_("input", f.field, v => { f.field = v; }),
+        configFormField(holder, "field", "Front-matter key", configFormText_("input", f.field, v => { f.field = v; }),
           "The name before the colon at the top of each file whose value names the target, for example service.");
       }
     };
@@ -4739,23 +4741,26 @@ function renderConfigForm(edit) {
     const paths = rows("Paths", f.paths, "path", "Add path", () => ({ glob: "" }), (set, p, path) => {
       const input = configFormText_("input", p.glob, v => { p.glob = v; });
       input.placeholder = "runbooks/**/*.md";
-      configFormField(set, path + "glob", "Path", input, "Use **/*.md for all folders; matching is case-sensitive.");
+      configFormField(set, path + "glob", "Path", input,
+        "`*` matches any name and `**` any number of folders: runbooks/**/*.md reads every .md file under runbooks/. Upper and lower case must match.");
     }, "paths.", "glob", p => p.glob);
     groupHint(paths, "paths");
     docsHolder.appendChild(paths);
     const where = rows("Conditions", f.where, "condition", "Add condition", () => ({ field: "", op: "is", value: "", open: {} }), (set, c, path) => {
-      text(set, path + "field", "Field", "field", c, "The name before the colon at the top of the file.");
-      configFormField(set, path + "op", "Test", configFormSelect(CONFIG_FORM_FIELDS.condition_operators.map(o => [o, OPS[o]]), c.op, [],
+      text(set, path + "field", "Front-matter key", "field", c, "The name before the colon at the top of the file.");
+      configFormField(set, path + "op", "How to compare", configFormSelect(CONFIG_FORM_FIELDS.condition_operators.map(o => [o, OPS[o]]), c.op, [],
         v => { c.op = v; configFormChanged(); }));
       text(set, path + "value", "Value", "value", c, "Compared as text, so 1 matches version: 1. Capital letters must match too.");
     }, "where.", "field", c => c.field);
     const whereHelp = configEl("div", "cfg-help", "Only files whose front matter passes every condition become entries. With no conditions, every file the paths match does.");
-    where.replaceChildren(where.children[0], whereHelp, ...where.children.slice(1));
+    where.insertBefore(whereHelp, where.children[1]);
     groupHint(where, "where");
     docsHolder.appendChild(where);
   };
   configFormField(box, "source", "Source", configFormSelect(kinds, f.source, [], v => {
     f.source = v;
+    /* a new docs source starts with one Path row to fill in (an empty row is not written) */
+    if (v === "docs" && !f.paths.length) f.paths.push({ glob: "" });
     fillDocs();
     fills.forEach(fn => fn());
     configFormChanged();
@@ -4766,12 +4771,18 @@ function renderConfigForm(edit) {
   const meta = rows("Metadata", f.metadata, "field", "Add field",
     () => ({ name: "", type: "string", required: false, key: false, description: "", fm_key: "", open: {} }),
     (set, m, path) => {
-      text(set, path + "name", "Name", "name", m);
       const fm = configEl("div", "");
+      /* path is the file's own location, never read from front matter: its row has no key */
+      const keyed = () => f.source === "docs" && m.name !== "path";
+      configFormField(set, path + "name", "Name", configFormText_("input", m.name, v => {
+        const before = keyed();
+        m.name = v;
+        if (keyed() !== before) fillKey();
+      }));
       const fillKey = () => {
         configFormClear(fm);
-        fm.style.display = f.source === "docs" ? "" : "none";
-        if (f.source === "docs") {
+        fm.style.display = keyed() ? "" : "none";
+        if (keyed()) {
           text(fm, path + "fm_key", "Front-matter key", "fm_key", m,
             "The name before the colon at the top of the file; leave blank if it's the same as the field name.");
         }

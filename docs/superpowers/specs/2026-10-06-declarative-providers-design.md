@@ -72,7 +72,7 @@ relationships:
   - has a control character (C0, DEL or C1) or a lone surrogate (a YAML `"\ud800"` escape). Front-matter keys and condition text refuse lone surrogates too;
   - uses `**` as a segment more than twice.
 
-  Matching splits the glob and the repo-relative path on `/`. A `**` segment matches zero or more whole folders, and every other segment is matched against one path segment with `fnmatch.fnmatchcase`. It is case-sensitive, and only `**` spans folders. The form hints "use `**/*.md` for every folder". Only `.md` and `.markdown` files are considered.
+  Matching splits the glob and the repo-relative path on `/`. A `**` segment matches zero or more whole folders, and every other segment is matched against one path segment with `fnmatch.fnmatchcase`. It is case-sensitive, and only `**` spans folders. The form's Path help says "`*` matches any name and `**` any number of folders: runbooks/**/*.md reads every .md file under runbooks/. Upper and lower case must match." Only `.md` and `.markdown` files are considered.
 - **`where`** lists at most 20 conditions, all of which must hold. Each is `{field, <operator>: text}` with exactly one operator. The text is at most 200 characters.
 
   | Operator | Holds when the value… | Form wording |
@@ -80,7 +80,7 @@ relationships:
   | `is` | equals the text | "is" |
   | `starts_with` | begins with the text | "starts with" |
   | `contains` | contains the text | "contains" |
-  | `like` | matches the text, where `*` is any run of characters and nothing else is special (`fnmatch.fnmatchcase`, with `?` and `[` escaped) | "looks like (use * as a wildcard)" |
+  | `like` | matches the text, where `*` is any run of characters and nothing else is special (`fnmatch.fnmatchcase`, with `?` and `[` escaped) | "matches pattern (use * as a wildcard)" |
 
   - **Values are compared as text on both sides, case-sensitively.** A string is itself, an integer is written in decimal, and a boolean is written `true`/`false`. So `is: 1` and `is: "1"` both match `version: 1`. The schema accepts a string, integer or boolean after an operator and stores its canonical text.
   - A list value holds when any item holds (`tags: [runbook, oncall]`). Floats, dates, maps and values longer than 4 KiB never hold.
@@ -176,19 +176,20 @@ relationships:
   - `edits.schema_entry_notes` names both providers in its note.
   - `devgraph config schema list` shows `docs (runbooks/**/*.md)` or `filesystem (file)` in the Source column, and the docs fields in `--json`.
 - **`devgraph doctor`.** The Project schemas section gains lines per docs-sourced type, from `docs.source_report(repo_root, effective, files)`. Doctor passes in `walk.indexable_paths(repo_root)`. The report touches no graph and imports no dispatcher. Examples:
-  - OK: "Runbook: 12 files match, 10 Runbook entries".
+  - OK: "Runbook: 12 files match, 10 Runbook entries". A type with conditions says how many they left out: "Runbook: 13 files match the paths; 2 left out by conditions; 11 Runbook entries". Zero entries is a warning.
   - Warning: "Runbook: no file matches runbooks/**/*.md (matching is case-sensitive; use **/*.md for every folder)".
   - Warning, naming up to 5 files with the reason and then "and N more":
-    - "runbooks/db.md: missing required 'owner'";
-    - "runbooks/x.md: front matter is not valid YAML";
-    - "runbooks/y.md: 'severity' is not a whole number, left blank".
-  - Edge values that match no target are a graph question, so `source_report` defers them explicitly. When Neo4j is reachable, doctor adds "Runbook → Service: 'paymnts' (runbooks/pay.md) matches no Service" for up to 5 values. Otherwise it prints "skipped: Neo4j is not reachable", as the drift section does.
+    - "Runbook: runbooks/db.md: missing required 'owner'";
+    - "Runbook: runbooks/x.md: front matter is not valid YAML";
+    - "Runbook: runbooks/y.md: 'severity' is not a whole number, left blank";
+    - "Runbook: and 4 more files with problems".
+  - Edge values that match no target are a graph question, so `source_report` defers them explicitly. When Neo4j is reachable, doctor adds "Runbook: service 'paymnts' in runbooks/pay.md matches no Service" for up to 5 values per relationship, then "Runbook: and N more service values that match no Service". Otherwise it prints "skipped <repo>: links named in front matter not checked: Neo4j is not reachable", as the drift section skips. Doctor reads each matched file once for both checks (`source_report(..., selected=...)`).
 - **The Config page form.** The node-type Source select gains "Markdown front matter". When it is picked, the form shows:
   - Paths, as rows with "Add path" and placeholder `runbooks/**/*.md`;
-  - Conditions, as rows of Field, a Test select in plain words (§2 table) and Value;
+  - Conditions, as rows of Front-matter key, a "How to compare" select in plain words (§2 table) and Value;
   - a "Front-matter key" input on each metadata row, with help text "the name before the colon at the top of the file; leave blank if it's the same as the field name".
 
-  Renaming a metadata row carries its `fields` entry. The relationship Provider select gains "Markdown front matter", which shows a Field input with the same help text.
+  Renaming a metadata row carries its `fields` entry. The relationship Provider select gains "Markdown front matter", which shows a "Front-matter key" input with the same help text. The `path` metadata row has no Front-matter key (an entry mapping `path` in `fields` opens in YAML), and a new docs source starts with one empty Path row.
   - A condition value from YAML that is an integer or boolean is shown as its canonical text and written back unchanged unless edited. It is not refused.
   - These entries open in YAML with a reason: unknown source keys, and a `fields` map whose key order differs from the metadata order (the form could not keep it).
   - `where` and `fields` are optional, so the `configFormFromEntry` all-fields-present check becomes provider-specific.

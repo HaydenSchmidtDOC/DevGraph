@@ -888,14 +888,16 @@ def _docs_source_findings(repos: list[Any], engine: Any) -> list[dict[str, Any]]
 
         try:
             files = walk.indexable_paths(repo.path)
-            for line in docs.source_report(repo.path, effective, files):
+            # each matched file is read once, for both the report and the links
+            selected = docs.read_selected(spec, docs.files_by_rel(repo.path, files))
+            for line in docs.source_report(repo.path, effective, files, selected=selected):
                 add(line["status"], line["detail"])
             if not spec.relationships:
                 continue
             if engine is None:
                 add("skipped", "links named in front matter not checked: Neo4j is not reachable")
                 continue
-            edges = docs.build_edges(spec, repo.repo_id, docs.read_selected(spec, docs.files_by_rel(repo.path, files)))
+            edges = docs.build_edges(spec, repo.repo_id, selected)
             present = {
                 label: engine.existing_node_names(repo.repo_id, label, names)
                 for label, names in docs.edge_targets(edges).items()

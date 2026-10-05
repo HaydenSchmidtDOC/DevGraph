@@ -31,12 +31,20 @@ const configSrc = grab(/^\/\* ── Config page/m, "/* ── end Config page �
 const allEls = [];
 const docRoot = {};
 const inTree = (root, e) => { for (; e; e = e.parentNode) if (e === root) return true; return false; };
+/* like a browser's HTMLCollection: indexable, `length`, `item()` and iterable, but no
+   array methods, so page code that calls .slice/.map on .children fails here too */
+const htmlCollection = kids => {
+  const c = Object.create({ item(i) { return kids[i] || null; }, [Symbol.iterator]() { return kids[Symbol.iterator](); } });
+  kids.forEach((k, i) => { c[i] = k; });
+  c.length = kids.length;
+  return Object.freeze(c);
+};
 const mkEl = tag => {
   const classes = new Set();
   const listeners = {};
   const attrs = {};
   const el = {
-    tagName: tag.toUpperCase(), children: [], dataset: {}, style: { display: "" }, title: "", type: "",
+    tagName: tag.toUpperCase(), _kids: [], get children() { return htmlCollection(el._kids); }, dataset: {}, style: { display: "" }, title: "", type: "",
     value: "", readOnly: false, parentNode: null, _text: "", _html: "",
     /* as in a browser: disabling the focused control (or its fieldset) drops focus to <body> */
     get disabled() { return el._dis === true; },
@@ -45,19 +53,24 @@ const mkEl = tag => {
       if (v && focused && (focused === el || (el.tagName === "FIELDSET" && inTree(el, focused)))) focused = null;
     },
     get isConnected() { let e = el; while (e.parentNode) e = e.parentNode; return e === docRoot || Object.values(els).includes(e); },
-    get textContent() { return el._text + el.children.map(c => c.textContent).join(""); },
-    set textContent(v) { el._text = String(v); el.children = []; },
+    get textContent() { return el._text + el._kids.map(c => c.textContent).join(""); },
+    set textContent(v) { el._text = String(v); el._kids = []; },
     get innerHTML() { return el._html; },
-    set innerHTML(v) { el._html = String(v); el._text = ""; el.children = []; },
+    set innerHTML(v) { el._html = String(v); el._text = ""; el._kids = []; },
     classList: {
       add: c => classes.add(c), remove: c => classes.delete(c), contains: c => classes.has(c),
       toggle: (c, on) => { if (on === undefined ? !classes.has(c) : on) classes.add(c); else classes.delete(c); },
     },
     get className() { return [...classes].join(" "); },
     set className(v) { classes.clear(); String(v).split(" ").filter(Boolean).forEach(c => classes.add(c)); },
-    appendChild(c) { c.parentNode = el; el.children.push(c); return c; },
-    replaceChildren(...cs) { el.children.forEach(c => { c.parentNode = null; }); el.children = []; el._text = ""; cs.forEach(c => el.appendChild(c)); },
-    replaceWith(n) { const p = el.parentNode; p.children[p.children.indexOf(el)] = n; n.parentNode = p; el.parentNode = null; },
+    appendChild(c) { if (c.parentNode) c.parentNode._kids = c.parentNode._kids.filter(k => k !== c); c.parentNode = el; el._kids.push(c); return c; },
+    insertBefore(c, ref) {
+      if (!ref) return el.appendChild(c);
+      if (c.parentNode) c.parentNode._kids = c.parentNode._kids.filter(k => k !== c);
+      c.parentNode = el; el._kids.splice(el._kids.indexOf(ref), 0, c); return c;
+    },
+    replaceChildren(...cs) { el._kids.forEach(c => { c.parentNode = null; }); el._kids = []; el._text = ""; cs.forEach(c => el.appendChild(c)); },
+    replaceWith(n) { const p = el.parentNode; p._kids[p._kids.indexOf(el)] = n; n.parentNode = p; el.parentNode = null; },
     addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
     async fire(type, detail = 1) {
       const ev = { target: el, detail, preventDefault() {} };
@@ -81,7 +94,7 @@ const mkEl = tag => {
   if (tag === "select") {
     let v = null;
     Object.defineProperty(el, "value", {
-      get() { const opts = el.children; return v === null ? (opts[0] ? opts[0].value : "") : opts.some(o => o.value === v) ? v : ""; },
+      get() { const opts = el._kids; return v === null ? (opts[0] ? opts[0].value : "") : opts.some(o => o.value === v) ? v : ""; },
       set(x) { v = String(x); },
     });
   }
@@ -100,7 +113,7 @@ const tagFor = id => id === "configYaml" ? "textarea" : id === "configDest" ? "s
 const els = Object.fromEntries(ids.map(id => [id, mkEl(tagFor(id))]));
 els["pane-config"].classList.add("active");
 /* the modal's own controls sit inside it, in the page's order (the page's other ids don't) */
-const nest = (parent, kids) => kids.forEach(k => { els[k].parentNode = els[parent]; els[parent].children.push(els[k]); });
+const nest = (parent, kids) => kids.forEach(k => { els[k].parentNode = els[parent]; els[parent]._kids.push(els[k]); });
 nest("configDestField", ["configDestLabel", "configDest"]);
 nest("configFormNotice", ["configFormNoticeText", "configFormDiscard"]);
 nest("configFormScroll", ["configForm"]);
@@ -186,12 +199,12 @@ const check = (label, cond, detail) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}${cond ? "" : "\n        " + detail}`);
   if (!cond) failures++;
 };
-const walk = (el, out = []) => { out.push(el); el.children.forEach(c => walk(c, out)); return out; };
+const walk = (el, out = []) => { out.push(el); [...el.children].forEach(c => walk(c, out)); return out; };
 const find = (root, pred) => walk(root).filter(pred);
 const byClass = (root, cls) => find(root, e => e.classList.contains(cls));
 const rowFor = (card, name) => byClass(card, "tool-row").find(r => byClass(r, "tool-name")[0]?.textContent === name);
 const buttons = (root, label) => find(root, e => e.tagName === "BUTTON" && e.textContent === label);
-const card = scope => els.configScopes.children.find(c => c.dataset.scope === scope);
+const card = scope => [...els.configScopes.children].find(c => c.dataset.scope === scope);
 const shown = el => el.style.display !== "none";
 const lastCall = () => fetchCalls[fetchCalls.length - 1];
 /* a deliberate click: well after the button last changed meaning */
@@ -207,8 +220,8 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   // 1. order and structure
   api.renderConfigPage(MODEL());
   check("renders Global first, then each project in payload order",
-    JSON.stringify(els.configScopes.children.map(c => c.dataset.scope)) === JSON.stringify(["__global__", "repo-a", "repo-b"]),
-    JSON.stringify(els.configScopes.children.map(c => c.dataset.scope)));
+    JSON.stringify([...els.configScopes.children].map(c => c.dataset.scope)) === JSON.stringify(["__global__", "repo-a", "repo-b"]),
+    JSON.stringify([...els.configScopes.children].map(c => c.dataset.scope)));
   const g = card("__global__");
   const locks = byClass(g, "cfg-lock");
   check("built-in node and relationship types carry a lock", ["Repository", "Container", "CALLS"].every(label =>
@@ -381,9 +394,9 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("Continue shows the editor", shown(els.configYaml) && els.configModalSave.textContent === "Save" && fetchCalls.length === 0,
     els.configModalSave.textContent);
   check("the destination dropdown lists the global store, then each repo",
-    JSON.stringify(els.configDest.children.map(o => [o.value, o.textContent])) ===
+    JSON.stringify([...els.configDest.children].map(o => [o.value, o.textContent])) ===
       JSON.stringify([["__global__", "Global store"], ["repo-a", "repo-a"], ["repo-b", "repo-b"]]) && shown(els.configDestField),
-    JSON.stringify(els.configDest.children.map(o => [o.value, o.textContent])));
+    JSON.stringify([...els.configDest.children].map(o => [o.value, o.textContent])));
   check("...defaulting to the global store", els.configDest.value === "__global__", els.configDest.value);
 
   // 8. destination switches POST <-> PUT by existence
@@ -1219,8 +1232,8 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     shown(els.configYaml), String(els.configYaml.readOnly));
   check("...a 'Copy to' list without the source, defaulting to the first other repo",
     shown(els.configDestField) && els.configDestLabel.textContent === "Copy to" &&
-    JSON.stringify(els.configDest.children.map(o => o.value)) === JSON.stringify(["repo-b", HOSTILE]) && els.configDest.value === "repo-b" &&
-    api.edit.dest === "repo-b", JSON.stringify(els.configDest.children.map(o => o.value)));
+    JSON.stringify([...els.configDest.children].map(o => o.value)) === JSON.stringify(["repo-b", HOSTILE]) && els.configDest.value === "repo-b" &&
+    api.edit.dest === "repo-b", JSON.stringify([...els.configDest.children].map(o => o.value)));
   check("...saying where it writes and that the source is unchanged",
     els.configModalWarnText.textContent === "Writes to repo-b/devgraph.schema.yaml; repo-a is unchanged." && shown(els.configModalWarn),
     els.configModalWarnText.textContent);
@@ -1350,9 +1363,9 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   fetchCalls = [];
   respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: globalBlock() } });
   await copyBtn("repo-a", "mine")[0].fire("click");
-  check("a tool's destinations include the global store", JSON.stringify(els.configDest.children.map(o => [o.value, o.textContent])) ===
+  check("a tool's destinations include the global store", JSON.stringify([...els.configDest.children].map(o => [o.value, o.textContent])) ===
     JSON.stringify([["repo-b", "repo-b"], [HOSTILE, HOSTILE], ["__global__", "Global store"]]),
-    JSON.stringify(els.configDest.children.map(o => o.value)));
+    JSON.stringify([...els.configDest.children].map(o => o.value)));
   els.configDest.value = "__global__";
   await els.configDest.fire("change");
   check("...the global store's warning says it adds the tool, the source overrides it, and where else it will be overridden",
@@ -1473,7 +1486,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await copyBtn("repo-a", HOSTILE)[0].fire("click");
   check("a hostile node type and repository id are text in the copy dialog",
     els.configModalTitle.textContent === "Copy node type " + HOSTILE + " from repo-a" &&
-    els.configDest.children.some(o => o.textContent === HOSTILE) &&
+    [...els.configDest.children].some(o => o.textContent === HOSTILE) &&
     allEls.every(e => !e._html.includes("<img") && !e._html.includes("onerror")), els.configModalTitle.textContent);
   els.configModalCancel.fire("click");
 
@@ -1961,7 +1974,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   };
   const typeIn = async (el, v) => { el.value = v; await el.fire("input"); };
   const group = title => find(els.configForm, e => e.tagName === "FIELDSET" && e.children[0] && e.children[0].textContent === title)[0];
-  const rowsOf = title => group(title).children.filter(e => e.tagName === "FIELDSET");
+  const rowsOf = title => [...group(title).children].filter(e => e.tagName === "FIELDSET");
   const legendOf = row => row.children[0].textContent;
   const removeOf = row => find(row, e => e.tagName === "BUTTON" && e.textContent === "Remove")[0];
   const editRow = async (scope, name, label = "Edit") => { await buttons(rowFor(card(scope), name), label)[0].fire("click"); };
@@ -2198,13 +2211,13 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await editRow("repo-b", "hot_paths");
   const flagDefault = formCtl("Default", 1);
   check("a boolean default the select has no word for gets its own option, and shows it",
-    flagDefault.tagName === "SELECT" && flagDefault.value === "yes" && flagDefault.children.some(o => o.value === "yes"), flagDefault.value);
+    flagDefault.tagName === "SELECT" && flagDefault.value === "yes" && [...flagDefault.children].some(o => o.value === "yes"), flagDefault.value);
   flagDefault.value = "true";
   await flagDefault.fire("change");
   check("...choosing true writes a boolean", /default: true/.test(els.configYaml.value), els.configYaml.value);
   await press(find(els.configForm, e => e.tagName === "BUTTON" && e.textContent === "Add parameter")[0]);
   check("...and the opened value keeps its option after a rebuild", formCtl("Default", 1).value === "true" &&
-    formCtl("Default", 1).children.some(o => o.value === "yes"), JSON.stringify(formCtl("Default", 1).children.map(o => o.value)));
+    [...formCtl("Default", 1).children].some(o => o.value === "yes"), JSON.stringify([...formCtl("Default", 1).children].map(o => o.value)));
   const limitDefault = formCtl("Default", 0);
   check("a typed default is a text input (a number input would read '' for '12abc')", limitDefault.tagName === "INPUT" && limitDefault.type === "text",
     limitDefault.type);
@@ -2287,10 +2300,10 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     JSON.stringify(find(els.configForm, e => e.tagName === "LABEL").map(l => l.textContent)));
   check("...Type's help says an edit renames it", /Changing it renames the relationship\./.test(
     find(els.configForm, e => e.id === formCtl("Type").getAttribute("aria-describedby").split(" ")[0])[0].textContent), "");
-  check("...the provider options name what each does", JSON.stringify(formCtl("Provider").children.map(o => [o.value, o.textContent])) ===
+  check("...the provider options name what each does", JSON.stringify([...formCtl("Provider").children].map(o => [o.value, o.textContent])) ===
     JSON.stringify([["builtin", "Built-in type"], ["custom", "Custom provider"], ["filesystem", "Filesystem (file → parent folder)"],
       ["docs", "Markdown front matter"]]),
-    JSON.stringify(formCtl("Provider").children.map(o => [o.value, o.textContent])));
+    JSON.stringify([...formCtl("Provider").children].map(o => [o.value, o.textContent])));
   check("...the textarea keeps the server's text, focus on the first control", els.configYaml.value === REL_YAML && focused === formCtl("Type"),
     focused && focused.tagName);
   check("every relationship form control has a label", labelled(els.configForm).length === 0, JSON.stringify(labelled(els.configForm).map(c => c.id)));
@@ -2317,13 +2330,13 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     nameGone &&
     formCtl("Provider") === prov && focused === prov && !formCtl("Custom provider name") &&
     !find(els.configForm, e => e.tagName === "LABEL" && e.textContent === "Custom provider name").length, focused && focused.tagName);
-  const emptyHolders = els.configForm.children.filter(e => e.tagName === "DIV" && !e.children.length && e.style.display !== "none");
+  const emptyHolders = [...els.configForm.children].filter(e => e.tagName === "DIV" && !e.children.length && e.style.display !== "none");
   check("...and the empty holder is out of the layout (no doubled flex gap)", !emptyHolders.length, String(emptyHolders.length));
   check("...and the YAML drops the custom block", /^provider: builtin$/m.test(els.configYaml.value) && !/custom:|owners/.test(els.configYaml.value),
     els.configYaml.value);
   prov.value = "custom";
   await prov.fire("change");
-  check("...the holder is shown again for the custom name", !els.configForm.children.some(e => e.tagName === "DIV" && e.style.display === "none" && !e.children.length), "");
+  check("...the holder is shown again for the custom name", ![...els.configForm.children].some(e => e.tagName === "DIV" && e.style.display === "none" && !e.children.length), "");
   check("switching back shows the custom name again with its value, focus still on the select",
     formCtl("Custom provider name") && formCtl("Custom provider name").value === "owners" && focused === prov &&
     /custom:\n  name: owners\n  params: \{\}/.test(els.configYaml.value), els.configYaml.value);
@@ -2687,6 +2700,8 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     ["fields naming no metadata field", withSource({ fields: { team: "x" } }),
       "This entry's front-matter keys (`fields`) name `team`, which is not one of its metadata fields; the form can't show that. Edit it as YAML."],
     ["a blank front-matter key", withSource({ fields: { owner: "" } }), FIELD("source.fields")],
+    ["a front-matter key for path", withSource({ fields: { path: "file" } }),
+      "This entry reads `path` from front matter, but path is always the file's own location; the form can't show that. Edit it as YAML."],
     ["a non-text front-matter key", withSource({ fields: { owner: 3 } }), FIELD("source.fields")],
     ["a docs source with no paths", { ...DOCS_NODE(), source: { provider: "docs" } }, FIELD("source.paths")],
     ["a path that is not text", withSource({ paths: [1] }), FIELD("source.paths")],
@@ -2758,7 +2773,6 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     ["three **", f => { f.paths[0].glob = "**/a/**/b/**/*.md"; }, "paths.0.glob", /\*\* at most 2 times/],
     ["a condition with no field", f => { f.where[0].field = ""; }, "where.0.field", /Name the front-matter field/],
     ["a long condition value", f => { f.where[0].value = "x".repeat(201); }, "where.0.value", /200 characters/],
-    ["a front-matter key on path", f => { f.metadata[0].fm_key = "file"; }, "metadata.0.fm_key", /path is the file's own location/],
     ["a docs key other than path", f => { f.metadata[0].key = false; f.metadata[1].key = true; }, "source", /Markdown front matter must be keyed on exactly one string field named path/],
   ].forEach(([what, edit, field, re]) => {
     const got = docsHints(edit);
@@ -2790,19 +2804,21 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   respond = quiet;
   await editRow("repo-b", "Ops");
   check("a docs node type opens in the form with Markdown front matter picked", shown(els.configForm) && formCtl("Source").value === "docs" &&
-    formCtl("Source").children.some(o => o.value === "docs" && o.textContent === "Markdown front matter"), formCtl("Source") && formCtl("Source").value);
+    [...formCtl("Source").children].some(o => o.value === "docs" && o.textContent === "Markdown front matter"), formCtl("Source") && formCtl("Source").value);
   check("...paths as rows with the placeholder and the case-sensitivity hint",
     rowsOf("Paths").length === 1 && formCtl("Path").value === "runbooks/**/*.md" && formCtl("Path").placeholder === "runbooks/**/*.md" &&
     find(els.configForm, e => e.id === formCtl("Path").getAttribute("aria-describedby").split(" ")[0])[0].textContent ===
-      "Use **/*.md for all folders; matching is case-sensitive.", formCtl("Path").placeholder);
-  check("...conditions as rows of Field, Test and Value, the test in plain words",
-    rowsOf("Conditions").length === 4 && formCtl("Field", 0, rowsOf("Conditions")[1]).value === "title" &&
-    formCtl("Test", 0, rowsOf("Conditions")[1]).value === "starts_with" && formCtl("Value", 0, rowsOf("Conditions")[2]).value === "1" &&
-    j(formCtl("Test").children.map(o => o.textContent)) === j(["is", "starts with", "contains", "matches pattern (use * as a wildcard)"]),
-    j(formCtl("Test").children.map(o => o.textContent)));
-  const fmHelp = find(els.configForm, e => e.id === formCtl("Front-matter key", 3).getAttribute("aria-describedby").split(" ")[0])[0];
-  check("...and a Front-matter key on each metadata row, with its help",
-    formCtl("Front-matter key", 3).value === "on-call-team" && formCtl("Front-matter key", 1).value === "" &&
+      "`*` matches any name and `**` any number of folders: runbooks/**/*.md reads every .md file under runbooks/. Upper and lower case must match.",
+    formCtl("Path").placeholder);
+  check("...conditions as rows of Front-matter key, How to compare and Value, the comparison in plain words",
+    rowsOf("Conditions").length === 4 && formCtl("Front-matter key", 0, rowsOf("Conditions")[1]).value === "title" &&
+    formCtl("How to compare", 0, rowsOf("Conditions")[1]).value === "starts_with" && formCtl("Value", 0, rowsOf("Conditions")[2]).value === "1" &&
+    j([...formCtl("How to compare").children].map(o => o.textContent)) === j(["is", "starts with", "contains", "matches pattern (use * as a wildcard)"]),
+    j([...formCtl("How to compare").children].map(o => o.textContent)));
+  const metaKey = n => formCtl("Front-matter key", 0, rowsOf("Metadata")[n]);
+  const fmHelp = find(els.configForm, e => e.id === metaKey(3).getAttribute("aria-describedby").split(" ")[0])[0];
+  check("...and a Front-matter key on each metadata row but path, with its help",
+    !metaKey(0) && metaKey(3).value === "on-call-team" && metaKey(1).value === "" &&
     fmHelp.textContent === "The name before the colon at the top of the file; leave blank if it's the same as the field name.", fmHelp && fmHelp.textContent);
   check("every docs node type control has a label", labelled(els.configForm).length === 0, j(labelled(els.configForm).map(c => c.id)));
   check("every button in the docs form has a name", find(els.configForm, e => e.tagName === "BUTTON").every(b => b.textContent || b.getAttribute("aria-label")), "");
@@ -2811,7 +2827,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await typeIn(formCtl("Name", 0, rowsOf("Metadata")[3]), "rota");
   check("renaming a metadata row moves its fields entry in the YAML", /fields:\n    severity: sev\n    rota: "on-call-team"/.test(els.configYaml.value) &&
     !/on_call/.test(els.configYaml.value), els.configYaml.value);
-  const testSel = formCtl("Test", 0, rowsOf("Conditions")[0]);
+  const testSel = formCtl("How to compare", 0, rowsOf("Conditions")[0]);
   testSel.focus();
   testSel.value = "like";
   await testSel.fire("change");
@@ -2829,14 +2845,19 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   srcSel.value = "docs";
   await srcSel.fire("change");
   check("switching back shows them again with their values, focus still on the select",
-    focused === srcSel && formCtl("Path").value === "runbooks/**/*.md" && formCtl("Front-matter key", 3).value === "on-call-team" &&
+    focused === srcSel && formCtl("Path").value === "runbooks/**/*.md" && metaKey(3).value === "on-call-team" &&
     /fields:\n    severity: sev\n    rota: "on-call-team"/.test(els.configYaml.value) && /like: runbook/.test(els.configYaml.value), els.configYaml.value);
+  await typeIn(formCtl("Name", 0, rowsOf("Metadata")[1]), "path");
+  check("renaming a metadata row to path hides its front-matter key, and writes none for it",
+    !metaKey(1) && !/fields:[^]*path:/.test(els.configYaml.value), els.configYaml.value);
+  await typeIn(formCtl("Name", 0, rowsOf("Metadata")[1]), "owner");
+  check("...and renaming it back shows it again", !!metaKey(1) && metaKey(1).value === "", String(!!metaKey(1)));
   await press(find(els.configForm, e => e.tagName === "BUTTON" && e.textContent === "Add path")[0]);
   check("Add path adds a row and focuses it", rowsOf("Paths").length === 2 && focused === formCtl("Path", 1), focused && focused.tagName);
   await typeIn(formCtl("Path", 1), "ops/*.md");
   check("...writing it into paths", /paths: \["runbooks\/\*\*\/\*\.md", "ops\/\*\.md"\]/.test(els.configYaml.value), els.configYaml.value);
   await press(find(els.configForm, e => e.tagName === "BUTTON" && e.textContent === "Add condition")[0]);
-  check("Add condition adds a row and focuses its Field", rowsOf("Conditions").length === 5 && focused === formCtl("Field", 0, rowsOf("Conditions")[4]),
+  check("Add condition adds a row and focuses its Field", rowsOf("Conditions").length === 5 && focused === formCtl("Front-matter key", 0, rowsOf("Conditions")[4]),
     focused && focused.tagName);
   await press(removeOf(rowsOf("Conditions")[4]));
   await press(removeOf(rowsOf("Paths")[1]));
@@ -2845,6 +2866,15 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await press(els.configModalSave);
   check("a docs node type form edit saves through the same dry run", writes().length === 2 && body(writes()[0]).dry_run === true &&
     body(writes()[0]).yaml === els.configYaml.value, j(writes()));
+  els.configModalCancel.fire("click");
+  // a node type that had no docs source starts with one empty Path row, which is not written
+  await editRow("repo-b", "Runbook");
+  const fresh47 = formCtl("Source");
+  fresh47.value = "docs";
+  await fresh47.fire("change");
+  check("choosing Markdown front matter on a new docs source shows one empty Path row and writes paths: []",
+    rowsOf("Paths").length === 1 && formCtl("Path").value === "" && focused !== formCtl("Path") && /source:\n  provider: docs\n  paths: \[\]/.test(els.configYaml.value),
+    els.configYaml.value);
   els.configModalCancel.fire("click");
   // busy: a source change that lands while a request is out changes nothing
   respond = quiet;
@@ -2863,30 +2893,32 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   els.configModalCancel.fire("click");
   // the docs relationship
   await editRow("repo-b", "RUNBOOK_FOR");
-  check("a docs relationship opens in the form with its Field shown", formCtl("Provider").value === "docs" && formCtl("Field").value === "service" &&
-    /the name before the colon at the top of each file/i.test(find(els.configForm, e => e.id === formCtl("Field").getAttribute("aria-describedby").split(" ")[0])[0].textContent),
-    formCtl("Field") && formCtl("Field").value);
+  const relKey = () => formCtl("Front-matter key");
+  check("a docs relationship opens in the form with its Front-matter key shown", formCtl("Provider").value === "docs" && relKey().value === "service" &&
+    /the name before the colon at the top of each file/i.test(find(els.configForm, e => e.id === relKey().getAttribute("aria-describedby").split(" ")[0])[0].textContent),
+    relKey() && relKey().value);
   check("every docs relationship control has a label", labelled(els.configForm).length === 0, j(labelled(els.configForm).map(c => c.id)));
   const dprov = formCtl("Provider");
   dprov.focus();
   dprov.value = "custom";
   await dprov.fire("change");
-  check("switching away from Markdown front matter hides Field in place and drops it from the YAML", focused === dprov && !formCtl("Field") &&
+  check("switching away from Markdown front matter hides Field in place and drops it from the YAML", focused === dprov && !relKey() &&
     !/field:/.test(els.configYaml.value) && !!formCtl("Custom provider name"), els.configYaml.value);
   dprov.value = "docs";
   await dprov.fire("change");
-  check("...and back shows it with its value", focused === dprov && formCtl("Field").value === "service" && /^field: service$/m.test(els.configYaml.value) &&
+  check("...and back shows it with its value", focused === dprov && relKey().value === "service" && /^field: service$/m.test(els.configYaml.value) &&
     !formCtl("Custom provider name"), els.configYaml.value);
   els.configModalCancel.fire("click");
   // hostile docs values land only in .value / textContent
   await editRow("repo-b", "Hostile");
   check("hostile path, condition and front-matter key are control values",
-    formCtl("Path").value === HOSTILE && formCtl("Field").value === HOSTILE && formCtl("Value").value === HOSTILE && formCtl("Front-matter key", 1).value === HOSTILE,
+    formCtl("Path").value === HOSTILE && formCtl("Front-matter key", 0, rowsOf("Conditions")[0]).value === HOSTILE && formCtl("Value").value === HOSTILE &&
+    formCtl("Front-matter key", 0, rowsOf("Metadata")[1]).value === HOSTILE,
     formCtl("Path").value);
   await typeIn(formCtl("Path"), HOSTILE + "/x");
   els.configModalCancel.fire("click");
   await editRow("repo-b", "HOSTILE_DOCS");
-  check("a hostile relationship field is a control value", formCtl("Field").value === HOSTILE, formCtl("Field").value);
+  check("a hostile relationship field is a control value", relKey().value === HOSTILE, relKey().value);
   check("...and nothing docs-sourced reaches innerHTML", allEls.every(e => !e._html.includes("<img") && !e._html.includes("onerror")),
     j(allEls.filter(e => e._html.includes("<img")).map(e => e._html)));
   els.configModalCancel.fire("click");

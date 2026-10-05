@@ -421,22 +421,27 @@ def files_by_rel(repo_root: Path, files: Iterable[Path]) -> dict[str, Path]:
     return by_rel
 
 
-def source_report(repo_root: Path, effective: EffectiveSchema, files: Iterable[Path]) -> list[dict[str, str]]:
+def source_report(
+    repo_root: Path, effective: EffectiveSchema, files: Iterable[Path], *, selected: Selected | None = None
+) -> list[dict[str, str]]:
     """Doctor lines for each docs-sourced type: {"status": "ok" | "warning", "detail": ...}.
 
     `files` are the repository's indexable paths. The report reads only
-    those files and never the graph, so edge values that match no target
+    those files (none, when `selected` is the `read_selected` result for
+    them already) and never the graph, so edge values that match no target
     are left to the caller.
     """
     spec = docs_spec(effective)
     if spec is None:
         return []
     by_rel = files_by_rel(repo_root, files)
-    nodes, problems = build_nodes(spec, "", read_selected(spec, by_rel))
+    if selected is None:
+        selected = read_selected(spec, by_rel)
+    nodes, problems = build_nodes(spec, "", selected)
     lines: list[dict[str, str]] = []
     for docs_type in spec.types:
         label = docs_type.label
-        matched = sum(1 for rel in by_rel if selects(docs_type, rel))
+        matched = [rel for rel in by_rel if selects(docs_type, rel)]
         if not matched:
             lines.append({
                 "status": "warning",
@@ -445,10 +450,18 @@ def source_report(repo_root: Path, effective: EffectiveSchema, files: Iterable[P
             })
             continue
         entries = sum(1 for node in nodes if node["label"] == label)
+        counts = [_plural(len(matched), "file matches", "files match")]
+        if docs_type.where:
+            left_out = sum(
+                1 for rel in matched
+                if selected[rel][0] is not None
+                and not all(_holds(condition, selected[rel][0]) for condition in docs_type.where)
+            )
+            counts = [counts[0] + " the paths", f"{left_out} left out by conditions"]
+        entry_words = _plural(entries, f"{label} entry", f"{label} entries")
         lines.append({
-            "status": "ok",
-            "detail": f"{label}: {_plural(matched, 'file matches', 'files match')}, "
-                      f"{_plural(entries, f'{label} entry', f'{label} entries')}",
+            "status": "ok" if entries else "warning",
+            "detail": f"{label}: " + ("; ".join(counts + [entry_words]) if docs_type.where else f"{counts[0]}, {entry_words}"),
         })
         reasons: dict[str, list[str]] = {}
         for problem in problems:

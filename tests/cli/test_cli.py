@@ -1366,6 +1366,23 @@ def test_cli_doctor_names_front_matter_values_that_match_no_node(runner, temp_re
     assert graph.asked and all(label == "Service" for label, _names in graph.asked)
 
 
+def test_cli_doctor_reads_each_matched_file_once(runner, temp_registry_db, tmp_path, monkeypatch):
+    from devgraph.indexer.providers import docs
+
+    root = _runbook_repo(tmp_path, {
+        "runbooks/x.md": "---\nowner: ops\nservice: apii\n---\n",
+        "runbooks/y.md": "---\nowner: ops\nservice: api\n---\n",
+    })
+    reads = []
+    real = docs.read_front_matter
+    monkeypatch.setattr(docs, "read_front_matter", lambda path: reads.append(path.name) or real(path))
+    section = _project_schemas_section(
+        _docs_doctor(runner, temp_registry_db, monkeypatch, root, _graph_with({"Service": {"api"}})).stdout
+    )
+    assert "Runbook: service 'apii' in runbooks/x.md matches no Service" in section
+    assert sorted(reads) == ["x.md", "y.md"]
+
+
 def test_cli_doctor_skips_the_link_check_when_neo4j_is_unreachable(runner, temp_registry_db, tmp_path, monkeypatch):
     root = _runbook_repo(tmp_path, {"runbooks/x.md": "---\nowner: ops\nservice: apii\n---\n"})
 
