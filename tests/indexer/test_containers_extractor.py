@@ -280,3 +280,9 @@ networks:
         content = "services:\n  api:\n    build: .\n"
         result = self.extractor.extract_from_compose_file(content)
         assert "build_context" not in result.services[0].properties
+
+
+def test_compose_file_that_yaml_cannot_construct_is_skipped():
+    content = "services:\n  web:\n    image: app\n    labels:\n      built: 2001-13-45\n"
+    result = ContainerExtractor("test-repo").extract_from_compose_file(content)
+    assert result.services == []

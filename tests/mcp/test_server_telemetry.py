@@ -35,6 +35,9 @@ class _StubEngine:
 class _StubRegistry:
     """build_server only stows the registry away for tools needing a repo root."""
 
+    def get(self, repo_id):
+        return None
+
 
 @pytest.fixture
 def settings(tmp_path, monkeypatch):
@@ -108,18 +111,61 @@ def test_no_arguments_cypher_or_results_are_recorded(settings):
     # The repo identifier is a caller-supplied argument like any other, and
     # the contract names repository IDs specifically: never harvested.
     assert distinctive_repo_id not in raw
+    assert distinctive_argument not in json.dumps(mcp_server.read_tool_telemetry(100))
     assert "MATCH" not in raw
     assert "results" not in raw
 
 
-def test_a_record_holds_exactly_the_four_allowed_fields(settings):
+_SIX = {"ts", "tool", "tool_id", "origin", "duration_ms", "ok"}
+
+
+def test_a_record_holds_exactly_the_six_allowed_fields(settings):
     server = _build()
 
     asyncio.run(server.call_tool("list_services", {"repo_id": "demo"}))
 
     raw = mcp_server.telemetry_path().read_text(encoding="utf-8")
-    assert json.loads(raw.strip()).keys() == {"ts", "tool", "duration_ms", "ok"}
-    assert mcp_server.read_tool_telemetry(100)[0].keys() == {"ts", "tool", "duration_ms", "ok"}
+    assert json.loads(raw.strip()).keys() == _SIX
+    assert mcp_server.read_tool_telemetry(100)[0].keys() == _SIX
+
+
+def test_a_builtin_call_records_its_bare_name_and_origin(settings):
+    asyncio.run(_build().call_tool("list_services", {"repo_id": "demo"}))
+
+    entry = mcp_server.read_tool_telemetry(100)[0]
+    assert (entry["tool"], entry["tool_id"], entry["origin"]) == ("list_services", "list_services", "builtin")
+
+
+def _stamped(name, tool_id, origin):
+    def fn() -> dict:
+        return {}
+
+    fn.__name__ = name
+    fn.devgraph_tool_id = tool_id
+    fn.devgraph_tool_origin = origin
+    return fn
+
+
+def test_declared_tools_record_scoped_ids_and_a_repo_named_gl_stays_distinct(settings):
+    for name, tool_id, origin in [("x", "gl_x", "global"), ("x", "gl_x", "project"), ("y", "demo_y", "project")]:
+        mcp_server._instrument(_stamped(name, tool_id, origin))()
+
+    got = [(e["tool"], e["tool_id"], e["origin"]) for e in reversed(mcp_server.read_tool_telemetry(100))]
+    assert got == [("x", "gl_x", "global"), ("x", "gl_x", "project"), ("y", "demo_y", "project")]
+
+
+def test_legacy_lines_are_normalised_on_read(settings):
+    lines = [
+        {"ts": 1, "tool": "list_services", "duration_ms": 1, "ok": True},
+        {"ts": 2, "tool": "my_declared_tool", "duration_ms": 1, "ok": True},
+        {"ts": 3, "tool": "list_services", "tool_id": 5, "origin": "bogus", "duration_ms": 1, "ok": True, "extra": "x"},
+    ]
+    mcp_server.telemetry_path().write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+    got = list(reversed(mcp_server.read_tool_telemetry(100)))
+    assert [(e["tool_id"], e["origin"]) for e in got] == [
+        ("list_services", "builtin"), ("my_declared_tool", "unscoped"), ("list_services", "builtin")]
+    assert all(e.keys() == _SIX for e in got)
 
 
 # Runs in its own interpreter, resolving the store from the environment the
@@ -223,7 +269,7 @@ def test_an_unresolvable_store_location_reads_as_no_entries(settings, monkeypatc
 
 
 def test_unexpected_fields_in_the_store_are_never_returned(settings):
-    # A parseable line carrying more than the four allowed fields -- a store
+    # A parseable line carrying more than the six allowed fields -- a store
     # corrupted or hand-edited outside this module. The metadata-only
     # guarantee has to hold where the API reads, not only where it writes.
     mcp_server.telemetry_path().write_text(
@@ -242,7 +288,8 @@ def test_unexpected_fields_in_the_store_are_never_returned(settings):
     )
 
     assert mcp_server.read_tool_telemetry(100) == [
-        {"ts": 1.0, "tool": "search_component", "duration_ms": 2.5, "ok": True}
+        {"ts": 1.0, "tool": "search_component", "tool_id": "search_component", "origin": "builtin",
+         "duration_ms": 2.5, "ok": True}
     ]
 
 

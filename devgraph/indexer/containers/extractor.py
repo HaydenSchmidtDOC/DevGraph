@@ -6,6 +6,8 @@ import re
 
 import yaml
 
+from devgraph.config.project_tools import YAML_LOAD_ERRORS
+
 
 @dataclass
 class ContainerNode:
@@ -143,7 +145,7 @@ class ContainerExtractor:
 
         try:
             compose_data = yaml.safe_load(content)
-        except yaml.YAMLError:
+        except YAML_LOAD_ERRORS:
             # Return empty result if YAML is malformed
             return result
 

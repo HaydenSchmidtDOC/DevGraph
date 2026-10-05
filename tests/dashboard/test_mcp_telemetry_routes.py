@@ -33,7 +33,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_server, "get_settings", lambda: fake)
     registry = RepoRegistry(fake.registry_db_path)
     try:
-        yield TestClient(build_app(_StubEngine(), registry, EventBroadcaster()))
+        yield TestClient(build_app(_StubEngine(), registry, EventBroadcaster()), base_url="http://127.0.0.1")
     finally:
         registry.close()
 
@@ -54,7 +54,35 @@ def test_endpoint_returns_recorded_mcp_entries_newest_first(client):
     assert entries[0]["ok"] is False
     assert entries[0]["duration_ms"] == 12.5
     # The endpoint exposes metadata only -- no repo_id, no other argument.
-    assert entries[0].keys() == {"ts", "tool", "duration_ms", "ok"}
+    assert entries[0].keys() == {"ts", "tool", "tool_id", "origin", "duration_ms", "ok"}
+    assert (entries[0]["tool_id"], entries[0]["origin"]) == ("impact_analysis", "builtin")
+
+
+def test_endpoint_carries_scoped_ids_and_normalises_legacy_lines(client):
+    mcp_server.record_tool_call(tool="f", tool_id="repo-a_f", origin="project", duration_ms=1.0, ok=True)
+    with mcp_server.telemetry_path().open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": 1, "tool": "search_component", "duration_ms": 1, "ok": True}) + "\n")
+        f.write(json.dumps({"ts": 2, "tool": "old_declared", "duration_ms": 1, "ok": True}) + "\n")
+
+    entries = client.get("/api/mcp-telemetry").json()["entries"]
+
+    assert [(e["tool_id"], e["origin"]) for e in entries] == [
+        ("old_declared", "unscoped"), ("search_component", "builtin"), ("repo-a_f", "project")]
+
+
+def test_lines_with_a_non_string_tool_or_tool_id_are_skipped_not_a_500(client):
+    _record("search_component")
+    with mcp_server.telemetry_path().open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": 1, "tool": ["x"], "duration_ms": 1, "ok": True}) + "\n")
+        f.write(json.dumps({"ts": 2, "tool": {"a": 1}, "tool_id": "x", "duration_ms": 1, "ok": True}) + "\n")
+        f.write(json.dumps({"ts": 3, "tool": "t", "tool_id": ["y"], "origin": "project", "duration_ms": 1, "ok": True}) + "\n")
+    _record("impact_analysis")
+
+    res = client.get("/api/mcp-telemetry")
+
+    assert res.status_code == 200
+    assert [e["tool"] for e in res.json()["entries"]] == ["impact_analysis", "t", "search_component"]
+    assert all(isinstance(e["tool_id"], str) for e in res.json()["entries"])
 
 
 def test_endpoint_is_empty_when_nothing_has_been_recorded(client):
@@ -83,7 +111,8 @@ def test_a_store_line_with_extra_fields_is_not_relayed_by_the_endpoint(client):
 
     entries = client.get("/api/mcp-telemetry").json()["entries"]
 
-    assert entries == [{"ts": 1.0, "tool": "search_component", "duration_ms": 2.5, "ok": True}]
+    assert entries == [{"ts": 1.0, "tool": "search_component", "tool_id": "search_component",
+                        "origin": "builtin", "duration_ms": 2.5, "ok": True}]
 
 
 def test_an_unresolvable_store_location_returns_no_entries_not_an_error(client, monkeypatch):

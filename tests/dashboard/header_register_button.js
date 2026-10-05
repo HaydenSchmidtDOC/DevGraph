@@ -31,11 +31,11 @@ const grab = (startRe, endMarker) => {
 };
 
 const registerLine = line(/document\.getElementById\(["']btnRegister["']\)\.addEventListener/);
-const mcpLine = line(/querySelectorAll\(['"]#linkOpenMcpSettings['"]\)/);
+const configLine = line(/querySelectorAll\(['"]#linkOpenConfig['"]\)/);
 const navHandler = grab(/^document\.querySelectorAll\("\.settings-nav button"\)/m, "}));");
 
 // --- stubs ------------------------------------------------------------
-const PANES = ["repos", "mcp", "watcher", "network", "neo4j", "vector", "global"];
+const PANES = ["repos", "config", "watcher", "network", "neo4j", "vector", "global"];
 
 const makeEl = (id, classes) => {
   const set = new Set(classes || []);
@@ -61,18 +61,18 @@ const makeEl = (id, classes) => {
   };
 };
 
-/* The overlay starts closed on the MCP pane, so "the Repos pane is active"
+/* The overlay starts closed on the Config pane, so "the Repos pane is active"
    can only become true if the handler actually switched panes. */
 const settingsOverlay = makeEl("settingsOverlay", ["settings-overlay"]);
 const btnRegister = makeEl("btnRegister", ["btn", "btn-sm"]);
-const linkOpenMcpSettings = makeEl("linkOpenMcpSettings");
+const linkOpenConfig = makeEl("linkOpenConfig");
 const navButtons = PANES.map(p => {
-  const b = makeEl("nav-" + p, p === "mcp" ? ["active"] : []);
+  const b = makeEl("nav-" + p, p === "config" ? ["active"] : []);
   b.dataset.pane = p;
   return b;
 });
-const panes = PANES.map(p => makeEl("pane-" + p, p === "mcp" ? ["settings-pane", "active"] : ["settings-pane"]));
-const els = { settingsOverlay, btnRegister, linkOpenMcpSettings };
+const panes = PANES.map(p => makeEl("pane-" + p, p === "config" ? ["settings-pane", "active"] : ["settings-pane"]));
+const els = { settingsOverlay, btnRegister, linkOpenConfig };
 panes.forEach(p => { els[p.id] = p; });
 
 const sandboxGlobals = {
@@ -81,7 +81,7 @@ const sandboxGlobals = {
     querySelectorAll: sel => {
       if (sel === ".settings-nav button") return navButtons;
       if (sel === ".settings-pane") return panes;
-      if (sel === "#linkOpenMcpSettings") return [linkOpenMcpSettings];
+      if (sel === "#linkOpenConfig") return [linkOpenConfig];
       const byPane = /^\[data-pane="([^"]+)"\]$/.exec(sel);
       if (byPane) return navButtons.filter(b => b.dataset.pane === byPane[1]);
       throw new Error("unstubbed selector: " + sel);
@@ -89,9 +89,11 @@ const sandboxGlobals = {
     querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
   },
   console,
+  loadConfigPage: () => {},
+  configModel: null,
 };
 
-const src = [navHandler, registerLine || "", mcpLine || ""].join("\n");
+const src = [navHandler, registerLine || "", configLine || ""].join("\n");
 new Function(...Object.keys(sandboxGlobals), src)(...Object.values(sandboxGlobals));
 
 // --- helpers ----------------------------------------------------------
@@ -126,7 +128,7 @@ check("exactly one click listener is bound to #btnRegister",
   "click listeners bound: " + btnRegister.listeners.filter(l => l.type === "click").length);
 
 // 3. clicking it opens the overlay ON THE REPOS PANE
-reset("mcp");
+reset("config");
 btnRegister.click();
 check("clicking #btnRegister opens the settings overlay",
   settingsOverlay.classList.contains("open"), "settingsOverlay classes: " + [...settingsOverlay.classes]);
@@ -152,11 +154,16 @@ check("the #btnRegister handler leaves the register-repo submit path alone",
 // 6. the pattern it copies still works -- the shared overlay/pane path is intact
 reset("repos");
 let prevented = 0;
-linkOpenMcpSettings.click({ preventDefault: () => { prevented++; } });
-check("#linkOpenMcpSettings still opens the overlay on the MCP pane",
-  settingsOverlay.classList.contains("open") && activePane() === "pane-mcp",
+linkOpenConfig.click({ preventDefault: () => { prevented++; } });
+check("#linkOpenConfig still opens the overlay on the Config pane",
+  settingsOverlay.classList.contains("open") && activePane() === "pane-config",
   "open=" + settingsOverlay.classList.contains("open") + " pane=" + (activePane() || "none"));
-check("#linkOpenMcpSettings still suppresses its anchor navigation", prevented === 1, "preventDefault calls: " + prevented);
+check("#linkOpenConfig still suppresses its anchor navigation", prevented === 1, "preventDefault calls: " + prevented);
+
+// 7. the prototype MCP tools pane is gone
+check("index.html has no MCP tools pane, nav key, tool list or Cypher toggle",
+  !/data-pane="mcp"|pane-mcp|mcpToolList|toggleCypher|linkOpenMcpSettings/.test(html),
+  "a retired MCP pane reference is still in index.html");
 
 console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
 process.exit(failures ? 1 : 0);

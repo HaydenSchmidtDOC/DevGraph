@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from neo4j import Driver, GraphDatabase
+from neo4j import Driver, GraphDatabase, READ_ACCESS, unit_of_work
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
@@ -71,6 +71,50 @@ _DELETE_STALE_FILE_NODES_CYPHER = (
     "  AND (n.file = $file_name OR n.source_file = $file_name) "
     "  AND NOT any(pair IN $keep WHERE labels(n)[0] = pair[0] AND n.name = pair[1]) "
     "DETACH DELETE n"
+)
+
+# Nodes a schema-declared provider owns (devgraph/indexer/providers/) are
+# tagged with `extractor` and keyed by repo-relative path in `name`; they
+# never carry `file`/`source_file`/`source`, so the built-in per-file cleanup
+# above never touches them and these two queries are their whole lifecycle.
+# A path deletes its own node and, as a directory, everything below it --
+# the trailing '/' keeps `src` from matching `src2/...`.
+_DELETE_EXTRACTED_PATHS_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
+    "AND (n.name IN $paths OR any(p IN $paths WHERE n.name STARTS WITH p + '/')) "
+    "DETACH DELETE n"
+)
+_PRUNE_EXTRACTED_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
+    "AND NOT (labels(n)[0] + ':' + n.name) IN $keep "
+    "DETACH DELETE n RETURN count(n) AS pruned"
+)
+
+# Which project schema the repository's graph was last built with (see
+# dispatch.apply_project_schema). Kept on the Repository node so every
+# process -- CLI, agent, dashboard -- reads the same state.
+_READ_APPLIED_SCHEMA_CYPHER = (
+    "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.schema_hash IS NOT NULL "
+    "RETURN r.schema_hash AS hash, coalesce(r.schema_labels, []) AS labels, "
+    "coalesce(r.schema_relationship_types, []) AS relationship_types, "
+    "coalesce(r.schema_keys, []) AS keys"
+)
+_READ_ALL_APPLIED_SCHEMAS_CYPHER = (
+    "MATCH (r:Repository) WHERE r.schema_hash IS NOT NULL "
+    "RETURN r.repo_id AS repo_id, coalesce(r.schema_labels, []) AS labels, "
+    "coalesce(r.schema_keys, []) AS keys"
+)
+_RECORD_APPLIED_SCHEMA_CYPHER = (
+    "MERGE (r:Repository {repo_id: $repo_id}) "
+    "SET r.schema_hash = $hash, r.schema_labels = $labels, "
+    "r.schema_relationship_types = $relationship_types, r.schema_keys = $keys"
+)
+# Constraints, and the indexes no constraint owns: the objects a project
+# schema can generate (see devgraph/indexer/schema_constraints.py).
+_SHOW_CONSTRAINTS_CYPHER = "SHOW CONSTRAINTS YIELD name, type, entityType, labelsOrTypes, properties"
+_SHOW_INDEXES_CYPHER = (
+    "SHOW INDEXES YIELD name, type, entityType, labelsOrTypes, properties, owningConstraint "
+    "WHERE owningConstraint IS NULL RETURN name, type, entityType, labelsOrTypes, properties"
 )
 
 # Transient Neo4j failures worth retrying: a connection blip, an expired
@@ -502,6 +546,117 @@ class GraphEngine:
             _retry_transient(session.run, _DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
             _retry_transient(session.run, _UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name)
 
+    def delete_extracted_nodes(self, repo_id: str, extractor: str, paths: list[str]) -> None:
+        """Delete one provider's nodes at these repo-relative paths, or below them."""
+        if not paths:
+            return
+        with self._driver.session() as session:
+            _retry_transient(
+                session.run, _DELETE_EXTRACTED_PATHS_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
+            )
+
+    def prune_extracted_nodes(self, repo_id: str, extractor: str, keep: list[str]) -> int:
+        """Delete every node of one provider in a repo except `keep` ("Label:name").
+
+        The full-scan reconcile for provider-owned nodes: it also removes nodes
+        of a label the schema no longer declares.
+        """
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run, _PRUNE_EXTRACTED_CYPHER, repo_id=repo_id, extractor=extractor, keep=keep
+            )
+            records = [record.data() for record in result or []]
+        return records[0]["pruned"] if records else 0
+
+    def read_applied_schema(self, repo_id: str) -> dict[str, Any] | None:
+        """The schema state the repo's graph was last built with, or None."""
+        with self._driver.session() as session:
+            result = _retry_transient(session.run, _READ_APPLIED_SCHEMA_CYPHER, repo_id=repo_id)
+            records = [record.data() for record in result or []]
+        return records[0] if records else None
+
+    def read_all_applied_schemas(self) -> list[dict[str, Any]]:
+        """Every repository's recorded user labels and keys, from the graph itself."""
+        with self._driver.session() as session:
+            result = _retry_transient(session.run, _READ_ALL_APPLIED_SCHEMAS_CYPHER)
+            return [record.data() for record in result or []]
+
+    def record_applied_schema(
+        self,
+        repo_id: str,
+        schema_hash: str,
+        labels: list[str],
+        relationship_types: list[str],
+        keys: list[str] | None = None,
+    ) -> None:
+        """Record the schema hash and user labels/relationship types/keys the repo's graph was last built with.
+
+        `keys` holds one "Label:k1,k2" string per label.
+        """
+        with self._driver.session() as session:
+            _retry_transient(
+                session.run, _RECORD_APPLIED_SCHEMA_CYPHER, repo_id=repo_id, hash=schema_hash,
+                labels=labels, relationship_types=relationship_types, keys=keys or [],
+            )
+
+    def list_schema_objects(self) -> list[dict[str, Any]]:
+        """Every constraint and every index no constraint owns, each tagged with `kind`."""
+        with self._driver.session() as session:
+            constraints = [
+                {**record.data(), "kind": "constraint"}
+                for record in _retry_transient(session.run, _SHOW_CONSTRAINTS_CYPHER) or []
+            ]
+            indexes = [
+                {**record.data(), "kind": "index"}
+                for record in _retry_transient(session.run, _SHOW_INDEXES_CYPHER) or []
+            ]
+        return constraints + indexes
+
+    def run_schema_statement(self, statement: str) -> None:
+        """Run one CREATE/DROP CONSTRAINT/INDEX statement. The caller builds it from validated names."""
+        with self._driver.session() as session:
+            _retry_transient(session.run, statement).consume()
+
+    def has_duplicate_keys(self, label: str, properties: tuple[str, ...]) -> bool:
+        """Whether two `label` nodes share every one of `properties` (all non-null), i.e. a
+        uniqueness constraint on them could not be created. The caller validates the names."""
+        values = ", ".join(f"n.`{p}` AS `{p}`" for p in properties)
+        present = " AND ".join(f"n.`{p}` IS NOT NULL" for p in properties)
+        query = (
+            f"MATCH (n:`{label}`) WHERE {present} WITH {values}, count(*) AS c "
+            "WHERE c > 1 RETURN 1 AS dup LIMIT 1"
+        )
+        with self._driver.session() as session:
+            result = _retry_transient(session.run, query)
+            return bool([record for record in result or []])
+
+    def label_has_nodes(self, label: str) -> bool:
+        """Whether any node, in any repository, carries `label`. The caller validates `label`."""
+        with self._driver.session() as session:
+            result = _retry_transient(session.run, f"MATCH (n:`{label}`) RETURN n LIMIT 1")
+            return bool([record for record in result or []])
+
+    def delete_label_nodes(self, repo_id: str, label: str) -> int:
+        """Delete one repo's nodes of a user label. The caller validates `label`."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run, f"MATCH (n:`{label}` {{repo_id: $repo_id}}) DETACH DELETE n RETURN count(n) AS n",
+                repo_id=repo_id,
+            )
+            records = [record.data() for record in result or []]
+        return records[0]["n"] if records else 0
+
+    def delete_relationship_type(self, repo_id: str, rel_type: str) -> int:
+        """Delete one repo's relationships of a user type. The caller validates `rel_type`."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                f"MATCH (a {{repo_id: $repo_id}})-[r:`{rel_type}`]->() DELETE r RETURN count(r) AS n",
+                repo_id=repo_id,
+            )
+            records = [record.data() for record in result or []]
+        return records[0]["n"] if records else 0
+
     def list_indexed_files(self, repo_id: str) -> set[str]:
         """Return every repo-relative path that currently backs file-provenance
         nodes for this repo.
@@ -730,6 +885,29 @@ class GraphEngine:
         with self._driver.session() as session:
             result = session.run(query, parameters or {})  # type: ignore[arg-type]
             return [record.data() for record in result]
+
+    def run_read_cypher(
+        self, query: str, parameters: dict[str, Any], *, timeout_s: float, max_rows: int
+    ) -> tuple[list[dict], bool]:
+        """Run one user-declared query read-only, bounded in time and rows.
+
+        Read access mode makes the server refuse any write; the transaction
+        timeout bounds the time; rows stop being pulled after `max_rows`, and
+        the second value says whether more existed. Used by the MCP tool
+        plane for `devgraph.tools.yaml` tools.
+        """
+
+        @unit_of_work(timeout=timeout_s)
+        def work(tx):
+            rows: list[dict] = []
+            for record in tx.run(query, parameters):
+                if len(rows) == max_rows:
+                    return rows, True
+                rows.append(record.data())
+            return rows, False
+
+        with self._driver.session(default_access_mode=READ_ACCESS) as session:
+            return session.execute_read(work)
 
     def run_cypher_graph(self, query: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
         """Same escape hatch as `run_cypher`, but preserves node/relationship
