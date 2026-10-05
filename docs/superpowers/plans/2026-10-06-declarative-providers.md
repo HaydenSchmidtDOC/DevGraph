@@ -166,7 +166,9 @@ Tests: `tests/indexer/test_docs_provider_live.py` (new, live), `tests/indexer/te
   - **Relink:**
     - a runbook naming `api` is indexed first, the compose file is added in a later batch, and the edge appears;
     - the compose file is deleted and then recreated, and the edge comes back;
-    - re-indexing an unchanged compose file triggers no relink, because nothing was added.
+    - re-indexing an unchanged compose file triggers no relink, because nothing was added;
+    - a docs-to-docs link: a runbook names an ADR path whose file is added in a later batch, and the edge appears.
+  - **Shared path, reverse:** with a docs `Runbook` and a filesystem `File` over the same file, deleting the file and then a filesystem `sync_absent` leave no orphaned `Runbook` edges and remove only the matching nodes.
   - **Bad values:** one file with an int64-overflow value and one with a 200-item list, in a batch with good files. The good nodes are written and a warning is logged.
   - **Deletes:** deleting a file, and deleting the directory, removes the nodes.
   - **Schema changes:**
@@ -230,7 +232,7 @@ Tests:
   - that docs→docs edge values are file paths for now, with front-matter keys the next slice;
   - the safety list and the known limit.
 - `PROJECT_STATUS.md`: declarative providers slice 1 done; `git`/`ast` and front-matter keys open.
-- `CONTEXT.md`: add **Declarative provider** and **Docs source** in the glossary's existing format. If this branch still lacks the file (it currently lives only on the coordinator branch), create it at the repo root with just these terms under a "Project schema" heading.
+- README.md: define **Declarative provider** and **Docs source** in the project-schema section. Do not create or edit `CONTEXT.md` (it is not part of this repository).
 
 - [ ] Live, against a throwaway registry and repository:
   - Add the Runbook type and the RUNBOOK_FOR relationship through the Config page form.

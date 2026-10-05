@@ -196,7 +196,7 @@ relationships:
   - the boolean wording;
   - the Service fan-out;
   - that docs→docs edge values are file paths for now, with front-matter keys the next slice.
-- **CONTEXT.md.** Gains **Declarative provider** and **Docs source**. Today the glossary exists only on the coordinator branch; Task 6 adds the terms wherever it lives once merged, or creates it at the repo root in that format.
+- **Glossary.** The README's project-schema section defines **Declarative provider** and **Docs source**. No `CONTEXT.md` is created here.
 
 ## 6. Out of scope
 
