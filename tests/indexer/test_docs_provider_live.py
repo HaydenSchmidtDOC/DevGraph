@@ -965,7 +965,7 @@ def test_a_long_chain_of_stale_entries_is_chased_with_a_fixed_number_of_lookups(
         monkeypatch.setattr(engine, name, lambda *args, _real=real, _name=name: calls.append(_name) or _real(*args))
     index_paths(engine, REPO, keyed, {q})
 
-    assert len(calls) <= 3, calls
+    assert len(calls) <= 4, calls  # the batch's snapshot and fetch, the pulled-in owners, the relink's fetch
     found = entries(engine)
     assert found["T"] == "decisions/c00.md" and found["K-0"] == "decisions/c01.md"
     assert f"K-{length - 1}" not in found
@@ -1034,6 +1034,24 @@ def test_a_relink_writes_no_edge_onto_an_entry_its_pending_owner_has_not_moved_y
         index_paths(engine, REPO, keyed, {g})
     assert entries(engine)["ADR-K3"] == "decisions/sub/c.md"
     assert links(engine, "ZZ_ADR_RFC") == []
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_a_relink_links_an_entry_from_its_file_while_a_pending_claimant_outranks_it(engine, keyed):
+    # g.md holds ADR-K1 and names RFC K3, which doesn't exist yet. b.md claims
+    # ADR-K1 too (and outranks g.md) but its event is pending when K3 appears,
+    # then b.md is deleted before it: the entry stays at g.md, linked from g.md.
+    g = md(keyed, "decisions/g.md", "id: ADR-K1\nrfc: ADR-K3")
+    kscan(engine, keyed)
+
+    b = md(keyed, "decisions/b.md", "id: ADR-K1")
+    r = md(keyed, "x/r.md", "id: ADR-K3\nkind: rfc")
+    index_paths(engine, REPO, keyed, {r})
+    b.unlink()
+    remove_paths(engine, REPO, keyed, {b})
+
+    assert entries(engine)["ADR-K1"] == "decisions/g.md" and g.exists()
+    assert links(engine, "ZZ_ADR_RFC") == [("ADR-K1", "ADR-K3")]
     assert_matches_fresh_apply(engine, REPO, keyed)
 
 

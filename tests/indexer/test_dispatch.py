@@ -1250,7 +1250,8 @@ class TestFieldKeyedDocsApply:
     def test_relink_writes_no_edge_from_a_loser_outside_the_batch(self, temp_repo):
         spec, _files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
-        # The copy, outside the batch, names ADR-9 but loses ADR-1 to the original.
+        engine.extracted_entries = lambda repo_id, extractor, labels: {("Adr", "ADR-1", "decisions/adr-1.md")}
+        # The copy, outside the batch, names ADR-9 but its ADR-1 entry sits at the original.
         dispatch._relink_docs(engine, "demo", temp_repo, spec, {("Adr", "ADR-9")}, {"decisions/adr-1.md"})
         assert engine.calls == [("upsert_relationships", ([],))]
 

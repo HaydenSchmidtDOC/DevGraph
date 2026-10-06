@@ -433,11 +433,11 @@ def _relink_docs(
     A docs edge to a node that didn't exist yet was skipped when its file was
     indexed. Only added nodes can be such a target: a re-indexed node MERGEs
     in place and keeps its incoming edges. Re-reads the files the docs types
-    select, and only when a docs relationship targets an
-    added node's label. The batch's `view` supplies the walk, the field-keyed
-    front matter and the owners (built here when a type is field-keyed and
-    the batch had none), so only the other files are read. An edge from a
-    field-keyed entry is written only when the entry is already at that file.
+    select, and only when a docs relationship targets an added node's label.
+    The batch's `view` supplies the walk and the field-keyed front matter
+    (built here when a type is field-keyed and the batch had none), so only
+    the other files are read. A field-keyed entry is linked from the file it
+    sits at in the graph (one query), whichever file owns its key on disk.
     """
     target_labels = {relationship.to_label for relationship in spec.relationships}
     targets = {(label, name) for label, name in added if label in target_labels}
@@ -452,19 +452,18 @@ def _relink_docs(
             files = dict(view.files)
         outside = {rel: p for rel, p in files.items() if rel not in batch}
         selected = _read_reusing(spec, outside, view.selected if view else {})
-        owners = view.owners if view else {}
-        edges = docs.build_edges(spec, repo_id, selected, targets, owners=owners)
-        keyed = sorted(docs_type.label for docs_type in spec.types if docs_type.key is not None)
-        if keyed and edges:
-            # A field-keyed owner whose own event is pending may not hold its
-            # entry yet; an edge hung on the entry at another file would outlive
-            # the owner giving the id up. Its event links it instead.
-            placed = engine.extracted_entries(repo_id, docs.EXTRACTOR, keyed)
-            edges = [
-                edge for edge in edges
-                if edge["from_label"] not in keyed or (edge["from_label"], edge["from_name"], edge["from_path"]) in placed
-            ]
-        engine.upsert_relationships(edges)
+        owners: Mapping[tuple[str, str], str] = {}
+        if view is not None:
+            # Each field-keyed entry is linked from the file it sits at in the
+            # graph, not from its owner on disk: a claimant whose event is
+            # pending may outrank that file, and give the id up again before its
+            # event (which would rebuild the entry's links) ever arrives.
+            keyed = sorted(docs_type.label for docs_type in spec.types if docs_type.key is not None)
+            owners = {
+                (label, name): path
+                for label, name, path in engine.extracted_entries(repo_id, docs.EXTRACTOR, keyed)
+            }
+        engine.upsert_relationships(docs.build_edges(spec, repo_id, selected, targets, owners=owners))
     except Exception:
         logger.warning("docs relink failed for %s; the next rescan links them", repo_id, exc_info=True)
 
