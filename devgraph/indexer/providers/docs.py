@@ -39,7 +39,7 @@ from devgraph.config.project_schema import INT64_MAX, INT64_MIN, Condition, Docs
 from devgraph.config.project_tools import YAML_LOAD_ERRORS
 from devgraph.config.yaml_bound import YAML_MAX_NODES, bounded_safe_load
 from devgraph.indexer.docs.extractor import _FRONTMATTER_RE
-from devgraph.indexer.walk import repo_relative
+from devgraph.indexer.walk import is_ignored_path, repo_relative
 from devgraph.paths import MAX_CONFIG_BYTES, FileTooLarge, NotRegularFile, read_bounded
 
 EXTRACTOR = "docs"
@@ -596,9 +596,13 @@ def files_by_rel(repo_root: Path, files: Iterable[Path]) -> dict[str, Path]:
     """`files` keyed by their repo-relative POSIX path, as `read_selected` takes them.
 
     Keyed like the indexer (`walk.repo_relative`), so a symlink is keyed by its
-    target; a path outside the repository is left out.
+    target; a path outside the repository or, through a symlink, under an
+    ignored directory is left out.
     """
-    return {rel: path for path in files if (rel := repo_relative(repo_root, path)) is not None}
+    return {
+        rel: path for path in files
+        if (rel := repo_relative(repo_root, path)) is not None and not is_ignored_path(Path(rel))
+    }
 
 
 def source_report(

@@ -164,7 +164,7 @@ def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) ->
             engine.delete_relationship_type(repo_id, rel_type)
 
     spec = filesystem.filesystem_spec(effective)
-    disk = {rel: p for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
+    disk = _disk_files(repo_root)
     on_disk = set(disk)
     docs_spec = docs.docs_spec(effective)
     docs_nodes, selected = _prune_docs(engine, repo_id, docs_spec, disk)
@@ -229,6 +229,16 @@ def _upsert_deferred_label(
             repo_id, label, ", ".join(others) or "another repository",
             "declares" if len(others) <= 1 else "declare", label, exc,
         )
+
+
+def _disk_files(repo_root: Path) -> dict[str, Path]:
+    """Every file a full scan indexes, by repo-relative path. A symlink is keyed
+    by its target, so one into an ignored directory is left out, as
+    `_is_provider_file` leaves it out of a batch."""
+    return {
+        rel: p for p in _indexable_paths(repo_root)
+        if (rel := _repo_relative(repo_root, p)) is not None and not is_ignored_path(Path(rel))
+    }
 
 
 def _is_provider_file(repo_root: Path, path: Path) -> bool:
@@ -296,7 +306,7 @@ def _keyed_view(repo_root: Path, spec: docs.DocsSpec, seen: Mapping[str, tuple] 
     batch's front matter (`seen`). Owners always come from all of them, never
     from the batch alone or from the graph.
     """
-    files = {rel: p for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
+    files = _disk_files(repo_root)
     keyed = docs.DocsSpec(tuple(docs_type for docs_type in spec.types if docs_type.key is not None), ())
     selected = _read_reusing(keyed, files, seen or {})
     claims = docs.keyed_claims(spec, selected)
@@ -433,7 +443,7 @@ def _relink_docs(
         if view is None and any(docs_type.key is not None for docs_type in spec.types):
             view = _keyed_view(repo_root, spec)
         if view is None:
-            files = {rel: p for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
+            files = _disk_files(repo_root)
         else:
             files = dict(view.files)
         outside = {rel: p for rel, p in files.items() if rel not in batch}

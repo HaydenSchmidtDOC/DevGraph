@@ -1001,6 +1001,18 @@ def test_a_takeover_moves_only_the_deleted_entries_and_leaves_the_rest_to_the_ow
     assert_matches_fresh_apply(engine, REPO, keyed)
 
 
+def test_a_symlink_into_an_ignored_directory_is_left_out_by_the_scan_and_by_a_save(engine, keyed):
+    md(keyed, "build/hidden.md", "kind: rfc\nid: RFC-H")
+    (keyed / "decisions" / "h.md").symlink_to(keyed / "build" / "hidden.md")
+    kscan(engine, keyed)
+    assert entries(engine, RFC) == {}
+    assert not [line for line in doctor_lines(keyed) if "build/hidden.md" in line]
+
+    index_paths(engine, REPO, keyed, {keyed / "decisions" / "h.md"})
+    assert entries(engine, RFC) == {}
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
 def test_deleting_an_owner_without_a_claimant_removes_its_entry_and_edges(engine, keyed):
     kscan(engine, keyed)
     path = keyed / "decisions" / "adr-012.md"
