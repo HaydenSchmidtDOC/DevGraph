@@ -294,6 +294,16 @@ def _coerce(value: Any, declared: str) -> tuple[Any, str | None]:
     return None, f"is not {_TYPE_WORDS[declared]}"
 
 
+def _hidden(c: str) -> bool:
+    """A control, format, line or paragraph separator, or noncharacter code point."""
+    point = ord(c)
+    return (
+        unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp")
+        or 0xFDD0 <= point <= 0xFDEF
+        or point & 0xFFFE == 0xFFFE
+    )
+
+
 def _key_text(raw: Any) -> tuple[str | None, str | None]:
     """(key text, None), or (None, why the value can't name an entry, after the field's name).
 
@@ -304,19 +314,22 @@ def _key_text(raw: Any) -> tuple[str | None, str | None]:
     """
     if type(raw) is int:
         if not _in_int64(raw):
-            return None, "does not fit in 64 bits"
+            return None, "is too large; quote it to keep it as text"
         return str(raw), None
     if type(raw) is not str:
         return None, "is not text or a whole number"
-    problem = _text_problem(raw)
-    if problem is not None:
-        return None, problem
+    try:
+        size = len(raw.encode("utf-8"))
+    except UnicodeEncodeError:  # a lone surrogate, from a YAML "\ud800" escape
+        return None, "isn't valid text; retype it"
+    if size > MAX_VALUE_BYTES:
+        return None, f"is longer than {MAX_VALUE_BYTES // 1024} KiB"
     if not raw:
         return None, "is empty"
     if raw != raw.strip():
         return None, "starts or ends with whitespace"
-    if any(unicodedata.category(c) in ("Cc", "Cf") for c in raw):
-        return None, "holds an invisible or control character"
+    if any(_hidden(c) for c in raw):
+        return None, "holds an invisible or control character; retype it without the hidden character"
     if raw.startswith("./"):
         return None, "starts with ./, which a link can never name"
     return raw, None
@@ -339,7 +352,7 @@ def _node(docs_type: DocsType, repo_id: str, rel: str, values: Mapping[Any, Any]
             return None, [f"{key.key!r} {why}"]
     reasons: list[str] = []
     for field in docs_type.fields:
-        if field is key:
+        if field == key:
             properties[field.name] = name
             continue
         raw = values.get(field.key)
@@ -611,7 +624,7 @@ def source_report(
         for rel in losers:
             problems.append(Problem(label, rel, (
                 f"{field!r} '{key}' is also used by {owner}, whose path sorts first and keeps it; "
-                f"change the id in one of them"
+                f"change the {field} in one of them"
             )))
     lines: list[dict[str, str]] = []
     for docs_type in spec.types:

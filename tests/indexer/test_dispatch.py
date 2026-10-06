@@ -1156,3 +1156,86 @@ class TestMentionRelinkBound:
             assert "rescan" in caplog.text
         finally:
             engine.delete_repository(repo_id)
+
+
+_KEYED_ADR_SCHEMA = textwrap.dedent("""
+    version: 1
+    node_types:
+      - label: Adr
+        key: [adr_id]
+        metadata: [{name: path}, {name: adr_id}]
+        source: {provider: docs, paths: ["decisions/*.md"], fields: {adr_id: id}}
+    relationships:
+      - {type: REPLACES, provider: docs, from: Adr, to: Adr, field: supersedes}
+""")
+
+
+class _RecordingEngine:
+    """Records every engine call by name and arguments; returns None."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: self.calls.append((name, args))
+
+
+def _keyed_docs(temp_repo):
+    from devgraph.config.project_schema import parse_project_schema, resolve_declaration
+    from devgraph.indexer.providers import docs
+
+    files = {}
+    for rel, body in {
+        "decisions/adr-1.md": "id: ADR-1\nsupersedes: ADR-0",
+        "decisions/adr-1 copy.md": "id: ADR-1\nsupersedes: ADR-9",
+    }.items():
+        path = temp_repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"---\n{body}\n---\n", encoding="utf-8")
+        files[rel] = path
+    spec = docs.docs_spec(resolve_declaration(parse_project_schema(_KEYED_ADR_SCHEMA, Path("devgraph.schema.yaml"))))
+    return spec, files
+
+
+class TestFieldKeyedDocsApply:
+    """The apply/full-scan path gates field-keyed docs entries on owners from every file on disk."""
+
+    def test_prune_docs_keeps_only_each_keys_owner(self, temp_repo):
+        spec, files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+        nodes, selected = dispatch._prune_docs(engine, "demo", spec, files)
+        assert [(n["name"], n["properties"]["path"]) for n in nodes] == [("ADR-1", "decisions/adr-1.md")]
+        assert sorted(selected) == sorted(files)
+        assert engine.calls[-1] == ("prune_extracted_nodes", ("demo", "docs", ["Adr:ADR-1"]))
+
+    def test_prune_docs_writes_nothing_when_building_nodes_fails(self, temp_repo, monkeypatch):
+        from devgraph.indexer.providers import docs
+
+        spec, files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+
+        def boom(*args, **kwargs):
+            raise ValueError("owners are required")
+
+        monkeypatch.setattr(docs, "build_nodes", boom)
+        with pytest.raises(ValueError):
+            dispatch._prune_docs(engine, "demo", spec, files)
+        assert engine.calls == []
+
+    def test_full_scan_edge_pass_writes_edges_from_owners_only(self, temp_repo, monkeypatch):
+        from devgraph.indexer.providers import docs
+
+        spec, files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+        monkeypatch.setattr(dispatch, "schema_pending", lambda *args: False)
+        dispatch._sync_docs_edges(engine, "demo", temp_repo, (spec, docs.read_selected(spec, files)))
+        ((name, (edges,)),) = engine.calls
+        assert name == "upsert_relationships"
+        assert [(e["from_path"], e["to_name"]) for e in edges] == [("decisions/adr-1.md", "ADR-0")]
+
+    def test_batch_path_skips_field_keyed_docs_without_writing(self, temp_repo):
+        spec, files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+        assert dispatch._read_docs_batch("demo", spec, files) is None
+        dispatch._relink_docs(engine, "demo", temp_repo, spec, {("Adr", "ADR-0")}, set())
+        assert engine.calls == []

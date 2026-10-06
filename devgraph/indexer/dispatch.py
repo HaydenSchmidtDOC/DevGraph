@@ -194,18 +194,24 @@ def _prune_docs(
     produces are pruned (all of them when no type is docs-sourced). Returns
     the nodes for the caller to upsert, and the front matter read (None
     without docs types).
+
+    `files` is every file on disk, so the owners of field-keyed entries are
+    worked out from all of them (`docs.keyed_owners`). The nodes are built
+    before anything is written, so a failure leaves the graph untouched.
     """
-    engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, None)
     nodes: list[dict] = []
     selected = None
+    if spec is not None:
+        selected = docs.read_selected(spec, files)
+        owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
+        nodes, problems = docs.build_nodes(spec, repo_id, selected, owners)
+        _log_docs_problems(repo_id, problems)
+    engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, None)
     if spec is not None:
         for docs_type in spec.types:
             engine.clear_extracted_properties(
                 repo_id, docs.EXTRACTOR, docs_type.label, [field.name for field in docs_type.fields]
             )
-        selected = docs.read_selected(spec, files)
-        nodes, problems = docs.build_nodes(spec, repo_id, selected)
-        _log_docs_problems(repo_id, problems)
     engine.prune_extracted_nodes(repo_id, docs.EXTRACTOR, [f"{n['label']}:{n['name']}" for n in nodes])
     return nodes, selected
 
@@ -290,7 +296,8 @@ def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, applied
         return
     spec, selected = applied
     try:
-        engine.upsert_relationships(docs.build_edges(spec, repo_id, selected))
+        owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
+        engine.upsert_relationships(docs.build_edges(spec, repo_id, selected, owners=owners))
     except Exception:
         logger.warning("docs edge pass failed for %s; the next rescan retries it", repo_id, exc_info=True)
 

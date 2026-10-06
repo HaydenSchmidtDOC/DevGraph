@@ -1052,12 +1052,16 @@ def test_an_integer_key_is_its_decimal_text_and_links_meet_it(tmp_path):
         ("id: ''", "'id' is empty"),
         ("id: ' ADR-1'", "'id' starts or ends with whitespace"),
         ("id: 'ADR-1 '", "'id' starts or ends with whitespace"),
-        ("id: 9223372036854775808", "'id' does not fit in 64 bits"),
+        ("id: 9223372036854775808", "'id' is too large; quote it to keep it as text"),
         pytest.param("id: " + "x" * 4097, "'id' is longer than 4 KiB", id="over-4-kib"),
-        ('id: "ADR\\u202e1"', "'id' holds an invisible or control character"),
-        ('id: "ADR\\a1"', "'id' holds an invisible or control character"),
-        ('id: "ADR\\N1"', "'id' holds an invisible or control character"),
-        ('id: "ADR\\ud8001"', "'id' is not valid text"),
+        ('id: "ADR\\u202e1"', "'id' holds an invisible or control character; retype it without the hidden character"),
+        ('id: "ADR\\a1"', "'id' holds an invisible or control character; retype it without the hidden character"),
+        ('id: "ADR\\N1"', "'id' holds an invisible or control character; retype it without the hidden character"),
+        ('id: "ADR\\u20281"', "'id' holds an invisible or control character; retype it without the hidden character"),
+        ('id: "ADR\\u20291"', "'id' holds an invisible or control character; retype it without the hidden character"),
+        ('id: "ADR\\uffff1"', "'id' holds an invisible or control character; retype it without the hidden character"),
+        ('id: "ADR\\ufdd01"', "'id' holds an invisible or control character; retype it without the hidden character"),
+        ('id: "ADR\\ud8001"', "'id' isn't valid text; retype it"),
         ("id: ./ADR-1", "'id' starts with ./, which a link can never name"),
     ],
 )
@@ -1271,3 +1275,33 @@ def test_unmatched_report_names_the_file_and_hints_for_field_keyed_targets(tmp_p
         "Adr: supersedes 'decisions/adr-012.md' in decisions/adr-013.md matches no Adr "
         "(Adr entries are named by 'id', not by file path)",
     ]
+
+
+def test_expand_to_owners_never_adds_a_loser_outside_the_batch(tmp_path):
+    files = write(tmp_path, {
+        "decisions/adr-1.md": fm("id: ADR-1"),
+        "decisions/adr-1 copy.md": fm("id: ADR-1"),
+        "decisions/adr-1 (1).md": fm("id: ADR-1"),
+        "decisions/adr-2.md": fm("id: ADR-2"),
+    })
+    spec = spec_of(ADR)
+    selected = read_selected(spec, files)
+    claims = docs.keyed_claims(spec, selected)
+    view = docs.KeyedView(files, selected, claims, docs.keyed_owners(claims))
+    batch = read_selected(spec, {"decisions/adr-2.md": files["decisions/adr-2.md"]})
+    keys = {("Adr", "ADR-1"), ("Adr", "ADR-2")}
+    expanded = docs.expand_to_owners(view, batch, keys)
+    assert sorted(expanded) == ["decisions/adr-1.md", "decisions/adr-2.md"]
+    assert len(expanded) <= len(batch) + len(keys)
+
+
+def test_report_duplicate_line_names_the_key_field(tmp_path):
+    schema = ADR.replace("fields: {adr_id: id}", "fields: {adr_id: number}")
+    lines = report(tmp_path, {
+        "decisions/a.md": fm("number: 7"),
+        "decisions/b.md": fm("number: 7"),
+    }, schema=schema)
+    assert lines[1]["detail"] == (
+        "Adr: decisions/b.md: 'number' '7' is also used by decisions/a.md, "
+        "whose path sorts first and keeps it; change the number in one of them"
+    )
