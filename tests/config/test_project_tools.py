@@ -43,7 +43,7 @@ def tool_text(cypher, params="", extra=""):
 
 
 def load_text(tmp_path, text):
-    (tmp_path / TOOLS_FILENAME).write_text(text)
+    (tmp_path / TOOLS_FILENAME).write_text(text, encoding="utf-8")
     return load_project_tools(tmp_path)
 
 

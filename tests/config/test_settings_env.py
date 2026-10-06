@@ -13,6 +13,7 @@ def clean_env(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # what Path.home() reads on Windows
     for key in list(os.environ):
         if key.startswith("DEVGRAPH_"):
             monkeypatch.delenv(key)

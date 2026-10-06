@@ -1805,7 +1805,7 @@ def test_claude_mcp_add_passes_safe_path_flag(tmp_path):
         assert cli_main._run_claude_mcp_add("/usr/bin/claude", Path("/venv/bin/python"), tmp_path)
 
     add_cmd = mock_run.call_args_list[-1].args[0]
-    assert add_cmd[add_cmd.index("--") + 1:] == ["/venv/bin/python", "-P", "-m", "devgraph.mcp.server"]
+    assert add_cmd[add_cmd.index("--") + 1:] == [str(Path("/venv/bin/python")), "-P", "-m", "devgraph.mcp.server"]
 
 
 def _write_shadow_package(workdir: Path, marker: str) -> None:

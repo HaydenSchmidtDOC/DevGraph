@@ -236,7 +236,11 @@ def test_realistic_deep_document_under_the_bound_loads_identically():
     assert bounded_safe_load(text) == yaml.safe_load(text)
 
 
-@pytest.mark.parametrize("text", [_nested(30_000), "a: " + _nested(300), "{a: " * 5000 + "}" * 5000])
+@pytest.mark.parametrize(
+    "text",
+    [_nested(30_000), "a: " + _nested(300), "{a: " * 5000 + "}" * 5000],
+    ids=["deep-flow", "deep-under-a-key", "deep-mapping"],  # a 30k-char id overflows the Windows environment
+)
 def test_pathological_nesting_is_a_bound_error_not_a_recursion_error(text):
     with pytest.raises(YAMLBoundError, match="levels deep"):
         bounded_safe_load(text)

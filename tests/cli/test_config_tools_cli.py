@@ -1,6 +1,7 @@
 """`devgraph config tools` (list/add/edit/delete/reset) and global-tool reporting."""
 
 import json
+import sys
 import textwrap
 
 import pytest
@@ -474,6 +475,7 @@ def test_list_shows_builtin_named_tools_as_ignored(runner, repo, store):
     assert only_global == [{"name": "search_component", "origin": "global", "locked": False, "ignored": "shadows a locked tool"}]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
 def test_project_write_is_atomic_and_keeps_the_mode(runner, repo, tmp_path, monkeypatch):
     import os
     import stat

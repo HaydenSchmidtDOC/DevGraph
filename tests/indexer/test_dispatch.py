@@ -846,8 +846,6 @@ class TestDeterministicIndexOrder:
         in the repo, not by how the caller spelled them."""
         (temp_repo / "a.py").write_text("def a():\n    pass\n")
         (temp_repo / "b.py").write_text("def b():\n    pass\n")
-        monkeypatch.chdir(temp_repo)
-
         seen: list[str] = []
 
         def record(engine, repo_id, repo_root, resolved, rel_path, *args):
@@ -855,8 +853,11 @@ class TestDeterministicIndexOrder:
             return 1
 
         monkeypatch.setattr(dispatch, "_index_single_path", record)
-        # As raw strings "/tmp/.../b.py" sorts before "a.py".
-        index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {Path("a.py"), (temp_repo / "b.py").resolve()})
+        # Leave the directory before temp_repo removes it: Windows can't delete the working directory.
+        with monkeypatch.context() as m:
+            m.chdir(temp_repo)
+            # As raw strings "/tmp/.../b.py" sorts before "a.py".
+            index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {Path("a.py"), (temp_repo / "b.py").resolve()})
 
         assert seen == ["a.py", "b.py"]
 

@@ -3,6 +3,7 @@
 import logging
 import sqlite3
 import subprocess
+import sys
 
 from devgraph.config import project_switch
 from devgraph.config.project_schema import (
@@ -87,7 +88,7 @@ def test_load_project_schema_and_hash_honour_the_switch(tmp_path, monkeypatch):
 
 
 def test_a_registry_path_with_uri_special_characters_still_applies(tmp_path, monkeypatch):
-    odd = tmp_path / "a#b ?c%20"
+    odd = tmp_path / ("a#b c%20" if sys.platform == "win32" else "a#b ?c%20")  # no "?" in Windows names
     odd.mkdir()
     db = odd / "r.sqlite3"
     monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db)

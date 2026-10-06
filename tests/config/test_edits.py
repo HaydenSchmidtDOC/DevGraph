@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -144,6 +145,7 @@ def test_symlinked_target_is_refused(tmp_path):
     assert real.read_text() == TOOLS_FILE
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
 def test_write_atomically_keeps_mode(tmp_path):
     path = tmp_path / "f.yaml"
     path.write_text("a")
@@ -356,7 +358,7 @@ def test_node_type_rename_to_a_taken_label_is_refused(tmp_path):
     assert (tmp_path / "devgraph.schema.yaml").read_bytes() == before
 
 
-@pytest.mark.parametrize("kind", ["dir", "fifo"])
+@pytest.mark.parametrize("kind", ["dir", pytest.param("fifo", marks=pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs"))])
 def test_non_regular_target_is_refused_without_opening_it(tmp_path, kind):
     target = tmp_path / "devgraph.tools.yaml"
     if kind == "dir":
