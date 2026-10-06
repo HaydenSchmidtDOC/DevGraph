@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS repos (
     pr_source_enabled INTEGER NOT NULL DEFAULT 0,
     issue_source_enabled INTEGER NOT NULL DEFAULT 0,
     last_indexed_commit TEXT,
-    mentions_enabled INTEGER NOT NULL DEFAULT 0
+    mentions_enabled INTEGER NOT NULL DEFAULT 0,
+    project_config_enabled INTEGER NOT NULL DEFAULT 1,
+    project_tools_sha256 TEXT
 );
 """
 
@@ -46,9 +48,20 @@ _MIGRATIONS = (
         "mentions_enabled",
         "ALTER TABLE repos ADD COLUMN mentions_enabled INTEGER NOT NULL DEFAULT 0",
     ),
+    (
+        "project_config_enabled",
+        "ALTER TABLE repos ADD COLUMN project_config_enabled INTEGER NOT NULL DEFAULT 1",
+    ),
+    ("project_tools_sha256", "ALTER TABLE repos ADD COLUMN project_tools_sha256 TEXT"),
 )
 
 _SLUG_RE = re.compile(r"[^a-z0-9_-]+")
+
+
+# Scope tokens the dashboard matches by exact equality before any registry
+# lookup (the Config page's global store, the canvas's "All Repos"): never
+# issued as a repo id, so a repository can't be shadowed by one.
+RESERVED_REPO_IDS = frozenset({"__global__", "__all__"})
 
 
 def _slugify(name: str) -> str:
@@ -68,6 +81,9 @@ class RepoRecord:
     issue_source_enabled: bool = False
     last_indexed_commit: str | None = None
     mentions_enabled: bool = False
+    project_config_enabled: bool = True
+    # sha256 of the devgraph.tools.yaml bytes the user approved (`devgraph config tools trust`); None = not trusted
+    project_tools_sha256: str | None = None
 
 
 class RepoRegistry:
@@ -176,7 +192,7 @@ class RepoRegistry:
             candidate = _slugify(repo_id or resolved.name)
             final_id = candidate
             suffix = 2
-            while self._conn.execute(
+            while final_id in RESERVED_REPO_IDS or self._conn.execute(
                 "SELECT 1 FROM repos WHERE repo_id = ?", (final_id,)
             ).fetchone():
                 final_id = f"{candidate}-{suffix}"
@@ -252,6 +268,21 @@ class RepoRegistry:
         """Opt this repo in/out of mentions indexing. Default is off (Principle 2)."""
         self._set_flag(repo_id, "mentions_enabled", enabled)
 
+    def set_project_config_enabled(self, repo_id: str, enabled: bool) -> None:
+        """Switch this repo's project config files (schema, tools) on or off. Default is on."""
+        self._set_flag(repo_id, "project_config_enabled", enabled)
+
+    def set_project_tools_sha256(self, repo_id: str, sha256: str | None) -> None:
+        """Record (or clear, with None) the approved sha256 of this repo's tools file. Default is none."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE repos SET project_tools_sha256 = ? WHERE repo_id = ?", (sha256, repo_id)
+            )
+            self._conn.commit()
+        if cur.rowcount == 0:
+            raise ValueError(f"no such repo_id: {repo_id}")
+        self._touch_change_marker()
+
     def set_last_indexed_commit(self, repo_id: str, sha: str | None) -> None:
         """Record the most recently walked commit SHA for incremental git history indexing."""
         with self._lock:
@@ -265,7 +296,8 @@ class RepoRegistry:
 
     _COLUMNS = (
         "repo_id, path, active, watch_enabled, last_indexed, docs_path, "
-        "pr_source_enabled, issue_source_enabled, last_indexed_commit, mentions_enabled"
+        "pr_source_enabled, issue_source_enabled, last_indexed_commit, mentions_enabled, "
+        "project_config_enabled, project_tools_sha256"
     )
 
     def get(self, repo_id: str) -> RepoRecord | None:
@@ -297,6 +329,8 @@ class RepoRegistry:
             issue_source_enabled,
             last_indexed_commit,
             mentions_enabled,
+            project_config_enabled,
+            project_tools_sha256,
         ) = row
         return RepoRecord(
             repo_id,
@@ -309,4 +343,6 @@ class RepoRegistry:
             bool(issue_source_enabled),
             last_indexed_commit,
             bool(mentions_enabled),
+            bool(project_config_enabled),
+            project_tools_sha256,
         )

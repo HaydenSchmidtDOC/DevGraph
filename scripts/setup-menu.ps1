@@ -98,7 +98,7 @@ if ($codeCmd -or (Test-Path $vscodeUserDir)) {
 if ($clients.Count -eq 0) {
     Write-Step "No supported AI client detected"
     Write-Info "Run this to get manual registration instructions any time:"
-    Write-Info "  $venvPython -m devgraph.cli.main client-config"
+    Write-Info "  $venvPython -P -m devgraph.cli.main client-config"
     Write-Host "`n==> Next steps" -ForegroundColor Cyan
     Write-Host "  devgraph add <path-to-a-git-repo>"
     Write-Host "`nSetup complete." -ForegroundColor Green
@@ -132,7 +132,7 @@ if ($selectedTargets.Count -eq 0) {
     # 6. Register against each selected target
     Write-Step "Registering DevGraph"
     foreach ($target in $selectedTargets) {
-        & $venvPython -m devgraph.cli.main client-config --target $target --run
+        & $venvPython -P -m devgraph.cli.main client-config --target $target --run
     }
 }
 

@@ -85,14 +85,18 @@ do not hardcode a path here, DevGraph's install location can differ machine
 to machine:
 
 ```bash
-"<DevGraph repo's resolved venv python, from devgraph client-config>" -m devgraph.cli.main register "<absolute path to this repo>"
+"<DevGraph repo's resolved venv python, from devgraph client-config>" -P -m devgraph.cli.main register "<absolute path to this repo>"
 ```
+
+Keep the `-P` flag in every command here: it stops Python from putting the
+current directory on its module path, so a `devgraph/` folder inside this
+repo cannot be imported in place of DevGraph itself.
 
 Add `--full` to also index git commit history in the same step (equivalent
 to a separate `index-history` call):
 
 ```bash
-"<venv python>" -m devgraph.cli.main register "<absolute path to this repo>" --full
+"<venv python>" -P -m devgraph.cli.main register "<absolute path to this repo>" --full
 ```
 
 This registers the repo **and runs a full initial scan** — Python source,
@@ -107,7 +111,7 @@ it. If Neo4j isn't reachable at registration time, `register` still succeeds
 Confirm registration:
 
 ```bash
-"<venv python>" -m devgraph.cli.main list
+"<venv python>" -P -m devgraph.cli.main list
 ```
 
 Only paths registered this way are ever watched or indexed by DevGraph —
@@ -123,7 +127,7 @@ rather than duplicating. Use it any time you want the graph refreshed after
 a batch of changes:
 
 ```bash
-"<venv python>" -m devgraph.cli.main rescan <repo_id>
+"<venv python>" -P -m devgraph.cli.main rescan <repo_id>
 ```
 
 **Git history** (separate command — not part of the file-scan above;
@@ -131,7 +135,7 @@ incremental, only walks new commits since the last run — or fold it into
 `register`/`rescan` with `--full` instead of calling this separately):
 
 ```bash
-"<venv python>" -m devgraph.cli.main index-history <repo_id>
+"<venv python>" -P -m devgraph.cli.main index-history <repo_id>
 ```
 
 **Docs / design decisions** (optional — only if this repo has Markdown notes
@@ -139,16 +143,16 @@ with `type: requirement|design_decision|architecture_note` front-matter;
 `rescan` picks these up automatically too, once `--docs-path` is set):
 
 ```bash
-"<venv python>" -m devgraph.cli.main annotate <repo_id> --docs-path <repo-relative docs folder>
-"<venv python>" -m devgraph.cli.main annotate <repo_id> --note <repo-relative note file>   # index one note immediately
+"<venv python>" -P -m devgraph.cli.main annotate <repo_id> --docs-path <repo-relative docs folder>
+"<venv python>" -P -m devgraph.cli.main annotate <repo_id> --note <repo-relative note file>   # index one note immediately
 ```
 
 **PR/issue history** is opt-in and talks to an external service (GitHub,
 etc.) — do not enable it without the repo owner's explicit go-ahead:
 
 ```bash
-"<venv python>" -m devgraph.cli.main pr-source enable <repo_id>
-"<venv python>" -m devgraph.cli.main issue-source enable <repo_id>
+"<venv python>" -P -m devgraph.cli.main pr-source enable <repo_id>
+"<venv python>" -P -m devgraph.cli.main issue-source enable <repo_id>
 ```
 
 Enabling the flags above doesn't fetch anything by itself yet — actually
@@ -177,14 +181,18 @@ not this literal text):
 ## Connect DevGraph as an MCP server
 
 - **command**: <resolved path to DevGraph's venv python.exe>
-- **args**: -m devgraph.mcp.server
+- **args**: -P -m devgraph.mcp.server
 - **cwd**: <resolved DevGraph repo root>
 
-claude mcp add devgraph -- "<resolved venv python.exe>" -m devgraph.mcp.server
+claude mcp add devgraph -- "<resolved venv python.exe>" -P -m devgraph.mcp.server
 
 VS Code (user mcp.json at <resolved path>):
 { "servers": { "devgraph": { "type": "stdio", "command": "...", "args": [...], "cwd": "..." } } }
 ```
+
+A Claude Code registration made before `-P` was added is left as-is by
+`--run` (an existing entry is skipped); run `claude mcp remove devgraph` and
+register again to pick it up. The VS Code entry is rewritten in place.
 
 `devgraph client-config --claude-mcp-add-only` prints just the Claude Code
 one-liner; `devgraph client-config --run` also executes registration for the
@@ -223,6 +231,33 @@ fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
 `max_results` (default 15) to widen the sample when you genuinely need more
 than the default. `search_component`'s `count` maxes out at 50 (its own
 Cypher cap) even if more matches exist beyond that.
+
+**Project tools**: if this repo has a `devgraph.tools.yaml`, the MCP session
+also serves its tools for the session's repository (`DEVGRAPH_MCP_REPO`, else
+the server's working directory). Read `devgraph://project-tools` for what is
+served. The server checks the file every 2 seconds and serves the new set
+without a restart, telling the client its tool list changed (clients that
+support `tools/list_changed` re-list automatically). Any edit changes the file's
+bytes, so it stops serving project tools until re-trusted; only trusted bytes that
+fail to parse keep the last good tools, with a notice (see `devgraph://project-tools`). Pin a project with
+`claude mcp add devgraph -e DEVGRAPH_MCP_REPO=<repo_id> -- "<venv python>" -P -m devgraph.mcp.server`.
+A path value must be absolute (a relative value is read as a repo id), and a value
+that matches no active registered repository serves nothing. A repository whose project config is disabled (`devgraph config disable`) serves no project tools; `devgraph://project-tools` says so. If `devgraph` is already
+registered in that project, run `claude mcp remove devgraph` first.
+
+**Global tools**: tools defined once with `devgraph config tools ... --global`
+are also served in every session scoped to a repository (an unscoped session
+serves none). Built-in tools win, then project tools, then global tools. Two
+notices can appear in a tool's response envelope: `resolved: project override
+of global tool '<name>'` (the project's tool replaced a global one) and `used
+global tool '<name>': <reason>` (the global tool is served because the project
+tool of that name could not be). A built-in tool whose name a project or global
+tool also uses says so in a `notices` list in each response:
+`ignored: project tool '<name>' shadows a locked tool; using the fixed
+implementation` (or `global tool`). Built-ins that return a list
+(`find_requirements_for`, `blame_component`, `run_cypher`) can't carry it;
+`devgraph://project-tools` reports it for them. `devgraph://project-tools` lists each served
+tool's origin and the global tools file.
 
 `run_cypher` will not appear unless DevGraph's own config has
 `enable_run_cypher=true` set. If it's missing and you need something the

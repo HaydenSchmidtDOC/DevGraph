@@ -16,13 +16,24 @@ repo's own `record.path`).
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from devgraph.config import get_settings
-from devgraph.graph.engine import GraphEngine
+from devgraph.config.project_schema import (
+    ABSENT_SCHEMA_HASH,
+    LABEL_PATTERN,
+    RELATIONSHIP_TYPE_PATTERN,
+    ProjectSchemaError,
+    resolve_effective_schema,
+    schema_file_hash,
+)
+from devgraph.graph.engine import GraphEngine, provision_repository_schema
+from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.containers.extractor import ContainerExtractor
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
+from devgraph.indexer.docs.extractor import DocsExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.csharp.extractor import extract_csharp_file
 from devgraph.indexer.go.extractor import _find_module_path, extract_go_file
@@ -30,9 +41,13 @@ from devgraph.indexer.java.extractor import extract_java_file
 from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.kotlin.extractor import extract_kotlin_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
+from devgraph.indexer.mentions.extractor import mentions_any, upsert_document_node
 from devgraph.indexer.cpp.extractor import extract_cpp_file
+from devgraph.indexer.providers import filesystem
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
+from devgraph.indexer.schema_constraints import encode_keys, realign_keys, release_labels
+from devgraph.paths import is_within
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +105,111 @@ IGNORED_DIR_NAMES = {
 _JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
 
 
+def is_ignored_dir_name(name: str) -> bool:
+    return name in IGNORED_DIR_NAMES or name.endswith(".egg-info")
+
+
 def is_ignored_path(path: Path) -> bool:
-    return any(part in IGNORED_DIR_NAMES or part.endswith(".egg-info") for part in path.parts)
+    return any(is_ignored_dir_name(part) for part in path.parts)
 
 
-def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None, mentions_enabled: bool = False) -> int:
+def _filesystem_spec(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | None]:
+    """(schema usable, spec). An invalid schema disables the provider for this
+    call -- including any prune -- so a bad edit never deletes good nodes."""
+    try:
+        return True, filesystem.load_filesystem_spec(repo_root)
+    except ProjectSchemaError as exc:
+        logger.warning("project schema for %s is invalid; filesystem provider skipped: %s", repo_root, exc)
+        return False, None
+
+
+def schema_pending(engine: GraphEngine, repo_id: str, repo_root: Path) -> bool:
+    """True when the schema file differs from the one the graph was built with.
+
+    A repository with no recorded state and no schema file has nothing to
+    apply, so repositories registered before schema tracking are never
+    pending just for lacking state.
+    """
+    current = schema_file_hash(repo_root)
+    applied = engine.read_applied_schema(repo_id)
+    if applied is None:
+        return current != ABSENT_SCHEMA_HASH
+    return current != applied["hash"]
+
+
+def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> bool:
+    """Bring the graph in line with the repository's current schema file.
+
+    Provisions constraints/indexes, deletes nodes and relationships of user
+    types the previously applied schema declared but this one doesn't
+    (built-ins are never touched), re-syncs the filesystem provider, records
+    the applied state, then reconciles the generated constraints/indexes with
+    every repository's recorded state (see schema_constraints). An invalid
+    schema or a provisioning failure returns False with the graph untouched;
+    errors from the deletion or reconcile steps propagate, while a failed
+    constraint reconcile (or the re-provisioning after the record) is only logged.
+    """
+    current_hash = schema_file_hash(repo_root)
+    try:
+        effective = resolve_effective_schema(repo_root)
+    except ProjectSchemaError as exc:
+        logger.warning("project schema for %s is invalid; not applied: %s", repo_root, exc)
+        return False
+    try:
+        provision_repository_schema(engine, repo_root)
+    except Exception as exc:
+        logger.warning("could not provision the project schema for %s; not applied: %s", repo_root, exc)
+        return False
+
+    labels = [node_type.label for node_type in effective.node_types]
+    rel_types = list(dict.fromkeys(r.type for r in effective.relationships if r.type not in RELATIONSHIP_TYPES))
+    previous = engine.read_applied_schema(repo_id) or {}
+    # Re-validated: these names come back from the graph and are interpolated.
+    removed_labels = [
+        label for label in previous.get("labels") or []
+        if label not in labels and label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or "")
+    ]
+    for label in removed_labels:
+        engine.delete_label_nodes(repo_id, label)
+    for rel_type in previous.get("relationship_types") or []:
+        if rel_type not in rel_types and rel_type not in RELATIONSHIP_TYPES and RELATIONSHIP_TYPE_PATTERN.fullmatch(rel_type or ""):
+            engine.delete_relationship_type(repo_id, rel_type)
+
+    spec = filesystem.filesystem_spec(effective)
+    on_disk = {rel for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
+    filesystem.reconcile(engine, repo_id, spec, on_disk)
+    if spec is not None:
+        filesystem.sync_present(engine, repo_id, spec, on_disk)
+    engine.record_applied_schema(repo_id, current_hash, labels, rel_types, encode_keys(effective.node_types))
+    # After recording, so this repository's new state is part of what every
+    # other repository's declarations are weighed against. Provisioning is
+    # re-run first: another repository's apply may have released a label
+    # between this one's provisioning and its record, and nothing else would
+    # re-create the constraint (the schema is no longer pending).
+    try:
+        engine.init_schema(effective)
+        release_labels(engine, removed_labels)
+        realign_keys(engine, effective.node_types)
+    except Exception as exc:
+        logger.warning("could not reconcile generated constraints/indexes for %s: %s", repo_id, exc)
+    return True
+
+
+def _repo_relative(repo_root: Path, path: Path) -> str | None:
+    """Repo-relative POSIX path, or None for a path outside the repository."""
+    try:
+        return Path(path).resolve().relative_to(repo_root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return None
+
+
+def _is_provider_file(repo_root: Path, path: Path) -> bool:
+    """A file the filesystem provider represents: what a full scan would index."""
+    rel = _repo_relative(repo_root, path)
+    return rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel))
+
+
+def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None, mentions_enabled: bool = False, sync_provider: bool = True) -> int:
     """Index a set of changed files, routing each to its extractor by name/extension.
 
     Args:
@@ -103,14 +218,20 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         repo_root: The repo's root path, used to resolve docs_path and to
             compute relative paths for provenance.
         paths: Files to (re)index. Paths outside repo_root are silently
-            skipped — this function never indexes anything the caller didn't
-            explicitly hand it, but the extra check guards against a caller
-            bug passing an unrelated path.
+            skipped. Besides these, the batch also re-indexes files that
+            refer to what these files contain: direct importers (see
+            _expand_with_reverse_dependents) and files whose by-name edges
+            target a node the batch adds (see _find_referrers), and relinks
+            Markdown mentioning an added name (see _mention_referrers).
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
+        sync_provider: Write filesystem-provider nodes for `paths` (skipped
+            while the schema is pending). False when the caller has just
+            applied the schema.
 
     Returns:
-        Number of files actually indexed (skipped/unrecognized files don't count).
+        Number of files actually indexed, including those referrers
+        (skipped/unrecognized files and Markdown relinks don't count).
     """
     indexed = 0
     docs_root = (repo_root / docs_path).resolve() if docs_path else None
@@ -144,46 +265,97 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # per file) that the Python branch has no equivalent of.
     go_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     module_path = _find_module_path(repo_root)
+    # Markdown files whose cross-file edges are resolved after every other
+    # node in the batch exists (see the docs/mentions passes below).
+    docs_files: list[Path] = []
+    mention_files: list[Path] = []
 
-    paths = _expand_with_reverse_dependents(engine, repo_id, repo_root, paths)
-
-    for path in paths:
-        path = Path(path)
+    # Process files in a fixed order, not set order. Shared nodes
+    # (Datastore/Endpoint) keep the last writer's `source`/`library` and
+    # accumulate `sources` in claim order -- so iterating the set directly
+    # made the graph depend on PYTHONHASHSEED. (Cross-file edges no longer
+    # depend on order: they are re-resolved in the passes after this loop.)
+    # Each path is resolved once and the batch is sorted by its
+    # repo-relative POSIX path, so the order is the same however the caller
+    # spelled a path (relative, absolute, through a symlink).
+    root_resolved = repo_root.resolve()
+    by_rel_path: dict[str, Path] = {}
+    for path in _expand_with_reverse_dependents(engine, repo_id, repo_root, paths):
         try:
-            resolved = path.resolve()
+            resolved = Path(path).resolve()
         except OSError:
             continue
-        if not str(resolved).startswith(str(repo_root.resolve())):
+        if not is_within(resolved, root_resolved):
             continue
+        by_rel_path[resolved.relative_to(root_resolved).as_posix()] = resolved
+
+    def index_one(rel_path: str, resolved: Path) -> None:
+        nonlocal indexed
         if not resolved.exists() or not resolved.is_file():
-            continue
-
-        name_lower = resolved.name.lower()
-        rel_path = resolved.relative_to(repo_root.resolve()).as_posix()
-
+            return
         # One unparseable/locked file (or a transient Neo4j error mid-batch)
         # must not abort the whole batch: a full scan or watcher batch would
         # otherwise silently lose every file after the failure point. Log and
         # skip the offending file so the rest of the batch still indexes.
         try:
             indexed += _index_single_path(
-                engine, repo_id, repo_root, resolved, rel_path, name_lower,
+                engine, repo_id, repo_root, resolved, rel_path, resolved.name.lower(),
                 docs_root, mentions_enabled, module_path,
                 py_files, py_extractions, js_files, js_extractions,
                 cs_files, cs_extractions, cpp_files, cpp_extractions,
                 java_files, java_extractions, rs_files, rs_extractions,
                 kt_files, kt_extractions, go_extractions,
+                docs_files, mention_files,
             )
         except Exception:
             logger.warning(
                 "indexing failed for %s (%s); skipping file", repo_id, rel_path, exc_info=True
             )
 
+    # What the batch's files produced before this run, so the referrer step
+    # below can tell which nodes the batch adds. Docs notes record a bare
+    # filename as their source_file, hence the extra keys.
+    provenance_keys = set(by_rel_path)
+    if docs_root is not None:
+        provenance_keys |= {p.name for p in by_rel_path.values() if p.is_relative_to(docs_root)}
+    batch_keys = sorted(provenance_keys)
+    previous_nodes = engine.list_file_nodes(repo_id, batch_keys)
+
+    for rel_path in sorted(by_rel_path):
+        index_one(rel_path, by_rel_path[rel_path])
+
+    # Files outside the batch that refer by name to a node the batch just
+    # added were indexed before that node existed, so their edge to it was
+    # skipped. Index them now as part of this batch (one level, no
+    # recursion); the passes below then link them like any batch file.
+    code_extractions = [
+        py_extractions, js_extractions, cs_extractions, cpp_extractions,
+        java_extractions, rs_extractions, kt_extractions, go_extractions,
+    ]
+    added_nodes = _batch_nodes(repo_id, root_resolved, code_extractions, docs_files, mention_files) - previous_nodes
+    referrers = _find_referrers(
+        engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path),
+        {**java_extractions, **kt_extractions},
+    )
+    for rel_path in sorted(referrers):
+        index_one(rel_path, root_resolved / rel_path)
+    # Markdown that only mentions an added name is unchanged itself, so it
+    # just gains edges to the added names (in the mentions pass below)
+    # instead of a full re-index that re-matches every name in the repo.
+    mention_relinks: list[Path] = []
+    if mentions_enabled and added_nodes:
+        mention_relinks = [
+            root_resolved / rel_path
+            for rel_path in sorted(
+                _mention_referrers(engine, repo_id, root_resolved, added_nodes, set(by_rel_path) | referrers, batch_keys)
+            )
+        ]
+
     # Second pass: re-upsert every .py file's already-extracted nodes/edges
-    # (no re-parse, no re-prune). Batch iteration order is unspecified (paths
-    # is a set), so a CALLS/IMPORTS edge from file X to file Y within the
+    # (no re-parse, no re-prune). Batch order is path order, not dependency
+    # order, so a CALLS/IMPORTS edge from file X to file Y within the
     # SAME batch can silently fail to materialize on the first pass if X
-    # happens to be processed before Y — upsert_relationships only
+    # happens to sort before Y — upsert_relationships only
     # MATCH-MATCHes existing endpoint nodes, it doesn't create them, so Y's
     # node isn't there yet when X's edges are upserted. Re-upserting (not
     # re-pruning) every file's cached extraction a second time is idempotent
@@ -244,8 +416,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # Service cross-linking runs as a final pass, after every file in this
     # batch (including any compose file) has been indexed — Service nodes'
     # build_context properties must already be in the graph for this to find
-    # anything, and paths/a compose file can be indexed in any order within
-    # one batch (set iteration has no guaranteed order). The Service/
+    # anything, and a compose file can sort after the files it owns within
+    # one batch. The Service/
     # build_context lookup is loaded once for the whole batch rather than
     # once per file, since it can't have changed mid-batch (Services are
     # only written by the Containerfile/compose branches above, already run
@@ -256,6 +428,45 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         for rel_path, content in py_files:
             service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
         engine.upsert_relationships(service_rels)
+
+    if sync_provider and not schema_pending(engine, repo_id, repo_root):
+        ok, spec = _filesystem_spec(repo_root)
+        if ok and spec is not None:
+            present = {
+                rel for p in paths
+                if _is_provider_file(repo_root, Path(p)) and (rel := _repo_relative(repo_root, Path(p))) is not None
+            }
+            filesystem.sync_present(engine, repo_id, spec, present)
+
+    # Docs notes get the same node-then-edge treatment as the source files
+    # above: pass 1 (in the loop) created every note's node, but a note's
+    # SUPERSEDES/DECIDED_BY target note or `links` Module may come from a
+    # file that sorted after it. Re-indexing the (tiny) note now that every
+    # node in the batch exists materializes those edges.
+    for path in docs_files:
+        try:
+            index_doc_file(engine, repo_id, path)
+        except Exception:
+            logger.warning("docs edge pass failed for %s (%s); skipping file", repo_id, path, exc_info=True)
+
+    # Mentions run last: unlike every other extractor, mention extraction
+    # reads the graph (the set of known entity names) to decide what a
+    # Markdown file mentions, so it needs every node from this batch --
+    # code symbols, docs notes, and the Document nodes pass 1 created --
+    # to already exist.
+    for path in mention_files:
+        try:
+            index_mentions_file(engine, repo_id, path, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode)
+        except Exception:
+            logger.warning("mentions pass failed for %s (%s); skipping file", repo_id, path, exc_info=True)
+    added_names = {name for _label, name in added_nodes}
+    for path in mention_relinks:
+        try:
+            index_mentions_file(
+                engine, repo_id, path, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode, names=added_names
+            )
+        except Exception:
+            logger.warning("mentions relink failed for %s (%s); skipping file", repo_id, path, exc_info=True)
 
     return indexed
 
@@ -285,6 +496,8 @@ def _index_single_path(
     kt_files: list[str],
     kt_extractions: dict[str, tuple[list[dict], list[dict]]],
     go_extractions: dict[str, tuple[list[dict], list[dict]]],
+    docs_files: list[Path],
+    mention_files: list[Path],
 ) -> int:
     """Extract and upsert one file's graph output, routing by name/extension.
 
@@ -321,9 +534,12 @@ def _index_single_path(
         # their 'source'/'file' provenance properties match what
         # delete_nodes_by_source_file looks up on file deletion.
         _index_datastores(engine, repo_id, rel_path, content)
-        _index_apis(engine, repo_id, rel_path, content)
+        api_rels = _index_apis(engine, repo_id, rel_path, content)
         py_files.append((rel_path, content))
-        py_extractions[rel_path] = (nodes, rels)
+        # API edges ride along in the re-upsert pass: an Endpoint's
+        # IMPLEMENTS target can be a handler defined in a later file (e.g.
+        # a Django urls.py naming a view from views.py).
+        py_extractions[rel_path] = (nodes, rels + api_rels)
     elif resolved.suffix in _JS_SUFFIXES:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_js_file(content, rel_path, repo_id)
@@ -404,12 +620,16 @@ def _index_single_path(
         engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
         indexed += 1
         go_extractions[rel_path] = (nodes, rels)
-    elif docs_root is not None and resolved.suffix in (".md", ".markdown") and str(resolved).startswith(str(docs_root)):
+    elif docs_root is not None and resolved.suffix in (".md", ".markdown") and is_within(resolved, docs_root):
         index_doc_file(engine, repo_id, resolved)
         indexed += 1
+        docs_files.append(resolved)
     if mentions_enabled and resolved.suffix in (".md", ".markdown"):
-        index_mentions_file(engine, repo_id, resolved, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode)
+        # Only the Document node here; its MENTIONS edges are resolved in
+        # index_paths' final pass, once every node in the batch exists.
+        upsert_document_node(engine, repo_id, resolved, repo_root)
         indexed += 1
+        mention_files.append(resolved)
     if name_lower in _CONTAINERFILE_NAMES:
         _index_containerfile(engine, repo_id, resolved, rel_path)
         indexed += 1
@@ -433,6 +653,10 @@ def _expand_with_reverse_dependents(
     fan-out only (direct importers, not transitive) to keep this a cheap
     per-change lookup rather than a repo walk; transitive staleness is rare
     enough that `--full` remains the intended escape hatch for it.
+
+    This finds referrers only through edges that already exist. A referrer
+    indexed before its target existed has no edge to follow; index_paths
+    finds those separately, after pass 1, via _find_referrers.
     """
     root_resolved = repo_root.resolve()
     expanded = set(paths)
@@ -443,7 +667,7 @@ def _expand_with_reverse_dependents(
             resolved = Path(path).resolve()
         except OSError:
             continue
-        if resolved.suffix not in (".py", ".java") or not str(resolved).startswith(str(root_resolved)):
+        if resolved.suffix not in (".py", ".java") or not is_within(resolved, root_resolved):
             continue
         try:
             original_rel_paths.add(resolved.relative_to(root_resolved).as_posix())
@@ -459,6 +683,187 @@ def _expand_with_reverse_dependents(
                 expanded.add(importer_path)
 
     return expanded
+
+
+def _batch_nodes(
+    repo_id: str,
+    root: Path,
+    code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
+    docs_files: list[Path],
+    mention_files: list[Path],
+) -> set[tuple[str, str]]:
+    """(label, name) of every file-provenance node this batch wrote: code
+    symbols and Modules, docs notes, and Markdown Document nodes -- the same
+    provenance list_file_nodes snapshots. File-less nodes (a C++ out-of-class
+    method's Class stub, API handler stubs, other `source`-keyed nodes) are
+    left out: they have no provenance to compare against, so they would
+    look newly added on every save."""
+    nodes = {
+        (node["label"], node["name"])
+        for extractions in code_extractions
+        for file_nodes, _rels in extractions.values()
+        for node in file_nodes
+        if node["label"] == "Module" or node["properties"].get("file")
+    }
+    for path in docs_files:
+        result = DocsExtractor(repo_id).extract_from_source(_read_text(path), path.name)
+        nodes |= {(doc.label, doc.name) for doc in result.docs}
+    nodes |= {("Document", path.relative_to(root).as_posix()) for path in mention_files}
+    return nodes
+
+
+def _find_referrers(
+    engine: GraphEngine,
+    repo_id: str,
+    root: Path,
+    docs_root: Path | None,
+    added: set[tuple[str, str]],
+    batch: set[str],
+    jvm_extractions: dict[str, tuple[list[dict], list[dict]]],
+) -> set[str]:
+    """Repo-relative paths outside `batch` whose by-name edges can target a
+    node in `added` -- files indexed before that node existed, so their edge
+    to it was skipped (an edge whose endpoint is missing is never created).
+
+    Unlike _expand_with_reverse_dependents, nothing in the graph points from
+    these files to the new node, so each kind is found by its own lookup,
+    and each is bounded to stay cheap: it only runs when the batch added a
+    node of a label it can target, and it only reads files outside the
+    batch. A full scan has no files outside the batch, and a batch that
+    only re-saves files adds no nodes, so either way this is close to free.
+    (Markdown mentions are found separately, by _mention_referrers.)
+    """
+    if not added:
+        return set()
+    found = _docs_note_referrers(repo_id, root, docs_root, added, batch)
+    found |= _handler_stub_referrers(engine, repo_id, added)
+    found |= _same_package_subtype_referrers(root, added, batch, jvm_extractions)
+    return found - batch
+
+
+# Labels a docs note's SUPERSEDES/DECIDED_BY/`links` edges can point at.
+_DOCS_NOTE_TARGET_LABELS = {"DesignDecision", "ArchitectureNote", "Module"}
+
+
+def _docs_note_referrers(
+    repo_id: str, root: Path, docs_root: Path | None, added: set[tuple[str, str]], batch: set[str]
+) -> set[str]:
+    """Docs notes whose SUPERSEDES/DECIDED_BY/`links` edge names an added
+    note or Module. Re-parses each note outside the batch (docs folders are
+    small; no graph access) and keeps only those with an edge endpoint in
+    `added`."""
+    if docs_root is None or not any(label in _DOCS_NOTE_TARGET_LABELS for label, _name in added):
+        return set()
+    found = set()
+    for path in sorted(docs_root.rglob("*")):
+        if path.suffix not in (".md", ".markdown") or not _is_indexable_file(path) or is_ignored_path(path):
+            continue
+        rel_path = path.relative_to(root).as_posix()
+        if rel_path in batch:
+            continue
+        result = DocsExtractor(repo_id).extract_from_source(_read_text(path), path.name)
+        if any(
+            (rel.source_label, rel.source_name) in added or (rel.target_label, rel.target_name) in added
+            for rel in result.relationships
+        ):
+            found.add(rel_path)
+    return found
+
+
+def _handler_stub_referrers(engine: GraphEngine, repo_id: str, added: set[tuple[str, str]]) -> set[str]:
+    """Route files whose Endpoint IMPLEMENTS a handler that only existed as
+    a file-less stub until the batch added a real Function of that name.
+    One graph lookup, only when the batch added Functions."""
+    functions = sorted(name for label, name in added if label == "Function")
+    if not functions:
+        return set()
+    return engine.find_handler_stub_sources(repo_id, functions)
+
+
+# At most this many Markdown files are relinked per batch to pick up
+# mentions of the batch's new names, so adding a common name (`get`, `run`)
+# mentioned across a large docs tree can't stall a watcher save. The rest
+# wait for the next rescan.
+_MAX_MENTION_RELINKS = 25
+
+
+def _mention_referrers(
+    engine: GraphEngine,
+    repo_id: str,
+    root: Path,
+    added: set[tuple[str, str]],
+    batch: set[str],
+    batch_keys: list[str],
+) -> set[str]:
+    """Markdown files (already indexed for mentions) that mention an added
+    node's name, at most _MAX_MENTION_RELINKS of them.
+
+    A name some node outside the batch already has is answered from the
+    graph: the Documents already MENTIONing that (label, name) are exactly
+    the ones that mention it. Only names new to the whole graph need a text
+    check of each Markdown file (the extractor's own matching), which stops
+    once the cap is exceeded.
+    """
+    candidates = [
+        rel_path
+        for rel_path in sorted(engine.list_indexed_files(repo_id))
+        if rel_path.endswith((".md", ".markdown")) and rel_path not in batch
+    ]
+    if not candidates:
+        return set()
+    existing = engine.find_mentioning_documents(repo_id, sorted(added), batch_keys)
+    found = {doc for docs in existing.values() for doc in docs} & set(candidates)
+    new_names = {name for label, name in added if (label, name) not in existing}
+    if new_names:
+        for rel_path in candidates:
+            if len(found) > _MAX_MENTION_RELINKS:
+                break
+            path = root / rel_path
+            if rel_path not in found and _is_indexable_file(path) and mentions_any(_read_text(path), new_names):
+                found.add(rel_path)
+    if len(found) > _MAX_MENTION_RELINKS:
+        logger.warning(
+            "%s: more than %d Markdown files mention names this batch added; relinking the first %d, "
+            "the rest link on the next rescan",
+            repo_id, _MAX_MENTION_RELINKS, _MAX_MENTION_RELINKS,
+        )
+        found = set(sorted(found)[:_MAX_MENTION_RELINKS])
+    return found
+
+
+def _same_package_subtype_referrers(
+    root: Path,
+    added: set[tuple[str, str]],
+    batch: set[str],
+    jvm_extractions: dict[str, tuple[list[dict], list[dict]]],
+) -> set[str]:
+    """Java/Kotlin files in the same directory (package) as an added Class
+    that name it -- a same-package subtype needs no import, so there is no
+    IMPORTS edge for _expand_with_reverse_dependents to follow. A word
+    match over sibling files with the same extension."""
+    found = set()
+    for rel_path, (nodes, _rels) in jvm_extractions.items():
+        classes = {node["name"] for node in nodes if node["label"] == "Class" and ("Class", node["name"]) in added}
+        if not classes:
+            continue
+        pattern = re.compile(r"\b(?:" + "|".join(re.escape(name) for name in sorted(classes)) + r")\b")
+        source = root / rel_path
+        for sibling in sorted(source.parent.iterdir()):
+            sibling_rel = sibling.relative_to(root).as_posix()
+            if sibling.suffix != source.suffix or sibling_rel in batch or not _is_indexable_file(sibling):
+                continue
+            if pattern.search(_read_text(sibling)):
+                found.add(sibling_rel)
+    return found
+
+
+def _read_text(path: Path) -> str:
+    """A referrer candidate's text, or "" if it can't be read (it is then
+    simply not a referrer)."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path]) -> int:
@@ -480,7 +885,7 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             resolved = path.resolve()
         except OSError:
             resolved = path
-        if not str(resolved).startswith(str(repo_root.resolve())):
+        if not is_within(resolved, repo_root):
             continue
 
         if resolved.suffix in (".py", ".cs", ".java", ".rs", ".go", ".kt"):
@@ -535,6 +940,17 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
                 module_name = resolved.name
             engine.delete_nodes_by_source_file(repo_id, module_name)
             cleaned += 1
+
+    if not schema_pending(engine, repo_id, repo_root):
+        ok, spec = _filesystem_spec(repo_root)
+        if ok and spec is not None:
+            gone = {rel for p in paths if (rel := _repo_relative(repo_root, Path(p))) is not None and rel != "."}
+            filesystem.sync_absent(
+                engine, repo_id, repo_root, spec, gone,
+                is_indexable=lambda p: _is_provider_file(repo_root, p),
+                is_ignored_dir=is_ignored_dir_name,
+            )
+
     return cleaned
 
 
@@ -552,7 +968,25 @@ def _indexable_paths(repo_root: Path) -> set[Path]:
     """Every file under repo_root that a full scan would index: a regular
     file, not under an ignored directory. Shared by full_scan (which indexes
     them) and prune_stale_files (which diffs them against the graph)."""
-    return {p for p in repo_root.rglob("*") if _is_indexable_file(p) and not is_ignored_path(p)}
+    return {
+        p for p in repo_root.rglob("*")
+        if _is_indexable_file(p) and not is_ignored_path(p) and not _links_outside(p, repo_root)
+    }
+
+
+def _links_outside(path: Path, repo_root: Path) -> bool:
+    """True for a symlink whose target resolves outside repo_root.
+
+    A symlink whose target cannot be resolved (OSError, e.g. a loop) is also
+    treated as outside, so it is skipped rather than followed.
+    """
+    try:
+        if not path.is_symlink() or is_within(path.resolve(), repo_root):
+            return False
+    except OSError:
+        pass
+    logger.debug("skipping %s: symlink target is outside %s", path, repo_root)
+    return True
 
 
 def prune_stale_files(
@@ -595,10 +1029,18 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
     nodes for that no longer exists on disk is pruned first (see
     prune_stale_files), so a rescan heals stale nodes left by a watcher
     that was down or missed events — not just adds/updates what's current.
+    A full scan also applies the project schema (see apply_project_schema),
+    which reconciles filesystem-provider nodes (see providers/filesystem.py).
+    A schema that cannot be applied leaves the repository pending; callers
+    that care check schema_pending afterwards.
     """
     prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
     all_files = _indexable_paths(repo_root)
-    return index_paths(engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled)
+    apply_project_schema(engine, repo_id, repo_root)
+    return index_paths(
+        engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
+        sync_provider=False,  # applied just above
+    )
 
 
 def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> None:
@@ -686,6 +1128,10 @@ def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict
         "RETURN s.name as name, s.build_context as build_context, s.file as file",
         {"repo_id": repo_id},
     )
+    # Sorted so the result doesn't depend on the order Neo4j returns rows:
+    # _match_owning_service keeps the first of several Services sharing a
+    # build_context, and a name declared in two compose files keeps the last.
+    results = sorted(results, key=lambda row: (row["name"], row["file"] or ""))
     return {row["name"]: (row["build_context"], row["file"]) for row in results}
 
 
@@ -762,7 +1208,7 @@ def _owning_service_relationships(
     return rels
 
 
-def _index_apis(engine: GraphEngine, repo_id: str, rel_path: str, content: str) -> None:
+def _index_apis(engine: GraphEngine, repo_id: str, rel_path: str, content: str) -> list[dict]:
     result = APIExtractor(repo_id).extract_from_source(content, rel_path)
     nodes = [
         {"label": "Endpoint", "repo_id": repo_id, "name": f"{e.method} {e.path}", "properties": e.properties}
@@ -772,4 +1218,6 @@ def _index_apis(engine: GraphEngine, repo_id: str, rel_path: str, content: str) 
         for f in result.functions
     ]
     engine.upsert_nodes(nodes)
-    engine.upsert_relationships([_relationship_dict(rel, repo_id) for rel in result.relationships])
+    rels = [_relationship_dict(rel, repo_id) for rel in result.relationships]
+    engine.upsert_relationships(rels)
+    return rels

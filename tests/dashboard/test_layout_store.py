@@ -1,6 +1,5 @@
 """Tests for the per-repo layout sidecar (devgraph/dashboard/layout_store.py)."""
 
-from pathlib import Path
 
 import pytest
 

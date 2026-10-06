@@ -1,5 +1,6 @@
 """DevGraph CLI: register repositories, manage watch settings, check status."""
 
+import contextlib
 import importlib.metadata
 import json
 import logging
@@ -13,22 +14,37 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import click
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
+from typer.core import TyperGroup
 
 from devgraph.agent import lifecycle
 from devgraph.cli._env import resolve_podman, resolve_repo_root, resolve_venv_python
 from devgraph.cli.exporters import export_cypher, export_dot, export_json
 from devgraph.config import get_settings
+from devgraph.config.edits import GLOBAL_TOOLS_NOTE as _GLOBAL_TOOLS_NOTE
+from devgraph.config.edits import SCHEMA_SECTIONS as _SCHEMA_SECTIONS
+from devgraph.config.edits import project_config_notes as _project_config_notes
+from devgraph.config.edits import removed_types as _removed_types  # noqa: F401  (kept importable from here)
+from devgraph.config.schema_findings import project_schema_findings as _project_schema_findings
 from devgraph.dashboard import queries as dashboard_queries
+from devgraph.dashboard.url import dashboard_url
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
+from devgraph.paths import is_within, read_bounded
 from devgraph.registry.store import RepoRegistry
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
+
+# Arguments for launching the MCP server with the venv python. -P keeps the
+# working directory off sys.path, so a `devgraph/` directory in the repo the
+# client starts in cannot shadow the installed package.
+MCP_SERVER_ARGS = ("-P", "-m", "devgraph.mcp.server")
 tray_app = typer.Typer(help="Manage the DevGraph tray app (live watcher + incremental indexer) as a background process.")
 app.add_typer(tray_app, name="tray")
 console = Console()
@@ -123,7 +139,9 @@ def remove(repo_id: str) -> None:
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
             try:
+                recorded = engine.read_applied_schema(repo_id) or {}
                 engine.delete_repository(repo_id)
+                _release_labels(engine, recorded.get("labels") or [])
             finally:
                 engine.close()
 
@@ -137,6 +155,18 @@ def remove(repo_id: str) -> None:
     except Exception as e:
         console.print(f"[red][X] Unexpected error:[/red] {e}")
         raise typer.Exit(code=1)
+
+
+def _release_labels(engine: GraphEngine, labels: list[str]) -> None:
+    """After deleting a repository's graph data: drop the generated constraints/indexes
+    of its labels no other repository uses. A failure is a warning; the data is gone either way."""
+    from devgraph.indexer.schema_constraints import release_labels
+
+    try:
+        for name in release_labels(engine, labels):
+            console.print(f"[green][OK][/green] Dropped {name} (no repository declares it any more)")
+    except Exception as e:
+        console.print(f"[yellow]Warning:[/yellow] could not drop unused schema constraints: {e}")
 
 
 @app.command(name="list")
@@ -155,6 +185,7 @@ def list_repos() -> None:
             table.add_column("Path", style="magenta")
             table.add_column("Active", style="green")
             table.add_column("Watch", style="blue")
+            table.add_column("Project config", style="blue")
             table.add_column("Last Indexed", style="yellow")
 
             # Load repo issues for display
@@ -177,6 +208,7 @@ def list_repos() -> None:
                     str(repo.path),
                     active_str,
                     watch_str,
+                    "on" if repo.project_config_enabled else "off",
                     last_indexed,
                 )
 
@@ -200,6 +232,11 @@ def rescan(
     full: bool = typer.Option(
         False, "--full", help="Also run git-history indexing after the file scan, forcing a full re-sync even if HEAD hasn't moved (local-only, no network)."
     ),
+    now: bool = typer.Option(
+        False, "--now",
+        help="Apply a changed devgraph.schema.yaml right away instead of waiting for the agent's "
+        "5-minute quiet period. A CLI rescan always applies immediately; this states it explicitly.",
+    ),
 ) -> None:
     """Run a full re-index of a registered repository.
 
@@ -213,6 +250,9 @@ def rescan(
     force-push or pruned branch). With --full, git history is force
     re-synced even when HEAD hasn't moved — the escape hatch for repairing
     a graph whose MODIFIES edges were destroyed by a bug.
+
+    A changed devgraph.schema.yaml is applied by this command immediately;
+    --now says so explicitly (the agent applies it only after a quiet period).
 
     Args:
         repo_id: The repository ID to rescan.
@@ -266,6 +306,44 @@ def rescan(
 
 
 @app.command()
+def insights(repo_id: str) -> None:
+    """Compute graph insights (communities, PageRank, betweenness) for a repository now.
+
+    The DevGraph agent recomputes them automatically after indexing; this
+    runs the same computation on demand, with or without the agent.
+
+    Args:
+        repo_id: The repository ID.
+    """
+    # Imported here so networkx only loads for this command, not every CLI call.
+    from devgraph.analytics.insights import refresh_insights
+
+    try:
+        registry = _get_registry()
+        try:
+            if registry.get(repo_id) is None:
+                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                raise typer.Exit(code=1)
+            settings = get_settings()
+            engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+            try:
+                summary = refresh_insights(engine, repo_id)
+            finally:
+                engine.close()
+        finally:
+            registry.close()
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"[red][X] Error:[/red] {e}")
+        raise typer.Exit(code=1)
+    console.print(
+        f"[green][OK][/green] Insights for {repo_id}: {summary['community_count']} communities "
+        f"(modularity {summary['modularity']:.2f}) over {summary['node_count']} nodes"
+    )
+
+
+@app.command()
 def watch(action: str, repo_id: str) -> None:
     """Enable or disable file watching for a repository.
 
@@ -275,7 +353,7 @@ def watch(action: str, repo_id: str) -> None:
     """
     try:
         if action not in ("enable", "disable"):
-            console.print(f"[red][X] Error:[/red] action must be 'enable' or 'disable'")
+            console.print("[red][X] Error:[/red] action must be 'enable' or 'disable'")
             raise typer.Exit(code=1)
 
         registry = _get_registry()
@@ -390,7 +468,7 @@ def annotate(
 
             if note is not None:
                 note_path = repo.path / note
-                if not str(note_path.resolve()).startswith(str(repo.path.resolve())):
+                if not is_within(note_path.resolve(), repo.path):
                     console.print("[red][X] Error:[/red] note path must be inside the repository")
                     raise typer.Exit(code=1)
 
@@ -613,103 +691,173 @@ def status() -> None:
     console.print()
 
 
-def _project_schema_findings(repos: list[Any]) -> list[dict[str, Any]]:
-    """Per-repository project schema state, plus cross-repository conflicts.
+def _registered_repo_id(root: Path) -> str:
+    """The registry id of the repository at `root`, or the `<repo_id>` placeholder."""
+    target = root.resolve()
+    registry = _get_registry()
+    try:
+        for repo in registry.list_repos():
+            if Path(repo.path).expanduser().resolve() == target:
+                return repo.repo_id
+    finally:
+        registry.close()
+    return "<repo_id>"
 
-    Reads each registered repository's optional `devgraph.schema.yaml` and
-    nothing else: no graph connection, no registry write, no cached or
-    persisted schema state. Every finding carries an explicit `failed` flag
-    rather than leaving the caller to infer severity from the rendered text.
 
-    Each repository reports `absent` (no file — the built-in schema, exactly
-    as before), `valid`, or `invalid` (the loader's own message). A final
-    `conflict` finding is emitted per label that two or more repositories
-    declare incompatibly. Labels are grouped case-insensitively because the
-    generated constraint names are lower-cased: `Widget` and `widget` would
-    generate one constraint name, and the loser's
-    `CREATE CONSTRAINT ... IF NOT EXISTS` would silently no-op, shipping a
-    label with no uniqueness constraint at all. Identical `(label, key)`
-    declarations are not a conflict — they provision the same constraint, and
-    registered repositories deliberately share one database.
-    """
-    from devgraph.config.project_schema import (
-        SCHEMA_FILENAME,
-        ProjectSchemaError,
-        load_project_schema,
-        project_schema_path,
-        resolve_declaration,
-    )
+def _project_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
+    """Per-repository `devgraph.tools.yaml` state, in the same shape as
+    `_project_schema_findings`. A tool named like a built-in is a non-failing
+    warning: the built-in is always used, as the tool plane will report."""
+    from devgraph.config.project_switch import project_config_enabled
+    from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError, load_project_tools
+    from devgraph.config.project_trust import untrusted_reason
+    from devgraph.mcp.catalog import builtin_tool_names
 
+    builtin = builtin_tool_names()
     findings: list[dict[str, Any]] = []
-    # Case-folded label -> the (repo_id, label, key) triples declaring it.
-    declared: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {}
-
     for repo in sorted(repos, key=lambda r: r.repo_id):
         try:
-            # `load_project_schema` returns None if and only if the file is
-            # absent, and raises for every unreadable/malformed/invalid one,
-            # so absent-vs-invalid is the loader's own distinction, not a
-            # second `exists()` check that could disagree with it.
-            declaration = load_project_schema(repo.path)
-            if declaration is None:
-                findings.append(
-                    {
-                        "repo_id": repo.repo_id,
-                        "status": "absent",
-                        "detail": f"no {SCHEMA_FILENAME} (built-in schema)",
-                        "failed": False,
-                    }
-                )
-                continue
-            effective = resolve_declaration(
-                declaration, origin=str(project_schema_path(repo.path))
-            )
-        except ProjectSchemaError as exc:
-            findings.append(
-                {
-                    "repo_id": repo.repo_id,
-                    "status": "invalid",
-                    "detail": str(exc),
-                    "failed": True,
-                }
-            )
+            declared = load_project_tools(repo.path)
+        except ProjectToolsError as exc:
+            findings.append({"repo_id": repo.repo_id, "status": "invalid", "detail": str(exc), "failed": True})
             continue
-
-        labels = ", ".join(node_type.label for node_type in effective.node_types)
-        findings.append(
-            {
+        if declared is None:
+            findings.append({"repo_id": repo.repo_id, "status": "absent", "detail": f"no {TOOLS_FILENAME}", "failed": False})
+            continue
+        names = ", ".join(tool.name for tool in declared.tools)
+        trust = _trust_state(repo.path)
+        if project_config_enabled(repo.path) and trust == "trusted":
+            findings.append({"repo_id": repo.repo_id, "status": "valid", "detail": f"tools: {names or 'none'}", "failed": False})
+        elif project_config_enabled(repo.path):
+            findings.append({
                 "repo_id": repo.repo_id,
-                "status": "valid",
-                "detail": f"extends: {effective.extends}; node types: {labels or 'none'}",
+                "status": "warning",
+                "detail": f"tools: {names or 'none'} (not served: {untrusted_reason(repo.repo_id, trust or 'untrusted')})",
                 "failed": False,
-            }
-        )
-        for node_type in effective.node_types:
-            declared.setdefault(node_type.label.casefold(), []).append(
-                (repo.repo_id, node_type.label, tuple(node_type.key))
-            )
+            })
+        else:
+            # The file is checked, but the MCP tool plane serves none of it.
+            findings.append({
+                "repo_id": repo.repo_id,
+                "status": "disabled",
+                "detail": f"tools: {names or 'none'} (not served: project config disabled)",
+                "failed": False,
+            })
+        for tool in declared.tools:
+            if tool.name in builtin:
+                findings.append({
+                    "repo_id": repo.repo_id,
+                    "status": "warning",
+                    "detail": f"{TOOLS_FILENAME}: tool {tool.name!r} shadows a locked tool; the fixed implementation is used",
+                    "failed": False,
+                })
+    return findings
 
-    for folded, entries in sorted(declared.items()):
-        if len({(label, key) for _repo_id, label, key in entries}) < 2:
+
+def _global_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
+    """The global tools store's state, plus a non-failing notice for each project
+    tool that overrides a global one. No finding when there is no store."""
+    from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, load_global_tools
+    from devgraph.config.project_switch import project_config_enabled
+    from devgraph.config.project_tools import ProjectToolsError, load_project_tools
+    from devgraph.mcp.catalog import builtin_tool_names
+
+    try:
+        declared = load_global_tools()
+    except ProjectToolsError as exc:
+        return [{"repo_id": "global", "status": "invalid", "detail": str(exc), "failed": True}]
+    if declared is None:
+        return []
+    names = {tool.name for tool in declared.tools}
+    findings: list[dict[str, Any]] = [{
+        "repo_id": "global",
+        "status": "valid",
+        "detail": f"tools: {', '.join(tool.name for tool in declared.tools) or 'none'}",
+        "failed": False,
+    }]
+    builtin = builtin_tool_names()
+    for tool in declared.tools:
+        if tool.name in builtin:
+            findings.append({
+                "repo_id": "global",
+                "status": "warning",
+                "detail": f"{GLOBAL_TOOLS_FILENAME}: tool {tool.name!r} shadows a locked tool; the fixed implementation is used",
+                "failed": False,
+            })
+    for repo in sorted(repos, key=lambda r: r.repo_id):
+        try:
+            project = load_project_tools(repo.path) if project_config_enabled(repo.path) else None
+        except ProjectToolsError:
+            continue  # reported by the project tools check
+        for tool in project.tools if project else ():
+            if tool.name in names and tool.name not in builtin:
+                findings.append({
+                    "repo_id": repo.repo_id,
+                    "status": "notice",
+                    "detail": f"tool {tool.name!r} overrides the global tool of the same name",
+                    "failed": False,
+                })
+    return findings
+
+
+def _stale_schema_objects(engine: Any, repos: list[Any]) -> list[Any]:
+    """Generated constraints/indexes no repository uses (schema_constraints.stale_generated_objects),
+    also counting the labels registered repositories' files declare but have not applied yet."""
+    from devgraph.config.project_schema import ProjectSchemaError, resolve_effective_schema
+    from devgraph.indexer.schema_constraints import stale_generated_objects
+
+    declared: set[str] = set()
+    for repo in repos:
+        try:
+            effective = resolve_effective_schema(repo.path)
+        except ProjectSchemaError:
+            continue  # what it applied is in the graph's recorded state
+        declared.update(node_type.label.casefold() for node_type in effective.node_types)
+    return stale_generated_objects(engine, declared)
+
+
+def _schema_drift_findings(engine: Any, repos: list[Any]) -> list[dict[str, Any]]:
+    """Per active repository: is the graph built with the schema the file hashes to?
+
+    `applied`, `pending` (a warning, fixed by the next rescan) or `never
+    applied` (a schema exists but no rescan recorded one). Mirrors
+    `schema_pending`: no recorded state and no schema is in sync.
+    """
+    from devgraph.config.project_schema import ABSENT_SCHEMA_HASH, schema_file_hash
+    from devgraph.config.project_switch import project_config_enabled
+
+    findings: list[dict[str, Any]] = []
+    for repo in sorted(repos, key=lambda r: r.repo_id):
+        if not repo.active:
             continue
-        described = "; ".join(
-            f"{repo_id} declares {label} keyed on ({', '.join(key)})"
-            for repo_id, label, key in sorted(entries)
-        )
-        findings.append(
-            {
-                "repo_id": None,
-                "status": "conflict",
-                "label": folded,
-                "detail": (
-                    f"incompatible declarations of label {folded!r} in one shared "
-                    f"database: {described}. Only the first provisioned constraint "
-                    f"takes effect; align the key or rename one label."
-                ),
-                "failed": True,
-            }
-        )
-
+        current = schema_file_hash(repo.path)
+        try:
+            recorded = engine.read_applied_schema(repo.repo_id)
+        except Exception as exc:
+            findings.append({"repo_id": repo.repo_id, "status": "error", "detail": f"could not read the applied schema: {exc}"})
+            continue
+        disabled = not project_config_enabled(repo.path)
+        if current.startswith("unreadable:"):
+            status, detail = "unreadable", "schema file unreadable"
+        elif recorded is None and current == ABSENT_SCHEMA_HASH:
+            status, detail = "applied", "no schema; graph is in sync"
+        elif recorded is None:
+            status, detail = "never applied", f"a schema exists but no rescan has applied one; run `devgraph rescan {repo.repo_id} --now`"
+        elif disabled and current == recorded["hash"]:
+            status, detail = "applied", "project config disabled; built-in schema applied"
+        elif disabled:
+            status, detail = "pending", (
+                f"project config disabled; built-in schema applied at the next rescan "
+                f"(devgraph rescan {repo.repo_id} --now)"
+            )
+        elif current == recorded["hash"]:
+            status, detail = "applied", "graph is in sync with the schema file"
+        else:
+            status, detail = "pending", (
+                f"the schema changed since the graph was built; applied at the next rescan, "
+                f"or `devgraph rescan {repo.repo_id} --now`"
+            )
+        findings.append({"repo_id": repo.repo_id, "status": status, "detail": detail})
     return findings
 
 
@@ -770,9 +918,11 @@ def doctor() -> None:
 
     # 4 & 5. Neo4j reachability + schema
     console.print("[bold]Neo4j[/bold]")
+    neo4j_reachable = False
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
     try:
         engine.verify_connectivity()
+        neo4j_reachable = True
         console.print(f"  [green][OK] Reachable[/green] at {settings.neo4j_uri}")
         try:
             engine.init_schema()
@@ -830,11 +980,100 @@ def doctor() -> None:
         console.print("  [green][OK][/green] no registered repositories to check")
     for finding in schema_findings:
         subject = finding["repo_id"] or "conflict"
-        if finding["failed"]:
-            console.print(f"  [red][X] {subject}:[/red] {finding['detail']}")
+        if finding["status"] == "disabled":
+            console.print(f"  [yellow][!] {escape(str(subject))}:[/yellow] {escape(finding['detail'])}")
+        elif finding["failed"]:
+            console.print(f"  [red][X] {escape(str(subject))}:[/red] {escape(finding['detail'])}")
             any_failed = True
         else:
-            console.print(f"  [green][OK][/green] {subject}: {finding['detail']}")
+            console.print(f"  [green][OK][/green] {escape(str(subject))}: {escape(finding['detail'])}")
+
+    console.print("[bold]Project tools[/bold]")
+    tools_findings = _project_tools_findings(registered_repos)
+    if not tools_findings:
+        console.print("  [green][OK][/green] no registered repositories to check")
+    for finding in tools_findings:
+        subject = escape(str(finding["repo_id"]))
+        if finding["failed"]:
+            console.print(f"  [red][X] {subject}:[/red] {escape(finding['detail'])}")
+            any_failed = True
+        elif finding["status"] in ("warning", "disabled"):
+            console.print(f"  [yellow][!] {subject}:[/yellow] {escape(finding['detail'])}")
+        else:
+            console.print(f"  [green][OK][/green] {subject}: {escape(finding['detail'])}")
+
+    console.print("[bold]Global tools[/bold]")
+    global_findings = _global_tools_findings(registered_repos)
+    if not global_findings:
+        console.print("  [green][OK][/green] no global tools")
+    for finding in global_findings:
+        subject = escape(str(finding["repo_id"]))
+        if finding["failed"]:
+            console.print(f"  [red][X] {subject}:[/red] {escape(finding['detail'])}")
+            any_failed = True
+        elif finding["status"] in ("warning", "notice"):
+            console.print(f"  [yellow][!] {subject}:[/yellow] {escape(finding['detail'])}")
+        else:
+            console.print(f"  [green][OK][/green] {subject}: {escape(finding['detail'])}")
+
+    # 7c. Schema drift: needs the graph, so it is skipped when Neo4j is down.
+    console.print("[bold]Schema drift[/bold]")
+    if not neo4j_reachable:
+        console.print("  [yellow]skipped[/yellow]: Neo4j is not reachable")
+    else:
+        drift_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+        try:
+            drift = _schema_drift_findings(drift_engine, registered_repos)
+        finally:
+            drift_engine.close()
+        if not drift:
+            console.print("  [green][OK][/green] no active repositories to check")
+        for finding in drift:
+            subject = escape(str(finding["repo_id"]))
+            if finding["status"] == "applied":
+                console.print(f"  [green][OK][/green] {subject}: applied ({escape(finding['detail'])})")
+            else:
+                console.print(f"  [yellow][!] {subject}:[/yellow] {finding['status']}: {escape(finding['detail'])}")
+
+    # 7d. Stale generated constraints/indexes: also needs the graph.
+    console.print("[bold]Schema constraints[/bold]")
+    if not neo4j_reachable:
+        console.print("  [yellow]skipped[/yellow]: Neo4j is not reachable")
+    else:
+        from devgraph.indexer.schema_constraints import constraint_drift
+
+        constraint_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+        try:
+            stale = _stale_schema_objects(constraint_engine, registered_repos)
+            drift = constraint_drift(constraint_engine)
+        except Exception as e:
+            stale = drift = None
+            console.print(f"  [yellow][!][/yellow] could not check: {escape(str(e))}")
+        finally:
+            constraint_engine.close()
+        if stale == [] and drift == []:
+            console.print("  [green][OK][/green] generated constraints and indexes match the applied schemas")
+        for obj in stale or []:
+            console.print(
+                f"  [yellow][!] {escape(obj.name)}:[/yellow] stale {obj.kind} on {escape(obj.label)} "
+                f"(no repository declares it); remove with `devgraph config schema prune-constraints`",
+                soft_wrap=True,
+            )
+        for finding in drift or []:
+            subject, label = escape(finding["repo_id"]), escape(finding["label"])
+            key = escape(", ".join(finding["key"]))
+            if finding["status"] == "missing":
+                detail = (
+                    f"applied {label} has no uniqueness constraint; re-provision with "
+                    f"`devgraph rescan {finding['repo_id']} --now`"
+                )
+            else:
+                detail = (
+                    f"key change blocked by duplicate nodes: {label} nodes share a (repo_id, {key}) value, "
+                    f"so the constraint keeps its old key; remove the duplicates, then "
+                    f"`devgraph rescan {finding['repo_id']} --now`"
+                )
+            console.print(f"  [yellow][!] {subject}:[/yellow] {detail}", soft_wrap=True)
 
     # 8. Tray/watcher liveness
     console.print("[bold]Live Watcher[/bold]")
@@ -892,7 +1131,7 @@ def _register_vscode(python_path: Path, repo_root: Path) -> bool:
     data["servers"]["devgraph"] = {
         "type": "stdio",
         "command": str(python_path),
-        "args": ["-m", "devgraph.mcp.server"],
+        "args": list(MCP_SERVER_ARGS),
         "cwd": str(repo_root),
     }
 
@@ -917,10 +1156,10 @@ def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path) ->
     if already_registered:
         console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
         return True
-    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" -m devgraph.mcp.server'
+    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
     console.print(f"\n[bold]Running:[/bold] {mcp_add_line}")
     result = subprocess.run(
-        [claude_path, "mcp", "add", "devgraph", "--", str(python_path), "-m", "devgraph.mcp.server"],
+        [claude_path, "mcp", "add", "devgraph", "--", str(python_path), *MCP_SERVER_ARGS],
         cwd=str(repo_root),
     )
     return result.returncode == 0
@@ -1012,7 +1251,7 @@ def client_config(
 
     python_path = resolve_venv_python()
     repo_root = resolve_repo_root()
-    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" -m devgraph.mcp.server'
+    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
     want_claude = target in ("claude", "both")
     want_vscode = target in ("vscode", "both")
 
@@ -1021,7 +1260,7 @@ def client_config(
     else:
         console.print("## Connect DevGraph as an MCP server\n")
         console.print(f"- **command**: {python_path}")
-        console.print("- **args**: -m devgraph.mcp.server")
+        console.print(f"- **args**: {' '.join(MCP_SERVER_ARGS)}")
         console.print(f"- **cwd**: {repo_root}\n")
         if want_claude:
             console.print("```bash")
@@ -1034,7 +1273,7 @@ def client_config(
                 {"servers": {"devgraph": {
                     "type": "stdio",
                     "command": str(python_path),
-                    "args": ["-m", "devgraph.mcp.server"],
+                    "args": list(MCP_SERVER_ARGS),
                     "cwd": str(repo_root),
                 }}},
                 indent=2,
@@ -1089,7 +1328,7 @@ def dashboard(
 ) -> None:
     """Open the DevGraph dashboard in the default browser, or print its URL."""
     settings = get_settings()
-    url = f"http://{settings.dashboard_host}:{settings.dashboard_port}"
+    url = dashboard_url(settings)
 
     # Check tray liveness
     liveness = _tray_liveness_text(settings)
@@ -1321,7 +1560,7 @@ def update(
     if was_running:
         console.print("[bold]Stopping tray app...[/bold]")
         subprocess.run(
-            [str(python_path), "-m", "devgraph.cli.main", "tray", "stop"],
+            [str(python_path), "-P", "-m", "devgraph.cli.main", "tray", "stop"],
             cwd=str(repo_root),
         )
 
@@ -1339,7 +1578,7 @@ def update(
     # 6. Doctor
     console.print("[bold]Verifying environment...[/bold]")
     result = subprocess.run(
-        [str(python_path), "-m", "devgraph.cli.main", "doctor"],
+        [str(python_path), "-P", "-m", "devgraph.cli.main", "doctor"],
         cwd=str(repo_root), capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -1352,65 +1591,1114 @@ def update(
     if was_running:
         console.print("[bold]Restarting tray app...[/bold]")
         subprocess.run(
-            [str(python_path), "-m", "devgraph.cli.main", "tray", "start"],
+            [str(python_path), "-P", "-m", "devgraph.cli.main", "tray", "start"],
             cwd=str(repo_root),
         )
 
     console.print("[green]Update complete.[/green]")
 
 
-@app.command()
-def config(
-    key: Optional[str] = typer.Argument(
-        None, help="Setting key to show (e.g. 'neo4j_uri'). Omit to show all."
-    ),
-    show_defaults: bool = typer.Option(
-        False, "--show-defaults", help="Also show the default value for each setting."
-    ),
-    as_json: bool = typer.Option(
-        False, "--json", help="Output as JSON."
-    ),
-) -> None:
-    """View or validate the current DevGraph configuration."""
+class _ConfigGroup(TyperGroup):
+    """`devgraph config` once took a setting name positionally; point that
+    old form at `config settings` instead of a bare "No such command"."""
+
+    def resolve_command(self, ctx: typer.Context, args: list[str]):  # type: ignore[override]
+        if args and args[0] not in self.commands and not args[0].startswith("-"):
+            from devgraph.config.settings import Settings
+
+            if args[0] in Settings.model_fields:
+                ctx.fail(
+                    f"'{args[0]}' is a setting, not a subcommand: use "
+                    f"`devgraph config settings {args[0]}`"
+                )
+        return super().resolve_command(ctx, args)
+
+
+config_app = typer.Typer(
+    cls=_ConfigGroup,
+    invoke_without_command=True,
+    help="View DevGraph settings, inspect and scaffold a repository's devgraph.schema.yaml, or enable/disable a repository's project config.",
+)
+app.add_typer(config_app, name="config")
+
+# Substrings that mark a setting as secret: masked wherever settings are shown.
+_SECRET_MARKERS = ("password", "secret", "token")
+
+
+def _is_secret_setting(name: str) -> bool:
+    return any(marker in name.lower() for marker in _SECRET_MARKERS)
+
+
+def _shown_value(name: str, value: Any) -> Any:
+    if _is_secret_setting(name):
+        return "****" if value else "(empty)"
+    return value
+
+
+def _show_settings(key: str | None, show_defaults: bool, as_json: bool) -> None:
+    """The settings view behind `devgraph config` and `devgraph config settings`."""
     settings = get_settings()
 
-    # Build a list of (field_name, value, default) tuples
     fields: list[tuple[str, Any, Any]] = []
-    for field_name in settings.model_fields:
-        field_info = settings.model_fields[field_name]
-        value = getattr(settings, field_name)
-        default = field_info.default
-        fields.append((field_name, value, default))
+    model_fields = type(settings).model_fields
+    for field_name in model_fields:
+        field_info = model_fields[field_name]
+        fields.append((field_name, getattr(settings, field_name), field_info.default))
 
     if key:
-        matched = [(n, v, d) for n, v, d in fields if n == key]
-        if not matched:
+        fields = [(n, v, d) for n, v, d in fields if n == key]
+        if not fields:
             console.print(f"[red][X] Unknown setting:[/red] {key}")
             raise typer.Exit(code=1)
-        fields = matched
-
-    # Mask passwords
-    def _display_value(v: Any) -> str:
-        if isinstance(v, str) and any(kw in (key or "").lower() or kw in str(key).lower() for kw in ("password", "secret", "token")):
-            return "****" if v else "(empty)"
-        return str(v)
 
     if as_json:
-        data = {n: getattr(settings, n) for n, _, _ in fields}
+        data = {n: _shown_value(n, v) for n, v, _ in fields}
         console.print_json(json.dumps(data, default=str))
-    else:
-        table = Table(title="DevGraph Configuration")
-        table.add_column("Key", style="cyan")
-        table.add_column("Value", style="green")
+        return
+
+    table = Table(title="DevGraph Configuration")
+    table.add_column("Key", style="cyan")
+    table.add_column("Value", style="green")
+    if show_defaults:
+        table.add_column("Default", style="yellow")
+    for field_name, value, default in fields:
+        row = [field_name, str(_shown_value(field_name, value))]
         if show_defaults:
-            table.add_column("Default", style="yellow")
-        for field_name, value, default in fields:
-            display = _display_value(value)
-            if show_defaults:
-                table.add_row(field_name, display, str(default))
-            else:
-                table.add_row(field_name, display)
+            row.append(str(_shown_value(field_name, default)))
+        table.add_row(*row)
+    console.print(table)
+
+
+@config_app.callback()
+def config(
+    ctx: typer.Context,
+    show_defaults: bool = typer.Option(False, "--show-defaults", help="Also show the default value for each setting."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """With no subcommand, show DevGraph's settings (same as `config settings`)."""
+    if ctx.invoked_subcommand is not None:
+        if as_json or show_defaults:
+            ctx.fail("--json/--show-defaults go after the subcommand, e.g. `devgraph config show --json`")
+        return
+    _show_settings(None, show_defaults, as_json)
+
+
+@config_app.command("settings")
+def config_settings(
+    key: Optional[str] = typer.Argument(None, help="Setting key to show (e.g. 'neo4j_uri'). Omit to show all."),
+    show_defaults: bool = typer.Option(False, "--show-defaults", help="Also show the default value for each setting."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Show DevGraph's settings, or one setting. Secrets are masked."""
+    _show_settings(key, show_defaults, as_json)
+
+
+def _repo_dir(repo: Path) -> Path:
+    """`--repo` as an absolute directory, or exit 1 with a plain message."""
+    root = repo.expanduser().resolve()
+    if not root.is_dir():
+        console.print(f"[red][X] Error:[/red] {escape(str(root))} is not a directory")
+        raise typer.Exit(code=1)
+    return root
+
+
+def _registered_repos() -> list[Any]:
+    """Every registered repository; [] when there is no registry yet (it is not created)."""
+    if not get_settings().registry_db_path.exists():
+        return []
+    registry = _get_registry()
+    try:
+        return registry.list_repos()
+    finally:
+        registry.close()
+
+
+def _containing_repo(repos: list[Any], target: Path) -> Any | None:
+    """The deepest of `repos` whose root contains `target` (as the MCP session scope is chosen)."""
+    best = None
+    for repo in repos:
+        root = Path(repo.path).expanduser().resolve()
+        if target == root or target.is_relative_to(root):
+            if best is None or len(root.parts) > len(Path(best.path).expanduser().resolve().parts):
+                best = repo
+    return best
+
+
+def _default_repo_root() -> tuple[Path, bool]:
+    """The scope when no `--repo` is given: the deepest active registered repository
+    containing the current directory, else the current directory. Also: was one found."""
+    cwd = _repo_dir(Path("."))
+    match = _containing_repo([r for r in _registered_repos() if r.active], cwd)
+    return (_repo_dir(Path(match.path)), True) if match is not None else (cwd, False)
+
+
+@config_app.command("eject")
+def config_eject(
+    repo: Path = typer.Option(Path("."), "--repo", help="Repository root (default: current directory)."),
+) -> None:
+    """Write a commented starter devgraph.schema.yaml. Never overwrites an existing file."""
+    from devgraph.config.project_schema import project_schema_path, starter_schema_text
+
+    path = project_schema_path(_repo_dir(repo))
+    try:
+        # Exclusive create: also refuses a symlink or a file that appeared
+        # after any check we could have made.
+        with open(path, "x", encoding="utf-8") as handle:
+            handle.write(starter_schema_text())
+    except FileExistsError:
+        console.print(
+            f"[red][X] Error:[/red] {escape(str(path))} already exists; eject never overwrites a "
+            f"project schema. Edit it, or move it aside and eject again."
+        )
+        raise typer.Exit(code=1)
+    console.print(f"[green][OK][/green] Wrote {escape(str(path))}")
+    console.print("  Edit it, then run `devgraph config validate` and `devgraph rescan <repo_id>`.")
+
+
+def _set_project_config(repo_id: str, enabled: bool) -> None:
+    word = "enabled" if enabled else "disabled"
+    registry = _get_registry()
+    try:
+        repo = registry.get(repo_id)
+        if repo is None:
+            console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
+            raise typer.Exit(code=1)
+        if repo.project_config_enabled == enabled:
+            console.print(f"Project config for {escape(repo_id)} is already {word}.")
+            return
+        registry.set_project_config_enabled(repo_id, enabled)
+    finally:
+        registry.close()
+    console.print(f"[green][OK][/green] Project config {word} for {escape(repo_id)}.")
+    for note in _project_config_notes(repo_id):
+        console.print(f"  {escape(note)}")
+
+
+@config_app.command("enable")
+def config_enable(repo_id: str = typer.Argument(..., help="Registered repo id.")) -> None:
+    """Use the repository's devgraph.schema.yaml and devgraph.tools.yaml (the default)."""
+    _set_project_config(repo_id, True)
+
+
+@config_app.command("disable")
+def config_disable(repo_id: str = typer.Argument(..., help="Registered repo id.")) -> None:
+    """Ignore the repository's devgraph.schema.yaml and devgraph.tools.yaml, as if they did not exist.
+
+    The files stay on disk. Use it to compare behaviour with and without them.
+    """
+    _set_project_config(repo_id, False)
+
+
+def _schema_report(repo_root: Path | None) -> dict[str, Any]:
+    """The effective schema and where each entry comes from.
+
+    `repo_root=None` reports the built-in schema alone. Raises
+    ProjectSchemaError for an unreadable or invalid project file.
+    """
+    from devgraph.config.project_schema import (
+        SCHEMA_FILENAME,
+        load_project_schema,
+        project_schema_path,
+        resolve_declaration,
+    )
+    from devgraph.config.project_switch import project_config_enabled
+    from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+
+    enabled = True if repo_root is None else project_config_enabled(repo_root)
+    declaration = None if repo_root is None else load_project_schema(repo_root)
+    origin = None if repo_root is None else str(project_schema_path(repo_root))
+    effective = resolve_declaration(declaration, origin=origin or SCHEMA_FILENAME)
+    inherits = effective.extends == "default"
+
+    node_types: list[dict[str, Any]] = [
+        {"label": label, "origin": "built-in", "key": None, "color": None} for label in (NODE_LABELS if inherits else ())
+    ]
+    node_types += [
+        {"label": n.label, "origin": SCHEMA_FILENAME, "key": list(n.key), "color": n.color} for n in effective.node_types
+    ]
+    relationships: list[dict[str, Any]] = [
+        {"type": rel, "origin": "built-in", "from": None, "to": None, "provider": "builtin", "color": None}
+        for rel in (RELATIONSHIP_TYPES if inherits else ())
+    ]
+    relationships += [
+        {"type": r.type, "origin": SCHEMA_FILENAME, "from": r.from_, "to": r.to, "provider": r.provider, "color": r.color}
+        for r in effective.relationships
+    ]
+    if repo_root is None:
+        status = "global"
+    elif not enabled:
+        status = "disabled"
+    else:
+        status = "absent" if declaration is None else "valid"
+    return {
+        "repo": None if repo_root is None else str(repo_root),
+        "project_config": None if repo_root is None else ("enabled" if enabled else "disabled"),
+        "schema_file": origin if declaration is not None else None,
+        "status": status,
+        "extends": effective.extends,
+        "node_types": node_types,
+        "relationships": relationships,
+    }
+
+
+def _global_tools_report(repo_root: Path | None) -> dict[str, Any]:
+    """The global tools store for `config show`, with the ones a project tool overrides. Raises ProjectToolsError."""
+    from devgraph.config.global_tools import global_tools_path, load_global_tools
+    from devgraph.config.project_switch import project_config_enabled
+    from devgraph.config.project_tools import load_project_tools
+
+    declared = load_global_tools()
+    if declared is None:
+        return {"status": "absent", "tools_file": None, "tools": []}
+    project = None
+    if repo_root is not None and project_config_enabled(repo_root):
+        project = load_project_tools(repo_root)
+    overriding = {tool.name for tool in project.tools} if project else set()
+    return {
+        "status": "valid",
+        "tools_file": str(global_tools_path()),
+        "tools": [
+            {"name": tool.name, "description": tool.description, "overridden": tool.name in overriding}
+            for tool in declared.tools
+        ],
+    }
+
+
+def _tools_report(repo_root: Path) -> dict[str, Any]:
+    """A repository's project tools for `config show`. Raises ProjectToolsError."""
+    from devgraph.config.project_switch import project_config_enabled
+    from devgraph.config.project_tools import load_project_tools, tools_file_path
+
+    if not project_config_enabled(repo_root):
+        return {"status": "disabled", "tools_file": None, "tools": []}
+    declared = load_project_tools(repo_root)
+    if declared is None:
+        return {"status": "absent", "tools_file": None, "tools": []}
+    return {
+        "status": "valid",
+        "tools_file": str(tools_file_path(repo_root)),
+        "tools": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": [
+                    {"name": p.name, "type": p.type, "required": p.required, "default": p.default}
+                    for p in tool.parameters
+                ],
+                "max_rows": tool.max_rows,
+                "timeout_s": tool.timeout_s,
+            }
+            for tool in declared.tools
+        ],
+    }
+
+
+@config_app.command("show")
+def config_show(
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    global_only: bool = typer.Option(False, "--global", help="Show only DevGraph's built-in schema."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Show the effective graph schema for a repository and where each entry comes from.
+
+    Built-in node types are keyed by DevGraph's own identity rules (JSON `key: null`).
+    Also shows the repository's project tools.
+    """
+    from devgraph.config.project_schema import SCHEMA_FILENAME, ProjectSchemaError
+    from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError
+
+    if global_only and repo is not None:
+        ctx.fail("use either --global or --repo, not both")
+    root = None if global_only else (_repo_dir(repo) if repo is not None else _default_repo_root()[0])
+    try:
+        report = _schema_report(root)
+    except ProjectSchemaError as exc:
+        console.print(f"[red][X] Invalid project schema:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=1)
+
+    if root is None:
+        report["tools"] = None
+    else:
+        try:
+            report["tools"] = _tools_report(root)
+        except ProjectToolsError as exc:
+            console.print(f"[red][X] Invalid project tools:[/red] {escape(str(exc))}")
+            raise typer.Exit(code=1)
+
+    try:
+        report["global_tools"] = _global_tools_report(root)
+    except ProjectToolsError as exc:
+        console.print(f"[red][X] Invalid global tools:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=1)
+
+    if as_json:
+        typer.echo(json.dumps(report, indent=2))
+        return
+
+    if report["status"] == "global":
+        console.print("Built-in schema (no global config file yet)")
+    elif report["status"] == "disabled":
+        console.print(
+            f"{escape(report['repo'])}: project config disabled — built-in schema "
+            f"(`devgraph config enable {escape(_registered_repo_id(root))}` to use {SCHEMA_FILENAME})"
+        )
+    elif report["status"] == "absent":
+        console.print(f"{escape(report['repo'])}: no {SCHEMA_FILENAME} — built-in schema")
+    else:
+        console.print(f"{escape(report['repo'])}: {escape(report['schema_file'])} (valid, extends: {report['extends']})")
+
+    nodes = Table(title="Node types")
+    nodes.add_column("Label", style="cyan")
+    nodes.add_column("Origin")
+    nodes.add_column("Key")
+    nodes.add_column("Colour")
+    for node in report["node_types"]:
+        nodes.add_row(
+            node["label"], node["origin"], ", ".join(node["key"]) if node["key"] else "built-in identity",
+            node["color"] or "\u2014",
+        )
+    console.print(nodes)
+
+    rels = Table(title="Relationships")
+    rels.add_column("Type", style="cyan")
+    rels.add_column("From")
+    rels.add_column("To")
+    rels.add_column("Provider")
+    rels.add_column("Origin")
+    rels.add_column("Colour")
+    for rel in report["relationships"]:
+        rels.add_row(
+            rel["type"], rel["from"] or "any", rel["to"] or "any", rel["provider"], rel["origin"],
+            rel["color"] or "\u2014",
+        )
+    console.print(rels)
+
+    tools = report["tools"]
+    if tools is not None:
+        if tools["status"] == "disabled":
+            console.print("Project config disabled — no project tools")
+        elif tools["status"] == "absent":
+            console.print(f"No {TOOLS_FILENAME} — no project tools")
+        else:
+            table = Table(title=f"Project tools ({escape(tools['tools_file'])})")
+            table.add_column("Name", style="cyan")
+            table.add_column("Parameters")
+            table.add_column("Max rows")
+            table.add_column("Timeout")
+            for tool in tools["tools"]:
+                params = ", ".join(p["name"] + ("" if p["required"] else "?") for p in tool["parameters"]) or "—"
+                table.add_row(tool["name"], params, str(tool["max_rows"]), f"{tool['timeout_s']}s")
+            console.print(table)
+
+    global_tools = report["global_tools"]
+    if global_tools["status"] == "absent":
+        console.print("No global tools")
+    else:
+        table = Table(title=f"Global tools ({escape(global_tools['tools_file'])})")
+        table.add_column("Name", style="cyan")
+        table.add_column("Description")
+        table.add_column("Overridden by project")
+        for tool in global_tools["tools"]:
+            table.add_row(tool["name"], escape(tool["description"]), "yes" if tool["overridden"] else "")
         console.print(table)
+
+
+@config_app.command("validate")
+def config_validate(
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    all_repos: bool = typer.Option(False, "--all", help="Check every registered repository, and conflicts between them."),
+) -> None:
+    """Fail-closed check of devgraph.schema.yaml and devgraph.tools.yaml. Exits 1 if anything is invalid or conflicting."""
+    from types import SimpleNamespace
+
+    from devgraph.config.project_switch import project_config_enabled
+
+    if all_repos and repo is not None:
+        ctx.fail("use either --repo or --all, not both")
+    if all_repos:
+        registry = _get_registry()
+        try:
+            repos = registry.list_repos()
+        finally:
+            registry.close()
+        if not repos:
+            console.print("No registered repositories.")
+            return
+    else:
+        root = _repo_dir(repo) if repo is not None else _default_repo_root()[0]
+        # `hint_id` is only needed (and the registry only opened) for a disabled repo,
+        # which is necessarily registered.
+        hint_id = "<repo_id>" if project_config_enabled(root) else _registered_repo_id(root)
+        repos = [SimpleNamespace(repo_id=str(root), path=root, hint_id=hint_id)]
+
+    findings = _project_schema_findings(repos) + _project_tools_findings(repos) + _global_tools_findings(repos)
+    for finding in findings:
+        colour = "red" if finding["failed"] else ("yellow" if finding["status"] in ("warning", "disabled", "notice") else "green")
+        subject = finding["repo_id"] or "cross-repository"
+        console.print(f"[{colour}]{finding['status']}[/{colour}] {escape(str(subject))}: {escape(finding['detail'])}")
+    if any(finding["failed"] for finding in findings):
+        raise typer.Exit(code=1)
+
+
+tools_app = typer.Typer(
+    help="List, add, edit, delete or reset tools: a repository's devgraph.tools.yaml, or with --global the user's global tools.",
+    no_args_is_help=True,
+)
+config_app.add_typer(tools_app, name="tools")
+
+
+def _tools_scope(
+    ctx: typer.Context,
+    repo: Optional[Path],
+    global_: bool,
+    consequence: str = "MCP sessions won't serve its tools",
+) -> Path | None:
+    """The repository root for a `config tools` command, or None for the global store.
+
+    Without `--repo`: the registered repository containing the current directory, else
+    the current directory itself (with a warning on stderr).
+    """
+    if global_ and repo is not None:
+        ctx.fail("use either --global or --repo, not both")
+    if global_:
+        return None
+    if repo is not None:
+        return _repo_dir(repo)
+    root, registered = _default_repo_root()
+    if not registered:
+        Console(stderr=True).print(
+            f"[yellow]Warning:[/yellow] {escape(str(root))} is not a registered repository (nor inside one), "
+            f"so {consequence}; register it with `devgraph add`.",
+            soft_wrap=True,
+        )
+    return root
+
+
+def _scope_record(root: Path):
+    """The registry record for the repository at `root` (active or not), else None."""
+    return next((r for r in _registered_repos() if Path(r.path).expanduser().resolve() == root), None)
+
+
+def _tools_scope_note(root: Path | None) -> str:
+    """Whether running MCP sessions will serve what is in this scope's file."""
+    from devgraph.config.edits import tools_effect_note
+
+    return tools_effect_note(root, None if root is None else _scope_record(root))
+
+
+@contextlib.contextmanager
+def _edit_errors(edit_command: str | None = None):
+    """Report a refused config edit as the CLI's error line and exit 1.
+
+    `edit_command` (e.g. "devgraph config tools edit x") replaces a taken-name
+    refusal's generic "edit it instead" with the command that does it.
+    """
+    from devgraph.config.edits import EDIT_INSTEAD, ConfigEditError
+
+    try:
+        yield
+    except ConfigEditError as exc:
+        message = exc.message
+        if edit_command and message.endswith(EDIT_INSTEAD):
+            message = message[: -len(EDIT_INSTEAD)] + f"; use `{edit_command}`"
+        raise _tools_fail(message) from None
+
+
+def _tools_fail(message: str) -> typer.Exit:
+    console.print(f"[red][X] Error:[/red] {escape(message)}")
+    return typer.Exit(code=1)
+
+
+def _read_tool_source(source: str) -> dict:
+    """One tool mapping from a YAML/JSON file, or stdin for `-`."""
+    try:
+        text = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _tools_fail(f"cannot read {source}: {exc}")
+    return _parse_tool_text(text, "stdin" if source == "-" else source)
+
+
+def _parse_tool_text(text: str, label: str, what: str = "one tool") -> dict:
+    from devgraph.config.project_tools import YAML_LOAD_ERRORS
+    from devgraph.config.yaml_bound import bounded_safe_load
+
+    try:
+        tool = bounded_safe_load(text)
+    except YAML_LOAD_ERRORS as exc:
+        raise _tools_fail(f"{label}: malformed YAML: {exc}")
+    if not isinstance(tool, dict):
+        raise _tools_fail(f"{label}: expected {what} as a YAML mapping")
+    return tool
+
+
+def _tools_done(verb: str, name: str, path: Path, root: Path | None) -> None:
+    console.print(f"[green]{verb}[/green] tool {escape(repr(name))}: {escape(str(path))}", soft_wrap=True)
+    console.print(escape(_tools_scope_note(root)), soft_wrap=True)
+
+
+@tools_app.command("list")
+def config_tools_list(
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    global_: bool = typer.Option(False, "--global", help="List only the global tools store."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """List the tools in effect: built-in (locked), global, and project, with overrides marked."""
+    from devgraph.config.global_tools import load_global_tools
+    from devgraph.config.project_switch import project_config_enabled
+    from devgraph.config.project_tools import ProjectToolsError, load_project_tools
+    from devgraph.mcp.catalog import builtin_tool_names
+
+    root = _tools_scope(ctx, repo, global_)
+    builtin = builtin_tool_names()
+    try:
+        declared_global = load_global_tools()
+        declared_project = None if root is None or not project_config_enabled(root) else load_project_tools(root)
+    except ProjectToolsError as exc:
+        raise _tools_fail(str(exc))
+    global_tools = {t.name: t for t in (declared_global.tools if declared_global else ())}
+    project_names = [t.name for t in (declared_project.tools if declared_project else ())]
+    ignored = {"ignored": "shadows a locked tool"}  # a built-in name in a tools file: MCP serves the built-in
+
+    rows: list[dict[str, Any]] = []
+    if root is None:
+        rows = [{"name": name, "origin": "global", "locked": False, **(ignored if name in builtin else {})}
+                for name in global_tools]
+    else:
+        # run_cypher is served (and so in effect) only with enable_run_cypher.
+        served_builtin = builtin if get_settings().enable_run_cypher else builtin - {"run_cypher"}
+        rows = [{"name": name, "origin": "built-in", "locked": True} for name in sorted(served_builtin)]
+        rows += [{"name": n, "origin": "global", "locked": False} for n in global_tools if n not in project_names and n not in builtin]
+        for name in project_names:
+            if name in builtin:
+                continue
+            origin = "project (overrides global)" if name in global_tools else "project"
+            rows.append({"name": name, "origin": origin, "locked": False})
+        rows += [{"name": n, "origin": "global", "locked": False, **ignored} for n in global_tools if n in builtin]
+        rows += [{"name": n, "origin": "project", "locked": False, **ignored} for n in project_names if n in builtin]
+
+    record = None if root is None else _scope_record(root)
+    serves = record is not None and record.active and record.project_config_enabled
+    trust = _trust_state(root) if serves else None
+    if as_json:
+        typer.echo(json.dumps({"tools": rows, **({"trust": trust} if root is not None else {})}, indent=2))
+        return
+    table = Table(title="Global tools" if root is None else escape(f"Tools for {root}"))
+    table.add_column("Name", style="cyan")
+    table.add_column("Origin")
+    for row in rows:
+        origin = row["origin"] + (" (locked)" if row["locked"] else "")
+        if row.get("ignored"):
+            origin += f" — ignored: {row['ignored']}"
+        table.add_row(escape(row["name"]), origin)
+    console.print(table)
+    if not serves:  # unregistered or disabled; or the global note for --global
+        console.print(escape(_tools_scope_note(root)), soft_wrap=True)
+    elif not project_config_enabled(root):
+        console.print("Project config disabled: project tools are not served")
+    elif trust == "trusted":
+        console.print("Project tools: trusted (devgraph.tools.yaml matches the approved sha256)", soft_wrap=True)
+    elif trust is not None:
+        from devgraph.config.project_trust import untrusted_reason
+
+        console.print(escape(f"Project tools are not served: {untrusted_reason(record.repo_id, trust)}"), soft_wrap=True)
+    if root is not None:
+        console.print(_GLOBAL_TOOLS_NOTE, soft_wrap=True)
+
+
+def _trust_state(root: Path) -> str | None:
+    """The trust state of the repository's tools file as it is now (see `project_trust`); None without a regular file."""
+    from devgraph.config import project_trust
+    from devgraph.config.project_tools import tools_file_outside, tools_file_path
+
+    path = tools_file_path(Path(root))
+    try:
+        if tools_file_outside(Path(root)) or not path.is_file():
+            return None
+        data = read_bounded(path)
+    except OSError:
+        return None
+    return project_trust.project_tools_trust(root, data)
+
+
+def _global_tool_names() -> set[str]:
+    """Names in the global tools store; empty when it is absent or invalid."""
+    from devgraph.config.global_tools import load_global_tools
+    from devgraph.config.project_tools import ProjectToolsError
+
+    try:
+        store = load_global_tools()
+    except ProjectToolsError:
+        return set()
+    return {t.name for t in store.tools} if store is not None else set()
+
+
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty()
+
+
+def _trust_target(repo: Optional[str]) -> Any:
+    """The registered repository `repo` names (a repo id, or a path inside one), else the one containing the current directory."""
+    repos = _registered_repos()
+    if repo is not None:
+        match = next((r for r in repos if r.repo_id == repo), None)
+        target = Path(repo).expanduser()
+        if match is None and target.is_dir():
+            match = _containing_repo(repos, target.resolve())
+    else:
+        match = _containing_repo([r for r in repos if r.active], _repo_dir(Path(".")))
+    if match is None:
+        raise _tools_fail(f"{repo or 'the current directory'} is not a registered repository (nor inside one); "
+                          "register it with `devgraph add`")
+    return match
+
+
+@tools_app.command("trust")
+def config_tools_trust(
+    repo: Optional[str] = typer.Argument(None, help="Registered repo id or path (default: the repository containing the current directory)."),
+    sha256: Optional[str] = typer.Option(None, "--sha256", help="For CI: approve without asking, only if this is the file's sha256 (hex)."),
+) -> None:
+    """Serve a repository's devgraph.tools.yaml: shows its tools and sha256, then approves exactly those bytes.
+
+    Project tools are off until trusted, and any change to the file needs trusting again.
+    """
+    from devgraph.config.project_tools import ProjectToolsError, parse_project_tools, tools_file_outside, tools_file_path
+    from devgraph.config.project_trust import tools_sha256
+
+    record = _trust_target(repo)
+    path = tools_file_path(Path(record.path))
+    if tools_file_outside(Path(record.path)):
+        raise _tools_fail(f"{path.name} in {record.path} resolves outside the repository; nothing was trusted")
+    try:
+        if not path.is_file():
+            raise _tools_fail(f"no {path.name} in {record.path}; nothing to trust")
+        data = read_bounded(path)
+    except OSError as exc:
+        raise _tools_fail(f"cannot read {path}: {exc}")
+    try:
+        declared = parse_project_tools(data.decode("utf-8"), path)
+    except (UnicodeDecodeError, ProjectToolsError) as exc:
+        raise _tools_fail(f"{path.name} is invalid; fix it before trusting it: {str(exc).splitlines()[0]}")
+    digest = tools_sha256(data)
+    global_names = _global_tool_names()
+    console.print(f"Tools in {escape(str(path))}:", soft_wrap=True)
+    for tool in declared.tools:
+        console.print(f"\n[cyan]{escape(tool.name)}[/cyan]")
+        if tool.name in global_names:
+            console.print(f"  overrides the global tool {escape(repr(tool.name))} in this repository", soft_wrap=True)
+        console.print(f"  description: {escape(tool.description)}", highlight=False, soft_wrap=True)
+        for p in tool.parameters:
+            detail = f"{p.type}, " + ("required" if p.required else f"optional, default {p.default!r}")
+            line = f"  parameter {p.name} ({detail})" + (f": {p.description}" if p.description else "")
+            console.print(escape(line), highlight=False, soft_wrap=True)
+        console.print(escape(tool.cypher.rstrip()), highlight=False, soft_wrap=True)
+    if not declared.tools:
+        console.print("(no tools)")
+    console.print(f"\nsha256: {digest}")
+    console.print(
+        "An enabled project tool can read the whole graph, every registered repository's data and not only this "
+        "one's: the $repo_id rule is a convention, not a sandbox.", soft_wrap=True,
+    )
+    if sha256 is not None:
+        if sha256.strip().lower() != digest:
+            raise _tools_fail(f"--sha256 does not match {path.name}; nothing was trusted")
+    elif not _stdin_is_tty():
+        raise _tools_fail("no terminal to confirm on: approving project tools needs the user at a terminal "
+                          f"to review them and run `devgraph config tools trust {record.repo_id}`")
+    elif not typer.confirm(f"Trust these tools for {record.repo_id}?", default=False):
+        console.print("Not trusted.")
+        raise typer.Exit(code=1)
+    registry = _get_registry()
+    try:
+        registry.set_project_tools_sha256(record.repo_id, digest)
+    finally:
+        registry.close()
+    console.print(f"[green][OK][/green] Trusted {escape(path.name)} for {escape(record.repo_id)}; "
+                  "running MCP sessions serve its tools within 2 seconds.", soft_wrap=True)
+    if not record.project_config_enabled:
+        console.print(f"Project config is disabled for {escape(record.repo_id)}, so its tools are still not served; "
+                      f"enable it with `devgraph config enable {escape(record.repo_id)}`.", soft_wrap=True)
+
+
+@tools_app.command("untrust")
+def config_tools_untrust(
+    repo: Optional[str] = typer.Argument(None, help="Registered repo id or path (default: the repository containing the current directory)."),
+) -> None:
+    """Stop serving a repository's project tools until they are trusted again."""
+    record = _trust_target(repo)
+    if record.project_tools_sha256 is None:
+        console.print(f"Project tools for {escape(record.repo_id)} are not trusted; nothing to do.")
+        return
+    registry = _get_registry()
+    try:
+        registry.set_project_tools_sha256(record.repo_id, None)
+    finally:
+        registry.close()
+    console.print(f"[green][OK][/green] Revoked trust in {escape(record.repo_id)}'s project tools; "
+                  "running MCP sessions stop serving them within 2 seconds.", soft_wrap=True)
+
+
+@tools_app.command("add")
+def config_tools_add(
+    ctx: typer.Context,
+    source: str = typer.Option(..., "--from", help="YAML or JSON file holding one tool, or - for stdin."),
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    global_: bool = typer.Option(False, "--global", help="Add to the global tools store."),
+) -> None:
+    """Add one tool. Fails if the name exists (use `edit`) or is a built-in name."""
+    from devgraph.config.edits import add_tool
+
+    root = _tools_scope(ctx, repo, global_)
+    tool = _read_tool_source(source)
+    with _edit_errors(f"devgraph config tools edit {tool.get('name')}"):
+        result = add_tool(root, tool)
+    _tools_done("Added", str(tool.get("name")), result.path, root)
+
+
+@tools_app.command("edit")
+def config_tools_edit(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Tool to replace."),
+    source: Optional[str] = typer.Option(None, "--from", help="YAML or JSON file holding the new tool, or - for stdin. Default: open $EDITOR."),
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    global_: bool = typer.Option(False, "--global", help="Edit a global tool."),
+) -> None:
+    """Replace one tool, from a file or in $EDITOR. Nothing is written if the result is unchanged or invalid."""
+    from devgraph.config.edits import find_tool, replace_tool
+    from devgraph.config.tools_edit import dump_tool
+
+    root = _tools_scope(ctx, repo, global_)
+    with _edit_errors():
+        current = find_tool(root, name)
+    if source is not None:
+        tool = _read_tool_source(source)
+    else:
+        original = dump_tool(current)
+        edited = click.edit(original, extension=".yaml")
+        if edited is None or edited == original:
+            console.print("No changes.")
+            return
+        tool = _parse_tool_text(edited, "edited tool")
+        if tool == current:
+            console.print("No changes.")
+            return
+    with _edit_errors():
+        result = replace_tool(root, name, tool)
+    _tools_done("Updated", name, result.path, root)
+
+
+@tools_app.command("delete")
+def config_tools_delete(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Tool to remove."),
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    global_: bool = typer.Option(False, "--global", help="Delete a global tool."),
+) -> None:
+    """Remove one tool. Unknown names exit 1."""
+    from devgraph.config.edits import delete_tool
+
+    root = _tools_scope(ctx, repo, global_)
+    with _edit_errors():
+        result = delete_tool(root, name)
+    _tools_done("Deleted", name, result.path, root)
+
+
+@tools_app.command("reset")
+def config_tools_reset(
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    global_: bool = typer.Option(False, "--global", help="Empty the global tools store."),
+    yes: bool = typer.Option(False, "--yes", help="Do not ask for confirmation."),
+) -> None:
+    """Remove every tool in the scope: delete devgraph.tools.yaml, or empty the global store."""
+    from devgraph.config.edits import reset_tools, tools_path
+
+    root = _tools_scope(ctx, repo, global_)
+    path = tools_path(root)
+    if not os.path.lexists(path):
+        console.print(f"Nothing to reset: {escape(str(path))} does not exist.", soft_wrap=True)
+        return
+    if not yes:
+        typer.confirm(f"Remove every tool in {path}?", abort=True)
+    with _edit_errors():
+        reset_tools(root)
+    console.print(f"[green]Reset[/green] {escape(str(path))}", soft_wrap=True)
+    console.print(escape(_tools_scope_note(root)), soft_wrap=True)
+
+
+schema_app = typer.Typer(
+    help="List, add, edit, delete or reset node types and relationships in a repository's devgraph.schema.yaml.",
+    no_args_is_help=True,
+)
+config_app.add_typer(schema_app, name="schema")
+
+def _schema_scope(ctx: typer.Context, repo: Optional[Path]) -> Path:
+    return _tools_scope(ctx, repo, False, "DevGraph does not index it")
+
+
+def _schema_record(root: Path):
+    """The registered, active repository record for `root`, else None."""
+    record = _scope_record(root)
+    return record if record is not None and record.active else None
+
+
+def _schema_effect_note(root: Path) -> str:
+    """When a schema change takes effect for this repository."""
+    from devgraph.config.edits import schema_effect_note
+
+    return schema_effect_note(root, _schema_record(root))
+
+
+def _schema_text(path: Path) -> str:
+    from devgraph.config.edits import read_text
+
+    with _edit_errors():
+        return read_text(path)
+
+
+def _read_schema_entry(source: str) -> dict:
+    if source == "-":
+        return _parse_tool_text(sys.stdin.read(), "stdin", "one schema entry")
+    try:
+        text = Path(source).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _tools_fail(f"cannot read {source}: {exc}")
+    return _parse_tool_text(text, source, "one schema entry")
+
+
+def _schema_done(verb: str, section: str, name: str, path: Path, root: Path) -> None:
+    noun = _SCHEMA_SECTIONS[section][1]
+    console.print(f"[green]{verb}[/green] {noun} {escape(repr(name))}: {escape(str(path))}", soft_wrap=True)
+    console.print(escape(_schema_effect_note(root)), soft_wrap=True)
+
+
+def _schema_follow_up(root: Path, result) -> None:
+    """Warnings and notes after a successful write: lost nodes, unpopulated types, key changes, conflicts."""
+    for warning in result.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(warning)}", soft_wrap=True)
+    for note in result.notes:
+        console.print(escape(note), soft_wrap=True)
+    record = _schema_record(root)
+    if record is None or result.after is None:
+        return
+    for finding in _project_schema_findings(_registered_repos()):
+        if finding["status"] == "conflict" and record.repo_id in finding.get("repo_ids", ()):
+            console.print(f"[yellow]Warning:[/yellow] {escape(finding['detail'])}", soft_wrap=True)
+
+
+@schema_app.command("prune-constraints")
+def config_schema_prune_constraints(
+    labels: Optional[list[str]] = typer.Option(None, "--label", help="Only this label (repeatable)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be dropped without dropping it."),
+) -> None:
+    """Drop DevGraph-generated constraints/indexes no repository declares any more.
+
+    Database-wide. Stale means: no repository's applied schema records the
+    label, no registered repository's schema file declares it, and no node
+    carries it. Built-in constraints are never touched.
+    """
+    from devgraph.indexer.schema_constraints import release_labels
+
+    settings = get_settings()
+    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    try:
+        engine.verify_connectivity()
+        stale = _stale_schema_objects(engine, _registered_repos())
+        if labels:
+            wanted = {label.casefold() for label in labels}
+            stale = [obj for obj in stale if obj.label.casefold() in wanted]
+        if not stale:
+            console.print("[green]No stale generated constraints or indexes.[/green]")
+            return
+        for obj in stale:
+            console.print(f"  {obj.kind} {escape(obj.name)} on {escape(obj.label)}")
+        if dry_run:
+            console.print("[yellow]Dry run — nothing dropped.[/yellow]")
+            return
+        dropped = release_labels(engine, [obj.label for obj in stale])
+        for name in dropped:
+            console.print(f"[green][OK][/green] Dropped {escape(name)}")
+    except Exception as e:
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
+        raise typer.Exit(code=1)
+    finally:
+        engine.close()
+
+
+@schema_app.command("list")
+def config_schema_list(
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """List the effective node types and relationships, marked built-in or project."""
+    from devgraph.config.project_schema import ProjectSchemaError, load_project_schema, resolve_declaration
+    from devgraph.config.project_switch import project_config_enabled
+    from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+
+    root = _schema_scope(ctx, repo)
+    try:
+        declaration = load_project_schema(root)
+        effective = resolve_declaration(declaration)
+    except ProjectSchemaError as exc:
+        raise _tools_fail(str(exc))
+
+    node_types: list[dict[str, Any]] = []
+    relationships: list[dict[str, Any]] = []
+    if declaration is None or declaration.extends == "default":
+        node_types += [{"label": n, "origin": "built-in", "key": None, "source": None, "color": None} for n in NODE_LABELS]
+        relationships += [
+            {"type": t, "from": None, "to": None, "provider": "builtin", "origin": "built-in", "color": None}
+            for t in RELATIONSHIP_TYPES
+        ]
+    node_types += [
+        {
+            "label": n.label,
+            "origin": "project",
+            "key": list(n.key),
+            "source": {"provider": n.source.provider, "kind": n.source.kind} if n.source else None,
+            "color": n.color,
+        }
+        for n in effective.node_types
+    ]
+    relationships += [
+        {"type": r.type, "from": list(r.from_labels), "to": r.to, "provider": r.provider, "origin": "project", "color": r.color}
+        for r in effective.relationships
+    ]
+
+    if as_json:
+        typer.echo(json.dumps({"node_types": node_types, "relationships": relationships}, indent=2))
+        return
+    nodes = Table(title=escape(f"Node types for {root}"))
+    nodes.add_column("Label", style="cyan")
+    nodes.add_column("Origin")
+    nodes.add_column("Key")
+    nodes.add_column("Source")
+    nodes.add_column("Colour")
+    for row in node_types:
+        source = row["source"]
+        nodes.add_row(
+            escape(row["label"]), row["origin"], escape(", ".join(row["key"] or ())),
+            f"{source['provider']} ({source['kind']})" if source else "\u2014",
+            row["color"] or "\u2014",
+        )
+    console.print(nodes)
+    rels = Table(title="Relationships")
+    for column in ("Type", "Origin", "From", "To", "Provider", "Colour"):
+        rels.add_column(column, style="cyan" if column == "Type" else None)
+    for row in relationships:
+        rels.add_row(
+            escape(row["type"]), row["origin"], escape(", ".join(row["from"] or ())), escape(row["to"] or ""), row["provider"], row["color"] or "\u2014"
+        )
+    console.print(rels)
+    if not project_config_enabled(root):
+        console.print("Project config is disabled: only the built-in schema is in effect.")
+
+
+@schema_app.command("add")
+def config_schema_add(
+    ctx: typer.Context,
+    source: str = typer.Option(..., "--from", help="YAML or JSON file holding one node type (`label`) or relationship (`type`), or - for stdin."),
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+) -> None:
+    """Add one node type or relationship. Fails if the label exists (use `edit`)."""
+    from devgraph.config.edits import add_schema_entry, entry_section
+
+    root = _schema_scope(ctx, repo)
+    entry = _read_schema_entry(source)
+    with _edit_errors(f"devgraph config schema edit {entry.get('label')}"):
+        section = entry_section(entry)
+        result = add_schema_entry(root, entry, record=_schema_record(root))
+    _schema_done("Added", section, str(entry[_SCHEMA_SECTIONS[section][0]]), result.path, root)
+    _schema_follow_up(root, result)
+
+
+@schema_app.command("edit")
+def config_schema_edit(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Node type label or relationship type to replace."),
+    source: Optional[str] = typer.Option(None, "--from", help="YAML or JSON file holding the new entry, or - for stdin. Default: open $EDITOR."),
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    node_type: bool = typer.Option(False, "--node-type", help="NAME is a node type label."),
+    relationship: bool = typer.Option(False, "--relationship", help="NAME is a relationship type."),
+) -> None:
+    """Replace one entry, from a file or in $EDITOR. Nothing is written if the result is unchanged or invalid."""
+    from devgraph.config.edits import find_schema_entry, locate_entry, replace_schema_entry
+    from devgraph.config.list_edit import dump_entry
+    from devgraph.config.project_schema import project_schema_path
+
+    root = _schema_scope(ctx, repo)
+    path = project_schema_path(root)
+    text = _schema_text(path)
+    with _edit_errors():
+        section = locate_entry(text, name, node_type, relationship)
+        current = find_schema_entry(text, name, section)
+    if source is not None:
+        entry = _read_schema_entry(source)
+    else:
+        original = dump_entry(current)
+        edited = click.edit(original, extension=".yaml")
+        if edited is None or edited == original:
+            console.print("No changes.")
+            return
+        entry = _parse_tool_text(edited, "edited entry", "one schema entry")
+        if entry == current:
+            console.print("No changes.")
+            return
+    with _edit_errors():
+        result = replace_schema_entry(
+            root, name, entry, node_type=node_type, relationship=relationship, record=_schema_record(root)
+        )
+    _schema_done("Updated", section, name, result.path, root)
+    _schema_follow_up(root, result)
+
+
+@schema_app.command("delete")
+def config_schema_delete(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Node type label or relationship type to remove."),
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    node_type: bool = typer.Option(False, "--node-type", help="NAME is a node type label."),
+    relationship: bool = typer.Option(False, "--relationship", help="NAME is a relationship type."),
+) -> None:
+    """Remove one node type or relationship. Unknown names exit 1."""
+    from devgraph.config.edits import delete_schema_entry, locate_entry
+    from devgraph.config.project_schema import project_schema_path
+
+    root = _schema_scope(ctx, repo)
+    with _edit_errors():
+        section = locate_entry(_schema_text(project_schema_path(root)), name, node_type, relationship)
+        result = delete_schema_entry(
+            root, name, node_type=node_type, relationship=relationship, record=_schema_record(root)
+        )
+    _schema_done("Deleted", section, name, result.path, root)
+    _schema_follow_up(root, result)
+
+
+@schema_app.command("reset")
+def config_schema_reset(
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    yes: bool = typer.Option(False, "--yes", help="Do not ask for confirmation."),
+) -> None:
+    """Delete devgraph.schema.yaml, returning the repository to the built-in schema."""
+    from devgraph.config.edits import reset_schema
+    from devgraph.config.project_schema import project_schema_path
+
+    root = _schema_scope(ctx, repo)
+    path = project_schema_path(root)
+    if not os.path.lexists(path):
+        console.print(f"Nothing to reset: {escape(str(path))} does not exist.", soft_wrap=True)
+        return
+    if not yes:
+        typer.confirm(f"Delete {path} and return to the built-in schema?", abort=True)
+    with _edit_errors():
+        result = reset_schema(root, record=_schema_record(root))
+    console.print(f"[green]Reset[/green] {escape(str(path))}", soft_wrap=True)
+    console.print(escape(_schema_effect_note(root)), soft_wrap=True)
+    _schema_follow_up(root, result)
 
 
 @app.command()
@@ -1507,8 +2795,10 @@ def prune(
             return
 
         for rid in sorted(orphaned):
+            recorded = engine.read_applied_schema(rid) or {}
             engine.delete_repository(rid)
             console.print(f"[green][OK][/green] Deleted: {rid}")
+            _release_labels(engine, recorded.get("labels") or [])
     finally:
         engine.close()
 
@@ -1556,7 +2846,7 @@ def self_test(
                 console.print(f"  [red][X] {count} Module(s) missing 'file' property[/red]")
                 all_passed = False
             else:
-                console.print(f"  [green][OK][/green] All Module nodes have 'file'")
+                console.print("  [green][OK][/green] All Module nodes have 'file'")
         except Exception as e:
             console.print(f"  [red][X] Check failed:[/red] {e}")
             all_passed = False
@@ -1573,7 +2863,7 @@ def self_test(
                 console.print(f"  [red][X] {count} dangling CONTAINS edge(s)[/red]")
                 all_passed = False
             else:
-                console.print(f"  [green][OK][/green] All CONTAINS edges valid")
+                console.print("  [green][OK][/green] All CONTAINS edges valid")
         except Exception as e:
             console.print(f"  [red][X] Check failed:[/red] {e}")
             all_passed = False
@@ -1590,7 +2880,7 @@ def self_test(
                 console.print(f"  [red][X] {count} dangling CALLS edge(s)[/red]")
                 all_passed = False
             else:
-                console.print(f"  [green][OK][/green] All CALLS edges valid")
+                console.print("  [green][OK][/green] All CALLS edges valid")
         except Exception as e:
             console.print(f"  [red][X] Check failed:[/red] {e}")
             all_passed = False
@@ -1614,7 +2904,7 @@ def self_test(
             if missing:
                 console.print(f"  [yellow]{len(missing)} repo(s) in registry but not in Neo4j: {', '.join(sorted(missing))}[/yellow]")
             if not orphaned and not missing:
-                console.print(f"  [green][OK][/green] Registry ↔ Neo4j consistent")
+                console.print("  [green][OK][/green] Registry ↔ Neo4j consistent")
         except Exception as e:
             console.print(f"  [red][X] Check failed:[/red] {e}")
             all_passed = False

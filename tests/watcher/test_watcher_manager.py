@@ -1,8 +1,6 @@
 """Tests for WatcherManager."""
 
-import sqlite3
 import tempfile
-import threading
 import time
 from pathlib import Path
 

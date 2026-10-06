@@ -23,4 +23,4 @@ RUN pip install --no-cache-dir .
 ENV DEVGRAPH_DASHBOARD_HOST=0.0.0.0
 EXPOSE 8765
 
-ENTRYPOINT ["python", "-m", "devgraph.agent.headless"]
+ENTRYPOINT ["python", "-P", "-m", "devgraph.agent.headless"]

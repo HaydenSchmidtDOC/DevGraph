@@ -75,6 +75,9 @@ code { font-family: var(--font-mono); }
 .btn:hover { background: rgba(255,255,255,0.06); color: var(--fg); border-color: rgba(255,255,255,0.14); }
 .btn-primary { background: var(--accent); color: var(--accent-on); border-color: var(--accent); }
 .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-on); }
+.btn-danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+.btn-danger:hover { background: color-mix(in oklab, var(--danger), black 15%); border-color: color-mix(in oklab, var(--danger), black 15%); color: #fff; }
+.btn-danger:disabled { opacity: 0.45; }
 .btn-sm { padding: 5px 10px; font-size: 12px; }
 
 /* ── themed custom select (replaces OS-default white dropdown lists) ── */
@@ -314,7 +317,7 @@ table.logtable tbody tr:hover { background: color-mix(in oklab, var(--accent), t
 .count-row .val.na { color: var(--meta); }
 .count-note { font-size: 10.5px; color: var(--meta); margin-top: 8px; line-height: 1.5; }
 .rel-grid { display: flex; flex-wrap: wrap; gap: 5px; overflow-y: auto; overflow-x: hidden; max-width: 100%; }
-.rel-chip { font-family: var(--font-mono); font-size: 10.5px; padding: 3px 7px; border-radius: var(--radius-pill); border: 1px solid var(--border); color: var(--muted); background: rgba(255,255,255,0.02); cursor: pointer; transition: background var(--motion-fast), color var(--motion-fast), border-color var(--motion-fast); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rel-chip { font-family: var(--font-mono); font-size: 10.5px; padding: 3px 7px; border-radius: var(--radius-pill); border: 1px solid var(--relcolor, var(--border)); color: var(--muted); background: rgba(255,255,255,0.02); cursor: pointer; transition: background var(--motion-fast), color var(--motion-fast), border-color var(--motion-fast); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rel-chip:hover { background: color-mix(in oklab, var(--accent), transparent 88%); color: var(--accent-hover); border-color: color-mix(in oklab, var(--accent), transparent 55%); }
 .rel-chip.isolated { background: color-mix(in oklab, var(--accent), transparent 78%); color: var(--accent-hover); border-color: color-mix(in oklab, var(--accent), transparent 40%); }
 .rel-chip.dimmed { opacity: 0.4; }
@@ -330,6 +333,8 @@ table.logtable tbody tr:hover { background: color-mix(in oklab, var(--accent), t
 .metric-block { padding: 9px 0; border-top: 1px solid var(--border-soft); }
 .metric-block:first-child { border-top: none; padding-top: 0; }
 .metric-block .metric-label { justify-content: space-between; margin-bottom: 2px; }
+.spark { display: block; width: 100%; height: 28px; margin-top: 6px; }
+.metric-sub { font-family: var(--font-mono); font-size: 11px; color: var(--meta); margin-top: 2px; }
 .leaderboard-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-top: 1px solid var(--border-soft); font-size: 12px; }
 .leaderboard-row:first-child { border-top: none; }
 .leaderboard-row .lb-rank { font-family: var(--font-mono); font-size: 10.5px; color: var(--meta); width: 14px; flex-shrink: 0; }
@@ -383,8 +388,6 @@ table.dstable input[type="text"] { width: 100%; }
 .tool-row:first-child { border-top: none; }
 .tool-name { font-family: var(--font-mono); font-size: 12px; color: var(--fg-2); flex-shrink: 0; }
 .tool-desc { font-size: 11.5px; color: var(--meta); flex: 1; margin: 0 14px; }
-.warn-note { display: flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--warn); margin-top: 3px; }
-.warn-note svg { width: 12px; height: 12px; flex-shrink: 0; }
 .snippet-box { background: #050506; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-2); line-height: 1.7; white-space: pre-wrap; word-break: break-all; }
 .snippet-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
 .copy-toast { font-size: 11px; color: var(--success); margin-left: 8px; opacity: 0; transition: opacity var(--motion-fast); }
@@ -396,6 +399,60 @@ table.dstable input[type="text"] { width: 100%; }
 .modal-box h4 { font-size: 15px; margin-bottom: 8px; }
 .modal-box p { font-size: 13px; color: var(--muted); line-height: 1.55; margin: 0 0 18px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.cfg-toolbar { display: flex; align-items: center; gap: 10px; }
+.cfg-status { font-size: 12px; color: var(--muted); }
+.cfg-status ul { margin: 0; padding-left: 16px; }
+.cfg-scopes { display: flex; flex-direction: column; gap: var(--space-4); }
+.cfg-scope .card-head h3 { margin: 0; }
+.cfg-section { margin-top: 14px; }
+.cfg-section-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; color: var(--fg-2); margin-bottom: 6px; }
+.cfg-section-head .cfg-actions { margin-left: auto; text-transform: none; letter-spacing: 0; }
+.cfg-toggle { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.cfg-toggle-msg { font-size: 12px; line-height: 1.5; color: var(--muted); }
+.cfg-toggle-msg ul { margin: 2px 0 0 18px; }
+.cfg-toggle-msg .modal-actions { justify-content: flex-start; margin-top: 6px; }
+.cfg-reset-list { font-size: 12.5px; line-height: 1.5; }
+.cfg-reset-list ul { margin: 4px 0 8px 18px; }
+.cfg-reset-list .cfg-sub { font-size: 11.5px; }
+.cfg-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.cfg-chip { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-2); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; }
+.cfg-row-main { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.cfg-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.cfg-sub { font-family: var(--font-mono); font-size: 10.5px; color: var(--meta); }
+.cfg-lock { display: inline-flex; color: var(--meta); }
+.cfg-lock svg { width: 12px; height: 12px; }
+.cfg-badge, .cfg-global { font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border); color: var(--meta); }
+.cfg-badge.info, .cfg-global { color: var(--accent); border-color: color-mix(in oklab, var(--accent), transparent 60%); }
+.cfg-badge.warn { color: var(--warn); border-color: color-mix(in oklab, var(--warn), transparent 60%); }
+.cfg-badge.error { color: var(--danger); border-color: color-mix(in oklab, var(--danger), transparent 60%); }
+.modal-box.cfg-modal-box { width: min(720px, 92vw); display: flex; flex-direction: column; gap: 12px; max-height: calc(100vh - 32px); overflow-y: auto; }
+/* the heading, banners and buttons keep their height; only the form shrinks (and scrolls) to fit */
+.cfg-modal-box > * { flex-shrink: 0; }
+/* the YAML keeps its 260px where there is room, and gives way before the buttons do */
+.cfg-modal-box > textarea.cfg-yaml { flex-shrink: 1; height: 260px; min-height: 120px; }
+.cfg-yaml { width: 100%; min-height: 260px; resize: vertical; background: #050506; border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--fg); padding: 10px 12px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; }
+.cfg-confirm { font-size: 12.5px; color: var(--warn); line-height: 1.5; }
+.cfg-switch { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.cfg-switch button[aria-pressed="true"] { border-color: var(--accent); color: var(--fg); }
+.cfg-switch button[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
+.cfg-form-notice { font-size: 12.5px; color: var(--warn); line-height: 1.5; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+#configFormHelp { font-size: 11.5px; color: var(--meta); }
+/* the scroller is a div: Chrome lets a scrolling fieldset's content overflow its parent */
+.cfg-modal-box > .cfg-form-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.cfg-form { margin: 0; min-width: 0; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+.cfg-form legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
+.cfg-form fieldset { margin: 0; min-width: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: 8px 10px; display: flex; flex-direction: column; gap: 8px; }
+.cfg-form textarea:not(.cfg-yaml) { background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--fg); padding: 9px 11px; font-size: 13px; font-family: var(--font-body); resize: vertical; }
+.cfg-form textarea.cfg-yaml { min-height: 0; }
+.cfg-form .field.cfg-check { flex-direction: row; align-items: center; gap: 8px; }
+.cfg-form .field.cfg-check input { padding: 0; }
+.cfg-form .cfg-inline { display: flex; align-items: center; gap: 8px; }
+.cfg-form .cfg-inline input[type="text"] { flex: 1; }
+.cfg-form .cfg-help { font-size: 11.5px; color: var(--meta); }
+.cfg-form .cfg-hint { font-size: 11.5px; color: var(--warn); }
+.cfg-form .cfg-row-actions { display: flex; gap: 8px; }
+.cfg-confirm ul { margin: 4px 0 0 18px; }
+.cfg-error { font-size: 12.5px; color: var(--danger); white-space: pre-wrap; line-height: 1.5; }
 .pagefoot { position: relative; z-index: 1; border-top: 1px solid var(--border-soft); padding: 24px var(--space-6); color: var(--meta); font-size: 12px; max-width: var(--container-max); margin-inline: auto; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; background: color-mix(in oklab, var(--bg) 88%, transparent); }
 </style>
 </head>
@@ -467,6 +524,10 @@ table.dstable input[type="text"] { width: 100%; }
             <label class="switch"><input type="checkbox" id="ctlRotationEnabled" /><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="toggle-row">
+            <span class="lbl">Color by community<span class="qmark" data-tip="Colors nodes by their graph-insights community instead of entity type. Grey nodes have no community: no dependency or containment edges, or insights not computed yet.">?</span></span>
+            <label class="switch"><input type="checkbox" id="ctlCommunityColors" /><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="toggle-row">
             <span class="lbl">Node/edge shadows<span class="qmark" data-tip="Soft drop-shadow on nodes and relationship lines. Costs real canvas paint time (shadow blur isn't free), more so with a lot on screen -- turn off for a flatter look on a large graph.">?</span></span>
             <label class="switch"><input type="checkbox" id="ctlShadowsEnabled" checked /><span class="track"></span><span class="thumb"></span></label>
           </div>
@@ -508,9 +569,10 @@ table.dstable input[type="text"] { width: 100%; }
       <div class="card-head"><h3>Entities</h3><span class="wired-pill" id="entityLivePill" style="display:none">Live</span></div>
       <div class="entity-total">Total:<span class="n" id="entityTotal">—</span></div>
       <div class="count-list floating-list" id="entityCounts"></div>
+      <div class="count-note" id="schemaPendingHint" style="display:none"></div>
       <div class="count-note">Document nodes: <span id="docCount" style="color:var(--fg-2)">—</span></div>
       <div class="fc-subsection" data-od-id="god-nodes-section">
-        <div class="fc-subhead">Top god nodes<span class="qmark" data-tip="Ranked by real degree centrality — size((n)--()) — a plain Cypher query, no plugin required. PageRank would need GDS.">?</span></div>
+        <div class="fc-subhead">Top god nodes <span class="lb-type" id="godNodesBasis">degree</span><span class="qmark" data-tip="PageRank over dependency edges (calls, imports, extends, implements, uses, depends-on) once graph insights are computed; until then, raw degree — size((n)--()) — which containment and history edges inflate. CALLS edges are resolved by name, so widely used generic method names (such as get or close) can rank high.">?</span></div>
         <div id="godNodes"></div>
       </div>
     </div>
@@ -535,7 +597,7 @@ table.dstable input[type="text"] { width: 100%; }
           <div class="autocomplete" id="autocomplete"></div>
         </div>
         <div class="cypher-foot">
-          <span class="cypher-note" id="cypherNote">Matches glow live as you type · MCP cypher access for AI agents toggles in <a href="#" id="linkOpenMcpSettings" style="color:var(--accent-hover)">Settings</a>.</span>
+          <span class="cypher-note" id="cypherNote">Matches glow live as you type · MCP clients' raw Cypher access (<code>run_cypher</code>) is shown in <a href="#" id="linkOpenConfig" style="color:var(--accent-hover)">Settings → Config</a>.</span>
           <button class="btn btn-sm" id="btnRunCypher">Run</button>
         </div>
         <div class="cypher-error" id="cypherError"></div>
@@ -572,22 +634,32 @@ table.dstable input[type="text"] { width: 100%; }
       </div>
 
       <div class="card" data-od-id="db-memory-card">
-        <div class="card-head"><h3>Database &amp; memory</h3><span class="sample-pill" id="memPill" title="JVM heap is read from the server's java.lang:type=Memory JMX bean on connect; stays dashed if this build doesn't expose it">Checking…</span></div>
+        <div class="card-head"><h3>Database &amp; memory</h3><span class="sample-pill" id="memPill" title="Sampled every 15 s from Neo4j's JMX beans and config, and from its data directory; anything without a usable reading stays dashed">Checking…</span></div>
         <div class="metric-block">
           <div class="metric-label"><span>JVM heap</span><span class="metric-val dim" id="heapVal">—</span></div>
           <div class="meter"><i id="heapMeter" style="width:0%"></i></div>
+          <canvas class="spark" id="heapSpark" height="56"></canvas>
         </div>
         <div class="metric-block">
-          <div class="metric-label"><span>Page cache hit ratio<span class="qmark" data-tip="Share of graph lookups served from RAM vs. disk reads. Healthy is generally >95%.">?</span></span><span class="metric-val dim" id="pageCacheVal">—</span></div>
-          <div class="meter"><i id="pageCacheMeter" style="width:0%"></i></div>
+          <div class="metric-label"><span>System RAM<span class="qmark" data-tip="Physical memory as the Neo4j JVM sees it: the host's RAM, or the container's memory limit if one is set.">?</span></span><span class="metric-val dim" id="ramVal">—</span></div>
+          <div class="meter"><i id="ramMeter" style="width:0%"></i></div>
+          <canvas class="spark" id="ramSpark" height="56"></canvas>
         </div>
-        <div class="metric-row"><span class="metric-label">Store size on disk</span><span class="metric-val dim" id="storeSizeVal">—</span></div>
-        <div class="placeholder-note" id="memNote">JVM heap is read live from the server on connect. Page cache hit ratio and store size still need APOC (<code>apoc.monitor.pc</code> / <code>apoc.monitor.store</code>), not confirmed installed on this build — those stay dashed, never fabricated.</div>
+        <div class="metric-row"><span class="metric-label">Swap used</span><span class="metric-val dim" id="swapVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">CPU (Neo4j / system)</span><span class="metric-val dim" id="cpuVal">— / —</span></div>
+        <div class="metric-row"><span class="metric-label">GC collections / time<span class="qmark" data-tip="Totals since Neo4j started, summed across the JVM's garbage collectors.">?</span></span><span class="metric-val dim" id="gcVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">Page cache (configured)<span class="qmark" data-tip="server.memory.pagecache.size as Neo4j reports it. Hit ratio needs Neo4j Enterprise metrics and has no source on Community.">?</span></span><span class="metric-val dim" id="pageCacheVal">—</span></div>
+        <div class="metric-block">
+          <div class="metric-label"><span>Store size on disk</span><span class="metric-val dim" id="storeSizeVal">—</span></div>
+          <div class="metric-sub" id="storeSplitVal"></div>
+          <canvas class="spark" id="storeSpark" height="56"></canvas>
+        </div>
+        <div class="placeholder-note" id="memNote">Reading database and memory stats…</div>
       </div>
 
       <div class="card" data-od-id="query-telemetry-card">
         <div class="card-head"><h3>Query telemetry</h3><span class="sample-pill" id="mcpPill">Checking…</span></div>
-        <div class="metric-row"><span class="metric-label">Tool calls (MCP, last 500)<span class="qmark" data-tip="MCP tool calls recorded by connected MCP clients (devgraph/mcp/server.py), metadata only — no query text, arguments, or repository. The store keeps the newest 500 records.">?</span></span><span class="metric-val dim" id="mcpCallsVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">Tool calls (MCP, last 500)<span class="qmark" data-tip="MCP tool calls recorded by connected MCP clients (devgraph/mcp/server.py), metadata only — no query text or arguments; a project tool's id names the repository its session is scoped to. The store keeps the newest 500 records.">?</span></span><span class="metric-val dim" id="mcpCallsVal">—</span></div>
         <div class="metric-row"><span class="metric-label">Top tools (MCP)</span><span class="metric-val dim" id="mcpTopToolsVal" style="flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</span></div>
         <div class="metric-row"><span class="metric-label">P50 / P95 / P99 latency (MCP)</span><span class="metric-val dim" id="latencyVal">— / — / —</span></div>
         <div class="metric-row"><span class="metric-label">Error rate (MCP)</span><span class="metric-val dim" id="errRateVal">—</span></div>
@@ -598,15 +670,21 @@ table.dstable input[type="text"] { width: 100%; }
       </div>
 
       <div class="card" data-od-id="community-card">
-        <div class="card-head"><h3>Community partitions</h3><span class="sample-pill" id="communityPill">Checking…</span></div>
-        <div class="metric-row"><span class="metric-label">Partitions detected<span class="qmark" data-tip="Louvain modularity via Neo4j Graph Data Science. Attempted live; falls back if the GDS plugin isn't installed.">?</span></span><span class="metric-val dim" id="communityVal">—</span></div>
-        <div class="placeholder-note" id="communityNote">Checking for the GDS plugin…</div>
+        <div class="card-head"><h3>Communities</h3><span class="sample-pill" id="communityPill">Checking…</span></div>
+        <div class="metric-row"><span class="metric-label">Communities<span class="qmark" data-tip="Louvain clusters over this repository's dependency and containment edges, computed by DevGraph itself (no Neo4j plugin) and refreshed automatically after indexing.">?</span></span><span class="metric-val dim" id="communityVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">Modularity<span class="qmark" data-tip="How cleanly the graph splits into these communities: near 0 means no real structure, above about 0.3 a clear split.">?</span></span><span class="metric-val dim" id="modularityVal">—</span></div>
+        <div class="metric-row"><span class="metric-label">Last computed</span><span class="metric-val dim" id="insightsAtVal">—</span></div>
+        <div id="communityList"></div>
+        <div class="metric-label" style="margin-top:10px">Bridges<span class="qmark" data-tip="Highest betweenness over dependency edges: entities that sit between subsystems, where a change ripples furthest.">?</span></div>
+        <div id="bridgeList"></div>
+        <div class="placeholder-note" id="communityNote">Reading graph insights…</div>
+        <button class="btn btn-sm" id="btnRecomputeInsights" style="margin-top:8px">Recompute</button>
       </div>
     </aside>
   </div>
 </main>
 
-<footer class="pagefoot" data-od-id="footer"><span>DevGraph dashboard prototype · design phase</span><span>Node/relationship taxonomy from <code>graph/schema.py</code> · git history is the real <code>devgraph</code> log</span></footer>
+<footer class="pagefoot" data-od-id="footer"><span>DevGraph dashboard prototype · design phase</span><span>Node/relationship types from each repository's schema · git history is the real <code>devgraph</code> log</span></footer>
 
 <div class="settings-overlay" id="settingsOverlay" data-od-id="settings-overlay">
   <div class="settings-topbar"><button class="icon-btn" id="btnCloseSettings" title="Back to graph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button><h2>Settings</h2></div>
@@ -614,7 +692,7 @@ table.dstable input[type="text"] { width: 100%; }
     <div class="settings-layout">
       <nav class="settings-nav" data-od-id="settings-nav">
         <button class="active" data-pane="repos">Repos</button>
-        <button data-pane="mcp">MCP tools</button>
+        <button data-pane="config">Config</button>
         <button data-pane="watcher">Watcher / tray</button>
         <button data-pane="network">Network / access</button>
         <button data-pane="neo4j">Neo4j</button>
@@ -653,21 +731,11 @@ table.dstable input[type="text"] { width: 100%; }
           <div class="banner info"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg><span>Registering runs the initial file scan only, exactly like <code>devgraph add &lt;path&gt;</code>; git-history indexing is separate (<code>devgraph index-history &lt;repo_id&gt;</code>). <code>docs_path</code> is a real, currently-unset repo field per the rebuild design doc §2 — the table above is wired to hold values, ready to POST to a backend save route once it exists, so its edits don't persist yet.</span></div>
         </div>
 
-        <div class="settings-pane" id="pane-mcp" data-od-id="pane-mcp">
-          <h3 class="pane-title">MCP tool exposure</h3>
-          <p class="desc">19 read tools registered today, plus the raw Cypher escape hatch below. Per-tool toggles gate registration in <code>mcp/server.py</code> — propagated via the shared config store, not a live push to running MCP processes.</p>
-          <div class="card">
-            <div class="tool-row" style="padding-bottom:10px; margin-bottom:6px; border-bottom:1px solid var(--border-soft); border-top:none; align-items:flex-start">
-              <div>
-                <span class="tool-name" style="color:var(--fg); font-weight:590">enable_run_cypher</span>
-                <div class="tool-desc" style="margin:2px 0 0">Raw Cypher access against Neo4j — global switch, off by default</div>
-                <div class="warn-note" id="cypherWarnNote" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg>MCP clients (Claude Code, IDEs, other AI agents) can now run arbitrary Cypher through this tool. The dashboard's own Cypher box on the Graph page is unaffected either way.</div>
-              </div>
-              <label class="switch"><input type="checkbox" id="toggleCypher" /><span class="track"></span><span class="thumb"></span></label>
-            </div>
-            <div id="mcpToolList"></div>
-          </div>
-          <div class="banner warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg>Per-model / per-client MCP access control is explicitly skipped this pass — the server is stdio-transport, 1:1 per client, with no allowlisting concept yet. Separate future spec.</div>
+        <div class="settings-pane" id="pane-config" data-od-id="pane-config">
+          <h3 class="pane-title">Config</h3>
+          <p class="desc">Node types, relationship types and MCP tools: DevGraph's built-ins and the global tools store, then each registered repository's own <code>devgraph.schema.yaml</code> and <code>devgraph.tools.yaml</code>. Edits are validated exactly like <code>devgraph config</code> and written to the file — nothing is committed.</p>
+          <div class="cfg-toolbar"><button class="btn btn-sm" id="btnConfigReload">Reload</button><div class="cfg-status" id="configStatus"></div></div>
+          <div class="cfg-scopes" id="configScopes"></div>
         </div>
 
         <div class="settings-pane" id="pane-watcher" data-od-id="pane-watcher">
@@ -682,7 +750,7 @@ table.dstable input[type="text"] { width: 100%; }
 
         <div class="settings-pane" id="pane-network" data-od-id="pane-network">
           <h3 class="pane-title">Network / access</h3>
-          <div class="banner warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg>No authentication or IP allowlist. Loopback-only by design this pass — per the rebuild design doc §5, adding auth is only in scope if <code>dashboard_host</code> ever moves off <code>127.0.0.1</code>.</div>
+          <div class="banner warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg>No authentication. Loopback-only by design this pass — per the rebuild design doc §5, adding auth is only in scope if <code>dashboard_host</code> ever moves off <code>127.0.0.1</code>. Requests are answered only when their Host is <code>127.0.0.1</code>, <code>localhost</code>, <code>[::1]</code> or <code>dashboard_host</code> (a wildcard bind adds nothing), which blocks DNS-rebinding pages; writes also refuse cross-origin requests.</div>
           <div class="card field-grid"><div class="field"><label>dashboard_host</label><input type="text" id="cfgDashboardHost" value="127.0.0.1" disabled /></div><div class="field"><label>dashboard_port</label><input type="text" id="cfgDashboardPort" value="8765" disabled /></div></div>
         </div>
 
@@ -753,6 +821,26 @@ table.dstable input[type="text"] { width: 100%; }
 </div>
 
 <div class="modal-overlay" id="restartModal"><div class="modal-box"><h4>Restart required</h4><p id="restartModalText"></p><div class="modal-actions"><button class="btn btn-sm" id="restartCancel">Cancel</button><button class="btn btn-sm btn-primary" id="restartConfirm">Confirm change</button></div></div></div>
+<div class="modal-overlay" id="configModal"><div class="modal-box cfg-modal-box" role="dialog" aria-modal="true" aria-labelledby="configModalTitle">
+  <h4 id="configModalTitle"></h4>
+  <div class="banner warn" id="configModalWarn" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 18a1 1 0 0 0 .9 1.5h16.8a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0z"/></svg><span id="configModalWarnText"></span></div>
+  <div class="field" id="configDestField" style="display:none"><label for="configDest" id="configDestLabel">Save to</label><select id="configDest"></select></div>
+  <div class="cfg-switch" id="configEditorSwitch" role="group" aria-labelledby="configEditorLabel" style="display:none"><span id="configEditorLabel">Editor</span><button type="button" class="btn btn-sm" id="configModeForm" aria-pressed="false">Form</button><button type="button" class="btn btn-sm" id="configModeYaml" aria-pressed="true">YAML</button></div>
+  <div class="cfg-help" id="configFormHelp" style="display:none">The form writes the YAML; Save checks it first, as before.</div>
+  <div class="cfg-form-notice" id="configFormNotice" aria-live="polite" style="display:none"><span id="configFormNoticeText"></span><button type="button" class="btn btn-sm" id="configFormDiscard" style="display:none">Discard YAML edits</button></div>
+  <div class="cfg-form-scroll" id="configFormScroll" style="display:none"><fieldset class="cfg-form" id="configForm" style="display:none"></fieldset></div>
+  <textarea class="cfg-yaml" id="configYaml" spellcheck="false" aria-label="Entry YAML"></textarea>
+  <div class="cfg-confirm" id="configModalConfirm" style="display:none"></div>
+  <div class="cfg-error" id="configModalError" role="alert" style="display:none"></div>
+  <div class="modal-actions"><button class="btn btn-sm" id="configModalReload" style="display:none">Reload</button><button class="btn btn-sm" id="configModalCancel">Cancel</button><button class="btn btn-sm btn-primary" id="configModalSave">Save</button></div>
+</div></div>
+<div class="modal-overlay" id="configResetModal"><div class="modal-box cfg-modal-box" role="dialog" aria-modal="true" aria-labelledby="configResetTitle">
+  <h4 id="configResetTitle"></h4>
+  <div class="cfg-reset-list" id="configResetList"></div>
+  <div class="field" id="configResetPhraseField" style="display:none"><label for="configResetTyped" id="configResetPhraseLabel"></label><input type="text" id="configResetTyped" autocomplete="off" spellcheck="false" /></div>
+  <div class="cfg-error" id="configResetError" style="display:none"></div>
+  <div class="modal-actions"><button class="btn btn-sm" id="configResetRecheck" style="display:none">Re-check</button><button class="btn btn-sm" id="configResetCancel">Cancel</button><button class="btn btn-sm btn-danger" id="configResetConfirm" disabled>Reset</button></div>
+</div></div>
 <div id="tooltipBubble"></div>
 <div id="gitHoverCard"></div>
 
@@ -809,8 +897,13 @@ function themeSelect(select) {
 }
 ["repoSelect","layoutSelect","chartInterval","chartSpan"].forEach(id => themeSelect(document.getElementById(id)));
 
-const NODE_TYPES = [
+/* The built-in types as the dashboard has always drawn them: the order,
+   category and colour of each row a repository with no schema file shows.
+   NODE_TYPES/REL_TYPES start as copies and are rebuilt in place from each
+   repository's /schema (applySchemaTypes, below); these never change. */
+const BUILTIN_NODE_TYPES = [
   { id:"Repository",       cat:"repo",        count:1 },
+  { id:"Container",        cat:"repo",        count:0 },
   { id:"Service",          cat:"service",      count:2 },
   { id:"Module",           cat:"module",       count:84 },
   { id:"Class",            cat:"class",        count:82 },
@@ -827,7 +920,11 @@ const NODE_TYPES = [
   { id:"PullRequest",      cat:"phase3",       count:null },
   { id:"Issue",            cat:"phase3",       count:null },
 ];
-const REL_TYPES = ["CONTAINS","CALLS","IMPORTS","USES","RUNS","WRITES_TO","READS_FROM","IMPLEMENTS","DEPENDS_ON","EXTENDS","SATISFIES","DOCUMENTED_BY","DECIDED_BY","SUPERSEDES","MENTIONS","MODIFIES","RESOLVES","REFERENCES"];
+const BUILTIN_REL_TYPES = ["CONTAINS","CALLS","IMPORTS","USES","RUNS","WRITES_TO","READS_FROM","IMPLEMENTS","DEPENDS_ON","EXTENDS","SATISFIES","DOCUMENTED_BY","DECIDED_BY","SUPERSEDES","MENTIONS","MODIFIES","RESOLVES","REFERENCES"];
+const NODE_TYPES = BUILTIN_NODE_TYPES.map(t => ({ ...t }));
+const REL_TYPES = [...BUILTIN_REL_TYPES];
+/* project relationship type -> its display colour, from the same payload */
+const REL_COLORS = {};
 
 /* plain literal hex colors, resolved once in JS — no CSS custom-property or
    color-mix() indirection at all, since canvas fillStyle can't parse an
@@ -846,6 +943,13 @@ const CAT_COLORS = {
   phase3:      "#6b7280",
 };
 function catColor(cat) { return CAT_COLORS[cat] || "#8a8f98"; }
+/* Community colours for the "Color by community" toggle. Defined here, ahead
+   of the Cytoscape style that calls communityColor, and cycled when a
+   repository has more communities than colours. */
+const COMMUNITY_PALETTE = ["#5e6ad2", "#26b5ce", "#4cb782", "#f2c94c", "#f2994a", "#eb5757", "#bb87fc", "#ff7eb6", "#6fcf97", "#56ccf2", "#c9a227", "#9b8afb"];
+function communityColor(c) {
+  return Number.isInteger(c) && c >= 0 ? COMMUNITY_PALETTE[c % COMMUNITY_PALETTE.length] : "#5a5f68";
+}
 const brightCache = {};
 function catColorBright(cat) {
   if (brightCache[cat]) return brightCache[cat];
@@ -861,7 +965,7 @@ function catColorBright(cat) {
    AND type(r)="X") instead of the old exclude-list (AND NOT ... IN [...]).
    Clicking the already-isolated one clears back to the whole graph. Entity
    and relationship isolation are independent of each other. */
-const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000, highlightMode: true, renderThreshold: 1600, rotationEnabled: false, shadowsEnabled: true, glowEnabled: true, settleOnChange: true };
+const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000, highlightMode: true, renderThreshold: 1600, rotationEnabled: false, shadowsEnabled: true, glowEnabled: true, settleOnChange: true, colorByCommunity: false };
 document.getElementById("ctlRotationEnabled").addEventListener("change", e => {
   state.rotationEnabled = e.target.checked;
   if (state.rotationEnabled) armRotationLoop();
@@ -874,6 +978,10 @@ document.getElementById("ctlRotationEnabled").addEventListener("change", e => {
 document.getElementById("ctlShadowsEnabled").addEventListener("change", e => {
   state.shadowsEnabled = e.target.checked;
   cy.style().update(); // shadow-* below are function-valued styles gated on state.shadowsEnabled -- force Cytoscape to re-evaluate them on every element now, not just on the next unrelated restyle
+});
+document.getElementById("ctlCommunityColors").addEventListener("change", e => {
+  state.colorByCommunity = e.target.checked;
+  cy.style().update(); // background-color below is function-valued on state.colorByCommunity
 });
 document.getElementById("ctlGlowEnabled").addEventListener("change", e => {
   state.glowEnabled = e.target.checked;
@@ -926,34 +1034,108 @@ document.getElementById("valRenderThreshold").textContent = state.renderThreshol
 document.getElementById("ctlRenderThreshold").value = state.renderThreshold;
 
 const entityCounts = document.getElementById("entityCounts");
+const relTypes = document.getElementById("relTypes");
 let entityTotal = 0;
-NODE_TYPES.forEach(t => {
-  if (t.count !== null) entityTotal += t.count;
-  const row = document.createElement("div");
-  row.className = "count-row";
-  row.dataset.cat = t.cat;
-  row.style.setProperty("--dotcolor", CAT_COLORS[t.cat]);
-  row.innerHTML = `<span class="type-dot" style="background:${CAT_COLORS[t.cat]}"></span><span class="name">${t.id}</span><span class="val ${t.count===null?'na':''}">${t.count===null ? "—" : t.count.toLocaleString()}</span>`;
-  row.addEventListener("mouseenter", () => highlightCat(t.cat, true));
-  row.addEventListener("mouseleave", () => highlightCat(t.cat, false));
-  row.addEventListener("click", () => { state.isolatedEntity = (state.isolatedEntity === t.cat) ? null : t.cat; isolateChanged(); });
-  entityCounts.appendChild(row);
-});
+NODE_TYPES.forEach(t => { if (t.count !== null) entityTotal += t.count; });
 document.getElementById("entityTotal").textContent = entityTotal.toLocaleString();
 document.getElementById("ctlNodeCeiling").max = entityTotal;
 document.getElementById("ctlNodeCeiling").value = entityTotal;
 document.getElementById("valNodeCeiling").textContent = entityTotal;
 state.nodeCeiling = entityTotal;
 
-const relTypes = document.getElementById("relTypes");
-REL_TYPES.forEach(r => {
-  const chip = document.createElement("span");
-  chip.className = "rel-chip"; chip.textContent = r; chip.dataset.rel = r;
-  chip.addEventListener("mouseenter", () => highlightRel(r, true));
-  chip.addEventListener("mouseleave", () => highlightRel(r, false));
-  chip.addEventListener("click", () => { state.isolatedRel = (state.isolatedRel === r) ? null : r; isolateChanged(); });
-  relTypes.appendChild(chip);
-});
+/* The label a canvas node stands for. Live nodes carry it (mapGraphResultToElements);
+   the demo graph's nodes only carry a built-in category, each of which it
+   uses for exactly one label. */
+function nodeType(n) {
+  return n.data("ntype") || BUILTIN_NODE_TYPES.find(t => t.cat === n.data("cat"))?.id;
+}
+/* (Re)builds the Entities rows and Relationships chips from NODE_TYPES/REL_TYPES.
+   Rows are keyed by label (data-label): several built-ins share a category,
+   so a category can't say which one was clicked. */
+function renderTypeLists() {
+  entityCounts.replaceChildren();
+  NODE_TYPES.forEach(t => {
+    const row = document.createElement("div");
+    row.className = "count-row";
+    row.dataset.cat = t.cat;
+    row.dataset.label = t.id;
+    row.style.setProperty("--dotcolor", catColor(t.cat));
+    row.innerHTML = `<span class="type-dot"></span><span class="name">${escapeHtmlVal(t.id)}</span><span class="val ${t.count===null?'na':''}">${t.count===null ? "—" : t.count.toLocaleString()}</span>`;
+    row.querySelector(".type-dot").style.background = catColor(t.cat);
+    row.addEventListener("mouseenter", () => highlightType(t.id, true));
+    row.addEventListener("mouseleave", () => highlightType(t.id, false));
+    row.addEventListener("click", () => { state.isolatedEntity = (state.isolatedEntity === t.id) ? null : t.id; isolateChanged(); });
+    entityCounts.appendChild(row);
+  });
+  relTypes.replaceChildren();
+  REL_TYPES.forEach(r => {
+    const chip = document.createElement("span");
+    chip.className = "rel-chip"; chip.textContent = r; chip.dataset.rel = r;
+    if (REL_COLORS[r]) chip.style.setProperty("--relcolor", REL_COLORS[r]);
+    chip.addEventListener("mouseenter", () => highlightRel(r, true));
+    chip.addEventListener("mouseleave", () => highlightRel(r, false));
+    chip.addEventListener("click", () => { state.isolatedRel = (state.isolatedRel === r) ? null : r; isolateChanged(); });
+    relTypes.appendChild(chip);
+  });
+  refreshIsolateUI();
+}
+renderTypeLists();
+/* Takes a repository's /schema payload (node_types, relationship_types,
+   schema_state) and rebuilds the type lists from it. Built-ins keep their
+   category and colour from BUILTIN_NODE_TYPES/CAT_COLORS -- the payload's own
+   order and set of built-ins is not used, so a repo with no schema file
+   renders exactly the rows above. Each project label gets its own category,
+   "user:" + label, coloured from the payload, so it isolates, highlights and
+   colours on its own. Nothing of the previous repo's survives the swap. */
+function applySchemaTypes(schema) {
+  const counts = Object.fromEntries((schema.node_types || []).map(t => [t.label, t.count]));
+  Object.keys(CAT_COLORS).filter(k => k.startsWith("user:")).forEach(k => { delete CAT_COLORS[k]; delete brightCache[k]; });
+  Object.keys(REL_COLORS).forEach(k => delete REL_COLORS[k]);
+  NODE_TYPES.length = 0;
+  BUILTIN_NODE_TYPES.forEach(t => NODE_TYPES.push({ ...t, count: (counts[t.id] === undefined || (t.count === null && counts[t.id] === 0)) ? t.count : counts[t.id] }));
+  (schema.node_types || []).filter(t => t.origin === "project").forEach(t => {
+    const cat = "user:" + t.label;
+    CAT_COLORS[cat] = t.color;
+    NODE_TYPES.push({ id: t.label, cat, count: t.count ?? null });
+  });
+  REL_TYPES.length = 0;
+  REL_TYPES.push(...BUILTIN_REL_TYPES);
+  (schema.relationship_types || []).filter(r => r.origin === "project").forEach(r => {
+    REL_TYPES.push(r.type);
+    if (r.color) REL_COLORS[r.type] = r.color;
+  });
+  if (state.isolatedEntity && !NODE_TYPES.some(t => t.id === state.isolatedEntity)) state.isolatedEntity = null;
+  if (state.isolatedRel && !REL_TYPES.includes(state.isolatedRel)) state.isolatedRel = null;
+  renderTypeLists();
+  /* a schema file the graph doesn't reflect yet: changed since the last scan,
+     or unreadable. textContent, never innerHTML: the notice is server text. */
+  const hint = document.getElementById("schemaPendingHint");
+  const notice = ((schema.notices || [])[0] || "").split("\n")[0];
+  hint.textContent =
+    schema.schema_state === "pending" ? "Schema file changed — new types and removals apply after a rescan (colour changes show now)." :
+    schema.schema_state === "never" ? "Schema file not applied yet — run a rescan." :
+    schema.schema_state === "invalid" ? "Schema file is invalid — showing the types from the last scan." + (notice ? " " + notice : "") : "";
+  hint.style.display = hint.textContent ? "" : "none";
+  cy.style().update(); // nodes already on the canvas re-read catColor
+}
+/* Fetches the selected repository's types (the union of every repo's for
+   __all__). A failed read leaves the current lists as they are.
+   schemaRequestSeq guards against out-of-order replies, same as
+   glowRequestSeq: switching repos quickly can have the previous repo's
+   reply arrive after the current one's, and installing it would leave the
+   previous repo's rows and colours on screen -- every call bumps the
+   counter, and only the latest one applies its result. */
+let schemaRequestSeq = 0;
+async function loadSchemaTypes(repo) {
+  const mySeq = ++schemaRequestSeq;
+  try {
+    const resp = await fetch(`/api/repos/${encodeURIComponent(repo)}/schema`);
+    if (!resp.ok) return;
+    const schema = await resp.json();
+    if (mySeq !== schemaRequestSeq) return; // superseded by a newer repo's request
+    applySchemaTypes(schema);
+  } catch (e) { /* network hiccup -- the next repo switch or reconnect retries */ }
+}
 /* isolating a type is a state change like any other -- goes through the
    same refreshGraph() the repo dropdown/ceiling sliders use, so the box,
    graph, and counts all move together. Falls back to the old client-only
@@ -965,8 +1147,8 @@ function isolateChanged() {
 }
 function refreshIsolateUI() {
   entityCounts.querySelectorAll(".count-row").forEach(row => {
-    row.classList.toggle("isolated", state.isolatedEntity === row.dataset.cat);
-    row.classList.toggle("dimmed", state.isolatedEntity !== null && state.isolatedEntity !== row.dataset.cat);
+    row.classList.toggle("isolated", state.isolatedEntity === row.dataset.label);
+    row.classList.toggle("dimmed", state.isolatedEntity !== null && state.isolatedEntity !== row.dataset.label);
   });
   relTypes.querySelectorAll(".rel-chip").forEach(chip => {
     chip.classList.toggle("isolated", state.isolatedRel === chip.dataset.rel);
@@ -1013,7 +1195,7 @@ const cy = cytoscape({
   userZoomingEnabled: false, /* scroll-to-zoom stays off deliberately — use the +/- controls instead */
   style: [
     { selector: "node", style: {
-        "background-color": ele => catColor(ele.data("cat")),
+        "background-color": ele => state.colorByCommunity ? communityColor(ele.data("community")) : catColor(ele.data("cat")),
         /* No label unless something is asking to read one. Text is the most
            expensive thing in a canvas repaint and the ambient rotation
            repaints on a tick, so a permanent label is paid for over and over
@@ -1663,6 +1845,16 @@ function mergeGraphElements(elements, mode, opts) {
   const toRemove = remove ? cy.elements().filter(e => !incoming.has(e.id())) : cy.collection();
   const toAdd = [...incoming.values()].filter(el => !existingIds.has(el.data.id));
 
+  /* Insights are recomputed independently of the structure, so a node already
+     on the canvas can carry a new community under the same id. Update it
+     before the identical-refetch bail-out below. */
+  incoming.forEach((el, id) => {
+    if (!el.data.source) {
+      const n = cy.getElementById(id);
+      if (n.nonempty() && n.data("community") !== el.data.community) n.data("community", el.data.community);
+    }
+  });
+
   /* A text-only file edit re-indexes the same nodes/edges under the same
      ids -- a refetch after it returns an identical element set, nothing
      added or removed. Previously this still fell through to
@@ -2057,10 +2249,13 @@ cy.on("render", renderGlow);
 /* Deliberately highlights without labelling: a type can cover most of the
    graph, so naming all of it at once is the mass of text the empty base
    label style exists to avoid. Names stay a single-node, on-demand thing. */
-function highlightCat(cat, on) {
-  cy.nodes(`[cat = "${cat}"]`).forEach(n => { n.toggleClass("hover-hl", on); setNodeGlowActive(n.id(), on || (n.data("glow")||0) > 0.02); });
+function highlightType(label, on) {
+  cy.nodes().filter(n => nodeType(n) === label).forEach(n => { n.toggleClass("hover-hl", on); setNodeGlowActive(n.id(), on || (n.data("glow")||0) > 0.02); });
 }
-function highlightRel(rel, on) { cy.edges(`[label = "${rel}"]`).toggleClass("hover-hl", on); }
+/* A relationship type is server text (a project schema can declare it), so it
+   is escaped into the Cytoscape selector rather than interpolated raw. */
+function relSelector(rel) { return `[label = "${String(rel).replace(/["\\]/g, "\\$&")}"]`; }
+function highlightRel(rel, on) { cy.edges(relSelector(rel)).toggleClass("hover-hl", on); }
 
 /* ── smooth glow/deglow: animate each node/edge's "glow" data value toward a
    target (1 = matched by the active cypher query, 0 = not) over ~420ms, driving
@@ -2101,7 +2296,7 @@ function applyState(skipQueryBuild, runMode) {
   let relNodeIds = null;
   if (state.isolatedRel) {
     relNodeIds = new Set();
-    cy.edges(`[label = "${state.isolatedRel}"]`).forEach(e => { relNodeIds.add(e.source().id()); relNodeIds.add(e.target().id()); });
+    cy.edges(relSelector(state.isolatedRel)).forEach(e => { relNodeIds.add(e.source().id()); relNodeIds.add(e.target().id()); });
   }
   /* .excluded (dimmed, still drawn) is deliberate context -- filtered out by
      type/relationship but left visible so the isolated set reads against the
@@ -2110,7 +2305,7 @@ function applyState(skipQueryBuild, runMode) {
      asked to see and no reason to keep paying its draw cost every frame. */
   let nSeen = 0;
   cy.nodes().forEach(n => {
-    let on = !state.isolatedEntity || n.data("cat") === state.isolatedEntity;
+    let on = !state.isolatedEntity || nodeType(n) === state.isolatedEntity;
     if (on && relNodeIds) on = relNodeIds.has(n.id());
     if (on) nSeen++;
     n.toggleClass("excluded", !on);
@@ -2123,7 +2318,7 @@ function applyState(skipQueryBuild, runMode) {
     // An isolated entity should glow along with its own relationships, not
     // every edge in the graph -- an edge only qualifies if it actually
     // touches an isolated-type node (its far endpoint doesn't have to).
-    const entityOn = !state.isolatedEntity || e.source().data("cat") === state.isolatedEntity || e.target().data("cat") === state.isolatedEntity;
+    const entityOn = !state.isolatedEntity || nodeType(e.source()) === state.isolatedEntity || nodeType(e.target()) === state.isolatedEntity;
     const on = relOn && entityOn;
     if (on) rSeen++;
     e.toggleClass("excluded", !on);
@@ -2257,7 +2452,8 @@ function mapGraphResultToElements(results) {
       // `key` is carried on the element so the inspector can look the node
       // back up by identity rather than by an internal id -- see
       // showDetailsCard. Null for a node the server couldn't key.
-      nodeMap.set(stableId, { data: { id: stableId, key: n.key ?? null, label: name, cat } });
+      const community = Number.isInteger(n.properties?.insight_community) ? n.properties.insight_community : null;
+      nodeMap.set(stableId, { data: { id: stableId, key: n.key ?? null, label: name, cat, ntype: realLabel, community } });
     });
     (r.graph?.relationships || []).forEach(rel => {
       const source = idByInternalId.get(rel.startNode), target = idByInternalId.get(rel.endNode);
@@ -2351,9 +2547,9 @@ function escapeCypherStr(s) { return String(s).replace(/["\\]/g, "\\$&"); }
    no separate edge-side check needed. */
 function currentStateQuery() {
   const repo = document.getElementById("repoSelect").value;
-  const isolatedEntityId = state.isolatedEntity ? NODE_TYPES.find(t => t.cat === state.isolatedEntity)?.id : null;
+  const isolatedEntityId = state.isolatedEntity;
   const nodeWhere = [repo === "__all__" ? "true" : `n.repo_id = "${escapeCypherStr(repo)}"`];
-  if (isolatedEntityId) nodeWhere.push(`labels(n)[0] = "${isolatedEntityId}"`);
+  if (isolatedEntityId) nodeWhere.push(`labels(n)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
   // A ceiling maxed out (the default) means "no cap" -- leave its LIMIT out
   // of the query entirely rather than spelling out the current real total,
   // so the query stays correct as the real total changes instead of
@@ -2475,6 +2671,7 @@ async function refreshGraph(mode, record, structural) {
   // ceiling back up) still builds its query with the OLD, now-too-low
   // ceiling, and the "real total" panels only catch up a step late.
   if (neo4jConnected) await loadTopologyCounts();
+  if (neo4jConnected) loadInsights(); // after the degree leaderboard, which it replaces with PageRank when computed
   /* Fetch the saved layout before the query that will need it. Scoped per
      repo view, so switching repos loads that view's own cache -- and the
      outgoing view's positions are flushed first, since the switch replaces
@@ -2607,6 +2804,7 @@ async function bootConnect() {
     neo4jStatus.style.color = "var(--success)";
     legendStatus.textContent = "Neo4j connected (via dashboard proxy)";
     await populateRealRepos(false);
+    await loadSchemaTypes(document.getElementById("repoSelect").value);
     // First load is always a structural (capped-to-repo) load, same as any
     // other repo switch -- also resyncs the node-ceiling slider/total
     // against real counts before it builds the query, so the first fetch
@@ -2614,16 +2812,17 @@ async function bootConnect() {
     await refreshGraph("full", false, true);
     loadGitHistory(document.getElementById("repoSelect").value);
     attemptMemoryMetrics();
+    startMemoryPolling();
     attemptQueryTelemetry();
-    attemptCommunityDetection();
   } catch (e) {
     neo4jStatus.textContent = "Neo4j unreachable";
     neo4jStatus.style.color = "var(--danger)";
     legendStatus.textContent = "Neo4j unreachable — showing demo graph";
-    /* The heap reading is never attempted on this branch, so say so: left
-       alone the card would sit on its initial "Checking…" pill forever,
-       which reads as "still loading" rather than "no reading exists". */
-    setHeapUnavailable("Neo4j is unreachable");
+    /* Neo4j didn't answer, so the card shows its Neo4j rows as unreachable
+       instead of sitting on "Checking…"; store size is read from disk and
+       can still be live. Polling picks Neo4j back up if it returns. */
+    attemptMemoryMetrics({ neo4jDown: true });
+    startMemoryPolling();
     cy.add(buildElements());
     forceDirectedSettle(() => focusRotation(null, 60));
   }
@@ -2641,10 +2840,13 @@ bootConnect();
    changed), so a reindex event just re-triggers a normal load. */
 function connectLiveEvents() {
   const es = new EventSource("/api/events");
-  es.onmessage = (e) => {
-    if (!document.getElementById("ctlLiveUpdate").checked) return; // toggle pauses reacting, not the connection itself
+  es.onmessage = async (e) => {
     let event;
     try { event = JSON.parse(e.data); } catch { return; }
+    /* the Config page lists every repo whatever the graph shows: once opened,
+       a registry change or a real rescan (schema state, badges) refreshes it */
+    if (configModel && (event.type === "registry_changed" || (event.type === "reindexed" && (event.changed || event.deleted)))) loadConfigPage(true);
+    if (!document.getElementById("ctlLiveUpdate").checked) return; // toggle pauses reacting, not the connection itself
     const repo = document.getElementById("repoSelect").value;
     const matchesRepo = repo === "__all__" || !event.repo_id || event.repo_id === repo;
     if (!matchesRepo) return;
@@ -2653,9 +2855,15 @@ function connectLiveEvents() {
        that report a real diff, so a noisy/looping publisher on the backend
        can't turn this into a client-side request storm. */
     if (event.type === "reindexed" && (event.changed || event.deleted)) {
-      if (neo4jConnected) refreshGraph();
+      /* a rescan is also what applies a changed schema file, so reload the
+         types first: the pending hint clears and new labels get their rows
+         and colours before the graph that contains them is drawn. */
+      if (neo4jConnected) { await loadSchemaTypes(repo); refreshGraph(); }
     } else if (event.type === "git_history_synced" && event.mode !== "noop") {
       loadGitHistory(repo);
+    } else if (event.type === "insights_refreshed" && neo4jConnected) {
+      // Refetching the graph also reloads insights and re-stamps community colours on existing nodes.
+      if (state.colorByCommunity) refreshGraph(); else loadInsights();
     } else if (event.type === "registry_changed" && neo4jConnected) {
       populateRealRepos();
     }
@@ -2718,7 +2926,7 @@ btnRunCypher.addEventListener("click", () => runCypherAndDisplay(cypherInput.val
 document.getElementById("btnGraphReload").addEventListener("click", () => {
   if (cy.elements().length) forceDirectedSettle(() => focusRotation(null, 60, 1000), "full");
 });
-document.querySelectorAll('#linkOpenMcpSettings').forEach(l => l.addEventListener("click", e => { e.preventDefault(); document.getElementById("settingsOverlay").classList.add("open"); document.querySelector('[data-pane="mcp"]').click(); }));
+document.querySelectorAll('#linkOpenConfig').forEach(l => l.addEventListener("click", e => { e.preventDefault(); document.getElementById("settingsOverlay").classList.add("open"); document.querySelector('[data-pane="config"]').click(); }));
 
 /* "input" fires continuously while dragging -- cheap client-side filtering
    of whatever's already loaded, no network call, so raising the slider
@@ -2750,32 +2958,1662 @@ document.getElementById("graphSearch").addEventListener("input", e => {
   if (matches.length) { cy.nodes().addClass("faded"); matches.removeClass("faded").addClass("highlighted show-label"); cy.animate({ fit: { eles: matches, padding: 80 } }, { duration: 300 }); }
 });
 document.getElementById("pullTab").addEventListener("click", () => document.getElementById("controlFlyout").classList.toggle("open"));
-document.getElementById("repoSelect").addEventListener("change", async e => {
+async function onRepoSelectChange(e) {
   const v = e.target.value;
   localStorage.setItem(SELECTED_REPO_KEY, v);
+  if (neo4jConnected) await loadSchemaTypes(v); // before the graph fetch, so a type the new repo lacks is no longer isolated
   const loaded = await refreshGraph("full", true, true); // switching repos is a deliberate scope change, not an incremental update -- always caps the displayed set to it, even in highlight mode
   if (!loaded && !neo4jConnected) buildQueryFromState();
   loadGitHistory(v);
-});
+}
+document.getElementById("repoSelect").addEventListener("change", onRepoSelectChange);
 
 /* ── settings overlay ──────────────────────────────────────────── */
 document.getElementById("btnOpenSettings").addEventListener("click", () => document.getElementById("settingsOverlay").classList.add("open"));
 document.getElementById("btnCloseSettings").addEventListener("click", () => document.getElementById("settingsOverlay").classList.remove("open"));
 /* The header's "+ Register repo" button is a shortcut to where registration
-   actually lives, same shape as #linkOpenMcpSettings: open the overlay, then
+   actually lives, same shape as #linkOpenConfig: open the overlay, then
    click the nav button so the settings-nav handler below does the pane swap --
    there stays exactly one place that knows how to switch panes. */
 document.getElementById("btnRegister").addEventListener("click", () => { document.getElementById("settingsOverlay").classList.add("open"); document.querySelector('[data-pane="repos"]').click(); });
 document.querySelectorAll(".settings-nav button").forEach(btn => btn.addEventListener("click", () => {
   document.querySelectorAll(".settings-nav button").forEach(b=>b.classList.remove("active")); btn.classList.add("active");
   document.querySelectorAll(".settings-pane").forEach(p=>p.classList.remove("active")); document.getElementById("pane-"+btn.dataset.pane).classList.add("active");
+  if (btn.dataset.pane === "config") loadConfigPage(!!configModel);
 }));
 
-/* enable_run_cypher only gates MCP/AI-agent tool access — the dashboard's own
-   Cypher box always runs, so it never gets disabled or re-worded here. */
-const toggleCypher = document.getElementById("toggleCypher");
-const cypherWarnNote = document.getElementById("cypherWarnNote");
-toggleCypher.addEventListener("change", () => { cypherWarnNote.style.display = toggleCypher.checked ? "flex" : "none"; });
+/* ── Config page (Settings → Config) ─────────────────────────────────
+   Global (built-in node/relationship types, built-in and global tools), then
+   one card per active registered repo, from /api/config. Every server string
+   (names, YAML, badge text, messages) is config text a cloned repo controls,
+   so it only ever lands through textContent; the one innerHTML is the
+   constant lock icon. Writes go through the /api/config routes with the
+   fingerprint of the file the user saw (If-Match): a changed file is a 412
+   with a Reload offer, never an overwrite. tests/dashboard/config_page_ui.js
+   lifts this whole block out of the page, so keep it to declarations. */
+const CONFIG_GLOBAL = "__global__";
+const CONFIG_LOCK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
+const CONFIG_SECTIONS = {
+  tools: { title: "Tools", noun: "tool", template: "name: my_tool\ndescription: What this tool answers, in one line an agent can choose it by.\ncypher: |\n  MATCH (n:Function {repo_id: $repo_id})\n  RETURN n.name AS name\n  LIMIT 25\n",
+    entry: { name: "my_tool", description: "What this tool answers, in one line an agent can choose it by.", cypher: "MATCH (n:Function {repo_id: $repo_id})\nRETURN n.name AS name\nLIMIT 25\n" } },
+  node_types: { title: "Nodes", noun: "node type", template: "label: Runbook\nkey: [slug]\nmetadata:\n  - name: slug\n    type: string\n    required: true\n",
+    entry: { label: "Runbook", key: ["slug"], metadata: [{ name: "slug", type: "string", required: true }] } },
+  relationships: { title: "Relationships", noun: "relationship", template: "# from and to must name node types that already exist: built-in, or declared in this file\ntype: DOCUMENTS\nprovider: custom\ncustom: {name: runbook_links}\nfrom: Runbook\nto: Service\n",
+    entry: { type: "DOCUMENTS", provider: "custom", custom: { name: "runbook_links" }, from: "Runbook", to: "Service" } },
+};
+/* the last /api/config payload; null until the pane is first opened */
+let configModel = null;
+/* bumped by every page load and every block a write returns: a load answered
+   after either is stale and dropped, so an older fingerprint never comes back */
+let configLoadSeq = 0;
+/* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, dryTarget, dryYaml, busy, label, armedAt,
+   mode (form|yaml), formState, formText, openText, openEntry, order } */
+let configEdit = null;
+/* the open reset dialog: { scope, kind, opener, phrase, fingerprint, review, stale, busy, ready, armedAt } */
+let configReset = null;
+/* per repo: the project-config switch's last action { busy, confirm, error, notes, armedAt }; survives re-renders */
+const configToggles = {};
+/* per scope: what its last reset reported, shown under the card header until the next config reload */
+const configOutcomes = {};
+
+function configEl(tag, cls, text) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (text !== undefined) el.textContent = String(text);
+  return el;
+}
+function configButton(label, onClick, where) {
+  const b = configEl("button", "btn btn-sm", label);
+  b.type = "button";
+  b.addEventListener("click", onClick);
+  /* where: { scope, action, section, name } -- what a re-render looks the button up by to give focus back */
+  if (where) Object.assign(b.dataset, { cfgScope: where.scope, cfgAction: where.action, cfgSection: where.section, cfgName: where.name === undefined ? "" : where.name });
+  return b;
+}
+function configLockEl() {
+  const el = configEl("span", "cfg-lock");
+  el.title = "Built-in — locked";
+  el.innerHTML = CONFIG_LOCK_SVG;
+  return el;
+}
+/* level (info|warn|error|muted) is the modifier class; detail is the hover text */
+function configBadgeEl(badge) {
+  const el = configEl("span", "cfg-badge " + String(badge.level || "info"), badge.text || "");
+  if (badge.detail) { el.dataset.tip = String(badge.detail); wireTooltip(el); }
+  return el;
+}
+function configRow(name, sub, extras, actions) {
+  const row = configEl("div", "tool-row");
+  const main = configEl("div", "cfg-row-main");
+  main.appendChild(configEl("span", "tool-name", name));
+  if (sub) main.appendChild(configEl("span", "cfg-sub", sub));
+  extras.forEach(e => main.appendChild(e));
+  const side = configEl("div", "cfg-actions");
+  actions.forEach(a => side.appendChild(a));
+  row.appendChild(main);
+  row.appendChild(side);
+  return row;
+}
+function configLockedChips(names) {
+  const box = configEl("div", "cfg-chips");
+  names.forEach(n => {
+    const chip = configEl("span", "cfg-chip");
+    chip.appendChild(configLockEl());
+    chip.appendChild(configEl("span", "", n));
+    box.appendChild(chip);
+  });
+  return box;
+}
+/* one sub-list: heading (title, file, file-level badges, extra buttons, Reset, Add), then its rows */
+function configSection(title, file, badges, onAdd, body, onReset, extra) {
+  const sec = configEl("div", "cfg-section");
+  const head = configEl("div", "cfg-section-head");
+  head.appendChild(configEl("span", "", title));
+  if (file) head.appendChild(configEl("span", "cfg-sub", file));
+  (badges || []).forEach(b => head.appendChild(configBadgeEl(b)));
+  const actions = configEl("div", "cfg-actions");
+  (extra || []).forEach(b => actions.appendChild(b));
+  if (onReset) actions.appendChild(configButton("Reset " + file + "…", onReset.fn, onReset.where));
+  if (onAdd) actions.appendChild(configButton("Add " + onAdd.noun, onAdd.fn, onAdd.where));
+  if (actions.children.length) head.appendChild(actions);
+  sec.appendChild(head);
+  sec.appendChild(body);
+  return sec;
+}
+/* where a project entry can be copied: every other listed (active) repository,
+   plus the global store for a tool (there is no global schema store) */
+function configCopyDestinations(model, scope, section) {
+  const repos = model.projects.filter(p => p.repo_id !== scope).map(p => ({ value: p.repo_id, label: p.repo_id }));
+  return section === "tools" ? [...repos, { value: CONFIG_GLOBAL, label: "Global store" }] : repos;
+}
+/* Copy to… is offered on a project entry that is unambiguous (editable), is not
+   a tool the destination would refuse as shadowing a locked one, and has
+   somewhere to go. A global tool's editor already offers "Save to" a repo. */
+function configCanCopy(model, scope, section, item) {
+  if (scope === CONFIG_GLOBAL || item.editable === false) return false;
+  if (section === "tools" && (item.badges || []).some(b => b.kind === "locked-shadow")) return false;
+  return configCopyDestinations(model, scope, section).length > 0;
+}
+/* the editable entries' rows, appended to box (a global entry carries the GLOBAL flag) */
+function configEntryRows(box, scope, section, items, nameKey) {
+  items.forEach(item => {
+    const name = item[nameKey];
+    const extras = (scope === CONFIG_GLOBAL ? [configEl("span", "cfg-global", "GLOBAL")] : []).concat((item.badges || []).map(configBadgeEl));
+    const actions = item.editable === false ? [] : [
+      configButton("Edit", () => openConfigEditor({ scope, section, op: "replace", name, yaml: item.yaml, entry: item.entry }), { scope, action: "edit", section, name }),
+      configButton(item.origin === "project (overrides global)" ? "Remove override" : "Delete",
+        () => openConfigEditor({ scope, section, op: "delete", name, yaml: item.yaml }), { scope, action: "delete", section, name }),
+    ];
+    if (configCanCopy(configModel, scope, section, item))
+      actions.push(configButton("Copy to…", () => openConfigEditor({ scope, section, op: "copy", name, yaml: item.yaml }), { scope, action: "copy", section, name }));
+    box.appendChild(configRow(name, item.tool_id || "", extras, actions));
+  });
+  return box;
+}
+function renderConfigScope(scope, block) {
+  const isGlobal = scope === CONFIG_GLOBAL;
+  const card = configEl("div", "card cfg-scope");
+  card.dataset.scope = scope;
+  const head = configEl("div", "card-head");
+  const heading = configEl("h3", "", isGlobal ? "Global" : block.repo_id);
+  heading.setAttribute("tabindex", "-1");
+  head.appendChild(heading);
+  if (!isGlobal) head.appendChild(configEl("span", "cfg-sub", block.display_path));
+  if (!isGlobal) head.appendChild(configToggleEl(block));
+  card.appendChild(head);
+  if (!isGlobal && configToggles[scope]) card.appendChild(configToggleMsgEl(scope, configToggles[scope]));
+  if (configOutcomes[scope]) {
+    const box = configEl("div", "cfg-toggle-msg");
+    const ul = configEl("ul", "");
+    configOutcomes[scope].forEach(t => ul.appendChild(configEl("li", "", t)));
+    box.appendChild(ul);
+    card.appendChild(box);
+  }
+  const add = section => ({ noun: CONFIG_SECTIONS[section].noun,
+    fn: () => openConfigEditor({ scope, section, op: "add", name: null, yaml: CONFIG_SECTIONS[section].template, entry: CONFIG_SECTIONS[section].entry }),
+    where: { scope, action: "add", section } });
+  /* a file that is not there has nothing to reset; an invalid one is when Reset matters most */
+  const reset = (part, kind) => part.state === "absent" || part.fingerprint === "absent" ? null
+    : { fn: () => openConfigReset(scope, kind), where: { scope, action: "reset", section: kind } };
+  const tools = block.tools;
+  if (isGlobal) {
+    card.appendChild(configSection("Nodes", null, [], null, configLockedChips(block.node_types.map(t => t.label))));
+    card.appendChild(configSection("Relationships", null, [], null, configLockedChips(block.relationship_types.map(r => r.type))));
+    const box = configEl("div", "");
+    tools.builtin.forEach(t => {
+      const extras = [configEl("span", "tool-desc", t.description || "")];
+      if (t.name === "run_cypher") extras.push(configBadgeEl({ level: "warn", text: "Raw Cypher enabled",
+        detail: "MCP sessions started with this environment (the dashboard process's settings) can run arbitrary Cypher against the graph. The dashboard's own Cypher box is unaffected." }));
+      box.appendChild(configRow(t.name, "", extras, [configLockEl()]));
+    });
+    if (!tools.run_cypher_enabled) box.appendChild(configRow("run_cypher", "",
+      [configEl("span", "tool-desc", "off for MCP sessions started with this environment (the dashboard process's settings): raw Cypher for MCP clients. " +
+        "Set DEVGRAPH_ENABLE_RUN_CYPHER=true where an MCP session starts, then restart it, to serve it there.")],
+      [configLockEl()]));
+    configEntryRows(box, scope, "tools", tools.entries, "name");
+    card.appendChild(configSection("Tools", tools.file, tools.badges, add("tools"), box, reset(tools, "tools")));
+  } else {
+    const schema = block.schema;
+    card.appendChild(configSection("Nodes", schema.file, schema.badges, add("node_types"),
+      configEntryRows(configEl("div", ""), scope, "node_types", schema.node_types, "label"), reset(schema, "schema")));
+    card.appendChild(configSection("Relationships", schema.file, [], add("relationships"),
+      configEntryRows(configEl("div", ""), scope, "relationships", schema.relationships, "type")));
+    /* revoking is the only trust control here: approving a tools file is CLI-only (the badge names the command) */
+    const revoke = tools.trust && tools.trust.revocable
+      ? [configButton("Revoke trust", () => revokeConfigTrust(scope), { scope, action: "revoke", section: "tools" })] : [];
+    card.appendChild(configSection("Tools", tools.file, tools.badges, add("tools"),
+      configEntryRows(configEl("div", ""), scope, "tools", tools.entries, "name"), reset(tools, "tools"), revoke));
+  }
+  return card;
+}
+function renderConfigPage(model) {
+  configModel = model;
+  document.getElementById("configScopes").replaceChildren(
+    renderConfigScope(CONFIG_GLOBAL, model.global),
+    ...model.projects.map(p => renderConfigScope(p.repo_id, p)));
+}
+function configScopeBlock(scope) {
+  return scope === CONFIG_GLOBAL ? configModel.global : configModel.projects.find(p => p.repo_id === scope);
+}
+function configFingerprint(scope, section) {
+  const block = configScopeBlock(scope);
+  return section === "tools" ? block.tools.fingerprint : block.schema.fingerprint;
+}
+/* swap one scope's block into the model and its card on the page */
+function applyConfigScope(scope, block) {
+  configLoadSeq++;
+  if (scope === CONFIG_GLOBAL) configModel.global = block;
+  else configModel.projects = configModel.projects.map(p => p.repo_id === scope ? block : p);
+  configRerender(scope);
+}
+/* redraw one card from the model (its toggle state changed, not its block) */
+function configRerender(scope) {
+  const box = document.getElementById("configScopes");
+  const old = [...box.children].find(c => c.dataset.scope === scope);
+  const block = configScopeBlock(scope);
+  if (old && block) old.replaceWith(renderConfigScope(scope, block));
+}
+/* A save or reset redraws its card, so the button that opened the dialog is gone
+   and focus would fall to <body>. Find its stand-in: the same button (scope,
+   action, section, name), else the same entry's Edit button, else the section's
+   Add button, else the card heading. */
+function configOpenerSpot(opener) {
+  const d = opener && opener.dataset;
+  return d && d.cfgAction ? { scope: d.cfgScope, action: d.cfgAction, section: d.cfgSection, name: d.cfgName } : null;
+}
+function configFindIn(root, pred) {
+  for (const c of root.children) {
+    if (pred(c)) return c;
+    const hit = configFindIn(c, pred);
+    if (hit) return hit;
+  }
+  return null;
+}
+function configRestoreFocus(spot) {
+  if (!spot) return;
+  const card = [...document.getElementById("configScopes").children].find(c => c.dataset.scope === spot.scope);
+  if (!card) return;
+  const tagged = (action, section, name) => configFindIn(card, e => e.dataset && e.dataset.cfgAction === action && e.dataset.cfgSection === section &&
+    (name === undefined || e.dataset.cfgName === name));
+  const addSection = spot.action === "reset" && spot.section === "schema" ? "node_types" : spot.section;
+  const target = tagged(spot.action, spot.section, spot.name) || (spot.name ? tagged("edit", spot.section, spot.name) : null) ||
+    tagged("add", addSection) || configFindIn(card, e => e.tagName === "H3");
+  if (target) target.focus();
+}
+/* true while focus is nowhere in particular: <body>, or the control that was just redrawn away */
+function configFocusLost(prev) {
+  const a = document.activeElement;
+  return !a || a === prev || a === document.body;
+}
+/* op: add|replace|delete; section: tools|node_types|relationships */
+function configWriteRequest(op, scope, section, name, yaml, fingerprint, dryRun) {
+  const base = "/api/config/" + encodeURIComponent(scope) + (section === "tools" ? "/tools" : "/schema/" + encodeURIComponent(section));
+  const url = op === "add" ? base : base + "/" + encodeURIComponent(name);
+  const headers = { "If-Match": '"' + fingerprint + '"' };
+  if (op === "delete") return { url: url + (dryRun ? "?dry_run=1" : ""), init: { method: "DELETE", headers } };
+  headers["Content-Type"] = "application/json";
+  return { url, init: { method: op === "add" ? "POST" : "PUT", headers, body: JSON.stringify({ yaml, dry_run: !!dryRun }) } };
+}
+function describeConfigError(status, detail) {
+  if (status === 412) return "The file changed on disk since this page loaded it. Reload to pick up the current version — your text is kept.";
+  if (detail && typeof detail === "object" && detail.message) return String(detail.message);
+  if (typeof detail === "string" && detail) return detail;
+  return status ? "Request failed (HTTP " + status + ")." : "Could not reach the dashboard server.";
+}
+async function configSend(req) {
+  let res;
+  try { res = await fetch(req.url, req.init); } catch (e) { return { ok: false, status: 0, body: null }; }
+  let body = null;
+  try { body = await res.json(); } catch (e) { /* no JSON body */ }
+  return { ok: res.ok, status: res.status, body };
+}
+/* where the open editor writes. A rename (PUT of the old name) happens only
+   within the entry's own scope. A global tool saved to a repo is a POST of the
+   YAML's own name there; only when that comes back 409 exists (the server
+   names the taken entry, `crossName`) does it become a PUT of that name.
+   A copy is the same cross-scope write, always to the chosen destination. */
+function configEditTarget(edit = configEdit) {
+  if (edit.op === "copy") return edit.crossName ? { scope: edit.dest, op: "replace", name: edit.crossName } : { scope: edit.dest, op: "add", name: null };
+  if (edit.op !== "replace" || edit.dest === edit.scope) return { scope: edit.scope, op: edit.op, name: edit.name };
+  return edit.crossName ? { scope: edit.dest, op: "replace", name: edit.crossName } : { scope: edit.dest, op: "add", name: null };
+}
+/* a copy's "Replaces …" line: names the destination's own entry the write would replace */
+function configCopyReplaces(edit) {
+  return "Replaces " + (edit.dest === CONFIG_GLOBAL ? "the global store" : edit.dest) + "'s own " +
+    CONFIG_SECTIONS[edit.section].noun + " " + edit.crossName + ".";
+}
+/* the repos whose own tool `name` overrides the global one; anyOrigin: also
+   those that will once it exists (a copy to the global store) */
+function configGlobalOverrides(name, anyOrigin) {
+  return configModel.projects
+    .filter(p => p.tools.entries.some(e => e.name === name && (anyOrigin || e.origin === "project (overrides global)")))
+    .map(p => p.repo_id);
+}
+function configGlobalReach(name) {
+  const n = configModel.projects.length;
+  const over = configGlobalOverrides(name, false);
+  return "Global tools are served in every registered repository's MCP sessions (" + n + " repo" + (n === 1 ? "" : "s") + ")." +
+    (over.length ? " Overridden in: " + over.join(", ") + "." : "");
+}
+const configSameTarget = (a, b) => !!a && !!b && a.scope === b.scope && a.op === b.op && a.name === b.name;
+/* copying from a repo whose tools file is not trusted: the global store needs no trust,
+   so the copy would be served everywhere without the approval the source lacks */
+function configUntrustedCopyNote(src) {
+  const trust = configScopeBlock(src).tools.trust;
+  if (trust && trust.state === "trusted") return "";
+  return " " + src + "'s devgraph.tools.yaml is not trusted: copying to the global store serves this tool in every " +
+    "repository without any trust approval. An enabled tool can read the whole graph: the $repo_id rule is a convention, not a sandbox.";
+}
+function configWarningText(edit) {
+  if (edit.op === "copy") {
+    const replaces = edit.crossName ? " " + configCopyReplaces(edit) : "";
+    if (edit.dest === CONFIG_GLOBAL) {
+      /* the confirm list carries the separate "Replaces …" line */
+      const src = edit.scope;
+      const others = configGlobalOverrides(edit.crossName || edit.name, true).filter(r => r !== src);
+      return (edit.crossName
+        ? "Replaces the global tool " + edit.crossName + " with " + src + "'s version: served in every repo without its own " +
+          edit.crossName + "; " + src + "'s own copy keeps overriding it there."
+        : "Adds " + edit.name + " to the global store; " + src + "'s own " + edit.name + " will override it in " + src + ".") +
+        (others.length ? " Will also be overridden in: " + others.join(", ") + "." : "") + configUntrustedCopyNote(src);
+    }
+    const block = configScopeBlock(edit.dest);
+    const file = edit.section === "tools" ? block.tools.file : block.schema.file;
+    return "Writes to " + edit.dest + "/" + file + "; " + edit.scope + " is unchanged." + replaces;
+  }
+  if (edit.scope !== CONFIG_GLOBAL || edit.op === "add") return "";
+  if (edit.dest !== CONFIG_GLOBAL) {
+    return "Writes a project override to " + edit.dest + "/devgraph.tools.yaml; the global tool is unchanged." +
+      (edit.crossName ? " Replaces " + edit.dest + "'s own " + edit.crossName + "." : "");
+  }
+  return configGlobalReach(edit.name);
+}
+function configModalTitle(edit) {
+  const noun = CONFIG_SECTIONS[edit.section].noun;
+  const where = edit.scope === CONFIG_GLOBAL ? "global store" : edit.scope;
+  if (edit.op === "add") return "Add a " + noun + " (" + where + ")";
+  if (edit.op === "copy") return "Copy " + noun + " " + edit.name + " from " + edit.scope;
+  if (edit.op === "replace" && edit.dest !== edit.scope) return "Save global tool " + edit.name + " to " + edit.dest;
+  return (edit.op === "delete" ? "Delete " : "Edit ") + noun + " " + edit.name + " (" + where + ")";
+}
+function configShow(id, on) { document.getElementById(id).style.display = on ? "" : "none"; }
+/* A confirm button that just changed meaning (Continue -> Save, Save -> Save
+   anyway) ignores clicks for this long, so the second click of a double-click
+   or a held Enter can't press the step it only just revealed. */
+const CONFIG_ARM_MS = 400;
+function renderConfigModal() {
+  const edit = configEdit;
+  const warn = configWarningText(edit);
+  const verb = edit.op === "delete" ? "Delete" : edit.op === "copy" ? "Copy" : "Save";
+  document.getElementById("configModalTitle").textContent = configModalTitle(edit);
+  document.getElementById("configModalWarnText").textContent = warn;
+  configShow("configModalWarn", !!warn);
+  configShow("configDestField", edit.step === "edit" &&
+    (edit.op === "copy" || (edit.scope === CONFIG_GLOBAL && edit.section === "tools" && edit.op === "replace")));
+  /* Form | YAML: offered by op first (delete and copy are the read-only YAML),
+     then by the text: the form shows only text it produced */
+  const sw = configFormAvailability(edit);
+  if (edit.mode === "form" && !(sw && sw.available)) edit.mode = "yaml";
+  const form = edit.mode === "form";
+  configShow("configYaml", edit.step === "edit" && !form);
+  configShow("configFormScroll", edit.step === "edit" && form);
+  configShow("configForm", edit.step === "edit" && form);
+  configShow("configEditorSwitch", edit.step === "edit" && !!sw);
+  configShow("configFormHelp", edit.step === "edit" && form);
+  const notice = edit.step === "edit" && !!sw && !form && !sw.available;
+  document.getElementById("configFormNoticeText").textContent = notice ? sw.reason : "";
+  configShow("configFormNotice", notice);
+  configShow("configFormDiscard", notice && sw.reason === CONFIG_FORM_REASONS.handEdit);
+  const formBtn = document.getElementById("configModeForm");
+  formBtn.setAttribute("aria-pressed", String(form));
+  document.getElementById("configModeYaml").setAttribute("aria-pressed", String(!form));
+  /* unavailable, the Form button stays focusable so its reason can be read */
+  formBtn.setAttribute("aria-disabled", String(!(sw && sw.available)));
+  if (sw && !sw.available) formBtn.setAttribute("aria-describedby", "configFormNoticeText");
+  else formBtn.removeAttribute("aria-describedby");
+  const confirm = document.getElementById("configModalConfirm");
+  confirm.replaceChildren();
+  if (edit.confirmed) {
+    confirm.appendChild(configEl("div", "", "Check before " + (edit.op === "delete" ? "deleting" : edit.op === "copy" ? "copying" : "saving") + ":"));
+    const list = configEl("ul", "");
+    edit.warnings.forEach(w => list.appendChild(configEl("li", "", w)));
+    confirm.appendChild(list);
+  }
+  configShow("configModalConfirm", edit.confirmed);
+  const label = edit.step === "warn" ? "Continue" : edit.confirmed ? verb + " anyway" : verb;
+  /* the destination is what the dry run checked: it cannot change under a request */
+  document.getElementById("configDest").disabled = !!edit.busy;
+  /* ...and neither can the text: typed meanwhile, it would be written unreviewed or lost on close */
+  /* a copy is the entry as shown; edit it in the destination afterwards */
+  document.getElementById("configYaml").readOnly = edit.op === "delete" || edit.op === "copy" || !!edit.busy;
+  /* the form edits that same text, so it is locked the same way, and so is switching */
+  document.getElementById("configForm").disabled = !!edit.busy;
+  formBtn.disabled = !!edit.busy;
+  document.getElementById("configModeYaml").disabled = !!edit.busy;
+  document.getElementById("configFormDiscard").disabled = !!edit.busy;
+  const save = document.getElementById("configModalSave");
+  save.disabled = !!edit.busy;
+  save.textContent = edit.busy || label;
+  /* last, once the locks above are off (a disabled fieldset's controls can't take focus) */
+  if (label !== edit.label) {
+    edit.label = label;
+    edit.armedAt = Date.now();
+    /* keyboard focus leaves the button whose meaning changed: a held Enter
+       then types into (or does nothing in) the editor instead of confirming.
+       Someone typing in the form keeps their place. */
+    if (edit.step === "edit" && !(form && configFormEls.all.includes(document.activeElement))) configEditorFocusTarget().focus();
+  }
+}
+/* the toolbar's status line: one message as text, or a write's warnings and notes as a list */
+function configSetStatus(items) {
+  const status = document.getElementById("configStatus");
+  if (!Array.isArray(items)) { status.textContent = items || ""; return; }
+  const list = configEl("ul", "");
+  items.forEach(t => list.appendChild(configEl("li", "", t)));
+  status.replaceChildren(...(items.length ? [list] : []));
+}
+/* Cancel, Escape and an overlay click: close the editor. A save still in flight
+   sees it no longer owns the editor after its next await and stops there. */
+function configCloseEditor() {
+  document.getElementById("configModal").classList.remove("open");
+  const opener = configEdit && configEdit.opener;
+  configEdit = null;
+  configFocusOpener(opener);
+}
+/* a re-render (Reload, Re-check) can replace the opener: then its stand-in takes the focus */
+function configFocusOpener(opener) {
+  if (!opener) return;
+  if (opener.isConnected) opener.focus();
+  else configRestoreFocus(configOpenerSpot(opener));
+}
+/* a modal's enabled, visible controls in tab order (a hidden step or a locked fieldset has none) */
+function configModalFocusable(modal) {
+  const out = [];
+  const walk = (el, locked) => {
+    if (el.style && el.style.display === "none") return;
+    const off = locked || (el.tagName === "FIELDSET" && el.disabled);
+    if (/^(BUTTON|TEXTAREA|SELECT|INPUT)$/.test(el.tagName) && !el.disabled && !locked && el.type !== "hidden") out.push(el);
+    [...el.children].forEach(c => walk(c, off));
+  };
+  [...modal.children].forEach(c => walk(c, false));
+  return out;
+}
+/* Tab and Shift+Tab wrap inside the open dialog (editor or reset) instead of reaching the page behind it */
+function configTrapTab(ev, modal) {
+  const items = configModalFocusable(modal);
+  if (!items.length) return;
+  const at = items.indexOf(document.activeElement);
+  const wrap = ev.shiftKey ? at <= 0 : at === items.length - 1 || at < 0;
+  if (!wrap) return;
+  ev.preventDefault();
+  items[ev.shiftKey ? items.length - 1 : 0].focus();
+}
+function configModalKey(ev) {
+  if (ev.key === "Tab" && configEdit) configTrapTab(ev, document.getElementById("configModal"));
+  if (ev.key === "Tab" && configReset) configTrapTab(ev, document.getElementById("configResetModal"));
+  if (ev.key === "Escape" && configEdit) configCloseEditor();
+  if (ev.key === "Escape" && configReset) configCloseReset();
+}
+function configSetError(text, reload) {
+  document.getElementById("configModalError").textContent = text || "";
+  configShow("configModalError", !!text);
+  configShow("configModalReload", !!reload);
+}
+/* opts: { scope, section, op: add|replace|delete|copy, name, yaml, entry } (entry: the
+   parsed mapping the form starts from, or null/absent: YAML only) */
+function openConfigEditor(opts) {
+  const isGlobal = opts.scope === CONFIG_GLOBAL;
+  const copy = opts.op === "copy";
+  /* a copy goes to another scope: its choices, never the source (which it only reads) */
+  const choices = copy ? configCopyDestinations(configModel, opts.scope, opts.section)
+    : [{ value: CONFIG_GLOBAL, label: "Global store" }, ...configModel.projects.map(p => ({ value: p.repo_id, label: p.repo_id }))];
+  const fps = {};
+  [CONFIG_GLOBAL, ...configModel.projects.map(p => p.repo_id)].forEach(s => {
+    if (copy ? choices.some(c => c.value === s) : s === opts.scope || (isGlobal && opts.section === "tools")) fps[s] = configFingerprint(s, opts.section);
+  });
+  configEdit = { ...opts, opener: document.activeElement, dest: copy ? choices[0].value : opts.scope, step: isGlobal && opts.op !== "add" ? "warn" : "edit", fps,
+    confirmed: false, warnings: [], crossName: null, dryTarget: null, dryYaml: null, busy: "", label: null, armedAt: 0 };
+  /* the textarea keeps the server's text until the first form change, so an
+     untouched save sends exactly what was opened */
+  const rep = configFormFromEntry(opts.section, opts.entry);
+  Object.assign(configEdit, { openText: opts.yaml || "", openEntry: opts.entry, formText: opts.yaml || "",
+    formState: rep.ok ? rep.form : null, order: configIsMap(opts.entry) ? Object.keys(opts.entry) : [] });
+  configEdit.mode = configFormOp(opts) && rep.ok && configEditorPref !== "yaml" ? "form" : "yaml";
+  configFormSeq = 0;
+  if (configEdit.mode === "form") renderConfigForm(configEdit);
+  else { document.getElementById("configForm").replaceChildren(); configFormEls = { controls: {}, hints: {}, all: [], refresh: [], first: null }; }
+  document.getElementById("configDestLabel").textContent = copy ? "Copy to" : "Save to";
+  const dest = document.getElementById("configDest");
+  dest.replaceChildren();
+  choices.forEach(({ value, label }) => {
+    const o = configEl("option", "", label);
+    o.value = value;
+    dest.appendChild(o);
+  });
+  dest.value = copy ? choices[0].value : CONFIG_GLOBAL;
+  dest.onchange = () => { configEdit.dest = dest.value; configEdit.crossName = null; configEdit.confirmed = false; renderConfigModal(); };
+  const yaml = document.getElementById("configYaml");
+  yaml.value = opts.yaml || "";
+  yaml.oninput = configTextChanged;
+  document.getElementById("configModeForm").onclick = () => configSetEditorMode("form");
+  document.getElementById("configModeYaml").onclick = () => configSetEditorMode("yaml");
+  document.getElementById("configFormDiscard").onclick = configFormDiscard;
+  document.getElementById("configModalSave").onclick = configSave;
+  /* Cancel works mid-request too: configSave checks it still owns the editor after every await */
+  document.getElementById("configModalCancel").onclick = configCloseEditor;
+  const modal = document.getElementById("configModal");
+  modal.onclick = ev => { if (ev.target === modal) configCloseEditor(); };
+  document.getElementById("configModalReload").onclick = configReload;
+  configSetError("");
+  configSetStatus("");
+  renderConfigModal();
+  modal.classList.add("open");
+  /* only now can the modal take focus: the warning step has no editor, so Continue gets it */
+  (configEdit.step === "warn" ? document.getElementById("configModalSave") : configEditorFocusTarget()).focus();
+}
+/* Save: a dry run first; its warnings (and a repo override replacing that
+   repo's own tool) need a second click; then the write itself */
+async function configSave(ev) {
+  const edit = configEdit;
+  if (!edit || edit.busy || (ev && ev.detail > 1) || Date.now() - edit.armedAt < CONFIG_ARM_MS) return;
+  const pressed = document.activeElement;
+  if (edit.step === "warn") { edit.step = "edit"; renderConfigModal(); return; }
+  const yaml = edit.op === "copy" ? edit.yaml : document.getElementById("configYaml").value;
+  const send = (t, dry) => configSend(configWriteRequest(t.op, t.scope, edit.section, t.name, yaml, edit.fps[t.scope], dry));
+  const busy = text => { edit.busy = text; renderConfigModal(); };
+  /* the target moved (another destination, a cleared name) since the dry run
+     was sent: what it checked is not what would be written, so stop */
+  const moved = t => {
+    if (configSameTarget(configEditTarget(edit), t)) return false;
+    edit.confirmed = false;
+    configSetError("The destination changed while checking; " + (edit.op === "copy" ? "copy" : "save") + " again to check the new one.");
+    return true;
+  };
+  /* a confirm covers only the text its dry run checked: changed text (and the
+     name it may carry) is checked again before anything is written */
+  if (edit.confirmed && yaml !== edit.dryYaml) { edit.confirmed = false; edit.crossName = null; }
+  try {
+    configSetError("");
+    if (!edit.confirmed) {
+      busy("Checking…");
+      edit.dryYaml = yaml;
+      let t = configEditTarget(edit);
+      let dry = await send(t, true);
+      if (configEdit !== edit || moved(t)) return;
+      const warnings = [];
+      const detail = dry.body && dry.body.detail;
+      if (dry.status === 409 && t.op === "add" && t.scope !== edit.scope && detail && detail.code === "exists" && detail.name) {
+        edit.crossName = String(detail.name);
+        t = configEditTarget(edit);
+        warnings.push(edit.op === "copy" ? configCopyReplaces(edit) : "Replaces " + t.scope + "'s own " + t.name + ".");
+        dry = await send(t, true);
+        if (configEdit !== edit || moved(t)) return;
+      }
+      if (!dry.ok) {
+        edit.crossName = null;
+        configSetError(describeConfigError(dry.status, dry.body && dry.body.detail), dry.status === 412);
+        return;
+      }
+      warnings.push(...((dry.body && dry.body.warnings) || []).map(String));
+      edit.dryTarget = t;
+      if (warnings.length) { edit.confirmed = true; edit.warnings = warnings; return; }
+      /* no confirm step: write only the text just checked, and never close over text it did not */
+      if (document.getElementById("configYaml").value !== yaml) {
+        configSetError("The text changed while checking; save again to check it.");
+        return;
+      }
+    }
+    const t = configEditTarget(edit);
+    if (moved(edit.dryTarget)) return;
+    busy(edit.op === "delete" ? "Deleting…" : edit.op === "copy" ? "Copying…" : "Saving…");
+    const res = await send(t, false);
+    const mine = configEdit === edit;
+    if (!res.ok) {
+      if (mine) {
+        edit.confirmed = false;
+        /* rediscover a cross-repo replace (POST -> 409) so it is confirmed again */
+        edit.crossName = null;
+        configSetError(describeConfigError(res.status, res.body && res.body.detail), res.status === 412);
+      }
+      return;
+    }
+    const spot = mine ? configOpenerSpot(edit.opener) : null;
+    if (mine) configCloseEditor();
+    /* written even if the editor was cancelled meanwhile: the page shows what is on disk */
+    configSetStatus([...(res.body.warnings || []), ...(res.body.notes || [])].map(String));
+    applyConfigScope(t.scope, res.body.scope);
+    configRestoreFocus(spot);
+    /* badges cross scopes (a global tool's "overridden in", a project tool's
+       "overrides global", a schema conflict naming another repo), so after
+       every write refresh the rest quietly */
+    const redrawn = document.activeElement;
+    await loadConfigPage(true);
+    if (configFocusLost(redrawn)) configRestoreFocus(spot);
+  } finally {
+    edit.busy = "";
+    if (configEdit === edit) {
+      renderConfigModal();
+      /* a failed check or write locked the form while it ran, which drops focus to <body> */
+      if (configFocusLost(pressed)) configEditorFocusTarget().focus();
+    }
+  }
+}
+/* after a 412: pick up the file's current fingerprint, keep the user's text */
+async function configReload() {
+  const edit = configEdit;
+  if (!edit) return;
+  const scope = configEditTarget(edit).scope;
+  const res = await configSend({ url: "/api/config/" + encodeURIComponent(scope), init: {} });
+  if (configEdit !== edit) return;
+  if (!res.ok) { configSetError(describeConfigError(res.status, res.body && res.body.detail), true); return; }
+  applyConfigScope(scope, res.body);
+  edit.fps[scope] = configFingerprint(scope, edit.section);
+  edit.confirmed = false;
+  renderConfigModal();
+  configSetError("Reloaded the current file; your text is kept. Review it and save again.");
+}
+/* ── whole-file reset: a dry run lists what goes, then the scope's name typed
+   in full and an armed Reset; the confirm carries the dry run's fingerprint,
+   so a file that changed after it was listed is a 412 and nothing is deleted ── */
+/* kind: tools|schema */
+function configResetRequest(scope, kind, fingerprint, dryRun) {
+  return { url: "/api/config/" + encodeURIComponent(scope) + "/reset/" + encodeURIComponent(kind),
+    init: { method: "POST", headers: { "If-Match": '"' + fingerprint + '"', "Content-Type": "application/json" },
+      body: JSON.stringify({ dry_run: !!dryRun }) } };
+}
+/* what to type: the repo id, or "global" (nobody should have to type the __global__ token) */
+function configResetPhrase(scope) {
+  return scope === CONFIG_GLOBAL ? "global" : String(scope);
+}
+/* exact match only: no trimming, no case folding */
+function configResetReady(typed, phrase) {
+  return typeof typed === "string" && typed.length > 0 && typed === phrase;
+}
+const CONFIG_RESET_RECOVERY = "Git can restore a tracked file; an untracked file or the global store cannot be restored.";
+const CONFIG_RESET_UNRECOVERABLE_GLOBAL = "The global tools store cannot be restored: it is not tracked by git, so emptying it is permanent.";
+const CONFIG_RESET_UNREADABLE = "The file is not valid YAML; its whole contents are removed.";
+function describeConfigReset(response) {
+  const r = (response && response.removed) || {};
+  const removed = [];
+  const list = (names, noun) => (names || []).forEach(n => removed.push(noun + " " + String(n)));
+  if ("tools" in r) {
+    if (r.tools === null) removed.push(CONFIG_RESET_UNREADABLE);
+    else list(r.tools, "Tool");
+  }
+  if ("node_types" in r || "relationships" in r) {
+    if (r.node_types === null || r.relationships === null) removed.push(CONFIG_RESET_UNREADABLE);
+    else { list(r.node_types, "Node type"); list(r.relationships, "Relationship"); }
+  }
+  return { removed, warnings: ((response && response.warnings) || []).map(String), notes: ((response && response.notes) || []).map(String) };
+}
+function configResetTitle(rs) {
+  if (rs.scope === CONFIG_GLOBAL) return "Reset the global tools store";
+  return "Reset " + (rs.kind === "tools" ? "devgraph.tools.yaml" : "devgraph.schema.yaml") + " (" + rs.scope + ")";
+}
+function configResetSetError(text) {
+  document.getElementById("configResetError").textContent = text || "";
+  configShow("configResetError", !!text);
+}
+function renderConfigReset() {
+  const rs = configReset;
+  document.getElementById("configResetTitle").textContent = configResetTitle(rs);
+  const box = document.getElementById("configResetList");
+  box.replaceChildren();
+  const section = (heading, items, cls) => {
+    if (!items.length) return;
+    box.appendChild(configEl("div", cls || "", heading));
+    const ul = configEl("ul", cls || "");
+    items.forEach(t => ul.appendChild(configEl("li", "", t)));
+    box.appendChild(ul);
+  };
+  if (rs.review) {
+    if (rs.review.removed.length) section("This removes:", rs.review.removed);
+    else box.appendChild(configEl("div", "", "Nothing is declared in this file."));
+    section("Check before resetting:", rs.review.warnings, "cfg-confirm");
+    section("After the reset:", rs.review.notes, "cfg-sub");
+    box.appendChild(configEl("div", "cfg-confirm", rs.scope === CONFIG_GLOBAL ? CONFIG_RESET_UNRECOVERABLE_GLOBAL : CONFIG_RESET_RECOVERY));
+  }
+  configShow("configResetPhraseField", !!rs.review);
+  document.getElementById("configResetPhraseLabel").textContent = "Type " + rs.phrase + " to reset";
+  const ready = !!rs.review && configResetReady(document.getElementById("configResetTyped").value, rs.phrase);
+  /* the button arms only a moment after it becomes pressable, like every changed confirm */
+  if (ready && !rs.ready) rs.armedAt = Date.now();
+  rs.ready = ready;
+  configShow("configResetRecheck", rs.stale);
+  const btn = document.getElementById("configResetConfirm");
+  btn.disabled = !ready || !!rs.busy;
+  btn.textContent = rs.busy || "Reset";
+}
+function configCloseReset() {
+  document.getElementById("configResetModal").classList.remove("open");
+  const opener = configReset && configReset.opener;
+  configReset = null;
+  configFocusOpener(opener);
+}
+/* a 412 at any step: the list is out of date, so it and the typed name go */
+function configResetFailed(rs, res) {
+  const detail = res.body && res.body.detail;
+  if (res.status === 412) {
+    rs.stale = true;
+    rs.review = null;
+    document.getElementById("configResetTyped").value = "";
+    configResetSetError("The file changed since this list was made; nothing was reset. Re-check to see what it holds now.");
+    document.getElementById("configResetRecheck").focus();
+  } else {
+    configResetSetError(describeConfigError(res.status, detail));
+  }
+}
+/* the dry run; fresh: fetch the scope first (after a 412 the page's fingerprint is the stale one) */
+async function configResetCheck(rs, fresh) {
+  rs.review = null;
+  rs.stale = false;
+  document.getElementById("configResetTyped").value = "";
+  configResetSetError("");
+  rs.busy = "Checking…";
+  renderConfigReset();
+  try {
+    if (fresh) {
+      const cur = await configSend({ url: "/api/config/" + encodeURIComponent(rs.scope), init: {} });
+      if (configReset !== rs) return;
+      if (!cur.ok) { configResetSetError(describeConfigError(cur.status, cur.body && cur.body.detail)); return; }
+      applyConfigScope(rs.scope, cur.body);
+    }
+    const fp = configFingerprint(rs.scope, rs.kind);
+    const res = await configSend(configResetRequest(rs.scope, rs.kind, fp, true));
+    if (configReset !== rs) return;
+    if (!res.ok) { configResetFailed(rs, res); return; }
+    rs.fingerprint = String(res.body.fingerprint);
+    rs.review = describeConfigReset(res.body);
+  } finally {
+    rs.busy = "";
+    if (configReset === rs) {
+      renderConfigReset();
+      /* a failed check leaves no list to type under, and Re-check may have
+         been hidden under the focus: Cancel is the one control always there */
+      document.getElementById(rs.review ? "configResetTyped" : "configResetCancel").focus();
+    }
+  }
+}
+async function configResetConfirm(ev) {
+  const rs = configReset;
+  if (!rs || rs.busy || !rs.review || (ev && ev.detail > 1) || Date.now() - rs.armedAt < CONFIG_ARM_MS) return;
+  if (!configResetReady(document.getElementById("configResetTyped").value, rs.phrase)) return;
+  configResetSetError("");
+  rs.busy = "Resetting…";
+  renderConfigReset();
+  let res;
+  try {
+    res = await configSend(configResetRequest(rs.scope, rs.kind, rs.fingerprint, false));
+  } finally {
+    rs.busy = "";
+  }
+  const mine = configReset === rs;
+  if (!res.ok) {
+    if (mine) { configResetFailed(rs, res); renderConfigReset(); }
+    /* cancelled meanwhile: the dialog is gone, so the status line says it did not happen */
+    else configSetStatus("Reset failed: " + describeConfigError(res.status, res.body && res.body.detail));
+    return;
+  }
+  const spot = mine ? configOpenerSpot(rs.opener) : null;
+  if (mine) configCloseReset();
+  /* reset even if the dialog was cancelled meanwhile: the page shows what is on disk */
+  const outcome = [...(res.body.warnings || []), ...(res.body.notes || [])].map(String);
+  configSetStatus(outcome);
+  configOutcomes[rs.scope] = outcome;
+  applyConfigScope(rs.scope, res.body.scope);
+  if (res.body.global && rs.scope !== CONFIG_GLOBAL) applyConfigScope(CONFIG_GLOBAL, res.body.global);
+  configRestoreFocus(spot);
+  /* emptying the global store changes every repo's "overrides global" badges */
+  if (rs.scope === CONFIG_GLOBAL) {
+    const redrawn = document.activeElement;
+    await loadConfigPage(true);
+    configOutcomes[rs.scope] = outcome;
+    configRerender(rs.scope);
+    if (configFocusLost(redrawn)) configRestoreFocus(spot);
+  }
+}
+/* kind: tools|schema */
+function openConfigReset(scope, kind) {
+  const rs = { scope, kind, opener: document.activeElement, phrase: configResetPhrase(scope), fingerprint: null, review: null, stale: false, busy: "", ready: false, armedAt: 0 };
+  configReset = rs;
+  const typed = document.getElementById("configResetTyped");
+  typed.value = "";
+  typed.oninput = () => { if (configReset) renderConfigReset(); };
+  document.getElementById("configResetConfirm").onclick = configResetConfirm;
+  document.getElementById("configResetRecheck").onclick = () => { if (configReset && !configReset.busy) configResetCheck(configReset, true); };
+  /* Cancel works mid-request too: each step checks it still owns the dialog after every await */
+  document.getElementById("configResetCancel").onclick = configCloseReset;
+  const modal = document.getElementById("configResetModal");
+  modal.onclick = ev => { if (ev.target === modal) configCloseReset(); };
+  modal.classList.add("open");
+  /* only now can the modal take focus; Cancel is the one control that is always enabled */
+  document.getElementById("configResetCancel").focus();
+  return configResetCheck(rs, false);
+}
+/* ── project-config switch: the request names the end state (idempotent, no
+   If-Match). Turning it off dry-runs first and asks only when that warns; the
+   switch always shows the server's state, never the click's. ── */
+function configToggleRequest(repoId, enabled, dryRun) {
+  return { url: "/api/config/" + encodeURIComponent(repoId) + "/project-config",
+    init: { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: !!enabled, dry_run: !!dryRun }) } };
+}
+function configToggleEl(block) {
+  const st = configToggles[block.repo_id];
+  const wrap = configEl("label", "cfg-toggle");
+  wrap.appendChild(configEl("span", "cfg-sub", "Project config"));
+  const sw = configEl("span", "switch");
+  const input = configEl("input");
+  input.type = "checkbox";
+  input.checked = !!block.project_config_enabled;
+  input.disabled = !!(st && (st.busy || st.confirm));
+  input.addEventListener("change", () => toggleProjectConfig(block.repo_id, input.checked));
+  sw.appendChild(input);
+  sw.appendChild(configEl("span", "track"));
+  sw.appendChild(configEl("span", "thumb"));
+  wrap.appendChild(sw);
+  return wrap;
+}
+function configToggleMsgEl(repoId, st) {
+  const box = configEl("div", "cfg-toggle-msg");
+  const list = (items, cls) => {
+    const ul = configEl("ul", cls || "");
+    items.forEach(t => ul.appendChild(configEl("li", "", t)));
+    return ul;
+  };
+  if (st.busy) box.appendChild(configEl("div", "", st.busy));
+  if (st.error) box.appendChild(configEl("div", "cfg-error", st.error));
+  if (st.confirm) {
+    const panel = configEl("div", "cfg-confirm");
+    panel.appendChild(configEl("div", "", "Disabling project config for " + repoId + ":"));
+    panel.appendChild(list(st.confirm));
+    const actions = configEl("div", "modal-actions");
+    actions.appendChild(configButton("Cancel", () => { delete configToggles[repoId]; configRerender(repoId); }));
+    actions.appendChild(configButton("Disable anyway", ev => {
+      if (configToggles[repoId] !== st || (ev && ev.detail > 1) || Date.now() - st.armedAt < CONFIG_ARM_MS) return;
+      return toggleProjectConfig(repoId, false, true);
+    }));
+    panel.appendChild(actions);
+    box.appendChild(panel);
+  }
+  if (st.notes && st.notes.length) box.appendChild(list(st.notes));
+  return box;
+}
+async function toggleProjectConfig(repoId, enabled, confirmed) {
+  const st = { busy: enabled ? "Enabling…" : "Checking…", confirm: null, error: "", notes: [], armedAt: 0 };
+  configToggles[repoId] = st;
+  configRerender(repoId);
+  try {
+    if (!enabled && !confirmed) {
+      const dry = await configSend(configToggleRequest(repoId, false, true));
+      if (configToggles[repoId] !== st) return;
+      if (!dry.ok) { st.error = describeConfigError(dry.status, dry.body && dry.body.detail); return; }
+      const warnings = ((dry.body && dry.body.warnings) || []).map(String);
+      if (warnings.length) { st.confirm = warnings; st.armedAt = Date.now(); return; }
+    }
+    st.busy = enabled ? "Enabling…" : "Disabling…";
+    configRerender(repoId);
+    const res = await configSend(configToggleRequest(repoId, enabled, false));
+    if (!res.ok) {
+      if (configToggles[repoId] === st) st.error = describeConfigError(res.status, res.body && res.body.detail);
+      return;
+    }
+    const outcome = [...(res.body.warnings || []), ...(res.body.notes || [])].map(String);
+    if (configToggles[repoId] === st) st.notes = outcome;
+    configSetStatus(outcome);
+    st.busy = "";
+    applyConfigScope(repoId, res.body.scope);
+    /* the global card's "Overridden in" badges depend on which repos serve project tools */
+    if (res.body.global) applyConfigScope(CONFIG_GLOBAL, res.body.global);
+  } finally {
+    st.busy = "";
+    if (configToggles[repoId] === st) configRerender(repoId);
+  }
+}
+/* ── project tools trust: the page can only revoke it (DELETE, idempotent, no If-Match);
+   trusting a tools file is `devgraph config tools trust` in a terminal. ── */
+function configRevokeTrustRequest(repoId) {
+  return { url: "/api/config/" + encodeURIComponent(repoId) + "/trust/tools", init: { method: "DELETE" } };
+}
+async function revokeConfigTrust(repoId) {
+  configSetStatus("Revoking trust…");
+  const res = await configSend(configRevokeTrustRequest(repoId));
+  if (!res.ok) { configSetStatus("Revoke failed: " + describeConfigError(res.status, res.body && res.body.detail)); return; }
+  const outcome = ((res.body && res.body.notes) || []).map(String);
+  configSetStatus(outcome);
+  configOutcomes[repoId] = outcome;
+  applyConfigScope(repoId, res.body.scope);
+  /* the global card's "Overridden in" badges depend on which repos serve project tools */
+  if (res.body.global) applyConfigScope(CONFIG_GLOBAL, res.body.global);
+  configRestoreFocus({ scope: repoId, action: "add", section: "tools" });
+}
+/* quiet: a background refresh (live event, after a write, pane activation).
+   One while the pane is hidden is skipped: activating the pane reloads it. */
+async function loadConfigPage(quiet) {
+  if (quiet && !document.getElementById("pane-config").classList.contains("active")) return;
+  const seq = ++configLoadSeq;
+  if (!quiet) configSetStatus("Loading…");
+  const res = await configSend({ url: "/api/config", init: {} });
+  if (seq !== configLoadSeq) return;
+  if (!res.ok) { configSetStatus("Could not load config: " + describeConfigError(res.status, res.body && res.body.detail)); return; }
+  if (!quiet) configSetStatus("");
+  Object.values(configToggles).forEach(t => { t.notes = []; });
+  for (const k of Object.keys(configOutcomes)) delete configOutcomes[k];
+  renderConfigPage(res.body);
+}
+/* ── Config form editor: pure functions ──
+   The form is a view over the YAML textarea: it is built from the server's
+   parsed `entry` (the browser never parses YAML), turned back into a mapping,
+   and serialised into the textarea, which Save reads exactly as before.
+   CONFIG_FORM_FIELDS and CONFIG_FORM_LIMITS are checked against the models'
+   JSON Schema and the validators' constants by test_config_form_drift.py;
+   the serialiser is checked against yaml.safe_load by
+   test_config_form_roundtrip.py. Field lists are in model order, which is
+   also the order new keys are written in. */
+const CONFIG_FORM_FIELDS = {
+  tool: ["name", "description", "cypher", "parameters", "max_rows", "timeout_s"],
+  parameter: ["name", "type", "required", "default", "description"],
+  node_type: ["label", "key", "description", "color", "source", "metadata"],
+  metadata: ["name", "type", "required", "description"],
+  source: ["provider", "kind"],
+  relationship: ["type", "from", "to", "provider", "custom", "color"],
+  custom: ["name", "params"],
+  parameter_types: ["string", "integer", "float", "boolean"],
+  metadata_types: ["string", "integer", "float", "boolean"],
+  filesystem_kinds: ["file", "folder"],
+  source_providers: ["filesystem"],
+  relationship_providers: ["builtin", "custom", "filesystem"],
+};
+/* the validators' patterns (used as fullmatch) and limits, for advisory hints only */
+const CONFIG_FORM_LIMITS = {
+  NAME_PATTERN: "[a-z][a-z0-9_]{0,63}", LABEL_PATTERN: "[A-Za-z][A-Za-z0-9_]{0,63}",
+  PROPERTY_NAME_PATTERN: "[a-z][a-z0-9_]{0,63}", RELATIONSHIP_TYPE_PATTERN: "[A-Z][A-Z0-9_]{0,63}", COLOR_PATTERN: "^#[0-9a-fA-F]{6}$",
+  MAX_DESCRIPTION_LENGTH: 1024, MAX_ROWS_LIMIT: 1000, MAX_TIMEOUT_S: 60, DEFAULT_MAX_ROWS: 100, DEFAULT_TIMEOUT_S: 10,
+};
+const CONFIG_FORM_REASONS = {
+  field: path => "This entry has a field the form doesn't edit: `" + path + "`. Edit it as YAML.",
+  keyOrder: "This entry's key order differs from its metadata order; the form can't show that. Edit it as YAML.",
+  keyName: name => "This entry's key names `" + name + "`, which is not one of its metadata fields; the form can't show that. Edit it as YAML.",
+  twice: name => "This entry declares metadata field `" + name + "` more than once; the form can't show that. Edit it as YAML.",
+  value: "This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML.",
+  fromList: "This entry's `from` can't be shown as comma-separated labels exactly (a label with a comma, surrounding spaces or a non-text value). Edit it as YAML.",
+  customProvider: "This entry has a `custom` block but its provider isn't custom; the form can't show that. Edit it as YAML.",
+  handEdit: "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form.",
+};
+const configIsMap = v => v !== null && typeof v === "object" && !Array.isArray(v);
+const configIsScalar = v => v === null || ["string", "number", "boolean"].includes(typeof v);
+const configFullMatch = (pattern, text) => new RegExp("^(?:" + pattern + ")$").test(text);
+/* the text a form control shows for a value */
+const configFormText = v => v === null || v === undefined ? "" : String(v);
+/* a single-line input can't show a line break, and a textarea turns CR and
+   CRLF into LF: text either would rewrite opens in YAML instead */
+const CONFIG_FORM_LINE_BREAK = /[\n\r\x85\u2028\u2029]/;
+const configFormLine = v => typeof v === "string" && !CONFIG_FORM_LINE_BREAK.test(v);
+const configFormArea = v => typeof v === "string" && !v.includes("\r");
+/* per field: what a value must be for the form to show it exactly */
+const CONFIG_FORM_CHECKS = {
+  tool: { name: configFormLine, description: configFormArea, cypher: configFormArea,
+    parameters: Array.isArray, max_rows: Number.isInteger, timeout_s: Number.isInteger },
+  parameter: { name: configFormLine, type: v => CONFIG_FORM_FIELDS.parameter_types.includes(v),
+    required: v => typeof v === "boolean", default: v => configIsScalar(v) && (typeof v !== "string" || configFormLine(v)),
+    description: v => v === null || configFormLine(v) },
+  node_type: { label: configFormLine, key: v => Array.isArray(v) && v.every(k => typeof k === "string"),
+    description: v => v === null || configFormArea(v), color: v => v === null || configFormLine(v),
+    source: v => v === null || configIsMap(v), metadata: Array.isArray },
+  metadata: { name: configFormLine, type: v => CONFIG_FORM_FIELDS.metadata_types.includes(v),
+    required: v => typeof v === "boolean", description: v => v === null || configFormLine(v) },
+  source: { provider: v => CONFIG_FORM_FIELDS.source_providers.includes(v), kind: v => CONFIG_FORM_FIELDS.filesystem_kinds.includes(v) },
+  relationship: { type: configFormLine, from: configFormLabels, to: configFormLine,
+    provider: v => CONFIG_FORM_FIELDS.relationship_providers.includes(v), custom: v => v === null || configIsMap(v),
+    color: v => v === null || configFormLine(v) },
+  custom: { name: configFormLine, params: v => configIsMap(v) && !Object.keys(v).length },
+};
+/* `from` as the form shows it: a string, or a list joined with ", " */
+const configFormFromText = v => typeof v === "string" ? v : v.join(", ");
+/* can `from` come back unchanged from its text, split on commas and trimmed?
+   A string or a non-empty list of single-line labels, each without a comma or
+   surrounding space; inside a list, also non-empty */
+function configFormLabels(v) {
+  const list = typeof v === "string" ? [v] : Array.isArray(v) && v.length ? v : null;
+  return !!list && list.every(l => configFormLine(l) && !l.includes(",") && l === l.trim() && (l !== "" || typeof v === "string"));
+}
+/* the path of the first field of `map` the form can't show, or null */
+function configFormBadField(map, kind, prefix) {
+  for (const [k, v] of Object.entries(map)) {
+    /* a field listed in CONFIG_FORM_FIELDS with no check here is the spec's
+       "explicitly YAML-only" field (G2b-3 §2.9): entries that use it open as YAML */
+    const check = CONFIG_FORM_CHECKS[kind][k];
+    if (!CONFIG_FORM_FIELDS[kind].includes(k) || !check || !check(v)) return prefix + k;
+  }
+  return null;
+}
+function configFormBadRows(rows, kind, prefix) {
+  for (let i = 0; i < rows.length; i++) {
+    const bad = configIsMap(rows[i]) ? configFormBadField(rows[i], kind, prefix + i + ".") : prefix + i;
+    if (bad) return bad;
+  }
+  return null;
+}
+/* {ok: true, form} when the form can show `entry` exactly, else {ok: false, reason} */
+function configFormFromEntry(section, entry) {
+  if (!configIsMap(entry)) return { ok: false, reason: CONFIG_FORM_REASONS.value };
+  const t = configFormText;
+  if (section === "relationships") {
+    /* the walk follows the entry's key order, so the reason names its first problem */
+    for (const k of Object.keys(entry)) {
+      const bad = configFormBadField({ [k]: entry[k] }, "relationship", "") ||
+        (k === "custom" && configIsMap(entry.custom) ? configFormBadField(entry.custom, "custom", "custom.") : null);
+      if (bad) return { ok: false, reason: bad === "from" ? CONFIG_FORM_REASONS.fromList : CONFIG_FORM_REASONS.field(bad) };
+    }
+    if (configIsMap(entry.custom) && entry.provider !== "custom") return { ok: false, reason: CONFIG_FORM_REASONS.customProvider };
+    return { ok: true, form: {
+      type: t(entry.type), from: "from" in entry ? configFormFromText(entry.from) : "", to: t(entry.to),
+      provider: entry.provider || "builtin", custom: t(configIsMap(entry.custom) ? entry.custom.name : null), color: t(entry.color),
+      open: entry } };
+  }
+  if (section === "tools") {
+    const bad = configFormBadField(entry, "tool", "") || configFormBadRows(entry.parameters || [], "parameter", "parameters.");
+    if (bad) return { ok: false, reason: CONFIG_FORM_REASONS.field(bad) };
+    return { ok: true, form: {
+      name: t(entry.name), description: t(entry.description), cypher: t(entry.cypher),
+      max_rows: t(entry.max_rows), timeout_s: t(entry.timeout_s),
+      parameters: (entry.parameters || []).map(p => ({ name: t(p.name), type: p.type || "string",
+        required: "required" in p ? p.required : true, default: t(p.default), description: t(p.description), open: p })),
+      open: entry } };
+  }
+  const metadata = entry.metadata || [];
+  let bad = configFormBadField(entry, "node_type", "") || configFormBadRows(metadata, "metadata", "metadata.");
+  if (!bad && configIsMap(entry.source)) {
+    bad = configFormBadField(entry.source, "source", "source.") ||
+      CONFIG_FORM_FIELDS.source.map(k => "source." + k).find(k => !(k.slice(7) in entry.source)) || null;
+  }
+  if (bad) return { ok: false, reason: CONFIG_FORM_REASONS.field(bad) };
+  const names = metadata.map(m => m.name);
+  const twice = names.find((n, i) => names.indexOf(n) !== i);
+  if (twice !== undefined) return { ok: false, reason: CONFIG_FORM_REASONS.twice(twice) };
+  const key = entry.key || [];
+  const missing = key.find(k => !names.includes(k));
+  if (missing !== undefined) return { ok: false, reason: CONFIG_FORM_REASONS.keyName(missing) };
+  if (key.some((k, i) => i && names.indexOf(k) <= names.indexOf(key[i - 1]))) return { ok: false, reason: CONFIG_FORM_REASONS.keyOrder };
+  return { ok: true, form: {
+    label: t(entry.label), description: t(entry.description), color: t(entry.color),
+    source: entry.source ? entry.source.kind : "",
+    metadata: metadata.map(m => ({ name: t(m.name), type: m.type || "string", required: m.required === true,
+      key: key.includes(m.name), description: t(m.description), open: m })),
+    open: entry } };
+}
+/* The rules that keep a form edit from rewriting what it didn't touch: a field
+   whose control still shows the opened value keeps that exact value (so null,
+   "", "12" for an integer stay as they were); an emptied field is omitted. */
+function configFormPut(vals, open, key, text, coerce, same = true) {
+  if (same && key in open && configFormText(open[key]) === text) vals[key] = open[key];
+  else if (text !== "") vals[key] = coerce(text);
+}
+/* a choice with a model default: written when the entry had it or it differs from the default */
+function configFormPutChoice(vals, open, key, value, dflt) {
+  if (key in open || value !== dflt) vals[key] = value;
+}
+function configFormOrdered(vals, order, model) {
+  const out = {};
+  for (const k of order.concat(model)) if (k in vals && !(k in out)) out[k] = vals[k];
+  return out;
+}
+const configFormInt = text => /^-?\d+$/.test(text) && Number.isSafeInteger(Number(text)) ? Number(text) : text;
+const configFormFloat = text => /^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(text) && Number.isFinite(Number(text)) ? Number(text) : text;
+const CONFIG_FORM_DEFAULTS = {
+  integer: configFormInt, float: configFormFloat, string: text => text,
+  boolean: text => text === "true" ? true : text === "false" ? false : text,
+};
+/* the mapping the form state stands for; `order` is the opened entry's key order */
+function configEntryFromForm(section, form, order) {
+  const open = form.open || {};
+  order = order || Object.keys(open);
+  const id = text => text;
+  const vals = {};
+  if (section === "tools") {
+    configFormPut(vals, open, "name", form.name, id);
+    configFormPut(vals, open, "description", form.description, id);
+    configFormPut(vals, open, "cypher", form.cypher, id);
+    const rows = form.parameters.map(p => {
+      const o = p.open || {}, v = {};
+      configFormPut(v, o, "name", p.name, id);
+      configFormPutChoice(v, o, "type", p.type, "string");
+      configFormPutChoice(v, o, "required", p.required, true);
+      configFormPut(v, o, "default", p.default, CONFIG_FORM_DEFAULTS[p.type] || id, p.type === (o.type || "string"));
+      configFormPut(v, o, "description", p.description, id);
+      return configFormOrdered(v, Object.keys(o), CONFIG_FORM_FIELDS.parameter);
+    });
+    if (rows.length || "parameters" in open) vals.parameters = rows;
+    configFormPut(vals, open, "max_rows", form.max_rows, configFormInt);
+    configFormPut(vals, open, "timeout_s", form.timeout_s, configFormInt);
+    return configFormOrdered(vals, order, CONFIG_FORM_FIELDS.tool);
+  }
+  if (section === "relationships") {
+    configFormPut(vals, open, "type", form.type, id);
+    if ("from" in open && configFormFromText(open.from) === form.from) vals.from = open.from;
+    else {
+      const labels = form.from.split(",").map(l => l.trim()).filter(Boolean);
+      /* one label stays a list when the entry wrote a list */
+      if (labels.length > 1 || (labels.length && Array.isArray(open.from))) vals.from = labels;
+      else if (labels.length) vals.from = labels[0];
+    }
+    configFormPut(vals, open, "to", form.to, id);
+    configFormPutChoice(vals, open, "provider", form.provider, "builtin");
+    /* the custom name is only written for the custom provider, so switching
+       away and back keeps it; an opened `custom: null` stays unless the form
+       ends with a name under the custom provider */
+    const block = configIsMap(open.custom) ? open.custom : null;
+    const named = form.provider === "custom" && form.custom !== "";
+    if ("custom" in open && open.custom === null && !named) vals.custom = null;
+    else if (form.provider === "custom" && (block || named)) {
+      const c = {};
+      configFormPut(c, block || {}, "name", form.custom, id);
+      if (block && "params" in block) c.params = block.params;
+      vals.custom = configFormOrdered(c, Object.keys(block || {}), CONFIG_FORM_FIELDS.custom);
+    }
+    configFormPut(vals, open, "color", form.color, id);
+    return configFormOrdered(vals, order, CONFIG_FORM_FIELDS.relationship);
+  }
+  configFormPut(vals, open, "label", form.label, id);
+  const key = form.metadata.filter(m => m.key).map(m => m.name);
+  if (key.length || "key" in open) vals.key = key;
+  configFormPut(vals, open, "description", form.description, id);
+  configFormPut(vals, open, "color", form.color, id);
+  if ("source" in open && (open.source ? open.source.kind : "") === form.source) vals.source = open.source;
+  else if (form.source) vals.source = { provider: "filesystem", kind: form.source };
+  const rows = form.metadata.map(m => {
+    const o = m.open || {}, v = {};
+    configFormPut(v, o, "name", m.name, id);
+    configFormPutChoice(v, o, "type", m.type, "string");
+    configFormPutChoice(v, o, "required", m.required, false);
+    configFormPut(v, o, "description", m.description, id);
+    return configFormOrdered(v, Object.keys(o), CONFIG_FORM_FIELDS.metadata);
+  });
+  if (rows.length || "metadata" in open) vals.metadata = rows;
+  return configFormOrdered(vals, order, CONFIG_FORM_FIELDS.node_type);
+}
+/* PyYAML refuses these characters anywhere in a stream (or, for \x85 and
+   \u2028/\u2029, reads them as line breaks), so a quoted string escapes them */
+const CONFIG_YAML_UNSAFE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029\ufffe\uffff]/;
+const CONFIG_YAML_ESCAPE = /[\x7f-\x9f\u2028\u2029\ufffe\uffff]/g;
+/* a lone UTF-16 surrogate is unwritable raw; JSON.stringify escapes it, so such text is quoted */
+const CONFIG_YAML_LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+/* one scalar as YAML; `indent` is a literal block's content indent; `flow`
+   rules a block out (inside [ ]) */
+function configYamlScalar(value, indent = "  ", flow = false) {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    /* YAML 1.1 reads 1e-7 as a string: a float needs a dot */
+    const s = String(value);
+    return /[.]|^-?\d+$/.test(s) ? s : s.replace("e", ".0e");
+  }
+  const s = String(value);
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(s) && !/^(y|n|yes|no|on|off|true|false|null)$/i.test(s)) return s;
+  const body = s.endsWith("\n") ? s.slice(0, -1) : s;
+  const first = body.split("\n").find(l => l) || "";
+  if (!flow && body.includes("\n") && !body.endsWith("\n") && first && !/^[ \t]/.test(first) &&
+      !s.includes("\r") && !CONFIG_YAML_UNSAFE.test(s) && !CONFIG_YAML_LONE_SURROGATE.test(s)) {
+    return (s.endsWith("\n") ? "|" : "|-") + "\n" + body.split("\n").map(l => l ? indent + l : "").join("\n");
+  }
+  /* a JSON string literal is a valid YAML double-quoted scalar */
+  return JSON.stringify(s).replace(CONFIG_YAML_ESCAPE, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+}
+function configYamlLines(map, keys, indent) {
+  const lines = [];
+  for (const k of keys) {
+    const v = map[k];
+    if (Array.isArray(v) && v.length && v.every(configIsMap)) {
+      lines.push(indent + k + ":");
+      for (const item of v) {
+        const sub = configYamlLines(item, Object.keys(item), indent + "    ");
+        if (!sub.length) { lines.push(indent + "  - {}"); continue; }
+        sub[0] = indent + "  - " + sub[0].slice(indent.length + 4);
+        lines.push(...sub);
+      }
+    } else if (Array.isArray(v)) {
+      lines.push(indent + k + ": [" + v.map(x => configYamlScalar(x, "", true)).join(", ") + "]");
+    } else if (configIsMap(v)) {
+      const sub = configYamlLines(v, Object.keys(v), indent + "  ");
+      lines.push(indent + k + ":" + (sub.length ? "" : " {}"), ...sub);
+    } else {
+      lines.push(indent + k + ": " + configYamlScalar(v, indent + "  "));
+    }
+  }
+  return lines;
+}
+const CONFIG_FORM_SECTION_FIELDS = { tools: "tool", node_types: "node_type", relationships: "relationship" };
+/* the YAML text for one entry mapping: keys in `order`, then model order */
+function configEntryYaml(section, mapping, order) {
+  const model = CONFIG_FORM_FIELDS[CONFIG_FORM_SECTION_FIELDS[section]];
+  const keys = Object.keys(configFormOrdered(mapping, order || [], model.concat(Object.keys(mapping))));
+  return configYamlLines(mapping, keys, "").join("\n") + "\n";
+}
+/* what relationship hints check labels and types against, from the loaded page
+   model (never a JS copy of the server's lists): the labels the repository has
+   (built-ins unless `extends: none`, plus this file's node types as last
+   loaded), the built-in relationship types, and the filesystem node types */
+function configFormContext(model, scope) {
+  const project = model.projects.find(p => p.repo_id === scope);
+  const schema = project ? project.schema : null;
+  const rows = schema ? schema.node_types : [];
+  const kind = k => (rows.find(r => configIsMap(r.entry) && configIsMap(r.entry.source) && r.entry.source.kind === k) || {}).label || null;
+  return {
+    labels: (schema && schema.extends === "none" ? [] : model.global.node_types.map(n => n.label)).concat(rows.map(r => r.label)),
+    relationship_types: model.global.relationship_types.map(r => r.type),
+    filesystem: { file: kind("file"), folder: kind("folder") },
+  };
+}
+/* advisory hints [{field, text}]: cheap structural checks that never block Save;
+   `ctx` (configFormContext) adds the relationship checks against the page model */
+function configFormHints(section, form, ctx) {
+  const L = CONFIG_FORM_LIMITS, out = [];
+  const hint = (field, text) => out.push({ field, text });
+  const intIn = (text, max) => /^-?\d+$/.test(text) && Number(text) >= 1 && Number(text) <= max;
+  const dupes = (rows, prefix, noun) => rows.forEach((r, i) => {
+    if (r.name && rows.findIndex(o => o.name === r.name) < i) hint(prefix + i + ".name", "Another " + noun + " is also named " + r.name + ".");
+  });
+  const nameHint = (field, text, pattern, noun) => {
+    if (!text) hint(field, noun + " is required.");
+    else if (!configFullMatch(pattern, text)) hint(field, noun + " must be lowercase letters, digits and underscores, starting with a letter (at most 64 characters).");
+  };
+  if (section === "tools") {
+    nameHint("name", form.name, L.NAME_PATTERN, "Name");
+    const description = configPyStrip(form.description);
+    if (!description) hint("description", "A description is required: it is what an agent reads to choose the tool.");
+    else if ([...description].length > L.MAX_DESCRIPTION_LENGTH) {
+      hint("description", "The description is " + [...description].length + " characters; the limit is " + L.MAX_DESCRIPTION_LENGTH + ".");
+    }
+    if (!form.cypher.trim()) hint("cypher", "A Cypher query is required.");
+    else if (!/\$(repo_id\b|`repo_id`)/.test(form.cypher)) hint("cypher", "The query doesn't appear to filter on `$repo_id`; DevGraph supplies it and every tool must use it.");
+    form.parameters.forEach((p, i) => {
+      if (!p.name) hint("parameters." + i + ".name", "A parameter name is required.");
+      if (p.default === "") return;
+      if (p.required) hint("parameters." + i + ".default", "A default makes the parameter optional: untick Required.");
+      const coerce = CONFIG_FORM_DEFAULTS[p.type];
+      if (coerce && typeof coerce(p.default) === "string" && p.type !== "string") {
+        hint("parameters." + i + ".default", p.default + " doesn't read as " + (p.type === "integer" ? "an " : "a ") + p.type + ".");
+      }
+    });
+    dupes(form.parameters, "parameters.", "parameter");
+    if (form.max_rows && !intIn(form.max_rows, L.MAX_ROWS_LIMIT)) hint("max_rows", "Max rows must be a whole number from 1 to " + L.MAX_ROWS_LIMIT + ".");
+    if (form.timeout_s && !intIn(form.timeout_s, L.MAX_TIMEOUT_S)) hint("timeout_s", "The timeout must be a whole number of seconds from 1 to " + L.MAX_TIMEOUT_S + ".");
+    return out;
+  }
+  const colorHint = () => {
+    if (form.color && !configFullMatch(L.COLOR_PATTERN, form.color)) hint("color", "A colour is written as #rrggbb.");
+  };
+  if (section === "relationships") {
+    const LABEL_RULE = "a label must start with a letter and use only letters, digits and underscores (at most 64 characters).";
+    const typeOk = configFullMatch(L.RELATIONSHIP_TYPE_PATTERN, form.type);
+    if (!typeOk) hint("type", "A relationship type is uppercase letters, digits and underscores, starting with a letter (at most 64 characters).");
+    if (ctx && typeOk) {
+      const builtin = ctx.relationship_types.includes(form.type);
+      if (form.provider === "builtin" && !builtin) {
+        hint("provider", "The builtin provider reuses one of DevGraph's relationship types; pick Custom or Filesystem to declare a new one.");
+      } else if (form.provider !== "builtin" && builtin) hint("provider", "`" + form.type + "` is built in: use the builtin provider to reuse it.");
+    }
+    if (form.provider === "custom") nameHint("custom", form.custom, L.PROPERTY_NAME_PATTERN, "A custom provider name");
+    const known = (field, label) => {
+      if (ctx && !ctx.labels.includes(label)) {
+        hint(field, "`" + label + "` isn't a node type this repository has (built-in, or declared in this file as last loaded).");
+      }
+    };
+    const from = form.from.split(",").map(l => l.trim()).filter(Boolean);
+    if (!from.length) hint("from", "Name at least one node label.");
+    from.forEach((label, i) => {
+      if (!configFullMatch(L.LABEL_PATTERN, label)) hint("from", "`" + label + "` isn't a valid label: " + LABEL_RULE);
+      else if (from.indexOf(label) < i) hint("from", "`" + label + "` is listed more than once.");
+      else known("from", label);
+    });
+    if (!form.to) hint("to", "A target label is required.");
+    else if (!configFullMatch(L.LABEL_PATTERN, form.to)) hint("to", "`" + form.to + "` isn't a valid label: " + LABEL_RULE);
+    else known("to", form.to);
+    if (ctx && form.provider === "filesystem") {
+      const fs = ctx.filesystem;
+      if (form.to !== fs.folder) {
+        hint("to", fs.folder ? "A filesystem relationship points to the filesystem folder node type (`" + fs.folder + "`)."
+          : "A filesystem relationship points to the filesystem folder node type, and this file declares none.");
+      }
+      /* advisory: one hint when the file has no filesystem types, and none on a label already refused */
+      if (!fs.file && !fs.folder) {
+        if (from.length) hint("from", "A filesystem relationship starts from the filesystem node types (file or folder), and this file declares none.");
+      } else {
+        from.filter((l, i) => from.indexOf(l) === i && configFullMatch(L.LABEL_PATTERN, l) && l !== fs.file && l !== fs.folder)
+          .forEach(l => hint("from", "`" + l + "` is not a filesystem node type."));
+      }
+    }
+    colorHint();
+    return out;
+  }
+  if (!form.label) hint("label", "A label is required.");
+  else if (!configFullMatch(L.LABEL_PATTERN, form.label)) hint("label", "A label must start with a letter and use only letters, digits and underscores (at most 64 characters).");
+  const key = form.metadata.filter(m => m.key);
+  if (!key.length) hint("key", "Tick Key on at least one metadata field: it is what identifies each node.");
+  form.metadata.forEach((m, i) => nameHint("metadata." + i + ".name", m.name, L.PROPERTY_NAME_PATTERN, "A field name"));
+  dupes(form.metadata, "metadata.", "field");
+  colorHint();
+  if (form.source && !(key.length === 1 && key[0].name === "path" && key[0].type === "string")) {
+    hint("source", "A filesystem node type's key must be exactly one string field named path.");
+  }
+  return out;
+}
+/* Can the editor (back) in YAML mode show the form for `text`? Only for text
+   whose mapping is known: the form's own last output (restore its state) or
+   the opening text (rebuild from the opening entry). */
+function configFormSwitch(edit, text) {
+  const rep = configFormFromEntry(edit.section, edit.openEntry);
+  if (!rep.ok) return { available: false, restore: null, reason: rep.reason };
+  if (edit.formState && text === edit.formText) return { available: true, restore: "state", reason: null };
+  if (text === edit.openText) return { available: true, restore: "open", reason: null };
+  return { available: false, restore: null, reason: CONFIG_FORM_REASONS.handEdit };
+}
+/* ── the form view (DOM). The form is a view over #configYaml: every change
+   re-serialises the entry into the textarea and runs the textarea's own reset,
+   so Save, the dry run and the confirm binding see only that text. ── */
+/* the editor the user last picked, for this page session; it wins when available */
+let configEditorPref = null;
+/* ids for form controls: a per-editor counter, never entry data */
+let configFormSeq = 0;
+/* the rendered form: controls and hint boxes by field path, every focusable
+   control, per-render updaters (legends, counts), and the first control */
+let configFormEls = { controls: {}, hints: {}, all: [], refresh: [], first: null };
+/* add and replace have a form in every section; delete and copy are the read-only YAML */
+const configFormOp = edit => edit.op === "add" || edit.op === "replace";
+/* null when the op has no form (delete, copy); else configFormSwitch for the textarea's text */
+function configFormAvailability(edit) {
+  if (!configFormOp(edit)) return null;
+  return configFormSwitch(edit, document.getElementById("configYaml").value);
+}
+/* the textarea's input handler, shared with the form: the text decides the
+   name, so a known-taken name and any confirm are stale */
+function configTextChanged() {
+  const edit = configEdit;
+  if (!edit) return;
+  edit.crossName = null;
+  edit.confirmed = false;
+  renderConfigModal();
+}
+function configFormChanged() {
+  const edit = configEdit;
+  if (!edit || !edit.formState) return;
+  const text = configEntryYaml(edit.section, configEntryFromForm(edit.section, edit.formState, edit.order), edit.order);
+  edit.formText = text;
+  configFormRefresh(edit);
+  const yaml = document.getElementById("configYaml");
+  /* the same text is the same request: a confirm still covers it */
+  if (yaml.value === text) return;
+  yaml.value = text;
+  configTextChanged();
+}
+/* the form is locked while a request is out; an event that lands anyway changes nothing */
+const configFormLocked = () => !configEdit || !!configEdit.busy;
+function configSetEditorMode(mode) {
+  const edit = configEdit;
+  if (!edit || edit.busy || mode === edit.mode) return;
+  if (mode === "form") {
+    const sw = configFormAvailability(edit);
+    if (!sw || !sw.available) return;
+    if (sw.restore === "open") {
+      edit.formState = configFormFromEntry(edit.section, edit.openEntry).form;
+      edit.formText = edit.openText;
+    }
+    renderConfigForm(edit);
+  }
+  edit.mode = mode;
+  configEditorPref = mode;
+  renderConfigModal();
+}
+/* back to the form's last text (through the textarea's reset, so a confirm is dropped) */
+function configFormDiscard() {
+  const edit = configEdit;
+  if (!edit || edit.busy) return;
+  document.getElementById("configYaml").value = edit.formText;
+  configTextChanged();
+  configSetEditorMode("form");
+  configEditorFocusTarget().focus();
+}
+/* the server's description check is `value.strip()` then `len()`: Python's whitespace (it
+   includes \x1c-\x1f and \x85 but not the BOM, unlike JS trim()), counted in code points */
+function configPyStrip(text) {
+  return text.replace(/^[\t-\r\x1c-\x20\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t-\r\x1c-\x20\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g, "");
+}
+function configEditorFocusTarget() {
+  return configEdit && configEdit.mode === "form" && configFormEls.first ? configFormEls.first : document.getElementById("configYaml");
+}
+/* hints, legends and counts follow the state without rebuilding (focus stays put) */
+function configFormRefresh(edit) {
+  const hints = configFormHints(edit.section, edit.formState, configFormContext(configModel, edit.scope));
+  for (const [path, box] of Object.entries(configFormEls.hints)) {
+    const text = hints.filter(h => h.field === path).map(h => h.text).join(" ");
+    box.textContent = text;
+    box.style.display = text ? "" : "none";
+  }
+  configFormEls.refresh.forEach(fn => fn());
+}
+/* one labelled control; `path` names it for hints and for focus after a rebuild */
+function configFormField(parent, path, labelText, control, help, cls) {
+  const wrap = configEl("div", "field" + (cls ? " " + cls : ""));
+  const id = "cfgf-" + (++configFormSeq);
+  control.id = id;
+  const label = configEl("label", "", labelText);
+  label.htmlFor = id;
+  if (cls === "cfg-check") { wrap.appendChild(control); wrap.appendChild(label); }
+  else { wrap.appendChild(label); wrap.appendChild(control); }
+  const described = [];
+  if (help !== undefined) {
+    const h = configEl("div", "cfg-help", help);
+    h.id = id + "-help";
+    wrap.appendChild(h);
+    described.push(h.id);
+  }
+  if (path) {
+    const hint = configEl("div", "cfg-hint");
+    hint.id = id + "-hint";
+    hint.style.display = "none";
+    wrap.appendChild(hint);
+    described.push(hint.id);
+    configFormEls.controls[path] = control;
+    configFormEls.hints[path] = hint;
+  }
+  if (described.length) control.setAttribute("aria-describedby", described.join(" "));
+  configFormEls.all.push(control);
+  if (!configFormEls.first) configFormEls.first = control;
+  parent.appendChild(wrap);
+  return wrap;
+}
+/* text controls write the state and re-serialise; nothing is ever read back
+   through a control that could have rewritten it */
+function configFormText_(tag, value, set) {
+  const el = configEl(tag, "");
+  if (tag === "input") { el.type = "text"; el.autocomplete = "off"; el.spellcheck = false; }
+  el.value = value;
+  el.addEventListener("input", () => { if (configFormLocked()) return; set(el.value); configFormChanged(); });
+  return el;
+}
+/* a select whose options come from constants, plus one for any current value
+   they don't hold (so the select never reads back "" for a value it can't show) */
+function configFormSelect(options, value, extra, set) {
+  const el = configEl("select", "");
+  const all = options.slice();
+  extra.filter(v => !all.some(([o]) => o === v)).forEach(v => all.push([v, v + " (current value)"]));
+  all.forEach(([v, text]) => { const o = configEl("option", "", text); o.value = v; el.appendChild(o); });
+  el.value = value;
+  el.addEventListener("change", () => { if (!configFormLocked()) set(el.value); });
+  return el;
+}
+function configFormCheck(checked, set) {
+  const el = configEl("input", "");
+  el.type = "checkbox";
+  el.checked = !!checked;
+  el.addEventListener("change", () => { if (!configFormLocked()) set(el.checked); });
+  return el;
+}
+/* a structural change (a row, a type, Required): rebuild, refocus, re-serialise */
+function configFormRebuild(edit, focusPath) {
+  renderConfigForm(edit);
+  const el = configFormEls.controls[focusPath];
+  if (el) el.focus();
+  configFormChanged();
+}
+/* the colour field (node types and relationships): the text is the value; a
+   native swatch follows it and can set it; Clear empties it */
+function configFormColour(box, f) {
+  const colour = configFormField(box, "color", "Colour", configFormText_("input", f.color, v => { f.color = v; }), "#rrggbb, or empty for the default colour.");
+  const [colourLabel, colourText, ...colourRest] = [...colour.children];
+  const line = configEl("div", "cfg-inline");
+  colour.replaceChildren(colourLabel, line, ...colourRest);
+  line.appendChild(colourText);
+  const swatch = configEl("input", "");
+  swatch.type = "color";
+  swatch.setAttribute("aria-label", "Pick a colour");
+  const follow = () => { if (configFullMatch(CONFIG_FORM_LIMITS.COLOR_PATTERN, f.color)) swatch.value = f.color.toLowerCase(); };
+  follow();
+  configFormEls.refresh.push(follow);
+  swatch.addEventListener("input", () => { if (configFormLocked()) return; f.color = swatch.value; colourText.value = f.color; configFormChanged(); });
+  const clear = configButton("Clear", () => { if (configFormLocked()) return; f.color = ""; colourText.value = ""; configFormChanged(); });
+  clear.setAttribute("aria-label", "Clear colour");
+  line.appendChild(swatch);
+  line.appendChild(clear);
+  configFormEls.all.push(swatch, clear);
+}
+function renderConfigForm(edit) {
+  const box = document.getElementById("configForm");
+  const f = edit.formState;
+  configFormEls = { controls: {}, hints: {}, all: [], refresh: [], first: null };
+  box.replaceChildren(configEl("legend", "", { tools: "Tool", node_types: "Node type", relationships: "Relationship" }[edit.section]));
+  const text = (parent, path, label, key, obj, help, tag = "input") =>
+    configFormField(parent, path, label, configFormText_(tag, obj[key], v => { obj[key] = v; }), help);
+  const rows = (title, list, noun, addLabel, fresh, fill) => {
+    const group = configEl("fieldset", "");
+    const legend = configEl("legend", "", title);
+    group.appendChild(legend);
+    const prefix = edit.section === "tools" ? "parameters." : "metadata.";
+    list.forEach((row, i) => {
+      const set = configEl("fieldset", "");
+      const lg = configEl("legend", "");
+      set.appendChild(lg);
+      fill(set, row, prefix + i + ".");
+      const remove = configButton("Remove", () => {
+        if (configFormLocked()) return;
+        list.splice(i, 1);
+        configFormRebuild(edit, i < list.length ? prefix + i + ".name" : prefix + "add");
+      });
+      configFormEls.all.push(remove);
+      const named = () => {
+        lg.textContent = noun[0].toUpperCase() + noun.slice(1) + " " + (i + 1) + (row.name ? ": " + row.name : "");
+        remove.setAttribute("aria-label", "Remove " + noun + " " + (row.name || i + 1));
+      };
+      named();
+      configFormEls.refresh.push(named);
+      const actions = configEl("div", "cfg-row-actions");
+      actions.appendChild(remove);
+      set.appendChild(actions);
+      group.appendChild(set);
+    });
+    const add = configButton(addLabel, () => {
+      if (configFormLocked()) return;
+      list.push(fresh());
+      configFormRebuild(edit, prefix + (list.length - 1) + ".name");
+    });
+    configFormEls.controls[prefix + "add"] = add;
+    configFormEls.all.push(add);
+    group.appendChild(add);
+    return group;
+  };
+  if (edit.section === "tools") {
+    text(box, "name", "Name", "name", f, "Lowercase letters, digits and underscores, starting with a letter." +
+      (edit.op === "replace" ? " Changing it renames the tool." : ""));
+    const desc = text(box, "description", "Description", "description", f, "", "textarea");
+    desc.children[1].rows = 3;
+    const count = desc.children[2];
+    const counted = () => { count.textContent = [...configPyStrip(f.description)].length + " / " + CONFIG_FORM_LIMITS.MAX_DESCRIPTION_LENGTH + " characters"; };
+    counted();
+    configFormEls.refresh.push(counted);
+    const cy = text(box, "cypher", "Cypher", "cypher", f, "Must filter on $repo_id; DevGraph supplies it. Read-only clauses only.", "textarea");
+    cy.children[1].className = "cfg-yaml";
+    cy.children[1].spellcheck = false;
+    cy.children[1].rows = 10;
+    const P = CONFIG_FORM_FIELDS.parameter_types.map(t => [t, t]);
+    box.appendChild(rows("Parameters", f.parameters, "parameter", "Add parameter",
+      () => ({ name: "", type: "string", required: true, default: "", description: "", open: {} }),
+      (set, p, path) => {
+        text(set, path + "name", "Name", "name", p);
+        /* Type and Required change only the Default control, in place: the
+           select keeps focus while arrow keys step through the types */
+        const holder = configEl("div", "");
+        let dflt = null;
+        const fillDefault = () => {
+          if (dflt) configFormEls.all.splice(configFormEls.all.indexOf(dflt), 1);
+          holder.replaceChildren();
+          /* typed defaults are text, kept as typed (a number input would read "" for "12abc") */
+          const open = p.open && "default" in p.open ? [configFormText(p.open.default)] : [];
+          dflt = p.type === "boolean"
+            ? configFormSelect([["", "(none)"], ["true", "true"], ["false", "false"]], p.default, open.concat(p.default).filter(v => v !== ""),
+              v => { p.default = v; configFormChanged(); })
+            : configFormText_("input", p.default, v => { p.default = v; });
+          if (p.type === "integer") dflt.inputMode = "numeric";
+          if (p.type === "float") dflt.inputMode = "decimal";
+          dflt.disabled = !!p.required;
+          configFormField(holder, path + "default", "Default", dflt, "A default makes the parameter optional.");
+        };
+        configFormField(set, path + "type", "Type", configFormSelect(P, p.type, [], v => { p.type = v; fillDefault(); configFormChanged(); }));
+        configFormField(set, path + "required", "Required", configFormCheck(p.required, v => { p.required = v; dflt.disabled = !!v; configFormChanged(); }),
+          undefined, "cfg-check");
+        fillDefault();
+        set.appendChild(holder);
+        text(set, path + "description", "Description", "description", p);
+      }));
+    const num = (key, label, dflt) => {
+      const wrap = text(box, key, label, key, f, "");
+      const el = wrap.children[1];
+      el.inputMode = "numeric";
+      el.placeholder = dflt + " (default)";
+    };
+    num("max_rows", "Max rows", CONFIG_FORM_LIMITS.DEFAULT_MAX_ROWS);
+    num("timeout_s", "Timeout (s)", CONFIG_FORM_LIMITS.DEFAULT_TIMEOUT_S);
+    configFormRefresh(edit);
+    return;
+  }
+  if (edit.section === "relationships") {
+    text(box, "type", "Type", "type", f, "Uppercase letters, digits and underscores." +
+      (edit.op === "replace" ? " Changing it renames the relationship." : ""));
+    text(box, "from", "From", "from", f, "One or more node labels, separated by commas. Each must be a node type declared in this file (or a built-in one when the file uses `extends: default`).");
+    text(box, "to", "To", "to", f, "One node label: a node type declared in this file (or a built-in one when the file uses `extends: default`).");
+    const names = { builtin: "Built-in type", custom: "Custom provider", filesystem: "Filesystem (file → parent folder)" };
+    /* Provider changes only the custom name field, in place: the select keeps
+       focus while arrow keys step through the providers */
+    const holder = configEl("div", "");
+    let custom = null;
+    const fillCustom = () => {
+      if (custom) configFormEls.all.splice(configFormEls.all.indexOf(custom), 1);
+      delete configFormEls.controls.custom;
+      delete configFormEls.hints.custom;
+      holder.replaceChildren();
+      custom = null;
+      /* empty, the holder would still take a flex gap */
+      holder.style.display = f.provider === "custom" ? "" : "none";
+      if (f.provider !== "custom") return;
+      custom = configFormText_("input", f.custom, v => { f.custom = v; });
+      configFormField(holder, "custom", "Custom provider name", custom, "Recorded as data; DevGraph does not run it.");
+    };
+    configFormField(box, "provider", "Provider", configFormSelect(CONFIG_FORM_FIELDS.relationship_providers.map(p => [p, names[p]]), f.provider, [],
+      v => { f.provider = v; fillCustom(); configFormChanged(); }));
+    box.appendChild(holder);
+    fillCustom();
+    configFormColour(box, f);
+    configFormRefresh(edit);
+    return;
+  }
+  text(box, "label", "Label", "label", f, "Letters, digits and underscores, starting with a letter; built-in labels are refused.");
+  const desc = text(box, "description", "Description", "description", f, undefined, "textarea");
+  desc.children[1].rows = 2;
+  configFormColour(box, f);
+  const kinds = [["", "None (declared only)"], ...CONFIG_FORM_FIELDS.filesystem_kinds.map(k => [k, "Filesystem — " + k])];
+  configFormField(box, "source", "Source", configFormSelect(kinds, f.source, [], v => { f.source = v; configFormChanged(); }));
+  const M = CONFIG_FORM_FIELDS.metadata_types.map(t => [t, t]);
+  const meta = rows("Metadata", f.metadata, "field", "Add field",
+    () => ({ name: "", type: "string", required: false, key: false, description: "", open: {} }),
+    (set, m, path) => {
+      text(set, path + "name", "Name", "name", m);
+      configFormField(set, path + "type", "Type", configFormSelect(M, m.type, [], v => { m.type = v; configFormChanged(); }));
+      configFormField(set, path + "required", "Required", configFormCheck(m.required, v => { m.required = v; configFormChanged(); }),
+        undefined, "cfg-check");
+      const key = configFormCheck(m.key, v => { m.key = v; configFormChanged(); });
+      configFormField(set, path + "key", "Key", key, "The key is the ticked fields, in this order.", "cfg-check");
+      key.setAttribute("aria-describedby", key.getAttribute("aria-describedby") + " configFormKeyHint");
+      text(set, path + "description", "Description", "description", m);
+    });
+  const keyHint = configEl("div", "cfg-hint");
+  keyHint.id = "configFormKeyHint";
+  keyHint.style.display = "none";
+  meta.appendChild(keyHint);
+  configFormEls.hints.key = keyHint;
+  box.appendChild(meta);
+  configFormRefresh(edit);
+}
+/* ── end Config page ── */
+document.getElementById("btnConfigReload").addEventListener("click", () => loadConfigPage());
+document.addEventListener("keydown", configModalKey);
 
 /* ── register-repo form (Repos pane) ──────────────────────────────────
    POSTs to /api/repos, which runs the same add-then-initial-scan the CLI's
@@ -2856,12 +4694,16 @@ document.getElementById("btnCopyNeoconf").addEventListener("click", async () => 
 renderNeoconfSnippet();
 
 /* ── autocomplete for the cypher box ──────────────────────────────── */
-const AC_CANDIDATES = [
+/* a function, not a constant: the label/relationship half follows the
+   selected repository's schema */
+function acCandidates() {
+  return [
   ...NODE_TYPES.map(t => ({ text: t.id, kind: "label" })),
   ...REL_TYPES.map(r => ({ text: r, kind: "rel" })),
   ...["MATCH","OPTIONAL MATCH","WHERE","RETURN","LIMIT","WITH","ORDER BY","AND","OR","AS","COUNT","DISTINCT","CONTAINS"].map(k => ({ text: k, kind: "keyword" })),
   ...["repo_id","name","type"].map(p => ({ text: p, kind: "prop" })),
-];
+  ];
+}
 const ac = document.getElementById("autocomplete");
 let acItems = [], acIndex = -1;
 function currentWordRange() {
@@ -2870,7 +4712,7 @@ function currentWordRange() {
   return { start, end: pos, word: val.slice(start, pos) };
 }
 function renderAC() {
-  ac.innerHTML = acItems.map((it,i) => `<div class="ac-item${i===acIndex?' active':''}" data-i="${i}"><span>${it.text}</span><span class="k">${it.kind}</span></div>`).join("");
+  ac.innerHTML = acItems.map((it,i) => `<div class="ac-item${i===acIndex?' active':''}" data-i="${i}"><span>${escapeHtmlVal(it.text)}</span><span class="k">${it.kind}</span></div>`).join("");
   ac.classList.toggle("show", acItems.length > 0);
 }
 function selectAC(i) {
@@ -2886,7 +4728,7 @@ function selectAC(i) {
 cypherInput.addEventListener("input", () => {
   const { word } = currentWordRange();
   if (word.length < 1) { acItems = []; acIndex = -1; renderAC(); return; }
-  acItems = AC_CANDIDATES.filter(c => c.text.toLowerCase().startsWith(word.toLowerCase())).slice(0, 8);
+  acItems = acCandidates().filter(c => c.text.toLowerCase().startsWith(word.toLowerCase())).slice(0, 8);
   acIndex = acItems.length ? 0 : -1;
   renderAC();
 });
@@ -3208,54 +5050,166 @@ document.querySelectorAll('#gitViewToggle button').forEach(btn => btn.addEventLi
   if (isTree) renderGitTree();
 }));
 
-/* ── Database & memory / Query telemetry / Community — attempted live,
+/* ── Database & memory / Query telemetry — attempted live,
    graceful labeled fallback per the no-fabrication rule if the underlying
    procedure isn't available on this Neo4j build. ── */
-function setMemNote(reason) {
-  document.getElementById("memNote").textContent = reason;
+const MEM_POLL_MS = 15000;
+let memPollTimer = null;
+/* Card-side wording for the server's store `reason` codes. */
+const STORE_REASONS = {
+  not_configured: "it needs DEVGRAPH_NEO4J_DATA_DIR pointing at Neo4j's data directory",
+  unreadable: "the Neo4j data directory could not be read",
+};
+function formatMemBytes(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "GB";
+  if (n >= 1e6) return (n / 1e6).toFixed(0) + "MB";
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + "KB";
+  return n + "B";
 }
-/* The card must never show a number it can't stand behind, so every way the
-   reading can be missing -- server says unavailable, HTTP error, network
-   failure, unparseable body, values that can't form a meter, or a boot that
-   never got as far as asking -- lands here, dashed and labelled, rather than
-   on a partly-filled bar or a stuck "Checking…". `reason` names which one,
-   in the card's own words; it is never backend error text. */
-function setHeapUnavailable(reason) {
-  const why = reason || "the server returned no usable java.lang:type=Memory reading";
-  const val = document.getElementById("heapVal");
-  val.textContent = "—";
-  val.classList.add("dim");
-  document.getElementById("heapMeter").style.width = "0%";
+function setMemNote(text) {
+  document.getElementById("memNote").textContent = text;
+}
+/* One value cell: real text undims it, null puts the dash back. */
+function memVal(id, text, dash = "—") {
+  const el = document.getElementById(id);
+  if (text === null) { el.textContent = dash; el.classList.add("dim"); }
+  else { el.textContent = text; el.classList.remove("dim"); }
+}
+/* Each render* takes one group of the server's snapshot and returns whether
+   it went live. Number.isFinite, not Number(): a string or null from an
+   unexpected server build must read as no value, not coerce into one. */
+function renderHeap(heap) {
+  const used = heap?.used_bytes, heapMax = heap?.max_bytes, percent = heap?.used_percent;
+  const ok = heap?.available === true && Number.isFinite(used) && Number.isFinite(heapMax) &&
+    Number.isFinite(percent) && used > 0 && heapMax > 0 && used <= heapMax;
+  memVal("heapVal", ok ? `${(used/1e6).toFixed(0)}MB / ${(heapMax/1e6).toFixed(0)}MB` : null);
+  document.getElementById("heapMeter").style.width = ok ? Math.min(100, Math.max(0, percent)) + "%" : "0%";
+  return ok;
+}
+function renderSystem(sys) {
+  const total = sys?.ram_total_bytes, free = sys?.ram_free_bytes;
+  const ok = sys?.available === true && Number.isFinite(total) && Number.isFinite(free) &&
+    total > 0 && free >= 0 && free <= total;
+  memVal("ramVal", ok ? `${formatMemBytes(total - free)} / ${formatMemBytes(total)}` : null);
+  document.getElementById("ramMeter").style.width = ok ? Math.round((total - free) / total * 1000) / 10 + "%" : "0%";
+  const st = sys?.swap_total_bytes, sf = sys?.swap_free_bytes;
+  const swapOk = ok && Number.isFinite(st) && Number.isFinite(sf) && st >= 0 && sf >= 0 && sf <= st;
+  memVal("swapVal", !swapOk ? null : st === 0 ? "no swap" : `${formatMemBytes(st - sf)} / ${formatMemBytes(st)}`);
+  const pct = v => (Number.isFinite(v) && v >= 0 && v <= 1) ? (v * 100).toFixed(0) + "%" : null;
+  const p = pct(sys?.process_cpu_load), s = pct(sys?.system_cpu_load);
+  memVal("cpuVal", ok && (p || s) ? `${p ?? "—"} / ${s ?? "—"}` : null, "— / —");
+  return ok;
+}
+function renderGc(gc) {
+  const n = gc?.collection_count, ms = gc?.collection_time_ms;
+  const ok = gc?.available === true && Number.isFinite(n) && Number.isFinite(ms) && n >= 0 && ms >= 0;
+  memVal("gcVal", ok ? `${n} / ${(ms / 1000).toFixed(1)}s` : null);
+  return ok;
+}
+function renderPagecache(pc) {
+  const v = pc?.configured;
+  const ok = pc?.available === true && typeof v === "string" && v.trim() !== "";
+  memVal("pageCacheVal", ok ? v : null);
+  return ok;
+}
+function renderStore(store) {
+  const g = store?.graph_bytes, t = store?.tx_log_bytes, total = store?.total_bytes;
+  const ok = store?.available === true && Number.isFinite(g) && Number.isFinite(t) &&
+    Number.isFinite(total) && g >= 0 && t >= 0 && total === g + t;
+  memVal("storeSizeVal", ok ? formatMemBytes(total) : null);
+  document.getElementById("storeSplitVal").textContent =
+    ok ? `graph ${formatMemBytes(g)} · transaction logs ${formatMemBytes(t)}` : "";
+  return ok;
+}
+/* The whole request failed: nothing on the card can be stood behind. `why`
+   is the card's own wording, never backend error text. */
+function setMemUnavailable(why) {
+  for (const render of [renderHeap, renderSystem, renderGc, renderPagecache, renderStore]) render(null);
   const pill = document.getElementById("memPill");
   pill.textContent = "Unavailable";
   pill.className = "sample-pill";
-  pill.title = "JVM heap unavailable — " + why;
-  setMemNote(`JVM heap unavailable — ${why}, so heap stays dashed rather than estimated. Page cache hit ratio and store size need APOC and are not wired.`);
+  pill.title = "Database and memory stats unavailable — " + why;
+  setMemNote(`Database and memory stats unavailable — ${why}, so every value stays dashed rather than estimated.`);
 }
-async function attemptMemoryMetrics() {
+/* opts.neo4jDown: boot already knows Neo4j didn't answer, so the Neo4j
+   groups are shown as unreachable whatever the server sent; store size is
+   read from disk and can still be live. Later polls trust the server. */
+async function attemptMemoryMetrics(opts = {}) {
+  const down = opts.neo4jDown === true;
+  let stats;
   try {
-    /* /api/database-stats, not the Cypher console endpoint: the JMX result
-       shape is the server's problem, and the browser gets plain numbers. */
     const res = await fetch("/api/database-stats");
     if (!res.ok) throw new Error("HTTP " + res.status);
-    const heap = (await res.json())?.heap;
-    if (!heap?.available) throw new Error("heap unavailable");
-    /* Number.isFinite, not Number(): a string or null from an unexpected
-       server build must read as no value, not coerce into one. */
-    const used = heap.used_bytes, heapMax = heap.max_bytes, percent = heap.used_percent;
-    if (!Number.isFinite(used) || !Number.isFinite(heapMax) || !Number.isFinite(percent)) throw new Error("non-numeric heap values");
-    if (used <= 0 || heapMax <= 0 || used > heapMax) throw new Error("inconsistent heap values");
-    const pct = Math.min(100, Math.max(0, percent));
-    document.getElementById("heapVal").textContent = `${(used/1e6).toFixed(0)}MB / ${(heapMax/1e6).toFixed(0)}MB`;
-    document.getElementById("heapVal").classList.remove("dim");
-    document.getElementById("heapMeter").style.width = pct + "%";
-    const pill = document.getElementById("memPill");
-    pill.textContent = "Live"; pill.className = "wired-pill";
-    pill.title = "JVM heap read live from the server's java.lang:type=Memory JMX bean";
-    setMemNote("JVM heap is live. Page cache hit ratio and store size still need APOC (apoc.monitor.pc / apoc.monitor.store) — not confirmed installed on this build.");
+    stats = await res.json();
+    if (!stats || typeof stats !== "object") throw new Error("empty body");
   } catch (e) {
-    setHeapUnavailable();
+    setMemUnavailable(down ? "Neo4j is unreachable" : "the dashboard server returned no usable reading");
+    return;
   }
+  const live = {
+    "JVM heap": renderHeap(down ? null : stats.heap),
+    "system RAM, swap and CPU": renderSystem(down ? null : stats.system),
+    "GC": renderGc(down ? null : stats.gc),
+    "page cache size": renderPagecache(down ? null : stats.pagecache),
+  };
+  const storeLive = renderStore(stats.store);
+  const missing = Object.keys(live).filter(k => !live[k]);
+  const notes = [];
+  if (missing.length) {
+    notes.push(`${missing.join(", ")} unavailable — ${down ? "Neo4j is unreachable" : "this Neo4j returned no usable reading"}, so they stay dashed rather than estimated.`);
+  }
+  if (!storeLive) notes.push(`Store size unavailable — ${STORE_REASONS[stats.store?.reason] || "no usable reading"}.`);
+  if (!notes.length) notes.push("All readings are live, sampled every 15 s.");
+  notes.push("Page cache hit ratio needs Neo4j Enterprise metrics and has no source on Community.");
+  setMemNote(notes.join(" "));
+  const anyLive = storeLive || missing.length < Object.keys(live).length;
+  const pill = document.getElementById("memPill");
+  pill.textContent = anyLive ? "Live" : "Unavailable";
+  pill.className = anyLive ? "wired-pill" : "sample-pill";
+  pill.title = anyLive
+    ? "Read live from Neo4j's JMX beans and config, and from its data directory"
+    : "No database or memory reading is available";
+}
+/* Draws one sparkline. Non-finite samples are gaps: the path is broken
+   there rather than bridged, so a stretch with Neo4j down never reads as a
+   smooth trend. Fewer than two points draws nothing. */
+function renderSpark(id, values) {
+  const canvas = document.getElementById(id);
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width = (canvas.clientWidth || 200) * 2, h = canvas.height = 56;
+  ctx.clearRect(0, 0, w, h);
+  const pts = values.map((v, i) => [i, v]).filter(([, v]) => Number.isFinite(v));
+  if (pts.length < 2) return;
+  const vs = pts.map(p => p[1]);
+  const min = Math.min(...vs), range = (Math.max(...vs) - min) || 1;
+  const span = Math.max(values.length - 1, 1), pad = 3;
+  ctx.beginPath();
+  let prev = -2;
+  for (const [i, v] of pts) {
+    const x = pad + (i / span) * (w - pad * 2), y = h - pad - ((v - min) / range) * (h - pad * 2);
+    if (i === prev + 1) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+    prev = i;
+  }
+  ctx.strokeStyle = "#7170ff"; ctx.lineWidth = 2; ctx.lineJoin = "round";
+  ctx.stroke();
+}
+async function attemptMemoryHistory() {
+  let samples = [];
+  try {
+    const res = await fetch("/api/database-stats/history?seconds=3600");
+    if (res.ok) {
+      const body = await res.json();
+      if (Array.isArray(body?.samples)) samples = body.samples;
+    }
+  } catch (e) { /* no history: sparklines stay empty, never invented */ }
+  renderSpark("heapSpark", samples.map(s => s?.heap_used_bytes));
+  renderSpark("ramSpark", samples.map(s => s?.ram_used_bytes));
+  renderSpark("storeSpark", samples.map(s => s?.store_total_bytes));
+}
+function startMemoryPolling() {
+  attemptMemoryHistory();
+  if (memPollTimer !== null) return;
+  memPollTimer = setInterval(() => { attemptMemoryMetrics(); attemptMemoryHistory(); }, MEM_POLL_MS);
 }
 async function attemptQueryTelemetry() {
   try {
@@ -3269,7 +5223,9 @@ async function attemptQueryTelemetry() {
 /* ── the MCP half of the Query telemetry card ───────────────────────────
    Reads GET /api/mcp-telemetry, the dashboard's view of what connected MCP
    clients ran in their own server processes (metadata only: timestamp, tool
-   name, duration, outcome -- no query text, arguments or repository). This
+   name, scoped tool id, origin, duration, outcome -- no query text or
+   arguments; a project tool's id names the repository its session is scoped
+   to, taken from the server's configuration, never from a call). This
    source is a local file the endpoint reads, so it works with the database
    down; nothing below touches the graph.
 
@@ -3300,27 +5256,37 @@ function mcpPercentile(sorted, p) {
    such instead of silently standing in for it. */
 function summarizeMcpTelemetry(entries) {
   if (!Array.isArray(entries)) return null;
-  const counts = new Map();
+  const counts = new Map(); // key "origin\u0000id" -> { id, tool, origin, n }
   const durations = [];
   let calls = 0, skipped = 0, errors = 0, okSample = 0;
   for (const e of entries) {
     const tool = (e && typeof e.tool === "string") ? e.tool.trim() : "";
     if (!tool) { skipped++; continue; }
     calls++;
-    counts.set(tool, (counts.get(tool) || 0) + 1);
+    const id = (typeof e.tool_id === "string" && e.tool_id.trim()) ? e.tool_id.trim() : tool;
+    const origin = typeof e.origin === "string" ? e.origin : "";
+    const key = origin + "\u0000" + id;
+    const row = counts.get(key) || { id, tool, origin, n: 0 };
+    row.n++;
+    counts.set(key, row);
     if (Number.isFinite(e.duration_ms) && e.duration_ms >= 0) durations.push(e.duration_ms);
     if (typeof e.ok === "boolean") { okSample++; if (!e.ok) errors++; }
   }
   durations.sort((a, b) => a - b);
   // ties broken by name so the same store always renders the same list
-  const top = [...counts.entries()]
-    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-    .slice(0, 3)
-    .map(([tool, n]) => `${tool.slice(0, 32)} ×${n}`);
+  const ranked = [...counts.values()]
+    .sort((a, b) => b.n - a.n || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0) || (a.origin < b.origin ? -1 : a.origin > b.origin ? 1 : 0))
+    .slice(0, 3);
+  const top = ranked.map(r => `${r.id.slice(0, 48)} ×${r.n}`);
+  const topTitles = ranked.map(r => {
+    const origin = r.origin === "unscoped" ? "(recorded before scoped ids)" : (r.origin || "unknown origin");
+    return `${r.id} ×${r.n} — wire name ${r.tool}, origin ${origin}`;
+  });
   return {
     calls,
     skipped,
     top,
+    topTitles,
     latency: durations.length ? [50, 95, 99].map(p => formatMcpMs(mcpPercentile(durations, p))).join(" / ") : null,
     latencySample: durations.length,
     errorRate: okSample ? (errors / okSample * 100).toFixed(1) + "%" : null,
@@ -3375,7 +5341,7 @@ function renderMcpTelemetry(summary) {
   const topEl = document.getElementById("mcpTopToolsVal");
   const topText = summary.top.join(" · ");
   topEl.textContent = topText;
-  topEl.title = topText; // the row can ellipsise; the hover carries it whole
+  topEl.title = summary.topTitles.join("\n"); // the row can ellipsise; the hover carries each id whole, with wire name and origin
   topEl.classList.remove("dim");
   // Per-metric independence: a populated card still dashes a metric whose own
   // sample is empty, instead of borrowing the call count for it.
@@ -3394,7 +5360,7 @@ function renderMcpTelemetry(summary) {
   pill.textContent = "MCP live";
   pill.className = "wired-pill";
   pill.title = "MCP tool-call metadata read live from the local telemetry store";
-  note.textContent = `Live MCP tool-call metadata — ${summary.calls} of up to the last 500 recorded calls, metadata only: no query text, arguments, or repository. Latency percentiles cover ${summary.latencySample} of those ${summary.calls} calls that recorded a usable duration; error rate covers ${summary.okSample} that recorded a usable outcome.` + skippedClause;
+  note.textContent = `Live MCP tool-call metadata — ${summary.calls} of up to the last 500 recorded calls, metadata only: no query text or arguments (a project tool's id names the repository its session is scoped to). Latency percentiles cover ${summary.latencySample} of those ${summary.calls} calls that recorded a usable duration; error rate covers ${summary.okSample} that recorded a usable outcome.` + skippedClause;
 }
 async function attemptMcpTelemetry() {
   /* Pre-set per step so the rendered reason is this card's description of how
@@ -3410,35 +5376,122 @@ async function attemptMcpTelemetry() {
     setMcpTelemetryUnavailable(reason);
   }
 }
-async function attemptCommunityDetection() {
-  const note = document.getElementById("communityNote");
+/* ── Graph insights: Communities card, Bridges, and the PageRank leaderboard.
+   Backed by /api/repos/{id}/insights, which the agent keeps current after
+   indexing (devgraph/analytics/insights.py). Per repository only. ── */
+function insightRowsHtml(rows) {
+  return rows.map((r, i) => `<div class="leaderboard-row"${r.title ? ` title="${escapeHtmlVal(r.title)}"` : ""}><span class="lb-rank">${i + 1}</span><span class="lb-name">${escapeHtmlVal(r.name ?? "")}${r.file ? ` <span style="color:var(--meta)">· ${escapeHtmlVal(r.file.split("/").pop())}</span>` : ""}</span><span class="lb-type">${escapeHtmlVal(r.tag ?? "")}</span><span class="lb-val">${escapeHtmlVal(r.value ?? "")}</span></div>`).join("");
+}
+function formatScore(v) {
+  return Number.isFinite(v) ? v.toFixed(3) : "—";
+}
+let insightsRequest = 0;
+function clearInsights(note, pillText) {
+  for (const id of ["communityVal", "modularityVal", "insightsAtVal"]) {
+    const el = document.getElementById(id);
+    el.textContent = "—";
+    el.classList.add("dim");
+  }
+  document.getElementById("communityList").innerHTML = "";
+  document.getElementById("bridgeList").innerHTML = "";
   const pill = document.getElementById("communityPill");
+  pill.textContent = pillText;
+  pill.className = "sample-pill";
+  document.getElementById("communityNote").textContent = note;
+}
+function renderInsights(body) {
+  if (!body?.computed) {
+    clearInsights("Not computed yet — the DevGraph agent computes insights after indexing, or press Recompute.", "Not computed");
+    return;
+  }
+  const set = (id, text) => {
+    const el = document.getElementById(id);
+    el.textContent = text;
+    el.classList.remove("dim");
+  };
+  set("communityVal", Number.isFinite(body.community_count) ? String(body.community_count) : "—");
+  set("modularityVal", Number.isFinite(body.modularity) ? body.modularity.toFixed(2) : "—");
+  set("insightsAtVal", body.computed_at ? new Date(body.computed_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—");
+  const communities = Array.isArray(body.communities) ? body.communities : [];
+  document.getElementById("communityList").innerHTML =
+    insightRowsHtml(communities.map(c => ({ name: c.label, tag: "#" + c.community, value: c.size })));
+  const bridges = Array.isArray(body.bridges) ? body.bridges : [];
+  document.getElementById("bridgeList").innerHTML = bridges.length
+    ? insightRowsHtml(bridges.map(b => ({ name: b.name, tag: (b.labels || [])[0] || "", value: formatScore(b.score), file: b.file, title: b.file })))
+    : `<div class="count-note">No dependency edges to rank.</div>`;
+  const keyNodes = Array.isArray(body.key_nodes) ? body.key_nodes : [];
+  if (keyNodes.length && !state.isolatedEntity) {
+    document.getElementById("godNodes").innerHTML =
+      insightRowsHtml(keyNodes.map(k => ({ name: k.name, tag: (k.labels || [])[0] || "", value: formatScore(k.score), file: k.file, title: k.file })));
+    document.getElementById("godNodesBasis").textContent = "PageRank";
+  }
+  const pill = document.getElementById("communityPill");
+  pill.textContent = "Live";
+  pill.className = "wired-pill";
+  document.getElementById("communityNote").textContent = communities.length
+    ? `Louvain over dependency and containment edges across ${body.node_count} nodes.`
+    : "No dependency structure found in this repository yet.";
+}
+async function loadInsights() {
+  const repo = document.getElementById("repoSelect").value;
+  const btn = document.getElementById("btnRecomputeInsights");
+  const ticket = ++insightsRequest;
+  if (!repo || repo === "__all__") {
+    btn.disabled = true;
+    clearInsights("Select a single repository to see its communities, key nodes and bridges.", "All repos");
+    return;
+  }
+  btn.disabled = false;
+  let body;
   try {
-    const check = await runCypher("CALL gds.list() YIELD name RETURN count(*) AS n");
-    if (check.errors?.length) throw new Error("no gds");
-    pill.textContent = "GDS detected"; pill.className = "wired-pill";
-    note.textContent = "GDS detected — Louvain run not triggered automatically (can be expensive on a large graph). Run it from Settings when ready.";
+    const res = await fetch(`/api/repos/${encodeURIComponent(repo)}/insights`);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    body = await res.json();
   } catch (e) {
-    pill.textContent = "Not wired"; pill.className = "sample-pill";
-    note.textContent = "GDS plugin not detected on this Neo4j instance — community partitioning stays a placeholder until it's installed.";
-    document.getElementById("communityVal").textContent = "—";
+    if (ticket === insightsRequest) clearInsights("Graph insights are unavailable right now — the graph could not be read.", "Unavailable");
+    return;
+  }
+  if (ticket !== insightsRequest) return; // a newer repo switch superseded this one
+  renderInsights(body);
+}
+async function recomputeInsights() {
+  const repo = document.getElementById("repoSelect").value;
+  if (!repo || repo === "__all__") return;
+  const btn = document.getElementById("btnRecomputeInsights");
+  const note = document.getElementById("communityNote");
+  btn.disabled = true;
+  note.textContent = "Recomputing…";
+  try {
+    const res = await fetch(`/api/repos/${encodeURIComponent(repo)}/insights`, { method: "POST" });
+    if (res.status === 409) {
+      note.textContent = "Already being computed — the result appears when it finishes.";
+      return;
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const body = await res.json();
+    if (document.getElementById("repoSelect").value === repo) renderInsights(body);
+  } catch (e) {
+    note.textContent = "Recompute failed — the graph could not be read.";
+  } finally {
+    btn.disabled = false;
   }
 }
+document.getElementById("btnRecomputeInsights").addEventListener("click", recomputeInsights);
 
 /* ── Graph topology: baked directly into the entity/relationship floating
    panels rather than a separate card. Node/edge counts by label overwrite
    the existing count rows/chips with real live numbers; the god-node
-   leaderboard is a real plain-Cypher degree count (no GDS needed for that
-   part — only Louvain/PageRank need the plugin, handled separately above). ── */
+   leaderboard starts as a plain-Cypher degree count; loadInsights swaps in
+   PageRank when graph insights are computed. ── */
 async function loadTopologyCounts() {
   const entityPill = document.getElementById("entityLivePill");
   const relPill = document.getElementById("relSamplePill");
   if (!neo4jConnected) { entityPill.style.display = "none"; relPill.textContent = "Not wired"; relPill.className = "sample-pill"; return; }
   const repo = document.getElementById("repoSelect").value;
-  const isolatedEntityId = state.isolatedEntity ? NODE_TYPES.find(t => t.cat === state.isolatedEntity)?.id : null;
+  const isolatedEntityId = state.isolatedEntity;
   const nodeFilters = [];
   if (repo !== "__all__") nodeFilters.push(`n.repo_id = "${escapeCypherStr(repo)}"`);
-  if (isolatedEntityId) nodeFilters.push(`labels(n)[0] = "${isolatedEntityId}"`);
+  if (isolatedEntityId) nodeFilters.push(`labels(n)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
   const where = nodeFilters.length ? `WHERE ${nodeFilters.join(" AND ")} ` : "";
   try {
     /* filtered by whatever's currently isolated -- these panels describe
@@ -3448,7 +5501,7 @@ async function loadTopologyCounts() {
     if (!labelJson.errors?.length) {
       const counts = Object.fromEntries(labelJson.results[0].data.map(d => [d.row[0], d.row[1]]));
       NODE_TYPES.forEach(t => {
-        const row = entityCounts.querySelector(`.count-row[data-cat="${t.cat}"] .val`);
+        const row = entityCounts.querySelector(`.count-row[data-label="${CSS.escape(t.id)}"] .val`);
         if (!row) return;
         const n = counts[t.id];
         if (n !== undefined) { row.textContent = n.toLocaleString(); row.classList.remove("na"); }
@@ -3477,7 +5530,7 @@ async function loadTopologyCounts() {
     }
     const relFilters = [];
     if (repo !== "__all__") relFilters.push(`a.repo_id = "${escapeCypherStr(repo)}"`);
-    if (isolatedEntityId) relFilters.push(`labels(a)[0] = "${isolatedEntityId}"`);
+    if (isolatedEntityId) relFilters.push(`labels(a)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
     const relWhere = relFilters.length ? `WHERE ${relFilters.join(" AND ")} ` : "";
     const relJson = await runCypher(`MATCH (a)-[r]->() ${relWhere}RETURN type(r) AS t, count(*) AS n`);
     if (!relJson.errors?.length) {
@@ -3522,21 +5575,13 @@ async function loadTopologyCounts() {
     const godEl = document.getElementById("godNodes");
     if (!godJson.errors?.length && godJson.results[0].data.length) {
       godEl.innerHTML = godJson.results[0].data.map((d,i) => `<div class="leaderboard-row"><span class="lb-rank">${i+1}</span><span class="lb-name">${escapeHtmlVal(d.row[0])}</span><span class="lb-type">${escapeHtmlVal(d.row[1]||"")}</span><span class="lb-val">${d.row[2]}</span></div>`).join("");
+      document.getElementById("godNodesBasis").textContent = "degree";
     } else {
       godEl.innerHTML = `<div class="count-note">No nodes for this scope yet.</div>`;
+      document.getElementById("godNodesBasis").textContent = "degree";
     }
   } catch (e) { /* left at static/sample values — next repo switch or reconnect retries */ }
 }
-
-const mcpToolList = document.getElementById("mcpToolList");
-async function loadMcpTools() {
-  try {
-    const tools = await fetch("/api/mcp-tools").then(r => r.json());
-    mcpToolList.innerHTML = "";
-    tools.forEach(t => { const row = document.createElement("div"); row.className = "tool-row"; row.innerHTML = `<span class="tool-name">${escapeHtmlVal(t.name)}</span><span class="tool-desc">${escapeHtmlVal(t.description || "")}</span><label class="switch"><input type="checkbox" checked/><span class="track"></span><span class="thumb"></span></label>`; mcpToolList.appendChild(row); });
-  } catch (e) { /* left empty — pane still usable, just no rows */ }
-}
-loadMcpTools();
 
 /* ── settings panes: display real current config (GET /api/settings) instead
    of the literal values baked into the HTML. Every field here stays
@@ -3551,8 +5596,6 @@ async function loadDashboardSettings() {
     setVal("cfgNeo4jUser", s.neo4j_user);
     setVal("cfgDashboardHost", s.dashboard_host);
     setVal("cfgDashboardPort", s.dashboard_port);
-    const cypherToggle = document.getElementById("toggleCypher");
-    if (cypherToggle) cypherToggle.checked = !!s.enable_run_cypher;
     const globalFields = {
       telemetry_enabled: s.telemetry_enabled,
       cloud_sync: s.cloud_sync,

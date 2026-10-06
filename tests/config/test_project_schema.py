@@ -22,6 +22,7 @@ import pytest
 
 from devgraph.config import project_schema
 from devgraph.config.project_schema import (
+    ABSENT_SCHEMA_HASH,
     EXTENDS_MODES,
     LABEL_PATTERN,
     MAX_IDENTIFIER_LENGTH,
@@ -37,6 +38,7 @@ from devgraph.config.project_schema import (
     project_schema_path,
     resolve_declaration,
     resolve_effective_schema,
+    schema_file_hash,
 )
 from devgraph.graph.schema import (
     NODE_LABELS,
@@ -102,6 +104,27 @@ def test_resolving_no_declaration_matches_the_missing_file_path(tmp_path):
 def test_project_schema_path_is_the_repo_root_file(tmp_path):
     assert project_schema_path(tmp_path) == tmp_path / SCHEMA_FILENAME
     assert SCHEMA_FILENAME == "devgraph.schema.yaml"
+
+
+def test_schema_file_symlinked_outside_the_repo_is_refused(tmp_path):
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("version: 1\nmarker_outside_content: true\n", encoding="utf-8")
+    (repo / SCHEMA_FILENAME).symlink_to(outside)
+
+    with pytest.raises(ProjectSchemaError, match="must be inside the repository") as excinfo:
+        load_project_schema(repo)
+    assert "marker_outside_content" not in str(excinfo.value)
+    assert str(outside) not in str(excinfo.value)
+
+
+def test_schema_file_symlinked_within_the_repo_loads(tmp_path):
+    (tmp_path / "config").mkdir()
+    write_schema(tmp_path / "config", WIDGET)
+    (tmp_path / SCHEMA_FILENAME).symlink_to(tmp_path / "config" / SCHEMA_FILENAME)
+
+    assert load_project_schema(tmp_path) is not None
 
 
 # --- Acceptance 2: extends resolution ------------------------------------
@@ -1078,3 +1101,307 @@ def test_builtin_constraint_names_are_all_recoverable():
     names = project_schema._builtin_constraint_names()
 
     assert len(names) == len(constraint_statements())
+
+
+# --- Filesystem provider (worktree example) --------------------------------
+
+WORKTREE = """
+    version: 1
+    node_types:
+      - label: File
+        key: [path]
+        metadata: [{name: path}]
+        source: {provider: filesystem, kind: file}
+      - label: Folder
+        key: [path]
+        metadata: [{name: path}]
+        source: {provider: filesystem, kind: folder}
+    relationships:
+      - type: IS_CHILD_OF
+        provider: filesystem
+        from: [File, Folder]
+        to: Folder
+"""
+
+
+def test_worktree_example_loads_and_resolves(tmp_path):
+    effective = resolve_effective_schema(write_schema(tmp_path, WORKTREE))
+    assert {"File", "Folder"} <= set(effective.node_labels)
+    assert "IS_CHILD_OF" in effective.relationship_types
+    (relationship,) = effective.relationships
+    assert relationship.provider == "filesystem"
+    assert relationship.from_labels == ("File", "Folder")
+    kinds = {n.label: (n.source.provider, n.source.kind) for n in effective.node_types}
+    assert kinds == {"File": ("filesystem", "file"), "Folder": ("filesystem", "folder")}
+
+
+def test_a_single_from_label_is_still_accepted(tmp_path):
+    effective = resolve_effective_schema(write_schema(tmp_path, WORKTREE.replace("from: [File, Folder]", "from: File")))
+    assert effective.relationships[0].from_labels == ("File",)
+
+
+def test_filesystem_node_types_must_be_keyed_on_path(tmp_path):
+    text = WORKTREE.replace(
+        "      - label: File\n        key: [path]\n        metadata: [{name: path}]",
+        "      - label: File\n        key: [slug]\n        metadata: [{name: slug}]",
+    )
+    with pytest.raises(ProjectSchemaError, match=r"key must be exactly \[path\]"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_filesystem_path_must_be_a_string(tmp_path):
+    text = WORKTREE.replace(
+        "      - label: File\n        key: [path]\n        metadata: [{name: path}]",
+        "      - label: File\n        key: [path]\n        metadata: [{name: path, type: integer}]",
+    )
+    with pytest.raises(ProjectSchemaError, match="must be a string"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_at_most_one_node_type_per_filesystem_kind(tmp_path):
+    text = WORKTREE.replace(
+        "    relationships:",
+        "      - label: Doc\n        key: [path]\n        metadata: [{name: path}]\n"
+        "        source: {provider: filesystem, kind: file}\n    relationships:",
+    )
+    with pytest.raises(ProjectSchemaError, match="both filesystem file types"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_filesystem_relationship_must_point_to_the_folder_type(tmp_path):
+    with pytest.raises(ProjectSchemaError, match="must point to the filesystem folder node type"):
+        load_project_schema(write_schema(tmp_path, WORKTREE.replace("to: Folder", "to: File")))
+
+
+def test_filesystem_relationship_needs_a_folder_type(tmp_path):
+    text = """
+        version: 1
+        node_types:
+          - label: File
+            key: [path]
+            metadata: [{name: path}]
+            source: {provider: filesystem, kind: file}
+        relationships:
+          - type: IS_CHILD_OF
+            provider: filesystem
+            from: File
+            to: File
+    """
+    with pytest.raises(ProjectSchemaError, match="none is declared"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_filesystem_relationship_children_must_be_filesystem_types(tmp_path):
+    text = WORKTREE.replace("from: [File, Folder]", "from: [File, Widget]").replace(
+        "    relationships:",
+        "      - label: Widget\n        key: [slug]\n        metadata: [{name: slug}]\n    relationships:",
+    )
+    with pytest.raises(ProjectSchemaError, match="'Widget' is not a filesystem node type"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_filesystem_relationship_rejects_a_custom_block(tmp_path):
+    text = WORKTREE.replace("        to: Folder", "        to: Folder\n        custom: {name: tree}")
+    with pytest.raises(ProjectSchemaError, match="filesystem provider, which must not declare a custom block"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_filesystem_relationship_cannot_reuse_a_builtin_type(tmp_path):
+    with pytest.raises(ProjectSchemaError, match="cannot be redeclared by the filesystem provider"):
+        load_project_schema(write_schema(tmp_path, WORKTREE.replace("type: IS_CHILD_OF", "type: CONTAINS")))
+
+
+def test_at_most_one_filesystem_relationship(tmp_path):
+    # Same indentation as WORKTREE's own relationship items (6 spaces).
+    text = WORKTREE + (
+        "      - type: IN_FOLDER\n"
+        "        provider: filesystem\n"
+        "        from: File\n"
+        "        to: Folder\n"
+    )
+    with pytest.raises(ProjectSchemaError, match="at most one filesystem relationship"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+@pytest.mark.parametrize("from_value", ["[]", "[File, File]"])
+def test_relationship_from_list_must_be_non_empty_and_unique(tmp_path, from_value):
+    with pytest.raises(ProjectSchemaError):
+        load_project_schema(write_schema(tmp_path, WORKTREE.replace("[File, Folder]", from_value)))
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["{provider: git, kind: file}", "{provider: filesystem, kind: symlink}", "{provider: filesystem}"],
+)
+def test_unknown_node_sources_are_rejected(tmp_path, source):
+    text = WORKTREE.replace("{provider: filesystem, kind: file}", source)
+    with pytest.raises(ProjectSchemaError):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_extractor_is_a_reserved_property(tmp_path):
+    assert "extractor" in RESERVED_NODE_PROPERTIES
+    # WIDGET's metadata list items sit at 10 spaces; this adds a second one.
+    text = WIDGET + "          - name: extractor\n"
+    with pytest.raises(ProjectSchemaError, match="reserved"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_every_label_in_a_from_list_must_resolve(tmp_path):
+    text = """
+        version: 1
+        node_types:
+          - label: Widget
+            key: [slug]
+            metadata: [{name: slug}]
+        relationships:
+          - type: LINKS
+            provider: custom
+            custom: {name: linker}
+            from: [Widget, Gadget]
+            to: Widget
+    """
+    with pytest.raises(ProjectSchemaError, match="'Gadget' is not a node label"):
+        resolve_effective_schema(write_schema(tmp_path, text))
+
+
+def test_json_schema_describes_node_sources_and_list_from():
+    defs = project_schema_json_schema()["$defs"]
+    assert defs["NodeSource"]["properties"]["kind"]["enum"] == ["file", "folder"]
+    assert "source" in defs["NodeTypeDecl"]["properties"]
+    from_schema = defs["RelationshipDecl"]["properties"]["from"]
+    assert {variant.get("type") for variant in from_schema["anyOf"]} == {"string", "array"}
+
+
+def test_filesystem_types_get_a_repo_name_index_beside_their_key_constraint(tmp_path):
+    effective = resolve_effective_schema(write_schema(tmp_path, WORKTREE))
+    statements = effective.constraint_statements()
+    builtin = constraint_statements()
+
+    assert statements[: len(builtin)] == builtin
+    assert statements[len(builtin) :] == [
+        "CREATE CONSTRAINT file_repo_key IF NOT EXISTS "
+        "FOR (n:File) REQUIRE (n.repo_id, n.path) IS UNIQUE",
+        "CREATE INDEX file_repo_name IF NOT EXISTS FOR (n:File) ON (n.repo_id, n.name)",
+        "CREATE CONSTRAINT folder_repo_key IF NOT EXISTS "
+        "FOR (n:Folder) REQUIRE (n.repo_id, n.path) IS UNIQUE",
+        "CREATE INDEX folder_repo_name IF NOT EXISTS FOR (n:Folder) ON (n.repo_id, n.name)",
+    ]
+
+
+def test_types_without_a_source_get_no_index(tmp_path):
+    effective = resolve_effective_schema(write_schema(tmp_path, WORKTREE))
+    plain = resolve_effective_schema(
+        write_schema(
+            tmp_path,
+            """
+            version: 1
+            node_types:
+              - label: Widget
+                key: [slug]
+                metadata: [{name: slug}]
+            """,
+        )
+    )
+
+    assert not any("CREATE INDEX" in s for s in plain.constraint_statements())
+    assert any("CREATE INDEX" in s for s in effective.constraint_statements())
+
+
+def test_a_generated_index_name_may_not_collide_with_an_existing_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(project_schema, "_builtin_constraint_names", lambda: {"file_repo_name"})
+    with pytest.raises(ProjectSchemaError, match="file_repo_name"):
+        resolve_effective_schema(write_schema(tmp_path, WORKTREE))
+
+
+def test_schema_file_hash_tracks_content(tmp_path):
+    assert schema_file_hash(tmp_path) == ABSENT_SCHEMA_HASH
+    write_schema(tmp_path, WIDGET)
+    first = schema_file_hash(tmp_path)
+    assert first.startswith("sha256:") and len(first) == len("sha256:") + 64
+    assert schema_file_hash(tmp_path) == first
+    (tmp_path / SCHEMA_FILENAME).write_text("version: 1\n")
+    assert schema_file_hash(tmp_path) != first
+
+
+def test_an_unreadable_schema_never_hashes_like_a_real_one(tmp_path):
+    (tmp_path / SCHEMA_FILENAME).mkdir()
+    value = schema_file_hash(tmp_path)
+    assert value.startswith("unreadable:") and value != ABSENT_SCHEMA_HASH
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["version: 1\nnode_types:\n  - label: X\n    description: 2001-13-45\n", "version: 1\nnode_types: " + "[" * 5000 + "\n"],
+    ids=["bad date", "deep nesting"],
+)
+def test_any_yaml_load_failure_is_a_schema_error(tmp_path, text):
+    (tmp_path / SCHEMA_FILENAME).write_text(text, encoding="utf-8")
+    with pytest.raises(ProjectSchemaError, match="malformed YAML"):
+        load_project_schema(tmp_path)
+
+
+def test_parse_project_schema_matches_loader_errors(tmp_path):
+    path = tmp_path / SCHEMA_FILENAME
+    text = "version: [unclosed\n"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ProjectSchemaError) as via_loader:
+        load_project_schema(tmp_path)
+    with pytest.raises(ProjectSchemaError) as via_parse:
+        project_schema.parse_project_schema(text, path)
+    assert str(via_parse.value) == str(via_loader.value)
+    assert "malformed YAML" in str(via_parse.value)
+    assert project_schema.parse_project_schema(textwrap.dedent(WIDGET), path).node_types[0].label == "Widget"
+
+
+# --- Display colour -------------------------------------------------------
+
+COLOURED = """
+    version: 1
+    node_types:
+      - label: Widget
+        color: "{node}"
+        key: [slug]
+        metadata:
+          - name: slug
+    relationships:
+      - type: USES
+        color: "{rel}"
+        from: Widget
+        to: Module
+"""
+
+
+def test_colour_is_accepted_on_node_type_and_relationship(tmp_path):
+    repo = write_schema(tmp_path, COLOURED.format(node="#1f77b4", rel="#AbCdEf"))
+    declaration = load_project_schema(repo)
+    assert declaration.node_types[0].color == "#1f77b4"
+    assert declaration.relationships[0].color == "#AbCdEf"
+
+
+def test_colour_defaults_to_none(tmp_path):
+    declaration = load_project_schema(write_schema(tmp_path, WIDGET))
+    assert declaration.node_types[0].color is None
+
+
+@pytest.mark.parametrize("bad", ["blue", "#12345", "#gggggg", "#1234567"])
+@pytest.mark.parametrize("where", ["node", "rel"])
+def test_bad_colour_is_rejected_naming_field_and_format(tmp_path, bad, where):
+    good = "#1f77b4"
+    repo = write_schema(
+        tmp_path,
+        COLOURED.format(node=bad if where == "node" else good, rel=bad if where == "rel" else good),
+    )
+    with pytest.raises(ProjectSchemaError, match=r"color: .*#rrggbb"):
+        load_project_schema(repo)
+
+
+def test_json_schema_documents_colour_pattern():
+    defs = project_schema_json_schema()["$defs"]
+    for name in ("NodeTypeDecl", "RelationshipDecl"):
+        branches = defs[name]["properties"]["color"]["anyOf"]
+        assert any(b.get("pattern") == "^#[0-9a-fA-F]{6}$" for b in branches)
+
+
+def test_starter_template_mentions_colour():
+    assert 'color: "#1f77b4"' in project_schema.starter_schema_text()

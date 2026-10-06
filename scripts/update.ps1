@@ -31,7 +31,7 @@ Write-Step "Was the tray app running?"
 $venvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 $wasRunning = $false
 if (Test-Path $venvPython) {
-    & $venvPython -m devgraph.cli.main tray status | Out-Null
+    & $venvPython -P -m devgraph.cli.main tray status | Out-Null
     $wasRunning = ($LASTEXITCODE -eq 0)
 }
 if ($wasRunning) { Write-Ok "running - will restart after update" } else { Write-Info "not running" }
@@ -46,7 +46,7 @@ Write-Ok "up to date"
 
 if ($wasRunning) {
     Write-Step "Stopping tray app for reinstall"
-    & $venvPython -m devgraph.cli.main tray stop | Out-Host
+    & $venvPython -P -m devgraph.cli.main tray stop | Out-Host
 }
 
 Write-Step "Reinstalling dependencies and verifying environment"
@@ -68,7 +68,7 @@ $coreSucceeded = Invoke-BootstrapCore -RepoRoot $RepoRoot -PodmanPath $podmanPat
 
 if ($wasRunning) {
     Write-Step "Restarting tray app"
-    & $venvPython -m devgraph.cli.main tray start | Out-Host
+    & $venvPython -P -m devgraph.cli.main tray start | Out-Host
 }
 
 if (-not $coreSucceeded) {

@@ -1,10 +1,10 @@
 """Container extractor for parsing Containerfile, Dockerfile, and docker-compose/podman-compose files."""
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
-import re
+from typing import List, Optional
 
-import yaml
+from devgraph.config.project_tools import YAML_LOAD_ERRORS
+from devgraph.config.yaml_bound import YAML_MAX_NODES, bounded_safe_load
 
 
 @dataclass
@@ -142,8 +142,8 @@ class ContainerExtractor:
         result = ExtractionResult()
 
         try:
-            compose_data = yaml.safe_load(content)
-        except yaml.YAMLError:
+            compose_data = bounded_safe_load(content, YAML_MAX_NODES)
+        except YAML_LOAD_ERRORS:
             # Return empty result if YAML is malformed
             return result
 

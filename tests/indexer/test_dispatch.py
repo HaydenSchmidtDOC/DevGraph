@@ -4,12 +4,18 @@ that was previously missing entirely: extractors existed but nothing called
 them from add/rescan/watch.
 """
 
+import json
+import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 from pathlib import Path
 
 import pytest
 
 from devgraph.graph.engine import GraphEngine
+from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 
 
@@ -176,10 +182,45 @@ class TestIndexPaths:
         finally:
             engine.delete_repository(repo_id)
 
+    def test_sibling_directory_sharing_the_repo_name_prefix_is_skipped(self, engine):
+        repo_id = "_smoketest_dispatch_sibling_prefix"
+        with tempfile.TemporaryDirectory() as parent:
+            repo_root = Path(parent) / "proj"
+            repo_root.mkdir()
+            sibling = Path(parent) / "proj-private"
+            sibling.mkdir()
+            sibling_file = sibling / "secret.py"
+            sibling_file.write_text("class ShouldNotAppear:\n    pass\n")
+
+            try:
+                count = index_paths(engine, repo_id, repo_root, {sibling_file})
+                assert count == 0
+
+                result = engine.run_cypher(
+                    "MATCH (c:Class {repo_id: $repo_id, name: 'ShouldNotAppear'}) RETURN COUNT(*) as c",
+                    {"repo_id": repo_id},
+                )
+                assert result[0]["c"] == 0
+            finally:
+                engine.delete_repository(repo_id)
+
     def test_markdown_outside_docs_path_is_skipped(self, engine, temp_repo):
         repo_id = "_smoketest_dispatch_docs_skip"
         note = temp_repo / "README.md"
         note.write_text("---\ntype: requirement\nid: req-skip\n---\n# Should not be indexed\n")
+
+        try:
+            count = index_paths(engine, repo_id, temp_repo, {note}, docs_path="docs")
+            assert count == 0
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_markdown_in_sibling_of_docs_path_is_skipped(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_docs_sibling_prefix"
+        (temp_repo / "docs").mkdir()
+        (temp_repo / "docs-private").mkdir()
+        note = temp_repo / "docs-private" / "note.md"
+        note.write_text("---\ntype: requirement\nid: req-sibling\n---\n# Should not be indexed\n")
 
         try:
             count = index_paths(engine, repo_id, temp_repo, {note}, docs_path="docs")
@@ -204,6 +245,28 @@ class TestIndexPaths:
 
 
 class TestRemovePaths:
+    def test_sibling_directory_sharing_the_repo_name_prefix_is_skipped(self, engine):
+        repo_id = "_smoketest_dispatch_remove_sibling_prefix"
+        with tempfile.TemporaryDirectory() as parent:
+            repo_root = Path(parent) / "proj"
+            repo_root.mkdir()
+            (repo_root / "a.py").write_text("class KeepMe:\n    pass\n")
+            sibling = Path(parent) / "proj-private"
+            sibling.mkdir()
+
+            try:
+                index_paths(engine, repo_id, repo_root, {repo_root / "a.py"})
+                cleaned = remove_paths(engine, repo_id, repo_root, {sibling / "a.py"})
+                assert cleaned == 0
+
+                result = engine.run_cypher(
+                    "MATCH (c:Class {repo_id: $repo_id, name: 'KeepMe'}) RETURN COUNT(*) as c",
+                    {"repo_id": repo_id},
+                )
+                assert result[0]["c"] == 1
+            finally:
+                engine.delete_repository(repo_id)
+
     def test_removes_nodes_for_deleted_python_file(self, engine, temp_repo):
         repo_id = "_smoketest_dispatch_remove"
         py_file = temp_repo / "gone.py"
@@ -349,6 +412,43 @@ class TestFullScan:
         try:
             count = full_scan(engine, repo_id, temp_repo)
             assert count == 1
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_full_scan_skips_symlink_pointing_outside_the_repo(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_symlink_out"
+        (temp_repo / "a.py").write_text("class A:\n    pass\n")
+        with tempfile.TemporaryDirectory() as other_dir:
+            outside_file = Path(other_dir) / "outside.py"
+            outside_file.write_text("class Outside:\n    pass\n")
+            (temp_repo / "link.py").symlink_to(outside_file)
+
+            try:
+                count = full_scan(engine, repo_id, temp_repo)
+                assert count == 1
+
+                result = engine.run_cypher(
+                    "MATCH (c:Class {repo_id: $repo_id}) RETURN c.name as name ORDER BY c.name",
+                    {"repo_id": repo_id},
+                )
+                assert [r["name"] for r in result] == ["A"]
+            finally:
+                engine.delete_repository(repo_id)
+
+    def test_full_scan_follows_symlink_within_the_repo(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_symlink_in"
+        (temp_repo / "pkg").mkdir()
+        (temp_repo / "pkg" / "a.py").write_text("class A:\n    pass\n")
+        (temp_repo / "alias.py").symlink_to(temp_repo / "pkg" / "a.py")
+
+        try:
+            full_scan(engine, repo_id, temp_repo)
+
+            result = engine.run_cypher(
+                "MATCH (c:Class {repo_id: $repo_id}) RETURN c.name as name, c.file as file",
+                {"repo_id": repo_id},
+            )
+            assert [(r["name"], r["file"]) for r in result] == [("A", "pkg/a.py")]
         finally:
             engine.delete_repository(repo_id)
 
@@ -608,5 +708,451 @@ class TestMentionsIntegration:
                 {"repo_id": repo_id},
             )
             assert mentions_result[0]["c"] >= 2
+        finally:
+            engine.delete_repository(repo_id)
+
+
+# A small repo whose graph depends on file order if indexing follows set
+# order: an Endpoint IMPLEMENTS edge to a same-named handler in another file,
+# a Java interface/implementation pair, a Markdown doc mentioning code
+# symbols, a SUPERSEDES chain of design decisions, and a Datastore node two
+# files (and two libraries in one file) both claim.
+_ORDER_FIXTURE = {
+    "api/routes.py": (
+        "import psycopg2\nimport psycopg\n\n"
+        "@app.get('/items')\ndef list_items():\n    return fetch_items()\n"
+    ),
+    "api/handlers.py": "def list_items():\n    pass\n\ndef fetch_items():\n    pass\n",
+    "worker.py": "import psycopg2\nimport redis\n\nclass Worker:\n    def run(self):\n        fetch_items()\n",
+    "store/Store.java": "package store;\n\npublic interface Store {\n    void save();\n}\n",
+    # Kotlin implementation before its same-package interface.
+    "repo/ASqlRepo.kt": "package repo\n\nclass ASqlRepo : Repo {\n    override fun save() {}\n}\n",
+    "repo/Repo.kt": "package repo\n\ninterface Repo {\n    fun save()\n}\n",
+    "store/SqlStore.java": (
+        "package store;\n\npublic class SqlStore implements Store {\n    public void save() {}\n}\n"
+    ),
+    "NOTES.md": "# Notes\n\n`list_items()` is served by `SqlStore` and `Worker`.\n",
+    "docs/adr-0001.md": "---\ntype: design_decision\nid: adr-0001\n---\n# Use Postgres\n",
+    "docs/adr-0002.md": (
+        "---\ntype: design_decision\nid: adr-0002\nsupersedes: adr-0001\n---\n# Use `SqlStore`\n"
+    ),
+    "docs/adr-0003.md": (
+        "---\ntype: design_decision\nid: adr-0003\nsupersedes: adr-0002\n---\n# Keep `Worker`\n"
+    ),
+}
+
+# Runs one full scan in a fresh interpreter (so PYTHONHASHSEED takes effect)
+# and prints the resulting graph with the per-run repo_id stripped.
+_SCAN_AND_EXPORT = textwrap.dedent(
+    """
+    import json, sys
+    from pathlib import Path
+    from devgraph.graph.engine import GraphEngine
+    from devgraph.indexer.dispatch import full_scan
+
+    repo_root, repo_id = Path(sys.argv[1]), sys.argv[2]
+    engine = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
+    try:
+        full_scan(engine, repo_id, repo_root, docs_path="docs", mentions_enabled=True)
+
+        def ident(labels, props):
+            return [sorted(labels), props.get("name"), props.get("file"), props.get("source_file")]
+
+        nodes = sorted(
+            json.dumps([sorted(r["labels"]), {k: v for k, v in r["props"].items() if k != "repo_id"}], sort_keys=True)
+            for r in engine.run_cypher(
+                "MATCH (n {repo_id: $repo_id}) RETURN labels(n) AS labels, properties(n) AS props",
+                {"repo_id": repo_id},
+            )
+        )
+        rels = sorted(
+            json.dumps(
+                [ident(r["a_labels"], r["a"]), r["type"], r["props"], ident(r["b_labels"], r["b"])],
+                sort_keys=True,
+            )
+            for r in engine.run_cypher(
+                "MATCH (a {repo_id: $repo_id})-[rel]->(b {repo_id: $repo_id}) "
+                "RETURN labels(a) AS a_labels, properties(a) AS a, type(rel) AS type, "
+                "properties(rel) AS props, labels(b) AS b_labels, properties(b) AS b",
+                {"repo_id": repo_id},
+            )
+        )
+        print(json.dumps({"nodes": nodes, "rels": rels}))
+    finally:
+        engine.delete_repository(repo_id)
+        engine.close()
+    """
+)
+
+
+class _NoImportersEngine:
+    def find_importing_modules(self, repo_id, module_name):
+        return []
+
+    def list_file_nodes(self, repo_id, files):
+        return set()
+
+    def read_applied_schema(self, repo_id):
+        return None
+
+
+class TestDeterministicIndexOrder:
+    def test_index_paths_processes_files_in_sorted_path_order(self, temp_repo, monkeypatch):
+        """Files are indexed in repo-relative path order, whatever order the
+        caller's set happens to iterate in."""
+        for rel in _ORDER_FIXTURE:
+            (temp_repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (temp_repo / rel).write_text(_ORDER_FIXTURE[rel])
+
+        seen: list[str] = []
+
+        def record(engine, repo_id, repo_root, resolved, rel_path, *args):
+            seen.append(rel_path)
+            return 1
+
+        monkeypatch.setattr(dispatch, "_index_single_path", record)
+        index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {temp_repo / rel for rel in _ORDER_FIXTURE})
+
+        assert seen == sorted(_ORDER_FIXTURE)
+
+    def test_full_scan_graph_is_identical_across_hash_seeds(self, engine, temp_repo):
+        """Two full scans of the same tree under different PYTHONHASHSEEDs
+        must produce the same nodes, properties and edges."""
+        for rel in _ORDER_FIXTURE:
+            (temp_repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (temp_repo / rel).write_text(_ORDER_FIXTURE[rel])
+
+        exports = []
+        for seed in ("1", "2", "3"):
+            repo_id = f"_smoketest_dispatch_hashseed_{seed}"
+            proc = subprocess.run(
+                [sys.executable, "-c", _SCAN_AND_EXPORT, str(temp_repo), repo_id],
+                env={**os.environ, "PYTHONHASHSEED": seed},
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            engine.delete_repository(repo_id)
+            assert proc.returncode == 0, proc.stderr
+            exports.append(json.loads(proc.stdout.strip().splitlines()[-1]))
+
+        assert exports[0]["rels"], "fixture should produce edges"
+        for other in exports[1:]:
+            assert other == exports[0]
+
+    def test_index_paths_orders_mixed_relative_and_absolute_paths_by_repo_path(self, temp_repo, monkeypatch):
+        """A relative path and an absolute path are ordered by where they sit
+        in the repo, not by how the caller spelled them."""
+        (temp_repo / "a.py").write_text("def a():\n    pass\n")
+        (temp_repo / "b.py").write_text("def b():\n    pass\n")
+        monkeypatch.chdir(temp_repo)
+
+        seen: list[str] = []
+
+        def record(engine, repo_id, repo_root, resolved, rel_path, *args):
+            seen.append(rel_path)
+            return 1
+
+        monkeypatch.setattr(dispatch, "_index_single_path", record)
+        # As raw strings "/tmp/.../b.py" sorts before "a.py".
+        index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {Path("a.py"), (temp_repo / "b.py").resolve()})
+
+        assert seen == ["a.py", "b.py"]
+
+
+class _RowsEngine:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def run_cypher(self, query, params):
+        return list(self.rows)
+
+
+class TestOwningServiceTieBreak:
+    def test_services_sharing_a_build_context_resolve_the_same_way_in_any_row_order(self):
+        rows = [
+            {"name": "web", "build_context": "app", "file": "compose.yml"},
+            {"name": "api", "build_context": "app", "file": "compose.yml"},
+        ]
+        owners = {
+            dispatch._match_owning_service(
+                dispatch._load_services_with_build_context(_RowsEngine(order), "_unit_services"), "app/main.py"
+            )
+            for order in (rows, rows[::-1])
+        }
+        assert owners == {"api"}
+
+
+# Every referrer here sorts BEFORE the file whose node its edge targets, so
+# an edge only forms on a first scan if index_paths resolves cross-file edges
+# after every node in the batch exists.
+_REFERRER_FIRST_FIXTURE = {
+    # Mentions: a doc mentioning a later file's class, a later design
+    # decision, and a later doc.
+    "a.md": "# Guide\n\n`Zebra` is decided in `b-old`; see `notes/z.md`.\n",
+    # Docs: a decision superseding / decided by later notes, linking a later module.
+    "docs/a-new.md": (
+        "---\ntype: design_decision\nid: a-new\nsupersedes: b-old\n"
+        "decided_by: c-arch\nlinks: [src/z.py]\n---\n# New\n"
+    ),
+    "docs/b-old.md": "---\ntype: design_decision\nid: b-old\n---\n# Old\n",
+    "docs/c-arch.md": "---\ntype: architecture_note\nid: c-arch\n---\n# Arch\n",
+    "notes/z.md": "# Z notes\n",
+    # Django route (urls.py) implemented by a view in a later file.
+    "api/urls.py": "urlpatterns = [path('items/', item_list)]\n",
+    "api/views.py": "def item_list(request):\n    pass\n",
+    # Java implementation before its interface.
+    "store/ASqlStore.java": "package store;\n\npublic class ASqlStore implements Store {\n    public void save() {}\n}\n",
+    "store/Store.java": "package store;\n\npublic interface Store {\n    void save();\n}\n",
+    # Kotlin implementation before its same-package interface.
+    "repo/ASqlRepo.kt": "package repo\n\nclass ASqlRepo : Repo {\n    override fun save() {}\n}\n",
+    "repo/Repo.kt": "package repo\n\ninterface Repo {\n    fun save()\n}\n",
+    "src/z.py": "class Zebra:\n    pass\n",
+}
+
+_CROSS_FILE_EDGES = {
+    "mentions class": (
+        "MATCH (:Document {repo_id: $repo_id, name: 'a.md'})-[:MENTIONS]->(:Class {name: 'Zebra'}) RETURN count(*) AS c"
+    ),
+    "mentions decision": (
+        "MATCH (:Document {repo_id: $repo_id, name: 'a.md'})-[:MENTIONS]->(:DesignDecision {name: 'b-old'}) "
+        "RETURN count(*) AS c"
+    ),
+    "mentions document": (
+        "MATCH (:Document {repo_id: $repo_id, name: 'a.md'})-[:MENTIONS]->(:Document {name: 'notes/z.md'}) "
+        "RETURN count(*) AS c"
+    ),
+    "supersedes": (
+        "MATCH (:DesignDecision {repo_id: $repo_id, name: 'a-new'})-[:SUPERSEDES]->(:DesignDecision {name: 'b-old'}) "
+        "RETURN count(*) AS c"
+    ),
+    "decided by": (
+        "MATCH (:DesignDecision {repo_id: $repo_id, name: 'a-new'})-[:DECIDED_BY]->(:ArchitectureNote {name: 'c-arch'}) "
+        "RETURN count(*) AS c"
+    ),
+    "documented by": (
+        "MATCH (:Module {repo_id: $repo_id, name: 'src/z.py'})-[:DOCUMENTED_BY]->(:DesignDecision {name: 'a-new'}) "
+        "RETURN count(*) AS c"
+    ),
+    "implements": (
+        "MATCH (:Endpoint {repo_id: $repo_id, name: '* items/'})-[:IMPLEMENTS]->"
+        "(:Function {name: 'item_list', file: 'api/views.py'}) RETURN count(*) AS c"
+    ),
+    "extends": (
+        "MATCH (:Class {repo_id: $repo_id, name: 'ASqlStore'})-[:EXTENDS]->(:Class {name: 'Store'}) RETURN count(*) AS c"
+    ),
+    "kotlin extends": (
+        "MATCH (:Class {repo_id: $repo_id, name: 'ASqlRepo'})-[:EXTENDS]->(:Class {name: 'Repo'}) RETURN count(*) AS c"
+    ),
+}
+
+# Per lookup kind: the referrer files, the target files added in a later
+# batch, and the edges that batch must create from the referrers.
+_RELINK_KINDS = {
+    "docs notes": (
+        {"docs/a-new.md"},
+        {"docs/b-old.md", "docs/c-arch.md", "src/z.py"},
+        {"supersedes", "decided by", "documented by"},
+    ),
+    "api handler stubs": ({"api/urls.py"}, {"api/views.py"}, {"implements"}),
+    "mentions": (
+        {"a.md"},
+        {"src/z.py", "docs/b-old.md", "notes/z.md"},
+        {"mentions class", "mentions decision", "mentions document"},
+    ),
+    "java same-package extends": ({"store/ASqlStore.java"}, {"store/Store.java"}, {"extends"}),
+    "kotlin same-package extends": ({"repo/ASqlRepo.kt"}, {"repo/Repo.kt"}, {"kotlin extends"}),
+}
+
+_REFERRERS = set().union(*(referrers for referrers, _, _ in _RELINK_KINDS.values()))
+
+
+def _write_fixture(root: Path, fixture: dict[str, str]) -> None:
+    for rel, content in fixture.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(content)
+
+
+def _record_indexed(monkeypatch) -> list[str]:
+    """Record the repo-relative path of every file index_paths indexes."""
+    seen: list[str] = []
+    original = dispatch._index_single_path
+
+    def record(engine, repo_id, repo_root, resolved, rel_path, *args):
+        seen.append(rel_path)
+        return original(engine, repo_id, repo_root, resolved, rel_path, *args)
+
+    monkeypatch.setattr(dispatch, "_index_single_path", record)
+    return seen
+
+
+def _missing_edges(engine, repo_id: str) -> list[str]:
+    return [name for name, query in _CROSS_FILE_EDGES.items() if engine.run_cypher(query, {"repo_id": repo_id})[0]["c"] == 0]
+
+
+class TestCrossFileEdgesIndependentOfOrder:
+    def test_full_scan_creates_edges_whose_referrer_sorts_before_its_target(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_referrer_first_full"
+        _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
+        try:
+            full_scan(engine, repo_id, temp_repo, docs_path="docs", mentions_enabled=True)
+            assert _missing_edges(engine, repo_id) == []
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_adding_a_target_later_relinks_existing_referrers(self, engine, temp_repo):
+        """An incremental batch that adds only target files re-indexes the
+        referrers indexed earlier, so their edges form without the referrer
+        changing or a full rescan."""
+        repo_id = "_smoketest_dispatch_referrer_first_incremental"
+        _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
+        try:
+            index_paths(engine, repo_id, temp_repo, {temp_repo / r for r in _REFERRERS}, docs_path="docs", mentions_enabled=True)
+            assert set(_missing_edges(engine, repo_id)) == set(_CROSS_FILE_EDGES)
+
+            targets = set(_REFERRER_FIRST_FIXTURE) - _REFERRERS
+            index_paths(engine, repo_id, temp_repo, {temp_repo / t for t in targets}, docs_path="docs", mentions_enabled=True)
+            assert _missing_edges(engine, repo_id) == []
+        finally:
+            engine.delete_repository(repo_id)
+
+    @pytest.mark.parametrize("kind", sorted(_RELINK_KINDS))
+    def test_each_lookup_kind_relinks_its_referrers(self, engine, temp_repo, kind):
+        referrers, targets, edges = _RELINK_KINDS[kind]
+        repo_id = "_smoketest_dispatch_relink_" + kind.replace(" ", "_")
+        _write_fixture(temp_repo, {rel: _REFERRER_FIRST_FIXTURE[rel] for rel in referrers | targets})
+        mentions_enabled = kind == "mentions"
+        try:
+            index_paths(engine, repo_id, temp_repo, {temp_repo / r for r in referrers}, docs_path="docs", mentions_enabled=mentions_enabled)
+            index_paths(engine, repo_id, temp_repo, {temp_repo / t for t in targets}, docs_path="docs", mentions_enabled=mentions_enabled)
+            assert edges.isdisjoint(_missing_edges(engine, repo_id))
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_batches_that_add_no_targets_index_no_extra_files(self, engine, temp_repo, monkeypatch):
+        """Cost guard: a full scan indexes each file once, and re-indexing
+        unchanged target files (they add no new nodes) pulls in no referrers."""
+        repo_id = "_smoketest_dispatch_relink_cost"
+        _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
+        seen = _record_indexed(monkeypatch)
+        try:
+            full_scan(engine, repo_id, temp_repo, docs_path="docs", mentions_enabled=True)
+            assert sorted(seen) == sorted(_REFERRER_FIRST_FIXTURE)
+
+            seen.clear()
+            targets = set(_REFERRER_FIRST_FIXTURE) - _REFERRERS
+            index_paths(engine, repo_id, temp_repo, {temp_repo / t for t in targets}, docs_path="docs", mentions_enabled=True)
+            assert sorted(seen) == sorted(targets)
+            assert _missing_edges(engine, repo_id) == []
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_resaving_a_file_with_a_file_less_stub_indexes_no_extra_files(self, engine, temp_repo, monkeypatch):
+        """Cost guard: a C++ out-of-class method definition emits a Class stub
+        with no file provenance; re-saving the file unchanged must not count
+        it as an added node and re-index the docs that mention it."""
+        repo_id = "_smoketest_dispatch_relink_cost_cpp"
+        _write_fixture(temp_repo, {
+            "w/widget.cpp": '#include "widget.h"\nvoid Widget::draw() {}\n',
+            "README.md": "# Readme\n\nUses `Widget`.\n",
+        })
+        seen = _record_indexed(monkeypatch)
+        try:
+            full_scan(engine, repo_id, temp_repo, mentions_enabled=True)
+            seen.clear()
+            index_paths(engine, repo_id, temp_repo, {temp_repo / "w/widget.cpp"}, mentions_enabled=True)
+            assert seen == ["w/widget.cpp"]
+        finally:
+            engine.delete_repository(repo_id)
+
+    @pytest.mark.parametrize(
+        ("target", "before", "edge"),
+        [
+            ("src/z.py", "class Other:\n    pass\n", "mentions class"),
+            ("api/views.py", "def other(request):\n    pass\n", "implements"),
+            ("store/Store.java", "package store;\n\npublic interface Other {\n    void save();\n}\n", "extends"),
+        ],
+    )
+    def test_an_existing_file_gaining_a_symbol_relinks_its_referrers(self, engine, temp_repo, target, before, edge):
+        """The watcher's common case: the target file is already indexed and an
+        edit adds (or renames to) the symbol a referrer names."""
+        repo_id = "_smoketest_dispatch_relink_gain_" + Path(target).stem
+        _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
+        (temp_repo / target).write_text(before)
+        try:
+            full_scan(engine, repo_id, temp_repo, docs_path="docs", mentions_enabled=True)
+            assert edge in _missing_edges(engine, repo_id)
+
+            (temp_repo / target).write_text(_REFERRER_FIRST_FIXTURE[target])
+            index_paths(engine, repo_id, temp_repo, {temp_repo / target}, docs_path="docs", mentions_enabled=True)
+            assert edge not in _missing_edges(engine, repo_id)
+        finally:
+            engine.delete_repository(repo_id)
+
+
+class TestMentionRelinkBound:
+    """Adding a common name (`get`, `run`) must not re-index (or relink)
+    every Markdown file that mentions it on a watcher save."""
+
+    def _repo(self, root: Path) -> None:
+        _write_fixture(root, {"a.py": "def alpha():\n    pass\n", "b.py": "def get():\n    pass\n"})
+        for i in range(6):
+            _write_fixture(root, {f"docs/d{i}.md": f"# Doc {i}\n\n```python\nget()\nput()\n```\n"})
+
+    def _record_relinks(self, monkeypatch) -> list[str]:
+        relinked: list[str] = []
+        original = dispatch.index_mentions_file
+
+        def record(engine, repo_id, path, repo_root, **kwargs):
+            if kwargs.get("names") is not None:
+                relinked.append(Path(path).name)
+            return original(engine, repo_id, path, repo_root, **kwargs)
+
+        monkeypatch.setattr(dispatch, "index_mentions_file", record)
+        return relinked
+
+    def _mentioning(self, engine, repo_id: str, name: str) -> int:
+        return engine.run_cypher(
+            "MATCH (:Document {repo_id: $repo_id})-[:MENTIONS]->(:Function {name: $name, file: 'a.py'}) RETURN count(*) AS c",
+            {"repo_id": repo_id, "name": name},
+        )[0]["c"]
+
+    def test_a_name_that_already_exists_finds_referrers_in_the_graph(self, engine, temp_repo, monkeypatch):
+        repo_id = "_smoketest_dispatch_relink_bound_existing"
+        self._repo(temp_repo)
+        monkeypatch.setattr(dispatch, "_MAX_MENTION_RELINKS", 3)
+        text_scans: list[set[str]] = []
+        original = dispatch.mentions_any
+        monkeypatch.setattr(dispatch, "mentions_any", lambda content, names: text_scans.append(names) or original(content, names))
+        try:
+            full_scan(engine, repo_id, temp_repo, mentions_enabled=True)
+            seen = _record_indexed(monkeypatch)
+            relinked = self._record_relinks(monkeypatch)
+            text_scans.clear()
+            (temp_repo / "a.py").write_text("def alpha():\n    pass\n\ndef get():\n    pass\n")
+            index_paths(engine, repo_id, temp_repo, {temp_repo / "a.py"}, mentions_enabled=True)
+
+            assert text_scans == []
+            assert seen == ["a.py"]
+            assert len(relinked) == 3
+            assert self._mentioning(engine, repo_id, "get") == 3
+        finally:
+            engine.delete_repository(repo_id)
+
+    def test_a_name_new_to_the_graph_is_text_scanned_up_to_the_cap(self, engine, temp_repo, monkeypatch, caplog):
+        repo_id = "_smoketest_dispatch_relink_bound_new"
+        self._repo(temp_repo)
+        monkeypatch.setattr(dispatch, "_MAX_MENTION_RELINKS", 3)
+        try:
+            full_scan(engine, repo_id, temp_repo, mentions_enabled=True)
+            seen = _record_indexed(monkeypatch)
+            relinked = self._record_relinks(monkeypatch)
+            (temp_repo / "a.py").write_text("def alpha():\n    pass\n\ndef put():\n    pass\n")
+            index_paths(engine, repo_id, temp_repo, {temp_repo / "a.py"}, mentions_enabled=True)
+
+            assert seen == ["a.py"]
+            assert len(relinked) == 3
+            assert self._mentioning(engine, repo_id, "put") == 3
+            assert "rescan" in caplog.text
         finally:
             engine.delete_repository(repo_id)

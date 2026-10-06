@@ -1,6 +1,5 @@
 """Unit tests for datastore extractor."""
 
-import pytest
 
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
 

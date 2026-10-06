@@ -125,3 +125,9 @@ id: note-x
 """
         result = self.extractor.extract_from_source(content)
         assert all(d.repo_id == self.repo_id for d in result.docs)
+
+
+def test_front_matter_that_yaml_cannot_construct_is_skipped():
+    content = "---\ntype: requirement\nid: 2001-13-45\n---\n# Title\n"
+    result = DocsExtractor("test-repo").extract_from_source(content, "bad-date.md")
+    assert result.docs == []

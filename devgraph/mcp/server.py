@@ -24,13 +24,13 @@ a human copy-pasting a doc into another repo's CLAUDE.md/AGENTS.md:
     it can never drift out of sync with the actual tool surface since it's
     served from the same process that registers the tools.
 
-Every tool call is recorded, metadata only (timestamp, tool name, duration,
-success), to a local JSONL store in the DevGraph state directory —
+Every tool call is recorded, metadata only (timestamp, tool name, scoped tool
+id, origin, duration, success), to a local JSONL store in the DevGraph state directory —
 see `record_tool_call` below. It exists because this process is short-lived
 and separate from the dashboard's, and the dashboard reads it back over
 `GET /api/mcp-telemetry`. Nothing about it leaves the machine.
 
-Run directly: `.venv/Scripts/python -m devgraph.mcp.server`
+Run directly: `.venv/Scripts/python -P -m devgraph.mcp.server`
 """
 
 from __future__ import annotations
@@ -45,13 +45,26 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import anyio
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
 from devgraph.agent import lifecycle
+from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, global_tools_fingerprint
+from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.config.settings import get_settings
 from devgraph.graph.engine import GraphEngine
 from devgraph.mcp import tools as devgraph_tools
+from devgraph.mcp.catalog import TOOL_CATALOG as _TOOL_CATALOG
+from devgraph.mcp.catalog import builtin_tool_names  # noqa: F401  (re-exported)
+from devgraph.mcp.tool_plane import (
+    SESSION_REPO_ENV,
+    ProjectToolPlane,
+    register_project_tools,
+    resolve_session_repo,
+    tools_fingerprint,
+)
+from devgraph.mcp.tool_reload import run_stdio
 from devgraph.registry.store import RepoRegistry
 
 logger = logging.getLogger(__name__)
@@ -65,16 +78,19 @@ _CLIENT_GUIDE_PATH = Path(__file__).resolve().parent.parent.parent / "DEVGRAPH-C
 # a different one, and several connected clients record at the same time.
 _TELEMETRY_FILENAME = "mcp_telemetry.jsonl"
 # The whole of a record: metadata about the call, never anything drawn from
-# the call itself. Nothing derived from a tool's arguments belongs here — a
-# repo_id in particular is caller-supplied data, not metadata. Written by
+# the call itself. Nothing derived from a tool's arguments belongs here — the
+# built-ins' repo_id argument in particular is caller-supplied data. The one
+# repository name that appears is inside a project tool's tool_id, and it comes
+# from the server's own session configuration, not from the call. Written by
 # record_tool_call and re-applied as an allow-list by read_tool_telemetry, so
 # the guarantee holds at both ends of the store.
-_TELEMETRY_FIELDS = ("ts", "tool", "duration_ms", "ok")
+_TELEMETRY_FIELDS = ("ts", "tool", "tool_id", "origin", "duration_ms", "ok")
+_TELEMETRY_ORIGINS = ("builtin", "global", "project", "unscoped")
 # Kept in step with QueryLog's own ring-buffer size, so the two telemetry
 # sources the dashboard reads hold a comparable amount of history.
 _TELEMETRY_MAX_ENTRIES = 500
 # Trimming rewrites the whole file, so it's amortised: append freely until
-# the store is comfortably past the cap's worth of ~120-byte records, then
+# the store is comfortably past the cap's worth of ~150-byte records, then
 # cut back to the newest _TELEMETRY_MAX_ENTRIES.
 _TELEMETRY_TRIM_AT_BYTES = 256 * 1024
 
@@ -85,37 +101,6 @@ _TELEMETRY_TRIM_AT_BYTES = 256 * 1024
 # can't be vouched for as read-only in the general case.
 _READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)  # type: ignore[call-arg]
 _ESCAPE_HATCH = ToolAnnotations(readOnlyHint=False, openWorldHint=True)  # type: ignore[call-arg]
-
-# Machine-readable catalog backing the devgraph://tool-catalog resource, kept
-# next to the @server.tool() registrations below so it can't silently drift
-# out of sync with the actual tool surface — a client can read this in one
-# call instead of relying on per-tool docstrings alone.
-_TOOL_CATALOG: list[dict[str, Any]] = [
-    {"name": "search_component", "identifier_kind": "name/description substring", "envelope": True, "phase": 1},
-    {"name": "list_recent_changes", "identifier_kind": "commit-count window (within_commits), optional entity_type label", "envelope": True, "phase": 3},
-    {"name": "trace_request_flow", "identifier_kind": "endpoint name", "envelope": False, "phase": 1},
-    {"name": "get_service_dependencies", "identifier_kind": "service name", "envelope": False, "phase": 1},
-    {"name": "find_callers", "identifier_kind": "function/class/service/endpoint name (not a file path)", "envelope": True, "phase": 1},
-    {"name": "find_related_files", "identifier_kind": "function/class name (not a file path)", "envelope": True, "phase": 1},
-    {"name": "summarise_repository", "identifier_kind": None, "envelope": False, "phase": 1},
-    {"name": "compare_branches", "identifier_kind": "branch names", "envelope": False, "phase": 1, "note": "stub until git metadata is fully wired"},
-    {"name": "impact_analysis", "identifier_kind": "function/class name (not a file path)", "envelope": True, "phase": 1},
-    {"name": "impact_analysis_for_diff", "identifier_kind": "two git refs (base_ref, head_ref), both must exist locally", "envelope": True, "phase": 3},
-    {"name": "explain_architecture", "identifier_kind": None, "envelope": False, "phase": 1},
-    {"name": "list_services", "identifier_kind": None, "envelope": True, "phase": 1},
-    {"name": "explain_decision", "identifier_kind": "DesignDecision name/id", "envelope": False, "phase": 2},
-    {"name": "find_requirements_for", "identifier_kind": "component name", "envelope": False, "phase": 2},
-    {"name": "trace_design_rationale", "identifier_kind": "component name", "envelope": False, "phase": 2},
-    {"name": "find_mentions", "identifier_kind": "entity name (mentioned_by) or Document repo-relative path (mentions)", "envelope": True, "phase": 2},
-    {"name": "blame_component", "identifier_kind": "file path (not a function name)", "envelope": False, "phase": 3},
-    {"name": "find_related_prs", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
-    {"name": "god_nodes", "identifier_kind": None, "envelope": True, "phase": 3},
-    {"name": "find_dependency_cycles", "identifier_kind": "dependency relationship type (CALLS/DEPENDS_ON/EXTENDS/IMPORTS/USES), not a component name", "envelope": True, "phase": 3},
-    {"name": "issue_history_for", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
-    {"name": "get_source", "identifier_kind": "function/class name (not a file path)", "envelope": False, "phase": 2},
-    {"name": "run_cypher", "identifier_kind": "raw Cypher", "envelope": False, "phase": None, "note": "only registered when enable_run_cypher=true; prefer the purpose-built tools above"},
-]
-
 
 def telemetry_path() -> Path:
     """Local JSONL store of MCP tool calls.
@@ -128,12 +113,17 @@ def telemetry_path() -> Path:
     return get_settings().registry_db_path.parent / _TELEMETRY_FILENAME
 
 
-def record_tool_call(*, tool: str, duration_ms: float, ok: bool) -> None:
+def record_tool_call(
+    *, tool: str, duration_ms: float, ok: bool, tool_id: str | None = None, origin: str = "builtin"
+) -> None:
     """Append one metadata-only record of a tool call.
 
     Records *that* a tool ran, never *what* was asked or answered: no
-    arguments — not even the repo_id every tool takes — no Cypher and no
-    results, only the four `_TELEMETRY_FIELDS` written below.
+    arguments — not even the repo_id the built-ins take — no Cypher and no
+    results, only the six `_TELEMETRY_FIELDS` written below. `tool` is the wire
+    name, `tool_id` the scoped id (a project tool's names its session's
+    repository, taken from server configuration) and `origin` is
+    builtin | global | project.
 
     Append-safe across the concurrently-connected clients' separate server
     processes: a single O_APPEND write of one line well under PIPE_BUF, which
@@ -150,7 +140,14 @@ def record_tool_call(*, tool: str, duration_ms: float, ok: bool) -> None:
     try:
         path = telemetry_path()
         line = json.dumps(
-            {"ts": time.time(), "tool": tool, "duration_ms": duration_ms, "ok": ok},
+            {
+                "ts": time.time(),
+                "tool": tool,
+                "tool_id": tool if tool_id is None else tool_id,
+                "origin": origin,
+                "duration_ms": duration_ms,
+                "ok": ok,
+            },
             separators=(",", ":"),
         )
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -198,7 +195,11 @@ def read_tool_telemetry(limit: int) -> list[dict[str, Any]]:
     Each record is rebuilt from `_TELEMETRY_FIELDS` alone rather than passed
     through as parsed, so a line that is valid JSON but carries extra keys —
     a store corrupted or hand-edited outside this module — can never relay
-    anything beyond the four allowed fields to the API.
+    anything beyond the six allowed fields to the API. Records written before
+    scoped ids are normalised here, not migrated: a missing or non-string
+    `tool_id` becomes `tool`, and a missing or unknown `origin` becomes
+    `builtin` for a built-in name and `unscoped` otherwise. A line whose `tool` is present but not a string is
+    skipped like any other unreadable line.
     """
     try:
         raw = telemetry_path().read_text(encoding="utf-8", errors="replace")
@@ -212,7 +213,15 @@ def read_tool_telemetry(limit: int) -> list[dict[str, Any]]:
         except ValueError:
             continue
         if isinstance(entry, dict):
-            entries.append({field: entry[field] for field in _TELEMETRY_FIELDS if field in entry})
+            record = {field: entry[field] for field in _TELEMETRY_FIELDS if field in entry}
+            if "tool" in record:
+                if not isinstance(record["tool"], str):
+                    continue
+                if not isinstance(record.get("tool_id"), str):
+                    record["tool_id"] = record["tool"]
+                if record.get("origin") not in _TELEMETRY_ORIGINS:
+                    record["origin"] = "builtin" if record["tool"] in builtin_tool_names() else "unscoped"
+            entries.append(record)
     entries.reverse()
     return entries
 
@@ -231,7 +240,9 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     The call's arguments are never inspected: the wrapper passes *args and
     **kwargs straight through and records only the tool's name, how long it
-    took and whether it succeeded.
+    took and whether it succeeded. A declared tool's function carries its
+    scoped id and origin (stamped by the tool plane); a built-in carries
+    neither and records its bare name as origin `builtin`.
     """
 
     @functools.wraps(fn)
@@ -245,6 +256,8 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
         finally:
             record_tool_call(
                 tool=fn.__name__,
+                tool_id=getattr(fn, "devgraph_tool_id", fn.__name__),
+                origin=getattr(fn, "devgraph_tool_origin", "builtin"),
                 duration_ms=(time.monotonic() - start) * 1000,
                 ok=ok,
             )
@@ -252,12 +265,47 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
-def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> MCPServer:
+def _with_shadow_notices(fn: Callable[..., Any], shadowed: Callable[[], dict[str, list[str]]]) -> Callable[..., Any]:
+    """Wrap a built-in tool so its dict result carries the notices for declared tools its name shadows.
+
+    `shadowed()` is read on every call, so a tools-file reload is reflected at once.
+    Every dict-returning built-in is typed `dict[str, Any]`, so the extra `notices` key
+    fits its schema. A list result can't carry a key and passes through unchanged; for
+    those built-ins `devgraph://project-tools`, `config validate`, `config tools list`
+    and `doctor` report the shadowing. Nothing shadowing the tool: the result is untouched.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        result = fn(*args, **kwargs)
+        notices = shadowed().get(fn.__name__)
+        if notices and isinstance(result, dict):
+            existing = result.get("notices")
+            result = {**result, "notices": [*(existing if isinstance(existing, list) else []), *notices]}
+        return result
+
+    return wrapper
+
+
+def build_server(
+    engine: GraphEngine,
+    registry: RepoRegistry | None = None,
+    *,
+    session_repo: Any | None = None,
+    session_source: str = "none",
+    session_pinned: str | None = None,
+) -> MCPServer:
     """Construct an MCPServer with every DevGraph tool registered against `engine`.
 
     `registry` is required for `get_source` (it resolves a repo_id to its
     registered root path to read source off disk); when omitted, a registry
     is opened from settings so existing single-argument callers keep working.
+
+    `session_repo` is the registered repository this session serves
+    `devgraph.tools.yaml` tools for (None serves none); `session_source` says
+    how it was chosen ("env", "cwd" or "none") and is reported by the
+    `devgraph://project-tools` resource. `session_pinned` is the raw
+    DEVGRAPH_MCP_REPO value, used only in the unmatched-value notice.
     """
     settings = get_settings()
     if registry is None:
@@ -269,10 +317,12 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
             "DevGraph: a local architecture knowledge graph for explicitly-registered "
             "repositories. Prefer these tools over reading source files directly when "
             "answering structural/dependency/history questions — they query a "
-            "pre-built graph instead of re-scanning the repo. Every tool takes a "
+            "pre-built graph instead of re-scanning the repo. Every built-in tool takes a "
             "repo_id (the id shown by `devgraph list`) and defaults to that repo only; "
             "pass cross_repo=true only when the user explicitly wants results across "
-            "multiple registered repositories."
+            "multiple registered repositories. Project-specific tools declared in a "
+            "repository's devgraph.tools.yaml (served only once the user trusts the file) are "
+            "scoped to this session's repository and take no repo_id; see devgraph://project-tools."
         ),
     )
 
@@ -284,7 +334,8 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
 
     def _instrumented_tool(*args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Any]:
         register = _register_tool(*args, **kwargs)
-        return lambda fn: register(_instrument(fn))
+        # `status` (the tool plane's, assigned below) is looked up at call time.
+        return lambda fn: register(_instrument(_with_shadow_notices(fn, lambda: status.shadowed)))
 
     server.tool = _instrumented_tool  # type: ignore[method-assign]
 
@@ -299,9 +350,13 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
         """Search for components by name/description; returns {count, results, truncated}.
         Pass modified_within_commits to restrict to components touched within the last
         N commits repo-wide (requires git-history recency staging; entities never staged
-        are excluded, not silently included)."""
+        are excluded, not silently included).
+        Also searches node types the repository's devgraph.schema.yaml declares (for
+        example File/Folder from the filesystem provider); with cross_repo=True only the
+        calling repository's declared labels are added."""
         return devgraph_tools.search_component(
-            engine, repo_id, query, cross_repo, max_results, modified_within_commits
+            engine, repo_id, query, cross_repo, max_results, modified_within_commits,
+            extra_labels=devgraph_tools.declared_node_labels(registry, repo_id),
         )
 
     @server.tool(annotations=_READ_ONLY)
@@ -332,6 +387,34 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
         return devgraph_tools.find_dependency_cycles(
             engine, repo_id, relationship, max_length, cross_repo, max_results
         )
+
+    @server.tool(annotations=_READ_ONLY)
+    def find_communities(
+        repo_id: str,
+        max_results: int = 10,
+        members_per_community: int = 5,
+    ) -> dict[str, Any]:
+        """Return the repository's subsystems: Louvain communities over dependency and
+        containment edges, largest first, as {count, results, truncated} of
+        {community, label, size, top_members}. top_members (highest PageRank first) is
+        filled for the communities within max_results. Errors if graph insights have
+        never been computed for the repository (the agent computes them after indexing)."""
+        return devgraph_tools.find_communities(engine, repo_id, max_results, members_per_community)
+
+    @server.tool(annotations=_READ_ONLY)
+    def key_nodes(
+        repo_id: str,
+        metric: str = "pagerank",
+        max_results: int = 10,
+    ) -> dict[str, Any]:
+        """Rank the repository's entities by PageRank over dependency edges (the core
+        abstractions everything leans on) or by betweenness (bridges between subsystems,
+        where a change ripples furthest); returns {count, results, truncated} of
+        {name, labels, file, score, community}. metric is pagerank or betweenness.
+        CALLS edges are resolved by name, so widely used generic method names (such as get or
+        close) can rank high.
+        Errors if graph insights have never been computed for the repository."""
+        return devgraph_tools.key_nodes(engine, repo_id, metric, max_results)
 
     @server.tool(annotations=_READ_ONLY)
     def list_recent_changes(
@@ -489,6 +572,34 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
             the purpose-built tools above whenever one of them fits."""
             return devgraph_tools.run_cypher(engine, query, parameters)
 
+    # The load parses exactly these bytes.
+    fingerprint = tools_fingerprint(session_repo.path) if session_repo is not None else None
+    global_fingerprint = global_tools_fingerprint()
+    status = register_project_tools(
+        server, engine, session_repo, session_source, instrument=_instrument, annotations=_READ_ONLY, pinned=session_pinned,
+        registry=registry, fingerprint=fingerprint, global_fingerprint=global_fingerprint,
+    )
+    # main() polls this for tools-file and global-store reloads.
+    server.devgraph_tool_plane = ProjectToolPlane(  # type: ignore[attr-defined]
+        server, engine, session_repo, status, instrument=_instrument, annotations=_READ_ONLY,
+        fingerprint=fingerprint, global_fingerprint=global_fingerprint,
+    )
+
+    @server.resource(
+        "devgraph://project-tools",
+        name="devgraph-project-tools",
+        title="DevGraph project tools",
+        description=(
+            f"Which repository this session serves {TOOLS_FILENAME} and global tools for, how it was "
+            "chosen, which tools are served and where each comes from (global, project, or a "
+            "project override of a global tool), whether the user trusts the project tools file, and "
+            "notices about ignored, invalid or untrusted declarations."
+        ),
+        mime_type="application/json",
+    )
+    def project_tools() -> str:
+        return json.dumps(status.to_dict(), indent=2)
+
     @server.resource(
         "devgraph://client-guide",
         name="devgraph-client-guide",
@@ -526,6 +637,22 @@ def build_server(engine: GraphEngine, registry: RepoRegistry | None = None) -> M
         catalog = _TOOL_CATALOG if settings.enable_run_cypher else [
             t for t in _TOOL_CATALOG if t["name"] != "run_cypher"
         ]
+        catalog = [
+            *catalog,
+            *(
+                {
+                    "name": n,
+                    "identifier_kind": "parameters: " + (", ".join(params) or "none"),
+                    "envelope": True,
+                    "phase": None,
+                    "note": (
+                        f"global tool from {GLOBAL_TOOLS_FILENAME}" if status.origins.get(n) == "global"
+                        else f"from {TOOLS_FILENAME} in {status.repo_id}"
+                    ),
+                }
+                for n, params in status.parameter_names.items()
+            ),
+        ]
         return json.dumps(catalog, indent=2)
 
     return server
@@ -537,7 +664,7 @@ def main() -> None:
     Also starts the tray app (watcher + incremental indexer) as a detached
     background process if one isn't already running, so a registered repo's
     saved changes get reindexed without anyone manually running
-    `devgraph tray start` or `python -m devgraph.agent.tray` first. This is a
+    `devgraph tray start` or `python -P -m devgraph.agent.tray` first. This is a
     no-op when a tray process is already alive (per its PID file) — safe to
     call from every concurrently-connected MCP client's own server process,
     since an MCP client spawns one of these per connection (see this
@@ -552,7 +679,7 @@ def main() -> None:
     shutdown is refcounted across all of them instead. `devgraph tray stop`
     remains available to force a stop regardless of holders.
 
-    Run with: `.venv/Scripts/python -m devgraph.mcp.server`
+    Run with: `.venv/Scripts/python -P -m devgraph.mcp.server`
     """
     settings = get_settings()
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
@@ -570,9 +697,16 @@ def main() -> None:
             exc_info=True,
         )
 
-    server = build_server(engine, registry)
     try:
-        server.run("stdio")
+        session_repo, source = resolve_session_repo(registry, os.environ, Path.cwd())
+        server = build_server(
+            engine,
+            registry,
+            session_repo=session_repo,
+            session_source=source,
+            session_pinned=os.environ.get(SESSION_REPO_ENV),
+        )
+        anyio.run(run_stdio, server)
     finally:
         engine.close()
         registry.close()

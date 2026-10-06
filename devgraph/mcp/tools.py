@@ -8,16 +8,19 @@ All Cypher is parameterized — user input never concatenates directly into
 query strings.
 """
 
-from pathlib import Path
 from typing import Any
 
 import git
 import json
+import os
 import subprocess
 
+from devgraph.config.project_schema import LABEL_PATTERN, ProjectSchemaError, resolve_effective_schema
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
+from devgraph.paths import is_within
 from devgraph.registry.store import RepoRegistry
+from devgraph.analytics.insights import INSIGHT_METRICS, community_members, read_insights, top_nodes
 
 import re
 import unicodedata
@@ -141,6 +144,11 @@ def _resolve_recency_cutoff(engine: GraphEngine, repo_id: str, modified_within_c
     return results[0]["d"]
 
 
+# Labels search_component always covers. A repository's schema-declared
+# labels are appended per call (see declared_node_labels).
+_SEARCH_LABELS: tuple[str, ...] = ("Service", "Module", "Class", "Function", "Endpoint")
+
+
 def search_component(
     engine: GraphEngine,
     repo_id: str,
@@ -148,6 +156,7 @@ def search_component(
     cross_repo: bool = False,
     max_results: int = 15,
     modified_within_commits: int | None = None,
+    extra_labels: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Search for components (modules, services, classes, functions) by name or description.
 
@@ -163,6 +172,9 @@ def search_component(
             `last_modified_at` property and is excluded, never silently included.
             If fewer than N commits exist repo-wide, no cutoff applies and this
             filter is a no-op.
+        extra_labels: Schema-declared labels of this repository to search as well;
+            anything that isn't a valid label identifier is ignored. With
+            cross_repo=True only the calling repository's declared labels are added.
 
     Returns:
         Dict with count, results, and truncated flag. Query is tokenized and
@@ -176,11 +188,15 @@ def search_component(
 
     tokens = _search_tokens(query)
 
+    labels = _SEARCH_LABELS + tuple(
+        label for label in extra_labels if LABEL_PATTERN.fullmatch(label) and label not in _SEARCH_LABELS
+    )
+    label_predicate = " OR ".join(f"n:{label}" for label in labels)
     repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
     recency_filter = "AND n.last_modified_at >= $cutoff" if cutoff is not None else ""
     cypher = f"""
     MATCH (n)
-    WHERE (n:Service OR n:Module OR n:Class OR n:Function OR n:Endpoint)
+    WHERE ({label_predicate})
     AND ANY(t IN $tokens WHERE toLower(n.name) CONTAINS t OR toLower(n.description) CONTAINS t)
     {repo_filter}
     {recency_filter}
@@ -196,6 +212,22 @@ def search_component(
     results = engine.run_cypher(cypher, params)
     results = _rank_search_results(results, tokens)
     return _envelope(results, max_results)
+
+
+def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[str, ...]:
+    """Node labels a repository's devgraph.schema.yaml declares; () if none.
+
+    A missing or invalid schema declares nothing -- searching just the
+    built-in labels is the safe fallback, not an error for the agent.
+    """
+    repo = registry.get(repo_id) if registry is not None else None
+    if repo is None:
+        return ()
+    try:
+        effective = resolve_effective_schema(repo.path)
+    except ProjectSchemaError:
+        return ()
+    return tuple(node_type.label for node_type in effective.node_types)
 
 
 def _rank_search_results(results: list[dict], tokens: list[str]) -> list[dict]:
@@ -407,6 +439,77 @@ def find_dependency_cycles(
         # max_results alone and cannot see that.
         envelope["truncated"] = True
     return envelope
+
+
+_INSIGHTS_NOT_COMPUTED = (
+    "graph insights have not been computed for this repository yet; the DevGraph agent "
+    "computes them after indexing, or run `devgraph insights <repo_id>`"
+)
+_MAX_MEMBERS_PER_COMMUNITY = 20
+# Rows pulled for key_nodes before the envelope trims to max_results.
+_KEY_NODES_LIMIT = 50
+
+
+def find_communities(
+    engine: GraphEngine,
+    repo_id: str,
+    max_results: int = 10,
+    members_per_community: int = 5,
+) -> dict[str, Any]:
+    """Return the repository's communities (Louvain over dependency and
+    containment edges), largest first.
+
+    Each result is {community, label, size, top_members}; `top_members`
+    (highest PageRank first, each {name, labels, file, pagerank}) is filled
+    for the communities inside max_results. `count` covers the largest 50
+    communities the repository stores.
+
+    Raises:
+        ValueError: insights have never been computed for this repository.
+    """
+    summary = read_insights(engine, repo_id)
+    if summary is None:
+        raise ValueError(_INSIGHTS_NOT_COMPUTED)
+    communities = summary["communities"]
+    shown = [c["community"] for c in communities[:max(0, max_results)]]
+    k = max(1, min(members_per_community, _MAX_MEMBERS_PER_COMMUNITY))
+    members = community_members(engine, repo_id, shown, k) if shown else {}
+    # Members are nested dicts, which _envelope's per-row sanitizing doesn't
+    # reach, so they are sanitized here.
+    rows = [
+        {**c, "top_members": [_sanitize_row(m) for m in members.get(c["community"], [])]}
+        if c["community"] in shown
+        else c
+        for c in communities
+    ]
+    return _envelope(rows, max_results)
+
+
+def key_nodes(
+    engine: GraphEngine,
+    repo_id: str,
+    metric: str = "pagerank",
+    max_results: int = 10,
+) -> dict[str, Any]:
+    """Rank the repository's entities by PageRank over dependency edges (core
+    abstractions) or betweenness (bridges between subsystems).
+
+    Returns {count, results, truncated} of {name, labels, file, score,
+    community}. `metric` is "pagerank" or "betweenness"; the property it
+    selects comes from an allow-list, never from the argument itself.
+
+    CALLS edges are resolved by name, so widely used generic method names
+    (such as get or close) can rank high.
+
+    Raises:
+        ValueError: unknown metric, or insights never computed.
+    """
+    metric_key = metric.strip().lower() if isinstance(metric, str) else ""
+    if metric_key not in INSIGHT_METRICS:
+        raise ValueError(f"metric must be one of: {', '.join(INSIGHT_METRICS)}")
+    if read_insights(engine, repo_id) is None:
+        raise ValueError(_INSIGHTS_NOT_COMPUTED)
+    return _envelope(top_nodes(engine, repo_id, metric_key, _KEY_NODES_LIMIT), max_results)
 
 
 def trace_request_flow(
@@ -1252,11 +1355,15 @@ def get_source(
         return empty
 
     file_path = (repo.path / file_rel_path).resolve()
-    if not str(file_path).startswith(str(repo.path.resolve())):
+    if not is_within(file_path, repo.path):
         return empty  # never read outside the registered repo root
 
+    # O_NOFOLLOW refuses a final component swapped for a symlink after the
+    # check above; platforms without it fall back to a plain open.
     try:
-        lines = file_path.read_text(encoding="utf-8").splitlines()
+        fd = os.open(file_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with open(fd, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
     except OSError:
         return empty
 
@@ -1303,7 +1410,7 @@ def find_mentions(
         return _envelope([], max_results)
 
     # Build label filter using node label check (not parameterized label in node pattern)
-    label_filter = f"AND $label IN labels(target)" if label else ""
+    label_filter = "AND $label IN labels(target)" if label else ""
 
     if direction == "mentions":
         # Document mentions target: (d:Document {name: $name})-[:MENTIONS]->(target)
