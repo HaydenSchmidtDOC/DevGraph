@@ -412,7 +412,9 @@ class NodeTypeDecl(BaseModel):
                     f"node type {self.label!r} key component {component!r} is "
                     f"not a declared metadata field"
                 )
-        if self.source is not None:
+        if isinstance(self.source, DocsSource):
+            self._check_docs_key(by_name)
+        elif self.source is not None:
             origin = _SOURCE_WORDS[self.source.provider]
             if self.key != FILESYSTEM_KEY:
                 raise ValueError(
@@ -428,6 +430,27 @@ class NodeTypeDecl(BaseModel):
         if isinstance(self.source, DocsSource):
             self._check_docs_source(self.source, by_name)
         return self
+
+    def _check_docs_key(self, by_name: dict[str, MetadataField]) -> None:
+        """A docs type is keyed on [path] or on one string field read from front matter."""
+        label = self.label
+        if len(self.key) != 1:
+            raise ValueError(
+                f"node type {label!r} is sourced from Markdown front matter, so its key must be "
+                f"[path] or one string field read from front matter (such as [adr_id])"
+            )
+        (component,) = self.key
+        if component != "path" and by_name[component].type != "string":
+            raise ValueError(
+                f"key field {component!r} of {label!r} must be a string: keys are compared as "
+                f"text (use string; numbers like 12 still work)"
+            )
+        path = by_name.get("path")
+        if path is None or path.type != "string":
+            raise ValueError(
+                f"node type {label!r} is sourced from Markdown front matter, so it must declare "
+                f"a string 'path' field: every entry records its file there"
+            )
 
     def _check_docs_source(self, source: DocsSource, by_name: dict[str, MetadataField]) -> None:
         label = self.label

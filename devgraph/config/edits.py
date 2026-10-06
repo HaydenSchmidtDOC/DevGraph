@@ -573,12 +573,18 @@ def schema_change_warnings(before, after, record: Any = None) -> list[str]:
             warnings.append(f"{when} rebuilds {label} entries from Markdown front matter.")
     if types:
         warnings.append(f"{when} removes the relationships of the removed relationship type(s): {', '.join(types)}.")
+    docs_labels = {n.label for n in after.node_types if n.source is not None and n.source.provider == "docs"} if after else set()
     for label, old_key in changed_keys(before, after):
         warnings.append(
             f"the uniqueness constraint on {label} keeps the old key ({', '.join(old_key)}) until this schema is "
             f"applied and every repository declaring {label} uses the new key; it also stays if existing nodes "
             f"violate the new key."
         )
+        if label in docs_labels:
+            warnings.append(
+                f"the next rescan renames every {label} entry by its new key; links that name an {label} the old "
+                f"way stop matching (devgraph doctor lists them)"
+            )
     return warnings
 
 

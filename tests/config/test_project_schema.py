@@ -1678,18 +1678,100 @@ def test_a_non_text_source_provider_gets_a_plain_message(tmp_path, capfd, provid
     assert capfd.readouterr().err == ""
 
 
-def test_docs_node_types_must_be_keyed_on_path(tmp_path):
-    text = runbook_with("key: [path]", "key: [owner]")
-    with pytest.raises(
-        ProjectSchemaError, match=r"node type 'Runbook' is sourced from Markdown front matter, so its key must be exactly \[path\]"
-    ):
-        load_project_schema(write_schema(tmp_path, text))
+ADR = """
+    version: 1
+    node_types:
+      - label: Adr
+        key: [adr_id]
+        metadata:
+          - {name: path}
+          - {name: adr_id}
+          - {name: title}
+          - {name: status}
+        source:
+          provider: docs
+          paths: ["decisions/**/*.md"]
+          fields: {adr_id: id}
+    relationships:
+      - type: REPLACES
+        provider: docs
+        from: Adr
+        to: Adr
+        field: supersedes
+"""
 
 
-def test_docs_path_must_be_a_string(tmp_path):
+def adr_with(old: str, new: str) -> str:
+    assert old in ADR, old
+    return ADR.replace(old, new)
+
+
+def test_the_adr_example_validates(tmp_path):
+    effective = resolve_effective_schema(write_schema(tmp_path, ADR))
+    (adr,) = effective.node_types
+    assert adr.key == ("adr_id",)
+    assert adr.source.fields == {"adr_id": "id"}
+    (relationship,) = effective.relationships
+    assert (relationship.from_labels, relationship.to, relationship.field) == (("Adr",), "Adr", "supersedes")
+
+
+def test_a_docs_key_field_may_keep_its_own_name(tmp_path):
+    text = ADR.replace("adr_id", "id").replace("          fields: {id: id}\n", "")
+    (adr,) = resolve_effective_schema(write_schema(tmp_path, text)).node_types
+    assert adr.key == ("id",)
+    assert adr.source.fields == {}
+
+
+DOCS_KEY_SHAPE = (
+    r"node type 'Adr' is sourced from Markdown front matter, so its key must be \[path\] or one string field "
+    r"read from front matter \(such as \[adr_id\]\)"
+)
+
+
+@pytest.mark.parametrize(
+    "old, new, message",
+    [
+        ("key: [adr_id]", "key: [adr_id, title]", DOCS_KEY_SHAPE),
+        ("key: [adr_id]", "key: [path, adr_id]", DOCS_KEY_SHAPE),
+        (
+            "- {name: adr_id}",
+            "- {name: adr_id, type: integer}",
+            r"key field 'adr_id' of 'Adr' must be a string: keys are compared as text "
+            r"\(use string; numbers like 12 still work\)",
+        ),
+        ("key: [adr_id]", "key: [number]", r"node type 'Adr' key component 'number' is not a declared metadata field"),
+        (
+            "          - {name: path}\n",
+            "",
+            r"node type 'Adr' is sourced from Markdown front matter, so it must declare a string 'path' field: "
+            r"every entry records its file there",
+        ),
+        (
+            "- {name: path}",
+            "- {name: path, type: integer}",
+            r"node type 'Adr' is sourced from Markdown front matter, so it must declare a string 'path' field: "
+            r"every entry records its file there",
+        ),
+    ],
+    ids=["composite", "path plus field", "integer key", "undeclared key", "no path", "non-string path"],
+)
+def test_docs_key_rules(tmp_path, old, new, message):
+    with pytest.raises(ProjectSchemaError, match=message):
+        load_project_schema(write_schema(tmp_path, adr_with(old, new)))
+
+
+def test_a_path_keyed_docs_type_still_needs_a_string_path(tmp_path):
     text = runbook_with("- {name: path}", "- {name: path, type: integer}")
-    with pytest.raises(ProjectSchemaError, match="sourced from Markdown front matter, so its path metadata field must be a string"):
+    with pytest.raises(ProjectSchemaError, match="so it must declare a string 'path' field"):
         load_project_schema(write_schema(tmp_path, text))
+
+
+def test_a_field_keyed_docs_type_gets_its_key_constraint_and_name_index(tmp_path):
+    statements = resolve_effective_schema(write_schema(tmp_path, ADR)).constraint_statements()
+    assert statements[len(constraint_statements()) :] == [
+        "CREATE CONSTRAINT adr_repo_key IF NOT EXISTS FOR (n:Adr) REQUIRE (n.repo_id, n.adr_id) IS UNIQUE",
+        "CREATE INDEX adr_repo_name IF NOT EXISTS FOR (n:Adr) ON (n.repo_id, n.name)",
+    ]
 
 
 def test_filesystem_key_message_still_names_the_filesystem(tmp_path):

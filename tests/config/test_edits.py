@@ -616,3 +616,46 @@ def test_schema_entry_notes_name_both_providers():
     assert "no provider produces Ticket nodes yet" in note
     assert "provider: filesystem" in note and "provider: docs" in note and "Markdown front matter" in note
     assert edits.schema_entry_notes({"label": "Runbook", "source": DOCS_SRC}) == []
+
+
+# --- docs key changes ------------------------------------------------------
+
+ADR_SRC = {"provider": "docs", "paths": ["decisions/**/*.md"], "fields": {"adr_id": "id"}}
+DOCS_RENAME = (
+    "the next rescan renames every Adr entry by its new key; links that name an Adr the old way stop matching "
+    "(devgraph doctor lists them)"
+)
+
+
+def adr(key, source=ADR_SRC):
+    from devgraph.config.project_schema import ProjectSchema
+
+    node = {"label": "Adr", "key": key, "metadata": [{"name": "path"}, {"name": "adr_id"}]}
+    if source is not None:
+        node["source"] = source
+    return ProjectSchema.model_validate({"version": 1, "node_types": [node]})
+
+
+@pytest.mark.parametrize("before, after", [(["path"], ["adr_id"]), (["adr_id"], ["path"])], ids=["path->field", "field->path"])
+def test_a_docs_key_change_warns_that_entries_are_renamed(before, after):
+    warnings = edits.schema_change_warnings(adr(before), adr(after), record())
+    assert DOCS_RENAME in warnings
+    assert any("uniqueness constraint on Adr keeps the old key" in w for w in warnings)
+
+
+def test_an_unchanged_docs_key_gives_no_rename_warning():
+    assert DOCS_RENAME not in edits.schema_change_warnings(adr(["adr_id"]), adr(["adr_id"]), record())
+
+
+@pytest.mark.parametrize(
+    "before, after",
+    [
+        (adr(["adr_id"]), adr(["path"], {"provider": "filesystem", "kind": "file"})),
+        (adr(["path"], None), adr(["adr_id"], None)),
+    ],
+    ids=["docs->filesystem", "unsourced"],
+)
+def test_a_key_change_outside_docs_gives_no_rename_warning(before, after):
+    warnings = edits.schema_change_warnings(before, after, record())
+    assert not any("renames every" in w for w in warnings)
+    assert any("uniqueness constraint on Adr keeps the old key" in w for w in warnings)
