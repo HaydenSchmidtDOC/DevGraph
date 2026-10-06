@@ -77,16 +77,20 @@ _DELETE_STALE_FILE_NODES_CYPHER = (
 )
 
 # Nodes a schema-declared provider owns (devgraph/indexer/providers/) are
-# tagged with `extractor` and keyed by repo-relative path in `name`; they
-# never carry `file`/`source_file`/`source`, so the built-in per-file cleanup
-# above never touches them and these two queries are their whole lifecycle.
-# A path deletes its own node and, as a directory, everything below it --
+# tagged with `extractor`. Their `path` property is the repo-relative file
+# that owns the entry and `name` is its key: the path itself for filesystem
+# and path-keyed docs nodes, a front-matter value for field-keyed docs nodes.
+# They never carry `file`/`source_file`/`source`, so the built-in per-file
+# cleanup above never touches them and these queries are their whole
+# lifecycle. Path-scoped queries match `path`; `keep` lists match the key.
+# A path matches its own node and, as a directory, everything below it --
 # the trailing '/' keeps `src` from matching `src2/...`.
-_DELETE_EXTRACTED_PATHS_CYPHER = (
+_EXTRACTED_AT_OR_BELOW = (
     "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
-    "AND (n.name IN $paths OR any(p IN $paths WHERE n.name STARTS WITH p + '/')) "
-    "DETACH DELETE n"
+    "AND (n.path IN $paths OR any(p IN $paths WHERE n.path STARTS WITH p + '/')) "
 )
+_DELETE_EXTRACTED_PATHS_CYPHER = _EXTRACTED_AT_OR_BELOW + "DETACH DELETE n"
+_EXTRACTED_NODES_AT_CYPHER = _EXTRACTED_AT_OR_BELOW + "RETURN DISTINCT labels(n)[0] AS label, n.name AS name"
 _PRUNE_EXTRACTED_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
     "AND NOT (labels(n)[0] + ':' + n.name) IN $keep "
@@ -96,7 +100,7 @@ _PRUNE_EXTRACTED_CYPHER = (
 # exact paths are candidates (never anything below them), so a batch of
 # changed files can't prune the rest of the provider's nodes.
 _PRUNE_EXTRACTED_AT_CYPHER = (
-    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND n.name IN $paths "
+    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND n.path IN $paths "
     "AND NOT (labels(n)[0] + ':' + n.name) IN $keep "
     "DETACH DELETE n RETURN count(n) AS pruned"
 )
@@ -104,7 +108,7 @@ _PRUNE_EXTRACTED_AT_CYPHER = (
 # edges belong to whoever wrote them. A null $paths means the whole repo.
 _DELETE_EXTRACTED_EDGES_CYPHER = (
     "MATCH (a {repo_id: $repo_id})-[r]->() WHERE a.extractor = $extractor "
-    "AND ($paths IS NULL OR a.name IN $paths) AND NOT type(r) IN $builtin_types "
+    "AND ($paths IS NULL OR a.path IN $paths) AND NOT type(r) IN $builtin_types "
     "DELETE r RETURN count(r) AS deleted"
 )
 # Property keys present on one provider label, for clearing the ones the
@@ -622,6 +626,17 @@ class GraphEngine:
                 session.run, _DELETE_EXTRACTED_PATHS_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
             )
 
+    def extracted_nodes_at(self, repo_id: str, extractor: str, paths: list[str]) -> set[tuple[str, str]]:
+        """(label, name) of one provider's nodes at these repo-relative paths, or below them --
+        the nodes delete_extracted_nodes would delete."""
+        if not paths:
+            return set()
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run, _EXTRACTED_NODES_AT_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
+            )
+            return {(record["label"], record["name"]) for record in result or []}
+
     def prune_extracted_nodes(self, repo_id: str, extractor: str, keep: list[str]) -> int:
         """Delete every node of one provider in a repo except `keep` ("Label:name").
 
@@ -824,7 +839,7 @@ class GraphEngine:
     def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str]]:
         """Return (label, name) for every node whose file provenance
         (`source_file`/`file`, a `Module` named by its path, or a schema
-        provider's node, which is keyed by its path) is one of `files`.
+        provider's node, which its `path` owns) is one of `files`.
 
         index_paths snapshots this before re-indexing a batch so it can tell
         which nodes the batch *adds* -- only those can be the missing
@@ -836,7 +851,7 @@ class GraphEngine:
                 "MATCH (n {repo_id: $repo_id}) "
                 "WHERE n.source_file IN $files OR n.file IN $files "
                 "   OR (n:Module AND n.name IN $files) "
-                "   OR (n.extractor IS NOT NULL AND n.name IN $files) "
+                "   OR (n.extractor IS NOT NULL AND n.path IN $files) "
                 "RETURN DISTINCT labels(n)[0] AS label, n.name AS name",
                 repo_id=repo_id,
                 files=files,

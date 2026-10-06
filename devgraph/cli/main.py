@@ -1131,6 +1131,14 @@ def doctor() -> None:
                     f"applied {label} has no uniqueness constraint; re-provision with "
                     f"`devgraph rescan {finding['repo_id']} --now`"
                 )
+            elif finding["status"] == "conflict":
+                declared_by = finding["declared_by"]
+                detail = (
+                    f"{label} is keyed on ({key}) but its constraint uses "
+                    f"({escape(', '.join(finding['constraint_key']))}), which "
+                    f"{escape(', '.join(declared_by))} {'declares' if len(declared_by) == 1 else 'declare'}; "
+                    f"entries that break it are not written. Align the key or rename one label"
+                )
             else:
                 detail = (
                     f"key change blocked by duplicate nodes: {label} nodes share a (repo_id, {key}) value, "

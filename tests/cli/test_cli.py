@@ -1608,6 +1608,26 @@ def test_cli_doctor_reports_a_missing_or_blocked_generated_constraint(runner, te
     assert f"devgraph rescan {missing} --now" in doctor
 
 
+def test_cli_doctor_reports_a_key_conflict_between_repositories(runner, temp_registry_db, stale_label):
+    engine, label, _name = stale_label  # constraint on (repo_id, slug)
+    db_path, registry = temp_registry_db
+    registry.close()
+    keyed, declaring = f"_smoketest_keyed_{label.lower()}", f"_smoketest_declaring_{label.lower()}"
+    try:
+        engine.upsert_repository(keyed, keyed, "/tmp/keyed")
+        engine.record_applied_schema(keyed, "sha256:x", [label], [], [f"{label}:code"])
+        engine.upsert_repository(declaring, declaring, "/tmp/declaring")
+        engine.record_applied_schema(declaring, "sha256:x", [label], [], [f"{label}:slug"])
+        doctor = _collapsed(_invoke_live(runner, db_path, ["doctor"]).stdout)
+    finally:
+        engine.delete_repository(keyed)
+        engine.delete_repository(declaring)
+    assert (
+        f"{keyed}: {label} is keyed on (code) but its constraint uses (slug), which {declaring} declares; "
+        f"entries that break it are not written. Align the key or rename one label"
+    ) in doctor
+
+
 def test_cli_dashboard_url_points_a_wildcard_bind_at_loopback(runner, temp_registry_db):
     """A wildcard bind address is refused by the dashboard's Host guard, so
     the printed URL must be the loopback address the server listens on."""

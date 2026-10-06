@@ -231,6 +231,7 @@ def test_empty_inputs_make_no_call():
     offline._driver = _NoDriver()
     assert offline.prune_extracted_at(REPO, "docs", [], ["Runbook:a.md"]) == 0
     assert offline.delete_extracted_edges(REPO, "docs", []) == 0
+    assert offline.extracted_nodes_at(REPO, "docs", []) == set()
 
 
 def test_existing_node_names_returns_only_names_this_repo_has_under_the_label(engine):
@@ -239,3 +240,60 @@ def test_existing_node_names_returns_only_names_this_repo_has_under_the_label(en
     seed(engine, OTHER, "Service", ["db"])
     assert engine.existing_node_names(REPO, "Service", ["api", "db", "nope"]) == {"api"}
     assert engine.existing_node_names(REPO, "Service", []) == set()
+
+
+# --- path ownership: a field-keyed docs node's `name` is its key, its `path` owns it ---
+
+
+def seed_keyed(engine, repo=REPO, extractor="docs"):
+    engine.upsert_nodes([{"label": "Adr", "repo_id": repo, "name": "ADR-012", "properties": {
+        "path": "decisions/a.md", "extractor": extractor, "adr_id": "ADR-012",
+    }}])
+
+
+def test_delete_matches_a_keyed_node_by_its_path(engine):
+    seed_keyed(engine)
+    engine.delete_extracted_nodes(REPO, "docs", ["decisions"])
+    assert names(engine, REPO) == []
+
+
+def test_prune_at_matches_a_keyed_node_by_its_path_and_keeps_it_by_its_key(engine):
+    seed_keyed(engine)
+    assert engine.prune_extracted_at(REPO, "docs", ["decisions/a.md"], ["Adr:ADR-012"]) == 0
+    assert names(engine, REPO) == ["Adr:ADR-012"]
+    assert engine.prune_extracted_at(REPO, "docs", ["ADR-012"], []) == 0
+    assert engine.prune_extracted_at(REPO, "docs", ["decisions/a.md"], []) == 1
+    assert names(engine, REPO) == []
+
+
+def test_delete_edges_matches_a_keyed_node_by_its_path(engine):
+    seed_keyed(engine)
+    engine.upsert_nodes([{"label": "Service", "repo_id": REPO, "name": "pay", "properties": {}}])
+    rel(engine, REPO, "Adr", "ADR-012", "DECIDES", "Service", "pay")
+    rel(engine, REPO, "Adr", "ADR-012", "MENTIONS", "Service", "pay")
+    assert engine.delete_extracted_edges(REPO, "docs", ["ADR-012"]) == 0
+    assert engine.delete_extracted_edges(REPO, "docs", ["decisions/a.md"]) == 1
+    assert edges(engine, REPO) == ["ADR-012-MENTIONS->pay"]
+
+
+def test_list_file_nodes_finds_a_keyed_node_by_its_path(engine):
+    seed_keyed(engine)
+    assert engine.list_file_nodes(REPO, ["decisions/a.md"]) == {("Adr", "ADR-012")}
+    assert engine.list_file_nodes(REPO, ["ADR-012"]) == set()
+
+
+def test_extracted_nodes_at_finds_nodes_at_and_below_the_paths(engine):
+    seed_keyed(engine)
+    seed(engine, REPO, "Runbook", ["decisions"], extractor="docs")
+    assert engine.extracted_nodes_at(REPO, "docs", ["decisions"]) == {("Adr", "ADR-012"), ("Runbook", "decisions")}
+    assert engine.extracted_nodes_at(REPO, "docs", ["decisions/a.md"]) == {("Adr", "ADR-012")}
+
+
+def test_extracted_nodes_at_respects_path_boundaries_extractor_and_repo(engine):
+    seed_keyed(engine, repo=OTHER)
+    assert engine.extracted_nodes_at(REPO, "docs", ["decisions"]) == set()
+    seed_keyed(engine)
+    assert engine.extracted_nodes_at(REPO, "docs", ["decisions2"]) == set()
+    assert engine.extracted_nodes_at(REPO, "docs", ["decision"]) == set()
+    assert engine.extracted_nodes_at(REPO, "filesystem", ["decisions"]) == set()
+    assert engine.extracted_nodes_at(REPO, "docs", []) == set()

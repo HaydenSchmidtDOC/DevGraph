@@ -219,8 +219,11 @@ def constraint_drift(engine: GraphEngine) -> list[dict]:
     Per repository and recorded label (with a recorded key): `missing` when
     the generated constraint does not exist (a rescan re-provisions it), and
     `blocked` when it has another definition and duplicate nodes stop the new
-    key from being created. A differing definition without duplicates is
-    either replaced on the next apply or a cross-repository conflict, which
+    key from being created. Without duplicates, a differing definition is a
+    `conflict` when another repository records the constraint's key, so
+    realign_keys will not replace it; that entry also carries the
+    `constraint_key` and the repositories that `declared_by` it. Otherwise it
+    is replaced on the next apply, or is a cross-repository conflict that
     `devgraph config validate` reports.
     """
     existing = generated_objects(engine)
@@ -231,15 +234,23 @@ def constraint_drift(engine: GraphEngine) -> list[dict]:
                 continue
             obj = existing.get(_user_constraint_name(label))
             wanted = ("repo_id", *key)
+            extra: dict = {}
             if obj is None:
                 status = "missing"
-            elif (obj.label, obj.properties) != (label, wanted) and all(
-                PROPERTY_NAME_PATTERN.fullmatch(p) for p in key
-            ) and engine.has_duplicate_keys(label, wanted):
+            elif (obj.label, obj.properties) == (label, wanted):
+                continue
+            elif all(PROPERTY_NAME_PATTERN.fullmatch(p) for p in key) and engine.has_duplicate_keys(label, wanted):
                 status = "blocked"
             else:
-                continue
-            drift.append({"repo_id": repo_id, "label": label, "status": status, "key": key})
+                declared_by = sorted(
+                    other for other, other_label, other_key in entries
+                    if other != repo_id and (other_label, other_key) == (obj.label, obj.properties[1:])
+                )
+                if not declared_by:
+                    continue
+                status = "conflict"
+                extra = {"constraint_key": obj.properties[1:], "declared_by": declared_by}
+            drift.append({"repo_id": repo_id, "label": label, "status": status, "key": key, **extra})
     return sorted(drift, key=lambda d: (d["repo_id"], d["label"]))
 
 

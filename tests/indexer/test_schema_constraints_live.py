@@ -246,3 +246,41 @@ def test_a_stale_generated_constraint_is_reported_and_released(engine, label):
     assert [(obj.kind, obj.name) for obj in stale] == [("constraint", f"{label.lower()}_repo_key")]
     # Declared by a registered repository: not stale.
     assert not [obj for obj in stale_generated_objects(engine, {label.casefold()}) if obj.label == label]
+
+
+def record_keyed_on(engine, repos, label, *keys):
+    """One scratch repository per key, each recording `label` keyed on it; returns their ids."""
+    ids = []
+    for key in keys:
+        repo_id, _root = repos()
+        engine.record_applied_schema(repo_id, "sha256:x", [label], [], [f"{label}:{key}"])
+        ids.append(repo_id)
+    return ids
+
+
+def test_drift_reports_a_conflict_when_another_repo_records_the_constraints_key(engine, repos, label):
+    engine.run_cypher(f"CREATE CONSTRAINT {label.lower()}_repo_key FOR (n:{label}) REQUIRE (n.repo_id, n.path) IS UNIQUE")
+    a_id, b_id = record_keyed_on(engine, repos, label, "adr_id", "path")
+    assert [d for d in constraint_drift(engine) if d["label"] == label] == [{
+        "repo_id": a_id, "label": label, "status": "conflict", "key": ("adr_id",),
+        "constraint_key": ("path",), "declared_by": [b_id],
+    }]
+
+
+def test_drift_reports_blocked_over_conflict_when_duplicates_exist(engine, repos, label):
+    engine.run_cypher(f"CREATE CONSTRAINT {label.lower()}_repo_key FOR (n:{label}) REQUIRE (n.repo_id, n.path) IS UNIQUE")
+    a_id, _b_id = record_keyed_on(engine, repos, label, "adr_id", "path")
+    engine.run_cypher(
+        f"CREATE (:{label} {{repo_id: $r, path: 'a.md', adr_id: 'same'}}), "
+        f"(:{label} {{repo_id: $r, path: 'b.md', adr_id: 'same'}})",
+        {"r": a_id},
+    )
+    assert [d for d in constraint_drift(engine) if d["label"] == label] == [
+        {"repo_id": a_id, "label": label, "status": "blocked", "key": ("adr_id",)}
+    ]
+
+
+def test_drift_reports_nothing_when_every_repo_agrees_with_the_constraint(engine, repos, label):
+    engine.run_cypher(f"CREATE CONSTRAINT {label.lower()}_repo_key FOR (n:{label}) REQUIRE (n.repo_id, n.path) IS UNIQUE")
+    record_keyed_on(engine, repos, label, "path", "path")
+    assert not [d for d in constraint_drift(engine) if d["label"] == label]
