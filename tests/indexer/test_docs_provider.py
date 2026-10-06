@@ -13,7 +13,14 @@ from pathlib import Path
 
 import pytest
 
-from devgraph.config.project_schema import parse_project_schema, resolve_declaration
+from devgraph.config.project_schema import (
+    MAX_DOCS_TYPES,
+    MAX_LIKE_STARS,
+    MAX_SCHEMA_CONDITIONS,
+    parse_project_schema,
+    resolve_declaration,
+)
+from devgraph.indexer import walk
 from devgraph.indexer.providers import docs
 from devgraph.indexer.providers.docs import (
     build_edges,
@@ -313,6 +320,71 @@ def test_a_value_over_4_kib_never_holds(tmp_path):
     files = write(tmp_path, {"a.md": fm("body: " + "x" * 4097), "b.md": fm("body: " + "x" * 4096)})
     nodes, _ = nodes_of(spec, files)
     assert names(nodes) == ["b.md"]
+
+
+def test_a_list_condition_examines_only_the_first_100_items(tmp_path):
+    spec = one_type(where="{field: tags, is: hit}")
+    head = ", ".join(f"t{i}" for i in range(99))
+    files = write(tmp_path, {"in.md": fm(f"tags: [{head}, hit]"), "out.md": fm(f"tags: [{head}, t99, hit]")})
+    nodes, _ = nodes_of(spec, files)
+    assert names(nodes) == ["in.md"]
+
+
+def test_conditions_are_evaluated_once_per_type_and_file(tmp_path, monkeypatch):
+    schema = """
+        version: 1
+        node_types:
+          - label: Runbook
+            key: [path]
+            metadata: [{name: path}]
+            source: {provider: docs, paths: ["runbooks/*.md"], where: [{field: kind, is: runbook}]}
+        relationships:
+          - {type: RUNBOOK_FOR, provider: docs, from: Runbook, to: Service, field: service}
+    """
+    written = write(tmp_path, {
+        "runbooks/a.md": fm("kind: runbook\nservice: api"),
+        "runbooks/b.md": fm("kind: note\nservice: api"),
+    })
+    spec = spec_of(schema)
+    calls = []
+    real = docs._holds
+    monkeypatch.setattr(docs, "_holds", lambda condition, values: (calls.append(1), real(condition, values))[1])
+    selected = read_selected(spec, docs.files_by_rel(tmp_path, written.values()))
+    nodes, _ = build_nodes(spec, "demo", selected)
+    edges = build_edges(spec, "demo", selected)
+    source_report(tmp_path, effective(schema), set(written.values()), selected=selected)
+    assert names(nodes) == ["runbooks/a.md"] and len(edges) == 1
+    assert len(calls) == 2
+
+
+def test_the_most_condition_work_the_caps_allow_stays_fast(tmp_path):
+    """The review's worst case within the caps: every docs type and condition
+    the schema may hold, each `like` with the most `*`s, against a list of the
+    most items examined, of the longest values. Every item but the last fails
+    each condition at full cost, so no condition stops early."""
+    per_type = MAX_SCHEMA_CONDITIONS // MAX_DOCS_TYPES
+    pattern = "*a" * (MAX_LIKE_STARS - 1) + "*b"
+    where = ", ".join(f"{{field: body, like: '{pattern}'}}" for _ in range(per_type))
+    types = "".join(f"""
+          - label: T{t}
+            key: [path]
+            metadata: [{{name: path}}]
+            source: {{provider: docs, paths: ["**/*.md"], where: [{where}]}}""" for t in range(MAX_DOCS_TYPES))
+    links = "".join(
+        f"\n          - {{type: LINKS, provider: docs, from: T{t}, to: T0, field: body}}" for t in range(MAX_DOCS_TYPES)
+    )
+    schema = "\n        version: 1\n        node_types:" + types + "\n        relationships:" + links
+    items = ["a" * 4000] * (docs.MAX_EDGE_VALUES - 1) + ["a" * 3999 + "b"]
+    written = write(tmp_path, {"x.md": "---\nbody:\n" + "".join(f"  - {item}\n" for item in items) + "---\n"})
+    spec = spec_of(schema)
+    selected = read_selected(spec, written)
+    started = time.perf_counter()
+    nodes, _ = build_nodes(spec, "demo", selected)
+    build_edges(spec, "demo", selected)
+    source_report(tmp_path, effective(schema), set(written.values()), selected=selected)
+    elapsed = time.perf_counter() - started
+    assert len(nodes) == MAX_DOCS_TYPES
+    assert elapsed < 0.5, f"{elapsed:.2f} s for one file"
 
 
 def test_all_conditions_must_hold(tmp_path):
@@ -628,6 +700,7 @@ def test_edge_values_str_and_int_count_bool_does_not(tmp_path):
         "to_name": rels[0]["to_name"],
         "repo_id": "demo",
         "properties": {},
+        "field": "service",
     }
 
 
@@ -679,6 +752,28 @@ def test_edges_can_be_filtered_to_targets(tmp_path):
     rels = edges_of(edge_spec(), files, targets={("Service", "web"), ("Service", "db"), ("Module", "api")})
     assert targets_of(rels) == [("runbooks/a.md", "web"), ("runbooks/b.md", "db")]
     assert edges_of(edge_spec(), files, targets=set()) == []
+
+
+def test_unmatched_report_keeps_a_type_declared_twice_apart(tmp_path):
+    spec = spec_of("""
+        version: 1
+        node_types:
+          - label: Runbook
+            key: [path]
+            metadata: [{name: path}]
+            source: {provider: docs, paths: ["runbooks/*.md"]}
+        relationships:
+          - {type: COVERS, provider: docs, from: Runbook, to: Service, field: service}
+          - {type: COVERS, provider: docs, from: Runbook, to: Module, field: module}
+    """)
+    files = write(tmp_path, {"runbooks/a.md": fm("service: api\nmodule: pkg/db.py")})
+    edges = build_edges(spec, "demo", read_selected(spec, files))
+    assert sorted((e["field"], e["to_label"], e["to_name"]) for e in edges) == [
+        ("module", "Module", "pkg/db.py"), ("service", "Service", "api"),
+    ]
+    assert docs.unmatched_report(spec, edges, {"Service": {"api"}, "Module": {"pkg/db.py"}}) == []
+    lines = docs.unmatched_report(spec, edges, {"Service": {"api"}, "Module": set()})
+    assert [line["detail"] for line in lines] == ["Runbook: module 'pkg/db.py' in runbooks/a.md matches no Module"]
 
 
 def test_no_relationships_means_no_edges(tmp_path):
@@ -811,6 +906,16 @@ def test_report_ignores_files_outside_the_repository(tmp_path):
     outside = write(tmp_path, {"runbooks/a.md": fm("owner: ops")})
     lines = source_report(tmp_path / "repo", effective(RUNBOOK), set(outside.values()))
     assert lines[0]["status"] == "warning"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_files_by_rel_keys_a_symlinked_file_by_its_target_like_the_indexer(tmp_path):
+    written = write(tmp_path, {"real/a.md": fm("owner: ops")})
+    (tmp_path / "runbooks").mkdir()
+    link = tmp_path / "runbooks" / "a.md"
+    link.symlink_to(written["real/a.md"])
+    assert walk.repo_relative(tmp_path, link) == "real/a.md"
+    assert docs.files_by_rel(tmp_path, [link]) == {"real/a.md": link}
 
 
 def test_provider_and_walk_never_import_the_dispatcher():

@@ -1493,10 +1493,11 @@ def test_where_and_fields_are_optional(tmp_path):
         ('["run\\tbooks/*.md"]', r"paths\[0\] of 'Runbook' contains a control character"),
         ('["run\\x7fbooks/*.md"]', r"paths\[0\] of 'Runbook' contains a control character"),
         ('["run\\x85books/*.md"]', r"paths\[0\] of 'Runbook' contains a control character"),
+        ('["run\\u202ebooks/*.md"]', r"paths\[0\] of 'Runbook' contains a format character"),
     ],
     ids=["empty", "21", "absolute", "dotdot", "bare dotdot", "backslash", "empty glob", "long",
          "dot slash", "dot segment", "double slash", "trailing slash", "three globstars", "thirty globstars",
-         "tab", "DEL", "C1"],
+         "tab", "DEL", "C1", "format"],
 )
 def test_docs_paths_rules(tmp_path, paths, message):
     text = runbook_with('paths: ["runbooks/**/*.md"]', f"paths: {paths}")
@@ -1521,12 +1522,14 @@ def test_a_glob_of_exactly_200_characters_and_20_globs_are_accepted(tmp_path):
         ('{field: "ty\\tpe", is: a}', r"where\[0\] of 'Runbook' .*control character"),
         ('{field: "ty\\x7fpe", is: a}', r"where\[0\] of 'Runbook' names a front-matter key with a control character"),
         ('{field: "ty\\x85pe", is: a}', r"where\[0\] of 'Runbook' names a front-matter key with a control character"),
+        ('{field: "ty\\u202epe", is: a}', r"where\[0\] of 'Runbook' names a front-matter key with a format character"),
+        ("{field: type, like: '" + "*a" * 11 + "'}", r"where\[0\] of 'Runbook' uses \* more than 10 times"),
         ("{field: type, is: null, like: a}", r"where\[0\] of 'Runbook' gives 'is' no value; give it text or remove it"),
         ("{field: type, starts_with: null}", r"where\[0\] of 'Runbook' gives 'starts_with' no value"),
         ("{field: type, is: 0x" + "f" * 5000 + "}", r"a whole number in a condition must fit in 64 bits"),
     ],
     ids=["no operator", "two operators", "long text", "empty field", "long field", "control char", "DEL", "C1",
-         "null beside another", "null alone", "huge int"],
+         "format char", "eleven stars", "null beside another", "null alone", "huge int"],
 )
 def test_docs_condition_rules(tmp_path, condition, message):
     text = runbook_with("- {field: type, is: runbook}", f"- {condition}")
@@ -1567,6 +1570,37 @@ def test_where_holds_at_most_20_conditions(tmp_path):
         load_project_schema(write_schema(tmp_path, text))
 
 
+def test_a_like_text_may_use_ten_stars(tmp_path):
+    text = runbook_with("- {field: title, starts_with: \"RB-\"}", "- {field: title, like: '" + "*a" * 10 + "'}")
+    assert load_project_schema(write_schema(tmp_path, text)) is not None
+
+
+def docs_types(count: int, conditions: int) -> str:
+    """A schema with `count` docs-sourced node types of `conditions` conditions each."""
+    where = ", ".join(f"{{field: f{i}, is: x}}" for i in range(conditions))
+    types = "".join(
+        f"""
+          - label: Doc{t}
+            key: [path]
+            metadata: [{{name: path}}]
+            source: {{provider: docs, paths: ["**/*.md"], where: [{where}]}}"""
+        for t in range(count)
+    )
+    return "version: 1\nnode_types:" + textwrap.dedent(types) + "\n"
+
+
+def test_a_schema_sources_at_most_20_node_types_from_docs(tmp_path):
+    assert load_project_schema(write_schema(tmp_path, docs_types(20, 0))) is not None
+    with pytest.raises(ProjectSchemaError, match=r"21 node types are sourced from Markdown front matter; at most 20"):
+        load_project_schema(write_schema(tmp_path, docs_types(21, 0)))
+
+
+def test_a_schema_lists_at_most_100_conditions_in_all(tmp_path):
+    assert load_project_schema(write_schema(tmp_path, docs_types(5, 20))) is not None
+    with pytest.raises(ProjectSchemaError, match=r"the docs node types list 102 conditions in all; at most 100"):
+        load_project_schema(write_schema(tmp_path, docs_types(6, 17)))
+
+
 def test_fields_holds_at_most_50_entries(tmp_path):
     metadata = "\n".join(f"          - {{name: f{i}}}" for i in range(51))
     mapping = ", ".join(f"f{i}: k{i}" for i in range(51))
@@ -1585,8 +1619,9 @@ def test_fields_holds_at_most_50_entries(tmp_path):
         ('{owner: "own\\u0007er"}', r"fields of 'Runbook' maps 'owner' to a front-matter key with a control character"),
         ('{owner: ""}', r"fields of 'Runbook' maps 'owner' to an empty front-matter key"),
         ("{owner: " + "k" * 65 + "}", r"fields of 'Runbook' maps 'owner' to a front-matter key longer than 64 characters$"),
+        ('{owner: "own\\u200eer"}', r"fields of 'Runbook' maps 'owner' to a front-matter key with a format character"),
     ],
-    ids=["undeclared", "path", "control char", "empty key", "long key"],
+    ids=["undeclared", "path", "control char", "empty key", "long key", "format char"],
 )
 def test_docs_fields_rules(tmp_path, mapping, message):
     text = runbook_with("fields: {on_call: on-call-team}", f"fields: {mapping}")
@@ -1673,8 +1708,9 @@ def test_filesystem_key_message_still_names_the_filesystem(tmp_path):
         ("        field: service\n", "        field: service\n        custom: {name: linker}\n", "docs provider, which must not declare a custom block"),
         ("type: RUNBOOK_FOR", "type: DOCUMENTED_BY", "cannot be redeclared by the docs provider"),
         ("        field: service\n", '        field: "ser\\nvice"\n', r"relationship 'RUNBOOK_FOR' field .*control character"),
+        ("        field: service\n", '        field: "ser\\u202evice"\n', r"relationship 'RUNBOOK_FOR' field .*format character"),
     ],
-    ids=["no field", "custom block", "builtin type", "control char"],
+    ids=["no field", "custom block", "builtin type", "control char", "format char"],
 )
 def test_docs_relationship_rules(tmp_path, old, new, message):
     with pytest.raises(ProjectSchemaError, match=message):

@@ -12,7 +12,10 @@ with `bounded_safe_load`; conditions are four plain text tests (`like` is
 `fnmatch.fnmatchcase` with only `*` as a wildcard), and globs are matched
 one folder at a time with `fnmatchcase` (see `glob_matches`). Nothing
 compiles a user-supplied regex or runs repository code. Compared and written
-strings are capped at 4 KiB, integers at int64 and edge lists at 100 items.
+strings are capped at 4 KiB, integers at int64, and edge lists and the list
+items a condition examines at 100. With the schema's own caps (docs types,
+conditions and `*`s per `like`), that bounds the condition work per file, and
+each (type, file) verdict is worked out once per read (see `Selected`).
 
 Nodes are keyed like filesystem nodes (`name = path = <repo-relative path>`)
 and tagged `extractor = "docs"`. This module is pure: it reads files and
@@ -31,6 +34,7 @@ from devgraph.config.project_schema import INT64_MAX, INT64_MIN, Condition, Docs
 from devgraph.config.project_tools import YAML_LOAD_ERRORS
 from devgraph.config.yaml_bound import YAML_MAX_NODES, bounded_safe_load
 from devgraph.indexer.docs.extractor import _FRONTMATTER_RE
+from devgraph.indexer.walk import repo_relative
 from devgraph.paths import MAX_CONFIG_BYTES, FileTooLarge, NotRegularFile, read_bounded
 
 EXTRACTOR = "docs"
@@ -38,7 +42,8 @@ MARKDOWN_SUFFIXES = (".md", ".markdown")
 
 #: Longest string (in UTF-8 bytes) compared, written or used as an edge value.
 MAX_VALUE_BYTES = 4096
-#: Most items of a list-valued relationship field that become edges.
+#: Most items of a list-valued relationship field that become edges, and of a
+#: list-valued field a condition examines.
 MAX_EDGE_VALUES = 100
 #: Most files `source_report` names before summarising the rest.
 REPORT_FILE_LIMIT = 5
@@ -243,8 +248,13 @@ def _test(condition: Condition, text: str) -> bool:
 
 
 def _holds(condition: Condition, values: Mapping[Any, Any]) -> bool:
+    """Whether the condition holds for the front matter.
+
+    A list value holds when any item holds, of its first `MAX_EDGE_VALUES`
+    items only: a longer list would multiply the cost of every condition.
+    """
     value = values.get(condition.field)
-    items = value if type(value) is list else [value]
+    items = value[:MAX_EDGE_VALUES] if type(value) is list else [value]
     return any(text is not None and _test(condition, text) for text in map(_as_text, items))
 
 
@@ -296,22 +306,40 @@ def _node(docs_type: DocsType, repo_id: str, rel: str, values: Mapping[Any, Any]
     return {"label": docs_type.label, "repo_id": repo_id, "name": rel, "properties": properties}, reasons
 
 
-#: What `read_selected` gives per file: (front matter, None) or (None, why it is skipped).
-Selected = Mapping[str, tuple[dict[Any, Any] | None, str | None]]
+class Selected(dict[str, tuple[dict[Any, Any] | None, str | None]]):
+    """What `read_selected` gives per file: (front matter, None) or (None, why it is skipped).
+
+    It also remembers whether each type's conditions hold for each file, so
+    the node, edge and report passes over one read evaluate them once.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.verdicts: dict[tuple[str, str], bool] = {}
 
 
-def read_selected(spec: DocsSpec, files: Mapping[str, Path]) -> dict[str, tuple[dict[Any, Any] | None, str | None]]:
+def read_selected(spec: DocsSpec, files: Mapping[str, Path]) -> Selected:
     """Front matter of the files some docs type selects, each read once.
 
     `files` maps a repo-relative POSIX path to the file on disk. Files no
     type's globs select are never read. Pass the result to `build_nodes`
     and `build_edges`.
     """
-    return {
-        rel: read_front_matter(files[rel])
+    return Selected(
+        (rel, read_front_matter(files[rel]))
         for rel in sorted(files)
         if any(selects(docs_type, rel) for docs_type in spec.types)
-    }
+    )
+
+
+def _conditions_hold(docs_type: DocsType, rel: str, selected: Selected) -> bool:
+    """Whether every condition of the type holds for a file read without problems, worked out once."""
+    key = (docs_type.label, rel)
+    verdict = selected.verdicts.get(key)
+    if verdict is None:
+        values = selected[rel][0]
+        verdict = selected.verdicts[key] = all(_holds(condition, values) for condition in docs_type.where)
+    return verdict
 
 
 def _evaluate(spec: DocsSpec, repo_id: str, selected: Selected):
@@ -324,7 +352,7 @@ def _evaluate(spec: DocsSpec, repo_id: str, selected: Selected):
             if values is None:
                 yield None, [Problem(docs_type.label, rel, problem)], None
                 continue
-            if not all(_holds(condition, values) for condition in docs_type.where):
+            if not _conditions_hold(docs_type, rel, selected):
                 continue
             node, reasons = _node(docs_type, repo_id, rel, values)
             yield node, [Problem(docs_type.label, rel, reason) for reason in reasons], values
@@ -393,6 +421,8 @@ def build_edges(
                     "to_name": name,
                     "repo_id": repo_id,
                     "properties": {},
+                    # which declaration made the edge, for `unmatched_report`; not written
+                    "field": relationship.field,
                 })
     return rels
 
@@ -411,14 +441,12 @@ def _plural(count: int, one: str, many: str) -> str:
 
 
 def files_by_rel(repo_root: Path, files: Iterable[Path]) -> dict[str, Path]:
-    """`files` keyed by their repo-relative POSIX path, as `read_selected` takes them."""
-    by_rel: dict[str, Path] = {}
-    for path in files:
-        try:
-            by_rel[path.relative_to(repo_root).as_posix()] = path
-        except ValueError:
-            continue
-    return by_rel
+    """`files` keyed by their repo-relative POSIX path, as `read_selected` takes them.
+
+    Keyed like the indexer (`walk.repo_relative`), so a symlink is keyed by its
+    target; a path outside the repository is left out.
+    """
+    return {rel: path for path in files if (rel := repo_relative(repo_root, path)) is not None}
 
 
 def source_report(
@@ -454,8 +482,7 @@ def source_report(
         if docs_type.where:
             left_out = sum(
                 1 for rel in matched
-                if selected[rel][0] is not None
-                and not all(_holds(condition, selected[rel][0]) for condition in docs_type.where)
+                if selected[rel][0] is not None and not _conditions_hold(docs_type, rel, selected)
             )
             counts = [counts[0] + " the paths", f"{left_out} left out by conditions"]
         entry_words = _plural(entries, f"{label} entry", f"{label} entries")
@@ -502,6 +529,9 @@ def unmatched_report(spec: DocsSpec, edges: list[dict], present: Mapping[str, se
                 (edge["from_name"], edge["to_name"], edge["from_label"])
                 for edge in edges
                 if edge["rel_type"] == relationship.type
+                and edge["field"] == relationship.field
+                and edge["to_label"] == relationship.to_label
+                and edge["from_label"] in relationship.from_labels
                 and edge["to_name"] not in present.get(relationship.to_label, set())
             }
         )

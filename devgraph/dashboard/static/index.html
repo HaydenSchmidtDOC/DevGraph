@@ -3912,7 +3912,7 @@ const CONFIG_FORM_LIMITS = {
   PROPERTY_NAME_PATTERN: "[a-z][a-z0-9_]{0,63}", RELATIONSHIP_TYPE_PATTERN: "[A-Z][A-Z0-9_]{0,63}", COLOR_PATTERN: "^#[0-9a-fA-F]{6}$",
   MAX_DESCRIPTION_LENGTH: 1024, MAX_ROWS_LIMIT: 1000, MAX_TIMEOUT_S: 60, DEFAULT_MAX_ROWS: 100, DEFAULT_TIMEOUT_S: 10,
   MAX_DOCS_PATHS: 20, MAX_GLOB_LENGTH: 200, MAX_GLOBSTARS: 2, MAX_CONDITIONS: 20, MAX_CONDITION_TEXT: 200, MAX_FIELD_MAP: 50,
-  MAX_FRONT_MATTER_KEY_LENGTH: 64,
+  MAX_FRONT_MATTER_KEY_LENGTH: 64, MAX_DOCS_TYPES: 20, MAX_SCHEMA_CONDITIONS: 100, MAX_LIKE_STARS: 10,
 };
 const CONFIG_FORM_REASONS = {
   field: path => "This entry has a field the form doesn't edit: `" + path + "`. Edit it as YAML.",
@@ -4389,6 +4389,7 @@ function configFormHints(section, form, ctx) {
     if (!c.field) hint("where." + i + ".field", "Name the front-matter field to test: the name before the colon at the top of the file.");
     else if ([...c.field].length > L.MAX_FRONT_MATTER_KEY_LENGTH) hint("where." + i + ".field", keyTooLong);
     if ([...c.value].length > L.MAX_CONDITION_TEXT) hint("where." + i + ".value", "The value is longer than " + L.MAX_CONDITION_TEXT + " characters.");
+    else if (c.op === "like" && c.value.split("*").length - 1 > L.MAX_LIKE_STARS) hint("where." + i + ".value", "Use * at most " + L.MAX_LIKE_STARS + " times in one pattern.");
   });
   form.metadata.forEach((m, i) => {
     if (m.name !== "path" && [...m.fm_key].length > L.MAX_FRONT_MATTER_KEY_LENGTH) hint("metadata." + i + ".fm_key", keyTooLong);

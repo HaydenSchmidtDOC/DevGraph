@@ -95,4 +95,7 @@ def test_form_limits_are_the_validators_limits(dumped):
         "MAX_CONDITION_TEXT": project_schema.MAX_CONDITION_TEXT,
         "MAX_FIELD_MAP": project_schema.MAX_FIELD_MAP,
         "MAX_FRONT_MATTER_KEY_LENGTH": project_schema.MAX_FRONT_MATTER_KEY_LENGTH,
+        "MAX_DOCS_TYPES": project_schema.MAX_DOCS_TYPES,
+        "MAX_SCHEMA_CONDITIONS": project_schema.MAX_SCHEMA_CONDITIONS,
+        "MAX_LIKE_STARS": project_schema.MAX_LIKE_STARS,
     }

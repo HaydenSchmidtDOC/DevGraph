@@ -88,6 +88,17 @@ def indexable_paths(repo_root: Path) -> set[Path]:
     }
 
 
+def repo_relative(repo_root: Path, path: Path) -> str | None:
+    """Repo-relative POSIX path, or None for a path outside the repository.
+
+    Resolved first, so a symlink is keyed by its target.
+    """
+    try:
+        return Path(path).resolve().relative_to(repo_root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return None
+
+
 def links_outside(path: Path, repo_root: Path) -> bool:
     """True for a symlink whose target resolves outside repo_root.
 

@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -91,6 +92,11 @@ MAX_CONDITIONS = 20
 MAX_CONDITION_TEXT = 200
 MAX_FIELD_MAP = 50
 MAX_FRONT_MATTER_KEY_LENGTH = 64
+#: Bounds across a whole schema, so the condition work per file stays small:
+#: at most this many docs types and conditions in all, and `*`s per `like`.
+MAX_DOCS_TYPES = 20
+MAX_SCHEMA_CONDITIONS = 100
+MAX_LIKE_STARS = 10
 
 #: The whole-number range Neo4j stores, and the range docs values are compared and written in.
 INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
@@ -193,6 +199,11 @@ def _has_lone_surrogate(text: str) -> bool:
     return any(0xD800 <= ord(c) <= 0xDFFF for c in text)
 
 
+def _has_format_character(text: str) -> bool:
+    """Whether `text` holds a format character (Unicode category Cf, such as U+202E), which reorders or hides text."""
+    return any(unicodedata.category(c) == "Cf" for c in text)
+
+
 def _front_matter_key_problem(key: str) -> str | None:
     """Why `key` can't name a front-matter key, in plain words, or None.
 
@@ -206,6 +217,8 @@ def _front_matter_key_problem(key: str) -> str | None:
         return f"a front-matter key with a control character ({key!r})"
     if _has_lone_surrogate(key):
         return "a front-matter key with a lone surrogate"
+    if _has_format_character(key):
+        return "a front-matter key with a format character (such as a right-to-left mark)"
     return None
 
 
@@ -223,6 +236,8 @@ def _glob_problem(glob: str) -> str | None:
         return "contains a control character"
     if _has_lone_surrogate(glob):
         return "contains a lone surrogate"
+    if _has_format_character(glob):
+        return "contains a format character (such as a right-to-left mark)"
     if "\\" in glob:
         return f"({glob!r}) contains a backslash; separate folders with /"
     if glob.startswith("/"):
@@ -448,6 +463,8 @@ class NodeTypeDecl(BaseModel):
                 )
             if _has_lone_surrogate(condition.text):
                 raise ValueError(f"where[{index}] of {label!r} compares with text that has a lone surrogate")
+            if condition.like is not None and condition.like.count("*") > MAX_LIKE_STARS:
+                raise ValueError(f"where[{index}] of {label!r} uses * more than {MAX_LIKE_STARS} times")
             problem = _front_matter_key_problem(condition.field)
             if problem is not None:
                 raise ValueError(f"where[{index}] of {label!r} names {problem}")
@@ -676,6 +693,16 @@ class ProjectSchema(BaseModel):
 
     @model_validator(mode="after")
     def _check_docs(self) -> ProjectSchema:
+        sources = [n.source for n in self.node_types if isinstance(n.source, DocsSource)]
+        if len(sources) > MAX_DOCS_TYPES:
+            raise ValueError(
+                f"{len(sources)} node types are sourced from Markdown front matter; at most {MAX_DOCS_TYPES}"
+            )
+        conditions = sum(len(source.where) for source in sources)
+        if conditions > MAX_SCHEMA_CONDITIONS:
+            raise ValueError(
+                f"the docs node types list {conditions} conditions in all; at most {MAX_SCHEMA_CONDITIONS}"
+            )
         docs_labels = {n.label for n in self.node_types if isinstance(n.source, DocsSource)}
         for relationship in self.relationships:
             if relationship.provider != "docs":

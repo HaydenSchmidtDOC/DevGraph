@@ -54,6 +54,7 @@ from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
 from devgraph.indexer.walk import is_ignored_path as is_ignored_path
 from devgraph.indexer.walk import is_indexable_file as _is_indexable_file
 from devgraph.indexer.walk import links_outside as _links_outside  # noqa: F401
+from devgraph.indexer.walk import repo_relative as _repo_relative
 from devgraph.paths import is_within
 
 logger = logging.getLogger(__name__)
@@ -100,7 +101,11 @@ def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> 
     return _apply_project_schema(engine, repo_id, repo_root)[0]
 
 
-def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> tuple[bool, docs.Selected | None]:
+#: What `_apply_project_schema` applied for the docs provider: the spec and the front matter it read.
+AppliedDocs = tuple[docs.DocsSpec, docs.Selected]
+
+
+def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> tuple[bool, AppliedDocs | None]:
     """Bring the graph in line with the repository's current schema file.
 
     Provisions constraints/indexes, deletes nodes and relationships of user
@@ -113,8 +118,14 @@ def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) ->
     errors from the deletion or reconcile steps propagate, while a failed
     constraint reconcile (or the re-provisioning after the record) is only logged.
 
-    Returns (applied, the docs front matter read), so full_scan's edge pass
-    reuses that read instead of reading every docs file again.
+    Both providers prune before either upserts: an upsert MERGEs onto the
+    node of that label and name whichever provider made it, and retags it,
+    so a type switching providers would otherwise keep the old provider's
+    properties.
+
+    Returns (applied, the docs spec and front matter applied, or None), so
+    full_scan's edge pass reuses them instead of resolving the schema and
+    reading every docs file again.
     """
     current_hash = schema_file_hash(repo_root)
     try:
@@ -145,10 +156,12 @@ def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) ->
     spec = filesystem.filesystem_spec(effective)
     disk = {rel: p for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
     on_disk = set(disk)
+    docs_spec = docs.docs_spec(effective)
+    docs_nodes, selected = _prune_docs(engine, repo_id, docs_spec, disk)
     filesystem.reconcile(engine, repo_id, spec, on_disk)
     if spec is not None:
         filesystem.sync_present(engine, repo_id, spec, on_disk)
-    selected = _apply_docs(engine, repo_id, docs.docs_spec(effective), disk)
+    engine.upsert_nodes(docs_nodes)
     engine.record_applied_schema(repo_id, current_hash, labels, rel_types, encode_keys(effective.node_types))
     # After recording, so this repository's new state is part of what every
     # other repository's declarations are weighed against. Provisioning is
@@ -161,15 +174,7 @@ def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) ->
         realign_keys(engine, effective.node_types)
     except Exception as exc:
         logger.warning("could not reconcile generated constraints/indexes for %s: %s", repo_id, exc)
-    return True, selected
-
-
-def _repo_relative(repo_root: Path, path: Path) -> str | None:
-    """Repo-relative POSIX path, or None for a path outside the repository."""
-    try:
-        return Path(path).resolve().relative_to(repo_root.resolve()).as_posix()
-    except (OSError, ValueError):
-        return None
+    return True, (docs_spec, selected) if docs_spec is not None and selected is not None else None
 
 
 def _is_provider_file(repo_root: Path, path: Path) -> bool:
@@ -178,16 +183,17 @@ def _is_provider_file(repo_root: Path, path: Path) -> bool:
     return rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel))
 
 
-def _apply_docs(
+def _prune_docs(
     engine: GraphEngine, repo_id: str, spec: docs.DocsSpec | None, files: dict[str, Path]
-) -> docs.Selected | None:
-    """Rebuild the docs provider's nodes from the whole repository (spec §4).
+) -> tuple[list[dict], docs.Selected | None]:
+    """Clear the docs provider's graph for a rebuild from the whole repository (spec §4).
 
     Every docs edge goes first, of any type, current or former: full_scan's
     final pass rebuilds them once every target exists. Then properties the
-    schema no longer declares are cleared, nodes the mapping no longer
-    produces are pruned (all of them when no type is docs-sourced) and the
-    rest upserted. Returns the front matter read (None without docs types).
+    schema no longer declares are cleared and nodes the mapping no longer
+    produces are pruned (all of them when no type is docs-sourced). Returns
+    the nodes for the caller to upsert, and the front matter read (None
+    without docs types).
     """
     engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, None)
     nodes: list[dict] = []
@@ -201,8 +207,7 @@ def _apply_docs(
         nodes, problems = docs.build_nodes(spec, repo_id, selected)
         _log_docs_problems(repo_id, problems)
     engine.prune_extracted_nodes(repo_id, docs.EXTRACTOR, [f"{n['label']}:{n['name']}" for n in nodes])
-    engine.upsert_nodes(nodes)
-    return selected
+    return nodes, selected
 
 
 def _log_docs_problems(repo_id: str, problems: list[docs.Problem]) -> None:
@@ -277,15 +282,13 @@ def _relink_docs(
         logger.warning("docs relink failed for %s; the next rescan links them", repo_id, exc_info=True)
 
 
-def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, selected: docs.Selected | None) -> None:
-    """Write every docs edge in the repository from the front matter apply
-    read: full_scan's last step, once every target node exists. Skipped
-    unless the schema is still valid and applied."""
-    if selected is None or schema_pending(engine, repo_id, repo_root):
+def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, applied: AppliedDocs | None) -> None:
+    """Write every docs edge in the repository from the spec and front matter
+    apply used: full_scan's last step, once every target node exists. Skipped
+    when the schema file changed since (it is then pending)."""
+    if applied is None or schema_pending(engine, repo_id, repo_root):
         return
-    ok, _filesystem, spec = _provider_specs(repo_root)
-    if not ok or spec is None:
-        return
+    spec, selected = applied
     try:
         engine.upsert_relationships(docs.build_edges(spec, repo_id, selected))
     except Exception:
@@ -1122,13 +1125,13 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
     """
     prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
     all_files = _indexable_paths(repo_root)
-    applied, selected = _apply_project_schema(engine, repo_id, repo_root)
+    applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)
     indexed = index_paths(
         engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
         sync_provider=False,  # applied just above
     )
     if applied:
-        _sync_docs_edges(engine, repo_id, repo_root, selected)
+        _sync_docs_edges(engine, repo_id, repo_root, applied_docs)
     return indexed
 
 

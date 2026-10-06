@@ -17,11 +17,11 @@ from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths, schema_pending
 from devgraph.indexer.providers import docs
 
-REPO = "_smoketest_docs_provider"
-
 # Unique per run: these tests drop and re-create the labels' generated
-# constraints, which are database-wide and shared with real repositories.
+# constraints, which are database-wide and shared with real repositories,
+# and a concurrent run must not delete this run's repository.
 _TOKEN = uuid.uuid4().hex[:8]
+REPO = f"_smoketest_docs_provider_{_TOKEN}"
 RUNBOOK, ADR, FILE = (f"ZzRunbook{_TOKEN}", f"ZzAdr{_TOKEN}", f"ZzFile{_TOKEN}")
 _SHOWN = {RUNBOOK: "Runbook", ADR: "Adr", FILE: "File"}
 
@@ -550,6 +550,21 @@ def test_an_invalid_schema_leaves_both_nodes(engine, shared):
     assert "runbooks/api.md" in label_nodes(engine, FILE)
 
 
+def test_a_type_switched_from_docs_to_filesystem_loses_its_front_matter_values(engine, repo):
+    scan(engine, repo)
+    assert props(engine, "runbooks/api.md")["owner"] == "team-a"
+    start, end = TYPES.index("      - label: Runbook"), TYPES.index("      - label: Adr")
+    runbook_files = (
+        "      - label: Runbook\n        key: [path]\n        metadata: [{name: path}]\n"
+        "        source: {provider: filesystem, kind: file}\n"
+    )
+    with_schema(repo, TYPES[:start] + runbook_files + TYPES[end:])
+    scan(engine, repo)
+    p = props(engine, "runbooks/api.md")
+    assert p["extractor"] == "filesystem"
+    assert {"owner", "severity", "on_call"} & set(p) == set()
+
+
 def test_removing_the_file_type_leaves_the_runbook_and_its_edges(engine, shared):
     scan(engine, shared)
     before = edges(engine)
@@ -643,6 +658,7 @@ def test_without_docs_sources_the_graph_is_unchanged(engine, repo, monkeypatch):
 
     with_change = build(repo)
     engine.delete_repository(REPO)
-    for name in ("_apply_docs", "_read_docs_batch", "_sync_docs", "_relink_docs", "_sync_docs_edges"):
+    monkeypatch.setattr(dispatch, "_prune_docs", lambda *a, **k: ([], None))
+    for name in ("_read_docs_batch", "_sync_docs", "_relink_docs", "_sync_docs_edges"):
         monkeypatch.setattr(dispatch, name, lambda *a, **k: None)
     assert build(repo) == with_change

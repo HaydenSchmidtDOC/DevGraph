@@ -2773,6 +2773,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     ["three **", f => { f.paths[0].glob = "**/a/**/b/**/*.md"; }, "paths.0.glob", /\*\* at most 2 times/],
     ["a condition with no field", f => { f.where[0].field = ""; }, "where.0.field", /Name the front-matter field/],
     ["a long condition value", f => { f.where[0].value = "x".repeat(201); }, "where.0.value", /200 characters/],
+    ["a pattern with eleven *", f => { f.where[0].op = "like"; f.where[0].value = "*a".repeat(11); }, "where.0.value", /\* at most 10 times/],
     ["a docs key other than path", f => { f.metadata[0].key = false; f.metadata[1].key = true; }, "source", /Markdown front matter must be keyed on exactly one string field named path/],
   ].forEach(([what, edit, field, re]) => {
     const got = docsHints(edit);
