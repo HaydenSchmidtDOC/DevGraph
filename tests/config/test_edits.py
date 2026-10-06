@@ -45,7 +45,7 @@ def code(excinfo) -> str:
 
 
 def test_add_tool_preserves_comments(tmp_path):
-    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
+    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE, newline="")  # LF on every platform
     result = edits.add_tool(tmp_path, {**TOOL, "name": "other"})
     text = (tmp_path / "devgraph.tools.yaml").read_text()
     assert text.startswith("# keep me\n") and "# inline" in text and "name: other" in text

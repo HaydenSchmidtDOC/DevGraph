@@ -186,6 +186,8 @@ def test_revoking_trust_stops_serving_while_the_file_is_unreadable(trust, tmp_pa
     assert "list_files" in tools(server)
     path = repo / TOOLS_FILENAME
     if break_file == "chmod":
+        if os.name == "nt":
+            pytest.skip("chmod cannot make a file unreadable on Windows")
         if os.geteuid() == 0:
             pytest.skip("root reads a mode-0 file")
         path.chmod(0)
