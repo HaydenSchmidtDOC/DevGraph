@@ -1267,7 +1267,7 @@ def test_every_label_in_a_from_list_must_resolve(tmp_path):
 
 def test_json_schema_describes_node_sources_and_list_from():
     defs = project_schema_json_schema()["$defs"]
-    assert defs["NodeSource"]["properties"]["kind"]["enum"] == ["file", "folder"]
+    assert defs["FilesystemSource"]["properties"]["kind"]["enum"] == ["file", "folder"]
     assert "source" in defs["NodeTypeDecl"]["properties"]
     from_schema = defs["RelationshipDecl"]["properties"]["from"]
     assert {variant.get("type") for variant in from_schema["anyOf"]} == {"string", "array"}
@@ -1405,3 +1405,498 @@ def test_json_schema_documents_colour_pattern():
 
 def test_starter_template_mentions_colour():
     assert 'color: "#1f77b4"' in project_schema.starter_schema_text()
+
+
+# --- Docs provider (Markdown front matter) ---------------------------------
+
+RUNBOOK = """
+    version: 1
+    node_types:
+      - label: Runbook
+        key: [path]
+        metadata:
+          - {name: path}
+          - {name: owner, required: true}
+          - {name: severity, type: integer}
+          - {name: on_call}
+        source:
+          provider: docs
+          paths: ["runbooks/**/*.md"]
+          where:
+            - {field: type, is: runbook}
+            - {field: title, starts_with: "RB-"}
+          fields: {on_call: on-call-team}
+    relationships:
+      - type: RUNBOOK_FOR
+        provider: docs
+        from: Runbook
+        to: Service
+        field: service
+"""
+
+
+def runbook_with(old: str, new: str) -> str:
+    assert old in RUNBOOK, old
+    return RUNBOOK.replace(old, new)
+
+
+def test_the_runbook_example_validates(tmp_path):
+    effective = resolve_effective_schema(write_schema(tmp_path, RUNBOOK))
+    (runbook,) = effective.node_types
+    assert runbook.source.provider == "docs"
+    assert runbook.source.paths == ("runbooks/**/*.md",)
+    assert [(c.field, c.operator, c.text) for c in runbook.source.where] == [
+        ("type", "is", "runbook"),
+        ("title", "starts_with", "RB-"),
+    ]
+    assert runbook.source.fields == {"on_call": "on-call-team"}
+    (relationship,) = effective.relationships
+    assert (relationship.provider, relationship.field, relationship.to) == ("docs", "service", "Service")
+    assert "RUNBOOK_FOR" in effective.relationship_types
+
+
+def test_docs_is_a_node_source_and_relationship_provider():
+    assert project_schema.NODE_SOURCE_PROVIDERS == ("filesystem", "docs")
+    assert "docs" in PROVIDER_KINDS
+
+
+def test_where_and_fields_are_optional(tmp_path):
+    text = """
+        version: 1
+        node_types:
+          - label: Note
+            key: [path]
+            metadata: [{name: path}]
+            source: {provider: docs, paths: ["**/*.md"]}
+    """
+    (note,) = load_project_schema(write_schema(tmp_path, text)).node_types
+    assert note.source.where == () and note.source.fields == {}
+
+
+@pytest.mark.parametrize(
+    "paths, message",
+    [
+        ("[]", r"paths of 'Runbook' must list 1 to 20 globs"),
+        ("[" + ", ".join(f'"d{i}/*.md"' for i in range(21)) + "]", r"paths of 'Runbook' must list 1 to 20 globs"),
+        ('["/etc/*.md"]', r"paths\[0\] of 'Runbook' .*repo-relative"),
+        ('["docs/../../*.md"]', r"paths\[0\] of 'Runbook' .*'\.\.'"),
+        ('["..", "x.md"]', r"paths\[0\] of 'Runbook' .*'\.\.'"),
+        ('["docs\\\\*.md"]', r"paths\[0\] of 'Runbook' .*backslash"),
+        ('[""]', r"paths\[0\] of 'Runbook' is empty"),
+        ('["ok.md", "' + "a" * 201 + '"]', r"paths\[1\] of 'Runbook' is longer than 200 characters"),
+        ('["./runbooks/*.md"]', r"paths\[0\] of 'Runbook' .*has a '\.' segment; write it relative to the repository root without '\./' \(e\.g\. runbooks/\*\*/\*\.md\)"),
+        ('["runbooks/./x.md"]', r"paths\[0\] of 'Runbook' .*has a '\.' segment"),
+        ('["runbooks//x.md"]', r"paths\[0\] of 'Runbook' .*has an empty folder name"),
+        ('["runbooks/"]', r"paths\[0\] of 'Runbook' .*has an empty folder name"),
+        ('["a/**/b/**/c/**/*.md"]', r"paths\[0\] of 'Runbook' .*uses \*\* more than 2 times"),
+        ('["' + "**/*/" * 30 + 'x"]', r"paths\[0\] of 'Runbook' .*uses \*\* more than 2 times"),
+        ('["run\\tbooks/*.md"]', r"paths\[0\] of 'Runbook' contains a control character"),
+        ('["run\\x7fbooks/*.md"]', r"paths\[0\] of 'Runbook' contains a control character"),
+        ('["run\\x85books/*.md"]', r"paths\[0\] of 'Runbook' contains a control character"),
+        ('["run\\u202ebooks/*.md"]', r"paths\[0\] of 'Runbook' contains a format character"),
+    ],
+    ids=["empty", "21", "absolute", "dotdot", "bare dotdot", "backslash", "empty glob", "long",
+         "dot slash", "dot segment", "double slash", "trailing slash", "three globstars", "thirty globstars",
+         "tab", "DEL", "C1", "format"],
+)
+def test_docs_paths_rules(tmp_path, paths, message):
+    text = runbook_with('paths: ["runbooks/**/*.md"]', f"paths: {paths}")
+    with pytest.raises(ProjectSchemaError, match=message):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_a_glob_of_exactly_200_characters_and_20_globs_are_accepted(tmp_path):
+    paths = "[" + ", ".join(f'"{i:02d}' + "a" * 195 + '.md"' for i in range(20)) + "]"
+    text = runbook_with('paths: ["runbooks/**/*.md"]', f"paths: {paths}")
+    assert len(load_project_schema(write_schema(tmp_path, text)).node_types[0].source.paths) == 20
+
+
+@pytest.mark.parametrize(
+    "condition, message",
+    [
+        ("{field: type}", r"where\[0\] of 'Runbook' must use exactly one of is, starts_with, contains, like"),
+        ("{field: type, is: a, contains: b}", r"where\[0\] of 'Runbook' must use exactly one of is, starts_with, contains, like"),
+        ("{field: type, like: " + "a" * 201 + "}", r"where\[0\] of 'Runbook' compares with text longer than 200 characters"),
+        ('{field: "", is: a}', r"where\[0\] of 'Runbook' names an empty front-matter key"),
+        ("{field: " + "k" * 65 + ", is: a}", r"where\[0\] of 'Runbook' names a front-matter key longer than 64 characters$"),
+        ('{field: "ty\\tpe", is: a}', r"where\[0\] of 'Runbook' .*control character"),
+        ('{field: "ty\\x7fpe", is: a}', r"where\[0\] of 'Runbook' names a front-matter key with a control character"),
+        ('{field: "ty\\x85pe", is: a}', r"where\[0\] of 'Runbook' names a front-matter key with a control character"),
+        ('{field: "ty\\u202epe", is: a}', r"where\[0\] of 'Runbook' names a front-matter key with a format character"),
+        ("{field: type, like: '" + "*a" * 11 + "'}", r"where\[0\] of 'Runbook' uses \* more than 10 times"),
+        ("{field: type, is: null, like: a}", r"where\[0\] of 'Runbook' gives 'is' no value; give it text or remove it"),
+        ("{field: type, starts_with: null}", r"where\[0\] of 'Runbook' gives 'starts_with' no value"),
+        ("{field: type, is: 0x" + "f" * 5000 + "}", r"a whole number in a condition must fit in 64 bits"),
+    ],
+    ids=["no operator", "two operators", "long text", "empty field", "long field", "control char", "DEL", "C1",
+         "format char", "eleven stars", "null beside another", "null alone", "huge int"],
+)
+def test_docs_condition_rules(tmp_path, condition, message):
+    text = runbook_with("- {field: type, is: runbook}", f"- {condition}")
+    with pytest.raises(ProjectSchemaError, match=message):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+@pytest.mark.parametrize("operator", ["regex", "matches"])
+def test_regex_and_matches_operators_are_refused_as_unknown(tmp_path, operator):
+    text = runbook_with("- {field: type, is: runbook}", f"- {{field: type, {operator}: 'run.*'}}")
+    with pytest.raises(ProjectSchemaError, match=rf"where\.0\.{operator}: Extra inputs are not permitted"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "value, text",
+    [("1", "1"), ('"1"', "1"), ("-42", "-42"), ("true", "true"), ("false", "false"), ("yes", "true"), ("runbook", "runbook")],
+)
+def test_condition_values_are_stored_as_canonical_text(tmp_path, value, text):
+    source = runbook_with("- {field: type, is: runbook}", f"- {{field: type, is: {value}}}")
+    condition = load_project_schema(write_schema(tmp_path, source)).node_types[0].source.where[0]
+    assert condition.is_ == text and condition.text == text and condition.operator == "is"
+
+
+@pytest.mark.parametrize("value", ["1.5", "2024-01-01", "[a]", "{a: b}", "null"])
+def test_condition_values_must_be_text_numbers_or_booleans(tmp_path, value):
+    text = runbook_with("- {field: type, is: runbook}", f"- {{field: type, is: {value}}}")
+    with pytest.raises(ProjectSchemaError):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_where_holds_at_most_20_conditions(tmp_path):
+    many = "\n".join(f"            - {{field: f{i}, is: x}}" for i in range(21))
+    text = runbook_with(
+        "            - {field: type, is: runbook}\n            - {field: title, starts_with: \"RB-\"}", many
+    )
+    with pytest.raises(ProjectSchemaError, match=r"where of 'Runbook' lists 21 conditions; at most 20"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_a_like_text_may_use_ten_stars(tmp_path):
+    text = runbook_with("- {field: title, starts_with: \"RB-\"}", "- {field: title, like: '" + "*a" * 10 + "'}")
+    assert load_project_schema(write_schema(tmp_path, text)) is not None
+
+
+def docs_types(count: int, conditions: int) -> str:
+    """A schema with `count` docs-sourced node types of `conditions` conditions each."""
+    where = ", ".join(f"{{field: f{i}, is: x}}" for i in range(conditions))
+    types = "".join(
+        f"""
+          - label: Doc{t}
+            key: [path]
+            metadata: [{{name: path}}]
+            source: {{provider: docs, paths: ["**/*.md"], where: [{where}]}}"""
+        for t in range(count)
+    )
+    return "version: 1\nnode_types:" + textwrap.dedent(types) + "\n"
+
+
+def test_a_schema_sources_at_most_20_node_types_from_docs(tmp_path):
+    assert load_project_schema(write_schema(tmp_path, docs_types(20, 0))) is not None
+    with pytest.raises(ProjectSchemaError, match=r"21 node types are sourced from Markdown front matter; at most 20"):
+        load_project_schema(write_schema(tmp_path, docs_types(21, 0)))
+
+
+def test_a_schema_lists_at_most_100_conditions_in_all(tmp_path):
+    assert load_project_schema(write_schema(tmp_path, docs_types(5, 20))) is not None
+    with pytest.raises(ProjectSchemaError, match=r"the docs node types list 102 conditions in all; at most 100"):
+        load_project_schema(write_schema(tmp_path, docs_types(6, 17)))
+
+
+def test_fields_holds_at_most_50_entries(tmp_path):
+    metadata = "\n".join(f"          - {{name: f{i}}}" for i in range(51))
+    mapping = ", ".join(f"f{i}: k{i}" for i in range(51))
+    text = runbook_with("          - {name: on_call}", "          - {name: on_call}\n" + metadata).replace(
+        "fields: {on_call: on-call-team}", f"fields: {{{mapping}}}"
+    )
+    with pytest.raises(ProjectSchemaError, match=r"fields of 'Runbook' maps 51 fields; at most 50"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "mapping, message",
+    [
+        ("{owner_name: owner}", r"fields of 'Runbook' maps 'owner_name', which is not a declared metadata field"),
+        ("{path: file}", r"fields of 'Runbook' maps 'path', which is always the file's repo-relative path"),
+        ('{owner: "own\\u0007er"}', r"fields of 'Runbook' maps 'owner' to a front-matter key with a control character"),
+        ('{owner: ""}', r"fields of 'Runbook' maps 'owner' to an empty front-matter key"),
+        ("{owner: " + "k" * 65 + "}", r"fields of 'Runbook' maps 'owner' to a front-matter key longer than 64 characters$"),
+        ('{owner: "own\\u200eer"}', r"fields of 'Runbook' maps 'owner' to a front-matter key with a format character"),
+    ],
+    ids=["undeclared", "path", "control char", "empty key", "long key", "format char"],
+)
+def test_docs_fields_rules(tmp_path, mapping, message):
+    text = runbook_with("fields: {on_call: on-call-team}", f"fields: {mapping}")
+    with pytest.raises(ProjectSchemaError, match=message):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("fields: {on_call: on-call-team}", "fields: {on_call: on}"),
+        ("          - {name: on_call}", "          - {name: on_call}\n          - {name: on}"),
+        ("        field: service\n", "        field: yes\n"),
+    ],
+    ids=["fields value", "metadata name", "relationship field"],
+)
+def test_an_unquoted_yaml_boolean_word_gets_a_plain_hint(tmp_path, old, new):
+    text = runbook_with(old, new)
+    with pytest.raises(ProjectSchemaError, match=r"YAML reads an unquoted on, off, yes or no as true or false; to mean the word, quote it: 'on'"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "old, new, message",
+    [
+        ('paths: ["runbooks/**/*.md"]', 'paths: ["runbooks/\\ud800/*.md"]', r"paths\[0\] of 'Runbook' contains a lone surrogate"),
+        ("- {field: type, is: runbook}", '- {field: "ty\\ud800pe", is: runbook}', r"where\[0\] of 'Runbook' names a front-matter key with a lone surrogate"),
+        ("- {field: type, is: runbook}", '- {field: type, is: "run\\ud800"}', r"where\[0\] of 'Runbook' compares with text that has a lone surrogate"),
+        ("- {field: type, is: runbook}", '- {field: type, starts_with: "run\\ud800"}', r"where\[0\] of 'Runbook' compares with text that has a lone surrogate"),
+        ("- {field: type, is: runbook}", '- {field: type, contains: "\\udfff"}', r"where\[0\] of 'Runbook' compares with text that has a lone surrogate"),
+        ("- {field: type, is: runbook}", '- {field: type, like: "*\\ud800*"}', r"where\[0\] of 'Runbook' compares with text that has a lone surrogate"),
+        ("fields: {on_call: on-call-team}", 'fields: {on_call: "on\\ud800call"}', r"fields of 'Runbook' maps 'on_call' to a front-matter key with a lone surrogate"),
+        ("        field: service\n", '        field: "serv\\ud800ice"\n', r"relationship 'RUNBOOK_FOR' field .*lone surrogate"),
+    ],
+    ids=["glob", "where field", "is", "starts_with", "contains", "like", "fields key", "relationship field"],
+)
+def test_lone_surrogates_are_refused(tmp_path, old, new, message):
+    text = runbook_with(old, new)
+    with pytest.raises(ProjectSchemaError, match=message) as caught:
+        load_project_schema(write_schema(tmp_path, text))
+    assert all(not "\ud800" <= c <= "\udfff" for c in str(caught.value))
+
+
+@pytest.mark.parametrize(
+    "provider",
+    ["0x" + "f" * 5000, "1", "[docs]", "{a: b}", "true", "null"],
+    ids=["huge int", "int", "list", "map", "bool", "null"],
+)
+def test_a_non_text_source_provider_gets_a_plain_message(tmp_path, capfd, provider):
+    text = runbook_with("          provider: docs\n", f"          provider: {provider}\n")
+    with pytest.raises(ProjectSchemaError, match=r"source provider must be one of filesystem, docs") as caught:
+        load_project_schema(write_schema(tmp_path, text))
+    assert "Exceeds the limit" not in str(caught.value)
+    assert capfd.readouterr().err == ""
+
+
+ADR = """
+    version: 1
+    node_types:
+      - label: Adr
+        key: [adr_id]
+        metadata:
+          - {name: path}
+          - {name: adr_id}
+          - {name: title}
+          - {name: status}
+        source:
+          provider: docs
+          paths: ["decisions/**/*.md"]
+          fields: {adr_id: id}
+    relationships:
+      - type: REPLACES
+        provider: docs
+        from: Adr
+        to: Adr
+        field: supersedes
+"""
+
+
+def adr_with(old: str, new: str) -> str:
+    assert old in ADR, old
+    return ADR.replace(old, new)
+
+
+def test_the_adr_example_validates(tmp_path):
+    effective = resolve_effective_schema(write_schema(tmp_path, ADR))
+    (adr,) = effective.node_types
+    assert adr.key == ("adr_id",)
+    assert adr.source.fields == {"adr_id": "id"}
+    (relationship,) = effective.relationships
+    assert (relationship.from_labels, relationship.to, relationship.field) == (("Adr",), "Adr", "supersedes")
+
+
+def test_a_docs_key_field_may_keep_its_own_name(tmp_path):
+    text = ADR.replace("adr_id", "id").replace("          fields: {id: id}\n", "")
+    (adr,) = resolve_effective_schema(write_schema(tmp_path, text)).node_types
+    assert adr.key == ("id",)
+    assert adr.source.fields == {}
+
+
+DOCS_KEY_SHAPE = (
+    r"node type 'Adr' is sourced from Markdown front matter, so its key must be \[path\] or one string field "
+    r"read from front matter \(such as \[adr_id\]\)"
+)
+
+
+@pytest.mark.parametrize(
+    "old, new, message",
+    [
+        ("key: [adr_id]", "key: [adr_id, title]", DOCS_KEY_SHAPE),
+        ("key: [adr_id]", "key: [path, adr_id]", DOCS_KEY_SHAPE),
+        (
+            "- {name: adr_id}",
+            "- {name: adr_id, type: integer}",
+            r"key field 'adr_id' of 'Adr' must be a string: keys are compared as text "
+            r"\(use string; numbers like 12 still work\)",
+        ),
+        (
+            "- {name: adr_id}",
+            "- {name: adr_id, type: boolean}",
+            r"key field 'adr_id' of 'Adr' must be a string: keys are compared as text "
+            r"\(use string; numbers like 12 still work\)",
+        ),
+        ("key: [adr_id]", "key: [number]", r"node type 'Adr' key component 'number' is not a declared metadata field"),
+        (
+            "          - {name: path}\n",
+            "",
+            r"node type 'Adr' is sourced from Markdown front matter, so it must declare a string 'path' field: "
+            r"every entry records its file there",
+        ),
+        (
+            "- {name: path}",
+            "- {name: path, type: integer}",
+            r"node type 'Adr' is sourced from Markdown front matter, so it must declare a string 'path' field: "
+            r"every entry records its file there",
+        ),
+    ],
+    ids=["composite", "path plus field", "integer key", "boolean key", "undeclared key", "no path", "non-string path"],
+)
+def test_docs_key_rules(tmp_path, old, new, message):
+    with pytest.raises(ProjectSchemaError, match=message):
+        load_project_schema(write_schema(tmp_path, adr_with(old, new)))
+
+
+def test_a_path_keyed_docs_type_still_needs_a_string_path(tmp_path):
+    text = runbook_with("- {name: path}", "- {name: path, type: integer}")
+    with pytest.raises(ProjectSchemaError, match="so it must declare a string 'path' field"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_a_field_keyed_docs_type_gets_its_key_constraint_and_name_index(tmp_path):
+    statements = resolve_effective_schema(write_schema(tmp_path, ADR)).constraint_statements()
+    assert statements[len(constraint_statements()) :] == [
+        "CREATE CONSTRAINT adr_repo_key IF NOT EXISTS FOR (n:Adr) REQUIRE (n.repo_id, n.adr_id) IS UNIQUE",
+        "CREATE INDEX adr_repo_name IF NOT EXISTS FOR (n:Adr) ON (n.repo_id, n.name)",
+    ]
+
+
+def test_filesystem_key_message_still_names_the_filesystem(tmp_path):
+    text = WORKTREE.replace(
+        "      - label: File\n        key: [path]\n        metadata: [{name: path}]",
+        "      - label: File\n        key: [slug]\n        metadata: [{name: slug}]",
+    )
+    with pytest.raises(ProjectSchemaError, match=r"sourced from the filesystem, so its key must be exactly \[path\]"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "old, new, message",
+    [
+        ("        field: service\n", "", r"relationship 'RUNBOOK_FOR' uses the docs provider, so it needs a 'field'"),
+        ("        field: service\n", "        field: service\n        custom: {name: linker}\n", "docs provider, which must not declare a custom block"),
+        ("type: RUNBOOK_FOR", "type: DOCUMENTED_BY", "cannot be redeclared by the docs provider"),
+        ("        field: service\n", '        field: "ser\\nvice"\n', r"relationship 'RUNBOOK_FOR' field .*control character"),
+        ("        field: service\n", '        field: "ser\\u202evice"\n', r"relationship 'RUNBOOK_FOR' field .*format character"),
+    ],
+    ids=["no field", "custom block", "builtin type", "control char", "format char"],
+)
+def test_docs_relationship_rules(tmp_path, old, new, message):
+    with pytest.raises(ProjectSchemaError, match=message):
+        load_project_schema(write_schema(tmp_path, runbook_with(old, new)))
+
+
+def test_docs_relationship_from_labels_must_be_docs_sourced(tmp_path):
+    text = runbook_with("from: Runbook", "from: [Runbook, Widget]").replace(
+        "    relationships:",
+        "      - label: Widget\n        key: [slug]\n        metadata: [{name: slug}]\n    relationships:",
+    )
+    with pytest.raises(
+        ProjectSchemaError,
+        match=r"docs relationship 'RUNBOOK_FOR' from label 'Widget' is not a node type sourced from Markdown front matter",
+    ):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_a_filesystem_type_is_not_a_docs_relationship_source(tmp_path):
+    text = WORKTREE + (
+        "      - type: DESCRIBES\n"
+        "        provider: docs\n"
+        "        from: File\n"
+        "        to: Folder\n"
+        "        field: folder\n"
+    )
+    with pytest.raises(ProjectSchemaError, match="from label 'File' is not a node type sourced from Markdown front matter"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+@pytest.mark.parametrize("provider", ["builtin", "filesystem", "custom"])
+def test_field_is_only_for_docs_relationships(tmp_path, provider):
+    extra = {"builtin": "", "filesystem": "", "custom": "        custom: {name: linker}\n"}[provider]
+    rel_type = "DOCUMENTED_BY" if provider == "builtin" else "IS_CHILD_OF"
+    text = WORKTREE.replace("type: IS_CHILD_OF", f"type: {rel_type}").replace(
+        "        provider: filesystem\n        from: [File, Folder]\n        to: Folder\n",
+        f"        provider: {provider}\n        from: [File, Folder]\n        to: Folder\n{extra}        field: folder\n",
+    )
+    with pytest.raises(ProjectSchemaError, match=rf"relationship '{rel_type}' uses the {provider} provider; only docs relationships take a 'field'"):
+        load_project_schema(write_schema(tmp_path, text))
+
+
+def test_several_docs_node_types_are_allowed_beside_filesystem_types(tmp_path):
+    text = WORKTREE.replace(
+        "    relationships:",
+        "      - label: Adr\n        key: [path]\n        metadata: [{name: path}]\n"
+        "        source: {provider: docs, paths: ['adr/*.md']}\n"
+        "      - label: Policy\n        key: [path]\n        metadata: [{name: path}]\n"
+        "        source: {provider: docs, paths: ['**/*.md'], where: [{field: kind, is: policy}]}\n"
+        "    relationships:",
+    )
+    effective = resolve_effective_schema(write_schema(tmp_path, text))
+    providers = {n.label: n.source.provider for n in effective.node_types}
+    assert providers == {"File": "filesystem", "Folder": "filesystem", "Adr": "docs", "Policy": "docs"}
+
+
+def test_docs_types_do_not_count_toward_the_filesystem_kind_limit(tmp_path):
+    # A docs type beside a filesystem file type is fine; two filesystem file types are not.
+    text = WORKTREE.replace(
+        "    relationships:",
+        "      - label: Doc\n        key: [path]\n        metadata: [{name: path}]\n"
+        "        source: {provider: docs, paths: ['**/*.md']}\n    relationships:",
+    )
+    load_project_schema(write_schema(tmp_path, text))
+    with pytest.raises(ProjectSchemaError, match="both filesystem file types"):
+        load_project_schema(write_schema(tmp_path, text.replace("source: {provider: docs, paths: ['**/*.md']}", "source: {provider: filesystem, kind: file}")))
+
+
+def test_docs_types_get_a_repo_name_index_beside_their_key_constraint(tmp_path):
+    effective = resolve_effective_schema(write_schema(tmp_path, RUNBOOK))
+    statements = effective.constraint_statements()
+    assert statements[len(constraint_statements()) :] == [
+        "CREATE CONSTRAINT runbook_repo_key IF NOT EXISTS FOR (n:Runbook) REQUIRE (n.repo_id, n.path) IS UNIQUE",
+        "CREATE INDEX runbook_repo_name IF NOT EXISTS FOR (n:Runbook) ON (n.repo_id, n.name)",
+    ]
+
+
+def test_a_docs_index_name_may_not_collide_with_an_existing_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(project_schema, "_builtin_constraint_names", lambda: {"runbook_repo_name"})
+    with pytest.raises(ProjectSchemaError, match="runbook_repo_name"):
+        resolve_effective_schema(write_schema(tmp_path, RUNBOOK))
+
+
+def test_json_schema_describes_the_docs_source():
+    defs = project_schema_json_schema()["$defs"]
+    assert set(defs["DocsSource"]["properties"]) == {"provider", "paths", "where", "fields"}
+    assert set(defs["Condition"]["properties"]) == {"field", "is", "starts_with", "contains", "like"}
+    assert "field" in defs["RelationshipDecl"]["properties"]
+
+
+def test_starter_example_is_the_runbook_example():
+    text = project_schema.starter_schema_text()
+    assert "provider: docs" in text and "RUNBOOK_FOR" in text and "provider: custom" not in text
+    assert "comes later" not in text and "Markdown front matter" in text
+
+
+def test_starter_header_says_a_docs_type_may_be_keyed_on_a_front_matter_field():
+    text = project_schema.starter_schema_text()
+    header = text[:text.index("version:")]
+    assert "key: [adr_id]" in header and "supersedes: ADR-012" in header
+    assert "key: [path]" in text[text.index("version:"):]  # the example stays the Runbook

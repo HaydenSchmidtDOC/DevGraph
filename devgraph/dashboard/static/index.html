@@ -3007,7 +3007,7 @@ let configModel = null;
    after either is stale and dropped, so an older fingerprint never comes back */
 let configLoadSeq = 0;
 /* the open editor: { scope, section, op, name, dest, step, fps, confirmed, warnings, crossName, dryTarget, dryYaml, busy, label, armedAt,
-   mode (form|yaml), formState, formText, openText, openEntry, order } */
+   mode (form|yaml), formState, formText, openText, openEntry, order, parseRefused } */
 let configEdit = null;
 /* the open reset dialog: { scope, kind, opener, phrase, fingerprint, review, stale, busy, ready, armedAt } */
 let configReset = null;
@@ -3331,7 +3331,8 @@ function renderConfigModal() {
   configShow("configDestField", edit.step === "edit" &&
     (edit.op === "copy" || (edit.scope === CONFIG_GLOBAL && edit.section === "tools" && edit.op === "replace")));
   /* Form | YAML: offered by op first (delete and copy are the read-only YAML),
-     then by the text: the form shows only text it produced */
+     then by the text: the form's own text, the opening text, or hand-edited
+     text the server reads back (configFormReadBack) */
   const sw = configFormAvailability(edit);
   if (edit.mode === "form" && !(sw && sw.available)) edit.mode = "yaml";
   const form = edit.mode === "form";
@@ -3340,16 +3341,16 @@ function renderConfigModal() {
   configShow("configForm", edit.step === "edit" && form);
   configShow("configEditorSwitch", edit.step === "edit" && !!sw);
   configShow("configFormHelp", edit.step === "edit" && form);
-  const notice = edit.step === "edit" && !!sw && !form && !sw.available;
+  const notice = edit.step === "edit" && !!sw && !form && !!sw.reason;
   document.getElementById("configFormNoticeText").textContent = notice ? sw.reason : "";
   configShow("configFormNotice", notice);
-  configShow("configFormDiscard", notice && sw.reason === CONFIG_FORM_REASONS.handEdit);
+  configShow("configFormDiscard", notice && !!sw.handEdit && !!edit.formState);
   const formBtn = document.getElementById("configModeForm");
   formBtn.setAttribute("aria-pressed", String(form));
   document.getElementById("configModeYaml").setAttribute("aria-pressed", String(!form));
   /* unavailable, the Form button stays focusable so its reason can be read */
   formBtn.setAttribute("aria-disabled", String(!(sw && sw.available)));
-  if (sw && !sw.available) formBtn.setAttribute("aria-describedby", "configFormNoticeText");
+  if (sw && sw.reason) formBtn.setAttribute("aria-describedby", "configFormNoticeText");
   else formBtn.removeAttribute("aria-describedby");
   const confirm = document.getElementById("configModalConfirm");
   confirm.replaceChildren();
@@ -3457,7 +3458,7 @@ function openConfigEditor(opts) {
      untouched save sends exactly what was opened */
   const rep = configFormFromEntry(opts.section, opts.entry);
   Object.assign(configEdit, { openText: opts.yaml || "", openEntry: opts.entry, formText: opts.yaml || "",
-    formState: rep.ok ? rep.form : null, order: configIsMap(opts.entry) ? Object.keys(opts.entry) : [] });
+    formState: rep.ok ? rep.form : null, order: configIsMap(opts.entry) ? Object.keys(opts.entry) : [], parseRefused: null });
   configEdit.mode = configFormOp(opts) && rep.ok && configEditorPref !== "yaml" ? "form" : "yaml";
   configFormSeq = 0;
   if (configEdit.mode === "form") renderConfigForm(configEdit);
@@ -3895,19 +3896,24 @@ const CONFIG_FORM_FIELDS = {
   node_type: ["label", "key", "description", "color", "source", "metadata"],
   metadata: ["name", "type", "required", "description"],
   source: ["provider", "kind"],
-  relationship: ["type", "from", "to", "provider", "custom", "color"],
+  docs_source: ["provider", "paths", "where", "fields"],
+  condition: ["field", "is", "starts_with", "contains", "like"],
+  relationship: ["type", "from", "to", "provider", "custom", "field", "color"],
   custom: ["name", "params"],
   parameter_types: ["string", "integer", "float", "boolean"],
   metadata_types: ["string", "integer", "float", "boolean"],
   filesystem_kinds: ["file", "folder"],
-  source_providers: ["filesystem"],
-  relationship_providers: ["builtin", "custom", "filesystem"],
+  condition_operators: ["is", "starts_with", "contains", "like"],
+  source_providers: ["filesystem", "docs"],
+  relationship_providers: ["builtin", "custom", "filesystem", "docs"],
 };
 /* the validators' patterns (used as fullmatch) and limits, for advisory hints only */
 const CONFIG_FORM_LIMITS = {
   NAME_PATTERN: "[a-z][a-z0-9_]{0,63}", LABEL_PATTERN: "[A-Za-z][A-Za-z0-9_]{0,63}",
   PROPERTY_NAME_PATTERN: "[a-z][a-z0-9_]{0,63}", RELATIONSHIP_TYPE_PATTERN: "[A-Z][A-Z0-9_]{0,63}", COLOR_PATTERN: "^#[0-9a-fA-F]{6}$",
   MAX_DESCRIPTION_LENGTH: 1024, MAX_ROWS_LIMIT: 1000, MAX_TIMEOUT_S: 60, DEFAULT_MAX_ROWS: 100, DEFAULT_TIMEOUT_S: 10,
+  MAX_DOCS_PATHS: 20, MAX_GLOB_LENGTH: 200, MAX_GLOBSTARS: 2, MAX_CONDITIONS: 20, MAX_CONDITION_TEXT: 200, MAX_FIELD_MAP: 50,
+  MAX_FRONT_MATTER_KEY_LENGTH: 64, MAX_DOCS_TYPES: 20, MAX_SCHEMA_CONDITIONS: 100, MAX_LIKE_STARS: 10,
 };
 const CONFIG_FORM_REASONS = {
   field: path => "This entry has a field the form doesn't edit: `" + path + "`. Edit it as YAML.",
@@ -3917,7 +3923,13 @@ const CONFIG_FORM_REASONS = {
   value: "This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML.",
   fromList: "This entry's `from` can't be shown as comma-separated labels exactly (a label with a comma, surrounding spaces or a non-text value). Edit it as YAML.",
   customProvider: "This entry has a `custom` block but its provider isn't custom; the form can't show that. Edit it as YAML.",
-  handEdit: "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form.",
+  fieldProvider: "This entry has a `field` but its provider isn't Markdown front matter; the form can't show that. Edit it as YAML.",
+  sourceKey: name => "This entry's source has a setting the form doesn't edit: `" + name + "`. Edit it as YAML.",
+  fieldsName: name => "This entry's front-matter keys (`fields`) name `" + name + "`, which is not one of its metadata fields; the form can't show that. Edit it as YAML.",
+  fieldsPath: "This entry reads `path` from front matter, but path is always the file's own location; the form can't show that. Edit it as YAML.",
+  fieldsOrder: "This entry lists its front-matter keys (`fields`) in a different order from its metadata fields; the form would reorder them. Edit it as YAML.",
+  condition: n => "Condition " + n + " doesn't use exactly one test (is, starts_with, contains or like); the form can't show that. Edit it as YAML.",
+  handEdit: "The YAML was edited by hand. Form reads it back if the form can show it exactly, or discard the hand edits to return to the form's last text.",
 };
 const configIsMap = v => v !== null && typeof v === "object" && !Array.isArray(v);
 const configIsScalar = v => v === null || ["string", "number", "boolean"].includes(typeof v);
@@ -3929,6 +3941,8 @@ const configFormText = v => v === null || v === undefined ? "" : String(v);
 const CONFIG_FORM_LINE_BREAK = /[\n\r\x85\u2028\u2029]/;
 const configFormLine = v => typeof v === "string" && !CONFIG_FORM_LINE_BREAK.test(v);
 const configFormArea = v => typeof v === "string" && !v.includes("\r");
+/* a condition value: text, or a number or boolean (compared as its text, kept as written) */
+const configFormOperand = v => configFormLine(v) || Number.isInteger(v) || typeof v === "boolean";
 /* per field: what a value must be for the form to show it exactly */
 const CONFIG_FORM_CHECKS = {
   tool: { name: configFormLine, description: configFormArea, cypher: configFormArea,
@@ -3942,9 +3956,13 @@ const CONFIG_FORM_CHECKS = {
   metadata: { name: configFormLine, type: v => CONFIG_FORM_FIELDS.metadata_types.includes(v),
     required: v => typeof v === "boolean", description: v => v === null || configFormLine(v) },
   source: { provider: v => CONFIG_FORM_FIELDS.source_providers.includes(v), kind: v => CONFIG_FORM_FIELDS.filesystem_kinds.includes(v) },
+  /* a blank front-matter key would read back as "same as the field name" */
+  docs_source: { provider: v => v === "docs", paths: v => Array.isArray(v) && v.every(configFormLine), where: Array.isArray,
+    fields: v => configIsMap(v) && Object.values(v).every(k => configFormLine(k) && k !== "") },
+  condition: { field: configFormLine, is: configFormOperand, starts_with: configFormOperand, contains: configFormOperand, like: configFormOperand },
   relationship: { type: configFormLine, from: configFormLabels, to: configFormLine,
     provider: v => CONFIG_FORM_FIELDS.relationship_providers.includes(v), custom: v => v === null || configIsMap(v),
-    color: v => v === null || configFormLine(v) },
+    field: v => v === null || configFormLine(v), color: v => v === null || configFormLine(v) },
   custom: { name: configFormLine, params: v => configIsMap(v) && !Object.keys(v).length },
 };
 /* `from` as the form shows it: a string, or a list joined with ", " */
@@ -3973,6 +3991,24 @@ function configFormBadRows(rows, kind, prefix) {
   }
   return null;
 }
+/* why the form can't show a node type's `source` exactly, or null; each
+   provider has its own keys, and only the ones it needs must be present */
+function configFormSourceReason(src) {
+  const kind = src.provider === "docs" ? "docs_source" : "source";
+  for (const [k, v] of Object.entries(src)) {
+    if (!CONFIG_FORM_FIELDS[kind].includes(k)) return CONFIG_FORM_REASONS.sourceKey(k);
+    if (!CONFIG_FORM_CHECKS[kind][k](v)) return CONFIG_FORM_REASONS.field("source." + k);
+  }
+  const missing = (kind === "docs_source" ? ["provider", "paths"] : ["provider", "kind"]).find(k => !(k in src));
+  if (missing) return CONFIG_FORM_REASONS.field("source." + missing);
+  const where = kind === "docs_source" ? src.where || [] : [];
+  for (let i = 0; i < where.length; i++) {
+    const bad = configIsMap(where[i]) ? configFormBadField(where[i], "condition", "source.where." + i + ".") : "source.where." + i;
+    if (bad) return CONFIG_FORM_REASONS.field(bad);
+    if (CONFIG_FORM_FIELDS.condition_operators.filter(op => op in where[i]).length !== 1) return CONFIG_FORM_REASONS.condition(i + 1);
+  }
+  return null;
+}
 /* {ok: true, form} when the form can show `entry` exactly, else {ok: false, reason} */
 function configFormFromEntry(section, entry) {
   if (!configIsMap(entry)) return { ok: false, reason: CONFIG_FORM_REASONS.value };
@@ -3985,10 +4021,11 @@ function configFormFromEntry(section, entry) {
       if (bad) return { ok: false, reason: bad === "from" ? CONFIG_FORM_REASONS.fromList : CONFIG_FORM_REASONS.field(bad) };
     }
     if (configIsMap(entry.custom) && entry.provider !== "custom") return { ok: false, reason: CONFIG_FORM_REASONS.customProvider };
+    if (typeof entry.field === "string" && entry.provider !== "docs") return { ok: false, reason: CONFIG_FORM_REASONS.fieldProvider };
     return { ok: true, form: {
       type: t(entry.type), from: "from" in entry ? configFormFromText(entry.from) : "", to: t(entry.to),
-      provider: entry.provider || "builtin", custom: t(configIsMap(entry.custom) ? entry.custom.name : null), color: t(entry.color),
-      open: entry } };
+      provider: entry.provider || "builtin", custom: t(configIsMap(entry.custom) ? entry.custom.name : null), field: t(entry.field),
+      color: t(entry.color), open: entry } };
   }
   if (section === "tools") {
     const bad = configFormBadField(entry, "tool", "") || configFormBadRows(entry.parameters || [], "parameter", "parameters.");
@@ -4001,12 +4038,11 @@ function configFormFromEntry(section, entry) {
       open: entry } };
   }
   const metadata = entry.metadata || [];
-  let bad = configFormBadField(entry, "node_type", "") || configFormBadRows(metadata, "metadata", "metadata.");
-  if (!bad && configIsMap(entry.source)) {
-    bad = configFormBadField(entry.source, "source", "source.") ||
-      CONFIG_FORM_FIELDS.source.map(k => "source." + k).find(k => !(k.slice(7) in entry.source)) || null;
-  }
+  const bad = configFormBadField(entry, "node_type", "") || configFormBadRows(metadata, "metadata", "metadata.");
   if (bad) return { ok: false, reason: CONFIG_FORM_REASONS.field(bad) };
+  const src = configIsMap(entry.source) ? entry.source : null;
+  const sourceReason = src && configFormSourceReason(src);
+  if (sourceReason) return { ok: false, reason: sourceReason };
   const names = metadata.map(m => m.name);
   const twice = names.find((n, i) => names.indexOf(n) !== i);
   if (twice !== undefined) return { ok: false, reason: CONFIG_FORM_REASONS.twice(twice) };
@@ -4014,11 +4050,25 @@ function configFormFromEntry(section, entry) {
   const missing = key.find(k => !names.includes(k));
   if (missing !== undefined) return { ok: false, reason: CONFIG_FORM_REASONS.keyName(missing) };
   if (key.some((k, i) => i && names.indexOf(k) <= names.indexOf(key[i - 1]))) return { ok: false, reason: CONFIG_FORM_REASONS.keyOrder };
+  /* front-matter keys sit on their metadata rows, so `fields` must follow the metadata order */
+  const docs = src && src.provider === "docs" ? src : null;
+  const fields = docs && docs.fields ? docs.fields : {};
+  const mapped = Object.keys(fields);
+  if (mapped.includes("path")) return { ok: false, reason: CONFIG_FORM_REASONS.fieldsPath };
+  const unknown = mapped.find(k => !names.includes(k));
+  if (unknown !== undefined) return { ok: false, reason: CONFIG_FORM_REASONS.fieldsName(unknown) };
+  if (mapped.some((k, i) => i && names.indexOf(k) <= names.indexOf(mapped[i - 1]))) return { ok: false, reason: CONFIG_FORM_REASONS.fieldsOrder };
+  const ops = CONFIG_FORM_FIELDS.condition_operators;
   return { ok: true, form: {
     label: t(entry.label), description: t(entry.description), color: t(entry.color),
-    source: entry.source ? entry.source.kind : "",
+    source: src ? (docs ? "docs" : src.kind) : "",
+    paths: (docs ? docs.paths : []).map(glob => ({ glob })),
+    where: (docs && docs.where || []).map(c => {
+      const op = ops.find(o => o in c);
+      return { field: t(c.field), op, value: t(c[op]), open: c };
+    }),
     metadata: metadata.map(m => ({ name: t(m.name), type: m.type || "string", required: m.required === true,
-      key: key.includes(m.name), description: t(m.description), open: m })),
+      key: key.includes(m.name), description: t(m.description), fm_key: t(Object.hasOwn(fields, m.name) ? fields[m.name] : null), open: m })),
     open: entry } };
 }
 /* The rules that keep a form edit from rewriting what it didn't touch: a field
@@ -4090,6 +4140,9 @@ function configEntryFromForm(section, form, order) {
       if (block && "params" in block) c.params = block.params;
       vals.custom = configFormOrdered(c, Object.keys(block || {}), CONFIG_FORM_FIELDS.custom);
     }
+    /* the front-matter field likewise: written only for the docs provider */
+    if ("field" in open && open.field === null && !(form.provider === "docs" && form.field !== "")) vals.field = null;
+    else if (form.provider === "docs") configFormPut(vals, open, "field", form.field, id);
     configFormPut(vals, open, "color", form.color, id);
     return configFormOrdered(vals, order, CONFIG_FORM_FIELDS.relationship);
   }
@@ -4098,7 +4151,10 @@ function configEntryFromForm(section, form, order) {
   if (key.length || "key" in open) vals.key = key;
   configFormPut(vals, open, "description", form.description, id);
   configFormPut(vals, open, "color", form.color, id);
-  if ("source" in open && (open.source ? open.source.kind : "") === form.source) vals.source = open.source;
+  const openSource = configIsMap(open.source) ? open.source : null;
+  const openDocs = openSource && openSource.provider === "docs" ? openSource : null;
+  if (form.source === "docs") vals.source = configFormDocsSource(form, openDocs || {});
+  else if ("source" in open && (openSource ? (openDocs ? "docs" : openSource.kind) : "") === form.source) vals.source = open.source;
   else if (form.source) vals.source = { provider: "filesystem", kind: form.source };
   const rows = form.metadata.map(m => {
     const o = m.open || {}, v = {};
@@ -4110,6 +4166,28 @@ function configEntryFromForm(section, form, order) {
   });
   if (rows.length || "metadata" in open) vals.metadata = rows;
   return configFormOrdered(vals, order, CONFIG_FORM_FIELDS.node_type);
+}
+/* a docs source from the form: unchanged paths stay as opened (empty rows are
+   not written), each condition keeps its own key order and an untouched value
+   (a number or boolean stays one), and `fields` comes from the metadata rows'
+   front-matter keys, so a renamed row carries its key */
+function configFormDocsSource(form, o) {
+  const v = { provider: "docs" };
+  const globs = form.paths.map(p => p.glob);
+  v.paths = Array.isArray(o.paths) && JSON.stringify(o.paths) === JSON.stringify(globs) ? o.paths : globs.filter(g => g !== "");
+  const where = form.where.map(r => {
+    const ro = r.open || {}, c = {};
+    configFormPut(c, ro, "field", r.field, text => text);
+    c[r.op] = r.op in ro && configFormText(ro[r.op]) === r.value ? ro[r.op] : r.value;
+    /* a changed test takes the old one's place */
+    return configFormOrdered(c, Object.keys(ro).map(k => CONFIG_FORM_FIELDS.condition_operators.includes(k) ? r.op : k), CONFIG_FORM_FIELDS.condition);
+  });
+  if (where.length || "where" in o) v.where = where;
+  /* fromEntries: a key is always the entry's own, whatever its name */
+  /* path is the file's own location: its row shows no front-matter key, so none is written */
+  const fields = Object.fromEntries(form.metadata.filter(m => m.fm_key !== "" && m.name !== "path").map(m => [m.name, m.fm_key]));
+  if (Object.keys(fields).length || "fields" in o) v.fields = fields;
+  return configFormOrdered(v, Object.keys(o), CONFIG_FORM_FIELDS.docs_source);
 }
 /* PyYAML refuses these characters anywhere in a stream (or, for \x85 and
    \u2028/\u2029, reads them as line breaks), so a quoted string escapes them */
@@ -4140,8 +4218,10 @@ function configYamlScalar(value, indent = "  ", flow = false) {
 }
 function configYamlLines(map, keys, indent) {
   const lines = [];
-  for (const k of keys) {
-    const v = map[k];
+  for (const name of keys) {
+    const v = map[name];
+    /* a key is quoted like a value: a front-matter key may read as a boolean (on), a number or YAML syntax */
+    const k = configYamlScalar(name, "", true);
     if (Array.isArray(v) && v.length && v.every(configIsMap)) {
       lines.push(indent + k + ":");
       for (const item of v) {
@@ -4181,7 +4261,22 @@ function configFormContext(model, scope) {
     labels: (schema && schema.extends === "none" ? [] : model.global.node_types.map(n => n.label)).concat(rows.map(r => r.label)),
     relationship_types: model.global.relationship_types.map(r => r.type),
     filesystem: { file: kind("file"), folder: kind("folder") },
+    docs: rows.filter(r => configIsMap(r.entry) && configIsMap(r.entry.source) && r.entry.source.provider === "docs").map(r => r.label),
   };
+}
+/* why a docs path would be refused (spec: devgraph/config/project_schema.py _glob_problem), in plain words, or null */
+function configFormGlobHint(glob) {
+  const L = CONFIG_FORM_LIMITS;
+  if (glob === "") return null; /* an empty row is not written */
+  if ([...glob].length > L.MAX_GLOB_LENGTH) return "A path is at most " + L.MAX_GLOB_LENGTH + " characters.";
+  if (glob.includes("\\")) return "Separate folders with /, not \\.";
+  if (glob.startsWith("/")) return "Write the path from the repository root, without a leading /.";
+  const parts = glob.split("/");
+  if (parts.includes(".") || parts.includes("..")) return "Write the path from the repository root, without ./ or ../ (for example runbooks/**/*.md).";
+  if (parts.includes("")) return "Use a single / between folders, and don't end the path with /.";
+  if (parts.filter(p => p === "**").length > L.MAX_GLOBSTARS) return "Use ** at most " + L.MAX_GLOBSTARS + " times in one path.";
+  if (/\.[A-Za-z0-9]+$/.test(glob) && !/\.(md|markdown)$/.test(glob)) return "Only .md and .markdown files are read: end the path with *.md.";
+  return null;
 }
 /* advisory hints [{field, text}]: cheap structural checks that never block Save;
    `ctx` (configFormContext) adds the relationship checks against the page model */
@@ -4229,10 +4324,14 @@ function configFormHints(section, form, ctx) {
     if (ctx && typeOk) {
       const builtin = ctx.relationship_types.includes(form.type);
       if (form.provider === "builtin" && !builtin) {
-        hint("provider", "The builtin provider reuses one of DevGraph's relationship types; pick Custom or Filesystem to declare a new one.");
+        hint("provider", "The builtin provider reuses one of DevGraph's relationship types; pick Custom, Filesystem or Markdown front matter to declare a new one.");
       } else if (form.provider !== "builtin" && builtin) hint("provider", "`" + form.type + "` is built in: use the builtin provider to reuse it.");
     }
     if (form.provider === "custom") nameHint("custom", form.custom, L.PROPERTY_NAME_PATTERN, "A custom provider name");
+    if (form.provider === "docs" && !form.field) hint("field", "Name the front-matter key whose value names the target, for example service.");
+    else if (form.provider === "docs" && [...form.field].length > L.MAX_FRONT_MATTER_KEY_LENGTH) {
+      hint("field", "A front-matter key is at most " + L.MAX_FRONT_MATTER_KEY_LENGTH + " characters.");
+    }
     const known = (field, label) => {
       if (ctx && !ctx.labels.includes(label)) {
         hint(field, "`" + label + "` isn't a node type this repository has (built-in, or declared in this file as last loaded).");
@@ -4262,6 +4361,10 @@ function configFormHints(section, form, ctx) {
           .forEach(l => hint("from", "`" + l + "` is not a filesystem node type."));
       }
     }
+    if (ctx && form.provider === "docs") {
+      from.filter((l, i) => from.indexOf(l) === i && ctx.labels.includes(l) && !ctx.docs.includes(l))
+        .forEach(l => hint("from", "`" + l + "` is not sourced from Markdown front matter; this relationship starts from a node type that is."));
+    }
     colorHint();
     return out;
   }
@@ -4272,20 +4375,54 @@ function configFormHints(section, form, ctx) {
   form.metadata.forEach((m, i) => nameHint("metadata." + i + ".name", m.name, L.PROPERTY_NAME_PATTERN, "A field name"));
   dupes(form.metadata, "metadata.", "field");
   colorHint();
-  if (form.source && !(key.length === 1 && key[0].name === "path" && key[0].type === "string")) {
+  if (form.source && form.source !== "docs" && !(key.length === 1 && key[0].name === "path" && key[0].type === "string")) {
     hint("source", "A filesystem node type's key must be exactly one string field named path.");
   }
+  if (form.source !== "docs") return out;
+  /* a docs key is path or one front-matter field, always text; an integer one only needs its type changed */
+  if (key.length === 1 && key[0].type === "integer") hint("metadata." + form.metadata.indexOf(key[0]) + ".type", "Use string: numbers like 12 still work.");
+  else if (!(key.length === 1 && key[0].type === "string")) {
+    hint("source", "A node type sourced from Markdown front matter is keyed on exactly one string field: path (the file's location) or a front-matter field such as id.");
+  }
+  if (!form.metadata.some(m => m.name === "path" && m.type === "string")) hint("key", "Add a field named path (type string): each entry records its file there.");
+  const globs = form.paths.filter(p => p.glob !== "");
+  if (!globs.length) hint("paths", "Add at least one path, for example runbooks/**/*.md.");
+  else if (globs.length > L.MAX_DOCS_PATHS) hint("paths", "At most " + L.MAX_DOCS_PATHS + " paths.");
+  form.paths.forEach((p, i) => { const why = configFormGlobHint(p.glob); if (why) hint("paths." + i + ".glob", why); });
+  if (form.where.length > L.MAX_CONDITIONS) hint("where", "At most " + L.MAX_CONDITIONS + " conditions.");
+  const keyTooLong = "A front-matter key is at most " + L.MAX_FRONT_MATTER_KEY_LENGTH + " characters.";
+  form.where.forEach((c, i) => {
+    if (!c.field) hint("where." + i + ".field", "Name the front-matter field to test: the name before the colon at the top of the file.");
+    else if ([...c.field].length > L.MAX_FRONT_MATTER_KEY_LENGTH) hint("where." + i + ".field", keyTooLong);
+    if ([...c.value].length > L.MAX_CONDITION_TEXT) hint("where." + i + ".value", "The value is longer than " + L.MAX_CONDITION_TEXT + " characters.");
+    else if (c.op === "like" && c.value.split("*").length - 1 > L.MAX_LIKE_STARS) hint("where." + i + ".value", "Use * at most " + L.MAX_LIKE_STARS + " times in one pattern.");
+  });
+  form.metadata.forEach((m, i) => {
+    if (m.name !== "path" && [...m.fm_key].length > L.MAX_FRONT_MATTER_KEY_LENGTH) hint("metadata." + i + ".fm_key", keyTooLong);
+  });
   return out;
 }
-/* Can the editor (back) in YAML mode show the form for `text`? Only for text
-   whose mapping is known: the form's own last output (restore its state) or
-   the opening text (rebuild from the opening entry). */
+/* Can the editor (back) in YAML mode show the form for `text`? The form's own
+   last output restores its state; the opening text rebuilds from the opening
+   entry; any other (hand-edited) text is read back by the server ("parse"),
+   unless reading back this exact text was already refused (a failed request
+   may be retried). */
 function configFormSwitch(edit, text) {
-  const rep = configFormFromEntry(edit.section, edit.openEntry);
-  if (!rep.ok) return { available: false, restore: null, reason: rep.reason };
   if (edit.formState && text === edit.formText) return { available: true, restore: "state", reason: null };
-  if (text === edit.openText) return { available: true, restore: "open", reason: null };
-  return { available: false, restore: null, reason: CONFIG_FORM_REASONS.handEdit };
+  if (text === edit.openText) {
+    const rep = configFormFromEntry(edit.section, edit.openEntry);
+    return rep.ok ? { available: true, restore: "open", reason: null } : { available: false, restore: null, reason: rep.reason };
+  }
+  const refused = edit.parseRefused && edit.parseRefused.text === text ? edit.parseRefused : null;
+  if (refused && !refused.retry) return { available: false, restore: null, reason: refused.reason, handEdit: true };
+  return { available: true, restore: "parse", reason: refused ? refused.reason : CONFIG_FORM_REASONS.handEdit, handEdit: true };
+}
+/* the parse route's entry kind for each editor section */
+const CONFIG_PARSE_KINDS = { tools: "tool", node_types: "node_type", relationships: "relationship" };
+/* read-only: the server parses the text (the browser never parses YAML) and returns the mapping or null */
+function configParseRequest(section, yaml) {
+  return { url: "/api/config/parse", init: { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind: CONFIG_PARSE_KINDS[section], yaml }) } };
 }
 /* ── the form view (DOM). The form is a view over #configYaml: every change
    re-serialises the entry into the textarea and runs the textarea's own reset,
@@ -4333,15 +4470,47 @@ function configSetEditorMode(mode) {
   if (mode === "form") {
     const sw = configFormAvailability(edit);
     if (!sw || !sw.available) return;
+    if (sw.restore === "parse") return configFormReadBack(edit);
     if (sw.restore === "open") {
       edit.formState = configFormFromEntry(edit.section, edit.openEntry).form;
       edit.formText = edit.openText;
+      edit.order = Object.keys(edit.openEntry);
     }
     renderConfigForm(edit);
   }
   edit.mode = mode;
   configEditorPref = mode;
   renderConfigModal();
+}
+/* Form after a hand edit: the server reads the text back. The switch never
+   writes the textarea: the form takes the mapping as its state and the typed
+   text as its own, so the text (and a confirm covering it) is kept until a
+   form control changes it. A reply for an editor that was closed, switched or
+   retyped meanwhile is dropped. */
+async function configFormReadBack(edit) {
+  const yaml = document.getElementById("configYaml");
+  const text = yaml.value;
+  const pressed = document.activeElement;
+  edit.busy = "Reading…";
+  renderConfigModal();
+  const res = await configSend(configParseRequest(edit.section, text));
+  edit.busy = "";
+  if (configEdit !== edit) return;
+  if (edit.mode === "yaml" && yaml.value === text) {
+    const entry = res.ok && res.body ? res.body.entry : null;
+    const rep = configIsMap(entry) ? configFormFromEntry(edit.section, entry) : null;
+    if (rep && rep.ok) {
+      Object.assign(edit, { formState: rep.form, formText: text, order: Object.keys(entry), parseRefused: null, mode: "form" });
+      configEditorPref = "form";
+      renderConfigForm(edit);
+    } else if (!res.ok) {
+      edit.parseRefused = { text, retry: true, reason: describeConfigError(res.status, res.body && res.body.detail) };
+    } else {
+      edit.parseRefused = { text, reason: res.body && res.body.error ? String(res.body.error) : rep ? rep.reason : CONFIG_FORM_REASONS.value };
+    }
+  }
+  renderConfigModal();
+  if (configFocusLost(pressed)) (edit.mode === "form" ? configEditorFocusTarget() : pressed).focus();
 }
 /* back to the form's last text (through the textarea's reset, so a confirm is dropped) */
 function configFormDiscard() {
@@ -4428,6 +4597,17 @@ function configFormCheck(checked, set) {
   el.addEventListener("change", () => { if (!configFormLocked()) set(el.checked); });
   return el;
 }
+/* empty a holder that is filled in place, dropping its controls, hint boxes and
+   updaters from the rendered form's lists so nothing hidden stays reachable */
+function configFormClear(holder) {
+  const inside = el => { for (let e = el; e; e = e.parentNode) if (e === holder) return true; return false; };
+  configFormEls.all = configFormEls.all.filter(c => !inside(c));
+  configFormEls.refresh = configFormEls.refresh.filter(fn => !fn.el || !inside(fn.el));
+  for (const map of [configFormEls.controls, configFormEls.hints]) {
+    for (const [path, el] of Object.entries(map)) if (inside(el)) delete map[path];
+  }
+  holder.replaceChildren();
+}
 /* a structural change (a row, a type, Required): rebuild, refocus, re-serialise */
 function configFormRebuild(edit, focusPath) {
   renderConfigForm(edit);
@@ -4463,11 +4643,12 @@ function renderConfigForm(edit) {
   box.replaceChildren(configEl("legend", "", { tools: "Tool", node_types: "Node type", relationships: "Relationship" }[edit.section]));
   const text = (parent, path, label, key, obj, help, tag = "input") =>
     configFormField(parent, path, label, configFormText_(tag, obj[key], v => { obj[key] = v; }), help);
-  const rows = (title, list, noun, addLabel, fresh, fill) => {
+  /* `prefix` names the rows' fields; `focusKey` is the field a new row focuses;
+     `nameOf` is what a row's legend and Remove button name it by */
+  const rows = (title, list, noun, addLabel, fresh, fill, prefix, focusKey = "name", nameOf = row => row.name) => {
     const group = configEl("fieldset", "");
     const legend = configEl("legend", "", title);
     group.appendChild(legend);
-    const prefix = edit.section === "tools" ? "parameters." : "metadata.";
     list.forEach((row, i) => {
       const set = configEl("fieldset", "");
       const lg = configEl("legend", "");
@@ -4476,13 +4657,15 @@ function renderConfigForm(edit) {
       const remove = configButton("Remove", () => {
         if (configFormLocked()) return;
         list.splice(i, 1);
-        configFormRebuild(edit, i < list.length ? prefix + i + ".name" : prefix + "add");
+        configFormRebuild(edit, i < list.length ? prefix + i + "." + focusKey : prefix + "add");
       });
       configFormEls.all.push(remove);
       const named = () => {
-        lg.textContent = noun[0].toUpperCase() + noun.slice(1) + " " + (i + 1) + (row.name ? ": " + row.name : "");
-        remove.setAttribute("aria-label", "Remove " + noun + " " + (row.name || i + 1));
+        const name = nameOf(row);
+        lg.textContent = noun[0].toUpperCase() + noun.slice(1) + " " + (i + 1) + (name ? ": " + name : "");
+        remove.setAttribute("aria-label", "Remove " + noun + " " + (name || i + 1));
       };
+      named.el = lg;
       named();
       configFormEls.refresh.push(named);
       const actions = configEl("div", "cfg-row-actions");
@@ -4493,7 +4676,7 @@ function renderConfigForm(edit) {
     const add = configButton(addLabel, () => {
       if (configFormLocked()) return;
       list.push(fresh());
-      configFormRebuild(edit, prefix + (list.length - 1) + ".name");
+      configFormRebuild(edit, prefix + (list.length - 1) + "." + focusKey);
     });
     configFormEls.controls[prefix + "add"] = add;
     configFormEls.all.push(add);
@@ -4542,7 +4725,7 @@ function renderConfigForm(edit) {
         fillDefault();
         set.appendChild(holder);
         text(set, path + "description", "Description", "description", p);
-      }));
+      }, "parameters."));
     const num = (key, label, dflt) => {
       const wrap = text(box, key, label, key, f, "");
       const el = wrap.children[1];
@@ -4559,27 +4742,27 @@ function renderConfigForm(edit) {
       (edit.op === "replace" ? " Changing it renames the relationship." : ""));
     text(box, "from", "From", "from", f, "One or more node labels, separated by commas. Each must be a node type declared in this file (or a built-in one when the file uses `extends: default`).");
     text(box, "to", "To", "to", f, "One node label: a node type declared in this file (or a built-in one when the file uses `extends: default`).");
-    const names = { builtin: "Built-in type", custom: "Custom provider", filesystem: "Filesystem (file → parent folder)" };
-    /* Provider changes only the custom name field, in place: the select keeps
-       focus while arrow keys step through the providers */
+    const names = { builtin: "Built-in type", custom: "Custom provider", filesystem: "Filesystem (file → parent folder)",
+      docs: "Markdown front matter" };
+    /* Provider changes only the custom name or front-matter field, in place:
+       the select keeps focus while arrow keys step through the providers */
     const holder = configEl("div", "");
-    let custom = null;
-    const fillCustom = () => {
-      if (custom) configFormEls.all.splice(configFormEls.all.indexOf(custom), 1);
-      delete configFormEls.controls.custom;
-      delete configFormEls.hints.custom;
-      holder.replaceChildren();
-      custom = null;
+    const fillProvider = () => {
+      configFormClear(holder);
       /* empty, the holder would still take a flex gap */
-      holder.style.display = f.provider === "custom" ? "" : "none";
-      if (f.provider !== "custom") return;
-      custom = configFormText_("input", f.custom, v => { f.custom = v; });
-      configFormField(holder, "custom", "Custom provider name", custom, "Recorded as data; DevGraph does not run it.");
+      holder.style.display = f.provider === "custom" || f.provider === "docs" ? "" : "none";
+      if (f.provider === "custom") {
+        configFormField(holder, "custom", "Custom provider name", configFormText_("input", f.custom, v => { f.custom = v; }),
+          "Recorded as data; DevGraph does not run it.");
+      } else if (f.provider === "docs") {
+        configFormField(holder, "field", "Front-matter key", configFormText_("input", f.field, v => { f.field = v; }),
+          "The name before the colon at the top of each file whose value names the target, for example service.");
+      }
     };
     configFormField(box, "provider", "Provider", configFormSelect(CONFIG_FORM_FIELDS.relationship_providers.map(p => [p, names[p]]), f.provider, [],
-      v => { f.provider = v; fillCustom(); configFormChanged(); }));
+      v => { f.provider = v; fillProvider(); configFormChanged(); }));
     box.appendChild(holder);
-    fillCustom();
+    fillProvider();
     configFormColour(box, f);
     configFormRefresh(edit);
     return;
@@ -4588,21 +4771,99 @@ function renderConfigForm(edit) {
   const desc = text(box, "description", "Description", "description", f, undefined, "textarea");
   desc.children[1].rows = 2;
   configFormColour(box, f);
-  const kinds = [["", "None (declared only)"], ...CONFIG_FORM_FIELDS.filesystem_kinds.map(k => [k, "Filesystem — " + k])];
-  configFormField(box, "source", "Source", configFormSelect(kinds, f.source, [], v => { f.source = v; configFormChanged(); }));
+  const kinds = [["", "None (declared only)"], ...CONFIG_FORM_FIELDS.filesystem_kinds.map(k => [k, "Filesystem — " + k]),
+    ["docs", "Markdown front matter"]];
+  /* Source shows and hides the docs controls in place (the select keeps focus):
+     the paths and conditions below it, and a front-matter key on each metadata row */
+  const docsHolder = configEl("div", "");
+  const fills = [];
+  const OPS = { is: "is", starts_with: "starts with", contains: "contains", like: "matches pattern (use * as a wildcard)" };
+  const fillDocs = () => {
+    configFormClear(docsHolder);
+    docsHolder.style.display = f.source === "docs" ? "" : "none";
+    if (f.source !== "docs") return;
+    const groupHint = (group, path) => {
+      const h = configEl("div", "cfg-hint");
+      h.id = "cfgf-" + (++configFormSeq) + "-hint";
+      h.style.display = "none";
+      group.appendChild(h);
+      configFormEls.hints[path] = h;
+    };
+    const paths = rows("Paths", f.paths, "path", "Add path", () => ({ glob: "" }), (set, p, path) => {
+      const input = configFormText_("input", p.glob, v => { p.glob = v; });
+      input.placeholder = "runbooks/**/*.md";
+      configFormField(set, path + "glob", "Path", input,
+        "`*` matches any name and `**` any number of folders: runbooks/**/*.md reads every .md file under runbooks/. Upper and lower case must match.");
+    }, "paths.", "glob", p => p.glob);
+    groupHint(paths, "paths");
+    docsHolder.appendChild(paths);
+    const where = rows("Conditions", f.where, "condition", "Add condition", () => ({ field: "", op: "is", value: "", open: {} }), (set, c, path) => {
+      text(set, path + "field", "Front-matter key", "field", c, "The name before the colon at the top of the file.");
+      configFormField(set, path + "op", "How to compare", configFormSelect(CONFIG_FORM_FIELDS.condition_operators.map(o => [o, OPS[o]]), c.op, [],
+        v => { c.op = v; configFormChanged(); }));
+      text(set, path + "value", "Value", "value", c, "Compared as text, so 1 matches version: 1. Capital letters must match too.");
+    }, "where.", "field", c => c.field);
+    const whereHelp = configEl("div", "cfg-help", "Only files whose front matter passes every condition become entries. With no conditions, every file the paths match does.");
+    where.insertBefore(whereHelp, where.children[1]);
+    groupHint(where, "where");
+    docsHolder.appendChild(where);
+  };
+  configFormField(box, "source", "Source", configFormSelect(kinds, f.source, [], v => {
+    f.source = v;
+    /* a new docs source starts with one Path row to fill in (an empty row is not written) */
+    if (v === "docs" && !f.paths.length) f.paths.push({ glob: "" });
+    fillDocs();
+    fills.forEach(fn => fn());
+    configFormChanged();
+  }));
+  box.appendChild(docsHolder);
+  fillDocs();
   const M = CONFIG_FORM_FIELDS.metadata_types.map(t => [t, t]);
   const meta = rows("Metadata", f.metadata, "field", "Add field",
-    () => ({ name: "", type: "string", required: false, key: false, description: "", open: {} }),
+    () => ({ name: "", type: "string", required: false, key: false, description: "", fm_key: "", open: {} }),
     (set, m, path) => {
-      text(set, path + "name", "Name", "name", m);
+      const fm = configEl("div", "");
+      /* path is the file's own location, never read from front matter: its row has no key */
+      const keyed = () => f.source === "docs" && m.name !== "path";
+      configFormField(set, path + "name", "Name", configFormText_("input", m.name, v => {
+        const before = keyed();
+        m.name = v;
+        if (keyed() !== before) fillKey();
+      }));
+      const fillKey = () => {
+        configFormClear(fm);
+        fm.style.display = keyed() ? "" : "none";
+        if (keyed()) {
+          text(fm, path + "fm_key", "Front-matter key", "fm_key", m,
+            "The name before the colon at the top of the file; leave blank if it's the same as the field name.");
+        }
+      };
+      fills.push(fillKey);
+      fillKey();
+      set.appendChild(fm);
       configFormField(set, path + "type", "Type", configFormSelect(M, m.type, [], v => { m.type = v; configFormChanged(); }));
-      configFormField(set, path + "required", "Required", configFormCheck(m.required, v => { m.required = v; configFormChanged(); }),
-        undefined, "cfg-check");
+      /* a docs key is always required: Required shows ticked and locked, and the YAML keeps what was written */
+      const required = configFormCheck(m.required, v => { m.required = v; configFormChanged(); });
+      const requiredHelp = configFormField(set, path + "required", "Required", required, "Key fields are always required.", "cfg-check").children[2];
       const key = configFormCheck(m.key, v => { m.key = v; configFormChanged(); });
-      configFormField(set, path + "key", "Key", key, "The key is the ticked fields, in this order.", "cfg-check");
+      const keyHelp = configFormField(set, path + "key", "Key", key, "", "cfg-check").children[2];
       key.setAttribute("aria-describedby", key.getAttribute("aria-describedby") + " configFormKeyHint");
+      const docsKey = () => {
+        const forced = f.source === "docs" && !!m.key;
+        required.checked = forced || !!m.required;
+        required.disabled = forced;
+        requiredHelp.style.display = forced ? "" : "none";
+        /* a hidden description is still read out, so it is referenced only while shown */
+        required.setAttribute("aria-describedby", (forced ? requiredHelp.id + " " : "") + required.id + "-hint");
+        keyHelp.textContent = f.source === "docs"
+          ? "Tick path, or one front-matter field whose value names the entry (like ADR-012), so links can use it."
+          : "The key is the ticked fields, in this order.";
+      };
+      docsKey.el = set;
+      docsKey();
+      configFormEls.refresh.push(docsKey);
       text(set, path + "description", "Description", "description", m);
-    });
+    }, "metadata.");
   const keyHint = configEl("div", "cfg-hint");
   keyHint.id = "configFormKeyHint";
   keyHint.style.display = "none";

@@ -31,6 +31,10 @@ class Blocked(BaseException):
 @contextmanager
 def deadline(seconds=3):
     """Fail instead of hanging if the code under test blocks."""
+    if not hasattr(signal, "SIGALRM"):  # Windows: only the oversize kind runs there
+        yield
+        return
+
     def expire(signum, frame):
         raise Blocked("the read blocked")
     previous = signal.signal(signal.SIGALRM, expire)
@@ -53,7 +57,11 @@ def make(repo, name, kind):
     return path
 
 
-KINDS = ["zero", "fifo", "oversize"]
+KINDS = [
+    pytest.param("zero", marks=pytest.mark.skipif(not os.path.exists("/dev/zero"), reason="needs /dev/zero")),
+    pytest.param("fifo", marks=pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")),
+    "oversize",
+]
 REFUSED = "not a regular file|larger than|inside the repository"
 
 
@@ -71,6 +79,12 @@ def test_schema_file_hash_refuses_a_file_outside_the_repository(tmp_path):
     (tmp_path / "outside.yaml").write_text("version: 1\n")
     (repo / SCHEMA_FILENAME).symlink_to(tmp_path / "outside.yaml")
     assert schema_file_hash(repo) == "unreadable:outside_repository"
+
+
+def test_read_bounded_returns_the_exact_bytes(tmp_path):
+    data = b"a: 1\r\nb: 2\r\n\x1a after a ctrl-z\n"
+    (tmp_path / "f.yaml").write_bytes(data)
+    assert paths.read_bounded(tmp_path / "f.yaml") == data
 
 
 def test_schema_file_hash_still_hashes_a_small_file(tmp_path):

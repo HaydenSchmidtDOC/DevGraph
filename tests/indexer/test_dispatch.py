@@ -5,6 +5,7 @@ them from add/rescan/watch.
 """
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -845,8 +846,6 @@ class TestDeterministicIndexOrder:
         in the repo, not by how the caller spelled them."""
         (temp_repo / "a.py").write_text("def a():\n    pass\n")
         (temp_repo / "b.py").write_text("def b():\n    pass\n")
-        monkeypatch.chdir(temp_repo)
-
         seen: list[str] = []
 
         def record(engine, repo_id, repo_root, resolved, rel_path, *args):
@@ -854,8 +853,11 @@ class TestDeterministicIndexOrder:
             return 1
 
         monkeypatch.setattr(dispatch, "_index_single_path", record)
-        # As raw strings "/tmp/.../b.py" sorts before "a.py".
-        index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {Path("a.py"), (temp_repo / "b.py").resolve()})
+        # Leave the directory before temp_repo removes it: Windows can't delete the working directory.
+        with monkeypatch.context() as m:
+            m.chdir(temp_repo)
+            # As raw strings "/tmp/.../b.py" sorts before "a.py".
+            index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {Path("a.py"), (temp_repo / "b.py").resolve()})
 
         assert seen == ["a.py", "b.py"]
 
@@ -1156,3 +1158,185 @@ class TestMentionRelinkBound:
             assert "rescan" in caplog.text
         finally:
             engine.delete_repository(repo_id)
+
+
+_KEYED_ADR_SCHEMA = textwrap.dedent("""
+    version: 1
+    node_types:
+      - label: Adr
+        key: [adr_id]
+        metadata: [{name: path}, {name: adr_id}]
+        source: {provider: docs, paths: ["decisions/*.md"], fields: {adr_id: id}}
+    relationships:
+      - {type: REPLACES, provider: docs, from: Adr, to: Adr, field: supersedes}
+""")
+
+
+class _RecordingEngine:
+    """Records every engine call by name and arguments; returns None."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: self.calls.append((name, args))
+
+
+def _keyed_docs(temp_repo):
+    from devgraph.config.project_schema import parse_project_schema, resolve_declaration
+    from devgraph.indexer.providers import docs
+
+    files = {}
+    for rel, body in {
+        "decisions/adr-1.md": "id: ADR-1\nsupersedes: ADR-0",
+        "decisions/adr-1 copy.md": "id: ADR-1\nsupersedes: ADR-9",
+    }.items():
+        path = temp_repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"---\n{body}\n---\n", encoding="utf-8")
+        files[rel] = path
+    spec = docs.docs_spec(resolve_declaration(parse_project_schema(_KEYED_ADR_SCHEMA, Path("devgraph.schema.yaml"))))
+    return spec, files
+
+
+class TestFieldKeyedDocsApply:
+    """The apply/full-scan path gates field-keyed docs entries on owners from every file on disk."""
+
+    def test_prune_docs_keeps_only_each_keys_owner(self, temp_repo):
+        spec, files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+        nodes, selected, _owners = dispatch._prune_docs(engine, "demo", temp_repo, spec, files)
+        assert [(n["name"], n["properties"]["path"]) for n in nodes] == [("ADR-1", "decisions/adr-1.md")]
+        assert sorted(selected) == sorted(files)
+        assert engine.calls[-1] == ("prune_extracted_nodes", ("demo", "docs", ["Adr:ADR-1"]))
+
+    def test_prune_docs_writes_nothing_when_building_nodes_fails(self, temp_repo, monkeypatch):
+        from devgraph.indexer.providers import docs
+
+        spec, files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+
+        def boom(*args, **kwargs):
+            raise ValueError("owners are required")
+
+        monkeypatch.setattr(docs, "build_nodes", boom)
+        with pytest.raises(ValueError):
+            dispatch._prune_docs(engine, "demo", temp_repo, spec, files)
+        assert engine.calls == []
+
+    def test_full_scan_edge_pass_writes_edges_from_owners_only(self, temp_repo, monkeypatch):
+        from devgraph.indexer.providers import docs
+
+        spec, files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+        monkeypatch.setattr(dispatch, "schema_pending", lambda *args: False)
+        selected = docs.read_selected(spec, files)
+        owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
+        dispatch._sync_docs_edges(engine, "demo", temp_repo, (spec, selected, owners))
+        ((name, (edges,)),) = engine.calls
+        assert name == "upsert_relationships"
+        assert [(e["from_path"], e["to_name"]) for e in edges] == [("decisions/adr-1.md", "ADR-0")]
+
+    def test_a_batch_holding_a_loser_adds_only_its_keys_owner(self, temp_repo):
+        spec, files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+        engine.extracted_entries = lambda repo_id, extractor, labels: {("Adr", "ADR-1", "decisions/adr-1.md")}
+        engine.list_file_nodes = lambda repo_id, files: {("Adr", "ADR-1")}
+        copy = "decisions/adr-1 copy.md"
+        batch = dispatch._read_docs_batch(engine, "demo", temp_repo, spec, {copy: files[copy]}, set())
+        assert sorted(batch.selected) == ["decisions/adr-1 copy.md", "decisions/adr-1.md"]
+        assert [(n["name"], n["properties"]["path"]) for n in batch.nodes] == [("ADR-1", "decisions/adr-1.md")]
+        assert batch.existing == {("Adr", "ADR-1")}
+
+    def test_relink_writes_no_edge_from_a_loser_outside_the_batch(self, temp_repo):
+        spec, _files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+        engine.extracted_entries = lambda repo_id, extractor, labels: {("Adr", "ADR-1", "decisions/adr-1.md")}
+        # The copy, outside the batch, names ADR-9 but its ADR-1 entry sits at the original.
+        dispatch._relink_docs(engine, "demo", temp_repo, spec, {("Adr", "ADR-9")}, {"decisions/adr-1.md"})
+        assert engine.calls == [("upsert_relationships", ([],))]
+
+
+class TestDeferredLabelWarning:
+    def test_a_repository_spelling_the_label_differently_is_named_as_such(self, monkeypatch, caplog):
+        from devgraph.config.project_schema import parse_project_schema, resolve_declaration
+
+        effective = resolve_declaration(parse_project_schema(
+            "version: 1\nnode_types:\n  - label: Adr\n    key: [adr_id]\n"
+            "    metadata: [{name: path}, {name: adr_id}]\n",
+            Path("devgraph.schema.yaml"),
+        ))
+        monkeypatch.setattr(dispatch, "recorded_declarations", lambda engine: {"adr": [
+            ("demo", "Adr", ("adr_id",)), ("b", "Adr", ("path",)), ("c", "ADR", ("adr_id",)),
+        ]})
+        engine = _RecordingEngine()
+
+        def boom(nodes):
+            raise RuntimeError("constraint violated")
+
+        engine.upsert_nodes = boom
+        with caplog.at_level(logging.WARNING, logger="devgraph.indexer.dispatch"):
+            dispatch._upsert_deferred_label(engine, "demo", effective, "Adr", [{"label": "Adr"}])
+        assert (
+            "demo: Adr entries were not written: b declares Adr keyed differently and c spells the type 'ADR', "
+            "so its constraint keeps the old key and these entries break it; align the key or rename one label "
+            "(constraint violated)"
+        ) in caplog.text
+
+
+class TestDocsPartialWrites:
+    """A docs write failing after an entry moved says what it left behind."""
+
+    def test_sync_logs_links_left_behind_when_clearing_fails_after_the_upsert(self, temp_repo, caplog):
+        from devgraph.indexer.providers import docs
+
+        spec, files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+
+        def boom(*args):
+            raise RuntimeError("edge delete refused")
+
+        engine.delete_extracted_edges = boom
+        selected = docs.read_selected(spec, files)
+        owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
+        nodes, _problems = docs.build_nodes(spec, "demo", selected, owners)
+        with caplog.at_level(logging.WARNING, logger="devgraph.indexer.dispatch"):
+            dispatch._sync_docs(engine, "demo", spec, dispatch._DocsBatch(selected, nodes, owners, None, set()))
+        assert [name for name, _args in engine.calls] == ["upsert_nodes"]  # no edges written after the failure
+        assert "wrote its nodes but could not clear their old links" in caplog.text
+
+    def test_takeover_logs_links_left_behind_when_its_edge_rebuild_fails(self, temp_repo, caplog):
+        spec, _files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+        engine.extracted_nodes_at = lambda *args: {("Adr", "ADR-1")}
+
+        def boom(*args):
+            raise RuntimeError("edge delete refused")
+
+        engine.delete_extracted_edges = boom
+        with caplog.at_level(logging.WARNING, logger="devgraph.indexer.dispatch"):
+            dispatch._take_over_keys(engine, "demo", temp_repo, spec, ["decisions/gone.md"])
+        assert [name for name, _args in engine.calls] == ["upsert_nodes"]
+        assert "moved entries to the files that now own their ids but could not rebuild their links" in caplog.text
+
+
+def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
+    # On Windows a junction can lead the walk outside the repository; pruning must not crash on those paths.
+    from devgraph.indexer import walk
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "a.py").write_text("x = 1\n")
+    outside = tmp_path / "outside.py"
+    outside.write_text("y = 2\n")
+    # As a junction to `outside` would be walked: linked, so keyed by its resolved target.
+    monkeypatch.setattr(walk, "_walk", lambda root: iter([(repo / "a.py", "a.py", False), (outside, "j/outside.py", True)]))
+    removed = []
+    monkeypatch.setattr(dispatch, "remove_paths", lambda engine, repo_id, root, paths: removed.append(paths) or len(paths))
+
+    class FakeEngine:
+        def list_indexed_files(self, repo_id):
+            return {"a.py", "gone.py"}
+
+    assert dispatch.prune_stale_files(FakeEngine(), "r", repo) == 1
+    assert removed == [{repo / "gone.py"}]

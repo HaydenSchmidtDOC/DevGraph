@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -44,7 +45,7 @@ def code(excinfo) -> str:
 
 
 def test_add_tool_preserves_comments(tmp_path):
-    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
+    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE, newline="")  # LF on every platform
     result = edits.add_tool(tmp_path, {**TOOL, "name": "other"})
     text = (tmp_path / "devgraph.tools.yaml").read_text()
     assert text.startswith("# keep me\n") and "# inline" in text and "name: other" in text
@@ -144,6 +145,7 @@ def test_symlinked_target_is_refused(tmp_path):
     assert real.read_text() == TOOLS_FILE
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
 def test_write_atomically_keeps_mode(tmp_path):
     path = tmp_path / "f.yaml"
     path.write_text("a")
@@ -356,7 +358,7 @@ def test_node_type_rename_to_a_taken_label_is_refused(tmp_path):
     assert (tmp_path / "devgraph.schema.yaml").read_bytes() == before
 
 
-@pytest.mark.parametrize("kind", ["dir", "fifo"])
+@pytest.mark.parametrize("kind", ["dir", pytest.param("fifo", marks=pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs"))])
 def test_non_regular_target_is_refused_without_opening_it(tmp_path, kind):
     target = tmp_path / "devgraph.tools.yaml"
     if kind == "dir":
@@ -545,3 +547,122 @@ def test_enabling_and_bare_repos_have_no_warnings(tmp_path, no_registry, store):
     assert edits.project_config_change(record(path=tmp_path), False)[0] == []
     (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
     assert edits.project_config_change(record(path=tmp_path, project_config_enabled=False), True)[0] == []
+
+
+# --- provider-aware source change warnings ---------------------------------
+
+FS_FILE = {"provider": "filesystem", "kind": "file"}
+DOCS_SRC = {"provider": "docs", "paths": ["runbooks/**/*.md"], "where": [{"field": "type", "is": "runbook"}]}
+
+
+def sourced(source):
+    from devgraph.config.project_schema import ProjectSchema
+
+    node = {"label": "Runbook", "key": ["path"], "metadata": [{"name": "path"}]}
+    if source is not None:
+        node["source"] = source
+    return ProjectSchema.model_validate({"version": 1, "node_types": [node]})
+
+
+@pytest.mark.parametrize(
+    "before, after, expected",
+    [
+        (FS_FILE, DOCS_SRC, "Runbook (filesystem -> docs)"),
+        (DOCS_SRC, FS_FILE, "Runbook (docs -> filesystem)"),
+        (DOCS_SRC, None, "Runbook (source removed)"),
+        (DOCS_SRC, {**DOCS_SRC, "paths": ["**/*.md"]}, "Runbook (paths changed)"),
+        (DOCS_SRC, {**DOCS_SRC, "where": [{"field": "type", "is": "policy"}]}, "Runbook (conditions changed)"),
+        (DOCS_SRC, {"provider": "docs", "paths": ["**/*.md"]}, "Runbook (paths and conditions changed)"),
+        (FS_FILE, {**FS_FILE, "kind": "folder"}, "Runbook (kind file -> folder)"),
+        (FS_FILE, None, "Runbook (source removed)"),
+    ],
+    ids=["fs->docs", "docs->fs", "docs->none", "docs paths", "docs where", "docs both", "fs kind", "fs->none"],
+)
+def test_pruned_types_covers_every_source_transition(before, after, expected):
+    assert edits.pruned_types(sourced(before), sourced(after)) == [expected]
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        DOCS_SRC,
+        {**DOCS_SRC, "fields": {}},
+        {**DOCS_SRC, "where": [{"field": "type", "is": "runbook"}]},
+    ],
+)
+def test_pruned_types_ignores_unchanged_docs_sources(after):
+    assert edits.pruned_types(sourced(DOCS_SRC), sourced(after)) == []
+
+
+def test_canonical_condition_text_is_not_a_change():
+    one = {**DOCS_SRC, "where": [{"field": "version", "is": 1}]}
+    assert edits.pruned_types(sourced(one), sourced({**one, "where": [{"field": "version", "is": "1"}]})) == []
+
+
+def test_source_change_warnings_name_the_provider():
+    fs_to_docs = edits.schema_change_warnings(sourced(FS_FILE), sourced(DOCS_SRC), record())
+    assert any("whose filesystem source changed: Runbook (filesystem -> docs)" in w for w in fs_to_docs)
+    assert any("the next rescan rebuilds Runbook entries from Markdown front matter" in w for w in fs_to_docs)
+
+    narrowed = edits.schema_change_warnings(sourced(DOCS_SRC), sourced({**DOCS_SRC, "paths": ["x/*.md"]}), None)
+    assert any("whose Markdown front-matter source changed: Runbook (paths changed)" in w for w in narrowed)
+    assert any("applying this schema rebuilds Runbook entries from Markdown front matter" in w for w in narrowed)
+
+    removed = edits.schema_change_warnings(sourced(DOCS_SRC), sourced(None), record())
+    assert any("whose Markdown front-matter source changed: Runbook (source removed)" in w for w in removed)
+    assert not any("rebuilds" in w for w in removed)
+
+
+def test_schema_entry_notes_name_both_providers():
+    (note,) = edits.schema_entry_notes({"label": "Ticket"})
+    assert "no provider produces Ticket nodes yet" in note
+    assert "provider: filesystem" in note and "provider: docs" in note and "Markdown front matter" in note
+    assert edits.schema_entry_notes({"label": "Runbook", "source": DOCS_SRC}) == []
+
+
+# --- docs key changes ------------------------------------------------------
+
+ADR_SRC = {"provider": "docs", "paths": ["decisions/**/*.md"], "fields": {"adr_id": "id"}}
+DOCS_RENAME = (
+    "the next rescan renames every Adr entry by its new key; links that name Adr entries the old way stop matching "
+    "(devgraph doctor lists them)."
+)
+
+
+def adr(key, source=ADR_SRC):
+    from devgraph.config.project_schema import ProjectSchema
+
+    node = {"label": "Adr", "key": key, "metadata": [{"name": "path"}, {"name": "adr_id"}]}
+    if source is not None:
+        node["source"] = source
+    return ProjectSchema.model_validate({"version": 1, "node_types": [node]})
+
+
+@pytest.mark.parametrize("before, after", [(["path"], ["adr_id"]), (["adr_id"], ["path"])], ids=["path->field", "field->path"])
+def test_a_docs_key_change_warns_that_entries_are_renamed(before, after):
+    warnings = edits.schema_change_warnings(adr(before), adr(after), record())
+    assert DOCS_RENAME in warnings
+    assert any("uniqueness constraint on Adr keeps the old key" in w for w in warnings)
+
+
+def test_the_rename_warning_says_when_it_applies_like_the_others():
+    warnings = edits.schema_change_warnings(adr(["path"]), adr(["adr_id"]), None)
+    assert DOCS_RENAME.replace("the next rescan", "applying this schema") in warnings
+
+
+def test_an_unchanged_docs_key_gives_no_rename_warning():
+    assert DOCS_RENAME not in edits.schema_change_warnings(adr(["adr_id"]), adr(["adr_id"]), record())
+
+
+@pytest.mark.parametrize(
+    "before, after",
+    [
+        (adr(["adr_id"]), adr(["path"], {"provider": "filesystem", "kind": "file"})),
+        (adr(["path"], None), adr(["adr_id"], None)),
+    ],
+    ids=["docs->filesystem", "unsourced"],
+)
+def test_a_key_change_outside_docs_gives_no_rename_warning(before, after):
+    warnings = edits.schema_change_warnings(before, after, record())
+    assert not any("renames every" in w for w in warnings)
+    assert any("uniqueness constraint on Adr keeps the old key" in w for w in warnings)

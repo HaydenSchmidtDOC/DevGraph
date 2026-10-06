@@ -25,7 +25,10 @@ def engine():
         user="neo4j",
         password="devgraph-local-dev",
     )
-    test_engine.verify_connectivity()
+    try:
+        test_engine.verify_connectivity()
+    except Exception as e:
+        pytest.skip(f"Neo4j not available: {e}")
     test_engine.init_schema()
     yield test_engine
     test_engine.close()

@@ -121,8 +121,9 @@ def test_starter_lists_every_builtin_and_loads(tmp_path):
 def test_the_uncommented_example_is_valid(tmp_path):
     (tmp_path / SCHEMA_FILENAME).write_text(uncommented_example(starter_schema_text()))
     declaration = load_project_schema(tmp_path)
-    assert [n.label for n in declaration.node_types] == ["Runbook"]
-    assert [r.type for r in declaration.relationships] == ["DOCUMENTS"]
+    (runbook,) = declaration.node_types
+    assert runbook.label == "Runbook" and runbook.source.provider == "docs"
+    assert [(r.type, r.provider, r.field) for r in declaration.relationships] == [("RUNBOOK_FOR", "docs", "service")]
 
 
 def test_eject_writes_the_starter(runner, settings, tmp_path):
@@ -321,11 +322,12 @@ def test_show_survives_markup_in_a_schema_error(runner, settings, tmp_path):
 
 
 def test_validate_survives_markup_in_the_repo_path(runner, settings, tmp_path):
+    # On Windows the '/' in "[/x]" is a separator too, so the path ends `[x]\[\x]`.
     repo = tmp_path / "[x]" / "[/x]"
     repo.mkdir(parents=True)
     result = runner.invoke(app, ["config", "validate", "--repo", str(repo)])
     assert result.exit_code == 0, result.output
-    assert "[/x]" in result.output
+    assert str(repo) in result.output
     assert result.exception is None or isinstance(result.exception, SystemExit)
 
 
