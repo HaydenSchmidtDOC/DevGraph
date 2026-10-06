@@ -5,6 +5,7 @@ them from add/rescan/watch.
 """
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -1237,6 +1238,7 @@ class TestFieldKeyedDocsApply:
         spec, files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
         engine.existing_node_names = lambda repo_id, label, names: set(names)
+        engine.extracted_nodes_at = lambda repo_id, extractor, paths: set()
         copy = "decisions/adr-1 copy.md"
         batch = dispatch._read_docs_batch(engine, "demo", temp_repo, spec, {copy: files[copy]}, set())
         assert sorted(batch.selected) == ["decisions/adr-1 copy.md", "decisions/adr-1.md"]
@@ -1249,3 +1251,39 @@ class TestFieldKeyedDocsApply:
         # The copy, outside the batch, names ADR-9 but loses ADR-1 to the original.
         dispatch._relink_docs(engine, "demo", temp_repo, spec, {("Adr", "ADR-9")}, {"decisions/adr-1.md"})
         assert engine.calls == [("upsert_relationships", ([],))]
+
+
+class TestDocsPartialWrites:
+    """A docs write failing after an entry moved says what it left behind."""
+
+    def test_sync_logs_links_left_behind_when_clearing_fails_after_the_upsert(self, temp_repo, caplog):
+        from devgraph.indexer.providers import docs
+
+        spec, files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+
+        def boom(*args):
+            raise RuntimeError("edge delete refused")
+
+        engine.delete_extracted_edges = boom
+        selected = docs.read_selected(spec, files)
+        owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
+        nodes, _problems = docs.build_nodes(spec, "demo", selected, owners)
+        with caplog.at_level(logging.WARNING, logger="devgraph.indexer.dispatch"):
+            dispatch._sync_docs(engine, "demo", spec, dispatch._DocsBatch(selected, nodes, owners, None, set()))
+        assert [name for name, _args in engine.calls] == ["upsert_nodes"]  # no edges written after the failure
+        assert "wrote its nodes but could not clear their old links" in caplog.text
+
+    def test_takeover_logs_links_left_behind_when_its_edge_rebuild_fails(self, temp_repo, caplog):
+        spec, _files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+        engine.extracted_nodes_at = lambda *args: {("Adr", "ADR-1")}
+
+        def boom(*args):
+            raise RuntimeError("edge delete refused")
+
+        engine.delete_extracted_edges = boom
+        with caplog.at_level(logging.WARNING, logger="devgraph.indexer.dispatch"):
+            dispatch._take_over_keys(engine, "demo", temp_repo, spec, ["decisions/gone.md"])
+        assert [name for name, _args in engine.calls] == ["upsert_nodes"]
+        assert "moved entries to the files that now own their ids but could not rebuild their links" in caplog.text

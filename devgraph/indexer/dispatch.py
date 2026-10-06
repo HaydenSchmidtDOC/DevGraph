@@ -324,17 +324,24 @@ def _read_docs_batch(
     docs pass is then skipped for this batch).
 
     For each field-keyed type the batch touches (one of its files is selected,
-    or `previous`, the nodes at its paths, holds one), the affected keys are
+    or `previous`, the nodes at its paths, holds one), the affected keys K are
     those its files claim plus those of its previous nodes, and the owner on
     disk of each joins the batch. Losers never do.
+
+    An owner pulled in may still hold, in the graph, an entry its file no
+    longer claims (its own event is pending). The batch prunes at its path,
+    so that entry's key joins K too and its owner on disk is pulled in, until
+    K stops growing. K only grows and every path added owns a key in it, so
+    this ends, without reading any file again, and every engine path list
+    holds at most |batch| + |K| paths.
     """
     try:
         selected = docs.read_selected(spec, files)
         view, owners, existing = None, {}, set()
-        keyed = [docs_type for docs_type in spec.types if docs_type.key is not None]
+        keyed = {docs_type.label for docs_type in spec.types if docs_type.key is not None}
         touched = {
-            docs_type.label for docs_type in keyed
-            if any(docs.selects(docs_type, rel) for rel in files) or any(label == docs_type.label for label, _ in previous)
+            docs_type.label for docs_type in spec.types if docs_type.label in keyed
+            and (any(docs.selects(docs_type, rel) for rel in files) or any(label == docs_type.label for label, _ in previous))
         }
         if touched:
             view = _keyed_view(repo_root, spec, selected)
@@ -342,7 +349,18 @@ def _read_docs_batch(
             batch = set(files)
             keys = {key for key, paths in view.claims.items() if key[0] in touched and not batch.isdisjoint(paths)}
             keys |= {(label, name) for label, name in previous if label in touched}
-            selected = docs.expand_to_owners(view, selected, keys)
+            batch_selected, checked = selected, set(batch)
+            while True:
+                selected = docs.expand_to_owners(view, batch_selected, keys)
+                pulled_in = sorted(set(selected) - checked)
+                checked |= set(pulled_in)
+                stale = {
+                    key for key in engine.extracted_nodes_at(repo_id, docs.EXTRACTOR, pulled_in) if key[0] in keyed
+                } - keys
+                if not stale:
+                    break
+                keys |= stale
+                touched |= {label for label, _name in stale}
             for label in sorted(touched):
                 names = sorted(name for claimed, name in keys if claimed == label)
                 existing |= {(label, name) for name in engine.existing_node_names(repo_id, label, names)}
@@ -360,15 +378,25 @@ def _sync_docs(engine: GraphEngine, repo_id: str, spec: docs.DocsSpec, batch: _D
     Nodes MERGE in place, so edges into them from other docs files survive.
     They are upserted first: an entry whose owner changed moves onto its new
     `path` before the outgoing edges at the batch's paths (its old owner's
-    among them) are deleted and rebuilt.
+    among them) are deleted and rebuilt. If that delete or the prune fails
+    after the upsert, a moved entry keeps its old owner's links and stale
+    entries stay until the owner's next save or a rescan rewrites them.
     """
     paths = sorted(batch.selected)
     try:
         engine.upsert_nodes(batch.nodes)
+    except Exception:
+        logger.warning("docs node pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
+        return
+    try:
         engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, paths)
         engine.prune_extracted_at(repo_id, docs.EXTRACTOR, paths, [f"{n['label']}:{n['name']}" for n in batch.nodes])
     except Exception:
-        logger.warning("docs node pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
+        logger.warning(
+            "docs pass for %s wrote its nodes but could not clear their old links and entries; "
+            "a moved entry may keep its previous file's links until that file's next save or a rescan",
+            repo_id, exc_info=True,
+        )
         return
     try:
         engine.upsert_relationships(docs.build_edges(spec, repo_id, batch.selected, owners=batch.owners))
@@ -413,7 +441,11 @@ def _take_over_keys(engine: GraphEngine, repo_id: str, repo_root: Path, spec: do
     """Before the docs nodes at deleted paths go: move each field-keyed entry
     among them to the file that now owns its key, and rebuild that file's
     outgoing edges. An entry whose key no file claims is left to the delete.
-    A failure falls through to the delete; the next rescan restores the entry.
+
+    A failure before the move falls through to the delete, and the next
+    rescan restores the entry. A failure after it leaves the entry at its new
+    owner (the delete matches paths, so it no longer reaches it) with the
+    deleted file's links, until the owner's next save or a rescan.
     """
     keyed = {docs_type.label for docs_type in spec.types if docs_type.key is not None}
     if not keyed:
@@ -427,11 +459,20 @@ def _take_over_keys(engine: GraphEngine, repo_id: str, repo_root: Path, spec: do
         if not selected:
             return
         nodes, _problems = docs.build_nodes(spec, repo_id, selected, view.owners)
+        edges = docs.build_edges(spec, repo_id, selected, owners=view.owners)
         engine.upsert_nodes(nodes)
-        engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, sorted(selected))
-        engine.upsert_relationships(docs.build_edges(spec, repo_id, selected, owners=view.owners))
     except Exception:
         logger.warning("docs takeover failed for %s; the next rescan restores the entries", repo_id, exc_info=True)
+        return
+    try:
+        engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, sorted(selected))
+        engine.upsert_relationships(edges)
+    except Exception:
+        logger.warning(
+            "docs takeover for %s moved entries to the files that now own their ids but could not rebuild "
+            "their links; they keep the deleted file's links until the owner's next save or a rescan",
+            repo_id, exc_info=True,
+        )
 
 
 def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, applied: AppliedDocs | None) -> None:

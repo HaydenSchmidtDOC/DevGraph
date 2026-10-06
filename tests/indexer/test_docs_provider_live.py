@@ -808,6 +808,7 @@ def test_the_original_keeps_its_id_whichever_file_is_saved_first(engine, keyed, 
 
 def test_a_file_sorting_first_takes_the_entry_over_in_place_and_hands_it_back_on_delete(engine, keyed):
     md(keyed, "decisions/adr-010.md", "id: ADR-010")
+    md(keyed, "decisions/adr-012-v2.md", "id: ADR-012\nsupersedes: ADR-013")  # sorts after the original
     kscan(engine, keyed)
     before = element_id(engine, "ADR-012")
 
@@ -885,6 +886,52 @@ def test_a_missing_or_invalid_id_leaves_the_file_out_and_writes_the_rest(engine,
     assert found["ADR-023"] == "decisions/adr-023.md"
     assert not {"decisions/adr-020.md", "decisions/adr-021.md", "decisions/adr-022.md"} & set(found.values())
     assert ("ADR-023", "ADR-013") in links(engine, "ZZ_REPLACES")
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_a_stale_entry_at_an_owner_pulled_into_the_batch_moves_to_its_new_owner(engine, keyed):
+    # o.md owns ADR-050 and p.md loses it; o.md then changes to ADR-060 without an
+    # event yet, and q.md (ADR-040) changes to ADR-060 and fires. o.md joins the
+    # batch as ADR-060's owner, so the ADR-050 still at o.md must move to p.md.
+    md(keyed, "decisions/o.md", "id: ADR-050\nsupersedes: ADR-011")
+    md(keyed, "decisions/p.md", "id: ADR-050\nsupersedes: ADR-013")
+    md(keyed, "decisions/q.md", "id: ADR-040")
+    md(keyed, "runbooks/z.md", "adr: ADR-050")
+    kscan(engine, keyed)
+    before = element_id(engine, "ADR-050")
+
+    md(keyed, "decisions/o.md", "id: ADR-060\nsupersedes: ADR-011")
+    q = md(keyed, "decisions/q.md", "id: ADR-060")
+    index_paths(engine, REPO, keyed, {q})
+
+    found = entries(engine)
+    assert (found["ADR-060"], found["ADR-050"]) == ("decisions/o.md", "decisions/p.md")
+    assert "ADR-040" not in found
+    assert element_id(engine, "ADR-050") == before
+    assert ("runbooks/z.md", "ADR-050") in links(engine, "ZZ_RUNBOOK_ADR")
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_stale_entries_are_chased_through_every_owner_pulled_in(engine, keyed, path_lists):
+    # Two rounds: o.md's stale ADR-050 pulls in p.md, whose stale ADR-070 pulls in s.md.
+    md(keyed, "decisions/o.md", "id: ADR-050")
+    md(keyed, "decisions/p.md", "id: ADR-070")
+    md(keyed, "decisions/s.md", "id: ADR-070\nsupersedes: ADR-011")
+    md(keyed, "decisions/q.md", "id: ADR-040")
+    kscan(engine, keyed)
+
+    md(keyed, "decisions/o.md", "id: ADR-060")
+    md(keyed, "decisions/p.md", "id: ADR-050")
+    q = md(keyed, "decisions/q.md", "id: ADR-060")
+    path_lists.clear()
+    index_paths(engine, REPO, keyed, {q})
+
+    found = entries(engine)
+    assert (found["ADR-060"], found["ADR-050"], found["ADR-070"]) == (
+        "decisions/o.md", "decisions/p.md", "decisions/s.md",
+    )
+    # |batch| + |K_final|: q.md, plus ADR-040, ADR-060, ADR-050 and ADR-070.
+    assert max(len(paths) for _name, paths in path_lists) <= 1 + 4
     assert_matches_fresh_apply(engine, REPO, keyed)
 
 
