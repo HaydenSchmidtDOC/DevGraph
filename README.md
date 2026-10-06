@@ -160,16 +160,16 @@ After the next rescan the graph has a `Runbook` node for `runbooks/api-outage.md
 The source has four parts:
 
 1. **Which files (`paths`).** One to 20 globs, relative to the repository root. `*` matches any name within one folder and `**` matches any number of folders, so `runbooks/**/*.md` reads every `.md` file anywhere under `runbooks/`, and `**/*.md` every Markdown file in the repository. Only `.md` and `.markdown` files are read. Upper and lower case must match: `Runbooks/**/*.md` does not find `runbooks/`.
-2. **Which of those files count (`where`, optional).** Up to 20 conditions, and a file must pass all of them. Without `where`, every matching file becomes a node, even one with no front matter. Each condition names a front-matter key and one way to compare it:
+2. **Which of those files count (`where`, optional).** Up to 20 conditions, and a file must pass all of them. A schema may source up to 20 node types from front matter, with up to 100 conditions across them all. Without `where`, every matching file becomes a node, even one with no front matter. Each condition names a front-matter key and one way to compare it:
 
    | Condition | Passes when the value… | Example |
    | --- | --- | --- |
    | `is` | is exactly the text | `{field: type, is: runbook}` |
    | `starts_with` | begins with the text | `{field: title, starts_with: "RB-"}` |
    | `contains` | has the text somewhere in it | `{field: owner, contains: platform}` |
-   | `like` | fits a pattern where `*` stands for any run of characters (nothing else is special) | `{field: title, like: "RB-*-db"}` |
+   | `like` | fits a pattern where `*` stands for any run of characters (nothing else is special; at most 10 `*`s) | `{field: title, like: "RB-*-db"}` |
 
-   Values are compared as text, and capital letters must match. A number is compared as its digits, so `is: 1` and `is: "1"` both match `version: 1`. A true/false value is compared as the words `true` and `false`; YAML also reads `yes`, `no`, `on` and `off` as true/false, so write `is: true` to match `draft: yes`. When the value is a list (`tags: [runbook, oncall]`), the condition passes if any item does. Dates, decimals and nested blocks never pass.
+   Values are compared as text, and capital letters must match. A number is compared as its digits, so `is: 1` and `is: "1"` both match `version: 1`. A true/false value is compared as the words `true` and `false`; YAML also reads `yes`, `no`, `on` and `off` as true/false, so write `is: true` to match `draft: yes`. When the value is a list (`tags: [runbook, oncall]`), the condition passes if any of its first 100 items does. Dates, decimals and nested blocks never pass.
 3. **Which values to copy (`metadata` and `fields`).** Every metadata field except `path` is copied from the front-matter key of the same name. When the key in the files is spelled differently, map it in `fields`: `{on_call: on-call-team}` fills `on_call` from `on-call-team:`. On the form this is the **Front-matter key** box on each metadata row, left blank when the names are the same. A value that doesn't fit the field's type (text in an `integer` field, say) is left blank, and a file missing a `required` field is skipped. A `string` field writes true/false values as `true`/`false`. Lists, dates and nested blocks are never copied. The key must be exactly `[path]`: each node is named by its file's path from the repository root.
 4. **What to link (`relationships`).** A relationship with `provider: docs` reads one front-matter key (`field`) and links the node to every `to` node whose name is that value. The value can be one name or a list of up to 100. The name is a Service's name, a Module's path, or a docs or filesystem node's path (such as `runbooks/db.md`; a leading `./` is ignored). A value that names nothing is skipped, and `devgraph doctor` lists it.
 
@@ -182,7 +182,7 @@ What it doesn't do yet:
 - A link from one docs node to another uses the target's file path (`decided_by: decisions/adr-012.md`). Naming the target by a front-matter key (`decided_by: ADR-012`) comes next.
 - A link fans out to every Service with that name. A Service is identified by its name and the compose file that declares it, so `service: api` links to each `api` declared in each compose file.
 - A link to a Folder created after the file that names it appears after the next rescan. Links to other new targets (a Service, a File, another docs node) appear as soon as the watcher indexes the new target.
-- Creating a docs node that another docs type links to re-reads every file of that type, to find the links waiting for it. In a repository with thousands of such files that save takes longer.
+- A save that adds a node of any label a docs relationship links to (a docs node, a Service, a File) re-reads every file any docs type selects, to find the links waiting for it. In a repository with thousands of such files that save takes longer.
 - Only front matter is read: not the title, headings or body text.
 
 ## Project tools (preview)

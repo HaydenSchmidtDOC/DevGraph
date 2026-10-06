@@ -69,11 +69,11 @@ relationships:
 - **`paths`** holds 1 to 20 globs. A glob is rejected when it:
   - is empty or longer than 200 characters;
   - has a `..` or `.` segment (including a leading `./`), an empty segment (`a//b`, a trailing `/`), a leading `/`, or a backslash;
-  - has a control character (C0, DEL or C1) or a lone surrogate (a YAML `"\ud800"` escape). Front-matter keys and condition text refuse lone surrogates too;
+  - has a control character (C0, DEL or C1), a format character (category Cf, such as U+202E) or a lone surrogate (a YAML `"\ud800"` escape). Front-matter keys refuse format characters and lone surrogates too, and condition text refuses lone surrogates;
   - uses `**` as a segment more than twice.
 
   Matching splits the glob and the repo-relative path on `/`. A `**` segment matches zero or more whole folders, and every other segment is matched against one path segment with `fnmatch.fnmatchcase`. It is case-sensitive, and only `**` spans folders. The form's Path help says "`*` matches any name and `**` any number of folders: runbooks/**/*.md reads every .md file under runbooks/. Upper and lower case must match." Only `.md` and `.markdown` files are considered.
-- **`where`** lists at most 20 conditions, all of which must hold. Each is `{field, <operator>: text}` with exactly one operator. The text is at most 200 characters.
+- **`where`** lists at most 20 conditions, all of which must hold. Each is `{field, <operator>: text}` with exactly one operator. The text is at most 200 characters, and a `like` text has at most 10 `*`s.
 
   | Operator | Holds when the value… | Form wording |
   | --- | --- | --- |
@@ -83,11 +83,11 @@ relationships:
   | `like` | matches the text, where `*` is any run of characters and nothing else is special (`fnmatch.fnmatchcase`, with `?` and `[` escaped) | "matches pattern (use * as a wildcard)" |
 
   - **Values are compared as text on both sides, case-sensitively.** A string is itself, an integer is written in decimal, and a boolean is written `true`/`false`. So `is: 1` and `is: "1"` both match `version: 1`. The schema accepts a string, integer or boolean after an operator and stores its canonical text.
-  - A list value holds when any item holds (`tags: [runbook, oncall]`). Floats, dates, maps and values longer than 4 KiB never hold.
+  - A list value holds when any of its first 100 items holds (`tags: [runbook, oncall]`); later items are never examined, so a long list can't multiply the cost of every condition. Floats, dates, maps and values longer than 4 KiB never hold.
   - Without a `where`, every file matching `paths` becomes a node, with or without front matter.
-- **`fields`** renames, with at most 50 entries. A metadata field is filled from the front-matter key of the same name unless `fields` maps it to another key. Every key in `fields` must be a declared metadata field other than `path`. Front-matter key names are 1 to 64 characters with no control characters. Nested paths (`a.b`) are not supported.
+- **`fields`** renames, with at most 50 entries. A metadata field is filled from the front-matter key of the same name unless `fields` maps it to another key. Every key in `fields` must be a declared metadata field other than `path`. Front-matter key names are 1 to 64 characters with no control or format characters. Nested paths (`a.b`) are not supported.
 - **Key.** The key must be exactly `[path]`, with `path` a string field. The `_check_key_and_metadata` message names the provider: "…is sourced from Markdown front matter, so its key must be exactly [path]".
-- **Limits.** The current "at most one type per kind" rule (`_check_filesystem`) applies to filesystem sources only. Any number of node types may be sourced from docs, and one file may become a node of several docs types and also be a filesystem `File`.
+- **Limits.** The current "at most one type per kind" rule (`_check_filesystem`) applies to filesystem sources only. At most 20 node types may be sourced from docs, with at most 100 `where` conditions across them (`_check_docs`), so the condition work per file is bounded (types × conditions × 100 list items, each verdict worked out once per read). One file may become a node of several docs types and also be a filesystem `File`.
 
 ### Relationships (provider `docs`)
 
@@ -146,9 +146,12 @@ relationships:
   2. Delete every outgoing non-built-in edge from docs nodes, of any type, current or former (`delete_extracted_edges(…, paths=None)`).
   3. Clear properties the schema no longer declares on each docs label: every property except declared fields, reserved names and `insight_*`, re-validated against `PROPERTY_NAME_PATTERN`.
   4. Run `prune_extracted_nodes(extractor="docs", keep=…)` with the nodes the new mapping produces.
-  5. Upsert those nodes.
+  5. Prune and upsert the filesystem provider's nodes.
+  6. Upsert the docs nodes.
 
-  After `index_paths`, `full_scan` runs one final `docs.sync_edges` over every matched file, so built-in targets exist first. It reuses the front matter apply read, so each file is read once per scan. It runs only when apply returned True.
+  Both providers prune before either upserts. An upsert MERGEs onto the node of that label and name whichever provider made it and retags it, so a type switched from docs to filesystem would otherwise keep its front-matter values.
+
+  After `index_paths`, `full_scan` runs one final `docs.sync_edges` over every matched file, so built-in targets exist first. It reuses the spec and front matter apply used, so the schema is resolved once and each file is read once per scan. It runs only when apply returned True and the schema has not changed since.
 - **Edits and creates, from the watcher's `index_paths`, when the schema is valid and not pending.** For the changed Markdown paths, the provider:
   1. deletes outgoing docs edges at those paths (`delete_extracted_edges`);
   2. upserts the produced nodes, all declared fields included;
