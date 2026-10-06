@@ -7,7 +7,7 @@ import re
 _BRACKET = re.compile(r"(\\*)\[(?=([a-z#/@][^[]*?\])?)")
 
 
-def escape(text: str) -> str:
+def escape(text: str, *, before_tag: bool = False) -> str:
     """`text` as markup that Rich prints back exactly, on every platform.
 
     `rich.markup.escape` only escapes tag-like brackets, but Rich's renderer
@@ -15,12 +15,17 @@ def escape(text: str) -> str:
     as `C:\\repo\\[1]` lost a separator. Before a tag-like '[' Rich halves the
     backslashes, so they are doubled and one more escapes the tag; before any
     other '[' it drops exactly one, so one is added. Backslashes elsewhere,
-    trailing ones included, are literal and left alone, which assumes the
-    result is not placed directly before a markup tag.
+    trailing ones included, are literal and left alone, unless `before_tag`
+    says the result is placed directly before a markup tag (as in
+    `[bold]{text}[/bold]`): then trailing backslashes are doubled too.
     """
 
     def sub(match: re.Match) -> str:
         backslashes, tag = match.groups()
         return (backslashes * 2 if tag is not None else backslashes) + "\\["
 
-    return _BRACKET.sub(sub, text)
+    escaped = _BRACKET.sub(sub, text)
+    if before_tag:
+        trailing = len(escaped) - len(escaped.rstrip("\\"))
+        escaped += "\\" * trailing
+    return escaped

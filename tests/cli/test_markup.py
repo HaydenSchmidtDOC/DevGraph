@@ -43,3 +43,8 @@ def test_text_round_trips_between_tags(text):
 @pytest.mark.parametrize("text", [t for t in TEXTS if "\\" not in t])
 def test_output_without_backslashes_matches_rich_escape(text):
     assert printed(escape(text)) == printed(rich_escape(text))
+
+
+@pytest.mark.parametrize("text", TEXTS)
+def test_text_round_trips_directly_before_a_tag(text):
+    assert printed(f"[red]{escape(text, before_tag=True)}[/red]") == text
