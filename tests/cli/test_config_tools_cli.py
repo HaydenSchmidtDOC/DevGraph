@@ -475,16 +475,17 @@ def test_list_shows_builtin_named_tools_as_ignored(runner, repo, store):
     assert only_global == [{"name": "search_component", "origin": "global", "locked": False, "ignored": "shadows a locked tool"}]
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
 def test_project_write_is_atomic_and_keeps_the_mode(runner, repo, tmp_path, monkeypatch):
     import os
     import stat
 
     add(runner, tmp_path, ["--repo", str(repo)], name="first_tool")
     path = repo / TOOLS_FILENAME
-    path.chmod(0o640)
+    if os.name != "nt":
+        path.chmod(0o640)
     assert add(runner, tmp_path, ["--repo", str(repo)], name="second_tool").exit_code == 0
-    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o640
     before = path.read_bytes()
 
     def boom(*args):

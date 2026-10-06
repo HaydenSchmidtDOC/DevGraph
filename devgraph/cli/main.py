@@ -1028,14 +1028,14 @@ def doctor() -> None:
     if not schema_findings:
         console.print("  [green][OK][/green] no registered repositories to check")
     for finding in schema_findings:
-        subject = finding["repo_id"] or "conflict"
+        subject = escape(str(finding["repo_id"] or "conflict"))
         if finding["status"] == "disabled":
-            console.print(f"  [yellow][!] {escape(str(subject))}:[/yellow] {escape(finding['detail'])}")
+            console.print(f"  [yellow][!] {subject}:[/yellow] {escape(finding['detail'])}")
         elif finding["failed"]:
-            console.print(f"  [red][X] {escape(str(subject))}:[/red] {escape(finding['detail'])}")
+            console.print(f"  [red][X] {subject}:[/red] {escape(finding['detail'])}")
             any_failed = True
         else:
-            console.print(f"  [green][OK][/green] {escape(str(subject))}: {escape(finding['detail'])}")
+            console.print(f"  [green][OK][/green] {subject}: {escape(finding['detail'])}")
     # Markdown front-matter sources: links are checked against the graph only when it is up.
     docs_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password) if neo4j_reachable else None
     try:
@@ -2122,8 +2122,8 @@ def config_validate(
     findings = _project_schema_findings(repos) + _project_tools_findings(repos) + _global_tools_findings(repos)
     for finding in findings:
         colour = "red" if finding["failed"] else ("yellow" if finding["status"] in ("warning", "disabled", "notice") else "green")
-        subject = finding["repo_id"] or "cross-repository"
-        console.print(f"[{colour}]{finding['status']}[/{colour}] {escape(str(subject))}: {escape(finding['detail'])}")
+        subject = escape(str(finding["repo_id"] or "cross-repository"))
+        console.print(f"[{colour}]{finding['status']}[/{colour}] {subject}: {escape(finding['detail'])}")
     if any(finding["failed"] for finding in findings):
         raise typer.Exit(code=1)
 
@@ -2376,8 +2376,8 @@ def config_tools_trust(
             console.print(f"  overrides the global tool {escape(repr(tool.name))} in this repository", soft_wrap=True)
         console.print(f"  description: {escape(tool.description)}", highlight=False, soft_wrap=True)
         for p in tool.parameters:
-            detail = f"{p.type}, " + ("required" if p.required else f"optional, default {p.default!r}")
-            line = f"  parameter {p.name} ({detail})" + (f": {p.description}" if p.description else "")
+            shape = f"{p.type}, " + ("required" if p.required else f"optional, default {p.default!r}")
+            line = f"  parameter {p.name} ({shape})" + (f": {p.description}" if p.description else "")
             console.print(escape(line), highlight=False, soft_wrap=True)
         console.print(escape(tool.cypher.rstrip()), highlight=False, soft_wrap=True)
     if not declared.tools:

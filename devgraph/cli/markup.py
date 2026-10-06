@@ -18,6 +18,8 @@ def escape(text: str, *, before_tag: bool = False) -> str:
     trailing ones included, are literal and left alone, unless `before_tag`
     says the result is placed directly before a markup tag (as in
     `[bold]{text}[/bold]`): then trailing backslashes are doubled too.
+    `escape(a) + escape(b)` is not `escape(a + b)` when `a` ends in a backslash
+    and `b` starts with a tag, so callers must escape the joined value.
     """
 
     def sub(match: re.Match) -> str:
