@@ -808,7 +808,6 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     if docs_batch:
         _sync_docs(engine, repo_id, docs_spec, docs_batch)
         _relink_docs(engine, repo_id, repo_root, docs_spec, added_nodes, set(docs_batch.selected), docs_batch.view)
-    if providers_ok and docs_spec is not None:
         _log_cache_stats()
 
     # Docs notes get the same node-then-edge treatment as the source files
@@ -1335,7 +1334,8 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             _take_over_keys(engine, repo_id, repo_root, docs_spec, sorted(gone))
             # Nodes (still) at or below the deleted paths, with all their edges.
             engine.delete_extracted_nodes(repo_id, docs.EXTRACTOR, sorted(gone))
-            _log_cache_stats()
+            if gone:
+                _log_cache_stats()
 
     return cleaned
 

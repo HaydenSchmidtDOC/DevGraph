@@ -1,6 +1,7 @@
 """Shared checks and fixtures for the docs-provider tests (not a test module itself)."""
 
 import os
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -82,16 +83,22 @@ def cache_off(monkeypatch):
     monkeypatch.setattr(docs_cache, "read_fresh", _uncached)
 
 
-def wait_ctime_advance(path, before_ns=None):
+def wait_ctime_advance(path, before_ns=None, timeout=5.0):
     """Touch a probe beside `path` until its ctime passes `before_ns` (default: `path`'s
-    own ctime), so the next write to `path` gets a later ctime."""
+    own ctime), so the next write to `path` gets a later ctime. Fails after `timeout`
+    seconds. On Windows st_ctime is the creation time, so the mtime is waited on instead."""
+    field = "st_mtime_ns" if sys.platform == "win32" else "st_ctime_ns"
     if before_ns is None:
-        before_ns = os.stat(path).st_ctime_ns
+        before_ns = getattr(os.stat(path), field)
     probe = Path(path).parent / ".ctime-probe"
+    deadline = time.monotonic() + timeout
     try:
         while True:
             probe.write_bytes(b"x")
-            if os.stat(probe).st_ctime_ns > before_ns:
+            if getattr(os.stat(probe), field) > before_ns:
                 return
+            if time.monotonic() > deadline:
+                pytest.fail(f"{field} of {probe} did not pass {before_ns} within {timeout}s")
+            time.sleep(0.001)
     finally:
         probe.unlink(missing_ok=True)

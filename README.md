@@ -228,6 +228,7 @@ What it doesn't do yet:
 - Saving any file that a type keyed on an id matches walks the repository once and re-reads every file that type matches (and every file any other id-keyed type matches), so it can find who owns each id. It writes only the saved files and the owners of their ids, but in a repository with thousands of such files the save takes longer. Unchanged files are not parsed again: their front matter comes from an in-process cache. The walk and the path resolution for each file remain and dominate, and the first save after the agent starts reads every file once.
 - Keys come from one top-level front-matter field. Composite keys, nested fields (`a.b`) and the body are not read, and ids are not trimmed, folded to one case or Unicode-normalised.
 - Only front matter is read: not the title, headings or body text.
+- On Windows and FAT/exFAT drives, a permission change, or a same-size edit whose modified time is put back, with no save event, can leave the old front matter in use until that file is saved again or the repository is rescanned. So can the clock stepping backwards.
 
 ## Project tools (preview)
 

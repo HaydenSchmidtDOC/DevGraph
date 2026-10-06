@@ -52,13 +52,38 @@ def spy(monkeypatch):
     return calls
 
 
-def wait_ctime_advance(path, before_ns):
-    """Touch a probe until its ctime passes `before_ns`, so the next write gets a later ctime."""
+def wait_ctime_advance(path, before_ns=None, timeout=5.0):
+    """Touch a probe beside `path` until its ctime passes `before_ns` (default: `path`'s
+    own ctime), so the next write to `path` gets a later ctime. Fails after `timeout`
+    seconds. On Windows st_ctime is the creation time, so the mtime is waited on instead."""
+    field = "st_mtime_ns" if sys.platform == "win32" else "st_ctime_ns"
+    if before_ns is None:
+        before_ns = getattr(os.stat(path), field)
     probe = Path(path).parent / ".ctime-probe"
-    while True:
-        probe.write_bytes(b"x")
-        if os.stat(probe).st_ctime_ns > before_ns:
-            return
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            probe.write_bytes(b"x")
+            if getattr(os.stat(probe), field) > before_ns:
+                return
+            if time.monotonic() > deadline:
+                pytest.fail(f"{field} of {probe} did not pass {before_ns} within {timeout}s")
+            time.sleep(0.001)
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def test_wait_ctime_advance_times_out(tmp_path, monkeypatch):
+    p = tmp_path / "a.md"
+    write(p, "x")
+    real = os.stat
+    frozen = real(p)
+    monkeypatch.setattr(os, "stat", lambda *a, **k: frozen)
+    start = time.monotonic()
+    with pytest.raises(pytest.fail.Exception):
+        wait_ctime_advance(p, timeout=0.05)
+    assert time.monotonic() - start < 2
+    assert ".ctime-probe" not in os.listdir(tmp_path)
 
 
 def write(path, text):
@@ -372,7 +397,7 @@ def test_hostile_large_entries(hostile_root, aged, monkeypatch):
     write(first, text)
     parsed = docs.read_front_matter(first)
     assert parsed[1] is None
-    charge = docs_cache.ENTRY_OVERHEAD + docs_cache._deep_size(parsed[0])
+    charge = charge_of(first, "0.md")
     assert docs_cache.MAX_ENTRY_BYTES * 0.9 < charge <= docs_cache.MAX_ENTRY_BYTES
     count = docs_cache.MAX_BYTES // charge + 4
     for i in range(1, count):
