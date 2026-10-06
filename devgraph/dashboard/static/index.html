@@ -4374,11 +4374,16 @@ function configFormHints(section, form, ctx) {
   form.metadata.forEach((m, i) => nameHint("metadata." + i + ".name", m.name, L.PROPERTY_NAME_PATTERN, "A field name"));
   dupes(form.metadata, "metadata.", "field");
   colorHint();
-  if (form.source && !(key.length === 1 && key[0].name === "path" && key[0].type === "string")) {
-    hint("source", form.source === "docs" ? "A node type sourced from Markdown front matter must be keyed on exactly one string field named path."
-      : "A filesystem node type's key must be exactly one string field named path.");
+  if (form.source && form.source !== "docs" && !(key.length === 1 && key[0].name === "path" && key[0].type === "string")) {
+    hint("source", "A filesystem node type's key must be exactly one string field named path.");
   }
   if (form.source !== "docs") return out;
+  /* a docs key is path or one front-matter field, always text; an integer one only needs its type changed */
+  if (key.length === 1 && key[0].type === "integer") hint("metadata." + form.metadata.indexOf(key[0]) + ".type", "Use string: numbers like 12 still work.");
+  else if (!(key.length === 1 && key[0].type === "string")) {
+    hint("source", "A node type sourced from Markdown front matter is keyed on exactly one string field: path (the file's location) or a front-matter field such as id.");
+  }
+  if (!form.metadata.some(m => m.name === "path" && m.type === "string")) hint("key", "Add a field named path (type string): each entry records its file there.");
   const globs = form.paths.filter(p => p.glob !== "");
   if (!globs.length) hint("paths", "Add at least one path, for example runbooks/**/*.md.");
   else if (globs.length > L.MAX_DOCS_PATHS) hint("paths", "At most " + L.MAX_DOCS_PATHS + " paths.");
@@ -4792,11 +4797,26 @@ function renderConfigForm(edit) {
       fillKey();
       set.appendChild(fm);
       configFormField(set, path + "type", "Type", configFormSelect(M, m.type, [], v => { m.type = v; configFormChanged(); }));
-      configFormField(set, path + "required", "Required", configFormCheck(m.required, v => { m.required = v; configFormChanged(); }),
-        undefined, "cfg-check");
+      /* a docs key is always required: Required shows ticked and locked, and the YAML keeps what was written */
+      const required = configFormCheck(m.required, v => { m.required = v; configFormChanged(); });
+      const requiredHelp = configFormField(set, path + "required", "Required", required, "Key fields are always required.", "cfg-check").children[2];
       const key = configFormCheck(m.key, v => { m.key = v; configFormChanged(); });
-      configFormField(set, path + "key", "Key", key, "The key is the ticked fields, in this order.", "cfg-check");
+      const keyHelp = configFormField(set, path + "key", "Key", key, "", "cfg-check").children[2];
       key.setAttribute("aria-describedby", key.getAttribute("aria-describedby") + " configFormKeyHint");
+      const docsKey = () => {
+        const forced = f.source === "docs" && !!m.key;
+        required.checked = forced || !!m.required;
+        required.disabled = forced;
+        requiredHelp.style.display = forced ? "" : "none";
+        /* a hidden description is still read out, so it is referenced only while shown */
+        required.setAttribute("aria-describedby", (forced ? requiredHelp.id + " " : "") + required.id + "-hint");
+        keyHelp.textContent = f.source === "docs"
+          ? "Tick path, or one front-matter field whose value names the entry (like ADR-012), so links can use it."
+          : "The key is the ticked fields, in this order.";
+      };
+      docsKey.el = set;
+      docsKey();
+      configFormEls.refresh.push(docsKey);
       text(set, path + "description", "Description", "description", m);
     }, "metadata.");
   const keyHint = configEl("div", "cfg-hint");

@@ -134,6 +134,13 @@ VALID_NODE_TYPES = [
             "fields": {"severity": "sev", "on_call": "on-call-team"},
         },
     },
+    # keyed on a front-matter field: the key row writes no `required` (the form only shows it as required)
+    {
+        "label": "Decision",
+        "key": ["adr_id"],
+        "metadata": [{"name": "path"}, {"name": "adr_id"}, {"name": "title"}],
+        "source": {"provider": "docs", "paths": ["decisions/**/*.md"], "fields": {"adr_id": "id"}},
+    },
     # no where or fields
     {"label": "Adr", "key": ["path"], "source": {"provider": "docs", "paths": ["docs/adr/*.md"]}, "metadata": [{"name": "path"}]},
     # empty where and fields, keys reordered, and a field named like a YAML 1.1 boolean

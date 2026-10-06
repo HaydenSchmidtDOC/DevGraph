@@ -2774,11 +2774,33 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     ["a condition with no field", f => { f.where[0].field = ""; }, "where.0.field", /Name the front-matter field/],
     ["a long condition value", f => { f.where[0].value = "x".repeat(201); }, "where.0.value", /200 characters/],
     ["a pattern with eleven *", f => { f.where[0].op = "like"; f.where[0].value = "*a".repeat(11); }, "where.0.value", /\* at most 10 times/],
-    ["a docs key other than path", f => { f.metadata[0].key = false; f.metadata[1].key = true; }, "source", /Markdown front matter must be keyed on exactly one string field named path/],
+    ["two keys", f => { f.metadata[1].key = true; }, "source",
+      /^A node type sourced from Markdown front matter is keyed on exactly one string field: path \(the file's location\) or a front-matter field such as id\.$/],
+    ["no key", f => { f.metadata[0].key = false; }, "source", /keyed on exactly one string field: path \(the file's location\)/],
+    ["a boolean key", f => { f.metadata[0].key = false; f.metadata.push({ name: "flag", type: "boolean", key: true, required: false, description: "", fm_key: "", open: {} }); },
+      "source", /keyed on exactly one string field/],
   ].forEach(([what, edit, field, re]) => {
     const got = docsHints(edit);
     check("a docs hint for " + what, got.some(h => h.field === field && re.test(h.text)), j(got));
   });
+  const ADR_NODE = () => ({ label: "Adr", key: ["adr_id"], metadata: [{ name: "path" }, { name: "adr_id" }, { name: "title" }],
+    source: { provider: "docs", paths: ["decisions/**/*.md"], fields: { adr_id: "id" } } });
+  check("no hints for a docs node type keyed on a front-matter field", j(docsHints(() => {}, ADR_NODE())) === "[]", j(docsHints(() => {}, ADR_NODE())));
+  let adrHints = docsHints(f => { f.metadata[0].key = false; f.metadata[1].key = true; });
+  check("...nor for a Runbook keyed on owner instead of path", !adrHints.some(h => h.field === "source"), j(adrHints));
+  adrHints = docsHints(f => { f.metadata[1].type = "integer"; }, ADR_NODE());
+  check("an integer docs key hints on its Type to use string, and nothing on the source",
+    adrHints.some(h => h.field === "metadata.1.type" && h.text === "Use string: numbers like 12 still work.") && !adrHints.some(h => h.field === "source"), j(adrHints));
+  adrHints = docsHints(f => { f.metadata.splice(0, 1); }, ADR_NODE());
+  check("a docs node type with no path row hints to add one",
+    adrHints.some(h => h.field === "key" && h.text === "Add a field named path (type string): each entry records its file there."), j(adrHints));
+  adrHints = docsHints(f => { f.metadata[0].type = "integer"; }, ADR_NODE());
+  check("...and so does one whose path row is not a string", adrHints.some(h => h.field === "key" && /Add a field named path \(type string\)/.test(h.text)), j(adrHints));
+  const fsHints = api.configFormHints("node_types", nodeForm({ label: "N", key: ["slug"], metadata: [{ name: "path" }, { name: "slug" }],
+    source: { provider: "filesystem", kind: "file" } }));
+  check("a filesystem node type keeps its own key hint",
+    fsHints.some(h => h.field === "source" && h.text === "A filesystem node type's key must be exactly one string field named path.") &&
+    !fsHints.some(h => /Markdown|path \(type string\)|Use string/.test(h.text)), j(fsHints));
   const docsRelHints = edit => { const f = relForm(DOCS_REL()); edit(f); return api.configFormHints("relationships", f, ctxDocs); };
   const ctxDocs = { labels: ["Service", "Runbook", "Team"], relationship_types: ["CALLS"], filesystem: { file: null, folder: null }, docs: ["Runbook"] };
   check("no hints for a valid docs relationship", j(docsRelHints(() => {})) === "[]", j(docsRelHints(() => {})));
@@ -2792,6 +2814,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     const m = FM();
     const b = m.projects[1];
     b.schema.node_types.push({ label: "Ops", yaml: "label: Ops\n", entry: DOCS_NODE(), editable: true, badges: [] },
+      { label: "Adr", yaml: "label: Adr\n", entry: ADR_NODE(), editable: true, badges: [] },
       { label: "Hostile", yaml: "label: Hostile\n", editable: true, badges: [], entry: { label: "Hostile", key: ["path"],
         metadata: [{ name: "path" }, { name: "owner" }],
         source: { provider: "docs", paths: [HOSTILE], where: [{ field: HOSTILE, is: HOSTILE }], fields: { owner: HOSTILE } } } });
@@ -2891,6 +2914,31 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("while a docs dry run is out, a source change or Add path changes nothing", els.configForm.disabled === true &&
     els.configYaml.value === docsBusy && api.edit.formState.source === "docs" && api.edit.formState.paths.length === 1, els.configYaml.value);
   gate = null; release(); await pending;
+  els.configModalCancel.fire("click");
+  // a docs node type keyed on a front-matter field: Required follows Key
+  await editRow("repo-b", "Adr");
+  const adrRow = n => rowsOf("Metadata")[n];
+  const reqOf = n => formCtl("Required", 0, adrRow(n));
+  const keyOf = n => formCtl("Key", 0, adrRow(n));
+  const helpOf = el => find(els.configForm, e => e.id === el.getAttribute("aria-describedby").split(" ")[0])[0];
+  check("a ticked docs key shows Required ticked and disabled, saying why, without writing it",
+    reqOf(1).checked === true && reqOf(1).disabled === true && shown(helpOf(reqOf(1))) && helpOf(reqOf(1)).textContent === "Key fields are always required." &&
+    reqOf(2).checked === false && reqOf(2).disabled === false && !/-help/.test(reqOf(2).getAttribute("aria-describedby")) && !/required/.test(els.configYaml.value),
+    els.configYaml.value);
+  check("...and Key's help says what a docs key is",
+    helpOf(keyOf(1)).textContent === "Tick path, or one front-matter field whose value names the entry (like ADR-012), so links can use it.",
+    helpOf(keyOf(1)).textContent);
+  keyOf(1).checked = false;
+  await keyOf(1).fire("change");
+  check("unticking Key gives Required back", reqOf(1).checked === false && reqOf(1).disabled === false && !/-help/.test(reqOf(1).getAttribute("aria-describedby")) &&
+    !/required/.test(els.configYaml.value), els.configYaml.value);
+  keyOf(1).checked = true;
+  await keyOf(1).fire("change");
+  formCtl("Source").value = "file";
+  await formCtl("Source").fire("change");
+  check("outside docs, a key row's Required is its own and Key has its usual help",
+    reqOf(1).checked === false && reqOf(1).disabled === false && helpOf(keyOf(1)).textContent === "The key is the ticked fields, in this order.",
+    helpOf(keyOf(1)).textContent);
   els.configModalCancel.fire("click");
   // the docs relationship
   await editRow("repo-b", "RUNBOOK_FOR");
