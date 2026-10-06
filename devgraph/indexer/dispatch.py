@@ -220,15 +220,17 @@ def _upsert_deferred_label(
         engine.upsert_nodes(nodes)
     except Exception as exc:
         key = next(tuple(node_type.key) for node_type in effective.node_types if node_type.label == label)
-        others = sorted({
-            other for other, other_label, other_key in recorded_declarations(engine).get(label.casefold(), [])
+        # A repository with the same key spells the label differently (case only).
+        reasons = [
+            f"{other} spells the type '{other_label}'" if other_key == key
+            else f"{other} declares {label} keyed differently"
+            for other, other_label, other_key in sorted(recorded_declarations(engine).get(label.casefold(), []), key=lambda entry: entry[0])
             if other != repo_id and (other_label, other_key) != (label, key)
-        })
+        ]
         logger.warning(
-            "%s: %s entries were not written: %s %s %s keyed differently, so its constraint keeps "
+            "%s: %s entries were not written: %s, so its constraint keeps "
             "the old key and these entries break it; align the key or rename one label (%s)",
-            repo_id, label, ", ".join(others) or "another repository",
-            "declares" if len(others) <= 1 else "declare", label, exc,
+            repo_id, label, " and ".join(reasons) or f"another repository declares {label} keyed differently", exc,
         )
 
 
@@ -431,10 +433,11 @@ def _relink_docs(
     A docs edge to a node that didn't exist yet was skipped when its file was
     indexed. Only added nodes can be such a target: a re-indexed node MERGEs
     in place and keeps its incoming edges. Re-reads the files the docs types
-    select (never the graph), and only when a docs relationship targets an
+    select, and only when a docs relationship targets an
     added node's label. The batch's `view` supplies the walk, the field-keyed
     front matter and the owners (built here when a type is field-keyed and
-    the batch had none), so only the other files are read.
+    the batch had none), so only the other files are read. An edge from a
+    field-keyed entry is written only when the entry is already at that file.
     """
     target_labels = {relationship.to_label for relationship in spec.relationships}
     targets = {(label, name) for label, name in added if label in target_labels}
@@ -450,7 +453,18 @@ def _relink_docs(
         outside = {rel: p for rel, p in files.items() if rel not in batch}
         selected = _read_reusing(spec, outside, view.selected if view else {})
         owners = view.owners if view else {}
-        engine.upsert_relationships(docs.build_edges(spec, repo_id, selected, targets, owners=owners))
+        edges = docs.build_edges(spec, repo_id, selected, targets, owners=owners)
+        keyed = sorted(docs_type.label for docs_type in spec.types if docs_type.key is not None)
+        if keyed and edges:
+            # A field-keyed owner whose own event is pending may not hold its
+            # entry yet; an edge hung on the entry at another file would outlive
+            # the owner giving the id up. Its event links it instead.
+            placed = engine.extracted_entries(repo_id, docs.EXTRACTOR, keyed)
+            edges = [
+                edge for edge in edges
+                if edge["from_label"] not in keyed or (edge["from_label"], edge["from_name"], edge["from_path"]) in placed
+            ]
+        engine.upsert_relationships(edges)
     except Exception:
         logger.warning("docs relink failed for %s; the next rescan links them", repo_id, exc_info=True)
 

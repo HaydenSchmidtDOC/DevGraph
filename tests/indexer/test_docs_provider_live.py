@@ -1010,6 +1010,48 @@ def test_a_takeover_moves_only_the_deleted_entries_and_leaves_the_rest_to_the_ow
     assert_matches_fresh_apply(engine, REPO, keyed)
 
 
+@pytest.mark.parametrize("gives_up", ["delete", "re-id"])
+def test_a_relink_writes_no_edge_onto_an_entry_its_pending_owner_has_not_moved_yet(engine, keyed, gives_up):
+    # g.md claims ADR-K3 on disk (outranking sub/c.md) but its event is pending,
+    # so the entry is still at sub/c.md. A relink must not hang g.md's links on
+    # it: if g.md gives the id up before its event, nothing would remove them.
+    md(keyed, "decisions/sub/c.md", "id: ADR-K3")
+    g = keyed / "decisions" / "g.md"
+    if gives_up == "re-id":
+        md(keyed, "decisions/g.md", "id: ADR-K5")
+    kscan(engine, keyed)
+
+    md(keyed, "decisions/g.md", "id: ADR-K3\nrfc: ADR-K1")
+    o = md(keyed, "decisions/o.md", "id: ADR-K1\nkind: rfc")
+    index_paths(engine, REPO, keyed, {o})
+    assert links(engine, "ZZ_ADR_RFC") == []
+
+    if gives_up == "delete":
+        g.unlink()
+        remove_paths(engine, REPO, keyed, {g})
+    else:
+        md(keyed, "decisions/g.md", "id: ADR-K5")
+        index_paths(engine, REPO, keyed, {g})
+    assert entries(engine)["ADR-K3"] == "decisions/sub/c.md"
+    assert links(engine, "ZZ_ADR_RFC") == []
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_a_takeover_rebuilds_the_links_of_the_owners_other_entries(engine, keyed):
+    # o.md is already the Adr R-9 (with a link) when it takes Rfc R-9 over from
+    # a/g.md: the takeover clears o.md's outgoing links, so it rebuilds those too.
+    g = md(keyed, "a/g.md", "kind: rfc\nid: R-9")
+    md(keyed, "decisions/o.md", "kind: rfc\nid: R-9\nsupersedes: ADR-011")
+    kscan(engine, keyed)
+    assert entries(engine, RFC) == {"R-9": "a/g.md"}
+
+    g.unlink()
+    remove_paths(engine, REPO, keyed, {g})
+    assert entries(engine, RFC) == {"R-9": "decisions/o.md"}
+    assert ("R-9", "ADR-011") in links(engine, "ZZ_REPLACES")
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
 def test_a_symlink_into_an_ignored_directory_is_left_out_by_the_scan_and_by_a_save(engine, keyed):
     md(keyed, "build/hidden.md", "kind: rfc\nid: RFC-H")
     (keyed / "decisions" / "h.md").symlink_to(keyed / "build" / "hidden.md")

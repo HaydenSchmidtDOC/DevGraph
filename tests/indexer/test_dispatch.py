@@ -1255,6 +1255,33 @@ class TestFieldKeyedDocsApply:
         assert engine.calls == [("upsert_relationships", ([],))]
 
 
+class TestDeferredLabelWarning:
+    def test_a_repository_spelling_the_label_differently_is_named_as_such(self, monkeypatch, caplog):
+        from devgraph.config.project_schema import parse_project_schema, resolve_declaration
+
+        effective = resolve_declaration(parse_project_schema(
+            "version: 1\nnode_types:\n  - label: Adr\n    key: [adr_id]\n"
+            "    metadata: [{name: path}, {name: adr_id}]\n",
+            Path("devgraph.schema.yaml"),
+        ))
+        monkeypatch.setattr(dispatch, "recorded_declarations", lambda engine: {"adr": [
+            ("demo", "Adr", ("adr_id",)), ("b", "Adr", ("path",)), ("c", "ADR", ("adr_id",)),
+        ]})
+        engine = _RecordingEngine()
+
+        def boom(nodes):
+            raise RuntimeError("constraint violated")
+
+        engine.upsert_nodes = boom
+        with caplog.at_level(logging.WARNING, logger="devgraph.indexer.dispatch"):
+            dispatch._upsert_deferred_label(engine, "demo", effective, "Adr", [{"label": "Adr"}])
+        assert (
+            "demo: Adr entries were not written: b declares Adr keyed differently and c spells the type 'ADR', "
+            "so its constraint keeps the old key and these entries break it; align the key or rename one label "
+            "(constraint violated)"
+        ) in caplog.text
+
+
 class TestDocsPartialWrites:
     """A docs write failing after an entry moved says what it left behind."""
 
