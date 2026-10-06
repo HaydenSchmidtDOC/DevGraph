@@ -890,15 +890,15 @@ def _docs_source_findings(repos: list[Any], engine: Any) -> list[dict[str, Any]]
             files = walk.indexable_paths(repo.path)
             # each matched file is read once, for both the report and the links
             selected = docs.read_selected(spec, docs.files_by_rel(repo.path, files))
-            for line in docs.source_report(repo.path, effective, files, selected=selected):
+            claims = docs.keyed_claims(spec, selected)
+            for line in docs.source_report(repo.path, effective, files, selected=selected, claims=claims):
                 add(line["status"], line["detail"])
             if not spec.relationships:
                 continue
             if engine is None:
                 add("skipped", "links named in front matter not checked: Neo4j is not reachable")
                 continue
-            owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
-            edges = docs.build_edges(spec, repo.repo_id, selected, owners=owners)
+            edges = docs.build_edges(spec, repo.repo_id, selected, owners=docs.keyed_owners(claims))
             present = {
                 label: engine.existing_node_names(repo.repo_id, label, names)
                 for label, names in docs.edge_targets(edges).items()
@@ -1107,13 +1107,13 @@ def doctor() -> None:
         from devgraph.indexer.schema_constraints import constraint_drift, recorded_declarations
 
         constraint_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
-        recorded_keys: dict[tuple[str, str], tuple[str, ...] | None] = {}
+        recorded_keys: dict[tuple[str, str], tuple[str, tuple[str, ...] | None]] = {}
         try:
             stale = _stale_schema_objects(constraint_engine, registered_repos)
             drift = constraint_drift(constraint_engine)
             if any(finding["status"] == "conflict" for finding in drift):
                 for folded, entries in recorded_declarations(constraint_engine).items():
-                    recorded_keys.update(((repo, folded), key) for repo, _label, key in entries)
+                    recorded_keys.update(((repo, folded), (label, key)) for repo, label, key in entries)
         except Exception as e:
             stale = drift = None
             console.print(f"  [yellow][!][/yellow] could not check: {escape(str(e))}")
@@ -1136,14 +1136,18 @@ def doctor() -> None:
                     f"`devgraph rescan {finding['repo_id']} --now`"
                 )
             elif finding["status"] == "conflict":
-                # each disagreeing repository with its own recorded key (None when unknown)
+                # each disagreeing repository with its own recorded key (None when unknown);
+                # one with the same key spells the label differently (realign_keys
+                # weighs the label's exact spelling too)
                 reasons = []
                 for other in finding["declared_by"]:
-                    other_key = recorded_keys.get((other, finding["label"].casefold()))
-                    reasons.append(
-                        f"{escape(other)} identifies them differently (by {escape(', '.join(other_key))})"
-                        if other_key else f"{escape(other)} hasn't recorded how"
-                    )
+                    other_label, other_key = recorded_keys.get((other, finding["label"].casefold()), (None, None))
+                    if other_key is None:
+                        reasons.append(f"{escape(other)} hasn't recorded how")
+                    elif tuple(other_key) == tuple(finding["key"]):
+                        reasons.append(f"{escape(other)} spells the type '{escape(other_label)}'")
+                    else:
+                        reasons.append(f"{escape(other)} identifies them differently (by {escape(', '.join(other_key))})")
                 detail = (
                     f"{label}: this repository identifies entries by {key}, but the database's uniqueness rule "
                     f"still uses {escape(', '.join(finding['constraint_key']))} because {' and '.join(reasons)}. "

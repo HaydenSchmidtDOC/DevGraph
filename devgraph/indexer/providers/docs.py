@@ -606,14 +606,15 @@ def files_by_rel(repo_root: Path, files: Iterable[Path]) -> dict[str, Path]:
 
 
 def source_report(
-    repo_root: Path, effective: EffectiveSchema, files: Iterable[Path], *, selected: Selected | None = None
+    repo_root: Path, effective: EffectiveSchema, files: Iterable[Path], *, selected: Selected | None = None,
+    claims: Mapping[tuple[str, str], list[str]] | None = None,
 ) -> list[dict[str, str]]:
     """Doctor lines for each docs-sourced type: {"status": "ok" | "warning", "detail": ...}.
 
     `files` are the repository's indexable paths. The report reads only
     those files (none, when `selected` is the `read_selected` result for
-    them already) and never the graph, so edge values that match no target
-    are left to the caller.
+    them already, and `claims` its `keyed_claims`) and never the graph, so
+    edge values that match no target are left to the caller.
     """
     spec = docs_spec(effective)
     if spec is None:
@@ -621,7 +622,8 @@ def source_report(
     by_rel = files_by_rel(repo_root, files)
     if selected is None:
         selected = read_selected(spec, by_rel)
-    claims = keyed_claims(spec, selected)
+    if claims is None:
+        claims = keyed_claims(spec, selected)
     nodes, problems = build_nodes(spec, "", selected, keyed_owners(claims))
     for (label, key), (owner, *losers) in sorted(claims.items()):
         field = next(docs_type.key.key for docs_type in spec.types if docs_type.label == label)

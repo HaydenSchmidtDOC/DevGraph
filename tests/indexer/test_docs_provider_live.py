@@ -663,7 +663,7 @@ def test_without_docs_sources_the_graph_is_unchanged(engine, repo, monkeypatch):
 
     with_change = build(repo)
     engine.delete_repository(REPO)
-    monkeypatch.setattr(dispatch, "_prune_docs", lambda *a, **k: ([], None))
+    monkeypatch.setattr(dispatch, "_prune_docs", lambda *a, **k: ([], None, {}))
     for name in ("_read_docs_batch", "_sync_docs", "_relink_docs", "_sync_docs_edges"):
         monkeypatch.setattr(dispatch, name, lambda *a, **k: None)
     assert build(repo) == with_change
@@ -935,6 +935,15 @@ def test_stale_entries_are_chased_through_every_owner_pulled_in(engine, keyed, p
     # |batch| + |K_final|: q.md, plus ADR-040, ADR-060, ADR-050 and ADR-070.
     assert max(len(paths) for _name, paths in path_lists) <= 1 + 4
     assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_a_full_scan_works_out_the_id_owners_once(engine, keyed, monkeypatch):
+    calls = []
+    real = docs.keyed_claims
+    monkeypatch.setattr(docs, "keyed_claims", lambda *args: calls.append(1) or real(*args))
+    kscan(engine, keyed)
+    assert links(engine, "ZZ_RUNBOOK_ADR") == [("runbooks/deploy.md", "ADR-012")]
+    assert len(calls) == 1
 
 
 def test_a_long_chain_of_stale_entries_is_chased_with_a_fixed_number_of_lookups(engine, keyed, monkeypatch):

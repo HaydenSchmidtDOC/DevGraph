@@ -111,8 +111,9 @@ def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> 
     return _apply_project_schema(engine, repo_id, repo_root)[0]
 
 
-#: What `_apply_project_schema` applied for the docs provider: the spec and the front matter it read.
-AppliedDocs = tuple[docs.DocsSpec, docs.Selected]
+#: What `_apply_project_schema` applied for the docs provider: the spec, the
+#: front matter it read and the owner of each field-keyed entry.
+AppliedDocs = tuple[docs.DocsSpec, docs.Selected, Mapping[tuple[str, str], str]]
 
 
 def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> tuple[bool, AppliedDocs | None]:
@@ -133,9 +134,9 @@ def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) ->
     so a type switching providers would otherwise keep the old provider's
     properties.
 
-    Returns (applied, the docs spec and front matter applied, or None), so
-    full_scan's edge pass reuses them instead of resolving the schema and
-    reading every docs file again.
+    Returns (applied, the docs spec, front matter and owners applied, or
+    None), so full_scan's edge pass reuses them instead of resolving the
+    schema, reading every docs file and working out the owners again.
     """
     current_hash = schema_file_hash(repo_root)
     try:
@@ -167,7 +168,7 @@ def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) ->
     disk = _disk_files(repo_root)
     on_disk = set(disk)
     docs_spec = docs.docs_spec(effective)
-    docs_nodes, selected = _prune_docs(engine, repo_id, docs_spec, disk)
+    docs_nodes, selected, owners = _prune_docs(engine, repo_id, docs_spec, disk)
     filesystem.reconcile(engine, repo_id, spec, on_disk)
     if spec is not None:
         filesystem.sync_present(engine, repo_id, spec, on_disk)
@@ -187,7 +188,7 @@ def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) ->
         logger.warning("could not reconcile generated constraints/indexes for %s: %s", repo_id, exc)
     for label in sorted(deferred):
         _upsert_deferred_label(engine, repo_id, effective, label, [node for node in docs_nodes if node["label"] == label])
-    return True, (docs_spec, selected) if docs_spec is not None and selected is not None else None
+    return True, (docs_spec, selected, owners) if docs_spec is not None and selected is not None else None
 
 
 def _deferred_docs_labels(engine: GraphEngine, effective: EffectiveSchema, spec: docs.DocsSpec | None) -> set[str]:
@@ -249,22 +250,22 @@ def _is_provider_file(repo_root: Path, path: Path) -> bool:
 
 def _prune_docs(
     engine: GraphEngine, repo_id: str, spec: docs.DocsSpec | None, files: dict[str, Path]
-) -> tuple[list[dict], docs.Selected | None]:
+) -> tuple[list[dict], docs.Selected | None, Mapping[tuple[str, str], str]]:
     """Clear the docs provider's graph for a rebuild from the whole repository (spec §4).
 
     Every docs edge goes first, of any type, current or former: full_scan's
     final pass rebuilds them once every target exists. Then properties the
     schema no longer declares are cleared and nodes the mapping no longer
     produces are pruned (all of them when no type is docs-sourced). Returns
-    the nodes for the caller to upsert, and the front matter read (None
-    without docs types).
+    the nodes for the caller to upsert, the front matter read (None without
+    docs types) and the owners.
 
     `files` is every file on disk, so the owners of field-keyed entries are
     worked out from all of them (`docs.keyed_owners`). The nodes are built
     before anything is written, so a failure leaves the graph untouched.
     """
     nodes: list[dict] = []
-    selected = None
+    selected, owners = None, {}
     if spec is not None:
         selected = docs.read_selected(spec, files)
         owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
@@ -277,7 +278,7 @@ def _prune_docs(
                 repo_id, docs.EXTRACTOR, docs_type.label, [field.name for field in docs_type.fields]
             )
     engine.prune_extracted_nodes(repo_id, docs.EXTRACTOR, [f"{n['label']}:{n['name']}" for n in nodes])
-    return nodes, selected
+    return nodes, selected, owners
 
 
 def _log_docs_problems(repo_id: str, problems: list[docs.Problem]) -> None:
@@ -509,9 +510,8 @@ def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, applied
     when the schema file changed since (it is then pending)."""
     if applied is None or schema_pending(engine, repo_id, repo_root):
         return
-    spec, selected = applied
+    spec, selected, owners = applied
     try:
-        owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
         engine.upsert_relationships(docs.build_edges(spec, repo_id, selected, owners=owners))
     except Exception:
         logger.warning("docs edge pass failed for %s; the next rescan retries it", repo_id, exc_info=True)

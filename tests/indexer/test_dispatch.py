@@ -1204,7 +1204,7 @@ class TestFieldKeyedDocsApply:
     def test_prune_docs_keeps_only_each_keys_owner(self, temp_repo):
         spec, files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
-        nodes, selected = dispatch._prune_docs(engine, "demo", spec, files)
+        nodes, selected, _owners = dispatch._prune_docs(engine, "demo", spec, files)
         assert [(n["name"], n["properties"]["path"]) for n in nodes] == [("ADR-1", "decisions/adr-1.md")]
         assert sorted(selected) == sorted(files)
         assert engine.calls[-1] == ("prune_extracted_nodes", ("demo", "docs", ["Adr:ADR-1"]))
@@ -1229,7 +1229,9 @@ class TestFieldKeyedDocsApply:
         spec, files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
         monkeypatch.setattr(dispatch, "schema_pending", lambda *args: False)
-        dispatch._sync_docs_edges(engine, "demo", temp_repo, (spec, docs.read_selected(spec, files)))
+        selected = docs.read_selected(spec, files)
+        owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
+        dispatch._sync_docs_edges(engine, "demo", temp_repo, (spec, selected, owners))
         ((name, (edges,)),) = engine.calls
         assert name == "upsert_relationships"
         assert [(e["from_path"], e["to_name"]) for e in edges] == [("decisions/adr-1.md", "ADR-0")]

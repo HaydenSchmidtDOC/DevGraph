@@ -1446,6 +1446,22 @@ def test_cli_doctor_names_duplicate_and_missing_ids_and_links_by_path(runner, te
     assert "'ADR-012' in decisions/adr-014.md" not in section
 
 
+def test_cli_doctor_works_out_each_repositorys_id_owners_once(runner, temp_registry_db, tmp_path, monkeypatch):
+    from devgraph.indexer.providers import docs
+
+    root = _runbook_repo(tmp_path, {
+        "decisions/adr-012.md": "---\nid: ADR-012\n---\n",
+        "decisions/adr-013.md": "---\nid: ADR-013\nsupersedes: ADR-099\n---\n",
+    }, schema=ADR_SCHEMA)
+    calls = []
+    real = docs.keyed_claims
+    monkeypatch.setattr(docs, "keyed_claims", lambda *args: calls.append(1) or real(*args))
+    graph = _graph_with({"Adr": {"ADR-012", "ADR-013"}})
+    section = _project_schemas_section(_docs_doctor(runner, temp_registry_db, monkeypatch, root, graph).stdout)
+    assert "Adr: supersedes 'ADR-099' in decisions/adr-013.md matches no Adr" in section
+    assert len(calls) == 1
+
+
 def test_cli_doctor_prints_no_docs_lines_without_docs_sources(runner, temp_registry_db, tmp_path, monkeypatch):
     root = _runbook_repo(tmp_path, {"runbooks/x.md": "---\nowner: ops\n---\n"}, schema=WIDGET_SCHEMA)
     section = _project_schemas_section(
@@ -1697,6 +1713,31 @@ def test_cli_doctor_names_a_third_key_and_an_unrecorded_one_in_a_key_conflict(ru
         f"still uses slug because {third} identifies them differently (by rfc_id) and {unknown} hasn't recorded "
         f"how. Make every repository that uses the {label} type agree, then rescan."
     ) in doctor
+
+
+def test_cli_doctor_says_a_label_spelled_differently_is_the_conflict(runner, temp_registry_db, stale_label):
+    # Same key, label differing only in case: realign_keys still won't replace
+    # the constraint, so this is a conflict, but not one of identification.
+    engine, label, _name = stale_label  # constraint on (repo_id, slug)
+    db_path, registry = temp_registry_db
+    registry.close()
+    keyed, spelled = f"_smoketest_keyed_{label.lower()}", f"_smoketest_spelled_{label.lower()}"
+    shouted = label.upper()
+    try:
+        engine.upsert_repository(keyed, keyed, "/tmp/keyed")
+        engine.record_applied_schema(keyed, "sha256:x", [label], [], [f"{label}:code"])
+        engine.upsert_repository(spelled, spelled, "/tmp/spelled")
+        engine.record_applied_schema(spelled, "sha256:x", [shouted], [], [f"{shouted}:code"])
+        doctor = _collapsed(_invoke_live(runner, db_path, ["doctor"]).stdout)
+    finally:
+        engine.delete_repository(keyed)
+        engine.delete_repository(spelled)
+    assert (
+        f"{keyed}: {label}: this repository identifies entries by code, but the database's uniqueness rule "
+        f"still uses slug because {spelled} spells the type '{shouted}'. Make every repository "
+        f"that uses the {label} type agree, then rescan."
+    ) in doctor
+    assert f"{spelled} identifies them differently" not in doctor
 
 
 def test_cli_dashboard_url_points_a_wildcard_bind_at_loopback(runner, temp_registry_db):
