@@ -74,16 +74,18 @@ def delta(before):
     return {k: after[k] - before[k] for k in ("hits", "misses", "fresh")}
 
 
-def charge_of(path):
-    return docs_cache.ENTRY_OVERHEAD + docs_cache._deep_size(docs.read_front_matter(path)[0])
+def charge_of(path, rel=""):
+    value = docs.read_front_matter(path)[0]
+    return docs_cache.ENTRY_OVERHEAD + sys.getsizeof(rel) + docs_cache._deep_size(value)
 
 
 def live_charges():
     """The sum of every live entry's charge, recomputed from the stored values."""
     with docs_cache._lock:
-        entries = list(docs_cache._store.values())
-    assert all(e.charge == docs_cache.ENTRY_OVERHEAD + docs_cache._deep_size(e.value) for e in entries)
-    return sum(e.charge for e in entries)
+        items = list(docs_cache._store.items())
+    for (_, rel), e in items:
+        assert e.charge == docs_cache.ENTRY_OVERHEAD + sys.getsizeof(rel) + docs_cache._deep_size(e.value)
+    return sum(e.charge for _, e in items)
 
 
 def test_hit_and_miss(tmp_path, aged, spy):
@@ -312,7 +314,7 @@ def test_bounds_entries_lru(tmp_path, aged, monkeypatch):
 
 def test_bounds_bytes(tmp_path, aged, monkeypatch):
     paths = _files(tmp_path, 5)
-    one = charge_of(paths[0])
+    one = charge_of(paths[0], "0")
     monkeypatch.setattr(docs_cache, "MAX_BYTES", one * 2 + one // 2)
     for i, p in enumerate(paths):
         docs_cache.read(tmp_path, str(i), p)
@@ -322,7 +324,7 @@ def test_bounds_bytes(tmp_path, aged, monkeypatch):
 
 def test_bounds_entry_too_large(tmp_path, aged, monkeypatch):
     (p,) = _files(tmp_path, 1)
-    monkeypatch.setattr(docs_cache, "MAX_ENTRY_BYTES", charge_of(p) + 100)
+    monkeypatch.setattr(docs_cache, "MAX_ENTRY_BYTES", charge_of(p, "a") + 100)
     docs_cache.read(tmp_path, "a", p)
     assert _keys(tmp_path) == ["a"]
     write(p, doc("ADR-0001", "big: " + "x" * 2000 + "\n"))
@@ -412,6 +414,34 @@ def test_keys_normalised(tmp_path, aged, monkeypatch):
     assert docs_cache.stats()["entries"] == 0
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+@pytest.mark.parametrize("read_via, forget_via", [("link", "real"), ("real", "link")])
+def test_keys_resolve_symlinked_root(tmp_path, aged, read_via, forget_via):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    (p,) = _files(real, 1)
+    roots = {"real": real, "link": link}
+    docs_cache.read(roots[read_via], "f0.md", p)
+    assert docs_cache.stats()["entries"] == 1
+    docs_cache.forget(roots[forget_via])
+    assert docs_cache.stats()["entries"] == 0
+
+
+def test_bounds_charge_long_rel_keys(tmp_path, aged, monkeypatch):
+    rels = [f"{i}-" + "d/" * 1995 + "f.md" for i in range(10)]
+    paths = _files(tmp_path, 10)
+    one = charge_of(paths[0], rels[0])
+    assert one > docs_cache.ENTRY_OVERHEAD + sys.getsizeof(rels[0])
+    monkeypatch.setattr(docs_cache, "MAX_BYTES", one * 3 + one // 2)
+    for rel, p in zip(rels, paths):
+        docs_cache.read(tmp_path, rel, p)
+        assert docs_cache.stats()["bytes"] <= docs_cache.MAX_BYTES
+    assert _keys(tmp_path) == rels[-3:]
+    assert docs_cache.stats()["bytes"] == live_charges()
+
+
 class _OwnedLock:
     """A lock whose `locked()` answers for the calling thread, so spies can run concurrently."""
 
@@ -451,16 +481,20 @@ def test_threads(tmp_path, aged, monkeypatch):
     before = docs_cache.stats()
     errors = []
     rounds = 3
+    fresh_every = 5
 
-    def worker(seed):
+    def worker(seed, fresh):
         order = list(paths)
         random.Random(seed).shuffle(order)
         for _ in range(rounds):
-            for p in order:
+            for i, p in enumerate(order):
                 if docs_cache.read(tmp_path, p.name, p) != expected[p]:
                     errors.append(p)
+                if fresh and i % fresh_every == 0 and docs_cache.read_fresh(tmp_path, p.name, p) != expected[p]:
+                    errors.append(p)
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    # Half the threads also read_fresh every fifth file, racing the lookups and stores.
+    threads = [threading.Thread(target=worker, args=(i, i % 2 == 0)) for i in range(8)]
     for t in threads:
         t.start()
     for t in threads:
@@ -469,6 +503,7 @@ def test_threads(tmp_path, aged, monkeypatch):
     assert unlocked and all(unlocked)
     d = delta(before)
     assert d["hits"] + d["misses"] == 8 * rounds * len(paths)
+    assert d["fresh"] == 4 * rounds * len(range(0, len(paths), fresh_every))
     assert docs_cache.stats()["entries"] == len(paths)
     assert docs_cache.stats()["bytes"] == live_charges()
 

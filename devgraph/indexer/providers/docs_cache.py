@@ -13,8 +13,8 @@ the spec's known limits (`docs/superpowers/specs/2026-10-07-docs-read-cache-desi
   creation time, so the identity rests on size, mtime and file index.
 - **Bounds (C3).** One process-wide LRU keyed by `(realpath(repo root), rel)`,
   capped at `MAX_ENTRIES` entries and `MAX_BYTES` bytes. An entry is charged
-  `ENTRY_OVERHEAD` plus the approximate deep size of its value; one over
-  `MAX_ENTRY_BYTES` is not stored. Nothing is persisted.
+  `ENTRY_OVERHEAD`, the size of its `rel` string and the approximate deep size
+  of its value; one over `MAX_ENTRY_BYTES` is not stored. Nothing is persisted.
 - **Copies (C4).** The store keeps a private `deepcopy` and every hit returns
   a `deepcopy`, so no caller can mutate a stored value. No parse, copy or
   size walk runs under `_lock`.
@@ -44,7 +44,7 @@ RACY_WINDOW_NS = 3_000_000_000
 MAX_ENTRIES = 20_000
 MAX_BYTES = 64 * 1024 * 1024
 MAX_ENTRY_BYTES = 1024 * 1024
-#: Charged per entry for its key, identity tuple and dict slot.
+#: Charged per entry for its key tuple, identity tuple and dict slot (the `rel` string is charged on top).
 ENTRY_OVERHEAD = 512
 
 _clock = time.time_ns
@@ -95,7 +95,12 @@ def _deep_size(value: Any) -> int:
 
 
 def _root_key(root: Path) -> str:
-    """`os.path.realpath(root)`, memoised on the absolute path so a cwd change can't alias roots."""
+    """`os.path.realpath(root)`, memoised on the absolute path so a cwd change can't alias roots.
+
+    A memo gone stale because a root symlink was repointed is safe: validity is
+    each file's own identity, so entries are never served for the wrong file,
+    and the memo is bounded at 256 roots.
+    """
     return _realpath(os.path.abspath(root))
 
 
@@ -130,7 +135,7 @@ def _load(key: tuple[str, str], path: Path, now: int, before: Any) -> tuple[dict
         _evict(key)
         return result
     stored = deepcopy(values)
-    charge = ENTRY_OVERHEAD + _deep_size(stored)
+    charge = ENTRY_OVERHEAD + sys.getsizeof(key[1]) + _deep_size(stored)
     if charge > MAX_ENTRY_BYTES:
         _evict(key)
         return result

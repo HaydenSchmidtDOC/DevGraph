@@ -127,8 +127,10 @@ The bounds are constants, not config:
 - `MAX_BYTES = 64 MiB`;
 - `MAX_ENTRY_BYTES = 1 MiB`. A larger entry is not stored, so one file cannot flush the store.
 
-An entry's charge is `ENTRY_OVERHEAD` (512 bytes, for the key, the identity
-tuple and the dict slot) plus the approximate deep size of its parsed value:
+An entry's charge is `ENTRY_OVERHEAD` (512 bytes, for the key tuple, the
+identity tuple and the dict slot), plus `sys.getsizeof` of its `rel` string
+(a hostile repository controls its length), plus the approximate deep size of
+its parsed value:
 a walk memoised by `id` that sums `sys.getsizeof` over containers, keys and
 leaves. A shared `&x` list is therefore charged once, and the walk terminates.
 The charge is computed once at store time, outside the lock. The walk is

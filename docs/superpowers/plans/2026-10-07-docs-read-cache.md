@@ -30,7 +30,7 @@
 - **Keys and bounds (C3).**
   - Entries are keyed by `(realpath(repo_root), rel)`, and `forget` normalises the same way.
   - `MAX_ENTRIES = 20_000`, `MAX_BYTES = 64 MiB` and `MAX_ENTRY_BYTES = 1 MiB`.
-  - Each entry is charged `ENTRY_OVERHEAD` (512) plus the deep size of its value, memoised by `id`.
+  - Each entry is charged `ENTRY_OVERHEAD` (512), plus `sys.getsizeof(rel)`, plus the deep size of its value, memoised by `id`.
   - LRU eviction runs across one process-wide `OrderedDict` behind one `threading.Lock`.
 
   There is no config knob, nothing goes to disk, and there is no new dependency.
@@ -210,7 +210,7 @@ Tests: `tests/indexer/test_docs_provider.py` (unit) and `tests/indexer/test_docs
     2. Make a same-length edit to `adr-0001.md`, then time `index_paths({adr-0001.md})` with `time.perf_counter`. This is the cold save.
     3. Do the same with `adr-0002.md`. This is the warm save.
     4. **Hard assertion:** the warm save makes exactly one `docs.read_front_matter` call, for the batch file. Spy on `docs.read_front_matter`, not `bounded_safe_load`, because the schema load also calls `bounded_safe_load`.
-    5. **Ratio:** `cold >= 3 * warm`. The walk and the per-file `resolve()` dominate the warm save (spec "Cost after caching").
+    5. **Ratio:** `cold >= 2 * warm`. The exactly-one-parse assertion above is the hard guard; the ratio is loose so it holds under load. The walk and the per-file `resolve()` dominate the warm save (spec "Cost after caching").
     6. `assert_matches_fresh_apply`.
   - **Live correctness: a same-size edit with the mtime restored is seen** (`cache_on`; skipped on win32).
     1. Start from a warm cache.

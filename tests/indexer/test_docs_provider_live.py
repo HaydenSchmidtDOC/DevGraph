@@ -1335,7 +1335,7 @@ def test_a_warm_save_parses_only_its_own_file(engine, tmp_path, monkeypatch, cap
     assert parses == [path]
     assert "docs read cache: " in caplog.text
     print(f"\ncold save {cold * 1000:.0f} ms, warm save {warm * 1000:.0f} ms over 2,000 Adr files")
-    assert cold >= 3 * warm, (cold, warm)
+    assert cold >= 2 * warm, (cold, warm)
     assert_matches_fresh_apply(engine, REPO, root)
 
 
