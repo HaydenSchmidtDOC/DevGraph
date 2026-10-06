@@ -1233,9 +1233,19 @@ class TestFieldKeyedDocsApply:
         assert name == "upsert_relationships"
         assert [(e["from_path"], e["to_name"]) for e in edges] == [("decisions/adr-1.md", "ADR-0")]
 
-    def test_batch_path_skips_field_keyed_docs_without_writing(self, temp_repo):
+    def test_a_batch_holding_a_loser_adds_only_its_keys_owner(self, temp_repo):
         spec, files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
-        assert dispatch._read_docs_batch("demo", spec, files) is None
-        dispatch._relink_docs(engine, "demo", temp_repo, spec, {("Adr", "ADR-0")}, set())
-        assert engine.calls == []
+        engine.existing_node_names = lambda repo_id, label, names: set(names)
+        copy = "decisions/adr-1 copy.md"
+        batch = dispatch._read_docs_batch(engine, "demo", temp_repo, spec, {copy: files[copy]}, set())
+        assert sorted(batch.selected) == ["decisions/adr-1 copy.md", "decisions/adr-1.md"]
+        assert [(n["name"], n["properties"]["path"]) for n in batch.nodes] == [("ADR-1", "decisions/adr-1.md")]
+        assert batch.existing == {("Adr", "ADR-1")}
+
+    def test_relink_writes_no_edge_from_a_loser_outside_the_batch(self, temp_repo):
+        spec, _files = _keyed_docs(temp_repo)
+        engine = _RecordingEngine()
+        # The copy, outside the batch, names ADR-9 but loses ADR-1 to the original.
+        dispatch._relink_docs(engine, "demo", temp_repo, spec, {("Adr", "ADR-9")}, {"decisions/adr-1.md"})
+        assert engine.calls == [("upsert_relationships", ([],))]

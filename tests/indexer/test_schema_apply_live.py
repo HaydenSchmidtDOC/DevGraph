@@ -1,5 +1,6 @@
 """Applying a project schema: recorded state, pending pause, removed-type cleanup."""
 
+import logging
 import textwrap
 import uuid
 
@@ -7,7 +8,10 @@ import pytest
 
 from devgraph.config.project_schema import ABSENT_SCHEMA_HASH, schema_file_hash
 from devgraph.graph.engine import GraphEngine
+from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import apply_project_schema, full_scan, index_paths, schema_pending
+from devgraph.indexer.schema_constraints import constraint_drift, generated_objects
+from tests.indexer.docs_live_helpers import assert_matches_fresh_apply
 
 REPO = "_smoketest_schema_apply"
 WORKTREE = """
@@ -34,6 +38,7 @@ _TOKEN = uuid.uuid4().hex[:8]
 FILE, FOLDER, ENTRY = (f"ZzFile{_TOKEN}", f"ZzFolder{_TOKEN}", f"ZzEntry{_TOKEN}")
 GADGET = f"ZzGadget{_TOKEN}"
 NOTE = f"ZzNote{_TOKEN}"
+KADR, KRFC, KRUNBOOK = (f"ZzKeyAdr{_TOKEN}", f"ZzKeyRfc{_TOKEN}", f"ZzKeyRunbook{_TOKEN}")
 _SHOWN = {FILE: "File", FOLDER: "Folder", ENTRY: "Entry"}
 
 
@@ -42,7 +47,7 @@ def _drop_generated_constraints():
     yield
     cleanup = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
     try:
-        for label in (FILE, FOLDER, ENTRY, GADGET, NOTE):
+        for label in (FILE, FOLDER, ENTRY, GADGET, NOTE, KADR, KRFC, KRUNBOOK):
             cleanup.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_key IF EXISTS")
             cleanup.run_cypher(f"DROP INDEX {label.lower()}_repo_name IF EXISTS")
     except Exception:
@@ -273,3 +278,191 @@ def test_a_failed_apply_writes_no_docs_edges(engine, noted, monkeypatch):
     full_scan(engine, REPO, noted)
     assert not schema_pending(engine, REPO, noted)  # still the applied schema: only apply's result gates it
     assert note_edges(engine) == []
+
+
+# --- docs key switch (front-matter keys, K7) ----------------------------------
+
+
+def keyed_schema(adr_key, rfc_key="rfc_id", adr_only=False):
+    adr = f"""
+    version: 1
+    node_types:
+      - label: {KADR}
+        key: [{adr_key}]
+        metadata: [{{name: path}}, {{name: adr_id}}]
+        source: {{provider: docs, paths: ["decisions/*.md"], fields: {{adr_id: id}}}}
+"""
+    return adr if adr_only else adr + f"""      - label: {KRFC}
+        key: [{rfc_key}]
+        metadata: [{{name: path}}, {{name: rfc_id}}]
+        source: {{provider: docs, paths: ["rfcs/*.md"], fields: {{rfc_id: id}}}}
+      - label: {KRUNBOOK}
+        key: [path]
+        metadata: [{{name: path}}]
+        source: {{provider: docs, paths: ["runbooks/*.md"]}}
+    relationships:
+      - {{type: ZZ_KEY_RUNBOOK_ADR, provider: docs, from: {KRUNBOOK}, to: {KADR}, field: adr}}
+"""
+
+
+@pytest.fixture
+def keyed_labels(engine):
+    """Drops the key tests' generated constraints before and after each test:
+    every test here starts with no constraint on its labels."""
+    def drop():
+        for label in (KADR, KRFC, KRUNBOOK):
+            engine.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_key IF EXISTS")
+
+    drop()
+    yield
+    drop()
+
+
+@pytest.fixture
+def other_repo(engine, tmp_path, keyed_labels):
+    """Repository B: scanned with only the Adr type, keyed on `adr_key`, holding one Adr, id ADR-1."""
+    repo_id = f"_smoketest_schema_apply_b_{_TOKEN}"
+    root = tmp_path / "other"
+
+    def make(adr_key):
+        page(root, "decisions/z.md", "id: ADR-1")
+        write_schema(root, keyed_schema(adr_key, adr_only=True))
+        engine.upsert_repository(repo_id, repo_id, str(root))
+        full_scan(engine, repo_id, root)
+        return repo_id
+
+    engine.delete_repository(repo_id)
+    yield make
+    engine.delete_repository(repo_id)
+
+
+def page(root, rel, front):
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"---\n{front}\n---\n# Page\n")
+    return path
+
+
+def entries(engine, label):
+    rows = engine.run_cypher(f"MATCH (n:{label} {{repo_id: $r}}) RETURN n.name AS n, n.path AS p", {"r": REPO})
+    return {r["n"]: r["p"] for r in rows}
+
+
+def constraint_key(engine, label):
+    obj = generated_objects(engine).get(f"{label.lower()}_repo_key")
+    return obj.properties[1:] if obj else None
+
+
+def runbook_links(engine):
+    rows = engine.run_cypher(
+        f"MATCH (a:{KRUNBOOK} {{repo_id: $r}})-[:ZZ_KEY_RUNBOOK_ADR]->(b) RETURN b.name AS b", {"r": REPO}
+    )
+    return sorted(r["b"] for r in rows)
+
+
+@pytest.fixture
+def shared_id(repo):
+    """Two Adr files sharing id ADR-1, and a runbook naming the entry both ways."""
+    page(repo, "decisions/a.md", "id: ADR-1")
+    page(repo, "decisions/b.md", "id: ADR-1")
+    page(repo, "rfcs/r.md", "id: RFC-1")
+    page(repo, "runbooks/deploy.md", "adr: [ADR-1, decisions/b.md]")
+    return repo
+
+
+def test_switching_a_docs_key_renames_the_entries_both_ways(engine, shared_id, keyed_labels):
+    write_schema(shared_id, keyed_schema("path"))
+    scan(engine, shared_id)
+    assert entries(engine, KADR) == {"decisions/a.md": "decisions/a.md", "decisions/b.md": "decisions/b.md"}
+    assert runbook_links(engine) == ["decisions/b.md"]
+
+    write_schema(shared_id, keyed_schema("adr_id"))
+    scan(engine, shared_id)
+    assert entries(engine, KADR) == {"ADR-1": "decisions/a.md"}  # the owner's
+    assert constraint_key(engine, KADR) == ("adr_id",)
+    assert runbook_links(engine) == ["ADR-1"]
+    assert_matches_fresh_apply(engine, REPO, shared_id)
+
+    write_schema(shared_id, keyed_schema("path"))
+    scan(engine, shared_id)
+    assert entries(engine, KADR) == {"decisions/a.md": "decisions/a.md", "decisions/b.md": "decisions/b.md"}
+    assert constraint_key(engine, KADR) == ("path",)
+    assert runbook_links(engine) == ["decisions/b.md"]
+    assert_matches_fresh_apply(engine, REPO, shared_id)
+
+
+def test_a_key_another_repo_still_records_leaves_the_label_unwritten(engine, shared_id, other_repo, caplog):
+    b_id = other_repo("adr_id")
+    write_schema(shared_id, keyed_schema("adr_id"))
+    scan(engine, shared_id)
+    assert entries(engine, KADR) == {"ADR-1": "decisions/a.md"}
+
+    # Both Adr and Rfc switch to [path]; only Adr's constraint is held by repo B.
+    write_schema(shared_id, keyed_schema("path", rfc_key="path"))
+    with caplog.at_level(logging.WARNING, logger="devgraph.indexer.dispatch"):
+        assert apply_project_schema(engine, REPO, shared_id)
+
+    assert entries(engine, KADR) == {}  # the duplicate ids break B's (repo_id, adr_id) constraint
+    assert constraint_key(engine, KADR) == ("adr_id",)
+    assert entries(engine, KRFC) == {"rfcs/r.md": "rfcs/r.md"}  # its own transaction
+    assert constraint_key(engine, KRFC) == ("path",)
+    assert entries(engine, KRUNBOOK) == {"runbooks/deploy.md": "runbooks/deploy.md"}
+    assert (
+        f"{REPO}: {KADR} entries were not written: {b_id} declares {KADR} keyed differently, so its constraint "
+        f"keeps the old key and these entries break it; align the key or rename one label"
+    ) in caplog.text
+    assert [d for d in constraint_drift(engine) if d["label"] == KADR] == [{
+        "repo_id": REPO, "label": KADR, "status": "conflict", "key": ("path",),
+        "constraint_key": ("adr_id",), "declared_by": [b_id],
+    }]
+    assert_matches_fresh_apply(engine, REPO, shared_id)
+
+
+def test_a_first_apply_under_another_repos_path_constraint_writes_unique_ids(
+    engine, repo, other_repo, monkeypatch, caplog
+):
+    b_id = other_repo("path")
+    assert constraint_key(engine, KADR) == ("path",)
+    page(repo, "decisions/a.md", "id: ADR-1")
+    page(repo, "decisions/b.md", "id: ADR-2")
+    page(repo, "runbooks/deploy.md", "adr: ADR-2")
+    write_schema(repo, keyed_schema("adr_id"))
+    deferred = []
+    real = dispatch._deferred_docs_labels
+    monkeypatch.setattr(dispatch, "_deferred_docs_labels", lambda *a: deferred.append(real(*a)) or deferred[-1])
+
+    with caplog.at_level(logging.WARNING):
+        scan(engine, repo)
+
+    assert KADR in deferred[0]
+    assert entries(engine, KADR) == {"ADR-1": "decisions/a.md", "ADR-2": "decisions/b.md"}
+    assert runbook_links(engine) == ["ADR-2"]
+    assert constraint_key(engine, KADR) == ("path",)  # B still declares it
+    assert (
+        f"not replacing the generated constraint/index of {KADR} keyed on (adr_id): other repositories "
+        f"disagree ({b_id} declares {KADR} keyed on (path)); align the key or rename one label"
+    ) in caplog.text
+    assert "entries were not written" not in caplog.text  # unique paths never break B's key
+    assert [d for d in constraint_drift(engine) if d["label"] == KADR] == [{
+        "repo_id": REPO, "label": KADR, "status": "conflict", "key": ("adr_id",),
+        "constraint_key": ("path",), "declared_by": [b_id],
+    }]
+    assert_matches_fresh_apply(engine, REPO, repo)
+
+
+def test_a_first_apply_under_another_repos_id_constraint_warns_its_entries_were_not_written(
+    engine, shared_id, other_repo, caplog
+):
+    b_id = other_repo("adr_id")
+    write_schema(shared_id, keyed_schema("path"))
+    with caplog.at_level(logging.WARNING, logger="devgraph.indexer.dispatch"):
+        scan(engine, shared_id)
+
+    assert entries(engine, KADR) == {}
+    assert entries(engine, KRUNBOOK) == {"runbooks/deploy.md": "runbooks/deploy.md"}
+    assert (
+        f"{REPO}: {KADR} entries were not written: {b_id} declares {KADR} keyed differently, so its constraint "
+        f"keeps the old key and these entries break it; align the key or rename one label"
+    ) in caplog.text
+    assert [d["status"] for d in constraint_drift(engine) if d["label"] == KADR] == ["conflict"]
+    assert_matches_fresh_apply(engine, REPO, shared_id)

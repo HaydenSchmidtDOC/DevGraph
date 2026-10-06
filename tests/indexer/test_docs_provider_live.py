@@ -12,10 +12,13 @@ import uuid
 
 import pytest
 
+from devgraph.config.project_schema import resolve_effective_schema
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths, schema_pending
 from devgraph.indexer.providers import docs
+from devgraph.indexer.walk import indexable_paths
+from tests.indexer.docs_live_helpers import assert_matches_fresh_apply
 
 # Unique per run: these tests drop and re-create the labels' generated
 # constraints, which are database-wide and shared with real repositories,
@@ -23,7 +26,9 @@ from devgraph.indexer.providers import docs
 _TOKEN = uuid.uuid4().hex[:8]
 REPO = f"_smoketest_docs_provider_{_TOKEN}"
 RUNBOOK, ADR, FILE = (f"ZzRunbook{_TOKEN}", f"ZzAdr{_TOKEN}", f"ZzFile{_TOKEN}")
-_SHOWN = {RUNBOOK: "Runbook", ADR: "Adr", FILE: "File"}
+# The front-matter key tests' own labels, so their keys never meet the ones above.
+KADR, RFC, KRUNBOOK = (f"ZzKAdr{_TOKEN}", f"ZzRfc{_TOKEN}", f"ZzKRunbook{_TOKEN}")
+_SHOWN = {RUNBOOK: "Runbook", ADR: "Adr", FILE: "File", KADR: "Adr", RFC: "Rfc", KRUNBOOK: "Runbook"}
 
 TYPES = """
     version: 1
@@ -83,7 +88,7 @@ def _drop_generated_constraints():
     yield
     cleanup = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
     try:
-        for label in (RUNBOOK, ADR, FILE):
+        for label in (RUNBOOK, ADR, FILE, KADR, RFC, KRUNBOOK):
             cleanup.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_key IF EXISTS")
             cleanup.run_cypher(f"DROP INDEX {label.lower()}_repo_name IF EXISTS")
     except Exception:
@@ -294,10 +299,10 @@ def relinks(monkeypatch):
     seen = []
     real = docs.build_edges
 
-    def spy(spec, repo_id, selected, targets=None):
+    def spy(spec, repo_id, selected, targets=None, **kwargs):
         if targets is not None:
             seen.append(sorted(targets))
-        return real(spec, repo_id, selected, targets)
+        return real(spec, repo_id, selected, targets, **kwargs)
 
     monkeypatch.setattr(docs, "build_edges", spy)
     return seen
@@ -662,3 +667,309 @@ def test_without_docs_sources_the_graph_is_unchanged(engine, repo, monkeypatch):
     for name in ("_read_docs_batch", "_sync_docs", "_relink_docs", "_sync_docs_edges"):
         monkeypatch.setattr(dispatch, name, lambda *a, **k: None)
     assert build(repo) == with_change
+
+
+# --- front-matter keys -------------------------------------------------------
+#
+# Adr is keyed on its `id` (adr_id), Rfc on `id` wherever `kind: rfc`, and
+# Runbook stays keyed on its path. Every sequence ends with the graph a fresh
+# full apply of the same files would build.
+
+KEYED_SCHEMA = f"""
+    version: 1
+    node_types:
+      - label: {KADR}
+        key: [adr_id]
+        metadata: [{{name: path}}, {{name: adr_id}}, {{name: title}}]
+        source: {{provider: docs, paths: ["decisions/**/*.md"], fields: {{adr_id: id}}}}
+      - label: {RFC}
+        key: [id]
+        metadata: [{{name: path}}, {{name: id}}]
+        source: {{provider: docs, paths: ["**/*.md"], where: [{{field: kind, is: rfc}}]}}
+      - label: {KRUNBOOK}
+        key: [path]
+        metadata: [{{name: path}}]
+        source: {{provider: docs, paths: ["runbooks/*.md"]}}
+    relationships:
+      - {{type: ZZ_REPLACES, provider: docs, from: {KADR}, to: {KADR}, field: supersedes}}
+      - {{type: ZZ_RUNBOOK_ADR, provider: docs, from: {KRUNBOOK}, to: {KADR}, field: adr}}
+"""
+
+
+@pytest.fixture
+def keyed(tmp_path):
+    root = tmp_path / "keyed"
+    root.mkdir()
+    (root / "devgraph.schema.yaml").write_text(textwrap.dedent(KEYED_SCHEMA))
+    md(root, "decisions/adr-011.md", "id: ADR-011\ntitle: Eleven")
+    md(root, "decisions/adr-012.md", "id: ADR-012\ntitle: Twelve\nsupersedes: ADR-011")
+    md(root, "decisions/adr-013.md", "id: ADR-013\nsupersedes: [ADR-011, ADR-012]")
+    md(root, "runbooks/deploy.md", "adr: ADR-012")
+    return root
+
+
+def kscan(engine, root):
+    engine.upsert_repository(REPO, REPO, str(root))
+    full_scan(engine, REPO, root)
+
+
+def entries(engine, label=KADR):
+    """{name: path} of one label's entries."""
+    rows = engine.run_cypher(f"MATCH (n:{label} {{repo_id: $r}}) RETURN n.name AS n, n.path AS p", {"r": REPO})
+    return {r["n"]: r["p"] for r in rows}
+
+
+def element_id(engine, name, label=KADR):
+    rows = engine.run_cypher(
+        f"MATCH (n:{label} {{repo_id: $r, name: $n}}) RETURN elementId(n) AS id", {"r": REPO, "n": name}
+    )
+    return rows[0]["id"] if rows else None
+
+
+def replaces(engine):
+    return edges(engine, "ZZ_REPLACES")
+
+
+def links(engine, rel_type):
+    return [(a, b) for a, b, _f in edges(engine, rel_type)]
+
+
+def doctor_lines(root):
+    files = indexable_paths(root)
+    return [line["detail"] for line in docs.source_report(root, resolve_effective_schema(root), files)]
+
+
+def test_keyed_full_scan_links_by_id_and_a_list_makes_two_edges(engine, keyed):
+    kscan(engine, keyed)
+    assert entries(engine) == {
+        "ADR-011": "decisions/adr-011.md", "ADR-012": "decisions/adr-012.md", "ADR-013": "decisions/adr-013.md",
+    }
+    assert links(engine, "ZZ_REPLACES") == [("ADR-012", "ADR-011"), ("ADR-013", "ADR-011"), ("ADR-013", "ADR-012")]
+    assert links(engine, "ZZ_RUNBOOK_ADR") == [("runbooks/deploy.md", "ADR-012")]
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_a_file_losing_a_key_in_one_type_still_owns_it_in_another(engine, keyed):
+    md(keyed, "decisions/adr-1.md", "id: ADR-1")
+    kscan(engine, keyed)
+    x = md(keyed, "decisions/x.md", "kind: rfc\nid: ADR-1\nsupersedes: ADR-011")
+    index_paths(engine, REPO, keyed, {x})
+    assert entries(engine, RFC) == {"ADR-1": "decisions/x.md"}
+    assert entries(engine)["ADR-1"] == "decisions/adr-1.md"
+    assert "decisions/x.md" not in entries(engine).values()
+    assert ("ADR-1", "ADR-011") not in links(engine, "ZZ_REPLACES")
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_the_relink_writes_edges_from_owners_only(engine, keyed, relinks):
+    (keyed / "decisions" / "adr-012.md").unlink()
+    md(keyed, "decisions/adr-006.md", "id: ADR-006")
+    kscan(engine, keyed)  # the runbook names ADR-012, which no file claims yet
+    assert links(engine, "ZZ_RUNBOOK_ADR") == []
+
+    # The copy reaches the disk without an event of its own; its owner comes in the batch.
+    md(keyed, "decisions/adr-012 copy.md", "id: ADR-012\nsupersedes: ADR-007")
+    owner = md(keyed, "decisions/adr-012.md", "id: ADR-012\nsupersedes: ADR-006")
+    seven = md(keyed, "decisions/adr-007.md", "id: ADR-007")
+    index_paths(engine, REPO, keyed, {owner, seven})
+
+    assert [(KADR, "ADR-007"), (KADR, "ADR-012")] in relinks
+    assert entries(engine)["ADR-012"] == "decisions/adr-012.md"
+    assert links(engine, "ZZ_RUNBOOK_ADR") == [("runbooks/deploy.md", "ADR-012")]
+    assert [b for a, b in links(engine, "ZZ_REPLACES") if a == "ADR-012"] == ["ADR-006"]
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+@pytest.mark.parametrize("copy_first", [False, True])
+def test_the_original_keeps_its_id_whichever_file_is_saved_first(engine, keyed, copy_first):
+    original = keyed / "decisions" / "adr-012.md"
+    text = original.read_text()
+    if copy_first:
+        original.unlink()
+        kscan(engine, keyed)
+        copy = md(keyed, "decisions/adr-012 copy.md", "id: ADR-012\nsupersedes: ADR-013")
+        index_paths(engine, REPO, keyed, {copy})
+        assert entries(engine)["ADR-012"] == "decisions/adr-012 copy.md"
+        original.write_text(text)
+        index_paths(engine, REPO, keyed, {original})
+    else:
+        kscan(engine, keyed)
+        copy = md(keyed, "decisions/adr-012 copy.md", "id: ADR-012\nsupersedes: ADR-013")
+        index_paths(engine, REPO, keyed, {copy})
+
+    assert entries(engine)["ADR-012"] == "decisions/adr-012.md"
+    assert [b for a, b in links(engine, "ZZ_REPLACES") if a == "ADR-012"] == ["ADR-011"]
+    assert "Adr: decisions/adr-012 copy.md: 'id' 'ADR-012' is also used by decisions/adr-012.md, whose path " \
+        "sorts first and keeps it; change the id in one of them" in [
+            line.replace(KADR, "Adr") for line in doctor_lines(keyed)
+        ]
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_a_file_sorting_first_takes_the_entry_over_in_place_and_hands_it_back_on_delete(engine, keyed):
+    md(keyed, "decisions/adr-010.md", "id: ADR-010")
+    kscan(engine, keyed)
+    before = element_id(engine, "ADR-012")
+
+    first = md(keyed, "decisions/adr-000.md", "id: ADR-012\nsupersedes: ADR-010")
+    index_paths(engine, REPO, keyed, {first})
+    assert entries(engine)["ADR-012"] == "decisions/adr-000.md"
+    assert element_id(engine, "ADR-012") == before
+    assert ("ADR-013", "ADR-012") in links(engine, "ZZ_REPLACES")
+    assert [b for a, b in links(engine, "ZZ_REPLACES") if a == "ADR-012"] == ["ADR-010"]
+    assert links(engine, "ZZ_RUNBOOK_ADR") == [("runbooks/deploy.md", "ADR-012")]
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+    first.unlink()
+    remove_paths(engine, REPO, keyed, {first})
+    assert entries(engine)["ADR-012"] == "decisions/adr-012.md"
+    assert element_id(engine, "ADR-012") == before
+    assert ("ADR-013", "ADR-012") in links(engine, "ZZ_REPLACES")
+    assert [b for a, b in links(engine, "ZZ_REPLACES") if a == "ADR-012"] == ["ADR-011"]
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+@pytest.mark.parametrize("remove_first", [True, False])
+def test_a_rename_keeping_the_id_moves_the_entry_and_keeps_its_incoming_edges(engine, keyed, relinks, remove_first):
+    kscan(engine, keyed)
+    before = element_id(engine, "ADR-012")
+    old = keyed / "decisions" / "adr-012.md"
+    new = keyed / "decisions" / "accepted" / "adr-012.md"
+    new.parent.mkdir()
+    old.rename(new)
+    relinks.clear()
+    if remove_first:
+        remove_paths(engine, REPO, keyed, {old})
+        index_paths(engine, REPO, keyed, {new})
+    else:
+        index_paths(engine, REPO, keyed, {new})
+        remove_paths(engine, REPO, keyed, {old})
+
+    assert entries(engine)["ADR-012"] == "decisions/accepted/adr-012.md"
+    assert element_id(engine, "ADR-012") == before
+    assert ("ADR-013", "ADR-012") in links(engine, "ZZ_REPLACES")
+    assert links(engine, "ZZ_RUNBOOK_ADR") == [("runbooks/deploy.md", "ADR-012")]
+    assert not [t for t in relinks if (KADR, "ADR-012") in t]
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_a_re_id_hands_the_old_id_to_its_claimant_and_relinks_the_new_one(engine, keyed, relinks, reads):
+    md(keyed, "decisions/adr-012 copy.md", "id: ADR-012\nsupersedes: ADR-013")
+    md(keyed, "runbooks/later.md", "adr: ADR-099")
+    kscan(engine, keyed)
+    before = element_id(engine, "ADR-012")
+
+    path = md(keyed, "decisions/adr-012.md", "id: ADR-099\nsupersedes: ADR-011")
+    reads.clear()
+    index_paths(engine, REPO, keyed, {path})
+    assert len(reads) == len(set(reads))  # the relink reused the batch's walk and reads
+
+    assert entries(engine)["ADR-012"] == "decisions/adr-012 copy.md"
+    assert entries(engine)["ADR-099"] == "decisions/adr-012.md"
+    assert element_id(engine, "ADR-012") == before
+    assert ("ADR-013", "ADR-012") in links(engine, "ZZ_REPLACES")
+    assert [b for a, b in links(engine, "ZZ_REPLACES") if a == "ADR-012"] == ["ADR-013"]
+    assert ("runbooks/later.md", "ADR-099") in links(engine, "ZZ_RUNBOOK_ADR")
+    assert [(KADR, "ADR-099")] in relinks
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_a_missing_or_invalid_id_leaves_the_file_out_and_writes_the_rest(engine, keyed):
+    kscan(engine, keyed)
+    missing = md(keyed, "decisions/adr-020.md", "title: No id")
+    spaced = md(keyed, "decisions/adr-021.md", "id: ' ADR-021'")
+    listed = md(keyed, "decisions/adr-022.md", "id: [ADR-022]")
+    good = md(keyed, "decisions/adr-023.md", "id: ADR-023\nsupersedes: ADR-013")
+    index_paths(engine, REPO, keyed, {missing, spaced, listed, good})
+    found = entries(engine)
+    assert found["ADR-023"] == "decisions/adr-023.md"
+    assert not {"decisions/adr-020.md", "decisions/adr-021.md", "decisions/adr-022.md"} & set(found.values())
+    assert ("ADR-023", "ADR-013") in links(engine, "ZZ_REPLACES")
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_deleting_an_owner_without_a_claimant_removes_its_entry_and_edges(engine, keyed):
+    kscan(engine, keyed)
+    path = keyed / "decisions" / "adr-012.md"
+    path.unlink()
+    remove_paths(engine, REPO, keyed, {path})
+    assert "ADR-012" not in entries(engine)
+    assert links(engine, "ZZ_REPLACES") == [("ADR-013", "ADR-011")]
+    assert links(engine, "ZZ_RUNBOOK_ADR") == []
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_deleting_the_folder_removes_every_entry(engine, keyed):
+    md(keyed, "decisions/x.md", "kind: rfc\nid: RFC-1")
+    md(keyed, "decisions/adr-012 copy.md", "id: ADR-012")
+    kscan(engine, keyed)
+    shutil.rmtree(keyed / "decisions")
+    remove_paths(engine, REPO, keyed, {keyed / "decisions"})
+    assert entries(engine) == {} and entries(engine, RFC) == {}
+    assert links(engine, "ZZ_REPLACES") == [] and links(engine, "ZZ_RUNBOOK_ADR") == []
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+# --- bounds ------------------------------------------------------------------
+
+
+@pytest.fixture
+def path_lists(engine, monkeypatch):
+    """Every repo-relative path list the docs engine calls receive."""
+    seen = []
+    # Where each call takes its list: (repo_id, extractor, paths, ...), (repo_id, files), (repo_id, label, names).
+    positions = {
+        "delete_extracted_edges": 2, "prune_extracted_at": 2, "delete_extracted_nodes": 2,
+        "extracted_nodes_at": 2, "list_file_nodes": 1, "existing_node_names": 2,
+    }
+    for name, position in positions.items():
+        real = getattr(engine, name)
+
+        def spy(*args, _real=real, _name=name, _position=position):
+            if args[_position] is not None:
+                seen.append((_name, list(args[_position])))
+            return _real(*args)
+
+        monkeypatch.setattr(engine, name, spy)
+    return seen
+
+
+@pytest.fixture
+def reads(monkeypatch):
+    read = []
+    real = docs.read_front_matter
+    monkeypatch.setattr(docs, "read_front_matter", lambda path: read.append(path) or real(path))
+    return read
+
+
+def test_fifty_duplicate_claimants_keep_every_path_list_small(engine, keyed, path_lists, reads):
+    for n in range(50):
+        md(keyed, f"decisions/adr-012 copy {n}.md", "id: ADR-012\nsupersedes: ADR-013")
+    kscan(engine, keyed)
+
+    for batch in ([keyed / "decisions" / "adr-012 copy 7.md"], [keyed / "decisions" / "adr-012.md"]):
+        path_lists.clear()
+        reads.clear()
+        index_paths(engine, REPO, keyed, set(batch))
+        assert path_lists
+        assert max(len(paths) for _name, paths in path_lists) <= len(batch) + 1  # |batch| + |K|
+        assert len(reads) == len(set(reads))
+
+    path_lists.clear()
+    reads.clear()
+    gone = keyed / "decisions" / "adr-012.md"
+    gone.unlink()
+    remove_paths(engine, REPO, keyed, {gone})
+    assert max(len(paths) for _name, paths in path_lists) <= 2
+    assert len(reads) == len(set(reads))
+    assert entries(engine)["ADR-012"] == "decisions/adr-012 copy 0.md"
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_without_keyed_types_a_save_reads_only_the_batch(engine, repo, reads):
+    scan(engine, repo)
+    reads.clear()
+    path = md(repo, "runbooks/api.md", "type: runbook\nowner: team-c\nservice: api")
+    index_paths(engine, REPO, repo, {path})
+    assert reads == [path]
+    assert_matches_fresh_apply(engine, REPO, repo)
