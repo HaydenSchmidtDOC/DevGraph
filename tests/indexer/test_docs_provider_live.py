@@ -6,9 +6,13 @@ relink of edges whose target appears in a later batch.
 
 import logging
 import os
+import random
 import shutil
+import sys
 import textwrap
+import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,9 +20,14 @@ from devgraph.config.project_schema import resolve_effective_schema
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths, schema_pending
-from devgraph.indexer.providers import docs
+from devgraph.indexer.providers import docs, docs_cache
 from devgraph.indexer.walk import indexable_paths
-from tests.indexer.docs_live_helpers import assert_matches_fresh_apply
+from tests.indexer.docs_live_helpers import (  # noqa: F401  (cache_off and cache_on are pytest fixtures)
+    assert_matches_fresh_apply,
+    cache_off,
+    cache_on,
+    wait_ctime_advance,
+)
 
 # Unique per run: these tests drop and re-create the labels' generated
 # constraints, which are database-wide and shared with real repositories,
@@ -112,6 +121,9 @@ def engine():
 
 def md(root, rel, front=None, body="# Notes\n"):
     path = root / rel
+    if path.exists():
+        # An in-place edit gets a later ctime than the read the cache may hold.
+        wait_ctime_advance(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     text = body if front is None else f"---\n{textwrap.dedent(front).strip()}\n---\n{body}"
     path.write_text(text)
@@ -698,8 +710,10 @@ KEYED_SCHEMA = f"""
 """
 
 
-@pytest.fixture
-def keyed(tmp_path):
+@pytest.fixture(params=["cache-on", "cache-off"])
+def keyed(tmp_path, request):
+    """The keyed repository; every sequence on it runs with the read cache storing and without it."""
+    request.getfixturevalue(request.param.replace("-", "_"))
     root = tmp_path / "keyed"
     root.mkdir()
     (root / "devgraph.schema.yaml").write_text(textwrap.dedent(KEYED_SCHEMA))
@@ -1167,3 +1181,289 @@ def test_without_keyed_types_a_save_reads_only_the_batch(engine, repo, reads):
     index_paths(engine, REPO, repo, {path})
     assert reads == [path]
     assert_matches_fresh_apply(engine, REPO, repo)
+
+
+# --- the read cache ----------------------------------------------------------
+#
+# Dispatch reads every docs file through `docs_cache`: the batch's own files
+# through `read_fresh`, every other one through `read`. Each sequence ends
+# with the graph a fresh, uncached apply builds.
+
+NO_CTIME = pytest.mark.skipif(sys.platform == "win32", reason="no change time; see the read cache spec's Known limits")
+
+
+@pytest.fixture
+def through_cache(monkeypatch):
+    """Every docs_cache call in order as (op, rel), and every parse made outside the cache."""
+    seen = SimpleNamespace(calls=[], outside=[])
+    depth = [0]
+
+    def wrap(op, real):
+        def spy(root, rel, path):
+            seen.calls.append((op, rel))
+            depth[0] += 1
+            try:
+                return real(root, rel, path)
+            finally:
+                depth[0] -= 1
+        return spy
+
+    real_forget, real_parse = docs_cache.forget, docs.read_front_matter
+    monkeypatch.setattr(docs_cache, "read", wrap("read", docs_cache.read))
+    monkeypatch.setattr(docs_cache, "read_fresh", wrap("fresh", docs_cache.read_fresh))
+    monkeypatch.setattr(docs_cache, "forget", lambda root: seen.calls.append(("forget", None)) or real_forget(root))
+
+    def parse(path):
+        if not depth[0]:
+            seen.outside.append(path)
+        return real_parse(path)
+
+    monkeypatch.setattr(docs, "read_front_matter", parse)
+    seen.of = lambda op: sorted(rel for o, rel in seen.calls if o == op)
+    return seen
+
+
+def adr_files(root):
+    return sorted(p.relative_to(root).as_posix() for p in (root / "decisions").rglob("*.md"))
+
+
+def test_a_save_reads_its_own_file_fresh_and_every_other_through_the_cache(engine, keyed, through_cache):
+    md(keyed, "decisions/adr-0003.md", "id: ADR-0003")
+    kscan(engine, keyed)
+    saved = md(keyed, "decisions/adr-0003.md", "id: ADR-0003\nsupersedes: ADR-011")
+    through_cache.calls.clear()
+    index_paths(engine, REPO, keyed, {saved})
+
+    assert through_cache.of("fresh") == ["decisions/adr-0003.md"]
+    others = [rel for rel in adr_files(keyed) if rel != "decisions/adr-0003.md"]
+    assert set(others) <= set(through_cache.of("read"))
+    assert "decisions/adr-0003.md" not in through_cache.of("read")
+    assert through_cache.outside == []
+    assert ("ADR-0003", "ADR-011") in links(engine, "ZZ_REPLACES")
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_the_relink_reads_through_the_cache(engine, keyed, through_cache):
+    # Rfc only under rfcs/: the runbooks are then read by the relink itself, not by the view.
+    (keyed / "devgraph.schema.yaml").write_text(
+        textwrap.dedent(KEYED_SCHEMA).replace('paths: ["**/*.md"], where', 'paths: ["rfcs/**/*.md"], where')
+    )
+    md(keyed, "runbooks/later.md", "adr: ADR-099")
+    kscan(engine, keyed)
+    target = md(keyed, "decisions/adr-099.md", "id: ADR-099")
+    through_cache.calls.clear()
+    index_paths(engine, REPO, keyed, {target})
+
+    assert {"runbooks/deploy.md", "runbooks/later.md"} <= set(through_cache.of("read"))
+    assert through_cache.of("fresh") == ["decisions/adr-099.md"]
+    assert through_cache.outside == []
+    assert ("runbooks/later.md", "ADR-099") in links(engine, "ZZ_RUNBOOK_ADR")
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_a_takeover_reads_through_the_cache(engine, keyed, through_cache):
+    md(keyed, "decisions/adr-012 copy.md", "id: ADR-012\nsupersedes: ADR-013")
+    kscan(engine, keyed)
+    gone = keyed / "decisions" / "adr-012.md"
+    gone.unlink()
+    through_cache.calls.clear()
+    remove_paths(engine, REPO, keyed, {gone})
+
+    assert "decisions/adr-012 copy.md" in through_cache.of("read")
+    assert through_cache.of("fresh") == []
+    assert through_cache.outside == []
+    assert entries(engine)["ADR-012"] == "decisions/adr-012 copy.md"
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_a_full_scan_forgets_the_repository_before_it_reads_through_the_cache(engine, keyed, through_cache):
+    kscan(engine, keyed)
+    stale = keyed / "decisions" / "adr-011.md"
+    stale.unlink()  # deleted while the watcher was down: the scan's prune takes it over
+    through_cache.calls.clear()
+    kscan(engine, keyed)
+
+    assert through_cache.calls[0] == ("forget", None)
+    assert [op for op, _ in through_cache.calls].count("forget") == 1
+    assert set(adr_files(keyed)) <= set(through_cache.of("read"))
+    assert through_cache.of("fresh") == []
+    assert through_cache.outside == []
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_doctor_never_touches_the_read_cache(engine, keyed):
+    from devgraph.cli.main import _docs_source_findings
+
+    kscan(engine, keyed)
+    before = docs_cache.stats()
+    findings = _docs_source_findings([SimpleNamespace(repo_id=REPO, path=keyed)], engine)
+    lines = doctor_lines(keyed)
+    assert findings and lines
+    assert docs_cache.stats() == before
+
+
+ADR_FRONT = (
+    "id: ADR-{n:04}\ntitle: Decision {n:04} version {v}\nstatus: accepted\ndate: 2026-10-07\n"
+    "deciders: [team-a, team-b]\ntags: [cache, docs]\nkind: decision\nsupersedes: ADR-{p:04}"
+)
+
+
+@pytest.mark.usefixtures("cache_on")
+def test_a_warm_save_parses_only_its_own_file(engine, tmp_path, monkeypatch, caplog):
+    root = tmp_path / "many"
+    root.mkdir()
+    (root / "devgraph.schema.yaml").write_text(textwrap.dedent(KEYED_SCHEMA))
+    for n in range(1, 2001):
+        md(root, f"decisions/adr-{n:04}.md", ADR_FRONT.format(n=n, v="A", p=max(n - 1, 1)))
+    kscan(engine, root)
+    docs_cache.forget(root)
+    parses = []
+    real = docs.read_front_matter
+    monkeypatch.setattr(docs, "read_front_matter", lambda path: parses.append(path) or real(path))
+
+    def save(n):
+        path = md(root, f"decisions/adr-{n:04}.md", ADR_FRONT.format(n=n, v="B", p=max(n - 1, 1)))
+        parses.clear()
+        start = time.perf_counter()
+        index_paths(engine, REPO, root, {path})
+        return time.perf_counter() - start, path
+
+    cold, _ = save(1)
+    assert len(parses) == 2000
+    with caplog.at_level(logging.DEBUG, logger="devgraph.indexer.dispatch"):
+        warm, path = save(2)
+    assert parses == [path]
+    assert "docs read cache: " in caplog.text
+    print(f"\ncold save {cold * 1000:.0f} ms, warm save {warm * 1000:.0f} ms over 2,000 Adr files")
+    assert cold >= 3 * warm, (cold, warm)
+    assert_matches_fresh_apply(engine, REPO, root)
+
+
+@pytest.fixture
+def two_adrs(engine, tmp_path):
+    """A warm cache over decisions/adr-a.md (ADR-0001) and adr-b.md (ADR-0009)."""
+    root = tmp_path / "two"
+    root.mkdir()
+    (root / "devgraph.schema.yaml").write_text(textwrap.dedent(KEYED_SCHEMA))
+    md(root, "decisions/adr-a.md", "id: ADR-0001")
+    md(root, "decisions/adr-b.md", "id: ADR-0009")
+    kscan(engine, root)
+    return root
+
+
+def _same_size_in_place(path, text):
+    """Rewrite `path` in place with as many bytes, then put its mtime back (no event)."""
+    before = os.stat(path)
+    assert len(text.encode()) == before.st_size
+    wait_ctime_advance(path)
+    path.write_text(text)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert os.stat(path).st_mtime_ns == before.st_mtime_ns
+
+
+def _same_size_atomic(path, text):
+    """Replace `path` with a new file of as many bytes and the same mtime (an editor's atomic save)."""
+    before = os.stat(path)
+    assert len(text.encode()) == before.st_size
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(text)
+    os.utime(temp, ns=(before.st_atime_ns, before.st_mtime_ns))
+    os.replace(temp, path)
+    assert os.stat(path).st_mtime_ns == before.st_mtime_ns
+
+
+@NO_CTIME
+@pytest.mark.usefixtures("cache_on")
+def test_a_same_size_edit_with_its_mtime_restored_is_seen(engine, two_adrs):
+    a = two_adrs / "decisions" / "adr-a.md"
+    _same_size_in_place(a, a.read_text().replace("ADR-0001", "ADR-0002"))
+    index_paths(engine, REPO, two_adrs, {md(two_adrs, "decisions/adr-b.md", "id: ADR-0002")})
+    assert entries(engine)["ADR-0002"] == "decisions/adr-a.md"  # a stale cache keeps it at adr-b.md
+
+    index_paths(engine, REPO, two_adrs, {a})
+    assert_matches_fresh_apply(engine, REPO, two_adrs)
+
+
+@pytest.mark.usefixtures("cache_on")
+def test_an_atomic_save_outside_the_batch_is_seen(engine, two_adrs):
+    a = two_adrs / "decisions" / "adr-a.md"
+    _same_size_atomic(a, a.read_text().replace("ADR-0001", "ADR-0002"))
+    index_paths(engine, REPO, two_adrs, {md(two_adrs, "decisions/adr-b.md", "id: ADR-0002")})
+    assert entries(engine)["ADR-0002"] == "decisions/adr-a.md"
+
+    index_paths(engine, REPO, two_adrs, {a})
+    assert_matches_fresh_apply(engine, REPO, two_adrs)
+
+
+@pytest.mark.usefixtures("cache_on")
+def test_a_schema_change_with_a_warm_cache_matches_a_fresh_apply(engine, tmp_path):
+    root = tmp_path / "schema"
+    root.mkdir()
+    (root / "devgraph.schema.yaml").write_text(textwrap.dedent(KEYED_SCHEMA))
+    for n in range(10):
+        status = "keep" if n % 2 else "drop"
+        md(root, f"decisions/adr-{n}.md", f"id: ADR-{n}\nstatus: {status}\nsupersedes: ADR-{n - 1}")
+    kscan(engine, root)
+    assert len(entries(engine)) == 10
+
+    (root / "devgraph.schema.yaml").write_text(textwrap.dedent(KEYED_SCHEMA).replace(
+        "fields: {adr_id: id}}", "fields: {adr_id: id}, where: [{field: status, is: keep}]}",
+    ))
+    full_scan(engine, REPO, root)
+    assert sorted(entries(engine)) == [f"ADR-{n}" for n in range(1, 10, 2)]
+    assert_matches_fresh_apply(engine, REPO, root)
+
+
+@pytest.mark.usefixtures("cache_on")
+def test_fuzz_events_and_silent_edits_with_a_warm_cache_match_a_fresh_apply(engine, tmp_path):
+    rng = random.Random(20261007)
+    root = tmp_path / "fuzz"
+    root.mkdir()
+    (root / "devgraph.schema.yaml").write_text(textwrap.dedent(KEYED_SCHEMA))
+    names = [f"decisions/f{n}.md" for n in range(8)]
+
+    def front():
+        # Always as many bytes: a silent edit keeps the size.
+        return f"id: ADR-K{rng.randrange(5)}\nsupersedes: ADR-K{rng.randrange(5)}"
+
+    def text():
+        return f"---\n{front()}\n---\n# Notes\n"
+
+    for rel in names:
+        md(root, rel, front())
+    kscan(engine, root)
+    pending: set[str] = set()
+    for step in range(60):
+        rel = rng.choice(sorted(pending)) if pending and rng.random() < 0.5 else rng.choice(names)
+        path = root / rel
+        kind = rng.choice(["save", "silent", "atomic", "atomic-event", "delete", "re-id"])
+        if not path.exists() and kind != "delete":
+            kind = "save"
+        if kind in ("save", "re-id"):
+            md(root, rel, front())
+            index_paths(engine, REPO, root, {path})
+            pending.discard(rel)
+        elif kind == "silent":
+            if sys.platform == "win32":
+                md(root, rel, front() + "\ntitle: grown")
+            else:
+                _same_size_in_place(path, text())
+            pending.add(rel)
+        elif kind.startswith("atomic"):
+            _same_size_atomic(path, text())
+            if kind == "atomic-event":
+                index_paths(engine, REPO, root, {path})
+                pending.discard(rel)
+            else:
+                pending.add(rel)
+        else:
+            if path.exists():
+                path.unlink()
+            remove_paths(engine, REPO, root, {path})
+            pending.discard(rel)
+        if not pending:
+            assert_matches_fresh_apply(engine, REPO, root)
+
+    for rel in sorted(pending):
+        index_paths(engine, REPO, root, {root / rel})
+    assert_matches_fresh_apply(engine, REPO, root)

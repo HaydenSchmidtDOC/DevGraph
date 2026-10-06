@@ -1204,7 +1204,7 @@ class TestFieldKeyedDocsApply:
     def test_prune_docs_keeps_only_each_keys_owner(self, temp_repo):
         spec, files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
-        nodes, selected, _owners = dispatch._prune_docs(engine, "demo", spec, files)
+        nodes, selected, _owners = dispatch._prune_docs(engine, "demo", temp_repo, spec, files)
         assert [(n["name"], n["properties"]["path"]) for n in nodes] == [("ADR-1", "decisions/adr-1.md")]
         assert sorted(selected) == sorted(files)
         assert engine.calls[-1] == ("prune_extracted_nodes", ("demo", "docs", ["Adr:ADR-1"]))
@@ -1220,7 +1220,7 @@ class TestFieldKeyedDocsApply:
 
         monkeypatch.setattr(docs, "build_nodes", boom)
         with pytest.raises(ValueError):
-            dispatch._prune_docs(engine, "demo", spec, files)
+            dispatch._prune_docs(engine, "demo", temp_repo, spec, files)
         assert engine.calls == []
 
     def test_full_scan_edge_pass_writes_edges_from_owners_only(self, temp_repo, monkeypatch):

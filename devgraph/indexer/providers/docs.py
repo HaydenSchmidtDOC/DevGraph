@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import fnmatch
 import unicodedata
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple
@@ -382,15 +382,28 @@ class Selected(dict[str, tuple[dict[Any, Any] | None, str | None]]):
         self.verdicts: dict[tuple[str, str], bool] = {}
 
 
-def read_selected(spec: DocsSpec, files: Mapping[str, Path]) -> Selected:
+def read_selected(
+    spec: DocsSpec,
+    files: Mapping[str, Path],
+    *,
+    read: Callable[[str, Path], tuple[dict[Any, Any] | None, str | None]] | None = None,
+) -> Selected:
     """Front matter of the files some docs type selects, each read once.
 
     `files` maps a repo-relative POSIX path to the file on disk. Files no
     type's globs select are never read. Pass the result to `build_nodes`
     and `build_edges`.
+
+    `read(rel, path)` reads one file and must return what
+    `read_front_matter(path)` returns (dispatch passes the read cache).
+    Without it, `read_front_matter` is looked up when called.
     """
+    if read is None:
+        def read(rel: str, path: Path) -> tuple[dict[Any, Any] | None, str | None]:
+            return read_front_matter(path)
+
     return Selected(
-        (rel, read_front_matter(files[rel]))
+        (rel, read(rel, files[rel]))
         for rel in sorted(files)
         if any(selects(docs_type, rel) for docs_type in spec.types)
     )

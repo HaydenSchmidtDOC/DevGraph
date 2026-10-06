@@ -188,7 +188,7 @@ Links into the new names are rebuilt by full_scan's final edge pass.
 
 A batch that touches a field-keyed type walks the repository once (`indexable_paths`) and reads every file any field-keyed type selects. That is O(repository files) for the walk and O(keyed files) for the reads. It writes only the batch's paths plus K's owners.
 
-An in-process cache keyed by `(path, mtime_ns, size)` would make repeated reads cheap. It is optional and left out of this slice. The README names the cost next to slice 1's relink cost.
+An in-process cache keyed by `(path, mtime_ns, size)` would make repeated reads cheap. It is optional and left out of this slice. The README names the cost next to slice 1's relink cost. The follow-up `2026-10-07-docs-read-cache-design.md` adds that cache, keyed on the file's full stat identity: a save re-parses only the files changed since they were last read, and the walk remains.
 
 ## 5. Safety
 
@@ -255,4 +255,4 @@ Point 4 changes from "a docs node's path" to "a docs node's name: its key (an id
 - Composite keys, and keys from nested front matter (`a.b`) or the body.
 - Case-insensitive, trimmed or Unicode-normalised key matching.
 - Keys for filesystem types.
-- The `(path, mtime_ns, size)` read cache.
+- The `(path, mtime_ns, size)` read cache. Since added: see `2026-10-07-docs-read-cache-design.md`.

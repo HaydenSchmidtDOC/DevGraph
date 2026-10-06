@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from functools import partial
 from pathlib import Path
 from typing import NamedTuple
 
@@ -47,7 +48,7 @@ from devgraph.indexer.kotlin.extractor import extract_kotlin_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
 from devgraph.indexer.mentions.extractor import mentions_any, upsert_document_node
 from devgraph.indexer.cpp.extractor import extract_cpp_file
-from devgraph.indexer.providers import docs, filesystem
+from devgraph.indexer.providers import docs, docs_cache, filesystem
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
 from devgraph.indexer.schema_constraints import (
@@ -168,7 +169,7 @@ def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) ->
     disk = _disk_files(repo_root)
     on_disk = set(disk)
     docs_spec = docs.docs_spec(effective)
-    docs_nodes, selected, owners = _prune_docs(engine, repo_id, docs_spec, disk)
+    docs_nodes, selected, owners = _prune_docs(engine, repo_id, repo_root, docs_spec, disk)
     filesystem.reconcile(engine, repo_id, spec, on_disk)
     if spec is not None:
         filesystem.sync_present(engine, repo_id, spec, on_disk)
@@ -251,7 +252,7 @@ def _is_provider_file(repo_root: Path, path: Path) -> bool:
 
 
 def _prune_docs(
-    engine: GraphEngine, repo_id: str, spec: docs.DocsSpec | None, files: dict[str, Path]
+    engine: GraphEngine, repo_id: str, repo_root: Path, spec: docs.DocsSpec | None, files: dict[str, Path]
 ) -> tuple[list[dict], docs.Selected | None, Mapping[tuple[str, str], str]]:
     """Clear the docs provider's graph for a rebuild from the whole repository (spec §4).
 
@@ -265,11 +266,13 @@ def _prune_docs(
     `files` is every file on disk, so the owners of field-keyed entries are
     worked out from all of them (`docs.keyed_owners`). The nodes are built
     before anything is written, so a failure leaves the graph untouched.
+    They are read through the read cache, which full_scan has just emptied
+    for this repository, so the reads refill it.
     """
     nodes: list[dict] = []
     selected, owners = None, {}
     if spec is not None:
-        selected = docs.read_selected(spec, files)
+        selected = docs.read_selected(spec, files, read=partial(docs_cache.read, repo_root))
         owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
         nodes, problems = docs.build_nodes(spec, repo_id, selected, owners)
         _log_docs_problems(repo_id, problems)
@@ -283,6 +286,16 @@ def _prune_docs(
     return nodes, selected, owners
 
 
+def _log_cache_stats() -> None:
+    """The docs read cache's process totals, after a batch's docs pass."""
+    if logger.isEnabledFor(logging.DEBUG):
+        stats = docs_cache.stats()
+        logger.debug(
+            "docs read cache: %d hits, %d misses, %d fresh, %d entries, %d bytes",
+            stats["hits"], stats["misses"], stats["fresh"], stats["entries"], stats["bytes"],
+        )
+
+
 def _log_docs_problems(repo_id: str, problems: list[docs.Problem]) -> None:
     """One warning per pass, naming the first problem (repr: file names are untrusted)."""
     if problems:
@@ -293,10 +306,12 @@ def _log_docs_problems(repo_id: str, problems: list[docs.Problem]) -> None:
         )
 
 
-def _read_reusing(spec: docs.DocsSpec, files: Mapping[str, Path], seen: Mapping[str, tuple]) -> docs.Selected:
-    """`docs.read_selected`, except that front matter already in `seen` is not read again."""
+def _read_reusing(
+    spec: docs.DocsSpec, files: Mapping[str, Path], seen: Mapping[str, tuple], read: Callable[[str, Path], tuple]
+) -> docs.Selected:
+    """`docs.read_selected` through `read`, except that front matter already in `seen` is not read again."""
     return docs.Selected(
-        (rel, seen[rel] if rel in seen else docs.read_front_matter(files[rel]))
+        (rel, seen[rel] if rel in seen else read(rel, files[rel]))
         for rel in sorted(files)
         if any(docs.selects(docs_type, rel) for docs_type in spec.types)
     )
@@ -307,11 +322,12 @@ def _keyed_view(repo_root: Path, spec: docs.DocsSpec, seen: Mapping[str, tuple] 
 
     One walk and one read of the files a field-keyed type selects, reusing the
     batch's front matter (`seen`). Owners always come from all of them, never
-    from the batch alone or from the graph.
+    from the batch alone or from the graph. The reads go through the read
+    cache, so only files changed since it last read them are parsed again.
     """
     files = _disk_files(repo_root)
     keyed = docs.DocsSpec(tuple(docs_type for docs_type in spec.types if docs_type.key is not None), ())
-    selected = _read_reusing(keyed, files, seen or {})
+    selected = _read_reusing(keyed, files, seen or {}, partial(docs_cache.read, repo_root))
     claims = docs.keyed_claims(spec, selected)
     return docs.KeyedView(files, selected, claims, docs.keyed_owners(claims))
 
@@ -349,9 +365,12 @@ def _read_docs_batch(
     this ends, without reading any file or querying the graph again (the
     field-keyed entries are fetched once), and every engine path list holds
     at most |batch| + |K| paths.
+
+    The watcher has just reported the batch's files as changed, so they are
+    read fresh (`docs_cache.read_fresh`), never served from the read cache.
     """
     try:
-        selected = docs.read_selected(spec, files)
+        selected = docs.read_selected(spec, files, read=partial(docs_cache.read_fresh, repo_root))
         view, owners, existing = None, {}, set()
         keyed = {docs_type.label for docs_type in spec.types if docs_type.key is not None}
         touched = {
@@ -436,7 +455,7 @@ def _relink_docs(
     select, and only when a docs relationship targets an added node's label.
     The batch's `view` supplies the walk and the field-keyed front matter
     (built here when a type is field-keyed and the batch had none), so only
-    the other files are read. A field-keyed entry is linked from the file it
+    the other files are read, through the read cache. A field-keyed entry is linked from the file it
     sits at in the graph (one query), whichever file owns its key on disk.
     """
     target_labels = {relationship.to_label for relationship in spec.relationships}
@@ -451,7 +470,7 @@ def _relink_docs(
         else:
             files = dict(view.files)
         outside = {rel: p for rel, p in files.items() if rel not in batch}
-        selected = _read_reusing(spec, outside, view.selected if view else {})
+        selected = _read_reusing(spec, outside, view.selected if view else {}, partial(docs_cache.read, repo_root))
         owners: Mapping[tuple[str, str], str] = {}
         if view is not None:
             # Each field-keyed entry is linked from the file it sits at in the
@@ -789,6 +808,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     if docs_batch:
         _sync_docs(engine, repo_id, docs_spec, docs_batch)
         _relink_docs(engine, repo_id, repo_root, docs_spec, added_nodes, set(docs_batch.selected), docs_batch.view)
+    if providers_ok and docs_spec is not None:
+        _log_cache_stats()
 
     # Docs notes get the same node-then-edge treatment as the source files
     # above: pass 1 (in the loop) created every note's node, but a note's
@@ -1314,6 +1335,7 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             _take_over_keys(engine, repo_id, repo_root, docs_spec, sorted(gone))
             # Nodes (still) at or below the deleted paths, with all their edges.
             engine.delete_extracted_nodes(repo_id, docs.EXTRACTOR, sorted(gone))
+            _log_cache_stats()
 
     return cleaned
 
@@ -1363,7 +1385,11 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
     and then writes every docs edge once every target node exists. A schema
     that cannot be applied leaves the repository pending, with no docs edge
     written; callers that care check schema_pending afterwards.
+
+    The docs read cache forgets the repository first: the scan reads every
+    docs file again, and a schema change is applied this way.
     """
+    docs_cache.forget(repo_root)
     prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
     all_files = _indexable_paths(repo_root)
     applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)

@@ -31,6 +31,7 @@ from devgraph.indexer.providers.docs import (
     read_selected,
     source_report,
 )
+from tests.indexer.docs_live_helpers import cache_on  # noqa: F401  (a pytest fixture)
 
 RUNBOOK = """
     version: 1
@@ -1305,3 +1306,47 @@ def test_report_duplicate_line_names_the_key_field(tmp_path):
         "Adr: decisions/b.md: 'number' '7' is also used by decisions/a.md, "
         "whose path sorts first and keeps it; change the number in one of them"
     )
+
+
+# --- the read cache's seam ------------------------------------------------------------------
+
+
+def test_read_selected_without_a_reader_reads_through_the_module_global(tmp_path, monkeypatch):
+    files = write(tmp_path, {"runbooks/a.md": fm("owner: ops"), "other/b.md": fm("owner: ops")})
+    spec = spec_of(RUNBOOK)
+    before = dict(read_selected(spec, files))
+    assert before == {"runbooks/a.md": ({"owner": "ops"}, None)}
+    monkeypatch.setattr(docs, "read_front_matter", lambda path: ({"owner": "patched"}, None))
+    assert dict(read_selected(spec, files)) == {"runbooks/a.md": ({"owner": "patched"}, None)}
+
+
+def test_read_selected_sends_every_selected_file_and_no_other_through_the_reader(tmp_path, monkeypatch):
+    files = write(tmp_path, {
+        "runbooks/a.md": fm("owner: ops"), "runbooks/x/b.md": fm("owner: dev"), "other/c.md": fm("owner: ops"),
+    })
+    monkeypatch.setattr(docs, "read_front_matter", lambda path: pytest.fail("read without the reader"))
+    seen = []
+
+    def reader(rel, path):
+        seen.append((rel, path))
+        return {"owner": rel}, None
+
+    selected = read_selected(spec_of(RUNBOOK), files, read=reader)
+    assert sorted(seen) == [("runbooks/a.md", files["runbooks/a.md"]), ("runbooks/x/b.md", files["runbooks/x/b.md"])]
+    assert selected["runbooks/x/b.md"] == ({"owner": "runbooks/x/b.md"}, None)
+
+
+@pytest.mark.usefixtures("cache_on")
+def test_a_second_keyed_view_reads_nothing_while_the_cache_is_warm(tmp_path, monkeypatch):
+    from devgraph.indexer import dispatch
+
+    files = write(tmp_path, {f"decisions/adr-{n:02}.md": fm(f"id: ADR-{n}") for n in range(50)})
+    spec = spec_of(ADR)
+    first = dispatch._keyed_view(tmp_path, spec)
+    calls = []
+    real = docs.read_front_matter
+    monkeypatch.setattr(docs, "read_front_matter", lambda path: calls.append(path) or real(path))
+    second = dispatch._keyed_view(tmp_path, spec)
+    assert calls == []
+    assert len(second.selected) == len(files) == 50
+    assert dict(second.selected) == dict(first.selected) and second.owners == first.owners
