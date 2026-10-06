@@ -1013,7 +1013,8 @@ def prune_stale_files(
 
     Returns the number of files pruned.
     """
-    on_disk = {p.resolve().relative_to(repo_root.resolve()).as_posix() for p in _indexable_paths(repo_root)}
+    # A Windows junction can lead the walk outside the repository; skip those paths.
+    on_disk = {rel for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
     in_graph = engine.list_indexed_files(repo_id)
     stale = in_graph - on_disk
     if not stale:

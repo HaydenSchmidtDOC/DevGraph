@@ -1156,3 +1156,22 @@ class TestMentionRelinkBound:
             assert "rescan" in caplog.text
         finally:
             engine.delete_repository(repo_id)
+
+
+def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
+    # On Windows a junction can lead the walk outside the repository; pruning must not crash on those paths.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "a.py").write_text("x = 1\n")
+    outside = tmp_path / "outside.py"
+    outside.write_text("y = 2\n")
+    monkeypatch.setattr(dispatch, "_indexable_paths", lambda root: [repo / "a.py", outside])
+    removed = []
+    monkeypatch.setattr(dispatch, "remove_paths", lambda engine, repo_id, root, paths: removed.append(paths) or len(paths))
+
+    class FakeEngine:
+        def list_indexed_files(self, repo_id):
+            return {"a.py", "gone.py"}
+
+    assert dispatch.prune_stale_files(FakeEngine(), "r", repo) == 1
+    assert removed == [{repo / "gone.py"}]
