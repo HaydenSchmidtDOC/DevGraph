@@ -36,7 +36,9 @@ def read_bounded(path: Path, max_bytes: int | None = None) -> bytes:
     Raises `NotRegularFile`, `FileTooLarge`, or the open's own `OSError`.
     """
     cap = MAX_CONFIG_BYTES if max_bytes is None else max_bytes
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    # O_BINARY: Windows otherwise opens in text mode and rewrites CRLF to LF,
+    # so hashes and fingerprints would not be of the file's bytes.
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise NotRegularFile(f"{path}: not a regular file")
