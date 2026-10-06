@@ -12,7 +12,8 @@ scan sequence `devgraph add <path>` runs, against the same services, the
 Cypher console (`POST /cypher`), which runs whatever it is given, and the
 Config page's entry edits (`POST|PUT|DELETE /config/...`), which write only
 a registered repo's `devgraph.tools.yaml`/`devgraph.schema.yaml` or the
-global tools store through `devgraph.config.edits`, and never touch git, and
+global tools store through `devgraph.config.edits`, and never touch git
+(`POST /config/parse` only reads entry YAML back for the form), and
 recomputing graph insights (`POST .../insights`), which replaces only derived
 properties. All of them refuse cross-site browser requests
 (`_reject_cross_site`).
@@ -52,7 +53,7 @@ from devgraph.config.schema_findings import introduced_conflicts, schema_conflic
 from devgraph.config.settings import get_settings
 from devgraph.config.yaml_bound import bounded_safe_load
 from devgraph.dashboard import queries
-from devgraph.dashboard.config_model import GLOBAL_SCOPE, build_config, build_global, build_project, scrub
+from devgraph.dashboard.config_model import GLOBAL_SCOPE, build_config, build_global, build_project, form_entry, scrub
 from devgraph.dashboard.db_metrics import MetricsHistory
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.dashboard.git_info import get_git_log, get_git_status
@@ -84,6 +85,8 @@ _HISTORY_SECONDS_MAX = 3600
 # One config entry's YAML is a few hundred bytes; 64 KiB leaves room for long
 # Cypher while keeping a hostile body from being buffered or parsed.
 _CONFIG_PAYLOAD_LIMIT_BYTES = 64 * 1024
+# The entry kinds `POST /config/parse` reads back (one per Config editor section).
+_CONFIG_PARSE_KINDS = ("tool", "node_type", "relationship")
 # `ConfigEditError.code` -> HTTP status. Every other code (invalid, malformed,
 # flow_list, unsupported, anchor, unreadable) means the resulting document
 # can't be validated or spliced: 422 `invalid`.
@@ -728,6 +731,26 @@ def build_router(
     @router.get("/config/{scope}")
     def get_config_scope(scope: str) -> dict[str, Any]:
         return _config_scope(scope)
+
+    @router.post("/config/parse")
+    async def parse_config_entry(request: Request) -> dict[str, Any]:
+        """Read hand-edited entry YAML back for the form: `{entry}` (`form_entry`, so null when JSON
+        can't carry it exactly) or `{entry: null, error}`. Read-only and unvalidated: no file, no
+        fingerprint, no model check -- the dry run and the write stay authoritative."""
+        _reject_cross_site_config(request)
+        payload = await _json_payload(request)
+        if payload.get("kind") not in _CONFIG_PARSE_KINDS:
+            raise _config_error(400, "bad_request", "kind must be tool, node_type or relationship")
+        text = payload.get("yaml")
+        if not isinstance(text, str):
+            raise _config_error(400, "bad_request", "yaml must be a string")
+        try:
+            entry = bounded_safe_load(text)
+        except yaml.YAMLError as exc:
+            return {"entry": None, "error": f"malformed YAML: {exc}"}
+        if not isinstance(entry, dict):
+            return {"entry": None, "error": "yaml must be one mapping (a single entry)"}
+        return {"entry": form_entry(entry)}
 
     # --- Config page writes ------------------------------------------------------------------
     # Every write: cross-site refusal, then the scope (only `__global__` or an

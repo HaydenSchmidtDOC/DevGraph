@@ -14,7 +14,7 @@ after every write) and the form view for tools, node types and relationships
 stay YAML with the reason, delete/copy never showing it; a form edit writing
 the serialised YAML into the textarea, dropping a confirm and going through
 the same dry run; untouched saves sending the server's text byte for byte;
-the form locked while busy; Discard after a hand edit; labels, legends, named
+the form locked while busy; Form after a hand edit reading the text back through the parse route without changing it, staying YAML with the reason when it can't, ignoring a reply after Cancel; Discard after a hand edit; labels, legends, named
 row buttons and focus; selects and typed text never rewriting a value; the
 relationship provider showing the custom name in place). The
 JS file drives the real functions out of index.html
