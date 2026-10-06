@@ -776,6 +776,31 @@ def test_unmatched_report_keeps_a_type_declared_twice_apart(tmp_path):
     assert [line["detail"] for line in lines] == ["Runbook: module 'pkg/db.py' in runbooks/a.md matches no Module"]
 
 
+def test_unmatched_report_stays_fast_with_many_relationships_and_edges():
+    count = 60
+    relationships = "".join(
+        f"\n          - {{type: R{r}, provider: docs, from: Runbook, to: Service, field: f{r}}}" for r in range(count)
+    )
+    spec = spec_of("""
+        version: 1
+        node_types:
+          - label: Runbook
+            key: [path]
+            metadata: [{name: path}]
+            source: {provider: docs, paths: ["**/*.md"]}
+        relationships:""" + relationships)
+    edges = [
+        {"rel_type": f"R{r}", "field": f"f{r}", "from_label": "Runbook", "to_label": "Service",
+         "from_name": f"r{i}.md", "to_name": f"s{i}"}
+        for r in range(count) for i in range(1500)
+    ]
+    started = time.perf_counter()
+    lines = docs.unmatched_report(spec, edges, {"Service": set()})
+    elapsed = time.perf_counter() - started
+    assert len(lines) == count * (docs.REPORT_FILE_LIMIT + 1)
+    assert elapsed < 0.2, f"{elapsed:.2f} s for {len(edges)} edges"
+
+
 def test_no_relationships_means_no_edges(tmp_path):
     files = write(tmp_path, {"a.md": fm("value: x")})
     assert edges_of(one_type(), files) == []

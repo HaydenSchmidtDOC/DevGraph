@@ -376,6 +376,7 @@ def _edge_values(value: Any) -> list[str]:
     """Target names: str or int (never bool) scalars or list items, leading `./`s removed, deduplicated."""
     items = value[:MAX_EDGE_VALUES] if type(value) is list else [value]
     out: list[str] = []
+    seen: set[str] = set()
     for item in items:
         if type(item) not in (str, int):
             continue
@@ -384,7 +385,8 @@ def _edge_values(value: Any) -> list[str]:
             continue
         while text.startswith("./"):
             text = text[2:]
-        if text and text not in out:
+        if text and text not in seen:
+            seen.add(text)
             out.append(text)
     return out
 
@@ -523,16 +525,17 @@ def unmatched_report(spec: DocsSpec, edges: list[dict], present: Mapping[str, se
     how many more.
     """
     lines: list[dict[str, str]] = []
+    buckets: dict[tuple[str, str, str, str], list[dict]] = {}
+    for edge in edges:
+        buckets.setdefault((edge["rel_type"], edge["field"], edge["from_label"], edge["to_label"]), []).append(edge)
     for relationship in spec.relationships:
+        known = present.get(relationship.to_label, set())
         missing = sorted(
             {
                 (edge["from_name"], edge["to_name"], edge["from_label"])
-                for edge in edges
-                if edge["rel_type"] == relationship.type
-                and edge["field"] == relationship.field
-                and edge["to_label"] == relationship.to_label
-                and edge["from_label"] in relationship.from_labels
-                and edge["to_name"] not in present.get(relationship.to_label, set())
+                for from_label in relationship.from_labels
+                for edge in buckets.get((relationship.type, relationship.field, from_label, relationship.to_label), ())
+                if edge["to_name"] not in known
             }
         )
         for path, value, label in missing[:REPORT_FILE_LIMIT]:
