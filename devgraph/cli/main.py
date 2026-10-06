@@ -870,7 +870,6 @@ def _docs_source_findings(repos: list[Any], engine: Any) -> list[dict[str, Any]]
     question: they are checked when `engine` is given, else reported skipped.
     """
     from devgraph.config.project_schema import ProjectSchemaError, resolve_effective_schema
-    from devgraph.indexer import walk
     from devgraph.indexer.providers import docs
 
     findings: list[dict[str, Any]] = []
@@ -887,11 +886,13 @@ def _docs_source_findings(repos: list[Any], engine: Any) -> list[dict[str, Any]]
             findings.append({"repo_id": repo_id, "status": status, "detail": detail})
 
         try:
-            files = walk.indexable_paths(repo.path)
+            by_rel = docs.files_by_rel(repo.path)
             # each matched file is read once, for both the report and the links
-            selected = docs.read_selected(spec, docs.files_by_rel(repo.path, files))
+            selected = docs.read_selected(spec, by_rel)
             claims = docs.keyed_claims(spec, selected)
-            for line in docs.source_report(repo.path, effective, files, selected=selected, claims=claims):
+            for line in docs.source_report(
+                repo.path, effective, by_rel.values(), selected=selected, claims=claims, by_rel=by_rel
+            ):
                 add(line["status"], line["detail"])
             if not spec.relationships:
                 continue
