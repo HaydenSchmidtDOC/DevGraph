@@ -64,6 +64,7 @@ from devgraph.indexer.walk import indexable_paths as _indexable_paths
 from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
 from devgraph.indexer.walk import is_ignored_path as is_ignored_path
 from devgraph.indexer.walk import is_indexable_file as _is_indexable_file
+from devgraph.indexer.walk import keyed_indexable_paths as _keyed_indexable_paths
 from devgraph.indexer.walk import links_outside as _links_outside  # noqa: F401
 from devgraph.indexer.walk import repo_relative as _repo_relative
 from devgraph.paths import is_within
@@ -239,10 +240,7 @@ def _disk_files(repo_root: Path) -> dict[str, Path]:
     """Every file a full scan indexes, by repo-relative path. A symlink is keyed
     by its target, so one into an ignored directory is left out, as
     `_is_provider_file` leaves it out of a batch."""
-    return {
-        rel: p for p in _indexable_paths(repo_root)
-        if (rel := _repo_relative(repo_root, p)) is not None and not is_ignored_path(Path(rel))
-    }
+    return {rel: p for p, rel in _keyed_indexable_paths(repo_root)}
 
 
 def _is_provider_file(repo_root: Path, path: Path) -> bool:

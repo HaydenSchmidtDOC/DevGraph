@@ -229,6 +229,8 @@ the walk's floor.
 
 **Named follow-up:** in `walk.repo_relative` and `_disk_files`, resolve the
 root once per walk and resolve only paths that are symlinks.
+Done: `walk.keyed_indexable_paths` does this for `_disk_files`, keying the
+other files lexically from the walk.
 
 ## Observability
 

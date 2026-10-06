@@ -7,6 +7,8 @@ each scopes files the same way without importing the dispatcher.
 from __future__ import annotations
 
 import logging
+import os
+from collections.abc import Iterator
 from pathlib import Path
 
 from devgraph.paths import is_within
@@ -82,10 +84,63 @@ def indexable_paths(repo_root: Path) -> set[Path]:
     """Every file under repo_root that a full scan would index: a regular
     file, not under an ignored directory. Shared by full_scan (which indexes
     them) and prune_stale_files (which diffs them against the graph)."""
-    return {
-        p for p in repo_root.rglob("*")
-        if is_indexable_file(p) and not is_ignored_path(p) and not links_outside(p, repo_root)
-    }
+    return {path for path, _, _ in _walk(repo_root)}
+
+
+def keyed_indexable_paths(repo_root: Path) -> list[tuple[Path, str]]:
+    """Each of `indexable_paths` with its `repo_relative` key, leaving out one
+    whose key is under an ignored directory (a symlink into one).
+
+    The root is resolved once. A file is keyed lexically unless it, or a
+    directory above it, is a link; only those are resolved, so a symlink is
+    still keyed by its target.
+    """
+    root = repo_root.resolve()
+    keyed = []
+    for path, rel, linked in _walk(repo_root):
+        if linked:
+            try:
+                rel = path.resolve().relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+            if is_ignored_path(Path(rel)):
+                continue
+        keyed.append((path, rel))
+    return keyed
+
+
+def _walk(repo_root: Path) -> Iterator[tuple[Path, str, bool]]:
+    """(path, lexical repo-relative POSIX path, whether a link is on the way)
+    for every indexable file: what `repo_root.rglob("*")` filtered by
+    `is_indexable_file`, `is_ignored_path` and `links_outside` gives, without
+    descending into ignored directories. Like rglob it does not follow a
+    symlinked directory; a Windows junction it does descend into, so the files
+    below one are marked as linked.
+    """
+    if is_ignored_path(repo_root):
+        return
+    stack = [(repo_root, "", False)]
+    while stack:
+        directory, prefix, linked = stack.pop()
+        try:
+            with os.scandir(directory) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
+            if is_ignored_dir_name(entry.name):
+                continue
+            path = directory / entry.name
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                is_dir = False
+            if is_dir:
+                stack.append((path, f"{prefix}{entry.name}/", linked or entry.is_junction()))
+                continue
+            if not is_indexable_file(path) or (entry.is_symlink() and links_outside(path, repo_root)):
+                continue
+            yield path, prefix + entry.name, linked or entry.is_symlink()
 
 
 def repo_relative(repo_root: Path, path: Path) -> str | None:
