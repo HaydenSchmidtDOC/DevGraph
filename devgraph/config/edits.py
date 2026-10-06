@@ -582,8 +582,8 @@ def schema_change_warnings(before, after, record: Any = None) -> list[str]:
         )
         if label in docs_labels:
             warnings.append(
-                f"the next rescan renames every {label} entry by its new key; links that name an {label} the old "
-                f"way stop matching (devgraph doctor lists them)"
+                f"{when} renames every {label} entry by its new key; links that name {label} entries the old "
+                f"way stop matching (devgraph doctor lists them)."
             )
     return warnings
 

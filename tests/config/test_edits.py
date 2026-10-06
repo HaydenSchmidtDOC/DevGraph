@@ -622,8 +622,8 @@ def test_schema_entry_notes_name_both_providers():
 
 ADR_SRC = {"provider": "docs", "paths": ["decisions/**/*.md"], "fields": {"adr_id": "id"}}
 DOCS_RENAME = (
-    "the next rescan renames every Adr entry by its new key; links that name an Adr the old way stop matching "
-    "(devgraph doctor lists them)"
+    "the next rescan renames every Adr entry by its new key; links that name Adr entries the old way stop matching "
+    "(devgraph doctor lists them)."
 )
 
 
@@ -641,6 +641,11 @@ def test_a_docs_key_change_warns_that_entries_are_renamed(before, after):
     warnings = edits.schema_change_warnings(adr(before), adr(after), record())
     assert DOCS_RENAME in warnings
     assert any("uniqueness constraint on Adr keeps the old key" in w for w in warnings)
+
+
+def test_the_rename_warning_says_when_it_applies_like_the_others():
+    warnings = edits.schema_change_warnings(adr(["path"]), adr(["adr_id"]), None)
+    assert DOCS_RENAME.replace("the next rescan", "applying this schema") in warnings
 
 
 def test_an_unchanged_docs_key_gives_no_rename_warning():

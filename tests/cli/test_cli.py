@@ -1399,6 +1399,53 @@ def test_cli_doctor_skips_the_link_check_when_neo4j_is_unreachable(runner, temp_
     assert "matches no" not in section
 
 
+ADR_SCHEMA = """\
+version: 1
+node_types:
+  - label: Adr
+    key: [adr_id]
+    metadata:
+      - {name: path}
+      - {name: adr_id}
+      - {name: title}
+    source:
+      provider: docs
+      paths: ["decisions/**/*.md"]
+      fields: {adr_id: id}
+relationships:
+  - type: REPLACES
+    provider: docs
+    from: Adr
+    to: Adr
+    field: supersedes
+"""
+
+
+def test_cli_doctor_names_duplicate_and_missing_ids_and_links_by_path(runner, temp_registry_db, tmp_path, monkeypatch):
+    root = _runbook_repo(tmp_path, {
+        "decisions/adr-012.md": "---\nid: ADR-012\n---\n",
+        "decisions/adr-012 copy.md": "---\nid: ADR-012\n---\n",
+        "decisions/draft.md": "---\ntitle: Draft\n---\n",
+        "decisions/adr-013.md": "---\nid: ADR-013\nsupersedes: decisions/adr-012.md\n---\n",
+        "decisions/adr-014.md": "---\nid: ADR-014\nsupersedes: ADR-012\n---\n",
+    }, schema=ADR_SCHEMA)
+    graph = _graph_with({"Adr": {"ADR-012", "ADR-013", "ADR-014"}})
+
+    section = _project_schemas_section(_docs_doctor(runner, temp_registry_db, monkeypatch, root, graph).stdout)
+
+    assert "Adr: 5 files match, 3 Adr entries, 1 duplicate id" in section
+    assert (
+        "Adr: decisions/adr-012 copy.md: 'id' 'ADR-012' is also used by decisions/adr-012.md, whose path sorts "
+        "first and keeps it; change the id in one of them"
+    ) in section
+    assert "Adr: decisions/draft.md: missing 'id', which names the entry; add an `id:` line" in section
+    assert (
+        "Adr: supersedes 'decisions/adr-012.md' in decisions/adr-013.md matches no Adr "
+        "(Adr entries are named by 'id', not by file path)"
+    ) in section
+    assert "'ADR-012' in decisions/adr-014.md" not in section
+
+
 def test_cli_doctor_prints_no_docs_lines_without_docs_sources(runner, temp_registry_db, tmp_path, monkeypatch):
     root = _runbook_repo(tmp_path, {"runbooks/x.md": "---\nowner: ops\n---\n"}, schema=WIDGET_SCHEMA)
     section = _project_schemas_section(
@@ -1623,8 +1670,32 @@ def test_cli_doctor_reports_a_key_conflict_between_repositories(runner, temp_reg
         engine.delete_repository(keyed)
         engine.delete_repository(declaring)
     assert (
-        f"{keyed}: {label} is keyed on (code) but its constraint uses (slug), which {declaring} declares; "
-        f"entries that break it are not written. Align the key or rename one label"
+        f"{keyed}: {label}: this repository identifies entries by code, but the database's uniqueness rule "
+        f"still uses slug because {declaring} identifies them differently (by slug). Make every repository "
+        f"that uses the {label} type agree, then rescan."
+    ) in doctor
+
+
+def test_cli_doctor_names_a_third_key_and_an_unrecorded_one_in_a_key_conflict(runner, temp_registry_db, stale_label):
+    engine, label, _name = stale_label  # constraint on (repo_id, slug), which nobody declares
+    db_path, registry = temp_registry_db
+    registry.close()
+    keyed, third, unknown = (f"_smoketest_{word}_{label.lower()}" for word in ("keyed", "third", "unknown"))
+    try:
+        engine.upsert_repository(keyed, keyed, "/tmp/keyed")
+        engine.record_applied_schema(keyed, "sha256:x", [label], [], [f"{label}:code"])
+        engine.upsert_repository(third, third, "/tmp/third")
+        engine.record_applied_schema(third, "sha256:x", [label], [], [f"{label}:rfc_id"])
+        engine.upsert_repository(unknown, unknown, "/tmp/unknown")
+        engine.record_applied_schema(unknown, "sha256:x", [label], [], [])
+        doctor = _collapsed(_invoke_live(runner, db_path, ["doctor"]).stdout)
+    finally:
+        for repo in (keyed, third, unknown):
+            engine.delete_repository(repo)
+    assert (
+        f"{keyed}: {label}: this repository identifies entries by code, but the database's uniqueness rule "
+        f"still uses slug because {third} identifies them differently (by rfc_id) and {unknown} hasn't recorded "
+        f"how. Make every repository that uses the {label} type agree, then rescan."
     ) in doctor
 
 

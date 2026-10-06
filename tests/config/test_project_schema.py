@@ -1739,6 +1739,12 @@ DOCS_KEY_SHAPE = (
             r"key field 'adr_id' of 'Adr' must be a string: keys are compared as text "
             r"\(use string; numbers like 12 still work\)",
         ),
+        (
+            "- {name: adr_id}",
+            "- {name: adr_id, type: boolean}",
+            r"key field 'adr_id' of 'Adr' must be a string: keys are compared as text "
+            r"\(use string; numbers like 12 still work\)",
+        ),
         ("key: [adr_id]", "key: [number]", r"node type 'Adr' key component 'number' is not a declared metadata field"),
         (
             "          - {name: path}\n",
@@ -1753,7 +1759,7 @@ DOCS_KEY_SHAPE = (
             r"every entry records its file there",
         ),
     ],
-    ids=["composite", "path plus field", "integer key", "undeclared key", "no path", "non-string path"],
+    ids=["composite", "path plus field", "integer key", "boolean key", "undeclared key", "no path", "non-string path"],
 )
 def test_docs_key_rules(tmp_path, old, new, message):
     with pytest.raises(ProjectSchemaError, match=message):
@@ -1887,3 +1893,10 @@ def test_starter_example_is_the_runbook_example():
     text = project_schema.starter_schema_text()
     assert "provider: docs" in text and "RUNBOOK_FOR" in text and "provider: custom" not in text
     assert "comes later" not in text and "Markdown front matter" in text
+
+
+def test_starter_header_says_a_docs_type_may_be_keyed_on_a_front_matter_field():
+    text = project_schema.starter_schema_text()
+    header = text[:text.index("version:")]
+    assert "key: [adr_id]" in header and "supersedes: ADR-012" in header
+    assert "key: [path]" in text[text.index("version:"):]  # the example stays the Runbook

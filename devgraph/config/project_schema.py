@@ -1011,8 +1011,11 @@ _STARTER_TEMPLATE = """\
 # constraint on its key. Node types with a `source` are indexed:
 # `provider: filesystem` makes one node per file or folder, and
 # `provider: docs` makes one node per matching Markdown file, filled from its
-# Markdown front matter (the `---` block at the top of the file). Nothing in
-# this file is ever run as code.
+# Markdown front matter (the `---` block at the top of the file). A docs
+# type is keyed `[path]` (links name the file) or on one string field read
+# from front matter: with `key: [adr_id]` and `fields: {{adr_id: id}}`, a link
+# can say `supersedes: ADR-012`. Quote ids with leading zeros (`id: "012"`).
+# Nothing in this file is ever run as code.
 #
 # Built-in node labels (inherited with `extends: default`; never redeclare one):
 {labels}

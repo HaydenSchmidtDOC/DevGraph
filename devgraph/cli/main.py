@@ -1104,12 +1104,16 @@ def doctor() -> None:
     if not neo4j_reachable:
         console.print("  [yellow]skipped[/yellow]: Neo4j is not reachable")
     else:
-        from devgraph.indexer.schema_constraints import constraint_drift
+        from devgraph.indexer.schema_constraints import constraint_drift, recorded_declarations
 
         constraint_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+        recorded_keys: dict[tuple[str, str], tuple[str, ...] | None] = {}
         try:
             stale = _stale_schema_objects(constraint_engine, registered_repos)
             drift = constraint_drift(constraint_engine)
+            if any(finding["status"] == "conflict" for finding in drift):
+                for folded, entries in recorded_declarations(constraint_engine).items():
+                    recorded_keys.update(((repo, folded), key) for repo, _label, key in entries)
         except Exception as e:
             stale = drift = None
             console.print(f"  [yellow][!][/yellow] could not check: {escape(str(e))}")
@@ -1132,12 +1136,18 @@ def doctor() -> None:
                     f"`devgraph rescan {finding['repo_id']} --now`"
                 )
             elif finding["status"] == "conflict":
-                declared_by = finding["declared_by"]
+                # each disagreeing repository with its own recorded key (None when unknown)
+                reasons = []
+                for other in finding["declared_by"]:
+                    other_key = recorded_keys.get((other, finding["label"].casefold()))
+                    reasons.append(
+                        f"{escape(other)} identifies them differently (by {escape(', '.join(other_key))})"
+                        if other_key else f"{escape(other)} hasn't recorded how"
+                    )
                 detail = (
-                    f"{label} is keyed on ({key}) but its constraint uses "
-                    f"({escape(', '.join(finding['constraint_key']))}), which "
-                    f"{escape(', '.join(declared_by))} {'declares' if len(declared_by) == 1 else 'declare'}; "
-                    f"entries that break it are not written. Align the key or rename one label"
+                    f"{label}: this repository identifies entries by {key}, but the database's uniqueness rule "
+                    f"still uses {escape(', '.join(finding['constraint_key']))} because {' and '.join(reasons)}. "
+                    f"Make every repository that uses the {label} type agree, then rescan."
                 )
             else:
                 detail = (
