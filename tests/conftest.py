@@ -36,6 +36,11 @@ def _wide_cli_console(monkeypatch):
 
     # The CLI console is created at import time, so it has already read COLUMNS.
     monkeypatch.setattr(main.console, "_width", 1000)
+    # Typer forces a colour terminal under GITHUB_ACTIONS/FORCE_COLOR, which
+    # splits asserted option names with ANSI codes; let Rich auto-detect instead.
+    from typer import rich_utils
+
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", None)
 
 
 @pytest.fixture(autouse=True)
