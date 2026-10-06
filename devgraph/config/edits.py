@@ -508,21 +508,40 @@ def removed_types(before, after) -> tuple[list[str], list[str]]:
     return sorted(old_labels - new_labels), sorted(old_types - new_types)
 
 
-def pruned_types(before, after) -> list[str]:
-    """Labels kept in `after` whose filesystem-sourced nodes the next apply deletes: source dropped or kind changed."""
+def _source_changes(before, after) -> list[tuple[str, str, str | None, str]]:
+    """(label, old provider, new provider or None, reason) for each kept node type whose source change prunes nodes.
+
+    Prunes follow a removed source, a provider change, a filesystem kind change, or a docs `paths`/`where` change.
+    """
     if before is None or after is None:
         return []
     now = {n.label: n for n in after.node_types}
-    pruned = []
+    changes = []
     for old in before.node_types:
         new = now.get(old.label)
         if new is None or old.source is None:
             continue
-        if new.source is None:
-            pruned.append(f"{old.label} (source removed)")
-        elif new.source.kind != old.source.kind:
-            pruned.append(f"{old.label} (kind {old.source.kind} -> {new.source.kind})")
-    return sorted(pruned)
+        was, became = old.source, new.source
+        if became is None:
+            reason = "source removed"
+        elif became.provider != was.provider:
+            reason = f"{was.provider} -> {became.provider}"
+        elif was.provider == "filesystem":
+            if became.kind == was.kind:
+                continue
+            reason = f"kind {was.kind} -> {became.kind}"
+        else:
+            changed = [part for part, a, b in (("paths", was.paths, became.paths), ("conditions", was.where, became.where)) if a != b]
+            if not changed:
+                continue
+            reason = " and ".join(changed) + " changed"
+        changes.append((old.label, was.provider, became.provider if became else None, reason))
+    return sorted(changes)
+
+
+def pruned_types(before, after) -> list[str]:
+    """Labels kept in `after` whose sourced nodes the next apply deletes, each with the reason."""
+    return [f"{label} ({reason})" for label, _, _, reason in _source_changes(before, after)]
 
 
 def changed_keys(before, after) -> list[tuple[str, tuple[str, ...]]]:
@@ -539,22 +558,33 @@ def schema_change_warnings(before, after, record: Any = None) -> list[str]:
     `record` (the registered repository record, or None) only chooses the wording of when they apply.
     """
     labels, types = removed_types(before, after)
-    pruned = pruned_types(before, after)
+    changes = _source_changes(before, after)
     enabled = record is not None and record.active and record.project_config_enabled
     when = "the next rescan" if enabled else "applying this schema"
     warnings = []
     if labels:
         warnings.append(f"{when} deletes the nodes of the removed node type(s): {', '.join(labels)}.")
-    if pruned:
-        warnings.append(f"{when} deletes the nodes of node type(s) whose filesystem source changed: {', '.join(pruned)}.")
+    for provider, words in (("filesystem", "filesystem"), ("docs", "Markdown front-matter")):
+        pruned = [f"{label} ({reason})" for label, was, _, reason in changes if was == provider]
+        if pruned:
+            warnings.append(f"{when} deletes the nodes of node type(s) whose {words} source changed: {', '.join(pruned)}.")
+    for label, _, became, _ in changes:
+        if became == "docs":
+            warnings.append(f"{when} rebuilds {label} entries from Markdown front matter.")
     if types:
         warnings.append(f"{when} removes the relationships of the removed relationship type(s): {', '.join(types)}.")
+    docs_labels = {n.label for n in after.node_types if n.source is not None and n.source.provider == "docs"} if after else set()
     for label, old_key in changed_keys(before, after):
         warnings.append(
             f"the uniqueness constraint on {label} keeps the old key ({', '.join(old_key)}) until this schema is "
             f"applied and every repository declaring {label} uses the new key; it also stays if existing nodes "
             f"violate the new key."
         )
+        if label in docs_labels:
+            warnings.append(
+                f"{when} renames every {label} entry by its new key; links that name {label} entries the old "
+                f"way stop matching (devgraph doctor lists them)."
+            )
     return warnings
 
 
@@ -563,7 +593,8 @@ def schema_entry_notes(entry: dict | None) -> list[str]:
     if entry is not None and "label" in entry and entry.get("source") is None:
         return [
             f"Note: no provider produces {entry['label']} nodes yet; only node types with "
-            f"`source: {{provider: filesystem}}` are populated."
+            f"`source: {{provider: filesystem}}` (files and folders) or `source: {{provider: docs}}` "
+            f"(Markdown front matter) are populated."
         ]
     return []
 

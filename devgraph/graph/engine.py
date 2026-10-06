@@ -17,7 +17,7 @@ from neo4j import Driver, GraphDatabase, READ_ACCESS, unit_of_work
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
-from devgraph.graph.schema import constraint_statements
+from devgraph.graph.schema import RELATIONSHIP_TYPES, RESERVED_NODE_PROPERTIES, constraint_statements
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Imported for annotations only: `devgraph.config.project_schema` imports
@@ -27,6 +27,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from devgraph.config.project_schema import EffectiveSchema
 
 logger = logging.getLogger(__name__)
+
+# What identifies a provider-owned node: never cleared, whatever the schema keeps.
+_EXTRACTED_IDENTITY_PROPERTIES = RESERVED_NODE_PROPERTIES | {"path"}
 
 # Shared by delete_nodes_by_source_file and _replace_file_nodes_tx.
 #
@@ -74,20 +77,45 @@ _DELETE_STALE_FILE_NODES_CYPHER = (
 )
 
 # Nodes a schema-declared provider owns (devgraph/indexer/providers/) are
-# tagged with `extractor` and keyed by repo-relative path in `name`; they
-# never carry `file`/`source_file`/`source`, so the built-in per-file cleanup
-# above never touches them and these two queries are their whole lifecycle.
-# A path deletes its own node and, as a directory, everything below it --
+# tagged with `extractor`. Their `path` property is the repo-relative file
+# that owns the entry and `name` is its key: the path itself for filesystem
+# and path-keyed docs nodes, a front-matter value for field-keyed docs nodes.
+# They never carry `file`/`source_file`/`source`, so the built-in per-file
+# cleanup above never touches them and these queries are their whole
+# lifecycle. Path-scoped queries match `path`; `keep` lists match the key.
+# A path matches its own node and, as a directory, everything below it --
 # the trailing '/' keeps `src` from matching `src2/...`.
-_DELETE_EXTRACTED_PATHS_CYPHER = (
+_EXTRACTED_AT_OR_BELOW = (
     "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
-    "AND (n.name IN $paths OR any(p IN $paths WHERE n.name STARTS WITH p + '/')) "
-    "DETACH DELETE n"
+    "AND (n.path IN $paths OR any(p IN $paths WHERE n.path STARTS WITH p + '/')) "
 )
+_DELETE_EXTRACTED_PATHS_CYPHER = _EXTRACTED_AT_OR_BELOW + "DETACH DELETE n"
+_EXTRACTED_NODES_AT_CYPHER = _EXTRACTED_AT_OR_BELOW + "RETURN DISTINCT labels(n)[0] AS label, n.name AS name"
 _PRUNE_EXTRACTED_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
     "AND NOT (labels(n)[0] + ':' + n.name) IN $keep "
     "DETACH DELETE n RETURN count(n) AS pruned"
+)
+# The incremental reconcile for provider-owned nodes: only nodes at these
+# exact paths are candidates (never anything below them), so a batch of
+# changed files can't prune the rest of the provider's nodes.
+_PRUNE_EXTRACTED_AT_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND n.path IN $paths "
+    "AND NOT (labels(n)[0] + ':' + n.name) IN $keep "
+    "DETACH DELETE n RETURN count(n) AS pruned"
+)
+# A provider's own edges are the outgoing ones of a non-built-in type; incoming
+# edges belong to whoever wrote them. A null $paths means the whole repo.
+_DELETE_EXTRACTED_EDGES_CYPHER = (
+    "MATCH (a {repo_id: $repo_id})-[r]->() WHERE a.extractor = $extractor "
+    "AND ($paths IS NULL OR a.path IN $paths) AND NOT type(r) IN $builtin_types "
+    "DELETE r RETURN count(r) AS deleted"
+)
+# Property keys present on one provider label, for clearing the ones the
+# schema no longer declares (see GraphEngine.clear_extracted_properties).
+_EXTRACTED_PROPERTY_KEYS_CYPHER = (
+    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] = $label "
+    "UNWIND keys(n) AS key RETURN DISTINCT key"
 )
 
 # Which project schema the repository's graph was last built with (see
@@ -598,6 +626,30 @@ class GraphEngine:
                 session.run, _DELETE_EXTRACTED_PATHS_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
             )
 
+    def extracted_nodes_at(self, repo_id: str, extractor: str, paths: list[str]) -> set[tuple[str, str]]:
+        """(label, name) of one provider's nodes at these repo-relative paths, or below them --
+        the nodes delete_extracted_nodes would delete."""
+        if not paths:
+            return set()
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run, _EXTRACTED_NODES_AT_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
+            )
+            return {(record["label"], record["name"]) for record in result or []}
+
+    def extracted_entries(self, repo_id: str, extractor: str, labels: list[str]) -> set[tuple[str, str, str]]:
+        """(label, name, path) of every node one provider wrote under these labels in a repo."""
+        if not labels:
+            return set()
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] IN $labels "
+                "RETURN labels(n)[0] AS label, n.name AS name, n.path AS path",
+                repo_id=repo_id, extractor=extractor, labels=labels,
+            )
+            return {(record["label"], record["name"], record["path"]) for record in result or []}
+
     def prune_extracted_nodes(self, repo_id: str, extractor: str, keep: list[str]) -> int:
         """Delete every node of one provider in a repo except `keep` ("Label:name").
 
@@ -610,6 +662,64 @@ class GraphEngine:
             )
             records = [record.data() for record in result or []]
         return records[0]["pruned"] if records else 0
+
+    def prune_extracted_at(self, repo_id: str, extractor: str, paths: list[str], keep: list[str]) -> int:
+        """Delete one provider's nodes at exactly these paths, except `keep` ("Label:name")."""
+        if not paths:
+            return 0
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run, _PRUNE_EXTRACTED_AT_CYPHER,
+                repo_id=repo_id, extractor=extractor, paths=paths, keep=keep,
+            )
+            records = [record.data() for record in result or []]
+        return records[0]["pruned"] if records else 0
+
+    def delete_extracted_edges(self, repo_id: str, extractor: str, paths: list[str] | None) -> int:
+        """Delete the outgoing non-built-in edges of one provider's nodes at these paths,
+        or across the whole repo when `paths` is None."""
+        if paths is not None and not paths:
+            return 0
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run, _DELETE_EXTRACTED_EDGES_CYPHER, repo_id=repo_id, extractor=extractor,
+                paths=paths, builtin_types=list(RELATIONSHIP_TYPES),
+            )
+            records = [record.data() for record in result or []]
+        return records[0]["deleted"] if records else 0
+
+    def clear_extracted_properties(self, repo_id: str, extractor: str, label: str, keep: list[str]) -> list[str]:
+        """Remove every property of one provider label's nodes that is not in `keep`,
+        not an identity property (reserved names and `path`) and not `insight_*`.
+        An empty `keep` clears every non-identity property. Returns the removed
+        names, sorted.
+
+        The names come from the graph, so each one must fullmatch the property-name
+        pattern before it is interpolated; anything else is left in place.
+        """
+        # Runtime import: see the TYPE_CHECKING note at the top of this module.
+        from devgraph.config.project_schema import PROPERTY_NAME_PATTERN
+
+        params = {"repo_id": repo_id, "extractor": extractor, "label": label}
+        with self._driver.session() as session:
+            result = _retry_transient(session.run, _EXTRACTED_PROPERTY_KEYS_CYPHER, **params)
+            present = [record["key"] for record in result or []]
+            stale = sorted(
+                key for key in present
+                if key not in keep
+                and key not in _EXTRACTED_IDENTITY_PROPERTIES
+                and not key.startswith("insight_")
+                and PROPERTY_NAME_PATTERN.fullmatch(key)
+            )
+            if stale:
+                removals = ", ".join(f"n.`{key}`" for key in stale)
+                _retry_transient(
+                    session.run,
+                    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] = $label "
+                    f"REMOVE {removals}",
+                    **params,
+                ).consume()
+        return stale
 
     def read_applied_schema(self, repo_id: str) -> dict[str, Any] | None:
         """The schema state the repo's graph was last built with, or None."""
@@ -679,6 +789,19 @@ class GraphEngine:
             result = _retry_transient(session.run, f"MATCH (n:`{label}`) RETURN n LIMIT 1")
             return bool([record for record in result or []])
 
+    def existing_node_names(self, repo_id: str, label: str, names: list[str]) -> set[str]:
+        """Which of `names` one repo's `label` nodes carry. The caller validates `label`."""
+        if not names:
+            return set()
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                f"MATCH (n:`{label}` {{repo_id: $repo_id}}) WHERE n.name IN $names RETURN DISTINCT n.name AS name",
+                repo_id=repo_id,
+                names=names,
+            )
+            return {record["name"] for record in result or []}
+
     def delete_label_nodes(self, repo_id: str, label: str) -> int:
         """Delete one repo's nodes of a user label. The caller validates `label`."""
         with self._driver.session() as session:
@@ -728,8 +851,8 @@ class GraphEngine:
 
     def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str]]:
         """Return (label, name) for every node whose file provenance
-        (`source_file`/`file`, or a `Module` named by its path) is one of
-        `files`.
+        (`source_file`/`file`, a `Module` named by its path, or a schema
+        provider's node, which its `path` owns) is one of `files`.
 
         index_paths snapshots this before re-indexing a batch so it can tell
         which nodes the batch *adds* -- only those can be the missing
@@ -741,6 +864,7 @@ class GraphEngine:
                 "MATCH (n {repo_id: $repo_id}) "
                 "WHERE n.source_file IN $files OR n.file IN $files "
                 "   OR (n:Module AND n.name IN $files) "
+                "   OR (n.extractor IS NOT NULL AND n.path IN $files) "
                 "RETURN DISTINCT labels(n)[0] AS label, n.name AS name",
                 repo_id=repo_id,
                 files=files,

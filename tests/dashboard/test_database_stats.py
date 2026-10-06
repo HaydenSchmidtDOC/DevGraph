@@ -9,6 +9,8 @@ used to read is the bug being fixed here) and lets the denied/empty/
 malformed paths be exercised deterministically.
 """
 
+from pathlib import Path
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -250,7 +252,7 @@ def test_history_endpoint_is_read_only():
 def test_blank_data_dir_setting_means_unset():
     assert Settings(_env_file=None, neo4j_data_dir="").neo4j_data_dir is None
     assert Settings(_env_file=None, neo4j_data_dir="  ").neo4j_data_dir is None
-    assert str(Settings(_env_file=None, neo4j_data_dir="/srv/neo4j").neo4j_data_dir) == "/srv/neo4j"
+    assert Settings(_env_file=None, neo4j_data_dir="/srv/neo4j").neo4j_data_dir == Path("/srv/neo4j")
 
 
 def test_app_lifespan_runs_the_sampler_with_the_configured_data_dir(tmp_path, monkeypatch):

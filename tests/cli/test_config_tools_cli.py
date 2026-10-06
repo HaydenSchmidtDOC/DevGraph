@@ -1,6 +1,7 @@
 """`devgraph config tools` (list/add/edit/delete/reset) and global-tool reporting."""
 
 import json
+import sys
 import textwrap
 
 import pytest
@@ -480,9 +481,11 @@ def test_project_write_is_atomic_and_keeps_the_mode(runner, repo, tmp_path, monk
 
     add(runner, tmp_path, ["--repo", str(repo)], name="first_tool")
     path = repo / TOOLS_FILENAME
-    path.chmod(0o640)
+    if os.name != "nt":
+        path.chmod(0o640)
     assert add(runner, tmp_path, ["--repo", str(repo)], name="second_tool").exit_code == 0
-    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o640
     before = path.read_bytes()
 
     def boom(*args):

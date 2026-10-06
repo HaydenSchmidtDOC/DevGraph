@@ -9,6 +9,7 @@ malformed paths are deterministic.
 
 import os
 import stat
+import sys
 import threading
 import time
 
@@ -240,7 +241,8 @@ def test_store_does_not_follow_or_count_symlinks(tmp_path):
     assert store_from_data_dir(data)["graph_bytes"] == 120
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root can read anything")
+@pytest.mark.skipif(sys.platform == "win32", reason="chmod cannot make a directory unreadable on Windows")
+@pytest.mark.skipif(sys.platform != "win32" and os.geteuid() == 0, reason="root can read anything")
 def test_unreadable_subdirectory_is_unreadable_not_an_undercount(tmp_path):
     data = make_data_dir(tmp_path)
     locked = data / "databases" / "neo4j"

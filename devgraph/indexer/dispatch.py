@@ -17,21 +17,26 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable, Mapping
+from functools import partial
 from pathlib import Path
+from typing import NamedTuple
 
 from devgraph.config import get_settings
 from devgraph.config.project_schema import (
     ABSENT_SCHEMA_HASH,
     LABEL_PATTERN,
     RELATIONSHIP_TYPE_PATTERN,
+    EffectiveSchema,
     ProjectSchemaError,
+    _user_constraint_name,
     resolve_effective_schema,
     schema_file_hash,
 )
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.indexer.apis.extractor import APIExtractor
-from devgraph.indexer.containers.extractor import ContainerExtractor
+from devgraph.indexer.containers.extractor import ContainerExtractor, ExtractionResult
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import DocsExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
@@ -43,10 +48,25 @@ from devgraph.indexer.kotlin.extractor import extract_kotlin_file
 from devgraph.indexer.mentions.extractor import index_file as index_mentions_file
 from devgraph.indexer.mentions.extractor import mentions_any, upsert_document_node
 from devgraph.indexer.cpp.extractor import extract_cpp_file
-from devgraph.indexer.providers import filesystem
+from devgraph.indexer.providers import docs, docs_cache, filesystem
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
-from devgraph.indexer.schema_constraints import encode_keys, realign_keys, release_labels
+from devgraph.indexer.schema_constraints import (
+    encode_keys,
+    generated_objects,
+    realign_keys,
+    recorded_declarations,
+    release_labels,
+)
+# Re-exported under their pre-walk.py names for the watcher and existing callers.
+from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
+from devgraph.indexer.walk import indexable_paths as _indexable_paths
+from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
+from devgraph.indexer.walk import is_ignored_path as is_ignored_path
+from devgraph.indexer.walk import is_indexable_file as _is_indexable_file
+from devgraph.indexer.walk import keyed_indexable_paths as _keyed_indexable_paths
+from devgraph.indexer.walk import links_outside as _links_outside  # noqa: F401
+from devgraph.indexer.walk import repo_relative as _repo_relative
 from devgraph.paths import is_within
 
 logger = logging.getLogger(__name__)
@@ -56,71 +76,21 @@ _CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 _COMPOSE_NAMES = {"docker-compose.yml", "docker-compose.yaml", "podman-compose.yml", "podman-compose.yaml", "compose.yml", "compose.yaml"}
 _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
 
-# Mirrors this project's own .gitignore: directories no full_scan (and, via
-# devgraph.watcher.manager, no live watch) should ever walk into. Without
-# this, `devgraph add` on any Python repo with a local venv indexes thousands
-# of third-party dependency files from .venv/site-packages alongside the
-# repo's actual ~dozens of source files.
-IGNORED_DIR_NAMES = {
-    ".git",
-    ".venv",
-    "venv",
-    "__pycache__",
-    "build",
-    "dist",
-    ".pytest_cache",
-    ".devgraph",
-    "node_modules",
-    "bin",
-    "obj",
-    "target",
-    "vendor",
-    # Kotlin/Gradle build + tool scratch (Kotlin extractor, "motonav" plan):
-    # .gradle is the venv-equivalent (build cache + expanded AAR dependency
-    # sources); .kotlin is the compiler session cache; the rest are IDE/MCP
-    # tool scratch that's never source.
-    ".gradle",
-    ".kotlin",
-    ".idea",
-    ".serena",
-    ".playwright-mcp",
-    # C++ build-directory conventions (Implementation Plan #8, C++ row):
-    # CLion/CMake's default out-of-source build dir names.
-    "cmake-build-debug",
-    "cmake-build-release",
-    # Tool-generated scratch caches that can land inside a registered repo's
-    # working tree (e.g. a research skill's local cache dir) rather than a
-    # true temp directory. Never source, never worth graphing.
-    ".firecrawl",
-    # Agent worktrees (.worktrees/ at the repo root, .claude/worktrees/ for
-    # ones a coding agent spawns). Each is a full checkout of the repo it
-    # lives inside, so walking them indexes the entire repo again per live
-    # worktree — the same function then legitimately exists at N paths and
-    # becomes N nodes under the file-scoped MERGE key, silently multiplying
-    # the graph by however many worktrees happen to be open at scan time.
-    ".worktrees",
-    "worktrees",
-}
-
 _JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
 
 
-def is_ignored_dir_name(name: str) -> bool:
-    return name in IGNORED_DIR_NAMES or name.endswith(".egg-info")
+def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | None, docs.DocsSpec | None]:
+    """(schema usable, filesystem spec, docs spec), from one schema resolve.
 
-
-def is_ignored_path(path: Path) -> bool:
-    return any(is_ignored_dir_name(part) for part in path.parts)
-
-
-def _filesystem_spec(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | None]:
-    """(schema usable, spec). An invalid schema disables the provider for this
-    call -- including any prune -- so a bad edit never deletes good nodes."""
+    An invalid schema disables both providers for this call -- including any
+    prune, edge write or relink -- so a bad edit never deletes good nodes.
+    """
     try:
-        return True, filesystem.load_filesystem_spec(repo_root)
+        effective = resolve_effective_schema(repo_root)
     except ProjectSchemaError as exc:
-        logger.warning("project schema for %s is invalid; filesystem provider skipped: %s", repo_root, exc)
-        return False, None
+        logger.warning("project schema for %s is invalid; schema providers skipped: %s", repo_root, exc)
+        return False, None, None
+    return True, filesystem.filesystem_spec(effective), docs.docs_spec(effective)
 
 
 def schema_pending(engine: GraphEngine, repo_id: str, repo_root: Path) -> bool:
@@ -138,28 +108,49 @@ def schema_pending(engine: GraphEngine, repo_id: str, repo_root: Path) -> bool:
 
 
 def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> bool:
+    """Bring the graph in line with the repository's current schema file;
+    see _apply_project_schema. True when applied."""
+    return _apply_project_schema(engine, repo_id, repo_root)[0]
+
+
+#: What `_apply_project_schema` applied for the docs provider: the spec, the
+#: front matter it read and the owner of each field-keyed entry.
+AppliedDocs = tuple[docs.DocsSpec, docs.Selected, Mapping[tuple[str, str], str]]
+
+
+def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> tuple[bool, AppliedDocs | None]:
     """Bring the graph in line with the repository's current schema file.
 
     Provisions constraints/indexes, deletes nodes and relationships of user
     types the previously applied schema declared but this one doesn't
-    (built-ins are never touched), re-syncs the filesystem provider, records
+    (built-ins are never touched), re-syncs the filesystem and docs providers
+    (docs edges are rebuilt by full_scan once every node exists), records
     the applied state, then reconciles the generated constraints/indexes with
     every repository's recorded state (see schema_constraints). An invalid
     schema or a provisioning failure returns False with the graph untouched;
     errors from the deletion or reconcile steps propagate, while a failed
     constraint reconcile (or the re-provisioning after the record) is only logged.
+
+    Both providers prune before either upserts: an upsert MERGEs onto the
+    node of that label and name whichever provider made it, and retags it,
+    so a type switching providers would otherwise keep the old provider's
+    properties.
+
+    Returns (applied, the docs spec, front matter and owners applied, or
+    None), so full_scan's edge pass reuses them instead of resolving the
+    schema, reading every docs file and working out the owners again.
     """
     current_hash = schema_file_hash(repo_root)
     try:
         effective = resolve_effective_schema(repo_root)
     except ProjectSchemaError as exc:
         logger.warning("project schema for %s is invalid; not applied: %s", repo_root, exc)
-        return False
+        return False, None
     try:
         provision_repository_schema(engine, repo_root)
     except Exception as exc:
         logger.warning("could not provision the project schema for %s; not applied: %s", repo_root, exc)
-        return False
+        return False, None
 
     labels = [node_type.label for node_type in effective.node_types]
     rel_types = list(dict.fromkeys(r.type for r in effective.relationships if r.type not in RELATIONSHIP_TYPES))
@@ -176,10 +167,15 @@ def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> 
             engine.delete_relationship_type(repo_id, rel_type)
 
     spec = filesystem.filesystem_spec(effective)
-    on_disk = {rel for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
+    disk = _disk_files(repo_root)
+    on_disk = set(disk)
+    docs_spec = docs.docs_spec(effective)
+    docs_nodes, selected, owners = _prune_docs(engine, repo_id, repo_root, docs_spec, disk)
     filesystem.reconcile(engine, repo_id, spec, on_disk)
     if spec is not None:
         filesystem.sync_present(engine, repo_id, spec, on_disk)
+    deferred = _deferred_docs_labels(engine, effective, docs_spec)
+    engine.upsert_nodes([node for node in docs_nodes if node["label"] not in deferred])
     engine.record_applied_schema(repo_id, current_hash, labels, rel_types, encode_keys(effective.node_types))
     # After recording, so this repository's new state is part of what every
     # other repository's declarations are weighed against. Provisioning is
@@ -192,21 +188,363 @@ def apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) -> 
         realign_keys(engine, effective.node_types)
     except Exception as exc:
         logger.warning("could not reconcile generated constraints/indexes for %s: %s", repo_id, exc)
-    return True
+    for label in sorted(deferred):
+        _upsert_deferred_label(engine, repo_id, effective, label, [node for node in docs_nodes if node["label"] == label])
+    return True, (docs_spec, selected, owners) if docs_spec is not None and selected is not None else None
 
 
-def _repo_relative(repo_root: Path, path: Path) -> str | None:
-    """Repo-relative POSIX path, or None for a path outside the repository."""
+def _deferred_docs_labels(engine: GraphEngine, effective: EffectiveSchema, spec: docs.DocsSpec | None) -> set[str]:
+    """Docs labels whose generated constraint in the database is keyed differently
+    from their declaration (addendum K7): a key switch, or a first apply under a
+    constraint another repository created. Their entries are written after
+    realign_keys, which may replace the constraint."""
+    if spec is None:
+        return set()
+    docs_labels = {docs_type.label for docs_type in spec.types}
+    existing = generated_objects(engine)
+    deferred = set()
+    for node_type in effective.node_types:
+        constraint = existing.get(_user_constraint_name(node_type.label))
+        if node_type.label in docs_labels and constraint is not None and (constraint.label, constraint.properties) != (
+            node_type.label, ("repo_id", *node_type.key)
+        ):
+            deferred.add(node_type.label)
+    return deferred
+
+
+def _upsert_deferred_label(
+    engine: GraphEngine, repo_id: str, effective: EffectiveSchema, label: str, nodes: list[dict]
+) -> None:
+    """Write one deferred label's entries in their own transaction. When another
+    repository's key keeps the old constraint and the entries break it, none of
+    them is written: warn, naming the repositories that disagree."""
     try:
-        return Path(path).resolve().relative_to(repo_root.resolve()).as_posix()
-    except (OSError, ValueError):
-        return None
+        engine.upsert_nodes(nodes)
+    except Exception as exc:
+        key = next(tuple(node_type.key) for node_type in effective.node_types if node_type.label == label)
+        # A repository with the same key spells the label differently (case only).
+        reasons = [
+            f"{other} spells the type '{other_label}'" if other_key == key
+            else f"{other} declares {label} keyed differently"
+            for other, other_label, other_key in sorted(recorded_declarations(engine).get(label.casefold(), []), key=lambda entry: entry[0])
+            if other != repo_id and (other_label, other_key) != (label, key)
+        ]
+        logger.warning(
+            "%s: %s entries were not written: %s, so its constraint keeps "
+            "the old key and these entries break it; align the key or rename one label (%s)",
+            repo_id, label, " and ".join(reasons) or f"another repository declares {label} keyed differently", exc,
+        )
+
+
+def _disk_files(repo_root: Path) -> dict[str, Path]:
+    """Every file a full scan indexes, by repo-relative path. A symlink is keyed
+    by its target, so one into an ignored directory is left out, as
+    `_is_provider_file` leaves it out of a batch."""
+    return {rel: p for p, rel in _keyed_indexable_paths(repo_root)}
 
 
 def _is_provider_file(repo_root: Path, path: Path) -> bool:
     """A file the filesystem provider represents: what a full scan would index."""
     rel = _repo_relative(repo_root, path)
     return rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel))
+
+
+def _prune_docs(
+    engine: GraphEngine, repo_id: str, repo_root: Path, spec: docs.DocsSpec | None, files: dict[str, Path]
+) -> tuple[list[dict], docs.Selected | None, Mapping[tuple[str, str], str]]:
+    """Clear the docs provider's graph for a rebuild from the whole repository (spec §4).
+
+    Every docs edge goes first, of any type, current or former: full_scan's
+    final pass rebuilds them once every target exists. Then properties the
+    schema no longer declares are cleared and nodes the mapping no longer
+    produces are pruned (all of them when no type is docs-sourced). Returns
+    the nodes for the caller to upsert, the front matter read (None without
+    docs types) and the owners.
+
+    `files` is every file on disk, so the owners of field-keyed entries are
+    worked out from all of them (`docs.keyed_owners`). The nodes are built
+    before anything is written, so a failure leaves the graph untouched.
+    They are read through the read cache, which full_scan has just emptied
+    for this repository, so the reads refill it.
+    """
+    nodes: list[dict] = []
+    selected, owners = None, {}
+    if spec is not None:
+        selected = docs.read_selected(spec, files, read=partial(docs_cache.read, repo_root))
+        owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
+        nodes, problems = docs.build_nodes(spec, repo_id, selected, owners)
+        _log_docs_problems(repo_id, problems)
+    engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, None)
+    if spec is not None:
+        for docs_type in spec.types:
+            engine.clear_extracted_properties(
+                repo_id, docs.EXTRACTOR, docs_type.label, [field.name for field in docs_type.fields]
+            )
+    engine.prune_extracted_nodes(repo_id, docs.EXTRACTOR, [f"{n['label']}:{n['name']}" for n in nodes])
+    return nodes, selected, owners
+
+
+def _log_cache_stats() -> None:
+    """The docs read cache's process totals, after a batch's docs pass."""
+    if logger.isEnabledFor(logging.DEBUG):
+        stats = docs_cache.stats()
+        logger.debug(
+            "docs read cache: %d hits, %d misses, %d fresh, %d entries, %d bytes",
+            stats["hits"], stats["misses"], stats["fresh"], stats["entries"], stats["bytes"],
+        )
+
+
+def _log_docs_problems(repo_id: str, problems: list[docs.Problem]) -> None:
+    """One warning per pass, naming the first problem (repr: file names are untrusted)."""
+    if problems:
+        first = problems[0]
+        logger.warning(
+            "%s: %d Markdown front-matter problem(s), first %r for %s: %r; `devgraph doctor` lists them",
+            repo_id, len(problems), first.path, first.label, first.reason,
+        )
+
+
+def _read_reusing(
+    spec: docs.DocsSpec, files: Mapping[str, Path], seen: Mapping[str, tuple], read: Callable[[str, Path], tuple]
+) -> docs.Selected:
+    """`docs.read_selected` through `read`, except that front matter already in `seen` is not read again."""
+    return docs.Selected(
+        (rel, seen[rel] if rel in seen else read(rel, files[rel]))
+        for rel in sorted(files)
+        if any(docs.selects(docs_type, rel) for docs_type in spec.types)
+    )
+
+
+def _keyed_view(repo_root: Path, spec: docs.DocsSpec, seen: Mapping[str, tuple] | None = None) -> docs.KeyedView:
+    """Every field-keyed docs file on disk and who owns each key (addendum §4).
+
+    One walk and one read of the files a field-keyed type selects, reusing the
+    batch's front matter (`seen`). Owners always come from all of them, never
+    from the batch alone or from the graph. The reads go through the read
+    cache, so only files changed since it last read them are parsed again.
+    """
+    files = _disk_files(repo_root)
+    keyed = docs.DocsSpec(tuple(docs_type for docs_type in spec.types if docs_type.key is not None), ())
+    selected = _read_reusing(keyed, files, seen or {}, partial(docs_cache.read, repo_root))
+    claims = docs.keyed_claims(spec, selected)
+    return docs.KeyedView(files, selected, claims, docs.keyed_owners(claims))
+
+
+class _DocsBatch(NamedTuple):
+    """What a batch writes for the docs provider."""
+
+    #: The batch's front matter plus that of the owner of each affected key.
+    selected: docs.Selected
+    nodes: list[dict]
+    owners: Mapping[tuple[str, str], str]
+    #: The batch's view of the field-keyed files, or None if it touches none.
+    view: docs.KeyedView | None
+    #: Affected (label, key)s whose entry is already in the graph, wherever it was,
+    #: and the entries already at the owners pulled in.
+    existing: set[tuple[str, str]]
+
+
+def _read_docs_batch(
+    engine: GraphEngine, repo_id: str, repo_root: Path, spec: docs.DocsSpec, files: dict[str, Path],
+    previous: set[tuple[str, str]],
+) -> _DocsBatch | None:
+    """The batch's docs front matter and nodes, or None if that failed (the
+    docs pass is then skipped for this batch).
+
+    For each field-keyed type the batch touches (one of its files is selected,
+    or `previous`, the nodes at its paths, holds one), the affected keys K are
+    those its files claim plus those of its previous nodes, and the owner on
+    disk of each joins the batch. Losers never do.
+
+    An owner pulled in may still hold, in the graph, an entry its file no
+    longer claims (its own event is pending). The batch prunes at its path,
+    so that entry's key joins K too and its owner on disk is pulled in, until
+    K stops growing. K only grows and every path added owns a key in it, so
+    this ends, without reading any file or querying the graph again (the
+    field-keyed entries are fetched once), and every engine path list holds
+    at most |batch| + |K| paths.
+
+    The watcher has just reported the batch's files as changed, so they are
+    read fresh (`docs_cache.read_fresh`), never served from the read cache.
+    """
+    try:
+        selected = docs.read_selected(spec, files, read=partial(docs_cache.read_fresh, repo_root))
+        view, owners, existing = None, {}, set()
+        keyed = {docs_type.label for docs_type in spec.types if docs_type.key is not None}
+        touched = {
+            docs_type.label for docs_type in spec.types if docs_type.label in keyed
+            and (any(docs.selects(docs_type, rel) for rel in files) or any(label == docs_type.label for label, _ in previous))
+        }
+        if touched:
+            view = _keyed_view(repo_root, spec, selected)
+            owners = view.owners
+            batch = set(files)
+            keys = {key for key, paths in view.claims.items() if key[0] in touched and not batch.isdisjoint(paths)}
+            keys |= {(label, name) for label, name in previous if label in touched}
+            # Every field-keyed entry in the graph, fetched once: the chase below
+            # runs in memory however long the chain of stale entries is.
+            in_graph: dict[str, set[tuple[str, str]]] = {}
+            for label, name, path in engine.extracted_entries(repo_id, docs.EXTRACTOR, sorted(keyed)):
+                in_graph.setdefault(path, set()).add((label, name))
+            batch_selected, checked = selected, set(batch)
+            while True:
+                selected = docs.expand_to_owners(view, batch_selected, keys)
+                pulled_in = set(selected) - checked
+                checked |= pulled_in
+                stale = {key for path in pulled_in for key in in_graph.get(path, ())} - keys
+                if not stale:
+                    break
+                keys |= stale
+            existing = keys & {key for entries in in_graph.values() for key in entries}
+            # An owner pulled in also rewrites its other entries (a path-keyed
+            # type's, say); those already there are not added either.
+            pulled_in = sorted(set(selected) - batch)
+            if pulled_in:
+                existing |= engine.list_file_nodes(repo_id, pulled_in)
+        nodes, problems = docs.build_nodes(spec, repo_id, selected, owners)
+    except Exception:
+        logger.warning("docs node pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
+        return None
+    _log_docs_problems(repo_id, problems)
+    return _DocsBatch(selected, nodes, owners, view, existing)
+
+
+def _sync_docs(engine: GraphEngine, repo_id: str, spec: docs.DocsSpec, batch: _DocsBatch) -> None:
+    """Rewrite the docs nodes and outgoing edges of the batch's selected files.
+
+    Nodes MERGE in place, so edges into them from other docs files survive.
+    They are upserted first: an entry whose owner changed moves onto its new
+    `path` before the outgoing edges at the batch's paths (its old owner's
+    among them) are deleted and rebuilt. If that delete or the prune fails
+    after the upsert, a moved entry keeps its old owner's links and stale
+    entries stay until the owner's next save or a rescan rewrites them.
+    """
+    paths = sorted(batch.selected)
+    try:
+        engine.upsert_nodes(batch.nodes)
+    except Exception:
+        logger.warning("docs node pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
+        return
+    try:
+        engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, paths)
+        engine.prune_extracted_at(repo_id, docs.EXTRACTOR, paths, [f"{n['label']}:{n['name']}" for n in batch.nodes])
+    except Exception:
+        logger.warning(
+            "docs pass for %s wrote its nodes but could not clear their old links and entries; "
+            "a moved entry may keep its previous file's links until that file's next save or a rescan",
+            repo_id, exc_info=True,
+        )
+        return
+    try:
+        engine.upsert_relationships(docs.build_edges(spec, repo_id, batch.selected, owners=batch.owners))
+    except Exception:
+        logger.warning("docs edge pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
+
+
+def _relink_docs(
+    engine: GraphEngine, repo_id: str, repo_root: Path, spec: docs.DocsSpec,
+    added: set[tuple[str, str]], batch: set[str], view: docs.KeyedView | None = None,
+) -> None:
+    """Link docs files outside the batch to the nodes the batch added.
+
+    A docs edge to a node that didn't exist yet was skipped when its file was
+    indexed. Only added nodes can be such a target: a re-indexed node MERGEs
+    in place and keeps its incoming edges. Re-reads the files the docs types
+    select, and only when a docs relationship targets an added node's label.
+    The batch's `view` supplies the walk and the field-keyed front matter
+    (built here when a type is field-keyed and the batch had none), so only
+    the other files are read, through the read cache. A field-keyed entry is linked from the file it
+    sits at in the graph (one query), whichever file owns its key on disk.
+    """
+    target_labels = {relationship.to_label for relationship in spec.relationships}
+    targets = {(label, name) for label, name in added if label in target_labels}
+    if not targets:
+        return
+    try:
+        if view is None and any(docs_type.key is not None for docs_type in spec.types):
+            view = _keyed_view(repo_root, spec)
+        if view is None:
+            files = _disk_files(repo_root)
+        else:
+            files = dict(view.files)
+        outside = {rel: p for rel, p in files.items() if rel not in batch}
+        selected = _read_reusing(spec, outside, view.selected if view else {}, partial(docs_cache.read, repo_root))
+        owners: Mapping[tuple[str, str], str] = {}
+        if view is not None:
+            # Each field-keyed entry is linked from the file it sits at in the
+            # graph, not from its owner on disk: a claimant whose event is
+            # pending may outrank that file, and give the id up again before its
+            # event (which would rebuild the entry's links) ever arrives.
+            keyed = sorted(docs_type.label for docs_type in spec.types if docs_type.key is not None)
+            owners = {
+                (label, name): path
+                for label, name, path in engine.extracted_entries(repo_id, docs.EXTRACTOR, keyed)
+            }
+        engine.upsert_relationships(docs.build_edges(spec, repo_id, selected, targets, owners=owners))
+    except Exception:
+        logger.warning("docs relink failed for %s; the next rescan links them", repo_id, exc_info=True)
+
+
+def _take_over_keys(engine: GraphEngine, repo_id: str, repo_root: Path, spec: docs.DocsSpec, gone: list[str]) -> None:
+    """Before the docs nodes at deleted paths go: move each field-keyed entry
+    among them to the file that now owns its key, and rebuild that file's
+    outgoing edges. Nothing else the owner claims is written: that is its
+    own event's work. An entry whose key no file claims is left to the delete.
+
+    A failure before the move falls through to the delete, and the next
+    rescan restores the entry. A failure after it leaves the entry at its new
+    owner (the delete matches paths, so it no longer reaches it) with the
+    deleted file's links, until the owner's next save or a rescan.
+    """
+    keyed = {docs_type.label for docs_type in spec.types if docs_type.key is not None}
+    if not keyed:
+        return
+    try:
+        keys = {key for key in engine.extracted_nodes_at(repo_id, docs.EXTRACTOR, gone) if key[0] in keyed}
+        if not keys:
+            return
+        view = _keyed_view(repo_root, spec)
+        selected = docs.expand_to_owners(view, docs.Selected(), keys)
+        if not selected:
+            return
+        # Only the entries taken over move. An owner whose own event is still
+        # pending may claim more on disk; writing those here would make its
+        # event see them as already there, so nothing would relink them.
+        nodes, _problems = docs.build_nodes(spec, repo_id, selected, view.owners)
+        nodes = [node for node in nodes if (node["label"], node["name"]) in keys]
+        # The edge delete below clears every outgoing edge at the owner paths,
+        # so those of the entries already there are rebuilt as well.
+        sources = keys | engine.extracted_nodes_at(repo_id, docs.EXTRACTOR, sorted(selected))
+        edges = [
+            edge for edge in docs.build_edges(spec, repo_id, selected, owners=view.owners)
+            if (edge["from_label"], edge["from_name"]) in sources
+        ]
+        engine.upsert_nodes(nodes)
+    except Exception:
+        logger.warning("docs takeover failed for %s; the next rescan restores the entries", repo_id, exc_info=True)
+        return
+    try:
+        engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, sorted(selected))
+        engine.upsert_relationships(edges)
+    except Exception:
+        logger.warning(
+            "docs takeover for %s moved entries to the files that now own their ids but could not rebuild "
+            "their links; they keep the deleted file's links until the owner's next save or a rescan",
+            repo_id, exc_info=True,
+        )
+
+
+def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, applied: AppliedDocs | None) -> None:
+    """Write every docs edge in the repository from the spec and front matter
+    apply used: full_scan's last step, once every target node exists. Skipped
+    when the schema file changed since (it is then pending)."""
+    if applied is None or schema_pending(engine, repo_id, repo_root):
+        return
+    spec, selected, owners = applied
+    try:
+        engine.upsert_relationships(docs.build_edges(spec, repo_id, selected, owners=owners))
+    except Exception:
+        logger.warning("docs edge pass failed for %s; the next rescan retries it", repo_id, exc_info=True)
 
 
 def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None, mentions_enabled: bool = False, sync_provider: bool = True) -> int:
@@ -225,9 +563,10 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             Markdown mentioning an added name (see _mention_referrers).
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
-        sync_provider: Write filesystem-provider nodes for `paths` (skipped
-            while the schema is pending). False when the caller has just
-            applied the schema.
+        sync_provider: Write schema-provider nodes and edges for `paths`
+            and relink docs edges to added nodes (skipped while the schema
+            is pending or invalid). False when the caller has just applied
+            the schema.
 
     Returns:
         Number of files actually indexed, including those referrers
@@ -269,6 +608,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # node in the batch exists (see the docs/mentions passes below).
     docs_files: list[Path] = []
     mention_files: list[Path] = []
+    # (label, name) of the Service nodes the batch's compose files wrote.
+    batch_services: set[tuple[str, str]] = set()
 
     # Process files in a fixed order, not set order. Shared nodes
     # (Datastore/Endpoint) keep the last writer's `source`/`library` and
@@ -305,7 +646,7 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
                 cs_files, cs_extractions, cpp_files, cpp_extractions,
                 java_files, java_extractions, rs_files, rs_extractions,
                 kt_files, kt_extractions, go_extractions,
-                docs_files, mention_files,
+                docs_files, mention_files, batch_services,
             )
         except Exception:
             logger.warning(
@@ -321,6 +662,35 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     batch_keys = sorted(provenance_keys)
     previous_nodes = engine.list_file_nodes(repo_id, batch_keys)
 
+    # The schema providers' specs, resolved once for the batch. The docs
+    # nodes are read now, so the relink below can tell which ones are new;
+    # they are written after the filesystem sync.
+    providers_ok, fs_spec, docs_spec = (False, None, None)
+    if sync_provider and not schema_pending(engine, repo_id, repo_root):
+        providers_ok, fs_spec, docs_spec = _provider_specs(repo_root)
+    present: set[str] = set()
+    if providers_ok and fs_spec is not None:
+        present = {
+            rel for p in paths
+            if _is_provider_file(repo_root, Path(p)) and (rel := _repo_relative(repo_root, Path(p))) is not None
+        }
+    docs_batch = None
+    if providers_ok and docs_spec is not None:
+        docs_batch = _read_docs_batch(
+            engine, repo_id, repo_root, docs_spec,
+            {rel: p for rel, p in by_rel_path.items() if _is_provider_file(repo_root, p)}, previous_nodes,
+        )
+    if docs_batch:
+        # A field-keyed entry the batch writes that was already in the graph
+        # (moving between files) is not added.
+        previous_nodes |= docs_batch.existing
+    # Provider nodes the batch writes that a docs edge can target: docs nodes
+    # and filesystem files. Folders are left out: a folder isn't one of the
+    # batch's files, so the snapshot above can't tell a new one from an old one.
+    provider_nodes = {(node["label"], node["name"]) for node in (docs_batch.nodes if docs_batch else [])}
+    if fs_spec is not None and fs_spec.file_label:
+        provider_nodes |= {(fs_spec.file_label, rel) for rel in present}
+
     for rel_path in sorted(by_rel_path):
         index_one(rel_path, by_rel_path[rel_path])
 
@@ -332,7 +702,9 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         py_extractions, js_extractions, cs_extractions, cpp_extractions,
         java_extractions, rs_extractions, kt_extractions, go_extractions,
     ]
-    added_nodes = _batch_nodes(repo_id, root_resolved, code_extractions, docs_files, mention_files) - previous_nodes
+    added_nodes = _batch_nodes(
+        repo_id, root_resolved, code_extractions, docs_files, mention_files, batch_services, provider_nodes,
+    ) - previous_nodes
     referrers = _find_referrers(
         engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path),
         {**java_extractions, **kt_extractions},
@@ -429,14 +801,12 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
         engine.upsert_relationships(service_rels)
 
-    if sync_provider and not schema_pending(engine, repo_id, repo_root):
-        ok, spec = _filesystem_spec(repo_root)
-        if ok and spec is not None:
-            present = {
-                rel for p in paths
-                if _is_provider_file(repo_root, Path(p)) and (rel := _repo_relative(repo_root, Path(p))) is not None
-            }
-            filesystem.sync_present(engine, repo_id, spec, present)
+    if providers_ok and fs_spec is not None:
+        filesystem.sync_present(engine, repo_id, fs_spec, present)
+    if docs_batch:
+        _sync_docs(engine, repo_id, docs_spec, docs_batch)
+        _relink_docs(engine, repo_id, repo_root, docs_spec, added_nodes, set(docs_batch.selected), docs_batch.view)
+        _log_cache_stats()
 
     # Docs notes get the same node-then-edge treatment as the source files
     # above: pass 1 (in the loop) created every note's node, but a note's
@@ -498,6 +868,7 @@ def _index_single_path(
     go_extractions: dict[str, tuple[list[dict], list[dict]]],
     docs_files: list[Path],
     mention_files: list[Path],
+    batch_services: set[tuple[str, str]],
 ) -> int:
     """Extract and upsert one file's graph output, routing by name/extension.
 
@@ -631,10 +1002,12 @@ def _index_single_path(
         indexed += 1
         mention_files.append(resolved)
     if name_lower in _CONTAINERFILE_NAMES:
-        _index_containerfile(engine, repo_id, resolved, rel_path)
+        result = _index_containerfile(engine, repo_id, resolved, rel_path)
+        batch_services |= {("Service", service.name) for service in result.services}
         indexed += 1
     elif name_lower in _COMPOSE_NAMES:
-        _index_compose_file(engine, repo_id, resolved, rel_path)
+        result = _index_compose_file(engine, repo_id, resolved, rel_path)
+        batch_services |= {("Service", service.name) for service in result.services}
         indexed += 1
     return indexed
 
@@ -691,10 +1064,13 @@ def _batch_nodes(
     code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
     docs_files: list[Path],
     mention_files: list[Path],
+    services: set[tuple[str, str]],
+    provider_nodes: set[tuple[str, str]],
 ) -> set[tuple[str, str]]:
     """(label, name) of every file-provenance node this batch wrote: code
-    symbols and Modules, docs notes, and Markdown Document nodes -- the same
-    provenance list_file_nodes snapshots. File-less nodes (a C++ out-of-class
+    symbols and Modules, docs notes, Markdown Document nodes, compose
+    Services and schema-provider nodes -- the same provenance list_file_nodes
+    snapshots. File-less nodes (a C++ out-of-class
     method's Class stub, API handler stubs, other `source`-keyed nodes) are
     left out: they have no provenance to compare against, so they would
     look newly added on every save."""
@@ -709,6 +1085,8 @@ def _batch_nodes(
         result = DocsExtractor(repo_id).extract_from_source(_read_text(path), path.name)
         nodes |= {(doc.label, doc.name) for doc in result.docs}
     nodes |= {("Document", path.relative_to(root).as_posix()) for path in mention_files}
+    nodes |= services
+    nodes |= provider_nodes
     return nodes
 
 
@@ -942,51 +1320,22 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
             cleaned += 1
 
     if not schema_pending(engine, repo_id, repo_root):
-        ok, spec = _filesystem_spec(repo_root)
-        if ok and spec is not None:
-            gone = {rel for p in paths if (rel := _repo_relative(repo_root, Path(p))) is not None and rel != "."}
+        ok, fs_spec, docs_spec = _provider_specs(repo_root)
+        gone = {rel for p in paths if (rel := _repo_relative(repo_root, Path(p))) is not None and rel != "."}
+        if ok and fs_spec is not None:
             filesystem.sync_absent(
-                engine, repo_id, repo_root, spec, gone,
+                engine, repo_id, repo_root, fs_spec, gone,
                 is_indexable=lambda p: _is_provider_file(repo_root, p),
                 is_ignored_dir=is_ignored_dir_name,
             )
+        if ok and docs_spec is not None:
+            _take_over_keys(engine, repo_id, repo_root, docs_spec, sorted(gone))
+            # Nodes (still) at or below the deleted paths, with all their edges.
+            engine.delete_extracted_nodes(repo_id, docs.EXTRACTOR, sorted(gone))
+            if gone:
+                _log_cache_stats()
 
     return cleaned
-
-
-def _is_indexable_file(path: Path) -> bool:
-    """p.is_file(), but a file the OS can't even stat (locked, broken
-    symlink, Windows reparse point) is skipped rather than aborting the
-    whole scan."""
-    try:
-        return path.is_file()
-    except OSError:
-        return False
-
-
-def _indexable_paths(repo_root: Path) -> set[Path]:
-    """Every file under repo_root that a full scan would index: a regular
-    file, not under an ignored directory. Shared by full_scan (which indexes
-    them) and prune_stale_files (which diffs them against the graph)."""
-    return {
-        p for p in repo_root.rglob("*")
-        if _is_indexable_file(p) and not is_ignored_path(p) and not _links_outside(p, repo_root)
-    }
-
-
-def _links_outside(path: Path, repo_root: Path) -> bool:
-    """True for a symlink whose target resolves outside repo_root.
-
-    A symlink whose target cannot be resolved (OSError, e.g. a loop) is also
-    treated as outside, so it is skipped rather than followed.
-    """
-    try:
-        if not path.is_symlink() or is_within(path.resolve(), repo_root):
-            return False
-    except OSError:
-        pass
-    logger.debug("skipping %s: symlink target is outside %s", path, repo_root)
-    return True
 
 
 def prune_stale_files(
@@ -1013,8 +1362,7 @@ def prune_stale_files(
 
     Returns the number of files pruned.
     """
-    # A Windows junction can lead the walk outside the repository; skip those paths.
-    on_disk = {rel for p in _indexable_paths(repo_root) if (rel := _repo_relative(repo_root, p)) is not None}
+    on_disk = {rel for _, rel in _keyed_indexable_paths(repo_root, keep_ignored_targets=True)}
     in_graph = engine.list_indexed_files(repo_id)
     stale = in_graph - on_disk
     if not stale:
@@ -1031,29 +1379,39 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
     prune_stale_files), so a rescan heals stale nodes left by a watcher
     that was down or missed events — not just adds/updates what's current.
     A full scan also applies the project schema (see apply_project_schema),
-    which reconciles filesystem-provider nodes (see providers/filesystem.py).
-    A schema that cannot be applied leaves the repository pending; callers
-    that care check schema_pending afterwards.
+    which reconciles filesystem- and docs-provider nodes (see providers/),
+    and then writes every docs edge once every target node exists. A schema
+    that cannot be applied leaves the repository pending, with no docs edge
+    written; callers that care check schema_pending afterwards.
+
+    The docs read cache forgets the repository first: the scan reads every
+    docs file again, and a schema change is applied this way.
     """
+    docs_cache.forget(repo_root)
     prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
     all_files = _indexable_paths(repo_root)
-    apply_project_schema(engine, repo_id, repo_root)
-    return index_paths(
+    applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)
+    indexed = index_paths(
         engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
         sync_provider=False,  # applied just above
     )
+    if applied:
+        _sync_docs_edges(engine, repo_id, repo_root, applied_docs)
+    return indexed
 
 
-def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> None:
+def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> ExtractionResult:
     content = path.read_text(encoding="utf-8", errors="replace")
     result = ContainerExtractor(repo_id).extract_from_containerfile(content, rel_path)
     _upsert_container_result(engine, repo_id, result)
+    return result
 
 
-def _index_compose_file(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> None:
+def _index_compose_file(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> ExtractionResult:
     content = path.read_text(encoding="utf-8", errors="replace")
     result = ContainerExtractor(repo_id).extract_from_compose_file(content, rel_path)
     _upsert_container_result(engine, repo_id, result)
+    return result
 
 
 def _relationship_dict(rel, repo_id: str) -> dict:

@@ -1,0 +1,95 @@
+name: tests
+
+on:
+  push:
+    branches: [master, "ci/**", "epic1/**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux (with Neo4j)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      neo4j:
+        image: neo4j:5.26-community
+        env:
+          NEO4J_AUTH: neo4j/devgraph-local-dev
+          NEO4J_PLUGINS: "[]"
+          NEO4J_dbms_usage__report_enabled: "false"
+        ports:
+          - 7687:7687
+          - 7474:7474
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p devgraph-local-dev 'RETURN 1'"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 30
+          --health-start-period 10s
+    env:
+      DEVGRAPH_NEO4J_URI: bolt://127.0.0.1:7687
+      DEVGRAPH_NEO4J_USER: neo4j
+      DEVGRAPH_NEO4J_PASSWORD: devgraph-local-dev
+      DEVGRAPH_REQUIRE_NEO4J: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          enable-cache: true
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Run pytest
+        run: uv run pytest -ra
+      - name: Run node harnesses
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in tests/dashboard/*.js; do
+            [ "$(basename "$f")" = config_form_dump.js ] && continue
+            echo "== $f"
+            node "$f"
+          done
+
+  windows:
+    name: Windows (no Neo4j)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          enable-cache: true
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Run pytest
+        run: uv run pytest -ra
+      - name: Run node harnesses
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in tests/dashboard/*.js; do
+            [ "$(basename "$f")" = config_form_dump.js ] && continue
+            echo "== $f"
+            node "$f"
+          done

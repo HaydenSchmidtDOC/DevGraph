@@ -889,7 +889,7 @@ def test_repo_root_replaced_by_a_symlink_is_409(client, registry, tmp_path):
     assert not (real / TOOLS_FILENAME).exists()
 
 
-@pytest.mark.parametrize("kind", ["dir", "fifo"])
+@pytest.mark.parametrize("kind", ["dir", pytest.param("fifo", marks=pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs"))])
 def test_non_regular_target_is_409(client, registry, tmp_path, kind):
     record = _repo(tmp_path, registry)
     target = record.path / TOOLS_FILENAME

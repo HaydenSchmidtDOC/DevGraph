@@ -236,7 +236,11 @@ def test_realistic_deep_document_under_the_bound_loads_identically():
     assert bounded_safe_load(text) == yaml.safe_load(text)
 
 
-@pytest.mark.parametrize("text", [_nested(30_000), "a: " + _nested(300), "{a: " * 5000 + "}" * 5000])
+@pytest.mark.parametrize(
+    "text",
+    [_nested(30_000), "a: " + _nested(300), "{a: " * 5000 + "}" * 5000],
+    ids=["deep-flow", "deep-under-a-key", "deep-mapping"],  # a 30k-char id overflows the Windows environment
+)
 def test_pathological_nesting_is_a_bound_error_not_a_recursion_error(text):
     with pytest.raises(YAMLBoundError, match="levels deep"):
         bounded_safe_load(text)
@@ -269,3 +273,37 @@ def test_aliases_cannot_stack_nesting_past_the_bound():
     text = "[" + ", ".join(items) + "]"
     with pytest.raises(YAMLBoundError, match="levels deep"):
         bounded_safe_load(text)
+
+
+def test_raw_keys_keep_mapping_keys_as_written():
+    loaded = bounded_safe_load("on: a\nyes: b\nno: c\n1: d\nnull: e\ndraft: yes\n", raw_keys=True)
+    assert loaded == {"on": "a", "yes": "b", "no": "c", "1": "d", "null": "e", "draft": True}
+
+
+def test_raw_keys_apply_to_nested_and_merged_mappings():
+    loaded = bounded_safe_load("base: &b {on: 1}\nchild:\n  <<: *b\n  off: 2\n", raw_keys=True)
+    assert loaded["child"] == {"on": 1, "off": 2}
+
+
+def test_raw_keys_refuse_a_non_scalar_key():
+    with pytest.raises(YAMLBoundError, match="mapping key"):
+        bounded_safe_load("? [a, b]\n: c\n", raw_keys=True)
+
+
+def test_default_loading_still_resolves_keys():
+    assert bounded_safe_load("on: a\n") == {True: "a"}
+
+
+def test_raw_keys_let_the_last_duplicate_win():
+    assert bounded_safe_load("a: 1\na: 2\n", raw_keys=True) == {"a": 2}
+
+
+def test_raw_keys_let_an_explicit_key_beat_a_merged_one():
+    loaded = bounded_safe_load("b: &b {x: 1}\nc: {x: 9, <<: *b}\nd: {<<: *b, x: 8}\n", raw_keys=True)
+    assert loaded["c"] == {"x": 9} and loaded["d"] == {"x": 8}
+
+
+def test_raw_keys_keep_the_depth_bound():
+    deep = "a:\n" + "".join("  " * level + "a:\n" for level in range(1, 70)) + "  " * 70 + "x"
+    with pytest.raises(YAMLBoundError, match="nests more than"):
+        bounded_safe_load(deep, raw_keys=True)

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import shutil
 import textwrap
 from contextlib import asynccontextmanager
@@ -561,6 +562,7 @@ def test_a_bad_date_or_deep_nesting_save_keeps_the_last_good_tools(tmp_path, mon
         assert any("keeping the last good tools" in n for n in current["notices"])
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
 def test_a_fifo_tools_file_is_never_opened(tmp_path):
     import os
 

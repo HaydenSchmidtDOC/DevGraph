@@ -1251,6 +1251,232 @@ def test_cli_doctor_skips_drift_when_neo4j_is_unreachable(runner, temp_registry_
     assert "pending" not in collapsed
 
 
+RUNBOOK_SCHEMA = """\
+version: 1
+node_types:
+  - label: Runbook
+    key: [path]
+    metadata:
+      - {name: path}
+      - {name: owner, required: true}
+      - {name: severity, type: integer}
+    source:
+      provider: docs
+      paths: ["runbooks/**/*.md"]
+relationships:
+  - type: RUNBOOK_FOR
+    provider: docs
+    from: Runbook
+    to: Service
+    field: service
+"""
+
+
+def _runbook_repo(tmp_path, files, schema=RUNBOOK_SCHEMA):
+    root = _repo_with_schema(tmp_path, "ops", schema)
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return root
+
+
+def _docs_doctor(runner, temp_registry_db, monkeypatch, root, engine_cls):
+    from devgraph.config import project_switch
+
+    db_path, registry = temp_registry_db
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db_path)
+    registry.add_repo(root)
+    registry.close()
+    return _doctor_with_engine(runner, db_path, engine_cls)
+
+
+def _graph_with(present):
+    """A reachable stub engine whose graph holds `present`: {label: {name, ...}}."""
+    stub = _stub_engine(None)
+
+    class Graph(stub):
+        asked = []
+
+        def existing_node_names(self, repo_id, label, names):
+            Graph.asked.append((label, sorted(names)))
+            return set(names) & present.get(label, set())
+
+    return Graph
+
+
+def _project_schemas_section(stdout):
+    collapsed = _collapsed(stdout)
+    return collapsed[collapsed.index("Project schemas"):collapsed.index("Project tools")]
+
+
+def test_cli_doctor_reports_docs_sources_and_names_problem_files(runner, temp_registry_db, tmp_path, monkeypatch):
+    files = {"runbooks/ok.md": "---\nowner: ops\nservice: api\n---\n"}
+    # seven files with problems: five named, then "and 2 more"
+    for name in "abcdefg":
+        files[f"runbooks/{name}.md"] = "---\nseverity: 1\n---\n"
+    files["runbooks/aa-sev.md"] = "---\nowner: ops\nseverity: high\n---\n"
+    files["runbooks/bad.md"] = "---\nowner: [unclosed\n---\n"
+    files["notes/other.md"] = "---\nowner: ops\n---\n"
+    root = _runbook_repo(tmp_path, files)
+
+    section = _project_schemas_section(
+        _docs_doctor(runner, temp_registry_db, monkeypatch, root, _graph_with({"Service": {"api"}})).stdout
+    )
+
+    assert "Runbook: 10 files match, 2 Runbook entries" in section
+    assert "runbooks/a.md: missing required 'owner'" in section
+    assert "runbooks/bad.md: front matter is not valid YAML" in section
+    # coercion failures are reported too
+    assert "runbooks/aa-sev.md: 'severity' is not a whole number, left blank" in section
+    named = [f"runbooks/{n}.md:" for n in ("a", "aa-sev", "b", "bad", "c", "d", "e", "f", "g")]
+    assert sum(1 for n in named if n in section) == 5
+    assert "and 4 more files with problems" in section
+    assert "notes/other.md" not in section
+    # every value matched a Service, so there is no unmatched-link line
+    assert "matches no" not in section
+
+
+def test_cli_doctor_says_when_no_docs_file_matches(runner, temp_registry_db, tmp_path, monkeypatch):
+    root = _runbook_repo(tmp_path, {"Runbooks/a.md": "---\nowner: ops\n---\n"})
+    section = _project_schemas_section(_docs_doctor(runner, temp_registry_db, monkeypatch, root, _graph_with({})).stdout)
+    assert (
+        "Runbook: no file matches runbooks/**/*.md (matching is case-sensitive; use **/*.md for every folder)"
+        in section
+    )
+
+
+def test_cli_doctor_names_front_matter_values_that_match_no_node(runner, temp_registry_db, tmp_path, monkeypatch):
+    files = {
+        "runbooks/x.md": "---\nowner: ops\nservice: apii\n---\n",
+        "runbooks/y.md": "---\nowner: ops\nservice: [api, worker]\n---\n",
+    }
+    for i in range(6):
+        files[f"runbooks/zz{i}.md"] = f"---\nowner: ops\nservice: gone{i}\n---\n"
+    root = _runbook_repo(tmp_path, files)
+    graph = _graph_with({"Service": {"api"}})
+
+    section = _project_schemas_section(_docs_doctor(runner, temp_registry_db, monkeypatch, root, graph).stdout)
+
+    assert "Runbook: service 'apii' in runbooks/x.md matches no Service" in section
+    assert "Runbook: service 'worker' in runbooks/y.md matches no Service" in section
+    assert "service 'api' in" not in section
+    assert section.count("matches no Service") == 5  # then "and 3 more"
+    assert "Runbook: and 3 more service values that match no Service" in section
+    assert graph.asked and all(label == "Service" for label, _names in graph.asked)
+
+
+def test_cli_doctor_reads_each_matched_file_once(runner, temp_registry_db, tmp_path, monkeypatch):
+    from devgraph.indexer.providers import docs
+
+    root = _runbook_repo(tmp_path, {
+        "runbooks/x.md": "---\nowner: ops\nservice: apii\n---\n",
+        "runbooks/y.md": "---\nowner: ops\nservice: api\n---\n",
+    })
+    reads = []
+    real = docs.read_front_matter
+    monkeypatch.setattr(docs, "read_front_matter", lambda path: reads.append(path.name) or real(path))
+    section = _project_schemas_section(
+        _docs_doctor(runner, temp_registry_db, monkeypatch, root, _graph_with({"Service": {"api"}})).stdout
+    )
+    assert "Runbook: service 'apii' in runbooks/x.md matches no Service" in section
+    assert sorted(reads) == ["x.md", "y.md"]
+
+
+def test_cli_doctor_skips_the_link_check_when_neo4j_is_unreachable(runner, temp_registry_db, tmp_path, monkeypatch):
+    root = _runbook_repo(tmp_path, {"runbooks/x.md": "---\nowner: ops\nservice: apii\n---\n"})
+
+    class Down(_graph_with({})):
+        def verify_connectivity(self):
+            raise RuntimeError("connection refused")
+
+        def existing_node_names(self, repo_id, label, names):
+            raise AssertionError("the graph must not be asked")
+
+    section = _project_schemas_section(_docs_doctor(runner, temp_registry_db, monkeypatch, root, Down).stdout)
+    assert "Runbook: 1 file matches, 1 Runbook entry" in section
+    assert "skipped" in section and "Neo4j is not reachable" in section
+    assert "matches no" not in section
+
+
+ADR_SCHEMA = """\
+version: 1
+node_types:
+  - label: Adr
+    key: [adr_id]
+    metadata:
+      - {name: path}
+      - {name: adr_id}
+      - {name: title}
+    source:
+      provider: docs
+      paths: ["decisions/**/*.md"]
+      fields: {adr_id: id}
+relationships:
+  - type: REPLACES
+    provider: docs
+    from: Adr
+    to: Adr
+    field: supersedes
+"""
+
+
+def test_cli_doctor_names_duplicate_and_missing_ids_and_links_by_path(runner, temp_registry_db, tmp_path, monkeypatch):
+    root = _runbook_repo(tmp_path, {
+        "decisions/adr-012.md": "---\nid: ADR-012\n---\n",
+        "decisions/adr-012 copy.md": "---\nid: ADR-012\n---\n",
+        "decisions/draft.md": "---\ntitle: Draft\n---\n",
+        "decisions/adr-013.md": "---\nid: ADR-013\nsupersedes: decisions/adr-012.md\n---\n",
+        "decisions/adr-014.md": "---\nid: ADR-014\nsupersedes: ADR-012\n---\n",
+    }, schema=ADR_SCHEMA)
+    graph = _graph_with({"Adr": {"ADR-012", "ADR-013", "ADR-014"}})
+
+    section = _project_schemas_section(_docs_doctor(runner, temp_registry_db, monkeypatch, root, graph).stdout)
+
+    assert "Adr: 5 files match, 3 Adr entries, 1 duplicate id" in section
+    assert (
+        "Adr: decisions/adr-012 copy.md: 'id' 'ADR-012' is also used by decisions/adr-012.md, whose path sorts "
+        "first and keeps it; change the id in one of them"
+    ) in section
+    assert "Adr: decisions/draft.md: missing 'id', which names the entry; add an `id:` line" in section
+    assert (
+        "Adr: supersedes 'decisions/adr-012.md' in decisions/adr-013.md matches no Adr "
+        "(Adr entries are named by 'id', not by file path)"
+    ) in section
+    assert "'ADR-012' in decisions/adr-014.md" not in section
+
+
+def test_cli_doctor_works_out_each_repositorys_id_owners_once(runner, temp_registry_db, tmp_path, monkeypatch):
+    from devgraph.indexer.providers import docs
+
+    root = _runbook_repo(tmp_path, {
+        "decisions/adr-012.md": "---\nid: ADR-012\n---\n",
+        "decisions/adr-013.md": "---\nid: ADR-013\nsupersedes: ADR-099\n---\n",
+    }, schema=ADR_SCHEMA)
+    calls = []
+    real = docs.keyed_claims
+    monkeypatch.setattr(docs, "keyed_claims", lambda *args: calls.append(1) or real(*args))
+    graph = _graph_with({"Adr": {"ADR-012", "ADR-013"}})
+    section = _project_schemas_section(_docs_doctor(runner, temp_registry_db, monkeypatch, root, graph).stdout)
+    assert "Adr: supersedes 'ADR-099' in decisions/adr-013.md matches no Adr" in section
+    assert len(calls) == 1
+
+
+def test_cli_doctor_prints_no_docs_lines_without_docs_sources(runner, temp_registry_db, tmp_path, monkeypatch):
+    root = _runbook_repo(tmp_path, {"runbooks/x.md": "---\nowner: ops\n---\n"}, schema=WIDGET_SCHEMA)
+    section = _project_schemas_section(
+        _docs_doctor(runner, temp_registry_db, monkeypatch, root, _graph_with({})).stdout
+    )
+    assert "files match" not in section and "no file matches" not in section
+    assert "skipped" not in section and "Runbook" not in section
+
+
+def test_cli_doctor_escapes_repository_file_names(runner, temp_registry_db, tmp_path, monkeypatch):
+    root = _runbook_repo(tmp_path, {"runbooks/[red]x[/red].md": "---\nseverity: 1\n---\n"})
+    section = _project_schemas_section(_docs_doctor(runner, temp_registry_db, monkeypatch, root, _graph_with({})).stdout)
+    assert "runbooks/[red]x[/red].md: missing required 'owner'" in section
+
+
 def test_cli_list_shows_the_project_config_switch(runner, temp_registry_db, tmp_path):
     db_path, registry = temp_registry_db
     on = registry.add_repo(_repo_with_schema(tmp_path, "on")).repo_id
@@ -1445,6 +1671,75 @@ def test_cli_doctor_reports_a_missing_or_blocked_generated_constraint(runner, te
     assert f"devgraph rescan {missing} --now" in doctor
 
 
+def test_cli_doctor_reports_a_key_conflict_between_repositories(runner, temp_registry_db, stale_label):
+    engine, label, _name = stale_label  # constraint on (repo_id, slug)
+    db_path, registry = temp_registry_db
+    registry.close()
+    keyed, declaring = f"_smoketest_keyed_{label.lower()}", f"_smoketest_declaring_{label.lower()}"
+    try:
+        engine.upsert_repository(keyed, keyed, "/tmp/keyed")
+        engine.record_applied_schema(keyed, "sha256:x", [label], [], [f"{label}:code"])
+        engine.upsert_repository(declaring, declaring, "/tmp/declaring")
+        engine.record_applied_schema(declaring, "sha256:x", [label], [], [f"{label}:slug"])
+        doctor = _collapsed(_invoke_live(runner, db_path, ["doctor"]).stdout)
+    finally:
+        engine.delete_repository(keyed)
+        engine.delete_repository(declaring)
+    assert (
+        f"{keyed}: {label}: this repository identifies entries by code, but the database's uniqueness rule "
+        f"still uses slug because {declaring} identifies them differently (by slug). Make every repository "
+        f"that uses the {label} type agree, then rescan."
+    ) in doctor
+
+
+def test_cli_doctor_names_a_third_key_and_an_unrecorded_one_in_a_key_conflict(runner, temp_registry_db, stale_label):
+    engine, label, _name = stale_label  # constraint on (repo_id, slug), which nobody declares
+    db_path, registry = temp_registry_db
+    registry.close()
+    keyed, third, unknown = (f"_smoketest_{word}_{label.lower()}" for word in ("keyed", "third", "unknown"))
+    try:
+        engine.upsert_repository(keyed, keyed, "/tmp/keyed")
+        engine.record_applied_schema(keyed, "sha256:x", [label], [], [f"{label}:code"])
+        engine.upsert_repository(third, third, "/tmp/third")
+        engine.record_applied_schema(third, "sha256:x", [label], [], [f"{label}:rfc_id"])
+        engine.upsert_repository(unknown, unknown, "/tmp/unknown")
+        engine.record_applied_schema(unknown, "sha256:x", [label], [], [])
+        doctor = _collapsed(_invoke_live(runner, db_path, ["doctor"]).stdout)
+    finally:
+        for repo in (keyed, third, unknown):
+            engine.delete_repository(repo)
+    assert (
+        f"{keyed}: {label}: this repository identifies entries by code, but the database's uniqueness rule "
+        f"still uses slug because {third} identifies them differently (by rfc_id) and {unknown} hasn't recorded "
+        f"how. Make every repository that uses the {label} type agree, then rescan."
+    ) in doctor
+
+
+def test_cli_doctor_says_a_label_spelled_differently_is_the_conflict(runner, temp_registry_db, stale_label):
+    # Same key, label differing only in case: realign_keys still won't replace
+    # the constraint, so this is a conflict, but not one of identification.
+    engine, label, _name = stale_label  # constraint on (repo_id, slug)
+    db_path, registry = temp_registry_db
+    registry.close()
+    keyed, spelled = f"_smoketest_keyed_{label.lower()}", f"_smoketest_spelled_{label.lower()}"
+    shouted = label.upper()
+    try:
+        engine.upsert_repository(keyed, keyed, "/tmp/keyed")
+        engine.record_applied_schema(keyed, "sha256:x", [label], [], [f"{label}:code"])
+        engine.upsert_repository(spelled, spelled, "/tmp/spelled")
+        engine.record_applied_schema(spelled, "sha256:x", [shouted], [], [f"{shouted}:code"])
+        doctor = _collapsed(_invoke_live(runner, db_path, ["doctor"]).stdout)
+    finally:
+        engine.delete_repository(keyed)
+        engine.delete_repository(spelled)
+    assert (
+        f"{keyed}: {label}: this repository identifies entries by code, but the database's uniqueness rule "
+        f"still uses slug because {spelled} spells the type '{shouted}'. Make every repository "
+        f"that uses the {label} type agree, then rescan."
+    ) in doctor
+    assert f"{spelled} identifies them differently" not in doctor
+
+
 def test_cli_dashboard_url_points_a_wildcard_bind_at_loopback(runner, temp_registry_db):
     """A wildcard bind address is refused by the dashboard's Host guard, so
     the printed URL must be the loopback address the server listens on."""
@@ -1510,7 +1805,7 @@ def test_claude_mcp_add_passes_safe_path_flag(tmp_path):
         assert cli_main._run_claude_mcp_add("/usr/bin/claude", Path("/venv/bin/python"), tmp_path)
 
     add_cmd = mock_run.call_args_list[-1].args[0]
-    assert add_cmd[add_cmd.index("--") + 1:] == ["/venv/bin/python", "-P", "-m", "devgraph.mcp.server"]
+    assert add_cmd[add_cmd.index("--") + 1:] == [str(Path("/venv/bin/python")), "-P", "-m", "devgraph.mcp.server"]
 
 
 def _write_shadow_package(workdir: Path, marker: str) -> None:

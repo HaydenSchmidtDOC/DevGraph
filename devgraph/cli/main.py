@@ -17,13 +17,13 @@ from typing import Any, Optional
 import click
 import typer
 from rich.console import Console
-from rich.markup import escape
 from rich.table import Table
 from typer.core import TyperGroup
 
 from devgraph.agent import lifecycle
 from devgraph.cli._env import resolve_podman, resolve_repo_root, resolve_venv_python
 from devgraph.cli.exporters import export_cypher, export_dot, export_json
+from devgraph.cli.markup import escape
 from devgraph.config import get_settings
 from devgraph.config.edits import GLOBAL_TOOLS_NOTE as _GLOBAL_TOOLS_NOTE
 from devgraph.config.edits import SCHEMA_SECTIONS as _SCHEMA_SECTIONS
@@ -47,7 +47,7 @@ app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
 MCP_SERVER_ARGS = ("-P", "-m", "devgraph.mcp.server")
 tray_app = typer.Typer(help="Manage the DevGraph tray app (live watcher + incremental indexer) as a background process.")
 app.add_typer(tray_app, name="tray")
-console = Console()
+console = Console(emoji=False)
 
 
 def _get_registry() -> RepoRegistry:
@@ -77,11 +77,11 @@ def add(
             resolved = Path(path).resolve()
             existing = next((r for r in registry.list_repos() if r.path == resolved), None)
             if existing is not None:
-                console.print(f"[green][OK][/green] Already registered: {existing.repo_id} at {existing.path}")
+                console.print(f"[green][OK][/green] Already registered: {escape(existing.repo_id)} at {escape(str(existing.path))}")
                 return
             record = registry.add_repo(path)
             console.print(
-                f"[green][OK][/green] Registered: {record.repo_id} at {record.path}"
+                f"[green][OK][/green] Registered: {escape(record.repo_id)} at {escape(str(record.path))}"
             )
 
             try:
@@ -100,8 +100,8 @@ def add(
                             console.print(f"[green][OK][/green] Indexed {result['commits_indexed']} commit(s)")
                         except Exception as e:
                             console.print(
-                                f"[yellow]Full scan complete but history indexing failed:[/yellow] {e}\n"
-                                f"  Run 'devgraph index-history {record.repo_id}' to retry."
+                                f"[yellow]Full scan complete but history indexing failed:[/yellow] {escape(str(e))}\n"
+                                f"  Run 'devgraph index-history {escape(record.repo_id)}' to retry."
                             )
                 finally:
                     engine.close()
@@ -110,16 +110,16 @@ def add(
                 # indexing failure (e.g. Neo4j unreachable) shouldn't undo that.
                 # `devgraph rescan <repo_id>` retries the scan once Neo4j is up.
                 console.print(
-                    f"[yellow]Registered but initial scan failed:[/yellow] {e}\n"
-                    f"  Run 'devgraph rescan {record.repo_id}' once Neo4j is reachable."
+                    f"[yellow]Registered but initial scan failed:[/yellow] {escape(str(e))}\n"
+                    f"  Run 'devgraph rescan {escape(record.repo_id)}' once Neo4j is reachable."
                 )
         finally:
             registry.close()
     except ValueError as e:
-        console.print(f"[red][X] Error:[/red] {e}")
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
     except Exception as e:
-        console.print(f"[red][X] Unexpected error:[/red] {e}")
+        console.print(f"[red][X] Unexpected error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
 
@@ -146,14 +146,14 @@ def remove(repo_id: str) -> None:
                 engine.close()
 
             registry.remove_repo(repo_id)
-            console.print(f"[green][OK][/green] Removed: {repo_id} (registry entry and graph data)")
+            console.print(f"[green][OK][/green] Removed: {escape(repo_id)} (registry entry and graph data)")
         finally:
             registry.close()
     except ValueError as e:
-        console.print(f"[red][X] Error:[/red] {e}")
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
     except Exception as e:
-        console.print(f"[red][X] Unexpected error:[/red] {e}")
+        console.print(f"[red][X] Unexpected error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
 
@@ -164,9 +164,9 @@ def _release_labels(engine: GraphEngine, labels: list[str]) -> None:
 
     try:
         for name in release_labels(engine, labels):
-            console.print(f"[green][OK][/green] Dropped {name} (no repository declares it any more)")
+            console.print(f"[green][OK][/green] Dropped {escape(name)} (no repository declares it any more)")
     except Exception as e:
-        console.print(f"[yellow]Warning:[/yellow] could not drop unused schema constraints: {e}")
+        console.print(f"[yellow]Warning:[/yellow] could not drop unused schema constraints: {escape(str(e))}")
 
 
 @app.command(name="list")
@@ -204,12 +204,12 @@ def list_repos() -> None:
                 watch_str = "[OK]" if repo.watch_enabled else "[X]"
                 last_indexed = repo.last_indexed or "-"
                 table.add_row(
-                    repo.repo_id,
-                    str(repo.path),
+                    escape(repo.repo_id),
+                    escape(str(repo.path)),
                     active_str,
                     watch_str,
                     "on" if repo.project_config_enabled else "off",
-                    last_indexed,
+                    escape(str(last_indexed)),
                 )
 
             console.print(table)
@@ -218,11 +218,11 @@ def list_repos() -> None:
             if repo_issues:
                 console.print("\n[bold]⚠️  Repository Issues[/bold]")
                 for repo_id, error_msg in repo_issues.items():
-                    console.print(f"  [yellow]{repo_id}:[/yellow] {error_msg}")
+                    console.print(f"  [yellow]{escape(str(repo_id))}:[/yellow] {escape(str(error_msg))}")
         finally:
             registry.close()
     except Exception as e:
-        console.print(f"[red][X] Error:[/red] {e}")
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
 
@@ -262,7 +262,7 @@ def rescan(
         try:
             repo = registry.get(repo_id)
             if not repo:
-                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
                 raise typer.Exit(code=1)
 
             settings = get_settings()
@@ -272,7 +272,7 @@ def rescan(
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
                 count = full_scan(engine, repo_id, repo.path, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled)
                 registry.mark_indexed(repo_id)
-                console.print(f"[green][OK][/green] Rescanned {repo_id}: {count} file(s) indexed")
+                console.print(f"[green][OK][/green] Rescanned {escape(repo_id)}: {count} file(s) indexed")
 
                 # Always reconcile git history on a rescan — not just with
                 # --full. sync_git_history is a cheap no-op when HEAD hasn't
@@ -291,8 +291,8 @@ def rescan(
                         )
                 except Exception as e:
                     console.print(
-                        f"[yellow]Rescan complete but history indexing failed:[/yellow] {e}\n"
-                        f"  Run 'devgraph index-history {repo_id}' to retry."
+                        f"[yellow]Rescan complete but history indexing failed:[/yellow] {escape(str(e))}\n"
+                        f"  Run 'devgraph index-history {escape(repo_id)}' to retry."
                     )
             finally:
                 engine.close()
@@ -301,7 +301,7 @@ def rescan(
     except typer.Exit:
         raise
     except Exception as e:
-        console.print(f"[red][X] Error:[/red] {e}")
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
 
@@ -322,7 +322,7 @@ def insights(repo_id: str) -> None:
         registry = _get_registry()
         try:
             if registry.get(repo_id) is None:
-                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
                 raise typer.Exit(code=1)
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
@@ -335,10 +335,10 @@ def insights(repo_id: str) -> None:
     except typer.Exit:
         raise
     except Exception as e:
-        console.print(f"[red][X] Error:[/red] {e}")
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
     console.print(
-        f"[green][OK][/green] Insights for {repo_id}: {summary['community_count']} communities "
+        f"[green][OK][/green] Insights for {escape(repo_id)}: {summary['community_count']} communities "
         f"(modularity {summary['modularity']:.2f}) over {summary['node_count']} nodes"
     )
 
@@ -360,21 +360,21 @@ def watch(action: str, repo_id: str) -> None:
         try:
             repo = registry.get(repo_id)
             if not repo:
-                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
                 raise typer.Exit(code=1)
 
             if action == "enable":
                 registry.enable_watch(repo_id)
-                console.print(f"[green][OK][/green] Watch enabled for {repo_id}")
+                console.print(f"[green][OK][/green] Watch enabled for {escape(repo_id)}")
             else:
                 registry.disable_watch(repo_id)
-                console.print(f"[green][OK][/green] Watch disabled for {repo_id}")
+                console.print(f"[green][OK][/green] Watch disabled for {escape(repo_id)}")
         finally:
             registry.close()
     except typer.Exit:
         raise
     except Exception as e:
-        console.print(f"[red][X] Error:[/red] {e}")
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
 
@@ -421,7 +421,7 @@ def tray_stop() -> None:
         os.kill(pid, signal.SIGTERM)
         console.print(f"[green][OK][/green] Sent stop signal to tray app (pid {pid})")
     except OSError as e:
-        console.print(f"[red][X] Error:[/red] failed to stop pid {pid}: {e}")
+        console.print(f"[red][X] Error:[/red] failed to stop pid {pid}: {escape(str(e))}")
         raise typer.Exit(code=1)
     finally:
         lifecycle.tray_pid_path().unlink(missing_ok=True)
@@ -459,12 +459,12 @@ def annotate(
         try:
             repo = registry.get(repo_id)
             if not repo:
-                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
                 raise typer.Exit(code=1)
 
             if docs_path is not None:
                 registry.set_docs_path(repo_id, docs_path)
-                console.print(f"[green][OK][/green] Docs path set for {repo_id}: {docs_path}")
+                console.print(f"[green][OK][/green] Docs path set for {escape(repo_id)}: {escape(docs_path)}")
 
             if note is not None:
                 note_path = repo.path / note
@@ -479,21 +479,21 @@ def annotate(
                 try:
                     engine.init_schema()
                     index_doc_file(engine, repo_id, note_path)
-                    console.print(f"[green][OK][/green] Indexed note: {note}")
+                    console.print(f"[green][OK][/green] Indexed note: {escape(note)}")
                 finally:
                     engine.close()
 
             if docs_path is None and note is None:
-                console.print(f"docs_path: {repo.docs_path or '(not set)'}")
+                console.print(f"docs_path: {escape(str(repo.docs_path or '(not set)'))}")
         finally:
             registry.close()
     except typer.Exit:
         raise
     except (ValueError, FileNotFoundError) as e:
-        console.print(f"[red][X] Error:[/red] {e}")
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
     except Exception as e:
-        console.print(f"[red][X] Unexpected error:[/red] {e}")
+        console.print(f"[red][X] Unexpected error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
 
@@ -517,7 +517,7 @@ def index_history(
         try:
             repo = registry.get(repo_id)
             if not repo:
-                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
                 raise typer.Exit(code=1)
 
             settings = get_settings()
@@ -525,7 +525,7 @@ def index_history(
             try:
                 engine.init_schema()
                 result = sync_git_history(engine, registry, repo_id, max_count=max_count)
-                console.print(f"[green][OK][/green] Indexed {result['commits_indexed']} new commit(s) for {repo_id}")
+                console.print(f"[green][OK][/green] Indexed {result['commits_indexed']} new commit(s) for {escape(repo_id)}")
             finally:
                 engine.close()
         finally:
@@ -533,10 +533,10 @@ def index_history(
     except typer.Exit:
         raise
     except ValueError as e:
-        console.print(f"[red][X] Error:[/red] {e}")
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
     except Exception as e:
-        console.print(f"[red][X] Unexpected error:[/red] {e}")
+        console.print(f"[red][X] Unexpected error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
 
@@ -592,7 +592,7 @@ def _set_external_source_flag(repo_id: str, action: str, setter_flag: str, label
         try:
             repo = registry.get(repo_id)
             if not repo:
-                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
                 raise typer.Exit(code=1)
 
             enabled = action == "enable"
@@ -604,13 +604,13 @@ def _set_external_source_flag(repo_id: str, action: str, setter_flag: str, label
                 registry.set_mentions_enabled(repo_id, enabled)
 
             verb = "enabled" if enabled else "disabled"
-            console.print(f"[green][OK][/green] {label} {verb} for {repo_id}")
+            console.print(f"[green][OK][/green] {label} {verb} for {escape(repo_id)}")
         finally:
             registry.close()
     except typer.Exit:
         raise
     except Exception as e:
-        console.print(f"[red][X] Error:[/red] {e}")
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
 
@@ -645,9 +645,9 @@ def status() -> None:
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
     try:
         engine.verify_connectivity()
-        console.print(f"  [green][OK] Reachable[/green] at {settings.neo4j_uri}")
+        console.print(f"  [green][OK] Reachable[/green] at {escape(str(settings.neo4j_uri))}")
     except Exception as e:
-        console.print(f"  [red][X] Not reachable:[/red] {e}")
+        console.print(f"  [red][X] Not reachable:[/red] {escape(str(e))}")
     finally:
         engine.close()
 
@@ -663,7 +663,7 @@ def status() -> None:
         finally:
             registry.close()
     except Exception as e:
-        console.print(f"  [red]Error:[/red] {e}")
+        console.print(f"  [red]Error:[/red] {escape(str(e))}")
 
     # Live watcher (tray app) liveness
     console.print("[bold]Live Watcher[/bold]")
@@ -684,7 +684,7 @@ def status() -> None:
             if issues:
                 console.print("[bold]⚠️  Repository Issues[/bold]")
                 for repo_id, error_msg in issues.items():
-                    console.print(f"  [yellow]{repo_id}:[/yellow] {error_msg}")
+                    console.print(f"  [yellow]{escape(str(repo_id))}:[/yellow] {escape(str(error_msg))}")
         except Exception:
             pass
 
@@ -861,6 +861,55 @@ def _schema_drift_findings(engine: Any, repos: list[Any]) -> list[dict[str, Any]
     return findings
 
 
+def _docs_source_findings(repos: list[Any], engine: Any) -> list[dict[str, Any]]:
+    """Doctor lines for each repository's node types sourced from Markdown front matter.
+
+    Per repository whose valid, enabled schema has docs sources: how many
+    files match and become entries, and which files have problems
+    (`docs.source_report`). Front-matter values that name no node are a graph
+    question: they are checked when `engine` is given, else reported skipped.
+    """
+    from devgraph.config.project_schema import ProjectSchemaError, resolve_effective_schema
+    from devgraph.indexer import walk
+    from devgraph.indexer.providers import docs
+
+    findings: list[dict[str, Any]] = []
+    for repo in sorted(repos, key=lambda r: r.repo_id):
+        try:
+            effective = resolve_effective_schema(repo.path)
+        except ProjectSchemaError:
+            continue  # reported above as invalid
+        spec = docs.docs_spec(effective)
+        if spec is None:
+            continue
+
+        def add(status: str, detail: str, repo_id: str = repo.repo_id) -> None:
+            findings.append({"repo_id": repo_id, "status": status, "detail": detail})
+
+        try:
+            files = walk.indexable_paths(repo.path)
+            # each matched file is read once, for both the report and the links
+            selected = docs.read_selected(spec, docs.files_by_rel(repo.path, files))
+            claims = docs.keyed_claims(spec, selected)
+            for line in docs.source_report(repo.path, effective, files, selected=selected, claims=claims):
+                add(line["status"], line["detail"])
+            if not spec.relationships:
+                continue
+            if engine is None:
+                add("skipped", "links named in front matter not checked: Neo4j is not reachable")
+                continue
+            edges = docs.build_edges(spec, repo.repo_id, selected, owners=docs.keyed_owners(claims))
+            present = {
+                label: engine.existing_node_names(repo.repo_id, label, names)
+                for label, names in docs.edge_targets(edges).items()
+            }
+            for line in docs.unmatched_report(spec, edges, present):
+                add(line["status"], line["detail"])
+        except Exception as exc:
+            add("warning", f"could not check the Markdown front-matter sources: {exc}")
+    return findings
+
+
 @app.command()
 def doctor() -> None:
     """Run a heavier environment-drift diagnostic than `status`.
@@ -880,14 +929,14 @@ def doctor() -> None:
     console.print("[bold]Python[/bold]")
     py_ok = sys.version_info >= (3, 13)
     marker = "[green][OK][/green]" if py_ok else "[red][X][/red]"
-    console.print(f"  {marker} {sys.version.split()[0]} ({sys.executable})")
+    console.print(f"  {marker} {sys.version.split()[0]} ({escape(str(sys.executable))})")
     any_failed = any_failed or not py_ok
 
     # 2. mcp package version
     console.print("[bold]mcp package[/bold]")
     try:
         mcp_version = importlib.metadata.version("mcp")
-        console.print(f"  [green][OK][/green] mcp {mcp_version} (pyproject.toml requires >=2.0)")
+        console.print(f"  [green][OK][/green] mcp {escape(mcp_version)} (pyproject.toml requires >=2.0)")
     except importlib.metadata.PackageNotFoundError:
         console.print("  [red][X] Not installed[/red]")
         any_failed = True
@@ -899,7 +948,7 @@ def doctor() -> None:
 
         console.print("  [green][OK][/green] devgraph.mcp.server.build_server imports cleanly")
     except Exception as e:
-        console.print(f"  [red][X] Import failed:[/red] {e}")
+        console.print(f"  [red][X] Import failed:[/red] {escape(str(e))}")
         any_failed = True
 
     # 3b. Indexer extractors importability smoke check
@@ -909,11 +958,11 @@ def doctor() -> None:
 
         console.print("  [green][OK][/green] devgraph.indexer.dispatch imports cleanly (all language extractors)")
     except ModuleNotFoundError as e:
-        console.print(f"  [red][X] Missing dependency:[/red] {e}")
+        console.print(f"  [red][X] Missing dependency:[/red] {escape(str(e))}")
         console.print("       Run `pip install -e '.[dev]'` to install all declared grammars.")
         any_failed = True
     except Exception as e:
-        console.print(f"  [red][X] Import failed:[/red] {e}")
+        console.print(f"  [red][X] Import failed:[/red] {escape(str(e))}")
         any_failed = True
 
     # 4 & 5. Neo4j reachability + schema
@@ -923,15 +972,15 @@ def doctor() -> None:
     try:
         engine.verify_connectivity()
         neo4j_reachable = True
-        console.print(f"  [green][OK] Reachable[/green] at {settings.neo4j_uri}")
+        console.print(f"  [green][OK] Reachable[/green] at {escape(str(settings.neo4j_uri))}")
         try:
             engine.init_schema()
             console.print("  [green][OK][/green] Schema present (init_schema is idempotent)")
         except Exception as e:
-            console.print(f"  [red][X] Schema init failed:[/red] {e}")
+            console.print(f"  [red][X] Schema init failed:[/red] {escape(str(e))}")
             any_failed = True
     except Exception as e:
-        console.print(f"  [red][X] Not reachable:[/red] {e}")
+        console.print(f"  [red][X] Not reachable:[/red] {escape(str(e))}")
         any_failed = True
     finally:
         engine.close()
@@ -952,9 +1001,9 @@ def doctor() -> None:
             if not output:
                 console.print("  [yellow]devgraph-neo4j container not found[/yellow]")
             else:
-                console.print(f"  [green][OK][/green] {output}")
+                console.print(f"  [green][OK][/green] {escape(output)}")
         except Exception as e:
-            console.print(f"  [red][X] podman ps failed:[/red] {e}")
+            console.print(f"  [red][X] podman ps failed:[/red] {escape(str(e))}")
             any_failed = True
 
     # 7. Registry reachability
@@ -964,11 +1013,11 @@ def doctor() -> None:
         registry = _get_registry()
         try:
             registered_repos = registry.list_repos()
-            console.print(f"  [green][OK][/green] {len(registered_repos)} repo(s) registered at {settings.registry_db_path}")
+            console.print(f"  [green][OK][/green] {len(registered_repos)} repo(s) registered at {escape(str(settings.registry_db_path))}")
         finally:
             registry.close()
     except Exception as e:
-        console.print(f"  [red][X] Registry error:[/red] {e}")
+        console.print(f"  [red][X] Registry error:[/red] {escape(str(e))}")
         any_failed = True
 
     # 7b. Per-repository project schemas. Filesystem-only, and reuses the list
@@ -979,14 +1028,29 @@ def doctor() -> None:
     if not schema_findings:
         console.print("  [green][OK][/green] no registered repositories to check")
     for finding in schema_findings:
-        subject = finding["repo_id"] or "conflict"
+        subject = escape(str(finding["repo_id"] or "conflict"))
         if finding["status"] == "disabled":
-            console.print(f"  [yellow][!] {escape(str(subject))}:[/yellow] {escape(finding['detail'])}")
+            console.print(f"  [yellow][!] {subject}:[/yellow] {escape(finding['detail'])}")
         elif finding["failed"]:
-            console.print(f"  [red][X] {escape(str(subject))}:[/red] {escape(finding['detail'])}")
+            console.print(f"  [red][X] {subject}:[/red] {escape(finding['detail'])}")
             any_failed = True
         else:
-            console.print(f"  [green][OK][/green] {escape(str(subject))}: {escape(finding['detail'])}")
+            console.print(f"  [green][OK][/green] {subject}: {escape(finding['detail'])}")
+    # Markdown front-matter sources: links are checked against the graph only when it is up.
+    docs_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password) if neo4j_reachable else None
+    try:
+        docs_findings = _docs_source_findings(registered_repos, docs_engine)
+    finally:
+        if docs_engine is not None:
+            docs_engine.close()
+    for finding in docs_findings:
+        subject, detail = escape(str(finding["repo_id"])), escape(finding["detail"])
+        if finding["status"] == "ok":
+            console.print(f"  [green][OK][/green] {subject}: {detail}", soft_wrap=True)
+        elif finding["status"] == "skipped":
+            console.print(f"  [yellow]skipped[/yellow] {subject}: {detail}", soft_wrap=True)
+        else:
+            console.print(f"  [yellow][!] {subject}:[/yellow] {detail}", soft_wrap=True)
 
     console.print("[bold]Project tools[/bold]")
     tools_findings = _project_tools_findings(registered_repos)
@@ -1040,12 +1104,16 @@ def doctor() -> None:
     if not neo4j_reachable:
         console.print("  [yellow]skipped[/yellow]: Neo4j is not reachable")
     else:
-        from devgraph.indexer.schema_constraints import constraint_drift
+        from devgraph.indexer.schema_constraints import constraint_drift, recorded_declarations
 
         constraint_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+        recorded_keys: dict[tuple[str, str], tuple[str, tuple[str, ...] | None]] = {}
         try:
             stale = _stale_schema_objects(constraint_engine, registered_repos)
             drift = constraint_drift(constraint_engine)
+            if any(finding["status"] == "conflict" for finding in drift):
+                for folded, entries in recorded_declarations(constraint_engine).items():
+                    recorded_keys.update(((repo, folded), (label, key)) for repo, label, key in entries)
         except Exception as e:
             stale = drift = None
             console.print(f"  [yellow][!][/yellow] could not check: {escape(str(e))}")
@@ -1065,13 +1133,31 @@ def doctor() -> None:
             if finding["status"] == "missing":
                 detail = (
                     f"applied {label} has no uniqueness constraint; re-provision with "
-                    f"`devgraph rescan {finding['repo_id']} --now`"
+                    f"`devgraph rescan {subject} --now`"
+                )
+            elif finding["status"] == "conflict":
+                # each disagreeing repository with its own recorded key (None when unknown);
+                # one with the same key spells the label differently (realign_keys
+                # weighs the label's exact spelling too)
+                reasons = []
+                for other in finding["declared_by"]:
+                    other_label, other_key = recorded_keys.get((other, finding["label"].casefold()), (None, None))
+                    if other_key is None:
+                        reasons.append(f"{escape(other)} hasn't recorded how")
+                    elif tuple(other_key) == tuple(finding["key"]):
+                        reasons.append(f"{escape(other)} spells the type '{escape(other_label)}'")
+                    else:
+                        reasons.append(f"{escape(other)} identifies them differently (by {escape(', '.join(other_key))})")
+                detail = (
+                    f"{label}: this repository identifies entries by {key}, but the database's uniqueness rule "
+                    f"still uses {escape(', '.join(finding['constraint_key']))} because {' and '.join(reasons)}. "
+                    f"Make every repository that uses the {label} type agree, then rescan."
                 )
             else:
                 detail = (
                     f"key change blocked by duplicate nodes: {label} nodes share a (repo_id, {key}) value, "
                     f"so the constraint keeps its old key; remove the duplicates, then "
-                    f"`devgraph rescan {finding['repo_id']} --now`"
+                    f"`devgraph rescan {subject} --now`"
                 )
             console.print(f"  [yellow][!] {subject}:[/yellow] {detail}", soft_wrap=True)
 
@@ -1124,7 +1210,7 @@ def _register_vscode(python_path: Path, repo_root: Path) -> bool:
         else:
             data = {}
     except (OSError, json.JSONDecodeError) as exc:
-        console.print(f"[red][X] Error:[/red] could not read {config_path}: {exc}")
+        console.print(f"[red][X] Error:[/red] could not read {escape(str(config_path))}: {escape(str(exc))}")
         return False
 
     data.setdefault("servers", {})
@@ -1139,10 +1225,10 @@ def _register_vscode(python_path: Path, repo_root: Path) -> bool:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
-        console.print(f"[red][X] Error:[/red] could not write {config_path}: {exc}")
+        console.print(f"[red][X] Error:[/red] could not write {escape(str(config_path))}: {escape(str(exc))}")
         return False
 
-    console.print(f"[green][OK][/green] VS Code: registered 'devgraph' in {config_path}")
+    console.print(f"[green][OK][/green] VS Code: registered 'devgraph' in {escape(str(config_path))}")
     return True
 
 
@@ -1157,7 +1243,7 @@ def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path) ->
         console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
         return True
     mcp_add_line = f'claude mcp add devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
-    console.print(f"\n[bold]Running:[/bold] {mcp_add_line}")
+    console.print(f"\n[bold]Running:[/bold] {escape(mcp_add_line)}")
     result = subprocess.run(
         [claude_path, "mcp", "add", "devgraph", "--", str(python_path), *MCP_SERVER_ARGS],
         cwd=str(repo_root),
@@ -1203,13 +1289,13 @@ def mcp_doctor() -> None:
         console.print("[red][X][/red] 'claude' CLI not found on PATH")
         any_failed = True
     else:
-        console.print(f"[green][OK][/green] claude CLI at {claude_path}")
+        console.print(f"[green][OK][/green] claude CLI at {escape(claude_path)}")
         result = subprocess.run(
             [claude_path, "mcp", "get", "devgraph"], capture_output=True, text=True
         )
         if result.returncode == 0:
             console.print("[green][OK][/green] 'devgraph' registered")
-            console.print(result.stdout.strip())
+            console.print(escape(result.stdout.strip()))
         else:
             console.print("[red][X][/red] 'devgraph' not registered (run 'devgraph mcp add')")
             any_failed = True
@@ -1219,7 +1305,7 @@ def mcp_doctor() -> None:
 
         console.print("[green][OK][/green] devgraph.mcp.server imports cleanly")
     except Exception as e:
-        console.print(f"[red][X] Import failed:[/red] {e}")
+        console.print(f"[red][X] Import failed:[/red] {escape(str(e))}")
         any_failed = True
 
     if any_failed:
@@ -1246,7 +1332,7 @@ def client_config(
     client repo's docs instead of a fixed path that only works on one machine.
     """
     if target not in ("claude", "vscode", "both"):
-        console.print(f"[red][X] Error:[/red] --target must be 'claude', 'vscode', or 'both' (got '{target}')")
+        console.print(f"[red][X] Error:[/red] --target must be 'claude', 'vscode', or 'both' (got '{escape(target)}')")
         raise typer.Exit(code=1)
 
     python_path = resolve_venv_python()
@@ -1256,20 +1342,20 @@ def client_config(
     want_vscode = target in ("vscode", "both")
 
     if claude_mcp_add_only:
-        console.print(mcp_add_line, soft_wrap=True)
+        console.print(escape(mcp_add_line), soft_wrap=True)
     else:
         console.print("## Connect DevGraph as an MCP server\n")
-        console.print(f"- **command**: {python_path}")
+        console.print(f"- **command**: {escape(str(python_path))}")
         console.print(f"- **args**: {' '.join(MCP_SERVER_ARGS)}")
-        console.print(f"- **cwd**: {repo_root}\n")
+        console.print(f"- **cwd**: {escape(str(repo_root))}\n")
         if want_claude:
             console.print("```bash")
-            console.print(mcp_add_line, soft_wrap=True)
+            console.print(escape(mcp_add_line), soft_wrap=True)
             console.print("```")
         if want_vscode:
-            console.print(f"\nVS Code (user mcp.json at {_vscode_mcp_config_path()}):")
+            console.print(f"\nVS Code (user mcp.json at {escape(str(_vscode_mcp_config_path()))}):")
             console.print("```json")
-            console.print(json.dumps(
+            console.print(escape(json.dumps(
                 {"servers": {"devgraph": {
                     "type": "stdio",
                     "command": str(python_path),
@@ -1277,7 +1363,7 @@ def client_config(
                     "cwd": str(repo_root),
                 }}},
                 indent=2,
-            ))
+            )))
             console.print("```")
 
     if run:
@@ -1314,7 +1400,7 @@ def version() -> None:
                 ver = "unknown"
         except Exception:
             ver = "unknown"
-    console.print(ver)
+    console.print(escape(str(ver)))
 
 
 @app.command()
@@ -1337,12 +1423,12 @@ def dashboard(
         console.print("  Start it with: devgraph tray start")
 
     if url_only:
-        console.print(url)
+        console.print(escape(url))
     elif open_browser:
-        console.print(f"Opening {url} ...")
+        console.print(f"Opening {escape(url)} ...")
         webbrowser.open(url)
     else:
-        console.print(url)
+        console.print(escape(url))
 
 
 @app.command()
@@ -1360,7 +1446,7 @@ def stats(
     try:
         engine.verify_connectivity()
     except Exception as e:
-        console.print(f"[red][X] Neo4j not reachable:[/red] {e}")
+        console.print(f"[red][X] Neo4j not reachable:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
     try:
@@ -1368,7 +1454,7 @@ def stats(
             registry = _get_registry()
             try:
                 if registry.get(repo_id) is None:
-                    console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                    console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
                     raise typer.Exit(code=1)
             finally:
                 registry.close()
@@ -1388,7 +1474,7 @@ def stats(
                 **data,
             }))
         else:
-            console.print(f"\n[bold]Stats{' for ' + repo_id if repo_id else ''}[/bold]")
+            console.print(f"\n[bold]Stats{escape(' for ' + repo_id, before_tag=True) if repo_id else ''}[/bold]")
             console.print(f"  Total nodes: {total_nodes}")
             console.print(f"  Total relationships: {total_rels}")
 
@@ -1397,7 +1483,7 @@ def stats(
                 node_table.add_column("Label", style="cyan")
                 node_table.add_column("Count", style="green")
                 for label, count in sorted(data["nodes_by_label"].items()):
-                    node_table.add_row(label, str(count))
+                    node_table.add_row(escape(label), str(count))
                 console.print(node_table)
 
             if data["relationships_by_type"]:
@@ -1405,7 +1491,7 @@ def stats(
                 rel_table.add_column("Type", style="cyan")
                 rel_table.add_column("Count", style="green")
                 for rtype, count in sorted(data["relationships_by_type"].items()):
-                    rel_table.add_row(rtype, str(count))
+                    rel_table.add_row(escape(rtype), str(count))
                 console.print(rel_table)
     finally:
         engine.close()
@@ -1424,7 +1510,7 @@ def info(
     try:
         repo = registry.get(repo_id)
         if not repo:
-            console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+            console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
             raise typer.Exit(code=1)
 
         # Node count from Neo4j
@@ -1472,28 +1558,28 @@ def info(
                 "issue": repo_issues.get(repo_id),
             }, default=str))
         else:
-            console.print(f"\n[bold]Repository: {repo.repo_id}[/bold]")
-            console.print(f"  Path: {repo.path}")
+            console.print(f"\n[bold]Repository: {escape(repo.repo_id, before_tag=True)}[/bold]")
+            console.print(f"  Path: {escape(str(repo.path))}")
             console.print(f"  Active: {'[OK]' if repo.active else '[X]'}")
             console.print(f"  Watch: {'[OK]' if repo.watch_enabled else '[X]'}")
-            console.print(f"  Last indexed: {repo.last_indexed or '-'}")
-            console.print(f"  Last indexed commit: {repo.last_indexed_commit or '-'}")
-            console.print(f"  Docs path: {repo.docs_path or '(not set)'}")
+            console.print(f"  Last indexed: {escape(str(repo.last_indexed or '-'))}")
+            console.print(f"  Last indexed commit: {escape(str(repo.last_indexed_commit or '-'))}")
+            console.print(f"  Docs path: {escape(str(repo.docs_path or '(not set)'))}")
             console.print(f"  Mentions: {'[OK]' if repo.mentions_enabled else '[X]'}")
             console.print(f"  PR source: {'[OK]' if repo.pr_source_enabled else '[X]'}")
             console.print(f"  Issue source: {'[OK]' if repo.issue_source_enabled else '[X]'}")
             console.print(f"  Nodes in graph: {node_count}")
-            console.print(f"  Git branch: {git_status.get('branch', '-')}")
+            console.print(f"  Git branch: {escape(str(git_status.get('branch', '-')))}")
             uncommitted = git_status.get("uncommitted", [])
             console.print(f"  Uncommitted changes: {len(uncommitted)}")
             if uncommitted:
                 for entry in uncommitted[:10]:
-                    console.print(f"    {entry['state']:>10}  {entry['path']}")
+                    console.print(f"    {escape(str(entry['state'])):>10}  {escape(str(entry['path']))}")
                 if len(uncommitted) > 10:
                     console.print(f"    ... and {len(uncommitted) - 10} more")
             issue = repo_issues.get(repo_id)
             if issue:
-                console.print(f"  [yellow]Issue:[/yellow] {issue}")
+                console.print(f"  [yellow]Issue:[/yellow] {escape(str(issue))}")
     finally:
         registry.close()
 
@@ -1532,7 +1618,7 @@ def update(
         )
         if result.stdout.strip():
             console.print("[red][X] Local changes present[/red] — commit, stash, or use --force.")
-            console.print(result.stdout)
+            console.print(escape(result.stdout))
             raise typer.Exit(code=1)
 
     # 2. Check tray liveness
@@ -1546,15 +1632,15 @@ def update(
     try:
         pull_command = _git_pull_command(branch)
     except ValueError as exc:
-        console.print(f"[red][X] {exc}[/red]")
+        console.print(f"[red][X] {escape(str(exc), before_tag=True)}[/red]")
         raise typer.Exit(code=2) from exc
     result = subprocess.run(
         pull_command, cwd=str(repo_root), capture_output=True, text=True,
     )
     if result.returncode != 0:
-        console.print(f"[red][X] git pull failed:[/red] {result.stderr.strip()}")
+        console.print(f"[red][X] git pull failed:[/red] {escape(result.stderr.strip())}")
         raise typer.Exit(code=1)
-    console.print(f"[green][OK][/green] {result.stdout.strip()}")
+    console.print(f"[green][OK][/green] {escape(result.stdout.strip())}")
 
     # 4. Stop tray if running
     if was_running:
@@ -1571,7 +1657,7 @@ def update(
         cwd=str(repo_root), capture_output=True, text=True,
     )
     if result.returncode != 0:
-        console.print(f"[red][X] pip install failed:[/red] {result.stderr.strip()}")
+        console.print(f"[red][X] pip install failed:[/red] {escape(result.stderr.strip())}")
         raise typer.Exit(code=1)
     console.print("[green][OK][/green] Dependencies reinstalled.")
 
@@ -1583,7 +1669,7 @@ def update(
     )
     if result.returncode != 0:
         console.print("[red]doctor reported issues:[/red]")
-        console.print(result.stdout)
+        console.print(escape(result.stdout))
         raise typer.Exit(code=1)
     console.print("[green][OK][/green] All checks passed.")
 
@@ -1648,7 +1734,7 @@ def _show_settings(key: str | None, show_defaults: bool, as_json: bool) -> None:
     if key:
         fields = [(n, v, d) for n, v, d in fields if n == key]
         if not fields:
-            console.print(f"[red][X] Unknown setting:[/red] {key}")
+            console.print(f"[red][X] Unknown setting:[/red] {escape(key)}")
             raise typer.Exit(code=1)
 
     if as_json:
@@ -1662,9 +1748,9 @@ def _show_settings(key: str | None, show_defaults: bool, as_json: bool) -> None:
     if show_defaults:
         table.add_column("Default", style="yellow")
     for field_name, value, default in fields:
-        row = [field_name, str(_shown_value(field_name, value))]
+        row = [field_name, escape(str(_shown_value(field_name, value)))]
         if show_defaults:
-            row.append(str(_shown_value(field_name, default)))
+            row.append(escape(str(_shown_value(field_name, default))))
         table.add_row(*row)
     console.print(table)
 
@@ -1946,7 +2032,7 @@ def config_show(
     elif report["status"] == "absent":
         console.print(f"{escape(report['repo'])}: no {SCHEMA_FILENAME} — built-in schema")
     else:
-        console.print(f"{escape(report['repo'])}: {escape(report['schema_file'])} (valid, extends: {report['extends']})")
+        console.print(f"{escape(report['repo'])}: {escape(report['schema_file'])} (valid, extends: {escape(str(report['extends']))})")
 
     nodes = Table(title="Node types")
     nodes.add_column("Label", style="cyan")
@@ -1955,8 +2041,8 @@ def config_show(
     nodes.add_column("Colour")
     for node in report["node_types"]:
         nodes.add_row(
-            node["label"], node["origin"], ", ".join(node["key"]) if node["key"] else "built-in identity",
-            node["color"] or "\u2014",
+            escape(node["label"]), escape(node["origin"]), escape(", ".join(node["key"])) if node["key"] else "built-in identity",
+            escape(node["color"] or "\u2014"),
         )
     console.print(nodes)
 
@@ -1969,8 +2055,8 @@ def config_show(
     rels.add_column("Colour")
     for rel in report["relationships"]:
         rels.add_row(
-            rel["type"], rel["from"] or "any", rel["to"] or "any", rel["provider"], rel["origin"],
-            rel["color"] or "\u2014",
+            escape(rel["type"]), escape(rel["from"] or "any"), escape(rel["to"] or "any"), escape(rel["provider"]),
+            escape(rel["origin"]), escape(rel["color"] or "\u2014"),
         )
     console.print(rels)
 
@@ -1988,7 +2074,7 @@ def config_show(
             table.add_column("Timeout")
             for tool in tools["tools"]:
                 params = ", ".join(p["name"] + ("" if p["required"] else "?") for p in tool["parameters"]) or "—"
-                table.add_row(tool["name"], params, str(tool["max_rows"]), f"{tool['timeout_s']}s")
+                table.add_row(escape(tool["name"]), escape(params), str(tool["max_rows"]), f"{tool['timeout_s']}s")
             console.print(table)
 
     global_tools = report["global_tools"]
@@ -2000,7 +2086,7 @@ def config_show(
         table.add_column("Description")
         table.add_column("Overridden by project")
         for tool in global_tools["tools"]:
-            table.add_row(tool["name"], escape(tool["description"]), "yes" if tool["overridden"] else "")
+            table.add_row(escape(tool["name"]), escape(tool["description"]), "yes" if tool["overridden"] else "")
         console.print(table)
 
 
@@ -2036,8 +2122,8 @@ def config_validate(
     findings = _project_schema_findings(repos) + _project_tools_findings(repos) + _global_tools_findings(repos)
     for finding in findings:
         colour = "red" if finding["failed"] else ("yellow" if finding["status"] in ("warning", "disabled", "notice") else "green")
-        subject = finding["repo_id"] or "cross-repository"
-        console.print(f"[{colour}]{finding['status']}[/{colour}] {escape(str(subject))}: {escape(finding['detail'])}")
+        subject = escape(str(finding["repo_id"] or "cross-repository"))
+        console.print(f"[{colour}]{finding['status']}[/{colour}] {subject}: {escape(finding['detail'])}")
     if any(finding["failed"] for finding in findings):
         raise typer.Exit(code=1)
 
@@ -2068,7 +2154,7 @@ def _tools_scope(
         return _repo_dir(repo)
     root, registered = _default_repo_root()
     if not registered:
-        Console(stderr=True).print(
+        Console(stderr=True, emoji=False).print(
             f"[yellow]Warning:[/yellow] {escape(str(root))} is not a registered repository (nor inside one), "
             f"so {consequence}; register it with `devgraph add`.",
             soft_wrap=True,
@@ -2285,18 +2371,18 @@ def config_tools_trust(
     global_names = _global_tool_names()
     console.print(f"Tools in {escape(str(path))}:", soft_wrap=True)
     for tool in declared.tools:
-        console.print(f"\n[cyan]{escape(tool.name)}[/cyan]")
+        console.print(f"\n[cyan]{escape(tool.name, before_tag=True)}[/cyan]")
         if tool.name in global_names:
             console.print(f"  overrides the global tool {escape(repr(tool.name))} in this repository", soft_wrap=True)
         console.print(f"  description: {escape(tool.description)}", highlight=False, soft_wrap=True)
         for p in tool.parameters:
-            detail = f"{p.type}, " + ("required" if p.required else f"optional, default {p.default!r}")
-            line = f"  parameter {p.name} ({detail})" + (f": {p.description}" if p.description else "")
+            shape = f"{p.type}, " + ("required" if p.required else f"optional, default {p.default!r}")
+            line = f"  parameter {p.name} ({shape})" + (f": {p.description}" if p.description else "")
             console.print(escape(line), highlight=False, soft_wrap=True)
         console.print(escape(tool.cypher.rstrip()), highlight=False, soft_wrap=True)
     if not declared.tools:
         console.print("(no tools)")
-    console.print(f"\nsha256: {digest}")
+    console.print(f"\nsha256: {escape(digest)}")
     console.print(
         "An enabled project tool can read the whole graph, every registered repository's data and not only this "
         "one's: the $repo_id rule is a convention, not a sandbox.", soft_wrap=True,
@@ -2550,7 +2636,7 @@ def config_schema_list(
     if declaration is None or declaration.extends == "default":
         node_types += [{"label": n, "origin": "built-in", "key": None, "source": None, "color": None} for n in NODE_LABELS]
         relationships += [
-            {"type": t, "from": None, "to": None, "provider": "builtin", "origin": "built-in", "color": None}
+            {"type": t, "from": None, "to": None, "provider": "builtin", "field": None, "origin": "built-in", "color": None}
             for t in RELATIONSHIP_TYPES
         ]
     node_types += [
@@ -2558,13 +2644,16 @@ def config_schema_list(
             "label": n.label,
             "origin": "project",
             "key": list(n.key),
-            "source": {"provider": n.source.provider, "kind": n.source.kind} if n.source else None,
+            "source": n.source.model_dump(mode="json", by_alias=True, exclude_none=True) if n.source else None,
             "color": n.color,
         }
         for n in effective.node_types
     ]
     relationships += [
-        {"type": r.type, "from": list(r.from_labels), "to": r.to, "provider": r.provider, "origin": "project", "color": r.color}
+        {
+            "type": r.type, "from": list(r.from_labels), "to": r.to, "provider": r.provider, "field": r.field,
+            "origin": "project", "color": r.color,
+        }
         for r in effective.relationships
     ]
 
@@ -2581,8 +2670,8 @@ def config_schema_list(
         source = row["source"]
         nodes.add_row(
             escape(row["label"]), row["origin"], escape(", ".join(row["key"] or ())),
-            f"{source['provider']} ({source['kind']})" if source else "\u2014",
-            row["color"] or "\u2014",
+            escape(f"{source['provider']} ({source.get('kind') or ', '.join(source.get('paths', ()))})") if source else "\u2014",
+            escape(row["color"] or "\u2014"),
         )
     console.print(nodes)
     rels = Table(title="Relationships")
@@ -2590,7 +2679,8 @@ def config_schema_list(
         rels.add_column(column, style="cyan" if column == "Type" else None)
     for row in relationships:
         rels.add_row(
-            escape(row["type"]), row["origin"], escape(", ".join(row["from"] or ())), escape(row["to"] or ""), row["provider"], row["color"] or "\u2014"
+            escape(row["type"]), row["origin"], escape(", ".join(row["from"] or ())), escape(row["to"] or ""),
+            escape(f"{row['provider']} ({row['field']})" if row["field"] else row["provider"]), escape(row["color"] or "\u2014")
         )
     console.print(rels)
     if not project_config_enabled(root):
@@ -2715,7 +2805,7 @@ def logs(
     log_path = settings.log_file
     if not log_path or not log_path.exists():
         console.print("[yellow]No log file found.[/yellow]")
-        console.print(f"  Expected at: {log_path}")
+        console.print(f"  Expected at: {escape(str(log_path))}")
         console.print("  The tray app must be started with file logging enabled.")
         return
 
@@ -2730,7 +2820,7 @@ def logs(
     try:
         text = log_path.read_text(encoding="utf-8")
     except OSError as e:
-        console.print(f"[red][X] Error reading log file:[/red] {e}")
+        console.print(f"[red][X] Error reading log file:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
     # Parse log lines, filter by level, take last N
@@ -2750,7 +2840,7 @@ def logs(
 
     tail = filtered[-lines:] if lines > 0 else filtered
     for line in tail:
-        console.print(line)
+        console.print(escape(line))
 
 
 @app.command()
@@ -2771,7 +2861,7 @@ def prune(
     try:
         engine.verify_connectivity()
     except Exception as e:
-        console.print(f"[red][X] Neo4j not reachable:[/red] {e}")
+        console.print(f"[red][X] Neo4j not reachable:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
     try:
@@ -2788,7 +2878,7 @@ def prune(
 
         console.print(f"Found {len(orphaned)} orphaned repo(s):")
         for rid in sorted(orphaned):
-            console.print(f"  {rid}")
+            console.print(f"  {escape(str(rid))}")
 
         if dry_run:
             console.print("[yellow]Dry run — no data deleted.[/yellow]")
@@ -2797,7 +2887,7 @@ def prune(
         for rid in sorted(orphaned):
             recorded = engine.read_applied_schema(rid) or {}
             engine.delete_repository(rid)
-            console.print(f"[green][OK][/green] Deleted: {rid}")
+            console.print(f"[green][OK][/green] Deleted: {escape(str(rid))}")
             _release_labels(engine, recorded.get("labels") or [])
     finally:
         engine.close()
@@ -2815,14 +2905,14 @@ def self_test(
     try:
         engine.verify_connectivity()
     except Exception as e:
-        console.print(f"[red][X] Neo4j not reachable:[/red] {e}")
+        console.print(f"[red][X] Neo4j not reachable:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
     registry = _get_registry()
     try:
         if repo_id:
             if registry.get(repo_id) is None:
-                console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+                console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
                 raise typer.Exit(code=1)
             repo_ids = [repo_id]
         else:
@@ -2833,7 +2923,7 @@ def self_test(
     all_passed = True
 
     for rid in repo_ids:
-        console.print(f"\n[bold]Checking: {rid}[/bold]")
+        console.print(f"\n[bold]Checking: {escape(str(rid), before_tag=True)}[/bold]")
 
         # 1. Every Module node has a file property
         try:
@@ -2848,7 +2938,7 @@ def self_test(
             else:
                 console.print("  [green][OK][/green] All Module nodes have 'file'")
         except Exception as e:
-            console.print(f"  [red][X] Check failed:[/red] {e}")
+            console.print(f"  [red][X] Check failed:[/red] {escape(str(e))}")
             all_passed = False
 
         # 2. No dangling CONTAINS edges
@@ -2865,7 +2955,7 @@ def self_test(
             else:
                 console.print("  [green][OK][/green] All CONTAINS edges valid")
         except Exception as e:
-            console.print(f"  [red][X] Check failed:[/red] {e}")
+            console.print(f"  [red][X] Check failed:[/red] {escape(str(e))}")
             all_passed = False
 
         # 3. No dangling CALLS edges
@@ -2882,7 +2972,7 @@ def self_test(
             else:
                 console.print("  [green][OK][/green] All CALLS edges valid")
         except Exception as e:
-            console.print(f"  [red][X] Check failed:[/red] {e}")
+            console.print(f"  [red][X] Check failed:[/red] {escape(str(e))}")
             all_passed = False
 
         # 4. Registry ↔ Neo4j consistency
@@ -2899,14 +2989,14 @@ def self_test(
             orphaned = neo4j_ids - reg_ids
             missing = reg_ids - neo4j_ids
             if orphaned:
-                console.print(f"  [red][X] {len(orphaned)} orphaned repo(s) in Neo4j: {', '.join(sorted(orphaned))}[/red]")
+                console.print(f"  [red][X] {len(orphaned)} orphaned repo(s) in Neo4j: {escape(', '.join(sorted(orphaned)), before_tag=True)}[/red]")
                 all_passed = False
             if missing:
-                console.print(f"  [yellow]{len(missing)} repo(s) in registry but not in Neo4j: {', '.join(sorted(missing))}[/yellow]")
+                console.print(f"  [yellow]{len(missing)} repo(s) in registry but not in Neo4j: {escape(', '.join(sorted(missing)), before_tag=True)}[/yellow]")
             if not orphaned and not missing:
                 console.print("  [green][OK][/green] Registry ↔ Neo4j consistent")
         except Exception as e:
-            console.print(f"  [red][X] Check failed:[/red] {e}")
+            console.print(f"  [red][X] Check failed:[/red] {escape(str(e))}")
             all_passed = False
 
     console.print()
@@ -2939,7 +3029,7 @@ def export(
     registry = _get_registry()
     try:
         if registry.get(repo_id) is None:
-            console.print(f"[red][X] Error:[/red] no such repo_id: {repo_id}")
+            console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
             raise typer.Exit(code=1)
     finally:
         registry.close()
@@ -2948,7 +3038,7 @@ def export(
     try:
         engine.verify_connectivity()
     except Exception as e:
-        console.print(f"[red][X] Neo4j not reachable:[/red] {e}")
+        console.print(f"[red][X] Neo4j not reachable:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
     try:
@@ -2963,9 +3053,9 @@ def export(
 
         if output:
             Path(output).write_text(result, encoding="utf-8")
-            console.print(f"[green][OK][/green] Exported {len(nodes)} nodes, {len(edges)} edges to {output}")
+            console.print(f"[green][OK][/green] Exported {len(nodes)} nodes, {len(edges)} edges to {escape(output)}")
         else:
-            console.print(result)
+            console.print(escape(result))
     finally:
         engine.close()
 
