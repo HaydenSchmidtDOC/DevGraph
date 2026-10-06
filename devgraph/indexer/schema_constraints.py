@@ -220,11 +220,11 @@ def constraint_drift(engine: GraphEngine) -> list[dict]:
     the generated constraint does not exist (a rescan re-provisions it), and
     `blocked` when it has another definition and duplicate nodes stop the new
     key from being created. Without duplicates, a differing definition is a
-    `conflict` when another repository records the constraint's key, so
-    realign_keys will not replace it; that entry also carries the
-    `constraint_key` and the repositories that `declared_by` it. Otherwise it
-    is replaced on the next apply, or is a cross-repository conflict that
-    `devgraph config validate` reports.
+    `conflict` when another repository records the label differently (the
+    constraint's key, a third key, or an unknown one), so realign_keys will
+    not replace it; that entry also carries the `constraint_key` and the
+    disagreeing repositories as `declared_by`. Otherwise it is replaced on
+    the next apply.
     """
     existing = generated_objects(engine)
     drift: list[dict] = []
@@ -242,9 +242,11 @@ def constraint_drift(engine: GraphEngine) -> list[dict]:
             elif all(PROPERTY_NAME_PATTERN.fullmatch(p) for p in key) and engine.has_duplicate_keys(label, wanted):
                 status = "blocked"
             else:
+                # realign_keys' skip rule: any other repository recording this
+                # label differently (another key, a third one, or unknown).
                 declared_by = sorted(
                     other for other, other_label, other_key in entries
-                    if other != repo_id and (other_label, other_key) == (obj.label, obj.properties[1:])
+                    if other != repo_id and (other_label, other_key) != (label, key)
                 )
                 if not declared_by:
                     continue

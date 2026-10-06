@@ -284,3 +284,27 @@ def test_drift_reports_nothing_when_every_repo_agrees_with_the_constraint(engine
     engine.run_cypher(f"CREATE CONSTRAINT {label.lower()}_repo_key FOR (n:{label}) REQUIRE (n.repo_id, n.path) IS UNIQUE")
     record_keyed_on(engine, repos, label, "path", "path")
     assert not [d for d in constraint_drift(engine) if d["label"] == label]
+
+
+def test_drift_reports_a_conflict_when_another_repo_records_a_third_key(engine, repos, label):
+    # Neither repository records the stale constraint's key, but they disagree,
+    # so realign_keys leaves it alone: doctor must not stay silent.
+    engine.run_cypher(f"CREATE CONSTRAINT {label.lower()}_repo_key FOR (n:{label}) REQUIRE (n.repo_id, n.path) IS UNIQUE")
+    a_id, b_id = record_keyed_on(engine, repos, label, "adr_id", "rfc_id")
+    assert [d for d in constraint_drift(engine) if d["label"] == label] == sorted([
+        {"repo_id": a_id, "label": label, "status": "conflict", "key": ("adr_id",),
+         "constraint_key": ("path",), "declared_by": [b_id]},
+        {"repo_id": b_id, "label": label, "status": "conflict", "key": ("rfc_id",),
+         "constraint_key": ("path",), "declared_by": [a_id]},
+    ], key=lambda d: d["repo_id"])
+
+
+def test_drift_reports_a_conflict_when_another_repo_records_an_unknown_key(engine, repos, label):
+    engine.run_cypher(f"CREATE CONSTRAINT {label.lower()}_repo_key FOR (n:{label}) REQUIRE (n.repo_id, n.path) IS UNIQUE")
+    (a_id,) = record_keyed_on(engine, repos, label, "adr_id")
+    b_id, _root = repos()
+    engine.record_applied_schema(b_id, "sha256:x", [label], [])  # recorded before keys were
+    assert [d for d in constraint_drift(engine) if d["label"] == label] == [{
+        "repo_id": a_id, "label": label, "status": "conflict", "key": ("adr_id",),
+        "constraint_key": ("path",), "declared_by": [b_id],
+    }]
