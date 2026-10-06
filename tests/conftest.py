@@ -1,6 +1,7 @@
 """Shared pytest configuration for environments without a desktop display."""
 
 import os
+import socket
 
 import pytest
 
@@ -9,6 +10,32 @@ if not os.environ.get("DISPLAY"):
     # pystray otherwise selects its X11 backend during module import and aborts
     # collection before tests that do not need a tray icon can run.
     os.environ.setdefault("PYSTRAY_BACKEND", "dummy")
+
+
+@pytest.fixture(scope="session")
+def _local_neo4j_reachable():
+    try:
+        socket.create_connection(("127.0.0.1", 7687), timeout=1).close()
+    except OSError:
+        return False
+    return True
+
+
+@pytest.fixture(autouse=True)
+def _fail_fast_without_neo4j(_local_neo4j_reachable, monkeypatch):
+    """With no local Neo4j, fail connectivity checks at once rather than after
+    the engine's transient-error retries (seconds per live test, ~10 s on
+    Windows), so the live tests skip quickly."""
+    if _local_neo4j_reachable:
+        return
+    from neo4j.exceptions import ServiceUnavailable
+
+    from devgraph.graph.engine import GraphEngine
+
+    def unreachable(self):
+        raise ServiceUnavailable("no Neo4j listening on 127.0.0.1:7687")
+
+    monkeypatch.setattr(GraphEngine, "verify_connectivity", unreachable)
 
 
 @pytest.fixture(autouse=True)
