@@ -1335,7 +1335,9 @@ def test_a_warm_save_parses_only_its_own_file(engine, tmp_path, monkeypatch, cap
     assert parses == [path]
     assert "docs read cache: " in caplog.text
     print(f"\ncold save {cold * 1000:.0f} ms, warm save {warm * 1000:.0f} ms over 2,000 Adr files")
-    assert cold >= 2 * warm, (cold, warm)
+    # Wall-clock ratios are noise on shared CI runners; the single parse above is the guard there.
+    if not os.environ.get("CI"):
+        assert cold >= 2 * warm, (cold, warm)
     assert_matches_fresh_apply(engine, REPO, root)
 
 
