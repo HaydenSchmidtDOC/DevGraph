@@ -1237,8 +1237,8 @@ class TestFieldKeyedDocsApply:
     def test_a_batch_holding_a_loser_adds_only_its_keys_owner(self, temp_repo):
         spec, files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
-        engine.existing_node_names = lambda repo_id, label, names: set(names)
-        engine.extracted_nodes_at = lambda repo_id, extractor, paths: set()
+        engine.extracted_entries = lambda repo_id, extractor, labels: {("Adr", "ADR-1", "decisions/adr-1.md")}
+        engine.list_file_nodes = lambda repo_id, files: {("Adr", "ADR-1")}
         copy = "decisions/adr-1 copy.md"
         batch = dispatch._read_docs_batch(engine, "demo", temp_repo, spec, {copy: files[copy]}, set())
         assert sorted(batch.selected) == ["decisions/adr-1 copy.md", "decisions/adr-1.md"]

@@ -312,7 +312,8 @@ class _DocsBatch(NamedTuple):
     owners: Mapping[tuple[str, str], str]
     #: The batch's view of the field-keyed files, or None if it touches none.
     view: docs.KeyedView | None
-    #: Affected (label, key)s whose entry is already in the graph, wherever it was.
+    #: Affected (label, key)s whose entry is already in the graph, wherever it was,
+    #: and the entries already at the owners pulled in.
     existing: set[tuple[str, str]]
 
 
@@ -332,8 +333,9 @@ def _read_docs_batch(
     longer claims (its own event is pending). The batch prunes at its path,
     so that entry's key joins K too and its owner on disk is pulled in, until
     K stops growing. K only grows and every path added owns a key in it, so
-    this ends, without reading any file again, and every engine path list
-    holds at most |batch| + |K| paths.
+    this ends, without reading any file or querying the graph again (the
+    field-keyed entries are fetched once), and every engine path list holds
+    at most |batch| + |K| paths.
     """
     try:
         selected = docs.read_selected(spec, files)
@@ -349,21 +351,26 @@ def _read_docs_batch(
             batch = set(files)
             keys = {key for key, paths in view.claims.items() if key[0] in touched and not batch.isdisjoint(paths)}
             keys |= {(label, name) for label, name in previous if label in touched}
+            # Every field-keyed entry in the graph, fetched once: the chase below
+            # runs in memory however long the chain of stale entries is.
+            in_graph: dict[str, set[tuple[str, str]]] = {}
+            for label, name, path in engine.extracted_entries(repo_id, docs.EXTRACTOR, sorted(keyed)):
+                in_graph.setdefault(path, set()).add((label, name))
             batch_selected, checked = selected, set(batch)
             while True:
                 selected = docs.expand_to_owners(view, batch_selected, keys)
-                pulled_in = sorted(set(selected) - checked)
-                checked |= set(pulled_in)
-                stale = {
-                    key for key in engine.extracted_nodes_at(repo_id, docs.EXTRACTOR, pulled_in) if key[0] in keyed
-                } - keys
+                pulled_in = set(selected) - checked
+                checked |= pulled_in
+                stale = {key for path in pulled_in for key in in_graph.get(path, ())} - keys
                 if not stale:
                     break
                 keys |= stale
-                touched |= {label for label, _name in stale}
-            for label in sorted(touched):
-                names = sorted(name for claimed, name in keys if claimed == label)
-                existing |= {(label, name) for name in engine.existing_node_names(repo_id, label, names)}
+            existing = keys & {key for entries in in_graph.values() for key in entries}
+            # An owner pulled in also rewrites its other entries (a path-keyed
+            # type's, say); those already there are not added either.
+            pulled_in = sorted(set(selected) - batch)
+            if pulled_in:
+                existing |= engine.list_file_nodes(repo_id, pulled_in)
         nodes, problems = docs.build_nodes(spec, repo_id, selected, owners)
     except Exception:
         logger.warning("docs node pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
@@ -440,7 +447,8 @@ def _relink_docs(
 def _take_over_keys(engine: GraphEngine, repo_id: str, repo_root: Path, spec: docs.DocsSpec, gone: list[str]) -> None:
     """Before the docs nodes at deleted paths go: move each field-keyed entry
     among them to the file that now owns its key, and rebuild that file's
-    outgoing edges. An entry whose key no file claims is left to the delete.
+    outgoing edges. Nothing else the owner claims is written: that is its
+    own event's work. An entry whose key no file claims is left to the delete.
 
     A failure before the move falls through to the delete, and the next
     rescan restores the entry. A failure after it leaves the entry at its new
@@ -458,8 +466,18 @@ def _take_over_keys(engine: GraphEngine, repo_id: str, repo_root: Path, spec: do
         selected = docs.expand_to_owners(view, docs.Selected(), keys)
         if not selected:
             return
+        # Only the entries taken over move. An owner whose own event is still
+        # pending may claim more on disk; writing those here would make its
+        # event see them as already there, so nothing would relink them.
         nodes, _problems = docs.build_nodes(spec, repo_id, selected, view.owners)
-        edges = docs.build_edges(spec, repo_id, selected, owners=view.owners)
+        nodes = [node for node in nodes if (node["label"], node["name"]) in keys]
+        # The edge delete below clears every outgoing edge at the owner paths,
+        # so those of the entries already there are rebuilt as well.
+        sources = keys | engine.extracted_nodes_at(repo_id, docs.EXTRACTOR, sorted(selected))
+        edges = [
+            edge for edge in docs.build_edges(spec, repo_id, selected, owners=view.owners)
+            if (edge["from_label"], edge["from_name"]) in sources
+        ]
         engine.upsert_nodes(nodes)
     except Exception:
         logger.warning("docs takeover failed for %s; the next rescan restores the entries", repo_id, exc_info=True)

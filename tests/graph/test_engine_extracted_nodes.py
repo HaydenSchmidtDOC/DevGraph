@@ -297,3 +297,15 @@ def test_extracted_nodes_at_respects_path_boundaries_extractor_and_repo(engine):
     assert engine.extracted_nodes_at(REPO, "docs", ["decision"]) == set()
     assert engine.extracted_nodes_at(REPO, "filesystem", ["decisions"]) == set()
     assert engine.extracted_nodes_at(REPO, "docs", []) == set()
+
+
+def test_extracted_entries_lists_one_providers_entries_of_the_given_labels(engine):
+    seed_keyed(engine)
+    seed_keyed(engine, repo=OTHER)
+    seed(engine, REPO, "Runbook", ["runbooks/a.md"], extractor="docs")
+    seed(engine, REPO, "Adr", ["fs-adr"])
+    assert engine.extracted_entries(REPO, "docs", ["Adr"]) == {("Adr", "ADR-012", "decisions/a.md")}
+    assert engine.extracted_entries(REPO, "docs", ["Adr", "Runbook"]) == {
+        ("Adr", "ADR-012", "decisions/a.md"), ("Runbook", "runbooks/a.md", "runbooks/a.md"),
+    }
+    assert engine.extracted_entries(REPO, "docs", []) == set()

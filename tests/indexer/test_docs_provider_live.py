@@ -693,6 +693,8 @@ KEYED_SCHEMA = f"""
     relationships:
       - {{type: ZZ_REPLACES, provider: docs, from: {KADR}, to: {KADR}, field: supersedes}}
       - {{type: ZZ_RUNBOOK_ADR, provider: docs, from: {KRUNBOOK}, to: {KADR}, field: adr}}
+      - {{type: ZZ_ADR_RFC, provider: docs, from: {KADR}, to: {RFC}, field: rfc}}
+      - {{type: ZZ_ADR_RUNBOOK, provider: docs, from: {KADR}, to: {KRUNBOOK}, field: runbook}}
 """
 
 
@@ -932,6 +934,70 @@ def test_stale_entries_are_chased_through_every_owner_pulled_in(engine, keyed, p
     )
     # |batch| + |K_final|: q.md, plus ADR-040, ADR-060, ADR-050 and ADR-070.
     assert max(len(paths) for _name, paths in path_lists) <= 1 + 4
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_a_long_chain_of_stale_entries_is_chased_with_a_fixed_number_of_lookups(engine, keyed, monkeypatch):
+    # c00 owns T, c01 owns c00's old id, ... : each owner pulled in holds a stale
+    # entry whose new owner is the next file. The chase must not query per link.
+    length = 40
+    for n in range(length):
+        md(keyed, f"decisions/c{n:02}.md", f"id: K-{n}")
+    md(keyed, "decisions/q.md", "id: Q")
+    kscan(engine, keyed)
+
+    md(keyed, "decisions/c00.md", "id: T")
+    for n in range(1, length):
+        md(keyed, f"decisions/c{n:02}.md", f"id: K-{n - 1}")
+    q = md(keyed, "decisions/q.md", "id: T")
+    calls = []
+    for name in ("extracted_nodes_at", "extracted_entries", "existing_node_names", "list_file_nodes"):
+        real = getattr(engine, name)
+        monkeypatch.setattr(engine, name, lambda *args, _real=real, _name=name: calls.append(_name) or _real(*args))
+    index_paths(engine, REPO, keyed, {q})
+
+    assert len(calls) <= 3, calls
+    found = entries(engine)
+    assert found["T"] == "decisions/c00.md" and found["K-0"] == "decisions/c01.md"
+    assert f"K-{length - 1}" not in found
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_an_owner_pulled_in_does_not_count_its_other_entries_as_added(engine, keyed, relinks):
+    # runbooks/r.md is a (path-keyed) Runbook and owns Rfc R-1. A loser of R-1
+    # pulls it into the batch; its Runbook entry was already there, so nothing
+    # links to it anew.
+    md(keyed, "runbooks/r.md", "kind: rfc\nid: R-1")
+    md(keyed, "decisions/x.md", "id: ADR-051\nrunbook: runbooks/r.md")
+    kscan(engine, keyed)
+    assert links(engine, "ZZ_ADR_RUNBOOK") == [("ADR-051", "runbooks/r.md")]
+
+    copy = md(keyed, "x/r.md", "kind: rfc\nid: R-1")
+    relinks.clear()
+    index_paths(engine, REPO, keyed, {copy})
+
+    assert not [t for t in relinks if (KRUNBOOK, "runbooks/r.md") in t]
+    assert entries(engine, RFC) == {"R-1": "runbooks/r.md"}
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
+def test_a_takeover_moves_only_the_deleted_entries_and_leaves_the_rest_to_the_owners_event(engine, keyed):
+    # o.md takes ADR-080 over from the deleted g.md while its own event (which
+    # also makes it Rfc ADR-080) is still pending. The takeover must not write
+    # that Rfc entry: o.md's event would then see it as already there and never
+    # relink x.md's edge into it.
+    g = md(keyed, "decisions/g.md", "id: ADR-080")
+    md(keyed, "decisions/x.md", "id: ADR-081\nrfc: ADR-080")
+    kscan(engine, keyed)
+
+    o = md(keyed, "decisions/o.md", "id: ADR-080\nkind: rfc")
+    g.unlink()
+    remove_paths(engine, REPO, keyed, {g})
+    assert entries(engine, RFC) == {}
+    index_paths(engine, REPO, keyed, {o})
+
+    assert entries(engine)["ADR-080"] == "decisions/o.md"
+    assert links(engine, "ZZ_ADR_RFC") == [("ADR-081", "ADR-080")]
     assert_matches_fresh_apply(engine, REPO, keyed)
 
 

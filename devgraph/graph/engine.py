@@ -637,6 +637,19 @@ class GraphEngine:
             )
             return {(record["label"], record["name"]) for record in result or []}
 
+    def extracted_entries(self, repo_id: str, extractor: str, labels: list[str]) -> set[tuple[str, str, str]]:
+        """(label, name, path) of every node one provider wrote under these labels in a repo."""
+        if not labels:
+            return set()
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] IN $labels "
+                "RETURN labels(n)[0] AS label, n.name AS name, n.path AS path",
+                repo_id=repo_id, extractor=extractor, labels=labels,
+            )
+            return {(record["label"], record["name"], record["path"]) for record in result or []}
+
     def prune_extracted_nodes(self, repo_id: str, extractor: str, keep: list[str]) -> int:
         """Delete every node of one provider in a repo except `keep` ("Label:name").
 
