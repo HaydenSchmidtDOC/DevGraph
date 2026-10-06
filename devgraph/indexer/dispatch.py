@@ -1362,7 +1362,7 @@ def prune_stale_files(
 
     Returns the number of files pruned.
     """
-    on_disk = {p.resolve().relative_to(repo_root.resolve()).as_posix() for p in _indexable_paths(repo_root)}
+    on_disk = {rel for _, rel in _keyed_indexable_paths(repo_root, keep_ignored_targets=True)}
     in_graph = engine.list_indexed_files(repo_id)
     stale = in_graph - on_disk
     if not stale:

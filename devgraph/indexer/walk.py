@@ -87,9 +87,11 @@ def indexable_paths(repo_root: Path) -> set[Path]:
     return {path for path, _, _ in _walk(repo_root)}
 
 
-def keyed_indexable_paths(repo_root: Path) -> list[tuple[Path, str]]:
+def keyed_indexable_paths(repo_root: Path, *, keep_ignored_targets: bool = False) -> list[tuple[Path, str]]:
     """Each of `indexable_paths` with its `repo_relative` key, leaving out one
-    whose key is under an ignored directory (a symlink into one).
+    whose key is under an ignored directory (a symlink into one) unless
+    `keep_ignored_targets`, as `prune_stale_files` needs: `index_paths` keys
+    such a symlink by its target too.
 
     The root is resolved once. A file is keyed lexically unless it, or a
     directory above it, is a link; only those are resolved, so a symlink is
@@ -103,7 +105,7 @@ def keyed_indexable_paths(repo_root: Path) -> list[tuple[Path, str]]:
                 rel = path.resolve().relative_to(root).as_posix()
             except (OSError, ValueError):
                 continue
-            if is_ignored_path(Path(rel)):
+            if not keep_ignored_targets and is_ignored_path(Path(rel)):
                 continue
         keyed.append((path, rel))
     return keyed
@@ -115,10 +117,13 @@ def _walk(repo_root: Path) -> Iterator[tuple[Path, str, bool]]:
     `is_indexable_file`, `is_ignored_path` and `links_outside` gives, without
     descending into ignored directories. Like rglob it does not follow a
     symlinked directory; a Windows junction it does descend into, so the files
-    below one are marked as linked.
+    below one are marked as linked, but only one whose target is inside the
+    repository and not under an ignored directory (the rule a symlinked file
+    follows), so nothing outside the repository is ever walked.
     """
     if is_ignored_path(repo_root):
         return
+    root: Path | None = None  # resolved at the first junction, if any
     stack = [(repo_root, "", False)]
     while stack:
         directory, prefix, linked = stack.pop()
@@ -136,11 +141,27 @@ def _walk(repo_root: Path) -> Iterator[tuple[Path, str, bool]]:
             except OSError:
                 is_dir = False
             if is_dir:
-                stack.append((path, f"{prefix}{entry.name}/", linked or entry.is_junction()))
+                junction = entry.is_junction()
+                if junction:
+                    root = root or repo_root.resolve()
+                    if not _junction_inside(path, root):
+                        continue
+                stack.append((path, f"{prefix}{entry.name}/", linked or junction))
                 continue
             if not is_indexable_file(path) or (entry.is_symlink() and links_outside(path, repo_root)):
                 continue
             yield path, prefix + entry.name, linked or entry.is_symlink()
+
+
+def _junction_inside(path: Path, root: Path) -> bool:
+    """True for a junction whose target is inside the (resolved) root and not
+    under an ignored directory there."""
+    try:
+        rel = path.resolve().relative_to(root)
+    except (OSError, ValueError):
+        logger.debug("skipping %s: junction target is outside %s", path, root)
+        return False
+    return not is_ignored_path(rel)
 
 
 def repo_relative(repo_root: Path, path: Path) -> str | None:

@@ -1,6 +1,7 @@
 """The shared file-walk helpers: which files a scan (and the providers) may read."""
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from devgraph.indexer.walk import (
     is_indexable_file,
     links_outside,
 )
+from devgraph.paths import is_within
 
 
 def test_ignored_dir_names_cover_venvs_build_output_and_worktrees():
@@ -159,3 +161,80 @@ def test_keyed_indexable_paths_resolves_the_root_once_and_only_links(tmp_path, m
 
     assert len(keyed) == 51
     assert all(p in (repo, repo / "link.md") for p in resolved), resolved
+
+
+def _junction(link, target):
+    # mklink /J needs no admin rights or Developer Mode, unlike a symlink.
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
+
+
+@pytest.fixture
+def junction_tree(tmp_path):
+    repo = tmp_path / "repo"
+    for rel in ("docs/a.md", "docs/deep/b.md", "vendor/v.md", "src/x.py"):
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(rel)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("secret")
+    links = [repo / "docs-j", repo / "vendor-j", repo / "out-j"]
+    _junction(links[0], repo / "docs")
+    _junction(links[1], repo / "vendor")
+    _junction(links[2], outside)
+    yield repo
+    for link in links:
+        os.rmdir(link)  # removes the junction only, never its target's contents
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junctions are Windows-only")
+def test_junctions_are_walked_as_rglob_walks_them_and_keyed_by_target(junction_tree):
+    repo = junction_tree
+    assert (repo / "docs-j").is_junction() and not (repo / "docs-j").is_symlink()
+
+    old_paths, old_keyed = _old_keyed(repo)
+    keyed = walk.keyed_indexable_paths(repo)
+
+    # The old walk also followed the outside and ignored-target junctions; this one does not.
+    assert indexable_paths(repo) == {
+        p for p in old_paths if not p.is_relative_to(repo / "out-j") and not p.is_relative_to(repo / "vendor-j")
+    }
+    assert set(keyed) == old_keyed
+    # Inside the repository: walked like rglob, keyed by the target, not the junction.
+    assert (repo / "docs-j" / "deep" / "b.md", "docs/deep/b.md") in keyed
+    assert "docs-j/deep/b.md" not in {rel for _, rel in keyed}
+    # Into an ignored directory: keyed out, as a symlinked file into one is.
+    assert not any(rel.startswith("vendor/") for _, rel in keyed)
+    # Outside the repository: never keyed, and every key is its resolved path.
+    root = repo.resolve()
+    for path, rel in keyed:
+        assert path.resolve().relative_to(root).as_posix() == rel
+    assert not any(path.is_relative_to(repo / "out-j") for path, _ in keyed)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junctions are Windows-only")
+def test_a_junction_out_of_the_repository_is_not_followed(junction_tree):
+    repo = junction_tree
+    paths = indexable_paths(repo)
+    assert all(is_within(p.resolve(), repo) for p in paths), sorted(map(str, paths))
+    assert not any(p.is_relative_to(repo / "out-j") for p in paths)
+    assert not any(p.is_relative_to(repo / "vendor-j") for p in paths)
+    assert repo / "docs-j" / "a.md" in paths  # an inside junction is still walked
+
+
+class _FakeEngine:
+    def __init__(self, files):
+        self.files = files
+
+    def list_indexed_files(self, repo_id):
+        return set(self.files)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junctions are Windows-only")
+def test_prune_stale_files_tolerates_a_junction_out_of_the_repository(junction_tree, monkeypatch):
+    repo = junction_tree
+    removed = []
+    monkeypatch.setattr(dispatch, "remove_paths", lambda engine, repo_id, root, paths: removed.append(paths) or len(paths))
+    engine = _FakeEngine({"docs/a.md", "docs/deep/b.md", "src/x.py", "gone.md"})
+
+    assert dispatch.prune_stale_files(engine, "r", repo) == 1
+    assert removed == [{repo / "gone.md"}]
