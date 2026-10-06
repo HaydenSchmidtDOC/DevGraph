@@ -897,7 +897,8 @@ def _docs_source_findings(repos: list[Any], engine: Any) -> list[dict[str, Any]]
             if engine is None:
                 add("skipped", "links named in front matter not checked: Neo4j is not reachable")
                 continue
-            edges = docs.build_edges(spec, repo.repo_id, selected)
+            owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
+            edges = docs.build_edges(spec, repo.repo_id, selected, owners=owners)
             present = {
                 label: engine.existing_node_names(repo.repo_id, label, names)
                 for label, names in docs.edge_targets(edges).items()

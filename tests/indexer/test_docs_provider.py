@@ -701,6 +701,7 @@ def test_edge_values_str_and_int_count_bool_does_not(tmp_path):
         "repo_id": "demo",
         "properties": {},
         "field": "service",
+        "from_path": rels[0]["from_name"],
     }
 
 
@@ -791,7 +792,7 @@ def test_unmatched_report_stays_fast_with_many_relationships_and_edges():
         relationships:""" + relationships)
     edges = [
         {"rel_type": f"R{r}", "field": f"f{r}", "from_label": "Runbook", "to_label": "Service",
-         "from_name": f"r{i}.md", "to_name": f"s{i}"}
+         "from_name": f"r{i}.md", "from_path": f"r{i}.md", "to_name": f"s{i}"}
         for r in range(count) for i in range(1500)
     ]
     started = time.perf_counter()
@@ -951,3 +952,322 @@ def test_provider_and_walk_never_import_the_dispatcher():
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+# --- front-matter keys --------------------------------------------------------------------
+
+ADR = """
+    version: 1
+    node_types:
+      - label: Adr
+        key: [adr_id]
+        metadata:
+          - {name: path}
+          - {name: adr_id}
+          - {name: title}
+        source:
+          provider: docs
+          paths: ["decisions/**/*.md"]
+          fields: {adr_id: id}
+    relationships:
+      - type: REPLACES
+        provider: docs
+        from: Adr
+        to: Adr
+        field: supersedes
+"""
+
+ADR_AND_RFC = """
+    version: 1
+    node_types:
+      - label: Adr
+        key: [adr_id]
+        metadata: [{name: path}, {name: adr_id}]
+        source: {provider: docs, paths: ["decisions/**/*.md"], fields: {adr_id: id}}
+      - label: Rfc
+        key: [id]
+        metadata: [{name: path}, {name: id}]
+        source: {provider: docs, paths: ["**/*.md"], where: [{field: kind, is: rfc}]}
+    relationships:
+      - {type: REPLACES, provider: docs, from: Adr, to: Adr, field: supersedes}
+      - {type: CITES, provider: docs, from: Rfc, to: Adr, field: cites}
+"""
+
+
+def owners_of(spec, selected):
+    return docs.keyed_owners(docs.keyed_claims(spec, selected))
+
+
+def keyed_nodes(spec, files):
+    selected = read_selected(spec, files)
+    return build_nodes(spec, "demo", selected, owners=owners_of(spec, selected))
+
+
+def keyed_edges(spec, files, targets=None):
+    selected = read_selected(spec, files)
+    return build_edges(spec, "demo", selected, targets, owners=owners_of(spec, selected))
+
+
+def test_spec_carries_the_key_field():
+    (adr,) = spec_of(ADR).types
+    assert adr.key == docs.DocsField("adr_id", "id", "string", False)
+    assert adr.key in adr.fields
+    assert spec_of(RUNBOOK).types[0].key is None
+
+
+def test_an_owners_node_is_named_by_its_key(tmp_path):
+    files = write(tmp_path, {"decisions/adr-012.md": fm("id: ADR-012\ntitle: Use Neo4j")})
+    (node,), problems = keyed_nodes(spec_of(ADR), files)
+    assert problems == []
+    assert node == {
+        "label": "Adr",
+        "repo_id": "demo",
+        "name": "ADR-012",
+        "properties": {"path": "decisions/adr-012.md", "extractor": "docs", "adr_id": "ADR-012", "title": "Use Neo4j"},
+    }
+
+
+def test_an_integer_key_is_its_decimal_text_and_links_meet_it(tmp_path):
+    files = write(tmp_path, {
+        "decisions/a.md": fm("id: 12"),
+        "decisions/b.md": fm("id: 13\nsupersedes: 12"),
+    })
+    nodes, _ = keyed_nodes(spec_of(ADR), files)
+    assert names(nodes) == ["12", "13"]
+    assert [(e["from_name"], e["from_path"], e["to_name"]) for e in keyed_edges(spec_of(ADR), files)] == [
+        ("13", "decisions/b.md", "12"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("yaml_line", "reason"),
+    [
+        ("id: true", "'id' is not text or a whole number"),
+        ("id: 1.5", "'id' is not text or a whole number"),
+        ("id: [ADR-1]", "'id' is not text or a whole number"),
+        ("id: {a: b}", "'id' is not text or a whole number"),
+        ("id: 2026-10-06", "'id' is not text or a whole number"),
+        ("id: null", "missing 'id', which names the entry; add an `id:` line"),
+        ("title: no id", "missing 'id', which names the entry; add an `id:` line"),
+        ("id: ''", "'id' is empty"),
+        ("id: ' ADR-1'", "'id' starts or ends with whitespace"),
+        ("id: 'ADR-1 '", "'id' starts or ends with whitespace"),
+        ("id: 9223372036854775808", "'id' does not fit in 64 bits"),
+        pytest.param("id: " + "x" * 4097, "'id' is longer than 4 KiB", id="over-4-kib"),
+        ('id: "ADR\\u202e1"', "'id' holds an invisible or control character"),
+        ('id: "ADR\\a1"', "'id' holds an invisible or control character"),
+        ('id: "ADR\\N1"', "'id' holds an invisible or control character"),
+        ('id: "ADR\\ud8001"', "'id' is not valid text"),
+        ("id: ./ADR-1", "'id' starts with ./, which a link can never name"),
+    ],
+)
+def test_a_value_that_is_not_a_key_leaves_the_file_out(tmp_path, yaml_line, reason):
+    files = write(tmp_path, {"decisions/a.md": fm(yaml_line)})
+    nodes, problems = keyed_nodes(spec_of(ADR), files)
+    assert nodes == []
+    assert problems == [docs.Problem("Adr", "decisions/a.md", reason)]
+    assert docs.keyed_claims(spec_of(ADR), read_selected(spec_of(ADR), files)) == {}
+
+
+def test_the_key_field_is_required_whatever_it_says(tmp_path):
+    schema = ADR.replace("- {name: adr_id}", "- {name: adr_id, required: false}")
+    files = write(tmp_path, {"decisions/a.md": fm("title: x")})
+    nodes, problems = keyed_nodes(spec_of(schema), files)
+    assert nodes == [] and [p.reason for p in problems] == ["missing 'id', which names the entry; add an `id:` line"]
+
+
+def test_nfc_and_nfd_spellings_are_distinct_keys(tmp_path):
+    files = write(tmp_path, {
+        "decisions/a.md": fm("id: \"café\""),
+        "decisions/b.md": fm("id: \"café\""),
+    })
+    nodes, _ = keyed_nodes(spec_of(ADR), files)
+    assert names(nodes) == sorted(["café", "café"])
+
+
+def test_the_original_comes_first_in_claimant_order():
+    copies = [
+        "decisions/adr-012 copy.md",
+        "decisions/adr-012 - Copy.md",
+        "decisions/adr-012 (1).md",
+        "decisions/adr-012-v2.md",
+    ]
+    for copy in copies:
+        assert copy < "decisions/adr-012.md"  # plain code-point order would pick the copy
+    ordered = sorted([*copies, "decisions/adr-012.md"], key=docs.claimant_order)
+    assert ordered[0] == "decisions/adr-012.md"
+
+
+def test_claimant_order_breaks_a_stem_tie_on_the_full_path():
+    assert sorted(["x.md", "x.markdown"], key=docs.claimant_order) == sorted(["x.md", "x.markdown"])
+    assert docs.claimant_order("x.md") != docs.claimant_order("x.markdown")
+
+
+def test_duplicates_give_one_node_and_its_edges_for_the_owner_only(tmp_path):
+    files = write(tmp_path, {
+        "decisions/adr-012.md": fm("id: ADR-012\ntitle: original\nsupersedes: ADR-001"),
+        "decisions/adr-012 copy.md": fm("id: ADR-012\ntitle: copy\nsupersedes: ADR-002"),
+        "decisions/adr-012 (1).md": fm("id: ADR-012\ntitle: copy\nsupersedes: ADR-003"),
+    })
+    spec = spec_of(ADR)
+    (node,), problems = keyed_nodes(spec, files)
+    assert node["properties"]["path"] == "decisions/adr-012.md"
+    assert problems == []  # losers are a doctor concern, never a batch problem
+    assert [(e["from_path"], e["to_name"]) for e in keyed_edges(spec, files)] == [("decisions/adr-012.md", "ADR-001")]
+    claims = docs.keyed_claims(spec, read_selected(spec, files))
+    assert claims == {("Adr", "ADR-012"): ["decisions/adr-012.md", "decisions/adr-012 (1).md", "decisions/adr-012 copy.md"]}
+    assert docs.keyed_owners(claims) == {("Adr", "ADR-012"): "decisions/adr-012.md"}
+
+
+def test_owners_do_not_depend_on_the_order_of_files(tmp_path):
+    files = write(tmp_path, {
+        "decisions/b.md": fm("id: X"),
+        "decisions/a.md": fm("id: X"),
+        "decisions/c copy.md": fm("id: Y"),
+        "decisions/c.md": fm("id: Y"),
+    })
+    spec = spec_of(ADR)
+    results = set()
+    for order in itertools.permutations(files.items()):
+        selected = read_selected(spec, dict(order))
+        results.add(tuple(sorted(owners_of(spec, selected).items())))
+    assert results == {((("Adr", "X"), "decisions/a.md"), (("Adr", "Y"), "decisions/c.md"))}
+
+
+def test_a_file_is_judged_separately_for_each_type(tmp_path):
+    files = write(tmp_path, {
+        "decisions/adr-1.md": fm("id: ADR-1"),
+        "decisions/x.md": fm("id: ADR-1\nkind: rfc\nsupersedes: ADR-9\ncites: ADR-1"),
+        "notes/y.md": fm("kind: rfc"),  # no claim in Rfc: nothing for it
+    })
+    spec = spec_of(ADR_AND_RFC)
+    nodes, problems = keyed_nodes(spec, files)
+    assert sorted((n["label"], n["name"], n["properties"]["path"]) for n in nodes) == [
+        ("Adr", "ADR-1", "decisions/adr-1.md"), ("Rfc", "ADR-1", "decisions/x.md"),
+    ]
+    assert problems == [docs.Problem("Rfc", "notes/y.md", "missing 'id', which names the entry; add an `id:` line")]
+    assert [(e["from_label"], e["rel_type"], e["from_path"], e["to_name"]) for e in keyed_edges(spec, files)] == [
+        ("Rfc", "CITES", "decisions/x.md", "ADR-1"),
+    ]
+
+
+def test_a_file_that_fails_conditions_or_a_required_field_never_claims(tmp_path):
+    schema = """
+        version: 1
+        node_types:
+          - label: Adr
+            key: [adr_id]
+            metadata: [{name: path}, {name: adr_id}, {name: owner, required: true}]
+            source:
+              provider: docs
+              paths: ["decisions/*.md"]
+              where: [{field: kind, is: adr}]
+              fields: {adr_id: id}
+    """
+    files = write(tmp_path, {
+        "decisions/a.md": fm("id: X\nowner: o"),  # fails where
+        "decisions/b.md": fm("id: X\nkind: adr"),  # missing required owner
+        "decisions/c.md": fm("id: X\nkind: adr\nowner: o"),
+    })
+    (node,), _ = keyed_nodes(spec_of(schema), files)
+    assert node["properties"]["path"] == "decisions/c.md"
+
+
+def test_owners_are_required_for_a_field_keyed_spec(tmp_path):
+    files = write(tmp_path, {"decisions/a.md": fm("id: X")})
+    spec = spec_of(ADR)
+    with pytest.raises(ValueError, match="owners"):
+        build_nodes(spec, "demo", read_selected(spec, files))
+    with pytest.raises(ValueError, match="owners"):
+        build_edges(spec, "demo", read_selected(spec, files))
+
+
+def test_a_path_keyed_spec_needs_no_owners_and_is_unchanged(tmp_path):
+    files = write(tmp_path, {"runbooks/a.md": fm("owner: o\nservice: api")})
+    spec = spec_of(RUNBOOK)
+    selected = read_selected(spec, files)
+    assert build_nodes(spec, "demo", selected) == build_nodes(spec, "demo", selected, owners={})
+    (node,), _ = build_nodes(spec, "demo", selected)
+    assert node["name"] == node["properties"]["path"] == "runbooks/a.md"
+    (edge,) = build_edges(spec, "demo", selected)
+    assert edge["from_name"] == edge["from_path"] == "runbooks/a.md"
+    assert docs.keyed_claims(spec, selected) == {}
+
+
+def test_expand_to_owners_adds_only_owners(tmp_path):
+    files = write(tmp_path, {
+        "decisions/adr-1.md": fm("id: ADR-1"),
+        "decisions/adr-1 copy.md": fm("id: ADR-1"),
+        "decisions/adr-2.md": fm("id: ADR-2"),
+        "decisions/adr-3.md": fm("id: ADR-3"),
+    })
+    spec = spec_of(ADR)
+    selected = read_selected(spec, files)
+    claims = docs.keyed_claims(spec, selected)
+    view = docs.KeyedView(files, selected, claims, docs.keyed_owners(claims))
+    batch = read_selected(spec, {"decisions/adr-1 copy.md": files["decisions/adr-1 copy.md"]})
+    keys = {("Adr", "ADR-1"), ("Adr", "ADR-2"), ("Adr", "ADR-404")}
+    expanded = docs.expand_to_owners(view, batch, keys)
+    assert sorted(expanded) == ["decisions/adr-1 copy.md", "decisions/adr-1.md", "decisions/adr-2.md"]
+    assert len(expanded) <= len(batch) + len(keys)
+    assert expanded["decisions/adr-2.md"] == selected["decisions/adr-2.md"]
+    assert "decisions/adr-1 copy.md" in batch and "decisions/adr-1.md" not in batch  # batch untouched
+    nodes, _ = build_nodes(spec, "demo", expanded, owners=view.owners)
+    assert sorted((n["name"], n["properties"]["path"]) for n in nodes) == [
+        ("ADR-1", "decisions/adr-1.md"), ("ADR-2", "decisions/adr-2.md"),
+    ]
+
+
+def test_report_names_duplicates_and_missing_ids(tmp_path):
+    lines = report(tmp_path, {
+        "decisions/adr-012.md": fm("id: ADR-012"),
+        "decisions/adr-012 copy.md": fm("id: ADR-012"),
+        "decisions/adr-013.md": fm("id: ADR-013"),
+        "decisions/draft.md": fm("title: draft"),
+    }, schema=ADR)
+    assert [line["detail"] for line in lines] == [
+        "Adr: 4 files match, 2 Adr entries, 1 duplicate id",
+        "Adr: decisions/adr-012 copy.md: 'id' 'ADR-012' is also used by decisions/adr-012.md, "
+        "whose path sorts first and keeps it; change the id in one of them",
+        "Adr: decisions/draft.md: missing 'id', which names the entry; add an `id:` line",
+    ]
+
+
+def test_report_counts_duplicate_ids_with_conditions(tmp_path):
+    schema = ADR.replace('paths: ["decisions/**/*.md"]', 'paths: ["decisions/**/*.md"]\n          where: [{field: kind, is: adr}]')
+    lines = report(tmp_path, {
+        "decisions/a.md": fm("id: X\nkind: adr"),
+        "decisions/b.md": fm("id: X\nkind: adr"),
+        "decisions/c.md": fm("id: X"),
+    }, schema=schema)
+    assert lines[0]["detail"] == (
+        "Adr: 3 files match the paths; 1 left out by conditions; 1 Adr entry; 1 duplicate id"
+    )
+
+
+def test_report_caps_duplicate_and_missing_lines_at_five_files(tmp_path):
+    files = {f"decisions/adr-1 ({i}).md": fm("id: ADR-1") for i in range(4)}
+    files["decisions/adr-1.md"] = fm("id: ADR-1")
+    files |= {f"decisions/draft{i}.md": fm("title: d") for i in range(3)}
+    lines = report(tmp_path, files, schema=ADR)
+    details = [line["detail"] for line in lines]
+    assert details[0] == "Adr: 8 files match, 1 Adr entry, 1 duplicate id"
+    assert len(details) == 1 + docs.REPORT_FILE_LIMIT + 1
+    assert details[-1] == "Adr: and 2 more files with problems"
+
+
+def test_unmatched_report_names_the_file_and_hints_for_field_keyed_targets(tmp_path):
+    spec = spec_of(ADR_AND_RFC.replace(
+        "relationships:",
+        "relationships:\n      - {type: COVERS, provider: docs, from: Adr, to: Service, field: service}",
+    ))
+    files = write(tmp_path, {
+        "decisions/adr-013.md": fm("id: ADR-013\nsupersedes: decisions/adr-012.md\nservice: api"),
+    })
+    edges = keyed_edges(spec, files)
+    lines = docs.unmatched_report(spec, edges, {"Adr": set(), "Service": set()})
+    assert [line["detail"] for line in lines] == [
+        "Adr: service 'api' in decisions/adr-013.md matches no Service",
+        "Adr: supersedes 'decisions/adr-012.md' in decisions/adr-013.md matches no Adr "
+        "(Adr entries are named by 'id', not by file path)",
+    ]

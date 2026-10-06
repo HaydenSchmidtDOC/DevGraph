@@ -17,14 +17,19 @@ items a condition examines at 100. With the schema's own caps (docs types,
 conditions and `*`s per `like`), that bounds the condition work per file, and
 each (type, file) verdict is worked out once per read (see `Selected`).
 
-Nodes are keyed like filesystem nodes (`name = path = <repo-relative path>`)
-and tagged `extractor = "docs"`. This module is pure: it reads files and
+A type keyed `[path]` names its nodes like filesystem nodes (`name = path =
+<repo-relative path>`). A type keyed on a front-matter field names each node
+by that field's text (`name = "ADR-012"`, with `path` still recording the
+file). When several files claim one key, the file first in `claimant_order`
+owns it (`keyed_owners`), and only the owner yields a node and edges. Every
+node is tagged `extractor = "docs"`. This module is pure: it reads files and
 returns plain data, and never touches the graph or imports the dispatcher.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -65,6 +70,8 @@ class DocsType:
     paths: tuple[str, ...]
     where: tuple[Condition, ...]
     fields: tuple[DocsField, ...]
+    #: The field (one of `fields`) the type is keyed on, or None for `[path]`.
+    key: DocsField | None = None
 
 
 @dataclass(frozen=True)
@@ -101,7 +108,8 @@ def docs_spec(effective: EffectiveSchema) -> DocsSpec | None:
             for field in node_type.metadata
             if field.name != "path"
         )
-        types.append(DocsType(node_type.label, source.paths, source.where, fields))
+        key = next((field for field in fields if (field.name,) == node_type.key), None)
+        types.append(DocsType(node_type.label, source.paths, source.where, fields, key))
     if not types:
         return None
     relationships = tuple(
@@ -286,11 +294,54 @@ def _coerce(value: Any, declared: str) -> tuple[Any, str | None]:
     return None, f"is not {_TYPE_WORDS[declared]}"
 
 
+def _key_text(raw: Any) -> tuple[str | None, str | None]:
+    """(key text, None), or (None, why the value can't name an entry, after the field's name).
+
+    A str is itself and an int (never a bool, within int64) is its decimal
+    text. Nothing is trimmed, case-folded or normalised: text a person could
+    not tell apart from another key, or that a link could never name, is
+    refused instead.
+    """
+    if type(raw) is int:
+        if not _in_int64(raw):
+            return None, "does not fit in 64 bits"
+        return str(raw), None
+    if type(raw) is not str:
+        return None, "is not text or a whole number"
+    problem = _text_problem(raw)
+    if problem is not None:
+        return None, problem
+    if not raw:
+        return None, "is empty"
+    if raw != raw.strip():
+        return None, "starts or ends with whitespace"
+    if any(unicodedata.category(c) in ("Cc", "Cf") for c in raw):
+        return None, "holds an invisible or control character"
+    if raw.startswith("./"):
+        return None, "starts with ./, which a link can never name"
+    return raw, None
+
+
 def _node(docs_type: DocsType, repo_id: str, rel: str, values: Mapping[Any, Any]) -> tuple[dict | None, list[str]]:
-    """The node for one selected file that meets every condition, or None, plus reasons."""
+    """The node for one selected file that meets every condition, or None, plus reasons.
+
+    A field-keyed type's key is checked first and always required.
+    """
     properties: dict[str, Any] = {"path": rel, "extractor": EXTRACTOR}
+    name = rel
+    key = docs_type.key
+    if key is not None:
+        raw = values.get(key.key)
+        if raw is None:
+            return None, [f"missing {key.key!r}, which names the entry; add an `{key.key}:` line"]
+        name, why = _key_text(raw)
+        if why is not None:
+            return None, [f"{key.key!r} {why}"]
     reasons: list[str] = []
     for field in docs_type.fields:
+        if field is key:
+            properties[field.name] = name
+            continue
         raw = values.get(field.key)
         if raw is None:
             if field.required:
@@ -303,7 +354,7 @@ def _node(docs_type: DocsType, repo_id: str, rel: str, values: Mapping[Any, Any]
                 return None, [f"{field.key!r} {why}; it is required, so the file is skipped"]
             reasons.append(f"{field.key!r} {why}, left blank")
         properties[field.name] = value
-    return {"label": docs_type.label, "repo_id": repo_id, "name": rel, "properties": properties}, reasons
+    return {"label": docs_type.label, "repo_id": repo_id, "name": name, "properties": properties}, reasons
 
 
 class Selected(dict[str, tuple[dict[Any, Any] | None, str | None]]):
@@ -342,8 +393,83 @@ def _conditions_hold(docs_type: DocsType, rel: str, selected: Selected) -> bool:
     return verdict
 
 
-def _evaluate(spec: DocsSpec, repo_id: str, selected: Selected):
-    """Yield (node or None, problems, front matter) per selected (type, file)."""
+def claimant_order(rel: str) -> tuple[tuple[str, ...], str]:
+    """Sort key among files claiming one key: folders and stem, then the full path.
+
+    Comparing the stem without its suffix puts `adr-012.md` before the copies
+    editors make of it (`adr-012 copy.md`, `adr-012 (1).md`, `adr-012-v2.md`),
+    which plain path order would put first.
+    """
+    path = PurePosixPath(rel)
+    return (*path.parent.parts, path.stem), rel
+
+
+def keyed_claims(spec: DocsSpec, selected: Selected) -> dict[tuple[str, str], list[str]]:
+    """{(label, key): the paths claiming it, in claimant order}, for the field-keyed types.
+
+    A claim is a (type, file) pair the type selects, whose conditions hold,
+    with no required-field skip and a valid key. Each label has its own keys.
+    """
+    claims: dict[tuple[str, str], list[str]] = {}
+    for docs_type in spec.types:
+        if docs_type.key is None:
+            continue
+        for rel, (values, _problem) in selected.items():
+            if values is None or not selects(docs_type, rel) or not _conditions_hold(docs_type, rel, selected):
+                continue
+            node, _reasons = _node(docs_type, "", rel, values)
+            if node is not None:
+                claims.setdefault((docs_type.label, node["name"]), []).append(rel)
+    for paths in claims.values():
+        paths.sort(key=claimant_order)
+    return claims
+
+
+def keyed_owners(claims: Mapping[tuple[str, str], list[str]]) -> dict[tuple[str, str], str]:
+    """{(label, key): the owning path}: the first claimant of each key."""
+    return {key: paths[0] for key, paths in claims.items()}
+
+
+@dataclass(frozen=True)
+class KeyedView:
+    """The repository's field-keyed docs files as one batch sees them.
+
+    `files` maps every indexable repo-relative path to its file, `selected`
+    is the front matter of the files a field-keyed type selects, and
+    `claims` and `owners` are computed from all of it.
+    """
+
+    files: Mapping[str, Path]
+    selected: Selected
+    claims: Mapping[tuple[str, str], list[str]]
+    owners: Mapping[tuple[str, str], str]
+
+
+def expand_to_owners(view: KeyedView, batch_selected: Selected, keys: Iterable[tuple[str, str]]) -> Selected:
+    """The batch's front matter plus that of the owner of each (label, key) in `keys`.
+
+    Only owners are added, never other claimants, so the result holds at
+    most |batch| + |keys| files. `batch_selected` is left unchanged.
+    """
+    expanded = Selected(batch_selected)
+    expanded.verdicts.update(batch_selected.verdicts)
+    for key in keys:
+        owner = view.owners.get(key)
+        if owner is not None and owner not in expanded:
+            expanded[owner] = view.selected[owner]
+    return expanded
+
+
+def _evaluate(
+    spec: DocsSpec, repo_id: str, selected: Selected, owners: Mapping[tuple[str, str], str] | None
+):
+    """Yield (node or None, problems, front matter) per selected (type, file).
+
+    A field-keyed (type, file) pair whose key `owners` gives to another file
+    yields nothing: losers are a doctor concern (`source_report`).
+    """
+    if owners is None and any(docs_type.key is not None for docs_type in spec.types):
+        raise ValueError("owners are required for a docs type keyed on a front-matter field")
     for rel in sorted(selected):
         values, problem = selected[rel]
         for docs_type in spec.types:
@@ -355,17 +481,26 @@ def _evaluate(spec: DocsSpec, repo_id: str, selected: Selected):
             if not _conditions_hold(docs_type, rel, selected):
                 continue
             node, reasons = _node(docs_type, repo_id, rel, values)
+            if node is not None and docs_type.key is not None and owners.get((docs_type.label, node["name"])) != rel:
+                continue
             yield node, [Problem(docs_type.label, rel, reason) for reason in reasons], values
 
 
-def build_nodes(spec: DocsSpec, repo_id: str, selected: Selected) -> tuple[list[dict], list[Problem]]:
+def build_nodes(
+    spec: DocsSpec,
+    repo_id: str,
+    selected: Selected,
+    owners: Mapping[tuple[str, str], str] | None = None,
+) -> tuple[list[dict], list[Problem]]:
     """Nodes for the files `read_selected` read, and the problems met.
 
     A problem either skipped the file for that type or left a value blank.
+    `owners` (from `keyed_owners`, over every file of the repository) is
+    required when a type is keyed on a front-matter field.
     """
     nodes: list[dict] = []
     problems: list[Problem] = []
-    for node, found, _values in _evaluate(spec, repo_id, selected):
+    for node, found, _values in _evaluate(spec, repo_id, selected, owners):
         problems += found
         if node is not None:
             nodes.append(node)
@@ -396,17 +531,18 @@ def build_edges(
     repo_id: str,
     selected: Selected,
     targets: set[tuple[str, str]] | None = None,
+    owners: Mapping[tuple[str, str], str] | None = None,
 ) -> list[dict]:
     """Edges from the docs nodes of the files `read_selected` read to the nodes their front matter names.
 
     With `targets`, only edges to those (label, name) pairs are returned.
     Whether a target exists is the graph's business: an edge to a missing
-    node is skipped when it is written.
+    node is skipped when it is written. `owners` is as for `build_nodes`.
     """
     if not spec.relationships:
         return []
     rels: list[dict] = []
-    for node, _problems, values in _evaluate(spec, repo_id, selected):
+    for node, _problems, values in _evaluate(spec, repo_id, selected, owners):
         if node is None:
             continue
         for relationship in spec.relationships:
@@ -423,8 +559,9 @@ def build_edges(
                     "to_name": name,
                     "repo_id": repo_id,
                     "properties": {},
-                    # which declaration made the edge, for `unmatched_report`; not written
+                    # which declaration and file made the edge, for `unmatched_report`; not written
                     "field": relationship.field,
+                    "from_path": node["properties"]["path"],
                 })
     return rels
 
@@ -467,7 +604,15 @@ def source_report(
     by_rel = files_by_rel(repo_root, files)
     if selected is None:
         selected = read_selected(spec, by_rel)
-    nodes, problems = build_nodes(spec, "", selected)
+    claims = keyed_claims(spec, selected)
+    nodes, problems = build_nodes(spec, "", selected, keyed_owners(claims))
+    for (label, key), (owner, *losers) in sorted(claims.items()):
+        field = next(docs_type.key.key for docs_type in spec.types if docs_type.label == label)
+        for rel in losers:
+            problems.append(Problem(label, rel, (
+                f"{field!r} '{key}' is also used by {owner}, whose path sorts first and keeps it; "
+                f"change the id in one of them"
+            )))
     lines: list[dict[str, str]] = []
     for docs_type in spec.types:
         label = docs_type.label
@@ -487,10 +632,13 @@ def source_report(
                 if selected[rel][0] is not None and not _conditions_hold(docs_type, rel, selected)
             )
             counts = [counts[0] + " the paths", f"{left_out} left out by conditions"]
-        entry_words = _plural(entries, f"{label} entry", f"{label} entries")
+        words = [_plural(entries, f"{label} entry", f"{label} entries")]
+        duplicates = sum(1 for (claimed, _key), paths in claims.items() if claimed == label and len(paths) > 1)
+        if duplicates:
+            words.append(_plural(duplicates, "duplicate id", "duplicate ids"))
         lines.append({
             "status": "ok" if entries else "warning",
-            "detail": f"{label}: " + ("; ".join(counts + [entry_words]) if docs_type.where else f"{counts[0]}, {entry_words}"),
+            "detail": f"{label}: " + ("; " if docs_type.where else ", ").join(counts + words),
         })
         reasons: dict[str, list[str]] = {}
         for problem in problems:
@@ -525,6 +673,7 @@ def unmatched_report(spec: DocsSpec, edges: list[dict], present: Mapping[str, se
     how many more.
     """
     lines: list[dict[str, str]] = []
+    key_names = {docs_type.label: docs_type.key.key for docs_type in spec.types if docs_type.key is not None}
     buckets: dict[tuple[str, str, str, str], list[dict]] = {}
     for edge in edges:
         buckets.setdefault((edge["rel_type"], edge["field"], edge["from_label"], edge["to_label"]), []).append(edge)
@@ -532,17 +681,22 @@ def unmatched_report(spec: DocsSpec, edges: list[dict], present: Mapping[str, se
         known = present.get(relationship.to_label, set())
         missing = sorted(
             {
-                (edge["from_name"], edge["to_name"], edge["from_label"])
+                (edge["from_path"], edge["to_name"], edge["from_label"])
                 for from_label in relationship.from_labels
                 for edge in buckets.get((relationship.type, relationship.field, from_label, relationship.to_label), ())
                 if edge["to_name"] not in known
             }
         )
+        to_label = relationship.to_label
+        hint = (
+            f" ({to_label} entries are named by '{_printable(key_names[to_label])}', not by file path)"
+            if to_label in key_names else ""
+        )
         for path, value, label in missing[:REPORT_FILE_LIMIT]:
             lines.append({
                 "status": "warning",
                 "detail": f"{label}: {_printable(relationship.field)} '{_printable(value)}' in "
-                          f"{_printable(path)} matches no {relationship.to_label}",
+                          f"{_printable(path)} matches no {to_label}{hint}",
             })
         if len(missing) > REPORT_FILE_LIMIT:
             lines.append({
