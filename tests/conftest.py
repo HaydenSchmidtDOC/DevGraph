@@ -17,6 +17,8 @@ if not os.environ.get("DISPLAY"):
 
 # The user's real DevGraph home, fixed before any test can repoint HOME or
 # USERPROFILE (expanduser reads USERPROFILE on Windows). Tests must never touch it.
+# Set DEVGRAPH_ALLOW_REAL_HOME=1 to deliberately run against it: no guard, no temp home.
+_ALLOW_REAL_HOME = bool(os.environ.get("DEVGRAPH_ALLOW_REAL_HOME"))
 _REAL_DEVGRAPH_HOME = os.path.normcase(os.path.realpath(os.path.join(os.path.expanduser("~"), ".devgraph")))
 _GUARDED_EVENTS = frozenset(
     {
@@ -52,7 +54,9 @@ def _under_real_home(target) -> bool:
 
 
 def _real_home_guard(event, args):
-    """Refuse, and record, any file access under the real DevGraph home.
+    """Refuse, and record, any file access under the real DevGraph home:
+    reads as well as writes, since even a read-only SQLite open updates the
+    registry's -shm file.
 
     Recorded as well as refused because production code may swallow the
     PermissionError (the MCP telemetry writer does); the record still fails
@@ -66,13 +70,17 @@ def _real_home_guard(event, args):
             raise PermissionError(f"test touched the real DevGraph home: {event} {target!r}")
 
 
-sys.addaudithook(_real_home_guard)
+if not _ALLOW_REAL_HOME:
+    sys.addaudithook(_real_home_guard)
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _isolate_devgraph_home(tmp_path_factory):
     """Point HOME, USERPROFILE and the registry path at a per-session temp home,
     so a test that forgets its own isolation still cannot reach ~/.devgraph."""
+    if _ALLOW_REAL_HOME:
+        yield None
+        return
     from devgraph.config.settings import get_settings
 
     home = tmp_path_factory.mktemp("home")
