@@ -441,6 +441,8 @@ def describe_node(
         No match raises ToolError with suggestions. `Repository` nodes are never
         matched or listed.
     """
+    if not name.strip():
+        raise ToolError("name is empty; pass a node's exact name, or search_component to find one")
     if direction not in _DESCRIBE_DIRECTIONS:
         raise ToolError(f"direction must be 'both', 'out' or 'in', not {_echo(direction)}")
     types = _validated_identifiers(relationship_types, RELATIONSHIP_TYPE_PATTERN, "relationship type")

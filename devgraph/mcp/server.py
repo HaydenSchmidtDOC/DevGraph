@@ -783,7 +783,7 @@ def build_server(
             "identifier it expects (a name vs. a file path vs. git refs — the most "
             "common usage mistake), whether its response uses the count/results/"
             "truncated envelope, and which build phase introduced it. Cheaper to "
-            "read once than to infer from trial and error across 20 tools."
+            "read once than to infer from trial and error across every tool."
         ),
         mime_type="application/json",
     )

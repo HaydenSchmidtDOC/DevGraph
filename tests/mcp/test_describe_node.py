@@ -539,3 +539,11 @@ def test_a_timeout_reaches_the_client_through_the_server(served_with):
     text = _visible(served_with(engine), {"name": "x"})
     assert "describe_node timed out after 10s; narrow it with" in text
     assert "secret detail" not in text
+
+
+@pytest.mark.parametrize("name", ["", "   ", "\t\n"])
+def test_an_empty_name_is_rejected(name):
+    engine = StubEngine()
+    with pytest.raises(ToolError, match="name is empty"):
+        describe_node(engine, "demo", name)
+    assert engine.calls == []

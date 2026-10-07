@@ -346,10 +346,12 @@ Things to know:
   (for example `["Module"]`).
 - `status: "ambiguous"` means the name matched more than one node (say a
   `Module` and a `File` on the same path, or a `main` function in two
-  files). The response lists the `candidates`; call again with one
-  candidate's `label` and `file`.
+  files). The response lists the `candidates`; pick one and call
+  `describe_node(**candidate)`. A candidate carries `file` only when it has
+  one (a `Module` doesn't), so pass the candidate as it is.
 - A name that matches nothing is an error that names the repository it
-  searched and suggests close names.
+  searched and suggests up to five nodes whose name or path contains it
+  (partial-name matches, not fuzzy ones).
 - There is no `cross_repo`. Pass `repo_id` to look in another repository.
 
 ## Recency filtering and git-derived properties
