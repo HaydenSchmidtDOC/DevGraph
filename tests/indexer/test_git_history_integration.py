@@ -316,3 +316,36 @@ def test_sync_git_history_force_resyncs_even_when_head_unchanged(graph_engine, t
 def test_sync_git_history_unknown_repo_raises(graph_engine, registry):
     with pytest.raises(ValueError):
         sync_git_history(graph_engine, registry, "nonexistent")
+
+
+def test_recency_never_creates_a_node_for_a_file_the_graph_does_not_hold(graph_engine, temp_git_repo, registry):
+    """A commit touching a file with no Module (README.md, an image, a deleted
+    file) leaves no Module behind: recency only annotates indexed nodes, so
+    the graph still equals a fresh scan's apart from recency itself."""
+    (temp_git_repo / "README.md").write_text("# Demo\n")
+    _run_git(temp_git_repo, "add", "README.md")
+    _run_git(temp_git_repo, "commit", "-m", "Add a readme")
+    record = registry.add_repo(temp_git_repo, repo_id="_smoketest_sync_no_stray")
+    graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
+
+    try:
+        assert sync_git_history(graph_engine, registry, record.repo_id)["mode"] == "initial"
+        (temp_git_repo / "gone.py").write_text("y = 2\n")
+        _run_git(temp_git_repo, "add", "gone.py")
+        _run_git(temp_git_repo, "commit", "-m", "Add a module that is never indexed")
+        assert sync_git_history(graph_engine, registry, record.repo_id)["mode"] == "fast"
+        assert sync_git_history(graph_engine, registry, record.repo_id, force=True)["mode"] == "reconcile"
+        graph_engine.set_recency("Function", record.repo_id, "missing", "2026-01-01", "2026-01-02", file="x.py")
+
+        modules = graph_engine.run_cypher(
+            "MATCH (n {repo_id: $repo_id}) WHERE NOT n:Commit RETURN labels(n)[0] AS label, n.name AS name",
+            {"repo_id": record.repo_id},
+        )
+        assert {(m["label"], m["name"]) for m in modules} == {("Module", "service.py")}
+        staged = graph_engine.run_cypher(
+            "MATCH (m:Module {repo_id: $repo_id, name: 'service.py'}) RETURN m.created_at AS c",
+            {"repo_id": record.repo_id},
+        )
+        assert staged[0]["c"] is not None
+    finally:
+        graph_engine.delete_repository(record.repo_id)

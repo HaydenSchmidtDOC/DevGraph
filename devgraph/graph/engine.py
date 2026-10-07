@@ -1061,6 +1061,10 @@ class GraphEngine:
         incremental batches). See `set_recency` for the plain-overwrite
         variant used during reconciliation.
 
+        Both only annotate a node that already exists (MATCH, not MERGE): a
+        commit also touches files that have no node (a README, an image, a
+        file deleted since), and recency must not create one for them.
+
         The `last_modified_by` CASE deliberately mirrors the
         `last_modified_at` comparison rather than having its own condition —
         that's what stops an out-of-order call from clobbering a newer
@@ -1078,7 +1082,7 @@ class GraphEngine:
         with self._driver.session() as session:
             _retry_transient(
                 session.run,
-                f"MERGE (n:{label} {merge_key}) "
+                f"MATCH (n:{label} {merge_key}) "
                 "SET n.created_at = CASE WHEN $created_at IS NULL THEN n.created_at "
                 "WHEN n.created_at IS NULL OR $created_at < n.created_at THEN $created_at "
                 "ELSE n.created_at END, "
@@ -1127,7 +1131,7 @@ class GraphEngine:
         with self._driver.session() as session:
             _retry_transient(
                 session.run,
-                f"MERGE (n:{label} {merge_key}) "
+                f"MATCH (n:{label} {merge_key}) "
                 f"SET {', '.join(set_clauses)}",
                 repo_id=repo_id,
                 name=name,
