@@ -524,6 +524,71 @@ def test_live_emitter_on_a_folder_deleted_and_recreated_with_the_same_inode_is_r
     assert rig.observer.unscheduled == [str(rig.root / "pkg")]
 
 
+def test_a_dead_emitter_forgets_its_closed_handle_before_it_is_unscheduled(tmp_path):
+    """watchdog's Windows emitter closes its directory handle when it stops
+    itself (its folder was deleted) but keeps the value; unschedule's stop()
+    would close it again, by then perhaps another object's handle."""
+    rig = FakeRig(tmp_path)
+    watch = rig.watch("pkg")
+    emitter = rig.observer._emitter_for_watch[watch]
+    emitter.alive, emitter._whandle = False, 1234
+    seen = []
+    unschedule = rig.observer.unschedule
+    rig.observer.unschedule = lambda w: (seen.append(emitter._whandle), unschedule(w))
+    rig.reconcile()
+    assert seen == [None]
+    assert rig.watched() == {"pkg": True}
+
+
+def test_a_live_emitter_keeps_its_handle_for_unschedule_to_close(tmp_path):
+    rig = FakeRig(tmp_path)
+    path = rig.root / "pkg"
+    watch = rig.watch("pkg")
+    emitter = rig.observer._emitter_for_watch[watch]
+    emitter._whandle = 1234
+    _watch, identity = rig.manager._watches["r"][path]
+    rig.manager._watches["r"][path] = (watch, (identity[0], identity[1] + 1))
+    seen = []
+    unschedule = rig.observer.unschedule
+    rig.observer.unschedule = lambda w: (seen.append(emitter._whandle), unschedule(w))
+    rig.reconcile()
+    assert seen == [1234]
+
+
+class StoppableObserver(FakeObserver):
+    """Records each emitter's handle when the observer is stopped (which stops
+    every emitter it still has)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.handles_at_stop: list = []
+
+    def is_alive(self) -> bool:
+        return True
+
+    def stop(self) -> None:
+        self.handles_at_stop = [getattr(e, "_whandle", None) for e in self._emitter_for_watch.values()]
+
+    def join(self, timeout=None) -> None:
+        pass
+
+
+@pytest.mark.parametrize("how", ["stop", "stop_single"])
+def test_stopping_forgets_the_closed_handle_of_a_dead_emitter(tmp_path, how):
+    rig = FakeRig(tmp_path, dirs=("pkg", "lib"))
+    rig.observer = rig.manager._observers["r"] = StoppableObserver()
+    dead = rig.observer._emitter_for_watch[rig.watch("pkg")]
+    live = rig.observer._emitter_for_watch[rig.watch("lib")]
+    dead.alive, dead._whandle = False, 1234
+    live._whandle = 5678
+    if how == "stop":
+        rig.manager.stop()
+    else:
+        with rig.manager._lock:
+            rig.manager._stop_single("r")
+    assert sorted(rig.observer.handles_at_stop, key=str) == [5678, None]
+
+
 class OpaqueObserver(FakeObserver):
     """An observer without watchdog's private `_emitter_for_watch` (a future
     watchdog may rename it): the reconcile falls back to identity checks."""

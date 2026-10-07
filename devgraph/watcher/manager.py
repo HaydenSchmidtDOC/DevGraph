@@ -188,6 +188,22 @@ class _GitStateEventHandler(FileSystemEventHandler):
         self._on_burst(self._repo_id, burst_start)
 
 
+def _forget_closed_handle(emitter: Any) -> None:
+    """Before a dead emitter is stopped again (unscheduled, or by its
+    observer's stop): watchdog's Windows emitter closes its directory handle
+    when it stops itself (its folder was deleted) but keeps the value, and a
+    second stop() would close it again, by then perhaps another object's
+    handle, which can crash the process. No-op for other emitters."""
+    if not emitter.is_alive() and getattr(emitter, "_whandle", None):
+        emitter._whandle = None
+
+
+def _forget_closed_handles(observer: Any) -> None:
+    """`_forget_closed_handle` for each of the observer's dead emitters."""
+    for emitter in list(getattr(observer, "_emitter_for_watch", {}).values()):
+        _forget_closed_handle(emitter)
+
+
 class WatcherManager:
     """Manages file watchers for active, watch-enabled repositories.
 
@@ -311,6 +327,7 @@ class WatcherManager:
         with self._lock:
             for repo_id, observer in self._observers.items():
                 if observer.is_alive():
+                    _forget_closed_handles(observer)
                     observer.stop()
                     observer.join(timeout=5)
             for handler in self._handlers.values():
@@ -590,6 +607,7 @@ class WatcherManager:
             handler.close()
 
         if observer.is_alive():
+            _forget_closed_handles(observer)
             observer.stop()
             observer.join(timeout=5)
         logger.debug(f"Stopped watcher for {repo_id}")
@@ -702,6 +720,8 @@ class WatcherManager:
                         and self._dir_identity(path) == identity
                     ):
                         continue
+                    if emitter is not None and not alive:
+                        _forget_closed_handle(emitter)
                     if emitters is None or emitter is not None:
                         try:
                             observer.unschedule(watch)
