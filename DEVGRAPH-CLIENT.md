@@ -37,7 +37,7 @@ requirements, mentions, and git history — for **Python, JavaScript/
 TypeScript, C#, C++, Java, Kotlin, Rust, and Go source**, detected per file by
 extension (a repo doesn't need to be single-language; each file is routed
 to the matching extractor automatically) — and exposes it through purpose-built MCP tools
-(`search_component`, `find_callers`, `impact_analysis`,
+(`search_component`, `describe_node`, `find_callers`, `impact_analysis`,
 `impact_analysis_for_diff`, `explain_architecture`, `blame_component`,
 `find_requirements_for`, `find_mentions`, `list_recent_changes`, `god_nodes`,
 `get_source`, and others), plus the opt-in `run_cypher` escape hatch. Read
@@ -238,7 +238,10 @@ repository only.
 path like `shared/utils/x.py` returns empty; the function name defined in
 that file, e.g. `batch_retrieve_payloads`, returns real results).
 `blame_component` is the opposite — it wants a **file path**, not a function
-name. `get_source` also takes a function/class **name**. Passing the wrong
+name. `get_source` also takes a function/class **name**. `describe_node`
+takes a node's exact **name**; a file, folder or docs node can also be named
+by its repo-relative path, and a docs node keyed by a front-matter id by that
+id (for example `ADR-013`). Passing the wrong
 kind of identifier looks like an empty/broken result but is a usage
 mismatch, not a graph gap.
 
@@ -251,7 +254,9 @@ before assuming you've seen everything. `find_related_files` and
 fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
 `max_results` (default 15) to widen the sample when you genuinely need more
 than the default. `search_component`'s `count` maxes out at 50 (its own
-Cypher cap) even if more matches exist beyond that.
+Cypher cap) even if more matches exist beyond that. `describe_node`'s
+response is not itself an envelope: each relationship group inside its
+`outgoing` and `incoming` maps is one (`{"count", "results", "truncated"}`).
 
 **Project tools**: if this repo has a `devgraph.tools.yaml`, the MCP session
 also serves its tools for the session's repository (`DEVGRAPH_MCP_REPO`, else
@@ -294,6 +299,7 @@ Prefer these over re-reading files when the question is structural:
 | Question shape | Tool |
 |---|---|
 | "What is X / where is it?" | `search_component` |
+| "What is X connected to? / follow X's links" | `describe_node` (a name, or a path or id for file, folder and docs nodes) |
 | "What is X, but only recently modified?" | `search_component` with `modified_within_commits=N` (only matches entities touched in the last N commits) |
 | "What calls X?" | `find_callers` (name, not path) |
 | "What calls X, but only recently modified?" | `find_callers` with `modified_within_commits=N` (filters results to entities touched in the last N commits) |
@@ -316,6 +322,35 @@ If a tool returns empty/sparse results, check whether the repo has actually
 been scanned (step 1/2) before concluding the graph has nothing to say — an
 unindexed repo will legitimately return empty results, that's not a tool
 failure.
+
+### Walking the graph
+
+`describe_node` shows one node and the nodes linked to it, so an assistant
+can follow links one step at a time:
+
+1. Find a starting node with `search_component` (it matches part of a name),
+   or start from a name you already know.
+2. Call `describe_node(name=...)`. It returns the node's fields and its
+   links, grouped by relationship type, in `outgoing` and `incoming`.
+3. Each linked node comes back as a ref, `{label, name, file}`. Pick one and
+   call `describe_node(**ref)` to look at it in turn.
+
+Things to know:
+
+- It goes one hop per call. Each relationship type lists at most 50
+  neighbours (`max_per_type`, default 10), and there is no paging.
+- `count` is the full number of neighbours of that type, so check
+  `truncated` to know whether you saw them all.
+- To narrow a busy node, pass `direction` (`"out"` or `"in"`),
+  `relationship_types` (for example `["CALLS"]`) or `neighbor_labels`
+  (for example `["Module"]`).
+- `status: "ambiguous"` means the name matched more than one node (say a
+  `Module` and a `File` on the same path, or a `main` function in two
+  files). The response lists the `candidates`; call again with one
+  candidate's `label` and `file`.
+- A name that matches nothing is an error that names the repository it
+  searched and suggests close names.
+- There is no `cross_repo`. Pass `repo_id` to look in another repository.
 
 ## Recency filtering and git-derived properties
 
