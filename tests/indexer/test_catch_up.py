@@ -12,6 +12,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -170,6 +171,68 @@ def test_a_pending_schema_offers_no_provider_files(tmp_path, stubbed, monkeypatc
     monkeypatch.setattr(dispatch, "schema_pending", lambda *a, **k: True)
     catch_up(None, "r", tmp_path, NOW)
     assert stubbed["offered"] == []
+
+
+def _routed_by_index_single_path(root, path, docs_root, mentions_enabled):
+    """Whether `index_paths` writes anything for this file through a built-in
+    extractor: `_index_single_path` on its resolved path, with a mock graph."""
+    resolved = path.resolve()
+    lists = {name: [] for name in (
+        "py_files", "js_files", "cs_files", "cpp_files", "java_files", "rs_files", "kt_files", "docs_files", "mention_files",
+    )}
+    extractions = {name: {} for name in (
+        "py_extractions", "js_extractions", "cs_extractions", "cpp_extractions", "java_extractions",
+        "rs_extractions", "kt_extractions", "go_extractions",
+    )}
+    return dispatch._index_single_path(
+        MagicMock(), "r", root, resolved, resolved.relative_to(root.resolve()).as_posix(),
+        docs_root, mentions_enabled, None, batch_services=set(), **lists, **extractions,
+    ) > 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+@pytest.mark.parametrize("mentions_enabled", [False, True])
+def test_would_index_routes_exactly_as_index_single_path(tmp_path, mentions_enabled):
+    root = tmp_path / "mixed"
+    (root / "docs" / "deep").mkdir(parents=True)
+    (root / "src").mkdir()
+    files = {
+        "src/a.py": "x = 1\n", "src/B.PY": "x = 1\n", "src/c.ts": "", "src/d.tsx": "", "src/e.js": "",
+        "src/f.cs": "", "src/g.cpp": "", "src/g.h": "", "src/G.java": "", "src/h.rs": "", "src/i.kt": "",
+        "src/j.go": "package j\n", "src/notes.txt": "", "src/data.json": "{}",
+        "Dockerfile": "FROM python\n", "src/dockerfile": "FROM python\n", "Containerfile": "FROM python\n",
+        "compose.yaml": "services: {}\n", "Docker-Compose.YML": "services: {}\n", "podman-compose.yaml": "",
+        "src/compose.yaml.bak": "", "README.md": "# R\n", "CHANGES.MARKDOWN": "# C\n",
+        "docs/a.md": "---\ntype: requirement\nid: r-a\n---\n# A\n", "docs/deep/b.markdown": "# B\n",
+        "docs/c.MD": "# C\n", "docs/d.txt": "",
+    }
+    for rel, text in files.items():
+        (root / rel).write_text(text)
+    links = {
+        "src/link.py": "notes.txt",          # a code name onto a file no extractor reads
+        "src/link.txt": "a.py",              # and the other way round
+        "doc-link.md": "docs/a.md",          # Markdown outside docs/ onto a note inside it
+        "docs/out-link.md": "../README.md",  # and the other way round
+        "src/note.txt": "../docs/a.md",      # a non-Markdown name onto a note
+        "Dockerfile.link": "Dockerfile",
+        "src/Dockerfile": "../src/notes.txt",
+    }
+    for rel, target in links.items():
+        (root / rel).symlink_to(target)
+    docs_root = (root / "docs").resolve()
+    no_specs = (False, None, None)
+    with patch.object(dispatch, "get_settings", return_value=MagicMock(mentions_ambiguous_mode="all")):
+        verdicts = {
+            rel: (
+                dispatch._would_index(path, rel, docs_root, mentions_enabled, no_specs),
+                _routed_by_index_single_path(root, path, docs_root, mentions_enabled),
+            )
+            for path, rel in dispatch._keyed_indexable_paths(root)
+            for rel in [path.relative_to(root).as_posix()]
+        }
+    assert set(verdicts) == set(files) | set(links)
+    assert {rel: v for rel, v in verdicts.items() if v[0] != v[1]} == {}
+    assert verdicts["src/link.py"] == (False, False) and verdicts["src/note.txt"] == (True, True)
 
 
 def test_prune_count_is_reported(tmp_path, stubbed):
@@ -333,3 +396,136 @@ def test_bare_modules_left_by_old_recency_writes_are_pruned(engine, repo):
     assert result.indexed == 0
     scan(engine, repo, FRESH)
     assert snapshot(engine, REPO) == snapshot(engine, FRESH)
+
+
+# --- docs notes under docs_path (keyed by their repo-relative path) -------
+
+
+@pytest.fixture
+def notes_repo(tmp_path):
+    """Two docs notes with the same filename in different folders, plus a
+    module they link to."""
+    root = tmp_path / "notes_repo"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "a.py").write_text("class Alpha:\n    pass\n")
+    _front(root, "docs/arch.md", "type: architecture_note\nid: note-top\nlinks: [pkg/a.py]")
+    _front(root, "docs/sub/arch.md", "type: requirement\nid: req-sub")
+    return root
+
+
+def _scan_docs(engine, root, repo_id=REPO):
+    engine.upsert_repository(repo_id, repo_id, str(root))
+    full_scan(engine, repo_id, root, docs_path="docs")
+
+
+def _note_files(engine, repo_id=REPO):
+    rows = engine.run_cypher(
+        "MATCH (n {repo_id: $r}) WHERE n:Requirement OR n:ArchitectureNote OR n:DesignDecision "
+        "RETURN n.name AS name, n.source_file AS file",
+        {"r": repo_id},
+    )
+    return sorted((row["name"], row["file"]) for row in rows)
+
+
+def test_docs_notes_record_their_repo_relative_path(engine, notes_repo):
+    _scan_docs(engine, notes_repo)
+    assert _note_files(engine) == [("note-top", "docs/arch.md"), ("req-sub", "docs/sub/arch.md")]
+
+
+def test_a_no_op_catch_up_with_a_docs_path_offers_nothing(engine, notes_repo):
+    _scan_docs(engine, notes_repo)
+    result = catch_up(engine, REPO, notes_repo, datetime.now(timezone.utc) + timedelta(minutes=1), docs_path="docs")
+    assert (result.offered, result.unknown, result.pruned, result.indexed) == (0, 0, 0, 0)
+    assert _note_files(engine) == [("note-top", "docs/arch.md"), ("req-sub", "docs/sub/arch.md")]
+
+
+def test_deleting_a_docs_note_removes_only_that_note(engine, notes_repo):
+    _scan_docs(engine, notes_repo)
+    (notes_repo / "docs" / "arch.md").unlink()
+    assert dispatch.remove_paths(engine, REPO, notes_repo, {notes_repo / "docs" / "arch.md"}) == 1
+    assert _note_files(engine) == [("req-sub", "docs/sub/arch.md")]
+    _scan_docs(engine, notes_repo, FRESH)
+    assert snapshot(engine, REPO) == snapshot(engine, FRESH)
+
+
+def _downgrade_note_keys(engine):
+    """What an older scan wrote: a docs note's bare filename as its source_file."""
+    engine.run_cypher(
+        "MATCH (n {repo_id: $r}) WHERE n:Requirement OR n:ArchitectureNote OR n:DesignDecision "
+        "SET n.source_file = split(n.source_file, '/')[-1]",
+        {"r": REPO},
+    )
+    assert _note_files(engine) == [("note-top", "arch.md"), ("req-sub", "arch.md")]
+
+
+@pytest.mark.parametrize("heal", ["catch_up", "full_scan"])
+def test_notes_keyed_by_a_bare_filename_are_rekeyed_without_duplicates(engine, notes_repo, heal):
+    _scan_docs(engine, notes_repo)
+    _downgrade_note_keys(engine)
+    if heal == "catch_up":
+        catch_up(engine, REPO, notes_repo, datetime.now(timezone.utc) + timedelta(minutes=1), docs_path="docs")
+    else:
+        _scan_docs(engine, notes_repo)
+    assert _note_files(engine) == [("note-top", "docs/arch.md"), ("req-sub", "docs/sub/arch.md")]
+    _scan_docs(engine, notes_repo, FRESH)
+    assert snapshot(engine, REPO) == snapshot(engine, FRESH)
+    again = catch_up(engine, REPO, notes_repo, datetime.now(timezone.utc) + timedelta(minutes=1), docs_path="docs")
+    assert (again.offered, again.pruned) == (0, 0)
+
+
+# --- the bare-Module cleanup's assumptions -------------------------------
+
+_MODULE_SOURCES = {
+    "py": ("pkg/mod.py", "import os\n\ndef f():\n    return 1\n"),
+    "ts": ("web/app.ts", "import { x } from './x';\nexport function f() { return 1; }\n"),
+    "js": ("web/app.js", "const x = require('./x');\nfunction f() { return 1; }\n"),
+    "cs": ("src/App.cs", "using System;\nnamespace A { class B { void F() {} } }\n"),
+    "cpp": ("src/app.cpp", "#include \"x.h\"\nint f() { return 1; }\n"),
+    "java": ("src/a/App.java", "package a;\nimport java.util.List;\nclass App { void f() {} }\n"),
+    "rs": ("src/app.rs", "use std::io;\nfn f() -> i32 { 1 }\n"),
+    "kt": ("src/App.kt", "package a\nimport b.C\nfun f() = 1\n"),
+    "go": ("cmd/app/main.go", "package main\nimport \"fmt\"\nfunc f() { fmt.Println(1) }\n"),
+}
+
+
+def _extract(kind: str, rel: str, content: str):
+    from devgraph.indexer.cpp.extractor import extract_cpp_file
+    from devgraph.indexer.csharp.extractor import extract_csharp_file
+    from devgraph.indexer.go.extractor import extract_go_file
+    from devgraph.indexer.java.extractor import extract_java_file
+    from devgraph.indexer.jsts.extractor import extract_js_file
+    from devgraph.indexer.kotlin.extractor import extract_kotlin_file
+    from devgraph.indexer.python.extractor import extract_python_file
+    from devgraph.indexer.rust.extractor import extract_rust_file
+
+    extractors = {
+        "py": extract_python_file, "ts": extract_js_file, "js": extract_js_file, "cs": extract_csharp_file,
+        "cpp": extract_cpp_file, "java": extract_java_file, "rs": extract_rust_file, "kt": extract_kotlin_file,
+    }
+    if kind == "go":
+        return extract_go_file(content, rel, "r", "example.com/app")
+    return extractors[kind](content, rel, "r")
+
+
+@pytest.mark.parametrize("kind", sorted(_MODULE_SOURCES))
+def test_every_module_an_extractor_writes_has_its_path_as_source_file(kind):
+    """`delete_bare_modules` deletes Modules with no file key: no scan may write one."""
+    rel, content = _MODULE_SOURCES[kind]
+    modules = [n.to_dict() for n in _extract(kind, rel, content).nodes]
+    modules = [n for n in modules if n["label"] == "Module"]
+    assert modules
+    assert [n["properties"].get("source_file") for n in modules] == [rel] * len(modules)
+
+
+def test_bare_module_cleanup_stays_in_its_repository(engine):
+    other = f"{REPO}_other"
+    engine.delete_repository(other)
+    try:
+        for repo_id in (REPO, other):
+            engine.run_cypher("CREATE (:Module {repo_id: $r, name: 'gone.py'})", {"r": repo_id})
+        assert engine.delete_bare_modules(REPO) == 1
+        left = engine.run_cypher("MATCH (m:Module {name: 'gone.py'}) WHERE m.repo_id IN $r RETURN m.repo_id AS r",
+                                 {"r": [REPO, other]})
+        assert [row["r"] for row in left] == [other]
+    finally:
+        engine.delete_repository(other)

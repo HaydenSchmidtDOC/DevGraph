@@ -166,13 +166,29 @@ def _first_heading(body: str) -> str | None:
     return None
 
 
-def index_file(engine, repo_id: str, file_path: str | Path) -> None:
+def source_key(file_path: Path, repo_root: str | Path | None) -> str:
+    """A note's `source_file`: file_path relative to repo_root (forward
+    slashes), or the bare filename when repo_root is omitted or doesn't
+    contain file_path."""
+    if repo_root is not None:
+        try:
+            return file_path.resolve().relative_to(Path(repo_root).resolve()).as_posix()
+        except ValueError:
+            pass
+    return file_path.name
+
+
+def index_file(engine, repo_id: str, file_path: str | Path, repo_root: str | Path | None = None) -> None:
     """Extract a docs Markdown file and upsert results into the graph.
 
     Args:
         engine: A GraphEngine instance.
         repo_id: Repository ID for scoping.
         file_path: Path to the Markdown file to index.
+        repo_root: The repository's root directory. When given, the note's
+            `source_file` is file_path relative to it (forward slashes), the
+            key every other extractor writes and a delete or prune looks up;
+            otherwise the bare filename.
 
     Raises:
         FileNotFoundError: If the file does not exist.
@@ -182,7 +198,7 @@ def index_file(engine, repo_id: str, file_path: str | Path) -> None:
         raise FileNotFoundError(f"File not found: {file_path}")
 
     content = file_path.read_text(encoding="utf-8")
-    result = DocsExtractor(repo_id).extract_from_source(content, file_path.name)
+    result = DocsExtractor(repo_id).extract_from_source(content, source_key(file_path, repo_root))
 
     engine.upsert_nodes(
         [{"label": doc.label, "repo_id": doc.repo_id, "name": doc.name, "properties": doc.properties} for doc in result.docs]

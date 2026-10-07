@@ -645,7 +645,7 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         # skip the offending file so the rest of the batch still indexes.
         try:
             indexed += _index_single_path(
-                engine, repo_id, repo_root, resolved, rel_path, resolved.name.lower(),
+                engine, repo_id, repo_root, resolved, rel_path,
                 docs_root, mentions_enabled, module_path,
                 py_files, py_extractions, js_files, js_extractions,
                 cs_files, cs_extractions, cpp_files, cpp_extractions,
@@ -659,12 +659,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             )
 
     # What the batch's files produced before this run, so the referrer step
-    # below can tell which nodes the batch adds. Docs notes record a bare
-    # filename as their source_file, hence the extra keys.
-    provenance_keys = set(by_rel_path)
-    if docs_root is not None:
-        provenance_keys |= {p.name for p in by_rel_path.values() if p.is_relative_to(docs_root)}
-    batch_keys = sorted(provenance_keys)
+    # below can tell which nodes the batch adds.
+    batch_keys = sorted(by_rel_path)
     previous_nodes = engine.list_file_nodes(repo_id, batch_keys)
 
     # The schema providers' specs, resolved once for the batch. The docs
@@ -820,7 +816,7 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # node in the batch exists materializes those edges.
     for path in docs_files:
         try:
-            index_doc_file(engine, repo_id, path)
+            index_doc_file(engine, repo_id, path, repo_root)
         except Exception:
             logger.warning("docs edge pass failed for %s (%s); skipping file", repo_id, path, exc_info=True)
 
@@ -846,13 +842,43 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     return indexed
 
 
+_MARKDOWN_SUFFIXES = (".md", ".markdown")
+_CODE_ROUTES = {
+    ".py": "py", ".cs": "cs", ".java": "java", ".rs": "rs", ".kt": "kt", ".go": "go",
+    **{suffix: "js" for suffix in _JS_SUFFIXES},
+    **{suffix: "cpp" for suffix in _CPP_SUFFIXES},
+}
+
+
+def _routes(resolved: Path, docs_root: Path | None, mentions_enabled: bool) -> list[str]:
+    """The built-in extractors `_index_single_path` runs on a file, by its
+    resolved path (a symlink is routed by its target, as it is keyed): one
+    code language or a docs note, then Markdown mentions, then a
+    Containerfile or a compose file. Empty when none would.
+    `_would_index` asks the same question for catch-up."""
+    routes = []
+    markdown = resolved.suffix in _MARKDOWN_SUFFIXES
+    code = _CODE_ROUTES.get(resolved.suffix)
+    if code is not None:
+        routes.append(code)
+    elif docs_root is not None and markdown and is_within(resolved, docs_root):
+        routes.append("docs")
+    if mentions_enabled and markdown:
+        routes.append("mentions")
+    name_lower = resolved.name.lower()
+    if name_lower in _CONTAINERFILE_NAMES:
+        routes.append("containerfile")
+    elif name_lower in _COMPOSE_NAMES:
+        routes.append("compose")
+    return routes
+
+
 def _index_single_path(
     engine: GraphEngine,
     repo_id: str,
     repo_root: Path,
     resolved: Path,
     rel_path: str,
-    name_lower: str,
     docs_root: Path | None,
     mentions_enabled: bool,
     module_path: str | None,
@@ -888,7 +914,8 @@ def _index_single_path(
     mentions disabled) -- mirrors the original loop's `indexed += 1` count.
     """
     indexed = 0
-    if resolved.suffix == ".py":
+    routes = _routes(resolved, docs_root, mentions_enabled)
+    if "py" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_python_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -916,7 +943,7 @@ def _index_single_path(
         # IMPLEMENTS target can be a handler defined in a later file (e.g.
         # a Django urls.py naming a view from views.py).
         py_extractions[rel_path] = (nodes, rels + api_rels)
-    elif resolved.suffix in _JS_SUFFIXES:
+    elif "js" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_js_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -928,7 +955,7 @@ def _index_single_path(
         indexed += 1
         js_files.append(rel_path)
         js_extractions[rel_path] = (nodes, rels)
-    elif resolved.suffix == ".cs":
+    elif "cs" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_csharp_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -940,7 +967,7 @@ def _index_single_path(
         indexed += 1
         cs_files.append(rel_path)
         cs_extractions[rel_path] = (nodes, rels)
-    elif resolved.suffix in _CPP_SUFFIXES:
+    elif "cpp" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_cpp_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -949,7 +976,7 @@ def _index_single_path(
         indexed += 1
         cpp_files.append(rel_path)
         cpp_extractions[rel_path] = (nodes, rels)
-    elif resolved.suffix == ".java":
+    elif "java" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_java_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -961,7 +988,7 @@ def _index_single_path(
         indexed += 1
         java_files.append((rel_path, content))
         java_extractions[rel_path] = (nodes, rels)
-    elif resolved.suffix == ".rs":
+    elif "rs" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_rust_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -973,7 +1000,7 @@ def _index_single_path(
         indexed += 1
         rs_files.append(rel_path)
         rs_extractions[rel_path] = (nodes, rels)
-    elif resolved.suffix == ".kt":
+    elif "kt" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_kotlin_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -985,7 +1012,7 @@ def _index_single_path(
         indexed += 1
         kt_files.append(rel_path)
         kt_extractions[rel_path] = (nodes, rels)
-    elif resolved.suffix == ".go":
+    elif "go" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_go_file(content, rel_path, repo_id, module_path)
         nodes = [n.to_dict() for n in result.nodes]
@@ -996,21 +1023,21 @@ def _index_single_path(
         engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
         indexed += 1
         go_extractions[rel_path] = (nodes, rels)
-    elif docs_root is not None and resolved.suffix in (".md", ".markdown") and is_within(resolved, docs_root):
-        index_doc_file(engine, repo_id, resolved)
+    elif "docs" in routes:
+        index_doc_file(engine, repo_id, resolved, repo_root)
         indexed += 1
         docs_files.append(resolved)
-    if mentions_enabled and resolved.suffix in (".md", ".markdown"):
+    if "mentions" in routes:
         # Only the Document node here; its MENTIONS edges are resolved in
         # index_paths' final pass, once every node in the batch exists.
         upsert_document_node(engine, repo_id, resolved, repo_root)
         indexed += 1
         mention_files.append(resolved)
-    if name_lower in _CONTAINERFILE_NAMES:
+    if "containerfile" in routes:
         result = _index_containerfile(engine, repo_id, resolved, rel_path)
         batch_services |= {("Service", service.name) for service in result.services}
         indexed += 1
-    elif name_lower in _COMPOSE_NAMES:
+    elif "compose" in routes:
         result = _index_compose_file(engine, repo_id, resolved, rel_path)
         batch_services |= {("Service", service.name) for service in result.services}
         indexed += 1
@@ -1454,10 +1481,6 @@ class CatchUp(NamedTuple):
     unknown: int = 0
 
 
-_EXTRACTOR_SUFFIXES = {".py", ".cs", ".java", ".rs", ".kt", ".go"} | _JS_SUFFIXES | _CPP_SUFFIXES
-_MARKDOWN_SUFFIXES = (".md", ".markdown")
-
-
 def _would_index(
     path: Path,
     rel: str,
@@ -1466,13 +1489,13 @@ def _would_index(
     specs: tuple[bool, filesystem.FilesystemSpec | None, docs.DocsSpec | None],
 ) -> bool:
     """Whether `index_paths` would write anything for this file: a built-in
-    extractor routes it (the branches of `_index_single_path`), or a declared
-    schema provider represents it. Keep in step with `_index_single_path`."""
-    if path.suffix in _EXTRACTOR_SUFFIXES or path.name.lower() in _CONTAINERFILE_NAMES | _COMPOSE_NAMES:
-        return True
-    if path.suffix in _MARKDOWN_SUFFIXES and (
-        mentions_enabled or (docs_root is not None and is_within(path.resolve(), docs_root))
-    ):
+    extractor routes it (`_routes`, as `_index_single_path` does), or a
+    declared schema provider represents it."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False  # index_paths skips it too
+    if _routes(resolved, docs_root, mentions_enabled):
         return True
     ok, fs_spec, docs_spec = specs
     if ok and fs_spec is not None and fs_spec.file_label:
