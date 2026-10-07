@@ -269,14 +269,72 @@ def test_git_checkouts_of_another_branch(engine, repo, live_agent, tmp_path):
     git(root, "commit", "-q", "-m", "Move the package")
     git(root, "checkout", "-q", "main")
     agent = start(live_agent, repo_id)
+    git_synced(agent, repo_id, 1)  # the start catch-up's
 
     git(root, "checkout", "-q", "feature")
-    git_synced(agent, repo_id, 1)
+    git_synced(agent, repo_id, 2)
     converges(engine, repo_id, root)
     assert recency_snapshot(engine, repo_id) == fresh_recency(engine, repo_id, root, tmp_path)
     modules = recency_snapshot(engine, repo_id)[0]
     assert modules and all(created for _name, created, _last, _by in modules)
 
     git(root, "checkout", "-q", "main")
-    git_synced(agent, repo_id, 2)
+    git_synced(agent, repo_id, 3)
     converges(engine, repo_id, root)
+
+
+def syncs(agent, repo_id):
+    return sum(1 for e in list(agent.events) if e.get("type") == "git_history_synced" and e.get("repo_id") == repo_id)
+
+
+def commit_a_new_module(root):
+    (root / "pkg" / "fresh.py").write_text("def fresh():\n    return 5\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "Add a module")
+
+
+def synced_like_a_fresh_scan(engine, repo_id, root, tmp_path):
+    converges(engine, repo_id, root)
+    recency = recency_snapshot(engine, repo_id)
+    assert recency == fresh_recency(engine, repo_id, root, tmp_path)
+    assert any(module == "pkg/fresh.py" for _commit, module in recency[1]), recency
+
+
+def test_a_commit_whose_post_git_job_a_stop_cancelled_is_synced_on_restart(engine, repo, live_agent, tmp_path):
+    root, repo_id = repo
+    first = start(live_agent, repo_id)
+    git_synced(first, repo_id, 1)
+    commit_a_new_module(root)
+    live_agent.stop(first)  # well within the post-git job's 2 s delay
+    assert syncs(first, repo_id) == 1
+
+    second = start(live_agent, repo_id)
+    git_synced(second, repo_id, 1)
+    synced_like_a_fresh_scan(engine, repo_id, root, tmp_path)
+
+
+def test_a_commit_whose_post_git_job_a_pause_cancelled_is_synced_on_resume(engine, repo, live_agent, tmp_path):
+    root, repo_id = repo
+    agent = start(live_agent, repo_id)
+    git_synced(agent, repo_id, 1)
+    commit_a_new_module(root)
+    # What the tray's Pause and Resume do.
+    agent._sync.stopping = True
+    agent._watcher.stop()
+    assert syncs(agent, repo_id) == 1
+    agent._sync.stopping = False
+    agent._watcher.start()
+    git_synced(agent, repo_id, 2)
+    synced_like_a_fresh_scan(engine, repo_id, root, tmp_path)
+
+
+def test_a_commit_made_while_off_is_synced_on_start(engine, repo, live_agent, tmp_path):
+    root, repo_id = repo
+    first = start(live_agent, repo_id)
+    git_synced(first, repo_id, 1)
+    live_agent.stop(first)
+    commit_a_new_module(root)
+
+    second = start(live_agent, repo_id)
+    git_synced(second, repo_id, 1)
+    synced_like_a_fresh_scan(engine, repo_id, root, tmp_path)

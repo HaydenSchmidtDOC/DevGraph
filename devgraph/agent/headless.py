@@ -15,7 +15,6 @@ import logging
 import signal
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
 
 import uvicorn
 
@@ -90,25 +89,23 @@ class HeadlessAgent:
     def _on_schema_rescanned(self, repo_id: str, files: int) -> None:
         self._events.publish({"type": "reindexed", "repo_id": repo_id, "changed": files, "deleted": 0})
 
-    def _on_changes(self, repo_id: str, changed_paths: set[Path], deleted_paths: set[Path]) -> None:
-        """Route watcher events to the indexer (see `RepoSync.on_changes`)."""
-        self._sync.on_changes(repo_id, changed_paths, deleted_paths)
-
     def _on_insights_refreshed(self, repo_id: str) -> None:
         self._events.publish({"type": "insights_refreshed", "repo_id": repo_id})
 
     def _on_git_state_changed(self, repo_id: str) -> None:
         """Route git state change events to the git history syncer.
 
-        Called when .git directory state changes (file save, branch switch, etc.),
-        debounced via WatcherManager. Syncs git history and updates recency
+        Called by WatcherManager after every catch-up of a git repository
+        (on start, after a git operation, on a retry), under its batch lock. Syncs git history and updates recency
         accordingly — handles append-only fast path as well as history rewrites
         (rebase, reset, amend).
         """
-        logger.info("git state changed for %s, syncing history", repo_id)
+        logger.debug("syncing git history for %s", repo_id)
         try:
             result = sync_git_history(self._engine, self._registry, repo_id)
-            logger.info(
+            # Every catch-up ends with a sync, so one with HEAD unmoved is quiet.
+            logger.log(
+                logging.DEBUG if result.get("mode") == "noop" else logging.INFO,
                 "git history synced for %s: mode=%s, indexed=%d, deleted=%d",
                 repo_id,
                 result.get("mode"),

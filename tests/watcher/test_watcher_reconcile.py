@@ -524,6 +524,55 @@ def test_live_emitter_on_a_folder_deleted_and_recreated_with_the_same_inode_is_r
     assert rig.observer.unscheduled == [str(rig.root / "pkg")]
 
 
+class OpaqueObserver(FakeObserver):
+    """An observer without watchdog's private `_emitter_for_watch` (a future
+    watchdog may rename it): the reconcile falls back to identity checks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.emitters = self.__dict__.pop("_emitter_for_watch")
+
+    def schedule(self, handler, path, *, recursive=False):
+        self._emitter_for_watch = self.emitters
+        try:
+            return super().schedule(handler, path, recursive=recursive)
+        finally:
+            del self._emitter_for_watch
+
+    def unschedule(self, watch) -> None:
+        del self.emitters[watch]
+        self.unscheduled.append(watch.path)
+
+
+def _opaque_rig(tmp_path, dirs=("pkg",)):
+    rig = FakeRig(tmp_path, dirs=dirs)
+    rig.observer = rig.manager._observers["r"] = OpaqueObserver()
+    return rig
+
+
+def test_without_the_emitter_map_a_watch_on_the_same_folder_is_kept(tmp_path):
+    rig = _opaque_rig(tmp_path)
+    rig.watch("pkg")
+    rig.reconcile()
+    assert rig.observer.unscheduled == []
+    assert set(rig.manager._watches["r"]) == {rig.root / "pkg"}
+
+
+def test_without_the_emitter_map_a_replaced_or_deleted_folder_is_rescheduled(tmp_path):
+    rig = _opaque_rig(tmp_path, dirs=("pkg", "lib", "old"))
+    rig.watch("pkg")
+    rig.watch("lib")
+    rig.watch("old")
+    path = rig.root / "pkg"
+    watch, identity = rig.manager._watches["r"][path]
+    rig.manager._watches["r"][path] = (watch, (identity[0], identity[1] + 1))
+    (rig.root / "old").rmdir()
+    rig.manager._request_reconcile("r", "lib")
+    rig.fire_pending()
+    assert sorted(rig.observer.unscheduled) == sorted(str(rig.root / n) for n in ("pkg", "lib", "old"))
+    assert set(rig.manager._watches["r"]) == {rig.root / "pkg", rig.root / "lib"}
+
+
 def test_failed_schedule_retries_with_backoff_then_succeeds(tmp_path):
     rig = FakeRig(tmp_path)
     rig.observer.fail = True
@@ -621,7 +670,8 @@ class CatchUpRig:
         def on_catch_up(repo_id, since, reason="start"):
             self.catch_ups.append((repo_id, since, reason))
             if self.catch_up_hook is not None:
-                self.catch_up_hook(repo_id, since)
+                return self.catch_up_hook(repo_id, since)
+            return None
 
         def on_changes(repo_id, changed, deleted):
             self.changes.append((repo_id, changed, deleted))
@@ -1032,3 +1082,120 @@ def test_a_never_indexed_repo_syncs_git_history_at_once(cu):
     cu.git("modified", "HEAD", 30)
     cu.fire_git_burst()
     assert synced == [cu.repo_id] and cu.pending_catch_up() is None
+
+
+def _ordered_sync(cu) -> list[str]:
+    order: list[str] = []
+    cu.manager._on_git_state_changed = lambda repo_id: order.append(
+        "sync, locked" if cu.manager._batch_locks[repo_id].locked() else "sync, unlocked"
+    )
+    cu.catch_up_hook = lambda repo_id, since: order.append("catch-up")
+    return order
+
+
+def test_the_start_catch_up_syncs_git_history_after_it_under_the_lock(cu):
+    """A commit whose post-git job was cancelled (stop or pause within the
+    delay), or made while the agent was off, is synced when watching starts."""
+    order = _ordered_sync(cu)
+    cu.stamp(T0)
+    cu.manager.start()
+    cu.start_timer().fire()
+    assert order == ["catch-up", "sync, locked"]
+
+
+def test_resume_syncs_git_history_again(cu):
+    order = _ordered_sync(cu)
+    cu.stamp(T0)
+    cu.manager.start()
+    cu.start_timer().fire()
+    cu.manager.stop()
+    cu.manager.start()
+    cu.start_timer().fire()
+    assert order == ["catch-up", "sync, locked"] * 2
+
+
+def test_a_cancelled_post_git_job_is_synced_on_the_next_start(cu):
+    order = _ordered_sync(cu)
+    cu.stamp(at(20))
+    cu.manager.start()
+    cu.start_timer().fire()
+    cu.git("modified", "HEAD", 30)
+    cu.fire_git_burst()
+    pending = cu.pending_catch_up()
+    cu.manager.stop()
+    pending.function()  # fired just as stop() ran
+    assert order == ["catch-up", "sync, locked"]
+    cu.manager.start()
+    cu.start_timer().fire()
+    assert order == ["catch-up", "sync, locked"] * 2
+
+
+def test_a_retry_catch_up_syncs_git_history(cu):
+    """A retry repairs a failed post-git catch-up, whose sync was skipped."""
+    order = _ordered_sync(cu)
+    cu.stamp(T0)
+    cu.manager.start()
+    cu.manager.request_catch_up(cu.repo_id, T0, 30)
+    cu.pending_catch_up().fire()
+    assert order == ["catch-up", "sync, locked"]
+
+
+def test_a_failed_catch_up_skips_the_sync(cu):
+    """Recency only annotates nodes that exist, and a fast-mode sync never
+    looks at its commits again: it waits for the retry instead."""
+    synced: list[str] = []
+    cu.manager._on_git_state_changed = synced.append
+    cu.catch_up_hook = lambda repo_id, since: False
+    cu.stamp(at(20))
+    cu.manager.start()
+    cu.start_timer().fire()
+    cu.git("modified", "HEAD", 30)
+    cu.fire_git_burst()
+    cu.pending_catch_up().fire()
+    assert len(cu.catch_ups) == 2 and synced == []
+
+
+def test_a_repo_without_a_git_folder_never_syncs(cu):
+    shutil.rmtree(cu.root / ".git")
+    synced: list[str] = []
+    cu.manager._on_git_state_changed = synced.append
+    cu.stamp(T0)
+    cu.manager.start()
+    cu.start_timer().fire()
+    cu.manager.request_catch_up(cu.repo_id, T0, 30)
+    cu.pending_catch_up().fire()
+    assert len(cu.catch_ups) == 2 and synced == []
+
+
+def test_a_never_indexed_repo_does_not_sync_on_start(cu):
+    synced: list[str] = []
+    cu.manager._on_git_state_changed = synced.append
+    cu.manager.start()
+    cu.start_timer().fire()
+    assert cu.catch_ups == [] and synced == []
+
+
+def test_stop_cancels_a_pending_git_burst(cu):
+    """The next start's catch-up and sync cover it; firing after stop would
+    read a registry the agent may have closed, and sync outside the lock."""
+    synced: list[str] = []
+    cu.manager._on_git_state_changed = synced.append
+    cu.stamp(at(20))
+    cu.manager.start()
+    cu.git("modified", "HEAD", 30)
+    handler = cu.manager._git_handlers[cu.repo_id]
+    burst = handler._debounce_timer
+    cu.manager.stop()
+    assert burst.cancelled
+    burst.function()  # a timer that fired just as stop() ran
+    assert synced == [] and cu.pending_catch_up() is None
+
+
+def test_a_burst_after_stop_neither_syncs_nor_catches_up(cu):
+    synced: list[str] = []
+    cu.manager._on_git_state_changed = synced.append
+    cu.stamp(at(20))
+    cu.manager.start()
+    cu.manager.stop()
+    cu.manager._on_git_burst(cu.repo_id, None)
+    assert synced == [] and cu.pending_catch_up() is None

@@ -101,6 +101,7 @@ class _GitStateEventHandler(FileSystemEventHandler):
         self._lock_released: float | None = None
         # The pending burst's start, from a lock that preceded its HEAD/ref event.
         self._burst_start: float | None = None
+        self._closed = False
 
     def on_modified(self, event: FileModifiedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
@@ -158,6 +159,8 @@ class _GitStateEventHandler(FileSystemEventHandler):
         """Reset the debounce timer. Must hold _lock."""
         if self._debounce_timer:
             self._debounce_timer.cancel()
+        if self._closed:
+            return
 
         self._debounce_timer = self._timer_factory(
             self._debounce_ms / 1000.0,
@@ -166,9 +169,19 @@ class _GitStateEventHandler(FileSystemEventHandler):
         self._debounce_timer.daemon = True
         self._debounce_timer.start()
 
+    def close(self) -> None:
+        """Drop a pending burst: the next start's catch-up and sync cover it."""
+        with self._lock:
+            self._closed = True
+            if self._debounce_timer:
+                self._debounce_timer.cancel()
+                self._debounce_timer = None
+
     def _fire_change(self) -> None:
         """Invoke the callback with the repo_id and the burst's start."""
         with self._lock:
+            if self._closed:
+                return  # fired just as close() ran
             self._debounce_timer = None
             burst_start, self._burst_start = self._burst_start, None
         # Invoke callback outside lock to avoid deadlock
@@ -210,7 +223,8 @@ class WatcherManager:
                 catches up on changes made since `since` (W5). It runs under
                 the repo's batch lock: when watching starts (reason "start"),
                 after a git operation ("git"), and when asked through
-                `request_catch_up` ("retry").
+                `request_catch_up` ("retry"). It returns False when it
+                failed; then the git-history sync that follows it is skipped.
             git_catch_up_delay_s: How long after a git burst its catch-up runs.
             now: The wall clock, in seconds; tests inject it.
         """
@@ -301,8 +315,11 @@ class WatcherManager:
                     observer.join(timeout=5)
             for handler in self._handlers.values():
                 handler.close()
+            for git_handler in self._git_handlers.values():
+                git_handler.close()
             self._observers.clear()
             self._handlers.clear()
+            self._git_handlers.clear()
             self._watches.clear()
 
     def run_exclusive(self, repo_id: str, fn: Callable[[], Any]) -> Any:
@@ -352,13 +369,26 @@ class WatcherManager:
         def run() -> None:
             if self._catch_up_stopped:
                 return
-            self._on_catch_up(repo_id, since, reason)
-            if reason == "git" and self._on_git_state_changed is not None:
-                # After the catch-up, so every file git wrote has its nodes:
-                # the sync's recency writes only annotate nodes that exist.
-                self._on_git_state_changed(repo_id)
+            self._catch_up_then_sync(repo_id, since, reason)
 
         self.run_exclusive(repo_id, run)
+
+    def _catch_up_then_sync(self, repo_id: str, since: datetime, reason: str) -> None:
+        """Catch up, then sync git history, in one job under the batch lock.
+
+        The sync runs after every catch-up (start, git, retry) of a repo with
+        a `.git` folder, not only after a git burst's: that job is cancelled
+        by a stop or pause within its delay, and a commit made while nothing
+        was watching has no burst at all. It runs after the catch-up, so every
+        file git wrote has its nodes (the recency writes only annotate nodes
+        that exist), and not after a failed one (`on_catch_up` returned
+        False): a fast-mode sync never looks at its commits again, so it
+        waits for the retry. With HEAD where the last sync left it, the sync
+        does nothing.
+        """
+        ok = self._on_catch_up(repo_id, since, reason)
+        if ok is not False and self._on_git_state_changed is not None and repo_id in self._git_handlers:
+            self._on_git_state_changed(repo_id)
 
     def _start_catch_up(self, repo_id: str, snapshot: datetime | None) -> None:
         """The catch-up when watching starts, on its own thread (W5).
@@ -381,7 +411,7 @@ class WatcherManager:
             if since is None:
                 logger.info('DevGraph hasn\'t indexed %s yet; run "devgraph rescan %s"', repo_id, repo_id)
                 return
-            self._on_catch_up(repo_id, since, "start")
+            self._catch_up_then_sync(repo_id, since, "start")
 
         self.run_exclusive(repo_id, run)
 
@@ -396,17 +426,17 @@ class WatcherManager:
         (or `last_indexed`) shortly, to repair events the OS dropped (W6),
         then sync git history in the same job, under the batch lock. Without
         a catch-up (none wired, or a never-indexed repo) the sync runs now."""
+        with self._catch_up_lock:
+            if self._catch_up_stopped:
+                return  # the next start's catch-up and sync cover it
         if self._on_catch_up is not None:
             last = self._last_indexed(repo_id)
             if last is not None:
                 since = last
                 if burst_start is not None:
                     since = min(last, datetime.fromtimestamp(burst_start, timezone.utc))
-                with self._catch_up_lock:
-                    stopped = self._catch_up_stopped
-                if not stopped:
-                    self.request_catch_up(repo_id, since, self._git_catch_up_delay_s, "git")
-                    return
+                self.request_catch_up(repo_id, since, self._git_catch_up_delay_s, "git")
+                return
         if self._on_git_state_changed is not None:
             self._on_git_state_changed(repo_id)
 
@@ -541,7 +571,9 @@ class WatcherManager:
 
         observer = self._observers.pop(repo_id)
         handler = self._handlers.pop(repo_id, None)
-        self._git_handlers.pop(repo_id, None)
+        git_handler = self._git_handlers.pop(repo_id, None)
+        if git_handler is not None:
+            git_handler.close()
         self._watches.pop(repo_id, None)
         with self._reconcile_lock:
             timer = self._reconcile_pending.pop(repo_id, None)
@@ -656,18 +688,25 @@ class WatcherManager:
                     logger.debug("Skipping watch reconcile for %s: %s", repo_id, e)
                     return
                 watches = self._watches[repo_id]
+                # watchdog's private map (pinned below 7 in pyproject). Without
+                # it, a watch is judged by its folder's identity alone, and a
+                # dead emitter on an unchanged folder goes unnoticed.
+                emitters = getattr(observer, "_emitter_for_watch", None)
                 for path, (watch, identity) in list(watches.items()):
-                    emitter = observer._emitter_for_watch.get(watch)
+                    emitter = emitters.get(watch) if emitters is not None else None
+                    alive = emitter is not None and emitter.is_alive() if emitters is not None else True
                     if (
-                        emitter is not None
-                        and emitter.is_alive()
+                        alive
                         and path in desired
                         and path.name not in gone
                         and self._dir_identity(path) == identity
                     ):
                         continue
-                    if emitter is not None:
-                        observer.unschedule(watch)
+                    if emitters is None or emitter is not None:
+                        try:
+                            observer.unschedule(watch)
+                        except KeyError:
+                            pass  # already gone from the observer
                     del watches[path]
                 added = []
                 failed: list[str] = []

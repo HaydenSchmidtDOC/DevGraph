@@ -24,8 +24,8 @@ const document = {
     (() => { throw new Error("unexpected element #" + id); })()),
 };
 const api = new Function("document",
-  html.slice(start, end) + "\nreturn { catchUpPillState, applyCatchUpPill };")(document);
-const { catchUpPillState, applyCatchUpPill } = api;
+  html.slice(start, end) + "\nreturn { catchUpPillState, applyCatchUpPill, setEntityPillTopology };")(document);
+const { catchUpPillState, applyCatchUpPill, setEntityPillTopology } = api;
 
 const ev = (repo_id, state) => ({ type: "catch_up", repo_id, state, changed: 0, deleted: 0 });
 
@@ -72,16 +72,32 @@ applyCatchUpPill(ev("beta", "failed"));
 assert.strictEqual(pill.textContent, "Live");
 
 // a pill hidden before the catch-up (Neo4j disconnected) is hidden again after it ...
-pill.style.display = "none";
+setEntityPillTopology("none");
+assert.strictEqual(pill.style.display, "none");
 applyCatchUpPill(ev("beta", "running"));
 assert.strictEqual(pill.style.display, "inline-block");
 applyCatchUpPill(ev("beta", "done"));
 assert.strictEqual(pill.style.display, "none");
 assert.strictEqual(pill.textContent, "Live");
 // ... and one already showing stays shown
-pill.style.display = "inline-block";
+setEntityPillTopology("inline-block");
 applyCatchUpPill(ev("beta", "running"));
 applyCatchUpPill(ev("beta", "failed"));
 assert.strictEqual(pill.style.display, "inline-block");
+// Neo4j reconnects mid-catch-up: the end shows the pill as the topology now
+// has it, not as it was when the catch-up began
+setEntityPillTopology("none");
+applyCatchUpPill(ev("beta", "running"));
+setEntityPillTopology("inline-block");
+assert.strictEqual(pill.textContent, "Catching up…");
+applyCatchUpPill(ev("beta", "done"));
+assert.strictEqual(pill.style.display, "inline-block");
+assert.strictEqual(pill.textContent, "Live");
+// Neo4j disconnects mid-catch-up: the catch-up keeps the pill showing, then it hides
+applyCatchUpPill(ev("beta", "running"));
+setEntityPillTopology("none");
+assert.strictEqual(pill.style.display, "inline-block");
+applyCatchUpPill(ev("beta", "done"));
+assert.strictEqual(pill.style.display, "none");
 
 console.log("catch_up_ui: ok");
