@@ -1,6 +1,8 @@
 # Watcher correctness — design
 
-Epic #1 slice. Upstream epic: HaydenSchmidtDOC/DevGraph#1.
+Epic #1 slice. Upstream epic: HaydenSchmidtDOC/DevGraph#1. Revised after a
+code-checked review. The deadlock (C1) and dead-watch (C2) findings were
+confirmed with watchdog probes.
 
 ## Problem
 
@@ -13,7 +15,8 @@ probe on Linux (watchdog 6.0.0, inotify):
 | Rename `pkg/a.py` → `pkg/a2.py` | changed `{pkg/a2.py}`, deleted `{}` | `pkg/a.py`'s nodes stay. `on_moved` never queues the source. |
 | Rename nested `pkg/sub` → `pkg/sub2` | changed `{pkg/sub2/b.py}` (watchdog's sub-moved events) | `pkg/sub/b.py`'s nodes stay. |
 | Trash or move `pkg/sub2` out of the repo | nothing | Every file's nodes stay. Directory events are dropped (`is_directory` returns at lines 311, 330, 349, 373). |
-| Rename a top-level directory `pkg` → `lib` | nothing | The old nodes stay, **and later edits under `lib/` are never seen.** Each top-level directory has its own recursive watch, scheduled once at start. |
+| Rename a top-level directory `pkg` → `lib` | nothing | The old nodes stay. The old emitter keeps running and reports `lib/` files as `pkg/...`, so later edits are attributed to paths that do not exist and are dropped. |
+| Delete a top-level directory, then recreate it | nothing | The inotify emitter stops itself on `IN_DELETE_SELF` but stays in `observer._emitter_for_watch`, so `schedule()` on the same path is a no-op. Probed: rmtree, mkdir, schedule, then an edit gave no event. |
 | Create a new top-level directory with files | nothing | The root is watched non-recursively, so nothing below a new top-level directory is ever seen. |
 | Edits, `git pull` or a checkout while the agent is off | nothing | Nothing reconciles on start; only `devgraph rescan` does. |
 
@@ -22,122 +25,198 @@ On Windows a deleted directory arrives as `FileDeletedEvent(dir)`
 `remove_paths`, which cleans filesystem- and docs-provider nodes below it but
 not language nodes, which are deleted by exact `source_file`.
 
-README "Known limits of the filesystem provider" admits the folder case.
-
-Two further defects surfaced while reading:
+Related defects found while reading:
 
 - `_fire_changes` calls `on_changes` while holding the handler's event lock.
-  The observer's dispatch thread therefore blocks for as long as a batch
-  indexes, which is how batches for one repository happen to be serialized
-  today.
-- `last_indexed` is written when a batch *finishes*. An edit whose event was
-  still pending when the agent stopped can have an mtime older than that.
+  The observer's dispatch thread then blocks for as long as a batch indexes.
+- `last_indexed` is written when a scan or batch *finishes* (every
+  `mark_indexed` caller). An edit made during a scan can be older than the
+  stamp and still unindexed.
+- `remove_paths`' provider passes (`filesystem.sync_absent` and
+  `delete_extracted_nodes`) delete everything at or below a gone path, with no
+  disk check. A folder deleted and recreated in one batch therefore loses the
+  provider nodes `index_paths` has just written for it.
+- `engine.list_indexed_files`, the graph side of `prune_stale_files`, returns
+  only `source_file`, `file` and `Module.name`. Provider nodes carry `path`.
+  A file that only a provider represents (for example `logo.png` as a `File`)
+  is never pruned.
 
 ## Goal
 
 After any sequence of file operations, whether the agent was running or not,
-the repository's graph equals a fresh `full_scan` of the same files. This
-excludes `Commit` and `Repository` nodes, and the by-name cross-batch gaps
-PROJECT_STATUS already lists. No new config knob.
+the repository's graph equals a fresh `full_scan` of the same files. The
+exceptions are listed under "Limits" below. No new config knob.
 
 ## Decisions
 
 | # | Decision |
 | --- | --- |
-| W1 | **A rename is one delete plus one create in the same batch.** |
-| W2 | **Directory deletes expand in `remove_paths`, from the graph's own file list.** Directory creates and in-repo moves are walked. |
-| W3 | **Top-level directory changes reschedule that directory's watch.** |
-| W4 | **One batch lock per repository**, shared by live batches and catch-up. Events keep collecting while a batch runs. |
-| W5 | **Catch-up is incremental**: prune, then index what is new or newer than the last batch. It runs whenever the watcher starts watching a repository. |
-| W6 | **The debounce is enough for delivered events. A git state change also triggers a catch-up**, to repair dropped events. |
-| W7 | **No docs-provider change.** The watcher delivers the pair; front-matter keys already handle both orders. |
-| W8 | **Say it plainly**: log lines a non-developer can read, a "catching up" state on the tray and the dashboard. |
+| W1 | **A rename is a delete of the source plus a create of the destination**, in one batch when both are seen by one emitter. |
+| W2 | **Deletes are expanded to exact file paths in `remove_paths`**, from the graph's own file list, which includes provider paths. Directory creates and in-repo moves are walked. |
+| W3 | **Top-level directory changes trigger a watch reconcile**, which runs on its own thread, replaces dead or stale watches, then walks new folders. **Handler code never takes `manager._lock`.** |
+| W4 | **One batch lock per repository, owned by the manager**, shared by live batches, catch-up and the schema rescan. Events keep collecting while a batch runs. |
+| W5 | **Catch-up is incremental**, with `since` snapshotted before the watch starts. It runs whenever the watcher starts watching a repository. A never-indexed repository is not scanned. |
+| W6 | **The debounce is enough for delivered events. A git operation also triggers a catch-up**, from the start of the git burst, to repair dropped events. |
+| W7 | **`last_indexed` is the start of the work it covers**, held back by a per-repository floor while a batch has failed. |
+| W8 | **Docs provider unchanged.** The watcher delivers the pair; front-matter keys already handle both orders. |
+| W9 | **Say it plainly**: log lines a non-developer can read, and a "catching up" state on the tray and the dashboard. |
 
 ### W1: rename and move of a file
 
-`on_moved` (file):
+`on_moved` (file), after an explicit containment check that both paths are
+inside the repository root (`is_within`):
 
-- **Source.** Queue it for deletion unless it is ignored, or empty (Windows
-  can split a rename pair across two reads and report an empty source). Drop
-  it from `changed`.
-- **Destination.** If it is a tracked file, queue it as changed and drop it
-  from `deleted`. If it is outside the repository or under an ignored
-  directory, nothing more happens: a move out is a delete.
-- A move in from outside the repository arrives as a create, from both
-  inotify and ReadDirectoryChangesW, and is already handled.
-- A move between two top-level directories crosses two watches. It arrives as
-  a delete and a create in the same handler, so in the same batch.
+- **Source.** Queue it for deletion unless it is ignored, outside the
+  repository, or empty (a Windows rename pair split across two reads reports
+  an empty source). Drop it from `changed`.
+- **Destination.** If it is a tracked file inside the repository, queue it as
+  changed and drop it from `deleted`. Otherwise nothing more happens: a move
+  out of the repository, or into an ignored directory, is a delete.
+- **Case-only rename on Windows** (`normcase(src) == normcase(dest)`). The
+  destination is a change. The source's exact lexical key is removed in
+  `remove_paths` (W2), which never resolves the missing leaf, so the new
+  file's nodes are not touched.
+- **Move in from outside the repository.** inotify reports an unmatched
+  `IN_MOVED_TO` and ReadDirectoryChangesW reports an add, so both arrive as a
+  create, which is already handled.
+- **Move between top-level directories.** watchdog pairs `IN_MOVED_FROM` and
+  `IN_MOVED_TO` by cookie only within one inotify instance, and every
+  scheduled watch has its own instance. A move between two top-level
+  directories therefore arrives as a delete and a create from two emitters
+  into the same handler. They land in one batch when both arrive inside the
+  debounce window, which is the usual case. If they split, each batch is
+  still correct on its own (W6).
 
-The atomic-save case still works. The destination is cleared from `deleted`,
-and the temp source's delete is a no-op in `remove_paths`.
+Atomic saves still work: the destination is cleared from `deleted`, and the
+temp source's delete removes nothing.
 
 Order inside a batch is unchanged: `index_paths(changed)`, then
-`remove_paths(deleted)`. `test_moving_a_file_in_one_batch_keeps_only_the_destination`
-already pins that order for the filesystem provider.
+`remove_paths(deleted)`.
 
-### W2: directory delete, move and create
+### W2: deletes and directory events
 
-The watcher has no engine, so expansion of a deleted directory lives where
-the engine is:
+**The watcher has no engine, so expansion lives in `remove_paths`.**
 
-- **`remove_paths` expands every gone path.** One `engine.list_indexed_files`
-  query per call gives every indexed path below a gone path (`rel + "/"`
-  prefix). Those are added to the paths removed, except any that is an
-  indexable file on disk again, such as a checkout that removes and recreates
-  a directory in one batch.
-  - This also fixes Windows' `FileDeletedEvent(dir)` without asking the
-    watcher what kind of path it was.
-  - A junction's files are keyed by their target, never by the junction's
-    lexical path, so removing a junction expands to nothing, which is right.
-- **Watcher, `DirDeletedEvent`.** Queue the directory path (unless ignored)
-  as deleted. This covers trash, and a move out of the repository, which
-  inotify reports as an unmatched `IN_MOVED_FROM`.
-- **Watcher, `DirMovedEvent` inside the repository.** Queue the source as
-  deleted, and the destination's indexable files as changed. They come from
-  `walk.indexable_paths_under(repo_root, dest)`, which applies the walk's
-  ignore, symlink and junction rules relative to the repository root.
-  - inotify and Windows also emit per-child sub-moved events for recursive
-    watches. They are harmless duplicates in the same sets.
-  - The root watch is non-recursive, so for a top-level move the walk is the
-    only source.
+1. **Gone keys are computed lexically.** Resolve the parent directory only,
+   then append the leaf name. The missing leaf is never resolved: on Windows,
+   resolving a missing `Foo.py` can return an existing `foo.py`.
+2. **One graph query per call.** It is made whenever `paths` is non-empty.
+   `_graph_files(engine, repo_id, repo_root)` returns:
+   - `list_indexed_files` (language keys);
+   - docs-provider nodes' `path`;
+   - filesystem-provider nodes' `path` for the file-kind label of the applied
+     schema. Folder-kind nodes are never included.
+
+   The provider paths are included only when the schema is not pending, which
+   matches when the provider passes run.
+3. **Each gone key `g` expands** to every graph file equal to `g` or strictly
+   below it (`g + "/"` prefix; never for `.`).
+4. **A path is kept when it is present on disk.** An expanded path that is an
+   indexable file on disk is dropped from the removal. Presence is checked
+   case-exactly: the leaf must appear in `os.listdir(parent)`.
+5. **Removals are exact.**
+   - **Language deletes** run per exact file path.
+   - **The provider passes** (`sync_absent`, `_take_over_keys`,
+     `delete_extracted_nodes`) receive the exact file paths too. The gone
+     directory itself is added only when no indexable file remains below it on
+     disk, so that its now-empty folder nodes go.
+   - **Folder nodes** emptied on disk are still found by `sync_absent`'s
+     ancestor check.
+
+This fixes:
+
+- Windows' `FileDeletedEvent(dir)`, without asking what kind of path it was;
+- a folder deleted and recreated in one batch, as a checkout does;
+- a junction: its files are keyed by their target, never by the junction's
+  lexical path, so removing a junction expands to nothing.
+
+`prune_stale_files` uses `_graph_files` as its graph side, so provider-only
+files deleted while the agent was off are pruned too.
+
+**Watcher side:**
+
+- **`DirDeletedEvent`.** Queue the directory (unless ignored) as deleted. This
+  covers trash, and a move out of the repository.
+- **`DirMovedEvent` inside the repository.** Queue the source as deleted.
+  Walk the destination with `walk.indexable_paths_under(repo_root, dest)`,
+  which applies `_walk`'s ignore, symlink and junction rules relative to the
+  root, and queue its files as changed.
+  - The per-child sub-moved events from watchdog are harmless duplicates.
   - A destination under an ignored directory is a delete only, and an ignored
     source is a create only.
-- **Watcher, `DirCreatedEvent`** (new, or moved in from outside). Walk it and
-  queue its indexable files. Empty directories produce nothing, as in a full
-  scan.
+- **`DirCreatedEvent`** (new, or moved in from outside). Walk it and queue its
+  files.
+- **Windows cross-folder move of a directory.** It arrives as
+  `FileDeletedEvent(pkg/sub)` plus `DirCreatedEvent(tools/sub)` (with
+  sub-created events), and is handled by the two rules above.
+- **Walks run outside the handler's `_lock`.** The paths are added under it
+  afterwards.
 
 ### W3: top-level directories
 
 The per-child watch layout stays. It exists to keep `.venv` and `build` out
 of ReadDirectoryChangesW's buffer.
 
-- When the handler sees a directory create, delete or move whose path (or
-  destination) is a direct child of the repository root, it asks the manager
-  to reconcile that repository's watches.
-- The manager unschedules watches whose directory is gone or renamed, and
-  schedules any missing ones.
-- Scheduling mirrors `walk._walk`. It skips ignored names, skips symlinked
-  directories, and skips junctions whose target is outside the repository.
-  Today `child.is_dir()` follows both.
+**Lock rule: handler code never takes `manager._lock`.** watchdog holds
+`observer._lock` while it dispatches to the handler. `stop()` holds
+`manager._lock` and calls `observer.stop()`, which takes `observer._lock`. A
+handler that took `manager._lock` would deadlock against it.
+
+1. **Signal.** Any create, delete or move event, of either kind, whose path or
+   destination is a direct child of the root calls
+   `manager._request_reconcile(repo_id)`.
+   - It takes only a small `_reconcile_lock`.
+   - It sets a pending flag and starts a coalescing timer (default 0.2 s).
+   - "Either kind" matters because Windows reports a deleted directory as
+     `FileDeletedEvent`.
+2. **Reconcile.** It runs on the timer thread under `manager._lock`, and
+   returns at once if the manager is stopping or the repository is no longer
+   in `_observers`.
+   - **Desired directories** are the root's children that are directories,
+     with no ignored names, no symlinked directories, and no junction whose
+     target is outside the repository or under an ignored directory. This
+     mirrors `walk._walk`. Today `child.is_dir()` follows symlinks and
+     junctions.
+   - **A watch is kept** only if its emitter `is_alive()`, its path exists,
+     and its path is still a desired directory. Every other watch is
+     unscheduled (`observer.unschedule(watch)`, which works on a dead emitter
+     because it is still registered). That covers a deleted directory, a
+     renamed directory's stale emitter, and a directory that became ignored.
+   - **Missing desired directories** are scheduled first, and then walked
+     (outside `manager._lock`). Their files are queued as changed, so files
+     written between the event and the new watch are not lost.
+3. **Cancellation.** `stop()` cancels a pending reconcile timer. The reconcile
+   timer's `_reconcile_lock` is never held while calling into the observer.
 
 ### W4: batch lock
 
-`_RepoEventHandler` gets a second lock, `_batch_lock`.
+`WatcherManager._batch_locks: dict[repo_id, threading.Lock]` is created on
+demand, so it survives a handler being recreated by stop and start or by
+refresh.
 
-1. `_fire_changes` takes `_batch_lock`.
-2. It swaps the sets under the short `_lock`, and releases `_lock`.
-3. It calls `on_changes`.
+- `_fire_changes` takes the repository's batch lock, swaps the sets under
+  the handler's short `_lock`, releases `_lock`, and calls `on_changes`.
+- `run_exclusive(repo_id, fn)` looks the lock up under `manager._lock`,
+  releases `manager._lock`, and then runs `fn` under the batch lock.
+- `SchemaRescanScheduler` takes an optional `run_exclusive`, and the agents
+  pass the watcher's, so a schema-applying `full_scan` no longer interleaves
+  with a live batch.
+- **Not covered:** writers in other processes (`devgraph rescan`, dashboard
+  registration) and the git-history sync. It serialises this process's file
+  indexing for one repository, not every writer.
 
-The observer thread therefore only ever waits for the swap, never for
-indexing. Batches for one repository stay serialized.
+**Timers.**
 
-`WatcherManager.run_exclusive(repo_id, fn)` runs `fn` under the same
-`_batch_lock`. Catch-up uses it.
+- Debounce, reconcile and post-git timers come from an injectable
+  `timer_factory` (default `threading.Timer`).
+- `_RepoEventHandler.flush()` fires pending changes now, if there are any.
+- `stop()` cancels every pending debounce timer. The changes they held are
+  repaired by the catch-up that runs on the next start or Resume.
+- A catch-up that is already running is not interrupted by Pause or Quit. It
+  runs on a daemon thread, `stop()` does not wait for it, and its failure
+  warning is suppressed while the agent is stopping.
 
-Out of scope: the schema rescan scheduler's `full_scan` still runs outside
-this lock, as it does today.
-
-### W5: startup catch-up
+### W5: catch-up
 
 **Measured** on this machine, on a copy of `devgraph/` and `docs/` (134
 indexable files) against local Neo4j:
@@ -145,176 +224,216 @@ indexable files) against local Neo4j:
 | Operation | Time |
 | --- | --- |
 | `full_scan` | 44–54 s |
-| Incremental, nothing changed (walk, stat, one `list_indexed_files`, prune) | 0.04 s |
+| Incremental, nothing changed (walk, stat, one query, prune) | 0.04 s |
 | Incremental, 20 `.py` files touched (64 indexed after the reverse-dependent expansion) | 17–18 s |
 
-A full scan costs about 0.35 s per file. A mid-size repository of 2,000 files
-would take about 12 minutes on every start, against well under a second when
-nothing changed. **Recommend incremental**, with a full scan only when the
-repository has never been indexed (`last_indexed` is `None`).
+A full scan costs about 0.35 s per file, so about 12 minutes on every start
+for a 2,000-file repository. **Catch-up is incremental.**
 
 `dispatch.catch_up(engine, repo_id, repo_root, since, docs_path, mentions_enabled) -> CatchUp(indexed, pruned, checked)`:
 
-1. `since is None`: run `full_scan` and return.
-2. `prune_stale_files(...)`. This removes files gone from disk, including the
-   old paths of renames made while the agent was off, through `remove_paths`,
-   so docs key takeover applies.
-3. Walk `keyed_indexable_paths(repo_root)`. A file is due when either holds:
-   - its key is not in `engine.list_indexed_files(repo_id)`;
-   - its change stamp is at or after `since - 2 s`.
+1. `prune_stale_files(...)` against `_graph_files`. This removes files gone
+   from disk, provider-only ones included, through `remove_paths`, so docs key
+   takeover applies.
+2. Walk `keyed_indexable_paths(repo_root)`. A file is due when either holds:
+   - its key is not in `_graph_files`;
+   - its change stamp is at or after `since - 5 s`.
 
-   The change stamp is `max(st_mtime_ns, st_ctime_ns)` on POSIX, and
+   The change stamp is `max(st_mtime_ns, st_ctime_ns)` on POSIX and
    `max(st_mtime_ns, st_birthtime_ns)` on Windows. The second term catches
-   files whose mtime was preserved, such as `cp -p`, tar, unzip or `rsync -a`.
-   Their change time on POSIX, and their creation time on Windows, is the
-   moment they landed. The 2 s covers FAT and SMB timestamp granularity.
-4. `index_paths(due)`.
+   files whose mtime was preserved, such as `cp -p`, tar, unzip or
+   `rsync -a`. The margin covers FAT and SMB timestamp granularity, and the
+   gap between an edit and its event.
+3. `index_paths(due)`.
 
-**`last_indexed` becomes "every edit before this moment has been indexed or
-is in a pending event".** `mark_indexed(repo_id, at=None)` gains an optional
-timestamp.
+Because `_graph_files` includes provider paths, a `File`-only file is
+"known", so it is not re-offered on every start.
 
-- `_on_changes` captures `started` on entry, before indexing. Under W4 that
-  is the moment of the swap, so it passes `at=started`.
-- Catch-up passes its own start time.
-- An edit whose event was still pending at shutdown has an mtime after the
-  last swap, so the next catch-up finds it.
+**When it runs, and with what `since`.**
 
-Files never represented in `list_indexed_files` are offered on every
-catch-up. Examples are Markdown with mentions off, and images. In the
-measurement that was 44 files and 0.05 s, so this is accepted.
-
-**When it runs.** It runs after `_start_single` has started the observer, on a
-daemon thread, through `run_exclusive`. That covers agent start, "Resume
-watching", and `watch enable` or a new registration picked up by `refresh()`.
-
-- Live events that arrive meanwhile queue behind it and then re-index
-  whatever they name. Indexing is idempotent, so the overlap costs time, not
-  correctness.
-- A repository with watching disabled gets no catch-up, which matches today's
-  meaning of `watch disable`.
-
-`WatcherManager` gains `on_catch_up: Callable[[str], None] | None`. The tray
-and headless agents implement it next to `_on_changes`, calling
-`dispatch.catch_up`, then `mark_indexed`, then publishing events. That matches
-how `_on_changes` is wired today, rather than adding a shared module.
+- **Start.** `_start_single` reads `last_indexed` *before* `observer.start()`,
+  then, once the observer runs, starts a daemon thread that calls
+  `on_catch_up(repo_id, since=snapshot)` through `run_exclusive`.
+  - A live batch that runs before the catch-up gets the lock cannot raise
+    `since` past edits made while the agent was off.
+  - This covers agent start, Resume, and `watch enable` or a registration
+    picked up by `refresh()`. A repository with watching disabled gets no
+    catch-up.
+- **Never indexed** (`last_indexed` is `None`). Skip, and log
+  `DevGraph hasn't indexed <repo> yet; run "devgraph rescan <repo>"`.
+  `devgraph add`, `rescan` and dashboard registration own the first scan, so
+  there is never a parallel `full_scan`.
+- **Live events that arrive during a catch-up** queue behind it and re-index
+  whatever they name. Indexing is idempotent.
 
 ### W6: git operations while running
 
 The debounce is trailing (500 ms, reset on every event). A checkout or pull
 writes its files in well under that, so it lands in one batch. A slower one
-splits into several.
+splits.
 
 - Each event names a path's final state, and the batch sets keep only the
   last kind per path, so split batches converge.
-- The only cost of a split is the existing by-name gap. A referrer indexed in
-  an earlier batch than its target stays unlinked until a rescan, as for any
-  two separate saves.
+- The only cost of a split is the existing by-name gap: a referrer indexed
+  before its target stays unlinked until a rescan.
 
-So the debounce is enough **for events that are delivered**. It is not enough
-when events are dropped. ReadDirectoryChangesW overflows its buffer on a large
-checkout and drops every pending event for that watch. inotify can overflow
-`max_queued_events`.
+So the debounce is enough **for delivered events**. It is not enough when
+events are dropped. ReadDirectoryChangesW drops every pending event for a
+watch when its buffer overflows on a large checkout, and inotify can overflow
+`max_queued_events`. A dropped event for a modified existing file is the hard
+case: the live batches that did run have stamped `last_indexed` after its
+mtime.
 
-Since `_GitStateEventHandler` already fires on `HEAD` and branch-ref changes,
-it also schedules a catch-up for the repository, 2 s after its own debounce,
-through `run_exclusive`.
+**Post-git catch-up.**
 
-- Because live batches stamp `last_indexed` with their start, files a live
-  batch already indexed are not re-indexed.
-- The catch-up only picks up what the batches missed, and costs about 0.04 s
-  when they missed nothing.
+- `_GitStateEventHandler` records the time of the first `.git/index.lock`
+  event of a burst, before its relevance filter. Checkout, pull, merge, reset
+  and stash all take that lock first.
+- When the burst's debounce fires, the manager schedules a catch-up 2 s later
+  (`git_catch_up_delay_s`, injectable). Its `since` is
+  `min(last_indexed, burst_start)`; `burst_start` is absent when no lock was
+  seen, for example on a fetch that only moves refs.
+- The catch-up runs through `run_exclusive`. Repeats coalesce.
+- When nothing was missed it costs about 0.04 s plus re-indexing what the
+  checkout touched, which is bounded by the files git wrote.
+- DevGraph never shells out to git for this. A `git diff` or `git status`
+  could run programs the repository configures.
 
-### W7: docs read cache and "incremental equals fresh apply"
+**Non-git overflows** are only partly repaired. Examples are a huge copy, or
+a build writing into a watched folder. The next start's catch-up adds files
+that are new and prunes files that are gone, but **a modified existing file
+whose event was dropped is repaired only by `devgraph rescan`**, because its
+mtime is older than the stamp. This is listed under Limits.
+
+### W7: stamps and failure floors
+
+`mark_indexed(repo_id, at=None)` gains an optional timestamp. **Every caller
+stamps the start of the work it covers**:
+
+- `cli/main.py` (register, about line 94; rescan, about line 274);
+- `dashboard/routes.py` (registration, about line 320);
+- `agent/schema_rescan.py` (about line 99);
+- live batches;
+- catch-up.
+
+The agents' glue moves into one place, `devgraph/agent/sync.py` `RepoSync`.
+Tray and headless each had an identical `_on_changes`, and both would
+otherwise grow the same catch-up, floor and status code. `RepoSync` holds:
+
+- `on_changes(repo_id, changed, deleted)`. It captures `started = now()` on
+  entry. Under W4 that is the swap time. It indexes, then stamps
+  `min(started, floor)`.
+- **A per-repository floor.** It is the start of the earliest failed batch,
+  kept in memory. While it is set, every stamp is `min(started, floor)`.
+  - A failure also asks the watcher for a catch-up, 30 s later.
+  - The health loop asks again when Neo4j recovers.
+  - A catch-up with `since <= floor` that succeeds clears the floor.
+- `on_catch_up(repo_id, since)`. It uses `since = min(since, floor)`, captures
+  `started`, runs `catch_up`, then stamps `min(started, floor-after)`. It
+  publishes status (W9).
+- `now` is injectable.
+
+Tray and headless keep `_on_changes` as one-line delegates.
+
+### W8: docs read cache and "incremental equals fresh apply"
 
 Nothing changes in `devgraph/indexer/providers/`.
 
-- **Live rename of an id-keyed file.** It delivers `{dest}` changed and
-  `{src}` deleted in one batch. `index_paths` merges the entry onto the new
-  path, and `remove_paths`' takeover sees the id still owned. The keys spec,
+- **A live rename of an id-keyed file** delivers the destination as changed
+  and the source as deleted. `index_paths` merges the entry onto the new path,
+  and `remove_paths`' takeover sees the id still owned. The keys spec,
   "Rename keeping the id, in either event order", already covers this, so the
   node and its incoming links survive.
-- **Rename while the agent is off.** Catch-up prunes first (takeover moves the
-  id to the surviving file) and then indexes, so the result is the same.
-- **Directory expansion.** It adds paths to `remove_paths`' language-node
-  deletes only. The docs and filesystem passes already treat a gone directory
-  as "at or below", and `gone` is unchanged for them.
-- **Cache.** The read cache keys by `(root, rel)` and validates by stat
-  identity. Renames, catch-up and checkouts all look like ordinary saves and
-  deletes to it.
+- **A rename while the agent was off.** Catch-up prunes first (takeover moves
+  the id) and then indexes, so the result is the same.
+- **Exact provider paths.** W2's exact paths change what the provider passes
+  receive. A gone directory becomes the exact files below it, plus the
+  directory itself only when nothing indexable remains below it on disk.
+  - Docs nodes are keyed by their owning file's `path`, so exact paths
+    remove exactly the entries the at-or-below match removed before, minus
+    any recreated file.
+  - `_take_over_keys` sees the same exact list.
+- **The read cache** keys by `(root, rel)` and validates by stat identity, so
+  renames, catch-up and checkouts look like ordinary saves and deletes to it.
 - **Tests.** `assert_matches_fresh_apply` and the docs fuzz keep passing
   unchanged. The new live tests call it as well as a whole-graph comparison.
 
 ### Windows
 
-- **Renames** come as a paired `RENAMED_OLD_NAME` and `RENAMED_NEW_NAME`.
-  watchdog classifies them by `os.path.isdir(dest)`.
+- **Renames** come as a paired `RENAMED_OLD_NAME` and `RENAMED_NEW_NAME`,
+  classified by `os.path.isdir(dest)`.
   - If the destination is already gone, a directory rename arrives as a file
-    move whose destination is not tracked, so the source becomes a delete.
-    That is correct, since nothing is left to index.
-  - A pair split across reads gives an empty source. W1 ignores it and keeps
-    the create.
-- **Deleted directories** arrive as `FileDeletedEvent`. W2's expansion in
-  `remove_paths` handles them regardless of the event's kind.
-- **The Recycle Bin** is a rename out of the watched tree on the same volume,
-  so it arrives as a removal of the top path only. W2 covers it.
-- **A buffer overflow** drops events silently. W6's post-git catch-up and W5's
-  start-up catch-up repair it. Overflows not caused by git (for example a huge
-  copy) are repaired at the next start, or by `devgraph rescan`.
-- **Junctions.** Scheduling follows `_walk`: a junction is watched only if its
-  target is inside the repository and not ignored. Its files are keyed by the
-  target, so events under it index the target's key, and deleting the
-  junction removes nothing.
-- **Change stamp.** It uses `st_birthtime_ns` (Python 3.12+), not the
-  deprecated Windows `st_ctime`.
-- **CI.** The Windows CI job has no Neo4j. Every fake-event unit test runs
-  there, and the live tests skip.
+    move with an untracked destination, so the source becomes a delete. That
+    is correct.
+  - A pair split across reads gives an empty source, which W1 ignores.
+  - Case-only renames are handled by W1 and W2.
+- **Deleted directories** arrive as `FileDeletedEvent`. W2 expands them and W3
+  reconciles watches on them.
+- **The Recycle Bin** is a rename out of the watched tree, so only the top
+  path is reported. W2 covers it.
+- **Buffer overflow** is repaired by W6 for git operations, and partly by W5
+  otherwise (see Limits).
+- **Junctions.** One is watched only if its target is inside the repository
+  and not ignored. Its files are keyed by the target.
+- **Change stamp.** It uses `st_birthtime_ns`, not the deprecated Windows
+  `st_ctime`.
+- **CI.** The Windows CI job has no Neo4j. Every fake-event and reconcile unit
+  test runs there, and the live tests skip.
 
-macOS (FSEvents) is not a supported agent platform. Nothing here depends on
-it.
+### W9: UX
 
-### W8: UX
-
-Log lines, at INFO unless noted. Repository ids are shown as stored.
+Log lines, at INFO unless noted:
 
 - `Checking <repo> for changes made while DevGraph wasn't watching…`
 - `<repo> is up to date (checked 1,234 files in 0.2 s)`
 - `Caught up on <repo>: 12 files updated, 3 removed (4.1 s)`
 - `Folder renamed in <repo>: pkg → lib` and `Folder removed from <repo>: pkg/sub`.
-  These are logged by the watcher, once per directory event, never per child.
+  One line per directory event, never per child.
 - `<repo>: found 5 files the live watcher missed after a git operation; updated them`.
-  This is logged only when it finds something; otherwise DEBUG.
-- WARNING `Couldn't catch up on <repo>; run "devgraph rescan <repo>" to fix it`,
-  with `exc_info`.
+  Logged only when it finds something; otherwise DEBUG.
+- `DevGraph hasn't indexed <repo> yet; run "devgraph rescan <repo>"`
+- WARNING `Couldn't update <repo>; DevGraph will retry, or run "devgraph rescan <repo>"`,
+  with `exc_info`. Not logged while stopping.
 
 The existing `changes detected for …` line stays.
 
 Status:
 
-- **Tray.** The tooltip reads `DevGraph (catching up)` while any catch-up runs.
-  Paused and warning states take precedence.
-- **Events.** The agents publish
+- **Tray.** The tooltip reads `DevGraph (catching up)` while any catch-up
+  runs. Paused and warning states take precedence.
+- **Events.** `RepoSync` publishes
   `{"type": "catch_up", "repo_id", "state": "running" | "done" | "failed", "changed", "deleted"}`.
-  `done` with a non-zero count is followed by the existing `reindexed` event,
-  so the graph refreshes through the path that is already wired.
+  `done` with a non-zero count is followed by the existing `reindexed` event.
 - **Dashboard.** The Entities card's pill (`entityLivePill`) shows
   `Catching up…` while a `running` event for the selected repository (or any,
   under `__all__`) has no matching `done` or `failed`. A dashboard opened
   mid-catch-up does not know about it. That is acceptable, since a catch-up of
   normal size is short.
 
-## Not in this slice
+## Limits
 
-- Serializing `SchemaRescanScheduler`'s `full_scan` with live batches.
-- The by-name cross-batch referrer gaps listed in PROJECT_STATUS.
-- Overflow detection (watchdog surfaces none on Windows).
-- macOS.
+These are documented, with `devgraph rescan` as the fallback:
+
+- **Modified existing files whose events were dropped outside a git
+  operation** are repaired only by `devgraph rescan` (W6).
+- **Timestamps.** Catch-up trusts change stamps. It misses a file whose
+  content changed while the agent was off but whose stamps all predate
+  `last_indexed - 5 s`. Examples:
+  - a clock moved backwards;
+  - a network share with a skewed server clock;
+  - on Windows, a file overwritten in place by a tool that restores its mtime
+    (the creation time stays old).
+- **By-name cross-batch referrer gaps** listed in PROJECT_STATUS.
+- **Writers in other processes** are not serialised with the agent (W4).
+- **macOS (FSEvents)** is not a supported agent platform.
 
 ## Docs to update
 
 - **README.** Remove the "Known gaps" paragraph under **Live updates** and
-  the folder limit from "Known limits of the filesystem provider". Add a short "Keeping up with changes" note: renames and folder
-  moves, catch-up on start, after git operations, and what the tray and
-  dashboard show.
-- **PROJECT_STATUS.** Replace the watcher entry's "Known gaps" sentence, extend
-  the `devgraph/watcher/` and `devgraph/agent/` entries, and add the slice to the shipped list with what stays open.
+  the folder limit from "Known limits of the filesystem provider". Add a short
+  "Keeping up with changes" note: renames and folder moves, catch-up on start,
+  after git operations, what the tray and dashboard show, and the Limits
+  above.
+- **PROJECT_STATUS.** Replace the watcher entry's "Known gaps" sentence,
+  extend the `devgraph/watcher/` and `devgraph/agent/` entries, and add the
+  slice to the shipped list with the Limits as "Still open".
