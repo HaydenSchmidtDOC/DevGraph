@@ -2,6 +2,9 @@
 
 import os
 import socket
+import sys
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import pytest
 
@@ -10,6 +13,96 @@ if not os.environ.get("DISPLAY"):
     # pystray otherwise selects its X11 backend during module import and aborts
     # collection before tests that do not need a tray icon can run.
     os.environ.setdefault("PYSTRAY_BACKEND", "dummy")
+
+
+# The user's real DevGraph home, fixed before any test can repoint HOME or
+# USERPROFILE (expanduser reads USERPROFILE on Windows). Tests must never touch it.
+_REAL_DEVGRAPH_HOME = os.path.normcase(os.path.realpath(os.path.join(os.path.expanduser("~"), ".devgraph")))
+_GUARDED_EVENTS = frozenset(
+    {
+        "open",
+        "sqlite3.connect",
+        "os.mkdir",
+        "os.remove",
+        "os.rename",
+        "os.replace",
+        "os.rmdir",
+        "os.truncate",
+        "os.chmod",
+        "os.utime",
+        "shutil.rmtree",
+    }
+)
+_real_home_hits: list[str] = []
+
+
+def _under_real_home(target) -> bool:
+    if isinstance(target, int):  # an already-open file descriptor
+        return False
+    try:
+        path = os.fsdecode(target)
+    except TypeError:
+        return False
+    if ".devgraph" not in path.lower():
+        return False
+    if path.startswith("file:"):  # a SQLite URI such as file:///.../registry.sqlite3?mode=ro
+        path = url2pathname(urlparse(path).path)
+    resolved = os.path.normcase(os.path.realpath(path))
+    return resolved == _REAL_DEVGRAPH_HOME or resolved.startswith(_REAL_DEVGRAPH_HOME + os.sep)
+
+
+def _real_home_guard(event, args):
+    """Refuse, and record, any file access under the real DevGraph home.
+
+    Recorded as well as refused because production code may swallow the
+    PermissionError (the MCP telemetry writer does); the record still fails
+    the test and the run."""
+    if event not in _GUARDED_EVENTS or not args:
+        return
+    targets = args[:2] if event in ("os.rename", "os.replace") else args[:1]
+    for target in targets:
+        if _under_real_home(target):
+            _real_home_hits.append(f"{os.environ.get('PYTEST_CURRENT_TEST', '<collection>')}: {event} {target!r}")
+            raise PermissionError(f"test touched the real DevGraph home: {event} {target!r}")
+
+
+sys.addaudithook(_real_home_guard)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_devgraph_home(tmp_path_factory):
+    """Point HOME, USERPROFILE and the registry path at a per-session temp home,
+    so a test that forgets its own isolation still cannot reach ~/.devgraph."""
+    from devgraph.config.settings import get_settings
+
+    home = tmp_path_factory.mktemp("home")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("HOME", str(home))
+        mp.setenv("USERPROFILE", str(home))
+        mp.setenv("DEVGRAPH_REGISTRY_DB_PATH", str(home / ".devgraph" / "registry.sqlite3"))
+        get_settings.cache_clear()
+        yield home
+        get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _fail_on_real_home_access():
+    seen = len(_real_home_hits)
+    yield
+    if len(_real_home_hits) > seen:
+        pytest.fail("touched the real DevGraph home:\n" + "\n".join(_real_home_hits[seen:]), pytrace=False)
+
+
+@pytest.fixture
+def real_home_hits():
+    """The guard's record; a test that trips the guard on purpose removes its own entries."""
+    return _real_home_hits
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if _real_home_hits:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        sys.stderr.write("\nTests touched the real DevGraph home:\n" + "\n".join(_real_home_hits) + "\n")
 
 
 def _neo4j_required() -> bool:
