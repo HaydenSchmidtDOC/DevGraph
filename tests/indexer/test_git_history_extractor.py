@@ -84,3 +84,36 @@ class TestGitHistoryExtractor:
         assert len(result.commits) == 1
         # max_count=1 with newest-first iter_commits then reversed -> the latest commit
         assert result.commits[0].properties["message"] == "Update module_a"
+
+
+def test_an_initial_sync_reports_how_many_commits_it_will_read(tmp_path):
+    """The agent logs the count before the (possibly long) first read."""
+    import os
+    import subprocess
+    from unittest.mock import MagicMock
+
+    from devgraph.indexer.git_history.extractor import sync_git_history
+    from devgraph.registry.store import RepoRegistry
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "A", "GIT_AUTHOR_EMAIL": "a@example.com",
+           "GIT_COMMITTER_NAME": "A", "GIT_COMMITTER_EMAIL": "a@example.com",
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    git = lambda *a: subprocess.run(["git", "-c", "commit.gpgsign=false", *a], cwd=root, check=True,  # noqa: E731
+                                    capture_output=True, env=env)
+    git("init", "-q", "-b", "main")
+    for i in range(3):
+        (root / "a.py").write_text(f"a = {i}\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", f"c{i}")
+    registry = RepoRegistry(tmp_path / "registry.db")
+    try:
+        repo_id = registry.add_repo(root).repo_id
+        counts: list[int] = []
+        assert sync_git_history(MagicMock(), registry, repo_id, on_initial=counts.append)["mode"] == "initial"
+        assert counts == [3]
+        assert sync_git_history(MagicMock(), registry, repo_id, on_initial=counts.append)["mode"] == "noop"
+        assert counts == [3]
+    finally:
+        registry.close()

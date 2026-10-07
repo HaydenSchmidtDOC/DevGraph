@@ -1,5 +1,5 @@
-"""Tests for TrayApp._on_changes — the previously-missing wiring between the
-watcher and the indexer. Uses a mocked engine/registry so this doesn't
+"""Tests for the tray's RepoSync — the wiring between the watcher and the
+indexer (the watcher calls `RepoSync.on_changes` directly). Uses a mocked engine/registry so this doesn't
 require live Neo4j or an actual pystray icon.
 """
 
@@ -41,7 +41,7 @@ class TestOnChanges:
         with patch("devgraph.agent.sync.index_paths") as mock_index_paths, \
              patch("devgraph.agent.sync.remove_paths") as mock_remove_paths:
             changed = {repo_path / "a.py"}
-            tray_app._on_changes(repo_id, changed, set())
+            tray_app._sync.on_changes(repo_id, changed, set())
 
             mock_index_paths.assert_called_once_with(
                 tray_app._engine, repo_id, repo_path, changed, docs_path=None, mentions_enabled=False
@@ -61,7 +61,7 @@ class TestOnChanges:
         with patch("devgraph.agent.sync.index_paths") as mock_index_paths, \
              patch("devgraph.agent.sync.remove_paths") as mock_remove_paths:
             deleted = {repo_path / "gone.py"}
-            tray_app._on_changes(repo_id, set(), deleted)
+            tray_app._sync.on_changes(repo_id, set(), deleted)
 
             mock_remove_paths.assert_called_once_with(tray_app._engine, repo_id, repo_path, deleted)
             mock_index_paths.assert_not_called()
@@ -70,7 +70,7 @@ class TestOnChanges:
         tray_app._registry.get.return_value = None
 
         with patch("devgraph.agent.sync.index_paths") as mock_index_paths:
-            tray_app._on_changes("gone-repo", {Path("x.py")}, set())
+            tray_app._sync.on_changes("gone-repo", {Path("x.py")}, set())
             mock_index_paths.assert_not_called()
 
     def test_indexing_failure_is_caught_not_raised(self, tray_app):
@@ -82,7 +82,7 @@ class TestOnChanges:
 
         with patch("devgraph.agent.sync.index_paths", side_effect=RuntimeError("boom")):
             # Should not raise — a failed reindex shouldn't crash the watcher thread.
-            tray_app._on_changes(repo_id, {repo_path / "a.py"}, set())
+            tray_app._sync.on_changes(repo_id, {repo_path / "a.py"}, set())
 
 
 class TestWiring:

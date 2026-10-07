@@ -3,7 +3,8 @@
 One `asyncio.Queue` per connected browser tab. `publish()` is the only
 method called from outside the dashboard's own event loop -- the tray's
 health-check thread and the watcher's debounce-timer threads call it
-directly (see `agent/tray.py`'s `_on_changes`/`_check_registry_changes`),
+directly (see `agent/sync.py`'s `RepoSync` and `agent/tray.py`'s
+`_check_registry_changes`),
 never the dashboard loop thread. `asyncio.Queue` is not thread-safe, so
 `publish()` never touches a queue directly; it schedules the actual
 `put_nowait` onto the dashboard loop via `call_soon_threadsafe` (a plain

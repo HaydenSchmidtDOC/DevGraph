@@ -330,3 +330,12 @@ def test_repeated_failures_warn_once_then_every_few_minutes_without_a_traceback(
         rig.clock.tick()
         rig.sync.on_changes(REPO, {rig.root / "a.py"}, set())
     assert warnings() == [True, False, True]
+
+
+def test_on_catch_up_reports_whether_it_succeeded(rig, indexing):
+    """The watcher skips the git-history sync after a failed catch-up."""
+    assert rig.sync.on_catch_up(REPO, T0) is True
+    indexing["catch_up"].side_effect = RuntimeError("neo4j down")
+    assert rig.sync.on_catch_up(REPO, T0) is False
+    rig.registry.get.return_value = None
+    assert rig.sync.on_catch_up(REPO, T0) is False

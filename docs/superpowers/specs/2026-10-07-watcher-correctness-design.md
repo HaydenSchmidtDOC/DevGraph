@@ -341,6 +341,14 @@ mtime.
   checkout's files were still being indexed left their modules without
   recency or `MODIFIES` edges for good. A never-indexed repository, which
   gets no catch-up, syncs at once.
+- **Every successful catch-up of a repository with a `.git` folder ends with
+  the sync**, not only the post-git one: the start catch-up (so resume too)
+  and a retry as well. A stop or pause within the 2 s delay cancels the
+  post-git job, and a commit made while the agent was off has no burst at
+  all; the next start's sync covers both. With HEAD unmoved the sync is a
+  no-op. A failed catch-up (`on_catch_up` returns False) skips it: a
+  fast-mode sync never revisits its commits, so it waits for the retry.
+  `stop()` cancels a pending git burst; the next start covers it.
 - When nothing was missed it costs about 0.04 s plus re-indexing what the
   checkout touched, which is bounded by the files git wrote.
 - DevGraph never shells out to git for this. A `git diff` or `git status`

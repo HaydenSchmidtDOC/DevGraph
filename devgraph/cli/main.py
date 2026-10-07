@@ -480,7 +480,7 @@ def annotate(
                 )
                 try:
                     engine.init_schema()
-                    index_doc_file(engine, repo_id, note_path)
+                    index_doc_file(engine, repo_id, note_path, repo.path)
                     console.print(f"[green][OK][/green] Indexed note: {escape(note)}")
                 finally:
                     engine.close()
