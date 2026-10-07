@@ -36,6 +36,7 @@ Run directly: `.venv/Scripts/python -P -m devgraph.mcp.server`
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import logging
 import os
@@ -47,6 +48,7 @@ from typing import Any
 
 import anyio
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from devgraph.agent import lifecycle
@@ -60,6 +62,7 @@ from devgraph.mcp.catalog import builtin_tool_names  # noqa: F401  (re-exported)
 from devgraph.mcp.tool_plane import (
     SESSION_REPO_ENV,
     ProjectToolPlane,
+    _inactive_match,
     register_project_tools,
     resolve_session_repo,
     tools_fingerprint,
@@ -287,6 +290,72 @@ def _with_shadow_notices(fn: Callable[..., Any], shadowed: Callable[[], dict[str
     return wrapper
 
 
+_SESSION_SOURCES = {"env": SESSION_REPO_ENV, "cwd": "the server's working directory"}
+
+
+def _unscoped_error(reason: str, active_repos: list[Any]) -> ToolError:
+    """Why a call without repo_id can't run: the reason, the active repositories, and how to fix it."""
+    if active_repos:
+        listed = ", ".join(f"{r.repo_id} ({Path(r.path).name})" for r in active_repos)
+    else:
+        listed = "none registered (register one with `devgraph add <path>`)"
+    return ToolError(
+        f"repo_id is required because this session has no repository: {reason}. "
+        f"Active registered repositories: {listed}. "
+        "To fix: pass repo_id explicitly, or restart the MCP server after registering a repository"
+    )
+
+
+def _with_repo_default(
+    fn: Callable[..., Any],
+    session_repo: Any | None,
+    session_source: str,
+    registry: Any,
+    unscoped_error: Callable[[str | None, list[Any]], Exception],
+) -> Callable[..., Any]:
+    """Make a built-in's `repo_id` optional, defaulting to the session's repository.
+
+    A function without a `repo_id` parameter (run_cypher) is returned unchanged. Otherwise
+    the wrapper's signature is `fn`'s with every parameter keyword-only (MCP always calls by
+    keyword) and `repo_id: str | None = None`; nothing else in the tool's schema changes.
+
+    An explicit `repo_id` (anything but None) calls `fn` untouched and returns its result as is.
+    Omitted or None: one `list_repos(active_only=True)` read; if the session repository is in
+    it, `fn` runs against it and a dict result gains `repo_id` and a notice. With no session
+    repository, or one no longer active, `unscoped_error(reason, active_repos)` is raised and
+    `fn` never runs; a None reason means there was no session repository to begin with.
+    """
+    signature = inspect.signature(fn, eval_str=True)
+    if "repo_id" not in signature.parameters:
+        return fn
+    parameters = [
+        p.replace(kind=inspect.Parameter.KEYWORD_ONLY, annotation=str | None, default=None)
+        if p.name == "repo_id"
+        else p.replace(kind=inspect.Parameter.KEYWORD_ONLY)
+        for p in signature.parameters.values()
+    ]
+
+    @functools.wraps(fn)
+    def wrapper(**kwargs: Any) -> Any:
+        if kwargs.get("repo_id") is not None:
+            return fn(**kwargs)
+        active = registry.list_repos(active_only=True)
+        if session_repo is None:
+            raise unscoped_error(None, active)
+        repo_id = session_repo.repo_id
+        if all(r.repo_id != repo_id for r in active):
+            raise unscoped_error(f"session repository {repo_id!r} is no longer registered or active", active)
+        result = fn(**{**kwargs, "repo_id": repo_id})
+        if isinstance(result, dict):
+            notice = f"repo_id not given; used this session's repository {repo_id!r} (from {_SESSION_SOURCES[session_source]})"
+            existing = result.get("notices")
+            result = {**result, "repo_id": repo_id, "notices": [*(existing if isinstance(existing, list) else []), notice]}
+        return result
+
+    wrapper.__signature__ = signature.replace(parameters=parameters)  # type: ignore[attr-defined]
+    return wrapper
+
+
 def build_server(
     engine: GraphEngine,
     registry: RepoRegistry | None = None,
@@ -332,10 +401,36 @@ def build_server(
     # the way a per-tool wrapper would be.
     _register_tool = server.tool
 
+    # Why a call without repo_id has no repository to default to (R1.3); fixed at startup.
+    if session_repo is not None:
+        no_session_reason = ""
+    elif session_source == "env":
+        pinned = session_pinned or ""
+        inactive = _inactive_match(registry, pinned)
+        no_session_reason = (
+            f"{SESSION_REPO_ENV}={pinned!r} names repository {inactive.repo_id!r}, which is registered but inactive"
+            if inactive is not None
+            else f"{SESSION_REPO_ENV}={pinned!r} matches no registered repository"
+        )
+    else:
+        no_session_reason = (
+            f"the server's working directory is not inside a registered repository and {SESSION_REPO_ENV} is unset"
+        )
+
+    def unscoped_error(reason: str | None, active_repos: list[Any]) -> ToolError:
+        return _unscoped_error(reason or no_session_reason, active_repos)
+
     def _instrumented_tool(*args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Any]:
         register = _register_tool(*args, **kwargs)
         # `status` (the tool plane's, assigned below) is looked up at call time.
-        return lambda fn: register(_instrument(_with_shadow_notices(fn, lambda: status.shadowed)))
+        return lambda fn: register(
+            _instrument(
+                _with_shadow_notices(
+                    _with_repo_default(fn, session_repo, session_source, registry, unscoped_error),
+                    lambda: status.shadowed,
+                )
+            )
+        )
 
     server.tool = _instrumented_tool  # type: ignore[method-assign]
 

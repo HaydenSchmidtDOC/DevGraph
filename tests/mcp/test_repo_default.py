@@ -6,10 +6,13 @@ no Neo4j, no git, no `gh`.
 
 import asyncio
 import inspect
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+from mcp.server.mcpserver.utilities.func_metadata import func_metadata
 
 from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
@@ -21,7 +24,6 @@ class Repo:
     repo_id: str
     path: Path
     active: bool = True
-    name: str = ""
 
 
 class Registry:
@@ -133,7 +135,7 @@ def make_server(tmp_path, monkeypatch):
 def demo(tmp_path, repo_id="demo", active=True):
     path = tmp_path / repo_id
     path.mkdir(exist_ok=True)
-    return Repo(repo_id, path, active, name=f"{repo_id}-name")
+    return Repo(repo_id, path, active)
 
 
 def _builtins_with_repo_id():
@@ -189,3 +191,130 @@ def test_explicit_calls_are_unchanged(name, repo_id, tmp_path, calls, make_serve
         dumps.append(result.model_dump_json())
     assert recorded[0] == recorded[1]
     assert dumps[0] == dumps[1]
+
+
+# ── the default ────────────────────────────────────────────────────────────
+
+OPTIONAL_REPO_ID = {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None, "title": "Repo Id"}
+ENV_NOTICE = "repo_id not given; used this session's repository 'demo' (from DEVGRAPH_MCP_REPO)"
+CWD_NOTICE = "repo_id not given; used this session's repository 'demo' (from the server's working directory)"
+RESTART_HINT = "pass repo_id explicitly, or restart the MCP server after registering a repository"
+
+
+def listed_schemas(server):
+    return {t.name: t.input_schema if hasattr(t, "input_schema") else t.inputSchema for t in asyncio.run(server.list_tools())}
+
+
+def call_over_wire(server, name, arguments):
+    """What a client receives: a deliberate ToolError becomes an is_error result.
+
+    In process, `MCPServer.call_tool` raises it; the request handler (`_handle_call_tool`
+    in mcp 2.3.0) turns it into `CallToolResult(content=[TextContent(str(exc))], is_error=True)`.
+    """
+    from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+    from mcp.types import CallToolResult, TextContent
+
+    try:
+        return call(server, name, arguments)
+    except ToolError as exc:
+        if isinstance(exc, UnexpectedToolError):
+            raise
+        return CallToolResult(content=[TextContent(type="text", text=str(exc))], is_error=True)
+
+
+def error_text(result):
+    return json.dumps([getattr(c, "text", str(c)) for c in result.content])
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_only_repo_id_became_optional(name, tmp_path, make_server):
+    server = make_server(demo(tmp_path), "env")
+    original = func_metadata(inspect.unwrap(registered_fn(server, name))).arg_model.model_json_schema()
+    expected = {**original, "properties": {**original["properties"], "repo_id": OPTIONAL_REPO_ID}}
+    required = [r for r in original["required"] if r != "repo_id"]
+    expected.pop("required")
+    if required:
+        expected["required"] = required
+    listed = listed_schemas(server)[name]
+    assert listed == expected
+    assert list(listed["properties"]) == list(original["properties"])
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_omitted_repo_id_uses_the_session_repo(name, tmp_path, calls, make_server):
+    server = make_server(demo(tmp_path), "env")
+    result = call(server, name, dict(MIN_ARGS[name]))
+    assert result.is_error is False
+    (_, args, _), = calls
+    assert args[REPO_ARG_INDEX[name]] == "demo"
+    if name in LIST_TOOLS:
+        assert result.structured_content == {"result": LIST_PAYLOAD}
+    else:
+        assert result.structured_content == {**DICT_PAYLOAD, "repo_id": "demo", "notices": [ENV_NOTICE]}
+
+
+@pytest.mark.parametrize("name", sorted(LIST_TOOLS))
+def test_defaulted_list_payload_is_unchanged(name, tmp_path, calls, make_server):
+    server = make_server(demo(tmp_path), "env")
+    explicit = call(server, name, {"repo_id": "demo", **MIN_ARGS[name]})
+    defaulted = call(server, name, dict(MIN_ARGS[name]))
+    assert explicit.model_dump_json() == defaulted.model_dump_json()
+    for result in (explicit, defaulted):
+        dumped = result.model_dump_json()
+        assert '"repo_id"' not in dumped and '"notices"' not in dumped
+
+
+def test_session_repo_still_active_defaults_normally(tmp_path, calls, make_server):
+    session = demo(tmp_path)
+    registry = Registry([session, demo(tmp_path, "other")])
+    server = make_server(session, "env", registry)
+    registry.list_calls.clear()
+    result = call(server, "god_nodes", {})
+    assert result.is_error is False
+    assert result.structured_content["repo_id"] == "demo"
+    assert registry.list_calls == [True]
+
+
+@pytest.mark.parametrize("still_registered_inactive", [False, True])
+def test_removed_session_repo_errors(still_registered_inactive, tmp_path, calls, make_server):
+    session = demo(tmp_path)
+    registry = Registry([session, demo(tmp_path, "other")])
+    server = make_server(session, "env", registry)
+    if still_registered_inactive:
+        session.active = False
+    else:
+        registry.repos.remove(session)
+    result = call_over_wire(server, "god_nodes", {})
+    assert result.is_error is True
+    text = error_text(result)
+    assert "session repository 'demo' is no longer registered or active" in text
+    assert "other (other)" in text and RESTART_HINT in text
+    assert calls == []
+
+    registry.list_calls.clear()
+    explicit = call(server, "god_nodes", {"repo_id": "demo"})
+    assert explicit.is_error is False and explicit.structured_content == DICT_PAYLOAD
+    assert registry.list_calls == []
+
+
+def test_null_repo_id_is_treated_as_omitted(tmp_path, calls, make_server):
+    server = make_server(demo(tmp_path), "env")
+    result = call(server, "search_component", {"repo_id": None, "query": "X"})
+    assert result.is_error is False
+    assert result.structured_content == {**DICT_PAYLOAD, "repo_id": "demo", "notices": [ENV_NOTICE]}
+    (_, args, _), = calls
+    assert args[1] == "demo"
+
+
+def test_cwd_source_notice(tmp_path, calls, make_server):
+    server = make_server(demo(tmp_path), "cwd")
+    result = call(server, "god_nodes", {})
+    assert result.structured_content["notices"] == [CWD_NOTICE]
+
+
+def test_run_cypher_is_unchanged(tmp_path, make_server):
+    server = make_server(demo(tmp_path), "env")
+    original = func_metadata(inspect.unwrap(registered_fn(server, "run_cypher"))).arg_model.model_json_schema()
+    listed = listed_schemas(server)["run_cypher"]
+    assert listed == original
+    assert listed["required"] == ["query"]
