@@ -973,6 +973,23 @@ class GraphEngine:
             )
             return {record["source"] for record in result or [] if record["source"]}
 
+    def delete_bare_modules(self, repo_id: str) -> int:
+        """Delete this repo's `Module` nodes that have no file key at all (no
+        `source_file`, `file` or `path`), with their edges, and return how
+        many went. Every extractor writes `source_file` on its Module, so
+        only a leftover of the git-history sync's old MERGE looks like this
+        (a commit touching a README, an image or a since-deleted file)."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (m:Module {repo_id: $repo_id}) "
+                "WHERE m.source_file IS NULL AND m.file IS NULL AND m.path IS NULL "
+                "DETACH DELETE m RETURN count(m) AS n",
+                repo_id=repo_id,
+            )
+            record = result.single() if result is not None else None
+            return record["n"] if record else 0
+
     def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str]]:
         """Return (label, name) for every node whose file provenance
         (`source_file`/`file`, a `Module` named by its path, or a schema

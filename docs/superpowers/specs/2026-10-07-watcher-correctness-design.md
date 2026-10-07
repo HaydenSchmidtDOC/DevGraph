@@ -335,6 +335,12 @@ mtime.
   `min(last_indexed, burst_start)`, or `last_indexed` when there is no
   `burst_start`.
 - The catch-up runs through `run_exclusive`. Repeats coalesce.
+- **The git-history sync runs after the catch-up**, in the same job under
+  the batch lock, not when the burst fires. Its recency writes only
+  annotate nodes that exist (MATCH, not MERGE), so a sync that ran while the
+  checkout's files were still being indexed left their modules without
+  recency or `MODIFIES` edges for good. A never-indexed repository, which
+  gets no catch-up, syncs at once.
 - When nothing was missed it costs about 0.04 s plus re-indexing what the
   checkout touched, which is bounded by the files git wrote.
 - DevGraph never shells out to git for this. A `git diff` or `git status`

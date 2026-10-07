@@ -312,3 +312,24 @@ def test_a_second_catch_up_does_nothing(engine, repo):
     again = catch_up(engine, REPO, repo, datetime.now(timezone.utc) + timedelta(minutes=1))
     assert (again.indexed, again.pruned) == (0, 0)
     assert again.checked == first.checked
+
+
+def test_bare_modules_left_by_old_recency_writes_are_pruned(engine, repo):
+    """Before recency writes became MATCH-only, a commit touching a README, an
+    image or a deleted file MERGEd a Module with no file key; nothing a scan
+    makes looks like that."""
+    scan(engine, repo)
+    for name in ("README.md", "logo.png", "gone.py"):
+        engine.run_cypher(
+            "CREATE (:Module {repo_id: $r, name: $n, created_at: '2026-01-01T00:00:00Z'})", {"r": REPO, "n": name}
+        )
+    result = catch_up(engine, REPO, repo, datetime.now(timezone.utc) + timedelta(minutes=1))
+    bare = engine.run_cypher(
+        "MATCH (m:Module {repo_id: $r}) WHERE m.source_file IS NULL AND m.file IS NULL AND m.path IS NULL "
+        "RETURN m.name AS n",
+        {"r": REPO},
+    )
+    assert bare == []
+    assert result.indexed == 0
+    scan(engine, repo, FRESH)
+    assert snapshot(engine, REPO) == snapshot(engine, FRESH)

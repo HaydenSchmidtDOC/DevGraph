@@ -39,13 +39,15 @@ class FakeTimer:
             self.function()
 
 
-def wait_for(predicate, what: str, timeout: float = DEADLINE_S) -> None:
+def wait_for(predicate, what, timeout: float = DEADLINE_S) -> None:
+    """`what` is a message, or a callable building one once the wait has
+    timed out (so it reads the state then, not before the wait)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
             return
         time.sleep(0.05)
-    raise AssertionError(f"timed out waiting for {what}")
+    raise AssertionError(f"timed out waiting for {what() if callable(what) else what}")
 
 
 class Rig:
@@ -114,13 +116,15 @@ class Rig:
             c, d = self.union(start)
             return c == changed and deleted <= d <= deleted | maybe
 
-        wait_for(ok, f"exactly ({changed}, {deleted} + some of {maybe}); got {self.union(start)}")
+        wait_for(ok, lambda: f"exactly ({changed}, {deleted} + some of {maybe}); got {self.union(start)}")
 
     def watched(self) -> dict[str, bool]:
         """Top-level directory watches: name -> emitter alive."""
-        observer = self.manager._observers[self.repo_id]
+        with self.manager._lock:  # the reconcile changes _watches under it
+            observer = self.manager._observers[self.repo_id]
+            watches = list(self.manager._watches[self.repo_id].items())
         out = {}
-        for path, (watch, _identity) in self.manager._watches[self.repo_id].items():
+        for path, (watch, _identity) in watches:
             emitter = observer._emitter_for_watch.get(watch)
             out[path.relative_to(self.root).as_posix()] = bool(emitter and emitter.is_alive())
         return out
@@ -137,7 +141,7 @@ class Rig:
             lambda: self.reconcile_idle()
             and set(self.watched()) == expected
             and all(self.watched().values()),
-            f"watches == {expected}, all alive; got {self.watched()}",
+            lambda: f"watches == {expected}, all alive; got {self.watched()}",
         )
 
     def close(self) -> None:
@@ -188,8 +192,11 @@ def test_top_level_delete_recreate_then_edit(rig):
     (rig.root / "pkg/a.py").write_text("a = 2\n")
     rig.settle_watches({"pkg"})
     # Children are deleted before their folder, so each that inotify reports
-    # before the watch dies is queued on its own.
-    rig.wait_exact(changed={"pkg/a.py"}, deleted={"pkg"}, maybe_deleted={"pkg/sub", "pkg/sub/b.py"})
+    # before the watch dies is queued on its own; the old pkg/a.py's delete
+    # can land in a batch before its recreation.
+    rig.wait_exact(
+        changed={"pkg/a.py"}, deleted={"pkg"}, maybe_deleted={"pkg/sub", "pkg/sub/b.py", "pkg/a.py"}
+    )
     start = len(rig.batches)
     (rig.root / "pkg/a.py").write_text("a = 3\n")
     (rig.root / "pkg/after.py").write_text("after = 1\n")
@@ -989,3 +996,39 @@ def test_git_stash_pop_triggers_a_post_git_catch_up(tmp_path):
     finally:
         manager.stop()
         registry.close()
+
+
+def test_the_git_sync_runs_after_the_post_git_catch_up_under_the_lock(cu):
+    order: list[str] = []
+    cu.manager._on_git_state_changed = lambda repo_id: order.append(
+        "sync, locked" if cu.manager._batch_locks[repo_id].locked() else "sync, unlocked"
+    )
+    cu.catch_up_hook = lambda repo_id, since: order.append("catch-up")
+    cu.stamp(at(20))
+    cu.manager.start()
+    cu.git("modified", "HEAD", 30)
+    cu.fire_git_burst()
+    assert order == []  # nothing until the delayed catch-up
+    cu.pending_catch_up().fire()
+    assert order == ["catch-up", "sync, locked"]
+
+
+def test_a_retry_that_a_git_burst_joined_also_syncs(cu):
+    synced: list[str] = []
+    cu.manager._on_git_state_changed = synced.append
+    cu.stamp(at(20))
+    cu.manager.start()
+    cu.manager.request_catch_up(cu.repo_id, at(5), 30)
+    cu.git("modified", "HEAD", 30)
+    cu.fire_git_burst()
+    cu.pending_catch_up().fire()
+    assert cu.catch_ups == [(cu.repo_id, at(5), "git")] and synced == [cu.repo_id]
+
+
+def test_a_never_indexed_repo_syncs_git_history_at_once(cu):
+    synced: list[str] = []
+    cu.manager._on_git_state_changed = synced.append
+    cu.manager.start()
+    cu.git("modified", "HEAD", 30)
+    cu.fire_git_burst()
+    assert synced == [cu.repo_id] and cu.pending_catch_up() is None

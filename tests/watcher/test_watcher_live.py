@@ -23,7 +23,7 @@ from devgraph.indexer.dispatch import full_scan
 from devgraph.registry.store import RepoRegistry
 from tests.indexer.docs_live_helpers import assert_matches_fresh_apply
 from tests.watcher import live_helpers
-from tests.watcher.live_helpers import fresh_snapshot, wait_until_equal
+from tests.watcher.live_helpers import fresh_recency, fresh_snapshot, recency_snapshot, wait_until_equal
 
 live_agent = live_helpers.live_agent  # the fixture
 
@@ -246,20 +246,37 @@ def test_edits_made_while_off_are_caught_up_on_start(engine, repo, live_agent):
     assert states[:2] == ["running", "done"], second.events
 
 
-def test_git_checkouts_of_another_branch(engine, repo, live_agent):
+def git_synced(agent, repo_id, count):
+    """Wait until the agent has synced git history `count` times for the repo:
+    the sync runs after the post-git catch-up, in the same job."""
+    deadline = time.monotonic() + EVENT_DEADLINE_S
+    while sum(1 for e in list(agent.events) if e.get("type") == "git_history_synced" and e.get("repo_id") == repo_id) < count:
+        if time.monotonic() > deadline:
+            pytest.fail(f"git history not synced {count} times for {repo_id}: {agent.events}")
+        time.sleep(0.05)
+
+
+def test_git_checkouts_of_another_branch(engine, repo, live_agent, tmp_path):
     root, repo_id = repo
     git(root, "checkout", "-q", "-b", "feature")
     git(root, "mv", "pkg", "lib")
     git(root, "rm", "-q", "decisions/adr-2.md")
     (root / "README.md").write_text("# Demo\n\nNow with a library.\n")
     (root / "lib" / "extra.py").write_text("def extra():\n    return 4\n")
+    with (root / "tools" / "run.py").open("a") as f:
+        f.write("\n\ndef later():\n    return 3\n")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "Move the package")
     git(root, "checkout", "-q", "main")
-    start(live_agent, repo_id)
+    agent = start(live_agent, repo_id)
 
     git(root, "checkout", "-q", "feature")
+    git_synced(agent, repo_id, 1)
     converges(engine, repo_id, root)
+    assert recency_snapshot(engine, repo_id) == fresh_recency(engine, repo_id, root, tmp_path)
+    modules = recency_snapshot(engine, repo_id)[0]
+    assert modules and all(created for _name, created, _last, _by in modules)
 
     git(root, "checkout", "-q", "main")
+    git_synced(agent, repo_id, 2)
     converges(engine, repo_id, root)

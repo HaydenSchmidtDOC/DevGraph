@@ -71,4 +71,17 @@ assert.strictEqual(pill.textContent, "Catching up…");
 applyCatchUpPill(ev("beta", "failed"));
 assert.strictEqual(pill.textContent, "Live");
 
+// a pill hidden before the catch-up (Neo4j disconnected) is hidden again after it ...
+pill.style.display = "none";
+applyCatchUpPill(ev("beta", "running"));
+assert.strictEqual(pill.style.display, "inline-block");
+applyCatchUpPill(ev("beta", "done"));
+assert.strictEqual(pill.style.display, "none");
+assert.strictEqual(pill.textContent, "Live");
+// ... and one already showing stays shown
+pill.style.display = "inline-block";
+applyCatchUpPill(ev("beta", "running"));
+applyCatchUpPill(ev("beta", "failed"));
+assert.strictEqual(pill.style.display, "inline-block");
+
 console.log("catch_up_ui: ok");

@@ -1421,8 +1421,14 @@ def prune_stale_files(
     disk is routed through remove_paths, which handles the delete-vs-unclaim
     distinction per node.
 
+    Module nodes with no file key at all, left by an older git-history sync,
+    are deleted first (an upgrade cleanup; a scan never makes one).
+
     Returns the number of files pruned.
     """
+    bare = engine.delete_bare_modules(repo_id)
+    if bare:
+        logger.info("removed %d leftover module nodes with no file behind them from %s", bare, repo_id)
     on_disk = {rel for _, rel in _keyed_indexable_paths(repo_root, keep_ignored_targets=True)}
     stale = _graph_files(engine, repo_id, repo_root) - on_disk
     if not stale:

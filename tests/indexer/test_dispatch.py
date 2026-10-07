@@ -1446,5 +1446,8 @@ def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
         def list_claim_sources(self, repo_id):
             return set()
 
+        def delete_bare_modules(self, repo_id):
+            return 0
+
     assert dispatch.prune_stale_files(FakeEngine(), "r", repo) == 1
     assert removed == [{repo / "gone.py"}]

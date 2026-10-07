@@ -30,12 +30,18 @@ from tests.indexer.docs_live_helpers import _uncached
 NEO4J = {"neo4j_uri": "bolt://127.0.0.1:7687", "neo4j_user": "neo4j", "neo4j_password": "devgraph-local-dev"}
 
 #: Properties a fresh scan can't reproduce: the repository id, git recency
-#: (staged by the git-history sync) and timestamps.
+#: (staged by the git-history sync), timestamps and computed insights.
 _VOLATILE = {"repo_id", "last_modified_by"}
+
+#: How long the live graph must stay equal before it counts as settled.
+SETTLED_S = 1.0
 
 
 def _props_hash(props: dict) -> str:
-    kept = {k: v for k, v in props.items() if k not in _VOLATILE and not k.endswith("_at")}
+    kept = {
+        k: v for k, v in props.items()
+        if k not in _VOLATILE and not k.endswith("_at") and not k.startswith("insight_")
+    }
     return hashlib.sha256(json.dumps(kept, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -80,12 +86,19 @@ def fresh_snapshot(engine, repo_id: str, root: Path) -> tuple[list, list]:
 
 
 def wait_until_equal(engine, repo_id: str, expected, timeout_s: float = 30) -> None:
-    """Poll the live graph every 0.2 s until it equals `expected`; fail with the diff."""
+    """Poll the live graph every 0.2 s until it has equalled `expected` for
+    `SETTLED_S` (a batch or catch-up still running can pass through the
+    expected graph on its way); fail with the diff."""
     deadline = time.monotonic() + timeout_s
+    equal_since: float | None = None
     while True:
         actual = graph_snapshot(engine, repo_id)
         if actual == expected:
-            return
+            equal_since = equal_since or time.monotonic()
+            if time.monotonic() - equal_since >= SETTLED_S:
+                return
+        else:
+            equal_since = None
         if time.monotonic() > deadline:
             diff = difflib.unified_diff(
                 pprint.pformat(expected, width=160).splitlines(),
@@ -137,3 +150,40 @@ def live_agent(tmp_path, monkeypatch):
     agents = LiveAgents(tmp_path / "state" / "registry.sqlite3", tmp_path / "state" / "devgraph.log", monkeypatch)
     yield agents
     agents.stop_all()
+
+
+def recency_snapshot(engine, repo_id: str) -> tuple[list, list]:
+    """Every Module's git recency, and every Commit -[:MODIFIES]-> Module edge."""
+    modules = engine.run_cypher(
+        "MATCH (m:Module {repo_id: $r}) "
+        "RETURN m.name AS n, m.created_at AS c, m.last_modified_at AS l, m.last_modified_by AS b",
+        {"r": repo_id},
+    )
+    edges = engine.run_cypher(
+        "MATCH (c:Commit {repo_id: $r})-[:MODIFIES]->(m:Module {repo_id: $r}) RETURN c.name AS c, m.name AS m",
+        {"r": repo_id},
+    )
+    return (
+        sorted((m["n"], m["c"], m["l"], m["b"]) for m in modules),
+        sorted((e["c"], e["m"]) for e in edges),
+    )
+
+
+def fresh_recency(engine, repo_id: str, root: Path, tmp_path: Path) -> tuple[list, list]:
+    """`recency_snapshot` of a fresh `full_scan` plus an initial git-history
+    sync of `root`, under `<repo_id>-fresh` in a registry of its own."""
+    from devgraph.indexer.git_history.extractor import sync_git_history
+    from devgraph.registry.store import RepoRegistry
+
+    registry = RepoRegistry(tmp_path / f"fresh-{time.monotonic_ns()}.sqlite3")
+    fresh = registry.add_repo(root, repo_id=f"{repo_id}-fresh").repo_id
+    engine.delete_repository(fresh)
+    try:
+        provision_repository_schema(engine, root)
+        engine.upsert_repository(fresh, fresh, str(root))
+        full_scan(engine, fresh, root)
+        sync_git_history(engine, registry, fresh)
+        return recency_snapshot(engine, fresh)
+    finally:
+        registry.close()
+        engine.delete_repository(fresh)

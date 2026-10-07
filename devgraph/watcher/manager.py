@@ -350,8 +350,13 @@ class WatcherManager:
         since, reason = entry[0], entry[1]
 
         def run() -> None:
-            if not self._catch_up_stopped:
-                self._on_catch_up(repo_id, since, reason)
+            if self._catch_up_stopped:
+                return
+            self._on_catch_up(repo_id, since, reason)
+            if reason == "git" and self._on_git_state_changed is not None:
+                # After the catch-up, so every file git wrote has its nodes:
+                # the sync's recency writes only annotate nodes that exist.
+                self._on_git_state_changed(repo_id)
 
         self.run_exclusive(repo_id, run)
 
@@ -389,14 +394,19 @@ class WatcherManager:
     def _on_git_burst(self, repo_id: str, burst_start: float | None) -> None:
         """A git burst's debounce fired: catch up from the start of the burst
         (or `last_indexed`) shortly, to repair events the OS dropped (W6),
-        then sync git history."""
+        then sync git history in the same job, under the batch lock. Without
+        a catch-up (none wired, or a never-indexed repo) the sync runs now."""
         if self._on_catch_up is not None:
             last = self._last_indexed(repo_id)
             if last is not None:
                 since = last
                 if burst_start is not None:
                     since = min(last, datetime.fromtimestamp(burst_start, timezone.utc))
-                self.request_catch_up(repo_id, since, self._git_catch_up_delay_s, "git")
+                with self._catch_up_lock:
+                    stopped = self._catch_up_stopped
+                if not stopped:
+                    self.request_catch_up(repo_id, since, self._git_catch_up_delay_s, "git")
+                    return
         if self._on_git_state_changed is not None:
             self._on_git_state_changed(repo_id)
 

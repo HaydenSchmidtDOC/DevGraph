@@ -2848,13 +2848,25 @@ function catchUpPillState(running, event, selectedRepo) {
   return { running: next, label: busy ? CATCH_UP_PILL_LABEL : LIVE_PILL_LABEL };
 }
 let catchUpRunning = [];
+/* The pill's display before a catch-up showed it (it is hidden while Neo4j
+   is disconnected), put back when the catch-up ends; null when the pill
+   was already showing. */
+let catchUpHiddenDisplay = null;
 /* `event` is null on a repository switch, which only recomputes the label */
 function applyCatchUpPill(event) {
   const pill = document.getElementById("entityLivePill");
   const next = catchUpPillState(catchUpRunning, event, document.getElementById("repoSelect").value);
   catchUpRunning = next.running;
   pill.textContent = next.label;
-  if (next.label === CATCH_UP_PILL_LABEL) pill.style.display = "inline-block";
+  if (next.label === CATCH_UP_PILL_LABEL) {
+    if (pill.style.display !== "inline-block" && catchUpHiddenDisplay === null) {
+      catchUpHiddenDisplay = pill.style.display;
+      pill.style.display = "inline-block";
+    }
+  } else if (catchUpHiddenDisplay !== null) {
+    pill.style.display = catchUpHiddenDisplay;
+    catchUpHiddenDisplay = null;
+  }
 }
 /* ── end Catch-up pill ── */
 
