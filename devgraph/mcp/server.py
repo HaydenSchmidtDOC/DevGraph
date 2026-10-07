@@ -299,17 +299,31 @@ def _with_shadow_notices(fn: Callable[..., Any], shadowed: Callable[[], dict[str
 _SESSION_SOURCES = {"env": SESSION_REPO_ENV, "cwd": "the server's working directory"}
 
 
+def _active_listing(active_repos: list[Any]) -> str:
+    if not active_repos:
+        return "none registered (register one with `devgraph add <path>`)"
+    # `name` in `id (name)` is the repository's folder name: RepoRecord has no name field.
+    return ", ".join(f"{r.repo_id} ({Path(r.path).name})" for r in active_repos)
+
+
 def _unscoped_error(reason: str, active_repos: list[Any]) -> ToolError:
     """Why a call without repo_id can't run: the reason, the active repositories, and how to fix it."""
-    if active_repos:
-        # `name` in `id (name)` is the repository's folder name: RepoRecord has no name field.
-        listed = ", ".join(f"{r.repo_id} ({Path(r.path).name})" for r in active_repos)
-    else:
-        listed = "none registered (register one with `devgraph add <path>`)"
     return ToolError(
         f"repo_id is required because this session has no repository: {reason}. "
-        f"Active registered repositories: {listed}. "
+        f"Active registered repositories: {_active_listing(active_repos)}. "
         "To fix: pass repo_id explicitly, or restart the MCP server after registering a repository"
+    )
+
+
+def _removed_session_error(repo_id: str, active_repos: list[Any]) -> ToolError:
+    """A call without repo_id whose session repository was removed or deactivated after startup.
+
+    No restart hint: re-registering under the same id is picked up by the next call.
+    """
+    return ToolError(
+        f"this session's repository {repo_id!r} is no longer registered or active; "
+        "re-register it, or pass repo_id explicitly. "
+        f"Active registered repositories: {_active_listing(active_repos)}"
     )
 
 
@@ -318,7 +332,7 @@ def _with_repo_default(
     session_repo: Any | None,
     session_source: str,
     registry: Any,
-    unscoped_error: Callable[[str | None, list[Any]], Exception],
+    unscoped_error: Callable[[list[Any]], Exception],
 ) -> Callable[..., Any]:
     """Make a built-in's `repo_id` optional, defaulting to the session's repository.
 
@@ -329,8 +343,8 @@ def _with_repo_default(
     An explicit `repo_id` (anything but None) calls `fn` untouched and returns its result as is.
     Omitted or None: one `list_repos(active_only=True)` read; if the session repository is in
     it, `fn` runs against it and a dict result gains `repo_id` and a notice. With no session
-    repository, or one no longer active, `unscoped_error(reason, active_repos)` is raised and
-    `fn` never runs; a None reason means there was no session repository to begin with.
+    repository `unscoped_error(active_repos)` is raised, and with one no longer active
+    `_removed_session_error`; either way `fn` never runs.
     """
     signature = inspect.signature(fn, eval_str=True)
     if "repo_id" not in signature.parameters:
@@ -348,10 +362,10 @@ def _with_repo_default(
             return fn(**kwargs)
         active = registry.list_repos(active_only=True)
         if session_repo is None:
-            raise unscoped_error(None, active)
+            raise unscoped_error(active)
         repo_id = session_repo.repo_id
         if all(r.repo_id != repo_id for r in active):
-            raise unscoped_error(f"session repository {repo_id!r} is no longer registered or active", active)
+            raise _removed_session_error(repo_id, active)
         result = fn(**{**kwargs, "repo_id": repo_id})
         if isinstance(result, dict):
             notice = f"repo_id not given; used this session's repository {repo_id!r} (from {_SESSION_SOURCES[session_source]})"
@@ -399,7 +413,7 @@ def build_server(
         )
     else:
         repo_scope = (
-            "This session has no repository, so every built-in tool requires a repo_id "
+            "This session has no repository, so every built-in tool that takes a repo_id requires one "
             "(the id shown by `devgraph list`)."
         )
     server = MCPServer(
@@ -440,8 +454,8 @@ def build_server(
             f"the server's working directory is not inside a registered repository and {SESSION_REPO_ENV} is unset"
         )
 
-    def unscoped_error(reason: str | None, active_repos: list[Any]) -> ToolError:
-        return _unscoped_error(reason or no_session_reason, active_repos)
+    def unscoped_error(active_repos: list[Any]) -> ToolError:
+        return _unscoped_error(no_session_reason, active_repos)
 
     def _instrumented_tool(*args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Any]:
         register = _register_tool(*args, **kwargs)

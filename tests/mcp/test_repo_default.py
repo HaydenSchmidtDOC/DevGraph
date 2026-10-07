@@ -185,7 +185,7 @@ def test_builtins_with_repo_id_are_exactly_the_24():
 
 
 @pytest.mark.parametrize("name", NAMES)
-@pytest.mark.parametrize("repo_id", ["other", "demo", ""])
+@pytest.mark.parametrize("repo_id", ["other", "demo", "", "  ", "*"])
 def test_explicit_calls_are_unchanged(name, repo_id, tmp_path, calls, make_server):
     session = demo(tmp_path)
     registry = Registry([session])  # shared, so registry-taking bodies see equal arguments
@@ -299,14 +299,24 @@ def test_removed_session_repo_errors(still_registered_inactive, tmp_path, calls,
     result = call_over_wire(server, "god_nodes", {})
     assert result.is_error is True
     text = error_text(result)
-    assert "session repository 'demo' is no longer registered or active" in text
-    assert "other (other)" in text and RESTART_HINT in text
+    assert (
+        "this session's repository 'demo' is no longer registered or active; "
+        "re-register it, or pass repo_id explicitly"
+    ) in text
+    assert "other (other)" in text
+    # Re-registering under the same id needs no restart, so neither the hint nor "no repository".
+    assert RESTART_HINT not in text and "has no repository" not in text
     assert calls == []
 
     registry.list_calls.clear()
     explicit = call(server, "god_nodes", {"repo_id": "demo"})
     assert explicit.is_error is False and explicit.structured_content == DICT_PAYLOAD
     assert registry.list_calls == []
+
+    session.active = True
+    if not still_registered_inactive:
+        registry.repos.append(session)
+    assert call(server, "god_nodes", {}).structured_content["repo_id"] == "demo"
 
 
 def test_null_repo_id_is_treated_as_omitted(tmp_path, calls, make_server):
@@ -602,6 +612,7 @@ def test_unscoped_instructions_require_repo_id(tmp_path, make_server):
     registry = Registry([demo(tmp_path, "alpha")])
     instructions = make_server(None, "none", registry).instructions
     assert "repo_id" in instructions and "devgraph list" in instructions
+    assert "every built-in tool that takes a repo_id requires one" in instructions
     assert "alpha" not in instructions and "demo" not in instructions
     assert "defaults to that repo only" not in instructions
     assert CROSS_REPO_RULE in instructions

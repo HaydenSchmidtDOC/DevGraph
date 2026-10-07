@@ -12,7 +12,7 @@
 
 - **Explicit wins, untouched (R1).** With `repo_id` present and not `None`, the wrapper calls the tool with the caller's kwargs and returns the very object the tool returned. It does not validate, normalise, add a key or add a notice, even when the value equals the session repository.
 - **One resolution (R2).** The default is `build_server`'s `session_repo`. Nothing calls `resolve_session_repo` again, nothing reads a file in the repository, and nothing falls back to the cwd after an unmatched pin.
-- **Active check (R1.2).** A defaulted call makes exactly one `registry.list_repos(active_only=True)` read. If the session repository's id is not in it, the call raises the R1.3 error with the reason "session repository '<id>' is no longer registered or active". An explicit call never reads the registry.
+- **Active check (R1.2).** A defaulted call makes exactly one `registry.list_repos(active_only=True)` read. If the session repository's id is not in it, the call raises "this session's repository '<id>' is no longer registered or active; re-register it, or pass repo_id explicitly", listing the active repositories (no restart hint). An explicit call never reads the registry.
 - **Never "any repo" (R6).** With no session repository, a call without `repo_id` raises `ToolError` before the tool body runs. That holds even with exactly one registered repository.
 - **Schema delta is exactly R3.**
   - For each of the 24 built-ins: `repo_id` leaves `required`, and its property is `{"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Repo Id"}`.
@@ -107,7 +107,7 @@ Each item names the test that proves it.
   - **`test_session_repo_still_active_defaults_normally`.** The registry lists `demo` as active. The call defaults, and the stub registry records exactly one `list_repos(active_only=True)` call.
   - **`test_removed_session_repo_errors`.** The session repository is `demo`, but the registry's active list no longer contains it (unregistered, or present only as inactive).
     - A call without `repo_id` gives `is_error is True`.
-    - The text contains `session repository 'demo' is no longer registered or active`, the remaining active ids and the restart hint.
+    - The text contains `this session's repository 'demo' is no longer registered or active; re-register it, or pass repo_id explicitly` and the remaining active ids, and no restart hint.
     - The recorder was never called.
     - The same call with `repo_id="demo"` succeeds unchanged, with no registry read.
   - **`test_null_repo_id_is_treated_as_omitted`.** `{"repo_id": None, ...}` behaves as the omitted case.

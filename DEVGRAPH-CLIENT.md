@@ -225,7 +225,7 @@ The server instructions name it, and so does `devgraph://project-tools`.
   working across several repositories. An explicit `repo_id` is used exactly
   as given.
 - If the session has no repository, a call without `repo_id` fails. The
-  error lists the registered repositories; pass one of them as `repo_id`.
+  error lists the active registered repositories; pass one of them as `repo_id`.
   A repository registered after the server started is only picked up once
   the MCP server restarts.
 

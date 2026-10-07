@@ -39,14 +39,13 @@ working directory, else none. Project tools inject it. Built-ins ignore it.
 ### R1: resolution order
 
 1. **Explicit argument wins.** Any value other than JSON `null`, including `""`, an unregistered id or another repository's id, is passed through untouched. Explicit values are not validated, because validation would change today's explicit calls (R3).
-2. **Session repository.** It is used when `repo_id` is omitted or `null`, provided it is still active. On this path the wrapper makes one `registry.list_repos(active_only=True)` read at call time. If the session repository's id is not among the results, the call fails (R1.3) with the reason `session repository '<id>' is no longer registered or active`. Explicit calls never make this read.
+2. **Session repository.** It is used when `repo_id` is omitted or `null`, provided it is still active. On this path the wrapper makes one `registry.list_repos(active_only=True)` read at call time. If the session repository's id is not among the results, the call fails as a tool error and the body never runs. The message reads `this session's repository '<id>' is no longer registered or active; re-register it, or pass repo_id explicitly`, then lists the active registered repositories as in R1.3. It has no restart hint: the session still has its repository, and re-registering it under the same id is picked up by the next call without a restart. Explicit calls never make this read.
 3. **Error.** Otherwise the call fails as an MCP tool error (`ToolError`, as in `tool_plane._failure`) and the tool body never runs. The message:
    - says `repo_id` is required because this session has no repository;
    - gives the reason, which is one of:
      - `DEVGRAPH_MCP_REPO=<value>` matches no registered repository;
      - it names an inactive one;
      - the server's working directory is not inside a registered repository and `DEVGRAPH_MCP_REPO` is unset;
-     - the session repository is no longer registered or active (R1.2);
    - lists the active registered repositories as `id (name)`, where `name` is the repository's folder name (a registry record has no name field), read from the registry at call time, or says there are none and points at `devgraph add`;
    - ends with: `pass repo_id explicitly, or restart the MCP server after registering a repository`. The session repository is resolved only at startup, so a repository registered later is not picked up without a restart.
 
@@ -59,7 +58,7 @@ The edge cases all follow from R2:
 | cwd inside a registered repository nested in another registered one | the deepest (inner) repository | `_deepest_containing`. The cwd is closest to the inner one. |
 | cwd inside an *unregistered* nested repository (for example a submodule) inside a registered one | the registered outer repository | Only registered repositories can be chosen. The outer one is what the user registered, and the notice names it. |
 | absolute `DEVGRAPH_MCP_REPO` path inside nested registered repositories | the deepest | Same rule as cwd. |
-| session repository unregistered or deactivated after startup | error: "no longer registered or active", listing the active repositories | One registry read per defaulted call. A silent empty answer is what this slice exists to remove. |
+| session repository unregistered or deactivated after startup | error: "no longer registered or active; re-register it, or pass repo_id explicitly", listing the active repositories (R1.2; no restart hint) | One registry read per defaulted call. A silent empty answer is what this slice exists to remove. |
 | exactly one repository registered and no session repository | error, listing that one | Never "any repo" (R6). The cost is one retry with the listed id. |
 | project config disabled, or the tools file untrusted | the default still applies | The default is not project config. It reads no file in the repository. |
 | `cross_repo=true` without `repo_id` | defaults or errors as above | Several built-ins still use `repo_id` with `cross_repo` (declared labels in `search_component`, the git root in `impact_analysis_for_diff`), so they still need a home repository. |
