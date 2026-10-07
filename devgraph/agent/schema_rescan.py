@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from collections.abc import Callable
 from typing import Any
 
@@ -35,7 +36,11 @@ class SchemaRescanScheduler:
         interval_s: float = CHECK_INTERVAL_S,
         clock: Callable[[], float] = time.monotonic,
         is_paused: Callable[[], bool] | None = None,
+        run_exclusive: Callable[[str, Callable[[], Any]], Any] | None = None,
     ) -> None:
+        """`run_exclusive(repo_id, fn)` is the watcher's: it runs the scan
+        under the repository's batch lock, so it never interleaves with a
+        live batch (W4)."""
         self._engine = engine
         self._registry = registry
         self._on_rescanned = on_rescanned
@@ -43,6 +48,7 @@ class SchemaRescanScheduler:
         self._interval_s = interval_s
         self._clock = clock
         self._is_paused = is_paused
+        self._run_exclusive = run_exclusive or (lambda repo_id, fn: fn())
         # repo_id -> (pending hash, when it was first seen)
         self._seen: dict[str, tuple[str, float]] = {}
         # repo_id -> hash that failed to resolve; skipped until the file changes
@@ -85,18 +91,14 @@ class SchemaRescanScheduler:
                     self._invalid[repo.repo_id] = current
                     logger.warning("project schema for %s is invalid; rescan skipped until it changes: %s", repo.repo_id, exc)
                     continue
-                count = full_scan(
-                    self._engine, repo.repo_id, repo.path,
-                    docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
-                )
+                count, applied = self._run_exclusive(repo.repo_id, lambda: self._rescan(repo))
                 self._failing.discard(repo.repo_id)
-                if schema_pending(self._engine, repo.repo_id, repo.path):
+                if not applied:
                     self._invalid[repo.repo_id] = current
                     logger.warning(
                         "project schema for %s could not be applied; not retried until the file changes", repo.repo_id
                     )
                     continue
-                self._registry.mark_indexed(repo.repo_id)
                 self._seen.pop(repo.repo_id, None)
                 rescanned.append(repo.repo_id)
                 logger.info("applied a changed project schema to %s with a full rescan (%d files)", repo.repo_id, count)
@@ -113,6 +115,19 @@ class SchemaRescanScheduler:
                     "schema rescan check failed for %s", repo.repo_id, exc_info=True,
                 )
         return rescanned
+
+    def _rescan(self, repo: Any) -> tuple[int, bool]:
+        """Full-scan `repo` and, if its schema got applied, stamp the scan's
+        start (W7). Returns (files indexed, applied)."""
+        started = datetime.now(timezone.utc)
+        count = full_scan(
+            self._engine, repo.repo_id, repo.path,
+            docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
+        )
+        if schema_pending(self._engine, repo.repo_id, repo.path):
+            return count, False
+        self._registry.mark_indexed(repo.repo_id, at=started)
+        return count, True
 
     def start(self) -> None:
         if self._thread is not None:

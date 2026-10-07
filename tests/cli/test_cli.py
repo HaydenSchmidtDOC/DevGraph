@@ -1042,6 +1042,55 @@ def test_cli_add_with_an_invalid_schema_keeps_the_repo_registered(
         verify.close()
 
 
+def _stamp_clock():
+    """A `datetime` stand-in for cli.main whose now() is T0 until the stubbed
+    scan has run, then T1; and that stubbed scan."""
+    from datetime import datetime, timedelta, timezone
+
+    t0 = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
+    scanned = []
+
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return t0 + timedelta(minutes=5) if scanned else t0
+
+    def scan(*a, **k):
+        scanned.append(a)
+        return 1
+
+    return t0, FakeDatetime, scan
+
+
+@pytest.mark.parametrize("command", ["add", "rescan"])
+def test_cli_add_and_rescan_stamp_the_start_of_the_scan(runner, temp_registry_db, tmp_path, command):
+    db_path, registry = temp_registry_db
+    repo = _repo_with_schema(tmp_path, "plain")
+    if command == "rescan":
+        registry.add_repo(repo)
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    t0, fake_datetime, scan = _stamp_clock()
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", lambda *a, **k: _StubEngine()), \
+         patch.object(cli_main, "full_scan", scan), \
+         patch.object(cli_main, "datetime", fake_datetime), \
+         patch.object(cli_main, "sync_git_history",
+                      lambda *a, **k: {"commits_indexed": 0, "commits_deleted": 0}):
+        result = runner.invoke(app, [command, "plain" if command == "rescan" else str(repo)])
+
+    assert result.exit_code == 0, f"stdout: {result.stdout}"
+    verify = RepoRegistry(db_path)
+    try:
+        assert verify.get("plain").last_indexed == t0.isoformat()
+    finally:
+        verify.close()
+
+
 def test_project_schema_findings_report_absent_valid_and_invalid(temp_registry_db, tmp_path):
     from devgraph.cli.main import _project_schema_findings
 

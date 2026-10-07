@@ -548,3 +548,353 @@ def test_folder_gone_before_schedule_is_skipped(tmp_path, monkeypatch):
     assert str(rig.root / "never-there") not in rig.observer.schedule_calls
     assert set(rig.watched()) == {"pkg", "gone"}
     assert "r" not in rig.manager._reconcile_pending
+
+
+# --- catch-up scheduling (W5, W6, W7): every timer a FakeTimer --------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from watchdog.events import (  # noqa: E402
+    FileCreatedEvent,
+    FileDeletedEvent,
+    FileModifiedEvent,
+    FileMovedEvent,
+)
+
+from devgraph.watcher.manager import GIT_LOCK_WINDOW_S  # noqa: E402
+
+T0 = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def at(seconds: float) -> datetime:
+    return datetime.fromtimestamp(seconds, timezone.utc)
+
+
+class CatchUpRig:
+    """A registered repo watched by a real observer, with every timer fake.
+    `on_catch_up` and `on_changes` record their calls; either can be replaced
+    by setting `catch_up_hook` / `changes_hook`."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.root = tmp_path / "repo"
+        (self.root / ".git" / "refs" / "heads").mkdir(parents=True)
+        (self.root / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        (self.root / "pkg").mkdir()
+        (self.root / "pkg/a.py").write_text("a = 1\n")
+        self.root = self.root.resolve()
+        self.registry = RepoRegistry(tmp_path / "registry.db")
+        self.repo_id = self.registry.add_repo(self.root).repo_id
+        self.timers: list[FakeTimer] = []
+        self.catch_ups: list[tuple] = []
+        self.changes: list[tuple] = []
+        self.catch_up_hook = None
+        self.changes_hook = None
+        self.clock = 0.0
+
+        def factory(interval, function):
+            timer = FakeTimer(interval, function)
+            self.timers.append(timer)
+            return timer
+
+        def on_catch_up(repo_id, since, reason="start"):
+            self.catch_ups.append((repo_id, since, reason))
+            if self.catch_up_hook is not None:
+                self.catch_up_hook(repo_id, since)
+
+        def on_changes(repo_id, changed, deleted):
+            self.changes.append((repo_id, changed, deleted))
+            if self.changes_hook is not None:
+                self.changes_hook(repo_id)
+
+        self.manager = WatcherManager(
+            self.registry,
+            on_changes,
+            on_catch_up=on_catch_up,
+            timer_factory=factory,
+            reconcile_delay_s=0,
+            git_catch_up_delay_s=2.0,
+            now=lambda: self.clock,
+        )
+
+    def stamp(self, when: datetime) -> None:
+        self.registry.mark_indexed(self.repo_id, at=when)
+
+    def start_timer(self) -> FakeTimer:
+        """The pending start catch-up."""
+        return self.manager._start_catch_ups[self.repo_id]
+
+    def pending_catch_up(self):
+        entry = self.manager._catch_up_pending.get(self.repo_id)
+        return None if entry is None else entry[2]
+
+    def handler(self):
+        return self.manager._handlers[self.repo_id]
+
+    def git(self, kind: str, name: str, when: float, dest: str | None = None) -> None:
+        """Deliver a `.git/<name>` event at clock time `when`."""
+        self.clock = when
+        handler = self.manager._git_handlers[self.repo_id]
+        path = str(self.root / ".git" / name)
+        if kind == "created":
+            handler.on_created(FileCreatedEvent(path))
+        elif kind == "deleted":
+            handler.on_deleted(FileDeletedEvent(path))
+        elif kind == "modified":
+            handler.on_modified(FileModifiedEvent(path))
+        else:
+            handler.on_moved(FileMovedEvent(path, str(self.root / ".git" / dest)))
+
+    def fire_git_burst(self) -> None:
+        self.manager._git_handlers[self.repo_id]._debounce_timer.fire()
+
+    def close(self) -> None:
+        self.manager.stop()
+        self.registry.close()
+
+
+@pytest.fixture
+def cu(tmp_path: Path):
+    r = CatchUpRig(tmp_path)
+    yield r
+    r.close()
+
+
+def run_in_thread(fn) -> threading.Thread:
+    t = threading.Thread(target=fn, daemon=True)
+    t.start()
+    return t
+
+
+def test_a_never_indexed_repo_gets_no_catch_up(cu, caplog):
+    cu.manager.start()
+    with caplog.at_level("INFO", logger="devgraph.watcher.manager"):
+        cu.start_timer().fire()
+    assert cu.catch_ups == []
+    assert f'DevGraph hasn\'t indexed {cu.repo_id} yet; run "devgraph rescan {cu.repo_id}"' in caplog.messages
+
+
+def test_since_is_snapshotted_before_the_watch_starts(cu):
+    cu.stamp(T0)
+    cu.manager.start()
+    cu.changes_hook = lambda repo_id: cu.stamp(T0 + timedelta(minutes=1))
+    cu.handler().queue_changed({cu.root / "pkg/a.py"})
+    cu.handler()._debounce_timer.fire()  # a live batch wins the lock first
+    assert cu.registry.get(cu.repo_id).last_indexed == (T0 + timedelta(minutes=1)).isoformat()
+    cu.start_timer().fire()
+    assert cu.catch_ups == [(cu.repo_id, T0, "start")]
+
+
+def test_pause_then_resume_with_a_debounce_pending(cu):
+    cu.stamp(datetime.now(timezone.utc) - timedelta(minutes=1))
+    cu.manager.start()
+    cu.start_timer().fire()
+    edited = datetime.now(timezone.utc)
+    (cu.root / "pkg/a.py").write_text("a = 2\n")
+    cu.handler().queue_changed({cu.root / "pkg/a.py"})
+    old = cu.handler()
+    cu.manager.stop()
+    old.flush()
+    assert cu.changes == []
+    cu.manager.start()
+    cu.start_timer().fire()
+    assert len(cu.catch_ups) == 2 and cu.catch_ups[1][1] <= edited
+
+
+def test_live_batches_wait_for_a_running_catch_up(cu):
+    cu.stamp(T0)
+    cu.manager.start()
+    release, entered = threading.Event(), threading.Event()
+    active, peak = [0], [0]
+    count_lock = threading.Lock()
+
+    def track(block: bool):
+        with count_lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        if block:
+            entered.set()
+            assert release.wait(5)
+        with count_lock:
+            active[0] -= 1
+
+    cu.catch_up_hook = lambda repo_id, since: track(True)
+    cu.changes_hook = lambda repo_id: track(False)
+    catching = run_in_thread(cu.start_timer().fire)
+    assert entered.wait(5)
+    cu.handler().queue_changed({cu.root / "pkg/a.py"})
+    batch = run_in_thread(cu.handler()._debounce_timer.fire)
+    batch.join(0.2)
+    assert batch.is_alive() and cu.changes == []
+    release.set()
+    catching.join(5)
+    batch.join(5)
+    assert len(cu.changes) == 1 and peak[0] == 1
+
+
+def test_registration_under_the_lock_then_the_catch_up_sees_its_stamp(cu, caplog):
+    cu.manager.start()  # snapshot: never indexed
+    registering, release = threading.Event(), threading.Event()
+
+    def register():
+        registering.set()
+        assert release.wait(5)
+        cu.stamp(T0)
+
+    reg = run_in_thread(lambda: cu.manager.run_exclusive(cu.repo_id, register))
+    assert registering.wait(5)
+    with caplog.at_level("INFO", logger="devgraph.watcher.manager"):
+        catching = run_in_thread(cu.start_timer().fire)
+        catching.join(0.2)
+        assert catching.is_alive()
+        release.set()
+        reg.join(5)
+        catching.join(5)
+    assert cu.catch_ups == [(cu.repo_id, T0, "start")]
+    assert not [m for m in caplog.messages if "hasn't indexed" in m]
+
+
+def test_request_catch_up_never_blocks_on_the_batch_lock_or_the_manager_lock(cu):
+    cu.stamp(T0)
+    cu.manager.start()
+    done = []
+    t = run_in_thread(
+        lambda: cu.manager.run_exclusive(
+            cu.repo_id, lambda: (cu.manager.request_catch_up(cu.repo_id, T0, 30), done.append(1))
+        )
+    )
+    t.join(1)
+    assert done == [1]
+
+    with cu.manager._lock:
+        t = run_in_thread(lambda: (cu.manager.request_catch_up(cu.repo_id, T0, 30), done.append(2)))
+        t.join(1)
+        assert done == [1, 2]
+
+
+def test_requests_coalesce_to_the_earliest_since_and_run_exclusively(cu):
+    cu.stamp(T0)
+    cu.manager.start()
+    cu.manager.request_catch_up(cu.repo_id, T0 + timedelta(minutes=2), 30)
+    timer = cu.pending_catch_up()
+    cu.manager.request_catch_up(cu.repo_id, T0 + timedelta(minutes=1), 30)
+    assert cu.pending_catch_up() is timer and timer.interval == 30
+    holding = threading.Event()
+    release = threading.Event()
+    holder = run_in_thread(lambda: cu.manager.run_exclusive(cu.repo_id, lambda: (holding.set(), release.wait(5))))
+    assert holding.wait(5)
+    firing = run_in_thread(timer.fire)
+    firing.join(0.2)
+    assert firing.is_alive() and cu.catch_ups == []
+    release.set()
+    holder.join(5)
+    firing.join(5)
+    assert cu.catch_ups == [(cu.repo_id, T0 + timedelta(minutes=1), "retry")]
+    assert cu.pending_catch_up() is None
+
+
+def test_stop_cancels_a_pending_catch_up(cu):
+    cu.stamp(T0)
+    cu.manager.start()
+    cu.manager.request_catch_up(cu.repo_id, T0, 30)
+    timer = cu.pending_catch_up()
+    cu.manager.stop()
+    assert timer.cancelled
+    timer.function()  # a timer that fired just as stop() ran
+    assert cu.catch_ups == []
+    cu.manager.request_catch_up(cu.repo_id, T0, 30)
+    assert cu.pending_catch_up() is None
+
+
+def test_a_git_burst_catches_up_from_the_lock_that_preceded_it(cu):
+    assert GIT_LOCK_WINDOW_S == 5
+    cu.stamp(at(20))
+    cu.manager.start()
+    cu.git("created", "index.lock", 10)
+    cu.git("modified", "HEAD", 11)
+    cu.git("moved", "index.lock", 11.5, dest="index")
+    cu.fire_git_burst()
+    timer = cu.pending_catch_up()
+    assert timer.interval == 2.0 and cu.catch_ups == []
+    timer.fire()
+    assert cu.catch_ups == [(cu.repo_id, at(10), "git")]
+
+
+def test_two_bursts_within_the_delay_coalesce(cu):
+    cu.stamp(at(20))
+    cu.manager.start()
+    cu.git("modified", "refs/heads/main", 30)
+    cu.fire_git_burst()
+    cu.git("created", "index.lock", 10)
+    cu.git("modified", "HEAD", 11)
+    cu.fire_git_burst()
+    cu.pending_catch_up().fire()
+    assert cu.catch_ups == [(cu.repo_id, at(10), "git")]
+
+
+def test_a_ref_only_burst_uses_last_indexed(cu):
+    cu.stamp(at(20))
+    cu.manager.start()
+    cu.git("modified", "refs/heads/main", 30)
+    cu.fire_git_burst()
+    cu.pending_catch_up().fire()
+    assert cu.catch_ups == [(cu.repo_id, at(20), "git")]
+
+
+def test_an_old_git_status_lock_is_ignored(cu):
+    cu.stamp(at(20))
+    cu.manager.start()
+    cu.git("created", "index.lock", 0)
+    cu.git("deleted", "index.lock", 0.1)
+    cu.git("modified", "HEAD", 60)
+    cu.fire_git_burst()
+    cu.pending_catch_up().fire()
+    assert cu.catch_ups == [(cu.repo_id, at(20), "git")]
+
+
+def test_a_long_checkout_counts_from_its_lock(cu):
+    cu.stamp(at(20))
+    cu.manager.start()
+    cu.git("created", "index.lock", 0)
+    cu.git("deleted", "index.lock", 40)
+    cu.git("modified", "HEAD", 41)
+    cu.fire_git_burst()
+    cu.pending_catch_up().fire()
+    assert cu.catch_ups == [(cu.repo_id, at(0), "git")]
+
+
+def test_a_lock_after_head_is_ignored(cu):
+    cu.stamp(at(20))
+    cu.manager.start()
+    cu.git("modified", "HEAD", 5)
+    cu.git("created", "index.lock", 6)
+    cu.fire_git_burst()
+    cu.pending_catch_up().fire()
+    assert cu.catch_ups == [(cu.repo_id, at(20), "git")]
+
+
+def test_stop_returns_while_a_catch_up_runs_and_its_failure_is_quiet(cu, caplog, monkeypatch):
+    from devgraph.agent import sync as sync_module
+    from devgraph.agent.sync import RepoSync
+
+    entered, release = threading.Event(), threading.Event()
+
+    def blocking_catch_up(*a, **k):
+        entered.set()
+        assert release.wait(5)
+        raise RuntimeError("driver closed")
+
+    monkeypatch.setattr(sync_module, "catch_up", blocking_catch_up)
+    repo_sync = RepoSync(None, cu.registry, lambda event: None, lambda *a: None)
+    cu.catch_up_hook = lambda repo_id, since: repo_sync.on_catch_up(repo_id, since)
+    cu.stamp(T0)
+    cu.manager.start()
+    catching = run_in_thread(cu.start_timer().fire)
+    assert entered.wait(5)
+    began = time.monotonic()
+    repo_sync.stopping = True
+    cu.manager.stop()
+    assert time.monotonic() - began < 5
+    with caplog.at_level("DEBUG", logger="devgraph.agent.sync"):
+        release.set()
+        catching.join(5)
+    assert not [r for r in caplog.records if r.levelno >= 30]

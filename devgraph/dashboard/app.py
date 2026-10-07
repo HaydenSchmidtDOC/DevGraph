@@ -8,9 +8,10 @@ stdin/stdout (see `mcp/server.py`'s module docstring).
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -100,10 +101,12 @@ def build_app(
     registry: RepoRegistry,
     events: EventBroadcaster,
     dashboard_host: str | None = None,
+    run_exclusive: Callable[[str, Callable[[], Any]], Any] | None = None,
 ) -> FastAPI:
     """`dashboard_host` is the address the server binds to (default: the
     `dashboard_host` setting); it joins the loopback names in the Host
-    allowlist unless it is a wildcard."""
+    allowlist unless it is a wildcard. `run_exclusive` is the agent's
+    watcher's, for registration (see `build_router`)."""
     settings = get_settings()
     if dashboard_host is None:
         dashboard_host = settings.dashboard_host
@@ -122,7 +125,7 @@ def build_app(
     app = FastAPI(title="DevGraph Dashboard", lifespan=lifespan)
     app.state.metrics = metrics
     app.add_middleware(_LocalHostOnlyMiddleware, allowed_hostnames=_allowed_hostnames(dashboard_host))
-    app.include_router(build_router(engine, registry, events, QueryLog(), metrics))
+    app.include_router(build_router(engine, registry, events, QueryLog(), metrics, run_exclusive))
     # Hand-written HTML/CSS/JS, no build step -- StaticFiles serves them
     # as-is (see Implementation Plan #5: no frontend framework in v1).
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")

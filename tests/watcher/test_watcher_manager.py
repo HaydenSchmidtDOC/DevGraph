@@ -253,7 +253,7 @@ def test_watcher_manager_never_accepts_raw_paths(temp_registry_db, temp_git_repo
 
     # All public methods should operate on registry-fetched repos only
     public_methods = {m for m in dir(watcher) if not m.startswith("_")}
-    allowed_methods = {"start", "stop", "refresh", "get_repo_issues", "run_exclusive"}
+    allowed_methods = {"start", "stop", "refresh", "get_repo_issues", "run_exclusive", "request_catch_up"}
     extra_methods = public_methods - allowed_methods
     assert not extra_methods, f"Unexpected public methods: {extra_methods}"
 

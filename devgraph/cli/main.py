@@ -90,8 +90,9 @@ def add(
                 try:
                     provision_repository_schema(engine, record.path)
                     engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
+                    started = datetime.now(timezone.utc)
                     count = full_scan(engine, record.repo_id, record.path, docs_path=record.docs_path, mentions_enabled=record.mentions_enabled)
-                    registry.mark_indexed(record.repo_id)
+                    registry.mark_indexed(record.repo_id, at=started)
                     console.print(f"[green][OK][/green] Indexed {count} file(s)")
 
                     if full:
@@ -270,8 +271,9 @@ def rescan(
             try:
                 provision_repository_schema(engine, repo.path)
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
+                started = datetime.now(timezone.utc)
                 count = full_scan(engine, repo_id, repo.path, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled)
-                registry.mark_indexed(repo_id)
+                registry.mark_indexed(repo_id, at=started)
                 console.print(f"[green][OK][/green] Rescanned {escape(repo_id)}: {count} file(s) indexed")
 
                 # Always reconcile git history on a rescan — not just with

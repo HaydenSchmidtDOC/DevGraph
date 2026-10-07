@@ -18,7 +18,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import NamedTuple
@@ -1427,6 +1429,67 @@ def prune_stale_files(
         return 0
     stale_paths = {repo_root / p for p in stale}
     return remove_paths(engine, repo_id, repo_root, stale_paths)
+
+
+#: How far before `since` a change stamp still makes a file due: FAT and SMB
+#: timestamp granularity, and the gap between an edit and its event.
+CATCH_UP_MARGIN_NS = 5_000_000_000
+
+
+class CatchUp(NamedTuple):
+    """What a catch-up did: files `index_paths` indexed (referrers included),
+    files `prune_stale_files` pruned, and files walked."""
+
+    indexed: int
+    pruned: int
+    checked: int
+
+
+def _change_stamp_ns(st: os.stat_result) -> int:
+    """When a file last changed, by any stamp. The second term catches a file
+    whose mtime was preserved (`cp -p`, tar, unzip, `rsync -a`): its ctime on
+    POSIX, its creation time on Windows (where `st_ctime` is deprecated)."""
+    second = st.st_birthtime_ns if sys.platform == "win32" else st.st_ctime_ns
+    return max(st.st_mtime_ns, second)
+
+
+def catch_up(
+    engine: GraphEngine,
+    repo_id: str,
+    repo_root: Path,
+    since: datetime,
+    docs_path: str | None = None,
+    mentions_enabled: bool = False,
+) -> CatchUp:
+    """Bring the graph up to date with changes made since `since`, while
+    nothing was watching: an incremental `full_scan`.
+
+    Files gone from disk are pruned first (provider-only ones included, and
+    through `remove_paths`, so docs key takeover applies). Then a file is
+    indexed when the graph has no file for its key, or when any of its change
+    stamps is at or after `since` less `CATCH_UP_MARGIN_NS`.
+    """
+    pruned = prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
+    known = _graph_files(engine, repo_id, repo_root)
+    cutoff = int(since.timestamp() * 1_000_000_000) - CATCH_UP_MARGIN_NS
+    walked = _keyed_indexable_paths(repo_root)
+    due: set[Path] = set()
+    for path, rel in walked:
+        if rel not in known:
+            due.add(path)
+            continue
+        try:
+            stamp = _change_stamp_ns(os.stat(path))
+        except OSError:
+            continue  # gone since the walk; the next catch-up prunes it
+        if stamp >= cutoff:
+            due.add(path)
+    indexed = (
+        index_paths(engine, repo_id, repo_root, due, docs_path=docs_path, mentions_enabled=mentions_enabled)
+        if due
+        else 0
+    )
+    return CatchUp(indexed=indexed, pruned=pruned, checked=len(walked))
 
 
 def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str | None = None, mentions_enabled: bool = False) -> int:

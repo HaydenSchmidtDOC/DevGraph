@@ -145,3 +145,12 @@ def _make_repo():
     repo_path = Path(tmpdir)
     subprocess.run(["git", "init"], cwd=str(repo_path), capture_output=True, check=True)
     return repo_path
+
+
+def test_mark_indexed_stamps_the_given_time(registry, temp_git_repo):
+    from datetime import datetime, timezone
+
+    record = registry.add_repo(temp_git_repo)
+    at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    registry.mark_indexed(record.repo_id, at=at)
+    assert registry.get(record.repo_id).last_indexed == at.isoformat()

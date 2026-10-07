@@ -231,8 +231,11 @@ class RepoRegistry:
             raise ValueError(f"no such repo_id: {repo_id}")
         self._touch_change_marker()
 
-    def mark_indexed(self, repo_id: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+    def mark_indexed(self, repo_id: str, at: datetime | None = None) -> None:
+        """Stamp `last_indexed`. `at` is the start of the work the stamp
+        covers (default: now): an edit made during that work may be unindexed,
+        so the stamp must not pass it (W7)."""
+        now = (at or datetime.now(timezone.utc)).isoformat()
         with self._lock:
             self._conn.execute(
                 "UPDATE repos SET last_indexed = ? WHERE repo_id = ?", (now, repo_id)

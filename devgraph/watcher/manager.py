@@ -9,7 +9,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections.abc import Iterable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -44,6 +46,10 @@ RECONCILE_RETRY_DELAYS_S = (0.5, 1.0, 2.0, 4.0)
 #: so a persistent failure must not be repeated per folder.
 MAX_SCHEDULE_FAILURES_PER_RECONCILE = 3
 
+#: How long after `.git/index.lock` is released a HEAD or ref change still
+#: counts as part of the same git operation (W6).
+GIT_LOCK_WINDOW_S = 5.0
+
 
 def _is_relevant_git_state_path(path: Path) -> bool:
     """Whether a path under `.git/` actually represents git *history* state.
@@ -63,52 +69,97 @@ def _is_relevant_git_state_path(path: Path) -> bool:
 
 
 class _GitStateEventHandler(FileSystemEventHandler):
-    """Handles git state changes (.git/HEAD, .git/refs) with debouncing."""
+    """Handles git state changes (.git/HEAD, .git/refs) with debouncing.
+
+    Also tells the manager when the burst that moved HEAD or a ref began (W6):
+    checkout, pull, merge, reset and stash take `.git/index.lock` before they
+    write files, so the burst starts at that lock's creation. A lock counts
+    only when it was created before the HEAD/ref event and was still held, or
+    released no more than `GIT_LOCK_WINDOW_S` before it: an IDE's `git status`
+    takes the same lock without moving HEAD.
+    """
 
     def __init__(
         self,
         repo_id: str,
         debounce_ms: int,
-        on_git_state_changed: Callable[[str], None],
+        on_burst: Callable[[str, float | None], None],
+        *,
+        timer_factory: TimerFactory = threading.Timer,
+        now: Callable[[], float] = time.time,
     ) -> None:
         self._repo_id = repo_id
         self._debounce_ms = debounce_ms
-        self._on_git_state_changed = on_git_state_changed
-        self._debounce_timer: threading.Timer | None = None
+        self._on_burst = on_burst
+        self._timer_factory = timer_factory
+        self._now = now
+        self._debounce_timer: Any = None
         self._lock = threading.Lock()
+        # The newest index.lock: when it was created, and released (None
+        # while held). Both None when there is no record.
+        self._lock_created: float | None = None
+        self._lock_released: float | None = None
+        # The pending burst's start, from a lock that preceded its HEAD/ref event.
+        self._burst_start: float | None = None
 
     def on_modified(self, event: FileModifiedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
         if not event.is_directory and _is_relevant_git_state_path(Path(str(event.src_path))):
-            with self._lock:
-                self._reset_debounce()
+            self._state_changed()
 
     def on_created(self, event: FileCreatedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
-        if not event.is_directory and _is_relevant_git_state_path(Path(str(event.src_path))):
+        if event.is_directory:
+            return
+        path = Path(str(event.src_path))
+        if path.name == "index.lock":
             with self._lock:
-                self._reset_debounce()
+                self._lock_created, self._lock_released = self._now(), None
+        if _is_relevant_git_state_path(path):
+            self._state_changed()
 
     def on_deleted(self, event: FileDeletedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
-        if not event.is_directory and _is_relevant_git_state_path(Path(str(event.src_path))):
-            with self._lock:
-                self._reset_debounce()
+        if event.is_directory:
+            return
+        path = Path(str(event.src_path))
+        if path.name == "index.lock":
+            self._lock_was_released()
+        if _is_relevant_git_state_path(path):
+            self._state_changed()
 
     def on_moved(self, event: FileMovedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
         if event.is_directory:
             return
+        if Path(str(event.src_path)).name == "index.lock":
+            self._lock_was_released()  # renamed onto `index`
         if _is_relevant_git_state_path(Path(str(event.src_path))) or _is_relevant_git_state_path(Path(str(event.dest_path))):
-            with self._lock:
-                self._reset_debounce()
+            self._state_changed()
+
+    def _lock_was_released(self) -> None:
+        with self._lock:
+            if self._lock_created is not None and self._lock_released is None:
+                self._lock_released = self._now()
+
+    def _state_changed(self) -> None:
+        """A HEAD/ref event: tie it to the lock that preceded it, if any, and
+        restart the debounce."""
+        t_h = self._now()
+        with self._lock:
+            created, released = self._lock_created, self._lock_released
+            if released is not None and t_h - released > GIT_LOCK_WINDOW_S:
+                self._lock_created = self._lock_released = None  # too old to matter
+            elif created is not None and created < t_h:
+                self._burst_start = created if self._burst_start is None else min(self._burst_start, created)
+            self._reset_debounce()
 
     def _reset_debounce(self) -> None:
         """Reset the debounce timer. Must hold _lock."""
         if self._debounce_timer:
             self._debounce_timer.cancel()
 
-        self._debounce_timer = threading.Timer(
+        self._debounce_timer = self._timer_factory(
             self._debounce_ms / 1000.0,
             self._fire_change,
         )
@@ -116,11 +167,12 @@ class _GitStateEventHandler(FileSystemEventHandler):
         self._debounce_timer.start()
 
     def _fire_change(self) -> None:
-        """Invoke the callback with the repo_id."""
+        """Invoke the callback with the repo_id and the burst's start."""
         with self._lock:
             self._debounce_timer = None
+            burst_start, self._burst_start = self._burst_start, None
         # Invoke callback outside lock to avoid deadlock
-        self._on_git_state_changed(self._repo_id)
+        self._on_burst(self._repo_id, burst_start)
 
 
 class WatcherManager:
@@ -139,6 +191,9 @@ class WatcherManager:
         *,
         timer_factory: TimerFactory = threading.Timer,
         reconcile_delay_s: float = 0.2,
+        on_catch_up: Callable[..., None] | None = None,
+        git_catch_up_delay_s: float = 2.0,
+        now: Callable[[], float] = time.time,
     ) -> None:
         """Initialize the watcher manager.
 
@@ -151,6 +206,13 @@ class WatcherManager:
             timer_factory: Builds the debounce and reconcile timers.
             reconcile_delay_s: How long a top-level watch reconcile waits to
                 coalesce the events that asked for it.
+            on_catch_up: Optional callback(repo_id, since, reason) that
+                catches up on changes made since `since` (W5). It runs under
+                the repo's batch lock: when watching starts (reason "start"),
+                after a git operation ("git"), and when asked through
+                `request_catch_up` ("retry").
+            git_catch_up_delay_s: How long after a git burst its catch-up runs.
+            now: The wall clock, in seconds; tests inject it.
         """
         self._registry = registry
         self._on_changes = on_changes
@@ -180,6 +242,18 @@ class WatcherManager:
         # Consecutive reconcile runs that couldn't watch every folder.
         self._reconcile_retries: dict[str, int] = {}
         self._stopping = False
+        self._on_catch_up = on_catch_up
+        self._git_catch_up_delay_s = git_catch_up_delay_s
+        self._now = now
+        # Guards the catch-up bookkeeping below. Never held while taking
+        # _lock or a batch lock, so request_catch_up can be called from
+        # inside a batch.
+        self._catch_up_lock = threading.Lock()
+        # repo_id -> [earliest since, reason, timer]
+        self._catch_up_pending: dict[str, list[Any]] = {}
+        # repo_id -> the start-of-watching catch-up's timer, until it fires.
+        self._start_catch_ups: dict[str, Any] = {}
+        self._catch_up_stopped = False
 
     def start(self) -> None:
         """Start watchers for all active, watch-enabled repos.
@@ -189,6 +263,8 @@ class WatcherManager:
         """
         with self._reconcile_lock:
             self._stopping = False
+        with self._catch_up_lock:
+            self._catch_up_stopped = False
         with self._lock:
             repos = self._registry.list_repos(active_only=True)
             repos_to_watch = [r for r in repos if r.watch_enabled]
@@ -199,13 +275,20 @@ class WatcherManager:
         """Stop all watchers and clean up.
 
         Pending reconciles are cancelled, and one that is running finishes
-        without queueing anything. Pending debounces are cancelled; the
-        changes they held are left for the next start's catch-up.
+        without queueing anything. Pending debounces and catch-ups are
+        cancelled; the changes they held are left for the next start's
+        catch-up. A catch-up that is running is not waited for.
         """
         with self._reconcile_lock:
             self._stopping = True
             timers = list(self._reconcile_pending.values())
             self._reconcile_pending.clear()
+        with self._catch_up_lock:
+            self._catch_up_stopped = True
+            timers += [entry[2] for entry in self._catch_up_pending.values()]
+            timers += list(self._start_catch_ups.values())
+            self._catch_up_pending.clear()
+            self._start_catch_ups.clear()
         for timer in timers:
             timer.cancel()
         with self._lock:
@@ -226,6 +309,86 @@ class WatcherManager:
             lock = self._batch_locks.setdefault(repo_id, threading.Lock())
         with lock:
             return fn()
+
+    def request_catch_up(self, repo_id: str, since: datetime, delay_s: float, reason: str = "retry") -> None:
+        """Run `on_catch_up(repo_id, since)` in `delay_s`, under the repo's
+        batch lock. Requests made before it runs coalesce: the earliest
+        `since` is kept, and so is the first request's timer.
+
+        Never takes `_lock` or a batch lock: `RepoSync.on_changes` calls it
+        from inside a batch.
+        """
+        if self._on_catch_up is None:
+            return
+        with self._catch_up_lock:
+            if self._catch_up_stopped:
+                return
+            entry = self._catch_up_pending.get(repo_id)
+            if entry is not None:
+                entry[0] = min(entry[0], since)
+                if reason == "git":
+                    entry[1] = reason
+                return
+            timer = self._timer_factory(delay_s, lambda: self._run_requested_catch_up(repo_id))
+            timer.daemon = True
+            self._catch_up_pending[repo_id] = [since, reason, timer]
+            timer.start()
+
+    def _run_requested_catch_up(self, repo_id: str) -> None:
+        with self._catch_up_lock:
+            entry = self._catch_up_pending.pop(repo_id, None)
+            if entry is None or self._catch_up_stopped:
+                return
+        since, reason, _timer = entry
+
+        def run() -> None:
+            if not self._catch_up_stopped:
+                self._on_catch_up(repo_id, since, reason)
+
+        self.run_exclusive(repo_id, run)
+
+    def _start_catch_up(self, repo_id: str, snapshot: datetime | None) -> None:
+        """The catch-up when watching starts, on its own thread (W5).
+
+        `snapshot` is `last_indexed` as read before the observer started, so
+        a live batch that wins the batch lock first cannot raise it past
+        edits made while nothing was watching. A None snapshot is re-read
+        under the lock: a registration in this process may just have
+        finished its first scan under the same lock.
+        """
+        with self._catch_up_lock:
+            self._start_catch_ups.pop(repo_id, None)
+            if self._catch_up_stopped:
+                return
+
+        def run() -> None:
+            since = snapshot if snapshot is not None else self._last_indexed(repo_id)
+            if since is None:
+                logger.info('DevGraph hasn\'t indexed %s yet; run "devgraph rescan %s"', repo_id, repo_id)
+                return
+            self._on_catch_up(repo_id, since, "start")
+
+        self.run_exclusive(repo_id, run)
+
+    def _last_indexed(self, repo_id: str) -> datetime | None:
+        repo = self._registry.get(repo_id)
+        if repo is None or not repo.last_indexed:
+            return None
+        return datetime.fromisoformat(repo.last_indexed)
+
+    def _on_git_burst(self, repo_id: str, burst_start: float | None) -> None:
+        """A git burst's debounce fired: catch up from the start of the burst
+        (or `last_indexed`) shortly, to repair events the OS dropped (W6),
+        then sync git history."""
+        if self._on_catch_up is not None:
+            last = self._last_indexed(repo_id)
+            if last is not None:
+                since = last
+                if burst_start is not None:
+                    since = min(last, datetime.fromtimestamp(burst_start, timezone.utc))
+                self.request_catch_up(repo_id, since, self._git_catch_up_delay_s, "git")
+        if self._on_git_state_changed is not None:
+            self._on_git_state_changed(repo_id)
 
     def refresh(self) -> None:
         """Rebuild watcher set by re-reading the registry.
@@ -304,11 +467,13 @@ class WatcherManager:
         # Watch git state changes (.git/HEAD, .git/refs) if .git exists as a directory.
         # Skip if .git is a file (linked git worktree contains gitdir: ... pointer).
         git_dir = repo.path / ".git"
-        if git_dir.is_dir() and self._on_git_state_changed:
+        if git_dir.is_dir() and (self._on_git_state_changed or self._on_catch_up):
             git_handler = _GitStateEventHandler(
                 repo.repo_id,
                 self._debounce_ms,
-                self._on_git_state_changed,
+                self._on_git_burst,
+                timer_factory=self._timer_factory,
+                now=self._now,
             )
             # Non-recursive watch on .git itself (catches HEAD, packed-refs)
             observer.schedule(git_handler, str(git_dir), recursive=False)
@@ -318,6 +483,8 @@ class WatcherManager:
                 observer.schedule(git_handler, str(refs_heads), recursive=True)
             self._git_handlers[repo.repo_id] = git_handler
 
+        # Read before the observer starts (W5): see _start_catch_up.
+        snapshot = self._last_indexed(repo.repo_id) if self._on_catch_up is not None else None
         try:
             observer.start()
             self._observers[repo.repo_id] = observer
@@ -332,6 +499,14 @@ class WatcherManager:
             logger.warning(
                 f"Skipping watcher for {repo.repo_id}: {error_msg}"
             )
+            return
+        if self._on_catch_up is not None:
+            repo_id = repo.repo_id
+            timer = self._timer_factory(0.0, lambda: self._start_catch_up(repo_id, snapshot))
+            timer.daemon = True
+            with self._catch_up_lock:
+                self._start_catch_ups[repo_id] = timer
+            timer.start()
 
     def _stop_single(self, repo_id: str) -> None:
         """Stop a watcher for a single repo. Must hold _lock."""
@@ -344,8 +519,14 @@ class WatcherManager:
         self._watches.pop(repo_id, None)
         with self._reconcile_lock:
             timer = self._reconcile_pending.pop(repo_id, None)
-        if timer is not None:
-            timer.cancel()
+        with self._catch_up_lock:
+            timers = [timer, self._start_catch_ups.pop(repo_id, None)]
+            entry = self._catch_up_pending.pop(repo_id, None)
+            if entry is not None:
+                timers.append(entry[2])
+        for timer in timers:
+            if timer is not None:
+                timer.cancel()
         if handler is not None:
             handler.close()
 

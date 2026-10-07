@@ -452,3 +452,42 @@ def test_register_repo_with_an_invalid_schema_stays_registered_and_warns(
         assert reopened.get("sample-repo") is not None
     finally:
         reopened.close()
+
+
+def test_registration_scans_and_stamps_under_run_exclusive_at_the_scans_start(
+    registry, engine, monkeypatch, tmp_path
+):
+    """The agent passes the watcher's run_exclusive, so a watcher that picks the
+    new repository up mid-scan waits for it, then sees the stamp (W4, W5)."""
+    from datetime import datetime, timedelta, timezone
+
+    t0 = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
+    scanned: list[str] = []
+
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return t0 + timedelta(minutes=5) if scanned else t0
+
+    def fake_full_scan(engine_arg, repo_id, repo_root, docs_path=None, mentions_enabled=False):
+        scanned.append(repo_id)
+        return 3
+
+    exclusive: list[tuple[str, str | None]] = []
+
+    def run_exclusive(repo_id, fn):
+        result = fn()
+        exclusive.append((repo_id, registry.get(repo_id).last_indexed))
+        return result
+
+    monkeypatch.setattr(routes, "full_scan", fake_full_scan)
+    monkeypatch.setattr(routes, "datetime", FakeDatetime)
+    app = FastAPI()
+    app.include_router(routes.build_router(engine, registry, EventBroadcaster(), run_exclusive=run_exclusive))
+    client = TestClient(app, base_url="http://127.0.0.1")
+
+    res = client.post("/api/repos", json={"path": str(_make_git_repo(tmp_path))})
+
+    assert res.status_code == 201, res.text
+    assert exclusive == [("sample-repo", t0.isoformat())]
+    assert res.json()["last_indexed"] == t0.isoformat()
