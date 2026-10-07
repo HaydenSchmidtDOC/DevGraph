@@ -1425,6 +1425,18 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     return len(removed)
 
 
+def _docs_folder(repo_root: Path, docs_path: str | None) -> str | None:
+    """The docs path as a repo-relative POSIX folder, or None when unset,
+    outside the repository, or the repository root itself."""
+    if not docs_path:
+        return None
+    root = repo_root.resolve()
+    folder = (root / docs_path).resolve()
+    if folder == root or not is_within(folder, root):
+        return None
+    return folder.relative_to(root).as_posix()
+
+
 def prune_stale_files(
     engine: GraphEngine,
     repo_id: str,
@@ -1449,13 +1461,24 @@ def prune_stale_files(
     distinction per node.
 
     Module nodes with no file key at all, left by an older git-history sync,
-    are deleted first (an upgrade cleanup; a scan never makes one).
+    are deleted first, and so are docs notes whose `source_file` is not under
+    the docs path, left by an older scan that keyed a note by its bare
+    filename (upgrade cleanups; a scan never makes either). The notes are
+    written again under their repo-relative path by the scan or catch-up
+    that follows.
 
     Returns the number of files pruned.
     """
     bare = engine.delete_bare_modules(repo_id)
     if bare:
         logger.info("removed %d leftover module nodes with no file behind them from %s", bare, repo_id)
+    docs_folder = _docs_folder(repo_root, docs_path)
+    # Skipped when the docs path is the repository root: every path is under
+    # it, so nothing tells a bare filename key from a root-level note's path.
+    if docs_folder is not None:
+        misplaced = engine.delete_docs_notes_outside(repo_id, docs_folder)
+        if misplaced:
+            logger.info("removed %d docs notes keyed outside %s from %s", misplaced, docs_folder, repo_id)
     on_disk = {rel for _, rel in _keyed_indexable_paths(repo_root, keep_ignored_targets=True)}
     stale = _graph_files(engine, repo_id, repo_root) - on_disk
     if not stale:
@@ -1503,6 +1526,24 @@ def _would_index(
     return ok and docs_spec is not None and any(docs.selects(t, rel) for t in docs_spec.types)
 
 
+def _docs_note_files(engine: GraphEngine, repo_id: str) -> set[str]:
+    return engine.list_docs_note_files(repo_id)
+
+
+def _is_unindexed_note(path: Path, docs_root: Path | None, mentions_enabled: bool) -> bool:
+    """Whether a file no docs note holds the key of is a docs note: routed to
+    the docs extractor and with note front matter. Read only for Markdown
+    under the docs path that isn't a note in the graph, so a plain page there
+    is read each catch-up and a note never is."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    if "docs" not in _routes(resolved, docs_root, mentions_enabled):
+        return False
+    return bool(DocsExtractor("").extract_from_source(_read_text(resolved), resolved.name).docs)
+
+
 def _change_stamp_ns(st: os.stat_result) -> int:
     """When a file last changed, by any stamp. The second term catches a file
     whose mtime was preserved (`cp -p`, tar, unzip, `rsync -a`): its ctime on
@@ -1533,6 +1574,10 @@ def catch_up(
     specs = _applied_provider_specs(engine, repo_id, repo_root)
     known = _graph_files(engine, repo_id, repo_root, specs)
     docs_root = (repo_root / docs_path).resolve() if docs_path else None
+    # A file the docs extractor routes counts as known only through a note
+    # holding its key: its mentions Document holds the same key, and a note
+    # an upgrade cleanup just deleted must be written again.
+    notes = _docs_note_files(engine, repo_id) if docs_root is not None else set()
     cutoff = int(since.timestamp() * 1_000_000_000) - CATCH_UP_MARGIN_NS
     walked = _keyed_indexable_paths(repo_root)
     due: set[Path] = set()
@@ -1540,7 +1585,7 @@ def catch_up(
     for path, rel in walked:
         if not _would_index(path, rel, docs_root, mentions_enabled, specs):
             continue
-        if rel not in known:
+        if rel not in known or (rel not in notes and _is_unindexed_note(path, docs_root, mentions_enabled)):
             due.add(path)
             unknown += 1
             continue

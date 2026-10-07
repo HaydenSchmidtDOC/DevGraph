@@ -189,17 +189,19 @@ class _GitStateEventHandler(FileSystemEventHandler):
 
 
 def _forget_closed_handle(emitter: Any) -> None:
-    """Before a dead emitter is stopped again (unscheduled, or by its
+    """Before a stopped emitter is stopped again (unscheduled, or by its
     observer's stop): watchdog's Windows emitter closes its directory handle
-    when it stops itself (its folder was deleted) but keeps the value, and a
-    second stop() would close it again, by then perhaps another object's
-    handle, which can crash the process. No-op for other emitters."""
-    if not emitter.is_alive() and getattr(emitter, "_whandle", None):
+    in stop() (which it calls itself when its folder is deleted) but keeps
+    the value, and a second stop() would close it again, by then perhaps
+    another object's handle, which can crash the process. The stopped event
+    is set just before that close, so it says the handle is (being) closed
+    even while the thread is still winding down. No-op for other emitters."""
+    if emitter.stopped_event.is_set() and getattr(emitter, "_whandle", None):
         emitter._whandle = None
 
 
 def _forget_closed_handles(observer: Any) -> None:
-    """`_forget_closed_handle` for each of the observer's dead emitters."""
+    """`_forget_closed_handle` for each of the observer's emitters."""
     for emitter in list(getattr(observer, "_emitter_for_watch", {}).values()):
         _forget_closed_handle(emitter)
 
@@ -720,7 +722,7 @@ class WatcherManager:
                         and self._dir_identity(path) == identity
                     ):
                         continue
-                    if emitter is not None and not alive:
+                    if emitter is not None:
                         _forget_closed_handle(emitter)
                     if emitters is None or emitter is not None:
                         try:

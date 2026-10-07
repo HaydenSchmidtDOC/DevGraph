@@ -408,9 +408,17 @@ def test_no_batch_starts_after_stop(rig):
 class FakeEmitter:
     def __init__(self) -> None:
         self.alive = True
+        self.stopped_event = threading.Event()
 
     def is_alive(self) -> bool:
         return self.alive
+
+    def stopped_itself(self, whandle=1234) -> None:
+        """What watchdog's Windows emitter does when its folder is deleted:
+        stop() (closing the handle but keeping its value), then its thread ends."""
+        self._whandle = whandle
+        self.stopped_event.set()
+        self.alive = False
 
 
 class FakeObserver:
@@ -531,13 +539,31 @@ def test_a_dead_emitter_forgets_its_closed_handle_before_it_is_unscheduled(tmp_p
     rig = FakeRig(tmp_path)
     watch = rig.watch("pkg")
     emitter = rig.observer._emitter_for_watch[watch]
-    emitter.alive, emitter._whandle = False, 1234
+    emitter.stopped_itself()
     seen = []
     unschedule = rig.observer.unschedule
     rig.observer.unschedule = lambda w: (seen.append(emitter._whandle), unschedule(w))
     rig.reconcile()
     assert seen == [None]
     assert rig.watched() == {"pkg": True}
+
+
+def test_an_emitter_stopped_but_still_winding_down_forgets_its_handle(tmp_path):
+    """stop() closes the handle before the thread ends: the stopped event,
+    not the thread, says the handle is closed."""
+    rig = FakeRig(tmp_path)
+    watch = rig.watch("pkg")
+    emitter = rig.observer._emitter_for_watch[watch]
+    emitter.stopped_itself()
+    emitter.alive = True
+    seen = []
+    unschedule = rig.observer.unschedule
+    rig.observer.unschedule = lambda w: (seen.append(emitter._whandle), unschedule(w))
+    path = rig.root / "pkg"
+    _watch, identity = rig.manager._watches["r"][path]
+    rig.manager._watches["r"][path] = (watch, (identity[0], identity[1] + 1))
+    rig.reconcile()
+    assert seen == [None]
 
 
 def test_a_live_emitter_keeps_its_handle_for_unschedule_to_close(tmp_path):
@@ -579,7 +605,7 @@ def test_stopping_forgets_the_closed_handle_of_a_dead_emitter(tmp_path, how):
     rig.observer = rig.manager._observers["r"] = StoppableObserver()
     dead = rig.observer._emitter_for_watch[rig.watch("pkg")]
     live = rig.observer._emitter_for_watch[rig.watch("lib")]
-    dead.alive, dead._whandle = False, 1234
+    dead.stopped_itself()
     live._whandle = 5678
     if how == "stop":
         rig.manager.stop()

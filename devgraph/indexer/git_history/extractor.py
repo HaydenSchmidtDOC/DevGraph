@@ -16,6 +16,7 @@ this codebase; see indexer/python/extractor.py's index_file for precedent).
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -360,7 +361,10 @@ def _apply_function_recency(
         )
 
 
-def sync_git_history(engine, registry, repo_id: str, max_count: int | None = None, force: bool = False) -> dict:
+def sync_git_history(
+    engine, registry, repo_id: str, max_count: int | None = None, force: bool = False,
+    on_initial: Callable[[int], None] | None = None,
+) -> dict:
     """Bring a repo's Commit graph and staged recency up to date with HEAD.
 
     Unlike `index_repo_history`, this is safe to call after history has been
@@ -381,6 +385,9 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
             for repairing a graph whose MODIFIES edges were destroyed by a
             bug (e.g. the old replace_file_nodes blanket-delete) — the
             normal fast/noop path would otherwise never re-create them.
+        on_initial: Called with the number of commits a *first* sync is about
+            to read, before it reads them (the agent logs it: a first sync of
+            a long history takes minutes, holding the batch lock).
 
     Returns:
         A dict with `mode` (`"noop"`, `"initial"`, `"fast"`, or
@@ -412,6 +419,10 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
             mode = "reconcile"
         else:
             mode = "fast"
+
+        if mode == "initial" and on_initial is not None:
+            count = int(repo.git.rev_list("--count", "HEAD"))
+            on_initial(count if max_count is None else min(count, max_count))
 
         extractor = GitHistoryExtractor(repo_id, repo_record.path)
 

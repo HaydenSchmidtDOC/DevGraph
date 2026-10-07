@@ -37,6 +37,7 @@ def stubbed(monkeypatch):
     monkeypatch.setattr(dispatch, "prune_stale_files", lambda *a, **k: state["pruned"])
     monkeypatch.setattr(dispatch, "schema_pending", lambda *a, **k: False)
     monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: set(state["known"]))
+    monkeypatch.setattr(dispatch, "_docs_note_files", lambda *a, **k: set(state["known"]))
 
     def index(engine, repo_id, root, paths, docs_path=None, mentions_enabled=False):
         state["offered"].append({p.relative_to(root).as_posix() for p in paths})
@@ -233,6 +234,17 @@ def test_would_index_routes_exactly_as_index_single_path(tmp_path, mentions_enab
     assert set(verdicts) == set(files) | set(links)
     assert {rel: v for rel, v in verdicts.items() if v[0] != v[1]} == {}
     assert verdicts["src/link.py"] == (False, False) and verdicts["src/note.txt"] == (True, True)
+
+
+def test_a_docs_note_known_only_through_its_mentions_document_is_offered(tmp_path, stubbed, monkeypatch):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "note.md").write_text("---\ntype: requirement\nid: r\n---\n# R\n")
+    (tmp_path / "docs" / "page.md").write_text("# Just a page\n")
+    stubbed["known"] = {"docs/note.md", "docs/page.md"}
+    monkeypatch.setattr(dispatch, "_docs_note_files", lambda *a, **k: set())
+    result = catch_up(None, "r", tmp_path, NOW + timedelta(hours=1), docs_path="docs", mentions_enabled=True)
+    assert stubbed["offered"] == [{"docs/note.md"}]
+    assert (result.offered, result.unknown) == (1, 1)
 
 
 def test_prune_count_is_reported(tmp_path, stubbed):
@@ -529,3 +541,61 @@ def test_bare_module_cleanup_stays_in_its_repository(engine):
         assert [row["r"] for row in left] == [other]
     finally:
         engine.delete_repository(other)
+
+
+def _scan_docs_mentions(engine, root, repo_id=REPO, mentions=True):
+    engine.upsert_repository(repo_id, repo_id, str(root))
+    full_scan(engine, repo_id, root, docs_path="docs", mentions_enabled=mentions)
+
+
+def _heal(engine, root, heal, mentions):
+    if heal == "catch_up":
+        catch_up(
+            engine, REPO, root, datetime.now(timezone.utc) + timedelta(minutes=1),
+            docs_path="docs", mentions_enabled=mentions,
+        )
+    else:
+        _scan_docs_mentions(engine, root, mentions=mentions)
+
+
+@pytest.mark.parametrize("heal", ["catch_up", "full_scan"])
+def test_bare_note_keys_are_rekeyed_with_mentions_on(engine, notes_repo, heal):
+    """The mentions Document already gives docs/arch.md a source_file, so the
+    file looks known; the note must still come back under its new key."""
+    _scan_docs_mentions(engine, notes_repo)
+    _downgrade_note_keys(engine)
+    _heal(engine, notes_repo, heal, mentions=True)
+    assert _note_files(engine) == [("note-top", "docs/arch.md"), ("req-sub", "docs/sub/arch.md")]
+    _scan_docs_mentions(engine, notes_repo, FRESH)
+    assert snapshot(engine, REPO) == snapshot(engine, FRESH)
+    again = catch_up(
+        engine, REPO, notes_repo, datetime.now(timezone.utc) + timedelta(minutes=1),
+        docs_path="docs", mentions_enabled=True,
+    )
+    assert (again.offered, again.pruned) == (0, 0)
+
+
+@pytest.mark.parametrize("heal", ["catch_up", "full_scan"])
+def test_a_bare_note_key_naming_a_real_root_file_is_rekeyed(engine, tmp_path, heal):
+    """Old key `README.md` for docs/README.md while a root README.md exists:
+    the stale key is on disk, so pruning alone never touches the note."""
+    root = tmp_path / "collide"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "a.py").write_text("class Alpha:\n    pass\n")
+    (root / "README.md").write_text("# Root\n")
+    _front(root, "docs/README.md", "type: architecture_note\nid: overview\nlinks: [Alpha]")
+    _scan_docs(engine, root)
+    engine.run_cypher(
+        "MATCH (n:ArchitectureNote {repo_id: $r, name: 'overview'}) SET n.source_file = 'README.md'", {"r": REPO}
+    )
+    # What an older scan left: a note since re-identified, under the bare key, with its edge.
+    engine.run_cypher(
+        "MATCH (m {repo_id: $r, name: 'Alpha'}) "
+        "CREATE (m)-[:DOCUMENTED_BY]->(:ArchitectureNote {repo_id: $r, name: 'note-old', source_file: 'README.md'})",
+        {"r": REPO},
+    )
+    assert _note_files(engine) == [("note-old", "README.md"), ("overview", "README.md")]
+    _heal(engine, root, heal, mentions=False)
+    assert _note_files(engine) == [("overview", "docs/README.md")]
+    _scan_docs(engine, root, FRESH)
+    assert snapshot(engine, REPO) == snapshot(engine, FRESH)

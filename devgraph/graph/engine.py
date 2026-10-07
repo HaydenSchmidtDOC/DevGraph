@@ -990,6 +990,39 @@ class GraphEngine:
             record = result.single() if result is not None else None
             return record["n"] if record else 0
 
+    def delete_docs_notes_outside(self, repo_id: str, folder: str) -> int:
+        """Delete this repo's docs notes (Requirement, DesignDecision,
+        ArchitectureNote) whose `source_file` is not under `folder` (a
+        repo-relative POSIX path, not the root), with their edges, and return
+        how many went. Notes under the docs path record their repo-relative
+        path, so only a note an older scan keyed by its bare filename, or one
+        left from a former docs path, looks like this."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) "
+                "WHERE (n:Requirement OR n:DesignDecision OR n:ArchitectureNote) "
+                "  AND n.source_file IS NOT NULL AND NOT n.source_file STARTS WITH $prefix "
+                "DETACH DELETE n RETURN count(n) AS n",
+                repo_id=repo_id,
+                prefix=folder.rstrip("/") + "/",
+            )
+            record = result.single() if result is not None else None
+            return record["n"] if record else 0
+
+    def list_docs_note_files(self, repo_id: str) -> set[str]:
+        """The `source_file` of every docs note (Requirement, DesignDecision,
+        ArchitectureNote) in this repo."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) "
+                "WHERE (n:Requirement OR n:DesignDecision OR n:ArchitectureNote) AND n.source_file IS NOT NULL "
+                "RETURN DISTINCT n.source_file AS path",
+                repo_id=repo_id,
+            )
+            return {record["path"] for record in result}
+
     def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str]]:
         """Return (label, name) for every node whose file provenance
         (`source_file`/`file`, a `Module` named by its path, or a schema

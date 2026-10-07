@@ -142,7 +142,13 @@ class TrayApp:
         """
         logger.debug("syncing git history for %s", repo_id)
         try:
-            result = sync_git_history(self._engine, self._registry, repo_id)
+            result = sync_git_history(
+                self._engine, self._registry, repo_id,
+                on_initial=lambda count: logger.info(
+                    "Reading the git history of %s for the first time (%s commits); "
+                    "live updates resume when it finishes", repo_id, f"{count:,}",
+                ),
+            )
             # Every catch-up ends with a sync, so one with HEAD unmoved is quiet.
             logger.log(
                 logging.DEBUG if result.get("mode") == "noop" else logging.INFO,
