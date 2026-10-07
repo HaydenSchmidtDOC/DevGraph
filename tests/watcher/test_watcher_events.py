@@ -197,6 +197,45 @@ def test_dir_move_walks_destination_and_sub_moves_add_nothing(h, root):
     assert h.one_batch() == ({"pkg/sub2/b.py"}, {"pkg/sub"})
 
 
+def test_synthetic_sub_moves_are_not_walked(h, root, monkeypatch):
+    walked = []
+    real = manager_module.indexable_paths_under
+    monkeypatch.setattr(
+        manager_module, "indexable_paths_under", lambda r, d: walked.append(d) or real(r, d)
+    )
+    _write(root / "pkg/sub2/inner/b.py")
+    h.send(
+        DirMovedEvent(h.p("pkg/sub"), h.p("pkg/sub2")),
+        DirMovedEvent(h.p("pkg/sub/inner"), h.p("pkg/sub2/inner"), is_synthetic=True),
+        FileMovedEvent(h.p("pkg/sub/inner/b.py"), h.p("pkg/sub2/inner/b.py"), is_synthetic=True),
+        DirCreatedEvent(h.p("pkg/sub2/inner"), is_synthetic=True),
+    )
+    assert walked == [root / "pkg/sub2"]
+    assert h.one_batch() == ({"pkg/sub2/inner/b.py"}, {"pkg/sub"})
+
+
+def test_top_level_dirs_are_left_to_the_reconcile_walk(h, root, monkeypatch):
+    walked = []
+    monkeypatch.setattr(manager_module, "indexable_paths_under", lambda r, d: walked.append(d) or set())
+    (root / "newtop").mkdir()
+    (root / "lib").mkdir()
+    h.send(DirCreatedEvent(h.p("newtop")), DirMovedEvent(h.p("pkg"), h.p("lib")))
+    assert walked == []
+    assert h.reconciles == ["repo", "repo"]
+    assert h.one_batch() == (set(), {"pkg"})
+
+
+def test_closed_handler_neither_queues_nor_fires(h, root):
+    _write(root / "pkg/a.py")
+    h.send(FileModifiedEvent(h.p("pkg/a.py")))
+    h.handler.close()
+    assert h.timers[-1].cancelled
+    h.send(FileModifiedEvent(h.p("pkg/a.py")))
+    assert len(h.timers) == 1
+    h.handler.flush()
+    assert h.batches == []
+
+
 def test_dir_created_walks_it(h, root):
     _write(root / "pkg/new/c.py")
     _write(root / "pkg/new/d.md", "# d\n")

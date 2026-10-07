@@ -35,6 +35,15 @@ logger = logging.getLogger(__name__)
 #: cancellable timer with a `daemon` attribute. Injected by tests.
 TimerFactory = Callable[[float, Callable[[], None]], Any]
 
+#: How long a reconcile waits before retrying a top-level folder it couldn't
+#: watch; after the last, it gives up until the next top-level change.
+RECONCILE_RETRY_DELAYS_S = (0.5, 1.0, 2.0, 4.0)
+
+#: Failed `observer.schedule` calls one reconcile run makes before leaving the
+#: rest to its retry. Each failure leaks an inotify instance in watchdog 6.0.0,
+#: so a persistent failure must not be repeated per folder.
+MAX_SCHEDULE_FAILURES_PER_RECONCILE = 3
+
 
 def _is_relevant_git_state_path(path: Path) -> bool:
     """Whether a path under `.git/` actually represents git *history* state.
@@ -168,6 +177,8 @@ class WatcherManager:
         self._reconcile_lock = threading.Lock()
         self._reconcile_pending: dict[str, Any] = {}
         self._reconcile_running: set[str] = set()
+        # Consecutive reconcile runs that couldn't watch every folder.
+        self._reconcile_retries: dict[str, int] = {}
         self._stopping = False
 
     def start(self) -> None:
@@ -203,7 +214,7 @@ class WatcherManager:
                     observer.stop()
                     observer.join(timeout=5)
             for handler in self._handlers.values():
-                handler.cancel()
+                handler.close()
             self._observers.clear()
             self._handlers.clear()
             self._watches.clear()
@@ -336,7 +347,7 @@ class WatcherManager:
         if timer is not None:
             timer.cancel()
         if handler is not None:
-            handler.cancel()
+            handler.close()
 
         if observer.is_alive():
             observer.stop()
@@ -388,12 +399,16 @@ class WatcherManager:
         on watchdog's dispatch thread, so it takes only `_reconcile_lock`;
         requests coalesce until the timer fires."""
         with self._reconcile_lock:
-            if self._stopping or repo_id in self._reconcile_pending:
-                return
-            timer = self._timer_factory(self._reconcile_delay_s, lambda: self._reconcile(repo_id))
-            timer.daemon = True
-            self._reconcile_pending[repo_id] = timer
-            timer.start()
+            self._schedule_reconcile(repo_id, self._reconcile_delay_s)
+
+    def _schedule_reconcile(self, repo_id: str, delay_s: float) -> None:
+        """Start a reconcile timer unless one is pending. Must hold _reconcile_lock."""
+        if self._stopping or repo_id in self._reconcile_pending:
+            return
+        timer = self._timer_factory(delay_s, lambda: self._reconcile(repo_id))
+        timer.daemon = True
+        self._reconcile_pending[repo_id] = timer
+        timer.start()
 
     def _reconcile(self, repo_id: str) -> None:
         """Make the repo's top-level watches match its top-level directories.
@@ -438,22 +453,53 @@ class WatcherManager:
                         observer.unschedule(watch)
                     del watches[path]
                 added = []
+                failed: list[str] = []
+                error: OSError | None = None
                 for path in sorted(desired - watches.keys()):
+                    if len(failed) >= MAX_SCHEDULE_FAILURES_PER_RECONCILE:
+                        failed.append(path.name)  # left for the retry
+                        continue
+                    if not path.is_dir():
+                        continue  # gone since the listing; its event will follow
                     try:
                         watches[path] = self._schedule_dir(observer, handler, path)
                     except OSError as e:
-                        logger.debug("Couldn't watch %s: %s", path, e)
+                        failed.append(path.name)
+                        error = e
                         continue
                     added.append(path)
             files: set[Path] = set()
             for path in added:
                 files |= indexable_paths_under(root, path)
             with self._reconcile_lock:
+                # A handler closed by stop() or refresh() drops what it's given.
                 if files and not self._stopping:
                     handler.queue_changed(files)
+                self._retry_reconcile(repo_id, failed, error)
         finally:
             with self._reconcile_lock:
                 self._reconcile_running.discard(repo_id)
+
+    def _retry_reconcile(self, repo_id: str, failed: list[str], error: OSError | None) -> None:
+        """Retry folders a reconcile couldn't watch, with backoff, then give
+        up until the next top-level change. Must hold _reconcile_lock."""
+        if not failed:
+            self._reconcile_retries.pop(repo_id, None)
+            return
+        attempt = self._reconcile_retries.get(repo_id, 0)
+        folders = ", ".join(failed)
+        if attempt >= len(RECONCILE_RETRY_DELAYS_S):
+            self._reconcile_retries.pop(repo_id, None)
+            logger.warning(
+                "Couldn't watch %s in %s (%s); changes there won't be picked up "
+                "until another top-level folder changes or DevGraph restarts",
+                folders, repo_id, error,
+            )
+            return
+        delay = RECONCILE_RETRY_DELAYS_S[attempt]
+        self._reconcile_retries[repo_id] = attempt + 1
+        logger.info("Couldn't watch %s in %s yet (%s); retrying in %g s", folders, repo_id, error, delay)
+        self._schedule_reconcile(repo_id, delay)
 
     def get_repo_issues(self) -> dict[str, str]:
         """Return a copy of repos with path/watcher issues.
@@ -508,6 +554,7 @@ class _RepoEventHandler(FileSystemEventHandler):
         # Folder log lines, keyed by the folder's repo-relative path.
         self._folder_events: dict[str, str] = {}
         self._debounce_timer: Any = None
+        self._closed = False
         self._lock = threading.Lock()
 
     # --- watchdog callbacks -------------------------------------------------
@@ -527,7 +574,8 @@ class _RepoEventHandler(FileSystemEventHandler):
         half of an atomic save."""
         path = Path(str(event.src_path))
         if event.is_directory:
-            self._queue(changed=self._walk_dir(path))
+            if self._should_walk(event, path):
+                self._queue(changed=self._walk_dir(path))
         elif self._is_tracked_path(path):
             self._queue(changed=[path])
         self._signal_top_level(str(event.src_path))
@@ -559,7 +607,7 @@ class _RepoEventHandler(FileSystemEventHandler):
         deleted = [Path(src_raw)] if src_rel is not None else []
         folders: dict[str, str] = {}
         if event.is_directory:
-            changed = self._walk_dir(dest) if dest is not None else set()
+            changed = self._walk_dir(dest) if dest is not None and self._should_walk(event, dest) else set()
             if src_rel is not None:
                 dest_rel = self._queue_rel(dest_raw)
                 folders[src_rel] = (
@@ -586,9 +634,20 @@ class _RepoEventHandler(FileSystemEventHandler):
     def cancel(self) -> None:
         """Drop the pending debounce timer. Pending paths stay queued."""
         with self._lock:
-            if self._debounce_timer is not None:
-                self._debounce_timer.cancel()
-                self._debounce_timer = None
+            self._cancel_timer()
+
+    def close(self) -> None:
+        """Retire the handler (the manager stopped watching its repo): drop
+        the pending timer, and queue and fire nothing from now on."""
+        with self._lock:
+            self._closed = True
+            self._cancel_timer()
+
+    def _cancel_timer(self) -> None:
+        """Must hold _lock."""
+        if self._debounce_timer is not None:
+            self._debounce_timer.cancel()
+            self._debounce_timer = None
 
     def _queue(
         self,
@@ -603,6 +662,8 @@ class _RepoEventHandler(FileSystemEventHandler):
         if not changed and not deleted:
             return
         with self._lock:
+            if self._closed:
+                return
             for path in deleted:
                 key = str(path)
                 self._changed.pop(key, None)
@@ -639,7 +700,9 @@ class _RepoEventHandler(FileSystemEventHandler):
         callback, so the dispatch thread can keep queueing while it runs."""
         with self._batch_lock:
             with self._lock:
-                if not self._changed and not self._deleted:
+                # Checked under the batch lock, so no batch starts after the
+                # manager's stop() has returned.
+                if self._closed or (not self._changed and not self._deleted):
                     return
                 changed = set(self._changed.values())
                 deleted = set(self._deleted.values())
@@ -653,6 +716,21 @@ class _RepoEventHandler(FileSystemEventHandler):
             self._on_changes(self._repo_id, changed, deleted)
 
     # --- paths --------------------------------------------------------------
+
+    def _should_walk(self, event: FileSystemEvent, directory: Path) -> bool:
+        """Whether a created or moved-in directory needs a walk here.
+
+        Not for watchdog's synthetic per-child events (the parent's walk
+        covered them; walking each would cost files x depth), and not for a
+        direct child of the root, which the manager's reconcile walks once it
+        has a watch on it."""
+        if event.is_synthetic:
+            return False
+        if self._request_reconcile is not None:
+            rel = self._rel(str(directory))
+            if rel is not None and len(rel.parts) == 1:
+                return False
+        return True
 
     def _walk_dir(self, directory: Path) -> set[Path]:
         """The indexable files under a directory, walked outside `_lock`."""

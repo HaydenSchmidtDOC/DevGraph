@@ -102,12 +102,19 @@ class Rig:
                 deleted |= d
         return changed, deleted
 
-    def wait_union(self, changed=(), deleted=(), start: int = 0) -> None:
-        def ok() -> bool:
-            c, d = self.union(start)
-            return set(changed) <= c and set(deleted) <= d
+    def wait_exact(self, changed=(), deleted=(), start: int = 0, maybe_deleted=()) -> None:
+        """Wait until the batches since `start`, with reconciles idle, add up
+        to exactly these changed and deleted sets. `maybe_deleted` may also be
+        deleted: events the kernel reports or not, depending on timing."""
+        changed, deleted, maybe = set(changed), set(deleted), set(maybe_deleted)
 
-        wait_for(ok, f"changed>={set(changed)} deleted>={set(deleted)}; got {self.union(start)}")
+        def ok() -> bool:
+            if not self.reconcile_idle():
+                return False
+            c, d = self.union(start)
+            return c == changed and deleted <= d <= deleted | maybe
+
+        wait_for(ok, f"exactly ({changed}, {deleted} + some of {maybe}); got {self.union(start)}")
 
     def watched(self) -> dict[str, bool]:
         """Top-level directory watches: name -> emitter alive."""
@@ -159,9 +166,10 @@ def test_batch_lock_survives_recreation(rig):
 def test_file_rename_and_nested_dir_move(rig):
     rig.manager.start()
     (rig.root / "pkg/a.py").rename(rig.root / "pkg/a2.py")
-    rig.wait_union(changed={"pkg/a2.py"}, deleted={"pkg/a.py"})
+    rig.wait_exact(changed={"pkg/a2.py"}, deleted={"pkg/a.py"})
+    start = len(rig.batches)
     (rig.root / "pkg/sub").rename(rig.root / "pkg/sub2")
-    rig.wait_union(changed={"pkg/sub2/b.py"}, deleted={"pkg/sub"})
+    rig.wait_exact(changed={"pkg/sub2/b.py"}, deleted={"pkg/sub"}, start=start)
 
 
 def test_folder_moved_out_of_repo_is_deleted(rig, tmp_path):
@@ -169,7 +177,7 @@ def test_folder_moved_out_of_repo_is_deleted(rig, tmp_path):
     outside = tmp_path / "trash"
     outside.mkdir()
     shutil.move(str(rig.root / "pkg/sub"), str(outside / "sub"))
-    rig.wait_union(deleted={"pkg/sub"})
+    rig.wait_exact(deleted={"pkg/sub"})
 
 
 def test_top_level_delete_recreate_then_edit(rig):
@@ -179,35 +187,53 @@ def test_top_level_delete_recreate_then_edit(rig):
     (rig.root / "pkg").mkdir()
     (rig.root / "pkg/a.py").write_text("a = 2\n")
     rig.settle_watches({"pkg"})
-    rig.wait_union(changed={"pkg/a.py"}, deleted={"pkg"})
+    # Children are deleted before their folder, so each that inotify reports
+    # before the watch dies is queued on its own.
+    rig.wait_exact(changed={"pkg/a.py"}, deleted={"pkg"}, maybe_deleted={"pkg/sub", "pkg/sub/b.py"})
     start = len(rig.batches)
     (rig.root / "pkg/a.py").write_text("a = 3\n")
     (rig.root / "pkg/after.py").write_text("after = 1\n")
-    rig.wait_union(changed={"pkg/a.py", "pkg/after.py"}, start=start)
+    rig.wait_exact(changed={"pkg/a.py", "pkg/after.py"}, start=start)
 
 
 def test_top_level_rename_then_edit(rig):
     rig.manager.start()
     (rig.root / "pkg").rename(rig.root / "lib")
-    rig.wait_union(changed={"lib/a.py", "lib/sub/b.py"}, deleted={"pkg"})
+    rig.wait_exact(changed={"lib/a.py", "lib/sub/b.py"}, deleted={"pkg"})
     rig.settle_watches({"lib"})
     start = len(rig.batches)
     (rig.root / "lib/a.py").write_text("a = 2\n")
     (rig.root / "lib/after.py").write_text("after = 1\n")
-    rig.wait_union(changed={"lib/a.py", "lib/after.py"}, start=start)
-    changed, deleted = rig.union(start)
-    assert not any(p.startswith("pkg/") for p in changed | deleted), (changed, deleted)
+    rig.wait_exact(changed={"lib/a.py", "lib/after.py"}, start=start)
 
 
 def test_new_top_level_dir_is_watched_and_walked(rig):
     rig.manager.start()
     (rig.root / "newtop").mkdir()
     (rig.root / "newtop/c.py").write_text("c = 1\n")
-    rig.wait_union(changed={"newtop/c.py"})
+    rig.wait_exact(changed={"newtop/c.py"})
     rig.settle_watches({"pkg", "newtop"})
     start = len(rig.batches)
     (rig.root / "newtop/c.py").write_text("c = 2\n")
-    rig.wait_union(changed={"newtop/c.py"}, start=start)
+    rig.wait_exact(changed={"newtop/c.py"}, start=start)
+
+
+def test_top_level_swap_then_edit(rig):
+    """`mv pkg old; mv other pkg`: the pkg watch's emitter is alive and its
+    path still exists, but it watches the folder now called `old`."""
+    (rig.root / "other").mkdir()
+    (rig.root / "other/c.py").write_text("c = 1\n")
+    rig.manager.start()
+    (rig.root / "pkg").rename(rig.root / "old")
+    (rig.root / "other").rename(rig.root / "pkg")
+    rig.settle_watches({"old", "pkg"})
+    rig.wait_exact(
+        changed={"old/a.py", "old/sub/b.py", "pkg/c.py"},
+        deleted={"pkg", "other"},
+    )
+    start = len(rig.batches)
+    (rig.root / "pkg/c.py").write_text("c = 2\n")
+    rig.wait_exact(changed={"pkg/c.py"}, start=start)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
@@ -302,8 +328,11 @@ def test_stop_with_reconcile_running(rig, monkeypatch):
     rig.manager._request_reconcile(rig.repo_id)
     assert entered.wait(5)
     stopper = threading.Thread(target=rig.manager.stop)
-    begun = time.monotonic()
     stopper.start()
+    # stop() has set _stopping and is now waiting on the reconcile's _lock.
+    wait_for(lambda: rig.manager._stopping, "stop() to begin")
+    assert stopper.is_alive(), "stop() did not wait for the running reconcile"
+    begun = time.monotonic()
     release.set()
     stopper.join(5)
     assert not stopper.is_alive(), "stop() hung behind a running reconcile"
@@ -324,3 +353,198 @@ def test_stop_cancels_pending_debounce(rig):
     assert timer.cancelled
     timer.fire()
     assert rig.batches == []
+
+
+def test_reconcile_spanning_stop_start_queues_nothing_into_old_handler(rig, monkeypatch):
+    import devgraph.watcher.manager as manager_module
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_walk = manager_module.indexable_paths_under
+
+    def blocking_walk(root, directory):
+        if isinstance(threading.current_thread(), threading.Timer):  # the reconcile
+            entered.set()
+            assert release.wait(5)
+        return real_walk(root, directory)
+
+    rig.manager.start()
+    old = rig.manager._handlers[rig.repo_id]
+    monkeypatch.setattr(manager_module, "indexable_paths_under", blocking_walk)
+    (rig.root / "newtop").mkdir()
+    (rig.root / "newtop/c.py").write_text("c = 1\n")
+    assert entered.wait(5), "reconcile never walked the new folder"
+    rig.manager.stop()
+    rig.manager.start()
+    release.set()
+    new = rig.manager._handlers[rig.repo_id]
+    assert new is not old
+    wait_for(rig.reconcile_idle, "the spanning reconcile to finish")
+    assert old._changed == {} and old._debounce_timer is None
+    old.flush()
+    assert rig.batches == []
+
+
+def test_no_batch_starts_after_stop(rig):
+    rig.manager.start()
+    handler = rig.manager._handlers[rig.repo_id]
+    (rig.root / "pkg/a.py").write_text("a = 2\n")
+    wait_for(lambda: handler._changed, "a pending change")
+    rig.manager.stop()
+    handler.flush()  # a timer that fired just as stop() ran
+    assert rig.batches == []
+
+
+# --- fake observer: the reconcile's keep/replace rules and schedule retries --
+
+
+class FakeEmitter:
+    def __init__(self) -> None:
+        self.alive = True
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+
+class FakeObserver:
+    def __init__(self) -> None:
+        self._emitter_for_watch: dict = {}
+        self.fail = False
+        self.schedule_calls: list[str] = []
+        self.unscheduled: list[str] = []
+
+    def schedule(self, handler, path, *, recursive=False):
+        from watchdog.observers.api import ObservedWatch
+
+        self.schedule_calls.append(path)
+        if self.fail:
+            raise OSError(28, "inotify instance limit reached")
+        watch = ObservedWatch(path, recursive=recursive)
+        self._emitter_for_watch[watch] = FakeEmitter()
+        return watch
+
+    def unschedule(self, watch) -> None:
+        del self._emitter_for_watch[watch]
+        self.unscheduled.append(watch.path)
+
+
+class FakeRig:
+    """A WatcherManager whose one repo is wired to a FakeObserver; every timer
+    is a FakeTimer, fired by hand."""
+
+    def __init__(self, tmp_path: Path, dirs=("pkg",)) -> None:
+        from devgraph.watcher.manager import _RepoEventHandler
+
+        self.root = tmp_path / "repo"
+        for name in dirs:
+            (self.root / name).mkdir(parents=True)
+        self.timers: list[FakeTimer] = []
+
+        def factory(interval, function):
+            timer = FakeTimer(interval, function)
+            self.timers.append(timer)
+            return timer
+
+        self.manager = WatcherManager(None, lambda *a: None, timer_factory=factory, reconcile_delay_s=0)
+        self.observer = FakeObserver()
+        self.handler = _RepoEventHandler("r", self.root, 500, lambda *a: None, timer_factory=factory)
+        self.manager._observers["r"] = self.observer
+        self.manager._handlers["r"] = self.handler
+        self.manager._watches["r"] = {}
+
+    def watch(self, name: str):
+        """Schedule `name` as start() would; returns its watch."""
+        path = self.root / name
+        self.manager._watches["r"][path] = self.manager._schedule_dir(self.observer, self.handler, path)
+        return self.manager._watches["r"][path][0]
+
+    def reconcile(self) -> None:
+        self.manager._request_reconcile("r")
+        self.fire_pending()
+
+    def fire_pending(self) -> FakeTimer | None:
+        pending = self.manager._reconcile_pending.get("r")
+        if pending is not None:
+            pending.fire()
+        return pending
+
+    def watched(self) -> dict[str, bool]:
+        return {
+            p.name: self.observer._emitter_for_watch[w].is_alive()
+            for p, (w, _) in self.manager._watches["r"].items()
+        }
+
+
+def test_dead_emitter_with_same_identity_is_rescheduled(tmp_path):
+    rig = FakeRig(tmp_path)
+    watch = rig.watch("pkg")
+    rig.observer._emitter_for_watch[watch].alive = False
+    rig.reconcile()
+    assert rig.observer.unscheduled == [str(rig.root / "pkg")]
+    assert rig.watched() == {"pkg": True}
+
+
+def test_live_emitter_on_a_replaced_folder_is_rescheduled(tmp_path):
+    rig = FakeRig(tmp_path)
+    rig.watch("pkg")
+    path, (watch, identity) = next(iter(rig.manager._watches["r"].items()))
+    rig.manager._watches["r"][path] = (watch, (identity[0], identity[1] + 1))
+    rig.reconcile()
+    assert rig.observer.unscheduled == [str(rig.root / "pkg")]
+    assert rig.watched() == {"pkg": True}
+
+
+def test_live_emitter_on_the_same_folder_is_kept(tmp_path):
+    rig = FakeRig(tmp_path)
+    rig.watch("pkg")
+    rig.reconcile()
+    assert rig.observer.unscheduled == []
+    assert rig.watched() == {"pkg": True}
+
+
+def test_failed_schedule_retries_with_backoff_then_succeeds(tmp_path):
+    rig = FakeRig(tmp_path)
+    rig.observer.fail = True
+    rig.reconcile()
+    assert rig.watched() == {}
+    retry = rig.manager._reconcile_pending["r"]
+    assert retry.interval == 0.5
+    rig.observer.fail = False
+    rig.fire_pending()
+    assert rig.watched() == {"pkg": True}
+    assert "r" not in rig.manager._reconcile_pending
+
+
+def test_failed_schedule_stops_at_the_cap(tmp_path):
+    from devgraph.watcher import manager as manager_module
+
+    names = [f"d{i}" for i in range(6)]
+    rig = FakeRig(tmp_path, dirs=names)
+    rig.observer.fail = True
+    rig.reconcile()
+    per_run = manager_module.MAX_SCHEDULE_FAILURES_PER_RECONCILE
+    assert len(rig.observer.schedule_calls) == per_run
+    intervals = []
+    while (timer := rig.fire_pending()) is not None and len(intervals) < 20:
+        intervals.append(timer.interval)
+    assert intervals == list(manager_module.RECONCILE_RETRY_DELAYS_S)
+    runs = 1 + len(intervals)
+    assert len(rig.observer.schedule_calls) == per_run * runs
+    assert "r" not in rig.manager._reconcile_pending, "kept retrying after giving up"
+    # A later top-level event starts afresh, and a working schedule watches all.
+    rig.observer.fail = False
+    rig.reconcile()
+    assert rig.watched() == {name: True for name in names}
+
+
+def test_folder_gone_before_schedule_is_skipped(tmp_path, monkeypatch):
+    rig = FakeRig(tmp_path, dirs=("pkg", "gone"))
+    real = rig.manager._desired_dirs
+    monkeypatch.setattr(
+        rig.manager, "_desired_dirs",
+        lambda root: real(root) | {root / "never-there"},
+    )
+    rig.reconcile()
+    assert str(rig.root / "never-there") not in rig.observer.schedule_calls
+    assert set(rig.watched()) == {"pkg", "gone"}
+    assert "r" not in rig.manager._reconcile_pending
