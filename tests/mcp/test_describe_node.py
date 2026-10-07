@@ -3,6 +3,7 @@
 import re
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 from neo4j import time as neo4j_time
 from neo4j.exceptions import ClientError
 
@@ -106,7 +107,7 @@ def test_refs_are_raw():
 
 def test_lookup_without_label_is_a_per_label_union():
     engine = StubEngine()
-    with pytest.raises(ValueError):
+    with pytest.raises(ToolError):
         describe_node(engine, "demo", "x", declared_labels=("Runbook", "Folder"))
     lookup = engine.calls[0]["query"]
     branches = _branches(lookup)
@@ -120,24 +121,24 @@ def test_lookup_without_label_is_a_per_label_union():
 
 def test_label_is_validated_then_interpolated():
     engine = StubEngine()
-    with pytest.raises(ValueError):
+    with pytest.raises(ToolError):
         describe_node(engine, "demo", "x", label="Runbook")
     assert _branches(engine.calls[0]["query"]) == [("Runbook", "name"), ("Runbook", "path")]
 
     engine = StubEngine()
-    with pytest.raises(ValueError, match="label"):
+    with pytest.raises(ToolError, match="label"):
         describe_node(engine, "demo", "x", label="Runbook) DETACH DELETE n //")
     assert engine.calls == []
 
     engine = StubEngine()
-    with pytest.raises(ValueError):
+    with pytest.raises(ToolError):
         describe_node(engine, "demo", "x", declared_labels=("Runbook) DETACH DELETE n //",))
     assert engine.calls and all("DETACH" not in call["query"] for call in engine.calls)
 
 
 def test_repository_is_excluded_everywhere():
     engine = StubEngine()
-    with pytest.raises(ValueError):
+    with pytest.raises(ToolError):
         describe_node(engine, "demo", "x")
     lookup, suggestions = (call["query"] for call in engine.calls)
     assert "NOT n:Repository" in lookup
@@ -196,7 +197,7 @@ def test_not_found_raises_with_repo_and_suggestions():
     suggestions = [{"label": "Service", "name": "api", "file": "docker-compose.yml"},
                    {"label": "Runbook", "name": "runbooks/api-outage.md", "file": "runbooks/api-outage.md"}]
     engine = StubEngine(([], False), (suggestions, False))
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(ToolError) as caught:
         describe_node(engine, "demo", "ap", label="Service", file="compose.yml")
     message = str(caught.value)
     assert "'demo'" in message
@@ -209,12 +210,12 @@ def test_not_found_raises_with_repo_and_suggestions():
 
 def test_error_echo_is_capped():
     engine = StubEngine()
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(ToolError) as caught:
         describe_node(engine, "demo", "q" * 5000)
     assert "q" * 100 in str(caught.value) and "q" * 101 not in str(caught.value)
 
     engine = StubEngine()
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(ToolError) as caught:
         describe_node(engine, "demo", "x", relationship_types=["Q" * 5000])
     assert "Q" * 100 in str(caught.value) and "Q" * 101 not in str(caught.value)
 
@@ -232,7 +233,7 @@ def test_error_echo_is_capped():
 )
 def test_hostile_filters_never_reach_cypher(kwargs):
     engine = StubEngine(([LOOKUP_ROW], False))
-    with pytest.raises(ValueError):
+    with pytest.raises(ToolError):
         describe_node(engine, "demo", "x", **kwargs)
     assert engine.calls == []
 
@@ -292,7 +293,7 @@ def test_queries_are_bounded():
     engine = StubEngine(([LOOKUP_ROW], False), ([], False))
     _found(engine)
     engine_nf = StubEngine()
-    with pytest.raises(ValueError):
+    with pytest.raises(ToolError):
         describe_node(engine_nf, "demo", "x")
     calls = engine.calls + engine_nf.calls
     assert all(call["timeout_s"] == DEFAULT_TIMEOUT_S for call in calls)
@@ -302,7 +303,7 @@ def test_queries_are_bounded():
 
 def test_timeout_is_a_clear_error():
     engine = StubEngine(error=_client_error("Neo.ClientError.Transaction.TransactionTimedOut", "secret detail"))
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(ToolError) as caught:
         describe_node(engine, "demo", "x")
     assert str(caught.value).startswith("describe_node timed out after 10s; narrow it with ")
     assert "secret detail" not in str(caught.value)
@@ -310,7 +311,7 @@ def test_timeout_is_a_clear_error():
 
 def test_other_neo4j_error_is_its_code_only():
     engine = StubEngine(error=_client_error("Neo.ClientError.Statement.SyntaxError", "secret detail"))
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(ToolError) as caught:
         describe_node(engine, "demo", "x")
     assert str(caught.value) == "describe_node failed: Neo.ClientError.Statement.SyntaxError"
 
@@ -321,8 +322,6 @@ import asyncio  # noqa: E402
 import json  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from pathlib import Path  # noqa: E402
-
-from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 
 from devgraph.config import global_tools  # noqa: E402
 from devgraph.config.project_tools import TOOLS_FILENAME  # noqa: E402
@@ -472,3 +471,71 @@ def test_describe_node_error_surfaces_as_tool_error(served, monkeypatch, tmp_pat
     assert "no node named 'x'" in str(excinfo.value.__cause__)
     entries = mcp_server.read_tool_telemetry(100)
     assert entries[0]["tool"] == "describe_node" and entries[0]["ok"] is False
+
+
+@pytest.mark.parametrize("kwargs", [{"relationship_types": "CALLS"}, {"neighbor_labels": "File"}])
+def test_a_bare_string_filter_is_rejected(kwargs):
+    engine = StubEngine(([LOOKUP_ROW], False))
+    with pytest.raises(ToolError, match="must be a list"):
+        describe_node(engine, "demo", "x", **kwargs)
+    assert engine.calls == []
+
+
+class _CannedEngine(_ServerEngine):
+    """The not-found path: an empty lookup, then one suggestion."""
+
+    def __init__(self, error=None):
+        self.responses = [([], False), ([{"label": "Service", "name": "api", "file": "docker-compose.yml"}], False)]
+        self.error = error
+
+    def run_read_cypher(self, query, parameters, *, timeout_s, max_rows):
+        if self.error is not None:
+            raise self.error
+        return self.responses.pop(0)
+
+
+@pytest.fixture
+def served_with(tmp_path, monkeypatch):
+    """A server for repo `demo` over the given engine, with the real describe_node."""
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3"))
+    monkeypatch.setattr(global_tools, "_default_path", lambda: tmp_path / "store" / global_tools.GLOBAL_TOOLS_FILENAME)
+
+    def build(engine):
+        repo = tmp_path / "demo"
+        repo.mkdir(exist_ok=True)
+        record = _Repo("demo", repo)
+        return mcp_server.build_server(engine, _Registry([record]), session_repo=record, session_source="env")
+
+    return build
+
+
+def _visible(server, arguments):
+    """The text a client sees for a failed call."""
+    with pytest.raises(ToolError) as excinfo:
+        _call(server, arguments)
+    return str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "arguments, expected",
+    [
+        ({"name": "ap"}, ["no node named 'ap'", "in repository 'demo'", "name='api'", "search_component"]),
+        ({"name": "x", "direction": "sideways"}, ["direction must be 'both', 'out' or 'in', not 'sideways'"]),
+        ({"name": "x", "label": "Runbook) DETACH DELETE n //"}, ["invalid label 'Runbook) DETACH DELETE n //'"]),
+        ({"name": "x", "relationship_types": ["calls"]}, ["invalid relationship type 'calls'"]),
+        ({"name": "x", "neighbor_labels": [f"L{i}" for i in range(21)]}, ["at most 20 neighbor labels, got 21"]),
+        ({"name": "q" * 5000}, ["no node named '" + "q" * 100 + "'"]),
+    ],
+)
+def test_errors_reach_the_client_through_the_server(served_with, arguments, expected):
+    text = _visible(served_with(_CannedEngine()), arguments)
+    for fragment in expected:
+        assert fragment in text
+    assert "q" * 101 not in text
+
+
+def test_a_timeout_reaches_the_client_through_the_server(served_with):
+    engine = _CannedEngine(error=_client_error("Neo.ClientError.Transaction.TransactionTimedOut", "secret detail"))
+    text = _visible(served_with(engine), {"name": "x"})
+    assert "describe_node timed out after 10s; narrow it with" in text
+    assert "secret detail" not in text

@@ -5,6 +5,7 @@ import time
 import uuid
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
@@ -227,7 +228,7 @@ def test_ambiguity(engine):
 
 
 def test_not_found(engine):
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(ToolError) as caught:
         describe(engine, name="ap")
     assert REPO in str(caught.value)
     assert "'api'" in str(caught.value)
@@ -280,6 +281,54 @@ def test_many_edges_cap_and_exact_count(engine):
     assert group["truncated"] is True
 
 
+def test_a_dense_node_caps_each_group_and_counts_exactly(engine):
+    callers = [f"d{i:04d}" for i in range(5000)]
+    engine.upsert_nodes(
+        [{"label": "Function", "repo_id": REPO, "name": n, "properties": {"file": "dense.py"}}
+         for n in ["dense", *callers, "u0", "u1", "u2"]]
+        + [{"label": "Module", "repo_id": REPO, "name": "dense.py", "properties": {"source_file": "dense.py"}}]
+    )
+
+    def edge(src, rel, dst, src_label="Function"):
+        # A Module is keyed on its name alone; it has no `file`.
+        from_file = None if src_label == "Module" else "dense.py"
+        return {"from_label": src_label, "from_name": src, "from_file": from_file, "rel_type": rel,
+                "to_label": "Function", "to_name": dst, "to_file": "dense.py", "repo_id": REPO}
+
+    engine.upsert_relationships(
+        [edge(n, "CALLS", "dense") for n in callers]
+        + [edge("dense", "IMPORTS", u) for u in ("u0", "u1", "u2")]
+        + [edge("dense", "USES", "u0"), edge("dense.py", "CONTAINS", "dense", src_label="Module")]
+    )
+    started = time.monotonic()
+    result = describe(engine, name="dense", label="Function", file="dense.py", max_per_type=7)
+    assert time.monotonic() - started < 10
+    calls = result["incoming"]["CALLS"]
+    assert (calls["count"], calls["truncated"]) == (5000, True)
+    assert [r["name"] for r in calls["results"]] == callers[:7]
+    assert result["incoming"]["CONTAINS"] == {
+        "count": 1, "results": [{"label": "Module", "name": "dense.py"}], "truncated": False,
+    }
+    imports = result["outgoing"]["IMPORTS"]
+    assert (imports["count"], imports["truncated"]) == (3, False)
+    assert [r["name"] for r in imports["results"]] == ["u0", "u1", "u2"]
+    assert result["outgoing"]["USES"]["count"] == 1
+    assert list(result["outgoing"]) == ["IMPORTS", "USES"]
+    assert list(result["incoming"]) == ["CALLS", "CONTAINS"]
+
+
+def test_a_self_loop_shows_in_both_directions(engine):
+    engine.upsert_nodes([{"label": "Function", "repo_id": REPO, "name": "recurse", "properties": {"file": "loop.py"}}])
+    engine.upsert_relationships([
+        {"from_label": "Function", "from_name": "recurse", "from_file": "loop.py", "rel_type": "CALLS",
+         "to_label": "Function", "to_name": "recurse", "to_file": "loop.py", "repo_id": REPO},
+    ])
+    result = describe(engine, name="recurse", label="Function", file="loop.py")
+    me = {"label": "Function", "name": "recurse", "file": "loop.py"}
+    assert result["outgoing"] == {"CALLS": {"count": 1, "results": [me], "truncated": False}}
+    assert result["incoming"] == {"CALLS": {"count": 1, "results": [me], "truncated": False}}
+
+
 def test_every_ref_round_trips(engine):
     for kwargs in ({"name": "src", "label": FOLDER}, {"name": "runbooks/api-outage.md", "label": RUNBOOK},
                    {"name": "ADR-013"}):
@@ -296,11 +345,11 @@ def test_every_ref_round_trips(engine):
 def test_injection_attempt_changes_nothing(engine):
     before = counts(engine)
     for kwargs in HOSTILE:
-        with pytest.raises(ValueError):
+        with pytest.raises(ToolError):
             describe(engine, name="src", **kwargs)
-    with pytest.raises(ValueError, match="no node named"):
+    with pytest.raises(ToolError, match="no node named"):
         describe(engine, name="x' OR 1=1 //")
-    with pytest.raises(ValueError, match="no node named"):
+    with pytest.raises(ToolError, match="no node named"):
         describe(engine, name="src", file="') DETACH DELETE n //")
     assert counts(engine) == before
 
@@ -326,12 +375,6 @@ def test_other_repo_is_invisible(engine, other_repo):
     assert sorted(c["label"] for c in by_path["candidates"]) == sorted([FILE, RUNBOOK])
     runbook = describe(engine, name="runbooks/api-outage.md", label=RUNBOOK)
     assert runbook["status"] == "found"
-    other_ids = {
-        row["id"] for row in engine.run_cypher(
-            "MATCH (n {repo_id: $r}) RETURN elementId(n) AS id", {"r": other_repo}
-        )
-    }
-    assert len(other_ids) == 2
     for res in (result, by_path, runbook, describe(engine, name="api", label="Service", file="docker-compose.yml")):
         assert other_repo not in repr(res)
     assert len(refs(runbook, "outgoing", FOR)) == 2

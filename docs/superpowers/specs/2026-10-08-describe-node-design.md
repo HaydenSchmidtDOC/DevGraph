@@ -77,7 +77,7 @@ How keys look today, which this has to cover:
   - The lookup reads 21 rows, so when `truncated` is true, `count` is 21, a lower bound.
   - The tool description says: call again with `label` and `file` from one candidate.
   - Typical cases are a `Module` and a `File` on the same path, a `Runbook` and a `File` on the same path, and a same-named `Function` in several files.
-- **None:** a tool error (`ValueError`, as the existing tools raise).
+- **None:** a tool error (`ToolError`, whose text the MCP SDK passes to the client; it hides a `ValueError`'s text behind `Error executing tool describe_node`).
   - It names the repository it searched and the filters used.
   - It lists up to five "did you mean" refs, from a second read-only query: a case-insensitive `CONTAINS` on `name` or `path`, under the same label set, repository and `Repository` exclusion.
   - It ends with the hint that `search_component` searches by partial name, and that a file, folder or docs node is named by its repo-relative path or its id.
@@ -100,7 +100,7 @@ Found:
            "properties": {"path": "runbooks/api-outage.md", "owner": "platform-team", "on_call": "api-oncall"},
            "properties_truncated": false},
   "outgoing": {"RUNBOOK_FOR": {"count": 2, "results": [
-      {"label": "Service", "name": "api", "file": "docker-compose.prod.yml"},
+      {"label": "Service", "name": "api", "file": "deploy/docker-compose.yml"},
       {"label": "Service", "name": "api", "file": "docker-compose.yml"}], "truncated": false}},
   "incoming": {},
   "groups_truncated": false
@@ -117,7 +117,7 @@ Found:
   - the extractor bookkeeping `claims` and `extractor`;
   - `insight_*`, which `key_nodes` and `find_communities` serve.
 
-  `sources` is kept: on a shared node it is the provenance, the files that declare this datastore or service. So are `path`, `file`, `source_file`, `source`, `created_at` and `last_modified_*`. No embedding property exists today, so there is no rule for one.
+  `sources` is kept: on a shared node (a `Container` or `Database` several compose files declare) it is the provenance, the files that declare it. A compose `Service` is file-scoped and carries `source` (its one compose file), not `sources`. So are `path`, `file`, `source_file`, `source`, `created_at` and `last_modified_*`. No embedding property exists today, so there is no rule for one.
 
   Display values go through `tool_plane._sanitize_deep`: control characters are stripped, strings are capped at 500 characters, and temporal values become ISO strings. On top of that, list values are capped at 20 items, and at most 50 properties are returned in key order, with `properties_truncated` saying whether any were dropped.
 - **Groups.** `outgoing` and `incoming` map each relationship type to an envelope with the same `{count, results, truncated}` shape as the other tools.
@@ -139,7 +139,7 @@ Found:
    - in: the same with `(n)<-[r]-(m)` and `['both','in']`.
 
    `direction` is a parameter, never interpolated. The `UNION` drops duplicate `(dir, rel, m)` rows, which collapses parallel edges, while a self-loop appears once in each direction. Then `WITH dir, rel, count(DISTINCT m) AS total ORDER BY dir, rel`, so the count is taken without collecting anything.
-3. **Take the first refs.** A `CALL (n, dir, rel) { ... }` per group re-matches that direction and type under the same filters. It does `WITH DISTINCT m ORDER BY m.name, coalesce(m.file, m.path) LIMIT $cap`, then `RETURN collect({label: labels(m)[0], name: m.name, file: coalesce(m.file, m.path)}) AS refs`. That gives a top-N, so a node with 50,000 incoming `CALLS` never builds a 50,000-element list.
+3. **Take the first refs.** A `CALL (n, dir, rel) { ... }` per group re-matches only that direction and type: an inner `UNION` of `MATCH (n)-[r:$(rel)]->(m) WHERE dir = 'out'` and `MATCH (n)<-[r:$(rel)]-(m) WHERE dir = 'in'`, so it expands only that type's relationships (`rel` comes from the graph; no text is interpolated). It then applies the repository, `Repository` and label filters, and does `WITH DISTINCT m ORDER BY m.name, coalesce(m.file, m.path) LIMIT $cap`, then `RETURN collect({label: labels(m)[0], name: m.name, file: coalesce(m.file, m.path)}) AS refs`. That gives a top-N, so a node with 50,000 incoming `CALLS` never builds a 50,000-element list.
 
 The neighbour filters are:
 
@@ -152,7 +152,7 @@ The scoped `CALL (...) { }` form matches what `summarise_repository` already use
 ### D3: filters and caps
 
 - **`direction`:** `"both"` (the default), `"out"` or `"in"`. Any other value is an error. With `"out"`, `incoming` is `{}`, and the reverse for `"in"`.
-- **`relationship_types`:** a list of up to 20 types. Each must fullmatch `RELATIONSHIP_TYPE_PATTERN`, otherwise the call fails and names the offending value, cut to 100 characters. They are matched as a value (`type(r) IN $types`). A valid type with no edges yields no group. `None` or `[]` means no filter.
+- **`relationship_types`:** a list of up to 20 types. Each must fullmatch `RELATIONSHIP_TYPE_PATTERN`, otherwise the call fails and names the offending value, cut to 100 characters. They are matched as a value (`type(r) IN $types`). A valid type with no edges yields no group. `None` or `[]` means no filter; a bare string is an error, never split into characters.
 - **`neighbor_labels`:** the same rules with `LABEL_PATTERN`, matched as a value.
 - **`max_per_type`:** default 10, clamped to 1..50, the way `find_dependency_cycles` clamps `max_length`.
 - The filters apply to relationships only. The node lookup uses `label` and `file`.
@@ -200,7 +200,7 @@ The scoped `CALL (...) { }` form matches what `summarise_repository` already use
 
   The other built-ins use the unbounded `engine.run_cypher`. That is left alone here.
 - **Values.** Every value is a parameter: `name`, `file`, `repo_id`, the filter lists, `direction` and the cap. The only interpolation is labels: built-in constants, or a `LABEL_PATTERN` fullmatch, inside backticks, as `search_component` does. Relationship types and neighbour labels are never interpolated.
-- **Errors.** A Neo4j error whose code contains `TransactionTimedOut` (a substring match, as in `tool_plane._failure`) becomes `describe_node timed out after 10s; narrow it with label, file, relationship_types or neighbor_labels`. Any other Neo4j error becomes `describe_node failed: <code>`, never the raw message.
+- **Errors.** A Neo4j error whose code contains `TransactionTimedOut` (a substring match, as in `tool_plane._failure`) becomes `describe_node timed out after 10s; narrow it with label, file, relationship_types or neighbor_labels`. Any other Neo4j error becomes `describe_node failed: <code>`, never the raw message. Every caller-facing error (not found, bad direction, label or filter, timeout) is a `ToolError`, so its text reaches the client.
 - **Races.** If the node is deleted between the lookup and the groups query, the groups query returns no rows. The result is the node as looked up, with empty maps: the same snapshot a later call corrects.
 - **Telemetry** is unchanged: metadata only, never arguments.
 

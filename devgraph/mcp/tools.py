@@ -15,6 +15,9 @@ import json
 import os
 import subprocess
 
+# The SDK passes a ToolError's text to the client and hides any other exception's.
+from mcp.server.mcpserver.exceptions import ToolError
+
 from devgraph.config.project_schema import (
     LABEL_PATTERN,
     RELATIONSHIP_TYPE_PATTERN,
@@ -291,10 +294,12 @@ WITH n, dir, rel, count(DISTINCT m) AS total
 ORDER BY dir, rel
 LIMIT {_DESCRIBE_MAX_GROUPS + 1}
 CALL (n, dir, rel) {{
-  MATCH (n)-[r]-(m)
-  WHERE type(r) = rel
-    AND ((dir = 'out' AND startNode(r) = n) OR (dir = 'in' AND endNode(r) = n))
-    AND m.repo_id = $repo_id AND NOT m:Repository
+  CALL (n, dir, rel) {{
+    MATCH (n)-[r:$(rel)]->(m) WHERE dir = 'out' RETURN m
+    UNION
+    MATCH (n)<-[r:$(rel)]-(m) WHERE dir = 'in' RETURN m
+  }}
+  WITH m WHERE m.repo_id = $repo_id AND NOT m:Repository
     AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))
   WITH DISTINCT m
   ORDER BY m.name, coalesce(m.file, m.path)
@@ -312,13 +317,15 @@ def _echo(value: Any) -> str:
 
 def _validated_identifiers(values: list[str] | None, pattern: re.Pattern[str], what: str) -> list[str] | None:
     """The filter list, or None for no filter; any value that isn't an identifier is an error."""
+    if isinstance(values, str):
+        raise ToolError(f"{what}s must be a list of names, not the string {_echo(values)}")
     if not values:
         return None
     if len(values) > _DESCRIBE_MAX_FILTERS:
-        raise ValueError(f"at most {_DESCRIBE_MAX_FILTERS} {what}s, got {len(values)}")
+        raise ToolError(f"at most {_DESCRIBE_MAX_FILTERS} {what}s, got {len(values)}")
     for value in values:
         if not isinstance(value, str) or not pattern.fullmatch(value):
-            raise ValueError(f"invalid {what} {_echo(value)}")
+            raise ToolError(f"invalid {what} {_echo(value)}")
     return list(values)
 
 
@@ -392,11 +399,11 @@ def _read(engine: GraphEngine, cypher: str, params: dict[str, Any], max_rows: in
     except Neo4jError as exc:
         code = str(getattr(exc, "code", None) or "unknown")
         if "TransactionTimedOut" in code:
-            raise ValueError(
+            raise ToolError(
                 f"describe_node timed out after {DEFAULT_TIMEOUT_S}s; "
                 "narrow it with label, file, relationship_types or neighbor_labels"
             ) from exc
-        raise ValueError(f"describe_node failed: {code}") from exc
+        raise ToolError(f"describe_node failed: {code}") from exc
 
 
 def describe_node(
@@ -431,17 +438,17 @@ def describe_node(
         `{"status": "found", "node", "outgoing", "incoming", "groups_truncated"}`,
         each group a `{count, results, truncated}` envelope of `{label, name, file}`
         refs; or `{"status": "ambiguous", "count", "candidates", "truncated"}`.
-        No match raises ValueError with suggestions. `Repository` nodes are never
+        No match raises ToolError with suggestions. `Repository` nodes are never
         matched or listed.
     """
     if direction not in _DESCRIBE_DIRECTIONS:
-        raise ValueError(f"direction must be 'both', 'out' or 'in', not {_echo(direction)}")
+        raise ToolError(f"direction must be 'both', 'out' or 'in', not {_echo(direction)}")
     types = _validated_identifiers(relationship_types, RELATIONSHIP_TYPE_PATTERN, "relationship type")
     neighbour_labels = _validated_identifiers(neighbor_labels, LABEL_PATTERN, "neighbor label")
     declared = tuple(dict.fromkeys(d for d in declared_labels if LABEL_PATTERN.fullmatch(d)))
     if label is not None:
         if not LABEL_PATTERN.fullmatch(label):
-            raise ValueError(f"invalid label {_echo(label)}")
+            raise ToolError(f"invalid label {_echo(label)}")
         labels: tuple[str, ...] = (label,)
         # A built-in label carries no path; any other label may be a provider's.
         path_labels = frozenset(labels) if label not in schema.NODE_LABELS or label in declared else frozenset()
@@ -466,7 +473,7 @@ def describe_node(
                 ", ".join(f"{k}={_echo(v)}" for k, v in _node_ref(s).items()) for s in suggestions
             )
             message += f" Did you mean: {shown}?"
-        raise ValueError(f"{message} {_DESCRIBE_HINT}.")
+        raise ToolError(f"{message} {_DESCRIBE_HINT}.")
 
     if len(rows) > 1:
         candidates = sorted(
