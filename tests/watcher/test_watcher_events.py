@@ -51,6 +51,7 @@ class Harness:
         self.batches: list[tuple[set[Path], set[Path]]] = []
         self.timers: list[FakeTimer] = []
         self.reconciles: list[str] = []
+        self.gone: list[str] = []
 
         def record(repo_id: str, changed: set[Path], deleted: set[Path]) -> None:
             self.batches.append((set(changed), set(deleted)))
@@ -67,8 +68,13 @@ class Harness:
             on_changes or record,
             timer_factory=factory,
             batch_lock=threading.Lock(),
-            request_reconcile=self.reconciles.append,
+            request_reconcile=self.reconcile,
         )
+
+    def reconcile(self, repo_id: str, gone: str | None = None) -> None:
+        self.reconciles.append(repo_id)
+        if gone is not None:
+            self.gone.append(gone)
 
     def p(self, rel: str) -> str:
         return str(self.root / rel)
@@ -223,6 +229,18 @@ def test_top_level_dirs_are_left_to_the_reconcile_walk(h, root, monkeypatch):
     assert walked == []
     assert h.reconciles == ["repo", "repo"]
     assert h.one_batch() == (set(), {"pkg"})
+
+
+def test_a_top_level_folder_deleted_or_moved_away_is_named_to_the_reconcile(h, root):
+    """Its watch must be replaced even if a new folder of the same name gets
+    the same inode, which ext4 hands out again at once."""
+    (root / "lib").mkdir()
+    h.send(
+        DirDeletedEvent(h.p("pkg")), FileDeletedEvent(h.p("old")), DirMovedEvent(h.p("tools"), h.p("lib")),
+        DirCreatedEvent(h.p("newtop")), DirDeletedEvent(h.p("pkg/sub")),
+    )
+    assert h.reconciles == ["repo"] * 4
+    assert h.gone == ["pkg", "old", "tools"]
 
 
 def test_closed_handler_neither_queues_nor_fires(h, root):

@@ -502,6 +502,21 @@ def test_live_emitter_on_the_same_folder_is_kept(tmp_path):
     assert rig.watched() == {"pkg": True}
 
 
+def test_live_emitter_on_a_folder_deleted_and_recreated_with_the_same_inode_is_rescheduled(tmp_path):
+    """rmtree then mkdir can reuse the inode, so the identity matches while the
+    old emitter has not yet read its IN_DELETE_SELF; the delete itself says
+    the watch is stale."""
+    rig = FakeRig(tmp_path, dirs=("pkg", "lib"))
+    rig.watch("pkg")
+    rig.watch("lib")
+    rig.manager._request_reconcile("r", "pkg")
+    rig.fire_pending()
+    assert rig.observer.unscheduled == [str(rig.root / "pkg")]
+    assert rig.watched() == {"pkg": True, "lib": True}
+    rig.reconcile()  # the name is used once
+    assert rig.observer.unscheduled == [str(rig.root / "pkg")]
+
+
 def test_failed_schedule_retries_with_backoff_then_succeeds(tmp_path):
     rig = FakeRig(tmp_path)
     rig.observer.fail = True

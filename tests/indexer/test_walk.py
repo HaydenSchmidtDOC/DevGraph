@@ -228,6 +228,12 @@ class _FakeEngine:
     def list_indexed_files(self, repo_id):
         return set(self.files)
 
+    def read_applied_schema(self, repo_id):
+        return None
+
+    def list_claim_sources(self, repo_id):
+        return set()
+
 
 @pytest.mark.skipif(os.name != "nt", reason="junctions are Windows-only")
 def test_prune_stale_files_tolerates_a_junction_out_of_the_repository(junction_tree, monkeypatch):

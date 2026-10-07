@@ -239,6 +239,8 @@ class WatcherManager:
         self._reconcile_lock = threading.Lock()
         self._reconcile_pending: dict[str, Any] = {}
         self._reconcile_running: set[str] = set()
+        # Top-level names deleted or moved away since the last reconcile began.
+        self._reconcile_gone: dict[str, set[str]] = {}
         # Consecutive reconcile runs that couldn't watch every folder.
         self._reconcile_retries: dict[str, int] = {}
         self._stopping = False
@@ -283,6 +285,7 @@ class WatcherManager:
             self._stopping = True
             timers = list(self._reconcile_pending.values())
             self._reconcile_pending.clear()
+            self._reconcile_gone.clear()
         with self._catch_up_lock:
             self._catch_up_stopped = True
             timers += [entry[2] for entry in self._catch_up_pending.values()]
@@ -519,6 +522,7 @@ class WatcherManager:
         self._watches.pop(repo_id, None)
         with self._reconcile_lock:
             timer = self._reconcile_pending.pop(repo_id, None)
+            self._reconcile_gone.pop(repo_id, None)
         with self._catch_up_lock:
             timers = [timer, self._start_catch_ups.pop(repo_id, None)]
             entry = self._catch_up_pending.pop(repo_id, None)
@@ -575,11 +579,18 @@ class WatcherManager:
         identity = self._dir_identity(directory)
         return observer.schedule(handler, str(directory), recursive=True), identity
 
-    def _request_reconcile(self, repo_id: str) -> None:
+    def _request_reconcile(self, repo_id: str, gone: str | None = None) -> None:
         """Ask for a top-level watch reconcile (W3). Called from handler code
         on watchdog's dispatch thread, so it takes only `_reconcile_lock`;
-        requests coalesce until the timer fires."""
+        requests coalesce until the timer fires.
+
+        `gone` names a top-level entry that was deleted or moved away. Its
+        watch is replaced whatever its emitter and identity say: a folder
+        deleted and made again can get the same inode back (ext4 reuses them
+        at once) before the old emitter has read its delete."""
         with self._reconcile_lock:
+            if gone is not None and not self._stopping:
+                self._reconcile_gone.setdefault(repo_id, set()).add(gone)
             self._schedule_reconcile(repo_id, self._reconcile_delay_s)
 
     def _schedule_reconcile(self, repo_id: str, delay_s: float) -> None:
@@ -605,6 +616,7 @@ class WatcherManager:
         """
         with self._reconcile_lock:
             self._reconcile_pending.pop(repo_id, None)
+            gone = self._reconcile_gone.pop(repo_id, set())
             if self._stopping:
                 return
             self._reconcile_running.add(repo_id)
@@ -627,6 +639,7 @@ class WatcherManager:
                         emitter is not None
                         and emitter.is_alive()
                         and path in desired
+                        and path.name not in gone
                         and self._dir_identity(path) == identity
                     ):
                         continue
@@ -721,7 +734,7 @@ class _RepoEventHandler(FileSystemEventHandler):
         *,
         timer_factory: TimerFactory = threading.Timer,
         batch_lock: threading.Lock | None = None,
-        request_reconcile: Callable[[str], None] | None = None,
+        request_reconcile: Callable[..., None] | None = None,
     ) -> None:
         self._repo_id = repo_id
         self._repo_root = repo_root
@@ -771,7 +784,7 @@ class _RepoEventHandler(FileSystemEventHandler):
         if rel is not None:
             folders = {rel: f"Folder removed from {self._repo_id}: {rel}"} if event.is_directory else {}
             self._queue(deleted=[Path(str(event.src_path))], folders=folders)
-        self._signal_top_level(str(event.src_path))
+        self._signal_top_level(gone=str(event.src_path))
 
     def on_moved(self, event: FileSystemEvent) -> None:
         """A move is a delete of its source plus a change of its destination.
@@ -799,7 +812,7 @@ class _RepoEventHandler(FileSystemEventHandler):
         else:
             changed = [dest] if dest is not None and self._is_tracked_path(dest) else []
         self._queue(changed=changed, deleted=deleted, folders=folders)
-        self._signal_top_level(src_raw, dest_raw)
+        self._signal_top_level(dest_raw, gone=src_raw)
 
     # --- batching -----------------------------------------------------------
 
@@ -953,10 +966,15 @@ class _RepoEventHandler(FileSystemEventHandler):
             return False
         return self._queue_rel(str(path)) is not None
 
-    def _signal_top_level(self, *raw_paths: str) -> None:
+    def _signal_top_level(self, *raw_paths: str, gone: str | None = None) -> None:
         """Ask the manager to reconcile watches when an event touches a direct
-        child of the root. Called with `_lock` released."""
+        child of the root, naming it when it was deleted or moved away
+        (`gone`). Called with `_lock` released."""
         if self._request_reconcile is None:
+            return
+        gone_rel = self._rel(gone) if gone else None
+        if gone_rel is not None and len(gone_rel.parts) == 1:
+            self._request_reconcile(self._repo_id, gone_rel.name)
             return
         for raw in raw_paths:
             rel = self._rel(raw)
