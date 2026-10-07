@@ -63,9 +63,29 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 - **Explicit registration.** DevGraph scans and watches only paths added with `devgraph register` or `devgraph add`.
 - **Local-first.** Neo4j, the registry, source reads, and git history stay on the local machine. Telemetry, cloud sync, cross-repository queries, and raw Cypher are off by default.
 - **Repository isolation.** Every graph object carries a `repo_id`. MCP queries stay within that repository unless the caller explicitly opts into a cross-repository query.
-- **Live updates.** Connecting an MCP client starts the tray app when needed. The watcher reindexes file and git-state changes; manual rescans remain safe and idempotent.
-  Known gaps until the watcher correctness work ships: a renamed or moved file can leave its old path's nodes behind; a folder that is moved, renamed or sent to the trash can leave every file below it behind; a new, renamed or deleted-and-recreated top-level folder is not watched until the tray restarts; and changes made while DevGraph wasn't running (a reboot, a `git pull`) are not picked up on start. `devgraph rescan <repo_id>` fixes all of these. See `docs/superpowers/specs/2026-10-07-watcher-correctness-design.md`.
+- **Live updates.** Connecting an MCP client starts the tray app when needed. The watcher reindexes file and git-state changes; manual rescans remain safe and idempotent. See [Keeping up with changes](#keeping-up-with-changes).
 - **Purpose-built queries.** MCP clients should use the registered tools and the live `devgraph://tool-catalog` resource rather than relying on a hand-maintained tool count.
+
+### Keeping up with changes
+
+While the DevGraph agent (the tray app, or the headless agent in a container) is running, it keeps each watched repository's graph the same as a fresh scan would make it:
+
+- **Edits, new files and deletes** are picked up about half a second after you save.
+- **Renames and moves** are picked up too: a renamed file, a folder moved somewhere else in the repository, a folder renamed at the top of the repository, and a folder deleted or sent to the trash. Nothing is left behind under the old name. A new top-level folder, or one deleted and created again, is watched straight away.
+- **Changes made while DevGraph wasn't running** (a reboot, editing with the tray paused, a `git pull` while it was off) are found when it starts or resumes. It checks every file against the time of its last update and re-reads only what changed, which takes well under a second when nothing did. A repository that has never been scanned is not scanned here; the log says to run `devgraph rescan <repo_id>`.
+- **After a git operation** (checkout, pull, merge, reset, stash), DevGraph checks the repository again a couple of seconds later, in case the operating system dropped some of the change notifications for a large checkout.
+- **If an update fails** (for example Neo4j is down), DevGraph logs `Couldn't update <repo>; DevGraph will retry, or run "devgraph rescan <repo>"`, tries again 30 seconds later, and again when Neo4j comes back.
+
+While a check like this runs, the tray icon's tooltip reads `DevGraph (catching up)` and the dashboard's Entities card shows `Catching up…` instead of `Live`. The log says what it found, for example `Caught up on myrepo: 12 files updated, 3 removed (4.1 s)`. A dashboard opened in the middle of a check doesn't show it.
+
+What it can still miss. `devgraph rescan <repo_id>` fixes each of these:
+
+- **A changed file whose change notification was lost outside a git operation**, for example during a very large copy or a build writing thousands of files into a watched folder. New and deleted files are still found on the next start; a changed existing file is not, because its timestamp is older than DevGraph's last update.
+- **A file whose timestamps say it hasn't changed.** The checks trust file timestamps, so they miss a file that changed while DevGraph was off if all its timestamps are older than DevGraph's last update (with a 5-second allowance). That happens when the computer's clock was moved backwards, on a network share whose server clock is wrong, or on Windows when a tool overwrites a file and then puts its old modified time back.
+- **A folder DevGraph couldn't start watching.** If the operating system refuses to watch a new top-level folder (for example it ran out of watches), DevGraph tries again a few times over about 8 seconds, then logs a warning. That folder is not watched until another top-level folder changes or DevGraph restarts; the check on restart picks up what changed in it.
+- **Links between files that are updated separately**, described under [Current limitations](#current-limitations) below.
+- **`devgraph add` or `devgraph rescan` running at the same time as the agent's own update** of the same repository. They run in a separate process, so the two aren't kept apart; run the rescan again if you edited files while it was running.
+- **macOS** is not a supported platform for the agent.
 
 ## Project schema
 
@@ -99,7 +119,6 @@ Every indexable file becomes a `File` node and every directory containing one a 
 - A node type or relationship may carry an optional display colour, `color: "#rrggbb"`. Quote it: in YAML an unquoted `#...` is a comment, so `color: #3b82f6` reads as no colour. The colour is display-only, shown in the Colour column of `config show` and `config schema list`, and used by the dashboard (a node type's colour tints its row and nodes, a relationship's colour tints its type chip); a type without one gets a stable colour derived from its name. Because the file's hash covers it, changing a colour counts as a schema change and is applied by a rescan like any other.
 - The dashboard builds its node-type and relationship-type lists (colours, counts, isolate toggles) from `GET /api/repos/<repo_id>/schema`, which reflects the schema last applied to the graph, on load, on repository change and after rescans run by the agent (a `devgraph rescan --now` in another process does not notify an open dashboard; reload the page). Declared labels work with the graph `?label=` filter and search. Built-in types look exactly as before. When the file has changed since the last scan (pending) or cannot be read (invalid), a hint under the type lists says so while the last-applied types stay shown. The route reports `schema_state` as `applied`, `pending`, `never`, `absent`, `invalid` or `disabled`; for `__all__` it is the union of the repositories' types with the most attention-needing state (invalid, then pending, never, applied, disabled, absent).
 - Known limits of the filesystem provider:
-  - A folder moved, renamed or trashed as a whole, or a renamed file, may leave stale nodes until `devgraph rescan` (see **Live updates** above).
   - `search_component` can return both a `Module` and a `File` for the same path; with `cross_repo=True` only the calling repository's declared labels are searched.
   - On the dashboard, filesystem nodes share the unfiltered canvas with code nodes.
   - A symlinked file is represented at its target's path, so one whose target is under an ignored directory (`build/`, `node_modules/`...) is left out, like the target itself.
