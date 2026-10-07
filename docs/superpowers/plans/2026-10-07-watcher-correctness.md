@@ -4,19 +4,20 @@
 
 **Goal:** Renames, folder moves and deletes, new, deleted and renamed top-level folders, edits made while the agent was off, and git checkouts all leave the graph equal to a fresh `full_scan`. A catch-up on start costs well under a second when nothing changed.
 
-**Spec:** `docs/superpowers/specs/2026-10-07-watcher-correctness-design.md`. Every task implements the decisions it names (W1–W9). The front-matter keys spec and the docs read cache spec still govern the docs provider, which this slice does not change.
+**Spec:** `docs/superpowers/specs/2026-10-07-watcher-correctness-design.md`. Every task implements the decisions it names (W1–W10). The front-matter keys spec and the docs read cache spec still govern the docs provider, which this slice does not change.
 
 **Working directory:** this worktree, branch `epic1/watcher` (from `epic1/tidy`). Run `uv sync --extra dev` once, then run `uv run` from inside the worktree, because the editable install otherwise imports another checkout (check `devgraph.__file__`). Live tests use Neo4j at `bolt://127.0.0.1:7687` (`neo4j`/`devgraph-local-dev`), unique repo_ids and cleanup in teardown. Never touch `~/.devgraph`.
 
 ## Global Constraints
 
 - **Incremental equals fresh.** After every live scenario, the repository's graph equals a fresh `full_scan` of the same files under a second repo_id.
-  - **Nodes** are compared as `(sorted labels, name, coalesce(source_file, file, path), props_hash)`. `props_hash` hashes every property except `repo_id`, keys ending in `_at`, `last_modified_by`, and the other git-recency properties `git_history` stages.
+  - **Nodes** are compared as `(sorted labels, name, coalesce(source_file, file, path), props_hash)`. `props_hash` hashes every property except `repo_id`, keys ending in `_at`, `last_modified_by`, and the other git-recency properties `git_history` stages. Shared nodes' `source`, `sources`, `library` and `claims` are included: under W10 they are order-independent, and `claims` is serialised with sorted keys.
   - **Edges** are compared as `(label, name, type, label, name)`.
   - `Commit` and `Repository` nodes, and their edges, are excluded.
   - Docs-part equality is also checked with `assert_matches_fresh_apply`.
   - Fixture files have no cross-file by-name references other than docs links and one shared `source`-keyed node, so the known cross-batch gaps cannot cause a mismatch.
-- **Lock order (W3, W4).**
+- **Lock order (W3, W4, W7).**
+  - `request_catch_up` never synchronously takes `manager._lock` or a batch lock. It is called from `on_changes` while the batch lock is held.
   - Handler code (anything that runs on watchdog's dispatch thread) never takes `manager._lock`.
   - `_reconcile_lock` is never held while calling into the observer.
   - No callback runs under the handler's `_lock`.
@@ -29,7 +30,7 @@
   - a containment check (`is_within`) applies to every move source and destination.
 
   No path outside a registered repository is ever watched, walked or passed on.
-- **Keys are lexical (I5).** A gone path's key resolves the parent only. Presence on disk is checked case-exactly against `os.listdir(parent)`.
+- **Keys are lexical (I5).** A gone path's key resolves the parent only. Presence on disk is checked case-exactly for every path component, each against its parent's `os.listdir` names.
 - **Stamps (W7).** Every `mark_indexed` caller passes `at=<start of the work>`. Catch-up uses `since - 5 s` against `max(mtime, ctime)` on POSIX and `max(mtime, birthtime)` on Windows. DevGraph never runs git to find changes.
 - **Deterministic tests.**
   - Timers come from an injected `timer_factory`, and clocks from an injected `now`.
@@ -65,7 +66,13 @@ Each item names the test that proves it.
    - The gone directory itself reaches the provider passes only when nothing indexable remains below it.
 
    Tests: Task 2.
-5. **Shared nodes across a rename.** Rename a file that co-produces a `source`-keyed shared node (for example a `Datastore` or `Endpoint` that two Python files both declare). Check that index-then-remove in one batch leaves exactly the fresh-scan result: the source list and `source`/`library` attribution are the same. Test: Task 4 rename scenario.
+5. **Shared-node attribution (W10).**
+   - Two claim orders give identical nodes.
+   - An unclaim of the minimum re-attributes from the next claim, and removes properties the new attribution lacks.
+   - A legacy node (`sources` without `claims`) is handled.
+   - Index-then-remove across a rename equals a fresh scan, `source`, `sources`, `library` and `claims` included.
+
+   Tests: Task 2 attribution tests; Task 4 rename scenario.
 6. **Catch-up correctness.**
    - `since` is snapshotted before `observer.start()`.
    - The post-git `since` is `min(last_indexed, burst_start)`.
@@ -166,25 +173,52 @@ Tests:
 - [ ] Implement (spec W1–W4).
 - [ ] `uv run pytest -q tests/watcher`, then `uv run pytest -q`. Commit "Deliver renames and folder moves to the indexer".
 
-### Task 2: Exact removal from the graph's own file list (W2 indexer half, W8)
+### Task 2: Order-independent shared nodes, and exact removal from the graph's own file list (W10, W2 indexer half, W8)
 
-**Files:**
+**Step A is W10 and goes first.** It is a behaviour change to existing shared-node writes, so it lands in its own commit.
+
+**Files (step A):**
+- `devgraph/graph/engine.py`: the two `sources` write paths (about lines 323 and 488) and the unclaim in `delete_nodes_by_source_file` (about line 55). Each runs read-modify-write in Python, inside one write transaction:
+  - maintain `claims` (a JSON string of `{source: written properties}`, with sorted keys);
+  - keep `sources` as the sorted keys;
+  - set the written properties from `claims[min(sources)]`, with `source = min(sources)`;
+  - remove properties the previous attribution had and the new one lacks;
+  - delete the node when no claim remains.
+
+  A legacy node's listed sources with no `claims` entry count as claiming its current properties.
+- `devgraph/indexer/dispatch.py`: the comment at about line 614 states the new rule.
+- **Existing tests that pin last-writer-wins.** Find them with `grep -rn "sources\|library" tests/graph tests/indexer`; `tests/graph/test_engine_delete.py` and `tests/graph/test_engine_extracted_nodes.py` are likely. Update them to the min-source rule, and say so in the commit message.
+
+Tests (step A): `tests/graph/test_engine_shared_nodes.py` (new; live).
+
+- [ ] Write failing tests (step A):
+  - **Two claim orders give identical nodes.** Claim a `Datastore` from `b.py` (`library: psycopg`), then from `a.py` (`library: sqlalchemy`). Do the same in the opposite order under a second repo_id. Every property is equal, including `source = a.py`, `sources = [a.py, b.py]`, `library = sqlalchemy` and `claims`.
+  - **Unclaim of the minimum.** Unclaim `a.py`. The node now has `source = b.py`, `library = psycopg` and `sources = [b.py]`. A property only `a.py` wrote is gone. Unclaim `b.py`, and the node is deleted.
+  - **Unclaim of a non-minimum** leaves the attribution unchanged.
+  - **Legacy node.** Write a node the old way (`sources` without `claims`), then claim from a third file. No source is lost, and the attribution follows the min-source rule.
+  - **Full scan versus incremental.** Full-scan two files sharing a `Datastore`, then rename the lower-sorted one via `index_paths` and `remove_paths`. The node equals a fresh scan's.
+- [ ] Implement step A (spec W10). `uv run pytest -q`. Commit "Attribute shared nodes to their first source, whatever the claim order".
+
+**Files (step B):**
 - `devgraph/graph/engine.py`: `list_extracted_paths(repo_id, extractor, labels: list[str] | None) -> set[str]`, which returns the `path` of that provider's nodes, optionally limited to labels.
 - `devgraph/indexer/dispatch.py`:
   - `_graph_files(engine, repo_id, repo_root)`: `list_indexed_files`, plus docs paths, plus filesystem file-label paths, the provider part only when not `schema_pending`;
   - `_gone_key(repo_root, path)`, lexical, resolving the parent only;
-  - `_present(repo_root, rel)`, case-exact via `os.listdir(parent)` plus `_is_provider_file`;
+  - `_present(repo_root, rel)`, which walks the components from the root, requires each to appear exactly in its parent's `os.listdir` names (memoised per call), and then applies `_is_provider_file`;
   - `remove_paths` expands every gone key over `_graph_files` (one query per non-empty call; never for `.`), drops paths present on disk, deletes language nodes per exact path, and gives the provider passes the exact paths plus each gone directory that holds no indexable file on disk;
   - `prune_stale_files` uses `_graph_files`;
   - the docstrings say so.
 
-Tests: `tests/indexer/test_dispatch.py`, `tests/indexer/test_filesystem_provider_live.py` and `tests/indexer/test_docs_provider_live.py` (live), and `tests/indexer/test_remove_keys.py` (unit, new).
+Tests (step B): `tests/indexer/test_dispatch.py`, `tests/indexer/test_filesystem_provider_live.py` and `tests/indexer/test_docs_provider_live.py` (live), and `tests/indexer/test_remove_keys.py` (unit, new).
 
-- [ ] Write failing tests:
+- [ ] Write failing tests (step B):
   - **Unit: lexical key.**
     - `_gone_key(root, root/"pkg"/"Foo.py")`, while `pkg/foo.py` exists, is `pkg/Foo.py`.
     - The parent is resolved, so a symlinked parent is keyed by its target.
     - `_present(root, "pkg/Foo.py")` is False when only `foo.py` is listed.
+  - **Unit: folder case rename.** Monkeypatch `os.listdir` (or use a fake directory listing) so that the root lists `pkg` and the disk answers `is_file` case-insensitively, as on Windows.
+    - `_present(root, "Pkg/a.py")` is False, and `_present(root, "pkg/a.py")` is True.
+    - With a stub engine whose graph files are `{Pkg/a.py, pkg/a.py}`, `remove_paths({Pkg})` removes only `Pkg/a.py`.
   - **Unit: case-only `remove_paths`.** With a stub engine whose graph files are `{pkg/Foo.py, pkg/foo.py}` and `foo.py` on disk, `remove_paths({pkg/Foo.py})` deletes only `pkg/Foo.py`'s language nodes and passes `{pkg/Foo.py}` to the provider passes.
   - **Unit: root and prefix.**
     - `remove_paths({root})` removes nothing.
@@ -208,14 +242,14 @@ Tests: `tests/indexer/test_dispatch.py`, `tests/indexer/test_filesystem_provider
   - **Live: one query.** `remove_paths({pkg/mod.py})` calls the graph-files query exactly once (a spy on the engine methods).
   - **Live: docs directory.** Remove a keyed docs directory, with entries in another directory linking into it. `assert_matches_fresh_apply` passes.
   - **Existing.** Every existing remove, filesystem and docs live test passes unchanged.
-- [ ] Implement (spec W2).
+- [ ] Implement step B (spec W2).
 - [ ] `uv run pytest -q tests/indexer`, then `uv run pytest -q`. Commit "Remove exactly the files below a deleted folder".
 
 ### Task 3: Stamps, floors, catch-up and the post-git reconcile (W4 schema rescan, W5, W6, W7, W9 agent half)
 
 **Files:**
 - `devgraph/registry/store.py`: `mark_indexed(repo_id, at: datetime | None = None)`.
-- `devgraph/cli/main.py` (about lines 94 and 274), `devgraph/dashboard/routes.py` (about line 320) and `devgraph/agent/schema_rescan.py` (about line 99): capture the start before `full_scan` and pass `at=`. `SchemaRescanScheduler` also gains an optional `run_exclusive` and runs `full_scan` through it.
+- `devgraph/cli/main.py` (about lines 94 and 274), `devgraph/dashboard/routes.py` (about line 320) and `devgraph/agent/schema_rescan.py` (about line 99): capture the start before `full_scan` and pass `at=`. `SchemaRescanScheduler` also gains an optional `run_exclusive` and runs `full_scan` through it. `build_app` gains an optional `run_exclusive`, which the agents pass, and dashboard registration's scan and stamp run through it. Registration runs inside the agent process.
 - `devgraph/indexer/dispatch.py`:
   - `CatchUp(indexed, pruned, checked)`;
   - `catch_up(engine, repo_id, repo_root, since, docs_path=None, mentions_enabled=False)`;
@@ -223,17 +257,21 @@ Tests: `tests/indexer/test_dispatch.py`, `tests/indexer/test_filesystem_provider
   - `CATCH_UP_MARGIN_NS = 5_000_000_000`.
 - `devgraph/watcher/manager.py`:
   - **`on_catch_up: Callable[[str, datetime], None] | None`** and `git_catch_up_delay_s` (default 2.0).
-  - **`_start_single`** snapshots `last_indexed` before `observer.start()`. It then starts a daemon thread that calls `run_exclusive(repo_id, lambda: on_catch_up(repo_id, snapshot))`, or logs the "hasn't indexed" line when the snapshot is `None`.
-  - **`request_catch_up(repo_id, since, delay_s)`**. Requests coalesce, keeping the minimum `since`. Each is cancelled by `stop()`.
-  - **`_GitStateEventHandler`** records the first `.git/index.lock` event time of a burst, before its filter. `_fire_change` hands `burst_start` to the manager, which calls `request_catch_up(repo_id, min(last_indexed, burst_start), git_catch_up_delay_s)`.
+  - **`_start_single`** snapshots `last_indexed` before `observer.start()`. It then starts a daemon thread that calls `run_exclusive(repo_id, …)`. Inside the lock, a `None` snapshot is re-read from the registry, because registration may have just finished under the same lock. It then calls `on_catch_up(repo_id, since)`, or logs the "hasn't indexed" line if the snapshot is still `None`.
+  - **`request_catch_up(repo_id, since, delay_s)`**. Requests coalesce, keeping the minimum `since`. It records the request under a small `_catch_up_lock`, starts or keeps a timer, and never synchronously takes `manager._lock` or a batch lock. The timer goes through `run_exclusive`. Each request is cancelled by `stop()`.
+  - **`_GitStateEventHandler`** takes an injectable `now`. Before its filter, it records the newest `.git/index.lock` creation and release times. When a relevant HEAD, `packed-refs` or `refs/` event arrives at `t_h`, it sets `burst_start` to that lock's creation time only if both hold:
+    - the lock was created before `t_h`;
+    - it is still held, or was released no more than `GIT_LOCK_WINDOW_S` (5) seconds before `t_h`.
+
+    It discards older lock records, and clears its state when the burst fires. `_fire_change` hands `burst_start` (or `None`) to the manager, which calls `request_catch_up(repo_id, min(last_indexed, burst_start) or last_indexed, git_catch_up_delay_s)`.
 - `devgraph/agent/sync.py` (new), **`RepoSync(engine, registry, publish, request_catch_up, now=...)`**:
   - `on_changes`, with the stamp `min(started, floor)`, a floor set on failure, and `request_catch_up(…, delay 30 s)`;
-  - `on_catch_up(repo_id, since)`, with `since = min(since, floor)`, the W9 logs, `catch_up` events and `reindexed`; a success with `since <= floor` clears the floor;
+  - `on_catch_up(repo_id, since)`, with `since = min(since, floor)`, the W9 logs, `catch_up` events and `reindexed`; a success with `since <= floor` clears the floor. The counts come from `CatchUp`: `indexed` is `index_paths`' return value and `pruned` is `prune_stale_files`'. `on_changes` reports `index_paths`' and `remove_paths`' return values the same way;
   - `retry_failed()`, for the health loop;
   - `running` (a count), for the tray;
   - `stopping`, which suppresses failure warnings.
 - `devgraph/agent/tray.py` and `devgraph/agent/headless.py`:
-  - build `RepoSync` and keep `_on_changes` as a delegate;
+  - build `RepoSync` first, with `request_catch_up=lambda *a: self._watcher.request_catch_up(*a)` (wired late, because the two depend on each other), then the watcher with `on_changes=self._sync.on_changes` and `on_catch_up=self._sync.on_catch_up`; keep `_on_changes` as a delegate;
   - pass `on_catch_up` and `run_exclusive`;
   - the health loop calls `retry_failed()` on an unhealthy-to-healthy transition;
   - `_status_text` shows `catching up`;
@@ -281,7 +319,17 @@ Tests:
     2. One `request_catch_up(since=t10)`, fired after `git_catch_up_delay_s` (fake timer).
     3. Two bursts within the delay coalesce to the minimum `since`.
     4. A ref-only burst uses `last_indexed`.
-    5. `stop()` cancels a pending request.
+    5. **An old lock is ignored.** Lock created at t=0 and released at t=0.1 (a `git status`), then `HEAD` at t=60: `since` is `last_indexed`, not t=0.
+    6. **A long checkout counts.** Lock created at t=0 and released at t=40, then `HEAD` at t=41: `since` is t=0.
+    7. **A lock after HEAD is ignored.** `HEAD` at t=5, then a lock at t=6: no `burst_start`.
+    8. `stop()` cancels a pending request.
+  - **`request_catch_up` takes no blocking lock.** Call it from inside a `run_exclusive` function for the same repository, and from a thread that holds `manager._lock`. Both return within 1 s, with no deadlock.
+  - **Late wiring.** A `TrayApp` built with mocks routes `watcher.request_catch_up` through `RepoSync` after construction (a spy on the watcher).
+  - **Counts.** With `index_paths` returning 7 for 3 changed paths, the `done` event and the log say 7 updated.
+  - **Registration and catch-up.**
+    1. Registration's `run_exclusive` holds the lock and stamps `last_indexed`.
+    2. A catch-up whose snapshot was `None` runs after it, with the re-read stamp as `since`.
+    3. It does not log the "hasn't indexed" line.
   - **Stop during a running catch-up.** `on_catch_up` blocks. `stop()` returns within 5 s, and the later failure logs no warning.
   - **Schema rescan.** `SchemaRescanScheduler.run_once` runs `full_scan` through the passed `run_exclusive` (a spy).
   - **Live catch-up, edits made while off.** Filesystem types and an id-keyed `Adr` docs type are declared.
@@ -354,5 +402,5 @@ Tests:
     - catch-up, the post-git reconcile and failure floors;
     - `devgraph/agent/sync.py`.
 
-    Add a shipped line with the spec's Limits as "Still open".
+    Add a shipped line with the spec's Limits as "Still open". In the `index_paths` batch-ordering bullet, add W10's shared-node rule, and say that it changed from last-writer-wins.
 - [ ] `uv run pytest -q`, plus the `tests/dashboard/*.js` harnesses. Commit "Test watcher scenarios end to end and show catch-up status".

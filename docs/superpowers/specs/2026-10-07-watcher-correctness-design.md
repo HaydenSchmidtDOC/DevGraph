@@ -54,12 +54,13 @@ exceptions are listed under "Limits" below. No new config knob.
 | W1 | **A rename is a delete of the source plus a create of the destination**, in one batch when both are seen by one emitter. |
 | W2 | **Deletes are expanded to exact file paths in `remove_paths`**, from the graph's own file list, which includes provider paths. Directory creates and in-repo moves are walked. |
 | W3 | **Top-level directory changes trigger a watch reconcile**, which runs on its own thread, replaces dead or stale watches, then walks new folders. **Handler code never takes `manager._lock`.** |
-| W4 | **One batch lock per repository, owned by the manager**, shared by live batches, catch-up and the schema rescan. Events keep collecting while a batch runs. |
+| W4 | **One batch lock per repository, owned by the manager**, shared by live batches, catch-up, the schema rescan and dashboard registration. Events keep collecting while a batch runs. |
 | W5 | **Catch-up is incremental**, with `since` snapshotted before the watch starts. It runs whenever the watcher starts watching a repository. A never-indexed repository is not scanned. |
 | W6 | **The debounce is enough for delivered events. A git operation also triggers a catch-up**, from the start of the git burst, to repair dropped events. |
 | W7 | **`last_indexed` is the start of the work it covers**, held back by a per-repository floor while a batch has failed. |
 | W8 | **Docs provider unchanged.** The watcher delivers the pair; front-matter keys already handle both orders. |
 | W9 | **Say it plainly**: log lines a non-developer can read, and a "catching up" state on the tray and the dashboard. |
+| W10 | **Shared-node attribution does not depend on claim order.** `sources` stays sorted, and the attributed properties come from the claim of `min(sources)`. |
 
 ### W1: rename and move of a file
 
@@ -113,7 +114,12 @@ Order inside a batch is unchanged: `index_paths(changed)`, then
    below it (`g + "/"` prefix; never for `.`).
 4. **A path is kept when it is present on disk.** An expanded path that is an
    indexable file on disk is dropped from the removal. Presence is checked
-   case-exactly: the leaf must appear in `os.listdir(parent)`.
+   case-exactly **for every path component**. Starting at the root, each
+   component must appear exactly in its parent's `os.listdir` names.
+   - Checking the leaf alone is not enough. After a Windows folder rename
+     `Pkg` → `pkg`, `Pkg/a.py` still opens, so a leaf-only check would keep
+     the stale `Pkg/**` nodes.
+   - The listings are memoised per call.
 5. **Removals are exact.**
    - **Language deletes** run per exact file path.
    - **The provider passes** (`sync_absent`, `_take_over_keys`,
@@ -201,8 +207,14 @@ refresh.
 - `SchemaRescanScheduler` takes an optional `run_exclusive`, and the agents
   pass the watcher's, so a schema-applying `full_scan` no longer interleaves
   with a live batch.
-- **Not covered:** writers in other processes (`devgraph rescan`, dashboard
-  registration) and the git-history sync. It serialises this process's file
+- Dashboard registration runs inside the agent process, because the tray
+  and headless agents serve the dashboard.
+  - `build_app` takes an optional `run_exclusive`, and registration's
+    `full_scan` and stamp run through it.
+  - A watcher that picks up the new repository mid-scan therefore waits for
+    the scan, and its catch-up then sees the stamp (W5).
+- **Not covered:** writers in other processes (`devgraph add`, `devgraph
+  rescan`) and the git-history sync. The lock serialises this process's file
   indexing for one repository, not every writer.
 
 **Timers.**
@@ -259,7 +271,9 @@ Because `_graph_files` includes provider paths, a `File`-only file is
   - This covers agent start, Resume, and `watch enable` or a registration
     picked up by `refresh()`. A repository with watching disabled gets no
     catch-up.
-- **Never indexed** (`last_indexed` is `None`). Skip, and log
+- **Inside the lock, a `None` snapshot is re-read.** Registration in this
+  process may have just finished under the same lock.
+- **Never indexed** (`last_indexed` still `None`). Skip, and log
   `DevGraph hasn't indexed <repo> yet; run "devgraph rescan <repo>"`.
   `devgraph add`, `rescan` and dashboard registration own the first scan, so
   there is never a parallel `full_scan`.
@@ -286,13 +300,29 @@ mtime.
 
 **Post-git catch-up.**
 
-- `_GitStateEventHandler` records the time of the first `.git/index.lock`
-  event of a burst, before its relevance filter. Checkout, pull, merge, reset
-  and stash all take that lock first.
+- **What a burst is.** Checkout, pull, merge, reset and stash take
+  `.git/index.lock` before they write files. IDEs also run `git status`, which
+  takes and releases the same lock without moving HEAD. So a lock counts only
+  when it is tied to a HEAD or ref change.
+  - Before its relevance filter, `_GitStateEventHandler` records the newest
+    lock's creation time, and the time it was released (deleted, or renamed
+    onto `index`).
+  - When a relevant HEAD, `packed-refs` or `refs/` event arrives at `t_h`,
+    `burst_start` is that lock's creation time if both hold:
+    - it was created before `t_h`;
+    - it is still held, or was released no more than `GIT_LOCK_WINDOW_S`
+      (5 s) before `t_h`.
+
+    Otherwise `burst_start` is absent. A fetch that only moves refs, or a
+    `git status` lock from minutes ago, gives no `burst_start`.
+  - The window is measured from the lock's release, not its creation, so a
+    long checkout that holds the lock for a minute still counts.
+  - Lock records older than the window are discarded. The burst state is
+    cleared when the burst fires.
 - When the burst's debounce fires, the manager schedules a catch-up 2 s later
   (`git_catch_up_delay_s`, injectable). Its `since` is
-  `min(last_indexed, burst_start)`; `burst_start` is absent when no lock was
-  seen, for example on a fetch that only moves refs.
+  `min(last_indexed, burst_start)`, or `last_indexed` when there is no
+  `burst_start`.
 - The catch-up runs through `run_exclusive`. Repeats coalesce.
 - When nothing was missed it costs about 0.04 s plus re-indexing what the
   checkout touched, which is bounded by the files git wrote.
@@ -334,6 +364,55 @@ otherwise grow the same catch-up, floor and status code. `RepoSync` holds:
 - `now` is injectable.
 
 Tray and headless keep `_on_changes` as one-line delegates.
+
+**Wiring.** `RepoSync` and `WatcherManager` depend on each other. The agent
+builds `RepoSync` first, with
+`request_catch_up=lambda *a: self._watcher.request_catch_up(*a)`, then builds
+the watcher with `on_changes=self._sync.on_changes` and
+`on_catch_up=self._sync.on_catch_up`. The lambda resolves `self._watcher`
+only when it is called.
+
+**`request_catch_up` never synchronously takes `manager._lock` or a batch
+lock.** `RepoSync.on_changes` calls it while holding the batch lock. It
+records the minimum `since` under its own small `_catch_up_lock` and starts or
+keeps a timer. The timer thread then goes through `run_exclusive`.
+
+### W10: shared-node attribution
+
+Some nodes are produced by several files, for example `Datastore` and
+`Endpoint`. These are the nodes written with a `source` property, through the
+`sources` clauses in `engine.py` at about lines 323 and 488.
+
+Today:
+
+- `SET n += properties` makes `source`, `library` and every other written
+  property last-writer-wins.
+- `sources` is appended in claim order.
+- `index_paths` sorts its batch, so a full scan writes in path order. A live
+  batch writes in a different order (for example a rename re-claims last), so
+  live and fresh results differ.
+
+**Rule.** For a shared node, the engine keeps a per-claim record of what each
+claiming file wrote, `claims` (a JSON string mapping the source path to its
+properties, since Neo4j has no map properties).
+
+- **On a claim**, it updates `claims[source]` and sets `sources` to the
+  sorted keys. The node's written properties become exactly `claims[min(sources)]`,
+  with `source = min(sources)`. Properties that the previous attribution had
+  and the new one lacks are removed.
+- **On an unclaim** (`delete_nodes_by_source_file`), it drops the entry. If
+  none is left the node is deleted; otherwise the node is re-attributed from
+  the new minimum the same way.
+- **Both run read-modify-write in Python inside one write transaction.**
+- **Legacy nodes.** A node written before this change has `sources` but no
+  `claims`. Each listed source that has no `claims` entry is treated as
+  claiming the node's current properties. The next rescan makes the node
+  exact.
+
+This is a behaviour change to existing shared-node writes. A full scan's
+result is the same as today only where the alphabetically first file was
+also the last writer. The comment in `dispatch.py` at about line 614 changes
+to state the new rule.
 
 ### W8: docs read cache and "incremental equals fresh apply"
 
@@ -386,7 +465,9 @@ Log lines, at INFO unless noted:
 
 - `Checking <repo> for changes made while DevGraph wasn't watching…`
 - `<repo> is up to date (checked 1,234 files in 0.2 s)`
-- `Caught up on <repo>: 12 files updated, 3 removed (4.1 s)`
+- `Caught up on <repo>: 12 files updated, 3 removed (4.1 s)`. "Updated" is
+  `index_paths`' return value (files actually indexed, referrers included),
+  and "removed" is `prune_stale_files`' return value.
 - `Folder renamed in <repo>: pkg → lib` and `Folder removed from <repo>: pkg/sub`.
   One line per directory event, never per child.
 - `<repo>: found 5 files the live watcher missed after a git operation; updated them`.
@@ -424,7 +505,8 @@ These are documented, with `devgraph rescan` as the fallback:
   - on Windows, a file overwritten in place by a tool that restores its mtime
     (the creation time stays old).
 - **By-name cross-batch referrer gaps** listed in PROJECT_STATUS.
-- **Writers in other processes** are not serialised with the agent (W4).
+- **Writers in other processes** (`devgraph add`, `devgraph rescan`) are not
+  serialised with the agent (W4).
 - **macOS (FSEvents)** is not a supported agent platform.
 
 ## Docs to update
@@ -436,4 +518,6 @@ These are documented, with `devgraph rescan` as the fallback:
   above.
 - **PROJECT_STATUS.** Replace the watcher entry's "Known gaps" sentence,
   extend the `devgraph/watcher/` and `devgraph/agent/` entries, and add the
-  slice to the shipped list with the Limits as "Still open".
+  slice to the shipped list with the Limits as "Still open". In the
+  `index_paths` batch-ordering bullet, add W10's rule for shared nodes, and
+  note that it is a behaviour change.
