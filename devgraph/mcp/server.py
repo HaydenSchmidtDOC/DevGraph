@@ -695,6 +695,28 @@ def build_server(
         the file may have changed since the last index."""
         return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo)
 
+    @server.tool(annotations=_READ_ONLY)
+    def describe_node(
+        repo_id: str,
+        name: str,
+        label: str | None = None,
+        file: str | None = None,
+        direction: str = "both",
+        relationship_types: list[str] | None = None,
+        neighbor_labels: list[str] | None = None,
+        max_per_type: int = 10,
+    ) -> dict[str, Any]:
+        """Look at one node: its properties and its relationships grouped by type and
+        direction, with each neighbour's identity. A file, folder or docs node is named by
+        its repo-relative path or id. An ambiguous name returns candidates; call again with
+        label and file. Each ref in the result is the next call's arguments. One hop per
+        call, at most 50 neighbours per type; direction, relationship_types, neighbor_labels
+        and max_per_type narrow it."""
+        return devgraph_tools.describe_node(
+            engine, repo_id, name, label, file, direction, relationship_types, neighbor_labels, max_per_type,
+            declared_labels=devgraph_tools.declared_node_labels(registry, repo_id),
+        )
+
     if settings.enable_run_cypher:
 
         @server.tool(annotations=_ESCAPE_HATCH)

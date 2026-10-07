@@ -313,3 +313,162 @@ def test_other_neo4j_error_is_its_code_only():
     with pytest.raises(ValueError) as caught:
         describe_node(engine, "demo", "x")
     assert str(caught.value) == "describe_node failed: Neo.ClientError.Statement.SyntaxError"
+
+
+# ── the MCP server: catalog, shadowing, session default ────────────────────
+
+import asyncio  # noqa: E402
+import json  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
+
+from devgraph.config import global_tools  # noqa: E402
+from devgraph.config.project_tools import TOOLS_FILENAME  # noqa: E402
+from devgraph.config.settings import Settings  # noqa: E402
+from devgraph.mcp import server as mcp_server  # noqa: E402
+from devgraph.mcp import tools as devgraph_tools  # noqa: E402
+from devgraph.mcp.catalog import TOOL_CATALOG, builtin_tool_names  # noqa: E402
+
+SHADOW = "ignored: {layer} tool 'describe_node' shadows a locked tool; using the fixed implementation"
+SHADOWING_TOOL = {
+    "name": "describe_node",
+    "description": "Shadows a built-in.",
+    "cypher": "MATCH (n {repo_id: $repo_id}) RETURN n.name AS name",
+}
+
+
+@dataclass
+class _Repo:
+    repo_id: str
+    path: Path
+    active: bool = True
+
+
+class _Registry:
+    def __init__(self, repos):
+        self.repos = repos
+
+    def list_repos(self, active_only=False):
+        return list(self.repos)
+
+    def get(self, repo_id):
+        return next((r for r in self.repos if r.repo_id == repo_id), None)
+
+
+class _ServerEngine:
+    def run_cypher(self, query, params=None):
+        return []
+
+    def run_read_cypher(self, query, parameters, *, timeout_s, max_rows):
+        return [], False
+
+
+@pytest.fixture
+def served(tmp_path, monkeypatch):
+    """Build a server for repo `demo`; optional project tools yaml and global tool dicts."""
+    from devgraph.config import project_trust
+
+    monkeypatch.setattr(project_trust, "project_tools_trust", lambda repo_root, data: "trusted")
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3"))
+    store = tmp_path / "store" / global_tools.GLOBAL_TOOLS_FILENAME
+    monkeypatch.setattr(global_tools, "_default_path", lambda: store)
+
+    def build(project=None, global_list=None):
+        repo = tmp_path / "demo"
+        repo.mkdir(exist_ok=True)
+        if project:
+            (repo / TOOLS_FILENAME).write_text(project)
+        if global_list:
+            store.parent.mkdir(exist_ok=True)
+            store.write_text(json.dumps({"version": 1, "tools": global_list}))
+        record = _Repo("demo", repo)
+        return mcp_server.build_server(_ServerEngine(), _Registry([record]), session_repo=record, session_source="env")
+
+    return build
+
+
+@pytest.fixture
+def recorder(monkeypatch):
+    log = []
+
+    def fake(*args, **kwargs):
+        log.append((args, kwargs))
+        return {"count": 1, "results": [{"name": "X"}], "truncated": False}
+
+    monkeypatch.setattr(devgraph_tools, "describe_node", fake)
+    monkeypatch.setattr(devgraph_tools, "declared_node_labels", lambda registry, repo_id: ("Runbook",))
+    return log
+
+
+def _call(server, arguments):
+    return asyncio.run(server.call_tool("describe_node", arguments))
+
+
+def _listed(server):
+    return {t.name: t for t in asyncio.run(server.list_tools())}["describe_node"]
+
+
+def test_describe_node_catalog_entry():
+    assert "describe_node" in builtin_tool_names()
+    entry = next(e for e in TOOL_CATALOG if e["name"] == "describe_node")
+    assert entry["envelope"] is False
+    assert "{count, results, truncated}" in entry["note"]
+
+
+@pytest.mark.parametrize("layer", ["project", "global"])
+def test_a_shadowing_tool_cannot_take_describe_node(served, recorder, layer):
+    if layer == "project":
+        server = served(project=(
+            "version: 1\ntools:\n  - name: describe_node\n    description: Shadows a built-in.\n"
+            "    cypher: |\n      MATCH (n {repo_id: $repo_id}) RETURN n.name AS name\n"
+        ))
+    else:
+        server = served(global_list=[SHADOWING_TOOL])
+    status = json.loads(asyncio.run(server.read_resource("devgraph://project-tools"))[0].content)
+    assert "describe_node" not in status["served"]
+    assert SHADOW.format(layer=layer) in status["notices"]
+    assert "max_per_type" in _listed(server).input_schema["properties"]
+    assert SHADOW.format(layer=layer) in _call(server, {"repo_id": "demo", "name": "X"}).structured_content["notices"]
+
+
+def test_describe_node_uses_the_session_repo(served, recorder):
+    server = served()
+    result = _call(server, {"name": "X"}).structured_content
+    (args, kwargs), = recorder
+    assert args[1] == "demo" and args[2] == "X"
+    assert kwargs["declared_labels"] == ("Runbook",)
+    assert result["repo_id"] == "demo"
+    assert any("used this session's repository 'demo'" in n for n in result["notices"])
+
+    recorder.clear()
+    explicit = _call(server, {"repo_id": "other", "name": "X"}).structured_content
+    assert recorder[0][0][1] == "other"
+    assert "repo_id" not in explicit and "notices" not in explicit
+
+
+def test_describe_node_has_no_cross_repo(served):
+    schema = _listed(served()).input_schema
+    assert "cross_repo" not in schema["properties"]
+    assert schema["required"] == ["name"]
+
+
+def test_describe_node_is_read_only_annotated(served):
+    assert _listed(served()).annotations.read_only_hint is True
+
+
+def test_describe_node_error_surfaces_as_tool_error(served, monkeypatch, tmp_path):
+    def boom(*args, **kwargs):
+        raise ValueError("no node named 'x' in repository 'demo'")
+
+    monkeypatch.setattr(devgraph_tools, "describe_node", boom)
+    monkeypatch.setattr(devgraph_tools, "declared_node_labels", lambda registry, repo_id: ())
+    server = served()
+    # In process the SDK raises; over the wire it becomes an is_error result. It hides a
+    # crash's own text from the client (as for every built-in), so the text is on __cause__.
+    with pytest.raises(ToolError) as excinfo:
+        _call(server, {"repo_id": "demo", "name": "x"})
+    assert "no node named 'x'" in str(excinfo.value.__cause__)
+    entries = mcp_server.read_tool_telemetry(100)
+    assert entries[0]["tool"] == "describe_node" and entries[0]["ok"] is False

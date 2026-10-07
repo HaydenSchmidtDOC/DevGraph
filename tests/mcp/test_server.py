@@ -40,14 +40,14 @@ def seeded_graph(engine):
 
 
 class TestServerBuild:
-    def test_all_24_tools_registered(self, engine):
+    def test_all_25_tools_registered(self, engine):
         server = build_server(engine)
         import asyncio
 
         tools = asyncio.run(server.list_tools())
         names = {t.name for t in tools}
 
-        assert len(tools) == 24
+        assert len(tools) == 25
         # spot check across all three phases plus Implementation Plan #3/6/10's new tools
         assert "search_component" in names
         assert "explain_decision" in names
