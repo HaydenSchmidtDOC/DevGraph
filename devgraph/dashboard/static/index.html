@@ -2848,25 +2848,23 @@ function catchUpPillState(running, event, selectedRepo) {
   return { running: next, label: busy ? CATCH_UP_PILL_LABEL : LIVE_PILL_LABEL };
 }
 let catchUpRunning = [];
-/* The pill's display before a catch-up showed it (it is hidden while Neo4j
-   is disconnected), put back when the catch-up ends; null when the pill
-   was already showing. */
-let catchUpHiddenDisplay = null;
+/* The pill's display as the topology counts last set it: hidden while Neo4j
+   is disconnected, shown once counts load (hidden in the markup until then).
+   A catch-up shows the pill whatever this is; when it ends the pill takes
+   this again, as it is then, not as it was when the catch-up began. */
+let entityPillTopologyDisplay = "none";
+function setEntityPillTopology(display) {
+  entityPillTopologyDisplay = display;
+  const pill = document.getElementById("entityLivePill");
+  if (pill.textContent !== CATCH_UP_PILL_LABEL) pill.style.display = display;
+}
 /* `event` is null on a repository switch, which only recomputes the label */
 function applyCatchUpPill(event) {
   const pill = document.getElementById("entityLivePill");
   const next = catchUpPillState(catchUpRunning, event, document.getElementById("repoSelect").value);
   catchUpRunning = next.running;
   pill.textContent = next.label;
-  if (next.label === CATCH_UP_PILL_LABEL) {
-    if (pill.style.display !== "inline-block" && catchUpHiddenDisplay === null) {
-      catchUpHiddenDisplay = pill.style.display;
-      pill.style.display = "inline-block";
-    }
-  } else if (catchUpHiddenDisplay !== null) {
-    pill.style.display = catchUpHiddenDisplay;
-    catchUpHiddenDisplay = null;
-  }
+  pill.style.display = next.label === CATCH_UP_PILL_LABEL ? "inline-block" : entityPillTopologyDisplay;
 }
 /* ── end Catch-up pill ── */
 
@@ -5788,9 +5786,8 @@ document.getElementById("btnRecomputeInsights").addEventListener("click", recomp
    leaderboard starts as a plain-Cypher degree count; loadInsights swaps in
    PageRank when graph insights are computed. ── */
 async function loadTopologyCounts() {
-  const entityPill = document.getElementById("entityLivePill");
   const relPill = document.getElementById("relSamplePill");
-  if (!neo4jConnected) { entityPill.style.display = "none"; relPill.textContent = "Not wired"; relPill.className = "sample-pill"; return; }
+  if (!neo4jConnected) { setEntityPillTopology("none"); relPill.textContent = "Not wired"; relPill.className = "sample-pill"; return; }
   const repo = document.getElementById("repoSelect").value;
   const isolatedEntityId = state.isolatedEntity;
   const nodeFilters = [];
@@ -5813,7 +5810,7 @@ async function loadTopologyCounts() {
       });
       const docCount = counts["Document"] ?? (isolatedEntityId ? 0 : undefined);
       if (docCount !== undefined) document.getElementById("docCount").textContent = docCount.toLocaleString();
-      entityPill.style.display = "inline-block";
+      setEntityPillTopology("inline-block");
 
       /* real total (of whatever's currently isolated) replaces the
          static-demo total (794) the Node ceiling slider was seeded with at

@@ -99,8 +99,9 @@ class RepoSync:
                 floor = min(floor, datetime.fromisoformat(repo.last_indexed))
             self._failed(repo_id, floor, exc)
 
-    def on_catch_up(self, repo_id: str, since: datetime, reason: str = "start") -> None:
+    def on_catch_up(self, repo_id: str, since: datetime, reason: str = "start") -> bool:
         """Catch up on changes made since `since` (or the floor, if earlier).
+        Returns whether it did (False when it failed, or the repository is gone).
 
         `reason` is "start" (the watcher started watching), "git" (after a
         git operation) or "retry" (after a failure); it only changes the logs.
@@ -111,7 +112,7 @@ class RepoSync:
             since = floor
         repo = self._registry.get(repo_id)
         if repo is None:
-            return
+            return False
         logger.log(
             logging.INFO if reason == "start" else logging.DEBUG,
             "Checking %s for changes made while DevGraph wasn't watching…", repo_id,
@@ -142,7 +143,7 @@ class RepoSync:
         if error is not None:
             self._publish({"type": "catch_up", "repo_id": repo_id, "state": "failed", "changed": 0, "deleted": 0})
             self._failed(repo_id, since, error)
-            return
+            return False
         elapsed = time.monotonic() - clock
         self._publish({
             "type": "catch_up", "repo_id": repo_id, "state": "done",
@@ -152,6 +153,7 @@ class RepoSync:
         if found:
             self._publish({"type": "reindexed", "repo_id": repo_id, "changed": result.indexed, "deleted": result.pruned})
         self._log_result(repo_id, reason, result, found, elapsed)
+        return True
 
     def retry_failed(self) -> None:
         """Ask for a catch-up of every repository with a floor (the health
