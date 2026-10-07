@@ -34,6 +34,7 @@ def stubbed(monkeypatch):
     state = {"known": set(), "offered": [], "pruned": 0}
 
     monkeypatch.setattr(dispatch, "prune_stale_files", lambda *a, **k: state["pruned"])
+    monkeypatch.setattr(dispatch, "schema_pending", lambda *a, **k: False)
     monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: set(state["known"]))
 
     def index(engine, repo_id, root, paths, docs_path=None, mentions_enabled=False):
@@ -63,7 +64,7 @@ def test_a_preserved_mtime_with_a_new_ctime_is_due(tmp_path, stubbed):
     stubbed["known"] = {"a.py"}
     result = catch_up(None, "r", tmp_path, NOW - timedelta(minutes=1))
     assert stubbed["offered"] == [{"a.py"}]
-    assert result == CatchUp(indexed=10, pruned=0, checked=1)
+    assert result == CatchUp(indexed=10, pruned=0, checked=1, offered=1, unknown=0)
 
 
 def test_a_file_with_every_stamp_old_is_not_due(tmp_path, stubbed):
@@ -71,7 +72,7 @@ def test_a_file_with_every_stamp_old_is_not_due(tmp_path, stubbed):
     stubbed["known"] = {"a.py"}
     result = catch_up(None, "r", tmp_path, datetime.now(timezone.utc) + timedelta(hours=1))
     assert stubbed["offered"] == []
-    assert result == CatchUp(indexed=0, pruned=0, checked=1)
+    assert result == CatchUp(indexed=0, pruned=0, checked=1, offered=0, unknown=0)
 
 
 @pytest.mark.parametrize(("before_s", "due"), [(4, True), (6, False)])
@@ -90,21 +91,90 @@ def test_a_file_the_graph_does_not_know_is_due_whatever_its_stamps(tmp_path, stu
     (tmp_path / "new.py").write_text("n = 1\n")
     (tmp_path / "old.py").write_text("o = 1\n")
     stubbed["known"] = {"old.py"}
-    catch_up(None, "r", tmp_path, datetime.now(timezone.utc) + timedelta(hours=1))
+    result = catch_up(None, "r", tmp_path, datetime.now(timezone.utc) + timedelta(hours=1))
     assert stubbed["offered"] == [{"new.py"}]
+    assert (result.offered, result.unknown) == (1, 1)
+
+
+FS_SCHEMA = """
+    version: 1
+    node_types:
+      - label: File
+        key: [path]
+        metadata: [{name: path}]
+        source: {provider: filesystem, kind: file}
+"""
 
 
 def test_a_provider_only_file_the_graph_knows_is_not_offered_again(tmp_path, stubbed):
+    (tmp_path / "devgraph.schema.yaml").write_text(textwrap.dedent(FS_SCHEMA))
     (tmp_path / "logo.png").write_bytes(b"\x89PNG")
-    stubbed["known"] = {"logo.png"}
+    stubbed["known"] = {"logo.png", "devgraph.schema.yaml"}
     result = catch_up(None, "r", tmp_path, datetime.now(timezone.utc) + timedelta(hours=1))
     assert stubbed["offered"] == []
-    assert result.checked == 1
+    assert result.checked == 2
+
+
+def test_files_nothing_would_index_are_never_offered(tmp_path, stubbed):
+    for name in ("notes.txt", "data.json", "LICENSE", "empty.md"):
+        (tmp_path / name).write_text("")
+    (tmp_path / "logo.png").write_bytes(b"\x89PNG")
+    result = catch_up(None, "r", tmp_path, datetime.now(timezone.utc) - timedelta(hours=1))
+    assert stubbed["offered"] == []
+    assert result == CatchUp(indexed=0, pruned=0, checked=5, offered=0, unknown=0)
+
+
+@pytest.mark.parametrize(
+    "name", ["a.py", "a.ts", "a.cs", "a.cpp", "A.java", "a.rs", "a.kt", "a.go", "Dockerfile", "compose.yaml"]
+)
+def test_files_an_extractor_handles_are_offered(tmp_path, stubbed, name):
+    (tmp_path / name).write_text("")
+    catch_up(None, "r", tmp_path, NOW)
+    assert stubbed["offered"] == [{name}]
+
+
+def test_markdown_is_offered_under_the_docs_path_or_with_mentions(tmp_path, stubbed):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "a.md").write_text("# A\n")
+    (tmp_path / "b.md").write_text("# B\n")
+    catch_up(None, "r", tmp_path, NOW, docs_path="docs")
+    catch_up(None, "r", tmp_path, NOW, mentions_enabled=True)
+    assert stubbed["offered"] == [{"docs/a.md"}, {"docs/a.md", "b.md"}]
+
+
+def test_declared_providers_make_their_files_offered(tmp_path, stubbed):
+    (tmp_path / "devgraph.schema.yaml").write_text(textwrap.dedent(FS_SCHEMA))
+    (tmp_path / "notes.txt").write_text("")
+    catch_up(None, "r", tmp_path, NOW)
+    assert stubbed["offered"] == [{"devgraph.schema.yaml", "notes.txt"}]
+
+    (tmp_path / "devgraph.schema.yaml").write_text(textwrap.dedent("""
+        version: 1
+        node_types:
+          - label: Adr
+            key: [path]
+            metadata: [{name: path}]
+            source: {provider: docs, paths: ["decisions/*.md"]}
+    """))
+    (tmp_path / "decisions").mkdir()
+    (tmp_path / "decisions" / "a.md").write_text("# A\n")
+    (tmp_path / "other.md").write_text("# B\n")
+    stubbed["offered"].clear()
+    catch_up(None, "r", tmp_path, NOW)
+    assert stubbed["offered"] == [{"decisions/a.md"}]
+
+
+def test_a_pending_schema_offers_no_provider_files(tmp_path, stubbed, monkeypatch):
+    (tmp_path / "devgraph.schema.yaml").write_text(textwrap.dedent(FS_SCHEMA))
+    (tmp_path / "notes.txt").write_text("")
+    monkeypatch.setattr(dispatch, "schema_pending", lambda *a, **k: True)
+    catch_up(None, "r", tmp_path, NOW)
+    assert stubbed["offered"] == []
 
 
 def test_prune_count_is_reported(tmp_path, stubbed):
     stubbed["pruned"] = 3
-    assert catch_up(None, "r", tmp_path, NOW) == CatchUp(indexed=0, pruned=3, checked=0)
+    assert catch_up(None, "r", tmp_path, NOW) == CatchUp(indexed=0, pruned=3, checked=0, offered=0, unknown=0)
 
 
 # --- live ----------------------------------------------------------------

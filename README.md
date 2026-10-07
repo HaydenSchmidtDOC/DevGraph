@@ -74,7 +74,7 @@ While the DevGraph agent (the tray app, or the headless agent in a container) is
 - **Renames and moves** are picked up too: a renamed file, a folder moved somewhere else in the repository, a folder renamed at the top of the repository, and a folder deleted or sent to the trash. Nothing is left behind under the old name. A new top-level folder, or one deleted and created again, is watched straight away.
 - **Changes made while DevGraph wasn't running** (a reboot, editing with the tray paused, a `git pull` while it was off) are found when it starts or resumes. It checks every file against the time of its last update and re-reads only what changed, which takes well under a second when nothing did. A repository that has never been scanned is not scanned here; the log says to run `devgraph rescan <repo_id>`.
 - **After a git operation** (checkout, pull, merge, reset, stash), DevGraph checks the repository again a couple of seconds later, in case the operating system dropped some of the change notifications for a large checkout.
-- **If an update fails** (for example Neo4j is down), DevGraph logs `Couldn't update <repo>; DevGraph will retry, or run "devgraph rescan <repo>"`, tries again 30 seconds later, and again when Neo4j comes back.
+- **If an update fails** (for example Neo4j is down), DevGraph logs `Couldn't update <repo>; DevGraph will retry, or run "devgraph rescan <repo>"`, tries again 30 seconds later, and again as soon as Neo4j comes back. While it keeps failing, the warning is repeated every few minutes rather than on every attempt.
 
 While a check like this runs, the tray icon's tooltip reads `DevGraph (catching up)` and the dashboard's Entities card shows `Catching up…` instead of `Live`. The log says what it found, for example `Caught up on myrepo: 12 files updated, 3 removed (4.1 s)`. A dashboard opened in the middle of a check doesn't show it.
 
@@ -86,6 +86,7 @@ What it can still miss. `devgraph rescan <repo_id>` fixes each of these:
 - **Links between files that are updated separately**, described under [Current limitations](#current-limitations) below.
 - **`devgraph add` or `devgraph rescan` running at the same time as the agent's own update** of the same repository. They run in a separate process, so the two aren't kept apart; run the rescan again if you edited files while it was running.
 - **macOS** is not a supported platform for the agent.
+- **Linked worktrees and submodules** (where `.git` is a file rather than a folder) get no check after a git operation, because DevGraph doesn't watch their git state. Edits are still picked up, and the check on start or resume still runs.
 
 ## Project schema
 

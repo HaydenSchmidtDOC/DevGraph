@@ -1438,11 +1438,40 @@ CATCH_UP_MARGIN_NS = 5_000_000_000
 
 class CatchUp(NamedTuple):
     """What a catch-up did: files `index_paths` indexed (referrers included),
-    files `prune_stale_files` pruned, and files walked."""
+    files `prune_stale_files` pruned, files walked, files offered to
+    `index_paths`, and how many of those the graph had no file for."""
 
     indexed: int
     pruned: int
     checked: int
+    offered: int = 0
+    unknown: int = 0
+
+
+_EXTRACTOR_SUFFIXES = {".py", ".cs", ".java", ".rs", ".kt", ".go"} | _JS_SUFFIXES | _CPP_SUFFIXES
+_MARKDOWN_SUFFIXES = (".md", ".markdown")
+
+
+def _would_index(
+    path: Path,
+    rel: str,
+    docs_root: Path | None,
+    mentions_enabled: bool,
+    specs: tuple[bool, filesystem.FilesystemSpec | None, docs.DocsSpec | None],
+) -> bool:
+    """Whether `index_paths` would write anything for this file: a built-in
+    extractor routes it (the branches of `_index_single_path`), or a declared
+    schema provider represents it. Keep in step with `_index_single_path`."""
+    if path.suffix in _EXTRACTOR_SUFFIXES or path.name.lower() in _CONTAINERFILE_NAMES | _COMPOSE_NAMES:
+        return True
+    if path.suffix in _MARKDOWN_SUFFIXES and (
+        mentions_enabled or (docs_root is not None and is_within(path.resolve(), docs_root))
+    ):
+        return True
+    ok, fs_spec, docs_spec = specs
+    if ok and fs_spec is not None and fs_spec.file_label:
+        return True
+    return ok and docs_spec is not None and any(docs.selects(t, rel) for t in docs_spec.types)
 
 
 def _change_stamp_ns(st: os.stat_result) -> int:
@@ -1465,18 +1494,26 @@ def catch_up(
     nothing was watching: an incremental `full_scan`.
 
     Files gone from disk are pruned first (provider-only ones included, and
-    through `remove_paths`, so docs key takeover applies). Then a file is
-    indexed when the graph has no file for its key, or when any of its change
-    stamps is at or after `since` less `CATCH_UP_MARGIN_NS`.
+    through `remove_paths`, so docs key takeover applies). Then a file that
+    `index_paths` would write something for is indexed when the graph has no
+    file for its key, or when any of its change stamps is at or after `since`
+    less `CATCH_UP_MARGIN_NS`. A file nothing would index (a `.txt` with no
+    filesystem type declared) is never offered.
     """
     pruned = prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
-    known = _graph_files(engine, repo_id, repo_root)
+    specs = _applied_provider_specs(engine, repo_id, repo_root)
+    known = _graph_files(engine, repo_id, repo_root, specs)
+    docs_root = (repo_root / docs_path).resolve() if docs_path else None
     cutoff = int(since.timestamp() * 1_000_000_000) - CATCH_UP_MARGIN_NS
     walked = _keyed_indexable_paths(repo_root)
     due: set[Path] = set()
+    unknown = 0
     for path, rel in walked:
+        if not _would_index(path, rel, docs_root, mentions_enabled, specs):
+            continue
         if rel not in known:
             due.add(path)
+            unknown += 1
             continue
         try:
             stamp = _change_stamp_ns(os.stat(path))
@@ -1489,7 +1526,7 @@ def catch_up(
         if due
         else 0
     )
-    return CatchUp(indexed=indexed, pruned=pruned, checked=len(walked))
+    return CatchUp(indexed=indexed, pruned=pruned, checked=len(walked), offered=len(due), unknown=unknown)
 
 
 def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str | None = None, mentions_enabled: bool = False) -> int:

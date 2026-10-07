@@ -913,3 +913,79 @@ def test_stop_returns_while_a_catch_up_runs_and_its_failure_is_quiet(cu, caplog,
         release.set()
         catching.join(5)
     assert not [r for r in caplog.records if r.levelno >= 30]
+
+
+def test_a_shorter_request_replaces_a_pending_longer_one(cu):
+    cu.stamp(T0)
+    cu.manager.start()
+    cu.manager.request_catch_up(cu.repo_id, T0 + timedelta(minutes=1), 30)
+    slow = cu.pending_catch_up()
+    cu.manager.request_catch_up(cu.repo_id, T0 + timedelta(minutes=2), 0)
+    fast = cu.pending_catch_up()
+    assert slow.cancelled and fast is not slow and fast.interval == 0
+    cu.manager.request_catch_up(cu.repo_id, T0, 30)  # a longer one coalesces
+    assert cu.pending_catch_up() is fast
+    fast.fire()
+    assert cu.catch_ups == [(cu.repo_id, T0, "retry")]
+
+
+def test_a_start_catch_up_waiting_on_the_lock_does_not_run_after_pause(cu):
+    cu.stamp(T0)
+    cu.manager.start()
+    holding, release = threading.Event(), threading.Event()
+    holder = run_in_thread(lambda: cu.manager.run_exclusive(cu.repo_id, lambda: (holding.set(), release.wait(5))))
+    assert holding.wait(5)
+    catching = run_in_thread(cu.start_timer().fire)
+    catching.join(0.2)
+    assert catching.is_alive()
+    cu.manager.stop()
+    release.set()
+    holder.join(5)
+    catching.join(5)
+    assert cu.catch_ups == []
+
+
+def _git(root: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *args],
+        cwd=root, check=True, capture_output=True,
+    )
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_git_stash_pop_triggers_a_post_git_catch_up(tmp_path):
+    root = (tmp_path / "repo")
+    (root / "pkg").mkdir(parents=True)
+    root = root.resolve()
+    (root / "pkg" / "a.py").write_text("a = 1\n")
+    _git(root, "init", "-q")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "init")
+    (root / "pkg" / "a.py").write_text("a = 2\n")
+    _git(root, "stash", "-q")
+    registry = RepoRegistry(tmp_path / "registry.db")
+    repo_id = registry.add_repo(root).repo_id
+    registry.mark_indexed(repo_id, at=T0)
+    timers: list[FakeTimer] = []
+
+    def factory(interval, function):
+        timer = FakeTimer(interval, function)
+        timers.append(timer)
+        return timer
+
+    manager = WatcherManager(
+        registry, lambda *a: None, on_catch_up=lambda *a: None, timer_factory=factory, reconcile_delay_s=0
+    )
+    manager.start()
+    try:
+        git_handler = manager._git_handlers[repo_id]
+        _git(root, "stash", "pop", "-q")  # moves no HEAD and no branch: only refs/stash
+        wait_for(lambda: git_handler._debounce_timer is not None, "a git burst from stash pop")
+        git_handler._debounce_timer.fire()
+        entry = manager._catch_up_pending.get(repo_id)
+        assert entry is not None and entry[1] == "git"
+    finally:
+        manager.stop()
+        registry.close()

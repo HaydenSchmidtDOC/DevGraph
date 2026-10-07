@@ -242,12 +242,16 @@ indexable files) against local Neo4j:
 A full scan costs about 0.35 s per file, so about 12 minutes on every start
 for a 2,000-file repository. **Catch-up is incremental.**
 
-`dispatch.catch_up(engine, repo_id, repo_root, since, docs_path, mentions_enabled) -> CatchUp(indexed, pruned, checked)`:
+`dispatch.catch_up(engine, repo_id, repo_root, since, docs_path, mentions_enabled) -> CatchUp(indexed, pruned, checked, offered, unknown)`:
 
 1. `prune_stale_files(...)` against `_graph_files`. This removes files gone
    from disk, provider-only ones included, through `remove_paths`, so docs key
    takeover applies.
-2. Walk `keyed_indexable_paths(repo_root)`. A file is due when either holds:
+2. Walk `keyed_indexable_paths(repo_root)`. Only a file `index_paths` would
+   write something for is a candidate: a built-in extractor routes it, or a
+   declared schema provider represents it (`_would_index`). A `.txt`, `.json`
+   or `.png` with no filesystem type declared is never offered, so it does
+   not cost a no-op catch-up anything. A candidate is due when either holds:
    - its key is not in `_graph_files`;
    - its change stamp is at or after `since - 5 s`.
 
@@ -259,7 +263,8 @@ for a 2,000-file repository. **Catch-up is incremental.**
 3. `index_paths(due)`.
 
 Because `_graph_files` includes provider paths, a `File`-only file is
-"known", so it is not re-offered on every start.
+"known", so it is not re-offered on every start. `offered` counts the due
+files and `unknown` those of them the graph had no file for.
 
 **When it runs, and with what `since`.**
 
@@ -299,6 +304,12 @@ case: the live batches that did run have stamped `last_indexed` after its
 mtime.
 
 **Post-git catch-up.**
+
+- **What is watched.** `.git` itself non-recursively (HEAD, `packed-refs`,
+  `index.lock`), `.git/refs` non-recursively (`refs/stash`: `git stash pop`
+  and `apply` move neither HEAD nor a branch), and `.git/refs/heads`
+  recursively. Remote-tracking refs and tags are not watched, so a background
+  fetch triggers nothing.
 
 - **What a burst is.** Checkout, pull, merge, reset and stash take
   `.git/index.lock` before they write files. IDEs also run `git status`, which
@@ -353,10 +364,18 @@ otherwise grow the same catch-up, floor and status code. `RepoSync` holds:
 - `on_changes(repo_id, changed, deleted)`. It captures `started = now()` on
   entry. Under W4 that is the swap time. It indexes, then stamps
   `min(started, floor)`.
-- **A per-repository floor.** It is the start of the earliest failed batch,
-  kept in memory. While it is set, every stamp is `min(started, floor)`.
+- **A per-repository floor**, kept in memory. While it is set, every stamp is
+  `min(started, floor)`.
+  - A failed live batch sets it to `min(started, last_indexed)`, the last good
+    stamp, not to `started` alone. The batch's events were queued before it
+    took the batch lock, and a catch-up or schema rescan can hold that lock
+    for minutes, so they can predate `started` by far more than the 5 s
+    margin. A floor at `started` would let the retry, and every later stamp,
+    pass them for good.
+  - A failed catch-up sets it to `min(floor, since)`.
   - A failure also asks the watcher for a catch-up, 30 s later.
-  - The health loop asks again when Neo4j recovers.
+  - The health loop asks again, at once, when Neo4j recovers. A request with
+    a shorter delay replaces a pending one; otherwise requests coalesce.
   - A catch-up with `since <= floor` that succeeds clears the floor.
 - `on_catch_up(repo_id, since)`. It uses `since = min(since, floor)`, captures
   `started`, runs `catch_up`, then stamps `min(started, floor-after)`. It
@@ -470,11 +489,17 @@ Log lines, at INFO unless noted:
   and "removed" is `prune_stale_files`' return value.
 - `Folder renamed in <repo>: pkg → lib` and `Folder removed from <repo>: pkg/sub`.
   One line per directory event, never per child.
-- `<repo>: found 5 files the live watcher missed after a git operation; updated them`.
-  Logged only when it finds something; otherwise DEBUG.
+- `<repo>: checked 3 files changed by a git operation`, when a post-git
+  catch-up offered any file. Files git wrote are offered whether or not the
+  live batches already indexed them, so this does not claim a miss.
+- `<repo>: found 2 files the live watcher missed after a git operation; updated them`,
+  only for what the live batches can't have handled: files the graph had no
+  file for, and files pruned. Otherwise DEBUG.
 - `DevGraph hasn't indexed <repo> yet; run "devgraph rescan <repo>"`
 - WARNING `Couldn't update <repo>; DevGraph will retry, or run "devgraph rescan <repo>"`,
-  with `exc_info`. Not logged while stopping.
+  with `exc_info`, once per failure streak; while it keeps failing, again
+  every 5 minutes without the traceback, and at DEBUG in between. Not logged
+  while stopping. The streak ends when a catch-up clears the floor.
 
 The existing `changes detected for …` line stays.
 
@@ -508,6 +533,10 @@ These are documented, with `devgraph rescan` as the fallback:
 - **Writers in other processes** (`devgraph add`, `devgraph rescan`) are not
   serialised with the agent (W4).
 - **macOS (FSEvents)** is not a supported agent platform.
+- **Linked worktrees and submodules** have a `.git` file, not a directory,
+  so nothing under it is watched: no post-git catch-up (and no git-history
+  sync) runs for them. Their file events are still watched, and the catch-up
+  on start still runs.
 
 ## Docs to update
 

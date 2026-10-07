@@ -296,8 +296,9 @@ def build_router(
     def _register_repo(path: str, repo_id: str | None) -> dict[str, Any]:
         """Register + initially scan, exactly as `devgraph add <path>` does.
 
-        Blocking (SQLite write, Neo4j round trips, a full file walk), so it
-        runs in a threadpool -- the event loop also serves the SSE stream the
+        Blocking (SQLite write, Neo4j round trips, a full file walk, and a
+        wait on the repository's batch lock while a live batch or catch-up
+        holds it), so it runs in a threadpool -- the event loop also serves the SSE stream the
         dashboard is watching while this runs.
         """
         try:
@@ -330,6 +331,9 @@ def build_router(
                 registry.mark_indexed(record.repo_id, at=started)
                 return count
 
+            # Waits on the repository's batch lock (W4): a watcher that picks
+            # the new repository up mid-scan waits too, then catches up from
+            # this stamp.
             files_indexed = run_exclusive(record.repo_id, scan_and_stamp)
             indexed = True
         except Exception as exc:

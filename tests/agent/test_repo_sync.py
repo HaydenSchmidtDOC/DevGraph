@@ -184,13 +184,22 @@ def test_a_failed_catch_up_publishes_failed(rig, indexing):
     assert rig.requests == [(REPO, T0, FAILURE_RETRY_DELAY_S)]
 
 
-def test_after_a_git_operation_only_a_find_is_logged_at_info(rig, indexing, caplog):
+def test_after_a_git_operation_a_miss_is_reported_only_for_files_not_already_handled(rig, indexing, caplog):
+    def infos():
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+
     with caplog.at_level(logging.INFO, logger="devgraph.agent.sync"):
+        rig.sync.on_catch_up(REPO, T0, reason="git")  # nothing changed
+        assert infos() == []
+        indexing["catch_up"].return_value = CatchUp(indexed=6, pruned=0, checked=9, offered=3, unknown=0)
+        rig.sync.on_catch_up(REPO, T0, reason="git")  # the live batches had them all
+        assert infos() == [f"{REPO}: checked 3 files changed by a git operation"]
+        caplog.clear()
+        indexing["catch_up"].return_value = CatchUp(indexed=6, pruned=1, checked=9, offered=3, unknown=1)
         rig.sync.on_catch_up(REPO, T0, reason="git")
-        indexing["catch_up"].return_value = CatchUp(4, 1, 9)
-        rig.sync.on_catch_up(REPO, T0, reason="git")
-    assert [r.getMessage() for r in caplog.records if r.levelno == logging.INFO] == [
-        f"{REPO}: found 5 files the live watcher missed after a git operation; updated them"
+    assert infos() == [
+        f"{REPO}: checked 3 files changed by a git operation",
+        f"{REPO}: found 2 files the live watcher missed after a git operation; updated them",
     ]
 
 
@@ -236,3 +245,88 @@ def test_running_counts_overlapping_catch_ups(rig, indexing):
     release.set()
     t.join(5)
     assert rig.sync.running == 0
+
+
+def test_a_catch_up_stamps_its_start_not_its_end(rig, indexing):
+    def slow(*a, **k):
+        rig.clock.tick(10)
+        return CatchUp(0, 0, 0)
+
+    indexing["catch_up"].side_effect = slow
+    started = rig.clock.tick()
+    rig.sync.on_catch_up(REPO, T0)
+    assert rig.stamps() == [started]
+
+
+# --- a failed batch whose events waited on the lock (floor = last good stamp)
+
+
+@pytest.fixture
+def real_catch_up(rig, monkeypatch):
+    """sync.catch_up is the real one over rig.root, with the graph stubbed:
+    every walked file is known. Returns the files offered to index_paths."""
+    offered: list[set[str]] = []
+    monkeypatch.setattr(dispatch, "prune_stale_files", lambda *a, **k: 0)
+    monkeypatch.setattr(dispatch, "schema_pending", lambda *a, **k: False)
+    monkeypatch.setattr(
+        dispatch, "_graph_files", lambda *a, **k: {p.name for p in rig.root.iterdir() if p.is_file()}
+    )
+
+    def index(engine, repo_id, root, paths, docs_path=None, mentions_enabled=False):
+        offered.append({p.name for p in paths})
+        return len(paths)
+
+    monkeypatch.setattr(dispatch, "index_paths", index)
+    return offered
+
+
+def _waited_on_the_lock(rig):
+    """a.py edited now, after a last good stamp a minute ago; its batch starts
+    a minute from now (a catch-up held the lock), and fails."""
+    real_now = datetime.now(timezone.utc)
+    last_good = real_now - timedelta(minutes=1)
+    (rig.root / "a.py").write_text("a = 2\n")
+    rig.registry.get.return_value = RepoRecord(REPO, rig.root, True, True, last_good.isoformat(), docs_path=None)
+    rig.clock.now = real_now + timedelta(minutes=1)
+    with patch.object(sync, "index_paths", side_effect=RuntimeError("neo4j down")):
+        rig.sync.on_changes(REPO, {rig.root / "a.py"}, set())
+    return last_good
+
+
+def test_a_failed_batch_is_retried_from_the_last_good_stamp(rig, real_catch_up):
+    last_good = _waited_on_the_lock(rig)
+    assert rig.requests == [(REPO, last_good, FAILURE_RETRY_DELAY_S)]
+    rig.sync.on_catch_up(REPO, last_good, "retry")
+    assert real_catch_up == [{"a.py"}]
+
+
+def test_a_later_batch_stamps_no_later_than_the_last_good_stamp(rig, real_catch_up):
+    last_good = _waited_on_the_lock(rig)
+    (rig.root / "b.py").write_text("b = 1\n")
+    with patch.object(sync, "index_paths", return_value=1):
+        rig.sync.on_changes(REPO, {rig.root / "b.py"}, set())
+    assert rig.stamps() == [last_good]
+    rig.sync.on_catch_up(REPO, rig.stamps()[-1])  # e.g. the next start's catch-up
+    assert "a.py" in real_catch_up[0]
+
+
+def test_repeated_failures_warn_once_then_every_few_minutes_without_a_traceback(rig, indexing, caplog):
+    indexing["index"].side_effect = RuntimeError("neo4j down")
+
+    def warnings():
+        return [(r.exc_info is not None) for r in caplog.records if r.levelno == logging.WARNING]
+
+    with caplog.at_level(logging.DEBUG, logger="devgraph.agent.sync"):
+        rig.sync.on_changes(REPO, {rig.root / "a.py"}, set())
+        rig.clock.tick()
+        rig.sync.on_changes(REPO, {rig.root / "a.py"}, set())
+        assert warnings() == [True]
+        rig.clock.tick(5)
+        rig.sync.on_changes(REPO, {rig.root / "a.py"}, set())
+        assert warnings() == [True, False]
+        indexing["index"].side_effect = None
+        rig.sync.on_catch_up(REPO, T0)  # floor cleared: the streak ends
+        indexing["index"].side_effect = RuntimeError("neo4j down")
+        rig.clock.tick()
+        rig.sync.on_changes(REPO, {rig.root / "a.py"}, set())
+    assert warnings() == [True, False, True]

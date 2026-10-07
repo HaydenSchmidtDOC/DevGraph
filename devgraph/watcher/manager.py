@@ -251,7 +251,7 @@ class WatcherManager:
         # _lock or a batch lock, so request_catch_up can be called from
         # inside a batch.
         self._catch_up_lock = threading.Lock()
-        # repo_id -> [earliest since, reason, timer]
+        # repo_id -> [earliest since, reason, timer, its delay]
         self._catch_up_pending: dict[str, list[Any]] = {}
         # repo_id -> the start-of-watching catch-up's timer, until it fires.
         self._start_catch_ups: dict[str, Any] = {}
@@ -316,7 +316,9 @@ class WatcherManager:
     def request_catch_up(self, repo_id: str, since: datetime, delay_s: float, reason: str = "retry") -> None:
         """Run `on_catch_up(repo_id, since)` in `delay_s`, under the repo's
         batch lock. Requests made before it runs coalesce: the earliest
-        `since` is kept, and so is the first request's timer.
+        `since` is kept, and so is the pending timer, unless the new request
+        asks for a shorter delay than it did (the health loop's immediate
+        retry replaces a failure's 30 s one).
 
         Never takes `_lock` or a batch lock: `RepoSync.on_changes` calls it
         from inside a batch.
@@ -328,13 +330,16 @@ class WatcherManager:
                 return
             entry = self._catch_up_pending.get(repo_id)
             if entry is not None:
-                entry[0] = min(entry[0], since)
-                if reason == "git":
-                    entry[1] = reason
-                return
+                since = min(entry[0], since)
+                if entry[1] == "git":
+                    reason = "git"
+                if delay_s >= entry[3]:
+                    entry[0], entry[1] = since, reason
+                    return
+                entry[2].cancel()
             timer = self._timer_factory(delay_s, lambda: self._run_requested_catch_up(repo_id))
             timer.daemon = True
-            self._catch_up_pending[repo_id] = [since, reason, timer]
+            self._catch_up_pending[repo_id] = [since, reason, timer, delay_s]
             timer.start()
 
     def _run_requested_catch_up(self, repo_id: str) -> None:
@@ -342,7 +347,7 @@ class WatcherManager:
             entry = self._catch_up_pending.pop(repo_id, None)
             if entry is None or self._catch_up_stopped:
                 return
-        since, reason, _timer = entry
+        since, reason = entry[0], entry[1]
 
         def run() -> None:
             if not self._catch_up_stopped:
@@ -365,6 +370,8 @@ class WatcherManager:
                 return
 
         def run() -> None:
+            if self._catch_up_stopped:
+                return  # paused while waiting for the lock
             since = snapshot if snapshot is not None else self._last_indexed(repo_id)
             if since is None:
                 logger.info('DevGraph hasn\'t indexed %s yet; run "devgraph rescan %s"', repo_id, repo_id)
@@ -480,8 +487,14 @@ class WatcherManager:
             )
             # Non-recursive watch on .git itself (catches HEAD, packed-refs)
             observer.schedule(git_handler, str(git_dir), recursive=False)
-            # Recursive watch on .git/refs/heads if it exists
-            refs_heads = git_dir / "refs" / "heads"
+            # Non-recursive watch on .git/refs (refs/stash: `git stash pop`
+            # moves neither HEAD nor a branch), and a recursive one on
+            # .git/refs/heads. Remote-tracking refs and tags stay unwatched,
+            # so a background fetch triggers nothing.
+            refs = git_dir / "refs"
+            if refs.is_dir():
+                observer.schedule(git_handler, str(refs), recursive=False)
+            refs_heads = refs / "heads"
             if refs_heads.is_dir():
                 observer.schedule(git_handler, str(refs_heads), recursive=True)
             self._git_handlers[repo.repo_id] = git_handler
