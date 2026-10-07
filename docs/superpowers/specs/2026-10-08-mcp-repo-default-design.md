@@ -19,7 +19,7 @@ working directory, else none. Project tools inject it. Built-ins ignore it.
 
 ## Goal
 
-- A built-in called without `repo_id` runs against the session's repository, and the response says which one was used.
+- A built-in called without `repo_id` runs against the session's repository. A dict response says which repository was used. The two list-returning built-ins can't carry a key, so the server instructions name the repository instead (R5).
 - A built-in called with `repo_id` behaves exactly as it does today, byte for byte.
 - When there is no session repository, a call without `repo_id` fails with an error that lists the registered repositories. It never picks one.
 - No new config knob and no new dependency.
@@ -39,14 +39,16 @@ working directory, else none. Project tools inject it. Built-ins ignore it.
 ### R1: resolution order
 
 1. **Explicit argument wins.** Any value other than JSON `null`, including `""`, an unregistered id or another repository's id, is passed through untouched. Explicit values are not validated, because validation would change today's explicit calls (R3).
-2. **Session repository.** It is used when `repo_id` is omitted or `null`.
+2. **Session repository.** It is used when `repo_id` is omitted or `null`, provided it is still active. On this path the wrapper makes one `registry.list_repos(active_only=True)` read at call time. If the session repository's id is not among the results, the call fails (R1.3) with the reason `session repository '<id>' is no longer registered or active`. Explicit calls never make this read.
 3. **Error.** Otherwise the call fails as an MCP tool error (`ToolError`, as in `tool_plane._failure`) and the tool body never runs. The message:
    - says `repo_id` is required because this session has no repository;
    - gives the reason, which is one of:
      - `DEVGRAPH_MCP_REPO=<value>` matches no registered repository;
      - it names an inactive one;
      - the server's working directory is not inside a registered repository and `DEVGRAPH_MCP_REPO` is unset;
-   - lists the active registered repositories as `id (name)`, read from the registry at call time, or says there are none.
+     - the session repository is no longer registered or active (R1.2);
+   - lists the active registered repositories as `id (name)`, read from the registry at call time, or says there are none and points at `devgraph add`;
+   - ends with: `pass repo_id explicitly, or restart the MCP server after registering a repository`. The session repository is resolved only at startup, so a repository registered later is not picked up without a restart.
 
 The edge cases all follow from R2:
 
@@ -57,6 +59,7 @@ The edge cases all follow from R2:
 | cwd inside a registered repository nested in another registered one | the deepest (inner) repository | `_deepest_containing`. The cwd is closest to the inner one. |
 | cwd inside an *unregistered* nested repository (for example a submodule) inside a registered one | the registered outer repository | Only registered repositories can be chosen. The outer one is what the user registered, and the notice names it. |
 | absolute `DEVGRAPH_MCP_REPO` path inside nested registered repositories | the deepest | Same rule as cwd. |
+| session repository unregistered or deactivated after startup | error: "no longer registered or active", listing the active repositories | One registry read per defaulted call. A silent empty answer is what this slice exists to remove. |
 | exactly one repository registered and no session repository | error, listing that one | Never "any repo" (R6). The cost is one retry with the listed id. |
 | project config disabled, or the tools file untrusted | the default still applies | The default is not project config. It reads no file in the repository. |
 | `cross_repo=true` without `repo_id` | defaults or errors as above | Several built-ins still use `repo_id` with `cross_repo` (declared labels in `search_component`, the git root in `impact_analysis_for_diff`), so they still need a home repository. |
@@ -66,9 +69,11 @@ The edge cases all follow from R2:
 `build_server` already takes `session_repo`, `session_source` and
 `session_pinned`, and `main()` fills them from `resolve_session_repo`. The
 default reuses those values. The session repository is fixed for the life of
-the process. Tools-file reloads do not change it, and neither does registry
-churn: a repository unregistered mid-session still defaults by its old id and
-returns empty results, exactly as an explicit stale id does today.
+the process. Nothing re-resolves it: tools-file reloads don't, registry changes
+don't, and there is no cwd fallback. The one call-time check is R1.2's: a
+defaulted call confirms that the session repository is still active, and errors
+if it is not. It never picks a replacement. An explicit stale id still returns
+empty results, as it does today.
 
 ### R3: schemas
 
@@ -107,7 +112,7 @@ built-in's input schema.
   - `repo_id` gets the annotation `str | None` and the default `None`.
 
   The SDK reads this signature through `functools.wraps`' `__wrapped__` chain, so the schema delta is exactly R3.
-- **Call.** With `repo_id` present and not `None`, the wrapper calls `fn(**kwargs)` and returns its result object untouched. Otherwise it substitutes the session repository (R5) or raises (R1.3).
+- **Call.** With `repo_id` present and not `None`, the wrapper calls `fn(**kwargs)` and returns its result object untouched. Otherwise it checks that the session repository is still active (R1.2), then substitutes it (R5). If there is no session repository, or it is no longer active, it raises (R1.3).
 - **Unchanged definitions.** The 24 definitions keep `repo_id: str` and their bodies. A built-in added later gets the default by being registered.
 - **Instrumentation and telemetry.** Instrumentation still sees the original name. Telemetry still records no arguments and no defaulted id (`_TELEMETRY_FIELDS` is unchanged). A raised error is recorded as `ok: false`.
 
@@ -116,7 +121,7 @@ built-in's input schema.
 - **Defaulted dict response.** It returns `{**result, "repo_id": "<id>", "notices": [...existing, notice]}`. No built-in's dict result has a top-level `repo_id` today: `summarise_repository` uses `repo_name`. `notices` is the key `_with_shadow_notices` already uses, and that wrapper appends to it, so both kinds of notice coexist. The `count`/`results`/`truncated` envelopes are untouched.
 - **Notice wording:** `repo_id not given; used this session's repository '<id>' (from DEVGRAPH_MCP_REPO)`, or `(from the server's working directory)`.
 - **Defaulted list response** (`find_requirements_for`, `blame_component`). It is returned unchanged, because a list can't carry a key without changing its envelope. This is the same limit the shadow notices accept. These two tools rely on the instructions below.
-- **Instructions.** The server `instructions` (sent once at session start) name the session repository and its source when there is one, for example "This session's repository is `<id>`; built-in tools use it when repo_id is omitted." With no session repository they say `repo_id` is required and point at `devgraph list`. The `devgraph://project-tools` resource already reports `scope.repo_id` and `scope.source`.
+- **Instructions.** The current sentence in `build_server`'s `instructions` (server.py about lines 320–322), "Every built-in tool takes a repo_id (the id shown by `devgraph list`) and defaults to that repo only", is rewritten so it does not contradict the default. The `cross_repo` rule that follows it stays. The `instructions` (sent once at session start) name the session repository and its source when there is one, for example "This session's repository is `<id>`; built-in tools use it when repo_id is omitted." With no session repository they say `repo_id` is required and point at `devgraph list`. The `devgraph://project-tools` resource already reports `scope.repo_id` and `scope.source`.
 - **Explicit calls** get no `repo_id` key and no notice, even when the value equals the session repository.
 
 ### R6: safety
@@ -141,7 +146,8 @@ built-in's input schema.
 
 - **DEVGRAPH-CLIENT.md** (around lines 209–211). Replace "Always pass this repo's `repo_id`" with:
   - built-ins default to the session's repository;
-  - a defaulted response carries `repo_id` and a notice, so check it;
+  - a defaulted dict response carries `repo_id` and a notice, so check it;
+  - `find_requirements_for` and `blame_component` return lists, which carry no notice; for those, the session repository is the one named in the server instructions and in `devgraph://project-tools`;
   - pass `repo_id` explicitly only for a different repository, or when the session has none (the error lists them);
   - `cross_repo` guidance is unchanged.
 
