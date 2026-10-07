@@ -17,6 +17,7 @@ from mcp.server.mcpserver.utilities.func_metadata import func_metadata
 from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
 from devgraph.mcp import tools as devgraph_tools
+from devgraph.mcp.tool_plane import SESSION_REPO_ENV, resolve_session_repo
 
 
 @dataclass
@@ -40,8 +41,15 @@ class Registry:
 
 
 class Engine:
+    def __init__(self):
+        self.read_calls = []
+
     def run_cypher(self, query, params=None):
         return []
+
+    def run_read_cypher(self, query, parameters, *, timeout_s, max_rows):
+        self.read_calls.append(dict(parameters))
+        return [], False
 
 
 DICT_PAYLOAD = {"count": 1, "results": [{"name": "X"}], "truncated": False}
@@ -117,10 +125,14 @@ def calls(monkeypatch):
 
 
 @pytest.fixture
-def make_server(tmp_path, monkeypatch):
+def engine():
+    return Engine()
+
+
+@pytest.fixture
+def make_server(tmp_path, monkeypatch, engine):
     settings = Settings(registry_db_path=tmp_path / "r.sqlite3", enable_run_cypher=True)
     monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
-    engine = Engine()
 
     def make(session_repo=None, session_source="none", registry=None, session_pinned=None):
         if registry is None:
@@ -318,3 +330,277 @@ def test_run_cypher_is_unchanged(tmp_path, make_server):
     listed = listed_schemas(server)["run_cypher"]
     assert listed == original
     assert listed["required"] == ["query"]
+
+
+# ── resolution branches, through the production resolution ────────────────
+
+SHADOW_NOTICE = "ignored: project tool 'search_component' shadows a locked tool; using the fixed implementation"
+TOOLS_YAML = """version: 1
+tools:
+  - name: list_folder
+    description: List the files directly inside a folder.
+    cypher: |
+      MATCH (f:File {repo_id: $repo_id}) WHERE f.path STARTS WITH $folder RETURN f.path AS path
+    parameters:
+      - name: folder
+        description: Folder path.
+  - name: search_component
+    description: Shadows a built-in.
+    cypher: |
+      MATCH (n {repo_id: $repo_id}) RETURN n.name AS name
+"""
+
+
+@pytest.fixture
+def resolved(make_server):
+    """A server whose session comes from the real `resolve_session_repo(registry, env, cwd)`, as in main()."""
+
+    def make(registry, env, cwd):
+        session, source = resolve_session_repo(registry, env, cwd)
+        return make_server(session, source, registry, env.get(SESSION_REPO_ENV))
+
+    return make
+
+
+def unscoped_scenario(kind, tmp_path):
+    """(registry, env, cwd) for each way a session ends up with no repository."""
+    a = demo(tmp_path, "a")
+    if kind == "unmatched_pin":
+        return Registry([a]), {SESSION_REPO_ENV: "nope"}, a.path
+    if kind == "inactive_pin":
+        return Registry([a, demo(tmp_path, "old", active=False)]), {SESSION_REPO_ENV: "old"}, a.path
+    if kind == "no_cwd_match":
+        return Registry([a, demo(tmp_path, "b")]), {}, tmp_path
+    if kind == "one_repo":
+        return Registry([a]), {}, tmp_path
+    if kind == "none_registered":
+        return Registry([]), {}, tmp_path
+    raise AssertionError(kind)
+
+
+UNSCOPED = ["unmatched_pin", "inactive_pin", "no_cwd_match", "one_repo", "none_registered"]
+
+
+def unscoped_error_text(server):
+    result = call_over_wire(server, "search_component", {"query": "X"})
+    assert result.is_error is True
+    return error_text(result)
+
+
+@pytest.mark.parametrize("kind", UNSCOPED)
+def test_every_unscoped_error_has_the_restart_hint_and_runs_nothing(kind, tmp_path, calls, resolved):
+    server = resolved(*unscoped_scenario(kind, tmp_path))
+    text = unscoped_error_text(server)
+    assert "repo_id is required because this session has no repository" in text
+    assert RESTART_HINT in text
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "kind, expected",
+    [
+        ("unmatched_pin", "DEVGRAPH_MCP_REPO='nope' matches no registered repository"),
+        ("inactive_pin", "DEVGRAPH_MCP_REPO='old' names repository 'old', which is registered but inactive"),
+        ("no_cwd_match", "the server's working directory is not inside a registered repository and DEVGRAPH_MCP_REPO is unset"),
+        ("none_registered", "Active registered repositories: none registered (register one with `devgraph add <path>`)"),
+    ],
+)
+def test_each_no_session_reason_is_stated(kind, expected, tmp_path, calls, resolved):
+    assert expected in unscoped_error_text(resolved(*unscoped_scenario(kind, tmp_path)))
+
+
+def test_unmatched_pin_errors_without_cwd_fallback(tmp_path, calls, resolved):
+    text = unscoped_error_text(resolved(*unscoped_scenario("unmatched_pin", tmp_path)))
+    assert "DEVGRAPH_MCP_REPO='nope'" in text and "matches no registered repository" in text
+    assert "a (" in text
+    assert calls == []
+
+
+def test_inactive_pin_says_inactive_and_does_not_list_it(tmp_path, calls, resolved):
+    text = unscoped_error_text(resolved(*unscoped_scenario("inactive_pin", tmp_path)))
+    assert "inactive" in text
+    assert "a (a)" in text and "old (" not in text
+
+
+def test_no_cwd_match_names_the_working_directory_and_the_env_var(tmp_path, calls, resolved):
+    text = unscoped_error_text(resolved(*unscoped_scenario("no_cwd_match", tmp_path)))
+    assert "working directory" in text and "DEVGRAPH_MCP_REPO" in text
+    assert "a (a)" in text and "b (b)" in text
+
+
+def test_one_registered_repo_is_listed_not_picked(tmp_path, calls, resolved):
+    text = unscoped_error_text(resolved(*unscoped_scenario("one_repo", tmp_path)))
+    assert "a (a)" in text
+    assert calls == []
+
+
+def test_no_registered_repos_points_at_devgraph_add(tmp_path, calls, resolved):
+    text = unscoped_error_text(resolved(*unscoped_scenario("none_registered", tmp_path)))
+    assert "none registered" in text and "devgraph add" in text
+    assert RESTART_HINT in text
+
+
+@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("kind", UNSCOPED)
+def test_explicit_wins_over_every_unscoped_branch(kind, name, tmp_path, calls, resolved, make_server):
+    registry, env, cwd = unscoped_scenario(kind, tmp_path)
+    unscoped = resolved(registry, env, cwd)
+    baseline = make_server(None, "none", registry)
+    dumps, recorded = [], []
+    for server in (unscoped, baseline):
+        calls.clear()
+        result = call(server, name, {"repo_id": "a", **MIN_ARGS[name]})
+        assert result.is_error is False
+        assert result.structured_content == structured(name)
+        assert "notices" not in (result.structured_content or {})
+        (seen_name, args, kwargs), = calls
+        assert seen_name == name and args[REPO_ARG_INDEX[name]] == "a"
+        recorded.append((args, kwargs))
+        dumps.append(result.model_dump_json())
+    assert recorded[0] == recorded[1]
+    assert dumps[0] == dumps[1]
+
+
+def nested(tmp_path):
+    outer, inner = demo(tmp_path, "outer"), Repo("inner", tmp_path / "outer" / "inner")
+    (inner.path / "src").mkdir(parents=True)
+    return outer, inner, Registry([outer, inner])
+
+
+def defaulted_repo(server, calls):
+    calls.clear()
+    result = call(server, "search_component", {"query": "X"})
+    assert result.is_error is False
+    (_, args, _), = calls
+    assert args[1] == result.structured_content["repo_id"]
+    return result.structured_content["repo_id"]
+
+
+def test_nested_registered_repos_default_to_the_deepest(tmp_path, calls, resolved):
+    outer, inner, registry = nested(tmp_path)
+    assert defaulted_repo(resolved(registry, {}, inner.path / "src"), calls) == "inner"
+    assert defaulted_repo(resolved(registry, {}, outer.path), calls) == "outer"
+    assert defaulted_repo(resolved(registry, {SESSION_REPO_ENV: str(inner.path / "src")}, tmp_path), calls) == "inner"
+
+
+def test_an_unregistered_nested_repo_defaults_to_the_registered_outer(tmp_path, calls, resolved):
+    outer = demo(tmp_path, "outer")
+    sub = outer.path / "vendor" / "sub"
+    (sub / ".git").mkdir(parents=True)
+    assert defaulted_repo(resolved(Registry([outer]), {}, sub), calls) == "outer"
+
+
+# ── composition with the project plane ─────────────────────────────────────
+
+
+def test_disabled_project_config_does_not_gate_the_default(tmp_path, calls, resolved, monkeypatch):
+    from devgraph.mcp import tool_plane
+
+    monkeypatch.setattr(tool_plane, "project_config_enabled", lambda _path: False)
+    session = demo(tmp_path)
+    (session.path / "devgraph.tools.yaml").write_text(TOOLS_YAML)
+    server = resolved(Registry([session]), {}, session.path)
+    assert json.loads(asyncio.run(server.read_resource("devgraph://project-tools"))[0].content)["served"] == []
+    assert defaulted_repo(server, calls) == "demo"
+
+
+def test_an_untrusted_tools_file_does_not_gate_the_default(tmp_path, calls, resolved):
+    session = demo(tmp_path)
+    (session.path / "devgraph.tools.yaml").write_text(TOOLS_YAML)
+    server = resolved(Registry([session]), {}, session.path)
+    assert "list_folder" not in {t.name for t in asyncio.run(server.list_tools())}
+    assert defaulted_repo(server, calls) == "demo"
+
+
+def test_cross_repo_without_repo_id_defaults_when_scoped(tmp_path, calls, resolved):
+    session = demo(tmp_path)
+    server = resolved(Registry([session]), {}, session.path)
+    result = call(server, "search_component", {"query": "X", "cross_repo": True})
+    assert result.structured_content["repo_id"] == "demo"
+    (_, args, _), = calls
+    assert args[1] == "demo" and args[3] is True
+
+
+def test_cross_repo_without_repo_id_errors_when_unscoped(tmp_path, calls, resolved):
+    server = resolved(*unscoped_scenario("no_cwd_match", tmp_path))
+    result = call_over_wire(server, "search_component", {"query": "X", "cross_repo": True})
+    assert result.is_error is True and RESTART_HINT in error_text(result)
+    assert calls == []
+
+
+@pytest.mark.usefixtures("trusted_project_tools")
+def test_shadow_and_default_notices_coexist(tmp_path, calls, resolved):
+    session = demo(tmp_path)
+    (session.path / "devgraph.tools.yaml").write_text(TOOLS_YAML)
+    server = resolved(Registry([session]), {}, session.path)
+    result = call(server, "search_component", {"query": "X"})
+    # The default notice comes first: which repository answered matters most.
+    assert result.structured_content["notices"] == [CWD_NOTICE, SHADOW_NOTICE]
+
+
+@pytest.mark.usefixtures("trusted_project_tools")
+def test_both_planes_use_the_same_session_repo(tmp_path, calls, resolved, engine):
+    session = demo(tmp_path)
+    (session.path / "devgraph.tools.yaml").write_text(TOOLS_YAML)
+    server = resolved(Registry([session]), {}, session.path)
+    builtin = call(server, "search_component", {"query": "X"})
+    project = call(server, "list_folder", {"folder": "src"})
+    assert project.is_error is False
+    (params,) = engine.read_calls
+    assert builtin.structured_content["repo_id"] == params["repo_id"] == "demo"
+
+
+@pytest.mark.usefixtures("trusted_project_tools")
+def test_a_tools_file_reload_keeps_the_default(tmp_path, calls, resolved):
+    session = demo(tmp_path)
+    tools_file = session.path / "devgraph.tools.yaml"
+    tools_file.write_text(TOOLS_YAML)
+    server = resolved(Registry([session]), {}, session.path)
+    tools_file.write_text(TOOLS_YAML.replace("Folder path.", "Changed."))
+    assert server.devgraph_tool_plane.reload_if_changed() is True
+    assert defaulted_repo(server, calls) == "demo"
+
+
+# ── telemetry ──────────────────────────────────────────────────────────────
+
+
+def telemetry_lines():
+    path = mcp_server.telemetry_path()
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
+def test_a_defaulted_call_records_no_repo_id(tmp_path, calls, make_server):
+    server = make_server(demo(tmp_path), "env")
+    call(server, "god_nodes", {})
+    (line,) = telemetry_lines()
+    assert set(json.loads(line)) == set(mcp_server._TELEMETRY_FIELDS)
+    assert "demo" not in line
+
+
+def test_an_unscoped_error_records_a_failure(tmp_path, calls, resolved):
+    server = resolved(*unscoped_scenario("no_cwd_match", tmp_path))
+    call_over_wire(server, "god_nodes", {})
+    (line,) = telemetry_lines()
+    assert json.loads(line)["ok"] is False
+
+
+# ── instructions ───────────────────────────────────────────────────────────
+
+CROSS_REPO_RULE = "pass cross_repo=true only when the user explicitly wants results across multiple registered repositories"
+
+
+@pytest.mark.parametrize("source, named", [("env", "DEVGRAPH_MCP_REPO"), ("cwd", "the server's working directory")])
+def test_scoped_instructions_name_the_session_repo_and_source(source, named, tmp_path, make_server):
+    instructions = make_server(demo(tmp_path), source).instructions
+    assert "'demo'" in instructions and named in instructions
+    assert "defaults to that repo only" not in instructions
+    assert CROSS_REPO_RULE in instructions
+
+
+def test_unscoped_instructions_require_repo_id(tmp_path, make_server):
+    registry = Registry([demo(tmp_path, "alpha")])
+    instructions = make_server(None, "none", registry).instructions
+    assert "repo_id" in instructions and "devgraph list" in instructions
+    assert "alpha" not in instructions and "demo" not in instructions
+    assert "defaults to that repo only" not in instructions
+    assert CROSS_REPO_RULE in instructions

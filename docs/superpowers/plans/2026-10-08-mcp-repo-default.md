@@ -19,7 +19,7 @@
   - Everything else in every listed tool is equal to what the original function's signature produces: the other properties and their order, the rest of `required`, descriptions, annotations and names.
   - `run_cypher`, project tools and global tools are unchanged.
 - **Tool definitions unchanged (R4).** The 24 `@server.tool` functions keep `repo_id: str` and their bodies. The change lives in one wrapper inside `_instrumented_tool`.
-- **Envelopes kept (R5).** A defaulted dict response gains only `repo_id` and one `notices` entry (appended after the shadow notices, never replacing them). A defaulted list response is unchanged.
+- **Envelopes kept (R5).** A defaulted dict response gains only `repo_id` and one `notices` entry (added before the shadow notices, never replacing them: the default wrapper is innermost). A defaulted list response is unchanged.
 - **Telemetry unchanged.** No argument and no defaulted id is ever recorded. `_TELEMETRY_FIELDS` and the existing telemetry tests are untouched. A default error is recorded as `ok: false`.
 - **Messages** use the spec's R1.3 and R5 wording.
 - **No new config knob, no new dependency.**
@@ -147,7 +147,7 @@ Each item names the test that proves it.
     - With `devgraph config disable` in effect (`project_config_enabled` → False) the default still applies.
     - With an untrusted `devgraph.tools.yaml` (the default conftest state) it also applies.
   - **`cross_repo=true` without `repo_id`.** It defaults when scoped, and errors when unscoped.
-  - **`test_shadow_and_default_notices_coexist`.** A trusted tools file declares `search_component` (like `test_tool_plane.TOOLS`). A defaulted `search_component` call gives `notices == [<shadow notice>, <default notice>]`.
+  - **`test_shadow_and_default_notices_coexist`.** A trusted tools file declares `search_component` (like `test_tool_plane.TOOLS`). A defaulted `search_component` call gives `notices == [<default notice>, <shadow notice>]`.
   - **Same repository across planes.**
     - In one session scoped by cwd to `demo`, with a trusted tools file declaring `list_folder` (as in `test_tool_plane.TOOLS`):
       - the `repo_id` key of a defaulted `search_component` response;

@@ -47,7 +47,7 @@ working directory, else none. Project tools inject it. Built-ins ignore it.
      - it names an inactive one;
      - the server's working directory is not inside a registered repository and `DEVGRAPH_MCP_REPO` is unset;
      - the session repository is no longer registered or active (R1.2);
-   - lists the active registered repositories as `id (name)`, read from the registry at call time, or says there are none and points at `devgraph add`;
+   - lists the active registered repositories as `id (name)`, where `name` is the repository's folder name (a registry record has no name field), read from the registry at call time, or says there are none and points at `devgraph add`;
    - ends with: `pass repo_id explicitly, or restart the MCP server after registering a repository`. The session repository is resolved only at startup, so a repository registered later is not picked up without a restart.
 
 The edge cases all follow from R2:
@@ -104,7 +104,7 @@ built-in's input schema.
 
 ### R4: where it plugs in
 
-- **New wrapper.** A new `_with_repo_default(fn, ...)` in `server.py` is applied inside `_instrumented_tool`, innermost. The chain becomes `_instrument(_with_shadow_notices(_with_repo_default(fn)))`.
+- **New wrapper.** A new `_with_repo_default(fn, ...)` in `server.py` is applied inside `_instrumented_tool`, innermost. The chain becomes `_instrument(_with_shadow_notices(_with_repo_default(fn)))`. Because the default wrapper is innermost, its notice is added first and the shadow wrapper appends after it, so a defaulted, shadowed call's `notices` is `[default notice, shadow notices...]`. The repository choice comes first because it is what the assistant most needs.
 - **Functions without `repo_id`.** For a function with no `repo_id` parameter (`run_cypher`), the wrapper returns it unchanged.
 - **Signature.** Otherwise the wrapper sets `__signature__`:
   - it starts from `inspect.signature(fn, eval_str=True)`;
@@ -118,7 +118,7 @@ built-in's input schema.
 
 ### R5: transparency
 
-- **Defaulted dict response.** It returns `{**result, "repo_id": "<id>", "notices": [...existing, notice]}`. No built-in's dict result has a top-level `repo_id` today: `summarise_repository` uses `repo_name`. `notices` is the key `_with_shadow_notices` already uses, and that wrapper appends to it, so both kinds of notice coexist. The `count`/`results`/`truncated` envelopes are untouched.
+- **Defaulted dict response.** It returns `{**result, "repo_id": "<id>", "notices": [...existing, notice]}`. No built-in's dict result has a top-level `repo_id` today: `summarise_repository` uses `repo_name`. `notices` is the key `_with_shadow_notices` already uses, and that wrapper appends to it, so both kinds of notice coexist, the default notice first (R4). The `count`/`results`/`truncated` envelopes are untouched.
 - **Notice wording:** `repo_id not given; used this session's repository '<id>' (from DEVGRAPH_MCP_REPO)`, or `(from the server's working directory)`.
 - **Defaulted list response** (`find_requirements_for`, `blame_component`). It is returned unchanged, because a list can't carry a key without changing its envelope. This is the same limit the shadow notices accept. These two tools rely on the instructions below.
 - **Instructions.** The current sentence in `build_server`'s `instructions` (server.py about lines 320–322), "Every built-in tool takes a repo_id (the id shown by `devgraph list`) and defaults to that repo only", is rewritten so it does not contradict the default. The `cross_repo` rule that follows it stays. The `instructions` (sent once at session start) name the session repository and its source when there is one, for example "This session's repository is `<id>`; built-in tools use it when repo_id is omitted." With no session repository they say `repo_id` is required and point at `devgraph list`. The `devgraph://project-tools` resource already reports `scope.repo_id` and `scope.source`.

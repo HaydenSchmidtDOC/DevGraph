@@ -24,6 +24,12 @@ a human copy-pasting a doc into another repo's CLAUDE.md/AGENTS.md:
     it can never drift out of sync with the actual tool surface since it's
     served from the same process that registers the tools.
 
+Built-in tools take an optional `repo_id`. Omitted, it defaults to this
+session's repository (`DEVGRAPH_MCP_REPO`, else the working directory; see
+`resolve_session_repo`), which the `instructions` name; a defaulted dict
+response carries `repo_id` and a notice. With no session repository the call
+errors and lists the registered repositories rather than picking one.
+
 Every tool call is recorded, metadata only (timestamp, tool name, scoped tool
 id, origin, duration, success), to a local JSONL store in the DevGraph state directory —
 see `record_tool_call` below. It exists because this process is short-lived
@@ -296,6 +302,7 @@ _SESSION_SOURCES = {"env": SESSION_REPO_ENV, "cwd": "the server's working direct
 def _unscoped_error(reason: str, active_repos: list[Any]) -> ToolError:
     """Why a call without repo_id can't run: the reason, the active repositories, and how to fix it."""
     if active_repos:
+        # `name` in `id (name)` is the repository's folder name: RepoRecord has no name field.
         listed = ", ".join(f"{r.repo_id} ({Path(r.path).name})" for r in active_repos)
     else:
         listed = "none registered (register one with `devgraph add <path>`)"
@@ -374,11 +381,27 @@ def build_server(
     `devgraph.tools.yaml` tools for (None serves none); `session_source` says
     how it was chosen ("env", "cwd" or "none") and is reported by the
     `devgraph://project-tools` resource. `session_pinned` is the raw
-    DEVGRAPH_MCP_REPO value, used only in the unmatched-value notice.
+    DEVGRAPH_MCP_REPO value, used only in the unmatched-value notice and the
+    no-session error.
+
+    The same `session_repo` is the default `repo_id` for every built-in tool
+    called without one (see `_with_repo_default`), and the `instructions` name
+    it. With no session repository, such a call errors; it never picks one.
     """
     settings = get_settings()
     if registry is None:
         registry = RepoRegistry(settings.registry_db_path)
+    if session_repo is not None:
+        repo_scope = (
+            f"This session's repository is {session_repo.repo_id!r} (from {_SESSION_SOURCES[session_source]}); "
+            "built-in tools use it when repo_id is omitted, and a dict response then carries repo_id "
+            "and a notice. Pass repo_id (the id shown by `devgraph list`) only for a different repository."
+        )
+    else:
+        repo_scope = (
+            "This session has no repository, so every built-in tool requires a repo_id "
+            "(the id shown by `devgraph list`)."
+        )
     server = MCPServer(
         name="devgraph",
         version="0.1.0",
@@ -386,8 +409,8 @@ def build_server(
             "DevGraph: a local architecture knowledge graph for explicitly-registered "
             "repositories. Prefer these tools over reading source files directly when "
             "answering structural/dependency/history questions — they query a "
-            "pre-built graph instead of re-scanning the repo. Every built-in tool takes a "
-            "repo_id (the id shown by `devgraph list`) and defaults to that repo only; "
+            f"pre-built graph instead of re-scanning the repo. {repo_scope} Built-in tools answer "
+            "for a single repository; "
             "pass cross_repo=true only when the user explicitly wants results across "
             "multiple registered repositories. Project-specific tools declared in a "
             "repository's devgraph.tools.yaml (served only once the user trusts the file) are "
