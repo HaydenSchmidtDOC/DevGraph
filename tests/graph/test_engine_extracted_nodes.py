@@ -188,7 +188,7 @@ def test_clear_properties_removes_undeclared_and_keeps_declared_reserved_and_ins
     assert removed == ["old_field", "severity"]
     assert "only_on_filesystem" not in removed
     assert keys_of(engine, REPO, "Runbook", "rb/a.md") == [
-        "extractor", "insight_pagerank", "name", "owner", "path", "repo_id", "source", "sources",
+        "claims", "extractor", "insight_pagerank", "name", "owner", "path", "repo_id", "source", "sources",
     ]
     assert "old_field" in keys_of(engine, REPO, "Guide", "g.md")
     assert "old_field" in keys_of(engine, REPO, "Runbook", "fs.md")

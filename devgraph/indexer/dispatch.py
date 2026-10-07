@@ -611,11 +611,12 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # (label, name) of the Service nodes the batch's compose files wrote.
     batch_services: set[tuple[str, str]] = set()
 
-    # Process files in a fixed order, not set order. Shared nodes
-    # (Datastore/Endpoint) keep the last writer's `source`/`library` and
-    # accumulate `sources` in claim order -- so iterating the set directly
-    # made the graph depend on PYTHONHASHSEED. (Cross-file edges no longer
-    # depend on order: they are re-resolved in the passes after this loop.)
+    # Process files in a fixed order, not set order, so a batch never
+    # depends on PYTHONHASHSEED. Shared nodes (Datastore/Endpoint) no longer
+    # depend on it: they take `source`/`library` from the claim of the
+    # alphabetically first file in `sources`, kept sorted, whatever order the
+    # files claim them in (see engine._claim_nodes_tx). Cross-file edges don't
+    # either: they are re-resolved in the passes after this loop.
     # Each path is resolved once and the batch is sorted by its
     # repo-relative POSIX path, so the order is the same however the caller
     # spelled a path (relative, absolute, through a symlink).
