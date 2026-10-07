@@ -411,6 +411,48 @@ class TestRemovePaths:
         finally:
             engine.delete_repository(repo_id)
 
+    def test_a_deleted_service_folder_unclaims_its_dockerfile(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_remove_dockerfile_dir"
+        fresh = f"{repo_id}_fresh"
+        (temp_repo / "svc").mkdir()
+        (temp_repo / "svc" / "Dockerfile").write_text("FROM python:3.12\n")
+        (temp_repo / "Containerfile").write_text("FROM postgres:16\n")
+        try:
+            full_scan(engine, repo_id, temp_repo)
+            assert _claimed_by(engine, repo_id, "svc/Dockerfile")
+            shutil.rmtree(temp_repo / "svc")
+            remove_paths(engine, repo_id, temp_repo, {temp_repo / "svc"})
+            assert not _claimed_by(engine, repo_id, "svc/Dockerfile")
+            full_scan(engine, fresh, temp_repo)
+            assert _graph(engine, repo_id) == _graph(engine, fresh)
+        finally:
+            engine.delete_repository(repo_id)
+            engine.delete_repository(fresh)
+
+    def test_a_containerfile_deleted_while_away_is_pruned(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_prune_containerfile"
+        fresh = f"{repo_id}_fresh"
+        (temp_repo / "Containerfile").write_text("FROM python:3.12\n")
+        (temp_repo / "app.py").write_text("def main():\n    pass\n")
+        try:
+            full_scan(engine, repo_id, temp_repo)
+            assert _claimed_by(engine, repo_id, "Containerfile")
+            (temp_repo / "Containerfile").unlink()
+            assert dispatch.prune_stale_files(engine, repo_id, temp_repo) == 1
+            assert not _claimed_by(engine, repo_id, "Containerfile")
+            full_scan(engine, fresh, temp_repo)
+            assert _graph(engine, repo_id) == _graph(engine, fresh)
+        finally:
+            engine.delete_repository(repo_id)
+            engine.delete_repository(fresh)
+
+
+def _claimed_by(engine, repo_id, source):
+    return engine.run_cypher(
+        "MATCH (n {repo_id: $r}) WHERE $s IN coalesce(n.sources, [n.source]) RETURN n.name AS n",
+        {"r": repo_id, "s": source},
+    )
+
 
 def _graph(engine, repo_id):
     nodes = engine.run_cypher(
@@ -1400,6 +1442,9 @@ def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
 
         def read_applied_schema(self, repo_id):
             return None
+
+        def list_claim_sources(self, repo_id):
+            return set()
 
     assert dispatch.prune_stale_files(FakeEngine(), "r", repo) == 1
     assert removed == [{repo / "gone.py"}]

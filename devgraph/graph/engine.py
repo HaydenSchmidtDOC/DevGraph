@@ -30,8 +30,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 logger = logging.getLogger(__name__)
 
 # What identifies a provider-owned node: never cleared, whatever the schema keeps.
-# `claims` is the shared-node bookkeeping beside `sources` (see _claims_of).
-_EXTRACTED_IDENTITY_PROPERTIES = RESERVED_NODE_PROPERTIES | {"path", "claims"}
+_EXTRACTED_IDENTITY_PROPERTIES = RESERVED_NODE_PROPERTIES | {"path"}
 
 # Shared by delete_nodes_by_source_file and _replace_file_nodes_tx.
 #
@@ -51,11 +50,16 @@ _DELETE_BY_SOURCE_FILE_CYPHER = (
     "DETACH DELETE n"
 )
 
+# A shared node's claims are read under its write lock (the no-op SET takes
+# it), so concurrent claims and unclaims of one node run one after another
+# instead of each overwriting the others from a stale read.
+_LOCK_AND_READ = "SET n.name = n.name RETURN elementId(n) AS id, properties(n) AS props"
+
 _UNCLAIM_SOURCE_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) "
     "WHERE n.file IS NULL AND n.source_file IS NULL "
     "  AND (n.source = $file_name OR $file_name IN coalesce(n.sources, [])) "
-    "RETURN elementId(n) AS id, properties(n) AS props"
+    + _LOCK_AND_READ
 )
 
 # Shared nodes are attributed to their first source, whatever order the files
@@ -63,8 +67,9 @@ _UNCLAIM_SOURCE_CYPHER = (
 # map properties) of {source: the properties that source wrote}; `sources`
 # is its sorted keys, and the node's written properties are exactly
 # claims[min(sources)]. Both directions run read-modify-write in Python inside
-# one write transaction. These properties are never part of a claim: the
-# identity, the bookkeeping itself, and what other passes write.
+# one write transaction, under the node's lock, and write back only the
+# properties the claim changed. These properties are never part of a claim:
+# the identity, the bookkeeping itself, and what other passes write.
 _UNCLAIMED_PROPERTIES = frozenset({
     "repo_id", "name", "file", "source_file", "sources", "claims", "extractor",
     "created_at", "last_modified_at", "last_modified_by",
@@ -106,38 +111,46 @@ def _reattributed(
     return updated
 
 
+def _changes(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """What `SET n += changes` needs to turn `before` into `after`: a null
+    removes a property. Properties no claim touches are left out, so a
+    concurrent writer's (`insight_*`) are never overwritten."""
+    changes = {key: value for key, value in after.items() if before.get(key) != value}
+    changes.update({key: None for key in before if key not in after})
+    return changes
+
+
+_WRITE_CHANGES_CYPHER = "UNWIND $rows AS row MATCH (n) WHERE elementId(n) = row.id SET n += row.changes"
+
+
 def _claim_nodes_tx(tx, label: str, rows: list[dict[str, Any]]) -> None:
     """Claim shared nodes of one label for each row's `source`, in row order.
 
-    Matches what `MERGE (n:{label} {repo_id, name})` matches, so a row
-    claims every node that MERGE would have updated, or creates one."""
+    MERGEs as `MERGE (n:{label} {repo_id, name})` did, so a row claims every
+    node that MERGE matches, or the one it creates."""
     keys = sorted({(row["repo_id"], row["name"]) for row in rows})
-    matched: dict[tuple[str, str], list[list[Any]]] = {key: [] for key in keys}
+    read: dict[str, dict[str, Any]] = {}
+    current: dict[str, dict[str, Any]] = {}
+    by_key: dict[tuple[str, str], list[str]] = {key: [] for key in keys}
     for record in tx.run(
-        f"UNWIND $keys AS k MATCH (n:{label} {{repo_id: k[0], name: k[1]}}) "
-        "RETURN k[0] AS repo_id, k[1] AS name, elementId(n) AS id, properties(n) AS props",
+        f"UNWIND $keys AS k MERGE (n:{label} {{repo_id: k[0], name: k[1]}}) "
+        "WITH k, n " + _LOCK_AND_READ + ", k[0] AS repo_id, k[1] AS name",
         keys=[list(key) for key in keys],
     ):
-        matched[(record["repo_id"], record["name"])].append([record["id"], dict(record["props"])])
+        read[record["id"]] = dict(record["props"])
+        current[record["id"]] = dict(record["props"])
+        by_key[(record["repo_id"], record["name"])].append(record["id"])
     for row in rows:
-        nodes = matched[(row["repo_id"], row["name"])]
-        if not nodes:
-            nodes.append([None, {"repo_id": row["repo_id"], "name": row["name"]}])
         written = {key: value for key, value in row["properties"].items() if value is not None}
-        for entry in nodes:
-            claims = _claims_of(entry[1])
+        for node_id in by_key[(row["repo_id"], row["name"])]:
+            claims = _claims_of(current[node_id])
             before = _attribution(claims)
             claims[written["source"]] = written
-            entry[1] = _reattributed(entry[1], claims, before)
-    existing = [{"id": node_id, "props": props} for nodes in matched.values() for node_id, props in nodes if node_id]
-    created = [props for nodes in matched.values() for node_id, props in nodes if node_id is None]
-    if existing:
-        tx.run("UNWIND $rows AS row MATCH (n) WHERE elementId(n) = row.id SET n = row.props", rows=existing)
-    if created:
-        tx.run(
-            f"UNWIND $rows AS props MERGE (n:{label} {{repo_id: props.repo_id, name: props.name}}) SET n = props",
-            rows=created,
-        )
+            current[node_id] = _reattributed(current[node_id], claims, before)
+    tx.run(
+        _WRITE_CHANGES_CYPHER,
+        rows=[{"id": node_id, "changes": _changes(read[node_id], props)} for node_id, props in current.items()],
+    )
 
 
 def _delete_by_source_file_tx(tx, repo_id: str, file_name: str) -> None:
@@ -156,11 +169,11 @@ def _unclaim_source_tx(tx, repo_id: str, file_name: str) -> None:
         before = _attribution(claims)
         claims.pop(file_name, None)
         if claims:
-            kept.append({"id": record["id"], "props": _reattributed(props, claims, before)})
+            kept.append({"id": record["id"], "changes": _changes(props, _reattributed(props, claims, before))})
         else:
             gone.append(record["id"])
     if kept:
-        tx.run("UNWIND $rows AS row MATCH (n) WHERE elementId(n) = row.id SET n = row.props", rows=kept)
+        tx.run(_WRITE_CHANGES_CYPHER, rows=kept)
     if gone:
         tx.run("MATCH (n) WHERE elementId(n) IN $ids DETACH DELETE n", ids=gone)
 
@@ -928,9 +941,9 @@ class GraphEngine:
         indexed. Covers both provenance styles: `source_file`/`file`
         properties, and bare `Module` nodes whose `name` *is* the file path
         (the docs/mentions extractors' shape). `Commit`/`Repository` nodes
-        and `source`-keyed nodes (Container/Service/API, co-produced by
-        several files) are deliberately excluded — they're not keyed to a
-        single file, so they can't be reconciled against the disk walk.
+        are excluded, and so are `source`-keyed shared nodes
+        (Container/Datastore/Endpoint, co-produced by several files): their
+        files come from `list_claim_sources`.
         """
         with self._driver.session() as session:
             result = _retry_transient(
@@ -943,6 +956,22 @@ class GraphEngine:
             )
             records = result or []
             return {record["path"] for record in records if record["path"]}
+
+    def list_claim_sources(self, repo_id: str) -> set[str]:
+        """Every repo-relative file claiming a shared node (`source`/`sources`)
+        in this repo: the files, such as a Dockerfile, that may back nothing
+        but a claim. Provider nodes are left out."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) "
+                "WHERE n.file IS NULL AND n.source_file IS NULL AND n.extractor IS NULL "
+                "  AND (n.sources IS NOT NULL OR n.source IS NOT NULL) "
+                "UNWIND coalesce(n.sources, [n.source]) AS source "
+                "RETURN DISTINCT source",
+                repo_id=repo_id,
+            )
+            return {record["source"] for record in result or [] if record["source"]}
 
     def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str]]:
         """Return (label, name) for every node whose file provenance

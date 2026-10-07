@@ -2,11 +2,14 @@
 source, whatever order the files claim them in (watcher spec W10)."""
 
 import json
+import threading
 import uuid
 
 import pytest
 
+from devgraph.graph import engine as engine_module
 from devgraph.graph.engine import GraphEngine
+from devgraph.graph.schema import RESERVED_NODE_PROPERTIES
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 
 _RUN = uuid.uuid4().hex[:8]
@@ -136,3 +139,71 @@ def test_incremental_rename_matches_a_fresh_scan(engine, repo_ids, tmp_path):
     assert after["source"] == "b.py"
     assert after["library"] == "psycopg"
     assert after["sources"] == ["b.py", "c.py"]
+
+
+def test_claims_is_reserved_beside_sources():
+    assert {"source", "sources", "claims"} <= RESERVED_NODE_PROPERTIES
+
+
+def test_concurrent_claims_on_one_node_keep_every_claim(engine, repo_ids):
+    repo_id = repo_ids[0]
+    sources = [f"f{i:02d}.py" for i in range(20)]
+    errors = []
+
+    def worker(mine):
+        try:
+            for source in mine:
+                claim(engine, repo_id, source, library=f"lib-{source}")
+        except Exception as exc:  # surfaced below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(sources[i::4],)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    after = node(engine, repo_id)
+    assert after["sources"] == sources
+    assert sorted(json.loads(after["claims"])) == sources
+    assert after["source"] == "f00.py" and after["library"] == "lib-f00.py"
+
+
+def _write_insight_during(monkeypatch, engine, repo_id, step):
+    """While `step` runs, a second session sets insight_pagerank on the node once,
+    in the middle of the claim transaction (after its read)."""
+    writer: list[threading.Thread] = []
+    original = engine_module._claims_of
+
+    def claims_of(props):
+        if not writer:
+            thread = threading.Thread(target=lambda: engine.run_cypher(
+                "MATCH (n:Database {repo_id: $r, name: 'PostgreSQL'}) SET n.insight_pagerank = 0.5", {"r": repo_id}
+            ))
+            writer.append(thread)
+            thread.start()
+            thread.join(timeout=0.5)  # blocks on the node's lock when the read took it
+        return original(props)
+
+    monkeypatch.setattr(engine_module, "_claims_of", claims_of)
+    step()
+    writer[0].join()
+
+
+def test_a_concurrent_insight_write_survives_a_claim(engine, repo_ids, monkeypatch):
+    repo_id = repo_ids[0]
+    claim(engine, repo_id, "b.py", library="psycopg")
+    _write_insight_during(monkeypatch, engine, repo_id, lambda: claim(engine, repo_id, "a.py", library="sqlalchemy"))
+    after = node(engine, repo_id)
+    assert after["insight_pagerank"] == 0.5
+    assert after["source"] == "a.py"
+
+
+def test_a_concurrent_insight_write_survives_an_unclaim(engine, repo_ids, monkeypatch):
+    repo_id = repo_ids[0]
+    claim(engine, repo_id, "b.py", library="psycopg")
+    claim(engine, repo_id, "a.py", library="sqlalchemy")
+    _write_insight_during(monkeypatch, engine, repo_id, lambda: engine.delete_nodes_by_source_file(repo_id, "a.py"))
+    after = node(engine, repo_id)
+    assert after["insight_pagerank"] == 0.5
+    assert after["source"] == "b.py"

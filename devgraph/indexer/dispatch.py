@@ -1247,16 +1247,32 @@ def _read_text(path: Path) -> str:
         return ""
 
 
-def _graph_files(engine: GraphEngine, repo_id: str, repo_root: Path) -> set[str]:
-    """Every repo-relative file the graph has nodes for: the language keys
-    (`list_indexed_files`), plus the docs provider's paths and the filesystem
-    provider's file-label paths. Folder nodes are never included. The provider
-    paths are left out while the schema is pending, as the provider passes are.
-    """
-    files = engine.list_indexed_files(repo_id)
+def _applied_provider_specs(
+    engine: GraphEngine, repo_id: str, repo_root: Path
+) -> tuple[bool, filesystem.FilesystemSpec | None, docs.DocsSpec | None]:
+    """`_provider_specs`, or (False, None, None) while the schema is pending:
+    the provider passes run only against the schema the graph was built with."""
     if schema_pending(engine, repo_id, repo_root):
-        return files
-    ok, fs_spec, docs_spec = _provider_specs(repo_root)
+        return False, None, None
+    return _provider_specs(repo_root)
+
+
+def _graph_files(
+    engine: GraphEngine,
+    repo_id: str,
+    repo_root: Path,
+    specs: tuple[bool, filesystem.FilesystemSpec | None, docs.DocsSpec | None] | None = None,
+) -> set[str]:
+    """Every repo-relative file the graph has nodes for: the language keys
+    (`list_indexed_files`), the sources claiming shared nodes
+    (`list_claim_sources`, e.g. a Dockerfile's Container), plus the docs
+    provider's paths and the filesystem provider's file-label paths. Folder
+    nodes are never included. The provider paths are left out while the
+    schema is pending, as the provider passes are. `specs` is
+    `_applied_provider_specs`, when the caller already has it.
+    """
+    files = engine.list_indexed_files(repo_id) | engine.list_claim_sources(repo_id)
+    ok, fs_spec, docs_spec = _applied_provider_specs(engine, repo_id, repo_root) if specs is None else specs
     if ok and docs_spec is not None:
         files |= engine.list_extracted_paths(repo_id, docs.EXTRACTOR, None)
     if ok and fs_spec is not None and fs_spec.file_label:
@@ -1350,7 +1366,8 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     keys = {key for p in paths if (key := _gone_key(repo_root, Path(p))) is not None and key != "."}
     if not keys:
         return 0
-    graph_files = _graph_files(engine, repo_id, repo_root)
+    specs = _applied_provider_specs(engine, repo_id, repo_root)
+    graph_files = _graph_files(engine, repo_id, repo_root, specs)
     listings: dict[str, set[str]] = {}
     below = {f for f in graph_files if f in keys or any(folder in keys for folder in _folders_above(f))}
     removed = {f for f in below if not _present(repo_root, f, listings)}
@@ -1362,8 +1379,8 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     for rel in sorted(removed):
         engine.delete_nodes_by_source_file(repo_id, rel)
 
-    if removed and not schema_pending(engine, repo_id, repo_root):
-        ok, fs_spec, docs_spec = _provider_specs(repo_root)
+    ok, fs_spec, docs_spec = specs
+    if removed:
         if ok and fs_spec is not None:
             filesystem.sync_absent(
                 engine, repo_id, repo_root, fs_spec, removed,
@@ -1393,15 +1410,14 @@ def prune_stale_files(
     deleted while the watcher was down (or that a watcher event missed).
     Without this, a rescan is additive-only and stale nodes linger forever.
 
-    Conservative by construction: only file-provenance nodes
-    (`source_file`/`file` keys, and schema providers' `path`) are reconciled — `Commit`/`Repository` nodes
-    and `source`-keyed nodes (Container/Service/API, co-produced by several
-    files) are never touched here. The diff is disk-vs-graph: every path the
-    graph believes it has indexed that is no longer an indexable file on
-    disk is routed through remove_paths, which handles the
-    delete-vs-unclaim distinction per node. The graph side is
-    `_graph_files`, so a file only a schema provider represents (a `File`
-    node for `logo.png`) is pruned too.
+    The diff is disk-vs-graph, with `_graph_files` as the graph side: file
+    provenance (`source_file`/`file`), the sources claiming shared nodes
+    (Container/Datastore/Endpoint, co-produced by several files), and schema
+    providers' `path`, so a file only a provider represents (a `File` node
+    for `logo.png`) is pruned too. `Commit`/`Repository` nodes are never
+    touched. Every path the graph has that is no longer an indexable file on
+    disk is routed through remove_paths, which handles the delete-vs-unclaim
+    distinction per node.
 
     Returns the number of files pruned.
     """

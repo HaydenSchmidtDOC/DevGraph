@@ -25,6 +25,9 @@ class _GraphFilesEngine:
     def list_extracted_paths(self, repo_id, extractor, labels):
         return set()
 
+    def list_claim_sources(self, repo_id):
+        return set()
+
     def read_applied_schema(self, repo_id):
         return None
 
@@ -143,3 +146,11 @@ def test_a_recreated_file_below_a_gone_folder_is_kept(tmp_path, providers):
     assert engine.language == ["pkg/sub/util.py"]
     # pkg still holds an indexable file, so only the exact paths go to the providers.
     assert providers["filesystem"] == {"pkg/sub/util.py"}
+
+
+def test_one_schema_resolve_per_call(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(dispatch, "schema_pending", lambda engine, repo_id, root: calls.append("pending") or False)
+    monkeypatch.setattr(dispatch, "_provider_specs", lambda root: calls.append("specs") or (True, None, None))
+    remove_paths(_GraphFilesEngine({"pkg/x.py"}), "_unit", tmp_path, {tmp_path / "pkg"})
+    assert calls == ["pending", "specs"]
