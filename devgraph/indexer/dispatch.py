@@ -16,6 +16,7 @@ repo's own `record.path`).
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Callable, Mapping
 from functools import partial
@@ -61,6 +62,7 @@ from devgraph.indexer.schema_constraints import (
 # Re-exported under their pre-walk.py names for the watcher and existing callers.
 from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
 from devgraph.indexer.walk import indexable_paths as _indexable_paths
+from devgraph.indexer.walk import indexable_paths_under
 from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
 from devgraph.indexer.walk import is_ignored_path as is_ignored_path
 from devgraph.indexer.walk import is_indexable_file as _is_indexable_file
@@ -1245,98 +1247,136 @@ def _read_text(path: Path) -> str:
         return ""
 
 
+def _graph_files(engine: GraphEngine, repo_id: str, repo_root: Path) -> set[str]:
+    """Every repo-relative file the graph has nodes for: the language keys
+    (`list_indexed_files`), plus the docs provider's paths and the filesystem
+    provider's file-label paths. Folder nodes are never included. The provider
+    paths are left out while the schema is pending, as the provider passes are.
+    """
+    files = engine.list_indexed_files(repo_id)
+    if schema_pending(engine, repo_id, repo_root):
+        return files
+    ok, fs_spec, docs_spec = _provider_specs(repo_root)
+    if ok and docs_spec is not None:
+        files |= engine.list_extracted_paths(repo_id, docs.EXTRACTOR, None)
+    if ok and fs_spec is not None and fs_spec.file_label:
+        files |= engine.list_extracted_paths(repo_id, filesystem.EXTRACTOR, [fs_spec.file_label])
+    return files
+
+
+def _gone_key(repo_root: Path, path: Path) -> str | None:
+    """The repo-relative key of a deleted path, or None outside the repository.
+
+    Only the parent is resolved. The missing leaf never is: on Windows,
+    resolving a missing `Foo.py` can return an existing `foo.py`.
+    """
+    path = Path(path)
+    try:
+        candidate = path.parent.resolve() / path.name
+    except OSError:
+        candidate = path
+    root = repo_root.resolve()
+    if not is_within(candidate, root):
+        return None
+    return candidate.relative_to(root).as_posix()
+
+
+def _listed(repo_root: Path, rel: str, listings: dict[str, set[str]]) -> bool:
+    """Whether every component of `rel` appears exactly in its parent's
+    `os.listdir` names. Listings are memoised in `listings`, keyed by the
+    path string: a Windows `Path` compares case-insensitively."""
+    current = repo_root
+    for part in Path(rel).parts:
+        names = listings.get(str(current))
+        if names is None:
+            try:
+                names = set(os.listdir(current))
+            except OSError:
+                names = set()
+            listings[str(current)] = names
+        if part not in names:
+            return False
+        current = current / part
+    return True
+
+
+def _present(repo_root: Path, rel: str, listings: dict[str, set[str]] | None = None) -> bool:
+    """Whether `rel` is an indexable file on disk, spelt case-exactly.
+
+    Every component is checked, not just the leaf: after a Windows folder
+    rename `Pkg` -> `pkg`, `Pkg/a.py` still opens.
+    """
+    listings = {} if listings is None else listings
+    return _listed(repo_root, rel, listings) and _is_provider_file(repo_root, repo_root / rel)
+
+
+def _holds_present_file(repo_root: Path, rel: str, listings: dict[str, set[str]]) -> bool:
+    """Whether `rel` is, or is a folder holding, an indexable file on disk."""
+    if not _listed(repo_root, rel, listings):
+        return False
+    folder = repo_root / rel
+    if not folder.is_dir():
+        return _is_provider_file(repo_root, folder)
+    return bool(indexable_paths_under(repo_root, folder))
+
+
+def _folders_above(rel: str) -> list[str]:
+    """`a/b/c.py` -> [`a`, `a/b`]."""
+    parts = rel.split("/")
+    return ["/".join(parts[:i]) for i in range(1, len(parts))]
+
+
 def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path]) -> int:
-    """Remove graph nodes whose provenance is one of these now-deleted files.
+    """Remove graph nodes whose provenance is one of these now-deleted paths.
+
+    A path may be a file or a folder: each is keyed lexically (`_gone_key`)
+    and expanded to every file the graph has at or below it (`_graph_files`,
+    one query per call; the repository root itself expands to nothing).
+    Anything present on disk, spelt case-exactly, is kept: a folder deleted
+    and recreated in one batch keeps its recreated files. Language nodes are
+    deleted per exact path; the provider passes get the exact paths, plus
+    each deleted path that holds no indexable file on disk, so that its now
+    empty folder nodes go.
 
     Args:
         engine: A GraphEngine instance.
         repo_id: Repository ID.
         repo_root: The repo's root path (paths outside it are skipped).
-        paths: Files that were deleted (no longer expected to exist on disk).
+        paths: Files or folders that were deleted.
 
     Returns:
-        Number of files whose provenance was cleaned up.
+        Number of paths whose provenance was cleaned up.
     """
-    cleaned = 0
-    for path in paths:
-        path = Path(path)
-        try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path
-        if not is_within(resolved, repo_root):
-            continue
+    keys = {key for p in paths if (key := _gone_key(repo_root, Path(p))) is not None and key != "."}
+    if not keys:
+        return 0
+    graph_files = _graph_files(engine, repo_id, repo_root)
+    listings: dict[str, set[str]] = {}
+    below = {f for f in graph_files if f in keys or any(folder in keys for folder in _folders_above(f))}
+    removed = {f for f in below if not _present(repo_root, f, listings)}
+    removed |= {key for key in keys if not _holds_present_file(repo_root, key, listings)}
 
-        if resolved.suffix in (".py", ".cs", ".java", ".rs", ".go", ".kt"):
-            # Must match the same repo-relative key index_paths() writes
-            # (Module nodes are keyed by path relative to repo_root, not
-            # bare filename — see the corresponding extractor's index_file
-            # for each language).
-            try:
-                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
-            except ValueError:
-                module_name = resolved.name
-            engine.delete_nodes_by_source_file(repo_id, module_name)
-            cleaned += 1
-        elif resolved.suffix in _JS_SUFFIXES:
-            # Same repo-relative-key rationale as the .py branch above,
-            # matching what index_paths()/extract_js_file() writes.
-            try:
-                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
-            except ValueError:
-                module_name = resolved.name
-            engine.delete_nodes_by_source_file(repo_id, module_name)
-            cleaned += 1
-        elif resolved.suffix in _CPP_SUFFIXES:
-            # Must match the same repo-relative key index_paths() writes
-            # (Module nodes are keyed by path relative to repo_root — see
-            # cpp/extractor.py's index_file).
-            try:
-                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
-            except ValueError:
-                module_name = resolved.name
-            engine.delete_nodes_by_source_file(repo_id, module_name)
-            cleaned += 1
-        elif resolved.suffix in (".md", ".markdown"):
-            # Must match the same repo-relative key index_paths() writes
-            # (Document nodes are keyed by path relative to repo_root via
-            # mentions/extractor.py's index_file, not bare filename).
-            try:
-                rel_path = resolved.relative_to(repo_root.resolve()).as_posix()
-            except ValueError:
-                rel_path = resolved.name
-            engine.delete_nodes_by_source_file(repo_id, rel_path)
-            cleaned += 1
-        else:
-            # Any other file that has a bare Module node keyed on its
-            # repo-relative path (docs/mentions extractors' shape, or a
-            # file indexed before its extension was routed). The delete
-            # Cypher matches Module.name == path, so no extension routing
-            # is needed here — just clean up whatever names this path.
-            try:
-                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
-            except ValueError:
-                module_name = resolved.name
-            engine.delete_nodes_by_source_file(repo_id, module_name)
-            cleaned += 1
+    # Must match the repo-relative key index_paths() writes for every
+    # extractor (Module/Class/Function/Document nodes, and shared nodes'
+    # `sources`).
+    for rel in sorted(removed):
+        engine.delete_nodes_by_source_file(repo_id, rel)
 
-    if not schema_pending(engine, repo_id, repo_root):
+    if removed and not schema_pending(engine, repo_id, repo_root):
         ok, fs_spec, docs_spec = _provider_specs(repo_root)
-        gone = {rel for p in paths if (rel := _repo_relative(repo_root, Path(p))) is not None and rel != "."}
         if ok and fs_spec is not None:
             filesystem.sync_absent(
-                engine, repo_id, repo_root, fs_spec, gone,
+                engine, repo_id, repo_root, fs_spec, removed,
                 is_indexable=lambda p: _is_provider_file(repo_root, p),
                 is_ignored_dir=is_ignored_dir_name,
             )
         if ok and docs_spec is not None:
-            _take_over_keys(engine, repo_id, repo_root, docs_spec, sorted(gone))
-            # Nodes (still) at or below the deleted paths, with all their edges.
-            engine.delete_extracted_nodes(repo_id, docs.EXTRACTOR, sorted(gone))
-            if gone:
-                _log_cache_stats()
+            _take_over_keys(engine, repo_id, repo_root, docs_spec, sorted(removed))
+            # Nodes (still) at the deleted paths, with all their edges.
+            engine.delete_extracted_nodes(repo_id, docs.EXTRACTOR, sorted(removed))
+            _log_cache_stats()
 
-    return cleaned
+    return len(removed)
 
 
 def prune_stale_files(
@@ -1354,18 +1394,19 @@ def prune_stale_files(
     Without this, a rescan is additive-only and stale nodes linger forever.
 
     Conservative by construction: only file-provenance nodes
-    (`source_file`/`file` keys) are reconciled — `Commit`/`Repository` nodes
+    (`source_file`/`file` keys, and schema providers' `path`) are reconciled — `Commit`/`Repository` nodes
     and `source`-keyed nodes (Container/Service/API, co-produced by several
     files) are never touched here. The diff is disk-vs-graph: every path the
     graph believes it has indexed that is no longer an indexable file on
     disk is routed through remove_paths, which handles the
-    delete-vs-unclaim distinction per node.
+    delete-vs-unclaim distinction per node. The graph side is
+    `_graph_files`, so a file only a schema provider represents (a `File`
+    node for `logo.png`) is pruned too.
 
     Returns the number of files pruned.
     """
     on_disk = {rel for _, rel in _keyed_indexable_paths(repo_root, keep_ignored_targets=True)}
-    in_graph = engine.list_indexed_files(repo_id)
-    stale = in_graph - on_disk
+    stale = _graph_files(engine, repo_id, repo_root) - on_disk
     if not stale:
         return 0
     stale_paths = {repo_root / p for p in stale}

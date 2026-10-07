@@ -7,8 +7,16 @@ import uuid
 import pytest
 
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
-from devgraph.indexer.dispatch import apply_project_schema, full_scan, index_paths, remove_paths, schema_pending
+from devgraph.indexer.dispatch import (
+    apply_project_schema,
+    full_scan,
+    index_paths,
+    prune_stale_files,
+    remove_paths,
+    schema_pending,
+)
 from devgraph.indexer.providers import filesystem
+from tests.indexer.docs_live_helpers import assert_matches_fresh_apply
 
 REPO = "_smoketest_fs_provider"
 WORKTREE = """
@@ -32,8 +40,9 @@ WORKTREE = """
 # Unique per run: these tests drop and re-create the labels' generated
 # constraints, which are database-wide and shared with real repositories.
 _TOKEN = uuid.uuid4().hex[:8]
-FILE, FOLDER, ENTRY = (f"ZzFile{_TOKEN}", f"ZzFolder{_TOKEN}", f"ZzEntry{_TOKEN}")
-_SHOWN = {FILE: "File", FOLDER: "Folder", ENTRY: "Entry"}
+FILE, FOLDER, ENTRY, NOTE = (f"ZzFile{_TOKEN}", f"ZzFolder{_TOKEN}", f"ZzEntry{_TOKEN}", f"ZzNote{_TOKEN}")
+_SHOWN = {FILE: "File", FOLDER: "Folder", ENTRY: "Entry", NOTE: "Note"}
+FRESH = f"{REPO}_fresh_{_TOKEN}"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -41,7 +50,7 @@ def _drop_generated_constraints():
     yield
     cleanup = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
     try:
-        for label in (FILE, FOLDER, ENTRY):
+        for label in (FILE, FOLDER, ENTRY, NOTE):
             cleanup.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_key IF EXISTS")
             cleanup.run_cypher(f"DROP INDEX {label.lower()}_repo_name IF EXISTS")
     except Exception:
@@ -68,6 +77,7 @@ def engine():
     test_engine.delete_repository(REPO)
     yield test_engine
     test_engine.delete_repository(REPO)
+    test_engine.delete_repository(FRESH)
     test_engine.close()
 
 
@@ -292,3 +302,82 @@ def test_moving_a_file_in_one_batch_keeps_only_the_destination(engine, repo):
     assert "File:lib/mod.py" in nodes and "Folder:lib" in nodes
     assert "File:pkg/mod.py" not in nodes
     assert "Folder:pkg" in nodes and "File:pkg/sub/util.py" in nodes
+
+
+# A path-keyed docs type over pkg/, beside the worktree types.
+WITH_NOTES = WORKTREE.replace("    relationships:", f"""      - label: {NOTE}
+        key: [path]
+        metadata: [{{name: path}}]
+        source: {{provider: docs, paths: ["pkg/**/*.md"]}}
+    relationships:""")
+
+
+def whole_graph(engine, repo_id):
+    """Every node with every property but repo_id, and every edge."""
+    nodes = engine.run_cypher(
+        "MATCH (n {repo_id: $r}) WHERE NOT n:Repository RETURN labels(n) AS labels, properties(n) AS p",
+        {"r": repo_id},
+    )
+    rels = engine.run_cypher(
+        "MATCH (a {repo_id: $r})-[x]->(b {repo_id: $r}) "
+        "RETURN labels(a)[0] AS a, a.name AS an, coalesce(a.file, '') AS af, type(x) AS t, "
+        "labels(b)[0] AS b, b.name AS bn, coalesce(b.file, '') AS bf",
+        {"r": repo_id},
+    )
+    return (
+        sorted(
+            repr((sorted(n["labels"]), sorted((k, repr(v)) for k, v in n["p"].items() if k != "repo_id")))
+            for n in nodes
+        ),
+        sorted((r["a"], r["an"] or "", r["af"], r["t"], r["b"], r["bn"] or "", r["bf"]) for r in rels),
+    )
+
+
+def assert_matches_fresh_scan(engine, root):
+    engine.delete_repository(FRESH)
+    engine.upsert_repository(FRESH, FRESH, str(root))
+    full_scan(engine, FRESH, root)
+    assert whole_graph(engine, REPO) == whole_graph(engine, FRESH)
+
+
+def test_a_folder_deleted_and_recreated_in_one_batch_keeps_the_recreated_files(engine, repo):
+    (repo / "pkg" / "notes.md").write_text("# Notes\n")
+    scan(engine, with_schema(repo, WITH_NOTES))
+
+    shutil.rmtree(repo / "pkg")
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "mod.py").write_text("class Gadget:\n    pass\n")
+    (repo / "pkg" / "notes.md").write_text("# New notes\n")
+    index_paths(engine, REPO, repo, {repo / "pkg" / "mod.py", repo / "pkg" / "notes.md"})
+    remove_paths(engine, REPO, repo, {repo / "pkg"})
+
+    nodes = fs_nodes(engine)
+    assert {"File:pkg/mod.py", "File:pkg/notes.md", "Folder:pkg"} <= set(nodes)
+    assert "File:pkg/sub/util.py" not in nodes and "Folder:pkg/sub" not in nodes
+    classes = engine.run_cypher("MATCH (c:Class {repo_id: $r}) RETURN c.name AS n, c.file AS f", {"r": REPO})
+    assert {(c["n"], c["f"]) for c in classes} == {("Gadget", "pkg/mod.py")}
+    assert not engine.run_cypher(
+        "MATCH (n {repo_id: $r}) WHERE n.file = 'pkg/sub/util.py' OR n.source_file = 'pkg/sub/util.py' "
+        "OR n.name = 'pkg/sub/util.py' RETURN n", {"r": REPO},
+    )
+    assert [r["n"] for r in engine.run_cypher(f"MATCH (n:{NOTE} {{repo_id: $r}}) RETURN n.name AS n", {"r": REPO})] == [
+        "pkg/notes.md"
+    ]
+    assert_matches_fresh_scan(engine, repo)
+    assert_matches_fresh_apply(engine, REPO, repo)
+
+
+def test_provider_only_files_deleted_while_away_are_pruned(engine, repo):
+    (repo / "notes.md").write_text("# Notes\n")
+    (repo / "logo.png").write_bytes(b"\x89PNG\r\n")
+    scan(engine, with_schema(repo))
+    assert {"File:notes.md", "File:logo.png"} <= set(fs_nodes(engine))
+
+    (repo / "notes.md").unlink()
+    (repo / "logo.png").unlink()
+    prune_stale_files(engine, REPO, repo)
+
+    nodes = fs_nodes(engine)
+    assert "File:notes.md" not in nodes and "File:logo.png" not in nodes
+    assert_matches_fresh_scan(engine, repo)
+    assert prune_stale_files(engine, REPO, repo) == 0

@@ -7,6 +7,7 @@ them from add/rescan/watch.
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -369,6 +370,65 @@ class TestRemovePaths:
             assert result[0]["c"] == 0, "Document node should be deleted"
         finally:
             engine.delete_repository(repo_id)
+
+
+    def test_a_deleted_directory_removes_its_language_nodes(self, engine, temp_repo):
+        repo_id = "_smoketest_dispatch_remove_dir"
+        fresh = f"{repo_id}_fresh"
+        (temp_repo / "pkg" / "sub").mkdir(parents=True)
+        (temp_repo / "pkg" / "mod.py").write_text("class Widget:\n    pass\n")
+        (temp_repo / "pkg" / "sub" / "util.py").write_text("def helper():\n    return 2\n")
+        (temp_repo / "keep.py").write_text("def kept():\n    pass\n")
+        try:
+            full_scan(engine, repo_id, temp_repo)
+            shutil.rmtree(temp_repo / "pkg")
+            remove_paths(engine, repo_id, temp_repo, {temp_repo / "pkg"})
+
+            left = engine.run_cypher(
+                "MATCH (n {repo_id: $r}) WHERE coalesce(n.source_file, n.file, n.name) STARTS WITH 'pkg/' "
+                "RETURN n.name AS n",
+                {"r": repo_id},
+            )
+            assert left == []
+            full_scan(engine, fresh, temp_repo)
+            assert _graph(engine, repo_id) == _graph(engine, fresh)
+        finally:
+            engine.delete_repository(repo_id)
+            engine.delete_repository(fresh)
+
+    def test_one_graph_files_query_per_call(self, engine, temp_repo, monkeypatch):
+        repo_id = "_smoketest_dispatch_remove_one_query"
+        (temp_repo / "pkg").mkdir()
+        (temp_repo / "pkg" / "mod.py").write_text("class Widget:\n    pass\n")
+        try:
+            full_scan(engine, repo_id, temp_repo)
+            (temp_repo / "pkg" / "mod.py").unlink()
+            calls = []
+            original = engine.list_indexed_files
+            monkeypatch.setattr(engine, "list_indexed_files", lambda r: calls.append(r) or original(r))
+            remove_paths(engine, repo_id, temp_repo, {temp_repo / "pkg" / "mod.py"})
+            assert calls == [repo_id]
+        finally:
+            engine.delete_repository(repo_id)
+
+
+def _graph(engine, repo_id):
+    nodes = engine.run_cypher(
+        "MATCH (n {repo_id: $r}) WHERE NOT n:Repository RETURN labels(n) AS labels, properties(n) AS p",
+        {"r": repo_id},
+    )
+    rels = engine.run_cypher(
+        "MATCH (a {repo_id: $r})-[x]->(b {repo_id: $r}) "
+        "RETURN labels(a)[0] AS a, a.name AS an, type(x) AS t, labels(b)[0] AS b, b.name AS bn",
+        {"r": repo_id},
+    )
+    return (
+        sorted(
+            repr((sorted(n["labels"]), sorted((k, repr(v)) for k, v in n["p"].items() if k != "repo_id")))
+            for n in nodes
+        ),
+        sorted((r["a"], r["an"] or "", r["t"], r["b"], r["bn"] or "") for r in rels),
+    )
 
 
 class TestFullScan:
@@ -1337,6 +1397,9 @@ def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
     class FakeEngine:
         def list_indexed_files(self, repo_id):
             return {"a.py", "gone.py"}
+
+        def read_applied_schema(self, repo_id):
+            return None
 
     assert dispatch.prune_stale_files(FakeEngine(), "r", repo) == 1
     assert removed == [{repo / "gone.py"}]

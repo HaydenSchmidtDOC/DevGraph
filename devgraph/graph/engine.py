@@ -731,6 +731,20 @@ class GraphEngine:
             )
             return {(record["label"], record["name"], record["path"]) for record in result or []}
 
+    def list_extracted_paths(self, repo_id: str, extractor: str, labels: list[str] | None) -> set[str]:
+        """The `path` of every node one provider wrote in a repo, only under
+        these labels when `labels` is given: the provider's side of the graph's
+        file list (see dispatch._graph_files)."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
+                "AND ($labels IS NULL OR labels(n)[0] IN $labels) AND n.path IS NOT NULL "
+                "RETURN DISTINCT n.path AS path",
+                repo_id=repo_id, extractor=extractor, labels=labels,
+            )
+            return {record["path"] for record in result or []}
+
     def prune_extracted_nodes(self, repo_id: str, extractor: str, keep: list[str]) -> int:
         """Delete every node of one provider in a repo except `keep` ("Label:name").
 
