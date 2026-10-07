@@ -419,6 +419,7 @@ def test_unmatched_pin_errors_without_cwd_fallback(tmp_path, calls, resolved):
 def test_inactive_pin_says_inactive_and_does_not_list_it(tmp_path, calls, resolved):
     text = unscoped_error_text(resolved(*unscoped_scenario("inactive_pin", tmp_path)))
     assert "inactive" in text
+    assert "DEVGRAPH_MCP_REPO='old' names repository 'old'" in text
     assert "a (a)" in text and "old (" not in text
 
 

@@ -93,6 +93,10 @@ class TestServerResources:
         text = content[0].content
         assert "DevGraph" in text
         assert "search_component" in text
+        # Built-ins default repo_id to the session's repository; the guide must not contradict that.
+        assert "Always pass this repo's" not in text
+        assert "omit `repo_id`" in text and "this session's repository" in text
+        assert "`find_requirements_for` and `blame_component` return lists, which carry no notice" in text
 
     def test_tool_catalog_resource_lists_every_registered_tool(self, engine):
         import asyncio
