@@ -7,24 +7,48 @@ Debounces events and invokes a callback with the set of changed file paths.
 from __future__ import annotations
 
 import logging
+import os
 import threading
+import time
+from collections.abc import Iterable
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from watchdog.events import (
     FileCreatedEvent,
     FileDeletedEvent,
     FileModifiedEvent,
     FileMovedEvent,
+    FileSystemEvent,
     FileSystemEventHandler,
 )
 from watchdog.observers import Observer
+from watchdog.observers.api import ObservedWatch
 
 from devgraph.config import get_settings
 from devgraph.indexer.dispatch import is_ignored_path
+from devgraph.indexer.walk import _junction_inside, indexable_paths_under, is_ignored_dir_name
 from devgraph.registry.store import RepoRegistry, RepoRecord
 
 logger = logging.getLogger(__name__)
+
+#: `threading.Timer`'s signature: (interval_s, function) -> a startable,
+#: cancellable timer with a `daemon` attribute. Injected by tests.
+TimerFactory = Callable[[float, Callable[[], None]], Any]
+
+#: How long a reconcile waits before retrying a top-level folder it couldn't
+#: watch; after the last, it gives up until the next top-level change.
+RECONCILE_RETRY_DELAYS_S = (0.5, 1.0, 2.0, 4.0)
+
+#: Failed `observer.schedule` calls one reconcile run makes before leaving the
+#: rest to its retry. Each failure leaks an inotify instance in watchdog 6.0.0,
+#: so a persistent failure must not be repeated per folder.
+MAX_SCHEDULE_FAILURES_PER_RECONCILE = 3
+
+#: How long after `.git/index.lock` is released a HEAD or ref change still
+#: counts as part of the same git operation (W6).
+GIT_LOCK_WINDOW_S = 5.0
 
 
 def _is_relevant_git_state_path(path: Path) -> bool:
@@ -45,64 +69,141 @@ def _is_relevant_git_state_path(path: Path) -> bool:
 
 
 class _GitStateEventHandler(FileSystemEventHandler):
-    """Handles git state changes (.git/HEAD, .git/refs) with debouncing."""
+    """Handles git state changes (.git/HEAD, .git/refs) with debouncing.
+
+    Also tells the manager when the burst that moved HEAD or a ref began (W6):
+    checkout, pull, merge, reset and stash take `.git/index.lock` before they
+    write files, so the burst starts at that lock's creation. A lock counts
+    only when it was created before the HEAD/ref event and was still held, or
+    released no more than `GIT_LOCK_WINDOW_S` before it: an IDE's `git status`
+    takes the same lock without moving HEAD.
+    """
 
     def __init__(
         self,
         repo_id: str,
         debounce_ms: int,
-        on_git_state_changed: Callable[[str], None],
+        on_burst: Callable[[str, float | None], None],
+        *,
+        timer_factory: TimerFactory = threading.Timer,
+        now: Callable[[], float] = time.time,
     ) -> None:
         self._repo_id = repo_id
         self._debounce_ms = debounce_ms
-        self._on_git_state_changed = on_git_state_changed
-        self._debounce_timer: threading.Timer | None = None
+        self._on_burst = on_burst
+        self._timer_factory = timer_factory
+        self._now = now
+        self._debounce_timer: Any = None
         self._lock = threading.Lock()
+        # The newest index.lock: when it was created, and released (None
+        # while held). Both None when there is no record.
+        self._lock_created: float | None = None
+        self._lock_released: float | None = None
+        # The pending burst's start, from a lock that preceded its HEAD/ref event.
+        self._burst_start: float | None = None
+        self._closed = False
 
     def on_modified(self, event: FileModifiedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
         if not event.is_directory and _is_relevant_git_state_path(Path(str(event.src_path))):
-            with self._lock:
-                self._reset_debounce()
+            self._state_changed()
 
     def on_created(self, event: FileCreatedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
-        if not event.is_directory and _is_relevant_git_state_path(Path(str(event.src_path))):
+        if event.is_directory:
+            return
+        path = Path(str(event.src_path))
+        if path.name == "index.lock":
             with self._lock:
-                self._reset_debounce()
+                self._lock_created, self._lock_released = self._now(), None
+        if _is_relevant_git_state_path(path):
+            self._state_changed()
 
     def on_deleted(self, event: FileDeletedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
-        if not event.is_directory and _is_relevant_git_state_path(Path(str(event.src_path))):
-            with self._lock:
-                self._reset_debounce()
+        if event.is_directory:
+            return
+        path = Path(str(event.src_path))
+        if path.name == "index.lock":
+            self._lock_was_released()
+        if _is_relevant_git_state_path(path):
+            self._state_changed()
 
     def on_moved(self, event: FileMovedEvent) -> None:  # type: ignore[override]
         """Record git state change and set debounce timer."""
         if event.is_directory:
             return
+        if Path(str(event.src_path)).name == "index.lock":
+            self._lock_was_released()  # renamed onto `index`
         if _is_relevant_git_state_path(Path(str(event.src_path))) or _is_relevant_git_state_path(Path(str(event.dest_path))):
-            with self._lock:
-                self._reset_debounce()
+            self._state_changed()
+
+    def _lock_was_released(self) -> None:
+        with self._lock:
+            if self._lock_created is not None and self._lock_released is None:
+                self._lock_released = self._now()
+
+    def _state_changed(self) -> None:
+        """A HEAD/ref event: tie it to the lock that preceded it, if any, and
+        restart the debounce."""
+        t_h = self._now()
+        with self._lock:
+            created, released = self._lock_created, self._lock_released
+            if released is not None and t_h - released > GIT_LOCK_WINDOW_S:
+                self._lock_created = self._lock_released = None  # too old to matter
+            elif created is not None and created < t_h:
+                self._burst_start = created if self._burst_start is None else min(self._burst_start, created)
+            self._reset_debounce()
 
     def _reset_debounce(self) -> None:
         """Reset the debounce timer. Must hold _lock."""
         if self._debounce_timer:
             self._debounce_timer.cancel()
+        if self._closed:
+            return
 
-        self._debounce_timer = threading.Timer(
+        self._debounce_timer = self._timer_factory(
             self._debounce_ms / 1000.0,
             self._fire_change,
         )
         self._debounce_timer.daemon = True
         self._debounce_timer.start()
 
-    def _fire_change(self) -> None:
-        """Invoke the callback with the repo_id."""
+    def close(self) -> None:
+        """Drop a pending burst: the next start's catch-up and sync cover it."""
         with self._lock:
+            self._closed = True
+            if self._debounce_timer:
+                self._debounce_timer.cancel()
+                self._debounce_timer = None
+
+    def _fire_change(self) -> None:
+        """Invoke the callback with the repo_id and the burst's start."""
+        with self._lock:
+            if self._closed:
+                return  # fired just as close() ran
             self._debounce_timer = None
+            burst_start, self._burst_start = self._burst_start, None
         # Invoke callback outside lock to avoid deadlock
-        self._on_git_state_changed(self._repo_id)
+        self._on_burst(self._repo_id, burst_start)
+
+
+def _forget_closed_handle(emitter: Any) -> None:
+    """Before a stopped emitter is stopped again (unscheduled, or by its
+    observer's stop): watchdog's Windows emitter closes its directory handle
+    in stop() (which it calls itself when its folder is deleted) but keeps
+    the value, and a second stop() would close it again, by then perhaps
+    another object's handle, which can crash the process. The stopped event
+    is set just before that close, so it says the handle is (being) closed
+    even while the thread is still winding down. No-op for other emitters."""
+    if emitter.stopped_event.is_set() and getattr(emitter, "_whandle", None):
+        emitter._whandle = None
+
+
+def _forget_closed_handles(observer: Any) -> None:
+    """`_forget_closed_handle` for each of the observer's emitters."""
+    for emitter in list(getattr(observer, "_emitter_for_watch", {}).values()):
+        _forget_closed_handle(emitter)
 
 
 class WatcherManager:
@@ -118,6 +219,12 @@ class WatcherManager:
         registry: RepoRegistry,
         on_changes: Callable[[str, set[Path], set[Path]], None],
         on_git_state_changed: Callable[[str], None] | None = None,
+        *,
+        timer_factory: TimerFactory = threading.Timer,
+        reconcile_delay_s: float = 0.2,
+        on_catch_up: Callable[..., None] | None = None,
+        git_catch_up_delay_s: float = 2.0,
+        now: Callable[[], float] = time.time,
     ) -> None:
         """Initialize the watcher manager.
 
@@ -127,6 +234,17 @@ class WatcherManager:
                 invoked when the debounce interval elapses.
             on_git_state_changed: Optional callback(repo_id) invoked when git
                 state changes (.git/HEAD, .git/refs, etc.).
+            timer_factory: Builds the debounce and reconcile timers.
+            reconcile_delay_s: How long a top-level watch reconcile waits to
+                coalesce the events that asked for it.
+            on_catch_up: Optional callback(repo_id, since, reason) that
+                catches up on changes made since `since` (W5). It runs under
+                the repo's batch lock: when watching starts (reason "start"),
+                after a git operation ("git"), and when asked through
+                `request_catch_up` ("retry"). It returns False when it
+                failed; then the git-history sync that follows it is skipped.
+            git_catch_up_delay_s: How long after a git burst its catch-up runs.
+            now: The wall clock, in seconds; tests inject it.
         """
         self._registry = registry
         self._on_changes = on_changes
@@ -139,6 +257,37 @@ class WatcherManager:
         # Track repos with path issues (e.g. missing directory) so they don't
         # crash the whole watcher. Maps repo_id -> error message.
         self._repo_issues: dict[str, str] = {}
+        self._timer_factory = timer_factory
+        self._reconcile_delay_s = reconcile_delay_s
+        # Top-level directory watches per repo: path -> (watch, the directory's
+        # identity when scheduled). The root's own non-recursive watch is not
+        # listed; it is never reconciled.
+        self._watches: dict[str, dict[Path, tuple[ObservedWatch, tuple[int, int] | None]]] = {}
+        # One per repo, created on demand and never dropped, so a handler
+        # recreated by stop/start or refresh shares it with run_exclusive (W4).
+        self._batch_locks: dict[str, threading.Lock] = {}
+        # Guards the reconcile bookkeeping below and _stopping. Handlers take
+        # it (never _lock); it is never held while calling into an observer.
+        self._reconcile_lock = threading.Lock()
+        self._reconcile_pending: dict[str, Any] = {}
+        self._reconcile_running: set[str] = set()
+        # Top-level names deleted or moved away since the last reconcile began.
+        self._reconcile_gone: dict[str, set[str]] = {}
+        # Consecutive reconcile runs that couldn't watch every folder.
+        self._reconcile_retries: dict[str, int] = {}
+        self._stopping = False
+        self._on_catch_up = on_catch_up
+        self._git_catch_up_delay_s = git_catch_up_delay_s
+        self._now = now
+        # Guards the catch-up bookkeeping below. Never held while taking
+        # _lock or a batch lock, so request_catch_up can be called from
+        # inside a batch.
+        self._catch_up_lock = threading.Lock()
+        # repo_id -> [earliest since, reason, timer, its delay]
+        self._catch_up_pending: dict[str, list[Any]] = {}
+        # repo_id -> the start-of-watching catch-up's timer, until it fires.
+        self._start_catch_ups: dict[str, Any] = {}
+        self._catch_up_stopped = False
 
     def start(self) -> None:
         """Start watchers for all active, watch-enabled repos.
@@ -146,6 +295,10 @@ class WatcherManager:
         Repos with invalid paths are logged as warnings and skipped;
         other repos continue normally so one bad path doesn't crash the whole watcher.
         """
+        with self._reconcile_lock:
+            self._stopping = False
+        with self._catch_up_lock:
+            self._catch_up_stopped = False
         with self._lock:
             repos = self._registry.list_repos(active_only=True)
             repos_to_watch = [r for r in repos if r.watch_enabled]
@@ -153,14 +306,158 @@ class WatcherManager:
                 self._start_single(repo)
 
     def stop(self) -> None:
-        """Stop all watchers and clean up."""
+        """Stop all watchers and clean up.
+
+        Pending reconciles are cancelled, and one that is running finishes
+        without queueing anything. Pending debounces and catch-ups are
+        cancelled; the changes they held are left for the next start's
+        catch-up. A catch-up that is running is not waited for.
+        """
+        with self._reconcile_lock:
+            self._stopping = True
+            timers = list(self._reconcile_pending.values())
+            self._reconcile_pending.clear()
+            self._reconcile_gone.clear()
+        with self._catch_up_lock:
+            self._catch_up_stopped = True
+            timers += [entry[2] for entry in self._catch_up_pending.values()]
+            timers += list(self._start_catch_ups.values())
+            self._catch_up_pending.clear()
+            self._start_catch_ups.clear()
+        for timer in timers:
+            timer.cancel()
         with self._lock:
             for repo_id, observer in self._observers.items():
                 if observer.is_alive():
+                    _forget_closed_handles(observer)
                     observer.stop()
                     observer.join(timeout=5)
+            for handler in self._handlers.values():
+                handler.close()
+            for git_handler in self._git_handlers.values():
+                git_handler.close()
             self._observers.clear()
             self._handlers.clear()
+            self._git_handlers.clear()
+            self._watches.clear()
+
+    def run_exclusive(self, repo_id: str, fn: Callable[[], Any]) -> Any:
+        """Run `fn` under the repo's batch lock, so it never interleaves with
+        a live batch. `_lock` is held only to look the lock up."""
+        with self._lock:
+            lock = self._batch_locks.setdefault(repo_id, threading.Lock())
+        with lock:
+            return fn()
+
+    def request_catch_up(self, repo_id: str, since: datetime, delay_s: float, reason: str = "retry") -> None:
+        """Run `on_catch_up(repo_id, since)` in `delay_s`, under the repo's
+        batch lock. Requests made before it runs coalesce: the earliest
+        `since` is kept, and so is the pending timer, unless the new request
+        asks for a shorter delay than it did (the health loop's immediate
+        retry replaces a failure's 30 s one).
+
+        Never takes `_lock` or a batch lock: `RepoSync.on_changes` calls it
+        from inside a batch.
+        """
+        if self._on_catch_up is None:
+            return
+        with self._catch_up_lock:
+            if self._catch_up_stopped:
+                return
+            entry = self._catch_up_pending.get(repo_id)
+            if entry is not None:
+                since = min(entry[0], since)
+                if entry[1] == "git":
+                    reason = "git"
+                if delay_s >= entry[3]:
+                    entry[0], entry[1] = since, reason
+                    return
+                entry[2].cancel()
+            timer = self._timer_factory(delay_s, lambda: self._run_requested_catch_up(repo_id))
+            timer.daemon = True
+            self._catch_up_pending[repo_id] = [since, reason, timer, delay_s]
+            timer.start()
+
+    def _run_requested_catch_up(self, repo_id: str) -> None:
+        with self._catch_up_lock:
+            entry = self._catch_up_pending.pop(repo_id, None)
+            if entry is None or self._catch_up_stopped:
+                return
+        since, reason = entry[0], entry[1]
+
+        def run() -> None:
+            if self._catch_up_stopped:
+                return
+            self._catch_up_then_sync(repo_id, since, reason)
+
+        self.run_exclusive(repo_id, run)
+
+    def _catch_up_then_sync(self, repo_id: str, since: datetime, reason: str) -> None:
+        """Catch up, then sync git history, in one job under the batch lock.
+
+        The sync runs after every catch-up (start, git, retry) of a repo with
+        a `.git` folder, not only after a git burst's: that job is cancelled
+        by a stop or pause within its delay, and a commit made while nothing
+        was watching has no burst at all. It runs after the catch-up, so every
+        file git wrote has its nodes (the recency writes only annotate nodes
+        that exist), and not after a failed one (`on_catch_up` returned
+        False): a fast-mode sync never looks at its commits again, so it
+        waits for the retry. With HEAD where the last sync left it, the sync
+        does nothing.
+        """
+        ok = self._on_catch_up(repo_id, since, reason)
+        if ok is not False and self._on_git_state_changed is not None and repo_id in self._git_handlers:
+            self._on_git_state_changed(repo_id)
+
+    def _start_catch_up(self, repo_id: str, snapshot: datetime | None) -> None:
+        """The catch-up when watching starts, on its own thread (W5).
+
+        `snapshot` is `last_indexed` as read before the observer started, so
+        a live batch that wins the batch lock first cannot raise it past
+        edits made while nothing was watching. A None snapshot is re-read
+        under the lock: a registration in this process may just have
+        finished its first scan under the same lock.
+        """
+        with self._catch_up_lock:
+            self._start_catch_ups.pop(repo_id, None)
+            if self._catch_up_stopped:
+                return
+
+        def run() -> None:
+            if self._catch_up_stopped:
+                return  # paused while waiting for the lock
+            since = snapshot if snapshot is not None else self._last_indexed(repo_id)
+            if since is None:
+                logger.info('DevGraph hasn\'t indexed %s yet; run "devgraph rescan %s"', repo_id, repo_id)
+                return
+            self._catch_up_then_sync(repo_id, since, "start")
+
+        self.run_exclusive(repo_id, run)
+
+    def _last_indexed(self, repo_id: str) -> datetime | None:
+        repo = self._registry.get(repo_id)
+        if repo is None or not repo.last_indexed:
+            return None
+        return datetime.fromisoformat(repo.last_indexed)
+
+    def _on_git_burst(self, repo_id: str, burst_start: float | None) -> None:
+        """A git burst's debounce fired: catch up from the start of the burst
+        (or `last_indexed`) shortly, to repair events the OS dropped (W6),
+        then sync git history in the same job, under the batch lock. Without
+        a catch-up (none wired, or a never-indexed repo) the sync runs now."""
+        with self._catch_up_lock:
+            if self._catch_up_stopped:
+                return  # the next start's catch-up and sync cover it
+        if self._on_catch_up is not None:
+            last = self._last_indexed(repo_id)
+            if last is not None:
+                since = last
+                if burst_start is not None:
+                    since = min(last, datetime.fromtimestamp(burst_start, timezone.utc))
+                self.request_catch_up(repo_id, since, self._git_catch_up_delay_s, "git")
+                return
+        if self._on_git_state_changed is not None:
+            self._on_git_state_changed(repo_id)
 
     def refresh(self) -> None:
         """Rebuild watcher set by re-reading the registry.
@@ -208,6 +505,9 @@ class WatcherManager:
                 repo.path,
                 self._debounce_ms,
                 self._on_changes,
+                timer_factory=self._timer_factory,
+                batch_lock=self._batch_locks.setdefault(repo.repo_id, threading.Lock()),
+                request_reconcile=self._request_reconcile,
             )
             observer = Observer()
             # Don't hand watchdog a single recursive watch on repo.path: that
@@ -221,9 +521,10 @@ class WatcherManager:
             # root-level files) plus each non-ignored top-level subdirectory
             # recursively, mirroring full_scan's IGNORED_DIR_NAMES exclusions.
             observer.schedule(handler, str(repo.path), recursive=False)
-            for child in repo.path.iterdir():
-                if child.is_dir() and not is_ignored_path(child.relative_to(repo.path)):
-                    observer.schedule(handler, str(child), recursive=True)
+            watches = {
+                child: self._schedule_dir(observer, handler, child)
+                for child in sorted(self._desired_dirs(repo.path))
+            }
         except (FileNotFoundError, OSError) as e:
             error_msg = f"failed to schedule watches: {e}"
             self._repo_issues[repo.repo_id] = error_msg
@@ -235,24 +536,35 @@ class WatcherManager:
         # Watch git state changes (.git/HEAD, .git/refs) if .git exists as a directory.
         # Skip if .git is a file (linked git worktree contains gitdir: ... pointer).
         git_dir = repo.path / ".git"
-        if git_dir.is_dir() and self._on_git_state_changed:
+        if git_dir.is_dir() and (self._on_git_state_changed or self._on_catch_up):
             git_handler = _GitStateEventHandler(
                 repo.repo_id,
                 self._debounce_ms,
-                self._on_git_state_changed,
+                self._on_git_burst,
+                timer_factory=self._timer_factory,
+                now=self._now,
             )
             # Non-recursive watch on .git itself (catches HEAD, packed-refs)
             observer.schedule(git_handler, str(git_dir), recursive=False)
-            # Recursive watch on .git/refs/heads if it exists
-            refs_heads = git_dir / "refs" / "heads"
+            # Non-recursive watch on .git/refs (refs/stash: `git stash pop`
+            # moves neither HEAD nor a branch), and a recursive one on
+            # .git/refs/heads. Remote-tracking refs and tags stay unwatched,
+            # so a background fetch triggers nothing.
+            refs = git_dir / "refs"
+            if refs.is_dir():
+                observer.schedule(git_handler, str(refs), recursive=False)
+            refs_heads = refs / "heads"
             if refs_heads.is_dir():
                 observer.schedule(git_handler, str(refs_heads), recursive=True)
             self._git_handlers[repo.repo_id] = git_handler
 
+        # Read before the observer starts (W5): see _start_catch_up.
+        snapshot = self._last_indexed(repo.repo_id) if self._on_catch_up is not None else None
         try:
             observer.start()
             self._observers[repo.repo_id] = observer
             self._handlers[repo.repo_id] = handler
+            self._watches[repo.repo_id] = watches
             # Clear any cached issues now that watch started successfully
             self._repo_issues.pop(repo.repo_id, None)
             logger.debug(f"Started watcher for {repo.repo_id} at {repo.path}")
@@ -262,6 +574,14 @@ class WatcherManager:
             logger.warning(
                 f"Skipping watcher for {repo.repo_id}: {error_msg}"
             )
+            return
+        if self._on_catch_up is not None:
+            repo_id = repo.repo_id
+            timer = self._timer_factory(0.0, lambda: self._start_catch_up(repo_id, snapshot))
+            timer.daemon = True
+            with self._catch_up_lock:
+                self._start_catch_ups[repo_id] = timer
+            timer.start()
 
     def _stop_single(self, repo_id: str) -> None:
         """Stop a watcher for a single repo. Must hold _lock."""
@@ -269,13 +589,195 @@ class WatcherManager:
             return
 
         observer = self._observers.pop(repo_id)
-        self._handlers.pop(repo_id, None)
-        self._git_handlers.pop(repo_id, None)
+        handler = self._handlers.pop(repo_id, None)
+        git_handler = self._git_handlers.pop(repo_id, None)
+        if git_handler is not None:
+            git_handler.close()
+        self._watches.pop(repo_id, None)
+        with self._reconcile_lock:
+            timer = self._reconcile_pending.pop(repo_id, None)
+            self._reconcile_gone.pop(repo_id, None)
+        with self._catch_up_lock:
+            timers = [timer, self._start_catch_ups.pop(repo_id, None)]
+            entry = self._catch_up_pending.pop(repo_id, None)
+            if entry is not None:
+                timers.append(entry[2])
+        for timer in timers:
+            if timer is not None:
+                timer.cancel()
+        if handler is not None:
+            handler.close()
 
         if observer.is_alive():
+            _forget_closed_handles(observer)
             observer.stop()
             observer.join(timeout=5)
         logger.debug(f"Stopped watcher for {repo_id}")
+
+    def _desired_dirs(self, root: Path) -> set[Path]:
+        """The root's children that get their own recursive watch: real
+        directories with no ignored name, plus junctions whose target is
+        inside the repository and not ignored. Symlinked directories are
+        skipped, as `walk._walk` skips them. Raises OSError if the root can't
+        be listed."""
+        desired = set()
+        resolved_root: Path | None = None
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if is_ignored_dir_name(entry.name):
+                    continue
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                path = root / entry.name
+                if path.is_junction():
+                    resolved_root = resolved_root or root.resolve()
+                    if not _junction_inside(path, resolved_root):
+                        continue
+                desired.add(path)
+        return desired
+
+    @staticmethod
+    def _dir_identity(path: Path) -> tuple[int, int] | None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    def _schedule_dir(
+        self, observer: Any, handler: _RepoEventHandler, directory: Path
+    ) -> tuple[ObservedWatch, tuple[int, int] | None]:
+        """Schedule a recursive watch on a top-level directory. Must hold _lock."""
+        identity = self._dir_identity(directory)
+        return observer.schedule(handler, str(directory), recursive=True), identity
+
+    def _request_reconcile(self, repo_id: str, gone: str | None = None) -> None:
+        """Ask for a top-level watch reconcile (W3). Called from handler code
+        on watchdog's dispatch thread, so it takes only `_reconcile_lock`;
+        requests coalesce until the timer fires.
+
+        `gone` names a top-level entry that was deleted or moved away. Its
+        watch is replaced whatever its emitter and identity say: a folder
+        deleted and made again can get the same inode back (ext4 reuses them
+        at once) before the old emitter has read its delete."""
+        with self._reconcile_lock:
+            if gone is not None and not self._stopping:
+                self._reconcile_gone.setdefault(repo_id, set()).add(gone)
+            self._schedule_reconcile(repo_id, self._reconcile_delay_s)
+
+    def _schedule_reconcile(self, repo_id: str, delay_s: float) -> None:
+        """Start a reconcile timer unless one is pending. Must hold _reconcile_lock."""
+        if self._stopping or repo_id in self._reconcile_pending:
+            return
+        timer = self._timer_factory(delay_s, lambda: self._reconcile(repo_id))
+        timer.daemon = True
+        self._reconcile_pending[repo_id] = timer
+        timer.start()
+
+    def _reconcile(self, repo_id: str) -> None:
+        """Make the repo's top-level watches match its top-level directories.
+
+        Runs on its own timer thread. A watch is kept only while its emitter
+        is alive and its path is still the same desired directory; any other
+        is unscheduled, which covers a deleted directory (inotify's emitter
+        stops itself but stays registered, so re-scheduling the same path
+        would be a no-op), a renamed one whose stale emitter still reports the
+        old name, and one that became ignored. Missing directories are then
+        scheduled and walked, so files written before the watch existed are
+        not lost.
+        """
+        with self._reconcile_lock:
+            self._reconcile_pending.pop(repo_id, None)
+            gone = self._reconcile_gone.pop(repo_id, set())
+            if self._stopping:
+                return
+            self._reconcile_running.add(repo_id)
+        try:
+            with self._lock:
+                if self._stopping or repo_id not in self._observers:
+                    return
+                observer = self._observers[repo_id]
+                handler = self._handlers[repo_id]
+                root = handler._repo_root
+                try:
+                    desired = self._desired_dirs(root)
+                except OSError as e:
+                    logger.debug("Skipping watch reconcile for %s: %s", repo_id, e)
+                    return
+                watches = self._watches[repo_id]
+                # watchdog's private map (pinned below 7 in pyproject). Without
+                # it, a watch is judged by its folder's identity alone, and a
+                # dead emitter on an unchanged folder goes unnoticed.
+                emitters = getattr(observer, "_emitter_for_watch", None)
+                for path, (watch, identity) in list(watches.items()):
+                    emitter = emitters.get(watch) if emitters is not None else None
+                    alive = emitter is not None and emitter.is_alive() if emitters is not None else True
+                    if (
+                        alive
+                        and path in desired
+                        and path.name not in gone
+                        and self._dir_identity(path) == identity
+                    ):
+                        continue
+                    if emitter is not None:
+                        _forget_closed_handle(emitter)
+                    if emitters is None or emitter is not None:
+                        try:
+                            observer.unschedule(watch)
+                        except KeyError:
+                            pass  # already gone from the observer
+                    del watches[path]
+                added = []
+                failed: list[str] = []
+                error: OSError | None = None
+                for path in sorted(desired - watches.keys()):
+                    if len(failed) >= MAX_SCHEDULE_FAILURES_PER_RECONCILE:
+                        failed.append(path.name)  # left for the retry
+                        continue
+                    if not path.is_dir():
+                        continue  # gone since the listing; its event will follow
+                    try:
+                        watches[path] = self._schedule_dir(observer, handler, path)
+                    except OSError as e:
+                        failed.append(path.name)
+                        error = e
+                        continue
+                    added.append(path)
+            files: set[Path] = set()
+            for path in added:
+                files |= indexable_paths_under(root, path)
+            with self._reconcile_lock:
+                # A handler closed by stop() or refresh() drops what it's given.
+                if files and not self._stopping:
+                    handler.queue_changed(files)
+                self._retry_reconcile(repo_id, failed, error)
+        finally:
+            with self._reconcile_lock:
+                self._reconcile_running.discard(repo_id)
+
+    def _retry_reconcile(self, repo_id: str, failed: list[str], error: OSError | None) -> None:
+        """Retry folders a reconcile couldn't watch, with backoff, then give
+        up until the next top-level change. Must hold _reconcile_lock."""
+        if not failed:
+            self._reconcile_retries.pop(repo_id, None)
+            return
+        attempt = self._reconcile_retries.get(repo_id, 0)
+        folders = ", ".join(failed)
+        if attempt >= len(RECONCILE_RETRY_DELAYS_S):
+            self._reconcile_retries.pop(repo_id, None)
+            logger.warning(
+                "Couldn't watch %s in %s (%s); changes there won't be picked up "
+                "until another top-level folder changes or DevGraph restarts",
+                folders, repo_id, error,
+            )
+            return
+        delay = RECONCILE_RETRY_DELAYS_S[attempt]
+        self._reconcile_retries[repo_id] = attempt + 1
+        logger.info("Couldn't watch %s in %s yet (%s); retrying in %g s", folders, repo_id, error, delay)
+        self._schedule_reconcile(repo_id, delay)
 
     def get_repo_issues(self) -> dict[str, str]:
         """Return a copy of repos with path/watcher issues.
@@ -288,7 +790,24 @@ class WatcherManager:
 
 
 class _RepoEventHandler(FileSystemEventHandler):
-    """Handles file system events for a single repo with debouncing."""
+    """Collects one repo's file events and hands them to `on_changes` in
+    debounced batches.
+
+    A rename is a delete of its source plus a change of its destination (W1).
+    A deleted directory is queued as that directory; `remove_paths` expands it
+    from the graph. A created or moved-in directory is walked for its files
+    (W2). An event on a direct child of the root asks the manager to reconcile
+    its top-level watches (W3).
+
+    Runs on watchdog's dispatch thread, which holds the observer's lock, so it
+    never takes the manager's `_lock`. Its own `_lock` guards only the pending
+    sets: walks and `on_changes` run outside it, and a batch holds the repo's
+    batch lock instead (W4), so events keep collecting while one runs.
+
+    Pending paths are keyed by their exact string, so a case-only rename's
+    source and destination never cancel each other, even where `Path`
+    equality ignores case.
+    """
 
     def __init__(
         self,
@@ -296,150 +815,253 @@ class _RepoEventHandler(FileSystemEventHandler):
         repo_root: Path,
         debounce_ms: int,
         on_changes: Callable[[str, set[Path], set[Path]], None],
+        *,
+        timer_factory: TimerFactory = threading.Timer,
+        batch_lock: threading.Lock | None = None,
+        request_reconcile: Callable[..., None] | None = None,
     ) -> None:
         self._repo_id = repo_id
         self._repo_root = repo_root
         self._debounce_ms = debounce_ms
         self._on_changes = on_changes
-        self._changed_paths: set[Path] = set()
-        self._deleted_paths: set[Path] = set()
-        self._debounce_timer: threading.Timer | None = None
+        self._timer_factory = timer_factory
+        self._batch_lock = batch_lock or threading.Lock()
+        self._request_reconcile = request_reconcile
+        self._changed: dict[str, Path] = {}
+        self._deleted: dict[str, Path] = {}
+        # Folder log lines, keyed by the folder's repo-relative path.
+        self._folder_events: dict[str, str] = {}
+        self._debounce_timer: Any = None
+        self._closed = False
         self._lock = threading.Lock()
 
-    def on_modified(self, event: FileModifiedEvent) -> None:  # type: ignore[override]
-        """Record file modification and set debounce timer."""
+    # --- watchdog callbacks -------------------------------------------------
+
+    def on_modified(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
+        path = Path(str(event.src_path))
+        if self._is_tracked_path(path):
+            self._queue(changed=[path])
 
-        # Track git state changes (.git/HEAD, .git/refs)
-        event_path = Path(str(event.src_path))
-        if self._is_tracked_path(event_path):
-            with self._lock:
-                self._changed_paths.add(event_path)
-                self._deleted_paths.discard(event_path)
-                self._reset_debounce()
-
-    def on_created(self, event: FileCreatedEvent) -> None:  # type: ignore[override]
-        """Record file creation and set debounce timer.
+    def on_created(self, event: FileSystemEvent) -> None:
+        """A created file is a change; a created directory (new, or moved in
+        from outside the repository) is walked for its files.
 
         Also covers the "write to a temp file, then create the real path"
-        half of an atomic-save sequence some editors/tools use — without
-        this, a plain on_modified-only handler misses the file entirely if
-        the save never touches an already-existing inode via a modify event.
-        """
+        half of an atomic save."""
+        path = Path(str(event.src_path))
         if event.is_directory:
-            return
+            if self._should_walk(event, path):
+                self._queue(changed=self._walk_dir(path))
+        elif self._is_tracked_path(path):
+            self._queue(changed=[path])
+        self._signal_top_level(str(event.src_path))
 
-        event_path = Path(str(event.src_path))
-        if self._is_tracked_path(event_path):
-            with self._lock:
-                self._changed_paths.add(event_path)
-                self._deleted_paths.discard(event_path)
-                self._reset_debounce()
+    def on_deleted(self, event: FileSystemEvent) -> None:
+        """Queue the deleted path, file or directory, unless it is ignored.
 
-    def on_deleted(self, event: FileDeletedEvent) -> None:  # type: ignore[override]
-        """Record file deletion and set debounce timer.
+        Either kind is queued the same way: Windows reports a deleted
+        directory as `FileDeletedEvent`, and `remove_paths` expands whatever
+        it is given from the graph's own file list."""
+        rel = self._queue_rel(str(event.src_path))
+        if rel is not None:
+            folders = {rel: f"Folder removed from {self._repo_id}: {rel}"} if event.is_directory else {}
+            self._queue(deleted=[Path(str(event.src_path))], folders=folders)
+        self._signal_top_level(gone=str(event.src_path))
 
-        Can't use `_is_tracked_path` here -- its `is_file()` check is always
-        False for a path that was just deleted, which would reject every
-        real deletion, not just ignored ones. `_is_ignored_repo_path` does
-        the same ignored-directory check without requiring the path to
-        still exist.
+    def on_moved(self, event: FileSystemEvent) -> None:
+        """A move is a delete of its source plus a change of its destination.
+
+        The source is queued for deletion unless it is empty (a Windows rename
+        pair split across two reads), outside the repository or ignored. The
+        destination is a change if it is a tracked file, or, for a directory,
+        its walked files; otherwise the move is a delete. An atomic save
+        (temp -> real path) therefore leaves the real path changed only.
         """
+        src_raw, dest_raw = str(event.src_path), str(event.dest_path)
+        src_rel = self._queue_rel(src_raw)
+        dest = Path(dest_raw) if dest_raw else None
+        deleted = [Path(src_raw)] if src_rel is not None else []
+        folders: dict[str, str] = {}
         if event.is_directory:
-            return
+            changed = self._walk_dir(dest) if dest is not None and self._should_walk(event, dest) else set()
+            if src_rel is not None:
+                dest_rel = self._queue_rel(dest_raw)
+                folders[src_rel] = (
+                    f"Folder renamed in {self._repo_id}: {src_rel} → {dest_rel}"
+                    if dest_rel is not None
+                    else f"Folder removed from {self._repo_id}: {src_rel}"
+                )
+        else:
+            changed = [dest] if dest is not None and self._is_tracked_path(dest) else []
+        self._queue(changed=changed, deleted=deleted, folders=folders)
+        self._signal_top_level(dest_raw, gone=src_raw)
 
-        event_path = Path(str(event.src_path))
-        if self._is_ignored_repo_path(event_path):
+    # --- batching -----------------------------------------------------------
+
+    def queue_changed(self, paths: set[Path]) -> None:
+        """Queue files found outside an event (the manager's reconcile walk)."""
+        self._queue(changed=paths)
+
+    def flush(self) -> None:
+        """Fire the pending batch now, if there is one."""
+        self.cancel()
+        self._fire_changes()
+
+    def cancel(self) -> None:
+        """Drop the pending debounce timer. Pending paths stay queued."""
+        with self._lock:
+            self._cancel_timer()
+
+    def close(self) -> None:
+        """Retire the handler (the manager stopped watching its repo): drop
+        the pending timer, and queue and fire nothing from now on."""
+        with self._lock:
+            self._closed = True
+            self._cancel_timer()
+
+    def _cancel_timer(self) -> None:
+        """Must hold _lock."""
+        if self._debounce_timer is not None:
+            self._debounce_timer.cancel()
+            self._debounce_timer = None
+
+    def _queue(
+        self,
+        changed: Iterable[Path] = (),
+        deleted: Iterable[Path] = (),
+        folders: dict[str, str] | None = None,
+    ) -> None:
+        """Record deletes, then changes, keeping the two sets disjoint, and
+        restart the debounce. A delete under a directory already queued for
+        deletion is covered by it (a moved directory's per-child events)."""
+        changed, deleted = list(changed), list(deleted)
+        if not changed and not deleted:
             return
         with self._lock:
-            self._deleted_paths.add(event_path)
-            self._changed_paths.discard(event_path)
+            if self._closed:
+                return
+            for path in deleted:
+                key = str(path)
+                self._changed.pop(key, None)
+                if not self._has_deleted_ancestor(path):
+                    self._deleted[key] = path
+            for path in changed:
+                key = str(path)
+                self._deleted.pop(key, None)
+                self._changed[key] = path
+            self._folder_events.update(folders or {})
             self._reset_debounce()
 
-    def on_moved(self, event: FileMovedEvent) -> None:  # type: ignore[override]
-        """Record an atomic-save rename (temp-file -> real path) as a change.
+    def _has_deleted_ancestor(self, path: Path) -> bool:
+        """Must hold _lock."""
+        for parent in path.parents:
+            if parent == self._repo_root or len(parent.parts) < len(self._repo_root.parts):
+                return False
+            if str(parent) in self._deleted:
+                return True
+        return False
 
-        Some editors/tools save by writing a temp file then renaming it onto
-        the real path — watchdog reports that as delete(old) + moved(temp,
-        real) rather than a modify on the real path, which an on_modified/
-        on_deleted-only handler silently misses: the delete would wrongly
-        queue the real path for removal, and nothing would ever queue it as
-        changed. Treat the destination as changed and clear any stray delete
-        recorded for it in the same debounce window; also treat the source
-        path being vacated as no longer deleted (it may have raced in as a
-        delete just before this move, e.g. rename onto an existing path).
-        """
-        if event.is_directory:
-            return
+    def _reset_debounce(self) -> None:
+        """Restart the debounce timer. Must hold _lock."""
+        if self._debounce_timer is not None:
+            self._debounce_timer.cancel()
+        self._debounce_timer = self._timer_factory(self._debounce_ms / 1000.0, self._fire_changes)
+        self._debounce_timer.daemon = True
+        self._debounce_timer.start()
 
-        dest_path = Path(str(event.dest_path))
-        src_path = Path(str(event.src_path))
-        with self._lock:
-            if self._is_tracked_path(dest_path):
-                self._changed_paths.add(dest_path)
-                self._deleted_paths.discard(dest_path)
-                self._deleted_paths.discard(src_path)
-                self._reset_debounce()
-            elif not self._is_ignored_repo_path(src_path):
-                # Destination isn't a file DevGraph tracks (e.g. moved out of
-                # the repo or into a non-file) but the source WAS a real,
-                # non-ignored path -- treat it like a deletion of the
-                # original path. (If the source is also ignored -- e.g. a
-                # lockfile-then-rename inside .git/ -- nothing real happened
-                # on either end, so skip it entirely rather than record a
-                # phantom deletion of an ignored path.)
-                self._deleted_paths.add(src_path)
-                self._changed_paths.discard(src_path)
-                self._reset_debounce()
+    def _fire_changes(self) -> None:
+        """Hand the pending batch to `on_changes` under the repo's batch lock.
+
+        The sets are swapped under `_lock`, which is released before the
+        callback, so the dispatch thread can keep queueing while it runs."""
+        with self._batch_lock:
+            with self._lock:
+                # Checked under the batch lock, so no batch starts after the
+                # manager's stop() has returned.
+                if self._closed or (not self._changed and not self._deleted):
+                    return
+                changed = set(self._changed.values())
+                deleted = set(self._deleted.values())
+                folders = self._folder_events
+                self._changed, self._deleted, self._folder_events = {}, {}, {}
+            for rel in sorted(folders):
+                # One line per folder event, never per child of a moved or
+                # removed folder.
+                if not any(parent.as_posix() in folders for parent in Path(rel).parents[:-1]):
+                    logger.info(folders[rel])
+            self._on_changes(self._repo_id, changed, deleted)
+
+    # --- paths --------------------------------------------------------------
+
+    def _should_walk(self, event: FileSystemEvent, directory: Path) -> bool:
+        """Whether a created or moved-in directory needs a walk here.
+
+        Not for watchdog's synthetic per-child events (the parent's walk
+        covered them; walking each would cost files x depth), and not for a
+        direct child of the root, which the manager's reconcile walks once it
+        has a watch on it."""
+        if event.is_synthetic:
+            return False
+        if self._request_reconcile is not None:
+            rel = self._rel(str(directory))
+            if rel is not None and len(rel.parts) == 1:
+                return False
+        return True
+
+    def _walk_dir(self, directory: Path) -> set[Path]:
+        """The indexable files under a directory, walked outside `_lock`."""
+        return indexable_paths_under(self._repo_root, directory)
+
+    def _rel(self, raw: str) -> Path | None:
+        """Repo-relative path of an event path, or None if empty or outside
+        the repository. Lexical first; otherwise the parent is resolved and
+        the leaf appended, so a missing leaf is never resolved."""
+        if not raw:
+            return None
+        path = Path(raw)
+        try:
+            return path.relative_to(self._repo_root)
+        except ValueError:
+            pass
+        try:
+            return (path.parent.resolve() / path.name).relative_to(self._repo_root.resolve())
+        except (OSError, ValueError):
+            return None
+
+    def _queue_rel(self, raw: str) -> str | None:
+        """The repo-relative POSIX path of an event path that may be queued:
+        inside the repository, not the root itself, and not ignored."""
+        rel = self._rel(raw)
+        if rel is None or not rel.parts or is_ignored_path(rel):
+            return None
+        return rel.as_posix()
 
     def _is_tracked_path(self, path: Path) -> bool:
-        """Check if this path should be tracked.
-
-        Tracks regular files, except those under an ignored directory
-        (.venv, __pycache__, build, ...) that nests inside an otherwise-
-        watched top-level directory -- the per-child exclusion in
-        WatcherManager._start_single only keeps top-level ignored dirs out
-        of the OS watch, so this is the backstop for ignored dirs deeper in
-        the tree (e.g. some_package/build/).
-        """
+        """A regular file inside the repository and not under an ignored
+        directory. The per-child watches keep only top-level ignored
+        directories out of the OS watch; this is the backstop for deeper ones
+        (e.g. some_package/build/)."""
         try:
             if not path.is_file():
                 return False
         except OSError:
             return False
-        return not self._is_ignored_repo_path(path)
+        return self._queue_rel(str(path)) is not None
 
-    def _is_ignored_repo_path(self, path: Path) -> bool:
-        """Shape-only ignored-directory check -- no existence check, so this
-        is safe to call on a path that no longer exists (a deletion) or
-        whose existence hasn't settled yet, unlike `_is_tracked_path`."""
-        try:
-            rel = path.resolve().relative_to(self._repo_root.resolve())
-        except (OSError, ValueError):
-            return False
-        return is_ignored_path(rel)
-
-    def _reset_debounce(self) -> None:
-        """Reset the debounce timer. Must hold _lock."""
-        if self._debounce_timer:
-            self._debounce_timer.cancel()
-
-        self._debounce_timer = threading.Timer(
-            self._debounce_ms / 1000.0,
-            self._fire_changes,
-        )
-        self._debounce_timer.daemon = True
-        self._debounce_timer.start()
-
-    def _fire_changes(self) -> None:
-        """Invoke the callback with collected changes and deletions."""
-        with self._lock:
-            if self._changed_paths or self._deleted_paths:
-                changed_copy = self._changed_paths.copy()
-                deleted_copy = self._deleted_paths.copy()
-                self._changed_paths.clear()
-                self._deleted_paths.clear()
-                self._debounce_timer = None
-                # Invoke callback outside lock to avoid deadlock
-                self._on_changes(self._repo_id, changed_copy, deleted_copy)
+    def _signal_top_level(self, *raw_paths: str, gone: str | None = None) -> None:
+        """Ask the manager to reconcile watches when an event touches a direct
+        child of the root, naming it when it was deleted or moved away
+        (`gone`). Called with `_lock` released."""
+        if self._request_reconcile is None:
+            return
+        gone_rel = self._rel(gone) if gone else None
+        if gone_rel is not None and len(gone_rel.parts) == 1:
+            self._request_reconcile(self._repo_id, gone_rel.name)
+            return
+        for raw in raw_paths:
+            rel = self._rel(raw)
+            if rel is not None and len(rel.parts) == 1:
+                self._request_reconcile(self._repo_id)
+                return

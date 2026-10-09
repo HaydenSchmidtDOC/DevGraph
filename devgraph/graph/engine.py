@@ -8,6 +8,7 @@ read, never an optional convenience — see Design Brief Principle 3.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -41,7 +42,7 @@ _EXTRACTED_IDENTITY_PROPERTIES = RESERVED_NODE_PROPERTIES | {"path"}
 # so those nodes are never file-scoped and a blind delete on any one
 # producing file would destroy a node the other file still claims. For that
 # population we track every claiming file in `sources` and only delete once
-# the last one is unclaimed — see _UNCLAIM_SOURCE_CYPHER.
+# the last one is unclaimed — see _unclaim_source_tx.
 _DELETE_BY_SOURCE_FILE_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) "
     "WHERE n.source_file = $file_name OR n.file = $file_name "
@@ -49,14 +50,133 @@ _DELETE_BY_SOURCE_FILE_CYPHER = (
     "DETACH DELETE n"
 )
 
+# A shared node's claims are read under its write lock (the no-op SET takes
+# it), so concurrent claims and unclaims of one node run one after another
+# instead of each overwriting the others from a stale read.
+_LOCK_AND_READ = "SET n.name = n.name RETURN elementId(n) AS id, properties(n) AS props"
+
 _UNCLAIM_SOURCE_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) "
     "WHERE n.file IS NULL AND n.source_file IS NULL "
     "  AND (n.source = $file_name OR $file_name IN coalesce(n.sources, [])) "
-    "SET n.sources = [s IN coalesce(n.sources, [n.source]) WHERE s <> $file_name] "
-    "WITH n WHERE size(n.sources) = 0 "
-    "DETACH DELETE n"
+    + _LOCK_AND_READ
 )
+
+# Shared nodes are attributed to their first source, whatever order the files
+# claim them in (watcher spec W10). `claims` is a JSON string (Neo4j has no
+# map properties) of {source: the properties that source wrote}; `sources`
+# is its sorted keys, and the node's written properties are exactly
+# claims[min(sources)]. Both directions run read-modify-write in Python inside
+# one write transaction, under the node's lock, and write back only the
+# properties the claim changed. These properties are never part of a claim:
+# the identity, the bookkeeping itself, and what other passes write.
+_UNCLAIMED_PROPERTIES = frozenset({
+    "repo_id", "name", "file", "source_file", "sources", "claims", "extractor",
+    "created_at", "last_modified_at", "last_modified_by",
+})
+
+
+def _claims_of(props: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """A shared node's claims. A legacy node (written before `claims`) has
+    `sources` alone: each listed source without an entry claims the node's
+    current properties."""
+    claims = json.loads(props["claims"]) if props.get("claims") else {}
+    listed = props.get("sources")
+    if listed is None:
+        listed = [props["source"]] if props.get("source") is not None else []
+    if any(source not in claims for source in listed):
+        current = {
+            key: value for key, value in props.items()
+            if key not in _UNCLAIMED_PROPERTIES and not key.startswith("insight_")
+        }
+        for source in listed:
+            claims.setdefault(source, {**current, "source": source})
+    return claims
+
+
+def _attribution(claims: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return claims[min(claims)] if claims else {}
+
+
+def _reattributed(
+    props: dict[str, Any], claims: dict[str, dict[str, Any]], before: dict[str, Any]
+) -> dict[str, Any]:
+    """The node's whole property map once `claims` changed from an attribution
+    of `before`: what `before` wrote and the new attribution lacks is removed."""
+    after = _attribution(claims)
+    updated = {key: value for key, value in props.items() if key not in before or key in after}
+    updated.update(after)
+    updated["sources"] = sorted(claims)
+    updated["claims"] = json.dumps(claims, sort_keys=True)
+    return updated
+
+
+def _changes(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """What `SET n += changes` needs to turn `before` into `after`: a null
+    removes a property. Properties no claim touches are left out, so a
+    concurrent writer's (`insight_*`) are never overwritten."""
+    changes = {key: value for key, value in after.items() if before.get(key) != value}
+    changes.update({key: None for key in before if key not in after})
+    return changes
+
+
+_WRITE_CHANGES_CYPHER = "UNWIND $rows AS row MATCH (n) WHERE elementId(n) = row.id SET n += row.changes"
+
+
+def _claim_nodes_tx(tx, label: str, rows: list[dict[str, Any]]) -> None:
+    """Claim shared nodes of one label for each row's `source`, in row order.
+
+    MERGEs as `MERGE (n:{label} {repo_id, name})` did, so a row claims every
+    node that MERGE matches, or the one it creates."""
+    keys = sorted({(row["repo_id"], row["name"]) for row in rows})
+    read: dict[str, dict[str, Any]] = {}
+    current: dict[str, dict[str, Any]] = {}
+    by_key: dict[tuple[str, str], list[str]] = {key: [] for key in keys}
+    for record in tx.run(
+        f"UNWIND $keys AS k MERGE (n:{label} {{repo_id: k[0], name: k[1]}}) "
+        "WITH k, n " + _LOCK_AND_READ + ", k[0] AS repo_id, k[1] AS name",
+        keys=[list(key) for key in keys],
+    ):
+        read[record["id"]] = dict(record["props"])
+        current[record["id"]] = dict(record["props"])
+        by_key[(record["repo_id"], record["name"])].append(record["id"])
+    for row in rows:
+        written = {key: value for key, value in row["properties"].items() if value is not None}
+        for node_id in by_key[(row["repo_id"], row["name"])]:
+            claims = _claims_of(current[node_id])
+            before = _attribution(claims)
+            claims[written["source"]] = written
+            current[node_id] = _reattributed(current[node_id], claims, before)
+    tx.run(
+        _WRITE_CHANGES_CYPHER,
+        rows=[{"id": node_id, "changes": _changes(read[node_id], props)} for node_id, props in current.items()],
+    )
+
+
+def _delete_by_source_file_tx(tx, repo_id: str, file_name: str) -> None:
+    tx.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
+    _unclaim_source_tx(tx, repo_id, file_name)
+
+
+def _unclaim_source_tx(tx, repo_id: str, file_name: str) -> None:
+    """Drop `file_name`'s claim on every shared node: re-attribute the node from
+    the new first source, or delete it when no claim is left."""
+    gone: list[str] = []
+    kept: list[dict[str, Any]] = []
+    for record in tx.run(_UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name):
+        props = dict(record["props"])
+        claims = _claims_of(props)
+        before = _attribution(claims)
+        claims.pop(file_name, None)
+        if claims:
+            kept.append({"id": record["id"], "changes": _changes(props, _reattributed(props, claims, before))})
+        else:
+            gone.append(record["id"])
+    if kept:
+        tx.run(_WRITE_CHANGES_CYPHER, rows=kept)
+    if gone:
+        tx.run("MATCH (n) WHERE elementId(n) IN $ids DETACH DELETE n", ids=gone)
+
 
 # Used by _replace_file_nodes_tx: delete only the file-scoped symbol nodes
 # (Class/Function) whose symbol no longer exists in the file's current
@@ -319,24 +439,24 @@ def _upsert_nodes_tx(tx, nodes: list[dict[str, Any]]) -> None:
             if file_scoped
             else "{repo_id: row.repo_id, name: row.name}"
         )
-        # Non-file-scoped nodes accumulate every claiming `source` into
-        # `sources` so delete_nodes_by_source_file can unclaim one producer
-        # without destroying a node another file still produces. A no-op
-        # when row.properties has no `source` (e.g. Module's `source_file`
-        # already uniquely identifies its one node).
-        sources_clause = (
-            ""
-            if file_scoped
-            else " SET n.sources = CASE WHEN row.properties.source IS NULL THEN n.sources "
-            "WHEN row.properties.source IN coalesce(n.sources, []) THEN n.sources "
-            "ELSE coalesce(n.sources, []) + row.properties.source END"
-        )
-        tx.run(
-            f"UNWIND $rows AS row "
-            f"MERGE (n:{label} {merge_key}) "
-            "SET n += row.properties" + sources_clause,
-            rows=rows,
-        )
+        # A non-file-scoped row with a `source` claims a shared node that
+        # several files can produce (see _claim_nodes_tx), so
+        # delete_nodes_by_source_file can unclaim one producer without
+        # destroying a node another file still produces. Every other row
+        # (e.g. Module, whose `source_file` already identifies its one node)
+        # is a plain MERGE.
+        claims = not file_scoped
+        claimed = [row for row in rows if claims and row["properties"].get("source") is not None]
+        plain = [row for row in rows if not (claims and row["properties"].get("source") is not None)]
+        if plain:
+            tx.run(
+                f"UNWIND $rows AS row "
+                f"MERGE (n:{label} {merge_key}) "
+                "SET n += row.properties",
+                rows=plain,
+            )
+        if claimed:
+            _claim_nodes_tx(tx, label, claimed)
 
 
 def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
@@ -392,7 +512,7 @@ def _replace_file_nodes_tx(
         )
     ]
     tx.run(_DELETE_STALE_FILE_NODES_CYPHER, repo_id=repo_id, file_name=file_name, keep=keep)
-    tx.run(_UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name)
+    _unclaim_source_tx(tx, repo_id, file_name)
     _upsert_nodes_tx(tx, nodes)
     _upsert_relationships_tx(tx, rels)
 
@@ -470,38 +590,13 @@ class GraphEngine:
     ) -> None:
         """Idempotent MERGE on (repo_id, name[, file]) for a repo-scoped node label.
 
-        Routed through the same `_is_file_scoped` predicate `_upsert_nodes_tx`
-        uses, so a caller passing a `file` property for a Class/Function/
+        Routed through `_upsert_nodes_tx` itself, so a caller passing a `file` property for a Class/Function/
         Service node gets the same collision-proof MERGE key the batched
-        indexer path does, instead of a second, un-unified implementation
-        that always MERGEs on bare (repo_id, name).
+        indexer path does, and a `source` claims a shared node the same way.
         """
-        props = properties or {}
-        file = props.get("file")
-        file_scoped = _is_file_scoped(file)
-        merge_key = (
-            "{repo_id: $repo_id, name: $name, file: $file}"
-            if file_scoped
-            else "{repo_id: $repo_id, name: $name}"
-        )
-        # See _upsert_nodes_tx for why non-file-scoped nodes accumulate
-        # `sources`.
-        sources_clause = (
-            ""
-            if file_scoped
-            else " SET n.sources = CASE WHEN $properties.source IS NULL THEN n.sources "
-            "WHEN $properties.source IN coalesce(n.sources, []) THEN n.sources "
-            "ELSE coalesce(n.sources, []) + $properties.source END"
-        )
         with self._driver.session() as session:
-            _retry_transient(
-                session.run,
-                f"MERGE (n:{label} {merge_key}) "
-                "SET n += $properties" + sources_clause,
-                repo_id=repo_id,
-                name=name,
-                file=file,
-                properties=props,
+            session.execute_write(
+                _upsert_nodes_tx, [{"label": label, "repo_id": repo_id, "name": name, "properties": properties or {}}]
             )
 
     def upsert_nodes(self, nodes: list[dict[str, Any]]) -> None:
@@ -611,11 +706,10 @@ class GraphEngine:
         construction and are deleted outright; `source` nodes can be
         co-produced by several files, so this file is unclaimed from
         `sources` and the node is only deleted once no file claims it —
-        see _UNCLAIM_SOURCE_CYPHER.
+        see _unclaim_source_tx.
         """
         with self._driver.session() as session:
-            _retry_transient(session.run, _DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
-            _retry_transient(session.run, _UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name)
+            session.execute_write(_delete_by_source_file_tx, repo_id, file_name)
 
     def delete_extracted_nodes(self, repo_id: str, extractor: str, paths: list[str]) -> None:
         """Delete one provider's nodes at these repo-relative paths, or below them."""
@@ -649,6 +743,20 @@ class GraphEngine:
                 repo_id=repo_id, extractor=extractor, labels=labels,
             )
             return {(record["label"], record["name"], record["path"]) for record in result or []}
+
+    def list_extracted_paths(self, repo_id: str, extractor: str, labels: list[str] | None) -> set[str]:
+        """The `path` of every node one provider wrote in a repo, only under
+        these labels when `labels` is given: the provider's side of the graph's
+        file list (see dispatch._graph_files)."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
+                "AND ($labels IS NULL OR labels(n)[0] IN $labels) AND n.path IS NOT NULL "
+                "RETURN DISTINCT n.path AS path",
+                repo_id=repo_id, extractor=extractor, labels=labels,
+            )
+            return {record["path"] for record in result or []}
 
     def prune_extracted_nodes(self, repo_id: str, extractor: str, keep: list[str]) -> int:
         """Delete every node of one provider in a repo except `keep` ("Label:name").
@@ -833,9 +941,9 @@ class GraphEngine:
         indexed. Covers both provenance styles: `source_file`/`file`
         properties, and bare `Module` nodes whose `name` *is* the file path
         (the docs/mentions extractors' shape). `Commit`/`Repository` nodes
-        and `source`-keyed nodes (Container/Service/API, co-produced by
-        several files) are deliberately excluded — they're not keyed to a
-        single file, so they can't be reconciled against the disk walk.
+        are excluded, and so are `source`-keyed shared nodes
+        (Container/Datastore/Endpoint, co-produced by several files): their
+        files come from `list_claim_sources`.
         """
         with self._driver.session() as session:
             result = _retry_transient(
@@ -848,6 +956,72 @@ class GraphEngine:
             )
             records = result or []
             return {record["path"] for record in records if record["path"]}
+
+    def list_claim_sources(self, repo_id: str) -> set[str]:
+        """Every repo-relative file claiming a shared node (`source`/`sources`)
+        in this repo: the files, such as a Dockerfile, that may back nothing
+        but a claim. Provider nodes are left out."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) "
+                "WHERE n.file IS NULL AND n.source_file IS NULL AND n.extractor IS NULL "
+                "  AND (n.sources IS NOT NULL OR n.source IS NOT NULL) "
+                "UNWIND coalesce(n.sources, [n.source]) AS source "
+                "RETURN DISTINCT source",
+                repo_id=repo_id,
+            )
+            return {record["source"] for record in result or [] if record["source"]}
+
+    def delete_bare_modules(self, repo_id: str) -> int:
+        """Delete this repo's `Module` nodes that have no file key at all (no
+        `source_file`, `file` or `path`), with their edges, and return how
+        many went. Every extractor writes `source_file` on its Module, so
+        only a leftover of the git-history sync's old MERGE looks like this
+        (a commit touching a README, an image or a since-deleted file)."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (m:Module {repo_id: $repo_id}) "
+                "WHERE m.source_file IS NULL AND m.file IS NULL AND m.path IS NULL "
+                "DETACH DELETE m RETURN count(m) AS n",
+                repo_id=repo_id,
+            )
+            record = result.single() if result is not None else None
+            return record["n"] if record else 0
+
+    def delete_docs_notes_outside(self, repo_id: str, folder: str) -> int:
+        """Delete this repo's docs notes (Requirement, DesignDecision,
+        ArchitectureNote) whose `source_file` is not under `folder` (a
+        repo-relative POSIX path, not the root), with their edges, and return
+        how many went. Notes under the docs path record their repo-relative
+        path, so only a note an older scan keyed by its bare filename, or one
+        left from a former docs path, looks like this."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) "
+                "WHERE (n:Requirement OR n:DesignDecision OR n:ArchitectureNote) "
+                "  AND n.source_file IS NOT NULL AND NOT n.source_file STARTS WITH $prefix "
+                "DETACH DELETE n RETURN count(n) AS n",
+                repo_id=repo_id,
+                prefix=folder.rstrip("/") + "/",
+            )
+            record = result.single() if result is not None else None
+            return record["n"] if record else 0
+
+    def list_docs_note_files(self, repo_id: str) -> set[str]:
+        """The `source_file` of every docs note (Requirement, DesignDecision,
+        ArchitectureNote) in this repo."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (n {repo_id: $repo_id}) "
+                "WHERE (n:Requirement OR n:DesignDecision OR n:ArchitectureNote) AND n.source_file IS NOT NULL "
+                "RETURN DISTINCT n.source_file AS path",
+                repo_id=repo_id,
+            )
+            return {record["path"] for record in result}
 
     def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str]]:
         """Return (label, name) for every node whose file provenance
@@ -937,6 +1111,10 @@ class GraphEngine:
         incremental batches). See `set_recency` for the plain-overwrite
         variant used during reconciliation.
 
+        Both only annotate a node that already exists (MATCH, not MERGE): a
+        commit also touches files that have no node (a README, an image, a
+        file deleted since), and recency must not create one for them.
+
         The `last_modified_by` CASE deliberately mirrors the
         `last_modified_at` comparison rather than having its own condition —
         that's what stops an out-of-order call from clobbering a newer
@@ -954,7 +1132,7 @@ class GraphEngine:
         with self._driver.session() as session:
             _retry_transient(
                 session.run,
-                f"MERGE (n:{label} {merge_key}) "
+                f"MATCH (n:{label} {merge_key}) "
                 "SET n.created_at = CASE WHEN $created_at IS NULL THEN n.created_at "
                 "WHEN n.created_at IS NULL OR $created_at < n.created_at THEN $created_at "
                 "ELSE n.created_at END, "
@@ -1003,7 +1181,7 @@ class GraphEngine:
         with self._driver.session() as session:
             _retry_transient(
                 session.run,
-                f"MERGE (n:{label} {merge_key}) "
+                f"MATCH (n:{label} {merge_key}) "
                 f"SET {', '.join(set_clauses)}",
                 repo_id=repo_id,
                 name=name,

@@ -55,12 +55,13 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # Node property names DevGraph itself owns. `repo_id`/`name`/`file` are the
 # identity key components (see graph/engine.py `identity_key`), and
 # `source_file`/`source`/`sources` are the provenance properties per-file
-# delete cleanup keys off. A per-project schema may not redeclare any of
+# delete cleanup keys off, and `claims` records what each of a shared node's
+# `sources` wrote (see graph/engine.py `_claims_of`). A per-project schema may not redeclare any of
 # them: a user-defined field of the same name would silently collide with
 # the value the pipeline writes. `extractor` marks nodes a schema-declared
 # provider owns (see devgraph/indexer/providers/).
 RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset(
-    {"repo_id", "name", "file", "source_file", "source", "sources", "extractor"}
+    {"repo_id", "name", "file", "source_file", "source", "sources", "claims", "extractor"}
 )
 
 # Labels other than Repository must be uniquely keyed on (repo_id, name)

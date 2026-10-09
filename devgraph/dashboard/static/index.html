@@ -2829,6 +2829,45 @@ async function bootConnect() {
 }
 bootConnect();
 
+/* ── Catch-up pill ── */
+/* While the agent catches up on changes it missed (on start, after a git
+   operation, after a failure), the Entities card's pill reads "Catching up…"
+   instead of "Live" -- for the selected repository, or any under All Repos.
+   `running` lists the repositories with a catch_up "running" event and no
+   "done"/"failed" yet; the reducer returns a new list and never changes the
+   one passed in. A dashboard opened mid-catch-up doesn't know about it. */
+const CATCH_UP_PILL_LABEL = "Catching up…";
+const LIVE_PILL_LABEL = "Live";
+function catchUpPillState(running, event, selectedRepo) {
+  let next = running;
+  if (event && event.type === "catch_up" && typeof event.repo_id === "string") {
+    next = running.filter(id => id !== event.repo_id);
+    if (event.state === "running") next.push(event.repo_id);
+  }
+  const busy = selectedRepo === "__all__" ? next.length > 0 : next.includes(selectedRepo);
+  return { running: next, label: busy ? CATCH_UP_PILL_LABEL : LIVE_PILL_LABEL };
+}
+let catchUpRunning = [];
+/* The pill's display as the topology counts last set it: hidden while Neo4j
+   is disconnected, shown once counts load (hidden in the markup until then).
+   A catch-up shows the pill whatever this is; when it ends the pill takes
+   this again, as it is then, not as it was when the catch-up began. */
+let entityPillTopologyDisplay = "none";
+function setEntityPillTopology(display) {
+  entityPillTopologyDisplay = display;
+  const pill = document.getElementById("entityLivePill");
+  if (pill.textContent !== CATCH_UP_PILL_LABEL) pill.style.display = display;
+}
+/* `event` is null on a repository switch, which only recomputes the label */
+function applyCatchUpPill(event) {
+  const pill = document.getElementById("entityLivePill");
+  const next = catchUpPillState(catchUpRunning, event, document.getElementById("repoSelect").value);
+  catchUpRunning = next.running;
+  pill.textContent = next.label;
+  pill.style.display = next.label === CATCH_UP_PILL_LABEL ? "inline-block" : entityPillTopologyDisplay;
+}
+/* ── end Catch-up pill ── */
+
 /* ── live auto-refresh: consumes the backend's /api/events SSE stream
    (agent/tray.py's watcher/reindex/git-sync code already publishes real
    events into it -- this was the missing half; nothing in the frontend
@@ -2843,6 +2882,7 @@ function connectLiveEvents() {
   es.onmessage = async (e) => {
     let event;
     try { event = JSON.parse(e.data); } catch { return; }
+    if (event.type === "catch_up") { applyCatchUpPill(event); return; } // status only: a catch-up that changed something is followed by "reindexed"
     /* the Config page lists every repo whatever the graph shows: once opened,
        a registry change or a real rescan (schema state, badges) refreshes it */
     if (configModel && (event.type === "registry_changed" || (event.type === "reindexed" && (event.changed || event.deleted)))) loadConfigPage(true);
@@ -2961,6 +3001,7 @@ document.getElementById("pullTab").addEventListener("click", () => document.getE
 async function onRepoSelectChange(e) {
   const v = e.target.value;
   localStorage.setItem(SELECTED_REPO_KEY, v);
+  applyCatchUpPill(null);
   if (neo4jConnected) await loadSchemaTypes(v); // before the graph fetch, so a type the new repo lacks is no longer isolated
   const loaded = await refreshGraph("full", true, true); // switching repos is a deliberate scope change, not an incremental update -- always caps the displayed set to it, even in highlight mode
   if (!loaded && !neo4jConnected) buildQueryFromState();
@@ -5745,9 +5786,8 @@ document.getElementById("btnRecomputeInsights").addEventListener("click", recomp
    leaderboard starts as a plain-Cypher degree count; loadInsights swaps in
    PageRank when graph insights are computed. ── */
 async function loadTopologyCounts() {
-  const entityPill = document.getElementById("entityLivePill");
   const relPill = document.getElementById("relSamplePill");
-  if (!neo4jConnected) { entityPill.style.display = "none"; relPill.textContent = "Not wired"; relPill.className = "sample-pill"; return; }
+  if (!neo4jConnected) { setEntityPillTopology("none"); relPill.textContent = "Not wired"; relPill.className = "sample-pill"; return; }
   const repo = document.getElementById("repoSelect").value;
   const isolatedEntityId = state.isolatedEntity;
   const nodeFilters = [];
@@ -5770,7 +5810,7 @@ async function loadTopologyCounts() {
       });
       const docCount = counts["Document"] ?? (isolatedEntityId ? 0 : undefined);
       if (docCount !== undefined) document.getElementById("docCount").textContent = docCount.toLocaleString();
-      entityPill.style.display = "inline-block";
+      setEntityPillTopology("inline-block");
 
       /* real total (of whatever's currently isolated) replaces the
          static-demo total (794) the Node ceiling slider was seeded with at

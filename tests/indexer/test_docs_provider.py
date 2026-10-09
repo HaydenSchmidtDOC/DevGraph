@@ -945,6 +945,30 @@ def test_files_by_rel_keys_a_symlinked_file_by_its_target_like_the_indexer(tmp_p
     assert docs.files_by_rel(tmp_path, [link]) == {"real/a.md": link}
 
 
+def test_files_by_rel_does_not_resolve_every_plain_file(tmp_path, monkeypatch):
+    written = write(tmp_path, {f"runbooks/r{n}.md": fm("owner: ops") for n in range(20)})
+    resolved = []
+    original = Path.resolve
+
+    def counting(self, *args, **kwargs):
+        resolved.append(self)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", counting)
+    assert len(docs.files_by_rel(tmp_path)) == 20
+    assert len(docs.files_by_rel(tmp_path, written.values())) == 20
+    assert len(resolved) <= 2  # the root, once per call
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_files_by_rel_leaves_out_a_symlink_into_an_ignored_directory_like_the_indexer(tmp_path):
+    written = write(tmp_path, {"node_modules/a.md": fm("owner: ops"), "runbooks/b.md": fm("owner: ops")})
+    link = tmp_path / "runbooks" / "a.md"
+    link.symlink_to(written["node_modules/a.md"])
+    assert set(docs.files_by_rel(tmp_path)) == {"runbooks/b.md"}
+    assert set(docs.files_by_rel(tmp_path)) == {rel for _, rel in walk.keyed_indexable_paths(tmp_path)}
+
+
 def test_provider_and_walk_never_import_the_dispatcher():
     code = (
         "import sys\n"

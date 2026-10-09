@@ -90,8 +90,9 @@ def add(
                 try:
                     provision_repository_schema(engine, record.path)
                     engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
+                    started = datetime.now(timezone.utc)
                     count = full_scan(engine, record.repo_id, record.path, docs_path=record.docs_path, mentions_enabled=record.mentions_enabled)
-                    registry.mark_indexed(record.repo_id)
+                    registry.mark_indexed(record.repo_id, at=started)
                     console.print(f"[green][OK][/green] Indexed {count} file(s)")
 
                     if full:
@@ -270,8 +271,9 @@ def rescan(
             try:
                 provision_repository_schema(engine, repo.path)
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
+                started = datetime.now(timezone.utc)
                 count = full_scan(engine, repo_id, repo.path, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled)
-                registry.mark_indexed(repo_id)
+                registry.mark_indexed(repo_id, at=started)
                 console.print(f"[green][OK][/green] Rescanned {escape(repo_id)}: {count} file(s) indexed")
 
                 # Always reconcile git history on a rescan — not just with
@@ -478,7 +480,7 @@ def annotate(
                 )
                 try:
                     engine.init_schema()
-                    index_doc_file(engine, repo_id, note_path)
+                    index_doc_file(engine, repo_id, note_path, repo.path)
                     console.print(f"[green][OK][/green] Indexed note: {escape(note)}")
                 finally:
                     engine.close()
@@ -870,7 +872,6 @@ def _docs_source_findings(repos: list[Any], engine: Any) -> list[dict[str, Any]]
     question: they are checked when `engine` is given, else reported skipped.
     """
     from devgraph.config.project_schema import ProjectSchemaError, resolve_effective_schema
-    from devgraph.indexer import walk
     from devgraph.indexer.providers import docs
 
     findings: list[dict[str, Any]] = []
@@ -887,11 +888,13 @@ def _docs_source_findings(repos: list[Any], engine: Any) -> list[dict[str, Any]]
             findings.append({"repo_id": repo_id, "status": status, "detail": detail})
 
         try:
-            files = walk.indexable_paths(repo.path)
+            by_rel = docs.files_by_rel(repo.path)
             # each matched file is read once, for both the report and the links
-            selected = docs.read_selected(spec, docs.files_by_rel(repo.path, files))
+            selected = docs.read_selected(spec, by_rel)
             claims = docs.keyed_claims(spec, selected)
-            for line in docs.source_report(repo.path, effective, files, selected=selected, claims=claims):
+            for line in docs.source_report(
+                repo.path, effective, by_rel.values(), selected=selected, claims=claims, by_rel=by_rel
+            ):
                 add(line["status"], line["detail"])
             if not spec.relationships:
                 continue

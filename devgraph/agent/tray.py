@@ -24,20 +24,19 @@ import logging
 import threading
 import webbrowser
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pystray
 import uvicorn
 from PIL import Image, ImageDraw
 
 from devgraph.agent.schema_rescan import SchemaRescanScheduler
+from devgraph.agent.sync import RepoSync
 from devgraph.analytics.insights import InsightsScheduler
 from devgraph.config import get_settings
 from devgraph.dashboard.app import build_app
 from devgraph.dashboard.url import dashboard_url
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.graph.engine import GraphEngine
-from devgraph.indexer.dispatch import index_paths, remove_paths
 from devgraph.indexer.git_history.extractor import sync_git_history
 from devgraph.registry.store import RepoRegistry
 from devgraph.watcher.manager import WatcherManager
@@ -91,14 +90,28 @@ class TrayApp:
         self._engine = GraphEngine(
             self._settings.neo4j_uri, self._settings.neo4j_user, self._settings.neo4j_password
         )
-        self._watcher = WatcherManager(self._registry, on_changes=self._on_changes, on_git_state_changed=self._on_git_state_changed)
+        self._events = EventBroadcaster()
+        # RepoSync and the watcher need each other: the lambda resolves
+        # self._watcher only when a catch-up is requested.
+        self._sync = RepoSync(
+            self._engine, self._registry, self._on_sync_event,
+            request_catch_up=lambda *a: self._watcher.request_catch_up(*a),
+        )
+        self._watcher = WatcherManager(
+            self._registry,
+            on_changes=self._sync.on_changes,
+            on_git_state_changed=self._on_git_state_changed,
+            on_catch_up=self._sync.on_catch_up,
+        )
         self._paused = False
         self._healthy = True
         self._stop_event = threading.Event()
         self._icon: pystray.Icon | None = None  # type: ignore[valid-type]
         self._last_seen_registry_change = self._registry.last_changed_at()
-        self._events = EventBroadcaster()
-        self._schema_rescans = SchemaRescanScheduler(self._engine, self._registry, on_rescanned=self._on_schema_rescanned, is_paused=lambda: self._paused)
+        self._schema_rescans = SchemaRescanScheduler(
+            self._engine, self._registry, on_rescanned=self._on_schema_rescanned,
+            is_paused=lambda: self._paused, run_exclusive=self._watcher.run_exclusive,
+        )
         self._insights = InsightsScheduler(self._engine, self._registry, on_refreshed=self._on_insights_refreshed)
         self._dashboard_loop: asyncio.AbstractEventLoop | None = None
         self._dashboard_server: uvicorn.Server | None = None
@@ -107,36 +120,14 @@ class TrayApp:
     def _on_schema_rescanned(self, repo_id: str, files: int) -> None:
         self._events.publish({"type": "reindexed", "repo_id": repo_id, "changed": files, "deleted": 0})
 
-    def _on_changes(self, repo_id: str, changed_paths: set[Path], deleted_paths: set[Path]) -> None:
-        """Route watcher events to the indexer. This is the piece that closes the
-        "developer saves file -> graph refreshed" loop from the Design Brief —
-        previously the watcher only logged changes and nothing consumed them.
-        """
-        logger.info(
-            "changes detected for %s: %d changed, %d deleted",
-            repo_id,
-            len(changed_paths),
-            len(deleted_paths),
-        )
-        try:
-            repo = self._registry.get(repo_id)
-            if repo is None:
-                return  # repo was removed between the event firing and now
-            if changed_paths:
-                index_paths(self._engine, repo_id, repo.path, changed_paths, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled)
-            if deleted_paths:
-                remove_paths(self._engine, repo_id, repo.path, deleted_paths)
-            self._registry.mark_indexed(repo_id)
-            self._events.publish(
-                {
-                    "type": "reindexed",
-                    "repo_id": repo_id,
-                    "changed": len(changed_paths),
-                    "deleted": len(deleted_paths),
-                }
-            )
-        except Exception:
-            logger.warning("incremental reindex failed for %s", repo_id, exc_info=True)
+    def _on_sync_event(self, event: dict) -> None:
+        """Publish RepoSync's events, and show a catch-up on the icon."""
+        self._events.publish(event)
+        if event["type"] == "catch_up":
+            try:
+                self._refresh_icon()
+            except Exception:
+                logger.warning("tray icon refresh failed", exc_info=True)
 
     def _on_insights_refreshed(self, repo_id: str) -> None:
         self._events.publish({"type": "insights_refreshed", "repo_id": repo_id})
@@ -144,15 +135,23 @@ class TrayApp:
     def _on_git_state_changed(self, repo_id: str) -> None:
         """Route git state change events to the git history syncer.
 
-        Called when .git directory state changes (file save, branch switch, etc.),
-        debounced via WatcherManager. Syncs git history and updates recency
+        Called by WatcherManager after every catch-up of a git repository
+        (on start, after a git operation, on a retry), under its batch lock. Syncs git history and updates recency
         accordingly — handles append-only fast path as well as history rewrites
         (rebase, reset, amend).
         """
-        logger.info("git state changed for %s, syncing history", repo_id)
+        logger.debug("syncing git history for %s", repo_id)
         try:
-            result = sync_git_history(self._engine, self._registry, repo_id)
-            logger.info(
+            result = sync_git_history(
+                self._engine, self._registry, repo_id,
+                on_initial=lambda count: logger.info(
+                    "Reading the git history of %s for the first time (%s commits); "
+                    "live updates resume when it finishes", repo_id, f"{count:,}",
+                ),
+            )
+            # Every catch-up ends with a sync, so one with HEAD unmoved is quiet.
+            logger.log(
+                logging.DEBUG if result.get("mode") == "noop" else logging.INFO,
                 "git history synced for %s: mode=%s, indexed=%d, deleted=%d",
                 repo_id,
                 result.get("mode"),
@@ -175,7 +174,10 @@ class TrayApp:
         while not self._stop_event.is_set():
             try:
                 self._engine.verify_connectivity()
+                recovered = not self._healthy
                 self._healthy = True
+                if recovered:
+                    self._sync.retry_failed()
             except Exception:
                 logger.warning("Neo4j health check failed", exc_info=True)
                 self._healthy = False
@@ -269,11 +271,17 @@ class TrayApp:
         self._icon.title = self._status_text()
 
     def _status_text(self) -> str:
-        state = "paused" if self._paused else ("ok" if self._healthy else "warning")
+        if self._paused:
+            state = "paused"
+        elif not self._healthy:
+            state = "warning"
+        else:
+            state = "catching up" if self._sync.running else "ok"
         return f"DevGraph ({state})"
 
     def _toggle_pause(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
         self._paused = not self._paused
+        self._sync.stopping = self._paused
         try:
             if self._paused:
                 self._watcher.stop()
@@ -285,6 +293,7 @@ class TrayApp:
             # state stays truthful.
             logger.warning("watcher pause/resume failed", exc_info=True)
             self._paused = not self._paused
+            self._sync.stopping = self._paused
         self._refresh_icon()
 
     def _open_dashboard(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
@@ -305,7 +314,10 @@ class TrayApp:
         self._dashboard_loop = loop
         self._events.bind_loop(loop)
 
-        app = build_app(self._engine, self._registry, self._events, self._settings.dashboard_host)
+        app = build_app(
+            self._engine, self._registry, self._events, self._settings.dashboard_host,
+            run_exclusive=self._watcher.run_exclusive,
+        )
         # The tray's pystray main loop keeps owning the process's signal
         # handling. uvicorn's Server.capture_signals() already detects it is
         # not running on the main thread and skips installing its own
@@ -339,6 +351,7 @@ class TrayApp:
 
     def _quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
         self._stop_event.set()
+        self._sync.stopping = True
         self._watcher.stop()
         self._schema_rescans.stop()
         self._insights.stop()
@@ -385,6 +398,7 @@ class TrayApp:
                 self._icon.run()
         except Exception:
             logger.critical("pystray event loop crashed", exc_info=True)
+            self._sync.stopping = True
             self._watcher.stop()
             self._schema_rescans.stop()
             self._insights.stop()

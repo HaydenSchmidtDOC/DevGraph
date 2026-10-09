@@ -39,7 +39,7 @@ from devgraph.config.project_schema import INT64_MAX, INT64_MIN, Condition, Docs
 from devgraph.config.project_tools import YAML_LOAD_ERRORS
 from devgraph.config.yaml_bound import YAML_MAX_NODES, bounded_safe_load
 from devgraph.indexer.docs.extractor import _FRONTMATTER_RE
-from devgraph.indexer.walk import is_ignored_path, repo_relative
+from devgraph.indexer.walk import keyed_indexable_paths
 from devgraph.paths import MAX_CONFIG_BYTES, FileTooLarge, NotRegularFile, read_bounded
 
 EXTRACTOR = "docs"
@@ -605,22 +605,23 @@ def _plural(count: int, one: str, many: str) -> str:
     return f"{count} {one if count == 1 else many}"
 
 
-def files_by_rel(repo_root: Path, files: Iterable[Path]) -> dict[str, Path]:
-    """`files` keyed by their repo-relative POSIX path, as `read_selected` takes them.
+def files_by_rel(repo_root: Path, files: Iterable[Path] | None = None) -> dict[str, Path]:
+    """The repository's indexable files keyed by repo-relative POSIX path, as `read_selected` takes them.
 
-    Keyed like the indexer (`walk.repo_relative`), so a symlink is keyed by its
-    target; a path outside the repository or, through a symlink, under an
-    ignored directory is left out.
+    The same walk and keys as the indexer's `_disk_files` (`walk.keyed_indexable_paths`),
+    so a symlink is keyed by its target and one into an ignored directory is
+    left out. `files` narrows the result to those paths; one the walk does not
+    yield (outside the repository, ignored) is left out.
     """
-    return {
-        rel: path for path in files
-        if (rel := repo_relative(repo_root, path)) is not None and not is_ignored_path(Path(rel))
-    }
+    keyed = {path: rel for path, rel in keyed_indexable_paths(repo_root)}
+    if files is None:
+        return {rel: path for path, rel in keyed.items()}
+    return {rel: path for path in files if (rel := keyed.get(path)) is not None}
 
 
 def source_report(
     repo_root: Path, effective: EffectiveSchema, files: Iterable[Path], *, selected: Selected | None = None,
-    claims: Mapping[tuple[str, str], list[str]] | None = None,
+    claims: Mapping[tuple[str, str], list[str]] | None = None, by_rel: Mapping[str, Path] | None = None,
 ) -> list[dict[str, str]]:
     """Doctor lines for each docs-sourced type: {"status": "ok" | "warning", "detail": ...}.
 
@@ -632,7 +633,8 @@ def source_report(
     spec = docs_spec(effective)
     if spec is None:
         return []
-    by_rel = files_by_rel(repo_root, files)
+    if by_rel is None:
+        by_rel = files_by_rel(repo_root, files)
     if selected is None:
         selected = read_selected(spec, by_rel)
     if claims is None:

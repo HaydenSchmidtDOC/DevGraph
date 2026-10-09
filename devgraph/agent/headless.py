@@ -15,18 +15,17 @@ import logging
 import signal
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
 
 import uvicorn
 
 from devgraph.agent.schema_rescan import SchemaRescanScheduler
+from devgraph.agent.sync import RepoSync
 from devgraph.analytics.insights import InsightsScheduler
 from devgraph.config import get_settings
 from devgraph.dashboard.app import build_app
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.dashboard.url import dashboard_url
 from devgraph.graph.engine import GraphEngine
-from devgraph.indexer.dispatch import index_paths, remove_paths
 from devgraph.indexer.git_history.extractor import sync_git_history
 from devgraph.registry.store import RepoRegistry
 from devgraph.watcher.manager import WatcherManager
@@ -63,12 +62,26 @@ class HeadlessAgent:
         self._engine = GraphEngine(
             self._settings.neo4j_uri, self._settings.neo4j_user, self._settings.neo4j_password
         )
-        self._watcher = WatcherManager(self._registry, on_changes=self._on_changes, on_git_state_changed=self._on_git_state_changed)
+        self._events = EventBroadcaster()
+        # RepoSync and the watcher need each other: the lambda resolves
+        # self._watcher only when a catch-up is requested.
+        self._sync = RepoSync(
+            self._engine, self._registry, self._events.publish,
+            request_catch_up=lambda *a: self._watcher.request_catch_up(*a),
+        )
+        self._watcher = WatcherManager(
+            self._registry,
+            on_changes=self._sync.on_changes,
+            on_git_state_changed=self._on_git_state_changed,
+            on_catch_up=self._sync.on_catch_up,
+        )
         self._healthy = True
         self._stop_event = threading.Event()
         self._last_seen_registry_change = self._registry.last_changed_at()
-        self._events = EventBroadcaster()
-        self._schema_rescans = SchemaRescanScheduler(self._engine, self._registry, on_rescanned=self._on_schema_rescanned)
+        self._schema_rescans = SchemaRescanScheduler(
+            self._engine, self._registry, on_rescanned=self._on_schema_rescanned,
+            run_exclusive=self._watcher.run_exclusive,
+        )
         self._insights = InsightsScheduler(self._engine, self._registry, on_refreshed=self._on_insights_refreshed)
         self._dashboard_server: uvicorn.Server | None = None
         self._dashboard_thread: threading.Thread | None = None
@@ -76,48 +89,29 @@ class HeadlessAgent:
     def _on_schema_rescanned(self, repo_id: str, files: int) -> None:
         self._events.publish({"type": "reindexed", "repo_id": repo_id, "changed": files, "deleted": 0})
 
-    def _on_changes(self, repo_id: str, changed_paths: set[Path], deleted_paths: set[Path]) -> None:
-        logger.info(
-            "changes detected for %s: %d changed, %d deleted",
-            repo_id,
-            len(changed_paths),
-            len(deleted_paths),
-        )
-        try:
-            repo = self._registry.get(repo_id)
-            if repo is None:
-                return
-            if changed_paths:
-                index_paths(self._engine, repo_id, repo.path, changed_paths, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled)
-            if deleted_paths:
-                remove_paths(self._engine, repo_id, repo.path, deleted_paths)
-            self._registry.mark_indexed(repo_id)
-            self._events.publish(
-                {
-                    "type": "reindexed",
-                    "repo_id": repo_id,
-                    "changed": len(changed_paths),
-                    "deleted": len(deleted_paths),
-                }
-            )
-        except Exception:
-            logger.warning("incremental reindex failed for %s", repo_id, exc_info=True)
-
     def _on_insights_refreshed(self, repo_id: str) -> None:
         self._events.publish({"type": "insights_refreshed", "repo_id": repo_id})
 
     def _on_git_state_changed(self, repo_id: str) -> None:
         """Route git state change events to the git history syncer.
 
-        Called when .git directory state changes (file save, branch switch, etc.),
-        debounced via WatcherManager. Syncs git history and updates recency
+        Called by WatcherManager after every catch-up of a git repository
+        (on start, after a git operation, on a retry), under its batch lock. Syncs git history and updates recency
         accordingly — handles append-only fast path as well as history rewrites
         (rebase, reset, amend).
         """
-        logger.info("git state changed for %s, syncing history", repo_id)
+        logger.debug("syncing git history for %s", repo_id)
         try:
-            result = sync_git_history(self._engine, self._registry, repo_id)
-            logger.info(
+            result = sync_git_history(
+                self._engine, self._registry, repo_id,
+                on_initial=lambda count: logger.info(
+                    "Reading the git history of %s for the first time (%s commits); "
+                    "live updates resume when it finishes", repo_id, f"{count:,}",
+                ),
+            )
+            # Every catch-up ends with a sync, so one with HEAD unmoved is quiet.
+            logger.log(
+                logging.DEBUG if result.get("mode") == "noop" else logging.INFO,
                 "git history synced for %s: mode=%s, indexed=%d, deleted=%d",
                 repo_id,
                 result.get("mode"),
@@ -140,7 +134,10 @@ class HeadlessAgent:
         while not self._stop_event.is_set():
             try:
                 self._engine.verify_connectivity()
+                recovered = not self._healthy
                 self._healthy = True
+                if recovered:
+                    self._sync.retry_failed()
             except Exception:
                 logger.warning("Neo4j health check failed", exc_info=True)
                 self._healthy = False
@@ -174,7 +171,10 @@ class HeadlessAgent:
         asyncio.set_event_loop(loop)
         self._events.bind_loop(loop)
 
-        app = build_app(self._engine, self._registry, self._events, self._settings.dashboard_host)
+        app = build_app(
+            self._engine, self._registry, self._events, self._settings.dashboard_host,
+            run_exclusive=self._watcher.run_exclusive,
+        )
         config = uvicorn.Config(
             app,
             host=self._settings.dashboard_host,
@@ -195,6 +195,7 @@ class HeadlessAgent:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._sync.stopping = True
         self._watcher.stop()
         self._schema_rescans.stop()
         self._insights.stop()

@@ -29,6 +29,7 @@ import json
 import logging
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -243,8 +244,14 @@ def build_router(
     events: EventBroadcaster,
     query_log: QueryLog | None = None,
     metrics: MetricsHistory | None = None,
+    run_exclusive: Callable[[str, Callable[[], Any]], Any] | None = None,
 ) -> APIRouter:
+    """`run_exclusive(repo_id, fn)` is the agent's watcher's: registration's
+    scan and stamp run under the repository's batch lock (W4)."""
     router = APIRouter(prefix="/api")
+    if run_exclusive is None:
+        def run_exclusive(repo_id: str, fn: Callable[[], Any]) -> Any:
+            return fn()
     query_log = query_log if query_log is not None else QueryLog()
     # Not started here: `build_app` runs the sampler under the app lifespan.
     # Unstarted, it takes a fresh reading per request.
@@ -289,8 +296,9 @@ def build_router(
     def _register_repo(path: str, repo_id: str | None) -> dict[str, Any]:
         """Register + initially scan, exactly as `devgraph add <path>` does.
 
-        Blocking (SQLite write, Neo4j round trips, a full file walk), so it
-        runs in a threadpool -- the event loop also serves the SSE stream the
+        Blocking (SQLite write, Neo4j round trips, a full file walk, and a
+        wait on the repository's batch lock while a live batch or catch-up
+        holds it), so it runs in a threadpool -- the event loop also serves the SSE stream the
         dashboard is watching while this runs.
         """
         try:
@@ -310,14 +318,23 @@ def build_router(
         try:
             provision_repository_schema(engine, record.path)
             engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
-            files_indexed = full_scan(
-                engine,
-                record.repo_id,
-                record.path,
-                docs_path=record.docs_path,
-                mentions_enabled=record.mentions_enabled,
-            )
-            registry.mark_indexed(record.repo_id)
+
+            def scan_and_stamp() -> int:
+                started = datetime.now(timezone.utc)
+                count = full_scan(
+                    engine,
+                    record.repo_id,
+                    record.path,
+                    docs_path=record.docs_path,
+                    mentions_enabled=record.mentions_enabled,
+                )
+                registry.mark_indexed(record.repo_id, at=started)
+                return count
+
+            # Waits on the repository's batch lock (W4): a watcher that picks
+            # the new repository up mid-scan waits too, then catches up from
+            # this stamp.
+            files_indexed = run_exclusive(record.repo_id, scan_and_stamp)
             indexed = True
         except Exception as exc:
             # Registration already committed to SQLite; an indexing failure

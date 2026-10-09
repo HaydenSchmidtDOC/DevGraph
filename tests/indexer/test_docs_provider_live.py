@@ -1118,6 +1118,20 @@ def test_deleting_the_folder_removes_every_entry(engine, keyed):
     assert_matches_fresh_apply(engine, REPO, keyed)
 
 
+def test_deleting_a_keyed_folder_linked_from_another_folder_matches_a_fresh_apply(engine, keyed):
+    md(keyed, "decisions/sub/rfc.md", "kind: rfc\nid: RFC-1")
+    md(keyed, "notes/rfc-copy.md", "kind: rfc\nid: RFC-1")
+    md(keyed, "decisions/adr-014.md", "id: ADR-014\nrfc: RFC-1\nrunbook: runbooks/deploy.md")
+    md(keyed, "notes/adr-link.md", "kind: rfc\nid: RFC-2")
+    kscan(engine, keyed)
+    shutil.rmtree(keyed / "decisions")
+    remove_paths(engine, REPO, keyed, {keyed / "decisions"})
+    assert entries(engine) == {}
+    assert entries(engine, RFC) == {"RFC-1": "notes/rfc-copy.md", "RFC-2": "notes/adr-link.md"}
+    assert links(engine, "ZZ_RUNBOOK_ADR") == []
+    assert_matches_fresh_apply(engine, REPO, keyed)
+
+
 # --- bounds ------------------------------------------------------------------
 
 

@@ -87,6 +87,13 @@ def indexable_paths(repo_root: Path) -> set[Path]:
     return {path for path, _, _ in _walk(repo_root)}
 
 
+def indexable_paths_under(repo_root: Path, directory: Path) -> set[Path]:
+    """The `indexable_paths` of repo_root that lie under `directory`, found by
+    walking only that directory. Empty for a directory outside the root, under
+    an ignored directory, or a symlink (never followed, as in `_walk`)."""
+    return {path for path, _, _ in _walk(repo_root, directory)}
+
+
 def keyed_indexable_paths(repo_root: Path, *, keep_ignored_targets: bool = False) -> list[tuple[Path, str]]:
     """Each of `indexable_paths` with its `repo_relative` key, leaving out one
     whose key is under an ignored directory (a symlink into one) unless
@@ -111,7 +118,7 @@ def keyed_indexable_paths(repo_root: Path, *, keep_ignored_targets: bool = False
     return keyed
 
 
-def _walk(repo_root: Path) -> Iterator[tuple[Path, str, bool]]:
+def _walk(repo_root: Path, start: Path | None = None) -> Iterator[tuple[Path, str, bool]]:
     """(path, lexical repo-relative POSIX path, whether a link is on the way)
     for every indexable file: what `repo_root.rglob("*")` filtered by
     `is_indexable_file`, `is_ignored_path` and `links_outside` gives, without
@@ -120,11 +127,27 @@ def _walk(repo_root: Path) -> Iterator[tuple[Path, str, bool]]:
     below one are marked as linked, but only one whose target is inside the
     repository and not under an ignored directory (the rule a symlinked file
     follows), so nothing outside the repository is ever walked.
+
+    `start`, a directory lexically under repo_root, walks only that subtree
+    under the same rules, judged relative to repo_root.
     """
     if is_ignored_path(repo_root):
         return
     root: Path | None = None  # resolved at the first junction, if any
     stack = [(repo_root, "", False)]
+    if start is not None and start != repo_root:
+        try:
+            rel = start.relative_to(repo_root)
+        except ValueError:
+            return
+        if is_ignored_path(rel) or start.is_symlink():
+            return
+        junction = start.is_junction()
+        if junction:
+            root = repo_root.resolve()
+            if not _junction_inside(start, root):
+                return
+        stack = [(start, f"{rel.as_posix()}/", junction)]
     while stack:
         directory, prefix, linked = stack.pop()
         try:

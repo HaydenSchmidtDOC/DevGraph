@@ -1,6 +1,7 @@
 """SchemaRescanScheduler debounce decisions, with stubs and a fake clock."""
 
 import threading
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,12 +22,14 @@ class Registry:
     def __init__(self, repos):
         self.repos = repos
         self.marked = []
+        self.stamps = []
 
     def list_repos(self, active_only=False):
         return list(self.repos)
 
-    def mark_indexed(self, repo_id):
+    def mark_indexed(self, repo_id, at=None):
         self.marked.append(repo_id)
+        self.stamps.append(at)
 
 
 class Clock:
@@ -194,3 +197,34 @@ def test_failure_streak_warns_once(monkeypatch, tmp_path, caplog):
         sched.run_once()
     warnings = [r for r in caplog.records if r.levelname == "WARNING" and "check failed" in r.getMessage()]
     assert len(warnings) == 1
+
+
+T0 = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
+T1 = T0 + timedelta(minutes=5)
+
+
+def test_the_stamp_is_the_scans_start_and_the_scan_runs_exclusively(monkeypatch, tmp_path):
+    state = setup(monkeypatch, tmp_path)
+
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return T1 if state["scans"] else T0
+
+    monkeypatch.setattr(schema_rescan, "datetime", FakeDatetime)
+    exclusive = []
+
+    def run_exclusive(repo_id, fn):
+        exclusive.append(repo_id)
+        assert state["scans"] == []
+        result = fn()
+        assert state["scans"] == [repo_id]
+        return result
+
+    clock, registry = Clock(), Registry([Repo("r", tmp_path)])
+    sched = SchemaRescanScheduler(None, registry, clock=clock, run_exclusive=run_exclusive)
+    sched.run_once()
+    clock.now += 301
+    assert sched.run_once() == ["r"]
+    assert exclusive == ["r"]
+    assert registry.stamps == [T0]

@@ -30,6 +30,7 @@ const fnSrc = [
   grab(/^function applySchemaTypes\(/m, "\n}"),
   grab(/^function relSelector\(/m, "\n}"),
   grab(/^let schemaRequestSeq = 0;/m, "\n}"),   // the sequence counter and loadSchemaTypes
+  grab(/^\/\* ── Catch-up pill ── \*\//m, "/* ── end Catch-up pill ── */"),  // the live handler and repo switch update the pill
   grab(/^function connectLiveEvents\(/m, "\n}"),
   grab(/^function refreshIsolateUI\(/m, "\n}"),
   grab(/^function escapeCypherStr\(/m, "\n"),
@@ -124,7 +125,7 @@ const mkEl = tag => {
   return el;
 };
 const els = {
-  entityCounts: mkEl("div"), relTypes: mkEl("div"), schemaPendingHint: mkEl("div"),
+  entityCounts: mkEl("div"), relTypes: mkEl("div"), schemaPendingHint: mkEl("div"), entityLivePill: mkEl("span"),
   repoSelect: mkEl("select"), ctlLiveUpdate: Object.assign(mkEl("input"), { checked: true }),
   ctlNodeCeiling: Object.assign(mkEl("input"), { max: 100 }),
   ctlRelCeiling: Object.assign(mkEl("input"), { max: 100 }),
@@ -363,6 +364,22 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
   check("...and then refreshes the graph", order.join() === "refreshGraph", order.join());
   check("...so the pending hint clears", !hintShown(), els.schemaPendingHint.style.display);
   check("...and the newly applied label gets its row", rowLabels().includes("Folder"), JSON.stringify(rowLabels()));
+
+  // 9b. a catch-up shows on the Entities pill, even with live updates paused, and reloads nothing itself
+  const pill = els.entityLivePill;
+  els.ctlLiveUpdate.checked = false;
+  order = [];
+  await eventSource.onmessage({ data: JSON.stringify({ type: "catch_up", repo_id: "waiting", state: "running", changed: 0, deleted: 0 }) });
+  check("a catch-up of the selected repo reads Catching up… on the pill", pill.textContent === "Catching up…", pill.textContent);
+  check("...and shows the pill", pill.style.display === "inline-block", pill.style.display);
+  check("...without reloading the graph", order.length === 0, order.join());
+  els.ctlLiveUpdate.checked = true;
+  await switchTo("alpha");
+  check("switching to a repo with no catch-up reads Live", pill.textContent === "Live", pill.textContent);
+  await switchTo("waiting");
+  check("switching back reads Catching up… again", pill.textContent === "Catching up…", pill.textContent);
+  await eventSource.onmessage({ data: JSON.stringify({ type: "catch_up", repo_id: "waiting", state: "done", changed: 0, deleted: 0 }) });
+  check("a done catch-up restores Live", pill.textContent === "Live", pill.textContent);
 
   // 10. remaining interpolations of labels
   check("autocomplete escapes candidate text into its markup", /escapeHtmlVal\(it\.text\)/.test(renderAcSrc), renderAcSrc);

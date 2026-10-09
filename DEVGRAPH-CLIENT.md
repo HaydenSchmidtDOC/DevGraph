@@ -103,8 +103,9 @@ This registers the repo **and runs a full initial scan** — Python source,
 container/compose files, API routes, datastore usage all get indexed in one
 pass via `devgraph/indexer/dispatch.py`. It prints the `repo_id` assigned
 (defaults to the folder name, deduped if already taken) and how many files
-were indexed. **Record that `repo_id`** — every DevGraph MCP tool call needs
-it. If Neo4j isn't reachable at registration time, `register` still succeeds
+were indexed. **Record that `repo_id`**: you'll need it to pin the MCP
+session to this repository (`DEVGRAPH_MCP_REPO`, below) or to pass it
+explicitly to a tool. If Neo4j isn't reachable at registration time, `register` still succeeds
 (registration and indexing are decoupled) and tells you to run
 `devgraph rescan <repo_id>` once it's up.
 
@@ -208,9 +209,29 @@ the specific CLI invocation.
 
 Once connected, the registered tools are scoped by a `repo_id` argument.
 Read `devgraph://tool-catalog` instead of relying on a copied tool list.
-**Always pass this repo's `repo_id` from step 1.** Never pass
-`cross_repo: true` unless the user explicitly asks for a cross-repository
-answer — the default is (and must stay) scoped to this repo only.
+
+**Repository scope.** Each MCP session has a repository: `DEVGRAPH_MCP_REPO`
+if set, otherwise the repository containing the server's working directory.
+The server instructions name it, and so does `devgraph://project-tools`.
+
+- You can omit `repo_id` from a built-in tool call to use
+  this session's repository.
+- When you omit it, the response carries `repo_id` and a notice saying which
+  repository was used. Check them before relying on the answer.
+- `find_requirements_for` and `blame_component` return lists, which carry no notice.
+  For those, the repository is the one named in the server instructions and
+  in `devgraph://project-tools`.
+- Pass `repo_id` explicitly when you want a different repository, or when
+  working across several repositories. An explicit `repo_id` is used exactly
+  as given.
+- If the session has no repository, a call without `repo_id` fails. The
+  error lists the active registered repositories; pass one of them as `repo_id`.
+  A repository registered after the server started is only picked up once
+  the MCP server restarts.
+
+Never pass `cross_repo: true` unless the user explicitly asks for a
+cross-repository answer — the default is (and must stay) scoped to one
+repository only.
 
 **Identifier-type nuance**: `find_callers`, `impact_analysis`, and
 `find_related_files` match against function/class **names** only (a file
@@ -241,6 +262,7 @@ support `tools/list_changed` re-list automatically). Any edit changes the file's
 bytes, so it stops serving project tools until re-trusted; only trusted bytes that
 fail to parse keep the last good tools, with a notice (see `devgraph://project-tools`). Pin a project with
 `claude mcp add devgraph -e DEVGRAPH_MCP_REPO=<repo_id> -- "<venv python>" -P -m devgraph.mcp.server`.
+The pin also sets the repository built-in tools use when `repo_id` is omitted.
 A path value must be absolute (a relative value is read as a repo id), and a value
 that matches no active registered repository serves nothing. A repository whose project config is disabled (`devgraph config disable`) serves no project tools; `devgraph://project-tools` says so. If `devgraph` is already
 registered in that project, run `claude mcp remove devgraph` first.

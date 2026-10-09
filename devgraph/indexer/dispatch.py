@@ -16,8 +16,11 @@ repo's own `record.path`).
 from __future__ import annotations
 
 import logging
+import os
 import re
+import sys
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import NamedTuple
@@ -61,6 +64,7 @@ from devgraph.indexer.schema_constraints import (
 # Re-exported under their pre-walk.py names for the watcher and existing callers.
 from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
 from devgraph.indexer.walk import indexable_paths as _indexable_paths
+from devgraph.indexer.walk import indexable_paths_under
 from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
 from devgraph.indexer.walk import is_ignored_path as is_ignored_path
 from devgraph.indexer.walk import is_indexable_file as _is_indexable_file
@@ -611,11 +615,12 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # (label, name) of the Service nodes the batch's compose files wrote.
     batch_services: set[tuple[str, str]] = set()
 
-    # Process files in a fixed order, not set order. Shared nodes
-    # (Datastore/Endpoint) keep the last writer's `source`/`library` and
-    # accumulate `sources` in claim order -- so iterating the set directly
-    # made the graph depend on PYTHONHASHSEED. (Cross-file edges no longer
-    # depend on order: they are re-resolved in the passes after this loop.)
+    # Process files in a fixed order, not set order, so a batch never
+    # depends on PYTHONHASHSEED. Shared nodes (Datastore/Endpoint) no longer
+    # depend on it: they take `source`/`library` from the claim of the
+    # alphabetically first file in `sources`, kept sorted, whatever order the
+    # files claim them in (see engine._claim_nodes_tx). Cross-file edges don't
+    # either: they are re-resolved in the passes after this loop.
     # Each path is resolved once and the batch is sorted by its
     # repo-relative POSIX path, so the order is the same however the caller
     # spelled a path (relative, absolute, through a symlink).
@@ -640,7 +645,7 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         # skip the offending file so the rest of the batch still indexes.
         try:
             indexed += _index_single_path(
-                engine, repo_id, repo_root, resolved, rel_path, resolved.name.lower(),
+                engine, repo_id, repo_root, resolved, rel_path,
                 docs_root, mentions_enabled, module_path,
                 py_files, py_extractions, js_files, js_extractions,
                 cs_files, cs_extractions, cpp_files, cpp_extractions,
@@ -654,12 +659,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             )
 
     # What the batch's files produced before this run, so the referrer step
-    # below can tell which nodes the batch adds. Docs notes record a bare
-    # filename as their source_file, hence the extra keys.
-    provenance_keys = set(by_rel_path)
-    if docs_root is not None:
-        provenance_keys |= {p.name for p in by_rel_path.values() if p.is_relative_to(docs_root)}
-    batch_keys = sorted(provenance_keys)
+    # below can tell which nodes the batch adds.
+    batch_keys = sorted(by_rel_path)
     previous_nodes = engine.list_file_nodes(repo_id, batch_keys)
 
     # The schema providers' specs, resolved once for the batch. The docs
@@ -815,7 +816,7 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # node in the batch exists materializes those edges.
     for path in docs_files:
         try:
-            index_doc_file(engine, repo_id, path)
+            index_doc_file(engine, repo_id, path, repo_root)
         except Exception:
             logger.warning("docs edge pass failed for %s (%s); skipping file", repo_id, path, exc_info=True)
 
@@ -841,13 +842,43 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     return indexed
 
 
+_MARKDOWN_SUFFIXES = (".md", ".markdown")
+_CODE_ROUTES = {
+    ".py": "py", ".cs": "cs", ".java": "java", ".rs": "rs", ".kt": "kt", ".go": "go",
+    **{suffix: "js" for suffix in _JS_SUFFIXES},
+    **{suffix: "cpp" for suffix in _CPP_SUFFIXES},
+}
+
+
+def _routes(resolved: Path, docs_root: Path | None, mentions_enabled: bool) -> list[str]:
+    """The built-in extractors `_index_single_path` runs on a file, by its
+    resolved path (a symlink is routed by its target, as it is keyed): one
+    code language or a docs note, then Markdown mentions, then a
+    Containerfile or a compose file. Empty when none would.
+    `_would_index` asks the same question for catch-up."""
+    routes = []
+    markdown = resolved.suffix in _MARKDOWN_SUFFIXES
+    code = _CODE_ROUTES.get(resolved.suffix)
+    if code is not None:
+        routes.append(code)
+    elif docs_root is not None and markdown and is_within(resolved, docs_root):
+        routes.append("docs")
+    if mentions_enabled and markdown:
+        routes.append("mentions")
+    name_lower = resolved.name.lower()
+    if name_lower in _CONTAINERFILE_NAMES:
+        routes.append("containerfile")
+    elif name_lower in _COMPOSE_NAMES:
+        routes.append("compose")
+    return routes
+
+
 def _index_single_path(
     engine: GraphEngine,
     repo_id: str,
     repo_root: Path,
     resolved: Path,
     rel_path: str,
-    name_lower: str,
     docs_root: Path | None,
     mentions_enabled: bool,
     module_path: str | None,
@@ -883,7 +914,8 @@ def _index_single_path(
     mentions disabled) -- mirrors the original loop's `indexed += 1` count.
     """
     indexed = 0
-    if resolved.suffix == ".py":
+    routes = _routes(resolved, docs_root, mentions_enabled)
+    if "py" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_python_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -911,7 +943,7 @@ def _index_single_path(
         # IMPLEMENTS target can be a handler defined in a later file (e.g.
         # a Django urls.py naming a view from views.py).
         py_extractions[rel_path] = (nodes, rels + api_rels)
-    elif resolved.suffix in _JS_SUFFIXES:
+    elif "js" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_js_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -923,7 +955,7 @@ def _index_single_path(
         indexed += 1
         js_files.append(rel_path)
         js_extractions[rel_path] = (nodes, rels)
-    elif resolved.suffix == ".cs":
+    elif "cs" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_csharp_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -935,7 +967,7 @@ def _index_single_path(
         indexed += 1
         cs_files.append(rel_path)
         cs_extractions[rel_path] = (nodes, rels)
-    elif resolved.suffix in _CPP_SUFFIXES:
+    elif "cpp" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_cpp_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -944,7 +976,7 @@ def _index_single_path(
         indexed += 1
         cpp_files.append(rel_path)
         cpp_extractions[rel_path] = (nodes, rels)
-    elif resolved.suffix == ".java":
+    elif "java" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_java_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -956,7 +988,7 @@ def _index_single_path(
         indexed += 1
         java_files.append((rel_path, content))
         java_extractions[rel_path] = (nodes, rels)
-    elif resolved.suffix == ".rs":
+    elif "rs" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_rust_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -968,7 +1000,7 @@ def _index_single_path(
         indexed += 1
         rs_files.append(rel_path)
         rs_extractions[rel_path] = (nodes, rels)
-    elif resolved.suffix == ".kt":
+    elif "kt" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_kotlin_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
@@ -980,7 +1012,7 @@ def _index_single_path(
         indexed += 1
         kt_files.append(rel_path)
         kt_extractions[rel_path] = (nodes, rels)
-    elif resolved.suffix == ".go":
+    elif "go" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_go_file(content, rel_path, repo_id, module_path)
         nodes = [n.to_dict() for n in result.nodes]
@@ -991,21 +1023,21 @@ def _index_single_path(
         engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
         indexed += 1
         go_extractions[rel_path] = (nodes, rels)
-    elif docs_root is not None and resolved.suffix in (".md", ".markdown") and is_within(resolved, docs_root):
-        index_doc_file(engine, repo_id, resolved)
+    elif "docs" in routes:
+        index_doc_file(engine, repo_id, resolved, repo_root)
         indexed += 1
         docs_files.append(resolved)
-    if mentions_enabled and resolved.suffix in (".md", ".markdown"):
+    if "mentions" in routes:
         # Only the Document node here; its MENTIONS edges are resolved in
         # index_paths' final pass, once every node in the batch exists.
         upsert_document_node(engine, repo_id, resolved, repo_root)
         indexed += 1
         mention_files.append(resolved)
-    if name_lower in _CONTAINERFILE_NAMES:
+    if "containerfile" in routes:
         result = _index_containerfile(engine, repo_id, resolved, rel_path)
         batch_services |= {("Service", service.name) for service in result.services}
         indexed += 1
-    elif name_lower in _COMPOSE_NAMES:
+    elif "compose" in routes:
         result = _index_compose_file(engine, repo_id, resolved, rel_path)
         batch_services |= {("Service", service.name) for service in result.services}
         indexed += 1
@@ -1244,98 +1276,165 @@ def _read_text(path: Path) -> str:
         return ""
 
 
+def _applied_provider_specs(
+    engine: GraphEngine, repo_id: str, repo_root: Path
+) -> tuple[bool, filesystem.FilesystemSpec | None, docs.DocsSpec | None]:
+    """`_provider_specs`, or (False, None, None) while the schema is pending:
+    the provider passes run only against the schema the graph was built with."""
+    if schema_pending(engine, repo_id, repo_root):
+        return False, None, None
+    return _provider_specs(repo_root)
+
+
+def _graph_files(
+    engine: GraphEngine,
+    repo_id: str,
+    repo_root: Path,
+    specs: tuple[bool, filesystem.FilesystemSpec | None, docs.DocsSpec | None] | None = None,
+) -> set[str]:
+    """Every repo-relative file the graph has nodes for: the language keys
+    (`list_indexed_files`), the sources claiming shared nodes
+    (`list_claim_sources`, e.g. a Dockerfile's Container), plus the docs
+    provider's paths and the filesystem provider's file-label paths. Folder
+    nodes are never included. The provider paths are left out while the
+    schema is pending, as the provider passes are. `specs` is
+    `_applied_provider_specs`, when the caller already has it.
+    """
+    files = engine.list_indexed_files(repo_id) | engine.list_claim_sources(repo_id)
+    ok, fs_spec, docs_spec = _applied_provider_specs(engine, repo_id, repo_root) if specs is None else specs
+    if ok and docs_spec is not None:
+        files |= engine.list_extracted_paths(repo_id, docs.EXTRACTOR, None)
+    if ok and fs_spec is not None and fs_spec.file_label:
+        files |= engine.list_extracted_paths(repo_id, filesystem.EXTRACTOR, [fs_spec.file_label])
+    return files
+
+
+def _gone_key(repo_root: Path, path: Path) -> str | None:
+    """The repo-relative key of a deleted path, or None outside the repository.
+
+    Only the parent is resolved. The missing leaf never is: on Windows,
+    resolving a missing `Foo.py` can return an existing `foo.py`.
+    """
+    path = Path(path)
+    try:
+        candidate = path.parent.resolve() / path.name
+    except OSError:
+        candidate = path
+    root = repo_root.resolve()
+    if not is_within(candidate, root):
+        return None
+    return candidate.relative_to(root).as_posix()
+
+
+def _listed(repo_root: Path, rel: str, listings: dict[str, set[str]]) -> bool:
+    """Whether every component of `rel` appears exactly in its parent's
+    `os.listdir` names. Listings are memoised in `listings`, keyed by the
+    path string: a Windows `Path` compares case-insensitively."""
+    current = repo_root
+    for part in Path(rel).parts:
+        names = listings.get(str(current))
+        if names is None:
+            try:
+                names = set(os.listdir(current))
+            except OSError:
+                names = set()
+            listings[str(current)] = names
+        if part not in names:
+            return False
+        current = current / part
+    return True
+
+
+def _present(repo_root: Path, rel: str, listings: dict[str, set[str]] | None = None) -> bool:
+    """Whether `rel` is an indexable file on disk, spelt case-exactly.
+
+    Every component is checked, not just the leaf: after a Windows folder
+    rename `Pkg` -> `pkg`, `Pkg/a.py` still opens.
+    """
+    listings = {} if listings is None else listings
+    return _listed(repo_root, rel, listings) and _is_provider_file(repo_root, repo_root / rel)
+
+
+def _holds_present_file(repo_root: Path, rel: str, listings: dict[str, set[str]]) -> bool:
+    """Whether `rel` is, or is a folder holding, an indexable file on disk."""
+    if not _listed(repo_root, rel, listings):
+        return False
+    folder = repo_root / rel
+    if not folder.is_dir():
+        return _is_provider_file(repo_root, folder)
+    return bool(indexable_paths_under(repo_root, folder))
+
+
+def _folders_above(rel: str) -> list[str]:
+    """`a/b/c.py` -> [`a`, `a/b`]."""
+    parts = rel.split("/")
+    return ["/".join(parts[:i]) for i in range(1, len(parts))]
+
+
 def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path]) -> int:
-    """Remove graph nodes whose provenance is one of these now-deleted files.
+    """Remove graph nodes whose provenance is one of these now-deleted paths.
+
+    A path may be a file or a folder: each is keyed lexically (`_gone_key`)
+    and expanded to every file the graph has at or below it (`_graph_files`,
+    one query per call; the repository root itself expands to nothing).
+    Anything present on disk, spelt case-exactly, is kept: a folder deleted
+    and recreated in one batch keeps its recreated files. Language nodes are
+    deleted per exact path; the provider passes get the exact paths, plus
+    each deleted path that holds no indexable file on disk, so that its now
+    empty folder nodes go.
 
     Args:
         engine: A GraphEngine instance.
         repo_id: Repository ID.
         repo_root: The repo's root path (paths outside it are skipped).
-        paths: Files that were deleted (no longer expected to exist on disk).
+        paths: Files or folders that were deleted.
 
     Returns:
-        Number of files whose provenance was cleaned up.
+        Number of paths whose provenance was cleaned up.
     """
-    cleaned = 0
-    for path in paths:
-        path = Path(path)
-        try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path
-        if not is_within(resolved, repo_root):
-            continue
+    keys = {key for p in paths if (key := _gone_key(repo_root, Path(p))) is not None and key != "."}
+    if not keys:
+        return 0
+    specs = _applied_provider_specs(engine, repo_id, repo_root)
+    graph_files = _graph_files(engine, repo_id, repo_root, specs)
+    listings: dict[str, set[str]] = {}
+    below = {f for f in graph_files if f in keys or any(folder in keys for folder in _folders_above(f))}
+    removed = {f for f in below if not _present(repo_root, f, listings)}
+    removed |= {key for key in keys if not _holds_present_file(repo_root, key, listings)}
 
-        if resolved.suffix in (".py", ".cs", ".java", ".rs", ".go", ".kt"):
-            # Must match the same repo-relative key index_paths() writes
-            # (Module nodes are keyed by path relative to repo_root, not
-            # bare filename — see the corresponding extractor's index_file
-            # for each language).
-            try:
-                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
-            except ValueError:
-                module_name = resolved.name
-            engine.delete_nodes_by_source_file(repo_id, module_name)
-            cleaned += 1
-        elif resolved.suffix in _JS_SUFFIXES:
-            # Same repo-relative-key rationale as the .py branch above,
-            # matching what index_paths()/extract_js_file() writes.
-            try:
-                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
-            except ValueError:
-                module_name = resolved.name
-            engine.delete_nodes_by_source_file(repo_id, module_name)
-            cleaned += 1
-        elif resolved.suffix in _CPP_SUFFIXES:
-            # Must match the same repo-relative key index_paths() writes
-            # (Module nodes are keyed by path relative to repo_root — see
-            # cpp/extractor.py's index_file).
-            try:
-                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
-            except ValueError:
-                module_name = resolved.name
-            engine.delete_nodes_by_source_file(repo_id, module_name)
-            cleaned += 1
-        elif resolved.suffix in (".md", ".markdown"):
-            # Must match the same repo-relative key index_paths() writes
-            # (Document nodes are keyed by path relative to repo_root via
-            # mentions/extractor.py's index_file, not bare filename).
-            try:
-                rel_path = resolved.relative_to(repo_root.resolve()).as_posix()
-            except ValueError:
-                rel_path = resolved.name
-            engine.delete_nodes_by_source_file(repo_id, rel_path)
-            cleaned += 1
-        else:
-            # Any other file that has a bare Module node keyed on its
-            # repo-relative path (docs/mentions extractors' shape, or a
-            # file indexed before its extension was routed). The delete
-            # Cypher matches Module.name == path, so no extension routing
-            # is needed here — just clean up whatever names this path.
-            try:
-                module_name = resolved.relative_to(repo_root.resolve()).as_posix()
-            except ValueError:
-                module_name = resolved.name
-            engine.delete_nodes_by_source_file(repo_id, module_name)
-            cleaned += 1
+    # Must match the repo-relative key index_paths() writes for every
+    # extractor (Module/Class/Function/Document nodes, and shared nodes'
+    # `sources`).
+    for rel in sorted(removed):
+        engine.delete_nodes_by_source_file(repo_id, rel)
 
-    if not schema_pending(engine, repo_id, repo_root):
-        ok, fs_spec, docs_spec = _provider_specs(repo_root)
-        gone = {rel for p in paths if (rel := _repo_relative(repo_root, Path(p))) is not None and rel != "."}
+    ok, fs_spec, docs_spec = specs
+    if removed:
         if ok and fs_spec is not None:
             filesystem.sync_absent(
-                engine, repo_id, repo_root, fs_spec, gone,
+                engine, repo_id, repo_root, fs_spec, removed,
                 is_indexable=lambda p: _is_provider_file(repo_root, p),
                 is_ignored_dir=is_ignored_dir_name,
             )
         if ok and docs_spec is not None:
-            _take_over_keys(engine, repo_id, repo_root, docs_spec, sorted(gone))
-            # Nodes (still) at or below the deleted paths, with all their edges.
-            engine.delete_extracted_nodes(repo_id, docs.EXTRACTOR, sorted(gone))
-            if gone:
-                _log_cache_stats()
+            _take_over_keys(engine, repo_id, repo_root, docs_spec, sorted(removed))
+            # Nodes (still) at the deleted paths, with all their edges.
+            engine.delete_extracted_nodes(repo_id, docs.EXTRACTOR, sorted(removed))
+            _log_cache_stats()
 
-    return cleaned
+    return len(removed)
+
+
+def _docs_folder(repo_root: Path, docs_path: str | None) -> str | None:
+    """The docs path as a repo-relative POSIX folder, or None when unset,
+    outside the repository, or the repository root itself."""
+    if not docs_path:
+        return None
+    root = repo_root.resolve()
+    folder = (root / docs_path).resolve()
+    if folder == root or not is_within(folder, root):
+        return None
+    return folder.relative_to(root).as_posix()
 
 
 def prune_stale_files(
@@ -1352,23 +1451,156 @@ def prune_stale_files(
     deleted while the watcher was down (or that a watcher event missed).
     Without this, a rescan is additive-only and stale nodes linger forever.
 
-    Conservative by construction: only file-provenance nodes
-    (`source_file`/`file` keys) are reconciled — `Commit`/`Repository` nodes
-    and `source`-keyed nodes (Container/Service/API, co-produced by several
-    files) are never touched here. The diff is disk-vs-graph: every path the
-    graph believes it has indexed that is no longer an indexable file on
-    disk is routed through remove_paths, which handles the
-    delete-vs-unclaim distinction per node.
+    The diff is disk-vs-graph, with `_graph_files` as the graph side: file
+    provenance (`source_file`/`file`), the sources claiming shared nodes
+    (Container/Datastore/Endpoint, co-produced by several files), and schema
+    providers' `path`, so a file only a provider represents (a `File` node
+    for `logo.png`) is pruned too. `Commit`/`Repository` nodes are never
+    touched. Every path the graph has that is no longer an indexable file on
+    disk is routed through remove_paths, which handles the delete-vs-unclaim
+    distinction per node.
+
+    Module nodes with no file key at all, left by an older git-history sync,
+    are deleted first, and so are docs notes whose `source_file` is not under
+    the docs path, left by an older scan that keyed a note by its bare
+    filename (upgrade cleanups; a scan never makes either). The notes are
+    written again under their repo-relative path by the scan or catch-up
+    that follows.
 
     Returns the number of files pruned.
     """
+    bare = engine.delete_bare_modules(repo_id)
+    if bare:
+        logger.info("removed %d leftover module nodes with no file behind them from %s", bare, repo_id)
+    docs_folder = _docs_folder(repo_root, docs_path)
+    # Skipped when the docs path is the repository root: every path is under
+    # it, so nothing tells a bare filename key from a root-level note's path.
+    if docs_folder is not None:
+        misplaced = engine.delete_docs_notes_outside(repo_id, docs_folder)
+        if misplaced:
+            logger.info("removed %d docs notes keyed outside %s from %s", misplaced, docs_folder, repo_id)
     on_disk = {rel for _, rel in _keyed_indexable_paths(repo_root, keep_ignored_targets=True)}
-    in_graph = engine.list_indexed_files(repo_id)
-    stale = in_graph - on_disk
+    stale = _graph_files(engine, repo_id, repo_root) - on_disk
     if not stale:
         return 0
     stale_paths = {repo_root / p for p in stale}
     return remove_paths(engine, repo_id, repo_root, stale_paths)
+
+
+#: How far before `since` a change stamp still makes a file due: FAT and SMB
+#: timestamp granularity, and the gap between an edit and its event.
+CATCH_UP_MARGIN_NS = 5_000_000_000
+
+
+class CatchUp(NamedTuple):
+    """What a catch-up did: files `index_paths` indexed (referrers included),
+    files `prune_stale_files` pruned, files walked, files offered to
+    `index_paths`, and how many of those the graph had no file for."""
+
+    indexed: int
+    pruned: int
+    checked: int
+    offered: int = 0
+    unknown: int = 0
+
+
+def _would_index(
+    path: Path,
+    rel: str,
+    docs_root: Path | None,
+    mentions_enabled: bool,
+    specs: tuple[bool, filesystem.FilesystemSpec | None, docs.DocsSpec | None],
+) -> bool:
+    """Whether `index_paths` would write anything for this file: a built-in
+    extractor routes it (`_routes`, as `_index_single_path` does), or a
+    declared schema provider represents it."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False  # index_paths skips it too
+    if _routes(resolved, docs_root, mentions_enabled):
+        return True
+    ok, fs_spec, docs_spec = specs
+    if ok and fs_spec is not None and fs_spec.file_label:
+        return True
+    return ok and docs_spec is not None and any(docs.selects(t, rel) for t in docs_spec.types)
+
+
+def _docs_note_files(engine: GraphEngine, repo_id: str) -> set[str]:
+    return engine.list_docs_note_files(repo_id)
+
+
+def _is_unindexed_note(path: Path, docs_root: Path | None, mentions_enabled: bool) -> bool:
+    """Whether a file no docs note holds the key of is a docs note: routed to
+    the docs extractor and with note front matter. Read only for Markdown
+    under the docs path that isn't a note in the graph, so a plain page there
+    is read each catch-up and a note never is."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    if "docs" not in _routes(resolved, docs_root, mentions_enabled):
+        return False
+    return bool(DocsExtractor("").extract_from_source(_read_text(resolved), resolved.name).docs)
+
+
+def _change_stamp_ns(st: os.stat_result) -> int:
+    """When a file last changed, by any stamp. The second term catches a file
+    whose mtime was preserved (`cp -p`, tar, unzip, `rsync -a`): its ctime on
+    POSIX, its creation time on Windows (where `st_ctime` is deprecated)."""
+    second = st.st_birthtime_ns if sys.platform == "win32" else st.st_ctime_ns
+    return max(st.st_mtime_ns, second)
+
+
+def catch_up(
+    engine: GraphEngine,
+    repo_id: str,
+    repo_root: Path,
+    since: datetime,
+    docs_path: str | None = None,
+    mentions_enabled: bool = False,
+) -> CatchUp:
+    """Bring the graph up to date with changes made since `since`, while
+    nothing was watching: an incremental `full_scan`.
+
+    Files gone from disk are pruned first (provider-only ones included, and
+    through `remove_paths`, so docs key takeover applies). Then a file that
+    `index_paths` would write something for is indexed when the graph has no
+    file for its key, or when any of its change stamps is at or after `since`
+    less `CATCH_UP_MARGIN_NS`. A file nothing would index (a `.txt` with no
+    filesystem type declared) is never offered.
+    """
+    pruned = prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
+    specs = _applied_provider_specs(engine, repo_id, repo_root)
+    known = _graph_files(engine, repo_id, repo_root, specs)
+    docs_root = (repo_root / docs_path).resolve() if docs_path else None
+    # A file the docs extractor routes counts as known only through a note
+    # holding its key: its mentions Document holds the same key, and a note
+    # an upgrade cleanup just deleted must be written again.
+    notes = _docs_note_files(engine, repo_id) if docs_root is not None else set()
+    cutoff = int(since.timestamp() * 1_000_000_000) - CATCH_UP_MARGIN_NS
+    walked = _keyed_indexable_paths(repo_root)
+    due: set[Path] = set()
+    unknown = 0
+    for path, rel in walked:
+        if not _would_index(path, rel, docs_root, mentions_enabled, specs):
+            continue
+        if rel not in known or (rel not in notes and _is_unindexed_note(path, docs_root, mentions_enabled)):
+            due.add(path)
+            unknown += 1
+            continue
+        try:
+            stamp = _change_stamp_ns(os.stat(path))
+        except OSError:
+            continue  # gone since the walk; the next catch-up prunes it
+        if stamp >= cutoff:
+            due.add(path)
+    indexed = (
+        index_paths(engine, repo_id, repo_root, due, docs_path=docs_path, mentions_enabled=mentions_enabled)
+        if due
+        else 0
+    )
+    return CatchUp(indexed=indexed, pruned=pruned, checked=len(walked), offered=len(due), unknown=unknown)
 
 
 def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str | None = None, mentions_enabled: bool = False) -> int:
