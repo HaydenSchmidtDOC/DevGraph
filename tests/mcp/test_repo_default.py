@@ -81,6 +81,7 @@ MIN_ARGS = {
     "find_related_prs": {"component_name": "X"},
     "issue_history_for": {"component_name": "X"},
     "get_source": {"component_name": "X"},
+    "describe_node": {"name": "X"},
 }
 
 
@@ -178,8 +179,8 @@ def call(server, name, arguments):
 # ── characterization: explicit calls ───────────────────────────────────────
 
 
-def test_builtins_with_repo_id_are_exactly_the_24():
-    assert len(BUILTINS_WITH_REPO_ID) == 24
+def test_builtins_with_repo_id_are_exactly_the_25():
+    assert len(BUILTINS_WITH_REPO_ID) == 25
     assert "run_cypher" not in BUILTINS_WITH_REPO_ID
     assert set(MIN_ARGS) == BUILTINS_WITH_REPO_ID
 
