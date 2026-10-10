@@ -363,8 +363,11 @@ asserts the targets, a strict xfail for each language not landed yet.
   caller and name too), each `no_edge` absent; for Kotlin, every expected
   symbol extracted.
 - **M6** cost: the fixture's `full_scan` and DevGraph's within +15 % of
-  BEFORE, the largest `name_refs` under 1 MiB, and the relink benchmark
-  (`test_name_ref_relink_benchmark`) green.
+  BEFORE, the largest `name_refs` under 1 MiB, the relink benchmark
+  (`test_name_ref_relink_benchmark`) green, and the S10 fan-in
+  (`--fan-in`: one re-save of a `main.go` calling `pK.New()`, `x.Get()` and
+  `pK.Get()` in 30 of 400 packages that each declare them) costing what its
+  own targets cost.
 
 BEFORE, measured on this branch before any extractor change (sample lists
 left out; every edge carries no confidence, so nothing is linked yet):
@@ -511,11 +514,18 @@ paired timing):
 | Python on DevGraph, ts fixture | unchanged | slice A | M1-M5 identical (old and new code over the same tree; ts 41/41 sites, `IMPORTS` 24/24) | met |
 | M6 `full_scan` | ≤ +15 % | DevGraph 48.0 s; go 0.92 s, java 1.03 s, kotlin 0.92-1.09 s | DevGraph 52.6-53.0 s (+10 %); go 0.94 s, java 1.00 s, kotlin 1.03 s | met |
 | M6 largest `name_refs` | < 1 MiB | 229,842 B (DevGraph) | 229,842 B (DevGraph); 3,134 B (java) | met |
+| M6 S10 fan-in save | follows its targets | 3.6-4.7 s, 929k db hits (742k in one `Get` query) | 0.21-0.27 s, 5.9k db hits (1.3k at most per query) | met |
 
 - **Timing.** Old and new code alternated over the same tree on one
   machine: DevGraph two pairs of `--scan` runs; each fixture the median of
   six in-process `full_scan`s after two warm-ups (kotlin's two series gave
   +13 % and -5 %).
+- **Fan-in.** A directory, loose directory or prefix pin first sought every
+  node of the name and then filtered by path, so a re-save's cost grew with
+  how many packages declare `Get`. It now seeks the unique (repo_id, name,
+  file) index as a prefix range (`b.file STARTS WITH` the pin's path),
+  hinted like every other seek. `test_path_pins` bounds the db hits of 90
+  such rows among 900 same-named functions (about 3.2k; 166k before).
 - **Measure changes.** M1 leaves out a group whose every target the truth
   calls (Go's `store.New()` and `cache.New()` from one `main`, a function
   per build tag); M5 does not count a `not_files` entry the truth also lists

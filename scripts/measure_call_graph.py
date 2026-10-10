@@ -9,6 +9,7 @@ ten (M4), a fixed sample of DevGraph call sites plus caller recall against an
 Usage:
     <venv python> scripts/measure_call_graph.py <repo_id> [--root PATH] [--scan] [--cleanup]
     <venv python> scripts/measure_call_graph.py --fixture <lang>
+    <venv python> scripts/measure_call_graph.py --fan-in
 
 `--fixture` measures one of the ground-truth fixtures under
 tests/fixtures/callgraph instead (see `measure_fixture` and
@@ -16,6 +17,9 @@ docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md): it
 copies the fixture to a temporary folder, scans it into a scratch repository,
 compares the graph with the fixture's expected.json and deletes the scratch
 repository again.
+
+`--fan-in` measures one save among 400 same-named Go packages (M6's S10 row,
+`measure_fan_in`).
 
 `--scan` deletes `<repo_id>` and full-scans `--root` (default: the current
 directory) into it first, timing the scan and an incremental save of
@@ -576,6 +580,65 @@ def measure_fixture(engine: GraphEngine, lang: str) -> dict:
     return {"fixture": lang, **metrics, "failures": fixture_failures(metrics)}
 
 
+def measure_fan_in(engine: GraphEngine, packages: int = 400, callers: int = 30) -> dict:
+    """M6's S10 fan-in row: `packages` Go packages each declaring `New`,
+    `Get` and a method `T.Get`, and a `main.go` calling `pK.New()`,
+    `x.Get()` and `pK.Get()` for `callers` of them (each a directory pin,
+    `Get` also a loose one, among `packages` same-named targets). The median
+    of five re-saves of main.go, and the db hits of one more, PROFILEd."""
+    from neo4j import ManagedTransaction, Session
+
+    root = Path(tempfile.mkdtemp(prefix="devgraph-measure-fanin-"))
+    repo_id = f"zz-measure-fanin-{uuid.uuid4().hex[:8]}"
+    (root / "go.mod").write_text("module example.com/app\n")
+    for i in range(packages):
+        (root / f"p{i}").mkdir()
+        (root / f"p{i}" / "a.go").write_text(
+            f"package p{i}\n\ntype T struct{{}}\n\nfunc New() *T {{ return &T{{}} }}\n\n"
+            "func Get() int { return 0 }\n\nfunc (t *T) Get() int { return 1 }\n"
+        )
+    imports = "".join(f'\t"example.com/app/p{i}"\n' for i in range(callers))
+    body = "".join(f"\tx{i} := p{i}.New()\n\tx{i}.Get()\n\tp{i}.Get()\n" for i in range(callers))
+    main = root / "main.go"
+    main.write_text(f"package main\n\nimport (\n{imports})\n\nfunc main() {{\n{body}}}\n")
+    real = {cls: cls.run for cls in (Session, ManagedTransaction)}
+    hits: list[int] = []
+
+    def profiled(run):
+        def run_profiled(self, query, *args, **kwargs):
+            result = run(self, "PROFILE " + query, *args, **kwargs)
+            records = list(result)
+
+            def total(plan):
+                return plan.get("dbHits", 0) + sum(total(child) for child in plan.get("children", []))
+
+            hits.append(total(result.consume().profile))
+            return records
+        return run_profiled
+
+    try:
+        provision_repository_schema(engine, root)
+        engine.upsert_repository(repo_id, repo_id, str(root))
+        full_scan(engine, repo_id, root)
+        saves = []
+        for _ in range(5):
+            started = time.perf_counter()
+            index_paths(engine, repo_id, root, {main})
+            saves.append(time.perf_counter() - started)
+        for cls in real:
+            cls.run = profiled(real[cls])
+        index_paths(engine, repo_id, root, {main})
+    finally:
+        for cls, run in real.items():
+            cls.run = run
+        engine.delete_repository(repo_id)
+        shutil.rmtree(root, ignore_errors=True)
+    return {
+        "packages": packages, "callers": callers, "save_s": round(sorted(saves)[2], 3),
+        "save_db_hits": sum(hits), "largest_query_db_hits": max(hits),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("repo_id", nargs="?")
@@ -583,15 +646,23 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--scan", action="store_true", help="delete the repo id and full-scan --root into it first")
     parser.add_argument("--cleanup", action="store_true", help="delete the repo id afterwards")
+    parser.add_argument("--fan-in", action="store_true", help="measure M6's S10 fan-in (one save among 400 packages)")
     args = parser.parse_args()
-    if not args.fixture and not args.repo_id:
-        parser.error("give a repo_id or --fixture")
+    if not args.fixture and not args.repo_id and not args.fan_in:
+        parser.error("give a repo_id, --fixture or --fan-in")
     root = args.root.resolve()
     engine = GraphEngine(
         uri=os.environ.get("DEVGRAPH_NEO4J_URI", "bolt://127.0.0.1:7687"),
         user=os.environ.get("DEVGRAPH_NEO4J_USER", "neo4j"),
         password=os.environ.get("DEVGRAPH_NEO4J_PASSWORD", "devgraph-local-dev"),
     )
+    if args.fan_in:
+        try:
+            json.dump(measure_fan_in(engine), sys.stdout, indent=1)
+            print()
+        finally:
+            engine.close()
+        return 0
     if args.fixture:
         try:
             json.dump(measure_fixture(engine, args.fixture), sys.stdout, indent=1)

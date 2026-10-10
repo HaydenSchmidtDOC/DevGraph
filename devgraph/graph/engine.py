@@ -699,6 +699,9 @@ def _pin(file: str | None) -> str:
 
 #: The pin kinds that match a set of files rather than one (see `_pin`).
 _PATH_PINS = frozenset({"dir", "loose_dir", "suffix", "suffix_dir", "prefix"})
+#: The path pins whose files all start with the pin's own path (`pin_value`'s
+#: `v`): a target seeks them as a prefix range of its file-keyed index.
+_ANCHORED_PINS = frozenset({"dir", "loose_dir", "prefix"})
 
 
 def _group_rels_by_triple(
@@ -856,7 +859,9 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     INDEX allows that scan) after the label has filled; in CI that made a
     5,000-module relink take 20 s instead of under 1 s. A path pin seeks by
     name and keeps the nodes whose file its `pin` matches and no `exclude`
-    pin does (`ex_files`, `ex_pins`); on a Module target it seeks the
+    pin does (`ex_files`, `ex_pins`); a directory or prefix pin seeks the
+    (repo_id, name, file) index from its path (`STARTS WITH`), so its cost
+    follows the directory's nodes of the name, not the repository's; on a Module target it seeks the
     Module's `dir` (a directory pin), `dir_name` (a suffix-directory pin:
     the last name of its directory) or `basename` (a suffix pin), the row's
     `to_name`, and tests the Module's path. `also` is one more condition on
@@ -875,7 +880,13 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
         else:
             path = f"{var}.file"
             match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
-            if label in FILE_SCOPED_LABELS:
+            if label in FILE_SCOPED_LABELS and pin in _ANCHORED_PINS:
+                # The files under one directory are a prefix range of the
+                # unique (repo_id, name, file) index: a package's own `Get`,
+                # not every `Get` of the repository (S10 fan-in).
+                match += f"USING INDEX SEEK {var}:{label}(repo_id, name, file) "
+                conditions.insert(0, f"{path} STARTS WITH {ref}.pin.v")
+            elif label in FILE_SCOPED_LABELS:
                 match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
         conditions[:0] = _path_pin_conditions(ref, path)
         return match + "WHERE " + " AND ".join(conditions) + " "

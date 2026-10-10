@@ -1541,7 +1541,9 @@ def test_a_directory_pin_is_tested_before_the_fileless_pin():
         "ex_files": ["pkg/a.py"], "ex_pins": [],
     }]
     match = _end_match("b", "Function", "to", "prefix", "t")
-    assert "USING INDEX SEEK b:Function(repo_id, name)" in match
+    # A prefix range of the file-keyed index (S10 fan-in); a suffix pin seeks by name.
+    assert "USING INDEX SEEK b:Function(repo_id, name, file)" in match and "b.file STARTS WITH t.pin.v" in match
+    assert "USING INDEX SEEK b:Function(repo_id, name) " in _end_match("b", "Function", "to", "suffix", "t")
     assert "WHEN 'prefix' THEN b.file STARTS WITH t.pin.v" in match
     assert "NOT b.file IN t.ex_files" in match and "NOT any(x IN t.ex_pins WHERE" in match
 
