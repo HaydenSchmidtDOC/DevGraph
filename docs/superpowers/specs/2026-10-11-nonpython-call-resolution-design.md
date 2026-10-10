@@ -426,6 +426,16 @@ reached; a `using` of a namespace, the bare dotted name and the old
 `A/B.cs` folder guess are gone. An extension method's class, which the
 caller never names, is not imported.
 
+**Limits, and a follow-up.** Two classes of one name in different
+namespaces both get every call and import of the name (the caller's
+`using`s and enclosing namespace cannot pick one by path), and a call into a
+class declared in a file not named after it (`UserMapper` in `Mappers.cs`)
+links nothing. Both need a mechanism that knows each file's namespace and
+classes, read from the project (`.csproj` files and the declarations of
+every C# file) and kept current as the target files change, so that an edge
+stays a function of the configuration and the target's existence; that is
+a follow-up, not part of slice C.
+
 ## C++ (`devgraph/indexer/cpp/extractor.py`)
 
 Without the build's `-I` flags a quoted include is read as the compiler's

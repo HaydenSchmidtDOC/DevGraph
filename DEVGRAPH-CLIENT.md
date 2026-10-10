@@ -421,8 +421,7 @@ Two things worth knowing about how they work:
   `caller_class` — pass `find_callers(..., scope_to_class="ThatClass")` to
   filter down to just that class's own callers. Graph insights (PageRank,
   communities) leave out `name` and `package` calls and `package`
-  imports. What stays out of
-  reach: a C# class in a file not named after it, two C# types of one name
+  imports. What stays out of reach: a C# class in a file not named after it, two C# types of one name
   in different namespaces (both get the edge), and a method a type inherits
   from a base declared in another file.
 - **Import/include resolution reads only the importing file and the
