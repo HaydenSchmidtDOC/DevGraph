@@ -63,12 +63,13 @@ Known limitations (v1 scope, structural parity — documented, not to be
 
 from __future__ import annotations
 
+import bisect
 import logging
 import re
 from pathlib import Path
 
 import tree_sitter_kotlin as tskotlin
-from tree_sitter import Language, Node, Parser
+from tree_sitter import Language, Node, Parser, Range
 
 from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
 
@@ -119,14 +120,24 @@ def _error_cost(node: Node) -> tuple[int, int]:
     return sum(c[0] for c in costs), sum(c[1] for c in costs)
 
 
-def _blank_outside(source: bytes, start: int, end: int) -> bytes:
-    """`source` with every byte outside [start, end) a space, newlines kept,
-    so the kept text parses at its own offsets."""
+#: Recovery parses at most this many pieces of a file, and at most this many
+#: times the file's bytes in all; what is left stays unrecovered. Both limits
+#: depend on the text alone, so recovery is deterministic.
+_MAX_PIECES = 5000
+_MAX_PARSED_FACTOR = 4
 
-    def blank(part: bytes) -> bytes:
-        return bytes(b if b == 0x0A else 0x20 for b in part)
 
-    return blank(source[:start]) + source[start:end] + blank(source[end:])
+def _parse_piece(parser: Parser, source: bytes, start: int, end: int, line_starts: list[int]):
+    """The tree of `source[start:end]` alone, parsed over that byte range
+    (`included_ranges`), so its nodes keep their offsets in `source` and the
+    cost follows the piece, not the file."""
+
+    def point(offset: int) -> tuple[int, int]:
+        row = bisect.bisect_right(line_starts, offset) - 1
+        return row, offset - line_starts[row]
+
+    parser.included_ranges = [Range(point(start), point(end), start, end)]
+    return parser.parse(source)
 
 
 def _better_of_two(parser: Parser, source: bytes) -> tuple:
@@ -154,10 +165,11 @@ def _parse_kotlin(parser: Parser, source: bytes) -> tuple[Node, list[Node], list
        nodes (then fewer missing ones) wins, the original on a tie (the blind patch can break a string
        template such as `"${ x }"`).
     2. Each top-level error node left is split at column-0 declaration
-       starts, and each piece is parsed alone with everything else blanked
-       (`_blank_outside`), so its declarations keep their offsets; they are
+       starts, and each piece is parsed alone over its own byte range
+       (`_parse_piece`), so its declarations keep their offsets; they are
        visited in place of the error node (each piece patched as in 1. when
-       that helps).
+       that helps). At most `_MAX_PIECES` pieces and `_MAX_PARSED_FACTOR`
+       times the file's bytes are parsed this way.
 
     Every node's text is read from the original `source`: offsets never move.
     """
@@ -166,6 +178,10 @@ def _parse_kotlin(parser: Parser, source: bytes) -> tuple[Node, list[Node], list
     root = tree.root_node
     top_level: list[Node] = []
     clean = True
+    patched = _UNTERMINATED_CLOSE.sub(b";}", chosen)
+    line_starts = [0] + [m.end() for m in re.finditer(rb"\n", chosen)]
+    piece_parser = _make_parser()
+    pieces = parsed = 0
     for node in root.named_children:
         if node.type != "ERROR":
             top_level.append(node)
@@ -174,7 +190,17 @@ def _parse_kotlin(parser: Parser, source: bytes) -> tuple[Node, list[Node], list
         starts = [m.start() for m in _DECLARATION_START.finditer(chosen, node.start_byte, node.end_byte)]
         clean = clean and bool(starts) and starts[0] == node.start_byte
         for start, end in zip(starts, [*starts[1:], node.end_byte]):
-            piece, _piece_source = _better_of_two(parser, _blank_outside(chosen, start, end))
+            if pieces >= _MAX_PIECES or parsed + 2 * (end - start) > _MAX_PARSED_FACTOR * len(source):
+                clean = False
+                break
+            pieces += 1
+            parsed += end - start
+            piece = _parse_piece(piece_parser, chosen, start, end, line_starts)
+            if piece.root_node.has_error and patched != chosen:
+                parsed += end - start
+                other = _parse_piece(piece_parser, patched, start, end, line_starts)
+                if _error_cost(other.root_node) < _error_cost(piece.root_node):
+                    piece = other
             trees.append(piece)
             clean = clean and not piece.root_node.has_error
             top_level += [child for child in piece.root_node.named_children if child.type != "ERROR"]

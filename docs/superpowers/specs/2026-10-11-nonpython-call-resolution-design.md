@@ -173,9 +173,13 @@ anonymous function (a callback, an IIFE) are still not attributed to anyone.
    with no erroneous child, and counts as one.
 2. Each remaining top-level error node is split at column-0 declaration starts
    (a declaration keyword, a modifier such as `data`, `private`, `sealed`, or an
-   annotation); each chunk is parsed with every other byte blanked to spaces
-   (newlines kept), so offsets stay the same, patched as in 1. when that
-   helps, and its top-level declarations are visited.
+   annotation); each piece is parsed alone over its own byte range
+   (tree-sitter's `included_ranges`), so offsets stay the same and the cost
+   follows the piece, patched as in 1. when that helps, and its top-level
+   declarations are visited. At most 5,000 pieces and four times the file's
+   bytes are parsed this way; the rest stays unrecovered. (Parsing each piece
+   blanked at full file length was quadratic: 18 s for a 39 KB file with an
+   unclosed brace near the top, now 0.13 s.)
 3. Text is always read from the original bytes.
 
 ## Later slices

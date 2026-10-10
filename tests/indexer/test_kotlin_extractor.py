@@ -310,3 +310,33 @@ def test_every_kotlin_fixture_symbol_is_extracted():
         result = extract_kotlin_file(path.read_text(), rel, "repo")
         found |= {(n.name, rel) for n in result.nodes if n.label in ("Class", "Function")}
     assert {(s["name"], s["file"]) for s in expected["symbols"]} <= found
+
+
+def test_recovery_after_an_early_error_scales_with_the_file():
+    """Each recovered piece is parsed over its own byte range, not the whole
+    file, so a large file with an error near the top stays fast (a watcher
+    save re-parses it), and the result is the same every time."""
+    import time
+
+    from devgraph.indexer.kotlin.extractor import extract_kotlin_file
+
+    for source in (
+        "package p\n\n}}} oops\n" + "".join(f"class C{i} {{ fun f{i}() = {i} }}\n" for i in range(1000)),
+        "package p\n\nfun a() {\n" + "".join(f"fun f{i}() {{ g() }}\n" for i in range(2000)),
+    ):
+        started = time.perf_counter()
+        first = extract_kotlin_file(source, "p/F.kt", "repo")
+        assert time.perf_counter() - started < 3.0  # 18 s each when every piece was parsed at file length
+        assert len(first.nodes) == 2001
+        again = extract_kotlin_file(source, "p/F.kt", "repo")
+        assert [n.to_dict() for n in again.nodes] == [n.to_dict() for n in first.nodes]
+
+
+def test_recovery_stops_at_its_piece_budget():
+    from devgraph.indexer.kotlin import extractor
+
+    source = "package p\n\n)\n" + "".join(f"fun f{i}() = {i}\n" for i in range(extractor._MAX_PIECES + 50))
+    result = extractor.extract_kotlin_file(source, "p/F.kt", "repo")
+    names = {n.name for n in result.nodes if n.label == "Function"}
+    assert len(names) == extractor._MAX_PIECES
+    assert "f0" in names and f"f{extractor._MAX_PIECES}" not in names
