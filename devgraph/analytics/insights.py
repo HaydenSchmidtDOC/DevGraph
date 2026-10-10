@@ -28,8 +28,9 @@ logger = logging.getLogger(__name__)
 
 # Edges that mean "A depends on B", directed as stored: A CALLS B gives B
 # importance. The cycle finder's dependency set plus IMPLEMENTS (an
-# interface its implementations lean on). Python CALLS edges matched by name
-# only or by package are not loaded (see GraphEngine.load_insight_graph).
+# interface its implementations lean on). CALLS edges matched by name only or
+# at package confidence, in any language, are not loaded (see
+# GraphEngine.load_insight_graph).
 DEPENDENCY_RELATIONSHIPS: tuple[str, ...] = ("CALLS", "DEPENDS_ON", "EXTENDS", "IMPLEMENTS", "IMPORTS", "USES")
 # Communities also follow containment, so a file's members stay together
 # and cross-file dependencies are what join files into subsystems.

@@ -606,13 +606,14 @@ def build_server(
         resolved_only: bool = False,
     ) -> dict[str, Any]:
         """Find all callers of a target; returns {count, results, truncated}, each caller
-        with its name, type, repo_id, file and confidence, most certain first. Python
-        calls are resolved through the caller's scope and imports: confidence
-        "resolved" (callee in a file the caller names), "package" (in a file under an
-        imported package) or "name" (a method on an untyped receiver, matched by name
-        only); other languages' calls are name-based and have no confidence. Pass
-        resolved_only to keep only "resolved"/"package" callers, or scope_to_class to
-        narrow to callers made from within a specific class's own methods. Pass
+        with its name, type, repo_id, file and confidence, most certain first. Calls
+        in every language are resolved through the caller's scope, imports and types:
+        confidence "resolved" (callee in a file the caller names), "package" (in a
+        file the caller's imports reach less exactly, e.g. under an imported package
+        or a class file found by suffix) or "name" (a method on an untyped receiver,
+        matched by name only). Pass resolved_only to keep only "resolved"/"package"
+        callers, or scope_to_class to narrow to callers made from within a specific
+        class's own methods. Pass
         modified_within_commits to restrict to targets touched within the last N
         commits repo-wide (requires git-history recency staging; entities never staged
         are excluded, not silently included)."""

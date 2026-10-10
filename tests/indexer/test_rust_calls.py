@@ -414,3 +414,63 @@ def test_renaming_a_crate_re_indexes_its_users_and_a_moved_function_relinks(engi
         engine, repo_id, "CALLS"
     )
     _equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_the_index_upgrade_replaces_bare_rust_csharp_and_cpp_calls(engine, repo_id, tmp_path, monkeypatch):
+    """A graph indexed at format 7 has bare Rust, C# and C++ CALLS with no
+    confidence; catch_up's automatic upgrade (a full_scan) leaves the
+    resolved edges."""
+    from datetime import datetime, timezone
+
+    from devgraph.indexer import dispatch
+    from devgraph.indexer.common import GraphRelationship
+
+    _write(tmp_path, "src/main.rs", "mod util;\n\nfn main() { util::run(); }\n")
+    _write(tmp_path, "src/util.rs", "pub fn run() {}\n")
+    _write(tmp_path, "tools/other.rs", "pub fn run() {}\n")
+    _write(tmp_path, "cs/Program.cs", "class Program { static void Main() { Jobs.Run(); } }\n")
+    _write(tmp_path, "cs/Jobs.cs", "class Jobs { public static void Run() {} }\n")
+    _write(tmp_path, "cs/Other.cs", "class Other { public static void Run() {} }\n")
+    _write(tmp_path, "cpp/main.cpp", '#include "jobs.h"\n\nint main() { jobs::start(); }\n')
+    _write(tmp_path, "cpp/jobs.h", "namespace jobs { inline void start() {} }\n")
+    _write(tmp_path, "cpp/other.cpp", "void start() {}\n")
+    callers = {"src/main.rs": "main", "cs/Program.cs": "Main", "cpp/main.cpp": "main"}
+
+    def old(real):
+        def extract(content, rel_path, repo_id, *args):
+            # Format 7: every Rust, C# and C++ call a bare name.
+            result = real(content, rel_path, repo_id, *args)
+            result.relationships = [r for r in result.relationships if r.rel_type != "CALLS"]
+            if rel_path in callers:
+                result.relationships.append(GraphRelationship(
+                    from_label="Function", from_name=callers[rel_path], rel_type="CALLS", to_label="Function",
+                    to_name={".rs": "run", ".cs": "Run", "cpp": "start"}[rel_path[-3:]], repo_id=repo_id,
+                    from_file=rel_path, origin=rel_path,
+                ))
+            return result
+        return extract
+
+    with monkeypatch.context() as patched:
+        for name in ("extract_rust_file", "extract_csharp_file", "extract_cpp_file"):
+            patched.setattr(dispatch, name, old(getattr(dispatch, name)))
+        provision_repository_schema(engine, tmp_path)
+        engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+        full_scan(engine, repo_id, tmp_path)
+    engine.set_index_format(repo_id, 7)
+
+    def calls():
+        return [e for e in _edges(engine, repo_id, "CALLS") if e[0] in callers]
+
+    assert {(e[0], e[2], e[4]) for e in calls()} == {
+        ("src/main.rs", "src/util.rs", None), ("src/main.rs", "tools/other.rs", None),
+        ("cs/Program.cs", "cs/Jobs.cs", None), ("cs/Program.cs", "cs/Other.cs", None),
+        ("cpp/main.cpp", "cpp/jobs.h", None), ("cpp/main.cpp", "cpp/other.cpp", None),
+    }
+    assert dispatch.index_outdated(engine, repo_id)
+
+    dispatch.catch_up(engine, repo_id, tmp_path, since=datetime.now(timezone.utc))
+    assert {(e[0], e[2], e[4]) for e in calls()} == {
+        ("src/main.rs", "src/util.rs", "resolved"), ("cs/Program.cs", "cs/Jobs.cs", "package"),
+        ("cpp/main.cpp", "cpp/jobs.h", "resolved"),
+    }
+    assert not dispatch.index_outdated(engine, repo_id)

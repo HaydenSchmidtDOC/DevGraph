@@ -118,9 +118,11 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: configuration fingerprint, JS/TS CALLS resolved through scope, imports,
 #: tsconfig aliases and types, Kotlin declarations recovered after one-line
 #: class bodies; 7: Go, Java and Kotlin CALLS and IMPORTS resolved through
-#: modules, source roots and types, path pin flags, Module `dir_name`). An
-#: index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 7
+#: modules, source roots and types, path pin flags, Module `dir_name`; 8:
+#: Rust, C# and C++ CALLS and IMPORTS resolved through crate roots and
+#: Cargo crate names, referenced types and quoted includes). An index
+#: stamped lower, or not at all, is rescanned automatically.
+INDEX_FORMAT = 8
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:

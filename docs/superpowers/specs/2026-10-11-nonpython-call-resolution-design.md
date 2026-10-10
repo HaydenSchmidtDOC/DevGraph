@@ -16,8 +16,7 @@ latest release, turns everything after a member that closes on the same line
 The work lands in three slices, each with its own `INDEX_FORMAT` bump: A (the
 shared core, JS/TS and the Kotlin parse fix, format 6), B (Go, Java, Kotlin,
 and dropping the reverse-dependent fan-out, format 7) and C (Rust, C#, C++,
-format 8). This spec covers what has landed; the later slices' rules are
-summarised at the end.
+format 8). All three have landed.
 
 ## Principle
 
@@ -407,11 +406,12 @@ Without the build's `-I` flags a quoted include is read as the compiler's
 search would most likely go. `#include "x/y.h"` names the file beside the
 includer (`<dir>/x/y.h`, resolved; a `../` path only that) and `/x/y.h^`
 anywhere else (package); a bare `"y.h"` names `<dir>/y.h` and only
-`/include/y.h^`, `/inc/y.h^` or `/src/y.h^` elsewhere, so `src/net/conn.cpp`'s
+`/include/y.h^` or `/src/y.h^` elsewhere, so `src/net/conn.cpp`'s
 `"log.h"` is `src/net/log.h`, never `include/util/log.h`. These are its
 `IMPORTS` (`#include <...>` none). A header's declarations are defined in
-its same-stem source, so an include also reaches `/x/y.cpp^` (`.cc`, `.cxx`,
-`.c`; package: a convention, not what the include names).
+its same-stem source, so an include also reaches `/x/y.cpp^` and
+`/x/y.cc^` (package: a convention, not what the include names; fewer
+source extensions and include roots keep the rows per call down, M6).
 
 **Calls**, first match wins:
 
@@ -676,3 +676,99 @@ timing):
 }
 
 ```
+
+### Results after slice C
+
+| | Target | BEFORE | AFTER | |
+|---|---|---|---|---|
+| rust M1 resolved multi-target share | < 2 % | no resolved edge (29 bare, 18 multi-target) | 0 % (10 resolved, 10 package) | met |
+| rust M2 linked precision | ≥ 98 %, 0 cross-directory without import | none linked; 59 % of all edges right | 100 %; 0 | met |
+| rust M3 `IMPORTS` precision / recall | ≥ 98 % / 95 % | 100 % / 42 % | 100 % / 100 % (19/19) | met |
+| rust M4 `CALLS` recall | ≥ 95 % | 85 % (all bare) | 100 % (linked 100 %, resolved 50 %) | met |
+| rust M5 named sites | all | 23/34 | 34/34 | met |
+| csharp M1 | < 2 % | no resolved edge (25 bare, 6 multi-target) | 0 % (1 resolved, 18 package, 4 name) | met |
+| csharp M2 | ≥ 98 %, 0 | none linked; 92 % | 89 % (2 wrong `User.cs`); 0 | short |
+| csharp M3 | ≥ 98 % / 95 % | none / 0 % | 80 % / 94 % (16/17) | short |
+| csharp M4 | ≥ 95 % | 100 % (all bare) | 90 % (linked 81 %) | short |
+| csharp M5 | all | 29/31 | 27/31 | short |
+| cpp M1 | < 2 % | no resolved edge (25 bare, 10 multi-target) | 0 % (3 resolved, 14 package) | met |
+| cpp M2 | ≥ 98 %, 0 | none linked; 76 % | 100 %; 0 | met |
+| cpp M3 | ≥ 98 % / 95 % | 100 % / 29 % | 100 % / 100 % (17/17) | met |
+| cpp M4 | ≥ 95 % | 100 % (all bare) | 100 % (linked 100 %, resolved 18 %) | met |
+| cpp M5 | all | 23/29 | 29/29 | met |
+| Python on DevGraph; ts, go, java, kotlin fixtures | unchanged | slice B | M1-M5 identical (slice B and slice C code over the same tree) | met |
+| M6 DevGraph `full_scan` | ≤ +15 % | 67.3 s | 70.8 s (+5 %) | met |
+| M6 fixture `full_scan` | ≤ +15 % | rust 1.07 s, csharp 1.19 s, cpp 1.12 s | rust 1.21 s (+13 %), csharp 1.23 s (+3 %), cpp 1.21 s (+8 %) | met |
+| M6 largest `name_refs` | < 1 MiB | 229,842 B (DevGraph) | 229,842 B (DevGraph); 1,441 B (cpp) | met |
+
+- **C# falls short where a caller's text cannot reach.** The fixture's two
+  `User.cs` (namespaces `Shop.Domain` and `Legacy.Accounts`, folders
+  `Models/` and `Legacy/`) both match `/User.cs`, so `UserMapper.Describe`
+  (`using Legacy.Accounts`) and `UserService.Register` (in `Shop.Domain`,
+  whose enclosing namespace wins over its `using Legacy.Accounts`) each
+  link both files' `Display` (two false linked edges, two wrong-file named
+  sites) and four files import both classes. `UserMapper` lives in
+  `Mappers.cs`, which `/UserMapper.cs` cannot find (two missed calls and
+  named sites), and `user.Initials()`'s extension class is never named, so
+  that import is missed. The design's namespace-segment narrowing (a pin to
+  folders named after a `using`'s segments) would fix `Describe` and break
+  `Register`, since `UserService.cs` has the same `using`; only an index
+  of every file's namespace and classes, read at query time or kept by the
+  engine, could tell them apart. `test_measure_fixtures` keeps C# a strict
+  xfail with that reason.
+- **Timing.** DevGraph's is one `--scan` each of the slice B and slice C
+  code over the same tree, beside other test runs. The fixtures' are
+  medians of alternating in-process runs (five scans after two warm-ups,
+  three or six series each). A first C++ build wrote 8 pins per include (3
+  include roots, 4 source extensions) and cost +19 %; `inc/` and `.cxx`/`.c`
+  went (`.c` is not indexed at all).
+
+AFTER (`full_scan_s` is one cold run of the script):
+
+```json
+{
+ "rust": {
+  "M1": {"calls_by_confidence": {"package": 10, "resolved": 10}, "multi_target_by_confidence": {"package": 4}, "resolved_multi_share": 0.0},
+  "M2": {"precision_resolved": 1.0, "precision_linked": 1.0, "precision_all": 1.0, "resolved_cross_dir_without_import": 0},
+  "M3": {"graph_imports": 19, "truth_imports": 19, "precision": 1.0, "recall": 1.0},
+  "M4": {"recall_any": 1.0, "recall_linked": 1.0, "recall_resolved": 0.5, "top5_stoplisted": []},
+  "M5": {"sites_ok": 34, "sites": 34},
+  "M6": {"full_scan_s": 2.92, "largest_name_refs_module": "crates/app/src/main.rs", "largest_name_refs_bytes": 1377, "total_name_refs_bytes": 5657},
+  "failures": []
+ },
+ "csharp": {
+  "M1": {"calls_by_confidence": {"name": 4, "package": 18, "resolved": 1}, "multi_target_by_confidence": {"name": 2, "package": 4}, "resolved_multi_share": 0.0},
+  "M2": {"precision_resolved": 1.0, "precision_linked": 0.8947, "precision_all": 0.913, "resolved_cross_dir_without_import": 0},
+  "M3": {"graph_imports": 20, "truth_imports": 17, "precision": 0.8, "recall": 0.9412},
+  "M4": {"recall_any": 0.9048, "recall_linked": 0.8095, "recall_resolved": 0.0476, "top5_stoplisted": []},
+  "M5": {"sites_ok": 27, "sites": 31},
+  "M6": {"full_scan_s": 2.23, "largest_name_refs_module": "src/Shop.App/Program.cs", "largest_name_refs_bytes": 1109, "total_name_refs_bytes": 3661},
+  "failures": ["M2 linked precision >= 98 %", "M3 IMPORTS precision >= 98 %", "M3 IMPORTS recall >= 95 %", "M4 CALLS recall >= 95 %", "M5 every named site"]
+ },
+ "cpp": {
+  "M1": {"calls_by_confidence": {"package": 14, "resolved": 3}, "multi_target_by_confidence": {}, "resolved_multi_share": 0.0},
+  "M2": {"precision_resolved": 1.0, "precision_linked": 1.0, "precision_all": 1.0, "resolved_cross_dir_without_import": 0},
+  "M3": {"graph_imports": 17, "truth_imports": 17, "precision": 1.0, "recall": 1.0},
+  "M4": {"recall_any": 1.0, "recall_linked": 1.0, "recall_resolved": 0.1765, "top5_stoplisted": []},
+  "M5": {"sites_ok": 29, "sites": 29},
+  "M6": {"full_scan_s": 1.19, "largest_name_refs_module": "src/main.cpp", "largest_name_refs_bytes": 1441, "total_name_refs_bytes": 6788},
+  "failures": []
+ }
+}
+```
+
+### Final results, every language
+
+| Fixture | M1 resolved multi-target | M2 linked precision | M3 `IMPORTS` P / R | M4 recall (linked) | M5 sites | |
+|---|---|---|---|---|---|---|
+| ts | 0 % | 100 % | 100 % / 100 % | 100 % (96 %) | 41/41 | met |
+| go | 0 % | 100 % | 100 % / 100 % | 100 % (100 %) | 33/33 | met |
+| java | 0 % | 100 % | 100 % / 100 % | 95 % (95 %) | 29/30 | one disputed site |
+| kotlin | 0 % | 100 % | 100 % / 100 % | 100 % (95 %) | 33/33, symbols 13/13 | met |
+| rust | 0 % | 100 % | 100 % / 100 % | 100 % (100 %) | 34/34 | met |
+| csharp | 0 % | 89 % | 80 % / 94 % | 90 % (81 %) | 27/31 | short (see above) |
+| cpp | 0 % | 100 % | 100 % / 100 % | 100 % (100 %) | 29/29 | met |
+
+Python on DevGraph is as after slice A (resolved precision, `IMPORTS` and
+`find_callers` recall unchanged; 15 fewer self-loops than before `no_self`).
+

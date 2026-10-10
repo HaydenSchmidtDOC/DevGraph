@@ -401,41 +401,40 @@ call edges, `explain_architecture` returning no `uses`/`calls`, and relative
 imports not resolving) have been fixed and checked against a reference repository.
 Two things worth knowing about how they work:
 
-- **Python calls are resolved through scope and imports; other languages'
-  are name-based.** A Python call links to the file its callee can be in:
-  a def in the same file, the module an imported name comes from (or any
-  file under that package, for a re-export), `self`/`super()` methods in
-  the class or its bases, and methods on a module or on a value whose type
-  an annotation or constructor call gives. Each Python `CALLS` edge has a
-  `confidence`: `resolved`, `package`, or `name` (a method on a value
-  nothing types, linked to every `Function` of that name). A call of a
-  builtin type's method (`.get`, `.join`, `.append`) on such a value, or a
-  bare name nothing defines or imports (a builtin), links nothing. In every
-  other language `self.foo()`, `this->foo()`, `obj.Foo()` and a bare `foo()`
-  all link to whichever `Function` node is named `foo`, so same-named
-  methods on unrelated types over-link. `find_callers` returns each
-  caller's `confidence`, most certain first; pass `resolved_only=True` to
-  keep only `resolved`/`package` callers. When a call was made from inside
-  a method body, its `CALLS` edge records the caller's enclosing class as
+- **Calls are resolved through scope, imports and types, in every
+  language.** A call links to the file its callee can be in: a function of
+  the same file, the module, package, class file, crate module or header an
+  import, `use` or `#include` names, `self`/`this`/`super` methods in the
+  class or its bases, and methods on a value whose type a parameter, a
+  local, a field or a constructor call gives. Each `CALLS` edge has a
+  `confidence`: `resolved` (a file the caller names), `package` (a file its
+  imports reach less exactly: under an imported package, a class file found
+  by path suffix in another module, a C# class file `/T.cs`, a C++ header's
+  same-stem source) or `name` (a method on a value nothing types, linked to
+  every `Function` of that name, never back to its own caller). A library
+  type's method (`.get`, `.push_back`, `List.Add`) on such a value, a call
+  through a library type or an external package, and a bare name nothing
+  defines or imports link nothing. `find_callers` returns each caller's
+  `confidence`, most certain first; pass `resolved_only=True` to keep only
+  `resolved`/`package` callers. When a call was made from inside a method
+  body, its `CALLS` edge records the caller's enclosing class as
   `caller_class` — pass `find_callers(..., scope_to_class="ThatClass")` to
   filter down to just that class's own callers. Graph insights (PageRank,
-  communities) leave out `name` and `package` edges.
-- **Import/include resolution is a same-repo best-effort guess, per
-  language, and it fails silently by design.** Each language extractor
-  resolves its own dominant intra-repo import convention (Python's dotted
-  imports, JS/TS's relative paths and `node_modules`, C#'s namespace/folder
-  convention, Java's package/folder convention, Rust's `mod`/`use`, Go's
-  module-path convention) to a same-repo file guess. A wrong guess doesn't
-  corrupt the graph — it simply never becomes an edge (`IMPORTS` edges only
-  materialize when the guessed target actually exists as an indexed node) —
-  but it does mean `find_related_files`'s `imported_modules` can legitimately
-  under-report for any language, not just Python. **C++ is a special case:**
-  `#include` resolution has no build-system truth to lean on (no compiler
-  flags/include paths available to DevGraph), so only same-directory quoted
-  includes (`#include "local.h"`) get a guess at all — angle-bracket
-  includes (`#include <foo.h>`) are skipped entirely. Treat C++'s `IMPORTS`
-  graph as thin by design, not as a sign indexing failed; its
-  Module/Class/Function/CALLS/EXTENDS extraction is unaffected by this.
+  communities) leave out `name` and `package` edges. What stays out of
+  reach: a C# class in a file not named after it, two C# types of one name
+  in different namespaces (both get the edge), and a method a type inherits
+  from a base declared in another file.
+- **Import/include resolution reads only the importing file and the
+  repository's resolver configuration** (tsconfig/jsconfig, go.mod/go.work,
+  Cargo.toml). Python, JS/TS, Go, Java, Kotlin and Rust imports name files
+  by each language's own rules; a C# `using` names a namespace, so C#
+  `IMPORTS` edges go to the classes a file references; a C++ quoted
+  `#include` names the file beside the includer, else the same path under
+  another directory (a bare `"x.h"` only under an `include/` or `src/`
+  directory), and `#include <...>` is never resolved (no compiler
+  flags are available to DevGraph). An import of something outside the
+  repository gets no edge, and a target that doesn't exist yet links when
+  it is added.
 - **Service cross-linking depends on the compose file's `build`/`context`
   matching each service's actual source directory.** If a compose service
   has no `build:` key (image-only services like databases) or an

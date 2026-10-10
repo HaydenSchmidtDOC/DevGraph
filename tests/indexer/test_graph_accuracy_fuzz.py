@@ -20,11 +20,13 @@ root or nested go.mod comes and goes, and a config under an ignored folder is
 edited. After every batch the fuzz runs what a live batch does,
 `sync_resolver_config`. Kotlin files hold adjacent one-line classes, which
 the extractor recovers from tree-sitter-kotlin's error nodes, and import a
-function or package of another one. Go, Java and Kotlin calls come in every
-style their resolvers read (bare, through a package or class, on `this`, on
-a typed or an untyped value); a function moves between files of its Go or
-Kotlin package, and a Java class moves to the same package under another
-source root (another module).
+function or package of another one. Go, Java, Kotlin, Rust, C# and C++ calls
+come in every style their resolvers read (bare, through a package, module,
+crate, namespace or class, on `this`/`base`, on a typed or an untyped value);
+a function moves between files of its Go or Kotlin package (and a C# method
+to another file's class), a Java class moves to the same package under
+another source root (another module), and a Rust crate's Cargo.toml renames
+it, moves its root file or stops declaring it.
 
 Path pins (docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md)
 are fuzzed ahead of the resolvers that write them: a Python file's
@@ -37,7 +39,7 @@ The spec's "Out of scope" gaps are left out by construction:
 - no datastore or route code (so no handler stub either);
 - no method moves out of its type's file: only free functions move, and the
   Go method and Rust inherent `impl` stay with their type;
-- no C++, and no C#/TS partial classes;
+- no C++ out-of-class method definitions, and no C#/TS partial classes;
 - the default `mentions_ambiguous_mode` (`all`);
 - a docs note's `id` never changes in place;
 - a renamed docs note's old path is removed before its new path is indexed,
@@ -137,7 +139,7 @@ def render(f: File) -> str:
         ]
         return "".join(parts) or "X = 1\n"
     if f.kind == "rs":
-        parts = [f"use crate::{m};\n" for m in f.imports]
+        parts = [f"{m}\n" for m in f.imports]
         parts.append("\n" + f.extra)
         if f.impl:
             parts.append("\nimpl Display for Foo {}\n")
@@ -146,6 +148,24 @@ def render(f: File) -> str:
             for name, calls in f.funcs.items()
         ]
         return "".join(parts)
+    if f.kind == "cs":
+        # One class per file, its methods calling in every style.
+        ((cls, base),) = f.bases.items()
+        parts = [f"{m}\n" for m in f.imports] + [f"namespace {f.head};\n\npublic class {cls}"]
+        parts.append((f" : {base}" if base else "") + "\n{\n")
+        parts += [
+            f"    public void {name}()\n    {{\n" + "".join(f"        {g}();\n" for g in calls) + "    }\n"
+            for name, calls in f.funcs.items()
+        ]
+        return "".join(parts) + "}\n"
+    if f.kind == "cpp":
+        # Free functions with a typed local, so a typed receiver's call has a type.
+        parts = [f"{m}\n" for m in f.imports]
+        parts += [
+            f"\nvoid {name}() {{\n    Widget w;\n" + "".join(f"    {g}();\n" for g in calls) + "}\n"
+            for name, calls in f.funcs.items()
+        ]
+        return "".join(parts) or "// Nothing.\n"
     if f.kind == "go":
         parts = [f"package {f.head}\n"]
         if f.imports:
@@ -220,9 +240,14 @@ TS_CONFIGS = {
     "go.mod": [None, "module example.com/top\n", "module example.com/other\n"],
     "go/b/go.mod": [None, "module example.com/bee\n"],
     "go.work": [None, "go 1.22\n\nuse ./go\n\nreplace example.com/ext => ./go/b\n"],
+    # crates/core is the crate shop_core, renamed, given another root file, or not a package at all.
+    "crates/core/Cargo.toml": [
+        '[package]\nname = "shop-core"\n', '[package]\nname = "store-core"\nversion = "0.2.0"\n',
+        '[package]\nname = "shop-core"\n\n[lib]\npath = "src/main.rs"\n', "[workspace]\n", None,
+    ],
 }
 # Folders holding a configuration file, which the fuzz may delete whole.
-CONFIG_DIRS = ["ts/configs", "go/b"]
+CONFIG_DIRS = ["ts/configs", "go/b", "crates/core"]
 
 RS_FOO = "pub struct Foo;\n\nimpl Foo {\n    pub fn new() -> Foo {\n        Foo\n    }\n}\n"
 GO_SERVER = "type Server struct{}\n\nfunc (s *Server) Run() {\n\tServe()\n}\n"
@@ -244,7 +269,18 @@ def initial_repo() -> dict:
         "src/lib/util.py": File("py", funcs={"render": []}),
         "rs/foo.rs": File("rs", extra=RS_FOO, funcs={"parse": ["render"]}),
         "rs/display.rs": File("rs", extra="pub trait Display {}\n", funcs={"render": []}),
-        "rs/conv.rs": File("rs", imports=["display::Display"], impl=True, funcs={"convert": ["parse"]}),
+        "rs/conv.rs": File("rs", imports=["use crate::display::Display;"], impl=True,
+                           funcs={"convert": ["parse", "shop_core::run"]}),
+        "crates/core/Cargo.toml": File("static", head=TS_CONFIGS["crates/core/Cargo.toml"][0]),
+        "crates/core/src/lib.rs": File("rs", imports=["pub mod util;"], funcs={"run": ["util::tidy"]}),
+        "crates/core/src/util.rs": File("rs", funcs={"tidy": []}),
+        "cs/Jobs.cs": File("cs", head="Shop", bases={"Jobs": None}, funcs={"Run": [], "Stop": []}),
+        "cs/Program.cs": File("cs", head="Shop.App", imports=["using Shop;"], bases={"Program": "Jobs"},
+                              funcs={"Main": ["Jobs.Run", "Stop", "new Jobs().Stop"]}),
+        "cs/Models/Base.cs": File("cs", head="Shop.Models", bases={"Base": None}, funcs={"Helper": []}),
+        "cpp/util/strings.h": File("cpp", funcs={"trim": []}),
+        "cpp/util/strings.cpp": File("cpp", imports=['#include "strings.h"'], funcs={"upper": ["trim"]}),
+        "cpp/main.cpp": File("cpp", imports=['#include "util/strings.h"'], funcs={"main": ["util::upper", "trim"]}),
         "java/app/K.java": File("java", head="app", imports=["base.Base"], bases={"K": "Base"},
                                 funcs={"run": ["helper", "assist"]}),
         "java/base/Base.java": File("java", head="base", bases={"Base": None}, funcs={"assist": []}),
@@ -279,14 +315,21 @@ IMPORTS = {
         "from . import a", "from pkg import helper", "from pkg import *", "from py.b import *",
         "from lib import util", "import pkg.impl", "from pkg.impl import pkgfn as alias",
     ],
-    "rs": ["display::Display", "foo::Foo"],
+    "rs": ["use crate::display::Display;", "use crate::foo::Foo;", "use shop_core::util;", "mod display;",
+           "use crate::util::tidy;", "use super::display::render;"],
+    "cs": ["using Shop;", "using Shop.Models;", "using static Shop.Jobs;", "using J = Shop.Jobs;"],
+    "cpp": ['#include "util/strings.h"', '#include "strings.h"', '#include "widget.h"',
+            '#include "../cpp/util/strings.h"', "#include <vector>"],
     "go": ["example.com/fz/a", "example.com/fz/b", "example.com/top/go/b", "example.com/bee", "example.com/ext"],
     "ts": ["import { f } from '@/lib';", "import * as u from '@/util';", "import { g } from './src/util';",
            "import { f } from './other/lib';", "import { f } from 'lib';", "import { g } from './src';"],
     "java": ["base.Base", "app.K", "base.*"],
     "kt": ["kt.util.slug", "kt.util.*", "kt.Clock", "kt.helper"],
 }
-BASES = {"py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "java": ["Base", "K"]}
+BASES = {
+    "py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "java": ["Base", "K"],
+    "cs": ["Jobs", "Base", "Program", "Missing"],
+}
 # How a Python call to `{n}` is written: bare, through a module or alias, on
 # an untyped value, on `self`, or on a literal.
 PY_CALLS = ["{n}()", "b.{n}()", "c.{n}()", "obj.{n}()", "pkg.impl.{n}()", "alias.{n}()", "self.{n}()", "''.{n}()"]
@@ -301,13 +344,24 @@ GO_CALLS = ["{n}", "b.{n}", "bee.{n}", "(&Server{{}}).{n}", "obj.{n}"]
 JAVA_CALLS = ["{n}", "this.{n}", "Base.{n}", "new K().{n}", "obj.{n}"]
 # How a Kotlin call to `{n}` is written: bare, on a constructed or an untyped value.
 KT_CALLS = ["{n}", "Clock().{n}", "x.{n}"]
+# How a Rust call to `{n}` is written: bare, through a module, a crate path,
+# another crate, a type, or on an untyped value.
+RS_CALLS = ["{n}", "display::{n}", "crate::foo::{n}", "shop_core::{n}", "shop_core::util::{n}", "Foo::{n}",
+            "x.{n}"]
+# How a C# call to `{n}` is written: bare, on `this`/`base`, static, through
+# an alias, on a new or an untyped object.
+CS_CALLS = ["{n}", "this.{n}", "base.{n}", "Jobs.{n}", "J.{n}", "new Jobs().{n}", "obj.{n}"]
+# How a C++ call to `{n}` is written: bare, namespace-qualified, on a typed or an untyped value.
+CPP_CALLS = ["{n}", "util::{n}", "w.{n}", "obj->{n}"]
 # The source roots a Java file moves between (another Maven module).
 JAVA_ROOTS = ["java/", "lib/src/main/java/"]
 SERVICES = ["api", "web", "worker", "db"]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
 EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing"]
-CODE = ("py", "rs", "go", "java", "ts", "kt")
-MOVABLE = ("py", "rs", "go", "ts", "kt")  # free functions only: a Java method stays in its class
+CODE = ("py", "rs", "go", "java", "ts", "kt", "cs", "cpp")
+# Free functions, and C# methods (one class per file, so a method moves to another class);
+# a Java method stays in its class.
+MOVABLE = ("py", "rs", "go", "ts", "kt", "cs", "cpp")
 KT_CLASSES = ["Clock", "Stopwatch", "Tag", "Index"]
 
 
@@ -336,7 +390,10 @@ class Fuzz:
     @staticmethod
     def _styled(kind: str, names: list) -> list:
         """Each name written as every call style of the language."""
-        styles = {"py": PY_CALLS, "ts": TS_CALLS, "go": GO_CALLS, "java": JAVA_CALLS, "kt": KT_CALLS}.get(kind, ["{n}"])
+        styles = {
+            "py": PY_CALLS, "ts": TS_CALLS, "go": GO_CALLS, "java": JAVA_CALLS, "kt": KT_CALLS, "rs": RS_CALLS,
+            "cs": CS_CALLS, "cpp": CPP_CALLS,
+        }.get(kind, ["{n}"])
         return [style.format(n=n) for style in styles for n in names]
 
     # Each operation returns (description, touched paths), or None when it can't apply.

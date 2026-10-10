@@ -12,10 +12,10 @@ includes are read as the compiler's search would most likely go:
   - `#include "x/y.h"` names the file beside the includer (`<dir>/x/y.h`,
     resolved) and, by suffix, `/x/y.h` anywhere else (package, vendored
     copies left out); a bare `"y.h"` only under a conventional include root
-    (`/include/y.h`, `/inc/y.h`, `/src/y.h`), so two `log.h` in different
+    (`/include/y.h`, `/src/y.h`), so two `log.h` in different
     folders stay apart. `#include <system.h>` is not resolved at all.
   - A header's declarations are defined in its same-stem source
-    (`/x/y.cpp`, `.cc`, `.cxx`, `.c`; package), which an include reaches
+    (`/x/y.cpp` or `.cc`; package), which an include reaches
     too.
 
 CALLS, by the first tier that applies: a function defined in the file ->
@@ -313,10 +313,10 @@ def _doc_summary(full_text: str, max_chars: int = 120) -> str:
 # --- resolution ------------------------------------------------------------------
 
 _HEADER_EXTS = (".h", ".hpp", ".hh", ".hxx")
-_SOURCE_EXTS = (".cpp", ".cc", ".cxx", ".c")
+_SOURCE_EXTS = (".cpp", ".cc")
 #: Where a quoted include of a bare name (`"platform.h"`) is looked for
 #: besides the includer's directory: the conventional include roots.
-_INCLUDE_ROOTS = ("include", "inc", "src")
+_INCLUDE_ROOTS = ("include", "src")
 _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 

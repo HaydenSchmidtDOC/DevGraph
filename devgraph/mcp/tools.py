@@ -1110,14 +1110,16 @@ def find_callers(
 ) -> dict[str, Any]:
     """Find all functions, services, or endpoints that call a given target.
 
-    A Python CALLS edge carries a `confidence`: "resolved" (the callee was
-    found through the caller's own scope or imports, in a file it names),
-    "package" (in a file under an imported package, e.g. a re-export) or
-    "name" (a method on a receiver nothing types, linked to every Function
-    of that name). Other languages' CALLS edges are name-based and carry
-    none: a call to `target_name` links to every Function node named
-    `target_name` repo-wide, which can surface unrelated same-named methods
-    as noise. Each caller is returned once, with its best confidence, and
+    A CALLS edge carries a `confidence`, in every source language:
+    "resolved" (the callee was found through the caller's own scope, imports
+    or types, in a file it names), "package" (in a file the caller's
+    imports reach less exactly: under an imported package or a re-exporting
+    module, a class file found by suffix in another module, a C# class file
+    `/T.cs`, a C++ header's same-stem source) or "name" (a method on a
+    receiver nothing types, linked to every Function of that name). An
+    edge written before index format 4 (Python), 6 (JS/TS), 7 (Go, Java,
+    Kotlin) or 8 (Rust, C#, C++) carries none until the automatic rescan.
+    Each caller is returned once, with its best confidence, and
     resolved callers come first. When a method-body call's enclosing class
     is known at index time, the edge carries a `caller_class` property
     recording it — pass scope_to_class to narrow results to callers made
