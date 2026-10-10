@@ -360,6 +360,47 @@ a type gets from a trait implemented in another file is not found through
 a receiver of that type: the call keeps a bare-name row when the type is
 declared in the file, and links the type's module otherwise.
 
+## C# (`devgraph/indexer/csharp/extractor.py`)
+
+A C# file's text says which namespaces it uses, not which files hold them:
+nothing ties a namespace to a folder, nor (beyond convention, SA1649) a
+class to a file named after it. Where another file's type `T` lives is
+therefore its class file by suffix, `/T.cs^` (no vendored copy), at package
+confidence: two namespaces can each hold a `User.cs`, and only an index of
+every file's namespace could tell them apart, which would make an edge
+depend on the target file's text (a namespace edit keeps the target's nodes,
+so edges into it would go stale). The design's partial-class rule (a
+suffix-directory pin to the class's folder) is dropped; a method of
+another part of a partial class keeps a bare-name row.
+
+**Calls**, first match wins:
+
+1. An unqualified `M()`, `this.M()`, `base.M()`: this file when an
+   enclosing class declared here, innermost first, or an in-file base has
+   M; else its other bases' class files; else a `using static` type's
+   class file. A local function or a delegate variable links nothing.
+2. `T.M()` on a type (an alias's target, the last name of a qualified
+   `A.B.T.M()`) and a typed receiver (a parameter, a field or property of
+   the enclosing classes, `T x`, `var x = new T()`, `new T().M()`, a
+   `foreach` element of a `List<T>` or array): this file when T is declared
+   here and has M; else `/T.cs^`, and for a receiver also
+   `/TExtensions.cs^`, the conventional class of T's extension methods. A
+   library type (`STOP_TYPES["csharp"]`: `Console`, `List`, `Math`, ...) or
+   a predefined one (`string.IsNullOrEmpty`) links nothing.
+3. Anything else, `dynamic` and `x?.M()` included: a bare-name row, off its
+   caller for a member call, none for a stoplisted method.
+
+**`IMPORTS`** are the classes a file references: an edge to the Class `T`
+for each type it writes (a base, a field, property, parameter, local or
+return type, `new T()`, a cast, `typeof`, a generic argument, a static
+receiver, an alias's target, a `using static` type it calls through),
+declared in any C# file (the suffix-directory pin `/.?.cs^`, package), not
+in this file, and no library type, as Kotlin's imports name symbols. A
+partial class's every part and a class in a file named otherwise are
+reached; a `using` of a namespace, the bare dotted name and the old
+`A/B.cs` folder guess are gone. An extension method's class, which the
+caller never names, is not imported.
+
 ## No reverse dependents
 
 With Go, Java and Kotlin resolved, every code edge is a function of its
@@ -376,8 +417,6 @@ nested go.mod.
 
 ## Later slices
 
-- **C#:** a referenced type `T` gives the suffix pin `/T.cs`, so C# calls
-  resolve at package confidence.
 - **C++:** a quoted `#include` gives the relative file and a suffix pin, plus
   same-stem sources.
 
