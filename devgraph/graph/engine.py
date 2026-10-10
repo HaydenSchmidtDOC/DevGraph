@@ -1559,6 +1559,22 @@ class GraphEngine:
             )
             return {record["source"] for record in result or [] if record["source"]}
 
+    def list_shared_claims(self, repo_id: str, files: list[str]) -> dict[tuple[str, str], set[str]]:
+        """(label, name) -> every claiming file (`sources`) of each shared node
+        one of `files` claims. index_paths reads it before and after a batch
+        to tell a shared node the batch may have deleted and written back."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                _union(_CLAIMED_BRANCHES)
+                + "WITH n, coalesce(n.sources, [n.source]) AS sources "
+                "WHERE n.file IS NULL AND n.source_file IS NULL AND any(s IN sources WHERE s IN $files) "
+                "RETURN labels(n)[0] AS label, n.name AS name, sources",
+                repo_id=repo_id,
+                files=files,
+            )
+            return {(record["label"], record["name"]): set(record["sources"]) for record in result or []}
+
     def delete_bare_modules(self, repo_id: str) -> int:
         """Delete this repo's `Module` nodes that have no file key at all (no
         `source_file`, `file` or `path`), with their edges, and return how

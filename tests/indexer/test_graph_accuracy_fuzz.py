@@ -24,7 +24,8 @@ function or package of another one. Go, Java and Kotlin calls come in every
 style their resolvers read (bare, through a package or class, on `this`, on
 a typed or an untyped value); a function moves between files of its Go or
 Kotlin package, and a Java class moves to the same package under another
-source root (another module).
+source root (another module). An image moves between the Dockerfile and a
+compose service in one step, so its shared Container changes claimant.
 
 Path pins (docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md)
 are fuzzed ahead of the resolvers that write them: a Python file's
@@ -265,9 +266,9 @@ def initial_repo() -> dict:
         "go/a/a.go": File("go", head="a", imports=["example.com/fz/b"], funcs={"Start": ["Serve"]}),
         "go/b/b.go": File("go", head="b", extra=GO_SERVER, funcs={"Serve": [], "Stop": []}),
         "go/b/halt.go": File("go", head="b", funcs={"Halt": ["Stop"]}),
-        "compose.yaml": File("compose", services={"api": "python:3.12", "web": "nginx:1.27"}),
+        "compose.yaml": File("compose", services={"api": "alpine:3.20", "web": "nginx:1.27"}),
         "Dockerfile": File("docker", froms=["python:3.12"]),
-        "notes.md": File("notes", mentions=["helper", "Foo", "Base", "K", "Serve", "api", "python"]),
+        "notes.md": File("notes", mentions=["helper", "Foo", "Base", "K", "Serve", "api", "python", "nginx"]),
         "docs/adr-1.md": File("note", head="ADR-1", links=["py/a.py"]),
         "docs/adr-2.md": File("note", head="ADR-2", supersedes="ADR-1"),
     }
@@ -558,6 +559,32 @@ class Fuzz:
         froms.append(image)
         return f"add FROM {image} in {path}", {path}
 
+    def op_move_image(self):
+        """Move an image only one of the Dockerfile and the compose file runs
+        to the other, in one step, so its shared Container changes claimant.
+        A Dockerfile claims only its first FROM's image."""
+        docker = self._pick(lambda f: f.kind == "docker")
+        compose = self._pick(lambda f: f.kind == "compose")
+        if not docker or not compose:
+            return None
+        froms, services = self.files[docker].froms, self.files[compose].services
+        claimed = froms[:1]
+        movable = sorted(set(claimed) ^ set(services.values()))
+        free = [s for s in SERVICES if s not in services]
+        if not movable or not free:
+            return None
+        image = self.rng.choice(movable)
+        if image in claimed:
+            froms.remove(image)
+            services[self.rng.choice(free)] = image
+            return f"move {image} from {docker} to {compose}", {docker, compose}
+        for name in sorted(s for s, i in services.items() if i == image):
+            del services[name]
+        if image in froms:
+            froms.remove(image)
+        froms.insert(0, image)
+        return f"move {image} from {compose} to {docker}", {docker, compose}
+
     def op_mention(self):
         path = self._pick(lambda f: f.kind == "notes")
         if not path:
@@ -592,7 +619,7 @@ class Fuzz:
 
     OPS = [
         "call", "base", "import", "import_style", "impl", "add_function", "remove_function", "move_function",
-        "rename", "delete", "restore", "service", "from", "mention", "link", "supersedes", "pin", "pin",
+        "rename", "delete", "restore", "service", "from", "move_image", "mention", "link", "supersedes", "pin", "pin",
         "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module",
     ]
 
