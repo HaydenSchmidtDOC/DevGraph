@@ -67,10 +67,9 @@ fun processData(data: List<Any>) {
     assert ("Class", "UserService", "EXTENDS", "Class", "BaseService") in rel_tuples
     assert ("Class", "UserService", "EXTENDS", "Class", "Describable") in rel_tuples
 
-    import_targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "com.example.bar.BaseService" in import_targets  # bare dotted, kept
-    assert "src/main/java/com/example/bar/BaseService.kt" in import_targets  # resolved file guess
-    assert "java.util.List" in import_targets
+    # An import names a class: the file of its package declaring it (see test_kotlin_calls.py).
+    imports = {(r.to_label, r.to_name) for r in result.relationships if r.rel_type == "IMPORTS"}
+    assert imports == {("Class", "BaseService"), ("Class", "List")}
 
 
 def test_extract_empty_file():
@@ -83,7 +82,7 @@ def test_extract_empty_file():
 def test_package_folder_convention_resolves_source_root():
     """A file at 'src/main/java/com/example/foo/Bar.kt' declaring
     'package com.example.foo' should detect 'src/main/java' as the source
-    root and use it to resolve a sibling-package import to a real file guess.
+    root and use it to resolve a sibling-package import to its directory.
     """
     source_code = """
 package com.example.foo
@@ -96,11 +95,11 @@ class Bar {
     result = extract_kotlin_file(
         source_code, "src/main/java/com/example/foo/Bar.kt", "test_repo"
     )
-    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "src/main/java/com/example/util/Helper.kt" in targets
+    pins = {r.to_file for r in result.relationships if r.rel_type == "IMPORTS" and r.to_name == "Helper"}
+    assert "src/main/java/com/example/util/.?.kt,.java" in pins
 
 
-def test_wildcard_import_has_no_file_guess():
+def test_wildcard_import_names_its_package_directory():
     source_code = """
 package com.example.foo
 
@@ -112,15 +111,16 @@ class Bar {
     result = extract_kotlin_file(
         source_code, "src/main/java/com/example/foo/Bar.kt", "test_repo"
     )
-    rels = [r for r in result.relationships if r.rel_type == "IMPORTS"]
-    targets = {r.to_name for r in rels}
-    assert "com.example.util" in targets  # bare dotted, kept
-    assert not any(t.endswith(".kt") for t in targets)  # no file guess for a wildcard
+    pins = {r.to_file for r in result.relationships if r.rel_type == "IMPORTS"}
+    assert pins == {
+        "src/main/java/com/example/util/.?.kt,.java", "/com/example/util/.?.kt^t", "/com/example/util/.?.java^t",
+    }
 
 
-def test_mismatched_package_directory_falls_back_to_repo_root_relative():
+def test_mismatched_package_directory_imports_by_suffix():
     """If the file's directory doesn't end with its declared package path,
-    the source-root guess falls back to '' (repo-root-relative)."""
+    its whole package is left out of the tree: an import outside it is
+    found by suffix only."""
     source_code = """
 package com.example.foo
 
@@ -130,8 +130,8 @@ class Weird {
 }
 """
     result = extract_kotlin_file(source_code, "somewhere/else/Weird.kt", "test_repo")
-    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "com/example/bar/Baz.kt" in targets
+    pins = {r.to_file for r in result.relationships if r.rel_type == "IMPORTS"}
+    assert pins == {"/com/example/bar/.?.kt^t", "/com/example/bar/.?.java^t"}
 
 
 def test_calls_edge_for_bare_function_call():
@@ -166,8 +166,8 @@ class Service {
     result = extract_kotlin_file(source_code, "Service.kt", "test_repo")
     calls = {(r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}
     assert ("process", "helper") in calls
-    assert ("process", "otherHelper") in calls
-    assert ("process", "currentTimeMillis") in calls
+    assert ("process", "otherHelper") in calls  # an untyped receiver: by name
+    assert ("process", "currentTimeMillis") not in calls  # a library type
 
 
 def test_calls_edge_carries_caller_class():
@@ -186,7 +186,7 @@ class Service {
         r for r in result.relationships if r.rel_type == "CALLS" and r.to_name == "helper"
     ]
     assert calls
-    assert calls[0].properties == {"caller_class": "Service"}
+    assert calls[0].properties == {"caller_class": "Service", "confidence": "resolved"}
 
 
 def test_data_class_and_enum_and_object_map_to_class():

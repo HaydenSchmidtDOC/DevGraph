@@ -18,8 +18,8 @@ from devgraph.graph.schema import (
     NAME_REF_SEP,
     PIN_CONFIDENCE,
     PIN_KINDS,
-    VENDORED_DIRS,
     pin_kind,
+    pin_root,
     split_pin,
 )
 
@@ -88,8 +88,8 @@ class GraphRelationship:
     A `to_file` may be a path pin instead of a file (see `pin_matches`): the
     edge goes to every node of the name in a file the pin matches, less the
     files any pin in `exclude` matches. A Module target's pin is matched on
-    the Module's path, its `to_name` being the directory or basename the
-    pin seeks (`module_pin_name`).
+    the Module's path, its `to_name` being the directory, directory name or
+    basename the pin seeks (`module_pin_name`).
 
     `no_self` keeps the edge off its own source: a call `x.m()` on a receiver
     nothing types, inside `m` itself, is not a recursive call.
@@ -173,19 +173,19 @@ def pin_matches(pin: str | None, path: str) -> bool:
         return False
     if parts.only and not path.endswith(parts.only):
         return False
-    if parts.no_vendored and any(segment in VENDORED_DIRS for segment in path.split("/")):
-        return False
     kind = pin_kind(pin)
     if kind in ("fileless", "file"):
         return path == base
     if kind in ("dir", "loose_dir"):
         folder = base[:-1]
-        return path.startswith(folder) and "/" not in path[len(folder):]
-    if kind == "suffix":
-        return ("/" + path).endswith(base)
-    if kind == "suffix_dir":
-        return ("/" + path[: len(path) - len(path.rsplit("/", 1)[-1])]).endswith(base[:-1])
-    return path.startswith(base)
+        matched = path.startswith(folder) and "/" not in path[len(folder):]
+    elif kind == "suffix":
+        matched = ("/" + path).endswith(base)
+    elif kind == "suffix_dir":
+        matched = ("/" + path[: len(path) - len(path.rsplit("/", 1)[-1])]).endswith(base[:-1])
+    else:
+        matched = path.startswith(base)
+    return matched and not any(segment in parts.skip for segment in pin_root(pin, path).split("/"))
 
 
 def _rank(pin: str) -> int:
@@ -222,13 +222,16 @@ def best_pin(pins: Iterable[str], path: str, file_path: str) -> str | None:
 
 def module_pin_name(pin: str) -> str:
     """What a pinned Module target seeks: a directory pin its directory (as
-    a Module's `dir`), a suffix pin its basename (as a Module's
+    a Module's `dir`), a suffix-directory pin its directory's last name (as
+    a Module's `dir_name`), a suffix pin its basename (as a Module's
     `basename`). A Module's own path is its name, so an exact file needs no
     pin."""
     base = split_pin(pin).base
     kind = pin_kind(pin)
     if kind == "dir":
         return base[:-2] if base.endswith("/.") else ""
+    if kind == "suffix_dir":
+        return posixpath.basename(base[:-2])
     if kind == "suffix":
         return posixpath.basename(base)
     raise ValueError(f"a Module target takes only a directory or suffix pin: {pin!r}")

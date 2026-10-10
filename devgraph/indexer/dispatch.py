@@ -1345,8 +1345,8 @@ def _relink_name_refs(
     (common.best_pin: the strongest pin that matches its file, as the
     writer's rows leave out what a stronger pin matches), with that pin's
     confidence. A pinned Module target is found by an added Module's
-    directory or basename (the row's `to_name`, see common.module_pin_name)
-    and relinked by its path. Each edge gets back the entry's `caller_class`.
+    directory, directory name or basename (the row's `to_name`, see
+    common.module_pin_name) and relinked by its path. Each edge gets back the entry's `caller_class`.
     """
     if not added:
         return
@@ -1369,7 +1369,7 @@ def _relink_name_refs(
         })
 
     names = {name for _label, name in pinned}
-    names |= {posixpath.dirname(module) for module in modules} | {posixpath.basename(module) for module in modules}
+    names |= {key for module in modules for key in _module_pin_keys(module)}
     for origin, refs in engine.find_name_refs(repo_id, sorted(names), sorted(skip)):
         parsed = [parse_name_ref(entry) for entry in refs]
         # Every Module a source imports, by path or by pin, as calls.import_rows
@@ -1387,7 +1387,7 @@ def _relink_name_refs(
             elif to_label == "Module":
                 # A directory or suffix pin: to_name is what it seeks.
                 for module in sorted(modules):
-                    if to_name in (posixpath.dirname(module), posixpath.basename(module)):
+                    if to_name in _module_pin_keys(module):
                         pin = best_pin(imported[tuple(fields[:4])], module, origin)
                         if pin in pins:
                             relink(origin, fields, from_file, None, pin_confidence(pin, confidence), to_name=module)
@@ -1404,6 +1404,13 @@ def _relink_name_refs(
                         relink(origin, fields, source_file, to_file, conf, exclude)
     if rels:
         engine.upsert_relationships(rels)
+
+
+def _module_pin_keys(module: str) -> tuple[str, str, str]:
+    """What a pinned IMPORTS row can seek a Module by (common.module_pin_name):
+    its directory, its directory's last name and its basename."""
+    folder = posixpath.dirname(module)
+    return folder, posixpath.basename(folder), posixpath.basename(module)
 
 
 def _find_referrers(

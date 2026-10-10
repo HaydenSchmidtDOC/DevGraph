@@ -93,10 +93,10 @@ class UserService extends BaseService implements Describable {
     assert ("Class", "UserService", "EXTENDS", "Class", "BaseService") in rel_tuples
     assert ("Class", "UserService", "EXTENDS", "Class", "Describable") in rel_tuples
 
-    import_targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "com.example.bar.BaseService" in import_targets  # bare dotted, kept for compatibility
-    assert "src/main/java/com/example/bar/BaseService.java" in import_targets  # resolved file guess
-    assert "java.util.List" in import_targets
+    imports = {(r.to_name, r.to_file) for r in result.relationships if r.rel_type == "IMPORTS"}
+    # The class file under this source root, and by suffix in any other (see test_java_calls.py).
+    assert ("src/main/java/com/example/bar/BaseService.java", None) in imports
+    assert ("BaseService.java", "/com/example/bar/BaseService.java^t") in imports
 
 
 def test_extract_empty_file():
@@ -141,7 +141,7 @@ class Bar {
     assert "src/main/java/com/example/util/Helper/doStuff.java" not in targets
 
 
-def test_wildcard_import_has_no_file_guess():
+def test_wildcard_import_names_its_package_directory():
     source_code = """
 package com.example.foo;
 
@@ -151,16 +151,14 @@ class Bar {
 }
 """
     result = extract_java_file(source_code, "src/main/java/com/example/foo/Bar.java", "test_repo")
-    rels = [r for r in result.relationships if r.rel_type == "IMPORTS"]
-    targets = {r.to_name for r in rels}
-    assert "com.example.util" in targets  # bare dotted, kept
-    assert not any(t.endswith(".java") for t in targets)  # no file guess for a wildcard
+    pins = {r.to_file for r in result.relationships if r.rel_type == "IMPORTS"}
+    assert pins == {"src/main/java/com/example/util/.?.java", "/com/example/util/.?.java^t"}
 
 
-def test_mismatched_package_directory_falls_back_to_repo_root_relative():
+def test_mismatched_package_directory_imports_by_suffix_only():
     """If the file's directory doesn't end with its declared package path,
-    the source-root guess falls back to '' (repo-root-relative) rather than
-    crashing or producing a nonsensical prefix.
+    there is no source root to anchor an import under: only the suffix pin,
+    which finds the class wherever its package's directories are.
     """
     source_code = """
 package com.example.foo;
@@ -171,8 +169,8 @@ class Weird {
 }
 """
     result = extract_java_file(source_code, "somewhere/else/Weird.java", "test_repo")
-    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "com/example/bar/Baz.java" in targets
+    pins = {r.to_file for r in result.relationships if r.rel_type == "IMPORTS"}
+    assert pins == {"/com/example/bar/Baz.java^t"}
 
 
 def test_calls_edge_for_bare_method_call():
@@ -224,7 +222,7 @@ class Service {
     calls_by_pair = {
         (r.from_name, r.to_name): r.properties for r in result.relationships if r.rel_type == "CALLS"
     }
-    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service"}
+    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service", "confidence": "resolved"}
 
 
 def test_calls_not_hoisted_out_of_nested_class():
@@ -234,10 +232,16 @@ class Outer {
         void innerMethod() {
             deepCall();
         }
+
+        void deepCall() {
+        }
     }
 
     void outerMethod() {
         outerCall();
+    }
+
+    void outerCall() {
     }
 }
 """

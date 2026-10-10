@@ -106,17 +106,20 @@ agree):
   match is `NOT any(p IN exclude WHERE pin_matches(p, file))`; a recursive
   prefix also leaves out the writer's own file, as before. Relink rebuilds
   `exclude` from the entry's pins in the same way.
-- **Module targets** (`IMPORTS`) have no `file`. Every Module carries `dir` and
-  `basename`, derived from its path in the engine's node writer, with
-  `(repo_id, dir)` and `(repo_id, basename)` lookup indexes. A directory pin to
-  a Module seeks `dir`; a suffix pin seeks `basename` and keeps the paths ending
-  with it. The row's `to_name` is then that seek key (the directory or the
-  basename), and the Module's own path is what relink pins.
-- **A file's imports collapse like one call.** Every `IMPORTS` edge of a file
-  ends at a Module, so its imports by path (unpinned, no confidence, as
-  before) and its Module pins form one set (`calls.import_rows`): a pin leaves
-  out what a path import or a stronger pin matches, and the file itself.
-  Relink rebuilds the set from the file's `IMPORTS` entries.
+- **Module targets** (`IMPORTS`) have no `file`. Every Module carries `dir`,
+  `dir_name` (its directory's last name) and `basename`, derived from its
+  path in the engine's node writer, each with a `(repo_id, ...)` lookup
+  index. A directory pin to a Module seeks `dir`; a suffix-directory pin
+  (a Java wildcard import reaching another module) seeks `dir_name`; a
+  suffix pin seeks `basename`; each keeps the paths its pin matches. The
+  row's `to_name` is then that seek key, and the Module's own path is what
+  relink pins.
+- **A file's imports collapse like one call.** Its `IMPORTS` edges to Modules,
+  by path (unpinned, no confidence, as before) and by Module pin, form one
+  set (`calls.import_rows`): a pin leaves out what a path import or a
+  stronger pin matches, and the file itself. Relink rebuilds the set from the
+  file's `IMPORTS` entries. (A Kotlin import of a class or function is an
+  edge to that symbol, collapsed per name like a call.)
 - **`no_self`** on a row adds `a <> b`: a call `x.m()` on an untyped receiver
   inside a method `m` never links the method to itself. A collapsed row has it
   only when every one of its call sites had it.
@@ -233,10 +236,74 @@ the directory's test files from an external test package (`package x_test`,
 `?_test.go`). Build-tag variants (`evict_linux.go`, `evict_other.go`) both
 match: genuinely several targets.
 
+## Java and Kotlin (`devgraph/indexer/java/`, `kotlin/extractor.py`, `jvm.py`)
+
+**Source roots.** A file's directory ends with as much of its package as its
+tree spells out: the longest tail of the package the directory ends with
+gives the source root (`core/src/main/java`) and the package prefix the tree
+leaves out (Kotlin's omitted root: `src/main/kotlin/data/Note.kt` declaring
+`com.acme.notes.data` has root `src/main/kotlin`, `com.acme.notes` omitted).
+A package then names its directory under the same root (*anchored*,
+resolved) and, by path suffix, its directory under every other root (another
+Maven or Gradle module, a test root: package confidence, S5). A suffix pin
+from code outside a vendored directory carries `^` (no `third_party` or
+`vendor` copy of the package: it is not on the classpath), from main code
+`^t` (no test root either: main never sees test sources). Only the source
+root, the path before what the suffix matches, is tested, so a package named
+`vendor` or `test` is still found.
+
+**Java.** `import a.b.C` (or a nested `a.b.Outer.Inner`, a static
+`a.b.C.m`: the first capitalised segment picks the file) is an `IMPORTS` edge
+to the anchored class file and a suffix pin `/a/b/C.java^t`; `a.b.*` is a
+directory pin to the package's `.java` files under this root and a
+suffix-directory pin elsewhere. The bare dotted target is gone. Calls, first
+match wins:
+
+1. Unqualified `m()`: the enclosing classes (innermost first) and their
+   bases: this file when the class declared here has `m`, else a base's (an
+   in-file base walked the same way, any other base's class file); then a
+   static import's class file, then a static wildcard's.
+2. `this.m()` and `super.m()`: the same, from the class or its bases.
+3. A typed receiver: a field of the enclosing classes, a parameter, a local
+   (`var x = new T()` included), a for-each, catch or resource variable,
+   `new T().m()`, or `T.m()` on a class name. T's class file: this file when
+   declared here (then its methods and in-file bases), an import's, else the
+   own package's and each wildcard package's. A library type (`STOP_TYPES`,
+   `ArrayList`, ...) links nothing, so `items.add()` on a `List<Item>` field
+   is no edge, and no self-loop.
+4. Anything else: a bare-name row off its caller, unless stoplisted.
+
+A method T inherits from a base declared in another file is not found
+through a receiver typed T (`repo.size()` on an `AuditedRepo` is Repo's
+`size`): only AuditedRepo.java says what it extends, and reading it would
+make the caller's edges depend on another file's text.
+
+**Kotlin.** A class is not tied to a file named after it, and a top-level
+function lives in any file of its package, so an import names a symbol, not
+a file: `import a.b.C` (or `a.b.f`) is an `IMPORTS` edge to the Class `C`
+(the Function `f`) declared in a `.kt` or `.java` file of the package's
+directory, anchored and by suffix, which follows the symbol between files as
+a call does (an edge to a Module would outlive the function moving out of
+it). A wildcard is a directory and suffix-directory pin to the package's
+files, as in Java. Calls, first match wins:
+
+1. `f()` declared in the file: this file.
+2. An imported function (or object member) `f`: its package's directory
+   (`src/main/kotlin/util/.?.kt`, resolved) and by suffix (package); also as
+   an extension call `x.f()`.
+3. Any other `f()`: the enclosing classes' bases, the own package's
+   directory (resolved; by suffix too, so a test reaches its package in main)
+   and each wildcard package's.
+4. `this.m()`, `super.m()` and a typed receiver as in Java (properties of the
+   enclosing classes, primary-constructor `val`/`var`, parameters, locals
+   typed by annotation or a constructor call, `T().m()`, `T.m()` on an object
+   or companion): the class's own `.kt` file (resolved), any `.kt` file of its
+   package (`~`, package confidence: `TagSet` lives in `Tags.kt`), by suffix
+   elsewhere, and its `.java` file by suffix.
+5. Anything else: a bare-name row off its caller, unless stoplisted.
+
 ## Later slices
-- **Java/Kotlin:** a source root from the package declaration; an import gives
-  an anchored class file and a package-confidence suffix pin (multi-module
-  builds, vendored duplicates); wildcards anchored and suffix directory pins.
+
 - **C#:** a referenced type `T` gives the suffix pin `/T.cs`, so C# calls
   resolve at package confidence.
 - **Rust:** crate roots (`src/`, `tests/`, `benches/`, `examples/`,
@@ -263,7 +330,9 @@ asserts the targets, a strict xfail for each language not landed yet.
 - **M2** precision of linked `CALLS` against the truth (resolved and all
   edges reported too). Target: at least 98 %, and no resolved edge between two
   directories without an `IMPORTS` between their files.
-- **M3** `IMPORTS` against the truth. Targets: precision 98 %, recall 95 %.
+- **M3** `IMPORTS` against the truth, file to file (an edge to a Kotlin
+  class or function counts as one to its file). Targets: precision 98 %,
+  recall 95 %.
 - **M4** `CALLS` recall at any confidence (linked and resolved recall
   reported). Target: 95 %, and no stoplisted name in the PageRank top five
   unless the truth calls it there.

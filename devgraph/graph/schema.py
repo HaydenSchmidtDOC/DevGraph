@@ -161,8 +161,8 @@ def lookup_index_statements() -> list[str]:
     edge's target end, `describe_node`) can't seek, so without these it
     scans every node of the label; the same on Cache, which has no
     constraint (named so it never reads as a user type's generated index).
-    Module's `(repo_id, dir)` and `(repo_id, basename)`, which a pinned
-    IMPORTS row seeks (see engine._end_match). Then the provenance indexes a per-file re-index seeks (`(repo_id, file)`,
+    Module's `(repo_id, dir)`, `(repo_id, dir_name)` and `(repo_id,
+    basename)`, which a pinned IMPORTS row seeks (see engine._end_match). Then the provenance indexes a per-file re-index seeks (`(repo_id, file)`,
     `(repo_id, source_file)`, `(repo_id, source)` on FILE_LABELS,
     SOURCE_FILE_LABELS, CLAIMED_LABELS), so its cost follows the file, not
     the whole database. Idempotent, like
@@ -176,7 +176,7 @@ def lookup_index_statements() -> list[str]:
     statements.append("CREATE INDEX cache_repo_name_index IF NOT EXISTS FOR (n:Cache) ON (n.repo_id, n.name)")
     statements += [
         f"CREATE INDEX module_repo_{prop}_lookup IF NOT EXISTS FOR (n:Module) ON (n.repo_id, n.{prop})"
-        for prop in ("dir", "basename")
+        for prop in ("dir", "dir_name", "basename")
     ]
     for prop, labels in (("file", FILE_LABELS), ("source_file", SOURCE_FILE_LABELS), ("source", CLAIMED_LABELS)):
         statements += [
@@ -210,9 +210,13 @@ PIN_CONFIDENCE: dict[str, str] = {
     "file": "resolved", "dir": "resolved", "loose_dir": "package", "suffix": "package", "suffix_dir": "package",
     "prefix": "package",
 }
-#: The directory names a pin's `^` flag keeps out: a vendored copy of code
-#: (`third_party/acme-util/...`) is not what an import names.
+#: The directory names a pin's `^` flag keeps out of the source root a file
+#: is under (the part of its path before what the pin matches): a vendored
+#: copy of code (`third_party/acme-util/...`) is not what an import names.
 VENDORED_DIRS: tuple[str, ...] = ("third_party", "third-party", "thirdparty", "vendor", "vendored")
+#: What `^t` keeps out besides: a test source root (`src/test/java`), which
+#: main code never sees.
+TEST_DIRS: tuple[str, ...] = ("test", "androidTest", "testFixtures", "integrationTest")
 #: The characters that start a path pin's flags (see `split_pin`); a resolver
 #: never writes a path pin whose own path holds one.
 PIN_FLAG_CHARS = "~?^!"
@@ -224,7 +228,7 @@ class PinParts(NamedTuple):
     base: str
     loose: bool = False
     only: tuple[str, ...] = ()
-    no_vendored: bool = False
+    skip: tuple[str, ...] = ()
     not_suffix: str = ""
 
 
@@ -232,31 +236,48 @@ def _is_path_pin(pin: str) -> bool:
     return pin == "." or pin.startswith("/") or pin.endswith(("/", "/."))
 
 
-_PIN_FLAGS = re.compile(r"(~)?(?:\?([^~?^!/]*))?(\^)?(?:!([^~?^!/]*))?")
+_PIN_FLAGS = re.compile(r"(~)?(?:\?([^~?^!/]*))?(\^t?)?(?:!([^~?^!/]*))?")
 
 
 def split_pin(pin: str) -> PinParts:
     """A pin and its flags, in this order after the path: `~` (a directory
     pin at package confidence, kind `loose_dir`), `?a,b` (a matched file must
-    end with one of these suffixes: a language's extensions), `^` (no path
-    segment of a matched file is a vendored directory, `VENDORED_DIRS`) and
-    `!x` (a matched file must not end with `x`): `go/b/.~?.go!_test.go` is
-    the Go files directly in go/b/, tests left out, at package confidence.
-    Only a path pin (no repository-relative path is `.`, starts with "/" or
-    ends with "/" or "/.") takes flags, so a file named `a!b.go` stays a file
-    pin. A path pin whose own path holds a flag character (a directory named
-    `x!y`) would be split there, so it is not supported: a resolver never
-    writes one (`PIN_FLAG_CHARS`)."""
+    end with one of these suffixes: a language's extensions), `^` (no
+    directory of the source root a matched file is under, the part of its
+    path before what the pin matches, is vendored: `VENDORED_DIRS`; `^t`
+    nor a test root: `TEST_DIRS`) and `!x` (a matched file must not end with
+    `x`): `go/b/.~?.go!_test.go` is the Go files directly in go/b/, tests
+    left out, at package confidence. Only a path pin (no repository-relative
+    path is `.`, starts with "/" or ends with "/" or "/.") takes flags, so a
+    file named `a!b.go` stays a file pin. A path pin whose own path holds a
+    flag character (a directory named `x!y`) would be split there, so it is
+    not supported: a resolver never writes one (`PIN_FLAG_CHARS`)."""
     for i, char in enumerate(pin):
         if char in PIN_FLAG_CHARS and _is_path_pin(pin[:i]):
             flags = _PIN_FLAGS.fullmatch(pin, i)
             if flags:
-                loose, only, vendored, not_suffix = flags.groups()
+                loose, only, skip, not_suffix = flags.groups()
                 return PinParts(
-                    pin[:i], bool(loose), tuple(s for s in (only or "").split(",") if s), bool(vendored),
+                    pin[:i], bool(loose), tuple(s for s in (only or "").split(",") if s),
+                    (VENDORED_DIRS + TEST_DIRS if skip == "^t" else VENDORED_DIRS) if skip else (),
                     not_suffix or "",
                 )
     return PinParts(pin)
+
+
+def pin_root(pin: str, path: str) -> str:
+    """The part of `path` before what the pin `pin` (one that matches it)
+    matches: for a suffix pin the path less that suffix, for a suffix
+    directory pin its directory less that suffix, else the whole path. The
+    `^` flag tests its directories."""
+    base = split_pin(pin).base
+    kind = pin_kind(pin)
+    if kind == "suffix":
+        return ("/" + path)[: len(path) + 1 - len(base)]
+    if kind == "suffix_dir":
+        name = path.rsplit("/", 1)[-1]
+        return ("/" + path)[: len(path) + 1 - len(name) - (len(base) - 1)]
+    return path
 
 
 def pin_kind(pin: str | None) -> str:
@@ -285,12 +306,13 @@ def pin_value(pin: str) -> dict:
     """A path pin as the map the engine's Cypher tests (`k` how it matches,
     `v` the path, directory or suffix it tests, `ns` the suffix a file must
     not end with, `os` the suffixes it must end with one of (empty: any),
-    `nv` whether a vendored segment rules a file out): a directory pin's `v`
-    is the directory with its trailing "/" ("" for the root), so `dir` and
-    `suffix_dir` drop the final "."; a `loose_dir` matches as a `dir`."""
+    `nv` the directory names its source root may not hold, `pin_root`): a
+    directory pin's `v` is the directory with its trailing "/" ("" for the
+    root), so `dir` and `suffix_dir` drop the final "."; a `loose_dir`
+    matches as a `dir`."""
     parts = split_pin(pin)
     kind = pin_kind(pin)
     kind = "dir" if kind == "loose_dir" else kind
     value = parts.base[:-1] if kind in ("dir", "suffix_dir") else parts.base
-    return {"k": kind, "v": value, "ns": parts.not_suffix, "os": list(parts.only), "nv": parts.no_vendored}
+    return {"k": kind, "v": value, "ns": parts.not_suffix, "os": list(parts.only), "nv": list(parts.skip)}
 

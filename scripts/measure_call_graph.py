@@ -394,12 +394,17 @@ def _graph_calls(engine: GraphEngine, repo_id: str) -> list[tuple[tuple, str]]:
 
 
 def _graph_imports(engine: GraphEngine, repo_id: str) -> set[tuple[str, str]]:
+    """Every IMPORTS edge file to file: to a Module, or to the file of the
+    class or function a Kotlin import names."""
     return {
         (row["a"], row["b"])
         for row in _rows(
-            engine, "MATCH (a:Module {repo_id: $r})-[:IMPORTS]->(b:Module {repo_id: $r}) RETURN a.name AS a, b.name AS b",
+            engine,
+            "MATCH (a:Module {repo_id: $r})-[:IMPORTS]->(b {repo_id: $r}) "
+            "RETURN a.name AS a, CASE WHEN b:Module THEN b.name ELSE b.file END AS b",
             r=repo_id,
         )
+        if row["b"]
     }
 
 

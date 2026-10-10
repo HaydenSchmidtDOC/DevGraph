@@ -163,6 +163,8 @@ def call_rows(
     file_path: str,
     repo_id: str,
     no_self: bool = False,
+    rel_type: str = "CALLS",
+    to_label: str = "Function",
 ) -> list[GraphRelationship]:
     """One caller's CALLS rows to one callee name, every call site to it
     collapsed together, so no two rows can meet in one edge with different
@@ -172,14 +174,15 @@ def call_rows(
     resolved, one bare-name row ("name"). `caller_class` is the least of the
     call sites' enclosing classes. `no_self` (every bare call site was a
     member call on an untyped receiver) keeps the bare row off the caller
-    itself."""
+    itself. `rel_type` and `to_label` write another symbol reference the
+    same way (a Kotlin file's IMPORTS of a class or function)."""
 
     def row(to_file: str | None, confidence: str, exclude: list[str] | None = None) -> GraphRelationship:
         properties = {"confidence": confidence}
         if caller_class:
             properties["caller_class"] = caller_class
         return GraphRelationship(
-            from_label=caller_label, from_name=caller_name, rel_type="CALLS", to_label="Function", to_name=name,
+            from_label=caller_label, from_name=caller_name, rel_type=rel_type, to_label=to_label, to_name=name,
             repo_id=repo_id, properties=properties, to_file=to_file, exclude=exclude,
             no_self=no_self and to_file is None,
         )

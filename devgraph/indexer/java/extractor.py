@@ -2,8 +2,10 @@
 
 Mirrors `devgraph/indexer/python/extractor.py`'s shape and philosophy —
 same GraphNode/GraphRelationship/ExtractionResult dataclasses (shared via
-`devgraph.indexer.common`), same name-based CALLS resolution, same
-non-materializing-guess approach to IMPORTS. Extracts:
+`devgraph.indexer.common`), CALLS and IMPORTS resolved to path pins
+(`_JavaResolver`; see the Java and Kotlin section of
+docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md).
+Extracts:
 
   - Module (the file itself)
   - Class/interface/enum declarations, with `extends`/`implements` -> EXTENDS
@@ -12,21 +14,32 @@ non-materializing-guess approach to IMPORTS. Extracts:
   - Javadoc (`/** ... */`) immediately preceding a class/method/constructor,
     stored the same way Python's docstring is (`description`/`docstring_full`)
   - `import` statements, resolved via Java's package/folder convention
-    (see `_extract_imports` and `_detect_source_root`) — the cleanest of the
-    six languages in Implementation Plan #8, since `package a.b.c;` living
-    in a folder that mirrors `a/b/c` is close to a hard convention, not just
-    a common style.
+    (`jvm.JvmLayout`: the source root a file's package gives) to the class
+    file under the same root and, by path suffix, under any other (another
+    module); a wildcard to the package's directory.
+  - CALLS, by tier: the enclosing classes and their bases, static imports,
+    then typed receivers (fields, parameters, locals, `new T()`, `T.m()`)
+    to their class's file; an untyped receiver by bare name unless its
+    method is stoplisted.
 """
 
 from __future__ import annotations
 
 import logging
+import posixpath
 from pathlib import Path
 
 import tree_sitter_java as tsjava
 from tree_sitter import Language, Node, Parser
 
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
+from devgraph.indexer.common import (
+    ExtractionResult,
+    GraphNode,
+    GraphRelationship,
+    own_edges,
+)
+from devgraph.indexer.jvm import JvmLayout, type_segment
 
 logger = logging.getLogger(__name__)
 
@@ -171,45 +184,6 @@ def _preceding_javadoc(node: Node, prev_sibling: Node | None, source: bytes) -> 
     return _clean_javadoc(raw)
 
 
-def _callee_simple_name(invocation: Node, source: bytes) -> str | None:
-    """A `method_invocation` node's callee name.
-
-    Unlike Python's grammar, `method_invocation` carries a `name` field
-    directly regardless of whether it's a bare call (`foo()`), a
-    qualified one (`obj.foo()`/`this.foo()`), or a chained one
-    (`getHandler().invoke()`) — no recursion into the `object` field is
-    needed to get the simple callee name. Same over-linking philosophy as
-    Python's `_callee_simple_name`: 'obj.foo()' and a bare 'foo()' both
-    target the Function node named 'foo', since there's no type info to
-    disambiguate further.
-    """
-    name_node = invocation.child_by_field_name("name")
-    if name_node is None:
-        return None
-    return _text(name_node, source)
-
-
-def _extract_call_targets(body: Node, source: bytes) -> list[str]:
-    """Walk a method/constructor body (or any statement) for
-    `method_invocation`s and return the callee's simple name, not
-    descending into nested type/method declarations — those are walked
-    separately so calls are attributed to the correct enclosing scope."""
-    targets: list[str] = []
-
-    def walk(node: Node) -> None:
-        if node.type in (*_TYPE_DECL_TYPES, *_METHOD_DECL_TYPES):
-            return  # nested scope — attributed separately by the caller
-        if node.type == "method_invocation":
-            name = _callee_simple_name(node, source)
-            if name:
-                targets.append(name)
-        for child in node.children:
-            walk(child)
-
-    walk(body)
-    return targets
-
-
 def _package_name(root: Node, source: bytes) -> str | None:
     for child in root.named_children:
         if child.type == "package_declaration":
@@ -218,60 +192,6 @@ def _package_name(root: Node, source: bytes) -> str | None:
                 if c.type in ("scoped_identifier", "identifier"):
                     return _text(c, source)
     return None
-
-
-def _detect_source_root(file_path: str, package_name: str | None) -> str:
-    """Guess the source-root prefix (e.g. 'src/main/java') that sits in
-    front of a package's folder structure, by checking whether this file's
-    own directory ends with its own `package` declaration reinterpreted as
-    a path.
-
-    'src/main/java/com/example/foo/Bar.java' declaring 'package
-    com.example.foo;' -> source root 'src/main/java'. A file with no
-    package declaration (default package) is its own source root. A file
-    whose directory does *not* end with its declared package path (a real
-    possibility DevGraph can't rule out — misconfigured build, generated
-    code, a file living outside its declared package's expected location)
-    falls back to '' (repo-root-relative guesses), the same
-    doesn't-crash-just-doesn't-resolve behavior Python's dotted-import
-    guess has when it's wrong.
-    """
-    current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
-    if not package_name:
-        return current_dir
-    pkg_path = package_name.replace(".", "/")
-    if current_dir == pkg_path:
-        return ""
-    if current_dir.endswith("/" + pkg_path):
-        return current_dir[: -(len(pkg_path) + 1)]
-    return ""
-
-
-def _import_file_guess(source_root: str, dotted: str, is_static: bool) -> str | None:
-    """Reinterpret an import's dotted path as a same-repo file path guess,
-    using the detected source-root prefix.
-
-    'import com.example.bar.Baz;' -> 'src/main/java/com/example/bar/Baz.java'
-    (source_root='src/main/java'). The class name is assumed to be the
-    dotted path's last segment for a normal import ('import a.b.C;' -> class
-    'C'), or its second-to-last segment for a static import ('import static
-    a.b.C.member;' -> class 'C', member 'member') — Java's own ambiguity
-    between a package segment and an inner-class segment in the middle of a
-    dotted path is not resolved here (documented limitation, same spirit as
-    Python's guess-that-may-not-materialize approach: `upsert_relationship`
-    only MATCHes real existing nodes, so a wrong guess just never produces
-    an edge).
-    """
-    segments = dotted.split(".")
-    if is_static:
-        segments = segments[:-1]  # drop the imported static member name
-    if not segments:
-        return None
-    pkg_segments, class_name = segments[:-1], segments[-1]
-    if not class_name:
-        return None
-    rel = "/".join([*pkg_segments, class_name]) + ".java"
-    return f"{source_root}/{rel}" if source_root else rel
 
 
 def _extract_imports(root: Node, source: bytes) -> list[tuple[str, bool, bool]]:
@@ -291,6 +211,294 @@ def _extract_imports(root: Node, source: bytes) -> list[tuple[str, bool, bool]]:
             continue
         imports.append((_text(path_node, source), is_static, is_wildcard))
     return imports
+
+
+# java.lang and other library types beyond STOP_TYPES: a call on one links
+# nothing (they are never a repository file).
+_LIBRARY_TYPES = frozenset({
+    "Object", "Exception", "RuntimeException", "IllegalArgumentException", "IllegalStateException", "Throwable",
+    "Error", "Iterable", "Iterator", "Comparable", "Runnable", "Class", "Void", "Float", "Short", "Byte",
+    "ArrayList", "LinkedList", "HashMap", "HashSet", "TreeMap", "TreeSet", "LinkedHashMap", "LinkedHashSet",
+    "Deque", "ArrayDeque", "Queue", "Collection", "BigDecimal", "BigInteger", "LocalDate", "LocalDateTime",
+    "Instant", "Duration", "UUID", "Pattern", "Matcher", "Files", "Paths", "Path", "File",
+})
+
+_FUNC_TYPES = (*_METHOD_DECL_TYPES, "lambda_expression")
+
+
+def _type_name(node: Node | None, source: bytes) -> str | None:
+    """A declared type as the simple name the resolver looks up (`List<X>`
+    -> List, `a.b.C` -> C, `Outer.Inner` -> Inner); None for a primitive,
+    an array, `var` or no type."""
+    if node is None:
+        return None
+    if node.type == "generic_type":
+        return _type_name(node.named_children[0] if node.named_children else None, source)
+    if node.type == "type_identifier":
+        name = _text(node, source)
+        return None if name == "var" else name
+    if node.type == "scoped_type_identifier":
+        return _text(node, source).rsplit(".", 1)[-1]
+    return None
+
+
+class _JavaResolver:
+    """Resolves one Java file's call sites to path pins: see the module
+    docstring's tiers."""
+
+    def __init__(self, root: Node, source: bytes, file_path: str, package: str | None) -> None:
+        self.source = source
+        self.file_path = file_path
+        self.layout = JvmLayout(file_path, package)
+        # The file's types: their methods, bases and fields.
+        self.methods: dict[str, set[str]] = {}
+        self.bases: dict[str, list[str]] = {}
+        self.fields: dict[str, dict[str, str | None]] = {}
+
+        def walk(node: Node) -> None:
+            if node.type in _TYPE_DECL_TYPES or node.type == "record_declaration":
+                name_node = node.child_by_field_name("name")
+                body = node.child_by_field_name("body")
+                if name_node is not None:
+                    name = _text(name_node, source)
+                    self.methods.setdefault(name, set())
+                    self.bases[name] = _extract_supertype_names(node, source)
+                    fields = self.fields.setdefault(name, {})
+                    for child in body.named_children if body is not None else []:
+                        if child.type in _METHOD_DECL_TYPES:
+                            method = child.child_by_field_name("name")
+                            if method is not None:
+                                self.methods[name].add(_text(method, source))
+                        elif child.type == "field_declaration":
+                            declared = _type_name(child.child_by_field_name("type"), source)
+                            for decl in child.children_by_field_name("declarator"):
+                                field_name = decl.child_by_field_name("name")
+                                if field_name is not None:
+                                    fields[_text(field_name, source)] = declared
+            for child in node.children:
+                walk(child)
+
+        walk(root)
+        # Imports: a simple name -> its class's package and class (the
+        # first capitalised segment picks the file); static members the same;
+        # wildcard packages, and the classes of static wildcards.
+        self.types: dict[str, tuple[list[str], str]] = {}
+        self.statics: dict[str, tuple[list[str], str]] = {}
+        self.static_wildcards: list[tuple[list[str], str]] = []
+        self.wildcards: list[list[str]] = []
+        self.import_files: set[str] = set()
+        self.import_pins: set[str] = set()
+        for dotted, is_static, is_wildcard in _extract_imports(root, source):
+            segments = dotted.split(".")
+            at = type_segment(segments)
+            if at is None:
+                if is_wildcard and not is_static:
+                    self.wildcards.append(segments)
+                    self._import_package(segments)
+                elif len(segments) > 1:
+                    # A lowercase class name: the last segment (less a static member).
+                    cls_at = len(segments) - (2 if is_static else 1)
+                    if cls_at > 0:
+                        self._import_class(segments[:cls_at], segments[cls_at])
+                continue
+            owner = (segments[:at], segments[at])
+            self._import_class(*owner)
+            if is_static:
+                if is_wildcard:
+                    self.static_wildcards.append(owner)
+                elif at < len(segments) - 1:
+                    self.statics[segments[-1]] = owner
+            elif not is_wildcard:
+                self.types[segments[-1]] = owner
+
+    # --- imports -------------------------------------------------------------
+
+    def _import_class(self, package: list[str], cls: str) -> None:
+        folder = self.layout.folder(package)
+        if folder is not None:
+            self.import_files.add(posixpath.join(folder, f"{cls}.java") if folder else f"{cls}.java")
+        suffix = self.layout.suffix(package, full=True)
+        if suffix is not None:
+            self.import_pins.add(f"{suffix}/{cls}.java{self.layout.flag}")
+
+    def _import_package(self, package: list[str]) -> None:
+        folder = self.layout.folder(package)
+        if folder is not None:
+            self.import_pins.add((f"{folder}/." if folder else ".") + "?.java")
+        suffix = self.layout.suffix(package, full=True)
+        if suffix is not None:
+            self.import_pins.add(f"{suffix}/.?.java{self.layout.flag}")
+
+    # --- pins ----------------------------------------------------------------
+
+    def _class_file_pins(self, package: list[str], cls: str) -> list[str]:
+        pins = []
+        folder = self.layout.folder(package)
+        if folder is not None:
+            pins.append(posixpath.join(folder, f"{cls}.java") if folder else f"{cls}.java")
+        suffix = self.layout.suffix(package, full=True)
+        if suffix is not None:
+            pins.append(f"{suffix}/{cls}.java{self.layout.flag}")
+        return pins
+
+    def type_pins(self, name: str) -> list[str] | None:
+        """Where the class `name` (not one of this file's) is: its import's
+        file, else its own package's or a wildcard package's; None for a
+        library type."""
+        if name in STOP_TYPES["java"] or name in _LIBRARY_TYPES:
+            return None
+        if name in self.types:
+            return self._class_file_pins(*self.types[name])
+        pins = self._class_file_pins(self.layout.package, name)
+        for package in self.wildcards:
+            pins += self._class_file_pins(package, name)
+        return pins
+
+    def member_pins(self, cls: str, method: str, seen: frozenset = frozenset()) -> list[str] | None:
+        """Where `method` of the class `cls` can be: this file when the class
+        is declared here and has it, else its bases', else the class's own
+        file for a class declared elsewhere."""
+        if cls in seen:
+            return None
+        if cls in self.methods:
+            if method in self.methods[cls]:
+                return [self.file_path]
+            pins = []
+            for base in self.bases.get(cls, []):
+                pins += self.member_pins(base, method, seen | {cls}) or []
+            return pins or None
+        return self.type_pins(cls)
+
+    # --- calls ---------------------------------------------------------------
+
+    def resolve(self, call: Node, classes: list[str], scope: dict[str, str | None]):
+        """One `method_invocation` as (name, pins or None for a bare-name
+        row, member call?), or None when it links nothing. `classes` are the
+        enclosing classes, innermost first; `scope` the typed names in
+        reach."""
+        name_node = call.child_by_field_name("name")
+        if name_node is None:
+            return None
+        name = _text(name_node, self.source)
+        obj = call.child_by_field_name("object")
+        if obj is None:
+            for cls in classes:
+                pins = self.member_pins(cls, name)
+                if pins:
+                    return name, pins, False
+            if name in self.statics:
+                return name, self._class_file_pins(*self.statics[name]), False
+            pins = [pin for owner in self.static_wildcards for pin in self._class_file_pins(*owner)]
+            return (name, pins, False) if pins else None
+        if obj.type == "this":
+            pins = self.member_pins(classes[0], name) if classes else None
+            return (name, pins, False) if pins else None
+        if obj.type == "super":
+            pins = [
+                pin for base in (self.bases.get(classes[0], []) if classes else [])
+                for pin in self.member_pins(base, name) or []
+            ]
+            return (name, pins, False) if pins else None
+        typed, cls = self.receiver_type(obj, classes, scope)
+        if typed:
+            pins = self.member_pins(cls, name) if cls else None
+            return (name, pins, True) if pins else None
+        if name in STOP_METHODS["java"]:
+            return None
+        return name, None, True
+
+    def receiver_type(self, obj: Node, classes: list[str], scope: dict[str, str | None]) -> tuple[bool, str | None]:
+        """(whether the receiver's type is known, the class name, None for
+        one that links nothing)."""
+        if obj.type == "parenthesized_expression" and obj.named_children:
+            return self.receiver_type(obj.named_children[0], classes, scope)
+        if obj.type == "identifier":
+            text = _text(obj, self.source)
+            if text in scope:
+                return scope[text] is not None, scope[text]
+            if text[:1].isupper():
+                return True, text  # a class: a static call
+            return False, None
+        if obj.type == "object_creation_expression":
+            return True, _type_name(obj.child_by_field_name("type"), self.source)
+        if obj.type == "field_access":
+            owner = obj.child_by_field_name("object")
+            field = obj.child_by_field_name("field")
+            if owner is not None and field is not None:
+                if owner.type == "this":
+                    for cls in classes:
+                        declared = self.fields.get(cls, {})
+                        if _text(field, self.source) in declared:
+                            return declared[_text(field, self.source)] is not None, declared[_text(field, self.source)]
+                elif owner.type == "identifier" and _text(owner, self.source) in STOP_TYPES["java"]:
+                    return True, None  # System.out
+        return False, None
+
+
+def _method_scope(node: Node, classes: list[str], resolver: _JavaResolver, source: bytes) -> dict[str, str | None]:
+    """The names typed in reach of a method body: the enclosing classes'
+    fields (innermost wins), the parameters, and every local, catch,
+    resource, for-each and pattern variable of the body (by declared type, or
+    by `new T()` for `var`); a lambda parameter is untyped."""
+    scope: dict[str, str | None] = {}
+    for cls in reversed(classes):
+        scope.update(resolver.fields.get(cls, {}))
+
+    def walk(n: Node) -> None:
+        if n.type in ("formal_parameter", "catch_formal_parameter", "enhanced_for_statement", "resource"):
+            name = n.child_by_field_name("name")
+            declared = _type_name(n.child_by_field_name("type"), source)
+            if declared is None and n.type == "resource":
+                value = n.child_by_field_name("value")
+                if value is not None and value.type == "object_creation_expression":
+                    declared = _type_name(value.child_by_field_name("type"), source)
+            if name is not None:
+                scope[_text(name, source)] = declared
+        elif n.type == "spread_parameter":
+            for decl in n.named_children:
+                if decl.type == "variable_declarator" and decl.child_by_field_name("name") is not None:
+                    scope[_text(decl.child_by_field_name("name"), source)] = None
+        elif n.type == "local_variable_declaration":
+            declared = _type_name(n.child_by_field_name("type"), source)
+            for decl in n.children_by_field_name("declarator"):
+                name = decl.child_by_field_name("name")
+                value = decl.child_by_field_name("value")
+                typed = declared
+                if typed is None and value is not None and value.type == "object_creation_expression":
+                    typed = _type_name(value.child_by_field_name("type"), source)
+                if name is not None:
+                    scope[_text(name, source)] = typed
+        elif n.type == "lambda_expression":
+            params = n.child_by_field_name("parameters")
+            if params is not None and params.type == "identifier":
+                scope[_text(params, source)] = None
+            for p in params.named_children if params is not None else []:
+                if p.type == "identifier":
+                    scope[_text(p, source)] = None
+        for child in n.children:
+            if child.type not in (*_TYPE_DECL_TYPES, "record_declaration"):
+                walk(child)
+
+    walk(node)
+    return scope
+
+
+def _invocations(body: Node) -> list[Node]:
+    """The `method_invocation`s of a body, not descending into nested
+    classes (attributed separately)."""
+    found: list[Node] = []
+
+    def walk(node: Node) -> None:
+        if node.type in (*_TYPE_DECL_TYPES, "record_declaration", *_METHOD_DECL_TYPES):
+            return
+        if node.type == "method_invocation":
+            found.append(node)
+        for child in node.children:
+            walk(child)
+
+    for child in body.children:
+        walk(child)
+    return found
 
 
 def extract_java_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
@@ -329,63 +537,30 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
     )
     result.nodes.append(module_node)
 
-    package_name = _package_name(root, source_bytes)
-    source_root = _detect_source_root(file_path, package_name)
+    resolver = _JavaResolver(root, source_bytes, file_path, _package_name(root, source_bytes))
+    result.relationships += import_rows(file_path, repo_id, resolver.import_files, resolver.import_pins)
+    sites = CallSites()
 
-    for dotted, is_static, is_wildcard in _extract_imports(root, source_bytes):
-        # Bare dotted form, kept for compatibility/introspection, same as
-        # Python's bare-dotted-name target.
-        result.relationships.append(
-            GraphRelationship(
-                from_label="Module",
-                from_name=file_path,
-                rel_type="IMPORTS",
-                to_label="Module",
-                to_name=dotted,
-                repo_id=repo_id,
-            )
-        )
-        if is_wildcard:
-            # A wildcard import ('import a.b.*;') names a package, not a
-            # single file — there's no single Module a wildcard import
-            # could resolve to (a Java package isn't itself a Module node
-            # in this schema), so no file-path guess is made for it.
-            continue
-        file_guess = _import_file_guess(source_root, dotted, is_static)
-        if file_guess:
-            result.relationships.append(
-                GraphRelationship(
-                    from_label="Module",
-                    from_name=file_path,
-                    rel_type="IMPORTS",
-                    to_label="Module",
-                    to_name=file_guess,
-                    repo_id=repo_id,
-                )
-            )
+    def _record_calls(
+        node: Node, body: Node, caller_label: str, caller_name: str, classes: list[str]
+    ) -> None:
+        scope = _method_scope(node, classes, resolver, source_bytes)
+        caller_class = classes[0] if classes else None
+        for call in _invocations(body):
+            site = resolver.resolve(call, classes, scope)
+            if site is not None:
+                name, pins, member = site
+                sites.add(caller_label, caller_name, caller_class, name, pins, member)
 
-    def _emit_call(caller_name: str, caller_label: str, target_name: str, caller_class: str | None = None) -> None:
-        properties = {"caller_class": caller_class} if caller_class else None
-        result.relationships.append(
-            GraphRelationship(
-                from_label=caller_label,
-                from_name=caller_name,
-                rel_type="CALLS",
-                to_label="Function",
-                to_name=target_name,
-                repo_id=repo_id,
-                properties=properties,
-            )
-        )
-
-    def visit_block(block: Node, parent_name: str | None, parent_label: str) -> None:
-        """Visit statements in a block (module/class/interface/enum body)."""
+    def visit_block(block: Node, parent_name: str | None, parent_label: str, classes: list[str]) -> None:
+        """Visit statements in a block (module/class/interface/enum body);
+        `classes` are the enclosing classes, innermost first."""
         prev_sibling: Node | None = None
         for node in block.named_children:
             if node.type in _TYPE_DECL_TYPES:
-                _visit_class(node, parent_name, parent_label, prev_sibling)
+                _visit_class(node, parent_name, parent_label, prev_sibling, classes)
             elif node.type in _METHOD_DECL_TYPES:
-                _visit_function(node, parent_name, parent_label, prev_sibling)
+                _visit_function(node, parent_name, parent_label, prev_sibling, classes)
             elif node.type == "block_comment":
                 pass  # only relevant as a *following* node's javadoc, handled via prev_sibling
             else:
@@ -394,12 +569,12 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
                 # (e.g. a field initializer) — attribute those to the
                 # enclosing scope, mirroring Python's else-branch handling
                 # of module/class-body-level statements.
-                caller_class = parent_name if parent_label == "Class" else None
-                for target in _extract_call_targets(node, source_bytes):
-                    _emit_call(parent_name if parent_name else file_path, parent_label, target, caller_class)
+                _record_calls(node, node, parent_label, parent_name if parent_name else file_path, classes)
             prev_sibling = node
 
-    def _visit_class(node: Node, parent_name: str | None, parent_label: str, prev_sibling: Node | None) -> None:
+    def _visit_class(
+        node: Node, parent_name: str | None, parent_label: str, prev_sibling: Node | None, classes: list[str]
+    ) -> None:
         name_node = node.child_by_field_name("name")
         if name_node is None:
             return
@@ -447,9 +622,11 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
 
         body_node = node.child_by_field_name("body")
         if body_node is not None:
-            visit_block(body_node, class_name, "Class")
+            visit_block(body_node, class_name, "Class", [class_name, *classes])
 
-    def _visit_function(node: Node, parent_name: str | None, parent_label: str, prev_sibling: Node | None) -> None:
+    def _visit_function(
+        node: Node, parent_name: str | None, parent_label: str, prev_sibling: Node | None, classes: list[str]
+    ) -> None:
         name_node = node.child_by_field_name("name")
         if name_node is None:
             return
@@ -485,11 +662,10 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
 
         body_node = node.child_by_field_name("body")
         if body_node is not None:
-            caller_class = parent_name if parent_label == "Class" else None
-            for target in _extract_call_targets(body_node, source_bytes):
-                _emit_call(func_name, "Function", target, caller_class)
+            _record_calls(node, body_node, "Function", func_name, classes)
 
-    visit_block(root, None, "Module")
+    visit_block(root, None, "Module", [])
+    result.relationships += sites.rows(file_path, repo_id)
 
     return own_edges(result, file_path)
 

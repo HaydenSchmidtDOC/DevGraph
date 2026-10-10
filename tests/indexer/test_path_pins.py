@@ -29,7 +29,7 @@ from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_
     (None, "name"), ("", "fileless"), ("a/b.go", "file"), ("a!b.go", "file"), ("a/b/.", "dir"), (".", "dir"),
     ("/a/B.java", "suffix"), ("/a/b/.", "suffix_dir"), ("a/b/", "prefix"), ("a/b/.!_test.go", "dir"),
     ("/a/.!_test.go", "suffix_dir"), ("a/b/.~", "loose_dir"), ("a/b/.~?.go!_test.go", "loose_dir"),
-    ("/a/B.java^", "suffix"), ("/a/.?.kt,.java^", "suffix_dir"), ("a~", "file"), ("a?b.go", "file"),
+    ("/a/B.java^", "suffix"), ("/a/.?.kt,.java^t", "suffix_dir"), ("a~", "file"), ("a?b.go", "file"),
 ])
 def test_pin_kinds(pin, kind):
     assert pin_kind(pin) == kind
@@ -50,6 +50,10 @@ def test_pin_kinds(pin, kind):
     ("/m/.?.kt,.java", "x/m/A.java", True), ("/m/.?.kt,.java", "x/m/A.md", False),
     ("/m/C.java^", "core/m/C.java", True), ("/m/C.java^", "third_party/u/m/C.java", False),
     ("/m/C.java^", "a/vendor/m/C.java", False), ("/m/C.java", "third_party/u/m/C.java", True),
+    # Only the source root before the match counts: a package named `vendor` or `test` is fine.
+    ("/vendor/C.java^t", "core/vendor/C.java", True), ("/m/C.java^t", "core/src/test/java/m/C.java", False),
+    ("/m/C.java^", "core/src/test/java/m/C.java", True), ("/test/.?.kt^t", "src/main/kotlin/test/a.kt", True),
+    ("/m/.?.kt^t", "src/test/kotlin/m/a.kt", False), ("/m/.^", "vendor/m/a.kt", False),
     ("a/b/.~", "a/b/c.go", True), ("a/b/.~?.go", "a/b/c/d.go", False),
 ])
 def test_pin_matches(pin, path, matches):
@@ -94,8 +98,9 @@ def test_call_rows_take_their_pin_kinds_confidence():
     ]
 
 
-def test_a_module_pin_seeks_its_directory_or_basename():
-    assert [module_pin_name(p) for p in ("a/b/.", ".", "a/b/.!_test.go", "/a/B.java")] == ["a/b", "", "a/b", "B.java"]
+def test_a_module_pin_seeks_its_directory_its_directory_name_or_basename():
+    pins = ("a/b/.", ".", "a/b/.!_test.go", "/a/B.java", "/a/b/.?.java^")
+    assert [module_pin_name(p) for p in pins] == ["a/b", "", "a/b", "B.java", "b"]
     with pytest.raises(ValueError):
         module_pin_name("a/b/")
 
@@ -124,7 +129,7 @@ def engine():
 
 
 #: Segments that share prefixes, so `a/b/` must not match `a/bc/`.
-_SEGMENTS = ["a", "ab", "b", "bc", "m", "vendor", "third_party"]
+_SEGMENTS = ["a", "ab", "b", "bc", "m", "vendor", "third_party", "test"]
 _NAMES = ["C.java", "a.py", "a_test.go", "x.go", "ab.py", "K.kt"]
 
 
@@ -150,7 +155,7 @@ def _random_pin(rng: random.Random, kinds=("file", "dir", "suffix", "suffix_dir"
         if rng.random() < 0.3:
             pin += "?" + ",".join(rng.sample([".go", ".kt", ".java", ".py"], rng.randint(1, 2)))
         if rng.random() < 0.3:
-            pin += "^"
+            pin += rng.choice(["^", "^t"])
         if rng.random() < 0.3:
             pin += rng.choice(["!_test.go", "!.py"])
     return pin
@@ -195,9 +200,9 @@ def test_the_cypher_pin_test_agrees_with_pin_matches(engine):
 
 
 def test_module_pins_seek_by_directory_and_basename_as_pin_matches_says(engine, repo_id):
-    """Random directory and suffix pins (with exclusions) on IMPORTS rows
-    link exactly the Modules `pin_matches` names, through the `dir` and
-    `basename` seeks."""
+    """Random directory, suffix-directory and suffix pins (with exclusions)
+    on IMPORTS rows link exactly the Modules `pin_matches` names, through
+    the `dir`, `dir_name` and `basename` seeks."""
     from devgraph.indexer.common import module_pin_name
 
     rng = random.Random(5)
@@ -207,7 +212,7 @@ def test_module_pins_seek_by_directory_and_basename_as_pin_matches_says(engine, 
         + [{"label": "Module", "repo_id": repo_id, "name": "origin.kt", "properties": {"source_file": "origin.kt"}}]
     )
     wrong, linked = [], 0
-    for pin, exclude in _random_cases(rng, ("dir", "suffix"), 80, loose=False):
+    for pin, exclude in _random_cases(rng, ("dir", "suffix", "suffix_dir"), 120, loose=False):
         engine.run_cypher("MATCH (:Module {repo_id: $r, name: 'origin.kt'})-[x:IMPORTS]->() DELETE x", {"r": repo_id})
         engine.upsert_relationships([{
             "from_label": "Module", "from_name": "origin.kt", "rel_type": "IMPORTS", "to_label": "Module",
@@ -363,7 +368,10 @@ def test_modules_carry_their_directory_and_basename(engine, repo_id, tmp_path):
     _write(tmp_path, "pkg/sub/b.py")
     _scan(engine, repo_id, tmp_path)
     rows = engine.run_cypher(
-        "MATCH (m:Module {repo_id: $r}) RETURN m.name AS name, m.dir AS dir, m.basename AS base ORDER BY name",
+        "MATCH (m:Module {repo_id: $r}) RETURN m.name AS name, m.dir AS dir, m.dir_name AS dir_name, "
+        "m.basename AS base ORDER BY name",
         {"r": repo_id},
     )
-    assert [(r["name"], r["dir"], r["base"]) for r in rows] == [("a.py", "", "a.py"), ("pkg/sub/b.py", "pkg/sub", "b.py")]
+    assert [(r["name"], r["dir"], r["dir_name"], r["base"]) for r in rows] == [
+        ("a.py", "", "", "a.py"), ("pkg/sub/b.py", "pkg/sub", "sub", "b.py"),
+    ]

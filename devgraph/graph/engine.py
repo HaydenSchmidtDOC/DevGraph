@@ -32,7 +32,6 @@ from devgraph.graph.schema import (
     RELATIONSHIP_TYPES,
     RESERVED_NODE_PROPERTIES,
     SOURCE_FILE_LABELS,
-    VENDORED_DIRS,
     constraint_statements,
     lookup_index_statements,
     pin_kind,
@@ -768,11 +767,13 @@ def _upsert_nodes_tx(tx, nodes: list[dict[str, Any]]) -> None:
             else "{repo_id: row.repo_id, name: row.name}"
         )
         if label == "Module":
-            # A Module's directory and basename, from its path, for the
-            # directory and suffix pins of an IMPORTS row (see _end_match).
+            # A Module's directory, its directory's own name and its
+            # basename, from its path, for the directory, suffix-directory
+            # and suffix pins of an IMPORTS row (see _end_match).
             rows = [
                 {**row, "properties": {
                     **row["properties"], "dir": posixpath.dirname(row["name"]),
+                    "dir_name": posixpath.basename(posixpath.dirname(row["name"])),
                     "basename": posixpath.basename(row["name"]),
                 }}
                 for row in rows
@@ -811,11 +812,20 @@ _ADD_ORIGIN = (
 def _pin_test(pin: str, file: str) -> str:
     """Cypher for graph/schema.py's `pin_value` map `pin` matching the path
     `file`, as devgraph/indexer/common.py `pin_matches` defines it."""
-    vendored = "[" + ", ".join(f"'{name}'" for name in VENDORED_DIRS) + "]"
+    name = f"last(split({file}, '/'))"
+    # graph/schema.py pin_root: the part of the path before what the pin matches.
+    def cut(length: str) -> str:  # never a negative length, which left() rejects
+        return f"left('/' + {file}, CASE WHEN {length} < 0 THEN 0 ELSE {length} END)"
+
+    root = (
+        f"CASE {pin}.k WHEN 'suffix' THEN {cut(f'size({file}) + 1 - size({pin}.v)')} "
+        f"WHEN 'suffix_dir' THEN {cut(f'size({file}) + 1 - size({name}) - size({pin}.v)')} "
+        f"ELSE {file} END"
+    )
     return (
         f"(({pin}.ns = '' OR NOT {file} ENDS WITH {pin}.ns) "
         f"AND (size({pin}.os) = 0 OR any(s IN {pin}.os WHERE {file} ENDS WITH s)) "
-        f"AND NOT ({pin}.nv AND any(s IN split({file}, '/') WHERE s IN {vendored})) AND CASE {pin}.k "
+        f"AND (size({pin}.nv) = 0 OR NOT any(s IN split({root}, '/') WHERE s IN {pin}.nv)) AND CASE {pin}.k "
         f"WHEN 'file' THEN {file} = {pin}.v "
         f"WHEN 'dir' THEN {file} STARTS WITH {pin}.v AND NOT substring({file}, size({pin}.v)) CONTAINS '/' "
         f"WHEN 'suffix' THEN '/' + {file} ENDS WITH {pin}.v "
@@ -846,15 +856,17 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     INDEX allows that scan) after the label has filled; in CI that made a
     5,000-module relink take 20 s instead of under 1 s. A path pin seeks by
     name and keeps the nodes whose file its `pin` matches and no `exclude`
-    pin does (`ex_files`, `ex_pins`); on a Module target it seeks the Module's `dir` (a directory
-    pin) or `basename` (a suffix pin), the row's `to_name`, and tests the
-    Module's path. `also` is one more condition on the match."""
+    pin does (`ex_files`, `ex_pins`); on a Module target it seeks the
+    Module's `dir` (a directory pin), `dir_name` (a suffix-directory pin:
+    the last name of its directory) or `basename` (a suffix pin), the row's
+    `to_name`, and tests the Module's path. `also` is one more condition on
+    the match."""
     conditions = [also] if also else []
     if pin in _PATH_PINS:
         if label == "Module":
-            if pin not in ("dir", "suffix"):
+            key = {"dir": "dir", "suffix_dir": "dir_name", "suffix": "basename"}.get(pin)
+            if key is None:
                 raise ValueError(f"a Module target takes only a directory or suffix pin, not {pin!r}")
-            key = "dir" if pin == "dir" else "basename"
             path = f"{var}.name"
             match = (
                 f"MATCH ({var}:Module {{repo_id: row.repo_id, {key}: {ref}.{end}_name}}) "
