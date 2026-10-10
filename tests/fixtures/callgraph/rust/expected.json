@@ -1,0 +1,383 @@
+{
+  "language": "rust",
+  "description": "Cargo workspace (shop-core lib + shop-app bin) with crate::/self::/super::super:: paths, non-mod.rs module files, an integration-test crate and a sibling-crate dependency.",
+  "calls": [
+    {
+      "caller": "new",
+      "caller_file": "crates/core/src/models/user.rs",
+      "callee": "normalize",
+      "callee_file": "crates/core/src/util/text.rs",
+      "note": "crate-path"
+    },
+    {
+      "caller": "total",
+      "caller_file": "crates/core/src/models/user.rs",
+      "callee": "amount",
+      "callee_file": "crates/core/src/models/order.rs",
+      "note": "typed-loop-var"
+    },
+    {
+      "caller": "format",
+      "caller_file": "crates/core/src/util/money.rs",
+      "callee": "cents_to_string",
+      "callee_file": "crates/core/src/util/money.rs",
+      "note": "self-path-inline-mod"
+    },
+    {
+      "caller": "cents_to_string",
+      "caller_file": "crates/core/src/util/money.rs",
+      "callee": "normalize",
+      "callee_file": "crates/core/src/util/text.rs",
+      "note": "super-super"
+    },
+    {
+      "caller": "connect",
+      "caller_file": "crates/core/src/net/mod.rs",
+      "callee": "new",
+      "callee_file": "crates/core/src/net/client.rs",
+      "not_files": [
+        "crates/core/src/models/user.rs",
+        "crates/core/src/models/order.rs"
+      ],
+      "note": "self-path-inline-mod"
+    },
+    {
+      "caller": "fetch_user",
+      "caller_file": "crates/core/src/net/client.rs",
+      "callee": "url",
+      "callee_file": "crates/core/src/net/client.rs"
+    },
+    {
+      "caller": "fetch_user",
+      "caller_file": "crates/core/src/net/client.rs",
+      "callee": "new",
+      "callee_file": "crates/core/src/models/user.rs",
+      "not_files": [
+        "crates/core/src/net/client.rs",
+        "crates/core/src/models/order.rs"
+      ],
+      "note": "client-vs-user-new"
+    },
+    {
+      "caller": "totals_orders",
+      "caller_file": "crates/core/tests/integration.rs",
+      "callee": "new",
+      "callee_file": "crates/core/src/models/user.rs",
+      "not_files": [
+        "crates/core/src/net/client.rs",
+        "crates/core/src/models/order.rs"
+      ],
+      "note": "tests-crate"
+    },
+    {
+      "caller": "totals_orders",
+      "caller_file": "crates/core/tests/integration.rs",
+      "callee": "add_order",
+      "callee_file": "crates/core/src/models/user.rs",
+      "note": "tests-crate"
+    },
+    {
+      "caller": "totals_orders",
+      "caller_file": "crates/core/tests/integration.rs",
+      "callee": "new",
+      "callee_file": "crates/core/src/models/order.rs",
+      "not_files": [
+        "crates/core/src/net/client.rs",
+        "crates/core/src/models/user.rs"
+      ],
+      "note": "tests-crate"
+    },
+    {
+      "caller": "totals_orders",
+      "caller_file": "crates/core/tests/integration.rs",
+      "callee": "total",
+      "callee_file": "crates/core/src/models/user.rs",
+      "note": "tests-crate"
+    },
+    {
+      "caller": "main",
+      "caller_file": "crates/app/src/main.rs",
+      "callee": "parse_args",
+      "callee_file": "crates/app/src/cli.rs",
+      "note": "mod-decl"
+    },
+    {
+      "caller": "main",
+      "caller_file": "crates/app/src/main.rs",
+      "callee": "new",
+      "callee_file": "crates/core/src/net/client.rs",
+      "not_files": [
+        "crates/core/src/models/user.rs",
+        "crates/core/src/models/order.rs"
+      ],
+      "note": "client-vs-user-new"
+    },
+    {
+      "caller": "main",
+      "caller_file": "crates/app/src/main.rs",
+      "callee": "fetch_user",
+      "callee_file": "crates/core/src/net/client.rs",
+      "note": "sibling-crate"
+    },
+    {
+      "caller": "main",
+      "caller_file": "crates/app/src/main.rs",
+      "callee": "new",
+      "callee_file": "crates/core/src/models/user.rs",
+      "not_files": [
+        "crates/core/src/net/client.rs",
+        "crates/core/src/models/order.rs"
+      ],
+      "note": "client-vs-user-new"
+    },
+    {
+      "caller": "main",
+      "caller_file": "crates/app/src/main.rs",
+      "callee": "print",
+      "callee_file": "crates/app/src/report.rs",
+      "note": "mod-decl"
+    },
+    {
+      "caller": "main",
+      "caller_file": "crates/app/src/main.rs",
+      "callee": "version",
+      "callee_file": "crates/core/src/lib.rs",
+      "note": "macro-args"
+    },
+    {
+      "caller": "parse_args",
+      "caller_file": "crates/app/src/cli.rs",
+      "callee": "default_base",
+      "callee_file": "crates/app/src/cli.rs"
+    },
+    {
+      "caller": "print",
+      "caller_file": "crates/app/src/report.rs",
+      "callee": "total",
+      "callee_file": "crates/core/src/models/user.rs",
+      "note": "sibling-crate"
+    },
+    {
+      "caller": "print",
+      "caller_file": "crates/app/src/report.rs",
+      "callee": "format",
+      "callee_file": "crates/core/src/util/money.rs",
+      "note": "macro-args"
+    }
+  ],
+  "imports": [
+    {
+      "from_file": "crates/core/src/lib.rs",
+      "to_file": "crates/core/src/models.rs",
+      "kind": "mod"
+    },
+    {
+      "from_file": "crates/core/src/lib.rs",
+      "to_file": "crates/core/src/net/mod.rs",
+      "kind": "mod"
+    },
+    {
+      "from_file": "crates/core/src/lib.rs",
+      "to_file": "crates/core/src/util/mod.rs",
+      "kind": "mod"
+    },
+    {
+      "from_file": "crates/core/src/models.rs",
+      "to_file": "crates/core/src/models/order.rs",
+      "kind": "mod",
+      "note": "mod-in-non-mod-rs"
+    },
+    {
+      "from_file": "crates/core/src/models.rs",
+      "to_file": "crates/core/src/models/user.rs",
+      "kind": "mod",
+      "note": "mod-in-non-mod-rs"
+    },
+    {
+      "from_file": "crates/core/src/util/mod.rs",
+      "to_file": "crates/core/src/util/money.rs",
+      "kind": "mod"
+    },
+    {
+      "from_file": "crates/core/src/util/mod.rs",
+      "to_file": "crates/core/src/util/text.rs",
+      "kind": "mod"
+    },
+    {
+      "from_file": "crates/core/src/net/mod.rs",
+      "to_file": "crates/core/src/net/client.rs",
+      "kind": "mod+use",
+      "note": "self-path-inline-mod"
+    },
+    {
+      "from_file": "crates/core/src/models/user.rs",
+      "to_file": "crates/core/src/models/order.rs",
+      "kind": "use",
+      "note": "super-path"
+    },
+    {
+      "from_file": "crates/core/src/models/user.rs",
+      "to_file": "crates/core/src/util/text.rs",
+      "kind": "use",
+      "note": "crate-path"
+    },
+    {
+      "from_file": "crates/core/src/net/client.rs",
+      "to_file": "crates/core/src/models/user.rs",
+      "kind": "use",
+      "note": "crate-path"
+    },
+    {
+      "from_file": "crates/core/tests/integration.rs",
+      "to_file": "crates/core/src/models/order.rs",
+      "kind": "use",
+      "note": "tests-crate"
+    },
+    {
+      "from_file": "crates/core/tests/integration.rs",
+      "to_file": "crates/core/src/models/user.rs",
+      "kind": "use",
+      "note": "tests-crate"
+    },
+    {
+      "from_file": "crates/app/src/main.rs",
+      "to_file": "crates/app/src/cli.rs",
+      "kind": "mod",
+      "note": "mod-decl"
+    },
+    {
+      "from_file": "crates/app/src/main.rs",
+      "to_file": "crates/app/src/report.rs",
+      "kind": "mod",
+      "note": "mod-decl"
+    },
+    {
+      "from_file": "crates/app/src/main.rs",
+      "to_file": "crates/core/src/models/user.rs",
+      "kind": "use",
+      "note": "sibling-crate"
+    },
+    {
+      "from_file": "crates/app/src/main.rs",
+      "to_file": "crates/core/src/net/client.rs",
+      "kind": "use",
+      "note": "sibling-crate"
+    },
+    {
+      "from_file": "crates/app/src/report.rs",
+      "to_file": "crates/core/src/models/user.rs",
+      "kind": "use",
+      "note": "sibling-crate"
+    },
+    {
+      "from_file": "crates/app/src/report.rs",
+      "to_file": "crates/core/src/util/money.rs",
+      "kind": "use",
+      "note": "sibling-crate"
+    }
+  ],
+  "no_edge": [
+    {
+      "caller": "new",
+      "caller_file": "crates/core/src/models/user.rs",
+      "callee": "new",
+      "note": "std-new"
+    },
+    {
+      "caller": "add_order",
+      "caller_file": "crates/core/src/models/user.rs",
+      "callee": "push"
+    },
+    {
+      "caller": "normalize",
+      "caller_file": "crates/core/src/util/text.rs",
+      "callee": "trim"
+    },
+    {
+      "caller": "normalize",
+      "caller_file": "crates/core/src/util/text.rs",
+      "callee": "to_lowercase"
+    },
+    {
+      "caller": "cents_to_string",
+      "caller_file": "crates/core/src/util/money.rs",
+      "callee": "format",
+      "note": "macro-not-call"
+    },
+    {
+      "caller": "new",
+      "caller_file": "crates/core/src/net/client.rs",
+      "callee": "to_string"
+    },
+    {
+      "caller": "url",
+      "caller_file": "crates/core/src/net/client.rs",
+      "callee": "format",
+      "note": "macro-not-call"
+    },
+    {
+      "caller": "parse_args",
+      "caller_file": "crates/app/src/cli.rs",
+      "callee": "args"
+    },
+    {
+      "caller": "parse_args",
+      "caller_file": "crates/app/src/cli.rs",
+      "callee": "skip"
+    },
+    {
+      "caller": "parse_args",
+      "caller_file": "crates/app/src/cli.rs",
+      "callee": "next"
+    },
+    {
+      "caller": "parse_args",
+      "caller_file": "crates/app/src/cli.rs",
+      "callee": "unwrap_or"
+    },
+    {
+      "caller": "parse_args",
+      "caller_file": "crates/app/src/cli.rs",
+      "callee": "unwrap_or_default"
+    },
+    {
+      "caller": "default_base",
+      "caller_file": "crates/app/src/cli.rs",
+      "callee": "from"
+    },
+    {
+      "caller": "print",
+      "caller_file": "crates/app/src/report.rs",
+      "callee": "new",
+      "note": "std-new"
+    },
+    {
+      "caller": "print",
+      "caller_file": "crates/app/src/report.rs",
+      "callee": "insert"
+    },
+    {
+      "caller": "print",
+      "caller_file": "crates/app/src/report.rs",
+      "callee": "clone"
+    }
+  ],
+  "notes": {
+    "workspace": "Cargo workspace with members crates/*; each crate root is crates/<name>/src (lib.rs or main.rs). The core package is named shop-core, so other crates refer to it as `shop_core`.",
+    "mod-in-non-mod-rs": "`pub mod user;` in src/models.rs (not a mod.rs) resolves to src/models/user.rs (Rust 2018 rule), not src/user.rs.",
+    "crate-path": "`crate::` is the root of the crate the file belongs to (crates/core/src): crate::util::text -> util/text.rs, crate::models::user -> models/user.rs.",
+    "super-path": "`super::order::Order` in models/user.rs: super is models -> models/order.rs.",
+    "super-super": "Inside the inline `mod fmt { }` of util/money.rs, super is util::money and super::super is util, so `super::super::text::normalize` is util/text.rs.",
+    "self-path-inline-mod": "`self::` is the current module. In util/money.rs, `use self::fmt::cents_to_string` names the inline module fmt in the same file. In net/mod.rs, `self::client::Client::new` is net/client.rs (the module declared by `pub mod client;` there).",
+    "client-vs-user-new": "Client::new, User::new and Order::new are three associated functions all named `new`; the type path picks the file. `fetch_user` returns `User::new(&url)`, which is models/user.rs, not Client::new in its own file.",
+    "std-new": "`Vec::new()` / `HashMap::new()` are std; they must not link to any repo `new` (in User::new this would otherwise be a self-loop).",
+    "macro-not-call": "`format!` is a macro invocation, not a call of the repo function util::money::format.",
+    "macro-args": "Expressions inside macro arguments (`println!(..., shop_core::version())`, `println!(..., money::format(...))`) are ordinary calls.",
+    "tests-crate": "crates/core/tests/integration.rs is a separate crate (an integration test) that depends on shop_core; it uses `shop_core::...`, not `crate::`.",
+    "sibling-crate": "crates/app depends on the sibling workspace crate shop-core (path dependency); `use shop_core::...` resolves into crates/core/src. `use shop_core::util::money` imports the module money -> util/money.rs.",
+    "mod-decl": "`mod cli;` / `mod report;` in crates/app/src/main.rs -> crates/app/src/cli.rs and report.rs.",
+    "typed-loop-var": "`for order in &self.orders` with `orders: Vec<Order>`, so `order.amount()` is Order::amount.",
+    "imports-format": "IMPORTS rows are `mod x;` declarations (kind `mod`) and `use` paths (kind `use`) that resolve to another in-repo file; the target is the file of the module the path names (for `use a::b::Item`, the file of module a::b). A pair present for both reasons is listed once (kind `mod+use`). Paths written inline in expressions (`super::super::text::normalize(...)`) are not imports. A `use` of an inline module in the same file gives no row.",
+    "scope": "Struct literals (`User { ... }`) are not calls. std/core items are external."
+  }
+}

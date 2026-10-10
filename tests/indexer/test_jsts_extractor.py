@@ -145,8 +145,9 @@ class Service {
     calls_by_pair = {
         (r.from_name, r.to_name): r.properties for r in result.relationships if r.rel_type == "CALLS"
     }
-    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service"}
-    assert calls_by_pair[("freeCall", "helper")] is None
+    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service", "confidence": "resolved"}
+    # A classic script (no import/export): its bare calls keep a by-name edge.
+    assert calls_by_pair[("freeCall", "helper")] == {"confidence": "name"}
 
 
 def test_calls_edge_attributed_to_correct_nested_scope():
@@ -287,10 +288,9 @@ def test_relative_import_resolving_to_repo_root_has_no_dangling_dot_extension():
     assert "index.js" in targets
 
 
-def test_bare_import_resolves_to_node_modules_guess():
+def test_a_bare_import_is_an_external_package_with_no_edge():
     result = extract_js_file("import lodash from 'lodash';\n", "app.js", "test_repo")
-    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "node_modules/lodash" in targets
+    assert [r for r in result.relationships if r.rel_type == "IMPORTS"] == []
 
 
 def test_require_import_resolves_relative_target():

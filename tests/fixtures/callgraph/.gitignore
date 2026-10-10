@@ -1,0 +1,5 @@
+# The language fixtures are tracked (add new files with `git add -f`), but
+# ignored here so DevGraph's own scan of this repository, which honours every
+# .gitignore, never indexes them as DevGraph source. A fixture scanned as its
+# own repository root does not see this file.
+/*/

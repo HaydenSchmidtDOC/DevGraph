@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import posixpath
 import threading
 import time
 from contextlib import contextmanager
@@ -33,6 +34,8 @@ from devgraph.graph.schema import (
     SOURCE_FILE_LABELS,
     constraint_statements,
     lookup_index_statements,
+    pin_kind,
+    pin_value,
 )
 from devgraph.indexer.docs.extractor import DOC_NOTE_LABELS
 
@@ -681,19 +684,21 @@ def identity_key(label: str, repo_id: str, name: str, file: str | None) -> str:
 
 
 def _pin(file: str | None) -> str:
-    """How an edge end matches its node: by bare name (`file` None), every
-    node of that name in a file under a package directory (`file` ending in
-    "/", e.g. "pkg/", but not one of the row's `exact` files), only the
-    file-less node of that name (`file` "", a route's handler stub), or the
-    node in that one file. A directory and "" are meant only for a
-    file-scoped label (`FILE_SCOPED_LABELS`); other labels never carry
-    `file`, so "" would match every node of the name and a directory none.
-    No file path ends in "/", so a directory is never mistaken for a file."""
-    if file is None:
-        return "name"
-    if file.endswith("/"):
-        return "prefix"
-    return "fileless" if file == "" else "file"
+    """How an edge end matches its node (graph/schema.py `pin_kind`): by bare
+    name (`file` None), only the file-less node of that name (`file` "", a
+    route's handler stub), the node in that one file, or, for a path pin
+    (`a/b/.`, `/a/b/C.java`, `/a/b/.`, `a/b/`), every node of the name in a
+    file the pin matches, less the files the row's `exclude` pins match. A
+    path pin and "" are meant only for a file-scoped label
+    (`FILE_SCOPED_LABELS`) or, for a directory or suffix pin, a Module
+    target; other labels never carry `file`, so "" would match every node
+    of the name. No file path is `.`, starts with "/" or ends with "/" or
+    "/.", so a path pin is never mistaken for a file."""
+    return pin_kind(file)
+
+
+#: The pin kinds that match a set of files rather than one (see `_pin`).
+_PATH_PINS = frozenset({"dir", "suffix", "suffix_dir", "prefix"})
 
 
 def _group_rels_by_triple(
@@ -712,18 +717,22 @@ def _group_rels_by_triple(
 
     Within a group, the edges out of one source with the same properties and
     `origin` (the file that wrote them, None for a writer that doesn't record
-    one) share a row, whose `targets` lists each edge's `to_name`, `to_file`
-    and `exact` (the files a "prefix" target pin leaves out, empty for every
-    other pin). The source is then matched once for all of them: a resolved
-    Python call names several candidate files per callee.
+    one) share a row, whose `targets` lists each edge's `to_name` and
+    `to_file`; for a path pin also `pin` (as graph/schema.py `pin_value`
+    gives it) and the pins its `exclude` leaves out, split into `ex_files`
+    (files, a list test) and `ex_pins` (other pins, as `pin_value` gives
+    them); for a bare name also `no_self` (the edge may not end at its
+    source). Only the keys its group's Cypher reads are sent. The source is
+    then matched once for all of them: a resolved call names several
+    candidate files per callee.
     """
     groups: dict[tuple[str, str, str, str, str], dict[tuple, dict[str, Any]]] = {}
     for rel in rels:
         from_file = rel.get("from_file")
         to_file = rel.get("to_file")
         key = (rel["from_label"], rel["rel_type"], rel["to_label"], _pin(from_file), _pin(to_file))
-        if key[3] == "prefix":
-            raise ValueError(f"a source end can't be pinned to a package directory: {from_file!r}")
+        if key[3] in _PATH_PINS:
+            raise ValueError(f"a source end can't be pinned to a set of files: {from_file!r}")
         properties = rel.get("properties") or {}
         origin = rel.get("origin")
         source = (
@@ -737,7 +746,16 @@ def _group_rels_by_triple(
             "origin": origin,
             "targets": [],
         })
-        row["targets"].append({"to_name": rel["to_name"], "to_file": to_file, "exact": rel.get("exact") or []})
+        target = {"to_name": rel["to_name"], "to_file": to_file}
+        if key[4] in _PATH_PINS:
+            # File pins are left out by a plain list test, other pins by `_pin_test`.
+            excluded = rel.get("exclude") or []
+            target["pin"] = pin_value(to_file)
+            target["ex_files"] = [pin for pin in excluded if pin_kind(pin) == "file"]
+            target["ex_pins"] = [pin_value(pin) for pin in excluded if pin_kind(pin) != "file"]
+        elif key[4] == "name":
+            target["no_self"] = bool(rel.get("no_self"))
+        row["targets"].append(target)
     return {key: list(rows.values()) for key, rows in groups.items()}
 
 
@@ -748,6 +766,16 @@ def _upsert_nodes_tx(tx, nodes: list[dict[str, Any]]) -> None:
             if file_scoped
             else "{repo_id: row.repo_id, name: row.name}"
         )
+        if label == "Module":
+            # A Module's directory and basename, from its path, for the
+            # directory and suffix pins of an IMPORTS row (see _end_match).
+            rows = [
+                {**row, "properties": {
+                    **row["properties"], "dir": posixpath.dirname(row["name"]),
+                    "basename": posixpath.basename(row["name"]),
+                }}
+                for row in rows
+            ]
         # A non-file-scoped row with a `source` claims a shared node that
         # several files can produce (see _claim_nodes_tx), so
         # delete_nodes_by_source_file can unclaim one producer without
@@ -779,7 +807,31 @@ _ADD_ORIGIN = (
 )
 
 
-def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row") -> str:
+def _pin_test(pin: str, file: str) -> str:
+    """Cypher for graph/schema.py's `pin_value` map `pin` matching the path
+    `file`, as devgraph/indexer/common.py `pin_matches` defines it."""
+    return (
+        f"(({pin}.ns = '' OR NOT {file} ENDS WITH {pin}.ns) AND CASE {pin}.k "
+        f"WHEN 'file' THEN {file} = {pin}.v "
+        f"WHEN 'dir' THEN {file} STARTS WITH {pin}.v AND NOT substring({file}, size({pin}.v)) CONTAINS '/' "
+        f"WHEN 'suffix' THEN '/' + {file} ENDS WITH {pin}.v "
+        f"WHEN 'suffix_dir' THEN '/' + left({file}, size({file}) - size(last(split({file}, '/')))) "
+        f"ENDS WITH {pin}.v "
+        f"WHEN 'prefix' THEN {file} STARTS WITH {pin}.v ELSE false END)"
+    )
+
+
+def _path_pin_conditions(ref: str, path: str) -> list[str]:
+    """Cypher conditions for a path-pinned target `ref` (see
+    `_group_rels_by_triple`) matching the path `path`: its `pin` matches and
+    no exclusion does."""
+    return [
+        _pin_test(f"{ref}.pin", path), f"NOT {path} IN {ref}.ex_files",
+        f"NOT any(x IN {ref}.ex_pins WHERE {_pin_test('x', path)})",
+    ]
+
+
+def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also: str | None = None) -> str:
     """The MATCH for one end of an edge row (`pin` from `_pin`), reading its
     `{end}_name`/`{end}_file` off `ref` (the row, or one of its targets). An
     end of a file-scoped label is hinted to seek its index: the (repo_id,
@@ -788,20 +840,39 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row") -> st
     made from index statistics sampled while the label was near-empty
     estimates 0 rows, and can then scan a whole index per row (a plain USING
     INDEX allows that scan) after the label has filled; in CI that made a
-    5,000-module relink take 20 s instead of under 1 s. A "prefix" end seeks
-    by name and keeps the nodes whose file is under the directory, less the
-    `exact` files."""
+    5,000-module relink take 20 s instead of under 1 s. A path pin seeks by
+    name and keeps the nodes whose file its `pin` matches and no `exclude`
+    pin does (`ex_files`, `ex_pins`); on a Module target it seeks the Module's `dir` (a directory
+    pin) or `basename` (a suffix pin), the row's `to_name`, and tests the
+    Module's path. `also` is one more condition on the match."""
+    conditions = [also] if also else []
+    if pin in _PATH_PINS:
+        if label == "Module":
+            if pin not in ("dir", "suffix"):
+                raise ValueError(f"a Module target takes only a directory or suffix pin, not {pin!r}")
+            key = "dir" if pin == "dir" else "basename"
+            path = f"{var}.name"
+            match = (
+                f"MATCH ({var}:Module {{repo_id: row.repo_id, {key}: {ref}.{end}_name}}) "
+                f"USING INDEX SEEK {var}:Module(repo_id, {key}) "
+            )
+        else:
+            path = f"{var}.file"
+            match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
+            if label in FILE_SCOPED_LABELS:
+                match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
+        conditions[:0] = _path_pin_conditions(ref, path)
+        return match + "WHERE " + " AND ".join(conditions) + " "
     pinned = pin == "file"
     keys = "repo_id, name, file" if pinned else "repo_id, name"
     hint = f"USING INDEX SEEK {var}:{label}({keys}) " if label in FILE_SCOPED_LABELS else ""
-    if not pinned:
-        match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) " + hint
-        if pin == "prefix":
-            return match + f"WHERE {var}.file STARTS WITH {ref}.{end}_file AND NOT {var}.file IN {ref}.exact "
-        return match + (f"WHERE {var}.file IS NULL " if pin == "fileless" else "")
-    return (
-        f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name, file: {ref}.{end}_file}}) " + hint
-    )
+    if pinned:
+        match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name, file: {ref}.{end}_file}}) "
+    else:
+        match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
+        if pin == "fileless":
+            conditions.insert(0, f"{var}.file IS NULL")
+    return match + hint + ("WHERE " + " AND ".join(conditions) + " " if conditions else "")
 
 
 def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
@@ -810,7 +881,7 @@ def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
             "UNWIND $rows AS row "
             + _end_match("a", from_label, "from", from_pin)
             + "UNWIND row.targets AS t "
-            + _end_match("b", to_label, "to", to_pin, "t")
+            + _end_match("b", to_label, "to", to_pin, "t", also="(NOT t.no_self OR a <> b)" if to_pin == "name" else None)
             + f"MERGE (a)-[r:{rel_type}]->(b) "
             "SET r += row.properties " + _ADD_ORIGIN,
             rows=rows,
@@ -1051,8 +1122,8 @@ class GraphEngine:
         """Batched MATCH-MATCH-MERGE for many relationships in one transaction.
 
         Each dict needs `from_label`/`from_name`/`rel_type`/`to_label`/
-        `to_name`/`repo_id` (`properties`, `from_file`/`to_file`, `exact`,
-        the files a directory `to_file` leaves out (see `_pin`), and
+        `to_name`/`repo_id` (`properties`, `from_file`/`to_file`, `exclude`,
+        the pins whose files a path-pinned `to_file` leaves out (see `_pin`), and
         `origin`, the writing file added to the edge's `origins`, optional). Grouped by
         `(from_label, rel_type, to_label)` — same reasoning as `upsert_nodes`,
         since label/rel-type can't be parameterized. An edge whose endpoint
@@ -1282,6 +1353,28 @@ class GraphEngine:
                 session.run,
                 "MERGE (r:Repository {repo_id: $repo_id}) SET r.index_format = $version",
                 repo_id=repo_id, version=version,
+            )
+
+    def read_resolver_config(self, repo_id: str) -> dict[str, dict]:
+        """The resolver configuration fingerprints the repository's graph was
+        built with, per language (see indexer/resolver_config.fingerprints);
+        empty when none is recorded."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (r:Repository {repo_id: $repo_id}) RETURN r.resolver_config AS config",
+                repo_id=repo_id,
+            )
+            records = [record["config"] for record in result or []]
+        return json.loads(records[0]) if records and records[0] else {}
+
+    def write_resolver_config(self, repo_id: str, config: dict[str, dict]) -> None:
+        """Record the resolver configuration fingerprints the graph was built with."""
+        with self._driver.session() as session:
+            _retry_transient(
+                session.run,
+                "MATCH (r:Repository {repo_id: $repo_id}) SET r.resolver_config = $config",
+                repo_id=repo_id, config=json.dumps(config, sort_keys=True),
             )
 
     def read_skipped_files(self, repo_id: str) -> dict[str, list]:

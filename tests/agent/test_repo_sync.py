@@ -97,6 +97,16 @@ def test_a_gitignore_change_catches_up_from_the_batch_start(rig, indexing, delet
                               "deleted": 3 + (1 if deleted else 0)}
 
 
+def test_a_batch_checks_the_resolver_configuration(rig, indexing):
+    """Every batch hands its changed and deleted paths to
+    sync_resolver_config, whose re-indexed files count as changed."""
+    config, gone = rig.root / "tsconfig.json", rig.root / "old.ts"
+    with patch.object(sync, "sync_resolver_config", return_value=5) as resync:
+        rig.sync.on_changes(REPO, {config}, {gone})
+    assert resync.call_args.args == (rig.engine, REPO, rig.root, {config, gone})
+    assert rig.events[-1] == {"type": "reindexed", "repo_id": REPO, "changed": 1 + 5, "deleted": 1}
+
+
 def test_a_batch_without_a_gitignore_does_not_catch_up(rig, indexing):
     rig.sync.on_changes(REPO, {rig.root / "a.py"}, set())
     indexing["catch_up"].assert_not_called()

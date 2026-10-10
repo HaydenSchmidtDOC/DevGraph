@@ -1160,9 +1160,9 @@ def _with_pinned_calls(monkeypatch, rows):
                 GraphRelationship(
                     from_label="Function", from_name="main", rel_type="CALLS", to_label="Function",
                     to_name=name, repo_id=repo_id, properties=properties, from_file="app.py", to_file=to_file,
-                    origin="app.py", exact=exact,
+                    origin="app.py", exclude=exclude,
                 )
-                for name, to_file, properties, exact in rows
+                for name, to_file, properties, exclude in rows
             ]
         return result
 
@@ -1279,9 +1279,13 @@ def test_name_refs_written_empty(engine, repo_id, tmp_path):
     assert _module_name_refs(engine, repo_id, "caller.py") == ([], [], [])
 
 
-def test_name_ref_relink_benchmark(engine, repo_id, monkeypatch):
+@pytest.mark.parametrize("pinned", [False, True], ids=["by name", "path pins"])
+def test_name_ref_relink_benchmark(engine, repo_id, monkeypatch, pinned):
     """The relink read over 5,000 Modules, each with 60 by-name edges drawn
-    from 2,000 names, then the parse and the upsert of what it found.
+    from 2,000 names, then the parse and the upsert of what it found. With
+    `pinned`, every edge carries a file, a directory, a suffix and a prefix
+    pin (docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md),
+    the added names' directory pin linking them.
 
     Locally it is held to a wall-clock bound. A CI runner's clock is too
     noisy for that, so there every query the relink runs is PROFILEd
@@ -1305,7 +1309,12 @@ def test_name_ref_relink_benchmark(engine, repo_id, monkeypatch):
         modules.append({
             "label": "Module", "repo_id": repo_id, "name": path, "properties": {
                 "source_file": path,
-                "name_refs": [f"CALLS\x1fFunction\x1fcaller\x1f{path}\x1fFunction\x1f{t}\x1f" for t in targets],
+                "name_refs": [
+                    f"CALLS\x1fFunction\x1fcaller\x1f{path}\x1fFunction\x1f{t}\x1f" + (
+                        f"\x1f{t}.py\x1elib/.\x1e/x/{t}.py\x1elib/\x1fpin" if pinned else ""
+                    )
+                    for t in targets
+                ],
                 "name_ref_targets": targets,
                 "name_ref_sources": [],
             },
@@ -1314,10 +1323,11 @@ def test_name_ref_relink_benchmark(engine, repo_id, monkeypatch):
     for chunk in range(0, len(modules), 500):
         engine.upsert_nodes(modules[chunk:chunk + 500] + callers[chunk:chunk + 500])
     added_names = rng.sample(names, 20)
+    new_file = "lib/new.py" if pinned else "new.py"
     engine.upsert_nodes([
-        {"label": "Function", "repo_id": repo_id, "name": n, "properties": {"file": "new.py"}} for n in added_names
+        {"label": "Function", "repo_id": repo_id, "name": n, "properties": {"file": new_file}} for n in added_names
     ])
-    added = {("Function", n, "new.py") for n in added_names}
+    added = {("Function", n, new_file) for n in added_names}
 
     profiles = []
     if os.environ.get("CI"):

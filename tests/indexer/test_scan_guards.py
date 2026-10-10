@@ -158,6 +158,7 @@ def caught_up(monkeypatch, small_limit):
     monkeypatch.setattr(dispatch, "index_outdated", lambda *a, **k: False)
     monkeypatch.setattr(dispatch, "_docs_note_files", lambda *a, **k: set())
     monkeypatch.setattr(dispatch, "index_paths", lambda e, r, root, paths, **k: offered.append(paths) or len(paths))
+    monkeypatch.setattr(dispatch, "sync_resolver_config", lambda *a, **k: 0)
     return offered
 
 

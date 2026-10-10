@@ -1,4 +1,4 @@
-"""Measure the Python call graph DevGraph builds for a repository (M1-M6).
+"""Measure the call graph DevGraph builds for a repository (M1-M6).
 
 See docs/superpowers/specs/2026-10-10-python-call-resolution-design.md. Prints
 one JSON object: multi-target CALLS (M1), cross-file resolved CALLS with no
@@ -8,6 +8,14 @@ ten (M4), a fixed sample of DevGraph call sites plus caller recall against an
 
 Usage:
     <venv python> scripts/measure_call_graph.py <repo_id> [--root PATH] [--scan] [--cleanup]
+    <venv python> scripts/measure_call_graph.py --fixture <lang>
+
+`--fixture` measures one of the ground-truth fixtures under
+tests/fixtures/callgraph instead (see `measure_fixture` and
+docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md): it
+copies the fixture to a temporary folder, scans it into a scratch repository,
+compares the graph with the fixture's expected.json and deletes the scratch
+repository again.
 
 `--scan` deletes `<repo_id>` and full-scans `--root` (default: the current
 directory) into it first, timing the scan and an incremental save of
@@ -23,8 +31,12 @@ import argparse
 import ast
 import json
 import os
+import posixpath
+import shutil
 import sys
+import tempfile
 import time
+import uuid
 from importlib.machinery import PathFinder
 from pathlib import Path
 
@@ -108,8 +120,10 @@ def measure_m1(engine: GraphEngine, repo_id: str) -> dict:
         )
     }
     resolved = totals.get("resolved", 0)
+    self_loops = _rows(engine, "MATCH (a {repo_id: $r})-[x:CALLS]->(a) RETURN count(x) AS n", r=repo_id)[0]["n"]
     return {
         "calls_by_confidence": totals,
+        "self_loops": self_loops,
         "multi_target_by_confidence": multi,
         "multi_target_total": sum(multi.values()),
         "resolved_multi_share": round(multi.get("resolved", 0) / resolved, 4) if resolved else None,
@@ -334,19 +348,241 @@ def measure_m6(engine: GraphEngine, repo_id: str, timings: dict) -> dict:
             "total_name_refs_bytes": sum(s for _n, s in sizes)}
 
 
+# --- fixture mode ----------------------------------------------------------------
+
+FIXTURES = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "callgraph"
+FIXTURE_LANGUAGES = ["ts", "go", "java", "kotlin", "csharp", "rust", "cpp"]
+
+# M4: callee names that must never rank in a fixture's PageRank top five (the
+# container, string and runtime methods every language's stoplist drops).
+_FIXTURE_STOPLIST_PROBE = {
+    "get", "set", "add", "put", "push", "pop", "find", "slice", "map", "filter", "join", "split", "append",
+    "remove", "contains", "size", "len", "length", "toString", "equals", "hashCode", "String", "Error", "Close",
+    "Lock", "Unlock", "clone", "unwrap", "iter", "new", "from", "parse", "stringify", "info", "log", "format",
+}
+
+
+def _fixture_scan(engine: GraphEngine, lang: str, repo_id: str) -> tuple[Path, dict]:
+    """Copy fixture `lang` (less its expected.json) to a temporary folder and
+    full-scan it into `repo_id`; the folder and the scan's timings."""
+    root = Path(tempfile.mkdtemp(prefix=f"devgraph-measure-{lang}-")) / lang
+    shutil.copytree(FIXTURES / lang, root, ignore=shutil.ignore_patterns("expected.json"))
+    engine.delete_repository(repo_id)
+    provision_repository_schema(engine, root)
+    engine.upsert_repository(repo_id, repo_id, str(root))
+    started = time.perf_counter()
+    full_scan(engine, repo_id, root)
+    return root, {"full_scan_s": round(time.perf_counter() - started, 2)}
+
+
+def _ratio(part: int, whole: int) -> float | None:
+    return round(part / whole, 4) if whole else None
+
+
+def _graph_calls(engine: GraphEngine, repo_id: str) -> list[tuple[tuple, str]]:
+    """Every CALLS edge as ((caller, caller file, callee, callee file), confidence)."""
+    return [
+        ((row["a"], row["af"], row["b"], row["bf"]), str(row["conf"]))
+        for row in _rows(
+            engine,
+            "MATCH (a {repo_id: $r})-[x:CALLS]->(b:Function {repo_id: $r}) "
+            "RETURN a.name AS a, coalesce(a.file, a.source_file) AS af, b.name AS b, b.file AS bf, "
+            "x.confidence AS conf",
+            r=repo_id,
+        )
+    ]
+
+
+def _graph_imports(engine: GraphEngine, repo_id: str) -> set[tuple[str, str]]:
+    return {
+        (row["a"], row["b"])
+        for row in _rows(
+            engine, "MATCH (a:Module {repo_id: $r})-[:IMPORTS]->(b:Module {repo_id: $r}) RETURN a.name AS a, b.name AS b",
+            r=repo_id,
+        )
+    }
+
+
+def fixture_metrics(engine: GraphEngine, repo_id: str, expected: dict, timings: dict) -> dict:
+    """M1-M6 of the graph `repo_id` holds against a fixture's `expected`.
+
+    A CALLS edge is linked when its confidence is `resolved` or `package` (a
+    package edge to the right file counts as a correct link; confidences are
+    reported apart). An `ambiguous` truth row is correct when linked and not
+    required for recall."""
+    truth = {(c["caller"], c["caller_file"], c["callee"], c["callee_file"]) for c in expected["calls"]}
+    required = {
+        (c["caller"], c["caller_file"], c["callee"], c["callee_file"]) for c in expected["calls"] if not c.get("ambiguous")
+    }
+    edges = _graph_calls(engine, repo_id)
+    by_conf: dict[str, set[tuple]] = {}
+    for key, conf in edges:
+        by_conf.setdefault(conf, set()).add(key)
+    every = {key for key, _conf in edges}
+    resolved = by_conf.get("resolved", set())
+    linked = resolved | by_conf.get("package", set())
+    imports = _graph_imports(engine, repo_id)
+
+    # M1: edges from one caller to one callee name with more than one target.
+    groups: dict[tuple, list[str]] = {}
+    for (a, af, b, _bf), conf in edges:
+        groups.setdefault((a, af, b, conf), []).append(conf)
+    multi: dict[str, int] = {}
+    for (_a, _af, _b, conf), hits in groups.items():
+        if len(hits) > 1:
+            multi[conf] = multi.get(conf, 0) + len(hits)
+    m1 = {
+        "calls_by_confidence": {conf: len(keys) for conf, keys in sorted(by_conf.items())},
+        "multi_target_by_confidence": dict(sorted(multi.items())),
+        "resolved_multi_share": _ratio(multi.get("resolved", 0), len(resolved)),
+    }
+
+    # M2: precision, and resolved edges between directories with no IMPORTS
+    # (a Go or Java package is one directory, so same-directory edges are exempt).
+    cross = sorted(
+        f"{af}:{a} -> {bf}:{b}" for a, af, b, bf in resolved
+        if af and bf and posixpath.dirname(af) != posixpath.dirname(bf) and (af, bf) not in imports
+    )
+    m2 = {
+        "precision_resolved": _ratio(len(resolved & truth), len(resolved)),
+        "precision_linked": _ratio(len(linked & truth), len(linked)),
+        "precision_all": _ratio(len(every & truth), len(every)),
+        "linked_false_positives": sorted(f"{af}:{a} -> {bf}:{b}" for a, af, b, bf in linked - truth)[:15],
+        "resolved_cross_dir_without_import": len(cross),
+        "cross_sample": cross[:10],
+    }
+
+    # M3: IMPORTS file to file.
+    import_truth = {(i["from_file"], i["to_file"]) for i in expected["imports"]}
+    import_required = {(i["from_file"], i["to_file"]) for i in expected["imports"] if not i.get("ambiguous")}
+    m3 = {
+        "graph_imports": len(imports),
+        "truth_imports": len(import_required),
+        "precision": _ratio(len(imports & import_truth), len(imports)),
+        "recall": _ratio(len(imports & import_required), len(import_required)),
+        "missed": sorted(f"{a} -> {b}" for a, b in import_required - imports)[:15],
+        "extra": sorted(f"{a} -> {b}" for a, b in imports - import_truth)[:15],
+    }
+
+    # M4: recall, and the PageRank top five.
+    refresh_insights(engine, repo_id)
+    top = _rows(
+        engine,
+        "MATCH (n {repo_id: $r}) WHERE n.insight_pagerank IS NOT NULL "
+        "RETURN n.name AS name, coalesce(n.file, n.source_file) AS file, n.insight_pagerank AS rank "
+        "ORDER BY rank DESC, name LIMIT 5",
+        r=repo_id,
+    )
+    m4 = {
+        "recall_any": _ratio(len(every & required), len(required)),
+        "recall_linked": _ratio(len(linked & required), len(required)),
+        "recall_resolved": _ratio(len(resolved & required), len(required)),
+        "missed": sorted(f"{af}:{a} -> {bf}:{b}" for a, af, b, bf in required - every)[:15],
+        "top5": [[row["name"], row["file"]] for row in top],
+        # A stoplisted name may rank when the truth really calls it there.
+        "top5_stoplisted": [
+            row["name"] for row in top
+            if row["name"] in _FIXTURE_STOPLIST_PROBE
+            and not any((b, bf) == (row["name"], row["file"]) for _a, _af, b, bf in truth)
+        ],
+    }
+
+    # M5: the named sites: every call with a `note`, and every `no_edge`.
+    conf_of = {key: conf for key, conf in edges}
+    sample = []
+    for c in expected["calls"]:
+        if not c.get("note") or c.get("ambiguous"):
+            continue
+        key = (c["caller"], c["caller_file"], c["callee"], c["callee_file"])
+        wrong = sorted(f for f in c.get("not_files", []) if (c["caller"], c["caller_file"], c["callee"], f) in every)
+        ok = key in every and not wrong
+        sample.append({"site": f"{c['caller_file']}:{c['caller']} -> {c['callee_file']}:{c['callee']}",
+                       "note": c["note"], "confidence": conf_of.get(key), "wrong_files": wrong, "ok": ok})
+    for n in expected.get("no_edge", []):
+        hits = sorted(
+            f"{bf}:{conf}" for (a, af, b, bf), conf in edges
+            if (a, af, b) == (n["caller"], n["caller_file"], n["callee"])
+        )
+        sample.append({"site": f"{n['caller_file']}:{n['caller']} -/-> {n['callee']}", "note": n.get("note"),
+                       "edges": hits, "ok": not hits})
+    m5 = {
+        "sites_ok": sum(s["ok"] for s in sample),
+        "sites": len(sample),
+        "failed": [s for s in sample if not s["ok"]],
+    }
+    if expected.get("symbols"):
+        nodes = {
+            (row["name"], row["file"])
+            for row in _rows(
+                engine, "MATCH (n {repo_id: $r}) WHERE n:Function OR n:Class RETURN n.name AS name, n.file AS file",
+                r=repo_id,
+            )
+        }
+        missing = sorted(f"{s['file']}:{s['name']}" for s in expected["symbols"] if (s["name"], s["file"]) not in nodes)
+        m5["symbols_found"] = len(expected["symbols"]) - len(missing)
+        m5["symbols"] = len(expected["symbols"])
+        m5["symbols_missing"] = missing
+
+    return {"M1": m1, "M2": m2, "M3": m3, "M4": m4, "M5": m5, "M6": measure_m6(engine, repo_id, timings)}
+
+
+def fixture_failures(metrics: dict) -> list[str]:
+    """The design's M1-M5 targets a fixture's metrics miss (empty when met)."""
+    m1, m2, m3, m4, m5 = (metrics[k] for k in ("M1", "M2", "M3", "M4", "M5"))
+    checks = [
+        ("M1 resolved multi-target share < 2 %", m1["resolved_multi_share"] is not None
+         and m1["resolved_multi_share"] < 0.02),
+        ("M2 linked precision >= 98 %", (m2["precision_linked"] or 0) >= 0.98),
+        ("M2 no resolved cross-directory edge without an import", m2["resolved_cross_dir_without_import"] == 0),
+        ("M3 IMPORTS precision >= 98 %", (m3["precision"] or 0) >= 0.98),
+        ("M3 IMPORTS recall >= 95 %", (m3["recall"] or 0) >= 0.95),
+        ("M4 CALLS recall >= 95 %", (m4["recall_any"] or 0) >= 0.95),
+        ("M4 no stoplisted name in the PageRank top five", not m4["top5_stoplisted"]),
+        ("M5 every named site", m5["sites_ok"] == m5["sites"]),
+        ("M5 every expected symbol", m5.get("symbols_found") == m5.get("symbols")),
+    ]
+    return [name for name, ok in checks if not ok]
+
+
+def measure_fixture(engine: GraphEngine, lang: str) -> dict:
+    """Scan fixture `lang` into a scratch repository and measure it; the
+    repository and the temporary copy are deleted afterwards."""
+    expected = json.loads((FIXTURES / lang / "expected.json").read_text(encoding="utf-8"))
+    repo_id = f"zz-measure-{lang}-{uuid.uuid4().hex[:8]}"
+    root = None
+    try:
+        root, timings = _fixture_scan(engine, lang, repo_id)
+        metrics = fixture_metrics(engine, repo_id, expected, timings)
+    finally:
+        engine.delete_repository(repo_id)
+        if root is not None:
+            shutil.rmtree(root.parent, ignore_errors=True)
+    return {"fixture": lang, **metrics, "failures": fixture_failures(metrics)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("repo_id")
+    parser.add_argument("repo_id", nargs="?")
+    parser.add_argument("--fixture", choices=FIXTURE_LANGUAGES, help="measure a ground-truth fixture instead")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--scan", action="store_true", help="delete the repo id and full-scan --root into it first")
     parser.add_argument("--cleanup", action="store_true", help="delete the repo id afterwards")
     args = parser.parse_args()
+    if not args.fixture and not args.repo_id:
+        parser.error("give a repo_id or --fixture")
     root = args.root.resolve()
     engine = GraphEngine(
         uri=os.environ.get("DEVGRAPH_NEO4J_URI", "bolt://127.0.0.1:7687"),
         user=os.environ.get("DEVGRAPH_NEO4J_USER", "neo4j"),
         password=os.environ.get("DEVGRAPH_NEO4J_PASSWORD", "devgraph-local-dev"),
     )
+    if args.fixture:
+        try:
+            json.dump(measure_fixture(engine, args.fixture), sys.stdout, indent=1)
+            print()
+        finally:
+            engine.close()
+        return 0
     timings: dict = {}
     try:
         if args.scan:

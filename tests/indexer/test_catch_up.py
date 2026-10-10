@@ -41,6 +41,7 @@ def stubbed(monkeypatch):
     monkeypatch.setattr(dispatch, "_docs_note_files", lambda *a, **k: set(state["known"]))
     monkeypatch.setattr(dispatch, "_extracted_files", lambda *a, **k: set(state["known"]))
     monkeypatch.setattr(dispatch, "_skip_marks", lambda *a, **k: {})
+    monkeypatch.setattr(dispatch, "sync_resolver_config", lambda *a, **k: 0)
 
     def index(engine, repo_id, root, paths, docs_path=None, mentions_enabled=False):
         state["offered"].append({p.relative_to(root).as_posix() for p in paths})
@@ -190,7 +191,7 @@ def _routed_by_index_single_path(root, path, docs_root, mentions_enabled):
     )}
     return dispatch._index_single_path(
         MagicMock(), "r", root, resolved, resolved.relative_to(root.resolve()).as_posix(),
-        docs_root, mentions_enabled, None, batch_services=set(), **lists, **extractions,
+        docs_root, mentions_enabled, None, config=None, batch_services=set(), **lists, **extractions,
     ) > 0
 
 

@@ -276,7 +276,7 @@ def test_a_resolved_call_suppresses_the_bare_row_of_the_same_name():
 def test_a_package_row_leaves_out_the_exact_files_and_this_file():
     result = extract_python_file("from pkg import f\n\n\ndef g():\n    f()\n", "pkg/user.py", "repo")
     (prefix,) = [r for r in result.relationships if r.rel_type == "CALLS" and r.to_file == "pkg/"]
-    assert prefix.exact == sorted({"pkg.py", "pkg/__init__.py", "pkg/pkg.py", "pkg/pkg/__init__.py", "pkg/user.py"})
+    assert prefix.exclude == sorted({"pkg.py", "pkg/__init__.py", "pkg/pkg.py", "pkg/pkg/__init__.py", "pkg/user.py"})
 
 
 def test_call_sites_collapse_to_one_caller_class_per_callee():
@@ -392,7 +392,7 @@ def test_the_index_upgrade_replaces_bare_python_calls(engine, repo_id, tmp_path,
         result = real(content, rel_path, repo_id)
         for rel in result.relationships:
             if rel.rel_type == "CALLS":
-                rel.to_file, rel.exact, rel.properties = None, None, None
+                rel.to_file, rel.exclude, rel.properties = None, None, None
         return result
 
     with monkeypatch.context() as old_extractor:
@@ -412,4 +412,16 @@ def test_the_index_upgrade_replaces_bare_python_calls(engine, repo_id, tmp_path,
     dispatch.catch_up(engine, repo_id, tmp_path, since=datetime.now(timezone.utc))
     assert caller_edges(engine, repo_id, "main") == [("helper", "lib.py", "resolved")]
     assert not dispatch.index_outdated(engine, repo_id)
+    equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_an_untyped_member_call_never_links_its_own_caller(engine, repo_id, tmp_path):
+    """`items.save()` inside `save` is a call on some other object, never a
+    recursion; the same name elsewhere keeps its bare edge."""
+    write(tmp_path, "repo.py", "class Repo:\n    def save(self, items):\n        items.save(1)\n")
+    write(tmp_path, "store.py", "def save(x):\n    return x\n")
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+    assert caller_edges(engine, repo_id, "save") == [("save", "store.py", "name")]
     equals_fresh(engine, repo_id, tmp_path)

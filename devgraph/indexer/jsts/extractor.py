@@ -50,23 +50,32 @@ Known limitations (v1 scope cuts, documented per Implementation Plan #8):
     across the TypeScript sources that emit it - the same non-materializing-guess pattern the Python
     extractor uses (a guessed target that doesn't match a real indexed file
     simply never produces an edge, since upsert_relationship only
-    MATCH-links real existing nodes). Bare specifiers (`import x from
-    'lodash'`) get a single best-effort `node_modules/{name}` guess; no
-    `package.json`/`tsconfig.json` `paths` mapping is consulted (out of
-    scope per the plan - "don't over-engineer"). No pnpm/yarn workspace
-    resolution.
+    MATCH-links real existing nodes). A bare specifier the file's
+    tsconfig.json/jsconfig.json maps (`paths`, `baseUrl`, through `extends`
+    and `references`; see resolver_config.py) names the same candidates
+    under the mapped path; any other bare specifier (`import x from
+    'lodash'`) is an external package, with no IMPORTS edge. No pnpm/yarn
+    workspace resolution.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import tree_sitter_javascript as tsjs
 import tree_sitter_typescript as tsts
 from tree_sitter import Language, Node, Parser
 
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, call_rows
+from devgraph.indexer.common import (
+    ExtractionResult,
+    GraphNode,
+    GraphRelationship,
+    own_edges,
+)
+from devgraph.indexer.resolver_config import ResolverConfig
 
 logger = logging.getLogger(__name__)
 
@@ -191,55 +200,26 @@ def _docstring_summary(full_text: str, max_chars: int = 120) -> str:
     return first_line
 
 
-def _callee_simple_name(func_node: Node, source: bytes) -> str | None:
-    """Resolve a call expression's `function` field to a simple callee name.
-
-    Same philosophy as the Python extractor's `_callee_simple_name`:
-    `foo()` -> 'foo', `obj.foo()`/`this.foo()` -> 'foo' (the member name,
-    not type-resolved - a structural choice that intentionally over-links
-    same-named methods/functions rather than under-linking).
-    """
-    if func_node.type == "identifier":
-        return _text(func_node, source)
-    if func_node.type == "member_expression":
-        prop = func_node.child_by_field_name("property")
-        if prop is not None:
-            return _text(prop, source)
-    if func_node.type == "call_expression":
-        # Chained/immediately-invoked call, e.g. `getHandler()()`.
-        inner = func_node.child_by_field_name("function")
-        if inner is not None:
-            return _callee_simple_name(inner, source)
-    return None
-
-
-def _extract_call_targets(body: Node, source: bytes) -> list[str]:
-    """Walk a function/method body for call expressions, returning callee
-    simple names. Does not descend into nested function/class scopes - those
-    are walked separately so calls are attributed to the correct enclosing
-    scope rather than hoisted to the outer function (mirrors the Python
-    extractor's `_extract_call_targets`).
-    """
-    targets: list[str] = []
+def _call_functions(body: Node) -> list[Node]:
+    """The `function` node of every call expression in `body`, not descending
+    into nested function/class scopes - those are walked separately so calls
+    are attributed to the correct enclosing scope rather than hoisted to the
+    outer function (mirrors the Python extractor's `_call_functions`).
+    `require(...)` is module-system syntax, captured by `_extract_imports`."""
+    found: list[Node] = []
 
     def walk(node: Node) -> None:
         if node.type in _NESTED_SCOPE_TYPES:
             return
         if node.type == "call_expression":
             func = node.child_by_field_name("function")
-            if func is not None:
-                name = _callee_simple_name(func, source)
-                # 'require(...)' is module-system syntax already captured by
-                # _extract_imports as an IMPORTS edge - not an app-level call
-                # worth a CALLS edge (and 'require' is never itself indexed
-                # as a Function node, so the edge would just be dead noise).
-                if name and name != "require":
-                    targets.append(name)
+            if func is not None and not (func.type == "identifier" and func.text == b"require"):
+                found.append(func)
         for child in node.children:
             walk(child)
 
     walk(body)
-    return targets
+    return found
 
 
 def _extract_base_class_names(class_node: Node, source: bytes) -> list[str]:
@@ -337,7 +317,9 @@ def _resolve_relative_base(current_dir: str, specifier: str) -> str:
     return "/".join(parts)
 
 
-def _resolve_module_specifier(specifier: str, current_dir: str) -> list[str]:
+def _resolve_module_specifier(
+    specifier: str, current_dir: str, config: ResolverConfig | None = None, file_path: str = ""
+) -> list[str]:
     """Return candidate Module-node target names for an import specifier.
 
     A relative specifier with an explicit JS/TS extension (`./x.js`,
@@ -355,33 +337,67 @@ def _resolve_module_specifier(specifier: str, current_dir: str) -> list[str]:
     extractor uses for its own import targets (a candidate that doesn't
     match a real indexed Module node simply never produces an edge).
 
-    Bare specifiers (`lodash`, `@scope/pkg`) get a single best-effort
-    `node_modules/{name}` guess - no package.json/tsconfig 'paths' mapping is
-    consulted (out of scope, see module docstring).
+    A bare specifier the importing file's tsconfig maps (`paths`, else
+    `baseUrl`; see resolver_config.ResolverConfig.ts_alias, given `config`)
+    names the same candidates for each path it maps to. Any other bare
+    specifier (`lodash`, `@scope/pkg`) is an external package: no candidate.
     """
     # A bundler query or fragment (`./worker.js?worker`, `./x#frag`) names no file.
     specifier = specifier.split("?", 1)[0].split("#", 1)[0]
     if specifier.startswith("."):
-        base = _resolve_relative_base(current_dir, specifier)
+        return _base_candidates(_resolve_relative_base(current_dir, specifier))
+    if config is not None and (aliased := config.ts_alias(specifier, file_path)) is not None:
+        return [candidate for base in aliased for candidate in _base_candidates(base)]
+    return []
+
+
+def _specifier_pins(
+    specifier: str, current_dir: str, config: ResolverConfig | None, file_path: str
+) -> list[str] | None:
+    """Where a name imported from `specifier` can be defined: its candidate
+    files (`_resolve_module_specifier`) and the recursive prefix of each path
+    it names, so a barrel's re-export reaches the defining file (as
+    "package"; never the repository root). None for an external package."""
+    specifier = specifier.split("?", 1)[0].split("#", 1)[0]
+    if specifier.startswith("."):
+        bases = [_resolve_relative_base(current_dir, specifier)]
+    elif config is not None and (aliased := config.ts_alias(specifier, file_path)) is not None:
+        bases = aliased
+    else:
+        return None
+    pins = []
+    for base in bases:
+        pins += _base_candidates(base)
         stem, dot, ext = base.rpartition(".")
-        mapped = _EXPLICIT_EXTENSIONS.get(f".{ext}") if dot and "/" not in ext else None
-        if mapped and stem and not stem.endswith("/"):
-            # Then the specifier as a directory, for a folder named like a file.
-            return [f"{stem}.{each}" for each in mapped] + [f"{base}/index.{each}" for each in _EXTENSIONS]
-        if base:
-            candidates = [f"{base}.{ext}" for ext in _EXTENSIONS]
-            candidates += [f"{base}/index.{ext}" for ext in _EXTENSIONS]
-        else:
-            # Specifier resolves to the repo root itself (e.g. `require('../..')`
-            # from two directories down) - only the directory-import ('index.*')
-            # form is meaningful; a bare '.js'/'.jsx'/etc with no basename isn't
-            # a real candidate file path.
-            candidates = [f"index.{ext}" for ext in _EXTENSIONS]
-        return candidates
-    return [f"node_modules/{specifier}"]
+        folder = stem if dot and "/" not in ext and f".{ext}" in _EXPLICIT_EXTENSIONS and stem else base
+        if folder and "!" not in folder:  # graph/schema.py split_pin: no "!" in a path pin
+            pins.append(folder + "/")
+    return list(dict.fromkeys(pins))
 
 
-def _extract_imports(root: Node, source: bytes, current_dir: str) -> list[tuple[str, list[str]]]:
+def _base_candidates(base: str) -> list[str]:
+    """The files a resolved specifier path (repo-relative, no extension
+    applied) can name: see `_resolve_module_specifier`."""
+    stem, dot, ext = base.rpartition(".")
+    mapped = _EXPLICIT_EXTENSIONS.get(f".{ext}") if dot and "/" not in ext else None
+    if mapped and stem and not stem.endswith("/"):
+        # Then the specifier as a directory, for a folder named like a file.
+        return [f"{stem}.{each}" for each in mapped] + [f"{base}/index.{each}" for each in _EXTENSIONS]
+    if base:
+        candidates = [f"{base}.{ext}" for ext in _EXTENSIONS]
+        candidates += [f"{base}/index.{ext}" for ext in _EXTENSIONS]
+    else:
+        # Specifier resolves to the repo root itself (e.g. `require('../..')`
+        # from two directories down) - only the directory-import ('index.*')
+        # form is meaningful; a bare '.js'/'.jsx'/etc with no basename isn't
+        # a real candidate file path.
+        candidates = [f"index.{ext}" for ext in _EXTENSIONS]
+    return candidates
+
+
+def _extract_imports(
+    root: Node, source: bytes, current_dir: str, config: ResolverConfig | None = None, file_path: str = ""
+) -> list[tuple[str, list[str]]]:
     """Extract import statements from the parse tree.
 
     Returns a list of (import_target, [bound_names]) tuples, where
@@ -398,14 +414,14 @@ def _extract_imports(root: Node, source: bytes, current_dir: str) -> list[tuple[
             if source_node is not None:
                 specifier = _string_value(source_node, source)
                 names = _import_clause_names(node, source) or [specifier]
-                for target in _resolve_module_specifier(specifier, current_dir):
+                for target in _resolve_module_specifier(specifier, current_dir, config, file_path):
                     imports.append((target, names))
         elif node.type == "export_statement":
             source_node = node.child_by_field_name("source")
             if source_node is not None:
                 specifier = _string_value(source_node, source)
                 names = _export_clause_names(node, source)
-                for target in _resolve_module_specifier(specifier, current_dir):
+                for target in _resolve_module_specifier(specifier, current_dir, config, file_path):
                     imports.append((target, names))
         elif node.type == "call_expression":
             func = node.child_by_field_name("function")
@@ -415,7 +431,7 @@ def _extract_imports(root: Node, source: bytes, current_dir: str) -> list[tuple[
                     first_arg = args.named_children[0]
                     if first_arg.type == "string":
                         specifier = _string_value(first_arg, source)
-                        for target in _resolve_module_specifier(specifier, current_dir):
+                        for target in _resolve_module_specifier(specifier, current_dir, config, file_path):
                             imports.append((target, [specifier]))
 
         for child in node.children:
@@ -425,7 +441,376 @@ def _extract_imports(root: Node, source: bytes, current_dir: str) -> list[tuple[
     return imports
 
 
-def extract_js_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
+@dataclass(frozen=True)
+class _Binding:
+    """A name an import binds: the callee name it stands for (the exported
+    name of `{a as b}`, else the local name), where that can be defined
+    (`_specifier_pins`; None for an external package), and whether it is a
+    whole module (`* as ns`, `const ns = require(...)`)."""
+
+    name: str
+    pins: tuple[str, ...] | None
+    namespace: bool
+
+
+@dataclass
+class _ClassInfo:
+    methods: set[str] = field(default_factory=set)
+    bases: list[str] = field(default_factory=list)
+    fields: dict[str, list[str]] = field(default_factory=dict)  # field -> the types it holds
+
+
+@dataclass
+class _Scope:
+    """What a call site sees: the enclosing class, the parameters of its
+    function (and enclosing ones) and the types of its typed names."""
+
+    cls: str | None = None
+    params: frozenset[str] = frozenset()
+    types: dict[str, list[str]] = field(default_factory=dict)
+
+    def nested(self, params: set[str], types: dict[str, list[str]]) -> _Scope:
+        outer = {name: t for name, t in self.types.items() if name not in params}
+        return _Scope(self.cls, self.params | params, {**outer, **types})
+
+
+#: Globals a classic script calls that are never a script's own function.
+_JS_GLOBALS = frozenset({
+    "fetch", "setTimeout", "setInterval", "clearTimeout", "clearInterval", "requestAnimationFrame", "parseInt",
+    "parseFloat", "isNaN", "isFinite", "alert", "confirm", "prompt", "encodeURIComponent", "decodeURIComponent",
+    "encodeURI", "decodeURI", "structuredClone", "queueMicrotask", "String", "Number", "Boolean", "Array", "Object",
+    "Symbol", "BigInt", "Date", "RegExp", "Error", "Promise", "require",
+})
+
+#: Receivers that are literals: `"".trim()`, `[].map()`, `({}).toString()`.
+_LITERAL_RECEIVERS = frozenset({
+    "string", "template_string", "array", "object", "number", "regex", "true", "false", "null", "undefined",
+})
+
+
+def _type_names(node: Node | None, source: bytes) -> list[str]:
+    """The named types a type annotation can hold: `T`, `ns.T`, each named
+    member of a union (`T | null`), a generic's own name; never an array
+    type (`T[]`), whose methods are the array's."""
+    if node is None:
+        return []
+    if node.type == "type_annotation":
+        return [name for child in node.named_children for name in _type_names(child, source)]
+    if node.type in ("type_identifier", "nested_type_identifier"):
+        return [_dotted_name(node, source)]
+    if node.type in ("union_type", "parenthesized_type"):
+        return [name for child in node.named_children for name in _type_names(child, source)]
+    if node.type == "generic_type":
+        name = node.child_by_field_name("name")
+        return [_dotted_name(name, source)] if name is not None else []
+    return []
+
+
+def _constructed(node: Node | None, source: bytes) -> str | None:
+    """`T` (or `ns.T`) of a `new T(...)` expression."""
+    if node is not None and node.type == "new_expression":
+        ctor = node.child_by_field_name("constructor")
+        if ctor is not None and ctor.type in ("identifier", "member_expression"):
+            return _dotted_name(ctor, source)
+    return None
+
+
+def _parameters(func: Node, source: bytes) -> tuple[set[str], dict[str, list[str]], dict[str, list[str]]]:
+    """A function's parameter names, the types its annotated ones hold, and
+    the fields its constructor parameter properties declare
+    (`constructor(private repo: Repo)` types `this.repo`)."""
+    names: set[str] = set()
+    types: dict[str, list[str]] = {}
+    fields: dict[str, list[str]] = {}
+    params = func.child_by_field_name("parameters")
+    if params is None and func.type == "arrow_function":
+        single = func.child_by_field_name("parameter")
+        if single is not None and single.type == "identifier":
+            names.add(_text(single, source))
+    for param in params.named_children if params is not None else []:
+        pattern = param.child_by_field_name("pattern") if param.type in (
+            "required_parameter", "optional_parameter"
+        ) else param
+        if pattern is None or pattern.type != "identifier":
+            continue
+        name = _text(pattern, source)
+        names.add(name)
+        annotated = _type_names(param.child_by_field_name("type"), source)
+        if annotated:
+            types[name] = annotated
+            if any(c.type in ("accessibility_modifier", "readonly") for c in param.children):
+                fields[name] = annotated
+    return names, types, fields
+
+
+def _local_types(body: Node, source: bytes) -> dict[str, list[str]]:
+    """Names a function body declares with a type annotation or a `new T()`
+    value, outside nested scopes."""
+    types: dict[str, list[str]] = {}
+
+    def walk(node: Node) -> None:
+        if node.type in _NESTED_SCOPE_TYPES:
+            return
+        if node.type == "variable_declarator":
+            name = node.child_by_field_name("name")
+            if name is not None and name.type == "identifier":
+                annotated = _type_names(node.child_by_field_name("type"), source)
+                constructed = _constructed(node.child_by_field_name("value"), source)
+                if annotated or constructed:
+                    types[_text(name, source)] = annotated or [constructed]
+        for child in node.children:
+            walk(child)
+
+    walk(body)
+    return types
+
+
+def _class_table(root: Node, source: bytes) -> dict[str, _ClassInfo]:
+    """Every class in the file: its methods, its `extends` bases and the
+    types of its fields (annotated, `= new T()`, or constructor parameter
+    properties)."""
+    classes: dict[str, _ClassInfo] = {}
+
+    def walk(node: Node) -> None:
+        if node.type in _CLASS_TYPES and (name := node.child_by_field_name("name")) is not None:
+            info = classes.setdefault(_text(name, source), _ClassInfo())
+            info.bases += _extract_base_class_names(node, source)
+            body = node.child_by_field_name("body")
+            for member in body.named_children if body is not None else []:
+                member_name = member.child_by_field_name("name") or member.child_by_field_name("property")
+                if member_name is None:
+                    continue
+                if member.type == "method_definition":
+                    info.methods.add(_text(member_name, source))
+                    if _text(member_name, source) == "constructor":
+                        info.fields.update(_parameters(member, source)[2])
+                elif member.type in ("field_definition", "public_field_definition"):
+                    value = member.child_by_field_name("value")
+                    if value is not None and value.type in _FUNCTION_VALUE_TYPES:
+                        info.methods.add(_text(member_name, source))
+                        continue
+                    held = _type_names(member.child_by_field_name("type"), source)
+                    constructed = _constructed(value, source)
+                    if held or constructed:
+                        info.fields[_text(member_name, source)] = held or [constructed]
+        for child in node.children:
+            walk(child)
+
+    walk(root)
+    return classes
+
+
+def _defined_functions(root: Node, source: bytes) -> set[str]:
+    """Names a bare call can reach in this file: function declarations and
+    functions bound to a name (`const f = () => {}`), at any depth; not
+    methods."""
+    names: set[str] = set()
+
+    def walk(node: Node) -> None:
+        if node.type in ("function_declaration", "generator_function_declaration"):
+            name = node.child_by_field_name("name")
+            if name is not None:
+                names.add(_text(name, source))
+        elif node.type == "variable_declarator":
+            name, value = node.child_by_field_name("name"), node.child_by_field_name("value")
+            if name is not None and name.type == "identifier" and value is not None and (
+                value.type in _FUNCTION_VALUE_TYPES
+            ):
+                names.add(_text(name, source))
+        for child in node.children:
+            walk(child)
+
+    walk(root)
+    return names
+
+
+def _bindings(
+    root: Node, source: bytes, current_dir: str, config: ResolverConfig | None, file_path: str
+) -> tuple[dict[str, _Binding], bool]:
+    """The names the file's imports bind (`import` statements, and
+    `const x = require(...)` / `const {a, b: c} = require(...)`), and
+    whether it is a module at all: a classic script has no `import`,
+    `export` or `require`."""
+    bindings: dict[str, _Binding] = {}
+    module = False
+
+    def pins(node: Node | None) -> tuple[str, ...] | None:
+        if node is None or node.type != "string":
+            return None
+        found = _specifier_pins(_string_value(node, source), current_dir, config, file_path)
+        return tuple(found) if found is not None else None
+
+    def walk(node: Node) -> None:
+        nonlocal module
+        if node.type in ("import_statement", "export_statement"):
+            module = True
+        if node.type == "import_statement":
+            where = pins(node.child_by_field_name("source"))
+            clause = next((c for c in node.named_children if c.type == "import_clause"), None)
+            for child in clause.named_children if clause is not None else []:
+                if child.type == "identifier":
+                    name = _text(child, source)
+                    bindings[name] = _Binding(name, where, False)
+                elif child.type == "namespace_import":
+                    ns = next((c for c in child.named_children if c.type == "identifier"), None)
+                    if ns is not None:
+                        bindings[_text(ns, source)] = _Binding(_text(ns, source), where, True)
+                elif child.type == "named_imports":
+                    for spec in child.named_children:
+                        name, alias = spec.child_by_field_name("name"), spec.child_by_field_name("alias")
+                        if spec.type == "import_specifier" and name is not None:
+                            bindings[_text(alias or name, source)] = _Binding(_text(name, source), where, False)
+        elif node.type == "call_expression":
+            func = node.child_by_field_name("function")
+            if func is not None and func.type == "identifier" and func.text == b"require":
+                module = True
+        elif node.type == "variable_declarator":
+            value = node.child_by_field_name("value")
+            func = value.child_by_field_name("function") if value is not None and value.type == "call_expression" \
+                else None
+            if func is not None and func.type == "identifier" and func.text == b"require":
+                args = value.child_by_field_name("arguments")
+                where = pins(args.named_children[0]) if args is not None and args.named_children else None
+                name = node.child_by_field_name("name")
+                if name is not None and name.type == "identifier":
+                    bindings[_text(name, source)] = _Binding(_text(name, source), where, True)
+                elif name is not None and name.type == "object_pattern":
+                    for prop in name.named_children:
+                        if prop.type == "shorthand_property_identifier_pattern":
+                            bindings[_text(prop, source)] = _Binding(_text(prop, source), where, False)
+                        elif prop.type == "pair_pattern":
+                            key, local = prop.child_by_field_name("key"), prop.child_by_field_name("value")
+                            if key is not None and local is not None and local.type == "identifier":
+                                bindings[_text(local, source)] = _Binding(_text(key, source), where, False)
+        for child in node.children:
+            walk(child)
+
+    walk(root)
+    return bindings, module
+
+
+class _CallResolver:
+    """Resolves a JS/TS call to the files its callee can be in (see the
+    module docstring's tiers): each target is (callee name, pin, member
+    call?), the pin a file, a package directory ending in "/", or None for a
+    bare-name match."""
+
+    def __init__(
+        self, file_path: str, bindings: dict[str, _Binding], classes: dict[str, _ClassInfo],
+        defined: set[str], script: bool, source: bytes,
+    ):
+        self.file_path = file_path
+        self.bindings = bindings
+        self.classes = classes
+        self.defined = defined
+        self.script = script
+        self.source = source
+
+    def _binding_pins(self, name: str) -> list[str] | None:
+        binding = self.bindings.get(name)
+        if binding is None:
+            return None
+        return list(binding.pins) if binding.pins is not None else []
+
+    def _class_pins(self, type_name: str, method: str) -> list[str] | None:
+        """Where `method` of the class `type_name` (as written) can be: an
+        in-file class is walked like `this` (`_method_pins`); an imported one
+        is its import's files; `ns.T` is the namespace's."""
+        if type_name in self.classes:
+            return self._method_pins(type_name, method, own=True)
+        head, dot, _rest = type_name.partition(".")
+        binding = self.bindings.get(head)
+        if binding is not None and (dot == "" or binding.namespace):
+            return list(binding.pins) if binding.pins is not None else []
+        return None
+
+    def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
+        """Where `this.method()` (own) or `super.method()` in `cls` can go:
+        this file when `cls` or an in-file base defines it, the files of an
+        imported base (not followed further); None when nothing does."""
+        if own and method in self.classes[cls].methods:
+            return [self.file_path]
+        seen = {cls}
+        pending = list(self.classes[cls].bases)
+        while pending:
+            base = pending.pop(0)
+            if base in self.classes:
+                if base in seen:
+                    continue
+                seen.add(base)
+                if method in self.classes[base].methods:
+                    return [self.file_path]
+                pending += self.classes[base].bases
+            elif (pins := self._class_pins(base, method)) is not None:
+                return pins
+        return None
+
+    def _receiver_pins(self, obj: Node, method: str, scope: _Scope) -> list[str] | None:
+        """Where `method` called on `obj` can be, or None when nothing types it."""
+        source = self.source
+        if obj.type == "this" and scope.cls in self.classes:
+            return self._method_pins(scope.cls, method, own=True)
+        if obj.type == "super" and scope.cls in self.classes:
+            return self._method_pins(scope.cls, method, own=False)
+        if obj.type == "member_expression":
+            inner, prop = obj.child_by_field_name("object"), obj.child_by_field_name("property")
+            if inner is not None and inner.type == "this" and prop is not None and scope.cls in self.classes:
+                held = self.classes[scope.cls].fields.get(_text(prop, source), [])
+                return self._typed_pins(held, method)
+            return None
+        if (constructed := _constructed(obj, source)) is not None:
+            return self._class_pins(constructed, method)
+        if obj.type != "identifier":
+            return None
+        receiver = _text(obj, source)
+        if receiver in scope.types:
+            return self._typed_pins(scope.types[receiver], method)
+        if receiver in scope.params:
+            return None  # an untyped parameter shadows any import of its name
+        binding = self.bindings.get(receiver)
+        if binding is not None:
+            return list(binding.pins) if binding.pins is not None else []
+        if receiver in self.classes:
+            return self._class_pins(receiver, method)
+        if receiver in STOP_TYPES["js"]:
+            return []
+        return None
+
+    def _typed_pins(self, types: list[str], method: str) -> list[str] | None:
+        found = [pins for name in types if (pins := self._class_pins(name, method)) is not None]
+        return sorted({pin for pins in found for pin in pins}) if found else None
+
+    def resolve(self, func: Node, scope: _Scope) -> list[tuple[str, str | None, bool]]:
+        source = self.source
+        if func.type == "identifier":
+            name = _text(func, source)
+            if name in scope.params:
+                return []  # calling a parameter: it shadows any function of its name
+            if name in self.defined:
+                return [(name, self.file_path, False)]
+            binding = self.bindings.get(name)
+            if binding is not None:
+                return [(binding.name, pin, False) for pin in binding.pins or ()]
+            if self.script and name not in _JS_GLOBALS:
+                return [(name, None, False)]  # a classic script's globals are shared
+            return []
+        if func.type != "member_expression":
+            return []
+        obj, prop = func.child_by_field_name("object"), func.child_by_field_name("property")
+        if obj is None or prop is None or prop.type not in ("property_identifier", "private_property_identifier"):
+            return []
+        method = _text(prop, source)
+        pins = self._receiver_pins(obj, method, scope)
+        if pins is not None:
+            return [(method, pin, True) for pin in pins]
+        if obj.type in _LITERAL_RECEIVERS or method in STOP_METHODS["js"]:
+            return []
+        return [(method, None, True)]
+
+
+def extract_js_file(
+    source_code: str, file_path: str, repo_id: str, config: ResolverConfig | None = None
+) -> ExtractionResult:
     """Parse a JS/TS/JSX/TSX file and extract nodes and relationships.
 
     Args:
@@ -434,6 +819,8 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
             the repo root, forward-slashed (e.g. 'src/services/api.ts').
             Also used to pick the Tree-sitter grammar, by extension.
         repo_id: Repository ID for scoping nodes.
+        config: The repository's resolver configuration (its tsconfig path
+            aliases), read once per batch; None resolves no alias.
 
     Returns:
         ExtractionResult containing lists of nodes and relationships. On a
@@ -461,7 +848,7 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
     result.nodes.append(module_node)
 
     current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
-    for target, names in _extract_imports(root, source_bytes, current_dir):
+    for target, names in _extract_imports(root, source_bytes, current_dir, config, file_path):
         for _name in names:
             result.relationships.append(
                 GraphRelationship(
@@ -474,21 +861,28 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
                 )
             )
 
-    def _emit_call(caller_name: str, caller_label: str, target_name: str, caller_class: str | None = None) -> None:
-        properties = {"caller_class": caller_class} if caller_class else None
-        result.relationships.append(
-            GraphRelationship(
-                from_label=caller_label,
-                from_name=caller_name,
-                rel_type="CALLS",
-                to_label="Function",
-                to_name=target_name,
-                repo_id=repo_id,
-                properties=properties,
-            )
-        )
+    bindings, module = _bindings(root, source_bytes, current_dir, config, file_path)
+    resolver = _CallResolver(
+        file_path, bindings, _class_table(root, source_bytes), _defined_functions(root, source_bytes),
+        not module, source_bytes,
+    )
+    # (caller label, caller name) -> callee name -> [pins, bare?, caller classes, every bare site a member call?]
+    calls: dict[tuple[str, str], dict[str, list]] = {}
 
-    def _try_visit_definition(node: Node, parent_name: str | None, parent_label: str) -> bool:
+    def record_calls(caller_label: str, caller_name: str, body: Node, scope: _Scope, caller_class: str | None) -> None:
+        by_name = calls.setdefault((caller_label, caller_name), {})
+        for func in _call_functions(body):
+            for name, pin, member in resolver.resolve(func, scope):
+                entry = by_name.setdefault(name, [set(), False, set(), True])
+                if pin is None:
+                    entry[1] = True
+                    entry[3] = entry[3] and member
+                else:
+                    entry[0].add(pin)
+                if caller_class:
+                    entry[2].add(caller_class)
+
+    def _try_visit_definition(node: Node, parent_name: str | None, parent_label: str, scope: _Scope) -> bool:
         """If `node` (a statement) is a class/function/named-function-const
         definition, visit it as such and return True. Otherwise return False
         without touching calls - the caller decides what a non-definition
@@ -503,12 +897,12 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
             target = decl
 
         if target.type in _CLASS_TYPES:
-            _visit_class(target, parent_name, parent_label, node)
+            _visit_class(target, parent_name, parent_label, node, scope)
             return True
         if target.type in ("function_declaration", "generator_function_declaration"):
             name_node = target.child_by_field_name("name")
             if name_node is not None:
-                _visit_function(target, parent_name, parent_label, node, name_node)
+                _visit_function(target, parent_name, parent_label, node, name_node, scope)
                 return True
             return False
         if target.type in ("lexical_declaration", "variable_declaration"):
@@ -526,31 +920,30 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
                     and value_node.type in _FUNCTION_VALUE_TYPES
                 )
                 if is_named_fn:
-                    _visit_variable_declarator(decl_node, parent_name, parent_label, node if first else None)
+                    _visit_variable_declarator(decl_node, parent_name, parent_label, node if first else None, scope)
                     handled = True
                 first = False
             return handled
         return False
 
-    def _visit_statement(node: Node, parent_name: str | None, parent_label: str) -> None:
+    def _visit_statement(node: Node, parent_name: str | None, parent_label: str, scope: _Scope) -> None:
         """Visit a Module-top-level statement: definitions become Class/
         Function nodes; anything else is scanned for call expressions
         attributed to the enclosing Module (mirrors the Python extractor's
         module-level-statement handling, e.g. `setup();` at top level).
         """
-        if _try_visit_definition(node, parent_name, parent_label):
+        if _try_visit_definition(node, parent_name, parent_label, scope):
             return
         if node.type == "export_statement":
             return  # declaration-less export - nothing left to scan for calls
         caller_class = parent_name if parent_label == "Class" else None
-        for call_target in _extract_call_targets(node, source_bytes):
-            _emit_call(parent_name if parent_name else file_path, parent_label, call_target, caller_class)
+        record_calls(parent_label, parent_name if parent_name else file_path, node, scope, caller_class)
 
-    def _visit_nested_defs(container: Node, parent_name: str, parent_label: str) -> None:
+    def _visit_nested_defs(container: Node, parent_name: str, parent_label: str, scope: _Scope) -> None:
         """Visit a function body's direct statement children for nested
         named function/class/const-arrow definitions only - NOT a general
         call-scanning pass, since the caller (`_visit_function`) already ran
-        `_extract_call_targets` over the whole body once, recursively
+        `record_calls` over the whole body once, recursively
         (excluding nested scopes). Re-scanning non-definition statements
         here would double-emit CALLS edges for that body's top-level calls.
         Only direct children are checked (not statements nested inside an
@@ -558,10 +951,10 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
         extractor has for nested `def`s.
         """
         for node in container.named_children:
-            _try_visit_definition(node, parent_name, parent_label)
+            _try_visit_definition(node, parent_name, parent_label, scope)
 
     def _visit_variable_declarator(
-        decl_node: Node, parent_name: str | None, parent_label: str, doc_anchor: Node | None
+        decl_node: Node, parent_name: str | None, parent_label: str, doc_anchor: Node | None, scope: _Scope
     ) -> None:
         name_node = decl_node.child_by_field_name("name")
         value_node = decl_node.child_by_field_name("value")
@@ -570,9 +963,9 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
         if value_node.type in _FUNCTION_VALUE_TYPES:
             # doc_anchor is None for a non-first declarator in a multi-name
             # `const a = ..., b = ...` statement - no JSDoc attributed to it.
-            _visit_function(value_node, parent_name, parent_label, doc_anchor or value_node, name_node)
+            _visit_function(value_node, parent_name, parent_label, doc_anchor or value_node, name_node, scope)
 
-    def _visit_class(node: Node, parent_name: str | None, parent_label: str, doc_anchor: Node) -> None:
+    def _visit_class(node: Node, parent_name: str | None, parent_label: str, doc_anchor: Node, scope: _Scope) -> None:
         name_node = node.child_by_field_name("name")
         if name_node is None:
             return
@@ -620,11 +1013,12 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
         body_node = node.child_by_field_name("body")
         if body_node is None:
             return
+        class_scope = _Scope(class_name, scope.params, scope.types)
         for member in body_node.named_children:
             if member.type == "method_definition":
                 m_name_node = member.child_by_field_name("name")
                 if m_name_node is not None and m_name_node.type == "property_identifier":
-                    _visit_function(member, class_name, "Class", member, m_name_node)
+                    _visit_function(member, class_name, "Class", member, m_name_node, class_scope)
             elif member.type in ("field_definition", "public_field_definition"):
                 f_name_node = member.child_by_field_name("property")
                 value_node = member.child_by_field_name("value")
@@ -634,10 +1028,10 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
                     and value_node is not None
                     and value_node.type in _FUNCTION_VALUE_TYPES
                 ):
-                    _visit_function(value_node, class_name, "Class", member, f_name_node)
+                    _visit_function(value_node, class_name, "Class", member, f_name_node, class_scope)
 
     def _visit_function(
-        node: Node, parent_name: str | None, parent_label: str, doc_anchor: Node, name_node: Node
+        node: Node, parent_name: str | None, parent_label: str, doc_anchor: Node, name_node: Node, scope: _Scope
     ) -> None:
         func_name = _text(name_node, source_bytes)
 
@@ -673,8 +1067,9 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
             return
 
         caller_class = parent_name if parent_label == "Class" else None
-        for call_target in _extract_call_targets(body_node, source_bytes):
-            _emit_call(func_name, "Function", call_target, caller_class)
+        params, param_types, _fields = _parameters(node, source_bytes)
+        inner = scope.nested(params, {**param_types, **_local_types(body_node, source_bytes)})
+        record_calls("Function", func_name, body_node, inner, caller_class)
 
         # Nested function/class declarations - only meaningful when the body
         # is an actual statement block; a concise arrow body (`() => expr`)
@@ -682,10 +1077,17 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
         # _visit_nested_defs (definitions only), NOT _visit_statement, since
         # the call scan above already covers every call in this body.
         if body_node.type == "statement_block":
-            _visit_nested_defs(body_node, func_name, "Function")
+            _visit_nested_defs(body_node, func_name, "Function", inner)
 
+    module_scope = _Scope(types=_local_types(root, source_bytes))
     for node in root.named_children:
-        _visit_statement(node, None, "Module")
+        _visit_statement(node, None, "Module", module_scope)
+    for (caller_label, caller_name), by_name in sorted(calls.items()):
+        for name, (pins, bare, classes, no_self) in sorted(by_name.items()):
+            result.relationships.extend(call_rows(
+                caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id,
+                no_self=no_self,
+            ))
 
     return own_edges(result, file_path)
 

@@ -26,6 +26,7 @@ from pathlib import Path
 import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
+from devgraph.indexer.calls import STOP_METHODS, call_rows
 from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
 from devgraph.indexer.python.resolve import Bindings, absolute_module, relative_module
 
@@ -109,27 +110,6 @@ def _pure_dotted(node: Node, source: bytes) -> str | None:
             return f"{head}.{_text(attr, source)}"
     return None
 
-
-#: Methods of the builtin container, text and file types. A call of one of
-#: these on a receiver nothing types is almost always on a builtin value, so
-#: it links nothing rather than every same-named function in the repository.
-_BUILTIN_TYPE_METHODS = frozenset({
-    # dict
-    "get", "items", "keys", "values", "update", "pop", "popitem", "setdefault", "copy", "clear", "fromkeys",
-    # list
-    "append", "extend", "insert", "remove", "index", "count", "sort", "reverse",
-    # str / bytes
-    "join", "split", "rsplit", "splitlines", "strip", "lstrip", "rstrip", "format", "format_map", "replace",
-    "startswith", "endswith", "lower", "upper", "casefold", "title", "capitalize", "encode", "decode", "find",
-    "rfind", "partition", "rpartition", "zfill", "ljust", "rjust", "center", "removeprefix", "removesuffix",
-    "isdigit", "isalpha", "isalnum", "isspace", "isidentifier", "islower", "isupper", "expandtabs", "translate",
-    "hex",
-    # set
-    "add", "discard", "union", "intersection", "difference", "symmetric_difference", "issubset",
-    "issuperset", "isdisjoint",
-    # io
-    "read", "write", "readline", "readlines", "writelines", "seek", "tell", "flush", "close", "truncate",
-})
 
 #: Receivers that are literals: `"".join(...)`, `{}.get(...)`.
 _LITERAL_RECEIVERS = frozenset({
@@ -508,7 +488,7 @@ class _CallResolver:
             pins = self._class_pins(constructor, attr)  # `Fake().run()`
             if pins is not None:
                 return [(attr, pin) for pin in pins]
-        if obj.type in _LITERAL_RECEIVERS or attr in _BUILTIN_TYPE_METHODS:
+        if obj.type in _LITERAL_RECEIVERS or attr in STOP_METHODS["python"]:
             return []
         return [(attr, None)]
 
@@ -903,44 +883,13 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
     for (caller_label, caller_name), by_name in sorted(calls.items()):
         for name, (pins, bare, classes) in sorted(by_name.items()):
             result.relationships.extend(
-                _call_rows(caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id)
+                call_rows(
+                    caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id,
+                    no_self=True,  # every bare Python call site is `x.m()` on an untyped receiver
+                )
             )
 
     return own_edges(result, file_path)
-
-
-def _call_rows(
-    caller_label: str,
-    caller_name: str,
-    name: str,
-    pins: set[str],
-    bare: bool,
-    caller_class: str | None,
-    file_path: str,
-    repo_id: str,
-) -> list[GraphRelationship]:
-    """One caller's CALLS rows to one callee name, every call site to it
-    collapsed together, so no two rows can meet in one edge with different
-    properties: a row per file pin ("resolved"), a row per package directory
-    ("package", leaving out the file pins and this file), or else, when no
-    call site resolved, one bare-name row ("name"). `caller_class` is the
-    least of the call sites' enclosing classes."""
-
-    def row(to_file: str | None, confidence: str, exact: list[str] | None = None) -> GraphRelationship:
-        properties = {"confidence": confidence}
-        if caller_class:
-            properties["caller_class"] = caller_class
-        return GraphRelationship(
-            from_label=caller_label, from_name=caller_name, rel_type="CALLS", to_label="Function", to_name=name,
-            repo_id=repo_id, properties=properties, to_file=to_file, exact=exact,
-        )
-
-    files = sorted(pin for pin in pins if not pin.endswith("/"))
-    dirs = sorted(pin for pin in pins if pin.endswith("/"))
-    if not files and not dirs:
-        return [row(None, "name")] if bare else []
-    excluded = sorted(set(files) | {file_path})
-    return [row(f, "resolved") for f in files] + [row(d, "package", excluded) for d in dirs]
 
 
 def index_file(

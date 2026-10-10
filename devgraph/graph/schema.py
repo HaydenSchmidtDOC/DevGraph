@@ -158,7 +158,8 @@ def lookup_index_statements() -> list[str]:
     edge's target end, `describe_node`) can't seek, so without these it
     scans every node of the label; the same on Cache, which has no
     constraint (named so it never reads as a user type's generated index).
-    Then the provenance indexes a per-file re-index seeks (`(repo_id, file)`,
+    Module's `(repo_id, dir)` and `(repo_id, basename)`, which a pinned
+    IMPORTS row seeks (see engine._end_match). Then the provenance indexes a per-file re-index seeks (`(repo_id, file)`,
     `(repo_id, source_file)`, `(repo_id, source)` on FILE_LABELS,
     SOURCE_FILE_LABELS, CLAIMED_LABELS), so its cost follows the file, not
     the whole database. Idempotent, like
@@ -170,6 +171,10 @@ def lookup_index_statements() -> list[str]:
         for label in FILE_SCOPED_LABELS
     ]
     statements.append("CREATE INDEX cache_repo_name_index IF NOT EXISTS FOR (n:Cache) ON (n.repo_id, n.name)")
+    statements += [
+        f"CREATE INDEX module_repo_{prop}_lookup IF NOT EXISTS FOR (n:Module) ON (n.repo_id, n.{prop})"
+        for prop in ("dir", "basename")
+    ]
     for prop, labels in (("file", FILE_LABELS), ("source_file", SOURCE_FILE_LABELS), ("source", CLAIMED_LABELS)):
         statements += [
             f"CREATE INDEX {label.lower()}_repo_{prop}_lookup IF NOT EXISTS FOR (n:{label}) ON (n.repo_id, n.{prop})"
@@ -187,3 +192,63 @@ NAME_REF_SEP = "\x1f"
 NAME_REF_PIN_SEP = "\x1e"
 #: A target pin to the file-less node ("" as a `to_file`).
 NAME_REF_FILELESS = "\x1d"
+
+
+# Path pins: a relationship row's `to_file` (see devgraph/indexer/common.py
+# `pin_matches`, which the engine's Cypher mirrors). Kept here, with no
+# imports, for the same reason as the name_refs encoding above.
+#: Path pin kinds, highest precedence first.
+PIN_KINDS: tuple[str, ...] = ("file", "dir", "suffix", "suffix_dir", "prefix")
+#: Every pin kind's edge confidence: a pin's confidence never depends on the
+#: other pins it was written with.
+PIN_CONFIDENCE: dict[str, str] = {
+    "file": "resolved", "dir": "resolved", "suffix": "package", "suffix_dir": "package", "prefix": "package",
+}
+
+
+def _is_path_pin(pin: str) -> bool:
+    return pin == "." or pin.startswith("/") or pin.endswith(("/", "/."))
+
+
+def split_pin(pin: str) -> tuple[str, str]:
+    """A pin and the suffix its files must not end with (`go/b/.!_test.go`
+    is `go/b/.` less `_test.go`), "" when it has none. Only a path pin (no
+    repository-relative path is `.`, starts with "/" or ends with "/" or
+    "/.") takes a suffix, so a file named `a!b.go` stays a file pin. A path
+    pin whose own path holds a "!" (a directory named `x!y`) would be split
+    there, so it is not supported: a resolver never emits one (see
+    jsts/extractor.py `_specifier_pins`)."""
+    base, bang, suffix = pin.rpartition("!")
+    if bang and _is_path_pin(base):
+        return base, suffix
+    return pin, ""
+
+
+def pin_kind(pin: str | None) -> str:
+    """How a `to_file` matches: "name" (None: by name alone), "fileless" (""),
+    "file", "dir" (`a/b/.`: files directly in a/b/; `.`: the root's files),
+    "suffix" (`/a/b/C.java`: files whose "/"-prefixed path ends with it),
+    "suffix_dir" (`/a/b/.`: files directly in any directory ending /a/b/) or
+    "prefix" (`a/b/`: files anywhere under a/b/)."""
+    if pin is None:
+        return "name"
+    base, _suffix = split_pin(pin)
+    if base == "":
+        return "fileless"
+    if base == "." or base.endswith("/."):
+        return "suffix_dir" if base.startswith("/") else "dir"
+    if base.startswith("/"):
+        return "suffix"
+    return "prefix" if base.endswith("/") else "file"
+
+
+def pin_value(pin: str) -> dict[str, str]:
+    """A path pin as the map the engine's Cypher tests (`k` its kind, `v` the
+    path, directory or suffix it tests, `ns` the suffix a file must not end
+    with): a directory pin's `v` is the directory with its trailing "/"
+    ("" for the root), so `dir` and `suffix_dir` drop the final "."."""
+    base, suffix = split_pin(pin)
+    kind = pin_kind(pin)
+    value = base[:-1] if kind in ("dir", "suffix_dir") else base
+    return {"k": kind, "v": value, "ns": suffix}
+

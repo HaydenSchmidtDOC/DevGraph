@@ -1,0 +1,383 @@
+{
+  "language": "kotlin",
+  "description": "Kotlin/Gradle notes app with an omitted root package directory, top-level and extension functions imported across packages, and adjacent one-line class bodies.",
+  "calls": [
+    {
+      "caller": "main",
+      "caller_file": "src/main/kotlin/Main.kt",
+      "callee": "create",
+      "callee_file": "src/main/kotlin/data/NoteRepository.kt",
+      "note": "typed-local"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main/kotlin/Main.kt",
+      "callee": "add",
+      "callee_file": "src/main/kotlin/tags/Tags.kt",
+      "note": "typed-local"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main/kotlin/Main.kt",
+      "callee": "slugify",
+      "callee_file": "src/main/kotlin/util/Text.kt",
+      "note": "string-template"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main/kotlin/Main.kt",
+      "callee": "formatStamp",
+      "callee_file": "src/main/kotlin/Format.kt",
+      "note": "same-package-top-level"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main/kotlin/Main.kt",
+      "callee": "export",
+      "callee_file": "src/main/kotlin/export/MarkdownExporter.kt"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main/kotlin/Main.kt",
+      "callee": "all",
+      "callee_file": "src/main/kotlin/data/NoteRepository.kt",
+      "note": "typed-local"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main/kotlin/Main.kt",
+      "callee": "runReport",
+      "callee_file": "src/main/kotlin/report/Report.kt",
+      "note": "top-level-import"
+    },
+    {
+      "caller": "create",
+      "caller_file": "src/main/kotlin/data/NoteRepository.kt",
+      "callee": "nextId",
+      "callee_file": "src/main/kotlin/data/NoteRepository.kt"
+    },
+    {
+      "caller": "create",
+      "caller_file": "src/main/kotlin/data/NoteRepository.kt",
+      "callee": "now",
+      "callee_file": "src/main/kotlin/util/Clock.kt",
+      "note": "primary-ctor-property"
+    },
+    {
+      "caller": "elapsed",
+      "caller_file": "src/main/kotlin/util/Clock.kt",
+      "callee": "now",
+      "callee_file": "src/main/kotlin/util/Clock.kt",
+      "note": "one-line-classes"
+    },
+    {
+      "caller": "runReport",
+      "caller_file": "src/main/kotlin/report/Report.kt",
+      "callee": "now",
+      "callee_file": "src/main/kotlin/util/Clock.kt"
+    },
+    {
+      "caller": "runReport",
+      "caller_file": "src/main/kotlin/report/Report.kt",
+      "callee": "all",
+      "callee_file": "src/main/kotlin/data/NoteRepository.kt",
+      "note": "typed-param"
+    },
+    {
+      "caller": "runReport",
+      "caller_file": "src/main/kotlin/report/Report.kt",
+      "callee": "isStale",
+      "callee_file": "src/main/kotlin/data/NoteExt.kt",
+      "note": "extension-import"
+    },
+    {
+      "caller": "runReport",
+      "caller_file": "src/main/kotlin/report/Report.kt",
+      "callee": "truncate",
+      "callee_file": "src/main/kotlin/util/Text.kt",
+      "note": "top-level-import"
+    },
+    {
+      "caller": "runReport",
+      "caller_file": "src/main/kotlin/report/Report.kt",
+      "callee": "summary",
+      "callee_file": "src/main/kotlin/data/Note.kt"
+    },
+    {
+      "caller": "export",
+      "caller_file": "src/main/kotlin/export/MarkdownExporter.kt",
+      "callee": "line",
+      "callee_file": "src/main/kotlin/export/MarkdownExporter.kt"
+    },
+    {
+      "caller": "line",
+      "caller_file": "src/main/kotlin/export/MarkdownExporter.kt",
+      "callee": "truncate",
+      "callee_file": "src/main/kotlin/util/Text.kt",
+      "note": "wildcard"
+    },
+    {
+      "caller": "line",
+      "caller_file": "src/main/kotlin/export/MarkdownExporter.kt",
+      "callee": "slugify",
+      "callee_file": "src/main/kotlin/util/Text.kt",
+      "note": "wildcard"
+    },
+    {
+      "caller": "createsSequentialIds",
+      "caller_file": "src/test/kotlin/data/NoteRepositoryTest.kt",
+      "callee": "create",
+      "callee_file": "src/main/kotlin/data/NoteRepository.kt",
+      "note": "test-same-package"
+    },
+    {
+      "caller": "slugifies",
+      "caller_file": "src/test/kotlin/util/TextTest.kt",
+      "callee": "slugify",
+      "callee_file": "src/main/kotlin/util/Text.kt",
+      "note": "test-same-package"
+    }
+  ],
+  "imports": [
+    {
+      "from_file": "src/main/kotlin/Main.kt",
+      "to_file": "src/main/kotlin/data/NoteRepository.kt"
+    },
+    {
+      "from_file": "src/main/kotlin/Main.kt",
+      "to_file": "src/main/kotlin/export/MarkdownExporter.kt"
+    },
+    {
+      "from_file": "src/main/kotlin/Main.kt",
+      "to_file": "src/main/kotlin/report/Report.kt",
+      "kind": "top-level-function",
+      "note": "top-level-import"
+    },
+    {
+      "from_file": "src/main/kotlin/Main.kt",
+      "to_file": "src/main/kotlin/tags/Tags.kt"
+    },
+    {
+      "from_file": "src/main/kotlin/Main.kt",
+      "to_file": "src/main/kotlin/util/Text.kt",
+      "kind": "top-level-function",
+      "note": "top-level-import"
+    },
+    {
+      "from_file": "src/main/kotlin/data/NoteRepository.kt",
+      "to_file": "src/main/kotlin/util/Clock.kt"
+    },
+    {
+      "from_file": "src/main/kotlin/report/Report.kt",
+      "to_file": "src/main/kotlin/data/NoteRepository.kt"
+    },
+    {
+      "from_file": "src/main/kotlin/report/Report.kt",
+      "to_file": "src/main/kotlin/data/NoteExt.kt",
+      "kind": "top-level-function",
+      "note": "extension-import"
+    },
+    {
+      "from_file": "src/main/kotlin/report/Report.kt",
+      "to_file": "src/main/kotlin/util/Clock.kt"
+    },
+    {
+      "from_file": "src/main/kotlin/report/Report.kt",
+      "to_file": "src/main/kotlin/util/Text.kt",
+      "kind": "top-level-function",
+      "note": "top-level-import"
+    },
+    {
+      "from_file": "src/main/kotlin/export/MarkdownExporter.kt",
+      "to_file": "src/main/kotlin/data/Note.kt"
+    },
+    {
+      "from_file": "src/main/kotlin/export/MarkdownExporter.kt",
+      "to_file": "src/main/kotlin/util/Text.kt",
+      "kind": "wildcard",
+      "note": "wildcard"
+    },
+    {
+      "from_file": "src/main/kotlin/export/MarkdownExporter.kt",
+      "to_file": "src/main/kotlin/util/Clock.kt",
+      "kind": "wildcard",
+      "note": "wildcard"
+    }
+  ],
+  "no_edge": [
+    {
+      "caller": "main",
+      "caller_file": "src/main/kotlin/Main.kt",
+      "callee": "println"
+    },
+    {
+      "caller": "create",
+      "caller_file": "src/main/kotlin/data/NoteRepository.kt",
+      "callee": "add",
+      "note": "stdlib-collection"
+    },
+    {
+      "caller": "all",
+      "caller_file": "src/main/kotlin/data/NoteRepository.kt",
+      "callee": "toList"
+    },
+    {
+      "caller": "find",
+      "caller_file": "src/main/kotlin/data/NoteRepository.kt",
+      "callee": "firstOrNull"
+    },
+    {
+      "caller": "summary",
+      "caller_file": "src/main/kotlin/data/Note.kt",
+      "callee": "take"
+    },
+    {
+      "caller": "slugify",
+      "caller_file": "src/main/kotlin/util/Text.kt",
+      "callee": "trim"
+    },
+    {
+      "caller": "slugify",
+      "caller_file": "src/main/kotlin/util/Text.kt",
+      "callee": "lowercase"
+    },
+    {
+      "caller": "slugify",
+      "caller_file": "src/main/kotlin/util/Text.kt",
+      "callee": "replace"
+    },
+    {
+      "caller": "truncate",
+      "caller_file": "src/main/kotlin/util/Text.kt",
+      "callee": "take"
+    },
+    {
+      "caller": "now",
+      "caller_file": "src/main/kotlin/util/Clock.kt",
+      "callee": "currentTimeMillis"
+    },
+    {
+      "caller": "runReport",
+      "caller_file": "src/main/kotlin/report/Report.kt",
+      "callee": "println"
+    },
+    {
+      "caller": "add",
+      "caller_file": "src/main/kotlin/tags/Tags.kt",
+      "callee": "add",
+      "note": "stdlib-collection"
+    },
+    {
+      "caller": "add",
+      "caller_file": "src/main/kotlin/tags/Tags.kt",
+      "callee": "lowercase"
+    },
+    {
+      "caller": "has",
+      "caller_file": "src/main/kotlin/tags/Tags.kt",
+      "callee": "lowercase"
+    },
+    {
+      "caller": "export",
+      "caller_file": "src/main/kotlin/export/MarkdownExporter.kt",
+      "callee": "append"
+    },
+    {
+      "caller": "export",
+      "caller_file": "src/main/kotlin/export/MarkdownExporter.kt",
+      "callee": "toString"
+    },
+    {
+      "caller": "createsSequentialIds",
+      "caller_file": "src/test/kotlin/data/NoteRepositoryTest.kt",
+      "callee": "assertEquals"
+    },
+    {
+      "caller": "slugifies",
+      "caller_file": "src/test/kotlin/util/TextTest.kt",
+      "callee": "assertEquals"
+    }
+  ],
+  "symbols": [
+    {
+      "name": "Clock",
+      "file": "src/main/kotlin/util/Clock.kt",
+      "kind": "class"
+    },
+    {
+      "name": "now",
+      "file": "src/main/kotlin/util/Clock.kt",
+      "kind": "function"
+    },
+    {
+      "name": "Stopwatch",
+      "file": "src/main/kotlin/util/Clock.kt",
+      "kind": "class"
+    },
+    {
+      "name": "elapsed",
+      "file": "src/main/kotlin/util/Clock.kt",
+      "kind": "function"
+    },
+    {
+      "name": "Tag",
+      "file": "src/main/kotlin/tags/TagModels.kt",
+      "kind": "class"
+    },
+    {
+      "name": "label",
+      "file": "src/main/kotlin/tags/TagModels.kt",
+      "kind": "function"
+    },
+    {
+      "name": "TagIndex",
+      "file": "src/main/kotlin/tags/TagModels.kt",
+      "kind": "class"
+    },
+    {
+      "name": "size",
+      "file": "src/main/kotlin/tags/TagModels.kt",
+      "kind": "function"
+    },
+    {
+      "name": "main",
+      "file": "src/main/kotlin/Main.kt",
+      "kind": "function"
+    },
+    {
+      "name": "formatStamp",
+      "file": "src/main/kotlin/Format.kt",
+      "kind": "function"
+    },
+    {
+      "name": "isStale",
+      "file": "src/main/kotlin/data/NoteExt.kt",
+      "kind": "function"
+    },
+    {
+      "name": "slugify",
+      "file": "src/main/kotlin/util/Text.kt",
+      "kind": "function"
+    },
+    {
+      "name": "truncate",
+      "file": "src/main/kotlin/util/Text.kt",
+      "kind": "function"
+    }
+  ],
+  "notes": {
+    "omitted-root": "Kotlin allows the directory layout to omit the common root package: src/main/kotlin/Main.kt is package com.acme.notes, src/main/kotlin/data/ is com.acme.notes.data, and so on. Test sources under src/test/kotlin follow the same omission.",
+    "one-line-classes": "util/Clock.kt and tags/TagModels.kt put two classes on adjacent lines, each with a one-line body (`class Clock { fun now(): Long = ... }`), the second with a modifier (`internal class`, `data class`). All their classes and functions must be extracted (see `symbols`). `Clock().now()` in Stopwatch.elapsed is Clock.now in the same file (Clock() is a constructor call, not listed).",
+    "string-template": "`\"Created ${ slugify(note.title) } at ${formatStamp(note.createdAt)}\"`: calls inside `${ }` (with and without inner spaces) are real calls.",
+    "same-package-top-level": "formatStamp is a top-level function in Format.kt, package com.acme.notes (same package as Main.kt): no import needed.",
+    "top-level-import": "`import com.acme.notes.util.slugify` / `truncate` / `com.acme.notes.report.runReport` import top-level functions; the compiler binds each to the one file that declares it (util/Text.kt, report/Report.kt). IMPORTS goes to that file.",
+    "extension-import": "`note.isStale(now)` looks like a member call but Note has no isStale member; it is the extension function imported by `import com.acme.notes.data.isStale`, declared in data/NoteExt.kt.",
+    "wildcard": "`import com.acme.notes.util.*` brings in slugify and truncate (Text.kt); IMPORTS lists every file of that package (Text.kt, Clock.kt).",
+    "primary-ctor-property": "`class NoteRepository(private val clock: Clock = Clock())`: `clock.now()` is Clock.now.",
+    "typed-local": "`val repo = NoteRepository()` / `val tags = TagSet()` type the locals.",
+    "typed-param": "`repo: NoteRepository` parameter.",
+    "stdlib-collection": "`notes.add(note)` / `tags.add(...)` are MutableList/MutableSet.add. TagSet.add calling tags.add must not self-loop, and NoteRepository.create's notes.add must not link to TagSet.add.",
+    "test-same-package": "Test files declare the same package as the code under test, so no import is needed.",
+    "scope": "Constructor calls (`Note(...)`, `Clock()`, `TagSet()`, `MarkdownExporter()`) are not listed as calls. Lambda bodies contain no repo calls. .kts build scripts are not source."
+  }
+}

@@ -19,7 +19,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from devgraph.indexer.dispatch import catch_up, index_paths, remove_paths
+from devgraph.indexer.dispatch import (
+    catch_up,
+    index_paths,
+    remove_paths,
+    sync_resolver_config,
+)
 from devgraph.indexer.gitignore import GITIGNORE
 from devgraph.indexer.walk import RepoRootUnavailable
 
@@ -92,6 +97,11 @@ class RepoSync:
                 )
             if deleted_paths:
                 removed = remove_paths(self._engine, repo_id, repo.path, deleted_paths)
+            # A tsconfig or go.mod change re-indexes every file it can resolve differently.
+            indexed += sync_resolver_config(
+                self._engine, repo_id, repo.path, changed_paths | deleted_paths,
+                docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
+            )
             if any(Path(p).name == GITIGNORE for p in changed_paths | deleted_paths):
                 # A .gitignore edit changes which files are indexed anywhere
                 # below it: catch up, which prunes the files now ignored and

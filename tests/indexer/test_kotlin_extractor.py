@@ -236,3 +236,107 @@ fun outer() {
     # `deep` is attributed to `nested`, not `outer`.
     assert ("nested", "deep") in calls
     assert ("outer", "deep") not in calls
+
+
+# --- parse recovery (audit item 11; tree-sitter-kotlin 1.1.0) ---------------------
+
+
+def _symbols(source):
+    from devgraph.indexer.kotlin.extractor import extract_kotlin_file
+
+    result = extract_kotlin_file(source, "p/F.kt", "repo")
+    return [
+        (n.label, n.name, n.properties["start_line"], n.properties["end_line"])
+        for n in result.nodes if n.label != "Module"
+    ]
+
+
+def test_adjacent_one_line_classes_and_objects_are_all_extracted():
+    source = (
+        "package p\n\n"
+        "class Clock { fun now(): Long = System.currentTimeMillis() }\n"
+        "internal class Stopwatch { fun elapsed(start: Long) = Clock().now() - start }\n"
+        "object Reg { fun get() = 1 }\n"
+        "data class Tag(val name: String) { fun label() = \"#$name\" }\n"
+        "@Suppress(\"x\") private fun top() = Reg.get()\n"
+    )
+    assert _symbols(source) == [
+        ("Class", "Clock", 3, 3), ("Function", "now", 3, 3),
+        ("Class", "Stopwatch", 4, 4), ("Function", "elapsed", 4, 4),
+        ("Class", "Reg", 5, 5), ("Function", "get", 5, 5),
+        ("Class", "Tag", 6, 6), ("Function", "label", 6, 6),
+        ("Function", "top", 7, 7),
+    ]
+
+
+def test_a_string_template_the_patch_would_break_keeps_the_original_parse():
+    """`"${ x }"` beside one-line classes: the original tree has fewer error
+    bytes, and each class after it is recovered from its own piece, at its
+    own lines."""
+    source = (
+        "package p\n\n"
+        "fun greet(x: String) = \"hi ${ x }\"\n"
+        "class A { fun a() = 1 }\n"
+        "class B { fun b() = 2 }\n"
+        "fun top() = greet(\"y\")\n"
+    )
+    assert _symbols(source) == [
+        ("Function", "greet", 3, 3), ("Class", "A", 4, 4), ("Function", "a", 4, 4),
+        ("Class", "B", 5, 5), ("Function", "b", 5, 5), ("Function", "top", 6, 6),
+    ]
+
+
+def test_recovered_text_is_read_from_the_original_bytes():
+    from devgraph.indexer.kotlin.extractor import extract_kotlin_file
+
+    source = "package p\n\n/** Doc. */\nclass A { fun a() = b() }\nclass B { fun b() = 1 }\n"
+    result = extract_kotlin_file(source, "p/F.kt", "repo")
+    calls = {(r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}
+    assert ("a", "b") in calls
+    assert {n.name for n in result.nodes} == {"p/F.kt", "A", "a", "B", "b"}
+
+
+def test_every_kotlin_fixture_symbol_is_extracted():
+    import json
+    from pathlib import Path
+
+    from devgraph.indexer.kotlin.extractor import extract_kotlin_file
+
+    root = Path(__file__).resolve().parent.parent / "fixtures" / "callgraph" / "kotlin"
+    expected = json.loads((root / "expected.json").read_text())
+    found = set()
+    for path in root.rglob("*.kt"):
+        rel = path.relative_to(root).as_posix()
+        result = extract_kotlin_file(path.read_text(), rel, "repo")
+        found |= {(n.name, rel) for n in result.nodes if n.label in ("Class", "Function")}
+    assert {(s["name"], s["file"]) for s in expected["symbols"]} <= found
+
+
+def test_recovery_after_an_early_error_scales_with_the_file():
+    """Each recovered piece is parsed over its own byte range, not the whole
+    file, so a large file with an error near the top stays fast (a watcher
+    save re-parses it), and the result is the same every time."""
+    import time
+
+    from devgraph.indexer.kotlin.extractor import extract_kotlin_file
+
+    for source in (
+        "package p\n\n}}} oops\n" + "".join(f"class C{i} {{ fun f{i}() = {i} }}\n" for i in range(1000)),
+        "package p\n\nfun a() {\n" + "".join(f"fun f{i}() {{ g() }}\n" for i in range(2000)),
+    ):
+        started = time.perf_counter()
+        first = extract_kotlin_file(source, "p/F.kt", "repo")
+        assert time.perf_counter() - started < 3.0  # 18 s each when every piece was parsed at file length
+        assert len(first.nodes) == 2001
+        again = extract_kotlin_file(source, "p/F.kt", "repo")
+        assert [n.to_dict() for n in again.nodes] == [n.to_dict() for n in first.nodes]
+
+
+def test_recovery_stops_at_its_piece_budget():
+    from devgraph.indexer.kotlin import extractor
+
+    source = "package p\n\n)\n" + "".join(f"fun f{i}() = {i}\n" for i in range(extractor._MAX_PIECES + 50))
+    result = extractor.extract_kotlin_file(source, "p/F.kt", "repo")
+    names = {n.name for n in result.nodes if n.label == "Function"}
+    assert len(names) == extractor._MAX_PIECES
+    assert "f0" in names and f"f{extractor._MAX_PIECES}" not in names

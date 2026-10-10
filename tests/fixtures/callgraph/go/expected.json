@@ -1,0 +1,421 @@
+{
+  "language": "go",
+  "description": "Go service with a /v2 root module, a nested tools/ module, go.work, multi-file packages, build-tag variants and external test packages.",
+  "calls": [
+    {
+      "caller": "main",
+      "caller_file": "main.go",
+      "callee": "New",
+      "callee_file": "internal/store/memory.go",
+      "not_files": [
+        "cache/cache.go",
+        "cache/cache_test.go"
+      ],
+      "note": "two-News"
+    },
+    {
+      "caller": "main",
+      "caller_file": "main.go",
+      "callee": "New",
+      "callee_file": "cache/cache.go",
+      "not_files": [
+        "internal/store/memory.go",
+        "cache/cache_test.go"
+      ],
+      "note": "two-News"
+    },
+    {
+      "caller": "main",
+      "caller_file": "main.go",
+      "callee": "Format",
+      "callee_file": "money/format.go",
+      "note": "v2-module"
+    },
+    {
+      "caller": "main",
+      "caller_file": "main.go",
+      "callee": "Get",
+      "callee_file": "cache/cache.go",
+      "not_files": [
+        "internal/store/memory.go"
+      ],
+      "note": "typed-local"
+    },
+    {
+      "caller": "main",
+      "caller_file": "main.go",
+      "callee": "run",
+      "callee_file": "main.go"
+    },
+    {
+      "caller": "main",
+      "caller_file": "main.go",
+      "callee": "migrate",
+      "callee_file": "migrate.go",
+      "note": "same-package-other-file"
+    },
+    {
+      "caller": "main",
+      "caller_file": "main.go",
+      "callee": "routes",
+      "callee_file": "main.go"
+    },
+    {
+      "caller": "run",
+      "caller_file": "main.go",
+      "callee": "Warm",
+      "callee_file": "cache/cache.go",
+      "note": "typed-param"
+    },
+    {
+      "caller": "migrate",
+      "caller_file": "migrate.go",
+      "callee": "Open",
+      "callee_file": "internal/legacydb/conn.go",
+      "note": "package-name-differs-from-dir"
+    },
+    {
+      "caller": "migrate",
+      "caller_file": "migrate.go",
+      "callee": "Close",
+      "callee_file": "internal/legacydb/conn.go",
+      "note": "package-name-differs-from-dir"
+    },
+    {
+      "caller": "Get",
+      "caller_file": "internal/store/memory.go",
+      "callee": "normalize",
+      "callee_file": "internal/store/keys.go",
+      "note": "multi-file-package"
+    },
+    {
+      "caller": "Put",
+      "caller_file": "internal/store/memory.go",
+      "callee": "normalize",
+      "callee_file": "internal/store/keys.go",
+      "note": "multi-file-package"
+    },
+    {
+      "caller": "Get",
+      "caller_file": "cache/cache.go",
+      "callee": "Get",
+      "callee_file": "internal/store/memory.go",
+      "not_files": [
+        "cache/cache.go"
+      ],
+      "note": "struct-field-receiver"
+    },
+    {
+      "caller": "Warm",
+      "caller_file": "cache/cache.go",
+      "callee": "Put",
+      "callee_file": "internal/store/memory.go",
+      "note": "struct-field-receiver"
+    },
+    {
+      "caller": "Warm",
+      "caller_file": "cache/cache.go",
+      "callee": "evict",
+      "callee_file": "cache/evict_linux.go",
+      "ambiguous": true,
+      "note": "build-tags"
+    },
+    {
+      "caller": "Warm",
+      "caller_file": "cache/cache.go",
+      "callee": "evict",
+      "callee_file": "cache/evict_other.go",
+      "ambiguous": true,
+      "note": "build-tags"
+    },
+    {
+      "caller": "New",
+      "caller_file": "cache/cache_test.go",
+      "callee": "New",
+      "callee_file": "cache/cache.go",
+      "not_files": [
+        "cache/cache_test.go"
+      ],
+      "note": "external-test-package"
+    },
+    {
+      "caller": "New",
+      "caller_file": "cache/cache_test.go",
+      "callee": "New",
+      "callee_file": "internal/store/memory.go",
+      "note": "external-test-package"
+    },
+    {
+      "caller": "TestWarm",
+      "caller_file": "cache/cache_test.go",
+      "callee": "New",
+      "callee_file": "cache/cache_test.go",
+      "not_files": [
+        "cache/cache.go",
+        "internal/store/memory.go"
+      ],
+      "note": "external-test-package"
+    },
+    {
+      "caller": "TestWarm",
+      "caller_file": "cache/cache_test.go",
+      "callee": "Warm",
+      "callee_file": "cache/cache.go"
+    },
+    {
+      "caller": "TestWarm",
+      "caller_file": "cache/cache_test.go",
+      "callee": "Get",
+      "callee_file": "cache/cache.go"
+    },
+    {
+      "caller": "TestGet",
+      "caller_file": "internal/store/memory_test.go",
+      "callee": "New",
+      "callee_file": "internal/store/memory.go",
+      "note": "internal-test-package"
+    },
+    {
+      "caller": "TestGet",
+      "caller_file": "internal/store/memory_test.go",
+      "callee": "Put",
+      "callee_file": "internal/store/memory.go",
+      "note": "internal-test-package"
+    },
+    {
+      "caller": "TestGet",
+      "caller_file": "internal/store/memory_test.go",
+      "callee": "Get",
+      "callee_file": "internal/store/memory.go",
+      "note": "internal-test-package"
+    },
+    {
+      "caller": "Format",
+      "caller_file": "money/format.go",
+      "callee": "whole",
+      "callee_file": "money/round.go",
+      "note": "multi-file-package"
+    },
+    {
+      "caller": "Format",
+      "caller_file": "money/format.go",
+      "callee": "frac",
+      "callee_file": "money/round.go",
+      "note": "multi-file-package"
+    },
+    {
+      "caller": "frac",
+      "caller_file": "money/round.go",
+      "callee": "abs",
+      "callee_file": "money/round.go"
+    },
+    {
+      "caller": "main",
+      "caller_file": "tools/cmd/gen/main.go",
+      "callee": "Render",
+      "callee_file": "tools/internal/codegen/render.go",
+      "note": "nested-module"
+    },
+    {
+      "caller": "main",
+      "caller_file": "tools/cmd/gen/main.go",
+      "callee": "Format",
+      "callee_file": "money/format.go",
+      "note": "go-work"
+    },
+    {
+      "caller": "main",
+      "caller_file": "tools/cmd/gen/main.go",
+      "callee": "writeFile",
+      "callee_file": "tools/cmd/gen/main.go"
+    },
+    {
+      "caller": "Render",
+      "caller_file": "tools/internal/codegen/render.go",
+      "callee": "header",
+      "callee_file": "tools/internal/codegen/render.go"
+    }
+  ],
+  "imports": [
+    {
+      "from_file": "main.go",
+      "to_file": "cache/cache.go",
+      "kind": "package"
+    },
+    {
+      "from_file": "main.go",
+      "to_file": "cache/evict_linux.go",
+      "kind": "package",
+      "ambiguous": true
+    },
+    {
+      "from_file": "main.go",
+      "to_file": "cache/evict_other.go",
+      "kind": "package",
+      "ambiguous": true
+    },
+    {
+      "from_file": "main.go",
+      "to_file": "internal/store/memory.go",
+      "kind": "package"
+    },
+    {
+      "from_file": "main.go",
+      "to_file": "internal/store/keys.go",
+      "kind": "package"
+    },
+    {
+      "from_file": "main.go",
+      "to_file": "money/format.go",
+      "kind": "package",
+      "note": "v2-module"
+    },
+    {
+      "from_file": "main.go",
+      "to_file": "money/round.go",
+      "kind": "package",
+      "note": "v2-module"
+    },
+    {
+      "from_file": "migrate.go",
+      "to_file": "internal/legacydb/conn.go",
+      "kind": "package",
+      "note": "package-name-differs-from-dir"
+    },
+    {
+      "from_file": "cache/cache.go",
+      "to_file": "internal/store/memory.go",
+      "kind": "package"
+    },
+    {
+      "from_file": "cache/cache.go",
+      "to_file": "internal/store/keys.go",
+      "kind": "package"
+    },
+    {
+      "from_file": "cache/cache_test.go",
+      "to_file": "cache/cache.go",
+      "kind": "package",
+      "note": "external-test-package"
+    },
+    {
+      "from_file": "cache/cache_test.go",
+      "to_file": "cache/evict_linux.go",
+      "kind": "package",
+      "ambiguous": true,
+      "note": "external-test-package"
+    },
+    {
+      "from_file": "cache/cache_test.go",
+      "to_file": "cache/evict_other.go",
+      "kind": "package",
+      "ambiguous": true,
+      "note": "external-test-package"
+    },
+    {
+      "from_file": "cache/cache_test.go",
+      "to_file": "internal/store/memory.go",
+      "kind": "package"
+    },
+    {
+      "from_file": "cache/cache_test.go",
+      "to_file": "internal/store/keys.go",
+      "kind": "package"
+    },
+    {
+      "from_file": "tools/cmd/gen/main.go",
+      "to_file": "tools/internal/codegen/render.go",
+      "kind": "package",
+      "note": "nested-module"
+    },
+    {
+      "from_file": "tools/cmd/gen/main.go",
+      "to_file": "money/format.go",
+      "kind": "package",
+      "note": "go-work"
+    },
+    {
+      "from_file": "tools/cmd/gen/main.go",
+      "to_file": "money/round.go",
+      "kind": "package",
+      "note": "go-work"
+    }
+  ],
+  "no_edge": [
+    {
+      "caller": "main",
+      "caller_file": "main.go",
+      "callee": "Println"
+    },
+    {
+      "caller": "main",
+      "caller_file": "main.go",
+      "callee": "ListenAndServe"
+    },
+    {
+      "caller": "routes",
+      "caller_file": "main.go",
+      "callee": "NewRouter",
+      "note": "versioned-external"
+    },
+    {
+      "caller": "routes",
+      "caller_file": "main.go",
+      "callee": "Get",
+      "note": "versioned-external"
+    },
+    {
+      "caller": "health",
+      "caller_file": "main.go",
+      "callee": "WriteHeader"
+    },
+    {
+      "caller": "normalize",
+      "caller_file": "internal/store/keys.go",
+      "callee": "ToLower"
+    },
+    {
+      "caller": "normalize",
+      "caller_file": "internal/store/keys.go",
+      "callee": "TrimSpace"
+    },
+    {
+      "caller": "Format",
+      "caller_file": "money/format.go",
+      "callee": "Sprintf"
+    },
+    {
+      "caller": "writeFile",
+      "caller_file": "tools/cmd/gen/main.go",
+      "callee": "WriteFile"
+    },
+    {
+      "caller": "TestWarm",
+      "caller_file": "cache/cache_test.go",
+      "callee": "Errorf"
+    },
+    {
+      "caller": "TestGet",
+      "caller_file": "internal/store/memory_test.go",
+      "callee": "Fatal"
+    }
+  ],
+  "notes": {
+    "v2-module": "The root module is `example.com/shop/v2`, so in-repo import paths carry `/v2/` in the middle (`example.com/shop/v2/money` -> money/). There is no v2/ directory.",
+    "versioned-external": "`github.com/go-chi/chi/v5` is external; its package name is `chi` (the /v5 suffix is a major-version element, not the name). `r.Get` is chi's Router.Get and must not link to Cache.Get or Store.Get.",
+    "two-News": "`store.New()` and `cache.New(s)` are two different functions named New, qualified by package.",
+    "typed-local": "`c := cache.New(s)` gives c type *cache.Cache, so `c.Get` is Cache.Get in cache/cache.go.",
+    "typed-param": "`c *cache.Cache` parameter.",
+    "same-package-other-file": "main.go and migrate.go are both package main in the root dir; an unqualified call binds across files of the package.",
+    "package-name-differs-from-dir": "internal/legacydb/ declares `package db`; the import is unaliased, so the identifier in migrate.go is `db` (the package clause), not `legacydb`. `conn := db.Open(...)` types conn as *db.Conn, so `conn.Close()` is Conn.Close (the only Close in the repo; a stoplist would drop it, but the language binds it).",
+    "multi-file-package": "Package store is split over memory.go and keys.go, package money over format.go and round.go; no file is named after its package. An unqualified call binds to whichever file of the package declares the name.",
+    "struct-field-receiver": "Cache.Get calls `c.s.Get(key)` where field s is *store.Store, so the target is Store.Get in internal/store/memory.go, never Cache.Get itself.",
+    "build-tags": "evict is declared in evict_linux.go (`//go:build linux`) and evict_other.go (`//go:build !linux`). Exactly one is compiled, chosen by GOOS: genuinely ambiguous at file granularity. The package-import edges to these two files carry the same flag.",
+    "external-test-package": "cache_test.go is `package cache_test` (external test package) and declares its own New helper. A bare `New()` in TestWarm is that helper; `cache.New` and `store.New` are qualified. Its import of example.com/shop/v2/cache is a real import of the package under test.",
+    "internal-test-package": "memory_test.go is `package store`, so New/Put/Get bind into the package without an import.",
+    "nested-module": "tools/ has its own go.mod (`example.com/shop/tools`), so tools/... is NOT part of the root module even though it sits under the root directory. `example.com/shop/tools/internal/codegen` -> tools/internal/codegen/.",
+    "go-work": "go.work uses both modules; tools/go.mod also replaces example.com/shop/v2 with ../, so the tools module's import of example.com/shop/v2/money resolves to the in-repo money/ package.",
+    "imports-format": "A Go import names a package (a directory). Each import is listed once per non-test .go file of the target package dir (kind `package`). Test files (_test.go) of the target are never part of the imported package.",
+    "scope": "Composite literals (`&Store{...}`) are not calls. Function values passed as arguments (`health` to r.Get) are not calls."
+  }
+}

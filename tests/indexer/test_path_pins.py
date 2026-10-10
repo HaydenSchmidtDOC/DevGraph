@@ -1,0 +1,344 @@
+"""Path pins: a relationship row's `to_file` that names a set of files (a
+directory, a path suffix, a suffix directory, a recursive prefix) rather than
+one, its confidence the pin kind's, and the precedence that gives a file two
+pins match one edge from the stronger pin. Unit checks of
+devgraph/indexer/common.py, a randomized check that the engine's Cypher
+agrees with `pin_matches`, and live writes and relinks per pin kind.
+
+See docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md
+(Engine: path pins).
+"""
+
+import random
+import uuid
+
+import pytest
+
+from devgraph.graph.engine import GraphEngine, provision_repository_schema
+from devgraph.graph.schema import pin_kind
+from devgraph.indexer import dispatch
+from devgraph.indexer.calls import call_rows, import_rows
+from devgraph.indexer.common import best_pin, module_pin_name, pin_excludes, pin_matches
+from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
+from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
+
+# --- unit ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("pin", "kind"), [
+    (None, "name"), ("", "fileless"), ("a/b.go", "file"), ("a!b.go", "file"), ("a/b/.", "dir"), (".", "dir"),
+    ("/a/B.java", "suffix"), ("/a/b/.", "suffix_dir"), ("a/b/", "prefix"), ("a/b/.!_test.go", "dir"),
+    ("/a/.!_test.go", "suffix_dir"),
+])
+def test_pin_kinds(pin, kind):
+    assert pin_kind(pin) == kind
+
+
+@pytest.mark.parametrize(("pin", "path", "matches"), [
+    ("a/b.go", "a/b.go", True), ("a/b.go", "x/a/b.go", False),
+    ("a/b/.", "a/b/c.go", True), ("a/b/.", "a/b/c/d.go", False), ("a/b/.", "x/a/b/c.go", False),
+    (".", "c.go", True), (".", "a/c.go", False),
+    ("a/b/.!_test.go", "a/b/c_test.go", False), ("a/b/.!_test.go", "a/b/c.go", True),
+    ("/a/B.java", "x/a/B.java", True), ("/a/B.java", "a/B.java", True), ("/a/B.java", "xa/B.java", False),
+    ("/a/b/.", "x/a/b/c.kt", True), ("/a/b/.", "a/b/c.kt", True), ("/a/b/.", "a/b/c/d.kt", False),
+    ("/a/b/.", "xa/b/c.kt", False),
+    ("a/b/", "a/b/c/d.py", True), ("a/b/", "a/bc/d.py", False),
+    ("", "", True), ("", "a.py", False), (None, "a.py", True),
+])
+def test_pin_matches(pin, path, matches):
+    assert pin_matches(pin, path) is matches
+
+
+def test_each_pin_leaves_out_what_a_stronger_pin_matches():
+    pins = {"lib/", "/a.py", "lib/.", "lib/a.py", "/m/."}
+    assert pin_excludes(pins, "app.py") == {
+        "lib/a.py": [],
+        "lib/.": ["lib/a.py"],
+        "/a.py": ["lib/.", "lib/a.py"],
+        "/m/.": ["/a.py", "lib/.", "lib/a.py"],
+        "lib/": ["/a.py", "/m/.", "app.py", "lib/.", "lib/a.py"],
+    }
+    assert best_pin(pins, "lib/a.py", "app.py") == "lib/a.py"
+    assert best_pin(pins, "lib/b.py", "app.py") == "lib/."
+    assert best_pin(pins, "x/a.py", "app.py") == "/a.py"
+    assert best_pin(pins, "x/m/c.py", "app.py") == "/m/."
+    assert best_pin(pins, "lib/sub/c.py", "app.py") == "lib/"
+    assert best_pin(pins, "other/c.py", "app.py") is None
+    assert best_pin({"lib/"}, "lib/x.py", "lib/x.py") is None  # a prefix never links its writer
+
+
+def test_call_rows_take_their_pin_kinds_confidence():
+    rows = call_rows("Function", "main", "f", {"lib/", "/a.py", "lib/.", "lib/a.py"}, False, None, "app.py", "r")
+    assert [(r.to_file, r.properties["confidence"], r.exclude) for r in rows] == [
+        ("lib/a.py", "resolved", None),
+        ("lib/.", "resolved", ["lib/a.py"]),
+        ("/a.py", "package", ["lib/.", "lib/a.py"]),
+        ("lib/", "package", ["/a.py", "app.py", "lib/.", "lib/a.py"]),
+    ]
+
+
+def test_a_module_pin_seeks_its_directory_or_basename():
+    assert [module_pin_name(p) for p in ("a/b/.", ".", "a/b/.!_test.go", "/a/B.java")] == ["a/b", "", "a/b", "B.java"]
+    with pytest.raises(ValueError):
+        module_pin_name("a/b/")
+
+
+def test_import_rows_collapse_a_files_imports():
+    rows = import_rows("app/A.java", "r", {"core/m/Item.java"}, {"/m/Item.java", "core/m/."})
+    assert [(r.to_name, r.to_file, (r.properties or {}).get("confidence"), r.exclude) for r in rows] == [
+        ("core/m/Item.java", None, None, None),
+        ("core/m", "core/m/.", "resolved", ["app/A.java", "core/m/Item.java"]),
+        ("Item.java", "/m/Item.java", "package", ["app/A.java", "core/m/.", "core/m/Item.java"]),
+    ]
+
+
+# --- the engine's Cypher agrees with pin_matches ----------------------------------
+
+
+@pytest.fixture
+def engine():
+    test_engine = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
+    try:
+        test_engine.verify_connectivity()
+    except Exception as e:
+        pytest.skip(f"Neo4j not available: {e}")
+    yield test_engine
+    test_engine.close()
+
+
+#: Segments that share prefixes, so `a/b/` must not match `a/bc/`.
+_SEGMENTS = ["a", "ab", "b", "bc", "m"]
+_NAMES = ["C.java", "a.py", "a_test.go", "x.go", "ab.py"]
+
+
+def _random_path(rng: random.Random) -> str:
+    return "/".join([rng.choice(_SEGMENTS) for _ in range(rng.randint(0, 3))] + [rng.choice(_NAMES)])
+
+
+def _random_pin(rng: random.Random, kinds=("file", "dir", "suffix", "suffix_dir", "prefix")) -> str:
+    folder = "/".join(rng.choice(_SEGMENTS) for _ in range(rng.randint(0, 2)))
+    name = rng.choice(_NAMES)
+    kind = rng.choice(kinds)
+    pin = {
+        "file": f"{folder}/{name}" if folder else name,
+        "dir": f"{folder}/." if folder else ".",
+        "suffix": f"/{folder}/{name}" if folder else f"/{name}",
+        "suffix_dir": f"/{folder}/." if folder else "/a/.",
+        "prefix": f"{folder}/" if folder else "b/",
+    }[kind]
+    if kind != "file" and rng.random() < 0.3:
+        pin += rng.choice(["!_test.go", "!.py"])
+    return pin
+
+
+def _random_cases(rng: random.Random, kinds, count: int) -> list[tuple[str, list[str]]]:
+    """(pin, its exclusions): files and other pins, as `pin_excludes` writes them."""
+    return [
+        (_random_pin(rng, kinds), sorted({_random_pin(rng) for _ in range(rng.randint(0, 3))}))
+        for _ in range(count)
+    ]
+
+
+def _expected(pin: str, exclude: list[str], path: str) -> bool:
+    return pin_matches(pin, path) and not any(pin_matches(other, path) for other in exclude)
+
+
+def test_the_cypher_pin_test_agrees_with_pin_matches(engine):
+    """A path pin and its exclusions, sent as `_group_rels_by_triple` sends
+    them (`pin`, `ex_files`, `ex_pins`), match in Cypher exactly the paths
+    `pin_matches` says."""
+    from devgraph.graph.engine import _group_rels_by_triple, _path_pin_conditions
+
+    rng = random.Random(11)
+    cases, expected = [], {}
+    for i, (pin, exclude) in enumerate(_random_cases(rng, ("dir", "suffix", "suffix_dir", "prefix"), 3000)):
+        path = _random_path(rng)
+        (rows,) = _group_rels_by_triple([{
+            "from_label": "Function", "from_name": "f", "rel_type": "CALLS", "to_label": "Function",
+            "to_name": "g", "repo_id": "r", "to_file": pin, "exclude": exclude,
+        }]).values()
+        cases.append({"i": i, "t": rows[0]["targets"][0], "f": path})
+        expected[i] = (pin, exclude, path, _expected(pin, exclude, path))
+    rows = engine.run_cypher(
+        "UNWIND $cases AS c WITH c, c.t AS t RETURN c.i AS i, "
+        + " AND ".join(_path_pin_conditions("t", "c.f")) + " AS m",
+        {"cases": cases},
+    )
+    wrong = [expected[row["i"]][:3] for row in rows if row["m"] is not expected[row["i"]][3]]
+    assert len(rows) == len(cases) and wrong == []
+    assert 100 < sum(e[3] for e in expected.values()) < 2900  # both outcomes well represented
+
+
+def test_module_pins_seek_by_directory_and_basename_as_pin_matches_says(engine, repo_id):
+    """Random directory and suffix pins (with exclusions) on IMPORTS rows
+    link exactly the Modules `pin_matches` names, through the `dir` and
+    `basename` seeks."""
+    from devgraph.indexer.common import module_pin_name
+
+    rng = random.Random(5)
+    paths = sorted({_random_path(rng) for _ in range(300)})
+    engine.upsert_nodes(
+        [{"label": "Module", "repo_id": repo_id, "name": p, "properties": {"source_file": p}} for p in paths]
+        + [{"label": "Module", "repo_id": repo_id, "name": "origin.kt", "properties": {"source_file": "origin.kt"}}]
+    )
+    wrong, linked = [], 0
+    for pin, exclude in _random_cases(rng, ("dir", "suffix"), 80):
+        engine.run_cypher("MATCH (:Module {repo_id: $r, name: 'origin.kt'})-[x:IMPORTS]->() DELETE x", {"r": repo_id})
+        engine.upsert_relationships([{
+            "from_label": "Module", "from_name": "origin.kt", "rel_type": "IMPORTS", "to_label": "Module",
+            "to_name": module_pin_name(pin), "repo_id": repo_id, "to_file": pin, "exclude": exclude,
+        }])
+        got = {
+            row["n"] for row in engine.run_cypher(
+                "MATCH (:Module {repo_id: $r, name: 'origin.kt'})-[:IMPORTS]->(b) RETURN b.name AS n", {"r": repo_id}
+            )
+        }
+        want = {p for p in [*paths, "origin.kt"] if _expected(pin, exclude, p)}
+        linked += bool(want)
+        if got != want:
+            wrong.append((pin, exclude, sorted(got ^ want)))
+    assert wrong == [] and linked > 20
+
+
+# --- live writes and relinks per pin kind -----------------------------------------
+
+
+@pytest.fixture
+def repo_id(engine):
+    repo = f"zz-pins-{uuid.uuid4().hex[:8]}"
+    for each in (repo, f"{repo}_fresh"):
+        engine.delete_repository(each)
+    yield repo
+    for each in (repo, f"{repo}_fresh"):
+        engine.delete_repository(each)
+
+
+def _write(root, rel, text="def f():\n    return 0\n"):
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def _inject(monkeypatch, calls=(), imports=(), files=()):
+    """app.py's `main` calls `f` through `calls` (pins) and app.py imports
+    `files` by path and `imports` (Module pins), whatever its text."""
+    real = dispatch.extract_python_file
+
+    def extract(content, rel_path, repo_id):
+        result = real(content, rel_path, repo_id)
+        if rel_path == "app.py":
+            for rel in call_rows("Function", "main", "f", set(calls), False, None, "app.py", repo_id):
+                rel.from_file = rel.origin = "app.py"
+                result.relationships.append(rel)
+            for rel in import_rows("app.py", repo_id, set(files), set(imports)):
+                rel.origin = "app.py"
+                result.relationships.append(rel)
+        return result
+
+    monkeypatch.setattr(dispatch, "extract_python_file", extract)
+
+
+def _scan(engine, repo_id, root):
+    provision_repository_schema(engine, root)
+    engine.upsert_repository(repo_id, repo_id, str(root))
+    full_scan(engine, repo_id, root)
+
+
+def _calls(engine, repo_id):
+    rows = engine.run_cypher(
+        "MATCH (:Function {repo_id: $r, name: 'main'})-[c:CALLS]->(b) RETURN b.file AS file, c.confidence AS conf",
+        {"r": repo_id},
+    )
+    return sorted((row["file"], row["conf"]) for row in rows)
+
+
+def _imports(engine, repo_id):
+    rows = engine.run_cypher(
+        "MATCH (:Module {repo_id: $r, name: 'app.py'})-[c:IMPORTS]->(b) RETURN b.name AS name, c.confidence AS conf",
+        {"r": repo_id},
+    )
+    return sorted((row["name"], row["conf"]) for row in rows)
+
+
+def _equals_fresh(engine, repo_id, root):
+    expected = fresh_snapshot(engine, repo_id, root)
+    actual = graph_snapshot(engine, repo_id)
+    if actual != expected:
+        pytest.fail("graph does not equal a fresh full_scan:\n" + snapshot_diff(expected, actual))
+
+
+@pytest.mark.parametrize(("pins", "before", "added", "after"), [
+    pytest.param(["lib/."], ["lib/a.py", "lib/sub/b.py", "other/lib/c.py", "a.py"], "lib/n.py",
+                 [("lib/a.py", "resolved"), ("lib/n.py", "resolved")], id="dir"),
+    pytest.param(["."], ["a.py", "lib/b.py"], "n.py", [("a.py", "resolved"), ("n.py", "resolved")], id="root dir"),
+    pytest.param(["lib/.!_test.py"], ["lib/a.py", "lib/a_test.py"], "lib/n_test.py", [("lib/a.py", "resolved")],
+                 id="dir less a suffix"),
+    pytest.param(["/m/Item.py"], ["x/m/Item.py", "m/Item.py", "x/m/Other.py", "xm/Item.py"], "y/z/m/Item.py",
+                 [("m/Item.py", "package"), ("x/m/Item.py", "package"), ("y/z/m/Item.py", "package")], id="suffix"),
+    pytest.param(["/m/."], ["x/m/a.py", "m/b.py", "x/m/s/c.py", "xm/d.py"], "q/m/n.py",
+                 [("m/b.py", "package"), ("q/m/n.py", "package"), ("x/m/a.py", "package")], id="suffix dir"),
+    pytest.param(["lib/a.py", "lib/.", "/a.py", "lib/"], ["lib/a.py", "lib/b.py", "x/a.py", "lib/s/c.py", "o/c.py"],
+                 "lib/s/a.py",
+                 [("lib/a.py", "resolved"), ("lib/b.py", "resolved"), ("lib/s/a.py", "package"),
+                  ("lib/s/c.py", "package"), ("x/a.py", "package")], id="precedence"),
+])
+def test_a_path_pinned_call_writes_and_relinks(engine, repo_id, tmp_path, monkeypatch, pins, before, added, after):
+    _inject(monkeypatch, calls=pins)
+    _write(tmp_path, "app.py", "def main():\n    return 0\n")
+    paths = {rel: _write(tmp_path, rel) for rel in before}
+    _scan(engine, repo_id, tmp_path)
+    linked = [(rel, conf) for rel, conf in after if rel != added]
+    assert _calls(engine, repo_id) == linked
+    _equals_fresh(engine, repo_id, tmp_path)
+
+    new = _write(tmp_path, added)
+    index_paths(engine, repo_id, tmp_path, {new})
+    assert _calls(engine, repo_id) == after
+    _equals_fresh(engine, repo_id, tmp_path)
+
+    gone = paths[before[0]]
+    gone.unlink()
+    remove_paths(engine, repo_id, tmp_path, {gone})
+    assert _calls(engine, repo_id) == [(rel, conf) for rel, conf in after if rel != before[0]]
+    _equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_module_pins_import_by_directory_and_suffix_and_relink(engine, repo_id, tmp_path, monkeypatch):
+    """A not-yet-existing class imported by suffix appears once another
+    module adds it (S2), and an anchored directory's new file is imported."""
+    _inject(monkeypatch, files={"lib/a.py"}, imports={"lib/.", "/m/Item.py"})
+    _write(tmp_path, "app.py", "def main():\n    return 0\n")
+    _write(tmp_path, "lib/a.py")
+    _write(tmp_path, "lib/b.py")
+    _write(tmp_path, "lib/sub/c.py")
+    _scan(engine, repo_id, tmp_path)
+    assert _imports(engine, repo_id) == [("lib/a.py", None), ("lib/b.py", "resolved")]
+    _equals_fresh(engine, repo_id, tmp_path)
+
+    item = _write(tmp_path, "core/src/m/Item.py")
+    index_paths(engine, repo_id, tmp_path, {item})
+    assert _imports(engine, repo_id) == [("core/src/m/Item.py", "package"), ("lib/a.py", None), ("lib/b.py", "resolved")]
+    _equals_fresh(engine, repo_id, tmp_path)
+
+    # A file matched by a path pin and by name keeps the by-name edge alone.
+    a = tmp_path / "lib/a.py"
+    a.unlink()
+    remove_paths(engine, repo_id, tmp_path, {a})
+    _write(tmp_path, "lib/a.py")
+    index_paths(engine, repo_id, tmp_path, {a, _write(tmp_path, "lib/n.py")})
+    assert _imports(engine, repo_id) == [
+        ("core/src/m/Item.py", "package"), ("lib/a.py", None), ("lib/b.py", "resolved"), ("lib/n.py", "resolved"),
+    ]
+    _equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_modules_carry_their_directory_and_basename(engine, repo_id, tmp_path):
+    _write(tmp_path, "a.py")
+    _write(tmp_path, "pkg/sub/b.py")
+    _scan(engine, repo_id, tmp_path)
+    rows = engine.run_cypher(
+        "MATCH (m:Module {repo_id: $r}) RETURN m.name AS name, m.dir AS dir, m.basename AS base ORDER BY name",
+        {"r": repo_id},
+    )
+    assert [(r["name"], r["dir"], r["base"]) for r in rows] == [("a.py", "", "a.py"), ("pkg/sub/b.py", "pkg/sub", "b.py")]

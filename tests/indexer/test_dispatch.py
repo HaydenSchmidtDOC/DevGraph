@@ -1511,8 +1511,9 @@ def test_name_refs_record_cross_file_pins_once_per_target_name():
     ])["name_refs"]
     parsed = sorted(parse_name_ref(entry) for entry in refs)
     assert parsed == [
+        # Each pin's confidence is its kind's, not one value for the entry.
         (["CALLS", "Function", "main", "app.py", "Function", "f", "C"], ["pkg.py", "pkg/", "pkg/__init__.py"],
-         "resolved"),
+         "pin"),
         (["CALLS", "Function", "main", "app.py", "Function", "g", ""], None, "name"),
     ]
 
@@ -1536,13 +1537,17 @@ def test_a_directory_pin_is_tested_before_the_fileless_pin():
     from devgraph.graph.engine import _end_match, _group_rels_by_triple, _pin
 
     assert [_pin(f) for f in (None, "", "pkg/", "pkg/a.py")] == ["name", "fileless", "prefix", "file"]
-    groups = _group_rels_by_triple([_rel("f", "pkg/a.py"), {**_rel("f", "pkg/"), "exact": ["pkg/a.py"]}])
+    groups = _group_rels_by_triple([_rel("f", "pkg/a.py"), {**_rel("f", "pkg/"), "exclude": ["pkg/a.py"]}])
     assert {key[4] for key in groups} == {"file", "prefix"}
     (prefix_row,) = groups[("Function", "CALLS", "Function", "file", "prefix")]
-    assert prefix_row["targets"] == [{"to_name": "f", "to_file": "pkg/", "exact": ["pkg/a.py"]}]
+    assert prefix_row["targets"] == [{
+        "to_name": "f", "to_file": "pkg/", "pin": {"k": "prefix", "v": "pkg/", "ns": ""},
+        "ex_files": ["pkg/a.py"], "ex_pins": [],
+    }]
     match = _end_match("b", "Function", "to", "prefix", "t")
     assert "USING INDEX SEEK b:Function(repo_id, name)" in match
-    assert "b.file STARTS WITH t.to_file AND NOT b.file IN t.exact" in match
+    assert "WHEN 'prefix' THEN b.file STARTS WITH t.pin.v" in match
+    assert "NOT b.file IN t.ex_files" in match and "NOT any(x IN t.ex_pins WHERE" in match
 
 
 def test_edges_out_of_one_source_share_a_row():

@@ -63,11 +63,13 @@ Known limitations (v1 scope, structural parity — documented, not to be
 
 from __future__ import annotations
 
+import bisect
 import logging
+import re
 from pathlib import Path
 
 import tree_sitter_kotlin as tskotlin
-from tree_sitter import Language, Node, Parser
+from tree_sitter import Language, Node, Parser, Range
 
 from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
 
@@ -84,6 +86,125 @@ _FUNCTION_TYPES = ("function_declaration",)
 
 def _make_parser() -> Parser:
     return Parser(_KOTLIN_LANGUAGE)
+
+
+# A member closing on its own line's `}` (`class A { fun a() = 1 }`): the
+# grammar wants a terminator before the brace and, without one, turns the
+# rest of the file into one error node. The patch keeps every byte offset.
+_UNTERMINATED_CLOSE = re.compile(rb"(?<=[^\s{;]) \}")
+
+# Where a top-level declaration can start at column 0: a declaration keyword,
+# a modifier, or an annotation.
+_DECLARATION_START = re.compile(
+    rb"^(?:@\w|(?:class|interface|object|fun|val|var|typealias|enum|data|sealed|abstract|open|internal|private"
+    rb"|public|protected|annotation|inline|value|const|suspend|operator|infix|tailrec|external|expect|actual"
+    rb"|override|lateinit)\b)",
+    re.MULTILINE,
+)
+
+
+def _error_cost(node: Node) -> tuple[int, int]:
+    """Bytes under error nodes (an error node's children not counted again),
+    then the zero-width tokens the parser had to invent (a missing node,
+    which a hidden token such as a member terminator leaves as an error flag
+    on its parent alone)."""
+    if node.type == "ERROR":
+        return node.end_byte - node.start_byte, 0
+    if node.is_missing:
+        return 0, 1
+    if not node.has_error:
+        return 0, 0
+    if not any(child.has_error for child in node.children):
+        return 0, 1
+    costs = [_error_cost(child) for child in node.children]
+    return sum(c[0] for c in costs), sum(c[1] for c in costs)
+
+
+#: Recovery parses at most this many pieces of a file, and at most this many
+#: times the file's bytes in all; what is left stays unrecovered. Both limits
+#: depend on the text alone, so recovery is deterministic.
+_MAX_PIECES = 5000
+_MAX_PARSED_FACTOR = 4
+
+
+def _parse_piece(parser: Parser, source: bytes, start: int, end: int, line_starts: list[int]):
+    """The tree of `source[start:end]` alone, parsed over that byte range
+    (`included_ranges`), so its nodes keep their offsets in `source` and the
+    cost follows the piece, not the file."""
+
+    def point(offset: int) -> tuple[int, int]:
+        row = bisect.bisect_right(line_starts, offset) - 1
+        return row, offset - line_starts[row]
+
+    parser.included_ranges = [Range(point(start), point(end), start, end)]
+    return parser.parse(source)
+
+
+def _better_of_two(parser: Parser, source: bytes) -> tuple:
+    """The tree of `source`, or of its `_UNTERMINATED_CLOSE` patch when that
+    has fewer bytes under error nodes (then fewer invented ones), with the
+    bytes it parsed."""
+    tree = parser.parse(source)
+    if tree.root_node.has_error:
+        patched = _UNTERMINATED_CLOSE.sub(b";}", source)
+        if patched != source:
+            other = parser.parse(patched)
+            if _error_cost(other.root_node) < _error_cost(tree.root_node):
+                return other, patched
+    return tree, source
+
+
+def _parse_kotlin(parser: Parser, source: bytes) -> tuple[Node, list[Node], list, bool]:
+    """Parse `source`, recovering what tree-sitter-kotlin 1.1.0 loses after
+    a one-line member body (audit item 11). Returns the root, its top-level
+    nodes to visit, the trees that own them (kept alive by the caller) and
+    whether every error was recovered.
+
+    1. A tree with errors is parsed again with `_UNTERMINATED_CLOSE`'s
+       same-length patch (` }` to `;}`); the tree with fewer bytes under error
+       nodes (then fewer missing ones) wins, the original on a tie (the blind patch can break a string
+       template such as `"${ x }"`).
+    2. Each top-level error node left is split at column-0 declaration
+       starts, and each piece is parsed alone over its own byte range
+       (`_parse_piece`), so its declarations keep their offsets; they are
+       visited in place of the error node (each piece patched as in 1. when
+       that helps). At most `_MAX_PIECES` pieces and `_MAX_PARSED_FACTOR`
+       times the file's bytes are parsed this way.
+
+    Every node's text is read from the original `source`: offsets never move.
+    """
+    tree, chosen = _better_of_two(parser, source)
+    trees = [tree]
+    root = tree.root_node
+    top_level: list[Node] = []
+    clean = True
+    patched = _UNTERMINATED_CLOSE.sub(b";}", chosen)
+    line_starts = [0] + [m.end() for m in re.finditer(rb"\n", chosen)]
+    piece_parser = _make_parser()
+    pieces = parsed = 0
+    for node in root.named_children:
+        if node.type != "ERROR":
+            top_level.append(node)
+            clean = clean and not node.has_error
+            continue
+        starts = [m.start() for m in _DECLARATION_START.finditer(chosen, node.start_byte, node.end_byte)]
+        clean = clean and bool(starts) and starts[0] == node.start_byte
+        for start, end in zip(starts, [*starts[1:], node.end_byte]):
+            if pieces >= _MAX_PIECES or parsed + 2 * (end - start) > _MAX_PARSED_FACTOR * len(source):
+                clean = False
+                break
+            pieces += 1
+            parsed += end - start
+            piece = _parse_piece(piece_parser, chosen, start, end, line_starts)
+            if piece.root_node.has_error and patched != chosen:
+                parsed += end - start
+                other = _parse_piece(piece_parser, patched, start, end, line_starts)
+                if _error_cost(other.root_node) < _error_cost(piece.root_node):
+                    piece = other
+            trees.append(piece)
+            clean = clean and not piece.root_node.has_error
+            top_level += [child for child in piece.root_node.named_children if child.type != "ERROR"]
+    return root, top_level, trees, clean
 
 
 def _text(node: Node, source: bytes) -> str:
@@ -354,10 +475,9 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
     source_bytes = source_code.encode("utf-8")
 
     parser = _make_parser()
-    tree = parser.parse(source_bytes)
-    root = tree.root_node
+    root, top_level, _trees, clean = _parse_kotlin(parser, source_bytes)
 
-    if root.has_error:
+    if not clean:
         logger.warning(f"Syntax errors while parsing {file_path}; extracting best-effort result")
 
     module_node = GraphNode(
@@ -524,10 +644,13 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
                         if grandchild.type == "function_declaration":
                             _visit_function(grandchild, func_name, "Function", prev_sibling=None)
 
-    def visit_block(block: Node, parent_name: str | None, parent_label: str) -> None:
-        """Visit declarations in a block (module/class/object body)."""
+    def visit_block(
+        block: Node, parent_name: str | None, parent_label: str, children: list[Node] | None = None
+    ) -> None:
+        """Visit declarations in a block (module/class/object body), or the
+        given `children` of it (the file's recovered top level)."""
         prev_sibling: Node | None = None
-        for node in block.named_children:
+        for node in block.named_children if children is None else children:
             if node.type in _TYPE_DECL_TYPES:
                 _visit_type_decl(node, parent_name, parent_label, prev_sibling)
             elif node.type in _FUNCTION_TYPES:
@@ -542,7 +665,7 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
                     _emit_call(parent_name if parent_name else file_path, parent_label, target, caller_class)
             prev_sibling = node
 
-    visit_block(root, None, "Module")
+    visit_block(root, None, "Module", top_level)
 
     return own_edges(result, file_path)
 
