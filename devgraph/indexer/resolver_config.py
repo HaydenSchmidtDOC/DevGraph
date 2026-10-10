@@ -60,14 +60,22 @@ def touches_config(rel: str, inputs: list[str]) -> bool:
     return any(each == rel or each.startswith(rel + "/") for each in inputs)
 
 
-_JSONC_TOKENS = re.compile(r'"(?:[^"\\]|\\.)*"|//[^\n]*|/\*.*?\*/|,(?=\s*[}\]])', re.DOTALL)
+_JSONC_COMMENTS = re.compile(r'"(?:[^"\\]|\\.)*"|//[^\n]*|/\*.*?\*/', re.DOTALL)
+_JSONC_TRAILING_COMMAS = re.compile(r'"(?:[^"\\]|\\.)*"|,(?=\s*[}\]])')
+
+
+def _keep_strings(match: re.Match) -> str:
+    return match.group(0) if match.group(0).startswith('"') else ""
 
 
 def parse_jsonc(text: str) -> dict | None:
     """A JSON-with-comments document (tsconfig's dialect: `//` and `/* */`
-    comments, trailing commas) as a dict; None when it is malformed or not
-    an object."""
-    stripped = _JSONC_TOKENS.sub(lambda m: m.group(0) if m.group(0).startswith('"') else "", text)
+    comments, trailing commas, a byte order mark) as a dict; None when it is
+    malformed or not an object. Comments go first, so a trailing comma
+    followed by a comment (`["a"], // x` before `}`) is still found; both
+    passes leave strings alone."""
+    stripped = _JSONC_COMMENTS.sub(_keep_strings, text.removeprefix("\ufeff"))
+    stripped = _JSONC_TRAILING_COMMAS.sub(_keep_strings, stripped)
     try:
         value = json.loads(stripped)
     except ValueError:
@@ -130,7 +138,7 @@ class ResolverConfig:
             if rel and not is_ignored_path(Path(rel)) and not is_gitignored(self.root, rel):
                 try:
                     if path.is_file() and path.stat().st_size <= _MAX_CONFIG_BYTES:
-                        text = path.read_text(encoding="utf-8", errors="replace")
+                        text = path.read_text(encoding="utf-8-sig", errors="replace")
                 except OSError:
                     text = None
             self._texts[rel] = text
@@ -141,10 +149,10 @@ class ResolverConfig:
     def _config_file(self, folder: str, target: str) -> str | None:
         """An `extends` or `references` target: a file, the same with `.json`
         added, or a directory's tsconfig.json. A package name (no leading
-        `.` or `/`) is outside the repository: None."""
-        if not target.startswith((".", "/")):
+        `.`) or an absolute path is outside the repository: None."""
+        if not target.startswith("."):
             return None
-        rel = _join(folder, target.lstrip("/") if target.startswith("/") else target)
+        rel = _join(folder, target)
         if rel is None:
             return None
         for candidate in (rel, f"{rel}.json", f"{rel}/tsconfig.json" if rel else "tsconfig.json"):
@@ -154,26 +162,37 @@ class ResolverConfig:
 
     # --- tsconfig --------------------------------------------------------------
 
-    def _ts_options(self, rel: str, seen: frozenset[str] = frozenset()) -> dict:
+    def _ts_options(self, rel: str) -> dict:
         """`rel`'s `baseUrl` and `paths`, each with the directory of the
         config that sets it, after its `extends` chain (a later base, then
-        the config itself, overriding an earlier one)."""
-        if rel in self._options:
-            return self._options[rel]
+        the config itself, overriding an earlier one). A chain that extends
+        itself is malformed, as TypeScript has it: no options. Only a whole
+        chain's result is cached, so a config read first through a cycle is
+        judged the same as one read directly."""
+        if rel not in self._options:
+            self._options[rel] = self._ts_chain(rel, frozenset()) or {}
+        return self._options[rel]
+
+    def _ts_chain(self, rel: str, seen: frozenset[str]) -> dict | None:
+        """`_ts_options` of `rel` reached through `seen`; None on a cycle."""
         merged: dict = {}
         data = parse_jsonc(self._text(rel) or "") or {}
         folder = posixpath.dirname(rel)
         extends = data.get("extends")
         for base in [extends] if isinstance(extends, str) else extends if isinstance(extends, list) else []:
-            if isinstance(base, str) and (base_rel := self._config_file(folder, base)) and base_rel not in seen:
-                merged.update(self._ts_options(base_rel, seen | {rel}))
+            if isinstance(base, str) and (base_rel := self._config_file(folder, base)):
+                if base_rel == rel or base_rel in seen:
+                    return None
+                inherited = self._ts_chain(base_rel, seen | {rel})
+                if inherited is None:
+                    return None
+                merged.update(inherited)
         options = data.get("compilerOptions")
         if isinstance(options, dict):
             if isinstance(options.get("baseUrl"), str):
                 merged["baseUrl"] = (options["baseUrl"], folder)
             if isinstance(options.get("paths"), dict):
                 merged["paths"] = (options["paths"], folder)
-        self._options[rel] = merged
         return merged
 
     def _ts_project(self, rel: str) -> _TsProject:

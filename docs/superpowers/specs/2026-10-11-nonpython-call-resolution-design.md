@@ -41,9 +41,11 @@ configuration*, declared inputs of extraction in the way a `.gitignore` is an
 input of the walk (`devgraph/indexer/resolver_config.py`):
 
 - **What is read.** For a JS/TS file, the nearest `tsconfig.json` (else
-  `jsconfig.json`) above it, parsed as JSONC (comments and trailing commas
-  allowed; a malformed file gives no aliases), with its `extends` chain and the
-  configs its `references` name followed inside the repository. `paths` and
+  `jsconfig.json`) above it, parsed as JSONC (comments, trailing commas and a
+  byte order mark allowed; a malformed file gives no aliases), with its
+  `extends` chain and the configs its `references` name followed inside the
+  repository (a package name or an absolute path is outside it; a chain that
+  extends itself is malformed). `paths` and
   `baseUrl` resolve against the config that defines them; `paths` win over
   `baseUrl`. A config under a path the walk ignores (a `.gitignore`, a
   `node_modules`) is treated as absent.

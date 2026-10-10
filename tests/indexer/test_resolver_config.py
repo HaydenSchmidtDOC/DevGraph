@@ -42,6 +42,37 @@ def test_jsonc_allows_comments_and_trailing_commas():
     assert parse_jsonc("[1]") is None
 
 
+def test_jsonc_allows_a_comment_between_a_trailing_comma_and_its_bracket():
+    assert parse_jsonc('{"paths": {"@/*": ["src/*"], // app\n}, "a": [1, /* x */ ]}') == {
+        "paths": {"@/*": ["src/*"]}, "a": [1],
+    }
+    assert parse_jsonc('{"s": ", }"}') == {"s": ", }"}  # a comma inside a string stays
+
+
+def test_a_config_with_a_byte_order_mark_keeps_its_aliases(tmp_path):
+    (tmp_path / "tsconfig.json").write_bytes(
+        "\ufeff{\"compilerOptions\": {\"paths\": {\"@/*\": [\"src/*\"]}}}".encode("utf-8")
+    )
+    assert ResolverConfig(tmp_path).ts_alias("@/a", "x.ts") == ["src/a"]
+
+
+def test_an_extends_cycle_is_malformed_whichever_config_is_read_first(tmp_path):
+    write(tmp_path, "a.json", '{"extends": "./b.json", "compilerOptions": {"baseUrl": "a"}}')
+    write(tmp_path, "b.json", '{"extends": "./a.json", "compilerOptions": {"baseUrl": "b"}}')
+    write(tmp_path, "tsconfig.json", '{"extends": "./a.json"}')
+    write(tmp_path, "web/tsconfig.json", '{"extends": "../b.json"}')
+    for first, second in (("x.ts", "web/x.ts"), ("web/x.ts", "x.ts")):
+        config = ResolverConfig(tmp_path)
+        assert config.ts_alias("m", first) is None
+        assert config.ts_alias("m", second) is None
+
+
+def test_an_absolute_extends_path_is_outside_the_repository(tmp_path):
+    write(tmp_path, "base.json", '{"compilerOptions": {"baseUrl": "src"}}')
+    write(tmp_path, "tsconfig.json", '{"extends": "/base.json"}')
+    assert ResolverConfig(tmp_path).ts_alias("m", "x.ts") is None
+
+
 def test_paths_come_through_references_and_beat_base_url(tmp_path):
     write(tmp_path, "tsconfig.json", '{"files": [], "references": [{"path": "./tsconfig.app.json"}]}')
     write(tmp_path, "tsconfig.app.json", """\
