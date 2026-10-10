@@ -370,7 +370,7 @@ def _specifier_pins(
         pins += _base_candidates(base)
         stem, dot, ext = base.rpartition(".")
         folder = stem if dot and "/" not in ext and f".{ext}" in _EXPLICIT_EXTENSIONS and stem else base
-        if folder:
+        if folder and "!" not in folder:  # graph/schema.py split_pin: no "!" in a path pin
             pins.append(folder + "/")
     return list(dict.fromkeys(pins))
 

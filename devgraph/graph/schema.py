@@ -214,7 +214,10 @@ def split_pin(pin: str) -> tuple[str, str]:
     """A pin and the suffix its files must not end with (`go/b/.!_test.go`
     is `go/b/.` less `_test.go`), "" when it has none. Only a path pin (no
     repository-relative path is `.`, starts with "/" or ends with "/" or
-    "/.") takes a suffix, so a file named `a!b.go` stays a file pin."""
+    "/.") takes a suffix, so a file named `a!b.go` stays a file pin. A path
+    pin whose own path holds a "!" (a directory named `x!y`) would be split
+    there, so it is not supported: a resolver never emits one (see
+    jsts/extractor.py `_specifier_pins`)."""
     base, bang, suffix = pin.rpartition("!")
     if bang and _is_path_pin(base):
         return base, suffix

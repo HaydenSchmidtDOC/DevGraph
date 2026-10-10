@@ -14,8 +14,8 @@ import uuid
 
 import pytest
 
-from devgraph.graph.engine import GraphEngine, _pin_test, provision_repository_schema
-from devgraph.graph.schema import pin_kind, pin_value
+from devgraph.graph.engine import GraphEngine, provision_repository_schema
+from devgraph.graph.schema import pin_kind
 from devgraph.indexer import dispatch
 from devgraph.indexer.calls import call_rows, import_rows
 from devgraph.indexer.common import best_pin, module_pin_name, pin_excludes, pin_matches
@@ -106,38 +106,98 @@ def engine():
     test_engine.close()
 
 
-def _random_pin(rng: random.Random) -> str:
-    segs = [rng.choice("abm") for _ in range(rng.randint(0, 2))]
-    folder = "/".join(segs)
-    name = rng.choice(["C.java", "a.py", "a_test.go", "x.go"])
-    pin = rng.choice([
-        f"{folder}/{name}" if folder else name,
-        f"{folder}/." if folder else ".",
-        f"/{folder}/{name}" if folder else f"/{name}",
-        f"/{folder}/." if folder else "/a/.",
-        f"{folder}/" if folder else "b/",
-    ])
-    if pin_kind(pin) not in ("file",) and rng.random() < 0.3:
-        pin += "!_test.go"
+#: Segments that share prefixes, so `a/b/` must not match `a/bc/`.
+_SEGMENTS = ["a", "ab", "b", "bc", "m"]
+_NAMES = ["C.java", "a.py", "a_test.go", "x.go", "ab.py"]
+
+
+def _random_path(rng: random.Random) -> str:
+    return "/".join([rng.choice(_SEGMENTS) for _ in range(rng.randint(0, 3))] + [rng.choice(_NAMES)])
+
+
+def _random_pin(rng: random.Random, kinds=("file", "dir", "suffix", "suffix_dir", "prefix")) -> str:
+    folder = "/".join(rng.choice(_SEGMENTS) for _ in range(rng.randint(0, 2)))
+    name = rng.choice(_NAMES)
+    kind = rng.choice(kinds)
+    pin = {
+        "file": f"{folder}/{name}" if folder else name,
+        "dir": f"{folder}/." if folder else ".",
+        "suffix": f"/{folder}/{name}" if folder else f"/{name}",
+        "suffix_dir": f"/{folder}/." if folder else "/a/.",
+        "prefix": f"{folder}/" if folder else "b/",
+    }[kind]
+    if kind != "file" and rng.random() < 0.3:
+        pin += rng.choice(["!_test.go", "!.py"])
     return pin
 
 
+def _random_cases(rng: random.Random, kinds, count: int) -> list[tuple[str, list[str]]]:
+    """(pin, its exclusions): files and other pins, as `pin_excludes` writes them."""
+    return [
+        (_random_pin(rng, kinds), sorted({_random_pin(rng) for _ in range(rng.randint(0, 3))}))
+        for _ in range(count)
+    ]
+
+
+def _expected(pin: str, exclude: list[str], path: str) -> bool:
+    return pin_matches(pin, path) and not any(pin_matches(other, path) for other in exclude)
+
+
 def test_the_cypher_pin_test_agrees_with_pin_matches(engine):
+    """A path pin and its exclusions, sent as `_group_rels_by_triple` sends
+    them (`pin`, `ex_files`, `ex_pins`), match in Cypher exactly the paths
+    `pin_matches` says."""
+    from devgraph.graph.engine import _group_rels_by_triple, _path_pin_conditions
+
     rng = random.Random(11)
-    cases = []
-    for i in range(3000):
-        path = "/".join([rng.choice("abmx") for _ in range(rng.randint(0, 3))] + [
-            rng.choice(["C.java", "a.py", "a_test.go", "x.go"])
-        ])
-        pin = _random_pin(rng)
-        cases.append({"i": i, "p": pin_value(pin), "f": path, "pin": pin})
+    cases, expected = [], {}
+    for i, (pin, exclude) in enumerate(_random_cases(rng, ("dir", "suffix", "suffix_dir", "prefix"), 3000)):
+        path = _random_path(rng)
+        (rows,) = _group_rels_by_triple([{
+            "from_label": "Function", "from_name": "f", "rel_type": "CALLS", "to_label": "Function",
+            "to_name": "g", "repo_id": "r", "to_file": pin, "exclude": exclude,
+        }]).values()
+        cases.append({"i": i, "t": rows[0]["targets"][0], "f": path})
+        expected[i] = (pin, exclude, path, _expected(pin, exclude, path))
     rows = engine.run_cypher(
-        "UNWIND $cases AS c RETURN c.i AS i, " + _pin_test("c.p", "c.f") + " AS m",
-        {"cases": [{k: c[k] for k in ("i", "p", "f")} for c in cases]},
+        "UNWIND $cases AS c WITH c, c.t AS t RETURN c.i AS i, "
+        + " AND ".join(_path_pin_conditions("t", "c.f")) + " AS m",
+        {"cases": cases},
     )
-    got = {row["i"]: row["m"] for row in rows}
-    wrong = [(c["pin"], c["f"], got[c["i"]]) for c in cases if got[c["i"]] is not pin_matches(c["pin"], c["f"])]
-    assert wrong == []
+    wrong = [expected[row["i"]][:3] for row in rows if row["m"] is not expected[row["i"]][3]]
+    assert len(rows) == len(cases) and wrong == []
+    assert 100 < sum(e[3] for e in expected.values()) < 2900  # both outcomes well represented
+
+
+def test_module_pins_seek_by_directory_and_basename_as_pin_matches_says(engine, repo_id):
+    """Random directory and suffix pins (with exclusions) on IMPORTS rows
+    link exactly the Modules `pin_matches` names, through the `dir` and
+    `basename` seeks."""
+    from devgraph.indexer.common import module_pin_name
+
+    rng = random.Random(5)
+    paths = sorted({_random_path(rng) for _ in range(300)})
+    engine.upsert_nodes(
+        [{"label": "Module", "repo_id": repo_id, "name": p, "properties": {"source_file": p}} for p in paths]
+        + [{"label": "Module", "repo_id": repo_id, "name": "origin.kt", "properties": {"source_file": "origin.kt"}}]
+    )
+    wrong, linked = [], 0
+    for pin, exclude in _random_cases(rng, ("dir", "suffix"), 80):
+        engine.run_cypher("MATCH (:Module {repo_id: $r, name: 'origin.kt'})-[x:IMPORTS]->() DELETE x", {"r": repo_id})
+        engine.upsert_relationships([{
+            "from_label": "Module", "from_name": "origin.kt", "rel_type": "IMPORTS", "to_label": "Module",
+            "to_name": module_pin_name(pin), "repo_id": repo_id, "to_file": pin, "exclude": exclude,
+        }])
+        got = {
+            row["n"] for row in engine.run_cypher(
+                "MATCH (:Module {repo_id: $r, name: 'origin.kt'})-[:IMPORTS]->(b) RETURN b.name AS n", {"r": repo_id}
+            )
+        }
+        want = {p for p in [*paths, "origin.kt"] if _expected(pin, exclude, p)}
+        linked += bool(want)
+        if got != want:
+            wrong.append((pin, exclude, sorted(got ^ want)))
+    assert wrong == [] and linked > 20
 
 
 # --- live writes and relinks per pin kind -----------------------------------------

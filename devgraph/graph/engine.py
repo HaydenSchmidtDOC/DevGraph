@@ -821,6 +821,16 @@ def _pin_test(pin: str, file: str) -> str:
     )
 
 
+def _path_pin_conditions(ref: str, path: str) -> list[str]:
+    """Cypher conditions for a path-pinned target `ref` (see
+    `_group_rels_by_triple`) matching the path `path`: its `pin` matches and
+    no exclusion does."""
+    return [
+        _pin_test(f"{ref}.pin", path), f"NOT {path} IN {ref}.ex_files",
+        f"NOT any(x IN {ref}.ex_pins WHERE {_pin_test('x', path)})",
+    ]
+
+
 def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also: str | None = None) -> str:
     """The MATCH for one end of an edge row (`pin` from `_pin`), reading its
     `{end}_name`/`{end}_file` off `ref` (the row, or one of its targets). An
@@ -851,10 +861,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
             match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
             if label in FILE_SCOPED_LABELS:
                 match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
-        conditions[:0] = [
-            _pin_test(f"{ref}.pin", path), f"NOT {path} IN {ref}.ex_files",
-            f"NOT any(x IN {ref}.ex_pins WHERE {_pin_test('x', path)})",
-        ]
+        conditions[:0] = _path_pin_conditions(ref, path)
         return match + "WHERE " + " AND ".join(conditions) + " "
     pinned = pin == "file"
     keys = "repo_id, name, file" if pinned else "repo_id, name"
