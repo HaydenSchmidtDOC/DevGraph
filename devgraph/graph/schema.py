@@ -214,9 +214,16 @@ PIN_CONFIDENCE: dict[str, str] = {
 #: is under (the part of its path before what the pin matches): a vendored
 #: copy of code (`third_party/acme-util/...`) is not what an import names.
 VENDORED_DIRS: tuple[str, ...] = ("third_party", "third-party", "thirdparty", "vendor", "vendored")
-#: What `^t` keeps out besides: a test source root (`src/test/java`), which
-#: main code never sees.
-TEST_DIRS: tuple[str, ...] = ("test", "androidTest", "testFixtures", "integrationTest")
+#: What `^t` keeps out besides: a conventional test source root, which main
+#: code never sees: a Gradle/Maven test source set (`src/test`,
+#: `src/androidTest`, ...) or a module's `test` directory holding language
+#: source sets (`lib/test/java`). Each is a path fragment the source root,
+#: wrapped in "/", must not contain; a directory merely named `test` (a
+#: package, a tools folder) is not one.
+TEST_ROOTS: tuple[str, ...] = (
+    "/src/test/", "/src/androidTest/", "/src/testFixtures/", "/src/integrationTest/", "/test/java/",
+    "/test/kotlin/",
+)
 #: The characters that start a path pin's flags (see `split_pin`); a resolver
 #: never writes a path pin whose own path holds one.
 PIN_FLAG_CHARS = "~?^!"
@@ -230,6 +237,7 @@ class PinParts(NamedTuple):
     only: tuple[str, ...] = ()
     skip: tuple[str, ...] = ()
     not_suffix: str = ""
+    skip_roots: tuple[str, ...] = ()
 
 
 def _is_path_pin(pin: str) -> bool:
@@ -245,7 +253,7 @@ def split_pin(pin: str) -> PinParts:
     end with one of these suffixes: a language's extensions), `^` (no
     directory of the source root a matched file is under, the part of its
     path before what the pin matches, is vendored: `VENDORED_DIRS`; `^t`
-    nor a test root: `TEST_DIRS`) and `!x` (a matched file must not end with
+    nor a test root: `TEST_ROOTS`) and `!x` (a matched file must not end with
     `x`): `go/b/.~?.go!_test.go` is the Go files directly in go/b/, tests
     left out, at package confidence. Only a path pin (no repository-relative
     path is `.`, starts with "/" or ends with "/" or "/.") takes flags, so a
@@ -259,8 +267,7 @@ def split_pin(pin: str) -> PinParts:
                 loose, only, skip, not_suffix = flags.groups()
                 return PinParts(
                     pin[:i], bool(loose), tuple(s for s in (only or "").split(",") if s),
-                    (VENDORED_DIRS + TEST_DIRS if skip == "^t" else VENDORED_DIRS) if skip else (),
-                    not_suffix or "",
+                    VENDORED_DIRS if skip else (), not_suffix or "", TEST_ROOTS if skip == "^t" else (),
                 )
     return PinParts(pin)
 
@@ -306,7 +313,8 @@ def pin_value(pin: str) -> dict:
     """A path pin as the map the engine's Cypher tests (`k` how it matches,
     `v` the path, directory or suffix it tests, `ns` the suffix a file must
     not end with, `os` the suffixes it must end with one of (empty: any),
-    `nv` the directory names its source root may not hold, `pin_root`): a
+    `nv` the directory names its source root may not hold, `pin_root`, `nr`
+    the fragments it may not contain, wrapped in "/"): a
     directory pin's `v` is the directory with its trailing "/" ("" for the
     root), so `dir` and `suffix_dir` drop the final "."; a `loose_dir`
     matches as a `dir`."""
@@ -314,5 +322,8 @@ def pin_value(pin: str) -> dict:
     kind = pin_kind(pin)
     kind = "dir" if kind == "loose_dir" else kind
     value = parts.base[:-1] if kind in ("dir", "suffix_dir") else parts.base
-    return {"k": kind, "v": value, "ns": parts.not_suffix, "os": list(parts.only), "nv": list(parts.skip)}
+    return {
+        "k": kind, "v": value, "ns": parts.not_suffix, "os": list(parts.only), "nv": list(parts.skip),
+        "nr": list(parts.skip_roots),
+    }
 

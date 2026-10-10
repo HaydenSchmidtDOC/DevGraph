@@ -54,6 +54,10 @@ def test_pin_kinds(pin, kind):
     ("/vendor/C.java^t", "core/vendor/C.java", True), ("/m/C.java^t", "core/src/test/java/m/C.java", False),
     ("/m/C.java^", "core/src/test/java/m/C.java", True), ("/test/.?.kt^t", "src/main/kotlin/test/a.kt", True),
     ("/m/.?.kt^t", "src/test/kotlin/m/a.kt", False), ("/m/.^", "vendor/m/a.kt", False),
+    # ^t leaves out conventional test roots only, not any directory named test.
+    ("/m/C.java^t", "test/m/C.java", True), ("/m/C.java^t", "tools/test/x/m/C.java", True),
+    ("/m/C.java^t", "lib/test/java/m/C.java", False), ("/m/C.java^t", "app/src/androidTest/java/m/C.java", False),
+    ("/m/C.java^t", "src/testFixtures/kotlin/m/C.java", False),
     ("a/b/.~", "a/b/c.go", True), ("a/b/.~?.go", "a/b/c/d.go", False),
 ])
 def test_pin_matches(pin, path, matches):
@@ -129,7 +133,7 @@ def engine():
 
 
 #: Segments that share prefixes, so `a/b/` must not match `a/bc/`.
-_SEGMENTS = ["a", "ab", "b", "bc", "m", "vendor", "third_party", "test"]
+_SEGMENTS = ["a", "ab", "b", "bc", "m", "vendor", "third_party", "test", "src", "java"]
 _NAMES = ["C.java", "a.py", "a_test.go", "x.go", "ab.py", "K.kt"]
 
 

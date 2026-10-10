@@ -250,3 +250,15 @@ def test_an_import_of_a_class_not_there_yet_links_when_another_module_adds_it(en
     assert (app, "lib/src/main/java/com/acme/core/model/Item.java", "getName", "package") in got
     assert not any(b.startswith("third_party/") and a == app for a, b, _bn, _c in got)
     _equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_a_test_root_is_a_conventional_one_not_any_test_directory():
+    """Main code's suffix pins leave out `src/test/...` roots but not a
+    directory that merely is named `test`; code under a test root may reach
+    other test roots."""
+    from devgraph.indexer.jvm import JvmLayout
+
+    assert JvmLayout("core/src/test/java/a/B.java", "a").flag == "^"
+    assert JvmLayout("test/a/B.java", "a").flag == "^t"
+    assert JvmLayout("tools/test/src/main/java/a/B.java", "a").flag == "^t"
+    assert JvmLayout("third_party/x/src/main/java/a/B.java", "a").flag == ""

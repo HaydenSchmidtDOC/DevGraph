@@ -96,8 +96,9 @@ agree):
   confidence, the `loose_dir` kind), `?.go` or `?.kt,.java` (the matched file
   must end with one of these: a directory or suffix pin is otherwise blind to
   language, and `pkg/.` would also match the `.md` beside the Go files), `^`
-  (no path segment of the matched file is a vendored directory such as
-  `third_party` or `vendor`) and `!_test.go` (the matched file must not end
+  (no directory of the matched file's source root, the path before what the
+  pin matches, is a vendored one such as `third_party` or `vendor`; `^t`
+  nor is that root a conventional test root) and `!_test.go` (the matched file must not end
   with it). The kind is read after the flags are stripped; a resolver never
   writes a path pin whose own path holds a flag character.
 - **Confidence is the pin kind's**, so it never depends on which other pins a
@@ -255,9 +256,13 @@ resolved) and, by path suffix, its directory under every other root (another
 Maven or Gradle module, a test root: package confidence, S5). A suffix pin
 from code outside a vendored directory carries `^` (no `third_party` or
 `vendor` copy of the package: it is not on the classpath), from main code
-`^t` (no test root either: main never sees test sources). Only the source
-root, the path before what the suffix matches, is tested, so a package named
-`vendor` or `test` is still found.
+`^t` (no conventional test root either: main never sees test sources). A
+test root is a test source set (`src/test`, `src/androidTest`,
+`src/testFixtures`, `src/integrationTest`) or a module's `test` directory
+holding language source sets (`test/java`, `test/kotlin`;
+`graph/schema.py` `TEST_ROOTS`), not any directory named `test`. Only the
+source root, the path before what the suffix matches, is tested, so a
+package named `vendor` or `test` is still found.
 
 **Java.** `import a.b.C` (or a nested `a.b.Outer.Inner`, a static
 `a.b.C.m`: the first capitalised segment picks the file) is an `IMPORTS` edge

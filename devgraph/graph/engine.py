@@ -828,7 +828,8 @@ def _pin_test(pin: str, file: str) -> str:
     return (
         f"(({pin}.ns = '' OR NOT {file} ENDS WITH {pin}.ns) "
         f"AND (size({pin}.os) = 0 OR any(s IN {pin}.os WHERE {file} ENDS WITH s)) "
-        f"AND (size({pin}.nv) = 0 OR NOT any(s IN split({root}, '/') WHERE s IN {pin}.nv)) AND CASE {pin}.k "
+        f"AND (size({pin}.nv) = 0 OR NOT any(s IN split({root}, '/') WHERE s IN {pin}.nv)) "
+        f"AND (size({pin}.nr) = 0 OR NOT any(s IN {pin}.nr WHERE '/' + {root} + '/' CONTAINS s)) AND CASE {pin}.k "
         f"WHEN 'file' THEN {file} = {pin}.v "
         f"WHEN 'dir' THEN {file} STARTS WITH {pin}.v AND NOT substring({file}, size({pin}.v)) CONTAINS '/' "
         f"WHEN 'suffix' THEN '/' + {file} ENDS WITH {pin}.v "

@@ -11,14 +11,16 @@ under the same root (anchored, resolved) and, for every other source root of
 the repository (another module, a test root), a path suffix (package
 confidence). A suffix pin from a file outside a vendored directory leaves
 vendored copies out (graph/schema.py `VENDORED_DIRS`, the `^` flag), and one
-from main code leaves test source roots out too (`^t`).
+from main code leaves conventional test source roots out too (`^t`,
+graph/schema.py `TEST_ROOTS`: `src/test`, `src/androidTest`, a module's
+`test/java`, ...).
 """
 
 from __future__ import annotations
 
 import posixpath
 
-from devgraph.graph.schema import TEST_DIRS, VENDORED_DIRS
+from devgraph.graph.schema import TEST_ROOTS, VENDORED_DIRS
 
 __all__ = ["JvmLayout", "type_segment"]
 
@@ -47,11 +49,10 @@ class JvmLayout:
         #: The flag a suffix pin carries (graph/schema.py `split_pin`): no
         #: vendored copy, and no test source root from main code; none from
         #: a vendored file itself.
-        roots = set(self.root.split("/"))
-        if roots & set(VENDORED_DIRS):
+        if set(self.root.split("/")) & set(VENDORED_DIRS):
             self.flag = ""
         else:
-            self.flag = "^" if roots & set(TEST_DIRS) else "^t"
+            self.flag = "^" if any(root in f"/{self.root}/" for root in TEST_ROOTS) else "^t"
 
     def _rel(self, package: list[str]) -> list[str] | None:
         if package[: len(self.omitted)] == self.omitted:
