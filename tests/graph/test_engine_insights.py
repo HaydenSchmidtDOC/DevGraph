@@ -77,6 +77,21 @@ def test_load_leaves_out_python_calls_matched_by_name_or_package(engine):
     assert len(edges) == 5
 
 
+def test_load_leaves_out_imports_at_package_confidence(engine):
+    """A package-confidence IMPORTS edge (a C# class reached in any C#
+    file, a Java class file found by suffix in another module) can fan one
+    import out to many same-named targets, as a package CALLS edge can."""
+    build_two_subsystems(engine)
+    engine.run_cypher(
+        "UNWIND $rows AS row "
+        "MERGE (m:Module {repo_id: $repo, name: row[0]}) MERGE (t:Module {repo_id: $repo, name: row[1]}) "
+        "CREATE (m)-[r:IMPORTS]->(t) SET r.confidence = row[2]",
+        {"repo": REPO, "rows": [["m.py", "n.py", "resolved"], ["m.py", "o.py", "package"], ["m.py", "p.py", None]]},
+    )
+    _nodes, edges = engine.load_insight_graph(REPO, COMMUNITY_RELATIONSHIPS)
+    assert sum(e["type"] == "IMPORTS" for e in edges) == 2
+
+
 def test_refresh_writes_node_and_repository_properties(engine):
     build_two_subsystems(engine)
     summary = refresh_insights(engine, REPO)

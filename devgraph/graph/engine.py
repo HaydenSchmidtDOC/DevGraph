@@ -400,14 +400,17 @@ _SHOW_INDEXES_CYPHER = (
 )
 # Graph insights (devgraph/analytics/insights.py). The Repository node is the
 # scoping root, not code, so it never takes part in the graph that's analysed.
-# A Python CALLS edge matched by name alone ("name") or to any file under an
-# imported package ("package") is left out: either can fan one call out to
-# many same-named functions. A CALLS edge without a confidence (another
-# language's) stays in.
+# A CALLS edge matched by name alone ("name") or at package confidence (any
+# file under an imported package, a class file found by suffix) is left out,
+# in any language: either can fan one call out to many same-named
+# functions. So is an IMPORTS edge at package confidence (a Java/Kotlin
+# suffix import, a C# class in any C# file). An edge without a confidence
+# (one written before its language resolved, or an import by path) stays in.
 _LOAD_INSIGHT_EDGES_CYPHER = (
     "MATCH (a {repo_id: $repo_id})-[r]->(b {repo_id: $repo_id}) "
     "WHERE type(r) IN $types AND NOT a:Repository AND NOT b:Repository "
     "  AND NOT (type(r) = 'CALLS' AND coalesce(r.confidence, '') IN ['name', 'package']) "
+    "  AND NOT (type(r) = 'IMPORTS' AND coalesce(r.confidence, '') = 'package') "
     "RETURN elementId(a) AS source, elementId(b) AS target, type(r) AS type"
 )
 _LOAD_INSIGHT_NODES_CYPHER = (
@@ -1907,7 +1910,8 @@ class GraphEngine:
         self, repo_id: str, relationship_types: tuple[str, ...]
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """One repository's edges of `relationship_types` and the nodes they touch,
-        less the Python CALLS edges of confidence "name" or "package".
+        less the CALLS edges of confidence "name" or "package" and the
+        IMPORTS edges of confidence "package", in any language.
 
         Identity is `elementId`, which is only promised stable within a
         transaction; it is used for the `write_insights` that immediately
