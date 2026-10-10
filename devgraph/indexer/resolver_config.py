@@ -147,6 +147,7 @@ class ResolverConfig:
         self._go_mod_dirs: list[str] = []
         self._rust_files = rust_files
         self._rust_crates: dict[str, list[str]] | None = None
+        self._rust_packages: set[str] = set()
 
     # --- files ---------------------------------------------------------------
 
@@ -433,8 +434,15 @@ class ResolverConfig:
             for rel in files:
                 for crate, root in self._cargo_entries(rel):
                     crates.setdefault(crate, set()).add(root)
+                    self._rust_packages.add(posixpath.dirname(rel))
             self._rust_crates = {crate: sorted(roots) for crate, roots in sorted(crates.items())}
         return self._rust_crates
+
+    def rust_packages(self) -> set[str]:
+        """The directories of every in-repository package's Cargo.toml (""
+        for the repository root)."""
+        self.rust_crates()
+        return self._rust_packages
 
 
 def fingerprints(repo_root: Path) -> dict[str, dict]:

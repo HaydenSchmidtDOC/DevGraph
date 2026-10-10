@@ -38,15 +38,19 @@ the graph schema alone:
   (`super::` there is the file's own module).
 
 Resolution (see docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md,
-Rust). A file's crate root is the nearest `src/` above it (`src/bin/x.rs`
-and `src/bin/x/main.rs` are crate roots of their own), else the nearest
-`tests/`, `benches/` or `examples/` (each file directly in one is a crate
-root), else its own directory; its module path follows from there
+Rust). A configured library's root file (a `[lib] path` included) and a
+file beside a package's Cargo.toml (`build.rs`) are crate roots; otherwise
+a file's crate root is a library root's directory above it, else the
+nearest `src/` (`src/bin/x.rs` and `src/bin/x/main.rs` are crate roots of
+their own), else the nearest `tests/`, `benches/` or `examples/` (each file
+directly in one, and each `<dir>/<x>/main.rs`, is a crate root), else its
+own directory; its module path follows from there
 (`src/a/b.rs` is `a::b`, `src/a/mod.rs` is `a`, `lib.rs`/`main.rs` the
 root). A module `a::b` is the file `<root>/a/b.rs` or `<root>/a/b/mod.rs`,
 or this file for one of its inline modules; another workspace crate's name
-(its Cargo.toml, the resolver configuration) names that crate's library,
-written as suffix pins (package confidence: two packages can share a name).
+(its Cargo.toml, the resolver configuration) names that crate's library
+by its exact files: resolved when no other package has the name, else at
+package confidence.
 
 - IMPORTS: `mod foo;` names the child module of the file's own (the 2018
   rule: `mod user;` in `src/models.rs` is `src/models/user.rs`); a `use`
@@ -224,13 +228,15 @@ _CONTAINERS = ("Vec", "VecDeque", "HashSet", "BTreeSet", "Option", "LinkedList",
 
 
 class _Crate(NamedTuple):
-    """A crate: its root directory, the files its root module can be, and
-    whether it is reached by another crate's name (Cargo configuration:
-    package confidence, written as suffix pins)."""
+    """A crate: its root directory, the files its root module can be, and,
+    for one reached by another crate's name (Cargo configuration), whether
+    another package shares that name (its files then at package
+    confidence)."""
 
     root: str
     root_files: tuple[str, ...]
     cross: bool = False
+    shared: bool = False
 
 
 class _Module(NamedTuple):
@@ -250,19 +256,39 @@ def _join(*parts: str) -> str:
     return "/".join(part for part in parts if part)
 
 
-def _layout(file_path: str) -> tuple[_Crate, tuple[str, ...]]:
-    """The crate a file belongs to and the file's module path in it. The
-    root is the nearest `src/` above the file (`src/bin/x.rs` and
-    `src/bin/x/main.rs` are crate roots of their own), else the nearest
-    `tests/`, `benches/` or `examples/` (each file directly in one is a crate
-    root), else the file's own directory."""
+def _layout(
+    file_path: str, lib_files: frozenset[str] = frozenset(), packages: frozenset[str] = frozenset(),
+) -> tuple[_Crate, tuple[str, ...]]:
+    """The crate a file belongs to and the file's module path in it.
+    `lib_files` are the configured libraries' root files (a `[lib] path`
+    included) and `packages` the directories holding a package's
+    Cargo.toml. A library root file is its crate's root, and so is a file
+    beside Cargo.toml (`build.rs`); a file under a library root's directory
+    belongs to that crate. Otherwise the root is the nearest `src/` above
+    the file (`src/bin/x.rs` and `src/bin/x/main.rs` are crate roots of
+    their own), else the nearest `tests/`, `benches/` or `examples/` (each
+    file directly in one, and each `<dir>/<x>/main.rs`, is a crate root),
+    else the file's own directory."""
     *dirs, name = file_path.split("/")
     stem = name[:-3] if name.endswith(".rs") else name
+    folder = _join(*dirs)
+    if file_path in lib_files or folder in packages or (not dirs and "" in packages):
+        return _Crate(folder, (file_path,)), ()
     src = max((i for i, d in enumerate(dirs) if d == "src"), default=None)
     own = max((i for i, d in enumerate(dirs) if d in _OWN_ROOT_DIRS), default=None)
-    if src is not None and src + 1 < len(dirs) and dirs[src + 1] == "bin":
+    # The nearest library root directory above the file, when no src/ is nearer.
+    lib = max(
+        ((posixpath.dirname(each).count("/") + 1 if posixpath.dirname(each) else 0, each) for each in lib_files
+         if posixpath.dirname(each) and file_path.startswith(posixpath.dirname(each) + "/")),
+        default=None,
+    )
+    if lib is not None and lib[0] > (src + 1 if src is not None else -1):
+        root = posixpath.dirname(lib[1])
+        crate = _Crate(root, (lib[1],))
+        rest = dirs[lib[0]:]
+    elif src is not None and src + 1 < len(dirs) and dirs[src + 1] == "bin":
         if len(dirs) == src + 2:
-            return _Crate(_join(*dirs), (file_path,)), ()
+            return _Crate(folder, (file_path,)), ()
         root = _join(*dirs[: src + 3])
         crate = _Crate(root, (f"{root}/main.rs",))
         rest = dirs[src + 3:]
@@ -271,14 +297,14 @@ def _layout(file_path: str) -> tuple[_Crate, tuple[str, ...]]:
         crate = _Crate(root, (f"{root}/lib.rs", f"{root}/main.rs"))
         rest = dirs[src + 1:]
     elif own is not None:
-        if len(dirs) == own + 1:
-            return _Crate(_join(*dirs), (file_path,)), ()
+        if len(dirs) == own + 1 or (len(dirs) == own + 2 and name == "main.rs"):
+            return _Crate(folder, (file_path,)), ()
         root = _join(*dirs[: own + 1])
         crate = _Crate(root, ())
         rest = dirs[own + 1:]
     else:
-        root = _join(*dirs)
-        crate = _Crate(root, (f"{root}/lib.rs" if root else "lib.rs", f"{root}/main.rs" if root else "main.rs"))
+        root = folder
+        crate = _Crate(root, (_join(root, "lib.rs"), _join(root, "main.rs")))
         rest = []
     if not rest and file_path in crate.root_files:
         return crate, ()
@@ -320,8 +346,10 @@ class _RustResolver:
     def __init__(self, root: Node, source: bytes, file_path: str, config: ResolverConfig | None) -> None:
         self.source = source
         self.file_path = file_path
-        self.crate, self.module = _layout(file_path)
         self.crates = config.rust_crates() if config is not None else {}
+        packages = frozenset(config.rust_packages()) if config is not None else frozenset()
+        lib_files = frozenset(root for roots in self.crates.values() for root in roots)
+        self.crate, self.module = _layout(file_path, lib_files, packages)
         # module scope -> name -> (path segments, the scope it was declared in)
         self.bindings: dict[tuple, dict[str, list[str]]] = {}
         self.globs: dict[tuple, list[list[str]]] = {}
@@ -479,7 +507,8 @@ class _RustResolver:
         roots = self.crates.get(first)
         if roots:
             # Two packages of one name: the first here, `_also` adds the others.
-            return _Module(_Crate(posixpath.dirname(roots[0]), (roots[0],), cross=True), ()), segs[1:]
+            crate = _Crate(posixpath.dirname(roots[0]), (roots[0],), cross=True, shared=len(roots) > 1)
+            return _Module(crate, ()), segs[1:]
         return None
 
     def _lookup_scope(self, name: str, scope: tuple) -> tuple:
@@ -493,13 +522,13 @@ class _RustResolver:
             return [crate]
         for roots in self.crates.values():
             if crate.root_files[0] in roots:
-                return [_Crate(posixpath.dirname(root), (root,), cross=True) for root in roots]
+                return [_Crate(posixpath.dirname(root), (root,), cross=True, shared=len(roots) > 1) for root in roots]
         return [crate]
 
     def files(self, module: _Module) -> list[str]:
         """The files a module can be: this file for one of its inline
         modules, else `<root>/a/b.rs` and `<root>/a/b/mod.rs` (a crate root
-        module: its root files), a cross-crate module as suffix pins."""
+        module: its root files)."""
         crate, path = module
         if not crate.cross and crate.root == self.crate.root and path in self.inline:
             return [self.file_path]
@@ -510,13 +539,19 @@ class _RustResolver:
                 candidates = [f"{base}.rs", f"{base}/mod.rs"]
             else:
                 candidates = list(each.root_files)
-            found += ["/" + c for c in candidates] if each.cross else candidates
+            found += candidates
         return found
 
     def pins(self, module: _Module) -> list[str]:
         """A module's files, and the recursive prefix of its directory
-        (package: an item re-exported from a submodule)."""
+        (package: an item re-exported from a submodule). The files of a
+        crate whose name another package shares are package confidence:
+        each a directory pin at package confidence limited to files ending
+        with its name (`a/src/.~?lib.rs`, which a `mylib.rs` beside it
+        would match too)."""
         found = self.files(module)
+        if module.crate.shared:
+            found = [f"{posixpath.dirname(each)}/.~?{posixpath.basename(each)}" for each in found]
         if module.path and found != [self.file_path]:
             found += [_join(each.root, *module.path) + "/" for each in self._also(module.crate)]
         return found
@@ -614,7 +649,7 @@ class _RustResolver:
 
     def imports(self) -> tuple[set[str], set[str]]:
         """The Modules the file's `mod` declarations and `use`s name: files
-        of its own crate, and suffix pins of other crates'. A `use a::b::X`
+        of its own crate and of other crates. A `use a::b::X`
         imports the module of X (a::b) when X is a type or used as a
         function, the module a::b::x when x is used as one (`x::f()`), else
         either."""
@@ -644,9 +679,8 @@ class _RustResolver:
         pins: set[str] = set()
         for module in modules:
             for each in self.files(module):
-                if each == self.file_path:
-                    continue
-                (pins if each.startswith("/") else files).add(each)
+                if each != self.file_path:
+                    files.add(each)
         return files, pins
 
 

@@ -324,20 +324,29 @@ files, as in Java. Calls, first match wins:
 
 ## Rust (`devgraph/indexer/rust/extractor.py`)
 
-**Crates and modules.** A file's crate root is the nearest `src/` above it;
+**Crates and modules.** A configured library's root file (its `[lib] path`
+included) is its crate's root, and the files under that directory are in
+it; a file beside a package's Cargo.toml (`build.rs`) is a crate root of its
+own. Otherwise a file's crate root is the nearest `src/` above it;
 `src/bin/x.rs` and `src/bin/x/main.rs` are crate roots of their own, as is
 every file directly in `tests/`, `benches/` or `examples/` (an integration
-test is its own crate); a file under none of these is in a crate rooted at
-its own directory. The module path follows from the root (`src/a/b.rs` is
+test is its own crate) and every `<dir>/<x>/main.rs` there; a file under
+none of these is in a crate rooted at its own directory. The module path follows from the root (`src/a/b.rs` is
 `a::b`, `src/a/mod.rs` is `a`, `lib.rs` and `main.rs` the root), and a
 module `a::b` is `<root>/a/b.rs` or `<root>/a/b/mod.rs` (resolved), or this
 file for an inline `mod x {}` of it. `crate::`, `self::` and `super::`
 (repeatable, from inside an inline module too) walk the module tree. Another
 crate is named by its package (the resolver configuration: each Cargo.toml's
 `[lib]` name, else its `[package]` name with `-` as `_`, and its `[lib]`
-path, else `src/lib.rs`): its files are written as suffix pins of their
-whole path, package confidence, since a repository can hold two packages of
-one name (a crate's own `tests/` reaches it the same way). Without a
+path, else `src/lib.rs`): its files are pinned exactly, resolved when no
+other package has the name, else at package confidence (a directory pin at
+package confidence limited to the file's name, `a/src/.~?lib.rs`). A suffix
+pin of the path would also match the same path inside another member: a
+root package `app` beside `[workspace]` members had `app::run()` reach
+`crates/core/src/lib.rs` too. A crate's own `tests/` reaches it the same
+way. A path through another crate needs no `use`, so `shop_core::version()`
+is a resolved edge between directories with no `IMPORTS` (the measure test
+lists it). Without a
 Cargo.toml naming it, a crate is external. `#[path]` attributes are not
 read.
 

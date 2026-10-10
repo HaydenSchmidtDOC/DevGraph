@@ -245,10 +245,10 @@ def test_calls_inside_macro_arguments_are_calls(tmp_path):
     """
     files = ["crates/core/src/lib.rs", "crates/core/src/util/money.rs", "crates/app/src/main.rs"]
     assert reached(source, "crates/app/src/main.rs", "main", "version", files, config) == {
-        "crates/core/src/lib.rs": "package"
+        "crates/core/src/lib.rs": "resolved"
     }
     assert reached(source, "crates/app/src/main.rs", "main", "format", files, config) == {
-        "crates/core/src/util/money.rs": "package"
+        "crates/core/src/util/money.rs": "resolved"
     }
     assert reached(source, "crates/app/src/main.rs", "main", "helper", files, config) == {
         "crates/app/src/main.rs": "resolved"
@@ -272,9 +272,9 @@ def test_a_workspace_crate_is_reached_by_its_package_name(tmp_path):
     """
     files = ["crates/core/src/models/user.rs", "crates/core/src/net/client.rs", "crates/core/src/models/order.rs"]
     path = "crates/app/src/main.rs"
-    assert reached(source, path, "main", "fetch_user", files, config) == {"crates/core/src/net/client.rs": "package"}
+    assert reached(source, path, "main", "fetch_user", files, config) == {"crates/core/src/net/client.rs": "resolved"}
     assert reached(source, path, "main", "new", files, config) == {
-        "crates/core/src/net/client.rs": "package", "crates/core/src/models/user.rs": "package",
+        "crates/core/src/net/client.rs": "resolved", "crates/core/src/models/user.rs": "resolved",
     }
     assert imported(source, path, files, config) == {"crates/core/src/models/user.rs", "crates/core/src/net/client.rs"}
     # Without the configuration another crate is external.
@@ -300,7 +300,7 @@ def test_tests_and_bins_are_crate_roots_of_their_own(tmp_path):
     path = "crates/core/tests/integration.rs"
     files = ["crates/core/src/models/user.rs", "crates/core/tests/common/mod.rs", "crates/core/src/common.rs"]
     assert reached(test, path, "totals_orders", "add_order", files, config) == {
-        "crates/core/src/models/user.rs": "package"
+        "crates/core/src/models/user.rs": "resolved"
     }
     assert reached(test, path, "totals_orders", "setup", files, config) == {
         "crates/core/tests/common/mod.rs": "resolved"
@@ -314,6 +314,52 @@ def test_tests_and_bins_are_crate_roots_of_their_own(tmp_path):
     assert imported(tool, "src/bin/tool.rs", files) == {"src/bin/helper.rs"}
     assert reached(tool, "src/bin/tool.rs", "main", "run", files) == {"src/bin/helper.rs": "resolved"}
     assert imported("mod helper;\n", "src/bin/tool/main.rs", files) == {"src/bin/tool/helper.rs"}
+
+
+def test_a_root_package_beside_a_workspace_names_only_its_own_files(tmp_path):
+    config = _config(tmp_path, {
+        "Cargo.toml": '[package]\nname = "app"\n\n[workspace]\nmembers = ["crates/*"]\n',
+        "crates/core/Cargo.toml": '[package]\nname = "shop-core"\n',
+    })
+    source = "use app::net;\n\nfn main() { app::run(); net::connect(); }\n"
+    files = ["src/lib.rs", "src/net.rs", "crates/core/src/lib.rs", "crates/core/src/net.rs"]
+    path = "crates/core/src/main.rs"
+    assert reached(source, path, "main", "run", files, config) == {"src/lib.rs": "resolved"}
+    assert reached(source, path, "main", "connect", files, config) == {"src/net.rs": "resolved"}
+    assert imported(source, path, files, config) == {"src/net.rs"}
+
+
+def test_two_packages_of_one_name_are_package_confidence(tmp_path):
+    config = _config(tmp_path, {
+        "a/Cargo.toml": '[package]\nname = "util"\n', "b/Cargo.toml": '[package]\nname = "util"\n',
+    })
+    source = "fn main() { util::run(); }\n"
+    files = ["a/src/lib.rs", "b/src/lib.rs", "a/src/other.rs"]
+    assert reached(source, "app/src/main.rs", "main", "run", files, config) == {
+        "a/src/lib.rs": "package", "b/src/lib.rs": "package",
+    }
+    assert imported("use util::run;\n", "app/src/main.rs", files, config) == {"a/src/lib.rs", "b/src/lib.rs"}
+
+
+def test_more_crate_roots_main_rs_targets_build_scripts_and_lib_paths(tmp_path):
+    files = ["tests/smoke/helper.rs", "tests/helper.rs", "examples/demo/helper.rs", "benches/load/helper.rs"]
+    for root in ("tests/smoke", "examples/demo", "benches/load"):
+        assert imported("mod helper;\n", f"{root}/main.rs", files) == {f"{root}/helper.rs"}, root
+    # A file beside Cargo.toml (build.rs) is a crate root of its own.
+    config = _config(tmp_path, {"crates/core/Cargo.toml": '[package]\nname = "core"\n\n[lib]\npath = "lib/core.rs"\n'})
+    build = "mod gen;\n\nfn main() { gen::run(); }\n"
+    files = ["crates/core/gen.rs", "crates/core/build/gen.rs"]
+    assert imported(build, "crates/core/build.rs", files, config) == {"crates/core/gen.rs"}
+    # A custom [lib] path is its crate's root: crate:: and mod resolve beside it.
+    lib = "mod net;\n\npub fn run() { crate::net::go(); }\n"
+    files = ["crates/core/lib/net.rs", "crates/core/lib/core/net.rs", "crates/core/src/net.rs"]
+    assert imported(lib, "crates/core/lib/core.rs", files, config) == {"crates/core/lib/net.rs"}
+    assert reached(lib, "crates/core/lib/core.rs", "run", "go", files, config) == {
+        "crates/core/lib/net.rs": "resolved"
+    }
+    other = "fn main() { core::run(); }\n"
+    assert reached(other, "app/src/main.rs", "main", "run", ["crates/core/lib/core.rs", "crates/core/src/lib.rs"],
+                   config) == {"crates/core/lib/core.rs": "resolved"}
 
 
 def test_the_cargo_fingerprint_follows_only_crate_names(tmp_path):
@@ -391,7 +437,7 @@ def test_renaming_a_crate_re_indexes_its_users_and_a_moved_function_relinks(engi
     provision_repository_schema(engine, tmp_path)
     engine.upsert_repository(repo_id, repo_id, str(tmp_path))
     full_scan(engine, repo_id, tmp_path)
-    edge = ("crates/app/src/main.rs", "main", "crates/core/src/util.rs", "run", "package")
+    edge = ("crates/app/src/main.rs", "main", "crates/core/src/util.rs", "run", "resolved")
     assert edge in _edges(engine, repo_id, "CALLS")
     _equals_fresh(engine, repo_id, tmp_path)
 
@@ -410,7 +456,7 @@ def test_renaming_a_crate_re_indexes_its_users_and_a_moved_function_relinks(engi
 
     remove_paths(engine, repo_id, tmp_path, {util})
     index_paths(engine, repo_id, tmp_path, {moved})
-    assert ("crates/app/src/main.rs", "main", "crates/core/src/util/mod.rs", "run", "package") in _edges(
+    assert ("crates/app/src/main.rs", "main", "crates/core/src/util/mod.rs", "run", "resolved") in _edges(
         engine, repo_id, "CALLS"
     )
     _equals_fresh(engine, repo_id, tmp_path)
