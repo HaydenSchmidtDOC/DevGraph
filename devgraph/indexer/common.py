@@ -18,6 +18,7 @@ from devgraph.graph.schema import (
     NAME_REF_SEP,
     PIN_CONFIDENCE,
     PIN_KINDS,
+    VENDORED_DIRS,
     pin_kind,
     split_pin,
 )
@@ -160,18 +161,24 @@ def own_edges(result: ExtractionResult, file_path: str) -> ExtractionResult:
 
 def pin_matches(pin: str | None, path: str) -> bool:
     """Whether the path pin `pin` (a relationship's `to_file`, see
-    graph/schema.py `pin_kind`) matches the repository-relative `path`: None
-    matches every path, "" only the file-less node (path ""), a file only
-    itself. The engine's Cypher mirrors this."""
+    graph/schema.py `pin_kind` and `split_pin` for its flags) matches the
+    repository-relative `path`: None matches every path, "" only the
+    file-less node (path ""), a file only itself. The engine's Cypher mirrors
+    this."""
     if pin is None:
         return True
-    base, not_suffix = split_pin(pin)
-    if not_suffix and path.endswith(not_suffix):
+    parts = split_pin(pin)
+    base = parts.base
+    if parts.not_suffix and path.endswith(parts.not_suffix):
+        return False
+    if parts.only and not path.endswith(parts.only):
+        return False
+    if parts.no_vendored and any(segment in VENDORED_DIRS for segment in path.split("/")):
         return False
     kind = pin_kind(pin)
     if kind in ("fileless", "file"):
         return path == base
-    if kind == "dir":
+    if kind in ("dir", "loose_dir"):
         folder = base[:-1]
         return path.startswith(folder) and "/" not in path[len(folder):]
     if kind == "suffix":
@@ -218,7 +225,7 @@ def module_pin_name(pin: str) -> str:
     a Module's `dir`), a suffix pin its basename (as a Module's
     `basename`). A Module's own path is its name, so an exact file needs no
     pin."""
-    base, _suffix = split_pin(pin)
+    base = split_pin(pin).base
     kind = pin_kind(pin)
     if kind == "dir":
         return base[:-2] if base.endswith("/.") else ""

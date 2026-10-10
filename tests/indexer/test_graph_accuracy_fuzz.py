@@ -209,8 +209,12 @@ TS_CONFIGS = {
     ],
     "ts/tsconfig.app.json": [None, '{"extends": "./configs/base.cfg"}', '{"compilerOptions": {"baseUrl": "other"}}'],
     "ignored/tsconfig.json": ['{"compilerOptions": {"baseUrl": "."}}', '{"compilerOptions": {"baseUrl": ".."}}'],
-    "go.mod": [None, "module example.com/fz\n", "module example.com/other\n"],
-    "go/b/go.mod": [None, "module example.com/fz/b\n"],
+    # go/go.mod (example.com/fz) holds go/a and go/b; a root go.mod is
+    # another module around it, a nested go/b/go.mod takes go/b out of it,
+    # and go.work's `replace` names go/b by a third path.
+    "go.mod": [None, "module example.com/top\n", "module example.com/other\n"],
+    "go/b/go.mod": [None, "module example.com/bee\n"],
+    "go.work": [None, "go 1.22\n\nuse ./go\n\nreplace example.com/ext => ./go/b\n"],
 }
 # Folders holding a configuration file, which the fuzz may delete whole.
 CONFIG_DIRS = ["ts/configs", "go/b"]
@@ -240,7 +244,7 @@ def initial_repo() -> dict:
                                 funcs={"run": ["helper", "assist"]}),
         "java/base/Base.java": File("java", head="base", bases={"Base": None}, funcs={"assist": []}),
         "go/go.mod": File("static", head="module example.com/fz\n\ngo 1.22\n"),
-        "go.mod": File("static", head="module example.com/fz\n"),
+        "go.mod": File("static", head="module example.com/top\n"),
         "ts/tsconfig.json": File("static", head=TS_CONFIGS["ts/tsconfig.json"][0]),
         "ts/configs/base.cfg": File("static", head=TS_CONFIGS["ts/configs/base.cfg"][0]),
         "ts/app.ts": File("ts", imports=["import { f } from '@/lib';", "import * as u from '@/util';"],
@@ -254,6 +258,7 @@ def initial_repo() -> dict:
         "ignored/tsconfig.json": File("static", head=TS_CONFIGS["ignored/tsconfig.json"][0]),
         "go/a/a.go": File("go", head="a", imports=["example.com/fz/b"], funcs={"Start": ["Serve"]}),
         "go/b/b.go": File("go", head="b", extra=GO_SERVER, funcs={"Serve": [], "Stop": []}),
+        "go/b/halt.go": File("go", head="b", funcs={"Halt": ["Stop"]}),
         "compose.yaml": File("compose", services={"api": "python:3.12", "web": "nginx:1.27"}),
         "Dockerfile": File("docker", froms=["python:3.12"]),
         "notes.md": File("notes", mentions=["helper", "Foo", "Base", "K", "Serve", "api", "python"]),
@@ -269,7 +274,7 @@ IMPORTS = {
         "from lib import util", "import pkg.impl", "from pkg.impl import pkgfn as alias",
     ],
     "rs": ["display::Display", "foo::Foo"],
-    "go": ["example.com/fz/a", "example.com/fz/b", "example.com/fz/go/b"],
+    "go": ["example.com/fz/a", "example.com/fz/b", "example.com/top/go/b", "example.com/bee", "example.com/ext"],
     "ts": ["import { f } from '@/lib';", "import * as u from '@/util';", "import { g } from './src/util';",
            "import { f } from './other/lib';", "import { f } from 'lib';", "import { g } from './src';"],
     "java": ["base.Base", "app.K"],
@@ -283,6 +288,8 @@ CALL_PINS = ["py/.", ".", "pkg/.!other.py", "/b.py", "/lib/util.py", "/py/.", "/
 IMPORT_PINS = ["py/.", "pkg/.", ".", "src/lib/.!core.py", "/b.py", "/util.py", "/impl.py"]
 # How a TS call to `{n}` is written: bare, through a namespace import, on `this` or an untyped value.
 TS_CALLS = ["{n}", "u.{n}", "this.{n}", "obj.{n}"]
+# How a Go call to `{n}` is written: bare, through a package, on a typed value or an untyped one.
+GO_CALLS = ["{n}", "b.{n}", "bee.{n}", "(&Server{{}}).{n}", "obj.{n}"]
 SERVICES = ["api", "web", "worker", "db"]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
 EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing"]
@@ -313,6 +320,12 @@ class Fuzz:
     def _func_names(self) -> list:
         return sorted({n for f in self.files.values() for n in f.funcs} | {"Run", "new", "missing_fn"})
 
+    @staticmethod
+    def _styled(kind: str, names: list) -> list:
+        """Each name written as every call style of the language."""
+        styles = {"py": PY_CALLS, "ts": TS_CALLS, "go": GO_CALLS}.get(kind, ["{n}"])
+        return [style.format(n=n) for style in styles for n in names]
+
     # Each operation returns (description, touched paths), or None when it can't apply.
 
     def op_call(self):
@@ -325,10 +338,7 @@ class Fuzz:
             gone = calls.pop(self.rng.randrange(len(calls)))
             return f"remove call {fn}->{gone} in {path}", {path}
         names = self._func_names()
-        if self.files[path].kind == "py":
-            names = [style.format(n=n) for style in PY_CALLS for n in names]
-        elif self.files[path].kind == "ts":
-            names = [style.format(n=n) for style in TS_CALLS for n in names]
+        names = self._styled(self.files[path].kind, names)
         new = self.rng.choice([n for n in names if n not in calls])
         calls.append(new)
         return f"add call {fn}->{new} in {path}", {path}
@@ -397,11 +407,7 @@ class Fuzz:
         if not path:
             return None
         name = self._fresh("fn")
-        names = self._func_names()
-        if self.files[path].kind == "py":
-            names = [style.format(n=n) for style in PY_CALLS for n in names]
-        elif self.files[path].kind == "ts":
-            names = [style.format(n=n) for style in TS_CALLS for n in names]
+        names = self._styled(self.files[path].kind, self._func_names())
         self.files[path].funcs[name] = self.rng.sample(names, self.rng.randrange(3))
         return f"add function {name} in {path}", {path}
 

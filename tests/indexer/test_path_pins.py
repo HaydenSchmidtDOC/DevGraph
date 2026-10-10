@@ -28,7 +28,8 @@ from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_
 @pytest.mark.parametrize(("pin", "kind"), [
     (None, "name"), ("", "fileless"), ("a/b.go", "file"), ("a!b.go", "file"), ("a/b/.", "dir"), (".", "dir"),
     ("/a/B.java", "suffix"), ("/a/b/.", "suffix_dir"), ("a/b/", "prefix"), ("a/b/.!_test.go", "dir"),
-    ("/a/.!_test.go", "suffix_dir"),
+    ("/a/.!_test.go", "suffix_dir"), ("a/b/.~", "loose_dir"), ("a/b/.~?.go!_test.go", "loose_dir"),
+    ("/a/B.java^", "suffix"), ("/a/.?.kt,.java^", "suffix_dir"), ("a~", "file"), ("a?b.go", "file"),
 ])
 def test_pin_kinds(pin, kind):
     assert pin_kind(pin) == kind
@@ -44,6 +45,12 @@ def test_pin_kinds(pin, kind):
     ("/a/b/.", "xa/b/c.kt", False),
     ("a/b/", "a/b/c/d.py", True), ("a/b/", "a/bc/d.py", False),
     ("", "", True), ("", "a.py", False), (None, "a.py", True),
+    # Flags: a language's suffixes, no vendored segment, a package-confidence directory.
+    ("a/b/.?.go", "a/b/c.go", True), ("a/b/.?.go", "a/b/c.py", False), ("a/b/.?.go!_test.go", "a/b/c_test.go", False),
+    ("/m/.?.kt,.java", "x/m/A.java", True), ("/m/.?.kt,.java", "x/m/A.md", False),
+    ("/m/C.java^", "core/m/C.java", True), ("/m/C.java^", "third_party/u/m/C.java", False),
+    ("/m/C.java^", "a/vendor/m/C.java", False), ("/m/C.java", "third_party/u/m/C.java", True),
+    ("a/b/.~", "a/b/c.go", True), ("a/b/.~?.go", "a/b/c/d.go", False),
 ])
 def test_pin_matches(pin, path, matches):
     assert pin_matches(pin, path) is matches
@@ -65,6 +72,16 @@ def test_each_pin_leaves_out_what_a_stronger_pin_matches():
     assert best_pin(pins, "lib/sub/c.py", "app.py") == "lib/"
     assert best_pin(pins, "other/c.py", "app.py") is None
     assert best_pin({"lib/"}, "lib/x.py", "lib/x.py") is None  # a prefix never links its writer
+
+
+def test_a_loose_directory_ranks_after_a_directory_at_package_confidence():
+    rows = call_rows("Function", "main", "f", {"a/.~?.go", "a/.?.go", "a/f.go", "/a/f.go"}, False, None, "m.go", "r")
+    assert [(r.to_file, r.properties["confidence"], r.exclude) for r in rows] == [
+        ("a/f.go", "resolved", None),
+        ("a/.?.go", "resolved", ["a/f.go"]),
+        ("a/.~?.go", "package", ["a/.?.go", "a/f.go"]),
+        ("/a/f.go", "package", ["a/.?.go", "a/.~?.go", "a/f.go"]),
+    ]
 
 
 def test_call_rows_take_their_pin_kinds_confidence():
@@ -107,15 +124,15 @@ def engine():
 
 
 #: Segments that share prefixes, so `a/b/` must not match `a/bc/`.
-_SEGMENTS = ["a", "ab", "b", "bc", "m"]
-_NAMES = ["C.java", "a.py", "a_test.go", "x.go", "ab.py"]
+_SEGMENTS = ["a", "ab", "b", "bc", "m", "vendor", "third_party"]
+_NAMES = ["C.java", "a.py", "a_test.go", "x.go", "ab.py", "K.kt"]
 
 
 def _random_path(rng: random.Random) -> str:
     return "/".join([rng.choice(_SEGMENTS) for _ in range(rng.randint(0, 3))] + [rng.choice(_NAMES)])
 
 
-def _random_pin(rng: random.Random, kinds=("file", "dir", "suffix", "suffix_dir", "prefix")) -> str:
+def _random_pin(rng: random.Random, kinds=("file", "dir", "suffix", "suffix_dir", "prefix"), loose=True) -> str:
     folder = "/".join(rng.choice(_SEGMENTS) for _ in range(rng.randint(0, 2)))
     name = rng.choice(_NAMES)
     kind = rng.choice(kinds)
@@ -126,15 +143,23 @@ def _random_pin(rng: random.Random, kinds=("file", "dir", "suffix", "suffix_dir"
         "suffix_dir": f"/{folder}/." if folder else "/a/.",
         "prefix": f"{folder}/" if folder else "b/",
     }[kind]
-    if kind != "file" and rng.random() < 0.3:
-        pin += rng.choice(["!_test.go", "!.py"])
+    if kind != "file":
+        # Flags, in their order: `~` (on a directory), `?` suffixes, `^`, `!` suffix.
+        if kind == "dir" and loose and rng.random() < 0.3:
+            pin += "~"
+        if rng.random() < 0.3:
+            pin += "?" + ",".join(rng.sample([".go", ".kt", ".java", ".py"], rng.randint(1, 2)))
+        if rng.random() < 0.3:
+            pin += "^"
+        if rng.random() < 0.3:
+            pin += rng.choice(["!_test.go", "!.py"])
     return pin
 
 
-def _random_cases(rng: random.Random, kinds, count: int) -> list[tuple[str, list[str]]]:
+def _random_cases(rng: random.Random, kinds, count: int, loose=True) -> list[tuple[str, list[str]]]:
     """(pin, its exclusions): files and other pins, as `pin_excludes` writes them."""
     return [
-        (_random_pin(rng, kinds), sorted({_random_pin(rng) for _ in range(rng.randint(0, 3))}))
+        (_random_pin(rng, kinds, loose), sorted({_random_pin(rng) for _ in range(rng.randint(0, 3))}))
         for _ in range(count)
     ]
 
@@ -182,7 +207,7 @@ def test_module_pins_seek_by_directory_and_basename_as_pin_matches_says(engine, 
         + [{"label": "Module", "repo_id": repo_id, "name": "origin.kt", "properties": {"source_file": "origin.kt"}}]
     )
     wrong, linked = [], 0
-    for pin, exclude in _random_cases(rng, ("dir", "suffix"), 80):
+    for pin, exclude in _random_cases(rng, ("dir", "suffix"), 80, loose=False):
         engine.run_cypher("MATCH (:Module {repo_id: $r, name: 'origin.kt'})-[x:IMPORTS]->() DELETE x", {"r": repo_id})
         engine.upsert_relationships([{
             "from_label": "Module", "from_name": "origin.kt", "rel_type": "IMPORTS", "to_label": "Module",

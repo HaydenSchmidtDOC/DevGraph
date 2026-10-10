@@ -19,6 +19,7 @@ import hashlib
 import json
 import posixpath
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -118,14 +119,22 @@ class ResolverConfig:
     """The resolver configuration of one repository, read once per batch.
 
     `read` collects every configuration path looked for (`extends` and
-    `references` targets included), found or not, repo-relative."""
+    `references` targets included), found or not, repo-relative.
 
-    def __init__(self, repo_root: Path) -> None:
+    `go_files` gives the repository's go.mod and go.work paths, as the
+    fingerprint the batch extracts under found them (`fingerprints`'
+    `inputs`), when a Go file first asks (`go_modules`); None, or a None
+    answer, walks the repository for them."""
+
+    def __init__(self, repo_root: Path, go_files: Callable[[], list[str] | None] | None = None) -> None:
         self.root = Path(repo_root)
         self.read: set[str] = set()
         self._texts: dict[str, str | None] = {}
         self._options: dict[str, dict] = {}
         self._nearest: dict[str, list[_TsProject]] = {}
+        self._go_files = go_files
+        self._go_modules: list[tuple[str, str]] | None = None
+        self._go_mod_dirs: list[str] = []
 
     # --- files ---------------------------------------------------------------
 
@@ -295,16 +304,77 @@ class ResolverConfig:
             "baseUrl": options.get("baseUrl"), "paths": options.get("paths"),
         }
 
+    # --- go.mod / go.work -------------------------------------------------------
+
+    def _go_entries(self, rel: str) -> list[tuple[str, str]]:
+        """What one go.mod or go.work says about where import paths live:
+        (import path prefix, repo-relative directory) for its `module` line
+        (a go.mod's own directory) and for each `replace` whose target is a
+        local directory (`=> ../shared`), resolved against the file's
+        directory; one outside the repository is left out."""
+        folder = posixpath.dirname(rel)
+        entries = []
+        in_replace = False
+        for raw in (self._text(rel) or "").splitlines():
+            line = raw.split("//", 1)[0].strip()
+            if in_replace:
+                if line == ")":
+                    in_replace = False
+                    continue
+                directive = "replace " + line
+            elif line.startswith("replace") and line[len("replace"):].strip() == "(":
+                in_replace = True
+                continue
+            else:
+                directive = line
+            words = directive.split()
+            if rel.endswith("go.mod") and len(words) == 2 and words[0] == "module":
+                entries.append((words[1].strip('"'), folder))
+            elif words[:1] == ["replace"] and "=>" in words:
+                arrow = words.index("=>")
+                old, target = words[1:2], words[arrow + 1:arrow + 2]
+                local = bool(target) and (target[0] in (".", "..") or target[0].startswith(("./", "../")))
+                path = _join(folder, target[0]) if old and local else None
+                if path is not None:
+                    entries.append((old[0].strip('"'), path))
+        return entries
+
     def _go_digest(self, rel: str) -> object:
-        lines = []
-        for line in (self._text(rel) or "").splitlines():
-            line = line.split("//", 1)[0].strip()
-            if rel.endswith("go.mod"):
-                if line.startswith("module "):
-                    lines.append(line)
-            elif line and not line.startswith(("go ", "toolchain ")):
-                lines.append(line)
-        return lines
+        return sorted(self._go_entries(rel))
+
+    def go_modules(self) -> list[tuple[str, str]]:
+        """Every in-repository Go import path prefix and the directory it
+        names, longest prefix first (then by directory): each go.mod's
+        module path and every local `replace` of a go.mod or go.work."""
+        if self._go_modules is None:
+            files = self._go_files() if self._go_files is not None else None
+            if files is None:
+                files = sorted(
+                    path.relative_to(self.root).as_posix() for path in indexable_paths(self.root)
+                    if path.name in ("go.mod", "go.work")
+                )
+            entries = {entry for rel in files for entry in self._go_entries(rel)}
+            self._go_modules = sorted(entries, key=lambda entry: (-len(entry[0]), entry[1], entry[0]))
+            self._go_mod_dirs = sorted({posixpath.dirname(rel) for rel in files if rel.endswith("go.mod")})
+        return self._go_modules
+
+    def go_package_dir(self, import_path: str) -> str | None:
+        """The repo-relative directory of the Go package `import_path`, by
+        the longest in-repository module path it is under (`go_modules`)
+        whose module holds that directory (a directory with a go.mod of its
+        own below the module's is another module); None when there is none
+        (an external package)."""
+        for prefix, folder in self.go_modules():
+            if import_path == prefix or import_path.startswith(prefix + "/"):
+                rest = import_path[len(prefix):].strip("/")
+                found = _join(folder, rest) if rest else folder
+                if found is not None and not any(
+                    other != folder and (folder == "" or other.startswith(folder + "/"))
+                    and (found == other or found.startswith(other + "/"))
+                    for other in self._go_mod_dirs
+                ):
+                    return found
+        return None
 
 
 def fingerprints(repo_root: Path) -> dict[str, dict]:
@@ -312,8 +382,9 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
     file of the repository (`fingerprint`) and the paths it looked at
     (`inputs`): for TS each tsconfig*/jsconfig.json's `extends`,
     `references`, `baseUrl` and `paths`, with every config its `extends` and
-    `references` reach; for Go each go.mod's `module` line and each go.work.
-    A compiler flag or a `require` bump changes nothing."""
+    `references` reach; for Go each go.mod's `module` line and the local
+    `replace` directives of each go.mod and go.work. A compiler flag or a
+    `require` bump changes nothing."""
     root = Path(repo_root)
     config = ResolverConfig(root)
     found: dict[str, set[str]] = {"ts": set(), "go": set()}

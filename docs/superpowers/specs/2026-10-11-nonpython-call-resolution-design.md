@@ -63,9 +63,11 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   succeeds (never after a batch cut short by shutdown). `full_scan` takes it
   before reading any file and stores it at the end
   (`dispatch.sync_resolver_config`).
-- **Go today.** The Go extractor still reads only the root go.mod's module
-  line until slice B; that line is in the fingerprint, so editing it now
-  re-indexes the Go files, which it did not before.
+- **Go.** The Go fingerprint covers each go.mod's `module` line and the
+  local `replace` directives (`=> ../shared`) of every go.mod and go.work. A
+  batch extracts Go files under the go.mod and go.work paths its fingerprint
+  found (the graph's, or the newer one `sync_resolver_config` re-indexes
+  under), so no batch walks the repository for them.
 
 Fresh is then extract(text, configuration), and an incremental run re-extracts
 every dependent when the configuration changes.
@@ -82,14 +84,21 @@ agree):
 |---|---|---|---|
 | `a/b.ts` | that file | resolved | all |
 | `a/b/.` | files directly in `a/b/` (`.` alone: the repository root's files) | resolved | Go packages, Kotlin same package |
+| `a/b/.~` | the same | package | a method on a typed Go/Kotlin receiver |
 | `/a/b/C.java` | files whose `/`-prefixed path ends with it | package | Java/Kotlin/C# class files, C++ includes |
 | `/a/b/.` | files directly in any directory ending `/a/b/` | package | Kotlin top-level functions, Java wildcards |
 | `a/b/` | files anywhere under `a/b/` | package | Python packages, JS barrels, Rust modules |
 
 - No repository-relative path starts with `/` or ends with `/.`, so a pin can
-  never be mistaken for a file. A pin may end with `!suffix` (Go's
-  `!_test.go`): the matched file must not end with the suffix. The kind is
-  read after the suffix is stripped.
+  never be mistaken for a file. After its path a pin may carry flags, in this
+  order (`graph/schema.py` `split_pin`): `~` (a directory at package
+  confidence, the `loose_dir` kind), `?.go` or `?.kt,.java` (the matched file
+  must end with one of these: a directory or suffix pin is otherwise blind to
+  language, and `pkg/.` would also match the `.md` beside the Go files), `^`
+  (no path segment of the matched file is a vendored directory such as
+  `third_party` or `vendor`) and `!_test.go` (the matched file must not end
+  with it). The kind is read after the flags are stripped; a resolver never
+  writes a path pin whose own path holds a flag character.
 - **Confidence is the pin kind's**, so it never depends on which other pins a
   row was written with. Precedence runs down the table: each row's pin leaves
   out every file a higher-precedence pin of the same call (the same caller and
@@ -184,12 +193,47 @@ anonymous function (a callback, an IIFE) are still not attributed to anyone.
    unclosed brace near the top, now 0.13 s.)
 3. Text is always read from the original bytes.
 
-## Later slices
+## Go (`devgraph/indexer/go/extractor.py`)
 
-- **Go:** an import resolves by the longest in-repo module path over every
-  `go.mod` (and `go.work`, and in-repo `replace` targets) to an anchored
-  directory pin with `!_test.go`; calls by package, receiver type and struct
-  field type.
+Imports: every in-repository module path (each go.mod's `module`, each local
+`replace` of a go.mod or go.work) names a directory; an import path resolves
+by the longest one it is under, unless the directory it lands in has a go.mod
+of its own below that module's (a nested module is not part of its parent).
+The import is a directory pin to the package's non-test Go files
+(`cache/.?.go!_test.go`, resolved); any other import is external, with no edge
+(no more bare import-path targets, and no `_find_module_path`: the root
+go.mod alone was read before). An unaliased import is used by its path's last
+element, skipping a major version (`chi/v5` is `chi`).
+
+Tiers, first match wins:
+
+1. `f()` declared in the file: this file.
+2. `pkg.F()` on an import: its package's directory; nothing for an external
+   package. A package clause can name a package otherwise than its directory
+   (`internal/legacydb` declaring `package db`), and every import must be
+   used, so an unknown qualifier is any unaliased in-repo import whose path
+   name the file never uses.
+3. Any other `f()`: the file's package directory (and a dot-imported
+   package's); a builtin (`len`, `append`) or a local function value links
+   nothing.
+4. `x.m()` on a typed `x`: the receiver, a parameter, `var x T`, `x := T{}`
+   (or `&T{}`, `new(T)`), a field of a struct declared in the file (`c.s.Get()`
+   with `s *store.Store`), what an in-file function returns, or what a
+   package's function returned (`conn := db.Open()` makes `conn` some type of
+   `db`). The method resolves to this file when its type and the method are
+   declared here, else to the type's package directory at package confidence
+   (`~`: methods are named bare, so another type of the package can have one
+   of the name). A builtin or external type links nothing.
+5. Anything else: a bare-name row that never ends at its caller, unless the
+   method is in `STOP_METHODS["go"]`.
+
+A pin to the file's own package leaves tests out from a non-test file
+(`!_test.go`), keeps them from a test file of the package, and reaches only
+the directory's test files from an external test package (`package x_test`,
+`?_test.go`). Build-tag variants (`evict_linux.go`, `evict_other.go`) both
+match: genuinely several targets.
+
+## Later slices
 - **Java/Kotlin:** a source root from the package declaration; an import gives
   an anchored class file and a package-confidence suffix pin (multi-module
   builds, vendored duplicates); wildcards anchored and suffix directory pins.
@@ -212,7 +256,10 @@ correct link, its confidence reported apart. `tests/scripts/test_measure_fixture
 asserts the targets, a strict xfail for each language not landed yet.
 
 - **M1** multi-target `CALLS` (one caller, one callee name, several targets) by
-  confidence. Target: resolved under 2 % of resolved edges.
+  confidence. Target: resolved under 2 % of resolved edges, not counting a
+  group whose every target the truth calls (Go's `store.New()` and
+  `cache.New()` from one caller, a function declared once per build tag):
+  that is no fan-out to a wrong file.
 - **M2** precision of linked `CALLS` against the truth (resolved and all
   edges reported too). Target: at least 98 %, and no resolved edge between two
   directories without an `IMPORTS` between their files.
@@ -221,8 +268,9 @@ asserts the targets, a strict xfail for each language not landed yet.
   reported). Target: 95 %, and no stoplisted name in the PageRank top five
   unless the truth calls it there.
 - **M5** every named site: each `calls` row with a `note` present (and none of
-  its `not_files`), each `no_edge` absent; for Kotlin, every expected symbol
-  extracted.
+  its `not_files`, unless the truth lists that file as a target of the same
+  caller and name too), each `no_edge` absent; for Kotlin, every expected
+  symbol extracted.
 - **M6** cost: the fixture's `full_scan` and DevGraph's within +15 % of
   BEFORE, the largest `name_refs` under 1 MiB, and the relink benchmark
   (`test_name_ref_relink_benchmark`) green.

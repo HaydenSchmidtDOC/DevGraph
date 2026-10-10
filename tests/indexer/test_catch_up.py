@@ -191,7 +191,7 @@ def _routed_by_index_single_path(root, path, docs_root, mentions_enabled):
     )}
     return dispatch._index_single_path(
         MagicMock(), "r", root, resolved, resolved.relative_to(root.resolve()).as_posix(),
-        docs_root, mentions_enabled, None, config=None, batch_services=set(), **lists, **extractions,
+        docs_root, mentions_enabled, config=None, batch_services=set(), **lists, **extractions,
     ) > 0
 
 
@@ -517,9 +517,8 @@ def _extract(kind: str, rel: str, content: str):
     extractors = {
         "py": extract_python_file, "ts": extract_js_file, "js": extract_js_file, "cs": extract_csharp_file,
         "cpp": extract_cpp_file, "java": extract_java_file, "rs": extract_rust_file, "kt": extract_kotlin_file,
+        "go": extract_go_file,
     }
-    if kind == "go":
-        return extract_go_file(content, rel, "r", "example.com/app")
     return extractors[kind](content, rel, "r")
 
 

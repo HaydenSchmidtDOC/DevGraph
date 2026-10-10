@@ -66,7 +66,8 @@ func ProcessData(data string) {
     # Struct embedding: UserService EXTENDS BaseService
     assert ("Class", "UserService", "EXTENDS", "Class", "BaseService") in rel_tuples
 
-    assert ("Module", "test_module.go", "IMPORTS", "Module", "fmt") in rel_tuples
+    # fmt is outside the repository: no IMPORTS edge (see test_go_calls.py).
+    assert not any(t[2] == "IMPORTS" for t in rel_tuples)
 
 
 def test_extract_empty_file():
@@ -121,9 +122,7 @@ func caller() {
 
 
 def test_calls_edge_for_method_call_via_selector():
-    """obj.method() resolves to the method's simple name — no type info, so
-    this extractor links by name, not by resolved type.
-    """
+    """A method call on the receiver links the receiver type's method."""
     source_code = """package foo
 
 type Service struct{}
@@ -163,8 +162,8 @@ func (s *Service) Helper() {
     calls_by_pair = {
         (r.from_name, r.to_name): r.properties for r in result.relationships if r.rel_type == "CALLS"
     }
-    assert calls_by_pair[("Process", "Helper")] == {"caller_class": "Service"}
-    assert calls_by_pair[("freeCall", "helper")] is None
+    assert calls_by_pair[("Process", "Helper")] == {"caller_class": "Service", "confidence": "resolved"}
+    assert calls_by_pair[("freeCall", "helper")] == {"confidence": "resolved"}
 
 
 def test_pointer_and_value_receivers_attribute_to_same_struct():
@@ -188,50 +187,6 @@ func (s Service) ValueMethod() {
     }
     assert ("Class", "Service", "CONTAINS", "Function", "PointerMethod") in rel_tuples
     assert ("Class", "Service", "CONTAINS", "Function", "ValueMethod") in rel_tuples
-
-
-def test_intra_module_import_resolves_to_file_guess():
-    """An import path under the repo's own module (per go.mod) gets an
-    extra same-repo file-path guess, alongside the bare import path.
-    """
-    result = extract_go_file(
-        'package foo\n\nimport "myproject/pkg/sub"\n',
-        "main.go",
-        "test_repo",
-        module_path="myproject",
-    )
-    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "myproject/pkg/sub" in targets  # bare path, kept for compatibility
-    assert "pkg/sub/sub.go" in targets  # same-repo file-path guess
-
-
-def test_external_import_has_no_extra_guess_when_module_known():
-    """When go.mod's module path is known, a genuinely external import
-    (outside this repo's module) gets no extra file-path guess — it's
-    expected not to resolve, same as Python's third-party-import behavior.
-    """
-    result = extract_go_file(
-        'package foo\n\nimport "github.com/someone/pkg"\n',
-        "main.go",
-        "test_repo",
-        module_path="myproject",
-    )
-    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert targets == {"github.com/someone/pkg"}
-
-
-def test_import_without_known_module_path_still_gets_a_guess():
-    """When go.mod isn't available (module_path=None), every import gets a
-    best-effort last-path-segment same-repo guess.
-    """
-    result = extract_go_file(
-        'package foo\n\nimport "path/to/pkg"\n',
-        "main.go",
-        "test_repo",
-    )
-    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "path/to/pkg" in targets
-    assert "pkg/pkg.go" in targets
 
 
 def test_calls_targets_are_function_label():

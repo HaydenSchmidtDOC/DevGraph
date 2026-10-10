@@ -53,7 +53,7 @@ from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import DocsExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.csharp.extractor import extract_csharp_file
-from devgraph.indexer.go.extractor import _find_module_path, extract_go_file
+from devgraph.indexer.go.extractor import extract_go_file
 from devgraph.indexer.java.extractor import extract_java_file
 from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.kotlin.extractor import extract_kotlin_file
@@ -642,7 +642,7 @@ def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, applied
 def index_paths(
     engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
     mentions_enabled: bool = False, sync_provider: bool = True, relink_outside: bool = True,
-    skipped: dict[str, str] | None = None,
+    skipped: dict[str, str] | None = None, resolver: dict[str, dict] | None = None,
 ) -> int:
     """Index a set of changed files, routing each to its extractor by name/extension.
 
@@ -672,6 +672,9 @@ def index_paths(
             path, with why (`_skip_reason`). Its graph nodes are deleted, so
             a file that grows past the size limit or becomes ignored leaves
             the graph, as a full scan would leave it out.
+        resolver: The resolver configuration's fingerprints to extract
+            under (resolver_config.fingerprints: the go.mod and go.work files
+            it found); None reads the ones the graph was built with.
 
     Returns:
         Number of files actually indexed, including those referrers
@@ -703,15 +706,20 @@ def index_paths(
     kt_files: list[str] = []
     kt_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
-    # Same cross-link-on-second-pass pattern as the .py branch, kept as a
-    # parallel list rather than folded into py_files/py_extractions since Go
-    # extraction needs go.mod's module path (resolved once per batch, not
-    # per file) that the Python branch has no equivalent of.
     go_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
-    module_path = _find_module_path(repo_root)
-    # The resolver configuration (tsconfig path aliases), read once for the
-    # batch; see sync_resolver_config for when a change to it re-indexes.
-    config = ResolverConfig(repo_root)
+
+    # The resolver configuration (tsconfig path aliases, go.mod module
+    # paths), read once for the batch under the fingerprint it was taken for
+    # (the graph's, unless the caller has a newer one); see
+    # sync_resolver_config for when a change to it re-indexes.
+    def go_files() -> list[str] | None:
+        stored = resolver if resolver is not None else engine.read_resolver_config(repo_id)
+        go = stored.get("go")
+        if go is None:
+            return None
+        return [rel for rel in go.get("inputs", []) if posixpath.basename(rel) in ("go.mod", "go.work")]
+
+    config = ResolverConfig(repo_root, go_files=go_files)
     # Markdown files whose cross-file edges are resolved after every other
     # node in the batch exists (see the docs/mentions passes below).
     docs_files: list[Path] = []
@@ -779,7 +787,7 @@ def index_paths(
                 return
             indexed += _index_single_path(
                 engine, repo_id, repo_root, resolved, rel_path,
-                docs_root, mentions_enabled, module_path, config,
+                docs_root, mentions_enabled, config,
                 py_files, py_extractions, js_files, js_extractions,
                 cs_files, cs_extractions, cpp_files, cpp_extractions,
                 java_files, java_extractions, rs_files, rs_extractions,
@@ -1056,7 +1064,6 @@ def _index_single_path(
     rel_path: str,
     docs_root: Path | None,
     mentions_enabled: bool,
-    module_path: str | None,
     config: ResolverConfig,
     py_files: list[tuple[str, str]],
     py_extractions: dict[str, tuple[list[dict], list[dict]]],
@@ -1192,7 +1199,7 @@ def _index_single_path(
         kt_extractions[rel_path] = (nodes, rels)
     elif "go" in routes:
         content = read_source(resolved)
-        result = extract_go_file(content, rel_path, repo_id, module_path)
+        result = extract_go_file(content, rel_path, repo_id, config)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above:
@@ -2038,7 +2045,8 @@ def sync_resolver_config(
                     ", ".join(changed), len(files))
         if files:
             indexed = index_paths(
-                engine, repo_id, repo_root, files, docs_path=docs_path, mentions_enabled=mentions_enabled
+                engine, repo_id, repo_root, files, docs_path=docs_path, mentions_enabled=mentions_enabled,
+                resolver=current,
             )
     if current != stored:
         engine.write_resolver_config(repo_id, current)
@@ -2099,6 +2107,7 @@ def full_scan(
         sync_provider=False,  # applied just above
         relink_outside=False,  # every file is in the batch
         skipped=left_out,
+        resolver=resolver,
     )
     if left_out:
         counts = Counter(left_out.values())

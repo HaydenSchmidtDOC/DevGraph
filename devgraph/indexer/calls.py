@@ -11,7 +11,7 @@ from __future__ import annotations
 from devgraph.graph.schema import PIN_CONFIDENCE, pin_kind
 from devgraph.indexer.common import GraphRelationship, module_pin_name, pin_excludes
 
-__all__ = ["STOP_METHODS", "STOP_TYPES", "call_rows", "import_rows"]
+__all__ = ["STOP_METHODS", "STOP_TYPES", "CallSites", "call_rows", "import_rows"]
 
 _JS_METHODS = frozenset({
     # Array
@@ -215,3 +215,39 @@ def import_rows(file_path: str, repo_id: str, files: set[str], pins: set[str]) -
             ))
     return rows
 
+
+
+class CallSites:
+    """One file's resolved call sites, collapsed per caller and callee name
+    as `call_rows` wants them."""
+
+    def __init__(self) -> None:
+        # (caller label, caller name) -> callee name -> [pins, bare?, caller classes, every bare site a member call?]
+        self._calls: dict[tuple[str, str], dict[str, list]] = {}
+
+    def add(
+        self, caller_label: str, caller_name: str, caller_class: str | None, name: str,
+        pins: list[str] | None, member: bool = False,
+    ) -> None:
+        """One call site of `name`: to `pins`, or (None) by bare name, which
+        `member` (a call on a receiver nothing types) keeps off the caller
+        itself."""
+        entry = self._calls.setdefault((caller_label, caller_name), {}).setdefault(name, [set(), False, set(), True])
+        if pins is None:
+            entry[1] = True
+            entry[3] = entry[3] and member
+        else:
+            entry[0].update(pins)
+        if caller_class:
+            entry[2].add(caller_class)
+
+    def rows(self, file_path: str, repo_id: str) -> list[GraphRelationship]:
+        return [
+            row
+            for (caller_label, caller_name), by_name in sorted(self._calls.items())
+            for name, (pins, bare, classes, no_self) in sorted(by_name.items())
+            for row in call_rows(
+                caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id,
+                no_self=no_self,
+            )
+        ]

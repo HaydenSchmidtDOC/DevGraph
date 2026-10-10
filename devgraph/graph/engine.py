@@ -32,6 +32,7 @@ from devgraph.graph.schema import (
     RELATIONSHIP_TYPES,
     RESERVED_NODE_PROPERTIES,
     SOURCE_FILE_LABELS,
+    VENDORED_DIRS,
     constraint_statements,
     lookup_index_statements,
     pin_kind,
@@ -698,7 +699,7 @@ def _pin(file: str | None) -> str:
 
 
 #: The pin kinds that match a set of files rather than one (see `_pin`).
-_PATH_PINS = frozenset({"dir", "suffix", "suffix_dir", "prefix"})
+_PATH_PINS = frozenset({"dir", "loose_dir", "suffix", "suffix_dir", "prefix"})
 
 
 def _group_rels_by_triple(
@@ -810,8 +811,11 @@ _ADD_ORIGIN = (
 def _pin_test(pin: str, file: str) -> str:
     """Cypher for graph/schema.py's `pin_value` map `pin` matching the path
     `file`, as devgraph/indexer/common.py `pin_matches` defines it."""
+    vendored = "[" + ", ".join(f"'{name}'" for name in VENDORED_DIRS) + "]"
     return (
-        f"(({pin}.ns = '' OR NOT {file} ENDS WITH {pin}.ns) AND CASE {pin}.k "
+        f"(({pin}.ns = '' OR NOT {file} ENDS WITH {pin}.ns) "
+        f"AND (size({pin}.os) = 0 OR any(s IN {pin}.os WHERE {file} ENDS WITH s)) "
+        f"AND NOT ({pin}.nv AND any(s IN split({file}, '/') WHERE s IN {vendored})) AND CASE {pin}.k "
         f"WHEN 'file' THEN {file} = {pin}.v "
         f"WHEN 'dir' THEN {file} STARTS WITH {pin}.v AND NOT substring({file}, size({pin}.v)) CONTAINS '/' "
         f"WHEN 'suffix' THEN '/' + {file} ENDS WITH {pin}.v "

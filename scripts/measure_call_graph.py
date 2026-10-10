@@ -423,18 +423,24 @@ def fixture_metrics(engine: GraphEngine, repo_id: str, expected: dict, timings: 
     linked = resolved | by_conf.get("package", set())
     imports = _graph_imports(engine, repo_id)
 
-    # M1: edges from one caller to one callee name with more than one target.
-    groups: dict[tuple, list[str]] = {}
-    for (a, af, b, _bf), conf in edges:
-        groups.setdefault((a, af, b, conf), []).append(conf)
+    # M1: edges from one caller to one callee name with more than one target;
+    # the share leaves out a group whose every target the truth calls (Go's
+    # `store.New()` and `cache.New()` from one caller, or a function declared
+    # once per build tag): that is no fan-out to a wrong file.
+    groups: dict[tuple, list[tuple]] = {}
+    for key, conf in edges:
+        groups.setdefault((*key[:3], conf), []).append(key)
     multi: dict[str, int] = {}
+    multi_unflagged: dict[str, int] = {}
     for (_a, _af, _b, conf), hits in groups.items():
         if len(hits) > 1:
             multi[conf] = multi.get(conf, 0) + len(hits)
+            if not all(hit in truth for hit in hits):
+                multi_unflagged[conf] = multi_unflagged.get(conf, 0) + len(hits)
     m1 = {
         "calls_by_confidence": {conf: len(keys) for conf, keys in sorted(by_conf.items())},
         "multi_target_by_confidence": dict(sorted(multi.items())),
-        "resolved_multi_share": _ratio(multi.get("resolved", 0), len(resolved)),
+        "resolved_multi_share": _ratio(multi_unflagged.get("resolved", 0), len(resolved)),
     }
 
     # M2: precision, and resolved edges between directories with no IMPORTS
@@ -494,7 +500,12 @@ def fixture_metrics(engine: GraphEngine, repo_id: str, expected: dict, timings: 
         if not c.get("note") or c.get("ambiguous"):
             continue
         key = (c["caller"], c["caller_file"], c["callee"], c["callee_file"])
-        wrong = sorted(f for f in c.get("not_files", []) if (c["caller"], c["caller_file"], c["callee"], f) in every)
+        # A file the truth also calls from this caller under this name (one
+        # `New` through each of two packages) is not wrong at file grain.
+        wrong = sorted(
+            f for f in c.get("not_files", [])
+            if (c["caller"], c["caller_file"], c["callee"], f) in every - truth
+        )
         ok = key in every and not wrong
         sample.append({"site": f"{c['caller_file']}:{c['caller']} -> {c['callee_file']}:{c['callee']}",
                        "note": c["note"], "confidence": conf_of.get(key), "wrong_files": wrong, "ok": ok})
