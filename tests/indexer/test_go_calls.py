@@ -163,6 +163,66 @@ def test_a_package_named_unlike_its_directory_is_found_through_the_import_it_mus
     assert targets(source, "migrate", "Close", config=config) == {("internal/legacydb/.~?.go!_test.go", "package")}
 
 
+def test_a_renamed_import_binds_only_when_the_unknown_qualifiers_match_it_one_for_one(tmp_path):
+    """Two unknown qualifiers (`db` and a package-level `logger` declared in
+    another file) for one renamed import: neither is known to be it, so
+    both reach its directory only at package confidence."""
+    config = _config(tmp_path)
+    source = """
+        package main
+
+        import "example.com/shop/v2/internal/legacydb"
+
+        func migrate() {
+            db.Open("x")
+            logger.Info("migrating")
+        }
+    """
+    loose = {("internal/legacydb/.~?.go!_test.go", "package")}
+    assert targets(source, "migrate", "Open", config=config) == loose
+    assert targets(source, "migrate", "Info", config=config) == loose
+    # A local or a parameter is never an unknown qualifier.
+    one = """
+        package main
+
+        import "example.com/shop/v2/internal/legacydb"
+
+        func migrate(cfg Config) {
+            cfg.Load()
+            x := 1
+            db.Open(x)
+        }
+    """
+    assert targets(one, "migrate", "Open", config=config) == {("internal/legacydb/.?.go!_test.go", "resolved")}
+
+
+def test_a_version_directory_is_the_package_name_unless_it_is_the_modules_major_version(tmp_path):
+    config = _config(tmp_path)
+    source = """
+        package main
+
+        import (
+            "example.com/shop/v2"
+            "example.com/shop/v2/apis/apps/v1"
+            "github.com/go-chi/chi/v5"
+        )
+
+        func main() {
+            v1.Register()
+            shop.Start()
+            chi.NewRouter()
+            logger.Info()
+        }
+    """
+    # apis/apps/v1 is `package v1`, a directory of the module: used as v1,
+    # not a renamed import an unknown qualifier (logger) could be.
+    assert targets(source, "main", "Register", config=config) == {("apis/apps/v1/.?.go!_test.go", "resolved")}
+    # The module's own /v2 is its major version: the root package is used by its path name.
+    assert targets(source, "main", "Start", config=config) == {(".?.go!_test.go", "resolved")}
+    assert targets(source, "main", "NewRouter", config=config) == set()
+    assert targets(source, "main", "Info", config=config) == {(None, "name")}
+
+
 def test_an_untyped_receiver_keeps_a_bare_row_unless_its_method_is_stoplisted():
     source = """
         package main

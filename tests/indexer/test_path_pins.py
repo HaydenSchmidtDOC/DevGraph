@@ -54,6 +54,10 @@ def test_pin_kinds(pin, kind):
     ("/vendor/C.java^t", "core/vendor/C.java", True), ("/m/C.java^t", "core/src/test/java/m/C.java", False),
     ("/m/C.java^", "core/src/test/java/m/C.java", True), ("/test/.?.kt^t", "src/main/kotlin/test/a.kt", True),
     ("/m/.?.kt^t", "src/test/kotlin/m/a.kt", False), ("/m/.^", "vendor/m/a.kt", False),
+    # ^t leaves out conventional test roots only, not any directory named test.
+    ("/m/C.java^t", "test/m/C.java", True), ("/m/C.java^t", "tools/test/x/m/C.java", True),
+    ("/m/C.java^t", "lib/test/java/m/C.java", False), ("/m/C.java^t", "app/src/androidTest/java/m/C.java", False),
+    ("/m/C.java^t", "src/testFixtures/kotlin/m/C.java", False),
     ("a/b/.~", "a/b/c.go", True), ("a/b/.~?.go", "a/b/c/d.go", False),
 ])
 def test_pin_matches(pin, path, matches):
@@ -129,7 +133,7 @@ def engine():
 
 
 #: Segments that share prefixes, so `a/b/` must not match `a/bc/`.
-_SEGMENTS = ["a", "ab", "b", "bc", "m", "vendor", "third_party", "test"]
+_SEGMENTS = ["a", "ab", "b", "bc", "m", "vendor", "third_party", "test", "src", "java"]
 _NAMES = ["C.java", "a.py", "a_test.go", "x.go", "ab.py", "K.kt"]
 
 
@@ -375,3 +379,56 @@ def test_modules_carry_their_directory_and_basename(engine, repo_id, tmp_path):
     assert [(r["name"], r["dir"], r["dir_name"], r["base"]) for r in rows] == [
         ("a.py", "", "", "a.py"), ("pkg/sub/b.py", "pkg/sub", "sub", "b.py"),
     ]
+
+
+def test_a_directory_pin_seeks_its_files_not_every_node_of_the_name(engine, repo_id):
+    """S10 fan-in: with 300 packages each declaring `Get`, rows pinned to 30
+    package directories (`pK/.~?.go`, `pK/.?.go`, a `pK/` prefix) cost what
+    their own targets cost, not what every `Get` of the repository does: the
+    seek is a prefix range on the (repo_id, name, file) index. Bounded on
+    PROFILE db hits, so it holds on a noisy CI machine."""
+    from neo4j import ManagedTransaction
+
+    engine.init_schema()  # the (repo_id, name, file) index this seeks, on any database
+    packages = 300
+    engine.upsert_nodes(
+        [{"label": "Module", "repo_id": repo_id, "name": "main.go", "properties": {"source_file": "main.go"}}]
+        + [{"label": "Function", "repo_id": repo_id, "name": "main", "properties": {"file": "main.go"}}]
+        + [
+            {"label": "Function", "repo_id": repo_id, "name": "Get", "properties": {"file": f"p{i}/{f}"}}
+            for i in range(packages) for f in ("a.go", "b.go", "a_test.go")
+        ]
+    )
+    rows = [
+        rel.to_dict()
+        for i in range(30)
+        for pin in (f"p{i}/.~?.go!_test.go", f"p{i}/.?.go", f"p{i}/")
+        for rel in call_rows("Function", "main", "Get", {pin}, False, None, "main.go", repo_id)
+    ]
+    for row in rows:
+        row["from_file"] = row["origin"] = "main.go"
+    hits: list[int] = []
+    real = ManagedTransaction.run
+
+    def profiled(self, query, *args, **kwargs):
+        result = real(self, "PROFILE " + query, *args, **kwargs)
+        list(result)
+
+        def total(plan):
+            return plan.get("dbHits", 0) + sum(total(child) for child in plan.get("children", []))
+
+        hits.append(total(result.consume().profile))
+        return result
+
+    ManagedTransaction.run = profiled
+    try:
+        engine.upsert_relationships(rows)
+    finally:
+        ManagedTransaction.run = real
+    linked = engine.run_cypher(
+        "MATCH (:Function {repo_id: $r, name: 'main'})-[:CALLS]->(b) RETURN count(b) AS n", {"r": repo_id}
+    )[0]["n"]
+    assert linked == 30 * 3  # a.go and b.go of each, and its test file through the prefix
+    # Every Get of the repository is 900 nodes; 90 rows over them all would be
+    # about 80k hits. Seeking each row's own directory stays well under that.
+    assert sum(hits) < 15_000, hits

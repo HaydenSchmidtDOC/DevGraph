@@ -97,8 +97,9 @@ agree):
   confidence, the `loose_dir` kind), `?.go` or `?.kt,.java` (the matched file
   must end with one of these: a directory or suffix pin is otherwise blind to
   language, and `pkg/.` would also match the `.md` beside the Go files), `^`
-  (no path segment of the matched file is a vendored directory such as
-  `third_party` or `vendor`) and `!_test.go` (the matched file must not end
+  (no directory of the matched file's source root, the path before what the
+  pin matches, is a vendored one such as `third_party` or `vendor`; `^t`
+  nor is that root a conventional test root) and `!_test.go` (the matched file must not end
   with it). The kind is read after the flags are stripped; a resolver never
   writes a path pin whose own path holds a flag character.
 - **Confidence is the pin kind's**, so it never depends on which other pins a
@@ -208,7 +209,10 @@ The import is a directory pin to the package's non-test Go files
 (`cache/.?.go!_test.go`, resolved); any other import is external, with no edge
 (no more bare import-path targets, and no `_find_module_path`: the root
 go.mod alone was read before). An unaliased import is used by its path's last
-element, skipping a major version (`chi/v5` is `chi`).
+element, skipping a major version: any `vN` for an external path (`chi/v5` is
+`chi`), only the module's own for an in-repository one (`example.com/shop/v2`
+is `shop`, but `example.com/shop/v2/apis/apps/v1` is a directory, `package
+v1`).
 
 Tiers, first match wins:
 
@@ -216,8 +220,11 @@ Tiers, first match wins:
 2. `pkg.F()` on an import: its package's directory; nothing for an external
    package. A package clause can name a package otherwise than its directory
    (`internal/legacydb` declaring `package db`), and every import must be
-   used, so an unknown qualifier is any unaliased in-repo import whose path
-   name the file never uses.
+   used, so an unknown qualifier (no import, type or name the file
+   declares) may be an unaliased in-repo import whose path name the file
+   never uses. Only when the unknown qualifiers and such imports are as many
+   is it taken to be them (resolved); otherwise (a package-level `logger`
+   of another file beside `db`) it reaches them at package confidence (`~`).
 3. Any other `f()`: the file's package directory (and a dot-imported
    package's); a builtin (`len`, `append`) or a local function value links
    nothing.
@@ -231,6 +238,12 @@ Tiers, first match wins:
    of the name). A builtin or external type links nothing.
 5. Anything else: a bare-name row that never ends at its caller, unless the
    method is in `STOP_METHODS["go"]`.
+
+Function nodes are keyed by (name, file), with no receiver, so the
+directory pin of a bare `f()` (tiers 2 and 3) also matches a method `T.f`
+declared in that package, at resolved; the same holds for an unqualified
+Kotlin `f()` through its package or an imported function's directory. A file
+is the finest target there is (see Principle).
 
 A pin to the file's own package leaves tests out from a non-test file
 (`!_test.go`), keeps them from a test file of the package, and reaches only
@@ -250,9 +263,13 @@ resolved) and, by path suffix, its directory under every other root (another
 Maven or Gradle module, a test root: package confidence, S5). A suffix pin
 from code outside a vendored directory carries `^` (no `third_party` or
 `vendor` copy of the package: it is not on the classpath), from main code
-`^t` (no test root either: main never sees test sources). Only the source
-root, the path before what the suffix matches, is tested, so a package named
-`vendor` or `test` is still found.
+`^t` (no conventional test root either: main never sees test sources). A
+test root is a test source set (`src/test`, `src/androidTest`,
+`src/testFixtures`, `src/integrationTest`) or a module's `test` directory
+holding language source sets (`test/java`, `test/kotlin`;
+`graph/schema.py` `TEST_ROOTS`), not any directory named `test`. Only the
+source root, the path before what the suffix matches, is tested, so a
+package named `vendor` or `test` is still found.
 
 **Java.** `import a.b.C` (or a nested `a.b.Outer.Inner`, a static
 `a.b.C.m`: the first capitalised segment picks the file) is an `IMPORTS` edge
@@ -480,8 +497,11 @@ asserts the targets, a strict xfail for each language not landed yet.
   caller and name too), each `no_edge` absent; for Kotlin, every expected
   symbol extracted.
 - **M6** cost: the fixture's `full_scan` and DevGraph's within +15 % of
-  BEFORE, the largest `name_refs` under 1 MiB, and the relink benchmark
-  (`test_name_ref_relink_benchmark`) green.
+  BEFORE, the largest `name_refs` under 1 MiB, the relink benchmark
+  (`test_name_ref_relink_benchmark`) green, and the S10 fan-in
+  (`--fan-in`: one re-save of a `main.go` calling `pK.New()`, `x.Get()` and
+  `pK.Get()` in 30 of 400 packages that each declare them) costing what its
+  own targets cost.
 
 BEFORE, measured on this branch before any extractor change (sample lists
 left out; every edge carries no confidence, so nothing is linked yet):
@@ -628,11 +648,18 @@ paired timing):
 | Python on DevGraph, ts fixture | unchanged | slice A | M1-M5 identical (old and new code over the same tree; ts 41/41 sites, `IMPORTS` 24/24) | met |
 | M6 `full_scan` | ≤ +15 % | DevGraph 48.0 s; go 0.92 s, java 1.03 s, kotlin 0.92-1.09 s | DevGraph 52.6-53.0 s (+10 %); go 0.94 s, java 1.00 s, kotlin 1.03 s | met |
 | M6 largest `name_refs` | < 1 MiB | 229,842 B (DevGraph) | 229,842 B (DevGraph); 3,134 B (java) | met |
+| M6 S10 fan-in save | follows its targets | 3.6-4.7 s, 929k db hits (742k in one `Get` query) | 0.21-0.27 s, 5.9k db hits (1.3k at most per query) | met |
 
 - **Timing.** Old and new code alternated over the same tree on one
   machine: DevGraph two pairs of `--scan` runs; each fixture the median of
   six in-process `full_scan`s after two warm-ups (kotlin's two series gave
   +13 % and -5 %).
+- **Fan-in.** A directory, loose directory or prefix pin first sought every
+  node of the name and then filtered by path, so a re-save's cost grew with
+  how many packages declare `Get`. It now seeks the unique (repo_id, name,
+  file) index as a prefix range (`b.file STARTS WITH` the pin's path),
+  hinted like every other seek. `test_path_pins` bounds the db hits of 90
+  such rows among 900 same-named functions (about 3.2k; 166k before).
 - **Measure changes.** M1 leaves out a group whose every target the truth
   calls (Go's `store.New()` and `cache.New()` from one `main`, a function
   per build tag); M5 does not count a `not_files` entry the truth also lists

@@ -198,14 +198,18 @@ def _extract_imports(root: Node, source: bytes) -> list[tuple[str | None, str]]:
 _MAJOR_VERSION = re.compile(r"v[0-9]+")
 
 
-def _default_import_name(import_path: str) -> str:
+def _default_import_name(import_path: str, module: str | None = None) -> str:
     """The name an unaliased import is used by, as far as its path tells:
-    the last path element, skipping a major-version element (`chi/v5` is
-    `chi`) and a gopkg.in-style `.vN` (`yaml.v3` is `yaml`). A package
-    clause may name it otherwise (`legacydb/` declaring `package db`); see
-    `_GoResolver.unknown_qualifier`."""
+    the last path element, skipping a major-version element and a
+    gopkg.in-style `.vN` (`yaml.v3` is `yaml`). For an in-repository import
+    (`module` the module path it resolved by) the last element is a major
+    version only when it is the module's own (`example.com/shop/v2` is
+    `shop`; `example.com/shop/v2/apis/apps/v1` is a directory, `package
+    v1`); for an external one (`module` None) any `vN` is (`chi/v5` is
+    `chi`). A package clause may name it otherwise (`legacydb/` declaring
+    `package db`); see `_GoResolver.qualifier_dirs`."""
     parts = [part for part in import_path.split("/") if part]
-    if len(parts) > 1 and _MAJOR_VERSION.fullmatch(parts[-1]):
+    if len(parts) > 1 and _MAJOR_VERSION.fullmatch(parts[-1]) and (module is None or import_path == module):
         parts.pop()
     name = parts[-1] if parts else import_path
     name = re.sub(r"\.v[0-9]+$", "", name)
@@ -270,7 +274,8 @@ class _GoResolver:
         self.import_pins: set[str] = set()
         unnamed: list[tuple[str, str]] = []  # (default name, directory) of in-repo unaliased imports
         for name, path in _extract_imports(root, source):
-            folder = config.go_package_dir(path) if config is not None else None
+            found = config.go_package(path) if config is not None else None
+            module, folder = found if found is not None else (None, None)
             if folder is not None:
                 self.import_pins.add(_dir_pin(folder, ".go", "_test.go"))
             if name == "_":
@@ -279,7 +284,7 @@ class _GoResolver:
                 if folder is not None:
                     self.dot_dirs.append(folder)
                 continue
-            binding = name or _default_import_name(path)
+            binding = name or _default_import_name(path, module)
             self.bindings[binding] = folder
             if name is None and folder is not None:
                 unnamed.append((binding, folder))
@@ -313,19 +318,35 @@ class _GoResolver:
                         self.fields[type_name] = _struct_fields(body, source)
         # An unaliased in-repo import whose path name the file never uses as
         # a qualifier is used by its package clause's name instead (every
-        # import must be used): an unknown qualifier may be any of them.
-        qualifiers = set()
+        # import must be used). An unknown qualifier (no import, type or name
+        # the file declares) may be one of them, or a package-level variable
+        # of another file: only when the unknown qualifiers and those imports
+        # are as many are they taken to be them (resolved); otherwise an
+        # unknown qualifier reaches them at package confidence (`~`).
+        qualifiers: set[str] = set()
+        declared: set[str] = set()
 
         def walk(node: Node) -> None:
             if node.type in ("selector_expression", "qualified_type"):
                 operand = node.child_by_field_name("operand") or node.child_by_field_name("package")
                 if operand is not None and operand.type in ("identifier", "package_identifier"):
                     qualifiers.add(_text(operand, source))
+            elif node.type in ("short_var_declaration", "range_clause"):
+                left = node.child_by_field_name("left")
+                for name in (left.named_children if left is not None and left.type == "expression_list"
+                             else [left] if left is not None else []):
+                    if name.type == "identifier":
+                        declared.add(_text(name, source))
+            elif node.type in ("var_spec", "const_spec", "parameter_declaration",
+                               "variadic_parameter_declaration"):
+                declared.update(_text(name, source) for name in node.children_by_field_name("name"))
             for child in node.children:
                 walk(child)
 
         walk(root)
         self.renamed = sorted({folder for name, folder in unnamed if name not in qualifiers})
+        unknown = qualifiers - self.bindings.keys() - self.types - declared - set(self.functions)
+        self.renamed_loose = len(unknown) != len(self.renamed)
 
     # --- pins ----------------------------------------------------------------
 
@@ -358,6 +379,11 @@ class _GoResolver:
         if self.renamed:
             return tuple(self.renamed)
         return None
+
+    def qualifier_loose(self, qualifier: str) -> bool:
+        """Whether `qualifier_dirs` reaches its directories only at package
+        confidence: a renamed import an unknown qualifier may not be."""
+        return qualifier not in self.bindings and self.renamed_loose
 
     def bare_pins(self, name: str) -> list[str] | None:
         """Where an unqualified `name()` is declared: this file, else its
@@ -488,7 +514,8 @@ class _GoResolver:
                     return name, self.method_pins(("local", qualifier), name), True
                 folders = self.qualifier_dirs(qualifier)
                 if folders is not None:
-                    pins = [pin for folder in folders for pin in self._package_pins(folder)]
+                    loose = self.qualifier_loose(qualifier)
+                    pins = [pin for folder in folders for pin in self._package_pins(folder, loose)]
                     return (name, pins, False) if pins else None
         receiver = self.value_type(operand, scope)
         if receiver is not None:

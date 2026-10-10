@@ -376,6 +376,12 @@ class ResolverConfig:
         whose module holds that directory (a directory with a go.mod of its
         own below the module's is another module); None when there is none
         (an external package)."""
+        found = self.go_package(import_path)
+        return found[1] if found is not None else None
+
+    def go_package(self, import_path: str) -> tuple[str, str] | None:
+        """(the module path, the directory) `go_package_dir` resolves
+        `import_path` by, or None."""
         for prefix, folder in self.go_modules():
             if import_path == prefix or import_path.startswith(prefix + "/"):
                 rest = import_path[len(prefix):].strip("/")
@@ -385,7 +391,7 @@ class ResolverConfig:
                     and (found == other or found.startswith(other + "/"))
                     for other in self._go_mod_dirs
                 ):
-                    return found
+                    return prefix, found
         return None
 
     # --- Cargo.toml ----------------------------------------------------------------

@@ -185,7 +185,12 @@ def pin_matches(pin: str | None, path: str) -> bool:
         matched = ("/" + path[: len(path) - len(path.rsplit("/", 1)[-1])]).endswith(base[:-1])
     else:
         matched = path.startswith(base)
-    return matched and not any(segment in parts.skip for segment in pin_root(pin, path).split("/"))
+    if not matched or not (parts.skip or parts.skip_roots):
+        return matched
+    root = pin_root(pin, path)
+    return not any(segment in parts.skip for segment in root.split("/")) and not any(
+        fragment in f"/{root}/" for fragment in parts.skip_roots
+    )
 
 
 def _rank(pin: str) -> int:

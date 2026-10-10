@@ -884,10 +884,7 @@ _SCAN_AND_EXPORT = textwrap.dedent(
 )
 
 
-class _NoImportersEngine:
-    def find_importing_modules(self, repo_id, module_name):
-        return []
-
+class _UnitEngine:
     def list_file_nodes(self, repo_id, files):
         return set()
 
@@ -913,7 +910,7 @@ class TestDeterministicIndexOrder:
             return 1
 
         monkeypatch.setattr(dispatch, "_index_single_path", record)
-        index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {temp_repo / rel for rel in _ORDER_FIXTURE})
+        index_paths(_UnitEngine(), "_unit_order", temp_repo, {temp_repo / rel for rel in _ORDER_FIXTURE})
 
         assert seen == sorted(_ORDER_FIXTURE)
 
@@ -958,7 +955,7 @@ class TestDeterministicIndexOrder:
         with monkeypatch.context() as m:
             m.chdir(temp_repo)
             # As raw strings "/tmp/.../b.py" sorts before "a.py".
-            index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {Path("a.py"), (temp_repo / "b.py").resolve()})
+            index_paths(_UnitEngine(), "_unit_order", temp_repo, {Path("a.py"), (temp_repo / "b.py").resolve()})
 
         assert seen == ["a.py", "b.py"]
 
@@ -1537,11 +1534,13 @@ def test_a_directory_pin_is_tested_before_the_fileless_pin():
     assert {key[4] for key in groups} == {"file", "prefix"}
     (prefix_row,) = groups[("Function", "CALLS", "Function", "file", "prefix")]
     assert prefix_row["targets"] == [{
-        "to_name": "f", "to_file": "pkg/", "pin": {"k": "prefix", "v": "pkg/", "ns": "", "os": [], "nv": []},
+        "to_name": "f", "to_file": "pkg/", "pin": {"k": "prefix", "v": "pkg/", "ns": "", "os": [], "nv": [], "nr": []},
         "ex_files": ["pkg/a.py"], "ex_pins": [],
     }]
     match = _end_match("b", "Function", "to", "prefix", "t")
-    assert "USING INDEX SEEK b:Function(repo_id, name)" in match
+    # A prefix range of the file-keyed index (S10 fan-in); a suffix pin seeks by name.
+    assert "USING INDEX SEEK b:Function(repo_id, name, file)" in match and "b.file STARTS WITH t.pin.v" in match
+    assert "USING INDEX SEEK b:Function(repo_id, name) " in _end_match("b", "Function", "to", "suffix", "t")
     assert "WHEN 'prefix' THEN b.file STARTS WITH t.pin.v" in match
     assert "NOT b.file IN t.ex_files" in match and "NOT any(x IN t.ex_pins WHERE" in match
 

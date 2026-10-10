@@ -79,9 +79,6 @@ class _Engine:
     def __init__(self):
         self.deleted: list[str] = []
 
-    def find_importing_modules(self, repo_id, module_name):
-        return []
-
     def list_file_nodes(self, repo_id, files):
         return set()
 
