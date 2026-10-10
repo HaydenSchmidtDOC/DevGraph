@@ -19,7 +19,7 @@ measure = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(measure)
 
 #: Languages whose resolution has not landed yet.
-PENDING = {"csharp", "rust", "cpp"}
+PENDING = {"csharp", "cpp"}
 #: Named sites no resolver that reads only its own file can reach (see the
 #: spec's slice B results): `repo.size()` on an `AuditedRepo` field is the
 #: `size` AuditedRepo inherits from Repo, which only AuditedRepo.java says.

@@ -674,8 +674,9 @@ def index_paths(
             a file that grows past the size limit or becomes ignored leaves
             the graph, as a full scan would leave it out.
         resolver: The resolver configuration's fingerprints to extract
-            under (resolver_config.fingerprints: the go.mod and go.work files
-            it found); None reads the ones the graph was built with.
+            under (resolver_config.fingerprints: the go.mod, go.work and
+            Cargo.toml files it found); None reads the ones the graph was
+            built with.
 
     Returns:
         Number of files actually indexed, including those referrers
@@ -710,17 +711,20 @@ def index_paths(
     go_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     # The resolver configuration (tsconfig path aliases, go.mod module
-    # paths), read once for the batch under the fingerprint it was taken for
+    # paths, Cargo crate names), read once for the batch under the fingerprint it was taken for
     # (the graph's, unless the caller has a newer one); see
     # sync_resolver_config for when a change to it re-indexes.
-    def go_files() -> list[str] | None:
+    def config_files(lang: str, names: tuple[str, ...]) -> list[str] | None:
         stored = resolver if resolver is not None else engine.read_resolver_config(repo_id)
-        go = stored.get("go")
-        if go is None:
+        entry = stored.get(lang)
+        if entry is None:
             return None
-        return [rel for rel in go.get("inputs", []) if posixpath.basename(rel) in ("go.mod", "go.work")]
+        return [rel for rel in entry.get("inputs", []) if posixpath.basename(rel) in names]
 
-    config = ResolverConfig(repo_root, go_files=go_files)
+    config = ResolverConfig(
+        repo_root, go_files=lambda: config_files("go", ("go.mod", "go.work")),
+        rust_files=lambda: config_files("rust", ("Cargo.toml",)),
+    )
     # Markdown files whose cross-file edges are resolved after every other
     # node in the batch exists (see the docs/mentions passes below).
     docs_files: list[Path] = []
@@ -1172,7 +1176,7 @@ def _index_single_path(
         java_extractions[rel_path] = (nodes, rels)
     elif "rs" in routes:
         content = read_source(resolved)
-        result = extract_rust_file(content, rel_path, repo_id)
+        result = extract_rust_file(content, rel_path, repo_id, config)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-not-merely-upsert reasoning as the .py branch
@@ -1928,7 +1932,8 @@ def sync_resolver_config(
     mentions_enabled: bool = False,
 ) -> int:
     """Re-index every graph file of a language whose resolver configuration
-    (tsconfig/jsconfig, go.mod/go.work; see resolver_config.fingerprints)
+    (tsconfig/jsconfig, go.mod/go.work, Cargo.toml; see
+    resolver_config.fingerprints)
     changed since the graph was built, and record the new fingerprints.
 
     `touched` are a live batch's changed and deleted paths: nothing is

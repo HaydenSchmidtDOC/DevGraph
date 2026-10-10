@@ -36,8 +36,9 @@ target there is: every tier only picks files.
 ## Resolver configuration
 
 Some names cannot be resolved from a file's text alone: a TypeScript path
-alias (`@/lib/text`) and a Go import path (`example.com/app/store`) mean
-nothing without `tsconfig.json` or `go.mod`. These files are *resolver
+alias (`@/lib/text`), a Go import path (`example.com/app/store`) and another
+Rust crate's name (`shop_core::`) mean nothing without `tsconfig.json`,
+`go.mod` or `Cargo.toml`. These files are *resolver
 configuration*, declared inputs of extraction in the way a `.gitignore` is an
 input of the walk (`devgraph/indexer/resolver_config.py`):
 
@@ -53,8 +54,9 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
 - **Fingerprint.** Per language, a hash of the relevant content of every
   configuration file the walk finds (for TS: `baseUrl`, `paths`, `extends`,
   `references`, with every config those reach, whatever its name; for Go:
-  each go.mod's `module` line and each go.work; a compiler flag or a
-  `require` bump never counts), stored on the Repository node
+  each go.mod's `module` line and each go.work; for Rust: each Cargo.toml's
+  library crate name and root file; a compiler flag, a `require` bump or a
+  dependency or version change never counts), stored on the Repository node
   (`resolver_config`) with the list of paths it looked at, found or not.
 - **Triggers.** A live batch (`RepoSync.on_changes`) that changes or deletes a
   path on that list, a directory holding one, or a path named like a
@@ -304,6 +306,60 @@ files, as in Java. Calls, first match wins:
    directory pins, package confidence).
 5. Anything else: a bare-name row off its caller, unless stoplisted.
 
+## Rust (`devgraph/indexer/rust/extractor.py`)
+
+**Crates and modules.** A file's crate root is the nearest `src/` above it;
+`src/bin/x.rs` and `src/bin/x/main.rs` are crate roots of their own, as is
+every file directly in `tests/`, `benches/` or `examples/` (an integration
+test is its own crate); a file under none of these is in a crate rooted at
+its own directory. The module path follows from the root (`src/a/b.rs` is
+`a::b`, `src/a/mod.rs` is `a`, `lib.rs` and `main.rs` the root), and a
+module `a::b` is `<root>/a/b.rs` or `<root>/a/b/mod.rs` (resolved), or this
+file for an inline `mod x {}` of it. `crate::`, `self::` and `super::`
+(repeatable, from inside an inline module too) walk the module tree. Another
+crate is named by its package (the resolver configuration: each Cargo.toml's
+`[lib]` name, else its `[package]` name with `-` as `_`, and its `[lib]`
+path, else `src/lib.rs`): its files are written as suffix pins of their
+whole path, package confidence, since a repository can hold two packages of
+one name (a crate's own `tests/` reaches it the same way). Without a
+Cargo.toml naming it, a crate is external. `#[path]` attributes are not
+read.
+
+**`IMPORTS`.** `mod foo;` names the child module of the file's own module
+(the 2018 rule: `mod user;` in `src/models.rs` is `src/models/user.rs`, which
+was `src/user.rs` before); a `use` names the module of its item: `use
+a::b::Type` is a::b, and a lowercase `use a::b::x` is the module a::b::x when
+the file writes `x::`, the module a::b when it calls `x(`, else either. A
+glob names its module. std, `::x` and any crate the configuration does not
+name give no edge, and a `use` of an inline module of the file none.
+
+**Calls**, first match wins:
+
+1. `f()` declared in the file (nested functions included): this file.
+2. A `use` binding or a path, `m::f()`, `crate::m::f()`, `super::super::m::f()`,
+   `shop_core::f()`, `Type::f()`: the module's files, and the recursive
+   prefix of its directory (package: an item re-exported from a submodule).
+   `Type::f()` on a type declared in the file, and `Self::f()`, is this
+   file. A path through std or an external crate links nothing, nor does a
+   library type's (`Vec::new()`, `HashMap::new()`, `String::from()`:
+   `STOP_TYPES["rust"]`), nor a bare `f()` nothing declares or imports (a
+   glob import's modules excepted).
+3. `self.m()` and a typed receiver: a parameter (`c: &Client`), `let x: T`,
+   `let x = T::new()` (any associated function of a type) or `T { .. }`, a
+   field of a struct declared in the file, the element of a `for` loop over
+   a `Vec<T>`, slice or array (`for order in &self.orders`); `Box`, `Rc` and
+   `Arc` are seen through. This file when the type and the method are
+   declared here, else the type's module; a library type links nothing.
+4. Anything else: a bare-name row off its caller, unless the method is in
+   `STOP_METHODS["rust"]`.
+
+The arguments of a macro invocation (`println!("{}", shop_core::version())`,
+`assert_eq!(user.total(), 500)`) are reparsed as a call's arguments, so the
+calls in them are found; the macro itself (`format!`) is no call. A method
+a type gets from a trait implemented in another file is not found through
+a receiver of that type: the call keeps a bare-name row when the type is
+declared in the file, and links the type's module otherwise.
+
 ## No reverse dependents
 
 With Go, Java and Kotlin resolved, every code edge is a function of its
@@ -322,9 +378,6 @@ nested go.mod.
 
 - **C#:** a referenced type `T` gives the suffix pin `/T.cs`, so C# calls
   resolve at package confidence.
-- **Rust:** crate roots (`src/`, `tests/`, `benches/`, `examples/`,
-  `src/bin/*.rs`), `crate::`/`self::`/`super::` paths, `mod foo;` in `src/a.rs`
-  naming `src/a/foo.rs`.
 - **C++:** a quoted `#include` gives the relative file and a suffix pin, plus
   same-stem sources.
 

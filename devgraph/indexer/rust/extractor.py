@@ -3,11 +3,11 @@
 Mirrors `devgraph/indexer/python/extractor.py`'s shape and philosophy
 (Implementation Plan #8, row 5): parse with Tree-sitter, walk the tree, and
 emit `GraphNode`/`GraphRelationship` records via the shared
-`devgraph.indexer.common` dataclasses -- name-based CALLS resolution
-(over-link same-named calls rather than require type resolution) and
-heuristic, non-materializing-guess IMPORTS resolution (a guessed target
-that doesn't correspond to a real indexed Module node just never becomes an
-edge, since `upsert_relationship` only MATCH-links existing nodes).
+`devgraph.indexer.common` dataclasses, with CALLS and IMPORTS resolved
+through crate roots, module paths and types (see Resolution below): a
+candidate target that doesn't correspond to a real indexed node just never
+becomes an edge, since `upsert_relationship` only MATCH-links existing
+nodes.
 
 Rust has no direct equivalent of Python's `class`/`def`, so this extractor
 makes a few judgment calls, documented here since they're not obvious from
@@ -33,42 +33,48 @@ the graph schema alone:
   Function nodes, mirroring how the Python extractor only extracts actual
   definitions, never bare declarations.
 - Inline `mod foo { .. }` blocks are flattened into their enclosing scope
-  (v1 does not model inline-module namespacing/scoping -- a struct declared
-  inside an inline `mod` is treated exactly as if it were declared at the
-  enclosing level). File-based `mod foo;` declarations are handled as
-  IMPORTS (see below), not flattened, since they point at another file.
+  for nodes (a struct declared inside an inline `mod` is a Class of the
+  file like any other), but paths inside one resolve from module foo
+  (`super::` there is the file's own module).
 
-IMPORTS resolution (single-crate scope only, per the Implementation Plan --
-Cargo workspaces/multi-crate resolution is out of scope for v1):
+Resolution (see docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md,
+Rust). A file's crate root is the nearest `src/` above it (`src/bin/x.rs`
+and `src/bin/x/main.rs` are crate roots of their own), else the nearest
+`tests/`, `benches/` or `examples/` (each file directly in one is a crate
+root), else its own directory; its module path follows from there
+(`src/a/b.rs` is `a::b`, `src/a/mod.rs` is `a`, `lib.rs`/`main.rs` the
+root). A module `a::b` is the file `<root>/a/b.rs` or `<root>/a/b/mod.rs`,
+or this file for one of its inline modules; another workspace crate's name
+(its Cargo.toml, the resolver configuration) names that crate's library,
+written as suffix pins (package confidence: two packages can share a name).
 
-- `mod foo;` / `pub mod foo;` (a file-based submodule declaration) resolves
-  to a same-directory file guess: both `{dir}/foo.rs` and `{dir}/foo/mod.rs`
-  are emitted as candidate IMPORTS targets, since only one of the two is
-  the actual on-disk convention for any given module and the wrong guess
-  simply never materializes an edge.
-- `use crate::foo::bar::Baz;` (crate-relative) is resolved by converting
-  `::` to `/` under an assumed crate root of `src/` -- the near-universal
-  convention for a single-crate Cargo project's `src/lib.rs`/`src/main.rs`
-  root (a workspace with a different layout won't resolve correctly; see
-  module-level limitation note below). Because Tree-sitter gives no type
-  information, whether the last path segment (`Baz`) is itself a module or
-  an item defined inside a module is ambiguous, so both readings are
-  emitted as candidate targets: `src/foo/bar/Baz.rs` (or `/mod.rs`) in case
-  `Baz` is itself a module, and `src/foo/bar.rs` (or `/mod.rs`) in case
-  `Baz` is an item inside the `bar` module -- exactly one is normally real.
-- `use std::...` and any other non-`crate::`-rooted `use` (external crates,
-  `self::`, `super::`) is skipped entirely, per the plan -- no same-repo
-  guess is attempted for paths that aren't obviously crate-relative.
+- IMPORTS: `mod foo;` names the child module of the file's own (the 2018
+  rule: `mod user;` in `src/models.rs` is `src/models/user.rs`); a `use`
+  path names the module of its item (`use a::b::Type` is a::b; a lowercase
+  name is the module a::b::x when the file writes `x::`, the item's module
+  a::b when it calls `x(`, else either). `crate::`, `self::` and `super::`
+  are followed; std and any external crate give no edge.
+- CALLS, by the first tier that applies: `f()` declared in the file -> this
+  file; a `use` binding or a path (`m::f()`, `crate::m::f()`,
+  `shop_core::f()`, `Type::f()`) -> its module's files (and the recursive
+  prefix of its directory, package: an item re-exported from a submodule),
+  `Type::f()` on a type declared here -> this file; `self.m()` and a method
+  on a typed receiver (a parameter, `let x: T`, `let x = T::new()` or
+  `T { .. }`, a field of a struct declared here, the element of a `for`
+  loop over a `Vec<T>` or slice) -> this file when the type and the method
+  are declared here, else the type's module; a std type (calls.STOP_TYPES)
+  or a path outside the repository links nothing, and neither does a bare
+  `f()` nothing declares or imports; an untyped receiver keeps a bare-name
+  edge that never ends at its caller, unless its method is stoplisted
+  (calls.STOP_METHODS["rust"]). The arguments of a macro invocation
+  (`println!("{}", f(x))`) are reparsed for their calls. `#[path]`
+  attributes are not read.
 
 Known limitations (documented per the Implementation Plan's per-language
 table):
-- Cargo workspaces / multi-crate repos are out of scope; the `src/` crate
-  root assumption breaks for any non-standard layout.
-- `use self::...` / `use super::...` and glob `use crate::foo::*;` imports
-  are not resolved to per-item edges (the wildcard case resolves only the
-  module itself, not the items it re-exports).
-- Inline `mod { }` scoping is flattened rather than modeled as a nested
-  namespace.
+- A method inherited through a trait implemented in another file is not
+  found through a typed receiver of the implementing type; such a call
+  keeps a bare-name edge.
 - Trait supertraits (`trait A: B`) do not emit an EXTENDS edge -- only
   `impl Trait for Type` does, per the Implementation Plan's brief.
 """
@@ -76,19 +82,21 @@ table):
 from __future__ import annotations
 
 import logging
+import posixpath
+import re
 from pathlib import Path
+from typing import NamedTuple
 
 import tree_sitter_rust as tsrust
 from tree_sitter import Language, Node, Parser
 
+from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
 from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.resolver_config import ResolverConfig
 
 logger = logging.getLogger(__name__)
 
 _RUST_LANGUAGE = Language(tsrust.language())
-
-# Assumed crate root for `use crate::...` resolution -- see module docstring.
-_CRATE_ROOT = "src"
 
 # Node types that introduce a new definition scope; call-target walking must
 # not descend into these when scanning an enclosing body, so calls get
@@ -204,192 +212,616 @@ def _type_name(node: Node | None, source: bytes) -> str | None:
     return _text(node, source)
 
 
-def _callee_simple_name(func_node: Node, source: bytes) -> str | None:
-    """Resolve a call expression's `function` field to a simple callee name,
-    same philosophy as Python's `_callee_simple_name`.
+# --- resolution ------------------------------------------------------------------
 
-    - `foo()` -> 'foo'
-    - `self.foo()` / `obj.foo()` -> 'foo' (the field name)
-    - `Foo::new()` / `pkg::Foo::new()` -> 'new' (the last scoped-path
-      segment -- structural, not type-resolved, so this over-links
-      same-named associated functions across types, same trade-off Python
-      makes for `self.foo()`).
-    - `(get())()` / nested calls -> resolves to the innermost call's own
-      callee name.
-    """
-    if func_node.type == "identifier":
-        return _text(func_node, source)
-    if func_node.type == "field_expression":
-        field = func_node.child_by_field_name("field")
-        if field is not None:
-            return _text(field, source)
-    if func_node.type == "scoped_identifier":
-        name = func_node.child_by_field_name("name")
-        if name is not None:
-            return _text(name, source)
-    if func_node.type == "call_expression":
-        inner_func = func_node.child_by_field_name("function")
-        if inner_func is not None:
-            return _callee_simple_name(inner_func, source)
-    if func_node.type == "parenthesized_expression":
-        for child in func_node.named_children:
-            return _callee_simple_name(child, source)
-    return None
+#: Directories whose files are crate roots of their own (S9): an integration
+#: test, a benchmark, an example.
+_OWN_ROOT_DIRS = ("tests", "benches", "examples")
+#: Generic types a method call sees through (auto-deref).
+_SMART_POINTERS = ("Box", "Rc", "Arc")
+#: Generic containers a `for` loop takes its element type from.
+_CONTAINERS = ("Vec", "VecDeque", "HashSet", "BTreeSet", "Option", "LinkedList", "BinaryHeap")
 
 
-def _extract_call_targets(body: Node, source: bytes) -> list[str]:
-    """Walk a body for call expressions, same philosophy as Python's
-    `_extract_call_targets`: name-based, over-linking rather than
-    under-linking, and not descending into a nested definition's own scope
-    (see `_SCOPE_BOUNDARY_TYPES`)."""
-    targets: list[str] = []
+class _Crate(NamedTuple):
+    """A crate: its root directory, the files its root module can be, and
+    whether it is reached by another crate's name (Cargo configuration:
+    package confidence, written as suffix pins)."""
 
-    def walk(node: Node) -> None:
-        if node.type in _SCOPE_BOUNDARY_TYPES:
-            return
-        if node.type == "call_expression":
-            func = node.child_by_field_name("function")
-            if func is not None:
-                name = _callee_simple_name(func, source)
-                if name:
-                    targets.append(name)
-        for child in node.children:
-            walk(child)
-
-    walk(body)
-    return targets
+    root: str
+    root_files: tuple[str, ...]
+    cross: bool = False
 
 
-def _use_segments(node: Node, source: bytes) -> list[str] | None:
-    """Render a `use` path node (`crate`/`identifier`/`scoped_identifier`/
-    `use_as_clause`) as its dotted-path segments, e.g. `crate::foo::Bar` ->
-    ['crate', 'foo', 'Bar']."""
-    if node.type in ("identifier", "crate"):
+class _Module(NamedTuple):
+    crate: _Crate
+    path: tuple[str, ...]
+
+
+class _Type(NamedTuple):
+    """A type as its path segments (`("crate", "net", "Client")`), and the
+    element type a `for` loop over it yields."""
+
+    segs: tuple[str, ...]
+    element: "_Type | None" = None
+
+
+def _join(*parts: str) -> str:
+    return "/".join(part for part in parts if part)
+
+
+def _layout(file_path: str) -> tuple[_Crate, tuple[str, ...]]:
+    """The crate a file belongs to and the file's module path in it. The
+    root is the nearest `src/` above the file (`src/bin/x.rs` and
+    `src/bin/x/main.rs` are crate roots of their own), else the nearest
+    `tests/`, `benches/` or `examples/` (each file directly in one is a crate
+    root), else the file's own directory."""
+    *dirs, name = file_path.split("/")
+    stem = name[:-3] if name.endswith(".rs") else name
+    src = max((i for i, d in enumerate(dirs) if d == "src"), default=None)
+    own = max((i for i, d in enumerate(dirs) if d in _OWN_ROOT_DIRS), default=None)
+    if src is not None and src + 1 < len(dirs) and dirs[src + 1] == "bin":
+        if len(dirs) == src + 2:
+            return _Crate(_join(*dirs), (file_path,)), ()
+        root = _join(*dirs[: src + 3])
+        crate = _Crate(root, (f"{root}/main.rs",))
+        rest = dirs[src + 3:]
+    elif src is not None:
+        root = _join(*dirs[: src + 1])
+        crate = _Crate(root, (f"{root}/lib.rs", f"{root}/main.rs"))
+        rest = dirs[src + 1:]
+    elif own is not None:
+        if len(dirs) == own + 1:
+            return _Crate(_join(*dirs), (file_path,)), ()
+        root = _join(*dirs[: own + 1])
+        crate = _Crate(root, ())
+        rest = dirs[own + 1:]
+    else:
+        root = _join(*dirs)
+        crate = _Crate(root, (f"{root}/lib.rs" if root else "lib.rs", f"{root}/main.rs" if root else "main.rs"))
+        rest = []
+    if not rest and file_path in crate.root_files:
+        return crate, ()
+    return crate, tuple(rest) + (() if stem == "mod" else (stem,))
+
+
+def _segs(node: Node | None, source: bytes) -> list[str] | None:
+    """A path (`a::b::C`, `super::x`, `Vec::<T>`, `g::<T>`) as its segments,
+    or None when it is no plain path. A path from the global root (`::std`)
+    starts with ""."""
+    if node is None:
+        return None
+    if node.type in ("identifier", "type_identifier", "self", "super", "crate", "field_identifier"):
         return [_text(node, source)]
-    if node.type == "scoped_identifier":
-        path_node = node.child_by_field_name("path")
-        name_node = node.child_by_field_name("name")
-        if path_node is None or name_node is None:
+    if node.type in ("scoped_identifier", "scoped_type_identifier"):
+        path = node.child_by_field_name("path")
+        name = node.child_by_field_name("name")
+        if name is None:
             return None
-        base = _use_segments(path_node, source)
-        if base is None:
-            return None
-        return base + [_text(name_node, source)]
-    if node.type == "use_as_clause":
-        path_node = node.child_by_field_name("path")
-        if path_node is None:
-            return None
-        return _use_segments(path_node, source)
+        head = [""] if path is None else _segs(path, source)
+        return None if head is None else head + [_text(name, source)]
+    if node.type == "generic_type":
+        return _segs(node.child_by_field_name("type"), source)
+    if node.type == "generic_function":
+        return _segs(node.child_by_field_name("function"), source)
     return None
 
 
-def _emit_use_targets(segments: list[str], imported_name: str) -> list[tuple[str, list[str]]]:
-    """Turn `['crate', 'foo', 'bar', 'Baz']` into candidate same-repo file
-    guesses under the assumed crate root (see module docstring): both
-    readings of the last segment (itself a module, or an item inside the
-    second-to-last-segment's module) are emitted, since Tree-sitter can't
-    tell which without type information."""
-    if not segments or segments[0] != "crate":
-        return []
-    rest = segments[1:]
-    if not rest:
-        return []
-
-    out: list[tuple[str, list[str]]] = []
-    full_path = "/".join([_CRATE_ROOT, *rest])
-    out.append((f"{full_path}.rs", [imported_name]))
-    out.append((f"{full_path}/mod.rs", [imported_name]))
-    if len(rest) > 1:
-        parent_path = "/".join([_CRATE_ROOT, *rest[:-1]])
-        out.append((f"{parent_path}.rs", [imported_name]))
-        out.append((f"{parent_path}/mod.rs", [imported_name]))
-    return out
+def _uppercase(seg: str) -> bool:
+    return seg[:1].isupper()
 
 
-def _resolve_use(arg: Node, source: bytes) -> list[tuple[str, list[str]]]:
-    """Resolve a `use_declaration`'s `argument` field to candidate IMPORTS
-    targets. Only `crate::`-rooted paths are handled -- external crates,
-    `self::`, and `super::` are skipped entirely, per the plan."""
-    if arg.type in ("scoped_identifier", "identifier", "use_as_clause"):
-        segs = _use_segments(arg, source)
-        if segs:
-            return _emit_use_targets(segs, segs[-1])
-        return []
+class _RustResolver:
+    """What one Rust file's names refer to: its crate and module path, its
+    `use` bindings, `mod` declarations and inline modules (per module
+    scope), the types and functions it declares, and the workspace's crates
+    (resolver configuration)."""
 
-    if arg.type == "scoped_use_list":
-        path_node = arg.child_by_field_name("path")
-        list_node = arg.child_by_field_name("list")
-        base_segs = _use_segments(path_node, source) if path_node is not None else None
-        if base_segs is None or list_node is None:
+    def __init__(self, root: Node, source: bytes, file_path: str, config: ResolverConfig | None) -> None:
+        self.source = source
+        self.file_path = file_path
+        self.crate, self.module = _layout(file_path)
+        self.crates = config.rust_crates() if config is not None else {}
+        # module scope -> name -> (path segments, the scope it was declared in)
+        self.bindings: dict[tuple, dict[str, list[str]]] = {}
+        self.globs: dict[tuple, list[list[str]]] = {}
+        self.declared: dict[tuple, set[str]] = {}  # `mod x;` and inline `mod x {}` names per scope
+        self.inline: set[tuple] = {self.module}
+        self.types: set[str] = set()
+        self.functions: set[str] = set()
+        self.methods: dict[str, set[str]] = {}
+        self.fields: dict[str, dict[str, _Type]] = {}
+        self.uses: list[tuple[tuple, list[str], str | None, bool]] = []  # (scope, segs, binding, glob)
+        self.mod_decls: list[tuple[tuple, str]] = []
+        self._use_ranges: list[tuple[int, int]] = []
+        self._collect(root, self.module)
+        # A use's ranges blanked, for how the file uses a name (`_used_as`).
+        text = bytearray(source)
+        for start, end in self._use_ranges:
+            text[start:end] = b" " * (end - start)
+        self._code = text.decode("utf-8", errors="replace")
+
+    # --- what the file declares -------------------------------------------------
+
+    def _collect(self, node: Node, scope: tuple) -> None:
+        for child in node.named_children:
+            kind = child.type
+            if kind == "use_declaration":
+                self._use_ranges.append((child.start_byte, child.end_byte))
+                argument = child.child_by_field_name("argument")
+                if argument is not None:
+                    for segs, binding, glob in self._use_paths(argument, []):
+                        self.uses.append((scope, segs, binding, glob))
+                        if glob:
+                            self.globs.setdefault(scope, []).append(segs)
+                        elif binding and binding != "_":
+                            self.bindings.setdefault(scope, {})[binding] = segs
+            elif kind == "mod_item":
+                name = child.child_by_field_name("name")
+                body = child.child_by_field_name("body")
+                if name is None:
+                    continue
+                mod = _text(name, self.source)
+                self.declared.setdefault(scope, set()).add(mod)
+                if body is None:
+                    self.mod_decls.append((scope, mod))
+                else:
+                    self.inline.add(scope + (mod,))
+                    self._collect(body, scope + (mod,))
+            elif kind in ("struct_item", "enum_item", "trait_item", "union_item", "type_item"):
+                name = child.child_by_field_name("name")
+                if name is not None:
+                    self.types.add(_text(name, self.source))
+                if kind == "struct_item" and name is not None:
+                    self._collect_fields(child, _text(name, self.source))
+                if kind == "trait_item":
+                    self._collect_methods(child, _text(name, self.source) if name is not None else None)
+            elif kind == "impl_item":
+                self._collect_methods(child, _type_name(child.child_by_field_name("type"), self.source))
+            elif kind == "function_item":
+                self._collect_functions(child)
+
+    def _collect_functions(self, node: Node) -> None:
+        """Every function item at or under `node` (nested ones included)."""
+        if node.type == "function_item":
+            name = node.child_by_field_name("name")
+            if name is not None:
+                self.functions.add(_text(name, self.source))
+        for child in node.named_children:
+            if child.type not in ("impl_item", "trait_item"):
+                self._collect_functions(child)
+
+    def _collect_methods(self, node: Node, type_name: str | None) -> None:
+        body = node.child_by_field_name("body")
+        for child in body.named_children if body is not None else []:
+            if child.type in ("function_item", "function_signature_item"):
+                name = child.child_by_field_name("name")
+                if name is not None and type_name:
+                    self.methods.setdefault(type_name, set()).add(_text(name, self.source))
+                if child.type == "function_item":
+                    self._collect_functions(child.child_by_field_name("body") or child)
+
+    def _collect_fields(self, node: Node, struct: str) -> None:
+        body = node.child_by_field_name("body")
+        for field in body.named_children if body is not None and body.type == "field_declaration_list" else []:
+            name = field.child_by_field_name("name")
+            declared = self.type_of(field.child_by_field_name("type"))
+            if name is not None and declared is not None:
+                self.fields.setdefault(struct, {})[_text(name, self.source)] = declared
+
+    def _use_paths(self, node: Node, prefix: list[str]) -> list[tuple[list[str], str | None, bool]]:
+        """A use tree's leaves as (path segments, the name bound, glob?)."""
+        kind = node.type
+        if kind == "use_as_clause":
+            segs = _segs(node.child_by_field_name("path"), self.source)
+            alias = node.child_by_field_name("alias")
+            if segs is None:
+                return []
+            return [(prefix + segs, _text(alias, self.source) if alias is not None else segs[-1], False)]
+        if kind == "use_wildcard":
+            inner = next((c for c in node.named_children), None)
+            segs = _segs(inner, self.source) if inner is not None else []
+            return [(prefix + (segs or []), None, True)]
+        if kind in ("scoped_use_list", "use_list"):
+            path = node.child_by_field_name("path")
+            base = prefix + (_segs(path, self.source) or []) if path is not None else prefix
+            items = node.child_by_field_name("list") if kind == "scoped_use_list" else node
+            found = []
+            for item in items.named_children if items is not None else []:
+                if item.type == "self":
+                    if base:
+                        found.append((base, base[-1], False))
+                else:
+                    found += self._use_paths(item, base)
+            return found
+        segs = _segs(node, self.source)
+        if segs is None:
             return []
-        results: list[tuple[str, list[str]]] = []
-        for item in list_node.named_children:
-            if item.type == "identifier":
-                name = _text(item, source)
-                results.extend(_emit_use_targets(base_segs + [name], name))
-            elif item.type == "use_as_clause":
-                inner_path = item.child_by_field_name("path")
-                if inner_path is not None:
-                    inner_segs = _use_segments(inner_path, source)
-                    if inner_segs:
-                        results.extend(_emit_use_targets(base_segs + inner_segs, inner_segs[-1]))
-            elif item.type == "self":
-                # `use crate::foo::{self, bar}` -- `self` imports the `foo`
-                # module itself, i.e. the base path unchanged.
-                if base_segs:
-                    results.extend(_emit_use_targets(base_segs, base_segs[-1]))
-        return results
+        return [(prefix + segs, segs[-1], False)]
 
-    if arg.type == "use_wildcard":
-        # `use crate::foo::*;` -- resolves the module itself (foo.rs /
-        # foo/mod.rs), not the individual items it re-exports.
-        inner = arg.named_children[0] if arg.named_children else None
-        if inner is not None:
-            segs = _use_segments(inner, source)
-            if segs:
-                return _emit_use_targets(segs, "*")
-        return []
+    # --- names to modules ---------------------------------------------------------
 
-    return []
+    def _lookup(self, table: dict[tuple, dict] | dict[tuple, set], name: str, scope: tuple):
+        """`name` in `table` at `scope` or an enclosing scope of the file."""
+        while True:
+            entry = table.get(scope)
+            if entry is not None and name in entry:
+                return entry[name] if isinstance(entry, dict) else scope
+            if len(scope) <= len(self.module):
+                return None
+            scope = scope[:-1]
+
+    def _start(
+        self, segs: list[str], scope: tuple, depth: int = 0, unbound: str | None = None,
+    ) -> tuple[_Module, list[str]] | None:
+        """The module a path's leading segments name and the rest of the
+        path; None when it starts outside the repository (std, an external
+        crate, `::x`) or with no module at all."""
+        if not segs or depth > 8:
+            return None
+        first = segs[0]
+        if first == "crate":
+            return _Module(self.crate, ()), segs[1:]
+        if first == "self":
+            return _Module(self.crate, scope), segs[1:]
+        if first == "super":
+            path, i = scope, 0
+            while i < len(segs) and segs[i] == "super":
+                path, i = path[:-1], i + 1
+            return _Module(self.crate, path), segs[i:]
+        bound = self._lookup(self.bindings, first, scope) if first != unbound else None
+        if bound is not None:
+            # `use foo::x;` names a crate or module foo, not this binding again.
+            return self._start(bound + segs[1:], self._lookup_scope(first, scope), depth + 1, bound[0])
+        declared = self._lookup(self.declared, first, scope)
+        if declared is not None:
+            return _Module(self.crate, declared + (first,)), segs[1:]
+        roots = self.crates.get(first)
+        if roots:
+            # Two packages of one name: the first here, `_also` adds the others.
+            return _Module(_Crate(posixpath.dirname(roots[0]), (roots[0],), cross=True), ()), segs[1:]
+        return None
+
+    def _lookup_scope(self, name: str, scope: tuple) -> tuple:
+        while scope not in self.bindings or name not in self.bindings[scope]:
+            scope = scope[:-1]
+        return scope
+
+    def _also(self, crate: _Crate) -> list[_Crate]:
+        """Every crate of the same name as the cross-crate `crate`."""
+        if not crate.cross:
+            return [crate]
+        for roots in self.crates.values():
+            if crate.root_files[0] in roots:
+                return [_Crate(posixpath.dirname(root), (root,), cross=True) for root in roots]
+        return [crate]
+
+    def files(self, module: _Module) -> list[str]:
+        """The files a module can be: this file for one of its inline
+        modules, else `<root>/a/b.rs` and `<root>/a/b/mod.rs` (a crate root
+        module: its root files), a cross-crate module as suffix pins."""
+        crate, path = module
+        if not crate.cross and crate.root == self.crate.root and path in self.inline:
+            return [self.file_path]
+        found = []
+        for each in self._also(crate):
+            if path:
+                base = _join(each.root, *path)
+                candidates = [f"{base}.rs", f"{base}/mod.rs"]
+            else:
+                candidates = list(each.root_files)
+            found += ["/" + c for c in candidates] if each.cross else candidates
+        return found
+
+    def pins(self, module: _Module) -> list[str]:
+        """A module's files, and the recursive prefix of its directory
+        (package: an item re-exported from a submodule)."""
+        found = self.files(module)
+        if module.path and found != [self.file_path]:
+            found += [_join(each.root, *module.path) + "/" for each in self._also(module.crate)]
+        return found
+
+    def _walk(self, start: tuple[_Module, list[str]]) -> tuple[_Module, list[str]]:
+        """Follow lowercase segments as modules down to the last one or a
+        type: (the module, what is left: [item], [Type, item...] or [])."""
+        module, rest = start
+        while len(rest) > 1 and not _uppercase(rest[0]):
+            module, rest = _Module(module.crate, module.path + (rest[0],)), rest[1:]
+        return module, rest
+
+    def path_pins(self, segs: list[str], scope: tuple) -> list[str] | None:
+        """The pins of the function a path call names (`a::f`, `T::f`,
+        `crate::m::T::f`), None when it is outside the repository."""
+        if len(segs) == 2 and segs[0] in self.types:
+            return [self.file_path]
+        if len(segs) == 2 and segs[0] in STOP_TYPES["rust"] and self._lookup(self.bindings, segs[0], scope) is None:
+            return None
+        start = self._start(segs, scope)
+        if start is None:
+            unbound = self._lookup(self.bindings, segs[0], scope) is None
+            return self._glob_pins(scope) if unbound and (len(segs) == 1 or len(segs) == 2 and _uppercase(segs[0])) \
+                else None
+        module, rest = self._walk(start)
+        if not rest:
+            return None
+        return self.pins(module)
+
+    def _glob_pins(self, scope: tuple) -> list[str] | None:
+        found = []
+        current = scope
+        while True:
+            for segs in self.globs.get(current, []):
+                start = self._start(segs, current)
+                if start is not None:
+                    module, rest = start
+                    found += self.pins(_Module(module.crate, module.path + tuple(rest)))
+            if len(current) <= len(self.module):
+                break
+            current = current[:-1]
+        return found or None
+
+    def type_pins(self, declared: _Type, scope: tuple) -> list[str] | None:
+        """The pins of a type's module: this file for a type declared here,
+        None for a library type or one outside the repository."""
+        segs = list(declared.segs)
+        unbound = self._lookup(self.bindings, segs[0], scope) is None
+        if len(segs) == 1:
+            if segs[0] in self.types:
+                return [self.file_path]
+            if unbound and (segs[0] in STOP_TYPES["rust"] or segs[0] in _CONTAINERS or segs[0] == "[]"):
+                return None
+        start = self._start(segs, scope)
+        if start is None:
+            return self._glob_pins(scope) if len(segs) == 1 and unbound else None
+        module, rest = start
+        while len(rest) > 1:
+            module, rest = _Module(module.crate, module.path + (rest[0],)), rest[1:]
+        return self.pins(module) if rest else None
+
+    # --- types ---------------------------------------------------------------------
+
+    def type_of(self, node: Node | None, source: bytes | None = None) -> _Type | None:
+        """A type expression as a `_Type`: references and smart pointers
+        seen through, a container's or array's element kept for loops."""
+        source = self.source if source is None else source
+        if node is None:
+            return None
+        kind = node.type
+        if kind in ("reference_type", "pointer_type"):
+            return self.type_of(node.child_by_field_name("type"), source)
+        if kind in ("array_type", "slice_type"):
+            element = self.type_of(node.child_by_field_name("element"), source)
+            return _Type(("[]",), element)
+        if kind == "generic_type":
+            base = _segs(node.child_by_field_name("type"), source)
+            arguments = node.child_by_field_name("type_arguments")
+            first = next(iter(arguments.named_children), None) if arguments is not None else None
+            if base and base[-1] in _SMART_POINTERS:
+                return self.type_of(first, source)
+            if base and base[-1] in _CONTAINERS:
+                return _Type(tuple(base), self.type_of(first, source))
+            return _Type(tuple(base)) if base else None
+        segs = _segs(node, source) if kind in ("type_identifier", "scoped_type_identifier") else None
+        return _Type(tuple(segs)) if segs else None
+
+    def _used_as(self, name: str) -> tuple[bool, bool]:
+        """Whether the file's code (its `use`s left out) writes `name::`
+        (a module) and `name(` (a function)."""
+        word = re.escape(name)
+        as_module = re.search(rf"(?<![\w:.]){word}\s*::", self._code) is not None
+        as_call = re.search(rf"(?<![\w:.]){word}\s*\(", self._code) is not None
+        return as_module, as_call
+
+    def imports(self) -> tuple[set[str], set[str]]:
+        """The Modules the file's `mod` declarations and `use`s name: files
+        of its own crate, and suffix pins of other crates'. A `use a::b::X`
+        imports the module of X (a::b) when X is a type or used as a
+        function, the module a::b::x when x is used as one (`x::f()`), else
+        either."""
+        modules: list[_Module] = [_Module(self.crate, scope + (name,)) for scope, name in self.mod_decls]
+        for scope, segs, binding, glob in self.uses:
+            start = self._start(segs, scope)
+            if start is None:
+                continue
+            module, rest = start
+            if glob:
+                modules.append(_Module(module.crate, module.path + tuple(rest)))
+                continue
+            while len(rest) > 1 and not _uppercase(rest[0]):
+                module, rest = _Module(module.crate, module.path + (rest[0],)), rest[1:]
+            if not rest or rest[0] == "self":
+                modules.append(module)
+                continue
+            if _uppercase(rest[0]):
+                modules.append(module)
+                continue
+            as_module, as_call = self._used_as(binding or rest[0])
+            if as_module or not as_call:
+                modules.append(_Module(module.crate, module.path + (rest[0],)))
+            if as_call or not as_module:
+                modules.append(module)
+        files: set[str] = set()
+        pins: set[str] = set()
+        for module in modules:
+            for each in self.files(module):
+                if each == self.file_path:
+                    continue
+                (pins if each.startswith("/") else files).add(each)
+        return files, pins
 
 
-def _extract_imports(root: Node, source: bytes, current_dir: str) -> list[tuple[str, list[str]]]:
-    """Extract `mod`/`use` statements from the parse tree.
-
-    Args:
-        current_dir: The importing file's directory, relative to the repo
-            root, using forward slashes ('' for repo-root files). Used only
-            for `mod foo;` resolution (directory-relative); `use crate::...`
-            resolution is always relative to the assumed crate root (see
-            module docstring), not to the importing file's own location.
-
-    Returns:
-        A list of (import_target, [imported_names]) tuples -- see module
-        docstring for the `mod`/`use` resolution rules.
-    """
-    imports: list[tuple[str, list[str]]] = []
-
-    def walk(node: Node) -> None:
-        if node.type == "mod_item" and node.child_by_field_name("body") is None:
-            name_node = node.child_by_field_name("name")
-            if name_node is not None:
-                mod_name = _text(name_node, source)
-                base = f"{current_dir}/{mod_name}" if current_dir else mod_name
-                imports.append((f"{base}.rs", [mod_name]))
-                imports.append((f"{base}/mod.rs", [mod_name]))
-        elif node.type == "use_declaration":
-            arg = node.child_by_field_name("argument")
-            if arg is not None:
-                imports.extend(_resolve_use(arg, source))
-        else:
-            for child in node.children:
-                walk(child)
-
-    walk(root)
-    return imports
+def _function_scope(node: Node, resolver: _RustResolver, self_type: _Type | None) -> dict[str, _Type | None]:
+    """A function's parameters by name, with their types."""
+    scope: dict[str, _Type | None] = {}
+    params = node.child_by_field_name("parameters")
+    for param in params.named_children if params is not None else []:
+        if param.type == "self_parameter":
+            scope["self"] = self_type
+        elif param.type == "parameter":
+            pattern = param.child_by_field_name("pattern")
+            if pattern is not None and pattern.type == "identifier":
+                scope[_text(pattern, resolver.source)] = resolver.type_of(param.child_by_field_name("type"))
+    return scope
 
 
-def extract_rust_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
+class _CallCollector:
+    """One caller's call sites, resolved by the tiers (see the module
+    docstring): (callee name, pins or None for a bare name, member call?)."""
+
+    def __init__(self, resolver: _RustResolver, scope: tuple, self_type: _Type | None,
+                 variables: dict[str, _Type | None]) -> None:
+        self.resolver = resolver
+        self.scope = scope
+        self.self_type = self_type
+        self.variables = variables
+        self.found: list[tuple[str, list[str] | None, bool]] = []
+
+    def expr_type(self, node: Node | None, source: bytes) -> _Type | None:
+        if node is None:
+            return None
+        kind = node.type
+        if kind in ("identifier", "self"):
+            return self.variables.get(_text(node, source))
+        if kind in ("reference_expression", "parenthesized_expression", "try_expression"):
+            inner = node.child_by_field_name("value") or next(iter(node.named_children), None)
+            return self.expr_type(inner, source) if kind != "try_expression" else None
+        if kind == "field_expression":
+            owner = self.expr_type(node.child_by_field_name("value"), source)
+            field = node.child_by_field_name("field")
+            if owner is not None and len(owner.segs) == 1 and field is not None:
+                return self.resolver.fields.get(owner.segs[0], {}).get(_text(field, source))
+            return None
+        if kind == "struct_expression":
+            segs = _segs(node.child_by_field_name("name"), source)
+            return self._typed(segs)
+        if kind == "call_expression":
+            function = node.child_by_field_name("function")
+            if function is not None and function.type == "field_expression":
+                method = function.child_by_field_name("field")
+                if method is not None and _text(method, source) in ("iter", "iter_mut", "into_iter"):
+                    return self.expr_type(function.child_by_field_name("value"), source)
+                return None
+            segs = _segs(function, source)
+            # `T::new()` and its like: a type's associated function makes a T.
+            if segs and len(segs) >= 2 and _uppercase(segs[-2]):
+                return self._typed(segs[:-1])
+        return None
+
+    def _typed(self, segs: list[str] | None) -> _Type | None:
+        if not segs:
+            return None
+        if segs == ["Self"]:
+            return self.self_type
+        return _Type(tuple(segs))
+
+    def bind(self, pattern: Node | None, declared: _Type | None) -> None:
+        if pattern is not None and pattern.type == "identifier":
+            self.variables[_text(pattern, self.resolver.source)] = declared
+        elif pattern is not None and pattern.type == "mut_pattern":
+            self.bind(next(iter(pattern.named_children), None), declared)
+
+    def walk(self, node: Node, source: bytes) -> None:
+        kind = node.type
+        if kind in _SCOPE_BOUNDARY_TYPES:
+            return
+        if kind == "let_declaration" and source is self.resolver.source:
+            value = node.child_by_field_name("value")
+            declared = self.resolver.type_of(node.child_by_field_name("type"))
+            if declared is None:
+                declared = self.expr_type(value, source)
+            self.bind(node.child_by_field_name("pattern"), declared)
+        elif kind == "for_expression" and source is self.resolver.source:
+            iterable = self.expr_type(node.child_by_field_name("value"), source)
+            self.bind(node.child_by_field_name("pattern"), iterable.element if iterable is not None else None)
+        elif kind == "closure_expression" and source is self.resolver.source:
+            params = node.child_by_field_name("parameters")
+            for param in params.named_children if params is not None else []:
+                self.bind(param if param.type == "identifier" else param.child_by_field_name("pattern"), None)
+        elif kind == "call_expression":
+            self.call(node, source)
+        elif kind == "macro_invocation":
+            self.macro(node, source)
+        for child in node.children:
+            self.walk(child, source)
+
+    def macro(self, node: Node, source: bytes) -> None:
+        """The calls in a macro's arguments (`println!("{}", f(x))`): its
+        token tree reparsed as a call's arguments."""
+        tree = next((c for c in node.named_children if c.type == "token_tree"), None)
+        if tree is None or not tree.children or tree.children[0].type not in ("(", "["):
+            return
+        inner = source[tree.children[0].end_byte: tree.children[-1].start_byte]
+        if b"(" not in inner:
+            return
+        wrapped = b"fn __devgraph_macro__() { __devgraph_macro__(" + inner + b"); }"
+        reparsed = _make_parser().parse(wrapped)
+        body = reparsed.root_node.named_children[0].child_by_field_name("body") if reparsed.root_node.named_children \
+            else None
+        arguments = None
+        if body is not None and body.named_children and body.named_children[0].named_children:
+            outer = body.named_children[0].named_children[0]
+            arguments = outer.child_by_field_name("arguments") if outer.type == "call_expression" else None
+        for child in arguments.named_children if arguments is not None else []:
+            self.walk(child, wrapped)
+
+    def call(self, node: Node, source: bytes) -> None:
+        function = node.child_by_field_name("function")
+        if function is None:
+            return
+        if function.type == "generic_function":
+            function = function.child_by_field_name("function")
+            if function is None:
+                return
+        resolver = self.resolver
+        if function.type == "identifier":
+            name = _text(function, source)
+            if name in self.variables or _uppercase(name):
+                return  # a closure or function value, or a tuple struct / variant
+            if name in resolver.functions:
+                self.found.append((name, [resolver.file_path], False))
+                return
+            pins = resolver.path_pins([name], self.scope)
+            if pins:
+                self.found.append((name, pins, False))
+            return
+        if function.type == "scoped_identifier":
+            segs = _segs(function, source)
+            if not segs or segs[0] == "" or len(segs) < 2:
+                return
+            name = segs[-1]
+            if segs[0] == "Self":
+                pins = resolver.type_pins(self.self_type, self.scope) if self.self_type is not None else None
+            else:
+                pins = resolver.path_pins(segs, self.scope)
+            if pins:
+                self.found.append((name, pins, False))
+            return
+        if function.type == "field_expression":
+            field = function.child_by_field_name("field")
+            if field is None:
+                return
+            name = _text(field, source)
+            receiver = function.child_by_field_name("value")
+            typed = self.expr_type(receiver, source)
+            if typed is not None:
+                owner = typed.segs[-1]
+                if len(typed.segs) == 1 and owner in resolver.types:
+                    if name in resolver.methods.get(owner, set()):
+                        self.found.append((name, [resolver.file_path], False))
+                        return
+                    # A trait's method, or one an impl in another file adds.
+                else:
+                    pins = resolver.type_pins(typed, self.scope)
+                    if pins:
+                        self.found.append((name, pins, False))
+                    return
+            if name not in STOP_METHODS["rust"]:
+                self.found.append((name, None, True))
+
+
+def extract_rust_file(
+    source_code: str, file_path: str, repo_id: str, config: ResolverConfig | None = None,
+) -> ExtractionResult:
     """Parse a Rust file and extract nodes and relationships.
 
     Args:
@@ -397,6 +829,9 @@ def extract_rust_file(source_code: str, file_path: str, repo_id: str) -> Extract
         file_path: The Module node's identity -- the file's path relative to
             the repo root, using forward slashes (e.g. 'src/lib.rs').
         repo_id: Repository ID for scoping nodes.
+        config: The repository's resolver configuration (its Cargo.toml
+            files), read once per batch: another crate's name names its
+            library. None makes every other crate external.
 
     Returns:
         ExtractionResult containing lists of nodes and relationships. On a
@@ -422,35 +857,21 @@ def extract_rust_file(source_code: str, file_path: str, repo_id: str) -> Extract
     module_node = GraphNode(label="Module", repo_id=repo_id, name=file_path, properties=module_properties)
     result.nodes.append(module_node)
 
-    current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
-    for target, imported_names in _extract_imports(root, source_bytes, current_dir):
-        for _imp_name in imported_names:
-            result.relationships.append(
-                GraphRelationship(
-                    from_label="Module",
-                    from_name=file_path,
-                    rel_type="IMPORTS",
-                    to_label="Module",
-                    to_name=target,
-                    repo_id=repo_id,
-                )
-            )
+    resolver = _RustResolver(root, source_bytes, file_path, config)
+    import_files, import_pins = resolver.imports()
+    result.relationships += import_rows(file_path, repo_id, import_files, import_pins)
+    sites = CallSites()
 
-    def _emit_call(caller_name: str, caller_label: str, target_name: str, caller_class: str | None = None) -> None:
-        properties = {"caller_class": caller_class} if caller_class else None
-        result.relationships.append(
-            GraphRelationship(
-                from_label=caller_label,
-                from_name=caller_name,
-                rel_type="CALLS",
-                to_label="Function",
-                to_name=target_name,
-                repo_id=repo_id,
-                properties=properties,
-            )
-        )
+    def _record_calls(
+        body: Node, caller_label: str, caller_name: str, caller_class: str | None, scope: tuple,
+        self_type: _Type | None, variables: dict,
+    ) -> None:
+        collector = _CallCollector(resolver, scope, self_type, variables)
+        collector.walk(body, source_bytes)
+        for name, pins, member in collector.found:
+            sites.add(caller_label, caller_name, caller_class, name, pins, member)
 
-    def visit_block(block: Node, parent_name: str | None, parent_label: str) -> None:
+    def visit_block(block: Node, parent_name: str | None, parent_label: str, scope: tuple) -> None:
         """Visit statements in a block (source_file, impl/trait body, fn
         body). Iterates raw `.children` (not `.named_children`) so doc
         comments stay positionally adjacent for `_leading_doc_comment`'s
@@ -461,17 +882,19 @@ def extract_rust_file(source_code: str, file_path: str, repo_id: str) -> Extract
             elif node.type == "enum_item":
                 _visit_type_item(node, "enum", parent_name, parent_label)
             elif node.type == "trait_item":
-                _visit_trait(node, parent_name, parent_label)
+                _visit_trait(node, parent_name, parent_label, scope)
             elif node.type == "impl_item":
-                _visit_impl(node, parent_name, parent_label)
+                _visit_impl(node, parent_name, parent_label, scope)
             elif node.type == "function_item":
-                _visit_function(node, parent_name, parent_label)
+                _visit_function(node, parent_name, parent_label, scope)
             elif node.type == "mod_item":
                 body_node = node.child_by_field_name("body")
-                if body_node is not None:
-                    # Inline `mod foo { .. }` -- flattened into the same
-                    # scope (see module docstring's known limitations).
-                    visit_block(body_node, parent_name, parent_label)
+                name_node = node.child_by_field_name("name")
+                if body_node is not None and name_node is not None:
+                    # Inline `mod foo { .. }` -- its items flattened into the
+                    # same graph scope (see module docstring's known
+                    # limitations), its paths resolved inside module foo.
+                    visit_block(body_node, parent_name, parent_label, scope + (_text(name_node, source_bytes),))
             elif node.type in (
                 "line_comment",
                 "block_comment",
@@ -488,8 +911,8 @@ def extract_rust_file(source_code: str, file_path: str, repo_id: str) -> Extract
                 # scope -- attribute its call expressions to the enclosing
                 # scope, same as Python's module/class-body-level handling.
                 caller_class = parent_name if parent_label == "Class" else None
-                for target in _extract_call_targets(node, source_bytes):
-                    _emit_call(parent_name if parent_name else file_path, parent_label, target, caller_class)
+                _record_calls(node, parent_label, parent_name if parent_name else file_path, caller_class, scope,
+                              None, {})
 
     def _visit_type_item(node: Node, kind: str, parent_name: str | None, parent_label: str) -> None:
         name_node = node.child_by_field_name("name")
@@ -523,7 +946,7 @@ def extract_rust_file(source_code: str, file_path: str, repo_id: str) -> Extract
             )
         )
 
-    def _visit_trait(node: Node, parent_name: str | None, parent_label: str) -> None:
+    def _visit_trait(node: Node, parent_name: str | None, parent_label: str, scope: tuple) -> None:
         name_node = node.child_by_field_name("name")
         if name_node is None:
             return
@@ -561,9 +984,9 @@ def extract_rust_file(source_code: str, file_path: str, repo_id: str) -> Extract
             # signature-only methods (function_signature_item) are skipped.
             for child in body_node.children:
                 if child.type == "function_item":
-                    _visit_function(child, trait_name, "Class")
+                    _visit_function(child, trait_name, "Class", scope)
 
-    def _visit_impl(node: Node, parent_name: str | None, parent_label: str) -> None:
+    def _visit_impl(node: Node, parent_name: str | None, parent_label: str, scope: tuple) -> None:
         type_field = node.child_by_field_name("type")
         target_name = _type_name(type_field, source_bytes)
         if target_name is None:
@@ -588,9 +1011,9 @@ def extract_rust_file(source_code: str, file_path: str, repo_id: str) -> Extract
         if body_node is not None:
             for child in body_node.children:
                 if child.type == "function_item":
-                    _visit_function(child, target_name, "Class")
+                    _visit_function(child, target_name, "Class", scope)
 
-    def _visit_function(node: Node, parent_name: str | None, parent_label: str) -> None:
+    def _visit_function(node: Node, parent_name: str | None, parent_label: str, scope: tuple) -> None:
         name_node = node.child_by_field_name("name")
         if name_node is None:
             return
@@ -624,15 +1047,17 @@ def extract_rust_file(source_code: str, file_path: str, repo_id: str) -> Extract
         body_node = node.child_by_field_name("body")
         if body_node is not None:
             caller_class = parent_name if parent_label == "Class" else None
-            for target in _extract_call_targets(body_node, source_bytes):
-                _emit_call(func_name, "Function", target, caller_class)
+            self_type = _Type((parent_name,)) if parent_label == "Class" and parent_name else None
+            _record_calls(body_node, "Function", func_name, caller_class, scope, self_type,
+                          _function_scope(node, resolver, self_type))
 
             # Nested fn items (rare, but Tree-sitter walks these fine).
             for child in body_node.children:
                 if child.type == "function_item":
-                    _visit_function(child, func_name, "Function")
+                    _visit_function(child, func_name, "Function", scope)
 
-    visit_block(root, None, "Module")
+    visit_block(root, None, "Module", resolver.module)
+    result.relationships += sites.rows(file_path, repo_id)
 
     return own_edges(result, file_path)
 
@@ -668,16 +1093,18 @@ def index_file(
 
     source_code = file_path.read_text(encoding="utf-8")
 
+    config = None
     if repo_root is not None:
         try:
             rel = file_path.resolve().relative_to(Path(repo_root).resolve())
             module_name = rel.as_posix()
         except ValueError:
             module_name = file_path.name
+        config = ResolverConfig(Path(repo_root))
     else:
         module_name = file_path.name
 
-    result = extract_rust_file(source_code, module_name, repo_id)
+    result = extract_rust_file(source_code, module_name, repo_id, config)
 
     engine.upsert_nodes([node.to_dict() for node in result.nodes])
     engine.upsert_relationships([rel.to_dict() for rel in result.relationships])

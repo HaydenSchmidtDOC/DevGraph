@@ -165,26 +165,27 @@ def test_mod_declaration_resolves_to_file_guesses():
 
 
 def test_mod_declaration_relative_to_importing_file_directory():
-    """A `mod foo;` inside a nested file resolves relative to that file's
-    own directory, not the repo root."""
+    """A `mod foo;` inside a nested file that is not a mod.rs names a child
+    of that file's own module (the 2018 rule): src/nested/child.rs's `foo`
+    is src/nested/child/foo.rs, not a sibling."""
     result = extract_rust_file("mod foo;\n", "src/nested/child.rs", "test_repo")
 
     targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "src/nested/foo.rs" in targets
-    assert "src/nested/foo/mod.rs" in targets
+    assert targets == {"src/nested/child/foo.rs", "src/nested/child/foo/mod.rs"}
 
 
 def test_use_crate_path_resolves_under_crate_root():
-    """`use crate::foo::bar::Baz;` resolves under the assumed src/ crate
-    root, with both readings of the last segment emitted (itself a module,
-    or an item defined inside the second-to-last segment's module)."""
+    """`use crate::foo::bar::Baz;` resolves under the file's crate root
+    (the nearest src/): a type names the module it is in, a lowercase name
+    either a module or an item of its parent, unless the file uses it as
+    one or the other."""
     result = extract_rust_file("use crate::foo::bar::Baz;\n", "src/lib.rs", "test_repo")
 
     targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "src/foo/bar.rs" in targets
-    assert "src/foo/bar/mod.rs" in targets
-    assert "src/foo/bar/Baz.rs" in targets
-    assert "src/foo/bar/Baz/mod.rs" in targets
+    assert targets == {"src/foo/bar.rs", "src/foo/bar/mod.rs"}
+    result = extract_rust_file("use crate::foo::bar;\n", "src/lib.rs", "test_repo")
+    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
+    assert targets == {"src/foo.rs", "src/foo/mod.rs", "src/foo/bar.rs", "src/foo/bar/mod.rs"}
 
 
 def test_use_external_crate_is_skipped():
@@ -280,8 +281,8 @@ fn helper() {}
 """
     result = extract_rust_file(source_code, "src/lib.rs", "test_repo")
     calls_by_pair = {(r.from_name, r.to_name): r.properties for r in result.relationships if r.rel_type == "CALLS"}
-    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service"}
-    assert calls_by_pair[("free_call", "helper")] is None
+    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service", "confidence": "resolved"}
+    assert calls_by_pair[("free_call", "helper")] == {"confidence": "resolved"}
 
 
 def test_calls_edge_at_module_level():
@@ -312,6 +313,9 @@ impl Foo {
         target_b();
     }
 }
+
+fn target_a() {}
+fn target_b() {}
 """
     result = extract_rust_file(source_code, "src/lib.rs", "test_repo")
     calls = {(r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}

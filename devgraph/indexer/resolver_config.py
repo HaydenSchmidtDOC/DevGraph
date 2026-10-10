@@ -1,6 +1,7 @@
 """Resolver configuration: the files besides a source file's own text that its
 edges depend on. A TypeScript path alias (`@/lib/text`) means nothing without
-the `tsconfig.json` that declares it, nor a Go import path without `go.mod`.
+the `tsconfig.json` that declares it, nor a Go import path without `go.mod`,
+nor another Rust crate's name without its `Cargo.toml`.
 
 See docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md
 (Resolver configuration). An extractor reads the configuration through one
@@ -19,6 +20,7 @@ import hashlib
 import json
 import posixpath
 import re
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +36,7 @@ __all__ = [
 LANGUAGE_SUFFIXES: dict[str, tuple[str, ...]] = {
     "ts": (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"),
     "go": (".go",),
+    "rust": (".rs",),
 }
 
 #: The largest configuration file read; a bigger one is treated as absent.
@@ -42,13 +45,16 @@ _MAX_CONFIG_BYTES = 1024 * 1024
 
 def config_language(name: str) -> str | None:
     """The language a file named `name` configures by its name alone (a
-    tsconfig*.json or jsconfig.json, a go.mod or go.work), else None. A
+    tsconfig*.json or jsconfig.json, a go.mod or go.work, a Cargo.toml),
+    else None. A
     config reached only through `extends` can have any name; it is followed
     by path (see `ResolverConfig.read`)."""
     if name == "jsconfig.json" or (name.startswith("tsconfig") and name.endswith(".json")):
         return "ts"
     if name in ("go.mod", "go.work"):
         return "go"
+    if name == "Cargo.toml":
+        return "rust"
     return None
 
 
@@ -124,9 +130,13 @@ class ResolverConfig:
     `go_files` gives the repository's go.mod and go.work paths, as the
     fingerprint the batch extracts under found them (`fingerprints`'
     `inputs`), when a Go file first asks (`go_modules`); None, or a None
-    answer, walks the repository for them."""
+    answer, walks the repository for them. `rust_files` does the same for
+    the Cargo.toml files (`rust_crates`)."""
 
-    def __init__(self, repo_root: Path, go_files: Callable[[], list[str] | None] | None = None) -> None:
+    def __init__(
+        self, repo_root: Path, go_files: Callable[[], list[str] | None] | None = None,
+        rust_files: Callable[[], list[str] | None] | None = None,
+    ) -> None:
         self.root = Path(repo_root)
         self.read: set[str] = set()
         self._texts: dict[str, str | None] = {}
@@ -135,6 +145,8 @@ class ResolverConfig:
         self._go_files = go_files
         self._go_modules: list[tuple[str, str]] | None = None
         self._go_mod_dirs: list[str] = []
+        self._rust_files = rust_files
+        self._rust_crates: dict[str, list[str]] | None = None
 
     # --- files ---------------------------------------------------------------
 
@@ -376,6 +388,48 @@ class ResolverConfig:
                     return found
         return None
 
+    # --- Cargo.toml ----------------------------------------------------------------
+
+    def _cargo_entries(self, rel: str) -> list[tuple[str, str]]:
+        """The library crate one Cargo.toml declares, as (the name code uses
+        for it, its repo-relative root file): the `[lib]` name, else the
+        `[package]` name with `-` as `_`, and the `[lib]` path, else the
+        package's `src/lib.rs`. A workspace-only or malformed Cargo.toml
+        declares none."""
+        try:
+            data = tomllib.loads(self._text(rel) or "")
+        except tomllib.TOMLDecodeError:
+            return []
+        package = data.get("package")
+        name = package.get("name") if isinstance(package, dict) else None
+        if not isinstance(name, str):
+            return []
+        lib = data.get("lib") if isinstance(data.get("lib"), dict) else {}
+        crate = lib.get("name") if isinstance(lib.get("name"), str) else name.replace("-", "_")
+        lib_path = lib.get("path") if isinstance(lib.get("path"), str) else "src/lib.rs"
+        root = _join(posixpath.dirname(rel), lib_path)
+        return [(crate, root)] if root and crate else []
+
+    def _rust_digest(self, rel: str) -> object:
+        return sorted(self._cargo_entries(rel))
+
+    def rust_crates(self) -> dict[str, list[str]]:
+        """Every in-repository library crate's name and its root files (two
+        packages can share a name)."""
+        if self._rust_crates is None:
+            files = self._rust_files() if self._rust_files is not None else None
+            if files is None:
+                files = sorted(
+                    path.relative_to(self.root).as_posix() for path in indexable_paths(self.root)
+                    if path.name == "Cargo.toml"
+                )
+            crates: dict[str, set[str]] = {}
+            for rel in files:
+                for crate, root in self._cargo_entries(rel):
+                    crates.setdefault(crate, set()).add(root)
+            self._rust_crates = {crate: sorted(roots) for crate, roots in sorted(crates.items())}
+        return self._rust_crates
+
 
 def fingerprints(repo_root: Path) -> dict[str, dict]:
     """Per language, a hash of the relevant content of every configuration
@@ -383,11 +437,13 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
     (`inputs`): for TS each tsconfig*/jsconfig.json's `extends`,
     `references`, `baseUrl` and `paths`, with every config its `extends` and
     `references` reach; for Go each go.mod's `module` line and the local
-    `replace` directives of each go.mod and go.work. A compiler flag or a
-    `require` bump changes nothing."""
+    `replace` directives of each go.mod and go.work; for Rust each
+    Cargo.toml's library crate name and root (`_cargo_entries`). A compiler
+    flag, a `require` bump or a dependency or version change counts for
+    nothing."""
     root = Path(repo_root)
     config = ResolverConfig(root)
-    found: dict[str, set[str]] = {"ts": set(), "go": set()}
+    found: dict[str, set[str]] = {"ts": set(), "go": set(), "rust": set()}
     for path in indexable_paths(root):
         lang = config_language(path.name)
         if lang is not None:
@@ -403,8 +459,10 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
                 config._ts_projects(posixpath.dirname(rel))  # reads extends and references
                 config._ts_options(rel)
             digest = [[rel, config._ts_digest(rel)] for rel in sorted(config.read | files)]
-        else:
+        elif lang == "go":
             digest = [[rel, config._go_digest(rel)] for rel in sorted(files)]
+        else:
+            digest = [[rel, config._rust_digest(rel)] for rel in sorted(files)]
         inputs = sorted(config.read | files)
         result[lang] = {
             "fingerprint": hashlib.sha256(json.dumps(digest, sort_keys=True).encode()).hexdigest(),
