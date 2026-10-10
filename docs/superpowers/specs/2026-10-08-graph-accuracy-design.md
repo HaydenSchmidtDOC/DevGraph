@@ -84,11 +84,15 @@ its edge. That is now in scope (G2).
      every incoming `IMPORTS`/`CALLS`/`EXTENDS`.
    - When the file comes back, `_expand_with_reverse_dependents`
      (`dispatch.py:1047-1090`) follows only *existing* `IMPORTS` edges, and
-     there are none left. (Since index format 4 it follows only Java
+     there are none left. (Since index format 4 it followed only Java
      importers: a Python edge depends only on its writer's text, and G5
-     relinks it; see 2026-10-10-python-call-resolution-design.md.)
+     relinks it; see 2026-10-10-python-call-resolution-design.md. Since
+     format 7 it is gone: every code edge is a function of its writer's
+     text, its resolver configuration and whether its target exists; see
+     2026-10-11-nonpython-call-resolution-design.md.)
    - `_find_referrers` (`dispatch.py:1125-1152`) knows only docs notes,
-     handler stubs and same-directory JVM subtypes.
+     handler stubs and (until format 7, when unpinned `EXTENDS` relinked
+     through G5 made it redundant) same-directory JVM subtypes.
    - "Added" is decided by `(label, name)` (`list_file_nodes`,
      `engine.py:1026-1047`). A symbol that moves between files in one batch
      is therefore not "added", even though every edge to its new node is

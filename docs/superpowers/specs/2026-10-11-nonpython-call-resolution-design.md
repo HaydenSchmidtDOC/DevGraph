@@ -302,6 +302,20 @@ files, as in Java. Calls, first match wins:
    elsewhere, and its `.java` file by suffix.
 5. Anything else: a bare-name row off its caller, unless stoplisted.
 
+## No reverse dependents
+
+With Go, Java and Kotlin resolved, every code edge is a function of its
+writer's text, its resolver configuration and whether its target exists, so
+`index_paths` no longer re-indexes a changed file's importers
+(`_expand_with_reverse_dependents`, which followed Java's `IMPORTS` edges, is
+gone) nor rescans a JVM file's directory for subtypes of a class it added
+(`_same_package_subtype_referrers`: an unpinned `EXTENDS` is relinked from
+`name_refs` like any by-name edge). A removed target goes with its node, an
+added one is relinked, a configuration change re-indexes its language. The
+graph-accuracy fuzz (13 seeds of 30 steps) moves a Java class between
+modules, a function within a Go or Kotlin package, and adds and removes a
+nested go.mod.
+
 ## Later slices
 
 - **C#:** a referenced type `T` gives the suffix pin `/T.cs`, so C# calls

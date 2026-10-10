@@ -1201,14 +1201,14 @@ class GraphEngine:
         """Return the repo-relative paths of every Module with an IMPORTS edge
         into `module_name` (direct importers only, one level).
 
-        Used to widen an incremental reindex of a Java file to its
-        dependents: a CALLS/IMPORTS edge in an importer's own extracted
-        source is only re-evaluated when that importer's file is itself
-        reindexed, so a rename/removal in the imported file otherwise leaves
-        the importer's edges stale until it happens to be edited again or a
-        full rescan runs. Python importers need no re-index (their edges are
-        relinked from `name_refs`). See dispatch.py's
-        _expand_with_reverse_dependents.
+        Indexing no longer uses it: no importer is re-indexed when what it
+        imports changes, since every code edge is a function of its
+        writer's own text, its resolver configuration and whether its
+        target exists (a removed target goes with its node, an added one is
+        relinked from the writer's `name_refs`; see
+        docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md).
+        Only Module-to-Module edges count: a Kotlin import of a class or
+        function ends at that symbol.
         """
         with self._driver.session() as session:
             result = _retry_transient(

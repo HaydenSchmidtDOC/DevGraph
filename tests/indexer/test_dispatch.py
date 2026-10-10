@@ -95,14 +95,10 @@ class TestIndexPaths:
             engine.delete_repository(repo_id)
 
     def test_reindexing_a_file_also_refreshes_its_direct_importers(self, engine, temp_repo):
-        """Renaming a function in file A must update file B's CALLS edge even
-        though only A was passed to index_paths — B is a direct importer of
-        A (via an IMPORTS edge already in the graph), so it should be
-        transparently pulled into the same reindex batch.
-
-        Without this, upsert_relationship's MATCH-MATCH semantics mean B's
-        stale CALLS edge to the old function name just silently never
-        re-resolves until B itself is edited or a full rescan runs.
+        """Renaming a function in file A must drop file B's CALLS edge to it
+        even though only A was passed to index_paths: the old function's node
+        goes with A's re-index, taking B's edge with it, so B needs no
+        re-index of its own.
         """
         repo_id = "_smoketest_dispatch_reverse_deps"
         a_file = temp_repo / "a.py"

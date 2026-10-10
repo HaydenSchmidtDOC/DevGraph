@@ -427,24 +427,6 @@ def test_raising_the_limit_lets_catch_up_index_a_file_with_a_provider_node(engin
         engine.run_cypher(f"DROP INDEX {label.lower()}_repo_name IF EXISTS")
 
 
-def test_same_package_referrer_scan_skips_ignored_and_oversized_siblings(tmp_path, monkeypatch, small_limit):
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    (tmp_path / ".gitignore").write_text("Ignored.java\n")
-    (pkg / "Base.java").write_text("class Base {}\n")
-    (pkg / "Sub.java").write_text("class Sub extends Base {}\n")
-    (pkg / "Ignored.java").write_text("class Ignored extends Base {}\n")
-    (pkg / "Big.java").write_text("class Big extends Base {}\n" + "// pad\n" * 1000)
-    read = []
-    real = dispatch._read_text
-    monkeypatch.setattr(dispatch, "_read_text", lambda path: read.append(path.name) or real(path))
-    nodes = [{"label": "Class", "name": "Base"}]
-    found = dispatch._same_package_subtype_referrers(tmp_path, {("Class", "Base")}, {"pkg/Base.java"},
-                                                    {"pkg/Base.java": (nodes, [])})
-    assert found == {"pkg/Sub.java"}
-    assert read == ["Sub.java"]
-
-
 @pytest.mark.skipif(__import__("os").name == "nt", reason="symlinks need privileges on Windows")
 def test_a_symlink_is_judged_by_its_own_path_not_its_target(tmp_path, monkeypatch, small_limit):
     (tmp_path / "out").mkdir()
@@ -518,14 +500,12 @@ def test_a_link_and_its_ignored_target_in_one_batch_keep_the_link_spelling(tmp_p
     assert seen == ["out/real.py"] and engine.deleted == []
 
 
-def test_reverse_dependents_and_referrers_are_not_judged_by_gitignore(tmp_path, monkeypatch, small_limit):
+def test_referrers_are_not_judged_by_gitignore(tmp_path, monkeypatch, small_limit):
     (tmp_path / "out").mkdir()
     (tmp_path / "out" / "dep.py").write_text("x = 1\n")
     (tmp_path / "a.py").write_text("x = 1\n")
     (tmp_path / ".gitignore").write_text("out/\n")
-    monkeypatch.setattr(
-        dispatch, "_expand_with_reverse_dependents", lambda e, r, root, paths: set(paths) | {tmp_path / "out" / "dep.py"}
-    )
+    monkeypatch.setattr(dispatch, "_find_referrers", lambda *a: {"out/dep.py"})
     seen = []
     monkeypatch.setattr(dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
     engine = _Engine()

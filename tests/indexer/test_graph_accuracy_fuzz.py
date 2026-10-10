@@ -19,7 +19,12 @@ an odd-named base, `references`), its base is edited or its folder deleted, a
 root or nested go.mod comes and goes, and a config under an ignored folder is
 edited. After every batch the fuzz runs what a live batch does,
 `sync_resolver_config`. Kotlin files hold adjacent one-line classes, which
-the extractor recovers from tree-sitter-kotlin's error nodes.
+the extractor recovers from tree-sitter-kotlin's error nodes, and import a
+function or package of another one. Go, Java and Kotlin calls come in every
+style their resolvers read (bare, through a package or class, on `this`, on
+a typed or an untyped value); a function moves between files of its Go or
+Kotlin package, and a Java class moves to the same package under another
+source root (another module).
 
 Path pins (docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md)
 are fuzzed ahead of the resolvers that write them: a Python file's
@@ -162,7 +167,7 @@ def render(f: File) -> str:
         return "".join(parts) + "}\n"
     if f.kind == "kt":
         # One-line class bodies, which tree-sitter-kotlin 1.1.0 needs recovered.
-        parts = [f"package {f.head}\n\n"]
+        parts = [f"package {f.head}\n\n"] + [f"import {m}\n" for m in f.imports]
         parts += [f"class {c} {{ fun {c.lower()}Run() = helper() }}\n" for c in f.bases]
         parts += [
             f"\nfun {name}() {{\n" + "".join(f"    {g}()\n" for g in calls) + "}\n"
@@ -253,7 +258,8 @@ def initial_repo() -> dict:
         "ts/src/util.ts": File("ts", imports=["import { f } from './lib';"], funcs={"g": ["f"]}),
         "ts/other/lib.ts": File("ts", funcs={"f": [], "g": []}),
         "kt/Models.kt": File("kt", head="kt", bases={"Clock": None, "Stopwatch": None}, funcs={"helper": []}),
-        "kt/Main.kt": File("kt", head="kt", funcs={"main": ["helper", "clockRun"]}),
+        "kt/Main.kt": File("kt", head="kt", imports=["kt.util.slug"], funcs={"main": ["helper", "clockRun", "slug"]}),
+        "kt/util/Text.kt": File("kt", head="kt.util", funcs={"slug": []}),
         ".gitignore": File("static", head="ignored/\n"),
         "ignored/tsconfig.json": File("static", head=TS_CONFIGS["ignored/tsconfig.json"][0]),
         "go/a/a.go": File("go", head="a", imports=["example.com/fz/b"], funcs={"Start": ["Serve"]}),
@@ -277,7 +283,8 @@ IMPORTS = {
     "go": ["example.com/fz/a", "example.com/fz/b", "example.com/top/go/b", "example.com/bee", "example.com/ext"],
     "ts": ["import { f } from '@/lib';", "import * as u from '@/util';", "import { g } from './src/util';",
            "import { f } from './other/lib';", "import { f } from 'lib';", "import { g } from './src';"],
-    "java": ["base.Base", "app.K"],
+    "java": ["base.Base", "app.K", "base.*"],
+    "kt": ["kt.util.slug", "kt.util.*", "kt.Clock", "kt.helper"],
 }
 BASES = {"py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "java": ["Base", "K"]}
 # How a Python call to `{n}` is written: bare, through a module or alias, on
@@ -290,6 +297,12 @@ IMPORT_PINS = ["py/.", "pkg/.", ".", "src/lib/.!core.py", "/b.py", "/util.py", "
 TS_CALLS = ["{n}", "u.{n}", "this.{n}", "obj.{n}"]
 # How a Go call to `{n}` is written: bare, through a package, on a typed value or an untyped one.
 GO_CALLS = ["{n}", "b.{n}", "bee.{n}", "(&Server{{}}).{n}", "obj.{n}"]
+# How a Java call to `{n}` is written: bare, on `this`, static, on a new or an untyped object.
+JAVA_CALLS = ["{n}", "this.{n}", "Base.{n}", "new K().{n}", "obj.{n}"]
+# How a Kotlin call to `{n}` is written: bare, on a constructed or an untyped value.
+KT_CALLS = ["{n}", "Clock().{n}", "x.{n}"]
+# The source roots a Java file moves between (another Maven module).
+JAVA_ROOTS = ["java/", "lib/src/main/java/"]
 SERVICES = ["api", "web", "worker", "db"]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
 EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing"]
@@ -323,7 +336,7 @@ class Fuzz:
     @staticmethod
     def _styled(kind: str, names: list) -> list:
         """Each name written as every call style of the language."""
-        styles = {"py": PY_CALLS, "ts": TS_CALLS, "go": GO_CALLS}.get(kind, ["{n}"])
+        styles = {"py": PY_CALLS, "ts": TS_CALLS, "go": GO_CALLS, "java": JAVA_CALLS, "kt": KT_CALLS}.get(kind, ["{n}"])
         return [style.format(n=n) for style in styles for n in names]
 
     # Each operation returns (description, touched paths), or None when it can't apply.
@@ -430,6 +443,36 @@ class Fuzz:
             return None
         self.files[target].funcs[name] = self.files[source].funcs.pop(name)
         return f"move function {name} from {source} to {target}", {source, target}
+
+    def op_move_within_package(self):
+        """Move a free function to another file of its directory (its Go or Kotlin package)."""
+        source = self._pick(lambda f: f.kind in ("go", "kt") and f.funcs)
+        if not source:
+            return None
+        folder = source.rpartition("/")[0]
+        name = self.rng.choice(sorted(self.files[source].funcs))
+        targets = sorted(
+            p for p, f in self.files.items()
+            if p != source and p.rpartition("/")[0] == folder and f.kind == self.files[source].kind
+            and name not in f.funcs
+        )
+        if not targets:
+            return None
+        target = self.rng.choice(targets)
+        self.files[target].funcs[name] = self.files[source].funcs.pop(name)
+        return f"move function {name} from {source} to {target}", {source, target}
+
+    def op_move_java_module(self):
+        """Move a Java class to the same package under another source root."""
+        path = self._pick(lambda f: f.kind == "java")
+        if not path:
+            return None
+        old = next(root for root in JAVA_ROOTS if path.startswith(root))
+        new = self.rng.choice([root for root in JAVA_ROOTS if root != old]) + path[len(old):]
+        if new in self.files:
+            return None
+        self.files[new] = self.files.pop(path)
+        return f"move {path} to {new}", {path, new}
 
     def op_rename(self):
         path = self._pick(lambda f: f.kind not in ("compose", "docker", "static"))
@@ -550,7 +593,7 @@ class Fuzz:
     OPS = [
         "call", "base", "import", "import_style", "impl", "add_function", "remove_function", "move_function",
         "rename", "delete", "restore", "service", "from", "mention", "link", "supersedes", "pin", "pin",
-        "config", "config", "delete_dir", "kt_class",
+        "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module",
     ]
 
     def draw(self):

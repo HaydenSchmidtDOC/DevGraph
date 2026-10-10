@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 import os
 import posixpath
-import re
 import sys
 from collections import Counter
 from collections.abc import Callable, Mapping
@@ -652,13 +651,14 @@ def index_paths(
         repo_root: The repo's root path, used to resolve docs_path and to
             compute relative paths for provenance.
         paths: Files to (re)index. Paths outside repo_root are silently
-            skipped. Besides these, the batch also re-indexes files that
-            refer to what these files contain: direct Java importers (see
-            _expand_with_reverse_dependents) and files whose by-name edges
-            target a node the batch adds (see _find_referrers), relinks
-            Markdown mentioning an added name (see _mention_referrers), and
-            relinks the by-name edges other code files recorded to an added
-            node (see _relink_name_refs).
+            skipped. Besides these, the batch also re-indexes files whose
+            by-name edges target a node the batch adds (see
+            _find_referrers), relinks Markdown mentioning an added name (see
+            _mention_referrers), and relinks the by-name edges other code
+            files recorded to an added node (see _relink_name_refs). No
+            importer is re-indexed: every code edge is a function of its
+            writer's text, its resolver configuration and whether its target
+            exists.
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
         sync_provider: Write schema-provider nodes and edges for `paths`
@@ -741,11 +741,11 @@ def index_paths(
     root_resolved = repo_root.resolve()
     by_rel_path: dict[str, Path] = {}
     # rel -> the caller's own spellings of it, unresolved (`_own_rel`). Only
-    # these are judged by .gitignore: reverse dependents and referrers come
-    # from graph keys the walk already let through (a .gitignore change is
-    # followed by a catch-up, whose prune handles them).
+    # these are judged by .gitignore: referrers come from graph keys the walk
+    # already let through (a .gitignore change is followed by a catch-up,
+    # whose prune handles them).
     supplied: dict[str, list[str]] = {}
-    for path in _expand_with_reverse_dependents(engine, repo_id, repo_root, paths):
+    for path in paths:
         try:
             resolved = Path(path).resolve()
         except OSError:
@@ -754,8 +754,7 @@ def index_paths(
             continue
         rel = resolved.relative_to(root_resolved).as_posix()
         by_rel_path[rel] = resolved
-        if path in paths:
-            supplied.setdefault(rel, []).append(_own_rel(repo_root, Path(path)) or rel)
+        supplied.setdefault(rel, []).append(_own_rel(repo_root, Path(path)) or rel)
 
     max_bytes = _max_file_bytes()
     # Files left out by their content, for catch_up (see `_skip_marks`).
@@ -855,10 +854,7 @@ def index_paths(
     if docs_batch:
         added -= {node for node in batch_nodes if node[:2] in docs_batch.existing}
     added_nodes = {node[:2] for node in added}
-    referrers = _find_referrers(
-        engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path),
-        {**java_extractions, **kt_extractions},
-    )
+    referrers = _find_referrers(engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path))
     for rel_path in sorted(referrers):
         index_one(rel_path, root_resolved / rel_path)
     if judged or read:
@@ -1231,57 +1227,6 @@ def _index_single_path(
     return indexed
 
 
-def _expand_with_reverse_dependents(
-    engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path]
-) -> set[Path]:
-    """Widen a changed-files batch to also include direct importers of any
-    changed .java file already in the graph.
-
-    Without this, a CALLS/IMPORTS edge in some other file (e.g. a caller of
-    a since-renamed/removed function) is only ever re-evaluated when that
-    other file happens to be edited again, or a full rescan runs — it isn't
-    a dangling edge (upsert_relationship only MATCH-MATCHes real endpoint
-    nodes), but it silently goes stale/missing until then. One level of
-    fan-out only (direct importers, not transitive) to keep this a cheap
-    per-change lookup rather than a repo walk; transitive staleness is rare
-    enough that `--full` remains the intended escape hatch for it.
-
-    Python files are not widened to: every Python edge is a function of its
-    writer's own text and whether its target exists, so a removed target
-    goes with its node and an added one is relinked from the writer's
-    `name_refs` (_relink_name_refs), with no re-index of the importer.
-
-    This finds referrers only through edges that already exist. A referrer
-    indexed before its target existed has no edge to follow; index_paths
-    finds those separately, after pass 1, via _find_referrers.
-    """
-    root_resolved = repo_root.resolve()
-    expanded = set(paths)
-    original_rel_paths = set()
-
-    for path in paths:
-        try:
-            resolved = Path(path).resolve()
-        except OSError:
-            continue
-        if resolved.suffix != ".java" or not is_within(resolved, root_resolved):
-            continue
-        try:
-            original_rel_paths.add(resolved.relative_to(root_resolved).as_posix())
-        except ValueError:
-            continue
-
-    for rel_path in original_rel_paths:
-        for importer_rel_path in engine.find_importing_modules(repo_id, rel_path):
-            if importer_rel_path in original_rel_paths:
-                continue
-            importer_path = (root_resolved / importer_rel_path).resolve()
-            if importer_path.exists():
-                expanded.add(importer_path)
-
-    return expanded
-
-
 def _batch_nodes(
     repo_id: str,
     root: Path,
@@ -1420,14 +1365,13 @@ def _find_referrers(
     docs_root: Path | None,
     added: set[tuple[str, str]],
     batch: set[str],
-    jvm_extractions: dict[str, tuple[list[dict], list[dict]]],
 ) -> set[str]:
     """Repo-relative paths outside `batch` whose by-name edges can target a
     node in `added` -- files indexed before that node existed, so their edge
     to it was skipped (an edge whose endpoint is missing is never created).
 
-    Unlike _expand_with_reverse_dependents, nothing in the graph points from
-    these files to the new node, so each kind is found by its own lookup,
+    Nothing in the graph points from these files to the new node, so each
+    kind is found by its own lookup,
     and each is bounded to stay cheap: it only runs when the batch added a
     node of a label it can target, and it only reads files outside the
     batch. A full scan has no files outside the batch, and a batch that
@@ -1440,7 +1384,6 @@ def _find_referrers(
         return set()
     found = _docs_note_referrers(repo_id, root, docs_root, added, batch)
     found |= _handler_stub_referrers(engine, repo_id, added)
-    found |= _same_package_subtype_referrers(root, added, batch, jvm_extractions)
     return found - batch
 
 
@@ -1532,44 +1475,6 @@ def _mention_referrers(
         )
         found = set(sorted(found)[:_MAX_MENTION_RELINKS])
     return found
-
-
-def _same_package_subtype_referrers(
-    root: Path,
-    added: set[tuple[str, str]],
-    batch: set[str],
-    jvm_extractions: dict[str, tuple[list[dict], list[dict]]],
-) -> set[str]:
-    """Java/Kotlin files in the same directory (package) as an added Class
-    that name it -- a same-package subtype needs no import, so there is no
-    IMPORTS edge for _expand_with_reverse_dependents to follow. A word
-    match over sibling files with the same extension. A sibling a .gitignore
-    ignores or over the size limit is not read: index_paths would skip it."""
-    found = set()
-    max_bytes = _max_file_bytes()
-    for rel_path, (nodes, _rels) in jvm_extractions.items():
-        classes = {node["name"] for node in nodes if node["label"] == "Class" and ("Class", node["name"]) in added}
-        if not classes:
-            continue
-        pattern = re.compile(r"\b(?:" + "|".join(re.escape(name) for name in sorted(classes)) + r")\b")
-        source = root / rel_path
-        for sibling in sorted(source.parent.iterdir()):
-            sibling_rel = sibling.relative_to(root).as_posix()
-            if sibling.suffix != source.suffix or sibling_rel in batch or not _is_indexable_file(sibling):
-                continue
-            if is_gitignored(root, sibling_rel) or _too_large(sibling, max_bytes):
-                continue
-            if pattern.search(_read_text(sibling)):
-                found.add(sibling_rel)
-    return found
-
-
-def _too_large(path: Path, max_bytes: int) -> bool:
-    """Whether the file is over the size limit (or can't be stat'ed)."""
-    try:
-        return os.stat(path).st_size > max_bytes
-    except OSError:
-        return True
 
 
 def _read_text(path: Path) -> str:
