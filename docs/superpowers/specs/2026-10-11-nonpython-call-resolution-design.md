@@ -238,6 +238,12 @@ Tiers, first match wins:
 5. Anything else: a bare-name row that never ends at its caller, unless the
    method is in `STOP_METHODS["go"]`.
 
+Function nodes are keyed by (name, file), with no receiver, so the
+directory pin of a bare `f()` (tiers 2 and 3) also matches a method `T.f`
+declared in that package, at resolved; the same holds for an unqualified
+Kotlin `f()` through its package or an imported function's directory. A file
+is the finest target there is (see Principle).
+
 A pin to the file's own package leaves tests out from a non-test file
 (`!_test.go`), keeps them from a test file of the package, and reaches only
 the directory's test files from an external test package (`package x_test`,

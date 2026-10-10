@@ -508,9 +508,8 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
         source_code: The Java source as a string.
         file_path: The Module node's identity — the file's path relative
             to the repo root, forward-slashed (e.g.
-            'src/main/java/com/example/foo/Bar.java'). Also used to detect
-            the source-root prefix for import resolution (see
-            `_detect_source_root`).
+            'src/main/java/com/example/foo/Bar.java'). Also gives the
+            source root imports resolve under (see `jvm.JvmLayout`).
         repo_id: Repository ID for scoping nodes.
 
     Returns:

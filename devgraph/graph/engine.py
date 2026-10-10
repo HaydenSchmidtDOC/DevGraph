@@ -1209,31 +1209,6 @@ class GraphEngine:
         with self._driver.session() as session:
             session.execute_write(_replace_mentions_tx, repo_id, file_name, nodes, rels)
 
-    def find_importing_modules(self, repo_id: str, module_name: str) -> list[str]:
-        """Return the repo-relative paths of every Module with an IMPORTS edge
-        into `module_name` (direct importers only, one level).
-
-        Indexing no longer uses it: no importer is re-indexed when what it
-        imports changes, since every code edge is a function of its
-        writer's own text, its resolver configuration and whether its
-        target exists (a removed target goes with its node, an added one is
-        relinked from the writer's `name_refs`; see
-        docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md).
-        Only Module-to-Module edges count: a Kotlin import of a class or
-        function ends at that symbol.
-        """
-        with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
-                "MATCH (m:Module {repo_id: $repo_id})-[:IMPORTS]->"
-                "(target:Module {repo_id: $repo_id, name: $module_name}) "
-                "RETURN m.name as name",
-                repo_id=repo_id,
-                module_name=module_name,
-            )
-            records = result or []
-            return [record["name"] for record in records]
-
     def delete_nodes_by_source_file(self, repo_id: str, file_name: str) -> None:
         """Remove or unclaim every node whose provenance names this file, scoped to repo_id.
 

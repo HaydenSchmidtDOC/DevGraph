@@ -884,10 +884,7 @@ _SCAN_AND_EXPORT = textwrap.dedent(
 )
 
 
-class _NoImportersEngine:
-    def find_importing_modules(self, repo_id, module_name):
-        return []
-
+class _UnitEngine:
     def list_file_nodes(self, repo_id, files):
         return set()
 
@@ -913,7 +910,7 @@ class TestDeterministicIndexOrder:
             return 1
 
         monkeypatch.setattr(dispatch, "_index_single_path", record)
-        index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {temp_repo / rel for rel in _ORDER_FIXTURE})
+        index_paths(_UnitEngine(), "_unit_order", temp_repo, {temp_repo / rel for rel in _ORDER_FIXTURE})
 
         assert seen == sorted(_ORDER_FIXTURE)
 
@@ -958,7 +955,7 @@ class TestDeterministicIndexOrder:
         with monkeypatch.context() as m:
             m.chdir(temp_repo)
             # As raw strings "/tmp/.../b.py" sorts before "a.py".
-            index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {Path("a.py"), (temp_repo / "b.py").resolve()})
+            index_paths(_UnitEngine(), "_unit_order", temp_repo, {Path("a.py"), (temp_repo / "b.py").resolve()})
 
         assert seen == ["a.py", "b.py"]
 

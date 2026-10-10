@@ -10,9 +10,6 @@ from devgraph.indexer.dispatch import index_paths
 
 
 class _QuietEngine:
-    def find_importing_modules(self, repo_id, module_name):
-        return []
-
     def list_file_nodes(self, repo_id, files):
         return set()
 

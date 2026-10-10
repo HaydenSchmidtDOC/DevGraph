@@ -825,7 +825,10 @@ def find_dependency_cycles(
         engine: GraphEngine instance
         repo_id: Repository ID to search within (unless cross_repo=True)
         relationship: Dependency edge type to traverse; case-insensitive, one of
-            CALLS, DEPENDS_ON, EXTENDS, IMPORTS, USES
+            CALLS, DEPENDS_ON, EXTENDS, IMPORTS, USES. Most IMPORTS edges join
+            two Modules, but a Kotlin import ends at the Class or Function it
+            names (no edge leaves those), so a Kotlin file's imports close no
+            IMPORTS cycle.
         max_length: Longest cycle to look for, in edges; clamped to 2..8
         cross_repo: If True, allow cycles that cross repository boundaries
         max_results: Maximum number of cycles to return in the envelope
@@ -1203,7 +1206,9 @@ def find_related_files(
 
     Returns:
         Dict with containing_modules, imported_modules, and related_components,
-        each wrapped as {count, results, truncated} envelope objects
+        each wrapped as {count, results, truncated} envelope objects.
+        imported_modules are the names of what `component_name` IMPORTS: a
+        Module's path, or, for a Kotlin import, the Class or Function it names
     """
     _at_least(1, max_results=max_results)
     repo_filter = "" if cross_repo else "WHERE n.repo_id = $repo_id"
