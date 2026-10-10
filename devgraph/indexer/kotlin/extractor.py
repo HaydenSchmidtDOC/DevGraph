@@ -538,17 +538,19 @@ class _KotlinResolver:
     def class_pins(self, package: list[str], cls: str) -> list[str]:
         """Where a member of the class `cls` of `package` is: its own `.kt`
         file, else any Kotlin file of its package (at package confidence),
-        under this source root or another; or its Java file."""
+        under this source root or another; or a Java file of the package."""
         pins = []
         folder = self.layout.folder(package)
         if folder is not None:
             pins.append(posixpath.join(folder, f"{cls}.kt") if folder else f"{cls}.kt")
             pins.append((f"{folder}/." if folder else ".") + "~?.kt")
+        # Elsewhere a file of the package's directories, at package confidence
+        # either way, so its own `.kt`/`.java` name adds nothing.
         rel, full = self._suffixes(package)
         if rel is not None:
-            pins += [f"{rel}/{cls}.kt{self.layout.flag}", f"{rel}/.?.kt{self.layout.flag}"]
+            pins.append(f"{rel}/.?.kt{self.layout.flag}")
         if full is not None:
-            pins.append(f"{full}/{cls}.java{self.layout.flag}")
+            pins.append(f"{full}/.?.java{self.layout.flag}")
         return pins
 
     def type_pins(self, name: str) -> list[str] | None:

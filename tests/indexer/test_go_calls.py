@@ -294,3 +294,50 @@ def test_a_nested_go_mod_moves_a_package_and_a_moved_function_relinks(engine, re
     sync_resolver_config(engine, repo_id, tmp_path, {nested})
     assert not any(e[0] == "main.go" for e in _edges(engine, repo_id, "CALLS")), _edges(engine, repo_id, "CALLS")
     _equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_the_index_upgrade_replaces_bare_go_calls(engine, repo_id, tmp_path, monkeypatch):
+    """A graph indexed at format 6 has bare Go CALLS with no confidence and
+    Modules without `dir_name`; catch_up's automatic upgrade (a full_scan)
+    leaves the resolved edges and records both."""
+    from datetime import datetime, timezone
+
+    from devgraph.indexer import dispatch
+    from devgraph.indexer.common import GraphRelationship
+
+    _write(tmp_path, "go.mod", "module example.com/app\n")
+    _write(tmp_path, "main.go", 'package main\n\nimport "example.com/app/lib"\n\nfunc main() { lib.Do() }\n')
+    _write(tmp_path, "lib/a.go", "package lib\n\nfunc Do() {}\n")
+    _write(tmp_path, "other/b.go", "package other\n\nfunc Do() {}\n")
+    real = dispatch.extract_go_file
+
+    def old_extract(content, rel_path, repo_id, config=None):
+        # Format 6: every Go call a bare name, no IMPORTS resolution.
+        result = real(content, rel_path, repo_id)
+        result.relationships = [r for r in result.relationships if r.rel_type not in ("CALLS", "IMPORTS")]
+        if rel_path == "main.go":
+            result.relationships.append(GraphRelationship(
+                from_label="Function", from_name="main", rel_type="CALLS", to_label="Function", to_name="Do",
+                repo_id=repo_id, from_file=rel_path, origin=rel_path,
+            ))
+        return result
+
+    with monkeypatch.context() as old:
+        old.setattr(dispatch, "extract_go_file", old_extract)
+        provision_repository_schema(engine, tmp_path)
+        engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+        full_scan(engine, repo_id, tmp_path)
+    engine.run_cypher("MATCH (m:Module {repo_id: $r}) REMOVE m.dir_name", {"r": repo_id})
+    engine.set_index_format(repo_id, 6)
+    calls = [e for e in _edges(engine, repo_id, "CALLS") if e[1] == "main"]
+    assert calls == [("main.go", "main", "lib/a.go", "Do", None), ("main.go", "main", "other/b.go", "Do", None)]
+    assert dispatch.index_outdated(engine, repo_id)
+
+    dispatch.catch_up(engine, repo_id, tmp_path, since=datetime.now(timezone.utc))
+    assert [e for e in _edges(engine, repo_id, "CALLS") if e[1] == "main"] == [
+        ("main.go", "main", "lib/a.go", "Do", "resolved"),
+    ]
+    assert not dispatch.index_outdated(engine, repo_id)
+    (row,) = engine.run_cypher("MATCH (m:Module {repo_id: $r, name: 'lib/a.go'}) RETURN m.dir_name AS d", {"r": repo_id})
+    assert row["d"] == "lib"
+    _equals_fresh(engine, repo_id, tmp_path)

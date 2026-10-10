@@ -15,8 +15,9 @@ latest release, turns everything after a member that closes on the same line
 
 The work lands in three slices, each with its own `INDEX_FORMAT` bump: A (the
 shared core, JS/TS and the Kotlin parse fix, format 6), B (Go, Java, Kotlin,
-format 7) and C (Rust, C#, C++, format 8). This spec covers what has landed;
-the later slices' rules are summarised at the end.
+and dropping the reverse-dependent fan-out, format 7) and C (Rust, C#, C++,
+format 8). This spec covers what has landed; the later slices' rules are
+summarised at the end.
 
 ## Principle
 
@@ -298,8 +299,9 @@ files, as in Java. Calls, first match wins:
    enclosing classes, primary-constructor `val`/`var`, parameters, locals
    typed by annotation or a constructor call, `T().m()`, `T.m()` on an object
    or companion): the class's own `.kt` file (resolved), any `.kt` file of its
-   package (`~`, package confidence: `TagSet` lives in `Tags.kt`), by suffix
-   elsewhere, and its `.java` file by suffix.
+   package (`~`, package confidence: `TagSet` lives in `Tags.kt`), and any
+   `.kt` or `.java` file of the package's directories elsewhere (suffix
+   directory pins, package confidence).
 5. Anything else: a bare-name row off its caller, unless stoplisted.
 
 ## No reverse dependents
@@ -481,3 +483,73 @@ paired timing):
 }
 ```
 
+### Results after slice B
+
+| | Target | BEFORE | AFTER | |
+|---|---|---|---|---|
+| go M1 resolved multi-target share | < 2 % | no resolved edge (43 bare, 24 multi-target) | 0 % (22 resolved, 9 package; its 6 multi-target edges all true: two `New`s, build tags) | met |
+| go M2 linked precision | ≥ 98 %, 0 cross-directory without import | none linked; 72 % of all edges right | 100 %; 0 | met |
+| go M3 `IMPORTS` precision / recall | ≥ 98 % / 95 % | 100 % / 14 % | 100 % / 100 % | met |
+| go M4 `CALLS` recall | ≥ 95 % | 100 % (all bare) | 100 % (linked 100 %, resolved 69 %) | met |
+| go M5 named sites | all | 26/33 | 33/33 | met |
+| java M1 | < 2 % | no resolved edge (34 bare, 17 multi-target) | 0 % (12 resolved, 9 package) | met |
+| java M2 | ≥ 98 %, 0 | none linked; 71 % | 100 %; 0 | met |
+| java M3 | ≥ 98 % / 95 % | 100 % / 15 % | 100 % / 100 % (13/13, no vendored copy) | met |
+| java M4 | ≥ 95 % | 100 % (all bare) | 95.2 % (linked 95.2 %, resolved 57 %) | met |
+| java M5 | all | 24/30 | 29/30: `repo.size()` on an `AuditedRepo` field (Repo's, inherited in another file) is out of reach, see Java and Kotlin | disputed |
+| kotlin M1 | < 2 % | no resolved edge (19 bare) | 0 % (16 resolved, 3 package, 1 name) | met |
+| kotlin M2 | ≥ 98 %, 0 | none linked; 89 % | 100 %; 0 | met |
+| kotlin M3 | ≥ 98 % / 95 % | none / 0 % | 100 % / 100 % (13/13) | met |
+| kotlin M4 | ≥ 95 % | 85 % | 100 % (linked 95 %, resolved 80 %) | met |
+| kotlin M5 | all | 29/33, symbols 5/13 | 33/33, symbols 13/13 | met |
+| Python on DevGraph, ts fixture | unchanged | slice A | M1-M5 identical (old and new code over the same tree; ts 41/41 sites, `IMPORTS` 24/24) | met |
+| M6 `full_scan` | ≤ +15 % | DevGraph 48.0 s; go 0.92 s, java 1.03 s, kotlin 0.92-1.09 s | DevGraph 52.6-53.0 s (+10 %); go 0.94 s, java 1.00 s, kotlin 1.03 s | met |
+| M6 largest `name_refs` | < 1 MiB | 229,842 B (DevGraph) | 229,842 B (DevGraph); 3,134 B (java) | met |
+
+- **Timing.** Old and new code alternated over the same tree on one
+  machine: DevGraph two pairs of `--scan` runs; each fixture the median of
+  six in-process `full_scan`s after two warm-ups (kotlin's two series gave
+  +13 % and -5 %).
+- **Measure changes.** M1 leaves out a group whose every target the truth
+  calls (Go's `store.New()` and `cache.New()` from one `main`, a function
+  per build tag); M5 does not count a `not_files` entry the truth also lists
+  for the same caller and name (the fixture's two `New` rows each name the
+  other's file); M3 counts a Kotlin import's edge to a class or function as
+  an import of its file. `test_measure_fixtures` lists the one disputed Java
+  site.
+
+AFTER (`full_scan_s` is one cold run of the script; the table has the paired
+timing):
+
+```json
+{
+ "go": {
+  "M1": {"calls_by_confidence": {"package": 9, "resolved": 22}, "multi_target_by_confidence": {"resolved": 6}, "resolved_multi_share": 0.0},
+  "M2": {"precision_resolved": 1.0, "precision_linked": 1.0, "precision_all": 1.0, "resolved_cross_dir_without_import": 0},
+  "M3": {"graph_imports": 18, "truth_imports": 14, "precision": 1.0, "recall": 1.0},
+  "M4": {"recall_any": 1.0, "recall_linked": 1.0, "recall_resolved": 0.6897, "top5": [["New", "internal/store/memory.go"], ["normalize", "internal/store/keys.go"], ["abs", "money/round.go"], ["header", "tools/internal/codegen/render.go"], ["Open", "internal/legacydb/conn.go"]], "top5_stoplisted": []},
+  "M5": {"sites_ok": 33, "sites": 33},
+  "M6": {"full_scan_s": 4.07, "largest_name_refs_module": "main.go", "largest_name_refs_bytes": 567, "total_name_refs_bytes": 2613},
+  "failures": []
+ },
+ "java": {
+  "M1": {"calls_by_confidence": {"package": 9, "resolved": 12}, "multi_target_by_confidence": {}, "resolved_multi_share": 0.0},
+  "M2": {"precision_resolved": 1.0, "precision_linked": 1.0, "precision_all": 1.0, "resolved_cross_dir_without_import": 0},
+  "M3": {"graph_imports": 13, "truth_imports": 13, "precision": 1.0, "recall": 1.0},
+  "M4": {"recall_any": 0.9524, "recall_linked": 0.9524, "recall_resolved": 0.5714, "top5": [["getName", "core/src/main/java/com/acme/core/model/Item.java"], ["core/src/main/java/com/acme/core/model/Item.java", "core/src/main/java/com/acme/core/model/Item.java"], ["validate", "core/src/main/java/com/acme/core/repo/Repo.java"], ["Notifier", "core/src/main/java/com/acme/core/notify/Notifier.java"], ["pages", "app/src/main/java/com/acme/app/OrderService.java"]], "top5_stoplisted": []},
+  "M5": {"sites_ok": 29, "sites": 30},
+  "M6": {"full_scan_s": 2.46, "largest_name_refs_module": "app/src/main/java/com/acme/app/OrderService.java", "largest_name_refs_bytes": 3134, "total_name_refs_bytes": 8710},
+  "failures": ["M5 every named site"]
+ },
+ "kotlin": {
+  "M1": {"calls_by_confidence": {"name": 1, "package": 3, "resolved": 16}, "multi_target_by_confidence": {}, "resolved_multi_share": 0.0},
+  "M2": {"precision_resolved": 1.0, "precision_linked": 1.0, "precision_all": 1.0, "resolved_cross_dir_without_import": 0},
+  "M3": {"graph_imports": 13, "truth_imports": 13, "precision": 1.0, "recall": 1.0},
+  "M4": {"recall_any": 1.0, "recall_linked": 0.95, "recall_resolved": 0.8, "top5": [["now", "src/main/kotlin/util/Clock.kt"], ["truncate", "src/main/kotlin/util/Text.kt"], ["slugify", "src/main/kotlin/util/Text.kt"], ["Clock", "src/main/kotlin/util/Clock.kt"], ["line", "src/main/kotlin/export/MarkdownExporter.kt"]], "top5_stoplisted": []},
+  "M5": {"sites_ok": 33, "sites": 33, "symbols_found": 13, "symbols": 13},
+  "M6": {"full_scan_s": 1.72, "largest_name_refs_module": "src/main/kotlin/Main.kt", "largest_name_refs_bytes": 2087, "total_name_refs_bytes": 6684},
+  "failures": []
+ }
+}
+
+```

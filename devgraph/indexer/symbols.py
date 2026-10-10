@@ -32,8 +32,8 @@ EXTRACTORS: dict[str, Callable[[str, str], ExtractionResult]] = {
     "java": lambda source, path: extract_java_file(source, path, ""),
     "rs": lambda source, path: extract_rust_file(source, path, ""),
     "kt": lambda source, path: extract_kotlin_file(source, path, ""),
-    # The module path only shapes IMPORTS targets, which are dropped here.
-    "go": lambda source, path: extract_go_file(source, path, "", module_path=None),
+    # The resolver configuration only shapes IMPORTS and CALLS targets, which are dropped here.
+    "go": lambda source, path: extract_go_file(source, path, ""),
 }
 
 _SYMBOL_LABELS = ("Function", "Class")
