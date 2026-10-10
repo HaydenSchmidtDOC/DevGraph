@@ -207,7 +207,10 @@ The import is a directory pin to the package's non-test Go files
 (`cache/.?.go!_test.go`, resolved); any other import is external, with no edge
 (no more bare import-path targets, and no `_find_module_path`: the root
 go.mod alone was read before). An unaliased import is used by its path's last
-element, skipping a major version (`chi/v5` is `chi`).
+element, skipping a major version: any `vN` for an external path (`chi/v5` is
+`chi`), only the module's own for an in-repository one (`example.com/shop/v2`
+is `shop`, but `example.com/shop/v2/apis/apps/v1` is a directory, `package
+v1`).
 
 Tiers, first match wins:
 
@@ -215,8 +218,11 @@ Tiers, first match wins:
 2. `pkg.F()` on an import: its package's directory; nothing for an external
    package. A package clause can name a package otherwise than its directory
    (`internal/legacydb` declaring `package db`), and every import must be
-   used, so an unknown qualifier is any unaliased in-repo import whose path
-   name the file never uses.
+   used, so an unknown qualifier (no import, type or name the file
+   declares) may be an unaliased in-repo import whose path name the file
+   never uses. Only when the unknown qualifiers and such imports are as many
+   is it taken to be them (resolved); otherwise (a package-level `logger`
+   of another file beside `db`) it reaches them at package confidence (`~`).
 3. Any other `f()`: the file's package directory (and a dot-imported
    package's); a builtin (`len`, `append`) or a local function value links
    nothing.
