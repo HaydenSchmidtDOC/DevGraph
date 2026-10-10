@@ -389,6 +389,7 @@ def test_a_directory_pin_seeks_its_files_not_every_node_of_the_name(engine, repo
     PROFILE db hits, so it holds on a noisy CI machine."""
     from neo4j import ManagedTransaction
 
+    engine.init_schema()  # the (repo_id, name, file) index this seeks, on any database
     packages = 300
     engine.upsert_nodes(
         [{"label": "Module", "repo_id": repo_id, "name": "main.go", "properties": {"source_file": "main.go"}}]
