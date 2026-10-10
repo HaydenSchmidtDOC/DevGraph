@@ -103,7 +103,7 @@ def test_unowned_sources_stay_bare():
     (extends,) = [r for r in rust.relationships if r.rel_type == "EXTENDS"]
     assert (extends.from_name, extends.from_file, extends.origin) == ("Foo", None, "conv.rs")
 
-    cpp = extract_cpp_file("void Foo::bar() { baz(); }\n", "foo.cpp", REPO)
+    cpp = extract_cpp_file("void baz() {}\n\nvoid Foo::bar() { baz(); }\n", "foo.cpp", REPO)
     (call,) = [r for r in cpp.relationships if r.rel_type == "CALLS"]
     assert (call.from_name, call.from_file) == ("bar", "foo.cpp")
     (stub,) = [n for n in cpp.nodes if n.label == "Class" and n.name == "Foo"]
