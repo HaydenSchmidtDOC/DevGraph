@@ -14,9 +14,11 @@ includes are read as the compiler's search would most likely go:
     copies left out); a bare `"y.h"` only under a conventional include root
     (`/include/y.h`, `/src/y.h`), so two `log.h` in different
     folders stay apart. `#include <system.h>` is not resolved at all.
-  - A header's declarations are defined in its same-stem source
-    (`/x/y.cpp` or `.cc`; package), which an include reaches
-    too.
+  - A header's declarations are defined in its same-stem source (`.cpp`
+    or `.cc`, never `.cxx`), beside the header the include names or under
+    a `src/` root (`/src/x/y.cpp`; package), which an include reaches too.
+    A header outside the includer's folder, `include/` and `src/` is not
+    resolved.
 
 CALLS, by the first tier that applies: a function defined in the file ->
 this file; `ns::f()` or `Cls::f()` -> the includes whose path names the
@@ -347,8 +349,17 @@ def _include(spelling: str, current_dir: str) -> _Include:
             suffixes = (f"/{clean}^",)
         else:
             suffixes = tuple(f"/{root}/{clean}^" for root in _INCLUDE_ROOTS)
-    stem_path, ext = posixpath.splitext(clean if ".." not in parts else (beside or ""))
-    sources = tuple(f"/{stem_path}{each}^" for each in _SOURCE_EXTS) if ext in _HEADER_EXTS and stem_path else ()
+    sources: tuple[str, ...] = ()
+    if posixpath.splitext(clean)[1] in _HEADER_EXTS:
+        # Beside the header the include names, at package confidence (a
+        # directory pin limited to the source's name), and under a src/
+        # root, as the header's own include roots go.
+        if beside:
+            folder, stem = posixpath.dirname(beside) or ".", posixpath.splitext(posixpath.basename(beside))[0]
+            sources += tuple(f"{folder if folder == '.' else folder + '/.'}~?{stem}{each}" for each in _SOURCE_EXTS)
+        if ".." not in parts:
+            stem_path = posixpath.splitext(clean)[0]
+            sources += tuple(f"/src/{stem_path}{each}^" for each in _SOURCE_EXTS)
     names = tuple(part.lower() for part in posixpath.splitext(clean)[0].split("/") if part not in ("", ".", ".."))
     return _Include(beside, suffixes, sources, names)
 

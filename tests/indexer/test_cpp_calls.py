@@ -115,6 +115,16 @@ def test_a_qualifier_picks_the_includes_whose_path_names_it():
     assert reached(source, path, "add", "begin") == {}
 
 
+def test_a_headers_sources_are_beside_it_or_under_src_only():
+    source = '#include "widget.h"\n#include "util/strings.h"\n\nint main() { draw(); }\n'
+    candidates = ["src/app/widget.cpp", "src/app/widget.cc", "src/widget.cpp", "lib/widget.cpp",
+                  "tools/gui/widget.cpp", "src/util/strings.cpp", "lib/util/strings.cpp", "src/app/widget.cxx"]
+    assert reached(source, "src/app/main.cpp", "main", "draw", candidates) == {
+        "src/app/widget.cpp": "package", "src/app/widget.cc": "package", "src/widget.cpp": "package",
+        "src/util/strings.cpp": "package",
+    }
+
+
 def test_typed_receivers_go_to_their_types_include_or_conventional_files():
     source = """
         #include "inventory.h"

@@ -435,9 +435,15 @@ anywhere else (package); a bare `"y.h"` names `<dir>/y.h` and only
 `/include/y.h^` or `/src/y.h^` elsewhere, so `src/net/conn.cpp`'s
 `"log.h"` is `src/net/log.h`, never `include/util/log.h`. These are its
 `IMPORTS` (`#include <...>` none). A header's declarations are defined in
-its same-stem source, so an include also reaches `/x/y.cpp^` and
-`/x/y.cc^` (package: a convention, not what the include names; fewer
-source extensions and include roots keep the rows per call down, M6).
+its same-stem source, so an include also reaches `y.cpp` and `y.cc` beside
+the header it names (`<dir>/x/.~?y.cpp`) and under a `src/` root
+(`/src/x/y.cpp^`), at package confidence (a convention, not what the
+include names). The include-root rule holds for sources too: a bare
+`"widget.h"` reaches no `widget.cpp` in another folder. `.cxx` (and `.c`,
+which is not indexed) is no same-stem source, and a header outside the
+includer's folder, `include/` and `src/` (a `-I` directory of another name)
+is not resolved; fewer source extensions and include roots also keep the
+rows per call down (M6).
 
 **Calls**, first match wins:
 
