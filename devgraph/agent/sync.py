@@ -19,7 +19,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from devgraph.indexer.dispatch import catch_up, index_paths, remove_paths, sync_resolver_config
+from devgraph.indexer.dispatch import (
+    catch_up,
+    index_paths,
+    remove_paths,
+    sync_resolver_config,
+)
 from devgraph.indexer.gitignore import GITIGNORE
 from devgraph.indexer.walk import RepoRootUnavailable
 
