@@ -219,8 +219,8 @@ public:
     calls_by_pair = {
         (r.from_name, r.to_name): r.properties for r in result.relationships if r.rel_type == "CALLS"
     }
-    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service"}
-    assert calls_by_pair[("free_call", "helper")] is None
+    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service", "confidence": "resolved"}
+    assert calls_by_pair[("free_call", "helper")] == {"confidence": "resolved"}
 
 
 def test_calls_not_hoisted_out_of_nested_class():
@@ -235,6 +235,9 @@ void outer() {
     };
     outer_call();
 }
+
+void inner_call() {}
+void outer_call() {}
 """
     result = extract_cpp_file(source_code, "x.cpp", "test_repo")
     calls = {(r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}

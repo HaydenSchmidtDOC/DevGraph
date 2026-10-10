@@ -401,6 +401,42 @@ reached; a `using` of a namespace, the bare dotted name and the old
 `A/B.cs` folder guess are gone. An extension method's class, which the
 caller never names, is not imported.
 
+## C++ (`devgraph/indexer/cpp/extractor.py`)
+
+Without the build's `-I` flags a quoted include is read as the compiler's
+search would most likely go. `#include "x/y.h"` names the file beside the
+includer (`<dir>/x/y.h`, resolved; a `../` path only that) and `/x/y.h^`
+anywhere else (package); a bare `"y.h"` names `<dir>/y.h` and only
+`/include/y.h^`, `/inc/y.h^` or `/src/y.h^` elsewhere, so `src/net/conn.cpp`'s
+`"log.h"` is `src/net/log.h`, never `include/util/log.h`. These are its
+`IMPORTS` (`#include <...>` none). A header's declarations are defined in
+its same-stem source, so an include also reaches `/x/y.cpp^` (`.cc`, `.cxx`,
+`.c`; package: a convention, not what the include names).
+
+**Calls**, first match wins:
+
+1. A function defined in the file (a prototype is no Function node):
+   this file.
+2. `ns::f()` and `Cls::f()`: the includes whose path names the qualifier
+   (`util::trim` reaches `util/strings.h` and `util/strings.cpp`), else
+   every include. `std::` links nothing.
+3. `x.m()` and `x->m()` on a typed receiver (a parameter, a local `T x;`,
+   `T* x`, `auto x = new T`, a field of a class declared in the file):
+   this file for a class declared here with m; else the include named after
+   the type or its namespace (`Inventory` picks `inventory.h`,
+   `net::Connection` picks `net/conn.h`); else the type's conventional files
+   (`/inventory.h^`, `/inventory.cpp^`, ...) and every include. An STL type
+   (`STOP_TYPES["cpp"]`, or anything in `std::`) links nothing.
+4. Any other `f()`, and `this->m()`: every include (a file including nothing
+   links nothing).
+5. An untyped receiver: a bare-name row off its caller, unless the method
+   is in `STOP_METHODS["cpp"]` (`items_.size()` inside `size()` is no
+   self-loop).
+
+A function defined once per platform (`now_ms` in `platform_posix.cpp` and
+`platform_win.cpp`, declared in `platform.h`) is reached by neither: its
+sources are not named after the header.
+
 ## No reverse dependents
 
 With Go, Java and Kotlin resolved, every code edge is a function of its
@@ -414,11 +450,6 @@ added one is relinked, a configuration change re-indexes its language. The
 graph-accuracy fuzz (13 seeds of 30 steps) moves a Java class between
 modules, a function within a Go or Kotlin package, and adds and removes a
 nested go.mod.
-
-## Later slices
-
-- **C++:** a quoted `#include` gives the relative file and a suffix pin, plus
-  same-stem sources.
 
 ## Measurements
 

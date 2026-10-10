@@ -20,7 +20,7 @@ measure = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(measure)
 
 #: Languages whose resolution has not landed yet.
-PENDING = {"cpp"}
+PENDING: set[str] = set()
 #: Languages whose resolution has landed short of the targets, and why.
 SHORT = {
     "csharp": "a caller's text cannot tell two User.cs apart nor find a class in a file named otherwise "

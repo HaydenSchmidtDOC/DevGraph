@@ -127,7 +127,9 @@ STOP_METHODS: dict[str, frozenset[str]] = {
 }
 
 #: Library types whose static calls and constructors link nothing
-#: (`Vec::new()`, `String.valueOf()`, `Console.WriteLine()`).
+#: (`Vec::new()`, `String.valueOf()`, `Console.WriteLine()`), nor do the
+#: methods of a value typed with one (C++'s `std::` types written without
+#: `std::`).
 STOP_TYPES: dict[str, frozenset[str]] = {
     "js": frozenset({
         "Object", "Array", "JSON", "Promise", "Math", "Number", "String", "Date", "Reflect", "Symbol", "console",
@@ -144,6 +146,13 @@ STOP_TYPES: dict[str, frozenset[str]] = {
     "csharp": frozenset({
         "Console", "Task", "Enumerable", "Math", "String", "string", "Convert", "DateTime", "Guid", "List",
         "Dictionary", "Path", "File", "Directory", "Environment", "Activator",
+    }),
+    "cpp": frozenset({
+        "string", "wstring", "string_view", "vector", "array", "deque", "list", "forward_list", "map", "multimap",
+        "unordered_map", "set", "multiset", "unordered_set", "stack", "queue", "priority_queue", "pair", "tuple",
+        "optional", "variant", "any", "unique_ptr", "shared_ptr", "weak_ptr", "function", "mutex", "thread",
+        "atomic", "ostream", "istream", "ostringstream", "istringstream", "stringstream", "ofstream", "ifstream",
+        "size_t", "chrono",
     }),
     "rust": frozenset({
         "Vec", "String", "HashMap", "HashSet", "BTreeMap", "BTreeSet", "VecDeque", "Box", "Arc", "Rc", "Mutex",
