@@ -17,7 +17,10 @@ repository with one recursive watch on its root through this emitter, which:
 - closes the inotify descriptor and its pipe when setting up a watch fails
   (watchdog leaks them, e.g. when the watch limit is hit part-way).
 
-Watches on any other path (the `.git` ones) are not filtered.
+With `watch_git`, the repository's git state (`.git`, `.git/refs`,
+`.git/refs/heads` and below) is watched on the same instance, so a
+repository costs one inotify instance. Watches on any other path are not
+filtered.
 
 It overrides watchdog internals (`Inotify._add_watch`, `_add_dir_watch`,
 `_wd_for_path`, `InotifyBuffer.__init__`); watchdog is pinned below 7 in
@@ -47,8 +50,16 @@ from devgraph.indexer.walk import is_ignored_path
 logger = logging.getLogger(__name__)
 
 
-def ignored_folder_filter(root: Path) -> Callable[[bytes], bool]:
-    """Whether a folder under `root` is one the indexer never enters."""
+#: The folders of a repository's git state the root watch keeps, with
+#: everything below the last: `.git` (HEAD, packed-refs, index.lock),
+#: `.git/refs` (refs/stash) and `.git/refs/heads` (branch tips). Remote-
+#: tracking refs and tags stay unwatched, so a background fetch triggers nothing.
+_GIT_STATE = ((".git",), (".git", "refs"), (".git", "refs", "heads"))
+
+
+def ignored_folder_filter(root: Path, *, watch_git: bool = False) -> Callable[[bytes], bool]:
+    """Whether a folder under `root` is one the indexer never enters, and,
+    with `watch_git`, not part of the git state (`_GIT_STATE`)."""
 
     def ignored(path: bytes) -> bool:
         try:
@@ -57,6 +68,8 @@ def ignored_folder_filter(root: Path) -> Callable[[bytes], bool]:
             return False
         if not rel.parts:
             return False
+        if watch_git and rel.parts[0] == ".git":
+            return not (rel.parts in _GIT_STATE or rel.parts[:3] == _GIT_STATE[2])
         return is_ignored_path(rel) or is_gitignored(root, rel.as_posix(), is_dir=True)
 
     return ignored
@@ -181,10 +194,11 @@ class FilteredInotifyEmitter(InotifyEmitter):
         timeout: float = DEFAULT_EMITTER_TIMEOUT,
         event_filter: Any = None,
         filter_root: Path | None = None,
+        watch_git: bool = False,
     ) -> None:
         super().__init__(event_queue, watch, timeout=timeout, event_filter=event_filter)
         self._skip = (
-            ignored_folder_filter(filter_root)
+            ignored_folder_filter(filter_root, watch_git=watch_git)
             if filter_root is not None and Path(watch.path) == filter_root
             else None
         )
@@ -205,8 +219,9 @@ class FilteredInotifyEmitter(InotifyEmitter):
         return [Path(os.fsdecode(p)) for p in buffer._inotify.add_missing_watches()]
 
 
-def new_observer(filter_root: Path | None) -> BaseObserver:
-    """An observer whose watch on `filter_root` skips ignored folders, and
-    whose every watch closes what it opened when it can't start."""
-    emitter_class = functools.partial(FilteredInotifyEmitter, filter_root=filter_root)
+def new_observer(filter_root: Path | None, *, watch_git: bool = False) -> BaseObserver:
+    """An observer whose watch on `filter_root` skips ignored folders (but,
+    with `watch_git`, keeps the git state), and whose every watch closes what
+    it opened when it can't start."""
+    emitter_class = functools.partial(FilteredInotifyEmitter, filter_root=filter_root, watch_git=watch_git)
     return BaseObserver(emitter_class, timeout=DEFAULT_OBSERVER_TIMEOUT)  # type: ignore[arg-type]

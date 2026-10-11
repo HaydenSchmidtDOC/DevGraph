@@ -247,6 +247,28 @@ def _debounce_s(debounce_ms: int, max_wait_ms: int | None, waited_s: float) -> f
     return max(0.0, min(interval, max_wait_ms / 1000.0 - waited_s))
 
 
+class _RootEventRouter(FileSystemEventHandler):
+    """The root watch's one handler: an event under `.git` (only the git
+    state is watched there) goes to the git handler, any other to the file
+    handler, so a source file named HEAD or a folder named refs is a file."""
+
+    def __init__(self, files: FileSystemEventHandler, git: FileSystemEventHandler | None, git_dir: Path) -> None:
+        self._files = files
+        self._git = git
+        self._git_prefix = str(git_dir) + os.sep
+
+    def _in_git(self, raw: Any) -> bool:
+        path = os.fsdecode(raw) if raw else ""
+        return path.startswith(self._git_prefix) or path == self._git_prefix[:-1]
+
+    def dispatch(self, event: FileSystemEvent) -> None:
+        if self._in_git(event.src_path) or self._in_git(getattr(event, "dest_path", "")):
+            if self._git is not None:
+                self._git.dispatch(event)
+            return
+        self._files.dispatch(event)
+
+
 def _forget_closed_handle(emitter: Any) -> None:
     """Before a stopped emitter is stopped again (unscheduled, or by its
     observer's stop): watchdog's Windows emitter closes its directory handle
@@ -612,10 +634,22 @@ class WatcherManager:
             request_catch_up=self.request_catch_up,
             max_wait_ms=self._max_wait_ms,
         )
-        observer = self._new_observer(repo.path)
+        # Watch git state changes (.git/HEAD, .git/refs) if .git exists as a directory.
+        # Skip if .git is a file (linked git worktree contains gitdir: ... pointer).
+        git_dir = repo.path / ".git"
+        git_handler: _GitStateEventHandler | None = None
+        if git_dir.is_dir() and (self._on_git_state_changed or self._on_catch_up):
+            git_handler = _GitStateEventHandler(
+                repo.repo_id,
+                self._debounce_ms,
+                self._on_git_burst,
+                timer_factory=self._timer_factory,
+                now=self._now,
+                max_wait_ms=self._max_wait_ms,
+            )
+        observer = self._new_observer(repo.path, watch_git=git_handler is not None)
         root_watch: ObservedWatch | None = None
         watches: dict[Path, tuple[ObservedWatch, tuple[int, int] | None]] = {}
-        git_handler: _GitStateEventHandler | None = None
         try:
             if self._root_watch:
                 # Linux: one recursive watch on the root, whose emitter leaves
@@ -623,9 +657,12 @@ class WatcherManager:
                 # out of the kernel watch (see devgraph/watcher/inotify.py).
                 # watchdog opens an inotify instance per watch, and Linux
                 # allows 128 per user, so one per top-level folder (below) ran
-                # out on a repository with ~100 of them. One instance also
-                # pairs a move between two top-level folders.
-                root_watch = observer.schedule(handler, str(repo.path), recursive=True)
+                # out on a repository with ~100 of them. The git state below
+                # rides on the same instance, so a repository costs one. One
+                # instance also pairs a move between two top-level folders.
+                root_watch = observer.schedule(
+                    _RootEventRouter(handler, git_handler, git_dir), str(repo.path), recursive=True
+                )
             else:
                 # Elsewhere, don't hand watchdog a single recursive watch on
                 # repo.path: that puts every file under .venv/.git/build/etc
@@ -643,31 +680,20 @@ class WatcherManager:
                     child: self._schedule_dir(observer, handler, child)
                     for child in sorted(self._desired_dirs(repo.path))
                 }
-
-            # Watch git state changes (.git/HEAD, .git/refs) if .git exists as a directory.
-            # Skip if .git is a file (linked git worktree contains gitdir: ... pointer).
-            git_dir = repo.path / ".git"
-            if git_dir.is_dir() and (self._on_git_state_changed or self._on_catch_up):
-                git_handler = _GitStateEventHandler(
-                    repo.repo_id,
-                    self._debounce_ms,
-                    self._on_git_burst,
-                    timer_factory=self._timer_factory,
-                    now=self._now,
-                    max_wait_ms=self._max_wait_ms,
-                )
-                # Non-recursive watch on .git itself (catches HEAD, packed-refs)
-                observer.schedule(git_handler, str(git_dir), recursive=False)
-                # Non-recursive watch on .git/refs (refs/stash: `git stash pop`
-                # moves neither HEAD nor a branch), and a recursive one on
-                # .git/refs/heads. Remote-tracking refs and tags stay unwatched,
-                # so a background fetch triggers nothing.
-                refs = git_dir / "refs"
-                if refs.is_dir():
-                    observer.schedule(git_handler, str(refs), recursive=False)
-                refs_heads = refs / "heads"
-                if refs_heads.is_dir():
-                    observer.schedule(git_handler, str(refs_heads), recursive=True)
+                if git_handler is not None:
+                    # Non-recursive watch on .git itself (catches HEAD, packed-refs)
+                    observer.schedule(git_handler, str(git_dir), recursive=False)
+                    # Non-recursive watch on .git/refs (refs/stash: `git stash pop`
+                    # moves neither HEAD nor a branch), and a recursive one on
+                    # .git/refs/heads. Remote-tracking refs and tags stay unwatched,
+                    # so a background fetch triggers nothing. (The root watch
+                    # covers the same three, see inotify.ignored_folder_filter.)
+                    refs = git_dir / "refs"
+                    if refs.is_dir():
+                        observer.schedule(git_handler, str(refs), recursive=False)
+                    refs_heads = refs / "heads"
+                    if refs_heads.is_dir():
+                        observer.schedule(git_handler, str(refs_heads), recursive=True)
 
             # Read before the observer starts (W5): see _start_catch_up.
             snapshot = self._last_indexed(repo.repo_id) if self._on_catch_up is not None else None
@@ -733,14 +759,14 @@ class WatcherManager:
             observer.join(timeout=5)
         logger.debug(f"Stopped watcher for {repo_id}")
 
-    def _new_observer(self, root: Path) -> Any:
+    def _new_observer(self, root: Path, *, watch_git: bool) -> Any:
         """The observer for one repository. On Linux its emitters close what
         they opened when they fail to start, and with `root_watch` its watch
-        on `root` skips ignored folders."""
+        on `root` skips ignored folders, except the git state when `watch_git`."""
         if sys.platform.startswith("linux"):
             from devgraph.watcher.inotify import new_observer
 
-            return new_observer(root if self._root_watch else None)
+            return new_observer(root if self._root_watch else None, watch_git=watch_git)
         return Observer()
 
     def _desired_dirs(self, root: Path) -> set[Path]:

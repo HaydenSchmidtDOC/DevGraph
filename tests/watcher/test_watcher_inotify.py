@@ -101,7 +101,9 @@ def test_inotify_instances_do_not_grow_with_top_level_folders(tmp_path):
             used[n] = len(set(inotify_watches()) - before)
         finally:
             w.close()
-    assert used[3] == used[100] <= 4, used
+    # One instance per repository: its folders and its git state (.git,
+    # .git/refs, .git/refs/heads) share it.
+    assert used == {3: 1, 100: 1}, used
 
 
 def test_ignored_and_gitignored_folders_get_no_kernel_watch(tmp_path):
@@ -185,8 +187,8 @@ def _fail_after(monkeypatch, name: str, calls: int, err: int) -> None:
 @pytest.mark.parametrize(
     ("call", "after", "err", "limit"),
     [
-        # The second instance can't be made: the user's instance limit.
-        ("inotify_init", 1, errno.EMFILE, "max_user_instances"),
+        # The instance can't be made: the user's instance limit.
+        ("inotify_init", 0, errno.EMFILE, "max_user_instances"),
         # A watch can't be added mid-way through the first instance's tree.
         ("inotify_add_watch", 2, errno.ENOSPC, "max_user_watches"),
     ],
@@ -206,3 +208,35 @@ def test_a_watch_that_cannot_start_leaks_nothing_and_is_reported(tmp_path, monke
         )
     finally:
         w.close()
+
+
+def test_git_state_changes_reach_the_git_handler_and_nothing_else_does(tmp_path):
+    """The root watch carries .git, .git/refs and .git/refs/heads (a branch
+    folder named like an ignored one included) to the git handler only; a
+    source file named HEAD or a folder named refs is a plain file event."""
+    root = make_repo(tmp_path, "repo", 1)
+    (root / ".git/refs/heads/build").mkdir()
+    (root / "pkg0/refs").mkdir()
+    bursts: list[str] = []
+    registry = RepoRegistry(tmp_path / "reg.db")
+    repo_id = registry.add_repo(root).repo_id
+    changed: list[str] = []
+    manager = WatcherManager(
+        registry,
+        lambda _r, c, _d: changed.extend(Path(p).relative_to(root).as_posix() for p in c),
+        on_git_state_changed=bursts.append,
+    )
+    manager.start()
+    try:
+        time.sleep(0.3)
+        (root / "pkg0/HEAD").write_text("not git\n")
+        (root / "pkg0/refs/x.py").write_text("x = 1\n")
+        wait_for(lambda: {"pkg0/HEAD", "pkg0/refs/x.py"} <= set(changed), lambda: f"file events; got {changed}")
+        time.sleep(1.0)
+        assert bursts == []
+        (root / ".git/refs/heads/build/feature").write_text("0" * 40 + "\n")
+        wait_for(lambda: bursts == [repo_id], lambda: f"one git burst; got {bursts}")
+        assert not any(p.startswith(".git") for p in changed)
+    finally:
+        manager.stop()
+        registry.close()
