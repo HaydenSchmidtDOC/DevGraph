@@ -342,6 +342,8 @@ table.logtable tbody tr:hover { background: color-mix(in oklab, var(--accent), t
 .leaderboard-row .lb-type { font-family: var(--font-mono); font-size: 9.5px; color: var(--meta); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; flex-shrink: 0; }
 .leaderboard-row .lb-val { font-family: var(--font-mono); font-size: 12px; color: var(--fg); flex-shrink: 0; }
 .topology-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+.repo-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 3; max-width: 420px; padding: 16px 20px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface); color: var(--fg-2); font-size: 13px; line-height: 1.6; text-align: center; pointer-events: auto; }
+.repo-empty code { font-family: var(--font-mono); color: var(--fg); }
 .placeholder-note { font-size: 11px; color: var(--meta); line-height: 1.5; margin-top: 6px; }
 
 .settings-overlay { position: fixed; inset: 0; z-index: 80; background: var(--bg); display: none; overflow-y: auto; }
@@ -468,7 +470,6 @@ table.dstable input[type="text"] { width: 100%; }
     <div class="repo-select-wrap">
       <select id="repoSelect" data-od-id="repo-select">
         <option value="__all__">All Repos</option>
-        <option value="devgraph" selected>devgraph</option>
       </select>
     </div>
     <button class="btn btn-sm" id="btnRegister" title="Add a repo below in Settings → Repos">+ Register repo</button>
@@ -490,6 +491,7 @@ table.dstable input[type="text"] { width: 100%; }
   </div>
   <canvas id="glowCanvas"></canvas>
   <div id="cy"></div>
+  <div id="repoEmptyState" class="repo-empty" hidden>No repositories registered yet. Register one with <code>devgraph register &lt;path&gt;</code>, or with <b>+ Register repo</b> above.</div>
   <div class="control-flyout" id="controlFlyout" data-od-id="graph-control-panel">
     <div class="control-panel-body">
       <div class="control-panel-scroll">
@@ -2790,7 +2792,9 @@ async function populateRealRepos(fireChangeEvent) {
   const json = await resp.json();
   const ids = (json.repos || []).filter(r => r.active).map(r => r.repo_id).sort();
   REGISTERED_REPO_IDS = ids;
-  if (!ids.length) return;
+  // Built even when empty: an early return here used to leave the static
+  // markup's options in place, showing a repository that doesn't exist.
+  document.getElementById("repoEmptyState").hidden = ids.length > 0;
   // A repo whose folder is missing (an unmounted drive, a moved folder)
   // keeps its graph -- every scan refuses it -- so it stays selectable, flagged.
   const missing = new Set((json.repos || []).filter(r => r.path_missing).map(r => r.repo_id));
@@ -2801,7 +2805,11 @@ async function populateRealRepos(fireChangeEvent) {
   const saved = localStorage.getItem(SELECTED_REPO_KEY);
   const current = saved || select.value;
   select.innerHTML = '<option value="__all__">All Repos</option>' + ids.map(id => `<option value="${escapeHtmlVal(id)}">${escapeHtmlVal(id)}${missing.has(id) ? " (path missing)" : ""}</option>`).join("");
-  select.value = (current === "__all__" || ids.includes(current)) ? current : (ids.includes("devgraph") ? "devgraph" : ids[0]);
+  // A saved All Repos is kept; a selection that is no longer registered (or
+  // no saved choice at all) falls back to the first repository, or to All
+  // Repos when none is left.
+  select.value = ids.includes(current) || (current === "__all__" && saved) ? current : (ids[0] ?? "__all__");
+  if (saved !== select.value) localStorage.setItem(SELECTED_REPO_KEY, select.value);
   select.themeRefresh?.();
   // Boot passes fireChangeEvent:false and does its own explicit, awaited
   // refreshGraph call right after (see below) -- dispatching here too used
