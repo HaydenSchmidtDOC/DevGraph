@@ -1803,11 +1803,20 @@ def test_cli_remove_releases_the_constraints_of_the_repos_labels(runner, temp_re
     assert not _has_constraint(engine, name)
 
 
-def test_cli_doctor_reports_a_missing_or_blocked_generated_constraint(runner, temp_registry_db, stale_label):
+def _register_ids(registry, tmp_path, *repo_ids):
+    """Register `repo_ids` (doctor's constraint check reads registered repositories only), then close."""
+    for repo_id in repo_ids:
+        root = tmp_path / repo_id
+        (root / ".git").mkdir(parents=True)
+        registry.add_repo(root, repo_id=repo_id)
+    registry.close()
+
+
+def test_cli_doctor_reports_a_missing_or_blocked_generated_constraint(runner, temp_registry_db, stale_label, tmp_path):
     engine, label, name = stale_label  # constraint on (repo_id, slug)
     db_path, registry = temp_registry_db
-    registry.close()
     blocked, missing = f"_smoketest_blocked_{label.lower()}", f"_smoketest_missing_{label.lower()}"
+    _register_ids(registry, tmp_path, blocked, missing)
     other = f"{label}b"
     try:
         engine.upsert_repository(blocked, blocked, "/tmp/blocked")
@@ -1826,11 +1835,11 @@ def test_cli_doctor_reports_a_missing_or_blocked_generated_constraint(runner, te
     assert f"devgraph rescan {missing} --now" in doctor
 
 
-def test_cli_doctor_reports_a_key_conflict_between_repositories(runner, temp_registry_db, stale_label):
+def test_cli_doctor_reports_a_key_conflict_between_repositories(runner, temp_registry_db, stale_label, tmp_path):
     engine, label, _name = stale_label  # constraint on (repo_id, slug)
     db_path, registry = temp_registry_db
-    registry.close()
     keyed, declaring = f"_smoketest_keyed_{label.lower()}", f"_smoketest_declaring_{label.lower()}"
+    _register_ids(registry, tmp_path, keyed, declaring)
     try:
         engine.upsert_repository(keyed, keyed, "/tmp/keyed")
         engine.record_applied_schema(keyed, "sha256:x", [label], [], [f"{label}:code"])
@@ -1847,11 +1856,11 @@ def test_cli_doctor_reports_a_key_conflict_between_repositories(runner, temp_reg
     ) in doctor
 
 
-def test_cli_doctor_names_a_third_key_and_an_unrecorded_one_in_a_key_conflict(runner, temp_registry_db, stale_label):
+def test_cli_doctor_names_a_third_key_and_an_unrecorded_one_in_a_key_conflict(runner, temp_registry_db, stale_label, tmp_path):
     engine, label, _name = stale_label  # constraint on (repo_id, slug), which nobody declares
     db_path, registry = temp_registry_db
-    registry.close()
     keyed, third, unknown = (f"_smoketest_{word}_{label.lower()}" for word in ("keyed", "third", "unknown"))
+    _register_ids(registry, tmp_path, keyed, third, unknown)
     try:
         engine.upsert_repository(keyed, keyed, "/tmp/keyed")
         engine.record_applied_schema(keyed, "sha256:x", [label], [], [f"{label}:code"])
@@ -1870,13 +1879,13 @@ def test_cli_doctor_names_a_third_key_and_an_unrecorded_one_in_a_key_conflict(ru
     ) in doctor
 
 
-def test_cli_doctor_says_a_label_spelled_differently_is_the_conflict(runner, temp_registry_db, stale_label):
+def test_cli_doctor_says_a_label_spelled_differently_is_the_conflict(runner, temp_registry_db, stale_label, tmp_path):
     # Same key, label differing only in case: realign_keys still won't replace
     # the constraint, so this is a conflict, but not one of identification.
     engine, label, _name = stale_label  # constraint on (repo_id, slug)
     db_path, registry = temp_registry_db
-    registry.close()
     keyed, spelled = f"_smoketest_keyed_{label.lower()}", f"_smoketest_spelled_{label.lower()}"
+    _register_ids(registry, tmp_path, keyed, spelled)
     shouted = label.upper()
     try:
         engine.upsert_repository(keyed, keyed, "/tmp/keyed")

@@ -1194,10 +1194,13 @@ def doctor() -> None:
     finally:
         engine.close()
 
-    # 6. Podman container state
+    # 6. Podman container state. Only a problem when Neo4j isn't answering:
+    # with it reachable, Neo4j runs some other way (Docker, a native install).
     console.print("[bold]Podman[/bold]")
     podman_path = resolve_podman()
-    if podman_path is None:
+    if podman_path is None and neo4j_reachable:
+        console.print("  podman not found (not needed: Neo4j is reachable)")
+    elif podman_path is None:
         console.print("  [red][X] podman not found[/red] on PATH or %LOCALAPPDATA%\\Programs\\Podman")
         any_failed = True
     else:
@@ -1212,8 +1215,11 @@ def doctor() -> None:
             else:
                 console.print(f"  [green][OK][/green] {escape(output)}")
         except Exception as e:
-            console.print(f"  [red][X] podman ps failed:[/red] {escape(str(e))}")
-            any_failed = True
+            if neo4j_reachable:
+                console.print(f"  podman ps failed (not needed: Neo4j is reachable): {escape(str(e))}")
+            else:
+                console.print(f"  [red][X] podman ps failed:[/red] {escape(str(e))}")
+                any_failed = True
 
     # 7. Registry reachability
     console.print("[bold]Registry[/bold]")
@@ -1342,7 +1348,9 @@ def doctor() -> None:
         recorded_keys: dict[tuple[str, str], tuple[str, tuple[str, ...] | None]] = {}
         try:
             stale = _stale_schema_objects(constraint_engine, registered_repos)
-            drift = constraint_drift(constraint_engine)
+            # registered repositories only: one left in the graph by a removed
+            # repository or an interrupted test run is not the user's to fix
+            drift = constraint_drift(constraint_engine, {r.repo_id for r in registered_repos})
             if any(finding["status"] == "conflict" for finding in drift):
                 for folded, entries in recorded_declarations(constraint_engine).items():
                     recorded_keys.update(((repo, folded), (label, key)) for repo, label, key in entries)
