@@ -75,7 +75,8 @@ def test_command_prints_markup_like_paths_literally(markup_repo, args):
 # Interpolated expressions known to be fixed text, numbers, or already escaped.
 SAFE_EXPRESSIONS = {
     "count", "pid", "existing_pid", "started_pid", "node_count", "total_nodes", "total_rels",
-    "marker", "liveness", "label", "verb", "word", "noun", "colour", "consequence", "origin",
+    "marker", "liveness", "label", "verb", "word", "noun", "colour", "consequence", "origin", "what",
+    "lifecycle.TRAY_START_TIMEOUT_S",
     "subject", "detail",  # escaped when assigned
     "active_str", "watch_str", "*row",  # row: escaped when built
     "SCHEMA_FILENAME", "TOOLS_FILENAME", "_GLOBAL_TOOLS_NOTE", "obj.kind", "sys.version.split()[0]",
