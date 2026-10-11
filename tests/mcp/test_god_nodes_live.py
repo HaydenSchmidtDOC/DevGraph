@@ -62,7 +62,10 @@ def hub(engine):
 
 
 def _call(engine, tmp_path, monkeypatch, arguments):
-    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3"))
+    monkeypatch.setattr(
+        mcp_server, "get_settings",
+        lambda: Settings(registry_db_path=tmp_path / "r.sqlite3", allow_cross_repo=bool(arguments.get("cross_repo"))),
+    )
     (tmp_path / "repo").mkdir(exist_ok=True)
     record = _Repo(REPO, tmp_path / "repo")
     server = mcp_server.build_server(engine, _Registry([record]), session_repo=record, session_source="env")
@@ -114,7 +117,9 @@ class _RecordingEngine:
 
 
 def test_cross_repo_god_nodes_ranks_every_repositorys_declared_labels(tmp_path, monkeypatch):
-    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3"))
+    monkeypatch.setattr(
+        mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3", allow_cross_repo=True)
+    )
     declared = {"a": ("Runbook",), "b": ("Adr",)}
     monkeypatch.setattr(mcp_server.devgraph_tools, "declared_node_labels", lambda registry, repo_id: declared.get(repo_id, ()))
     for name in declared:

@@ -2556,10 +2556,17 @@ function escapeCypherStr(s) { return String(s).replace(/["\\]/g, "\\$&"); }
    or re-deriving the filter client-side. Every relationship this query
    returns already satisfies WHERE, so it's a match by construction --
    no separate edge-side check needed. */
+/* "All Repos" means every registered repository (populateRealRepos keeps the
+   list), never a repo_id left in the graph after it was unregistered or by a
+   stray test run -- the same bound an MCP cross_repo call gets. */
+let REGISTERED_REPO_IDS = [];
+function allReposClause(alias) {
+  return `${alias}.repo_id IN [${REGISTERED_REPO_IDS.map(id => `"${escapeCypherStr(id)}"`).join(", ")}]`;
+}
 function currentStateQuery() {
   const repo = document.getElementById("repoSelect").value;
   const isolatedEntityId = state.isolatedEntity;
-  const nodeWhere = [repo === "__all__" ? "true" : `n.repo_id = "${escapeCypherStr(repo)}"`];
+  const nodeWhere = [repo === "__all__" ? allReposClause("n") : `n.repo_id = "${escapeCypherStr(repo)}"`];
   if (isolatedEntityId) nodeWhere.push(`labels(n)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
   // A ceiling maxed out (the default) means "no cap" -- leave its LIMIT out
   // of the query entirely rather than spelling out the current real total,
@@ -2782,6 +2789,7 @@ async function populateRealRepos(fireChangeEvent) {
   if (!resp.ok) return;
   const json = await resp.json();
   const ids = (json.repos || []).filter(r => r.active).map(r => r.repo_id).sort();
+  REGISTERED_REPO_IDS = ids;
   if (!ids.length) return;
   // A repo whose folder is missing (an unmounted drive, a moved folder)
   // keeps its graph -- every scan refuses it -- so it stays selectable, flagged.
@@ -5806,7 +5814,7 @@ async function loadTopologyCounts() {
   const repo = document.getElementById("repoSelect").value;
   const isolatedEntityId = state.isolatedEntity;
   const nodeFilters = [];
-  if (repo !== "__all__") nodeFilters.push(`n.repo_id = "${escapeCypherStr(repo)}"`);
+  nodeFilters.push(repo === "__all__" ? allReposClause("n") : `n.repo_id = "${escapeCypherStr(repo)}"`);
   if (isolatedEntityId) nodeFilters.push(`labels(n)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
   const where = nodeFilters.length ? `WHERE ${nodeFilters.join(" AND ")} ` : "";
   try {
@@ -5845,7 +5853,7 @@ async function loadTopologyCounts() {
       }
     }
     const relFilters = [];
-    if (repo !== "__all__") relFilters.push(`a.repo_id = "${escapeCypherStr(repo)}"`);
+    relFilters.push(repo === "__all__" ? allReposClause("a") : `a.repo_id = "${escapeCypherStr(repo)}"`);
     if (isolatedEntityId) relFilters.push(`labels(a)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
     const relWhere = relFilters.length ? `WHERE ${relFilters.join(" AND ")} ` : "";
     const relJson = await runCypher(`MATCH (a)-[r]->() ${relWhere}RETURN type(r) AS t, count(*) AS n`);

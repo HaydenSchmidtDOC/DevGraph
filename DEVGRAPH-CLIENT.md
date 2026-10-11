@@ -231,7 +231,9 @@ The server instructions name it, and so does `devgraph://project-tools`.
 
 Never pass `cross_repo: true` unless the user explicitly asks for a
 cross-repository answer — the default is (and must stay) scoped to one
-repository only.
+repository only. It is also refused (a ToolError naming
+`DEVGRAPH_ALLOW_CROSS_REPO`) unless the user has turned that setting on; when
+it is on, results cover registered repositories only.
 
 **Identifier-type nuance**: `find_callers`, `impact_analysis`, and
 `find_related_files` match against function/class **names** only (a file

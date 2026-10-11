@@ -191,16 +191,18 @@ class TestRepositoryScoping:
         assert "start.repo_id = $repo_id" in engine.cypher
         assert engine.params == {"repo_id": "demo"}
 
-    def test_cross_repo_drops_every_repo_predicate(self):
+    def test_cross_repo_drops_the_single_repo_predicate(self):
         engine = _StubEngine()
 
         find_dependency_cycles(engine, "demo", cross_repo=True)
 
         # The projection still reports each node's repo_id; what goes is every
-        # predicate that would restrict the match to one repository.
+        # predicate that would restrict the match to one repository. What stays
+        # is the bound to the registered repositories (None here: a direct call,
+        # not through the MCP server's cross-repo gate).
         assert "$repo_id" not in engine.cypher
-        assert "ALL(n IN nodes(path)" not in engine.cypher
-        assert engine.params == {}
+        assert "$cross_repo_ids" in engine.cypher
+        assert engine.params == {"cross_repo_ids": None}
 
 
 class TestCanonicalisation:
