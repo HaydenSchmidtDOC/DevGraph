@@ -381,16 +381,10 @@ def test_modules_carry_their_directory_and_basename(engine, repo_id, tmp_path):
     ]
 
 
-def test_a_directory_pin_seeks_its_files_not_every_node_of_the_name(engine, repo_id):
-    """S10 fan-in: with 300 packages each declaring `Get`, rows pinned to 30
-    package directories (`pK/.~?.go`, `pK/.?.go`, a `pK/` prefix) cost what
-    their own targets cost, not what every `Get` of the repository does: the
-    seek is a prefix range on the (repo_id, name, file) index. Bounded on
-    PROFILE db hits, so it holds on a noisy CI machine."""
-    from neo4j import ManagedTransaction
-
-    engine.init_schema()  # the (repo_id, name, file) index this seeks, on any database
-    packages = 300
+def _fan_in(engine, repo_id, packages: int, callers: int) -> list[dict]:
+    """`packages` package directories each declaring `Get` (twice, and in a
+    test file), and the CALLS rows of a `main` pinned to `callers` of them
+    (a loose directory, a directory and a prefix pin each)."""
     engine.upsert_nodes(
         [{"label": "Module", "repo_id": repo_id, "name": "main.go", "properties": {"source_file": "main.go"}}]
         + [{"label": "Function", "repo_id": repo_id, "name": "main", "properties": {"file": "main.go"}}]
@@ -401,16 +395,19 @@ def test_a_directory_pin_seeks_its_files_not_every_node_of_the_name(engine, repo
     )
     rows = [
         rel.to_dict()
-        for i in range(30)
+        for i in range(callers)
         for pin in (f"p{i}/.~?.go!_test.go", f"p{i}/.?.go", f"p{i}/")
         for rel in call_rows("Function", "main", "Get", {pin}, False, None, "main.go", repo_id)
     ]
     for row in rows:
         row["from_file"] = row["origin"] = "main.go"
-    # A plan cached by an earlier test of the same row shape, made while the
-    # label held a few nodes, can seek (repo_id, name) and filter the file;
-    # profile this graph's own plan.
-    engine.run_cypher("CALL db.clearQueryCaches()")
+    return rows
+
+
+def _profiled_upsert(engine, rows) -> list[int]:
+    """Upsert `rows`, PROFILEd: the db hits of each query."""
+    from neo4j import ManagedTransaction
+
     hits: list[int] = []
     real = ManagedTransaction.run
 
@@ -429,10 +426,50 @@ def test_a_directory_pin_seeks_its_files_not_every_node_of_the_name(engine, repo
         engine.upsert_relationships(rows)
     finally:
         ManagedTransaction.run = real
+    return hits
+
+
+def test_a_directory_pin_seeks_its_files_not_every_node_of_the_name(engine, repo_id):
+    """S10 fan-in: with 300 packages each declaring `Get`, rows pinned to 30
+    package directories (`pK/.~?.go`, `pK/.?.go`, a `pK/` prefix) cost what
+    their own targets cost, not what every `Get` of the repository does: the
+    seek is a prefix range on the (repo_id, name, file) index. Bounded on
+    PROFILE db hits, so it holds on a noisy CI machine."""
+    engine.init_schema()  # the (repo_id, name, file) index this seeks, on any database
+    rows = _fan_in(engine, repo_id, packages=300, callers=30)
+    # A plan cached by an earlier test of the same row shape, made while the
+    # label held a few nodes, can satisfy the index hint with `file IS NOT
+    # NULL` and filter the file afterwards (Neo4j replans it once its
+    # statistics move, see the next test); this one profiles the plan this
+    # graph gets.
+    engine.run_cypher("CALL db.clearQueryCaches()")
+    hits = _profiled_upsert(engine, rows)
     linked = engine.run_cypher(
         "MATCH (:Function {repo_id: $r, name: 'main'})-[:CALLS]->(b) RETURN count(b) AS n", {"r": repo_id}
     )[0]["n"]
     assert linked == 30 * 3  # a.go and b.go of each, and its test file through the prefix
     # Every Get of the repository is 900 nodes; 90 rows over them all would be
     # about 80k hits. Seeking each row's own directory stays well under that.
+    assert sum(hits) < 15_000, hits
+
+
+def test_a_directory_pin_plan_cached_on_a_tiny_graph_is_replanned_once_it_grows(engine, repo_id):
+    """A repository starts empty: the first saves plan the pinned-CALLS query
+    on a few nodes, where the index hint may be met by seeking `(repo_id,
+    name)` with `file IS NOT NULL` (about 1 in 2 fresh databases did). That
+    costs what the query cost before the prefix seek, never more, and Neo4j
+    replans a cached query whose statistics have moved once its minimum
+    replan interval (`dbms.cypher.min_replan_interval`, 10 s) has passed:
+    the same query, its cache never cleared, then seeks the prefix range."""
+    import time
+
+    engine.init_schema()
+    engine.run_cypher("CALL db.clearQueryCaches()")
+    _profiled_upsert(engine, _fan_in(engine, f"{repo_id}-tiny", packages=2, callers=2))  # plans it
+    try:
+        rows = _fan_in(engine, repo_id, packages=300, callers=30)
+        time.sleep(12)
+        hits = _profiled_upsert(engine, rows)
+    finally:
+        engine.delete_repository(f"{repo_id}-tiny")
     assert sum(hits) < 15_000, hits
