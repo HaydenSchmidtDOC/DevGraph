@@ -1579,6 +1579,24 @@ class GraphEngine:
             record = result.single() if result is not None else None
             return record["n"] if record else 0
 
+    def delete_bare_class_stubs(self, repo_id: str) -> int:
+        """Delete this repo's `Class` nodes with no `file`, `source` or
+        `source_file`, with their edges, and return how many went. Every
+        extractor writes `file` on a Class, and a C++ out-of-class method's
+        stub has carried `source` since index format 9, so only a stub an
+        older index wrote looks like this; with no claim, nothing would ever
+        delete it."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (c:Class {repo_id: $repo_id}) "
+                "WHERE c.file IS NULL AND c.source IS NULL AND c.source_file IS NULL "
+                "DETACH DELETE c RETURN count(c) AS n",
+                repo_id=repo_id,
+            )
+            record = result.single() if result is not None else None
+            return record["n"] if record else 0
+
     def delete_docs_notes_outside(self, repo_id: str, folder: str) -> int:
         """Delete this repo's docs notes (Requirement, DesignDecision,
         ArchitectureNote) whose `source_file` is not under `folder` (a

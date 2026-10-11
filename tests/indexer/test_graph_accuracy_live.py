@@ -1606,3 +1606,25 @@ def test_a_cpp_out_of_class_definition_keeps_its_own_class_stub(engine, repo_id,
     if (tmp_path / "widget.h").exists():
         expected.append(("widget.h", []))
     assert _widget_nodes(engine, repo_id) == expected
+
+
+def test_the_index_upgrade_drops_old_class_stubs(engine, repo_id, tmp_path):
+    """A stub an index before format 9 wrote has no `source`, so nothing ever
+    unclaimed it: the upgrade's full scan deletes this repository's Class
+    nodes with no `file` or `source`, and keeps the claimed stub."""
+    write(tmp_path, "widget.h", WIDGET_H)
+    write(tmp_path, "widget.cpp", WIDGET_CPP)
+    write(tmp_path, "gadget.h", GADGET_H)
+    scan(engine, repo_id, tmp_path)
+    other = f"{repo_id}-other"
+    for repo in (repo_id, other):
+        engine.run_cypher("CREATE (:Class {repo_id: $r, name: 'Gone', type: 'class'})", {"r": repo})
+    engine.set_index_format(repo_id, 8)
+
+    dispatch.catch_up(engine, repo_id, tmp_path, datetime.now(timezone.utc))
+    assert engine.index_format(repo_id) == dispatch.INDEX_FORMAT
+    assert engine.run_cypher(
+        "MATCH (n:Class {name: 'Gone'}) WHERE n.repo_id IN $r RETURN n.repo_id AS r", {"r": [repo_id, other]}
+    ) == [{"r": other}]
+    assert _widget_nodes(engine, repo_id) == [("", ["widget.cpp"]), ("widget.h", [])]
+    incremental_equals_fresh(engine, repo_id, tmp_path)

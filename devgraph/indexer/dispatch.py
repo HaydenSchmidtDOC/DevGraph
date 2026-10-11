@@ -120,9 +120,11 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: class bodies; 7: Go, Java and Kotlin CALLS and IMPORTS resolved through
 #: modules, source roots and types, path pin flags, Module `dir_name`; 8:
 #: Rust, C# and C++ CALLS and IMPORTS resolved through crate roots and
-#: Cargo crate names, referenced types and quoted includes). An index
-#: stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 8
+#: Cargo crate names, referenced types and quoted includes; 9: a C++
+#: out-of-class method's Class stub claimed by its file, and the unclaimed
+#: stubs an older index left deleted). An index stamped lower, or not at
+#: all, is rescanned automatically.
+INDEX_FORMAT = 9
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -1684,7 +1686,8 @@ def prune_stale_files(
     distinction per node.
 
     Module nodes with no file key at all, left by an older git-history sync,
-    are deleted first, and so are docs notes whose `source_file` is not under
+    are deleted first, and so are Class nodes with no `file` or `source` (a
+    C++ out-of-class method's stub before index format 9) and docs notes whose `source_file` is not under
     the docs path, left by an older scan that keyed a note by its bare
     filename (upgrade cleanups; a scan never makes either). The notes are
     written again under their repo-relative path by the scan or catch-up
@@ -1712,6 +1715,9 @@ def prune_stale_files(
     bare = engine.delete_bare_modules(repo_id)
     if bare:
         logger.info("removed %d leftover module nodes with no file behind them from %s", bare, repo_id)
+    stubs = engine.delete_bare_class_stubs(repo_id)
+    if stubs:
+        logger.info("removed %d unclaimed C++ class stubs from %s", stubs, repo_id)
     docs_folder = _docs_folder(repo_root, docs_path)
     # Skipped when the docs path is the repository root: every path is under
     # it, so nothing tells a bare filename key from a root-level note's path.
