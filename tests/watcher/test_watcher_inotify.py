@@ -298,3 +298,29 @@ def test_an_error_inside_watchdog_is_reported_not_silent(tmp_path, monkeypatch):
         assert w.manager.get_repo_issues()[w.repo_id].startswith("watching stopped: KeyError")
     finally:
         w.close()
+
+
+def _root_inotify(manager, repo_id):
+    """The running `_FilteredInotify` behind a repository's root watch."""
+    observer = manager._observers[repo_id]
+    return observer._emitter_for_watch[manager._root_watches[repo_id]]._inotify._inotify
+
+
+def test_a_queue_overflow_asks_for_a_catch_up(tmp_path):
+    """When the kernel's event queue overflows (IN_Q_OVERFLOW), the events it
+    dropped are gone: the watcher catches up from the last update."""
+    w = Watching(tmp_path, make_repo(tmp_path, "repo", 1), git=False)
+    w.registry.mark_indexed(w.repo_id)
+    catch_ups: list[str] = []
+    w.manager._on_catch_up = lambda _r, _since, reason: catch_ups.append(reason)
+    w.manager.start()
+    try:
+        wait_for(lambda: "start" in catch_ups, "the start catch-up")
+        limit = int(Path("/proc/sys/fs/inotify/max_queued_events").read_text())
+        inotify = _root_inotify(w.manager, w.repo_id)
+        with inotify._lock:  # the reader can't drain the queue meanwhile
+            for i in range(limit + 2000):
+                (w.root / f"pkg0/f{i}.txt").touch()
+        wait_for(lambda: "overflow" in catch_ups, lambda: f"an overflow catch-up; got {catch_ups}")
+    finally:
+        w.close()

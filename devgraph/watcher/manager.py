@@ -59,6 +59,10 @@ def _inotify_supported() -> bool:
         logger.warning("This watchdog lacks the internals DevGraph's inotify watch needs; watching per folder")
     return inotify.SUPPORTED
 
+#: How soon after the kernel's inotify queue overflowed its catch-up runs:
+#: long enough for the burst that overflowed it to end.
+OVERFLOW_CATCH_UP_DELAY_S = 2.0
+
 #: How long after `.git/index.lock` is released a HEAD or ref change still
 #: counts as part of the same git operation (W6).
 GIT_LOCK_WINDOW_S = 5.0
@@ -794,6 +798,14 @@ class WatcherManager:
         """An emitter's report, from watchdog's reader thread (which may hold
         its inotify lock): so it takes only `_issues_lock` and the catch-up
         lock, never `_lock`."""
+        if kind == "overflow":
+            # The kernel dropped events: catch up from the last update, as
+            # after a git operation (W6).
+            since = self._last_indexed(repo_id)
+            logger.warning("%s: the inotify event queue overflowed; catching up", repo_id)
+            if since is not None:
+                self.request_catch_up(repo_id, since, OVERFLOW_CATCH_UP_DELAY_S, "overflow")
+            return
         if kind == "broken":
             problem = f"watching stopped: {error!r}; restart the agent"
             logger.error("Watching %s stopped: watchdog's reader failed", repo_id, exc_info=error)

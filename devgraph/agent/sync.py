@@ -130,7 +130,8 @@ class RepoSync:
         Returns whether it did (False when it failed, or the repository is gone).
 
         `reason` is "start" (the watcher started watching), "git" (after a
-        git operation) or "retry" (after a failure); it only changes the logs.
+        git operation), "overflow" (the OS dropped events) or "retry" (after
+        a failure); it only changes the logs.
         """
         with self._lock:
             floor = self._floors.get(repo_id)

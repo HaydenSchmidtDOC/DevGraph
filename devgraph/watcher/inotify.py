@@ -36,13 +36,15 @@ import errno
 import functools
 import logging
 import os
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Callable
 
 from watchdog.observers.api import DEFAULT_EMITTER_TIMEOUT, DEFAULT_OBSERVER_TIMEOUT, BaseObserver
 from watchdog.observers.inotify import InotifyEmitter
 from watchdog.observers.inotify_buffer import InotifyBuffer
-from watchdog.observers.inotify_c import DEFAULT_EVENT_BUFFER_SIZE, Inotify, InotifyEvent
+from watchdog.observers.inotify_c import DEFAULT_EVENT_BUFFER_SIZE, Inotify, InotifyConstants, InotifyEvent
 from watchdog.utils import BaseThread
 from watchdog.utils.delayed_queue import DelayedQueue
 
@@ -53,7 +55,8 @@ logger = logging.getLogger(__name__)
 
 #: How the emitter tells the watcher about a problem: (kind, error). Kinds:
 #: "broken" (watchdog's reader raised; its thread ends, so nothing is watched
-#: from then on).
+#: from then on) and "overflow" (the kernel's queue overflowed: events were
+#: dropped).
 Report = Callable[[str, BaseException], None]
 
 
@@ -65,7 +68,7 @@ def supports(inotify_cls: Any, buffer_cls: Any) -> bool:
         names = set(inotify_cls.__init__.__code__.co_names)
     except AttributeError:
         return False
-    methods = ("_add_dir_watch", "_add_watch", "read_events")
+    methods = ("_add_dir_watch", "_add_watch", "read_events", "_parse_event_buffer")
     return (
         {"_closed", "_wd_for_path", "_path_for_wd", "_path"} <= names
         and all(callable(getattr(inotify_cls, name, None)) for name in methods)
@@ -75,6 +78,27 @@ def supports(inotify_cls: Any, buffer_cls: Any) -> bool:
 
 #: Whether the installed watchdog can carry the root watch (see `supports`).
 SUPPORTED = supports(Inotify, InotifyBuffer)
+
+#: The `_FilteredInotify` whose `read_events` runs on this thread.
+_reading = threading.local()
+
+
+def _parse_event_buffer(event_buffer: bytes) -> Iterator[tuple[int, int, int, bytes]]:
+    """watchdog's parser, noting an overflow for the `_FilteredInotify`
+    reading on this thread: watchdog's `read_events` skips the overflow
+    event (wd -1) without a trace. Installed on `Inotify` itself, since
+    `read_events` calls it by class; to anything else it is the original."""
+    for wd, mask, cookie, name in _watchdog_parse_event_buffer(event_buffer):
+        if wd == -1 and mask & InotifyConstants.IN_Q_OVERFLOW:
+            inotify = getattr(_reading, "inotify", None)
+            if inotify is not None:
+                inotify._overflowed = True
+        yield wd, mask, cookie, name
+
+
+if SUPPORTED:
+    _watchdog_parse_event_buffer = Inotify._parse_event_buffer
+    Inotify._parse_event_buffer = staticmethod(_parse_event_buffer)  # type: ignore[method-assign]
 
 
 #: The folders of a repository's git state the root watch keeps, with
@@ -116,6 +140,7 @@ class _FilteredInotify(Inotify):
     ) -> None:
         self._skip = skip
         self._report = report
+        self._overflowed = False
         # Stand-in watch descriptors for skipped folders, below -1 (the
         # kernel's are positive; -1 marks an overflow): see `_add_watch`.
         self._placeholders: list[int] = []
@@ -139,10 +164,13 @@ class _FilteredInotify(Inotify):
         if recursive:
             self._add_watches_below(path, mask)
 
-    def _add_watches_below(self, path: bytes, mask: int, *, only_missing: bool = False) -> list[bytes]:
+    def _add_watches_below(
+        self, path: bytes, mask: int, *, only_missing: bool = False, lock: Any = None
+    ) -> list[bytes]:
         """Watch every folder below `path` that isn't skipped (or a symlink),
         without entering skipped ones; with `only_missing`, only those not
-        watched yet. Returns the folders newly watched."""
+        watched yet. With `lock`, the walk runs outside it and each watch is
+        added under it. Returns the folders newly watched."""
         added = []
         for parent, dirnames, _ in os.walk(path):
             kept = []
@@ -151,9 +179,12 @@ class _FilteredInotify(Inotify):
                 if os.path.islink(full) or self._skipped(full):
                     continue
                 kept.append(name)
-                if only_missing and full in self._wd_for_path:
-                    continue
-                self._add_watch(full, mask)
+                with lock if lock is not None else contextlib.nullcontext():
+                    if lock is not None and self._closed:
+                        return added
+                    if only_missing and full in self._wd_for_path:
+                        continue
+                    self._add_watch(full, mask)
                 added.append(full)
             dirnames[:] = kept
         return added
@@ -184,7 +215,15 @@ class _FilteredInotify(Inotify):
             raise
 
     def _read_events(self, event_buffer_size: int) -> list[InotifyEvent]:
-        events = super().read_events(event_buffer_size=event_buffer_size)
+        _reading.inotify = self
+        try:
+            events = super().read_events(event_buffer_size=event_buffer_size)
+        finally:
+            _reading.inotify = None
+        if self._overflowed:
+            self._overflowed = False
+            if self._report is not None:
+                self._report("overflow", OSError(errno.EOVERFLOW, "inotify event queue overflowed"))
         with self._lock:
             for wd in self._placeholders:
                 path = self._path_for_wd.pop(wd, None)
@@ -209,10 +248,11 @@ class _FilteredInotify(Inotify):
     def add_missing_watches(self) -> list[bytes]:
         """Watch the folders that are no longer skipped (a .gitignore
         changed). Returns the folders newly watched."""
-        with self._lock:
-            if self._closed or self._skip is None:
-                return []
-            return self._add_watches_below(self._path, self._event_mask, only_missing=True)
+        if self._closed or self._skip is None:
+            return []
+        # The walk (and the .gitignore checks) run outside the lock, which
+        # the reader thread needs for every event.
+        return self._add_watches_below(self._path, self._event_mask, only_missing=True, lock=self._lock)
 
 
 class _FilteredInotifyBuffer(InotifyBuffer):
