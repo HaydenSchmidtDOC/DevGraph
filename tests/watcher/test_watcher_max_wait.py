@@ -11,7 +11,10 @@ whichever timer is due.
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
+
+from pathlib import Path
 
 from watchdog.events import FileModifiedEvent
 
@@ -135,3 +138,33 @@ def test_a_file_written_every_200_ms_is_indexed_while_it_is_being_written(tmp_pa
         manager.stop()
         registry.close()
         config.get_settings.cache_clear()
+
+
+def test_events_while_a_batch_waits_for_the_batch_lock_start_no_more_timers(tmp_path):
+    """A batch held up by a long job (a catch-up holding the batch lock) is in
+    flight: events meanwhile join it rather than each firing a 0 s timer
+    whose thread blocks on the lock too."""
+    (tmp_path / "a.py").write_text("a = 1\n")
+    batch_lock = threading.Lock()
+    batches: list[set[Path]] = []
+    handler = _RepoEventHandler(
+        "repo", tmp_path, 20, lambda _r, changed, _d: batches.append(changed),
+        batch_lock=batch_lock, max_wait_ms=100,
+    )
+    event = FileModifiedEvent(str(tmp_path / "a.py"))
+    threads = threading.active_count()
+    with batch_lock:
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            handler.dispatch(event)
+            time.sleep(0.005)
+        assert threading.active_count() <= threads + 2, threading.active_count() - threads
+    deadline = time.monotonic() + 5
+    while not batches and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert batches == [{tmp_path / "a.py"}]
+    handler.dispatch(event)  # the next event starts a new batch
+    deadline = time.monotonic() + 5
+    while len(batches) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(batches) == 2

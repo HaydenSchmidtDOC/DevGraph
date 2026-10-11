@@ -989,6 +989,9 @@ class _RepoEventHandler(FileSystemEventHandler):
         self._max_wait_ms = max_wait_ms
         # When the first event of the pending batch was queued (see `_debounce_s`).
         self._pending_since: float | None = None
+        # A fired batch is waiting for the batch lock: events meanwhile join
+        # it, starting no timer (each would be a thread blocked on the lock).
+        self._in_flight = False
         self._on_changes = on_changes
         self._timer_factory = timer_factory
         self._batch_lock = batch_lock or threading.Lock()
@@ -1111,7 +1114,7 @@ class _RepoEventHandler(FileSystemEventHandler):
     def flush(self) -> None:
         """Fire the pending batch now, if there is one."""
         self.cancel()
-        self._fire_changes()
+        self._deliver()
 
     def cancel(self) -> None:
         """Drop the pending debounce timer. Pending paths stay queued."""
@@ -1170,7 +1173,10 @@ class _RepoEventHandler(FileSystemEventHandler):
         return False
 
     def _reset_debounce(self) -> None:
-        """Restart the debounce timer, within the maximum wait. Must hold _lock."""
+        """Restart the debounce timer, within the maximum wait, unless a batch
+        is in flight (it takes what is queued). Must hold _lock."""
+        if self._in_flight:
+            return
         if self._debounce_timer is not None:
             self._debounce_timer.cancel()
         now = self._clock()
@@ -1182,12 +1188,23 @@ class _RepoEventHandler(FileSystemEventHandler):
         self._debounce_timer.start()
 
     def _fire_changes(self) -> None:
+        """The debounce timer's target: mark the batch in flight, then deliver it."""
+        with self._lock:
+            if self._in_flight:
+                return
+            self._in_flight = True
+            self._debounce_timer = None
+        self._deliver()
+
+    def _deliver(self) -> None:
         """Hand the pending batch to `on_changes` under the repo's batch lock.
 
         The sets are swapped under `_lock`, which is released before the
-        callback, so the dispatch thread can keep queueing while it runs."""
+        callback, so the dispatch thread can keep queueing while it runs.
+        Events queued from then on start a new batch."""
         with self._batch_lock:
             with self._lock:
+                self._in_flight = False
                 # Checked under the batch lock, so no batch starts after the
                 # manager's stop() has returned.
                 if self._closed or (not self._changed and not self._deleted):
