@@ -835,7 +835,7 @@ def test_cli_tray_status_not_running(runner, temp_registry_db):
     with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
          patch.object(lifecycle, "get_settings", return_value=_mock_settings(db_path)):
         result = runner.invoke(app, ["tray", "status"])
-        assert result.exit_code == 0, f"stdout: {result.stdout}"
+        assert result.exit_code == 1, f"stdout: {result.stdout}"
         assert "not running" in result.stdout
         assert "devgraph tray start" in result.stdout
 
@@ -866,7 +866,9 @@ def test_cli_tray_start_then_status_then_stop(runner, temp_registry_db):
          patch.object(lifecycle.subprocess, "Popen", return_value=fake_process), \
          patch.object(lifecycle, "pid_is_running", side_effect=lambda pid: pid in alive), \
          patch.object(lifecycle, "resolve_venv_python", return_value=Path("python")), \
-         patch.object(lifecycle, "resolve_repo_root", return_value=Path(".")):
+         patch.object(lifecycle, "resolve_repo_root", return_value=Path(".")), \
+         patch.object(lifecycle, "wait_for_tray", return_value="running"), \
+         patch.object(lifecycle, "tray_ui_problem", return_value=None):
         start_result = runner.invoke(app, ["tray", "start"])
         assert start_result.exit_code == 0, f"stdout: {start_result.stdout}"
         assert str(fake_pid) in start_result.stdout

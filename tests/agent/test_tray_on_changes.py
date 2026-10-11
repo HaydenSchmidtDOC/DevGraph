@@ -192,12 +192,12 @@ class TestSchemaAtStart:
         import time
 
         seen, order = self._start_while_the_indexes_build(tray_app)
-        assert seen == {"title": "DevGraph (preparing graph indexes…)", "order": []}
+        assert seen == {"title": "DevGraph (preparing graph indexes...)", "order": []}
         deadline = time.monotonic() + 5
         while order != ["schema", "watch"] and time.monotonic() < deadline:
             time.sleep(0.01)
         assert order == ["schema", "watch"]
-        assert tray_app._status_text() != "DevGraph (preparing graph indexes…)"
+        assert tray_app._status_text() != "DevGraph (preparing graph indexes...)"
 
     def test_resume_while_preparing_leaves_the_watcher_to_the_start_thread(self, tray_app):
         tray_app._preparing = True

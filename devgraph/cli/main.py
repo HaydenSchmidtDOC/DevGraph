@@ -495,15 +495,40 @@ def tray_start() -> None:
     the same way, so most workflows never need to run this by hand — it's
     here for manual control (checking in on it, or running it without an
     MCP client attached).
+
+    With no display or no system tray (a server, an SSH session), the same
+    process runs the headless agent instead: no icon, same watcher, indexer
+    and dashboard. Reports OK only once the agent has written its first
+    heartbeat; exits non-zero if it exits or stays silent.
     """
+    problem = lifecycle.tray_ui_problem()
+    since = datetime.now(timezone.utc)
     started_pid = lifecycle.start_tray_if_not_running()
     if started_pid is None:
         existing_pid = lifecycle.read_tray_pid()
         console.print(f"[yellow]Tray app already running[/yellow] (pid {existing_pid})")
         return
 
-    console.print(f"[green][OK][/green] Tray app started (pid {started_pid})")
-    console.print("  Run 'devgraph status' to confirm the heartbeat once it's up.")
+    what = "Tray app"
+    if problem is not None:
+        what = "Headless agent"
+        console.print(
+            f"[yellow]No system tray available[/yellow] ({escape(problem)}); running the headless agent "
+            "instead: no icon, same watcher, indexer and dashboard. Stop it with 'devgraph tray stop'."
+        )
+    console.print(f"Waiting for the agent's first heartbeat (pid {started_pid})...")
+    outcome = lifecycle.wait_for_tray(started_pid, since)
+    if outcome == "running":
+        console.print(f"[green][OK][/green] {what} started (pid {started_pid})")
+        return
+    if outcome == "exited":
+        console.print(f"[red][X] {what} exited during startup[/red] (pid {started_pid}). See 'devgraph logs'.")
+    else:
+        console.print(
+            f"[red][X] {what} sent no heartbeat within {lifecycle.TRAY_START_TIMEOUT_S:.0f}s[/red] (pid {started_pid}). "
+            "See 'devgraph logs'; 'devgraph tray status' shows whether it is still up."
+        )
+    raise typer.Exit(code=1)
 
 
 @tray_app.command("stop")
@@ -534,12 +559,16 @@ def tray_stop() -> None:
 
 @tray_app.command("status")
 def tray_status() -> None:
-    """Report whether the background tray process (per the PID file) is alive."""
+    """Report whether the background tray process (per the PID file) is alive.
+
+    Exits non-zero when it is not running.
+    """
     pid = lifecycle.read_tray_pid()
     if pid is not None and lifecycle.pid_is_running(pid):
         console.print(f"[green][OK] running[/green] (pid {pid})")
     else:
         console.print("[yellow]not running[/yellow] (start with 'devgraph tray start')")
+        raise typer.Exit(code=1)
 
 
 @app.command()
