@@ -10,7 +10,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -74,7 +74,8 @@ class Settings(BaseSettings):
     git_recency_track_author: bool = False
 
     mentions_ambiguous_mode: str = "all"
-    registry_db_path: Path = Path.home() / ".devgraph" / "registry.sqlite3"
+    # Resolved per instance, not at import, so a later HOME change is honoured.
+    registry_db_path: Path = Field(default_factory=lambda: Path.home() / ".devgraph" / "registry.sqlite3")
 
     @field_validator("registry_db_path")
     @classmethod

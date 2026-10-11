@@ -40,14 +40,14 @@ def seeded_graph(engine):
 
 
 class TestServerBuild:
-    def test_all_24_tools_registered(self, engine):
+    def test_all_25_tools_registered(self, engine):
         server = build_server(engine)
         import asyncio
 
         tools = asyncio.run(server.list_tools())
         names = {t.name for t in tools}
 
-        assert len(tools) == 24
+        assert len(tools) == 25
         # spot check across all three phases plus Implementation Plan #3/6/10's new tools
         assert "search_component" in names
         assert "explain_decision" in names
@@ -97,6 +97,7 @@ class TestServerResources:
         assert "Always pass this repo's" not in text
         assert "omit `repo_id`" in text and "this session's repository" in text
         assert "`find_requirements_for` and `blame_component` return lists, which carry no notice" in text
+        assert "describe_node" in text and "ambiguous" in text and "one hop" in text
 
     def test_tool_catalog_resource_lists_every_registered_tool(self, engine):
         import asyncio

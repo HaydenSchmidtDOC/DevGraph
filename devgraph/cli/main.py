@@ -1732,7 +1732,7 @@ def _show_settings(key: str | None, show_defaults: bool, as_json: bool) -> None:
     model_fields = type(settings).model_fields
     for field_name in model_fields:
         field_info = model_fields[field_name]
-        fields.append((field_name, getattr(settings, field_name), field_info.default))
+        fields.append((field_name, getattr(settings, field_name), field_info.get_default(call_default_factory=True)))
 
     if key:
         fields = [(n, v, d) for n, v, d in fields if n == key]

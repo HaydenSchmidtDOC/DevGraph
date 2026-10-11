@@ -35,6 +35,7 @@ TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "key_nodes", "identifier_kind": "metric (pagerank/betweenness), not a component name", "envelope": True, "phase": 3, "note": "requires computed graph insights (automatic after indexing, or `devgraph insights`)"},
     {"name": "issue_history_for", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in"},
     {"name": "get_source", "identifier_kind": "function/class name (not a file path)", "envelope": False, "phase": 2},
+    {"name": "describe_node", "identifier_kind": "node name (any label; a file, folder or docs node by repo-relative path or front-matter id), optional label and file to disambiguate", "envelope": False, "phase": 3, "note": "the response is not an envelope; each relationship group inside outgoing/incoming is {count, results, truncated}"},
     {"name": "run_cypher", "identifier_kind": "raw Cypher", "envelope": False, "phase": None, "note": "only registered when enable_run_cypher=true; prefer the purpose-built tools above"},
 ]
 

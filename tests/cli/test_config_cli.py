@@ -3,6 +3,7 @@
 import json
 import subprocess
 import textwrap
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -75,6 +76,14 @@ def test_table_masks_secret_values_and_defaults(runner, settings):
     assert "s3cret-pw" not in result.output
     assert "devgraph-local-dev" not in result.output  # the password's default is a secret too
     assert "****" in result.output
+
+
+def test_table_shows_the_computed_registry_default(runner, settings):
+    result = runner.invoke(app, ["config", "--show-defaults"])
+    assert result.exit_code == 0
+    [row] = [line for line in result.output.splitlines() if "registry_db_path" in line]
+    assert str(Path.home() / ".devgraph" / "registry.sqlite3") in row
+    assert "PydanticUndefined" not in result.output
 
 
 def test_the_old_positional_form_points_at_settings(runner, settings):

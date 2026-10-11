@@ -15,7 +15,16 @@ import json
 import os
 import subprocess
 
-from devgraph.config.project_schema import LABEL_PATTERN, ProjectSchemaError, resolve_effective_schema
+# The SDK passes a ToolError's text to the client and hides any other exception's.
+from mcp.server.mcpserver.exceptions import ToolError
+
+from devgraph.config.project_schema import (
+    LABEL_PATTERN,
+    RELATIONSHIP_TYPE_PATTERN,
+    ProjectSchemaError,
+    resolve_effective_schema,
+)
+from devgraph.config.project_tools import DEFAULT_TIMEOUT_S
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
 from devgraph.paths import is_within
@@ -244,6 +253,264 @@ def _rank_search_results(results: list[dict], tokens: list[str]) -> list[dict]:
             return 2
         return 3
     return sorted(results, key=tier)
+
+
+# --- describe_node -------------------------------------------------------------
+
+_DESCRIBE_MAX_CANDIDATES = 20
+_DESCRIBE_MAX_SUGGESTIONS = 5
+_DESCRIBE_MAX_GROUPS = 200
+_DESCRIBE_MAX_PER_TYPE = 50
+_DESCRIBE_MAX_FILTERS = 20
+_DESCRIBE_MAX_PROPERTIES = 50
+_DESCRIBE_MAX_LIST_ITEMS = 20
+_DESCRIBE_ECHO = 100
+_DESCRIBE_DIRECTIONS = ("both", "out", "in")
+# Shown elsewhere in the response, or extractor/insight bookkeeping that other tools serve.
+_DESCRIBE_HIDDEN = frozenset({"repo_id", "name", "claims", "extractor"})
+_DESCRIBE_BUILTIN_LABELS = tuple(label for label in schema.NODE_LABELS if label != "Repository")
+_DESCRIBE_HINT = (
+    "search_component searches by partial name; a file, folder or docs node is named by its "
+    "repo-relative path or its id"
+)
+
+_DESCRIBE_NEIGHBOUR = (
+    "m.repo_id = $repo_id AND NOT m:Repository "
+    "AND ($types IS NULL OR type(r) IN $types) "
+    "AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))"
+)
+_DESCRIBE_GROUPS = f"""
+MATCH (n) WHERE elementId(n) = $id
+CALL (n) {{
+  MATCH (n)-[r]->(m)
+  WHERE $direction IN ['both','out'] AND {_DESCRIBE_NEIGHBOUR}
+  RETURN 'out' AS dir, type(r) AS rel, m
+  UNION
+  MATCH (n)<-[r]-(m)
+  WHERE $direction IN ['both','in'] AND {_DESCRIBE_NEIGHBOUR}
+  RETURN 'in' AS dir, type(r) AS rel, m
+}}
+WITH n, dir, rel, count(DISTINCT m) AS total
+ORDER BY dir, rel
+LIMIT {_DESCRIBE_MAX_GROUPS + 1}
+CALL (n, dir, rel) {{
+  CALL (n, dir, rel) {{
+    MATCH (n)-[r:$(rel)]->(m) WHERE dir = 'out' RETURN m
+    UNION
+    MATCH (n)<-[r:$(rel)]-(m) WHERE dir = 'in' RETURN m
+  }}
+  WITH m WHERE m.repo_id = $repo_id AND NOT m:Repository
+    AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))
+  WITH DISTINCT m
+  ORDER BY m.name, coalesce(m.file, m.path)
+  LIMIT $cap
+  RETURN collect({{label: labels(m)[0], name: m.name, file: coalesce(m.file, m.path)}}) AS refs
+}}
+RETURN dir, rel, total, refs
+"""
+
+
+def _echo(value: Any) -> str:
+    """A caller value for an error message: cut to 100 characters, quoted."""
+    return repr(str(value)[:_DESCRIBE_ECHO])
+
+
+def _validated_identifiers(values: list[str] | None, pattern: re.Pattern[str], what: str) -> list[str] | None:
+    """The filter list, or None for no filter; any value that isn't an identifier is an error."""
+    if isinstance(values, str):
+        raise ToolError(f"{what}s must be a list of names, not the string {_echo(values)}")
+    if not values:
+        return None
+    if len(values) > _DESCRIBE_MAX_FILTERS:
+        raise ToolError(f"at most {_DESCRIBE_MAX_FILTERS} {what}s, got {len(values)}")
+    for value in values:
+        if not isinstance(value, str) or not pattern.fullmatch(value):
+            raise ToolError(f"invalid {what} {_echo(value)}")
+    return list(values)
+
+
+def _label_branches(labels: tuple[str, ...], predicate: str) -> str:
+    return "\n  UNION\n".join(
+        f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND {predicate} RETURN n" for label in labels
+    )
+
+
+def _lookup_cypher(labels: tuple[str, ...], declared: frozenset[str]) -> str:
+    """One single-property branch per label, so each can seek on its own index.
+
+    Every label gets a name branch; only declared (provider) labels carry
+    `path`, so only they get a path branch. Labels are validated identifiers.
+    """
+    tail = "AND NOT n:Repository AND ($file IS NULL OR $file IN [n.file, n.path, n.source_file])"
+    body = "\n  UNION\n".join(
+        f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.{key} = $name {tail} RETURN n"
+        for label in labels
+        for key in (("name", "path") if label in declared else ("name",))
+    )
+    return (
+        f"CALL () {{\n{body}\n}}\n"
+        "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, "
+        "coalesce(n.file, n.path) AS file, properties(n) AS properties\n"
+        f"LIMIT {_DESCRIBE_MAX_CANDIDATES + 1}"
+    )
+
+
+def _suggestions_cypher(labels: tuple[str, ...]) -> str:
+    body = _label_branches(
+        labels,
+        "NOT n:Repository AND (toLower(n.name) CONTAINS toLower($name) "
+        "OR toLower(n.path) CONTAINS toLower($name))",
+    )
+    return (
+        f"CALL () {{\n{body}\n}}\n"
+        "RETURN labels(n)[0] AS label, n.name AS name, coalesce(n.file, n.path) AS file\n"
+        f"ORDER BY name, file LIMIT {_DESCRIBE_MAX_SUGGESTIONS}"
+    )
+
+
+def _node_ref(row: dict[str, Any]) -> dict[str, Any]:
+    """`{label, name, file}` from raw values, so it re-describes exactly this node."""
+    ref = {"label": row["label"], "name": row["name"]}
+    if row.get("file") is not None:
+        ref["file"] = row["file"]
+    return ref
+
+
+def _visible_properties(props: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Properties minus bookkeeping, sanitised for display and capped; and whether any were dropped."""
+    from devgraph.mcp.tool_plane import _sanitize_deep
+
+    keys = sorted(k for k in props if k not in _DESCRIBE_HIDDEN and not k.startswith("insight_"))
+    shown = {}
+    for key in keys[:_DESCRIBE_MAX_PROPERTIES]:
+        value = props[key]
+        if isinstance(value, list):
+            value = value[:_DESCRIBE_MAX_LIST_ITEMS]
+        shown[key] = _sanitize_deep(value)
+    return shown, len(keys) > _DESCRIBE_MAX_PROPERTIES
+
+
+def _read(engine: GraphEngine, cypher: str, params: dict[str, Any], max_rows: int) -> tuple[list[dict], bool]:
+    """A read-only, time- and row-bounded read; a Neo4j error becomes its code, never its message."""
+    from neo4j.exceptions import Neo4jError
+
+    try:
+        return engine.run_read_cypher(cypher, params, timeout_s=DEFAULT_TIMEOUT_S, max_rows=max_rows)
+    except Neo4jError as exc:
+        code = str(getattr(exc, "code", None) or "unknown")
+        if "TransactionTimedOut" in code:
+            raise ToolError(
+                f"describe_node timed out after {DEFAULT_TIMEOUT_S}s; "
+                "narrow it with label, file, relationship_types or neighbor_labels"
+            ) from exc
+        raise ToolError(f"describe_node failed: {code}") from exc
+
+
+def describe_node(
+    engine: GraphEngine,
+    repo_id: str,
+    name: str,
+    label: str | None = None,
+    file: str | None = None,
+    direction: str = "both",
+    relationship_types: list[str] | None = None,
+    neighbor_labels: list[str] | None = None,
+    max_per_type: int = 10,
+    declared_labels: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """One node's properties and its relationships, grouped by type, one hop out.
+
+    Args:
+        engine: GraphEngine instance
+        repo_id: Repository to look in
+        name: The node's exact name; a file, folder or docs node may also be
+            named by its repo-relative path
+        label: Only nodes of this label
+        file: Only nodes whose file, path or source_file is this
+        direction: "both", "out" or "in"
+        relationship_types: Only these relationship types (at most 20)
+        neighbor_labels: Only neighbours with one of these labels (at most 20)
+        max_per_type: Neighbours listed per relationship type, clamped to 1..50
+        declared_labels: The repository's schema-declared labels to search as
+            well; anything that isn't a valid label identifier is ignored
+
+    Returns:
+        `{"status": "found", "node", "outgoing", "incoming", "groups_truncated"}`,
+        each group a `{count, results, truncated}` envelope of `{label, name, file}`
+        refs; or `{"status": "ambiguous", "count", "candidates", "truncated"}`.
+        No match raises ToolError with suggestions. `Repository` nodes are never
+        matched or listed.
+    """
+    if not name.strip():
+        raise ToolError("name is empty; pass a node's exact name, or search_component to find one")
+    if direction not in _DESCRIBE_DIRECTIONS:
+        raise ToolError(f"direction must be 'both', 'out' or 'in', not {_echo(direction)}")
+    types = _validated_identifiers(relationship_types, RELATIONSHIP_TYPE_PATTERN, "relationship type")
+    neighbour_labels = _validated_identifiers(neighbor_labels, LABEL_PATTERN, "neighbor label")
+    declared = tuple(dict.fromkeys(d for d in declared_labels if LABEL_PATTERN.fullmatch(d)))
+    if label is not None:
+        if not LABEL_PATTERN.fullmatch(label):
+            raise ToolError(f"invalid label {_echo(label)}")
+        labels: tuple[str, ...] = (label,)
+        # A built-in label carries no path; any other label may be a provider's.
+        path_labels = frozenset(labels) if label not in schema.NODE_LABELS or label in declared else frozenset()
+    else:
+        labels = _DESCRIBE_BUILTIN_LABELS + tuple(d for d in declared if d not in _DESCRIBE_BUILTIN_LABELS)
+        path_labels = frozenset(declared)
+    cap = max(1, min(_DESCRIBE_MAX_PER_TYPE, int(max_per_type)))
+
+    params = {"repo_id": repo_id, "name": name, "file": file}
+    rows, _more = _read(engine, _lookup_cypher(labels, path_labels), params, _DESCRIBE_MAX_CANDIDATES + 1)
+
+    if not rows:
+        suggestions, _ = _read(
+            engine, _suggestions_cypher(labels), {"repo_id": repo_id, "name": name}, _DESCRIBE_MAX_SUGGESTIONS
+        )
+        filters = "".join(
+            f", {key}={_echo(value)}" for key, value in (("label", label), ("file", file)) if value is not None
+        )
+        message = f"no node named {_echo(name)}{filters} in repository {_echo(repo_id)}."
+        if suggestions:
+            shown = "; ".join(
+                ", ".join(f"{k}={_echo(v)}" for k, v in _node_ref(s).items()) for s in suggestions
+            )
+            message += f" Did you mean: {shown}?"
+        raise ToolError(f"{message} {_DESCRIBE_HINT}.")
+
+    if len(rows) > 1:
+        candidates = sorted(
+            (_node_ref(row) for row in rows), key=lambda r: (r["label"], r["name"], r.get("file") or "")
+        )
+        return {
+            "status": "ambiguous",
+            "count": len(rows),
+            "candidates": candidates[:_DESCRIBE_MAX_CANDIDATES],
+            "truncated": len(rows) > _DESCRIBE_MAX_CANDIDATES,
+        }
+
+    (row,) = rows
+    properties, properties_truncated = _visible_properties(row["properties"])
+    node = {**_node_ref(row), "properties": properties, "properties_truncated": properties_truncated}
+    groups, groups_truncated = _read(
+        engine,
+        _DESCRIBE_GROUPS,
+        {"id": row["id"], "repo_id": repo_id, "direction": direction, "types": types,
+         "labels": neighbour_labels, "cap": cap},
+        _DESCRIBE_MAX_GROUPS,
+    )
+    outgoing: dict[str, Any] = {}
+    incoming: dict[str, Any] = {}
+    for group in groups:
+        refs = [_node_ref(ref) for ref in group["refs"]]
+        target = outgoing if group["dir"] == "out" else incoming
+        target[group["rel"]] = {"count": group["total"], "results": refs, "truncated": group["total"] > len(refs)}
+    return {
+        "status": "found",
+        "node": node,
+        "outgoing": dict(sorted(outgoing.items())),
+        "incoming": dict(sorted(incoming.items())),
+        "groups_truncated": groups_truncated,
+    }
 
 
 def god_nodes(
