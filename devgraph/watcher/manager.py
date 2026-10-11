@@ -235,6 +235,7 @@ class WatcherManager:
         on_catch_up: Callable[..., None] | None = None,
         git_catch_up_delay_s: float = 2.0,
         now: Callable[[], float] = time.time,
+        on_removed: Callable[[str], None] | None = None,
     ) -> None:
         """Initialize the watcher manager.
 
@@ -255,6 +256,13 @@ class WatcherManager:
                 failed; then the git-history sync that follows it is skipped.
             git_catch_up_delay_s: How long after a git burst its catch-up runs.
             now: The wall clock, in seconds; tests inject it.
+            on_removed: Optional callback(repo_id) for a repo that `refresh`
+                stopped watching because it is no longer registered. It runs
+                on its own thread under the repo's batch lock, so after any
+                job of that repo still running (`devgraph remove` deletes the
+                graph from another process, maybe under a running batch) and
+                before any that waits; those find the repo gone and write
+                nothing. Not run once `stop` has begun.
         """
         self._registry = registry
         self._on_changes = on_changes
@@ -287,6 +295,7 @@ class WatcherManager:
         self._reconcile_retries: dict[str, int] = {}
         self._stopping = False
         self._on_catch_up = on_catch_up
+        self._on_removed = on_removed
         self._git_catch_up_delay_s = git_catch_up_delay_s
         self._now = now
         # Guards the catch-up bookkeeping below. Never held while taking
@@ -494,8 +503,8 @@ class WatcherManager:
                 return
         if self._on_git_state_changed is not None:
             def run() -> None:
-                if self._catch_up_stopped or repo_id not in self._git_handlers:
-                    return  # stopped (or the repo unwatched) while waiting for the lock
+                if self._catch_up_stopped or repo_id not in self._git_handlers or self._registry.get(repo_id) is None:
+                    return  # stopped (or the repo unwatched or removed) while waiting for the lock
                 self._on_git_state_changed(repo_id)
 
             self.run_exclusive(repo_id, run)
@@ -516,11 +525,31 @@ class WatcherManager:
             for repo_id in current_ids - desired_ids:
                 self._stop_single(repo_id)
                 self._repo_issues.pop(repo_id, None)  # Clear any cached issues
+                if self._on_removed is not None and self._registry.get(repo_id) is None:
+                    self._start_purge(repo_id)
 
             # Start watchers for new repos
             for repo in repos:
                 if repo.repo_id in (desired_ids - current_ids):
                     self._start_single(repo)
+
+    def _start_purge(self, repo_id: str) -> None:
+        """Run `on_removed` for a repo no longer registered, on its own thread
+        under the batch lock (see `__init__`)."""
+        def purge() -> None:
+            if self._catch_up_stopped or self._registry.get(repo_id) is not None:
+                return  # stopping, or registered again while waiting for the lock
+            self._on_removed(repo_id)
+
+        def run() -> None:
+            try:
+                self.run_exclusive(repo_id, purge)
+            except Exception:
+                logger.warning("couldn't delete the graph data %s left after its removal", repo_id, exc_info=True)
+
+        timer = self._timer_factory(0.0, run)
+        timer.daemon = True
+        timer.start()
 
     def _start_single(self, repo: RepoRecord, index_if_never: bool = False) -> None:
         """Start a watcher for a single repo. Must hold _lock.

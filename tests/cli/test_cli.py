@@ -2140,3 +2140,54 @@ def test_cli_doctor_with_every_repository_folder_missing_says_none_are_reachable
     collapsed = _collapsed(_doctor_with_engine(runner, db_path, _stub_engine(None)).stdout)
     assert "no registered repositories to check" not in collapsed
     assert collapsed.count("[OK] no reachable repositories to check") >= 2
+
+
+def _orphan_engine(graph_ids, deleted):
+    stub = _stub_engine(None)
+
+    class OrphanEngine(stub):
+        def graph_repo_ids(self):
+            return set(graph_ids)
+
+        def delete_repository(self, repo_id):
+            deleted.append(repo_id)
+
+        def close(self, timeout=None):
+            pass
+
+    return OrphanEngine
+
+
+def test_cli_doctor_reports_graph_data_of_unregistered_repos(runner, temp_registry_db, tmp_path):
+    """Nodes a write left after `devgraph remove` (with or without their
+    Repository node) are reported, with the command that deletes them."""
+    db_path, registry = temp_registry_db
+    kept = registry.add_repo(_repo_with_schema(tmp_path, "kept")).repo_id
+    registry.close()
+
+    collapsed = _collapsed(_doctor_with_engine(runner, db_path, _orphan_engine({kept, "gone-repo"}, [])).stdout)
+    assert "Orphaned graph data" in collapsed
+    assert "gone-repo" in collapsed and "devgraph prune" in collapsed
+
+    clean = _collapsed(_doctor_with_engine(runner, db_path, _orphan_engine({kept}, [])).stdout)
+    assert "no graph data of unregistered repositories" in clean
+
+
+def test_cli_prune_deletes_nodes_left_without_a_repository_node(runner, temp_registry_db, tmp_path):
+    from devgraph.cli import main as cli_main
+
+    db_path, registry = temp_registry_db
+    kept = registry.add_repo(_repo_with_schema(tmp_path, "kept")).repo_id
+    registry.close()
+    deleted: list[str] = []
+    engine_cls = _orphan_engine({kept, "gone-repo"}, deleted)
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", engine_cls):
+        dry = runner.invoke(app, ["prune", "--dry-run"])
+        assert "gone-repo" in dry.stdout and deleted == []
+        result = runner.invoke(app, ["prune"])
+    assert result.exit_code == 0, result.stdout
+    assert deleted == ["gone-repo"]

@@ -369,3 +369,17 @@ def test_on_catch_up_reports_whether_it_succeeded(rig, indexing):
     assert rig.sync.on_catch_up(REPO, T0) is False
     rig.registry.get.return_value = None
     assert rig.sync.on_catch_up(REPO, T0) is False
+
+
+def test_a_removed_repo_is_purged_and_forgotten(tmp_path):
+    """The watcher calls `on_removed` once a removed repo's jobs are done:
+    whatever they wrote after `devgraph remove` deleted the graph goes too,
+    and its failure floor with it."""
+    rig = Rig(tmp_path)
+    rig.sync._failed(REPO, T0, RuntimeError("neo4j down"))
+    rig.registry.get.return_value = None
+    rig.sync.on_removed(REPO)
+    rig.engine.delete_repository.assert_called_once_with(REPO)
+    rig.requests.clear()
+    rig.sync.retry_failed()
+    assert rig.requests == []

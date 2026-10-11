@@ -159,9 +159,15 @@ class SchemaRescanScheduler:
         return rescanned
 
     def _exclusive(self, repo_id: str, fn: Callable[[], Any]) -> Any:
-        """`fn` under the batch lock, or None if stop came while waiting for it:
-        the agent closes the graph engine right after stop."""
-        return self._run_exclusive(repo_id, lambda: None if self._stop.is_set() else fn())
+        """`fn` under the batch lock, or None if stop came while waiting for it
+        (the agent closes the graph engine right after stop) or the repo was
+        removed meanwhile (its scan would outlive the removal's delete)."""
+        def run() -> Any:
+            if self._stop.is_set() or self._registry.get(repo_id) is None:
+                return None
+            return fn()
+
+        return self._run_exclusive(repo_id, run)
 
     def _upgrade(self, repo: Any) -> tuple[int, bool] | None:
         """`_rescan` unless the index got upgraded while this pass waited on

@@ -76,6 +76,7 @@ class HeadlessAgent:
             on_changes=self._sync.on_changes,
             on_git_state_changed=self._on_git_state_changed,
             on_catch_up=self._sync.on_catch_up,
+            on_removed=self._sync.on_removed,
         )
         self._healthy = True
         self._schema_ready = False

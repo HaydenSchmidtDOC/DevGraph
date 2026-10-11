@@ -186,6 +186,17 @@ class RepoSync:
         self._log_result(repo_id, reason, result, found, elapsed)
         return True
 
+    def on_removed(self, repo_id: str) -> None:
+        """Delete the graph data of a repository no longer registered, and
+        forget its floor. The watcher calls this under the batch lock once the
+        repository's last job is done: `devgraph remove` deletes the graph
+        from another process, and a batch running then can write after it."""
+        self._engine.delete_repository(repo_id)
+        with self._lock:
+            self._floors.pop(repo_id, None)
+            self._warned.pop(repo_id, None)
+            self._root_warned.discard(repo_id)
+
     def retry_failed(self) -> None:
         """Ask for a catch-up of every repository with a floor (the health
         loop calls this when Neo4j comes back)."""

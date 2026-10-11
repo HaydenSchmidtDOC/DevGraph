@@ -428,8 +428,10 @@ _WRITE_INSIGHTS_CYPHER = (
     "SET n.insight_community = row.community, n.insight_pagerank = row.pagerank, "
     "n.insight_betweenness = row.betweenness"
 )
+# MATCH, not MERGE: a refresh finishing after `devgraph remove` deleted the
+# repository must not bring its Repository node back.
 _WRITE_INSIGHTS_SUMMARY_CYPHER = (
-    "MERGE (r:Repository {repo_id: $repo_id}) "
+    "MATCH (r:Repository {repo_id: $repo_id}) "
     "SET r.insights_computed_at = $computed_at, r.insights_node_count = $node_count, "
     "r.insights_community_count = $community_count, r.insights_modularity = $modularity, "
     "r.insights_communities = $communities"
@@ -1896,6 +1898,15 @@ class GraphEngine:
                 repo_id=repo_id,
                 shas=shas,
             )
+
+    def graph_repo_ids(self) -> set[str]:
+        """Every repo_id some node carries: the Repository nodes' and any left
+        without one (a write that landed after its repository was deleted)."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run, "MATCH (n) WHERE n.repo_id IS NOT NULL RETURN DISTINCT n.repo_id AS repo_id"
+            )
+            return {record["repo_id"] for record in result or []}
 
     def delete_repository(self, repo_id: str) -> None:
         """Remove every node (and its relationships) scoped to this repo_id."""
