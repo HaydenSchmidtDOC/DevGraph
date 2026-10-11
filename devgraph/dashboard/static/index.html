@@ -2384,7 +2384,10 @@ neo4jStatus.id = "neo4jStatus"; neo4jStatus.style.cssText = "margin-right:auto; 
 document.querySelector(".cypher-foot").prepend(neo4jStatus);
 neo4jStatus.textContent = "checking…"; neo4jStatus.style.color = "var(--meta)";
 
-function escapeHtmlVal(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+/* Escapes for both text and quoted-attribute contexts: graph, git, filesystem
+   and registry strings come from indexed repositories, not from the user, and
+   an attribute such as title="${...}" breaks out on a bare quote. */
+function escapeHtmlVal(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
 /* RETURN n (a whole node/relationship) comes back with EVERY stored property —
    for devgraph that includes docstring_full on Module/Class/Function nodes,
    which can run to paragraphs of text per node. JSON.stringify-ing that raw
@@ -5023,7 +5026,7 @@ function currentWordRange() {
   return { start, end: pos, word: val.slice(start, pos) };
 }
 function renderAC() {
-  ac.innerHTML = acItems.map((it,i) => `<div class="ac-item${i===acIndex?' active':''}" data-i="${i}"><span>${escapeHtmlVal(it.text)}</span><span class="k">${it.kind}</span></div>`).join("");
+  ac.innerHTML = acItems.map((it,i) => `<div class="ac-item${i===acIndex?' active':''}" data-i="${i}"><span>${escapeHtmlVal(it.text)}</span><span class="k">${escapeHtmlVal(it.kind)}</span></div>`).join("");
   ac.classList.toggle("show", acItems.length > 0);
 }
 function selectAC(i) {
@@ -5172,7 +5175,7 @@ function loadQueryFromHistory(cypherText) {
   runCypherAndDisplay(cypherText, { skipConfirm: true });
   cypherInput.focus();
 }
-function renderLog(filter) { logBody.innerHTML = ""; logRows.filter(r => !filter || (r.tool+r.repo+r.cypher).toLowerCase().includes(filter)).forEach(r => { const tr = document.createElement("tr"); tr.title = "Load this query into the Cypher box"; tr.innerHTML = `<td class="mono">${r.t}</td><td>${r.tool}</td><td class="mono">${escapeHtmlVal(r.repo)}</td><td class="mono">${escapeHtmlVal(r.cypher)}</td>`; tr.addEventListener("click", () => loadQueryFromHistory(r.cypher)); logBody.appendChild(tr); }); }
+function renderLog(filter) { logBody.innerHTML = ""; logRows.filter(r => !filter || (r.tool+r.repo+r.cypher).toLowerCase().includes(filter)).forEach(r => { const tr = document.createElement("tr"); tr.title = "Load this query into the Cypher box"; tr.innerHTML = `<td class="mono">${escapeHtmlVal(r.t)}</td><td>${escapeHtmlVal(r.tool)}</td><td class="mono">${escapeHtmlVal(r.repo)}</td><td class="mono">${escapeHtmlVal(r.cypher)}</td>`; tr.addEventListener("click", () => loadQueryFromHistory(r.cypher)); logBody.appendChild(tr); }); }
 document.getElementById("logSearch").addEventListener("input", e => renderLog(e.target.value.trim().toLowerCase()));
 /* The card reads its two independent sources together: the chart/console log
    below, and the MCP tool-call telemetry the endpoint serves from the local
@@ -5264,7 +5267,7 @@ function renderGitList() {
   COMMITS.forEach((c,i) => {
     const row = document.createElement("div"); row.className = "commit-row";
     const dateStr = new Date(c.date).toLocaleDateString(undefined, {year:"numeric",month:"short",day:"numeric"});
-    row.innerHTML = `<div class="commit-rail"><div class="commit-dot${c.merge?" merge":""}"></div>${i<COMMITS.length-1?'<div class="commit-line"></div>':''}</div><div class="commit-body"><div class="commit-top"><span class="commit-hash">${c.short_hash}</span>${c.merge?'<span class="commit-branch merge-badge">merge</span>':''}</div><div class="commit-msg">${escapeHtmlVal(c.title)}</div><div class="commit-meta">${escapeHtmlVal(c.author||"—")} · ${dateStr}</div><div class="commit-detail">commit ${c.hash}\nAuthor: ${c.author||"—"}\nDate: ${dateStr}\n\n${c.title}${c.body?'\n\n'+c.body:''}</div></div>`;
+    row.innerHTML = `<div class="commit-rail"><div class="commit-dot${c.merge?" merge":""}"></div>${i<COMMITS.length-1?'<div class="commit-line"></div>':''}</div><div class="commit-body"><div class="commit-top"><span class="commit-hash">${escapeHtmlVal(c.short_hash)}</span>${c.merge?'<span class="commit-branch merge-badge">merge</span>':''}</div><div class="commit-msg">${escapeHtmlVal(c.title)}</div><div class="commit-meta">${escapeHtmlVal(c.author||"—")} · ${dateStr}</div><div class="commit-detail">commit ${escapeHtmlVal(c.hash)}\nAuthor: ${escapeHtmlVal(c.author||"—")}\nDate: ${dateStr}\n\n${escapeHtmlVal(c.title)}${c.body?'\n\n'+escapeHtmlVal(c.body):''}</div></div>`;
     row.addEventListener("click", () => row.classList.toggle("open"));
     wrap.appendChild(row);
   });
@@ -5303,11 +5306,11 @@ function renderGitTree() {
       return;
     }
     const title = c.title.length > 30 ? c.title.slice(0,30)+"…" : c.title;
-    if (c.merge) parts += `<rect x="${p.x-3.5}" y="${p.y-3.5}" width="7" height="7" fill="var(--success)" transform="rotate(45 ${p.x} ${p.y})" class="tree-hit tree-node" data-hash="${c.hash}"/>`;
-    else parts += `<circle cx="${p.x}" cy="${p.y}" r="3.5" fill="${laneColorOf[c.hash]}" class="tree-hit tree-node" data-hash="${c.hash}"/>`;
-    parts += `<text x="${labelX}" y="${p.y-2}" font-size="7.5" fill="var(--meta)" font-family="var(--font-mono)">${c.short_hash}</text>`;
+    if (c.merge) parts += `<rect x="${p.x-3.5}" y="${p.y-3.5}" width="7" height="7" fill="var(--success)" transform="rotate(45 ${p.x} ${p.y})" class="tree-hit tree-node" data-hash="${escapeHtmlVal(c.hash)}"/>`;
+    else parts += `<circle cx="${p.x}" cy="${p.y}" r="3.5" fill="${laneColorOf[c.hash]}" class="tree-hit tree-node" data-hash="${escapeHtmlVal(c.hash)}"/>`;
+    parts += `<text x="${labelX}" y="${p.y-2}" font-size="7.5" fill="var(--meta)" font-family="var(--font-mono)">${escapeHtmlVal(c.short_hash)}</text>`;
     parts += `<text x="${labelX}" y="${p.y+9}" font-size="8.5" fill="var(--fg-2)">${escapeHtmlVal(title)}</text>`;
-    parts += `<circle cx="${p.x}" cy="${p.y}" r="10" fill="transparent" class="tree-hit" data-hash="${c.hash}"/>`;
+    parts += `<circle cx="${p.x}" cy="${p.y}" r="10" fill="transparent" class="tree-hit" data-hash="${escapeHtmlVal(c.hash)}"/>`;
   });
   svg.innerHTML = parts;
   svg.setAttribute("width", treeBaseW);
@@ -5328,7 +5331,7 @@ function showGitCard(hash, x, y) {
   } else {
     const full = c.body ? `${c.title}\n\n${c.body}` : c.title;
     const truncated = full.length > bodyLimit;
-    html = `<div class="h-hash">${c.short_hash}</div><div class="h-title">${escapeHtmlVal(c.title)}</div>` + (c.body ? `<div class="h-body" data-full="${encodeURIComponent(full)}">${escapeHtmlVal(truncated ? full.slice(0,bodyLimit)+"…" : full)}</div>` + (truncated ? `<span class="h-more">show more</span>` : "") : "");
+    html = `<div class="h-hash">${escapeHtmlVal(c.short_hash)}</div><div class="h-title">${escapeHtmlVal(c.title)}</div>` + (c.body ? `<div class="h-body" data-full="${encodeURIComponent(full)}">${escapeHtmlVal(truncated ? full.slice(0,bodyLimit)+"…" : full)}</div>` + (truncated ? `<span class="h-more">show more</span>` : "") : "");
   }
   gitHoverCard.innerHTML = html;
   const more = gitHoverCard.querySelector(".h-more");
@@ -5884,7 +5887,7 @@ async function loadTopologyCounts() {
     const godJson = await runCypher(`MATCH (n) ${where}RETURN coalesce(n.name, n.repo_id, labels(n)[0]) AS name, labels(n)[0] AS label, COUNT { (n)--() } AS degree ORDER BY degree DESC LIMIT 6`);
     const godEl = document.getElementById("godNodes");
     if (!godJson.errors?.length && godJson.results[0].data.length) {
-      godEl.innerHTML = godJson.results[0].data.map((d,i) => `<div class="leaderboard-row"><span class="lb-rank">${i+1}</span><span class="lb-name">${escapeHtmlVal(d.row[0])}</span><span class="lb-type">${escapeHtmlVal(d.row[1]||"")}</span><span class="lb-val">${d.row[2]}</span></div>`).join("");
+      godEl.innerHTML = godJson.results[0].data.map((d,i) => `<div class="leaderboard-row"><span class="lb-rank">${i+1}</span><span class="lb-name">${escapeHtmlVal(d.row[0])}</span><span class="lb-type">${escapeHtmlVal(d.row[1]||"")}</span><span class="lb-val">${escapeHtmlVal(d.row[2])}</span></div>`).join("");
       document.getElementById("godNodesBasis").textContent = "degree";
     } else {
       godEl.innerHTML = `<div class="count-note">No nodes for this scope yet.</div>`;
