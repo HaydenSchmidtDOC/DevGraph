@@ -15,6 +15,7 @@ this codebase; see indexer/python/extractor.py's index_file for precedent).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -151,6 +152,16 @@ def _shallow_boundary(repo: Repo) -> set[str]:
         return set(Path(repo.common_dir, "shallow").read_text(encoding="ascii").split())
     except OSError:
         return set()
+
+
+def _shallow_digest(repo: Repo) -> str | None:
+    """sha256 of `.git/shallow`, or None for a full clone: it changes when
+    the clone is deepened or unshallowed."""
+    try:
+        data = Path(repo.common_dir, "shallow").read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(data).hexdigest()
 
 
 def _changed_paths(commit, boundary: bool = False) -> list[str] | None:
@@ -448,13 +459,17 @@ def sync_git_history(
             # a freshly-initialized repo, not an error. Nothing to sync.
             return {"mode": "noop", "commits_indexed": 0, "commits_deleted": 0}
         last = repo_record.last_indexed_commit
+        shallow = _shallow_digest(repo)
+        # A shallow clone deepened (or unshallowed) since: commits read as
+        # boundaries then, with every file as touched, have parents now.
+        reshaped = last is not None and shallow != repo_record.last_indexed_shallow
 
-        if last == head_sha and not force:
+        if last == head_sha and not force and not reshaped:
             return {"mode": "noop", "commits_indexed": 0, "commits_deleted": 0}
 
         if last is None:
             mode = "initial"
-        elif force or not _is_ancestor(repo, last, head_sha):
+        elif force or reshaped or not _is_ancestor(repo, last, head_sha):
             mode = "reconcile"
         else:
             mode = "fast"
@@ -471,6 +486,9 @@ def sync_git_history(
             # than speed for what should be a rare event, and capping it
             # risks leaving real orphans undetected.
             result = extractor.extract_new_commits(since_sha=None, max_count=None)
+            # Each commit's MODIFIES edges are written again, not added to: a
+            # former shallow boundary keeps only the files it changed.
+            engine.delete_commit_modifies(repo_id, [c.sha for c in result.commits])
             _upsert_extraction_result(engine, repo_id, result)
 
             reachable_shas = {c.sha for c in result.commits}
@@ -514,7 +532,7 @@ def sync_git_history(
                 f"(first {failed[0]!r}: {blame_failures[failed[0]]})"
             )
 
-        registry.set_last_indexed_commit(repo_id, head_sha)
+        registry.set_last_indexed_commit(repo_id, head_sha, shallow)
         return {"mode": mode, "commits_indexed": commits_indexed, "commits_deleted": commits_deleted}
     finally:
         repo.close()

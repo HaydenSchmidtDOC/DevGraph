@@ -1897,6 +1897,19 @@ class GraphEngine:
                 shas=shas,
             )
 
+    def delete_commit_modifies(self, repo_id: str, shas: list[str]) -> None:
+        """Delete the MODIFIES edges of these Commit nodes, scoped to
+        repo_id, so a reconcile can write them again from scratch."""
+        if not shas:
+            return
+        with self._driver.session() as session:
+            _retry_transient(
+                session.run,
+                "MATCH (c:Commit {repo_id: $repo_id})-[r:MODIFIES]->() WHERE c.name IN $shas DELETE r",
+                repo_id=repo_id,
+                shas=shas,
+            )
+
     def delete_repository(self, repo_id: str) -> None:
         """Remove every node (and its relationships) scoped to this repo_id."""
         with self._driver.session() as session:

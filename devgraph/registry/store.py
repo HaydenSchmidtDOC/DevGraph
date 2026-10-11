@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS repos (
     last_indexed_commit TEXT,
     mentions_enabled INTEGER NOT NULL DEFAULT 0,
     project_config_enabled INTEGER NOT NULL DEFAULT 1,
-    project_tools_sha256 TEXT
+    project_tools_sha256 TEXT,
+    last_indexed_shallow TEXT
 );
 """
 
@@ -53,6 +54,7 @@ _MIGRATIONS = (
         "ALTER TABLE repos ADD COLUMN project_config_enabled INTEGER NOT NULL DEFAULT 1",
     ),
     ("project_tools_sha256", "ALTER TABLE repos ADD COLUMN project_tools_sha256 TEXT"),
+    ("last_indexed_shallow", "ALTER TABLE repos ADD COLUMN last_indexed_shallow TEXT"),
 )
 
 _SLUG_RE = re.compile(r"[^a-z0-9_-]+")
@@ -84,6 +86,8 @@ class RepoRecord:
     project_config_enabled: bool = True
     # sha256 of the devgraph.tools.yaml bytes the user approved (`devgraph config tools trust`); None = not trusted
     project_tools_sha256: str | None = None
+    # sha256 of .git/shallow when last_indexed_commit was synced (None: a full clone)
+    last_indexed_shallow: str | None = None
 
 
 class RepoRegistry:
@@ -294,21 +298,23 @@ class RepoRegistry:
             raise ValueError(f"no such repo_id: {repo_id}")
         self._touch_change_marker()
 
-    def set_last_indexed_commit(self, repo_id: str, sha: str | None) -> None:
-        """Record the most recently walked commit SHA for incremental git history indexing."""
+    def set_last_indexed_commit(self, repo_id: str, sha: str | None, shallow: str | None = None) -> None:
+        """Record the most recently walked commit SHA for incremental git history indexing,
+        with the digest of the clone's `.git/shallow` then (None for a full clone)."""
         with self._lock:
             repo = self.get(repo_id)
             if repo is None:
                 raise ValueError(f"no such repo_id: {repo_id}")
             self._conn.execute(
-                "UPDATE repos SET last_indexed_commit = ? WHERE repo_id = ?", (sha, repo_id)
+                "UPDATE repos SET last_indexed_commit = ?, last_indexed_shallow = ? WHERE repo_id = ?",
+                (sha, shallow, repo_id),
             )
             self._conn.commit()
 
     _COLUMNS = (
         "repo_id, path, active, watch_enabled, last_indexed, docs_path, "
         "pr_source_enabled, issue_source_enabled, last_indexed_commit, mentions_enabled, "
-        "project_config_enabled, project_tools_sha256"
+        "project_config_enabled, project_tools_sha256, last_indexed_shallow"
     )
 
     def get(self, repo_id: str) -> RepoRecord | None:
@@ -342,6 +348,7 @@ class RepoRegistry:
             mentions_enabled,
             project_config_enabled,
             project_tools_sha256,
+            last_indexed_shallow,
         ) = row
         return RepoRecord(
             repo_id,
@@ -356,4 +363,5 @@ class RepoRegistry:
             bool(mentions_enabled),
             bool(project_config_enabled),
             project_tools_sha256,
+            last_indexed_shallow,
         )
