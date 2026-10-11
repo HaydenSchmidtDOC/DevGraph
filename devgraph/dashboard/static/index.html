@@ -2726,6 +2726,12 @@ async function previewQueryGlow(text) {
   const trimmed = (text||"").trim();
   const mySeq = ++glowRequestSeq;
   if (!trimmed) { animateGlowTo([]); focusRotation(null, 60); return; }
+  /* Only a query that opens with a plain read clause, and calls nothing, is
+     previewed: a read transaction still runs LOAD CSV (fetching a URL or a
+     file), SHOW, TERMINATE and procedure CALLs. Leading comments are skipped. */
+  const body = trimmed.replace(/^(?:\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|\s+)+/, "");
+  if (!/^(?:OPTIONAL\s+MATCH|MATCH|WITH|RETURN|UNWIND)\b/i.test(body)) return;
+  if (/\b(?:CALL|LOAD\s+CSV|TERMINATE|SHOW)\b/i.test(body)) return;
   try {
     // preview: fired while the user is still typing, so it must never write
     const json = await runCypher(trimmed, { preview: true });

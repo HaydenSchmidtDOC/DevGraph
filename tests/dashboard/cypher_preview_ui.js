@@ -77,6 +77,25 @@ const check = (label, cond, detail) => {
   check("runCypher without preview does not ask for one",
     bodies.length === 1 && !bodies[0].preview && bodies[0].record === true, JSON.stringify(bodies));
 
+  // 3. Only text that opens with a plain read clause is previewed: a read
+  //    transaction still runs LOAD CSV (fetches a URL), SHOW, TERMINATE and
+  //    procedure CALLs.
+  const previewed = async text => {
+    bodies.length = 0;
+    await api.previewQueryGlow(text);
+    return bodies.length > 0;
+  };
+  for (const text of [
+    "MATCH (n) RETURN n", "  optional match (n) return n", "WITH 1 AS x RETURN x", "RETURN 1",
+    "UNWIND [1,2] AS x RETURN x", "// a note\nMATCH (n) RETURN n",
+  ]) check(`previews ${JSON.stringify(text)}`, await previewed(text), "no request");
+  for (const text of [
+    "LOAD CSV FROM 'http://example.test/x.csv' AS row RETURN row", "CALL db.labels()",
+    "SHOW TRANSACTIONS", "TERMINATE TRANSACTIONS 'x'", "MATCH (n) CALL apoc.load.json('http://example.test') YIELD value RETURN value",
+    "WITH 1 AS x LOAD CSV FROM 'file:///etc/passwd' AS row RETURN row", "match (n) call { return 1 as y } return n",
+    "CREATE (n) RETURN n", "EXPLAIN MATCH (n) RETURN n",
+  ]) check(`does not preview ${JSON.stringify(text)}`, !(await previewed(text)), JSON.stringify(bodies));
+
   if (failures) { console.log(`\n${failures} check(s) failed`); process.exit(1); }
   console.log("\nall checks passed");
 })();
