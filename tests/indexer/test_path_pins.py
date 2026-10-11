@@ -441,8 +441,10 @@ def test_a_directory_pin_seeks_its_files_not_every_node_of_the_name(engine, repo
     # label held a few nodes, can satisfy the index hint with `file IS NOT
     # NULL` and filter the file afterwards (Neo4j replans it once its
     # statistics move, see the next test); this one profiles the plan this
-    # graph gets.
-    engine.run_cypher("CALL db.clearQueryCaches()")
+    # graph gets. Clearing the caches alone isn't enough: the replan can use
+    # index statistics sampled before these rows (a CI failure did);
+    # prepareForReplanning resamples the indexes, then clears the caches.
+    engine.run_cypher("CALL db.prepareForReplanning()")
     hits = _profiled_upsert(engine, rows)
     linked = engine.run_cypher(
         "MATCH (:Function {repo_id: $r, name: 'main'})-[:CALLS]->(b) RETURN count(b) AS n", {"r": repo_id}
@@ -464,7 +466,7 @@ def test_a_directory_pin_plan_cached_on_a_tiny_graph_is_replanned_once_it_grows(
     import time
 
     engine.init_schema()
-    engine.run_cypher("CALL db.clearQueryCaches()")
+    engine.run_cypher("CALL db.prepareForReplanning()")
     _profiled_upsert(engine, _fan_in(engine, f"{repo_id}-tiny", packages=2, callers=2))  # plans it
     try:
         rows = _fan_in(engine, repo_id, packages=300, callers=30)
