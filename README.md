@@ -53,7 +53,7 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 | Recompute communities, key nodes and bridges | `devgraph insights <repo_id>` |
 | Open the dashboard | `devgraph dashboard` |
 | Start, check or stop the background agent | `devgraph tray start`, `devgraph tray status`, `devgraph tray stop` |
-| Configure an MCP client | `devgraph client-config`, `devgraph mcp add`, `devgraph mcp doctor` |
+| Configure an MCP client | `devgraph client-config`, `devgraph mcp add` (Claude Code, user scope: every project), `devgraph mcp doctor` |
 | View settings, project schema, or tray logs | `devgraph config`, `devgraph config show / validate / eject / enable / disable`, `devgraph config schema list / add / edit / delete / reset`, `devgraph config tools list / add / edit / delete / reset`, `devgraph logs` |
 | Export a repository graph | `devgraph export <repo_id> --format json|cypher|dot` |
 | Update DevGraph | `devgraph update` |

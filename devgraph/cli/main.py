@@ -1464,20 +1464,66 @@ def _register_vscode(python_path: Path, repo_root: Path) -> bool:
     return True
 
 
+#: Claude Code scope DevGraph registers in: one registration serves every
+#: project. A bare `claude mcp add` registers in local scope, which is tied to
+#: the directory it ran in (the DevGraph checkout) and so serves no other repository.
+CLAUDE_MCP_SCOPE = "user"
+
+
+def _claude_mcp_add_line(python_path: Path) -> str:
+    return f'claude mcp add -s {CLAUDE_MCP_SCOPE} devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
+
+
+def _claude_mcp_registration(claude_path: str, repo_root: Path) -> tuple[str | None, str]:
+    """Where Claude Code has 'devgraph' registered, and `claude mcp get`'s output.
+
+    The scope is "user", "local", "project", "unknown" (registered, but the
+    output names no scope this recognises) or None (not registered). Run from
+    the checkout so a local registration made there by an older `mcp add` is
+    seen, the same answer for `mcp add` and `mcp doctor` wherever they start.
+    """
+    result = subprocess.run(
+        [claude_path, "mcp", "get", "devgraph"], cwd=str(repo_root), capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return None, ""
+    output = result.stdout if isinstance(result.stdout, str) else ""
+    for line in output.splitlines():
+        if line.strip().lower().startswith("scope:"):
+            described = line.split(":", 1)[1].strip().lower()
+            for scope in ("user", "local", "project"):
+                if described.startswith(scope):
+                    return scope, output
+    return "unknown", output
+
+
+def _wrong_scope_help(scope: str, repo_root: Path) -> str:
+    """How to move a non-user 'devgraph' registration to user scope."""
+    return (
+        f"'devgraph' is registered with Claude Code in {scope} scope, which serves only "
+        f"{'this checkout' if scope == 'local' else 'projects with that .mcp.json'}, not every repository. "
+        f"To move it to user scope, run 'claude mcp remove devgraph -s {scope}' in {repo_root}, "
+        "then 'devgraph mcp add'."
+    )
+
+
 def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path) -> bool:
-    """Register 'devgraph' with Claude Code via `claude mcp add`, skipping if already registered."""
-    already_registered = subprocess.run(
-        [claude_path, "mcp", "get", "devgraph"],
-        cwd=str(repo_root),
-        capture_output=True,
-    ).returncode == 0
-    if already_registered:
+    """Register 'devgraph' with Claude Code in user scope via `claude mcp add`.
+
+    Skips an existing user-scope registration. A local- or project-scope one
+    is reported with how to move it, and nothing is added: Claude Code
+    prefers it over a user-scope entry in that folder.
+    """
+    scope, _ = _claude_mcp_registration(claude_path, repo_root)
+    if scope in ("user", "unknown"):
         console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
         return True
-    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
-    console.print(f"\n[bold]Running:[/bold] {escape(mcp_add_line)}")
+    if scope is not None:
+        console.print(f"[yellow][!][/yellow] {escape(_wrong_scope_help(scope, repo_root))}", soft_wrap=True)
+        return False
+    console.print(f"\n[bold]Running:[/bold] {escape(_claude_mcp_add_line(python_path))}")
     result = subprocess.run(
-        [claude_path, "mcp", "add", "devgraph", "--", str(python_path), *MCP_SERVER_ARGS],
+        [claude_path, "mcp", "add", "-s", CLAUDE_MCP_SCOPE, "devgraph", "--", str(python_path), *MCP_SERVER_ARGS],
         cwd=str(repo_root),
     )
     return result.returncode == 0
@@ -1489,7 +1535,7 @@ app.add_typer(mcp_app, name="mcp")
 
 @mcp_app.command(name="add")
 def mcp_add() -> None:
-    """Register DevGraph as an MCP server with Claude Code (runs 'claude mcp add')."""
+    """Register DevGraph as an MCP server for every Claude Code project (runs 'claude mcp add -s user')."""
     claude_path = shutil.which("claude")
     if claude_path is None:
         console.print("[red][X] Error:[/red] 'claude' not found on PATH")
@@ -1500,12 +1546,12 @@ def mcp_add() -> None:
 
 @mcp_app.command(name="remove")
 def mcp_remove() -> None:
-    """Unregister DevGraph's MCP server from Claude Code (runs 'claude mcp remove')."""
+    """Unregister DevGraph's user-scope MCP server from Claude Code (runs 'claude mcp remove -s user')."""
     claude_path = shutil.which("claude")
     if claude_path is None:
         console.print("[red][X] Error:[/red] 'claude' not found on PATH")
         raise typer.Exit(code=1)
-    result = subprocess.run([claude_path, "mcp", "remove", "devgraph"])
+    result = subprocess.run([claude_path, "mcp", "remove", "-s", CLAUDE_MCP_SCOPE, "devgraph"])
     if result.returncode != 0:
         raise typer.Exit(code=1)
     console.print("[green][OK][/green] Removed 'devgraph' from Claude Code")
@@ -1522,12 +1568,14 @@ def mcp_doctor() -> None:
         any_failed = True
     else:
         console.print(f"[green][OK][/green] claude CLI at {escape(claude_path)}")
-        result = subprocess.run(
-            [claude_path, "mcp", "get", "devgraph"], capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            console.print("[green][OK][/green] 'devgraph' registered")
-            console.print(escape(result.stdout.strip()))
+        repo_root = resolve_repo_root()
+        scope, output = _claude_mcp_registration(claude_path, repo_root)
+        if scope in ("user", "unknown"):
+            console.print(f"[green][OK][/green] 'devgraph' registered{' (user scope)' if scope == 'user' else ''}")
+            console.print(escape(output.strip()))
+        elif scope is not None:
+            console.print(f"[red][X][/red] {escape(_wrong_scope_help(scope, repo_root))}", soft_wrap=True)
+            any_failed = True
         else:
             console.print("[red][X][/red] 'devgraph' not registered (run 'devgraph mcp add')")
             any_failed = True
@@ -1569,7 +1617,7 @@ def client_config(
 
     python_path = resolve_venv_python()
     repo_root = resolve_repo_root()
-    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
+    mcp_add_line = _claude_mcp_add_line(python_path)
     want_claude = target in ("claude", "both")
     want_vscode = target in ("vscode", "both")
 
