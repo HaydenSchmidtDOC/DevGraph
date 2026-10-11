@@ -1486,13 +1486,19 @@ def _claude_mcp_registration(claude_path: str, repo_root: Path) -> tuple[str | N
     """Where Claude Code has 'devgraph' registered, and `claude mcp get`'s output.
 
     The scope is "user", "local", "project", "unknown" (registered, but the
-    output names no scope this recognises) or None (not registered). Run from
+    output names no scope this recognises, or `claude mcp get` did not answer
+    within 60 seconds) or None (not registered). Run from
     the checkout so a local registration made there by an older `mcp add` is
     seen, the same answer for `mcp add` and `mcp doctor` wherever they start.
     """
-    result = subprocess.run(
-        [claude_path, "mcp", "get", "devgraph"], cwd=str(repo_root), capture_output=True, text=True
-    )
+    try:
+        # `mcp get` health-checks the server, which can hang
+        result = subprocess.run(
+            [claude_path, "mcp", "get", "devgraph"], cwd=str(repo_root), capture_output=True, text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return "unknown", "'claude mcp get devgraph' did not answer within 60s"
     if result.returncode != 0:
         return None, ""
     output = result.stdout if isinstance(result.stdout, str) else ""
@@ -1522,9 +1528,13 @@ def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path) ->
     is reported with how to move it, and nothing is added: Claude Code
     prefers it over a user-scope entry in that folder.
     """
-    scope, _ = _claude_mcp_registration(claude_path, repo_root)
-    if scope in ("user", "unknown"):
+    scope, output = _claude_mcp_registration(claude_path, repo_root)
+    if scope == "user":
         console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
+        return True
+    if scope == "unknown":
+        # registered in a scope this can't read, or `mcp get` timed out: leave it alone
+        console.print(f"[yellow][!][/yellow] Claude Code: not adding 'devgraph'; its registration is unclear: {escape(output.strip())}", soft_wrap=True)
         return True
     if scope is not None:
         console.print(f"[yellow][!][/yellow] {escape(_wrong_scope_help(scope, repo_root))}", soft_wrap=True)

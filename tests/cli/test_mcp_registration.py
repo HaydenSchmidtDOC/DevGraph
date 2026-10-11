@@ -164,3 +164,18 @@ def test_mcp_remove_removes_the_user_registration(claude):
     assert result.exit_code == 0, result.stdout
     removes = [c[1:] for c in claude.calls() if c[1:3] == ["mcp", "remove"]]
     assert removes == [["mcp", "remove", "-s", "user", "devgraph"]]
+
+
+def test_a_hanging_mcp_get_is_bounded_and_reads_as_unknown(claude, monkeypatch):
+    """`claude mcp get` health-checks the server; a hang must not hang devgraph."""
+    import subprocess
+
+    seen = {}
+
+    def hang(cmd, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 0)
+
+    monkeypatch.setattr(cli_main.subprocess, "run", hang)
+    scope, output = cli_main._claude_mcp_registration("/usr/bin/claude", claude.root)
+    assert scope == "unknown" and seen["timeout"] == 60
