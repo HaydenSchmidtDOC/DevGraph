@@ -83,6 +83,7 @@ class GitHistoryExtractor:
         unreadable = 0
         repo = open_repo(self.repo_path)
         try:
+            shallow = _shallow_boundary(repo)
             commits = list(repo.iter_commits(max_count=max_count))
             commits.reverse()  # iter_commits is newest-first; we want oldest-first
 
@@ -111,7 +112,7 @@ class GitHistoryExtractor:
                     )
                 )
 
-                changed = _changed_paths(commit)
+                changed = _changed_paths(commit, boundary=sha in shallow)
                 if changed is None:
                     unreadable += 1
                     changed = []
@@ -136,21 +137,34 @@ class GitHistoryExtractor:
 
         if unreadable:
             logger.warning(
-                f"{self.repo_id}: {unreadable} commit(s) have trees missing from this partial clone; "
-                "recorded without MODIFIES edges (DevGraph never fetches them); after fetching them, "
-                "run `devgraph rescan --full`"
+                f"{self.repo_id}: {unreadable} commit(s) could not be read: their trees are missing from this "
+                "clone (a partial clone, or a damaged one); recorded without MODIFIES edges (DevGraph never "
+                "fetches them); after fetching them, run `devgraph rescan --full`"
             )
         return result
 
 
-def _changed_paths(commit) -> list[str] | None:
+def _shallow_boundary(repo: Repo) -> set[str]:
+    """The commits a shallow clone ends at (`.git/shallow`): their parents
+    are not in the clone. Empty for a full clone."""
+    try:
+        return set(Path(repo.common_dir, "shallow").read_text(encoding="ascii").split())
+    except OSError:
+        return set()
+
+
+def _changed_paths(commit, boundary: bool = False) -> list[str] | None:
     """Return file paths touched by a commit (diff against its first parent, or full tree for a root commit).
+
+    A shallow clone's `boundary` commit is read like a root commit: its
+    parents are not in the clone (git itself shows it without them), so every
+    file it has counts as touched.
 
     Rename detection is off: a rename still yields both paths, and detecting it
     reads blobs a blobless partial clone lacks. None when a tree is missing
     (a `tree:0` partial clone), which the caller counts and logs.
     """
-    if commit.parents:
+    if commit.parents and not boundary:
         try:
             diffs = commit.parents[0].diff(commit, no_renames=True)
         except GitCommandError:

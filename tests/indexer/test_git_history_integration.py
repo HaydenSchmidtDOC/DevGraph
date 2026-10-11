@@ -411,7 +411,7 @@ def test_sync_git_history_never_lazy_fetches_in_a_partial_clone(graph_engine, re
         # (A treeless clone's initial sync records no MODIFIES, so blames nothing.)
         assert len(blame) == (2 if filter_spec == "blob:none" else 1)
         assert all("2 file(s)" in line for line in blame)
-        trees = [r.message for r in caplog.records if "trees missing" in r.message]
+        trees = [r.message for r in caplog.records if "trees are missing" in r.message]
         if filter_spec == "tree:0":
             assert len(trees) == 2 and "run `devgraph rescan --full`" in trees[0]
         else:
