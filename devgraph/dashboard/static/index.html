@@ -2533,6 +2533,8 @@ async function runCypher(statement, opts) {
       query: statement,
       repo_id: document.getElementById("repoSelect")?.value || null,
       record: !!opts?.record,
+      // read transaction server-side: the server refuses any write
+      preview: !!opts?.preview,
     }),
   });
   return res.json();
@@ -2716,7 +2718,8 @@ async function previewQueryGlow(text) {
   const mySeq = ++glowRequestSeq;
   if (!trimmed) { animateGlowTo([]); focusRotation(null, 60); return; }
   try {
-    const json = await runCypher(trimmed);
+    // preview: fired while the user is still typing, so it must never write
+    const json = await runCypher(trimmed, { preview: true });
     if (mySeq !== glowRequestSeq) return; // superseded by a newer query before this one came back
     if (json.errors?.length) return; // mid-typing/invalid — leave current glow state alone
     const { nodeIds, edgeIds } = extractGraphIds(json.results[0].data);

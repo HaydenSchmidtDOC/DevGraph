@@ -698,6 +698,12 @@ def build_router(
 
         The query is arbitrary Cypher, writes included, so this gets the same
         cross-site check as the other state-changing routes.
+
+        `preview: true` runs the query in a read transaction instead, so the
+        server refuses any write. The console's live preview (fired while the
+        user is still typing) sends only this; a write runs only from Run,
+        behind the console's destructive-query confirm. Previews are never
+        recorded.
         """
         _reject_cross_site(request)
         query = (payload.get("query") or "").strip()
@@ -705,11 +711,13 @@ def build_router(
             raise HTTPException(status_code=400, detail="query is required")
         params = payload.get("params") or {}
         repo_id = payload.get("repo_id")
-        should_record = bool(payload.get("record"))
+        preview = bool(payload.get("preview"))
+        should_record = bool(payload.get("record")) and not preview
+        run = engine.preview_cypher_graph if preview else engine.run_cypher_graph
 
         start = time.monotonic()
         try:
-            result = engine.run_cypher_graph(query, params)
+            result = run(query, params)
         except Exception as exc:  # neo4j driver raises its own exception hierarchy
             if should_record:
                 query_log.record(

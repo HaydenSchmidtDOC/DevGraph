@@ -1989,67 +1989,83 @@ class GraphEngine:
         path.
         """
         with self._driver.session() as session:
-            result = session.run(query, parameters or {})  # type: ignore[arg-type]
-            columns = list(result.keys())
-            data: list[dict[str, Any]] = []
-            for record in result:
-                nodes: dict[int, dict[str, Any]] = {}
-                rels: dict[int, dict[str, Any]] = {}
+            return _graph_shaped(session.run(query, parameters or {}))  # type: ignore[arg-type]
 
-                def collect(value: Any) -> None:
-                    if isinstance(value, Node):
-                        properties = dict(value)
-                        labels = list(value.labels)
-                        # `key` alongside the legacy `id` above: the id is a
-                        # storage-slot pointer that churns whenever
-                        # _replace_file_nodes_tx recreates a changed file's
-                        # nodes, so the dashboard cannot use it to recognise
-                        # the same node across reindexes. Computed here rather
-                        # than in the browser so the "is this file-scoped"
-                        # rule lives in exactly one place (see identity_key).
-                        # Absent when a node has no name to key on — a
-                        # projection like `RETURN {x: 1}` never reaches this
-                        # branch, but an aggregate or a node written outside
-                        # the extractors might.
-                        name = properties.get("name")
-                        nodes[value.id] = {
-                            "id": value.id,
-                            "labels": labels,
-                            "properties": properties,
-                            "key": identity_key(
-                                labels[0] if labels else "Unknown",
-                                properties.get("repo_id") or "",
-                                name,
-                                properties.get("file"),
-                            ) if isinstance(name, str) else None,
-                        }
-                    elif isinstance(value, Relationship):
-                        rels[value.id] = {
-                            "id": value.id,
-                            "type": value.type,
-                            "startNode": value.start_node.id if value.start_node else None,
-                            "endNode": value.end_node.id if value.end_node else None,
-                            "properties": dict(value),
-                        }
-                    elif isinstance(value, list):
-                        for item in value:
-                            collect(item)
+    def preview_cypher_graph(self, query: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+        """`run_cypher_graph`, but in a read transaction: the server refuses
+        any write. Backs the console's live preview, which fires while the
+        user is still typing and so must never change the graph."""
 
-                row: list[Any] = []
-                for value in record.values():
-                    collect(value)
-                    if isinstance(value, (Node, Relationship)):
-                        row.append(dict(value))
-                    else:
-                        row.append(value)
+        def work(tx):
+            return _graph_shaped(tx.run(query, parameters or {}))
 
-                data.append(
-                    {
-                        "row": row,
-                        "graph": {"nodes": list(nodes.values()), "relationships": list(rels.values())},
-                    }
-                )
-            return {"columns": columns, "data": data}
+        with self._driver.session(default_access_mode=READ_ACCESS) as session:
+            return session.execute_read(work)
+
+
+def _graph_shaped(result: Any) -> dict[str, Any]:
+    """A Cypher result as Neo4j's HTTP `["row","graph"]` shape (see
+    `GraphEngine.run_cypher_graph`), consumed fully before returning."""
+    columns = list(result.keys())
+    data: list[dict[str, Any]] = []
+    for record in result:
+        nodes: dict[int, dict[str, Any]] = {}
+        rels: dict[int, dict[str, Any]] = {}
+
+        def collect(value: Any) -> None:
+            if isinstance(value, Node):
+                properties = dict(value)
+                labels = list(value.labels)
+                # `key` alongside the legacy `id` above: the id is a
+                # storage-slot pointer that churns whenever
+                # _replace_file_nodes_tx recreates a changed file's
+                # nodes, so the dashboard cannot use it to recognise
+                # the same node across reindexes. Computed here rather
+                # than in the browser so the "is this file-scoped"
+                # rule lives in exactly one place (see identity_key).
+                # Absent when a node has no name to key on — a
+                # projection like `RETURN {x: 1}` never reaches this
+                # branch, but an aggregate or a node written outside
+                # the extractors might.
+                name = properties.get("name")
+                nodes[value.id] = {
+                    "id": value.id,
+                    "labels": labels,
+                    "properties": properties,
+                    "key": identity_key(
+                        labels[0] if labels else "Unknown",
+                        properties.get("repo_id") or "",
+                        name,
+                        properties.get("file"),
+                    ) if isinstance(name, str) else None,
+                }
+            elif isinstance(value, Relationship):
+                rels[value.id] = {
+                    "id": value.id,
+                    "type": value.type,
+                    "startNode": value.start_node.id if value.start_node else None,
+                    "endNode": value.end_node.id if value.end_node else None,
+                    "properties": dict(value),
+                }
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+
+        row: list[Any] = []
+        for value in record.values():
+            collect(value)
+            if isinstance(value, (Node, Relationship)):
+                row.append(dict(value))
+            else:
+                row.append(value)
+
+        data.append(
+            {
+                "row": row,
+                "graph": {"nodes": list(nodes.values()), "relationships": list(rels.values())},
+            }
+        )
+    return {"columns": columns, "data": data}
 
 
 def provision_repository_schema(engine: GraphEngine, repo_root: Path | str) -> None:
