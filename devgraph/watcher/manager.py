@@ -806,7 +806,15 @@ class WatcherManager:
             if since is not None:
                 self.request_catch_up(repo_id, since, OVERFLOW_CATCH_UP_DELAY_S, "overflow")
             return
-        if kind == "broken":
+        if kind == "limit":
+            # A folder found later stays unwatched until a restart; catch up
+            # on what it holds now.
+            problem = _watch_problem(error)
+            logger.warning("%s: %s", repo_id, problem)
+            since = self._last_indexed(repo_id)
+            if since is not None:
+                self.request_catch_up(repo_id, since, OVERFLOW_CATCH_UP_DELAY_S, "unwatched")
+        elif kind == "broken":
             problem = f"watching stopped: {error!r}; restart the agent"
             logger.error("Watching %s stopped: watchdog's reader failed", repo_id, exc_info=error)
         else:

@@ -55,8 +55,9 @@ logger = logging.getLogger(__name__)
 
 #: How the emitter tells the watcher about a problem: (kind, error). Kinds:
 #: "broken" (watchdog's reader raised; its thread ends, so nothing is watched
-#: from then on) and "overflow" (the kernel's queue overflowed: events were
-#: dropped).
+#: from then on), "overflow" (the kernel's queue overflowed: events were
+#: dropped) and "limit" (a folder found after the watch started can't be
+#: watched: ENOSPC or EMFILE, the inotify limits).
 Report = Callable[[str, BaseException], None]
 
 
@@ -141,11 +142,13 @@ class _FilteredInotify(Inotify):
         self._skip = skip
         self._report = report
         self._overflowed = False
+        self._started = False
         # Stand-in watch descriptors for skipped folders, below -1 (the
         # kernel's are positive; -1 marks an overflow): see `_add_watch`.
         self._placeholders: list[int] = []
         try:
             super().__init__(path, recursive=recursive, event_mask=event_mask)
+            self._started = True
         except BaseException:
             for name in ("_inotify_fd", "_kill_r", "_kill_w"):
                 fd = getattr(self, name, None)
@@ -201,7 +204,14 @@ class _FilteredInotify(Inotify):
             self._wd_for_path[path] = wd
             self._path_for_wd[wd] = path
             raise OSError(errno.EPERM, "folder not watched: ignored", path)
-        return super()._add_watch(path, mask)
+        try:
+            return super()._add_watch(path, mask)
+        except OSError as e:
+            # Past the start (whose failure the watcher reports itself), a
+            # limit reached leaves this folder unwatched until a restart.
+            if self._started and e.errno in (errno.ENOSPC, errno.EMFILE) and self._report is not None:
+                self._report("limit", e)
+            raise
 
     def read_events(self, *, event_buffer_size: int = DEFAULT_EVENT_BUFFER_SIZE) -> list[InotifyEvent]:
         """watchdog's, plus the placeholder cleanup and moved-in folders
