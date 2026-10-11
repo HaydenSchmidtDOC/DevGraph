@@ -102,9 +102,13 @@ class _GitStateEventHandler(FileSystemEventHandler):
         *,
         timer_factory: TimerFactory = threading.Timer,
         now: Callable[[], float] = time.time,
+        max_wait_ms: int | None = None,
     ) -> None:
         self._repo_id = repo_id
         self._debounce_ms = debounce_ms
+        self._max_wait_ms = max_wait_ms
+        # When the first event of the pending burst arrived (see `_debounce_s`).
+        self._pending_since: float | None = None
         self._on_burst = on_burst
         self._timer_factory = timer_factory
         self._now = now
@@ -171,14 +175,17 @@ class _GitStateEventHandler(FileSystemEventHandler):
             self._reset_debounce()
 
     def _reset_debounce(self) -> None:
-        """Reset the debounce timer. Must hold _lock."""
+        """Reset the debounce timer, within the maximum wait. Must hold _lock."""
         if self._debounce_timer:
             self._debounce_timer.cancel()
         if self._closed:
             return
 
+        now = self._now()
+        if self._pending_since is None:
+            self._pending_since = now
         self._debounce_timer = self._timer_factory(
-            self._debounce_ms / 1000.0,
+            _debounce_s(self._debounce_ms, self._max_wait_ms, now - self._pending_since),
             self._fire_change,
         )
         self._debounce_timer.daemon = True
@@ -198,6 +205,7 @@ class _GitStateEventHandler(FileSystemEventHandler):
             if self._closed:
                 return  # fired just as close() ran
             self._debounce_timer = None
+            self._pending_since = None
             burst_start, self._burst_start = self._burst_start, None
         # Invoke callback outside lock to avoid deadlock
         self._on_burst(self._repo_id, burst_start)
@@ -226,6 +234,17 @@ def _discard_observer(observer: Any) -> None:
     observer.stop()
     if observer.is_alive():
         observer.join(timeout=5)
+
+
+def _debounce_s(debounce_ms: int, max_wait_ms: int | None, waited_s: float) -> float:
+    """The next debounce timer's interval: the debounce, cut short so a
+    batch whose first event came `waited_s` ago fires no later than
+    `max_wait_ms` after it. Without that cap, events arriving faster than the
+    debounce would hold the batch back for as long as they kept coming."""
+    interval = debounce_ms / 1000.0
+    if max_wait_ms is None:
+        return interval
+    return max(0.0, min(interval, max_wait_ms / 1000.0 - waited_s))
 
 
 def _forget_closed_handle(emitter: Any) -> None:
@@ -297,6 +316,7 @@ class WatcherManager:
         self._handlers: dict[str, _RepoEventHandler] = {}
         self._git_handlers: dict[str, _GitStateEventHandler] = {}
         self._debounce_ms = get_settings().watch_debounce_ms
+        self._max_wait_ms = get_settings().watch_max_wait_ms
         self._lock = threading.Lock()
         # Track repos with path issues (e.g. missing directory) so they don't
         # crash the whole watcher. Maps repo_id -> error message.
@@ -590,6 +610,7 @@ class WatcherManager:
             request_reconcile=None if self._root_watch else self._request_reconcile,
             request_rewatch=self._request_reconcile if self._root_watch else None,
             request_catch_up=self.request_catch_up,
+            max_wait_ms=self._max_wait_ms,
         )
         observer = self._new_observer(repo.path)
         root_watch: ObservedWatch | None = None
@@ -633,6 +654,7 @@ class WatcherManager:
                     self._on_git_burst,
                     timer_factory=self._timer_factory,
                     now=self._now,
+                    max_wait_ms=self._max_wait_ms,
                 )
                 # Non-recursive watch on .git itself (catches HEAD, packed-refs)
                 observer.schedule(git_handler, str(git_dir), recursive=False)
@@ -959,10 +981,14 @@ class _RepoEventHandler(FileSystemEventHandler):
         request_rewatch: Callable[[str], None] | None = None,
         request_catch_up: Callable[[str, datetime, float, str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        max_wait_ms: int | None = None,
     ) -> None:
         self._repo_id = repo_id
         self._repo_root = repo_root
         self._debounce_ms = debounce_ms
+        self._max_wait_ms = max_wait_ms
+        # When the first event of the pending batch was queued (see `_debounce_s`).
+        self._pending_since: float | None = None
         self._on_changes = on_changes
         self._timer_factory = timer_factory
         self._batch_lock = batch_lock or threading.Lock()
@@ -1144,10 +1170,14 @@ class _RepoEventHandler(FileSystemEventHandler):
         return False
 
     def _reset_debounce(self) -> None:
-        """Restart the debounce timer. Must hold _lock."""
+        """Restart the debounce timer, within the maximum wait. Must hold _lock."""
         if self._debounce_timer is not None:
             self._debounce_timer.cancel()
-        self._debounce_timer = self._timer_factory(self._debounce_ms / 1000.0, self._fire_changes)
+        now = self._clock()
+        if self._pending_since is None:
+            self._pending_since = now
+        interval = _debounce_s(self._debounce_ms, self._max_wait_ms, now - self._pending_since)
+        self._debounce_timer = self._timer_factory(interval, self._fire_changes)
         self._debounce_timer.daemon = True
         self._debounce_timer.start()
 
@@ -1166,6 +1196,7 @@ class _RepoEventHandler(FileSystemEventHandler):
                 deleted = set(self._deleted.values())
                 folders = self._folder_events
                 self._changed, self._deleted, self._folder_events = {}, {}, {}
+                self._pending_since = None
             for rel in sorted(folders):
                 # One line per folder event, never per child of a moved or
                 # removed folder.
