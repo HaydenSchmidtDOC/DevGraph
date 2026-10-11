@@ -2140,3 +2140,58 @@ def test_cli_doctor_with_every_repository_folder_missing_says_none_are_reachable
     collapsed = _collapsed(_doctor_with_engine(runner, db_path, _stub_engine(None)).stdout)
     assert "no registered repositories to check" not in collapsed
     assert collapsed.count("[OK] no reachable repositories to check") >= 2
+
+
+def _agent_running_with_issues(db_path, issues):
+    """A fresh tray heartbeat and the repo_issues.json the agent writes."""
+    from datetime import datetime, timezone
+
+    (db_path.parent / "tray_heartbeat.txt").write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+    (db_path.parent / "repo_issues.json").write_text(json.dumps(issues), encoding="utf-8")
+    settings = _mock_settings(db_path)
+    settings.health_check_interval_s = 30
+    return settings
+
+
+UNWATCHED = "watching unavailable: inotify limit reached (too many inotify instances, fs.inotify.max_user_instances)"
+
+
+def test_status_says_a_running_watcher_is_not_watching_a_repository(runner, temp_registry_db, temp_git_repo):
+    """The agent can be alive while a repository's watch failed to start:
+    "running" alone hid that nothing there was being picked up."""
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.close()
+    settings = _agent_running_with_issues(db_path, {repo_id: UNWATCHED})
+
+    from devgraph.cli import main as cli_main
+
+    with patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine") as engine_cls:
+        engine_cls.return_value.verify_connectivity.return_value = None
+        result = runner.invoke(app, ["status"])
+
+    watcher = _collapsed(result.stdout.split("Live Watcher", 1)[1].split("Dashboard", 1)[0])
+    assert "running, but not watching 1 repository" in watcher
+    assert f"{repo_id}: {UNWATCHED}" in watcher
+
+
+def test_doctor_fails_a_repository_the_watcher_is_not_watching(runner, temp_registry_db, temp_git_repo):
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.close()
+    settings = _agent_running_with_issues(db_path, {repo_id: UNWATCHED})
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=settings), \
+         patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine", _stub_engine(None)), \
+         patch.object(cli_main, "resolve_podman", return_value=None):
+        result = runner.invoke(app, ["doctor"])
+
+    watcher = _collapsed(result.stdout.split("Live Watcher", 1)[1])
+    assert "running, but not watching 1 repository" in watcher
+    assert f"[X] {repo_id}: {UNWATCHED}" in watcher
+    assert result.exit_code == 1
