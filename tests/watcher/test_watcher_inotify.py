@@ -345,3 +345,23 @@ def test_a_folder_that_hits_the_watch_limit_mid_session_is_reported(tmp_path, mo
         wait_for(lambda: "unwatched" in catch_ups, lambda: f"a catch-up; got {catch_ups}")
     finally:
         w.close()
+
+
+def test_a_symlinked_folder_below_the_root_gets_no_watch(tmp_path):
+    """inotify follows a symlink it is asked to watch: a linked folder found
+    in a new folder's walk would put a folder outside the repository under
+    the watch."""
+    outside = tmp_path / "outside"
+    (outside / "deep").mkdir(parents=True)
+    w = Watching(tmp_path, make_repo(tmp_path, "repo", 1), git=False)
+    w.manager.start()
+    try:
+        inotify = _root_inotify(w.manager, w.repo_id)
+        link = w.root / "pkg0/link"
+        link.symlink_to(outside, target_is_directory=True)
+        before = inotify_watches()
+        with inotify._lock, pytest.raises(OSError):
+            inotify._add_watch(os.fsencode(link), inotify._event_mask)
+        assert inotify_watches() == before
+    finally:
+        w.close()

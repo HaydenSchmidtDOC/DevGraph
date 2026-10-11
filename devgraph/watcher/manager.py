@@ -113,13 +113,9 @@ class _GitStateEventHandler(FileSystemEventHandler):
         *,
         timer_factory: TimerFactory = threading.Timer,
         now: Callable[[], float] = time.time,
-        max_wait_ms: int | None = None,
     ) -> None:
         self._repo_id = repo_id
         self._debounce_ms = debounce_ms
-        self._max_wait_ms = max_wait_ms
-        # When the first event of the pending burst arrived (see `_debounce_s`).
-        self._pending_since: float | None = None
         self._on_burst = on_burst
         self._timer_factory = timer_factory
         self._now = now
@@ -186,17 +182,18 @@ class _GitStateEventHandler(FileSystemEventHandler):
             self._reset_debounce()
 
     def _reset_debounce(self) -> None:
-        """Reset the debounce timer, within the maximum wait. Must hold _lock."""
+        """Reset the debounce timer. Must hold _lock.
+
+        No maximum wait here, unlike file batches: a rebase or a long
+        checkout moves refs for as long as it runs, and a catch-up in the
+        middle of it would read a half-done working tree."""
         if self._debounce_timer:
             self._debounce_timer.cancel()
         if self._closed:
             return
 
-        now = self._now()
-        if self._pending_since is None:
-            self._pending_since = now
         self._debounce_timer = self._timer_factory(
-            _debounce_s(self._debounce_ms, self._max_wait_ms, now - self._pending_since),
+            self._debounce_ms / 1000.0,
             self._fire_change,
         )
         self._debounce_timer.daemon = True
@@ -216,7 +213,6 @@ class _GitStateEventHandler(FileSystemEventHandler):
             if self._closed:
                 return  # fired just as close() ran
             self._debounce_timer = None
-            self._pending_since = None
             burst_start, self._burst_start = self._burst_start, None
         # Invoke callback outside lock to avoid deadlock
         self._on_burst(self._repo_id, burst_start)
@@ -664,7 +660,6 @@ class WatcherManager:
                 self._on_git_burst,
                 timer_factory=self._timer_factory,
                 now=self._now,
-                max_wait_ms=self._max_wait_ms,
             )
         observer = self._new_observer(repo.repo_id, repo.path, watch_git=git_handler is not None)
         root_watch: ObservedWatch | None = None

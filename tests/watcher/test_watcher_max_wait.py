@@ -93,19 +93,18 @@ def test_a_lone_write_still_waits_only_the_debounce(tmp_path):
     assert len(fired) == 1 and abs(fired[0] - start - 0.5) < 0.02, fired
 
 
-def test_continuous_ref_changes_flush_a_git_burst_at_least_every_max_wait(tmp_path):
+def test_a_git_burst_waits_for_its_events_to_stop(tmp_path):
+    """No maximum wait for git state: a rebase moves refs for as long as it
+    runs, and a catch-up in the middle of it would read a half-done tree."""
     clock, timers, fired = Clock(), [], []
     handler = _GitStateEventHandler(
         "repo", 500, lambda _r, _start: fired.append(clock.t),
         timer_factory=lambda interval, fn: timers.append(FakeTimer(clock, interval, fn)) or timers[-1],
         now=clock,
-        max_wait_ms=5000,
     )
     start = clock.t
     run(clock, timers, lambda: handler.on_modified(FileModifiedEvent(str(tmp_path / ".git/HEAD"))), every_s=0.3, for_s=12)
-    gaps = [b - a for a, b in zip([start, *fired], fired)]
-    assert len(fired) == 3, fired
-    assert all(gap <= 5.0 + 0.3 + 0.02 for gap in gaps), gaps  # from the first event after the last batch
+    assert len(fired) == 1 and fired[0] > start + 12, fired
 
 
 def test_a_file_written_every_200_ms_is_indexed_while_it_is_being_written(tmp_path, monkeypatch):

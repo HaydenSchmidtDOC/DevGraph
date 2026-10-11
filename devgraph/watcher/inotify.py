@@ -13,7 +13,9 @@ repository with one recursive watch on its root through this emitter, which:
 - watches a folder moved in from outside the watched tree, or from an ignored
   folder (watchdog leaves those unwatched);
 - adds watches for folders that are no longer ignored (`add_missing_watches`,
-  after a .gitignore change);
+  after a .gitignore change); a folder that becomes ignored keeps its watch
+  until the agent restarts (its events are dropped by the handler);
+- never watches a symlinked folder below the root (inotify follows links);
 - closes the inotify descriptor and its pipe when setting up a watch fails
   (watchdog leaks them, e.g. when the watch limit is hit part-way).
 
@@ -158,7 +160,11 @@ class _FilteredInotify(Inotify):
             raise
 
     def _skipped(self, path: bytes) -> bool:
-        return self._skip is not None and path != self._path and self._skip(path)
+        """A folder below the root to keep unwatched: one `skip` accepts, or
+        a symlink (inotify would follow it, perhaps out of the repository)."""
+        if self._skip is None or path == self._path:
+            return False
+        return os.path.islink(path) or self._skip(path)
 
     def _add_dir_watch(self, path: bytes, mask: int, *, recursive: bool) -> None:
         if not os.path.isdir(path):
