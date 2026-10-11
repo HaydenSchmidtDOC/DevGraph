@@ -54,7 +54,7 @@ def test_a_pip_environment_reinstalls_with_pip(tmp_path, monkeypatch):
     venv = _venv(tmp_path, uv=False)
     monkeypatch.setattr(cli_main.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
     assert cli_main._reinstall_command(venv, Path("/venv/bin/python")) == [
-        "/venv/bin/python", "-m", "pip", "install", "-e", ".[dev]",
+        str(Path("/venv/bin/python")), "-m", "pip", "install", "-e", ".[dev]",
     ]
 
 
