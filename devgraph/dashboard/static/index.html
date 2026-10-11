@@ -2353,11 +2353,15 @@ function buildQueryFromState(runMode) {
 }
 
 /* ── cypher syntax highlighting (overlay <pre> behind a transparent textarea) ── */
-function escapeHtml(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+/* Quotes escaped too, so the only raw quotes in highlightCypher's output are
+   its own attribute quotes: matching string literals on raw `"` used to wrap
+   the comment span's class="tok-cm" in a string span. &apos;, not &#39;, so
+   the number rule below has no digits to match. */
+function escapeHtml(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;"); }
 function highlightCypher(text) {
   let t = escapeHtml(text);
   t = t.replace(/(\/\/[^\n]*)/g, '<span class="tok-cm">$1</span>');
-  t = t.replace(/"([^"]*)"/g, '<span class="tok-str">"$1"</span>');
+  t = t.replace(/&quot;((?:(?!&quot;)[^\n])*)&quot;/g, '<span class="tok-str">&quot;$1&quot;</span>');
   t = t.replace(/\b(MATCH|OPTIONAL MATCH|WHERE|RETURN|LIMIT|WITH|ORDER BY|AND|OR|NOT|AS|DISTINCT|COUNT|IN)\b/g, '<span class="tok-kw">$1</span>');
   t = t.replace(/:(\w+)/g, ':<span class="tok-label">$1</span>');
   t = t.replace(/\b(\d+)\b/g, '<span class="tok-num">$1</span>');

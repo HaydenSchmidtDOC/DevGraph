@@ -33,6 +33,8 @@ const src = [
   grab(/^function renderLog\(/m, "\n"),
   grab(/^function insightRowsHtml\(/m, "\n}"),
   grab(/^function renderAC\(/m, "\n}"),
+  grab(/^function escapeHtml\(/m, "}"),
+  grab(/^function highlightCypher\(/m, "\n}"),
 ].join("\n");
 
 // --- DOM stubs: every element records what was written into it ----------
@@ -64,7 +66,7 @@ const globals = {
 };
 const api = new Function(...Object.keys(globals), src + `
 return {
-  escapeHtmlVal, renderGitList, renderGitTree, showGitCard, renderLog, insightRowsHtml, renderAC,
+  escapeHtmlVal, highlightCypher, renderGitList, renderGitTree, showGitCard, renderLog, insightRowsHtml, renderAC,
   setGit: (commits, uncommitted) => {
     COMMITS = commits; UNCOMMITTED = uncommitted;
     COMMITS_BY_HASH = Object.fromEntries(commits.map(c => [c.hash, c]));
@@ -148,6 +150,24 @@ const collect = () => { const out = written.join("\n"); written.length = 0; retu
   const line = html.split("\n").find(l => l.includes("godEl.innerHTML = godJson.results[0].data.map"));
   check("degree leaderboard escapes every column",
     !!line && !/\$\{d\.row\[\d\]\}/.test(line), line);
+}
+
+// 9. The Cypher highlighter: quotes escaped, and the markup it builds shows
+//    exactly the query text (no garbled attributes, no live tags).
+{
+  const strip = m => m.replace(/<span class="tok-[a-z]+">/g, "").replace(/<\/span>/g, "")
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  for (const q of [
+    `MATCH (n {name: "a<img src=x onerror=alert(1)>"}) RETURN n LIMIT 25`,
+    `MATCH (n) // it's "quoted" here\nWHERE n.name = 'x"y' RETURN n`,
+    `RETURN "a" + 'b' AS s, 'x' AS t, 39 AS n`,
+  ]) {
+    const out = api.highlightCypher(q);
+    check(`highlightCypher round-trips ${JSON.stringify(q)}`, strip(out) === q, out);
+    check(`highlightCypher emits no live tag for ${JSON.stringify(q)}`, safe(out) && !/<(?!\/?span\b)/.test(out), out);
+  }
+  check("string literals are still highlighted", /<span class="tok-str">&quot;a&quot;<\/span>/.test(api.highlightCypher(`RETURN "a"`)),
+    api.highlightCypher(`RETURN "a"`));
 }
 
 if (failures) { console.log(`\n${failures} check(s) failed`); process.exit(1); }
