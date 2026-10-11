@@ -79,14 +79,14 @@
 
 - **Canonical setup**: the README installer launches `.\scripts\setup-menu.ps1`, which creates the Python environment, installs DevGraph, starts Neo4j, initializes schema, runs `devgraph doctor`, and offers MCP client registration. Idempotent.
 - **Update an existing checkout**: `devgraph update` — fast-forward pull, reinstall, `doctor`, and tray restart when needed. Commit or stash local changes first; `--force` only suppresses the dirty-tree guard. `.\scripts\update.ps1` remains as a compatibility entry point.
-- Manual equivalent: `python -m venv .venv` → `.venv/Scripts/python -m pip install -e ".[dev]"` → start Neo4j:
+- Manual equivalent (any platform): `uv sync --extra dev` (or `python -m venv .venv` and `python -m pip install -e ".[dev]"` with that environment's Python: `.venv/bin/python` on Linux and macOS, `.venv\Scripts\python` on Windows) → start Neo4j with Podman or Docker (`docker` takes the same arguments):
   `podman run -d --name devgraph-neo4j -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 -e NEO4J_AUTH=neo4j/devgraph-local-dev -v devgraph_neo4j_data:/data -v devgraph_neo4j_logs:/logs docker.io/library/neo4j:5.26-community`
-  (`deploy/podman-compose.yml` is an untested alternative for compose-provider setups.)
-- Tests: `.venv/Scripts/python -m pytest`
+  (`deploy/podman-compose.yml` is an untested alternative for compose-provider setups.) The README's Linux quickstart walks through the same steps.
+- Tests: `uv run pytest` (or the environment's Python with `-m pytest`)
 - Continuous integration: `.github/workflows/tests.yml` runs on every push and pull request (and on demand). The Linux job runs the full pytest suite against a Neo4j 5.26 service container, then the `tests/dashboard/*.js` node harnesses. The Windows job runs the same suite and harnesses without live Neo4j: the live tests skip there, so Windows covers everything but the graph round trips.
 - CLI: run `devgraph --help` for the authoritative command list. Main groups cover repository registration and rescans; status, diagnostics, stats, and pruning; dashboard and tray control; MCP client setup; configuration (the `config` group: settings, schema list/add/edit/delete/reset, show/validate/eject, tools) and logs; graph export; annotations, mentions, git history, and PR/issue opt-ins; and self-update.
 
-**Podman note**: `podman.exe` may not be on PATH by default even when installed — check `%LOCALAPPDATA%\Programs\Podman` first. Never install software to the host; dependencies live in `.venv/` and containers. Never touch containers/volumes not prefixed `devgraph-`.
+**Podman note**: on Windows, `podman.exe` may not be on PATH by default even when installed — check `%LOCALAPPDATA%\Programs\Podman` first. `devgraph doctor` needs Podman only while Neo4j is unreachable. Never install software to the host; dependencies live in `.venv/` and containers. Never touch containers/volumes not prefixed `devgraph-`.
 
 ## Structure
 

@@ -15,7 +15,28 @@ Source extraction is selected per file, so one repository can mix **Python, Java
 
 ## Quickstart
 
-The interactive installer currently targets Windows PowerShell and requires Python 3.13 or newer, Git, and [Podman](https://podman.io/):
+### Linux
+
+Requires Python 3.13 or newer, Git, [uv](https://docs.astral.sh/uv/), and Podman or Docker:
+
+```bash
+git clone https://github.com/HaydenSchmidtDOC/DevGraph.git && cd DevGraph
+uv sync --extra dev
+podman run -d --name devgraph-neo4j --restart=always \
+  -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 \
+  -e NEO4J_AUTH=neo4j/devgraph-local-dev \
+  -v devgraph_neo4j_data:/data -v devgraph_neo4j_logs:/logs \
+  docker.io/library/neo4j:5.26-community
+uv run devgraph doctor
+uv run devgraph register ~/code/my-repo --full
+uv run devgraph mcp add
+```
+
+`docker run` takes the same arguments. `devgraph mcp add` registers DevGraph with Claude Code for every project (user scope); `devgraph client-config` prints the VS Code entry. Activate the environment (`source .venv/bin/activate`) to drop the `uv run` prefix. Without a desktop tray, the agent runs headless (see `devgraph tray start` below).
+
+### Windows
+
+The interactive installer targets Windows PowerShell and requires Python 3.13 or newer, Git, and [Podman](https://podman.io/):
 
 ```powershell
 irm https://raw.githubusercontent.com/HaydenSchmidtDOC/DevGraph/master/scripts/install.ps1 | iex
@@ -64,7 +85,7 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 
 `devgraph tray start` reports OK only once the agent has written its first heartbeat, and exits non-zero if it exits during startup or sends none within 30 seconds (`devgraph logs` shows why). `devgraph tray status` exits non-zero when the agent is not running. With no display or no system tray (a Linux server, an SSH session, a desktop without a tray), the same process runs the headless agent instead and `tray start` says so: no icon, but the same watcher, indexer and dashboard, stopped with `devgraph tray stop`. MCP auto-start falls back the same way.
 
-`devgraph update` is the normal update path. It fast-forwards the configured branch, reinstalls DevGraph, runs `doctor`, and restarts the tray app if it was running. Commit or stash local changes first; `--force` only suppresses the dirty-tree guard. The older `scripts/update.ps1` entry point remains available for existing Windows installations.
+`devgraph update` is the normal update path. It fast-forwards the configured branch, reinstalls DevGraph (`uv sync --extra dev` in an environment uv created, else `pip install -e .[dev]`), runs `doctor`, and restarts the tray app if it was running, even when the reinstall or `doctor` fails. An untracked `uv.lock` (which `uv sync` writes) does not count as a local change. Commit or stash local changes first; `--force` only suppresses the dirty-tree guard. The older `scripts/update.ps1` entry point remains available for existing Windows installations.
 
 ## Operating model
 

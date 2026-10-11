@@ -1905,21 +1905,25 @@ def update(
     """Pull latest from git, reinstall dependencies, and verify.
 
     Port of scripts/update.ps1 into Python. Runs git pull --ff-only,
-    reinstalls the editable package, runs doctor, and restarts the tray
-    if it was running.
+    reinstalls the editable package (`uv sync` in a uv environment, else
+    pip), runs doctor, and restarts the tray if it was running, even when
+    the reinstall or doctor fails.
     """
     repo_root = resolve_repo_root()
     python_path = resolve_venv_python()
+    reinstall = _reinstall_command(Path(sys.prefix), python_path)
 
-    # 1. Check working tree
+    # 1. Check working tree. uv sync writes uv.lock, which the repository
+    # does not track, so an untracked uv.lock is not a local change.
     if not force:
         result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=str(repo_root), capture_output=True, text=True,
         )
-        if result.stdout.strip():
+        changes = [line for line in result.stdout.splitlines() if line.strip() and line.strip() != "?? uv.lock"]
+        if changes:
             console.print("[red][X] Local changes present[/red] — commit, stash, or use --force.")
-            console.print(escape(result.stdout))
+            console.print(escape("\n".join(changes)))
             raise typer.Exit(code=1)
 
     # 2. Check tray liveness
@@ -1951,38 +1955,60 @@ def update(
             cwd=str(repo_root),
         )
 
-    # 5. Reinstall
-    console.print("[bold]Reinstalling dependencies...[/bold]")
-    result = subprocess.run(
-        [str(python_path), "-m", "pip", "install", "-e", ".[dev]"],
-        cwd=str(repo_root), capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        console.print(f"[red][X] pip install failed:[/red] {escape(result.stderr.strip())}")
-        raise typer.Exit(code=1)
-    console.print("[green][OK][/green] Dependencies reinstalled.")
-
-    # 6. Doctor
-    console.print("[bold]Verifying environment...[/bold]")
-    result = subprocess.run(
-        [str(python_path), "-P", "-m", "devgraph.cli.main", "doctor"],
-        cwd=str(repo_root), capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        console.print("[red]doctor reported issues:[/red]")
-        console.print(escape(result.stdout))
-        raise typer.Exit(code=1)
-    console.print("[green][OK][/green] All checks passed.")
-
-    # 7. Restart tray
-    if was_running:
-        console.print("[bold]Restarting tray app...[/bold]")
-        subprocess.run(
-            [str(python_path), "-P", "-m", "devgraph.cli.main", "tray", "start"],
-            cwd=str(repo_root),
+    try:
+        # 5. Reinstall
+        console.print(f"[bold]Reinstalling dependencies[/bold] ({escape(' '.join(reinstall[1:3]))})...")
+        # UV_PROJECT_ENVIRONMENT: sync the environment DevGraph runs from,
+        # not a fresh .venv, when that is somewhere else
+        result = subprocess.run(
+            reinstall, cwd=str(repo_root), capture_output=True, text=True,
+            env={**os.environ, "UV_PROJECT_ENVIRONMENT": sys.prefix},
         )
+        if result.returncode != 0:
+            console.print(f"[red][X] {escape(' '.join(reinstall[1:3]))} failed:[/red] {escape(result.stderr.strip())}")
+            raise typer.Exit(code=1)
+        console.print("[green][OK][/green] Dependencies reinstalled.")
+
+        # 6. Doctor
+        console.print("[bold]Verifying environment...[/bold]")
+        result = subprocess.run(
+            [str(python_path), "-P", "-m", "devgraph.cli.main", "doctor"],
+            cwd=str(repo_root), capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            console.print("[red]doctor reported issues:[/red]")
+            console.print(escape(result.stdout))
+            raise typer.Exit(code=1)
+        console.print("[green][OK][/green] All checks passed.")
+    finally:
+        # 7. Restart the tray this command stopped, whatever happened above:
+        # a failed reinstall used to leave it stopped.
+        if was_running:
+            console.print("[bold]Restarting tray app...[/bold]")
+            subprocess.run(
+                [str(python_path), "-P", "-m", "devgraph.cli.main", "tray", "start"],
+                cwd=str(repo_root),
+            )
 
     console.print("[green]Update complete.[/green]")
+
+
+def _reinstall_command(venv: Path, python_path: Path) -> list[str]:
+    """How `update` reinstalls DevGraph into the environment at `venv`.
+
+    `uv sync --extra dev` when uv created it (its pyvenv.cfg has a `uv`
+    line; such an environment has no pip) and uv is on PATH, else
+    `python -m pip install -e .[dev]`.
+    """
+    uv = shutil.which("uv")
+    try:
+        cfg = (venv / "pyvenv.cfg").read_text(encoding="utf-8")
+    except OSError:
+        cfg = ""
+    made_by_uv = any(line.split("=", 1)[0].strip() == "uv" for line in cfg.splitlines())
+    if uv and made_by_uv:
+        return [uv, "sync", "--extra", "dev"]
+    return [str(python_path), "-m", "pip", "install", "-e", ".[dev]"]
 
 
 class _ConfigGroup(TyperGroup):
