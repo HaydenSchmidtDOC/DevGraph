@@ -758,7 +758,7 @@ def _print_unwatched_repos(settings, mark: str) -> int:
         noun = "repository" if len(issues) == 1 else "repositories"
         console.print(f"  [yellow][!] running, but not watching {len(issues)} {noun}[/yellow]")
         for repo_id, problem in sorted(issues.items()):
-            console.print(f"    [yellow]{mark} {escape(repo_id)}:[/yellow] {escape(problem)}", soft_wrap=True)
+            console.print(f"    [yellow]{escape(mark)} {escape(repo_id)}:[/yellow] {escape(problem)}", soft_wrap=True)
     return len(issues)
 
 
