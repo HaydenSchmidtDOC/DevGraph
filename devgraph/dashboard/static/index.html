@@ -2815,7 +2815,10 @@ async function populateRealRepos(fireChangeEvent) {
   // no saved choice at all) falls back to the first repository, or to All
   // Repos when none is left.
   select.value = ids.includes(current) || (current === "__all__" && saved) ? current : (ids[0] ?? "__all__");
-  if (saved !== select.value) localStorage.setItem(SELECTED_REPO_KEY, select.value);
+  // Only a user's choice is remembered: a saved repository that is gone is
+  // forgotten, and the fallback is not saved in its place -- saving All Repos
+  // on an empty registry used to pin it after the first registration.
+  if (saved && saved !== select.value) localStorage.removeItem(SELECTED_REPO_KEY);
   select.themeRefresh?.();
   // Boot passes fireChangeEvent:false and does its own explicit, awaited
   // refreshGraph call right after (see below) -- dispatching here too used
@@ -2825,7 +2828,11 @@ async function populateRealRepos(fireChangeEvent) {
   // dimmed instead of reconciled. The SSE registry_changed handler is the
   // only other caller and still wants the dispatch -- nothing else reloads
   // the graph after it changes the repo list.
-  if (fireChangeEvent !== false) select.dispatchEvent(new Event("change", { bubbles: true }));
+  if (fireChangeEvent !== false) {
+    const change = new Event("change", { bubbles: true });
+    change.automatic = true; // onRepoSelectChange: not the user's choice, don't save it
+    select.dispatchEvent(change);
+  }
 }
 const legendStatus = document.getElementById("neo4jStatusLegend");
 /* Named rather than an inline IIFE so the boot path -- including the
@@ -3037,7 +3044,7 @@ document.getElementById("graphSearch").addEventListener("input", e => {
 document.getElementById("pullTab").addEventListener("click", () => document.getElementById("controlFlyout").classList.toggle("open"));
 async function onRepoSelectChange(e) {
   const v = e.target.value;
-  localStorage.setItem(SELECTED_REPO_KEY, v);
+  if (!e.automatic) localStorage.setItem(SELECTED_REPO_KEY, v);
   applyCatchUpPill(null);
   if (neo4jConnected) await loadSchemaTypes(v); // before the graph fetch, so a type the new repo lacks is no longer isolated
   const loaded = await refreshGraph("full", true, true); // switching repos is a deliberate scope change, not an incremental update -- always caps the displayed set to it, even in highlight mode
