@@ -407,6 +407,10 @@ def test_a_directory_pin_seeks_its_files_not_every_node_of_the_name(engine, repo
     ]
     for row in rows:
         row["from_file"] = row["origin"] = "main.go"
+    # A plan cached by an earlier test of the same row shape, made while the
+    # label held a few nodes, can seek (repo_id, name) and filter the file;
+    # profile this graph's own plan.
+    engine.run_cypher("CALL db.clearQueryCaches()")
     hits: list[int] = []
     real = ManagedTransaction.run
 
