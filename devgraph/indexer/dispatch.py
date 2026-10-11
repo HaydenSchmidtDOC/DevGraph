@@ -1247,12 +1247,10 @@ def _batch_nodes(
     code symbols and Modules, docs notes, Markdown Document nodes, compose
     Services and schema-provider nodes -- the same provenance, with the same
     `file`, that list_file_nodes snapshots. A shared node a batch file claims
-    (a `Datastore`, `Endpoint` or handler stub, or a compose/Containerfile
-    `Container`) has `file` "", as list_file_nodes gives it, so one whose
-    last claim went and came back is added. Other file-less nodes (a C++
-    out-of-class method's Class stub) are left out: they have no
-    provenance to compare against, so they would look newly added on every
-    save."""
+    (a `Datastore`, `Endpoint`, handler stub or C++ out-of-class method's
+    Class stub, or a compose/Containerfile `Container`) has `file` "", as
+    list_file_nodes gives it, so one whose last claim went and came back is
+    added."""
     nodes = {
         (node["label"], node["name"], rel_path if node["label"] == "Module" else node["properties"]["file"])
         for extractions in code_extractions

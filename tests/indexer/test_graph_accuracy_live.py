@@ -1547,3 +1547,62 @@ def test_failed_full_scan_leaves_the_index_unstamped(engine, repo_id, tmp_path, 
         scan(engine, repo_id, tmp_path)
     assert not engine.index_format(repo_id)  # 0: unstamped while the scan ran
     assert dispatch.index_outdated(engine, repo_id)
+
+
+WIDGET_H = "class Widget {\npublic:\n  void draw();\n};\n"
+WIDGET_CPP = '#include "widget.h"\n\nvoid Widget::draw() {}\n'
+GADGET_H = '#include "widget.h"\n\nclass Gadget : public Widget {};\n'
+
+
+def _widget_nodes(engine, repo_id):
+    return sorted(
+        (row["file"] or "", row["sources"] or [])
+        for row in engine.run_cypher(
+            "MATCH (n:Class {repo_id: $r, name: 'Widget'}) RETURN n.file AS file, n.sources AS sources",
+            {"r": repo_id},
+        )
+    )
+
+
+# Each step is the files written (or removed, None) and whether the batch is split per path.
+@pytest.mark.parametrize("steps", [
+    [({"widget.h": WIDGET_H}, False), ({"widget.cpp": WIDGET_CPP}, False)],
+    [({"widget.cpp": WIDGET_CPP}, False), ({"widget.h": WIDGET_H}, False)],
+    [({"widget.h": WIDGET_H, "widget.cpp": WIDGET_CPP}, True)],
+    [({"widget.h": WIDGET_H, "widget.cpp": WIDGET_CPP}, False), ({"widget.cpp": None}, False)],
+    [({"widget.cpp": WIDGET_CPP}, False), ({"widget.cpp": None}, False)],
+    [({"widget.h": WIDGET_H, "widget.cpp": WIDGET_CPP}, False), ({"widget.cpp": None}, False),
+     ({"widget.cpp": WIDGET_CPP}, False)],
+    [({"widget.h": WIDGET_H, "widget.cpp": WIDGET_CPP}, False), ({"widget.h": None}, False),
+     ({"widget.h": WIDGET_H}, False)],
+    [({"widget.h": WIDGET_H, "widget.cpp": WIDGET_CPP}, False),
+     ({"widget.cpp": "void Widget::draw() {}\n"}, False)],
+], ids=["header-first", "cpp-first", "split", "cpp-removed", "only-cpp-removed", "cpp-restored",
+        "header-restored", "cpp-edited"])
+def test_a_cpp_out_of_class_definition_keeps_its_own_class_stub(engine, repo_id, tmp_path, steps):
+    """`void Widget::draw() {}` claims a file-less Class stub, like a route's
+    handler stub: it never merges onto the header's Class, and it goes with
+    its last claimant, whatever the order and batching."""
+    write(tmp_path, "gadget.h", GADGET_H)
+    scan(engine, repo_id, tmp_path)
+    for files, split in steps:
+        for rel, text in files.items():
+            if text is None:
+                (tmp_path / rel).unlink()
+            else:
+                write(tmp_path, rel, text)
+        gone = {tmp_path / rel for rel, text in files.items() if text is None}
+        changed = {tmp_path / rel for rel, text in files.items() if text is not None}
+        if split:
+            for path in sorted(changed):
+                index_paths(engine, repo_id, tmp_path, {path})
+        else:
+            if gone:
+                remove_paths(engine, repo_id, tmp_path, gone)
+            if changed:
+                index_paths(engine, repo_id, tmp_path, changed)
+        incremental_equals_fresh(engine, repo_id, tmp_path)
+    expected = [("", ["widget.cpp"])] if (tmp_path / "widget.cpp").exists() else []
+    if (tmp_path / "widget.h").exists():
+        expected.append(("widget.h", []))
+    assert _widget_nodes(engine, repo_id) == expected

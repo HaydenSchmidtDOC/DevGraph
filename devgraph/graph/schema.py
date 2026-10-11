@@ -111,11 +111,12 @@ SOURCE_FILE_LABELS: tuple[str, ...] = (
 )
 # Shared nodes several files can claim through `source`/`sources` (see
 # graph/engine.py `_claim_nodes_tx`): Container, Endpoint, a route's
-# file-less handler-stub Function, every datastore type (Cache included,
-# though it is not in NODE_LABELS), and the file-less Service an older index
-# wrote. Every claimed node has a `source` (its first claim's).
+# file-less handler-stub Function, a C++ out-of-class method's file-less
+# Class stub, every datastore type (Cache included, though it is not in
+# NODE_LABELS), and the file-less Service an older index wrote. Every
+# claimed node has a `source` (its first claim's).
 CLAIMED_LABELS: tuple[str, ...] = (
-    "Container", "Endpoint", "Function", "Service", "Database", "VectorStore", "Queue", "Cache",
+    "Container", "Endpoint", "Class", "Function", "Service", "Database", "VectorStore", "Queue", "Cache",
 )
 # Every built-in label with a `(repo_id, name)` index: the uniqueness
 # constraints' and the file-scoped lookups', and Cache's own (it has no

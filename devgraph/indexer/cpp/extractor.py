@@ -66,10 +66,11 @@ heuristic, not a semantic one: it does not require (or verify) that a class
 named 'Inner' was actually declared in this same file. When it wasn't (e.g.
 the class lives in a header this file doesn't happen to also be extracting
 in the same batch), a minimal stub Class node is still emitted so the
-Function's CONTAINS edge has a real endpoint to MATCH onto — Neo4j's
-`SET n += properties` merge (see GraphEngine.upsert_nodes) means this stub
-never clobbers the fuller Class node the header's own extraction writes,
-regardless of which file is indexed first or second.
+Function's CONTAINS edge has a real endpoint to MATCH onto. The stub is
+file-less and carries `source`, so it is a shared node the file claims
+(GraphEngine._claim_nodes_tx), like a route's handler stub: it never merges
+onto the header's own Class, whichever file is indexed first, and it goes
+with its last claimant.
 """
 
 from __future__ import annotations
@@ -671,7 +672,7 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                 label="Class",
                 repo_id=repo_id,
                 name=class_name,
-                properties={"type": "class"},
+                properties={"type": "class", "source": file_path},
             )
         )
 
