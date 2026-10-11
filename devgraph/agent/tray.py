@@ -226,6 +226,9 @@ class TrayApp:
         self._refresh_icon()
 
     def _health_check_loop(self) -> None:
+        # Beat once before the first Neo4j check, which can take a while
+        # (driver retries): `devgraph tray start` waits for this to say OK.
+        self._write_heartbeat()
         while not self._stop_event.is_set():
             try:
                 self._engine.verify_connectivity()
