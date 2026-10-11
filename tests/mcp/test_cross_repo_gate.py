@@ -51,7 +51,7 @@ class _RecordingEngine:
         raise AssertionError("built-in tools must not use the unbounded run_cypher")
 
 
-def _server(engine, tmp_path, monkeypatch, *, allow, repos=("demo", "other")):
+def _server(engine, tmp_path, monkeypatch, *, allow, repos=("demo", "other"), inactive=()):
     monkeypatch.setattr(
         mcp_server, "get_settings",
         lambda: Settings(registry_db_path=tmp_path / "r.sqlite3", allow_cross_repo=allow),
@@ -59,7 +59,7 @@ def _server(engine, tmp_path, monkeypatch, *, allow, repos=("demo", "other")):
     records = []
     for name in repos:
         (tmp_path / name).mkdir(exist_ok=True)
-        records.append(_Repo(name, tmp_path / name))
+        records.append(_Repo(name, tmp_path / name, active=name not in inactive))
     return mcp_server.build_server(engine, _Registry(records), session_repo=records[0], session_source="env")
 
 
@@ -146,3 +146,13 @@ def test_live_cross_repo_search_skips_unregistered_repositories(live_engine, tmp
     finally:
         for repo in (registered, orphan):
             live_engine.delete_repository(repo)
+
+
+
+def test_a_deactivated_repository_is_outside_the_cross_repo_bound(tmp_path, monkeypatch):
+    """The same set the dashboard's All Repos shows: active registered repositories."""
+    engine = _RecordingEngine()
+    server = _server(engine, tmp_path, monkeypatch, allow=True, repos=("demo", "other", "paused"), inactive=("paused",))
+    assert _call(server, "list_services", {"cross_repo": True}).is_error is False
+    ((_, params),) = engine.calls
+    assert sorted(params["cross_repo_ids"]) == ["demo", "other"]

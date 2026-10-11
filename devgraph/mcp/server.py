@@ -391,7 +391,7 @@ def _with_cross_repo_gate(fn: Callable[..., Any], allow: bool, registry: Any) ->
 
     `cross_repo=True` raises the ToolError `CROSS_REPO_DISABLED` while the setting
     is off; `fn` never runs. With it on, `fn` runs with `tools.cross_repo_ids` set to
-    every registered repository's id, so a cross-repo query never reaches a
+    every active registered repository's id (the dashboard's All Repos set), so a cross-repo query never reaches a
     repository left in the graph after it was unregistered. Calls without
     `cross_repo` pass through untouched. MCP always calls by keyword.
     """
@@ -402,7 +402,7 @@ def _with_cross_repo_gate(fn: Callable[..., Any], allow: bool, registry: Any) ->
             return fn(*args, **kwargs)
         if not allow:
             raise ToolError(CROSS_REPO_DISABLED)
-        token = devgraph_tools.cross_repo_ids.set([r.repo_id for r in registry.list_repos()])
+        token = devgraph_tools.cross_repo_ids.set([r.repo_id for r in registry.list_repos(active_only=True)])
         try:
             return fn(*args, **kwargs)
         finally:
