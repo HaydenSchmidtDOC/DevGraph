@@ -7,6 +7,7 @@ Debounces events and invokes a callback with the set of changed file paths.
 from __future__ import annotations
 
 import errno
+import functools
 import logging
 import os
 import sys
@@ -48,9 +49,15 @@ RECONCILE_RETRY_DELAYS_S = (0.5, 1.0, 2.0, 4.0)
 #: rest to its retry: a persistent failure must not be repeated per folder.
 MAX_SCHEDULE_FAILURES_PER_RECONCILE = 3
 
-#: Whether a repository is watched by one recursive watch on its root (Linux)
-#: rather than one per top-level folder (elsewhere). See `_start_single`.
-ROOT_WATCH = sys.platform.startswith("linux")
+def _inotify_supported() -> bool:
+    """Linux, with the watchdog internals devgraph/watcher/inotify.py needs."""
+    if not sys.platform.startswith("linux"):
+        return False
+    from devgraph.watcher import inotify
+
+    if not inotify.SUPPORTED:
+        logger.warning("This watchdog lacks the internals DevGraph's inotify watch needs; watching per folder")
+    return inotify.SUPPORTED
 
 #: How long after `.git/index.lock` is released a HEAD or ref change still
 #: counts as part of the same git operation (W6).
@@ -306,7 +313,7 @@ class WatcherManager:
         on_catch_up: Callable[..., None] | None = None,
         git_catch_up_delay_s: float = 2.0,
         now: Callable[[], float] = time.time,
-        root_watch: bool = ROOT_WATCH,
+        root_watch: bool | None = None,
     ) -> None:
         """Initialize the watcher manager.
 
@@ -328,8 +335,8 @@ class WatcherManager:
             git_catch_up_delay_s: How long after a git burst its catch-up runs.
             now: The wall clock, in seconds; tests inject it.
             root_watch: Watch each repository with one recursive watch on
-                its root (Linux), not one per top-level folder. See
-                `_start_single`.
+                its root, not one per top-level folder. See `_start_single`.
+                By default, on Linux when watchdog has the internals it needs.
         """
         self._registry = registry
         self._on_changes = on_changes
@@ -343,9 +350,12 @@ class WatcherManager:
         # Track repos with path issues (e.g. missing directory) so they don't
         # crash the whole watcher. Maps repo_id -> error message.
         self._repo_issues: dict[str, str] = {}
+        # Guards _repo_issues alone (innermost): an emitter reports problems
+        # from watchdog's reader thread, where taking _lock could deadlock.
+        self._issues_lock = threading.Lock()
         self._timer_factory = timer_factory
         self._reconcile_delay_s = reconcile_delay_s
-        self._root_watch = root_watch
+        self._root_watch = _inotify_supported() if root_watch is None else root_watch
         # Top-level directory watches per repo: path -> (watch, the directory's
         # identity when scheduled). The root's own non-recursive watch is not
         # listed; it is never reconciled. Empty with `root_watch`.
@@ -595,7 +605,8 @@ class WatcherManager:
             # Stop watchers for repos that are no longer active/watch-enabled
             for repo_id in current_ids - desired_ids:
                 self._stop_single(repo_id)
-                self._repo_issues.pop(repo_id, None)  # Clear any cached issues
+                with self._issues_lock:
+                    self._repo_issues.pop(repo_id, None)  # Clear any cached issues
 
             # Start watchers for new repos
             for repo in repos:
@@ -616,7 +627,8 @@ class WatcherManager:
         # Validate path exists before attempting to watch
         if not repo.path.exists() or not repo.path.is_dir():
             error_msg = f"path does not exist or is not a directory: {repo.path}"
-            self._repo_issues[repo.repo_id] = error_msg
+            with self._issues_lock:
+                self._repo_issues[repo.repo_id] = error_msg
             logger.warning(
                 f"Skipping watcher for {repo.repo_id}: {error_msg}"
             )
@@ -647,7 +659,7 @@ class WatcherManager:
                 now=self._now,
                 max_wait_ms=self._max_wait_ms,
             )
-        observer = self._new_observer(repo.path, watch_git=git_handler is not None)
+        observer = self._new_observer(repo.repo_id, repo.path, watch_git=git_handler is not None)
         root_watch: ObservedWatch | None = None
         watches: dict[Path, tuple[ObservedWatch, tuple[int, int] | None]] = {}
         try:
@@ -706,7 +718,8 @@ class WatcherManager:
             if git_handler is not None:
                 git_handler.close()
             error_msg = _watch_problem(e)
-            self._repo_issues[repo.repo_id] = error_msg
+            with self._issues_lock:
+                self._repo_issues[repo.repo_id] = error_msg
             logger.warning(f"Skipping watcher for {repo.repo_id}: {error_msg}")
             return
         self._observers[repo.repo_id] = observer
@@ -717,7 +730,8 @@ class WatcherManager:
         if git_handler is not None:
             self._git_handlers[repo.repo_id] = git_handler
         # Clear any cached issues now that watch started successfully
-        self._repo_issues.pop(repo.repo_id, None)
+        with self._issues_lock:
+            self._repo_issues.pop(repo.repo_id, None)
         logger.debug(f"Started watcher for {repo.repo_id} at {repo.path}")
         if self._on_catch_up is not None:
             repo_id = repo.repo_id
@@ -759,15 +773,34 @@ class WatcherManager:
             observer.join(timeout=5)
         logger.debug(f"Stopped watcher for {repo_id}")
 
-    def _new_observer(self, root: Path, *, watch_git: bool) -> Any:
-        """The observer for one repository. On Linux its emitters close what
-        they opened when they fail to start, and with `root_watch` its watch
-        on `root` skips ignored folders, except the git state when `watch_git`."""
+    def _new_observer(self, repo_id: str, root: Path, *, watch_git: bool) -> Any:
+        """The observer for one repository. On Linux (with the watchdog
+        internals it needs) its emitters close what they opened when they
+        fail to start and report problems (`_inotify_problem`), and with
+        `root_watch` its watch on `root` skips ignored folders, except the git
+        state when `watch_git`."""
         if sys.platform.startswith("linux"):
-            from devgraph.watcher.inotify import new_observer
+            from devgraph.watcher import inotify
 
-            return new_observer(root if self._root_watch else None, watch_git=watch_git)
+            if inotify.SUPPORTED:
+                return inotify.new_observer(
+                    root if self._root_watch else None,
+                    watch_git=watch_git,
+                    report=functools.partial(self._inotify_problem, repo_id),
+                )
         return Observer()
+
+    def _inotify_problem(self, repo_id: str, kind: str, error: BaseException) -> None:
+        """An emitter's report, from watchdog's reader thread (which may hold
+        its inotify lock): so it takes only `_issues_lock` and the catch-up
+        lock, never `_lock`."""
+        if kind == "broken":
+            problem = f"watching stopped: {error!r}; restart the agent"
+            logger.error("Watching %s stopped: watchdog's reader failed", repo_id, exc_info=error)
+        else:
+            return
+        with self._issues_lock:
+            self._repo_issues[repo_id] = problem
 
     def _desired_dirs(self, root: Path) -> set[Path]:
         """The root's children that get their own recursive watch: real
@@ -963,7 +996,7 @@ class WatcherManager:
         Returns:
             Dict mapping repo_id -> error message for repos that couldn't be watched.
         """
-        with self._lock:
+        with self._issues_lock:
             return dict(self._repo_issues.items())
 
 

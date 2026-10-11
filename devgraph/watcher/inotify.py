@@ -23,8 +23,10 @@ repository costs one inotify instance. Watches on any other path are not
 filtered.
 
 It overrides watchdog internals (`Inotify._add_watch`, `_add_dir_watch`,
-`_wd_for_path`, `InotifyBuffer.__init__`); watchdog is pinned below 7 in
-pyproject.
+`_wd_for_path`, `_closed`, `InotifyBuffer.__init__`); watchdog is pinned to
+6.x in pyproject, and `SUPPORTED` checks they are there at import (without
+them the watcher uses per-folder watches). An exception in watchdog's reader
+is reported to the watcher, which records it as a repository issue.
 """
 
 from __future__ import annotations
@@ -48,6 +50,31 @@ from devgraph.indexer.gitignore import is_gitignored
 from devgraph.indexer.walk import is_ignored_path
 
 logger = logging.getLogger(__name__)
+
+#: How the emitter tells the watcher about a problem: (kind, error). Kinds:
+#: "broken" (watchdog's reader raised; its thread ends, so nothing is watched
+#: from then on).
+Report = Callable[[str, BaseException], None]
+
+
+def supports(inotify_cls: Any, buffer_cls: Any) -> bool:
+    """Whether watchdog has the internals this module overrides. 5.0.2, for
+    one, has no `Inotify._closed`; the root watch's emitter would kill its
+    reader thread there, so the watcher falls back to per-folder watches."""
+    try:
+        names = set(inotify_cls.__init__.__code__.co_names)
+    except AttributeError:
+        return False
+    methods = ("_add_dir_watch", "_add_watch", "read_events")
+    return (
+        {"_closed", "_wd_for_path", "_path_for_wd", "_path"} <= names
+        and all(callable(getattr(inotify_cls, name, None)) for name in methods)
+        and isinstance(getattr(buffer_cls, "delay", None), (int, float))
+    )
+
+
+#: Whether the installed watchdog can carry the root watch (see `supports`).
+SUPPORTED = supports(Inotify, InotifyBuffer)
 
 
 #: The folders of a repository's git state the root watch keeps, with
@@ -79,9 +106,16 @@ class _FilteredInotify(Inotify):
     """`Inotify` that never puts a folder `skip` accepts under a kernel watch."""
 
     def __init__(
-        self, path: bytes, *, recursive: bool, event_mask: int | None, skip: Callable[[bytes], bool] | None
+        self,
+        path: bytes,
+        *,
+        recursive: bool,
+        event_mask: int | None,
+        skip: Callable[[bytes], bool] | None,
+        report: Report | None = None,
     ) -> None:
         self._skip = skip
+        self._report = report
         # Stand-in watch descriptors for skipped folders, below -1 (the
         # kernel's are positive; -1 marks an overflow): see `_add_watch`.
         self._placeholders: list[int] = []
@@ -139,6 +173,17 @@ class _FilteredInotify(Inotify):
         return super()._add_watch(path, mask)
 
     def read_events(self, *, event_buffer_size: int = DEFAULT_EVENT_BUFFER_SIZE) -> list[InotifyEvent]:
+        """watchdog's, plus the placeholder cleanup and moved-in folders
+        below. An exception ends the reader thread, so it is reported first:
+        otherwise watching would stop without a word."""
+        try:
+            return self._read_events(event_buffer_size)
+        except Exception as e:
+            if self._report is not None:
+                self._report("broken", e)
+            raise
+
+    def _read_events(self, event_buffer_size: int) -> list[InotifyEvent]:
         events = super().read_events(event_buffer_size=event_buffer_size)
         with self._lock:
             for wd in self._placeholders:
@@ -174,11 +219,17 @@ class _FilteredInotifyBuffer(InotifyBuffer):
     """`InotifyBuffer` over a `_FilteredInotify`; its __init__, with that one change."""
 
     def __init__(
-        self, path: bytes, *, recursive: bool, event_mask: int | None, skip: Callable[[bytes], bool] | None
+        self,
+        path: bytes,
+        *,
+        recursive: bool,
+        event_mask: int | None,
+        skip: Callable[[bytes], bool] | None,
+        report: Report | None,
     ) -> None:
         BaseThread.__init__(self)
         self._queue = DelayedQueue["InotifyEvent | tuple[InotifyEvent, InotifyEvent]"](self.delay)
-        self._inotify = _FilteredInotify(path, recursive=recursive, event_mask=event_mask, skip=skip)
+        self._inotify = _FilteredInotify(path, recursive=recursive, event_mask=event_mask, skip=skip, report=report)
         self.start()
 
 
@@ -195,8 +246,10 @@ class FilteredInotifyEmitter(InotifyEmitter):
         event_filter: Any = None,
         filter_root: Path | None = None,
         watch_git: bool = False,
+        report: Report | None = None,
     ) -> None:
         super().__init__(event_queue, watch, timeout=timeout, event_filter=event_filter)
+        self._report = report
         self._skip = (
             ignored_folder_filter(filter_root, watch_git=watch_git)
             if filter_root is not None and Path(watch.path) == filter_root
@@ -209,6 +262,7 @@ class FilteredInotifyEmitter(InotifyEmitter):
             recursive=self.watch.is_recursive,
             event_mask=self.get_event_mask_from_filter(),
             skip=self._skip,
+            report=self._report,
         )
 
     def add_missing_watches(self) -> list[Path]:
@@ -219,9 +273,11 @@ class FilteredInotifyEmitter(InotifyEmitter):
         return [Path(os.fsdecode(p)) for p in buffer._inotify.add_missing_watches()]
 
 
-def new_observer(filter_root: Path | None, *, watch_git: bool = False) -> BaseObserver:
+def new_observer(filter_root: Path | None, *, watch_git: bool = False, report: Report | None = None) -> BaseObserver:
     """An observer whose watch on `filter_root` skips ignored folders (but,
-    with `watch_git`, keeps the git state), and whose every watch closes what
-    it opened when it can't start."""
-    emitter_class = functools.partial(FilteredInotifyEmitter, filter_root=filter_root, watch_git=watch_git)
+    with `watch_git`, keeps the git state), whose every watch closes what it
+    opened when it can't start, and which tells `report` about problems."""
+    emitter_class = functools.partial(
+        FilteredInotifyEmitter, filter_root=filter_root, watch_git=watch_git, report=report
+    )
     return BaseObserver(emitter_class, timeout=DEFAULT_OBSERVER_TIMEOUT)  # type: ignore[arg-type]

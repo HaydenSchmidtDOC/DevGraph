@@ -240,3 +240,61 @@ def test_git_state_changes_reach_the_git_handler_and_nothing_else_does(tmp_path)
     finally:
         manager.stop()
         registry.close()
+
+
+def test_the_internals_check_rejects_a_watchdog_without_them():
+    """The root watch overrides watchdog internals; a watchdog without them
+    (5.0.2 has no `Inotify._closed`) must not be used for it."""
+    from watchdog.observers.inotify_buffer import InotifyBuffer
+    from watchdog.observers.inotify_c import Inotify
+
+    from devgraph.watcher import inotify
+
+    class OldInotify:
+        def __init__(self):
+            self._wd_for_path = {}
+
+        def _add_dir_watch(self): ...
+
+        def _add_watch(self): ...
+
+        def read_events(self): ...
+
+    assert inotify.supports(Inotify, InotifyBuffer)
+    assert not inotify.supports(OldInotify, InotifyBuffer)
+    assert not inotify.supports(Inotify, object)
+
+
+def test_without_the_internals_the_watcher_falls_back_to_per_folder_watches(tmp_path, monkeypatch):
+    from devgraph.watcher import inotify
+
+    monkeypatch.setattr(inotify, "SUPPORTED", False)
+    w = Watching(tmp_path, make_repo(tmp_path, "repo", 2), git=False)
+    w.manager.start()
+    try:
+        assert w.manager._root_watches == {}
+        assert set(w.manager._watches[w.repo_id]) == {w.root / "pkg0", w.root / "pkg1"}
+        time.sleep(0.3)
+        (w.root / "pkg1/m.py").write_text("x = 2\n")
+        wait_for(lambda: "pkg1/m.py" in w.seen(), lambda: f"the edit; got {w.seen()}")
+    finally:
+        w.close()
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_an_error_inside_watchdog_is_reported_not_silent(tmp_path, monkeypatch):
+    """An exception in watchdog's reader ends its thread: nothing is watched
+    from then on, so it is a repository issue, not a silent stop."""
+    from watchdog.observers import inotify_c
+
+    def broken(self, **_kwargs):
+        raise KeyError(b"/somewhere")
+
+    monkeypatch.setattr(inotify_c.Inotify, "read_events", broken)
+    w = Watching(tmp_path, make_repo(tmp_path, "repo", 1))
+    w.manager.start()
+    try:
+        wait_for(lambda: w.repo_id in w.manager.get_repo_issues(), "the issue")
+        assert w.manager.get_repo_issues()[w.repo_id].startswith("watching stopped: KeyError")
+    finally:
+        w.close()
