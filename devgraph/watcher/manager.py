@@ -609,8 +609,11 @@ class WatcherManager:
             # Stop watchers for repos that are no longer active/watch-enabled
             for repo_id in current_ids - desired_ids:
                 self._stop_single(repo_id)
-                with self._issues_lock:
-                    self._repo_issues.pop(repo_id, None)  # Clear any cached issues
+            # ...and forget their issues, including those of repos that never
+            # started (a missing folder, an inotify limit).
+            with self._issues_lock:
+                for repo_id in set(self._repo_issues) - desired_ids:
+                    del self._repo_issues[repo_id]
 
             # Start watchers for new repos
             for repo in repos:

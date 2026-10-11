@@ -742,12 +742,23 @@ def _tray_liveness_text(settings) -> str:
 def _watcher_issues(settings) -> dict[str, str]:
     """The repositories the running agent's watcher isn't watching, and why
     (a missing folder, an inotify limit), from the repo_issues.json it writes
-    with its heartbeat."""
+    with its heartbeat; only those still registered, active and watched (the
+    file can predate a `remove` or `watch disable`)."""
     try:
         issues = json.loads((settings.registry_db_path.parent / "repo_issues.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return {str(k): str(v) for k, v in issues.items()} if isinstance(issues, dict) else {}
+    if not isinstance(issues, dict):
+        return {}
+    try:
+        registry = RepoRegistry(settings.registry_db_path)
+        try:
+            watched = {r.repo_id for r in registry.list_repos(active_only=True) if r.watch_enabled}
+        finally:
+            registry.close()
+    except Exception:
+        watched = set(map(str, issues))
+    return {str(k): str(v) for k, v in issues.items() if str(k) in watched}
 
 
 def _print_unwatched_repos(settings, mark: str) -> int:

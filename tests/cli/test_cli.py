@@ -2195,3 +2195,27 @@ def test_doctor_fails_a_repository_the_watcher_is_not_watching(runner, temp_regi
     assert "running, but not watching 1 repository" in watcher
     assert f"[X] {repo_id}: {UNWATCHED}" in watcher
     assert result.exit_code == 1
+
+
+def test_status_and_doctor_ignore_issues_of_repositories_no_longer_watched(runner, temp_registry_db, temp_git_repo):
+    """repo_issues.json is written by the agent every few seconds: an issue
+    of a repository removed, deactivated or unwatched since is stale."""
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.disable_watch(repo_id)
+    registry.close()
+    settings = _agent_running_with_issues(db_path, {repo_id: UNWATCHED, "removed-repo": UNWATCHED})
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=settings), \
+         patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine", _stub_engine(None)), \
+         patch.object(cli_main, "resolve_podman", return_value=None):
+        status = runner.invoke(app, ["status"])
+        doctor = runner.invoke(app, ["doctor"])
+
+    for result in (status, doctor):
+        watcher = _collapsed(result.stdout.split("Live Watcher", 1)[1])
+        assert "[OK] running" in watcher and "not watching" not in watcher, watcher
