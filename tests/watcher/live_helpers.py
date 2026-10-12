@@ -193,6 +193,11 @@ class LiveAgents:
     def stop(self, agent) -> None:
         self._running.remove(agent)
         agent.stop()
+        # The agent's shutdown is bounded: a query still running then is
+        # abandoned, not waited for, and lands whenever it finishes. Wait for
+        # it here (the engine already refuses new sessions), so the caller's
+        # cleanup deletes the repository after its last write, not before.
+        agent._engine.close(timeout=60)
 
     def stop_all(self) -> None:
         for agent in list(self._running):

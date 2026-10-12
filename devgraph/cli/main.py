@@ -1147,9 +1147,9 @@ def doctor() -> None:
     Checks Python version, the installed `mcp` package, MCP server
     importability, Neo4j reachability + schema, Podman container state, the
     repo registry, each registered repository's folder (present and
-    readable), each repository's optional `devgraph.schema.yaml`, and tray
-    liveness — continuing past non-fatal failures so one run surfaces
-    everything at once. Intended for bootstrap/troubleshooting moments;
+    readable), each repository's optional `devgraph.schema.yaml`, graph data
+    of unregistered repositories, and tray liveness — continuing past
+    non-fatal failures so one run surfaces everything at once. Intended for bootstrap/troubleshooting moments;
     `status` stays the fast/lightweight command for quick glances.
     """
     settings = get_settings()
@@ -1246,10 +1246,12 @@ def doctor() -> None:
     # 7. Registry reachability
     console.print("[bold]Registry[/bold]")
     registered_repos: list[Any] = []
+    registry_read = False
     try:
         registry = _get_registry()
         try:
             registered_repos = registry.list_repos()
+            registry_read = True
             console.print(f"  [green][OK][/green] {len(registered_repos)} repo(s) registered at {escape(str(settings.registry_db_path))}")
         finally:
             registry.close()
@@ -1422,6 +1424,30 @@ def doctor() -> None:
                     f"`devgraph rescan {subject} --now`"
                 )
             console.print(f"  [yellow][!] {subject}:[/yellow] {detail}", soft_wrap=True)
+
+    # 7e. Graph data of repositories no longer registered: a removal while
+    # Neo4j was down (`remove --keep-graph`), or a write that landed after
+    # `devgraph remove` deleted the graph. Needs the graph and the registry.
+    console.print("[bold]Orphaned graph data[/bold]")
+    if not neo4j_reachable or not registry_read:
+        console.print("  [yellow]skipped[/yellow]: needs both Neo4j and the registry")
+    else:
+        orphan_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+        try:
+            orphaned = sorted(orphan_engine.graph_repo_ids() - {r.repo_id for r in registered_repos})
+        except Exception as e:
+            orphaned = None
+            console.print(f"  [yellow][!][/yellow] could not check: {escape(str(e))}")
+        finally:
+            orphan_engine.close()
+        if orphaned == []:
+            console.print("  [green][OK][/green] no graph data of unregistered repositories")
+        elif orphaned:
+            console.print(
+                f"  [yellow][!][/yellow] graph data of {len(orphaned)} unregistered repo_id(s): "
+                f"{escape(', '.join(orphaned))}; delete it with `devgraph prune`",
+                soft_wrap=True,
+            )
 
     # 8. Tray/watcher liveness
     console.print("[bold]Live Watcher[/bold]")
@@ -3227,12 +3253,9 @@ def prune(
         raise typer.Exit(code=1)
 
     try:
-        # Find all Repository nodes in Neo4j
-        repo_rows = engine.run_cypher(
-            "MATCH (n:Repository) RETURN n.repo_id AS repo_id"
-        )
-        neo4j_ids = {row["repo_id"] for row in repo_rows if row.get("repo_id")}
-        orphaned = neo4j_ids - registered_ids
+        # Every repo_id in the graph, including nodes left without their
+        # Repository node by a write that landed after a removal.
+        orphaned = engine.graph_repo_ids() - registered_ids
 
         if not orphaned:
             console.print("[green]No orphaned repos found.[/green]")

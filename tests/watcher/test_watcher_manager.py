@@ -600,3 +600,116 @@ def test_refresh_drops_the_issue_of_a_repo_no_longer_watched(temp_registry_db, t
         assert watcher.get_repo_issues() == {}
     finally:
         watcher.stop()
+
+
+def test_watcher_manager_purges_a_removed_repo_only_after_its_running_job(temp_registry_db, temp_git_repo):
+    """`devgraph remove` deletes the graph from another process while a batch
+    may still be writing. When refresh() sees the repo gone from the registry,
+    it stops the repo's watcher and calls `on_removed` under the batch lock:
+    after the running job has finished, so nothing it writes outlives the purge."""
+    registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    holding, release, job_done = threading.Event(), threading.Event(), threading.Event()
+    removed: list[tuple[str, bool]] = []
+
+    def on_removed(rid: str) -> None:
+        removed.append((rid, job_done.is_set()))
+
+    watcher = WatcherManager(registry, lambda *a: None, on_removed=on_removed)
+    watcher.start()
+    try:
+        def job() -> None:
+            holding.set()
+            release.wait(5)
+            job_done.set()
+
+        holder = threading.Thread(target=watcher.run_exclusive, args=(repo_id, job))
+        holder.start()
+        assert holding.wait(5)
+        registry.remove_repo(repo_id)
+        watcher.refresh()
+        time.sleep(0.3)
+        assert removed == []  # still waiting for the job
+        release.set()
+        holder.join(5)
+        deadline = time.monotonic() + 5
+        while not removed and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert removed == [(repo_id, True)]
+    finally:
+        release.set()
+        watcher.stop()
+
+
+def test_watcher_manager_does_not_purge_a_repo_that_is_only_unwatched(temp_registry_db, temp_git_repo):
+    registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    removed: list[str] = []
+    watcher = WatcherManager(registry, lambda *a: None, on_removed=removed.append)
+    watcher.start()
+    try:
+        registry.disable_watch(repo_id)
+        watcher.refresh()
+        time.sleep(0.3)
+        assert removed == []
+    finally:
+        watcher.stop()
+
+
+def test_watcher_manager_stop_keeps_a_waiting_purge_from_running(temp_registry_db, temp_git_repo):
+    """A purge still waiting for the batch lock when stop() runs never runs:
+    the agent closes the graph engine right after stop."""
+    registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    removed: list[str] = []
+    watcher = WatcherManager(registry, lambda *a: None, on_removed=removed.append)
+    watcher.start()
+    holding, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        holding.set()
+        release.wait(5)
+
+    holder = threading.Thread(target=watcher.run_exclusive, args=(repo_id, hold))
+    holder.start()
+    assert holding.wait(5)
+    registry.remove_repo(repo_id)
+    watcher.refresh()
+    threading.Timer(0.3, release.set).start()
+    watcher.stop()
+    holder.join(5)
+    time.sleep(0.2)
+    assert removed == []
+
+
+def test_watcher_manager_skips_a_git_sync_for_a_repo_removed_while_it_waited(temp_registry_db, temp_git_repo):
+    """A never-indexed repo's git burst syncs under the batch lock; a sync
+    that got the lock after the repo was removed writes nothing."""
+    registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    syncs: list[str] = []
+    watcher = WatcherManager(
+        registry, lambda *a: None, on_git_state_changed=syncs.append, on_catch_up=lambda *a: False
+    )
+    watcher.start()
+    try:
+        holding, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            holding.set()
+            release.wait(5)
+
+        holder = threading.Thread(target=watcher.run_exclusive, args=(repo_id, hold))
+        holder.start()
+        assert holding.wait(5)
+        burst = threading.Thread(target=watcher._on_git_burst, args=(repo_id, None))
+        burst.start()
+        time.sleep(0.2)
+        registry.remove_repo(repo_id)
+        release.set()
+        burst.join(5)
+        holder.join(5)
+        assert syncs == []
+    finally:
+        release.set()
+        watcher.stop()

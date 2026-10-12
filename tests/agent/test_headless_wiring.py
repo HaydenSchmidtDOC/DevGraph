@@ -15,6 +15,7 @@ def test_headless_agent_wires_repo_sync_and_the_watcher():
         kwargs = watcher_cls.call_args.kwargs
         assert kwargs["on_changes"] == agent._sync.on_changes
         assert kwargs["on_catch_up"] == agent._sync.on_catch_up
+        assert kwargs["on_removed"] == agent._sync.on_removed
         since = datetime(2026, 10, 7, tzinfo=timezone.utc)
         agent._sync._request_catch_up("r", since, 30.0)
         agent._watcher.request_catch_up.assert_called_once_with("r", since, 30.0)

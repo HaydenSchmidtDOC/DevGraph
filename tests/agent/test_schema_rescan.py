@@ -28,6 +28,9 @@ class Registry:
     def list_repos(self, active_only=False):
         return list(self.repos)
 
+    def get(self, repo_id):
+        return next((r for r in self.repos if r.repo_id == repo_id), None)
+
     def mark_indexed(self, repo_id, at=None):
         self.marked.append(repo_id)
         self.stamps.append(at)
@@ -376,3 +379,20 @@ def test_a_rescan_waiting_on_the_batch_lock_at_stop_never_starts(monkeypatch, tm
     threading.Timer(0.3, lock.release).start()
     sched.stop()
     assert state["scans"] == []
+
+
+def test_a_rescan_of_a_repo_removed_while_it_waited_on_the_batch_lock_never_starts(monkeypatch, tmp_path):
+    """`devgraph remove` (another process) may unregister the repo while the
+    pass waits on the batch lock: the scan then writes nothing, or its nodes
+    would outlive the removal's delete."""
+    state = setup(monkeypatch, tmp_path)
+    registry = Registry([Repo("r", tmp_path)])
+
+    def run_exclusive(repo_id, fn):
+        registry.repos.clear()  # removed while waiting
+        return fn()
+
+    sched = SchemaRescanScheduler(None, registry, quiet_s=0, clock=Clock(), run_exclusive=run_exclusive)
+    sched.run_once()
+    assert sched.run_once() == []
+    assert state["scans"] == [] and registry.marked == []

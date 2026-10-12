@@ -157,3 +157,16 @@ def test_communities_json_is_capped_at_fifty(engine):
     assert summary["community_count"] == 60
     raw = engine.read_insights_summary(REPO)
     assert len(json.loads(raw["communities"])) == 50
+
+
+def test_a_refresh_of_a_deleted_repository_does_not_recreate_it(engine):
+    """A refresh that lands after `devgraph remove` deleted the graph only
+    updates nodes that still exist: it never brings back a Repository node."""
+    import uuid
+
+    repo = f"_smoketest_insights_removed_{uuid.uuid4().hex[:8]}"
+    try:
+        refresh_insights(engine, repo)
+        assert engine.run_cypher("MATCH (n {repo_id: $r}) RETURN count(n) AS c", {"r": repo}) == [{"c": 0}]
+    finally:
+        engine.delete_repository(repo)

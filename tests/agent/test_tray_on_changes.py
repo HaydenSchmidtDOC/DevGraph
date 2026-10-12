@@ -94,6 +94,7 @@ class TestWiring:
         kwargs = tray.WatcherManager.call_args.kwargs
         assert kwargs["on_changes"] == tray_app._sync.on_changes
         assert kwargs["on_catch_up"] == tray_app._sync.on_catch_up
+        assert kwargs["on_removed"] == tray_app._sync.on_removed
         since = datetime(2026, 10, 7, tzinfo=timezone.utc)
         tray_app._sync.retry_failed()  # nothing floored yet
         tray_app._watcher.request_catch_up.assert_not_called()
