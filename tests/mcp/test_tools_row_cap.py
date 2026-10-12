@@ -14,6 +14,8 @@ class _Overflowing:
 
     def run_read_cypher(self, query, params, *, timeout_s, max_rows):
         self.queries.append((query, max_rows))
+        if "AS label, n.file AS file" in query:  # find_callers' target lookup: one target
+            return [{"label": "Function", "file": "a.py"}], False
         if max_rows != tools.LIST_ROW_LIMIT:  # list_recent_changes' commit cutoff lookup
             return [], False
         return [{"name": f"n{i}", "type": ["Function"], "repo_id": "demo", "file": "a.py"} for i in range(max_rows)], True

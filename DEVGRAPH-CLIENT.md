@@ -253,6 +253,17 @@ id (for example `ADR-013`). Passing the wrong
 kind of identifier looks like an empty/broken result but is a usage
 mismatch, not a graph gap.
 
+**Same-named targets**: `find_callers`, `impact_analysis` and
+`find_related_files` take an optional `file` (the target's repo-relative
+path) to pick one of several functions or classes with the same name. Without
+it, a name defined in more than one file is answered for all of them, with the
+same rows as before, but every row adds `target_files`, the files of the
+targets it belongs to (in `find_related_files` a row becomes
+`{"name", "target_files"}`); `impact_analysis` traces each file's target apart
+and reports the riskiest one's `risk_level`; and the response adds
+`ambiguous_targets` (`{label, file}`, at most 20). A name defined in one file
+answers as before, with no `target_files`.
+
 **Response shape (`count`/`results`/`truncated`)**: `search_component`,
 `find_callers`, `list_services`, `find_related_prs`, `issue_history_for`
 return `{"count": N, "results": [...], "truncated": bool}` instead of a bare

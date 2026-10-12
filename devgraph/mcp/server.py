@@ -640,6 +640,7 @@ def build_server(
         scope_to_class: str | None = None,
         modified_within_commits: int | None = None,
         resolved_only: bool = False,
+        file: str | None = None,
     ) -> dict[str, Any]:
         """Find all callers of a target; returns {count, results, truncated}, each caller
         with its name, type, repo_id, file and confidence, most certain first. Calls
@@ -653,17 +654,24 @@ def build_server(
         modified_within_commits to restrict to targets touched within the last N
         commits repo-wide (requires git-history recency staging; entities never staged
         are excluded, not silently included). An unknown target is an error with similar
-        names; a known one nothing calls is count 0."""
+        names; a known one nothing calls is count 0. When the name is defined in several
+        files, pass file (the target's repo-relative path) to pick one; without it each
+        caller adds target_files (the files of the targets it calls) and
+        ambiguous_targets lists them."""
         return devgraph_tools.find_callers(
             engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits,
-            resolved_only,
+            resolved_only, file,
         )
 
     @server.tool(annotations=_READ_ONLY)
-    def find_related_files(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
+    def find_related_files(
+        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None
+    ) -> dict[str, Any]:
         """Find related files; each list returns {count, results, truncated} envelope. An
-        unknown component is an error with similar names."""
-        return devgraph_tools.find_related_files(engine, repo_id, component_name, cross_repo, max_results)
+        unknown component is an error with similar names. When the name is defined in
+        several files, pass file (repo-relative path) to pick one; without it each row is
+        {name, target_files} and ambiguous_targets lists them."""
+        return devgraph_tools.find_related_files(engine, repo_id, component_name, cross_repo, max_results, file)
 
     @server.tool(annotations=_READ_ONLY)
     def summarise_repository(repo_id: str) -> dict[str, Any]:
@@ -687,12 +695,17 @@ def build_server(
         return devgraph_tools.compare_branches(engine, registry, repo_id, branch_a, branch_b)
 
     @server.tool(annotations=_READ_ONLY)
-    def impact_analysis(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
+    def impact_analysis(
+        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None
+    ) -> dict[str, Any]:
         """Analyze component impact: direct dependents (one CALLS/USES/DEPENDS_ON hop) and
         transitive ones (two to four hops; further ones are not followed). Dependents
         wrapped in {count, results, truncated} envelopes. An unknown component is an
-        error with similar names."""
-        return devgraph_tools.impact_analysis(engine, repo_id, component_name, cross_repo, max_results)
+        error with similar names. When the name is defined in several files, pass file
+        (repo-relative path) to pick one; without it each file's are traced apart, every
+        dependent adds target_files (the files of the targets it depends on), risk_level
+        is the riskiest one's, and ambiguous_targets lists them."""
+        return devgraph_tools.impact_analysis(engine, repo_id, component_name, cross_repo, max_results, file)
 
     @server.tool(annotations=_READ_ONLY)
     def impact_analysis_for_diff(
