@@ -588,16 +588,16 @@ def test_a_batch_that_fails_after_writing_match_keys_rekeys_again(engine, repo_i
     _write(tmp_path, "lib/b.py", _f("N:A"))
     with monkeypatch.context() as patch:
         if fails == "keys":
-            real, calls = engine_module._retry_transient, []
+            real, calls = engine_module._run, []
 
-            def flaky(fn, query, *args, **kwargs):
+            def flaky(session, query, **params):
                 if "mkeys_stale = CASE" in query:
                     calls.append(query)
                     if len(calls) == 2:
                         raise RuntimeError("down")
-                return real(fn, query, *args, **kwargs)
+                return real(session, query, **params)
 
-            patch.setattr(engine_module, "_retry_transient", flaky)
+            patch.setattr(engine_module, "_run", flaky)
         else:
             method = "upsert_relationships" if fails == "pass 2" else "settle_match_keys"
             patch.setattr(type(engine), method, lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("down")))
