@@ -714,7 +714,7 @@ def test_cli_client_config_mcp_add_only(runner, temp_registry_db):
         assert result.exit_code == 0, f"stdout: {result.stdout}"
         # Rich's console may soft-wrap a long line across multiple terminal
         # rows — join before asserting on content rather than counting lines.
-        collapsed = " ".join(l.strip() for l in result.stdout.strip().splitlines())
+        collapsed = " ".join(line.strip() for line in result.stdout.strip().splitlines())
         assert collapsed.startswith("claude mcp add -s user devgraph")
         assert collapsed.endswith('" -P -m devgraph.mcp.server')
 

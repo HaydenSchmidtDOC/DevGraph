@@ -526,10 +526,10 @@ def _clean_docstring(raw: str) -> str:
     lines = text.split("\n")
     # Dedent using the minimum indentation of non-blank lines after the first
     # (PEP 257: the first line typically starts right after the opening quote).
-    non_first = [l for l in lines[1:] if l.strip()]
+    non_first = [line for line in lines[1:] if line.strip()]
     if non_first:
-        indent = min(len(l) - len(l.lstrip()) for l in non_first)
-        lines = [lines[0]] + [l[indent:] if len(l) >= indent else l for l in lines[1:]]
+        indent = min(len(line) - len(line.lstrip()) for line in non_first)
+        lines = [lines[0]] + [line[indent:] if len(line) >= indent else line for line in lines[1:]]
     return "\n".join(lines).strip()
 
 

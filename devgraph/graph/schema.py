@@ -90,7 +90,7 @@ INTERNAL_EDGE_PROPERTIES: frozenset[str] = frozenset({"origins"})
 
 # Labels other than Repository must be uniquely keyed on (repo_id, name)
 # so incremental MERGE writes update in place instead of duplicating.
-_REPO_SCOPED_LABELS = tuple(l for l in NODE_LABELS if l != "Repository")
+_REPO_SCOPED_LABELS = tuple(label for label in NODE_LABELS if label != "Repository")
 
 # Class/Function/Service are keyed on (repo_id, name, file) instead: a bare
 # name isn't unique across files (two files can each define a function

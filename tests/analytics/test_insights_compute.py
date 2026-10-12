@@ -117,7 +117,10 @@ def test_betweenness_is_sampled_only_above_256_nodes(monkeypatch):
         return real(graph, **kwargs)
 
     monkeypatch.setattr(insights.nx, "betweenness_centrality", spy)
-    chain = lambda n: ([node(f"n{i:03}") for i in range(n)], [edge(f"n{i:03}", f"n{i + 1:03}") for i in range(n - 1)])
+
+    def chain(n):
+        return [node(f"n{i:03}") for i in range(n)], [edge(f"n{i:03}", f"n{i + 1:03}") for i in range(n - 1)]
+
     compute_insights(*chain(10))
     compute_insights(*chain(300))
     assert seen == [None, 256]

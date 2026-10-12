@@ -2055,7 +2055,7 @@ def get_source(
         return empty
 
     def label_of(row: dict[str, Any]) -> str:
-        return next((l for l in row["labels"] if l in ("Function", "Class")), row["labels"][0])
+        return next((label for label in row["labels"] if label in ("Function", "Class")), row["labels"][0])
 
     if len(results) > 1:
         candidates = [
