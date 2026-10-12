@@ -125,6 +125,32 @@ def test_records_failing_as_they_are_read_are_retried(monkeypatch):
     assert len(driver.runs) == 2
 
 
+def _rekeyed(count: int) -> list:
+    return [("Function", f"f{i}", "a.cs", ("Ns:A",), True) for i in range(count)]
+
+
+def test_a_match_key_chunk_failing_as_it_executes_is_retried(monkeypatch):
+    """write_match_keys runs one statement per chunk of nodes: the last
+    chunk's deadlock is retried as that chunk, not lost when the session
+    closes."""
+    monkeypatch.setattr(engine_module, "RETRACT_NODES", 2)
+    engine, driver = fake_engine(monkeypatch, [None, TransientError("deadlock"), None])
+    engine.write_match_keys("r", _rekeyed(3))
+    assert len(driver.runs) == 3
+    assert driver.runs[1] == driver.runs[2]
+
+
+def test_a_match_key_chunk_that_keeps_failing_raises(monkeypatch):
+    monkeypatch.setattr(engine_module, "RETRACT_NODES", 2)
+    engine, driver = fake_engine(monkeypatch, [None] + [TransientError("lock timeout")] * 10)
+    with pytest.raises(TransientError):
+        engine.write_match_keys("r", _rekeyed(3))
+    assert len(driver.runs) == 1 + engine_module._MAX_RETRIES + 1
+    engine, driver = fake_engine(monkeypatch, [ConstraintError("bad")])
+    with pytest.raises(ConstraintError):
+        engine.settle_match_keys("r", [("Function", "f", "a.cs")])
+
+
 @pytest.fixture
 def engine():
     test_engine = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")

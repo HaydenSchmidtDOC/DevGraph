@@ -1795,15 +1795,16 @@ class GraphEngine:
     def _per_label_chunk(self, repo_id: str, nodes: list[tuple[tuple[str, str, str], dict]], update: str) -> None:
         """Run `update` on each (label, name, file) node `b`, with its own
         `row` fields, RETRACT_NODES nodes per transaction (see
-        write_match_keys)."""
+        write_match_keys), each consumed inside its retry (`_run`), so a
+        chunk that fails, the last one included, raises."""
         groups: dict[str, list[dict[str, Any]]] = {}
         for (label, name, file), fields in nodes:
             groups.setdefault(label, []).append({"name": name, "file": file, **fields})
         with self._driver.session() as session:
             for label, rows in sorted(groups.items()):
                 for start in range(0, len(rows), RETRACT_NODES):
-                    _retry_transient(
-                        session.run,
+                    _run(
+                        session,
                         f"UNWIND $rows AS row MATCH (b:{label} {{repo_id: $repo_id, name: row.name, file: row.file}}) "
                         f"USING INDEX SEEK b:{label}(repo_id, name, file) " + update,
                         repo_id=repo_id,
