@@ -746,9 +746,10 @@ table.dstable input[type="text"] { width: 100%; }
           <p class="desc">Global start/stop calls the same path as <code>devgraph tray start/stop</code> — there's no separate global-watch flag independent of per-repo toggles.</p>
           <div class="card" style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px"><div><div style="font-weight:510">Tray watcher</div><span class="status-live">running</span></div><button class="btn btn-sm">Stop</button></div>
           <div class="card field-grid">
-            <div class="field"><label><span class="lbl-txt">watch_debounce_ms<span class="qmark" data-tip="Milliseconds the watcher waits after a filesystem event before triggering a re-index.">?</span></span></label><input type="number" id="cfgWatchDebounceMs" value="500" /></div>
-            <div class="field"><label><span class="lbl-txt">watch_max_wait_ms<span class="qmark" data-tip="The longest a file change waits while events keep arriving within the debounce of each other (a log or build output written continuously): it is re-indexed at least this often. DEVGRAPH_WATCH_MAX_WAIT_MS.">?</span></span></label><input type="number" id="cfgWatchMaxWaitMs" value="5000" /></div>
-            <div class="field"><label><span class="lbl-txt">health_check_interval_s<span class="qmark" data-tip="How often the tray checks that the watcher process is still alive and responsive.">?</span></span></label><input type="number" id="cfgHealthCheckIntervalS" value="30" /></div>
+            <p class="desc" style="grid-column:1/-1">Read-only: set with <code>DEVGRAPH_WATCH_DEBOUNCE_MS</code>, <code>DEVGRAPH_WATCH_MAX_WAIT_MS</code> and <code>DEVGRAPH_HEALTH_CHECK_INTERVAL_S</code> (environment or <code>.env</code>).<span id="watcherSettingsError" hidden> Couldn't load settings.</span></p>
+            <div class="field"><label><span class="lbl-txt">watch_debounce_ms<span class="qmark" data-tip="Milliseconds the watcher waits after a filesystem event before triggering a re-index.">?</span></span></label><input type="number" id="cfgWatchDebounceMs" disabled /></div>
+            <div class="field"><label><span class="lbl-txt">watch_max_wait_ms<span class="qmark" data-tip="The longest a file change waits while events keep arriving within the debounce of each other (a log or build output written continuously): it is re-indexed at least this often. DEVGRAPH_WATCH_MAX_WAIT_MS.">?</span></span></label><input type="number" id="cfgWatchMaxWaitMs" disabled /></div>
+            <div class="field"><label><span class="lbl-txt">health_check_interval_s<span class="qmark" data-tip="How often the tray checks that the watcher process is still alive and responsive.">?</span></span></label><input type="number" id="cfgHealthCheckIntervalS" disabled /></div>
           </div>
         </div>
 
@@ -6050,7 +6051,9 @@ async function loadTopologyCounts() {
    backend or shown here; the masked dots are just a placeholder. ── */
 async function loadDashboardSettings() {
   try {
-    const s = await fetch("/api/settings").then(r => r.json());
+    const resp = await fetch("/api/settings");
+    if (!resp.ok) throw new Error(`/api/settings: ${resp.status}`);
+    const s = await resp.json();
     const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
     setVal("cfgNeo4jUri", s.neo4j_uri);
     setVal("cfgNeo4jUser", s.neo4j_user);
@@ -6073,7 +6076,11 @@ async function loadDashboardSettings() {
       if (!input) return;
       if (input.type === "checkbox") input.checked = !!value; else input.value = value;
     });
-  } catch (e) { /* panes fall back to their static placeholder values */ }
+  } catch (e) {
+    // The other panes fall back to their static placeholder values; the
+    // Watcher pane's timings have none, so it says why they are empty.
+    document.getElementById("watcherSettingsError").hidden = false;
+  }
 }
 loadDashboardSettings();
 
