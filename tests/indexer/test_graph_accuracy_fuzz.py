@@ -51,7 +51,6 @@ The spec's "Out of scope" gaps are left out by construction:
 
 import os
 import random
-import uuid
 from dataclasses import dataclass, field, replace
 
 import pytest
@@ -65,7 +64,13 @@ from devgraph.indexer.dispatch import (
     remove_paths,
     sync_resolver_config,
 )
-from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
+from tests.watcher.live_helpers import (
+    fresh_snapshot,
+    graph_snapshot,
+    live_repo_id,
+    snapshot_diff,
+    sweep_stale_live_repos,
+)
 
 SEEDS = [int(s) for s in os.environ.get("DEVGRAPH_ACCURACY_FUZZ_SEEDS", "1,2,3").split(",") if s.strip()]
 STEPS = int(os.environ.get("DEVGRAPH_ACCURACY_FUZZ_STEPS", "15"))
@@ -85,7 +90,8 @@ def engine():
 
 @pytest.fixture
 def repo_id(engine):
-    repo = f"zz-accfuzz-{uuid.uuid4().hex[:8]}"
+    sweep_stale_live_repos(engine, "zz-accfuzz")
+    repo = live_repo_id("zz-accfuzz")
     for each in (repo, f"{repo}_fresh"):
         engine.delete_repository(each)
     yield repo

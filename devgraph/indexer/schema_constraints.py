@@ -17,7 +17,7 @@ ever touched.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 
 from devgraph.config.project_schema import (
@@ -213,8 +213,12 @@ def realign_keys(engine: GraphEngine, node_types: Iterable[NodeTypeDecl]) -> lis
     return replaced
 
 
-def constraint_drift(engine: GraphEngine) -> list[dict]:
+def constraint_drift(engine: GraphEngine, repo_ids: Collection[str] | None = None) -> list[dict]:
     """Applied declarations the database does not enforce, for `devgraph doctor`.
+
+    With `repo_ids`, only those repositories' declarations are read, as
+    findings and as the other side of a conflict (doctor passes the registered
+    ones). None reads every repository recorded in the graph.
 
     Per repository and recorded label (with a recorded key): `missing` when
     the generated constraint does not exist (a rescan re-provisions it), and
@@ -229,6 +233,8 @@ def constraint_drift(engine: GraphEngine) -> list[dict]:
     existing = generated_objects(engine)
     drift: list[dict] = []
     for entries in recorded_declarations(engine).values():
+        if repo_ids is not None:
+            entries = [entry for entry in entries if entry[0] in repo_ids]
         for repo_id, label, key in entries:
             if key is None:
                 continue

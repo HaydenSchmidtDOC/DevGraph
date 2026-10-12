@@ -62,7 +62,7 @@ def engine():
 
 @pytest.fixture
 def client(engine, tmp_path, monkeypatch):
-    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3"))
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3", allow_cross_repo=True))
     record = _Repo(REPO, tmp_path)
     server = mcp_server.build_server(engine, _Registry([record]), session_repo=record, session_source="env")
 

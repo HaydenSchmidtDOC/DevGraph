@@ -15,7 +15,28 @@ Source extraction is selected per file, so one repository can mix **Python, Java
 
 ## Quickstart
 
-The interactive installer currently targets Windows PowerShell and requires Python 3.13 or newer, Git, and [Podman](https://podman.io/):
+### Linux
+
+Requires Python 3.13 or newer, Git, [uv](https://docs.astral.sh/uv/), and Podman or Docker:
+
+```bash
+git clone https://github.com/HaydenSchmidtDOC/DevGraph.git && cd DevGraph
+uv sync --extra dev
+podman run -d --name devgraph-neo4j --restart=always \
+  -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 \
+  -e NEO4J_AUTH=neo4j/devgraph-local-dev \
+  -v devgraph_neo4j_data:/data -v devgraph_neo4j_logs:/logs \
+  docker.io/library/neo4j:5.26-community
+uv run devgraph doctor
+uv run devgraph register ~/code/my-repo --full
+uv run devgraph mcp add
+```
+
+`docker run` takes the same arguments. `devgraph mcp add` registers DevGraph with Claude Code for every project (user scope); `devgraph client-config` prints the VS Code entry. Activate the environment (`source .venv/bin/activate`) to drop the `uv run` prefix. Without a desktop tray, the agent runs headless (see `devgraph tray start` below).
+
+### Windows
+
+The interactive installer targets Windows PowerShell and requires Python 3.13 or newer, Git, and [Podman](https://podman.io/):
 
 ```powershell
 irm https://raw.githubusercontent.com/HaydenSchmidtDOC/DevGraph/master/scripts/install.ps1 | iex
@@ -52,20 +73,25 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 | Unregister a repository and delete its graph | `devgraph remove <repo_id> [--keep-graph]` |
 | Recompute communities, key nodes and bridges | `devgraph insights <repo_id>` |
 | Open the dashboard | `devgraph dashboard` |
-| Configure an MCP client | `devgraph client-config`, `devgraph mcp add`, `devgraph mcp doctor` |
+| Start, check or stop the background agent | `devgraph tray start`, `devgraph tray status`, `devgraph tray stop` |
+| Configure an MCP client | `devgraph client-config`, `devgraph mcp add` (Claude Code, user scope: every project), `devgraph mcp doctor` |
 | View settings, project schema, or tray logs | `devgraph config`, `devgraph config show / validate / eject / enable / disable`, `devgraph config schema list / add / edit / delete / reset`, `devgraph config tools list / add / edit / delete / reset`, `devgraph logs` |
 | Export a repository graph | `devgraph export <repo_id> --format json|cypher|dot` |
 | Update DevGraph | `devgraph update` |
 
 `devgraph status` exits non-zero when Neo4j is unreachable or the registry cannot be read, and `devgraph register` when its initial scan fails (the repository stays registered; `devgraph rescan <repo_id>` indexes it once the cause is fixed). A refused Neo4j password names the settings file to fix (`~/.devgraph/.env`, or the folder holding `DEVGRAPH_REGISTRY_DB_PATH`; an environment variable works too). `devgraph remove` needs Neo4j to delete the graph data; with Neo4j down it stops and keeps the repository registered, and `--keep-graph` unregisters it without touching the graph (`devgraph prune` deletes that data once Neo4j is up).
 
-`devgraph update` is the normal update path. It fast-forwards the configured branch, reinstalls DevGraph, runs `doctor`, and restarts the tray app if it was running. Commit or stash local changes first; `--force` only suppresses the dirty-tree guard. The older `scripts/update.ps1` entry point remains available for existing Windows installations.
+`devgraph doctor` treats Podman as informational once Neo4j is reachable (Docker or a native Neo4j is fine), and its schema-constraint check reads only registered repositories, not data a removed repository left in the graph.
+
+`devgraph tray start` reports OK only once the agent has written its first heartbeat, and exits non-zero if it exits during startup or sends none within 30 seconds (`devgraph logs` shows why). `devgraph tray status` exits non-zero when the agent is not running. With no display or no system tray (a Linux server, an SSH session, a desktop without a tray), the same process runs the headless agent instead and `tray start` says so: no icon, but the same watcher, indexer and dashboard, stopped with `devgraph tray stop`. MCP auto-start falls back the same way.
+
+`devgraph update` is the normal update path. It fast-forwards the configured branch, reinstalls DevGraph (`uv sync --extra dev` in an environment uv created, else `pip install -e .[dev]`), runs `doctor`, and restarts the tray app if it was running, even when the reinstall or `doctor` fails. An untracked `uv.lock` (which `uv sync` writes) does not count as a local change. Commit or stash local changes first; `--force` only suppresses the dirty-tree guard. The older `scripts/update.ps1` entry point remains available for existing Windows installations.
 
 ## Operating model
 
 - **Explicit registration.** DevGraph scans and watches only paths added with `devgraph register` or `devgraph add`.
 - **Local-first.** Neo4j, the registry, source reads, and git history stay on the local machine. Telemetry, cloud sync, cross-repository queries, and raw Cypher are off by default.
-- **Repository isolation.** Every graph object carries a `repo_id`. MCP queries stay within that repository unless the caller explicitly opts into a cross-repository query.
+- **Repository isolation.** Every graph object carries a `repo_id`, and each MCP call answers for one repository: the session's, or any registered repository named by an explicit `repo_id` (that is always allowed). `DEVGRAPH_ALLOW_CROSS_REPO` gates only multi-repository aggregation: `cross_repo=true` on a built-in tool is refused with an error unless it is set to `true` for the MCP server, and when it is on, the aggregated answer covers active registered repositories only, never data left in the graph by a repository that was removed. The setting governs MCP tools only: the dashboard is the local user's own view (like its Cypher console), and its "All Repos" scope always shows every registered repository, with the same registered-only bound.
 - **Session repository.** Each MCP session has a repository: `DEVGRAPH_MCP_REPO` (a repo id, or an absolute path inside a registered repository), else the registered repository containing the server's working directory. Built-in MCP tools use it when `repo_id` is omitted, and a dict response then says which repository answered. With no session repository, a call without `repo_id` fails and lists the active registered repositories; DevGraph never picks one for you. A repository registered later needs an MCP server restart. One limitation: `devgraph client-config` starts VS Code's server in the DevGraph checkout, so if that checkout is registered, an unpinned VS Code session defaults to it. Set `DEVGRAPH_MCP_REPO` to avoid that.
 - **Live updates.** Connecting an MCP client starts the tray app when needed. The watcher reindexes file and git-state changes; manual rescans remain safe and idempotent. See [Keeping up with changes](#keeping-up-with-changes).
 - **Purpose-built queries.** MCP clients should use the registered tools and the live `devgraph://tool-catalog` resource rather than relying on a hand-maintained tool count. Built-in tools run their queries read-only with a 30-second timeout; a query that runs longer comes back as `query timed out after 30 s; narrow the request`. `impact_analysis` and `impact_analysis_for_diff` follow transitive dependents at most four hops. `search_component` and the dashboard's search box rank exact name matches first, then name prefixes, then other substrings; each result names its file, and `search_component`'s `count` is the true number of matches unless it says `count_is_lower_bound`. A mistake is an error rather than an empty answer: an unregistered `repo_id`, an unknown component, service, endpoint or design decision (with similar names suggested), or a count argument below its minimum. `trace_request_flow` takes `GET /users/<id>` or a bare `/users/<id>` (every method).
@@ -352,7 +378,7 @@ Exported environment variables override both files.
 
 ## Dashboard
 
-The tray app serves the dashboard at `http://127.0.0.1:8765`. It shows registered repositories, graph and git information, query telemetry, an interactive graph canvas, query-driven highlighting, and saved per-repository layouts. The repository picker can register a local path and run its initial scan; if indexing fails, the registration remains available for retry. Server-Sent Events refresh the view after indexing changes.
+The tray app serves the dashboard at `http://127.0.0.1:8765`. It shows registered repositories, graph and git information, query telemetry, an interactive graph canvas, query-driven highlighting, and saved per-repository layouts. The repository picker lists exactly the registered repositories (with nothing registered it offers only All Repos and the graph says how to register one), and when the selected repository is removed it switches to the first remaining one, or to All Repos. It can register a local path and run its initial scan; if indexing fails, the registration remains available for retry. Server-Sent Events refresh the view after indexing changes.
 
 The Communities card shows each repository's subsystems (Louvain communities over dependency and containment edges), with modularity and the bridges between them; the god-node list ranks by PageRank over dependency edges once these are computed (CALLS edges that match by name only or at package confidence, and IMPORTS edges at package confidence, are left out). A canvas toggle colors nodes by community. DevGraph computes all of this itself — no Neo4j plugin — and the agent refreshes it after indexing; `devgraph insights <repo_id>` recomputes on demand.
 

@@ -15,6 +15,7 @@ import hashlib
 import json
 import pprint
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -35,6 +36,43 @@ _VOLATILE = {"repo_id", "last_modified_by"}
 
 #: How long the live graph must stay equal before it counts as settled.
 SETTLED_S = 1.0
+
+
+#: A live test's repository older than this is from a run killed before its
+#: teardown (no live test runs this long), and the next run's fixture sweeps it.
+STALE_LIVE_REPO_S = 3600
+
+
+def live_repo_id(prefix: str) -> str:
+    """`<prefix>-<epoch seconds>-<random>`: unique, and dated for `sweep_stale_live_repos`."""
+    return f"{prefix}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+
+
+def sweep_stale_live_repos(engine, prefix: str, max_age_s: float = STALE_LIVE_REPO_S) -> list[str]:
+    """Delete the `live_repo_id(prefix)` repositories (and their `_fresh`/`-fresh`
+    copies) made more than `max_age_s` ago, then release the generated
+    constraints of the labels they recorded. Returns the ids deleted.
+
+    Teardown deletes a test's repository, but a killed run never reaches it,
+    and the leftovers sat in the shared Neo4j for `devgraph doctor` to report.
+    A run still in progress is never touched: its ids are younger.
+    """
+    from devgraph.indexer.schema_constraints import release_labels
+
+    rows = engine.run_cypher(
+        "MATCH (r:Repository) WHERE r.repo_id STARTS WITH $p RETURN r.repo_id AS id, r.schema_labels AS labels",
+        {"p": f"{prefix}-"},
+    )
+    now, swept, labels = time.time(), [], set()
+    for row in rows:
+        stamp = row["id"][len(prefix) + 1:].split("-", 1)[0]
+        if stamp.isdigit() and now - int(stamp) > max_age_s:
+            engine.delete_repository(row["id"])
+            swept.append(row["id"])
+            labels.update(row["labels"] or [])
+    if labels:
+        release_labels(engine, labels)
+    return swept
 
 
 def _props_hash(props: dict) -> str:

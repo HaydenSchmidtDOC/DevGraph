@@ -185,14 +185,20 @@ not this literal text):
 - **args**: -P -m devgraph.mcp.server
 - **cwd**: <resolved DevGraph repo root>
 
-claude mcp add devgraph -- "<resolved venv python.exe>" -P -m devgraph.mcp.server
+claude mcp add -s user devgraph -- "<resolved venv python.exe>" -P -m devgraph.mcp.server
 
 VS Code (user mcp.json at <resolved path>):
 { "servers": { "devgraph": { "type": "stdio", "command": "...", "args": [...], "cwd": "..." } } }
 ```
 
-A Claude Code registration made before `-P` was added is left as-is by
-`--run` (an existing entry is skipped); run `claude mcp remove devgraph` and
+Claude Code registration is user-scoped (`-s user`), so one registration
+serves every project; `devgraph mcp add`, `client-config --run`, `mcp doctor`
+and `mcp remove` all use that scope. Older versions ran a bare `claude mcp
+add`, which registers in local scope, for the DevGraph checkout folder only:
+`devgraph mcp add` and `mcp doctor` detect such a registration and print how to
+move it (`claude mcp remove devgraph -s local` in the checkout, then `devgraph
+mcp add`). A user-scope registration made before `-P` was added is left as-is
+by `--run` (an existing entry is skipped); run `devgraph mcp remove` and
 register again to pick it up. The VS Code entry is rewritten in place.
 
 `devgraph client-config --claude-mcp-add-only` prints just the Claude Code
@@ -231,7 +237,9 @@ The server instructions name it, and so does `devgraph://project-tools`.
 
 Never pass `cross_repo: true` unless the user explicitly asks for a
 cross-repository answer — the default is (and must stay) scoped to one
-repository only.
+repository only. It is also refused (a ToolError naming
+`DEVGRAPH_ALLOW_CROSS_REPO`) unless the user has turned that setting on; when
+it is on, results cover registered repositories only.
 
 **Identifier-type nuance**: `find_callers`, `impact_analysis`, and
 `find_related_files` match against function/class **names** only (a file

@@ -379,6 +379,38 @@ def _with_repo_default(
     return wrapper
 
 
+CROSS_REPO_DISABLED = (
+    "cross_repo is disabled: results from other repositories are off unless the user sets "
+    "DEVGRAPH_ALLOW_CROSS_REPO=true for the DevGraph MCP server. Call again without cross_repo "
+    "to answer for this repository."
+)
+
+
+def _with_cross_repo_gate(fn: Callable[..., Any], allow: bool, registry: Any) -> Callable[..., Any]:
+    """Enforce `Settings.allow_cross_repo` on a built-in that takes `cross_repo`.
+
+    `cross_repo=True` raises the ToolError `CROSS_REPO_DISABLED` while the setting
+    is off; `fn` never runs. With it on, `fn` runs with `tools.cross_repo_ids` set to
+    every active registered repository's id (the dashboard's All Repos set), so a cross-repo query never reaches a
+    repository left in the graph after it was unregistered. Calls without
+    `cross_repo` pass through untouched. MCP always calls by keyword.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if not kwargs.get("cross_repo"):
+            return fn(*args, **kwargs)
+        if not allow:
+            raise ToolError(CROSS_REPO_DISABLED)
+        token = devgraph_tools.cross_repo_ids.set([r.repo_id for r in registry.list_repos(active_only=True)])
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            devgraph_tools.cross_repo_ids.reset(token)
+
+    return wrapper
+
+
 def build_server(
     engine: GraphEngine,
     registry: RepoRegistry | None = None,
@@ -465,7 +497,11 @@ def build_server(
         return lambda fn: register(
             _instrument(
                 _with_shadow_notices(
-                    _with_repo_default(fn, session_repo, session_source, registry, unscoped_error),
+                    _with_cross_repo_gate(
+                        _with_repo_default(fn, session_repo, session_source, registry, unscoped_error),
+                        settings.allow_cross_repo,
+                        registry,
+                    ),
                     lambda: status.shadowed,
                 )
             )

@@ -495,15 +495,40 @@ def tray_start() -> None:
     the same way, so most workflows never need to run this by hand — it's
     here for manual control (checking in on it, or running it without an
     MCP client attached).
+
+    With no display or no system tray (a server, an SSH session), the same
+    process runs the headless agent instead: no icon, same watcher, indexer
+    and dashboard. Reports OK only once the agent has written its first
+    heartbeat; exits non-zero if it exits or stays silent.
     """
+    problem = lifecycle.tray_ui_problem()
+    since = datetime.now(timezone.utc)
     started_pid = lifecycle.start_tray_if_not_running()
     if started_pid is None:
         existing_pid = lifecycle.read_tray_pid()
         console.print(f"[yellow]Tray app already running[/yellow] (pid {existing_pid})")
         return
 
-    console.print(f"[green][OK][/green] Tray app started (pid {started_pid})")
-    console.print("  Run 'devgraph status' to confirm the heartbeat once it's up.")
+    what = "Tray app"
+    if problem is not None:
+        what = "Headless agent"
+        console.print(
+            f"[yellow]No system tray available[/yellow] ({escape(problem)}); running the headless agent "
+            "instead: no icon, same watcher, indexer and dashboard. Stop it with 'devgraph tray stop'."
+        )
+    console.print(f"Waiting for the agent's first heartbeat (pid {started_pid})...")
+    outcome = lifecycle.wait_for_tray(started_pid, since)
+    if outcome == "running":
+        console.print(f"[green][OK][/green] {what} started (pid {started_pid})")
+        return
+    if outcome == "exited":
+        console.print(f"[red][X] {what} exited during startup[/red] (pid {started_pid}). See 'devgraph logs'.")
+    else:
+        console.print(
+            f"[red][X] {what} sent no heartbeat within {lifecycle.TRAY_START_TIMEOUT_S:.0f}s[/red] (pid {started_pid}). "
+            "See 'devgraph logs'; 'devgraph tray status' shows whether it is still up."
+        )
+    raise typer.Exit(code=1)
 
 
 @tray_app.command("stop")
@@ -534,12 +559,16 @@ def tray_stop() -> None:
 
 @tray_app.command("status")
 def tray_status() -> None:
-    """Report whether the background tray process (per the PID file) is alive."""
+    """Report whether the background tray process (per the PID file) is alive.
+
+    Exits non-zero when it is not running.
+    """
     pid = lifecycle.read_tray_pid()
     if pid is not None and lifecycle.pid_is_running(pid):
         console.print(f"[green][OK] running[/green] (pid {pid})")
     else:
         console.print("[yellow]not running[/yellow] (start with 'devgraph tray start')")
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -1165,10 +1194,13 @@ def doctor() -> None:
     finally:
         engine.close()
 
-    # 6. Podman container state
+    # 6. Podman container state. Only a problem when Neo4j isn't answering:
+    # with it reachable, Neo4j runs some other way (Docker, a native install).
     console.print("[bold]Podman[/bold]")
     podman_path = resolve_podman()
-    if podman_path is None:
+    if podman_path is None and neo4j_reachable:
+        console.print("  podman not found (not needed: Neo4j is reachable)")
+    elif podman_path is None:
         console.print("  [red][X] podman not found[/red] on PATH or %LOCALAPPDATA%\\Programs\\Podman")
         any_failed = True
     else:
@@ -1183,8 +1215,11 @@ def doctor() -> None:
             else:
                 console.print(f"  [green][OK][/green] {escape(output)}")
         except Exception as e:
-            console.print(f"  [red][X] podman ps failed:[/red] {escape(str(e))}")
-            any_failed = True
+            if neo4j_reachable:
+                console.print(f"  podman ps failed (not needed: Neo4j is reachable): {escape(str(e))}")
+            else:
+                console.print(f"  [red][X] podman ps failed:[/red] {escape(str(e))}")
+                any_failed = True
 
     # 7. Registry reachability
     console.print("[bold]Registry[/bold]")
@@ -1313,7 +1348,9 @@ def doctor() -> None:
         recorded_keys: dict[tuple[str, str], tuple[str, tuple[str, ...] | None]] = {}
         try:
             stale = _stale_schema_objects(constraint_engine, registered_repos)
-            drift = constraint_drift(constraint_engine)
+            # registered repositories only: one left in the graph by a removed
+            # repository or an interrupted test run is not the user's to fix
+            drift = constraint_drift(constraint_engine, {r.repo_id for r in registered_repos})
             if any(finding["status"] == "conflict" for finding in drift):
                 for folded, entries in recorded_declarations(constraint_engine).items():
                     recorded_keys.update(((repo, folded), (label, key)) for repo, label, key in entries)
@@ -1435,20 +1472,76 @@ def _register_vscode(python_path: Path, repo_root: Path) -> bool:
     return True
 
 
+#: Claude Code scope DevGraph registers in: one registration serves every
+#: project. A bare `claude mcp add` registers in local scope, which is tied to
+#: the directory it ran in (the DevGraph checkout) and so serves no other repository.
+CLAUDE_MCP_SCOPE = "user"
+
+
+def _claude_mcp_add_line(python_path: Path) -> str:
+    return f'claude mcp add -s {CLAUDE_MCP_SCOPE} devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
+
+
+def _claude_mcp_registration(claude_path: str, repo_root: Path) -> tuple[str | None, str]:
+    """Where Claude Code has 'devgraph' registered, and `claude mcp get`'s output.
+
+    The scope is "user", "local", "project", "unknown" (registered, but the
+    output names no scope this recognises, or `claude mcp get` did not answer
+    within 60 seconds) or None (not registered). Run from
+    the checkout so a local registration made there by an older `mcp add` is
+    seen, the same answer for `mcp add` and `mcp doctor` wherever they start.
+    """
+    try:
+        # `mcp get` health-checks the server, which can hang
+        result = subprocess.run(
+            [claude_path, "mcp", "get", "devgraph"], cwd=str(repo_root), capture_output=True, text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return "unknown", "'claude mcp get devgraph' did not answer within 60s"
+    if result.returncode != 0:
+        return None, ""
+    output = result.stdout if isinstance(result.stdout, str) else ""
+    for line in output.splitlines():
+        if line.strip().lower().startswith("scope:"):
+            described = line.split(":", 1)[1].strip().lower()
+            for scope in ("user", "local", "project"):
+                if described.startswith(scope):
+                    return scope, output
+    return "unknown", output
+
+
+def _wrong_scope_help(scope: str, repo_root: Path) -> str:
+    """How to move a non-user 'devgraph' registration to user scope."""
+    return (
+        f"'devgraph' is registered with Claude Code in {scope} scope, which serves only "
+        f"{'this checkout' if scope == 'local' else 'projects with that .mcp.json'}, not every repository. "
+        f"To move it to user scope, run 'claude mcp remove devgraph -s {scope}' in {repo_root}, "
+        "then 'devgraph mcp add'."
+    )
+
+
 def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path) -> bool:
-    """Register 'devgraph' with Claude Code via `claude mcp add`, skipping if already registered."""
-    already_registered = subprocess.run(
-        [claude_path, "mcp", "get", "devgraph"],
-        cwd=str(repo_root),
-        capture_output=True,
-    ).returncode == 0
-    if already_registered:
+    """Register 'devgraph' with Claude Code in user scope via `claude mcp add`.
+
+    Skips an existing user-scope registration. A local- or project-scope one
+    is reported with how to move it, and nothing is added: Claude Code
+    prefers it over a user-scope entry in that folder.
+    """
+    scope, output = _claude_mcp_registration(claude_path, repo_root)
+    if scope == "user":
         console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
         return True
-    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
-    console.print(f"\n[bold]Running:[/bold] {escape(mcp_add_line)}")
+    if scope == "unknown":
+        # registered in a scope this can't read, or `mcp get` timed out: leave it alone
+        console.print(f"[yellow][!][/yellow] Claude Code: not adding 'devgraph'; its registration is unclear: {escape(output.strip())}", soft_wrap=True)
+        return True
+    if scope is not None:
+        console.print(f"[yellow][!][/yellow] {escape(_wrong_scope_help(scope, repo_root))}", soft_wrap=True)
+        return False
+    console.print(f"\n[bold]Running:[/bold] {escape(_claude_mcp_add_line(python_path))}")
     result = subprocess.run(
-        [claude_path, "mcp", "add", "devgraph", "--", str(python_path), *MCP_SERVER_ARGS],
+        [claude_path, "mcp", "add", "-s", CLAUDE_MCP_SCOPE, "devgraph", "--", str(python_path), *MCP_SERVER_ARGS],
         cwd=str(repo_root),
     )
     return result.returncode == 0
@@ -1460,7 +1553,7 @@ app.add_typer(mcp_app, name="mcp")
 
 @mcp_app.command(name="add")
 def mcp_add() -> None:
-    """Register DevGraph as an MCP server with Claude Code (runs 'claude mcp add')."""
+    """Register DevGraph as an MCP server for every Claude Code project (runs 'claude mcp add -s user')."""
     claude_path = shutil.which("claude")
     if claude_path is None:
         console.print("[red][X] Error:[/red] 'claude' not found on PATH")
@@ -1471,12 +1564,12 @@ def mcp_add() -> None:
 
 @mcp_app.command(name="remove")
 def mcp_remove() -> None:
-    """Unregister DevGraph's MCP server from Claude Code (runs 'claude mcp remove')."""
+    """Unregister DevGraph's user-scope MCP server from Claude Code (runs 'claude mcp remove -s user')."""
     claude_path = shutil.which("claude")
     if claude_path is None:
         console.print("[red][X] Error:[/red] 'claude' not found on PATH")
         raise typer.Exit(code=1)
-    result = subprocess.run([claude_path, "mcp", "remove", "devgraph"])
+    result = subprocess.run([claude_path, "mcp", "remove", "-s", CLAUDE_MCP_SCOPE, "devgraph"])
     if result.returncode != 0:
         raise typer.Exit(code=1)
     console.print("[green][OK][/green] Removed 'devgraph' from Claude Code")
@@ -1493,12 +1586,14 @@ def mcp_doctor() -> None:
         any_failed = True
     else:
         console.print(f"[green][OK][/green] claude CLI at {escape(claude_path)}")
-        result = subprocess.run(
-            [claude_path, "mcp", "get", "devgraph"], capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            console.print("[green][OK][/green] 'devgraph' registered")
-            console.print(escape(result.stdout.strip()))
+        repo_root = resolve_repo_root()
+        scope, output = _claude_mcp_registration(claude_path, repo_root)
+        if scope in ("user", "unknown"):
+            console.print(f"[green][OK][/green] 'devgraph' registered{' (user scope)' if scope == 'user' else ''}")
+            console.print(escape(output.strip()))
+        elif scope is not None:
+            console.print(f"[red][X][/red] {escape(_wrong_scope_help(scope, repo_root))}", soft_wrap=True)
+            any_failed = True
         else:
             console.print("[red][X][/red] 'devgraph' not registered (run 'devgraph mcp add')")
             any_failed = True
@@ -1540,7 +1635,7 @@ def client_config(
 
     python_path = resolve_venv_python()
     repo_root = resolve_repo_root()
-    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
+    mcp_add_line = _claude_mcp_add_line(python_path)
     want_claude = target in ("claude", "both")
     want_vscode = target in ("vscode", "both")
 
@@ -1820,21 +1915,25 @@ def update(
     """Pull latest from git, reinstall dependencies, and verify.
 
     Port of scripts/update.ps1 into Python. Runs git pull --ff-only,
-    reinstalls the editable package, runs doctor, and restarts the tray
-    if it was running.
+    reinstalls the editable package (`uv sync` in a uv environment, else
+    pip), runs doctor, and restarts the tray if it was running, even when
+    the reinstall or doctor fails.
     """
     repo_root = resolve_repo_root()
     python_path = resolve_venv_python()
+    reinstall = _reinstall_command(Path(sys.prefix), python_path)
 
-    # 1. Check working tree
+    # 1. Check working tree. uv sync writes uv.lock, which the repository
+    # does not track, so an untracked uv.lock is not a local change.
     if not force:
         result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=str(repo_root), capture_output=True, text=True,
         )
-        if result.stdout.strip():
+        changes = [line for line in result.stdout.splitlines() if line.strip() and line.strip() != "?? uv.lock"]
+        if changes:
             console.print("[red][X] Local changes present[/red] — commit, stash, or use --force.")
-            console.print(escape(result.stdout))
+            console.print(escape("\n".join(changes)))
             raise typer.Exit(code=1)
 
     # 2. Check tray liveness
@@ -1866,38 +1965,60 @@ def update(
             cwd=str(repo_root),
         )
 
-    # 5. Reinstall
-    console.print("[bold]Reinstalling dependencies...[/bold]")
-    result = subprocess.run(
-        [str(python_path), "-m", "pip", "install", "-e", ".[dev]"],
-        cwd=str(repo_root), capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        console.print(f"[red][X] pip install failed:[/red] {escape(result.stderr.strip())}")
-        raise typer.Exit(code=1)
-    console.print("[green][OK][/green] Dependencies reinstalled.")
-
-    # 6. Doctor
-    console.print("[bold]Verifying environment...[/bold]")
-    result = subprocess.run(
-        [str(python_path), "-P", "-m", "devgraph.cli.main", "doctor"],
-        cwd=str(repo_root), capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        console.print("[red]doctor reported issues:[/red]")
-        console.print(escape(result.stdout))
-        raise typer.Exit(code=1)
-    console.print("[green][OK][/green] All checks passed.")
-
-    # 7. Restart tray
-    if was_running:
-        console.print("[bold]Restarting tray app...[/bold]")
-        subprocess.run(
-            [str(python_path), "-P", "-m", "devgraph.cli.main", "tray", "start"],
-            cwd=str(repo_root),
+    try:
+        # 5. Reinstall
+        console.print(f"[bold]Reinstalling dependencies[/bold] ({escape(' '.join(reinstall[1:3]))})...")
+        # UV_PROJECT_ENVIRONMENT: sync the environment DevGraph runs from,
+        # not a fresh .venv, when that is somewhere else
+        result = subprocess.run(
+            reinstall, cwd=str(repo_root), capture_output=True, text=True,
+            env={**os.environ, "UV_PROJECT_ENVIRONMENT": sys.prefix},
         )
+        if result.returncode != 0:
+            console.print(f"[red][X] {escape(' '.join(reinstall[1:3]))} failed:[/red] {escape(result.stderr.strip())}")
+            raise typer.Exit(code=1)
+        console.print("[green][OK][/green] Dependencies reinstalled.")
+
+        # 6. Doctor
+        console.print("[bold]Verifying environment...[/bold]")
+        result = subprocess.run(
+            [str(python_path), "-P", "-m", "devgraph.cli.main", "doctor"],
+            cwd=str(repo_root), capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            console.print("[red]doctor reported issues:[/red]")
+            console.print(escape(result.stdout))
+            raise typer.Exit(code=1)
+        console.print("[green][OK][/green] All checks passed.")
+    finally:
+        # 7. Restart the tray this command stopped, whatever happened above:
+        # a failed reinstall used to leave it stopped.
+        if was_running:
+            console.print("[bold]Restarting tray app...[/bold]")
+            subprocess.run(
+                [str(python_path), "-P", "-m", "devgraph.cli.main", "tray", "start"],
+                cwd=str(repo_root),
+            )
 
     console.print("[green]Update complete.[/green]")
+
+
+def _reinstall_command(venv: Path, python_path: Path) -> list[str]:
+    """How `update` reinstalls DevGraph into the environment at `venv`.
+
+    `uv sync --extra dev` when uv created it (its pyvenv.cfg has a `uv`
+    line; such an environment has no pip) and uv is on PATH, else
+    `python -m pip install -e .[dev]`.
+    """
+    uv = shutil.which("uv")
+    try:
+        cfg = (venv / "pyvenv.cfg").read_text(encoding="utf-8")
+    except OSError:
+        cfg = ""
+    made_by_uv = any(line.split("=", 1)[0].strip() == "uv" for line in cfg.splitlines())
+    if uv and made_by_uv:
+        return [uv, "sync", "--extra", "dev"]
+    return [str(python_path), "-m", "pip", "install", "-e", ".[dev]"]
 
 
 class _ConfigGroup(TyperGroup):

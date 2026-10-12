@@ -135,7 +135,7 @@ def engine():
 
 @pytest.fixture
 def make_server(tmp_path, monkeypatch, engine):
-    settings = Settings(registry_db_path=tmp_path / "r.sqlite3", enable_run_cypher=True)
+    settings = Settings(registry_db_path=tmp_path / "r.sqlite3", enable_run_cypher=True, allow_cross_repo=True)
     monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
 
     def make(session_repo=None, session_source="none", registry=None, session_pinned=None):
@@ -158,7 +158,7 @@ def _builtins_with_repo_id():
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp, pytest.MonkeyPatch.context() as mp:
-        settings = Settings(registry_db_path=Path(tmp) / "r.sqlite3", enable_run_cypher=True)
+        settings = Settings(registry_db_path=Path(tmp) / "r.sqlite3", enable_run_cypher=True, allow_cross_repo=True)
         mp.setattr(mcp_server, "get_settings", lambda: settings)
         from devgraph.config import global_tools
 

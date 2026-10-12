@@ -25,7 +25,6 @@ import threading
 import webbrowser
 from datetime import datetime, timezone
 
-import pystray
 import uvicorn
 from PIL import Image, ImageDraw
 
@@ -44,6 +43,27 @@ from devgraph.registry.store import RepoRegistry
 from devgraph.watcher.manager import WatcherManager
 
 logger = logging.getLogger(__name__)
+
+try:
+    import pystray
+except Exception as _exc:  # no display (Xlib DisplayNameError), or no tray backend for this desktop
+    pystray = None
+    _PYSTRAY_PROBLEM: str | None = f"{type(_exc).__name__}: {_exc}"
+else:
+    _PYSTRAY_PROBLEM = None
+
+#: Typographic characters the tray's own text uses, spelled in ASCII.
+_ASCII_PUNCTUATION = str.maketrans({"…": "...", "—": "-", "–": "-", "‘": "'", "’": "'", "“": '"', "”": '"'})
+
+
+def pystray_text(text: str) -> str:
+    """`text` made safe for every pystray backend: pystray's X11 backend
+    encodes the icon title as latin-1 and raised UnicodeEncodeError on the
+    ellipsis in "preparing graph indexes…", killing the tray on start. Common
+    punctuation becomes its ASCII spelling; anything else outside latin-1
+    becomes "?". Every string handed to pystray goes through here."""
+    return text.translate(_ASCII_PUNCTUATION).encode("latin-1", "replace").decode("latin-1")
+
 
 _OK_COLOR = (46, 160, 67)
 _WARN_COLOR = (200, 60, 60)
@@ -206,6 +226,9 @@ class TrayApp:
         self._refresh_icon()
 
     def _health_check_loop(self) -> None:
+        # Beat once before the first Neo4j check, which can take a while
+        # (driver retries): `devgraph tray start` waits for this to say OK.
+        self._write_heartbeat()
         while not self._stop_event.is_set():
             try:
                 self._engine.verify_connectivity()
@@ -309,11 +332,11 @@ class TrayApp:
             return
         color = _OK_COLOR if self._healthy else _WARN_COLOR
         self._icon.icon = _make_icon(color)
-        self._icon.title = self._status_text()
+        self._icon.title = pystray_text(self._status_text())
 
     def _status_text(self) -> str:
         if self._preparing:
-            state = "preparing graph indexes…"
+            state = "preparing graph indexes..."
         elif self._paused:
             state = "paused"
         elif not self._healthy:
@@ -435,14 +458,14 @@ class TrayApp:
             self._dashboard_thread.start()
 
         menu = pystray.Menu(
-            pystray.MenuItem(lambda item: self._status_text(), self._open_dashboard),
+            pystray.MenuItem(lambda item: pystray_text(self._status_text()), self._open_dashboard),
             pystray.MenuItem(
-                lambda item: "Resume watching" if self._paused else "Pause watching",
+                lambda item: pystray_text("Resume watching" if self._paused else "Pause watching"),
                 self._toggle_pause,
             ),
-            pystray.MenuItem("Quit", self._quit),
+            pystray.MenuItem(pystray_text("Quit"), self._quit),
         )
-        self._icon = pystray.Icon("devgraph", _make_icon(_OK_COLOR), self._status_text(), menu)
+        self._icon = pystray.Icon("devgraph", _make_icon(_OK_COLOR), pystray_text(self._status_text()), menu)
         try:
             if self._icon:
                 self._icon.run()
@@ -466,6 +489,15 @@ class TrayApp:
 
 def main() -> None:
     _configure_logging()
+    if pystray is None:
+        # No display or no tray backend (a server, an SSH session, a desktop
+        # without a tray): run the same agent without an icon rather than
+        # failing. `devgraph tray stop` stops it the same way (SIGTERM).
+        from devgraph.agent import headless
+
+        logger.warning("no system tray available (%s); running the headless agent instead", _PYSTRAY_PROBLEM)
+        headless.main()
+        return
     try:
         TrayApp().start()
     except Exception:

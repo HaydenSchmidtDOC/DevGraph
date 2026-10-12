@@ -120,11 +120,12 @@ def repo(tmp_path, engine, live_agent):
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "Start")
     root = root.resolve()
+    live_helpers.sweep_stale_live_repos(engine, "zz-watcher-live")
 
     live_agent.registry_path.parent.mkdir(parents=True)
     registry = RepoRegistry(live_agent.registry_path)
     try:
-        repo_id = registry.add_repo(root, repo_id=f"zz-watcher-live-{_TOKEN}-{uuid.uuid4().hex[:6]}").repo_id
+        repo_id = registry.add_repo(root, repo_id=live_helpers.live_repo_id("zz-watcher-live")).repo_id
         engine.delete_repository(repo_id)
         provision_repository_schema(engine, root)
         engine.upsert_repository(repo_id, repo_id, str(root))
@@ -134,9 +135,13 @@ def repo(tmp_path, engine, live_agent):
     finally:
         registry.close()
     yield root, repo_id
-    live_agent.stop_all()
-    engine.delete_repository(repo_id)
-    engine.delete_repository(f"{repo_id}_fresh")
+    try:
+        live_agent.stop_all()
+    finally:
+        # even when stopping the agent fails: a raise here used to skip these,
+        # leaving every test's repository in the shared graph
+        engine.delete_repository(repo_id)
+        engine.delete_repository(f"{repo_id}_fresh")
 
 
 def catch_up_states(agent, repo_id):

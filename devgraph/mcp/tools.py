@@ -2,7 +2,10 @@
 
 Each tool accepts a GraphEngine and returns structured data without exposing
 raw Cypher to the AI. Tools filter by repo_id by default and support an
-explicit cross_repo flag to opt-in to cross-repository results.
+explicit cross_repo flag to opt-in to cross-repository results. A cross_repo
+query reaches only `cross_repo_ids` (the registered repositories, when called
+through the MCP server, which also refuses cross_repo unless
+DEVGRAPH_ALLOW_CROSS_REPO is on).
 
 All Cypher is parameterized — user input never concatenates directly into
 query strings.
@@ -10,6 +13,7 @@ query strings.
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import os
@@ -113,7 +117,7 @@ def _impact_expansion(cross_repo: bool) -> str:
     and edges within reach; a variable-length path enumerates every path, which
     times out on a common name like `get` in a real repository.
     """
-    scope = "" if cross_repo else "AND d.repo_id = $repo_id"
+    scope = _cross_scope("d", "AND") if cross_repo else "AND d.repo_id = $repo_id"
     parts = []
     for hop in range(1, IMPACT_MAX_DEPTH + 1):
         seen = [f"l{k}" for k in range(hop)]
@@ -145,11 +149,29 @@ def _timeouts_as_tool_errors() -> Iterator[None]:
         raise
 
 
+#: Repository ids a cross_repo query may reach. The MCP server sets it, per
+#: call, to the registered repositories (see `_with_cross_repo_gate` in
+#: server.py); unset -- a direct library call -- it is None and does not restrict.
+cross_repo_ids: ContextVar[list[str] | None] = ContextVar("cross_repo_ids", default=None)
+
+
+def _cross_scope(var: str, keyword: str = "") -> str:
+    """The repo filter a cross_repo query uses in place of `var.repo_id = $repo_id`:
+    any repository in `cross_repo_ids`. `keyword` ("AND"/"WHERE") leads it."""
+    clause = f"({var}.repo_id IS NOT NULL AND ($cross_repo_ids IS NULL OR {var}.repo_id IN $cross_repo_ids))"
+    return f"{keyword} {clause}" if keyword else clause
+
+
+def _with_cross_ids(cypher: str, params: dict[str, Any]) -> dict[str, Any]:
+    """`params` plus `cross_repo_ids` when `cypher` refers to it."""
+    return {**params, "cross_repo_ids": cross_repo_ids.get()} if "$cross_repo_ids" in cypher else params
+
+
 def _query(engine: GraphEngine, cypher: str, params: dict[str, Any]) -> list[dict]:
     """Run a built-in tool's query read-only, bounded in time and rows. A
     timeout or a row overflow becomes a ToolError the client can act on."""
     with _timeouts_as_tool_errors():
-        rows, more = engine.run_read_cypher(cypher, params, timeout_s=BUILTIN_TIMEOUT_S, max_rows=BUILTIN_MAX_ROWS)
+        rows, more = engine.run_read_cypher(cypher, _with_cross_ids(cypher, params), timeout_s=BUILTIN_TIMEOUT_S, max_rows=BUILTIN_MAX_ROWS)
     if more:
         raise ToolError(f"query returned more than {BUILTIN_MAX_ROWS} rows; narrow the request")
     return rows
@@ -164,7 +186,7 @@ def _list_query(engine: GraphEngine, cypher: str, params: dict[str, Any]) -> tup
     """A list-style built-in's query (ending in `LIMIT LIST_ROW_LIMIT + 1`), read
     only, with a timeout: its first `LIST_ROW_LIMIT` rows and whether more exist."""
     with _timeouts_as_tool_errors():
-        return engine.run_read_cypher(cypher, params, timeout_s=BUILTIN_TIMEOUT_S, max_rows=LIST_ROW_LIMIT)
+        return engine.run_read_cypher(cypher, _with_cross_ids(cypher, params), timeout_s=BUILTIN_TIMEOUT_S, max_rows=LIST_ROW_LIMIT)
 
 
 def _capped_envelope(rows: list[Any], more: bool, max_results: int) -> dict[str, Any]:
@@ -349,7 +371,7 @@ def ranked_search(
     count_is_lower_bound): the count is a lower bound when the scan never ran.
     `repo_id` None searches every repository. Labels must be validated identifiers.
     """
-    scope = "n.repo_id = $repo_id" if repo_id is not None else "n.repo_id IS NOT NULL"
+    scope = "n.repo_id = $repo_id" if repo_id is not None else _cross_scope("n")
     if cutoff is not None:
         scope += " AND n.last_modified_at >= $cutoff"
     params: dict[str, Any] = {"repo_id": repo_id, "terms": terms, "names": names, "cutoff": cutoff}
@@ -592,7 +614,7 @@ def _read(engine: GraphEngine, cypher: str, params: dict[str, Any], max_rows: in
     from neo4j.exceptions import Neo4jError
 
     try:
-        return engine.run_read_cypher(cypher, params, timeout_s=DEFAULT_TIMEOUT_S, max_rows=max_rows)
+        return engine.run_read_cypher(cypher, _with_cross_ids(cypher, params), timeout_s=DEFAULT_TIMEOUT_S, max_rows=max_rows)
     except Neo4jError as exc:
         code = str(getattr(exc, "code", None) or "unknown")
         if "TransactionTimedOut" in code:
@@ -737,7 +759,7 @@ def god_nodes(
     _at_least(1, max_results=max_results)
     declared = tuple(d for d in dict.fromkeys(declared_labels) if LABEL_PATTERN.fullmatch(d))
     labels = _DESCRIBE_BUILTIN_LABELS + tuple(d for d in declared if d not in _DESCRIBE_BUILTIN_LABELS)
-    repo_filter = "n.repo_id IS NOT NULL" if cross_repo else "n.repo_id = $repo_id"
+    repo_filter = _cross_scope("n") if cross_repo else "n.repo_id = $repo_id"
     # One branch per label, so each is a label scan rather than a scan of every
     # node; UNION drops a node reached through two of its labels.
     nodes = "\n  UNION\n".join(f"  MATCH (n:`{label}`) WHERE {repo_filter} RETURN n" for label in labels)
@@ -868,8 +890,11 @@ def find_dependency_cycles(
     # predicate below: ALL(nodes(path)) can only be evaluated once a whole
     # path exists, so without this the planner would expand from every node in
     # the database and discard the out-of-repo paths afterwards.
-    start_scope = "" if cross_repo else "AND start.repo_id = $repo_id"
-    path_scope = "" if cross_repo else "WHERE ALL(n IN nodes(path) WHERE n.repo_id = $repo_id)"
+    start_scope = _cross_scope("start", "AND") if cross_repo else "AND start.repo_id = $repo_id"
+    path_scope = (
+        f"WHERE ALL(n IN nodes(path) WHERE {_cross_scope('n')})" if cross_repo
+        else "WHERE ALL(n IN nodes(path) WHERE n.repo_id = $repo_id)"
+    )
     # Lossless prefilter: every node on a cycle of this type necessarily has
     # both an outgoing and an incoming edge of it, so this can only remove
     # nodes that could not have started a cycle — it narrows the scan without
@@ -1037,7 +1062,7 @@ def trace_request_flow(
     Raises:
         ToolError: no endpoint has that name or path.
     """
-    repo_filter = "" if cross_repo else "AND start.repo_id = $repo_id"
+    repo_filter = _cross_scope("start", "AND") if cross_repo else "AND start.repo_id = $repo_id"
     cypher = f"""
     MATCH (start:Endpoint)
     WHERE (start.name = $endpoint OR ($bare AND start.name ENDS WITH ' ' + $endpoint))
@@ -1081,7 +1106,7 @@ def get_service_dependencies(
     Returns:
         Dict with direct_dependencies, transitive_dependencies, and potential_impacts
     """
-    repo_filter = "" if cross_repo else "WHERE s.repo_id = $repo_id"
+    repo_filter = _cross_scope("s", "WHERE") if cross_repo else "WHERE s.repo_id = $repo_id"
     cypher = f"""
     MATCH (s:Service {{name: $service_name}})
     {repo_filter}
@@ -1157,7 +1182,7 @@ def find_callers(
     if modified_within_commits is not None:
         cutoff = _resolve_recency_cutoff(engine, repo_id, modified_within_commits)
 
-    repo_filter = "" if cross_repo else "AND target.repo_id = $repo_id"
+    repo_filter = _cross_scope("target", "AND") if cross_repo else "AND target.repo_id = $repo_id"
     class_filter = "AND rel.caller_class = $scope_to_class" if scope_to_class else ""
     recency_filter = "AND target.last_modified_at >= $cutoff" if cutoff is not None else ""
     resolved_filter = "AND rel.confidence IN ['resolved', 'package']" if resolved_only else ""
@@ -1213,7 +1238,7 @@ def find_related_files(
         Module's path, or, for a Kotlin import, the Class or Function it names
     """
     _at_least(1, max_results=max_results)
-    repo_filter = "" if cross_repo else "WHERE n.repo_id = $repo_id"
+    repo_filter = _cross_scope("n", "WHERE") if cross_repo else "WHERE n.repo_id = $repo_id"
     cypher = f"""
     MATCH (n {{name: $component_name}})
     {repo_filter}
@@ -1442,7 +1467,7 @@ def impact_analysis(
         nearest hop only, so a direct dependent is never also transitive.
     """
     _at_least(1, max_results=max_results)
-    repo_filter = "" if cross_repo else "WHERE n.repo_id = $repo_id"
+    repo_filter = _cross_scope("n", "WHERE") if cross_repo else "WHERE n.repo_id = $repo_id"
     cypher = f"""
     MATCH (n {{name: $component_name}})
     {repo_filter}
@@ -1692,7 +1717,7 @@ def list_services(
         Dict with count, results, and truncated flag containing services with their properties
     """
     _at_least(1, max_results=max_results)
-    repo_filter = "" if cross_repo else "WHERE s.repo_id = $repo_id"
+    repo_filter = _cross_scope("s", "WHERE") if cross_repo else "WHERE s.repo_id = $repo_id"
     # `truncated` is applied to the ordered list, so ordering decides what
     # survives max_results. Sorting by repo_id alone meant a cross-repo call
     # could drop the caller's own repo entirely -- with enough registered
@@ -1729,7 +1754,7 @@ def explain_decision(
         Dict with the decision's properties, what it documents, what it
         supersedes, and any ArchitectureNote it's backed by.
     """
-    repo_filter = "" if cross_repo else "WHERE d.repo_id = $repo_id"
+    repo_filter = _cross_scope("d", "WHERE") if cross_repo else "WHERE d.repo_id = $repo_id"
     cypher = f"""
     MATCH (d:DesignDecision {{name: $decision_name}})
     {repo_filter}
@@ -1768,7 +1793,7 @@ def find_requirements_for(
     Returns:
         List of Requirement notes satisfied by this component
     """
-    repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
+    repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
     cypher = f"""
     MATCH (n {{name: $component_name}})-[:SATISFIES]->(r:Requirement)
     WHERE true
@@ -1802,7 +1827,7 @@ def trace_design_rationale(
         Dict grouping every Requirement/DesignDecision/ArchitectureNote linked
         to this component via SATISFIES or DOCUMENTED_BY.
     """
-    repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
+    repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
     cypher = f"""
     MATCH (n {{name: $component_name}})
     WHERE true
@@ -1842,7 +1867,7 @@ def blame_component(
         List of commits (sha, message, author, authored_date) that modified
         this component, ordered most-recent-first.
     """
-    repo_filter = "" if cross_repo else "AND c.repo_id = $repo_id"
+    repo_filter = _cross_scope("c", "AND") if cross_repo else "AND c.repo_id = $repo_id"
     cypher = f"""
     MATCH (c:Commit)-[:MODIFIES]->(m:Module {{name: $component_name}})
     WHERE true
@@ -1891,7 +1916,7 @@ def find_related_prs(
     if _source_off(registry, repo_id, "pr_source_enabled"):
         return _source_off_notice(max_results, "PR", "pr-source", repo_id)
 
-    repo_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
+    repo_filter = _cross_scope("m", "AND") if cross_repo else "AND m.repo_id = $repo_id"
     cypher = f"""
     MATCH (m:Module {{name: $component_name}})
     WHERE true
@@ -1940,7 +1965,7 @@ def issue_history_for(
     if _source_off(registry, repo_id, "issue_source_enabled"):
         return _source_off_notice(max_results, "Issue", "issue-source", repo_id)
 
-    repo_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
+    repo_filter = _cross_scope("m", "AND") if cross_repo else "AND m.repo_id = $repo_id"
     cypher = f"""
     MATCH (m:Module {{name: $component_name}})
     WHERE true
@@ -1994,7 +2019,7 @@ def get_source(
         undeclared file is not valid UTF-8, or a file isn't valid in its
         declared codec, the dict adds a `notice` saying how it was decoded.
     """
-    repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
+    repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
     cypher = f"""
     MATCH (n)
     WHERE (n:Function OR n:Class) AND n.name = $component_name
@@ -2126,7 +2151,7 @@ def find_mentions(
 
     if direction == "mentions":
         # Document mentions target: (d:Document {name: $name})-[:MENTIONS]->(target)
-        repo_filter = "" if cross_repo else "AND d.repo_id = $repo_id"
+        repo_filter = _cross_scope("d", "AND") if cross_repo else "AND d.repo_id = $repo_id"
         cypher = f"""
         MATCH (d:Document {{name: $name}})-[:MENTIONS]->(target)
         WHERE true
@@ -2138,7 +2163,7 @@ def find_mentions(
         """
     else:
         # Mentioned by: (d:Document)-[:MENTIONS]->(target {name: $name})
-        repo_filter = "" if cross_repo else "AND target.repo_id = $repo_id"
+        repo_filter = _cross_scope("target", "AND") if cross_repo else "AND target.repo_id = $repo_id"
         cypher = f"""
         MATCH (d:Document)-[:MENTIONS]->(target {{name: $name}})
         WHERE true
@@ -2197,7 +2222,7 @@ def list_recent_changes(
     cutoff = _resolve_recency_cutoff(engine, repo_id, within_commits)
     recency_filter = "AND n.last_modified_at >= $cutoff" if cutoff is not None else "AND n.last_modified_at IS NOT NULL"
 
-    repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
+    repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
     label_filter = "AND $entity_type IN labels(n)" if entity_type else ""
     cypher = f"""
     MATCH (n)
