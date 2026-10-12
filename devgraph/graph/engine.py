@@ -597,7 +597,9 @@ def _retry_transient(fn, *args, **kwargs):
     transient errors internally, but the autocommit `session.run` paths and
     `verify_connectivity` do not — so a Neo4j blip mid-scan would otherwise
     fail the whole operation. Every write here is an idempotent MERGE, so
-    re-running after a transient failure is always safe.
+    re-running after a transient failure is always safe. Autocommit
+    statements go through `_run`/`_run_records`, which consume the result
+    inside the retry.
     """
     delay = _BASE_DELAY_S
     for attempt in range(_MAX_RETRIES + 1):
@@ -619,6 +621,26 @@ def _retry_transient(fn, *args, **kwargs):
             )
             time.sleep(delay)
             delay *= 2
+
+
+def _run(session, query: str, **params: Any) -> Any:
+    """Run one autocommit statement and consume it, both inside `_retry_transient`;
+    return its summary.
+
+    `session.run` returns a lazy result, and the statement executes as that
+    result is pulled, so an execution error (a deadlock, a lock timeout, a
+    constraint violation) surfaces only when it is consumed. Left unconsumed,
+    the session's next `run` raised it inside that statement's retry, which
+    re-ran the wrong statement, or the session's close swallowed it into a
+    warning, losing the write.
+    """
+    return _retry_transient(lambda: session.run(query, **params).consume())
+
+
+def _run_records(session, query: str, **params: Any) -> list:
+    """`_run` for a statement whose records the caller reads: they are
+    buffered inside the retry, so an execution error is retried or raised."""
+    return _retry_transient(lambda: list(session.run(query, **params)))
 
 
 def _is_file_scoped(file: str | None) -> bool:
@@ -1069,12 +1091,12 @@ class GraphEngine:
         """
         with self._driver.session() as session:
             for stmt in repository_constraint_statements(effective) + lookup_index_statements():
-                _retry_transient(session.run, stmt)
+                _run(session, stmt)
             if not wait:
                 return
             building = [
-                record["name"] for record in _retry_transient(
-                    session.run, "SHOW INDEXES YIELD name, state WHERE state <> 'ONLINE' RETURN name"
+                record["name"] for record in _run_records(
+                    session, "SHOW INDEXES YIELD name, state WHERE state <> 'ONLINE' RETURN name"
                 )
             ]
             if building:
@@ -1083,15 +1105,15 @@ class GraphEngine:
                     len(building), ", ".join(sorted(building)), INDEX_WAIT_S,
                 )
             try:
-                _retry_transient(session.run, "CALL db.awaitIndexes($timeout)", timeout=int(INDEX_WAIT_S)).consume()
+                _run(session, "CALL db.awaitIndexes($timeout)", timeout=int(INDEX_WAIT_S))
             except Neo4jError:
                 # Still building (or failed): each hinted query waits on its own.
                 logger.warning("graph indexes not online after %.0f s; queries wait for them", INDEX_WAIT_S, exc_info=True)
 
     def upsert_repository(self, repo_id: str, name: str, path: str) -> None:
         with self._driver.session() as session:
-            _retry_transient(
-                session.run,
+            _run(
+                session,
                 "MERGE (r:Repository {repo_id: $repo_id}) "
                 "SET r.name = $name, r.path = $path",
                 repo_id=repo_id,
@@ -1146,8 +1168,8 @@ class GraphEngine:
         call site; behavior is unchanged for them.
         """
         with self._driver.session() as session:
-            _retry_transient(
-                session.run,
+            _run(
+                session,
                 f"MATCH (a:{from_label} {{repo_id: $repo_id, name: $from_name}}) "
                 f"MATCH (b:{to_label} {{repo_id: $repo_id, name: $to_name}}) "
                 f"MERGE (a)-[r:{rel_type}]->(b) "
@@ -1241,8 +1263,8 @@ class GraphEngine:
         if not paths:
             return
         with self._driver.session() as session:
-            _retry_transient(
-                session.run, _DELETE_EXTRACTED_PATHS_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
+            _run(
+                session, _DELETE_EXTRACTED_PATHS_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
             )
 
     def extracted_nodes_at(self, repo_id: str, extractor: str, paths: list[str]) -> set[tuple[str, str]]:
@@ -1251,8 +1273,8 @@ class GraphEngine:
         if not paths:
             return set()
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run, _EXTRACTED_NODES_AT_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
+            result = _run_records(
+                session, _EXTRACTED_NODES_AT_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
             )
             return {(record["label"], record["name"]) for record in result or []}
 
@@ -1261,8 +1283,8 @@ class GraphEngine:
         if not labels:
             return set()
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] IN $labels "
                 "RETURN labels(n)[0] AS label, n.name AS name, n.path AS path",
                 repo_id=repo_id, extractor=extractor, labels=labels,
@@ -1274,8 +1296,8 @@ class GraphEngine:
         these labels when `labels` is given: the provider's side of the graph's
         file list (see dispatch._graph_files)."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
                 "AND ($labels IS NULL OR labels(n)[0] IN $labels) AND n.path IS NOT NULL "
                 "RETURN DISTINCT n.path AS path",
@@ -1290,8 +1312,8 @@ class GraphEngine:
         of a label the schema no longer declares.
         """
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run, _PRUNE_EXTRACTED_CYPHER, repo_id=repo_id, extractor=extractor, keep=keep
+            result = _run_records(
+                session, _PRUNE_EXTRACTED_CYPHER, repo_id=repo_id, extractor=extractor, keep=keep
             )
             records = [record.data() for record in result or []]
         return records[0]["pruned"] if records else 0
@@ -1301,8 +1323,8 @@ class GraphEngine:
         if not paths:
             return 0
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run, _PRUNE_EXTRACTED_AT_CYPHER,
+            result = _run_records(
+                session, _PRUNE_EXTRACTED_AT_CYPHER,
                 repo_id=repo_id, extractor=extractor, paths=paths, keep=keep,
             )
             records = [record.data() for record in result or []]
@@ -1314,8 +1336,8 @@ class GraphEngine:
         if paths is not None and not paths:
             return 0
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run, _DELETE_EXTRACTED_EDGES_CYPHER, repo_id=repo_id, extractor=extractor,
+            result = _run_records(
+                session, _DELETE_EXTRACTED_EDGES_CYPHER, repo_id=repo_id, extractor=extractor,
                 paths=paths, builtin_types=list(RELATIONSHIP_TYPES),
             )
             records = [record.data() for record in result or []]
@@ -1335,7 +1357,7 @@ class GraphEngine:
 
         params = {"repo_id": repo_id, "extractor": extractor, "label": label}
         with self._driver.session() as session:
-            result = _retry_transient(session.run, _EXTRACTED_PROPERTY_KEYS_CYPHER, **params)
+            result = _run_records(session, _EXTRACTED_PROPERTY_KEYS_CYPHER, **params)
             present = [record["key"] for record in result or []]
             stale = sorted(
                 key for key in present
@@ -1346,26 +1368,26 @@ class GraphEngine:
             )
             if stale:
                 removals = ", ".join(f"n.`{key}`" for key in stale)
-                _retry_transient(
-                    session.run,
+                _run(
+                    session,
                     "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] = $label "
                     f"REMOVE {removals}",
                     **params,
-                ).consume()
+                )
         return stale
 
     def read_applied_schema(self, repo_id: str) -> dict[str, Any] | None:
         """The schema state the repo's graph was last built with, or None."""
         with self._driver.session() as session:
-            result = _retry_transient(session.run, _READ_APPLIED_SCHEMA_CYPHER, repo_id=repo_id)
+            result = _run_records(session, _READ_APPLIED_SCHEMA_CYPHER, repo_id=repo_id)
             records = [record.data() for record in result or []]
         return records[0] if records else None
 
     def set_index_format(self, repo_id: str, version: int) -> None:
         """Stamp the graph index format the repository was last fully scanned with."""
         with self._driver.session() as session:
-            _retry_transient(
-                session.run,
+            _run(
+                session,
                 "MERGE (r:Repository {repo_id: $repo_id}) SET r.index_format = $version",
                 repo_id=repo_id, version=version,
             )
@@ -1375,8 +1397,8 @@ class GraphEngine:
         built with, per language (see indexer/resolver_config.fingerprints);
         empty when none is recorded."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 "MATCH (r:Repository {repo_id: $repo_id}) RETURN r.resolver_config AS config",
                 repo_id=repo_id,
             )
@@ -1386,8 +1408,8 @@ class GraphEngine:
     def write_resolver_config(self, repo_id: str, config: dict[str, dict]) -> None:
         """Record the resolver configuration fingerprints the graph was built with."""
         with self._driver.session() as session:
-            _retry_transient(
-                session.run,
+            _run(
+                session,
                 "MATCH (r:Repository {repo_id: $repo_id}) SET r.resolver_config = $config",
                 repo_id=repo_id, config=json.dumps(config, sort_keys=True),
             )
@@ -1397,8 +1419,8 @@ class GraphEngine:
         [reason, the size limit it was judged under, the file's change stamp]
         (see dispatch.index_paths). Empty when none are recorded."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 "MATCH (r:Repository {repo_id: $repo_id}) RETURN r.skipped_files AS skipped",
                 repo_id=repo_id,
             )
@@ -1418,8 +1440,8 @@ class GraphEngine:
         if after == before and not replace:
             return
         with self._driver.session() as session:
-            _retry_transient(
-                session.run,
+            _run(
+                session,
                 "MERGE (r:Repository {repo_id: $repo_id}) SET r.skipped_files = $skipped",
                 repo_id=repo_id, skipped=json.dumps(after, sort_keys=True) if after else None,
             )
@@ -1427,8 +1449,8 @@ class GraphEngine:
     def index_format(self, repo_id: str) -> int | None:
         """The index format stamped by the last full scan, or None for an older index."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 "MATCH (r:Repository {repo_id: $repo_id}) RETURN r.index_format AS format",
                 repo_id=repo_id,
             )
@@ -1438,7 +1460,7 @@ class GraphEngine:
     def read_all_applied_schemas(self) -> list[dict[str, Any]]:
         """Every repository's recorded user labels and keys, from the graph itself."""
         with self._driver.session() as session:
-            result = _retry_transient(session.run, _READ_ALL_APPLIED_SCHEMAS_CYPHER)
+            result = _run_records(session, _READ_ALL_APPLIED_SCHEMAS_CYPHER)
             return [record.data() for record in result or []]
 
     def record_applied_schema(
@@ -1454,8 +1476,8 @@ class GraphEngine:
         `keys` holds one "Label:k1,k2" string per label.
         """
         with self._driver.session() as session:
-            _retry_transient(
-                session.run, _RECORD_APPLIED_SCHEMA_CYPHER, repo_id=repo_id, hash=schema_hash,
+            _run(
+                session, _RECORD_APPLIED_SCHEMA_CYPHER, repo_id=repo_id, hash=schema_hash,
                 labels=labels, relationship_types=relationship_types, keys=keys or [],
             )
 
@@ -1464,18 +1486,18 @@ class GraphEngine:
         with self._driver.session() as session:
             constraints = [
                 {**record.data(), "kind": "constraint"}
-                for record in _retry_transient(session.run, _SHOW_CONSTRAINTS_CYPHER) or []
+                for record in _run_records(session, _SHOW_CONSTRAINTS_CYPHER) or []
             ]
             indexes = [
                 {**record.data(), "kind": "index"}
-                for record in _retry_transient(session.run, _SHOW_INDEXES_CYPHER) or []
+                for record in _run_records(session, _SHOW_INDEXES_CYPHER) or []
             ]
         return constraints + indexes
 
     def run_schema_statement(self, statement: str) -> None:
         """Run one CREATE/DROP CONSTRAINT/INDEX statement. The caller builds it from validated names."""
         with self._driver.session() as session:
-            _retry_transient(session.run, statement).consume()
+            _run(session, statement)
 
     def has_duplicate_keys(self, label: str, properties: tuple[str, ...]) -> bool:
         """Whether two `label` nodes share every one of `properties` (all non-null), i.e. a
@@ -1487,13 +1509,13 @@ class GraphEngine:
             "WHERE c > 1 RETURN 1 AS dup LIMIT 1"
         )
         with self._driver.session() as session:
-            result = _retry_transient(session.run, query)
+            result = _run_records(session, query)
             return bool([record for record in result or []])
 
     def label_has_nodes(self, label: str) -> bool:
         """Whether any node, in any repository, carries `label`. The caller validates `label`."""
         with self._driver.session() as session:
-            result = _retry_transient(session.run, f"MATCH (n:`{label}`) RETURN n LIMIT 1")
+            result = _run_records(session, f"MATCH (n:`{label}`) RETURN n LIMIT 1")
             return bool([record for record in result or []])
 
     def existing_node_names(self, repo_id: str, label: str, names: list[str]) -> set[str]:
@@ -1501,8 +1523,8 @@ class GraphEngine:
         if not names:
             return set()
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 f"MATCH (n:`{label}` {{repo_id: $repo_id}}) WHERE n.name IN $names RETURN DISTINCT n.name AS name",
                 repo_id=repo_id,
                 names=names,
@@ -1512,8 +1534,8 @@ class GraphEngine:
     def delete_label_nodes(self, repo_id: str, label: str) -> int:
         """Delete one repo's nodes of a user label. The caller validates `label`."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run, f"MATCH (n:`{label}` {{repo_id: $repo_id}}) DETACH DELETE n RETURN count(n) AS n",
+            result = _run_records(
+                session, f"MATCH (n:`{label}` {{repo_id: $repo_id}}) DETACH DELETE n RETURN count(n) AS n",
                 repo_id=repo_id,
             )
             records = [record.data() for record in result or []]
@@ -1522,8 +1544,8 @@ class GraphEngine:
     def delete_relationship_type(self, repo_id: str, rel_type: str) -> int:
         """Delete one repo's relationships of a user type. The caller validates `rel_type`."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 f"MATCH (a {{repo_id: $repo_id}})-[r:`{rel_type}`]->() DELETE r RETURN count(r) AS n",
                 repo_id=repo_id,
             )
@@ -1546,8 +1568,8 @@ class GraphEngine:
         the provenance indexes (see `_owned_branches`).
         """
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 _union(_owned_branches("IS NOT NULL"))
                 + "RETURN DISTINCT coalesce(n.source_file, n.file, n.name) AS path",
                 repo_id=repo_id,
@@ -1560,8 +1582,8 @@ class GraphEngine:
         in this repo: the files, such as a Dockerfile, that may back nothing
         but a claim. Provider nodes are left out."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 _union(_CLAIMED_BRANCHES)
                 + "WITH n WHERE n.file IS NULL AND n.source_file IS NULL AND n.extractor IS NULL "
                 "  AND (n.sources IS NOT NULL OR n.source IS NOT NULL) "
@@ -1576,8 +1598,8 @@ class GraphEngine:
         one of `files` claims. index_paths reads it before and after a batch
         to tell a shared node the batch may have deleted and written back."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 _union(_CLAIMED_BRANCHES)
                 + "WITH n, coalesce(n.sources, [n.source]) AS sources "
                 "WHERE n.file IS NULL AND n.source_file IS NULL AND any(s IN sources WHERE s IN $files) "
@@ -1594,14 +1616,14 @@ class GraphEngine:
         only a leftover of the git-history sync's old MERGE looks like this
         (a commit touching a README, an image or a since-deleted file)."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 "MATCH (m:Module {repo_id: $repo_id}) "
                 "WHERE m.source_file IS NULL AND m.file IS NULL AND m.path IS NULL "
                 "DETACH DELETE m RETURN count(m) AS n",
                 repo_id=repo_id,
             )
-            record = result.single() if result is not None else None
+            record = result[0] if result else None
             return record["n"] if record else 0
 
     def delete_bare_class_stubs(self, repo_id: str) -> int:
@@ -1612,14 +1634,14 @@ class GraphEngine:
         older index wrote looks like this; with no claim, nothing would ever
         delete it."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 "MATCH (c:Class {repo_id: $repo_id}) "
                 "WHERE c.file IS NULL AND c.source IS NULL AND c.source_file IS NULL "
                 "DETACH DELETE c RETURN count(c) AS n",
                 repo_id=repo_id,
             )
-            record = result.single() if result is not None else None
+            record = result[0] if result else None
             return record["n"] if record else 0
 
     def delete_docs_notes_outside(self, repo_id: str, folder: str) -> int:
@@ -1630,8 +1652,8 @@ class GraphEngine:
         path, so only a note an older scan keyed by its bare filename, or one
         left from a former docs path, looks like this."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 "MATCH (n {repo_id: $repo_id}) "
                 "WHERE (n:Requirement OR n:DesignDecision OR n:ArchitectureNote) "
                 "  AND n.source_file IS NOT NULL AND NOT n.source_file STARTS WITH $prefix "
@@ -1639,15 +1661,15 @@ class GraphEngine:
                 repo_id=repo_id,
                 prefix=folder.rstrip("/") + "/",
             )
-            record = result.single() if result is not None else None
+            record = result[0] if result else None
             return record["n"] if record else 0
 
     def list_docs_note_files(self, repo_id: str) -> set[str]:
         """The `source_file` of every docs note (Requirement, DesignDecision,
         ArchitectureNote) in this repo."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 "MATCH (n {repo_id: $repo_id}) "
                 "WHERE (n:Requirement OR n:DesignDecision OR n:ArchitectureNote) AND n.source_file IS NOT NULL "
                 "RETURN DISTINCT n.source_file AS path",
@@ -1720,8 +1742,8 @@ class GraphEngine:
             ]
         )
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 candidates
                 + "WITH n, (n.source_file IN $files OR n.file IN $files "
                 "   OR (n:Module AND n.name IN $files) "
@@ -1793,8 +1815,8 @@ class GraphEngine:
         the Modules before any entry is split. The Module index is hinted to
         seek, for the reason _end_match gives."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 "MATCH (m:Module {repo_id: $repo_id}) USING INDEX SEEK m:Module(repo_id, name) "
                 "WHERE NOT m.name IN $skip "
                 "  AND (any(t IN m.name_ref_targets WHERE t IN $names) "
@@ -1835,8 +1857,8 @@ class GraphEngine:
             for label in labels
         )
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 candidates
                 + "WITH n WHERE NOT coalesce(n.file, n.source_file, '') IN $batch_keys "
                 "  AND NOT (n:Module AND n.name IN $batch_keys) "
@@ -1862,8 +1884,8 @@ class GraphEngine:
         of that name. Hinted to seek by name: the planner otherwise scanned
         the `(repo_id, source)` index, every repository's stubs."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run,
+            result = _run_records(
+                session,
                 "MATCH (f:Function) USING INDEX SEEK f:Function(repo_id, name) "
                 "WHERE f.repo_id = $repo_id AND f.name IN $names AND f.file IS NULL AND f.source IS NOT NULL "
                 "UNWIND coalesce(f.sources, [f.source]) AS source "
@@ -1909,8 +1931,8 @@ class GraphEngine:
             "{repo_id: $repo_id, name: $name, file: $file}" if file is not None else "{repo_id: $repo_id, name: $name}"
         )
         with self._driver.session() as session:
-            _retry_transient(
-                session.run,
+            _run(
+                session,
                 f"MATCH (n:{label} {merge_key}) "
                 "SET n.created_at = CASE WHEN $created_at IS NULL THEN n.created_at "
                 "WHEN n.created_at IS NULL OR $created_at < n.created_at THEN $created_at "
@@ -1958,8 +1980,8 @@ class GraphEngine:
         if last_modified_by is not None:
             set_clauses.append("n.last_modified_by = $last_modified_by")
         with self._driver.session() as session:
-            _retry_transient(
-                session.run,
+            _run(
+                session,
                 f"MATCH (n:{label} {merge_key}) "
                 f"SET {', '.join(set_clauses)}",
                 repo_id=repo_id,
@@ -1986,8 +2008,8 @@ class GraphEngine:
         if not shas:
             return
         with self._driver.session() as session:
-            _retry_transient(
-                session.run,
+            _run(
+                session,
                 "MATCH (c:Commit {repo_id: $repo_id}) WHERE c.name IN $shas DETACH DELETE c",
                 repo_id=repo_id,
                 shas=shas,
@@ -1999,8 +2021,8 @@ class GraphEngine:
         if not shas:
             return
         with self._driver.session() as session:
-            _retry_transient(
-                session.run,
+            _run(
+                session,
                 "MATCH (c:Commit {repo_id: $repo_id})-[r:MODIFIES]->() WHERE c.name IN $shas DELETE r",
                 repo_id=repo_id,
                 shas=shas,
@@ -2010,16 +2032,16 @@ class GraphEngine:
         """Every repo_id some node carries: the Repository nodes' and any left
         without one (a write that landed after its repository was deleted)."""
         with self._driver.session() as session:
-            result = _retry_transient(
-                session.run, "MATCH (n) WHERE n.repo_id IS NOT NULL RETURN DISTINCT n.repo_id AS repo_id"
+            result = _run_records(
+                session, "MATCH (n) WHERE n.repo_id IS NOT NULL RETURN DISTINCT n.repo_id AS repo_id"
             )
             return {record["repo_id"] for record in result or []}
 
     def delete_repository(self, repo_id: str) -> None:
         """Remove every node (and its relationships) scoped to this repo_id."""
         with self._driver.session() as session:
-            _retry_transient(
-                session.run,
+            _run(
+                session,
                 "MATCH (n {repo_id: $repo_id}) DETACH DELETE n",
                 repo_id=repo_id,
             )
@@ -2036,12 +2058,12 @@ class GraphEngine:
         follows, and a node deleted in between is simply not matched there.
         """
         with self._driver.session() as session:
-            edge_result = _retry_transient(
-                session.run, _LOAD_INSIGHT_EDGES_CYPHER, repo_id=repo_id, types=list(relationship_types)
+            edge_result = _run_records(
+                session, _LOAD_INSIGHT_EDGES_CYPHER, repo_id=repo_id, types=list(relationship_types)
             )
             edges = [record.data() for record in edge_result or []]
             ids = sorted({e["source"] for e in edges} | {e["target"] for e in edges})
-            node_result = _retry_transient(session.run, _LOAD_INSIGHT_NODES_CYPHER, repo_id=repo_id, ids=ids)
+            node_result = _run_records(session, _LOAD_INSIGHT_NODES_CYPHER, repo_id=repo_id, ids=ids)
             nodes = [record.data() for record in node_result or []]
         return nodes, edges
 
@@ -2053,7 +2075,7 @@ class GraphEngine:
     def read_insights_summary(self, repo_id: str) -> dict[str, Any] | None:
         """The Repository node's insight summary, or None if never computed."""
         with self._driver.session() as session:
-            result = _retry_transient(session.run, _READ_INSIGHTS_SUMMARY_CYPHER, repo_id=repo_id)
+            result = _run_records(session, _READ_INSIGHTS_SUMMARY_CYPHER, repo_id=repo_id)
             records = [record.data() for record in result or []]
         return records[0] if records else None
 
