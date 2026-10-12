@@ -601,6 +601,23 @@ def test_container_regains_mentions_when_re_added(engine, repo_id, tmp_path):
     incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
 
 
+def test_container_moving_between_claimants_keeps_its_mentions(engine, repo_id, tmp_path):
+    # One batch drops the Dockerfile's claim (it sorts first, so the
+    # Container goes with its MENTIONS edges) and adds a compose claim (which
+    # writes it back): the Markdown mentioning it must link again.
+    dockerfile = write(tmp_path, "Dockerfile", "FROM python:3.12\n")
+    compose = write(tmp_path, "compose.yaml", "services: {}\n")
+    write(tmp_path, "notes.md", "Runs on `python`.\n")
+    scan(engine, repo_id, tmp_path, mentions_enabled=True)
+    assert len(_mentions_of(engine, repo_id, "python")) == 1
+
+    write(tmp_path, "Dockerfile", "# No stages.\n")
+    write(tmp_path, "compose.yaml", "services:\n  api:\n    image: python:3.12\n")
+    index_paths(engine, repo_id, tmp_path, {dockerfile, compose}, mentions_enabled=True)
+    assert len(_mentions_of(engine, repo_id, "python")) == 1
+    incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
+
+
 REDIS_APP = """\
     import redis
 
@@ -620,6 +637,22 @@ def test_datastore_mentions_survive_python_reindex(engine, repo_id, tmp_path):
     index_paths(engine, repo_id, tmp_path, {app}, mentions_enabled=True)
     assert len(_mentions_of(engine, repo_id, "Redis")) == 1
     assert node(engine, repo_id, "Cache", "Redis") == before
+    incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
+
+
+def test_datastore_moving_between_claimants_keeps_its_mentions(engine, repo_id, tmp_path):
+    # The Python counterpart: `a.py` drops the only claim on `Redis` before
+    # `b.py`, later in the same batch, claims it.
+    first = write(tmp_path, "a.py", REDIS_APP)
+    second = write(tmp_path, "b.py", "VALUE = 1\n")
+    write(tmp_path, "notes.md", "Sessions live in `Redis`.\n")
+    scan(engine, repo_id, tmp_path, mentions_enabled=True)
+    assert len(_mentions_of(engine, repo_id, "Redis")) == 1
+
+    write(tmp_path, "a.py", "VALUE = 1\n")
+    write(tmp_path, "b.py", REDIS_APP)
+    index_paths(engine, repo_id, tmp_path, {first, second}, mentions_enabled=True)
+    assert len(_mentions_of(engine, repo_id, "Redis")) == 1
     incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
 
 

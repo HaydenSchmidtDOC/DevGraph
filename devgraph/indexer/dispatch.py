@@ -810,6 +810,9 @@ def index_paths(
     # below can tell which nodes the batch adds.
     batch_keys = sorted(by_rel_path)
     previous_nodes = engine.list_file_nodes(repo_id, batch_keys)
+    # The claims on the shared nodes the batch's files claim (see
+    # _written_back_shared).
+    claims_before = engine.list_shared_claims(repo_id, batch_keys) if any(not n[2] for n in previous_nodes) else {}
 
     # The schema providers' specs, resolved once for the batch. The docs
     # nodes are read now, so the relink below can tell which ones are new;
@@ -858,6 +861,9 @@ def index_paths(
     # A field-keyed docs entry already in the graph (moving between files)
     # is not: its edges move with it.
     added = batch_nodes - previous_nodes
+    if claims_before:
+        written_back = _written_back_shared(claims_before, engine.list_shared_claims(repo_id, batch_keys), batch_keys)
+        added |= {(label, name, "") for label, name in written_back} & batch_nodes
     if docs_batch:
         added -= {node for node in batch_nodes if node[:2] in docs_batch.existing}
     added_nodes = {node[:2] for node in added}
@@ -1431,6 +1437,21 @@ def _handler_stub_referrers(engine: GraphEngine, repo_id: str, added: set[tuple[
     if not functions:
         return set()
     return engine.find_handler_stub_sources(repo_id, functions)
+
+
+def _written_back_shared(
+    before: dict[tuple[str, str], set[str]], after: dict[tuple[str, str], set[str]], batch: list[str]
+) -> set[tuple[str, str]]:
+    """The shared nodes (label, name) the batch may have deleted and written
+    back: every claim on one came from the batch's files, and one of those
+    files dropped its claim. Files go in path order, so the dropping file can
+    delete the node, with every edge into it (a Document's MENTIONS), before
+    a later file claims it again; it was there before and after the batch,
+    so the snapshot diff alone would not count it as added."""
+    return {
+        node for node, sources in before.items()
+        if sources <= set(batch) and not sources <= after.get(node, set())
+    }
 
 
 # At most this many Markdown files are relinked per batch to pick up
