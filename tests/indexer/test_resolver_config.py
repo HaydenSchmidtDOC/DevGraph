@@ -8,6 +8,7 @@ See docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md
 
 import json
 import textwrap
+import time
 import uuid
 
 import pytest
@@ -156,14 +157,18 @@ def test_what_can_touch_the_configuration(tmp_path):
     assert touches_config("configs", inputs, tmp_path)  # a deleted folder holding one
     assert not touches_config("web/a.ts", inputs, tmp_path)
     assert not touches_config("config", inputs, tmp_path)
-    # A .cs file is configuration while its head holds a `global using`:
+    # A project's .cs file is configuration while its head holds a `global using`:
     # one that had one is an input, one that has one now is read.
     assert touches_config("app/Usings.cs", inputs, tmp_path)
     write(tmp_path, "app/Program.cs", "using System;\n\nnamespace App;\n")
     assert not touches_config("app/Program.cs", inputs, tmp_path)
     write(tmp_path, "app/Program.cs", "// Shared.\nglobal using System.Text;\n\nnamespace App;\n")
+    assert not touches_config("app/Program.cs", inputs, tmp_path)  # no project above it
+    inputs.append("app/App.csproj")
     assert touches_config("app/Program.cs", inputs, tmp_path)
     assert not touches_config("app/Gone.cs", inputs, tmp_path)
+    write(tmp_path, "tools/Script.cs", "global using System.Text;\n")
+    assert not touches_config("tools/Script.cs", inputs, tmp_path)
 
 
 # --- C# projects -----------------------------------------------------------------
@@ -204,6 +209,25 @@ def test_a_head_holds_only_directives_comments_and_preprocessor_lines():
     assert _cs_head_usings("using var file = Open();\nglobal using A;\n") == ()
     assert _cs_head_usings("namespace A;\nglobal using B;\n") == ()
     assert _cs_head_usings("/* unterminated\nglobal using A;\n") == ()
+    # A comment inside a directive ends the head too, as the spec has it.
+    assert _cs_head_usings("global using A // hi\n.B;\nglobal using C;\n") == ()
+    assert _cs_head_usings("global using A /* x */ .B;\nglobal using C;\n") == ()
+
+
+def test_a_head_reads_unsafe_aliases():
+    head = "global using unsafe P = int*;\nusing unsafe Q = char*;\nglobal using Shop.Models;\n"
+    assert _cs_head_usings(head) == (CsUsing("Shop.Models"), CsUsing("int*", alias="P"))
+
+
+def test_an_unterminated_directive_costs_one_pass():
+    for text in (
+        "global using A" + " " * _CS_HEAD_BYTES, "global using" + " " * _CS_HEAD_BYTES + "A",
+        "global using A =" + " " * _CS_HEAD_BYTES, "global using " + "A " * (_CS_HEAD_BYTES // 2),
+        "global using A = " + "B " * (_CS_HEAD_BYTES // 2),
+    ):
+        start = time.perf_counter()
+        assert _cs_head_usings(text) == ()
+        assert time.perf_counter() - start < 0.1
 
 
 def test_a_global_using_past_the_head_limit_is_not_seen(tmp_path):

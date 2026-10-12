@@ -78,13 +78,18 @@ def touches_config(rel: str, inputs: list[str], repo_root: Path) -> bool:
     """Whether a changed or deleted repo-relative path can change the
     configuration: it is named like a configuration file, is one of the
     `inputs` a fingerprint read, or is a directory holding one, or it is a
-    .cs file whose head now holds a `global using` (one whose head held one
-    is an input)."""
+    .cs file of a project (a `.csproj` among `inputs` at or above it) whose
+    head now holds a `global using` (one whose head held one is an input; a
+    file of no project counts for nothing until a `.csproj` above it, itself
+    a change, makes it one)."""
     if config_language(posixpath.basename(rel)):
         return True
     if any(each == rel or each.startswith(rel + "/") for each in inputs):
         return True
-    return rel.endswith(".cs") and bool(cs_global_usings(Path(repo_root) / rel))
+    if not rel.endswith(".cs"):
+        return False
+    project_dirs = {posixpath.dirname(each) for each in inputs if each.endswith(".csproj")}
+    return _cs_owner(rel, project_dirs) is not None and bool(cs_global_usings(Path(repo_root) / rel))
 
 
 _JSONC_COMMENTS = re.compile(r'"(?:[^"\\]|\\.)*"|//[^\n]*|/\*.*?\*/', re.DOTALL)
@@ -184,10 +189,13 @@ _CS_HEAD_BYTES = 32 * 1024
 
 # What may come before a `global using` in a .cs file's head: whitespace, a
 # comment, a preprocessor line (`#if`, `#region`, `#nullable`, ...) and an
-# `extern alias`; and a using directive itself, global or not.
+# `extern alias`; and a using directive itself, global or not (C# 12's
+# `using unsafe P = int*;` included). A name runs possessively up to its `;`
+# and holds no `/`, so a comment inside a directive ends the head and an
+# unterminated one costs one pass, not a backtrack per character.
 _CS_HEAD_SKIP = re.compile(r"\s+|//[^\n]*|/\*.*?\*/|#[^\n]*|extern\s+alias\s+@?\w+\s*;", re.DOTALL)
 _CS_USING = re.compile(
-    r"(global\s+)?using\s+(static\s+)?(?:(@?\w+)\s*=\s*([^;{}]+?)|([^;=(){}]+?))\s*;"
+    r"(global\s++)?using\s++(static\s++)?(?:unsafe\s++)?(?:(@?\w++)\s*+=\s*+([^;{}/]++)|([^;=(){}/]++));"
 )
 
 
@@ -202,7 +210,8 @@ def _cs_head_usings(text: str) -> tuple[CsUsing, ...]:
     allows a `global using` nowhere else. A directive under an `#if` counts
     whatever the condition. The first anything else ends the head: an
     attribute, a namespace or a type, a top-level statement (`using var`),
-    or a directive the pattern does not read (a comment inside it, say)."""
+    or a directive the pattern does not read (one with a comment inside
+    it, say)."""
     found = set()
     pos, text = 0, text.removeprefix("﻿")
     while pos < len(text):

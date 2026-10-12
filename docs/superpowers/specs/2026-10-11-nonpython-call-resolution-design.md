@@ -88,17 +88,25 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   A file's *head* is read from its start, at most its first 32 KiB, for as
   long as it holds only whitespace, comments, preprocessor lines (`#if`,
   `#region`, `#nullable`, ...), `extern alias` and using directives, global
-  or not (the compiler allows a `global using` nowhere else); a directive
+  or not, `using unsafe P = int*;` included (the compiler allows a `global
+  using` nowhere else); a directive
   under an `#if` counts whatever the condition, and anything else ends the
   head (an attribute, a namespace, a type, a top-level `using var`, a
   directive with a comment inside). The fingerprint's inputs are every
   `.csproj` and Directory.Build file and every .cs file of a project whose
   head holds a `global using`; the digest is each project file's `<Using>`
   items and each such file's `global using`s, so a package bump changes
-  nothing. Every catch-up and full scan reads every .cs file's head (about
-  45 ms for 500 files, 5.5 MB; no cache). A batch extracts C# under the
-  inputs its fingerprint found. A configuration change re-indexes every C#
-  file; no resolver reads the configuration yet.
+  nothing. A live batch reads a changed .cs file's head only when a stored
+  `.csproj` is at or above it: a file of no project cannot change the
+  digest, and the `.csproj` that would make it one is a change itself.
+  Every catch-up and full scan reads every .cs file's head (about 45 ms for
+  500 files, 5.5 MB; no cache). A batch extracts C# under the inputs its
+  fingerprint found. A configuration change re-indexes every C# file; no
+  resolver reads the configuration yet. Left for the extractor's change:
+  `symbols.EXTRACTORS` and the legacy `csharp/extractor.py` indexing entry
+  point call `extract_csharp_file` without a configuration, and
+  `ImplicitUsings` stays unread (if it is ever read, it is one more
+  `<PropertyGroup>` input of the digest).
 
 Fresh is then extract(text, configuration), and an incremental run re-extracts
 every dependent when the configuration changes.

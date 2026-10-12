@@ -20,7 +20,9 @@ root or nested go.mod comes and goes, and a config under an ignored folder is
 edited. After every batch the fuzz runs what a live batch does,
 `sync_resolver_config`. C# projects change the same way: a .csproj or
 Directory.Build file is written, created or deleted, and a C# file gains or
-loses a `global using`; a C# Module records its project's usings
+loses a `global using` (written behind a comment, `#if`, a byte order mark,
+CRLF or `extern alias`), or moves to another project's folder or out of
+every project (scripts/); a C# Module records its project's usings
 (`_with_cs_projects`), so a change that did not re-index every C# file
 would leave one stale. Kotlin files hold adjacent one-line classes, which
 the extractor recovers from tree-sitter-kotlin's error nodes, and import a
@@ -264,9 +266,10 @@ TS_CONFIGS = {
         '[package]\nname = "shop-core"\n\n[lib]\npath = "src/main.rs"\n', "[workspace]\n", None,
     ],
 }
-# The C# projects' versions: cs/ is a project, cs/Models a nested one when
-# its .csproj exists, and the nearest Directory.Build.props/.targets wrap
-# their `<Using>` items.
+# The C# projects' versions: cs/ is a project (of one or two .csproj
+# files), cs/Models a nested one when its .csproj exists, and the nearest
+# Directory.Build.props/.targets wrap their `<Using>` items (cs/Models' own
+# props shadowing the root one). scripts/ is under no project.
 CS_PROJECT = '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n{}  </ItemGroup>\n</Project>\n'
 CS_CONFIGS = {
     "cs/Shop.csproj": [
@@ -274,14 +277,22 @@ CS_CONFIGS = {
         CS_PROJECT.format('    <Using Include="Shop.Jobs" Static="true" />\n    <Using Include="Shop.Jobs" Alias="J" />\n'),
         CS_PROJECT.format('    <Using Remove="Shop" />\n    <Using Include="Shop.App" />\n'), None,
     ],
+    "cs/Shop.Tests.csproj": [None, CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop.Tests" />\n')],
     "cs/Models/Models.csproj": [None, CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop" />\n')],
     "Directory.Build.props": [None, CS_PROJECT.format('    <Using Include="Shop" />\n')],
+    "cs/Models/Directory.Build.props": [None, CS_PROJECT.format('    <Using Include="Shop.Text" />\n')],
     "cs/Directory.Build.targets": [None, CS_PROJECT.format('    <Using Remove="Shop.Models" />\n')],
 }
-# A C# file's `global using`s, with what may come before one in a file's head.
+# A C# file's `global using`s, with what may come before one in a file's
+# head (a byte order mark only counts first; elsewhere it ends the head, as
+# a comment inside a directive does).
 CS_GLOBAL_USINGS = [
     "global using Shop.Models;", "// Shared.\nglobal using static Shop.Jobs;", "#if NET8_0\nglobal using J = Shop.Jobs;\n#endif",
+    "\ufeffglobal using Shop.Text;", "// CRLF\r\nglobal using Shop.Data;\r", "extern alias Legacy;\nglobal using Shop.Legacy;",
+    "global using unsafe P = int*;", "global using Shop // cut\n.Cut;",
 ]
+# The folders a C# file moves between: two projects and no project.
+CS_DIRS = ["cs/", "cs/Models/", "scripts/"]
 # Folders holding a configuration file, which the fuzz may delete whole.
 CONFIG_DIRS = ["ts/configs", "go/b", "crates/core", "cs/Models"]
 
@@ -315,6 +326,7 @@ def initial_repo() -> dict:
         "cs/Program.cs": File("cs", head="Shop.App", imports=["using Shop;"], bases={"Program": "Jobs"},
                               funcs={"Main": ["Jobs.Run", "Stop", "new Jobs().Stop"]}),
         "cs/Models/Base.cs": File("cs", head="Shop.Models", bases={"Base": None}, funcs={"Helper": []}),
+        "scripts/Tool.cs": File("cs", head="Tools", imports=["global using Shop.Models;"], bases={"Tool": None}),
         "cpp/util/strings.h": File("cpp", funcs={"trim": []}),
         "cpp/util/strings.cpp": File("cpp", imports=['#include "strings.h"'], methods=["Widget::draw"],
                                      funcs={"upper": ["trim"]}),
@@ -645,6 +657,18 @@ class Fuzz:
         imports.insert(0, using)
         return f"add {using!r} in {path}", {path}
 
+    def op_cs_move(self):
+        """Move a C# file to another project's folder, or out of every project."""
+        path = self._pick(lambda f: f.kind == "cs")
+        if not path:
+            return None
+        folder, _sep, name = path.rpartition("/")
+        new = self.rng.choice([d for d in CS_DIRS if d != folder + "/"]) + name
+        if new in self.files:
+            return None
+        self.files[new] = self.files.pop(path)
+        return f"move {path} to {new}", {path, new}
+
     def op_delete_dir(self):
         """Delete a folder holding a configuration file, with everything in it."""
         folder = self.rng.choice(CONFIG_DIRS)
@@ -756,7 +780,7 @@ class Fuzz:
         "call", "base", "import", "import_style", "impl", "add_function", "remove_function", "move_function",
         "rename", "delete", "restore", "service", "from", "move_image", "mention", "link", "supersedes", "pin", "pin",
         "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module", "method", "method",
-        "cs_csproj", "cs_global_using",
+        "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move",
     ]
 
     def draw(self):
