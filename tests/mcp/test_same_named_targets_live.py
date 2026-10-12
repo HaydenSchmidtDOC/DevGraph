@@ -27,6 +27,12 @@ CREATE (c)-[:CALLS {confidence: 'resolved'}]->(os)
 CREATE (b)-[:CALLS {confidence: 'resolved'}]->(ms)
 CREATE (b)-[:CALLS {confidence: 'resolved'}]->(os)
 CREATE (t)-[:CALLS {confidence: 'resolved'}]->(a)
+CREATE (la:Function {repo_id: $r, name: 'load', file: 'a.py'})
+CREATE (lb:Function {repo_id: $r, name: 'load', file: 'b.py'})
+CREATE (ls:Function {repo_id: $r, name: 'load'})
+CREATE (:Function {repo_id: $r, name: 'loader', file: 'c.py'})-[:CALLS]->(ls)
+CREATE (:Function {repo_id: $r, name: 'reader', file: 'c.py'})-[:CALLS]->(la)
+CREATE (:Function {repo_id: $r, name: 'gadget_user', file: 'g.py'})-[:CALLS]->(:Gadget {repo_id: $r, name: 'gadget'})
 """
 
 
@@ -44,7 +50,11 @@ def engine():
     test_engine.close()
 
 
-TARGETS = [{"label": "Function", "file": "models.py"}, {"label": "Function", "file": "other.py"}]
+TARGETS = {
+    "count": 2,
+    "results": [{"label": "Function", "file": "models.py"}, {"label": "Function", "file": "other.py"}],
+    "truncated": False,
+}
 
 
 def test_find_callers_labels_each_caller_with_its_target(engine):
@@ -90,3 +100,34 @@ def test_find_related_files_labels_rows_only_when_ambiguous(engine):
     assert result["containing_modules"]["results"] == [{"name": "models.py", "target_files": ["models.py"]}]
     narrowed = tools.find_related_files(engine, REPO, "save", file="models.py")
     assert narrowed["containing_modules"]["results"] == ["models.py"] and "ambiguous_targets" not in narrowed
+
+
+def test_a_file_parameter_is_normalised(engine):
+    result = tools.find_callers(engine, REPO, "save", file=".\\other.py")
+    assert sorted(r["name"] for r in result["results"]) == ["caller", "use_both"]
+
+
+def test_a_file_less_target_is_listed_but_never_a_target_file(engine):
+    """A file-less same-named node (a route's handler stub) shows as `file: None` in
+    ambiguous_targets, and a row that reaches only it has empty `target_files`."""
+    expected = [{"label": "Function", "file": None}, {"label": "Function", "file": "a.py"}, {"label": "Function", "file": "b.py"}]
+    callers = tools.find_callers(engine, REPO, "load")
+    assert sorted(callers["ambiguous_targets"]["results"], key=lambda t: t["file"] or "") == expected
+    assert {r["name"]: r["target_files"] for r in callers["results"]} == {"loader": [], "reader": ["a.py"]}
+    impact = tools.impact_analysis(engine, REPO, "load")
+    assert sorted(impact["ambiguous_targets"]["results"], key=lambda t: t["file"] or "") == expected
+    direct = {d["name"]: d["target_files"] for d in impact["direct_dependents"]["results"]}
+    assert direct == {"loader": [], "reader": ["a.py"]}
+
+
+def test_cross_repo_ambiguous_targets_name_their_repository(engine):
+    result = tools.find_callers(engine, REPO, "save", cross_repo=True)
+    assert {t["repo_id"] for t in result["ambiguous_targets"]["results"]} == {REPO}
+
+
+def test_a_node_whose_label_is_not_declared_is_still_found(engine):
+    """Gadget is no built-in label and nothing declares it (a schema typo, a label
+    removed but not rescanned, a console-made node): found by the fallback lookup."""
+    assert [r["name"] for r in tools.find_callers(engine, REPO, "gadget")["results"]] == ["gadget_user"]
+    assert tools.impact_analysis(engine, REPO, "gadget")["direct_dependents"]["count"] == 1
+    assert tools.find_requirements_for(engine, REPO, "gadget")["count"] == 0

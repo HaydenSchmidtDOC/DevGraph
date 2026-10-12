@@ -99,6 +99,10 @@ BUILTIN_TIMEOUT_S = 30
 #: or aggregates, so this only guards against an unbounded result.
 BUILTIN_MAX_ROWS = 100_000
 
+#: Most files whose same-named targets `impact_analysis` traces apart; past it
+#: one expansion covers them all (with a notice to pass `file`).
+IMPACT_MAX_SPLIT = 5
+
 #: How many CALLS/USES/DEPENDS_ON hops `impact_analysis` and
 #: `impact_analysis_for_diff` follow for transitive dependents. An unbounded
 #: variable-length path hangs on a real repository's call graph, and a
@@ -636,34 +640,77 @@ def _exists(engine: GraphEngine, repo_id: str, name: str, labels: tuple[str, ...
     return bool(_query(engine, _named_nodes(labels, "name", cross_repo) + "RETURN 1 LIMIT 1", params))
 
 
+#: Most files a row's `target_files` lists; past it the row adds `target_file_count`.
+_MAX_TARGET_FILES = 10
+
+_TARGETS_RETURN = (
+    "WITH DISTINCT labels(n)[0] AS label, n.file AS file, n.repo_id AS repo_id "
+    "RETURN label, file, repo_id ORDER BY repo_id, file, label"
+)
+
+
+def _normalize_file(file: str | None) -> str | None:
+    """A repo-relative path as the graph stores it: `/` separators, no leading `./`."""
+    if file is None:
+        return None
+    file = file.replace("\\", "/")
+    while file.startswith("./"):
+        file = file[2:]
+    return file
+
+
 def _resolve_targets(
     engine: GraphEngine, repo_id: str, name: str, cross_repo: bool, file: str | None, labels: tuple[str, ...]
-) -> list[dict[str, Any]] | None:
-    """The `{label, file}` of every node named `name` when they lie in more than one
-    file and no `file` narrows them (the caller then labels each row with its
-    `target_files`), else None.
+) -> tuple[dict[str, Any] | None, tuple[str, ...], int]:
+    """Look up the nodes named `name`. Returns `ambiguous_targets` (an envelope of
+    their `{label, file}`, `repo_id` too when cross_repo, a file-less one with
+    `file` None) when they lie in more than one file and no `file` narrows them,
+    else None; the labels to look the name up under; and how many files they lie in.
+
+    The lookup seeks `labels`. When it finds nothing it falls back to a scan of
+    every node, so a node whose label the repository does not declare (any more)
+    is still found, and its label is added to the returned ones.
 
     Raises:
         ToolError: no node has that name, or none of them is in `file`.
     """
     params = {"name": name} if cross_repo else {"name": name, "repo_id": repo_id}
-    rows = _query(
-        engine,
-        _named_nodes(labels, "name", cross_repo)
-        + "WITH DISTINCT labels(n)[0] AS label, n.file AS file RETURN label, file ORDER BY file, label",
-        params,
-    )
+    rows = _query(engine, _named_nodes(labels, "name", cross_repo) + _TARGETS_RETURN, params)
     if not rows:
-        raise _not_found(engine, repo_id, "component", name, labels, cross_repo)
+        scope = _cross_scope("n") if cross_repo else "n.repo_id = $repo_id"
+        rows = _query(engine, f"MATCH (n) WHERE n.name = $name AND {scope} AND NOT n:Repository " + _TARGETS_RETURN, params)
+        if not rows:
+            raise _not_found(engine, repo_id, "component", name, labels, cross_repo)
+        found = (row["label"] for row in rows if LABEL_PATTERN.fullmatch(row["label"]))
+        labels = tuple(dict.fromkeys((*labels, *found)))
     files = sorted({row["file"] for row in rows if row["file"] is not None})
     if file is not None:
         if file not in files:
             shown = ", ".join(_echo(f) for f in files[:_DESCRIBE_MAX_CANDIDATES]) or "no file"
             raise ToolError(f"no component named {_echo(name)} in file {_echo(file)}; it is defined in: {shown}")
-        return None
+        return None, labels, 1
     if len(files) < 2:
-        return None
-    return [_sanitize_row(row) for row in rows if row["file"] is not None][:_DESCRIBE_MAX_CANDIDATES]
+        return None, labels, len(files)
+    refs = [
+        {"label": row["label"], "file": row["file"], **({"repo_id": row["repo_id"]} if cross_repo else {})}
+        for row in rows
+    ]
+    ambiguous = {
+        "count": len(refs),
+        "results": [_sanitize_row(ref) for ref in refs[:_DESCRIBE_MAX_CANDIDATES]],
+        "truncated": len(refs) > _DESCRIBE_MAX_CANDIDATES,
+    }
+    return ambiguous, labels, len(files)
+
+
+def _with_target_files(row: dict[str, Any], files: Any) -> dict[str, Any]:
+    """`row` plus `target_files`: the sorted distinct non-null `files`, at most
+    `_MAX_TARGET_FILES`, and `target_file_count` when there are more."""
+    distinct = sorted({f for f in files if f is not None})
+    labelled = {**row, "target_files": distinct[:_MAX_TARGET_FILES]}
+    if len(distinct) > _MAX_TARGET_FILES:
+        labelled["target_file_count"] = len(distinct)
+    return labelled
 
 
 def _node_ref(row: dict[str, Any]) -> dict[str, Any]:
@@ -742,6 +789,7 @@ def describe_node(
         No match raises ToolError with suggestions. `Repository` nodes are never
         matched or listed.
     """
+    file = _normalize_file(file)
     if not name.strip():
         raise ToolError("name is empty; pass a node's exact name, or search_component to find one")
     _at_least(1, max_per_type=max_per_type)
@@ -1264,8 +1312,10 @@ def find_callers(
         types, repo_id, file and confidence (same-named callers in different files
         are separate rows); count 0 for a known target nothing calls. When targets
         of that name lie in several files and `file` is not given, each row adds
-        `target_files`, the files of the targets it calls, and the dict adds
-        `ambiguous_targets` ({label, file}, at most 20)
+        `target_files`, the files of the targets it calls (at most 10, with
+        `target_file_count` past that; a file-less target is never listed), and
+        the dict adds `ambiguous_targets`, a {count, results, truncated} envelope of their
+        {label, file} (file None for a file-less one; repo_id too when cross_repo)
 
     Raises:
         ToolError: no node has that name, or none in `file`.
@@ -1274,8 +1324,8 @@ def find_callers(
     cutoff = None
     if modified_within_commits is not None:
         cutoff = _resolve_recency_cutoff(engine, repo_id, modified_within_commits)
-    labels = component_labels(extra_labels)
-    ambiguous = _resolve_targets(engine, repo_id, target_name, cross_repo, file, labels)
+    file = _normalize_file(file)
+    ambiguous, labels, _ = _resolve_targets(engine, repo_id, target_name, cross_repo, file, component_labels(extra_labels))
     target_files = ", collect(DISTINCT target.file) AS target_files" if ambiguous else ""
 
     class_filter = "AND rel.caller_class = $scope_to_class" if scope_to_class else ""
@@ -1307,7 +1357,7 @@ def find_callers(
 
     results, more = _list_query(engine, cypher, params)
     if ambiguous:
-        results = [{**row, "target_files": sorted(row["target_files"])} for row in results]
+        results = [_with_target_files(row, row["target_files"]) for row in results]
     envelope = _capped_envelope(results, more, max_results)
     if ambiguous:
         envelope["ambiguous_targets"] = ambiguous
@@ -1344,15 +1394,18 @@ def find_related_files(
         Module's path, or, for a Kotlin import, the Class or Function it names.
         When components of that name lie in several files and `file` is not
         given, each row is `{name, target_files}` (the files of the components it
-        is related to) instead of a bare name, and the dict adds
-        `ambiguous_targets` ({label, file}, at most 20)
+        is related to, capped as in find_callers) instead of a bare name, and the
+        dict adds `ambiguous_targets`, a {count, results, truncated} envelope of their
+        {label, file} (file None for a file-less one; repo_id too when cross_repo)
 
     Raises:
         ToolError: no node has that name, or none in `file`.
     """
     _at_least(1, max_results=max_results)
-    labels = component_labels(extra_labels)
-    ambiguous = _resolve_targets(engine, repo_id, component_name, cross_repo, file, labels)
+    file = _normalize_file(file)
+    ambiguous, labels, _ = _resolve_targets(
+        engine, repo_id, component_name, cross_repo, file, component_labels(extra_labels)
+    )
     cypher = f"""
     {_named_nodes(labels, "component_name", cross_repo)}
     WITH n WHERE $file IS NULL OR n.file = $file
@@ -1376,11 +1429,11 @@ def find_related_files(
         return {key: _envelope(results[0][key], max_results) for key in keys}
     answer: dict[str, Any] = {}
     for key in keys:
-        files: dict[str, list[str]] = {}
+        by_name: dict[str, list[str]] = {}
         for row in results:
             for name in row[key]:
-                files.setdefault(name, []).append(row["target_file"])
-        answer[key] = _envelope([{"name": name, "target_files": f} for name, f in files.items()], max_results)
+                by_name.setdefault(name, []).append(row["target_file"])
+        answer[key] = _envelope([_with_target_files({"name": name}, f) for name, f in by_name.items()], max_results)
     answer["ambiguous_targets"] = ambiguous
     return answer
 
@@ -1586,39 +1639,57 @@ def impact_analysis(
         envelopes, plus risk_level (computed from true untruncated count). Transitive
         dependents are 2 to `IMPACT_MAX_DEPTH` hops away; a node is listed at its
         nearest hop only, so a direct dependent is never also transitive. When
-        components of that name lie in several files and `file` is not given, each
-        file's are traced apart: every dependent adds `target_files`, the files of
-        the targets it depends on, risk_level is the riskiest target's, and the dict
-        adds `ambiguous_targets` ({label, file}, at most 20)
+        components of that name lie in several files and `file` is not given, the
+        dict adds `ambiguous_targets`, a {count, results, truncated} envelope of their
+        {label, file} (file None for a file-less one; repo_id too when cross_repo). Up to `IMPACT_MAX_SPLIT` files, each file's are traced
+        apart: a dependent is listed at its nearest hop to any of them, with
+        `target_files` (capped as in find_callers): for a direct dependent the
+        files of the targets it depends on directly, for a transitive one those of
+        every target that reaches it within `IMPACT_MAX_DEPTH` hops; risk_level is
+        the riskiest target's. Past that, one expansion covers them all, as for a
+        single target, with a notice to pass `file`. Another same-named target can
+        itself be listed as a dependent.
 
     Raises:
         ToolError: no node has that name, or none in `file`.
     """
     _at_least(1, max_results=max_results)
-    labels = component_labels(extra_labels)
-    ambiguous = _resolve_targets(engine, repo_id, component_name, cross_repo, file, labels)
+    file = _normalize_file(file)
+    ambiguous, labels, files = _resolve_targets(
+        engine, repo_id, component_name, cross_repo, file, component_labels(extra_labels)
+    )
+    # Each file's targets are traced apart only for a few files: the expansion
+    # runs once per file, and a name like `get` is defined in hundreds.
+    split = ambiguous is not None and files <= IMPACT_MAX_SPLIT
     cypher = f"""
     {_named_nodes(labels, "component_name", cross_repo)}
     WITH n WHERE $file IS NULL OR n.file = $file
     WITH CASE WHEN $split THEN n.file END AS target_file, collect(n) AS l0
     CALL (l0) {{
-    {_impact_expansion(cross_repo, with_ids=bool(ambiguous))}
+    {_impact_expansion(cross_repo, with_ids=split)}
     }}
     RETURN target_file, direct_dependents, transitive_dependents, direct_count
     ORDER BY target_file
     """
-    params = {"component_name": component_name, "file": file, "split": bool(ambiguous)}
+    params = {"component_name": component_name, "file": file, "split": split}
     if not cross_repo:
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if not ambiguous:
+    if not split:
         row = results[0]
-        return {
+        answer = {
             "direct_dependents": _envelope(row["direct_dependents"], max_results),
             "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
             "risk_level": _risk_level(row["direct_count"]),
         }
+        if ambiguous:
+            answer["ambiguous_targets"] = ambiguous
+            answer["notices"] = [
+                f"{_echo(component_name)} is defined in {files} files; their dependents are listed together "
+                "and risk_level is theirs together. Pass file to analyse one."
+            ]
+        return answer
     # A dependent is listed once, at its nearest hop to any target (as the union of
     # the targets would list it), with the files of every target it depends on.
     direct_ids = {d["id"] for row in results for d in row["direct_dependents"]}
@@ -1628,10 +1699,10 @@ def impact_analysis(
             for d in row[key]:
                 if key == "transitive_dependents" and d["id"] in direct_ids:
                     continue
-                entry = dependents.setdefault(d["id"], {"key": key, "name": d["name"], "type": d["type"], "target_files": []})
-                entry["target_files"].append(row["target_file"])
+                entry = dependents.setdefault(d["id"], {"key": key, "row": {"name": d["name"], "type": d["type"]}, "files": []})
+                entry["files"].append(row["target_file"])
     lists = {
-        key: [{k: v for k, v in d.items() if k != "key"} for d in dependents.values() if d["key"] == key]
+        key: [_with_target_files(d["row"], d["files"]) for d in dependents.values() if d["key"] == key]
         for key in ("direct_dependents", "transitive_dependents")
     }
     return {
@@ -1851,12 +1922,18 @@ def explain_architecture(
     rows, more = _list_query(engine, cypher, {"repo_id": repo_id})
     services: list[dict[str, Any]] = []
     endpoints: list[dict[str, Any]] = []
-    for row in rows:
+    seen_services: set[tuple[Any, ...]] = set()
+    seen_endpoints: set[tuple[Any, ...]] = set()
+    for row in rows:  # two same-named services with the same lists are one entry, as before
         service = _sanitize_deep({"service": row["service"], "uses": row["datastore_names"]})
-        if service not in services:
+        key = (service["service"], tuple(service["uses"]))
+        if key not in seen_services:
+            seen_services.add(key)
             services.append(service)
         called = _sanitize_deep({"endpoints": row["endpoint_names"], "calls": row["service"]})
-        if called["endpoints"] and called not in endpoints:
+        key = (called["calls"], tuple(called["endpoints"]))
+        if called["endpoints"] and key not in seen_endpoints:
+            seen_endpoints.add(key)
             endpoints.append(called)
     return {
         "services_and_datastores": _capped_envelope(services, more, max_results),
@@ -1967,7 +2044,8 @@ def find_requirements_for(
     Raises:
         ToolError: no node has that name.
     """
-    labels = component_labels(extra_labels)
+    _at_least(1, max_results=max_results)
+    _, labels, _ = _resolve_targets(engine, repo_id, component_name, cross_repo, None, component_labels(extra_labels))
     cypher = f"""
     {_named_nodes(labels, "component_name", cross_repo)}
     MATCH (n)-[:SATISFIES]->(r:Requirement)
@@ -1979,10 +2057,7 @@ def find_requirements_for(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    _at_least(1, max_results=max_results)
     results, more = _list_query(engine, cypher, params)
-    if not results and not _exists(engine, repo_id, component_name, labels, cross_repo):
-        raise _not_found(engine, repo_id, "component", component_name, labels, cross_repo)
     return _capped_envelope(results, more, max_results)
 
 
@@ -2009,7 +2084,7 @@ def trace_design_rationale(
     Raises:
         ToolError: no node has that name.
     """
-    labels = component_labels(extra_labels)
+    _, labels, _ = _resolve_targets(engine, repo_id, component_name, cross_repo, None, component_labels(extra_labels))
     cypher = f"""
     {_named_nodes(labels, "component_name", cross_repo)}
     OPTIONAL MATCH (n)-[:SATISFIES]->(req:Requirement)
@@ -2024,8 +2099,6 @@ def trace_design_rationale(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if not results:
-        raise _not_found(engine, repo_id, "component", component_name, labels, cross_repo)
     return _sanitize_row(results[0])
 
 
@@ -2107,6 +2180,8 @@ def find_related_prs(
     """
     _at_least(1, max_results=max_results)
     if _source_off(registry, repo_id, "pr_source_enabled"):
+        if not _exists(engine, repo_id, component_name, ("Module",), cross_repo):
+            raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
         return _source_off_notice(max_results, "PR", "pr-source", repo_id)
 
     repo_filter = _cross_scope("m", "AND") if cross_repo else "AND m.repo_id = $repo_id"
@@ -2161,6 +2236,8 @@ def issue_history_for(
     """
     _at_least(1, max_results=max_results)
     if _source_off(registry, repo_id, "issue_source_enabled"):
+        if not _exists(engine, repo_id, component_name, ("Module",), cross_repo):
+            raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
         return _source_off_notice(max_results, "Issue", "issue-source", repo_id)
 
     repo_filter = _cross_scope("m", "AND") if cross_repo else "AND m.repo_id = $repo_id"
@@ -2219,6 +2296,7 @@ def get_source(
         undeclared file is not valid UTF-8, or a file isn't valid in its
         declared codec, the dict adds a `notice` saying how it was decoded.
     """
+    file = _normalize_file(file)
     repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
     cypher = f"""
     MATCH (n)

@@ -4,6 +4,7 @@ repository's PR or issue source off they say how to turn it on."""
 import subprocess
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.mcp import tools
 from devgraph.mcp.tools import find_related_prs, issue_history_for
@@ -19,12 +20,13 @@ class _Registry:
 
 
 class _Graph:
-    def __init__(self):
+    def __init__(self, file_exists=True):
         self.queries = []
+        self.file_exists = file_exists
 
     def run_read_cypher(self, query, params, *, timeout_s, max_rows):
         self.queries.append(query)
-        return ([{"found": 1}] if query.endswith("RETURN 1 LIMIT 1") else []), False  # the file exists
+        return ([{"found": 1}] if self.file_exists and query.endswith("RETURN 1 LIMIT 1") else []), False
 
 
 @pytest.fixture
@@ -46,7 +48,14 @@ def test_a_source_that_is_off_returns_a_notice_and_runs_nothing(tmp_path, no_sub
     result = tool(graph, "widget", "widget/core.py", registry=registry)
     assert result["count"] == 0 and result["results"] == [] and result["truncated"] is False
     assert command in result["notice"]
-    assert graph.queries == []
+    assert len(graph.queries) == 1 and graph.queries[0].endswith("RETURN 1 LIMIT 1")  # only: does the file exist
+
+
+@pytest.mark.parametrize("tool", [find_related_prs, issue_history_for])
+def test_an_unknown_file_is_an_error_even_with_the_source_off(tmp_path, no_subprocess, tool):
+    registry = _Registry(RepoRecord("widget", tmp_path, True, True, None))
+    with pytest.raises(ToolError, match="no file named 'widget/nope.py'"):
+        tool(_Graph(file_exists=False), "widget", "widget/nope.py", registry=registry)
 
 
 @pytest.mark.parametrize(

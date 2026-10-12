@@ -684,8 +684,8 @@ def build_server(
         are excluded, not silently included). An unknown target is an error with similar
         names; a known one nothing calls is count 0. When the name is defined in several
         files, pass file (the target's repo-relative path) to pick one; without it each
-        caller adds target_files (the files of the targets it calls) and
-        ambiguous_targets lists them."""
+        caller adds target_files (the files of the targets it calls, at most 10) and
+        ambiguous_targets lists the definitions."""
         return devgraph_tools.find_callers(
             engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits,
             resolved_only, file, declared(repo_id, cross_repo),
@@ -732,9 +732,11 @@ def build_server(
         transitive ones (two to four hops; further ones are not followed). Dependents
         wrapped in {count, results, truncated} envelopes. An unknown component is an
         error with similar names. When the name is defined in several files, pass file
-        (repo-relative path) to pick one; without it each file's are traced apart, every
-        dependent adds target_files (the files of the targets it depends on), risk_level
-        is the riskiest one's, and ambiguous_targets lists them."""
+        (repo-relative path) to pick one; without it ambiguous_targets lists them, and for
+        up to five files each is traced apart (every dependent adds target_files, the
+        targets it depends on, and risk_level is the riskiest one's); past five, their
+        dependents are listed together, with a notice. Another same-named definition
+        can itself appear as a dependent."""
         return devgraph_tools.impact_analysis(
             engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo)
         )

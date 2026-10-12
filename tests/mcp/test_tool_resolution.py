@@ -294,7 +294,7 @@ def test_a_shadowed_builtin_with_another_dict_shape_carries_the_notice(tmp_path,
 
 def test_a_shadowed_builtin_answers_with_its_own_envelope(tmp_path, monkeypatch):
     server, _ = build(tmp_path, monkeypatch, project=PROJECT.replace("list_files", "find_requirements_for"))
-    monkeypatch.setattr(devgraph_tools, "_exists", lambda *args: True)
+    monkeypatch.setattr(devgraph_tools, "_resolve_targets", lambda *args: (None, args[-1], 1))
     args = {"repo_id": "demo", "component_name": "x"}
     result = asyncio.run(server.call_tool("find_requirements_for", args)).structured_content
     assert {k: result[k] for k in ("count", "results", "truncated")} == {"count": 0, "results": [], "truncated": False}

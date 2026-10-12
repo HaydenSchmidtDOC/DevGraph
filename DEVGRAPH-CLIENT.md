@@ -254,12 +254,20 @@ mismatch, not a graph gap.
 `find_related_files` take an optional `file` (the target's repo-relative
 path) to pick one of several functions or classes with the same name. Without
 it, a name defined in more than one file is answered for all of them, with the
-same rows as before, but every row adds `target_files`, the files of the
-targets it belongs to (in `find_related_files` a row becomes
-`{"name", "target_files"}`); `impact_analysis` traces each file's target apart
-and reports the riskiest one's `risk_level`; and the response adds
-`ambiguous_targets` (`{label, file}`, at most 20). A name defined in one file
-answers as before, with no `target_files`.
+same rows as before, and the response adds `ambiguous_targets`, a
+`{count, results, truncated}` envelope of the definitions' `{label, file}`
+(`file` is null for a file-less one, such as a route's handler stub; `repo_id`
+is added with `cross_repo`). Every `find_callers` and `find_related_files` row
+adds `target_files`, the files of the targets it belongs to (at most 10, with
+`target_file_count` past that; a file-less target is never listed); in
+`find_related_files` a row becomes `{"name", "target_files"}`.
+`impact_analysis` traces each file's target apart for up to five files: every
+dependent adds `target_files` and `risk_level` is the riskiest one's. For a
+name in more files (`get`, `run`) the dependents of all of them are listed
+together, with a notice to pass `file`. Another definition of the same name
+can itself appear as a dependent. A name defined in one file answers as
+before, with no `target_files`. `file` takes `\` or `/`, with or without a
+leading `./`.
 
 **Response shape (`count`/`results`/`truncated`)**: `search_component`,
 `find_callers`, `list_services`, `find_related_prs`, `issue_history_for`,
