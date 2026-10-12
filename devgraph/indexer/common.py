@@ -21,6 +21,7 @@ from devgraph.graph.schema import (
     pin_kind,
     pin_root,
     split_pin,
+    unscoped_pin,
 )
 
 __all__ = [
@@ -159,16 +160,18 @@ def own_edges(result: ExtractionResult, file_path: str) -> ExtractionResult:
 
 
 
-def pin_matches(pin: str | None, path: str) -> bool:
+def pin_matches(pin: str | None, path: str, keys: Iterable[str] = ()) -> bool:
     """Whether the path pin `pin` (a relationship's `to_file`, see
     graph/schema.py `pin_kind` and `split_pin` for its flags) matches the
-    repository-relative `path`: None matches every path, "" only the
-    file-less node (path ""), a file only itself. The engine's Cypher mirrors
-    this."""
+    node at the repository-relative `path` whose `mkeys` are `keys`: None
+    matches every path, "" only the file-less node (path ""), a file only
+    itself. The engine's Cypher mirrors this."""
     if pin is None:
         return True
     parts = split_pin(pin)
     base = parts.base
+    if parts.scope and not set(parts.scope) & set(keys):
+        return False
     if parts.not_suffix and path.endswith(parts.not_suffix):
         return False
     if parts.only and not path.endswith(parts.only):
@@ -215,12 +218,13 @@ def pin_excludes(pins: Iterable[str], file_path: str) -> dict[str, list[str]]:
     return excludes
 
 
-def best_pin(pins: Iterable[str], path: str, file_path: str) -> str | None:
+def best_pin(pins: Iterable[str], path: str, file_path: str, keys: Iterable[str] = ()) -> str | None:
     """The pin of `pins` (one call's, written by `file_path`) whose row links
-    the node at `path`, or None when none does: the highest-precedence pin
-    that matches it (see `pin_excludes`)."""
+    the node at `path` whose `mkeys` are `keys`, or None when none does: the
+    highest-precedence pin that matches it (see `pin_excludes`)."""
+    keys = tuple(keys)
     for pin, excluded in pin_excludes(pins, file_path).items():
-        if pin_matches(pin, path) and not any(pin_matches(other, path) for other in excluded):
+        if pin_matches(pin, path, keys) and not any(pin_matches(other, path, keys) for other in excluded):
             return pin
     return None
 
@@ -260,7 +264,10 @@ def name_ref_properties(rels: list[dict]) -> dict:
     empty). `pins` is empty for an unpinned target, else the target's
     `to_file`s joined by NAME_REF_PIN_SEP, with NAME_REF_FILELESS for "";
     a pinned and an unpinned edge of the same source and name are separate
-    entries. An unpinned entry's `confidence` is its edges' `confidence`
+    entries. A pin's `@` flag keeps only its "@" there, and the entry's
+    match keys follow `confidence` as one more field, once: one call's `@`
+    pins share them (graph/schema.py `scoped_pin`); an entry with none has
+    no such field. An unpinned entry's `confidence` is its edges' `confidence`
     property. A pinned entry's is "pin" when its edges carry one, each pin's
     being its kind's (graph/schema.py `PIN_CONFIDENCE`), and empty when they
     carry none. `name_ref_targets` is their sorted
@@ -268,7 +275,7 @@ def name_ref_properties(rels: list[dict]) -> dict:
     `from_name`s of their unpinned non-Module sources. All three are lists,
     empty when there is nothing.
     """
-    entries: dict[tuple, tuple[set, set]] = {}
+    entries: dict[tuple, tuple[set, set, set]] = {}
     targets, sources = set(), set()
     for rel in rels:
         unpinned_source = not rel.get("from_file") and rel["from_label"] != "Module"
@@ -287,20 +294,26 @@ def name_ref_properties(rels: list[dict]) -> dict:
             # pins each carry their kind's.
             None if to_file is not None else properties.get("confidence") or "",
         )
-        pins, confidences = entries.setdefault(key, (set(), set()))
+        pins, confidences, scopes = entries.setdefault(key, (set(), set(), set()))
         if to_file is not None:
+            to_file, scope = unscoped_pin(to_file)
             pins.add(to_file)
+            if scope:
+                scopes.add(scope)
             if properties.get("confidence"):
                 confidences.add(PIN_BY_KIND)
         targets.add(rel["to_name"])
         if unpinned_source:
             sources.add(rel["from_name"])
     refs = set()
-    for key, (pins, confidences) in entries.items():
+    for key, (pins, confidences, scopes) in entries.items():
         *fields, unpinned_confidence = key
         encoded = NAME_REF_PIN_SEP.join(sorted(NAME_REF_FILELESS if pin == "" else pin for pin in pins))
         confidence = unpinned_confidence if unpinned_confidence is not None else min(confidences, default="")
-        refs.add(NAME_REF_SEP.join((*fields, encoded, confidence)))
+        if len(scopes) > 1:
+            raise ValueError(f"one call's @ pins carry different match keys: {key[:6]!r}")
+        scope = [",".join(next(iter(scopes)))] if scopes else []
+        refs.add(NAME_REF_SEP.join((*fields, encoded, confidence, *scope)))
     return {"name_refs": sorted(refs), "name_ref_targets": sorted(targets), "name_ref_sources": sorted(sources)}
 
 
@@ -323,14 +336,16 @@ def pin_confidence(pin: str, entry_confidence: str) -> str:
 
 def parse_name_ref(entry: str) -> tuple[list[str], list[str] | None, str]:
     """An entry of `name_refs` as (its first seven fields, its target pins
-    (None when unpinned, "" for the file-less node), its confidence). An
-    entry written before pins (seven fields) is unpinned, with no
-    confidence."""
+    (None when unpinned, "" for the file-less node), its confidence), each
+    `@` pin with the entry's match keys back on it. An entry written before
+    pins (seven fields) is unpinned, with no confidence."""
     fields = entry.split(NAME_REF_SEP)
     if len(fields) == 7:
         return fields, None, ""
+    scope = fields.pop() if len(fields) == 10 else ""
     *head, encoded, confidence = fields
     pins = [
-        "" if pin == NAME_REF_FILELESS else pin for pin in encoded.split(NAME_REF_PIN_SEP)
+        "" if pin == NAME_REF_FILELESS else pin + scope if pin.endswith("@") and split_pin(pin + scope).scope else pin
+        for pin in encoded.split(NAME_REF_PIN_SEP)
     ] if encoded else None
     return head, pins, confidence

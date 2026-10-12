@@ -811,7 +811,9 @@ def index_paths(
     # What the batch's files produced before this run, so the referrer step
     # below can tell which nodes the batch adds.
     batch_keys = sorted(by_rel_path)
-    previous_nodes = engine.list_file_nodes(repo_id, batch_keys)
+    previous = engine.list_file_nodes(repo_id, batch_keys)
+    previous_nodes = {node[:3] for node in previous}
+    previous_keys = {node[:3]: node[3] for node in previous}
     # The claims on the shared nodes the batch's files claim (see
     # _written_back_shared).
     claims_before = engine.list_shared_claims(repo_id, batch_keys) if any(not n[2] for n in previous_nodes) else {}
@@ -869,6 +871,14 @@ def index_paths(
     if docs_batch:
         added -= {node for node in batch_nodes if node[:2] in docs_batch.existing}
     added_nodes = {node[:2] for node in added}
+    # A kept node whose match keys changed was linked by `@` pins under its
+    # old keys: its CALLS/IMPORTS edges go now, before pass 2 and the relink
+    # below write them again under the new ones, as for an added node. It is
+    # not added otherwise: no referrer, docs or mention depends on its keys.
+    match_keys = _match_keys(code_extractions)
+    rekeyed = {node for node, keys in match_keys.items() if previous_keys.get(node, keys) != keys}
+    if rekeyed:
+        engine.retract_match_key_edges(repo_id, sorted(rekeyed))
     referrers = _find_referrers(engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path))
     for rel_path in sorted(referrers):
         index_one(rel_path, root_resolved / rel_path)
@@ -953,7 +963,7 @@ def index_paths(
     # edges straight from the graph, with no file read. A full scan has no
     # file outside the batch.
     if relink_outside:
-        _relink_name_refs(engine, repo_id, added, set(by_rel_path) | referrers)
+        _relink_name_refs(engine, repo_id, added | rekeyed, set(by_rel_path) | referrers, match_keys)
 
     # Service cross-linking runs as a final pass, after every file in this
     # batch (including any compose file) has been indexed — Service nodes'
@@ -1285,14 +1295,31 @@ def _batch_nodes(
     return nodes
 
 
+def _match_keys(
+    code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
+) -> dict[tuple[str, str, str], tuple[str, ...]]:
+    """(label, name, file) -> sorted `mkeys` of every code node this batch
+    wrote that carries them (graph/schema.py `split_pin`'s `@` flag tests
+    them); a node without them keeps the ones it has."""
+    return {
+        (node["label"], node["name"], node["properties"]["file"]): tuple(sorted(set(node["properties"]["mkeys"])))
+        for extractions in code_extractions
+        for _rel_path, (file_nodes, _rels) in extractions.items()
+        for node in file_nodes
+        if node["properties"].get("file") and node["properties"].get("mkeys") is not None
+    }
+
+
 def _relink_name_refs(
-    engine: GraphEngine, repo_id: str, added: set[tuple[str, str, str]], skip: set[str]
+    engine: GraphEngine, repo_id: str, added: set[tuple[str, str, str]], skip: set[str],
+    match_keys: dict[tuple[str, str, str], tuple[str, ...]] | None = None,
 ) -> None:
     """Re-write the by-name edges that code files outside `skip` recorded in
     their Modules' `name_refs` (see name_ref_properties) and that meet a node
     in `added`: by their target, or by an unpinned non-Module source (a Rust
     `impl Trait for Foo` whose `Foo` was just added). Those files were
-    indexed before the node existed, so the edge was skipped then. One graph
+    indexed before the node existed, so the edge was skipped then (or, for
+    a node whose match keys changed, its edges were retracted). One graph
     read and one upsert, no file read; each edge's origin is its file.
 
     The end that met an added node is pinned to it when its label is keyed
@@ -1301,10 +1328,11 @@ def _relink_name_refs(
     was added), and a bare-name match can't use the file-keyed index. An
     entry with target pins relinks only an added node a pin of its links
     (common.best_pin: the strongest pin that matches its file, as the
-    writer's rows leave out what a stronger pin matches), with that pin's
-    confidence. A pinned Module target is found by an added Module's
-    directory, directory name or basename (the row's `to_name`, see
-    common.module_pin_name) and relinked by its path. Each edge gets back the entry's `caller_class`.
+    writer's rows leave out what a stronger pin matches, tested against
+    the node's `match_keys`), with that pin's confidence. A pinned Module
+    target is found by an added Module's directory, directory name or
+    basename (the row's `to_name`, see common.module_pin_name) and relinked
+    by its path. Each edge gets back the entry's `caller_class`.
     """
     if not added:
         return
@@ -1351,7 +1379,8 @@ def _relink_name_refs(
                             relink(origin, fields, from_file, None, pin_confidence(pin, confidence), to_name=module)
             else:
                 for to_file in pinned.get((to_label, to_name), ()):
-                    pin = best_pin(pins, to_file or "", origin) if to_file is not None else None
+                    keys = (match_keys or {}).get((to_label, to_name, to_file), ())
+                    pin = best_pin(pins, to_file or "", origin, keys) if to_file is not None else None
                     if pin is not None:
                         relink(origin, fields, from_file, to_file, pin_confidence(pin, confidence))
             if not from_file and from_label != "Module":

@@ -99,9 +99,29 @@ agree):
   language, and `pkg/.` would also match the `.md` beside the Go files), `^`
   (no directory of the matched file's source root, the path before what the
   pin matches, is a vendored one such as `third_party` or `vendor`; `^t`
-  nor is that root a conventional test root) and `!_test.go` (the matched file must not end
-  with it). The kind is read after the flags are stripped; a resolver never
-  writes a path pin whose own path holds a flag character.
+  nor is that root a conventional test root), `!_test.go` (the matched file must not end
+  with it) and `@Shop:User,.:User` (the matched node's `mkeys`, its match
+  keys, must hold one of these; each key holds a `:`, so a name starting
+  with `@`, such as an npm scope, is no flag). The kind is read after the
+  flags are stripped; a resolver never writes a path pin whose own path
+  holds a flag character.
+- **Match keys** (`@`, for C# namespaces; see the C# section) are written
+  canonically, sorted and without repeats, by `schema.scoped_pin`, which
+  drops the flag when there are more than 32: the site then links by its
+  path alone. A Class or Function that carries `mkeys` always carries them,
+  sorted, even when empty; a node without them (any other language, or a
+  graph written before them) matches no `@` pin and every other one. The
+  Cypher reads them as `coalesce(n.mkeys, [])`, and an `@` flag with no
+  keys does not exist. A node keeps its identity, `(name, file)`, when its
+  keys change, so the edges `@` pins gave it would go stale: a batch
+  compares each kept node's keys with the graph's (`list_file_nodes` gives
+  them), and for every node whose keys changed
+  `engine.retract_match_key_edges` deletes its incoming `CALLS` and
+  `IMPORTS` edges (the types a resolver writes `@` pins on) after pass 1.
+  Pass 2 writes the batch's again, and the relink writes other files'
+  again under the new keys, as for an added node; such a node is not
+  added otherwise (no referrer, docs edge or mention depends on its keys),
+  and its `MODIFIES` and `MENTIONS` edges stay.
 - **Confidence is the pin kind's**, so it never depends on which other pins a
   row was written with. Precedence runs down the table: each row's pin leaves
   out every file a higher-precedence pin of the same call (the same caller and
@@ -127,7 +147,10 @@ agree):
   inside a method `m` never links the method to itself. A collapsed row has it
   only when every one of its call sites had it.
 
-`name_refs` keeps its format (pins are strings). A pinned entry no longer
+`name_refs` keeps its format (pins are strings), with one field more for
+an entry whose pins carry match keys: they are stored once, after the
+confidence, each such pin keeping only its `@` (one call's `@` pins share
+one key set). A pinned entry no longer
 stores one confidence for all its pins: its confidence field is `pin` when its
 edges carry one, and relink gives each pin its kind's (`common.best_pin`
 picks the strongest pin matching the added file, as the writer's `exclude`

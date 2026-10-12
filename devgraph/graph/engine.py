@@ -702,6 +702,9 @@ def _pin(file: str | None) -> str:
     return pin_kind(file)
 
 
+#: The edge types a resolver writes with a pin's `@` flag, whose edges into a
+#: node therefore depend on its match keys (see retract_match_key_edges).
+MATCH_KEY_EDGE_TYPES = ("CALLS", "IMPORTS")
 #: The pin kinds that match a set of files rather than one (see `_pin`).
 _PATH_PINS = frozenset({"dir", "loose_dir", "suffix", "suffix_dir", "prefix"})
 #: The path pins whose files all start with the pin's own path (`pin_value`'s
@@ -817,9 +820,10 @@ _ADD_ORIGIN = (
 )
 
 
-def _pin_test(pin: str, file: str) -> str:
-    """Cypher for graph/schema.py's `pin_value` map `pin` matching the path
-    `file`, as devgraph/indexer/common.py `pin_matches` defines it."""
+def _pin_test(pin: str, file: str, node: str) -> str:
+    """Cypher for graph/schema.py's `pin_value` map `pin` matching the node
+    `node` at the path `file`, as devgraph/indexer/common.py `pin_matches`
+    defines it (the node's `mkeys` are its keys)."""
     name = f"last(split({file}, '/'))"
     # graph/schema.py pin_root: the part of the path before what the pin matches.
     def cut(length: str) -> str:  # never a negative length, which left() rejects
@@ -834,7 +838,8 @@ def _pin_test(pin: str, file: str) -> str:
         f"(({pin}.ns = '' OR NOT {file} ENDS WITH {pin}.ns) "
         f"AND (size({pin}.os) = 0 OR any(s IN {pin}.os WHERE {file} ENDS WITH s)) "
         f"AND (size({pin}.nv) = 0 OR NOT any(s IN split({root}, '/') WHERE s IN {pin}.nv)) "
-        f"AND (size({pin}.nr) = 0 OR NOT any(s IN {pin}.nr WHERE '/' + {root} + '/' CONTAINS s)) AND CASE {pin}.k "
+        f"AND (size({pin}.nr) = 0 OR NOT any(s IN {pin}.nr WHERE '/' + {root} + '/' CONTAINS s)) "
+        f"AND (size({pin}.sc) = 0 OR any(s IN {pin}.sc WHERE s IN coalesce({node}.mkeys, []))) AND CASE {pin}.k "
         f"WHEN 'file' THEN {file} = {pin}.v "
         f"WHEN 'dir' THEN {file} STARTS WITH {pin}.v AND NOT substring({file}, size({pin}.v)) CONTAINS '/' "
         f"WHEN 'suffix' THEN '/' + {file} ENDS WITH {pin}.v "
@@ -844,13 +849,13 @@ def _pin_test(pin: str, file: str) -> str:
     )
 
 
-def _path_pin_conditions(ref: str, path: str) -> list[str]:
+def _path_pin_conditions(ref: str, path: str, node: str) -> list[str]:
     """Cypher conditions for a path-pinned target `ref` (see
-    `_group_rels_by_triple`) matching the path `path`: its `pin` matches and
-    no exclusion does."""
+    `_group_rels_by_triple`) matching the node `node` at the path `path`: its
+    `pin` matches and no exclusion does."""
     return [
-        _pin_test(f"{ref}.pin", path), f"NOT {path} IN {ref}.ex_files",
-        f"NOT any(x IN {ref}.ex_pins WHERE {_pin_test('x', path)})",
+        _pin_test(f"{ref}.pin", path, node), f"NOT {path} IN {ref}.ex_files",
+        f"NOT any(x IN {ref}.ex_pins WHERE {_pin_test('x', path, node)})",
     ]
 
 
@@ -894,7 +899,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
                 conditions.insert(0, f"{path} STARTS WITH {ref}.pin.v")
             elif label in FILE_SCOPED_LABELS:
                 match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
-        conditions[:0] = _path_pin_conditions(ref, path)
+        conditions[:0] = _path_pin_conditions(ref, path, var)
         return match + "WHERE " + " AND ".join(conditions) + " "
     pinned = pin == "file"
     keys = "repo_id, name, file" if pinned else "repo_id, name"
@@ -1679,19 +1684,21 @@ class GraphEngine:
         records = self.run_cypher(query, {"repo_id": repo_id, "names": names})
         return [(record["name"], record["label"]) for record in records]
 
-    def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str, str]]:
-        """Return (label, name, file) for every node whose file provenance
+    def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str, str, tuple[str, ...]]]:
+        """Return (label, name, file, mkeys) for every node whose file provenance
         (`source_file`/`file`, a `Module` named by its path, or a schema
         provider's node, which its `path` owns) is one of `files`. `file` is
         that provenance: the Module's name, else `file`, `source_file` or
         `path`, in that order. A shared node one of `files` claims (in its
         `sources`: a `Container`, `Datastore`, `Endpoint` or handler stub) is
         returned with `file` "", besides any row for its own provenance.
+        `mkeys` is the node's match keys, sorted (empty when it has none).
 
         index_paths snapshots this before re-indexing a batch so it can tell
         which nodes the batch *adds* -- only those can be the missing
         target of an edge from a file outside the batch. A node moving
-        between two of the batch's files counts as added.
+        between two of the batch's files counts as added. It also tells
+        which kept nodes' match keys change (see retract_match_key_edges).
 
         Each label is matched on its own: the built-in ones through their
         provenance indexes, a provider's through the labels the repository's
@@ -1716,14 +1723,36 @@ class GraphEngine:
                 "   any(s IN coalesce(n.sources, []) WHERE s IN $files) AS claimed "
                 "WHERE owned OR claimed "
                 "RETURN DISTINCT labels(n)[0] AS label, n.name AS name, owned, claimed, "
-                "CASE WHEN n:Module THEN n.name ELSE coalesce(n.file, n.source_file, n.path) END AS file",
+                "CASE WHEN n:Module THEN n.name ELSE coalesce(n.file, n.source_file, n.path) END AS file, "
+                "coalesce(n.mkeys, []) AS mkeys",
                 repo_id=repo_id,
                 files=files,
             )
-            records = list(result or [])
-            return {(r["label"], r["name"], r["file"]) for r in records if r["owned"]} | {
-                (r["label"], r["name"], "") for r in records if r["claimed"]
+            records = [(r, tuple(sorted(set(r["mkeys"])))) for r in result or []]
+            return {(r["label"], r["name"], r["file"], keys) for r, keys in records if r["owned"]} | {
+                (r["label"], r["name"], "", keys) for r, keys in records if r["claimed"]
             }
+
+    def retract_match_key_edges(self, repo_id: str, nodes: list[tuple[str, str, str]]) -> None:
+        """Delete the CALLS and IMPORTS edges into these (label, name, file)
+        nodes, whose match keys (`mkeys`) a batch changed: a pin's `@` flag
+        (graph/schema.py `split_pin`) linked them under the old keys, so the
+        batch writes them again under the new ones, the way it writes an
+        added node's. Each label's (repo_id, name, file) index is hinted to
+        seek, for the reason _end_match gives. Every other edge stays."""
+        groups: dict[str, list[dict[str, str]]] = {}
+        for label, name, file in nodes:
+            groups.setdefault(label, []).append({"name": name, "file": file})
+        with self._driver.session() as session:
+            for label, rows in sorted(groups.items()):
+                _retry_transient(
+                    session.run,
+                    f"UNWIND $rows AS row MATCH (b:{label} {{repo_id: $repo_id, name: row.name, file: row.file}}) "
+                    f"USING INDEX SEEK b:{label}(repo_id, name, file) "
+                    f"MATCH ()-[r:{'|'.join(MATCH_KEY_EDGE_TYPES)}]->(b) DELETE r",
+                    repo_id=repo_id,
+                    rows=rows,
+                )
 
     def find_name_refs(self, repo_id: str, names: list[str], skip: list[str]) -> list[tuple[str, list[str]]]:
         """(Module name, entries) for every Module outside `skip` whose
