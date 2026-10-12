@@ -814,6 +814,7 @@ def index_paths(
     previous = engine.list_file_nodes(repo_id, batch_keys)
     previous_nodes = {node[:3] for node in previous}
     previous_keys = {node[:3]: node[3] for node in previous}
+    stale = {node[:3] for node in previous if node[4]}
     # The claims on the shared nodes the batch's files claim (see
     # _written_back_shared).
     claims_before = engine.list_shared_claims(repo_id, batch_keys) if any(not n[2] for n in previous_nodes) else {}
@@ -871,17 +872,24 @@ def index_paths(
     if docs_batch:
         added -= {node for node in batch_nodes if node[:2] in docs_batch.existing}
     added_nodes = {node[:2] for node in added}
-    # A kept node whose match keys changed was linked by `@` pins under its
-    # old keys: its CALLS/IMPORTS edges go now, before pass 2 and the relink
-    # below write them again under the new ones, as for an added node. It is
-    # not added otherwise: no referrer, docs or mention depends on its keys.
-    # One written without keys loses those it had.
+    # Match keys, which pass 1 left as they were, are written now, before
+    # pass 2 tests them. A kept node whose keys changed (no keys and none
+    # being the same) was linked by `@` pins under its old ones: its
+    # CALLS/IMPORTS edges go with them, and pass 2 and the relink below
+    # write them again under the new ones, as for an added node; one a
+    # failed batch left stale goes again. It is not added otherwise: no
+    # referrer, docs or mention depends on its keys.
     match_keys = _match_keys(code_extractions)
-    rekeyed = {node for node, keys in match_keys.items() if previous_keys.get(node, keys) != keys}
-    if rekeyed:
-        engine.retract_match_key_edges(
-            repo_id, sorted(rekeyed), {node for node in rekeyed if match_keys[node] is None}
-        )
+    rekeyed = {
+        node for node, keys in match_keys.items()
+        if node in stale or (node in previous_keys and (previous_keys[node] or ()) != (keys or ()))
+    }
+    rewritten = sorted(
+        (*node, keys, node in rekeyed) for node, keys in match_keys.items()
+        if node in rekeyed or previous_keys.get(node) != keys
+    )
+    if rewritten:
+        engine.write_match_keys(repo_id, rewritten)
     referrers = _find_referrers(engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path))
     for rel_path in sorted(referrers):
         index_one(rel_path, root_resolved / rel_path)
@@ -967,6 +975,8 @@ def index_paths(
     # file outside the batch.
     if relink_outside:
         _relink_name_refs(engine, repo_id, added | rekeyed, set(by_rel_path) | referrers, match_keys)
+    if rekeyed:
+        engine.settle_match_keys(repo_id, sorted(rekeyed))
 
     # Service cross-linking runs as a final pass, after every file in this
     # batch (including any compose file) has been indexed — Service nodes'
@@ -1071,11 +1081,15 @@ def _routes(resolved: Path, docs_root: Path | None, mentions_enabled: bool) -> l
 def _with_name_refs(nodes: list[dict], rels: list[dict], rel_path: str) -> list[dict]:
     """A copy of a code file's `nodes` whose Module carries the file's
     by-name edges (see name_ref_properties), for its pass-1 replace only:
-    pass 2 re-upserts the plain `nodes`, so it never writes them again."""
+    pass 2 re-upserts the plain `nodes`, so it never writes them again. Its
+    symbols' match keys are left out: index_paths writes them after pass 1
+    (engine.write_match_keys), with the edges they decide."""
     refs = name_ref_properties(rels)
     return [
         {**node, "properties": {**node["properties"], **refs}}
-        if node["label"] == "Module" and node["name"] == rel_path else node
+        if node["label"] == "Module" and node["name"] == rel_path
+        else {**node, "properties": {k: v for k, v in node["properties"].items() if k != "mkeys"}}
+        if "mkeys" in node["properties"] else node
         for node in nodes
     ]
 

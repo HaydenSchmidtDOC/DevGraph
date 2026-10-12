@@ -66,10 +66,12 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # provider owns (see devgraph/indexer/providers/). `name_refs`,
 # `name_ref_targets` and `name_ref_sources` record a code Module's by-name
 # edges (see devgraph/indexer/common.py `name_ref_properties`). `mkeys` is a
-# code symbol's match keys, which a pin's `@` flag tests (see `split_pin`).
+# code symbol's match keys, which a pin's `@` flag tests (see `split_pin`),
+# and `mkeys_stale` marks one whose edges a batch has yet to relink after
+# they changed (see graph/engine.py `write_match_keys`).
 RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
     "repo_id", "name", "file", "source_file", "source", "sources", "claims", "extractor",
-    "name_refs", "name_ref_targets", "name_ref_sources", "mkeys",
+    "name_refs", "name_ref_targets", "name_ref_sources", "mkeys", "mkeys_stale",
 })
 
 # The pipeline's own bookkeeping among those, plus the Repository node's
@@ -77,7 +79,8 @@ RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
 # hidden wherever a node's properties are shown (describe_node, the
 # dashboard's node inspector).
 INTERNAL_NODE_PROPERTIES: frozenset[str] = frozenset({
-    "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources", "mkeys", "skipped_files",
+    "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources", "mkeys", "mkeys_stale",
+    "skipped_files",
 })
 
 # An extracted edge's bookkeeping: `origins`, the files that wrote it

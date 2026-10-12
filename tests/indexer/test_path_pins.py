@@ -461,15 +461,22 @@ _KEYED_CALLERS = {
 }
 
 
-def _inject_match_keys(monkeypatch):
+def _inject_match_keys(monkeypatch) -> dict:
     """A `# mkeys k1,k2` first line gives a file's Functions those match
-    keys; the `_KEYED_CALLERS` files call (and app.py imports) `f`."""
+    keys (and every lib/ file's none, [], while the returned settings'
+    `empty` is true); the `_KEYED_CALLERS` files call (and app.py imports)
+    `f`."""
     real = dispatch.extract_python_file
+    settings = {"empty": False}
 
     def extract(content, rel_path, repo_id):
         result = real(content, rel_path, repo_id)
+        keys = None
         if content.startswith("# mkeys "):
             keys = sorted(set(content.splitlines()[0][len("# mkeys "):].split(",")))
+        elif settings["empty"] and rel_path.startswith("lib/"):
+            keys = []
+        if keys is not None:
             for node in result.nodes:
                 if node.label == "Function":
                     node.properties["mkeys"] = keys
@@ -486,6 +493,7 @@ def _inject_match_keys(monkeypatch):
         return result
 
     monkeypatch.setattr(dispatch, "extract_python_file", extract)
+    return settings
 
 
 def _keyed_links(engine, repo_id):
@@ -558,6 +566,81 @@ def test_a_nodes_new_match_keys_retract_and_relink_its_edges(engine, repo_id, tm
         "MATCH (:Commit {repo_id: $r, name: 'c1'})-[x:MODIFIES]->(:Module {name: 'lib/a.py'}) RETURN count(x) AS n",
         {"r": repo_id},
     ) == [{"n": 1}]
+
+
+@pytest.mark.parametrize("fails", ["keys", "pass 2", "settle"])
+def test_a_batch_that_fails_after_writing_match_keys_rekeys_again(engine, repo_id, tmp_path, monkeypatch, fails):
+    """A batch that dies once the first node's keys are written (and its
+    edges gone), in pass 2, or just before its rekeyed nodes are settled
+    leaves them `mkeys_stale`: running it again retracts and relinks them,
+    as a fresh scan has them."""
+    from devgraph.graph import engine as engine_module
+
+    _inject_match_keys(monkeypatch)
+    monkeypatch.setattr(engine_module, "RETRACT_NODES", 1)
+    for rel in _KEYED_CALLERS:
+        _write(tmp_path, rel, "def main():\n    return 0\n")
+    a = _write(tmp_path, "lib/a.py", _f("N:A,.:A"))
+    b = _write(tmp_path, "lib/b.py", _f("N:B"))
+    _scan(engine, repo_id, tmp_path)
+
+    _write(tmp_path, "lib/a.py", _f())
+    _write(tmp_path, "lib/b.py", _f("N:A"))
+    with monkeypatch.context() as patch:
+        if fails == "keys":
+            real, calls = engine_module._retry_transient, []
+
+            def flaky(fn, query, *args, **kwargs):
+                if "mkeys_stale = CASE" in query:
+                    calls.append(query)
+                    if len(calls) == 2:
+                        raise RuntimeError("down")
+                return real(fn, query, *args, **kwargs)
+
+            patch.setattr(engine_module, "_retry_transient", flaky)
+        else:
+            method = "upsert_relationships" if fails == "pass 2" else "settle_match_keys"
+            patch.setattr(type(engine), method, lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("down")))
+        with pytest.raises(RuntimeError):
+            index_paths(engine, repo_id, tmp_path, {a, b})
+    assert engine.run_cypher(
+        "MATCH (n:Function {repo_id: $r, name: 'f'}) WHERE n.mkeys_stale RETURN n.file AS f", {"r": repo_id}
+    )
+    index_paths(engine, repo_id, tmp_path, {a, b})
+    assert ("app.py", "CALLS", "lib/b.py", "resolved") in _keyed_links(engine, repo_id)
+    _equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_keys_that_still_match_the_same_write_no_edge_again(engine, repo_id, tmp_path, monkeypatch):
+    """A node stored without keys and written with none ([]) or back keeps
+    every edge into it: the keys match the same nodes either way. The
+    property follows, as a fresh scan has it."""
+    settings = _inject_match_keys(monkeypatch)
+    for rel in _KEYED_CALLERS:
+        _write(tmp_path, rel, "def main():\n    return 0\n")
+    a = _write(tmp_path, "lib/a.py", _f())
+    _write(tmp_path, "lib/b.py", _f("N:A"))
+    _scan(engine, repo_id, tmp_path)
+
+    def edges():
+        return engine.run_cypher(
+            "MATCH ()-[x:CALLS|IMPORTS]->(n:Function {repo_id: $r, name: 'f', file: 'lib/a.py'}) "
+            "RETURN elementId(x) AS x ORDER BY x",
+            {"r": repo_id},
+        )
+
+    def keys():
+        return engine.run_cypher(
+            "MATCH (n:Function {repo_id: $r, name: 'f', file: 'lib/a.py'}) RETURN n.mkeys AS k", {"r": repo_id}
+        )
+
+    before = edges()
+    assert len(before) == 2 and keys() == [{"k": None}]  # bare.py's and exact.py's
+    for empty, stored in ((True, []), (False, None)):
+        settings["empty"] = empty
+        index_paths(engine, repo_id, tmp_path, {a})
+        assert edges() == before and keys() == [{"k": stored}]
+        _equals_fresh(engine, repo_id, tmp_path)
 
 
 def test_module_pins_import_by_directory_and_suffix_and_relink(engine, repo_id, tmp_path, monkeypatch):

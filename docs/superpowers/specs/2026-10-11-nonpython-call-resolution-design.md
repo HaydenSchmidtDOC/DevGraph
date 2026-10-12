@@ -113,19 +113,23 @@ agree):
   graph written before them) matches no `@` pin and every other one. The
   Cypher reads them as `coalesce(n.mkeys, [])`, and an `@` flag with no
   keys does not exist. A node keeps its identity, `(name, file)`, when its
-  keys change, so the edges `@` pins gave it would go stale: a batch
-  compares each kept node's keys with the graph's (`list_file_nodes` gives
-  them), and for every node whose keys changed
-  `engine.retract_match_key_edges` deletes its incoming `CALLS` and
-  `IMPORTS` edges (the types a resolver writes `@` pins on, whatever pin
-  or bare name wrote them) after pass 1, a few hundred nodes per
-  transaction. Pass 2 writes the batch's again, and the relink writes
-  other files' again under the new keys, as for an added node; such a
-  node is not added otherwise (no referrer, docs edge or mention depends
-  on its keys), and its `MODIFIES` and `MENTIONS` edges stay. A node
-  written without keys that had some loses them the same way. A batch
-  file whose extraction fails loses its edges into such a node until it
-  is indexed again, as it loses its other edges.
+  keys change, so the edges `@` pins gave it would go stale. A batch's
+  pass-1 node writes leave the keys as they were; after pass 1,
+  `engine.write_match_keys` writes every changed node's keys (removing them from one written
+  without any), a few hundred nodes per transaction, before pass 2 tests
+  them. A kept node whose keys match differently (no keys and none, `[]`,
+  match alike) loses its incoming `CALLS` and `IMPORTS` edges (the types a
+  resolver writes `@` pins on, whatever pin or bare name wrote them) in
+  the same transaction and is marked `mkeys_stale`. Pass 2 writes the
+  batch's edges again, and the relink writes other files' again under the
+  new keys, as for an added node; then the mark goes. A batch that fails
+  in between leaves the mark, so running it again (or any batch holding
+  the node's file) retracts and relinks the node again: its new keys alone
+  would no longer tell. Such a node is not added otherwise (no referrer,
+  docs edge or mention depends on its keys), and its `MODIFIES` and
+  `MENTIONS` edges stay. A batch file whose extraction fails loses its
+  edges into such a node until it is indexed again, as it loses its other
+  edges.
 - **Confidence is the pin kind's**, so it never depends on which other pins a
   row was written with. Precedence runs down the table: each row's pin leaves
   out every file a higher-precedence pin of the same call (the same caller and
