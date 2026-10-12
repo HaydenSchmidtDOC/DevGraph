@@ -18,7 +18,11 @@ changes under them: the tsconfig is rewritten (its own `paths`, `extends` to
 an odd-named base, `references`), its base is edited or its folder deleted, a
 root or nested go.mod comes and goes, and a config under an ignored folder is
 edited. After every batch the fuzz runs what a live batch does,
-`sync_resolver_config`. Kotlin files hold adjacent one-line classes, which
+`sync_resolver_config`. C# projects change the same way: a .csproj or
+Directory.Build file is written, created or deleted, and a C# file gains or
+loses a `global using`; a C# Module records its project's usings
+(`_with_cs_projects`), so a change that did not re-index every C# file
+would leave one stale. Kotlin files hold adjacent one-line classes, which
 the extractor recovers from tree-sitter-kotlin's error nodes, and import a
 function or package of another one. Go, Java, Kotlin, Rust, C# and C++ calls
 come in every style their resolvers read (bare, through a package, module,
@@ -260,8 +264,26 @@ TS_CONFIGS = {
         '[package]\nname = "shop-core"\n\n[lib]\npath = "src/main.rs"\n', "[workspace]\n", None,
     ],
 }
+# The C# projects' versions: cs/ is a project, cs/Models a nested one when
+# its .csproj exists, and the nearest Directory.Build.props/.targets wrap
+# their `<Using>` items.
+CS_PROJECT = '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n{}  </ItemGroup>\n</Project>\n'
+CS_CONFIGS = {
+    "cs/Shop.csproj": [
+        CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop.Models" />\n'),
+        CS_PROJECT.format('    <Using Include="Shop.Jobs" Static="true" />\n    <Using Include="Shop.Jobs" Alias="J" />\n'),
+        CS_PROJECT.format('    <Using Remove="Shop" />\n    <Using Include="Shop.App" />\n'), None,
+    ],
+    "cs/Models/Models.csproj": [None, CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop" />\n')],
+    "Directory.Build.props": [None, CS_PROJECT.format('    <Using Include="Shop" />\n')],
+    "cs/Directory.Build.targets": [None, CS_PROJECT.format('    <Using Remove="Shop.Models" />\n')],
+}
+# A C# file's `global using`s, with what may come before one in a file's head.
+CS_GLOBAL_USINGS = [
+    "global using Shop.Models;", "// Shared.\nglobal using static Shop.Jobs;", "#if NET8_0\nglobal using J = Shop.Jobs;\n#endif",
+]
 # Folders holding a configuration file, which the fuzz may delete whole.
-CONFIG_DIRS = ["ts/configs", "go/b", "crates/core"]
+CONFIG_DIRS = ["ts/configs", "go/b", "crates/core", "cs/Models"]
 
 RS_FOO = "pub struct Foo;\n\nimpl Foo {\n    pub fn new() -> Foo {\n        Foo\n    }\n}\n"
 GO_SERVER = "type Server struct{}\n\nfunc (s *Server) Run() {\n\tServe()\n}\n"
@@ -288,6 +310,7 @@ def initial_repo() -> dict:
         "crates/core/Cargo.toml": File("static", head=TS_CONFIGS["crates/core/Cargo.toml"][0]),
         "crates/core/src/lib.rs": File("rs", imports=["pub mod util;"], funcs={"run": ["util::tidy"]}),
         "crates/core/src/util.rs": File("rs", funcs={"tidy": []}),
+        "cs/Shop.csproj": File("static", head=CS_CONFIGS["cs/Shop.csproj"][0]),
         "cs/Jobs.cs": File("cs", head="Shop", bases={"Jobs": None}, funcs={"Run": [], "Stop": []}),
         "cs/Program.cs": File("cs", head="Shop.App", imports=["using Shop;"], bases={"Program": "Jobs"},
                               funcs={"Main": ["Jobs.Run", "Stop", "new Jobs().Stop"]}),
@@ -598,6 +621,30 @@ class Fuzz:
         self.files[path] = File("static", head=text)
         return f"write config {path}: {text!r}", {path}
 
+    def op_cs_csproj(self):
+        """Write, create or delete a C# project file or a Directory.Build file."""
+        path = self.rng.choice(sorted(CS_CONFIGS))
+        current = self.files[path].head if path in self.files else None
+        text = self.rng.choice([t for t in CS_CONFIGS[path] if t != current])
+        if text is None:
+            del self.files[path]
+            return f"delete {path}", {path}
+        self.files[path] = File("static", head=text)
+        return f"write {path}: {text!r}", {path}
+
+    def op_cs_global_using(self):
+        """Add or remove a `global using` at the top of a C# file."""
+        path = self._pick(lambda f: f.kind == "cs")
+        if not path:
+            return None
+        imports = self.files[path].imports
+        using = self.rng.choice(CS_GLOBAL_USINGS)
+        if using in imports:
+            imports.remove(using)
+            return f"remove {using!r} in {path}", {path}
+        imports.insert(0, using)
+        return f"add {using!r} in {path}", {path}
+
     def op_delete_dir(self):
         """Delete a folder holding a configuration file, with everything in it."""
         folder = self.rng.choice(CONFIG_DIRS)
@@ -709,6 +756,7 @@ class Fuzz:
         "call", "base", "import", "import_style", "impl", "add_function", "remove_function", "move_function",
         "rename", "delete", "restore", "service", "from", "move_image", "mention", "link", "supersedes", "pin", "pin",
         "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module", "method", "method",
+        "cs_csproj", "cs_global_using",
     ]
 
     def draw(self):
@@ -756,6 +804,24 @@ def _with_pin_comments(monkeypatch):
         return result
 
     monkeypatch.setattr(dispatch, "extract_python_file", extract)
+
+
+@pytest.fixture(autouse=True)
+def _with_cs_projects(monkeypatch):
+    """A C# file's Module records its project's usings (`fz_usings`), so its
+    extraction depends on the C# configuration as the resolver's will: a
+    configuration change that does not re-index every C# file leaves a
+    stale one."""
+    real = dispatch.extract_csharp_file
+
+    def extract(content, rel_path, repo_id, config=None):
+        result = real(content, rel_path, repo_id, config)
+        project = config.cs_project(rel_path)
+        usings = [] if project is None else [project.dir, *project.csproj, *project.usings, *project.global_usings]
+        result.nodes[0].properties["fz_usings"] = [str(each) for each in usings]
+        return result
+
+    monkeypatch.setattr(dispatch, "extract_csharp_file", extract)
 
 
 def check(engine, repo_id, root, seed, step, log):

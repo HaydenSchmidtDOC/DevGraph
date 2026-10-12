@@ -678,9 +678,9 @@ def index_paths(
             a file that grows past the size limit or becomes ignored leaves
             the graph, as a full scan would leave it out.
         resolver: The resolver configuration's fingerprints to extract
-            under (resolver_config.fingerprints: the go.mod, go.work and
-            Cargo.toml files it found); None reads the ones the graph was
-            built with.
+            under (resolver_config.fingerprints: the go.mod, go.work,
+            Cargo.toml and C# configuration files it found); None reads the
+            ones the graph was built with.
 
     Returns:
         Number of files actually indexed, including those referrers
@@ -715,19 +715,19 @@ def index_paths(
     go_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     # The resolver configuration (tsconfig path aliases, go.mod module
-    # paths, Cargo crate names), read once for the batch under the fingerprint it was taken for
+    # paths, Cargo crate names, C# projects), read once for the batch under the fingerprint it was taken for
     # (the graph's, unless the caller has a newer one); see
     # sync_resolver_config for when a change to it re-indexes.
-    def config_files(lang: str, names: tuple[str, ...]) -> list[str] | None:
+    def config_files(lang: str, names: tuple[str, ...] | None = None) -> list[str] | None:
         stored = resolver if resolver is not None else engine.read_resolver_config(repo_id)
         entry = stored.get(lang)
         if entry is None:
             return None
-        return [rel for rel in entry.get("inputs", []) if posixpath.basename(rel) in names]
+        return [rel for rel in entry.get("inputs", []) if names is None or posixpath.basename(rel) in names]
 
     config = ResolverConfig(
         repo_root, go_files=lambda: config_files("go", ("go.mod", "go.work")),
-        rust_files=lambda: config_files("rust", ("Cargo.toml",)),
+        rust_files=lambda: config_files("rust", ("Cargo.toml",)), cs_files=lambda: config_files("csharp"),
     )
     # Markdown files whose cross-file edges are resolved after every other
     # node in the batch exists (see the docs/mentions passes below).
@@ -1163,7 +1163,7 @@ def _index_single_path(
         js_extractions[rel_path] = (nodes, rels)
     elif "cs" in routes:
         content = read_source(resolved)
-        result = extract_csharp_file(content, rel_path, repo_id)
+        result = extract_csharp_file(content, rel_path, repo_id, config)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above:
@@ -1988,14 +1988,15 @@ def sync_resolver_config(
     mentions_enabled: bool = False,
 ) -> int:
     """Re-index every graph file of a language whose resolver configuration
-    (tsconfig/jsconfig, go.mod/go.work, Cargo.toml; see
-    resolver_config.fingerprints)
+    (tsconfig/jsconfig, go.mod/go.work, Cargo.toml, C# projects and
+    `global using`s; see resolver_config.fingerprints)
     changed since the graph was built, and record the new fingerprints.
 
     `touched` are a live batch's changed and deleted paths: nothing is
     checked unless one of them can change the configuration (named like a
-    configuration file, read by the last fingerprint, or a folder holding
-    one; resolver_config.touches_config). None (a catch-up) always checks.
+    configuration file, read by the last fingerprint, a folder holding
+    one, or a .cs file whose head now holds a `global using`;
+    resolver_config.touches_config). None (a catch-up) always checks.
     The fingerprints are taken before the re-index reads any file and
     recorded only once it has succeeded, so a batch cut short is redone.
     Returns the number of files re-indexed.
@@ -2004,7 +2005,7 @@ def sync_resolver_config(
     if touched is not None:
         inputs = [rel for entry in stored.values() for rel in entry.get("inputs", [])]
         rels = {rel for path in touched if (rel := _repo_relative(repo_root, Path(path))) is not None}
-        if not any(touches_config(rel, inputs) for rel in rels):
+        if not any(touches_config(rel, inputs, repo_root) for rel in rels):
             return 0
     current = fingerprints(repo_root)
     changed = [

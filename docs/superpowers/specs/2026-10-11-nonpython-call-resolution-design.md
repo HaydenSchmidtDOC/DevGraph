@@ -54,12 +54,14 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   configuration file the walk finds (for TS: `baseUrl`, `paths`, `extends`,
   `references`, with every config those reach, whatever its name; for Go:
   each go.mod's `module` line and each go.work; for Rust: each Cargo.toml's
-  library crate name and root file; a compiler flag, a `require` bump or a
-  dependency or version change never counts), stored on the Repository node
-  (`resolver_config`) with the list of paths it looked at, found or not.
+  library crate name and root file; for C#: see below; a compiler flag, a
+  `require` bump or a dependency or version change never counts), stored on
+  the Repository node (`resolver_config`) with the list of paths it looked
+  at, found or not.
 - **Triggers.** A live batch (`RepoSync.on_changes`) that changes or deletes a
-  path on that list, a directory holding one, or a path named like a
-  configuration file recomputes the fingerprint; `catch_up` recomputes it after
+  path on that list, a directory holding one, a path named like a
+  configuration file, or a .cs file whose head now holds a `global using`
+  recomputes the fingerprint; `catch_up` recomputes it after
   its walk. When it differs, every graph file of that language is re-indexed in
   one more batch, and the new fingerprint is stored only once that batch
   succeeds (never after a batch cut short by shutdown). `full_scan` takes it
@@ -70,6 +72,33 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   batch extracts Go files under the go.mod and go.work paths its fingerprint
   found (the graph's, or the newer one `sync_resolver_config` re-indexes
   under), so no batch walks the repository for them.
+- **C#** (`csharp_projects`, `ResolverConfig.cs_project`). A .cs file
+  belongs to the project of the nearest directory at or above it holding a
+  `.csproj` (several there are one project, their items unioned); a file
+  with none above it has no project and no configuration. A project's
+  configuration is its `<Using>` items (`Include`, `Remove`, `Static`,
+  `Alias`, as attributes or child elements), applied in order after the
+  nearest Directory.Build.props and before the nearest
+  Directory.Build.targets, and the `global using` directives in the heads of
+  its own .cs files (not a nested project's), whatever the file is called.
+  Nothing is evaluated: an `<Import>` is not followed, an item under a
+  `Condition` counts as if the condition held, and a name holding `$(`,
+  `@(`, `%(` or a wildcard is left out. `ImplicitUsings` (only `System.*`
+  and `Microsoft.*`), `RootNamespace` and `<ProjectReference>` are not read.
+  A file's *head* is read from its start, at most its first 32 KiB, for as
+  long as it holds only whitespace, comments, preprocessor lines (`#if`,
+  `#region`, `#nullable`, ...), `extern alias` and using directives, global
+  or not (the compiler allows a `global using` nowhere else); a directive
+  under an `#if` counts whatever the condition, and anything else ends the
+  head (an attribute, a namespace, a type, a top-level `using var`, a
+  directive with a comment inside). The fingerprint's inputs are every
+  `.csproj` and Directory.Build file and every .cs file of a project whose
+  head holds a `global using`; the digest is each project file's `<Using>`
+  items and each such file's `global using`s, so a package bump changes
+  nothing. Every catch-up and full scan reads every .cs file's head (about
+  45 ms for 500 files, 5.5 MB; no cache). A batch extracts C# under the
+  inputs its fingerprint found. A configuration change re-indexes every C#
+  file; no resolver reads the configuration yet.
 
 Fresh is then extract(text, configuration), and an incremental run re-extracts
 every dependent when the configuration changes.

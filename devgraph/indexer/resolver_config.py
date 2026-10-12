@@ -12,6 +12,10 @@ incremental one extract every file under the same configuration.
 
 A configuration file under a path the walk ignores (an ignored directory, or a
 `.gitignore` rule) is treated as absent.
+
+C#'s configuration is its projects (`csharp_projects`): each `.csproj`, the
+nearest Directory.Build.props and Directory.Build.targets above it, and every
+`.cs` file whose head (`cs_global_usings`) holds a `global using`.
 """
 
 from __future__ import annotations
@@ -21,15 +25,17 @@ import json
 import posixpath
 import re
 import tomllib
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import astuple, dataclass
 from pathlib import Path
 
 from devgraph.indexer.gitignore import is_gitignored
 from devgraph.indexer.walk import indexable_paths, is_ignored_path
 
 __all__ = [
-    "LANGUAGE_SUFFIXES", "ResolverConfig", "config_language", "fingerprints", "parse_jsonc", "touches_config",
+    "LANGUAGE_SUFFIXES", "CsProject", "CsUsing", "ResolverConfig", "config_language", "cs_global_usings",
+    "csharp_projects", "fingerprints", "parse_jsonc", "touches_config",
 ]
 
 #: The source files each language's configuration applies to.
@@ -37,16 +43,24 @@ LANGUAGE_SUFFIXES: dict[str, tuple[str, ...]] = {
     "ts": (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"),
     "go": (".go",),
     "rust": (".rs",),
+    "csharp": (".cs",),
 }
 
 #: The largest configuration file read; a bigger one is treated as absent.
 _MAX_CONFIG_BYTES = 1024 * 1024
 
 
+#: Directory.Build.props and Directory.Build.targets: MSBuild imports the
+#: nearest of each above a project into it.
+_CS_BUILD_FILES = ("Directory.Build.props", "Directory.Build.targets")
+
+
 def config_language(name: str) -> str | None:
     """The language a file named `name` configures by its name alone (a
-    tsconfig*.json or jsconfig.json, a go.mod or go.work, a Cargo.toml),
-    else None. A
+    tsconfig*.json or jsconfig.json, a go.mod or go.work, a Cargo.toml, a
+    *.csproj or Directory.Build.props/.targets), else None. A .cs file
+    holding a `global using` is C# configuration by its head, not its name
+    (see `touches_config`). A
     config reached only through `extends` can have any name; it is followed
     by path (see `ResolverConfig.read`)."""
     if name == "jsconfig.json" or (name.startswith("tsconfig") and name.endswith(".json")):
@@ -55,16 +69,22 @@ def config_language(name: str) -> str | None:
         return "go"
     if name == "Cargo.toml":
         return "rust"
+    if name.endswith(".csproj") or name in _CS_BUILD_FILES:
+        return "csharp"
     return None
 
 
-def touches_config(rel: str, inputs: list[str]) -> bool:
+def touches_config(rel: str, inputs: list[str], repo_root: Path) -> bool:
     """Whether a changed or deleted repo-relative path can change the
     configuration: it is named like a configuration file, is one of the
-    `inputs` a fingerprint read, or is a directory holding one."""
+    `inputs` a fingerprint read, or is a directory holding one, or it is a
+    .cs file whose head now holds a `global using` (one whose head held one
+    is an input)."""
     if config_language(posixpath.basename(rel)):
         return True
-    return any(each == rel or each.startswith(rel + "/") for each in inputs)
+    if any(each == rel or each.startswith(rel + "/") for each in inputs):
+        return True
+    return rel.endswith(".cs") and bool(cs_global_usings(Path(repo_root) / rel))
 
 
 _JSONC_COMMENTS = re.compile(r'"(?:[^"\\]|\\.)*"|//[^\n]*|/\*.*?\*/', re.DOTALL)
@@ -110,6 +130,133 @@ def _join(folder: str, path: str) -> str | None:
     return _normalize(f"{folder}/{path}" if folder else path)
 
 
+def _ancestors(folder: str) -> list[str]:
+    """`folder` and every directory above it, innermost first, "" last."""
+    found = [folder]
+    while folder:
+        folder = posixpath.dirname(folder)
+        found.append(folder)
+    return found
+
+
+# --- C# projects -------------------------------------------------------------------
+
+
+@dataclass(frozen=True, order=True)
+class CsUsing:
+    """A using a C# project's files share without writing it: a `<Using>`
+    item of its project files or a `global using` of one of its .cs files.
+    `name` is a namespace (`Shop.Models`), with `static` a type whose static
+    members are in scope (`using static Shop.Jobs`); with `alias`
+    (`using J = Shop.Jobs`) the alias names `name`, a namespace or a type,
+    and nothing comes into scope otherwise. Names are written without
+    whitespace, `global::` or a verbatim `@`."""
+
+    name: str
+    static: bool = False
+    alias: str = ""
+
+
+@dataclass(frozen=True)
+class CsProject:
+    """One C# project, as `csharp_projects` reads it.
+
+    `dir` is the repo-relative directory of its project files ("" the
+    root), `csproj` those files: several in one directory are one project,
+    their items unioned. A .cs file belongs to the project of the nearest
+    directory at or above it holding a `.csproj`; one with none above it
+    has no project. `usings` are the `<Using>` items (after `Remove`s) of
+    the project files, with the nearest Directory.Build.props before and the
+    nearest Directory.Build.targets after each, and `global_usings` the
+    `global using` directives in the heads (`cs_global_usings`) of the
+    project's own .cs files, not those of a nested project. Both are sorted
+    and without repeats. Another project a `<ProjectReference>` names is not
+    read."""
+
+    dir: str
+    csproj: tuple[str, ...]
+    usings: tuple[CsUsing, ...]
+    global_usings: tuple[CsUsing, ...]
+
+
+#: The most of a .cs file read for its head (`cs_global_usings`).
+_CS_HEAD_BYTES = 32 * 1024
+
+# What may come before a `global using` in a .cs file's head: whitespace, a
+# comment, a preprocessor line (`#if`, `#region`, `#nullable`, ...) and an
+# `extern alias`; and a using directive itself, global or not.
+_CS_HEAD_SKIP = re.compile(r"\s+|//[^\n]*|/\*.*?\*/|#[^\n]*|extern\s+alias\s+@?\w+\s*;", re.DOTALL)
+_CS_USING = re.compile(
+    r"(global\s+)?using\s+(static\s+)?(?:(@?\w+)\s*=\s*([^;{}]+?)|([^;=(){}]+?))\s*;"
+)
+
+
+def _cs_name(text: str) -> str:
+    return re.sub(r"\s+", "", text).removeprefix("global::").replace("@", "")
+
+
+def _cs_head_usings(text: str) -> tuple[CsUsing, ...]:
+    """The `global using` directives of a .cs file's head, read from its
+    start for as long as it holds only whitespace, comments, preprocessor
+    lines, `extern alias` and using directives, global or not: the compiler
+    allows a `global using` nowhere else. A directive under an `#if` counts
+    whatever the condition. The first anything else ends the head: an
+    attribute, a namespace or a type, a top-level statement (`using var`),
+    or a directive the pattern does not read (a comment inside it, say)."""
+    found = set()
+    pos, text = 0, text.removeprefix("﻿")
+    while pos < len(text):
+        match = _CS_HEAD_SKIP.match(text, pos) or _CS_USING.match(text, pos)
+        if match is None:
+            break
+        if match.re is _CS_USING and match.group(1):
+            alias = (match.group(3) or "").replace("@", "")
+            found.add(CsUsing(_cs_name(match.group(4) or match.group(5)), bool(match.group(2)), alias))
+        pos = match.end()
+    return tuple(sorted(found))
+
+
+def cs_global_usings(path: Path) -> tuple[CsUsing, ...]:
+    """The `global using` directives in the head of the .cs file at `path`
+    (`_cs_head_usings`), sorted; only its first `_CS_HEAD_BYTES` are read,
+    so one past them is not seen, by a fresh scan and an incremental one
+    alike. A missing or unreadable file has none."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(_CS_HEAD_BYTES)
+    except OSError:
+        return ()
+    return _cs_head_usings(head.decode("utf-8", errors="replace"))
+
+
+def _cs_using_items(text: str | None) -> list[tuple[str, CsUsing]]:
+    """A project file's `<Using>` items in document order, as ("Include" or
+    "Remove", the using), their `Static` and `Alias` metadata read from
+    attributes or child elements. Nothing is evaluated: an item under a
+    `Condition` counts as if it held, an `<Import>` is not followed, and a
+    name holding a property, item or metadata reference or a wildcard
+    (`$(`, `@(`, `%(`, `*`) is left out. A malformed file has none."""
+    try:
+        root = ET.fromstring(text or "")
+    except (ET.ParseError, ValueError):
+        return []
+    items = []
+    for element in root.iter():
+        if not isinstance(element.tag, str) or element.tag.rpartition("}")[2] != "Using":
+            continue
+        meta = dict(element.attrib)
+        for child in element:
+            if isinstance(child.tag, str):
+                meta.setdefault(child.tag.rpartition("}")[2], (child.text or "").strip())
+        static = meta.get("Static", "").strip().lower() == "true"
+        alias = meta.get("Alias", "").strip()
+        for op in ("Include", "Remove"):
+            for name in meta.get(op, "").split(";"):
+                if name.strip() and not any(c in name for c in "$@%*"):
+                    items.append((op, CsUsing(_cs_name(name), static, alias)))
+    return items
+
+
 @dataclass(frozen=True)
 class _TsProject:
     """One tsconfig's resolved options, its `extends` chain applied: the
@@ -131,11 +278,14 @@ class ResolverConfig:
     fingerprint the batch extracts under found them (`fingerprints`'
     `inputs`), when a Go file first asks (`go_modules`); None, or a None
     answer, walks the repository for them. `rust_files` does the same for
-    the Cargo.toml files (`rust_crates`)."""
+    the Cargo.toml files (`rust_crates`), and `cs_files` for the C#
+    project files and the .cs files holding a `global using`
+    (`cs_projects`)."""
 
     def __init__(
         self, repo_root: Path, go_files: Callable[[], list[str] | None] | None = None,
         rust_files: Callable[[], list[str] | None] | None = None,
+        cs_files: Callable[[], list[str] | None] | None = None,
     ) -> None:
         self.root = Path(repo_root)
         self.read: set[str] = set()
@@ -148,6 +298,8 @@ class ResolverConfig:
         self._rust_files = rust_files
         self._rust_crates: dict[str, list[str]] | None = None
         self._rust_packages: set[str] = set()
+        self._cs_files = cs_files
+        self._cs_projects: dict[str, CsProject] | None = None
 
     # --- files ---------------------------------------------------------------
 
@@ -444,6 +596,97 @@ class ResolverConfig:
         self.rust_crates()
         return self._rust_packages
 
+    # --- C# projects ---------------------------------------------------------------
+
+    def _cs_digest(self, rel: str) -> object:
+        if rel.endswith(".cs"):
+            return [list(astuple(each)) for each in cs_global_usings(self.root / rel)]
+        return [[op, *astuple(each)] for op, each in _cs_using_items(self._text(rel))]
+
+    def cs_projects(self) -> dict[str, CsProject]:
+        """Every C# project of the repository by its directory (see
+        `CsProject`), read from the inputs `cs_files` gives (else
+        `_cs_inputs` walks for them)."""
+        if self._cs_projects is None:
+            files = self._cs_files() if self._cs_files is not None else None
+            if files is None:
+                files = _cs_inputs(self.root)
+            csproj: dict[str, list[str]] = {}
+            for rel in sorted(files):
+                if rel.endswith(".csproj"):
+                    csproj.setdefault(posixpath.dirname(rel), []).append(rel)
+            build = {rel for rel in files if posixpath.basename(rel) in _CS_BUILD_FILES}
+
+            def nearest(folder: str, name: str) -> list[tuple[str, CsUsing]]:
+                for each in _ancestors(folder):
+                    rel = f"{each}/{name}" if each else name
+                    if rel in build:
+                        return _cs_using_items(self._text(rel))
+                return []
+
+            global_usings: dict[str, set[CsUsing]] = {folder: set() for folder in csproj}
+            for rel in files:
+                if rel.endswith(".cs") and (owner := _cs_owner(rel, csproj)) is not None:
+                    global_usings[owner].update(cs_global_usings(self.root / rel))
+            projects = {}
+            for folder, paths in sorted(csproj.items()):
+                props, targets = nearest(folder, _CS_BUILD_FILES[0]), nearest(folder, _CS_BUILD_FILES[1])
+                usings: set[CsUsing] = set()
+                for path in paths:
+                    kept: dict[CsUsing, None] = {}
+                    for op, using in props + _cs_using_items(self._text(path)) + targets:
+                        if op == "Include":
+                            kept[using] = None
+                        else:
+                            kept = {each: None for each in kept if each.name != using.name}
+                    usings.update(kept)
+                projects[folder] = CsProject(
+                    folder, tuple(paths), tuple(sorted(usings)), tuple(sorted(global_usings[folder]))
+                )
+            self._cs_projects = projects
+        return self._cs_projects
+
+    def cs_project(self, file_path: str) -> CsProject | None:
+        """The project the .cs file `file_path` (repo-relative) belongs to:
+        the nearest directory at or above it holding a `.csproj`. None when
+        there is none."""
+        projects = self.cs_projects()
+        owner = _cs_owner(file_path, projects)
+        return projects[owner] if owner is not None else None
+
+
+def _cs_owner(rel: str, project_dirs) -> str | None:
+    """The directory, among `project_dirs`, of the project `rel` belongs to:
+    the nearest at or above it."""
+    return next((each for each in _ancestors(posixpath.dirname(rel)) if each in project_dirs), None)
+
+
+def _cs_inputs(root: Path, walked: list[str] | None = None) -> list[str]:
+    """The C# configuration files of the repository at `root` (its
+    indexable paths, or `walked`): every `.csproj`, Directory.Build.props
+    and Directory.Build.targets, and every .cs file of a project whose head
+    holds a `global using`, sorted."""
+    if walked is None:
+        walked = []
+        for path in indexable_paths(root):
+            try:
+                walked.append(path.relative_to(root).as_posix())
+            except ValueError:
+                continue
+    found = sorted(rel for rel in walked if config_language(posixpath.basename(rel)) == "csharp")
+    project_dirs = {posixpath.dirname(rel) for rel in found if rel.endswith(".csproj")}
+    found += sorted(
+        rel for rel in walked
+        if rel.endswith(".cs") and _cs_owner(rel, project_dirs) is not None and cs_global_usings(root / rel)
+    )
+    return sorted(found)
+
+
+def csharp_projects(repo_root: Path) -> list[CsProject]:
+    """Every C# project of the repository at `repo_root`, by directory (see
+    `CsProject` and `ResolverConfig.cs_project`)."""
+    return list(ResolverConfig(repo_root).cs_projects().values())
+
 
 def fingerprints(repo_root: Path) -> dict[str, dict]:
     """Per language, a hash of the relevant content of every configuration
@@ -452,19 +695,24 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
     `references`, `baseUrl` and `paths`, with every config its `extends` and
     `references` reach; for Go each go.mod's `module` line and the local
     `replace` directives of each go.mod and go.work; for Rust each
-    Cargo.toml's library crate name and root (`_cargo_entries`). A compiler
-    flag, a `require` bump or a dependency or version change counts for
-    nothing."""
+    Cargo.toml's library crate name and root (`_cargo_entries`); for C# each
+    project file's and Directory.Build.props/.targets' `<Using>` items and
+    the `global using` directives of each project's .cs files
+    (`_cs_inputs`). A compiler flag, a `require` bump or a dependency or
+    version change counts for nothing."""
     root = Path(repo_root)
     config = ResolverConfig(root)
-    found: dict[str, set[str]] = {"ts": set(), "go": set(), "rust": set()}
+    found: dict[str, set[str]] = {"ts": set(), "go": set(), "rust": set(), "csharp": set()}
+    walked = []
     for path in indexable_paths(root):
+        try:
+            walked.append(path.relative_to(root).as_posix())
+        except ValueError:
+            continue
         lang = config_language(path.name)
         if lang is not None:
-            try:
-                found[lang].add(path.relative_to(root).as_posix())
-            except ValueError:
-                continue
+            found[lang].add(walked[-1])
+    found["csharp"] = set(_cs_inputs(root, walked))
     result = {}
     for lang, files in found.items():
         config.read = set()
@@ -475,6 +723,8 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
             digest = [[rel, config._ts_digest(rel)] for rel in sorted(config.read | files)]
         elif lang == "go":
             digest = [[rel, config._go_digest(rel)] for rel in sorted(files)]
+        elif lang == "csharp":
+            digest = [[rel, config._cs_digest(rel)] for rel in sorted(files)]
         else:
             digest = [[rel, config._rust_digest(rel)] for rel in sorted(files)]
         inputs = sorted(config.read | files)

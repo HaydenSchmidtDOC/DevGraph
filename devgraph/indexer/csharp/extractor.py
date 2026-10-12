@@ -80,6 +80,7 @@ from tree_sitter import Language, Node, Parser
 
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, call_rows
 from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.resolver_config import ResolverConfig
 
 logger = logging.getLogger(__name__)
 
@@ -676,7 +677,9 @@ def _referenced_types(root: Node, source: bytes) -> set[str]:
     return found
 
 
-def extract_csharp_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
+def extract_csharp_file(
+    source_code: str, file_path: str, repo_id: str, config: ResolverConfig | None = None,
+) -> ExtractionResult:
     """Parse a C# file and extract nodes and relationships.
 
     Args:
@@ -684,6 +687,9 @@ def extract_csharp_file(source_code: str, file_path: str, repo_id: str) -> Extra
         file_path: The Module node's identity — the file's path relative to
             the repo root, forward-slashed (e.g. 'MyApp/Services/Foo.cs').
         repo_id: Repository ID for scoping nodes.
+        config: The repository's resolver configuration, read once per
+            batch: the file's project (`ResolverConfig.cs_project`). Not
+            read yet.
 
     Returns:
         ExtractionResult containing lists of nodes and relationships. On a
