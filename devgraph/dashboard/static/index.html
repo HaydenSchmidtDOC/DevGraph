@@ -746,8 +746,9 @@ table.dstable input[type="text"] { width: 100%; }
           <p class="desc">Global start/stop calls the same path as <code>devgraph tray start/stop</code> — there's no separate global-watch flag independent of per-repo toggles.</p>
           <div class="card" style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px"><div><div style="font-weight:510">Tray watcher</div><span class="status-live">running</span></div><button class="btn btn-sm">Stop</button></div>
           <div class="card field-grid">
-            <div class="field"><label><span class="lbl-txt">watch_debounce_ms<span class="qmark" data-tip="Milliseconds the watcher waits after a filesystem event before triggering a re-index.">?</span></span></label><input type="number" value="500" /></div>
-            <div class="field"><label><span class="lbl-txt">health_check_interval_s<span class="qmark" data-tip="How often the tray checks that the watcher process is still alive and responsive.">?</span></span></label><input type="number" value="30" /></div>
+            <div class="field"><label><span class="lbl-txt">watch_debounce_ms<span class="qmark" data-tip="Milliseconds the watcher waits after a filesystem event before triggering a re-index.">?</span></span></label><input type="number" id="cfgWatchDebounceMs" value="500" /></div>
+            <div class="field"><label><span class="lbl-txt">watch_max_wait_ms<span class="qmark" data-tip="The longest a file change waits while events keep arriving within the debounce of each other (a log or build output written continuously): it is re-indexed at least this often. DEVGRAPH_WATCH_MAX_WAIT_MS.">?</span></span></label><input type="number" id="cfgWatchMaxWaitMs" value="5000" /></div>
+            <div class="field"><label><span class="lbl-txt">health_check_interval_s<span class="qmark" data-tip="How often the tray checks that the watcher process is still alive and responsive.">?</span></span></label><input type="number" id="cfgHealthCheckIntervalS" value="30" /></div>
           </div>
         </div>
 
@@ -6052,6 +6053,9 @@ async function loadDashboardSettings() {
     setVal("cfgNeo4jUser", s.neo4j_user);
     setVal("cfgDashboardHost", s.dashboard_host);
     setVal("cfgDashboardPort", s.dashboard_port);
+    setVal("cfgWatchDebounceMs", s.watch_debounce_ms);
+    setVal("cfgWatchMaxWaitMs", s.watch_max_wait_ms);
+    setVal("cfgHealthCheckIntervalS", s.health_check_interval_s);
     const globalFields = {
       telemetry_enabled: s.telemetry_enabled,
       cloud_sync: s.cloud_sync,

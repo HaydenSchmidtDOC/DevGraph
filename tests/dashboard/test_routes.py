@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from devgraph.config.settings import get_settings
 from devgraph.dashboard.app import build_app
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.graph.engine import GraphEngine
@@ -352,6 +353,15 @@ def test_settings_endpoint_never_exposes_password(client):
     body = res.json()
     assert "neo4j_password" not in body
     assert body["neo4j_uri"] == "bolt://127.0.0.1:7687"
+
+
+def test_settings_endpoint_reports_the_watcher_timings(client, monkeypatch):
+    from devgraph.dashboard import routes
+
+    settings = get_settings().model_copy(update={"watch_debounce_ms": 700, "watch_max_wait_ms": 9000})
+    monkeypatch.setattr(routes, "get_settings", lambda: settings)
+    body = client.get("/api/settings").json()
+    assert (body["watch_debounce_ms"], body["watch_max_wait_ms"]) == (700, 9000)
 
 
 # --- GET /api/repos/{repo_id}/schema ---------------------------------------

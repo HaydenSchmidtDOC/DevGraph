@@ -1098,6 +1098,7 @@ def build_router(
             "git_recency_track_author": s.git_recency_track_author,
             "registry_db_path": str(s.registry_db_path),
             "watch_debounce_ms": s.watch_debounce_ms,
+            "watch_max_wait_ms": s.watch_max_wait_ms,
             "health_check_interval_s": s.health_check_interval_s,
         }
 
