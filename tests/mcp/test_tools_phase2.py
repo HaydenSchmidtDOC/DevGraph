@@ -143,18 +143,18 @@ class TestExplainDecision:
 class TestFindRequirementsFor:
     def test_find_requirements_for_component(self, seeded_graph):
         result = find_requirements_for(seeded_graph, "test_repo_a", "AuthService")
-        names = {r["name"] for r in result}
+        names = {r["name"] for r in result["results"]}
         assert "req-auth-001" in names
 
     def test_no_cross_repo_leakage_default(self, seeded_graph):
         result = find_requirements_for(seeded_graph, "test_repo_a", "AuthService")
-        assert len(result) == 1  # not both repo_a's and repo_b's req-auth-001
+        assert result["count"] == 1  # not both repo_a's and repo_b's req-auth-001
 
     def test_cross_repo_opt_in(self, seeded_graph):
         result = find_requirements_for(
             seeded_graph, "test_repo_a", "AuthService", cross_repo=True
         )
-        assert len(result) == 2
+        assert result["count"] == 2
 
 
 class TestTraceDesignRationale:

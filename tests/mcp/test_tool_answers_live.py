@@ -15,7 +15,6 @@ from mcp.client import Client
 from devgraph.config.settings import Settings
 from devgraph.graph.engine import GraphEngine
 from devgraph.mcp import server as mcp_server
-from devgraph.mcp import tools
 
 REPO = f"_smoketest_answers_{uuid.uuid4().hex[:8]}"
 
@@ -198,9 +197,9 @@ def test_a_misspelled_component_is_an_error_with_suggestions(client, tool):
     assert "name='validate_token'" in text
 
 
-def test_a_known_name_with_no_answers_is_still_empty(client, engine):
+def test_a_known_name_with_no_answers_is_still_empty(client):
     assert _answer(client, "find_callers", {"target_name": "validate_token"})["count"] == 0
-    assert tools.find_requirements_for(engine, REPO, "validate_token") == []
+    assert _answer(client, "find_requirements_for", {"component_name": "validate_token"})["count"] == 0
     related = _answer(client, "find_related_files", {"component_name": "validate_token"})
     assert related["related_components"]["count"] == 0
 

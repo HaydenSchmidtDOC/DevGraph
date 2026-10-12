@@ -1804,34 +1804,48 @@ def impact_analysis_for_diff(
 def explain_architecture(
     engine: GraphEngine,
     repo_id: str,
+    max_results: int = 15,
 ) -> dict[str, Any]:
     """Generate a high-level architectural explanation of the repository.
 
     Args:
         engine: GraphEngine instance
         repo_id: Repository ID
+        max_results: Maximum number of results per list to return in the envelope
 
     Returns:
-        Dict with layers, key services, data flow overview
+        Dict with services_and_datastores ({service, uses}) and endpoints
+        ({endpoints, calls}, only services some endpoint calls), each a
+        {count, results, truncated} envelope; past `LIST_ROW_LIMIT` services
+        both are truncated, with a notice
     """
-    cypher = """
-    MATCH (s:Service {repo_id: $repo_id})
+    from devgraph.mcp.tool_plane import _sanitize_deep
+
+    _at_least(1, max_results=max_results)
+    cypher = f"""
+    MATCH (s:Service {{repo_id: $repo_id}})
     OPTIONAL MATCH (s)-[:USES]->(ds:Database|VectorStore|Queue)
     WITH s, COLLECT(DISTINCT ds.name) as datastore_names
-    OPTIONAL MATCH (ep:Endpoint {repo_id: $repo_id})-[:CALLS]->(s)
+    OPTIONAL MATCH (ep:Endpoint {{repo_id: $repo_id}})-[:CALLS]->(s)
     WITH s, datastore_names, COLLECT(DISTINCT ep.name) as endpoint_names
-    RETURN
-        COLLECT(DISTINCT {service: s.name, uses: datastore_names}) as services_and_datastores,
-        COLLECT(DISTINCT {endpoints: endpoint_names, calls: s.name}) as endpoints
-    LIMIT 1
+    RETURN s.name as service, datastore_names, endpoint_names
+    ORDER BY service
+    LIMIT {LIST_ROW_LIMIT + 1}
     """
-    results = _query(engine, cypher, {"repo_id": repo_id})
-    if results:
-        return {
-            "services_and_datastores": results[0].get("services_and_datastores", []),
-            "endpoints": results[0].get("endpoints", []),
-        }
-    return {"services_and_datastores": [], "endpoints": []}
+    rows, more = _list_query(engine, cypher, {"repo_id": repo_id})
+    services: list[dict[str, Any]] = []
+    endpoints: list[dict[str, Any]] = []
+    for row in rows:
+        service = _sanitize_deep({"service": row["service"], "uses": row["datastore_names"]})
+        if service not in services:
+            services.append(service)
+        called = _sanitize_deep({"endpoints": row["endpoint_names"], "calls": row["service"]})
+        if called["endpoints"] and called not in endpoints:
+            endpoints.append(called)
+    return {
+        "services_and_datastores": _capped_envelope(services, more, max_results),
+        "endpoints": _capped_envelope(endpoints, more, max_results),
+    }
 
 
 def list_services(
@@ -1917,7 +1931,8 @@ def find_requirements_for(
     repo_id: str,
     component_name: str,
     cross_repo: bool = False,
-) -> list[dict[str, Any]]:
+    max_results: int = 15,
+) -> dict[str, Any]:
     """Find requirements a component (Module/Service/etc.) satisfies.
 
     Args:
@@ -1925,9 +1940,11 @@ def find_requirements_for(
         repo_id: Repository ID
         component_name: Name of the component
         cross_repo: If True, search across repos
+        max_results: Maximum number of results to return in the envelope
 
     Returns:
-        List of Requirement notes satisfied by this component
+        Dict with count, results, and truncated flag containing the Requirement
+        notes ({name, title, body}) satisfied by this component
 
     Raises:
         ToolError: no node has that name.
@@ -1939,15 +1956,17 @@ def find_requirements_for(
     {repo_filter}
     RETURN r.name as name, r.title as title, r.body as body
     ORDER BY r.name
+    LIMIT {LIST_ROW_LIMIT + 1}
     """
     params = {"component_name": component_name}
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = _query(engine, cypher, params)
+    _at_least(1, max_results=max_results)
+    results, more = _list_query(engine, cypher, params)
     if not results and not _exists(engine, repo_id, component_name, _DESCRIBE_BUILTIN_LABELS, cross_repo):
         raise _not_found(engine, repo_id, "component", component_name, _DESCRIBE_BUILTIN_LABELS, cross_repo)
-    return [_sanitize_row(r) for r in results]
+    return _capped_envelope(results, more, max_results)
 
 
 def trace_design_rationale(
@@ -1998,7 +2017,8 @@ def blame_component(
     repo_id: str,
     component_name: str,
     cross_repo: bool = False,
-) -> list[dict[str, Any]]:
+    max_results: int = 15,
+) -> dict[str, Any]:
     """Find commits that modified a component's file, most recent first.
 
     Args:
@@ -2006,11 +2026,13 @@ def blame_component(
         repo_id: Repository ID
         component_name: Name of the Module (file) to look up commit history for
         cross_repo: If True, search across repos
+        max_results: Maximum number of results to return in the envelope
 
     Returns:
-        List of commits (sha, message, author, authored_date) that modified
-        this component, ordered most-recent-first; empty for a file no
-        recorded commit touched.
+        Dict with count, results, and truncated flag containing the commits
+        (sha, message, author, authored_date) that modified this component,
+        most recent first; count 0 for a file no recorded commit touched.
+        Past `LIST_ROW_LIMIT` commits it is truncated, with a notice.
 
     Raises:
         ToolError: no file (Module) has that path.
@@ -2029,10 +2051,11 @@ def blame_component(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results, _more = _list_query(engine, cypher, params)  # at most LIST_ROW_LIMIT commits
+    _at_least(1, max_results=max_results)
+    results, more = _list_query(engine, cypher, params)
     if not results and not _exists(engine, repo_id, component_name, ("Module",), cross_repo):
         raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
-    return [_sanitize_row(r) for r in results]
+    return _capped_envelope(results, more, max_results)
 
 
 def find_related_prs(

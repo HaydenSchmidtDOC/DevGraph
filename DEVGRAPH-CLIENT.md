@@ -224,9 +224,6 @@ The server instructions name it, and so does `devgraph://project-tools`.
   this session's repository.
 - When you omit it, the response carries `repo_id` and a notice saying which
   repository was used. Check them before relying on the answer.
-- `find_requirements_for` and `blame_component` return lists, which carry no notice.
-  For those, the repository is the one named in the server instructions and
-  in `devgraph://project-tools`.
 - Pass `repo_id` explicitly when you want a different repository, or when
   working across several repositories. An explicit `repo_id` is used exactly
   as given.
@@ -265,12 +262,13 @@ and reports the riskiest one's `risk_level`; and the response adds
 answers as before, with no `target_files`.
 
 **Response shape (`count`/`results`/`truncated`)**: `search_component`,
-`find_callers`, `list_services`, `find_related_prs`, `issue_history_for`
-return `{"count": N, "results": [...], "truncated": bool}` instead of a bare
+`find_callers`, `list_services`, `find_related_prs`, `issue_history_for`,
+`find_requirements_for` and `blame_component` return
+`{"count": N, "results": [...], "truncated": bool}` instead of a bare
 list — read the match set from `result["results"]`, and check `truncated`
-before assuming you've seen everything. `find_related_files` and
-`impact_analysis` apply the same envelope to each of their list-valued
-fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
+before assuming you've seen everything. `find_related_files`,
+`explain_architecture` and `impact_analysis` apply the same envelope to each
+of their list-valued fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
 `max_results` (default 15) to widen the sample when you genuinely need more
 than the default. `search_component` ranks exact name matches first, then
 name prefixes, then other substrings, then description-only matches; each
@@ -308,8 +306,8 @@ global tool '<name>': <reason>` (the global tool is served because the project
 tool of that name could not be). A built-in tool whose name a project or global
 tool also uses says so in a `notices` list in each response:
 `ignored: project tool '<name>' shadows a locked tool; using the fixed
-implementation` (or `global tool`). Built-ins that return a list
-(`find_requirements_for`, `blame_component`, `run_cypher`) can't carry it;
+implementation` (or `global tool`). `run_cypher`, which returns a list,
+can't carry it;
 `devgraph://project-tools` reports it for them. `devgraph://project-tools` lists each served
 tool's origin and the global tools file.
 

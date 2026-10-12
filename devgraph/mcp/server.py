@@ -753,9 +753,11 @@ def build_server(
         )
 
     @server.tool(annotations=_READ_ONLY)
-    def explain_architecture(repo_id: str) -> dict[str, Any]:
-        """Generate a high-level architectural explanation of the repository."""
-        return devgraph_tools.explain_architecture(engine, repo_id)
+    def explain_architecture(repo_id: str, max_results: int = 15) -> dict[str, Any]:
+        """Generate a high-level architectural explanation of the repository:
+        services_and_datastores ({service, uses}) and endpoints ({endpoints, calls}, only
+        services some endpoint calls), each a {count, results, truncated} envelope."""
+        return devgraph_tools.explain_architecture(engine, repo_id, max_results)
 
     @server.tool(annotations=_READ_ONLY)
     def list_services(repo_id: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
@@ -769,10 +771,12 @@ def build_server(
         return devgraph_tools.explain_decision(engine, repo_id, decision_name, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
-    def find_requirements_for(repo_id: str, component_name: str, cross_repo: bool = False) -> list[dict[str, Any]]:
-        """Find requirements a component (module/service/etc.) satisfies. An unknown
-        component is an error with similar names."""
-        return devgraph_tools.find_requirements_for(engine, repo_id, component_name, cross_repo)
+    def find_requirements_for(
+        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15
+    ) -> dict[str, Any]:
+        """Find requirements a component (module/service/etc.) satisfies; returns
+        {count, results, truncated}. An unknown component is an error with similar names."""
+        return devgraph_tools.find_requirements_for(engine, repo_id, component_name, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
     def trace_design_rationale(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
@@ -799,10 +803,12 @@ def build_server(
         )
 
     @server.tool(annotations=_READ_ONLY)
-    def blame_component(repo_id: str, component_name: str, cross_repo: bool = False) -> list[dict[str, Any]]:
+    def blame_component(
+        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15
+    ) -> dict[str, Any]:
         """Find commits that modified a component's file, most recent first
-        (pass a file path, not a function name)."""
-        return devgraph_tools.blame_component(engine, repo_id, component_name, cross_repo)
+        (pass a file path, not a function name); returns {count, results, truncated}."""
+        return devgraph_tools.blame_component(engine, repo_id, component_name, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
     def find_related_prs(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
