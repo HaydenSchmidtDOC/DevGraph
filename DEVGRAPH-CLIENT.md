@@ -351,9 +351,14 @@ branch change?" and `impact_analysis_for_diff` for "what could this diff
 break?".
 
 Mistakes are errors, not empty answers: an unregistered `repo_id` fails with
-`no such repo_id`; `impact_analysis`, `get_service_dependencies`,
-`trace_request_flow` and `explain_decision` on a name the graph doesn't have
-fail with `no ... named ...` and up to five similar names; and a count
+`no such repo_id`; `find_callers`, `find_related_files`, `impact_analysis`,
+`get_service_dependencies`, `trace_request_flow`, `explain_decision`,
+`find_requirements_for` and `trace_design_rationale` on a name the graph
+doesn't have, and `blame_component`, `find_related_prs` and `issue_history_for`
+on a file it doesn't have, fail with `no ... named ...` and up to five similar
+names (a name that exists but has no answer, such as a function nothing calls,
+is still `count: 0`); `list_recent_changes` with an unknown `entity_type` fails
+and lists the valid labels; and a count
 argument below its minimum (`max_results`, `within_commits`,
 `modified_within_commits`, `members_per_community`, `max_per_type` below 1,
 `max_length` below 2) fails and names the argument.

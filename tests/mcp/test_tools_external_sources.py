@@ -24,7 +24,7 @@ class _Graph:
 
     def run_read_cypher(self, query, params, *, timeout_s, max_rows):
         self.queries.append(query)
-        return [], False
+        return ([{"found": 1}] if query.endswith("RETURN 1 LIMIT 1") else []), False  # the file exists
 
 
 @pytest.fixture
@@ -57,7 +57,8 @@ def test_a_source_that_is_on_reads_the_graph(tmp_path, no_subprocess, tool, flag
     graph = _Graph()
     result = tool(graph, "widget", "widget/core.py", registry=registry)
     assert "notice" not in result
-    assert len(graph.queries) == 1
+    assert len(graph.queries) == 2  # the read, then (it being empty) whether the file exists
+    assert "MODIFIES" in graph.queries[0]
 
 
 def test_no_gh_fallback_is_left():

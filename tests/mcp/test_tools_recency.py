@@ -9,6 +9,7 @@ indexing — these tools only ever read the property, never write it).
 """
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.mcp.tools import find_callers, search_component, list_recent_changes
@@ -117,13 +118,9 @@ class TestListRecentChanges:
         names = {r["name"] for r in result["results"]}
         assert names == {"RecentService"}
 
-    def test_invalid_entity_type_returns_empty(self, seeded_graph):
-        result = list_recent_changes(
-            seeded_graph, "test_repo_a", within_commits=1, entity_type="NotALabel"
-        )
-        assert result["count"] == 0
-        assert result["results"] == []
-        assert result["truncated"] is False
+    def test_invalid_entity_type_is_an_error(self, seeded_graph):
+        with pytest.raises(ToolError, match="unknown entity_type 'NotALabel'; use one of: Repository, "):
+            list_recent_changes(seeded_graph, "test_repo_a", within_commits=1, entity_type="NotALabel")
 
     def test_no_cutoff_returns_every_staged_entity(self, seeded_graph):
         """Requesting a window larger than the repo's whole commit history

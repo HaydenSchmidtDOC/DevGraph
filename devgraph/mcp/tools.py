@@ -587,6 +587,23 @@ def _not_found(
     )
 
 
+def _named_nodes(labels: tuple[str, ...], param: str, cross_repo: bool) -> str:
+    """`CALL () { ... }` returning `n`: every node of `labels` whose name is
+    `$param`, in the repository (or in any of `cross_repo_ids`), one branch per
+    label so each can seek its `(repo_id, name)` index. Labels are validated identifiers."""
+    scope = _cross_scope("n") if cross_repo else "n.repo_id = $repo_id"
+    body = "\n  UNION\n".join(
+        f"  MATCH (n:`{label}`) WHERE n.name = ${param} AND {scope} RETURN n" for label in labels
+    )
+    return f"CALL () {{\n{body}\n}}\n"
+
+
+def _exists(engine: GraphEngine, repo_id: str, name: str, labels: tuple[str, ...], cross_repo: bool = False) -> bool:
+    """Whether a node of `labels` is named `name` in the repository (any repository when cross_repo)."""
+    params = {"name": name} if cross_repo else {"name": name, "repo_id": repo_id}
+    return bool(_query(engine, _named_nodes(labels, "name", cross_repo) + "RETURN 1 LIMIT 1", params))
+
+
 def _node_ref(row: dict[str, Any]) -> dict[str, Any]:
     """`{label, name, file}` from raw values, so it re-describes exactly this node."""
     ref = {"label": row["label"], "name": row["name"]}
@@ -1175,7 +1192,10 @@ def find_callers(
     Returns:
         Dict with count, results, and truncated flag containing callers with their
         types, repo_id, file and confidence (same-named callers in different files
-        are separate rows)
+        are separate rows); count 0 for a known target nothing calls
+
+    Raises:
+        ToolError: no node has that name.
     """
     _at_least(1, max_results=max_results, modified_within_commits=modified_within_commits)
     cutoff = None
@@ -1210,6 +1230,8 @@ def find_callers(
         params["cutoff"] = cutoff
 
     results, more = _list_query(engine, cypher, params)
+    if not results and not _exists(engine, repo_id, target_name, _DESCRIBE_BUILTIN_LABELS, cross_repo):
+        raise _not_found(engine, repo_id, "component", target_name, _DESCRIBE_BUILTIN_LABELS, cross_repo)
     return _capped_envelope(results, more, max_results)
 
 
@@ -1236,6 +1258,9 @@ def find_related_files(
         each wrapped as {count, results, truncated} envelope objects.
         imported_modules are the names of what `component_name` IMPORTS: a
         Module's path, or, for a Kotlin import, the Class or Function it names
+
+    Raises:
+        ToolError: no node has that name.
     """
     _at_least(1, max_results=max_results)
     repo_filter = _cross_scope("n", "WHERE") if cross_repo else "WHERE n.repo_id = $repo_id"
@@ -1248,24 +1273,21 @@ def find_related_files(
     RETURN
         COLLECT(DISTINCT m.name) as containing_modules,
         COLLECT(DISTINCT imported.name) as imported_modules,
-        COLLECT(DISTINCT related.name) as related_components
+        COLLECT(DISTINCT related.name) as related_components,
+        COUNT(DISTINCT n) as matched
     """
     params = {"component_name": component_name}
     if not cross_repo:
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if results:
-        row = results[0]
-        return {
-            "containing_modules": _envelope(row["containing_modules"], max_results),
-            "imported_modules": _envelope(row["imported_modules"], max_results),
-            "related_components": _envelope(row["related_components"], max_results),
-        }
+    if not results or not results[0]["matched"]:
+        raise _not_found(engine, repo_id, "component", component_name, _DESCRIBE_BUILTIN_LABELS, cross_repo)
+    row = results[0]
     return {
-        "containing_modules": _envelope([], max_results),
-        "imported_modules": _envelope([], max_results),
-        "related_components": _envelope([], max_results),
+        "containing_modules": _envelope(row["containing_modules"], max_results),
+        "imported_modules": _envelope(row["imported_modules"], max_results),
+        "related_components": _envelope(row["related_components"], max_results),
     }
 
 
@@ -1792,6 +1814,9 @@ def find_requirements_for(
 
     Returns:
         List of Requirement notes satisfied by this component
+
+    Raises:
+        ToolError: no node has that name.
     """
     repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
     cypher = f"""
@@ -1806,6 +1831,8 @@ def find_requirements_for(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
+    if not results and not _exists(engine, repo_id, component_name, _DESCRIBE_BUILTIN_LABELS, cross_repo):
+        raise _not_found(engine, repo_id, "component", component_name, _DESCRIBE_BUILTIN_LABELS, cross_repo)
     return [_sanitize_row(r) for r in results]
 
 
@@ -1826,6 +1853,9 @@ def trace_design_rationale(
     Returns:
         Dict grouping every Requirement/DesignDecision/ArchitectureNote linked
         to this component via SATISFIES or DOCUMENTED_BY.
+
+    Raises:
+        ToolError: no node has that name.
     """
     repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
     cypher = f"""
@@ -1844,9 +1874,9 @@ def trace_design_rationale(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if results:
-        return _sanitize_row(results[0])
-    return {"component": component_name, "requirements": [], "notes": []}
+    if not results:
+        raise _not_found(engine, repo_id, "component", component_name, _DESCRIBE_BUILTIN_LABELS, cross_repo)
+    return _sanitize_row(results[0])
 
 
 def blame_component(
@@ -1886,13 +1916,8 @@ def blame_component(
         params["repo_id"] = repo_id
 
     results, _more = _list_query(engine, cypher, params)  # at most LIST_ROW_LIMIT commits
-    if not results:
-        module_filter = _cross_scope("m", "AND") if cross_repo else "AND m.repo_id = $repo_id"
-        found = _query(
-            engine, f"MATCH (m:Module {{name: $component_name}}) WHERE true {module_filter} RETURN m LIMIT 1", params
-        )
-        if not found:
-            raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
+    if not results and not _exists(engine, repo_id, component_name, ("Module",), cross_repo):
+        raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
     return [_sanitize_row(r) for r in results]
 
 
@@ -1922,6 +1947,9 @@ def find_related_prs(
         Dict with count, results, and truncated flag containing PullRequests linked
         (via RESOLVES on an Issue referenced by a commit that touched this component)
         to the component.
+
+    Raises:
+        ToolError: no file (Module) has that path.
     """
     _at_least(1, max_results=max_results)
     if _source_off(registry, repo_id, "pr_source_enabled"):
@@ -1943,6 +1971,8 @@ def find_related_prs(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
+    if not results and not _exists(engine, repo_id, component_name, ("Module",), cross_repo):
+        raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
     return _envelope(results, max_results)
 
 
@@ -1971,6 +2001,9 @@ def issue_history_for(
     Returns:
         Dict with count, results, and truncated flag containing Issues referenced
         by commits that modified this component.
+
+    Raises:
+        ToolError: no file (Module) has that path.
     """
     _at_least(1, max_results=max_results)
     if _source_off(registry, repo_id, "issue_source_enabled"):
@@ -1992,6 +2025,8 @@ def issue_history_for(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
+    if not results and not _exists(engine, repo_id, component_name, ("Module",), cross_repo):
+        raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
     return _envelope(results, max_results)
 
 
@@ -2217,7 +2252,7 @@ def list_recent_changes(
         engine: GraphEngine instance
         repo_id: Repository ID
         within_commits: Only include entities modified within this many most-recent commits
-        entity_type: Optional node label filter (validates against NODE_LABELS)
+        entity_type: Optional node label filter; a label not in NODE_LABELS is a ToolError
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
 
@@ -2226,9 +2261,8 @@ def list_recent_changes(
         name, type (labels), repo_id, and last_modified_at, ordered most-recently-modified first.
     """
     _at_least(1, within_commits=within_commits, max_results=max_results)
-    # Validate and reject unrecognized labels
     if entity_type is not None and entity_type not in schema.NODE_LABELS:
-        return _envelope([], max_results)
+        raise ToolError(f"unknown entity_type {_echo(entity_type)}; use one of: {', '.join(schema.NODE_LABELS)}")
 
     cutoff = _resolve_recency_cutoff(engine, repo_id, within_commits)
     recency_filter = "AND n.last_modified_at >= $cutoff" if cutoff is not None else "AND n.last_modified_at IS NOT NULL"

@@ -611,8 +611,8 @@ def build_server(
         """List entities touched within the last N commits repo-wide, most-recently-modified
         first; returns {count, results, truncated}. Requires git-history recency staging —
         entities never staged with last_modified_at are excluded. entity_type optionally
-        restricts to one node label (validated against NODE_LABELS). within_commits must
-        be at least 1."""
+        restricts to one node label; an unknown label is an error naming the valid ones.
+        within_commits must be at least 1."""
         return devgraph_tools.list_recent_changes(
             engine, repo_id, within_commits, entity_type, cross_repo, max_results
         )
@@ -652,7 +652,8 @@ def build_server(
         class's own methods. Pass
         modified_within_commits to restrict to targets touched within the last N
         commits repo-wide (requires git-history recency staging; entities never staged
-        are excluded, not silently included)."""
+        are excluded, not silently included). An unknown target is an error with similar
+        names; a known one nothing calls is count 0."""
         return devgraph_tools.find_callers(
             engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits,
             resolved_only,
@@ -660,7 +661,8 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def find_related_files(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Find related files; each list returns {count, results, truncated} envelope."""
+        """Find related files; each list returns {count, results, truncated} envelope. An
+        unknown component is an error with similar names."""
         return devgraph_tools.find_related_files(engine, repo_id, component_name, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
@@ -733,12 +735,14 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def find_requirements_for(repo_id: str, component_name: str, cross_repo: bool = False) -> list[dict[str, Any]]:
-        """Find requirements a component (module/service/etc.) satisfies."""
+        """Find requirements a component (module/service/etc.) satisfies. An unknown
+        component is an error with similar names."""
         return devgraph_tools.find_requirements_for(engine, repo_id, component_name, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
     def trace_design_rationale(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
-        """Trace the design rationale (requirements, decisions, notes) behind a component."""
+        """Trace the design rationale (requirements, decisions, notes) behind a component.
+        An unknown component is an error with similar names."""
         return devgraph_tools.trace_design_rationale(engine, repo_id, component_name, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
@@ -769,14 +773,14 @@ def build_server(
     def find_related_prs(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
         """Find related PRs; returns {count, results, truncated}. With the repository's PR
         ingestion off, the envelope is empty and a `notice` says how to enable it (never
-        contacts the network)."""
+        contacts the network). An unknown file is an error with similar names."""
         return devgraph_tools.find_related_prs(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
     def issue_history_for(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
         """Find issue history; returns {count, results, truncated}. With the repository's
         issue ingestion off, the envelope is empty and a `notice` says how to enable it
-        (never contacts the network)."""
+        (never contacts the network). An unknown file is an error with similar names."""
         return devgraph_tools.issue_history_for(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
