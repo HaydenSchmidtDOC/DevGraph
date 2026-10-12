@@ -328,7 +328,8 @@ def test_a_queue_overflow_asks_for_a_catch_up(tmp_path):
 
 def test_a_folder_that_hits_the_watch_limit_mid_session_is_reported(tmp_path, monkeypatch):
     """A folder created once the watch limit is reached gets no watch; that
-    is a repository issue (with the sysctl to raise), and a catch-up runs."""
+    is a repository issue (with the sysctl to raise) saying the repository
+    is partly watched, not unwatched, and a catch-up runs."""
     w = Watching(tmp_path, make_repo(tmp_path, "repo", 1), git=False)
     w.registry.mark_indexed(w.repo_id)
     catch_ups: list[str] = []
@@ -341,7 +342,8 @@ def test_a_folder_that_hits_the_watch_limit_mid_session_is_reported(tmp_path, mo
         (w.root / "pkg0/new").mkdir()
         wait_for(lambda: w.repo_id in w.manager.get_repo_issues(), "the issue")
         issue = w.manager.get_repo_issues()[w.repo_id]
-        assert issue.startswith("watching unavailable: inotify limit reached") and "max_user_watches" in issue
+        assert issue.startswith("partly watched: a new folder isn't watched, inotify limit reached"), issue
+        assert "max_user_watches" in issue
         wait_for(lambda: "unwatched" in catch_ups, lambda: f"a catch-up; got {catch_ups}")
     finally:
         w.close()

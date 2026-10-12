@@ -71,6 +71,7 @@ from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.walk import repo_root_problem
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.registry.store import RepoRegistry
+from devgraph.watcher.manager import is_partly_watched
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +301,8 @@ def build_router(
                 "node_count": queries.count_nodes(engine, repo.repo_id),
                 "path_missing": problem is not None,
                 "issue": issue,  # Include issue if any
+                # Watched, but for a folder an inotify limit kept unwatched.
+                "partly_watched": problem is None and issue is not None and is_partly_watched(issue),
             })
         return {
             "repos": repos,

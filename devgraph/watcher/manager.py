@@ -218,20 +218,32 @@ class _GitStateEventHandler(FileSystemEventHandler):
         self._on_burst(self._repo_id, burst_start)
 
 
-def _watch_problem(error: Exception) -> str:
+#: How a partly-watched repository's issue starts: its watch is running, but
+#: an inotify limit kept a folder created since from being watched.
+#: `status`, `doctor` and the dashboard tell it from a watch that never
+#: started (see `is_partly_watched`).
+PARTLY_WATCHED = "partly watched: "
+
+
+def is_partly_watched(issue: str) -> bool:
+    """Whether a repository issue is a partial watch, not a failed one."""
+    return issue.startswith(PARTLY_WATCHED)
+
+
+def _watch_problem(error: Exception, prefix: str = "watching unavailable: ") -> str:
     """The issue `status`, `doctor` and the dashboard show for a repository
-    that couldn't be watched."""
+    that couldn't be watched (or, with `PARTLY_WATCHED`, only partly)."""
     if isinstance(error, OSError) and error.errno == errno.EMFILE:
         return (
-            "watching unavailable: inotify limit reached (too many inotify instances, "
+            f"{prefix}inotify limit reached (too many inotify instances, "
             "fs.inotify.max_user_instances, or open files); restart the agent once others are closed"
         )
     if isinstance(error, OSError) and error.errno == errno.ENOSPC:
         return (
-            "watching unavailable: inotify limit reached (too many watched folders, "
+            f"{prefix}inotify limit reached (too many watched folders, "
             "fs.inotify.max_user_watches); raise it, then restart the agent"
         )
-    return f"watching unavailable: {error}"
+    return f"{prefix}{error}"
 
 
 def _discard_observer(observer: Any) -> None:
@@ -835,8 +847,8 @@ class WatcherManager:
             return
         if kind == "limit":
             # A folder found later stays unwatched until a restart; catch up
-            # on what it holds now.
-            problem = _watch_problem(error)
+            # on what it holds now. The rest of the repository stays watched.
+            problem = _watch_problem(error, PARTLY_WATCHED + "a new folder isn't watched, ")
             logger.warning("%s: %s", repo_id, problem)
             since = self._last_indexed(repo_id)
             if since is not None:

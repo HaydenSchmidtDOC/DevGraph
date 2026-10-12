@@ -769,8 +769,9 @@ def _tray_liveness_text(settings) -> str:
 
 
 def _watcher_issues(settings) -> dict[str, str]:
-    """The repositories the running agent's watcher isn't watching, and why
-    (a missing folder, an inotify limit), from the repo_issues.json it writes
+    """The repositories the running agent's watcher isn't watching, or only
+    partly, and why (a missing folder, an inotify limit), from the
+    repo_issues.json it writes
     with its heartbeat; only those still registered, active and watched (the
     file can predate a `remove` or `watch disable`)."""
     try:
@@ -790,16 +791,23 @@ def _watcher_issues(settings) -> dict[str, str]:
     return {str(k): str(v) for k, v in issues.items() if str(k) in watched}
 
 
-def _print_unwatched_repos(settings, mark: str) -> int:
+def _print_unwatched_repos(settings, mark: str) -> tuple[int, int]:
     """Under a running watcher: the repositories it isn't watching, each
-    flagged with `mark`. Returns how many."""
+    flagged with `mark`, then those it watches only partly (an inotify limit
+    reached on a folder created since), each flagged `[!]`. Returns how many
+    of each."""
+    from devgraph.watcher.manager import is_partly_watched
+
     issues = _watcher_issues(settings)
-    if issues:
-        noun = "repository" if len(issues) == 1 else "repositories"
-        console.print(f"  [yellow][!] running, but not watching {len(issues)} {noun}[/yellow]")
-        for repo_id, problem in sorted(issues.items()):
-            console.print(f"    [yellow]{escape(mark)} {escape(repo_id)}:[/yellow] {escape(problem)}", soft_wrap=True)
-    return len(issues)
+    unwatched = {k: v for k, v in issues.items() if not is_partly_watched(v)}
+    partly = {k: v for k, v in issues.items() if is_partly_watched(v)}
+    for found, flag, what in ((unwatched, mark, "not watching"), (partly, "[!]", "only partly watching")):
+        if found:
+            noun = "repository" if len(found) == 1 else "repositories"
+            console.print(f"  [yellow][!] running, but {what} {len(found)} {noun}[/yellow]")
+            for repo_id, problem in sorted(found.items()):
+                console.print(f"    [yellow]{escape(flag)} {escape(repo_id)}:[/yellow] {escape(problem)}", soft_wrap=True)
+    return len(unwatched), len(partly)
 
 
 @app.command()
@@ -847,7 +855,7 @@ def status() -> None:
     console.print("[bold]Live Watcher[/bold]")
     liveness = _tray_liveness_text(settings)
     if liveness == "running":
-        if not _print_unwatched_repos(settings, "[!]"):
+        if not any(_print_unwatched_repos(settings, "[!]")):
             console.print("  [green][OK] running[/green]")
     elif liveness == "not running":
         console.print("  [yellow]not running[/yellow] (no heartbeat file — start with 'devgraph tray start')")
@@ -1453,9 +1461,10 @@ def doctor() -> None:
     console.print("[bold]Live Watcher[/bold]")
     liveness = _tray_liveness_text(settings)
     if liveness == "running":
-        if _print_unwatched_repos(settings, "[X]"):
+        unwatched, partly = _print_unwatched_repos(settings, "[X]")
+        if unwatched:
             any_failed = True
-        else:
+        elif not partly:
             console.print("  [green][OK] running[/green]")
     elif liveness == "not running":
         console.print("  [yellow]not running[/yellow] (expected if the tray app isn't started)")

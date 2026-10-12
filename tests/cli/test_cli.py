@@ -2208,6 +2208,42 @@ def test_doctor_fails_a_repository_the_watcher_is_not_watching(runner, temp_regi
     assert result.exit_code == 1
 
 
+PARTLY = (
+    "partly watched: a new folder isn't watched, inotify limit reached (too many watched folders, "
+    "fs.inotify.max_user_watches); raise it, then restart the agent"
+)
+
+
+def test_doctor_warns_about_a_partly_watched_repository_and_status_says_so(
+    runner, temp_registry_db, temp_git_repo
+):
+    """A limit reached on a folder created after the watch started leaves the
+    rest of the repository watched: a warning, not a failure that would also
+    fail `devgraph update`, and never "not watching"."""
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.close()
+    settings = _agent_running_with_issues(db_path, {repo_id: PARTLY})
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=settings), \
+         patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine", _stub_engine(None)), \
+         patch.object(cli_main, "resolve_podman", return_value=None):
+        status = runner.invoke(app, ["status"])
+        doctor = runner.invoke(app, ["doctor"])
+
+    for result in (status, doctor):
+        watcher = _collapsed(result.stdout.split("Live Watcher", 1)[1].split("Dashboard", 1)[0])
+        assert "running, but only partly watching 1 repository" in watcher, watcher
+        assert f"[!] {repo_id}: {PARTLY}" in watcher
+        assert "not watching" not in watcher and "[X]" not in watcher and "[OK] running" not in watcher
+    assert "All checks passed." in doctor.stdout
+    assert doctor.exit_code == 0
+
+
 def test_status_and_doctor_ignore_issues_of_repositories_no_longer_watched(runner, temp_registry_db, temp_git_repo):
     """repo_issues.json is written by the agent every few seconds: an issue
     of a repository removed, deactivated or unwatched since is stale."""

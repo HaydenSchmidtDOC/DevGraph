@@ -117,6 +117,23 @@ def test_list_repos_marks_a_missing_repository_folder(seeded_graph, registry, tm
     assert repos["dash_repo_b"]["issue"] == f"path missing: repository folder not found: {gone}"
 
 
+def test_list_repos_tells_a_partly_watched_repository_from_an_unwatched_one(client, tmp_path, monkeypatch):
+    import json
+
+    from devgraph.dashboard import routes
+
+    settings = get_settings().model_copy(update={"registry_db_path": tmp_path / "registry.sqlite3"})
+    monkeypatch.setattr(routes, "get_settings", lambda: settings)
+    (tmp_path / "repo_issues.json").write_text(json.dumps({
+        "dash_repo_a": "partly watched: a new folder isn't watched, inotify limit reached",
+        "dash_repo_b": "watching unavailable: inotify limit reached",
+    }))
+    repos = {r["repo_id"]: r for r in client.get("/api/repos").json()["repos"]}
+    assert repos["dash_repo_a"]["partly_watched"] is True
+    assert repos["dash_repo_b"]["partly_watched"] is False
+    assert repos["dash_repo_b"]["issue"] == "watching unavailable: inotify limit reached"
+
+
 def test_summary_counts_known_seeded_data(client):
     res = client.get("/api/repos/dash_repo_a/summary")
     assert res.status_code == 200

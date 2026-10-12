@@ -2913,8 +2913,11 @@ async function populateRealRepos(fireChangeEvent) {
   const missing = new Set((json.repos || []).filter(r => r.path_missing).map(r => r.repo_id));
   // One the agent's watcher isn't watching (say an inotify limit was reached)
   // is browsable too, but not kept live: flagged, with the reason as tooltip.
+  // One watched but for a folder created since (a limit reached adding it) is
+  // flagged as partly watched.
   const unwatched = new Map((json.repos || []).filter(r => r.issue && !r.path_missing).map(r => [r.repo_id, r.issue]));
-  const optionLabel = id => missing.has(id) ? " (path missing)" : unwatched.has(id) ? " (not watched)" : "";
+  const partly = new Set((json.repos || []).filter(r => r.partly_watched).map(r => r.repo_id));
+  const optionLabel = id => missing.has(id) ? " (path missing)" : partly.has(id) ? " (partly watched)" : unwatched.has(id) ? " (not watched)" : "";
   const optionTitle = id => unwatched.has(id) ? ` title="${escapeHtmlVal(unwatched.get(id))}"` : "";
   const select = document.getElementById("repoSelect");
   // A saved repo (from a prior reload) wins over whatever the select's
