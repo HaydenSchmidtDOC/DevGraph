@@ -171,9 +171,7 @@ def lookup_index_statements() -> list[str]:
     basename)`, which a pinned IMPORTS row seeks (see engine._end_match). Then the provenance indexes a per-file re-index seeks (`(repo_id, file)`,
     `(repo_id, source_file)`, `(repo_id, source)` on FILE_LABELS,
     SOURCE_FILE_LABELS, CLAIMED_LABELS), so its cost follows the file, not
-    the whole database. Last, a `repo_id` index on every NAMED_LABELS label,
-    which `graph_repo_ids` skip-scans: unlike the composite ones it holds a
-    node whose other key properties are null. Idempotent, like
+    the whole database. Idempotent, like
     `constraint_statements`; the names never collide with a generated
     user-type constraint or index (built-in labels can't be redeclared).
     """
@@ -191,10 +189,6 @@ def lookup_index_statements() -> list[str]:
             f"CREATE INDEX {label.lower()}_repo_{prop}_lookup IF NOT EXISTS FOR (n:{label}) ON (n.repo_id, n.{prop})"
             for label in labels
         ]
-    statements += [
-        f"CREATE INDEX {label.lower()}_repo_id_lookup IF NOT EXISTS FOR (n:{label}) ON (n.repo_id)"
-        for label in NAMED_LABELS
-    ]
     return statements
 
 
