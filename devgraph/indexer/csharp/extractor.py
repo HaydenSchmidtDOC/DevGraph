@@ -34,7 +34,8 @@ Mirrors `devgraph/indexer/python/extractor.py`'s shape (Implementation Plan
     the global one; the usings of its namespace blocks, also relative to
     each enclosing namespace, and of the file; its project's `<Using>`
     items and `global using`s, read from the resolver configuration;
-    `System` and `Microsoft` ones left out), an alias's target (its
+    `System` and `Microsoft` ones left out unless the site's own namespace
+    is under the same root), an alias's target (its
     block's), a dotted name at every split (`A.B.T`: `A.B:T`, `A:B.T`,
     `.:A.B.T`, as a type can be nested; a qualified one also under each
     enclosing namespace, and as a type nested in `A.B`), a nested
@@ -383,7 +384,8 @@ def _declared_type(node: Node | None, source: bytes, qualifier: str = "") -> _Cs
 
 def _using(node: Node, source: bytes) -> CsUsing | None:
     """A using directive as the configuration's `CsUsing` writes one: its
-    namespace or type (dotted), `using static` and an alias."""
+    namespace or type (dotted, `global::` kept: the scope reads it as
+    absolute), `using static` and an alias."""
     alias = node.child_by_field_name("name")
     target = next(
         (c for c in node.named_children
@@ -394,7 +396,6 @@ def _using(node: Node, source: bytes) -> CsUsing | None:
     name = _dotted(target, source)
     if name is None:
         return None
-    name = name.removeprefix("global::")
     return CsUsing(name, any(c.type == "static" for c in node.children), _text(alias, source) if alias else "")
 
 
@@ -474,8 +475,10 @@ class _Target:
 
 
 def _library_namespace(name: str) -> bool:
-    """`System`, `Microsoft` or a namespace under one, which hold no
-    repository type."""
+    """`System`, `Microsoft` or a namespace under one: the framework's,
+    unless the site's own namespace is under the same root (the framework's
+    own repositories, `Microsoft.AspNetCore.Http` using
+    `Microsoft.AspNetCore.Routing`)."""
     return name.split(".", 1)[0] in ("System", "Microsoft")
 
 
@@ -529,10 +532,15 @@ class _CsResolver:
             return [".".join(parts[:i]) for i in range(len(parts), 0, -1)]
 
         def relative(using: CsUsing, parts: list[str]) -> tuple[CsUsing, tuple[str, ...]]:
+            if using.name.startswith("global::"):
+                return absolute(using)
             return using, (using.name, *(f"{prefix}.{using.name}" for prefix in prefixes(parts)))
 
+        def absolute(using: CsUsing) -> tuple[CsUsing, tuple[str, ...]]:
+            return using, (using.name.removeprefix("global::"),)
+
         parts = [part for part in (self._file_namespace or "").split(".") if part]
-        usings = [(using, (using.name,)) for using in self._unit_usings]
+        usings = [absolute(using) for using in self._unit_usings]
         usings += [relative(using, parts) for using in self._file_ns_usings]
         for block in reversed(blocks):
             parts += [part for part in (_dotted(block.child_by_field_name("name"), self.source) or "").split(".")
@@ -541,10 +549,12 @@ class _CsResolver:
             usings += [relative(u, parts) for c in (body.named_children if body is not None else [])
                        if c.type == "using_directive" if (u := _using(c, self.source)) is not None]
         chain = tuple(prefixes(parts))
+        root = parts[0] if parts else None  # a library root the file's own namespace is under is the repo's
         found = _CsScope(
             chain,
             frozenset({*chain, _GLOBAL_NS, *(name for using, names in usings if not using.static and not using.alias
-                                             for name in names if not _library_namespace(name))}),
+                                             for name in names
+                                             if not _library_namespace(name) or name.split(".", 1)[0] == root)}),
             {using.alias: names for using, names in usings if using.alias},
             tuple(sorted({names for using, names in usings if using.static and not using.alias})),
         )
@@ -886,6 +896,11 @@ class _CsCalls:
             return
         static = None
         typed = None
+        if owner.type == "alias_qualified_name" and _global(owner, source):
+            # `global::Util.Run()`: a type of the global namespace.
+            self._typed(_CsType(_member_name(owner.child_by_field_name("name"), source), None, "global::"), name,
+                        False)
+            return
         if owner.type in ("identifier", "generic_name"):
             text = _member_name(owner, source)
             if owner.type == "identifier" and (text in self.variables or self._field(text)[0]):
@@ -1147,12 +1162,13 @@ def extract_csharp_file(
         if first is not None and any(c.type == "modifier" and _text(c, source_bytes) == "this" for c in first.children):
             extended = _declared_type(first.child_by_field_name("type"), source_bytes)
             if extended is not None:
-                # `this T x where T : IRepo`: an extension method of IRepo.
+                # `this T x where T : class, IRepo`: an extension method of
+                # IRepo, the first constraint naming a type.
                 for clause in (c for c in node.named_children if c.type == "type_parameter_constraints_clause"):
                     target = next(iter(clause.named_children), None)
-                    constraint = next((c for c in clause.named_children if c.type == "type_parameter_constraint"), None)
-                    bound = _declared_type(constraint.child_by_field_name("type"), source_bytes) \
-                        if constraint is not None else None
+                    bound = next((found for c in clause.named_children if c.type == "type_parameter_constraint"
+                                  if (found := _declared_type(c.child_by_field_name("type"), source_bytes))
+                                  is not None), None)
                     if target is not None and _text(target, source_bytes) == extended.name and bound is not None:
                         extended = bound
                 keys.add(f"{namespace}:+{extended.name}")  # an extension method of `extended`

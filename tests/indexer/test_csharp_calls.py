@@ -577,3 +577,64 @@ def test_a_namespace_edit_moves_calls_and_imports_between_same_named_classes(eng
     index_paths(engine, repo_id, tmp_path, {program})
     assert targets() == ({"Models/User.cs"}, {"Models/User.cs"})
     _equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_a_library_root_the_files_own_namespace_is_under_stays_a_candidate():
+    source = """
+        namespace Microsoft.AspNetCore.Http
+        {
+            using Microsoft.AspNetCore.Routing;
+            using System.Text;
+
+            class Endpoint { void Run(RouteData d) { d.Match(); } }
+        }
+    """
+    keys = _call_keys(source, "Run", "Match")
+    assert {"Microsoft.AspNetCore.Routing:RouteData", "Microsoft.AspNetCore.Http.Microsoft.AspNetCore.Routing:RouteData",
+            "Microsoft.AspNetCore.Http:RouteData"} <= keys
+    assert not any(key.startswith("System.") for key in keys)  # another library root still is the framework's
+
+
+def test_a_project_using_under_the_files_own_library_root_stays_a_candidate(tmp_path):
+    (tmp_path / "Http").mkdir()
+    (tmp_path / "Http" / "Http.csproj").write_text(
+        '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><Using Include="Microsoft.AspNetCore.Routing" />'
+        '<Using Include="Microsoft.Extensions.Logging" /></ItemGroup></Project>'
+    )
+    config = ResolverConfig(tmp_path)
+    source = "namespace Microsoft.AspNetCore.Http;\nclass E { void Run() { RouteData.Make(); } }\n"
+    keys = _call_keys(source, "Run", "Make", "Http/E.cs", config)
+    assert "Microsoft.AspNetCore.Routing:RouteData" in keys and "Microsoft.Extensions.Logging:RouteData" in keys
+    elsewhere = _call_keys(source.replace("Microsoft.AspNetCore.Http", "Shop"), "Run", "Make", "Http/E.cs", config)
+    assert not any(key.startswith("Microsoft.") for key in elsewhere)
+
+
+def test_an_extension_on_a_constrained_type_parameter_skips_constraints_naming_no_type():
+    keys = _mkeys("""
+        namespace Shop
+        {
+            public static class RepoExtensions
+            {
+                public static void Touch<T>(this T repo) where T : class, IRepo { }
+                public static void Poke<T>(this T value) where T : struct { }
+            }
+        }
+    """)
+    assert keys[("Function", "Touch")] == ["Shop:+IRepo", "Shop:RepoExtensions"]
+    assert keys[("Function", "Poke")] == ["Shop:+T", "Shop:RepoExtensions"]
+
+
+def test_global_qualified_calls_and_block_usings_stay_absolute():
+    source = """
+        namespace Shop
+        {
+            using global::Tools.Text;
+            using Models;
+
+            class C { void Run() { global::Util.Go(); Formatting.Trim(); } }
+        }
+    """
+    assert _call_keys(source, "Run", "Go") == {".:Util"}
+    keys = _call_keys(source, "Run", "Trim")
+    assert "Tools.Text:Formatting" in keys and "Shop.Tools.Text:Formatting" not in keys
+    assert {"Models:Formatting", "Shop.Models:Formatting"} <= keys  # a plain block using is relative too

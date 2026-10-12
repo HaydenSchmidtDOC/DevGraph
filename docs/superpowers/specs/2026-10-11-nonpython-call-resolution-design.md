@@ -491,15 +491,20 @@ configuration). A using inside a namespace block (or after a file-scoped
 namespace) is also read relative to each enclosing namespace
 (`namespace Contoso.Web { using Services; }`: `Services`,
 `Contoso.Web.Services`, `Contoso.Services`), and its aliases are that
-block's alone. `System`, `Microsoft` and the namespaces under them are left
-out: they hold no repository type, and they are most of a typical file's
-usings. A type `T` written unqualified at the site is `Ns:T` for each
+block's alone; `using global::A.B;` stays absolute. `System`, `Microsoft`
+and the namespaces under them are left out, the framework's in a typical
+repository and most of a typical file's usings, unless the site's own
+namespace is under the same root (the framework's own repositories:
+`Microsoft.AspNetCore.Http` using `Microsoft.AspNetCore.Routing` keeps it);
+this applies to the project's `<Using>` items and `global using`s alike.
+A type `T` written unqualified at the site is `Ns:T` for each
 candidate, `Ns:Outer.T` for each enclosing class `Outer`, or an alias's
 target alone. A dotted name (an alias's target, a `using static` type, a
 qualified `A.B.T`) is keyed at every split, since a type can be nested:
 `A.B:T`, `A:B.T`, `.:A.B.T`; a qualified name's splits also under each
 enclosing namespace `P` (`P.A.B:T`, `P.A:B.T`), and `Ns:A.B.T` for each
-candidate (`A` a type there); `global::A.B.T` only at the global namespace.
+candidate (`A` a type there); `global::A.B.T`, and a call `global::T.M()`,
+only at the global namespace.
 A verbatim identifier's `@` is left out of every key.
 
 **Pins.** A site writes at most two `@` pins: its types' keys and, for a
@@ -553,10 +558,10 @@ picking the innermost tier that matches is a follow-up (shadow tiers). A
 key group over the cap links by class file name, as before match keys.
 `ImplicitUsings` is not read. An extension method is keyed by its `this`
 parameter's type's simple name (`Ns:+T`), or by a type parameter's first
-constraint's (`this T x where T : IRepo`: `+IRepo`); a receiver typed with
-a class implementing that interface (`Repo r; r.Touch()`) looks for
-`+Repo` and misses it, as does a constraint that names no type (`class`,
-`new()`).
+constraint naming a type (`this T x where T : class, IRepo`: `+IRepo`); a
+receiver typed with a class implementing that interface (`Repo r;
+r.Touch()`) looks for `+Repo` and misses it, and a type parameter
+constrained by no type (`class`, `struct`, `new()`) keeps `+T`.
 
 ## C++ (`devgraph/indexer/cpp/extractor.py`)
 
