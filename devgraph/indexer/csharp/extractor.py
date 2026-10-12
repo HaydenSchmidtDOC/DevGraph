@@ -419,7 +419,6 @@ class _CsResolver:
         self.classes: dict[str, _CsClass] = {}
         self.types: set[str] = set()
         self.type_params: set[str] = set()
-        self.methods: set[str] = set()  # every method name declared here
         self.imports: dict[str, set[str]] = {}  # class name -> IMPORTS pins
         self.extension_imports: dict[str, set[str]] = {}  # method name -> IMPORTS pins
         self._scopes: dict[int | None, _CsScope] = {}
@@ -428,14 +427,13 @@ class _CsResolver:
         file_ns = next((c for c in root.named_children if c.type == "file_scoped_namespace_declaration"), None)
         self._file_namespace = _dotted(file_ns.child_by_field_name("name"), source) if file_ns is not None else None
         self._unit_usings = usings
-        every = usings + [u for c in _descendants(root, "using_directive") if (u := _using(c, source)) is not None]
-        # A name written as a type, by its alias: the target's simple name.
-        self.aliases: dict[str, str] = {u.alias: u.name.rpartition(".")[2] for u in every if u.alias}
+        self._block_usings: list[CsUsing] = []
         self._collect(root, ())
-        for each in _descendants(root, "method_declaration"):
-            name = each.child_by_field_name("name")
-            if name is not None:
-                self.methods.add(_text(name, source))
+        # A name written as a type, by its alias: the target's simple name.
+        self.aliases: dict[str, str] = {
+            u.alias: u.name.rpartition(".")[2] for u in usings + self._block_usings if u.alias
+        }
+        self.methods: set[str] = set().union(*(info.methods for info in self.classes.values()))  # declared here
 
     def scope(self, node: Node) -> _CsScope:
         """The namespaces at `node` (see `_CsScope`)."""
@@ -532,6 +530,8 @@ class _CsResolver:
             elif kind in ("namespace_declaration",):
                 body = child.child_by_field_name("body")
                 if body is not None:
+                    self._block_usings += [u for c in body.named_children if c.type == "using_directive"
+                                           if (u := _using(c, source)) is not None]
                     self._collect(body, path)
         for each in _descendants(node, "type_parameter"):
             name = each.child_by_field_name("name")

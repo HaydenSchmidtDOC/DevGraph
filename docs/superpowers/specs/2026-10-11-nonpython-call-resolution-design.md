@@ -101,12 +101,15 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   digest, and the `.csproj` that would make it one is a change itself.
   Every catch-up and full scan reads every .cs file's head (about 45 ms for
   500 files, 5.5 MB; no cache). A batch extracts C# under the inputs its
-  fingerprint found. A configuration change re-indexes every C# file; no
-  resolver reads the configuration yet. Left for the extractor's change:
-  `symbols.EXTRACTORS` and the legacy `csharp/extractor.py` indexing entry
-  point call `extract_csharp_file` without a configuration, and
-  `ImplicitUsings` stays unread (if it is ever read, it is one more
-  `<PropertyGroup>` input of the digest).
+  fingerprint found. A configuration change re-indexes every C# file. The
+  C# resolver reads a file's project's `<Using>` items and `global using`s
+  as usings of the file (see the C# section); the legacy
+  `csharp/extractor.py` indexing entry point reads the repository's
+  projects too, and `symbols.EXTRACTORS` needs none (it keeps nodes only,
+  whose match keys come from the file's text). `ImplicitUsings` stays
+  unread: it adds only `System.*` and `Microsoft.*` namespaces, which hold
+  no repository type (if it is ever read, it is one more `<PropertyGroup>`
+  input of the digest).
 
 Fresh is then extract(text, configuration), and an incremental run re-extracts
 every dependent when the configuration changes.
@@ -460,52 +463,82 @@ declared in the file, and links the type's module otherwise.
 
 A C# file's text says which namespaces it uses, not which files hold them:
 nothing ties a namespace to a folder, nor (beyond convention, SA1649) a
-class to a file named after it. Where another file's type `T` lives is
-therefore its class file by suffix, `/T.cs^` (no vendored copy), at package
-confidence: two namespaces can each hold a `User.cs`, and only an index of
-every file's namespace could tell them apart, which would make an edge
-depend on the target file's text (a namespace edit keeps the target's nodes,
-so edges into it would go stale). The design's partial-class rule (a
-suffix-directory pin to the class's folder) is dropped; a method of
-another part of a partial class keeps a bare-name row.
+class to a file named after it. Each declaration therefore carries its
+namespace as *match keys* (`mkeys`, see Engine: path pins), and a reference
+to another file's type `T` is one pin to any C# file, `/.?.cs^`, limited
+with `@` to the nodes holding a key the reference can mean, at package
+confidence (two projects can each declare `Shop.Domain.User`; which one a
+project references is not read). The keys come from the target's own text,
+so a namespace edit keeps the target's nodes and only changes their keys:
+the engine retracts and relinks the edges into them.
 
-**Calls**, first match wins:
+**Match keys** (target side). A class `Ns:Name` (`.` for the global
+namespace; a nested class `Ns:Outer.Inner`); a method or constructor
+`Ns:Owner`, and an extension method also `Ns:+T`, `T` the simple name of
+its `this` parameter's type. `Ns` is the file's block namespaces joined
+(`namespace A { namespace B.C` is `A.B.C`) or its file-scoped one. Every
+part of a partial class has the same key (the compiler puts all parts in
+one namespace). A file's same-named declarations (overloads, a method
+name in two classes, one class name in two namespaces) are one node: its
+keys are their union. `mkeys` is always written on a C# Class and Function,
+sorted, even empty, and never derived from the configuration.
+
+**Candidate namespaces per site** (the writer's text and its project): the
+enclosing namespaces, innermost first, then their parents, then `.`; the
+usings of the enclosing namespace blocks and of the compilation unit; the
+project's `<Using>` items and the `global using`s of its files (resolver
+configuration). A type `T` written unqualified at the site is `Ns:T` for
+each of them, `Ns:Outer.T` for each enclosing class `Outer`, or an alias's
+exact target alone (`using LegacyUser = Legacy.Accounts.User`:
+`Legacy.Accounts:User`; an alias of a namespace qualifies the rest the same
+way). A qualified `A.B.T` is `A.B:T`, `P.A.B:T` for each enclosing
+namespace `P`, and `Ns:A.B.T` (a type nested in a type `A.B`) for each
+candidate namespace. `using static A.T` adds `A:T`. More than 32 keys at a
+site (`schema.MAX_SCOPE_KEYS`) drop the `@` deterministically, and the site
+then links any C# file declaring the name.
+
+**Calls**, first match wins (one pin per site, its keys the union of what
+the tier found):
 
 1. An unqualified `M()`, `this.M()`, `base.M()`: this file when an
    enclosing class declared here, innermost first, or an in-file base has
-   M; else its other bases' class files; else a `using static` type's
-   class file. A local function or a delegate variable links nothing.
-2. `T.M()` on a type (an alias's target, the last name of a qualified
-   `A.B.T.M()`) and a typed receiver (a parameter, a field or property of
-   the enclosing classes, `T x`, `var x = new T()`, `new T().M()`, a
-   `foreach` element of a `List<T>` or array): this file when T is declared
-   here and has M; else `/T.cs^`, and for a receiver also
-   `/TExtensions.cs^`, the conventional class of T's extension methods. A
-   library type (`STOP_TYPES["csharp"]`: `Console`, `List`, `Math`, ...) or
-   a predefined one (`string.IsNullOrEmpty`) links nothing.
+   M; else the keys of its out-of-file bases, of the class itself when it
+   is partial (another part, in another file, has M), and, for an
+   unqualified `M()`, of the `using static` types. A local function or a
+   delegate variable links nothing.
+2. `T.M()` on a type (an alias's target, a qualified `A.B.T.M()`) and a
+   typed receiver (a parameter, a field or property of the enclosing
+   classes, `T x`, `var x = new T()`, `new T().M()`, a `foreach` element
+   of a `List<T>` or array): this file when T is declared here and has M
+   (else, for a class declared here, tier 1's keys for it); else T's keys,
+   and for a receiver also `Ns:+T` for each candidate namespace (the
+   extension methods in scope). A library type (`STOP_TYPES["csharp"]`:
+   `Console`, `List`, `Math`, ..., also as a qualifier such as
+   `DateTime.UtcNow`) or a predefined one (`string.IsNullOrEmpty`) links
+   nothing.
 3. Anything else, `dynamic` and `x?.M()` included: a bare-name row, off its
    caller for a member call, none for a stoplisted method.
 
 **`IMPORTS`** are the classes a file references: an edge to the Class `T`
 for each type it writes (a base, a field, property, parameter, local or
 return type, `new T()`, a cast, `typeof`, a generic argument, a static
-receiver, an alias's target, a `using static` type it calls through),
-declared in any C# file (the suffix-directory pin `/.?.cs^`, package), not
-in this file, and no library type, as Kotlin's imports name symbols. A
-partial class's every part and a class in a file named otherwise are
-reached; a `using` of a namespace, the bare dotted name and the old
-`A/B.cs` folder guess are gone. An extension method's class, which the
-caller never names, is not imported.
+receiver, an alias's target, a `using static` type it calls through), under
+the keys the reference can mean, not declared in this file, and no library
+type. A partial class's every part and a class in a file named otherwise
+are reached; a `using` of a namespace imports nothing. A typed receiver's
+call `x.M()` also imports the Function `M` under the `Ns:+T` keys alone
+(the file depends on an extension class it never names), unless the file
+declares an `M` itself.
 
-**Limits, and a follow-up.** Two classes of one name in different
-namespaces both get every call and import of the name (the caller's
-`using`s and enclosing namespace cannot pick one by path), and a call into a
-class declared in a file not named after it (`UserMapper` in `Mappers.cs`)
-links nothing. Both need a mechanism that knows each file's namespace and
-classes, read from the project (`.csproj` files and the declarations of
-every C# file) and kept current as the target files change, so that an edge
-stays a function of the configuration and the target's existence; that is
-a follow-up, not part of slice C.
+**Limits.** Stage 1 of the namespace design: a project's
+`<ProjectReference>`s are not read, so a same-named type in a project the
+writer's does not reference matches too (in one compilation, two visible
+`Ns.T` are error CS0433). An enclosing namespace's type does not shadow a
+using's (`UserService` in `Shop.Domain.Services` with `using
+Legacy.Accounts` links both `User`s' `Display`): the keys are a union, and
+picking the innermost tier that matches is a follow-up (shadow tiers). A
+site with more than 32 candidate keys links by path alone. `ImplicitUsings`
+is not read.
 
 ## C++ (`devgraph/indexer/cpp/extractor.py`)
 
@@ -894,4 +927,68 @@ AFTER (`full_scan_s` is one cold run of the script):
 
 Python on DevGraph is as after slice A (resolved precision, `IMPORTS` and
 `find_callers` recall unchanged; 15 fewer self-loops than before `no_self`).
+
+### Results after C# match keys (index format 10)
+
+Stage 1 of the C# namespace design (`.superpowers/csharp-ns-design.md`):
+match keys and one `/.?.cs^@keys` pin per site, the project's `<Using>`
+items and `global using`s read, no `<ProjectReference>` and no shadow
+tiers. BEFORE is this branch's code before the extractor change.
+
+| csharp fixture | Target | BEFORE | AFTER | |
+|---|---|---|---|---|
+| M1 resolved multi-target | < 2 % | 0 % (1 resolved, 18 package, 4 name) | 0 % (1 resolved, 21 package, 2 name) | met |
+| M2 linked precision | ≥ 98 %, 0 | 89 % (17/19); 0 | 95 % (21/22); 0 | short |
+| M3 `IMPORTS` precision / recall | ≥ 98 % / 95 % | 80 % / 94 % (16/17) | 94 % (17/18) / 100 % (17/17) | short |
+| M4 `CALLS` recall | ≥ 95 % | 90 % (linked 81 %) | 100 % (linked 100 %) | met |
+| M5 named sites | all | 27/31 | 30/31 | short |
+| M6 largest `name_refs` | < 1 MiB | 1,109 B | 4,203 B (total 3,661 B to 11,566 B) | met |
+
+- **What is left is shadowing.** `UserService.Register` (namespace
+  `Shop.Domain.Services`, `using Legacy.Accounts`) still links both
+  `User`s' `Display`, and `UserService.cs` imports both `User.cs`: the
+  enclosing namespace's `User` hides the using's in C#, but the pin's keys
+  are a union. Everything else the slice C notes listed is fixed:
+  `UserMapper.Describe` links only Legacy's `Display`, `UserMapper` is
+  found in `Mappers.cs`, the partial `Order`'s `Subtotal`/`Tax` link
+  `Order.Pricing.cs`, the alias `LegacyUser` imports Legacy's `User` alone,
+  and `user.Initials()` imports `UserExtensions.cs`. These match the
+  design's estimates (M2 ~96-97 %, M3 17/18 and 17/17, M5 30/31);
+  `test_measure_fixtures` keeps C# a strict xfail until shadow tiers.
+- **Synthetic multi-project repository** (`measure_call_graph.py
+  --cs-synthetic`, seed 1): N library projects declaring the same class
+  names in their own namespaces, each service calling its own project's
+  types and one other project's `Gateway.Send()`; linked `CALLS` against
+  the generator's truth.
+
+| `--cs-synthetic` | BEFORE | AFTER |
+|---|---|---|
+| 10 projects (202 files): cross-project wrong links / linked | 88.3 % (6,480 / 7,335) | 0 % (0 / 865) |
+| 10 projects: linked precision, recall; `IMPORTS` P / R | 11.7 %, 98.8 %; 10.2 % / 83.9 % | 100 %, 100 %; 100 % / 100 % |
+| 50 projects (1,002 files): cross-project wrong links / linked | 97.7 % (176,400 / 180,637) | 0.58 % (25 / 4,312) |
+| 50 projects: linked precision, recall; `IMPORTS` P / R | 2.3 %, 98.8 %; 2.0 % / 83.7 % | 99.4 %, 100 %; 100 % / 100 % |
+| 50 projects: largest `name_refs` (gate < 1 MiB) | 1,961 B | 8,802 B (total 0.54 MB to 2.0 MB) |
+| 50 projects: `full_scan` | 188 s | 114 s (far fewer edges) |
+
+  The 25 wrong links of the 50-project run are all `Startup.cs`'s: it has
+  a `using` of every project's Api namespace (53 candidate keys, over the
+  32-key cap), so its `ModuleN.Start()` sites link by path alone, every
+  project's `Start()`, where the old `/ModuleN.cs` pin found the right
+  file by its name. A file with more than about 30 usings in scope
+  (its own, its project's `<Using>` items and `global using`s, its
+  enclosing namespaces) loses the narrowing; a typed receiver's site counts
+  each namespace twice (`Ns:T` and the extension key `Ns:+T`).
+- **Cost.** The fixture's `full_scan`, BEFORE and AFTER alternating in
+  their own processes (12 scans after two warm-ups each, two series, the
+  shared Neo4j otherwise idle): fastest 0.97 s and 1.03 s (+6 %); the
+  medians are bimodal (about 1.0 s or 1.6 s, the index-wait polling of
+  `provision_repository_schema`) and were 1.03/1.81 s and 1.61/2.37 s, so
+  they settle nothing. A profiled scan of each issues the same queries
+  bar two (the match-key write and its settle) and spends 0.07 s more
+  upserting relationships (the extension `IMPORTS` rows and the `@` test).
+  Extraction alone, 202 synthetic files: 0.22 s to 0.32 s. On the
+  synthetic repositories the scan got faster (10 projects 22.2 s to
+  19.5 s, 50 projects 188 s to 114 s: far fewer edges). C# `name_refs`
+  grow about 4x (the fixture's largest 1.1 KB to 4.2 KB), as each entry
+  stores its keys once.
 
