@@ -24,7 +24,9 @@ loses a `global using` (written behind a comment, `#if`, a byte order mark,
 CRLF or `extern alias`), or moves to another project's folder or out of
 every project (scripts/); a C# Module records its project's usings
 (`_with_cs_projects`), so a change that did not re-index every C# file
-would leave one stale. Kotlin files hold adjacent one-line classes, which
+would leave one stale. A C# file's namespace changes, two files swap their
+classes, and a class takes the name of another file's class in another
+namespace, so C# match keys change under the edges `@` pins gave them. Kotlin files hold adjacent one-line classes, which
 the extractor recovers from tree-sitter-kotlin's error nodes, and import a
 function or package of another one. Go, Java, Kotlin, Rust, C# and C++ calls
 come in every style their resolvers read (bare, through a package, module,
@@ -400,8 +402,10 @@ KT_CALLS = ["{n}", "Clock().{n}", "x.{n}"]
 RS_CALLS = ["{n}", "display::{n}", "crate::foo::{n}", "shop_core::{n}", "shop_core::util::{n}", "Foo::{n}",
             "x.{n}"]
 # How a C# call to `{n}` is written: bare, on `this`/`base`, static, through
-# an alias, on a new or an untyped object.
-CS_CALLS = ["{n}", "this.{n}", "base.{n}", "Jobs.{n}", "J.{n}", "new Jobs().{n}", "obj.{n}"]
+# an alias or a qualified name, on a new or an untyped object.
+CS_CALLS = ["{n}", "this.{n}", "base.{n}", "Jobs.{n}", "J.{n}", "Shop.Models.Base.{n}", "new Jobs().{n}", "obj.{n}"]
+# The namespaces a C# file's class moves between.
+CS_NAMESPACES = ["Shop", "Shop.App", "Shop.Models", "Tools", "Legacy"]
 # How a C++ call to `{n}` is written: bare, namespace-qualified, on a typed or an untyped value.
 CPP_CALLS = ["{n}", "util::{n}", "w.{n}", "obj->{n}"]
 # C++ out-of-class method definitions: of a header's class, of a class
@@ -669,6 +673,42 @@ class Fuzz:
         self.files[new] = self.files.pop(path)
         return f"move {path} to {new}", {path, new}
 
+    def op_cs_namespace(self):
+        """Change a C# file's namespace."""
+        path = self._pick(lambda f: f.kind == "cs")
+        if not path:
+            return None
+        f = self.files[path]
+        f.head = self.rng.choice([n for n in CS_NAMESPACES if n != f.head])
+        return f"namespace of {path} to {f.head}", {path}
+
+    def op_cs_move_class(self):
+        """Swap two C# files' classes (name, base and methods), each file
+        keeping its namespace."""
+        paths = sorted(p for p, f in self.files.items() if f.kind == "cs")
+        if len(paths) < 2:
+            return None
+        a, b = self.rng.sample(paths, 2)
+        fa, fb = self.files[a], self.files[b]
+        fa.bases, fb.bases = fb.bases, fa.bases
+        fa.funcs, fb.funcs = fb.funcs, fa.funcs
+        return f"swap the classes of {a} and {b}", {a, b}
+
+    def op_cs_dup_class(self):
+        """Give a C# file's class the name of another file's class, in
+        another namespace."""
+        paths = sorted(p for p, f in self.files.items() if f.kind == "cs")
+        if len(paths) < 2:
+            return None
+        a, b = self.rng.sample(paths, 2)
+        ((name, _base),) = self.files[a].bases.items()
+        fb = self.files[b]
+        ((_old, base),) = fb.bases.items()
+        fb.bases = {name: base}
+        if fb.head == self.files[a].head:
+            fb.head = self.rng.choice([n for n in CS_NAMESPACES if n != fb.head])
+        return f"class of {b} named {name} in namespace {fb.head}", {b}
+
     def op_delete_dir(self):
         """Delete a folder holding a configuration file, with everything in it."""
         folder = self.rng.choice(CONFIG_DIRS)
@@ -780,7 +820,8 @@ class Fuzz:
         "call", "base", "import", "import_style", "impl", "add_function", "remove_function", "move_function",
         "rename", "delete", "restore", "service", "from", "move_image", "mention", "link", "supersedes", "pin", "pin",
         "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module", "method", "method",
-        "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move",
+        "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move", "cs_namespace", "cs_move_class",
+        "cs_dup_class",
     ]
 
     def draw(self):
@@ -833,9 +874,9 @@ def _with_pin_comments(monkeypatch):
 @pytest.fixture(autouse=True)
 def _with_cs_projects(monkeypatch):
     """A C# file's Module records its project's usings (`fz_usings`), so its
-    extraction depends on the C# configuration as the resolver's will: a
-    configuration change that does not re-index every C# file leaves a
-    stale one."""
+    extraction depends on all of the C# configuration, not only the part its
+    resolved edges show: a configuration change that does not re-index
+    every C# file leaves a stale one."""
     real = dispatch.extract_csharp_file
 
     def extract(content, rel_path, repo_id, config=None):

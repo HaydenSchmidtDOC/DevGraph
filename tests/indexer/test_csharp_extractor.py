@@ -1,9 +1,13 @@
 """Unit tests for the C# source-code extractor."""
 
+from unittest.mock import MagicMock
+
 from devgraph.indexer.csharp.extractor import (
     ExtractionResult,
     extract_csharp_file,
+    index_file,
 )
+from devgraph.indexer.symbols import EXTRACTORS
 
 
 def test_extract_module_classes_functions_using():
@@ -166,6 +170,33 @@ def test_a_using_imports_no_file():
     for source in ("using System;\n", "using MyApp.Services.Foo;\n"):
         result = extract_csharp_file(source, "App.cs", "test_repo")
         assert [r for r in result.relationships if r.rel_type == "IMPORTS"] == []
+
+
+def test_every_class_and_function_carries_match_keys():
+    """`mkeys` is written on every Class and Function, sorted, even empty."""
+    result = extract_csharp_file("class A { void Run() {} }\nenum E { X }\n", "A.cs", "test_repo")
+    assert {(n.label, n.name): n.properties.get("mkeys") for n in result.nodes} == {
+        ("Module", "A.cs"): None, ("Class", "A"): [".:A"], ("Function", "Run"): [".:A"],
+    }
+
+
+def test_every_entry_point_reads_the_project_as_index_paths_does(tmp_path):
+    """The legacy `index_file` reads the repository's C# projects, so a
+    project `<Using>` narrows its pins as in a scan; `symbols.EXTRACTORS`
+    keeps only nodes, whose match keys come from the text alone."""
+    (tmp_path / "App.csproj").write_text(
+        '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><Using Include="Shop.Text" /></ItemGroup></Project>'
+    )
+    source = "namespace App;\nclass P { void Main() { Formatting.Title(); } }\n"
+    (tmp_path / "P.cs").write_text(source)
+    engine = MagicMock()
+    index_file(engine, "test_repo", tmp_path / "P.cs", repo_root=tmp_path)
+    (rels,), _ = engine.upsert_relationships.call_args
+    pins = {r["to_file"] for r in rels if r["rel_type"] == "CALLS"}
+    assert len(pins) == 1 and "Shop.Text:Formatting" in pins.pop()
+    nodes = {(n.label, n.name, tuple(n.properties["mkeys"])) for n in EXTRACTORS["cs"](source, "P.cs").nodes
+             if n.label != "Module"}
+    assert nodes == {("Class", "P", ("App:P",)), ("Function", "Main", ("App:P",))}
 
 
 def test_all_nodes_scoped_to_repo():

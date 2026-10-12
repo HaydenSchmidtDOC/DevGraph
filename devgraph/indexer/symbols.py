@@ -27,6 +27,8 @@ from devgraph.indexer import source_text
 EXTRACTORS: dict[str, Callable[[str, str], ExtractionResult]] = {
     "py": lambda source, path: extract_python_file(source, path, ""),
     "js": lambda source, path: extract_js_file(source, path, ""),
+    # A C# file's match keys come from its text alone; its project's usings, the
+    # configuration, only shape IMPORTS and CALLS targets, which are dropped here.
     "cs": lambda source, path: extract_csharp_file(source, path, ""),
     "cpp": lambda source, path: extract_cpp_file(source, path, ""),
     "java": lambda source, path: extract_java_file(source, path, ""),

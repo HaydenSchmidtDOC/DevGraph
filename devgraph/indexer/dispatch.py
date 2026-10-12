@@ -122,9 +122,10 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: Rust, C# and C++ CALLS and IMPORTS resolved through crate roots and
 #: Cargo crate names, referenced types and quoted includes; 9: a C++
 #: out-of-class method's Class stub claimed by its file, and the unclaimed
-#: stubs an older index left deleted). An index stamped lower, or not at
-#: all, is rescanned automatically.
-INDEX_FORMAT = 9
+#: stubs an older index left deleted; 10: C# Class and Function match keys
+#: (`mkeys`) and C# CALLS and IMPORTS narrowed by namespace through them).
+#: An index stamped lower, or not at all, is rescanned automatically.
+INDEX_FORMAT = 10
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
