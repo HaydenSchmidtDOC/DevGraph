@@ -166,8 +166,8 @@ def neo4j_unavailable(exc: BaseException, uri: str) -> ToolError | None:
         )
     if isinstance(exc, ServiceUnavailable) and not isinstance(exc, (EngineClosed, IndexesNotReady)):
         return ToolError(
-            f"Neo4j isn't reachable at {uri}; start it (for example `podman start devgraph-neo4j`), "
-            "then retry (`devgraph doctor` checks the connection)"
+            f"Neo4j isn't reachable at {uri}; start Neo4j (`podman start devgraph-neo4j`; on Windows "
+            "and macOS run `podman machine start` first), then retry (`devgraph doctor` checks the connection)"
         )
     return None
 
@@ -695,6 +695,9 @@ def _read(engine: GraphEngine, cypher: str, params: dict[str, Any], max_rows: in
     try:
         return engine.run_read_cypher(cypher, _with_cross_ids(cypher, params), timeout_s=DEFAULT_TIMEOUT_S, max_rows=max_rows)
     except Neo4jError as exc:
+        unavailable = neo4j_unavailable(exc, getattr(engine, "uri", "the configured URI"))
+        if unavailable is not None:  # a refused login is a Neo4jError too
+            raise unavailable from exc
         code = str(getattr(exc, "code", None) or "unknown")
         if "TransactionTimedOut" in code:
             raise ToolError(

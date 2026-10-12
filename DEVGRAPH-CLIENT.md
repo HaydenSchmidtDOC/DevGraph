@@ -373,7 +373,7 @@ argument below its minimum (`max_results`, `within_commits`,
 `max_length` below 2) fails and names the argument.
 
 If Neo4j is down, every tool fails within a few seconds with `Neo4j isn't
-reachable at <uri>; start it ...`: tell the user to start Neo4j (or run
+reachable at <uri>; start Neo4j ...`: tell the user to start Neo4j (or run
 `devgraph doctor`) rather than retrying the call in a loop.
 
 If a tool returns empty/sparse results, check whether the repo has actually

@@ -454,6 +454,11 @@ RETRY_LOG_LEVEL = logging.WARNING
 _BASE_DELAY_S = 0.5
 
 
+#: How long `GraphEngine.run_read_cypher` waits before its one quick retry (see
+#: `GraphEngine`'s `quick_retry_s`).
+QUICK_RETRY_PAUSE_S = 0.5
+
+
 #: How long `GraphEngine.close` waits, by default, for open sessions to end.
 CLOSE_WAIT_S = 5.0
 
@@ -1067,20 +1072,28 @@ class GraphEngine:
         user: str,
         password: str,
         *,
-        transaction_retry_s: float | None = None,
+        quick_retry_s: float | None = None,
         connection_timeout_s: float | None = None,
     ) -> None:
-        """`transaction_retry_s` bounds how long a managed transaction
-        (`execute_read`/`execute_write`) retries a transient failure, and
-        `connection_timeout_s` how long opening a connection may take; omitted,
-        the driver's defaults (30 s each) apply. The MCP server sets both low,
-        so a request fails fast when Neo4j is down."""
+        """Omitted, both limits keep the driver's defaults: a managed transaction
+        is retried for up to 30 s, and getting a connection may take 30-60 s.
+
+        `connection_timeout_s` bounds getting a connection: opening it, the Bolt
+        handshake, or waiting for a pooled one. `quick_retry_s` turns the
+        driver's retries off; `run_read_cypher` then retries a failed read once,
+        `QUICK_RETRY_PAUSE_S` later, only when it failed within `quick_retry_s`
+        (a blip: a deadlock, a dropped connection), never after a connection
+        timed out or took long to be refused (Windows reports a refusal after
+        about 2 s). The MCP server sets both, so a request fails within a few
+        seconds when Neo4j is down."""
         self.uri = uri
+        self._quick_retry_s = quick_retry_s
         limits: dict[str, float] = {}
-        if transaction_retry_s is not None:
-            limits["max_transaction_retry_time"] = transaction_retry_s
+        if quick_retry_s is not None:
+            limits["max_transaction_retry_time"] = 0
         if connection_timeout_s is not None:
             limits["connection_timeout"] = connection_timeout_s
+            limits["connection_acquisition_timeout"] = connection_timeout_s
         # Hint notifications are off: a hinted index an older database hasn't
         # built yet (init_schema creates it) would log one per query.
         self._driver = _GatedDriver(GraphDatabase.driver(
@@ -2131,6 +2144,19 @@ class GraphEngine:
                 rows.append(record.data())
             return rows, False
 
+        if self._quick_retry_s is None:
+            with self._driver.session(default_access_mode=READ_ACCESS) as session:
+                return session.execute_read(work)
+        started = time.monotonic()
+        try:
+            with self._driver.session(default_access_mode=READ_ACCESS) as session:
+                return session.execute_read(work)
+        except ABORTS_BATCH:
+            raise
+        except _RETRYABLE_EXCEPTIONS:
+            if time.monotonic() - started > self._quick_retry_s:
+                raise
+        time.sleep(QUICK_RETRY_PAUSE_S)
         with self._driver.session(default_access_mode=READ_ACCESS) as session:
             return session.execute_read(work)
 

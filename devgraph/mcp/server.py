@@ -967,10 +967,11 @@ def build_server(
     return server
 
 
-#: How long the MCP server's driver retries a failed read, and waits to open a
-#: connection: a transient blip is still retried, but with Neo4j down a call
-#: fails within seconds rather than after the driver's default 30 s.
-MCP_TRANSACTION_RETRY_S = 3.0
+#: The MCP server's engine limits (see `GraphEngine`): a read that fails within
+#: a second (a blip) is retried once; getting a connection may take 2 s. With
+#: Neo4j down a call fails in at most about 3.5 s (1 s + the 0.5 s pause + 2 s)
+#: on every platform, not after the driver's default 30 s of retries.
+MCP_QUICK_RETRY_S = 1.0
 MCP_CONNECTION_TIMEOUT_S = 2.0
 
 
@@ -980,7 +981,7 @@ def mcp_engine(settings: Any) -> GraphEngine:
         settings.neo4j_uri,
         settings.neo4j_user,
         settings.neo4j_password,
-        transaction_retry_s=MCP_TRANSACTION_RETRY_S,
+        quick_retry_s=MCP_QUICK_RETRY_S,
         connection_timeout_s=MCP_CONNECTION_TIMEOUT_S,
     )
 
@@ -1010,10 +1011,19 @@ def main() -> None:
     """
     settings = get_settings()
     engine = mcp_engine(settings)
-    engine.verify_connectivity()
-    # Not waiting for indexes an upgrade is still building: that can outlast
-    # the client's handshake timeout, and each query waits for its own.
-    engine.init_schema(wait=False)
+    try:
+        engine.verify_connectivity()
+        # Not waiting for indexes an upgrade is still building: that can outlast
+        # the client's handshake timeout, and each query waits for its own.
+        engine.init_schema(wait=False)
+    except Exception as exc:
+        # Neo4j down (or refusing the login) at startup: serve anyway, so the
+        # client gets each tool's error saying how to fix it, and the tools work
+        # as soon as Neo4j is reachable (the agent provisions the schema).
+        error = devgraph_tools.neo4j_unavailable(exc, settings.neo4j_uri)
+        if error is None:
+            raise
+        logger.warning("%s; serving anyway, each tool answers with this until Neo4j is reachable", error)
     registry = RepoRegistry(settings.registry_db_path)
 
     try:
