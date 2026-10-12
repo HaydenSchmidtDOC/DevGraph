@@ -280,7 +280,7 @@ def test_list_file_nodes_finds_a_keyed_node_by_its_path(engine):
     seed_keyed(engine)
     # Provider nodes are looked up by the labels the applied schema records.
     engine.record_applied_schema(REPO, "h", ["Adr"], [], ["Adr:adr_id"])
-    assert engine.list_file_nodes(REPO, ["decisions/a.md"]) == {("Adr", "ADR-012", "decisions/a.md", ())}
+    assert engine.list_file_nodes(REPO, ["decisions/a.md"]) == {("Adr", "ADR-012", "decisions/a.md", None)}
     assert engine.list_file_nodes(REPO, ["ADR-012"]) == set()
 
 

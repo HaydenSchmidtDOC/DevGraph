@@ -15,7 +15,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from typing import TYPE_CHECKING, Any
 
 from neo4j import Driver, GraphDatabase, NotificationDisabledClassification, READ_ACCESS, unit_of_work
@@ -705,6 +705,8 @@ def _pin(file: str | None) -> str:
 #: The edge types a resolver writes with a pin's `@` flag, whose edges into a
 #: node therefore depend on its match keys (see retract_match_key_edges).
 MATCH_KEY_EDGE_TYPES = ("CALLS", "IMPORTS")
+#: The most nodes retract_match_key_edges handles in one transaction.
+RETRACT_NODES = 500
 #: The pin kinds that match a set of files rather than one (see `_pin`).
 _PATH_PINS = frozenset({"dir", "loose_dir", "suffix", "suffix_dir", "prefix"})
 #: The path pins whose files all start with the pin's own path (`pin_value`'s
@@ -1684,7 +1686,7 @@ class GraphEngine:
         records = self.run_cypher(query, {"repo_id": repo_id, "names": names})
         return [(record["name"], record["label"]) for record in records]
 
-    def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str, str, tuple[str, ...]]]:
+    def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str, str, tuple[str, ...] | None]]:
         """Return (label, name, file, mkeys) for every node whose file provenance
         (`source_file`/`file`, a `Module` named by its path, or a schema
         provider's node, which its `path` owns) is one of `files`. `file` is
@@ -1692,7 +1694,7 @@ class GraphEngine:
         `path`, in that order. A shared node one of `files` claims (in its
         `sources`: a `Container`, `Datastore`, `Endpoint` or handler stub) is
         returned with `file` "", besides any row for its own provenance.
-        `mkeys` is the node's match keys, sorted (empty when it has none).
+        `mkeys` is the node's match keys, sorted (None when it has none).
 
         index_paths snapshots this before re-indexing a batch so it can tell
         which nodes the batch *adds* -- only those can be the missing
@@ -1724,35 +1726,43 @@ class GraphEngine:
                 "WHERE owned OR claimed "
                 "RETURN DISTINCT labels(n)[0] AS label, n.name AS name, owned, claimed, "
                 "CASE WHEN n:Module THEN n.name ELSE coalesce(n.file, n.source_file, n.path) END AS file, "
-                "coalesce(n.mkeys, []) AS mkeys",
+                "n.mkeys AS mkeys",
                 repo_id=repo_id,
                 files=files,
             )
-            records = [(r, tuple(sorted(set(r["mkeys"])))) for r in result or []]
+            records = [(r, None if r["mkeys"] is None else tuple(sorted(set(r["mkeys"])))) for r in result or []]
             return {(r["label"], r["name"], r["file"], keys) for r, keys in records if r["owned"]} | {
                 (r["label"], r["name"], "", keys) for r, keys in records if r["claimed"]
             }
 
-    def retract_match_key_edges(self, repo_id: str, nodes: list[tuple[str, str, str]]) -> None:
+    def retract_match_key_edges(
+        self, repo_id: str, nodes: list[tuple[str, str, str]], clear: Collection[tuple[str, str, str]] = (),
+    ) -> None:
         """Delete the CALLS and IMPORTS edges into these (label, name, file)
         nodes, whose match keys (`mkeys`) a batch changed: a pin's `@` flag
         (graph/schema.py `split_pin`) linked them under the old keys, so the
         batch writes them again under the new ones, the way it writes an
-        added node's. Each label's (repo_id, name, file) index is hinted to
-        seek, for the reason _end_match gives. Every other edge stays."""
-        groups: dict[str, list[dict[str, str]]] = {}
+        added node's. Those in `clear` were written without keys, which the
+        node's own write leaves as they were: they are removed. Each label's
+        (repo_id, name, file) index is hinted to seek, for the reason
+        _end_match gives, and RETRACT_NODES nodes go per transaction, so a
+        format upgrade that rekeys a whole repository never holds one
+        transaction over all of it. Every other edge stays."""
+        groups: dict[str, list[dict[str, Any]]] = {}
         for label, name, file in nodes:
-            groups.setdefault(label, []).append({"name": name, "file": file})
+            groups.setdefault(label, []).append({"name": name, "file": file, "clear": (label, name, file) in clear})
         with self._driver.session() as session:
             for label, rows in sorted(groups.items()):
-                _retry_transient(
-                    session.run,
-                    f"UNWIND $rows AS row MATCH (b:{label} {{repo_id: $repo_id, name: row.name, file: row.file}}) "
-                    f"USING INDEX SEEK b:{label}(repo_id, name, file) "
-                    f"MATCH ()-[r:{'|'.join(MATCH_KEY_EDGE_TYPES)}]->(b) DELETE r",
-                    repo_id=repo_id,
-                    rows=rows,
-                )
+                for start in range(0, len(rows), RETRACT_NODES):
+                    _retry_transient(
+                        session.run,
+                        f"UNWIND $rows AS row MATCH (b:{label} {{repo_id: $repo_id, name: row.name, file: row.file}}) "
+                        f"USING INDEX SEEK b:{label}(repo_id, name, file) "
+                        "FOREACH (_ IN CASE WHEN row.clear THEN [1] ELSE [] END | REMOVE b.mkeys) "
+                        f"WITH b MATCH ()-[r:{'|'.join(MATCH_KEY_EDGE_TYPES)}]->(b) DELETE r",
+                        repo_id=repo_id,
+                        rows=rows[start:start + RETRACT_NODES],
+                    )
 
     def find_name_refs(self, repo_id: str, names: list[str], skip: list[str]) -> list[tuple[str, list[str]]]:
         """(Module name, entries) for every Module outside `skip` whose
