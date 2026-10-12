@@ -225,9 +225,10 @@ class _GitStateEventHandler(FileSystemEventHandler):
 PARTLY_WATCHED = "partly watched: "
 
 
-def is_partly_watched(issue: str) -> bool:
-    """Whether a repository issue is a partial watch, not a failed one."""
-    return issue.startswith(PARTLY_WATCHED)
+def is_partly_watched(issue: object) -> bool:
+    """Whether a repository issue is a partial watch, not a failed one (an
+    issue read back from repo_issues.json may be any JSON value)."""
+    return str(issue).startswith(PARTLY_WATCHED)
 
 
 def _watch_problem(error: Exception, prefix: str = "watching unavailable: ") -> str:
@@ -860,6 +861,10 @@ class WatcherManager:
         else:
             return
         with self._issues_lock:
+            # A partial watch never hides a worse issue (a stopped reader).
+            old = self._repo_issues.get(repo_id)
+            if kind == "limit" and old is not None and not is_partly_watched(old):
+                return
             self._repo_issues[repo_id] = problem
 
     def _desired_dirs(self, root: Path) -> set[Path]:

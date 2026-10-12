@@ -133,6 +133,11 @@ def test_list_repos_tells_a_partly_watched_repository_from_an_unwatched_one(clie
     assert repos["dash_repo_b"]["partly_watched"] is False
     assert repos["dash_repo_b"]["issue"] == "watching unavailable: inotify limit reached"
 
+    # A hand-edited or corrupt file's non-string issue is not an error.
+    (tmp_path / "repo_issues.json").write_text(json.dumps({"dash_repo_a": 7}))
+    repos = {r["repo_id"]: r for r in client.get("/api/repos").json()["repos"]}
+    assert repos["dash_repo_a"]["partly_watched"] is False
+
 
 def test_summary_counts_known_seeded_data(client):
     res = client.get("/api/repos/dash_repo_a/summary")

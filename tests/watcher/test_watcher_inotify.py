@@ -377,6 +377,21 @@ def test_a_limit_reported_as_the_watch_starts_is_kept(tmp_path):
         w.close()
 
 
+def test_a_limit_report_never_replaces_a_worse_issue(tmp_path):
+    """A partial watch is recorded over nothing or another partial watch,
+    never over a watch that stopped altogether."""
+    w = Watching(tmp_path, make_repo(tmp_path, "repo", 1), git=False)
+    limit = OSError(errno.ENOSPC, "No space left on device")
+    try:
+        w.manager._inotify_problem(w.repo_id, "limit", limit)
+        assert w.manager.get_repo_issues()[w.repo_id].startswith("partly watched: ")
+        w.manager._inotify_problem(w.repo_id, "broken", KeyError("x"))
+        w.manager._inotify_problem(w.repo_id, "limit", limit)
+        assert w.manager.get_repo_issues()[w.repo_id].startswith("watching stopped: KeyError")
+    finally:
+        w.close()
+
+
 def test_a_symlinked_folder_below_the_root_gets_no_watch(tmp_path):
     """inotify follows a symlink it is asked to watch: a linked folder found
     in a new folder's walk would put a folder outside the repository under
