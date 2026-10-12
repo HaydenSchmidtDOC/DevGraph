@@ -650,6 +650,11 @@ def measure_fan_in(engine: GraphEngine, packages: int = 400, callers: int = 30) 
 # --- synthetic multi-project C# --------------------------------------------------
 
 _CS_PROJECT = '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n{}  </ItemGroup>\n</Project>\n'
+# The library namespaces a synthetic project's global usings and its files' usings name besides its own.
+_CS_GLOBAL_LIBRARIES = ["System", "System.Linq", "System.Collections.Generic", "System.Threading.Tasks",
+                        "Microsoft.Extensions.Logging", "Microsoft.Extensions.DependencyInjection"]
+_CS_FILE_LIBRARIES = ["System.Text", "System.IO", "System.Net.Http", "System.Text.Json", "System.Diagnostics",
+                      "Microsoft.AspNetCore.Mvc", "Microsoft.Extensions.Options", "System.Threading"]
 
 
 def generate_cs_synthetic(
@@ -666,9 +671,12 @@ def generate_cs_synthetic(
     every project has), and `services` service classes (`Services.Service<k>`),
     each calling them through typed receivers, a static type, an extension
     method and its own helper, and one other project's `Gateway.Send()`
-    through a `using` of it (a cross-project edge). `Util` is in scope by a
-    `global using`; `Models` by the file's `using` or, for some projects, a
-    `<Using>` item. The App project's Program.cs calls a dozen projects'
+    through a `using` of it (a cross-project edge). Each project's
+    GlobalUsings.cs holds ten `global using`s (six `System`/`Microsoft`
+    ones, its `Util`, and three more of its own); `Models` is in scope by
+    the file's `using` or, for some projects, a `<Using>` item; a service
+    file has 8 to 15 usings, the rest `System`/`Microsoft` ones and other
+    projects' `Contracts` (each project declares `Contracts.Contract<i>`). The App project's Program.cs calls a dozen projects'
     `Module<j>.Start()` through a `using` of each Api namespace, its
     Startup.cs half of them through a `using` of every project's (more than
     32 match keys once there are more than about 30 projects: its sites
@@ -688,7 +696,9 @@ def generate_cs_synthetic(
         base, ns = f"src/P{i}", f"Co.P{i}"
         item = rng.random() < 0.5  # Models by a <Using> item, else by each file's using
         write(f"{base}/P{i}.csproj", _CS_PROJECT.format(f'    <Using Include="{ns}.Models" />\n' if item else ""))
-        write(f"{base}/GlobalUsings.cs", f"global using {ns}.Util;\n")
+        globals = [*_CS_GLOBAL_LIBRARIES, f"{ns}.Util", f"{ns}.Abstractions", "Co.Common", "Co.Shared"]
+        write(f"{base}/GlobalUsings.cs", "".join(f"global using {each};\n" for each in globals))
+        write(f"{base}/Contracts/Contract{i}.cs", f"namespace {ns}.Contracts;\n\npublic class Contract{i} {{ }}\n")
         write(f"{base}/Models/User.cs", f"namespace {ns}.Models;\n\npublic class User\n{{\n"
               "    public string Display() => \"\";\n\n    public void Save() { }\n}\n")
         write(f"{base}/Models/Order.cs", f"namespace {ns}.Models;\n\npublic partial class Order\n{{\n"
@@ -708,7 +718,11 @@ def generate_cs_synthetic(
         for k in range(services):
             rel = f"{base}/Services/Service{k}.cs"
             other = rng.choice([j for j in range(projects) if j != i]) if projects > 1 else i
-            usings = ([] if item else [f"using {ns}.Models;\n"]) + [f"using Co.P{other}.Api;\n"]
+            usings = ([] if item else [f"{ns}.Models"]) + [f"Co.P{other}.Api"]
+            count = rng.randint(8, 15)
+            libraries = rng.sample(_CS_FILE_LIBRARIES, min(len(_CS_FILE_LIBRARIES), (count - len(usings) + 1) // 2))
+            contracts = [f"Co.P{j}.Contracts" for j in rng.sample(range(projects), min(projects, count))]
+            usings = [f"using {each};\n" for each in (usings + libraries + contracts)[:count]]
             write(rel, "".join(usings) + f"\nnamespace {ns}.Services;\n\npublic class Service{k}\n{{\n"
                   f"    public void Run{k}(User user, Order order)\n    {{\n"
                   "        user.Display();\n        user.Save();\n        user.Initials();\n"
@@ -740,18 +754,41 @@ def generate_cs_synthetic(
     return calls, imports
 
 
+def _cs_pin_shapes(root: Path) -> dict:
+    """How the C# CALLS rows of the repository at `root` pin their targets:
+    `keyed` (`/.?.cs^@...`), `any_cs_file` (`/.?.cs^`, a key group over the
+    cap before the class-file fallback) and `class_file` (`/T.cs^`: before
+    match keys, or a group over the cap since)."""
+    from devgraph.indexer.csharp.extractor import extract_csharp_file
+    from devgraph.indexer.resolver_config import ResolverConfig
+
+    config = ResolverConfig(root)
+    shapes = {"keyed": 0, "any_cs_file": 0, "class_file": 0}
+    for path in sorted(root.rglob("*.cs")):
+        rel = path.relative_to(root).as_posix()
+        for row in extract_csharp_file(path.read_text(), rel, "measure", config).relationships:
+            pin = row.to_file or ""
+            if row.rel_type != "CALLS" or not pin.startswith("/"):
+                continue
+            shape = "keyed" if pin.startswith("/.?.cs^@") else "any_cs_file" if pin == "/.?.cs^" else "class_file"
+            shapes[shape] += 1
+    return shapes
+
+
 def measure_cs_synthetic(engine: GraphEngine, projects: int = 10, services: int = 12, seed: int = 1) -> dict:
     """Scan `generate_cs_synthetic`'s repository into a scratch repository
     and measure it: linked (resolved or package) CALLS against the truth,
     the wrong ones, those of them to another project than the truth's
     target (the cross-project wrong-link rate is their share of linked
     edges), the same for Startup.cs alone, IMPORTS file to file, the scan
-    time and the largest `name_refs`. The repository and the folder are
+    time, the largest `name_refs`, and how CALLS rows pin (`_cs_pin_shapes`).
+    The repository and the folder are
     deleted afterwards."""
     root = Path(tempfile.mkdtemp(prefix="devgraph-measure-cs-"))
     repo_id = f"zz-measure-cs-{uuid.uuid4().hex[:8]}"
     try:
         truth, import_truth = generate_cs_synthetic(root, projects, services, seed)
+        shapes = _cs_pin_shapes(root)
         provision_repository_schema(engine, root)
         engine.upsert_repository(repo_id, repo_id, str(root))
         started = time.perf_counter()
@@ -786,6 +823,7 @@ def measure_cs_synthetic(engine: GraphEngine, projects: int = 10, services: int 
         "calls": {**rates(linked, wrong, cross), "recall_linked": _ratio(len(linked & truth), len(truth)),
                   "by_confidence": {conf: sum(1 for _k, c in edges if c == conf) for conf in sorted({c for _k, c in edges})}},
         "startup_calls": rates(startup, startup & wrong, startup & cross),
+        "call_pins": shapes,
         "imports": {"graph": len(imports), "truth": len(import_truth),
                     "precision": _ratio(len(imports & import_truth), len(imports)),
                     "recall": _ratio(len(imports & import_truth), len(import_truth))},

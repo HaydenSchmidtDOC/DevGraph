@@ -31,12 +31,18 @@ Mirrors `devgraph/indexer/python/extractor.py`'s shape (Implementation Plan
     vendored copy) whose node holds one of the keys the site can mean
     (`@`, graph/schema.py `scoped_pin`): `Ns:T` for each namespace a name
     written there reaches (the enclosing namespaces, innermost first, and
-    the global one; the usings of its namespace blocks and of the file; its
-    project's `<Using>` items and `global using`s, read from the resolver
-    configuration), an alias's exact target, a qualified `A.B.T`'s `A.B:T`
-    (also under each enclosing namespace, and as a type nested in `A.B`), a
-    nested `Ns:Outer.T` inside Outer; more than 32 keys drop the `@`
-    (package confidence either way: two projects can each hold `Ns.T`).
+    the global one; the usings of its namespace blocks, also relative to
+    each enclosing namespace, and of the file; its project's `<Using>`
+    items and `global using`s, read from the resolver configuration;
+    `System` and `Microsoft` ones left out), an alias's target (its
+    block's), a dotted name at every split (`A.B.T`: `A.B:T`, `A:B.T`,
+    `.:A.B.T`, as a type can be nested; a qualified one also under each
+    enclosing namespace, and as a type nested in `A.B`), a nested
+    `Ns:Outer.T` inside Outer. A site's types' keys and its extension keys
+    (`Ns:+T`) are two pins, each capped at 32 keys on its own; a group over
+    the cap falls back to the class file pins written before match keys
+    (`/T.cs^`, `/TExtensions.cs^`). Package confidence either way: two
+    projects can each hold `Ns.T`.
     CALLS, by the first tier that applies: an unqualified `M()`, `this.M()`
     or `base.M()` -> this file when an enclosing class declared here (or an
     in-file base) has M, else its other bases' keys, a partial class's own

@@ -487,34 +487,47 @@ sorted, even empty, and never derived from the configuration.
 enclosing namespaces, innermost first, then their parents, then `.`; the
 usings of the enclosing namespace blocks and of the compilation unit; the
 project's `<Using>` items and the `global using`s of its files (resolver
-configuration). A type `T` written unqualified at the site is `Ns:T` for
-each of them, `Ns:Outer.T` for each enclosing class `Outer`, or an alias's
-exact target alone (`using LegacyUser = Legacy.Accounts.User`:
-`Legacy.Accounts:User`; an alias of a namespace qualifies the rest the same
-way). A qualified `A.B.T` is `A.B:T`, `P.A.B:T` for each enclosing
-namespace `P`, and `Ns:A.B.T` (a type nested in a type `A.B`) for each
-candidate namespace. `using static A.T` adds `A:T`. More than 32 keys at a
-site (`schema.MAX_SCOPE_KEYS`) drop the `@` deterministically, and the site
-then links any C# file declaring the name.
+configuration). A using inside a namespace block (or after a file-scoped
+namespace) is also read relative to each enclosing namespace
+(`namespace Contoso.Web { using Services; }`: `Services`,
+`Contoso.Web.Services`, `Contoso.Services`), and its aliases are that
+block's alone. `System`, `Microsoft` and the namespaces under them are left
+out: they hold no repository type, and they are most of a typical file's
+usings. A type `T` written unqualified at the site is `Ns:T` for each
+candidate, `Ns:Outer.T` for each enclosing class `Outer`, or an alias's
+target alone. A dotted name (an alias's target, a `using static` type, a
+qualified `A.B.T`) is keyed at every split, since a type can be nested:
+`A.B:T`, `A:B.T`, `.:A.B.T`; a qualified name's splits also under each
+enclosing namespace `P` (`P.A.B:T`, `P.A:B.T`), and `Ns:A.B.T` for each
+candidate (`A` a type there); `global::A.B.T` only at the global namespace.
+A verbatim identifier's `@` is left out of every key.
 
-**Calls**, first match wins (one pin per site, its keys the union of what
-the tier found):
+**Pins.** A site writes at most two `@` pins: its types' keys and, for a
+typed receiver, their extension methods' `Ns:+T`, each capped at 32 keys
+(`schema.MAX_SCOPE_KEYS`) on its own. A group over the cap falls back to
+the class files the resolver pinned before match keys, `/T.cs^` and
+`/TExtensions.cs^`, so a site never links worse than before; its
+extension `IMPORTS` are then left out.
+
+**Calls**, first match wins (each pin's keys the union of what the tier
+found):
 
 1. An unqualified `M()`, `this.M()`, `base.M()`: this file when an
    enclosing class declared here, innermost first, or an in-file base has
    M; else the keys of its out-of-file bases, of the class itself when it
    is partial (another part, in another file, has M), and, for an
-   unqualified `M()`, of the `using static` types. A local function or a
-   delegate variable links nothing.
+   unqualified `M()`, of the `using static` types. A local function
+   (declared anywhere in the method) or a delegate variable links nothing.
 2. `T.M()` on a type (an alias's target, a qualified `A.B.T.M()`) and a
    typed receiver (a parameter, a field or property of the enclosing
    classes, `T x`, `var x = new T()`, `new T().M()`, a `foreach` element
-   of a `List<T>` or array): this file when T is declared here and has M
+   of a `List<T>` or array; a generic `Svc<int>.M()` by `Svc`): this file
+   when T is declared here and has M
    (else, for a class declared here, tier 1's keys for it); else T's keys,
    and for a receiver also `Ns:+T` for each candidate namespace (the
    extension methods in scope). A library type (`STOP_TYPES["csharp"]`:
-   `Console`, `List`, `Math`, ..., also as a qualifier such as
-   `DateTime.UtcNow`) or a predefined one (`string.IsNullOrEmpty`) links
+   `Console`, `List`, `Math`, ..., also as the leftmost qualifier such as
+   `DateTime.UtcNow`, not `Contoso.Directory.UserStore`) or a predefined one (`string.IsNullOrEmpty`) links
    nothing.
 3. Anything else, `dynamic` and `x?.M()` included: a bare-name row, off its
    caller for a member call, none for a stoplisted method.
@@ -537,8 +550,13 @@ writer's does not reference matches too (in one compilation, two visible
 using's (`UserService` in `Shop.Domain.Services` with `using
 Legacy.Accounts` links both `User`s' `Display`): the keys are a union, and
 picking the innermost tier that matches is a follow-up (shadow tiers). A
-site with more than 32 candidate keys links by path alone. `ImplicitUsings`
-is not read.
+key group over the cap links by class file name, as before match keys.
+`ImplicitUsings` is not read. An extension method is keyed by its `this`
+parameter's type's simple name (`Ns:+T`), or by a type parameter's first
+constraint's (`this T x where T : IRepo`: `+IRepo`); a receiver typed with
+a class implementing that interface (`Repo r; r.Touch()`) looks for
+`+Repo` and misses it, as does a constraint that names no type (`class`,
+`new()`).
 
 ## C++ (`devgraph/indexer/cpp/extractor.py`)
 
@@ -942,7 +960,7 @@ tiers. BEFORE is this branch's code before the extractor change.
 | M3 `IMPORTS` precision / recall | ≥ 98 % / 95 % | 80 % / 94 % (16/17) | 94 % (17/18) / 100 % (17/17) | short |
 | M4 `CALLS` recall | ≥ 95 % | 90 % (linked 81 %) | 100 % (linked 100 %) | met |
 | M5 named sites | all | 27/31 | 30/31 | short |
-| M6 largest `name_refs` | < 1 MiB | 1,109 B | 4,203 B (total 3,661 B to 11,566 B) | met |
+| M6 largest `name_refs` | < 1 MiB | 1,109 B | 4,612 B | met |
 
 - **What is left is shadowing.** `UserService.Register` (namespace
   `Shop.Domain.Services`, `using Legacy.Accounts`) still links both
@@ -958,26 +976,33 @@ tiers. BEFORE is this branch's code before the extractor change.
 - **Synthetic multi-project repository** (`measure_call_graph.py
   --cs-synthetic`, seed 1): N library projects declaring the same class
   names in their own namespaces, each service calling its own project's
-  types and one other project's `Gateway.Send()`; linked `CALLS` against
-  the generator's truth.
+  types and one other project's `Gateway.Send()`, with realistic usings
+  (ten `global using`s per project, six of them `System`/`Microsoft`; 8 to
+  15 usings per service file); linked `CALLS` against the generator's
+  truth. BEFORE is the code before match keys, FIRST CUT the first match
+  key change (one pin per site, its type and extension keys together,
+  dropping the `@` over 32 keys, `System` usings counted), AFTER this one.
+  A capped row is a key-pinned CALLS row whose group went over 32 keys.
 
-| `--cs-synthetic` | BEFORE | AFTER |
-|---|---|---|
-| 10 projects (202 files): cross-project wrong links / linked | 88.3 % (6,480 / 7,335) | 0 % (0 / 865) |
-| 10 projects: linked precision, recall; `IMPORTS` P / R | 11.7 %, 98.8 %; 10.2 % / 83.9 % | 100 %, 100 %; 100 % / 100 % |
-| 50 projects (1,002 files): cross-project wrong links / linked | 97.7 % (176,400 / 180,637) | 0.58 % (25 / 4,312) |
-| 50 projects: linked precision, recall; `IMPORTS` P / R | 2.3 %, 98.8 %; 2.0 % / 83.7 % | 99.4 %, 100 %; 100 % / 100 % |
-| 50 projects: largest `name_refs` (gate < 1 MiB) | 1,961 B | 8,802 B (total 0.54 MB to 2.0 MB) |
-| 50 projects: `full_scan` | 188 s | 114 s (far fewer edges) |
+| `--cs-synthetic` | BEFORE | FIRST CUT | AFTER |
+|---|---|---|---|
+| 10 projects: capped rows / key-pinned rows | n/a | 64 % (480 / 745) | 0 % (0 / 1,225) |
+| 10 projects: cross-project wrong links / linked | 88.3 % (6,480 / 7,335) | 83.3 % (4,320 / 5,185) | 0 % (0 / 865) |
+| 10 projects: linked precision, recall; `IMPORTS` P / R | 11.7 %, 98.8 %; 10.2 % / 83.9 % | 16.7 %, 100 %; 100 % / 100 % | 100 %, 100 %; 100 % / 100 % |
+| 50 projects: capped rows / key-pinned rows | n/a | 66 % (2,401 / 3,663) | 0.4 % (25 / 6,087) |
+| 50 projects: cross-project wrong links / linked | 97.7 % (176,400 / 180,637) | 96.5 % (117,625 / 121,912) | 0 % (0 / 4,287) |
+| 50 projects: linked precision, recall; `IMPORTS` P / R | 2.3 %, 98.8 %; 2.0 % / 83.7 % | 3.5 %, 100 %; 100 % / 100 % | 100 %, 100 %; 100 % / 100 % |
+| 50 projects: largest `name_refs` (gate < 1 MiB) | 1,955 B | 8,802 B | 8,802 B (total 0.54 MB to 4.0 MB) |
+| 50 projects: `full_scan` | 92.5 s | 82.1 s | 70.0 s (fewer edges) |
 
-  The 25 wrong links of the 50-project run are all `Startup.cs`'s: it has
-  a `using` of every project's Api namespace (53 candidate keys, over the
-  32-key cap), so its `ModuleN.Start()` sites link by path alone, every
-  project's `Start()`, where the old `/ModuleN.cs` pin found the right
-  file by its name. A file with more than about 30 usings in scope
-  (its own, its project's `<Using>` items and `global using`s, its
-  enclosing namespaces) loses the narrowing; a typed receiver's site counts
-  each namespace twice (`Ns:T` and the extension key `Ns:+T`).
+  The 25 capped rows at 50 projects are `Startup.cs`'s: it has a `using`
+  of every project's Api namespace (over 50 candidates), so its
+  `ModuleN.Start()` sites fall back to `/ModuleN.cs^`, which is right
+  here; the first cut linked every project's `Start()` from them (25
+  wrong). With the realistic usings the first cut overflowed two thirds
+  of its keyed rows (a typed receiver counted each namespace twice, and
+  `System` usings counted) and linked any C# file from them, worse than
+  BEFORE's class file pins.
 - **Cost.** The fixture's `full_scan`, BEFORE and AFTER alternating in
   their own processes (12 scans after two warm-ups each, two series, the
   shared Neo4j otherwise idle): fastest 0.97 s and 1.03 s (+6 %); the
@@ -987,8 +1012,7 @@ tiers. BEFORE is this branch's code before the extractor change.
   bar two (the match-key write and its settle) and spends 0.07 s more
   upserting relationships (the extension `IMPORTS` rows and the `@` test).
   Extraction alone, 202 synthetic files: 0.22 s to 0.32 s. On the
-  synthetic repositories the scan got faster (10 projects 22.2 s to
-  19.5 s, 50 projects 188 s to 114 s: far fewer edges). C# `name_refs`
-  grow about 4x (the fixture's largest 1.1 KB to 4.2 KB), as each entry
-  stores its keys once.
+  synthetic repositories the scan got faster (see the table: far fewer
+  edges). C# `name_refs` grow about 4x to 7x (the fixture's largest 1.1 KB
+  to 4.6 KB), as each entry stores its keys once.
 
