@@ -596,8 +596,11 @@ def _retry_transient(fn, *args, **kwargs):
     The neo4j driver's `session.execute_write`/`execute_read` already retry
     transient errors internally, but the autocommit `session.run` paths and
     `verify_connectivity` do not — so a Neo4j blip mid-scan would otherwise
-    fail the whole operation. Every write here is an idempotent MERGE, so
-    re-running after a transient failure is always safe. Autocommit
+    fail the whole operation. A retried statement must be safe to run
+    again: the writes are MERGEs, deletes, and schema statements with
+    `IF [NOT] EXISTS`, so a re-run leaves the same graph (a delete's
+    returned count can come back low if its first run had committed before
+    the error). Autocommit
     statements go through `_run`/`_run_records`, which consume the result
     inside the retry.
     """
