@@ -148,6 +148,24 @@ def test_live_cross_repo_search_skips_unregistered_repositories(live_engine, tmp
             live_engine.delete_repository(repo)
 
 
+def test_live_cross_repo_blame_of_a_file_only_an_unregistered_repository_has_is_not_found(
+    live_engine, tmp_path, monkeypatch
+):
+    """The not-found check behind an empty blame is scoped like the blame
+    itself: a Module left by an unregistered repository doesn't count."""
+    tag = uuid.uuid4().hex[:8]
+    registered, orphan = f"zz-xr-reg-{tag}", f"zz-xr-orphan-{tag}"
+    module = f"pkg/blame_probe_{tag}.py"
+    try:
+        live_engine.upsert_node("Module", orphan, module)
+        server = _server(live_engine, tmp_path, monkeypatch, allow=True, repos=(registered,))
+        result = _call(server, "blame_component", {"repo_id": registered, "component_name": module, "cross_repo": True})
+        assert result.is_error is True, result.content
+    finally:
+        for repo in (registered, orphan):
+            live_engine.delete_repository(repo)
+
+
 
 def test_a_deactivated_repository_is_outside_the_cross_repo_bound(tmp_path, monkeypatch):
     """The same set the dashboard's All Repos shows: active registered repositories."""

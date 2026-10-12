@@ -941,6 +941,9 @@ function themeSelect(select, label) {
       item.setAttribute("role", "option");
       item.setAttribute("aria-selected", String(selected));
       item.textContent = o.textContent;
+      // An option's title (why a repository isn't watched) would otherwise be
+      // lost with the native select, which is hidden.
+      if (o.title) { item.title = o.title; item.setAttribute("aria-description", o.title); }
       item.addEventListener("mousedown", e => { e.preventDefault(); choose(o); });
       list.appendChild(item);
     });

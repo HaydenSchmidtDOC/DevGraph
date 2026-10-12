@@ -1887,7 +1887,7 @@ def blame_component(
 
     results, _more = _list_query(engine, cypher, params)  # at most LIST_ROW_LIMIT commits
     if not results:
-        module_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
+        module_filter = _cross_scope("m", "AND") if cross_repo else "AND m.repo_id = $repo_id"
         found = _query(
             engine, f"MATCH (m:Module {{name: $component_name}}) WHERE true {module_filter} RETURN m LIMIT 1", params
         )
