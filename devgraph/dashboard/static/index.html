@@ -197,6 +197,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); height: 14px; }
 .switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; z-index: 2; }
 .switch .track { position: absolute; inset: 0; background: rgba(255,255,255,0.12); border-radius: 999px; transition: background var(--motion-fast); pointer-events: none; }
 .switch .thumb { position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--muted); transition: transform var(--motion-fast), background var(--motion-fast); pointer-events: none; }
+.switch input:focus-visible + .track { box-shadow: var(--focus-ring); }
 .switch input:checked + .track { background: color-mix(in oklab, var(--accent), transparent 25%); }
 .switch input:checked + .track + .thumb { transform: translateX(13px); background: var(--accent); }
 
@@ -462,7 +463,7 @@ table.dstable input[type="text"] { width: 100%; }
 
 <header class="topnav" data-od-id="topnav">
   <div class="topnav-inner">
-    <button class="icon-btn" id="btnOpenSettings" title="Settings" data-od-id="btn-settings-cog">
+    <button class="icon-btn" id="btnOpenSettings" title="Settings" aria-label="Settings" data-od-id="btn-settings-cog">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
     <div class="brand" data-od-id="brand"><span class="mark">DG</span>DevGraph<span class="ver" title="Read from pyproject.toml — wire to real build metadata later">v0.1.0</span><span class="beta">Beta</span></div>
@@ -561,7 +562,7 @@ table.dstable input[type="text"] { width: 100%; }
   <div class="details-card" id="detailsCard" data-od-id="node-details-card">
     <div class="card-head">
       <h3 id="detailsTitle">Details</h3>
-      <button class="icon-btn" id="btnCloseDetails" title="Close" style="width:22px;height:22px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+      <button class="icon-btn" id="btnCloseDetails" title="Close" aria-label="Close details" style="width:22px;height:22px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
     </div>
     <div id="detailsBody"></div>
   </div>
@@ -589,7 +590,7 @@ table.dstable input[type="text"] { width: 100%; }
   <div class="below-layout" data-od-id="view-graph">
     <div class="canvas-col">
       <div class="graph-reload-wrap">
-        <button class="icon-btn graph-reload-btn" id="btnGraphReload" title="Re-settle the graph from its current layout" data-od-id="graph-reload-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button>
+        <button class="icon-btn graph-reload-btn" id="btnGraphReload" title="Re-settle the graph from its current layout" aria-label="Re-settle the graph" data-od-id="graph-reload-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button>
       </div>
       <div class="card" data-od-id="cypher-card">
         <div class="card-head"><h3>Cypher query</h3></div>
@@ -689,7 +690,7 @@ table.dstable input[type="text"] { width: 100%; }
 <footer class="pagefoot" data-od-id="footer"><span>DevGraph dashboard prototype · design phase</span><span>Node/relationship types from each repository's schema · git history is the real <code>devgraph</code> log</span></footer>
 
 <div class="settings-overlay" id="settingsOverlay" data-od-id="settings-overlay">
-  <div class="settings-topbar"><button class="icon-btn" id="btnCloseSettings" title="Back to graph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button><h2>Settings</h2></div>
+  <div class="settings-topbar"><button class="icon-btn" id="btnCloseSettings" title="Back to graph" aria-label="Back to graph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button><h2>Settings</h2></div>
   <div class="settings-body">
     <div class="settings-layout">
       <nav class="settings-nav" data-od-id="settings-nav">
@@ -849,55 +850,153 @@ table.dstable input[type="text"] { width: 100%; }
 <script src="/static/vendor/cytoscape-3.30.2.min.js"></script>
 <script>
 /* ── global fixed tooltip (not clipped by scroll containers) ─────── */
+/* Each trigger is focusable and described by the one shared bubble, which
+   shows on hover or focus and hides on leave, blur or Escape. */
 const tip = document.getElementById("tooltipBubble");
-function wireTooltip(q) {
-  q.addEventListener("mouseenter", () => {
-    tip.textContent = q.dataset.tip;
-    const r = q.getBoundingClientRect();
-    tip.style.left = Math.min(r.left - 100, window.innerWidth - 226) + "px";
-    tip.style.top = (r.top - 10) + "px";
-    tip.style.transform = "translateY(-100%)";
-    tip.classList.add("show");
-  });
-  q.addEventListener("mouseleave", () => tip.classList.remove("show"));
+tip.setAttribute("role", "tooltip");
+function showTip(q) {
+  tip.textContent = q.dataset.tip;
+  const r = q.getBoundingClientRect();
+  tip.style.left = Math.min(r.left - 100, window.innerWidth - 226) + "px";
+  tip.style.top = (r.top - 10) + "px";
+  tip.style.transform = "translateY(-100%)";
+  tip.classList.add("show");
 }
+function hideTip() { tip.classList.remove("show"); }
+function wireTooltip(q) {
+  q.tabIndex = 0;
+  q.setAttribute("role", "button");
+  if (q.textContent.trim() === "?") q.setAttribute("aria-label", "Help");
+  q.setAttribute("aria-describedby", "tooltipBubble");
+  q.addEventListener("mouseenter", () => showTip(q));
+  q.addEventListener("mouseleave", hideTip);
+  q.addEventListener("focus", () => showTip(q));
+  q.addEventListener("blur", hideTip);
+}
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && tip.classList.contains("show")) { hideTip(); e.preventDefault(); }
+});
 document.querySelectorAll(".qmark").forEach(wireTooltip);
 
-/* ── themed custom <select> (replaces the OS-default white popup list) ── */
-function themeSelect(select) {
+/* ── themed custom <select> (replaces the OS-default white popup list) ──
+   The trigger is an ARIA select-only combobox: focus stays on it while the
+   arrow keys, Home/End and type-ahead move the active option, announced via
+   aria-activedescendant. The native <select> keeps the value but is taken out
+   of the tab order and the accessibility tree. */
+let cselSeq = 0;
+function themeSelect(select, label) {
+  const uid = "csel" + (++cselSeq);
   const wrap = document.createElement("div"); wrap.className = "csel";
   select.parentNode.insertBefore(wrap, select);
   wrap.appendChild(select);
   select.classList.add("csel-native");
+  select.tabIndex = -1;
+  select.setAttribute("aria-hidden", "true");
   const btn = document.createElement("button"); btn.type = "button"; btn.className = "csel-btn";
   const list = document.createElement("div"); list.className = "csel-list";
+  list.id = uid + "-list";
+  list.setAttribute("role", "listbox");
+  list.setAttribute("aria-label", label);
+  btn.setAttribute("role", "combobox");
+  btn.setAttribute("aria-haspopup", "listbox");
+  btn.setAttribute("aria-expanded", "false");
+  btn.setAttribute("aria-controls", list.id);
+  btn.setAttribute("aria-label", label);
+  let active = -1, typed = "", typedAt = 0;
   function labelFor(v) { const o = [...select.options].find(o => o.value === v); return o ? o.textContent : v; }
+  const isOpen = () => list.classList.contains("show");
+  function setActive(i) {
+    const items = list.children;
+    if (!items.length) return;
+    active = Math.max(0, Math.min(items.length - 1, i));
+    [...items].forEach((it, j) => it.classList.toggle("active", j === active));
+    btn.setAttribute("aria-activedescendant", items[active].id);
+    items[active].scrollIntoView?.({ block: "nearest" });
+  }
+  function open() {
+    document.querySelectorAll(".csel-list.show").forEach(l => { if (l !== list) l.classList.remove("show"); });
+    list.classList.add("show");
+    btn.setAttribute("aria-expanded", "true");
+    setActive(select.selectedIndex);
+  }
+  function close() {
+    list.classList.remove("show");
+    btn.setAttribute("aria-expanded", "false");
+    btn.removeAttribute("aria-activedescendant");
+  }
+  function choose(o) {
+    select.value = o.value;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    btn.textContent = o.textContent;
+    close();
+    renderList();
+  }
   function renderList() {
     list.innerHTML = "";
-    [...select.options].forEach(o => {
+    [...select.options].forEach((o, i) => {
       const item = document.createElement("div");
-      item.className = "csel-item" + (o.value === select.value ? " active" : "");
+      const selected = o.value === select.value;
+      item.className = "csel-item" + (selected ? " active" : "");
+      item.id = uid + "-opt-" + i;
+      item.setAttribute("role", "option");
+      item.setAttribute("aria-selected", String(selected));
       item.textContent = o.textContent;
-      item.addEventListener("mousedown", e => {
-        e.preventDefault();
-        select.value = o.value;
-        select.dispatchEvent(new Event("change", { bubbles: true }));
-        btn.textContent = o.textContent;
-        list.classList.remove("show");
-        renderList();
-      });
+      item.addEventListener("mousedown", e => { e.preventDefault(); choose(o); });
       list.appendChild(item);
     });
   }
+  /* Type-ahead: letters typed within half a second build one search string;
+     repeating a single letter cycles through the options it starts. */
+  function typeAhead(ch) {
+    const now = Date.now();
+    typed = now - typedAt > 500 ? ch : typed + ch;
+    typedAt = now;
+    const names = [...select.options].map(o => o.textContent.toLowerCase());
+    const cycling = typed.length > 1 && [...typed].every(c => c === typed[0]);
+    const needle = cycling ? typed[0] : typed;
+    const from = typed.length === 1 || cycling ? active + 1 : active;
+    for (let k = 0; k < names.length; k++) {
+      const i = (from + k) % names.length;
+      if (names[i].startsWith(needle)) { setActive(i); return; }
+    }
+  }
+  btn.addEventListener("keydown", e => {
+    const k = e.key;
+    if (!isOpen()) {
+      if (["ArrowDown", "ArrowUp", "Enter", " ", "Home", "End"].includes(k)) {
+        e.preventDefault();
+        open();
+        if (k === "Home") setActive(0);
+        if (k === "End") setActive(list.children.length - 1);
+      } else if (k.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault(); open(); typeAhead(k.toLowerCase());
+      }
+      return;
+    }
+    if (k === "ArrowDown") { e.preventDefault(); setActive(active + 1); }
+    else if (k === "ArrowUp") { e.preventDefault(); setActive(active - 1); }
+    else if (k === "Home" || k === "PageUp") { e.preventDefault(); setActive(0); }
+    else if (k === "End" || k === "PageDown") { e.preventDefault(); setActive(list.children.length - 1); }
+    else if (k === "Enter" || (k === " " && Date.now() - typedAt > 500)) {
+      e.preventDefault();
+      const o = select.options[active];
+      if (o) choose(o); else close();
+    }
+    else if (k === "Escape") { e.preventDefault(); e.stopPropagation(); close(); }
+    else if (k === "Tab") close();
+    else if (k.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); typeAhead(k.toLowerCase()); }
+  });
   btn.textContent = labelFor(select.value);
   renderList();
-  btn.addEventListener("click", () => { document.querySelectorAll(".csel-list.show").forEach(l => { if (l !== list) l.classList.remove("show"); }); list.classList.toggle("show"); });
-  document.addEventListener("click", e => { if (!wrap.contains(e.target)) list.classList.remove("show"); });
+  btn.addEventListener("click", () => { if (isOpen()) close(); else open(); });
+  btn.addEventListener("blur", close);
+  document.addEventListener("click", e => { if (!wrap.contains(e.target)) close(); });
   wrap.appendChild(btn);
   wrap.appendChild(list);
-  select.themeRefresh = () => { btn.textContent = labelFor(select.value); renderList(); };
+  select.themeRefresh = () => { btn.textContent = labelFor(select.value); renderList(); if (isOpen()) setActive(select.selectedIndex); };
 }
-["repoSelect","layoutSelect","chartInterval","chartSpan"].forEach(id => themeSelect(document.getElementById(id)));
+[["repoSelect", "Repository"], ["layoutSelect", "Layout algorithm"], ["chartInterval", "Chart interval"], ["chartSpan", "Chart time span"]]
+  .forEach(([id, label]) => themeSelect(document.getElementById(id), label));
 
 /* The built-in types as the dashboard has always drawn them: the order,
    category and colour of each row a repository with no schema file shows.
