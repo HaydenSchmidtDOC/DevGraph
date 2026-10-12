@@ -237,6 +237,9 @@ class _FakeEngine:
     def delete_bare_modules(self, repo_id):
         return 0
 
+    def delete_bare_class_stubs(self, repo_id):
+        return 0
+
 
 @pytest.mark.skipif(os.name != "nt", reason="junctions are Windows-only")
 def test_prune_stale_files_tolerates_a_junction_out_of_the_repository(junction_tree, monkeypatch):

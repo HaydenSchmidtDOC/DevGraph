@@ -41,7 +41,7 @@ The spec's "Out of scope" gaps are left out by construction:
 - no datastore or route code (so no handler stub either);
 - no method moves out of its type's file: only free functions move, and the
   Go method and Rust inherent `impl` stay with their type;
-- no C++ out-of-class method definitions, and no C#/TS partial classes;
+- no C#/TS partial classes;
 - the default `mentions_ambiguous_mode` (`all`);
 - a docs note's `id` never changes in place;
 - a renamed docs note's old path is removed before its new path is indexed,
@@ -113,12 +113,14 @@ class File:
     links: list = field(default_factory=list)
     supersedes: str | None = None
     pins: list = field(default_factory=list)  # py: "calls <name> <pin>" / "imports <pin>"
+    methods: list = field(default_factory=list)  # cpp: out-of-class definitions, "Widget::draw"
 
     def copy(self):
         return replace(
             self, imports=list(self.imports), bases=dict(self.bases),
             funcs={k: list(v) for k, v in self.funcs.items()}, services=dict(self.services),
             froms=list(self.froms), mentions=list(self.mentions), links=list(self.links), pins=list(self.pins),
+            methods=list(self.methods),
         )
 
 
@@ -161,8 +163,12 @@ def render(f: File) -> str:
         ]
         return "".join(parts) + "}\n"
     if f.kind == "cpp":
-        # Free functions with a typed local, so a typed receiver's call has a type.
+        # Classes, out-of-class method definitions (a Class stub for their
+        # qualifier), and free functions with a typed local, so a typed
+        # receiver's call has a type.
         parts = [f"{m}\n" for m in f.imports]
+        parts += [f"\nclass {cls}" + (f" : public {base}" if base else "") + " {};\n" for cls, base in f.bases.items()]
+        parts += [f"\nvoid {q}() {{}}\n" for q in f.methods]
         parts += [
             f"\nvoid {name}() {{\n    Widget w;\n" + "".join(f"    {g}();\n" for g in calls) + "}\n"
             for name, calls in f.funcs.items()
@@ -281,7 +287,9 @@ def initial_repo() -> dict:
                               funcs={"Main": ["Jobs.Run", "Stop", "new Jobs().Stop"]}),
         "cs/Models/Base.cs": File("cs", head="Shop.Models", bases={"Base": None}, funcs={"Helper": []}),
         "cpp/util/strings.h": File("cpp", funcs={"trim": []}),
-        "cpp/util/strings.cpp": File("cpp", imports=['#include "strings.h"'], funcs={"upper": ["trim"]}),
+        "cpp/util/strings.cpp": File("cpp", imports=['#include "strings.h"'], methods=["Widget::draw"],
+                                     funcs={"upper": ["trim"]}),
+        "cpp/widget.h": File("cpp", bases={"Widget": None, "Gadget": "Widget"}),
         "cpp/main.cpp": File("cpp", imports=['#include "util/strings.h"'], funcs={"main": ["util::upper", "trim"]}),
         "java/app/K.java": File("java", head="app", imports=["base.Base"], bases={"K": "Base"},
                                 funcs={"run": ["helper", "assist"]}),
@@ -330,7 +338,7 @@ IMPORTS = {
 }
 BASES = {
     "py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "java": ["Base", "K"],
-    "cs": ["Jobs", "Base", "Program", "Missing"],
+    "cs": ["Jobs", "Base", "Program", "Missing"], "cpp": ["Widget", "Gadget", "Missing"],
 }
 # How a Python call to `{n}` is written: bare, through a module or alias, on
 # an untyped value, on `self`, or on a literal.
@@ -355,6 +363,9 @@ RS_CALLS = ["{n}", "display::{n}", "crate::foo::{n}", "shop_core::{n}", "shop_co
 CS_CALLS = ["{n}", "this.{n}", "base.{n}", "Jobs.{n}", "J.{n}", "new Jobs().{n}", "obj.{n}"]
 # How a C++ call to `{n}` is written: bare, namespace-qualified, on a typed or an untyped value.
 CPP_CALLS = ["{n}", "util::{n}", "w.{n}", "obj->{n}"]
+# C++ out-of-class method definitions: of a header's class, of a class
+# declared nowhere, and through a namespace.
+CPP_METHODS = ["Widget::draw", "Widget::size", "Gadget::run", "Missing::stop", "ui::Widget::paint"]
 # The source roots a Java file moves between (another Maven module).
 JAVA_ROOTS = ["java/", "lib/src/main/java/"]
 SERVICES = ["api", "web", "worker", "db"]
@@ -466,6 +477,19 @@ class Fuzz:
             return None
         pins.append(new)
         return f"add pin {new!r} in {path}", {path}
+
+    def op_method(self):
+        """Add or remove a C++ out-of-class method definition."""
+        path = self._pick(lambda f: f.kind == "cpp")
+        if not path:
+            return None
+        methods = self.files[path].methods
+        q = self.rng.choice(CPP_METHODS)
+        if q in methods:
+            methods.remove(q)
+            return f"remove {q} in {path}", {path}
+        methods.append(q)
+        return f"add {q} in {path}", {path}
 
     def op_impl(self):
         path = self._pick(lambda f: f.impl is not None)
@@ -678,7 +702,7 @@ class Fuzz:
     OPS = [
         "call", "base", "import", "import_style", "impl", "add_function", "remove_function", "move_function",
         "rename", "delete", "restore", "service", "from", "move_image", "mention", "link", "supersedes", "pin", "pin",
-        "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module",
+        "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module", "method", "method",
     ]
 
     def draw(self):
