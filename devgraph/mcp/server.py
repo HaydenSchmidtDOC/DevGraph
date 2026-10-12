@@ -531,6 +531,12 @@ def build_server(
 
     server.tool = _instrumented_tool  # type: ignore[method-assign]
 
+    def declared(repo_id: str, cross_repo: bool) -> tuple[str, ...]:
+        """The declared labels a component lookup adds: the repository's, or every registered one's."""
+        if cross_repo:
+            return devgraph_tools.all_declared_node_labels(registry)
+        return devgraph_tools.declared_node_labels(registry, repo_id)
+
     @server.tool(annotations=_READ_ONLY)
     def search_component(
         repo_id: str,
@@ -682,7 +688,7 @@ def build_server(
         ambiguous_targets lists them."""
         return devgraph_tools.find_callers(
             engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits,
-            resolved_only, file,
+            resolved_only, file, declared(repo_id, cross_repo),
         )
 
     @server.tool(annotations=_READ_ONLY)
@@ -693,7 +699,9 @@ def build_server(
         unknown component is an error with similar names. When the name is defined in
         several files, pass file (repo-relative path) to pick one; without it each row is
         {name, target_files} and ambiguous_targets lists them."""
-        return devgraph_tools.find_related_files(engine, repo_id, component_name, cross_repo, max_results, file)
+        return devgraph_tools.find_related_files(
+            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo)
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def summarise_repository(repo_id: str) -> dict[str, Any]:
@@ -727,7 +735,9 @@ def build_server(
         (repo-relative path) to pick one; without it each file's are traced apart, every
         dependent adds target_files (the files of the targets it depends on), risk_level
         is the riskiest one's, and ambiguous_targets lists them."""
-        return devgraph_tools.impact_analysis(engine, repo_id, component_name, cross_repo, max_results, file)
+        return devgraph_tools.impact_analysis(
+            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo)
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def impact_analysis_for_diff(
@@ -776,13 +786,17 @@ def build_server(
     ) -> dict[str, Any]:
         """Find requirements a component (module/service/etc.) satisfies; returns
         {count, results, truncated}. An unknown component is an error with similar names."""
-        return devgraph_tools.find_requirements_for(engine, repo_id, component_name, cross_repo, max_results)
+        return devgraph_tools.find_requirements_for(
+            engine, repo_id, component_name, cross_repo, max_results, declared(repo_id, cross_repo)
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def trace_design_rationale(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
         """Trace the design rationale (requirements, decisions, notes) behind a component.
         An unknown component is an error with similar names."""
-        return devgraph_tools.trace_design_rationale(engine, repo_id, component_name, cross_repo)
+        return devgraph_tools.trace_design_rationale(
+            engine, repo_id, component_name, cross_repo, declared(repo_id, cross_repo)
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def find_mentions(
