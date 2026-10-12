@@ -126,3 +126,24 @@ def test_graph_repo_ids_includes_nodes_left_without_a_repository_node(engine):
     finally:
         engine.delete_repository(orphan)
     assert orphan not in engine.graph_repo_ids()
+
+
+def test_graph_repo_ids_skip_scans_every_label_and_scans_an_unindexed_one(engine):
+    """Several repo_ids on one indexed label are each found (the skip scan
+    steps past one to the next), as is one on a label no `repo_id` index
+    covers."""
+    import uuid
+
+    tag = uuid.uuid4().hex[:8]
+    ids = [f"_smoketest_graph_ids_{tag}_{i}" for i in range(3)]
+    bare_label = f"ZzNoIndex{tag}"
+    for repo_id in ids:
+        engine.upsert_node("Function", repo_id, "f", {"file": "a.py"})
+    engine.run_cypher(f"CREATE (:{bare_label} {{repo_id: $repo_id}})", {"repo_id": ids[0] + "_bare"})
+    try:
+        assert set(ids) | {ids[0] + "_bare"} <= engine.graph_repo_ids()
+    finally:
+        engine.run_cypher(f"MATCH (n:{bare_label}) DELETE n")
+        for repo_id in ids:
+            engine.delete_repository(repo_id)
+    assert not {repo_id for repo_id in engine.graph_repo_ids() if tag in repo_id}

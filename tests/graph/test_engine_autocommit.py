@@ -120,8 +120,8 @@ def test_a_failed_statement_is_retried_not_the_one_after_it(monkeypatch):
 
 
 def test_records_failing_as_they_are_read_are_retried(monkeypatch):
-    engine, driver = fake_engine(monkeypatch, [TransientError("deadlock"), None], [{"repo_id": "r"}])
-    assert engine.graph_repo_ids() == {"r"}
+    engine, driver = fake_engine(monkeypatch, [TransientError("deadlock"), None], [{"label": "Module", "name": "m"}])
+    assert engine.extracted_nodes_at("r", "fs", ["m"]) == {("Module", "m")}
     assert len(driver.runs) == 2
 
 
