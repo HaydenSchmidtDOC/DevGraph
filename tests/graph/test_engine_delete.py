@@ -147,3 +147,39 @@ def test_graph_repo_ids_skip_scans_every_label_and_scans_an_unindexed_one(engine
         for repo_id in ids:
             engine.delete_repository(repo_id)
     assert not {repo_id for repo_id in engine.graph_repo_ids() if tag in repo_id}
+
+
+def test_graph_repo_ids_finds_nodes_no_composite_index_holds(engine):
+    """A file-less handler-stub Function or C++ Class stub is in no
+    `(repo_id, name, file)` index and a nameless Module in no `(repo_id,
+    name)` one; an orphan made only of those is still found, as is an
+    empty-string repo_id."""
+    import uuid
+
+    tag = uuid.uuid4().hex[:8]
+    stubs, nameless = f"_smoketest_stubs_{tag}", f"_smoketest_nameless_{tag}"
+    engine.run_cypher(
+        "CREATE (:Function {repo_id: $stubs, name: 'handler', source: 'app.py'}), "
+        "(:Class {repo_id: $stubs, name: 'Widget', source: 'widget.cpp'}), "
+        "(:Module {repo_id: $nameless}), "
+        "(:Endpoint {repo_id: '', name: $marker})",
+        {"stubs": stubs, "nameless": nameless, "marker": f"_smoketest_empty_{tag}"},
+    )
+    try:
+        assert {stubs, nameless, ""} <= engine.graph_repo_ids()
+    finally:
+        engine.delete_repository(stubs)
+        engine.delete_repository(nameless)
+        engine.run_cypher("MATCH (n:Endpoint {repo_id: '', name: $marker}) DELETE n", {"marker": f"_smoketest_empty_{tag}"})
+
+
+def test_graph_repo_ids_reads_a_label_with_a_backtick(engine):
+    import uuid
+
+    tag = uuid.uuid4().hex[:8]
+    repo_id = f"_smoketest_tick_{tag}"
+    engine.run_cypher(f"CREATE (:`Zz``Tick{tag}` {{repo_id: $repo_id}})", {"repo_id": repo_id})
+    try:
+        assert repo_id in engine.graph_repo_ids()
+    finally:
+        engine.delete_repository(repo_id)

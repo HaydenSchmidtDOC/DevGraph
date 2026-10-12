@@ -398,24 +398,33 @@ _SHOW_INDEXES_CYPHER = (
     "SHOW INDEXES YIELD name, type, entityType, labelsOrTypes, properties, owningConstraint "
     "WHERE owningConstraint IS NULL RETURN name, type, entityType, labelsOrTypes, properties"
 )
-# graph_repo_ids: the online RANGE indexes led by `repo_id` (one label each).
+# graph_repo_ids: the labels with an online single-property `repo_id` RANGE
+# index. A composite index led by `repo_id` won't do: it leaves out a node
+# whose later property is null (a file-less handler-stub Function, a
+# nameless Module), so it would miss a repository made only of those.
 _REPO_ID_INDEXES_CYPHER = (
-    "SHOW INDEXES YIELD state, type, entityType, labelsOrTypes, properties, owningConstraint "
-    "WHERE state = 'ONLINE' AND type = 'RANGE' AND entityType = 'NODE' AND properties[0] = 'repo_id' "
-    "RETURN labelsOrTypes[0] AS label, properties, owningConstraint IS NOT NULL AS owned"
+    "SHOW INDEXES YIELD state, type, entityType, labelsOrTypes, properties "
+    "WHERE state = 'ONLINE' AND type = 'RANGE' AND entityType = 'NODE' AND properties = ['repo_id'] "
+    "RETURN labelsOrTypes[0] AS label"
 )
 
 
-def _next_repo_id(i: int, label: str, properties: list[str]) -> str:
-    """One branch of a graph_repo_ids round: the least repo_id above
-    `$after[i]` on `label`, sought through its `properties` index (each
-    property tested, as a composite index hint requires), as row `i`."""
+def _quoted(name: str) -> str:
+    """A label or property name as a Cypher identifier, backticks escaped."""
+    return "`" + name.replace("`", "``") + "`"
+
+
+def _next_repo_id(i: int, label: str, first: bool) -> str:
+    """One branch of a graph_repo_ids round: the least repo_id on `label`
+    from `$after[i]` (the first round, from "" inclusive) or above it,
+    sought through the label's `repo_id` index, as row `i`."""
+    node = f"n:{_quoted(label)}"
     return (
-        f"MATCH (n:`{label}`) USING INDEX n:`{label}`({', '.join(f'`{prop}`' for prop in properties)}) "
-        f"WHERE n.repo_id > $after[{i}] "
-        + "".join(f"AND n.`{prop}` IS NOT NULL " for prop in properties[1:])
-        + f"WITH min(n.repo_id) AS repo_id RETURN {i} AS i, repo_id"
+        f"MATCH ({node}) USING INDEX {node}(repo_id) WHERE n.repo_id {'>=' if first else '>'} $after[{i}] "
+        f"WITH min(n.repo_id) AS repo_id RETURN {i} AS i, repo_id"
     )
+
+
 # Graph insights (devgraph/analytics/insights.py). The Repository node is the
 # scoping root, not code, so it never takes part in the graph that's analysed.
 # A CALLS edge matched by name alone ("name") or at package confidence (any
@@ -2055,40 +2064,38 @@ class GraphEngine:
         without one (a write that landed after its repository was deleted).
 
         Read label by label, over every label in use (user types included),
-        never by scanning every node. A label with an online RANGE index led
-        by `repo_id` is skip-scanned through it (its key constraint's by
-        preference, which every node MERGEd on its key is in): each round
+        never by scanning every node. A label with an online single-property
+        `repo_id` RANGE index (every built-in label: see
+        `lookup_index_statements`) is skip-scanned through it: each round
         seeks, for every label still going, the least repo_id above the last
         one found, so the cost follows the repo_ids, not the nodes. A label
-        without such an index is scanned on its own."""
+        without one (a user type) is scanned on its own. The seeks compare
+        strings, so a non-string repo_id on an indexed label (DevGraph
+        writes none) is not found."""
         with self._driver.session() as session:
-            # Sorted so each label keeps its best index: owned, then narrowest.
-            index_of = {
-                record["label"]: record["properties"]
-                for record in sorted(
-                    _run_records(session, _REPO_ID_INDEXES_CYPHER),
-                    key=lambda record: (record["owned"], -len(record["properties"])),
-                )
-            }
+            indexed = {record["label"] for record in _run_records(session, _REPO_ID_INDEXES_CYPHER)}
             found: set[str] = set()
             after: dict[str, str] = {}
             for record in _run_records(session, "CALL db.labels() YIELD label RETURN label"):
                 label = record["label"]
-                if label in index_of:
+                if label in indexed:
                     after[label] = ""
                 else:
                     found.update(row["repo_id"] for row in _run_records(
-                        session, f"MATCH (n:`{label}`) WHERE n.repo_id IS NOT NULL RETURN DISTINCT n.repo_id AS repo_id"
+                        session,
+                        f"MATCH (n:{_quoted(label)}) WHERE n.repo_id IS NOT NULL RETURN DISTINCT n.repo_id AS repo_id",
                     ))
+            first = True
             while after:
                 labels = list(after)
                 rows = _run_records(
                     session,
-                    " UNION ALL ".join(_next_repo_id(i, label, index_of[label]) for i, label in enumerate(labels)),
+                    " UNION ALL ".join(_next_repo_id(i, label, first) for i, label in enumerate(labels)),
                     after=list(after.values()),
                 )
                 after = {labels[row["i"]]: row["repo_id"] for row in rows if row["repo_id"] is not None}
                 found.update(after.values())
+                first = False
             return found
 
     def delete_repository(self, repo_id: str) -> None:
