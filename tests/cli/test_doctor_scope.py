@@ -110,6 +110,9 @@ def test_constraint_check_ignores_unregistered_repositories(engine, tmp_path):
     finally:
         for repo in (registered, orphan):
             engine.delete_repository(repo)
-    constraints = out.split("Schema constraints", 1)[1]
+    # The orphan is named further down, by the orphaned-graph-data check
+    # (which offers `devgraph prune`) -- never as a constraint to rescan.
+    constraints = out.split("Schema constraints", 1)[1].split("Orphaned graph data", 1)[0]
     assert f"devgraph rescan {registered} --now" in constraints
     assert orphan not in constraints
+    assert orphan in out.split("Orphaned graph data", 1)[1]
