@@ -752,6 +752,10 @@ class WatcherManager:
 
             # Read before the observer starts (W5): see _start_catch_up.
             snapshot = self._last_indexed(repo.repo_id) if self._on_catch_up is not None else None
+            # Any old issue is cleared before the start, not after it: the new
+            # watch can report one (a limit) as soon as it runs.
+            with self._issues_lock:
+                self._repo_issues.pop(repo.repo_id, None)
             observer.start()
         except Exception as e:
             # Whatever did start (emitters, their inotify instances) is
@@ -772,9 +776,6 @@ class WatcherManager:
             self._root_watches[repo.repo_id] = root_watch
         if git_handler is not None:
             self._git_handlers[repo.repo_id] = git_handler
-        # Clear any cached issues now that watch started successfully
-        with self._issues_lock:
-            self._repo_issues.pop(repo.repo_id, None)
         logger.debug(f"Started watcher for {repo.repo_id} at {repo.path}")
         if self._on_catch_up is not None:
             repo_id = repo.repo_id

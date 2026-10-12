@@ -349,6 +349,34 @@ def test_a_folder_that_hits_the_watch_limit_mid_session_is_reported(tmp_path, mo
         w.close()
 
 
+def test_a_limit_reported_as_the_watch_starts_is_kept(tmp_path):
+    """A report from the new watch's reader can land before `_start_single`
+    returns; clearing the old issue after the start erased it. The old
+    issue is still cleared."""
+    w = Watching(tmp_path, make_repo(tmp_path, "repo", 1), git=False)
+    new_observer = w.manager._new_observer
+
+    def reporting_observer(repo_id, root, *, watch_git):
+        observer = new_observer(repo_id, root, watch_git=watch_git)
+        start = observer.start
+
+        def start_then_report():
+            start()
+            w.manager._inotify_problem(repo_id, "limit", OSError(errno.ENOSPC, "No space left on device"))
+
+        observer.start = start_then_report
+        return observer
+
+    w.manager._new_observer = reporting_observer
+    w.manager._repo_issues[w.repo_id] = "watching unavailable: an earlier start's"
+    w.manager.start()
+    try:
+        issue = w.manager.get_repo_issues().get(w.repo_id, "")
+        assert issue.startswith("partly watched: "), issue
+    finally:
+        w.close()
+
+
 def test_a_symlinked_folder_below_the_root_gets_no_watch(tmp_path):
     """inotify follows a symlink it is asked to watch: a linked folder found
     in a new folder's walk would put a folder outside the repository under
