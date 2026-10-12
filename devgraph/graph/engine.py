@@ -703,8 +703,10 @@ def _pin(file: str | None) -> str:
 
 
 #: The edge types a resolver writes with a pin's `@` flag, whose edges into a
-#: node therefore depend on its match keys (see retract_match_key_edges).
+#: node therefore depend on its match keys (see GraphEngine.write_match_keys).
 MATCH_KEY_EDGE_TYPES = ("CALLS", "IMPORTS")
+#: The most nodes GraphEngine.write_match_keys handles in one transaction.
+RETRACT_NODES = 500
 #: The pin kinds that match a set of files rather than one (see `_pin`).
 _PATH_PINS = frozenset({"dir", "loose_dir", "suffix", "suffix_dir", "prefix"})
 #: The path pins whose files all start with the pin's own path (`pin_value`'s
@@ -1684,21 +1686,25 @@ class GraphEngine:
         records = self.run_cypher(query, {"repo_id": repo_id, "names": names})
         return [(record["name"], record["label"]) for record in records]
 
-    def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str, str, tuple[str, ...]]]:
-        """Return (label, name, file, mkeys) for every node whose file provenance
+    def list_file_nodes(
+        self, repo_id: str, files: list[str],
+    ) -> set[tuple[str, str, str, tuple[str, ...] | None, bool]]:
+        """Return (label, name, file, mkeys, stale) for every node whose file provenance
         (`source_file`/`file`, a `Module` named by its path, or a schema
         provider's node, which its `path` owns) is one of `files`. `file` is
         that provenance: the Module's name, else `file`, `source_file` or
         `path`, in that order. A shared node one of `files` claims (in its
         `sources`: a `Container`, `Datastore`, `Endpoint` or handler stub) is
         returned with `file` "", besides any row for its own provenance.
-        `mkeys` is the node's match keys, sorted (empty when it has none).
+        `mkeys` is the node's match keys, sorted (None when it has none), and
+        `stale` whether a batch that changed them has yet to finish
+        relinking its edges (see write_match_keys).
 
         index_paths snapshots this before re-indexing a batch so it can tell
         which nodes the batch *adds* -- only those can be the missing
         target of an edge from a file outside the batch. A node moving
         between two of the batch's files counts as added. It also tells
-        which kept nodes' match keys change (see retract_match_key_edges).
+        which kept nodes' match keys change (see write_match_keys).
 
         Each label is matched on its own: the built-in ones through their
         provenance indexes, a provider's through the labels the repository's
@@ -1724,35 +1730,60 @@ class GraphEngine:
                 "WHERE owned OR claimed "
                 "RETURN DISTINCT labels(n)[0] AS label, n.name AS name, owned, claimed, "
                 "CASE WHEN n:Module THEN n.name ELSE coalesce(n.file, n.source_file, n.path) END AS file, "
-                "coalesce(n.mkeys, []) AS mkeys",
+                "n.mkeys AS mkeys, coalesce(n.mkeys_stale, false) AS stale",
                 repo_id=repo_id,
                 files=files,
             )
-            records = [(r, tuple(sorted(set(r["mkeys"])))) for r in result or []]
-            return {(r["label"], r["name"], r["file"], keys) for r, keys in records if r["owned"]} | {
-                (r["label"], r["name"], "", keys) for r, keys in records if r["claimed"]
+            records = [(r, None if r["mkeys"] is None else tuple(sorted(set(r["mkeys"])))) for r in result or []]
+            return {(r["label"], r["name"], r["file"], keys, r["stale"]) for r, keys in records if r["owned"]} | {
+                (r["label"], r["name"], "", keys, r["stale"]) for r, keys in records if r["claimed"]
             }
 
-    def retract_match_key_edges(self, repo_id: str, nodes: list[tuple[str, str, str]]) -> None:
-        """Delete the CALLS and IMPORTS edges into these (label, name, file)
-        nodes, whose match keys (`mkeys`) a batch changed: a pin's `@` flag
-        (graph/schema.py `split_pin`) linked them under the old keys, so the
-        batch writes them again under the new ones, the way it writes an
-        added node's. Each label's (repo_id, name, file) index is hinted to
-        seek, for the reason _end_match gives. Every other edge stays."""
-        groups: dict[str, list[dict[str, str]]] = {}
-        for label, name, file in nodes:
-            groups.setdefault(label, []).append({"name": name, "file": file})
+    def write_match_keys(
+        self, repo_id: str, nodes: list[tuple[str, str, str, tuple[str, ...] | None, bool]],
+    ) -> None:
+        """Write these (label, name, file, mkeys, retract) nodes' match keys
+        (`mkeys`; None removes them), which a batch's own node writes leave
+        as they were until now, so a pin's `@` flag (graph/schema.py
+        `split_pin`) only ever sees one node's old keys with its old edges.
+        A node to `retract` loses its CALLS and IMPORTS edges, which those
+        pins linked under its old keys, in the same transaction, and stays
+        `mkeys_stale` until settle_match_keys: the batch writes them again
+        under the new keys, the way it writes an added node's, and a batch
+        that fails before then finds it stale and does it again. Each
+        label's (repo_id, name, file) index is hinted to seek, for the reason
+        _end_match gives, and RETRACT_NODES nodes go per transaction, so a
+        format upgrade that rekeys a whole repository never holds one
+        transaction over all of it. Every other edge stays."""
+        self._per_label_chunk(
+            repo_id, [((label, name, file), {"mkeys": list(keys) if keys is not None else None, "retract": retract})
+                      for label, name, file, keys, retract in nodes],
+            "SET b.mkeys = row.mkeys, b.mkeys_stale = CASE WHEN row.retract THEN true END "
+            f"WITH b, row WHERE row.retract MATCH ()-[r:{'|'.join(MATCH_KEY_EDGE_TYPES)}]->(b) DELETE r",
+        )
+
+    def settle_match_keys(self, repo_id: str, nodes: list[tuple[str, str, str]]) -> None:
+        """Clear `mkeys_stale` (see write_match_keys) off these (label, name,
+        file) nodes once their edges are written again."""
+        self._per_label_chunk(repo_id, [(node, {}) for node in nodes], "REMOVE b.mkeys_stale")
+
+    def _per_label_chunk(self, repo_id: str, nodes: list[tuple[tuple[str, str, str], dict]], update: str) -> None:
+        """Run `update` on each (label, name, file) node `b`, with its own
+        `row` fields, RETRACT_NODES nodes per transaction (see
+        write_match_keys)."""
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for (label, name, file), fields in nodes:
+            groups.setdefault(label, []).append({"name": name, "file": file, **fields})
         with self._driver.session() as session:
             for label, rows in sorted(groups.items()):
-                _retry_transient(
-                    session.run,
-                    f"UNWIND $rows AS row MATCH (b:{label} {{repo_id: $repo_id, name: row.name, file: row.file}}) "
-                    f"USING INDEX SEEK b:{label}(repo_id, name, file) "
-                    f"MATCH ()-[r:{'|'.join(MATCH_KEY_EDGE_TYPES)}]->(b) DELETE r",
-                    repo_id=repo_id,
-                    rows=rows,
-                )
+                for start in range(0, len(rows), RETRACT_NODES):
+                    _retry_transient(
+                        session.run,
+                        f"UNWIND $rows AS row MATCH (b:{label} {{repo_id: $repo_id, name: row.name, file: row.file}}) "
+                        f"USING INDEX SEEK b:{label}(repo_id, name, file) " + update,
+                        repo_id=repo_id,
+                        rows=rows[start:start + RETRACT_NODES],
+                    )
 
     def find_name_refs(self, repo_id: str, names: list[str], skip: list[str]) -> list[tuple[str, list[str]]]:
         """(Module name, entries) for every Module outside `skip` whose

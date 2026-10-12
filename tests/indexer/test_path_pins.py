@@ -104,25 +104,59 @@ def test_best_pin_tests_at_keys_against_the_nodes():
     assert best_pin({"x/.@N:A", "/.?.cs"}, "x/a.cs", "app.cs", ["N:A"]) == "x/.@N:A"
 
 
-def test_name_refs_store_a_calls_at_keys_once():
-    rows = [
-        r.to_dict() for r in call_rows(
-            "Function", "main", "f", {"a/f.cs", "/.?.cs^@N:A,.:A", "lib/.@N:A,.:A"}, False, None, "app.cs", "r",
-        )
-    ]
+def _cs_rows(pins):
+    rows = [r.to_dict() for r in call_rows("Function", "main", "f", set(pins), False, None, "app.cs", "r")]
     for row in rows:
         row["from_file"] = row["origin"] = "app.cs"
-    (entry,) = name_ref_properties(rows)["name_refs"]
-    assert entry.count("N:A") == 1 and entry.endswith(".:A,N:A")
-    assert parse_name_ref(entry) == (
-        ["CALLS", "Function", "main", "app.cs", "Function", "f", ""], ["/.?.cs^@.:A,N:A", "a/f.cs", "lib/.@.:A,N:A"],
-        "pin",
-    )
+    return rows
+
+
+def test_name_refs_store_each_set_of_at_keys_once():
+    """Two call sites on receivers of two types give one call two `@` pins
+    with different keys: an entry per key set, each storing its keys once,
+    which relink takes together again."""
+    from devgraph.indexer.dispatch import _with_scopes_merged
+
+    refs = name_ref_properties(_cs_rows({"a/f.cs", "/.?.cs^@N:A,.:A", "lib/.@N:A,.:A", "/.?.cs^@B:Y"}))["name_refs"]
+    head = ["CALLS", "Function", "main", "app.cs", "Function", "f", ""]
+    assert all(entry.count("N:A") <= 1 for entry in refs)
+    assert sorted(parse_name_ref(entry) for entry in refs) == [
+        (head, ["/.?.cs^@.:A,N:A", "lib/.@.:A,N:A"], "pin"),
+        (head, ["/.?.cs^@B:Y"], "pin"),
+        (head, ["a/f.cs"], "pin"),
+    ]
     # An entry without keys has no such field, as before.
-    (plain,) = name_ref_properties([{**rows[0], "to_file": "/.?.cs^"}])["name_refs"]
-    assert len(plain.split("\x1f")) == 9
-    with pytest.raises(ValueError):
-        name_ref_properties([rows[1], {**rows[2], "to_file": "/.?.cs^@N:B"}])
+    assert [len(entry.split("\x1f")) for entry in sorted(refs)] == [10, 10, 9]
+    assert _with_scopes_merged([parse_name_ref(entry) for entry in refs]) == [
+        (head, ["/.?.cs^@.:A,N:A", "/.?.cs^@B:Y", "a/f.cs", "lib/.@.:A,N:A"], "pin"),
+    ]
+
+
+def test_relink_takes_a_calls_entries_of_different_at_keys_together():
+    """A node an exact file pin and a weaker `@` pin of the same call both
+    match is relinked once, through the file pin, as the writer's rows left
+    it out of the `@` pin's."""
+    from devgraph.indexer.dispatch import _relink_name_refs
+
+    refs = name_ref_properties(_cs_rows({"lib/a.cs", "/lib/.@N:A", "/lib/.@N:B"}))["name_refs"]
+
+    class Engine:
+        def __init__(self):
+            self.rels = []
+
+        def find_name_refs(self, repo_id, names, skip):
+            return [("app.cs", refs)]
+
+        def upsert_relationships(self, rels):
+            self.rels += rels
+
+    engine = Engine()
+    _relink_name_refs(engine, "r", {("Function", "f", "lib/a.cs"), ("Function", "f", "lib/b.cs")}, set(), {
+        ("Function", "f", "lib/a.cs"): ("N:A",), ("Function", "f", "lib/b.cs"): ("N:B",),
+    })
+    assert sorted((rel["to_file"], rel["properties"]["confidence"]) for rel in engine.rels) == [
+        ("lib/a.cs", "resolved"), ("lib/b.cs", "package"),
+    ]
 
 
 def test_each_pin_leaves_out_what_a_stronger_pin_matches():
@@ -416,64 +450,197 @@ def test_a_path_pinned_call_writes_and_relinks(engine, repo_id, tmp_path, monkey
     _equals_fresh(engine, repo_id, tmp_path)
 
 
-def test_a_nodes_new_match_keys_retract_and_relink_its_at_pinned_edges(engine, repo_id, tmp_path, monkeypatch):
-    """app.py's `main` calls, and app.py imports, the `f` whose match keys
-    hold N:A (a `# mkeys` line gives a file's Functions theirs). When an
-    edit moves N:A from lib/a.py's `f` to lib/b.py's, the stale edges into
-    lib/a.py go and app.py, outside the batch, is relinked to lib/b.py,
-    as a fresh scan has them; a commit's MODIFIES edge survives."""
+#: Each caller file's `main` calls `f` through these pins (and app.py also
+#: imports it so): `@` pins (two.py's from two call sites on receivers of
+#: two types), a bare name, an exact file beside a weaker `@` pin.
+_KEYED_CALLERS = {
+    "app.py": {scoped_pin("lib/.", ["N:A"])},
+    "two.py": {scoped_pin("lib/.", ["N:A"]), scoped_pin("lib/.", ["N:B"])},
+    "bare.py": set(),
+    "exact.py": {"lib/a.py", scoped_pin("/lib/.", ["N:A"])},
+}
+
+
+def _inject_match_keys(monkeypatch) -> dict:
+    """A `# mkeys k1,k2` first line gives a file's Functions those match
+    keys (and every lib/ file's none, [], while the returned settings'
+    `empty` is true); the `_KEYED_CALLERS` files call (and app.py imports)
+    `f`."""
     real = dispatch.extract_python_file
-    pin = scoped_pin("lib/.", ["N:A"])
+    settings = {"empty": False}
 
     def extract(content, rel_path, repo_id):
         result = real(content, rel_path, repo_id)
+        keys = None
         if content.startswith("# mkeys "):
             keys = sorted(set(content.splitlines()[0][len("# mkeys "):].split(",")))
+        elif settings["empty"] and rel_path.startswith("lib/"):
+            keys = []
+        if keys is not None:
             for node in result.nodes:
                 if node.label == "Function":
                     node.properties["mkeys"] = keys
-        if rel_path == "app.py":
-            for kind, source in (("CALLS", ("Function", "main")), ("IMPORTS", ("Module", "app.py"))):
-                for rel in call_rows(*source, "f", {pin}, False, None, "app.py", repo_id, rel_type=kind):
-                    rel.origin = "app.py"
-                    rel.from_file = "app.py" if kind == "CALLS" else None
+        pins = _KEYED_CALLERS.get(rel_path)
+        if pins is not None:
+            sources = [("CALLS", ("Function", "main"))]
+            if rel_path == "app.py":
+                sources.append(("IMPORTS", ("Module", rel_path)))
+            for kind, source in sources:
+                for rel in call_rows(*source, "f", set(pins), not pins, None, rel_path, repo_id, rel_type=kind):
+                    rel.origin = rel_path
+                    rel.from_file = rel_path if kind == "CALLS" else None
                     result.relationships.append(rel)
         return result
 
     monkeypatch.setattr(dispatch, "extract_python_file", extract)
-    _write(tmp_path, "app.py", "def main():\n    return 0\n")
-    a = _write(tmp_path, "lib/a.py", "# mkeys N:A,.:A\ndef f():\n    return 0\n")
-    b = _write(tmp_path, "lib/b.py", "# mkeys N:B\ndef f():\n    return 0\n")
+    return settings
+
+
+def _keyed_links(engine, repo_id):
+    rows = engine.run_cypher(
+        "MATCH (a {repo_id: $r})-[x:CALLS|IMPORTS]->(b:Function {name: 'f'}) "
+        "RETURN coalesce(a.file, a.name) AS a, type(x) AS t, b.file AS f, x.confidence AS c",
+        {"r": repo_id},
+    )
+    return sorted((row["a"], row["t"], row["f"], row["c"]) for row in rows)
+
+
+def _f(keys=None):
+    return (f"# mkeys {keys}\n" if keys else "") + "def f():\n    return 0\n"
+
+
+def test_a_nodes_new_match_keys_retract_and_relink_its_edges(engine, repo_id, tmp_path, monkeypatch):
+    """When an edit moves N:A from lib/a.py's `f` to lib/b.py's, the edges
+    into both go and are written again under the new keys: `@` pins (two
+    sites with different keys among them), a bare name and an exact file,
+    from callers outside the batch or in it, as a fresh scan has them. A
+    node written without keys loses the ones it had. A commit's MODIFIES
+    edge survives."""
+    _inject_match_keys(monkeypatch)
+    monkeypatch.setattr("devgraph.graph.engine.RETRACT_NODES", 1)  # a transaction per node
+    callers = {rel: _write(tmp_path, rel, "def main():\n    return 0\n") for rel in _KEYED_CALLERS}
+    a = _write(tmp_path, "lib/a.py", _f("N:A,.:A"))
+    b = _write(tmp_path, "lib/b.py", _f("N:B"))
     _scan(engine, repo_id, tmp_path)
     engine.run_cypher(
         "MATCH (m:Module {repo_id: $r, name: 'lib/a.py'}) CREATE (:Commit {repo_id: $r, name: 'c1'})-[:MODIFIES]->(m)",
         {"r": repo_id},
     )
+    fixed = [
+        ("bare.py", "CALLS", "lib/a.py", "name"), ("bare.py", "CALLS", "lib/b.py", "name"),
+        ("exact.py", "CALLS", "lib/a.py", "resolved"),  # the file pin, whatever a's keys
+    ]
 
-    def linked():
-        rows = engine.run_cypher(
-            "MATCH (a {repo_id: $r})-[x:CALLS|IMPORTS]->(b:Function {name: 'f'}) RETURN type(x) AS t, b.file AS f",
-            {"r": repo_id},
-        )
-        return sorted((row["t"], row["f"]) for row in rows)
+    def keyed(app, two):
+        # exact.py's `@` pin links only b: a is its stronger file pin's.
+        return sorted(fixed + [("app.py", t, f, "resolved") for f in app for t in ("CALLS", "IMPORTS")]
+                      + [("two.py", "CALLS", f, "resolved") for f in two]
+                      + [("exact.py", "CALLS", "lib/b.py", "package") for f in app if f == "lib/b.py"])
 
-    assert linked() == [("CALLS", "lib/a.py"), ("IMPORTS", "lib/a.py")]
+    assert _keyed_links(engine, repo_id) == keyed(["lib/a.py"], ["lib/a.py", "lib/b.py"])
     _equals_fresh(engine, repo_id, tmp_path)
 
-    _write(tmp_path, "lib/a.py", "# mkeys N:C\ndef f():\n    return 0\n")
-    _write(tmp_path, "lib/b.py", "# mkeys N:A\ndef f():\n    return 0\n")
+    # Callers outside the batch: relinked from their name_refs.
+    _write(tmp_path, "lib/a.py", _f("N:C"))
+    _write(tmp_path, "lib/b.py", _f("N:A"))
     index_paths(engine, repo_id, tmp_path, {a, b})
-    assert linked() == [("CALLS", "lib/b.py"), ("IMPORTS", "lib/b.py")]
+    assert _keyed_links(engine, repo_id) == keyed(["lib/b.py"], ["lib/b.py"])
     _equals_fresh(engine, repo_id, tmp_path)
 
-    _write(tmp_path, "lib/a.py", "# mkeys .:A,N:A\ndef f():\n    return 0\n")  # one file at a time
-    index_paths(engine, repo_id, tmp_path, {a})
-    assert linked() == [("CALLS", "lib/a.py"), ("CALLS", "lib/b.py"), ("IMPORTS", "lib/a.py"), ("IMPORTS", "lib/b.py")]
+    # A caller in the batch: written again by pass 2.
+    _write(tmp_path, "lib/a.py", _f(".:A,N:A"))
+    _write(tmp_path, "app.py", "def main():\n    return 1\n")
+    index_paths(engine, repo_id, tmp_path, {a, callers["app.py"]})
+    assert _keyed_links(engine, repo_id) == keyed(["lib/a.py", "lib/b.py"], ["lib/a.py", "lib/b.py"])
     _equals_fresh(engine, repo_id, tmp_path)
+
+    # Written without keys: it has none, and no `@` pin links it.
+    _write(tmp_path, "lib/a.py", _f())
+    index_paths(engine, repo_id, tmp_path, {a})
+    assert _keyed_links(engine, repo_id) == keyed(["lib/b.py"], ["lib/b.py"])
+    _equals_fresh(engine, repo_id, tmp_path)
+    assert engine.run_cypher(
+        "MATCH (n:Function {repo_id: $r, name: 'f', file: 'lib/a.py'}) RETURN n.mkeys AS k", {"r": repo_id}
+    ) == [{"k": None}]
     assert engine.run_cypher(
         "MATCH (:Commit {repo_id: $r, name: 'c1'})-[x:MODIFIES]->(:Module {name: 'lib/a.py'}) RETURN count(x) AS n",
         {"r": repo_id},
     ) == [{"n": 1}]
+
+
+@pytest.mark.parametrize("fails", ["keys", "pass 2", "settle"])
+def test_a_batch_that_fails_after_writing_match_keys_rekeys_again(engine, repo_id, tmp_path, monkeypatch, fails):
+    """A batch that dies once the first node's keys are written (and its
+    edges gone), in pass 2, or just before its rekeyed nodes are settled
+    leaves them `mkeys_stale`: running it again retracts and relinks them,
+    as a fresh scan has them."""
+    from devgraph.graph import engine as engine_module
+
+    _inject_match_keys(monkeypatch)
+    monkeypatch.setattr(engine_module, "RETRACT_NODES", 1)
+    for rel in _KEYED_CALLERS:
+        _write(tmp_path, rel, "def main():\n    return 0\n")
+    a = _write(tmp_path, "lib/a.py", _f("N:A,.:A"))
+    b = _write(tmp_path, "lib/b.py", _f("N:B"))
+    _scan(engine, repo_id, tmp_path)
+
+    _write(tmp_path, "lib/a.py", _f())
+    _write(tmp_path, "lib/b.py", _f("N:A"))
+    with monkeypatch.context() as patch:
+        if fails == "keys":
+            real, calls = engine_module._retry_transient, []
+
+            def flaky(fn, query, *args, **kwargs):
+                if "mkeys_stale = CASE" in query:
+                    calls.append(query)
+                    if len(calls) == 2:
+                        raise RuntimeError("down")
+                return real(fn, query, *args, **kwargs)
+
+            patch.setattr(engine_module, "_retry_transient", flaky)
+        else:
+            method = "upsert_relationships" if fails == "pass 2" else "settle_match_keys"
+            patch.setattr(type(engine), method, lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("down")))
+        with pytest.raises(RuntimeError):
+            index_paths(engine, repo_id, tmp_path, {a, b})
+    assert engine.run_cypher(
+        "MATCH (n:Function {repo_id: $r, name: 'f'}) WHERE n.mkeys_stale RETURN n.file AS f", {"r": repo_id}
+    )
+    index_paths(engine, repo_id, tmp_path, {a, b})
+    assert ("app.py", "CALLS", "lib/b.py", "resolved") in _keyed_links(engine, repo_id)
+    _equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_keys_that_still_match_the_same_write_no_edge_again(engine, repo_id, tmp_path, monkeypatch):
+    """A node stored without keys and written with none ([]) or back keeps
+    every edge into it: the keys match the same nodes either way. The
+    property follows, as a fresh scan has it."""
+    settings = _inject_match_keys(monkeypatch)
+    for rel in _KEYED_CALLERS:
+        _write(tmp_path, rel, "def main():\n    return 0\n")
+    a = _write(tmp_path, "lib/a.py", _f())
+    _write(tmp_path, "lib/b.py", _f("N:A"))
+    _scan(engine, repo_id, tmp_path)
+
+    def edges():
+        return engine.run_cypher(
+            "MATCH ()-[x:CALLS|IMPORTS]->(n:Function {repo_id: $r, name: 'f', file: 'lib/a.py'}) "
+            "RETURN elementId(x) AS x ORDER BY x",
+            {"r": repo_id},
+        )
+
+    def keys():
+        return engine.run_cypher(
+            "MATCH (n:Function {repo_id: $r, name: 'f', file: 'lib/a.py'}) RETURN n.mkeys AS k", {"r": repo_id}
+        )
+
+    before = edges()
+    assert len(before) == 2 and keys() == [{"k": None}]  # bare.py's and exact.py's
+    for empty, stored in ((True, []), (False, None)):
+        settings["empty"] = empty
+        index_paths(engine, repo_id, tmp_path, {a})
+        assert edges() == before and keys() == [{"k": stored}]
+        _equals_fresh(engine, repo_id, tmp_path)
 
 
 def test_module_pins_import_by_directory_and_suffix_and_relink(engine, repo_id, tmp_path, monkeypatch):

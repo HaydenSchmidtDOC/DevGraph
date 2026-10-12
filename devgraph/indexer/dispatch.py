@@ -814,6 +814,7 @@ def index_paths(
     previous = engine.list_file_nodes(repo_id, batch_keys)
     previous_nodes = {node[:3] for node in previous}
     previous_keys = {node[:3]: node[3] for node in previous}
+    stale = {node[:3] for node in previous if node[4]}
     # The claims on the shared nodes the batch's files claim (see
     # _written_back_shared).
     claims_before = engine.list_shared_claims(repo_id, batch_keys) if any(not n[2] for n in previous_nodes) else {}
@@ -871,14 +872,24 @@ def index_paths(
     if docs_batch:
         added -= {node for node in batch_nodes if node[:2] in docs_batch.existing}
     added_nodes = {node[:2] for node in added}
-    # A kept node whose match keys changed was linked by `@` pins under its
-    # old keys: its CALLS/IMPORTS edges go now, before pass 2 and the relink
-    # below write them again under the new ones, as for an added node. It is
-    # not added otherwise: no referrer, docs or mention depends on its keys.
+    # Match keys, which pass 1 left as they were, are written now, before
+    # pass 2 tests them. A kept node whose keys changed (no keys and none
+    # being the same) was linked by `@` pins under its old ones: its
+    # CALLS/IMPORTS edges go with them, and pass 2 and the relink below
+    # write them again under the new ones, as for an added node; one a
+    # failed batch left stale goes again. It is not added otherwise: no
+    # referrer, docs or mention depends on its keys.
     match_keys = _match_keys(code_extractions)
-    rekeyed = {node for node, keys in match_keys.items() if previous_keys.get(node, keys) != keys}
-    if rekeyed:
-        engine.retract_match_key_edges(repo_id, sorted(rekeyed))
+    rekeyed = {
+        node for node, keys in match_keys.items()
+        if node in stale or (node in previous_keys and (previous_keys[node] or ()) != (keys or ()))
+    }
+    rewritten = sorted(
+        (*node, keys, node in rekeyed) for node, keys in match_keys.items()
+        if node in rekeyed or previous_keys.get(node) != keys
+    )
+    if rewritten:
+        engine.write_match_keys(repo_id, rewritten)
     referrers = _find_referrers(engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path))
     for rel_path in sorted(referrers):
         index_one(rel_path, root_resolved / rel_path)
@@ -964,6 +975,8 @@ def index_paths(
     # file outside the batch.
     if relink_outside:
         _relink_name_refs(engine, repo_id, added | rekeyed, set(by_rel_path) | referrers, match_keys)
+    if rekeyed:
+        engine.settle_match_keys(repo_id, sorted(rekeyed))
 
     # Service cross-linking runs as a final pass, after every file in this
     # batch (including any compose file) has been indexed — Service nodes'
@@ -1068,11 +1081,15 @@ def _routes(resolved: Path, docs_root: Path | None, mentions_enabled: bool) -> l
 def _with_name_refs(nodes: list[dict], rels: list[dict], rel_path: str) -> list[dict]:
     """A copy of a code file's `nodes` whose Module carries the file's
     by-name edges (see name_ref_properties), for its pass-1 replace only:
-    pass 2 re-upserts the plain `nodes`, so it never writes them again."""
+    pass 2 re-upserts the plain `nodes`, so it never writes them again. Its
+    symbols' match keys are left out: index_paths writes them after pass 1
+    (engine.write_match_keys), with the edges they decide."""
     refs = name_ref_properties(rels)
     return [
         {**node, "properties": {**node["properties"], **refs}}
-        if node["label"] == "Module" and node["name"] == rel_path else node
+        if node["label"] == "Module" and node["name"] == rel_path
+        else {**node, "properties": {k: v for k, v in node["properties"].items() if k != "mkeys"}}
+        if "mkeys" in node["properties"] else node
         for node in nodes
     ]
 
@@ -1297,22 +1314,24 @@ def _batch_nodes(
 
 def _match_keys(
     code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
-) -> dict[tuple[str, str, str], tuple[str, ...]]:
-    """(label, name, file) -> sorted `mkeys` of every code node this batch
-    wrote that carries them (graph/schema.py `split_pin`'s `@` flag tests
-    them); a node without them keeps the ones it has."""
+) -> dict[tuple[str, str, str], tuple[str, ...] | None]:
+    """(label, name, file) -> sorted `mkeys` (graph/schema.py `split_pin`'s
+    `@` flag tests them) of every code symbol this batch wrote, None for
+    one written without them, as list_file_nodes gives them."""
     return {
-        (node["label"], node["name"], node["properties"]["file"]): tuple(sorted(set(node["properties"]["mkeys"])))
+        (node["label"], node["name"], node["properties"]["file"]): (
+            None if node["properties"].get("mkeys") is None else tuple(sorted(set(node["properties"]["mkeys"])))
+        )
         for extractions in code_extractions
         for _rel_path, (file_nodes, _rels) in extractions.items()
         for node in file_nodes
-        if node["properties"].get("file") and node["properties"].get("mkeys") is not None
+        if node["properties"].get("file")
     }
 
 
 def _relink_name_refs(
     engine: GraphEngine, repo_id: str, added: set[tuple[str, str, str]], skip: set[str],
-    match_keys: dict[tuple[str, str, str], tuple[str, ...]] | None = None,
+    match_keys: dict[tuple[str, str, str], tuple[str, ...] | None] | None = None,
 ) -> None:
     """Re-write the by-name edges that code files outside `skip` recorded in
     their Modules' `name_refs` (see name_ref_properties) and that meet a node
@@ -1357,7 +1376,7 @@ def _relink_name_refs(
     names = {name for _label, name in pinned}
     names |= {key for module in modules for key in _module_pin_keys(module)}
     for origin, refs in engine.find_name_refs(repo_id, sorted(names), sorted(skip)):
-        parsed = [parse_name_ref(entry) for entry in refs]
+        parsed = _with_scopes_merged([parse_name_ref(entry) for entry in refs])
         # Every Module a source imports, by path or by pin, as calls.import_rows
         # collapsed them: a pinned Module target leaves out what a stronger
         # one of them matches.
@@ -1379,7 +1398,7 @@ def _relink_name_refs(
                             relink(origin, fields, from_file, None, pin_confidence(pin, confidence), to_name=module)
             else:
                 for to_file in pinned.get((to_label, to_name), ()):
-                    keys = (match_keys or {}).get((to_label, to_name, to_file), ())
+                    keys = (match_keys or {}).get((to_label, to_name, to_file)) or ()
                     pin = best_pin(pins, to_file or "", origin, keys) if to_file is not None else None
                     if pin is not None:
                         relink(origin, fields, from_file, to_file, pin_confidence(pin, confidence))
@@ -1391,6 +1410,28 @@ def _relink_name_refs(
                         relink(origin, fields, source_file, to_file, conf, exclude)
     if rels:
         engine.upsert_relationships(rels)
+
+
+def _with_scopes_merged(
+    parsed: list[tuple[list[str], list[str] | None, str]],
+) -> list[tuple[list[str], list[str] | None, str]]:
+    """`name_refs` entries (parse_name_ref's) with the pinned entries of one
+    source and name taken together: its pins with different match keys are
+    entries of their own (name_ref_properties), and each of one call's pins
+    leaves out what a stronger one of them matches, as the writer's rows
+    did. Every other entry is as it was."""
+    merged: dict[tuple[str, ...], tuple[set[str], set[str]]] = {}
+    unpinned = []
+    for fields, pins, confidence in parsed:
+        if pins is None:
+            unpinned.append((fields, pins, confidence))
+        else:
+            all_pins, confidences = merged.setdefault(tuple(fields), (set(), set()))
+            all_pins.update(pins)
+            confidences.add(confidence)
+    return unpinned + [
+        (list(fields), sorted(pins), min(confidences)) for fields, (pins, confidences) in merged.items()
+    ]
 
 
 def _module_pin_keys(module: str) -> tuple[str, str, str]:
