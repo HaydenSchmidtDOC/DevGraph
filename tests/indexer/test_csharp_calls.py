@@ -214,8 +214,9 @@ def test_imports_are_the_classes_a_file_references_under_their_keys():
     by_name = {}
     for row in rows:
         by_name.setdefault(row.to_name, []).append(_keys(row))
-    assert by_name["Account"] == [{"Shop.Domain:Account"}]  # the alias's exact target
-    assert by_name["Formatting"] == [{"Shop.Text:Formatting"}]  # the `using static` type
+    # The alias's exact target, at each split (a type can be nested).
+    assert by_name["Account"] == [{"Shop.Domain:Account", "Shop:Domain.Account", ".:Shop.Domain.Account"}]
+    assert by_name["Formatting"] == [{"Shop.Text:Formatting", "Shop:Text.Formatting", ".:Shop.Text.Formatting"}]
     # `User` (Legacy.Accounts by the using) and `Shop.Domain.User` (qualified).
     users = sorted(by_name["User"], key=len)
     assert "Legacy.Accounts:User" in users[0] and "Shop.Domain:User" not in users[0]
@@ -332,9 +333,10 @@ def test_a_sites_namespaces_are_its_enclosing_ones_and_its_blocks_usings():
     assert _call_keys(source, "Run", "Go") >= {"Shop.Domain:Jobs", "Shop:Jobs", ".:Jobs", "Top:Jobs", "Inside:Jobs",
                                                "Elsewhere:Jobs"}
     other = [r for r in _rows(source, "src/A.cs") if r.to_name == "Go"]
-    # Inside's using is the Shop block's alone.
+    # Inside's using is the Shop block's alone, and relative to Shop too.
     assert {frozenset(_keys(r)) for r in other} == {
-        frozenset({"Shop.Domain:Jobs", "Shop:Jobs", ".:Jobs", "Top:Jobs", "Inside:Jobs", "Shop.Domain:Service.Jobs"}),
+        frozenset({"Shop.Domain:Jobs", "Shop:Jobs", ".:Jobs", "Top:Jobs", "Inside:Jobs", "Shop.Inside:Jobs",
+                   "Shop.Domain:Service.Jobs"}),
         frozenset({"Elsewhere:Jobs", ".:Jobs", "Top:Jobs", "Elsewhere:Other.Jobs"}),
     }
     # A qualified name, relative to the global namespace and each enclosing one.
@@ -354,9 +356,11 @@ def test_aliases_name_their_exact_target_and_a_using_static_its_type():
 
         class Program { void Main() { LA.User.Parse(); J.Run(); Title(); } }
     """
-    assert _call_keys(source, "Main", "Parse") == {"Legacy.Accounts:User"}
-    assert _call_keys(source, "Main", "Run") == {"Shop:Jobs"}
-    assert _call_keys(source, "Main", "Title") == {"Shop.Text:Formatting"}
+    assert _call_keys(source, "Main", "Parse") == {"Legacy.Accounts:User", "Legacy:Accounts.User",
+                                                    ".:Legacy.Accounts.User"}
+    assert _call_keys(source, "Main", "Run") == {"Shop:Jobs", ".:Shop.Jobs"}
+    assert _call_keys(source, "Main", "Title") == {"Shop.Text:Formatting", "Shop:Text.Formatting",
+                                                    ".:Shop.Text.Formatting"}
 
 
 def test_a_projects_usings_and_global_usings_are_in_scope(tmp_path):
@@ -369,18 +373,100 @@ def test_a_projects_usings_and_global_usings_are_in_scope(tmp_path):
     config = ResolverConfig(tmp_path)
     source = "namespace App;\nclass Program { void Main() { Formatting.Title(); User.Make(); L.Parse(); Run(); } }\n"
     assert {"Shop.Text:Formatting", "Shop.Models:Formatting"} <= _call_keys(source, "Main", "Title", "App/P.cs", config)
-    assert _call_keys(source, "Main", "Parse", "App/P.cs", config) == {"Legacy:User"}
-    assert _call_keys(source, "Main", "Run", "App/P.cs", config) == {"Shop:Jobs"}
+    assert _call_keys(source, "Main", "Parse", "App/P.cs", config) == {"Legacy:User", ".:Legacy.User"}
+    assert _call_keys(source, "Main", "Run", "App/P.cs", config) == {"Shop:Jobs", ".:Shop.Jobs"}
     # A file outside every project has none of them.
     assert "Shop.Text:Formatting" not in _call_keys(source, "Main", "Title", "Scripts/P.cs", config)
     assert reached(source, "Scripts/P.cs", "Main", "Run", {}, config) == {"<name>": "name"}
 
 
-def test_more_candidate_keys_than_the_cap_drop_the_scope():
+def test_more_candidate_keys_than_the_cap_fall_back_to_the_class_file_each_group_on_its_own():
     usings = "".join(f"using N{i};\n" for i in range(MAX_SCOPE_KEYS))
-    source = usings + "namespace A;\nclass C { void Run() { Jobs.Go(); } }\n"
-    rows = [r for r in _rows(source, "src/C.cs") if r.to_name == "Go"]
-    assert [r.to_file for r in rows] == ["/.?.cs^"]
+    source = usings + "namespace A;\nclass C { void Run(User u) { Jobs.Go(); u.Save(); } }\n"
+    rows = _rows(source, "src/C.cs")
+    # Over the cap: the class file, as before match keys (never any C# file).
+    assert [r.to_file for r in rows if r.to_name == "Go"] == ["/Jobs.cs^"]
+    assert sorted(r.to_file for r in rows if r.to_name == "Save") == ["/User.cs^", "/UserExtensions.cs^"]
+    # The extension import needs its keys: none over the cap.
+    assert [r.to_name for r in _rows(source, "src/C.cs", "IMPORTS") if r.to_label == "Function"] == []
+    # Half as many namespaces: two pins, each under the cap on its own.
+    usings = "".join(f"using N{i};\n" for i in range(MAX_SCOPE_KEYS // 2 + 2))
+    rows = _rows(usings + "namespace A;\nclass C { void Run(User u) { u.Save(); } }\n", "src/C.cs")
+    pins = sorted(r.to_file for r in rows if r.to_name == "Save")
+    assert len(pins) == 2 and all(pin.startswith("/.?.cs^@") for pin in pins)
+    assert {len(split_pin(pin).scope) for pin in pins} == {MAX_SCOPE_KEYS // 2 + 4, MAX_SCOPE_KEYS // 2 + 5}
+
+
+def test_system_and_microsoft_usings_are_no_candidates():
+    source = """
+        using System;
+        using System.Linq;
+        using Microsoft.Extensions.Logging;
+        using Shop.Models;
+
+        namespace App;
+
+        class C { void Run() { Jobs.Go(); } }
+    """
+    assert _call_keys(source, "Run", "Go") == {"App:Jobs", ".:Jobs", "Shop.Models:Jobs", "App:C.Jobs"}
+
+
+def test_a_nested_type_through_a_using_static_an_alias_or_a_qualified_name():
+    source = """
+        using static Shop.Outer.Inner;
+        using IA = Shop.Outer.Inner;
+
+        namespace App;
+
+        class C { void Run() { Go(); IA.Make(); Shop.Outer.Inner.Stop(); global::Shop.Outer.Inner.Halt(); } }
+    """
+    for callee in ("Go", "Make", "Stop", "Halt"):
+        assert "Shop:Outer.Inner" in _call_keys(source, "Run", callee), callee
+    # `global::` is the global namespace's alone.
+    assert _call_keys(source, "Run", "Halt") == {"Shop.Outer:Inner", "Shop:Outer.Inner", ".:Shop.Outer.Inner"}
+    assert "App.Shop.Outer:Inner" in _call_keys(source, "Run", "Stop")
+
+
+def test_a_library_type_is_the_leftmost_name_alone_and_a_generic_type_its_simple_name():
+    source = """
+        namespace App;
+
+        class C { void Run() { Contoso.Directory.UserStore.Get(); Directory.Exists(); Svc<int>.Make(); } }
+    """
+    assert "Contoso.Directory:UserStore" in _call_keys(source, "Run", "Get")
+    assert reached(source, "src/C.cs", "Run", "Exists") == {}
+    assert "App:Svc" in _call_keys(source, "Run", "Make")
+
+
+def test_a_local_function_called_above_its_declaration_links_nothing():
+    source = "class C { void Run() { Helper(); void Helper() { } } }\n"
+    assert [r for r in _rows(source, "src/C.cs") if r.to_name == "Helper"] == []
+
+
+def test_an_alias_is_its_namespace_blocks_alone():
+    source = """
+        namespace A { using J = Shop.Jobs; class C { void Run() { J.Go(); } } }
+        namespace B { class D { void Run() { J.Go(); } } }
+    """
+    keys = [_keys(r) for r in _rows(source, "src/C.cs") if r.to_name == "Go"]
+    assert {"Shop:Jobs", "A.Shop:Jobs"} <= keys[0] or {"Shop:Jobs", "A.Shop:Jobs"} <= keys[1]
+    assert any("B:J" in each for each in keys)  # in B, J is no alias
+
+
+def test_verbatim_identifiers_and_a_constraints_extension_key():
+    keys = _mkeys("""
+        namespace @Shop.Models
+        {
+            public class @event { void @Run() { } }
+
+            public static class RepoExtensions
+            {
+                public static void Touch<T>(this T repo) where T : IRepo, new() { }
+            }
+        }
+    """)
+    assert keys[("Class", "@event")] == ["Shop.Models:event"]
+    assert keys[("Function", "Touch")] == ["Shop.Models:+IRepo", "Shop.Models:RepoExtensions"]
 
 
 # --- live --------------------------------------------------------------------------

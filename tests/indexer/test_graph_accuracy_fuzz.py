@@ -49,7 +49,7 @@ The spec's "Out of scope" gaps are left out by construction:
 - no datastore or route code (so no handler stub either);
 - no method moves out of its type's file: only free functions move, and the
   Go method and Rust inherent `impl` stay with their type;
-- no C#/TS partial classes;
+- no TS partial classes (C#'s Jobs is partial over two files);
 - the default `mentions_ambiguous_mode` (`all`);
 - a docs note's `id` never changes in place;
 - a renamed docs note's old path is removed before its new path is indexed,
@@ -128,6 +128,7 @@ class File:
     supersedes: str | None = None
     pins: list = field(default_factory=list)  # py: "calls <name> <pin>" / "imports <pin>"
     methods: list = field(default_factory=list)  # cpp: out-of-class definitions, "Widget::draw"
+    block: bool = False  # cs: a block namespace, its `using`s inside it
 
     def copy(self):
         return replace(
@@ -167,15 +168,24 @@ def render(f: File) -> str:
         ]
         return "".join(parts)
     if f.kind == "cs":
-        # One class per file, its methods calling in every style.
+        # One class per file (Jobs partial), with a field and a parameter
+        # its methods call through as well as every other style, then any
+        # fixed code (`extra`), in a file-scoped, block or no namespace.
         ((cls, base),) = f.bases.items()
-        parts = [f"{m}\n" for m in f.imports] + [f"namespace {f.head};\n\npublic class {cls}"]
-        parts.append((f" : {base}" if base else "") + "\n{\n")
-        parts += [
-            f"    public void {name}()\n    {{\n" + "".join(f"        {g}();\n" for g in calls) + "    }\n"
+        inner = [m for m in f.imports if f.block and f.head and m.startswith("using ")]
+        head = "".join(f"{m}\n" for m in f.imports if m not in inner)
+        body = f"public {'partial ' if cls == 'Jobs' else ''}class {cls}" + (f" : {base}" if base else "") + "\n{\n"
+        body += "    private Jobs _jobs;\n"
+        body += "".join(
+            f"    public void {name}(Base p)\n    {{\n" + "".join(f"        {g}();\n" for g in calls) + "    }\n"
             for name, calls in f.funcs.items()
-        ]
-        return "".join(parts) + "}\n"
+        )
+        body += "}\n" + f.extra
+        if not f.head:
+            return head + body
+        if f.block:
+            return head + f"namespace {f.head}\n{{\n" + "".join(f"{m}\n" for m in inner) + body + "}\n"
+        return head + f"namespace {f.head};\n\n" + body
     if f.kind == "cpp":
         # Classes, out-of-class method definitions (a Class stub for their
         # qualifier), and free functions with a typed local, so a typed
@@ -327,7 +337,19 @@ def initial_repo() -> dict:
         "cs/Jobs.cs": File("cs", head="Shop", bases={"Jobs": None}, funcs={"Run": [], "Stop": []}),
         "cs/Program.cs": File("cs", head="Shop.App", imports=["using Shop;"], bases={"Program": "Jobs"},
                               funcs={"Main": ["Jobs.Run", "Stop", "new Jobs().Stop"]}),
-        "cs/Models/Base.cs": File("cs", head="Shop.Models", bases={"Base": None}, funcs={"Helper": []}),
+        "cs/Models/Base.cs": File("cs", head="Shop.Models", bases={"Base": None}, funcs={"Helper": []},
+                                  extra=CS_NESTED),
+        # Jobs's other part, its extension methods, a block namespace with a
+        # relative `using Models;` (Shop.App.Models or Shop.Models), the
+        # global namespace, and more namespaces in scope than a pin's keys.
+        "cs/Jobs.Part.cs": File("cs", head="Shop", bases={"Jobs": None}, funcs={"Halt": ["Run", "Tidy"]}),
+        "cs/JobsExtensions.cs": File("cs", head="Shop", bases={"Ext": None}, funcs={"Use": ["_jobs.Tidy"]},
+                                     extra=CS_EXTENSIONS),
+        "cs/Block.cs": File("cs", head="Shop.App", block=True, imports=["using Models;", "using Shop;"],
+                            bases={"Block": None}, funcs={"Go": ["p.Helper", "_jobs.Tidy", "Outer.Inner.Run"]}),
+        "cs/Global.cs": File("cs", head="", bases={"Root": None}, funcs={"Run": ["Jobs.Run", "_jobs.Stop"]}),
+        "cs/Wide.cs": File("cs", head="Shop.Wide", imports=[f"using N{i};" for i in range(40)] + ["using Shop;"],
+                           bases={"Wide": None}, funcs={"Spread": ["Jobs.Run", "_jobs.Stop", "p.Helper"]}),
         "scripts/Tool.cs": File("cs", head="Tools", imports=["global using Shop.Models;"], bases={"Tool": None}),
         "cpp/util/strings.h": File("cpp", funcs={"trim": []}),
         "cpp/util/strings.cpp": File("cpp", imports=['#include "strings.h"'], methods=["Widget::draw"],
@@ -370,7 +392,7 @@ IMPORTS = {
     ],
     "rs": ["use crate::display::Display;", "use crate::foo::Foo;", "use shop_core::util;", "mod display;",
            "use crate::util::tidy;", "use super::display::render;"],
-    "cs": ["using Shop;", "using Shop.Models;", "using static Shop.Jobs;", "using J = Shop.Jobs;"],
+    "cs": ["using Shop;", "using Shop.Models;", "using static Shop.Jobs;", "using J = Shop.Jobs;", "using Models;"],
     "cpp": ['#include "util/strings.h"', '#include "strings.h"', '#include "widget.h"',
             '#include "../cpp/util/strings.h"', "#include <vector>"],
     "go": ["example.com/fz/a", "example.com/fz/b", "example.com/top/go/b", "example.com/bee", "example.com/ext"],
@@ -402,10 +424,15 @@ KT_CALLS = ["{n}", "Clock().{n}", "x.{n}"]
 RS_CALLS = ["{n}", "display::{n}", "crate::foo::{n}", "shop_core::{n}", "shop_core::util::{n}", "Foo::{n}",
             "x.{n}"]
 # How a C# call to `{n}` is written: bare, on `this`/`base`, static, through
-# an alias or a qualified name, on a new or an untyped object.
-CS_CALLS = ["{n}", "this.{n}", "base.{n}", "Jobs.{n}", "J.{n}", "Shop.Models.Base.{n}", "new Jobs().{n}", "obj.{n}"]
-# The namespaces a C# file's class moves between.
-CS_NAMESPACES = ["Shop", "Shop.App", "Shop.Models", "Tools", "Legacy"]
+# an alias, a qualified name or a nested type, on a new object, a typed field
+# or parameter, or an untyped object.
+CS_CALLS = ["{n}", "this.{n}", "base.{n}", "Jobs.{n}", "J.{n}", "Shop.Models.Base.{n}", "Outer.Inner.{n}",
+            "new Jobs().{n}", "_jobs.{n}", "p.{n}", "obj.{n}"]
+# The namespaces a C# file's class moves between ("" the global one).
+CS_NAMESPACES = ["Shop", "Shop.App", "Shop.Models", "Tools", "Legacy", ""]
+# A C# extension class of Jobs, and a nested type, as fixed code after a file's class.
+CS_EXTENSIONS = "\npublic static class JobsExtensions\n{\n    public static void Tidy(this Jobs jobs) { }\n}\n"
+CS_NESTED = "\npublic class Outer\n{\n    public class Inner\n    {\n        public static void Run() { }\n    }\n}\n"
 # How a C++ call to `{n}` is written: bare, namespace-qualified, on a typed or an untyped value.
 CPP_CALLS = ["{n}", "util::{n}", "w.{n}", "obj->{n}"]
 # C++ out-of-class method definitions: of a header's class, of a class
@@ -443,7 +470,7 @@ class Fuzz:
         return self.rng.choice(paths) if paths else None
 
     def _func_names(self) -> list:
-        return sorted({n for f in self.files.values() for n in f.funcs} | {"Run", "new", "missing_fn"})
+        return sorted({n for f in self.files.values() for n in f.funcs} | {"Run", "new", "missing_fn", "Tidy"})
 
     @staticmethod
     def _styled(kind: str, names: list) -> list:
@@ -951,3 +978,66 @@ def test_graph_accuracy_fuzz(engine, repo_id, tmp_path, seed):
                             mentions_enabled=True)
             resync(touched | folders)
         check(engine, repo_id, root, seed, step, log)
+
+
+class _Scripted:
+    """An rng whose choices are given in advance: each `choice` or `sample`
+    returns the next of `picks`, which must be one the call could make."""
+
+    def __init__(self, picks):
+        self.picks = list(picks)
+
+    def choice(self, options):
+        pick = self.picks.pop(0)
+        assert pick in options, (pick, options)
+        return pick
+
+    def sample(self, options, k):
+        pick = self.picks.pop(0)
+        assert len(pick) == k and set(pick) <= set(options), (pick, options)
+        return pick
+
+
+def test_cs_rekey_ops_retract_callers_in_other_files(engine, repo_id, tmp_path, monkeypatch):
+    """Each C# rekeying operation changes a node's match keys under edges
+    other files' `@` pins gave it: the batch retracts those edges and the
+    graph still equals a fresh scan."""
+    retracted = []
+    real = GraphEngine.write_match_keys
+
+    def write_match_keys(self, repo, nodes):
+        for label, name, file, _keys, retract in nodes:
+            if retract:
+                retracted.append(self.run_cypher(
+                    f"MATCH (a)-[r:CALLS|IMPORTS]->(b:{label} {{repo_id: $r, name: $n, file: $f}}) "
+                    "WHERE coalesce(a.file, a.source_file) <> $f RETURN count(r) AS n",
+                    {"r": repo, "n": name, "f": file},
+                )[0]["n"])
+        return real(self, repo, nodes)
+
+    monkeypatch.setattr(GraphEngine, "write_match_keys", write_match_keys)
+    fuzz = Fuzz(random.Random(0))
+    root = tmp_path
+    fuzz.write(root, set(fuzz.files))
+    provision_repository_schema(engine, root)
+    engine.upsert_repository(repo_id, repo_id, str(root))
+    full_scan(engine, repo_id, root, docs_path=DOCS, mentions_enabled=True)
+    steps = [
+        # Jobs.cs's Run becomes Root's (Shop:Jobs to Shop:Root) under Program's and Wide's Jobs.Run.
+        ("cs_move_class", [["cs/Jobs.cs", "cs/Global.cs"]]),
+        # Base.cs's class is named Jobs: its Helper's key changes under Block's and Wide's p.Helper.
+        ("cs_dup_class", [["cs/Global.cs", "cs/Models/Base.cs"]]),
+        # Tidy's extension key moves to the global namespace under Block's and Use's _jobs.Tidy.
+        ("cs_namespace", ["cs/JobsExtensions.cs", ""]),
+        # Jobs (now in Global.cs) moves from the global namespace to Shop under the Jobs.Run calls.
+        ("cs_namespace", ["cs/Global.cs", "Shop"]),
+    ]
+    for step, (op, picks) in enumerate(steps):
+        fuzz.rng = _Scripted(picks)
+        description, touched = getattr(fuzz, f"op_{op}")()
+        retracted.clear()
+        fuzz.write(root, touched)
+        index_paths(engine, repo_id, root, {root / rel for rel in touched}, docs_path=DOCS, mentions_enabled=True)
+        assert any(retracted), f"{description}: no edge from another file retracted"
+        check(engine, repo_id, root, "scripted", step, [description])
+

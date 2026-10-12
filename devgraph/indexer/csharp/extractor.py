@@ -96,7 +96,7 @@ from typing import NamedTuple
 import tree_sitter_c_sharp as tscsharp
 from tree_sitter import Language, Node, Parser
 
-from devgraph.graph.schema import scoped_pin
+from devgraph.graph.schema import MAX_SCOPE_KEYS, scoped_pin
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, call_rows
 from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
 from devgraph.indexer.resolver_config import CsUsing, ResolverConfig
@@ -276,7 +276,8 @@ class _CsType(NamedTuple):
 
 def _dotted(node: Node | None, source: bytes) -> str | None:
     """A name or member access written as a dotted name (`A.B.C`), type
-    arguments and `global::` left off; None for anything else."""
+    arguments and an extern alias left off, `global::` kept; None for
+    anything else."""
     if node is None:
         return None
     kind = node.type
@@ -286,7 +287,9 @@ def _dotted(node: Node | None, source: bytes) -> str | None:
         ident = next((c for c in node.named_children if c.type == "identifier"), None)
         return _text(ident, source) if ident is not None else None
     if kind == "alias_qualified_name":
-        return _dotted(node.child_by_field_name("name"), source)
+        alias = node.child_by_field_name("alias")
+        name = _dotted(node.child_by_field_name("name"), source)
+        return f"global::{name}" if name is not None and alias is not None and _text(alias, source) == "global" else name
     if kind in ("qualified_name", "member_access_expression"):
         head = _dotted(node.child_by_field_name("qualifier") or node.child_by_field_name("expression"), source)
         tail = _dotted(node.child_by_field_name("name"), source)
@@ -294,11 +297,18 @@ def _dotted(node: Node | None, source: bytes) -> str | None:
     return None
 
 
-def _key(dotted: str) -> str:
-    """The match key of the type `dotted` names (`A.B.T`): `A.B:T`, `.:T`
-    in the global namespace."""
-    namespace, _dot, name = dotted.rpartition(".")
-    return f"{namespace or _GLOBAL_NS}:{name}"
+def _splits(dotted: str) -> set[str]:
+    """Every match key the type `dotted` (`A.B.T`) can have, one per split
+    into a namespace and a type path, as a type can be nested in another:
+    `A.B:T`, `A:B.T` and `.:A.B.T`."""
+    parts = dotted.split(".")
+    return {f"{'.'.join(parts[:i]) or _GLOBAL_NS}:{'.'.join(parts[i:])}" for i in range(len(parts))}
+
+
+def _global(node: Node, source: bytes) -> str:
+    """`global::` for a name written `global::T`, else nothing."""
+    alias = node.child_by_field_name("alias")
+    return "global::" if alias is not None and _text(alias, source) == "global" else ""
 
 
 def _type_refs(node: Node | None, source: bytes, qualifier: str = "") -> list[tuple[str, str]]:
@@ -314,7 +324,7 @@ def _type_refs(node: Node | None, source: bytes, qualifier: str = "") -> list[tu
         return _type_refs(node.child_by_field_name("name"), source,
                           _dotted(node.child_by_field_name("qualifier"), source) or "")
     if kind == "alias_qualified_name":
-        return _type_refs(node.child_by_field_name("name"), source, qualifier)
+        return _type_refs(node.child_by_field_name("name"), source, _global(node, source) or qualifier)
     if kind == "generic_name":
         found = []
         for child in node.named_children:
@@ -352,7 +362,7 @@ def _declared_type(node: Node | None, source: bytes, qualifier: str = "") -> _Cs
         return _declared_type(node.child_by_field_name("name"), source,
                               _dotted(node.child_by_field_name("qualifier"), source) or "")
     if kind == "alias_qualified_name":
-        return _declared_type(node.child_by_field_name("name"), source, qualifier)
+        return _declared_type(node.child_by_field_name("name"), source, _global(node, source) or qualifier)
     if kind == "nullable_type":
         return _declared_type(node.child_by_field_name("type") or next(iter(node.named_children), None), source)
     if kind == "generic_name":
@@ -378,6 +388,7 @@ def _using(node: Node, source: bytes) -> CsUsing | None:
     name = _dotted(target, source)
     if name is None:
         return None
+    name = name.removeprefix("global::")
     return CsUsing(name, any(c.type == "static" for c in node.children), _text(alias, source) if alias else "")
 
 
@@ -385,14 +396,16 @@ class _CsScope(NamedTuple):
     """What a site's type names can mean: `chain` the namespaces enclosing
     it, innermost first (`A.B`, `A`); `namespaces` every namespace whose
     types it names unqualified (the chain, the global namespace and the
-    usings in scope: the namespace blocks', the file's and its project's);
-    `aliases` each using alias's target; `statics` the `using static`
-    types."""
+    usings in scope: the namespace blocks', the file's and its project's,
+    `System` and `Microsoft` ones left out); `aliases` each using alias's
+    target, and `statics` each `using static` type, as the dotted names it
+    can be (a namespace block's using is relative to each enclosing
+    namespace too)."""
 
     chain: tuple[str, ...]
     namespaces: frozenset[str]
-    aliases: dict[str, str]
-    statics: tuple[str, ...]
+    aliases: dict[str, tuple[str, ...]]
+    statics: tuple[tuple[str, ...], ...]
 
     @property
     def namespace(self) -> str:
@@ -403,15 +416,71 @@ class _CsClass:
     def __init__(self) -> None:
         self.methods: set[str] = set()
         self.fields: dict[str, _CsType | None] = {}
-        self.bases: list[tuple[str, frozenset[str]]] = []  # (simple name, match keys)
+        # (name as written, the class it names or None for none or a library type, its match keys)
+        self.bases: list[tuple[str, str | None, frozenset[str]]] = []
         self.keys: set[str] = set()  # its own match keys, `Ns:Outer.Name`
         self.partial = False
 
 
+def _clean(keys) -> set[str]:
+    """Match keys as a pin writes them: a verbatim identifier's `@` left off."""
+    return {key.replace("@", "") for key in keys}
+
+
+def _key_group(keys: set[str], fallback) -> list[str]:
+    """One group of a site's match keys as pins: one pin to any C# file
+    whose node holds one of them, or, with more than MAX_SCOPE_KEYS, the
+    `fallback` filename pins (`/T.cs^`, as before match keys)."""
+    keys = _clean(keys)
+    if not keys:
+        return []
+    if len(keys) <= MAX_SCOPE_KEYS:
+        return [scoped_pin(_ANY_CS_FILE, keys)]
+    return sorted({pin.replace("@", "") for pin in fallback})
+
+
+class _Target:
+    """Where a call site's callee can be: files, and two groups of match
+    keys, each capped on its own: the types' (`Ns:T`, falling back to each
+    type's class file `/T.cs^`) and their extension methods' (`Ns:+T`,
+    falling back to `/TExtensions.cs^`)."""
+
+    def __init__(self) -> None:
+        self.files: set[str] = set()
+        self.keys: set[str] = set()
+        self.types: set[str] = set()  # the types `keys` are of
+        self.extension_keys: set[str] = set()
+        self.extended: set[str] = set()  # the types `extension_keys` are of
+
+    def __bool__(self) -> bool:
+        return bool(self.files or self.keys or self.extension_keys)
+
+    def add(self, other: _Target) -> None:
+        self.files |= other.files
+        self.keys |= other.keys
+        self.types |= other.types
+        self.extension_keys |= other.extension_keys
+        self.extended |= other.extended
+
+    def pins(self) -> list[str]:
+        return (sorted(self.files) + _key_group(self.keys, (f"/{name}.cs^" for name in self.types))
+                + _key_group(self.extension_keys, (f"/{name}Extensions.cs^" for name in self.extended)))
+
+
+def _library_namespace(name: str) -> bool:
+    """`System`, `Microsoft` or a namespace under one, which hold no
+    repository type."""
+    return name.split(".", 1)[0] in ("System", "Microsoft")
+
+
+def _leftmost(qualifier: str) -> str:
+    return qualifier.removeprefix("global::").split(".", 1)[0]
+
+
 class _CsResolver:
     """What one C# file's names refer to: its classes (members, fields and
-    bases, partial parts merged), its using aliases, the type parameters it
-    declares, and each site's namespaces (`scope`)."""
+    bases, partial parts merged), the type parameters it declares, and each
+    site's namespaces and aliases (`scope`)."""
 
     def __init__(self, root: Node, source: bytes, file_path: str, project_usings: tuple[CsUsing, ...] = ()) -> None:
         self.source = source
@@ -422,17 +491,20 @@ class _CsResolver:
         self.imports: dict[str, set[str]] = {}  # class name -> IMPORTS pins
         self.extension_imports: dict[str, set[str]] = {}  # method name -> IMPORTS pins
         self._scopes: dict[int | None, _CsScope] = {}
-        usings = [*project_usings, *(u for c in root.named_children if c.type == "using_directive"
-                                     if (u := _using(c, source)) is not None)]
         file_ns = next((c for c in root.named_children if c.type == "file_scoped_namespace_declaration"), None)
         self._file_namespace = _dotted(file_ns.child_by_field_name("name"), source) if file_ns is not None else None
-        self._unit_usings = usings
-        self._block_usings: list[CsUsing] = []
+        # The file's usings before a file-scoped namespace are absolute, those after it inside it.
+        self._unit_usings = list(project_usings)
+        self._file_ns_usings = []
+        for child in root.named_children:
+            if child.type == "using_directive" and (using := _using(child, source)) is not None:
+                inside = file_ns is not None and child.start_byte > file_ns.start_byte
+                (self._file_ns_usings if inside else self._unit_usings).append(using)
+        for each in _descendants(root, "type_parameter"):
+            name = each.child_by_field_name("name")
+            if name is not None:
+                self.type_params.add(_text(name, source))
         self._collect(root, ())
-        # A name written as a type, by its alias: the target's simple name.
-        self.aliases: dict[str, str] = {
-            u.alias: u.name.rpartition(".")[2] for u in usings + self._block_usings if u.alias
-        }
         self.methods: set[str] = set().union(*(info.methods for info in self.classes.values()))  # declared here
 
     def scope(self, node: Node) -> _CsScope:
@@ -446,20 +518,29 @@ class _CsResolver:
         cache = blocks[0].start_byte if blocks else None
         if cache in self._scopes:
             return self._scopes[cache]
-        names = [self._file_namespace] if self._file_namespace else []
-        usings = list(self._unit_usings)
+
+        def prefixes(parts: list[str]) -> list[str]:
+            return [".".join(parts[:i]) for i in range(len(parts), 0, -1)]
+
+        def relative(using: CsUsing, parts: list[str]) -> tuple[CsUsing, tuple[str, ...]]:
+            return using, (using.name, *(f"{prefix}.{using.name}" for prefix in prefixes(parts)))
+
+        parts = [part for part in (self._file_namespace or "").split(".") if part]
+        usings = [(using, (using.name,)) for using in self._unit_usings]
+        usings += [relative(using, parts) for using in self._file_ns_usings]
         for block in reversed(blocks):
-            names.append(_dotted(block.child_by_field_name("name"), self.source) or "")
+            parts += [part for part in (_dotted(block.child_by_field_name("name"), self.source) or "").split(".")
+                      if part]
             body = block.child_by_field_name("body")
-            usings += [u for c in (body.named_children if body is not None else [])
+            usings += [relative(u, parts) for c in (body.named_children if body is not None else [])
                        if c.type == "using_directive" if (u := _using(c, self.source)) is not None]
-        parts = [part for name in names for part in name.split(".") if part]
-        chain = tuple(".".join(parts[:i]) for i in range(len(parts), 0, -1))
+        chain = tuple(prefixes(parts))
         found = _CsScope(
             chain,
-            frozenset({*chain, _GLOBAL_NS, *(u.name for u in usings if not u.static and not u.alias)}),
-            {u.alias: u.name for u in usings if u.alias},
-            tuple(sorted({u.name for u in usings if u.static and not u.alias})),
+            frozenset({*chain, _GLOBAL_NS, *(name for using, names in usings if not using.static and not using.alias
+                                             for name in names if not _library_namespace(name))}),
+            {using.alias: names for using, names in usings if using.alias},
+            tuple(sorted({names for using, names in usings if using.static and not using.alias})),
         )
         self._scopes[cache] = found
         return found
@@ -467,23 +548,31 @@ class _CsResolver:
     def type_keys(self, qualifier: str, name: str, scope: _CsScope, classes: list[str]) -> set[str]:
         """The match keys the type `qualifier.name`, written at a site in
         `scope` inside `classes` (innermost first), can have: an alias's
-        target; unqualified, the name in each of the site's namespaces and
-        nested in each enclosing class (`Ns:Outer.Inner`); qualified `A.B.T`,
-        `A.B:T` relative to the global namespace and to each enclosing one,
-        and `T` nested in a type `A.B` of the site's namespaces."""
+        target, split at each dot (`_splits`: a type can be nested);
+        unqualified, the name in each of the site's namespaces and nested in
+        each enclosing class (`Ns:Outer.Inner`); qualified `A.B.T`, each
+        split of it relative to the global namespace (`global::` only
+        there) and the splits within it relative to each enclosing
+        namespace, and `A.B.T` nested in a type `A` of the site's
+        namespaces."""
         if not qualifier:
             if name in scope.aliases:
-                return {_key(scope.aliases[name])}
+                return set().union(*(_splits(target) for target in scope.aliases[name]))
             path = list(reversed(classes))
             return {f"{namespace}:{name}" for namespace in scope.namespaces} | {
                 f"{scope.namespace}:{'.'.join([*path[:i], name])}" for i in range(1, len(path) + 1)
             }
+        if qualifier.startswith("global::"):
+            return _splits(".".join(part for part in (qualifier.removeprefix("global::"), name) if part))
         head, _dot, rest = qualifier.partition(".")
         if head in scope.aliases:
-            return {_key(".".join(part for part in (scope.aliases[head], rest, name) if part))}
-        return {f"{qualifier}:{name}"} | {f"{prefix}.{qualifier}:{name}" for prefix in scope.chain} | {
-            f"{namespace}:{qualifier}.{name}" for namespace in scope.namespaces
-        }
+            return set().union(*(_splits(".".join(part for part in (target, rest, name) if part))
+                                 for target in scope.aliases[head]))
+        dotted = f"{qualifier}.{name}"
+        keys = _splits(dotted) | {f"{namespace}:{dotted}" for namespace in scope.namespaces}
+        for prefix in scope.chain:
+            keys |= {f"{prefix}.{key}" for key in _splits(dotted) if not key.startswith(_GLOBAL_NS + ":")}
+        return keys
 
     def _collect(self, node: Node, path: tuple[str, ...]) -> None:
         source = self.source
@@ -496,16 +585,18 @@ class _CsResolver:
                 cls = self.classes.setdefault(_text(name, source), _CsClass())
                 self.types.add(_text(name, source))
                 scope = self.scope(child)
-                cls.keys.add(f"{scope.namespace}:{'.'.join([*path, _text(name, source)])}")
+                cls.keys |= _clean({f"{scope.namespace}:{'.'.join([*path, _text(name, source)])}"})
                 cls.partial |= any(c.type == "modifier" and _text(c, source) == "partial" for c in child.children)
                 base_list = next((c for c in child.named_children if c.type == "base_list"), None)
                 for base in base_list.named_children if base_list is not None else []:
                     refs = _type_refs(base, source)
                     if refs:
                         qualifier, base_name = refs[0]
-                        cls.bases.append(
-                            (base_name, frozenset(self.type_keys(qualifier, base_name, scope, list(reversed(path)))))
-                        )
+                        resolved = base_name if qualifier else self.type_name(base_name, scope)
+                        if resolved in STOP_TYPES["csharp"] or _leftmost(qualifier) in STOP_TYPES["csharp"]:
+                            resolved = None
+                        keys = self.type_keys(qualifier, base_name, scope, list(reversed(path))) if resolved else ()
+                        cls.bases.append((base_name, resolved, frozenset(keys)))
                 body = child.child_by_field_name("body")
                 for member in body.named_children if body is not None else []:
                     if member.type in _METHOD_LIKE:
@@ -530,80 +621,72 @@ class _CsResolver:
             elif kind in ("namespace_declaration",):
                 body = child.child_by_field_name("body")
                 if body is not None:
-                    self._block_usings += [u for c in body.named_children if c.type == "using_directive"
-                                           if (u := _using(c, source)) is not None]
                     self._collect(body, path)
-        for each in _descendants(node, "type_parameter"):
-            name = each.child_by_field_name("name")
-            if name is not None:
-                self.type_params.add(_text(name, source))
 
-    def type_name(self, name: str) -> str | None:
-        """A name written as a type, as the class it names: an alias's
-        target; None for a type parameter or no class at all."""
-        name = self.aliases.get(name, name)
+    def type_name(self, name: str, scope: _CsScope) -> str | None:
+        """A name written unqualified as a type at a site in `scope`, as the
+        class it names: an alias's target's simple name; None for a type
+        parameter or no class at all."""
+        if name in scope.aliases:
+            name = scope.aliases[name][0].rpartition(".")[2]
         if name in self.type_params or name in _NOT_TYPES:
             return None
         return name
 
     def type_target(
         self, written: _CsType, method: str, scope: _CsScope, classes: list[str], instance: bool,
-    ) -> tuple[set[str], set[str]] | None:
-        """Where `method` of the type `written` is, as (files, match keys):
-        a class declared here, as `class_target` finds it (this file for
-        another type declared here); another file's type by its keys
-        (`type_keys`), and on an instance also the extension methods of it
-        the site's namespaces hold (`Ns:+T`), which the file then imports;
-        None for a library type."""
-        resolved = self.type_name(written.name) if not written.qualifier else written.name
+    ) -> _Target | None:
+        """Where `method` of the type `written` is: a class declared here,
+        as `class_target` finds it (this file for another type declared
+        here); another file's type by its keys (`type_keys`), which the file
+        then imports, and on an instance also the extension methods of it
+        the site's namespaces hold (`Ns:+T`), which it imports too; None for
+        a library type."""
+        resolved = written.name if written.qualifier else self.type_name(written.name, scope)
         if resolved is None or resolved == "[]" or resolved in STOP_TYPES["csharp"]:
             return None
-        if any(part in STOP_TYPES["csharp"] for part in written.qualifier.split(".")):
+        if _leftmost(written.qualifier) in STOP_TYPES["csharp"]:
             return None  # a library type's member (`DateTime.UtcNow`)
-        files: set[str] = set()
-        keys: set[str] = set()
+        target = _Target()
         if not written.qualifier and resolved in self.types:
-            files, keys = self.class_target(resolved, method) if resolved in self.classes else (set(), set())
-            if not files and not keys and not instance:
-                files = {self.file_path}
+            if resolved in self.classes:
+                target = self.class_target(resolved, method)
+            if not target and not instance:
+                target.files.add(self.file_path)
         else:
-            keys = self.type_keys(written.qualifier, written.name, scope, classes)
-            self.imports.setdefault(resolved, set()).add(scoped_pin(_ANY_CS_FILE, keys))
+            target.keys = self.type_keys(written.qualifier, written.name, scope, classes)
+            target.types.add(resolved)
+            self.imports.setdefault(resolved, set()).add(scoped_pin(_ANY_CS_FILE, _clean(target.keys)))
         if instance:
-            extensions = {f"{namespace}:+{resolved}" for namespace in scope.namespaces}
-            keys |= extensions
-            if method not in self.methods:
+            extensions = _clean({f"{namespace}:+{resolved}" for namespace in scope.namespaces})
+            target.extension_keys |= extensions
+            target.extended.add(resolved)
+            if method not in self.methods and len(extensions) <= MAX_SCOPE_KEYS:
                 self.extension_imports.setdefault(method, set()).add(scoped_pin(_ANY_CS_FILE, extensions))
-        return files, keys
+        return target
 
-    def class_target(
-        self, cls: str, method: str, seen: frozenset = frozenset(), own: bool = True,
-    ) -> tuple[set[str], set[str]]:
-        """Where `method` of class `cls` (declared here) is, as (files, match
-        keys): this file when the class (`own`) or an in-file base declares
-        it; else its other bases' keys, and for a partial class its own
-        keys (another part, in another file, can declare it)."""
+    def class_target(self, cls: str, method: str, seen: frozenset = frozenset(), own: bool = True) -> _Target:
+        """Where `method` of class `cls` (declared here) is: this file when
+        the class (`own`) or an in-file base declares it; else its other
+        bases' keys, and for a partial class its own keys (another part, in
+        another file, can declare it)."""
+        target = _Target()
         info = self.classes.get(cls)
         if info is None or cls in seen:
-            return set(), set()
+            return target
         if own and method in info.methods:
-            return {self.file_path}, set()
-        files: set[str] = set()
-        keys: set[str] = set(info.keys) if own and info.partial else set()
-        for base, base_keys in info.bases:
-            if base in self.classes:
-                found_files, found_keys = self.class_target(base, method, seen | {cls})
-                files |= found_files
-                keys |= found_keys
-            elif self.type_name(base) is not None and self.type_name(base) not in STOP_TYPES["csharp"]:
-                keys |= base_keys
-        return files, keys
-
-
-def _pins(files: set[str], keys: set[str]) -> list[str]:
-    """A call site's pins: each file, and one pin to any C# file whose node
-    has one of `keys` (with more than MAX_SCOPE_KEYS, any C# file)."""
-    return sorted(files) + ([scoped_pin(_ANY_CS_FILE, keys)] if keys else [])
+            target.files.add(self.file_path)
+            return target
+        if own and info.partial:
+            target.keys |= info.keys
+            target.types.add(cls)
+        for written, resolved, base_keys in info.bases:
+            if written in self.classes:
+                target.add(self.class_target(written, method, seen | {cls}))
+            elif base_keys:
+                target.keys |= base_keys
+                target.types.add(resolved)
+        return target
 
 
 def _descendants(node: Node, kind: str):
@@ -722,27 +805,24 @@ class _CsCalls:
         if not (member and name in STOP_METHODS["csharp"]):
             self.found.append((name, None, member))
 
-    def _own(self, name: str, start_at_bases: bool = False) -> tuple[set[str], set[str]]:
+    def _own(self, name: str, start_at_bases: bool = False) -> _Target:
         """`name` called unqualified, or on `this`/`base`: the enclosing
         classes and their bases, innermost first, up to the first that has
         it in this file (a `base.` call starts at the bases)."""
-        files: set[str] = set()
-        keys: set[str] = set()
+        target = _Target()
         for cls in self.classes:
-            found_files, found_keys = self.resolver.class_target(cls, name, own=not start_at_bases)
-            files |= found_files
-            keys |= found_keys
-            if files or start_at_bases:
+            target.add(self.resolver.class_target(cls, name, own=not start_at_bases))
+            if target.files or start_at_bases:
                 break
-        return files, keys
+        return target
 
     def _typed(self, written: _CsType, name: str, instance: bool) -> None:
         """A call of `name` on the type `written` (static) or an instance of it."""
         target = self.resolver.type_target(written, name, self.scope, self.classes, instance)
         if target is None:
             return
-        if target[0] or target[1]:
-            self.found.append((name, _pins(*target), False))
+        if target:
+            self.found.append((name, target.pins(), False))
         else:
             self._bare(name, True)
 
@@ -760,17 +840,19 @@ class _CsCalls:
             name = _text(function, source)
             if name in self.locals or name in self.variables:
                 return  # a local function or a delegate
-            files, keys = self._own(name)
-            if not files:
+            target = self._own(name)
+            if not target.files:
                 for static in self.scope.statics:
-                    simple = static.rpartition(".")[2]
+                    simple = static[0].rpartition(".")[2]
                     if simple in resolver.types:
-                        files.add(resolver.file_path)
+                        target.files.add(resolver.file_path)
                     elif simple not in STOP_TYPES["csharp"]:
-                        keys.add(_key(static))
-                        resolver.imports.setdefault(simple, set()).add(scoped_pin(_ANY_CS_FILE, {_key(static)}))
-            if files or keys:
-                self.found.append((name, _pins(files, keys), False))
+                        keys = set().union(*(_splits(each) for each in static))
+                        target.keys |= keys
+                        target.types.add(simple)
+                        resolver.imports.setdefault(simple, set()).add(scoped_pin(_ANY_CS_FILE, _clean(keys)))
+            if target:
+                self.found.append((name, target.pins(), False))
             else:
                 self._bare(name, False)
             return
@@ -788,9 +870,9 @@ class _CsCalls:
             return
         name = _member_name(member, source)
         if owner.type in ("this", "base"):
-            files, keys = self._own(name, start_at_bases=owner.type == "base")
-            if files or keys:
-                self.found.append((name, _pins(files, keys), False))
+            target = self._own(name, start_at_bases=owner.type == "base")
+            if target:
+                self.found.append((name, target.pins(), False))
             else:
                 self._bare(name, False)
             return
@@ -798,15 +880,15 @@ class _CsCalls:
             return
         static = None
         typed = None
-        if owner.type == "identifier":
-            text = _text(owner, source)
-            if text in self.variables or self._field(text)[0]:
+        if owner.type in ("identifier", "generic_name"):
+            text = _member_name(owner, source)
+            if owner.type == "identifier" and (text in self.variables or self._field(text)[0]):
                 typed = self.expr_type(owner)
                 if typed is None:
                     self._bare(name, True)
                     return
-            elif text[:1].isupper() or text in resolver.aliases:
-                static = _CsType(text)
+            elif text[:1].isupper() or text in self.scope.aliases:
+                static = _CsType(text)  # `T.M()`, `Svc<int>.M()`
             else:
                 self._bare(name, True)
                 return
@@ -816,12 +898,14 @@ class _CsCalls:
                 head = head.child_by_field_name("expression") or head.child_by_field_name("qualifier")
                 if head is None:
                     break
-            leftmost = _text(head, source) if head is not None and head.type == "identifier" else None
+            leftmost = _dotted(head, source) if head is not None and head.type in (
+                "identifier", "generic_name", "alias_qualified_name") else None
             last = owner.child_by_field_name("name")
             if head is not None and head.type == "this":
                 typed = self.expr_type(owner)
             elif (leftmost is not None and leftmost not in self.variables and not self._field(leftmost)[0]
-                  and leftmost[:1].isupper() and last is not None and _member_name(last, source)[:1].isupper()):
+                  and _leftmost(leftmost)[:1].isupper() and last is not None
+                  and _member_name(last, source)[:1].isupper()):
                 # A.B.Type.M(): a qualified type name.
                 qualifier = _dotted(owner.child_by_field_name("expression") or owner.child_by_field_name("qualifier"),
                                     source)
@@ -922,6 +1006,9 @@ def extract_csharp_file(
         body: Node, caller_label: str, caller_name: str, classes: list[str], variables: dict,
     ) -> None:
         collector = _CsCalls(resolver, classes, variables, resolver.scope(body))
+        # A local function can be called above its declaration.
+        collector.locals |= {_text(name, source_bytes) for each in _descendants(body, "local_function_statement")
+                             if (name := each.child_by_field_name("name")) is not None}
         collector.walk(body)
         for name, pins, member in collector.found:
             sites.add(caller_label, caller_name, classes[0] if classes else None, name, pins, member)
@@ -1054,6 +1141,14 @@ def extract_csharp_file(
         if first is not None and any(c.type == "modifier" and _text(c, source_bytes) == "this" for c in first.children):
             extended = _declared_type(first.child_by_field_name("type"), source_bytes)
             if extended is not None:
+                # `this T x where T : IRepo`: an extension method of IRepo.
+                for clause in (c for c in node.named_children if c.type == "type_parameter_constraints_clause"):
+                    target = next(iter(clause.named_children), None)
+                    constraint = next((c for c in clause.named_children if c.type == "type_parameter_constraint"), None)
+                    bound = _declared_type(constraint.child_by_field_name("type"), source_bytes) \
+                        if constraint is not None else None
+                    if target is not None and _text(target, source_bytes) == extended.name and bound is not None:
+                        extended = bound
                 keys.add(f"{namespace}:+{extended.name}")  # an extension method of `extended`
         result.relationships.append(
             GraphRelationship(
@@ -1081,16 +1176,18 @@ def extract_csharp_file(
     result.relationships += sites.rows(file_path, repo_id)
     for each in result.nodes:
         if each.label in ("Class", "Function"):
-            each.properties["mkeys"] = sorted(match_keys.get((each.label, each.name), ()))
+            each.properties["mkeys"] = sorted(_clean(match_keys.get((each.label, each.name), ())))
     # IMPORTS: the classes the file references, in whichever C# file declares
     # them under a key the reference can mean, and the extension methods its
     # typed receivers' calls can reach.
     for qualifier, name, node in _referenced_types(root, source_bytes):
-        resolved = resolver.type_name(name) if not qualifier else name
-        if resolved is None or resolved in resolver.types or resolved in STOP_TYPES["csharp"]:
+        scope = resolver.scope(node)
+        resolved = resolver.type_name(name, scope) if not qualifier else name
+        if (resolved is None or resolved in resolver.types or resolved in STOP_TYPES["csharp"]
+                or _leftmost(qualifier) in STOP_TYPES["csharp"]):
             continue
-        keys = resolver.type_keys(qualifier, name, resolver.scope(node), _enclosing_classes(node, source_bytes))
-        resolver.imports.setdefault(resolved, set()).add(scoped_pin(_ANY_CS_FILE, keys))
+        keys = resolver.type_keys(qualifier, name, scope, _enclosing_classes(node, source_bytes))
+        resolver.imports.setdefault(resolved, set()).add(scoped_pin(_ANY_CS_FILE, _clean(keys)))
     for to_label, imports in (("Class", resolver.imports), ("Function", resolver.extension_imports)):
         for name, pins in sorted(imports.items()):
             if to_label == "Class" and name in resolver.types:
