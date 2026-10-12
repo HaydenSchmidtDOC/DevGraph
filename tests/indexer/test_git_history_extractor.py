@@ -117,3 +117,65 @@ def test_an_initial_sync_reports_how_many_commits_it_will_read(tmp_path):
         assert counts == [3]
     finally:
         registry.close()
+
+
+@pytest.fixture(scope="module")
+def five_commit_origin(tmp_path_factory):
+    """pkg/a.py, b.py, c.py, d.py and e.py, one commit each, then an edit of a.py."""
+    origin = tmp_path_factory.mktemp("origin")
+    _run_git(origin, "init")
+    _run_git(origin, "config", "user.email", "test@example.com")
+    _run_git(origin, "config", "user.name", "Test Author")
+    (origin / "pkg").mkdir()
+    for name in ("a", "b", "c", "d", "e"):
+        (origin / f"pkg/{name}.py").write_text(f"{name} = 1\n")
+        _run_git(origin, "add", ".")
+        _run_git(origin, "commit", "-m", f"Add {name}")
+    (origin / "pkg/a.py").write_text("a = 2\n")
+    _run_git(origin, "commit", "-am", "Edit a")
+    return origin
+
+
+def _shallow_clone(origin: Path, dest: Path, depth: int) -> Path:
+    subprocess.run(
+        ["git", "clone", "--quiet", f"--depth={depth}", f"file://{origin}", str(dest)], capture_output=True, check=True
+    )
+    assert (dest / ".git/shallow").exists()
+    return dest
+
+
+def _modifies(result) -> dict[str, set[str]]:
+    by_message = {c.sha: c.properties["message"] for c in result.commits}
+    out: dict[str, set[str]] = {}
+    for r in result.relationships:
+        out.setdefault(by_message[r.source_name], set()).add(r.target_name)
+    return out
+
+
+@pytest.mark.parametrize(
+    ("depth", "expected"),
+    [
+        # The one commit is the boundary: its parent isn't in the clone, so it
+        # is read like a root commit, every file it has counting as touched.
+        (1, {"Edit a": {f"pkg/{n}.py" for n in "abcde"}}),
+        (3, {"Add d": {f"pkg/{n}.py" for n in "abcd"}, "Add e": {"pkg/e.py"}, "Edit a": {"pkg/a.py"}}),
+    ],
+)
+def test_a_shallow_clone_has_history(five_commit_origin, tmp_path, caplog, depth, expected):
+    """A shallow clone's oldest commit names a parent the clone doesn't have:
+    diffing against it failed, and its files got no MODIFIES edges."""
+    clone = _shallow_clone(five_commit_origin, tmp_path / "clone", depth)
+    with caplog.at_level("WARNING"):
+        result = GitHistoryExtractor("shallow", clone).extract_new_commits()
+    assert [c.properties["message"] for c in result.commits] == list(expected)
+    assert _modifies(result) == expected
+    assert "partial clone" not in caplog.text
+
+
+def test_a_shallow_clone_deepened_later_reads_only_new_commits(five_commit_origin, tmp_path):
+    """After `git fetch --deepen`, an incremental sync from the old boundary
+    reads nothing new: the commits it gained are older than it."""
+    clone = _shallow_clone(five_commit_origin, tmp_path / "clone", 1)
+    head = GitHistoryExtractor("shallow", clone).extract_new_commits().commits[-1].sha
+    _run_git(clone, "fetch", "--quiet", "--deepen=2")
+    assert GitHistoryExtractor("shallow", clone).extract_new_commits(since_sha=head).commits == []

@@ -15,6 +15,7 @@ this codebase; see indexer/python/extractor.py's index_file for precedent).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -83,6 +84,7 @@ class GitHistoryExtractor:
         unreadable = 0
         repo = open_repo(self.repo_path)
         try:
+            shallow = _shallow_boundary(repo)
             commits = list(repo.iter_commits(max_count=max_count))
             commits.reverse()  # iter_commits is newest-first; we want oldest-first
 
@@ -111,7 +113,7 @@ class GitHistoryExtractor:
                     )
                 )
 
-                changed = _changed_paths(commit)
+                changed = _changed_paths(commit, boundary=sha in shallow)
                 if changed is None:
                     unreadable += 1
                     changed = []
@@ -136,21 +138,44 @@ class GitHistoryExtractor:
 
         if unreadable:
             logger.warning(
-                f"{self.repo_id}: {unreadable} commit(s) have trees missing from this partial clone; "
-                "recorded without MODIFIES edges (DevGraph never fetches them); after fetching them, "
-                "run `devgraph rescan --full`"
+                f"{self.repo_id}: {unreadable} commit(s) could not be read: their trees are missing from this "
+                "clone (a partial clone, or a damaged one); recorded without MODIFIES edges (DevGraph never "
+                "fetches them); after fetching them, run `devgraph rescan --full`"
             )
         return result
 
 
-def _changed_paths(commit) -> list[str] | None:
+def _shallow_boundary(repo: Repo) -> set[str]:
+    """The commits a shallow clone ends at (`.git/shallow`): their parents
+    are not in the clone. Empty for a full clone."""
+    try:
+        return set(Path(repo.common_dir, "shallow").read_text(encoding="ascii").split())
+    except OSError:
+        return set()
+
+
+def _shallow_digest(repo: Repo) -> str | None:
+    """sha256 of `.git/shallow`, or None for a full clone: it changes when
+    the clone is deepened or unshallowed."""
+    try:
+        data = Path(repo.common_dir, "shallow").read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
+def _changed_paths(commit, boundary: bool = False) -> list[str] | None:
     """Return file paths touched by a commit (diff against its first parent, or full tree for a root commit).
+
+    A shallow clone's `boundary` commit is read like a root commit: its
+    parents are not in the clone (git itself shows it without them), so every
+    file it has counts as touched.
 
     Rename detection is off: a rename still yields both paths, and detecting it
     reads blobs a blobless partial clone lacks. None when a tree is missing
     (a `tree:0` partial clone), which the caller counts and logs.
     """
-    if commit.parents:
+    if commit.parents and not boundary:
         try:
             diffs = commit.parents[0].diff(commit, no_renames=True)
         except GitCommandError:
@@ -434,13 +459,17 @@ def sync_git_history(
             # a freshly-initialized repo, not an error. Nothing to sync.
             return {"mode": "noop", "commits_indexed": 0, "commits_deleted": 0}
         last = repo_record.last_indexed_commit
+        shallow = _shallow_digest(repo)
+        # A shallow clone deepened (or unshallowed) since: commits read as
+        # boundaries then, with every file as touched, have parents now.
+        reshaped = last is not None and shallow != repo_record.last_indexed_shallow
 
-        if last == head_sha and not force:
+        if last == head_sha and not force and not reshaped:
             return {"mode": "noop", "commits_indexed": 0, "commits_deleted": 0}
 
         if last is None:
             mode = "initial"
-        elif force or not _is_ancestor(repo, last, head_sha):
+        elif force or reshaped or not _is_ancestor(repo, last, head_sha):
             mode = "reconcile"
         else:
             mode = "fast"
@@ -457,6 +486,9 @@ def sync_git_history(
             # than speed for what should be a rare event, and capping it
             # risks leaving real orphans undetected.
             result = extractor.extract_new_commits(since_sha=None, max_count=None)
+            # Each commit's MODIFIES edges are written again, not added to: a
+            # former shallow boundary keeps only the files it changed.
+            engine.delete_commit_modifies(repo_id, [c.sha for c in result.commits])
             _upsert_extraction_result(engine, repo_id, result)
 
             reachable_shas = {c.sha for c in result.commits}
@@ -500,7 +532,7 @@ def sync_git_history(
                 f"(first {failed[0]!r}: {blame_failures[failed[0]]})"
             )
 
-        registry.set_last_indexed_commit(repo_id, head_sha)
+        registry.set_last_indexed_commit(repo_id, head_sha, shallow)
         return {"mode": mode, "commits_indexed": commits_indexed, "commits_deleted": commits_deleted}
     finally:
         repo.close()

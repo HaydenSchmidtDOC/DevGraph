@@ -573,3 +573,30 @@ def test_watcher_manager_stop_keeps_a_waiting_never_indexed_git_sync_from_starti
     burst.join(5)
     holder.join(5)
     assert syncs == []
+
+
+def test_refresh_drops_the_issue_of_a_repo_no_longer_watched(temp_registry_db, tmp_path):
+    """A repository that failed to start and was then removed or had
+    watching turned off is no longer an issue: doctor would fail on it."""
+    import shutil
+    import subprocess
+
+    registry = temp_registry_db
+    gone_root = tmp_path / "gone"
+    off_root = tmp_path / "off"
+    for root in (gone_root, off_root):
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+    gone = registry.add_repo(gone_root).repo_id
+    off = registry.add_repo(off_root).repo_id
+    shutil.rmtree(gone_root)
+    shutil.rmtree(off_root)
+    watcher = WatcherManager(registry, lambda *a: None)
+    watcher.start()
+    try:
+        assert set(watcher.get_repo_issues()) == {gone, off}
+        registry.remove_repo(gone)
+        registry.disable_watch(off)
+        watcher.refresh()
+        assert watcher.get_repo_issues() == {}
+    finally:
+        watcher.stop()

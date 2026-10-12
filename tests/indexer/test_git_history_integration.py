@@ -411,7 +411,7 @@ def test_sync_git_history_never_lazy_fetches_in_a_partial_clone(graph_engine, re
         # (A treeless clone's initial sync records no MODIFIES, so blames nothing.)
         assert len(blame) == (2 if filter_spec == "blob:none" else 1)
         assert all("2 file(s)" in line for line in blame)
-        trees = [r.message for r in caplog.records if "trees missing" in r.message]
+        trees = [r.message for r in caplog.records if "trees are missing" in r.message]
         if filter_spec == "tree:0":
             assert len(trees) == 2 and "run `devgraph rescan --full`" in trees[0]
         else:
@@ -423,5 +423,64 @@ def test_sync_git_history_never_lazy_fetches_in_a_partial_clone(graph_engine, re
         # A blobless clone holds every tree, so every commit's paths are read without
         # rename detection; a treeless one lacks every parent tree, so no commit's paths are read.
         assert edges[0]["n"] == (3 if filter_spec == "blob:none" else 0)
+    finally:
+        graph_engine.delete_repository(record.repo_id)
+
+
+def _git_log_modifies(repo_path: Path) -> dict[str, set[str]]:
+    """sha -> files, as `git log --name-only` shows them (a shallow
+    boundary commit lists its whole tree, like a root commit)."""
+    out = subprocess.run(
+        ["git", "log", "--name-only", "--format=@%H"], cwd=str(repo_path), capture_output=True, text=True, check=True
+    ).stdout
+    modifies: dict[str, set[str]] = {}
+    sha = None
+    for line in out.splitlines():
+        if line.startswith("@"):
+            sha = line[1:]
+            modifies[sha] = set()
+        elif line:
+            modifies[sha].add(line)
+    return modifies
+
+
+def test_deepening_a_shallow_clone_corrects_its_history(graph_engine, registry, tmp_path):
+    """At depth 1 the one commit is a boundary and counts every file as
+    touched. After `git fetch --deepen`, HEAD hasn't moved, but the sync
+    notices the new boundary and re-reads: each commit's MODIFIES edges are
+    replaced, so the old boundary keeps only the file it changed."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _run_git(origin, "init")
+    _run_git(origin, "config", "user.email", "test@example.com")
+    _run_git(origin, "config", "user.name", "Test Author")
+    for name in ("a", "b", "c", "d"):
+        (origin / f"{name}.py").write_text(f"{name} = 1\n")
+        _run_git(origin, "add", ".")
+        _run_git(origin, "commit", "-m", f"Add {name}")
+    (origin / "a.py").write_text("a = 2\n")
+    _run_git(origin, "commit", "-am", "Edit a")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "--quiet", "--depth=1", f"file://{origin}", str(clone)], check=True)
+    record = registry.add_repo(clone, repo_id="_shallow_deepen_test")
+    for name in ("a", "b", "c", "d"):
+        graph_engine.upsert_node("Module", record.repo_id, f"{name}.py", {})
+
+    def graphed() -> dict[str, set[str]]:
+        rows = graph_engine.run_cypher(
+            "MATCH (c:Commit {repo_id: $r}) OPTIONAL MATCH (c)-[:MODIFIES]->(m:Module) "
+            "RETURN c.name AS sha, collect(m.name) AS files",
+            {"r": record.repo_id},
+        )
+        return {row["sha"]: set(row["files"]) for row in rows}
+
+    try:
+        assert sync_git_history(graph_engine, registry, record.repo_id)["mode"] == "initial"
+        assert graphed() == _git_log_modifies(clone)
+        _run_git(clone, "fetch", "--quiet", "--deepen=2")
+        assert sync_git_history(graph_engine, registry, record.repo_id)["mode"] == "reconcile"
+        assert graphed() == _git_log_modifies(clone)
+        assert len(graphed()) == 3
+        assert sync_git_history(graph_engine, registry, record.repo_id)["mode"] == "noop"
     finally:
         graph_engine.delete_repository(record.repo_id)

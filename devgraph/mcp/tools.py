@@ -1865,7 +1865,11 @@ def blame_component(
 
     Returns:
         List of commits (sha, message, author, authored_date) that modified
-        this component, ordered most-recent-first.
+        this component, ordered most-recent-first; empty for a file no
+        recorded commit touched.
+
+    Raises:
+        ToolError: no file (Module) has that path.
     """
     repo_filter = _cross_scope("c", "AND") if cross_repo else "AND c.repo_id = $repo_id"
     cypher = f"""
@@ -1882,6 +1886,13 @@ def blame_component(
         params["repo_id"] = repo_id
 
     results, _more = _list_query(engine, cypher, params)  # at most LIST_ROW_LIMIT commits
+    if not results:
+        module_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
+        found = _query(
+            engine, f"MATCH (m:Module {{name: $component_name}}) WHERE true {module_filter} RETURN m LIMIT 1", params
+        )
+        if not found:
+            raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
     return [_sanitize_row(r) for r in results]
 
 

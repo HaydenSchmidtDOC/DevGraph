@@ -2808,13 +2808,18 @@ async function populateRealRepos(fireChangeEvent) {
   // A repo whose folder is missing (an unmounted drive, a moved folder)
   // keeps its graph -- every scan refuses it -- so it stays selectable, flagged.
   const missing = new Set((json.repos || []).filter(r => r.path_missing).map(r => r.repo_id));
+  // One the agent's watcher isn't watching (say an inotify limit was reached)
+  // is browsable too, but not kept live: flagged, with the reason as tooltip.
+  const unwatched = new Map((json.repos || []).filter(r => r.issue && !r.path_missing).map(r => [r.repo_id, r.issue]));
+  const optionLabel = id => missing.has(id) ? " (path missing)" : unwatched.has(id) ? " (not watched)" : "";
+  const optionTitle = id => unwatched.has(id) ? ` title="${escapeHtmlVal(unwatched.get(id))}"` : "";
   const select = document.getElementById("repoSelect");
   // A saved repo (from a prior reload) wins over whatever the select's
   // current value happens to be -- on first boot that's just the static
   // markup's default option, not a real user choice.
   const saved = localStorage.getItem(SELECTED_REPO_KEY);
   const current = saved || select.value;
-  select.innerHTML = '<option value="__all__">All Repos</option>' + ids.map(id => `<option value="${escapeHtmlVal(id)}">${escapeHtmlVal(id)}${missing.has(id) ? " (path missing)" : ""}</option>`).join("");
+  select.innerHTML = '<option value="__all__">All Repos</option>' + ids.map(id => `<option value="${escapeHtmlVal(id)}"${optionTitle(id)}>${escapeHtmlVal(id)}${optionLabel(id)}</option>`).join("");
   // A saved All Repos is kept; a selection that is no longer registered (or
   // no saved choice at all) falls back to the first repository, or to All
   // Repos when none is left.

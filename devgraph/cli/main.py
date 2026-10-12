@@ -768,6 +768,40 @@ def _tray_liveness_text(settings) -> str:
     return "stale (process may have crashed)"
 
 
+def _watcher_issues(settings) -> dict[str, str]:
+    """The repositories the running agent's watcher isn't watching, and why
+    (a missing folder, an inotify limit), from the repo_issues.json it writes
+    with its heartbeat; only those still registered, active and watched (the
+    file can predate a `remove` or `watch disable`)."""
+    try:
+        issues = json.loads((settings.registry_db_path.parent / "repo_issues.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(issues, dict):
+        return {}
+    try:
+        registry = RepoRegistry(settings.registry_db_path)
+        try:
+            watched = {r.repo_id for r in registry.list_repos(active_only=True) if r.watch_enabled}
+        finally:
+            registry.close()
+    except Exception:
+        watched = set(map(str, issues))
+    return {str(k): str(v) for k, v in issues.items() if str(k) in watched}
+
+
+def _print_unwatched_repos(settings, mark: str) -> int:
+    """Under a running watcher: the repositories it isn't watching, each
+    flagged with `mark`. Returns how many."""
+    issues = _watcher_issues(settings)
+    if issues:
+        noun = "repository" if len(issues) == 1 else "repositories"
+        console.print(f"  [yellow][!] running, but not watching {len(issues)} {noun}[/yellow]")
+        for repo_id, problem in sorted(issues.items()):
+            console.print(f"    [yellow]{escape(mark)} {escape(repo_id)}:[/yellow] {escape(problem)}", soft_wrap=True)
+    return len(issues)
+
+
 @app.command()
 def status() -> None:
     """Check DevGraph status: Neo4j connectivity and repository counts.
@@ -813,26 +847,14 @@ def status() -> None:
     console.print("[bold]Live Watcher[/bold]")
     liveness = _tray_liveness_text(settings)
     if liveness == "running":
-        console.print("  [green][OK] running[/green]")
+        if not _print_unwatched_repos(settings, "[!]"):
+            console.print("  [green][OK] running[/green]")
     elif liveness == "not running":
         console.print("  [yellow]not running[/yellow] (no heartbeat file — start with 'devgraph tray start')")
     else:
         console.print(f"  [red]{liveness}[/red]")
 
     _print_dashboard_status(settings)
-
-    # Repo issues (missing paths, etc.)
-    issues_path = settings.registry_db_path.parent / "repo_issues.json"
-    if issues_path.exists():
-        try:
-            import json
-            issues = json.loads(issues_path.read_text(encoding="utf-8"))
-            if issues:
-                console.print("[bold]⚠️  Repository Issues[/bold]")
-                for repo_id, error_msg in issues.items():
-                    console.print(f"  [yellow]{escape(str(repo_id))}:[/yellow] {escape(str(error_msg))}")
-        except Exception:
-            pass
 
     console.print()
     # Non-zero when DevGraph cannot work: Neo4j or the registry is unusable.
@@ -1405,7 +1427,10 @@ def doctor() -> None:
     console.print("[bold]Live Watcher[/bold]")
     liveness = _tray_liveness_text(settings)
     if liveness == "running":
-        console.print("  [green][OK] running[/green]")
+        if _print_unwatched_repos(settings, "[X]"):
+            any_failed = True
+        else:
+            console.print("  [green][OK] running[/green]")
     elif liveness == "not running":
         console.print("  [yellow]not running[/yellow] (expected if the tray app isn't started)")
     else:

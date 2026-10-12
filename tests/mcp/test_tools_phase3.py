@@ -3,6 +3,7 @@ issue_history_for.
 """
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.mcp.tools import blame_component, find_related_prs, issue_history_for
@@ -73,6 +74,17 @@ class TestBlameComponent:
         result = blame_component(seeded_graph, "test_repo_a", "auth.py", cross_repo=True)
         shas = {r["sha"] for r in result}
         assert "sha_b" in shas
+
+    def test_blame_an_unknown_file_is_not_found(self, seeded_graph):
+        """Like the other tools: an empty list read as "no commits touched it"."""
+        with pytest.raises(ToolError, match=r"no file named 'auth' in repository 'test_repo_a'.*name='auth\.py'"):
+            blame_component(seeded_graph, "test_repo_a", "auth")
+        with pytest.raises(ToolError, match="no file named 'nowhere.py' in any repository"):
+            blame_component(seeded_graph, "test_repo_a", "nowhere.py", cross_repo=True)
+
+    def test_blame_a_file_no_commit_touched_is_empty(self, seeded_graph):
+        seeded_graph.upsert_node("Module", "test_repo_a", "untouched.py")
+        assert blame_component(seeded_graph, "test_repo_a", "untouched.py") == []
 
 
 class TestFindRelatedPrs:

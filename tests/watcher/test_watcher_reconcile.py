@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
@@ -53,7 +54,7 @@ def wait_for(predicate, what, timeout: float = DEADLINE_S) -> None:
 class Rig:
     """A registered repo, a WatcherManager over it, and the batches it delivers."""
 
-    def __init__(self, tmp_path: Path, *, real_reconcile_timers: bool = True) -> None:
+    def __init__(self, tmp_path: Path, *, real_reconcile_timers: bool = True, root_watch: bool = False) -> None:
         self.root = tmp_path / "repo"
         (self.root / ".git").mkdir(parents=True)
         (self.root / "pkg/sub").mkdir(parents=True)
@@ -83,7 +84,7 @@ class Rig:
                 self.batches.append((self.rel(changed), self.rel(deleted)))
 
         self.manager = WatcherManager(
-            self.registry, on_changes, timer_factory=factory, reconcile_delay_s=0
+            self.registry, on_changes, timer_factory=factory, reconcile_delay_s=0, root_watch=root_watch
         )
 
     def rel(self, paths) -> set[str]:
@@ -119,10 +120,18 @@ class Rig:
         wait_for(ok, lambda: f"exactly ({changed}, {deleted} + some of {maybe}); got {self.union(start)}")
 
     def watched(self) -> dict[str, bool]:
-        """Top-level directory watches: name -> emitter alive."""
+        """Top-level directory watches: name -> emitter alive. With a root
+        watch, the top-level folders its inotify instance has a kernel watch on."""
         with self.manager._lock:  # the reconcile changes _watches under it
             observer = self.manager._observers[self.repo_id]
             watches = list(self.manager._watches[self.repo_id].items())
+            root_watch = self.manager._root_watches.get(self.repo_id)
+        if root_watch is not None:
+            buffer = observer._emitter_for_watch[root_watch]._inotify
+            with buffer._inotify._lock:
+                paths = [p for p, wd in buffer._inotify._wd_for_path.items() if wd > 0]
+            rels = [Path(os.fsdecode(p)).relative_to(self.root) for p in paths]
+            return {rel.as_posix(): True for rel in rels if len(rel.parts) == 1}
         out = {}
         for path, (watch, _identity) in watches:
             emitter = observer._emitter_for_watch.get(watch)
@@ -156,6 +165,23 @@ def rig(tmp_path: Path):
     r.close()
 
 
+@pytest.fixture(
+    params=[
+        pytest.param(False, id="per-folder"),
+        pytest.param(
+            True, id="root",
+            marks=pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the root watch is Linux-only"),
+        ),
+    ]
+)
+def any_rig(tmp_path: Path, request):
+    """A Rig with one watch per top-level folder (Windows, macOS), or one on
+    the root (Linux): the events must come out the same."""
+    r = Rig(tmp_path, root_watch=request.param)
+    yield r
+    r.close()
+
+
 def test_batch_lock_survives_recreation(rig):
     rig.manager.start()
     lock = rig.manager._handlers[rig.repo_id]._batch_lock
@@ -167,80 +193,80 @@ def test_batch_lock_survives_recreation(rig):
     assert not lock.locked()
 
 
-def test_file_rename_and_nested_dir_move(rig):
-    rig.manager.start()
-    (rig.root / "pkg/a.py").rename(rig.root / "pkg/a2.py")
-    rig.wait_exact(changed={"pkg/a2.py"}, deleted={"pkg/a.py"})
-    start = len(rig.batches)
-    (rig.root / "pkg/sub").rename(rig.root / "pkg/sub2")
-    rig.wait_exact(changed={"pkg/sub2/b.py"}, deleted={"pkg/sub"}, start=start)
+def test_file_rename_and_nested_dir_move(any_rig):
+    any_rig.manager.start()
+    (any_rig.root / "pkg/a.py").rename(any_rig.root / "pkg/a2.py")
+    any_rig.wait_exact(changed={"pkg/a2.py"}, deleted={"pkg/a.py"})
+    start = len(any_rig.batches)
+    (any_rig.root / "pkg/sub").rename(any_rig.root / "pkg/sub2")
+    any_rig.wait_exact(changed={"pkg/sub2/b.py"}, deleted={"pkg/sub"}, start=start)
 
 
-def test_folder_moved_out_of_repo_is_deleted(rig, tmp_path):
-    rig.manager.start()
+def test_folder_moved_out_of_repo_is_deleted(any_rig, tmp_path):
+    any_rig.manager.start()
     outside = tmp_path / "trash"
     outside.mkdir()
-    shutil.move(str(rig.root / "pkg/sub"), str(outside / "sub"))
-    rig.wait_exact(deleted={"pkg/sub"})
+    shutil.move(str(any_rig.root / "pkg/sub"), str(outside / "sub"))
+    any_rig.wait_exact(deleted={"pkg/sub"})
 
 
-def test_top_level_delete_recreate_then_edit(rig):
+def test_top_level_delete_recreate_then_edit(any_rig):
     """C2: the dead emitter for a deleted top-level dir is replaced."""
-    rig.manager.start()
-    shutil.rmtree(rig.root / "pkg")
-    (rig.root / "pkg").mkdir()
-    (rig.root / "pkg/a.py").write_text("a = 2\n")
-    rig.settle_watches({"pkg"})
+    any_rig.manager.start()
+    shutil.rmtree(any_rig.root / "pkg")
+    (any_rig.root / "pkg").mkdir()
+    (any_rig.root / "pkg/a.py").write_text("a = 2\n")
+    any_rig.settle_watches({"pkg"})
     # Children are deleted before their folder, so each that inotify reports
     # before the watch dies is queued on its own; the old pkg/a.py's delete
     # can land in a batch before its recreation.
-    rig.wait_exact(
+    any_rig.wait_exact(
         changed={"pkg/a.py"}, deleted={"pkg"}, maybe_deleted={"pkg/sub", "pkg/sub/b.py", "pkg/a.py"}
     )
-    start = len(rig.batches)
-    (rig.root / "pkg/a.py").write_text("a = 3\n")
-    (rig.root / "pkg/after.py").write_text("after = 1\n")
-    rig.wait_exact(changed={"pkg/a.py", "pkg/after.py"}, start=start)
+    start = len(any_rig.batches)
+    (any_rig.root / "pkg/a.py").write_text("a = 3\n")
+    (any_rig.root / "pkg/after.py").write_text("after = 1\n")
+    any_rig.wait_exact(changed={"pkg/a.py", "pkg/after.py"}, start=start)
 
 
-def test_top_level_rename_then_edit(rig):
-    rig.manager.start()
-    (rig.root / "pkg").rename(rig.root / "lib")
-    rig.wait_exact(changed={"lib/a.py", "lib/sub/b.py"}, deleted={"pkg"})
-    rig.settle_watches({"lib"})
-    start = len(rig.batches)
-    (rig.root / "lib/a.py").write_text("a = 2\n")
-    (rig.root / "lib/after.py").write_text("after = 1\n")
-    rig.wait_exact(changed={"lib/a.py", "lib/after.py"}, start=start)
+def test_top_level_rename_then_edit(any_rig):
+    any_rig.manager.start()
+    (any_rig.root / "pkg").rename(any_rig.root / "lib")
+    any_rig.wait_exact(changed={"lib/a.py", "lib/sub/b.py"}, deleted={"pkg"})
+    any_rig.settle_watches({"lib"})
+    start = len(any_rig.batches)
+    (any_rig.root / "lib/a.py").write_text("a = 2\n")
+    (any_rig.root / "lib/after.py").write_text("after = 1\n")
+    any_rig.wait_exact(changed={"lib/a.py", "lib/after.py"}, start=start)
 
 
-def test_new_top_level_dir_is_watched_and_walked(rig):
-    rig.manager.start()
-    (rig.root / "newtop").mkdir()
-    (rig.root / "newtop/c.py").write_text("c = 1\n")
-    rig.wait_exact(changed={"newtop/c.py"})
-    rig.settle_watches({"pkg", "newtop"})
-    start = len(rig.batches)
-    (rig.root / "newtop/c.py").write_text("c = 2\n")
-    rig.wait_exact(changed={"newtop/c.py"}, start=start)
+def test_new_top_level_dir_is_watched_and_walked(any_rig):
+    any_rig.manager.start()
+    (any_rig.root / "newtop").mkdir()
+    (any_rig.root / "newtop/c.py").write_text("c = 1\n")
+    any_rig.wait_exact(changed={"newtop/c.py"})
+    any_rig.settle_watches({"pkg", "newtop"})
+    start = len(any_rig.batches)
+    (any_rig.root / "newtop/c.py").write_text("c = 2\n")
+    any_rig.wait_exact(changed={"newtop/c.py"}, start=start)
 
 
-def test_top_level_swap_then_edit(rig):
+def test_top_level_swap_then_edit(any_rig):
     """`mv pkg old; mv other pkg`: the pkg watch's emitter is alive and its
     path still exists, but it watches the folder now called `old`."""
-    (rig.root / "other").mkdir()
-    (rig.root / "other/c.py").write_text("c = 1\n")
-    rig.manager.start()
-    (rig.root / "pkg").rename(rig.root / "old")
-    (rig.root / "other").rename(rig.root / "pkg")
-    rig.settle_watches({"old", "pkg"})
-    rig.wait_exact(
+    (any_rig.root / "other").mkdir()
+    (any_rig.root / "other/c.py").write_text("c = 1\n")
+    any_rig.manager.start()
+    (any_rig.root / "pkg").rename(any_rig.root / "old")
+    (any_rig.root / "other").rename(any_rig.root / "pkg")
+    any_rig.settle_watches({"old", "pkg"})
+    any_rig.wait_exact(
         changed={"old/a.py", "old/sub/b.py", "pkg/c.py"},
         deleted={"pkg", "other"},
     )
-    start = len(rig.batches)
-    (rig.root / "pkg/c.py").write_text("c = 2\n")
-    rig.wait_exact(changed={"pkg/c.py"}, start=start)
+    start = len(any_rig.batches)
+    (any_rig.root / "pkg/c.py").write_text("c = 2\n")
+    any_rig.wait_exact(changed={"pkg/c.py"}, start=start)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
@@ -350,16 +376,16 @@ def test_stop_with_reconcile_running(rig, monkeypatch):
     assert len(calls) == count
 
 
-def test_stop_cancels_pending_debounce(rig):
-    rig.manager.start()
-    (rig.root / "pkg/a.py").write_text("a = 2\n")
-    handler = rig.manager._handlers[rig.repo_id]
+def test_stop_cancels_pending_debounce(any_rig):
+    any_rig.manager.start()
+    (any_rig.root / "pkg/a.py").write_text("a = 2\n")
+    handler = any_rig.manager._handlers[any_rig.repo_id]
     wait_for(lambda: handler._debounce_timer is not None, "a pending debounce")
     timer = handler._debounce_timer
-    rig.manager.stop()
+    any_rig.manager.stop()
     assert timer.cancelled
     timer.fire()
-    assert rig.batches == []
+    assert any_rig.batches == []
 
 
 def test_reconcile_spanning_stop_start_queues_nothing_into_old_handler(rig, monkeypatch):
@@ -392,14 +418,14 @@ def test_reconcile_spanning_stop_start_queues_nothing_into_old_handler(rig, monk
     assert rig.batches == []
 
 
-def test_no_batch_starts_after_stop(rig):
-    rig.manager.start()
-    handler = rig.manager._handlers[rig.repo_id]
-    (rig.root / "pkg/a.py").write_text("a = 2\n")
+def test_no_batch_starts_after_stop(any_rig):
+    any_rig.manager.start()
+    handler = any_rig.manager._handlers[any_rig.repo_id]
+    (any_rig.root / "pkg/a.py").write_text("a = 2\n")
     wait_for(lambda: handler._changed, "a pending change")
-    rig.manager.stop()
+    any_rig.manager.stop()
     handler.flush()  # a timer that fired just as stop() ran
-    assert rig.batches == []
+    assert any_rig.batches == []
 
 
 # --- fake observer: the reconcile's keep/replace rules and schedule retries --

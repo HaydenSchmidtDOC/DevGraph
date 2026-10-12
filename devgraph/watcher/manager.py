@@ -6,8 +6,11 @@ Debounces events and invokes a callback with the set of changed file paths.
 
 from __future__ import annotations
 
+import errno
+import functools
 import logging
 import os
+import sys
 import threading
 import time
 from collections.abc import Iterable
@@ -43,9 +46,22 @@ TimerFactory = Callable[[float, Callable[[], None]], Any]
 RECONCILE_RETRY_DELAYS_S = (0.5, 1.0, 2.0, 4.0)
 
 #: Failed `observer.schedule` calls one reconcile run makes before leaving the
-#: rest to its retry. Each failure leaks an inotify instance in watchdog 6.0.0,
-#: so a persistent failure must not be repeated per folder.
+#: rest to its retry: a persistent failure must not be repeated per folder.
 MAX_SCHEDULE_FAILURES_PER_RECONCILE = 3
+
+def _inotify_supported() -> bool:
+    """Linux, with the watchdog internals devgraph/watcher/inotify.py needs."""
+    if not sys.platform.startswith("linux"):
+        return False
+    from devgraph.watcher import inotify
+
+    if not inotify.SUPPORTED:
+        logger.warning("This watchdog lacks the internals DevGraph's inotify watch needs; watching per folder")
+    return inotify.SUPPORTED
+
+#: How soon after the kernel's inotify queue overflowed its catch-up runs:
+#: long enough for the burst that overflowed it to end.
+OVERFLOW_CATCH_UP_DELAY_S = 2.0
 
 #: How long after `.git/index.lock` is released a HEAD or ref change still
 #: counts as part of the same git operation (W6).
@@ -166,7 +182,11 @@ class _GitStateEventHandler(FileSystemEventHandler):
             self._reset_debounce()
 
     def _reset_debounce(self) -> None:
-        """Reset the debounce timer. Must hold _lock."""
+        """Reset the debounce timer. Must hold _lock.
+
+        No maximum wait here, unlike file batches: a rebase or a long
+        checkout moves refs for as long as it runs, and a catch-up in the
+        middle of it would read a half-done working tree."""
         if self._debounce_timer:
             self._debounce_timer.cancel()
         if self._closed:
@@ -196,6 +216,64 @@ class _GitStateEventHandler(FileSystemEventHandler):
             burst_start, self._burst_start = self._burst_start, None
         # Invoke callback outside lock to avoid deadlock
         self._on_burst(self._repo_id, burst_start)
+
+
+def _watch_problem(error: Exception) -> str:
+    """The issue `status`, `doctor` and the dashboard show for a repository
+    that couldn't be watched."""
+    if isinstance(error, OSError) and error.errno == errno.EMFILE:
+        return (
+            "watching unavailable: inotify limit reached (too many inotify instances, "
+            "fs.inotify.max_user_instances, or open files); restart the agent once others are closed"
+        )
+    if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+        return (
+            "watching unavailable: inotify limit reached (too many watched folders, "
+            "fs.inotify.max_user_watches); raise it, then restart the agent"
+        )
+    return f"watching unavailable: {error}"
+
+
+def _discard_observer(observer: Any) -> None:
+    """Stop an observer whose start failed part-way, and wait for it: its
+    stop stops and joins every emitter that did start, closing their watches."""
+    _forget_closed_handles(observer)
+    observer.stop()
+    if observer.is_alive():
+        observer.join(timeout=5)
+
+
+def _debounce_s(debounce_ms: int, max_wait_ms: int | None, waited_s: float) -> float:
+    """The next debounce timer's interval: the debounce, cut short so a
+    batch whose first event came `waited_s` ago fires no later than
+    `max_wait_ms` after it. Without that cap, events arriving faster than the
+    debounce would hold the batch back for as long as they kept coming."""
+    interval = debounce_ms / 1000.0
+    if max_wait_ms is None:
+        return interval
+    return max(0.0, min(interval, max_wait_ms / 1000.0 - waited_s))
+
+
+class _RootEventRouter(FileSystemEventHandler):
+    """The root watch's one handler: an event under `.git` (only the git
+    state is watched there) goes to the git handler, any other to the file
+    handler, so a source file named HEAD or a folder named refs is a file."""
+
+    def __init__(self, files: FileSystemEventHandler, git: FileSystemEventHandler | None, git_dir: Path) -> None:
+        self._files = files
+        self._git = git
+        self._git_prefix = str(git_dir) + os.sep
+
+    def _in_git(self, raw: Any) -> bool:
+        path = os.fsdecode(raw) if raw else ""
+        return path.startswith(self._git_prefix) or path == self._git_prefix[:-1]
+
+    def dispatch(self, event: FileSystemEvent) -> None:
+        if self._in_git(event.src_path) or self._in_git(getattr(event, "dest_path", "")):
+            if self._git is not None:
+                self._git.dispatch(event)
+            return
+        self._files.dispatch(event)
 
 
 def _forget_closed_handle(emitter: Any) -> None:
@@ -235,6 +313,7 @@ class WatcherManager:
         on_catch_up: Callable[..., None] | None = None,
         git_catch_up_delay_s: float = 2.0,
         now: Callable[[], float] = time.time,
+        root_watch: bool | None = None,
     ) -> None:
         """Initialize the watcher manager.
 
@@ -255,6 +334,9 @@ class WatcherManager:
                 failed; then the git-history sync that follows it is skipped.
             git_catch_up_delay_s: How long after a git burst its catch-up runs.
             now: The wall clock, in seconds; tests inject it.
+            root_watch: Watch each repository with one recursive watch on
+                its root, not one per top-level folder. See `_start_single`.
+                By default, on Linux when watchdog has the internals it needs.
         """
         self._registry = registry
         self._on_changes = on_changes
@@ -263,16 +345,23 @@ class WatcherManager:
         self._handlers: dict[str, _RepoEventHandler] = {}
         self._git_handlers: dict[str, _GitStateEventHandler] = {}
         self._debounce_ms = get_settings().watch_debounce_ms
+        self._max_wait_ms = get_settings().watch_max_wait_ms
         self._lock = threading.Lock()
         # Track repos with path issues (e.g. missing directory) so they don't
         # crash the whole watcher. Maps repo_id -> error message.
         self._repo_issues: dict[str, str] = {}
+        # Guards _repo_issues alone (innermost): an emitter reports problems
+        # from watchdog's reader thread, where taking _lock could deadlock.
+        self._issues_lock = threading.Lock()
         self._timer_factory = timer_factory
         self._reconcile_delay_s = reconcile_delay_s
+        self._root_watch = _inotify_supported() if root_watch is None else root_watch
         # Top-level directory watches per repo: path -> (watch, the directory's
         # identity when scheduled). The root's own non-recursive watch is not
-        # listed; it is never reconciled.
+        # listed; it is never reconciled. Empty with `root_watch`.
         self._watches: dict[str, dict[Path, tuple[ObservedWatch, tuple[int, int] | None]]] = {}
+        # With `root_watch`: each repo's one recursive watch on its root.
+        self._root_watches: dict[str, ObservedWatch] = {}
         # One per repo, created on demand and never dropped, so a handler
         # recreated by stop/start or refresh shares it with run_exclusive (W4).
         self._batch_locks: dict[str, threading.Lock] = {}
@@ -355,6 +444,7 @@ class WatcherManager:
             self._handlers.clear()
             self._git_handlers.clear()
             self._watches.clear()
+            self._root_watches.clear()
             batch_locks = list(self._batch_locks.values())
         # Every job that writes the graph runs under its repo's batch lock and,
         # once there, checks the flags set above, so holding each lock once
@@ -515,7 +605,11 @@ class WatcherManager:
             # Stop watchers for repos that are no longer active/watch-enabled
             for repo_id in current_ids - desired_ids:
                 self._stop_single(repo_id)
-                self._repo_issues.pop(repo_id, None)  # Clear any cached issues
+            # ...and forget their issues, including those of repos that never
+            # started (a missing folder, an inotify limit).
+            with self._issues_lock:
+                for repo_id in set(self._repo_issues) - desired_ids:
+                    del self._repo_issues[repo_id]
 
             # Start watchers for new repos
             for repo in repos:
@@ -536,50 +630,29 @@ class WatcherManager:
         # Validate path exists before attempting to watch
         if not repo.path.exists() or not repo.path.is_dir():
             error_msg = f"path does not exist or is not a directory: {repo.path}"
-            self._repo_issues[repo.repo_id] = error_msg
+            with self._issues_lock:
+                self._repo_issues[repo.repo_id] = error_msg
             logger.warning(
                 f"Skipping watcher for {repo.repo_id}: {error_msg}"
             )
             return
 
-        try:
-            handler = _RepoEventHandler(
-                repo.repo_id,
-                repo.path,
-                self._debounce_ms,
-                self._on_changes,
-                timer_factory=self._timer_factory,
-                batch_lock=self._batch_locks.setdefault(repo.repo_id, threading.Lock()),
-                request_reconcile=self._request_reconcile,
-                request_catch_up=self.request_catch_up,
-            )
-            observer = Observer()
-            # Don't hand watchdog a single recursive watch on repo.path: that
-            # puts every file under .venv/.git/build/etc under OS-level
-            # notification too, alongside the repo's actual (much smaller)
-            # source tree. On Windows in particular, a directory that busy can
-            # overflow ReadDirectoryChangesW's notification buffer, which
-            # silently drops ALL pending events for the watch -- including ones
-            # for real source edits -- so the graph looks "live" but quietly
-            # stops picking up changes. Watch the root non-recursively (for
-            # root-level files) plus each non-ignored top-level subdirectory
-            # recursively, mirroring full_scan's IGNORED_DIR_NAMES exclusions.
-            observer.schedule(handler, str(repo.path), recursive=False)
-            watches = {
-                child: self._schedule_dir(observer, handler, child)
-                for child in sorted(self._desired_dirs(repo.path))
-            }
-        except (FileNotFoundError, OSError) as e:
-            error_msg = f"failed to schedule watches: {e}"
-            self._repo_issues[repo.repo_id] = error_msg
-            logger.warning(
-                f"Skipping watcher for {repo.repo_id}: {error_msg}"
-            )
-            return
-
+        handler = _RepoEventHandler(
+            repo.repo_id,
+            repo.path,
+            self._debounce_ms,
+            self._on_changes,
+            timer_factory=self._timer_factory,
+            batch_lock=self._batch_locks.setdefault(repo.repo_id, threading.Lock()),
+            request_reconcile=None if self._root_watch else self._request_reconcile,
+            request_rewatch=self._request_reconcile if self._root_watch else None,
+            request_catch_up=self.request_catch_up,
+            max_wait_ms=self._max_wait_ms,
+        )
         # Watch git state changes (.git/HEAD, .git/refs) if .git exists as a directory.
         # Skip if .git is a file (linked git worktree contains gitdir: ... pointer).
         git_dir = repo.path / ".git"
+        git_handler: _GitStateEventHandler | None = None
         if git_dir.is_dir() and (self._on_git_state_changed or self._on_catch_up):
             git_handler = _GitStateEventHandler(
                 repo.repo_id,
@@ -588,37 +661,80 @@ class WatcherManager:
                 timer_factory=self._timer_factory,
                 now=self._now,
             )
-            # Non-recursive watch on .git itself (catches HEAD, packed-refs)
-            observer.schedule(git_handler, str(git_dir), recursive=False)
-            # Non-recursive watch on .git/refs (refs/stash: `git stash pop`
-            # moves neither HEAD nor a branch), and a recursive one on
-            # .git/refs/heads. Remote-tracking refs and tags stay unwatched,
-            # so a background fetch triggers nothing.
-            refs = git_dir / "refs"
-            if refs.is_dir():
-                observer.schedule(git_handler, str(refs), recursive=False)
-            refs_heads = refs / "heads"
-            if refs_heads.is_dir():
-                observer.schedule(git_handler, str(refs_heads), recursive=True)
-            self._git_handlers[repo.repo_id] = git_handler
-
-        # Read before the observer starts (W5): see _start_catch_up.
-        snapshot = self._last_indexed(repo.repo_id) if self._on_catch_up is not None else None
+        observer = self._new_observer(repo.repo_id, repo.path, watch_git=git_handler is not None)
+        root_watch: ObservedWatch | None = None
+        watches: dict[Path, tuple[ObservedWatch, tuple[int, int] | None]] = {}
         try:
+            if self._root_watch:
+                # Linux: one recursive watch on the root, whose emitter leaves
+                # the folders full_scan skips (IGNORED_DIR_NAMES, .gitignore)
+                # out of the kernel watch (see devgraph/watcher/inotify.py).
+                # watchdog opens an inotify instance per watch, and Linux
+                # allows 128 per user, so one per top-level folder (below) ran
+                # out on a repository with ~100 of them. The git state below
+                # rides on the same instance, so a repository costs one. One
+                # instance also pairs a move between two top-level folders.
+                root_watch = observer.schedule(
+                    _RootEventRouter(handler, git_handler, git_dir), str(repo.path), recursive=True
+                )
+            else:
+                # Elsewhere, don't hand watchdog a single recursive watch on
+                # repo.path: that puts every file under .venv/.git/build/etc
+                # under OS-level notification too, alongside the repo's
+                # actual (much smaller) source tree. On Windows in particular,
+                # a directory that busy can overflow ReadDirectoryChangesW's
+                # notification buffer, which silently drops ALL pending events
+                # for the watch -- including ones for real source edits -- so
+                # the graph looks "live" but quietly stops picking up changes.
+                # Watch the root non-recursively (for root-level files) plus
+                # each non-ignored top-level subdirectory recursively,
+                # mirroring full_scan's IGNORED_DIR_NAMES exclusions.
+                observer.schedule(handler, str(repo.path), recursive=False)
+                watches = {
+                    child: self._schedule_dir(observer, handler, child)
+                    for child in sorted(self._desired_dirs(repo.path))
+                }
+                if git_handler is not None:
+                    # Non-recursive watch on .git itself (catches HEAD, packed-refs)
+                    observer.schedule(git_handler, str(git_dir), recursive=False)
+                    # Non-recursive watch on .git/refs (refs/stash: `git stash pop`
+                    # moves neither HEAD nor a branch), and a recursive one on
+                    # .git/refs/heads. Remote-tracking refs and tags stay unwatched,
+                    # so a background fetch triggers nothing. (The root watch
+                    # covers the same three, see inotify.ignored_folder_filter.)
+                    refs = git_dir / "refs"
+                    if refs.is_dir():
+                        observer.schedule(git_handler, str(refs), recursive=False)
+                    refs_heads = refs / "heads"
+                    if refs_heads.is_dir():
+                        observer.schedule(git_handler, str(refs_heads), recursive=True)
+
+            # Read before the observer starts (W5): see _start_catch_up.
+            snapshot = self._last_indexed(repo.repo_id) if self._on_catch_up is not None else None
             observer.start()
-            self._observers[repo.repo_id] = observer
-            self._handlers[repo.repo_id] = handler
-            self._watches[repo.repo_id] = watches
-            # Clear any cached issues now that watch started successfully
-            self._repo_issues.pop(repo.repo_id, None)
-            logger.debug(f"Started watcher for {repo.repo_id} at {repo.path}")
         except Exception as e:
-            error_msg = f"failed to start observer: {e}"
-            self._repo_issues[repo.repo_id] = error_msg
-            logger.warning(
-                f"Skipping watcher for {repo.repo_id}: {error_msg}"
-            )
+            # Whatever did start (emitters, their inotify instances) is
+            # stopped and closed, or it would hold them until the agent exits.
+            _discard_observer(observer)
+            handler.close()
+            if git_handler is not None:
+                git_handler.close()
+            error_msg = _watch_problem(e)
+            with self._issues_lock:
+                self._repo_issues[repo.repo_id] = error_msg
+            logger.warning(f"Skipping watcher for {repo.repo_id}: {error_msg}")
             return
+        self._observers[repo.repo_id] = observer
+        self._handlers[repo.repo_id] = handler
+        self._watches[repo.repo_id] = watches
+        if root_watch is not None:
+            self._root_watches[repo.repo_id] = root_watch
+        if git_handler is not None:
+            self._git_handlers[repo.repo_id] = git_handler
+        # Clear any cached issues now that watch started successfully
+        with self._issues_lock:
+            self._repo_issues.pop(repo.repo_id, None)
+        logger.debug(f"Started watcher for {repo.repo_id} at {repo.path}")
         if self._on_catch_up is not None:
             repo_id = repo.repo_id
             timer = self._timer_factory(0.0, lambda: self._start_catch_up(repo_id, snapshot, index_if_never))
@@ -638,6 +754,7 @@ class WatcherManager:
         if git_handler is not None:
             git_handler.close()
         self._watches.pop(repo_id, None)
+        self._root_watches.pop(repo_id, None)
         with self._reconcile_lock:
             timer = self._reconcile_pending.pop(repo_id, None)
             self._reconcile_gone.pop(repo_id, None)
@@ -657,6 +774,51 @@ class WatcherManager:
             observer.stop()
             observer.join(timeout=5)
         logger.debug(f"Stopped watcher for {repo_id}")
+
+    def _new_observer(self, repo_id: str, root: Path, *, watch_git: bool) -> Any:
+        """The observer for one repository. On Linux (with the watchdog
+        internals it needs) its emitters close what they opened when they
+        fail to start and report problems (`_inotify_problem`), and with
+        `root_watch` its watch on `root` skips ignored folders, except the git
+        state when `watch_git`."""
+        if sys.platform.startswith("linux"):
+            from devgraph.watcher import inotify
+
+            if inotify.SUPPORTED:
+                return inotify.new_observer(
+                    root if self._root_watch else None,
+                    watch_git=watch_git,
+                    report=functools.partial(self._inotify_problem, repo_id),
+                )
+        return Observer()
+
+    def _inotify_problem(self, repo_id: str, kind: str, error: BaseException) -> None:
+        """An emitter's report, from watchdog's reader thread (which may hold
+        its inotify lock): so it takes only `_issues_lock` and the catch-up
+        lock, never `_lock`."""
+        if kind == "overflow":
+            # The kernel dropped events: catch up from the last update, as
+            # after a git operation (W6).
+            since = self._last_indexed(repo_id)
+            logger.warning("%s: the inotify event queue overflowed; catching up", repo_id)
+            if since is not None:
+                self.request_catch_up(repo_id, since, OVERFLOW_CATCH_UP_DELAY_S, "overflow")
+            return
+        if kind == "limit":
+            # A folder found later stays unwatched until a restart; catch up
+            # on what it holds now.
+            problem = _watch_problem(error)
+            logger.warning("%s: %s", repo_id, problem)
+            since = self._last_indexed(repo_id)
+            if since is not None:
+                self.request_catch_up(repo_id, since, OVERFLOW_CATCH_UP_DELAY_S, "unwatched")
+        elif kind == "broken":
+            problem = f"watching stopped: {error!r}; restart the agent"
+            logger.error("Watching %s stopped: watchdog's reader failed", repo_id, exc_info=error)
+        else:
+            return
+        with self._issues_lock:
+            self._repo_issues[repo_id] = problem
 
     def _desired_dirs(self, root: Path) -> set[Path]:
         """The root's children that get their own recursive watch: real
@@ -722,7 +884,9 @@ class WatcherManager:
         timer.start()
 
     def _reconcile(self, repo_id: str) -> None:
-        """Make the repo's top-level watches match its top-level directories.
+        """Make the repo's top-level watches match its top-level directories,
+        or, with a root watch, watch the folders a .gitignore no longer
+        ignores, and walk them.
 
         Runs on its own timer thread. A watch is kept only while its emitter
         is alive and its path is still the same desired directory; any other
@@ -746,8 +910,11 @@ class WatcherManager:
                 observer = self._observers[repo_id]
                 handler = self._handlers[repo_id]
                 root = handler._repo_root
+                # With a root watch there are no top-level ones: only folders
+                # a .gitignore no longer ignores are watched (and walked).
+                root_watch = self._root_watches.get(repo_id)
                 try:
-                    desired = self._desired_dirs(root)
+                    desired = set() if root_watch is not None else self._desired_dirs(root)
                 except OSError as e:
                     logger.debug("Skipping watch reconcile for %s: %s", repo_id, e)
                     return
@@ -790,6 +957,11 @@ class WatcherManager:
                         error = e
                         continue
                     added.append(path)
+                if root_watch is not None:
+                    added = self._add_missing_watches(repo_id, observer, root_watch)
+                    # A folder newly watched below another is in its walk.
+                    new = set(added)
+                    added = [p for p in added if not any(parent in new for parent in p.parents)]
             files: set[Path] = set()
             for path in added:
                 files |= indexable_paths_under(root, path)
@@ -801,6 +973,19 @@ class WatcherManager:
         finally:
             with self._reconcile_lock:
                 self._reconcile_running.discard(repo_id)
+
+    @staticmethod
+    def _add_missing_watches(repo_id: str, observer: Any, root_watch: ObservedWatch) -> list[Path]:
+        """With `root_watch`, after a .gitignore change: watch the folders no
+        longer ignored. Must hold _lock."""
+        emitter = getattr(observer, "_emitter_for_watch", {}).get(root_watch)
+        if emitter is None:
+            return []
+        try:
+            return emitter.add_missing_watches()
+        except OSError as e:
+            logger.warning("Couldn't watch every folder of %s that is no longer ignored: %s", repo_id, e)
+            return []
 
     def _retry_reconcile(self, repo_id: str, failed: list[str], error: OSError | None) -> None:
         """Retry folders a reconcile couldn't watch, with backoff, then give
@@ -829,7 +1014,7 @@ class WatcherManager:
         Returns:
             Dict mapping repo_id -> error message for repos that couldn't be watched.
         """
-        with self._lock:
+        with self._issues_lock:
             return dict(self._repo_issues.items())
 
 
@@ -870,16 +1055,27 @@ class _RepoEventHandler(FileSystemEventHandler):
         timer_factory: TimerFactory = threading.Timer,
         batch_lock: threading.Lock | None = None,
         request_reconcile: Callable[..., None] | None = None,
+        request_rewatch: Callable[[str], None] | None = None,
         request_catch_up: Callable[[str, datetime, float, str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        max_wait_ms: int | None = None,
     ) -> None:
         self._repo_id = repo_id
         self._repo_root = repo_root
         self._debounce_ms = debounce_ms
+        self._max_wait_ms = max_wait_ms
+        # When the first event of the pending batch was queued (see `_debounce_s`).
+        self._pending_since: float | None = None
+        # A fired batch is waiting for the batch lock: events meanwhile join
+        # it, starting no timer (each would be a thread blocked on the lock).
+        self._in_flight = False
         self._on_changes = on_changes
         self._timer_factory = timer_factory
         self._batch_lock = batch_lock or threading.Lock()
         self._request_reconcile = request_reconcile
+        # Asked when a .gitignore changes: a folder it no longer ignores needs
+        # a watch (with a root watch, which leaves ignored folders out).
+        self._request_rewatch = request_rewatch
         self._changed: dict[str, Path] = {}
         self._deleted: dict[str, Path] = {}
         # Folder log lines, keyed by the folder's repo-relative path.
@@ -995,7 +1191,7 @@ class _RepoEventHandler(FileSystemEventHandler):
     def flush(self) -> None:
         """Fire the pending batch now, if there is one."""
         self.cancel()
-        self._fire_changes()
+        self._deliver()
 
     def cancel(self) -> None:
         """Drop the pending debounce timer. Pending paths stay queued."""
@@ -1041,6 +1237,8 @@ class _RepoEventHandler(FileSystemEventHandler):
                 self._changed[key] = path
             self._folder_events.update(folders or {})
             self._reset_debounce()
+        if self._request_rewatch is not None and any(p.name == GITIGNORE for p in changed + deleted):
+            self._request_rewatch(self._repo_id)
 
     def _has_deleted_ancestor(self, path: Path) -> bool:
         """Must hold _lock."""
@@ -1052,20 +1250,38 @@ class _RepoEventHandler(FileSystemEventHandler):
         return False
 
     def _reset_debounce(self) -> None:
-        """Restart the debounce timer. Must hold _lock."""
+        """Restart the debounce timer, within the maximum wait, unless a batch
+        is in flight (it takes what is queued). Must hold _lock."""
+        if self._in_flight:
+            return
         if self._debounce_timer is not None:
             self._debounce_timer.cancel()
-        self._debounce_timer = self._timer_factory(self._debounce_ms / 1000.0, self._fire_changes)
+        now = self._clock()
+        if self._pending_since is None:
+            self._pending_since = now
+        interval = _debounce_s(self._debounce_ms, self._max_wait_ms, now - self._pending_since)
+        self._debounce_timer = self._timer_factory(interval, self._fire_changes)
         self._debounce_timer.daemon = True
         self._debounce_timer.start()
 
     def _fire_changes(self) -> None:
+        """The debounce timer's target: mark the batch in flight, then deliver it."""
+        with self._lock:
+            if self._in_flight:
+                return
+            self._in_flight = True
+            self._debounce_timer = None
+        self._deliver()
+
+    def _deliver(self) -> None:
         """Hand the pending batch to `on_changes` under the repo's batch lock.
 
         The sets are swapped under `_lock`, which is released before the
-        callback, so the dispatch thread can keep queueing while it runs."""
+        callback, so the dispatch thread can keep queueing while it runs.
+        Events queued from then on start a new batch."""
         with self._batch_lock:
             with self._lock:
+                self._in_flight = False
                 # Checked under the batch lock, so no batch starts after the
                 # manager's stop() has returned.
                 if self._closed or (not self._changed and not self._deleted):
@@ -1074,6 +1290,7 @@ class _RepoEventHandler(FileSystemEventHandler):
                 deleted = set(self._deleted.values())
                 folders = self._folder_events
                 self._changed, self._deleted, self._folder_events = {}, {}, {}
+                self._pending_since = None
             for rel in sorted(folders):
                 # One line per folder event, never per child of a moved or
                 # removed folder.
@@ -1139,8 +1356,9 @@ class _RepoEventHandler(FileSystemEventHandler):
     def _is_tracked_path(self, path: Path) -> bool:
         """A regular file inside the repository and not under an ignored
         directory. The per-child watches keep only top-level ignored
-        directories out of the OS watch; this is the backstop for deeper ones
-        (e.g. some_package/build/)."""
+        directories out of the OS watch, and a root watch keeps out those
+        ignored when it started; this is the backstop for the rest (e.g.
+        some_package/build/, or a folder a .gitignore ignores since)."""
         try:
             if not path.is_file():
                 return False
