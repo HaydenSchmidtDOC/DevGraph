@@ -1061,12 +1061,32 @@ def repository_constraint_statements(effective: EffectiveSchema | None = None) -
 
 
 class GraphEngine:
-    def __init__(self, uri: str, user: str, password: str) -> None:
+    def __init__(
+        self,
+        uri: str,
+        user: str,
+        password: str,
+        *,
+        transaction_retry_s: float | None = None,
+        connection_timeout_s: float | None = None,
+    ) -> None:
+        """`transaction_retry_s` bounds how long a managed transaction
+        (`execute_read`/`execute_write`) retries a transient failure, and
+        `connection_timeout_s` how long opening a connection may take; omitted,
+        the driver's defaults (30 s each) apply. The MCP server sets both low,
+        so a request fails fast when Neo4j is down."""
+        self.uri = uri
+        limits: dict[str, float] = {}
+        if transaction_retry_s is not None:
+            limits["max_transaction_retry_time"] = transaction_retry_s
+        if connection_timeout_s is not None:
+            limits["connection_timeout"] = connection_timeout_s
         # Hint notifications are off: a hinted index an older database hasn't
         # built yet (init_schema creates it) would log one per query.
         self._driver = _GatedDriver(GraphDatabase.driver(
             uri, auth=(user, password),
             notifications_disabled_classifications=[NotificationDisabledClassification.HINT],
+            **limits,
         ))
 
     def close(self, timeout: float = CLOSE_WAIT_S) -> None:

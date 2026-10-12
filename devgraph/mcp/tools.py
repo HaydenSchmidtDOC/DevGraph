@@ -151,6 +151,27 @@ def _timeouts_as_tool_errors() -> Iterator[None]:
         raise
 
 
+def neo4j_unavailable(exc: BaseException, uri: str) -> ToolError | None:
+    """A ToolError saying how to reach Neo4j at `uri` when `exc` is the driver
+    failing to connect or authenticate; None for anything else. A closing
+    engine or an index still being built is not a connection problem."""
+    from neo4j.exceptions import AuthError, ServiceUnavailable
+
+    from devgraph.graph.engine import EngineClosed, IndexesNotReady
+
+    if isinstance(exc, AuthError):
+        return ToolError(
+            f"Neo4j at {uri} refused the username or password; check DEVGRAPH_NEO4J_USER and "
+            "DEVGRAPH_NEO4J_PASSWORD (`devgraph doctor` checks the connection)"
+        )
+    if isinstance(exc, ServiceUnavailable) and not isinstance(exc, (EngineClosed, IndexesNotReady)):
+        return ToolError(
+            f"Neo4j isn't reachable at {uri}; start it (for example `podman start devgraph-neo4j`), "
+            "then retry (`devgraph doctor` checks the connection)"
+        )
+    return None
+
+
 #: Repository ids a cross_repo query may reach. The MCP server sets it, per
 #: call, to the registered repositories (see `_with_cross_repo_gate` in
 #: server.py); unset -- a direct library call -- it is None and does not restrict.

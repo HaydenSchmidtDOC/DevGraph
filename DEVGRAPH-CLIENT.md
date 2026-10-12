@@ -374,6 +374,10 @@ argument below its minimum (`max_results`, `within_commits`,
 `modified_within_commits`, `members_per_community`, `max_per_type` below 1,
 `max_length` below 2) fails and names the argument.
 
+If Neo4j is down, every tool fails within a few seconds with `Neo4j isn't
+reachable at <uri>; start it ...`: tell the user to start Neo4j (or run
+`devgraph doctor`) rather than retrying the call in a loop.
+
 If a tool returns empty/sparse results, check whether the repo has actually
 been scanned (step 1/2) before concluding the graph has nothing to say — an
 unindexed repo will legitimately return empty results, that's not a tool

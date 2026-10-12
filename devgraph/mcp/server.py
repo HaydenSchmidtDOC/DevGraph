@@ -274,6 +274,24 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def _with_neo4j_errors(fn: Callable[..., Any], uri: str) -> Callable[..., Any]:
+    """Wrap a built-in tool so Neo4j being down or refusing the login reaches the
+    client as a ToolError saying what to do (see `tools.neo4j_unavailable`), not
+    as the driver's bare error; every other exception passes through."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            error = devgraph_tools.neo4j_unavailable(exc, uri)
+            if error is None:
+                raise
+            raise error from exc
+
+    return wrapper
+
+
 def _with_shadow_notices(fn: Callable[..., Any], shadowed: Callable[[], dict[str, list[str]]]) -> Callable[..., Any]:
     """Wrap a built-in tool so its dict result carries the notices for declared tools its name shadows.
 
@@ -466,6 +484,7 @@ def build_server(
         ),
     )
 
+    neo4j_uri = getattr(engine, "uri", None) or settings.neo4j_uri
     # Single chokepoint for tool-call telemetry: every `@server.tool(...)`
     # registration below goes through this rebound decorator, including any
     # tool added later, so instrumentation can't be forgotten on a new tool
@@ -496,13 +515,16 @@ def build_server(
         # `status` (the tool plane's, assigned below) is looked up at call time.
         return lambda fn: register(
             _instrument(
-                _with_shadow_notices(
-                    _with_cross_repo_gate(
-                        _with_repo_default(fn, session_repo, session_source, registry, unscoped_error),
-                        settings.allow_cross_repo,
-                        registry,
+                _with_neo4j_errors(
+                    _with_shadow_notices(
+                        _with_cross_repo_gate(
+                            _with_repo_default(fn, session_repo, session_source, registry, unscoped_error),
+                            settings.allow_cross_repo,
+                            registry,
+                        ),
+                        lambda: status.shadowed,
                     ),
-                    lambda: status.shadowed,
+                    neo4j_uri,
                 )
             )
         )
@@ -925,6 +947,24 @@ def build_server(
     return server
 
 
+#: How long the MCP server's driver retries a failed read, and waits to open a
+#: connection: a transient blip is still retried, but with Neo4j down a call
+#: fails within seconds rather than after the driver's default 30 s.
+MCP_TRANSACTION_RETRY_S = 3.0
+MCP_CONNECTION_TIMEOUT_S = 2.0
+
+
+def mcp_engine(settings: Any) -> GraphEngine:
+    """The MCP server's engine: `settings`' Neo4j, with the short limits above."""
+    return GraphEngine(
+        settings.neo4j_uri,
+        settings.neo4j_user,
+        settings.neo4j_password,
+        transaction_retry_s=MCP_TRANSACTION_RETRY_S,
+        connection_timeout_s=MCP_CONNECTION_TIMEOUT_S,
+    )
+
+
 def main() -> None:
     """Entry point: connect to Neo4j, initialize schema, run the stdio MCP server.
 
@@ -949,7 +989,7 @@ def main() -> None:
     Run with: `.venv/Scripts/python -P -m devgraph.mcp.server`
     """
     settings = get_settings()
-    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    engine = mcp_engine(settings)
     engine.verify_connectivity()
     # Not waiting for indexes an upgrade is still building: that can outlast
     # the client's handshake timeout, and each query waits for its own.
