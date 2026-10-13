@@ -670,21 +670,44 @@ has:
   An inline handler (arrow function, lambda, function literal) has no node:
   its `Endpoint` implements nothing.
 
+A route on a router or group whose mount its file doesn't show has an
+unknown prefix. Its Endpoint is the file's own, named
+`"<METHOD> ?<path> (<file>)"` (`routes.unmounted_endpoint`), so no two files'
+`GET /` meet in one Endpoint that no request reaches as such, and
+`trace_request_flow` never starts from such a hub (a bare `/` does not
+match it; its full name does). Unknown means: an Express router (a
+`Router()`, a Koa `new Router()`, a name-only `router`/`...Router`) the
+file doesn't mount on its app; a Go receiver of a router package's group
+or router type (`*gin.RouterGroup`, `chi.Router` outside a `Route`
+closure, a gorilla `*mux.Router` parameter) or one nothing types; an
+ASP.NET builder that is no `WebApplication` (`IEndpointRouteBuilder`
+parameters). A name-only `app`/`fastify`, an `express()`/`Fastify()` app,
+a router package's root constructor or type (`gin.Default()`,
+`*gin.Engine`, `http.NewServeMux()`, `chi.NewRouter()`, `mux.NewRouter()`,
+`echo.New()`, `fiber.New()`) and a `WebApplication` are roots.
+
+A receiver is followed to its nearest declaration before the call: in
+the same function, then the enclosing ones, then the file's (Go and
+ASP.NET; a same-named group in another function is another group).
+
 Forms read, all with literal paths only (a variable, constant or
 concatenation in a path or prefix skips the route):
 
 | Framework | Forms | Prefix |
 |---|---|---|
-| Express (and Koa-router, Fastify) | `r.get/post/put/delete/patch/options/head/all('/x', ..., h)`, `r.route('/x').get(h)`, Koa's named `r.get('name', '/x', h)`; `r` an app or router the file makes (`express()`, `Router()`, `new Router()`, `Fastify()`) or named `app`, `router`, `fastify`, `...Router`; the path starts with "/" and the last argument is the handler | `app.use('/api', r)` when the same file makes `r` |
+| Express (and Koa-router, Fastify) | `r.get/post/put/delete/patch/options/head/all('/x', ..., h)`, `r.route('/x').get(h)`, Koa's named `r.get('name', '/x', h)`; `r` an app or router the file makes (`express()`, `Router()`, `new Router()`, `Fastify()`, held by a name or a class's `this.router`) or named `app`, `router`, `fastify`, `...Router`; the path starts with "/" and the last argument is the handler | `app.use('/api', r)` in the same file |
 | Spring (Java, Kotlin) | methods of a `@RestController`/`@Controller` class with `@GetMapping`...`@PatchMapping` or `@RequestMapping(method = ...)` (none: `*`), `value`/`path`, arrays | the class's `@RequestMapping` |
-| ASP.NET Core | actions of an `[ApiController]`, `[Route]` or `...Controller` class with `[HttpGet("x")]`... or `[Route("x")]` (`*`), `[controller]`/`[action]` filled in (`Async` dropped), a template starting with "/" or "~/" absolute; `app.MapGet/MapPost/MapPut/MapDelete/MapPatch("/x", h)`, `h` a method group of the file | the class's `[Route]`; a `MapGroup("/x")` variable of the file |
-| Go | `Handle`/`HandleFunc` on any receiver with a Go 1.22 pattern (`"GET /x"`, no method `*`, a host dropped), gin/echo `GET`...`Any`, chi `Get`..., gin `Handle("GET", "/x", h)`, chi `Method("GET", "/x", h)`; `http.HandlerFunc(h)` is `h`; a call whose arguments after the path include a string (`client.Post("/x", "text/plain", b)`) is not a route | gin/echo `v := r.Group("/x")` in the file; chi `r.Route("/x", func(r chi.Router) {...})` |
+| ASP.NET Core | actions of an `[ApiController]`, `[Route]` or `...Controller` class with `[HttpGet("x")]`... or `[Route("x")]` (`*`), every one of repeated attributes, `[controller]`/`[action]` filled in in any case (`Async` dropped), a template starting with "/" or "~/" absolute; `app.MapGet/MapPost/MapPut/MapDelete/MapPatch("/x", h)`, `h` a method group of the file | each of the class's `[Route]`s; a `MapGroup("/x")` declaration (or assignment) of the same scope |
+| Go (a file importing `net/http` or gin, echo, chi, gorilla/mux, httprouter, fiber) | `Handle`/`HandleFunc` with a Go 1.22 pattern (`"GET /x"`, no method `*`, a host dropped, a subtree's trailing "/" kept), gorilla's chained `.Methods("GET", ...)`, gin/echo `GET`...`Any`, chi/fiber `Get`..., gin `Handle("GET", "/x", h)`, chi `Method("GET", "/x", h)`; `http.HandlerFunc(h)` is `h`; a verb-named call counts only on a router or with a handler that is a function of the file, an imported package's exported name or a typed value's method, and never with a string after the path (`client.Post("/x", "text/plain", b)`, `cache.Get("/k", v)` are no routes) | gin/echo `v := r.Group("/x")`, gorilla `r.PathPrefix("/x").Subrouter()`, chi `r.Route("/x", func(r chi.Router) {...})`, in the same function or an enclosing one |
 
-Not read: a router or group made or mounted in another file (its routes
-keep their own paths), Fastify's `route({...})` object form, echo's `Add`,
-chi `Mount`, ASP.NET `MapMethods` and conventional routing, Spring
-functional routes (`RouterFunction`), Kotlin Ktor. Express, Koa and
-Fastify routes all carry `framework: Express`.
+Not read: Fastify's `route({...})` object form, echo's `Add`, chi
+`Mount`, Koa's `app.use(router.routes())` as a mount, ASP.NET `MapMethods`
+and conventional routing, Spring functional routes (`RouterFunction`),
+Kotlin Ktor. Express, Koa and Fastify routes all carry `framework:
+Express`. A compose change (a `build:` added or moved) leaves the
+Endpoint `CALLS` Service edges as they were until the route files are
+indexed again, as for Python (the graph-accuracy design's out-of-scope
+compose-only batch).
 
 The dispatcher treats these files as it treats a Python file. Their replace
 is a `service_api` one (`engine.SERVICE_API_SUFFIXES`, also checked on
@@ -705,7 +728,16 @@ in the repository's Endpoints and stubs. A code file's Module now records
 the shared nodes its replace claimed (`shared_claims`, hidden and reserved
 like `claims`), and the next replace or delete seeks just those by name; a
 code file with no Module yet claims nothing, and a file with no record (a
-compose file, a Module an older index wrote) still takes the scan. Python
+compose file, a Module an older index wrote) still takes the scan. The
+record is read under the Module's write lock (a no-op `SET`), so two
+overlapping writes of one file, from two processes, take turns: the second
+unclaims what the first claimed. A record can still lose a claim (a version
+without the lock, a write cut between claim and record); a full scan heals
+it, rebuilding every code Module's record from the shared nodes' own
+`sources` before it writes (`rebuild_claim_records`, one read and one
+write), and a deleted file whose record is empty reads every claim.
+Set (c)'s `USES` unclaim runs for Python files only, the only writers of
+`USES`. Python
 route files gain the same. Measured on a synthetic repository of 2,000
 files (400 each of TS, Java, Go, C# and Python, a quarter of the first four
 with routes: 1,600 Endpoints), `full_scan` against the shared local Neo4j:
