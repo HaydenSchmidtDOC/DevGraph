@@ -2174,10 +2174,10 @@ def full_scan(
     """
     check_repo_root(repo_root)
     docs_cache.forget(repo_root)
-    prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force)
     # The shared-claim records the writes below unclaim through are rebuilt
     # from the shared nodes first, so a full scan heals any that drifted.
     engine.rebuild_claim_records(repo_id)
+    prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force)
     engine.set_index_format(repo_id, 0)
     resolver = fingerprints(repo_root)  # before extraction reads the configuration
     all_files = _indexable_paths(repo_root)

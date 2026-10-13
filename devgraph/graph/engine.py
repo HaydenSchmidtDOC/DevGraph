@@ -131,10 +131,13 @@ _CLAIM_SOURCES_CYPHER = (
     _union(_CLAIMED_BRANCHES) + "WITH n WHERE n.file IS NULL AND n.source_file IS NULL "
     "RETURN labels(n)[0] AS label, n.name AS name, coalesce(n.sources, [n.source]) AS sources"
 )
+# Only a record that differs is written, so a scan that changes nothing
+# locks no Module.
 _WRITE_CLAIM_RECORDS_CYPHER = (
     "MATCH (m:Module) USING INDEX SEEK m:Module(repo_id, name) "
     "WHERE m.repo_id = $repo_id AND m.name IS NOT NULL AND properties(m)['shared_claims'] IS NOT NULL "
-    "SET m.shared_claims = coalesce($claims[m.name], [])"
+    "WITH m, coalesce($claims[m.name], []) AS claims WHERE m.shared_claims <> claims "
+    "SET m.shared_claims = claims"
 )
 _UNCLAIM_RECORDED_CYPHER = (
     _union(_seek(label, "name", f"IN $claimed_{i}") for i, label in enumerate(CLAIMED_LABELS))
@@ -269,9 +272,9 @@ def _rebuild_claim_records_tx(tx, repo_id: str) -> None:
 
 
 def _delete_by_source_file_tx(tx, repo_id: str, file_name: str) -> None:
-    # An empty record is read in full too: deletes are rare, and so a claim
+    # Every claim is read, not the record: deletes are rare, and so a claim
     # a record lost goes with its file.
-    recorded = _recorded_claims(tx, repo_id, file_name) or None
+    recorded = None
     _unclaim_foreign_sources_tx(tx, repo_id, file_name)
     if file_name.endswith(SERVICE_API_SUFFIXES):
         _unclaim_service_api_edges_tx(tx, repo_id, file_name, recorded)

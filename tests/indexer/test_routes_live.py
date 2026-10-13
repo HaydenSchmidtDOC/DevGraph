@@ -225,15 +225,30 @@ def test_a_record_that_lost_a_claim_heals_on_a_full_scan(engine, repo_id, tmp_pa
     incremental_equals_fresh(engine, repo_id, tmp_path)
 
 
-def test_deleting_a_file_with_an_empty_record_reads_every_claim(engine, repo_id, tmp_path):
+def test_deleting_a_file_reads_every_claim(engine, repo_id, tmp_path):
+    """A delete reads every claim, not the record: one the record lost goes too."""
     from devgraph.graph.engine import SHARED_CLAIM_SEP
 
     routes = write(tmp_path, "web/routes.ts", ROUTED)
     _scan(engine, repo_id, tmp_path)
-    for entry in ("Endpoint", "GET /orders"), ("Function", "list"):
-        _drop_record(engine, repo_id, "web/routes.ts", SHARED_CLAIM_SEP.join(entry))
+    _drop_record(engine, repo_id, "web/routes.ts", SHARED_CLAIM_SEP.join(("Endpoint", "GET /orders")))
     routes.unlink()
     remove_paths(engine, repo_id, tmp_path, {routes})
+    assert _endpoint_sources(engine, repo_id) == []
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_a_full_scan_heals_a_lost_claim_of_a_deleted_file(engine, repo_id, tmp_path):
+    """The file is gone before the scan: its prune deletes it, and the claim
+    its record lost goes with it."""
+    from devgraph.graph.engine import SHARED_CLAIM_SEP
+
+    routes = write(tmp_path, "web/routes.ts", ROUTED)
+    write(tmp_path, "web/other.ts", UNROUTED)
+    _scan(engine, repo_id, tmp_path)
+    _drop_record(engine, repo_id, "web/routes.ts", SHARED_CLAIM_SEP.join(("Endpoint", "GET /orders")))
+    routes.unlink()
+    full_scan(engine, repo_id, tmp_path)
     assert _endpoint_sources(engine, repo_id) == []
     incremental_equals_fresh(engine, repo_id, tmp_path)
 
