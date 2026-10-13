@@ -22,10 +22,12 @@ class _Registry:
 class _Graph:
     def __init__(self, file_exists=True):
         self.queries = []
+        self.params = []
         self.file_exists = file_exists
 
     def run_read_cypher(self, query, params, *, timeout_s, max_rows):
         self.queries.append(query)
+        self.params.append(params)
         return ([{"found": 1}] if self.file_exists and query.endswith("RETURN 1 LIMIT 1") else []), False
 
 
@@ -72,3 +74,26 @@ def test_a_source_that_is_on_reads_the_graph(tmp_path, no_subprocess, tool, flag
 
 def test_no_gh_fallback_is_left():
     assert not any(hasattr(tools, name) for name in ("_gh_pr_list", "_gh_issue_list", "_resolve_gh_repo"))
+
+
+class _Down:
+    uri = "bolt://127.0.0.1:9"
+
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        from neo4j.exceptions import ServiceUnavailable
+
+        raise ServiceUnavailable("refused")
+
+
+@pytest.mark.parametrize(("tool", "command"), [(find_related_prs, "pr-source"), (issue_history_for, "issue-source")])
+def test_with_the_source_off_and_neo4j_down_the_notice_comes_first(tmp_path, no_subprocess, tool, command):
+    registry = _Registry(RepoRecord("widget", tmp_path, True, True, None))
+    result = tool(_Down(), "widget", ".\\widget\\core.py", registry=registry)
+    assert f"devgraph {command} widget enable" in result["notice"]
+
+
+def test_a_path_is_normalised(tmp_path, no_subprocess):
+    registry = _Registry(RepoRecord("widget", tmp_path, True, True, None, pr_source_enabled=True))
+    graph = _Graph()
+    find_related_prs(graph, "widget", ".\\widget\\core.py", registry=registry)
+    assert graph.params[0]["component_name"] == "widget/core.py"

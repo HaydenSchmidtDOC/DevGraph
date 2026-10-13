@@ -4,6 +4,7 @@ one label's scan), never a scan of every node or every edge in the database."""
 import uuid
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 from neo4j import GraphDatabase
 
 from devgraph.graph.engine import GraphEngine
@@ -41,7 +42,8 @@ def engine():
         {"r": REPO},
     )
     test_engine.run_cypher(
-        "MATCH (q:Requirement {repo_id: $r}) CREATE (:File {repo_id: $r, name: 'docs/spec.md'})-[:SATISFIES]->(q)",
+        "MATCH (q:Requirement {repo_id: $r}) CREATE (:File {repo_id: $r, name: 'docs/spec.md'})-[:SATISFIES]->(q) "
+        "CREATE (:Function {repo_id: $r, name: 'gadget_user', file: 'g.py'})-[:CALLS]->(:Gadget {repo_id: $r, name: 'gadget'})",
         {"r": REPO},
     )
     yield test_engine
@@ -62,6 +64,9 @@ CALLS = {
     "trace_design_rationale": lambda e: tools.trace_design_rationale(e, REPO, "caller"),
     "find_requirements_for": lambda e: tools.find_requirements_for(e, REPO, "caller"),
     "list_recent_changes": lambda e: tools.list_recent_changes(e, REPO, 5),
+    # Gadget is no built-in label and nothing declares it: the fallback lookup.
+    "find_callers on an undeclared label": lambda e: tools.find_callers(e, REPO, "gadget"),
+    "a name nothing has": lambda e: pytest.raises(ToolError, tools.find_callers, e, REPO, "no_such_name"),
 }
 
 

@@ -1980,7 +1980,26 @@ def _write_shadow_package(workdir: Path, marker: str) -> None:
     (pkg / "server.py").write_text(f"print({marker!r})\n")
 
 
-def test_generated_mcp_command_ignores_devgraph_package_in_working_directory(tmp_path):
+@pytest.fixture
+def stops_its_tray(tmp_path):
+    """The real server starts the tray under this test's home; however the test
+    ends (a timeout included), kill the tray its pid file names."""
+    import os
+    import signal
+
+    from devgraph.agent.lifecycle import pid_is_running
+
+    yield
+    pid_file = tmp_path / "home" / ".devgraph" / "tray.pid"
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return
+    if pid_is_running(pid):
+        os.kill(pid, signal.SIGTERM)
+
+
+def test_generated_mcp_command_ignores_devgraph_package_in_working_directory(tmp_path, stops_its_tray):
     """The generated server command must import the installed DevGraph even
     when started from a directory that contains its own `devgraph/` package."""
     import os

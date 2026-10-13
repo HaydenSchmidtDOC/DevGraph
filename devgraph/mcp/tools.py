@@ -659,17 +659,53 @@ def _normalize_file(file: str | None) -> str | None:
     return file
 
 
+#: How long the lookup under undeclared labels may take before it gives up.
+_UNDECLARED_LOOKUP_TIMEOUT_S = 3
+
+
+def _undeclared_targets(engine: GraphEngine, params: dict[str, Any], cross_repo: bool) -> list[dict]:
+    """`_TARGETS_RETURN` rows for the nodes named `$name` under a label in use that
+    is no built-in one, one label scan per label (never every node), within
+    `_UNDECLARED_LOOKUP_TIMEOUT_S`; [] when there are none or it ran out of time."""
+    from neo4j.exceptions import Neo4jError
+
+    in_use = _query(engine, "CALL db.labels() YIELD label RETURN label", {})
+    labels = [
+        r["label"] for r in in_use
+        if r["label"] not in schema.NAMED_LABELS and r["label"] != "Repository" and LABEL_PATTERN.fullmatch(r["label"])
+    ]
+    if not labels:
+        return []
+    cypher = _named_nodes(tuple(labels), "name", cross_repo) + _TARGETS_RETURN
+    try:
+        rows, _ = engine.run_read_cypher(
+            cypher, _with_cross_ids(cypher, params), timeout_s=_UNDECLARED_LOOKUP_TIMEOUT_S, max_rows=BUILTIN_MAX_ROWS
+        )
+    except Neo4jError as exc:
+        if "TransactionTimedOut" in str(getattr(exc, "code", None) or ""):
+            return []
+        raise
+    return rows
+
+
 def _resolve_targets(
-    engine: GraphEngine, repo_id: str, name: str, cross_repo: bool, file: str | None, labels: tuple[str, ...]
+    engine: GraphEngine,
+    repo_id: str,
+    name: str,
+    cross_repo: bool,
+    file: str | None,
+    labels: tuple[str, ...],
+    describe: bool = True,
 ) -> tuple[dict[str, Any] | None, tuple[str, ...], int]:
     """Look up the nodes named `name`. Returns `ambiguous_targets` (an envelope of
     their `{label, file}`, `repo_id` too when cross_repo, a file-less one with
     `file` None) when they lie in more than one file and no `file` narrows them,
     else None; the labels to look the name up under; and how many files they lie in.
 
-    The lookup seeks `labels`. When it finds nothing it falls back to a scan of
-    every node, so a node whose label the repository does not declare (any more)
-    is still found, and its label is added to the returned ones.
+    The lookup seeks `labels`. When it finds nothing it falls back to the labels
+    in use that are no built-in one (`_undeclared_targets`), so a node whose label
+    the repository does not declare (any more) is still found, and its label is
+    added to the returned ones. `describe` False skips building the envelope.
 
     Raises:
         ToolError: no node has that name, or none of them is in `file`.
@@ -677,8 +713,7 @@ def _resolve_targets(
     params = {"name": name} if cross_repo else {"name": name, "repo_id": repo_id}
     rows = _query(engine, _named_nodes(labels, "name", cross_repo) + _TARGETS_RETURN, params)
     if not rows:
-        scope = _cross_scope("n") if cross_repo else "n.repo_id = $repo_id"
-        rows = _query(engine, f"MATCH (n) WHERE n.name = $name AND {scope} AND NOT n:Repository " + _TARGETS_RETURN, params)
+        rows = _undeclared_targets(engine, params, cross_repo)
         if not rows:
             raise _not_found(engine, repo_id, "component", name, labels, cross_repo)
         found = (row["label"] for row in rows if LABEL_PATTERN.fullmatch(row["label"]))
@@ -689,7 +724,7 @@ def _resolve_targets(
             shown = ", ".join(_echo(f) for f in files[:_DESCRIBE_MAX_CANDIDATES]) or "no file"
             raise ToolError(f"no component named {_echo(name)} in file {_echo(file)}; it is defined in: {shown}")
         return None, labels, 1
-    if len(files) < 2:
+    if len(files) < 2 or not describe:
         return None, labels, len(files)
     refs = [
         {"label": row["label"], "file": row["file"], **({"repo_id": row["repo_id"]} if cross_repo else {})}
@@ -2045,7 +2080,9 @@ def find_requirements_for(
         ToolError: no node has that name.
     """
     _at_least(1, max_results=max_results)
-    _, labels, _ = _resolve_targets(engine, repo_id, component_name, cross_repo, None, component_labels(extra_labels))
+    _, labels, _ = _resolve_targets(
+        engine, repo_id, component_name, cross_repo, None, component_labels(extra_labels), describe=False
+    )
     cypher = f"""
     {_named_nodes(labels, "component_name", cross_repo)}
     MATCH (n)-[:SATISFIES]->(r:Requirement)
@@ -2084,7 +2121,9 @@ def trace_design_rationale(
     Raises:
         ToolError: no node has that name.
     """
-    _, labels, _ = _resolve_targets(engine, repo_id, component_name, cross_repo, None, component_labels(extra_labels))
+    _, labels, _ = _resolve_targets(
+        engine, repo_id, component_name, cross_repo, None, component_labels(extra_labels), describe=False
+    )
     cypher = f"""
     {_named_nodes(labels, "component_name", cross_repo)}
     OPTIONAL MATCH (n)-[:SATISFIES]->(req:Requirement)
@@ -2148,6 +2187,19 @@ def blame_component(
     return _capped_envelope(results, more, max_results)
 
 
+def _off_source_file_check(engine: GraphEngine, repo_id: str, path: str, cross_repo: bool) -> None:
+    """With a repository's source off: the not-found error for a path no Module has,
+    unless Neo4j can't be reached, when the source-off notice comes first."""
+    try:
+        exists = _exists(engine, repo_id, path, ("Module",), cross_repo)
+    except Exception as exc:
+        if neo4j_unavailable(exc, getattr(engine, "uri", "")) is not None:
+            return
+        raise
+    if not exists:
+        raise _not_found(engine, repo_id, "file", path, ("Module",), cross_repo)
+
+
 def find_related_prs(
     engine: GraphEngine,
     repo_id: str,
@@ -2179,9 +2231,9 @@ def find_related_prs(
         ToolError: no file (Module) has that path.
     """
     _at_least(1, max_results=max_results)
+    component_name = _normalize_file(component_name)
     if _source_off(registry, repo_id, "pr_source_enabled"):
-        if not _exists(engine, repo_id, component_name, ("Module",), cross_repo):
-            raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
+        _off_source_file_check(engine, repo_id, component_name, cross_repo)
         return _source_off_notice(max_results, "PR", "pr-source", repo_id)
 
     repo_filter = _cross_scope("m", "AND") if cross_repo else "AND m.repo_id = $repo_id"
@@ -2235,9 +2287,9 @@ def issue_history_for(
         ToolError: no file (Module) has that path.
     """
     _at_least(1, max_results=max_results)
+    component_name = _normalize_file(component_name)
     if _source_off(registry, repo_id, "issue_source_enabled"):
-        if not _exists(engine, repo_id, component_name, ("Module",), cross_repo):
-            raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
+        _off_source_file_check(engine, repo_id, component_name, cross_repo)
         return _source_off_notice(max_results, "Issue", "issue-source", repo_id)
 
     repo_filter = _cross_scope("m", "AND") if cross_repo else "AND m.repo_id = $repo_id"
