@@ -673,8 +673,14 @@ _ROUTER_PACKAGES = (
 _ROUTER_FACTORIES = frozenset({"Default", "New", "NewRouter", "NewMux", "NewServeMux"})
 #: A router package's types: a root router, or a group or router that can
 #: be mounted under a prefix the declaring file doesn't show.
-_ROOT_ROUTER_TYPES = frozenset({"Engine", "Echo", "ServeMux", "App", "Mux"})
-_SUB_ROUTER_TYPES = frozenset({"RouterGroup", "IRouter", "IRoutes", "Group", "Router", "Routes"})
+_ROOT_ROUTER_TYPES = frozenset({"Engine", "Echo", "ServeMux", "App", "Mux", "Router"})
+_SUB_ROUTER_TYPES = frozenset({"RouterGroup", "IRouter", "IRoutes", "Group", "Routes"})
+#: Blocks a declaration is scoped to: one inside one that doesn't enclose the call is not its.
+_SCOPE_NODES = frozenset({
+    "block", "func_literal", "if_statement", "for_statement", "expression_switch_statement",
+    "type_switch_statement", "select_statement", "expression_case", "type_case", "default_case",
+    "communication_case",
+})
 _FUNCTION_NODES = ("function_declaration", "method_declaration", "func_literal")
 
 
@@ -720,13 +726,28 @@ def _go_routes(
     handler resolves as a call to it would (`http.HandlerFunc(h)` is `h`); a
     function literal implements nothing."""
     imports = _extract_imports(root, source)
+    # A router package itself (or its major version, `chi/v5`), never one of
+    # its subpackages (`fiber/v2/middleware/cache`). A dot import of one is
+    # not read: its names have no qualifier to tell them by.
     routers = {
         name or _default_import_name(path)
         for name, path in imports
-        if path == "net/http" or any(path == each or path.startswith(each + "/") for each in _ROUTER_PACKAGES)
+        if name != "." and (path == "net/http" or any(
+            path == each or _MAJOR_VERSION.fullmatch(path[len(each) + 1:]) and path.startswith(each + "/")
+            for each in _ROUTER_PACKAGES
+        ))
     }
     if not routers:
         return
+
+    def encloses(spec: Node, function: Node, at: Node) -> bool:
+        """Whether every block `spec` is scoped to, up to `function`, holds `at`."""
+        node = spec.parent
+        while node is not None and (node.start_byte, node.end_byte) != (function.start_byte, function.end_byte):
+            if node.type in _SCOPE_NODES and not (node.start_byte <= at.start_byte and at.end_byte <= node.end_byte):
+                return False
+            node = node.parent
+        return True
 
     def declaration(name: str, at: Node) -> tuple[str, Node] | None:
         """The nearest declaration of `name` before `at`: ("value", its
@@ -739,7 +760,7 @@ def _go_routes(
                 found = None
                 for spec in [*_descendants(body, "short_var_declaration"), *_descendants(body, "var_spec")] \
                         if body is not None else []:
-                    if spec.end_byte > at.start_byte:
+                    if spec.end_byte > at.start_byte or not encloses(spec, node, at):
                         continue
                     if spec.type == "short_var_declaration":
                         left, right = spec.child_by_field_name("left"), spec.child_by_field_name("right")
@@ -834,6 +855,8 @@ def _go_routes(
             return under(kind(func.child_by_field_name("operand"), node, depth + 1), _go_literal(first, source))
         if node.type == "unary_expression":
             node = node.child_by_field_name("operand") or node
+        if node.type in ("identifier", "selector_expression"):
+            return kind(node, node, depth + 1)  # `v := s.router`
         func = node.child_by_field_name("function") if node.type == "call_expression" else None
         if func is None or func.type != "selector_expression":
             return ("none", None)
@@ -910,8 +933,13 @@ def _go_routes(
         receiver = kind(operand, call)
         if receiver[0] == "skip":
             continue  # a dynamic prefix
-        if field not in _PATTERN_CALLS and receiver[0] == "none" and not is_function(handler, scope):
-            continue  # `kv.Put("/config/a", value)`: no router, no handler
+        if field not in _PATTERN_CALLS and receiver[0] == "none" and (
+            not is_function(handler, scope) or (
+                operand.type == "identifier" and _text(operand, source) in resolver.bindings
+                and declaration(_text(operand, source), call) is None
+            )
+        ):
+            continue  # `kv.Put("/config/a", value)`, another package's `cache.Get("/k", load)`
         mounted = receiver[0] in ("root", "prefix")
         full = join_route(receiver[1] or "", path)
         if pattern and path.endswith("/") and full != "/":
