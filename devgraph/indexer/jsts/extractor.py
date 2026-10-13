@@ -448,11 +448,15 @@ class _Binding:
     """A name an import binds: the callee name it stands for (the exported
     name of `{a as b}`, else the local name), where that can be defined
     (`_specifier_pins`; None for an external package), and whether it is a
-    whole module (`* as ns`, `const ns = require(...)`)."""
+    whole module (`* as ns`, `const ns = require(...)`). `top_level` is
+    true for an ES named import (`{a}`: a module's top-level function when
+    called) and an ES namespace (`* as ns`: its members are top-level ones);
+    a default import or a `require` can bind anything."""
 
     name: str
     pins: tuple[str, ...] | None
     namespace: bool
+    top_level: bool = False
 
 
 @dataclass
@@ -582,12 +586,6 @@ _FUNCTION_NODE_TYPES = frozenset({
 })
 
 
-def _class_like(name: str) -> str | None:
-    """`name` as the owner of the members read off it when it names a class
-    (capitalised), else None: an imported value's methods are any class's."""
-    return name if name[:1].isupper() else None
-
-
 def _class_table(root: Node, source: bytes) -> dict[str, _ClassInfo]:
     """Every class in the file: its methods, its `extends` bases and the
     types of its fields (annotated, `= new T()`, or constructor parameter
@@ -683,12 +681,12 @@ def _bindings(
                 elif child.type == "namespace_import":
                     ns = next((c for c in child.named_children if c.type == "identifier"), None)
                     if ns is not None:
-                        bindings[_text(ns, source)] = _Binding(_text(ns, source), where, True)
+                        bindings[_text(ns, source)] = _Binding(_text(ns, source), where, True, True)
                 elif child.type == "named_imports":
                     for spec in child.named_children:
                         name, alias = spec.child_by_field_name("name"), spec.child_by_field_name("alias")
                         if spec.type == "import_specifier" and name is not None:
-                            bindings[_text(alias or name, source)] = _Binding(_text(name, source), where, False)
+                            bindings[_text(alias or name, source)] = _Binding(_text(name, source), where, False, True)
         elif node.type == "call_expression":
             func = node.child_by_field_name("function")
             if func is not None and func.type == "identifier" and func.text == b"require":
@@ -750,10 +748,9 @@ class _CallResolver:
         head, dot, rest = type_name.partition(".")
         binding = self.bindings.get(head)
         if binding is not None and (dot == "" or binding.namespace):
-            # An imported class's member is owned by the class (a method it
-            # inherits from a base of that file is then not linked).
-            cls = rest.rpartition(".")[2] if dot else binding.name
-            return [owned_pin(pin, _class_like(cls)) for pin in binding.pins or ()]
+            # An imported class's method: any of the name there, since the
+            # class can inherit it from a base of its file.
+            return list(binding.pins or ())
         return None
 
     def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
@@ -802,9 +799,9 @@ class _CallResolver:
             return None  # an untyped parameter shadows any import of its name
         binding = self.bindings.get(receiver)
         if binding is not None:
-            # A namespace's member is a module's top-level one; a named
-            # import's, a member of the class it names (a static call).
-            owner = "" if binding.namespace else _class_like(binding.name)
+            # An ES namespace's member is a module's top-level one; anything
+            # else's (a require, an imported class's static) any of the name.
+            owner = "" if binding.namespace and binding.top_level else None
             return [owned_pin(pin, owner) for pin in binding.pins or ()]
         if receiver in self.classes:
             return self._class_pins(receiver, method)
@@ -825,8 +822,9 @@ class _CallResolver:
             if name in self.defined:
                 return [(name, self.file_path, False)]
             binding = self.bindings.get(name)
-            if binding is not None:  # an import's top-level function
-                return [(binding.name, owned_pin(pin, ""), False) for pin in binding.pins or ()]
+            if binding is not None:  # an ES named import's top-level function; else any of the name
+                owner = "" if binding.top_level else None
+                return [(binding.name, owned_pin(pin, owner), False) for pin in binding.pins or ()]
             if self.script and name not in _JS_GLOBALS:
                 return [(name, None, False)]  # a classic script's globals are shared
             return []

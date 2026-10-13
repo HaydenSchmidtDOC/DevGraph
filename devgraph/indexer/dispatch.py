@@ -128,9 +128,12 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: 11: Class and Function keyed by their `owner` within a file, so two
 #: classes' same-named methods are two nodes, `name_refs` recording the
 #: source's owner; C++ templates, Java records, TS class-field arrow
-#: functions and Go methods on a pointer to a generic type extracted).
+#: functions and Go methods on a pointer to a generic type extracted; 12:
+#: `name_refs` entries of one marked layout recording both ends' owners, a
+#: nested function's owner including its functions, and calls to another
+#: file's top-level function narrowed to it).
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 11
+INDEX_FORMAT = 12
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:

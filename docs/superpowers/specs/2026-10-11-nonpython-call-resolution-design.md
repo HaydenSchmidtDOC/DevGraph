@@ -629,12 +629,13 @@ list), and a resolver that knows the owner of a call's target names it: a
 typed receiver's or `this`/`self` call to a class declared in the file
 links that class's member (Python, JS/TS, Java, Kotlin, C#, Go, Rust; C++
 resolves by function name alone and still links every same-named member of
-the file); across files, an imported top-level function (Python, JS/TS, a
-Go package's function) links the top-level one, never a method of its name,
-and an imported class's member (Python, JS/TS, a Java top-level class)
-that class's. C# narrows by owner through its match keys already. Kotlin
-and other packages' Go types are left as they were: an implicit receiver,
-or an embedded type, can supply the method. The measurement fixtures are
+the file); across files, an imported top-level function (a Python
+from-import or module attribute, a JS/TS ES named import or namespace
+member, a Go package's function) links the top-level one, never a method
+of its name. A method of another file's class still links every member of
+the name there (a subclass can inherit it from a base of that file), and so
+does a call through a JS/TS default import or `require`. C# narrows by
+owner through its match keys already. The measurement fixtures are
 unchanged by it (M1 to M5 equal; `name_refs` 3 to 8 % larger).
 
 A C++ explicit specialisation is its template's class, a class nested in

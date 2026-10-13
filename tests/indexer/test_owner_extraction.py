@@ -244,18 +244,18 @@ def test_cpp_specialisation_qualifier_and_nested_class_owners():
 
 
 def test_a_cross_file_call_names_the_owner_its_resolver_knows():
-    """Python: an imported function is top-level (""), an imported class's
-    method that class's; a method on an imported value names none."""
+    """Python: an imported function is top-level (""); a method of an
+    imported class or instance names no owner (the class can inherit it)."""
     result = extract_python_file(textwrap.dedent("""\
         from shop.models import Order, save, client
 
 
         def run():
-            Order().save()
             save()
 
 
         def sync():
+            Order().save()
             client.save()
         """), "shop/jobs.py", "repo")
 
@@ -265,9 +265,8 @@ def test_a_cross_file_call_names_the_owner_its_resolver_knows():
             if r.rel_type == "CALLS" and r.to_name == "save" and r.from_name == caller
         }
 
-    assert {("shop/models.py", "Order"), ("shop/models.py", "")} <= rows("run")
-    assert ("shop/models.py", None) not in rows("run")
-    assert ("shop/models.py", None) in rows("sync")  # client.save(): any `save` there
+    assert ("shop/models.py", "") in rows("run") and ("shop/models.py", None) not in rows("run")
+    assert ("shop/models.py", None) in rows("sync") and ("shop/models.py", "Order") not in rows("sync")
 
 
 def test_a_route_implements_its_handlers_owner():

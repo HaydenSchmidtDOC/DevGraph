@@ -410,15 +410,15 @@ class _CallResolver:
         """Where a name read off an imported module or a from-imported name
         can be, as owned pins (common.owned_pin): a module's attribute is a
         top-level one (owner ""), and so is a submodule's; one read off a
-        from-imported capitalised name is that class's member; anything
-        else's owner is unknown (a from-imported instance's methods)."""
+        from-imported name that is no module (a class, an instance) is any
+        of the name in its module, since a class can inherit it from a base
+        of that file."""
         ref = self.bindings.modules.get(receiver)
         if ref is not None:
             return [owned_pin(pin, "") for pin in ref.files() + ref.dirs()]
         symbol = self.bindings.symbols.get(receiver)
         if symbol is not None:
-            member_of = symbol.name if symbol.name[:1].isupper() else None
-            return [owned_pin(pin, member_of) for pin in symbol.module.files() + symbol.module.dirs()] + [
+            return symbol.module.files() + symbol.module.dirs() + [
                 owned_pin(pin, "") for pin in symbol.submodule.files() + symbol.submodule.dirs()
             ]
         return None
@@ -426,18 +426,16 @@ class _CallResolver:
     def _class_pins(self, type_name: str, method: str) -> list[str] | None:
         """Where `method` of the class `type_name` (as written) can be. An
         in-file class is walked like `self.method()` (see _method_pins); an
-        imported one's member is owned by it (its name where it is declared,
-        a top-level class's). A method it inherits from a base of its own
-        file is then not linked: that file is not read."""
+        imported one's method is any of the name in its files (its owner is
+        unknown: the class can inherit it from a base of its file)."""
         if type_name in self.classes:
             return self._method_pins(type_name, method, own=True)
         if "." in type_name:
-            module, _dot, cls = type_name.rpartition(".")
-            pins = self._module_pins(module)
-            return [owned_pin(split_owned_pin(pin)[0], cls) for pin in pins] if pins is not None else None
+            pins = self._module_pins(type_name.rsplit(".", 1)[0])
+            return [split_owned_pin(pin)[0] for pin in pins] if pins is not None else None
         symbol = self.bindings.symbols.get(type_name)
         if symbol is not None:
-            return [owned_pin(pin, symbol.name) for pin in symbol.module.files() + symbol.module.dirs()]
+            return symbol.module.files() + symbol.module.dirs()
         return None
 
     def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:

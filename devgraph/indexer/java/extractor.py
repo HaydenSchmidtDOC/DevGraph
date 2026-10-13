@@ -376,12 +376,9 @@ class _JavaResolver:
             for base in self.bases.get(cls, []):
                 pins += self.member_pins(base, method, seen | {cls}) or []
             return pins or None
-        pins = self.type_pins(cls)
-        # Another file's top-level class (the class its file is named after)
-        # owns the method; a nested class's owner chain isn't known here. A
-        # method it inherits from a base of that file is then not linked.
-        top_level = cls not in self.types or self.types[cls][1] == cls
-        return [owned_pin(pin, cls if top_level else None) for pin in pins] if pins is not None else None
+        # Another file's class: any method of the name there (the class can
+        # inherit it from a base of its file).
+        return self.type_pins(cls)
 
     # --- calls ---------------------------------------------------------------
 

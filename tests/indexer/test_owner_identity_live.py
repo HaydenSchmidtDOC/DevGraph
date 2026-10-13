@@ -410,9 +410,10 @@ def test_a_nested_function_is_owned_by_its_enclosing_functions(engine, repo):
 
 
 def test_a_call_into_another_file_reaches_the_owner_it_names(engine, repo):
-    """`from m import A, save`: `A().save()` links `A.save` only and `save()`
-    the top-level `save` only, never `B.save`; and an incremental index,
-    adding the siblings after the caller, equals a fresh scan."""
+    """`from m import A, save`: `save()` links the top-level `save` only;
+    `A().save()` every method `save` there (`A` could inherit it), never the
+    top-level one; and an incremental index, adding the siblings after the
+    caller, equals a fresh scan."""
     root, _registry, repo_id = repo
     models = write(root, "shop/models.py", "def other():\n    return 0\n")
     write(root, "shop/jobs.py", """\
@@ -431,7 +432,9 @@ def test_a_call_into_another_file_reaches_the_owner_it_names(engine, repo):
         "RETURN b.owner AS owner, x.confidence AS confidence",
         {"r": repo_id},
     )
-    assert sorted((row["owner"], row["confidence"]) for row in rows) == [("", "resolved"), ("A", "resolved")]
+    assert sorted((row["owner"], row["confidence"]) for row in rows) == [
+        ("", "resolved"), ("A", "resolved"), ("B", "resolved"),
+    ]
     equals_fresh(engine, repo_id, root)
 
 
@@ -451,4 +454,62 @@ def test_a_node_the_upgrade_left_without_an_owner_relinks_when_indexed(engine, r
     )
     index_paths(engine, repo_id, root, {models})
     assert calls(engine, repo_id) == [(".run", ".helper")]
+    equals_fresh(engine, repo_id, root)
+
+
+def _targets(engine, repo_id, caller):
+    rows = engine.run_cypher(
+        "MATCH (:Function {repo_id: $r, name: $c})-[:CALLS]->(b:Function) RETURN b.name AS n, b.file AS f, b.owner AS o",
+        {"r": repo_id, "c": caller},
+    )
+    return sorted((row["n"], row["f"], row["o"]) for row in rows)
+
+
+def test_a_method_of_another_files_class_links_as_before_owners(engine, repo):
+    """The owner of a method called on another file's class or instance is
+    unknown to the caller: an inherited `save`/`create`, an ALL_CAPS
+    instance's method, a `require`d class's static, a default import of a
+    class of another name all still link every member of the name there."""
+    root, _registry, repo_id = repo
+    write(root, "shop/models.py", """\
+        class Base:
+            def save(self):
+                return 1
+
+            @classmethod
+            def create(cls):
+                return cls()
+
+
+        class User(Base):
+            pass
+
+
+        class Registry:
+            def register(self):
+                return 2
+
+
+        REGISTRY = Registry()
+        """)
+    write(root, "shop/jobs.py", """\
+        from shop.models import User, REGISTRY
+
+
+        def run():
+            User().save()
+            User.create()
+            REGISTRY.register()
+        """)
+    write(root, "web/svc.js", "class Base { make() { return 1; } }\nclass Svc extends Base {}\nmodule.exports = Svc;\n")
+    write(root, "web/app.js", "const Svc = require('./svc');\n\nfunction build() {\n  return Svc.make();\n}\n")
+    write(root, "web/thing.ts", "export default class ThingImpl {\n  start() { return 1; }\n}\n")
+    write(root, "web/main.ts", "import Thing from './thing';\n\nexport function go() {\n  return Thing.start();\n}\n")
+    full_scan(engine, repo_id, root)
+    assert _targets(engine, repo_id, "run") == [
+        ("create", "shop/models.py", "Base"), ("register", "shop/models.py", "Registry"),
+        ("save", "shop/models.py", "Base"),
+    ]
+    assert _targets(engine, repo_id, "build") == [("make", "web/svc.js", "Base")]
+    assert _targets(engine, repo_id, "go") == [("start", "web/thing.ts", "ThingImpl")]
     equals_fresh(engine, repo_id, root)
