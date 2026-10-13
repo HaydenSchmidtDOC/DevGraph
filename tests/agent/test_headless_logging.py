@@ -12,7 +12,11 @@ import sys
 import types
 from contextlib import contextmanager
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from unittest.mock import MagicMock, patch
+
+import pytest
+from typer.testing import CliRunner
 
 try:  # pystray binds to an X display as a side effect of import (see
     # tests/conftest.py); `devgraph.agent.__init__` pulls it in transitively.
@@ -21,6 +25,8 @@ except Exception:  # pragma: no cover — depends on the host having a display
     sys.modules["pystray"] = types.ModuleType("pystray")
 
 from devgraph.agent import headless
+from devgraph.cli import main as cli_main
+from devgraph.config.settings import LOG_BACKUP_COUNT, LOG_MAX_BYTES
 
 _EXPECTED_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
@@ -108,3 +114,53 @@ def test_main_starts_the_agent_when_no_log_file_is_configured():
         assert root.handlers == []
 
     agent.start.assert_called_once_with()
+
+
+@pytest.mark.parametrize("module", ["headless", "tray"])
+def test_the_agent_log_rotates_with_a_size_cap_and_a_few_backups(tmp_path, module):
+    """One agent log line per live batch adds up; the file must not grow forever."""
+    if module == "tray":
+        from devgraph.agent import tray as agent
+    else:
+        agent = headless
+    log_path = tmp_path / "devgraph.log"
+    settings = MagicMock()
+    settings.log_file = log_path
+
+    with _isolated_root_logger() as root, \
+         patch.object(agent, "get_settings", return_value=settings), \
+         patch.object(agent, "LOG_MAX_BYTES", 2000):
+        agent._configure_logging()
+        [handler] = root.handlers
+        assert isinstance(handler, RotatingFileHandler)
+        assert handler.maxBytes == 2000 and handler.backupCount == LOG_BACKUP_COUNT
+        for i in range(200):
+            logging.getLogger("devgraph.agent").info("batch %03d done", i)
+        handler.flush()
+
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == ["devgraph.log"] + [f"devgraph.log.{n}" for n in range(1, LOG_BACKUP_COUNT + 1)]
+    assert all(p.stat().st_size <= 2000 for p in tmp_path.iterdir())
+    assert "batch 199 done" in log_path.read_text(encoding="utf-8")
+    assert LOG_MAX_BYTES == 5 * 1024 * 1024 and LOG_BACKUP_COUNT == 3
+
+
+def test_devgraph_logs_reads_across_a_rollover(tmp_path):
+    """Just after a rollover the current file holds a line or two; the
+    requested tail comes from the newest older file too, in order."""
+    log_path = tmp_path / "devgraph.log"
+    (tmp_path / "devgraph.log.2").write_text("2026-01-01 INFO x: ancient\n", encoding="utf-8")
+    (tmp_path / "devgraph.log.1").write_text(
+        "".join(f"2026-01-02 INFO x: old {i}\n" for i in range(5)), encoding="utf-8"
+    )
+    log_path.write_text("2026-01-03 INFO x: new 0\n", encoding="utf-8")
+    settings = MagicMock()
+    settings.log_file = log_path
+
+    with patch.object(cli_main, "get_settings", return_value=settings):
+        result = CliRunner().invoke(cli_main.app, ["logs", "-n", "3"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == [
+        "2026-01-02 INFO x: old 3", "2026-01-02 INFO x: old 4", "2026-01-03 INFO x: new 0",
+    ]

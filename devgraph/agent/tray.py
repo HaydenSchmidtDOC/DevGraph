@@ -24,6 +24,7 @@ import logging
 import threading
 import webbrowser
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 
 import uvicorn
 from PIL import Image, ImageDraw
@@ -33,6 +34,7 @@ from devgraph.agent.shutdown import shutdown
 from devgraph.agent.sync import RepoSync
 from devgraph.analytics.insights import InsightsScheduler
 from devgraph.config import get_settings
+from devgraph.config.settings import LOG_BACKUP_COUNT, LOG_MAX_BYTES
 from devgraph.dashboard.app import build_app
 from devgraph.dashboard.serving import DashboardFailure, serve_dashboard
 from devgraph.dashboard.url import dashboard_url
@@ -70,7 +72,8 @@ _WARN_COLOR = (200, 60, 60)
 
 
 def _configure_logging() -> None:
-    """Wire Python logging to a file handler at `settings.log_file`.
+    """Wire Python logging to a rotating file handler at `settings.log_file`
+    (rolled over at `LOG_MAX_BYTES`, keeping `LOG_BACKUP_COUNT` older files).
 
     The tray runs detached (pythonw.exe, stdout/stderr = DEVNULL), so a
     failure inside a background thread — e.g. the dashboard failing to bind
@@ -88,7 +91,9 @@ def _configure_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+        handlers=[
+            RotatingFileHandler(log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
+        ],
     )
 
 

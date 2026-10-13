@@ -3214,8 +3214,14 @@ def logs(
     }
     min_level = level_map.get(level.upper(), logging.INFO)
 
+    # The agent rotates the file (see LOG_MAX_BYTES): just after a rollover the
+    # current file holds only a few lines, so the newest older file is read
+    # before it, oldest first.
+    previous = log_path.with_name(log_path.name + ".1")
     try:
-        text = log_path.read_text(encoding="utf-8")
+        text = "".join(
+            path.read_text(encoding="utf-8") for path in (previous, log_path) if path.exists()
+        )
     except OSError as e:
         console.print(f"[red][X] Error reading log file:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
