@@ -272,20 +272,24 @@ def tiered(pin: str | None) -> bool:
     return pin is not None and bool(split_pin(pin).ranks)
 
 
-def shadowed(pin: str, keys: Iterable[str], others: Iterable[tuple[str, Iterable[str]]]) -> bool:
+def shadowed(
+    pin: str, keys: Iterable[str] | None, others: Iterable[tuple[str | None, Iterable[str] | None]],
+) -> bool:
     """Whether the tiered pin `pin` leaves out a node it matches whose `mkeys`
     are `keys`: one of `others` (the (path, mkeys) of the nodes of its label
     and name) that the pin's path and flags match, its keys aside, holds a
     key of a nearer tier than the node's nearest. The engine's Cypher
-    mirrors this; a pin without tiers shadows nothing."""
+    mirrors this: a node without `mkeys` (None) holds none, and a
+    file-less one (path None or "") no path pin matches. A pin without
+    tiers shadows nothing."""
     parts = split_pin(pin)
     if not parts.ranks:
         return False
     rank = dict(zip(parts.scope, parts.ranks))
-    own = min((rank[key] for key in keys if key in rank), default=len(rank))
+    own = min((rank[key] for key in keys or () if key in rank), default=len(rank))
     path_only = pin.rsplit("@", 1)[0]
     return any(
-        pin_matches(path_only, path) and any(rank.get(key, own) < own for key in other_keys)
+        bool(path) and pin_matches(path_only, path) and any(rank.get(key, own) < own for key in other_keys or ())
         for path, other_keys in others
     )
 

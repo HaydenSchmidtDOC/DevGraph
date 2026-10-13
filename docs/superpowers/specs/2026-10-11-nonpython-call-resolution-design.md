@@ -610,8 +610,13 @@ the namespace each enclosing level reads `A` in (`N.A.B:T`, `N.A:B.T`,
 `N:A.B.T` at level `N`, `U:A.B.T` for its usings `U`, the splits at the
 global level); and a receiver's extension keys `Ns:+T`, one tier per
 enclosing namespace with its usings (C# looks for extension methods per
-namespace declaration, its own namespace and its usings together). An
-alias's target, `global::A.B.T`, and a `using static` type are one tier. A
+namespace declaration, its own namespace and its usings together). A
+using alias for the name (or for a qualified name's first part) belongs
+to its declaration's level: after that level's namespace's own types, in
+place of its using-namespace imports, its target split at each dot as one
+tier, and the lookup ends there (C# resolves an alias before a using's
+types, and nothing farther is reached). `global::A.B.T` and a `using
+static` type are one tier. A
 pin that unions several lookups (a class's several bases, a partial
 class's own keys with a base's, several `using static` types) is one tier:
 one type's nearer candidate must not hide another type's. A key group
@@ -631,14 +636,19 @@ so three things change:
   leaves out), so the group can be written again from the graph alone.
 - *Changed names re-run their tiered groups.* For each label and name with
   a node the batch adds, removes (`previous_nodes - batch_nodes`) or rekeys,
-  each tiered group outside the batch to that name is re-run after pass 2,
-  in one transaction (`engine.rerun_edges`): its edges (from its source, of
+  each tiered group outside the batch to that name one of whose pins holds
+  one of those nodes' keys, old or new, is re-run after pass 2, 200 groups
+  per transaction (`engine.rerun_edges`): a node holding none of a pin's
+  keys neither links nor shadows under it, so the other groups cannot
+  change, and a node without keys (any language but C#) touches none.
+  Re-running a group means its edges (from its source, of
   its type, to that name, written by its file) lose that file from their
   `origins`, and its rows are written again exactly as the writer's. This
   covers both directions: a nearer node added retracts the farther edges,
   one removed or rekeyed away restores them, and a move between namespaces
   or files is both. `remove_paths` lists the deleted files' nodes first and
-  re-runs their names' groups after deleting. A tiered group never takes
+  re-runs their names' groups after deleting, only when a deleted file is
+  a `.cs` file (no other language writes match keys). A tiered group never takes
   the additive relink (`best_pin` on the added node alone), which would
   link a shadowed node. Other groups keep it.
 
@@ -654,8 +664,10 @@ nearer keys are computed once per matched node (`WITH`), and the test is
 select-or-anti-semi-apply seeking the index; a first cut wrapping the
 `NOT EXISTS` in a `CASE` was evaluated as an expression scanning every
 node of the label, and made the 10-project synthetic scan 5x slower. A
-touched name re-runs its tiered callers outside the batch, a retraction
-and a write per group, where the additive relink wrote one edge.
+touched name re-runs those of its tiered callers outside the batch whose
+keys it holds, a retraction and a write per group, where the additive
+relink wrote one edge. A batch of another language costs nothing more:
+its nodes have no keys, so it looks up no `name_refs` for them.
 
 ## C++ (`devgraph/indexer/cpp/extractor.py`)
 

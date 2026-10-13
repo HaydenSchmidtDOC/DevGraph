@@ -414,13 +414,15 @@ class _CsScope(NamedTuple):
     namespace too); `levels` the order C# looks a name up in: each
     enclosing namespace, innermost first, then the global one (`.`), with
     the namespaces the usings of its declaration bring in (the global
-    one's: the file's and its project's)."""
+    one's: the file's and its project's); `alias_levels` the level each
+    alias is declared at (the innermost declaration's)."""
 
     chain: tuple[str, ...]
     namespaces: frozenset[str]
     aliases: dict[str, tuple[str, ...]]
     statics: tuple[tuple[str, ...], ...]
     levels: tuple[tuple[str, frozenset[str]], ...]
+    alias_levels: dict[str, str]
 
     @property
     def namespace(self) -> str:
@@ -598,6 +600,7 @@ class _CsResolver:
             {using.alias: names for _at, using, names in usings if using.alias},
             tuple(sorted({names for _at, using, names in usings if using.static and not using.alias})),
             tuple(used.items()),
+            {using.alias: at for at, using, _names in usings if using.alias},
         )
         self._scopes[cache] = found
         return found
@@ -605,36 +608,39 @@ class _CsResolver:
     def type_keys(self, qualifier: str, name: str, scope: _CsScope, classes: list[str]) -> list[set[str]]:
         """The match keys the type `qualifier.name`, written at a site in
         `scope` inside `classes` (innermost first), can have, in the tiers C#
-        looks it up in, nearest first (graph/schema.py `tiered_pin`): an
-        alias's target, split at each dot (`_splits`: a type can be nested),
-        one tier; unqualified, the name nested in each enclosing class
+        looks it up in, nearest first (graph/schema.py `tiered_pin`):
+        unqualified, the name nested in each enclosing class
         (`Ns:Outer.Inner`), innermost first, then for each level of
         `scope.levels` the name in its namespace and then in its usings'
         namespaces; qualified `A.B.T` the same way, each split within it
         relative to the level's namespace and `A.B.T` nested in a type `A`
         of it, then `A.B.T` nested in a type of its usings' namespaces (at
-        the global level, each split of it: `global::` only there)."""
-        if not qualifier:
-            if name in scope.aliases:
-                return [set().union(*(_splits(target) for target in scope.aliases[name]))]
-            path = list(reversed(classes))
-            tiers = [{f"{scope.namespace}:{'.'.join([*path[:i], name])}"} for i in range(len(path), 0, -1)]
-            for namespace, usings in scope.levels:
-                tiers += [{f"{namespace}:{name}"}, {f"{using}:{name}" for using in usings}]
-            return tiers
+        the global level, each split of it: `global::` only there). A using
+        alias for the name (or for `A`) is its declaration level's: after
+        that level's namespace, in place of its usings, its target split at
+        each dot (`_splits`: a type can be nested); the lookup ends there."""
         if qualifier.startswith("global::"):
             return [_splits(".".join(part for part in (qualifier.removeprefix("global::"), name) if part))]
         head, _dot, rest = qualifier.partition(".")
-        if head in scope.aliases:
-            return [set().union(*(_splits(".".join(part for part in (target, rest, name) if part))
-                                  for target in scope.aliases[head]))]
-        dotted = f"{qualifier}.{name}"
+        alias = head if qualifier else name
+        aliased = set().union(*(_splits(".".join(part for part in (target, rest, name if qualifier else "") if part))
+                                for target in scope.aliases.get(alias, ())))
+        dotted = f"{qualifier}.{name}" if qualifier else name
         tiers = []
+        if not qualifier:
+            path = list(reversed(classes))
+            tiers = [{f"{scope.namespace}:{'.'.join([*path[:i], name])}"} for i in range(len(path), 0, -1)]
         for namespace, usings in scope.levels:
-            own = _splits(dotted) if namespace == _GLOBAL_NS else {f"{namespace}:{dotted}"} | {
-                f"{namespace}.{key}" for key in _splits(dotted) if not key.startswith(_GLOBAL_NS + ":")
-            }
-            tiers += [own, {f"{using}:{dotted}" for using in usings}]
+            if not qualifier:
+                tiers.append({f"{namespace}:{name}"})
+            else:
+                tiers.append(_splits(dotted) if namespace == _GLOBAL_NS else {f"{namespace}:{dotted}"} | {
+                    f"{namespace}.{key}" for key in _splits(dotted) if not key.startswith(_GLOBAL_NS + ":")
+                })
+            if aliased and scope.alias_levels.get(alias) == namespace:
+                tiers.append(aliased)
+                return tiers
+            tiers.append({f"{using}:{dotted}" for using in usings})
         return tiers
 
     @staticmethod

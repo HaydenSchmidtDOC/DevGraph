@@ -124,6 +124,8 @@ def test_tiered_keys_are_canonical_nearest_first():
     (["c:T"], [("x/U.md", ["a:T"])], False),  # a file the pin's path leaves out shadows nothing ...
     (["c:T"], [("vendor/U.cs", ["a:T"])], False),  # ... nor a vendored one
     (["c:T"], [("x/U.cs", ["z:T"]), ("y/U.cs", [])], False),
+    (None, [("x/U.cs", ["a:T"])], True),  # a node without keys is matched by none, shadowed by any
+    (["c:T"], [("x/U.cs", None), (None, ["a:T"]), ("", ["a:T"])], False),  # no keys; file-less
 ])
 def test_a_nearer_tier_shadows_a_farther_one(keys, others, left_out):
     pin = "/.?.cs^@a:T;b:T;c:T"
@@ -384,54 +386,71 @@ def test_module_pins_seek_by_directory_and_basename_as_pin_matches_says(engine, 
 
 
 def test_the_cypher_shadow_test_agrees_with_shadowed(engine, repo_id):
-    """Random tiered pins (with exclusions) on CALLS rows link, among random
-    nodes of their name (paths and match keys), exactly those `pin_matches`
-    and `shadowed` say: the row's pin matches the node, no exclusion does,
-    and no node its path matches holds a nearer tier's key."""
+    """Random tiered pins (every path kind but a file, with flags, an owner
+    and exclusions) on CALLS rows to Functions and IMPORTS rows to Classes
+    link, among random nodes of their name (paths, owners and match keys),
+    exactly those `pin_matches` and `shadowed` say: the row's pin matches
+    the node, its owner is the row's (when it names one), no exclusion
+    matches, and no node its path and flags match, of any owner, holds a
+    nearer tier's key."""
     rng = random.Random(7)
     keys = ["N:A", "M:A", ".:A", "N.M:A", "N:+A"]
     nodes, rels, expected = [], [], set()
     shadows = 0
-    for i in range(400):
+    for i in range(1500):
         name = f"g{i}"
-        pin = tiered_pin(
-            rng.choice(["/.?.cs^", "/.", "/a/.", "a/", "/.?.cs"]),
-            [rng.sample(keys, rng.randint(1, 2)) for _ in range(rng.randint(2, 4))],
-        )
+        label = rng.choice(["Function", "Class"])
+        base = rng.choice(["/.", "/a/.", "a/.", ".", "a/", "/ab/", "/.cs"])
+        pin = base
+        if base.endswith(".") and not base.startswith("/") and rng.random() < 0.3:
+            pin += "~"
+        if rng.random() < 0.5:
+            pin += "?.cs"
+        if rng.random() < 0.4:
+            pin += rng.choice(["^", "^t"])
+        if rng.random() < 0.3:
+            pin += "!_g.cs"
+        if base == "/.cs":  # a suffix pin: a file named `.cs`, never one of these
+            pin = "/C.java" + pin[len(base):]
+        pin = tiered_pin(pin, [rng.sample(keys, rng.randint(1, 2)) for _ in range(rng.randint(2, 4))])
         candidates = {}
         for _ in range(rng.randint(1, 5)):
             path = _random_path(rng)
-            path = path if rng.random() < 0.3 else path.rsplit(".", 1)[0] + ".cs"
-            candidates[path] = None if rng.random() < 0.1 else sorted(rng.sample(keys, rng.randint(0, 2)))
-        exclude = sorted(rng.sample(sorted(candidates), 1)) if rng.random() < 0.2 else []
+            path = path if rng.random() < 0.3 else path.rsplit(".", 1)[0] + rng.choice([".cs", "_g.cs"])
+            owner = rng.choice(["", "A", "B"])
+            candidates[(path, owner)] = None if rng.random() < 0.1 else sorted(rng.sample(keys, rng.randint(0, 2)))
+        exclude = sorted({rng.choice(sorted(candidates))[0]}) if rng.random() < 0.2 else []
+        to_owner = rng.choice([None, None, "A"])
         nodes += [
-            {"label": "Function", "repo_id": repo_id, "name": name,
-             "properties": {"file": path, "owner": "", **({"mkeys": mkeys} if mkeys is not None else {})}}
-            for path, mkeys in candidates.items()
+            {"label": label, "repo_id": repo_id, "name": name,
+             "properties": {"file": path, "owner": owner, **({"mkeys": mkeys} if mkeys is not None else {})}}
+            for (path, owner), mkeys in candidates.items()
         ]
         rels.append({
-            "from_label": "Module", "from_name": "origin.cs", "rel_type": "CALLS", "to_label": "Function",
-            "to_name": name, "repo_id": repo_id, "to_file": pin, "exclude": exclude, "origin": "origin.cs",
+            "from_label": "Module", "from_name": "origin.cs", "rel_type": "CALLS" if label == "Function" else "IMPORTS",
+            "to_label": label, "to_name": name, "repo_id": repo_id, "to_file": pin, "exclude": exclude,
+            "origin": "origin.cs", "to_owner": to_owner,
         })
-        others = [(path, mkeys or ()) for path, mkeys in candidates.items()]
-        for path, mkeys in candidates.items():
-            if _expected(pin, exclude, path, mkeys):
-                if shadowed(pin, mkeys or (), others):
+        others = [(path, mkeys) for (path, _owner), mkeys in candidates.items()]
+        for (path, owner), mkeys in candidates.items():
+            if _expected(pin, exclude, path, mkeys) and to_owner in (None, owner):
+                if shadowed(pin, mkeys, others):
                     shadows += 1
                 else:
-                    expected.add((name, path))
+                    expected.add((name, path, owner))
     engine.upsert_nodes(
         nodes + [{"label": "Module", "repo_id": repo_id, "name": "origin.cs", "properties": {"source_file": "origin.cs"}}]
     )
     engine.upsert_relationships(rels)
     got = {
-        (row["n"], row["f"]) for row in engine.run_cypher(
-            "MATCH (:Module {repo_id: $r, name: 'origin.cs'})-[:CALLS]->(b) RETURN b.name AS n, b.file AS f",
+        (row["n"], row["f"], row["o"]) for row in engine.run_cypher(
+            "MATCH (:Module {repo_id: $r, name: 'origin.cs'})-[:CALLS|IMPORTS]->(b) "
+            "RETURN b.name AS n, b.file AS f, b.owner AS o",
             {"r": repo_id},
         )
     }
     assert sorted(got ^ expected) == []
-    assert len(expected) > 60 and shadows > 30
+    assert len(expected) > 100 and shadows > 25
 
 
 # --- live writes and relinks per pin kind -----------------------------------------
@@ -868,3 +887,27 @@ def test_a_directory_pin_plan_cached_on_a_tiny_graph_is_replanned_once_it_grows(
     finally:
         engine.delete_repository(f"{repo_id}-tiny")
     assert sum(hits) < 15_000, hits
+
+
+def test_python_removals_read_no_name_refs(engine, repo_id, tmp_path, monkeypatch):
+    """Only C# writes match keys, so only a C# node's removal can change what
+    a tiered pin links: a Python symbol's removal and a Python file's
+    deletion look up no `name_refs`."""
+    calls = []
+    real = GraphEngine.find_name_refs
+
+    def find_name_refs(self, *args, **kwargs):
+        calls.append(args)
+        return real(self, *args, **kwargs)
+
+    a = _write(tmp_path, "a.py", "def f():\n    return 0\n\n\ndef g():\n    return 0\n")
+    _write(tmp_path, "b.py", "from a import f\n\n\ndef main():\n    return f()\n")
+    c = _write(tmp_path, "c.py", "def h():\n    return 0\n")
+    _scan(engine, repo_id, tmp_path)
+    monkeypatch.setattr(GraphEngine, "find_name_refs", find_name_refs)
+    a.write_text("def f():\n    return 0\n")
+    index_paths(engine, repo_id, tmp_path, {a})
+    c.unlink()
+    remove_paths(engine, repo_id, tmp_path, {c})
+    assert calls == []
+    _equals_fresh(engine, repo_id, tmp_path)

@@ -214,8 +214,11 @@ def test_imports_are_the_classes_a_file_references_under_their_keys():
     by_name = {}
     for row in rows:
         by_name.setdefault(row.to_name, []).append(_keys(row))
-    # The alias's exact target, at each split (a type can be nested).
-    assert by_name["Account"] == [{"Shop.Domain:Account", "Shop:Domain.Account", ".:Shop.Domain.Account"}]
+    # The alias's exact target, at each split (a type can be nested), its
+    # last tier: after the namespaces nearer than its declaration.
+    (account,) = [_tiers(r) for r in rows if r.to_name == "Account"]
+    assert account == [{"Shop.Mapping:UserMapper.Alias"}, {"Shop.Mapping:Alias"}, {"Shop:Alias"}, {".:Alias"},
+                       {"Shop.Domain:Account", "Shop:Domain.Account", ".:Shop.Domain.Account"}]
     assert by_name["Formatting"] == [{"Shop.Text:Formatting", "Shop:Text.Formatting", ".:Shop.Text.Formatting"}]
     # `User` (Legacy.Accounts by the using) and `Shop.Domain.User` (qualified).
     users = sorted(by_name["User"], key=len)
@@ -362,9 +365,15 @@ def test_aliases_name_their_exact_target_and_a_using_static_its_type():
 
         class Program { void Main() { LA.User.Parse(); J.Run(); Title(); } }
     """
-    assert _call_keys(source, "Main", "Parse") == {"Legacy.Accounts:User", "Legacy:Accounts.User",
-                                                    ".:Legacy.Accounts.User"}
-    assert _call_keys(source, "Main", "Run") == {"Shop:Jobs", ".:Shop.Jobs"}
+    # An alias is its declaration's level (here the file's): after the
+    # namespaces nearer than it, and nothing after it.
+    assert _call_tiers(source, "Main", "Parse") == [[
+        {"Shop.App:LA.User", "Shop.App.LA:User"}, {"Shop:LA.User", "Shop.LA:User"}, {".:LA.User", "LA:User"},
+        {"Legacy.Accounts:User", "Legacy:Accounts.User", ".:Legacy.Accounts.User"},
+    ]]
+    assert _call_tiers(source, "Main", "Run") == [[
+        {"Shop.App:Program.J"}, {"Shop.App:J"}, {"Shop:J"}, {".:J"}, {"Shop:Jobs", ".:Shop.Jobs"},
+    ]]
     assert _call_keys(source, "Main", "Title") == {"Shop.Text:Formatting", "Shop:Text.Formatting",
                                                     ".:Shop.Text.Formatting"}
 
@@ -379,7 +388,8 @@ def test_a_projects_usings_and_global_usings_are_in_scope(tmp_path):
     config = ResolverConfig(tmp_path)
     source = "namespace App;\nclass Program { void Main() { Formatting.Title(); User.Make(); L.Parse(); Run(); } }\n"
     assert {"Shop.Text:Formatting", "Shop.Models:Formatting"} <= _call_keys(source, "Main", "Title", "App/P.cs", config)
-    assert _call_keys(source, "Main", "Parse", "App/P.cs", config) == {"Legacy:User", ".:Legacy.User"}
+    assert _call_keys(source, "Main", "Parse", "App/P.cs", config) == {"Legacy:User", ".:Legacy.User", "App:L", ".:L",
+                                                                        "App:Program.L"}
     assert _call_keys(source, "Main", "Run", "App/P.cs", config) == {"Shop:Jobs", ".:Shop.Jobs"}
     # A file outside every project has none of them.
     assert "Shop.Text:Formatting" not in _call_keys(source, "Main", "Title", "Scripts/P.cs", config)
@@ -635,20 +645,23 @@ def test_a_types_keys_are_tiered_as_csharp_looks_the_name_up():
     ]]
 
 
-def test_an_enclosing_namespaces_type_shadows_a_usings():
-    """`User` in Shop.Domain.Services with `using Legacy.Accounts` is
+@pytest.mark.parametrize("using", ["using Legacy.Accounts;", "using User = Legacy.Accounts.User;"])
+def test_an_enclosing_namespaces_type_shadows_a_usings(using):
+    """`User` in Shop.Domain.Services with `using Legacy.Accounts` (or an
+    alias `User` for Legacy.Accounts.User: an alias is its declaration's
+    level, here the file's, after the enclosing namespaces) is
     Shop.Domain.User while that type exists (Legacy's is left out, the
     calls' and the import's alike), and Legacy.Accounts.User when it
     does not."""
-    source = """
-        using Legacy.Accounts;
+    source = f"""
+        {using}
 
         namespace Shop.Domain.Services;
 
         public class UserService
-        {
+        {{
             public void Register(User user) => user.Display();
-        }
+        }}
     """
     path = "src/Services/UserService.cs"
     rows = [r for r in _rows(source, path) if r.to_name == "Display"]
@@ -749,6 +762,66 @@ def test_a_nearer_type_retracts_a_farther_ones_edges_and_restores_them(engine, r
     # Back, with a caller edited in the same batch.
     assert step([("Models/User.cs", _USER.format("Shop.Domain")),
                  ("App/UserService.cs", service.read_text() + "// edited\n")]) == ({"Models/User.cs"}, 2)
+
+
+def test_an_alias_is_shadowed_by_a_nearer_namespaces_type(engine, repo_id, tmp_path):
+    """`using User = Legacy.Accounts.User;` at the top of a file in
+    Shop.Domain.Services: Shop.Domain.User, once added, hides the alias's
+    target (C# finds a namespace's own type before its declaration's
+    alias), and its removal restores it. Every step equals a fresh scan."""
+    _write(tmp_path, "Legacy/User.cs", _USER.format("Legacy.Accounts"))
+    _write(tmp_path, "App/UserService.cs", _SERVICE.format("UserService").replace(
+        "using Legacy.Accounts;", "using User = Legacy.Accounts.User;"))
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+
+    def targets():
+        return {e[2] for e in _edges(engine, repo_id, "CALLS") if e[1] == "Register"}
+
+    assert targets() == {"Legacy/User.cs"}
+    models = _write(tmp_path, "Models/User.cs", _USER.format("Shop.Domain"))
+    index_paths(engine, repo_id, tmp_path, {models})
+    assert targets() == {"Models/User.cs"}
+    _equals_fresh(engine, repo_id, tmp_path)
+    models.unlink()
+    remove_paths(engine, repo_id, tmp_path, {models})
+    assert targets() == {"Legacy/User.cs"}
+    _equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_a_touched_name_reruns_only_the_groups_its_keys_meet(engine, repo_id, tmp_path, monkeypatch):
+    """A `Get` added in a namespace no caller's pin names writes no other
+    file's group again; one in the caller's own namespace writes the
+    caller's again, and it hides the farther one."""
+    groups = []
+    real = GraphEngine.rerun_edges
+
+    def rerun_edges(self, repo, rerun, rels):
+        groups.extend((group["from_name"], group["to_name"]) for group in rerun)
+        return real(self, repo, rerun, rels)
+
+    monkeypatch.setattr(GraphEngine, "rerun_edges", rerun_edges)
+    repo = "namespace {}\n{{\n    public class Repo {{ public void Get() {{ }} }}\n}}\n"
+    _write(tmp_path, "Models/Repo.cs", repo.format("Shop.Domain"))
+    _write(tmp_path, "App/Svc.cs", "namespace Shop.Domain.Services;\n\n"
+                                    "public class Svc { public void Run(Repo r) { r.Get(); } }\n")
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+
+    def targets():
+        return {e[2] for e in _edges(engine, repo_id, "CALLS") if e[1] == "Run"}
+
+    assert targets() == {"Models/Repo.cs"}
+    unrelated = _write(tmp_path, "Other/Cache.cs", repo.format("Unrelated").replace("Repo", "Cache"))
+    index_paths(engine, repo_id, tmp_path, {unrelated})
+    assert groups == [] and targets() == {"Models/Repo.cs"}
+    _equals_fresh(engine, repo_id, tmp_path)
+    nearer = _write(tmp_path, "Near/Repo.cs", repo.format("Shop.Domain.Services"))
+    index_paths(engine, repo_id, tmp_path, {nearer})
+    assert ("Run", "Get") in groups and targets() == {"Near/Repo.cs"}
+    _equals_fresh(engine, repo_id, tmp_path)
 
 
 def test_a_library_root_the_files_own_namespace_is_under_stays_a_candidate():

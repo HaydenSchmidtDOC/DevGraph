@@ -38,7 +38,7 @@ from devgraph.config.project_schema import (
     schema_file_hash,
 )
 from devgraph.graph.engine import ABORTS_BATCH, GraphEngine, provision_repository_schema
-from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES
+from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES, split_pin
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.common import (
     best_pin,
@@ -910,12 +910,15 @@ def index_paths(
     )
     if rewritten:
         engine.write_match_keys(repo_id, rewritten)
-    # The names whose nodes the batch adds, removes or rekeys: a tiered pin's
-    # edges to such a name depend on all its nodes, so the relink writes
-    # them again (see _relink_name_refs).
-    shadow_names = {
-        node[:2] for node in added | rekeyed | (previous_nodes - batch_nodes) if node[0] in FILE_SCOPED_LABELS
-    }
+    # The match keys, old and new, of the nodes the batch adds, removes or
+    # rekeys, by name: a tiered pin's edges to such a name depend on all its
+    # nodes, so the relink writes the groups whose keys meet them again (see
+    # _relink_name_refs). A node with no keys (any other language's) can
+    # neither link nor shadow under an `@` pin, so it touches none.
+    shadow_names = _shadow_keys(
+        (node, previous_keys.get(node), match_keys.get(node))
+        for node in added | rekeyed | (previous_nodes - batch_nodes)
+    )
     referrers = _find_referrers(engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path))
     for rel_path in sorted(referrers):
         index_one(rel_path, root_resolved / rel_path)
@@ -1374,10 +1377,26 @@ def _match_keys(
     }
 
 
+def _shadow_keys(nodes) -> dict[tuple[str, str], set[str]]:
+    """(label, name) -> the match keys of these (node, old mkeys, new mkeys)
+    of a file-scoped label, old and new together; a name whose nodes hold
+    none is left out."""
+    found: dict[tuple[str, str], set[str]] = {}
+    for node, old, new in nodes:
+        keys = set(old or ()) | set(new or ())
+        if keys and node[0] in FILE_SCOPED_LABELS:
+            found.setdefault(node[:2], set()).update(keys)
+    return found
+
+
+#: The most tiered groups `_relink_name_refs` writes again per transaction.
+RERUN_GROUPS = 200
+
+
 def _relink_name_refs(
     engine: GraphEngine, repo_id: str, added: set[tuple[str, str, str, str]], skip: set[str],
     match_keys: dict[tuple[str, str, str, str], tuple[str, ...] | None] | None = None,
-    shadow_names: set[tuple[str, str]] = frozenset(),
+    shadow_names: Mapping[tuple[str, str], set[str]] | None = None,
 ) -> None:
     """Re-write the by-name edges that code files outside `skip` recorded in
     their Modules' `name_refs` (see name_ref_properties) and that meet a node
@@ -1404,12 +1423,15 @@ def _relink_name_refs(
 
     A group (one source's entries to one name) with a tiered pin
     (graph/schema.py `tiered_pin`) is never relinked edge by edge: whether
-    it links a node depends on every node of the name. When its (to_label,
-    to_name) is in `shadow_names` (a name whose nodes the batch added,
+    it links a node depends on every node of the name. When one of its
+    pins' keys is among `shadow_names`' keys for its (to_label, to_name)
+    (the old and new match keys of the nodes of that name the batch added,
     removed or rekeyed) it is written again whole, as its writer wrote it
-    (engine.rerun_edges: its file's edges of the group go first); else it
-    stays as it is.
+    (engine.rerun_edges: its file's edges of the group go first),
+    RERUN_GROUPS groups per transaction; else it stays as it is: a node
+    holding none of a pin's keys neither links nor shadows under it.
     """
+    shadow_names = shadow_names or {}
     if not added and not shadow_names:
         return
     pinned: dict[tuple[str, str], set[tuple[str | None, str | None]]] = {}
@@ -1419,7 +1441,7 @@ def _relink_name_refs(
         if label == "Module":
             modules.add(name)
     rels = []
-    rerun = []
+    rerun: list[tuple[dict, list[dict]]] = []
 
     def relink(origin, fields, from_file, to_file, confidence, exclude=(), to_name=None, from_owner=None,
                to_owner=None):
@@ -1452,19 +1474,23 @@ def _relink_name_refs(
             owner = from_owner if from_file else None
             owners = owners_by_pin(pins) if pins is not None else {}
             if pins is not None and any(tiered(pin) for pin in owners):
-                if (to_label, to_name) in shadow_names:
-                    rerun.append({
+                touched = shadow_names.get((to_label, to_name), set())
+                if any(touched & set(split_pin(pin).scope) for pin in owners):
+                    group = {
                         "rel_type": fields[0], "from_label": from_label, "from_name": from_name,
                         "from_file": from_file or None, "from_owner": owner, "to_label": to_label,
                         "to_name": to_name, "origin": origin,
-                    })
+                    }
                     # The writer's rows (calls.call_rows).
+                    start = len(rels)
                     for pin, exclude in pin_excludes(owners, origin).items():
                         for to_owner in [None] if None in owners[pin] else sorted(owners[pin]):
                             relink(
                                 origin, fields, from_file, pin, pin_confidence(pin, confidence), exclude,
                                 from_owner=owner, to_owner=to_owner,
                             )
+                    rerun.append((group, rels[start:]))
+                    del rels[start:]
                 continue
             if pins is None:
                 for to_file, to_owner in pinned.get((to_label, to_name), ()):
@@ -1500,9 +1526,10 @@ def _relink_name_refs(
                                 origin, fields, source_file, to_file, conf, exclude, from_owner=source_owner,
                                 to_owner=to_owner,
                             )
-    if rerun:
-        engine.rerun_edges(repo_id, rerun, rels)
-    elif rels:
+    for start in range(0, len(rerun), RERUN_GROUPS):
+        chunk = rerun[start:start + RERUN_GROUPS]
+        engine.rerun_edges(repo_id, [group for group, _rows in chunk], [row for _group, rows in chunk for row in rows])
+    if rels:
         engine.upsert_relationships(rels)
 
 
@@ -1824,12 +1851,13 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     removed = {f for f in below if not _present(repo_root, f, listings)}
     removed |= {key for key in keys if not _holds_present_file(repo_root, key, listings)}
 
-    # The names of the symbols that go: a tiered pin's edges to such a name
-    # depend on all its nodes (see _relink_name_refs).
-    shadow_names = {
-        node[:2] for node in (engine.list_file_nodes(repo_id, sorted(removed)) if removed else ())
-        if node[0] in FILE_SCOPED_LABELS
-    }
+    # The names and match keys of the symbols that go: a tiered pin's edges
+    # to such a name depend on all its nodes (see _relink_name_refs). Only
+    # C# writes match keys, so only a deleted .cs file is looked at.
+    gone_cs = sorted(rel for rel in removed if rel.endswith(".cs"))
+    shadow_names = _shadow_keys(
+        (node[:4], node[4], None) for node in (engine.list_file_nodes(repo_id, gone_cs) if gone_cs else ())
+    )
     # Must match the repo-relative key index_paths() writes for every
     # extractor (Module/Class/Function/Document nodes, and shared nodes'
     # `sources`).
@@ -1837,7 +1865,8 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
         engine.delete_nodes_by_source_file(repo_id, rel)
     if removed:
         engine.update_skipped_files(repo_id, drop=removed)
-    _relink_name_refs(engine, repo_id, set(), removed, shadow_names=shadow_names)
+    if shadow_names:
+        _relink_name_refs(engine, repo_id, set(), removed, shadow_names=shadow_names)
 
     ok, fs_spec, docs_spec = specs
     if removed:
