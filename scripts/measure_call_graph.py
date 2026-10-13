@@ -348,16 +348,21 @@ def measure_m5(engine: GraphEngine, repo_id: str, root: Path, py_files: list[str
 
 
 def measure_m6(engine: GraphEngine, repo_id: str, timings: dict) -> dict:
-    sizes = [
-        (row["name"], sum(len(e.encode("utf-8")) for e in row["refs"]))
-        for row in _rows(
-            engine, "MATCH (m:Module {repo_id: $r}) RETURN m.name AS name, coalesce(m.name_refs, []) AS refs",
-            r=repo_id,
-        )
-    ]
+    """The scan's `timings`, the largest and total `name_refs`, and the
+    largest and total C# visible sets a Module stores beside them
+    (`name_ref_visible`, its projects as a list)."""
+    rows = _rows(
+        engine, "MATCH (m:Module {repo_id: $r}) RETURN m.name AS name, coalesce(m.name_refs, []) AS refs, "
+        "coalesce(m.name_ref_visible, []) AS visible",
+        r=repo_id,
+    )
+    sizes = [(row["name"], sum(len(e.encode("utf-8")) for e in row["refs"])) for row in rows]
+    visible = [sum(len(e.encode("utf-8")) for e in row["visible"]) for row in rows]
     name, size = max(sizes, key=lambda pair: pair[1]) if sizes else (None, 0)
     return {**timings, "largest_name_refs_module": name, "largest_name_refs_bytes": size,
-            "total_name_refs_bytes": sum(s for _n, s in sizes)}
+            "total_name_refs_bytes": sum(s for _n, s in sizes),
+            "largest_visible_projects": max((len(row["visible"]) for row in rows), default=0),
+            "largest_visible_bytes": max(visible, default=0), "total_visible_bytes": sum(visible)}
 
 
 # --- fixture mode ----------------------------------------------------------------
@@ -649,6 +654,8 @@ def measure_fan_in(engine: GraphEngine, packages: int = 400, callers: int = 30) 
 
 # --- synthetic multi-project C# --------------------------------------------------
 
+#: The projects of one `generate_cs_synthetic` cluster, which reference each other and no other cluster.
+_CS_CLUSTER = 5
 _CS_PROJECT = '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n{}  </ItemGroup>\n</Project>\n'
 # The library namespaces a synthetic project's global usings and its files' usings name besides its own.
 _CS_GLOBAL_LIBRARIES = ["System", "System.Linq", "System.Collections.Generic", "System.Threading.Tasks",
@@ -682,7 +689,19 @@ def generate_cs_synthetic(
     32 match keys once there are more than about 30 projects: its sites
     then link by path alone, to every project's `Start()`).
     The fixed names repeated in every project are what a resolver that
-    reads no namespace links to every project."""
+    reads no namespace links to every project.
+
+    The projects come in clusters of `_CS_CLUSTER` (`P0`-`P4`, `P5`-`P9`,
+    ...): each but a cluster's first `<ProjectReference>`s one or two
+    earlier members of its cluster (written with `\\`, as Visual Studio
+    does), so it reaches the first transitively, and no cluster references
+    another; the App project references every project. The other project
+    a service calls `Gateway.Send()` of is one its project reaches (its
+    own, for a cluster's first). A cluster's first project also declares
+    `Co.Shared.Clock` (`Co.Shared` is a global using of every project), so
+    every cluster has a `Clock` of the same namespace and name, and each
+    service's `Clock.Now()` means its own cluster's: the same type in
+    projects that do not reference each other."""
     rng = random.Random(seed)
     calls: set[tuple[str, str, str, str]] = set()
     imports: set[tuple[str, str]] = set()
@@ -692,10 +711,20 @@ def generate_cs_synthetic(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
 
+    reaches: dict[int, set[int]] = {}
     for i in range(projects):
         base, ns = f"src/P{i}", f"Co.P{i}"
         item = rng.random() < 0.5  # Models by a <Using> item, else by each file's using
-        write(f"{base}/P{i}.csproj", _CS_PROJECT.format(f'    <Using Include="{ns}.Models" />\n' if item else ""))
+        first = i - i % _CS_CLUSTER
+        references = sorted(set(rng.sample(range(first, i), min(i - first, rng.randint(1, 2))))) if i > first else []
+        reaches[i] = set(references).union(*(reaches[j] for j in references))
+        write(f"{base}/P{i}.csproj", _CS_PROJECT.format(
+            (f'    <Using Include="{ns}.Models" />\n' if item else "")
+            + "".join(f'    <ProjectReference Include="..\\P{j}\\P{j}.csproj" />\n' for j in references)
+        ))
+        clock = f"src/P{first}/Shared/Clock.cs"
+        if i == first:
+            write(clock, "namespace Co.Shared;\n\npublic static class Clock\n{\n    public static void Now() { }\n}\n")
         globals = [*_CS_GLOBAL_LIBRARIES, f"{ns}.Util", f"{ns}.Abstractions", "Co.Common", "Co.Shared"]
         write(f"{base}/GlobalUsings.cs", "".join(f"global using {each};\n" for each in globals))
         write(f"{base}/Contracts/Contract{i}.cs", f"namespace {ns}.Contracts;\n\npublic class Contract{i} {{ }}\n")
@@ -717,7 +746,7 @@ def generate_cs_synthetic(
         imports.add((f"{base}/Models/UserExtensions.cs", f"{base}/Models/User.cs"))
         for k in range(services):
             rel = f"{base}/Services/Service{k}.cs"
-            other = rng.choice([j for j in range(projects) if j != i]) if projects > 1 else i
+            other = rng.choice(sorted(reaches[i])) if reaches[i] else i
             usings = ([] if item else [f"{ns}.Models"]) + [f"Co.P{other}.Api"]
             count = rng.randint(8, 15)
             libraries = rng.sample(_CS_FILE_LIBRARIES, min(len(_CS_FILE_LIBRARIES), (count - len(usings) + 1) // 2))
@@ -727,17 +756,20 @@ def generate_cs_synthetic(
                   f"    public void Run{k}(User user, Order order)\n    {{\n"
                   "        user.Display();\n        user.Save();\n        user.Initials();\n"
                   "        order.Total();\n        Text.Clean(\"\");\n        Gateway.Send();\n"
-                  f"        Helper{k}();\n    }}\n\n    private void Helper{k}() {{ }}\n}}\n")
+                  f"        Clock.Now();\n        Helper{k}();\n    }}\n\n    private void Helper{k}() {{ }}\n}}\n")
             caller = f"Run{k}"
             calls |= {
                 (caller, rel, "Display", f"{base}/Models/User.cs"), (caller, rel, "Save", f"{base}/Models/User.cs"),
                 (caller, rel, "Initials", f"{base}/Models/UserExtensions.cs"),
                 (caller, rel, "Total", f"{base}/Models/Order.cs"), (caller, rel, "Clean", f"{base}/Util/Text.cs"),
                 (caller, rel, "Send", f"src/P{other}/Api/Gateway.cs"), (caller, rel, f"Helper{k}", rel),
+                (caller, rel, "Now", clock),
             }
             imports |= {(rel, f"{base}/Models/{name}.cs") for name in ("User", "Order", "Order.Pricing", "UserExtensions")}
-            imports |= {(rel, f"{base}/Util/Text.cs"), (rel, f"src/P{other}/Api/Gateway.cs")}
-    write("src/App/App.csproj", _CS_PROJECT.format(""))
+            imports |= {(rel, f"{base}/Util/Text.cs"), (rel, f"src/P{other}/Api/Gateway.cs"), (rel, clock)}
+    write("src/App/App.csproj", _CS_PROJECT.format(
+        "".join(f'    <ProjectReference Include="..\\P{j}\\P{j}.csproj" />\n' for j in range(projects))
+    ))
     for name, count in (("Program", min(projects, 12)), ("Startup", projects)):
         chosen = sorted(rng.sample(range(projects), count))
         if name == "Startup":
