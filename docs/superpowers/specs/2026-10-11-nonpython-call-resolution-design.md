@@ -148,7 +148,10 @@ agree):
 - **Match keys** (`@`, for C# namespaces; see the C# section) are written
   canonically, sorted and without repeats, by `schema.scoped_pin`, which
   drops the flag when there are more than 32: the site then links by its
-  path alone. A Class or Function that carries `mkeys` always carries them,
+  path alone. The keys may come in tiers, nearest first, separated by `;`
+  (`schema.tiered_pin`): a node is then linked only when no node of its
+  name the pin's path matches holds a key of a nearer tier than its own
+  (C# shadow tiers, see the C# section). A Class or Function that carries `mkeys` always carries them,
   sorted, even when empty; a node without them (any other language, or a
   graph written before them) matches no `@` pin and every other one. The
   Cypher reads them as `coalesce(n.mkeys, [])`, and an `@` flag with no
@@ -551,17 +554,108 @@ declares an `M` itself.
 **Limits.** Stage 1 of the namespace design: a project's
 `<ProjectReference>`s are not read, so a same-named type in a project the
 writer's does not reference matches too (in one compilation, two visible
-`Ns.T` are error CS0433). An enclosing namespace's type does not shadow a
-using's (`UserService` in `Shop.Domain.Services` with `using
-Legacy.Accounts` links both `User`s' `Display`): the keys are a union, and
-picking the innermost tier that matches is a follow-up (shadow tiers). A
-key group over the cap links by class file name, as before match keys.
+`Ns.T` are error CS0433). A key group over the cap links by class file
+name, as before match keys, and is not tiered (see Shadow tiers).
 `ImplicitUsings` is not read. An extension method is keyed by its `this`
 parameter's type's simple name (`Ns:+T`), or by a type parameter's first
 constraint naming a type (`this T x where T : class, IRepo`: `+IRepo`); a
 receiver typed with a class implementing that interface (`Repo r;
 r.Touch()`) looks for `+Repo` and misses it, and a type parameter
 constrained by no type (`class`, `struct`, `new()`) keeps `+T`.
+
+### Shadow tiers (index format 14)
+
+C# finds a simple type name by tiers, and the first tier holding the name
+hides every farther one: the types nested in the enclosing classes
+(innermost first), then, for each enclosing namespace innermost first, the
+namespace's own types and then the usings of the namespace declaration
+for it in this file, and last the global namespace's types and then the
+compilation unit's usings (with the project's `<Using>` items and `global
+using`s, which act as the compilation unit's). `UserService` in
+`Shop.Domain.Services` with `using Legacy.Accounts` means `Shop.Domain.User`
+whenever that type exists, and `Legacy.Accounts.User` only when it does
+not. Stage 1 wrote a site's candidate keys as one union, so it linked both.
+
+**Encoding.** An `@` flag's keys are written in tiers, nearest first,
+separated by `;` (`@Shop.Domain.Services:User;Shop.Domain:User;Shop:User;.:User;Legacy.Accounts:User`):
+each key once, in its nearest tier, sorted within it, empty tiers
+dropped, so a pin is canonical (`schema.tiered_pin`; `scoped_pin` is the
+one-tier case and writes what Stage 1 wrote). The 32-key cap counts the
+keys of every tier. `split_pin` gives `scope` (every key, sorted, as before)
+and `ranks` (each key's tier; empty for one tier), and `pin_value` sends
+`sr` beside `sc`.
+
+**Matching.** A tiered pin links a node when the pin matches it as before
+(its path and flags, and one of its keys) and no node of its label and
+name that the pin's path and flags match (keys and the row's exclusions
+aside) holds a key of a nearer tier than the node's own nearest
+(`common.shadowed`; the engine's `NOT EXISTS` in `_end_match`, which the
+randomized Python-vs-Cypher test covers). Equal nearest tiers link alike,
+as an ambiguity in C# is an error the graph still shows. Rows with a tiered
+pin are grouped apart (`_group_rels_by_triple`), so no other row's Cypher
+tests it, and a node of the nearest tier a row reaches skips the
+subquery.
+
+The shadow is tested on the callee itself, not on the type: `user.Display()`
+is shadowed by a `Display` keyed `Shop.Domain:User`, so a nearer `User`
+without `Display` (whose `Display` an unread base declares) leaves the
+farther `User`'s linked, as Stage 1 did. Testing the type would need a
+second name per row and a relink keyed by it; the callee is what the
+relink already looks up by.
+
+**What is tiered.** One type lookup: an unqualified type name (a typed
+receiver, a static `T.M()`, an `IMPORTS` of a referenced type, a class's
+base), its keys in the tiers above; a qualified `A.B.T` the same way, by
+the namespace each enclosing level reads `A` in (`N.A.B:T`, `N.A:B.T`,
+`N:A.B.T` at level `N`, `U:A.B.T` for its usings `U`, the splits at the
+global level); and a receiver's extension keys `Ns:+T`, one tier per
+enclosing namespace with its usings (C# looks for extension methods per
+namespace declaration, its own namespace and its usings together). An
+alias's target, `global::A.B.T`, and a `using static` type are one tier. A
+pin that unions several lookups (a class's several bases, a partial
+class's own keys with a base's, several `using static` types) is one tier:
+one type's nearer candidate must not hide another type's. A key group
+over the cap falls back to its class file pins, un-tiered, as before.
+
+**Keeping incremental equal to a fresh scan.** A tiered row's edges
+depend on every node of its target's name, not only on the one it links,
+so three things change:
+
+- *Pass 1 writes no tiered row.* Between the batch's files the graph is
+  half old: a node a later file adds, removes or rekeys would decide the
+  shadow, and pass 2 only adds edges. Pass 2 writes them once every node
+  and match key of the batch is final.
+- *A tiered group is recorded whole.* A group is one source's rows to one
+  name, the set `call_rows` collapses; its `name_refs` entries keep every
+  pin, its own file's included (which `name_ref_properties` otherwise
+  leaves out), so the group can be written again from the graph alone.
+- *Changed names re-run their tiered groups.* For each label and name with
+  a node the batch adds, removes (`previous_nodes - batch_nodes`) or rekeys,
+  each tiered group outside the batch to that name is re-run after pass 2,
+  in one transaction (`engine.rerun_edges`): its edges (from its source, of
+  its type, to that name, written by its file) lose that file from their
+  `origins`, and its rows are written again exactly as the writer's. This
+  covers both directions: a nearer node added retracts the farther edges,
+  one removed or rekeyed away restores them, and a move between namespaces
+  or files is both. `remove_paths` lists the deleted files' nodes first and
+  re-runs their names' groups after deleting. A tiered group never takes
+  the additive relink (`best_pin` on the added node alone), which would
+  link a shadowed node. Other groups keep it.
+
+As with the additive relink, a batch that fails between pass 1 and the
+re-run leaves the outside groups as they were until their files are
+indexed again or a full scan runs (a rekeyed node, marked `mkeys_stale`,
+is re-run by the next batch holding it).
+
+**Cost.** Each matched node of a farther tier tests the name's nodes once
+through the `(repo_id, name)` index; a nearest-tier match does not. The
+nearer keys are computed once per matched node (`WITH`), and the test is
+`size(nearer) = 0 OR NOT EXISTS {...}`, which Neo4j plans as a
+select-or-anti-semi-apply seeking the index; a first cut wrapping the
+`NOT EXISTS` in a `CASE` was evaluated as an expression scanning every
+node of the label, and made the 10-project synthetic scan 5x slower. A
+touched name re-runs its tiered callers outside the batch, a retraction
+and a write per group, where the additive relink wrote one edge.
 
 ## C++ (`devgraph/indexer/cpp/extractor.py`)
 
@@ -767,7 +861,8 @@ file, and their edges).
 ## No reverse dependents
 
 With Go, Java and Kotlin resolved, every code edge is a function of its
-writer's text, its resolver configuration and whether its target exists, so
+writer's text, its resolver configuration and whether its target exists
+(for a C# shadow tier, which nodes of its target's name exist), so
 `index_paths` no longer re-indexes a changed file's importers
 (`_expand_with_reverse_dependents`, which followed Java's `IMPORTS` edges, is
 gone) nor rescans a JVM file's directory for subtypes of a class it added
@@ -1179,3 +1274,37 @@ tiers. BEFORE is this branch's code before the extractor change.
   edges). C# `name_refs` grow about 4x to 7x (the fixture's largest 1.1 KB
   to 4.6 KB), as each entry stores its keys once.
 
+
+### Results after C# shadow tiers (index format 14)
+
+See the C# section's Shadow tiers. BEFORE is index format 13 (match keys,
+one union per site), AFTER this branch.
+
+| csharp fixture | Target | BEFORE | AFTER | |
+|---|---|---|---|---|
+| M1 resolved multi-target | < 2 % | 0 % | 0 % | met |
+| M2 linked precision | ≥ 98 %, 0 | 95 % (21/22); 0 | 100 %; 0 | met |
+| M3 `IMPORTS` precision / recall | ≥ 98 % / 95 % | 94 % (17/18) / 100 % | 100 % (17/17) / 100 % | met |
+| M4 `CALLS` recall | ≥ 95 % | 100 % (linked 100 %) | 100 % (linked 100 %) | met |
+| M5 named sites | all | 30/31 | 31/31 | met |
+| M6 largest `name_refs` | < 1 MiB | 4,771 B (total 13,192 B) | 4,771 B (total 13,192 B) | met |
+
+- `UserService.Register` now links Shop.Domain's `User.Display` alone and
+  `UserService.cs` imports only Models/User.cs; `test_measure_fixtures`
+  has no C# xfail left.
+- **Synthetic multi-project repository** (`--cs-synthetic`, seed 1):
+  nothing in it shadows, so links are unchanged (precision, recall and
+  `IMPORTS` 100 %, 0 cross-project wrong links at 10 and 50 projects; 25
+  capped rows at 50, Startup.cs's, un-tiered as before). A `;` takes a
+  `,`'s place in a tiered pin, so `name_refs` are byte for byte the same
+  size: largest 7,549 B (10 projects) and 8,970 B (50; total 4.10 MB).
+- **Cost**, BEFORE and AFTER alternating in their own processes on the
+  otherwise idle shared Neo4j: `full_scan` of the 10-project synthetic
+  12.0/11.1 s before, 10.8/10.7 s after; 50 projects 76.9/69.1 s before,
+  63.9/64.4 s after (pass 1 no longer writes the tiered rows that pass 2
+  writes again). The fixture, 12 scans after two warm-ups, two series:
+  fastest 0.92 s before and 0.90 s after, medians 0.97/1.00 s and
+  0.94/0.94 s.
+- Seeds 1 to 12 of the graph-accuracy fuzz (15 steps each, `cs_shadow`
+  among its operations) and a scripted run of that operation equal a
+  fresh scan after every step.

@@ -34,6 +34,9 @@ class _GraphFilesEngine:
     def update_skipped_files(self, repo_id, add=None, drop=(), replace=False):
         pass
 
+    def list_file_nodes(self, repo_id, files):
+        return set()
+
     def delete_nodes_by_source_file(self, repo_id, file_name):
         self.language.append(file_name)
 

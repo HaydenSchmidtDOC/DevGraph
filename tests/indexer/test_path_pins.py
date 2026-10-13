@@ -15,7 +15,7 @@ import uuid
 import pytest
 
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
-from devgraph.graph.schema import MAX_SCOPE_KEYS, pin_kind, scoped_pin, split_pin
+from devgraph.graph.schema import MAX_SCOPE_KEYS, pin_kind, scoped_pin, split_pin, tiered_pin, unscoped_pin
 from devgraph.indexer import dispatch
 from devgraph.indexer.calls import call_rows, import_rows
 from devgraph.indexer.common import (
@@ -25,6 +25,7 @@ from devgraph.indexer.common import (
     parse_name_ref,
     pin_excludes,
     pin_matches,
+    shadowed,
 )
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
@@ -92,6 +93,42 @@ def test_at_keys_are_canonical_and_capped():
     keys = [f"N:T{i}" for i in range(MAX_SCOPE_KEYS)]
     assert scoped_pin("/.?.cs^", keys + keys[:5]).count(",") == MAX_SCOPE_KEYS - 1  # 32 once deduplicated
     assert scoped_pin("/.?.cs^", [*keys, "N:X"]) == "/.?.cs^"  # more than 32: the pin alone
+
+
+def test_tiered_keys_are_canonical_nearest_first():
+    """Each key in its nearest tier, sorted within it, empty tiers dropped;
+    one tier is `scoped_pin`'s form; the cap counts every tier's keys."""
+    pin = tiered_pin("/.?.cs^", [["b:T", "a:T"], ["a:T"], [], ["c:T", ".:T"]])
+    assert pin == "/.?.cs^@a:T,b:T;.:T,c:T"
+    assert split_pin(pin).scope == (".:T", "a:T", "b:T", "c:T")
+    assert split_pin(pin).ranks == (1, 0, 0, 1)
+    assert tiered_pin("/.?.cs^", [["b:T"], ["b:T", "a:T"]]) == "/.?.cs^@b:T;a:T"
+    assert tiered_pin("/.?.cs^", [["b:T", "a:T"], ["b:T"]]) == scoped_pin("/.?.cs^", ["a:T", "b:T"])
+    assert split_pin(scoped_pin("/.?.cs^", ["a:T", "b:T"])).ranks == ()
+    keys = [f"N:T{i}" for i in range(MAX_SCOPE_KEYS)]
+    assert tiered_pin("/.?.cs^", [keys[:20], keys[20:]]).count(";") == 1
+    assert tiered_pin("/.?.cs^", [keys[:20], [*keys[20:], "N:X"]]) == "/.?.cs^"
+    # name_refs keep a pin's keys once, canonical and in their tiers.
+    assert unscoped_pin("/.?.cs^@b:T,a:T;c:T") == ("/.?.cs^@", "a:T,b:T;c:T")
+    assert unscoped_pin("/.?.cs^@b:T,a:T") == ("/.?.cs^@", "a:T,b:T")
+    entry = name_ref_properties(_cs_rows({"/.?.cs^@b:T;a:T"}))["name_refs"][0]
+    assert parse_name_ref(entry)[1] == ["/.?.cs^@b:T;a:T"]
+
+
+@pytest.mark.parametrize(("keys", "others", "left_out"), [
+    (["a:T"], [], False),  # the nearest tier: never left out
+    (["c:T"], [("x/U.cs", ["a:T"])], True),
+    (["c:T"], [("x/U.cs", ["b:T"])], True),
+    (["b:T"], [("x/U.cs", ["b:T"])], False),  # the same tier: both link
+    (["b:T", "a:T"], [("x/U.cs", ["a:T"])], False),  # its nearest key counts
+    (["c:T"], [("x/U.md", ["a:T"])], False),  # a file the pin's path leaves out shadows nothing ...
+    (["c:T"], [("vendor/U.cs", ["a:T"])], False),  # ... nor a vendored one
+    (["c:T"], [("x/U.cs", ["z:T"]), ("y/U.cs", [])], False),
+])
+def test_a_nearer_tier_shadows_a_farther_one(keys, others, left_out):
+    pin = "/.?.cs^@a:T;b:T;c:T"
+    assert shadowed(pin, keys, others) is left_out
+    assert shadowed(scoped_pin("/.?.cs^", ["a:T", "b:T", "c:T"]), keys, others) is False
 
 
 def test_best_pin_tests_at_keys_against_the_nodes():
@@ -344,6 +381,57 @@ def test_module_pins_seek_by_directory_and_basename_as_pin_matches_says(engine, 
         if got != want:
             wrong.append((pin, exclude, sorted(got ^ want)))
     assert wrong == [] and linked > 20
+
+
+def test_the_cypher_shadow_test_agrees_with_shadowed(engine, repo_id):
+    """Random tiered pins (with exclusions) on CALLS rows link, among random
+    nodes of their name (paths and match keys), exactly those `pin_matches`
+    and `shadowed` say: the row's pin matches the node, no exclusion does,
+    and no node its path matches holds a nearer tier's key."""
+    rng = random.Random(7)
+    keys = ["N:A", "M:A", ".:A", "N.M:A", "N:+A"]
+    nodes, rels, expected = [], [], set()
+    shadows = 0
+    for i in range(400):
+        name = f"g{i}"
+        pin = tiered_pin(
+            rng.choice(["/.?.cs^", "/.", "/a/.", "a/", "/.?.cs"]),
+            [rng.sample(keys, rng.randint(1, 2)) for _ in range(rng.randint(2, 4))],
+        )
+        candidates = {}
+        for _ in range(rng.randint(1, 5)):
+            path = _random_path(rng)
+            path = path if rng.random() < 0.3 else path.rsplit(".", 1)[0] + ".cs"
+            candidates[path] = None if rng.random() < 0.1 else sorted(rng.sample(keys, rng.randint(0, 2)))
+        exclude = sorted(rng.sample(sorted(candidates), 1)) if rng.random() < 0.2 else []
+        nodes += [
+            {"label": "Function", "repo_id": repo_id, "name": name,
+             "properties": {"file": path, "owner": "", **({"mkeys": mkeys} if mkeys is not None else {})}}
+            for path, mkeys in candidates.items()
+        ]
+        rels.append({
+            "from_label": "Module", "from_name": "origin.cs", "rel_type": "CALLS", "to_label": "Function",
+            "to_name": name, "repo_id": repo_id, "to_file": pin, "exclude": exclude, "origin": "origin.cs",
+        })
+        others = [(path, mkeys or ()) for path, mkeys in candidates.items()]
+        for path, mkeys in candidates.items():
+            if _expected(pin, exclude, path, mkeys):
+                if shadowed(pin, mkeys or (), others):
+                    shadows += 1
+                else:
+                    expected.add((name, path))
+    engine.upsert_nodes(
+        nodes + [{"label": "Module", "repo_id": repo_id, "name": "origin.cs", "properties": {"source_file": "origin.cs"}}]
+    )
+    engine.upsert_relationships(rels)
+    got = {
+        (row["n"], row["f"]) for row in engine.run_cypher(
+            "MATCH (:Module {repo_id: $r, name: 'origin.cs'})-[:CALLS]->(b) RETURN b.name AS n, b.file AS f",
+            {"r": repo_id},
+        )
+    }
+    assert sorted(got ^ expected) == []
+    assert len(expected) > 60 and shadows > 30
 
 
 # --- live writes and relinks per pin kind -----------------------------------------

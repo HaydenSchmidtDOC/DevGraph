@@ -32,7 +32,11 @@ every project (scripts/); a C# Module records its project's usings
 (`_with_cs_projects`), so a change that did not re-index every C# file
 would leave one stale. A C# file's namespace changes, two files swap their
 classes, and a class takes the name of another file's class in another
-namespace, so C# match keys change under the edges `@` pins gave them. Kotlin files hold adjacent one-line classes, which
+namespace, so C# match keys change under the edges `@` pins gave them;
+cs/Shadow.cs comes, goes, changes namespace and renames its class, a
+`Jobs` or `Base` nearer some callers than the one they reach otherwise,
+so the shadow tiers of their pins hide and restore edges into files
+outside the batch. Kotlin files hold adjacent one-line classes, which
 the extractor recovers from tree-sitter-kotlin's error nodes, and import a
 function or package of another one. Go, Java, Kotlin, Rust, C# and C++ calls
 come in every style their resolvers read (bare, through a package, module,
@@ -828,6 +832,31 @@ class Fuzz:
             fb.head = self.rng.choice([n for n in CS_NAMESPACES if n != fb.head])
         return f"class of {b} named {name} in namespace {fb.head}", {b}
 
+    def op_cs_shadow(self):
+        """Add, rekey, rename or remove cs/Shadow.cs, whose class is named
+        like a type other C# files reach farther out (`Jobs` in Shop, `Base`
+        through Block.cs's `using Models;`), in a namespace enclosing some
+        of them (Shop.App) or not: a nearer type hides the farther one's
+        edges until it moves away or goes."""
+        path = "cs/Shadow.cs"
+        f = self.files.get(path)
+        if f is None:
+            cls = self.rng.choice(["Jobs", "Base"])
+            head = self.rng.choice(["Shop.App", "Shop.App", "Shop", "Tools", ""])
+            self.files[path] = File("cs", head=head, bases={cls: None},
+                                    funcs={name: [] for name in ("Run", "Stop", "Helper", "Tidy")})
+            return f"add shadowing class {cls} in namespace {head!r} as {path}", {path}
+        pick = self.rng.random()
+        if pick < 0.35:
+            del self.files[path]
+            return f"remove {path}", {path}
+        if pick < 0.7:
+            f.head = self.rng.choice([n for n in ["Shop.App", "Shop", "Tools", ""] if n != f.head])
+            return f"namespace of {path} to {f.head!r}", {path}
+        ((cls, base),) = f.bases.items()
+        f.bases = {"Base" if cls == "Jobs" else "Jobs": base}
+        return f"rename the class of {path} to {next(iter(f.bases))}", {path}
+
     def op_delete_dir(self):
         """Delete a folder holding a configuration file, with everything in it."""
         folder = self.rng.choice(CONFIG_DIRS)
@@ -1002,7 +1031,8 @@ class Fuzz:
         "rename", "delete", "restore", "service", "from", "move_image", "mention", "link", "supersedes", "pin", "pin",
         "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module", "method", "method",
         "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move", "cs_namespace", "cs_move_class",
-        "cs_dup_class", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route", "route",
+        "cs_dup_class", "cs_shadow", "cs_shadow", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route",
+        "route",
         "route_change", "route_move",
     ]
 
@@ -1151,6 +1181,46 @@ class _Scripted:
         pick = self.picks.pop(0)
         assert len(pick) == k and set(pick) <= set(options), (pick, options)
         return pick
+
+    def random(self):
+        return self.picks.pop(0)
+
+
+def test_cs_shadow_op_hides_and_restores_callers_edges_in_other_files(engine, repo_id, tmp_path):
+    """cs/Shadow.cs's Jobs in Shop.App is nearer Program.cs (Shop.App) than
+    cs/Jobs.cs's in Shop: Program's `Jobs.Run` leaves Jobs.cs for it, and
+    goes back when it moves to another namespace or goes, cs/Shadow.cs
+    alone in each batch. Every step equals a fresh scan."""
+    fuzz = Fuzz(random.Random(0))
+    root = tmp_path
+    fuzz.write(root, set(fuzz.files))
+    provision_repository_schema(engine, root)
+    engine.upsert_repository(repo_id, repo_id, str(root))
+    full_scan(engine, repo_id, root, docs_path=DOCS, mentions_enabled=True)
+
+    def run_targets():
+        return {row["f"] for row in engine.run_cypher(
+            "MATCH (:Function {repo_id: $r, name: 'Main', file: 'cs/Program.cs'})-[:CALLS]->(b:Function {name: 'Run'}) "
+            "RETURN b.file AS f", {"r": repo_id},
+        )}
+
+    assert "cs/Jobs.cs" in run_targets()
+    steps = [
+        (["Jobs", "Shop.App"], {"cs/Shadow.cs"}),  # added: it hides Jobs.cs's
+        ([0.5, "Tools"], {"cs/Jobs.cs"}),  # rekeyed away
+        ([0.5, "Shop.App"], {"cs/Shadow.cs"}),  # rekeyed back
+        ([0.1], {"cs/Jobs.cs"}),  # removed
+    ]
+    for step, (picks, want) in enumerate(steps):
+        fuzz.rng = _Scripted(picks)
+        description, touched = fuzz.op_cs_shadow()
+        fuzz.write(root, touched)
+        if "cs/Shadow.cs" in fuzz.files:
+            index_paths(engine, repo_id, root, {root / rel for rel in touched}, docs_path=DOCS, mentions_enabled=True)
+        else:
+            remove_paths(engine, repo_id, root, {root / rel for rel in touched})
+        assert run_targets() == want, description
+        check(engine, repo_id, root, "scripted", step, [description])
 
 
 def test_cs_rekey_ops_retract_callers_in_other_files(engine, repo_id, tmp_path, monkeypatch):

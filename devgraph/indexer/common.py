@@ -45,7 +45,9 @@ __all__ = [
     "pin_confidence",
     "pin_excludes",
     "pin_matches",
+    "shadowed",
     "split_owned_pin",
+    "tiered",
 ]
 
 
@@ -265,6 +267,29 @@ def pin_matches(pin: str | None, path: str, keys: Iterable[str] = ()) -> bool:
     )
 
 
+def tiered(pin: str | None) -> bool:
+    """Whether `pin`'s `@` keys come in tiers (graph/schema.py `tiered_pin`)."""
+    return pin is not None and bool(split_pin(pin).ranks)
+
+
+def shadowed(pin: str, keys: Iterable[str], others: Iterable[tuple[str, Iterable[str]]]) -> bool:
+    """Whether the tiered pin `pin` leaves out a node it matches whose `mkeys`
+    are `keys`: one of `others` (the (path, mkeys) of the nodes of its label
+    and name) that the pin's path and flags match, its keys aside, holds a
+    key of a nearer tier than the node's nearest. The engine's Cypher
+    mirrors this; a pin without tiers shadows nothing."""
+    parts = split_pin(pin)
+    if not parts.ranks:
+        return False
+    rank = dict(zip(parts.scope, parts.ranks))
+    own = min((rank[key] for key in keys if key in rank), default=len(rank))
+    path_only = pin.rsplit("@", 1)[0]
+    return any(
+        pin_matches(path_only, path) and any(rank.get(key, own) < own for key in other_keys)
+        for path, other_keys in others
+    )
+
+
 def _rank(pin: str) -> int:
     """A pin's precedence, 0 the highest; the file-less node ranks as a file."""
     kind = pin_kind(pin)
@@ -325,7 +350,10 @@ def name_ref_properties(rels: list[dict]) -> dict:
     package directory). It is also recorded when its source is unpinned and
     not a Module (a Rust `impl Trait for Foo`, which another file's `Foo`
     can add), unless that source is not a code symbol (a route's Endpoint,
-    which the same file writes).
+    which the same file writes). Every edge of a group (one source's to one
+    `to_name`) with a tiered pin (graph/schema.py `tiered_pin`) is
+    recorded, its own file's and the file-less node's too: the relink
+    writes such a group again whole (dispatch `_relink_name_refs`).
 
     `name_refs` holds one entry per edge source and target name, sorted, as
     `rel_type, from_label, from_name, from_file, to_label, to_name,
@@ -337,7 +365,8 @@ def name_ref_properties(rels: list[dict]) -> dict:
     for "", each followed by OWNER_PIN_SEP and its `to_owner` when it names
     one (`owned_pin`); a pinned and an unpinned edge of the same source and
     name are separate entries. A pin's `@` flag keeps only its "@" there, and
-    its match keys are the `keys` field, once: the pins of one source and
+    its match keys are the `keys` field, once, as the flag wrote them (in
+    tiers, when it has them): the pins of one source and
     name with different keys (two call sites on receivers of two types) are
     separate entries, which relink takes together. The trailing
     NAME_REF_OWNED marks the layout; an older entry has none (see
@@ -351,6 +380,14 @@ def name_ref_properties(rels: list[dict]) -> dict:
     """
     entries: dict[tuple, tuple[set, set]] = {}
     targets, sources = set(), set()
+
+    def group(rel: dict) -> tuple:
+        return (
+            rel["rel_type"], rel["from_label"], rel["from_name"], rel.get("from_file"), rel.get("from_owner"),
+            rel["to_label"], rel["to_name"],
+        )
+
+    whole = {group(rel) for rel in rels if tiered(rel.get("to_file"))}
     for rel in rels:
         unpinned_source = not rel.get("from_file") and rel["from_label"] != "Module"
         to_file = rel.get("to_file")
@@ -358,10 +395,11 @@ def name_ref_properties(rels: list[dict]) -> dict:
             to_file is not None
             and to_file in ("", rel.get("origin"))
             and not (unpinned_source and rel["from_label"] in FILE_SCOPED_LABELS)
+            and group(rel) not in whole
         ):
             continue
         properties = rel.get("properties") or {}
-        to_file, scope = unscoped_pin(to_file) if to_file is not None else (None, ())
+        to_file, scope = unscoped_pin(to_file) if to_file is not None else (None, "")
         if to_file is not None:
             to_file = owned_pin(to_file, rel.get("to_owner"))
         from_owner = rel.get("from_owner")
@@ -388,7 +426,7 @@ def name_ref_properties(rels: list[dict]) -> dict:
             NAME_REF_FILELESS + pin if split_owned_pin(pin)[0] == "" else pin for pin in pins
         ))
         confidence = unpinned_confidence if unpinned_confidence is not None else min(confidences, default="")
-        refs.add(NAME_REF_SEP.join((*fields, encoded, confidence, ",".join(scope), NAME_REF_OWNED)))
+        refs.add(NAME_REF_SEP.join((*fields, encoded, confidence, scope, NAME_REF_OWNED)))
     return {"name_refs": sorted(refs), "name_ref_targets": sorted(targets), "name_ref_sources": sorted(sources)}
 
 

@@ -276,6 +276,7 @@ class PinParts(NamedTuple):
     not_suffix: str = ""
     skip_roots: tuple[str, ...] = ()
     scope: tuple[str, ...] = ()
+    ranks: tuple[int, ...] = ()
 
 
 def _is_path_pin(pin: str) -> bool:
@@ -283,7 +284,7 @@ def _is_path_pin(pin: str) -> bool:
 
 
 _PIN_FLAGS = re.compile(
-    r"(~)?(?:\?([^~?^!@/]*))?(\^t?)?(?:!([^~?^!@/]*))?(?:@([\w.+]+:[\w.+]+(?:,[\w.+]+:[\w.+]+)*))?"
+    r"(~)?(?:\?([^~?^!@/]*))?(\^t?)?(?:!([^~?^!@/]*))?(?:@([\w.+]+:[\w.+]+(?:[,;][\w.+]+:[\w.+]+)*))?"
 )
 
 
@@ -295,7 +296,8 @@ def split_pin(pin: str) -> PinParts:
     path before what the pin matches, is vendored: `VENDORED_DIRS`; `^t`
     nor a test root: `TEST_ROOTS`), `!x` (a matched file must not end with
     `x`) and `@k1,k2` (the matched node's `mkeys` must hold one of these
-    match keys, each `namespace:name`; see `scoped_pin`):
+    match keys, each `namespace:name`, maybe in tiers separated by `;`,
+    nearest first; see `scoped_pin` and `tiered_pin`):
     `go/b/.~?.go!_test.go` is the Go files directly in go/b/, tests left
     out, at package confidence. Only a path pin (no repository-relative
     path is `.`, starts with "/" or ends with "/" or "/.") takes flags, so a
@@ -307,10 +309,16 @@ def split_pin(pin: str) -> PinParts:
             flags = _PIN_FLAGS.fullmatch(pin, i)
             if flags:
                 loose, only, skip, not_suffix, scope = flags.groups()
+                tiers = scope.split(";") if scope else []
+                rank: dict[str, int] = {}
+                for tier, keys in enumerate(tiers):
+                    for key in keys.split(","):
+                        rank.setdefault(key, tier)
+                keys = tuple(sorted(rank))
                 return PinParts(
                     pin[:i], bool(loose), tuple(s for s in (only or "").split(",") if s),
                     VENDORED_DIRS if skip else (), not_suffix or "", TEST_ROOTS if skip == "^t" else (),
-                    tuple(sorted(set(scope.split(",")))) if scope else (),
+                    keys, tuple(rank[key] for key in keys) if len(tiers) > 1 else (),
                 )
     return PinParts(pin)
 
@@ -320,15 +328,38 @@ def scoped_pin(pin: str, keys: Iterable[str]) -> str:
     `mkeys` hold one of `keys`, written canonically (sorted, without
     repeats). With no keys, or more than MAX_SCOPE_KEYS, it is `pin` as it
     is: the site links by its path alone."""
-    scope = sorted(set(keys))
-    return pin + "@" + ",".join(scope) if 0 < len(scope) <= MAX_SCOPE_KEYS else pin
+    return tiered_pin(pin, [keys])
 
 
-def unscoped_pin(pin: str) -> tuple[str, tuple[str, ...]]:
+def tiered_pin(pin: str, tiers: Iterable[Iterable[str]]) -> str:
+    """`scoped_pin` with its keys in tiers, nearest first: a node holding a
+    key of a farther tier is linked only when no node of its name the pin's
+    path matches holds one of a nearer tier (C#'s shadowing, see
+    devgraph/indexer/common.py `shadowed`). Canonical: each key once, in
+    its nearest tier, sorted within it, empty tiers dropped (one tier is
+    `scoped_pin`'s form), `;` between tiers. MAX_SCOPE_KEYS counts every
+    tier's keys."""
+    seen: set[str] = set()
+    groups = []
+    for tier in tiers:
+        group = sorted(set(tier) - seen)
+        seen.update(group)
+        if group:
+            groups.append(",".join(group))
+    return pin + "@" + ";".join(groups) if 0 < len(seen) <= MAX_SCOPE_KEYS else pin
+
+
+def unscoped_pin(pin: str) -> tuple[str, str]:
     """`pin` less its `@` flag's keys (the flag itself kept, as "@"), and
-    those keys: a `name_refs` entry stores them once, not with each pin."""
-    scope = split_pin(pin).scope
-    return (pin.rsplit("@", 1)[0] + "@", scope) if scope else (pin, ())
+    those keys, canonical, in their tiers (see `tiered_pin`): a `name_refs`
+    entry stores them once, not with each pin."""
+    parts = split_pin(pin)
+    if not parts.scope:
+        return pin, ""
+    tiers: dict[int, list[str]] = {}
+    for key, rank in zip(parts.scope, parts.ranks or [0] * len(parts.scope)):
+        tiers.setdefault(rank, []).append(key)
+    return pin.rsplit("@", 1)[0] + "@", ";".join(",".join(tiers[rank]) for rank in sorted(tiers))
 
 
 def pin_root(pin: str, path: str) -> str:
@@ -374,7 +405,8 @@ def pin_value(pin: str) -> dict:
     not end with, `os` the suffixes it must end with one of (empty: any),
     `nv` the directory names its source root may not hold, `pin_root`, `nr`
     the fragments it may not contain, wrapped in "/", `sc` the match keys
-    one of which the node's `mkeys` must hold (empty: any node)): a
+    one of which the node's `mkeys` must hold (empty: any node), `sr` each
+    of those keys' tier, nearest 0, for a tiered pin (empty otherwise)): a
     directory pin's `v` is the directory with its trailing "/" ("" for the
     root), so `dir` and `suffix_dir` drop the final "."; a `loose_dir`
     matches as a `dir`."""
@@ -384,6 +416,6 @@ def pin_value(pin: str) -> dict:
     value = parts.base[:-1] if kind in ("dir", "suffix_dir") else parts.base
     return {
         "k": kind, "v": value, "ns": parts.not_suffix, "os": list(parts.only), "nv": list(parts.skip),
-        "nr": list(parts.skip_roots), "sc": list(parts.scope),
+        "nr": list(parts.skip_roots), "sc": list(parts.scope), "sr": list(parts.ranks),
     }
 

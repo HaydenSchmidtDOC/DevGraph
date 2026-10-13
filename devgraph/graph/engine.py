@@ -36,6 +36,7 @@ from devgraph.graph.schema import (
     lookup_index_statements,
     pin_kind,
     pin_value,
+    split_pin,
 )
 from devgraph.indexer.docs.extractor import DOC_NOTE_LABELS
 
@@ -857,6 +858,9 @@ MATCH_KEY_EDGE_TYPES = ("CALLS", "IMPORTS")
 RETRACT_NODES = 500
 #: The pin kinds that match a set of files rather than one (see `_pin`).
 _PATH_PINS = frozenset({"dir", "loose_dir", "suffix", "suffix_dir", "prefix"})
+#: Marks the to-pin of a `_group_rels_by_triple` group whose path pins'
+#: `@` keys come in tiers (see `_shadow_free`).
+_TIERED = "@"
 #: The path pins whose files all start with the pin's own path (`pin_value`'s
 #: `v`): a target seeks them as a prefix range of its file-keyed index.
 _ANCHORED_PINS = frozenset({"dir", "loose_dir", "prefix"})
@@ -885,7 +889,10 @@ def _group_rels_by_triple(
     out, split into `ex_files`
     (files, a list test) and `ex_pins` (other pins, as `pin_value` gives
     them); for a bare name also `no_self` (the edge may not end at its
-    source). Only the keys its group's Cypher reads are sent. The source is
+    source). A path pin whose `@` keys come in tiers (graph/schema.py
+    `tiered_pin`) is grouped apart, its kind marked with `_TIERED`, so only
+    its group's Cypher tests the shadow (see `_end_match`). Only the keys
+    its group's Cypher reads are sent. The source is
     then matched once for all of them: a resolved call names several
     candidate files per callee.
     """
@@ -893,7 +900,11 @@ def _group_rels_by_triple(
     for rel in rels:
         from_file = rel.get("from_file")
         to_file = rel.get("to_file")
-        key = (rel["from_label"], rel["rel_type"], rel["to_label"], _pin(from_file), _pin(to_file))
+        to_pin = _pin(to_file)
+        if to_pin in _PATH_PINS and split_pin(to_file).ranks:
+            to_pin += _TIERED
+        key = (rel["from_label"], rel["rel_type"], rel["to_label"], _pin(from_file), to_pin)
+        to_pin = to_pin.removesuffix(_TIERED)
         if key[3] in _PATH_PINS:
             raise ValueError(f"a source end can't be pinned to a set of files: {from_file!r}")
         properties = rel.get("properties") or {}
@@ -913,15 +924,15 @@ def _group_rels_by_triple(
             "targets": [],
         })
         target = {"to_name": rel["to_name"], "to_file": to_file}
-        if key[4] == "file" or key[4] in _PATH_PINS:
+        if to_pin == "file" or to_pin in _PATH_PINS:
             target["to_owner"] = rel.get("to_owner")
-        if key[4] in _PATH_PINS:
+        if to_pin in _PATH_PINS:
             # File pins are left out by a plain list test, other pins by `_pin_test`.
             excluded = rel.get("exclude") or []
             target["pin"] = pin_value(to_file)
             target["ex_files"] = [pin for pin in excluded if pin_kind(pin) == "file"]
             target["ex_pins"] = [pin_value(pin) for pin in excluded if pin_kind(pin) != "file"]
-        elif key[4] == "name":
+        elif to_pin == "name":
             target["no_self"] = bool(rel.get("no_self"))
         row["targets"].append(target)
     return {key: list(rows.values()) for key, rows in groups.items()}
@@ -977,10 +988,10 @@ _ADD_ORIGIN = (
 )
 
 
-def _pin_test(pin: str, file: str, node: str) -> str:
+def _pin_test(pin: str, file: str, node: str, keys: bool = True) -> str:
     """Cypher for graph/schema.py's `pin_value` map `pin` matching the node
     `node` at the path `file`, as devgraph/indexer/common.py `pin_matches`
-    defines it (the node's `mkeys` are its keys)."""
+    defines it (the node's `mkeys` are its keys; not tested without `keys`)."""
     name = f"last(split({file}, '/'))"
     # graph/schema.py pin_root: the part of the path before what the pin matches.
     def cut(length: str) -> str:  # never a negative length, which left() rejects
@@ -996,7 +1007,8 @@ def _pin_test(pin: str, file: str, node: str) -> str:
         f"AND (size({pin}.os) = 0 OR any(s IN {pin}.os WHERE {file} ENDS WITH s)) "
         f"AND (size({pin}.nv) = 0 OR NOT any(s IN split({root}, '/') WHERE s IN {pin}.nv)) "
         f"AND (size({pin}.nr) = 0 OR NOT any(s IN {pin}.nr WHERE '/' + {root} + '/' CONTAINS s)) "
-        f"AND (size({pin}.sc) = 0 OR any(s IN {pin}.sc WHERE s IN coalesce({node}.mkeys, []))) AND CASE {pin}.k "
+        + (f"AND (size({pin}.sc) = 0 OR any(s IN {pin}.sc WHERE s IN coalesce({node}.mkeys, []))) " if keys else "")
+        + f"AND CASE {pin}.k "
         f"WHEN 'file' THEN {file} = {pin}.v "
         f"WHEN 'dir' THEN {file} STARTS WITH {pin}.v AND NOT substring({file}, size({pin}.v)) CONTAINS '/' "
         f"WHEN 'suffix' THEN '/' + {file} ENDS WITH {pin}.v "
@@ -1014,6 +1026,33 @@ def _path_pin_conditions(ref: str, path: str, node: str) -> list[str]:
         _pin_test(f"{ref}.pin", path, node), f"NOT {path} IN {ref}.ex_files",
         f"NOT any(x IN {ref}.ex_pins WHERE {_pin_test('x', path, node)})",
     ]
+
+
+def _shadow_free(ref: str, var: str, label: str) -> str:
+    """Cypher, after the MATCH of the node `var` (`label`), keeping it only
+    when the tiered pin `{ref}.pin` (graph/schema.py `tiered_pin`) does not
+    shadow it, as devgraph/indexer/common.py `shadowed` defines it: no node
+    of its label and name that the pin's path and flags match holds a key
+    of a nearer tier than `var`'s nearest. The keys of the nearer tiers are
+    computed once per node, and a node of the nearest tier (none nearer)
+    skips the subquery, which seeks the name's nodes as `_end_match` does
+    (an `OR NOT EXISTS`, planned as a select-or-anti-semi-apply; inside a
+    CASE it was not, and scanned every node of the label)."""
+    pin = f"{ref}.pin"
+    every = f"range(0, size({pin}.sc) - 1)"
+    rank = (
+        f"reduce(tier_r = size({pin}.sc), tier_i IN {every} | CASE WHEN {pin}.sr[tier_i] < tier_r "
+        f"AND {pin}.sc[tier_i] IN coalesce({var}.mkeys, []) THEN {pin}.sr[tier_i] ELSE tier_r END)"
+    )
+    return (
+        f"WITH *, {rank} AS {var}_tier "
+        f"WITH *, [tier_i IN {every} WHERE {pin}.sr[tier_i] < {var}_tier | {pin}.sc[tier_i]] AS {var}_nearer "
+        f"WHERE size({var}_nearer) = 0 OR NOT EXISTS {{ "
+        f"MATCH (shadow:{label} {{repo_id: {var}.repo_id, name: {var}.name}}) "
+        f"USING INDEX SEEK shadow:{label}(repo_id, name) "
+        f"WHERE any(key IN {var}_nearer WHERE key IN coalesce(shadow.mkeys, [])) "
+        f"AND {_pin_test(pin, 'shadow.file', 'shadow', keys=False)} }} "
+    )
 
 
 def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also: str | None = None) -> str:
@@ -1036,8 +1075,11 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     `to_name`, and tests the Module's path. `also` is one more condition on
     the match. An end pinned to a file or a path with an `{end}_owner` keeps
     only the nodes of that `owner` (two classes' same-named methods in one
-    file)."""
+    file). A path pin marked `_TIERED` also keeps only the nodes its tiers
+    do not shadow (`_shadow_free`)."""
     conditions = [also] if also else []
+    tiered = pin.endswith(_TIERED)
+    pin = pin.removesuffix(_TIERED)
     if pin in _PATH_PINS:
         if label == "Module":
             key = {"dir": "dir", "suffix_dir": "dir_name", "suffix": "basename"}.get(pin)
@@ -1063,7 +1105,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
                 # The members of one owner in the files the pin matches, when the row names it.
                 conditions.append(f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)")
         conditions[:0] = _path_pin_conditions(ref, path, var)
-        return match + "WHERE " + " AND ".join(conditions) + " "
+        return match + "WHERE " + " AND ".join(conditions) + " " + (_shadow_free(ref, var, label) if tiered else "")
     pinned = pin == "file"
     keys = "repo_id, name, file, owner" if pinned else "repo_id, name"
     hint = f"USING INDEX SEEK {var}:{label}({keys}) " if label in FILE_SCOPED_LABELS else ""
@@ -1094,6 +1136,27 @@ def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
             "SET r += row.properties " + _ADD_ORIGIN,
             rows=rows,
         )
+
+
+def _rerun_edges_tx(
+    tx, repo_id: str, groups: dict[tuple[str, str, str], list[dict[str, Any]]], rels: list[dict[str, Any]],
+) -> None:
+    """GraphEngine.rerun_edges' transaction."""
+    for (from_label, rel_type, to_label), rows in sorted(groups.items()):
+        hint = f"USING INDEX SEEK a:{from_label}(repo_id, name) " if from_label in FILE_SCOPED_LABELS else ""
+        tx.run(
+            f"UNWIND $rows AS row MATCH (a:{from_label} {{repo_id: $repo_id, name: row.from_name}}) {hint}"
+            "WHERE (row.from_file IS NULL OR a.file = row.from_file) "
+            "AND (row.from_owner IS NULL OR a.owner = row.from_owner) "
+            f"MATCH (a)-[r:{rel_type}]->(b:{to_label} {{repo_id: $repo_id, name: row.to_name}}) "
+            "WHERE row.origin IN coalesce(r.origins, [row.origin]) "
+            "WITH r, [x IN coalesce(r.origins, [row.origin]) WHERE x <> row.origin] AS left "
+            "FOREACH (_ IN CASE WHEN size(left) = 0 THEN [1] ELSE [] END | DELETE r) "
+            "FOREACH (_ IN CASE WHEN size(left) > 0 THEN [1] ELSE [] END | SET r.origins = left)",
+            repo_id=repo_id,
+            rows=rows,
+        )
+    _upsert_relationships_tx(tx, rels)
 
 
 def _write_insights_tx(tx, repo_id: str, rows: list[dict[str, Any]], summary: dict[str, Any]) -> None:
@@ -1380,6 +1443,22 @@ class GraphEngine:
             return
         with self._driver.session() as session:
             session.execute_write(_upsert_relationships_tx, rels)
+
+    def rerun_edges(self, repo_id: str, groups: list[dict[str, Any]], rels: list[dict[str, Any]]) -> None:
+        """Write these groups' edges again, in one transaction: each group
+        (`rel_type`, `from_label`, `from_name`, `from_file` and `from_owner`
+        when known, `to_label`, `to_name`, `origin`) first unclaims its
+        `origin` from the edges of its type out of its source to nodes of
+        its `to_name` (an edge no file writes any more goes), then `rels`
+        are upserted. A tiered pin's edges depend on every node of its
+        name (graph/schema.py `tiered_pin`), so the relink writes such a
+        group whole rather than adding an edge (dispatch
+        `_relink_name_refs`)."""
+        by_type: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for group in groups:
+            by_type.setdefault((group["from_label"], group["rel_type"], group["to_label"]), []).append(group)
+        with self._driver.session() as session:
+            session.execute_write(_rerun_edges_tx, repo_id, by_type, rels)
 
     def rebuild_claim_records(self, repo_id: str) -> None:
         """Rewrite every code Module's `shared_claims` from the claims the

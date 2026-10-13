@@ -21,9 +21,9 @@ import pytest
 
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.graph.schema import MAX_SCOPE_KEYS, split_pin
-from devgraph.indexer.common import best_pin
+from devgraph.indexer.common import best_pin, shadowed
 from devgraph.indexer.csharp.extractor import extract_csharp_file
-from devgraph.indexer.dispatch import full_scan, index_paths
+from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 from devgraph.indexer.resolver_config import ResolverConfig
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
@@ -583,6 +583,172 @@ def test_a_namespace_edit_moves_calls_and_imports_between_same_named_classes(eng
     index_paths(engine, repo_id, tmp_path, {program})
     assert targets() == ({"Models/User.cs"}, {"Models/User.cs"})
     _equals_fresh(engine, repo_id, tmp_path)
+
+
+def _tiers(row):
+    """A row's `@` keys by tier, nearest first (one tier when it has none)."""
+    parts = split_pin(row.to_file)
+    found = {}
+    for key, rank in zip(parts.scope, parts.ranks or [0] * len(parts.scope)):
+        found.setdefault(rank, set()).add(key)
+    return [found[rank] for rank in sorted(found)]
+
+
+def _call_tiers(source, caller, callee, file_path="src/A.cs"):
+    """The tiers of each `@` pin of `caller`'s rows to `callee`."""
+    rows = [r for r in _rows(source, file_path) if (r.from_name, r.to_name) == (caller, callee)]
+    return sorted((_tiers(r) for r in rows if r.to_file and "@" in r.to_file), key=len)
+
+
+def test_a_types_keys_are_tiered_as_csharp_looks_the_name_up():
+    """Nested in the enclosing classes (innermost first), then each enclosing
+    namespace's own types and its declaration's usings, innermost first,
+    then the global namespace's and the file's usings. A receiver's
+    extension methods take a tier per namespace, its usings with it."""
+    source = """
+        using Top;
+
+        namespace Shop
+        {
+            using Inside;
+
+            namespace App
+            {
+                class Outer
+                {
+                    class C { void Run(User u) { u.Display(); Models.Base.Go(); } }
+                }
+            }
+        }
+    """
+    extensions, types = _call_tiers(source, "Run", "Display")
+    assert types == [
+        {"Shop.App:Outer.C.User"}, {"Shop.App:Outer.User"}, {"Shop.App:User"}, {"Shop:User"},
+        {"Inside:User", "Shop.Inside:User"}, {".:User"}, {"Top:User"},
+    ]
+    assert extensions == [
+        {"Shop.App:+User"}, {"Shop:+User", "Inside:+User", "Shop.Inside:+User"}, {".:+User", "Top:+User"},
+    ]
+    assert _call_tiers(source, "Run", "Go") == [[
+        {"Shop.App:Models.Base", "Shop.App.Models:Base"}, {"Shop:Models.Base", "Shop.Models:Base"},
+        {"Inside:Models.Base", "Shop.Inside:Models.Base"}, {".:Models.Base", "Models:Base"}, {"Top:Models.Base"},
+    ]]
+
+
+def test_an_enclosing_namespaces_type_shadows_a_usings():
+    """`User` in Shop.Domain.Services with `using Legacy.Accounts` is
+    Shop.Domain.User while that type exists (Legacy's is left out, the
+    calls' and the import's alike), and Legacy.Accounts.User when it
+    does not."""
+    source = """
+        using Legacy.Accounts;
+
+        namespace Shop.Domain.Services;
+
+        public class UserService
+        {
+            public void Register(User user) => user.Display();
+        }
+    """
+    path = "src/Services/UserService.cs"
+    rows = [r for r in _rows(source, path) if r.to_name == "Display"]
+    imports = [r for r in _rows(source, path, "IMPORTS") if r.to_name == "User"]
+    candidates = {"src/Models/User.cs": ("Shop.Domain:User",), "src/Legacy/User.cs": ("Legacy.Accounts:User",)}
+
+    def linked(rows, candidates):
+        pins = {r.to_file for r in rows}
+        return {
+            path for path, keys in candidates.items()
+            if (pin := best_pin(pins, path, "src/Services/UserService.cs", keys)) is not None
+            and not shadowed(pin, keys, list(candidates.items()))
+        }
+
+    assert linked(rows, candidates) == linked(imports, candidates) == {"src/Models/User.cs"}
+    legacy = {"src/Legacy/User.cs": candidates["src/Legacy/User.cs"]}
+    assert linked(rows, legacy) == linked(imports, legacy) == {"src/Legacy/User.cs"}
+
+
+def test_several_lookups_in_one_pin_and_a_group_over_the_cap_have_no_tiers():
+    """A class's two bases (one lookup each) are one tier: one base's nearer
+    candidate must not hide the other's. A group over the cap falls back to
+    its class file, which has none."""
+    source = """
+        namespace Shop.App;
+
+        public class Child : Base, Other
+        {
+            public void Run() { Help(); }
+        }
+    """
+    assert [len(tiers) for tiers in _call_tiers(source, "Run", "Help")] == [1]
+    usings = "".join(f"using N{i};\n" for i in range(MAX_SCOPE_KEYS))
+    wide = usings + "namespace Shop.App;\nclass C { void Run(User u) { u.Display(); } }\n"
+    pins = {r.to_file for r in _rows(wide, "src/C.cs") if r.to_name == "Display"}
+    assert pins == {"/User.cs^", "/UserExtensions.cs^"}
+
+
+_USER = "namespace {}\n{{\n    public class User {{ public void Display() {{ }} }}\n}}\n"
+_SERVICE = (
+    "using Legacy.Accounts;\n\nnamespace Shop.Domain.Services;\n\n"
+    "public class {} {{ public void Register(User user) {{ user.Display(); }} }}\n"
+)
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["one batch", "a batch per file"])
+def test_a_nearer_type_retracts_a_farther_ones_edges_and_restores_them(engine, repo_id, tmp_path, split):
+    """Two callers, `using Legacy.Accounts` in Shop.Domain.Services, link
+    Legacy.Accounts.User until a Shop.Domain.User is added (by a batch
+    without them), and again once it moves to another namespace, moves to
+    another file, or goes; it comes back with an edit of a caller. Every
+    step equals a fresh scan, its files indexed in one batch or one batch
+    each (a watcher's), the target file never in the callers' batch but
+    the last one."""
+    _write(tmp_path, "Legacy/User.cs", _USER.format("Legacy.Accounts"))
+    service = _write(tmp_path, "App/UserService.cs", _SERVICE.format("UserService"))
+    _write(tmp_path, "App/Audit.cs", _SERVICE.format("Audit"))
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+
+    def targets():
+        calls = {(e[0], e[2]) for e in _edges(engine, repo_id, "CALLS") if e[1] == "Register"}
+        imports = {(e[0], e[2]) for e in _edges(engine, repo_id, "IMPORTS") if e[3] == "User"}
+        assert imports == calls
+        return {target for _caller, target in calls}, len(calls)
+
+    def step(written=(), gone=()):
+        written = [_write(tmp_path, rel, text) for rel, text in written]
+        for rel in gone:
+            (tmp_path / rel).unlink()
+        if split:
+            for path in written:
+                index_paths(engine, repo_id, tmp_path, {path})
+            for rel in gone:
+                remove_paths(engine, repo_id, tmp_path, {tmp_path / rel})
+        else:
+            if gone:
+                remove_paths(engine, repo_id, tmp_path, {tmp_path / rel for rel in gone})
+            index_paths(engine, repo_id, tmp_path, set(written))
+        _equals_fresh(engine, repo_id, tmp_path)
+        return targets()
+
+    assert targets() == ({"Legacy/User.cs"}, 2)
+    _equals_fresh(engine, repo_id, tmp_path)
+    # Added: the nearer type hides the farther one.
+    assert step([("Models/User.cs", _USER.format("Shop.Domain"))]) == ({"Models/User.cs"}, 2)
+    # Rekeyed to a namespace no caller reaches, and back.
+    assert step([("Models/User.cs", _USER.format("Elsewhere"))]) == ({"Legacy/User.cs"}, 2)
+    assert step([("Models/User.cs", _USER.format("Shop.Domain"))]) == ({"Models/User.cs"}, 2)
+    # Moved to another file; its old one goes in the same step.
+    assert step([("Core/Person.cs", _USER.format("Shop.Domain"))], ["Models/User.cs"]) == ({"Core/Person.cs"}, 2)
+    # The farther one moved to the nearer namespace: both are Shop.Domain.User.
+    assert step([("Legacy/User.cs", _USER.format("Shop.Domain"))]) == ({"Core/Person.cs", "Legacy/User.cs"}, 4)
+    assert step([("Legacy/User.cs", _USER.format("Legacy.Accounts"))]) == ({"Core/Person.cs"}, 2)
+    # Gone: the farther one is linked again.
+    assert step(gone=["Core/Person.cs"]) == ({"Legacy/User.cs"}, 2)
+    # Back, with a caller edited in the same batch.
+    assert step([("Models/User.cs", _USER.format("Shop.Domain")),
+                 ("App/UserService.cs", service.read_text() + "// edited\n")]) == ({"Models/User.cs"}, 2)
 
 
 def test_a_library_root_the_files_own_namespace_is_under_stays_a_candidate():

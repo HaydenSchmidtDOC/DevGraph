@@ -47,6 +47,7 @@ from devgraph.indexer.common import (
     parse_name_ref,
     pin_confidence,
     pin_excludes,
+    tiered,
 )
 from devgraph.indexer.containers.extractor import ContainerExtractor, ExtractionResult
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
@@ -133,9 +134,11 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: nested function's owner including its functions, and calls to another
 #: file's top-level function narrowed to it; 13: routes beyond Python as
 #: `Endpoint` nodes, with their handlers' IMPLEMENTS and owning-service CALLS
-#: (apis/routes.py), and a code Module's `shared_claims`).
+#: (apis/routes.py), and a code Module's `shared_claims`); 14: C# match keys
+#: in shadow tiers (an enclosing namespace's type hides a using's), a
+#: tiered group's every pin recorded in `name_refs`.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 13
+INDEX_FORMAT = 14
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -679,7 +682,9 @@ def index_paths(
             files recorded to an added node (see _relink_name_refs). No
             importer is re-indexed: every code edge is a function of its
             writer's text, its resolver configuration and whether its target
-            exists.
+            exists (a tiered pin's, which nodes of its target's name exist:
+            other files' tiered groups to a name whose nodes the batch adds,
+            removes or rekeys are written again).
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
         sync_provider: Write schema-provider nodes and edges for `paths`
@@ -905,6 +910,12 @@ def index_paths(
     )
     if rewritten:
         engine.write_match_keys(repo_id, rewritten)
+    # The names whose nodes the batch adds, removes or rekeys: a tiered pin's
+    # edges to such a name depend on all its nodes, so the relink writes
+    # them again (see _relink_name_refs).
+    shadow_names = {
+        node[:2] for node in added | rekeyed | (previous_nodes - batch_nodes) if node[0] in FILE_SCOPED_LABELS
+    }
     referrers = _find_referrers(engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path))
     for rel_path in sorted(referrers):
         index_one(rel_path, root_resolved / rel_path)
@@ -989,7 +1000,7 @@ def index_paths(
     # edges straight from the graph, with no file read. A full scan has no
     # file outside the batch.
     if relink_outside:
-        _relink_name_refs(engine, repo_id, added | rekeyed, set(by_rel_path) | referrers, match_keys)
+        _relink_name_refs(engine, repo_id, added | rekeyed, set(by_rel_path) | referrers, match_keys, shadow_names)
     if rekeyed:
         engine.settle_match_keys(repo_id, sorted(rekeyed))
 
@@ -1210,8 +1221,14 @@ def _index_single_path(
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above:
         # prune this file's stale nodes/edges in one transaction, then
-        # re-upsert in pass 2 once every file in the batch has a node.
-        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
+        # re-upsert in pass 2 once every file in the batch has a node. A
+        # row with tiered match keys waits for pass 2: whether a nearer
+        # node shadows its target depends on nodes a later file of the
+        # batch may still add, remove or rekey, and pass 2 only adds edges.
+        engine.replace_file_nodes(
+            repo_id, rel_path, _with_name_refs(nodes, rels, rel_path),
+            [rel for rel in rels if not tiered(rel.get("to_file"))], service_api=True,
+        )
         indexed += 1
         cs_files.append(rel_path)
         cs_extractions[rel_path] = (nodes, rels)
@@ -1360,6 +1377,7 @@ def _match_keys(
 def _relink_name_refs(
     engine: GraphEngine, repo_id: str, added: set[tuple[str, str, str, str]], skip: set[str],
     match_keys: dict[tuple[str, str, str, str], tuple[str, ...] | None] | None = None,
+    shadow_names: set[tuple[str, str]] = frozenset(),
 ) -> None:
     """Re-write the by-name edges that code files outside `skip` recorded in
     their Modules' `name_refs` (see name_ref_properties) and that meet a node
@@ -1383,8 +1401,16 @@ def _relink_name_refs(
     basename (the row's `to_name`, see common.module_pin_name) and relinked
     by its path. Each edge gets back the entry's `caller_class`, and its
     source the entry's owner.
+
+    A group (one source's entries to one name) with a tiered pin
+    (graph/schema.py `tiered_pin`) is never relinked edge by edge: whether
+    it links a node depends on every node of the name. When its (to_label,
+    to_name) is in `shadow_names` (a name whose nodes the batch added,
+    removed or rekeyed) it is written again whole, as its writer wrote it
+    (engine.rerun_edges: its file's edges of the group go first); else it
+    stays as it is.
     """
-    if not added:
+    if not added and not shadow_names:
         return
     pinned: dict[tuple[str, str], set[tuple[str | None, str | None]]] = {}
     modules: set[str] = set()
@@ -1393,6 +1419,7 @@ def _relink_name_refs(
         if label == "Module":
             modules.add(name)
     rels = []
+    rerun = []
 
     def relink(origin, fields, from_file, to_file, confidence, exclude=(), to_name=None, from_owner=None,
                to_owner=None):
@@ -1406,7 +1433,7 @@ def _relink_name_refs(
             "from_owner": from_owner, "to_owner": to_owner,
         })
 
-    names = {name for _label, name in pinned}
+    names = {name for _label, name in pinned} | {name for _label, name in shadow_names}
     names |= {key for module in modules for key in _module_pin_keys(module)}
     for origin, refs in engine.find_name_refs(repo_id, sorted(names), sorted(skip)):
         parsed = _with_scopes_merged(_parsed_name_refs(origin, refs))
@@ -1424,6 +1451,21 @@ def _relink_name_refs(
             # (an entry written before owners) matches them all.
             owner = from_owner if from_file else None
             owners = owners_by_pin(pins) if pins is not None else {}
+            if pins is not None and any(tiered(pin) for pin in owners):
+                if (to_label, to_name) in shadow_names:
+                    rerun.append({
+                        "rel_type": fields[0], "from_label": from_label, "from_name": from_name,
+                        "from_file": from_file or None, "from_owner": owner, "to_label": to_label,
+                        "to_name": to_name, "origin": origin,
+                    })
+                    # The writer's rows (calls.call_rows).
+                    for pin, exclude in pin_excludes(owners, origin).items():
+                        for to_owner in [None] if None in owners[pin] else sorted(owners[pin]):
+                            relink(
+                                origin, fields, from_file, pin, pin_confidence(pin, confidence), exclude,
+                                from_owner=owner, to_owner=to_owner,
+                            )
+                continue
             if pins is None:
                 for to_file, to_owner in pinned.get((to_label, to_name), ()):
                     relink(origin, fields, from_file, to_file, confidence, from_owner=owner, to_owner=to_owner)
@@ -1458,7 +1500,9 @@ def _relink_name_refs(
                                 origin, fields, source_file, to_file, conf, exclude, from_owner=source_owner,
                                 to_owner=to_owner,
                             )
-    if rels:
+    if rerun:
+        engine.rerun_edges(repo_id, rerun, rels)
+    elif rels:
         engine.upsert_relationships(rels)
 
 
@@ -1752,7 +1796,9 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     and recreated in one batch keeps its recreated files. Language nodes are
     deleted per exact path; the provider passes get the exact paths, plus
     each deleted path that holds no indexable file on disk, so that its now
-    empty folder nodes go.
+    empty folder nodes go. The tiered groups of other files to the deleted
+    symbols' names are written again (`_relink_name_refs`): a farther node
+    the deleted one hid is linked again.
 
     Args:
         engine: A GraphEngine instance.
@@ -1778,6 +1824,12 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     removed = {f for f in below if not _present(repo_root, f, listings)}
     removed |= {key for key in keys if not _holds_present_file(repo_root, key, listings)}
 
+    # The names of the symbols that go: a tiered pin's edges to such a name
+    # depend on all its nodes (see _relink_name_refs).
+    shadow_names = {
+        node[:2] for node in (engine.list_file_nodes(repo_id, sorted(removed)) if removed else ())
+        if node[0] in FILE_SCOPED_LABELS
+    }
     # Must match the repo-relative key index_paths() writes for every
     # extractor (Module/Class/Function/Document nodes, and shared nodes'
     # `sources`).
@@ -1785,6 +1837,7 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
         engine.delete_nodes_by_source_file(repo_id, rel)
     if removed:
         engine.update_skipped_files(repo_id, drop=removed)
+    _relink_name_refs(engine, repo_id, set(), removed, shadow_names=shadow_names)
 
     ok, fs_spec, docs_spec = specs
     if removed:

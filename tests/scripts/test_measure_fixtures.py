@@ -22,10 +22,7 @@ _spec.loader.exec_module(measure)
 #: Languages whose resolution has not landed yet.
 PENDING: set[str] = set()
 #: Languages whose resolution has landed short of the targets, and why.
-SHORT = {
-    "csharp": "an enclosing namespace's User does not shadow a using's: both match until shadow tiers "
-    "(see the spec's C# section)",
-}
+SHORT: dict[str, str] = {}
 #: Named sites no resolver that reads only its own file can reach (see the
 #: spec's slice B results): `repo.size()` on an `AuditedRepo` field is the
 #: `size` AuditedRepo inherits from Repo, which only AuditedRepo.java says.

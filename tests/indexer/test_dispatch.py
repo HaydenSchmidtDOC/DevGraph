@@ -1540,7 +1540,7 @@ def test_a_directory_pin_is_tested_before_the_fileless_pin():
     (prefix_row,) = groups[("Function", "CALLS", "Function", "file", "prefix")]
     assert prefix_row["targets"] == [{
         "to_name": "f", "to_file": "pkg/", "to_owner": None,
-        "pin": {"k": "prefix", "v": "pkg/", "ns": "", "os": [], "nv": [], "nr": [], "sc": []},
+        "pin": {"k": "prefix", "v": "pkg/", "ns": "", "os": [], "nv": [], "nr": [], "sc": [], "sr": []},
         "ex_files": ["pkg/a.py"], "ex_pins": [],
     }]
     match = _end_match("b", "Function", "to", "prefix", "t")

@@ -39,7 +39,10 @@ Mirrors `devgraph/indexer/python/extractor.py`'s shape (Implementation Plan
     block's), a dotted name at every split (`A.B.T`: `A.B:T`, `A:B.T`,
     `.:A.B.T`, as a type can be nested; a qualified one also under each
     enclosing namespace, and as a type nested in `A.B`), a nested
-    `Ns:Outer.T` inside Outer. A site's types' keys and its extension keys
+    `Ns:Outer.T` inside Outer. The keys of one type lookup come in the
+    tiers C# looks the name up in, nearest first (graph/schema.py
+    `tiered_pin`): a nearer type hides a farther one's (an enclosing
+    namespace's `User` a using's). A site's types' keys and its extension keys
     (`Ns:+T`) are two pins, each capped at 32 keys on its own; a group over
     the cap falls back to the class file pins written before match keys
     (`/T.cs^`, `/TExtensions.cs^`). Package confidence either way: two
@@ -90,8 +93,7 @@ Known scope cuts (documented, not silently dropped):
     what the golden-repo parity bar targets.
   - A project's `<ProjectReference>`s are not read: a type of a project the
     writer's does not reference matches as well as one it does. Nor is
-    `ImplicitUsings` (only System.* and Microsoft.* namespaces), and an
-    enclosing namespace's type does not shadow a using's: both match.
+    `ImplicitUsings` (only System.* and Microsoft.* namespaces).
 """
 
 from __future__ import annotations
@@ -104,7 +106,7 @@ from typing import NamedTuple
 import tree_sitter_c_sharp as tscsharp
 from tree_sitter import Language, Node, Parser
 
-from devgraph.graph.schema import MAX_SCOPE_KEYS, scoped_pin
+from devgraph.graph.schema import MAX_SCOPE_KEYS, scoped_pin, tiered_pin
 from devgraph.indexer.apis.routes import add_route, join_route
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, call_rows
 from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges, owned_pin
@@ -409,12 +411,16 @@ class _CsScope(NamedTuple):
     `System` and `Microsoft` ones left out); `aliases` each using alias's
     target, and `statics` each `using static` type, as the dotted names it
     can be (a namespace block's using is relative to each enclosing
-    namespace too)."""
+    namespace too); `levels` the order C# looks a name up in: each
+    enclosing namespace, innermost first, then the global one (`.`), with
+    the namespaces the usings of its declaration bring in (the global
+    one's: the file's and its project's)."""
 
     chain: tuple[str, ...]
     namespaces: frozenset[str]
     aliases: dict[str, tuple[str, ...]]
     statics: tuple[tuple[str, ...], ...]
+    levels: tuple[tuple[str, frozenset[str]], ...]
 
     @property
     def namespace(self) -> str:
@@ -425,8 +431,8 @@ class _CsClass:
     def __init__(self) -> None:
         self.methods: set[str] = set()
         self.fields: dict[str, _CsType | None] = {}
-        # (name as written, the class it names or None for none or a library type, its match keys)
-        self.bases: list[tuple[str, str | None, frozenset[str]]] = []
+        # (name as written, the class it names or None for none or a library type, its match key tiers)
+        self.bases: list[tuple[str, str | None, tuple[frozenset[str], ...]]] = []
         self.keys: set[str] = set()  # its own match keys, `Ns:Outer.Name`
         self.partial = False
         # What its members are owned by (common.member_owner), `Outer.Name`:
@@ -444,39 +450,56 @@ def _clean(keys) -> set[str]:
     return {key.replace("@", "") for key in keys}
 
 
-def _key_group(keys: set[str], fallback) -> list[str]:
-    """One group of a site's match keys as pins: one pin to any C# file
-    whose node holds one of them, or, with more than MAX_SCOPE_KEYS, the
-    `fallback` filename pins (`/T.cs^`, as before match keys)."""
-    keys = _clean(keys)
+def _key_pin(tiers: list[set[str]]) -> str:
+    """The pin to any C# file whose node holds one of these tiers' keys
+    (graph/schema.py `tiered_pin`; with more than MAX_SCOPE_KEYS, any C#
+    file)."""
+    return tiered_pin(_ANY_CS_FILE, [_clean(tier) for tier in tiers])
+
+
+def _key_group(tiers: list[set[str]], fallback) -> list[str]:
+    """One group of a site's match keys, in tiers, as pins: one pin to any
+    C# file whose node holds one of them (`_key_pin`), or, with more than
+    MAX_SCOPE_KEYS, the `fallback` filename pins (`/T.cs^`, as before match
+    keys), which have no tiers."""
+    keys = _clean(set().union(*tiers))
     if not keys:
         return []
     if len(keys) <= MAX_SCOPE_KEYS:
-        return [scoped_pin(_ANY_CS_FILE, keys)]
+        return [_key_pin(tiers)]
     return sorted({pin.replace("@", "") for pin in fallback})
+
+
+def _merged(tiers: list[set[str]], other: list[set[str]]) -> list[set[str]]:
+    """Two lookups' key tiers as one group: either alone keeps its tiers;
+    both are one tier, so that one type's nearer candidate never hides
+    another type's."""
+    if not any(tiers) or not any(other):
+        return [set(tier) for tier in (tiers if any(tiers) else other)]
+    return [set().union(*tiers, *other)]
 
 
 class _Target:
     """Where a call site's callee can be: files, and two groups of match
-    keys, each capped on its own: the types' (`Ns:T`, falling back to each
-    type's class file `/T.cs^`) and their extension methods' (`Ns:+T`,
-    falling back to `/TExtensions.cs^`)."""
+    keys in tiers (`_key_group`), each capped on its own: the types'
+    (`Ns:T`, falling back to each type's class file `/T.cs^`) and their
+    extension methods' (`Ns:+T`, falling back to `/TExtensions.cs^`)."""
 
     def __init__(self) -> None:
         self.files: set[str] = set()
-        self.keys: set[str] = set()
+        self.keys: list[set[str]] = []
         self.types: set[str] = set()  # the types `keys` are of
-        self.extension_keys: set[str] = set()
+        self.extension_keys: list[set[str]] = []
         self.extended: set[str] = set()  # the types `extension_keys` are of
 
     def __bool__(self) -> bool:
-        return bool(self.files or self.keys or self.extension_keys)
+        return bool(self.files or any(self.keys) or any(self.extension_keys))
 
     def add(self, other: _Target) -> None:
         self.files |= other.files
-        self.keys |= other.keys
+        self.keys = _merged(self.keys, other.keys)
         self.types |= other.types
-        self.extension_keys |= other.extension_keys
+        self.extension_keys = _merged(self.extension_keys, other.extension_keys)
         self.extended |= other.extended
 
     def pins(self) -> list[str]:
@@ -550,55 +573,78 @@ class _CsResolver:
             return using, (using.name.removeprefix("global::"),)
 
         parts = [part for part in (self._file_namespace or "").split(".") if part]
-        usings = [absolute(using) for using in self._unit_usings]
-        usings += [relative(using, parts) for using in self._file_ns_usings]
+        # Each using with the namespace whose declaration holds it (the
+        # global one's: the file's and its project's).
+        usings = [(_GLOBAL_NS, *absolute(using)) for using in self._unit_usings]
+        usings += [(".".join(parts), *relative(using, parts)) for using in self._file_ns_usings]
         for block in reversed(blocks):
             parts += [part for part in (_dotted(block.child_by_field_name("name"), self.source) or "").split(".")
                       if part]
             body = block.child_by_field_name("body")
-            usings += [relative(u, parts) for c in (body.named_children if body is not None else [])
+            usings += [(".".join(parts), *relative(u, parts)) for c in (body.named_children if body is not None else [])
                        if c.type == "using_directive" if (u := _using(c, self.source)) is not None]
         chain = tuple(prefixes(parts))
         root = parts[0] if parts else None  # a library root the file's own namespace is under is the repo's
+        used = {
+            level: frozenset(
+                name for at, using, names in usings if at == level and not using.static and not using.alias
+                for name in names if not _library_namespace(name) or name.split(".", 1)[0] == root
+            )
+            for level in (*chain, _GLOBAL_NS)
+        }
         found = _CsScope(
             chain,
-            frozenset({*chain, _GLOBAL_NS, *(name for using, names in usings if not using.static and not using.alias
-                                             for name in names
-                                             if not _library_namespace(name) or name.split(".", 1)[0] == root)}),
-            {using.alias: names for using, names in usings if using.alias},
-            tuple(sorted({names for using, names in usings if using.static and not using.alias})),
+            frozenset({*chain, _GLOBAL_NS, *(name for names in used.values() for name in names)}),
+            {using.alias: names for _at, using, names in usings if using.alias},
+            tuple(sorted({names for _at, using, names in usings if using.static and not using.alias})),
+            tuple(used.items()),
         )
         self._scopes[cache] = found
         return found
 
-    def type_keys(self, qualifier: str, name: str, scope: _CsScope, classes: list[str]) -> set[str]:
+    def type_keys(self, qualifier: str, name: str, scope: _CsScope, classes: list[str]) -> list[set[str]]:
         """The match keys the type `qualifier.name`, written at a site in
-        `scope` inside `classes` (innermost first), can have: an alias's
-        target, split at each dot (`_splits`: a type can be nested);
-        unqualified, the name in each of the site's namespaces and nested in
-        each enclosing class (`Ns:Outer.Inner`); qualified `A.B.T`, each
-        split of it relative to the global namespace (`global::` only
-        there) and the splits within it relative to each enclosing
-        namespace, and `A.B.T` nested in a type `A` of the site's
-        namespaces."""
+        `scope` inside `classes` (innermost first), can have, in the tiers C#
+        looks it up in, nearest first (graph/schema.py `tiered_pin`): an
+        alias's target, split at each dot (`_splits`: a type can be nested),
+        one tier; unqualified, the name nested in each enclosing class
+        (`Ns:Outer.Inner`), innermost first, then for each level of
+        `scope.levels` the name in its namespace and then in its usings'
+        namespaces; qualified `A.B.T` the same way, each split within it
+        relative to the level's namespace and `A.B.T` nested in a type `A`
+        of it, then `A.B.T` nested in a type of its usings' namespaces (at
+        the global level, each split of it: `global::` only there)."""
         if not qualifier:
             if name in scope.aliases:
-                return set().union(*(_splits(target) for target in scope.aliases[name]))
+                return [set().union(*(_splits(target) for target in scope.aliases[name]))]
             path = list(reversed(classes))
-            return {f"{namespace}:{name}" for namespace in scope.namespaces} | {
-                f"{scope.namespace}:{'.'.join([*path[:i], name])}" for i in range(1, len(path) + 1)
-            }
+            tiers = [{f"{scope.namespace}:{'.'.join([*path[:i], name])}"} for i in range(len(path), 0, -1)]
+            for namespace, usings in scope.levels:
+                tiers += [{f"{namespace}:{name}"}, {f"{using}:{name}" for using in usings}]
+            return tiers
         if qualifier.startswith("global::"):
-            return _splits(".".join(part for part in (qualifier.removeprefix("global::"), name) if part))
+            return [_splits(".".join(part for part in (qualifier.removeprefix("global::"), name) if part))]
         head, _dot, rest = qualifier.partition(".")
         if head in scope.aliases:
-            return set().union(*(_splits(".".join(part for part in (target, rest, name) if part))
-                                 for target in scope.aliases[head]))
+            return [set().union(*(_splits(".".join(part for part in (target, rest, name) if part))
+                                  for target in scope.aliases[head]))]
         dotted = f"{qualifier}.{name}"
-        keys = _splits(dotted) | {f"{namespace}:{dotted}" for namespace in scope.namespaces}
-        for prefix in scope.chain:
-            keys |= {f"{prefix}.{key}" for key in _splits(dotted) if not key.startswith(_GLOBAL_NS + ":")}
-        return keys
+        tiers = []
+        for namespace, usings in scope.levels:
+            own = _splits(dotted) if namespace == _GLOBAL_NS else {f"{namespace}:{dotted}"} | {
+                f"{namespace}.{key}" for key in _splits(dotted) if not key.startswith(_GLOBAL_NS + ":")
+            }
+            tiers += [own, {f"{using}:{dotted}" for using in usings}]
+        return tiers
+
+    @staticmethod
+    def extension_keys(name: str, scope: _CsScope) -> list[set[str]]:
+        """The keys of the extension methods of type `name` a site in
+        `scope` reaches (`Ns:+T`), a tier per level of `scope.levels`, its
+        namespace and its usings' together: C# looks for extension methods
+        one enclosing namespace declaration at a time."""
+        return [_clean({f"{namespace}:+{name}"} | {f"{using}:+{name}" for using in usings})
+                for namespace, usings in scope.levels]
 
     def _collect(self, node: Node, path: tuple[str, ...]) -> None:
         source = self.source
@@ -622,8 +668,8 @@ class _CsResolver:
                         resolved = base_name if qualifier else self.type_name(base_name, scope)
                         if resolved in STOP_TYPES["csharp"] or _leftmost(qualifier) in STOP_TYPES["csharp"]:
                             resolved = None
-                        keys = self.type_keys(qualifier, base_name, scope, list(reversed(path))) if resolved else ()
-                        cls.bases.append((base_name, resolved, frozenset(keys)))
+                        keys = self.type_keys(qualifier, base_name, scope, list(reversed(path))) if resolved else []
+                        cls.bases.append((base_name, resolved, tuple(frozenset(tier) for tier in keys)))
                 body = child.child_by_field_name("body")
                 for member in body.named_children if body is not None else []:
                     if member.type in _METHOD_LIKE:
@@ -683,13 +729,13 @@ class _CsResolver:
         else:
             target.keys = self.type_keys(written.qualifier, written.name, scope, classes)
             target.types.add(resolved)
-            self.imports.setdefault(resolved, set()).add(scoped_pin(_ANY_CS_FILE, _clean(target.keys)))
+            self.imports.setdefault(resolved, set()).add(_key_pin(target.keys))
         if instance:
-            extensions = _clean({f"{namespace}:+{resolved}" for namespace in scope.namespaces})
-            target.extension_keys |= extensions
+            extensions = self.extension_keys(resolved, scope)
+            target.extension_keys = _merged(target.extension_keys, extensions)
             target.extended.add(resolved)
-            if method not in self.methods and len(extensions) <= MAX_SCOPE_KEYS:
-                self.extension_imports.setdefault(method, set()).add(scoped_pin(_ANY_CS_FILE, extensions))
+            if method not in self.methods and len(set().union(*extensions)) <= MAX_SCOPE_KEYS:
+                self.extension_imports.setdefault(method, set()).add(_key_pin(extensions))
         return target
 
     def class_target(self, cls: str, method: str, seen: frozenset = frozenset(), own: bool = True) -> _Target:
@@ -706,13 +752,13 @@ class _CsResolver:
             target.files.add(owned_pin(self.file_path, info.members_owner()))
             return target
         if own and info.partial:
-            target.keys |= info.keys
+            target.keys = _merged(target.keys, [info.keys])
             target.types.add(cls)
         for written, resolved, base_keys in info.bases:
             if written in self.classes:
                 target.add(self.class_target(written, method, seen | {cls}))
             elif base_keys:
-                target.keys |= base_keys
+                target.keys = _merged(target.keys, list(base_keys))
                 target.types.add(resolved)
         return target
 
@@ -876,7 +922,7 @@ class _CsCalls:
                         target.files.add(resolver.file_path)
                     elif simple not in STOP_TYPES["csharp"]:
                         keys = set().union(*(_splits(each) for each in static))
-                        target.keys |= keys
+                        target.keys = _merged(target.keys, [keys])
                         target.types.add(simple)
                         resolver.imports.setdefault(simple, set()).add(scoped_pin(_ANY_CS_FILE, _clean(keys)))
             if target:
@@ -1469,7 +1515,7 @@ def extract_csharp_file(
                 or _leftmost(qualifier) in STOP_TYPES["csharp"]):
             continue
         keys = resolver.type_keys(qualifier, name, scope, _enclosing_classes(node, source_bytes))
-        resolver.imports.setdefault(resolved, set()).add(scoped_pin(_ANY_CS_FILE, _clean(keys)))
+        resolver.imports.setdefault(resolved, set()).add(_key_pin(keys))
     for to_label, imports in (("Class", resolver.imports), ("Function", resolver.extension_imports)):
         for name, pins in sorted(imports.items()):
             if to_label == "Class" and name in resolver.types:
