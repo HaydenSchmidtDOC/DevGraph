@@ -81,10 +81,17 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   nearest Directory.Build.props and before the nearest
   Directory.Build.targets, and the `global using` directives in the heads of
   its own .cs files (not a nested project's), whatever the file is called.
-  Nothing is evaluated: an `<Import>` is not followed, an item under a
-  `Condition` counts as if the condition held, and a name holding `$(`,
-  `@(`, `%(` or a wildcard is left out. `ImplicitUsings` (only `System.*`
-  and `Microsoft.*`), `RootNamespace` and `<ProjectReference>` are not read.
+  A project's references are the projects its `.csproj` files'
+  `<ProjectReference Include>` paths name (read relative to the
+  `.csproj`, `\` as `/`; a Directory.Build file's are not read, as MSBuild
+  reads their relative paths from each importing project), closed
+  transitively (`CsProject.references`; a cycle ends where it comes back,
+  and a path naming no `.csproj` of the repository, missing, ignored,
+  absolute or outside it, reaches nothing until one is there). Nothing is
+  evaluated: an `<Import>` is not followed, an item under a `Condition`
+  counts as if the condition held, and a name or path holding `$(`, `@(`,
+  `%(` or a wildcard is left out. `ImplicitUsings` (only `System.*` and
+  `Microsoft.*`) and `RootNamespace` are not read.
   A file's *head* is read from its start, at most its first 32 KiB, for as
   long as it holds only whitespace, comments, preprocessor lines (`#if`,
   `#region`, `#nullable`, ...), `extern alias` and using directives, global
@@ -96,7 +103,8 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   `.csproj` and Directory.Build file and every .cs file of a project whose
   head holds a `global using`; the digest is each project file's `<Using>`
   items and each such file's `global using`s, so a package bump changes
-  nothing. A live batch reads a changed .cs file's head only when a stored
+  nothing; each `.csproj`'s `<ProjectReference>` paths count too, so adding
+  or removing one re-indexes every C# file. A live batch reads a changed .cs file's head only when a stored
   `.csproj` is at or above it: a file of no project cannot change the
   digest, and the `.csproj` that would make it one is a change itself.
   Every catch-up and full scan reads every .cs file's head (about 45 ms for
@@ -470,8 +478,8 @@ class to a file named after it. Each declaration therefore carries its
 namespace as *match keys* (`mkeys`, see Engine: path pins), and a reference
 to another file's type `T` is one pin to any C# file, `/.?.cs^`, limited
 with `@` to the nodes holding a key the reference can mean, at package
-confidence (two projects can each declare `Shop.Domain.User`; which one a
-project references is not read). The keys come from the target's own text,
+confidence, and to the projects the writer's project sees (see Project
+visibility). The keys come from the target's own text,
 so a namespace edit keeps the target's nodes and only changes their keys:
 the engine retracts and relinks the edges into them.
 
@@ -551,10 +559,9 @@ call `x.M()` also imports the Function `M` under the `Ns:+T` keys alone
 (the file depends on an extension class it never names), unless the file
 declares an `M` itself.
 
-**Limits.** Stage 1 of the namespace design: a project's
-`<ProjectReference>`s are not read, so a same-named type in a project the
-writer's does not reference matches too (in one compilation, two visible
-`Ns.T` are error CS0433). A key group over the cap links by class file
+**Limits.** Two visible `Ns.T` (one compilation's error CS0433, or a
+project's own type beside a referenced one, which C# prefers with warning
+CS0436) both link. A key group over the cap links by class file
 name, as before match keys, and is not tiered (see Shadow tiers).
 `ImplicitUsings` is not read. An extension method is keyed by its `this`
 parameter's type's simple name (`Ns:+T`), or by a type parameter's first
@@ -668,6 +675,58 @@ touched name re-runs those of its tiered callers outside the batch whose
 keys it holds, a retraction and a write per group, where the additive
 relink wrote one edge. A batch of another language costs nothing more:
 its nodes have no keys, so it looks up no `name_refs` for them.
+
+### Project visibility (index format 15)
+
+Stage 2 of the namespace design (ruling N1): two projects of one
+repository can declare the same namespace and type, and a site sees only
+its own project's and those its project references, transitively.
+
+**Node side.** A C# Class and Function carry `proj`, their project's
+directory (`CsProject.dir`; "." for a project at the repository root, so
+it is never ""), or "" for a file of no project. It comes from the
+configuration, never the text, and is written beside the node's match
+keys after pass 1 (`engine.write_match_keys`): a kept node whose `proj`
+changes is retracted, stale-marked and relinked exactly as one whose
+keys change, and the shadow tiers of its name re-run for its keys. Only a
+`.csproj` added, deleted or moved changes a node's `proj`, and that is a
+configuration change re-indexing every C# file anyway; a .cs file moving
+between projects is a new path, so its nodes are added and removed.
+
+**Row side.** Every path-pinned `CALLS` and `IMPORTS` row of a file in a
+project carries `visible`, its project's and its references' `proj`s,
+sorted (`GraphRelationship.visible`). The engine sends it once per row
+(`vis`, beside `targets`), not per pin, and a path-pinned end of a Class
+or Function keeps a node only when `row.vis IS NULL OR coalesce(n.proj,
+'') = '' OR n.proj IN row.vis` (`_visible`; `common.visible_to` is its
+Python mirror, which the randomized shadow test checks against the
+Cypher). A file of no project writes no `visible` and sees every node; a
+node of no project, or of another language, is seen by every row. A row
+pinned to a file (the writer's own) or by bare name is not limited.
+Like a tiered row, such a row waits for pass 2, when every node's `proj`
+is final.
+
+**Shadow tiers.** A nearer tier's node shadows only when it is visible to
+the row: the `NOT EXISTS` of `_shadow_free` tests `shadow` with
+`_visible` too, so an unreferenced project's nearer `User` neither links
+nor hides the referenced farther one.
+
+**Relink.** The visible set is stored once per file, as the Module's
+`name_ref_visible` (`name_ref_properties`), not in each `name_refs`
+entry, so entries are unchanged in size. `find_name_refs` returns it
+with the entries; the additive relink tests an added or rekeyed node's
+`proj` against it before linking through a path pin, and a tiered
+group's re-run rows carry it as `visible`.
+
+**Incremental equals fresh.** A `<ProjectReference>` added or removed,
+and a project added or deleted, change the C# fingerprint, so every C#
+file is re-indexed under the new references (and nodes under their new
+`proj`). A .cs file moving between projects deletes its old nodes and
+adds new ones, relinked from other files' `name_refs` through their
+visible sets, and re-runs the tiered groups its keys meet. The fuzz
+toggles a `<ProjectReference>` (one written with `\`, a cycle through
+two projects) and moves a file declaring a type another project's file
+declares too between projects.
 
 ## C++ (`devgraph/indexer/cpp/extractor.py`)
 
@@ -1324,3 +1383,44 @@ one union per site), AFTER this branch.
 - Seeds 1 to 12 of the graph-accuracy fuzz (15 steps each, `cs_shadow`
   among its operations) and a scripted run of that operation equal a
   fresh scan after every step.
+
+### Results after C# project visibility (index format 15)
+
+See the C# section's Project visibility. BEFORE is index format 14
+(shadow tiers), AFTER this branch, both measured on the generator as
+extended here: `--cs-synthetic` now groups its projects in clusters of
+five that `<ProjectReference>` earlier members of their cluster (one or
+two each, written with `\`, so each reaches the first transitively, and
+no cluster another), the App project references every project, a
+service's cross-project `Gateway.Send()` goes to a project its own
+reaches, and each cluster's first project declares `Co.Shared.Clock`
+(`Co.Shared` a global using of every project), which every service calls:
+the same namespace and type in projects that do not reference each other.
+
+| | BEFORE | AFTER |
+|---|---|---|
+| csharp fixture (App and Tests reference Core) | all targets met; M2 100 %, `IMPORTS` 100 % / 100 %, 31/31 | the same |
+| 10 projects: linked precision (wrong, all cross-project) | 89.1 % (120 / 1,105) | 100 % (0 / 985) |
+| 10 projects: `IMPORTS` precision / recall | 87.8 % / 100 % | 100 % / 100 % |
+| 50 projects: linked precision (wrong, all cross-project) | 47.5 % (5,400 / 10,287) | 100 % (0 / 4,887) |
+| 50 projects: `IMPORTS` precision / recall | 44.3 % / 100 % | 100 % / 100 % |
+| CALLS recall (10 and 50 projects) | 100 % | 100 % |
+| 50 projects: largest / total `name_refs` | 9,027 B / 4.55 MB | the same |
+| 50 projects: largest / total `name_ref_visible` | none | 51 projects, 347 B (App) / 13.8 KB |
+
+- The wrong links BEFORE are every other cluster's `Clock.Now()` and
+  `Clock` import (the namespace and name match; only the project tells
+  them apart). The visible set is stored once per Module, so `name_refs`
+  are byte for byte the same; the largest visible set is the App
+  project's (itself and the 50 it references).
+- **Cost**, BEFORE and AFTER alternating in their own processes on the
+  otherwise idle shared Neo4j: the fixture's `full_scan`, eight scans
+  each after a warm-up, fastest 0.93 s and 0.93 s, medians 0.98 s and
+  0.97 s; the 10-project synthetic 11.2/10.7 s before, 10.8/10.6 s after;
+  50 projects 73.3/80.5 s before, 67.3/68.4 s after (fewer edges to
+  write). Pass 1 no longer writes a project file's path-pinned rows,
+  which pass 2 writes anyway.
+- Seeds 1 to 12 of the graph-accuracy fuzz (15 steps each, with
+  `cs_reference` toggling a `<ProjectReference>`, a cycle included, and
+  `cs_project_move` moving a file whose class another project declares
+  too) and the scripted fuzz runs equal a fresh scan after every step.
