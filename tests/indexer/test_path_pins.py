@@ -118,15 +118,15 @@ def test_name_refs_store_each_set_of_at_keys_once():
     from devgraph.indexer.dispatch import _with_scopes_merged
 
     refs = name_ref_properties(_cs_rows({"a/f.cs", "/.?.cs^@N:A,.:A", "lib/.@N:A,.:A", "/.?.cs^@B:Y"}))["name_refs"]
-    head = ["CALLS", "Function", "main", "app.cs", "Function", "f", "", ""]
+    head = ["CALLS", "Function", "main", "app.cs", "Function", "f", "", None]
     assert all(entry.count("N:A") <= 1 for entry in refs)
     assert sorted(parse_name_ref(entry) for entry in refs) == [
         (head, ["/.?.cs^@.:A,N:A", "lib/.@.:A,N:A"], "pin"),
         (head, ["/.?.cs^@B:Y"], "pin"),
         (head, ["a/f.cs"], "pin"),
     ]
-    # An entry without keys has no such field, as before.
-    assert [len(entry.split("\x1f")) for entry in sorted(refs)] == [11, 11, 10]
+    # Every entry since owners has the same twelve fields, its keys' empty when it has none.
+    assert [len(entry.split("\x1f")) for entry in sorted(refs)] == [12, 12, 12]
     assert _with_scopes_merged([parse_name_ref(entry) for entry in refs]) == [
         (head, ["/.?.cs^@.:A,N:A", "/.?.cs^@B:Y", "a/f.cs", "lib/.@.:A,N:A"], "pin"),
     ]

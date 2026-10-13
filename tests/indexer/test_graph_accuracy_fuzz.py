@@ -12,8 +12,12 @@ Python files import and call in every style the call resolution reads
 aliased, relative and star imports, a package re-exporting from its module,
 a src/ layout, calls through modules, aliases and untyped values, and
 `self.shared()` reaching a base in the same or another file. A class `Twin`
-comes and goes beside another class of a file, repeating its method names, so
-same-named methods of one file are told apart by their owner.
+comes and goes beside another class of a file, repeating its method names
+(both nest a `Meta` with its own base), and so do a top-level `act` and one
+nested in a function, so same-named symbols of one file are told apart by
+their owner; another file calls `b.Twin().act()` and `b.Base().act()`, one
+owner's member across files. go/b gains a type whose methods are named like
+the package's functions, which other files call by package.
 
 TS files import through a tsconfig path alias, and the resolver configuration
 changes under them: the tsconfig is rewritten (its own `paths`, `extends` to
@@ -147,7 +151,10 @@ def py_class(name: str, base: str | None) -> str:
     method names (two `act`s, maybe two `shared`s, each its own node)."""
     head = f"\n\nclass {name}({base}):\n" if base else f"\n\nclass {name}:\n"
     shared = "\n    def shared(self):\n        return 0\n" if name in ("Base", "Twin") else ""
-    return head + "    def act(self):\n        return self.shared()\n" + shared
+    # Both also nest a `Meta` (two same-named classes of one file, each
+    # with its own EXTENDS and `act`).
+    meta = "\n    class Meta(Child):\n        def act(self):\n            return 1\n" if shared else ""
+    return head + "    def act(self):\n        return self.shared()\n" + shared + meta
 
 
 def render(f: File) -> str:
@@ -160,6 +167,7 @@ def render(f: File) -> str:
             f"\n\ndef {name}():\n" + "".join(f"    {g}\n" for g in calls) + "    return 0\n"
             for name, calls in f.funcs.items()
         ]
+        parts.append(f.extra)
         return "".join(parts) or "X = 1\n"
     if f.kind == "rs":
         parts = [f"{m}\n" for m in f.imports]
@@ -314,6 +322,10 @@ CONFIG_DIRS = ["ts/configs", "go/b", "crates/core", "cs/Models"]
 
 RS_FOO = "pub struct Foo;\n\nimpl Foo {\n    pub fn new() -> Foo {\n        Foo\n    }\n}\n"
 GO_SERVER = "type Server struct{}\n\nfunc (s *Server) Run() {\n\tServe()\n}\n"
+# Methods named like go/b's functions Serve and Stop.
+GO_TWIN = "\ntype Twin struct{}\n\nfunc (t Twin) Serve() {}\n\nfunc (t *Twin) Stop() {\n\tt.Serve()\n}\n"
+# A function nested in another, named like the classes' methods.
+PY_NESTED = "\n\ndef outer():\n    def act():\n        return shared()\n    return act()\n"
 
 
 def initial_repo() -> dict:
@@ -411,7 +423,8 @@ BASES = {
 }
 # How a Python call to `{n}` is written: bare, through a module or alias, on
 # an untyped value, on `self`, or on a literal.
-PY_CALLS = ["{n}()", "b.{n}()", "c.{n}()", "obj.{n}()", "pkg.impl.{n}()", "alias.{n}()", "self.{n}()", "''.{n}()"]
+PY_CALLS = ["{n}()", "b.{n}()", "c.{n}()", "obj.{n}()", "pkg.impl.{n}()", "alias.{n}()", "self.{n}()", "''.{n}()",
+            "b.Twin().{n}()", "b.Base().{n}()"]
 # Path pins of every kind over the fuzz's own paths (renames add `_rN` to a stem).
 CALL_PINS = ["py/.", ".", "pkg/.!other.py", "/b.py", "/lib/util.py", "/py/.", "/lib/.", "src/", "pkg/", "py/b.py"]
 IMPORT_PINS = ["py/.", "pkg/.", ".", "src/lib/.!core.py", "/b.py", "/util.py", "/impl.py"]
@@ -474,7 +487,7 @@ class Fuzz:
         return self.rng.choice(paths) if paths else None
 
     def _func_names(self) -> list:
-        return sorted({n for f in self.files.values() for n in f.funcs} | {"Run", "new", "missing_fn", "Tidy"})
+        return sorted({n for f in self.files.values() for n in f.funcs} | {"Run", "new", "missing_fn", "Tidy", "act", "shared"})
 
     @staticmethod
     def _styled(kind: str, names: list) -> list:
@@ -527,6 +540,39 @@ class Fuzz:
         beside = sorted(f.bases)[0]
         f.bases["Twin"] = None
         return f"add class Twin beside {beside} in {path}", {path}
+
+    def op_shadow(self):
+        """A Python file with a class gains or loses a top-level `act`, the
+        name its classes' methods have."""
+        path = self._pick(lambda f: f.kind == "py" and f.bases)
+        if not path:
+            return None
+        f = self.files[path]
+        if "act" in f.funcs:
+            del f.funcs["act"]
+            return f"remove top-level act from {path}", {path}
+        f.funcs["act"] = ["shared()"]
+        return f"add top-level act in {path}", {path}
+
+    def op_nested(self):
+        """A Python file gains or loses `outer`, with an `act` nested in it
+        (owned by `outer`) calling `shared`."""
+        path = self._pick(lambda f: f.kind == "py")
+        if not path:
+            return None
+        f = self.files[path]
+        f.extra = "" if f.extra else PY_NESTED
+        return f"{'add' if f.extra else 'remove'} nested act in {path}", {path}
+
+    def op_go_twin(self):
+        """go/b/b.go gains or loses a type `Twin` whose methods are named
+        like the package's functions `Serve` and `Stop`."""
+        path = "go/b/b.go"
+        if path not in self.files:
+            return None
+        f = self.files[path]
+        f.extra = GO_SERVER if f.extra != GO_SERVER else GO_SERVER + GO_TWIN
+        return f"{'add' if f.extra != GO_SERVER else 'remove'} type Twin in {path}", {path}
 
     def op_import(self):
         path = self._pick(lambda f: f.kind in IMPORTS)
@@ -866,7 +912,7 @@ class Fuzz:
         "rename", "delete", "restore", "service", "from", "move_image", "mention", "link", "supersedes", "pin", "pin",
         "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module", "method", "method",
         "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move", "cs_namespace", "cs_move_class",
-        "cs_dup_class", "twin", "twin",
+        "cs_dup_class", "twin", "twin", "shadow", "nested", "go_twin", "go_twin",
     ]
 
     def draw(self):

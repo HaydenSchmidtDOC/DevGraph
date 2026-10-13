@@ -191,6 +191,12 @@ def lookup_index_statements() -> list[str]:
     user-type constraint or index (built-in labels can't be redeclared).
     """
     statements = [
+        # A pre-release build of owner identity created these; they would
+        # block an older DevGraph's (repo_id, name, file) constraint.
+        f"DROP INDEX {label.lower()}_repo_name_file_lookup IF EXISTS"
+        for label in FILE_SCOPED_LABELS
+    ]
+    statements += [
         f"CREATE INDEX {label.lower()}_repo_name_lookup IF NOT EXISTS FOR (n:{label}) ON (n.repo_id, n.name)"
         for label in FILE_SCOPED_LABELS
     ]
@@ -216,9 +222,12 @@ NAME_REF_SEP = "\x1f"
 NAME_REF_PIN_SEP = "\x1e"
 #: A target pin to the file-less node ("" as a `to_file`).
 NAME_REF_FILELESS = "\x1d"
-#: Joins a file pin and the owner of the target in that file, in a
-#: resolver's *owned pin* (see devgraph/indexer/common.py `owned_pin`).
+#: Joins a pin and the owner of the target in the files it matches, in an
+#: *owned pin* (see devgraph/indexer/common.py `owned_pin`).
 OWNER_PIN_SEP = "\x1c"
+#: The last field of a `name_refs` entry written since owners (index format
+#: 11), which no older entry's last field can be: its layout is then fixed.
+NAME_REF_OWNED = "\x1b"
 
 
 # Path pins: a relationship row's `to_file` (see devgraph/indexer/common.py

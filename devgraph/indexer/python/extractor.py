@@ -27,7 +27,15 @@ import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
 from devgraph.indexer.calls import STOP_METHODS, call_rows
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, member_owner, own_edges, owned_pin
+from devgraph.indexer.common import (
+    ExtractionResult,
+    GraphNode,
+    GraphRelationship,
+    member_owner,
+    own_edges,
+    owned_pin,
+    split_owned_pin,
+)
 from devgraph.indexer.python.resolve import Bindings, absolute_module, relative_module
 
 logger = logging.getLogger(__name__)
@@ -399,27 +407,37 @@ class _CallResolver:
         self.source = source
 
     def _module_pins(self, receiver: str) -> list[str] | None:
-        """Where a name read off an imported module or a from-imported name can be."""
+        """Where a name read off an imported module or a from-imported name
+        can be, as owned pins (common.owned_pin): a module's attribute is a
+        top-level one (owner ""), and so is a submodule's; one read off a
+        from-imported capitalised name is that class's member; anything
+        else's owner is unknown (a from-imported instance's methods)."""
         ref = self.bindings.modules.get(receiver)
         if ref is not None:
-            return ref.files() + ref.dirs()
+            return [owned_pin(pin, "") for pin in ref.files() + ref.dirs()]
         symbol = self.bindings.symbols.get(receiver)
         if symbol is not None:
-            return (
-                symbol.module.files() + symbol.submodule.files() + symbol.module.dirs() + symbol.submodule.dirs()
-            )
+            member_of = symbol.name if symbol.name[:1].isupper() else None
+            return [owned_pin(pin, member_of) for pin in symbol.module.files() + symbol.module.dirs()] + [
+                owned_pin(pin, "") for pin in symbol.submodule.files() + symbol.submodule.dirs()
+            ]
         return None
 
     def _class_pins(self, type_name: str, method: str) -> list[str] | None:
         """Where `method` of the class `type_name` (as written) can be. An
-        in-file class is walked like `self.method()` (see _method_pins)."""
+        in-file class is walked like `self.method()` (see _method_pins); an
+        imported one's member is owned by it (its name where it is declared,
+        a top-level class's). A method it inherits from a base of its own
+        file is then not linked: that file is not read."""
         if type_name in self.classes:
             return self._method_pins(type_name, method, own=True)
         if "." in type_name:
-            return self._module_pins(type_name.rsplit(".", 1)[0])
+            module, _dot, cls = type_name.rpartition(".")
+            pins = self._module_pins(module)
+            return [owned_pin(split_owned_pin(pin)[0], cls) for pin in pins] if pins is not None else None
         symbol = self.bindings.symbols.get(type_name)
         if symbol is not None:
-            return symbol.module.files() + symbol.module.dirs()
+            return [owned_pin(pin, symbol.name) for pin in symbol.module.files() + symbol.module.dirs()]
         return None
 
     def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
@@ -474,11 +492,12 @@ class _CallResolver:
             if scope.is_parameter(name):
                 return []  # calling a parameter: nothing to resolve, and it shadows any import
             symbol = self.bindings.symbols.get(name)
+            # A from-imported (or star-imported) name is a module's top-level one.
             if symbol is not None:
-                return [(symbol.name, pin) for pin in symbol.module.files() + symbol.module.dirs()]
+                return [(symbol.name, owned_pin(pin, "")) for pin in symbol.module.files() + symbol.module.dirs()]
             if name in self.bindings.modules or name in _BUILTIN_NAMES:
                 return []
-            return [(name, pin) for star in self.bindings.stars for pin in star.files() + star.dirs()]
+            return [(name, owned_pin(pin, "")) for star in self.bindings.stars for pin in star.files() + star.dirs()]
         if func.type != "attribute":
             return []
         obj = func.child_by_field_name("object")

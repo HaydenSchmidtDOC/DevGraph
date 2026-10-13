@@ -43,6 +43,7 @@ from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.common import (
     best_pin,
     name_ref_properties,
+    owners_by_pin,
     parse_name_ref,
     pin_confidence,
     pin_excludes,
@@ -1395,7 +1396,7 @@ def _relink_name_refs(
     names = {name for _label, name in pinned}
     names |= {key for module in modules for key in _module_pin_keys(module)}
     for origin, refs in engine.find_name_refs(repo_id, sorted(names), sorted(skip)):
-        parsed = _with_scopes_merged([parse_name_ref(entry) for entry in refs])
+        parsed = _with_scopes_merged(_parsed_name_refs(origin, refs))
         # Every Module a source imports, by path or by pin, as calls.import_rows
         # collapsed them: a pinned Module target leaves out what a stronger
         # one of them matches.
@@ -1406,8 +1407,10 @@ def _relink_name_refs(
         for fields, pins, confidence in parsed:
             _rel_type, from_label, from_name, from_file, to_label, to_name, _caller_class, from_owner = fields
             # A source pinned to its file keeps the entry's owner (one of the
-            # file's same-named siblings); an entry written before owners matches them all.
+            # file's same-named siblings); one whose owner was not known
+            # (an entry written before owners) matches them all.
             owner = from_owner if from_file else None
+            owners = owners_by_pin(pins) if pins is not None else {}
             if pins is None:
                 for to_file, to_owner in pinned.get((to_label, to_name), ()):
                     relink(origin, fields, from_file, to_file, confidence, from_owner=owner, to_owner=to_owner)
@@ -1424,20 +1427,39 @@ def _relink_name_refs(
             else:
                 for to_file, to_owner in pinned.get((to_label, to_name), ()):
                     keys = (match_keys or {}).get((to_label, to_name, to_file, to_owner)) or ()
-                    pin = best_pin(pins, to_file or "", origin, keys) if to_file is not None else None
-                    if pin is not None:
+                    pin = best_pin(owners, to_file or "", origin, keys) if to_file is not None else None
+                    # A pin that named its target's owner links only that owner's member.
+                    if pin is not None and (None in owners[pin] or to_owner in owners[pin]):
                         relink(
                             origin, fields, from_file, to_file, pin_confidence(pin, confidence), from_owner=owner,
                             to_owner=to_owner,
                         )
             if not from_file and from_label != "Module":
-                excludes = pin_excludes(pins, origin) if pins is not None else {None: ()}
+                excludes = pin_excludes(owners, origin) if pins is not None else {None: ()}
                 for source_file, source_owner in pinned.get((from_label, from_name), ()):
                     for to_file, exclude in excludes.items():
                         conf = confidence if to_file is None else pin_confidence(to_file, confidence)
-                        relink(origin, fields, source_file, to_file, conf, exclude, from_owner=source_owner)
+                        pin_owners = owners.get(to_file, {None})
+                        for to_owner in [None] if None in pin_owners else sorted(pin_owners):
+                            relink(
+                                origin, fields, source_file, to_file, conf, exclude, from_owner=source_owner,
+                                to_owner=to_owner,
+                            )
     if rels:
         engine.upsert_relationships(rels)
+
+
+def _parsed_name_refs(origin: str, refs: list[str]) -> list[tuple[list, list[str] | None, str]]:
+    """`refs` (a Module's `name_refs` entries) parsed, leaving out, with a
+    debug line, any entry no layout reads: one an index older than owners
+    wrote in a shape `parse_name_ref` does not know never stops a batch."""
+    parsed = []
+    for entry in refs:
+        try:
+            parsed.append(parse_name_ref(entry))
+        except ValueError:
+            logger.debug("skipping an unreadable name_refs entry of %s: %r", origin, entry)
+    return parsed
 
 
 def _with_scopes_merged(
@@ -2204,6 +2226,7 @@ def _relationship_dict(rel, repo_id: str, origin: str) -> dict:
         "properties": getattr(rel, "properties", None) or {},
         "from_file": getattr(rel, "from_file", None),
         "to_file": getattr(rel, "to_file", None),
+        "to_owner": getattr(rel, "to_owner", None),
         "origin": origin,
     }
 

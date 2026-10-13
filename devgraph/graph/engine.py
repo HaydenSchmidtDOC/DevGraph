@@ -785,7 +785,7 @@ def _group_rels_by_triple(
     `origin` (the file that wrote them, None for a writer that doesn't record
     one), and for a source pinned to a file the same `from_owner`, share a
     row, whose `targets` lists each edge's `to_name` and `to_file`; for a
-    target pinned to a file also `to_owner`; for a path pin also `pin` (as
+    target pinned to a file or a path also `to_owner`; for a path pin also `pin` (as
     graph/schema.py `pin_value` gives it) and the pins its `exclude` leaves
     out, split into `ex_files`
     (files, a list test) and `ex_pins` (other pins, as `pin_value` gives
@@ -818,7 +818,7 @@ def _group_rels_by_triple(
             "targets": [],
         })
         target = {"to_name": rel["to_name"], "to_file": to_file}
-        if key[4] == "file":
+        if key[4] == "file" or key[4] in _PATH_PINS:
             target["to_owner"] = rel.get("to_owner")
         if key[4] in _PATH_PINS:
             # File pins are left out by a plain list test, other pins by `_pin_test`.
@@ -939,8 +939,9 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     Module's `dir` (a directory pin), `dir_name` (a suffix-directory pin:
     the last name of its directory) or `basename` (a suffix pin), the row's
     `to_name`, and tests the Module's path. `also` is one more condition on
-    the match. An end pinned to a file with an `{end}_owner` keeps only the
-    node of that `owner` (two classes' same-named methods in one file)."""
+    the match. An end pinned to a file or a path with an `{end}_owner` keeps
+    only the nodes of that `owner` (two classes' same-named methods in one
+    file)."""
     conditions = [also] if also else []
     if pin in _PATH_PINS:
         if label == "Module":
@@ -963,6 +964,9 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
                 conditions[:0] = [f"{path} STARTS WITH {ref}.pin.v", f"{var}.owner IS NOT NULL"]
             elif label in FILE_SCOPED_LABELS:
                 match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
+            if label in FILE_SCOPED_LABELS:
+                # The members of one owner in the files the pin matches, when the row names it.
+                conditions.append(f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)")
         conditions[:0] = _path_pin_conditions(ref, path, var)
         return match + "WHERE " + " AND ".join(conditions) + " "
     pinned = pin == "file"
@@ -1880,7 +1884,10 @@ class GraphEngine:
         `sources`: a `Container`, `Datastore`, `Endpoint` or handler stub) is
         returned with `file` "", besides any row for its own provenance.
         `owner` is a code symbol's (graph/schema.py FILE_SCOPED_LABELS), ""
-        for any node without a `file`. `mkeys` is the node's match keys,
+        for any node without a `file`, and None for one an index older than
+        owners wrote: the batch then counts the node it writes as added, so
+        other files' edges into it are relinked (a file that failed during
+        the upgrade rescan, indexed again). `mkeys` is the node's match keys,
         sorted (None when it has none), and `stale` whether a batch that
         changed them has yet to finish relinking its edges (see
         write_match_keys).
@@ -1915,7 +1922,7 @@ class GraphEngine:
                 "WHERE owned OR claimed "
                 "RETURN DISTINCT labels(n)[0] AS label, n.name AS name, owned, claimed, "
                 "CASE WHEN n:Module THEN n.name ELSE coalesce(n.file, n.source_file, n.path) END AS file, "
-                "CASE WHEN n.file IS NULL THEN '' ELSE coalesce(n.owner, '') END AS owner, "
+                "CASE WHEN n.file IS NULL THEN '' ELSE n.owner END AS owner, "
                 "n.mkeys AS mkeys, coalesce(n.mkeys_stale, false) AS stale",
                 repo_id=repo_id,
                 files=files,

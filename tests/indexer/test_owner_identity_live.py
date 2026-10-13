@@ -16,7 +16,7 @@ from neo4j.exceptions import Neo4jError
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.graph.schema import FILE_SCOPED_LABELS
 from devgraph.indexer.dispatch import catch_up, full_scan, index_outdated, index_paths
-from devgraph.mcp.tools import describe_node, find_callers, get_source
+from devgraph.mcp.tools import describe_node, find_callers, get_source, search_component
 from devgraph.registry.store import RepoRegistry
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, live_repo_id, snapshot_diff
 
@@ -299,8 +299,10 @@ def test_a_database_an_older_version_built_migrates_on_start_and_rescan(engine, 
                     f"CREATE CONSTRAINT {label.lower()}_repo_name_file IF NOT EXISTS "
                     f"FOR (n:{label}) REQUIRE (n.repo_id, n.name, n.file) IS UNIQUE"
                 )
-            except Neo4jError as exc:  # another repository's same-file siblings
-                pytest.skip(f"the old constraint can't be created over the shared database's data: {exc}")
+            except Neo4jError:
+                # Another repository of the shared database holds same-file
+                # siblings already: start from no constraint for the label instead.
+                pass
         # A start cut short: one old constraint already dropped, its new one not created.
         engine.run_cypher("DROP CONSTRAINT function_repo_name_file IF EXISTS")
         assert "function_repo_name_file_owner" not in _constraints(engine)
@@ -347,3 +349,106 @@ def test_a_database_an_older_version_built_migrates_on_start_and_rescan(engine, 
         for label in FILE_SCOPED_LABELS:
             engine.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_name_file IF EXISTS")
         engine.init_schema()
+
+
+TOP_AND_METHODS = """\
+    def save():
+        def helper():
+            return 0
+        return helper()
+
+
+    class A:
+        def save(self):
+            return 1
+
+        def helper(self):
+            return 2
+
+
+    class B:
+        def save(self):
+            return 3
+    """
+
+
+def test_a_top_level_function_beside_same_named_methods_is_reachable(engine, repo):
+    """Every candidate and ref carries its owner, "" for the top-level one,
+    and is the next call's arguments as it is."""
+    root, registry, repo_id = repo
+    write(root, "shop/models.py", TOP_AND_METHODS)
+    full_scan(engine, repo_id, root)
+
+    ambiguous = get_source(engine, registry, repo_id, "save", file="shop/models.py")
+    assert sorted(c["owner"] for c in ambiguous["candidates"]) == ["", "A", "B"]
+    for candidate in ambiguous["candidates"]:
+        picked = get_source(engine, registry, repo_id, candidate["name"], file=candidate["file"], owner=candidate["owner"])
+        assert picked["owner"] == candidate["owner"] and picked["source"]
+    assert "return helper()" in get_source(engine, registry, repo_id, "save", owner="")["source"]
+    assert "return 3" in get_source(engine, registry, repo_id, "B::save")["source"]
+
+    rows = search_component(engine, repo_id, "save")["results"]
+    assert sorted(row["owner"] for row in rows if row["name"] == "save") == ["", "A", "B"]
+
+    found = describe_node(engine, repo_id, "save")
+    assert sorted(c["owner"] for c in found["candidates"]) == ["", "A", "B"]
+    for candidate in found["candidates"]:
+        again = describe_node(engine, repo_id, **candidate)
+        assert again["status"] == "found" and again["node"]["owner"] == candidate["owner"]
+        for group in again["outgoing"].values():
+            for ref in group["results"]:
+                assert describe_node(engine, repo_id, **ref)["status"] == "found"
+
+
+def test_a_nested_function_is_owned_by_its_enclosing_functions(engine, repo):
+    root, _registry, repo_id = repo
+    write(root, "shop/models.py", TOP_AND_METHODS)
+    full_scan(engine, repo_id, root)
+    assert nodes(engine, repo_id, "helper") == [("A", 11), ("save", 2)]
+    assert ("save.helper" in {b for _a, b in calls(engine, repo_id)})
+    assert describe_node(engine, repo_id, "save.helper")["node"]["owner"] == "save"
+
+
+def test_a_call_into_another_file_reaches_the_owner_it_names(engine, repo):
+    """`from m import A, save`: `A().save()` links `A.save` only and `save()`
+    the top-level `save` only, never `B.save`; and an incremental index,
+    adding the siblings after the caller, equals a fresh scan."""
+    root, _registry, repo_id = repo
+    models = write(root, "shop/models.py", "def other():\n    return 0\n")
+    write(root, "shop/jobs.py", """\
+        from shop.models import A, save
+
+
+        def run(obj):
+            A().save()
+            save()
+        """)
+    full_scan(engine, repo_id, root)
+    models.write_text(textwrap.dedent(TOP_AND_METHODS))
+    index_paths(engine, repo_id, root, {models})
+    rows = engine.run_cypher(
+        "MATCH (:Function {repo_id: $r, name: 'run'})-[x:CALLS]->(b:Function {name: 'save'}) "
+        "RETURN b.owner AS owner, x.confidence AS confidence",
+        {"r": repo_id},
+    )
+    assert sorted((row["owner"], row["confidence"]) for row in rows) == [("", "resolved"), ("A", "resolved")]
+    equals_fresh(engine, repo_id, root)
+
+
+def test_a_node_the_upgrade_left_without_an_owner_relinks_when_indexed(engine, repo):
+    """A file that failed during the upgrade scan keeps its owner-less nodes,
+    which no end pinned to a file matches, so another file's edge into one
+    was skipped. Indexed again, the file's node counts as added (its owner
+    was unknown) and that edge is relinked."""
+    root, _registry, repo_id = repo
+    models = write(root, "shop/models.py", "def helper():\n    return 1\n")
+    write(root, "shop/jobs.py", "from shop.models import helper\n\n\ndef run():\n    return helper()\n")
+    full_scan(engine, repo_id, root)
+    engine.run_cypher(
+        "MATCH (f:Function {repo_id: $r, file: 'shop/models.py'}) OPTIONAL MATCH ()-[x:CALLS]->(f) DELETE x "
+        "REMOVE f.owner",
+        {"r": repo_id},
+    )
+    index_paths(engine, repo_id, root, {models})
+    assert calls(engine, repo_id) == [(".run", ".helper")]
+    equals_fresh(engine, repo_id, root)

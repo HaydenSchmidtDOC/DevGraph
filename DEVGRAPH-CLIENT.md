@@ -350,7 +350,7 @@ Prefer these over re-reading files when the question is structural:
 | "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled; otherwise an empty result whose `notice` names the enable command) |
 | "Who changed X and when?" | `blame_component` (file path, not name) |
 | "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2; otherwise they return an empty result whose `notice` names the enable command, and never contact GitHub) |
-| "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed; a name defined in several files returns `status: "ambiguous"` with `candidates`, so pass `file` to pick one; for two classes' same-named methods in one file, name the method with its class, `A.save`) |
+| "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed; a name defined in several files returns `status: "ambiguous"` with `candidates`, so pass `file` to pick one; each candidate carries `owner`, which `get_source` also takes, to pick one of several same-named functions in one file; a method can be named `A.save` or `A::save`) |
 
 `compare_branches` and `impact_analysis_for_diff` both take two local refs
 and never fetch. `compare_branches` compares from the merge base, like
@@ -414,10 +414,11 @@ Things to know:
   `Module` and a `File` on the same path, or a `main` function in two
   files). The response lists the `candidates`; pick one and call
   `describe_node(**candidate)`. A candidate carries `file` only when it has
-  one (a `Module` doesn't), and `owner` only for a method or nested class
-  (the class it is declared in, which tells two classes' `save` in one file
-  apart), so pass the candidate as it is. A method can also be named with
-  its class: `describe_node(name="A.save")`.
+  one (a `Module` doesn't), and then `owner` too: the classes or functions
+  it is declared in, `""` at the top level, which tells a top-level `save`,
+  `A.save` and `B.save` of one file apart. Pass the candidate as it is. A
+  method can also be named with its class: `describe_node(name="A.save")`
+  or `"A::save"`.
 - A name that matches nothing is an error that names the repository it
   searched and suggests up to five nodes whose name or path contains it
   (partial-name matches, not fuzzy ones).

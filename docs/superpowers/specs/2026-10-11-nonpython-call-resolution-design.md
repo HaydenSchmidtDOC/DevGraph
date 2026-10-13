@@ -624,12 +624,22 @@ Four constructs were dropped or misattributed before any call was resolved:
   source and the method table resolves typed calls into them.
 
 The same format keys each Class and Function by its owner within its file
-(2026-10-08-graph-accuracy-design.md, owner identity), and a resolver that
-knows the class of a call into its own file names it: a typed receiver's or
-`this`/`self` call to a class declared in the file links that class's member
-(Python, JS/TS, Java, Kotlin, C#, Go, Rust; C++ resolves by function name
-alone and still links every same-named member of the file), and a bare Go
-call links the file's function, never a method of its name.
+(2026-10-08-graph-accuracy-design.md, owner identity, O3 for the full
+list), and a resolver that knows the owner of a call's target names it: a
+typed receiver's or `this`/`self` call to a class declared in the file
+links that class's member (Python, JS/TS, Java, Kotlin, C#, Go, Rust; C++
+resolves by function name alone and still links every same-named member of
+the file); across files, an imported top-level function (Python, JS/TS, a
+Go package's function) links the top-level one, never a method of its name,
+and an imported class's member (Python, JS/TS, a Java top-level class)
+that class's. C# narrows by owner through its match keys already. Kotlin
+and other packages' Go types are left as they were: an implicit receiver,
+or an embedded type, can supply the method. The measurement fixtures are
+unchanged by it (M1 to M5 equal; `name_refs` 3 to 8 % larger).
+
+A C++ explicit specialisation is its template's class, a class nested in
+a class body is extracted, and an out-of-class member is owned by its
+qualifier's classes (less the file's namespaces).
 
 ## No reverse dependents
 

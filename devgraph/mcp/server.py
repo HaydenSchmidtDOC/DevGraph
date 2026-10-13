@@ -892,17 +892,18 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def get_source(
-        repo_id: str, component_name: str, cross_repo: bool = False, file: str | None = None
+        repo_id: str, component_name: str, cross_repo: bool = False, file: str | None = None,
+        owner: str | None = None,
     ) -> dict[str, Any]:
         """Fetch a Function or Class's actual source text and full docstring (when present),
         using the graph's last-indexed line range. Reads live from disk — rescan first if
         the file may have changed since the last index. When several nodes share the name,
-        returns status "ambiguous" with candidates ({label, name, file}, and owner for a
-        method) instead of picking one: pass file (repo-relative path) to choose, and for
-        same-named methods of two classes in one file name the method with its class,
-        "A.save". A file that is not valid UTF-8 is decoded with replacement characters,
-        and a notice says so."""
-        return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo, file)
+        returns status "ambiguous" with candidates ({label, name, file, owner}) instead of
+        picking one: pass the candidate's file (repo-relative path) and owner (the classes
+        or functions it is declared in, "" at the top level) to choose. A method may also
+        be named with its class, "A.save" or "A::save". A file that is not valid UTF-8 is
+        decoded with replacement characters, and a notice says so."""
+        return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo, file, owner)
 
     @server.tool(annotations=_READ_ONLY)
     def describe_node(
@@ -918,10 +919,11 @@ def build_server(
     ) -> dict[str, Any]:
         """Look at one node: its properties and its relationships grouped by type and
         direction, with each neighbour's identity. A file, folder or docs node is named by
-        its repo-relative path or id; a method may be named with its class, "A.save". An
-        ambiguous name returns candidates; call again with label and file. A method's or
-        nested class's ref carries owner (its class), which picks it from a same-named
-        method of another class in its file. Each ref in the result is the next call's
+        its repo-relative path or id; a method may be named with its class, "A.save" or
+        "A::save". An ambiguous name returns candidates; call again with label, file and
+        owner. A code symbol's ref carries owner (the classes or functions it is declared
+        in, "" at the top level), which picks it from a same-named one in its file. Each
+        ref in the result is the next call's
         arguments. One hop per call, at most 50 neighbours per type; direction,
         relationship_types, neighbor_labels and max_per_type narrow it."""
         return devgraph_tools.describe_node(

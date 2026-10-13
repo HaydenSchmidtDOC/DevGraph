@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from devgraph.graph.schema import (
     FILE_SCOPED_LABELS,
     NAME_REF_FILELESS,
+    NAME_REF_OWNED,
     NAME_REF_PIN_SEP,
     NAME_REF_SEP,
     OWNER_PIN_SEP,
@@ -39,6 +40,7 @@ __all__ = [
     "name_ref_properties",
     "own_edges",
     "owned_pin",
+    "owners_by_pin",
     "parse_name_ref",
     "pin_confidence",
     "pin_excludes",
@@ -156,32 +158,44 @@ class ExtractionResult:
 
 def member_owner(parent_label: str, parent_name: str | None, parent_owner: str | None) -> str:
     """The `owner` of a Class or Function declared directly in a `parent_label`
-    named `parent_name` whose own owner is `parent_owner`: a member of a class
-    is owned by the class's owner chain and the class (`Outer.Inner`), a
-    function nested in a function by that function's owner, and anything at
-    a Module's (or a namespace's) top level by nothing, "". Two same-named
-    members of one file with different owners are two nodes (graph/engine.py
-    `_upsert_nodes_tx`)."""
-    if parent_label == "Class" and parent_name:
+    named `parent_name` whose own owner is `parent_owner`.
+
+    The owner grammar: the names of the declarations enclosing it, classes
+    and functions alike, outermost first, joined by "." (`Outer.Inner` for a
+    method of a nested class, `A.save` for a function nested in method
+    `A.save`, `save` for one nested in a top-level `save`); "" at a Module's
+    (or a namespace's) top level. A namespace, package or module is never
+    part of it. Two same-named declarations of one file with different
+    owners are two nodes (graph/engine.py `_upsert_nodes_tx`)."""
+    if parent_label in ("Class", "Function") and parent_name:
         return f"{parent_owner}.{parent_name}" if parent_owner else parent_name
-    if parent_label == "Function":
-        return parent_owner or ""
     return ""
 
 
-def owned_pin(file: str, owner: str | None) -> str:
-    """A resolver's pin to the members of `owner` named like the callee in
-    `file`, the writer's own file (`calls.call_rows` turns it back into
-    `to_file` and `to_owner`); `file` itself when the owner is unknown."""
-    return f"{file}{OWNER_PIN_SEP}{owner}" if owner is not None else file
+def owned_pin(pin: str, owner: str | None) -> str:
+    """A resolver's pin narrowed to the members of `owner` (the declarations
+    they are in, common.member_owner) named like the callee, in the files
+    `pin` matches (`calls.call_rows` turns it back into `to_file` and
+    `to_owner`); `pin` itself when the owner is unknown."""
+    return f"{pin}{OWNER_PIN_SEP}{owner}" if owner is not None else pin
 
 
 def split_owned_pin(pin: str | None) -> tuple[str | None, str | None]:
     """An `owned_pin` as (pin, owner); any other pin as (pin, None)."""
     if pin is None or OWNER_PIN_SEP not in pin:
         return pin, None
-    file, owner = pin.split(OWNER_PIN_SEP, 1)
-    return file, owner
+    base, owner = pin.split(OWNER_PIN_SEP, 1)
+    return base, owner
+
+
+def owners_by_pin(pins: Iterable[str]) -> dict[str, set[str | None]]:
+    """Owned pins grouped by their pin: the owners each names (None for a
+    pin with no owner: every member of the name in its files)."""
+    found: dict[str, set[str | None]] = {}
+    for pin in pins:
+        base, owner = split_owned_pin(pin)
+        found.setdefault(base, set()).add(owner)
+    return found
 
 
 def own_edges(result: ExtractionResult, file_path: str) -> ExtractionResult:
@@ -315,16 +329,19 @@ def name_ref_properties(rels: list[dict]) -> dict:
 
     `name_refs` holds one entry per edge source and target name, sorted, as
     `rel_type, from_label, from_name, from_file, to_label, to_name,
-    caller_class, from_owner, pins, confidence` joined by NAME_REF_SEP (an
-    unset field is empty; `from_owner` is the source's owner, so two
-    same-named sources of one file are two entries). `pins` is empty for an unpinned target, else the target's
-    `to_file`s joined by NAME_REF_PIN_SEP, with NAME_REF_FILELESS for "";
-    a pinned and an unpinned edge of the same source and name are separate
-    entries. A pin's `@` flag keeps only its "@" there, and its match keys
-    follow `confidence` as one more field, once: the pins of one source and
+    caller_class, from_owner, pins, confidence, keys, NAME_REF_OWNED` joined
+    by NAME_REF_SEP (an unset field is empty). `from_owner` is "=" and the
+    source's owner, or empty when unknown, so two same-named sources of one
+    file are two entries. `pins` is empty for an unpinned target, else the
+    target's `to_file`s joined by NAME_REF_PIN_SEP, with NAME_REF_FILELESS
+    for "", each followed by OWNER_PIN_SEP and its `to_owner` when it names
+    one (`owned_pin`); a pinned and an unpinned edge of the same source and
+    name are separate entries. A pin's `@` flag keeps only its "@" there, and
+    its match keys are the `keys` field, once: the pins of one source and
     name with different keys (two call sites on receivers of two types) are
-    separate entries, which relink takes together; an entry with none has
-    no such field. An unpinned entry's `confidence` is its edges' `confidence`
+    separate entries, which relink takes together. The trailing
+    NAME_REF_OWNED marks the layout; an older entry has none (see
+    `parse_name_ref`). An unpinned entry's `confidence` is its edges' `confidence`
     property. A pinned entry's is "pin" when its edges carry one, each pin's
     being its kind's (graph/schema.py `PIN_CONFIDENCE`), and empty when they
     carry none. `name_ref_targets` is their sorted
@@ -343,13 +360,15 @@ def name_ref_properties(rels: list[dict]) -> dict:
             and not (unpinned_source and rel["from_label"] in FILE_SCOPED_LABELS)
         ):
             continue
-        if rel.get("to_owner") is not None and to_file != rel.get("origin"):
-            raise ValueError(f"only a target in the writer's own file takes an owner: {rel!r}")
         properties = rel.get("properties") or {}
         to_file, scope = unscoped_pin(to_file) if to_file is not None else (None, ())
+        if to_file is not None:
+            to_file = owned_pin(to_file, rel.get("to_owner"))
+        from_owner = rel.get("from_owner")
         key = (
             rel["rel_type"], rel["from_label"], rel["from_name"], rel.get("from_file") or "",
-            rel["to_label"], rel["to_name"], properties.get("caller_class") or "", rel.get("from_owner") or "",
+            rel["to_label"], rel["to_name"], properties.get("caller_class") or "",
+            "" if from_owner is None else "=" + from_owner,
             # Unpinned entries are kept apart by confidence; a pinned entry's
             # pins each carry their kind's.
             None if to_file is not None else properties.get("confidence") or "", scope,
@@ -365,9 +384,11 @@ def name_ref_properties(rels: list[dict]) -> dict:
     refs = set()
     for key, (pins, confidences) in entries.items():
         *fields, unpinned_confidence, scope = key
-        encoded = NAME_REF_PIN_SEP.join(sorted(NAME_REF_FILELESS if pin == "" else pin for pin in pins))
+        encoded = NAME_REF_PIN_SEP.join(sorted(
+            NAME_REF_FILELESS + pin if split_owned_pin(pin)[0] == "" else pin for pin in pins
+        ))
         confidence = unpinned_confidence if unpinned_confidence is not None else min(confidences, default="")
-        refs.add(NAME_REF_SEP.join((*fields, encoded, confidence, *([",".join(scope)] if scope else []))))
+        refs.add(NAME_REF_SEP.join((*fields, encoded, confidence, ",".join(scope), NAME_REF_OWNED)))
     return {"name_refs": sorted(refs), "name_ref_targets": sorted(targets), "name_ref_sources": sorted(sources)}
 
 
@@ -388,19 +409,39 @@ def pin_confidence(pin: str, entry_confidence: str) -> str:
     return ""
 
 
-def parse_name_ref(entry: str) -> tuple[list[str], list[str] | None, str]:
+def parse_name_ref(entry: str) -> tuple[list, list[str] | None, str]:
     """An entry of `name_refs` as (its first eight fields, the eighth its
-    source's owner, its target pins (None when unpinned, "" for the
-    file-less node), its confidence), each `@` pin with the entry's match
-    keys back on it. An entry written before pins (seven fields) is
-    unpinned and unowned, with no confidence."""
+    source's owner, None when unknown; its target pins, None when unpinned,
+    "" for the file-less node, each an `owned_pin` when it names its
+    target's owner; its confidence), each `@` pin with the entry's match keys
+    back on it.
+
+    An entry written before owners (no NAME_REF_OWNED last) is read by its
+    length: seven fields (before pins) is unpinned, with no confidence; nine
+    is pinned; ten is pinned with match keys. Either has an unknown source
+    owner and owner-less pins. Any other entry raises ValueError, which a
+    reader skips the entry for."""
     fields = entry.split(NAME_REF_SEP)
-    if len(fields) == 7:
-        return [*fields, ""], None, ""
-    scope = fields.pop() if len(fields) == 11 else ""
-    *head, encoded, confidence = fields
-    pins = [
-        "" if pin == NAME_REF_FILELESS else pin + scope if pin.endswith("@") and split_pin(pin + scope).scope else pin
-        for pin in encoded.split(NAME_REF_PIN_SEP)
-    ] if encoded else None
-    return head, pins, confidence
+    if fields[-1] == NAME_REF_OWNED and len(fields) == 12:
+        *head, from_owner, encoded, confidence, scope, _marker = fields
+        if from_owner and not from_owner.startswith("="):
+            raise ValueError(f"not a name_refs owner: {from_owner!r}")
+        owner = from_owner[1:] if from_owner else None
+    elif len(fields) == 7:
+        return [*fields, None], None, ""
+    elif len(fields) in (9, 10):
+        head, encoded, confidence, scope = fields[:7], fields[7], fields[8], fields[9] if len(fields) == 10 else ""
+        owner = None
+    else:
+        raise ValueError(f"not a name_refs entry: {len(fields)} fields")
+
+    def pin_of(text: str) -> str:
+        base, pin_owner = split_owned_pin(text)
+        if base.startswith(NAME_REF_FILELESS):
+            base = ""
+        elif base.endswith("@") and split_pin(base + scope).scope:
+            base += scope
+        return owned_pin(base, pin_owner)
+
+    pins = [pin_of(pin) for pin in encoded.split(NAME_REF_PIN_SEP)] if encoded else None
+    return [*head, owner], pins, confidence

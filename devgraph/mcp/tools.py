@@ -115,7 +115,7 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     CALL per hop collecting the distinct nodes with a CALLS/USES/DEPENDS_ON edge
     into the previous hop's nodes, never one seen at an earlier hop, then
     returning `direct_dependents` (hop 1), `transitive_dependents` (hops 2 to
-    `IMPACT_MAX_DEPTH`), `direct_count` and `matched` (the changed nodes' {name, file}).
+    `IMPACT_MAX_DEPTH`), `direct_count` and `matched` (the changed nodes' {name, file, owner}).
     `with_ids` adds each dependent's `id` (its elementId).
 
     Expanding distinct nodes hop by hop does work proportional to the nodes
@@ -137,7 +137,7 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     parts.append(
         f"RETURN [d IN l1 | {ref}] AS direct_dependents, "
         f"[d IN {transitive} | {ref}] AS transitive_dependents, "
-        "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file}] AS matched"
+        "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched"
     )
     return "\n".join(parts)
 
@@ -350,7 +350,7 @@ _SEARCH_TIER = (
 _SEARCH_FILE = "CASE WHEN coalesce(n.file, '') <> '' THEN n.file ELSE coalesce(n.path, n.source_file, n.source) END"
 _SEARCH_ROW = (
     "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, description: n.description, "
-    f"file: {_SEARCH_FILE}}}"
+    f"file: {_SEARCH_FILE}, owner: CASE WHEN n.file IS NOT NULL THEN coalesce(n.owner, '') END}}"
 )
 
 
@@ -486,12 +486,12 @@ _DESCRIBE_NEIGHBOUR = (
     "AND ($types IS NULL OR type(r) IN $types) "
     "AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))"
 )
-#: The labels a code symbol's `owner` keys within its file (the class it is
-#: declared in, "" at the top level; see devgraph/graph/schema.py FILE_SCOPED_LABELS).
-_OWNED_LABELS = ("Class", "Function")
-#: Cypher for node `{v}`'s owner when it has one: null for a top-level symbol
-#: and for any node without a `file` (a declared type's `owner` field is its own).
-_OWNER_OF = "CASE WHEN {v}.file IS NOT NULL AND {v}.owner <> '' THEN {v}.owner END"
+#: The labels whose `owner` keys a node within its file (the declarations it
+#: is in, "" at the top level; see devgraph/graph/schema.py FILE_SCOPED_LABELS).
+_OWNED_LABELS = schema.FILE_SCOPED_LABELS
+#: Cypher for node `{v}`'s owner: "" for a top-level symbol, null for any node
+#: without a `file` (a declared type's `owner` field is its own).
+_OWNER_OF = "CASE WHEN {v}.file IS NOT NULL THEN coalesce({v}.owner, '') END"
 
 _DESCRIBE_GROUPS = f"""
 MATCH (n) WHERE elementId(n) = $id
@@ -603,11 +603,13 @@ def _owned_lookup_cypher(labels: tuple[str, ...]) -> str:
 
 
 def _owner_split(name: str) -> tuple[str, str] | None:
-    """`A.save` (`Outer.Inner.run`) as (owner, member): a method named with
-    the class it is declared in (see devgraph/indexer/common.py
-    `member_owner`); None for a name with no dot."""
-    owner, dot, member = name.rpartition(".")
-    return (owner, member) if dot and owner and member else None
+    """`A.save` (`Outer.Inner.run`, `A::save`, `Outer::Inner::run`) as
+    (owner, member), the owner dotted: a symbol named with the declarations
+    it is in (see devgraph/indexer/common.py `member_owner`); None for a name
+    with neither separator."""
+    separator = "::" if "::" in name else "."
+    owner, found, member = name.rpartition(separator)
+    return (owner.replace("::", "."), member) if found and owner and member else None
 
 
 def _suggestions_cypher(labels: tuple[str, ...]) -> str:
@@ -782,13 +784,14 @@ def _with_target_files(row: dict[str, Any], files: Any) -> dict[str, Any]:
 
 
 def _node_ref(row: dict[str, Any]) -> dict[str, Any]:
-    """`{label, name, file}` from raw values, so it re-describes exactly this
-    node; and `owner` for a method or nested class (the class it is declared
-    in: `owner.name` names it apart from a same-named sibling of its file)."""
+    """`{label, name, file, owner}` from raw values, so it re-describes exactly
+    this node: `file` when it has one, and then `owner` too (the declarations
+    it is in, "" at the top level), which tells it from a same-named
+    member of another declaration of its file."""
     ref = {"label": row["label"], "name": row["name"]}
     if row.get("file") is not None:
         ref["file"] = row["file"]
-    if row.get("owner"):
+    if row.get("owner") is not None:
         ref["owner"] = row["owner"]
     return ref
 
@@ -1590,8 +1593,10 @@ CALL (t) {
 MATCH (caller)-[:CALLS]->(n)
 WHERE caller.repo_id = $repo_id
 RETURN DISTINCT caller.name AS caller, labels(caller)[0] AS caller_type,
-       caller.file AS caller_file, n.name AS calls, n.file AS calls_file
-ORDER BY caller_file, caller, calls_file, calls
+       caller.file AS caller_file,
+       CASE WHEN caller.file IS NOT NULL THEN coalesce(caller.owner, '') END AS caller_owner,
+       n.name AS calls, n.file AS calls_file, coalesce(n.owner, '') AS calls_owner
+ORDER BY caller_file, caller_owner, caller, calls_file, calls_owner, calls
 """
 
 
@@ -1830,9 +1835,10 @@ WITH collect(DISTINCT n) AS l0
 
 
 def _diff_symbol(entry: dict[str, Any], path: str) -> dict[str, Any]:
-    return _sanitize_row(
-        {"name": entry["name"], "kind": entry["kind"], "container": entry["container"], "file": path}
-    )
+    return _sanitize_row({
+        "name": entry["name"], "kind": entry["kind"], "container": entry["container"], "file": path,
+        **({"owner": entry["owner"]} if "owner" in entry else {}),
+    })
 
 
 def impact_analysis_for_diff(
@@ -1954,8 +1960,8 @@ def impact_analysis_for_diff(
         rows = _query(engine, cypher, {"repo_id": repo_id, "targets": targets, "files": files})
         if rows:
             row = rows[0]
-    found = {(m["name"], m["file"]) for m in row["matched"]}
-    missing = [t for t in targets if (t["name"], t["file"]) not in found]
+    found = {(m["name"], m["file"], m["owner"]) for m in row["matched"]}
+    missing = [t for t in targets if (t["name"], t["file"], t["owner"]) not in found]
     if missing:
         shown = ", ".join(f"{t['name']} ({t['file']})" for t in missing[:_DESCRIBE_MAX_SUGGESTIONS])
         more = f" and {len(missing) - _DESCRIBE_MAX_SUGGESTIONS} more" if len(missing) > _DESCRIBE_MAX_SUGGESTIONS else ""
@@ -2376,6 +2382,7 @@ def get_source(
     component_name: str,
     cross_repo: bool = False,
     file: str | None = None,
+    owner: str | None = None,
 ) -> dict[str, Any]:
     """Fetch a Function or Class's actual source text by reading its last-indexed line range.
 
@@ -2388,22 +2395,23 @@ def get_source(
         registry: RepoRegistry, used to resolve repo_id to its registered root path
         repo_id: Repository ID
         component_name: Name of the Function or Class to fetch source for; a
-            method may be named with the class it is declared in, `A.save`
-            (`Outer.Inner.run`), when no node has that exact name
+            method may be named with the declarations it is in, `A.save`
+            (`Outer.Inner.run`, `A::save`), when no node has that exact name
         cross_repo: If True, search across repos (the file is still read from
             whichever repo actually owns the matched node, via its own registry entry)
         file: Repo-relative path of the defining file, to pick one of several
             same-named Functions or Classes
+        owner: The declarations the Function or Class is in, as a candidate's
+            `owner` gives it ("" for a top-level one), to pick one of several
+            same-named ones in one file
 
     Returns:
         Dict with name, label, file, start_line, end_line, source, and
         docstring_full (when present). Empty/None fields if no match found.
         When several nodes match, `source` is None and the dict adds
         `status: "ambiguous"`, `count`, `truncated` and `candidates`
-        ({label, name, file}, with `owner` for a method or nested class;
-        repo_id too when cross_repo): pass one's `file`, and for two
-        same-named methods of one file, `owner.name` as the name. A method's
-        result adds `owner` too.
+        ({label, name, file, owner}; repo_id too when cross_repo): pass one's
+        `file` and `owner`. The result names its `owner` too.
         A file is decoded as the indexer decodes it (`source_text`): a
         Python coding line, else UTF-8, else cp1252 or Latin-1; when an
         undeclared file is not valid UTF-8, or a file isn't valid in its
@@ -2428,8 +2436,12 @@ def get_source(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = lookup("n.name = $component_name")
-    if not results and (owned := _owner_split(component_name)) is not None:
+    if owner is not None:
+        params["owner"] = owner
+        results = lookup("n.name = $component_name AND coalesce(n.owner, '') = $owner AND n.file IS NOT NULL")
+    else:
+        results = lookup("n.name = $component_name")
+    if not results and owner is None and (owned := _owner_split(component_name)) is not None:
         params["owner"], params["member"] = owned
         results = lookup("n.name = $member AND n.owner = $owner")
     empty = {
@@ -2446,7 +2458,8 @@ def get_source(
         candidates = [
             {
                 "label": label_of(r), "name": r["name"], "file": r["file"],
-                **({"owner": r["owner"]} if r["owner"] else {}), **({"repo_id": r["repo_id"]} if cross_repo else {}),
+                **({"owner": r["owner"]} if r["owner"] is not None else {}),
+                **({"repo_id": r["repo_id"]} if cross_repo else {}),
             }
             for r in results[:_DESCRIBE_MAX_CANDIDATES]
         ]
@@ -2504,7 +2517,7 @@ def get_source(
         "source": source_text,
         "docstring_full": row.get("docstring_full"),
     }
-    if row["owner"]:
+    if row["owner"] is not None:
         result["owner"] = row["owner"]
     if notice is not None:
         result["notice"] = notice

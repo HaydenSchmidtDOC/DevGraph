@@ -103,7 +103,9 @@ def search_components(
     Ranked the way `mcp.tools.search_component` ranks (`ranked_search`: exact
     name, then name prefix, then substring, then description), over the same
     label set, for the whole query as one case-insensitive term, trimmed to
-    the {id, name, label, file} shape the dashboard actually renders.
+    the {id, name, label, file, owner} shape the dashboard actually renders
+    (`owner`, the declarations a code symbol is in, tells same-named methods
+    of one file apart; null for a node with no file).
     `project_labels` are a repo's applied schema labels, searched in addition
     to the built-in set; the caller must take them from the applied schema
     (never from user input) since a label cannot be parameterized.
@@ -115,7 +117,10 @@ def search_components(
     rows, _count, _lower_bound = ranked_search(
         engine, labels, terms, _name_variants(query, terms), max(1, max_results), repo_id=repo_id
     )
-    return [{"id": r["id"], "name": r["name"], "label": r["labels"][0], "file": r["file"]} for r in rows]
+    return [
+        {"id": r["id"], "name": r["name"], "label": r["labels"][0], "file": r["file"], "owner": r.get("owner")}
+        for r in rows
+    ]
 
 
 def total_counts(engine: GraphEngine) -> dict[str, Any]:

@@ -75,6 +75,7 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    member_owner,
     own_edges,
     owned_pin,
 )
@@ -468,7 +469,7 @@ class _KotlinResolver:
                 name_node = node.child_by_field_name("name")
                 if name_node is not None:
                     self.functions.add(_text(name_node, source))
-                    if owner is not None:
+                    if owner is not None and not _extension_receiver(node, source):
                         self.methods[owner].add(_text(name_node, source))
             for child in node.children:
                 walk(child, owner, enclosing)
@@ -694,6 +695,16 @@ def _kotlin_scope(node: Node, classes: list[str], resolver: _KotlinResolver, sou
     return scope
 
 
+def _extension_receiver(node: Node, source: bytes) -> str | None:
+    """An extension function's receiver type, as its simple name
+    (`fun a.b.Repo<T>?.save()`: Repo); None for any other function."""
+    children = node.children
+    for i, child in enumerate(children[1:], 1):
+        if child.type == "." and i + 1 < len(children) and children[i + 1].type == "identifier":
+            return _kotlin_type(children[i - 1], source)
+    return None
+
+
 def _owner_of(classes: list[str] | tuple[str, ...]) -> str:
     """The owner (common.member_owner) of a member of the innermost of
     `classes`, the enclosing classes innermost first: their names, outermost
@@ -764,12 +775,16 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
         )
     sites = CallSites()
 
-    def _record_calls(node: Node, body: Node, caller_label: str, caller_name: str, classes: list[str]) -> None:
+    def _record_calls(
+        node: Node, body: Node, caller_label: str, caller_name: str, classes: list[str],
+        caller_owner: str | None = None,
+    ) -> None:
         scope = _kotlin_scope(node, classes, resolver, source_bytes)
         caller_class = classes[0] if classes else None
-        # A function is owned by its classes; a class (a property
-        # initializer's caller) by the classes around it; the Module by nothing.
-        caller_owner = {"Function": _owner_of(classes), "Class": _owner_of(classes[1:])}.get(caller_label)
+        # A function's owner is given; a class (a property initializer's
+        # caller) is owned by the classes around it; the Module by nothing.
+        if caller_label == "Class":
+            caller_owner = _owner_of(classes[1:])
         for call in _kotlin_calls(body):
             site = resolver.resolve(call, classes, scope)
             if site is not None:
@@ -841,18 +856,29 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
             visit_block(body_node, class_name, "Class", [class_name, *classes])
 
     def _visit_function(
-        node: Node, parent_name: str | None, parent_label: str, prev_sibling: Node | None, classes: list[str]
+        node: Node, parent_name: str | None, parent_label: str, prev_sibling: Node | None, classes: list[str],
+        parent_owner: str | None = None,
     ) -> None:
+        """`parent_owner` is a parent function's own owner."""
         name_node = node.child_by_field_name("name")
         if name_node is None:
             return
         func_name = _text(name_node, source_bytes)
+        # Declared in its classes, or in a function; an extension function
+        # is owned by its receiver type besides (`fun A.save()`: A), as a Go
+        # method by its receiver's.
+        owner = (
+            member_owner("Function", parent_name, parent_owner) if parent_label == "Function" else _owner_of(classes)
+        )
+        receiver = _extension_receiver(node, source_bytes)
+        if receiver:
+            owner = f"{owner}.{receiver}" if owner else receiver
 
         func_properties: dict = {
             "type": "function",
             "decorators": _extract_annotation_names(node, source_bytes),
             "file": file_path,
-            "owner": _owner_of(classes),
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -874,9 +900,9 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
-                from_owner=_owner_of(classes[1:]) if parent_label == "Class" else _owner_of(classes)
+                from_owner=_owner_of(classes[1:]) if parent_label == "Class" else parent_owner
                 if parent_label == "Function" else None,
-                to_owner=_owner_of(classes),
+                to_owner=owner,
             )
         )
 
@@ -884,7 +910,7 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
         # `function_body` child (the `name` field exists, `body` does not).
         body_node = node.child_by_field_name("body") or _child_of_type(node, "function_body")
         if body_node is not None:
-            _record_calls(node, body_node, "Function", func_name, classes)
+            _record_calls(node, body_node, "Function", func_name, classes, owner)
 
             # Nested function declarations (a `fun` declared inside this
             # function's body) are visited with this function as their parent,
@@ -893,11 +919,11 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
             # function/class scopes, mirroring Python's nested-function walk.
             for child in body_node.named_children:
                 if child.type == "function_declaration":
-                    _visit_function(child, func_name, "Function", None, classes)
+                    _visit_function(child, func_name, "Function", None, classes, owner)
                 elif child.type == "block":
                     for grandchild in child.named_children:
                         if grandchild.type == "function_declaration":
-                            _visit_function(grandchild, func_name, "Function", None, classes)
+                            _visit_function(grandchild, func_name, "Function", None, classes, owner)
 
     def visit_block(
         block: Node, parent_name: str | None, parent_label: str, classes: list[str],

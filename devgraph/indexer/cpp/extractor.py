@@ -448,7 +448,7 @@ class _CppResolver:
         body = node.child_by_field_name("body")
         if name is None or body is None:
             return
-        cls = _text(name, self.source)
+        cls = _class_name(name, self.source)
         methods = self.methods.setdefault(cls, set())
         fields = self.fields.setdefault(cls, {})
         for member in body.named_children:
@@ -496,6 +496,38 @@ class _CppResolver:
             for ext in (".h", ".hpp", ".cpp", ".cc")
         ]
         return conventional + self.included()
+
+
+def _class_name(name_node: Node, source: bytes) -> str:
+    """A class specifier's name: an explicit specialisation's
+    (`template<> class Stack<int>`) is its template's, `Stack`."""
+    if name_node.type == "template_type":
+        name_node = name_node.child_by_field_name("name") or name_node
+    return _text(name_node, source)
+
+
+def _nested_class(declaration: Node) -> Node | None:
+    """The class or struct a member declaration defines with a body
+    (`class Inner { ... };` in a class), or None."""
+    declared = declaration.child_by_field_name("type")
+    if declared is not None and declared.type in ("class_specifier", "struct_specifier") and \
+            declared.child_by_field_name("body") is not None:
+        return declared
+    return None
+
+
+def _namespaces(root: Node, source: bytes) -> set[str]:
+    """Every namespace name the file declares (`namespace a::b` both)."""
+    found = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "namespace_definition":
+            name = node.child_by_field_name("name")
+            if name is not None:
+                found.update(part.strip() for part in _text(name, source).split("::"))
+        stack.extend(node.named_children)
+    return found
 
 
 def _qualified_parts(node: Node, source: bytes) -> list[str]:
@@ -671,6 +703,7 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
     result.nodes.append(module_node)
 
     resolver = _CppResolver(root, source_bytes, file_path)
+    namespaces = _namespaces(root, source_bytes)
     result.relationships += import_rows(
         file_path, repo_id,
         {each.beside for each in resolver.includes if each.beside},
@@ -724,6 +757,8 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                 visit_block(node, parent_name, parent_label)
             elif node.type in ("comment", "preproc_include", "preproc_def", "preproc_call", "template_parameter_list"):
                 continue
+            elif node.type == "field_declaration" and (nested := _nested_class(node)) is not None:
+                _visit_class(nested, parent_name, parent_label)  # `class Inner { ... };` in a class body
             else:
                 caller_class = parent_name if parent_label == "Class" else None
                 _record_calls(
@@ -735,7 +770,7 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
         name_node = node.child_by_field_name("name")
         if name_node is None:
             return
-        class_name = _text(name_node, source_bytes)
+        class_name = _class_name(name_node, source_bytes)
 
         base_clause = node.child_by_field_name("base_class_clause") or next(
             (c for c in node.named_children if c.type == "base_class_clause"), None
@@ -856,6 +891,7 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             return
 
         class_name: str | None = None
+        qualifier: list[str] = []
         if inner.type == "qualified_identifier":
             # Out-of-class definition, e.g. 'ClassName::method' or
             # 'Outer::Inner::method' — see module docstring for the
@@ -864,6 +900,12 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             func_name = parts[-1]
             if len(parts) >= 2:
                 class_name = parts[-2]
+                # Its owner is the qualifier's classes, `Outer.Inner`, as for
+                # a member defined in a nested class; leading segments that
+                # name a namespace of the file are no owner.
+                qualifier = parts[:-1]
+                while len(qualifier) > 1 and qualifier[0] in namespaces:
+                    qualifier = qualifier[1:]
         elif inner.type in ("identifier", "field_identifier", "destructor_name", "operator_name"):
             func_name = _text(inner, source_bytes)
             class_name = parent_name if parent_label == "Class" else None
@@ -878,11 +920,13 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             contains_label, contains_name = "Class", class_name
         else:
             contains_label, contains_name = parent_label, (parent_name if parent_name else file_path)
-        # An out-of-class definition is owned by its qualifier's class alone
-        # (no enclosing class is known); a member defined in its class by the
-        # class's owner chain.
+        # An out-of-class definition is owned by its qualifier's classes; a
+        # member defined in its class by the class's owner chain.
         in_class = parent_label == "Class" and inner.type != "qualified_identifier"
-        owner = member_owner("Class", class_name, owners[-1] if in_class else None) if class_name else ""
+        if qualifier:
+            owner = ".".join(qualifier)
+        else:
+            owner = member_owner("Class", class_name, owners[-1] if in_class else None) if class_name else ""
 
         func_properties: dict = {
             "type": "function",

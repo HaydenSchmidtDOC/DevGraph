@@ -274,6 +274,10 @@ class TestNameLookupIndexes:
             for child in node.get("children", []):
                 yield from operators(child)
 
+        # A pre-release build's (repo_id, name, file) index goes at the next start.
+        engine.run_cypher(
+            "CREATE INDEX function_repo_name_file_lookup IF NOT EXISTS FOR (n:Function) ON (n.repo_id, n.name, n.file)"
+        )
         engine.init_schema()
         with engine._driver.session() as session:
             for owner in (None, "A"):

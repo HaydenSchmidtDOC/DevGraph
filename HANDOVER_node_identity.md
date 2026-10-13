@@ -18,8 +18,8 @@ only, unchanged — deliberate over-linking, not a bug (see docstring at
 `devgraph/indexer/python/extractor.py:72-89`).
 
 **Design chosen: file-only**, not file+scope, at first. Since index format
-11 a node with a `file` is also keyed by its `owner` (the dotted classes it
-is declared in), so two classes in the *same* file with same-named methods
+11 a node with a `file` is also keyed by its `owner` (the dotted classes and
+functions it is declared in), so two classes in the *same* file with same-named methods
 are two nodes; `name` still stays the bare identifier. See the owner
 identity section of
 `docs/superpowers/specs/2026-10-08-graph-accuracy-design.md`.
@@ -70,7 +70,8 @@ and the node is only removed once no file claims it. See
 ## Still open, not in scope of either fix
 
 1. Same-file sibling collisions — resolved by `owner` (index format 11),
-   except two same-named functions nested in two functions of one owner.
+   except one type name in two namespaces of a file and a Rust type's
+   same-named trait methods.
 2. **Cheap CALLS precision upgrade**: cross-reference the IMPORTS data
    extractors already collect to resolve direct `module.function()` calls
    to a specific file, no new dependency. Leaves instance dispatch

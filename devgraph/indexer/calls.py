@@ -9,7 +9,7 @@ module turns that into rows, so every language writes them the same way.
 from __future__ import annotations
 
 from devgraph.graph.schema import PIN_CONFIDENCE, pin_kind
-from devgraph.indexer.common import GraphRelationship, module_pin_name, pin_excludes, split_owned_pin
+from devgraph.indexer.common import GraphRelationship, module_pin_name, owners_by_pin, pin_excludes
 
 __all__ = ["STOP_METHODS", "STOP_TYPES", "CallSites", "call_rows", "import_rows"]
 
@@ -186,30 +186,30 @@ def call_rows(
     member call on an untyped receiver) keeps the bare row off the caller
     itself. `rel_type` and `to_label` write another symbol reference the
     same way (a Kotlin file's IMPORTS of a class or function).
-    `caller_owner` is the caller's owner (common.member_owner), and an owned
-    pin (common.owned_pin) a row to the callee's members of that owner in
-    the writer's file alone: as a file pin, it leaves out nothing another
-    pin of the call matches, and what it leaves out of a weaker pin is its
-    whole file."""
+    `caller_owner` is the caller's owner (common.member_owner). An owned
+    pin (common.owned_pin) narrows its pin to the callee's members of that
+    owner: a pin some call site reached with no owner links every member of
+    the name, and one reached under several owners a row per owner.
+    Precedence and exclusions are the pins', whatever their owners."""
 
-    def row(pin: str | None, confidence: str, exclude: list[str] | None = None) -> GraphRelationship:
+    def row(pin: str | None, confidence: str, exclude: list[str] | None = None,
+            to_owner: str | None = None) -> GraphRelationship:
         properties = {"confidence": confidence}
         if caller_class:
             properties["caller_class"] = caller_class
-        to_file, to_owner = split_owned_pin(pin)
-        if to_owner is not None and to_file != file_path:
-            raise ValueError(f"an owned pin names the writer's own file, not {to_file!r}")
         return GraphRelationship(
             from_label=caller_label, from_name=caller_name, rel_type=rel_type, to_label=to_label, to_name=name,
-            repo_id=repo_id, properties=properties, to_file=to_file, exclude=exclude,
-            no_self=no_self and to_file is None, from_owner=caller_owner, to_owner=to_owner,
+            repo_id=repo_id, properties=properties, to_file=pin, exclude=exclude,
+            no_self=no_self and pin is None, from_owner=caller_owner, to_owner=to_owner,
         )
 
     if not pins:
         return [row(None, "name")] if bare else []
+    owners = owners_by_pin(pins)
     return [
-        row(pin, PIN_CONFIDENCE[pin_kind(pin)], sorted({split_owned_pin(other)[0] for other in excluded}) or None)
-        for pin, excluded in pin_excludes(pins, file_path).items()
+        row(pin, PIN_CONFIDENCE[pin_kind(pin)], excluded or None, owner)
+        for pin, excluded in pin_excludes(owners, file_path).items()
+        for owner in ([None] if None in owners[pin] else sorted(owners[pin]))
     ]
 
 

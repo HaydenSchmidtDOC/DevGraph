@@ -164,12 +164,12 @@ def test_a_call_into_a_class_of_the_file_names_its_owner(lang):
     assert targets == {("A", "A"), ("B", "B")}
 
 
-def test_member_owner_follows_classes_not_functions():
+def test_member_owner_follows_classes_and_functions():
     assert member_owner("Module", "app.py", None) == ""
     assert member_owner("Class", "A", "") == "A"
     assert member_owner("Class", "Inner", "A") == "A.Inner"
-    assert member_owner("Function", "save", "A") == "A"
-    assert member_owner("Function", "main", "") == ""
+    assert member_owner("Function", "save", "A") == "A.save"
+    assert member_owner("Function", "main", "") == "main"
 
 
 def test_owned_pins_round_trip():
@@ -197,3 +197,93 @@ def test_own_edges_fills_in_an_owner_only_the_file_decides():
     assert (go.from_file, go.from_owner) == ("a.py", "A")
     assert (save.from_file, save.from_owner) == ("a.py", None)  # two `save`s: the extractor says which
     assert (contains.from_owner, contains.to_owner) == ("", "A")
+
+
+def test_nested_functions_are_owned_by_their_enclosing_functions():
+    result, _path = extract_python_file(textwrap.dedent("""\
+        def save():
+            def helper():
+                return 0
+            return helper()
+
+
+        class A:
+            def save(self):
+                def helper():
+                    return 1
+                return helper()
+
+            def helper(self):
+                return 2
+        """), "app/m.py", "repo"), None
+    owners = sorted((n.name, n.properties["owner"]) for n in result.nodes if n.label == "Function")
+    assert owners == [("helper", "A"), ("helper", "A.save"), ("helper", "save"), ("save", ""), ("save", "A")]
+
+
+def test_kotlin_extension_functions_are_owned_by_their_receiver():
+    result = extract_kotlin_file("package k\n\nclass A\nclass B\n\nfun A.save() {}\nfun B?.save() {}\nfun save() {}\n",
+                                 "k/Ext.kt", "repo")
+    assert sorted(n.properties["owner"] for n in result.nodes if n.name == "save") == ["", "A", "B"]
+
+
+def test_cpp_specialisation_qualifier_and_nested_class_owners():
+    result = extract_cpp_file(textwrap.dedent("""\
+        namespace ui {
+        class Outer { class Inner { void run() {} }; };
+        void Outer::Inner::stop() {}
+        }
+        template<> class Stack<int> { void push(int v) {} };
+        void Stack<int>::pop() {}
+        void lib::Widget::paint() {}
+        """), "src/ui.cpp", "repo")
+    owners = {(n.label, n.name): n.properties.get("owner") for n in result.nodes if n.properties.get("file")}
+    assert owners[("Class", "Inner")] == "Outer"
+    assert owners[("Function", "run")] == owners[("Function", "stop")] == "Outer.Inner"
+    assert owners[("Class", "Stack")] == "" and owners[("Function", "push")] == owners[("Function", "pop")] == "Stack"
+    assert owners[("Function", "paint")] == "lib.Widget"  # `lib` is no namespace of this file
+
+
+def test_a_cross_file_call_names_the_owner_its_resolver_knows():
+    """Python: an imported function is top-level (""), an imported class's
+    method that class's; a method on an imported value names none."""
+    result = extract_python_file(textwrap.dedent("""\
+        from shop.models import Order, save, client
+
+
+        def run():
+            Order().save()
+            save()
+
+
+        def sync():
+            client.save()
+        """), "shop/jobs.py", "repo")
+
+    def rows(caller):
+        return {
+            (r.to_file, r.to_owner) for r in result.relationships
+            if r.rel_type == "CALLS" and r.to_name == "save" and r.from_name == caller
+        }
+
+    assert {("shop/models.py", "Order"), ("shop/models.py", "")} <= rows("run")
+    assert ("shop/models.py", None) not in rows("run")
+    assert ("shop/models.py", None) in rows("sync")  # client.save(): any `save` there
+
+
+def test_a_route_implements_its_handlers_owner():
+    from devgraph.indexer.apis.extractor import APIExtractor
+
+    source = textwrap.dedent("""\
+        @app.get("/items")
+        def search():
+            return []
+
+
+        class Views:
+            @router.get("/users")
+            def search(self):
+                return []
+        """)
+    result = APIExtractor("repo").extract_from_source(source, "api/routes.py")
+    pinned = {(r.source_name, r.to_owner) for r in result.relationships if r.to_file == "api/routes.py"}
+    assert pinned == {("GET /items", ""), ("GET /users", "Views")}

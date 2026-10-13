@@ -462,11 +462,11 @@ class _ClassInfo:
     fields: dict[str, list[str]] = field(default_factory=dict)  # field -> the types it holds
     # What its members are owned by (common.member_owner): the enclosing
     # classes' names and its own, one per class of the name in the file.
-    members_owners: set[str] = field(default_factory=set)
+    members_owners: set[str | None] = field(default_factory=set)
 
     def members_owner(self) -> str | None:
         """The owner of the class's members, None when several classes of
-        the file share its name."""
+        the file share its name or it is declared in a function."""
         return next(iter(self.members_owners)) if len(self.members_owners) == 1 else None
 
 
@@ -575,16 +575,33 @@ def _local_types(body: Node, source: bytes) -> dict[str, list[str]]:
     return types
 
 
+#: Every node a function's body hangs off.
+_FUNCTION_NODE_TYPES = frozenset({
+    "function_declaration", "generator_function_declaration", "function_expression", "function",
+    "generator_function", "arrow_function", "method_definition",
+})
+
+
+def _class_like(name: str) -> str | None:
+    """`name` as the owner of the members read off it when it names a class
+    (capitalised), else None: an imported value's methods are any class's."""
+    return name if name[:1].isupper() else None
+
+
 def _class_table(root: Node, source: bytes) -> dict[str, _ClassInfo]:
     """Every class in the file: its methods, its `extends` bases and the
     types of its fields (annotated, `= new T()`, or constructor parameter
     properties)."""
     classes: dict[str, _ClassInfo] = {}
 
-    def walk(node: Node, owner: str) -> None:
+    def walk(node: Node, owner: str | None) -> None:
+        if node.type in _FUNCTION_NODE_TYPES:
+            # A class inside a function (owned by its functions too) has an
+            # owner this walk doesn't follow: its members are any of the name.
+            owner = None
         if node.type in _CLASS_TYPES and (name := node.child_by_field_name("name")) is not None:
             info = classes.setdefault(_text(name, source), _ClassInfo())
-            owner = member_owner("Class", _text(name, source), owner)
+            owner = member_owner("Class", _text(name, source), owner) if owner is not None else None
             info.members_owners.add(owner)
             info.bases += _extract_base_class_names(node, source)
             body = node.child_by_field_name("body")
@@ -730,10 +747,13 @@ class _CallResolver:
         is its import's files; `ns.T` is the namespace's."""
         if type_name in self.classes:
             return self._method_pins(type_name, method, own=True)
-        head, dot, _rest = type_name.partition(".")
+        head, dot, rest = type_name.partition(".")
         binding = self.bindings.get(head)
         if binding is not None and (dot == "" or binding.namespace):
-            return list(binding.pins) if binding.pins is not None else []
+            # An imported class's member is owned by the class (a method it
+            # inherits from a base of that file is then not linked).
+            cls = rest.rpartition(".")[2] if dot else binding.name
+            return [owned_pin(pin, _class_like(cls)) for pin in binding.pins or ()]
         return None
 
     def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
@@ -782,7 +802,10 @@ class _CallResolver:
             return None  # an untyped parameter shadows any import of its name
         binding = self.bindings.get(receiver)
         if binding is not None:
-            return list(binding.pins) if binding.pins is not None else []
+            # A namespace's member is a module's top-level one; a named
+            # import's, a member of the class it names (a static call).
+            owner = "" if binding.namespace else _class_like(binding.name)
+            return [owned_pin(pin, owner) for pin in binding.pins or ()]
         if receiver in self.classes:
             return self._class_pins(receiver, method)
         if receiver in STOP_TYPES["js"]:
@@ -802,8 +825,8 @@ class _CallResolver:
             if name in self.defined:
                 return [(name, self.file_path, False)]
             binding = self.bindings.get(name)
-            if binding is not None:
-                return [(binding.name, pin, False) for pin in binding.pins or ()]
+            if binding is not None:  # an import's top-level function
+                return [(binding.name, owned_pin(pin, ""), False) for pin in binding.pins or ()]
             if self.script and name not in _JS_GLOBALS:
                 return [(name, None, False)]  # a classic script's globals are shared
             return []

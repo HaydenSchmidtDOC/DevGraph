@@ -389,8 +389,8 @@ class _GoResolver:
 
     def bare_pins(self, name: str) -> list[str] | None:
         """Where an unqualified `name()` is declared: this file, else its
-        package (and any dot-imported one); None for a builtin. In this file
-        it is a function, never a method of the same name (owner "")."""
+        package (and any dot-imported one); None for a builtin. Wherever it
+        is, it is a function, never a method of the same name (owner "")."""
         if name in self.functions:
             return [owned_pin(self.file_path, "")]
         if name in _BUILTIN_FUNCS:
@@ -398,7 +398,7 @@ class _GoResolver:
         pins = [self._own_dir()]
         for folder in self.dot_dirs:
             pins += self._package_pins(folder)
-        return pins
+        return [owned_pin(pin, "") for pin in pins]
 
     # --- types ---------------------------------------------------------------
 
@@ -518,7 +518,10 @@ class _GoResolver:
                 folders = self.qualifier_dirs(qualifier)
                 if folders is not None:
                     loose = self.qualifier_loose(qualifier)
-                    pins = [pin for folder in folders for pin in self._package_pins(folder, loose)]
+                    # A package's function, never a method of the name; a
+                    # qualifier that may be a variable calls any method.
+                    owner = None if loose else ""
+                    pins = [owned_pin(pin, owner) for folder in folders for pin in self._package_pins(folder, loose)]
                     return (name, pins, False) if pins else None
         receiver = self.value_type(operand, scope)
         if receiver is not None:
