@@ -199,6 +199,37 @@ def test_every_entry_point_reads_the_project_as_index_paths_does(tmp_path):
     assert nodes == {("Class", "P", ("App:P",)), ("Function", "Main", ("App:P",))}
 
 
+def test_nodes_carry_their_project_and_path_pins_what_it_sees(tmp_path):
+    """A Class and Function carry their project's directory as `proj` ("."
+    at the repository root, "" with no project); a path-pinned row of a
+    file in a project carries its `visible` projects (its own and what its
+    references reach), a row pinned to its own file none, and a file of no
+    project none at all."""
+    from devgraph.indexer.resolver_config import ResolverConfig
+
+    def project(rel, *references):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text('<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>' + "".join(
+            f'<ProjectReference Include="{each}" />' for each in references
+        ) + "</ItemGroup></Project>")
+
+    project("src/App/App.csproj", r"..\Web\Web.csproj")
+    project("src/Web/Web.csproj", "../Core/Core.csproj")
+    project("src/Core/Core.csproj")
+    source = "namespace App;\nclass P { void Main() { Svc.Run(); Help(); } void Help() {} }\n"
+
+    def extract(rel):
+        result = extract_csharp_file(source, rel, "test_repo", ResolverConfig(tmp_path))
+        projs = {n.properties.get("proj") for n in result.nodes if n.label != "Module"}
+        calls = {r.to_name: r.visible for r in result.relationships if r.rel_type == "CALLS"}
+        return projs, calls
+
+    assert extract("src/App/P.cs") == ({"src/App"}, {"Run": ["src/App", "src/Core", "src/Web"], "Help": None})
+    assert extract("loose/P.cs") == ({""}, {"Run": None, "Help": None})
+    project("Root.csproj")
+    assert extract("loose/P.cs") == ({"."}, {"Run": ["."], "Help": None})
+
+
 def test_all_nodes_scoped_to_repo():
     """Test that all extracted nodes carry the correct repo_id."""
     source_code = """

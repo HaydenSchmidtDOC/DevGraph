@@ -130,7 +130,7 @@ def test_records_failing_as_they_are_read_are_retried(monkeypatch):
 
 
 def _rekeyed(count: int) -> list:
-    return [("Function", f"f{i}", "a.cs", "", ("Ns:A",), True) for i in range(count)]
+    return [("Function", f"f{i}", "a.cs", "", ("Ns:A",), "a", True) for i in range(count)]
 
 
 def test_a_match_key_chunk_failing_as_it_executes_is_retried(monkeypatch):

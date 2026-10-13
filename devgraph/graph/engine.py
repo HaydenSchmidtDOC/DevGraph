@@ -892,7 +892,9 @@ def _group_rels_by_triple(
     source). A path pin whose `@` keys come in tiers (graph/schema.py
     `tiered_pin`) is grouped apart, its kind marked with `_TIERED`, so only
     its group's Cypher tests the shadow (see `_end_match`). Only the keys
-    its group's Cypher reads are sent. The source is
+    its group's Cypher reads are sent. A row also carries its edges'
+    `visible` (C# project visibility) as `vis`, once, which a path-pinned
+    target tests (`_visible`). The source is
     then matched once for all of them: a resolved call names several
     candidate files per callee.
     """
@@ -910,9 +912,10 @@ def _group_rels_by_triple(
         properties = rel.get("properties") or {}
         origin = rel.get("origin")
         from_owner = rel.get("from_owner") if key[3] == "file" else None
+        visible = sorted(rel.get("visible") or []) or None
         source = (
             rel["repo_id"], rel["from_name"], from_file, from_owner, origin,
-            json.dumps(properties, sort_keys=True, default=str),
+            json.dumps(properties, sort_keys=True, default=str), tuple(visible or ()),
         )
         row = groups.setdefault(key, {}).setdefault(source, {
             "repo_id": rel["repo_id"],
@@ -921,6 +924,7 @@ def _group_rels_by_triple(
             "from_owner": from_owner,
             "properties": properties,
             "origin": origin,
+            "vis": visible,
             "targets": [],
         })
         target = {"to_name": rel["to_name"], "to_file": to_file}
@@ -1028,12 +1032,22 @@ def _path_pin_conditions(ref: str, path: str, node: str) -> list[str]:
     ]
 
 
+def _visible(var: str) -> str:
+    """Cypher keeping the node `var` only when it is visible to the row's
+    project (`row.vis`, see `_group_rels_by_triple`), as
+    devgraph/indexer/common.py `visible_to` defines it: a row without `vis`
+    sees every node, and a node without `proj` (or "") is seen by every
+    row. Tested once per row, not per pin."""
+    return f"(row.vis IS NULL OR coalesce({var}.proj, '') = '' OR {var}.proj IN row.vis)"
+
+
 def _shadow_free(ref: str, var: str, label: str) -> str:
     """Cypher, after the MATCH of the node `var` (`label`), keeping it only
     when the tiered pin `{ref}.pin` (graph/schema.py `tiered_pin`) does not
     shadow it, as devgraph/indexer/common.py `shadowed` defines it: no node
     of its label and name that the pin's path and flags match holds a key
-    of a nearer tier than `var`'s nearest. The keys of the nearer tiers are
+    of a nearer tier than `var`'s nearest and is visible to the row
+    (`_visible`). The keys of the nearer tiers are
     computed once per node, and a node of the nearest tier (none nearer)
     skips the subquery, which seeks the name's nodes as `_end_match` does
     (an `OR NOT EXISTS`, planned as a select-or-anti-semi-apply; inside a
@@ -1051,7 +1065,7 @@ def _shadow_free(ref: str, var: str, label: str) -> str:
         f"MATCH (shadow:{label} {{repo_id: {var}.repo_id, name: {var}.name}}) "
         f"USING INDEX SEEK shadow:{label}(repo_id, name) "
         f"WHERE any(key IN {var}_nearer WHERE key IN coalesce(shadow.mkeys, [])) "
-        f"AND {_pin_test(pin, 'shadow.file', 'shadow', keys=False)} }} "
+        f"AND {_visible('shadow')} AND {_pin_test(pin, 'shadow.file', 'shadow', keys=False)} }} "
     )
 
 
@@ -1075,8 +1089,9 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     `to_name`, and tests the Module's path. `also` is one more condition on
     the match. An end pinned to a file or a path with an `{end}_owner` keeps
     only the nodes of that `owner` (two classes' same-named methods in one
-    file). A path pin marked `_TIERED` also keeps only the nodes its tiers
-    do not shadow (`_shadow_free`)."""
+    file). A path-pinned end of a file-scoped label keeps only the nodes
+    visible to the row's project (`_visible`). A path pin marked `_TIERED`
+    also keeps only the nodes its tiers do not shadow (`_shadow_free`)."""
     conditions = [also] if also else []
     tiered = pin.endswith(_TIERED)
     pin = pin.removesuffix(_TIERED)
@@ -1104,6 +1119,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
             if label in FILE_SCOPED_LABELS:
                 # The members of one owner in the files the pin matches, when the row names it.
                 conditions.append(f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)")
+                conditions.append(_visible(var))
         conditions[:0] = _path_pin_conditions(ref, path, var)
         return match + "WHERE " + " AND ".join(conditions) + " " + (_shadow_free(ref, var, label) if tiered else "")
     pinned = pin == "file"
@@ -2067,8 +2083,8 @@ class GraphEngine:
 
     def list_file_nodes(
         self, repo_id: str, files: list[str],
-    ) -> set[tuple[str, str, str, str, tuple[str, ...] | None, bool]]:
-        """Return (label, name, file, owner, mkeys, stale) for every node whose file provenance
+    ) -> set[tuple[str, str, str, str, tuple[str, ...] | None, bool, str | None]]:
+        """Return (label, name, file, owner, mkeys, stale, proj) for every node whose file provenance
         (`source_file`/`file`, a `Module` named by its path, or a schema
         provider's node, which its `path` owns) is one of `files`. `file` is
         that provenance: the Module's name, else `file`, `source_file` or
@@ -2082,7 +2098,8 @@ class GraphEngine:
         the upgrade rescan, indexed again). `mkeys` is the node's match keys,
         sorted (None when it has none), and `stale` whether a batch that
         changed them has yet to finish relinking its edges (see
-        write_match_keys).
+        write_match_keys); `proj` is its C# project (None when it has
+        none), which decides its edges as its keys do.
 
         index_paths snapshots this before re-indexing a batch so it can tell
         which nodes the batch *adds* -- only those can be the missing
@@ -2115,22 +2132,25 @@ class GraphEngine:
                 "RETURN DISTINCT labels(n)[0] AS label, n.name AS name, owned, claimed, "
                 "CASE WHEN n:Module THEN n.name ELSE coalesce(n.file, n.source_file, n.path) END AS file, "
                 "CASE WHEN n.file IS NULL THEN '' ELSE n.owner END AS owner, "
-                "n.mkeys AS mkeys, coalesce(n.mkeys_stale, false) AS stale",
+                "n.mkeys AS mkeys, coalesce(n.mkeys_stale, false) AS stale, n.proj AS proj",
                 repo_id=repo_id,
                 files=files,
             )
             records = [(r, None if r["mkeys"] is None else tuple(sorted(set(r["mkeys"])))) for r in result or []]
             return {
-                (r["label"], r["name"], r["file"], r["owner"], keys, r["stale"]) for r, keys in records if r["owned"]
-            } | {(r["label"], r["name"], "", "", keys, r["stale"]) for r, keys in records if r["claimed"]}
+                (r["label"], r["name"], r["file"], r["owner"], keys, r["stale"], r["proj"])
+                for r, keys in records if r["owned"]
+            } | {(r["label"], r["name"], "", "", keys, r["stale"], r["proj"]) for r, keys in records if r["claimed"]}
 
     def write_match_keys(
-        self, repo_id: str, nodes: list[tuple[str, str, str, str, tuple[str, ...] | None, bool]],
+        self, repo_id: str, nodes: list[tuple[str, str, str, str, tuple[str, ...] | None, str | None, bool]],
     ) -> None:
-        """Write these (label, name, file, owner, mkeys, retract) nodes' match keys
-        (`mkeys`; None removes them), which a batch's own node writes leave
-        as they were until now, so a pin's `@` flag (graph/schema.py
-        `split_pin`) only ever sees one node's old keys with its old edges.
+        """Write these (label, name, file, owner, mkeys, proj, retract) nodes' match keys
+        (`mkeys`; None removes them) and C# project (`proj`, which a row's
+        `vis` tests, see `_visible`; None removes it), which a batch's own
+        node writes leave as they were until now, so a pin's `@` flag
+        (graph/schema.py `split_pin`) only ever sees one node's old keys
+        with its old edges.
         A node to `retract` loses its CALLS and IMPORTS edges, which those
         pins linked under its old keys, in the same transaction, and stays
         `mkeys_stale` until settle_match_keys: the batch writes them again
@@ -2142,9 +2162,9 @@ class GraphEngine:
         transaction over all of it. Every other edge stays."""
         self._per_label_chunk(
             repo_id, [((label, name, file, owner), {"mkeys": list(keys) if keys is not None else None,
-                                                    "retract": retract})
-                      for label, name, file, owner, keys, retract in nodes],
-            "SET b.mkeys = row.mkeys, b.mkeys_stale = CASE WHEN row.retract THEN true END "
+                                                    "proj": proj, "retract": retract})
+                      for label, name, file, owner, keys, proj, retract in nodes],
+            "SET b.mkeys = row.mkeys, b.proj = row.proj, b.mkeys_stale = CASE WHEN row.retract THEN true END "
             f"WITH b, row WHERE row.retract MATCH ()-[r:{'|'.join(MATCH_KEY_EDGE_TYPES)}]->(b) DELETE r",
         )
 
@@ -2175,11 +2195,14 @@ class GraphEngine:
                         rows=rows[start:start + RETRACT_NODES],
                     )
 
-    def find_name_refs(self, repo_id: str, names: list[str], skip: list[str]) -> list[tuple[str, list[str]]]:
-        """(Module name, entries) for every Module outside `skip` whose
+    def find_name_refs(
+        self, repo_id: str, names: list[str], skip: list[str],
+    ) -> list[tuple[str, list[str], list[str]]]:
+        """(Module name, entries, visible) for every Module outside `skip` whose
         `name_refs` (see indexer/common.py `name_ref_properties`) target, or
         come from an unpinned source, named one of `names`, with just those
-        entries. The short `name_ref_targets`/`name_ref_sources` lists filter
+        entries, and the projects its file's sites see (its
+        `name_ref_visible`, empty for every project). The short `name_ref_targets`/`name_ref_sources` lists filter
         the Modules before any entry is split. The Module index is hinted to
         seek, for the reason _end_match gives."""
         with self._driver.session() as session:
@@ -2190,14 +2213,15 @@ class GraphEngine:
                 "  AND (any(t IN m.name_ref_targets WHERE t IN $names) "
                 "       OR any(s IN m.name_ref_sources WHERE s IN $names)) "
                 "RETURN m.name AS origin, "
-                "       [e IN m.name_refs WHERE split(e, $sep)[5] IN $names OR split(e, $sep)[2] IN $names] AS refs",
+                "       [e IN m.name_refs WHERE split(e, $sep)[5] IN $names OR split(e, $sep)[2] IN $names] AS refs, "
+                "       coalesce(m.name_ref_visible, []) AS visible",
                 repo_id=repo_id,
                 names=names,
                 skip=skip,
                 sep=NAME_REF_SEP,
             )
             records = result or []
-            return [(record["origin"], list(record["refs"])) for record in records]
+            return [(record["origin"], list(record["refs"]), list(record["visible"])) for record in records]
 
     def find_mentioning_documents(
         self, repo_id: str, pairs: list[tuple[str, str]], batch_keys: list[str]

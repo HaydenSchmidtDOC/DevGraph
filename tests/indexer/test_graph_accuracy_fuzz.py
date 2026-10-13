@@ -36,7 +36,10 @@ namespace, so C# match keys change under the edges `@` pins gave them;
 cs/Shadow.cs comes, goes, changes namespace and renames its class, a
 `Jobs` or `Base` nearer some callers than the one they reach otherwise,
 so the shadow tiers of their pins hide and restore edges into files
-outside the batch. Kotlin files hold adjacent one-line classes, which
+outside the batch. A project file gains or loses a `<ProjectReference>`
+(cs/ and cs/Models to cs2/, cs2/ to cs/Models), and a file whose class
+another folder's declares too (cs2/'s own Shop.Jobs) moves between
+projects, so a site sees a project's types and stops seeing them. Kotlin files hold adjacent one-line classes, which
 the extractor recovers from tree-sitter-kotlin's error nodes, and import a
 function or package of another one. Go, Java, Kotlin, Rust, C# and C++ calls
 come in every style their resolvers read (bare, through a package, module,
@@ -338,8 +341,16 @@ CS_GLOBAL_USINGS = [
     "\ufeffglobal using Shop.Text;", "// CRLF\r\nglobal using Shop.Data;\r", "extern alias Legacy;\nglobal using Shop.Legacy;",
     "global using unsafe P = int*;", "global using Shop // cut\n.Cut;",
 ]
-# The folders a C# file moves between: two projects and no project.
-CS_DIRS = ["cs/", "cs/Models/", "scripts/"]
+# The `<ProjectReference>` each C# project file may gain or lose: cs/ and
+# cs/Models to cs2/ (another project declaring Shop.Jobs), cs2/ back to
+# cs/Models (a cycle through cs/Models' reference).
+CS_REFERENCES = {
+    "cs/Shop.csproj": '    <ProjectReference Include="..\\cs2\\Lib.csproj" />\n',
+    "cs/Models/Models.csproj": '    <ProjectReference Include="../../cs2/Lib.csproj" />\n',
+    "cs2/Lib.csproj": '    <ProjectReference Include="..\\cs\\Models\\Models.csproj" />\n',
+}
+# The folders a C# file moves between: three projects and no project.
+CS_DIRS = ["cs/", "cs/Models/", "cs2/", "scripts/"]
 # Folders holding a configuration file, which the fuzz may delete whole.
 CONFIG_DIRS = ["ts/configs", "go/b", "crates/core", "cs/Models"]
 
@@ -390,6 +401,9 @@ def initial_repo() -> dict:
         "cs/Wide.cs": File("cs", head="Shop.Wide", imports=[f"using N{i};" for i in range(40)] + ["using Shop;"],
                            bases={"Wide": None}, funcs={"Spread": ["Jobs.Run", "_jobs.Stop", "p.Helper"]}),
         "scripts/Tool.cs": File("cs", head="Tools", imports=["global using Shop.Models;"], bases={"Tool": None}),
+        # Another project's Shop.Jobs, which cs/ sees only through a reference.
+        "cs2/Lib.csproj": File("static", head=CS_PROJECT.format("")),
+        "cs2/Jobs.cs": File("cs", head="Shop", bases={"Jobs": None}, funcs={"Run": [], "Stop": ["Run"]}),
         "cpp/util/strings.h": File("cpp", funcs={"trim": []}),
         "cpp/util/strings.cpp": File("cpp", imports=['#include "strings.h"'], methods=["Widget::draw"],
                                      funcs={"upper": ["trim"]}),
@@ -796,6 +810,38 @@ class Fuzz:
         self.files[new] = self.files.pop(path)
         return f"move {path} to {new}", {path, new}
 
+    def op_cs_reference(self):
+        """Add or remove a C# project file's `<ProjectReference>` (one
+        written with `\\`, one with `/`)."""
+        paths = sorted(p for p in CS_REFERENCES if p in self.files)
+        if not paths:
+            return None
+        path = self.rng.choice(paths)
+        f, line = self.files[path], CS_REFERENCES[path]
+        if line in f.head:
+            f.head = f.head.replace(line, "")
+            return f"remove the reference in {path}", {path}
+        f.head = f.head.replace("<ItemGroup>\n", "<ItemGroup>\n" + line, 1)
+        return f"add a reference in {path}", {path}
+
+    def op_cs_project_move(self):
+        """Move a C# file whose class another folder's file declares too (a
+        Jobs) to another project's folder, or out of every project."""
+        names = {}
+        for p, f in self.files.items():
+            if f.kind == "cs":
+                for cls in f.bases:
+                    names.setdefault(cls, set()).add(p.rpartition("/")[0])
+        path = self._pick(lambda f: f.kind == "cs" and any(len(names[cls]) > 1 for cls in f.bases))
+        if not path:
+            return None
+        folder, _sep, name = path.rpartition("/")
+        new = self.rng.choice([d for d in CS_DIRS if d != folder + "/"]) + name
+        if new in self.files:
+            return None
+        self.files[new] = self.files.pop(path)
+        return f"move {path} to {new}", {path, new}
+
     def op_cs_namespace(self):
         """Change a C# file's namespace."""
         path = self._pick(lambda f: f.kind == "cs")
@@ -1031,7 +1077,7 @@ class Fuzz:
         "rename", "delete", "restore", "service", "from", "move_image", "mention", "link", "supersedes", "pin", "pin",
         "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module", "method", "method",
         "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move", "cs_namespace", "cs_move_class",
-        "cs_dup_class", "cs_shadow", "cs_shadow", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route",
+        "cs_dup_class", "cs_shadow", "cs_shadow", "cs_reference", "cs_reference", "cs_project_move", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route",
         "route",
         "route_change", "route_move",
     ]
@@ -1085,7 +1131,7 @@ def _with_pin_comments(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _with_cs_projects(monkeypatch):
-    """A C# file's Module records its project's usings (`fz_usings`), so its
+    """A C# file's Module records its project's usings and references (`fz_usings`), so its
     extraction depends on all of the C# configuration, not only the part its
     resolved edges show: a configuration change that does not re-index
     every C# file leaves a stale one."""
@@ -1094,7 +1140,9 @@ def _with_cs_projects(monkeypatch):
     def extract(content, rel_path, repo_id, config=None):
         result = real(content, rel_path, repo_id, config)
         project = config.cs_project(rel_path)
-        usings = [] if project is None else [project.dir, *project.csproj, *project.usings, *project.global_usings]
+        usings = [] if project is None else [
+            project.dir, *project.csproj, *project.references, *project.usings, *project.global_usings,
+        ]
         result.nodes[0].properties["fz_usings"] = [str(each) for each in usings]
         return result
 
@@ -1233,7 +1281,7 @@ def test_cs_rekey_ops_retract_callers_in_other_files(engine, repo_id, tmp_path, 
     real = GraphEngine.write_match_keys
 
     def write_match_keys(self, repo, nodes):
-        for label, name, file, owner, _keys, retract in nodes:
+        for label, name, file, owner, _keys, _proj, retract in nodes:
             if retract:
                 retracted.append(self.run_cypher(
                     f"MATCH (a)-[r:CALLS|IMPORTS]->(b:{label} {{repo_id: $r, name: $n, file: $f, owner: $o}}) "

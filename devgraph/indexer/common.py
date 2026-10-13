@@ -48,6 +48,7 @@ __all__ = [
     "shadowed",
     "split_owned_pin",
     "tiered",
+    "visible_to",
 ]
 
 
@@ -108,6 +109,10 @@ class GraphRelationship:
     non-None owner must equal the node's `owner`, and None matches every
     node of the name there. `own_edges` fills them in where the file alone
     decides them.
+
+    `visible` (C#: the writer's project and those it references, see
+    `visible_to`) limits a path-pinned target to the nodes of those
+    projects and of no project; None limits nothing.
     """
 
     from_label: str
@@ -124,6 +129,7 @@ class GraphRelationship:
     no_self: bool = False
     from_owner: str | None = None
     to_owner: str | None = None
+    visible: list[str] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -141,6 +147,7 @@ class GraphRelationship:
             "no_self": self.no_self,
             "from_owner": self.from_owner,
             "to_owner": self.to_owner,
+            "visible": self.visible,
         }
 
 
@@ -267,19 +274,31 @@ def pin_matches(pin: str | None, path: str, keys: Iterable[str] = ()) -> bool:
     )
 
 
+def visible_to(proj: str | None, visible: Iterable[str] | None) -> bool:
+    """Whether a node of the project `proj` (a C# Class or Function's
+    `proj`: its project's directory, "." the repository root's; "" or None
+    for one of no project, or of another language) is visible to a site
+    whose project sees `visible` (its own and those it references,
+    transitively; empty or None for a site of no project, which sees
+    every node). A node of no project is visible to every site. The
+    engine's Cypher mirrors this, once per row (`_end_match`)."""
+    return not visible or not proj or proj in visible
+
+
 def tiered(pin: str | None) -> bool:
     """Whether `pin`'s `@` keys come in tiers (graph/schema.py `tiered_pin`)."""
     return pin is not None and bool(split_pin(pin).ranks)
 
 
 def shadowed(
-    pin: str, keys: Iterable[str] | None, others: Iterable[tuple[str | None, Iterable[str] | None]],
+    pin: str, keys: Iterable[str] | None, others: Iterable[tuple], visible: Iterable[str] | None = None,
 ) -> bool:
     """Whether the tiered pin `pin` leaves out a node it matches whose `mkeys`
-    are `keys`: one of `others` (the (path, mkeys) of the nodes of its label
-    and name) that the pin's path and flags match, its keys aside, holds a
-    key of a nearer tier than the node's nearest. The engine's Cypher
-    mirrors this: a node without `mkeys` (None) holds none, and a
+    are `keys`: one of `others` (the (path, mkeys) or (path, mkeys, proj)
+    of the nodes of its label and name) that the pin's path and flags
+    match, its keys aside, and that is visible to the row (`visible_to`)
+    holds a key of a nearer tier than the node's nearest. The engine's
+    Cypher mirrors this: a node without `mkeys` (None) holds none, and a
     file-less one (path None or "") no path pin matches. A pin without
     tiers shadows nothing."""
     parts = split_pin(pin)
@@ -289,8 +308,9 @@ def shadowed(
     own = min((rank[key] for key in keys or () if key in rank), default=len(rank))
     path_only = pin.rsplit("@", 1)[0]
     return any(
-        bool(path) and pin_matches(path_only, path) and any(rank.get(key, own) < own for key in other_keys or ())
-        for path, other_keys in others
+        bool(path) and pin_matches(path_only, path) and visible_to(proj[0] if proj else None, visible)
+        and any(rank.get(key, own) < own for key in other_keys or ())
+        for path, other_keys, *proj in others
     )
 
 
@@ -379,11 +399,15 @@ def name_ref_properties(rels: list[dict]) -> dict:
     being its kind's (graph/schema.py `PIN_CONFIDENCE`), and empty when they
     carry none. `name_ref_targets` is their sorted
     distinct `to_name`s and `name_ref_sources` the sorted distinct
-    `from_name`s of their unpinned non-Module sources. All three are lists,
-    empty when there is nothing.
+    `from_name`s of their unpinned non-Module sources. `name_ref_visible`
+    is the sorted `visible` of the file's edges (one C# project's, the
+    same on every edge of a file; see `visible_to`), stored once for the
+    file rather than per entry. All four are lists, empty when there is
+    nothing.
     """
     entries: dict[tuple, tuple[set, set]] = {}
     targets, sources = set(), set()
+    visible = {project for rel in rels for project in rel.get("visible") or ()}
 
     def group(rel: dict) -> tuple:
         return (
@@ -431,7 +455,10 @@ def name_ref_properties(rels: list[dict]) -> dict:
         ))
         confidence = unpinned_confidence if unpinned_confidence is not None else min(confidences, default="")
         refs.add(NAME_REF_SEP.join((*fields, encoded, confidence, scope, NAME_REF_OWNED)))
-    return {"name_refs": sorted(refs), "name_ref_targets": sorted(targets), "name_ref_sources": sorted(sources)}
+    return {
+        "name_refs": sorted(refs), "name_ref_targets": sorted(targets), "name_ref_sources": sorted(sources),
+        "name_ref_visible": sorted(visible),
+    }
 
 
 #: A pinned `name_refs` entry's confidence when its edges carry one: each

@@ -69,6 +69,12 @@ Mirrors `devgraph/indexer/python/extractor.py`'s shape (Implementation Plan
     method (`Ns:+T`), unless this file declares an `M`: the file depends on
     an extension class it never names. A `using` of a namespace imports
     nothing.
+  - Project visibility: every Class and Function carries its project's
+    directory as `proj` ("." the repository root's, "" for a file of no
+    project), and every path-pinned CALLS and IMPORTS row of a file in a
+    project its `visible` projects (its own and those its
+    `<ProjectReference>`s reach, transitively): such a row links only
+    nodes of those projects or of none (common.visible_to).
 
 Known scope cuts (documented, not silently dropped):
   - `interface` declarations are not emitted as Class nodes (brief allows
@@ -91,9 +97,9 @@ Known scope cuts (documented, not silently dropped):
     class) are not modeled — there's no enclosing Function/Class to attach
     CALLS to, and this is a rare style in mid-size/library code, which is
     what the golden-repo parity bar targets.
-  - A project's `<ProjectReference>`s are not read: a type of a project the
-    writer's does not reference matches as well as one it does. Nor is
-    `ImplicitUsings` (only System.* and Microsoft.* namespaces).
+  - `ImplicitUsings` is not read (only System.* and Microsoft.*
+    namespaces), nor is a `<ProjectReference>`'s `Condition` or `$(...)`
+    evaluated (resolver_config).
 """
 
 from __future__ import annotations
@@ -106,7 +112,7 @@ from typing import NamedTuple
 import tree_sitter_c_sharp as tscsharp
 from tree_sitter import Language, Node, Parser
 
-from devgraph.graph.schema import MAX_SCOPE_KEYS, scoped_pin, tiered_pin
+from devgraph.graph.schema import MAX_SCOPE_KEYS, pin_kind, scoped_pin, tiered_pin
 from devgraph.indexer.apis.routes import add_route, join_route
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, call_rows
 from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges, owned_pin
@@ -1531,8 +1537,25 @@ def extract_csharp_file(
                 to_label=to_label,
             )
     _aspnet_routes(root, source_bytes, result, file_path, repo_id)
+    # Project visibility: a node's project, and the projects a path-pinned
+    # row of a file in a project may link nodes of.
+    proj = _project_key(project.dir) if project is not None else ""
+    for each in result.nodes:
+        if each.label in ("Class", "Function"):
+            each.properties["proj"] = proj
+    if project is not None:
+        visible = sorted({proj, *(_project_key(each) for each in project.references)})
+        for rel in result.relationships:
+            if rel.to_file is not None and pin_kind(rel.to_file) not in ("file", "fileless"):
+                rel.visible = visible
 
     return own_edges(result, file_path)
+
+
+def _project_key(folder: str) -> str:
+    """A C# project's `proj`: its directory, "." for the repository root's,
+    so it is never "", which a node of no project has."""
+    return folder or "."
 
 
 def index_file(

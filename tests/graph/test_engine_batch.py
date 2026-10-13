@@ -371,7 +371,7 @@ class TestIndexesStillBuilding:
                 {"label": "Function", "repo_id": repo_id, "name": "f", "properties": {"file": "a.py"}},
             ], [])
             assert left["n"] == 0
-            assert engine.list_file_nodes(repo_id, ["a.py"]) == {("Function", "f", "a.py", "", None, False)}
+            assert engine.list_file_nodes(repo_id, ["a.py"]) == {("Function", "f", "a.py", "", None, False, None)}
         finally:
             monkeypatch.undo()
             engine.delete_repository(repo_id)

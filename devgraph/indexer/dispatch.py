@@ -38,7 +38,7 @@ from devgraph.config.project_schema import (
     schema_file_hash,
 )
 from devgraph.graph.engine import ABORTS_BATCH, GraphEngine, provision_repository_schema
-from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES, split_pin
+from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES, pin_kind, split_pin
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.common import (
     best_pin,
@@ -48,6 +48,7 @@ from devgraph.indexer.common import (
     pin_confidence,
     pin_excludes,
     tiered,
+    visible_to,
 )
 from devgraph.indexer.containers.extractor import ContainerExtractor, ExtractionResult
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
@@ -136,9 +137,11 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: `Endpoint` nodes, with their handlers' IMPLEMENTS and owning-service CALLS
 #: (apis/routes.py), and a code Module's `shared_claims`); 14: C# match keys
 #: in shadow tiers (an enclosing namespace's type hides a using's), a
-#: tiered group's every pin recorded in `name_refs`.
+#: tiered group's every pin recorded in `name_refs`; 15: C# Class and
+#: Function `proj` and C# path-pinned rows limited to the projects their
+#: file's project references (`visible`, a Module's `name_ref_visible`).
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 14
+INDEX_FORMAT = 15
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -833,6 +836,7 @@ def index_paths(
     previous = engine.list_file_nodes(repo_id, batch_keys)
     previous_nodes = {node[:4] for node in previous}
     previous_keys = {node[:4]: node[4] for node in previous}
+    previous_projects = {node[:4]: node[6] for node in previous}
     stale = {node[:4] for node in previous if node[5]}
     # The claims on the shared nodes the batch's files claim (see
     # _written_back_shared).
@@ -892,21 +896,25 @@ def index_paths(
     if docs_batch:
         added -= {node for node in batch_nodes if node[:2] in docs_batch.existing}
     added_nodes = {node[:2] for node in added}
-    # Match keys, which pass 1 left as they were, are written now, before
-    # pass 2 tests them. A kept node whose keys changed (no keys and none
-    # being the same) was linked by `@` pins under its old ones: its
-    # CALLS/IMPORTS edges go with them, and pass 2 and the relink below
-    # write them again under the new ones, as for an added node; one a
-    # failed batch left stale goes again. It is not added otherwise: no
-    # referrer, docs or mention depends on its keys.
+    # Match keys and C# projects, which pass 1 left as they were, are
+    # written now, before pass 2 tests them. A kept node whose keys or
+    # project changed (no keys and none, no project and "", being the
+    # same) was linked by `@` pins under its old keys, and by rows that
+    # could see its old project: its CALLS/IMPORTS edges go with them, and
+    # pass 2 and the relink below write them again under the new ones, as
+    # for an added node; one a failed batch left stale goes again. It is
+    # not added otherwise: no referrer, docs or mention depends on them.
     match_keys = _match_keys(code_extractions)
+    projects = _projects(code_extractions)
     rekeyed = {
         node for node, keys in match_keys.items()
-        if node in stale or (node in previous_keys and (previous_keys[node] or ()) != (keys or ()))
+        if node in stale or (node in previous_keys and (
+            (previous_keys[node] or ()) != (keys or ()) or (previous_projects[node] or "") != (projects[node] or "")
+        ))
     }
     rewritten = sorted(
-        (*node, keys, node in rekeyed) for node, keys in match_keys.items()
-        if node in rekeyed or previous_keys.get(node) != keys
+        (*node, keys, projects[node], node in rekeyed) for node, keys in match_keys.items()
+        if node in rekeyed or previous_keys.get(node) != keys or previous_projects.get(node) != projects[node]
     )
     if rewritten:
         engine.write_match_keys(repo_id, rewritten)
@@ -1003,7 +1011,9 @@ def index_paths(
     # edges straight from the graph, with no file read. A full scan has no
     # file outside the batch.
     if relink_outside:
-        _relink_name_refs(engine, repo_id, added | rekeyed, set(by_rel_path) | referrers, match_keys, shadow_names)
+        _relink_name_refs(
+            engine, repo_id, added | rekeyed, set(by_rel_path) | referrers, match_keys, shadow_names, projects,
+        )
     if rekeyed:
         engine.settle_match_keys(repo_id, sorted(rekeyed))
 
@@ -1121,13 +1131,14 @@ def _with_name_refs(nodes: list[dict], rels: list[dict], rel_path: str) -> list[
     by-name edges (see name_ref_properties), for its pass-1 replace only:
     pass 2 re-upserts the plain `nodes`, so it never writes them again. Its
     symbols' match keys are left out: index_paths writes them after pass 1
-    (engine.write_match_keys), with the edges they decide."""
+    (engine.write_match_keys), with the edges they decide, and so is their
+    C# project (`proj`)."""
     refs = name_ref_properties(rels)
     return [
         {**node, "properties": {**node["properties"], **refs}}
         if node["label"] == "Module" and node["name"] == rel_path
-        else {**node, "properties": {k: v for k, v in node["properties"].items() if k != "mkeys"}}
-        if "mkeys" in node["properties"] else node
+        else {**node, "properties": {k: v for k, v in node["properties"].items() if k not in ("mkeys", "proj")}}
+        if "mkeys" in node["properties"] or "proj" in node["properties"] else node
         for node in nodes
     ]
 
@@ -1228,9 +1239,11 @@ def _index_single_path(
         # row with tiered match keys waits for pass 2: whether a nearer
         # node shadows its target depends on nodes a later file of the
         # batch may still add, remove or rekey, and pass 2 only adds edges.
+        # So does a row limited to its project's references (`visible`):
+        # a node's `proj` is written with its match keys, after pass 1.
         engine.replace_file_nodes(
             repo_id, rel_path, _with_name_refs(nodes, rels, rel_path),
-            [rel for rel in rels if not tiered(rel.get("to_file"))], service_api=True,
+            [rel for rel in rels if not tiered(rel.get("to_file")) and not rel.get("visible")], service_api=True,
         )
         indexed += 1
         cs_files.append(rel_path)
@@ -1377,6 +1390,22 @@ def _match_keys(
     }
 
 
+def _projects(
+    code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
+) -> dict[tuple[str, str, str, str], str | None]:
+    """(label, name, file, owner) -> the C# project (`proj`, which a row's
+    `visible` tests, see common.visible_to) of every code symbol this batch
+    wrote, None for one written without one, as list_file_nodes gives it."""
+    return {
+        (node["label"], node["name"], node["properties"]["file"], node["properties"].get("owner") or ""):
+            node["properties"].get("proj")
+        for extractions in code_extractions
+        for _rel_path, (file_nodes, _rels) in extractions.items()
+        for node in file_nodes
+        if node["properties"].get("file")
+    }
+
+
 def _shadow_keys(nodes) -> dict[tuple[str, str], set[str]]:
     """(label, name) -> the match keys of these (node, old mkeys, new mkeys)
     of a file-scoped label, old and new together; a name whose nodes hold
@@ -1397,6 +1426,7 @@ def _relink_name_refs(
     engine: GraphEngine, repo_id: str, added: set[tuple[str, str, str, str]], skip: set[str],
     match_keys: dict[tuple[str, str, str, str], tuple[str, ...] | None] | None = None,
     shadow_names: Mapping[tuple[str, str], set[str]] | None = None,
+    projects: dict[tuple[str, str, str, str], str | None] | None = None,
 ) -> None:
     """Re-write the by-name edges that code files outside `skip` recorded in
     their Modules' `name_refs` (see name_ref_properties) and that meet a node
@@ -1415,7 +1445,10 @@ def _relink_name_refs(
     file-keyed index. An entry with target pins relinks only an added node a
     pin of its links (common.best_pin: the strongest pin that matches its
     file, as the writer's rows leave out what a stronger pin matches, tested
-    against the node's `match_keys`), with that pin's confidence. A pinned
+    against the node's `match_keys`), with that pin's confidence, when a
+    path pin's node is visible to the entry's file's project (its
+    Module's `name_ref_visible` against the node's `projects`,
+    common.visible_to); every edge it writes carries that `visible`. A pinned
     Module target is found by an added Module's directory, directory name or
     basename (the row's `to_name`, see common.module_pin_name) and relinked
     by its path. Each edge gets back the entry's `caller_class`, and its
@@ -1444,7 +1477,7 @@ def _relink_name_refs(
     rerun: list[tuple[dict, list[dict]]] = []
 
     def relink(origin, fields, from_file, to_file, confidence, exclude=(), to_name=None, from_owner=None,
-               to_owner=None):
+               to_owner=None, visible=None):
         rel_type, from_label, from_name, _from_file, to_label, field_to_name, caller_class, _owner = fields
         properties = {key: value for key, value in (("caller_class", caller_class), ("confidence", confidence)) if value}
         rels.append({
@@ -1452,12 +1485,12 @@ def _relink_name_refs(
             "to_label": to_label, "to_name": to_name or field_to_name, "repo_id": repo_id,
             "properties": properties or None,
             "from_file": from_file or None, "to_file": to_file, "origin": origin, "exclude": list(exclude),
-            "from_owner": from_owner, "to_owner": to_owner,
+            "from_owner": from_owner, "to_owner": to_owner, "visible": visible or None,
         })
 
     names = {name for _label, name in pinned} | {name for _label, name in shadow_names}
     names |= {key for module in modules for key in _module_pin_keys(module)}
-    for origin, refs in engine.find_name_refs(repo_id, sorted(names), sorted(skip)):
+    for origin, refs, visible in engine.find_name_refs(repo_id, sorted(names), sorted(skip)):
         parsed = _with_scopes_merged(_parsed_name_refs(origin, refs))
         # Every Module a source imports, by path or by pin, as calls.import_rows
         # collapsed them: a pinned Module target leaves out what a stronger
@@ -1487,7 +1520,7 @@ def _relink_name_refs(
                         for to_owner in [None] if None in owners[pin] else sorted(owners[pin]):
                             relink(
                                 origin, fields, from_file, pin, pin_confidence(pin, confidence), exclude,
-                                from_owner=owner, to_owner=to_owner,
+                                from_owner=owner, to_owner=to_owner, visible=visible,
                             )
                     rerun.append((group, rels[start:]))
                     del rels[start:]
@@ -1507,8 +1540,12 @@ def _relink_name_refs(
                             )
             else:
                 for to_file, to_owner in pinned.get((to_label, to_name), ()):
-                    keys = (match_keys or {}).get((to_label, to_name, to_file, to_owner)) or ()
+                    node = (to_label, to_name, to_file, to_owner)
+                    keys = (match_keys or {}).get(node) or ()
                     pin = best_pin(owners, to_file or "", origin, keys) if to_file is not None else None
+                    # A path pin's row sees only its project's references (graph/engine.py `_visible`).
+                    if pin is not None and pin_kind(pin) not in ("file", "fileless"):
+                        pin = pin if visible_to((projects or {}).get(node), visible) else None
                     # A pin that named its target's owner links only that owner's member.
                     if pin is not None and (None in owners[pin] or to_owner in owners[pin]):
                         relink(
@@ -1524,7 +1561,7 @@ def _relink_name_refs(
                         for to_owner in [None] if None in pin_owners else sorted(pin_owners):
                             relink(
                                 origin, fields, source_file, to_file, conf, exclude, from_owner=source_owner,
-                                to_owner=to_owner,
+                                to_owner=to_owner, visible=visible,
                             )
     for start in range(0, len(rerun), RERUN_GROUPS):
         chunk = rerun[start:start + RERUN_GROUPS]

@@ -1339,7 +1339,7 @@ class TestFieldKeyedDocsApply:
         spec, files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
         engine.extracted_entries = lambda repo_id, extractor, labels: {("Adr", "ADR-1", "decisions/adr-1.md")}
-        engine.list_file_nodes = lambda repo_id, files: {("Adr", "ADR-1", "decisions/adr-1.md", "", None, False)}
+        engine.list_file_nodes = lambda repo_id, files: {("Adr", "ADR-1", "decisions/adr-1.md", "", None, False, None)}
         copy = "decisions/adr-1 copy.md"
         batch = dispatch._read_docs_batch(engine, "demo", temp_repo, spec, {copy: files[copy]}, set())
         assert sorted(batch.selected) == ["decisions/adr-1 copy.md", "decisions/adr-1.md"]
@@ -1658,7 +1658,7 @@ def test_an_unreadable_name_ref_entry_is_skipped_not_fatal():
         rels: list = []
 
         def find_name_refs(self, repo_id, names, skip):
-            return [("app.py", [NAME_REF_SEP.join(["CALLS", "Function", "x"]), *good])]
+            return [("app.py", [NAME_REF_SEP.join(["CALLS", "Function", "x"]), *good], [])]
 
         def upsert_relationships(self, rels):
             self.rels += rels
@@ -1684,7 +1684,7 @@ def test_an_owned_pin_relinks_only_its_owners_member():
             self.rels = []
 
         def find_name_refs(self, repo_id, names, skip):
-            return [("app.py", refs)]
+            return [("app.py", refs, [])]
 
         def upsert_relationships(self, rels):
             self.rels += rels

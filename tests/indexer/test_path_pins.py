@@ -26,6 +26,7 @@ from devgraph.indexer.common import (
     pin_excludes,
     pin_matches,
     shadowed,
+    visible_to,
 )
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
@@ -184,7 +185,7 @@ def test_relink_takes_a_calls_entries_of_different_at_keys_together():
             self.rels = []
 
         def find_name_refs(self, repo_id, names, skip):
-            return [("app.cs", refs)]
+            return [("app.cs", refs, [])]
 
         def upsert_relationships(self, rels):
             self.rels += rels
@@ -389,14 +390,17 @@ def test_the_cypher_shadow_test_agrees_with_shadowed(engine, repo_id):
     """Random tiered pins (every path kind but a file, with flags, an owner
     and exclusions) on CALLS rows to Functions and IMPORTS rows to Classes
     link, among random nodes of their name (paths, owners and match keys),
-    exactly those `pin_matches` and `shadowed` say: the row's pin matches
-    the node, its owner is the row's (when it names one), no exclusion
-    matches, and no node its path and flags match, of any owner, holds a
-    nearer tier's key."""
+    exactly those `pin_matches`, `visible_to` and `shadowed` say: the row's
+    pin matches the node, its owner is the row's (when it names one), no
+    exclusion matches, the node's project (`proj`) is visible to the row
+    (`visible`), and no node its path and flags match and the row sees,
+    of any owner, holds a nearer tier's key. A fifth of the pins have one
+    tier, which shadows nothing but still sees by project."""
     rng = random.Random(7)
     keys = ["N:A", "M:A", ".:A", "N.M:A", "N:+A"]
+    projects = [".", "p", "q"]
     nodes, rels, expected = [], [], set()
-    shadows = 0
+    shadows = hidden = 0
     for i in range(1500):
         name = f"g{i}"
         label = rng.choice(["Function", "Class"])
@@ -412,29 +416,35 @@ def test_the_cypher_shadow_test_agrees_with_shadowed(engine, repo_id):
             pin += "!_g.cs"
         if base == "/.cs":  # a suffix pin: a file named `.cs`, never one of these
             pin = "/C.java" + pin[len(base):]
-        pin = tiered_pin(pin, [rng.sample(keys, rng.randint(1, 2)) for _ in range(rng.randint(2, 4))])
-        candidates = {}
+        tiers = 1 if rng.random() < 0.2 else rng.randint(2, 4)
+        pin = tiered_pin(pin, [rng.sample(keys, rng.randint(1, 2)) for _ in range(tiers)])
+        visible = None if rng.random() < 0.3 else sorted(rng.sample(projects, rng.randint(1, 2)))
+        candidates, proj = {}, {}
         for _ in range(rng.randint(1, 5)):
             path = _random_path(rng)
             path = path if rng.random() < 0.3 else path.rsplit(".", 1)[0] + rng.choice([".cs", "_g.cs"])
             owner = rng.choice(["", "A", "B"])
             candidates[(path, owner)] = None if rng.random() < 0.1 else sorted(rng.sample(keys, rng.randint(0, 2)))
+            proj[(path, owner)] = rng.choice([None, "", *projects])
         exclude = sorted({rng.choice(sorted(candidates))[0]}) if rng.random() < 0.2 else []
         to_owner = rng.choice([None, None, "A"])
         nodes += [
             {"label": label, "repo_id": repo_id, "name": name,
-             "properties": {"file": path, "owner": owner, **({"mkeys": mkeys} if mkeys is not None else {})}}
+             "properties": {"file": path, "owner": owner, **({"mkeys": mkeys} if mkeys is not None else {}),
+                            **({"proj": proj[(path, owner)]} if proj[(path, owner)] is not None else {})}}
             for (path, owner), mkeys in candidates.items()
         ]
         rels.append({
             "from_label": "Module", "from_name": "origin.cs", "rel_type": "CALLS" if label == "Function" else "IMPORTS",
             "to_label": label, "to_name": name, "repo_id": repo_id, "to_file": pin, "exclude": exclude,
-            "origin": "origin.cs", "to_owner": to_owner,
+            "origin": "origin.cs", "to_owner": to_owner, "visible": visible,
         })
-        others = [(path, mkeys) for (path, _owner), mkeys in candidates.items()]
+        others = [(path, mkeys, proj[(path, owner)]) for (path, owner), mkeys in candidates.items()]
         for (path, owner), mkeys in candidates.items():
             if _expected(pin, exclude, path, mkeys) and to_owner in (None, owner):
-                if shadowed(pin, mkeys, others):
+                if not visible_to(proj[(path, owner)], visible):
+                    hidden += 1
+                elif shadowed(pin, mkeys, others, visible):
                     shadows += 1
                 else:
                     expected.add((name, path, owner))
@@ -450,7 +460,9 @@ def test_the_cypher_shadow_test_agrees_with_shadowed(engine, repo_id):
         )
     }
     assert sorted(got ^ expected) == []
-    assert len(expected) > 100 and shadows > 25
+    assert len(expected) > 100 and shadows > 15
+    assert hidden > 25
+
 
 
 # --- live writes and relinks per pin kind -----------------------------------------
