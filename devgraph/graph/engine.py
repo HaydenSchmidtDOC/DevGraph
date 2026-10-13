@@ -272,10 +272,14 @@ _REPLACE_OWNED_NODES_CYPHER = (
     _union(_owned_branches("= $f"))
     + "CALL (n) { MATCH (n)-[r]->() " + _UNCLAIM_EDGE + " } "
     "WITH n WHERE NOT n:Module "
-    "FOREACH (_ IN CASE WHEN n.file IS NOT NULL AND n.owner IS NULL THEN [1] ELSE [] END | SET n.owner = '') "
-    "WITH n WHERE NOT any(key IN $keep WHERE labels(n)[0] = key[0] AND n.name = key[1] "
-    "  AND coalesce(n.owner, '') = key[2]) "
-    "DETACH DELETE n"
+    "WITH n, any(key IN $keep WHERE labels(n)[0] = key[0] AND n.name = key[1] "
+    "  AND coalesce(n.owner, '') = key[2]) AS kept "
+    # A node is either given its owner or deleted, never both: one that
+    # gains the owner key and goes in one transaction is left behind in the
+    # transaction's view of the (repo_id, name, file, owner) index.
+    "FOREACH (_ IN CASE WHEN kept AND n.file IS NOT NULL AND n.owner IS NULL THEN [1] ELSE [] END | "
+    "  SET n.owner = '') "
+    "FOREACH (_ IN CASE WHEN kept THEN [] ELSE [1] END | DETACH DELETE n)"
 )
 
 # G2 set (d): every edge a docs note writes touches one of the note's own
@@ -921,15 +925,16 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     """The MATCH for one end of an edge row (`pin` from `_pin`), reading its
     `{end}_name`/`{end}_file` off `ref` (the row, or one of its targets). An
     end of a file-scoped label is hinted to seek its index: the (repo_id,
-    name, file) unique one when pinned to a file, the (repo_id, name) lookup
-    one otherwise (a file-less end then keeps only `file IS NULL`). A plan
+    name, file, owner) unique one when pinned to a file (any owner, `owner
+    IS NOT NULL`, unless the row names one), the (repo_id, name) lookup one
+    otherwise (a file-less end then keeps only `file IS NULL`). A plan
     made from index statistics sampled while the label was near-empty
     estimates 0 rows, and can then scan a whole index per row (a plain USING
     INDEX allows that scan) after the label has filled; in CI that made a
     5,000-module relink take 20 s instead of under 1 s. A path pin seeks by
     name and keeps the nodes whose file its `pin` matches and no `exclude`
     pin does (`ex_files`, `ex_pins`); a directory or prefix pin seeks the
-    (repo_id, name, file) index from its path (`STARTS WITH`), so its cost
+    (repo_id, name, file, owner) index from its path (`STARTS WITH`), so its cost
     follows the directory's nodes of the name, not the repository's; on a Module target it seeks the
     Module's `dir` (a directory pin), `dir_name` (a suffix-directory pin:
     the last name of its directory) or `basename` (a suffix pin), the row's
@@ -952,22 +957,26 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
             match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
             if label in FILE_SCOPED_LABELS and pin in _ANCHORED_PINS:
                 # The files under one directory are a prefix range of the
-                # unique (repo_id, name, file) index: a package's own `Get`,
-                # not every `Get` of the repository (S10 fan-in).
-                match += f"USING INDEX SEEK {var}:{label}(repo_id, name, file) "
-                conditions.insert(0, f"{path} STARTS WITH {ref}.pin.v")
+                # unique (repo_id, name, file, owner) index: a package's own
+                # `Get`, not every `Get` of the repository (S10 fan-in).
+                match += f"USING INDEX SEEK {var}:{label}(repo_id, name, file, owner) "
+                conditions[:0] = [f"{path} STARTS WITH {ref}.pin.v", f"{var}.owner IS NOT NULL"]
             elif label in FILE_SCOPED_LABELS:
                 match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
         conditions[:0] = _path_pin_conditions(ref, path, var)
         return match + "WHERE " + " AND ".join(conditions) + " "
     pinned = pin == "file"
-    keys = "repo_id, name, file" if pinned else "repo_id, name"
+    keys = "repo_id, name, file, owner" if pinned else "repo_id, name"
     hint = f"USING INDEX SEEK {var}:{label}({keys}) " if label in FILE_SCOPED_LABELS else ""
     if pinned:
         match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name, file: {ref}.{end}_file}}) "
         if label in FILE_SCOPED_LABELS:
-            # One of the file's same-named siblings, when the row names its owner.
-            conditions.insert(0, f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)")
+            # One of the file's same-named siblings, when the row names its
+            # owner; every one of them otherwise. A node an index older than
+            # owners wrote is left out until the upgrade rescan gives it one.
+            conditions[:0] = [
+                f"{var}.owner IS NOT NULL", f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)",
+            ]
     else:
         match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
         if pin == "fileless":
@@ -1928,7 +1937,7 @@ class GraphEngine:
         `mkeys_stale` until settle_match_keys: the batch writes them again
         under the new keys, the way it writes an added node's, and a batch
         that fails before then finds it stale and does it again. Each
-        label's (repo_id, name, file) index is hinted to seek, for the reason
+        label's (repo_id, name, file, owner) index is hinted to seek, for the reason
         _end_match gives, and RETRACT_NODES nodes go per transaction, so a
         format upgrade that rekeys a whole repository never holds one
         transaction over all of it. Every other edge stays."""
@@ -1960,8 +1969,9 @@ class GraphEngine:
                 for start in range(0, len(rows), RETRACT_NODES):
                     _run(
                         session,
-                        f"UNWIND $rows AS row MATCH (b:{label} {{repo_id: $repo_id, name: row.name, file: row.file}}) "
-                        f"USING INDEX SEEK b:{label}(repo_id, name, file) WHERE b.owner = row.owner " + update,
+                        f"UNWIND $rows AS row MATCH (b:{label} "
+                        "{repo_id: $repo_id, name: row.name, file: row.file, owner: row.owner}) "
+                        f"USING INDEX SEEK b:{label}(repo_id, name, file, owner) " + update,
                         repo_id=repo_id,
                         rows=rows[start:start + RETRACT_NODES],
                     )

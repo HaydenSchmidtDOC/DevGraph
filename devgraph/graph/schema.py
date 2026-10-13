@@ -176,9 +176,11 @@ def lookup_index_statements() -> list[str]:
     A `(repo_id, name)` index on each file-scoped label: their uniqueness
     constraint indexes `(repo_id, name, file, owner)`, which a bare-name
     match (an edge's target end, `describe_node`) can't seek, so without
-    these it scans every node of the label; and a `(repo_id, name, file)`
-    one, which an end pinned to a file seeks (its `owner` filtered after);
-    the same on Cache, which has no
+    these it scans every node of the label (an end pinned to a file seeks
+    the constraint's index, with `owner IS NOT NULL` when the row names no
+    owner; no separate `(repo_id, name, file)` index exists, which an older
+    DevGraph's constraint of that shape would collide with); the same on
+    Cache, which has no
     constraint (named so it never reads as a user type's generated index).
     Module's `(repo_id, dir)`, `(repo_id, dir_name)` and `(repo_id,
     basename)`, which a pinned IMPORTS row seeks (see engine._end_match). Then the provenance indexes a per-file re-index seeks (`(repo_id, file)`,
@@ -190,11 +192,6 @@ def lookup_index_statements() -> list[str]:
     """
     statements = [
         f"CREATE INDEX {label.lower()}_repo_name_lookup IF NOT EXISTS FOR (n:{label}) ON (n.repo_id, n.name)"
-        for label in FILE_SCOPED_LABELS
-    ]
-    statements += [
-        f"CREATE INDEX {label.lower()}_repo_name_file_lookup IF NOT EXISTS "
-        f"FOR (n:{label}) ON (n.repo_id, n.name, n.file)"
         for label in FILE_SCOPED_LABELS
     ]
     statements.append("CREATE INDEX cache_repo_name_index IF NOT EXISTS FOR (n:Cache) ON (n.repo_id, n.name)")

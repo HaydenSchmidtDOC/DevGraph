@@ -6,12 +6,16 @@ fresh scan."""
 
 import tempfile
 import textwrap
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from neo4j.exceptions import Neo4jError
 
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
-from devgraph.indexer.dispatch import full_scan, index_paths
+from devgraph.graph.schema import FILE_SCOPED_LABELS
+from devgraph.indexer.dispatch import catch_up, full_scan, index_outdated, index_paths
 from devgraph.mcp.tools import describe_node, find_callers, get_source
 from devgraph.registry.store import RepoRegistry
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, live_repo_id, snapshot_diff
@@ -261,3 +265,85 @@ def test_an_index_written_before_owners_keeps_its_top_level_nodes(engine, repo):
     assert sorted((row["name"], row["owner"], row["kept"]) for row in rows) == [
         ("helper", "", True), ("save", "Order", None),
     ]
+
+
+def _constraints(engine):
+    rows = engine.run_cypher(
+        "SHOW CONSTRAINTS YIELD name, properties WHERE name CONTAINS '_repo_name_file' RETURN name, properties"
+    )
+    return {row["name"]: tuple(row["properties"]) for row in rows}
+
+
+def test_a_database_an_older_version_built_migrates_on_start_and_rescan(engine, repo):
+    """The upgrade path from index format 10: the old (repo_id, name, file)
+    constraints and owner-less nodes. Two processes starting at once (the
+    agent and the MCP server) both run init_schema, from a state where a
+    previous start dropped one old constraint and was cut short before
+    creating its new one; then the automatic rescan (catch_up of an outdated
+    index) gives every node its owner. The constraints are shared by the
+    whole database, so they are put back whatever happens."""
+    root, _registry, repo_id = repo
+    write(root, "shop/models.py", "def helper():\n    return 1\n\n\nclass Order:\n    def save(self):\n        return 2\n")
+    write(root, "shop/jobs.py", "from shop.models import helper\n\n\ndef run():\n    return helper()\n")
+    full_scan(engine, repo_id, root)
+    engine.run_cypher(
+        "MATCH (n:Function|Class {repo_id: $r}) WHERE n.file IS NOT NULL REMOVE n.owner SET n.marker = true",
+        {"r": repo_id},
+    )
+    engine.set_index_format(repo_id, 10)
+    try:
+        for label in FILE_SCOPED_LABELS:
+            engine.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_name_file_owner IF EXISTS")
+            try:
+                engine.run_cypher(
+                    f"CREATE CONSTRAINT {label.lower()}_repo_name_file IF NOT EXISTS "
+                    f"FOR (n:{label}) REQUIRE (n.repo_id, n.name, n.file) IS UNIQUE"
+                )
+            except Neo4jError as exc:  # another repository's same-file siblings
+                pytest.skip(f"the old constraint can't be created over the shared database's data: {exc}")
+        # A start cut short: one old constraint already dropped, its new one not created.
+        engine.run_cypher("DROP CONSTRAINT function_repo_name_file IF EXISTS")
+        assert "function_repo_name_file_owner" not in _constraints(engine)
+
+        errors = []
+        engines = [GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev") for _ in range(2)]
+
+        def start(each):
+            try:
+                each.init_schema()
+            except Exception as exc:  # pragma: no cover - the assertion below reports it
+                errors.append(exc)
+
+        threads = [threading.Thread(target=start, args=(each,)) for each in engines]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        for each in engines:
+            each.close()
+        assert errors == []
+        assert {name: props for name, props in _constraints(engine).items() if name.endswith(("_file", "_owner"))} == {
+            f"{label.lower()}_repo_name_file_owner": ("repo_id", "name", "file", "owner") for label in FILE_SCOPED_LABELS
+        }
+
+        # The file gains a sibling `save` while the old index waits for its rescan.
+        write(root, "shop/models.py", MODELS.replace("    def archive():", "    def helper():\n        return 1\n\n\n    def archive():"))
+        assert index_outdated(engine, repo_id)
+        catch_up(engine, repo_id, root, since=datetime.now(timezone.utc))
+        assert not index_outdated(engine, repo_id)
+        rows = engine.run_cypher(
+            "MATCH (n:Function {repo_id: $r, file: 'shop/models.py'}) RETURN n.name AS name, n.owner AS owner, "
+            "n.marker AS kept",
+            {"r": repo_id},
+        )
+        assert sorted((row["name"], row["owner"], row["kept"]) for row in rows) == [
+            ("archive", "", None), ("check", "Invoice", None), ("check", "Order", None),
+            ("helper", "", True),  # a top-level function keeps its node
+            ("save", "Invoice", None), ("save", "Order", None),  # the old `save` is replaced, one node per owner
+        ]
+        engine.run_cypher("MATCH (n:Function|Class {repo_id: $r}) REMOVE n.marker", {"r": repo_id})
+        equals_fresh(engine, repo_id, root)
+    finally:
+        for label in FILE_SCOPED_LABELS:
+            engine.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_name_file IF EXISTS")
+        engine.init_schema()

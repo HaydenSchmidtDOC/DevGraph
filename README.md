@@ -144,6 +144,7 @@ Graphs built by this version are more accurate in four ways:
 - Removed code goes away. A call, base class or import you delete from a file loses its edge on the next save, and so does a service removed from a compose file and a mention removed from a Markdown file.
 - A file you delete and restore (or a file added after the files that import it) gets its links back, without a rescan.
 - Existing graphs upgrade on their own. While the agent runs, it rescans each watched repository once, in the background. Until that finishes, `devgraph status` shows the repository as `rescan pending`. A repository the agent doesn't watch needs `devgraph rescan <repo_id>`.
+- Going back to an older version is not supported once a newer one has upgraded the database's constraints: since index format 11 (same-named methods of one file kept apart), an older DevGraph fails at start once the graph holds such methods, until the `class_repo_name_file_owner`, `function_repo_name_file_owner` and `service_repo_name_file_owner` constraints are dropped and the repositories are registered again with it.
 
 ## Project schema
 
