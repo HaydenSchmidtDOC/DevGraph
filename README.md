@@ -11,7 +11,7 @@ It provides:
 
 ![DevGraph dashboard — a live graph of this repository](docs/dashboard.png)
 
-Source extraction is selected per file, so one repository can mix **Python, JavaScript/TypeScript, C#, C++, Java, Kotlin, Rust, and Go**. DevGraph also recognizes container/compose files, API routes, datastore usage, Markdown annotations and mentions, and local git history.
+Source extraction is selected per file, so one repository can mix **Python, JavaScript/TypeScript, C#, C++, Java, Kotlin, Rust, and Go**. DevGraph also recognizes container/compose files, API routes and datastore usage (in Python source only; see [Current limitations](#current-limitations)), Markdown annotations and mentions, and local git history.
 
 ## Quickstart
 
@@ -459,6 +459,7 @@ Bind-mount each allowed repository under `/repos` before registering it. The loc
 - The agent reads a repository's git history in one go the first time it watches it (unless it was registered with `--full`), and live updates for that repository wait until it finishes: minutes for a history of thousands of commits.
 - `compare_branches` detects renames only when the content is identical (a renamed and edited file shows as removed plus added), and its `impacted_callers` come from the last index of the working tree, not from either ref.
 - `impact_analysis_for_diff` compares the same way and traces dependents of the functions and classes changed or removed (added ones are listed apart: nothing depends on them yet). Its dependents also come from the last index of the working tree, so a symbol the index has never seen has none.
+- API routes and datastore usage are extracted from Python source only: FastAPI (`@app.get`/`@router.get` style decorators), Flask (`@app.route` and the method shortcuts) and Django (`path`/`re_path` in URL patterns) routes, and the Python clients of PostgreSQL, MySQL, SQLite, MongoDB, DuckDB, Neo4j, Redis, Valkey, Qdrant, Weaviate, Pinecone, Kafka and RabbitMQ. Express, Koa, Spring, ASP.NET and Go `net/http` services get no `Endpoint` nodes yet, so `trace_request_flow` and `explain_architecture` show no routes for them, and their datastore clients are not detected, so `get_service_dependencies` lists none.
 - Enterprise federation and semantic search are design directions rather than shipped capabilities.
 
 ## Contributing
