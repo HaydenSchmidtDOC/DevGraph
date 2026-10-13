@@ -1299,11 +1299,15 @@ one union per site), AFTER this branch.
 | M3 `IMPORTS` precision / recall | ≥ 98 % / 95 % | 94 % (17/18) / 100 % | 100 % (17/17) / 100 % | met |
 | M4 `CALLS` recall | ≥ 95 % | 100 % (linked 100 %) | 100 % (linked 100 %) | met |
 | M5 named sites | all | 30/31 | 31/31 | met |
-| M6 largest `name_refs` | < 1 MiB | 4,771 B (total 13,192 B) | 4,771 B (total 13,192 B) | met |
+| M6 largest `name_refs` | < 1 MiB | 4,771 B (total 13,192 B) | 4,925 B (total 13,346 B) | met |
 
 - `UserService.Register` now links Shop.Domain's `User.Display` alone and
   `UserService.cs` imports only Models/User.cs; `test_measure_fixtures`
-  has no C# xfail left.
+  has no C# xfail left. The `name_refs` grow a little where an alias is
+  used (its pin also names the namespaces nearer than its declaration).
+  After the review fixes (reruns limited to the groups a node's keys meet,
+  the alias at its level) the 50-project synthetic scanned in 61.7 s, its
+  links and `name_refs` unchanged.
 - **Synthetic multi-project repository** (`--cs-synthetic`, seed 1):
   nothing in it shadows, so links are unchanged (precision, recall and
   `IMPORTS` 100 %, 0 cross-project wrong links at 10 and 50 projects; 25
