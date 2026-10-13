@@ -104,6 +104,7 @@ import tree_sitter_c_sharp as tscsharp
 from tree_sitter import Language, Node, Parser
 
 from devgraph.graph.schema import MAX_SCOPE_KEYS, scoped_pin
+from devgraph.indexer.apis.routes import add_route, join_route
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, call_rows
 from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges, owned_pin
 from devgraph.indexer.resolver_config import CsUsing, ResolverConfig
@@ -985,6 +986,157 @@ def _referenced_types(root: Node, source: bytes) -> list[tuple[str, str, Node]]:
     return found
 
 
+#: ASP.NET Core's attribute-routing verbs and minimal-API map calls, by HTTP method.
+_HTTP_ATTRIBUTES = {
+    "HttpGet": "GET", "HttpPost": "POST", "HttpPut": "PUT", "HttpDelete": "DELETE", "HttpPatch": "PATCH",
+    "HttpHead": "HEAD", "HttpOptions": "OPTIONS",
+}
+_MAP_CALLS = {"MapGet": "GET", "MapPost": "POST", "MapPut": "PUT", "MapDelete": "DELETE", "MapPatch": "PATCH"}
+
+
+def _string_literal(node: Node | None, source: bytes) -> str | None:
+    """A plain or verbatim string literal's value; None for anything else
+    (an interpolated or raw string, a constant, `nameof`)."""
+    if node is None:
+        return None
+    text = _text(node, source)
+    if node.type == "string_literal" and text.startswith('"'):
+        return text[1:-1]
+    if node.type == "verbatim_string_literal":
+        return text[2:-1].replace('""', '"')
+    return None
+
+
+def _route_attributes(node: Node, source: bytes) -> dict[str, list[str | None]]:
+    """A declaration's attributes by name (an `Attribute` suffix dropped),
+    each as its positional arguments' string values (None: not a literal)."""
+    found: dict[str, list[str | None]] = {}
+    for attribute_list in (c for c in node.children if c.type == "attribute_list"):
+        for attribute in (a for a in attribute_list.named_children if a.type == "attribute"):
+            name = attribute.child_by_field_name("name")
+            if name is None:
+                continue
+            arguments = next((c for c in attribute.named_children if c.type == "attribute_argument_list"), None)
+            values = [
+                _string_literal(arg.named_children[0], source)
+                for arg in (arguments.named_children if arguments is not None else [])
+                if arg.type == "attribute_argument" and len(arg.named_children) == 1
+                and arg.named_children[0].type != "assignment_expression"
+            ]
+            key = _text(name, source).rsplit(".", 1)[-1]
+            found[key.removesuffix("Attribute") if key != "Attribute" else key] = values
+    return found
+
+
+def _aspnet_routes(root: Node, source: bytes, result: ExtractionResult, file_path: str, repo_id: str) -> None:
+    """ASP.NET Core routes as Endpoints (apis/routes.py). Attribute routing:
+    a controller's (`[ApiController]`, a `[Route]` or a `...Controller`
+    name) `[HttpGet("x")]`/`[Route("x")]` actions under its `[Route]`, the
+    `[controller]` and `[action]` tokens filled in, implemented by the
+    action, owned by its class. Minimal APIs: `app.MapGet("/x", handler)`
+    under the literal prefixes of the file's `MapGroup`s, implemented by a
+    method of the file it names (a lambda implements nothing)."""
+    functions: dict[str, set[str]] = {}
+    for node in result.nodes:
+        if node.label == "Function" and node.properties.get("file") == file_path:
+            functions.setdefault(node.name, set()).add(node.properties["owner"])
+
+    def controller(node: Node, classes: list[str]) -> None:
+        name = _text(node.child_by_field_name("name"), source)
+        attributes = _route_attributes(node, source)
+        if not ({"ApiController", "Route"} & set(attributes) or name.endswith("Controller")):
+            return
+        prefixes = attributes.get("Route") or [""]
+        body = node.child_by_field_name("body")
+        for member in body.named_children if body is not None else []:
+            action = member.child_by_field_name("name")
+            if member.type != "method_declaration" or action is None:
+                continue
+            action_name = _text(action, source)
+            on_action = _route_attributes(member, source)
+            verbs = [(verb, on_action[attr]) for attr, verb in _HTTP_ATTRIBUTES.items() if attr in on_action]
+            if not verbs and "Route" in on_action:
+                verbs = [("*", [])]
+            for verb, templates in verbs:
+                for template in templates or on_action.get("Route") or [""]:
+                    for prefix in prefixes:
+                        if template is None or prefix is None:
+                            continue  # not a literal
+                        path = template.lstrip("~") if template.startswith(("/", "~/")) else join_route(prefix, template)
+                        path = path.replace("[controller]", name.removesuffix("Controller"))
+                        path = path.replace("[action]", action_name.removesuffix("Async"))
+                        add_route(result, repo_id, file_path, "ASP.NET Core", verb, join_route(path), action_name,
+                                  ".".join([*reversed(classes), name]))
+
+    def classes_in(container: Node, classes: list[str]) -> None:
+        for node in container.named_children:
+            if node.type == "namespace_declaration" and (body := node.child_by_field_name("body")) is not None:
+                classes_in(body, classes)
+            elif node.type in _CLASS_LIKE and node.child_by_field_name("name") is not None:
+                controller(node, classes)
+                if (body := node.child_by_field_name("body")) is not None:
+                    classes_in(body, [_text(node.child_by_field_name("name"), source), *classes])
+
+    classes_in(root, [])
+
+    groups: dict[str, tuple[str, str | None]] = {}  # group variable -> (what it is mapped on, its prefix)
+    maps: list[tuple[str, str, str, Node]] = []  # (receiver, method, path, handler)
+    for call in _descendants(root, "invocation_expression"):
+        func = call.child_by_field_name("function")
+        arguments = call.child_by_field_name("arguments")
+        if func is None or func.type != "member_access_expression" or arguments is None:
+            continue
+        receiver, method = func.child_by_field_name("expression"), func.child_by_field_name("name")
+        values = [arg.named_children[-1] for arg in arguments.named_children if arg.type == "argument"]
+        if receiver is None or method is None or receiver.type != "identifier" or not values:
+            continue
+        verb = _MAP_CALLS.get(_text(method, source))
+        if _text(method, source) == "MapGroup":
+            # `var g = app.MapGroup("/x")`, maybe configured on (`.WithTags(...)`).
+            outer = call
+            while outer.parent is not None and outer.parent.type == "member_access_expression" and (
+                outer.parent.parent is not None and outer.parent.parent.type == "invocation_expression"
+            ):
+                outer = outer.parent.parent
+            variable = outer.parent.child_by_field_name("name") if outer.parent is not None and (
+                outer.parent.type == "variable_declarator"
+            ) else None
+            if variable is not None:
+                groups[_text(variable, source)] = (_text(receiver, source), _string_literal(values[0], source))
+        elif verb is not None and len(values) >= 2 and (path := _string_literal(values[0], source)) is not None:
+            maps.append((_text(receiver, source), verb, path, values[1]))
+
+    def prefix(receiver: str, seen: frozenset = frozenset()) -> str | None:
+        if receiver not in groups or receiver in seen:
+            return ""
+        parent, mounted = groups[receiver]
+        above = prefix(parent, seen | {receiver})
+        return None if mounted is None or above is None else join_route(above, mounted)
+
+    for receiver, verb, path, handler in maps:
+        above = prefix(receiver)
+        if above is None:
+            continue  # a group with a dynamic prefix
+        full = join_route(above, path)
+        if handler.type == "identifier" or (
+            handler.type == "member_access_expression" and handler.child_by_field_name("name") is not None
+        ):
+            # A method group: the method of the file it names, when only one does.
+            qualifier = None
+            if handler.type == "member_access_expression":
+                expression = handler.child_by_field_name("expression")
+                qualifier = _text(expression, source).rsplit(".", 1)[-1] if expression is not None else ""
+                handler = handler.child_by_field_name("name")
+            name = _text(handler, source)
+            owners = {o for o in functions.get(name, ()) if qualifier is None or o.rsplit(".", 1)[-1] == qualifier}
+            if len(owners) == 1:
+                add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, next(iter(owners)))
+            else:
+                add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, pins=set())
+        else:
+            add_route(result, repo_id, file_path, "ASP.NET Core", verb, full)
+
+
 def extract_csharp_file(
     source_code: str, file_path: str, repo_id: str, config: ResolverConfig | None = None,
 ) -> ExtractionResult:
@@ -1244,6 +1396,7 @@ def extract_csharp_file(
                 "Module", file_path, name, pins, False, None, file_path, repo_id, rel_type="IMPORTS",
                 to_label=to_label,
             )
+    _aspnet_routes(root, source_bytes, result, file_path, repo_id)
 
     return own_edges(result, file_path)
 

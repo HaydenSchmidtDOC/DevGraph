@@ -99,6 +99,20 @@ FRAMEWORKS = {
         "package shop\n\nclass OrderService {\n    fun all(): String = \"\"\n}\n",
         "POST /orders", "place", "services/shop/src/main/kotlin/shop/OrderController.kt",
     ),
+    "aspnet": (
+        "services/shop/Controllers/OrdersController.cs", """\
+        namespace Shop.Controllers;
+
+        [ApiController]
+        public class OrdersController : ControllerBase
+        {
+            [HttpDelete("/orders")]
+            public IActionResult Clear() => Ok();
+        }
+        """,
+        "services/shop/Program.cs", "var app = WebApplication.Create(args);\napp.Run();\n",
+        "DELETE /orders", "Clear", "services/shop/Controllers/OrdersController.cs",
+    ),
 }
 
 

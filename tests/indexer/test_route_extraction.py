@@ -212,3 +212,88 @@ def test_spring_kotlin_routes():
     }
     assert ("GET /api/carts/{id}", "show", path, "CartController") in _implements(result)
     assert _stubs(result) == {"show", "post", "clear"}
+
+
+ASPNET_CONTROLLER = """\
+namespace Shop.Api.Controllers;
+
+[ApiController]
+[Route("api/[controller]")]
+public class InvoicesController : ControllerBase
+{
+    [HttpGet]
+    public IActionResult List() => Ok();
+
+    [HttpGet("{id:int}", Name = "invoice")]
+    public IActionResult Show(int id) => Ok();
+
+    [HttpPost, Route("[action]")]
+    public async Task<IActionResult> ImportAsync() => Ok();
+
+    [HttpDelete("/admin/purge")]
+    public void Purge() {}
+
+    [Route(Paths.Archive)]
+    public void Archive() {}
+
+    public void NotRouted() {}
+}
+"""
+
+
+def test_aspnet_attribute_routes():
+    from devgraph.indexer.csharp.extractor import extract_csharp_file
+
+    path = "src/Shop.Api/Controllers/InvoicesController.cs"
+    result = extract_csharp_file(ASPNET_CONTROLLER, path, "r")
+    assert _endpoints(result) == {
+        "GET /api/Invoices": "ASP.NET Core",
+        "GET /api/Invoices/{id:int}": "ASP.NET Core",
+        "POST /api/Invoices/Import": "ASP.NET Core",
+        "DELETE /admin/purge": "ASP.NET Core",
+    }
+    implements = _implements(result)
+    assert {("GET /api/Invoices/{id:int}", "Show", path, "InvoicesController"),
+            ("GET /api/Invoices/{id:int}", "Show", "", None),
+            ("POST /api/Invoices/Import", "ImportAsync", path, "InvoicesController")} <= implements
+    # The stubs never get the match keys a C# Function has.
+    assert all("mkeys" not in n.properties for n in result.nodes if n.properties.get("type") == "handler")
+
+
+ASPNET_MINIMAL = """\
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+
+var todos = app.MapGroup("/todos").WithTags("Todos");
+todos.MapGet("/", TodoEndpoints.GetAll);
+todos.MapPost("/{id}", (int id) => Results.Ok(id));
+app.MapDelete("/items/{id}", TodoEndpoints.Remove);
+app.MapGet("/health", Health);
+app.MapGet("/" + prefix, TodoEndpoints.GetAll);
+
+app.Run();
+
+public static class TodoEndpoints
+{
+    public static IResult GetAll() => Results.Ok();
+    public static IResult Remove(int id) => Results.Ok();
+}
+"""
+
+
+def test_aspnet_minimal_api_routes():
+    from devgraph.indexer.csharp.extractor import extract_csharp_file
+
+    result = extract_csharp_file(ASPNET_MINIMAL, "src/Todo/Program.cs", "r")
+    assert _endpoints(result) == {
+        "GET /todos": "ASP.NET Core",
+        "POST /todos/{id}": "ASP.NET Core",
+        "DELETE /items/{id}": "ASP.NET Core",
+        "GET /health": "ASP.NET Core",
+    }
+    implements = _implements(result)
+    assert ("GET /todos", "GetAll", "src/Todo/Program.cs", "TodoEndpoints") in implements
+    assert ("DELETE /items/{id}", "Remove", "src/Todo/Program.cs", "TodoEndpoints") in implements
+    # `Health` is no method of the file: its stub alone.
+    assert {e for e in implements if e[0] == "GET /health"} == {("GET /health", "Health", "", None)}
+    assert not [e for e in implements if e[0] == "POST /todos/{id}"]
