@@ -118,8 +118,23 @@ _UNCLAIM_SOURCE_CYPHER = _union(_CLAIMED_BRANCHES) + _UNCLAIM_FILTER + _LOCK_AND
 # file with no record (a compose file or Containerfile, which has no Module,
 # or a Module an older index wrote) is unclaimed by the scan.
 SHARED_CLAIM_SEP = "\x1f"
+# Read under the Module's write lock (the no-op SET takes it), so two
+# overlapping writes of one file run one after the other: the second reads
+# the record the first wrote, never the one both started from.
 _RECORDED_CLAIMS_CYPHER = (
-    "MATCH (m:Module {repo_id: $repo_id, name: $file_name}) RETURN properties(m)['shared_claims'] AS claims"
+    "MATCH (m:Module {repo_id: $repo_id, name: $file_name}) SET m.name = m.name "
+    "RETURN properties(m)['shared_claims'] AS claims"
+)
+# Every code Module's record rewritten from the shared nodes' own `sources`
+# (`rebuild_claim_records`).
+_CLAIM_SOURCES_CYPHER = (
+    _union(_CLAIMED_BRANCHES) + "WITH n WHERE n.file IS NULL AND n.source_file IS NULL "
+    "RETURN labels(n)[0] AS label, n.name AS name, coalesce(n.sources, [n.source]) AS sources"
+)
+_WRITE_CLAIM_RECORDS_CYPHER = (
+    "MATCH (m:Module) USING INDEX SEEK m:Module(repo_id, name) "
+    "WHERE m.repo_id = $repo_id AND m.name IS NOT NULL AND properties(m)['shared_claims'] IS NOT NULL "
+    "SET m.shared_claims = coalesce($claims[m.name], [])"
 )
 _UNCLAIM_RECORDED_CYPHER = (
     _union(_seek(label, "name", f"IN $claimed_{i}") for i, label in enumerate(CLAIMED_LABELS))
@@ -244,8 +259,19 @@ SERVICE_API_SUFFIXES = (
 )
 
 
+def _rebuild_claim_records_tx(tx, repo_id: str) -> None:
+    claims: dict[str, set[str]] = {}
+    for record in tx.run(_CLAIM_SOURCES_CYPHER, repo_id=repo_id):
+        for source in record["sources"] or []:
+            claims.setdefault(source, set()).add(SHARED_CLAIM_SEP.join((record["label"], record["name"])))
+    tx.run(_WRITE_CLAIM_RECORDS_CYPHER, repo_id=repo_id,
+           claims={source: sorted(entries) for source, entries in claims.items()})
+
+
 def _delete_by_source_file_tx(tx, repo_id: str, file_name: str) -> None:
-    recorded = _recorded_claims(tx, repo_id, file_name)
+    # An empty record is read in full too: deletes are rare, and so a claim
+    # a record lost goes with its file.
+    recorded = _recorded_claims(tx, repo_id, file_name) or None
     _unclaim_foreign_sources_tx(tx, repo_id, file_name)
     if file_name.endswith(SERVICE_API_SUFFIXES):
         _unclaim_service_api_edges_tx(tx, repo_id, file_name, recorded)
@@ -396,7 +422,8 @@ def _unclaim_service_api_edges_tx(
     # The owning-service edges come back only in index_paths' final service
     # pass, which needs every compose file in the batch, so between this
     # file's replace and that pass a reader can briefly miss them.
-    tx.run(_UNCLAIM_SERVICE_USES_CYPHER, repo_id=repo_id, f=file_name)
+    if file_name.endswith(".py"):  # only a Python file writes USES
+        tx.run(_UNCLAIM_SERVICE_USES_CYPHER, repo_id=repo_id, f=file_name)
     if recorded is None:
         tx.run(_UNCLAIM_ENDPOINT_EDGES_CYPHER, repo_id=repo_id, f=file_name)
     else:
@@ -1350,6 +1377,15 @@ class GraphEngine:
             return
         with self._driver.session() as session:
             session.execute_write(_upsert_relationships_tx, rels)
+
+    def rebuild_claim_records(self, repo_id: str) -> None:
+        """Rewrite every code Module's `shared_claims` from the claims the
+        shared nodes themselves hold (their `sources`), in one read and one
+        write: a full scan starts with it, so a record that lost a claim (a
+        write that failed between its claim and its record, or a version
+        without the record's lock) is healed before the scan relies on it."""
+        with self._driver.session() as session:
+            session.execute_write(_rebuild_claim_records_tx, repo_id)
 
     def replace_file_nodes(
         self,

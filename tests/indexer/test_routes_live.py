@@ -181,3 +181,85 @@ def test_routes_reach_the_architecture_tools(engine, repo_id, tmp_path, framewor
     index_paths(engine, repo_id, tmp_path, {routes})
     incremental_equals_fresh(engine, repo_id, tmp_path)
     assert all(endpoint not in entry["endpoints"] for entry in explain_architecture(engine, repo_id)["endpoints"]["results"])
+
+
+def _endpoint_sources(engine, repo_id):
+    return sorted(
+        (row["name"], tuple(row["sources"] or [row["source"]]))
+        for row in engine.run_cypher(
+            "MATCH (e:Endpoint {repo_id: $r}) RETURN e.name AS name, e.source AS source, e.sources AS sources",
+            {"r": repo_id},
+        )
+    )
+
+
+def _drop_record(engine, repo_id, module, entry):
+    """What overlapping batches of two processes left before the record's
+    lock: the file claims `entry` but its Module's record lacks it."""
+    engine.run_cypher(
+        "MATCH (m:Module {repo_id: $r, name: $m}) SET m.shared_claims = [x IN m.shared_claims WHERE x <> $e]",
+        {"r": repo_id, "m": module, "e": entry},
+    )
+
+
+ROUTED = "import express from 'express';\nconst app = express();\napp.get('/orders', list);\nfunction list() {}\n"
+UNROUTED = "export function list() {}\n"
+
+
+def test_a_record_that_lost_a_claim_heals_on_a_full_scan(engine, repo_id, tmp_path):
+    from devgraph.graph.engine import SHARED_CLAIM_SEP
+
+    routes = write(tmp_path, "web/routes.ts", ROUTED)
+    _scan(engine, repo_id, tmp_path)
+    assert _endpoint_sources(engine, repo_id) == [("GET /orders", ("web/routes.ts",))]
+    _drop_record(engine, repo_id, "web/routes.ts", SHARED_CLAIM_SEP.join(("Endpoint", "GET /orders")))
+
+    # A replace unclaims what the record lists, so the lost claim survives it.
+    write(tmp_path, "web/routes.ts", UNROUTED)
+    index_paths(engine, repo_id, tmp_path, {routes})
+    assert _endpoint_sources(engine, repo_id) == [("GET /orders", ("web/routes.ts",))]
+
+    # A full scan rebuilds the records from the claims first: healed.
+    full_scan(engine, repo_id, tmp_path)
+    assert _endpoint_sources(engine, repo_id) == []
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_deleting_a_file_with_an_empty_record_reads_every_claim(engine, repo_id, tmp_path):
+    from devgraph.graph.engine import SHARED_CLAIM_SEP
+
+    routes = write(tmp_path, "web/routes.ts", ROUTED)
+    _scan(engine, repo_id, tmp_path)
+    for entry in ("Endpoint", "GET /orders"), ("Function", "list"):
+        _drop_record(engine, repo_id, "web/routes.ts", SHARED_CLAIM_SEP.join(entry))
+    routes.unlink()
+    remove_paths(engine, repo_id, tmp_path, {routes})
+    assert _endpoint_sources(engine, repo_id) == []
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_two_writes_of_one_file_take_turns_on_its_record(engine, repo_id, tmp_path):
+    """A replace reads its file's record under the Module's lock, so a
+    second write waits for the first and unclaims what the first claimed."""
+    import threading
+
+    routes = write(tmp_path, "web/routes.ts", UNROUTED)
+    _scan(engine, repo_id, tmp_path)
+    with engine._driver.session() as session:
+        tx = session.begin_transaction()
+        tx.run(
+            "MATCH (m:Module {repo_id: $r, name: 'web/routes.ts'}) SET m.name = m.name", {"r": repo_id}
+        ).consume()
+        done = threading.Event()
+        write(tmp_path, "web/routes.ts", ROUTED)
+        worker = threading.Thread(
+            target=lambda: (index_paths(engine, repo_id, tmp_path, {routes}), done.set()), daemon=True
+        )
+        worker.start()
+        # The other write waits on the lock this transaction holds.
+        assert not done.wait(2)
+        tx.commit()
+    worker.join(60)
+    assert done.is_set()
+    assert _endpoint_sources(engine, repo_id) == [("GET /orders", ("web/routes.ts",))]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
