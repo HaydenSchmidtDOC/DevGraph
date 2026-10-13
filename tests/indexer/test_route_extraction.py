@@ -283,6 +283,8 @@ def test_aspnet_attribute_routes():
         for verb, rest in (("GET", ""), ("GET", "/{id:int}"), ("POST", "/Import"), ("GET", "/recent"),
                            ("GET", "/latest"))
     } | {"DELETE /admin/purge": "ASP.NET Core"}
+    # The absolute route is one row, not one per class route.
+    assert [n.name for n in result.nodes if n.label == "Endpoint"].count("DELETE /admin/purge") == 1
     implements = _implements(result)
     assert {("GET /api/Invoices/{id:int}", "Show", path, "InvoicesController"),
             ("GET /api/Invoices/{id:int}", "Show", "", None),
@@ -310,6 +312,7 @@ static void Admin(WebApplication app)
 todos.MapPost("/{id}", (int id) => Results.Ok(id));
 app.MapDelete("/items/{id}", TodoEndpoints.Remove);
 app.MapGet("/health", Health);
+app.MapGroup("/chained").WithTags("C").MapGet("/x", TodoEndpoints.GetAll);
 app.MapGet("/" + prefix, TodoEndpoints.GetAll);
 
 app.Run();
@@ -337,6 +340,7 @@ def test_aspnet_minimal_api_routes():
         "DELETE /items/{id}": "ASP.NET Core",
         "GET /health": "ASP.NET Core",
         "GET /admin/all": "ASP.NET Core",
+        "GET /chained/x": "ASP.NET Core",
         # The nearest `todos` before the call: /tasks, no longer /todos.
         "PUT /tasks/{id}": "ASP.NET Core",
         # A builder a caller passes: the file's own Endpoint.
@@ -453,3 +457,51 @@ func Sync(cache *Cache, kv KV, store *Store, client *http.Client, ct string, bod
     # Without net/http or a router package, not even a router's call is read.
     plain = "package x\n\nfunc F(r Router) {\n\tr.HandleFunc(\"/x\", F)\n}\n"
     assert _endpoints(extract_go_file(plain, "x/x.go", "r")) == {}
+
+
+def test_go_router_subpackages_fields_and_scopes():
+    from devgraph.indexer.go.extractor import extract_go_file
+
+    source = """\
+package web
+
+import (
+\t"github.com/go-chi/chi/v5"
+\t"github.com/gofiber/fiber/v2/middleware/cache"
+\t"github.com/gorilla/mux"
+)
+
+type Server struct {
+\trouter *mux.Router
+\tapi    chi.Router
+}
+
+func load() {}
+
+func (s *Server) Routes(flag bool) {
+\tcache.Get("/k", load)
+\ts.router.HandleFunc("/health", load)
+\ts.api.Get("/items", load)
+\tif flag {
+\t\tv := s.router.PathPrefix("/inner").Subrouter()
+\t\tv.HandleFunc("/a", load)
+\t}
+\tgo func() {
+\t\tw := s.router.PathPrefix("/closure").Subrouter()
+\t\t_ = w
+\t}()
+\tv := s.router
+\tv.HandleFunc("/b", load)
+\tw := s.router
+\tw.HandleFunc("/c", load)
+}
+"""
+    assert _endpoints(extract_go_file(source, "web/server.go", "r")) == {
+        # A middleware subpackage's `cache.Get` is no router's.
+        "* /health": "Go",
+        "GET /items": "Go",
+        "* /inner/a": "Go",
+        # The `v`/`w` declared in a block or function literal before are not these.
+        "* /b": "Go",
+        "* /c": "Go",
+    }

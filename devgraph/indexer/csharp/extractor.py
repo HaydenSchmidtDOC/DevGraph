@@ -1086,15 +1086,18 @@ def _aspnet_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
             ]
             if not verbs:
                 verbs = [("*", template) for template in routes]
+            seen: set[tuple[str, str]] = set()  # an absolute template is one route whatever the class's
             for verb, template in verbs:
                 for prefix in prefixes:
                     if template is None or prefix is None:
                         continue  # not a literal
                     path = template.lstrip("~") if template.startswith(("/", "~/")) else join_route(prefix, template)
                     path = fill(path, "controller", name.removesuffix("Controller"))
-                    path = fill(path, "action", action_name.removesuffix("Async"))
-                    add_route(result, repo_id, file_path, "ASP.NET Core", verb, join_route(path), action_name,
-                              ".".join([*reversed(classes), name]))
+                    path = join_route(fill(path, "action", action_name.removesuffix("Async")))
+                    if (verb, path) not in seen:
+                        seen.add((verb, path))
+                        add_route(result, repo_id, file_path, "ASP.NET Core", verb, path, action_name,
+                                  ".".join([*reversed(classes), name]))
 
     def classes_in(container: Node, classes: list[str]) -> None:
         for node in container.named_children:
@@ -1143,12 +1146,18 @@ def _aspnet_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
 
     def kind(receiver: Node, at: Node, depth: int = 0) -> tuple[str, str | None]:
         """("root", ""), ("prefix", it), ("unknown", None) or ("skip", None) (a dynamic prefix)."""
-        found = declaration(_text(receiver, source), at) if receiver.type == "identifier" and depth < 8 else None
-        if found is None:
+        if depth >= 8:
             return ("unknown", None)
-        how, node = found
-        if how == "type":
-            return ("root", "") if _text(node, source).rsplit(".", 1)[-1] in _ROOT_BUILDER_TYPES else ("unknown", None)
+        if receiver.type == "invocation_expression":
+            node = receiver  # `app.MapGroup("/x").MapGet(...)`
+        else:
+            found = declaration(_text(receiver, source), at) if receiver.type == "identifier" else None
+            if found is None:
+                return ("unknown", None)
+            how, node = found
+            if how == "type":
+                return ("root", "") if _text(node, source).rsplit(".", 1)[-1] in _ROOT_BUILDER_TYPES \
+                    else ("unknown", None)
         # Down a configuring chain (`app.MapGroup("/x").WithTags(...)`) to its group or app.
         while node.type == "invocation_expression":
             func = node.child_by_field_name("function")
