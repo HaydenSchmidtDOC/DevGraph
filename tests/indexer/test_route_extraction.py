@@ -331,26 +331,44 @@ import (
 \t"net/http"
 
 \t"example.com/shop/internal/handlers"
+\t"github.com/gin-gonic/gin"
+\t"github.com/go-chi/chi/v5"
+\tmux "github.com/gorilla/mux"
 )
 
 func listItems(w http.ResponseWriter, r *http.Request) {}
 
-func Register(mux *http.ServeMux, r *gin.Engine, c chi.Router) {
-\tmux.HandleFunc("GET /items/{id}", listItems)
+func Register(sm *http.ServeMux, r *gin.Engine) {
+\tsm.HandleFunc("GET /items/{id}", listItems)
 \thttp.HandleFunc("/legacy", listItems)
-\tmux.Handle("POST shop.example.com/items", http.HandlerFunc(handlers.Create))
-\tmux.HandleFunc("/inline", func(w http.ResponseWriter, r *http.Request) {})
+\tsm.Handle("POST shop.example.com/items", http.HandlerFunc(handlers.Create))
+\tsm.HandleFunc("/inline", func(w http.ResponseWriter, r *http.Request) {})
+\tsm.Handle("/static/", files)
 \tv1 := r.Group("/v1")
 \tv1.GET("/users/:id", handlers.ShowUser)
 \tr.Any("/ping", listItems)
 \tr.Handle("DELETE", "/users/:id", handlers.DeleteUser)
+\tc := chi.NewRouter()
 \tc.Route("/orders", func(c chi.Router) {
 \t\tc.Get("/", listItems)
 \t\tc.Method("PUT", "/{id}", http.HandlerFunc(listItems))
 \t})
-\tclient.Post("/upload", "text/plain", body)
-\tcache.Get("/key", &value)
-\tmux.HandleFunc(base+"/x", listItems)
+\tg := mux.NewRouter()
+\tg.HandleFunc("/carts", listItems).Methods("GET", "POST")
+\tapi := g.PathPrefix("/api").Subrouter()
+\tapi.HandleFunc("/sessions", listItems)
+\tmux2 := http.NewServeMux()
+\tmux2.HandleFunc(base+"/x", listItems)
+}
+
+func Other(r *gin.Engine) {
+\t// v1 here is another group: the one in Register is not it.
+\tv1 := r.Group("/v2")
+\tv1.GET("/users/:id", handlers.ShowUser)
+}
+
+func Mounted(rg *gin.RouterGroup) {
+\trg.GET("/", listItems)
 }
 """
 
@@ -365,15 +383,47 @@ def test_go_routes():
         "* /legacy": "Go",
         "POST /items": "Go",
         "* /inline": "Go",
+        "* /static/": "Go",
         "GET /v1/users/:id": "Go",
+        "GET /v2/users/:id": "Go",
         "* /ping": "Go",
         "DELETE /users/:id": "Go",
         "GET /orders": "Go",
         "PUT /orders/{id}": "Go",
+        "GET /carts": "Go",
+        "POST /carts": "Go",
+        "* /api/sessions": "Go",
+        # A group another file mounts: the file's own Endpoint.
+        "GET ?/ (internal/api/routes.go)": "Go",
     }
     implements = _implements(result)
     # A function of the file, as a call to it resolves: the file, owner "".
     assert ("GET /items/{id}", "listItems", path, "") in implements
     assert ("GET /items/{id}", "listItems", "", None) in implements
     assert not [e for e in implements if e[0] == "* /inline"]
-    assert _stubs(result) == {"listItems", "Create", "ShowUser", "DeleteUser"}
+    assert _stubs(result) == {"listItems", "Create", "ShowUser", "DeleteUser", "files"}
+
+
+def test_go_calls_that_are_not_routes():
+    from devgraph.indexer.go.extractor import extract_go_file
+
+    source = """\
+package store
+
+import (
+\t"net/http"
+)
+
+func Sync(cache *Cache, kv KV, store *Store, client *http.Client, ct string, body []byte, value string) {
+\tvar v string
+\tcache.Get("/k", v)
+\tcache.Get("/k", &v)
+\tclient.Post("/upload", ct, body)
+\tstore.Delete("/tmp/file", force)
+\tkv.Put("/config/a", value)
+}
+"""
+    assert _endpoints(extract_go_file(source, "store/sync.go", "r")) == {}
+    # Without net/http or a router package, not even a router's call is read.
+    plain = "package x\n\nfunc F(r Router) {\n\tr.HandleFunc(\"/x\", F)\n}\n"
+    assert _endpoints(extract_go_file(plain, "x/x.go", "r")) == {}
