@@ -15,6 +15,13 @@ Endpoint IMPLEMENTS nothing.
 
 Only literal paths are read: a path built from a variable, a constant or a
 concatenation is skipped, and so is a route whose prefix is.
+
+A route on a router or group whose mount the file does not show (an
+Express router another file mounts, a gin `*gin.RouterGroup` parameter)
+has an unknown prefix: its Endpoint is the file's own, named
+`"<METHOD> ?<path> (<file>)"` (`unmounted_endpoint`), never merged with
+another file's route of the same path (every `GET /` would otherwise meet
+in one Endpoint that no request reaches as such).
 """
 
 from __future__ import annotations
@@ -37,6 +44,11 @@ def join_route(*parts: str) -> str:
     return "/" + "/".join(segment for part in parts for segment in part.split("/") if segment)
 
 
+def unmounted_endpoint(method: str, path: str, file_path: str) -> str:
+    """The Endpoint name of a route under a prefix its file doesn't know."""
+    return f"{method} ?{path} ({file_path})"
+
+
 def add_route(
     result: ExtractionResult,
     repo_id: str,
@@ -47,13 +59,16 @@ def add_route(
     handler: str | None = None,
     owner: str | None = None,
     pins: set[str] | None = None,
+    mounted: bool = True,
 ) -> None:
     """Add one route's Endpoint, handler stub and IMPLEMENTS edges to
     `result`. `handler` None is an inline handler: the Endpoint alone.
     `pins` None is a handler of this file, of `owner` (None: any owner);
     else the files the handler can be in (`calls.call_rows` pins), none
-    when nothing resolves it, which leaves the stub its only target."""
-    endpoint = f"{method} {path}"
+    when nothing resolves it, which leaves the stub its only target.
+    `mounted` False is a route under a prefix the file doesn't know
+    (`unmounted_endpoint`)."""
+    endpoint = f"{method} {path}" if mounted else unmounted_endpoint(method, path, file_path)
     result.nodes.append(GraphNode(
         label="Endpoint", repo_id=repo_id, name=endpoint, properties={"framework": framework, "source": file_path},
     ))

@@ -61,11 +61,11 @@ COMPOSE = """\
 FRAMEWORKS = {
     "express": (
         "services/shop/routes.ts", """\
-        import { Router } from 'express';
+        import express from 'express';
         import { listOrders } from './orders';
-        const router = Router();
-        router.get('/orders', listOrders);
-        router.post('/orders/:id/cancel', cancelOrder);
+        const app = express();
+        app.get('/orders', listOrders);
+        app.post('/orders/:id/cancel', cancelOrder);
         function cancelOrder(req, res) {}
         """,
         "services/shop/orders.ts", "export function listOrders(req, res) {}\n",

@@ -76,7 +76,7 @@ def test_express_routes_and_handlers():
     assert {r.origin for r in result.relationships if r.rel_type == "IMPLEMENTS"} == {"src/routes/users.ts"}
 
 
-def test_express_router_mounted_elsewhere_keeps_its_own_paths():
+def test_express_router_mounted_elsewhere_is_the_files_own_endpoint():
     source = """\
 const { Router } = require('express');
 const orders = Router();
@@ -85,7 +85,9 @@ async function listOrders(req, res) {}
 module.exports = orders;
 """
     result = extract_js_file(source, "routes/orders.js", "r")
-    assert _endpoints(result) == {"GET /": "Express"}
+    # Its prefix is another file's: never merged with another file's `GET /`.
+    assert _endpoints(result) == {"GET ?/ (routes/orders.js)": "Express"}
+    assert ("GET ?/ (routes/orders.js)", "listOrders", "routes/orders.js", "") in _implements(result)
 
 
 def test_express_needs_a_router_receiver_and_a_handler():
@@ -99,8 +101,8 @@ userRouter.patch('/users/:id', update);
 const update = (req, res) => {};
 """
     result = extract_js_file(source, "app.js", "r")
-    assert _endpoints(result) == {"PATCH /users/:id": "Express"}
-    assert ("PATCH /users/:id", "update", "app.js", "") in _implements(result)
+    assert _endpoints(result) == {"PATCH ?/users/:id (app.js)": "Express"}
+    assert ("PATCH ?/users/:id (app.js)", "update", "app.js", "") in _implements(result)
 
 
 def test_koa_and_fastify_routes():
@@ -115,8 +117,31 @@ function show(ctx) {}
 function create(request, reply) {}
 """
     result = extract_js_file(source, "server.js", "r")
-    assert _endpoints(result) == {"GET /users/:id": "Express", "POST /items": "Express"}
+    # The Koa router is mounted where the file doesn't show (`app.use(router.routes())`).
+    assert _endpoints(result) == {"GET ?/users/:id (server.js)": "Express", "POST /items": "Express"}
     assert _stubs(result) == {"show", "create"}
+
+
+def test_express_router_held_by_a_class():
+    source = """\
+import express, { Router } from 'express';
+
+export class UsersController {
+  private router = Router();
+
+  constructor(private app = express()) {
+    this.app = express();
+    this.router.get('/:id', this.show);
+    this.app.use('/users', this.router);
+    this.other.get('/ignored', this.show);
+  }
+
+  show(req, res) {}
+}
+"""
+    result = extract_js_file(source, "src/users.controller.ts", "r")
+    assert _endpoints(result) == {"GET /users/:id": "Express"}
+    assert _stubs(result) == {"show"}
 
 
 SPRING_JAVA = """\

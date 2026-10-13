@@ -255,10 +255,14 @@ def render(f: File) -> str:
             for name, calls in f.funcs.items()
         ]
         if f.routes:
-            # An Express router: a handler of the file, an imported one, a
-            # namespace's member, a name nothing defines, or inline.
-            parts.append("\nconst router = Router();\n")
-            parts += [f"router.{method}('{path}', {handler});\n" for method, path, handler in f.routes]
+            # An Express app's routes, a router's it mounts and an unmounted
+            # router's: a handler of the file, an imported one, a namespace's
+            # member, a name nothing defines, or inline.
+            parts.append("\nconst app = express();\nconst router = Router();\napp.use('/r', router);\n")
+            parts += [
+                f"{TS_ROUTERS.get(path, 'app')}.{method}('{path}', {handler});\n"
+                for method, path, handler in f.routes
+            ]
         return "".join(parts) or "export {};\n"
     if f.kind == "compose":
         return "services:\n" + "".join(f"  {s}:\n    image: {i}\n" for s, i in f.services.items()) if f.services \
@@ -483,7 +487,9 @@ KT_CLASSES = ["Clock", "Stopwatch", "Tag", "Index"]
 # Routes: Express paths (some meeting a Spring controller's under /api) and
 # handlers beyond the file's own functions, and Spring's mappings.
 ROUTE_METHODS = ["get", "post", "put"]
-TS_ROUTE_PATHS = ["/items", "/items/:id", "/api/items", "/api/orders", "/health"]
+TS_ROUTE_PATHS = ["/items", "/items/:id", "/api/items", "/api/orders", "/health", "/loose"]
+# `/items/:id` goes on the router the file mounts, `/loose` on one another file mounts.
+TS_ROUTERS = {"/items/:id": "router", "/loose": "looseRouter"}
 JAVA_ROUTE_PATHS = ["/items", "/orders", "/items/{id}"]
 TS_HANDLERS = ["f", "g", "u.g", "missing", "(req, res) => res.end()"]
 SPRING_MAPPINGS = {"get": "GetMapping", "post": "PostMapping", "put": "PutMapping"}
