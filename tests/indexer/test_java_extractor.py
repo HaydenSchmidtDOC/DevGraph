@@ -430,3 +430,24 @@ class Foo {
         (r.from_label, r.from_name, r.rel_type, r.to_label, r.to_name) for r in result.relationships
     }
     assert ("Class", "Foo", "CONTAINS", "Function", "Foo") in rel_tuples
+
+
+def test_record_and_its_methods_are_extracted():
+    """A record is a Class like any other type, with its methods, its compact
+    canonical constructor and its interfaces (audit 4 item 5)."""
+    source_code = """package shop;
+
+record Point(int x) implements Comparable<Point> {
+    Point { check(x); }
+    int twice() { return scale(2); }
+    int scale(int factor) { return x * factor; }
+    static void check(int value) {}
+}
+"""
+    result = extract_java_file(source_code, "src/main/java/shop/Point.java", "test_repo")
+    nodes = {(n.label, n.name) for n in result.nodes}
+    assert {("Class", "Point"), ("Function", "Point"), ("Function", "twice"), ("Function", "scale"),
+            ("Function", "check")} <= nodes
+    rels = {(r.from_name, r.rel_type, r.to_name) for r in result.relationships}
+    assert {("Point", "CONTAINS", "twice"), ("Point", "EXTENDS", "Comparable"), ("twice", "CALLS", "scale"),
+            ("Point", "CALLS", "check")} <= rels

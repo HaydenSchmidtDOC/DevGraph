@@ -45,12 +45,13 @@ logger = logging.getLogger(__name__)
 
 _JAVA_LANGUAGE = Language(tsjava.language())
 
-# class_declaration, interface_declaration, and enum_declaration are all
-# treated as "Class" nodes (Java has no separate interface/enum label in
-# the graph schema, matching how the generic Class/Function/Module labels
-# are meant to generalize across languages).
-_TYPE_DECL_TYPES = ("class_declaration", "interface_declaration", "enum_declaration")
-_METHOD_DECL_TYPES = ("method_declaration", "constructor_declaration")
+# class_declaration, interface_declaration, enum_declaration and
+# record_declaration are all treated as "Class" nodes (Java has no separate
+# interface/enum/record label in the graph schema, matching how the generic
+# Class/Function/Module labels are meant to generalize across languages). A
+# record's compact canonical constructor (`P { ... }`) is a constructor.
+_TYPE_DECL_TYPES = ("class_declaration", "interface_declaration", "enum_declaration", "record_declaration")
+_METHOD_DECL_TYPES = ("method_declaration", "constructor_declaration", "compact_constructor_declaration")
 
 
 def _make_parser() -> Parser:
@@ -256,7 +257,7 @@ class _JavaResolver:
         self.fields: dict[str, dict[str, str | None]] = {}
 
         def walk(node: Node) -> None:
-            if node.type in _TYPE_DECL_TYPES or node.type == "record_declaration":
+            if node.type in _TYPE_DECL_TYPES:
                 name_node = node.child_by_field_name("name")
                 body = node.child_by_field_name("body")
                 if name_node is not None:
@@ -476,7 +477,7 @@ def _method_scope(node: Node, classes: list[str], resolver: _JavaResolver, sourc
                 if p.type == "identifier":
                     scope[_text(p, source)] = None
         for child in n.children:
-            if child.type not in (*_TYPE_DECL_TYPES, "record_declaration"):
+            if child.type not in _TYPE_DECL_TYPES:
                 walk(child)
 
     walk(node)
@@ -489,7 +490,7 @@ def _invocations(body: Node) -> list[Node]:
     found: list[Node] = []
 
     def walk(node: Node) -> None:
-        if node.type in (*_TYPE_DECL_TYPES, "record_declaration", *_METHOD_DECL_TYPES):
+        if node.type in (*_TYPE_DECL_TYPES, *_METHOD_DECL_TYPES):
             return
         if node.type == "method_invocation":
             found.append(node)
