@@ -46,6 +46,7 @@ class Symbol:
     kind: str  # "Function" or "Class"
     name: str
     container: str | None  # the innermost enclosing class's name
+    owner: str  # its node's `owner` (common.member_owner), "" at the top level
     ordinal: int  # position among symbols with the same (kind, container, name)
     start_line: int
     end_line: int
@@ -126,18 +127,24 @@ def extract_symbols(path: str, text: str, max_symbols: int | None = None) -> lis
         group = (node.label, container, node.name)
         ordinal = seen.get(group, 0)
         seen[group] = ordinal + 1
-        symbols.append(Symbol(node.label, node.name, container, ordinal, start, end, "\n".join(lines[start - 1 : end])))
+        symbols.append(Symbol(
+            node.label, node.name, container, node.properties.get("owner") or "", ordinal, start, end,
+            "\n".join(lines[start - 1 : end]),
+        ))
     return symbols
 
 
 def _entry(symbol: Symbol) -> dict:
-    return {
+    entry = {
         "kind": symbol.kind,
         "name": symbol.name,
         "container": symbol.container,
         "start_line": symbol.start_line,
         "end_line": symbol.end_line,
     }
+    if symbol.owner:
+        entry["owner"] = symbol.owner  # tells the graph's same-named siblings of the file apart
+    return entry
 
 
 def _order(entry: dict) -> tuple:

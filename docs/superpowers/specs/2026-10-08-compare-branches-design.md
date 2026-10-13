@@ -95,6 +95,9 @@ which functions or classes were added, removed or edited.
     - A `changed` entry also carries `old_start_line` and `old_end_line`, its
       lines on the base side.
     - `container` is the enclosing class's name, or `null`.
+    - A member of a type also carries `owner`, its graph node's (the types
+      it is declared in, dotted; a Go method's receiver type), which keys
+      its callers' lookup (C8).
   - `<caller>` is `{"caller", "caller_type", "caller_file", "calls", "calls_file"}`.
 - **The old stub keys go.** `added_in_b`, `removed_in_b`, `changed` and `note`
   only ever held empty lists and a placeholder, so nothing can depend on
@@ -455,17 +458,22 @@ cut to 100 characters and quoted, as `tools._echo` does. The messages:
 ### C8: impacted callers
 
 - **Targets:** every `changed` or `removed` symbol listed (not `added` ones:
-  nothing indexed can call them yet), as `{"name", "file"}` pairs. `file` is
-  the file's path.
+  nothing indexed can call them yet), as `{"name", "file", "owner"}`. `file` is
+  the file's path, `owner` the symbol's (its entry's, "" when it has none;
+  see 2026-10-08-graph-accuracy-design.md, owner identity), so a changed
+  `A.save` does not list the callers of `B.save` in the same file. A node
+  an index older than owners wrote (no `owner`) matches whatever the target's.
 - **One read-only query,** a per-label union so that each branch uses the
   `(repo_id, name, file)` key:
 
   ```cypher
   UNWIND $targets AS t
   CALL (t) {
-    MATCH (n:Function {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+    MATCH (n:Function {repo_id: $repo_id, name: t.name, file: t.file})
+    WHERE n.owner IS NULL OR n.owner = t.owner RETURN n
     UNION
-    MATCH (n:Class {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+    MATCH (n:Class {repo_id: $repo_id, name: t.name, file: t.file})
+    WHERE n.owner IS NULL OR n.owner = t.owner RETURN n
   }
   MATCH (caller)-[:CALLS]->(n)
   WHERE caller.repo_id = $repo_id

@@ -95,7 +95,7 @@ import tree_sitter_rust as tsrust
 from tree_sitter import Language, Node, Parser
 
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, member_owner, own_edges, owned_pin
 from devgraph.indexer.resolver_config import ResolverConfig
 
 logger = logging.getLogger(__name__)
@@ -358,6 +358,9 @@ class _RustResolver:
         self.types: set[str] = set()
         self.functions: set[str] = set()
         self.methods: dict[str, set[str]] = {}
+        # The methods an `impl` or trait of the type defines with a body here:
+        # Functions owned by the type (common.member_owner).
+        self.bodied: dict[str, set[str]] = {}
         self.fields: dict[str, dict[str, _Type]] = {}
         self.uses: list[tuple[tuple, list[str], str | None, bool]] = []  # (scope, segs, binding, glob)
         self.mod_decls: list[tuple[tuple, str]] = []
@@ -426,6 +429,8 @@ class _RustResolver:
                 name = child.child_by_field_name("name")
                 if name is not None and type_name:
                     self.methods.setdefault(type_name, set()).add(_text(name, self.source))
+                    if child.type == "function_item":
+                        self.bodied.setdefault(type_name, set()).add(_text(name, self.source))
                 if child.type == "function_item":
                     self._collect_functions(child.child_by_field_name("body") or child)
 
@@ -568,7 +573,8 @@ class _RustResolver:
         """The pins of the function a path call names (`a::f`, `T::f`,
         `crate::m::T::f`), None when it is outside the repository."""
         if len(segs) == 2 and segs[0] in self.types:
-            return [self.file_path]
+            # The type's own associated function when an impl here defines it.
+            return [owned_pin(self.file_path, segs[0] if segs[1] in self.bodied.get(segs[0], set()) else None)]
         if len(segs) == 2 and segs[0] in STOP_TYPES["rust"] and self._lookup(self.bindings, segs[0], scope) is None:
             return None
         start = self._start(segs, scope)
@@ -841,7 +847,9 @@ class _CallCollector:
                 owner = typed.segs[-1]
                 if len(typed.segs) == 1 and owner in resolver.types:
                     if name in resolver.methods.get(owner, set()):
-                        self.found.append((name, [resolver.file_path], False))
+                        # The type's own method when an impl here defines it.
+                        defined = owner if name in resolver.bodied.get(owner, set()) else None
+                        self.found.append((name, [owned_pin(resolver.file_path, defined)], False))
                         return
                     # A trait's method, or one an impl in another file adds.
                 else:
@@ -898,12 +906,12 @@ def extract_rust_file(
 
     def _record_calls(
         body: Node, caller_label: str, caller_name: str, caller_class: str | None, scope: tuple,
-        self_type: _Type | None, variables: dict,
+        self_type: _Type | None, variables: dict, caller_owner: str | None = None,
     ) -> None:
         collector = _CallCollector(resolver, scope, self_type, variables)
         collector.walk(body, source_bytes)
         for name, pins, member in collector.found:
-            sites.add(caller_label, caller_name, caller_class, name, pins, member)
+            sites.add(caller_label, caller_name, caller_class, name, pins, member, caller_owner)
 
     def visit_block(block: Node, parent_name: str | None, parent_label: str, scope: tuple) -> None:
         """Visit statements in a block (source_file, impl/trait body, fn
@@ -946,7 +954,7 @@ def extract_rust_file(
                 # scope, same as Python's module/class-body-level handling.
                 caller_class = parent_name if parent_label == "Class" else None
                 _record_calls(node, parent_label, parent_name if parent_name else file_path, caller_class, scope,
-                              None, {})
+                              None, {}, "" if parent_label == "Class" else None)
 
     def _visit_type_item(node: Node, kind: str, parent_name: str | None, parent_label: str) -> None:
         name_node = node.child_by_field_name("name")
@@ -958,6 +966,7 @@ def extract_rust_file(
             "type": "class",
             "kind": kind,
             "file": file_path,
+            "owner": "",
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -990,6 +999,7 @@ def extract_rust_file(
             "type": "class",
             "kind": "trait",
             "file": file_path,
+            "owner": "",
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -1047,15 +1057,21 @@ def extract_rust_file(
                 if child.type == "function_item":
                     _visit_function(child, target_name, "Class", scope)
 
-    def _visit_function(node: Node, parent_name: str | None, parent_label: str, scope: tuple) -> None:
+    def _visit_function(
+        node: Node, parent_name: str | None, parent_label: str, scope: tuple, parent_owner: str = "",
+    ) -> None:
+        """`parent_owner` is the parent's own owner: "" for a type (types are
+        top-level) or the Module, a function's for a nested fn."""
         name_node = node.child_by_field_name("name")
         if name_node is None:
             return
         func_name = _text(name_node, source_bytes)
+        owner = member_owner(parent_label, parent_name, parent_owner)
 
         properties: dict = {
             "type": "function",
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -1075,6 +1091,8 @@ def extract_rust_file(
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=parent_owner if parent_label != "Module" else None,
+                to_owner=owner,
             )
         )
 
@@ -1083,12 +1101,12 @@ def extract_rust_file(
             caller_class = parent_name if parent_label == "Class" else None
             self_type = _Type((parent_name,)) if parent_label == "Class" and parent_name else None
             _record_calls(body_node, "Function", func_name, caller_class, scope, self_type,
-                          _function_scope(node, resolver, self_type))
+                          _function_scope(node, resolver, self_type), owner)
 
             # Nested fn items (rare, but Tree-sitter walks these fine).
             for child in body_node.children:
                 if child.type == "function_item":
-                    _visit_function(child, func_name, "Function", scope)
+                    _visit_function(child, func_name, "Function", scope, owner)
 
     visit_block(root, None, "Module", resolver.module)
     result.relationships += sites.rows(file_path, repo_id)

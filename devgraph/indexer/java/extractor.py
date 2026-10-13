@@ -38,6 +38,7 @@ from devgraph.indexer.common import (
     GraphNode,
     GraphRelationship,
     own_edges,
+    owned_pin,
 )
 from devgraph.indexer.jvm import JvmLayout, type_segment
 
@@ -255,13 +256,17 @@ class _JavaResolver:
         self.methods: dict[str, set[str]] = {}
         self.bases: dict[str, list[str]] = {}
         self.fields: dict[str, dict[str, str | None]] = {}
+        # What each type's members are owned by (_owner_of): one per type of the name in the file.
+        self.owners: dict[str, set[str]] = {}
 
-        def walk(node: Node) -> None:
+        def walk(node: Node, enclosing: tuple[str, ...]) -> None:
             if node.type in _TYPE_DECL_TYPES:
                 name_node = node.child_by_field_name("name")
                 body = node.child_by_field_name("body")
                 if name_node is not None:
                     name = _text(name_node, source)
+                    enclosing = (name, *enclosing)
+                    self.owners.setdefault(name, set()).add(_owner_of(enclosing))
                     self.methods.setdefault(name, set())
                     self.bases[name] = _extract_supertype_names(node, source)
                     fields = self.fields.setdefault(name, {})
@@ -277,9 +282,9 @@ class _JavaResolver:
                                 if field_name is not None:
                                     fields[_text(field_name, source)] = declared
             for child in node.children:
-                walk(child)
+                walk(child, enclosing)
 
-        walk(root)
+        walk(root, ())
         # Imports: a simple name -> its class's package and class (the
         # first capitalised segment picks the file); static members the same;
         # wildcard packages, and the classes of static wildcards.
@@ -358,12 +363,15 @@ class _JavaResolver:
     def member_pins(self, cls: str, method: str, seen: frozenset = frozenset()) -> list[str] | None:
         """Where `method` of the class `cls` can be: this file when the class
         is declared here and has it, else its bases', else the class's own
-        file for a class declared elsewhere."""
+        file for a class declared elsewhere. A method of this file names its
+        class as its owner (common.owned_pin), unless two classes of the file
+        share the name."""
         if cls in seen:
             return None
         if cls in self.methods:
             if method in self.methods[cls]:
-                return [self.file_path]
+                owners = self.owners.get(cls, set())
+                return [owned_pin(self.file_path, next(iter(owners)) if len(owners) == 1 else None)]
             pins = []
             for base in self.bases.get(cls, []):
                 pins += self.member_pins(base, method, seen | {cls}) or []
@@ -484,6 +492,13 @@ def _method_scope(node: Node, classes: list[str], resolver: _JavaResolver, sourc
     return scope
 
 
+def _owner_of(classes: list[str] | tuple[str, ...]) -> str:
+    """The owner (common.member_owner) of a member of the innermost of
+    `classes`, the enclosing classes innermost first: their names, outermost
+    first, dotted ("" for a top-level type)."""
+    return ".".join(reversed(classes))
+
+
 def _invocations(body: Node) -> list[Node]:
     """The `method_invocation`s of a body, not descending into nested
     classes (attributed separately)."""
@@ -546,11 +561,14 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
     ) -> None:
         scope = _method_scope(node, classes, resolver, source_bytes)
         caller_class = classes[0] if classes else None
+        # A method is owned by its classes; a class (a field initializer's
+        # caller) by the classes around it; the Module by nothing.
+        caller_owner = {"Function": _owner_of(classes), "Class": _owner_of(classes[1:])}.get(caller_label)
         for call in _invocations(body):
             site = resolver.resolve(call, classes, scope)
             if site is not None:
                 name, pins, member = site
-                sites.add(caller_label, caller_name, caller_class, name, pins, member)
+                sites.add(caller_label, caller_name, caller_class, name, pins, member, caller_owner)
 
     def visit_block(block: Node, parent_name: str | None, parent_label: str, classes: list[str]) -> None:
         """Visit statements in a block (module/class/interface/enum body);
@@ -584,6 +602,7 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
             "type": "class",
             "decorators": _extract_annotation_names(node, source_bytes),
             "file": file_path,
+            "owner": _owner_of(classes),
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -605,6 +624,8 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=_owner_of(classes[1:]) if parent_label == "Class" else None,
+                to_owner=_owner_of(classes),
             )
         )
 
@@ -617,6 +638,7 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
                     to_label="Class",
                     to_name=supertype,
                     repo_id=repo_id,
+                    from_owner=_owner_of(classes),
                 )
             )
 
@@ -636,6 +658,7 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
             "type": "function",
             "decorators": _extract_annotation_names(node, source_bytes),
             "file": file_path,
+            "owner": _owner_of(classes),
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -657,6 +680,8 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=_owner_of(classes[1:]) if parent_label == "Class" else None,
+                to_owner=_owner_of(classes),
             )
         )
 

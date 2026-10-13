@@ -68,7 +68,10 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # edges (see devgraph/indexer/common.py `name_ref_properties`). `mkeys` is a
 # code symbol's match keys, which a pin's `@` flag tests (see `split_pin`),
 # and `mkeys_stale` marks one whose edges a batch has yet to relink after
-# they changed (see graph/engine.py `write_match_keys`).
+# they changed (see graph/engine.py `write_match_keys`). A code symbol's
+# `owner` (its identity within its file, see FILE_SCOPED_LABELS) is not
+# reserved: only a node with a `file` has one, which no declared type's node
+# has, so a declared `owner` field (a runbook's front matter) stays the user's.
 RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
     "repo_id", "name", "file", "source_file", "source", "sources", "claims", "extractor",
     "name_refs", "name_ref_targets", "name_ref_sources", "mkeys", "mkeys_stale",
@@ -101,7 +104,11 @@ _REPO_SCOPED_LABELS = tuple(label for label in NODE_LABELS if label != "Reposito
 # (Endpoint, Database, ...), so it doesn't need the extra key component —
 # and Container deliberately stays bare-name keyed too, since it represents
 # a shared base image, not a per-file entity (see
-# indexer/dispatch.py:_upsert_container_result).
+# indexer/dispatch.py:_upsert_container_result). Within a file a node is
+# also keyed by its `owner`, the dotted chain of the types it is declared in
+# ("" at the top level, and always for a Service), so two classes' same-named
+# methods in one file are two nodes (see devgraph/indexer/common.py
+# `member_owner`).
 FILE_SCOPED_LABELS = ("Class", "Function", "Service")
 
 # The labels a file's own nodes can carry, by the property that names the
@@ -134,11 +141,14 @@ def constraint_statements() -> list[str]:
     """Cypher to create uniqueness constraints for every node label.
 
     Idempotent — `IF NOT EXISTS` makes this safe to run on every startup.
-    Class/Function additionally DROP their old two-property constraint
-    first: changing a constraint's definition in place isn't something
-    `CREATE CONSTRAINT ... IF NOT EXISTS` can do (a same-named constraint
-    with a different definition is just left alone), so an explicit drop is
-    the only way an already-provisioned Neo4j instance picks up the new key.
+    Class/Function/Service additionally DROP their older two- and
+    three-property constraints first: changing a constraint's definition in
+    place isn't something `CREATE CONSTRAINT ... IF NOT EXISTS` can do (a
+    same-named constraint with a different definition is just left alone),
+    so an explicit drop is the only way an already-provisioned Neo4j
+    instance picks up the new key. A node an older index wrote without
+    `owner` is outside the new constraint until the automatic rescan gives
+    it one (see graph/engine.py `_replace_file_nodes_tx`).
     """
     statements = [
         "CREATE CONSTRAINT repository_id IF NOT EXISTS "
@@ -147,9 +157,10 @@ def constraint_statements() -> list[str]:
     for label in _REPO_SCOPED_LABELS:
         if label in FILE_SCOPED_LABELS:
             statements.append(f"DROP CONSTRAINT {label.lower()}_repo_name IF EXISTS")
+            statements.append(f"DROP CONSTRAINT {label.lower()}_repo_name_file IF EXISTS")
             statements.append(
-                f"CREATE CONSTRAINT {label.lower()}_repo_name_file IF NOT EXISTS "
-                f"FOR (n:{label}) REQUIRE (n.repo_id, n.name, n.file) IS UNIQUE"
+                f"CREATE CONSTRAINT {label.lower()}_repo_name_file_owner IF NOT EXISTS "
+                f"FOR (n:{label}) REQUIRE (n.repo_id, n.name, n.file, n.owner) IS UNIQUE"
             )
         else:
             statements.append(
@@ -163,9 +174,11 @@ def lookup_index_statements() -> list[str]:
     """Cypher for the RANGE lookup indexes the built-in queries seek.
 
     A `(repo_id, name)` index on each file-scoped label: their uniqueness
-    constraint indexes `(repo_id, name, file)`, which a bare-name match (an
-    edge's target end, `describe_node`) can't seek, so without these it
-    scans every node of the label; the same on Cache, which has no
+    constraint indexes `(repo_id, name, file, owner)`, which a bare-name
+    match (an edge's target end, `describe_node`) can't seek, so without
+    these it scans every node of the label; and a `(repo_id, name, file)`
+    one, which an end pinned to a file seeks (its `owner` filtered after);
+    the same on Cache, which has no
     constraint (named so it never reads as a user type's generated index).
     Module's `(repo_id, dir)`, `(repo_id, dir_name)` and `(repo_id,
     basename)`, which a pinned IMPORTS row seeks (see engine._end_match). Then the provenance indexes a per-file re-index seeks (`(repo_id, file)`,
@@ -177,6 +190,11 @@ def lookup_index_statements() -> list[str]:
     """
     statements = [
         f"CREATE INDEX {label.lower()}_repo_name_lookup IF NOT EXISTS FOR (n:{label}) ON (n.repo_id, n.name)"
+        for label in FILE_SCOPED_LABELS
+    ]
+    statements += [
+        f"CREATE INDEX {label.lower()}_repo_name_file_lookup IF NOT EXISTS "
+        f"FOR (n:{label}) ON (n.repo_id, n.name, n.file)"
         for label in FILE_SCOPED_LABELS
     ]
     statements.append("CREATE INDEX cache_repo_name_index IF NOT EXISTS FOR (n:Cache) ON (n.repo_id, n.name)")
@@ -201,6 +219,9 @@ NAME_REF_SEP = "\x1f"
 NAME_REF_PIN_SEP = "\x1e"
 #: A target pin to the file-less node ("" as a `to_file`).
 NAME_REF_FILELESS = "\x1d"
+#: Joins a file pin and the owner of the target in that file, in a
+#: resolver's *owned pin* (see devgraph/indexer/common.py `owned_pin`).
+OWNER_PIN_SEP = "\x1c"
 
 
 # Path pins: a relationship row's `to_file` (see devgraph/indexer/common.py

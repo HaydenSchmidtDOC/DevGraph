@@ -1511,7 +1511,7 @@ function nodeDetailsQuery(ele) {
   // \u001f is the separator identity_key joins on (engine.py) -- chosen
   // because it cannot occur in a label, repo id, name or path. Written as an
   // escape here rather than as the literal control character it is.
-  const [label, repoId, name, file] = key.split("\u001f");
+  const [label, repoId, name, file, owner] = key.split("\u001f");
   // The label is interpolated, not matched as a value, so nothing but a plain
   // identifier may reach the query. It always is one -- it comes from
   // labels(n)[0] -- but a query built by concatenation shouldn't rely on that.
@@ -1525,6 +1525,9 @@ function nodeDetailsQuery(ele) {
     // first -- the same collision the file-scoped key exists to prevent.
     file === undefined ? "n.file IS NULL" : `n.file = "${escapeCypherStr(file)}"`,
   ];
+  // A file-scoped key carries the owner only when it isn't "" (two classes'
+  // same-named methods in one file); a key without one is a top-level symbol.
+  if (file !== undefined) where.push(`coalesce(n.owner, "") = "${escapeCypherStr(owner || "")}"`);
   return `MATCH (n:${label}) WHERE ${where.join(" AND ")} RETURN labels(n) AS labels, properties(n) AS props LIMIT 1`;
 }
 function showDetailsCard(ele, isEdge) {

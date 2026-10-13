@@ -11,7 +11,9 @@ Python files import and call in every style the call resolution reads
 (docs/superpowers/specs/2026-10-10-python-call-resolution-design.md): plain,
 aliased, relative and star imports, a package re-exporting from its module,
 a src/ layout, calls through modules, aliases and untyped values, and
-`self.shared()` reaching a base in the same or another file.
+`self.shared()` reaching a base in the same or another file. A class `Twin`
+comes and goes beside another class of a file, repeating its method names, so
+same-named methods of one file are told apart by their owner.
 
 TS files import through a tsconfig path alias, and the resolver configuration
 changes under them: the tsconfig is rewritten (its own `paths`, `extends` to
@@ -140,9 +142,11 @@ class File:
 
 
 def py_class(name: str, base: str | None) -> str:
-    """A class whose `act` calls `self.shared()`, which only `Base` defines."""
+    """A class whose `act` calls `self.shared()`, which only `Base` and
+    `Twin` define: a `Twin` beside another class in one file repeats its
+    method names (two `act`s, maybe two `shared`s, each its own node)."""
     head = f"\n\nclass {name}({base}):\n" if base else f"\n\nclass {name}:\n"
-    shared = "\n    def shared(self):\n        return 0\n" if name == "Base" else ""
+    shared = "\n    def shared(self):\n        return 0\n" if name in ("Base", "Twin") else ""
     return head + "    def act(self):\n        return self.shared()\n" + shared
 
 
@@ -442,7 +446,7 @@ CPP_METHODS = ["Widget::draw", "Widget::size", "Gadget::run", "Missing::stop", "
 JAVA_ROOTS = ["java/", "lib/src/main/java/"]
 SERVICES = ["api", "web", "worker", "db"]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
-EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing"]
+EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing", "act", "shared"]
 CODE = ("py", "rs", "go", "java", "ts", "kt", "cs", "cpp")
 # Free functions, and C# methods (one class per file, so a method moves to another class);
 # a Java method stays in its class.
@@ -509,6 +513,20 @@ class Fuzz:
             return f"remove base of {cls} in {path}", {path}
         f.bases[cls] = self.rng.choice([b for b in BASES[f.kind] if b != cls])
         return f"set base {cls}({f.bases[cls]}) in {path}", {path}
+
+    def op_twin(self):
+        """A Python file with a class gains or loses a second class, `Twin`,
+        whose methods share the first one's names."""
+        path = self._pick(lambda f: f.kind == "py" and f.bases)
+        if not path:
+            return None
+        f = self.files[path]
+        if "Twin" in f.bases:
+            del f.bases["Twin"]
+            return f"remove class Twin from {path}", {path}
+        beside = sorted(f.bases)[0]
+        f.bases["Twin"] = None
+        return f"add class Twin beside {beside} in {path}", {path}
 
     def op_import(self):
         path = self._pick(lambda f: f.kind in IMPORTS)
@@ -848,7 +866,7 @@ class Fuzz:
         "rename", "delete", "restore", "service", "from", "move_image", "mention", "link", "supersedes", "pin", "pin",
         "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module", "method", "method",
         "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move", "cs_namespace", "cs_move_class",
-        "cs_dup_class",
+        "cs_dup_class", "twin", "twin",
     ]
 
     def draw(self):
@@ -1001,17 +1019,19 @@ class _Scripted:
 def test_cs_rekey_ops_retract_callers_in_other_files(engine, repo_id, tmp_path, monkeypatch):
     """Each C# rekeying operation changes a node's match keys under edges
     other files' `@` pins gave it: the batch retracts those edges and the
-    graph still equals a fresh scan."""
+    graph still equals a fresh scan. A method that moves to another class
+    is another node (its owner changed), not a rekeyed one: its old node
+    goes with its edges, and the new one is added and relinked."""
     retracted = []
     real = GraphEngine.write_match_keys
 
     def write_match_keys(self, repo, nodes):
-        for label, name, file, _keys, retract in nodes:
+        for label, name, file, owner, _keys, retract in nodes:
             if retract:
                 retracted.append(self.run_cypher(
-                    f"MATCH (a)-[r:CALLS|IMPORTS]->(b:{label} {{repo_id: $r, name: $n, file: $f}}) "
+                    f"MATCH (a)-[r:CALLS|IMPORTS]->(b:{label} {{repo_id: $r, name: $n, file: $f, owner: $o}}) "
                     "WHERE coalesce(a.file, a.source_file) <> $f RETURN count(r) AS n",
-                    {"r": repo, "n": name, "f": file},
+                    {"r": repo, "n": name, "f": file, "o": owner},
                 )[0]["n"])
         return real(self, repo, nodes)
 
@@ -1023,21 +1043,22 @@ def test_cs_rekey_ops_retract_callers_in_other_files(engine, repo_id, tmp_path, 
     engine.upsert_repository(repo_id, repo_id, str(root))
     full_scan(engine, repo_id, root, docs_path=DOCS, mentions_enabled=True)
     steps = [
-        # Jobs.cs's Run becomes Root's (Shop:Jobs to Shop:Root) under Program's and Wide's Jobs.Run.
-        ("cs_move_class", [["cs/Jobs.cs", "cs/Global.cs"]]),
-        # Base.cs's class is named Jobs: its Helper's key changes under Block's and Wide's p.Helper.
-        ("cs_dup_class", [["cs/Global.cs", "cs/Models/Base.cs"]]),
+        # Jobs.cs's Run becomes Root's (owner Jobs to Root): another node, under Program's and Wide's Jobs.Run.
+        ("cs_move_class", [["cs/Jobs.cs", "cs/Global.cs"]], False),
+        # Base.cs's class is named Jobs: its Helper is another node, under Block's and Wide's p.Helper.
+        ("cs_dup_class", [["cs/Global.cs", "cs/Models/Base.cs"]], False),
         # Tidy's extension key moves to the global namespace under Block's and Use's _jobs.Tidy.
-        ("cs_namespace", ["cs/JobsExtensions.cs", ""]),
+        ("cs_namespace", ["cs/JobsExtensions.cs", ""], True),
         # Jobs (now in Global.cs) moves from the global namespace to Shop under the Jobs.Run calls.
-        ("cs_namespace", ["cs/Global.cs", "Shop"]),
+        ("cs_namespace", ["cs/Global.cs", "Shop"], True),
     ]
-    for step, (op, picks) in enumerate(steps):
+    for step, (op, picks, rekeys) in enumerate(steps):
         fuzz.rng = _Scripted(picks)
         description, touched = getattr(fuzz, f"op_{op}")()
         retracted.clear()
         fuzz.write(root, touched)
         index_paths(engine, repo_id, root, {root / rel for rel in touched}, docs_path=DOCS, mentions_enabled=True)
-        assert any(retracted), f"{description}: no edge from another file retracted"
+        if rekeys:
+            assert any(retracted), f"{description}: no edge from another file retracted"
         check(engine, repo_id, root, "scripted", step, [description])
 

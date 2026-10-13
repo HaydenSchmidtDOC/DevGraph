@@ -1297,7 +1297,7 @@ def test_pass_two_omits_name_refs(engine, repo_id, tmp_path, monkeypatch):
     index_paths(engine, repo_id, tmp_path, {a})
     modules = [n for (nodes,) in calls for n in nodes if n["label"] == "Module"]
     assert modules and not any("name_refs" in n["properties"] for n in modules)
-    assert _module_name_refs(engine, repo_id, "a.py")[0] == ["CALLS\x1fFunction\x1fmain\x1fa.py\x1fFunction\x1fhelper\x1f\x1f\x1fname"]
+    assert _module_name_refs(engine, repo_id, "a.py")[0] == ["CALLS\x1fFunction\x1fmain\x1fa.py\x1fFunction\x1fhelper\x1f\x1f\x1f\x1fname"]
 
 
 def test_name_refs_written_empty(engine, repo_id, tmp_path):
@@ -1344,7 +1344,7 @@ def test_name_ref_relink_benchmark(engine, repo_id, monkeypatch, pinned):
                 "source_file": path,
                 "name_refs": [
                     f"CALLS\x1fFunction\x1fcaller\x1f{path}\x1fFunction\x1f{t}\x1f" + (
-                        f"\x1f{t}.py\x1elib/.\x1e/x/{t}.py\x1elib/\x1fpin" if pinned else ""
+                        f"\x1f\x1f{t}.py\x1elib/.\x1e/x/{t}.py\x1elib/\x1fpin" if pinned else ""
                     )
                     for t in targets
                 ],
@@ -1360,7 +1360,7 @@ def test_name_ref_relink_benchmark(engine, repo_id, monkeypatch, pinned):
     engine.upsert_nodes([
         {"label": "Function", "repo_id": repo_id, "name": n, "properties": {"file": new_file}} for n in added_names
     ])
-    added = {("Function", n, new_file) for n in added_names}
+    added = {("Function", n, new_file, "") for n in added_names}
 
     profiles = []
     if os.environ.get("CI"):

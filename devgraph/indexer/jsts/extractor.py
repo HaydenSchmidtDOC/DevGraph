@@ -73,7 +73,9 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    member_owner,
     own_edges,
+    owned_pin,
 )
 from devgraph.indexer.resolver_config import ResolverConfig
 
@@ -458,6 +460,14 @@ class _ClassInfo:
     methods: set[str] = field(default_factory=set)
     bases: list[str] = field(default_factory=list)
     fields: dict[str, list[str]] = field(default_factory=dict)  # field -> the types it holds
+    # What its members are owned by (common.member_owner): the enclosing
+    # classes' names and its own, one per class of the name in the file.
+    members_owners: set[str] = field(default_factory=set)
+
+    def members_owner(self) -> str | None:
+        """The owner of the class's members, None when several classes of
+        the file share its name."""
+        return next(iter(self.members_owners)) if len(self.members_owners) == 1 else None
 
 
 @dataclass
@@ -571,9 +581,11 @@ def _class_table(root: Node, source: bytes) -> dict[str, _ClassInfo]:
     properties)."""
     classes: dict[str, _ClassInfo] = {}
 
-    def walk(node: Node) -> None:
+    def walk(node: Node, owner: str) -> None:
         if node.type in _CLASS_TYPES and (name := node.child_by_field_name("name")) is not None:
             info = classes.setdefault(_text(name, source), _ClassInfo())
+            owner = member_owner("Class", _text(name, source), owner)
+            info.members_owners.add(owner)
             info.bases += _extract_base_class_names(node, source)
             body = node.child_by_field_name("body")
             for member in body.named_children if body is not None else []:
@@ -594,9 +606,9 @@ def _class_table(root: Node, source: bytes) -> dict[str, _ClassInfo]:
                     if held or constructed:
                         info.fields[_text(member_name, source)] = held or [constructed]
         for child in node.children:
-            walk(child)
+            walk(child, owner)
 
-    walk(root)
+    walk(root, "")
     return classes
 
 
@@ -726,10 +738,11 @@ class _CallResolver:
 
     def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
         """Where `this.method()` (own) or `super.method()` in `cls` can go:
-        this file when `cls` or an in-file base defines it, the files of an
-        imported base (not followed further); None when nothing does."""
+        this file when `cls` or an in-file base defines it, as that class's
+        member (common.owned_pin), the files of an imported base (not
+        followed further); None when nothing does."""
         if own and method in self.classes[cls].methods:
-            return [self.file_path]
+            return [owned_pin(self.file_path, self.classes[cls].members_owner())]
         seen = {cls}
         pending = list(self.classes[cls].bases)
         while pending:
@@ -739,7 +752,7 @@ class _CallResolver:
                     continue
                 seen.add(base)
                 if method in self.classes[base].methods:
-                    return [self.file_path]
+                    return [owned_pin(self.file_path, self.classes[base].members_owner())]
                 pending += self.classes[base].bases
             elif (pins := self._class_pins(base, method)) is not None:
                 return pins
@@ -866,11 +879,18 @@ def extract_js_file(
         file_path, bindings, _class_table(root, source_bytes), _defined_functions(root, source_bytes),
         not module, source_bytes,
     )
-    # (caller label, caller name) -> callee name -> [pins, bare?, caller classes, every bare site a member call?]
-    calls: dict[tuple[str, str], dict[str, list]] = {}
+    # (caller label, caller name, caller owner)
+    #   -> callee name -> [pins, bare?, caller classes, every bare site a member call?]
+    calls: dict[tuple[str, str, str | None], dict[str, list]] = {}
+    # The owner (common.member_owner) of the class or function being visited,
+    # innermost last; "" at the Module.
+    owners = [""]
 
-    def record_calls(caller_label: str, caller_name: str, body: Node, scope: _Scope, caller_class: str | None) -> None:
-        by_name = calls.setdefault((caller_label, caller_name), {})
+    def record_calls(
+        caller_label: str, caller_name: str, body: Node, scope: _Scope, caller_class: str | None,
+        caller_owner: str | None,
+    ) -> None:
+        by_name = calls.setdefault((caller_label, caller_name, caller_owner), {})
         for func in _call_functions(body):
             for name, pin, member in resolver.resolve(func, scope):
                 entry = by_name.setdefault(name, [set(), False, set(), True])
@@ -937,7 +957,10 @@ def extract_js_file(
         if node.type == "export_statement":
             return  # declaration-less export - nothing left to scan for calls
         caller_class = parent_name if parent_label == "Class" else None
-        record_calls(parent_label, parent_name if parent_name else file_path, node, scope, caller_class)
+        record_calls(
+            parent_label, parent_name if parent_name else file_path, node, scope, caller_class,
+            owners[-1] if parent_label != "Module" else None,
+        )
 
     def _visit_nested_defs(container: Node, parent_name: str, parent_label: str, scope: _Scope) -> None:
         """Visit a function body's direct statement children for nested
@@ -972,9 +995,12 @@ def extract_js_file(
         class_name = _text(name_node, source_bytes)
         base_classes = _extract_base_class_names(node, source_bytes)
 
+        parent_owner = owners[-1] if parent_label != "Module" else None
+        owner = member_owner(parent_label, parent_name, parent_owner)
         class_properties: dict = {
             "type": "class",
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -996,6 +1022,8 @@ def extract_js_file(
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=parent_owner,
+                to_owner=owner,
             )
         )
         for base_class in base_classes:
@@ -1007,6 +1035,7 @@ def extract_js_file(
                     to_label="Class",
                     to_name=base_class,
                     repo_id=repo_id,
+                    from_owner=owner,
                 )
             )
 
@@ -1014,6 +1043,11 @@ def extract_js_file(
         if body_node is None:
             return
         class_scope = _Scope(class_name, scope.params, scope.types)
+        owners.append(owner)
+        _visit_members(body_node, class_name, class_scope)
+        owners.pop()
+
+    def _visit_members(body_node: Node, class_name: str, class_scope: _Scope) -> None:
         for member in body_node.named_children:
             if member.type == "method_definition":
                 m_name_node = member.child_by_field_name("name")
@@ -1036,9 +1070,12 @@ def extract_js_file(
     ) -> None:
         func_name = _text(name_node, source_bytes)
 
+        parent_owner = owners[-1] if parent_label != "Module" else None
+        owner = member_owner(parent_label, parent_name, parent_owner)
         func_properties: dict = {
             "type": "function",
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -1060,6 +1097,8 @@ def extract_js_file(
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=parent_owner,
+                to_owner=owner,
             )
         )
 
@@ -1070,7 +1109,7 @@ def extract_js_file(
         caller_class = parent_name if parent_label == "Class" else None
         params, param_types, _fields = _parameters(node, source_bytes)
         inner = scope.nested(params, {**param_types, **_local_types(body_node, source_bytes)})
-        record_calls("Function", func_name, body_node, inner, caller_class)
+        record_calls("Function", func_name, body_node, inner, caller_class, owner)
 
         # Nested function/class declarations - only meaningful when the body
         # is an actual statement block; a concise arrow body (`() => expr`)
@@ -1078,16 +1117,20 @@ def extract_js_file(
         # _visit_nested_defs (definitions only), NOT _visit_statement, since
         # the call scan above already covers every call in this body.
         if body_node.type == "statement_block":
+            owners.append(owner)
             _visit_nested_defs(body_node, func_name, "Function", inner)
+            owners.pop()
 
     module_scope = _Scope(types=_local_types(root, source_bytes))
     for node in root.named_children:
         _visit_statement(node, None, "Module", module_scope)
-    for (caller_label, caller_name), by_name in sorted(calls.items()):
+    for (caller_label, caller_name, caller_owner), by_name in sorted(
+        calls.items(), key=lambda item: (item[0][0], item[0][1], item[0][2] or "")
+    ):
         for name, (pins, bare, classes, no_self) in sorted(by_name.items()):
             result.relationships.extend(call_rows(
                 caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id,
-                no_self=no_self,
+                no_self=no_self, caller_owner=caller_owner,
             ))
 
     return own_edges(result, file_path)

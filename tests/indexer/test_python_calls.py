@@ -279,7 +279,9 @@ def test_a_package_row_leaves_out_the_exact_files_and_this_file():
     assert prefix.exclude == sorted({"pkg.py", "pkg/__init__.py", "pkg/pkg.py", "pkg/pkg/__init__.py", "pkg/user.py"})
 
 
-def test_call_sites_collapse_to_one_caller_class_per_callee():
+def test_same_named_callers_in_two_classes_are_two_callers():
+    """Each class's `run` is its own node (its owner), so each keeps its own
+    caller_class instead of collapsing into one caller."""
     source = """\
         class B:
             def run(self):
@@ -290,7 +292,7 @@ def test_call_sites_collapse_to_one_caller_class_per_callee():
             def run(self):
                 obj.work()
         """
-    assert calls(source) == {("run", "work", None, "name", "A")}
+    assert calls(source) == {("run", "work", None, "name", "A"), ("run", "work", None, "name", "B")}
 
 
 # --- live ---------------------------------------------------------------------

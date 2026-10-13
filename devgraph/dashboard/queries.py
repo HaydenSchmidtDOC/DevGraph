@@ -73,7 +73,7 @@ def graph_slice(
     """
     nodes = f"MATCH (n:`{label}` {{repo_id: $repo_id}}) " if label else engine.repository_nodes([repo_id])
     node_rows = engine.run_cypher(
-        nodes + "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, n.file AS file "
+        nodes + "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, n.file AS file, n.owner AS owner "
         "LIMIT $limit",
         {"repo_id": repo_id, "repo_ids": [repo_id], "limit": limit},
     )

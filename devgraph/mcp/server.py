@@ -897,9 +897,11 @@ def build_server(
         """Fetch a Function or Class's actual source text and full docstring (when present),
         using the graph's last-indexed line range. Reads live from disk — rescan first if
         the file may have changed since the last index. When several nodes share the name,
-        returns status "ambiguous" with candidates ({label, name, file}) instead of
-        picking one: pass file (repo-relative path) to choose. A file that is not valid
-        UTF-8 is decoded with replacement characters, and a notice says so."""
+        returns status "ambiguous" with candidates ({label, name, file}, and owner for a
+        method) instead of picking one: pass file (repo-relative path) to choose, and for
+        same-named methods of two classes in one file name the method with its class,
+        "A.save". A file that is not valid UTF-8 is decoded with replacement characters,
+        and a notice says so."""
         return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo, file)
 
     @server.tool(annotations=_READ_ONLY)
@@ -912,16 +914,19 @@ def build_server(
         relationship_types: list[str] | None = None,
         neighbor_labels: list[str] | None = None,
         max_per_type: int = 10,
+        owner: str | None = None,
     ) -> dict[str, Any]:
         """Look at one node: its properties and its relationships grouped by type and
         direction, with each neighbour's identity. A file, folder or docs node is named by
-        its repo-relative path or id. An ambiguous name returns candidates; call again with
-        label and file. Each ref in the result is the next call's arguments. One hop per
-        call, at most 50 neighbours per type; direction, relationship_types, neighbor_labels
-        and max_per_type narrow it."""
+        its repo-relative path or id; a method may be named with its class, "A.save". An
+        ambiguous name returns candidates; call again with label and file. A method's or
+        nested class's ref carries owner (its class), which picks it from a same-named
+        method of another class in its file. Each ref in the result is the next call's
+        arguments. One hop per call, at most 50 neighbours per type; direction,
+        relationship_types, neighbor_labels and max_per_type narrow it."""
         return devgraph_tools.describe_node(
             engine, repo_id, name, label, file, direction, relationship_types, neighbor_labels, max_per_type,
-            declared_labels=devgraph_tools.declared_node_labels(registry, repo_id),
+            declared_labels=devgraph_tools.declared_node_labels(registry, repo_id), owner=owner,
         )
 
     if settings.enable_run_cypher:

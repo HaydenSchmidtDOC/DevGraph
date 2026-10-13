@@ -118,7 +118,7 @@ def test_name_refs_store_each_set_of_at_keys_once():
     from devgraph.indexer.dispatch import _with_scopes_merged
 
     refs = name_ref_properties(_cs_rows({"a/f.cs", "/.?.cs^@N:A,.:A", "lib/.@N:A,.:A", "/.?.cs^@B:Y"}))["name_refs"]
-    head = ["CALLS", "Function", "main", "app.cs", "Function", "f", ""]
+    head = ["CALLS", "Function", "main", "app.cs", "Function", "f", "", ""]
     assert all(entry.count("N:A") <= 1 for entry in refs)
     assert sorted(parse_name_ref(entry) for entry in refs) == [
         (head, ["/.?.cs^@.:A,N:A", "lib/.@.:A,N:A"], "pin"),
@@ -126,7 +126,7 @@ def test_name_refs_store_each_set_of_at_keys_once():
         (head, ["a/f.cs"], "pin"),
     ]
     # An entry without keys has no such field, as before.
-    assert [len(entry.split("\x1f")) for entry in sorted(refs)] == [10, 10, 9]
+    assert [len(entry.split("\x1f")) for entry in sorted(refs)] == [11, 11, 10]
     assert _with_scopes_merged([parse_name_ref(entry) for entry in refs]) == [
         (head, ["/.?.cs^@.:A,N:A", "/.?.cs^@B:Y", "a/f.cs", "lib/.@.:A,N:A"], "pin"),
     ]
@@ -151,8 +151,8 @@ def test_relink_takes_a_calls_entries_of_different_at_keys_together():
             self.rels += rels
 
     engine = Engine()
-    _relink_name_refs(engine, "r", {("Function", "f", "lib/a.cs"), ("Function", "f", "lib/b.cs")}, set(), {
-        ("Function", "f", "lib/a.cs"): ("N:A",), ("Function", "f", "lib/b.cs"): ("N:B",),
+    _relink_name_refs(engine, "r", {("Function", "f", "lib/a.cs", ""), ("Function", "f", "lib/b.cs", "")}, set(), {
+        ("Function", "f", "lib/a.cs", ""): ("N:A",), ("Function", "f", "lib/b.cs", ""): ("N:B",),
     })
     assert sorted((rel["to_file"], rel["properties"]["confidence"]) for rel in engine.rels) == [
         ("lib/a.cs", "resolved"), ("lib/b.cs", "package"),

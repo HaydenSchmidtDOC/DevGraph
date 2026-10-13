@@ -76,6 +76,7 @@ from devgraph.indexer.common import (
     GraphNode,
     GraphRelationship,
     own_edges,
+    owned_pin,
 )
 from devgraph.indexer.jvm import JvmLayout, type_segment
 
@@ -437,12 +438,16 @@ class _KotlinResolver:
         self.methods: dict[str, set[str]] = {}
         self.bases: dict[str, list[str]] = {}
         self.properties: dict[str, dict[str, str | None]] = {}
+        # What each class's members are owned by (_owner_of): one per class of the name in the file.
+        self.owners: dict[str, set[str]] = {}
 
-        def walk(node: Node, owner: str | None) -> None:
+        def walk(node: Node, owner: str | None, enclosing: tuple[str, ...] = ()) -> None:
             if node.type in _TYPE_DECL_TYPES:
                 name_node = node.child_by_field_name("name") or _child_of_type(node, "identifier")
                 if name_node is not None:
                     owner = _text(name_node, source)
+                    enclosing = (owner, *enclosing)
+                    self.owners.setdefault(owner, set()).add(_owner_of(enclosing))
                     self.methods.setdefault(owner, set())
                     self.bases[owner] = _extract_supertype_names(node, source)
                     props = self.properties.setdefault(owner, {})
@@ -466,7 +471,7 @@ class _KotlinResolver:
                     if owner is not None:
                         self.methods[owner].add(_text(name_node, source))
             for child in node.children:
-                walk(child, owner)
+                walk(child, owner, enclosing)
 
         for node in top_level:
             walk(node, None)
@@ -573,7 +578,8 @@ class _KotlinResolver:
             return None
         if cls in self.methods:
             if method in self.methods[cls]:
-                return [self.file_path]
+                owners = self.owners.get(cls, set())
+                return [owned_pin(self.file_path, next(iter(owners)) if len(owners) == 1 else None)]
             pins = []
             for base in self.bases.get(cls, []):
                 pins += self.member_pins(base, method, seen | {cls}) or []
@@ -688,6 +694,13 @@ def _kotlin_scope(node: Node, classes: list[str], resolver: _KotlinResolver, sou
     return scope
 
 
+def _owner_of(classes: list[str] | tuple[str, ...]) -> str:
+    """The owner (common.member_owner) of a member of the innermost of
+    `classes`, the enclosing classes innermost first: their names, outermost
+    first, dotted ("" at the top level)."""
+    return ".".join(reversed(classes))
+
+
 def _kotlin_calls(body: Node) -> list[Node]:
     """The `call_expression`s of a body, not descending into nested
     function, class or object declarations (attributed separately)."""
@@ -754,11 +767,14 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
     def _record_calls(node: Node, body: Node, caller_label: str, caller_name: str, classes: list[str]) -> None:
         scope = _kotlin_scope(node, classes, resolver, source_bytes)
         caller_class = classes[0] if classes else None
+        # A function is owned by its classes; a class (a property
+        # initializer's caller) by the classes around it; the Module by nothing.
+        caller_owner = {"Function": _owner_of(classes), "Class": _owner_of(classes[1:])}.get(caller_label)
         for call in _kotlin_calls(body):
             site = resolver.resolve(call, classes, scope)
             if site is not None:
                 name, pins, member = site
-                sites.add(caller_label, caller_name, caller_class, name, pins, member)
+                sites.add(caller_label, caller_name, caller_class, name, pins, member, caller_owner)
 
     def _visit_type_decl(
         node: Node, parent_name: str | None, parent_label: str, prev_sibling: Node | None, classes: list[str]
@@ -776,6 +792,7 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
             "type": "class",
             "decorators": _extract_annotation_names(node, source_bytes),
             "file": file_path,
+            "owner": _owner_of(classes),
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -797,6 +814,8 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=_owner_of(classes[1:]) if parent_label == "Class" else None,
+                to_owner=_owner_of(classes),
             )
         )
 
@@ -809,6 +828,7 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
                     to_label="Class",
                     to_name=supertype,
                     repo_id=repo_id,
+                    from_owner=_owner_of(classes),
                 )
             )
 
@@ -832,6 +852,7 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
             "type": "function",
             "decorators": _extract_annotation_names(node, source_bytes),
             "file": file_path,
+            "owner": _owner_of(classes),
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -853,6 +874,9 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=_owner_of(classes[1:]) if parent_label == "Class" else _owner_of(classes)
+                if parent_label == "Function" else None,
+                to_owner=_owner_of(classes),
             )
         )
 

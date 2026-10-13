@@ -16,6 +16,7 @@ from devgraph.graph.schema import (
     NAME_REF_FILELESS,
     NAME_REF_PIN_SEP,
     NAME_REF_SEP,
+    OWNER_PIN_SEP,
     PIN_CONFIDENCE,
     PIN_KINDS,
     pin_kind,
@@ -33,13 +34,16 @@ __all__ = [
     "GraphNode",
     "GraphRelationship",
     "best_pin",
+    "member_owner",
     "module_pin_name",
     "name_ref_properties",
     "own_edges",
+    "owned_pin",
     "parse_name_ref",
     "pin_confidence",
     "pin_excludes",
     "pin_matches",
+    "split_owned_pin",
 ]
 
 
@@ -94,6 +98,12 @@ class GraphRelationship:
 
     `no_self` keeps the edge off its own source: a call `x.m()` on a receiver
     nothing types, inside `m` itself, is not a recursive call.
+
+    `from_owner`/`to_owner` tell same-named siblings of one file apart (two
+    classes' `save`, see `member_owner`): on an end pinned to a file, a
+    non-None owner must equal the node's `owner`, and None matches every
+    node of the name there. `own_edges` fills them in where the file alone
+    decides them.
     """
 
     from_label: str
@@ -108,6 +118,8 @@ class GraphRelationship:
     origin: str | None = None
     exclude: list[str] | None = None
     no_self: bool = False
+    from_owner: str | None = None
+    to_owner: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -123,6 +135,8 @@ class GraphRelationship:
             "origin": self.origin,
             "exclude": self.exclude,
             "no_self": self.no_self,
+            "from_owner": self.from_owner,
+            "to_owner": self.to_owner,
         }
 
 
@@ -140,24 +154,65 @@ class ExtractionResult:
         }
 
 
+def member_owner(parent_label: str, parent_name: str | None, parent_owner: str | None) -> str:
+    """The `owner` of a Class or Function declared directly in a `parent_label`
+    named `parent_name` whose own owner is `parent_owner`: a member of a class
+    is owned by the class's owner chain and the class (`Outer.Inner`), a
+    function nested in a function by that function's owner, and anything at
+    a Module's (or a namespace's) top level by nothing, "". Two same-named
+    members of one file with different owners are two nodes (graph/engine.py
+    `_upsert_nodes_tx`)."""
+    if parent_label == "Class" and parent_name:
+        return f"{parent_owner}.{parent_name}" if parent_owner else parent_name
+    if parent_label == "Function":
+        return parent_owner or ""
+    return ""
+
+
+def owned_pin(file: str, owner: str | None) -> str:
+    """A resolver's pin to the members of `owner` named like the callee in
+    `file`, the writer's own file (`calls.call_rows` turns it back into
+    `to_file` and `to_owner`); `file` itself when the owner is unknown."""
+    return f"{file}{OWNER_PIN_SEP}{owner}" if owner is not None else file
+
+
+def split_owned_pin(pin: str | None) -> tuple[str | None, str | None]:
+    """An `owned_pin` as (pin, owner); any other pin as (pin, None)."""
+    if pin is None or OWNER_PIN_SEP not in pin:
+        return pin, None
+    file, owner = pin.split(OWNER_PIN_SEP, 1)
+    return file, owner
+
+
 def own_edges(result: ExtractionResult, file_path: str) -> ExtractionResult:
     """Mark `result` as `file_path`'s own edges, in place, and return it.
 
     Pins the source end (`from_file`) of every relationship whose source
     `(label, name)` is one of the result's nodes with `file == file_path`,
     and stamps `origin = file_path` on every relationship. An already-set
-    `from_file` is left as it is.
+    `from_file` is left as it is. A pinned source whose `from_owner` is
+    unset gets the owner of the file's one node of that label and name, if
+    there is one (with several it stays unset, matching them all); a
+    CONTAINS into the file whose `to_owner` is unset gets the one its parent
+    implies (`member_owner`), once the parent's owner is known.
     """
-    owned = {
-        (node.label, node.name) for node in result.nodes if node.properties.get("file") == file_path
-    }
+    owners: dict[tuple[str, str], set[str]] = {}
+    for node in result.nodes:
+        if node.properties.get("file") == file_path:
+            owners.setdefault((node.label, node.name), set()).add(node.properties.get("owner") or "")
     for rel in result.relationships:
         rel.origin = file_path
-        if rel.from_file is None and (rel.from_label, rel.from_name) in owned:
+        source = (rel.from_label, rel.from_name)
+        if rel.from_file is None and source in owners:
             rel.from_file = file_path
+        if rel.from_file == file_path and rel.from_owner is None and len(owners.get(source, ())) == 1:
+            (rel.from_owner,) = owners[source]
+        if (
+            rel.rel_type == "CONTAINS" and rel.to_file == file_path and rel.to_owner is None
+            and (rel.from_owner is not None or rel.from_label not in FILE_SCOPED_LABELS)
+        ):
+            rel.to_owner = member_owner(rel.from_label, rel.from_name, rel.from_owner)
     return result
-
-
 
 
 def pin_matches(pin: str | None, path: str, keys: Iterable[str] = ()) -> bool:
@@ -260,8 +315,9 @@ def name_ref_properties(rels: list[dict]) -> dict:
 
     `name_refs` holds one entry per edge source and target name, sorted, as
     `rel_type, from_label, from_name, from_file, to_label, to_name,
-    caller_class, pins, confidence` joined by NAME_REF_SEP (an unset field is
-    empty). `pins` is empty for an unpinned target, else the target's
+    caller_class, from_owner, pins, confidence` joined by NAME_REF_SEP (an
+    unset field is empty; `from_owner` is the source's owner, so two
+    same-named sources of one file are two entries). `pins` is empty for an unpinned target, else the target's
     `to_file`s joined by NAME_REF_PIN_SEP, with NAME_REF_FILELESS for "";
     a pinned and an unpinned edge of the same source and name are separate
     entries. A pin's `@` flag keeps only its "@" there, and its match keys
@@ -287,11 +343,13 @@ def name_ref_properties(rels: list[dict]) -> dict:
             and not (unpinned_source and rel["from_label"] in FILE_SCOPED_LABELS)
         ):
             continue
+        if rel.get("to_owner") is not None and to_file != rel.get("origin"):
+            raise ValueError(f"only a target in the writer's own file takes an owner: {rel!r}")
         properties = rel.get("properties") or {}
         to_file, scope = unscoped_pin(to_file) if to_file is not None else (None, ())
         key = (
             rel["rel_type"], rel["from_label"], rel["from_name"], rel.get("from_file") or "",
-            rel["to_label"], rel["to_name"], properties.get("caller_class") or "",
+            rel["to_label"], rel["to_name"], properties.get("caller_class") or "", rel.get("from_owner") or "",
             # Unpinned entries are kept apart by confidence; a pinned entry's
             # pins each carry their kind's.
             None if to_file is not None else properties.get("confidence") or "", scope,
@@ -331,14 +389,15 @@ def pin_confidence(pin: str, entry_confidence: str) -> str:
 
 
 def parse_name_ref(entry: str) -> tuple[list[str], list[str] | None, str]:
-    """An entry of `name_refs` as (its first seven fields, its target pins
-    (None when unpinned, "" for the file-less node), its confidence), each
-    `@` pin with the entry's match keys back on it. An entry written before
-    pins (seven fields) is unpinned, with no confidence."""
+    """An entry of `name_refs` as (its first eight fields, the eighth its
+    source's owner, its target pins (None when unpinned, "" for the
+    file-less node), its confidence), each `@` pin with the entry's match
+    keys back on it. An entry written before pins (seven fields) is
+    unpinned and unowned, with no confidence."""
     fields = entry.split(NAME_REF_SEP)
     if len(fields) == 7:
-        return fields, None, ""
-    scope = fields.pop() if len(fields) == 10 else ""
+        return [*fields, ""], None, ""
+    scope = fields.pop() if len(fields) == 11 else ""
     *head, encoded, confidence = fields
     pins = [
         "" if pin == NAME_REF_FILELESS else pin + scope if pin.endswith("@") and split_pin(pin + scope).scope else pin

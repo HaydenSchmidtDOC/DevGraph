@@ -2,7 +2,8 @@
 
 `graph_snapshot` is the plan's comparison projection: every node as
 (sorted labels, name, its file, a hash of its non-volatile properties) and
-every edge as (label, name, file, type, label, name, file, origins, its other properties), leaving out `Commit` and
+every edge as (label, name, file, type, label, name, file, origins, its other properties, source owner,
+target owner), leaving out `Commit` and
 `Repository` nodes and their edges. `fresh_snapshot` is the same projection of
 a fresh `full_scan` of the same files, and `wait_until_equal` polls the live
 graph until it matches.
@@ -94,8 +95,9 @@ def graph_snapshot(engine, repo_id: str) -> tuple[list, list]:
         "MATCH (a {repo_id: $r})-[x]->(b {repo_id: $r}) "
         "WHERE NOT a:Commit AND NOT a:Repository AND NOT b:Commit AND NOT b:Repository "
         "RETURN labels(a)[0] AS a, a.name AS an, coalesce(a.file, a.source_file, a.path, '') AS af, "
+        "coalesce(a.owner, '') AS ao, "
         "type(x) AS t, labels(b)[0] AS b, b.name AS bn, coalesce(b.file, b.source_file, b.path, '') AS bf, "
-        "coalesce(x.origins, []) AS o, properties(x) AS p",
+        "coalesce(b.owner, '') AS bo, coalesce(x.origins, []) AS o, properties(x) AS p",
         {"r": repo_id},
     )
     return (
@@ -105,7 +107,7 @@ def graph_snapshot(engine, repo_id: str) -> tuple[list, list]:
         sorted(
             (
                 e["a"], e["an"] or "", e["af"], e["t"], e["b"], e["bn"] or "", e["bf"], tuple(e["o"]),
-                tuple(sorted((k, v) for k, v in e["p"].items() if k != "origins")),
+                tuple(sorted((k, v) for k, v in e["p"].items() if k != "origins")), e["ao"], e["bo"],
             )
             for e in edges
         ),

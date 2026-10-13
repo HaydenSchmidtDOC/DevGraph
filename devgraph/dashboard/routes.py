@@ -439,7 +439,7 @@ def build_router(
                         "id": n["id"],
                         "label": n["label"],
                         "name": n["name"],
-                        "key": identity_key(n["label"], repo_id, n["name"], n["file"]),
+                        "key": identity_key(n["label"], repo_id, n["name"], n["file"], n.get("owner")),
                     }
                 }
                 for n in nodes

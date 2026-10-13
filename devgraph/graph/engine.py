@@ -261,14 +261,20 @@ _UNCLAIM_EDGE = (
 # (MODIFIES from git history, MENTIONS from docs, cross-file CALLS/IMPORTS),
 # which a blanket delete-then-recreate silently destroyed. The Module node
 # (the file itself) is always kept and MERGEd in place. `keep` is a list of
-# [label, name] pairs for the file-scoped nodes the current extraction still
-# produces; an empty list (file now has no classes/functions) correctly
-# deletes them all.
+# [label, name, owner] triples for the file-scoped nodes the current
+# extraction still produces; an empty list (file now has no
+# classes/functions) correctly deletes them all. A node an index older than
+# owners wrote (with `file` but no `owner`) is given the owner "" first, so
+# a top-level symbol keeps its node and its incoming edges, and the upsert
+# below MERGEs onto it instead of beside it; a method's old node is not kept
+# (its owner is its class now) and is replaced.
 _REPLACE_OWNED_NODES_CYPHER = (
     _union(_owned_branches("= $f"))
     + "CALL (n) { MATCH (n)-[r]->() " + _UNCLAIM_EDGE + " } "
     "WITH n WHERE NOT n:Module "
-    "  AND NOT any(pair IN $keep WHERE labels(n)[0] = pair[0] AND n.name = pair[1]) "
+    "FOREACH (_ IN CASE WHEN n.file IS NOT NULL AND n.owner IS NULL THEN [1] ELSE [] END | SET n.owner = '') "
+    "WITH n WHERE NOT any(key IN $keep WHERE labels(n)[0] = key[0] AND n.name = key[1] "
+    "  AND coalesce(n.owner, '') = key[2]) "
     "DETACH DELETE n"
 )
 
@@ -678,16 +684,24 @@ def _group_nodes_by_label(
     node — see Design Brief follow-up on cross-file symbol collisions).
     Folding `file` into the MERGE key for just that population fixes the
     collision without touching the many labels that don't need it.
+    Within a file a node is also keyed by its `owner` (the types it is
+    declared in, "" at the top level), so two classes' same-named methods in
+    one file are two nodes; a file-scoped row always writes it, "" when the
+    extractor set none.
     """
     groups: dict[tuple[str, bool], list[dict[str, Any]]] = {}
     for node in nodes:
         properties = node.get("properties") or {}
         file = properties.get("file")
-        groups.setdefault((node["label"], _is_file_scoped(file)), []).append(
+        file_scoped = _is_file_scoped(file)
+        if file_scoped:
+            properties = {**properties, "owner": properties.get("owner") or ""}
+        groups.setdefault((node["label"], file_scoped), []).append(
             {
                 "repo_id": node["repo_id"],
                 "name": node["name"],
                 "file": file,
+                "owner": properties.get("owner"),
                 "properties": properties,
             }
         )
@@ -702,7 +716,7 @@ def _group_nodes_by_label(
 _IDENTITY_KEY_SEP = "\x1f"
 
 
-def identity_key(label: str, repo_id: str, name: str, file: str | None) -> str:
+def identity_key(label: str, repo_id: str, name: str, file: str | None, owner: str | None = None) -> str:
     """Stable, server-derived cache key for a node — independent of Neo4j's
     internal elementId(), which is a storage-slot pointer that shifts on any
     full re-index, restore, or delete/recreate and would silently invalidate
@@ -711,11 +725,15 @@ def identity_key(label: str, repo_id: str, name: str, file: str | None) -> str:
     Mirrors the MERGE key `_upsert_nodes_tx` actually writes with: file is
     folded in only when `_is_file_scoped` says this node's MERGE key includes
     it, so the dashboard never has to reimplement that conditional itself
-    (and risk it drifting from the Cypher above).
+    (and risk it drifting from the Cypher above). The `owner` is folded in
+    after it only when it is not "", so a top-level node keeps the key it
+    had before owners.
     """
     parts = [label, repo_id, name]
     if _is_file_scoped(file) and file is not None:
         parts.append(file)
+        if owner:
+            parts.append(owner)
     return _IDENTITY_KEY_SEP.join(parts)
 
 
@@ -761,9 +779,11 @@ def _group_rels_by_triple(
 
     Within a group, the edges out of one source with the same properties and
     `origin` (the file that wrote them, None for a writer that doesn't record
-    one) share a row, whose `targets` lists each edge's `to_name` and
-    `to_file`; for a path pin also `pin` (as graph/schema.py `pin_value`
-    gives it) and the pins its `exclude` leaves out, split into `ex_files`
+    one), and for a source pinned to a file the same `from_owner`, share a
+    row, whose `targets` lists each edge's `to_name` and `to_file`; for a
+    target pinned to a file also `to_owner`; for a path pin also `pin` (as
+    graph/schema.py `pin_value` gives it) and the pins its `exclude` leaves
+    out, split into `ex_files`
     (files, a list test) and `ex_pins` (other pins, as `pin_value` gives
     them); for a bare name also `no_self` (the edge may not end at its
     source). Only the keys its group's Cypher reads are sent. The source is
@@ -779,18 +799,23 @@ def _group_rels_by_triple(
             raise ValueError(f"a source end can't be pinned to a set of files: {from_file!r}")
         properties = rel.get("properties") or {}
         origin = rel.get("origin")
+        from_owner = rel.get("from_owner") if key[3] == "file" else None
         source = (
-            rel["repo_id"], rel["from_name"], from_file, origin, json.dumps(properties, sort_keys=True, default=str)
+            rel["repo_id"], rel["from_name"], from_file, from_owner, origin,
+            json.dumps(properties, sort_keys=True, default=str),
         )
         row = groups.setdefault(key, {}).setdefault(source, {
             "repo_id": rel["repo_id"],
             "from_name": rel["from_name"],
             "from_file": from_file,
+            "from_owner": from_owner,
             "properties": properties,
             "origin": origin,
             "targets": [],
         })
         target = {"to_name": rel["to_name"], "to_file": to_file}
+        if key[4] == "file":
+            target["to_owner"] = rel.get("to_owner")
         if key[4] in _PATH_PINS:
             # File pins are left out by a plain list test, other pins by `_pin_test`.
             excluded = rel.get("exclude") or []
@@ -806,7 +831,7 @@ def _group_rels_by_triple(
 def _upsert_nodes_tx(tx, nodes: list[dict[str, Any]]) -> None:
     for (label, file_scoped), rows in _group_nodes_by_label(nodes).items():
         merge_key = (
-            "{repo_id: row.repo_id, name: row.name, file: row.file}"
+            "{repo_id: row.repo_id, name: row.name, file: row.file, owner: row.owner}"
             if file_scoped
             else "{repo_id: row.repo_id, name: row.name}"
         )
@@ -909,7 +934,8 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     Module's `dir` (a directory pin), `dir_name` (a suffix-directory pin:
     the last name of its directory) or `basename` (a suffix pin), the row's
     `to_name`, and tests the Module's path. `also` is one more condition on
-    the match."""
+    the match. An end pinned to a file with an `{end}_owner` keeps only the
+    node of that `owner` (two classes' same-named methods in one file)."""
     conditions = [also] if also else []
     if pin in _PATH_PINS:
         if label == "Module":
@@ -939,6 +965,9 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     hint = f"USING INDEX SEEK {var}:{label}({keys}) " if label in FILE_SCOPED_LABELS else ""
     if pinned:
         match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name, file: {ref}.{end}_file}}) "
+        if label in FILE_SCOPED_LABELS:
+            # One of the file's same-named siblings, when the row names its owner.
+            conditions.insert(0, f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)")
     else:
         match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
         if pin == "fileless":
@@ -987,7 +1016,7 @@ def _replace_file_nodes_tx(
     # git-history MODIFIES edges silently vanished for any file re-indexed
     # after history was synced.
     keep = [
-        [node["label"], node["name"]]
+        [node["label"], node["name"], (node.get("properties") or {}).get("owner") or ""]
         for node in nodes
         if node["label"] != "Module"
         and (
@@ -1833,17 +1862,19 @@ class GraphEngine:
 
     def list_file_nodes(
         self, repo_id: str, files: list[str],
-    ) -> set[tuple[str, str, str, tuple[str, ...] | None, bool]]:
-        """Return (label, name, file, mkeys, stale) for every node whose file provenance
+    ) -> set[tuple[str, str, str, str, tuple[str, ...] | None, bool]]:
+        """Return (label, name, file, owner, mkeys, stale) for every node whose file provenance
         (`source_file`/`file`, a `Module` named by its path, or a schema
         provider's node, which its `path` owns) is one of `files`. `file` is
         that provenance: the Module's name, else `file`, `source_file` or
         `path`, in that order. A shared node one of `files` claims (in its
         `sources`: a `Container`, `Datastore`, `Endpoint` or handler stub) is
         returned with `file` "", besides any row for its own provenance.
-        `mkeys` is the node's match keys, sorted (None when it has none), and
-        `stale` whether a batch that changed them has yet to finish
-        relinking its edges (see write_match_keys).
+        `owner` is a code symbol's (graph/schema.py FILE_SCOPED_LABELS), ""
+        for any node without a `file`. `mkeys` is the node's match keys,
+        sorted (None when it has none), and `stale` whether a batch that
+        changed them has yet to finish relinking its edges (see
+        write_match_keys).
 
         index_paths snapshots this before re-indexing a batch so it can tell
         which nodes the batch *adds* -- only those can be the missing
@@ -1875,19 +1906,20 @@ class GraphEngine:
                 "WHERE owned OR claimed "
                 "RETURN DISTINCT labels(n)[0] AS label, n.name AS name, owned, claimed, "
                 "CASE WHEN n:Module THEN n.name ELSE coalesce(n.file, n.source_file, n.path) END AS file, "
+                "CASE WHEN n.file IS NULL THEN '' ELSE coalesce(n.owner, '') END AS owner, "
                 "n.mkeys AS mkeys, coalesce(n.mkeys_stale, false) AS stale",
                 repo_id=repo_id,
                 files=files,
             )
             records = [(r, None if r["mkeys"] is None else tuple(sorted(set(r["mkeys"])))) for r in result or []]
-            return {(r["label"], r["name"], r["file"], keys, r["stale"]) for r, keys in records if r["owned"]} | {
-                (r["label"], r["name"], "", keys, r["stale"]) for r, keys in records if r["claimed"]
-            }
+            return {
+                (r["label"], r["name"], r["file"], r["owner"], keys, r["stale"]) for r, keys in records if r["owned"]
+            } | {(r["label"], r["name"], "", "", keys, r["stale"]) for r, keys in records if r["claimed"]}
 
     def write_match_keys(
-        self, repo_id: str, nodes: list[tuple[str, str, str, tuple[str, ...] | None, bool]],
+        self, repo_id: str, nodes: list[tuple[str, str, str, str, tuple[str, ...] | None, bool]],
     ) -> None:
-        """Write these (label, name, file, mkeys, retract) nodes' match keys
+        """Write these (label, name, file, owner, mkeys, retract) nodes' match keys
         (`mkeys`; None removes them), which a batch's own node writes leave
         as they were until now, so a pin's `@` flag (graph/schema.py
         `split_pin`) only ever sees one node's old keys with its old edges.
@@ -1901,32 +1933,35 @@ class GraphEngine:
         format upgrade that rekeys a whole repository never holds one
         transaction over all of it. Every other edge stays."""
         self._per_label_chunk(
-            repo_id, [((label, name, file), {"mkeys": list(keys) if keys is not None else None, "retract": retract})
-                      for label, name, file, keys, retract in nodes],
+            repo_id, [((label, name, file, owner), {"mkeys": list(keys) if keys is not None else None,
+                                                    "retract": retract})
+                      for label, name, file, owner, keys, retract in nodes],
             "SET b.mkeys = row.mkeys, b.mkeys_stale = CASE WHEN row.retract THEN true END "
             f"WITH b, row WHERE row.retract MATCH ()-[r:{'|'.join(MATCH_KEY_EDGE_TYPES)}]->(b) DELETE r",
         )
 
-    def settle_match_keys(self, repo_id: str, nodes: list[tuple[str, str, str]]) -> None:
+    def settle_match_keys(self, repo_id: str, nodes: list[tuple[str, str, str, str]]) -> None:
         """Clear `mkeys_stale` (see write_match_keys) off these (label, name,
-        file) nodes once their edges are written again."""
+        file, owner) nodes once their edges are written again."""
         self._per_label_chunk(repo_id, [(node, {}) for node in nodes], "REMOVE b.mkeys_stale")
 
-    def _per_label_chunk(self, repo_id: str, nodes: list[tuple[tuple[str, str, str], dict]], update: str) -> None:
-        """Run `update` on each (label, name, file) node `b`, with its own
+    def _per_label_chunk(
+        self, repo_id: str, nodes: list[tuple[tuple[str, str, str, str], dict]], update: str
+    ) -> None:
+        """Run `update` on each (label, name, file, owner) node `b`, with its own
         `row` fields, RETRACT_NODES nodes per transaction (see
         write_match_keys), each consumed inside its retry (`_run`), so a
         chunk that fails, the last one included, raises."""
         groups: dict[str, list[dict[str, Any]]] = {}
-        for (label, name, file), fields in nodes:
-            groups.setdefault(label, []).append({"name": name, "file": file, **fields})
+        for (label, name, file, owner), fields in nodes:
+            groups.setdefault(label, []).append({"name": name, "file": file, "owner": owner, **fields})
         with self._driver.session() as session:
             for label, rows in sorted(groups.items()):
                 for start in range(0, len(rows), RETRACT_NODES):
                     _run(
                         session,
                         f"UNWIND $rows AS row MATCH (b:{label} {{repo_id: $repo_id, name: row.name, file: row.file}}) "
-                        f"USING INDEX SEEK b:{label}(repo_id, name, file) " + update,
+                        f"USING INDEX SEEK b:{label}(repo_id, name, file) WHERE b.owner = row.owner " + update,
                         repo_id=repo_id,
                         rows=rows[start:start + RETRACT_NODES],
                     )
@@ -2348,6 +2383,7 @@ def _graph_shaped(result: Any, max_rows: int | None = None) -> dict[str, Any]:
                         properties.get("repo_id") or "",
                         name,
                         properties.get("file"),
+                        properties.get("owner"),
                     ) if isinstance(name, str) else None,
                 }
             elif isinstance(value, Relationship):

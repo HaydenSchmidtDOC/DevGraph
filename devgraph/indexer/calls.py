@@ -9,7 +9,7 @@ module turns that into rows, so every language writes them the same way.
 from __future__ import annotations
 
 from devgraph.graph.schema import PIN_CONFIDENCE, pin_kind
-from devgraph.indexer.common import GraphRelationship, module_pin_name, pin_excludes
+from devgraph.indexer.common import GraphRelationship, module_pin_name, pin_excludes, split_owned_pin
 
 __all__ = ["STOP_METHODS", "STOP_TYPES", "CallSites", "call_rows", "import_rows"]
 
@@ -174,6 +174,7 @@ def call_rows(
     no_self: bool = False,
     rel_type: str = "CALLS",
     to_label: str = "Function",
+    caller_owner: str | None = None,
 ) -> list[GraphRelationship]:
     """One caller's CALLS rows to one callee name, every call site to it
     collapsed together, so no two rows can meet in one edge with different
@@ -184,22 +185,30 @@ def call_rows(
     call sites' enclosing classes. `no_self` (every bare call site was a
     member call on an untyped receiver) keeps the bare row off the caller
     itself. `rel_type` and `to_label` write another symbol reference the
-    same way (a Kotlin file's IMPORTS of a class or function)."""
+    same way (a Kotlin file's IMPORTS of a class or function).
+    `caller_owner` is the caller's owner (common.member_owner), and an owned
+    pin (common.owned_pin) a row to the callee's members of that owner in
+    the writer's file alone: as a file pin, it leaves out nothing another
+    pin of the call matches, and what it leaves out of a weaker pin is its
+    whole file."""
 
-    def row(to_file: str | None, confidence: str, exclude: list[str] | None = None) -> GraphRelationship:
+    def row(pin: str | None, confidence: str, exclude: list[str] | None = None) -> GraphRelationship:
         properties = {"confidence": confidence}
         if caller_class:
             properties["caller_class"] = caller_class
+        to_file, to_owner = split_owned_pin(pin)
+        if to_owner is not None and to_file != file_path:
+            raise ValueError(f"an owned pin names the writer's own file, not {to_file!r}")
         return GraphRelationship(
             from_label=caller_label, from_name=caller_name, rel_type=rel_type, to_label=to_label, to_name=name,
             repo_id=repo_id, properties=properties, to_file=to_file, exclude=exclude,
-            no_self=no_self and to_file is None,
+            no_self=no_self and to_file is None, from_owner=caller_owner, to_owner=to_owner,
         )
 
     if not pins:
         return [row(None, "name")] if bare else []
     return [
-        row(pin, PIN_CONFIDENCE[pin_kind(pin)], excluded or None)
+        row(pin, PIN_CONFIDENCE[pin_kind(pin)], sorted({split_owned_pin(other)[0] for other in excluded}) or None)
         for pin, excluded in pin_excludes(pins, file_path).items()
     ]
 
@@ -234,17 +243,20 @@ class CallSites:
     as `call_rows` wants them."""
 
     def __init__(self) -> None:
-        # (caller label, caller name) -> callee name -> [pins, bare?, caller classes, every bare site a member call?]
-        self._calls: dict[tuple[str, str], dict[str, list]] = {}
+        # (caller label, caller name, caller owner) -> callee name
+        #   -> [pins, bare?, caller classes, every bare site a member call?]
+        self._calls: dict[tuple[str, str, str | None], dict[str, list]] = {}
 
     def add(
         self, caller_label: str, caller_name: str, caller_class: str | None, name: str,
-        pins: list[str] | None, member: bool = False,
+        pins: list[str] | None, member: bool = False, caller_owner: str | None = None,
     ) -> None:
-        """One call site of `name`: to `pins`, or (None) by bare name, which
-        `member` (a call on a receiver nothing types) keeps off the caller
-        itself."""
-        entry = self._calls.setdefault((caller_label, caller_name), {}).setdefault(name, [set(), False, set(), True])
+        """One call site of `name` in the caller `caller_name` whose owner
+        is `caller_owner` (common.member_owner; None for a Module): to
+        `pins`, or (None) by bare name, which `member` (a call on a receiver
+        nothing types) keeps off the caller itself."""
+        key = (caller_label, caller_name, caller_owner)
+        entry = self._calls.setdefault(key, {}).setdefault(name, [set(), False, set(), True])
         if pins is None:
             entry[1] = True
             entry[3] = entry[3] and member
@@ -256,10 +268,12 @@ class CallSites:
     def rows(self, file_path: str, repo_id: str) -> list[GraphRelationship]:
         return [
             row
-            for (caller_label, caller_name), by_name in sorted(self._calls.items())
+            for (caller_label, caller_name, caller_owner), by_name in sorted(
+                self._calls.items(), key=lambda item: (item[0][0], item[0][1], item[0][2] or "")
+            )
             for name, (pins, bare, classes, no_self) in sorted(by_name.items())
             for row in call_rows(
                 caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id,
-                no_self=no_self,
+                no_self=no_self, caller_owner=caller_owner,
             )
         ]

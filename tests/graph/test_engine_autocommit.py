@@ -130,7 +130,7 @@ def test_records_failing_as_they_are_read_are_retried(monkeypatch):
 
 
 def _rekeyed(count: int) -> list:
-    return [("Function", f"f{i}", "a.cs", ("Ns:A",), True) for i in range(count)]
+    return [("Function", f"f{i}", "a.cs", "", ("Ns:A",), True) for i in range(count)]
 
 
 def test_a_match_key_chunk_failing_as_it_executes_is_retried(monkeypatch):
@@ -152,7 +152,7 @@ def test_a_match_key_chunk_that_keeps_failing_raises(monkeypatch):
     assert len(driver.runs) == 1 + engine_module._MAX_RETRIES + 1
     engine, driver = fake_engine(monkeypatch, [ConstraintError("bad")])
     with pytest.raises(ConstraintError):
-        engine.settle_match_keys("r", [("Function", "f", "a.cs")])
+        engine.settle_match_keys("r", [("Function", "f", "a.cs", "")])
 
 
 @pytest.fixture

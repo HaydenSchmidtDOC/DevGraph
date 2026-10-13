@@ -1339,7 +1339,7 @@ class TestFieldKeyedDocsApply:
         spec, files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
         engine.extracted_entries = lambda repo_id, extractor, labels: {("Adr", "ADR-1", "decisions/adr-1.md")}
-        engine.list_file_nodes = lambda repo_id, files: {("Adr", "ADR-1", "decisions/adr-1.md", None, False)}
+        engine.list_file_nodes = lambda repo_id, files: {("Adr", "ADR-1", "decisions/adr-1.md", "", None, False)}
         copy = "decisions/adr-1 copy.md"
         batch = dispatch._read_docs_batch(engine, "demo", temp_repo, spec, {copy: files[copy]}, set())
         assert sorted(batch.selected) == ["decisions/adr-1 copy.md", "decisions/adr-1.md"]
@@ -1508,9 +1508,9 @@ def test_name_refs_record_cross_file_pins_once_per_target_name():
     parsed = sorted(parse_name_ref(entry) for entry in refs)
     assert parsed == [
         # Each pin's confidence is its kind's, not one value for the entry.
-        (["CALLS", "Function", "main", "app.py", "Function", "f", "C"], ["pkg.py", "pkg/", "pkg/__init__.py"],
+        (["CALLS", "Function", "main", "app.py", "Function", "f", "C", ""], ["pkg.py", "pkg/", "pkg/__init__.py"],
          "pin"),
-        (["CALLS", "Function", "main", "app.py", "Function", "g", ""], None, "name"),
+        (["CALLS", "Function", "main", "app.py", "Function", "g", "", ""], None, "name"),
     ]
 
 
@@ -1519,14 +1519,15 @@ def test_name_refs_keep_a_fileless_pin_apart_from_unpinned():
 
     unpinned_source = {**_rel("Display", ""), "from_label": "Class", "from_name": "Foo", "from_file": None}
     (entry,) = name_ref_properties([unpinned_source])["name_refs"]
-    assert parse_name_ref(entry) == (["CALLS", "Class", "Foo", "", "Function", "Display", ""], [""], "")
+    assert parse_name_ref(entry) == (["CALLS", "Class", "Foo", "", "Function", "Display", "", ""], [""], "")
 
 
 def test_a_legacy_name_ref_entry_parses_as_unpinned():
     from devgraph.indexer.common import NAME_REF_SEP, parse_name_ref
 
     legacy = NAME_REF_SEP.join(["CALLS", "Function", "main", "a.py", "Function", "helper", "Svc"])
-    assert parse_name_ref(legacy) == (["CALLS", "Function", "main", "a.py", "Function", "helper", "Svc"], None, "")
+    # Unowned, too: written before owners.
+    assert parse_name_ref(legacy) == (["CALLS", "Function", "main", "a.py", "Function", "helper", "Svc", ""], None, "")
 
 
 def test_a_directory_pin_is_tested_before_the_fileless_pin():
@@ -1615,3 +1616,12 @@ def test_a_save_while_the_indexes_build_fails_its_batch_instead_of_skipping_the_
     finally:
         monkeypatch.undo()
         engine.delete_repository(repo_id)
+
+
+def test_name_refs_keep_same_named_sources_of_two_owners_apart():
+    from devgraph.indexer.common import name_ref_properties, parse_name_ref
+
+    refs = name_ref_properties([
+        {**_rel("f", "lib.py"), "from_owner": "A"}, {**_rel("f", "lib.py"), "from_owner": "B"},
+    ])["name_refs"]
+    assert sorted(parse_name_ref(entry)[0][7] for entry in refs) == ["A", "B"]

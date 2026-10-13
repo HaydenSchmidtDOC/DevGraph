@@ -117,7 +117,7 @@ RELATIONSHIP_TYPE_PATTERN = re.compile(rf"[A-Z][A-Z0-9_]{{0,{_BOUND}}}")
 PROPERTY_NAME_PATTERN = re.compile(rf"[a-z][a-z0-9_]{{0,{_BOUND}}}")
 
 #: Suffix for the uniqueness constraint generated for a user node type.
-#: Deliberately distinct from the built-in `_repo_name`/`_repo_name_file`
+#: Deliberately distinct from the built-in `_repo_name`/`_repo_name_file_owner`
 #: suffixes, because a user key is not necessarily `name`.
 USER_CONSTRAINT_SUFFIX = "_repo_key"
 

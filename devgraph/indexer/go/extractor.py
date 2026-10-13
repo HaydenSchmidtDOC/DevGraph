@@ -68,6 +68,7 @@ from devgraph.indexer.common import (
     GraphNode,
     GraphRelationship,
     own_edges,
+    owned_pin,
 )
 from devgraph.indexer.resolver_config import ResolverConfig
 
@@ -363,7 +364,7 @@ class _GoResolver:
         the repository (a builtin or external type)."""
         if go_type[0] == "local":
             if method in self.methods.get(go_type[1], ()):
-                return [self.file_path]
+                return [owned_pin(self.file_path, go_type[1])]  # the type's own method
             return [self._own_dir(loose=True)]
         if go_type[0] == "pkg":
             return [pin for folder in go_type[1] for pin in self._package_pins(folder, loose=True)]
@@ -388,9 +389,10 @@ class _GoResolver:
 
     def bare_pins(self, name: str) -> list[str] | None:
         """Where an unqualified `name()` is declared: this file, else its
-        package (and any dot-imported one); None for a builtin."""
+        package (and any dot-imported one); None for a builtin. In this file
+        it is a function, never a method of the same name (owner "")."""
         if name in self.functions:
-            return [self.file_path]
+            return [owned_pin(self.file_path, "")]
         if name in _BUILTIN_FUNCS:
             return None
         pins = [self._own_dir()]
@@ -694,6 +696,8 @@ def extract_go_file(
     sites = CallSites()
 
     def _emit_contains(parent_label: str, parent_name: str, child_label: str, child_name: str) -> None:
+        # A type and a function are top-level, owned by nothing; a method by
+        # its receiver's type.
         result.relationships.append(
             GraphRelationship(
                 from_label=parent_label,
@@ -704,6 +708,8 @@ def extract_go_file(
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner="" if parent_label == "Class" else None,
+                to_owner=parent_name if parent_label == "Class" else "",
             )
         )
 
@@ -711,7 +717,7 @@ def extract_go_file(
         found: list = []
         _collect_calls(body, _function_scope(node, resolver, source_bytes), resolver, source_bytes, found)
         for name, pins, member in found:
-            sites.add("Function", caller_name, caller_class, name, pins, member)
+            sites.add("Function", caller_name, caller_class, name, pins, member, caller_class or "")
 
     def _visit_struct(type_spec: Node) -> None:
         name_node = type_spec.child_by_field_name("name")
@@ -724,6 +730,7 @@ def extract_go_file(
             "type": "class",
             "decorators": [],
             "file": file_path,
+            "owner": "",
             "start_line": type_spec.start_point[0] + 1,
             "end_line": type_spec.end_point[0] + 1,
         }
@@ -766,6 +773,7 @@ def extract_go_file(
                             to_label="Class",
                             to_name=embedded_name,
                             repo_id=repo_id,
+                            from_owner="",
                         )
                     )
 
@@ -780,6 +788,7 @@ def extract_go_file(
             "type": "function",
             "decorators": [],
             "file": file_path,
+            "owner": "",
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -808,6 +817,7 @@ def extract_go_file(
             "type": "function",
             "decorators": [],
             "file": file_path,
+            "owner": receiver_type or "",
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }

@@ -486,6 +486,13 @@ _DESCRIBE_NEIGHBOUR = (
     "AND ($types IS NULL OR type(r) IN $types) "
     "AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))"
 )
+#: The labels a code symbol's `owner` keys within its file (the class it is
+#: declared in, "" at the top level; see devgraph/graph/schema.py FILE_SCOPED_LABELS).
+_OWNED_LABELS = ("Class", "Function")
+#: Cypher for node `{v}`'s owner when it has one: null for a top-level symbol
+#: and for any node without a `file` (a declared type's `owner` field is its own).
+_OWNER_OF = "CASE WHEN {v}.file IS NOT NULL AND {v}.owner <> '' THEN {v}.owner END"
+
 _DESCRIBE_GROUPS = f"""
 MATCH (n) WHERE elementId(n) = $id
 CALL (n) {{
@@ -509,9 +516,11 @@ CALL (n, dir, rel) {{
   WITH m WHERE m.repo_id = $repo_id AND NOT m:Repository
     AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))
   WITH DISTINCT m
-  ORDER BY m.name, coalesce(m.file, m.path)
+  ORDER BY m.name, coalesce(m.file, m.path), m.owner
   LIMIT $cap
-  RETURN collect({{label: labels(m)[0], name: m.name, file: coalesce(m.file, m.path)}}) AS refs
+  RETURN collect({{
+    label: labels(m)[0], name: m.name, file: coalesce(m.file, m.path), owner: {_OWNER_OF.format(v="m")}
+  }}) AS refs
 }}
 RETURN dir, rel, total, refs
 """
@@ -572,9 +581,33 @@ def _lookup_cypher(labels: tuple[str, ...], declared: frozenset[str]) -> str:
     return (
         f"CALL () {{\n{body}\n}}\n"
         "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, "
-        "coalesce(n.file, n.path) AS file, properties(n) AS properties\n"
+        f"coalesce(n.file, n.path) AS file, {_OWNER_OF.format(v='n')} AS owner, properties(n) AS properties\n"
         f"LIMIT {_DESCRIBE_MAX_CANDIDATES + 1}"
     )
+
+
+def _owned_lookup_cypher(labels: tuple[str, ...]) -> str:
+    """`_lookup_cypher`'s match for a name qualified with its owner: the
+    Class or Function of `labels` named `$member` whose owner is `$owner`."""
+    body = "\n  UNION\n".join(
+        f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.name = $member AND n.owner = $owner "
+        "AND ($file IS NULL OR n.file = $file) RETURN n"
+        for label in labels if label in _OWNED_LABELS
+    )
+    return (
+        f"CALL () {{\n{body}\n}}\n"
+        "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, "
+        f"n.file AS file, n.owner AS owner, properties(n) AS properties\n"
+        f"LIMIT {_DESCRIBE_MAX_CANDIDATES + 1}"
+    )
+
+
+def _owner_split(name: str) -> tuple[str, str] | None:
+    """`A.save` (`Outer.Inner.run`) as (owner, member): a method named with
+    the class it is declared in (see devgraph/indexer/common.py
+    `member_owner`); None for a name with no dot."""
+    owner, dot, member = name.rpartition(".")
+    return (owner, member) if dot and owner and member else None
 
 
 def _suggestions_cypher(labels: tuple[str, ...]) -> str:
@@ -749,10 +782,14 @@ def _with_target_files(row: dict[str, Any], files: Any) -> dict[str, Any]:
 
 
 def _node_ref(row: dict[str, Any]) -> dict[str, Any]:
-    """`{label, name, file}` from raw values, so it re-describes exactly this node."""
+    """`{label, name, file}` from raw values, so it re-describes exactly this
+    node; and `owner` for a method or nested class (the class it is declared
+    in: `owner.name` names it apart from a same-named sibling of its file)."""
     ref = {"label": row["label"], "name": row["name"]}
     if row.get("file") is not None:
         ref["file"] = row["file"]
+    if row.get("owner"):
+        ref["owner"] = row["owner"]
     return ref
 
 
@@ -800,6 +837,7 @@ def describe_node(
     neighbor_labels: list[str] | None = None,
     max_per_type: int = 10,
     declared_labels: tuple[str, ...] = (),
+    owner: str | None = None,
 ) -> dict[str, Any]:
     """One node's properties and its relationships, grouped by type, one hop out.
 
@@ -807,7 +845,9 @@ def describe_node(
         engine: GraphEngine instance
         repo_id: Repository to look in
         name: The node's exact name; a file, folder or docs node may also be
-            named by its repo-relative path
+            named by its repo-relative path; a method or nested class by its
+            name qualified with its owner (`A.save`), when no node has that
+            exact name
         label: Only nodes of this label
         file: Only nodes whose file, path or source_file is this
         direction: "both", "out" or "in"
@@ -816,11 +856,14 @@ def describe_node(
         max_per_type: Neighbours listed per relationship type, clamped to 1..50
         declared_labels: The repository's schema-declared labels to search as
             well; anything that isn't a valid label identifier is ignored
+        owner: Only the Class or Function declared in this owner (the dotted
+            classes around it, as a ref's `owner` gives it); "" for a top-level one
 
     Returns:
         `{"status": "found", "node", "outgoing", "incoming", "groups_truncated"}`,
         each group a `{count, results, truncated}` envelope of `{label, name, file}`
-        refs; or `{"status": "ambiguous", "count", "candidates", "truncated"}`.
+        refs (and `owner` for a method or nested class); or `{"status":
+        "ambiguous", "count", "candidates", "truncated"}`.
         No match raises ToolError with suggestions. `Repository` nodes are never
         matched or listed.
     """
@@ -845,21 +888,30 @@ def describe_node(
     cap = max(1, min(_DESCRIBE_MAX_PER_TYPE, int(max_per_type)))
 
     params = {"repo_id": repo_id, "name": name, "file": file}
-    rows, _more = _read(engine, _lookup_cypher(labels, path_labels), params, _DESCRIBE_MAX_CANDIDATES + 1)
+    owned = (owner, name) if owner is not None else None
+    rows = []
+    if owned is None:
+        rows, _more = _read(engine, _lookup_cypher(labels, path_labels), params, _DESCRIBE_MAX_CANDIDATES + 1)
+        owned = _owner_split(name) if not rows else None
+    if owned is not None and any(each in _OWNED_LABELS for each in labels):
+        params = {**params, "owner": owned[0], "member": owned[1]}
+        rows, _more = _read(engine, _owned_lookup_cypher(labels), params, _DESCRIBE_MAX_CANDIDATES + 1)
 
     if not rows:
         suggestions, _ = _read(
             engine, _suggestions_cypher(labels), {"repo_id": repo_id, "name": name}, _DESCRIBE_MAX_SUGGESTIONS
         )
         filters = "".join(
-            f", {key}={_echo(value)}" for key, value in (("label", label), ("file", file)) if value is not None
+            f", {key}={_echo(value)}" for key, value in (("label", label), ("file", file), ("owner", owner))
+            if value is not None
         )
         message = f"no node named {_echo(name)}{filters} in repository {_echo(repo_id)}.{_did_you_mean(suggestions)}"
         raise ToolError(f"{message} {_DESCRIBE_HINT}.")
 
     if len(rows) > 1:
         candidates = sorted(
-            (_node_ref(row) for row in rows), key=lambda r: (r["label"], r["name"], r.get("file") or "")
+            (_node_ref(row) for row in rows),
+            key=lambda r: (r["label"], r["name"], r.get("file") or "", r.get("owner") or ""),
         )
         return {
             "status": "ambiguous",
@@ -1529,9 +1581,11 @@ _COMPARE_LISTS = ("added", "removed", "changed")
 _COMPARE_CALLERS_CYPHER = """
 UNWIND $targets AS t
 CALL (t) {
-  MATCH (n:Function {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+  MATCH (n:Function {repo_id: $repo_id, name: t.name, file: t.file}) WHERE n.owner IS NULL OR n.owner = t.owner
+  RETURN n
   UNION
-  MATCH (n:Class {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+  MATCH (n:Class {repo_id: $repo_id, name: t.name, file: t.file}) WHERE n.owner IS NULL OR n.owner = t.owner
+  RETURN n
 }
 MATCH (caller)-[:CALLS]->(n)
 WHERE caller.repo_id = $repo_id
@@ -1621,7 +1675,7 @@ def compare_branches(
             symbol_counts[name] += len(change.symbols[name])
         for name in ("changed", "removed"):
             for entry in change.symbols[name]:
-                target = {"name": entry["name"], "file": change.path}
+                target = {"name": entry["name"], "file": change.path, "owner": entry.get("owner", "")}
                 if target not in targets:
                     targets.append(target)
     callers, notices = _compare_callers(engine, repo_id, targets, git_compare._COMPARE_MAX_CALLERS)
@@ -1755,9 +1809,11 @@ _DIFF_TARGETS_CYPHER = """
 CALL () {
   UNWIND $targets AS t
   CALL (t) {
-    MATCH (n:Function {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+    MATCH (n:Function {repo_id: $repo_id, name: t.name, file: t.file}) WHERE n.owner IS NULL OR n.owner = t.owner
+    RETURN n
     UNION
-    MATCH (n:Class {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+    MATCH (n:Class {repo_id: $repo_id, name: t.name, file: t.file}) WHERE n.owner IS NULL OR n.owner = t.owner
+    RETURN n
   }
   RETURN n
   UNION
@@ -1872,7 +1928,7 @@ def impact_analysis_for_diff(
             symbols[name] += [_diff_symbol(entry, change.path) for entry in change.symbols[name]]
         for name in ("changed", "removed"):
             for entry in change.symbols[name]:
-                target = {"name": entry["name"], "file": change.path}
+                target = {"name": entry["name"], "file": change.path, "owner": entry.get("owner", "")}
                 if target not in targets:
                     targets.append(target)
     if fallback["unread"] and not detail_failed:
@@ -2331,7 +2387,9 @@ def get_source(
         engine: GraphEngine instance
         registry: RepoRegistry, used to resolve repo_id to its registered root path
         repo_id: Repository ID
-        component_name: Name of the Function or Class to fetch source for
+        component_name: Name of the Function or Class to fetch source for; a
+            method may be named with the class it is declared in, `A.save`
+            (`Outer.Inner.run`), when no node has that exact name
         cross_repo: If True, search across repos (the file is still read from
             whichever repo actually owns the matched node, via its own registry entry)
         file: Repo-relative path of the defining file, to pick one of several
@@ -2342,7 +2400,10 @@ def get_source(
         docstring_full (when present). Empty/None fields if no match found.
         When several nodes match, `source` is None and the dict adds
         `status: "ambiguous"`, `count`, `truncated` and `candidates`
-        ({label, name, file}; repo_id too when cross_repo): pass one's `file`.
+        ({label, name, file}, with `owner` for a method or nested class;
+        repo_id too when cross_repo): pass one's `file`, and for two
+        same-named methods of one file, `owner.name` as the name. A method's
+        result adds `owner` too.
         A file is decoded as the indexer decodes it (`source_text`): a
         Python coding line, else UTF-8, else cp1252 or Latin-1; when an
         undeclared file is not valid UTF-8, or a file isn't valid in its
@@ -2350,22 +2411,27 @@ def get_source(
     """
     file = _normalize_file(file)
     repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
-    cypher = f"""
+    def lookup(match: str) -> list[dict[str, Any]]:
+        return _query(engine, f"""
     MATCH (n)
-    WHERE (n:Function OR n:Class) AND n.name = $component_name
+    WHERE (n:Function OR n:Class) AND {match}
     {repo_filter}
     AND ($file IS NULL OR n.file = $file)
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
-           n.file as file, n.start_line as start_line, n.end_line as end_line,
+           n.file as file, {_OWNER_OF.format(v="n")} as owner, n.start_line as start_line, n.end_line as end_line,
            n.docstring_full as docstring_full
     ORDER BY n.repo_id, n.file, n.start_line
     LIMIT {_DESCRIBE_MAX_CANDIDATES + 1}
-    """
+    """, params)
+
     params: dict[str, Any] = {"component_name": component_name, "file": file}
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = _query(engine, cypher, params)
+    results = lookup("n.name = $component_name")
+    if not results and (owned := _owner_split(component_name)) is not None:
+        params["owner"], params["member"] = owned
+        results = lookup("n.name = $member AND n.owner = $owner")
     empty = {
         "name": component_name, "label": None, "file": None,
         "start_line": None, "end_line": None, "source": None, "docstring_full": None,
@@ -2378,7 +2444,10 @@ def get_source(
 
     if len(results) > 1:
         candidates = [
-            {"label": label_of(r), "name": r["name"], "file": r["file"], **({"repo_id": r["repo_id"]} if cross_repo else {})}
+            {
+                "label": label_of(r), "name": r["name"], "file": r["file"],
+                **({"owner": r["owner"]} if r["owner"] else {}), **({"repo_id": r["repo_id"]} if cross_repo else {}),
+            }
             for r in results[:_DESCRIBE_MAX_CANDIDATES]
         ]
         return {
@@ -2435,6 +2504,8 @@ def get_source(
         "source": source_text,
         "docstring_full": row.get("docstring_full"),
     }
+    if row["owner"]:
+        result["owner"] = row["owner"]
     if notice is not None:
         result["notice"] = notice
     return result

@@ -105,7 +105,7 @@ from tree_sitter import Language, Node, Parser
 
 from devgraph.graph.schema import MAX_SCOPE_KEYS, scoped_pin
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, call_rows
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges, owned_pin
 from devgraph.indexer.resolver_config import CsUsing, ResolverConfig
 
 logger = logging.getLogger(__name__)
@@ -427,6 +427,14 @@ class _CsClass:
         self.bases: list[tuple[str, str | None, frozenset[str]]] = []
         self.keys: set[str] = set()  # its own match keys, `Ns:Outer.Name`
         self.partial = False
+        # What its members are owned by (common.member_owner), `Outer.Name`:
+        # one per class of the name in the file.
+        self.owners: set[str] = set()
+
+    def members_owner(self) -> str | None:
+        """The owner of the class's members, None when several classes of
+        the file share its name."""
+        return next(iter(self.owners)) if len(self.owners) == 1 else None
 
 
 def _clean(keys) -> set[str]:
@@ -602,6 +610,7 @@ class _CsResolver:
                 self.types.add(_text(name, source))
                 scope = self.scope(child)
                 cls.keys |= _clean({f"{scope.namespace}:{'.'.join([*path, _text(name, source)])}"})
+                cls.owners.add(".".join([*path, _text(name, source)]))
                 cls.partial |= any(c.type == "modifier" and _text(c, source) == "partial" for c in child.children)
                 base_list = next((c for c in child.named_children if c.type == "base_list"), None)
                 for base in base_list.named_children if base_list is not None else []:
@@ -683,7 +692,8 @@ class _CsResolver:
 
     def class_target(self, cls: str, method: str, seen: frozenset = frozenset(), own: bool = True) -> _Target:
         """Where `method` of class `cls` (declared here) is: this file when
-        the class (`own`) or an in-file base declares it; else its other
+        the class (`own`) or an in-file base declares it, as that class's
+        member (common.owned_pin); else its other
         bases' keys, and for a partial class its own keys (another part, in
         another file, can declare it)."""
         target = _Target()
@@ -691,7 +701,7 @@ class _CsResolver:
         if info is None or cls in seen:
             return target
         if own and method in info.methods:
-            target.files.add(self.file_path)
+            target.files.add(owned_pin(self.file_path, info.members_owner()))
             return target
         if own and info.partial:
             target.keys |= info.keys
@@ -1020,8 +1030,9 @@ def extract_csharp_file(
         root, source_bytes, file_path, (*project.usings, *project.global_usings) if project is not None else (),
     )
     sites = CallSites()
-    # (label, name) -> the match keys of every same-named Class or Function declared here.
-    match_keys: dict[tuple[str, str], set[str]] = {}
+    # (label, name, owner) -> the match keys of every same-named Class or
+    # Function of one owner declared here.
+    match_keys: dict[tuple[str, str, str], set[str]] = {}
 
     def _record_calls(
         body: Node, caller_label: str, caller_name: str, classes: list[str], variables: dict,
@@ -1031,8 +1042,13 @@ def extract_csharp_file(
         collector.locals |= {_text(name, source_bytes) for each in _descendants(body, "local_function_statement")
                              if (name := each.child_by_field_name("name")) is not None}
         collector.walk(body)
+        # A method is owned by its classes; a class (a field initializer's
+        # caller) by the classes around it; the Module by nothing.
+        caller_owner = {"Function": ".".join(reversed(classes)), "Class": ".".join(reversed(classes[1:]))}.get(
+            caller_label
+        )
         for name, pins, member in collector.found:
-            sites.add(caller_label, caller_name, classes[0] if classes else None, name, pins, member)
+            sites.add(caller_label, caller_name, classes[0] if classes else None, name, pins, member, caller_owner)
 
     def visit_block(container: Node, parent_name: str | None, parent_label: str, classes: list[str]) -> None:
         """Visit a container's named children: `compilation_unit` (file
@@ -1078,10 +1094,12 @@ def extract_csharp_file(
         decorators = _extract_attribute_names(node, source_bytes)
         base_names = _extract_base_list_names(node, source_bytes)
 
+        owner = ".".join(reversed(classes))
         class_properties: dict = {
             "type": "class",
             "decorators": decorators,
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -1096,7 +1114,7 @@ def extract_csharp_file(
             GraphNode(label="Class", repo_id=repo_id, name=class_name, properties=class_properties)
         )
         path = ".".join([*reversed(classes), class_name])
-        match_keys.setdefault(("Class", class_name), set()).add(f"{resolver.scope(node).namespace}:{path}")
+        match_keys.setdefault(("Class", class_name, owner), set()).add(f"{resolver.scope(node).namespace}:{path}")
         result.relationships.append(
             GraphRelationship(
                 from_label=parent_label,
@@ -1107,6 +1125,8 @@ def extract_csharp_file(
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=".".join(reversed(classes[1:])) if parent_label == "Class" else None,
+                to_owner=owner,
             )
         )
         for base_name in base_names:
@@ -1118,6 +1138,7 @@ def extract_csharp_file(
                     to_label="Class",
                     to_name=base_name,
                     repo_id=repo_id,
+                    from_owner=owner,
                 )
             )
 
@@ -1136,10 +1157,12 @@ def extract_csharp_file(
 
         decorators = _extract_attribute_names(node, source_bytes)
 
+        owner = ".".join(reversed(classes))
         func_properties: dict = {
             "type": "function",
             "decorators": decorators,
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -1153,7 +1176,7 @@ def extract_csharp_file(
         result.nodes.append(
             GraphNode(label="Function", repo_id=repo_id, name=func_name, properties=func_properties)
         )
-        keys = match_keys.setdefault(("Function", func_name), set())
+        keys = match_keys.setdefault(("Function", func_name, owner), set())
         namespace = resolver.scope(node).namespace
         if classes:
             keys.add(f"{namespace}:{'.'.join(reversed(classes))}")
@@ -1182,6 +1205,8 @@ def extract_csharp_file(
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=".".join(reversed(classes[1:])) if parent_label == "Class" else None,
+                to_owner=owner,
             )
         )
 
@@ -1198,7 +1223,8 @@ def extract_csharp_file(
     result.relationships += sites.rows(file_path, repo_id)
     for each in result.nodes:
         if each.label in ("Class", "Function"):
-            each.properties["mkeys"] = sorted(_clean(match_keys.get((each.label, each.name), ())))
+            key = (each.label, each.name, each.properties["owner"])
+            each.properties["mkeys"] = sorted(_clean(match_keys.get(key, ())))
     # IMPORTS: the classes the file references, in whichever C# file declares
     # them under a key the reference can mean, and the extension methods its
     # typed receivers' calls can reach.

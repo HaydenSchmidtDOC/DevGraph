@@ -88,7 +88,7 @@ import tree_sitter_cpp as tscpp
 from tree_sitter import Language, Node, Parser
 
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, member_owner, own_edges
 
 logger = logging.getLogger(__name__)
 
@@ -678,11 +678,17 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
     )
     sites = CallSites()
 
-    def _record_calls(body: Node, caller_label: str, caller_name: str, cls: str | None, variables: dict) -> None:
+    def _record_calls(
+        body: Node, caller_label: str, caller_name: str, cls: str | None, variables: dict, caller_owner: str | None,
+    ) -> None:
         collector = _CppCalls(resolver, cls, variables)
         collector.walk(body)
         for name, pins, member in collector.found:
-            sites.add(caller_label, caller_name, cls, name, pins, member)
+            sites.add(caller_label, caller_name, cls, name, pins, member, caller_owner)
+
+    # The owner (common.member_owner) of the class being visited, innermost
+    # last; "" at the Module (a namespace is no owner).
+    owners = [""]
 
     classes_emitted: set[str] = set()
 
@@ -720,7 +726,10 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                 continue
             else:
                 caller_class = parent_name if parent_label == "Class" else None
-                _record_calls(node, parent_label, parent_name if parent_name else file_path, caller_class, {})
+                _record_calls(
+                    node, parent_label, parent_name if parent_name else file_path, caller_class, {},
+                    owners[-1] if parent_label == "Class" else None,
+                )
 
     def _visit_class(node: Node, parent_name: str | None, parent_label: str) -> None:
         name_node = node.child_by_field_name("name")
@@ -733,9 +742,12 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
         )
         base_classes = _extract_base_class_names(base_clause, source_bytes)
 
+        parent_owner = owners[-1] if parent_label == "Class" else None
+        owner = member_owner(parent_label, parent_name, parent_owner)
         class_properties: dict = {
             "type": "class",
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -759,6 +771,8 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=parent_owner,
+                to_owner=owner,
             )
         )
 
@@ -771,12 +785,15 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                     to_label="Class",
                     to_name=base_class,
                     repo_id=repo_id,
+                    from_owner=owner,
                 )
             )
 
         body_node = node.child_by_field_name("body")
         if body_node is not None:
+            owners.append(owner)
             visit_block(body_node, class_name, "Class")
+            owners.pop()
 
     def _visit_recovered_macro_class(
         node: Node, class_name: str, base_names: list[str], parent_name: str | None, parent_label: str
@@ -785,9 +802,12 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
         `_recover_macro_prefixed_class` — no member walk, see that
         function's docstring for why.
         """
+        parent_owner = owners[-1] if parent_label == "Class" else None
+        owner = member_owner(parent_label, parent_name, parent_owner)
         class_properties: dict = {
             "type": "class",
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -810,6 +830,8 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=parent_owner,
+                to_owner=owner,
             )
         )
         for base_class in base_names:
@@ -821,6 +843,7 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                     to_label="Class",
                     to_name=base_class,
                     repo_id=repo_id,
+                    from_owner=owner,
                 )
             )
 
@@ -855,10 +878,16 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             contains_label, contains_name = "Class", class_name
         else:
             contains_label, contains_name = parent_label, (parent_name if parent_name else file_path)
+        # An out-of-class definition is owned by its qualifier's class alone
+        # (no enclosing class is known); a member defined in its class by the
+        # class's owner chain.
+        in_class = parent_label == "Class" and inner.type != "qualified_identifier"
+        owner = member_owner("Class", class_name, owners[-1] if in_class else None) if class_name else ""
 
         func_properties: dict = {
             "type": "function",
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -881,12 +910,16 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                 repo_id=repo_id,
                 from_file=file_path if contains_label == "Class" else None,
                 to_file=file_path,
+                from_owner=owners[-1] if in_class else None,
+                to_owner=owner,
             )
         )
 
         body_node = node.child_by_field_name("body")
         if body_node is not None:
-            _record_calls(body_node, "Function", func_name, class_name, _function_variables(node, source_bytes))
+            _record_calls(
+                body_node, "Function", func_name, class_name, _function_variables(node, source_bytes), owner,
+            )
 
     visit_block(root, None, "Module")
     result.relationships += sites.rows(file_path, repo_id)

@@ -606,6 +606,31 @@ A function defined once per platform (`now_ms` in `platform_posix.cpp` and
 `platform_win.cpp`, declared in `platform.h`) is reached by neither: its
 sources are not named after the header.
 
+## Audit 4 extractor fixes (index format 11)
+
+Four constructs were dropped or misattributed before any call was resolved:
+
+- **C++ templates.** A `template_declaration` is walked through to the
+  class, struct or function it declares, at file scope, in a namespace and
+  as a member template (the class table reads member templates too). An
+  out-of-class member of a class template names the template
+  (`template<class T> void Stack<T>::push()` belongs to `Stack`).
+- **Java records** are types like classes, with their methods and a compact
+  canonical constructor (`P { ... }`, a constructor named `P`).
+- **TS/TSX class-field arrow functions.** tree-sitter-typescript names a
+  field `name`, tree-sitter-javascript `property`; both are read.
+- **Go methods on a pointer to a generic type** (`func (s *Stack[T]) Push`)
+  belong to `Stack`, like a value receiver, so their `CONTAINS` has a real
+  source and the method table resolves typed calls into them.
+
+The same format keys each Class and Function by its owner within its file
+(2026-10-08-graph-accuracy-design.md, owner identity), and a resolver that
+knows the class of a call into its own file names it: a typed receiver's or
+`this`/`self` call to a class declared in the file links that class's member
+(Python, JS/TS, Java, Kotlin, C#, Go, Rust; C++ resolves by function name
+alone and still links every same-named member of the file), and a bare Go
+call links the file's function, never a method of its name.
+
 ## No reverse dependents
 
 With Go, Java and Kotlin resolved, every code edge is a function of its

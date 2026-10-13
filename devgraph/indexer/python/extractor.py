@@ -27,7 +27,7 @@ import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
 from devgraph.indexer.calls import STOP_METHODS, call_rows
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, member_owner, own_edges, owned_pin
 from devgraph.indexer.python.resolve import Bindings, absolute_module, relative_module
 
 logger = logging.getLogger(__name__)
@@ -308,26 +308,42 @@ def _direct_defs(block: Node | None, source: bytes) -> set[str]:
 class _ClassInfo:
     methods: set[str] = field(default_factory=set)
     bases: list[str] = field(default_factory=list)
+    # What its members are owned by (common.member_owner): its own owner
+    # chain and its name, one per class of the name in the file.
+    members_owners: set[str] = field(default_factory=set)
+
+    def members_owner(self) -> str | None:
+        """The owner of the class's members, None when several classes of
+        the file share its name (their methods are told apart by nothing
+        a call names)."""
+        return next(iter(self.members_owners)) if len(self.members_owners) == 1 else None
 
 
 def _class_table(root: Node, source: bytes) -> dict[str, _ClassInfo]:
     """Every class in the file, at any depth: its own methods and its bases.
-    Same-named classes merge (one Class node per name and file anyway)."""
+    Same-named classes merge."""
     classes: dict[str, _ClassInfo] = {}
 
-    def walk(node: Node) -> None:
-        if node.type == "class_definition":
+    def walk(node: Node, label: str, name: str | None, owner: str) -> None:
+        if node.type in ("class_definition", "function_definition"):
             name_node = node.child_by_field_name("name")
             if name_node is not None:
-                info = classes.setdefault(_text(name_node, source), _ClassInfo())
-                info.methods |= _direct_defs(node.child_by_field_name("body"), source)
-                for base in _extract_base_class_names(node.child_by_field_name("superclasses"), source):
-                    if base not in info.bases:
-                        info.bases.append(base)
+                own = member_owner(label, name, owner)
+                if node.type == "function_definition":
+                    label, name, owner = "Function", _text(name_node, source), own
+                else:
+                    class_name = _text(name_node, source)
+                    info = classes.setdefault(class_name, _ClassInfo())
+                    info.methods |= _direct_defs(node.child_by_field_name("body"), source)
+                    info.members_owners.add(member_owner("Class", class_name, own))
+                    for base in _extract_base_class_names(node.child_by_field_name("superclasses"), source):
+                        if base not in info.bases:
+                            info.bases.append(base)
+                    label, name, owner = "Class", class_name, own
         for child in node.children:
-            walk(child)
+            walk(child, label, name, owner)
 
-    walk(root)
+    walk(root, "Module", None, "")
     return classes
 
 
@@ -408,10 +424,11 @@ class _CallResolver:
 
     def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
         """Where `self.method()` (own) or `super().method()` in `cls` can go:
-        this file when `cls` or an in-file base defines it, and the files of
-        each imported base (not followed further). None when nothing does."""
+        this file when `cls` or an in-file base defines it, as that class's
+        member (common.owned_pin), and the files of each imported base (not
+        followed further). None when nothing does."""
         if own and method in self.classes[cls].methods:
-            return [self.file_path]
+            return [owned_pin(self.file_path, self.classes[cls].members_owner())]
         pins: set[str] = set()
         found = False
         seen = {cls}
@@ -424,7 +441,7 @@ class _CallResolver:
                         continue
                     seen.add(base)
                     if method in self.classes[base].methods:
-                        pins.add(self.file_path)
+                        pins.add(owned_pin(self.file_path, self.classes[base].members_owner()))
                         found = True
                     else:
                         bases_of(base)
@@ -691,15 +708,19 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
 
     resolver = _CallResolver(file_path, bindings, _class_table(root, source_bytes), source_bytes)
     fixtures = _fixture_types(root, source_bytes)
-    # (caller label, caller name) -> callee name -> [pins, bare?, caller classes]
-    calls: dict[tuple[str, str], dict[str, list]] = {}
+    # (caller label, caller name, caller owner) -> callee name -> [pins, bare?, caller classes]
+    calls: dict[tuple[str, str, str | None], dict[str, list]] = {}
 
-    def record_calls(caller_label: str, caller_name: str, body: Node, scope: _Scope, caller_class: str | None) -> None:
+    def record_calls(
+        caller_label: str, caller_name: str, body: Node, scope: _Scope, caller_class: str | None,
+        caller_owner: str | None,
+    ) -> None:
         # caller_class records the enclosing class of a method-body call (None
         # for module-level/free-function calls) so find_callers can optionally
         # narrow results via scope_to_class — an opt-in query-time filter
-        # (Implementation Plan #3, Item 2).
-        by_name = calls.setdefault((caller_label, caller_name), {})
+        # (Implementation Plan #3, Item 2). caller_owner tells same-named
+        # callers of the file apart (None for the Module).
+        by_name = calls.setdefault((caller_label, caller_name, caller_owner), {})
         for func in _call_functions(body):
             for name, pin in resolver.resolve(func, scope):
                 entry = by_name.setdefault(name, [set(), False, set()])
@@ -710,37 +731,45 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 if caller_class:
                     entry[2].add(caller_class)
 
-    def visit_block(block: Node, parent_name: str | None, parent_label: str, scope: _Scope) -> None:
-        """Visit statements in a block (module body, class body, function body).
-        A class body's defs are methods: they see the class's enclosing scope."""
+    def visit_block(block: Node, parent_name: str | None, parent_label: str, scope: _Scope, parent_owner: str) -> None:
+        """Visit statements in a block (module body, class body, function body)
+        whose own owner is `parent_owner`. A class body's defs are methods:
+        they see the class's enclosing scope."""
         def_scope, def_cls = (scope.parent, parent_name) if parent_label == "Class" else (scope, scope.cls)
         for node in block.named_children:
             if node.type == "class_definition":
-                _visit_class(node, parent_name, parent_label, scope)
+                _visit_class(node, parent_name, parent_label, scope, parent_owner)
             elif node.type in ("function_definition",):
-                _visit_function(node, parent_name, parent_label, def_scope, def_cls)
+                _visit_function(node, parent_name, parent_label, def_scope, def_cls, parent_owner)
             elif node.type == "decorated_definition":
                 # decorated_definition wraps decorator(s) + the actual definition.
                 definition = node.child_by_field_name("definition")
                 decorators = [c for c in node.named_children if c.type == "decorator"]
                 if definition is not None and definition.type == "class_definition":
-                    _visit_class(definition, parent_name, parent_label, scope, extra_decorators=decorators)
+                    _visit_class(
+                        definition, parent_name, parent_label, scope, parent_owner, extra_decorators=decorators
+                    )
                 elif definition is not None and definition.type == "function_definition":
                     _visit_function(
-                        definition, parent_name, parent_label, def_scope, def_cls, extra_decorators=decorators
+                        definition, parent_name, parent_label, def_scope, def_cls, parent_owner,
+                        extra_decorators=decorators,
                     )
             else:
                 # Module/class-body-level statement (not a def) — attribute
                 # any call expressions in it to the enclosing scope (usually
                 # the Module, for top-level script code / constant setup).
                 caller_class = parent_name if parent_label == "Class" else None
-                record_calls(parent_label, parent_name if parent_name else file_path, node, scope, caller_class)
+                record_calls(
+                    parent_label, parent_name if parent_name else file_path, node, scope, caller_class,
+                    parent_owner if parent_label != "Module" else None,
+                )
 
     def _visit_class(
         node: Node,
         parent_name: str | None,
         parent_label: str,
         scope: _Scope,
+        parent_owner: str,
         extra_decorators: list[Node] | None = None,
     ) -> None:
         name_node = node.child_by_field_name("name")
@@ -754,10 +783,12 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         superclasses_node = node.child_by_field_name("superclasses")
         base_classes = _extract_base_class_names(superclasses_node, source_bytes)
 
+        owner = member_owner(parent_label, parent_name, parent_owner)
         class_properties: dict = {
             "type": "class",
             "decorators": decorators,
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -787,6 +818,8 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=parent_owner if parent_label != "Module" else None,
+                to_owner=owner,
             )
         )
 
@@ -799,11 +832,12 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                     to_label="Class",
                     to_name=base_class,
                     repo_id=repo_id,
+                    from_owner=owner,
                 )
             )
 
         if body_node is not None:
-            visit_block(body_node, class_name, "Class", _Scope(set(), {}, None, scope))
+            visit_block(body_node, class_name, "Class", _Scope(set(), {}, None, scope), owner)
 
     def _visit_function(
         node: Node,
@@ -811,6 +845,7 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         parent_label: str,
         enclosing: _Scope,
         cls: str | None,
+        parent_owner: str,
         extra_decorators: list[Node] | None = None,
     ) -> None:
         name_node = node.child_by_field_name("name")
@@ -821,10 +856,12 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         decorator_nodes = extra_decorators or []
         decorators = _extract_decorator_names(decorator_nodes, source_bytes)
 
+        owner = member_owner(parent_label, parent_name, parent_owner)
         func_properties: dict = {
             "type": "function",
             "decorators": decorators,
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -854,6 +891,8 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=parent_owner if parent_label != "Module" else None,
+                to_owner=owner,
             )
         )
 
@@ -868,24 +907,27 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 enclosing, _parameter_names(node, source_bytes),
             )
             caller_class = parent_name if parent_label == "Class" else None
-            record_calls("Function", func_name, body_node, scope, caller_class)
+            record_calls("Function", func_name, body_node, scope, caller_class, owner)
 
             for child in body_node.named_children:
                 if child.type == "function_definition":
-                    _visit_function(child, func_name, "Function", scope, cls)
+                    _visit_function(child, func_name, "Function", scope, cls, owner)
                 elif child.type == "decorated_definition":
                     definition = child.child_by_field_name("definition")
                     decos = [c for c in child.named_children if c.type == "decorator"]
                     if definition is not None and definition.type == "function_definition":
-                        _visit_function(definition, func_name, "Function", scope, cls, extra_decorators=decos)
+                        _visit_function(definition, func_name, "Function", scope, cls, owner, extra_decorators=decos)
 
-    visit_block(root, None, "Module", _Scope(_direct_defs(root, source_bytes), {}, None))
-    for (caller_label, caller_name), by_name in sorted(calls.items()):
+    visit_block(root, None, "Module", _Scope(_direct_defs(root, source_bytes), {}, None), "")
+    for (caller_label, caller_name, caller_owner), by_name in sorted(
+        calls.items(), key=lambda item: (item[0][0], item[0][1], item[0][2] or "")
+    ):
         for name, (pins, bare, classes) in sorted(by_name.items()):
             result.relationships.extend(
                 call_rows(
                     caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id,
                     no_self=True,  # every bare Python call site is `x.m()` on an untyped receiver
+                    caller_owner=caller_owner,
                 )
             )
 

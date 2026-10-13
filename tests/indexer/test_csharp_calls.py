@@ -251,8 +251,13 @@ def test_a_typed_receivers_call_imports_the_extension_methods_it_can_reach():
 
 
 def _mkeys(source, file_path="src/A.cs"):
+    """(label, name) -> mkeys of each declaration; a member of a class is
+    named with its owner (`Outer.Run`)."""
     result = extract_csharp_file(textwrap.dedent(source), file_path, "repo")
-    return {(n.label, n.name): n.properties["mkeys"] for n in result.nodes if n.label != "Module"}
+    return {
+        (n.label, f"{n.properties['owner']}.{n.name}" if n.properties["owner"] else n.name): n.properties["mkeys"]
+        for n in result.nodes if n.label != "Module"
+    }
 
 
 def test_classes_and_functions_carry_their_namespace_and_owner_as_match_keys():
@@ -281,21 +286,22 @@ def test_classes_and_functions_carry_their_namespace_and_owner_as_match_keys():
     """)
     assert keys == {
         ("Class", "Outer"): ["Shop.Domain.Models:Outer"],
-        ("Function", "Outer"): ["Shop.Domain.Models:Outer"],
-        # Two methods named Run in one file: one node, its keys unioned.
-        ("Function", "Run"): ["Shop.Domain.Models:Outer", "Shop.Domain.Models:Outer.Inner"],
-        ("Class", "Inner"): ["Shop.Domain.Models:Outer.Inner"],
+        ("Function", "Outer.Outer"): ["Shop.Domain.Models:Outer"],
+        # Two methods named Run in one file, in two classes: two nodes, each with its own owner's key.
+        ("Function", "Outer.Run"): ["Shop.Domain.Models:Outer"],
+        ("Function", "Outer.Inner.Run"): ["Shop.Domain.Models:Outer.Inner"],
+        ("Class", "Outer.Inner"): ["Shop.Domain.Models:Outer.Inner"],
         ("Class", "UserExtensions"): ["Shop.Domain.Models:UserExtensions"],
-        ("Function", "Initials"): ["Shop.Domain.Models:+User", "Shop.Domain.Models:UserExtensions"],
+        ("Function", "UserExtensions.Initials"): ["Shop.Domain.Models:+User", "Shop.Domain.Models:UserExtensions"],
         ("Class", "Point"): ["Shop:Point"],
         ("Class", "Global"): [".:Global"],
-        ("Function", "Go"): [".:Global"],
+        ("Function", "Global.Go"): [".:Global"],
     }
 
 
 def test_a_file_scoped_namespace_keys_every_declaration_and_one_name_in_two_namespaces_unions():
     assert _mkeys("namespace Shop.Sales;\npublic partial class Order { void Total() { } }\n") == {
-        ("Class", "Order"): ["Shop.Sales:Order"], ("Function", "Total"): ["Shop.Sales:Order"],
+        ("Class", "Order"): ["Shop.Sales:Order"], ("Function", "Order.Total"): ["Shop.Sales:Order"],
     }
     assert _mkeys("namespace A { class User { } }\nnamespace B { class User { } }\n") == {
         ("Class", "User"): ["A:User", "B:User"],
@@ -466,7 +472,7 @@ def test_verbatim_identifiers_and_a_constraints_extension_key():
         }
     """)
     assert keys[("Class", "@event")] == ["Shop.Models:event"]
-    assert keys[("Function", "Touch")] == ["Shop.Models:+IRepo", "Shop.Models:RepoExtensions"]
+    assert keys[("Function", "RepoExtensions.Touch")] == ["Shop.Models:+IRepo", "Shop.Models:RepoExtensions"]
 
 
 # --- live --------------------------------------------------------------------------
@@ -620,8 +626,8 @@ def test_an_extension_on_a_constrained_type_parameter_skips_constraints_naming_n
             }
         }
     """)
-    assert keys[("Function", "Touch")] == ["Shop:+IRepo", "Shop:RepoExtensions"]
-    assert keys[("Function", "Poke")] == ["Shop:+T", "Shop:RepoExtensions"]
+    assert keys[("Function", "RepoExtensions.Touch")] == ["Shop:+IRepo", "Shop:RepoExtensions"]
+    assert keys[("Function", "RepoExtensions.Poke")] == ["Shop:+T", "Shop:RepoExtensions"]
 
 
 def test_global_qualified_calls_and_block_usings_stay_absolute():

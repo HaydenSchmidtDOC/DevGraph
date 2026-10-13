@@ -154,7 +154,9 @@ its edge. That is now in scope (G2).
 ## Out of scope (known gaps, recorded in PROJECT_STATUS)
 
 - **Same-file sibling collisions** (file+scope identity) and IMPORTS-based
-  call precision. These are the handover's open items 1 and 2.
+  call precision. These are the handover's open items 1 and 2. The first is
+  resolved by owner identity (index format 11, below), except two
+  same-named functions nested in two functions of one owner.
 - **A compose-only batch that adds `build:`.** It gets no owning-service
   `USES`/`CALLS` until the owned Python files are re-indexed. The fuzz
   excludes it.
@@ -195,3 +197,61 @@ its edge. That is now in scope (G2).
   - The C#/TS partial-`EXTENDS` note.
 - **Docstrings.** `GraphRelationship` (`common.py`), and `index_paths` and
   `_find_referrers` (`dispatch.py`).
+
+## Same-file siblings: owner identity (index format 11)
+
+Audit 4, item 1. Two same-named methods in one file (`class A: def save`
+and `class B: def save`; Go `String()` on two types; Rust `new` in two
+`impl`s; a Kotlin interface's `go` and its implementation's) were one node:
+the MERGE key `(repo_id, name, file)` fused them, so `get_source` returned
+whichever was written last and `find_callers` could not tell them apart.
+The extractors already emitted both; only identity lost one.
+
+### Options weighed
+
+| | A: qualify `name` (`A.save`) | B: add `owner` to the identity key |
+|---|---|---|
+| Bare-name lookups (`find_callers('save')`, `get_source`, `search_component`, `impact_analysis`) | break: each must also match a second "short name" property | unchanged: `name` stays `save` |
+| CALLS/EXTENDS/IMPORTS targets, `name_refs`, relink, `name_ref_targets` | every by-name target end matches `name`, so every resolver, the relink and the G5 read would have to match the short property instead | unchanged: a target still matches `name`; a pinned target in a file with siblings links every sibling of the name, as an unpinned one links every same-named node |
+| C# match keys (`Ns:Owner`) | unchanged | each sibling gets its own node, so its keys are its own owner's: a `@Ns:A` pin no longer reaches `B.Run` |
+| MENTIONS (Markdown by bare name) | `save` matches nothing any more | unchanged: it mentions both |
+| Dashboard `identity_key`, `compare_branches` | keys change for every method | the key gains the owner only for a node that has one |
+| Constraint and migration | the `(repo_id, name, file)` constraint can stay | the constraint becomes `(repo_id, name, file, owner)` |
+
+B is chosen: user-facing lookups by bare method name keep working and
+resolution keeps matching `name`, so only the ends that must tell siblings
+apart learn the owner.
+
+### Decisions
+
+| # | Decision |
+|---|---|
+| O1 | **`owner`.** Every `Class` and `Function` an extractor writes with a `file` carries `owner`: the dotted chain of the types it is declared in, outermost first, `""` at the top level. A member of a class `C` whose own owner is `o` has owner `o.C` (`C` when `o` is `""`); a function nested in a function has that function's owner, so two nested functions of one name in two functions of one owner still share a node (left open, as before); a namespace or package is no owner. The type is the one the language attaches the member to: a Go method's receiver type with its type parameters stripped (`*Stack[T]` is `Stack`), a Rust `impl` block's type, a C++ out-of-class definition's class (the qualifier's last segment, as its `CONTAINS` stub: `ui::Widget::paint` is `Widget`), a Kotlin `object`. A compose `Service` (also keyed by file) has owner `""`. `common.member_owner(parent_label, parent_name, parent_owner)` is the rule. |
+| O2 | **Identity.** A node with a `file` MERGEs on `(repo_id, name, file, owner)`; `owner` is always written (`""` when the extractor sets none), so the key is never null. The uniqueness constraint `<label>_repo_name_file` becomes `<label>_repo_name_file_owner` on Class, Function and Service (`constraint_statements` drops the old one), and a `(repo_id, name, file)` lookup index keeps every `USING INDEX SEEK ...(repo_id, name, file)` hint seeking. `identity_key` appends the owner when it is not `""`, so a top-level node's dashboard key is unchanged. |
+| O3 | **Edge ends.** `GraphRelationship` gains `from_owner` and `to_owner`. On an end pinned to a file, a non-null owner must equal the node's `owner`; null matches every node of the name in that file (the pre-owner behaviour, and what an unpinned or package-pinned end still does). The extractors set `from_owner` on every edge out of their own symbols; `own_edges` fills it in when the file has one node of that label and name, and sets a `CONTAINS` target's `to_owner` from its parent by O1. `to_owner` on a call target is written only for a target in the writer's own file, where the resolver knows the class: Python `self.m()`/`cls.m()`, `X().m()` and a receiver typed with an in-file class `X` link `X.m` (or the in-file base that declares `m`), not every `m` of the file. A resolver passes such a target as an *owned pin* (`common.owned_pin`, the file and the owner joined by `OWNER_PIN_SEP`), which `call_rows` splits back into `to_file` and `to_owner`; an owned pin never reaches `name_refs`, since a same-file target is never recorded there. Elsewhere a pinned call target links every sibling of its name in the pinned file. |
+| O4 | **`name_refs`.** An entry gains the source's owner as an eighth head field, after `caller_class` (so the G5 read's `split(e, $sep)[2]` and `[5]` are unchanged): `rel_type, from_label, from_name, from_file, to_label, to_name, caller_class, from_owner, pins, confidence[, keys]`. Entries of one source name but two owners are separate. A seven-field entry (written before pins) still parses, unowned. |
+| O5 | **Batches.** "Added", the match-key snapshot and `write_match_keys` key a node by `(label, name, file, owner)` (`list_file_nodes` returns the owner; a shared or Module node has `""`). Adding `B.save` next to an existing `A.save` is therefore an addition: the relink pins the matching end to `(file, owner)` of the added node, so it never re-links a sibling a key pin left out. The replace keeps a file's nodes by `(label, name, owner)`. |
+| O6 | **Upgrade.** `INDEX_FORMAT` 11 (with audit 4 item 5's extractor fixes). The automatic rescan's replace first gives each of the file's old nodes without `owner` the owner `""`, so a top-level symbol keeps its node and its incoming edges; a method's old node is then not kept (its owner is now its class) and is replaced by one node per owner. The rescan rewrites every code edge, so only edges no rescan writes into a method node (a provider's) are lost with it; MODIFIES ends at Modules. |
+| O7 | **Tools.** Lookups by bare name are unchanged and match every owner. `get_source` and `describe_node` also take a name qualified with its owner, `A.save` (`Outer.Inner.run`), when no node has that exact name: it matches the node named `save` whose owner is `A`. Their ambiguity candidates and `describe_node`'s neighbour refs carry `owner` when it is not `""`, and `describe_node` takes `owner`, so a ref is still the next call's arguments; `get_source` returns it too. The owner is read only off a node with a `file`: a declared type's own `owner` field (a runbook's front matter) is neither reserved nor read as one. `compare_branches` looks up a changed method's callers, and `impact_analysis_for_diff` its dependents, by its owner as well as its name and file (a symbol entry carries `owner` when it has one). `find_callers('save')` still returns the callers of every `save`. |
+
+### Interactions
+
+- **MENTIONS** stay by bare name: a document mentioning `save` mentions
+  both siblings, in a fresh scan and through the mentions relink alike.
+- **C# match keys.** A file's same-named methods in two classes are two
+  nodes, each with its own owner's key (`Ns:A`, `Ns:B`); overloads, and one
+  class name in two namespaces of one file, are still one node with the
+  union of their keys.
+- **Handler stubs and C++ `Class` stubs** have no `file`, so no owner; the
+  claimed nodes are unchanged.
+- **Cost.** One more property per symbol; the `(repo_id, name, file)`
+  lookup index replaces the old constraint's index, so a pinned end seeks
+  as before and filters the few siblings by owner.
+
+### Fuzz
+
+`test_graph_accuracy_fuzz.py` gains `op_twin`: a Python file gains or loses
+a second class `Twin` whose `act` and `shared` repeat its other class's
+method names, `act` calling `self.shared()`. Its incremental graph must
+equal a fresh scan, edges compared by `(label, name, file, owner)` at both
+ends.
