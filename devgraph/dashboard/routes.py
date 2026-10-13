@@ -86,6 +86,14 @@ _GRAPH_LIMIT_CEILING = 2000
 # can't write an unbounded file to disk.
 _LAYOUT_PAYLOAD_LIMIT_BYTES = _GRAPH_LIMIT_CEILING * 1024
 _SSE_KEEPALIVE_S = 15
+# The Cypher console's bounds (`POST /cypher`), so a runaway query can't hold
+# the Neo4j the watcher and the MCP tools share, or send the browser the
+# whole database. The live preview fires while the user is still typing, so
+# it gets far less; Run has room for a whole repository's canvas query.
+_CONSOLE_TIMEOUT_S = 60.0
+_CONSOLE_MAX_ROWS = 50_000
+_PREVIEW_TIMEOUT_S = 5.0
+_PREVIEW_MAX_ROWS = 5_000
 # History window bounds for `/database-stats/history`: at least one minute,
 # at most what the in-memory ring buffer holds (one hour).
 _HISTORY_SECONDS_MIN = 60
@@ -707,6 +715,10 @@ def build_router(
         user is still typing) sends only this; a write runs only from Run,
         behind the console's destructive-query confirm. Previews are never
         recorded.
+
+        Both are bounded: a server-side transaction timeout, after which the
+        query is stopped and a plain `Timeout` error says so, and a row cap,
+        past which the rest is dropped and the result says `truncated`.
         """
         _reject_cross_site(request)
         query = (payload.get("query") or "").strip()
@@ -717,15 +729,23 @@ def build_router(
         preview = bool(payload.get("preview"))
         should_record = bool(payload.get("record")) and not preview
         run = engine.preview_cypher_graph if preview else engine.run_cypher_graph
+        timeout_s = _PREVIEW_TIMEOUT_S if preview else _CONSOLE_TIMEOUT_S
+        max_rows = _PREVIEW_MAX_ROWS if preview else _CONSOLE_MAX_ROWS
 
         start = time.monotonic()
         try:
-            result = run(query, params)
+            result = run(query, params, timeout_s=timeout_s, max_rows=max_rows)
         except Exception as exc:  # neo4j driver raises its own exception hierarchy
             if should_record:
                 query_log.record(
                     repo_id=repo_id, query=query, duration_ms=(time.monotonic() - start) * 1000, ok=False
                 )
+            if "TransactionTimedOut" in str(getattr(exc, "code", None) or ""):
+                message = (
+                    f"The query ran longer than {timeout_s:g} s and was stopped. "
+                    "Narrow the MATCH or add a LIMIT."
+                )
+                return {"results": [], "errors": [{"code": "Timeout", "message": message}]}
             return {"results": [], "errors": [{"code": exc.__class__.__name__, "message": str(exc)}]}
 
         if should_record:

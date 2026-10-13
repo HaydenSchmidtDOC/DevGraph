@@ -18,7 +18,7 @@ from pathlib import Path
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-from neo4j import Driver, GraphDatabase, NotificationDisabledClassification, READ_ACCESS, unit_of_work
+from neo4j import Driver, GraphDatabase, NotificationDisabledClassification, Query, READ_ACCESS, unit_of_work
 from neo4j.exceptions import Neo4jError, ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
@@ -2217,7 +2217,14 @@ class GraphEngine:
         """One connectivity check, not retried: raises at once when Neo4j can't be reached."""
         self._driver.verify_connectivity()
 
-    def run_cypher_graph(self, query: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+    def run_cypher_graph(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        timeout_s: float | None = None,
+        max_rows: int | None = None,
+    ) -> dict[str, Any]:
         """Same escape hatch as `run_cypher`, but preserves node/relationship
         graph structure instead of flattening records with `.data()`.
 
@@ -2234,28 +2241,48 @@ class GraphEngine:
         `element_id` here would silently break that round trip. Same gating
         rule as `run_cypher`: never wire this up as a default/unauthenticated
         path.
+
+        `timeout_s` is the server-side transaction timeout; `max_rows` stops
+        pulling rows after that many (see `_graph_shaped`).
         """
         with self._driver.session() as session:
-            return _graph_shaped(session.run(query, parameters or {}))  # type: ignore[arg-type]
+            result = session.run(Query(query, timeout=timeout_s), parameters or {})  # type: ignore[arg-type]
+            return _graph_shaped(result, max_rows)
 
-    def preview_cypher_graph(self, query: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+    def preview_cypher_graph(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        timeout_s: float | None = None,
+        max_rows: int | None = None,
+    ) -> dict[str, Any]:
         """`run_cypher_graph`, but in a read transaction: the server refuses
         any write. Backs the console's live preview, which fires while the
         user is still typing and so must never change the graph."""
 
+        @unit_of_work(timeout=timeout_s)
         def work(tx):
-            return _graph_shaped(tx.run(query, parameters or {}))
+            return _graph_shaped(tx.run(query, parameters or {}), max_rows)
 
         with self._driver.session(default_access_mode=READ_ACCESS) as session:
             return session.execute_read(work)
 
 
-def _graph_shaped(result: Any) -> dict[str, Any]:
+def _graph_shaped(result: Any, max_rows: int | None = None) -> dict[str, Any]:
     """A Cypher result as Neo4j's HTTP `["row","graph"]` shape (see
-    `GraphEngine.run_cypher_graph`), consumed fully before returning."""
+    `GraphEngine.run_cypher_graph`), consumed fully before returning, or only
+    its first `max_rows` rows: `truncated` says whether more existed."""
     columns = list(result.keys())
     data: list[dict[str, Any]] = []
+    truncated = False
     for record in result:
+        if max_rows is not None and len(data) == max_rows:
+            # The rest is discarded, not sent; the query still runs to its end
+            # (bounded by the transaction timeout), and a failure there is raised.
+            result.consume()
+            truncated = True
+            break
         nodes: dict[int, dict[str, Any]] = {}
         rels: dict[int, dict[str, Any]] = {}
 
@@ -2312,7 +2339,7 @@ def _graph_shaped(result: Any) -> dict[str, Any]:
                 "graph": {"nodes": list(nodes.values()), "relationships": list(rels.values())},
             }
         )
-    return {"columns": columns, "data": data}
+    return {"columns": columns, "data": data, "truncated": truncated}
 
 
 def provision_repository_schema(engine: GraphEngine, repo_root: Path | str) -> None:

@@ -1,7 +1,9 @@
-/* Headless test that typing in the Cypher console can never execute a write.
-   Drives the real input listener, previewQueryGlow and runCypher out of
-   index.html against a recording fetch: every request the live preview sends
-   must carry `preview: true`, which the server runs in a read transaction. */
+/* Headless test that typing in the Cypher console can never execute a write,
+   nor stack previews on Neo4j. Drives the real input listener,
+   schedulePreview, previewQueryGlow and runCypher out of index.html against a
+   recording fetch: every request the live preview sends must carry
+   `preview: true`, which the server runs in a read transaction, and at most
+   one is in flight at a time. */
 const fs = require("fs");
 const path = require("path");
 
@@ -18,6 +20,9 @@ const src = [
   grab(/^async function runCypher\(statement, opts\)/m, "\n}"),
   grab(/^let previewDebounce = null;/m, ";"),
   grab(/^let glowRequestSeq = 0;/m, ";"),
+  grab(/^let previewInFlight = null;/m, ";"),
+  grab(/^let previewQueued = null;/m, ";"),
+  grab(/^function schedulePreview\(text\)/m, "\n}"),
   grab(/^async function previewQueryGlow\(text\)/m, "\n}"),
   grab(/^cypherInput\.addEventListener\("input"/m, "\n});"),
 ].join("\n");
@@ -29,10 +34,16 @@ const cypherInput = {
   addEventListener: (ev, fn) => { if (ev === "input") inputHandler = fn; },
 };
 const pending = [];
+// When set, each fetch waits for its own release() before replying.
+let held = null;
+let inFlight = 0, maxInFlight = 0;
 const globals = {
   document: { getElementById: id => (id === "repoSelect" ? { value: "zz-repo" } : null) },
   fetch: async (url, opts) => {
     bodies.push(JSON.parse(opts.body));
+    inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+    if (held) await new Promise(release => held.push(release));
+    inFlight--;
     return { json: async () => ({ results: [], errors: [{ code: "Forbidden", message: "read only" }] }) };
   },
   setTimeout: fn => { pending.push(fn); return pending.length; },
@@ -70,6 +81,29 @@ const check = (label, cond, detail) => {
     bodies.every(b => b.preview === true), JSON.stringify(bodies.filter(b => b.preview !== true)));
   check("no preview is recorded in the query log",
     bodies.every(b => !b.record), JSON.stringify(bodies));
+
+  // 1b. Pauses in typing while a preview is still running on the server: no
+  //     second query is sent beside it, the texts in between are never sent,
+  //     and the newest one runs once the first returns.
+  bodies.length = 0;
+  held = [];
+  maxInFlight = 0;
+  const settled = [];
+  for (const text of ["MATCH (a) RETURN a", "MATCH (b) RETURN b", "MATCH (c) RETURN c"]) {
+    cypherInput.value = text;
+    inputHandler();
+    settled.push(pending.shift()());
+  }
+  await new Promise(r => setTimeout(r, 0));
+  check("one preview in flight while typing continues", bodies.length === 1 && maxInFlight === 1,
+    JSON.stringify(bodies));
+  while (held.length) { held.shift()(); await new Promise(r => setTimeout(r, 0)); }
+  await Promise.all(settled);
+  check("only the first and the newest text are previewed",
+    JSON.stringify(bodies.map(b => b.query)) === JSON.stringify(["MATCH (a) RETURN a", "MATCH (c) RETURN c"]),
+    JSON.stringify(bodies.map(b => b.query)));
+  check("never two previews at once", maxInFlight === 1, `max in flight ${maxInFlight}`);
+  held = null;
 
   // 2. Run (and everything else that calls runCypher without opts) is not a preview.
   bodies.length = 0;

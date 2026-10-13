@@ -23,7 +23,7 @@ from devgraph.registry.store import RepoRegistry
 class _StubEngine:
     """Serves the dashboard's Cypher console without a graph behind it."""
 
-    def run_cypher_graph(self, query, params=None):
+    def run_cypher_graph(self, query, params=None, **bounds):
         return {"data": []}
 
 
