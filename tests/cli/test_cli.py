@@ -2002,8 +2002,8 @@ def test_generated_mcp_command_ignores_devgraph_package_in_working_directory(tmp
         "HOME": str(home),
         "USERPROFILE": str(home),
         "DEVGRAPH_REGISTRY_DB_PATH": str(home / ".devgraph" / "registry.sqlite3"),
-        # Unreachable, so the real server exits at its connectivity check
-        # before starting anything else.
+        # Unreachable: the real server says so on stderr, then serves until
+        # stdin (closed here) ends.
         "DEVGRAPH_NEO4J_URI": "bolt://127.0.0.1:1",
     })
 
@@ -2019,8 +2019,7 @@ def test_generated_mcp_command_ignores_devgraph_package_in_working_directory(tmp
 
     safe = run(list(MCP_SERVER_ARGS))
     assert marker not in safe.stdout
-    assert safe.returncode != 0
-    assert "ServiceUnavailable" in safe.stderr  # reached the real server
+    assert "Neo4j isn't reachable at bolt://127.0.0.1:1" in safe.stderr  # reached the real server
     assert str(workdir) not in safe.stderr
 
 
