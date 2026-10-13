@@ -454,9 +454,9 @@ RETRY_LOG_LEVEL = logging.WARNING
 _BASE_DELAY_S = 0.5
 
 
-#: How long `GraphEngine.run_read_cypher` waits before its one quick retry (see
-#: `GraphEngine`'s `quick_retry_s`).
-QUICK_RETRY_PAUSE_S = 0.5
+#: How long a fail-fast `GraphEngine.run_read_cypher` waits before its one
+#: retry of a transient failure (see `GraphEngine`'s `fail_fast`).
+FAIL_FAST_RETRY_PAUSE_S = 0.5
 
 
 #: How long `GraphEngine.close` waits, by default, for open sessions to end.
@@ -1072,25 +1072,27 @@ class GraphEngine:
         user: str,
         password: str,
         *,
-        quick_retry_s: float | None = None,
+        fail_fast: bool = False,
         connection_timeout_s: float | None = None,
     ) -> None:
-        """Omitted, both limits keep the driver's defaults: a managed transaction
-        is retried for up to 30 s, and getting a connection may take 30-60 s.
+        """Omitted, both keep the driver's defaults: a managed transaction is
+        retried for up to 30 s, and getting a connection may take 30-60 s.
 
         `connection_timeout_s` bounds getting a connection: opening it, the Bolt
-        handshake, or waiting for a pooled one. `quick_retry_s` turns the
-        driver's retries off; `run_read_cypher` then retries a failed read once,
-        `QUICK_RETRY_PAUSE_S` later, only when it failed within `quick_retry_s`
-        (a blip: a deadlock, a dropped connection), never after a connection
-        timed out or took long to be refused (Windows reports a refusal after
-        about 2 s). The MCP server sets both, so a request fails within a few
-        seconds when Neo4j is down."""
+        handshake, or waiting for a pooled one. `fail_fast` turns the driver's
+        retries off; `run_read_cypher` then retries a read once,
+        `FAIL_FAST_RETRY_PAUSE_S` later, when it failed once connected (a
+        transient error, an expired session, the connection lost mid-query),
+        and never when no connection could be had at all (refused, timed out).
+        The MCP server sets both, so a request fails within a few seconds when
+        Neo4j is down."""
         self.uri = uri
-        self._quick_retry_s = quick_retry_s
+        self._fail_fast = fail_fast
         limits: dict[str, float] = {}
-        if quick_retry_s is not None:
-            limits["max_transaction_retry_time"] = 0
+        if fail_fast:
+            # Negative: the driver retries while `elapsed > limit` is false, and
+            # a coarse clock can make the elapsed time exactly 0.
+            limits["max_transaction_retry_time"] = -1
         if connection_timeout_s is not None:
             limits["connection_timeout"] = connection_timeout_s
             limits["connection_acquisition_timeout"] = connection_timeout_s
@@ -2135,8 +2137,11 @@ class GraphEngine:
         plane for `devgraph.tools.yaml` tools.
         """
 
+        connected = []
+
         @unit_of_work(timeout=timeout_s)
         def work(tx):
+            connected.append(True)
             rows: list[dict] = []
             for record in tx.run(query, parameters):
                 if len(rows) == max_rows:
@@ -2144,21 +2149,25 @@ class GraphEngine:
                 rows.append(record.data())
             return rows, False
 
-        if self._quick_retry_s is None:
+        if not self._fail_fast:
             with self._driver.session(default_access_mode=READ_ACCESS) as session:
                 return session.execute_read(work)
-        started = time.monotonic()
         try:
             with self._driver.session(default_access_mode=READ_ACCESS) as session:
                 return session.execute_read(work)
         except ABORTS_BATCH:
             raise
-        except _RETRYABLE_EXCEPTIONS:
-            if time.monotonic() - started > self._quick_retry_s:
+        except _RETRYABLE_EXCEPTIONS as exc:
+            timed_out = "TransactionTimedOut" in str(getattr(exc, "code", None) or "")
+            if not connected or timed_out:  # Neo4j can't be reached, or the query ran out of time
                 raise
-        time.sleep(QUICK_RETRY_PAUSE_S)
+        time.sleep(FAIL_FAST_RETRY_PAUSE_S)
         with self._driver.session(default_access_mode=READ_ACCESS) as session:
             return session.execute_read(work)
+
+    def probe_connectivity(self) -> None:
+        """One connectivity check, not retried: raises at once when Neo4j can't be reached."""
+        self._driver.verify_connectivity()
 
     def run_cypher_graph(self, query: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
         """Same escape hatch as `run_cypher`, but preserves node/relationship

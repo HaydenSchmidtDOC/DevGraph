@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -292,6 +293,46 @@ def _with_neo4j_errors(fn: Callable[..., Any], uri: str) -> Callable[..., Any]:
     return wrapper
 
 
+class _SchemaProvisioner:
+    """Runs `init_schema` once, for a server that started with Neo4j down (its
+    startup could not). Thread-safe; marked done only when it succeeded."""
+
+    def __init__(self, engine: GraphEngine) -> None:
+        self._engine = engine
+        self._lock = threading.Lock()
+        self.ready = False
+
+    def ensure(self) -> None:
+        """Provision the schema unless done. Neo4j still unreachable raises the
+        driver's error at once (one probe, not retried); any other failure is
+        logged and retried on the next call."""
+        if self.ready:
+            return
+        with self._lock:
+            if self.ready:
+                return
+            self._engine.probe_connectivity()
+            try:
+                self._engine.init_schema(wait=False)
+            except Exception:
+                logger.warning("provisioning the graph schema failed; retrying on the next call", exc_info=True)
+                return
+            self.ready = True
+
+
+def _with_schema(fn: Callable[..., Any], provisioner: _SchemaProvisioner | None) -> Callable[..., Any]:
+    """Wrap a built-in tool so `provisioner` (if any) runs before the call."""
+    if provisioner is None:
+        return fn
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        provisioner.ensure()
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
 def _with_shadow_notices(fn: Callable[..., Any], shadowed: Callable[[], dict[str, list[str]]]) -> Callable[..., Any]:
     """Wrap a built-in tool so its dict result carries the notices for declared tools its name shadows.
 
@@ -436,6 +477,7 @@ def build_server(
     session_repo: Any | None = None,
     session_source: str = "none",
     session_pinned: str | None = None,
+    provision_schema: bool = False,
 ) -> MCPServer:
     """Construct an MCPServer with every DevGraph tool registered against `engine`.
 
@@ -449,6 +491,10 @@ def build_server(
     `devgraph://project-tools` resource. `session_pinned` is the raw
     DEVGRAPH_MCP_REPO value, used only in the unmatched-value notice and the
     no-session error.
+
+    `provision_schema` (the server started with Neo4j down) makes the first
+    built-in call that finds Neo4j reachable run `init_schema` first; see
+    `_SchemaProvisioner`.
 
     The same `session_repo` is the default `repo_id` for every built-in tool
     called without one (see `_with_repo_default`), and the `instructions` name
@@ -485,6 +531,7 @@ def build_server(
     )
 
     neo4j_uri = getattr(engine, "uri", None) or settings.neo4j_uri
+    provisioner = _SchemaProvisioner(engine) if provision_schema else None
     # Single chokepoint for tool-call telemetry: every `@server.tool(...)`
     # registration below goes through this rebound decorator, including any
     # tool added later, so instrumentation can't be forgotten on a new tool
@@ -516,13 +563,16 @@ def build_server(
         return lambda fn: register(
             _instrument(
                 _with_neo4j_errors(
-                    _with_shadow_notices(
-                        _with_cross_repo_gate(
-                            _with_repo_default(fn, session_repo, session_source, registry, unscoped_error),
-                            settings.allow_cross_repo,
-                            registry,
+                    _with_schema(
+                        _with_shadow_notices(
+                            _with_cross_repo_gate(
+                                _with_repo_default(fn, session_repo, session_source, registry, unscoped_error),
+                                settings.allow_cross_repo,
+                                registry,
+                            ),
+                            lambda: status.shadowed,
                         ),
-                        lambda: status.shadowed,
+                        provisioner,
                     ),
                     neo4j_uri,
                 )
@@ -969,11 +1019,11 @@ def build_server(
     return server
 
 
-#: The MCP server's engine limits (see `GraphEngine`): a read that fails within
-#: a second (a blip) is retried once; getting a connection may take 2 s. With
-#: Neo4j down a call fails in at most about 3.5 s (1 s + the 0.5 s pause + 2 s)
-#: on every platform, not after the driver's default 30 s of retries.
-MCP_QUICK_RETRY_S = 1.0
+#: How long the MCP server's engine may take to get a connection (see
+#: `GraphEngine`, which it runs `fail_fast`: a read that failed once connected
+#: is retried once, one that could not connect is not). With Neo4j down a call
+#: fails in about this long on every platform, not after the driver's default
+#: 30 s of retries.
 MCP_CONNECTION_TIMEOUT_S = 2.0
 
 
@@ -983,7 +1033,7 @@ def mcp_engine(settings: Any) -> GraphEngine:
         settings.neo4j_uri,
         settings.neo4j_user,
         settings.neo4j_password,
-        quick_retry_s=MCP_QUICK_RETRY_S,
+        fail_fast=True,
         connection_timeout_s=MCP_CONNECTION_TIMEOUT_S,
     )
 
@@ -1013,19 +1063,22 @@ def main() -> None:
     """
     settings = get_settings()
     engine = mcp_engine(settings)
+    provision_schema = False
     try:
-        engine.verify_connectivity()
+        # One check, not retried, so a server with Neo4j down starts serving at once.
+        engine.probe_connectivity()
         # Not waiting for indexes an upgrade is still building: that can outlast
         # the client's handshake timeout, and each query waits for its own.
         engine.init_schema(wait=False)
     except Exception as exc:
         # Neo4j down (or refusing the login) at startup: serve anyway, so the
-        # client gets each tool's error saying how to fix it, and the tools work
-        # as soon as Neo4j is reachable (the agent provisions the schema).
+        # client gets each tool's error saying how to fix it, and provision the
+        # schema on the first call that finds Neo4j reachable.
         error = devgraph_tools.neo4j_unavailable(exc, settings.neo4j_uri)
         if error is None:
             raise
         logger.warning("%s; serving anyway, each tool answers with this until Neo4j is reachable", error)
+        provision_schema = True
     registry = RepoRegistry(settings.registry_db_path)
 
     try:
@@ -1046,6 +1099,7 @@ def main() -> None:
             session_repo=session_repo,
             session_source=source,
             session_pinned=os.environ.get(SESSION_REPO_ENV),
+            provision_schema=provision_schema,
         )
         anyio.run(run_stdio, server)
     finally:

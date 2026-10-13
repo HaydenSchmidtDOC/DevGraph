@@ -1,6 +1,7 @@
 """With Neo4j down, an MCP call fails within seconds with an error saying what to
 do, instead of retrying for the driver's default 30 s and returning its raw error."""
 
+import logging
 import socket
 from contextlib import contextmanager
 import threading
@@ -11,7 +12,7 @@ from pathlib import Path
 import anyio
 import pytest
 from mcp.client import Client
-from neo4j.exceptions import AuthError, ServiceUnavailable, TransientError
+from neo4j.exceptions import AuthError, ServiceUnavailable, SessionExpired, TransientError
 
 from devgraph.config.settings import Settings
 from devgraph.graph.engine import EngineClosed, GraphEngine
@@ -107,11 +108,21 @@ def test_other_errors_are_not_reported_as_neo4j_down():
     assert tools.neo4j_unavailable(ServiceUnavailable("down"), CLOSED) is not None
 
 
-class _Driver:
-    """Fails each session's read with the next of `failures`, then answers."""
+class _Tx:
+    def __init__(self, failure):
+        self.failure = failure
 
-    def __init__(self, failures, slow_s=0.0):
-        self.failures, self.slow_s, self.attempts = list(failures), slow_s, 0
+    def run(self, query, parameters):
+        raise self.failure
+
+
+class _Driver:
+    """Each read takes the next of `steps`: ("connect", error) fails before the
+    transaction function runs (no connection), ("query", error) fails inside it,
+    after `slow_s`; no steps left, the read answers."""
+
+    def __init__(self, steps, slow_s=0.0):
+        self.steps, self.slow_s, self.attempts = list(steps), slow_s, 0
 
     @contextmanager
     def session(self, **kwargs):
@@ -119,47 +130,114 @@ class _Driver:
 
     def execute_read(self, work):
         self.attempts += 1
-        if self.failures:
-            time.sleep(self.slow_s)
-            raise self.failures.pop(0)
-        return [], False
+        if not self.steps:
+            return [], False
+        stage, failure = self.steps.pop(0)
+        time.sleep(self.slow_s)
+        if stage == "connect":
+            raise failure
+        return work(_Tx(failure))
 
 
-def _quick_engine(driver):
-    engine = GraphEngine(CLOSED, "neo4j", "x", quick_retry_s=1.0, connection_timeout_s=2.0)
+def _fail_fast_engine(driver):
+    engine = GraphEngine(CLOSED, "neo4j", "x", fail_fast=True, connection_timeout_s=2.0)
     engine._driver = driver
     return engine
 
 
-def test_a_quick_blip_is_retried_once():
-    driver = _Driver([TransientError("deadlock")])
-    assert _quick_engine(driver).run_read_cypher("RETURN 1", {}, timeout_s=1, max_rows=1) == ([], False)
+def _read(engine):
+    return engine.run_read_cypher("RETURN 1", {}, timeout_s=1, max_rows=1)
+
+
+@pytest.mark.parametrize(
+    "failure", [TransientError("deadlock"), SessionExpired("expired"), ServiceUnavailable("connection lost")]
+)
+def test_a_failure_once_connected_is_retried_once_however_long_it_took(failure):
+    driver = _Driver([("query", failure)], slow_s=1.2)
+    assert _read(_fail_fast_engine(driver)) == ([], False)
     assert driver.attempts == 2
-    driver = _Driver([ServiceUnavailable("dropped"), ServiceUnavailable("dropped")])
-    with pytest.raises(ServiceUnavailable):
-        _quick_engine(driver).run_read_cypher("RETURN 1", {}, timeout_s=1, max_rows=1)
+    driver = _Driver([("query", failure), ("query", failure)])
+    with pytest.raises(type(failure)):
+        _read(_fail_fast_engine(driver))
     assert driver.attempts == 2
 
 
-def test_a_slow_failure_is_not_retried():
-    driver = _Driver([ServiceUnavailable("timed out")], slow_s=1.1)
+def test_no_connection_at_all_is_not_retried():
+    driver = _Driver([("connect", ServiceUnavailable("refused"))])
     with pytest.raises(ServiceUnavailable):
-        _quick_engine(driver).run_read_cypher("RETURN 1", {}, timeout_s=1, max_rows=1)
+        _read(_fail_fast_engine(driver))
     assert driver.attempts == 1
 
 
-def test_the_server_starts_and_serves_with_neo4j_down(tmp_path, monkeypatch, caplog):
-    from devgraph.graph import engine as engine_module
+def test_the_driver_itself_never_retries(caplog):
+    engine = mcp_server.mcp_engine(Settings(neo4j_uri=CLOSED))
+    caplog.set_level(logging.WARNING, logger="neo4j")
+    try:
+        with pytest.raises(ServiceUnavailable):
+            _read(engine)
+    finally:
+        engine.close(timeout=0.1)
+    assert not [r for r in caplog.records if "will be retried" in r.getMessage()]
 
-    monkeypatch.setattr(engine_module, "_BASE_DELAY_S", 0.001)
-    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3", neo4j_uri=CLOSED))
+
+class _SchemaEngine:
+    """Unreachable until `up`; counts init_schema runs."""
+
+    uri = CLOSED
+
+    def __init__(self):
+        self.up, self.inits = False, 0
+
+    def probe_connectivity(self):
+        if not self.up:
+            raise ServiceUnavailable("refused")
+
+    def init_schema(self, wait=True):
+        assert wait is False
+        self.inits += 1
+
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        if not self.up:
+            raise ServiceUnavailable("refused")
+        return [{"repo_name": "zz-schema", "service_count": 0}], False
+
+
+def test_a_server_started_with_neo4j_down_provisions_the_schema_once_it_is_up(tmp_path, monkeypatch):
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3"))
+    record = _Repo("zz-schema", tmp_path)
+    engine = _SchemaEngine()
+    server = mcp_server.build_server(
+        engine, _Registry([record]), session_repo=record, session_source="env", provision_schema=True
+    )
+
+    def call():
+        async def scenario():
+            async with Client(server, mode="auto") as client:
+                return await client.call_tool("summarise_repository", {})
+
+        return anyio.run(scenario)
+
+    down = call()
+    assert down.is_error is True and "isn't reachable" in down.content[0].text
+    assert engine.inits == 0
+    engine.up = True
+    assert call().is_error is False and call().is_error is False
+    assert engine.inits == 1
+
+
+@pytest.mark.parametrize("down", ["refused", "silent"])
+def test_the_server_starts_and_serves_with_neo4j_down(tmp_path, monkeypatch, caplog, down, request):
+    uri = CLOSED if down == "refused" else request.getfixturevalue("silent_uri")
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3", neo4j_uri=uri))
     for name in ("start_tray_if_not_running", "register_tray_holder", "stop_tray_if_last_holder"):
         monkeypatch.setattr(mcp_server.lifecycle, name, lambda: None)
     served = []
-    monkeypatch.setattr(mcp_server.anyio, "run", lambda fn, server: served.append(server))
+    monkeypatch.setattr(mcp_server.anyio, "run", lambda fn, server: served.append(time.monotonic()))
+    started = time.monotonic()
     mcp_server.main()
     assert len(served) == 1
-    assert f"Neo4j isn't reachable at {CLOSED}; start Neo4j" in caplog.text and "serving anyway" in caplog.text
+    assert served[0] - started < BOUND_S, "one connectivity probe, not retried"
+    assert f"Neo4j isn't reachable at {uri}; start Neo4j" in caplog.text and "serving anyway" in caplog.text
 
 
 @pytest.mark.parametrize(
