@@ -113,6 +113,7 @@ def test_a_failed_statement_is_retried_not_the_one_after_it(monkeypatch):
     """clear_extracted_properties reads the keys, then removes the stale ones:
     a failure of the read is retried as the read."""
     engine, driver = fake_engine(monkeypatch, [TransientError("deadlock"), None, None], [{"key": "stale"}])
+    monkeypatch.setattr(engine, "_schema_labels", lambda repo_id: [])  # the labels' own read is not under test
     assert engine.clear_extracted_properties("r", "fs", "Doc", keep=[]) == ["stale"]
     assert len(driver.runs) == 3
     assert driver.runs[0] == driver.runs[1] != driver.runs[2]
@@ -121,6 +122,7 @@ def test_a_failed_statement_is_retried_not_the_one_after_it(monkeypatch):
 
 def test_records_failing_as_they_are_read_are_retried(monkeypatch):
     engine, driver = fake_engine(monkeypatch, [TransientError("deadlock"), None], [{"label": "Module", "name": "m"}])
+    monkeypatch.setattr(engine, "_schema_labels", lambda repo_id: ["Doc"])  # the labels' own read is not under test
     assert engine.extracted_nodes_at("r", "fs", ["m"]) == {("Module", "m")}
     assert len(driver.runs) == 2
 

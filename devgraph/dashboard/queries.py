@@ -17,7 +17,7 @@ from devgraph.graph.engine import GraphEngine
 def count_nodes(engine: GraphEngine, repo_id: str) -> int:
     """Cheap total node count for a repo, used by the `/api/repos` list."""
     results = engine.run_cypher(
-        "MATCH (n {repo_id: $repo_id}) RETURN count(n) AS count", {"repo_id": repo_id}
+        engine.repository_nodes([repo_id]) + "RETURN count(n) AS count", {"repo_ids": [repo_id]}
     )
     return results[0]["count"] if results else 0
 
@@ -30,18 +30,18 @@ def summary_counts(engine: GraphEngine, repo_id: str) -> dict[str, Any]:
     /types are actually present so the dashboard's stat grid doesn't need
     updating every time a new label is introduced.
     """
+    nodes = engine.repository_nodes([repo_id])
     node_rows = engine.run_cypher(
-        "MATCH (n {repo_id: $repo_id}) "
-        "UNWIND labels(n) AS label "
+        nodes + "UNWIND labels(n) AS label "
         "RETURN label, count(*) AS count "
         "ORDER BY label",
-        {"repo_id": repo_id},
+        {"repo_ids": [repo_id]},
     )
     rel_rows = engine.run_cypher(
-        "MATCH (a {repo_id: $repo_id})-[r]->(b {repo_id: $repo_id}) "
+        nodes + "MATCH (n)-[r]->(b) WHERE b.repo_id = $repo_id "
         "RETURN type(r) AS type, count(*) AS count "
         "ORDER BY type",
-        {"repo_id": repo_id},
+        {"repo_ids": [repo_id], "repo_id": repo_id},
     )
     return {
         "nodes_by_label": {row["label"]: row["count"] for row in node_rows},
@@ -52,10 +52,9 @@ def summary_counts(engine: GraphEngine, repo_id: str) -> dict[str, Any]:
 def node_counts_by_label(engine: GraphEngine, repo_ids: list[str]) -> dict[str, int]:
     """Node counts grouped by label across `repo_ids`; scans nodes only."""
     rows = engine.run_cypher(
-        "MATCH (n) WHERE n.repo_id IN $ids "
-        "UNWIND labels(n) AS label "
+        engine.repository_nodes(repo_ids) + "UNWIND labels(n) AS label "
         "RETURN label, count(*) AS count",
-        {"ids": repo_ids},
+        {"repo_ids": repo_ids},
     )
     return {row["label"]: row["count"] for row in rows}
 
@@ -72,21 +71,19 @@ def graph_slice(
     Cypher can't parameterize a label, so an unvalidated value must never be
     interpolated into the query string.
     """
-    label_filter = f"AND n:`{label}`" if label else ""
+    nodes = f"MATCH (n:`{label}` {{repo_id: $repo_id}}) " if label else engine.repository_nodes([repo_id])
     node_rows = engine.run_cypher(
-        f"MATCH (n {{repo_id: $repo_id}}) "
-        f"WHERE true {label_filter} "
-        "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, n.file AS file "
+        nodes + "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, n.file AS file "
         "LIMIT $limit",
-        {"repo_id": repo_id, "limit": limit},
+        {"repo_id": repo_id, "repo_ids": [repo_id], "limit": limit},
     )
     ids = [row["id"] for row in node_rows]
     if not ids:
         return node_rows, []
 
     edge_rows = engine.run_cypher(
-        "MATCH (a {repo_id: $repo_id})-[r]->(b {repo_id: $repo_id}) "
-        "WHERE elementId(a) IN $ids AND elementId(b) IN $ids "
+        "MATCH (a)-[r]->(b) WHERE elementId(a) IN $ids AND elementId(b) IN $ids "
+        "AND a.repo_id = $repo_id AND b.repo_id = $repo_id "
         "RETURN elementId(a) AS source, elementId(b) AS target, type(r) AS rel_type "
         "LIMIT $limit",
         {"repo_id": repo_id, "ids": ids, "limit": limit},

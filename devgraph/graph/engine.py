@@ -339,14 +339,17 @@ def _unclaim_service_api_edges_tx(tx, repo_id: str, file_name: str) -> None:
 # lifecycle. Path-scoped queries match `path`; `keep` lists match the key.
 # A path matches its own node and, as a directory, everything below it --
 # the trailing '/' keeps `src` from matching `src2/...`.
+# Each one follows the candidates GraphEngine._provider_nodes yields as `n`
+# (the repository's nodes of its applied schema's labels), never a match on
+# `{repo_id}` alone, which scanned every node in the database.
 _EXTRACTED_AT_OR_BELOW = (
-    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
+    "WITH n WHERE n.extractor = $extractor "
     "AND (n.path IN $paths OR any(p IN $paths WHERE n.path STARTS WITH p + '/')) "
 )
 _DELETE_EXTRACTED_PATHS_CYPHER = _EXTRACTED_AT_OR_BELOW + "DETACH DELETE n"
 _EXTRACTED_NODES_AT_CYPHER = _EXTRACTED_AT_OR_BELOW + "RETURN DISTINCT labels(n)[0] AS label, n.name AS name"
 _PRUNE_EXTRACTED_CYPHER = (
-    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
+    "WITH n WHERE n.extractor = $extractor "
     "AND NOT (labels(n)[0] + ':' + n.name) IN $keep "
     "DETACH DELETE n RETURN count(n) AS pruned"
 )
@@ -354,23 +357,21 @@ _PRUNE_EXTRACTED_CYPHER = (
 # exact paths are candidates (never anything below them), so a batch of
 # changed files can't prune the rest of the provider's nodes.
 _PRUNE_EXTRACTED_AT_CYPHER = (
-    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND n.path IN $paths "
+    "WITH n WHERE n.extractor = $extractor AND n.path IN $paths "
     "AND NOT (labels(n)[0] + ':' + n.name) IN $keep "
     "DETACH DELETE n RETURN count(n) AS pruned"
 )
 # A provider's own edges are the outgoing ones of a non-built-in type; incoming
 # edges belong to whoever wrote them. A null $paths means the whole repo.
 _DELETE_EXTRACTED_EDGES_CYPHER = (
-    "MATCH (a {repo_id: $repo_id})-[r]->() WHERE a.extractor = $extractor "
-    "AND ($paths IS NULL OR a.path IN $paths) AND NOT type(r) IN $builtin_types "
+    "WITH n WHERE n.extractor = $extractor AND ($paths IS NULL OR n.path IN $paths) "
+    "MATCH (n)-[r]->() WHERE NOT type(r) IN $builtin_types "
     "DELETE r RETURN count(r) AS deleted"
 )
 # Property keys present on one provider label, for clearing the ones the
 # schema no longer declares (see GraphEngine.clear_extracted_properties).
-_EXTRACTED_PROPERTY_KEYS_CYPHER = (
-    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] = $label "
-    "UNWIND keys(n) AS key RETURN DISTINCT key"
-)
+_EXTRACTED_OF_LABEL = "WITH n WHERE n.extractor = $extractor AND labels(n)[0] = $label "
+_EXTRACTED_PROPERTY_KEYS_CYPHER = _EXTRACTED_OF_LABEL + "UNWIND keys(n) AS key RETURN DISTINCT key"
 
 # Which project schema the repository's graph was last built with (see
 # dispatch.apply_project_schema). Kept on the Repository node so every
@@ -1300,9 +1301,12 @@ class GraphEngine:
         """Delete one provider's nodes at these repo-relative paths, or below them."""
         if not paths:
             return
+        nodes = self._provider_nodes(repo_id)
+        if nodes is None:
+            return
         with self._driver.session() as session:
             _run(
-                session, _DELETE_EXTRACTED_PATHS_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
+                session, nodes + _DELETE_EXTRACTED_PATHS_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
             )
 
     def extracted_nodes_at(self, repo_id: str, extractor: str, paths: list[str]) -> set[tuple[str, str]]:
@@ -1310,9 +1314,12 @@ class GraphEngine:
         the nodes delete_extracted_nodes would delete."""
         if not paths:
             return set()
+        nodes = self._provider_nodes(repo_id)
+        if nodes is None:
+            return set()
         with self._driver.session() as session:
             result = _run_records(
-                session, _EXTRACTED_NODES_AT_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
+                session, nodes + _EXTRACTED_NODES_AT_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
             )
             return {(record["label"], record["name"]) for record in result or []}
 
@@ -1320,10 +1327,13 @@ class GraphEngine:
         """(label, name, path) of every node one provider wrote under these labels in a repo."""
         if not labels:
             return set()
+        nodes = self._provider_nodes(repo_id, labels)
+        if nodes is None:
+            return set()
         with self._driver.session() as session:
             result = _run_records(
                 session,
-                "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] IN $labels "
+                nodes + "WITH n WHERE n.extractor = $extractor AND labels(n)[0] IN $labels "
                 "RETURN labels(n)[0] AS label, n.name AS name, n.path AS path",
                 repo_id=repo_id, extractor=extractor, labels=labels,
             )
@@ -1333,10 +1343,13 @@ class GraphEngine:
         """The `path` of every node one provider wrote in a repo, only under
         these labels when `labels` is given: the provider's side of the graph's
         file list (see dispatch._graph_files)."""
+        nodes = self._provider_nodes(repo_id, labels or ())
+        if nodes is None:
+            return set()
         with self._driver.session() as session:
             result = _run_records(
                 session,
-                "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
+                nodes + "WITH n WHERE n.extractor = $extractor "
                 "AND ($labels IS NULL OR labels(n)[0] IN $labels) AND n.path IS NOT NULL "
                 "RETURN DISTINCT n.path AS path",
                 repo_id=repo_id, extractor=extractor, labels=labels,
@@ -1349,9 +1362,12 @@ class GraphEngine:
         The full-scan reconcile for provider-owned nodes: it also removes nodes
         of a label the schema no longer declares.
         """
+        nodes = self._provider_nodes(repo_id, [entry.split(":", 1)[0] for entry in keep])
+        if nodes is None:
+            return 0
         with self._driver.session() as session:
             result = _run_records(
-                session, _PRUNE_EXTRACTED_CYPHER, repo_id=repo_id, extractor=extractor, keep=keep
+                session, nodes + _PRUNE_EXTRACTED_CYPHER, repo_id=repo_id, extractor=extractor, keep=keep
             )
             records = [record.data() for record in result or []]
         return records[0]["pruned"] if records else 0
@@ -1360,9 +1376,12 @@ class GraphEngine:
         """Delete one provider's nodes at exactly these paths, except `keep` ("Label:name")."""
         if not paths:
             return 0
+        nodes = self._provider_nodes(repo_id, [entry.split(":", 1)[0] for entry in keep])
+        if nodes is None:
+            return 0
         with self._driver.session() as session:
             result = _run_records(
-                session, _PRUNE_EXTRACTED_AT_CYPHER,
+                session, nodes + _PRUNE_EXTRACTED_AT_CYPHER,
                 repo_id=repo_id, extractor=extractor, paths=paths, keep=keep,
             )
             records = [record.data() for record in result or []]
@@ -1373,9 +1392,12 @@ class GraphEngine:
         or across the whole repo when `paths` is None."""
         if paths is not None and not paths:
             return 0
+        nodes = self._provider_nodes(repo_id)
+        if nodes is None:
+            return 0
         with self._driver.session() as session:
             result = _run_records(
-                session, _DELETE_EXTRACTED_EDGES_CYPHER, repo_id=repo_id, extractor=extractor,
+                session, nodes + _DELETE_EXTRACTED_EDGES_CYPHER, repo_id=repo_id, extractor=extractor,
                 paths=paths, builtin_types=list(RELATIONSHIP_TYPES),
             )
             records = [record.data() for record in result or []]
@@ -1393,9 +1415,12 @@ class GraphEngine:
         # Runtime import: see the TYPE_CHECKING note at the top of this module.
         from devgraph.config.project_schema import PROPERTY_NAME_PATTERN
 
+        nodes = self._provider_nodes(repo_id, [label])
+        if nodes is None:
+            return []
         params = {"repo_id": repo_id, "extractor": extractor, "label": label}
         with self._driver.session() as session:
-            result = _run_records(session, _EXTRACTED_PROPERTY_KEYS_CYPHER, **params)
+            result = _run_records(session, nodes + _EXTRACTED_PROPERTY_KEYS_CYPHER, **params)
             present = [record["key"] for record in result or []]
             stale = sorted(
                 key for key in present
@@ -1406,12 +1431,7 @@ class GraphEngine:
             )
             if stale:
                 removals = ", ".join(f"n.`{key}`" for key in stale)
-                _run(
-                    session,
-                    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] = $label "
-                    f"REMOVE {removals}",
-                    **params,
-                )
+                _run(session, nodes + _EXTRACTED_OF_LABEL + f"REMOVE {removals}", **params)
         return stale
 
     def read_applied_schema(self, repo_id: str) -> dict[str, Any] | None:
@@ -1727,6 +1747,34 @@ class GraphEngine:
             label for label in applied.get("labels") or []
             if label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or "")
         ]
+
+    def _provider_nodes(self, repo_id: str, labels: Iterable[str] = ()) -> str | None:
+        """The repository's nodes of its applied schema's labels, and of
+        `labels` (one being written before the schema is recorded), as a
+        `_union` yielding `n`: every node a provider can own, each label
+        matched on its own. None when there are no such labels, so there is
+        nothing to match. Labels that aren't a valid user label are dropped,
+        since they are interpolated."""
+        from devgraph.config.project_schema import LABEL_PATTERN  # runtime import: see TYPE_CHECKING above
+
+        extra = [label for label in labels if label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or "")]
+        names = sorted(set(self._schema_labels(repo_id)) | set(extra))
+        if not names:
+            return None
+        return _union(f"MATCH (n:{label}) WHERE n.repo_id = $repo_id RETURN n" for label in names)
+
+    def repository_nodes(self, repo_ids: list[str]) -> str:
+        """Every node of these repositories (the query's `$repo_ids`) as a
+        `_union` yielding `n`: each named label through its `(repo_id, name)`
+        index, the Repository nodes, and the labels their applied schemas
+        record. For whole-repository reads (the dashboard's counts), which
+        matched `{repo_id}` alone and so scanned every node in the database."""
+        user = sorted({label for repo_id in repo_ids for label in self._schema_labels(repo_id)})
+        return _union(
+            [f"MATCH (n:{label}) WHERE n.repo_id IN $repo_ids AND n.name IS NOT NULL RETURN n" for label in NAMED_LABELS]
+            + ["MATCH (n:Repository) WHERE n.repo_id IN $repo_ids RETURN n"]
+            + [f"MATCH (n:{label}) WHERE n.repo_id IN $repo_ids RETURN n" for label in user]
+        )
 
     def entity_names(self, repo_id: str, names: list[str] | None) -> list[tuple[str, str]]:
         """(name, label) of every named node of the repository, or only of
