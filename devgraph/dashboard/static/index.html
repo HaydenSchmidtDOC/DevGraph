@@ -2815,7 +2815,7 @@ async function refreshGraph(mode, record, structural) {
   try {
     const res = await runQueryAndUpdateGraph(q, { record, mode, replace });
     ok = res.ok;
-    if (!res.superseded && res.json?.results?.[0]?.truncated) cypherErrorEl.textContent = truncatedNotice(res.json.results[0]);
+    if (!res.superseded && res.json?.results?.[0]) showTruncatedNotice(res.json.results[0]);
   } catch (e) { /* network hiccup -- leave whatever's on screen alone */ }
   return ok;
 }
@@ -2833,14 +2833,22 @@ let glowRequestSeq = 0;
 /* At most one preview in flight: a pause in typing while one is still running
    on Neo4j queues its text (the newest wins) for when that one returns, rather
    than stacking another query beside it, and marks the running one stale so
-   its reply is ignored. The server stops a preview after 5 s regardless. */
+   its reply is ignored. A Run or canvas refresh issued after the text was
+   queued is newer than it, so the queued preview is then dropped rather than
+   sent (sending would supersede that reply). The server stops a preview after
+   5 s regardless. */
 let previewInFlight = null;
 let previewQueued = null;
+let previewQueuedSeq = 0;
 function schedulePreview(text) {
-  if (previewInFlight) { previewQueued = text; ++glowRequestSeq; return previewInFlight; }
+  if (previewInFlight) { previewQueued = text; previewQueuedSeq = ++glowRequestSeq; return previewInFlight; }
   previewInFlight = (async () => {
     try { await previewQueryGlow(text); } finally { previewInFlight = null; }
-    if (previewQueued !== null) { const next = previewQueued; previewQueued = null; await schedulePreview(next); }
+    if (previewQueued !== null) {
+      const next = previewQueued;
+      previewQueued = null;
+      if (glowRequestSeq === previewQueuedSeq) await schedulePreview(next);
+    }
   })();
   return previewInFlight;
 }
@@ -3104,9 +3112,16 @@ const DESTRUCTIVE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP)\b/i;
    a destructive-looking sample/history query doesn't need a button in hand
    to trigger the same confirm() dialog Run would. */
 /* The server caps a result's rows (and says `truncated`): say so, rather than
-   show part of a result as the whole of it. */
-function truncatedNotice(result) {
-  return `Showing the first ${result.data.length.toLocaleString()} rows: the query returned more. Add a LIMIT or narrow the MATCH.`;
+   show part of a result as the whole of it. A later result that isn't capped
+   clears the notice, and only the notice, never an error shown since. */
+let shownTruncatedNotice = null;
+function showTruncatedNotice(result) {
+  if (result.truncated) {
+    shownTruncatedNotice = `Showing the first ${result.data.length.toLocaleString()} rows: the query returned more. Add a LIMIT or narrow the MATCH.`;
+    cypherErrorEl.textContent = shownTruncatedNotice;
+  } else if (shownTruncatedNotice !== null && cypherErrorEl.textContent === shownTruncatedNotice) {
+    cypherErrorEl.textContent = "";
+  }
 }
 async function runCypherAndDisplay(text, opts) {
   if (!text) return;
@@ -3128,7 +3143,7 @@ async function runCypherAndDisplay(text, opts) {
     const result = res.json.results[0];
     const rows = result.data.map(d => d.row);
     cypherResultsEl.innerHTML = renderResultTable(result.columns, rows);
-    if (result.truncated) cypherErrorEl.textContent = truncatedNotice(result);
+    showTruncatedNotice(result);
     btnToggleResults.textContent = `Show results (${rows.length})`;
     btnToggleResults.style.display = "inline-flex";
   } catch (e) {

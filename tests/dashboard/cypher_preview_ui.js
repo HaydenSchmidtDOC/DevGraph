@@ -22,6 +22,7 @@ const src = [
   grab(/^let glowRequestSeq = 0;/m, ";"),
   grab(/^let previewInFlight = null;/m, ";"),
   grab(/^let previewQueued = null;/m, ";"),
+  grab(/^let previewQueuedSeq = 0;/m, ";"),
   grab(/^function schedulePreview\(text\)/m, "\n}"),
   grab(/^async function previewQueryGlow\(text\)/m, "\n}"),
   grab(/^cypherInput\.addEventListener\("input"/m, "\n});"),
@@ -59,7 +60,7 @@ const globals = {
   console,
 };
 const api = new Function(...Object.keys(globals),
-  src + "\nreturn { runCypher, previewQueryGlow };")(...Object.values(globals));
+  src + "\nreturn { runCypher, previewQueryGlow, otherRequest: () => ++glowRequestSeq };")(...Object.values(globals));
 
 let failures = 0;
 const check = (label, cond, detail) => {
@@ -103,6 +104,23 @@ const check = (label, cond, detail) => {
     JSON.stringify(bodies.map(b => b.query)) === JSON.stringify(["MATCH (a) RETURN a", "MATCH (c) RETURN c"]),
     JSON.stringify(bodies.map(b => b.query)));
   check("never two previews at once", maxInFlight === 1, `max in flight ${maxInFlight}`);
+  // 1c. A Run or canvas refresh issued after a preview was queued is newer:
+  //     the queued preview is dropped, so it can't supersede that reply.
+  bodies.length = 0;
+  maxInFlight = 0;
+  settled.length = 0;
+  for (const text of ["MATCH (d) RETURN d", "MATCH (e) RETURN e"]) {
+    cypherInput.value = text;
+    inputHandler();
+    settled.push(pending.shift()());
+  }
+  await new Promise(r => setTimeout(r, 0));
+  api.otherRequest();  // what runQueryAndUpdateGraph does as it starts
+  while (held.length) { held.shift()(); await new Promise(r => setTimeout(r, 0)); }
+  await Promise.all(settled);
+  check("a preview queued before a Run is not sent after it",
+    JSON.stringify(bodies.map(b => b.query)) === JSON.stringify(["MATCH (d) RETURN d"]),
+    JSON.stringify(bodies.map(b => b.query)));
   held = null;
 
   // 2. Run (and everything else that calls runCypher without opts) is not a preview.
@@ -129,6 +147,21 @@ const check = (label, cond, detail) => {
     "WITH 1 AS x LOAD CSV FROM 'file:///etc/passwd' AS row RETURN row", "match (n) call { return 1 as y } return n",
     "CREATE (n) RETURN n", "EXPLAIN MATCH (n) RETURN n",
   ]) check(`does not preview ${JSON.stringify(text)}`, !(await previewed(text)), JSON.stringify(bodies));
+
+  // 4. The row-cap notice: shown for a capped result, cleared by an uncapped
+  //    one (a canvas refresh), and an error shown since is left alone.
+  const errorEl = { textContent: "" };
+  const notice = new Function("cypherErrorEl",
+    grab(/^let shownTruncatedNotice = null;/m, ";") + "\n" + grab(/^function showTruncatedNotice\(result\)/m, "\n}") +
+    "\nreturn showTruncatedNotice;")(errorEl);
+  notice({ truncated: true, data: new Array(3) });
+  check("a capped result shows the notice", errorEl.textContent.startsWith("Showing the first 3 rows"), errorEl.textContent);
+  notice({ truncated: false, data: [] });
+  check("an uncapped result clears it", errorEl.textContent === "", errorEl.textContent);
+  notice({ truncated: true, data: [] });
+  errorEl.textContent = "ClientError: bad query";
+  notice({ truncated: false, data: [] });
+  check("an error shown since is not cleared", errorEl.textContent === "ClientError: bad query", errorEl.textContent);
 
   if (failures) { console.log(`\n${failures} check(s) failed`); process.exit(1); }
   console.log("\nall checks passed");
