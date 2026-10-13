@@ -244,6 +244,7 @@ namespace Shop.Api.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
+[Route("v2/[Controller]")]
 public class InvoicesController : ControllerBase
 {
     [HttpGet]
@@ -252,8 +253,12 @@ public class InvoicesController : ControllerBase
     [HttpGet("{id:int}", Name = "invoice")]
     public IActionResult Show(int id) => Ok();
 
-    [HttpPost, Route("[action]")]
+    [HttpPost, Route("[Action]")]
     public async Task<IActionResult> ImportAsync() => Ok();
+
+    [HttpGet("recent")]
+    [HttpGet("latest")]
+    public IActionResult Recent() => Ok();
 
     [HttpDelete("/admin/purge")]
     public void Purge() {}
@@ -271,12 +276,13 @@ def test_aspnet_attribute_routes():
 
     path = "src/Shop.Api/Controllers/InvoicesController.cs"
     result = extract_csharp_file(ASPNET_CONTROLLER, path, "r")
+    # Every class route and every action route, the tokens in any case.
     assert _endpoints(result) == {
-        "GET /api/Invoices": "ASP.NET Core",
-        "GET /api/Invoices/{id:int}": "ASP.NET Core",
-        "POST /api/Invoices/Import": "ASP.NET Core",
-        "DELETE /admin/purge": "ASP.NET Core",
-    }
+        f"{verb} /{prefix}/Invoices{rest}": "ASP.NET Core"
+        for prefix in ("api", "v2")
+        for verb, rest in (("GET", ""), ("GET", "/{id:int}"), ("POST", "/Import"), ("GET", "/recent"),
+                           ("GET", "/latest"))
+    } | {"DELETE /admin/purge": "ASP.NET Core"}
     implements = _implements(result)
     assert {("GET /api/Invoices/{id:int}", "Show", path, "InvoicesController"),
             ("GET /api/Invoices/{id:int}", "Show", "", None),
@@ -291,6 +297,16 @@ var app = builder.Build();
 
 var todos = app.MapGroup("/todos").WithTags("Todos");
 todos.MapGet("/", TodoEndpoints.GetAll);
+Admin(app);
+todos = app.MapGroup("/tasks");
+todos.MapPut("/{id}", TodoEndpoints.Remove);
+
+static void Admin(WebApplication app)
+{
+    // Another `todos`, under /admin.
+    var todos = app.MapGroup("/admin");
+    todos.MapGet("/all", TodoEndpoints.GetAll);
+}
 todos.MapPost("/{id}", (int id) => Results.Ok(id));
 app.MapDelete("/items/{id}", TodoEndpoints.Remove);
 app.MapGet("/health", Health);
@@ -302,6 +318,11 @@ public static class TodoEndpoints
 {
     public static IResult GetAll() => Results.Ok();
     public static IResult Remove(int id) => Results.Ok();
+
+    public static void Map(IEndpointRouteBuilder routes)
+    {
+        routes.MapGet("/", GetAll);
+    }
 }
 """
 
@@ -312,16 +333,21 @@ def test_aspnet_minimal_api_routes():
     result = extract_csharp_file(ASPNET_MINIMAL, "src/Todo/Program.cs", "r")
     assert _endpoints(result) == {
         "GET /todos": "ASP.NET Core",
-        "POST /todos/{id}": "ASP.NET Core",
+        "POST /tasks/{id}": "ASP.NET Core",
         "DELETE /items/{id}": "ASP.NET Core",
         "GET /health": "ASP.NET Core",
+        "GET /admin/all": "ASP.NET Core",
+        # The nearest `todos` before the call: /tasks, no longer /todos.
+        "PUT /tasks/{id}": "ASP.NET Core",
+        # A builder a caller passes: the file's own Endpoint.
+        "GET ?/ (src/Todo/Program.cs)": "ASP.NET Core",
     }
     implements = _implements(result)
     assert ("GET /todos", "GetAll", "src/Todo/Program.cs", "TodoEndpoints") in implements
     assert ("DELETE /items/{id}", "Remove", "src/Todo/Program.cs", "TodoEndpoints") in implements
     # `Health` is no method of the file: its stub alone.
     assert {e for e in implements if e[0] == "GET /health"} == {("GET /health", "Health", "", None)}
-    assert not [e for e in implements if e[0] == "POST /todos/{id}"]
+    assert not [e for e in implements if e[0] == "POST /tasks/{id}"]
 
 
 GO_ROUTES = """\

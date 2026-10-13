@@ -97,6 +97,7 @@ Known scope cuts (documented, not silently dropped):
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import NamedTuple
 
@@ -1007,9 +1008,14 @@ def _string_literal(node: Node | None, source: bytes) -> str | None:
     return None
 
 
+_NO_TEMPLATE = ""  # an attribute given without a template
+
+
 def _route_attributes(node: Node, source: bytes) -> dict[str, list[str | None]]:
     """A declaration's attributes by name (an `Attribute` suffix dropped),
-    each as its positional arguments' string values (None: not a literal)."""
+    each as the template of every one of that name, in order: its first
+    positional argument's string value (None: not a literal; "" when it has
+    none)."""
     found: dict[str, list[str | None]] = {}
     for attribute_list in (c for c in node.children if c.type == "attribute_list"):
         for attribute in (a for a in attribute_list.named_children if a.type == "attribute"):
@@ -1024,29 +1030,45 @@ def _route_attributes(node: Node, source: bytes) -> dict[str, list[str | None]]:
                 and arg.named_children[0].type != "assignment_expression"
             ]
             key = _text(name, source).rsplit(".", 1)[-1]
-            found[key.removesuffix("Attribute") if key != "Attribute" else key] = values
+            key = key.removesuffix("Attribute") if key != "Attribute" else key
+            found.setdefault(key, []).append(values[0] if values else _NO_TEMPLATE)
     return found
+
+
+#: Minimal-API receivers: an app (a root), or a route builder a caller
+#: passes, mounted under a prefix the file doesn't show.
+_ROOT_BUILDER_TYPES = frozenset({"WebApplication"})
+_SCOPE_TYPES = ("method_declaration", "local_function_statement", "constructor_declaration", "lambda_expression",
+                "anonymous_method_expression", "compilation_unit")
 
 
 def _aspnet_routes(root: Node, source: bytes, result: ExtractionResult, file_path: str, repo_id: str) -> None:
     """ASP.NET Core routes as Endpoints (apis/routes.py). Attribute routing:
     a controller's (`[ApiController]`, a `[Route]` or a `...Controller`
-    name) `[HttpGet("x")]`/`[Route("x")]` actions under its `[Route]`, the
-    `[controller]` and `[action]` tokens filled in, implemented by the
-    action, owned by its class. Minimal APIs: `app.MapGet("/x", handler)`
-    under the literal prefixes of the file's `MapGroup`s, implemented by a
-    method of the file it names (a lambda implements nothing)."""
+    name) `[HttpGet("x")]`/`[Route("x")]` actions under each of its
+    `[Route]`s, the `[controller]` and `[action]` tokens filled in (any
+    case), implemented by the action, owned by its class. Minimal APIs:
+    `app.MapGet("/x", handler)`, implemented by a method of the file it
+    names (a lambda implements nothing). The receiver is followed to its
+    nearest declaration before the call in its scope (then the enclosing
+    ones): `builder.Build()`, `WebApplication.Create...` or a
+    `WebApplication` is the root; a literal `MapGroup("/x")` of a known one
+    adds its prefix; anything else (an `IEndpointRouteBuilder` parameter)
+    is mounted where the file doesn't show (`unmounted_endpoint`)."""
     functions: dict[str, set[str]] = {}
     for node in result.nodes:
         if node.label == "Function" and node.properties.get("file") == file_path:
             functions.setdefault(node.name, set()).add(node.properties["owner"])
+
+    def fill(path: str, token: str, value: str) -> str:
+        return re.sub(re.escape(f"[{token}]"), lambda _m: value, path, flags=re.IGNORECASE)
 
     def controller(node: Node, classes: list[str]) -> None:
         name = _text(node.child_by_field_name("name"), source)
         attributes = _route_attributes(node, source)
         if not ({"ApiController", "Route"} & set(attributes) or name.endswith("Controller")):
             return
-        prefixes = attributes.get("Route") or [""]
+        prefixes = attributes.get("Route") or [_NO_TEMPLATE]
         body = node.child_by_field_name("body")
         for member in body.named_children if body is not None else []:
             action = member.child_by_field_name("name")
@@ -1054,19 +1076,25 @@ def _aspnet_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
                 continue
             action_name = _text(action, source)
             on_action = _route_attributes(member, source)
-            verbs = [(verb, on_action[attr]) for attr, verb in _HTTP_ATTRIBUTES.items() if attr in on_action]
-            if not verbs and "Route" in on_action:
-                verbs = [("*", [])]
-            for verb, templates in verbs:
-                for template in templates or on_action.get("Route") or [""]:
-                    for prefix in prefixes:
-                        if template is None or prefix is None:
-                            continue  # not a literal
-                        path = template.lstrip("~") if template.startswith(("/", "~/")) else join_route(prefix, template)
-                        path = path.replace("[controller]", name.removesuffix("Controller"))
-                        path = path.replace("[action]", action_name.removesuffix("Async"))
-                        add_route(result, repo_id, file_path, "ASP.NET Core", verb, join_route(path), action_name,
-                                  ".".join([*reversed(classes), name]))
+            routes = on_action.get("Route", [])
+            # Each verb attribute's template; one with none takes each [Route]'s.
+            verbs = [
+                (verb, template)
+                for attr, verb in _HTTP_ATTRIBUTES.items()
+                for each in on_action.get(attr, [])
+                for template in ([each] if each != _NO_TEMPLATE else routes or [_NO_TEMPLATE])
+            ]
+            if not verbs:
+                verbs = [("*", template) for template in routes]
+            for verb, template in verbs:
+                for prefix in prefixes:
+                    if template is None or prefix is None:
+                        continue  # not a literal
+                    path = template.lstrip("~") if template.startswith(("/", "~/")) else join_route(prefix, template)
+                    path = fill(path, "controller", name.removesuffix("Controller"))
+                    path = fill(path, "action", action_name.removesuffix("Async"))
+                    add_route(result, repo_id, file_path, "ASP.NET Core", verb, join_route(path), action_name,
+                              ".".join([*reversed(classes), name]))
 
     def classes_in(container: Node, classes: list[str]) -> None:
         for node in container.named_children:
@@ -1079,8 +1107,70 @@ def _aspnet_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
 
     classes_in(root, [])
 
-    groups: dict[str, tuple[str, str | None]] = {}  # group variable -> (what it is mapped on, its prefix)
-    maps: list[tuple[str, str, str, Node]] = []  # (receiver, method, path, handler)
+    def declaration(name: str, at: Node) -> tuple[str, Node] | None:
+        """The nearest declaration of `name` before `at`: ("value", its
+        initializer) or ("type", a parameter's type)."""
+        node = at
+        while node is not None:
+            if node.type in _SCOPE_TYPES:
+                found: tuple[int, Node | None] | None = None
+                # Declarations and assignments of this scope (not of a scope in it).
+                for each in [*_descendants(node, "variable_declarator"), *_descendants(node, "assignment_expression")]:
+                    if each.type == "variable_declarator":
+                        named = each.child_by_field_name("name")
+                        value = each.named_children[-1] if len(each.named_children) > 1 else None
+                    else:
+                        named, value = each.child_by_field_name("left"), each.child_by_field_name("right")
+                    if named is None or _text(named, source) != name or each.end_byte > at.start_byte:
+                        continue
+                    scope = each.parent
+                    while scope is not None and scope.type not in _SCOPE_TYPES:
+                        scope = scope.parent
+                    if scope is None or (scope.start_byte, scope.end_byte) != (node.start_byte, node.end_byte):
+                        continue
+                    if found is None or each.start_byte > found[0]:
+                        found = (each.start_byte, value)
+                if found is not None:
+                    return ("value", found[1]) if found[1] is not None else None
+                params = node.child_by_field_name("parameters")
+                for param in _descendants(params, "parameter") if params is not None else []:
+                    named = param.child_by_field_name("name")
+                    if named is not None and _text(named, source) == name:
+                        declared = param.child_by_field_name("type")
+                        return ("type", declared) if declared is not None else None
+            node = node.parent
+        return None
+
+    def kind(receiver: Node, at: Node, depth: int = 0) -> tuple[str, str | None]:
+        """("root", ""), ("prefix", it), ("unknown", None) or ("skip", None) (a dynamic prefix)."""
+        found = declaration(_text(receiver, source), at) if receiver.type == "identifier" and depth < 8 else None
+        if found is None:
+            return ("unknown", None)
+        how, node = found
+        if how == "type":
+            return ("root", "") if _text(node, source).rsplit(".", 1)[-1] in _ROOT_BUILDER_TYPES else ("unknown", None)
+        # Down a configuring chain (`app.MapGroup("/x").WithTags(...)`) to its group or app.
+        while node.type == "invocation_expression":
+            func = node.child_by_field_name("function")
+            if func is None or func.type != "member_access_expression":
+                break
+            method = _text(func.child_by_field_name("name"), source)
+            inner = func.child_by_field_name("expression")
+            if method == "Build" or _text(func, source).startswith("WebApplication."):
+                return ("root", "")
+            if method == "MapGroup":
+                arguments = node.child_by_field_name("arguments")
+                args = [a.named_children[-1] for a in arguments.named_children if a.type == "argument"] \
+                    if arguments is not None else []
+                mounted = _string_literal(args[0], source) if args else None
+                parent = kind(inner, node, depth + 1)
+                if mounted is None or parent[0] == "skip":
+                    return ("skip", None)
+                return ("prefix", join_route(parent[1], mounted)) if parent[0] in ("root", "prefix") \
+                    else ("unknown", None)
+            node = inner
+        return ("unknown", None)
+
     for call in _descendants(root, "invocation_expression"):
         func = call.child_by_field_name("function")
         arguments = call.child_by_field_name("arguments")
@@ -1088,36 +1178,18 @@ def _aspnet_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
             continue
         receiver, method = func.child_by_field_name("expression"), func.child_by_field_name("name")
         values = [arg.named_children[-1] for arg in arguments.named_children if arg.type == "argument"]
-        if receiver is None or method is None or receiver.type != "identifier" or not values:
+        verb = _MAP_CALLS.get(_text(method, source)) if method is not None else None
+        if receiver is None or verb is None or len(values) < 2:
             continue
-        verb = _MAP_CALLS.get(_text(method, source))
-        if _text(method, source) == "MapGroup":
-            # `var g = app.MapGroup("/x")`, maybe configured on (`.WithTags(...)`).
-            outer = call
-            while outer.parent is not None and outer.parent.type == "member_access_expression" and (
-                outer.parent.parent is not None and outer.parent.parent.type == "invocation_expression"
-            ):
-                outer = outer.parent.parent
-            variable = outer.parent.child_by_field_name("name") if outer.parent is not None and (
-                outer.parent.type == "variable_declarator"
-            ) else None
-            if variable is not None:
-                groups[_text(variable, source)] = (_text(receiver, source), _string_literal(values[0], source))
-        elif verb is not None and len(values) >= 2 and (path := _string_literal(values[0], source)) is not None:
-            maps.append((_text(receiver, source), verb, path, values[1]))
-
-    def prefix(receiver: str, seen: frozenset = frozenset()) -> str | None:
-        if receiver not in groups or receiver in seen:
-            return ""
-        parent, mounted = groups[receiver]
-        above = prefix(parent, seen | {receiver})
-        return None if mounted is None or above is None else join_route(above, mounted)
-
-    for receiver, verb, path, handler in maps:
-        above = prefix(receiver)
-        if above is None:
+        path = _string_literal(values[0], source)
+        if path is None:
+            continue
+        where = kind(receiver, call)
+        if where[0] == "skip":
             continue  # a group with a dynamic prefix
-        full = join_route(above, path)
+        mounted = where[0] in ("root", "prefix")
+        full = join_route(where[1] or "", path)
+        handler = values[1]
         if handler.type == "identifier" or (
             handler.type == "member_access_expression" and handler.child_by_field_name("name") is not None
         ):
@@ -1130,11 +1202,12 @@ def _aspnet_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
             name = _text(handler, source)
             owners = {o for o in functions.get(name, ()) if qualifier is None or o.rsplit(".", 1)[-1] == qualifier}
             if len(owners) == 1:
-                add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, next(iter(owners)))
+                add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, next(iter(owners)),
+                          mounted=mounted)
             else:
-                add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, pins=set())
+                add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, pins=set(), mounted=mounted)
         else:
-            add_route(result, repo_id, file_path, "ASP.NET Core", verb, full)
+            add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, mounted=mounted)
 
 
 def extract_csharp_file(
