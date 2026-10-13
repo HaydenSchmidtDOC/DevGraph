@@ -279,3 +279,26 @@ type Wrapper struct {
         for r in result.relationships
     }
     assert ("Class", "Wrapper", "EXTENDS", "Class", "Other") in rel_tuples
+
+
+def test_method_on_a_pointer_to_a_generic_type_belongs_to_the_type():
+    """`func (s *Stack[T]) Push()` is a method of `Stack`, like a value
+    receiver `Stack[T]`, so its CONTAINS has a real source and a call
+    through the type resolves into it (audit 4 item 5)."""
+    source_code = """package stack
+
+type Stack[T any] struct{ items []T }
+
+func (s *Stack[T]) Push(v T) { s.grow() }
+
+func (s *Stack[T]) grow() {}
+
+func (s Stack[T]) Len() int { return len(s.items) }
+"""
+    result = extract_go_file(source_code, "stack/stack.go", "test_repo")
+    rels = {(r.from_label, r.from_name, r.rel_type, r.to_name) for r in result.relationships}
+    assert {("Class", "Stack", "CONTAINS", "Push"), ("Class", "Stack", "CONTAINS", "grow"),
+            ("Class", "Stack", "CONTAINS", "Len")} <= rels
+    assert not any("[" in r.from_name for r in result.relationships)
+    calls = {(r.from_name, r.to_name, r.to_file) for r in result.relationships if r.rel_type == "CALLS"}
+    assert ("Push", "grow", "stack/stack.go") in calls

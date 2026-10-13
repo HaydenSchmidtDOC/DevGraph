@@ -136,7 +136,8 @@ def _receiver_type_name(method_node: Node, source: bytes) -> str | None:
 
     `func (d *Dog) Speak()` and `func (d Dog) Speak()` both resolve to
     'Dog' — pointer vs. value receiver makes no difference to which struct
-    the method is attributed to.
+    the method is attributed to, and a generic receiver's type parameters
+    are dropped: `func (s *Stack[T]) Push()` is 'Stack'.
     """
     receiver = method_node.child_by_field_name("receiver")
     if receiver is None:
@@ -148,7 +149,7 @@ def _receiver_type_name(method_node: Node, source: bytes) -> str | None:
         if type_node is None:
             continue
         if type_node.type == "pointer_type" and type_node.named_children:
-            return _text(type_node.named_children[0], source)
+            type_node = type_node.named_children[0]  # `*Stack[T]`: read `Stack[T]` as a value receiver
         if type_node.type == "type_identifier":
             return _text(type_node, source)
         if type_node.type == "generic_type":
