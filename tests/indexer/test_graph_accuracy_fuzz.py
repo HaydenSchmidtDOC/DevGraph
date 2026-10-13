@@ -52,7 +52,10 @@ kind is written, relinked and removed as files come and go.
 
 The spec's "Out of scope" gaps are left out by construction:
 - compose services have `image:` only, never `build:`;
-- no datastore or route code (so no handler stub either);
+- no datastore code, and routes only in Express (TS) files,
+  which add, drop and change routes and move a handler (`op_route`,
+  `op_route_change`, `op_route_move`), each Endpoint and handler stub
+  claimed by every file routing it;
 - no method moves out of its type's file: only free functions move, and the
   Go method and Rust inherent `impl` stay with their type;
 - no TS partial classes (C#'s Jobs is partial over two files);
@@ -135,13 +138,14 @@ class File:
     pins: list = field(default_factory=list)  # py: "calls <name> <pin>" / "imports <pin>"
     methods: list = field(default_factory=list)  # cpp: out-of-class definitions, "Widget::draw"
     block: bool = False  # cs: a block namespace, its `using`s inside it
+    routes: list = field(default_factory=list)  # ts: (method, path, handler) routes
 
     def copy(self):
         return replace(
             self, imports=list(self.imports), bases=dict(self.bases),
             funcs={k: list(v) for k, v in self.funcs.items()}, services=dict(self.services),
             froms=list(self.froms), mentions=list(self.mentions), links=list(self.links), pins=list(self.pins),
-            methods=list(self.methods),
+            methods=list(self.methods), routes=list(self.routes),
         )
 
 
@@ -244,6 +248,11 @@ def render(f: File) -> str:
             f"\nexport function {name}() {{\n" + "".join(f"  {g}();\n" for g in calls) + "}\n"
             for name, calls in f.funcs.items()
         ]
+        if f.routes:
+            # An Express router: a handler of the file, an imported one, a
+            # namespace's member, a name nothing defines, or inline.
+            parts.append("\nconst router = Router();\n")
+            parts += [f"router.{method}('{path}', {handler});\n" for method, path, handler in f.routes]
         return "".join(parts) or "export {};\n"
     if f.kind == "compose":
         return "services:\n" + "".join(f"  {s}:\n    image: {i}\n" for s, i in f.services.items()) if f.services \
@@ -380,7 +389,7 @@ def initial_repo() -> dict:
         "ts/tsconfig.json": File("static", head=TS_CONFIGS["ts/tsconfig.json"][0]),
         "ts/configs/base.cfg": File("static", head=TS_CONFIGS["ts/configs/base.cfg"][0]),
         "ts/app.ts": File("ts", imports=["import { f } from '@/lib';", "import * as u from '@/util';"],
-                          funcs={"main": ["f", "u.g"]}),
+                          funcs={"main": ["f", "u.g"]}, routes=[("get", "/items", "main"), ("post", "/api/items", "f")]),
         "ts/src/lib.ts": File("ts", funcs={"f": []}),
         "ts/src/util.ts": File("ts", imports=["import { f } from './lib';"], funcs={"g": ["f"]}),
         "ts/other/lib.ts": File("ts", funcs={"f": [], "g": []}),
@@ -465,6 +474,10 @@ CODE = ("py", "rs", "go", "java", "ts", "kt", "cs", "cpp")
 # a Java method stays in its class.
 MOVABLE = ("py", "rs", "go", "ts", "kt", "cs", "cpp")
 KT_CLASSES = ["Clock", "Stopwatch", "Tag", "Index"]
+# Routes: Express paths and handlers beyond the file's own functions.
+ROUTE_METHODS = ["get", "post", "put"]
+TS_ROUTE_PATHS = ["/items", "/items/:id", "/api/items", "/api/orders", "/health"]
+TS_HANDLERS = ["f", "g", "u.g", "missing", "(req, res) => res.end()"]
 
 
 class Fuzz:
@@ -811,6 +824,60 @@ class Fuzz:
         self.removed_dirs.append(folder)
         return f"delete folder {folder}", set(paths)
 
+    def _route_handlers(self, path: str) -> list:
+        return sorted(self.files[path].funcs) + TS_HANDLERS
+
+    def op_route(self):
+        """Add or remove an Express route."""
+        path = self._pick(lambda f: f.kind == "ts")
+        if not path:
+            return None
+        f = self.files[path]
+        if f.routes and self.rng.random() < 0.4:
+            gone = f.routes.pop(self.rng.randrange(len(f.routes)))
+            return f"remove route {gone} in {path}", {path}
+        handlers = self._route_handlers(path)
+        if not handlers:
+            return None
+        route = (self.rng.choice(ROUTE_METHODS), self.rng.choice(TS_ROUTE_PATHS), self.rng.choice(handlers))
+        f.routes.append(route)
+        return f"add route {route} in {path}", {path}
+
+    def op_route_change(self):
+        """Change a route's method or path."""
+        path = self._pick(lambda f: f.routes)
+        if not path:
+            return None
+        routes = self.files[path].routes
+        at = self.rng.randrange(len(routes))
+        method, route_path, handler = routes[at]
+        if self.rng.random() < 0.5:
+            method = self.rng.choice([m for m in ROUTE_METHODS if m != method])
+        else:
+            route_path = self.rng.choice([p for p in TS_ROUTE_PATHS if p != route_path])
+        routes[at] = (method, route_path, handler)
+        return f"change route {at} to {routes[at]} in {path}", {path}
+
+    def op_route_move(self):
+        """Move a route's handler to another file: an Express handler
+        function out of its router's file (the route then names it
+        unresolved) or the route itself to another router."""
+        path = self._pick(lambda f: f.routes)
+        if not path:
+            return None
+        f = self.files[path]
+        route = self.rng.choice(f.routes)
+        handler = route[2]
+        target = self._pick(lambda o: o.kind == f.kind and o is not f and handler not in o.funcs)
+        if not target:
+            return None
+        if handler not in f.funcs or self.rng.random() < 0.5:
+            f.routes.remove(route)
+            self.files[target].routes.append(route)
+            return f"move route {route} from {path} to {target}", {path, target}
+        self.files[target].funcs[handler] = f.funcs.pop(handler)
+        return f"move handler {handler} from {path} to {target}", {path, target}
+
     def op_delete(self):
         path = self._pick(lambda f: True)
         if not path or path == ".gitignore":
@@ -912,7 +979,8 @@ class Fuzz:
         "rename", "delete", "restore", "service", "from", "move_image", "mention", "link", "supersedes", "pin", "pin",
         "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module", "method", "method",
         "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move", "cs_namespace", "cs_move_class",
-        "cs_dup_class", "twin", "twin", "shadow", "nested", "go_twin", "go_twin",
+        "cs_dup_class", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route", "route",
+        "route_change", "route_move",
     ]
 
     def draw(self):

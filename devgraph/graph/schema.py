@@ -65,7 +65,9 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # the value the pipeline writes. `extractor` marks nodes a schema-declared
 # provider owns (see devgraph/indexer/providers/). `name_refs`,
 # `name_ref_targets` and `name_ref_sources` record a code Module's by-name
-# edges (see devgraph/indexer/common.py `name_ref_properties`). `mkeys` is a
+# edges (see devgraph/indexer/common.py `name_ref_properties`), and
+# `shared_claims` the shared nodes its file claims (graph/engine.py
+# `SHARED_CLAIM_SEP`). `mkeys` is a
 # code symbol's match keys, which a pin's `@` flag tests (see `split_pin`),
 # and `mkeys_stale` marks one whose edges a batch has yet to relink after
 # they changed (see graph/engine.py `write_match_keys`). A code symbol's
@@ -74,7 +76,7 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # has, so a declared `owner` field (a runbook's front matter) stays the user's.
 RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
     "repo_id", "name", "file", "source_file", "source", "sources", "claims", "extractor",
-    "name_refs", "name_ref_targets", "name_ref_sources", "mkeys", "mkeys_stale",
+    "name_refs", "name_ref_targets", "name_ref_sources", "mkeys", "mkeys_stale", "shared_claims",
 })
 
 # The pipeline's own bookkeeping among those, plus the Repository node's
@@ -83,7 +85,7 @@ RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
 # dashboard's node inspector).
 INTERNAL_NODE_PROPERTIES: frozenset[str] = frozenset({
     "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources", "mkeys", "mkeys_stale",
-    "skipped_files",
+    "shared_claims", "skipped_files",
 })
 
 # An extracted edge's bookkeeping: `origins`, the files that wrote it

@@ -219,13 +219,14 @@ class TestBatchingReducesRoundTrips:
 
         try:
             engine.replace_file_nodes(repo_id, "big.py", nodes, rels)
-            # 1 read of the Module's old name_ref_sources (none here, so no
-            # foreign-source unclaim) + 1 delete + 1 unclaim (source-tracked
-            # nodes) + 1 UNWIND per node label (just "Function") + 1 UNWIND
-            # per relationship (from_label, rel_type, to_label) triple (just
-            # one triple here) = 5 tx.run calls total, independent of the 20
-            # nodes / 19 edges — not the 39+ calls the old per-item loop cost.
-            assert call_count["n"] == 5
+            # 1 read of the Module's recorded shared claims + 1 read of its
+            # old name_ref_sources (none here, so no foreign-source unclaim)
+            # + 1 delete + 1 unclaim (source-tracked nodes) + 1 UNWIND per
+            # node label (just "Function") + 1 UNWIND per relationship
+            # (from_label, rel_type, to_label) triple (just one triple here)
+            # = 6 tx.run calls total, independent of the 20 nodes / 19 edges
+            # — not the 39+ calls the old per-item loop cost.
+            assert call_count["n"] == 6
         finally:
             engine.delete_repository(repo_id)
 

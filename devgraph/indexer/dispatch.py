@@ -131,9 +131,11 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: functions and Go methods on a pointer to a generic type extracted; 12:
 #: `name_refs` entries of one marked layout recording both ends' owners, a
 #: nested function's owner including its functions, and calls to another
-#: file's top-level function narrowed to it).
+#: file's top-level function narrowed to it; 13: routes beyond Python as
+#: `Endpoint` nodes, with their handlers' IMPLEMENTS and owning-service CALLS
+#: (apis/routes.py), and a code Module's `shared_claims`).
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 12
+INDEX_FORMAT = 13
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -708,11 +710,9 @@ def index_paths(
     py_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     # Same two-pass cross-link machinery as py_files/py_extractions above,
     # kept as parallel lists rather than merged with the Python one:
-    # datastore/API extraction (_datastore_nodes/_api_nodes_and_rels/
-    # _owning_service_relationships below) is still keyed to Python source
-    # conventions (regex/AST patterns tuned for Python), so non-Python files
-    # don't participate in those passes — only in their own node/edge
-    # re-upsert pass.
+    # datastore extraction (_datastore_nodes) is still keyed to Python source
+    # conventions, so non-Python files join the owning-service pass below
+    # only with the Endpoints their own extractor found (apis/routes.py).
     js_files: list[str] = []  # rel_path, for the cross-link pass below
     js_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     cs_files: list[str] = []
@@ -1002,11 +1002,20 @@ def index_paths(
     # once per file, since it can't have changed mid-batch (Services are
     # only written by the Containerfile/compose branches above, already run
     # by this point).
-    if py_files:
+    # Another language's routes are its extraction's Endpoint nodes.
+    route_endpoints = {
+        rel_path: [node["name"] for node in nodes if node["label"] == "Endpoint"]
+        for extractions in code_extractions[1:]
+        for rel_path, (nodes, _rels) in extractions.items()
+    }
+    route_endpoints = {rel_path: names for rel_path, names in route_endpoints.items() if names}
+    if py_files or route_endpoints:
         services = _load_services_with_build_context(engine, repo_id)
         service_rels: list[dict] = []
         for rel_path, content in py_files:
             service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
+        for rel_path, names in sorted(route_endpoints.items()):
+            service_rels.extend(_endpoint_service_relationships(repo_id, rel_path, names, services))
         engine.upsert_relationships(service_rels)
 
     if providers_ok and fs_spec is not None:
@@ -1188,8 +1197,9 @@ def _index_single_path(
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-reupsert rationale as the .py branch above:
         # prune this file's previously-indexed nodes/edges and write the
-        # freshly-extracted ones in one transaction.
-        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
+        # freshly-extracted ones in one transaction. Its routes' Endpoint
+        # edges go as a Python file's do (`service_api`).
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
         js_files.append(rel_path)
         js_extractions[rel_path] = (nodes, rels)
@@ -2347,23 +2357,32 @@ def _owning_service_relationships(
         )
 
     api_result = APIExtractor(repo_id).extract_from_source(content, rel_path)
-    for endpoint in api_result.endpoints:
-        endpoint_id = f"{endpoint.method} {endpoint.path}"
-        rels.append(
-            {
-                "from_label": "Endpoint",
-                "from_name": endpoint_id,
-                "rel_type": "CALLS",
-                "to_label": "Service",
-                "to_name": owning_service,
-                "to_file": owning_service_file,
-                "repo_id": repo_id,
-                "properties": {},
-                "origin": rel_path,
-            }
-        )
+    endpoints = [f"{endpoint.method} {endpoint.path}" for endpoint in api_result.endpoints]
+    return rels + _endpoint_service_relationships(repo_id, rel_path, endpoints, services)
 
-    return rels
+
+def _endpoint_service_relationships(
+    repo_id: str, rel_path: str, endpoints: list[str], services: dict[str, tuple[str, str]]
+) -> list[dict]:
+    """CALLS from each of the file's Endpoints (by name) to the compose
+    Service that owns the file (`_owning_service_relationships`)."""
+    owning_service = _match_owning_service(services, rel_path)
+    if owning_service is None:
+        return []
+    return [
+        {
+            "from_label": "Endpoint",
+            "from_name": endpoint_id,
+            "rel_type": "CALLS",
+            "to_label": "Service",
+            "to_name": owning_service,
+            "to_file": services[owning_service][1],
+            "repo_id": repo_id,
+            "properties": {},
+            "origin": rel_path,
+        }
+        for endpoint_id in endpoints
+    ]
 
 
 def _api_nodes_and_rels(repo_id: str, rel_path: str, content: str) -> tuple[list[dict], list[dict]]:

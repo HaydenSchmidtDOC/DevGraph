@@ -68,6 +68,7 @@ import tree_sitter_javascript as tsjs
 import tree_sitter_typescript as tsts
 from tree_sitter import Language, Node, Parser
 
+from devgraph.indexer.apis.routes import add_route, join_route
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, call_rows
 from devgraph.indexer.common import (
     ExtractionResult,
@@ -842,6 +843,137 @@ class _CallResolver:
         return [(method, None, True)]
 
 
+#: Express/Koa-router/Fastify route methods; `all` maps every method.
+_ROUTE_METHODS = frozenset({"get", "post", "put", "delete", "patch", "options", "head", "all"})
+#: Calls that make an app or a router (`express()`, `express.Router()`,
+#: `Router()`, `new Router()`, `Fastify()`), by the callee's last name.
+_ROUTER_FACTORIES = frozenset({"express", "Router", "fastify", "Fastify"})
+#: Receivers taken for an app or router by name alone (and any `...Router`).
+_ROUTER_NAMES = frozenset({"app", "router", "fastify"})
+_HANDLER_TYPES = frozenset({"identifier", "member_expression", "call_expression", *_FUNCTION_VALUE_TYPES})
+
+
+def _literal(node: Node | None, source: bytes) -> str | None:
+    """A string literal's value, or a template literal's with nothing
+    substituted; None for anything else (a dynamic value)."""
+    if node is None:
+        return None
+    if node.type == "string":
+        return _string_value(node, source)
+    if node.type == "template_string" and not any(c.type == "template_substitution" for c in node.named_children):
+        return _text(node, source)[1:-1]
+    return None
+
+
+def _express_routes(
+    root: Node, source: bytes, resolver: _CallResolver, result: ExtractionResult, file_path: str, repo_id: str
+) -> None:
+    """Express-style routes (`app.get('/x', h)`, `router.post(...)`,
+    `app.route('/x').get(h)`; Koa-router's and Fastify's are the same
+    calls) as Endpoints (apis/routes.py). The receiver is an app or router
+    the file makes (`_ROUTER_FACTORIES`) or one named like one
+    (`_ROUTER_NAMES`, `...Router`); the path is a literal starting with "/",
+    and the last argument is the handler. A router the file makes and
+    mounts with a literal prefix (`app.use('/api', router)`) has its routes
+    under it; one another file mounts, or made in another file, does not."""
+    routers: set[str] = set()
+    mounts: dict[str, tuple[str, str]] = {}  # router -> (the app or router it is mounted on, the prefix)
+    routes: list[tuple[str, str, str, Node]] = []  # (receiver, method, path, handler)
+
+    def callee(call: Node) -> tuple[Node, str] | None:
+        """(receiver, method name) of a `receiver.method(...)` call."""
+        func = call.child_by_field_name("function")
+        if func is None or func.type != "member_expression":
+            return None
+        obj, prop = func.child_by_field_name("object"), func.child_by_field_name("property")
+        return (obj, _text(prop, source)) if obj is not None and prop is not None else None
+
+    def visit_call(call: Node) -> None:
+        found = callee(call)
+        args = call.child_by_field_name("arguments")
+        if found is None or args is None:
+            return
+        obj, method = found
+        values = [arg for arg in args.named_children if arg.type != "comment"]
+        if method == "use" and obj.type == "identifier" and len(values) == 2 and values[1].type == "identifier":
+            mounted = _literal(values[0], source)
+            if mounted is not None and mounted.startswith("/"):
+                mounts[_text(values[1], source)] = (_text(obj, source), mounted)
+            return
+        if method not in _ROUTE_METHODS:
+            return
+        path, handlers = None, values
+        if obj.type == "call_expression":
+            # `app.route('/x').get(h).post(h2)`: down the chain to its `route`.
+            while obj.type == "call_expression" and (inner := callee(obj)) is not None and inner[1] in _ROUTE_METHODS:
+                obj = inner[0]
+            inner = callee(obj) if obj.type == "call_expression" else None
+            route_args = obj.child_by_field_name("arguments") if inner is not None and inner[1] == "route" else None
+            if route_args is None or not route_args.named_children:
+                return
+            path, obj = _literal(route_args.named_children[0], source), inner[0]
+        elif values and (path := _literal(values[0], source)) is not None:
+            handlers = values[1:]
+            if not path.startswith("/") and len(values) > 2:
+                # Koa-router's named route: `router.get('name', '/x', h)`.
+                path, handlers = _literal(values[1], source), values[2:]
+        if path is None or not path.startswith("/") or not handlers or handlers[-1].type not in _HANDLER_TYPES:
+            return
+        if obj.type == "identifier":
+            routes.append((_text(obj, source), "*" if method == "all" else method.upper(), path, handlers[-1]))
+
+    def walk(node: Node) -> None:
+        if node.type == "variable_declarator":
+            name, value = node.child_by_field_name("name"), node.child_by_field_name("value")
+            made = None
+            if value is not None and value.type in ("call_expression", "new_expression"):
+                made = value.child_by_field_name("function") or value.child_by_field_name("constructor")
+            if (
+                name is not None and name.type == "identifier" and made is not None
+                and _dotted_name(made, source).rsplit(".", 1)[-1] in _ROUTER_FACTORIES
+            ):
+                routers.add(_text(name, source))
+        elif node.type == "call_expression":
+            visit_call(node)
+        for child in node.children:
+            walk(child)
+
+    walk(root)
+
+    def prefix(router: str, seen: frozenset = frozenset()) -> str:
+        if router not in routers or router not in mounts or router in seen:
+            return ""
+        parent, mounted = mounts[router]
+        return join_route(prefix(parent, seen | {router}), mounted)
+
+    # The file's functions, by name, with their owners.
+    functions: dict[str, set[str]] = {}
+    for node in result.nodes:
+        if node.label == "Function" and node.properties.get("file") == file_path:
+            functions.setdefault(node.name, set()).add(node.properties.get("owner") or "")
+    for receiver, method, path, handler in routes:
+        if receiver not in routers and receiver not in _ROUTER_NAMES and not receiver.endswith("Router"):
+            continue
+        full = join_route(prefix(receiver), path)
+        if handler.type == "identifier" and _text(handler, source) in functions:
+            # A function of the file: the top-level one, else any of the name.
+            name = _text(handler, source)
+            owner = "" if "" in functions[name] else None
+            add_route(result, repo_id, file_path, "Express", method, full, name, owner)
+        elif handler.type in ("identifier", "member_expression"):
+            # An imported function, or a member of an imported or typed
+            # value: where a call to it would go.
+            targets = resolver.resolve(handler, _Scope())
+            if handler.type == "member_expression":
+                name = _text(handler.child_by_field_name("property"), source)
+            else:
+                name = targets[0][0] if targets else _text(handler, source)
+            pins = {pin for _name, pin, _member in targets if pin is not None}
+            add_route(result, repo_id, file_path, "Express", method, full, name, pins=pins)
+        else:
+            add_route(result, repo_id, file_path, "Express", method, full)
+
+
 def extract_js_file(
     source_code: str, file_path: str, repo_id: str, config: ResolverConfig | None = None
 ) -> ExtractionResult:
@@ -1153,6 +1285,7 @@ def extract_js_file(
                 caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id,
                 no_self=no_self, caller_owner=caller_owner,
             ))
+    _express_routes(root, source_bytes, resolver, result, file_path, repo_id)
 
     return own_edges(result, file_path)
 

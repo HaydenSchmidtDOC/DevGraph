@@ -102,13 +102,41 @@ _DELETE_BY_SOURCE_FILE_CYPHER = _union(_owned_branches("= $f")) + "DETACH DELETE
 # instead of each overwriting the others from a stale read.
 _LOCK_AND_READ = "SET n.name = n.name RETURN elementId(n) AS id, properties(n) AS props"
 
-_UNCLAIM_SOURCE_CYPHER = (
-    _union(_CLAIMED_BRANCHES)
-    + "WITH n WHERE n.file IS NULL AND n.source_file IS NULL "
+_UNCLAIM_FILTER = (
+    "WITH n WHERE n.file IS NULL AND n.source_file IS NULL "
     "  AND (n.source = $file_name OR $file_name IN coalesce(n.sources, [])) "
     "  AND NOT any(p IN $keep WHERE labels(n)[0] = p[0] AND n.name = p[1]) "
-    + _LOCK_AND_READ
 )
+_UNCLAIM_SOURCE_CYPHER = _union(_CLAIMED_BRANCHES) + _UNCLAIM_FILTER + _LOCK_AND_READ
+
+# A code file's Module records the shared nodes its last replace claimed
+# (`shared_claims`, "<label>\x1f<name>" entries), so its next replace or
+# delete seeks just those by name instead of every shared node of the
+# repository, whose count grows with the repository (each file's write
+# scanned them all: quadratic in a full scan of a repository with many
+# routes). A code file not indexed before (no Module yet) claims nothing; a
+# file with no record (a compose file or Containerfile, which has no Module,
+# or a Module an older index wrote) is unclaimed by the scan.
+SHARED_CLAIM_SEP = "\x1f"
+_RECORDED_CLAIMS_CYPHER = (
+    "MATCH (m:Module {repo_id: $repo_id, name: $file_name}) RETURN properties(m)['shared_claims'] AS claims"
+)
+_UNCLAIM_RECORDED_CYPHER = (
+    _union(_seek(label, "name", f"IN $claimed_{i}") for i, label in enumerate(CLAIMED_LABELS))
+    + _UNCLAIM_FILTER + _LOCK_AND_READ
+)
+
+
+def _recorded_claims(tx, repo_id: str, file_name: str, code: bool = False) -> list[list[str]] | None:
+    """The [label, name] pairs of the shared nodes `file_name`'s Module
+    recorded claiming, None when it recorded none (see SHARED_CLAIM_SEP).
+    A `code` file (one writing its Module) with no Module yet claims none."""
+    record = tx.run(_RECORDED_CLAIMS_CYPHER, repo_id=repo_id, file_name=file_name).single()
+    if record is None:
+        return [] if code else None
+    if record["claims"] is None:
+        return None
+    return [entry.split(SHARED_CLAIM_SEP, 1) for entry in record["claims"]]
 
 # Shared nodes are attributed to their first source, whatever order the files
 # claim them in (watcher spec W10). `claims` is a JSON string (Neo4j has no
@@ -208,22 +236,42 @@ def _claim_nodes_tx(tx, label: str, rows: list[dict[str, Any]]) -> None:
     )
 
 
+# The files whose replace is a `service_api` one: Python's (its owning-service
+# and API edges) and the languages whose routes are extracted
+# (indexer/apis/routes.py: their Endpoint and owning-service CALLS edges).
+SERVICE_API_SUFFIXES = (
+    ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
+)
+
+
 def _delete_by_source_file_tx(tx, repo_id: str, file_name: str) -> None:
+    recorded = _recorded_claims(tx, repo_id, file_name)
     _unclaim_foreign_sources_tx(tx, repo_id, file_name)
-    if file_name.endswith(".py"):
-        _unclaim_service_api_edges_tx(tx, repo_id, file_name)
+    if file_name.endswith(SERVICE_API_SUFFIXES):
+        _unclaim_service_api_edges_tx(tx, repo_id, file_name, recorded)
     tx.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, f=file_name)
-    _unclaim_source_tx(tx, repo_id, file_name, [])
+    _unclaim_source_tx(tx, repo_id, file_name, [], recorded)
 
 
-def _unclaim_source_tx(tx, repo_id: str, file_name: str, keep: list[list[str]]) -> None:
+def _unclaim_source_tx(
+    tx, repo_id: str, file_name: str, keep: list[list[str]], recorded: list[list[str]] | None = None
+) -> None:
     """Drop `file_name`'s claim on every shared node except the `keep` ones
     ([label, name] pairs the file still claims, which the upsert that follows
     re-claims in place): re-attribute the node from the new first source, or
-    delete it when no claim is left."""
+    delete it when no claim is left. `recorded` (`_recorded_claims`) limits
+    the search to the nodes the file recorded claiming; None searches all."""
     gone: list[str] = []
     kept: list[dict[str, Any]] = []
-    for record in tx.run(_UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name, keep=keep):
+    if recorded is None:
+        records = tx.run(_UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name, keep=keep)
+    else:
+        names = {
+            f"claimed_{i}": sorted({name for each, name in recorded if each == label})
+            for i, label in enumerate(CLAIMED_LABELS)
+        }
+        records = tx.run(_UNCLAIM_RECORDED_CYPHER, repo_id=repo_id, file_name=file_name, keep=keep, **names)
+    for record in records:
         props = dict(record["props"])
         claims = _claims_of(props)
         before = _attribution(claims)
@@ -316,8 +364,9 @@ def _unclaim_foreign_sources_tx(tx, repo_id: str, file_name: str) -> None:
         tx.run(_UNCLAIM_FOREIGN_SOURCES_CYPHER, repo_id=repo_id, f=file_name, sources=sources)
 
 
-# G2 set (c): the edges a Python file writes out of nodes it doesn't own,
-# the owning-service USES/CALLS and the API pass's Endpoint edges. Only the
+# G2 set (c): the edges a Python file (or another route file,
+# SERVICE_API_SUFFIXES) writes out of nodes it doesn't own, the
+# owning-service USES/CALLS and the API pass's Endpoint edges. Only the
 # edges that list the file (or list no writer) are touched.
 # The repository's Services and Endpoints are sought by repo_id on their
 # `(repo_id, name)` index (every node has a name); a plain `{repo_id}` match
@@ -332,12 +381,28 @@ _UNCLAIM_ENDPOINT_EDGES_CYPHER = (
 )
 
 
-def _unclaim_service_api_edges_tx(tx, repo_id: str, file_name: str) -> None:
+# Set (c)'s Endpoint edges when the file recorded its claims (SHARED_CLAIM_SEP):
+# every Endpoint edge a file writes (its routes', its owning-service CALLS,
+# their relinks) goes out of an Endpoint it claims.
+_UNCLAIM_RECORDED_ENDPOINT_EDGES_CYPHER = (
+    "MATCH (e:Endpoint)-[r:CALLS|IMPLEMENTS]->() USING INDEX SEEK e:Endpoint(repo_id, name) "
+    "WHERE e.repo_id = $repo_id AND e.name IN $endpoints AND $f IN coalesce(r.origins, [$f]) " + _UNCLAIM_EDGE
+)
+
+
+def _unclaim_service_api_edges_tx(
+    tx, repo_id: str, file_name: str, recorded: list[list[str]] | None = None
+) -> None:
     # The owning-service edges come back only in index_paths' final service
     # pass, which needs every compose file in the batch, so between this
     # file's replace and that pass a reader can briefly miss them.
     tx.run(_UNCLAIM_SERVICE_USES_CYPHER, repo_id=repo_id, f=file_name)
-    tx.run(_UNCLAIM_ENDPOINT_EDGES_CYPHER, repo_id=repo_id, f=file_name)
+    if recorded is None:
+        tx.run(_UNCLAIM_ENDPOINT_EDGES_CYPHER, repo_id=repo_id, f=file_name)
+    else:
+        endpoints = sorted({name for label, name in recorded if label == "Endpoint"})
+        if endpoints:
+            tx.run(_UNCLAIM_RECORDED_ENDPOINT_EDGES_CYPHER, repo_id=repo_id, f=file_name, endpoints=endpoints)
 
 
 # Nodes a schema-declared provider owns (devgraph/indexer/providers/) are
@@ -1037,10 +1102,12 @@ def _replace_file_nodes_tx(
             or (node.get("properties") or {}).get("source_file") == file_name
         )
     ]
+    code = any(node["label"] == "Module" and node["name"] == file_name for node in nodes)
+    recorded = _recorded_claims(tx, repo_id, file_name, code)
     _unclaim_foreign_sources_tx(tx, repo_id, file_name)
     tx.run(_REPLACE_OWNED_NODES_CYPHER, repo_id=repo_id, f=file_name, keep=keep)
     if service_api:
-        _unclaim_service_api_edges_tx(tx, repo_id, file_name)
+        _unclaim_service_api_edges_tx(tx, repo_id, file_name, recorded)
     # Shared nodes the file still claims are re-claimed in place by the
     # upsert below, not deleted and recreated, so a single-claimant
     # Container or Datastore keeps its incoming edges (MENTIONS, USES).
@@ -1050,7 +1117,14 @@ def _replace_file_nodes_tx(
         if not (node.get("properties") or {}).get("file")
         and (node.get("properties") or {}).get("source") == file_name
     ]
-    _unclaim_source_tx(tx, repo_id, file_name, claimed)
+    _unclaim_source_tx(tx, repo_id, file_name, claimed, recorded)
+    # The file's Module records what it claims now, for its next write.
+    record = sorted({SHARED_CLAIM_SEP.join(pair) for pair in claimed})
+    nodes = [
+        {**node, "properties": {**(node.get("properties") or {}), "shared_claims": record}}
+        if node["label"] == "Module" and node["name"] == file_name else node
+        for node in nodes
+    ]
     _upsert_nodes_tx(tx, nodes)
     _upsert_relationships_tx(tx, rels)
 
@@ -1294,7 +1368,7 @@ class GraphEngine:
         read-committed isolation it sees either the pre-reindex state or the
         fully-rebuilt state, never in between.
 
-        `service_api` (a Python file) also unclaims the file from the
+        `service_api` (a file of SERVICE_API_SUFFIXES) also unclaims the file from the
         owning-service USES and the Endpoint CALLS/IMPLEMENTS edges it wrote,
         which `nodes`/`rels` and index_paths' service pass write again. The
         file is always unclaimed from the edges it wrote out of other files'
