@@ -13,9 +13,10 @@ incremental one extract every file under the same configuration.
 A configuration file under a path the walk ignores (an ignored directory, or a
 `.gitignore` rule) is treated as absent.
 
-C#'s configuration is its projects (`csharp_projects`): each `.csproj`, the
-nearest Directory.Build.props and Directory.Build.targets above it, and every
-`.cs` file whose head (`cs_global_usings`) holds a `global using`.
+C#'s configuration is its projects (`csharp_projects`): each `.csproj` (its
+`<Using>` items and `<ProjectReference>`s), the nearest Directory.Build.props
+and Directory.Build.targets above it, and every `.cs` file whose head
+(`cs_global_usings`) holds a `global using`.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import re
 import tomllib
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
-from dataclasses import astuple, dataclass
+from dataclasses import astuple, dataclass, replace
 from pathlib import Path
 
 from devgraph.indexer.gitignore import is_gitignored
@@ -175,13 +176,15 @@ class CsProject:
     nearest Directory.Build.targets after each, and `global_usings` the
     `global using` directives in the heads (`cs_global_usings`) of the
     project's own .cs files, not those of a nested project. Both are sorted
-    and without repeats. Another project a `<ProjectReference>` names is not
-    read."""
+    and without repeats. `references` are the directories of the projects
+    its project files' `<ProjectReference>`s reach, transitively, sorted,
+    its own left out (`_cs_project_references`)."""
 
     dir: str
     csproj: tuple[str, ...]
     usings: tuple[CsUsing, ...]
     global_usings: tuple[CsUsing, ...]
+    references: tuple[str, ...] = ()
 
 
 #: The most of a .cs file read for its head (`cs_global_usings`).
@@ -264,6 +267,33 @@ def _cs_using_items(text: str | None) -> list[tuple[str, CsUsing]]:
                 if name.strip() and not any(c in name for c in "$@%*"):
                     items.append((op, CsUsing(_cs_name(name), static, alias)))
     return items
+
+
+def _cs_project_references(text: str | None, rel: str) -> list[str]:
+    """The project files the `<ProjectReference>` items of the project file
+    `rel` name, repo-relative and sorted: each `Include` read relative to
+    `rel`'s directory, `\\` taken as `/`. As with `<Using>` nothing is
+    evaluated: an item under a `Condition` counts as if it held, and a path
+    holding a property, item or metadata reference or a wildcard is left
+    out, as is an absolute one or one leaving the repository. Only a
+    `.csproj` is read for them, not a Directory.Build file (whose relative
+    paths MSBuild reads from each importing project). A malformed file has
+    none."""
+    try:
+        root = ET.fromstring(text or "")
+    except (ET.ParseError, ValueError):
+        return []
+    found = set()
+    for element in root.iter():
+        if not isinstance(element.tag, str) or element.tag.rpartition("}")[2] != "ProjectReference":
+            continue
+        for name in element.attrib.get("Include", "").split(";"):
+            name = name.strip().replace("\\", "/")
+            if not name or any(c in name for c in "$@%*:") or name.startswith("/"):
+                continue
+            if (path := _join(posixpath.dirname(rel), name)) is not None:
+                found.add(path)
+    return sorted(found)
 
 
 @dataclass(frozen=True)
@@ -610,7 +640,11 @@ class ResolverConfig:
     def _cs_digest(self, rel: str) -> object:
         if rel.endswith(".cs"):
             return [list(astuple(each)) for each in cs_global_usings(self.root / rel)]
-        return [[op, *astuple(each)] for op, each in _cs_using_items(self._text(rel))]
+        text = self._text(rel)
+        references = _cs_project_references(text, rel) if rel.endswith(".csproj") else []
+        return [[op, *astuple(each)] for op, each in _cs_using_items(text)] + [
+            ["ProjectReference", path] for path in references
+        ]
 
     def cs_projects(self) -> dict[str, CsProject]:
         """Every C# project of the repository by its directory (see
@@ -652,6 +686,23 @@ class ResolverConfig:
                 projects[folder] = CsProject(
                     folder, tuple(paths), tuple(sorted(usings)), tuple(sorted(global_usings[folder]))
                 )
+            # A reference to a project file the repository does not hold
+            # (missing, ignored, outside it) reaches nothing; a cycle ends
+            # where it comes back.
+            owners = {path: folder for folder, paths in csproj.items() for path in paths}
+            direct = {
+                folder: {owners[ref] for path in paths for ref in _cs_project_references(self._text(path), path)
+                         if ref in owners}
+                for folder, paths in csproj.items()
+            }
+            for folder, project in projects.items():
+                reached, todo = set(), list(direct[folder])
+                while todo:
+                    if (each := todo.pop()) not in reached:
+                        reached.add(each)
+                        todo += direct[each]
+                reached.discard(folder)
+                projects[folder] = replace(project, references=tuple(sorted(reached)))
             self._cs_projects = projects
         return self._cs_projects
 
@@ -705,8 +756,9 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
     `references` reach; for Go each go.mod's `module` line and the local
     `replace` directives of each go.mod and go.work; for Rust each
     Cargo.toml's library crate name and root (`_cargo_entries`); for C# each
-    project file's and Directory.Build.props/.targets' `<Using>` items and
-    the `global using` directives of each project's .cs files
+    project file's and Directory.Build.props/.targets' `<Using>` items, each
+    project file's `<ProjectReference>` paths and the `global using`
+    directives of each project's .cs files
     (`_cs_inputs`). A compiler flag, a `require` bump or a dependency or
     version change counts for nothing."""
     root = Path(repo_root)

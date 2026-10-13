@@ -305,7 +305,7 @@ def test_a_global_using_in_any_file_counts_and_its_loss_changes_the_fingerprint(
     assert fingerprints(tmp_path)["csharp"] == empty
 
 
-def test_only_using_items_count_in_a_project_file(tmp_path):
+def test_only_using_items_and_references_count_in_a_project_file(tmp_path):
     write(tmp_path, "App.csproj", csproj('<PackageReference Include="Pkg" Version="1.0" />'))
     before = fingerprints(tmp_path)["csharp"]
     write(tmp_path, "App.csproj", csproj('<PackageReference Include="Pkg" Version="2.0" />'))
@@ -314,6 +314,55 @@ def test_only_using_items_count_in_a_project_file(tmp_path):
     assert fingerprints(tmp_path)["csharp"]["fingerprint"] != before["fingerprint"]
     write(tmp_path, "App.csproj", "<Project><broken")
     assert csharp_projects(tmp_path)[0].usings == ()
+
+
+def _references(root) -> dict[str, tuple[str, ...]]:
+    return {project.dir: project.references for project in csharp_projects(root)}
+
+
+def test_project_references_are_closed_transitively(tmp_path):
+    write(tmp_path, "src/App/App.csproj", csproj('<ProjectReference Include="../Web/Web.csproj" />'))
+    write(tmp_path, "src/Web/Web.csproj", csproj(
+        '<ProjectReference Include="../Core/Core.csproj;../Data/Data.csproj" Condition="\'$(X)\' == \'1\'" />'
+    ))
+    write(tmp_path, "src/Core/Core.csproj", csproj())
+    write(tmp_path, "src/Data/Data.csproj", csproj('<ProjectReference Include="$(Root)/Other.csproj" />'))
+    write(tmp_path, "src/Lone/Lone.csproj", csproj())
+    assert _references(tmp_path) == {
+        "src/App": ("src/Core", "src/Data", "src/Web"),  # a Condition counts as if it held
+        "src/Core": (), "src/Data": (), "src/Lone": (),  # a `$(...)` path is left out
+        "src/Web": ("src/Core", "src/Data"),
+    }
+
+
+def test_a_reference_cycle_ends_where_it_comes_back(tmp_path):
+    write(tmp_path, "a/A.csproj", csproj('<ProjectReference Include="../b/B.csproj" />'))
+    write(tmp_path, "b/B.csproj", csproj('<ProjectReference Include="../c/C.csproj" />'))
+    write(tmp_path, "c/C.csproj", csproj('<ProjectReference Include="../a/A.csproj" />'))
+    assert _references(tmp_path) == {"a": ("b", "c"), "b": ("a", "c"), "c": ("a", "b")}
+
+
+def test_a_missing_referenced_project_reaches_nothing_until_it_exists(tmp_path):
+    write(tmp_path, "a/A.csproj", csproj('<ProjectReference Include="../b/B.csproj" />'))
+    write(tmp_path, "a/Out.csproj", csproj('<ProjectReference Include="../../elsewhere/E.csproj" />'))
+    before = fingerprints(tmp_path)["csharp"]
+    assert _references(tmp_path) == {"a": ()}
+    write(tmp_path, "b/B.csproj", csproj())
+    assert _references(tmp_path) == {"a": ("b",), "b": ()}
+    assert fingerprints(tmp_path)["csharp"]["fingerprint"] != before["fingerprint"]
+
+
+def test_a_backslashed_reference_and_its_change_count_in_the_fingerprint(tmp_path):
+    write(tmp_path, "src/App/App.csproj", csproj(r'<ProjectReference Include="..\Lib\Lib.csproj" />'))
+    write(tmp_path, "src/Lib/Lib.csproj", csproj())
+    write(tmp_path, "src/Two/Two.csproj", csproj())
+    assert _references(tmp_path)["src/App"] == ("src/Lib",)
+    before = fingerprints(tmp_path)["csharp"]
+    write(tmp_path, "src/App/App.csproj", csproj(r'<ProjectReference Include="..\Two\Two.csproj" />'))
+    assert _references(tmp_path)["src/App"] == ("src/Two",)
+    assert fingerprints(tmp_path)["csharp"]["fingerprint"] != before["fingerprint"]
+    write(tmp_path, "src/App/App.csproj", csproj(r'<ProjectReference Include="..\Lib\Lib.csproj" />'))
+    assert fingerprints(tmp_path)["csharp"] == before
 
 
 # --- live ----------------------------------------------------------------------
@@ -458,3 +507,55 @@ def test_a_csharp_configuration_change_re_indexes_every_csharp_file(engine, repo
     assert sync_resolver_config(engine, repo_id, tmp_path, {program}) == 2
     assert engine.read_resolver_config(repo_id)["csharp"]["inputs"] == ["src/App.csproj"]
     equals_fresh(engine, repo_id, tmp_path)
+
+
+def display_targets(engine, repo_id):
+    rows = engine.run_cypher(
+        "MATCH (:Function {repo_id: $r, name: 'Run'})-[:CALLS]->(b:Function {name: 'Display'}) RETURN b.file AS f "
+        "UNION MATCH (:Module {repo_id: $r, name: 'src/A/Service.cs'})-[:IMPORTS]->(b:Class {name: 'User'}) "
+        "RETURN b.file AS f",
+        {"r": repo_id},
+    )
+    return sorted({row["f"] for row in rows})
+
+
+def test_a_project_reference_decides_which_project_a_site_links(engine, repo_id, tmp_path):
+    """Two projects declare the same `Shop.Models.User`: a site of project A
+    links the one its project references, transitively, and a reference
+    added or removed, a project deleted (its files then of no project,
+    seen by every site) or added again, and a file moving between projects
+    each relink it, equal to a fresh scan."""
+    user = "namespace Shop.Models;\n\npublic class User\n{\n    public string Display() => \"\";\n}\n"
+    a = write(tmp_path, "src/A/A.csproj", csproj(r'<ProjectReference Include="..\B\B.csproj" />'))
+    write(tmp_path, "src/A/Service.cs", "using Shop.Models;\n\nnamespace Shop.App;\n\npublic class Service\n{\n"
+          "    public void Run(User user) => user.Display();\n}\n")
+    write(tmp_path, "src/B/B.csproj", csproj('<ProjectReference Include="../C/C.csproj" />'))
+    write(tmp_path, "src/C/C.csproj", csproj())
+    write(tmp_path, "src/D/D.csproj", csproj())
+    write(tmp_path, "src/C/User.cs", user)
+    d_user = write(tmp_path, "src/D/User.cs", user)
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+    assert display_targets(engine, repo_id) == ["src/C/User.cs"]  # A reaches C through B; never D
+
+    def changed(*paths):
+        index_paths(engine, repo_id, tmp_path, set(paths))
+        sync_resolver_config(engine, repo_id, tmp_path, set(paths))
+        equals_fresh(engine, repo_id, tmp_path)
+        return display_targets(engine, repo_id)
+
+    write(tmp_path, "src/A/A.csproj", csproj(r'<ProjectReference Include="..\D\D.csproj" />'))
+    assert changed(a) == ["src/D/User.cs"]
+    write(tmp_path, "src/A/A.csproj", csproj())
+    assert changed(a) == []
+    d_project = tmp_path / "src/D/D.csproj"
+    d_project.unlink()
+    remove_paths(engine, repo_id, tmp_path, {d_project})
+    assert changed(d_project) == ["src/D/User.cs"]  # D's files are of no project now
+    write(tmp_path, "src/D/D.csproj", csproj())
+    assert changed(d_project) == []
+    moved = write(tmp_path, "src/A/User.cs", user)  # D's User moves into A
+    d_user.unlink()
+    remove_paths(engine, repo_id, tmp_path, {d_user})
+    assert changed(moved) == ["src/A/User.cs"]
