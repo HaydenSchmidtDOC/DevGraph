@@ -297,3 +297,58 @@ def test_aspnet_minimal_api_routes():
     # `Health` is no method of the file: its stub alone.
     assert {e for e in implements if e[0] == "GET /health"} == {("GET /health", "Health", "", None)}
     assert not [e for e in implements if e[0] == "POST /todos/{id}"]
+
+
+GO_ROUTES = """\
+package api
+
+import (
+\t"net/http"
+
+\t"example.com/shop/internal/handlers"
+)
+
+func listItems(w http.ResponseWriter, r *http.Request) {}
+
+func Register(mux *http.ServeMux, r *gin.Engine, c chi.Router) {
+\tmux.HandleFunc("GET /items/{id}", listItems)
+\thttp.HandleFunc("/legacy", listItems)
+\tmux.Handle("POST shop.example.com/items", http.HandlerFunc(handlers.Create))
+\tmux.HandleFunc("/inline", func(w http.ResponseWriter, r *http.Request) {})
+\tv1 := r.Group("/v1")
+\tv1.GET("/users/:id", handlers.ShowUser)
+\tr.Any("/ping", listItems)
+\tr.Handle("DELETE", "/users/:id", handlers.DeleteUser)
+\tc.Route("/orders", func(c chi.Router) {
+\t\tc.Get("/", listItems)
+\t\tc.Method("PUT", "/{id}", http.HandlerFunc(listItems))
+\t})
+\tclient.Post("/upload", "text/plain", body)
+\tcache.Get("/key", &value)
+\tmux.HandleFunc(base+"/x", listItems)
+}
+"""
+
+
+def test_go_routes():
+    from devgraph.indexer.go.extractor import extract_go_file
+
+    path = "internal/api/routes.go"
+    result = extract_go_file(GO_ROUTES, path, "r")
+    assert _endpoints(result) == {
+        "GET /items/{id}": "Go",
+        "* /legacy": "Go",
+        "POST /items": "Go",
+        "* /inline": "Go",
+        "GET /v1/users/:id": "Go",
+        "* /ping": "Go",
+        "DELETE /users/:id": "Go",
+        "GET /orders": "Go",
+        "PUT /orders/{id}": "Go",
+    }
+    implements = _implements(result)
+    # A function of the file, as a call to it resolves: the file, owner "".
+    assert ("GET /items/{id}", "listItems", path, "") in implements
+    assert ("GET /items/{id}", "listItems", "", None) in implements
+    assert not [e for e in implements if e[0] == "* /inline"]
+    assert _stubs(result) == {"listItems", "Create", "ShowUser", "DeleteUser"}

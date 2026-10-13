@@ -240,7 +240,7 @@ def _claim_nodes_tx(tx, label: str, rows: list[dict[str, Any]]) -> None:
 # and API edges) and the languages whose routes are extracted
 # (indexer/apis/routes.py: their Endpoint and owning-service CALLS edges).
 SERVICE_API_SUFFIXES = (
-    ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".java", ".kt", ".cs",
+    ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".java", ".kt", ".cs", ".go",
 )
 
 

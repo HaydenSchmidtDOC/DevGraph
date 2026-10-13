@@ -642,6 +642,84 @@ A C++ explicit specialisation is its template's class, a class nested in
 a class body is extracted, and an out-of-class member is owned by its
 qualifier's classes (less the file's namespaces).
 
+## Routes beyond Python (index format 13)
+
+Audit 4, item 9: `Endpoint` nodes came from Python alone, so
+`trace_request_flow` and `explain_architecture` were empty for Express,
+Spring, ASP.NET Core and Go services. Each extractor now finds its
+framework's statically detectable routes and writes them through
+`devgraph/indexer/apis/routes.py` `add_route`, in the shape a FastAPI route
+has:
+
+- An `Endpoint` named `"<METHOD> <path>"` (`*` for every method), with
+  `framework` and `source`, claimed by the file (a shared node, as before:
+  two files routing `GET /x` both claim it).
+- A file-less handler stub `Function` (`type: handler`, `source`), claimed
+  the same way, and `IMPLEMENTS` to it (`to_file` "").
+- `IMPLEMENTS` to the handler. A handler declared in the route's file is
+  pinned to that file and its owner (a Spring or ASP.NET action's class, a
+  top-level JS function's ""), so the file writes both ends. A handler
+  declared elsewhere is pinned where a call to it would go: `call_rows`
+  with `rel_type="IMPLEMENTS"` over the pins the language's call resolver
+  gives the name (an ES named import's candidate files and folder at owner
+  "", a default import's or a typed value's member at any owner, a Go
+  identifier's own file or package directory, a Go `pkg.H` the package's).
+  Such an edge is pinned to another file, so `name_ref_properties` records
+  it and G5 relinks it when a batch adds the handler; nothing else is new
+  for incremental equals fresh. A name nothing resolves keeps only the stub.
+  An inline handler (arrow function, lambda, function literal) has no node:
+  its `Endpoint` implements nothing.
+
+Forms read, all with literal paths only (a variable, constant or
+concatenation in a path or prefix skips the route):
+
+| Framework | Forms | Prefix |
+|---|---|---|
+| Express (and Koa-router, Fastify) | `r.get/post/put/delete/patch/options/head/all('/x', ..., h)`, `r.route('/x').get(h)`, Koa's named `r.get('name', '/x', h)`; `r` an app or router the file makes (`express()`, `Router()`, `new Router()`, `Fastify()`) or named `app`, `router`, `fastify`, `...Router`; the path starts with "/" and the last argument is the handler | `app.use('/api', r)` when the same file makes `r` |
+| Spring (Java, Kotlin) | methods of a `@RestController`/`@Controller` class with `@GetMapping`...`@PatchMapping` or `@RequestMapping(method = ...)` (none: `*`), `value`/`path`, arrays | the class's `@RequestMapping` |
+| ASP.NET Core | actions of an `[ApiController]`, `[Route]` or `...Controller` class with `[HttpGet("x")]`... or `[Route("x")]` (`*`), `[controller]`/`[action]` filled in (`Async` dropped), a template starting with "/" or "~/" absolute; `app.MapGet/MapPost/MapPut/MapDelete/MapPatch("/x", h)`, `h` a method group of the file | the class's `[Route]`; a `MapGroup("/x")` variable of the file |
+| Go | `Handle`/`HandleFunc` on any receiver with a Go 1.22 pattern (`"GET /x"`, no method `*`, a host dropped), gin/echo `GET`...`Any`, chi `Get`..., gin `Handle("GET", "/x", h)`, chi `Method("GET", "/x", h)`; `http.HandlerFunc(h)` is `h`; a call whose arguments after the path include a string (`client.Post("/x", "text/plain", b)`) is not a route | gin/echo `v := r.Group("/x")` in the file; chi `r.Route("/x", func(r chi.Router) {...})` |
+
+Not read: a router or group made or mounted in another file (its routes
+keep their own paths), Fastify's `route({...})` object form, echo's `Add`,
+chi `Mount`, ASP.NET `MapMethods` and conventional routing, Spring
+functional routes (`RouterFunction`), Kotlin Ktor. Express, Koa and
+Fastify routes all carry `framework: Express`.
+
+The dispatcher treats these files as it treats a Python file. Their replace
+is a `service_api` one (`engine.SERVICE_API_SUFFIXES`, also checked on
+deletion), so set (c) of the graph-accuracy design unclaims the Endpoint
+edges they wrote. Their extraction's `Endpoint` nodes join the
+owning-service pass (`_endpoint_service_relationships`), so a service's
+Endpoints `CALLS` its compose `Service` as Python's do. Index format 13
+makes an older graph rescan to gain them. The accuracy fuzz adds, removes
+and changes Express and Spring routes and moves their handlers
+(`op_route`, `op_route_change`, `op_route_move`), and
+`tests/indexer/test_routes_live.py` checks `explain_architecture` and
+`trace_request_flow` per framework.
+
+**Cost.** A file's replace used to find the shared nodes it claimed by
+reading every shared node of the repository (`_UNCLAIM_SOURCE_CYPHER`), and
+a route file's set (c) every Endpoint's edges, so a full scan was quadratic
+in the repository's Endpoints and stubs. A code file's Module now records
+the shared nodes its replace claimed (`shared_claims`, hidden and reserved
+like `claims`), and the next replace or delete seeks just those by name; a
+code file with no Module yet claims nothing, and a file with no record (a
+compose file, a Module an older index wrote) still takes the scan. Python
+route files gain the same. Measured on a synthetic repository of 2,000
+files (400 each of TS, Java, Go, C# and Python, a quarter of the first four
+with routes: 1,600 Endpoints), `full_scan` against the shared local Neo4j:
+
+| | before (format 12) | routes, scan unclaim | routes, recorded claims |
+|---|---|---|---|
+| 2,000 files, no routes in them | 74-75 s | | 75-76 s |
+| 2,000 files, 1,600 Endpoints | 74-75 s (none extracted) | 113-116 s | 89-93 s |
+| 1,000 files, 800 Endpoints (the same files without routes: 41 s) | not run | 52 s | 46 s |
+
+A repository with no routes costs the same. What remains is linear in the
+routes (their Endpoint and stub claims, about 5.5 ms per label per route
+file, and their edges).
+
 ## No reverse dependents
 
 With Go, Java and Kotlin resolved, every code edge is a function of its

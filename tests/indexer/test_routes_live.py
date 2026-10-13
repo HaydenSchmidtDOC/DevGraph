@@ -113,6 +113,22 @@ FRAMEWORKS = {
         "services/shop/Program.cs", "var app = WebApplication.Create(args);\napp.Run();\n",
         "DELETE /orders", "Clear", "services/shop/Controllers/OrdersController.cs",
     ),
+    "go": (
+        "services/shop/main.go", """\
+        package main
+
+        import "net/http"
+
+        func main() {
+        \tmux := http.NewServeMux()
+        \tmux.HandleFunc("GET /orders", listOrders)
+        \thttp.ListenAndServe(":8080", mux)
+        }
+        """,
+        "services/shop/orders.go",
+        "package main\n\nimport \"net/http\"\n\nfunc listOrders(w http.ResponseWriter, r *http.Request) {}\n",
+        "GET /orders", "listOrders", "services/shop/orders.go",
+    ),
 }
 
 

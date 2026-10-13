@@ -62,6 +62,7 @@ from pathlib import Path
 import tree_sitter_go as tsgo
 from tree_sitter import Language, Node, Parser
 
+from devgraph.indexer.apis.routes import add_route, join_route
 from devgraph.indexer.calls import STOP_METHODS, CallSites, import_rows
 from devgraph.indexer.common import (
     ExtractionResult,
@@ -493,8 +494,11 @@ class _GoResolver:
         """One call site as (callee name, its pins or None for a bare-name
         row, whether it is a member call); None when it links nothing."""
         func = call.child_by_field_name("function")
-        if func is None:
-            return None
+        return self.callee(func, scope) if func is not None else None
+
+    def callee(self, func: Node, scope: dict[str, GoType | None]) -> tuple[str, list[str] | None, bool] | None:
+        """`resolve` for the called expression `func` (a function value
+        passed as a route's handler resolves the same way)."""
         if func.type == "parenthesized_expression" and func.named_children:
             func = func.named_children[0]
         if func.type == "identifier":
@@ -590,11 +594,14 @@ def _function_scope(func: Node, resolver: _GoResolver, source: bytes) -> dict:
     return scope
 
 
-def _collect_calls(body: Node, scope: dict, resolver: _GoResolver, source: bytes, found: list) -> None:
+def _collect_calls(
+    body: Node, scope: dict, resolver: _GoResolver, source: bytes, found: list, routes: list | None = None
+) -> None:
     """Walk a function body in order, binding local variables as they are
     declared and resolving each call against the scope at that point.
     Anonymous functions are walked as part of their enclosing function (no
-    node of their own to attribute calls to)."""
+    node of their own to attribute calls to). `routes` collects each call
+    that can register a route (`_ROUTE_CALLS`) with the scope at it."""
 
     def expressions(node: Node | None) -> list[Node]:
         if node is None:
@@ -603,6 +610,10 @@ def _collect_calls(body: Node, scope: dict, resolver: _GoResolver, source: bytes
 
     def walk(node: Node) -> None:
         if node.type == "call_expression":
+            func = node.child_by_field_name("function")
+            field = func.child_by_field_name("field") if func is not None and func.type == "selector_expression" else None
+            if routes is not None and field is not None and _text(field, source) in _ROUTE_CALLS:
+                routes.append((node, dict(scope)))
             # Arguments and the callee's own operand first, as evaluated.
             for child in node.children:
                 walk(child)
@@ -639,6 +650,131 @@ def _collect_calls(body: Node, scope: dict, resolver: _GoResolver, source: bytes
             walk(child)
 
     walk(body)
+
+
+#: Calls that register a route: net/http's and chi's `Handle`/`HandleFunc`
+#: (a Go 1.22 pattern, "GET /x"), gin's/echo's `GET`..., chi's `Get`...
+#: (method by name), gin's `Handle`, chi's `Method`/`MethodFunc` (method as
+#: the first argument).
+_ROUTE_CALLS = frozenset({
+    "Handle", "HandleFunc", "Method", "MethodFunc", "Any", "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS",
+    "HEAD", "Get", "Post", "Put", "Delete", "Patch", "Options", "Head",
+})
+_GO_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD", "CONNECT", "TRACE")
+
+
+def _descendants(node: Node, kind: str) -> list[Node]:
+    found, stack = [], [node]
+    while stack:
+        current = stack.pop()
+        if current.type == kind:
+            found.append(current)
+        stack.extend(reversed(current.named_children))
+    return found
+
+
+def _go_literal(node: Node | None, source: bytes) -> str | None:
+    """A string literal's value (escapes left as written); None for
+    anything else (a dynamic value)."""
+    if node is None or node.type not in ("interpreted_string_literal", "raw_string_literal"):
+        return None
+    return _text(node, source)[1:-1]
+
+
+def _go_routes(
+    calls: list, root: Node, source: bytes, resolver: _GoResolver, result: ExtractionResult, file_path: str,
+    repo_id: str,
+) -> None:
+    """Go routes as Endpoints (apis/routes.py): `http.HandleFunc("GET /x",
+    h)` and any `mux.Handle`/`HandleFunc` (a Go 1.22 pattern; no method
+    maps every one, a host before the path is dropped), gin's and echo's
+    `r.GET("/x", h)`, chi's `r.Get("/x", h)` and `r.Method("GET", "/x", h)`.
+    A route is under the literal prefixes of the file's gin/echo groups
+    (`v1 := r.Group("/v1")`) and of the chi `r.Route("/x", func(r
+    chi.Router) {...})` it is in. The handler resolves as a call to it
+    would (`http.HandlerFunc(h)` is `h`); a function literal implements
+    nothing."""
+    groups: dict[str, tuple[str, str | None]] = {}  # group variable -> (what it groups, its prefix)
+    for declaration in _descendants(root, "short_var_declaration"):
+        left, right = declaration.child_by_field_name("left"), declaration.child_by_field_name("right")
+        if left is None or right is None or len(left.named_children) != 1 or len(right.named_children) != 1:
+            continue
+        call = right.named_children[0]
+        func = call.child_by_field_name("function") if call.type == "call_expression" else None
+        args = call.child_by_field_name("arguments") if func is not None else None
+        if func is None or func.type != "selector_expression" or args is None or not args.named_children:
+            continue
+        operand, field = func.child_by_field_name("operand"), func.child_by_field_name("field")
+        if operand is not None and operand.type == "identifier" and field is not None and _text(field, source) == "Group":
+            groups[_text(left.named_children[0], source)] = (_text(operand, source),
+                                                             _go_literal(args.named_children[0], source))
+
+    def prefix(receiver: str, at: Node, seen: frozenset = frozenset()) -> str | None:
+        """The literal prefix the routes of `receiver` at the call `at` are under."""
+        node = at.parent
+        while node is not None:
+            # A chi subrouter: the function literal `r.Route("/x", func(r chi.Router) {...})` passes.
+            if node.type == "func_literal" and node.parent is not None and node.parent.type == "argument_list":
+                params = node.child_by_field_name("parameters")
+                first = params.named_children[0] if params is not None and params.named_children else None
+                names = [_text(n, source) for n in first.children_by_field_name("name")] if first is not None else []
+                outer = node.parent.parent
+                func = outer.child_by_field_name("function") if outer is not None else None
+                if receiver in names and func is not None and func.type == "selector_expression" and (
+                    _text(func.child_by_field_name("field"), source) == "Route"
+                ):
+                    mounted = _go_literal(node.parent.named_children[0], source)
+                    operand = func.child_by_field_name("operand")
+                    above = prefix(_text(operand, source), outer) if operand.type == "identifier" else ""
+                    return None if mounted is None or above is None else join_route(above, mounted)
+                if receiver in names:
+                    return ""
+            node = node.parent
+        if receiver in groups and receiver not in seen:
+            parent, mounted = groups[receiver]
+            above = prefix(parent, at, seen | {receiver})
+            return None if mounted is None or above is None else join_route(above, mounted)
+        return ""
+
+    for call, scope in calls:
+        func = call.child_by_field_name("function")
+        operand, field = func.child_by_field_name("operand"), _text(func.child_by_field_name("field"), source)
+        args = call.child_by_field_name("arguments")
+        values = [a for a in args.named_children if a.type != "comment"] if args is not None else []
+        if len(values) < 2 or operand is None:
+            continue
+        method = None
+        first, second = _go_literal(values[0], source), _go_literal(values[1], source)
+        if field in ("Handle", "HandleFunc", "Method", "MethodFunc") and first in _GO_METHODS and second is not None:
+            method, path, handlers = first, second, values[2:]  # gin's Handle, chi's Method
+        elif field in ("Handle", "HandleFunc") and first is not None:
+            verb, _space, rest = first.partition(" ")
+            method, path = (verb, rest.strip()) if rest and verb in _GO_METHODS else ("*", first)
+            path, handlers = path[path.find("/"):] if "/" in path else "", values[1:]
+        elif field not in ("Handle", "HandleFunc", "Method", "MethodFunc") and first is not None:
+            method, path, handlers = "*" if field == "Any" else field.upper(), first, values[1:]
+        if method is None or not path.startswith("/") or not handlers or any(
+            _go_literal(each, source) is not None for each in handlers
+        ) or handlers[-1].type not in ("identifier", "selector_expression", "func_literal", "call_expression"):
+            continue  # not a route: `client.Post("/x", "text/plain", body)`, `cache.Get("/k", &v)`
+        above = prefix(_text(operand, source), call) if operand.type == "identifier" else ""
+        if above is None:
+            continue  # a dynamic prefix
+        handler = handlers[-1]
+        if handler.type == "call_expression" and (args := handler.child_by_field_name("arguments")) is not None:
+            wrapper = handler.child_by_field_name("function")
+            if wrapper is not None and _text(wrapper, source).endswith("HandlerFunc") and len(args.named_children) == 1:
+                handler = args.named_children[0]  # http.HandlerFunc(h)
+        full = join_route(above, path)
+        target = resolver.callee(handler, scope) if handler.type in ("identifier", "selector_expression") else None
+        if handler.type not in ("identifier", "selector_expression"):
+            add_route(result, repo_id, file_path, "Go", method, full)
+        elif target is None:
+            name = handler if handler.type == "identifier" else handler.child_by_field_name("field")
+            add_route(result, repo_id, file_path, "Go", method, full, _text(name, source), pins=set())
+        else:
+            name, pins, _member = target
+            add_route(result, repo_id, file_path, "Go", method, full, name, pins=set(pins or ()))
 
 
 def extract_go_file(
@@ -716,9 +852,11 @@ def extract_go_file(
             )
         )
 
+    route_calls: list = []
+
     def _record_calls(node: Node, body: Node, caller_name: str, caller_class: str | None) -> None:
         found: list = []
-        _collect_calls(body, _function_scope(node, resolver, source_bytes), resolver, source_bytes, found)
+        _collect_calls(body, _function_scope(node, resolver, source_bytes), resolver, source_bytes, found, route_calls)
         for name, pins, member in found:
             sites.add("Function", caller_name, caller_class, name, pins, member, caller_class or "")
 
@@ -850,6 +988,7 @@ def extract_go_file(
         elif node.type == "method_declaration":
             _visit_method(node)
     result.relationships += sites.rows(file_path, repo_id)
+    _go_routes(route_calls, root, source_bytes, resolver, result, file_path, repo_id)
 
     return own_edges(result, file_path)
 

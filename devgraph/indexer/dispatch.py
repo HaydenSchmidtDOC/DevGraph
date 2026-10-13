@@ -1268,7 +1268,7 @@ def _index_single_path(
         # Same replace-then-re-upsert rationale as the .py branch above:
         # a struct/func/method removed from the file must not survive in
         # the graph as a stale node.
-        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
         go_extractions[rel_path] = (nodes, rels)
     elif "docs" in routes:
