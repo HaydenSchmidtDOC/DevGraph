@@ -678,17 +678,27 @@ unknown prefix. Its Endpoint is the file's own, named
 match it; its full name does). Unknown means: an Express router (a
 `Router()`, a Koa `new Router()`, a name-only `router`/`...Router`) the
 file doesn't mount on its app; a Go receiver of a router package's group
-or router type (`*gin.RouterGroup`, `chi.Router` outside a `Route`
-closure, a gorilla `*mux.Router` parameter) or one nothing types; an
+type (`*gin.RouterGroup`, `gin.IRouter`, `*echo.Group`) or one nothing
+types; an
 ASP.NET builder that is no `WebApplication` (`IEndpointRouteBuilder`
 parameters). A name-only `app`/`fastify`, an `express()`/`Fastify()` app,
 a router package's root constructor or type (`gin.Default()`,
 `*gin.Engine`, `http.NewServeMux()`, `chi.NewRouter()`, `mux.NewRouter()`,
+a gorilla `*mux.Router` or `chi.Router` parameter or struct field,
 `echo.New()`, `fiber.New()`) and a `WebApplication` are roots.
 
 A receiver is followed to its nearest declaration before the call: in
 the same function, then the enclosing ones, then the file's (Go and
-ASP.NET; a same-named group in another function is another group).
+ASP.NET; a same-named group in another function is another group, and in
+Go one declared in a block or function literal that doesn't hold the
+call is not it). A Go receiver declared from another (`v := s.router`)
+is followed to it; an ASP.NET chained receiver
+(`app.MapGroup("/x").MapGet(...)`) is read as its group. Only a router
+package itself (or its major version, `chi/v5`) names routers, never one
+of its subpackages (`fiber/v2/middleware/cache`); a dot import of a
+router package is not read; and a verb-named call on another package
+(`cache.Get("/k", load)`) is no route. An absolute ASP.NET action route
+is one Endpoint whatever the class's `[Route]`s.
 
 Forms read, all with literal paths only (a variable, constant or
 concatenation in a path or prefix skips the route):
@@ -734,8 +744,10 @@ overlapping writes of one file, from two processes, take turns: the second
 unclaims what the first claimed. A record can still lose a claim (a version
 without the lock, a write cut between claim and record); a full scan heals
 it, rebuilding every code Module's record from the shared nodes' own
-`sources` before it writes (`rebuild_claim_records`, one read and one
-write), and a deleted file whose record is empty reads every claim.
+`sources` before it prunes deleted files or writes (`rebuild_claim_records`,
+one read and a write of only the records that differ, so a scan that
+changes nothing locks no Module), and a file's delete reads every claim,
+not its record (deletes are rare).
 Set (c)'s `USES` unclaim runs for Python files only, the only writers of
 `USES`. Python
 route files gain the same. Measured on a synthetic repository of 2,000

@@ -1272,7 +1272,9 @@ def trace_request_flow(
         repo_id: Repository ID (or cross-repo search if cross_repo=True)
         start_endpoint: The endpoint's name, `"<METHOD> <path>"` (`"GET /users/<id>"`),
             or a bare path (`"/users/<id>"`), which starts from that path's endpoint
-            for every method
+            for every method. A route on a router whose mount its file doesn't show
+            is its file's own endpoint, `"<METHOD> ?<path> (<file>)"`
+            (`"GET ?/:id (routes/users.js)"`), reached by that full name only
         cross_repo: If True, cross repository boundaries
 
     Returns:
