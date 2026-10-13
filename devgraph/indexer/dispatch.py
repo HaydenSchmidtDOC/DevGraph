@@ -202,6 +202,11 @@ def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) ->
         label for label in previous.get("labels") or []
         if label not in labels and label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or "")
     ]
+    # Recorded before anything is written: a crash part-way then never leaves
+    # a label's nodes without a record naming it, so the next apply deletes
+    # them if the schema has dropped the label. The final record below
+    # replaces it with `labels`.
+    engine.record_schema_labels(repo_id, list(dict.fromkeys([*(previous.get("labels") or []), *labels])))
     for label in removed_labels:
         engine.delete_label_nodes(repo_id, label)
     for rel_type in previous.get("relationship_types") or []:

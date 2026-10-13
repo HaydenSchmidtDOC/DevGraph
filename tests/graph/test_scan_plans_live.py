@@ -1,6 +1,7 @@
 """A full scan's provider queries and the dashboard's whole-repository counts
 start from labels, so Neo4j never plans a scan of every node in the database,
-and they answer exactly as the label-less queries they replaced did."""
+and they answer exactly as the label-less queries they replaced did, nodes of
+a label no schema records included."""
 
 import textwrap
 import uuid
@@ -10,12 +11,15 @@ from neo4j import GraphDatabase, ManagedTransaction, Session
 
 from devgraph.dashboard import queries
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
+from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import full_scan
 
 URI, AUTH = "bolt://127.0.0.1:7687", ("neo4j", "devgraph-local-dev")
 # Unique per run: the schema's generated constraints are database-wide.
 _TOKEN = uuid.uuid4().hex[:8]
 FILE, NOTE = f"ZzPlanFile{_TOKEN}", f"ZzPlanNote{_TOKEN}"
+# A label nothing records: a provider node left by an apply a crash cut short.
+STRAY = f"ZzPlanStray{_TOKEN}"
 SCHEMA = f"""
     version: 1
     node_types:
@@ -37,7 +41,7 @@ def _drop_generated_constraints():
     yield
     cleanup = GraphEngine(uri=URI, user=AUTH[0], password=AUTH[1])
     try:
-        for label in (FILE, NOTE):
+        for label in (FILE, NOTE, STRAY):
             cleanup.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_key IF EXISTS")
             cleanup.run_cypher(f"DROP INDEX {label.lower()}_repo_name IF EXISTS")
     except Exception:
@@ -135,11 +139,12 @@ _OLD_RELS = "MATCH (a {repo_id: $repo_id})-[r]->(b {repo_id: $repo_id}) RETURN t
 def test_dashboard_counts_start_from_labels_and_match_the_old_answers(engine, repo_id, tmp_path):
     make_repo(tmp_path, schema=True)
     scan(engine, repo_id, tmp_path)
+    leave_stray(engine, repo_id)  # counted too, though no record names its label
     params = {"repo_id": repo_id}
 
     old_nodes = {r["label"]: r["count"] for r in engine.run_cypher(_OLD_NODES, params)}
     old_rels = {r["type"]: r["count"] for r in engine.run_cypher(_OLD_RELS, params)}
-    assert FILE in old_nodes and NOTE in old_nodes and "Function" in old_nodes and old_rels
+    assert FILE in old_nodes and NOTE in old_nodes and STRAY in old_nodes and "Function" in old_nodes and old_rels
     assert queries.count_nodes(engine, repo_id) == engine.run_cypher(_OLD_COUNT, params)[0]["count"]
     assert queries.summary_counts(engine, repo_id) == {"nodes_by_label": old_nodes, "relationships_by_type": old_rels}
     assert queries.node_counts_by_label(engine, [repo_id]) == old_nodes
@@ -152,3 +157,56 @@ def test_dashboard_counts_start_from_labels_and_match_the_old_answers(engine, re
     plans.append((union + "MATCH (n)-[r]->(b) WHERE b.repo_id = $repo_id RETURN count(r)",
                   {"repo_ids": [repo_id], "repo_id": repo_id}))
     assert whole_database_scans(plans) == []
+
+
+def strays(engine, repo_id):
+    return engine.run_cypher(f"MATCH (n:{STRAY} {{repo_id: $r}}) RETURN count(n) AS n", {"r": repo_id})[0]["n"]
+
+
+def leave_stray(engine, repo_id):
+    engine.run_cypher(
+        f"CREATE (:{STRAY} {{repo_id: $r, name: 'notes/x.md', path: 'notes/x.md', extractor: 'docs'}})",
+        {"r": repo_id},
+    )
+
+
+def test_a_provider_node_of_a_label_no_record_names_is_pruned(engine, repo_id):
+    engine.upsert_repository(repo_id, repo_id, "/nowhere")
+    leave_stray(engine, repo_id)
+    assert engine.read_applied_schema(repo_id) is None
+    assert engine.prune_extracted_nodes(repo_id, "docs", []) == 1
+    assert strays(engine, repo_id) == 0
+
+
+@pytest.mark.parametrize("schema", [False, True], ids=["no schema", "provider schema"])
+def test_a_full_scan_prunes_a_provider_node_of_a_label_no_record_names(engine, repo_id, tmp_path, schema):
+    make_repo(tmp_path, schema)
+    scan(engine, repo_id, tmp_path)
+    leave_stray(engine, repo_id)
+    full_scan(engine, repo_id, tmp_path)
+    assert strays(engine, repo_id) == 0
+
+
+def test_an_apply_cut_short_records_its_labels_first(engine, repo_id, tmp_path, monkeypatch):
+    """A crash between writing a new label's nodes and recording the schema
+    used to leave them under a label no record named; once the schema
+    dropped it, nothing deleted them."""
+    make_repo(tmp_path, schema=True)
+    scan(engine, repo_id, tmp_path)
+    write(tmp_path, "devgraph.schema.yaml", SCHEMA.replace(NOTE, STRAY))
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("killed")
+
+    monkeypatch.setattr(engine, "record_applied_schema", crash)
+    with pytest.raises(RuntimeError):
+        dispatch.apply_project_schema(engine, repo_id, tmp_path)
+    monkeypatch.undo()
+    assert strays(engine, repo_id) == 2
+    assert STRAY in engine.run_cypher(
+        "MATCH (r:Repository {repo_id: $r}) RETURN r.schema_labels AS l", {"r": repo_id}
+    )[0]["l"]
+
+    write(tmp_path, "devgraph.schema.yaml", SCHEMA)
+    full_scan(engine, repo_id, tmp_path)
+    assert strays(engine, repo_id) == 0

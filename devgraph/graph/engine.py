@@ -1521,6 +1521,16 @@ class GraphEngine:
             result = _run_records(session, _READ_ALL_APPLIED_SCHEMAS_CYPHER)
             return [record.data() for record in result or []]
 
+    def record_schema_labels(self, repo_id: str, labels: list[str]) -> None:
+        """Record the user labels the repository's graph may hold, ahead of a
+        schema apply that writes them (see dispatch._apply_project_schema)."""
+        with self._driver.session() as session:
+            _run(
+                session,
+                "MERGE (r:Repository {repo_id: $repo_id}) SET r.schema_labels = $labels",
+                repo_id=repo_id, labels=labels,
+            )
+
     def record_applied_schema(
         self,
         repo_id: str,
@@ -1748,17 +1758,35 @@ class GraphEngine:
             if label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or "")
         ]
 
+    def _user_labels_in_use(self) -> list[str]:
+        """Every label the database knows (`CALL db.labels()`) that is no
+        built-in one: a provider node can carry a label no schema records any
+        more (written before a crash cut its apply short, then dropped from
+        the schema), and a console-made node any label at all. Validated,
+        since they are interpolated. User labels are few, and each is matched
+        by its own label scan."""
+        from devgraph.config.project_schema import LABEL_PATTERN  # runtime import: see TYPE_CHECKING above
+
+        with self._driver.session() as session:
+            result = _run_records(session, "CALL db.labels() YIELD label RETURN label")
+        return [
+            record["label"] for record in result or []
+            if record["label"] not in NAMED_LABELS and record["label"] != "Repository"
+            and LABEL_PATTERN.fullmatch(record["label"] or "")
+        ]
+
     def _provider_nodes(self, repo_id: str, labels: Iterable[str] = ()) -> str | None:
-        """The repository's nodes of its applied schema's labels, and of
-        `labels` (one being written before the schema is recorded), as a
-        `_union` yielding `n`: every node a provider can own, each label
-        matched on its own. None when there are no such labels, so there is
-        nothing to match. Labels that aren't a valid user label are dropped,
-        since they are interpolated."""
+        """The repository's nodes of every label a provider node can carry, as
+        a `_union` yielding `n`, each label matched on its own: its applied
+        schema's labels, `labels` (one being written before the schema is
+        recorded) and every other non-built-in label in use, which catches
+        nodes of a label no record names any more. None when there are no
+        such labels, so there is nothing to match. Labels that aren't a valid
+        user label are dropped, since they are interpolated."""
         from devgraph.config.project_schema import LABEL_PATTERN  # runtime import: see TYPE_CHECKING above
 
         extra = [label for label in labels if label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or "")]
-        names = sorted(set(self._schema_labels(repo_id)) | set(extra))
+        names = sorted(set(self._schema_labels(repo_id)) | set(extra) | set(self._user_labels_in_use()))
         if not names:
             return None
         return _union(f"MATCH (n:{label}) WHERE n.repo_id = $repo_id RETURN n" for label in names)
@@ -1766,10 +1794,19 @@ class GraphEngine:
     def repository_nodes(self, repo_ids: list[str]) -> str:
         """Every node of these repositories (the query's `$repo_ids`) as a
         `_union` yielding `n`: each named label through its `(repo_id, name)`
-        index, the Repository nodes, and the labels their applied schemas
-        record. For whole-repository reads (the dashboard's counts), which
-        matched `{repo_id}` alone and so scanned every node in the database."""
-        user = sorted({label for repo_id in repo_ids for label in self._schema_labels(repo_id)})
+        index, the Repository nodes, and every other label in use (their
+        applied schemas' and any a node carries without a record, see
+        `_user_labels_in_use`), each by its own label scan. For
+        whole-repository reads (the dashboard's counts), which matched
+        `{repo_id}` alone and so scanned every node in the database.
+
+        A built-in node without a `name` is left out: the `(repo_id, name)`
+        index doesn't hold it, and finding one would scan every node of its
+        label. Only a console or manual write makes one; the extractors key
+        every node on its name."""
+        user = sorted(
+            {label for repo_id in repo_ids for label in self._schema_labels(repo_id)} | set(self._user_labels_in_use())
+        )
         return _union(
             [f"MATCH (n:{label}) WHERE n.repo_id IN $repo_ids AND n.name IS NOT NULL RETURN n" for label in NAMED_LABELS]
             + ["MATCH (n:Repository) WHERE n.repo_id IN $repo_ids RETURN n"]
