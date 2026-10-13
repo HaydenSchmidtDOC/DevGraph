@@ -53,13 +53,16 @@ conditionals (`#ifdef`/`#ifndef`/`#if`/`#else`/`#elif`) are flattened the
 same way, since `preproc_ifdef` etc. wrap their body as direct named
 children in Tree-sitter's cpp grammar — this lets include-guarded headers
 (the overwhelming majority of real-world .h files) parse normally instead of
-losing every declaration inside the guard.
+losing every declaration inside the guard. A `template<...>` declaration is
+walked through to the class, struct or function it declares, at file scope,
+in a namespace or as a member template.
 
 Out-of-class method definitions (`ClassName::MethodName(...) { ... }`,
 common in .cpp files that implement a class declared in the matching .h)
-are attributed to Class ClassName via a text split on '::' on the qualified
-declarator (e.g. 'Outer::Inner::method' -> class 'Inner', method 'method';
-'A::~A' -> class 'A', method '~A') — the segment immediately before the
+are attributed to Class ClassName via the segments of the qualified
+declarator, template arguments dropped (e.g. 'Outer::Inner::method' -> class
+'Inner', method 'method'; 'A::~A' -> class 'A', method '~A';
+'Stack<T>::push' -> class 'Stack') — the segment immediately before the
 final name, not the leftmost one, since the leftmost segment is more likely
 to be an enclosing namespace than the class itself. This is a textual
 heuristic, not a semantic one: it does not require (or verify) that a class
@@ -103,6 +106,7 @@ _TRANSPARENT_CONTAINER_TYPES = (
     "preproc_else",
     "linkage_specification",  # extern "C" { ... }
     "declaration_list",  # the body of the above / of a namespace
+    "template_declaration",  # template<...> class/struct/function, its parameters skipped
 )
 
 
@@ -448,6 +452,8 @@ class _CppResolver:
         methods = self.methods.setdefault(cls, set())
         fields = self.fields.setdefault(cls, {})
         for member in body.named_children:
+            if member.type == "template_declaration":  # a member template: what it declares
+                member = next((c for c in member.named_children if c.type != "template_parameter_list"), member)
             if member.type == "function_definition":
                 method = _function_name(member, self.source)
                 if method:
@@ -490,6 +496,23 @@ class _CppResolver:
             for ext in (".h", ".hpp", ".cpp", ".cc")
         ]
         return conventional + self.included()
+
+
+def _qualified_parts(node: Node, source: bytes) -> list[str]:
+    """A `qualified_identifier`'s segments, each scope without its template
+    arguments: `Stack<std::map<K, V>>::push` is `["Stack", "push"]` (an
+    out-of-class member of a class template), `Widget::operator<` is
+    `["Widget", "operator<"]`."""
+    parts = []
+    while node is not None and node.type == "qualified_identifier":
+        scope = node.child_by_field_name("scope")
+        if scope is not None:
+            named = scope.child_by_field_name("name") if scope.type == "template_type" else scope
+            parts.append(_text(named if named is not None else scope, source))
+        node = node.child_by_field_name("name")
+    if node is not None:
+        parts.append(_text(node, source))
+    return parts
 
 
 def _function_name(node: Node, source: bytes) -> str | None:
@@ -693,7 +716,7 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                     visit_block(body, parent_name, parent_label)
             elif node.type in _TRANSPARENT_CONTAINER_TYPES:
                 visit_block(node, parent_name, parent_label)
-            elif node.type in ("comment", "preproc_include", "preproc_def", "preproc_call"):
+            elif node.type in ("comment", "preproc_include", "preproc_def", "preproc_call", "template_parameter_list"):
                 continue
             else:
                 caller_class = parent_name if parent_label == "Class" else None
@@ -814,8 +837,7 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             # Out-of-class definition, e.g. 'ClassName::method' or
             # 'Outer::Inner::method' — see module docstring for the
             # class-attribution heuristic (last segment before the name).
-            qualified_text = _text(inner, source_bytes)
-            parts = qualified_text.split("::")
+            parts = _qualified_parts(inner, source_bytes)
             func_name = parts[-1]
             if len(parts) >= 2:
                 class_name = parts[-2]

@@ -354,3 +354,35 @@ public:
     node_names = {(n.label, n.name) for n in result.nodes}
     assert ("Module", "widget.h") in node_names
     assert ("Class", "Widget") in node_names
+
+
+def test_templates_are_extracted():
+    """A class template, a member template, a function template and one in a
+    namespace are nodes like any other, and a call inside one is attributed
+    to it (audit 4 item 5)."""
+    source_code = """
+template<typename T> class Box { void open() {} template<class U> void fill(U u) { open(); } };
+template<typename T> T maxof(T a, T b) { return a; }
+namespace shapes { template<class T> struct Vec { int size() { return 0; } }; }
+int use() { return maxof(1, 2); }
+"""
+    result = extract_cpp_file(source_code, "src/box.h", "test_repo")
+    nodes = {(n.label, n.name) for n in result.nodes}
+    assert {("Class", "Box"), ("Function", "open"), ("Function", "fill"), ("Function", "maxof"),
+            ("Class", "Vec"), ("Function", "size"), ("Function", "use")} <= nodes
+    rels = {(r.from_name, r.rel_type, r.to_name) for r in result.relationships}
+    assert {("Box", "CONTAINS", "fill"), ("Vec", "CONTAINS", "size"), ("src/box.h", "CONTAINS", "maxof"),
+            ("fill", "CALLS", "open"), ("use", "CALLS", "maxof")} <= rels
+
+
+def test_out_of_class_member_of_a_class_template_names_the_template():
+    """`template<class T> void Stack<T>::push()` belongs to `Stack`, not to a
+    class named `Stack<T>`."""
+    source_code = """
+template<typename T> void Stack<T>::push(T v) {}
+template<typename K> int Stack<std::map<K, int>>::size() { return 0; }
+"""
+    result = extract_cpp_file(source_code, "src/stack.cpp", "test_repo")
+    assert {(n.label, n.name) for n in result.nodes if n.label == "Class"} == {("Class", "Stack")}
+    rels = {(r.from_name, r.rel_type, r.to_name) for r in result.relationships}
+    assert {("Stack", "CONTAINS", "push"), ("Stack", "CONTAINS", "size")} <= rels
