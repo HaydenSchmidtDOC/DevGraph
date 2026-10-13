@@ -482,3 +482,15 @@ def test_module_suffixes_are_routed_to_the_js_extractor():
 
     for suffix in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"):
         assert _CODE_ROUTES[suffix] == "js", suffix
+
+
+def test_class_field_arrow_functions_in_every_dialect():
+    """A class field holding an arrow function is a method in TS and TSX as
+    in JS and JSX: tree-sitter-typescript names the field `name`, not
+    `property` (audit 4 item 5)."""
+    source_code = "class Panel {\n  render = () => { this.close(); };\n  close = () => {};\n}\n"
+    for path in ("ui/panel.js", "ui/panel.jsx", "ui/panel.ts", "ui/panel.tsx"):
+        result = extract_js_file(source_code, path, "test_repo")
+        assert {("Function", "render"), ("Function", "close")} <= {(n.label, n.name) for n in result.nodes}, path
+        rels = {(r.from_name, r.rel_type, r.to_name) for r in result.relationships}
+        assert {("Panel", "CONTAINS", "render"), ("render", "CALLS", "close")} <= rels, path

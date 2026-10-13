@@ -1020,7 +1020,8 @@ def extract_js_file(
                 if m_name_node is not None and m_name_node.type == "property_identifier":
                     _visit_function(member, class_name, "Class", member, m_name_node, class_scope)
             elif member.type in ("field_definition", "public_field_definition"):
-                f_name_node = member.child_by_field_name("property")
+                # tree-sitter-typescript names the field `name`, tree-sitter-javascript `property`.
+                f_name_node = member.child_by_field_name("name") or member.child_by_field_name("property")
                 value_node = member.child_by_field_name("value")
                 if (
                     f_name_node is not None
