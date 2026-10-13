@@ -15,10 +15,10 @@ import logging
 import signal
 import threading
 from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
 
 import uvicorn
 
+from devgraph.agent.log_file import AgentLogHandler
 from devgraph.agent.schema_rescan import SchemaRescanScheduler
 from devgraph.agent.shutdown import shutdown
 from devgraph.agent.sync import RepoSync
@@ -55,7 +55,7 @@ def _configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[
-            RotatingFileHandler(log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
+            AgentLogHandler(log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
         ],
     )
 

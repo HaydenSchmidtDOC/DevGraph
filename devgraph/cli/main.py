@@ -3219,9 +3219,12 @@ def logs(
     # before it, oldest first.
     previous = log_path.with_name(log_path.name + ".1")
     try:
-        text = "".join(
-            path.read_text(encoding="utf-8") for path in (previous, log_path) if path.exists()
-        )
+        text = ""
+        for path in (previous, log_path):
+            try:
+                text += path.read_text(encoding="utf-8")
+            except FileNotFoundError:  # absent, or renamed by a rollover since
+                continue
     except OSError as e:
         console.print(f"[red][X] Error reading log file:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
