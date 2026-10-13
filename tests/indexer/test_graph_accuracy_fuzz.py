@@ -52,7 +52,7 @@ kind is written, relinked and removed as files come and go.
 
 The spec's "Out of scope" gaps are left out by construction:
 - compose services have `image:` only, never `build:`;
-- no datastore code, and routes only in Express (TS) files,
+- no datastore code, and routes only in Express (TS) and Spring (Java) files,
   which add, drop and change routes and move a handler (`op_route`,
   `op_route_change`, `op_route_move`), each Endpoint and handler stub
   claimed by every file routing it;
@@ -138,7 +138,7 @@ class File:
     pins: list = field(default_factory=list)  # py: "calls <name> <pin>" / "imports <pin>"
     methods: list = field(default_factory=list)  # cpp: out-of-class definitions, "Widget::draw"
     block: bool = False  # cs: a block namespace, its `using`s inside it
-    routes: list = field(default_factory=list)  # ts: (method, path, handler) routes
+    routes: list = field(default_factory=list)  # ts/java: (method, path, handler) routes
 
     def copy(self):
         return replace(
@@ -225,11 +225,17 @@ def render(f: File) -> str:
         ]
         return "".join(parts)
     if f.kind == "java":
+        # A file with routes is a Spring controller under /api, each route
+        # a mapping on its handler method (one the class no longer has maps nothing).
         ((cls, base),) = f.bases.items()
         parts = [f"package {f.head};\n\n"] + [f"import {m};\n" for m in f.imports]
+        if f.routes:
+            parts.append('\n@RestController\n@RequestMapping("/api")')
         parts.append(f"\npublic class {cls}" + (f" extends {base}" if base else "") + " {\n")
+        mapped = {handler: (method, path) for method, path, handler in f.routes}
         parts += [
-            f"    void {name}() {{\n" + "".join(f"        {g}();\n" for g in calls) + "    }\n"
+            (f'    @{SPRING_MAPPINGS[mapped[name][0]]}("{mapped[name][1]}")\n' if name in mapped else "")
+            + f"    void {name}() {{\n" + "".join(f"        {g}();\n" for g in calls) + "    }\n"
             for name, calls in f.funcs.items()
         ]
         return "".join(parts) + "}\n"
@@ -382,7 +388,7 @@ def initial_repo() -> dict:
         "cpp/widget.h": File("cpp", bases={"Widget": None, "Gadget": "Widget"}),
         "cpp/main.cpp": File("cpp", imports=['#include "util/strings.h"'], funcs={"main": ["util::upper", "trim"]}),
         "java/app/K.java": File("java", head="app", imports=["base.Base"], bases={"K": "Base"},
-                                funcs={"run": ["helper", "assist"]}),
+                                funcs={"run": ["helper", "assist"]}, routes=[("get", "/items", "run")]),
         "java/base/Base.java": File("java", head="base", bases={"Base": None}, funcs={"assist": []}),
         "go/go.mod": File("static", head="module example.com/fz\n\ngo 1.22\n"),
         "go.mod": File("static", head="module example.com/top\n"),
@@ -474,10 +480,13 @@ CODE = ("py", "rs", "go", "java", "ts", "kt", "cs", "cpp")
 # a Java method stays in its class.
 MOVABLE = ("py", "rs", "go", "ts", "kt", "cs", "cpp")
 KT_CLASSES = ["Clock", "Stopwatch", "Tag", "Index"]
-# Routes: Express paths and handlers beyond the file's own functions.
+# Routes: Express paths (some meeting a Spring controller's under /api) and
+# handlers beyond the file's own functions, and Spring's mappings.
 ROUTE_METHODS = ["get", "post", "put"]
 TS_ROUTE_PATHS = ["/items", "/items/:id", "/api/items", "/api/orders", "/health"]
+JAVA_ROUTE_PATHS = ["/items", "/orders", "/items/{id}"]
 TS_HANDLERS = ["f", "g", "u.g", "missing", "(req, res) => res.end()"]
+SPRING_MAPPINGS = {"get": "GetMapping", "post": "PostMapping", "put": "PutMapping"}
 
 
 class Fuzz:
@@ -825,11 +834,14 @@ class Fuzz:
         return f"delete folder {folder}", set(paths)
 
     def _route_handlers(self, path: str) -> list:
-        return sorted(self.files[path].funcs) + TS_HANDLERS
+        f = self.files[path]
+        if f.kind == "java":  # a method of the class not mapped yet
+            return sorted(set(f.funcs) - {handler for _m, _p, handler in f.routes})
+        return sorted(f.funcs) + TS_HANDLERS
 
     def op_route(self):
-        """Add or remove an Express route."""
-        path = self._pick(lambda f: f.kind == "ts")
+        """Add or remove an Express or Spring route."""
+        path = self._pick(lambda f: f.kind in ("ts", "java"))
         if not path:
             return None
         f = self.files[path]
@@ -839,7 +851,8 @@ class Fuzz:
         handlers = self._route_handlers(path)
         if not handlers:
             return None
-        route = (self.rng.choice(ROUTE_METHODS), self.rng.choice(TS_ROUTE_PATHS), self.rng.choice(handlers))
+        paths = JAVA_ROUTE_PATHS if f.kind == "java" else TS_ROUTE_PATHS
+        route = (self.rng.choice(ROUTE_METHODS), self.rng.choice(paths), self.rng.choice(handlers))
         f.routes.append(route)
         return f"add route {route} in {path}", {path}
 
@@ -854,13 +867,15 @@ class Fuzz:
         if self.rng.random() < 0.5:
             method = self.rng.choice([m for m in ROUTE_METHODS if m != method])
         else:
-            route_path = self.rng.choice([p for p in TS_ROUTE_PATHS if p != route_path])
+            paths = JAVA_ROUTE_PATHS if self.files[path].kind == "java" else TS_ROUTE_PATHS
+            route_path = self.rng.choice([p for p in paths if p != route_path])
         routes[at] = (method, route_path, handler)
         return f"change route {at} to {routes[at]} in {path}", {path}
 
     def op_route_move(self):
-        """Move a route's handler to another file: an Express handler
-        function out of its router's file (the route then names it
+        """Move a route's handler to another file of its language: a Spring
+        handler method with its mapping to another controller, an Express
+        handler function out of its router's file (the route then names it
         unresolved) or the route itself to another router."""
         path = self._pick(lambda f: f.routes)
         if not path:
@@ -869,11 +884,13 @@ class Fuzz:
         route = self.rng.choice(f.routes)
         handler = route[2]
         target = self._pick(lambda o: o.kind == f.kind and o is not f and handler not in o.funcs)
-        if not target:
+        if not target or (f.kind == "java" and handler not in f.funcs):
             return None
-        if handler not in f.funcs or self.rng.random() < 0.5:
+        if f.kind == "java" or handler not in f.funcs or self.rng.random() < 0.5:
             f.routes.remove(route)
             self.files[target].routes.append(route)
+            if f.kind == "java":
+                self.files[target].funcs[handler] = f.funcs.pop(handler)
             return f"move route {route} from {path} to {target}", {path, target}
         self.files[target].funcs[handler] = f.funcs.pop(handler)
         return f"move handler {handler} from {path} to {target}", {path, target}

@@ -32,6 +32,7 @@ from pathlib import Path
 import tree_sitter_java as tsjava
 from tree_sitter import Language, Node, Parser
 
+from devgraph.indexer.apis.routes import add_route, spring_routes
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
 from devgraph.indexer.common import (
     ExtractionResult,
@@ -519,6 +520,60 @@ def _invocations(body: Node) -> list[Node]:
     return found
 
 
+def _annotations(node: Node, source: bytes) -> dict[str, dict[str, list[str] | None]]:
+    """A declaration's annotations by name, each as its `value` (the
+    positional argument, or `value =`/`path =`: its string literals, None
+    when one is not a literal) and `method` (the RequestMethod names) when
+    given (apis/routes.py `spring_routes`)."""
+    found: dict[str, dict[str, list[str] | None]] = {}
+    modifiers = _child_of_type(node, "modifiers")
+    for annotation in modifiers.named_children if modifiers is not None else []:
+        name = annotation.child_by_field_name("name")
+        if annotation.type not in ("marker_annotation", "annotation") or name is None:
+            continue
+        args: dict[str, list[str] | None] = {}
+        arguments = annotation.child_by_field_name("arguments")
+        for arg in arguments.named_children if arguments is not None else []:
+            key, value = "value", arg
+            if arg.type == "element_value_pair":
+                key_node, value = arg.child_by_field_name("key"), arg.child_by_field_name("value")
+                key = _text(key_node, source) if key_node is not None else ""
+            if value is None:
+                continue
+            items = value.named_children if value.type == "element_value_array_initializer" else [value]
+            if key == "method":
+                args["method"] = [_text(item, source).rsplit(".", 1)[-1] for item in items]
+            elif key in ("value", "path"):
+                literal = all(item.type == "string_literal" and not _text(item, source).startswith('"""')
+                              for item in items)
+                args["value"] = [_text(item, source)[1:-1] for item in items] if literal else None
+        found[_text(name, source).rsplit(".", 1)[-1]] = args
+    return found
+
+
+def _spring_routes(root: Node, source: bytes, result: ExtractionResult, file_path: str, repo_id: str) -> None:
+    """A Spring controller's mapped methods as Endpoints (apis/routes.py),
+    each implemented by its method, owned by its class."""
+
+    def walk(block: Node, classes: list[str]) -> None:
+        for node in block.named_children:
+            name = node.child_by_field_name("name")
+            body = node.child_by_field_name("body")
+            if node.type not in _TYPE_DECL_TYPES or name is None or body is None:
+                continue
+            inner = [_text(name, source), *classes]
+            mapped = _annotations(node, source)
+            for member in body.named_children:
+                method = member.child_by_field_name("name")
+                if member.type == "method_declaration" and method is not None:
+                    for http_method, path in spring_routes(mapped, _annotations(member, source)):
+                        add_route(result, repo_id, file_path, "Spring", http_method, path, _text(method, source),
+                                  _owner_of(inner))
+            walk(body, inner)
+
+    walk(root, [])
+
+
 def extract_java_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
     """Parse a Java file and extract nodes and relationships.
 
@@ -693,6 +748,7 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
 
     visit_block(root, None, "Module", [])
     result.relationships += sites.rows(file_path, repo_id)
+    _spring_routes(root, source_bytes, result, file_path, repo_id)
 
     return own_edges(result, file_path)
 

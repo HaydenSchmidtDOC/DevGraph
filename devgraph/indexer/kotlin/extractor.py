@@ -64,6 +64,7 @@ from pathlib import Path
 import tree_sitter_kotlin as tskotlin
 from tree_sitter import Language, Node, Parser, Range
 
+from devgraph.indexer.apis.routes import add_route, spring_routes
 from devgraph.indexer.calls import (
     STOP_METHODS,
     STOP_TYPES,
@@ -730,6 +731,70 @@ def _kotlin_calls(body: Node) -> list[Node]:
     return found
 
 
+def _annotations(node: Node, source: bytes) -> dict[str, dict[str, list[str] | None]]:
+    """A declaration's annotations by name, each as its `value` (the
+    positional argument, or `value =`/`path =`: its string literals, None
+    when one is not a literal) and `method` (the RequestMethod names) when
+    given (apis/routes.py `spring_routes`)."""
+    found: dict[str, dict[str, list[str] | None]] = {}
+    modifiers = _child_of_type(node, "modifiers")
+    for annotation in modifiers.named_children if modifiers is not None else []:
+        if annotation.type != "annotation" or not annotation.named_children:
+            continue
+        invocation = annotation.named_children[0]
+        name = invocation if invocation.type == "user_type" else _child_of_type(invocation, "user_type")
+        if name is None:
+            continue
+        args: dict[str, list[str] | None] = {}
+        arguments = _child_of_type(invocation, "value_arguments")
+        for arg in arguments.named_children if arguments is not None else []:
+            parts = arg.named_children
+            key = "value"
+            if len(parts) == 2 and parts[0].type == "identifier":
+                key = _text(parts[0], source)
+            if not parts:
+                continue
+            value = parts[-1]
+            items = value.named_children if value.type == "collection_literal" else [value]
+            if value.type == "call_expression" and _text(value, source).startswith("arrayOf("):
+                arguments_node = _child_of_type(value, "value_arguments")
+                items = [a.named_children[-1] for a in arguments_node.named_children] if arguments_node else []
+            if key == "method":
+                args["method"] = [_text(item, source).rsplit(".", 1)[-1] for item in items]
+            elif key in ("value", "path"):
+                literal = all(
+                    item.type == "string_literal" and not _text(item, source).startswith('"""')
+                    and all(part.type == "string_content" for part in item.named_children)
+                    for item in items
+                )
+                args["value"] = [_text(item, source)[1:-1] for item in items] if literal else None
+        found[_text(name, source).rsplit(".", 1)[-1]] = args
+    return found
+
+
+def _spring_routes(top_level: list[Node], source: bytes, result: ExtractionResult, file_path: str, repo_id: str) -> None:
+    """A Spring controller's mapped functions as Endpoints (apis/routes.py),
+    each implemented by its function, owned by its class."""
+
+    def walk(nodes: list[Node], classes: list[str]) -> None:
+        for node in nodes:
+            name = node.child_by_field_name("name") or _child_of_type(node, "identifier")
+            body = _child_of_type(node, "class_body")
+            if node.type not in _TYPE_DECL_TYPES or name is None or body is None:
+                continue
+            inner = [_text(name, source), *classes]
+            mapped = _annotations(node, source)
+            for member in body.named_children:
+                function = member.child_by_field_name("name")
+                if member.type == "function_declaration" and function is not None:
+                    for http_method, path in spring_routes(mapped, _annotations(member, source)):
+                        add_route(result, repo_id, file_path, "Spring", http_method, path, _text(function, source),
+                                  _owner_of(inner))
+            walk(body.named_children, inner)
+
+    walk(top_level, [])
+
+
 def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
     """Parse a Kotlin file and extract nodes and relationships.
 
@@ -948,6 +1013,7 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
 
     visit_block(root, None, "Module", [], top_level)
     result.relationships += sites.rows(file_path, repo_id)
+    _spring_routes(top_level, source_bytes, result, file_path, repo_id)
 
     return own_edges(result, file_path)
 

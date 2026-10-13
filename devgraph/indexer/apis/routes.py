@@ -22,6 +22,13 @@ from __future__ import annotations
 from devgraph.indexer.calls import call_rows
 from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship
 
+#: Spring's mapping annotations and the method each maps (None: RequestMapping's `method`).
+SPRING_MAPPINGS: dict[str, str | None] = {
+    "GetMapping": "GET", "PostMapping": "POST", "PutMapping": "PUT", "DeleteMapping": "DELETE",
+    "PatchMapping": "PATCH", "RequestMapping": None,
+}
+SPRING_CONTROLLERS = frozenset({"RestController", "Controller"})
+
 
 def join_route(*parts: str) -> str:
     """Route path segments joined with single slashes, with a leading one
@@ -69,3 +76,30 @@ def add_route(
     result.relationships += call_rows(
         "Endpoint", endpoint, handler, pins, False, None, file_path, repo_id, rel_type="IMPLEMENTS",
     )
+
+
+def spring_routes(
+    class_annotations: dict[str, dict[str, list[str] | None]],
+    method_annotations: dict[str, dict[str, list[str] | None]],
+) -> list[tuple[str, str]]:
+    """The (method, path) pairs a Spring controller method maps.
+
+    Each annotation is given as its arguments: `value` (the positional one,
+    or `value=`/`path=`) as its literal strings, None when one of them is
+    not a literal, absent when not given; `method` as the RequestMethod
+    names. The class's RequestMapping paths prefix the method's; a
+    RequestMapping with no `method` maps every method ("*")."""
+    if not SPRING_CONTROLLERS & set(class_annotations):
+        return []
+    prefixes = class_annotations.get("RequestMapping", {}).get("value", [""])
+    routes: list[tuple[str, str]] = []
+    for name, http_method in SPRING_MAPPINGS.items():
+        if name not in method_annotations:
+            continue
+        args = method_annotations[name]
+        paths = args.get("value", [""])
+        if prefixes is None or paths is None:
+            continue  # a dynamic path
+        methods = [http_method] if http_method else sorted(args.get("method") or ["*"])
+        routes += [(each, join_route(prefix, path)) for prefix in prefixes for path in paths for each in methods]
+    return routes

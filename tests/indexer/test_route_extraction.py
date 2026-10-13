@@ -117,3 +117,98 @@ function create(request, reply) {}
     result = extract_js_file(source, "server.js", "r")
     assert _endpoints(result) == {"GET /users/:id": "Express", "POST /items": "Express"}
     assert _stubs(result) == {"show", "create"}
+
+
+SPRING_JAVA = """\
+package com.example.shop.web;
+
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+    @GetMapping("/{id}")
+    public Order show(@PathVariable long id) { return null; }
+
+    @PostMapping
+    public Order create(@RequestBody Order order) { return order; }
+
+    @RequestMapping(value = {"/a", "/b"}, method = {RequestMethod.PUT, RequestMethod.PATCH})
+    public void change() {}
+
+    @RequestMapping(path = "/any")
+    public void any() {}
+
+    @GetMapping(BASE + "/dynamic")
+    public void dynamic() {}
+
+    public void helper() {}
+
+    @RestController
+    public static class Nested {
+        @DeleteMapping("/gone")
+        public void gone() {}
+    }
+}
+
+class NotAController {
+    @GetMapping("/ignored")
+    public void ignored() {}
+}
+"""
+
+
+def test_spring_java_routes():
+    from devgraph.indexer.java.extractor import extract_java_file
+
+    result = extract_java_file(SPRING_JAVA, "src/main/java/com/example/shop/web/OrderController.java", "r")
+    path = "src/main/java/com/example/shop/web/OrderController.java"
+    assert _endpoints(result) == {
+        "GET /api/orders/{id}": "Spring",
+        "POST /api/orders": "Spring",
+        "PUT /api/orders/a": "Spring",
+        "PATCH /api/orders/a": "Spring",
+        "PUT /api/orders/b": "Spring",
+        "PATCH /api/orders/b": "Spring",
+        "* /api/orders/any": "Spring",
+        "DELETE /gone": "Spring",
+    }
+    implements = _implements(result)
+    assert {("GET /api/orders/{id}", "show", path, "OrderController"),
+            ("GET /api/orders/{id}", "show", "", None),
+            ("DELETE /gone", "gone", path, "OrderController.Nested")} <= implements
+    assert _stubs(result) == {"show", "create", "change", "any", "gone"}
+
+
+SPRING_KOTLIN = """\
+package com.example.shop.web
+
+@RestController
+@RequestMapping("/api/carts", produces = ["application/json"])
+class CartController(private val carts: CartService) {
+    @GetMapping("/{id}")
+    fun show(@PathVariable id: Long): Cart = carts.find(id)
+
+    @RequestMapping(value = ["/x", "/y"], method = [RequestMethod.POST])
+    fun post() {}
+
+    @PutMapping("/${'$'}{version}/z")
+    fun templated() {}
+
+    @DeleteMapping
+    fun clear() {}
+}
+"""
+
+
+def test_spring_kotlin_routes():
+    from devgraph.indexer.kotlin.extractor import extract_kotlin_file
+
+    path = "src/main/kotlin/com/example/shop/web/CartController.kt"
+    result = extract_kotlin_file(SPRING_KOTLIN, path, "r")
+    assert _endpoints(result) == {
+        "GET /api/carts/{id}": "Spring",
+        "POST /api/carts/x": "Spring",
+        "POST /api/carts/y": "Spring",
+        "DELETE /api/carts": "Spring",
+    }
+    assert ("GET /api/carts/{id}", "show", path, "CartController") in _implements(result)
+    assert _stubs(result) == {"show", "post", "clear"}

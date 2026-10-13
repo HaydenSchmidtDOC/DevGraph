@@ -71,6 +71,34 @@ FRAMEWORKS = {
         "services/shop/orders.ts", "export function listOrders(req, res) {}\n",
         "GET /orders", "listOrders", "services/shop/orders.ts",
     ),
+    "spring-java": (
+        "services/shop/src/main/java/shop/OrderController.java", """\
+        package shop;
+
+        @RestController
+        public class OrderController {
+            @GetMapping("/orders")
+            public String list() { return new OrderService().all(); }
+        }
+        """,
+        "services/shop/src/main/java/shop/OrderService.java",
+        "package shop;\n\npublic class OrderService {\n    public String all() { return \"\"; }\n}\n",
+        "GET /orders", "list", "services/shop/src/main/java/shop/OrderController.java",
+    ),
+    "spring-kotlin": (
+        "services/shop/src/main/kotlin/shop/OrderController.kt", """\
+        package shop
+
+        @RestController
+        class OrderController(private val orders: OrderService) {
+            @PostMapping("/orders")
+            fun place(): String = orders.all()
+        }
+        """,
+        "services/shop/src/main/kotlin/shop/OrderService.kt",
+        "package shop\n\nclass OrderService {\n    fun all(): String = \"\"\n}\n",
+        "POST /orders", "place", "services/shop/src/main/kotlin/shop/OrderController.kt",
+    ),
 }
 
 
