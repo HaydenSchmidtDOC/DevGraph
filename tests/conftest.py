@@ -1,6 +1,7 @@
 """Shared pytest configuration for environments without a desktop display."""
 
 import os
+import re
 import socket
 import sys
 from urllib.parse import urlparse
@@ -223,18 +224,22 @@ def real_project_trust():
 
 
 #: Repository ids only tests make. The session-end sweep below deletes one only
-#: when this process passed it to Neo4j and it didn't exist when the session
-#: started, so it never touches a real repository, nor one a test was already
-#: holding before this run.
+#: when it is unique to its creation (`_UNIQUE_PART`), this process passed it to
+#: Neo4j and it didn't exist when the session started, so it never touches a
+#: real repository, one a test was already holding before this run, or a fixed
+#: id (`test-repo`, `_smoketest_fs_provider`) another session may be using.
 _TEST_REPO_PREFIXES = ("zz-", "zz_", "_smoketest_", "test_repo_", "test-repo", "dash_repo_")
+#: A random part: a run of 8 or more hex characters, digits among them (a uuid
+#: slice, an epoch stamp), standing between separators.
+_UNIQUE_PART = re.compile(r"(?:^|[-_])(?=[0-9a-f]*[0-9])[0-9a-f]{8,}(?=$|[-_])")
 
 
 def _test_repo_ids(parameters) -> set[str]:
-    """The test repository ids among a query's parameters (one level of lists)."""
+    """The sweepable test repository ids among a query's parameters (one level of lists)."""
     found = set()
     for value in (parameters or {}).values():
         for item in value if isinstance(value, (list, tuple)) else (value,):
-            if isinstance(item, str) and item.startswith(_TEST_REPO_PREFIXES):
+            if isinstance(item, str) and item.startswith(_TEST_REPO_PREFIXES) and _UNIQUE_PART.search(item):
                 found.add(item)
     return found
 
