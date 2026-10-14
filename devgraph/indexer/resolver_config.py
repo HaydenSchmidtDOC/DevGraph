@@ -109,9 +109,10 @@ def touches_config(rel: str, inputs: list[str], repo_root: Path) -> bool:
         return True
     if any(each == rel or each.startswith(rel + "/") for each in inputs):
         return True
-    gone = not (Path(repo_root) / rel).exists()
-    if gone and any(rel.startswith(each + "/") for each in inputs if posixpath.basename(each) == "src"):
-        return True  # deleted under a source root: it may hold its last Python file
+    if (rel.endswith(".py") or not posixpath.splitext(rel)[1]) and any(
+        rel.startswith(each + "/") for each in inputs if posixpath.basename(each) == "src"
+    ) and not (Path(repo_root) / rel).exists():
+        return True  # a Python file or a folder deleted under a source root: it may hold the last
     if rel.endswith(".rs"):
         return bool(_rust_file_reexports(Path(repo_root) / rel))
     if rel.endswith(".py"):
@@ -903,8 +904,13 @@ def _src_dirs(rel: str) -> list[str]:
 
 def _python_project(root: Path, folder: str) -> bool:
     """Whether the directory `folder` (repo-relative) holds a Python project
-    file (`_PY_PROJECT_FILES`)."""
-    return any((root / folder / name).is_file() for name in _PY_PROJECT_FILES)
+    file (`_PY_PROJECT_FILES`) the walk would index, as `fingerprints` sees
+    it: one under an ignored or gitignored path does not count."""
+    for name in _PY_PROJECT_FILES:
+        rel = f"{folder}/{name}" if folder else name
+        if (root / rel).is_file() and not is_ignored_path(Path(rel)) and not is_gitignored(root, rel):
+            return True
+    return False
 
 
 def _python_inputs(root: Path, walked: list[str] | None = None) -> list[str]:

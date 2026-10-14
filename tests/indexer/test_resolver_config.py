@@ -204,6 +204,28 @@ def test_what_can_touch_the_configuration(tmp_path):
     assert not touches_config("tools/Script.cs", inputs, tmp_path)
 
 
+def test_what_python_paths_touch_the_configuration(tmp_path):
+    inputs = {"setup.cfg", "src"}
+    write(tmp_path, "setup.cfg", "[metadata]\nname = app\n")
+    write(tmp_path, "src/pkg/api.py", "X = 1\n")
+    assert not touches_config("src/pkg/api.py", inputs, tmp_path)  # an edit
+    # Deleted under the root: a Python file or a folder may be its last;
+    # an editor's swap file or a moved-away temp file never is.
+    assert touches_config("src/gone.py", inputs, tmp_path)
+    assert touches_config("src/old_pkg", inputs, tmp_path)
+    assert not touches_config("src/pkg/.api.py.swp", inputs, tmp_path)
+    assert not touches_config("src/pkg/data.json", inputs, tmp_path)
+    # A new file under a project's src/ that is no root yet; a project file
+    # the walk ignores makes none.
+    write(tmp_path, "tools/src/gen.py", "X = 1\n")
+    assert not touches_config("tools/src/gen.py", inputs, tmp_path)
+    write(tmp_path, ".gitignore", "tools/setup.py\n")
+    write(tmp_path, "tools/setup.py", "")
+    assert not touches_config("tools/src/gen.py", inputs, tmp_path)
+    write(tmp_path, "tools/pyproject.toml", "")
+    assert touches_config("tools/src/gen.py", inputs, tmp_path)
+
+
 # --- C# projects -----------------------------------------------------------------
 
 

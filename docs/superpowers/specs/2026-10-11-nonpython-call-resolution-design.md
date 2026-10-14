@@ -446,11 +446,16 @@ companion's are by `Repo.Factory`. They used to be dropped with the
 anonymous companion. `Repo.create()` on a class declared in the file
 reaches a member of its companion when the class itself has none of the
 name (an owned pin to `Repo.Companion`), and so does a bare `create()`
-inside Repo or inside its companion; from another file it reaches Repo's
-files like any member of Repo (tier 4). Companions are keyed by their
-members' owner, so two classes' anonymous companions in one file stay
-apart. `get_source` and `describe_node` take `Repo.create` (or
-`owner="Repo"`) for the companion's member when Repo has none of the name.
+inside Repo when neither Repo nor a base declared in the file has one (an
+inherited member comes first, as in Kotlin); inside the companion a bare
+call or `this.m()` reaches its own members, then its bases', and its
+typed properties type their receivers; from another file it reaches
+Repo's files like any member of Repo (tier 4). Companions are keyed by
+their members' owner, so two classes' anonymous companions in one file
+stay apart. A companion's Class node carries `kind: companion`, and
+`get_source` and `describe_node` take `Repo.create` (or `owner="Repo"`)
+for a member of Repo's companion, anonymous or named, when Repo has none
+of the name.
 
 ## Rust (`devgraph/indexer/rust/extractor.py`)
 
@@ -528,10 +533,18 @@ file also re-exports `X` by name, Rust's shadowing rule), to the module
 it names too, and on through that module's own re-exports (at most nine
 hops; a cycle ends): every module on the way stays a possible definer
 (`a` may define `X` beside its own glob). What a glob reaches is linked
-at package confidence: its module's files as package-confidence pins on
-their names (`a/.~?util.rs`) and its directory's recursive prefix
+at package confidence: its module's files as suffix pins of their whole
+paths (`/a/util.rs`, which `a/my_util.rs` does not match) and its
+directory's recursive prefix
 (`a/util/`, so anything under it of the name), each leaving out the
-re-exporting module's own files, which stay resolved. An item M itself
+re-exporting module's own files, which stay resolved. An associated call
+through a re-exported type (`shop_core::Client::new()`) names the type as
+the owner of every module the re-exports reach, so `net/mod.rs`, which
+only passes `Client` on, links its own `Pool::new` no more than
+`client.rs` does; a method on a value of that type (`c.fetch()`) is not
+narrowed by owner (a trait's default method is owned by the trait), so a
+module on the way that defines a same-named function of another type
+links it too. An item M itself
 defines hides a glob's in Rust, and M's text is not the caller's: this
 way a function added to M is no configuration change, and the glob's
 module only ranks below it. A function re-exported under another name (`pub use

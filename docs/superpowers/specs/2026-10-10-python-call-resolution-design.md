@@ -44,8 +44,11 @@ source file's content (no filesystem check in the extractor). A removed target g
   a project file added or removed, or a `src` directory gaining its first
   Python file or losing its last, re-indexes every Python file (a live
   batch recomputes the fingerprint for a Python file created under a
-  project's `src` directory that is no root yet, or a file or directory
-  deleted under a root: the watcher reports a deleted directory alone). `setup.cfg` and `setup.py` are not read. A first cut tried every
+  project's `src` directory that is no root yet, or a Python file or a
+  directory (a path with no suffix) deleted under a root: the watcher
+  reports a deleted directory alone, and an editor's swap file or a
+  moved-away temp file triggers nothing). A project file under an ignored
+  or gitignored path counts for nothing, as in the walk. `setup.cfg` and `setup.py` are not read. A first cut tried every
   ancestor's `src/` without reading the tree: it doubled each import's
   candidate rows, and DevGraph's own full scan went from 76 s to 109 s with
   `name_refs` from 7.2 MB to 13.5 MB, so roots are discovered instead.
