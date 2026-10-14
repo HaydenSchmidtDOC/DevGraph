@@ -128,6 +128,42 @@ def test_a_test_reaches_its_package_in_main_by_suffix_and_main_never_reaches_tes
     assert not linked(got, "src/test/kotlin/util/TextTest.kt")
 
 
+def test_a_companion_member_is_called_on_its_class():
+    """`Repo.create()` reaches the companion's member: in the file, as the
+    member of `Repo.Companion` (a named companion's too); from another
+    file, through Repo's file like any member of Repo."""
+    source = """
+        package com.acme.notes.data
+
+        class Repo {
+            companion object {
+                fun create(): Repo = Repo()
+            }
+            fun copy() = Repo.create()
+        }
+
+        class Store {
+            companion object Factory {
+                fun open(): Store = Store()
+            }
+            fun again() = Store.open()
+        }
+    """
+    path = "src/main/kotlin/data/Repo.kt"
+    result = extract_kotlin_file(textwrap.dedent(source), path, "repo")
+    rows = {(r.from_name, r.to_name, r.to_file, r.to_owner) for r in result.relationships if r.rel_type == "CALLS"}
+    assert (("copy", "create", path, "Repo.Companion")) in rows
+    assert (("again", "open", path, "Store.Factory")) in rows
+    other = """
+        package com.acme.notes
+
+        import com.acme.notes.data.Repo
+
+        fun main() { Repo.create() }
+    """
+    assert linked(targets(other, "main", "create"), path)
+
+
 # --- live --------------------------------------------------------------------------
 
 
@@ -192,4 +228,36 @@ def test_a_function_import_follows_the_function_between_files(engine, repo_id, t
     other.write_text("package com.acme.notes.util\n\nclass Clock\n\nfun slugify() = 1\n")
     index_paths(engine, repo_id, tmp_path, {text, other})
     assert _imports(engine, repo_id) == [(MAIN, "src/main/kotlin/util/Clock.kt", "resolved")]
+    _equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_a_companion_member_call_follows_the_companion(engine, repo_id, tmp_path):
+    """Main's `Repo.create()` links the companion's `create`; it goes when
+    the companion loses it and comes back when it returns, as a fresh scan."""
+    repo_kt = "src/main/kotlin/data/Repo.kt"
+    with_create = (
+        "package com.acme.notes.data\n\nclass Repo {\n    companion object {\n"
+        "        fun create(): Repo = Repo()\n    }\n}\n"
+    )
+    _write(tmp_path, MAIN, "package com.acme.notes\n\nimport com.acme.notes.data.Repo\n\nfun main() { Repo.create() }\n")
+    repo = _write(tmp_path, repo_kt, with_create)
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+
+    def callees():
+        rows = engine.run_cypher(
+            "MATCH (:Function {repo_id: $r, name: 'main'})-[x:CALLS]->(b) RETURN b.file AS f, b.owner AS o",
+            {"r": repo_id},
+        )
+        return sorted((row["f"], row["o"]) for row in rows)
+
+    assert callees() == [(repo_kt, "Repo.Companion")]
+    repo.write_text("package com.acme.notes.data\n\nclass Repo {\n    companion object {}\n}\n")
+    index_paths(engine, repo_id, tmp_path, {repo})
+    assert callees() == []
+    _equals_fresh(engine, repo_id, tmp_path)
+    repo.write_text(with_create)
+    index_paths(engine, repo_id, tmp_path, {repo})
+    assert callees() == [(repo_kt, "Repo.Companion")]
     _equals_fresh(engine, repo_id, tmp_path)

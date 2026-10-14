@@ -30,9 +30,10 @@ Known limitations (v1 scope, structural parity — documented, not to be
     distinguishing modifier is recorded in the `modifiers` property rather
     than modeled as separate node labels (DevGraph's schema has no
     DataClass/SealedClass/Enum/Object labels).
-  - `companion object` declarations are treated as Class nodes when they
-    carry an identifier; an anonymous `companion object { ... }` is skipped
-    (no name to key a node on).
+  - `companion object` declarations are Class nodes owned by their class;
+    an anonymous `companion object { ... }` is named `Companion`, Kotlin's
+    own name for it, so its members are owned by `Repo.Companion` (a named
+    one's by `Repo.Factory`), and `Repo.create()` resolves to them.
   - Constructors (`primary_constructor`, `secondary_constructor`) are NOT
     extracted as Function nodes — Kotlin's primary constructor is part of the
     class header, not a named `fun`, and secondary constructors are uncommon.
@@ -442,12 +443,16 @@ class _KotlinResolver:
         self.properties: dict[str, dict[str, str | None]] = {}
         # What each class's members are owned by (_owner_of): one per class of the name in the file.
         self.owners: dict[str, set[str]] = {}
+        # A class's companion object, by name (`Companion` when anonymous).
+        self.companions: dict[str, str] = {}
 
         def walk(node: Node, owner: str | None, enclosing: tuple[str, ...] = ()) -> None:
             if node.type in _TYPE_DECL_TYPES:
-                name_node = node.child_by_field_name("name") or _child_of_type(node, "identifier")
-                if name_node is not None:
-                    owner = _text(name_node, source)
+                name = _type_decl_name(node, source)
+                if name is not None:
+                    if node.type == "companion_object" and owner is not None:
+                        self.companions[owner] = name
+                    owner = name
                     enclosing = (owner, *enclosing)
                     self.owners.setdefault(owner, set()).add(_owner_of(enclosing))
                     self.methods.setdefault(owner, set())
@@ -582,6 +587,11 @@ class _KotlinResolver:
             if method in self.methods[cls]:
                 owners = self.owners.get(cls, set())
                 return [owned_pin(self.file_path, next(iter(owners)) if len(owners) == 1 else None)]
+            companion = self.companions.get(cls)
+            if companion is not None and method in self.methods.get(companion, set()):
+                # `Repo.create()`: a member of Repo's companion, owned by `Repo.Companion`.
+                owners = self.owners.get(cls, set())
+                return [owned_pin(self.file_path, f"{next(iter(owners))}.{companion}" if len(owners) == 1 else None)]
             pins = []
             for base in self.bases.get(cls, []):
                 pins += self.member_pins(base, method, seen | {cls}) or []
@@ -694,6 +704,17 @@ def _kotlin_scope(node: Node, classes: list[str], resolver: _KotlinResolver, sou
 
     walk(node)
     return scope
+
+
+def _type_decl_name(node: Node, source: bytes) -> str | None:
+    """A class, object or companion declaration's name: its `name` field,
+    else an explicit `identifier` child (`companion object Factory`), else
+    `Companion` for an anonymous companion (Kotlin's own name for it);
+    None for anything else without a name."""
+    name = node.child_by_field_name("name") or _child_of_type(node, "identifier")
+    if name is not None:
+        return _text(name, source)
+    return "Companion" if node.type == "companion_object" else None
 
 
 def _extension_receiver(node: Node, source: bytes) -> str | None:
@@ -859,14 +880,9 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
     def _visit_type_decl(
         node: Node, parent_name: str | None, parent_label: str, prev_sibling: Node | None, classes: list[str]
     ) -> None:
-        name_node = node.child_by_field_name("name")
-        if name_node is None:
-            # `companion object { ... }` has no name field; fall back to an
-            # explicit `identifier` child, else skip (anonymous companion).
-            name_node = _child_of_type(node, "identifier")
-        if name_node is None:
+        class_name = _type_decl_name(node, source_bytes)
+        if class_name is None:
             return
-        class_name = _text(name_node, source_bytes)
 
         class_properties: dict = {
             "type": "class",

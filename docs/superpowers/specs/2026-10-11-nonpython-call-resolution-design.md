@@ -416,6 +416,16 @@ files, as in Java. Calls, first match wins:
    directory pins, package confidence).
 5. Anything else: a bare-name row off its caller, unless stoplisted.
 
+**Companion objects** (index format 16, audit 5 item 5). A `companion
+object` is a Class owned by its class; an anonymous one is named
+`Companion`, Kotlin's own name for it (`Repo.Companion` in Kotlin and
+Java code), so its members are owned by `Repo.Companion`, as a named
+companion's are by `Repo.Factory`. They used to be dropped with the
+anonymous companion. `Repo.create()` on a class declared in the file
+reaches a member of its companion when the class itself has none of the
+name (an owned pin to `Repo.Companion`); from another file it reaches
+Repo's files like any member of Repo (tier 4).
+
 ## Rust (`devgraph/indexer/rust/extractor.py`)
 
 **Crates and modules.** A configured library's root file (its `[lib] path`
