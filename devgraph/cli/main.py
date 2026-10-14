@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1165,7 +1166,7 @@ def _docs_source_findings(repos: list[Any], engine: Any) -> list[dict[str, Any]]
     return findings
 
 
-def _wait_for_neo4j(engine, settings, timeout_s: float) -> None:
+def _wait_for_neo4j(settings, timeout_s: float) -> None:
     """Wait up to `timeout_s` for Neo4j to answer, saying so every 10 s."""
     from devgraph.graph.engine import wait_for_bolt
 
@@ -1180,8 +1181,15 @@ def _wait_for_neo4j(engine, settings, timeout_s: float) -> None:
             console.print(f"  still waiting ({elapsed:.0f} s)")
         said[0] = int(elapsed)
 
-    if wait_for_bolt(engine, timeout_s, on_wait=progress) and said[0] >= 0:
-        console.print("  Neo4j answered")
+    started = time.monotonic()
+    answered = wait_for_bolt(
+        settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password, timeout_s, on_wait=progress
+    )
+    waited = time.monotonic() - started
+    if not answered:
+        console.print(f"  Neo4j did not answer after waiting {waited:.0f} s")
+    elif said[0] >= 0:
+        console.print(f"  Neo4j answered after {waited:.0f} s")
 
 
 @app.command()
@@ -1253,7 +1261,7 @@ def doctor(
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
     try:
         if wait > 0:
-            _wait_for_neo4j(engine, settings, wait)
+            _wait_for_neo4j(settings, wait)
         engine.verify_connectivity()
         neo4j_reachable = True
         console.print(f"  [green][OK] Reachable[/green] at {escape(str(settings.neo4j_uri))}")

@@ -205,23 +205,36 @@ def test_constraint_check_ignores_unregistered_repositories(engine, tmp_path):
 
 
 def test_doctor_wait_waits_for_neo4j_before_checking(tmp_path, monkeypatch):
+    from neo4j.exceptions import ServiceUnavailable
+
     from devgraph.graph import engine as engine_module
 
     monkeypatch.setattr(engine_module.time, "sleep", lambda s: None)
     tries = []
 
-    class Starting(_ReachableEngine):
+    class StartingDriver:
         def verify_connectivity(self):
             tries.append(1)
             if len(tries) <= 3:
-                from neo4j.exceptions import ServiceUnavailable
-
                 raise ServiceUnavailable("Connection reset by peer")
 
-    out, result = _doctor_args(tmp_path, Starting, None, ["--wait", "90"])
-    assert "Waiting for Neo4j" in out and "Neo4j answered" in out
+        def close(self):
+            pass
+
+    monkeypatch.setattr(engine_module.GraphDatabase, "driver", lambda *a, **k: StartingDriver())
+    out, result = _doctor_args(tmp_path, _ReachableEngine, None, ["--wait", "90"])
+    assert "Waiting for Neo4j" in out and "Neo4j answered after" in out
     assert "[OK] Reachable" in out
     assert result.exit_code == 0, out
+
+
+def test_doctor_wait_says_how_long_it_waited_when_neo4j_never_answers(tmp_path, monkeypatch):
+    from devgraph.graph import engine as engine_module
+
+    monkeypatch.setattr(engine_module, "wait_for_bolt", lambda *a, **k: False)
+    out, result = _doctor_args(tmp_path, _DownEngine, None, ["--wait", "1"])
+    assert "did not answer after waiting" in out
+    assert result.exit_code == 1
 
 
 def test_doctor_without_wait_checks_once(tmp_path):

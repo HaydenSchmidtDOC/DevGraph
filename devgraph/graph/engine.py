@@ -744,31 +744,45 @@ def _retry_transient(fn, *args, **kwargs):
 BOLT_WAIT_S = 90.0
 
 
-def wait_for_bolt(engine, timeout_s: float = BOLT_WAIT_S, on_wait=None, poll_s: float = 2.0) -> bool:
-    """Poll `engine.verify_connectivity` until Neo4j answers or `timeout_s` passes.
+#: Each try's connection budget, so a wait never runs much past its deadline.
+BOLT_ATTEMPT_S = 5.0
+
+
+def wait_for_bolt(
+    uri: str, user: str, password: str, timeout_s: float = BOLT_WAIT_S, on_wait=None, poll_s: float = 2.0,
+) -> bool:
+    """Poll Neo4j at `uri` until it answers Bolt or `timeout_s` passes.
 
     True once Neo4j answers, a refused login included (it is up; the caller's
     own check reports the login); False when it still doesn't answer by the
-    deadline. Only "not answering yet" errors are waited out. `on_wait(elapsed_s)`
-    is called after each failed try, for a progress message.
+    deadline. Only "not answering yet" errors are waited out. Each try is one
+    bare `verify_connectivity` on a driver whose connection timeout is
+    BOLT_ATTEMPT_S (no retries inside a try), so the wait ends within about
+    that of its deadline. `on_wait(elapsed_s)` is called after each failed
+    try, for a progress message.
     """
     started = time.monotonic()
-    while True:
-        try:
-            engine.verify_connectivity()
-            return True
-        except EngineClosed:
-            raise
-        except _RETRYABLE_EXCEPTIONS:
-            pass
-        except Neo4jError:
-            return True
-        elapsed = time.monotonic() - started
-        if elapsed >= timeout_s:
-            return False
-        if on_wait is not None:
-            on_wait(elapsed)
-        time.sleep(min(poll_s, max(0.0, timeout_s - elapsed)))
+    driver = GraphDatabase.driver(
+        uri, auth=(user, password),
+        connection_timeout=BOLT_ATTEMPT_S, connection_acquisition_timeout=BOLT_ATTEMPT_S,
+    )
+    try:
+        while True:
+            try:
+                driver.verify_connectivity()
+                return True
+            except _RETRYABLE_EXCEPTIONS:
+                pass
+            except Neo4jError:
+                return True
+            elapsed = time.monotonic() - started
+            if elapsed >= timeout_s:
+                return False
+            if on_wait is not None:
+                on_wait(elapsed)
+            time.sleep(min(poll_s, max(0.0, timeout_s - elapsed)))
+    finally:
+        driver.close()
 
 
 def _run(session, query: str, **params: Any) -> Any:
