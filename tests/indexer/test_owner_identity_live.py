@@ -148,6 +148,12 @@ def test_a_kotlin_companion_member_is_found_by_its_classes_name(engine, repo):
             }
             fun save() {}
         }
+
+        class Store {
+            companion object Factory {
+                fun open(): Store = Store()
+            }
+        }
         """)
     full_scan(engine, repo_id, root)
     source = get_source(engine, registry, repo_id, "Repo.create")
@@ -156,6 +162,9 @@ def test_a_kotlin_companion_member_is_found_by_its_classes_name(engine, repo):
     assert get_source(engine, registry, repo_id, "Repo.save")["owner"] == "Repo"
     described = describe_node(engine, repo_id, "Repo.create")
     assert described["status"] == "found" and described["node"]["owner"] == "Repo.Companion"
+    # A named companion's member too.
+    assert get_source(engine, registry, repo_id, "Store.open")["owner"] == "Store.Factory"
+    assert describe_node(engine, repo_id, "Store.open")["node"]["owner"] == "Store.Factory"
 
 
 def test_calls_reach_the_method_of_the_class_they_name(engine, repo):

@@ -199,6 +199,51 @@ def test_two_anonymous_companions_of_one_file_stay_apart():
     assert {("make", "A.Companion"), ("make", "B.Companion")} <= owners
 
 
+def test_a_companion_body_resolves_its_own_members_bases_and_properties():
+    """Inside a companion: `this.foo()` is its own member, `h.help()` goes
+    through its typed property, and a bare call reaches its base's member."""
+    source = """
+        package p
+
+        class Helper { fun help() {} }
+
+        open class Base { fun shared() {} }
+
+        class A {
+            companion object : Base() {
+                val h: Helper = Helper()
+                fun foo() {}
+                fun bar() { this.foo(); h.help(); shared(); foo() }
+            }
+        }
+    """
+    path = "src/main/kotlin/p/A.kt"
+    result = extract_kotlin_file(textwrap.dedent(source), path, "repo")
+    rows = {(r.from_name, r.to_name, r.to_file, r.to_owner) for r in result.relationships if r.rel_type == "CALLS"}
+    assert {
+        ("bar", "foo", path, "A.Companion"), ("bar", "help", path, "Helper"), ("bar", "shared", path, "Base"),
+    } <= rows
+
+
+def test_an_inherited_member_beats_the_companions():
+    """`create()` in A reaches what A inherits from B, not A's companion's."""
+    source = """
+        package p
+
+        open class B { fun create() {} }
+
+        class A : B() {
+            fun go() { create() }
+            companion object { fun create() {} }
+        }
+    """
+    path = "src/main/kotlin/p/A.kt"
+    result = extract_kotlin_file(textwrap.dedent(source), path, "repo")
+    rows = {(r.to_file, r.to_owner) for r in result.relationships
+            if r.rel_type == "CALLS" and (r.from_name, r.to_name) == ("go", "create")}
+    assert rows == {(path, "B")}
+
+
 # --- live --------------------------------------------------------------------------
 
 

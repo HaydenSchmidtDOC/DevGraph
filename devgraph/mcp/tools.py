@@ -586,11 +586,13 @@ def _lookup_cypher(labels: tuple[str, ...], declared: frozenset[str]) -> str:
     )
 
 
-def _owned_lookup_cypher(labels: tuple[str, ...]) -> str:
+def _owned_lookup_cypher(labels: tuple[str, ...], companion: bool = False) -> str:
     """`_lookup_cypher`'s match for a name qualified with its owner: the
-    Class or Function of `labels` named `$member` whose owner is `$owner`."""
+    Class or Function of `labels` named `$member` whose owner is `$owner`,
+    or with `companion` a member of `$owner`'s Kotlin companion."""
+    owned = _COMPANION_MEMBER.format() if companion else "n.owner = $owner"
     body = "\n  UNION\n".join(
-        f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.name = $member AND n.owner = $owner "
+        f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.name = $member AND {owned} "
         "AND ($file IS NULL OR n.file = $file) RETURN n"
         for label in labels if label in _OWNED_LABELS
     )
@@ -602,9 +604,14 @@ def _owned_lookup_cypher(labels: tuple[str, ...]) -> str:
     )
 
 
-#: The name Kotlin gives an anonymous companion object, whose members a
-#: caller names through the class (`Repo.create`): owner `Repo.Companion`.
-COMPANION = "Companion"
+#: A member of `$owner`'s Kotlin companion object (anonymous `Companion` or
+#: named), which a caller names through the class (`Repo.create` for owner
+#: `Repo.Companion` or `Repo.Factory`): the companion is a Class of kind
+#: `companion` owned by `$owner` in the member's file.
+_COMPANION_MEMBER = (
+    "n.owner STARTS WITH $owner + '.' AND EXISTS {{ MATCH (c:Class) WHERE c.repo_id = n.repo_id "
+    "AND c.file = n.file AND c.owner = $owner AND c.kind = 'companion' AND n.owner = $owner + '.' + c.name }}"
+)
 
 
 def _owner_split(name: str) -> tuple[str, str] | None:
@@ -907,8 +914,7 @@ def describe_node(
         rows, _more = _read(engine, _owned_lookup_cypher(labels), params, _DESCRIBE_MAX_CANDIDATES + 1)
         if not rows:
             # `Repo.create` written as Kotlin calls it: the member of Repo's companion.
-            params = {**params, "owner": f"{owned[0]}.{COMPANION}"}
-            rows, _more = _read(engine, _owned_lookup_cypher(labels), params, _DESCRIBE_MAX_CANDIDATES + 1)
+            rows, _more = _read(engine, _owned_lookup_cypher(labels, True), params, _DESCRIBE_MAX_CANDIDATES + 1)
 
     if not rows:
         suggestions, _ = _read(
@@ -2455,9 +2461,7 @@ def get_source(
         results = lookup("n.name = $component_name AND coalesce(n.owner, '') = $owner AND n.file IS NOT NULL")
         if not results:
             # `owner="Repo"` for a member of Repo's Kotlin companion.
-            params["owner"] = f"{owner}.{COMPANION}"
-            results = lookup("n.name = $component_name AND n.owner = $owner AND n.file IS NOT NULL")
-            params["owner"] = owner
+            results = lookup(f"n.name = $component_name AND {_COMPANION_MEMBER.format()}")
     else:
         results = lookup("n.name = $component_name")
     if not results and owner is None and (owned := _owner_split(component_name)) is not None:
@@ -2465,8 +2469,7 @@ def get_source(
         results = lookup("n.name = $member AND n.owner = $owner")
         if not results:
             # `Repo.create` written as Kotlin calls it: the member of Repo's companion.
-            params["owner"] = f"{owned[0]}.{COMPANION}"
-            results = lookup("n.name = $member AND n.owner = $owner")
+            results = lookup(f"n.name = $member AND {_COMPANION_MEMBER.format()}")
     empty = {
         "name": component_name, "label": None, "file": None,
         "start_line": None, "end_line": None, "source": None, "docstring_full": None,

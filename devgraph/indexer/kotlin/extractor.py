@@ -489,6 +489,7 @@ class _KotlinResolver:
 
         for node in top_level:
             walk(node, None)
+        self.companion_keys = {key for keys in self.companions.values() for key in keys}
         # Imports: a class (the first capitalised segment) or a function by
         # the name it is used by, and wildcard packages.
         self.types: dict[str, tuple[list[str], str]] = {}
@@ -602,6 +603,15 @@ class _KotlinResolver:
             return pins or None
         return self.type_pins(cls)
 
+    def keys(self, classes: list[str]) -> list[str]:
+        """The enclosing classes (innermost first, as declared: a companion
+        is `Companion`) as the keys their members are recorded under: a
+        companion's is its owner (`A.Companion`)."""
+        return [
+            owner if (owner := _owner_of(classes[i:])) in self.companion_keys else cls
+            for i, cls in enumerate(classes)
+        ]
+
     def companion_pins(self, cls: str, method: str) -> list[str]:
         """This file, as the member of each companion of the class `cls`
         declared here that defines `method` (owned by `Repo.Companion`)."""
@@ -620,20 +630,27 @@ class _KotlinResolver:
             name = _text(callee, self.source)
             if name in scope:
                 return None  # a function value
-            if classes:
-                # Inside class C or its companion: C's own member, else its
-                # companion's (`create()` in Repo is `Repo.Companion.create`).
-                outer = classes[1] if len(classes) > 1 and any(
-                    key.rsplit(".", 1)[-1] == classes[0] for key in self.companions.get(classes[1], ())
-                ) else classes[0]
-                if name not in self.methods.get(outer, ()) and (pins := self.companion_pins(outer, name)):
+            keys = self.keys(classes)
+            if keys and keys[0] in self.companion_keys:
+                # Inside a companion: its own member, else its bases'.
+                if pins := self.member_pins(keys[0], name):
+                    return name, pins, False
+            elif keys and name not in self.methods.get(keys[0], ()):
+                # Inside class C without such a member: an in-file base's,
+                # else C's companion's (`create()` in Repo is
+                # `Repo.Companion.create`).
+                inherited = [pin for base in self.bases.get(keys[0], []) if base in self.methods
+                             for pin in self.member_pins(base, name) or []]
+                if inherited:
+                    return name, inherited, False
+                if pins := self.companion_pins(keys[0], name):
                     return name, pins, False
             if name in self.functions:
                 return name, [self.file_path], False
             if name in self.imported_functions:
                 return name, self.imported_functions[name], False
             pins = []
-            for cls in classes:
+            for cls in self.keys(classes):
                 for base in self.bases.get(cls, []):
                     pins += self.member_pins(base, name) or []
             pins += self.function_pins(self.layout.package)
@@ -647,11 +664,12 @@ class _KotlinResolver:
         if not names or receiver is None or receiver is names[-1]:
             return None
         name = _text(names[-1], self.source)
+        keys = self.keys(classes)
         if receiver.type == "this_expression":
-            pins = self.member_pins(classes[0], name) if classes else None
+            pins = self.member_pins(keys[0], name) if keys else None
             return (name, pins, False) if pins else None
         if receiver.type == "super_expression":
-            pins = [pin for base in (self.bases.get(classes[0], []) if classes else [])
+            pins = [pin for base in (self.bases.get(keys[0], []) if keys else [])
                     for pin in self.member_pins(base, name) or []]
             return (name, pins, False) if pins else None
         if name in self.imported_functions:
@@ -696,7 +714,7 @@ def _kotlin_scope(node: Node, classes: list[str], resolver: _KotlinResolver, sou
     properties (innermost wins), the parameters and every local (a lambda
     or loop variable untyped unless annotated)."""
     scope: dict[str, str | None] = {}
-    for cls in reversed(classes):
+    for cls in reversed(resolver.keys(classes)):
         scope.update(resolver.properties.get(cls, {}))
 
     def walk(n: Node) -> None:
@@ -910,6 +928,8 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
+        if node.type == "companion_object":
+            class_properties["kind"] = "companion"  # its members are found by its class's name (mcp/tools.py)
         kdoc = _preceding_kdoc(node, prev_sibling, source_bytes)
         if kdoc:
             class_properties["description"] = _docstring_summary(kdoc)
