@@ -33,17 +33,6 @@ def targets(source: str, caller: str, callee: str, file_path: str = "app/main.py
     return {(to_file, conf) for c, n, to_file, conf, _cls in calls(source, file_path) if (c, n) == (caller, callee)}
 
 
-def module_rows(path: str) -> set[tuple]:
-    """The rows a call into module `path` gets from a repository-root file:
-    its file, package and prefix under the root and under `src/`
-    (resolve.import_roots)."""
-    return {
-        row for root in ("", "src/")
-        for row in ((f"{root}{path}.py", "resolved"), (f"{root}{path}/__init__.py", "resolved"),
-                    (f"{root}{path}/", "package"))
-    }
-
-
 def test_same_file_and_enclosing_defs_resolve_to_this_file():
     source = """\
         def helper():
@@ -62,15 +51,14 @@ def test_same_file_and_enclosing_defs_resolve_to_this_file():
 
 def test_a_from_imported_name_goes_to_its_module_and_package():
     found = targets("from pkg.mod import f\n\n\ndef g():\n    f()\n", "g", "f", "main.py")
-    assert found == {
-        ("pkg/mod.py", "resolved"), ("pkg/mod/__init__.py", "resolved"), ("pkg/mod/", "package"),
-        ("src/pkg/mod.py", "resolved"), ("src/pkg/mod/__init__.py", "resolved"), ("src/pkg/mod/", "package"),
-    }
+    assert found == {("pkg/mod.py", "resolved"), ("pkg/mod/__init__.py", "resolved"), ("pkg/mod/", "package")}
 
 
 def test_an_alias_calls_the_name_it_was_imported_as():
     source = "from pkg import f as h\n\n\ndef g():\n    h()\n"
-    assert targets(source, "g", "f", "main.py") == module_rows("pkg")
+    assert targets(source, "g", "f", "main.py") == {
+        ("pkg.py", "resolved"), ("pkg/__init__.py", "resolved"), ("pkg/", "package"),
+    }
     assert targets(source, "g", "h", "main.py") == set()
 
 
@@ -81,7 +69,9 @@ def test_a_relative_import_resolves_against_the_package():
 
 def test_a_module_attribute_resolves_to_the_module():
     source = "import lib.lifecycle as lifecycle\n\n\ndef g():\n    lifecycle.start()\n"
-    assert targets(source, "g", "start", "main.py") == module_rows("lib/lifecycle")
+    assert targets(source, "g", "start", "main.py") == {
+        ("lib/lifecycle.py", "resolved"), ("lib/lifecycle/__init__.py", "resolved"), ("lib/lifecycle/", "package"),
+    }
     dotted = "import lib.lifecycle\n\n\ndef g():\n    lib.lifecycle.start()\n"
     assert ("lib/lifecycle.py", "resolved") in targets(dotted, "g", "start", "main.py")
 
@@ -115,7 +105,9 @@ def test_self_method_of_an_imported_base_goes_to_the_base_module():
             def act(self):
                 self.shared()
         """
-    assert targets(source, "act", "shared", "main.py") == module_rows("base")
+    assert targets(source, "act", "shared", "main.py") == {
+        ("base.py", "resolved"), ("base/__init__.py", "resolved"), ("base/", "package"),
+    }
 
 
 def test_annotated_and_constructed_receivers_resolve_to_their_class():
@@ -135,7 +127,7 @@ def test_annotated_and_constructed_receivers_resolve_to_their_class():
             built = GraphEngine(1)
             built.flush_all()
         """
-    expected = module_rows("engine")
+    expected = {("engine.py", "resolved"), ("engine/__init__.py", "resolved"), ("engine/", "package")}
     assert targets(source, "f", "upsert_nodes", "main.py") == expected
     assert targets(source, "f", "close_all", "main.py") == expected
     assert targets(source, "f", "flush_all", "main.py") == expected
@@ -168,7 +160,7 @@ def test_a_parameter_named_after_a_fixture_in_the_file_is_typed_by_it():
             other.close_all()
             helper.work()
         """
-    expected = module_rows("engine")
+    expected = {("engine.py", "resolved"), ("engine/__init__.py", "resolved"), ("engine/", "package")}
     assert targets(source, "test_it", "run_cypher", "test_x.py") == expected
     assert targets(source, "test_it", "close_all", "test_x.py") == expected
     assert targets(source, "test_it", "work", "test_x.py") == {(None, "name")}  # not a fixture
@@ -200,7 +192,7 @@ def test_an_in_file_subclass_receiver_walks_its_bases():
             Local().own()
             Local().missing()
         """
-    expected = module_rows("engine")
+    expected = {("engine.py", "resolved"), ("engine/__init__.py", "resolved"), ("engine/", "package")}
     assert targets(source, "f", "run_cypher", "main.py") == expected
     assert targets(source, "f", "close_all", "main.py") == expected
     assert targets(source, "f", "own", "main.py") == {("main.py", "resolved")}
@@ -224,7 +216,9 @@ def test_a_parameter_shadows_an_import_of_its_name():
 
 def test_importing_a_submodule_binds_its_top_package():
     source = "import os.path\n\n\ndef f():\n    os.getcwd()\n"
-    assert targets(source, "f", "getcwd", "main.py") == module_rows("os")
+    assert targets(source, "f", "getcwd", "main.py") == {
+        ("os.py", "resolved"), ("os/__init__.py", "resolved"), ("os/", "package"),
+    }
 
 
 def test_builtin_names_are_a_fixed_set():
@@ -264,7 +258,9 @@ def test_a_stoplisted_method_still_resolves_on_a_known_receiver():
 
 def test_a_star_import_binds_unknown_bare_names_but_not_builtins():
     source = "from pkg.mod import *\n\n\ndef g():\n    f()\n    print()\n"
-    assert targets(source, "g", "f", "main.py") == module_rows("pkg/mod")
+    assert targets(source, "g", "f", "main.py") == {
+        ("pkg/mod.py", "resolved"), ("pkg/mod/__init__.py", "resolved"), ("pkg/mod/", "package"),
+    }
     assert targets(source, "g", "print", "main.py") == set()
 
 
@@ -280,9 +276,7 @@ def test_a_resolved_call_suppresses_the_bare_row_of_the_same_name():
 def test_a_package_row_leaves_out_the_exact_files_and_this_file():
     result = extract_python_file("from pkg import f\n\n\ndef g():\n    f()\n", "pkg/user.py", "repo")
     (prefix,) = [r for r in result.relationships if r.rel_type == "CALLS" and r.to_file == "pkg/"]
-    assert prefix.exclude == sorted({
-        f"{root}{path}" for root in ("", "src/", "pkg/", "pkg/src/") for path in ("pkg.py", "pkg/__init__.py")
-    } | {"pkg/user.py"})
+    assert prefix.exclude == sorted({"pkg.py", "pkg/__init__.py", "pkg/pkg.py", "pkg/pkg/__init__.py", "pkg/user.py"})
 
 
 def test_same_named_callers_in_two_classes_are_two_callers():

@@ -140,8 +140,8 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: tiered group's every pin recorded in `name_refs`; 15: C# Class and
 #: Function `proj` and C# path-pinned rows limited to the projects their
 #: file's project references (`visible`, a Module's `name_ref_visible`);
-#: 16: Python absolute imports also tried under each ancestor's `src/` and
-#: the source roots a pyproject.toml declares; Rust calls and imports
+#: 16: Python absolute imports also tried under a `src/` directory beside
+#: an ancestor and the source roots a pyproject.toml declares; Rust calls and imports
 #: through `pub use` re-exports (resolver configuration); a Kotlin
 #: anonymous companion object's members (owner `Class.Companion`); JSX
 #: component elements as calls.
@@ -756,7 +756,7 @@ def index_paths(
     config = ResolverConfig(
         repo_root, go_files=lambda: config_files("go", ("go.mod", "go.work")),
         rust_files=lambda: config_files("rust"), cs_files=lambda: config_files("csharp"),
-        python_files=lambda: config_files("python", ("pyproject.toml",)),
+        python_files=lambda: config_files("python"),
     )
     # Markdown files whose cross-file edges are resolved after every other
     # node in the batch exists (see the docs/mentions passes below).

@@ -605,8 +605,8 @@ def _extract_imports(root: Node, source: bytes, file_path: str, roots: tuple[str
 
     `file_path` is the importing file's repo-relative path with forward
     slashes ('services/api/main.py', or 'main.py' at the repo root): absolute
-    imports are tried under each of its ancestor directories, their `src/`
-    and the configured `roots`, and relative ones against its own directory. Each import targets every candidate
+    imports are tried under each of its ancestor directories and the
+    configured `roots` (`src/` directories beside them, pyproject roots), and relative ones against its own directory. Each import targets every candidate
     file, `p.py` and `p/__init__.py`; only the ones that exist as Modules
     ever become edges. `from P import n` also targets the submodule `P.n`.
     """
@@ -679,9 +679,9 @@ def extract_python_file(
             the correct repo-relative form automatically.
         repo_id: Repository ID for scoping nodes.
         config: The repository's resolver configuration (its pyproject.toml
-            files), read once per batch: the source roots they declare are
-            import roots of the files under them. None reads no roots
-            besides each ancestor directory and its `src/`.
+            files and `src/` directories), read once per batch: the source
+            roots are import roots of the files they apply to. None reads no
+            roots besides each ancestor directory.
 
     Returns:
         ExtractionResult containing lists of nodes and relationships. On a

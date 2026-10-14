@@ -646,3 +646,34 @@ def test_a_pyproject_root_change_re_indexes_the_python_files(engine, repo_id, tm
     assert sync_resolver_config(engine, repo_id, tmp_path, {project}) == 3
     assert imports(engine, repo_id, "scripts/run.py") == ["code/acme/core.py"]
     equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_a_src_directory_is_a_python_root_while_it_holds_python(engine, repo_id, tmp_path):
+    """tests/ reaches src/'s package once src/ holds a Python file: its first
+    file, created in a live batch, re-indexes the Python files, and so does
+    deleting its last; every step equals a fresh scan."""
+    write(tmp_path, "tests/test_api.py", "import pkg.api\n")
+    write(tmp_path, "pkg_other/x.py", "X = 1\n")
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+    assert imports(engine, repo_id, "tests/test_api.py") == []
+    inputs = [rel for entry in engine.read_resolver_config(repo_id).values() for rel in entry["inputs"]]
+    assert not touches_config("tests/test_api.py", inputs, tmp_path)
+
+    api = write(tmp_path, "src/pkg/api.py", "def run():\n    return 1\n")
+    assert touches_config("src/pkg/api.py", inputs, tmp_path)  # src/ is no root yet
+    index_paths(engine, repo_id, tmp_path, {api})
+    assert sync_resolver_config(engine, repo_id, tmp_path, {api}) == 3
+    assert imports(engine, repo_id, "tests/test_api.py") == ["src/pkg/api.py"]
+    assert engine.read_resolver_config(repo_id)["python"]["inputs"] == ["src"]
+    equals_fresh(engine, repo_id, tmp_path)
+
+    api.write_text("def run():\n    return 2\n")
+    assert not touches_config("src/pkg/api.py", ["src"], tmp_path)  # an edit changes no root
+    api.unlink()
+    assert touches_config("src/pkg/api.py", ["src"], tmp_path)
+    remove_paths(engine, repo_id, tmp_path, {api})
+    sync_resolver_config(engine, repo_id, tmp_path, {api})
+    assert engine.read_resolver_config(repo_id)["python"]["inputs"] == []
+    equals_fresh(engine, repo_id, tmp_path)

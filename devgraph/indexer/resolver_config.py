@@ -93,14 +93,21 @@ def touches_config(rel: str, inputs: list[str], repo_root: Path) -> bool:
     .cs file of a project (a `.csproj` among `inputs` at or above it) whose
     head now holds a `global using` (one whose head held one is an input; a
     file of no project counts for nothing until a `.csproj` above it, itself
-    a change, makes it one), or a .rs file that now re-exports (one that
-    did is an input)."""
+    a change, makes it one), a .rs file that now re-exports (one that
+    did is an input), or a Python file created under a `src` directory
+    that is no source root yet, or deleted under one."""
     if config_language(posixpath.basename(rel)):
         return True
     if any(each == rel or each.startswith(rel + "/") for each in inputs):
         return True
     if rel.endswith(".rs"):
         return bool(_rust_file_reexports(Path(repo_root) / rel))
+    if rel.endswith(".py"):
+        # A Python file under a `src` directory: one not yet an input can
+        # become a source root, and deleting one can end one.
+        known = set(inputs)
+        gone = not (Path(repo_root) / rel).exists()
+        return any(each not in known or gone for each in _src_dirs(rel))
     if not rel.endswith(".cs"):
         return False
     project_dirs = {posixpath.dirname(each) for each in inputs if each.endswith(".csproj")}
@@ -358,8 +365,8 @@ class ResolverConfig:
     the Cargo.toml files and the re-exporting .rs files (`rust_crates`,
     `rust_reexports`), `cs_files` for the C#
     project files and the .cs files holding a `global using`
-    (`cs_projects`), and `python_files` for the pyproject.toml files
-    (`python_roots`)."""
+    (`cs_projects`), and `python_files` for the pyproject.toml files and
+    the `src` directories holding Python files (`python_roots`)."""
 
     def __init__(
         self, repo_root: Path, go_files: Callable[[], list[str] | None] | None = None,
@@ -383,6 +390,7 @@ class ResolverConfig:
         self._cs_projects: dict[str, CsProject] | None = None
         self._python_files = python_files
         self._python_roots: dict[str, list[str]] | None = None
+        self._python_src: list[str] = []
 
     # --- files ---------------------------------------------------------------
 
@@ -737,24 +745,30 @@ class ResolverConfig:
         return sorted(roots)
 
     def _python_digest(self, rel: str) -> object:
-        return self._pyproject_roots(rel)
+        return self._pyproject_roots(rel) if posixpath.basename(rel) == "pyproject.toml" else []
 
     def python_roots(self, file_path: str) -> tuple[str, ...]:
-        """The source roots the pyproject.toml files at or above the Python
-        file `file_path` (repo-relative) declare, sorted."""
+        """The source roots of the Python file `file_path` (repo-relative),
+        sorted: each `src` directory holding Python files whose parent is
+        at or above it (`_python_inputs`), and the roots the pyproject.toml
+        files at or above it declare."""
         if self._python_roots is None:
             files = self._python_files() if self._python_files is not None else None
             if files is None:
-                files = sorted(
-                    path.relative_to(self.root).as_posix() for path in indexable_paths(self.root)
-                    if path.name == "pyproject.toml"
-                )
-            self._python_roots = {rel: self._pyproject_roots(rel) for rel in files}
+                files = _python_inputs(self.root)
+            self._python_roots = {
+                rel: self._pyproject_roots(rel) for rel in files if posixpath.basename(rel) == "pyproject.toml"
+            }
+            self._python_src = [rel for rel in files if posixpath.basename(rel) == "src"]
         found = set()
         for rel, roots in self._python_roots.items():
             folder = posixpath.dirname(rel)
             if not folder or file_path.startswith(folder + "/"):
                 found.update(roots)
+        for rel in self._python_src:
+            folder = posixpath.dirname(rel)
+            if not folder or file_path.startswith(folder + "/"):
+                found.add(rel + "/")
         return tuple(sorted(found))
 
     # --- C# projects ---------------------------------------------------------------
@@ -870,6 +884,28 @@ def _cs_inputs(root: Path, walked: list[str] | None = None) -> list[str]:
     return sorted(found)
 
 
+def _src_dirs(rel: str) -> list[str]:
+    """The directories named `src` on the path `rel` (`a/src`, `a/src/b/src`)."""
+    parts = rel.split("/")[:-1]
+    return ["/".join(parts[: i + 1]) for i, part in enumerate(parts) if part == "src"]
+
+
+def _python_inputs(root: Path, walked: list[str] | None = None) -> list[str]:
+    """The Python configuration of the repository at `root` (its indexable
+    paths, or `walked`): every pyproject.toml, and every directory named
+    `src` holding a Python file (at any depth), sorted."""
+    if walked is None:
+        walked = []
+        for path in indexable_paths(root):
+            try:
+                walked.append(path.relative_to(root).as_posix())
+            except ValueError:
+                continue
+    found = {rel for rel in walked if posixpath.basename(rel) == "pyproject.toml"}
+    found.update(each for rel in walked if rel.endswith(".py") for each in _src_dirs(rel))
+    return sorted(found)
+
+
 def _rust_file_reexports(path: Path) -> list[list]:
     """The re-exports of the .rs file at `path` (none when it is missing,
     unreadable or larger than a configuration file may be)."""
@@ -919,7 +955,8 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
     `<ProjectReference>` paths and the `global using`
     directives of each project's .cs files
     (`_cs_inputs`); for Python each pyproject.toml's source roots
-    (`_pyproject_roots`). A compiler flag, a `require` bump or a dependency or
+    (`_pyproject_roots`) and every `src` directory holding Python files
+    (`_python_inputs`). A compiler flag, a `require` bump or a dependency or
     version change counts for nothing."""
     root = Path(repo_root)
     config = ResolverConfig(root)
@@ -935,6 +972,7 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
             found[lang].add(walked[-1])
     found["csharp"] = set(_cs_inputs(root, walked))
     found["rust"] = set(_rust_inputs(root, walked))
+    found["python"] = set(_python_inputs(root, walked))
     result = {}
     for lang, files in found.items():
         config.read = set()

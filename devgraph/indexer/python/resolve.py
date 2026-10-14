@@ -1,20 +1,21 @@
 """Resolve a Python file's imports to the repository files they can name.
 
 Everything here is a pure function of the importing file's path and text
-and of the source roots its pyproject.toml files declare (resolver
-configuration): no filesystem, no other source file. An import names a set
+and of the source roots the repository holds or its pyproject.toml files
+declare (resolver configuration): no filesystem, no other source file. An import names a set
 of *candidate* files, and the graph links only the candidates that exist as
 Modules, so an edge never depends on anything but the writer's text, the
 configuration and whether its target exists (see
 docs/superpowers/specs/2026-10-10-python-call-resolution-design.md).
 
-Absolute imports are tried under every ancestor directory of the importer
-and under each one's `src/`: `import a.b` in `x/y/f.py` names `a/b`,
-`src/a/b`, `x/a/b`, `x/src/a/b`, `x/y/a/b` and `x/y/src/a/b`. That covers a
-flat layout, a `src/` layout (from `tests/` and `scripts/` too) and a
-monorepo's nested projects without reading any configuration; a root a
-pyproject.toml declares (`package-dir`, `packages.find` `where`, Poetry's
-`from`, Hatch's wheel `packages`) is tried after them. A module path `p` is
+Absolute imports are tried under every ancestor directory of the importer:
+`import a.b` in `x/y/f.py` names `a/b`, `x/a/b` and `x/y/a/b`. That covers a
+flat layout, a `src/` layout from inside `src/` and a monorepo's nested
+projects. The configured roots come after them: every `src/` directory
+holding Python files beside an ancestor (`src/` for `tests/test_a.py`,
+`packages/foo/src/` for `packages/foo/tests/test_a.py`), and the roots a
+pyproject.toml at or above the importer declares (`package-dir`,
+`packages.find` `where`, Poetry's `from`, Hatch's wheel `packages`). A module path `p` is
 the file `p.py` or the package `p/__init__.py`; the package's directory `p/`
 is its prefix, which a re-exported name can live anywhere under.
 """
@@ -33,13 +34,12 @@ def ancestor_roots(file_path: str) -> tuple[str, ...]:
 
 def import_roots(file_path: str, configured: tuple[str, ...] = ()) -> tuple[str, ...]:
     """The directories an absolute import is tried under: each ancestor
-    directory and its `src/`, outermost first, then the `configured` roots
-    (`ResolverConfig.python_roots`), without repeats. `x/f.py` gives `""`,
-    `"src/"`, `"x/"`, `"x/src/"`."""
+    directory, outermost first, then the `configured` roots
+    (`ResolverConfig.python_roots`), without repeats. `x/f.py` with
+    `("src/",)` gives `""`, `"x/"`, `"src/"`."""
     found: dict[str, None] = {}
     for root in ancestor_roots(file_path):
         found[root] = None
-        found[f"{root}src/"] = None
     for root in configured:
         found[root] = None
     return tuple(found)

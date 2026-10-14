@@ -68,10 +68,13 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   before reading any file and stores it at the end
   (`dispatch.sync_resolver_config`).
 - **Python** (index format 16). Each `pyproject.toml`'s declared source
-  roots (`ResolverConfig.python_roots`; see the Roots bullet of
-  2026-10-10-python-call-resolution-design.md) apply to the Python files at
-  or under its directory; the digest is those roots, and a batch extracts
-  Python under the pyproject.toml paths its fingerprint found.
+  roots apply to the Python files at or under its directory, and each
+  directory named `src` holding a Python file to the files under its parent
+  (`ResolverConfig.python_roots`; see the Roots bullet of
+  2026-10-10-python-call-resolution-design.md). The inputs are the
+  pyproject.toml files and those `src` directories, the digest each
+  pyproject's roots, and a batch extracts Python under the inputs its
+  fingerprint found.
 - **Go.** The Go fingerprint covers each go.mod's `module` line and the
   local `replace` directives (`=> ../shared`) of every go.mod and go.work. A
   batch extracts Go files under the go.mod and go.work paths its fingerprint
