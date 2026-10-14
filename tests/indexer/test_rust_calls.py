@@ -490,11 +490,31 @@ def test_a_glob_reexport_ranks_below_the_reexporting_modules_own_items(tmp_path)
             if r.to_name == "tidy"]
     pins = {r.to_file: r.properties["confidence"] for r in rows}
     assert pins == {
-        "crates/core/src/lib.rs": "resolved", "crates/core/src/.~?util.rs": "package",
-        "crates/core/src/util/.~?mod.rs": "package", "crates/core/src/util/": "package",
+        "crates/core/src/lib.rs": "resolved", "/crates/core/src/util.rs": "package",
+        "/crates/core/src/util/mod.rs": "package", "crates/core/src/util/": "package",
     }
     (loose,) = [r for r in rows if r.to_file.endswith("util.rs")]
     assert "crates/core/src/lib.rs" in loose.exclude
+    # Its own file only, not a sibling ending like it.
+    files = ["crates/core/src/util.rs", "crates/core/src/my_util.rs"]
+    assert reached("fn main() { shop_core::tidy(); }\n", "crates/app/src/main.rs", "main", "tidy", files,
+                   config) == {"crates/core/src/util.rs": "package"}
+
+
+def test_an_associated_call_through_a_reexport_names_its_type(tmp_path):
+    """`shop_core::Client::new()` through net/mod.rs's re-export reaches
+    `Client::new` only: net/mod.rs's own `Pool::new` is no target."""
+    config = _config(tmp_path, {
+        **WORKSPACE,
+        "crates/core/src/lib.rs": "pub mod net;\npub use net::Client;\n",
+        "crates/core/src/net/mod.rs": "pub mod client;\npub use self::client::Client;\n",
+    })
+    rows = [r for r in _rows("fn main() { shop_core::Client::new(); }\n", "crates/app/src/main.rs", config)
+            if r.to_name == "new"]
+    owners = {(r.to_file, r.to_owner) for r in rows}
+    assert ("crates/core/src/net/mod.rs", "Client") in owners
+    assert ("crates/core/src/net/client.rs", "Client") in owners
+    assert ("crates/core/src/lib.rs", None) in owners
 
 
 def test_reexport_cycles_and_external_paths_end(tmp_path):

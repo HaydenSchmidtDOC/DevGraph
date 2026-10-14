@@ -413,16 +413,16 @@ def reexports(text: str) -> list[list]:
 
 
 def _loose(pins: list[str]) -> list[str]:
-    """`pins` at package confidence: a file pin as a package-confidence
-    directory pin limited to its name (`a/.~?b.rs`, as for a crate whose
-    name two packages share); a recursive prefix is package already."""
+    """`pins` at package confidence: a file pin as the suffix pin of its
+    whole path (`/a/util.rs`, which `a/my_util.rs` beside it does not
+    match), a repository-root file as a package-confidence pin on its name
+    in the root (`.~?util.rs`); a recursive prefix is package already."""
     found = []
     for pin in pins:
         if pin.endswith("/") or "/.~" in pin or pin.startswith(".~"):
             found.append(pin)
         else:
-            folder, name = posixpath.split(pin)
-            found.append(f"{folder}/.~?{name}" if folder else f".~?{name}")
+            found.append(f"/{pin}" if "/" in pin else f".~?{pin}")
     return found
 
 
@@ -736,8 +736,14 @@ class _RustResolver:
         found = {rest[-1]: self.pins(module)}
         for target, item, glob in self.reexported(module, rest[0]):
             callee = item if len(rest) == 1 else rest[-1]
+            pins = self._reexport_pins(target, glob)
+            if len(rest) == 2:
+                # `Client::new()`: an associated function of the type as its
+                # module calls it, so a module the re-export passes through
+                # links its own `Pool::new` no more than the definer does.
+                pins = [owned_pin(pin, item) for pin in pins]
             found.setdefault(callee, [])
-            found[callee] += [pin for pin in self._reexport_pins(target, glob) if pin not in found[callee]]
+            found[callee] += [pin for pin in pins if pin not in found[callee]]
         return list(found.items())
 
     def _glob_pins(self, scope: tuple, item: str) -> list[str] | None:
