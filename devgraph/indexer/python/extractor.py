@@ -37,6 +37,7 @@ from devgraph.indexer.common import (
     split_owned_pin,
 )
 from devgraph.indexer.python.resolve import Bindings, absolute_module, relative_module
+from devgraph.indexer.resolver_config import ResolverConfig
 
 logger = logging.getLogger(__name__)
 
@@ -598,18 +599,18 @@ def _extract_base_class_names(superclasses_node: Node | None, source: bytes) -> 
     return names
 
 
-def _extract_imports(root: Node, source: bytes, file_path: str) -> Bindings:
+def _extract_imports(root: Node, source: bytes, file_path: str, roots: tuple[str, ...] = ()) -> Bindings:
     """Every import statement in the file, function-local ones included, as
     its bindings and IMPORTS targets (see resolve.py).
 
     `file_path` is the importing file's repo-relative path with forward
     slashes ('services/api/main.py', or 'main.py' at the repo root): absolute
-    imports are tried under each of its ancestor directories and relative
-    ones against its own directory. Each import targets every candidate
+    imports are tried under each of its ancestor directories, their `src/`
+    and the configured `roots`, and relative ones against its own directory. Each import targets every candidate
     file, `p.py` and `p/__init__.py`; only the ones that exist as Modules
     ever become edges. `from P import n` also targets the submodule `P.n`.
     """
-    bindings = Bindings()
+    bindings = Bindings(roots=roots)
     current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
 
     def walk(node: Node) -> None:
@@ -651,7 +652,7 @@ def _extract_imports(root: Node, source: bytes, file_path: str) -> Bindings:
             if module_name.startswith("."):
                 bindings.add_from(relative_module(module_name, current_dir), names, star)
             elif module_name:
-                bindings.add_from(absolute_module(module_name, file_path), names, star)
+                bindings.add_from(absolute_module(module_name, file_path, roots), names, star)
 
         for child in node.children:
             walk(child)
@@ -660,7 +661,9 @@ def _extract_imports(root: Node, source: bytes, file_path: str) -> Bindings:
     return bindings
 
 
-def extract_python_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
+def extract_python_file(
+    source_code: str, file_path: str, repo_id: str, config: ResolverConfig | None = None,
+) -> ExtractionResult:
     """Parse a Python file and extract nodes and relationships.
 
     Args:
@@ -675,6 +678,10 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
             otherwise merge into one Module node) — index_file() computes
             the correct repo-relative form automatically.
         repo_id: Repository ID for scoping nodes.
+        config: The repository's resolver configuration (its pyproject.toml
+            files), read once per batch: the source roots they declare are
+            import roots of the files under them. None reads no roots
+            besides each ancestor directory and its `src/`.
 
     Returns:
         ExtractionResult containing lists of nodes and relationships. On a
@@ -710,7 +717,8 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
     # file_path is expected to be the repo-relative path with forward
     # slashes (e.g. 'services/api/main.py'), which the candidates hang off.
     # A package's `from . import x` names its own __init__.py, never an edge.
-    bindings = _extract_imports(root, source_bytes, file_path)
+    roots = config.python_roots(file_path) if config is not None else ()
+    bindings = _extract_imports(root, source_bytes, file_path, roots)
     for target in sorted(bindings.targets - {file_path}):
         result.relationships.append(
             GraphRelationship(

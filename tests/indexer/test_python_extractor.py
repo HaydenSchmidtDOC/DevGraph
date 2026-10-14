@@ -200,7 +200,10 @@ def test_absolute_import_targets_are_candidate_files():
     """
     result = extract_python_file("import os\nimport requests\n", "main.py", "test_repo")
     targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert targets == {"os.py", "os/__init__.py", "requests.py", "requests/__init__.py"}
+    assert targets == {
+        f"{root}{path}" for root in ("", "src/")
+        for path in ("os.py", "os/__init__.py", "requests.py", "requests/__init__.py")
+    }
 
 
 def test_all_nodes_scoped_to_repo():
@@ -325,7 +328,10 @@ def test_from_import_names_exclude_the_module_name():
     targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
     # The module and the one imported name as its submodule, never the
     # module name duplicated in as a submodule of itself ('typing/typing.py').
-    assert targets == {"typing.py", "typing/__init__.py", "typing/List.py", "typing/List/__init__.py"}
+    assert targets == {
+        f"{root}{path}" for root in ("", "src/")
+        for path in ("typing.py", "typing/__init__.py", "typing/List.py", "typing/List/__init__.py")
+    }
 
 
 def test_dotted_absolute_import_resolves_to_same_repo_file_path():
@@ -354,10 +360,13 @@ def test_dotted_import_statement_also_resolves():
 
 def test_single_segment_import_targets_its_file_and_package():
     """A bare single-word import ('import os') targets 'os.py' and
-    'os/__init__.py' under each ancestor directory of the importer."""
+    'os/__init__.py' under each ancestor directory of the importer and its
+    `src/`."""
     result = extract_python_file("import os\n", "app/main.py", "test_repo")
     targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert targets == {"os.py", "os/__init__.py", "app/os.py", "app/os/__init__.py"}
+    assert targets == {
+        f"{root}{path}" for root in ("", "src/", "app/", "app/src/") for path in ("os.py", "os/__init__.py")
+    }
 
 
 def test_calls_targets_are_function_label():

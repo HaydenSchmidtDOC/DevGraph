@@ -490,8 +490,8 @@ def _inject(monkeypatch, calls=(), imports=(), files=()):
     `files` by path and `imports` (Module pins), whatever its text."""
     real = dispatch.extract_python_file
 
-    def extract(content, rel_path, repo_id):
-        result = real(content, rel_path, repo_id)
+    def extract(content, rel_path, repo_id, config=None):
+        result = real(content, rel_path, repo_id, config)
         if rel_path == "app.py":
             for rel in call_rows("Function", "main", "f", set(calls), False, None, "app.py", repo_id):
                 rel.from_file = rel.origin = "app.py"
@@ -588,8 +588,8 @@ def _inject_match_keys(monkeypatch) -> dict:
     real = dispatch.extract_python_file
     settings = {"empty": False}
 
-    def extract(content, rel_path, repo_id):
-        result = real(content, rel_path, repo_id)
+    def extract(content, rel_path, repo_id, config=None):
+        result = real(content, rel_path, repo_id, config)
         keys = None
         if content.startswith("# mkeys "):
             keys = sorted(set(content.splitlines()[0][len("# mkeys "):].split(",")))

@@ -10,7 +10,9 @@ fixed seeds of 15 steps. `DEVGRAPH_ACCURACY_FUZZ_SEEDS` (a comma list) and
 Python files import and call in every style the call resolution reads
 (docs/superpowers/specs/2026-10-10-python-call-resolution-design.md): plain,
 aliased, relative and star imports, a package re-exporting from its module,
-a src/ layout, calls through modules, aliases and untyped values, and
+a src/ layout reached from tests/ outside it, its modules moving between
+src/, the repository root and a root a pyproject.toml declares (which comes
+and goes), calls through modules, aliases and untyped values, and
 `self.shared()` reaching a base in the same or another file. A class `Twin`
 comes and goes beside another class of a file, repeating its method names
 (both nest a `Meta` with its own base), and so do a top-level `act` and one
@@ -310,6 +312,8 @@ TS_CONFIGS = {
     "go.mod": [None, "module example.com/top\n", "module example.com/other\n"],
     "go/b/go.mod": [None, "module example.com/bee\n"],
     "go.work": [None, "go 1.22\n\nuse ./go\n\nreplace example.com/ext => ./go/b\n"],
+    # pyproject.toml makes code/ a source root, or nothing.
+    "pyproject.toml": [None, '[tool.setuptools]\npackage-dir = {"" = "code"}\n', '[project]\nname = "fz"\n'],
     # crates/core is the crate shop_core, renamed, given another root file, or not a package at all.
     "crates/core/Cargo.toml": [
         '[package]\nname = "shop-core"\n', '[package]\nname = "store-core"\nversion = "0.2.0"\n',
@@ -376,6 +380,8 @@ def initial_repo() -> dict:
         "pkg/other.py": File("py", funcs={"spare": []}),
         "src/lib/core.py": File("py", imports=["from lib import util"], funcs={"core": ["util.render()"]}),
         "src/lib/util.py": File("py", funcs={"render": []}),
+        "tests/test_lib.py": File("py", imports=["from lib.core import core", "import lib.util"],
+                                  funcs={"test_core": ["core()", "lib.util.render()"]}),
         "rs/foo.rs": File("rs", extra=RS_FOO, funcs={"parse": ["render"]}),
         "rs/display.rs": File("rs", extra="pub trait Display {}\n", funcs={"render": []}),
         "rs/conv.rs": File("rs", imports=["use crate::display::Display;"], impl=True,
@@ -492,6 +498,8 @@ CPP_CALLS = ["{n}", "util::{n}", "w.{n}", "obj->{n}"]
 # C++ out-of-class method definitions: of a header's class, of a class
 # declared nowhere, and through a namespace.
 CPP_METHODS = ["Widget::draw", "Widget::size", "Gadget::run", "Missing::stop", "ui::Widget::paint"]
+# The roots the Python package `lib` moves between.
+PY_ROOTS = ["src/", "", "code/"]
 # The source roots a Java file moves between (another Maven module).
 JAVA_ROOTS = ["java/", "lib/src/main/java/"]
 SERVICES = ["api", "web", "worker", "db"]
@@ -726,6 +734,19 @@ class Fuzz:
         target = self.rng.choice(targets)
         self.files[target].funcs[name] = self.files[source].funcs.pop(name)
         return f"move function {name} from {source} to {target}", {source, target}
+
+    def op_src_move(self):
+        """Move a module of the package `lib` between src/, the repository
+        root and code/ (a source root while pyproject.toml declares it)."""
+        moving = sorted((p, root) for p in self.files for root in PY_ROOTS if p.startswith(f"{root}lib/"))
+        if not moving:
+            return None
+        path, old = self.rng.choice(moving)
+        new = self.rng.choice([root for root in PY_ROOTS if root != old]) + path[len(old):]
+        if new in self.files:
+            return None
+        self.files[new] = self.files.pop(path)
+        return f"move {path} to {new}", {path, new}
 
     def op_move_java_module(self):
         """Move a Java class to the same package under another source root."""
@@ -1079,7 +1100,7 @@ class Fuzz:
         "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move", "cs_namespace", "cs_move_class",
         "cs_dup_class", "cs_shadow", "cs_shadow", "cs_reference", "cs_reference", "cs_project_move", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route",
         "route",
-        "route_change", "route_move",
+        "route_change", "route_move", "src_move", "src_move",
     ]
 
     def draw(self):
@@ -1104,8 +1125,8 @@ def _with_pin_comments(monkeypatch):
     collapse per callee (calls.call_rows), imports per file (calls.import_rows)."""
     real = dispatch.extract_python_file
 
-    def extract(content, rel_path, repo_id):
-        result = real(content, rel_path, repo_id)
+    def extract(content, rel_path, repo_id, config=None):
+        result = real(content, rel_path, repo_id, config)
         calls: dict[str, set] = {}
         imports: set = set()
         for line in content.splitlines():

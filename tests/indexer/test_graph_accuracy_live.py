@@ -1186,8 +1186,8 @@ def test_relink_reads_no_files(engine, repo_id, tmp_path, monkeypatch):
 def _with_pinned_calls(monkeypatch, rows):
     real = dispatch.extract_python_file
 
-    def extract(content, rel_path, repo_id):
-        result = real(content, rel_path, repo_id)
+    def extract(content, rel_path, repo_id, config=None):
+        result = real(content, rel_path, repo_id, config)
         if rel_path == "app.py":
             result.relationships += [
                 GraphRelationship(

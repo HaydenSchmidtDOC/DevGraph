@@ -147,12 +147,45 @@ def test_fingerprints_follow_only_what_resolution_reads(tmp_path):
     assert after["go"]["fingerprint"] != before["go"]["fingerprint"]
 
 
+def test_pyproject_source_roots_and_their_fingerprint(tmp_path):
+    write(tmp_path, "pyproject.toml", """\
+        [project]
+        name = "acme"
+        version = "1.0"
+
+        [tool.setuptools]
+        package-dir = {"" = "lib", "extra" = "vendor/extra"}
+
+        [tool.setuptools.packages.find]
+        where = ["lib", "../outside"]
+        """)
+    write(tmp_path, "svc/pyproject.toml", """\
+        [tool.poetry]
+        packages = [{include = "svc", from = "code"}]
+
+        [tool.hatch.build.targets.wheel]
+        packages = ["pkgs/web"]
+        """)
+    write(tmp_path, "bad/pyproject.toml", "[tool.setuptools\n")
+    config = ResolverConfig(tmp_path)
+    assert config.python_roots("tests/test_a.py") == ("lib/", "vendor/")
+    assert config.python_roots("svc/tests/test_b.py") == ("lib/", "svc/code/", "svc/pkgs/", "vendor/")
+    before = fingerprints(tmp_path)["python"]
+    assert before["inputs"] == ["bad/pyproject.toml", "pyproject.toml", "svc/pyproject.toml"]
+
+    write(tmp_path, "pyproject.toml", (tmp_path / "pyproject.toml").read_text().replace('"1.0"', '"1.1"'))
+    assert fingerprints(tmp_path)["python"] == before  # a version bump changes nothing
+    write(tmp_path, "svc/pyproject.toml", '[tool.poetry]\npackages = [{include = "svc", from = "src2"}]\n')
+    assert fingerprints(tmp_path)["python"]["fingerprint"] != before["fingerprint"]
+
+
 def test_what_can_touch_the_configuration(tmp_path):
     inputs = ["web/tsconfig.json", "configs/base.cfg", "app/Usings.cs"]
     assert touches_config("tsconfig.app.json", [], tmp_path)
     assert touches_config("a/go.mod", [], tmp_path)
     assert touches_config("src/App.csproj", [], tmp_path)
     assert touches_config("Directory.Build.targets", [], tmp_path)
+    assert touches_config("svc/pyproject.toml", [], tmp_path)
     assert touches_config("configs/base.cfg", inputs, tmp_path)
     assert touches_config("configs", inputs, tmp_path)  # a deleted folder holding one
     assert not touches_config("web/a.ts", inputs, tmp_path)
@@ -595,3 +628,21 @@ def test_a_project_reference_decides_which_project_a_site_links(engine, repo_id,
     d_user.unlink()
     remove_paths(engine, repo_id, tmp_path, {d_user})
     assert changed(moved) == ["src/A/User.cs"]
+
+
+def test_a_pyproject_root_change_re_indexes_the_python_files(engine, repo_id, tmp_path):
+    project = write(tmp_path, "pyproject.toml", '[tool.setuptools]\npackage-dir = {"" = "lib"}\n')
+    write(tmp_path, "scripts/run.py", "import acme.core\n")
+    write(tmp_path, "lib/acme/core.py", "X = 1\n")
+    write(tmp_path, "code/acme/core.py", "X = 2\n")
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+    assert imports(engine, repo_id, "scripts/run.py") == ["lib/acme/core.py"]
+    assert engine.read_resolver_config(repo_id)["python"]["inputs"] == ["pyproject.toml"]
+
+    write(tmp_path, "pyproject.toml", '[tool.setuptools.packages.find]\nwhere = ["code"]\n')
+    index_paths(engine, repo_id, tmp_path, {project})
+    assert sync_resolver_config(engine, repo_id, tmp_path, {project}) == 3
+    assert imports(engine, repo_id, "scripts/run.py") == ["code/acme/core.py"]
+    equals_fresh(engine, repo_id, tmp_path)

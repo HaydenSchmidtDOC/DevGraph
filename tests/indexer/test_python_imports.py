@@ -13,11 +13,13 @@ import pytest
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.python.extractor import extract_python_file
+from devgraph.indexer.resolver_config import ResolverConfig
 from devgraph.indexer.python.resolve import (
     ModuleRef,
     Symbol,
     absolute_module,
     ancestor_roots,
+    import_roots,
     relative_dir,
     relative_module,
 )
@@ -43,6 +45,13 @@ def test_ancestor_roots_are_every_directory_above_the_file():
     assert ancestor_roots("x/y/f.py") == ("", "x/", "x/y/")
 
 
+def test_import_roots_add_each_ancestors_src_then_the_configured_roots():
+    assert import_roots("main.py") == ("", "src/")
+    assert import_roots("x/f.py") == ("", "src/", "x/", "x/src/")
+    # A repeat is left out, a configured root comes last.
+    assert import_roots("src/f.py", ("lib/", "src/")) == ("", "src/", "src/src/", "lib/")
+
+
 def test_relative_dir_walks_up_one_parent_per_extra_dot():
     assert relative_dir("a/b/c", 1) == "a/b/c"
     assert relative_dir("a/b/c", 2) == "a/b"
@@ -51,10 +60,10 @@ def test_relative_dir_walks_up_one_parent_per_extra_dot():
 
 
 def test_a_module_names_its_file_its_package_and_its_prefix():
-    ref = absolute_module("a.b", "x/f.py")
-    assert ref.files() == ["a/b.py", "a/b/__init__.py", "x/a/b.py", "x/a/b/__init__.py"]
-    assert ref.dirs() == ["a/b/", "x/a/b/"]
-    assert ref.child("c").files() == ["a/b/c.py", "a/b/c/__init__.py", "x/a/b/c.py", "x/a/b/c/__init__.py"]
+    ref = absolute_module("a.b", "f.py")
+    assert ref.files() == ["a/b.py", "a/b/__init__.py", "src/a/b.py", "src/a/b/__init__.py"]
+    assert ref.dirs() == ["a/b/", "src/a/b/"]
+    assert ref.child("c").files() == ["a/b/c.py", "a/b/c/__init__.py", "src/a/b/c.py", "src/a/b/c/__init__.py"]
 
 
 def test_a_relative_package_is_a_directory_never_a_file():
@@ -86,7 +95,8 @@ def test_relative_modules(module, current, paths):
 
 def test_from_pkg_import_mod_targets_the_package_and_the_submodule():
     assert targets("from pkg import mod\n", "app.py") == {
-        "pkg.py", "pkg/__init__.py", "pkg/mod.py", "pkg/mod/__init__.py",
+        f"{root}{path}" for root in ("", "src/")
+        for path in ("pkg.py", "pkg/__init__.py", "pkg/mod.py", "pkg/mod/__init__.py")
     }
 
 
@@ -97,6 +107,26 @@ def test_a_name_imported_from_a_package_can_live_in_its_init():
 def test_src_layout_resolves_under_the_src_root():
     found = targets("from mylib.core import run\n", "src/mylib/cli.py")
     assert {"src/mylib/core.py", "src/mylib/core/__init__.py"} <= found
+
+
+def test_src_layout_resolves_from_outside_src():
+    # tests/ and scripts/ beside src/ reach the package, as a monorepo
+    # project's tests reach its own src/.
+    assert {"src/pkg/api.py", "src/pkg/api/__init__.py"} <= targets("import pkg.api\n", "tests/test_api.py")
+    assert "src/pkg/core.py" in targets("from pkg import core\n", "scripts/run.py")
+    assert "packages/foo/src/foo/x.py" in targets("import foo.x\n", "packages/foo/tests/test_x.py")
+
+
+def test_a_pyproject_source_root_is_an_import_root_of_the_files_under_it(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[tool.setuptools]\npackage-dir = {"" = "lib"}\n')
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other/pyproject.toml").write_text('[tool.setuptools.packages.find]\nwhere = ["code"]\n')
+    config = ResolverConfig(tmp_path)
+    found = {r.to_name for r in extract_python_file("import pkg.api\n", "tests/t.py", "repo", config).relationships}
+    assert "lib/pkg/api.py" in found
+    assert "other/code/pkg/api.py" not in found  # another project's root
+    found = {r.to_name for r in extract_python_file("import pkg.api\n", "other/t.py", "repo", config).relationships}
+    assert {"lib/pkg/api.py", "other/code/pkg/api.py"} <= found
 
 
 def test_nested_monorepo_root_resolves():
@@ -118,8 +148,10 @@ def test_relative_import_targets(source, expected):
 def test_no_bare_dotted_targets():
     found = targets("import os\nimport a.b\nfrom typing import List\n", "app.py")
     assert found == {
-        "os.py", "os/__init__.py", "a/b.py", "a/b/__init__.py",
-        "typing.py", "typing/__init__.py", "typing/List.py", "typing/List/__init__.py",
+        f"{root}{path}" for root in ("", "src/") for path in (
+            "os.py", "os/__init__.py", "a/b.py", "a/b/__init__.py",
+            "typing.py", "typing/__init__.py", "typing/List.py", "typing/List/__init__.py",
+        )
     }
 
 

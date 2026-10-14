@@ -1,7 +1,8 @@
 """Resolver configuration: the files besides a source file's own text that its
 edges depend on. A TypeScript path alias (`@/lib/text`) means nothing without
 the `tsconfig.json` that declares it, nor a Go import path without `go.mod`,
-nor another Rust crate's name without its `Cargo.toml`.
+nor another Rust crate's name without its `Cargo.toml`, nor a Python package
+in a source root that `pyproject.toml` declares (`lib/`) without that file.
 
 See docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md
 (Resolver configuration). An extractor reads the configuration through one
@@ -45,6 +46,7 @@ LANGUAGE_SUFFIXES: dict[str, tuple[str, ...]] = {
     "go": (".go",),
     "rust": (".rs",),
     "csharp": (".cs",),
+    "python": (".py",),
 }
 
 #: The largest configuration file read; a bigger one is treated as absent.
@@ -59,7 +61,8 @@ _CS_BUILD_FILES = ("Directory.Build.props", "Directory.Build.targets")
 def config_language(name: str) -> str | None:
     """The language a file named `name` configures by its name alone (a
     tsconfig*.json or jsconfig.json, a go.mod or go.work, a Cargo.toml, a
-    *.csproj or Directory.Build.props/.targets), else None. A .cs file
+    *.csproj or Directory.Build.props/.targets, a pyproject.toml), else
+    None. A .cs file
     holding a `global using` is C# configuration by its head, not its name
     (see `touches_config`). A
     config reached only through `extends` can have any name; it is followed
@@ -72,6 +75,8 @@ def config_language(name: str) -> str | None:
         return "rust"
     if name.endswith(".csproj") or name in _CS_BUILD_FILES:
         return "csharp"
+    if name == "pyproject.toml":
+        return "python"
     return None
 
 
@@ -341,14 +346,16 @@ class ResolverConfig:
     fingerprint the batch extracts under found them (`fingerprints`'
     `inputs`), when a Go file first asks (`go_modules`); None, or a None
     answer, walks the repository for them. `rust_files` does the same for
-    the Cargo.toml files (`rust_crates`), and `cs_files` for the C#
+    the Cargo.toml files (`rust_crates`), `cs_files` for the C#
     project files and the .cs files holding a `global using`
-    (`cs_projects`)."""
+    (`cs_projects`), and `python_files` for the pyproject.toml files
+    (`python_roots`)."""
 
     def __init__(
         self, repo_root: Path, go_files: Callable[[], list[str] | None] | None = None,
         rust_files: Callable[[], list[str] | None] | None = None,
         cs_files: Callable[[], list[str] | None] | None = None,
+        python_files: Callable[[], list[str] | None] | None = None,
     ) -> None:
         self.root = Path(repo_root)
         self.read: set[str] = set()
@@ -363,6 +370,8 @@ class ResolverConfig:
         self._rust_packages: set[str] = set()
         self._cs_files = cs_files
         self._cs_projects: dict[str, CsProject] | None = None
+        self._python_files = python_files
+        self._python_roots: dict[str, list[str]] | None = None
 
     # --- files ---------------------------------------------------------------
 
@@ -659,6 +668,72 @@ class ResolverConfig:
         self.rust_crates()
         return self._rust_packages
 
+    # --- pyproject.toml --------------------------------------------------------------
+
+    def _pyproject_roots(self, rel: str) -> list[str]:
+        """The source roots one pyproject.toml declares, repo-relative with a
+        trailing `/` ("" the repository root): setuptools' `package-dir`
+        (`"" = "lib"`, or `pkg = "lib/pkg"`, whose root is `lib`) and
+        `packages.find` `where`, Poetry's `packages` `from`, and the
+        directories of Hatch's wheel `packages`. A malformed file, or a
+        root leaving the repository, declares none."""
+        try:
+            data = tomllib.loads(self._text(rel) or "")
+        except tomllib.TOMLDecodeError:
+            return []
+
+        def table(parent: object, key: str) -> dict:
+            value = parent.get(key) if isinstance(parent, dict) else None
+            return value if isinstance(value, dict) else {}
+
+        tool = table(data, "tool")
+        setuptools = table(tool, "setuptools")
+        dirs: list[str] = []
+        for package, folder in table(setuptools, "package-dir").items():
+            tail = package.replace(".", "/")
+            if not isinstance(folder, str):
+                continue
+            if not package:
+                dirs.append(folder)
+            elif folder == tail or folder.endswith("/" + tail):
+                dirs.append(folder[: -len(tail)])
+        where = table(table(setuptools, "packages"), "find").get("where")
+        dirs += [each for each in where if isinstance(each, str)] if isinstance(where, list) else []
+        poetry = table(tool, "poetry").get("packages")
+        dirs += [
+            each["from"] for each in poetry if isinstance(each, dict) and isinstance(each.get("from"), str)
+        ] if isinstance(poetry, list) else []
+        hatch = table(table(table(table(tool, "hatch"), "build"), "targets"), "wheel").get("packages")
+        dirs += [posixpath.dirname(each.rstrip("/")) for each in hatch if isinstance(each, str)] \
+            if isinstance(hatch, list) else []
+        roots = set()
+        for each in dirs:
+            joined = _join(posixpath.dirname(rel), each)
+            if joined is not None:
+                roots.add(f"{joined}/" if joined else "")
+        return sorted(roots)
+
+    def _python_digest(self, rel: str) -> object:
+        return self._pyproject_roots(rel)
+
+    def python_roots(self, file_path: str) -> tuple[str, ...]:
+        """The source roots the pyproject.toml files at or above the Python
+        file `file_path` (repo-relative) declare, sorted."""
+        if self._python_roots is None:
+            files = self._python_files() if self._python_files is not None else None
+            if files is None:
+                files = sorted(
+                    path.relative_to(self.root).as_posix() for path in indexable_paths(self.root)
+                    if path.name == "pyproject.toml"
+                )
+            self._python_roots = {rel: self._pyproject_roots(rel) for rel in files}
+        found = set()
+        for rel, roots in self._python_roots.items():
+            folder = posixpath.dirname(rel)
+            if not folder or file_path.startswith(folder + "/"):
+                found.update(roots)
+        return tuple(sorted(found))
+
     # --- C# projects ---------------------------------------------------------------
 
     def _cs_digest(self, rel: str) -> object:
@@ -789,11 +864,12 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
     project file's and Directory.Build.props/.targets' `<Using>` items and
     `<ProjectReference>` paths and the `global using`
     directives of each project's .cs files
-    (`_cs_inputs`). A compiler flag, a `require` bump or a dependency or
+    (`_cs_inputs`); for Python each pyproject.toml's source roots
+    (`_pyproject_roots`). A compiler flag, a `require` bump or a dependency or
     version change counts for nothing."""
     root = Path(repo_root)
     config = ResolverConfig(root)
-    found: dict[str, set[str]] = {"ts": set(), "go": set(), "rust": set(), "csharp": set()}
+    found: dict[str, set[str]] = {"ts": set(), "go": set(), "rust": set(), "csharp": set(), "python": set()}
     walked = []
     for path in indexable_paths(root):
         try:
@@ -816,6 +892,8 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
             digest = [[rel, config._go_digest(rel)] for rel in sorted(files)]
         elif lang == "csharp":
             digest = [[rel, config._cs_digest(rel)] for rel in sorted(files)]
+        elif lang == "python":
+            digest = [[rel, config._python_digest(rel)] for rel in sorted(files)]
         else:
             digest = [[rel, config._rust_digest(rel)] for rel in sorted(files)]
         inputs = sorted(config.read | files)

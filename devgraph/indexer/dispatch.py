@@ -139,9 +139,11 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: in shadow tiers (an enclosing namespace's type hides a using's), a
 #: tiered group's every pin recorded in `name_refs`; 15: C# Class and
 #: Function `proj` and C# path-pinned rows limited to the projects their
-#: file's project references (`visible`, a Module's `name_ref_visible`).
+#: file's project references (`visible`, a Module's `name_ref_visible`);
+#: 16: Python absolute imports also tried under each ancestor's `src/` and
+#: the source roots a pyproject.toml declares.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 15
+INDEX_FORMAT = 16
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -703,7 +705,7 @@ def index_paths(
             the graph, as a full scan would leave it out.
         resolver: The resolver configuration's fingerprints to extract
             under (resolver_config.fingerprints: the go.mod, go.work,
-            Cargo.toml and C# configuration files it found); None reads the
+            Cargo.toml, C# and pyproject.toml files it found); None reads the
             ones the graph was built with.
 
     Returns:
@@ -737,7 +739,7 @@ def index_paths(
     go_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     # The resolver configuration (tsconfig path aliases, go.mod module
-    # paths, Cargo crate names, C# projects), read once for the batch under the fingerprint it was taken for
+    # paths, Cargo crate names, C# projects, pyproject source roots), read once for the batch under the fingerprint it was taken for
     # (the graph's, unless the caller has a newer one); see
     # sync_resolver_config for when a change to it re-indexes.
     def config_files(lang: str, names: tuple[str, ...] | None = None) -> list[str] | None:
@@ -750,6 +752,7 @@ def index_paths(
     config = ResolverConfig(
         repo_root, go_files=lambda: config_files("go", ("go.mod", "go.work")),
         rust_files=lambda: config_files("rust", ("Cargo.toml",)), cs_files=lambda: config_files("csharp"),
+        python_files=lambda: config_files("python", ("pyproject.toml",)),
     )
     # Markdown files whose cross-file edges are resolved after every other
     # node in the batch exists (see the docs/mentions passes below).
@@ -1187,7 +1190,7 @@ def _index_single_path(
     routes = _routes(resolved, docs_root, mentions_enabled)
     if "py" in routes:
         content = read_source(resolved)
-        result = extract_python_file(content, rel_path, repo_id)
+        result = extract_python_file(content, rel_path, repo_id, config)
         # Datastore/API extraction reads the same content, so it runs
         # alongside the Python indexer rather than as a separate dispatch
         # branch. Passed the repo-relative path (not bare filename) so
@@ -2215,7 +2218,7 @@ def sync_resolver_config(
 ) -> int:
     """Re-index every graph file of a language whose resolver configuration
     (tsconfig/jsconfig, go.mod/go.work, Cargo.toml, C# projects and
-    `global using`s; see resolver_config.fingerprints)
+    `global using`s, pyproject.toml; see resolver_config.fingerprints)
     changed since the graph was built, and record the new fingerprints.
 
     `touched` are a live batch's changed and deleted paths: nothing is
