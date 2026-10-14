@@ -412,6 +412,20 @@ def reexports(text: str) -> list[list]:
     return sorted(found)
 
 
+def _loose(pins: list[str]) -> list[str]:
+    """`pins` at package confidence: a file pin as a package-confidence
+    directory pin limited to its name (`a/.~?b.rs`, as for a crate whose
+    name two packages share); a recursive prefix is package already."""
+    found = []
+    for pin in pins:
+        if pin.endswith("/") or "/.~" in pin or pin.startswith(".~"):
+            found.append(pin)
+        else:
+            folder, name = posixpath.split(pin)
+            found.append(f"{folder}/.~?{name}" if folder else f".~?{name}")
+    return found
+
+
 class _RustResolver:
     """What one Rust file's names refer to: its crate and module path, its
     `use` bindings, `mod` declarations and inline modules (per module
@@ -629,22 +643,28 @@ class _RustResolver:
                 segs[1:]
         return None
 
-    def reexported(self, module: _Module, name: str, seen: frozenset = frozenset()) -> list[tuple[_Module, str]]:
-        """Where the item `name` that `module` re-exports is defined: (its
-        module, its name there), the re-exports of each followed in turn
-        (`pub use a::X;` in lib.rs and `pub use self::b::X;` in a/mod.rs
-        reach a/b.rs); a glob's module may define it or re-export it in
-        turn, unless the file also re-exports it by name. Empty when
-        `module` re-exports no such name (resolver configuration:
-        `ResolverConfig.rust_reexports`). An inline module of this file
-        re-exports nothing: only a file's top level is read."""
+    def reexported(
+        self, module: _Module, name: str, seen: frozenset = frozenset(), glob: bool = False,
+    ) -> list[tuple[_Module, str, bool]]:
+        """Where the item `name` that `module` re-exports can be defined:
+        (its module, its name there, reached through a glob?). A named
+        re-export's module may define it or re-export it in turn (`pub use
+        a::X;` in lib.rs and `pub use self::b::X;` in a/mod.rs reach a/mod.rs
+        and a/b.rs), and so may a glob's, unless the file also re-exports it
+        by name. A glob's module may not hold it at all, and an item the
+        re-exporting module defines itself hides a glob's (Rust's rule),
+        which this file cannot see: whatever a glob reaches is linked at
+        package confidence (`_loose`), below the re-exporting module's own
+        files. Empty when `module` re-exports no such name (resolver
+        configuration: `ResolverConfig.rust_reexports`). An inline module
+        of this file re-exports nothing: only a file's top level is read."""
         if (module, name) in seen or len(seen) > 8 or (
             not module.crate.cross and module.crate.root == self.crate.root and module.path in self.inline
             and module.path != self.module
         ):
             return []
         seen = seen | {(module, name)}
-        found: list[tuple[_Module, str]] = []
+        found: list[tuple[_Module, str, bool]] = []
         for file in self.files(module):
             entries = self.reexports.get(file, [])
             # A name the file re-exports by name hides its globs' (Rust's rule).
@@ -657,13 +677,21 @@ class _RustResolver:
                     continue
                 target, rest = start
                 if bound == "*":
-                    target = _Module(target.crate, target.path + tuple(rest))
-                    found.append((target, name))
-                    found += self.reexported(target, name, seen)
+                    target, item, reached = _Module(target.crate, target.path + tuple(rest)), name, True
                 elif rest:
                     target, item = _Module(target.crate, target.path + tuple(rest[:-1])), rest[-1]
-                    found += self.reexported(target, item, seen) or [(target, item)]
+                    reached = glob
+                else:
+                    continue
+                found.append((target, item, reached))
+                found += self.reexported(target, item, seen, reached)
         return list(dict.fromkeys(found))
+
+    def _reexport_pins(self, target: _Module, glob: bool) -> list[str]:
+        """The pins of a module a re-export reaches (`reexported`): its
+        own, at package confidence when a glob reached it (`_loose`)."""
+        found = self.pins(target)
+        return _loose(found) if glob else found
 
     def _walk(self, start: tuple[_Module, list[str]]) -> tuple[_Module, list[str]]:
         """Follow lowercase segments as modules down to the last one or a
@@ -677,8 +705,8 @@ class _RustResolver:
         """The pins of `item` reached through `module`: the module's, then
         those of every module that defines it when `module` re-exports it."""
         found = self.pins(module)
-        for target, _name in self.reexported(module, item):
-            found += [pin for pin in self.pins(target) if pin not in found]
+        for target, _name, glob in self.reexported(module, item):
+            found += [pin for pin in self._reexport_pins(target, glob) if pin not in found]
         return found
 
     def path_targets(self, segs: list[str], scope: tuple) -> list[tuple[str, list[str]]] | None:
@@ -706,10 +734,10 @@ class _RustResolver:
         # A function bound or re-exported under another name (`use a::f as
         # g;`, `pub use a::f as g;`) is called by its own.
         found = {rest[-1]: self.pins(module)}
-        for target, item in self.reexported(module, rest[0]):
+        for target, item, glob in self.reexported(module, rest[0]):
             callee = item if len(rest) == 1 else rest[-1]
             found.setdefault(callee, [])
-            found[callee] += [pin for pin in self.pins(target) if pin not in found[callee]]
+            found[callee] += [pin for pin in self._reexport_pins(target, glob) if pin not in found[callee]]
         return list(found.items())
 
     def _glob_pins(self, scope: tuple, item: str) -> list[str] | None:
@@ -800,8 +828,12 @@ class _RustResolver:
             if not rest or rest[0] == "self":
                 modules.append(module)
                 continue
-            # A re-exported item: the module defining it too.
-            modules += [target for target, _item in self.reexported(module, rest[0])]
+            # A re-exported item: the module defining it too (not one that
+            # only re-exports it by name in turn).
+            modules += [
+                target for target, item, _glob in self.reexported(module, rest[0])
+                if not any(bound == item for each in self.files(target) for bound, _segs in self.reexports.get(each, []))
+            ]
             if _uppercase(rest[0]):
                 modules.append(module)
                 continue

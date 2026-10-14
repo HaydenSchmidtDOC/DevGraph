@@ -438,12 +438,15 @@ def test_a_crate_root_reexport_reaches_the_defining_file(tmp_path):
     path = "crates/app/src/main.rs"
     # lib.rs is pinned too (it links nothing: it defines no `new`).
     lib = {"crates/core/src/lib.rs": "resolved"}
-    client = {**lib, "crates/core/src/net/client.rs": "resolved"}
+    # net/mod.rs, which re-exports it in turn, may define it too.
+    client = {**lib, "crates/core/src/net/mod.rs": "resolved", "crates/core/src/net/client.rs": "resolved"}
     assert reached(source, path, "main", "new", FACADE, config) == client
     assert reached(source, path, "main", "fetch", FACADE, config) == client
-    assert reached(source, path, "main", "tidy", FACADE, config) == {**lib, "crates/core/src/util.rs": "resolved"}
+    # A glob's module at package confidence: lib.rs may define tidy itself.
+    assert reached(source, path, "main", "tidy", FACADE, config) == {**lib, "crates/core/src/util.rs": "package"}
     assert reached(source, path, "main", "fetch_all", FACADE, config) == {"crates/core/src/net/client.rs": "resolved"}
     assert reached(source, path, "main", "get_all", FACADE, config) == lib
+    # net/mod.rs only passes Client on: no import of it.
     assert imported(source, path, FACADE, config) == {"crates/core/src/lib.rs", "crates/core/src/net/client.rs"}
     # A local `use .. as` alias is called by the function's own name too.
     aliased = "use shop_core::util::tidy as neat;\n\nfn main() { neat(); }\n"
@@ -456,6 +459,44 @@ def test_a_crate_root_reexport_reaches_the_defining_file(tmp_path):
     assert reached(source, path, "main", "new", FACADE, plain) == lib
 
 
+def test_a_named_reexport_keeps_its_module_beside_that_modules_glob(tmp_path):
+    """lib.rs `pub use util::dig;`, util.rs `pub use crate::deep::*;`: dig
+    may be util.rs's own (resolved) or deep.rs's through the glob (package)."""
+    config = _config(tmp_path, {
+        **WORKSPACE,
+        "crates/core/src/lib.rs": "pub mod util;\npub mod deep;\npub use util::dig;\n",
+        "crates/core/src/util.rs": "pub use crate::deep::*;\npub fn dig() {}\n",
+        "crates/core/src/deep.rs": "pub fn dig() {}\n",
+    })
+    files = ["crates/core/src/lib.rs", "crates/core/src/util.rs", "crates/core/src/deep.rs"]
+    found = reached("fn main() { shop_core::dig(); }\n", "crates/app/src/main.rs", "main", "dig", files, config)
+    assert found == {
+        "crates/core/src/lib.rs": "resolved", "crates/core/src/util.rs": "resolved",
+        "crates/core/src/deep.rs": "package",
+    }
+
+
+def test_a_glob_reexport_ranks_below_the_reexporting_modules_own_items(tmp_path):
+    """lib.rs `pub use util::*;` and its own `fn tidy`: Rust takes lib.rs's,
+    so lib.rs is the resolved pin and util.rs only a package one, which
+    leaves lib.rs out (its `exclude`); adding a function is no configuration
+    change."""
+    config = _config(tmp_path, {
+        **WORKSPACE,
+        "crates/core/src/lib.rs": "pub mod util;\npub use util::*;\npub fn tidy() {}\n",
+        "crates/core/src/util.rs": "pub fn tidy() {}\n",
+    })
+    rows = [r for r in _rows("fn main() { shop_core::tidy(); }\n", "crates/app/src/main.rs", config)
+            if r.to_name == "tidy"]
+    pins = {r.to_file: r.properties["confidence"] for r in rows}
+    assert pins == {
+        "crates/core/src/lib.rs": "resolved", "crates/core/src/.~?util.rs": "package",
+        "crates/core/src/util/.~?mod.rs": "package", "crates/core/src/util/": "package",
+    }
+    (loose,) = [r for r in rows if r.to_file.endswith("util.rs")]
+    assert "crates/core/src/lib.rs" in loose.exclude
+
+
 def test_reexport_cycles_and_external_paths_end(tmp_path):
     config = _config(tmp_path, {
         **WORKSPACE,
@@ -465,7 +506,7 @@ def test_reexport_cycles_and_external_paths_end(tmp_path):
     source = "use shop_core::{X, Y};\n\nfn main() { X::go(); Y::go(); }\n"
     found = reached(source, "crates/app/src/main.rs", "main", "go", ["crates/core/src/lib.rs", "crates/core/src/a.rs"],
                     config)
-    assert found == {"crates/core/src/lib.rs": "resolved"}
+    assert found == {"crates/core/src/lib.rs": "resolved", "crates/core/src/a.rs": "resolved"}
 
 
 def test_reexports_are_rust_configuration(tmp_path):
