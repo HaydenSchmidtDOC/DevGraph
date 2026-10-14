@@ -8,17 +8,20 @@ copies. No UI/console output here — callers format their own messages.
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from devgraph.cli._env import resolve_repo_root, resolve_venv_python
 from devgraph.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 def tray_pid_path() -> Path:
@@ -30,32 +33,61 @@ def tray_pid_path() -> Path:
 AGENT_MODULE = "devgraph.agent.tray"
 
 
-def _read_tray_record() -> Optional[tuple[int, str]]:
-    """The pid and start identity `tray.pid` records, or None when it is missing
-    or unreadable. A file from before the identity line has an empty one."""
+def _read_tray_record() -> Optional[tuple[str, int, str]]:
+    """`tray.pid` as read (text, pid, start identity), or None when it is
+    missing or unreadable. A file from before the identity line, or written
+    when the identity couldn't be read, has an empty one."""
     try:
-        lines = tray_pid_path().read_text(encoding="utf-8").splitlines()
-        return int(lines[0].strip()), (lines[1].strip() if len(lines) > 1 else "")
+        text = tray_pid_path().read_text(encoding="utf-8")
+        lines = text.splitlines()
+        return text, int(lines[0].strip()), (lines[1].strip() if len(lines) > 1 else "")
     except (OSError, ValueError, IndexError):
         return None
 
 
-def record_tray_pid(pid: int) -> None:
-    """Write `tray.pid` for the agent just started: its pid and its start
-    identity (`process_identity`), replaced atomically so no reader sees half."""
+def _write_tray_record(pid: int, identity: str) -> None:
     pid_path = tray_pid_path()
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = pid_path.with_name(f"{pid_path.name}.{os.getpid()}.tmp")
-    tmp.write_text(f"{pid}\n{process_identity(pid) or ''}\n", encoding="utf-8")
+    tmp.write_text(f"{pid}\n{identity}\n", encoding="utf-8")
     os.replace(tmp, pid_path)
+
+
+def record_tray_pid(pid: int) -> None:
+    """Write `tray.pid` for the agent just started: its pid and its start
+    identity (`process_identity`), replaced atomically so no reader sees half.
+    Without an identity the record still names the pid, and readers recognise
+    the agent by its command line instead (`read_tray_pid`)."""
+    identity = process_identity(pid)
+    if identity is None:
+        logger.warning("could not read the start time of the agent (pid %d); recognising it by its command line", pid)
+    _write_tray_record(pid, identity or "")
 
 
 def forget_tray_pid(pid: int) -> None:
     """Remove `tray.pid` when it records `pid` (the agent exiting), leaving a
     newer agent's record alone."""
     record = _read_tray_record()
-    if record is not None and record[0] == pid:
-        tray_pid_path().unlink(missing_ok=True)
+    if record is not None and record[1] == pid:
+        _drop_tray_record(record[0])
+
+
+def _drop_tray_record(text: str) -> None:
+    """Remove `tray.pid` only if it still holds exactly `text`, the record that
+    was checked: a starter may have replaced it with a fresh one meanwhile."""
+    try:
+        if tray_pid_path().read_text(encoding="utf-8") == text:
+            tray_pid_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _heartbeat_is_fresh() -> bool:
+    beat = _heartbeat_at()
+    if beat is None:
+        return False
+    interval = getattr(get_settings(), "health_check_interval_s", 30)
+    return (datetime.now(timezone.utc) - beat).total_seconds() <= 2 * interval
 
 
 def read_tray_pid() -> Optional[int]:
@@ -67,16 +99,28 @@ def read_tray_pid() -> Optional[int]:
     stays behind and its pid can name an unrelated process, which must never
     be adopted or signalled: a record that fails the check is stale and is
     removed.
+
+    A record with no identity (written before identities were recorded, by
+    the agent `devgraph update` is about to stop, or when it couldn't be read)
+    counts when the process's command line runs the agent or, on Windows
+    where the command line isn't read, while the agent's heartbeat is fresh;
+    it is then rewritten with the identity.
     """
     record = _read_tray_record()
     if record is None:
         return None
-    pid, identity = record
-    if identity and process_identity(pid) == identity:
-        command = process_command(pid)
-        if command is None or AGENT_MODULE in command:
+    text, pid, identity = record
+    current = process_identity(pid)
+    command = process_command(pid)
+    if identity:
+        if current == identity and (command is None or AGENT_MODULE in command):
             return pid
-    tray_pid_path().unlink(missing_ok=True)
+    elif current is not None or pid_is_running(pid):
+        if (AGENT_MODULE in command) if command is not None else _heartbeat_is_fresh():
+            if current is not None and _read_tray_record() == record:
+                _write_tray_record(pid, current)
+            return pid
+    _drop_tray_record(text)
     return None
 
 
@@ -126,9 +170,12 @@ def process_command(pid: int) -> Optional[str]:
 
 
 def _ps_field(pid: int, field: str) -> Optional[str]:
+    # lstart is printed in the locale's words and the local time zone: fix
+    # both, so the identity read later matches the one recorded.
+    env = {**os.environ, "LC_ALL": "C", "TZ": "UTC0"}
     try:
         result = subprocess.run(
-            ["ps", "-o", f"{field}=", "-p", str(pid)], capture_output=True, text=True, timeout=5
+            ["ps", "-o", f"{field}=", "-p", str(pid)], capture_output=True, text=True, timeout=5, env=env
         )
     except (OSError, subprocess.SubprocessError):
         return None
