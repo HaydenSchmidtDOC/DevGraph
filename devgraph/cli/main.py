@@ -542,9 +542,8 @@ def tray_stop() -> None:
     """
     pid = lifecycle.read_tray_pid()
     lifecycle.clear_tray_holders()
-    if pid is None or not lifecycle.pid_is_running(pid):
-        console.print("[yellow]Tray app is not running[/yellow] (no live PID on record)")
-        lifecycle.tray_pid_path().unlink(missing_ok=True)
+    if pid is None:
+        console.print("[yellow]Tray app is not running[/yellow] (no live agent on record)")
         return
 
     try:
@@ -561,10 +560,12 @@ def tray_stop() -> None:
 def tray_status() -> None:
     """Report whether the background tray process (per the PID file) is alive.
 
-    Exits non-zero when it is not running.
+    The PID counts only while it is still the agent that file recorded (same
+    start time and command); a stale record is removed. Exits non-zero when
+    it is not running.
     """
     pid = lifecycle.read_tray_pid()
-    if pid is not None and lifecycle.pid_is_running(pid):
+    if pid is not None:
         console.print(f"[green][OK] running[/green] (pid {pid})")
     else:
         console.print("[yellow]not running[/yellow] (start with 'devgraph tray start')")

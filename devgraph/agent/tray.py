@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import webbrowser
 from datetime import datetime, timezone
@@ -495,6 +496,22 @@ class TrayApp:
 
 def main() -> None:
     _configure_logging()
+    try:
+        _run()
+    finally:
+        # However the agent ends (Quit, a failed start, a crash out of
+        # pystray's loop, the headless agent stopping), drop its PID file so
+        # a stale PID can't later name an unrelated process. Only our own
+        # record: a newer agent's is left alone.
+        try:
+            from devgraph.agent import lifecycle
+
+            lifecycle.forget_tray_pid(os.getpid())
+        except Exception:
+            pass
+
+
+def _run() -> None:
     if pystray is None:
         # No display or no tray backend (a server, an SSH session, a desktop
         # without a tray): run the same agent without an icon rather than
@@ -508,18 +525,10 @@ def main() -> None:
         TrayApp().start()
     except Exception:
         # Last line of defense: if the tray fails to start (or crashes out of
-        # pystray's loop before its own cleanup runs), log it and clear the
-        # PID file so a stale PID doesn't make `devgraph tray start`/the MCP
-        # auto-start think a dead tray is still running. Re-raise so the
-        # process exits non-zero and the failure is visible to whoever
-        # launched it.
+        # pystray's loop before its own cleanup runs), log it and re-raise so
+        # the process exits non-zero and the failure is visible to whoever
+        # launched it; `main` clears the PID file.
         logger.critical("tray app failed to start", exc_info=True)
-        try:
-            from devgraph.agent import lifecycle
-
-            lifecycle.tray_pid_path().unlink(missing_ok=True)
-        except Exception:
-            pass
         raise
 
 

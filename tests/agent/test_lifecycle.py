@@ -76,16 +76,30 @@ def test_clear_tray_holders_removes_all(settings):
         assert lifecycle.has_tray_holders() is False
 
 
+def _record_agent(pid):
+    """Write `tray.pid` as the starter does, for a fake agent `pid`."""
+    with patch.object(lifecycle, "process_identity", return_value=f"start-{pid}"):
+        lifecycle.record_tray_pid(pid)
+
+
+def _agent_alive(*pids):
+    """Patch the identity probes so each of `pids` is a live agent."""
+    return patch.multiple(
+        lifecycle,
+        process_identity=lambda pid: f"start-{pid}" if pid in pids else None,
+        process_command=lambda pid: f"python -P -m {lifecycle.AGENT_MODULE}",
+    )
+
+
 def test_stop_tray_if_last_holder_keeps_tray_alive_with_other_holders(settings):
     real_pid = os.getpid()
     other_pid = 333333
     tray_pid = 987654
 
-    lifecycle.tray_pid_path().parent.mkdir(parents=True, exist_ok=True)
-    lifecycle.tray_pid_path().write_text(str(tray_pid), encoding="utf-8")
+    _record_agent(tray_pid)
 
     with patch.object(lifecycle, "pid_is_running", side_effect=lambda pid: pid in (real_pid, other_pid, tray_pid)), \
-         patch.object(lifecycle.os, "kill") as fake_kill:
+         _agent_alive(tray_pid), patch.object(lifecycle.os, "kill") as fake_kill:
         lifecycle.register_tray_holder(holder_pid=real_pid)
         lifecycle.register_tray_holder(holder_pid=other_pid)
 
@@ -100,11 +114,10 @@ def test_stop_tray_if_last_holder_stops_tray_when_last_one_leaves(settings):
     real_pid = os.getpid()
     tray_pid = 987654
 
-    lifecycle.tray_pid_path().parent.mkdir(parents=True, exist_ok=True)
-    lifecycle.tray_pid_path().write_text(str(tray_pid), encoding="utf-8")
+    _record_agent(tray_pid)
 
     with patch.object(lifecycle, "pid_is_running", side_effect=lambda pid: pid in (real_pid, tray_pid)), \
-         patch.object(lifecycle.os, "kill") as fake_kill:
+         _agent_alive(tray_pid), patch.object(lifecycle.os, "kill") as fake_kill:
         lifecycle.register_tray_holder(holder_pid=real_pid)
 
         stopped = lifecycle.stop_tray_if_last_holder(holder_pid=real_pid)

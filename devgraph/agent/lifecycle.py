@@ -26,14 +26,114 @@ def tray_pid_path() -> Path:
     return get_settings().registry_db_path.parent / "tray.pid"
 
 
-def read_tray_pid() -> Optional[int]:
-    pid_path = tray_pid_path()
-    if not pid_path.exists():
-        return None
+#: The module the agent runs as; its command line names it.
+AGENT_MODULE = "devgraph.agent.tray"
+
+
+def _read_tray_record() -> Optional[tuple[int, str]]:
+    """The pid and start identity `tray.pid` records, or None when it is missing
+    or unreadable. A file from before the identity line has an empty one."""
     try:
-        return int(pid_path.read_text(encoding="utf-8").strip())
-    except (ValueError, OSError):
+        lines = tray_pid_path().read_text(encoding="utf-8").splitlines()
+        return int(lines[0].strip()), (lines[1].strip() if len(lines) > 1 else "")
+    except (OSError, ValueError, IndexError):
         return None
+
+
+def record_tray_pid(pid: int) -> None:
+    """Write `tray.pid` for the agent just started: its pid and its start
+    identity (`process_identity`), replaced atomically so no reader sees half."""
+    pid_path = tray_pid_path()
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = pid_path.with_name(f"{pid_path.name}.{os.getpid()}.tmp")
+    tmp.write_text(f"{pid}\n{process_identity(pid) or ''}\n", encoding="utf-8")
+    os.replace(tmp, pid_path)
+
+
+def forget_tray_pid(pid: int) -> None:
+    """Remove `tray.pid` when it records `pid` (the agent exiting), leaving a
+    newer agent's record alone."""
+    record = _read_tray_record()
+    if record is not None and record[0] == pid:
+        tray_pid_path().unlink(missing_ok=True)
+
+
+def read_tray_pid() -> Optional[int]:
+    """The pid of the running agent, or None.
+
+    The pid in `tray.pid` counts only while that process still has the start
+    identity recorded beside it and, where its command line can be read,
+    runs `devgraph.agent.tray`. After a reboot, a crash or a kill the file
+    stays behind and its pid can name an unrelated process, which must never
+    be adopted or signalled: a record that fails the check is stale and is
+    removed.
+    """
+    record = _read_tray_record()
+    if record is None:
+        return None
+    pid, identity = record
+    if identity and process_identity(pid) == identity:
+        command = process_command(pid)
+        if command is None or AGENT_MODULE in command:
+            return pid
+    tray_pid_path().unlink(missing_ok=True)
+    return None
+
+
+def process_identity(pid: int) -> Optional[str]:
+    """A string naming this instance of process `pid` (its start time), or None
+    when it is gone or unreadable. A reused pid gets a different one."""
+    if sys.platform == "win32":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            created, exited, kernel, user = (ctypes.c_ulonglong() for _ in range(4))
+            if not kernel32.GetProcessTimes(
+                handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)
+            ):
+                return None
+            return f"win:{created.value}"
+        finally:
+            kernel32.CloseHandle(handle)
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+            # Field 22, start time in clock ticks since boot; the name (field 2)
+            # can hold spaces and parentheses, so count from its closing one.
+            return f"linux:{boot}:{stat.rsplit(')', 1)[1].split()[19]}"
+        except (OSError, IndexError):
+            return None
+    return _ps_field(pid, "lstart")
+
+
+def process_command(pid: int) -> Optional[str]:
+    """Process `pid`'s command line, or None where it can't be read (Windows,
+    whose check rests on the start identity alone)."""
+    if sys.platform == "win32":
+        return None
+    if sys.platform.startswith("linux"):
+        try:
+            return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            return None
+    return _ps_field(pid, "command")
+
+
+def _ps_field(pid: int, field: str) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["ps", "-o", f"{field}=", "-p", str(pid)], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = result.stdout.strip()
+    return f"ps:{value}" if result.returncode == 0 and value else None
 
 
 def pid_is_running(pid: int) -> bool:
@@ -62,8 +162,7 @@ def pid_is_running(pid: int) -> bool:
 
 
 def is_tray_running() -> bool:
-    pid = read_tray_pid()
-    return pid is not None and pid_is_running(pid)
+    return read_tray_pid() is not None
 
 
 def _holders_dir() -> Path:
@@ -205,8 +304,7 @@ def start_tray_if_not_running() -> Optional[int]:
 
 
 def _start_tray_if_not_running_locked() -> Optional[int]:
-    existing_pid = read_tray_pid()
-    if existing_pid is not None and pid_is_running(existing_pid):
+    if read_tray_pid() is not None:
         return None
 
     python_path = resolve_venv_python()
@@ -234,9 +332,7 @@ def _start_tray_if_not_running_locked() -> Optional[int]:
         close_fds=True,
     )
 
-    pid_path = tray_pid_path()
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(str(process.pid), encoding="utf-8")
+    record_tray_pid(process.pid)
     return process.pid
 
 
@@ -316,8 +412,7 @@ def stop_tray_if_last_holder(holder_pid: Optional[int] = None) -> bool:
         return False
 
     pid = read_tray_pid()
-    if pid is None or not pid_is_running(pid):
-        tray_pid_path().unlink(missing_ok=True)
+    if pid is None:
         return False
 
     try:
