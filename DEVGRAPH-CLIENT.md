@@ -360,7 +360,7 @@ Prefer these over re-reading files when the question is structural:
 | "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled; otherwise an empty result whose `notice` names the enable command) |
 | "Who changed X and when?" | `blame_component` (file path, not name) |
 | "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2; otherwise they return an empty result whose `notice` names the enable command, and never contact GitHub) |
-| "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed; a name defined in several files returns `status: "ambiguous"` with `candidates`, so pass `file` to pick one; each candidate carries `owner`, which `get_source` also takes, to pick one of several same-named functions in one file; a method can be named `A.save` or `A::save`) |
+| "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed; a name defined in several files returns `status: "ambiguous"` with `candidates`, so pass `file` to pick one; each candidate carries `owner`, which `get_source` also takes, to pick one of several same-named functions in one file; a method can be named `A.save` or `A::save`, and a Kotlin companion's member `Repo.create`) |
 
 `compare_branches` and `impact_analysis_for_diff` both take two local refs
 and never fetch. `compare_branches` compares from the merge base, like

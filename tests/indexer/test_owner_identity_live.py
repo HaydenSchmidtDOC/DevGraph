@@ -135,6 +135,29 @@ def test_two_classes_same_named_methods_are_two_nodes_with_their_own_source(engi
     assert again["status"] == "found" and again["node"]["properties"]["start_line"] == 2
 
 
+def test_a_kotlin_companion_member_is_found_by_its_classes_name(engine, repo):
+    """`Repo.create`, as Kotlin calls it, finds the member of Repo's
+    anonymous companion (owner `Repo.Companion`) when Repo has none."""
+    root, registry, repo_id = repo
+    write(root, "src/main/kotlin/data/Repo.kt", """\
+        package data
+
+        class Repo {
+            companion object {
+                fun create(): Repo = Repo()
+            }
+            fun save() {}
+        }
+        """)
+    full_scan(engine, repo_id, root)
+    source = get_source(engine, registry, repo_id, "Repo.create")
+    assert source["owner"] == "Repo.Companion" and "fun create()" in source["source"]
+    assert get_source(engine, registry, repo_id, "create", owner="Repo")["owner"] == "Repo.Companion"
+    assert get_source(engine, registry, repo_id, "Repo.save")["owner"] == "Repo"
+    described = describe_node(engine, repo_id, "Repo.create")
+    assert described["status"] == "found" and described["node"]["owner"] == "Repo.Companion"
+
+
 def test_calls_reach_the_method_of_the_class_they_name(engine, repo):
     root, _registry, repo_id = repo
     write(root, "shop/models.py", MODELS)

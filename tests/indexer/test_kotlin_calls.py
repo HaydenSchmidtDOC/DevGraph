@@ -164,6 +164,41 @@ def test_a_companion_member_is_called_on_its_class():
     assert linked(targets(other, "main", "create"), path)
 
 
+def test_two_anonymous_companions_of_one_file_stay_apart():
+    """A's and B's companions each define their own members: `A.make()`
+    reaches A.Companion only, and a bare call in a class or its companion
+    reaches that class's companion, never the other's."""
+    source = """
+        package p
+
+        class A {
+            companion object {
+                fun make(): A = A()
+                fun only(): Int = make().hashCode()
+            }
+            fun copy() = make()
+        }
+
+        class B {
+            companion object {
+                fun make(): B = B()
+            }
+            fun again() = A.make()
+            fun mine() = make()
+        }
+    """
+    path = "src/main/kotlin/p/AB.kt"
+    result = extract_kotlin_file(textwrap.dedent(source), path, "repo")
+    rows = {(r.from_name, r.to_name, r.to_file, r.to_owner) for r in result.relationships if r.rel_type == "CALLS"}
+    assert ("again", "make", path, "A.Companion") in rows
+    assert ("copy", "make", path, "A.Companion") in rows
+    assert ("only", "make", path, "A.Companion") in rows
+    assert ("mine", "make", path, "B.Companion") in rows
+    assert not any(c == "again" and n == "make" and o == "B.Companion" for c, n, _f, o in rows)
+    owners = {(n.name, n.properties["owner"]) for n in result.nodes if n.label == "Function"}
+    assert {("make", "A.Companion"), ("make", "B.Companion")} <= owners
+
+
 # --- live --------------------------------------------------------------------------
 
 

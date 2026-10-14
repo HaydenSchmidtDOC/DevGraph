@@ -602,6 +602,11 @@ def _owned_lookup_cypher(labels: tuple[str, ...]) -> str:
     )
 
 
+#: The name Kotlin gives an anonymous companion object, whose members a
+#: caller names through the class (`Repo.create`): owner `Repo.Companion`.
+COMPANION = "Companion"
+
+
 def _owner_split(name: str) -> tuple[str, str] | None:
     """`A.save` (`Outer.Inner.run`, `A::save`, `Outer::Inner::run`) as
     (owner, member), the owner dotted: a symbol named with the declarations
@@ -850,7 +855,8 @@ def describe_node(
         name: The node's exact name; a file, folder or docs node may also be
             named by its repo-relative path; a method or nested class by its
             name qualified with its owner (`A.save`), when no node has that
-            exact name
+            exact name (a Kotlin companion's member by its class's,
+            `Repo.create` for `Repo.Companion.create`)
         label: Only nodes of this label
         file: Only nodes whose file, path or source_file is this
         direction: "both", "out" or "in"
@@ -899,6 +905,10 @@ def describe_node(
     if owned is not None and any(each in _OWNED_LABELS for each in labels):
         params = {**params, "owner": owned[0], "member": owned[1]}
         rows, _more = _read(engine, _owned_lookup_cypher(labels), params, _DESCRIBE_MAX_CANDIDATES + 1)
+        if not rows:
+            # `Repo.create` written as Kotlin calls it: the member of Repo's companion.
+            params = {**params, "owner": f"{owned[0]}.{COMPANION}"}
+            rows, _more = _read(engine, _owned_lookup_cypher(labels), params, _DESCRIBE_MAX_CANDIDATES + 1)
 
     if not rows:
         suggestions, _ = _read(
@@ -2398,7 +2408,9 @@ def get_source(
         repo_id: Repository ID
         component_name: Name of the Function or Class to fetch source for; a
             method may be named with the declarations it is in, `A.save`
-            (`Outer.Inner.run`, `A::save`), when no node has that exact name
+            (`Outer.Inner.run`, `A::save`), when no node has that exact name;
+            a Kotlin companion's member by its class's (`Repo.create` for
+            `Repo.Companion.create`, and `owner="Repo"` likewise)
         cross_repo: If True, search across repos (the file is still read from
             whichever repo actually owns the matched node, via its own registry entry)
         file: Repo-relative path of the defining file, to pick one of several
@@ -2441,11 +2453,20 @@ def get_source(
     if owner is not None:
         params["owner"] = owner
         results = lookup("n.name = $component_name AND coalesce(n.owner, '') = $owner AND n.file IS NOT NULL")
+        if not results:
+            # `owner="Repo"` for a member of Repo's Kotlin companion.
+            params["owner"] = f"{owner}.{COMPANION}"
+            results = lookup("n.name = $component_name AND n.owner = $owner AND n.file IS NOT NULL")
+            params["owner"] = owner
     else:
         results = lookup("n.name = $component_name")
     if not results and owner is None and (owned := _owner_split(component_name)) is not None:
         params["owner"], params["member"] = owned
         results = lookup("n.name = $member AND n.owner = $owner")
+        if not results:
+            # `Repo.create` written as Kotlin calls it: the member of Repo's companion.
+            params["owner"] = f"{owned[0]}.{COMPANION}"
+            results = lookup("n.name = $member AND n.owner = $owner")
     empty = {
         "name": component_name, "label": None, "file": None,
         "start_line": None, "end_line": None, "source": None, "docstring_full": None,

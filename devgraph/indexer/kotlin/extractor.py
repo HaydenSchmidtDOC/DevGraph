@@ -443,17 +443,24 @@ class _KotlinResolver:
         self.properties: dict[str, dict[str, str | None]] = {}
         # What each class's members are owned by (_owner_of): one per class of the name in the file.
         self.owners: dict[str, set[str]] = {}
-        # A class's companion object, by name (`Companion` when anonymous).
-        self.companions: dict[str, str] = {}
+        # A class's companion objects (one per class of the name in the
+        # file), each by its members' owner (`Repo.Companion`): the key its
+        # methods, bases and properties are under, so two classes'
+        # anonymous companions stay apart.
+        self.companions: dict[str, set[str]] = {}
 
         def walk(node: Node, owner: str | None, enclosing: tuple[str, ...] = ()) -> None:
             if node.type in _TYPE_DECL_TYPES:
                 name = _type_decl_name(node, source)
                 if name is not None:
-                    if node.type == "companion_object" and owner is not None:
-                        self.companions[owner] = name
-                    owner = name
-                    enclosing = (owner, *enclosing)
+                    enclosing = (name, *enclosing)
+                    if node.type == "companion_object":
+                        key = _owner_of(enclosing)
+                        if owner is not None:
+                            self.companions.setdefault(owner, set()).add(key)
+                        owner = key
+                    else:
+                        owner = name
                     self.owners.setdefault(owner, set()).add(_owner_of(enclosing))
                     self.methods.setdefault(owner, set())
                     self.bases[owner] = _extract_supertype_names(node, source)
@@ -587,16 +594,19 @@ class _KotlinResolver:
             if method in self.methods[cls]:
                 owners = self.owners.get(cls, set())
                 return [owned_pin(self.file_path, next(iter(owners)) if len(owners) == 1 else None)]
-            companion = self.companions.get(cls)
-            if companion is not None and method in self.methods.get(companion, set()):
-                # `Repo.create()`: a member of Repo's companion, owned by `Repo.Companion`.
-                owners = self.owners.get(cls, set())
-                return [owned_pin(self.file_path, f"{next(iter(owners))}.{companion}" if len(owners) == 1 else None)]
+            if pins := self.companion_pins(cls, method):
+                return pins  # `Repo.create()`: a member of Repo's companion
             pins = []
             for base in self.bases.get(cls, []):
                 pins += self.member_pins(base, method, seen | {cls}) or []
             return pins or None
         return self.type_pins(cls)
+
+    def companion_pins(self, cls: str, method: str) -> list[str]:
+        """This file, as the member of each companion of the class `cls`
+        declared here that defines `method` (owned by `Repo.Companion`)."""
+        return [owned_pin(self.file_path, key) for key in sorted(self.companions.get(cls, ()))
+                if method in self.methods.get(key, ())]
 
     # --- calls ---------------------------------------------------------------
 
@@ -610,6 +620,14 @@ class _KotlinResolver:
             name = _text(callee, self.source)
             if name in scope:
                 return None  # a function value
+            if classes:
+                # Inside class C or its companion: C's own member, else its
+                # companion's (`create()` in Repo is `Repo.Companion.create`).
+                outer = classes[1] if len(classes) > 1 and any(
+                    key.rsplit(".", 1)[-1] == classes[0] for key in self.companions.get(classes[1], ())
+                ) else classes[0]
+                if name not in self.methods.get(outer, ()) and (pins := self.companion_pins(outer, name)):
+                    return name, pins, False
             if name in self.functions:
                 return name, [self.file_path], False
             if name in self.imported_functions:
