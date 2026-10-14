@@ -15,7 +15,28 @@ Source extraction is selected per file, so one repository can mix **Python, Java
 
 ## Quickstart
 
-The interactive installer currently targets Windows PowerShell and requires Python 3.13 or newer, Git, and [Podman](https://podman.io/):
+### Linux
+
+Requires Python 3.13 or newer, Git, [uv](https://docs.astral.sh/uv/), and Podman or Docker:
+
+```bash
+git clone https://github.com/HaydenSchmidtDOC/DevGraph.git && cd DevGraph
+uv sync --extra dev
+podman run -d --name devgraph-neo4j --restart=always \
+  -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 \
+  -e NEO4J_AUTH=neo4j/devgraph-local-dev \
+  -v devgraph_neo4j_data:/data -v devgraph_neo4j_logs:/logs \
+  docker.io/library/neo4j:5.26-community
+uv run devgraph doctor
+uv run devgraph register ~/code/my-repo --full
+uv run devgraph mcp add
+```
+
+`docker run` takes the same arguments. `devgraph mcp add` registers DevGraph with Claude Code for every project (user scope); `devgraph client-config` prints the VS Code entry. Activate the environment (`source .venv/bin/activate`) to drop the `uv run` prefix. Without a desktop tray, the agent runs headless (see `devgraph tray start` below).
+
+### Windows
+
+The interactive installer targets Windows PowerShell and requires Python 3.13 or newer, Git, and [Podman](https://podman.io/):
 
 ```powershell
 irm https://raw.githubusercontent.com/HaydenSchmidtDOC/DevGraph/master/scripts/install.ps1 | iex
@@ -46,37 +67,59 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 | Task | Command |
 |---|---|
 | Register and initially index a repository | `devgraph register [path] [--full]` |
-| Refresh source and reconcile git history | `devgraph rescan <repo_id> [--full]` |
+| Refresh source and reconcile git history | `devgraph rescan <repo_id> [--full] [--force]` |
 | Inspect registered repositories | `devgraph list`, `devgraph info <repo_id>`, `devgraph stats [repo_id]` |
 | Check installation and graph health | `devgraph status`, `devgraph doctor`, `devgraph self-test [repo_id]` |
+| Unregister a repository and delete its graph | `devgraph remove <repo_id> [--keep-graph]` |
 | Recompute communities, key nodes and bridges | `devgraph insights <repo_id>` |
 | Open the dashboard | `devgraph dashboard` |
-| Configure an MCP client | `devgraph client-config`, `devgraph mcp add`, `devgraph mcp doctor` |
+| Start, check or stop the background agent | `devgraph tray start`, `devgraph tray status`, `devgraph tray stop` |
+| Configure an MCP client | `devgraph client-config`, `devgraph mcp add` (Claude Code, user scope: every project), `devgraph mcp doctor` |
 | View settings, project schema, or tray logs | `devgraph config`, `devgraph config show / validate / eject / enable / disable`, `devgraph config schema list / add / edit / delete / reset`, `devgraph config tools list / add / edit / delete / reset`, `devgraph logs` |
 | Export a repository graph | `devgraph export <repo_id> --format json|cypher|dot` |
 | Update DevGraph | `devgraph update` |
 
-`devgraph update` is the normal update path. It fast-forwards the configured branch, reinstalls DevGraph, runs `doctor`, and restarts the tray app if it was running. Commit or stash local changes first; `--force` only suppresses the dirty-tree guard. The older `scripts/update.ps1` entry point remains available for existing Windows installations.
+`devgraph status` exits non-zero when Neo4j is unreachable or the registry cannot be read, and `devgraph register` when its initial scan fails (the repository stays registered; `devgraph rescan <repo_id>` indexes it once the cause is fixed). A refused Neo4j password names the settings file to fix (`~/.devgraph/.env`, or the folder holding `DEVGRAPH_REGISTRY_DB_PATH`; an environment variable works too). `devgraph remove` needs Neo4j to delete the graph data; with Neo4j down it stops and keeps the repository registered, and `--keep-graph` unregisters it without touching the graph (`devgraph prune` deletes that data once Neo4j is up). A DevGraph agent watching the repository stops watching it once it sees the removal, waits for any batch still running and deletes what that batch wrote after `remove` had deleted the graph. `devgraph doctor` warns about graph data of repositories no longer registered ("Orphaned graph data"), nodes left without their `Repository` node included, and `devgraph prune` deletes it.
+
+`devgraph doctor` treats Podman as informational once Neo4j is reachable (Docker or a native Neo4j is fine), and its schema-constraint check reads only registered repositories, not data a removed repository left in the graph.
+
+`devgraph tray start` reports OK only once the agent has written its first heartbeat, and exits non-zero if it exits during startup or sends none within 30 seconds (`devgraph logs` shows why). `devgraph tray status` exits non-zero when the agent is not running. With no display or no system tray (a Linux server, an SSH session, a desktop without a tray), the same process runs the headless agent instead and `tray start` says so: no icon, but the same watcher, indexer and dashboard, stopped with `devgraph tray stop`. MCP auto-start falls back the same way.
+
+`devgraph update` is the normal update path. It fast-forwards the configured branch, reinstalls DevGraph (`uv sync --extra dev` in an environment uv created, else `pip install -e .[dev]`), runs `doctor`, and restarts the tray app if it was running, even when the reinstall or `doctor` fails. An untracked `uv.lock` (which `uv sync` writes) does not count as a local change. Commit or stash local changes first; `--force` only suppresses the dirty-tree guard. The older `scripts/update.ps1` entry point remains available for existing Windows installations.
 
 ## Operating model
 
 - **Explicit registration.** DevGraph scans and watches only paths added with `devgraph register` or `devgraph add`.
 - **Local-first.** Neo4j, the registry, source reads, and git history stay on the local machine. Telemetry, cloud sync, cross-repository queries, and raw Cypher are off by default.
-- **Repository isolation.** Every graph object carries a `repo_id`. MCP queries stay within that repository unless the caller explicitly opts into a cross-repository query.
+- **Repository isolation.** Every graph object carries a `repo_id`, and each MCP call answers for one repository: the session's, or any registered repository named by an explicit `repo_id` (that is always allowed). `DEVGRAPH_ALLOW_CROSS_REPO` gates only multi-repository aggregation: `cross_repo=true` on a built-in tool is refused with an error unless it is set to `true` for the MCP server, and when it is on, the aggregated answer covers active registered repositories only, never data left in the graph by a repository that was removed. The setting governs MCP tools only: the dashboard is the local user's own view (like its Cypher console), and its "All Repos" scope always shows every registered repository, with the same registered-only bound.
 - **Session repository.** Each MCP session has a repository: `DEVGRAPH_MCP_REPO` (a repo id, or an absolute path inside a registered repository), else the registered repository containing the server's working directory. Built-in MCP tools use it when `repo_id` is omitted, and a dict response then says which repository answered. With no session repository, a call without `repo_id` fails and lists the active registered repositories; DevGraph never picks one for you. A repository registered later needs an MCP server restart. One limitation: `devgraph client-config` starts VS Code's server in the DevGraph checkout, so if that checkout is registered, an unpinned VS Code session defaults to it. Set `DEVGRAPH_MCP_REPO` to avoid that.
 - **Live updates.** Connecting an MCP client starts the tray app when needed. The watcher reindexes file and git-state changes; manual rescans remain safe and idempotent. See [Keeping up with changes](#keeping-up-with-changes).
-- **Purpose-built queries.** MCP clients should use the registered tools and the live `devgraph://tool-catalog` resource rather than relying on a hand-maintained tool count.
+- **Purpose-built queries.** MCP clients should use the registered tools and the live `devgraph://tool-catalog` resource rather than relying on a hand-maintained tool count. Built-in tools run their queries read-only with a 30-second timeout; a query that runs longer comes back as `query timed out after 30 s; narrow the request`. `impact_analysis` and `impact_analysis_for_diff` follow transitive dependents at most four hops. `search_component` and the dashboard's search box rank exact name matches first, then name prefixes, then other substrings; each result names its file, and `search_component`'s `count` is the true number of matches unless it says `count_is_lower_bound`. A mistake is an error rather than an empty answer: an unregistered `repo_id`, an unknown component, service, endpoint or design decision (with similar names suggested), or a count argument below its minimum. `trace_request_flow` takes `GET /users/<id>` or a bare `/users/<id>` (every method).
+
+### Which files are indexed
+
+A scan walks the repository's folder and skips:
+
+- **Ignored folders**: `.git`, virtual environments (`.venv`, `venv`), build output (`build`, `dist`, `target`, `bin`, `obj`), `node_modules`, `vendor`, caches and agent worktrees.
+- **Anything a `.gitignore` ignores**: the one at the root and every nested one, with `!` negations, as git applies them (a file inside an ignored folder can't be re-included). This applies to any registered folder, git checkout or not. `.git/info/exclude` and your global excludes file are not read, so two clones of a repository index the same files. DevGraph follows the `.gitignore` files only, not git's index: a file committed with `git add -f` but matching a `.gitignore` pattern is still left out. A symlink is judged by its own path, as git judges it. On Windows and macOS patterns match regardless of case, like git's default there. Editing a `.gitignore` while the agent runs updates the graph straight away: files it now ignores are removed and files it no longer ignores are added.
+- **Files too big or not worth reading as source**: larger than 1 MiB (set `DEVGRAPH_MAX_FILE_BYTES` to change the limit), binary (a NUL byte in the first 8 KiB), or minified or generated (a line longer than 10,000 bytes, or lines averaging more than 200 bytes in a file of 4 KiB or more; Markdown and other prose is never judged by line length). These are not extracted, and a file that grows past the limit leaves the graph until it shrinks back. After you change the limit, files it now skips or lets through are updated at the next start of the agent or the next `devgraph rescan`. A schema-declared `filesystem` node type still lists them as files.
+
+`devgraph add` and `devgraph rescan` list the files they skipped and why, for example `static/js/app.min.js (too large)`.
+
+Source that isn't UTF-8 is still read correctly: a Python file's `# -*- coding: latin-1 -*-` line is honoured, and any other file that isn't valid UTF-8 is read as Windows-1252 (or Latin-1), so identifiers such as `café` survive. A file that can't be read at all is skipped with a one-line warning.
 
 ### Keeping up with changes
 
 While the DevGraph agent (the tray app, or the headless agent in a container) is running, it keeps each watched repository's graph the same as a fresh scan would make it:
 
-- **Edits, new files and deletes** are picked up about half a second after you save.
+- **Edits, new files and deletes** are picked up about half a second after you save (`DEVGRAPH_WATCH_DEBOUNCE_MS`, default 500). A file written continuously, more often than that (a log, a build writing output), is still picked up at least every 5 seconds while the writes go on (`DEVGRAPH_WATCH_MAX_WAIT_MS`, default 5000). The check after a git operation has no such cap: it waits for the operation's changes to stop, so a long rebase isn't checked half-done.
 - **Renames and moves** are picked up too: a renamed file, a folder moved somewhere else in the repository, a folder renamed at the top of the repository, and a folder deleted or sent to the trash. Nothing is left behind under the old name. A new top-level folder, or one deleted and created again, is watched straight away.
-- **Changes made while DevGraph wasn't running** (a reboot, editing with the tray paused, a `git pull` while it was off) are found when it starts or resumes. It checks every file against the time of its last update and re-reads only what changed, which takes well under a second when nothing did. A repository that has never been scanned is not scanned here; the log says to run `devgraph rescan <repo_id>`.
+- **Changes made while DevGraph wasn't running** (a reboot, editing with the tray paused, a `git pull` while it was off) are found when it starts or resumes. It checks every file against the time of its last update and re-reads only what changed, which takes well under a second when nothing did. A repository that has never been scanned is not scanned here: its first scan belongs to `devgraph add` (or `devgraph rescan`), which may still be running. If that scan never finished, the log says to run `devgraph rescan <repo_id>`.
 - **After a git operation** (checkout, pull, merge, reset, stash), DevGraph checks the repository again a couple of seconds later, in case the operating system dropped some of the change notifications for a large checkout.
 - **Git history** (commits, the files each one changed, and each module's recency) is brought up to date right after each of those checks: after a git operation, on start or resume, and on a retry. So a commit made while DevGraph was off, or just before it was stopped or paused, is picked up when it starts again. A repository registered without `--full` gets its history the first time the agent checks it, and live updates wait until that read finishes: about a minute and a half for 400 commits, several minutes for thousands. The log says so when it starts (`Reading the git history of <repo> for the first time (N commits); live updates resume when it finishes`); registering with `--full` reads it up front instead.
 - **If an update fails** (for example Neo4j is down), DevGraph logs `Couldn't update <repo>; DevGraph will retry, or run "devgraph rescan <repo>"`, tries again 30 seconds later, and again as soon as Neo4j comes back. While it keeps failing, the warning is repeated every few minutes rather than on every attempt.
+
+- **If a repository's folder is missing or unreadable** (an unmounted drive, a moved folder), nothing in the graph is changed: `devgraph rescan` exits non-zero with `repository folder not found: <path>; nothing was changed`, the agent logs one warning and skips that repository until it restarts, and the dashboard's repository list and `devgraph doctor` mark it as path missing. A folder that exists but has no indexable files while the graph still has files for it (what a mount point with nothing mounted looks like) is refused the same way; if the files really are gone, `devgraph rescan <repo_id> --force` prunes them. When the folder does have files but its `.gitignore` files ignore every one of them, the message says `every file is ignored by .gitignore` instead, and `--force` clears the graph.
 
 While a check like this runs, the tray icon's tooltip reads `DevGraph (catching up)` and the dashboard's Entities card shows `Catching up…` instead of `Live`. The log says what it found, for example `Caught up on myrepo: 12 files updated, 3 removed (4.1 s)`. A dashboard opened in the middle of a check doesn't show it.
 
@@ -84,13 +127,23 @@ What it can still miss. `devgraph rescan <repo_id>` fixes each of these:
 
 - **A changed file whose change notification was lost outside a git operation**, for example during a very large copy or a build writing thousands of files into a watched folder. New and deleted files are still found on the next start; a changed existing file is not, because its timestamp is older than DevGraph's last update.
 - **A file whose timestamps say it hasn't changed.** The checks trust file timestamps, so they miss a file that changed while DevGraph was off if all its timestamps are older than DevGraph's last update (with a 5-second allowance). That happens when the computer's clock was moved backwards, on a network share whose server clock is wrong, or on Windows when a tool overwrites a file and then puts its old modified time back.
-- **A folder DevGraph couldn't start watching.** If the operating system refuses to watch a new top-level folder (for example it ran out of watches), DevGraph tries again a few times over about 8 seconds, then logs a warning. That folder is not watched until another top-level folder changes or DevGraph restarts; the check on restart picks up what changed in it.
-- **Links between files that are updated separately**, described under [Current limitations](#current-limitations) below.
+- **A folder DevGraph couldn't start watching.** On Windows, if the operating system refuses to watch a new top-level folder (for example it ran out of watches), DevGraph tries again a few times over about 8 seconds, then logs a warning. That folder is not watched until another top-level folder changes or DevGraph restarts; the check on restart picks up what changed in it. On Linux a folder that can't be watched when it is created or moved in (an inotify limit reached) stays unwatched until DevGraph restarts: DevGraph catches up on what it holds then, and `devgraph status` reports the repository as below.
+- **A repository DevGraph couldn't start watching.** On Linux each repository uses one inotify instance (its folders and its git state) whatever its size, and no watches on folders it never indexes (`.venv`, `node_modules`, build output, anything a `.gitignore` ignores). When the system's inotify limits are still reached (`fs.inotify.max_user_instances`, shared with every other program that watches files, or `fs.inotify.max_user_watches`), that repository isn't watched: `devgraph status` and `devgraph doctor` say `running, but not watching 1 repository` with the reason (`watching unavailable: inotify limit reached ...`), and the dashboard's repository list marks it `(not watched)`. Raise the limit or close other watchers, then restart the agent.
+- **Links that should change when a file is deleted**, described under [Current limitations](#current-limitations) below.
 - **`devgraph add` or `devgraph rescan` running at the same time as the agent's own update** of the same repository. They run in a separate process, so the two aren't kept apart; run the rescan again if you edited files while it was running.
 - **macOS** is not a supported platform for the agent.
 - **Linked worktrees and submodules** (where `.git` is a file rather than a folder) get no check after a git operation and no git-history update, because DevGraph doesn't watch their git state. Edits are still picked up, and the check on start or resume still runs.
 
 A plain `devgraph rescan` doesn't fix everything. A file deleted and then restored (`rm a.py; git checkout -- a.py`) comes back without its git recency and without the `MODIFIES` edges from earlier commits; only `devgraph rescan <repo_id> --full`, which re-reads all of git history, brings them back. Some extractor gaps survive any rescan; see [Current limitations](#current-limitations).
+
+### More accurate links
+
+Graphs built by this version are more accurate in four ways:
+
+- Links no longer cross between functions that share a name. A `main` in one file no longer gets the calls made by a `main` in another.
+- Removed code goes away. A call, base class or import you delete from a file loses its edge on the next save, and so does a service removed from a compose file and a mention removed from a Markdown file.
+- A file you delete and restore (or a file added after the files that import it) gets its links back, without a rescan.
+- Existing graphs upgrade on their own. While the agent runs, it rescans each watched repository once, in the background. Until that finishes, `devgraph status` shows the repository as `rescan pending`. A repository the agent doesn't watch needs `devgraph rescan <repo_id>`.
 
 ## Project schema
 
@@ -326,11 +379,13 @@ Exported environment variables override both files.
 
 ## Dashboard
 
-The tray app serves the dashboard at `http://127.0.0.1:8765`. It shows registered repositories, graph and git information, query telemetry, an interactive graph canvas, query-driven highlighting, and saved per-repository layouts. The repository picker can register a local path and run its initial scan; if indexing fails, the registration remains available for retry. Server-Sent Events refresh the view after indexing changes.
+The tray app serves the dashboard at `http://127.0.0.1:8765`. It shows registered repositories, graph and git information, query telemetry, an interactive graph canvas, query-driven highlighting, and saved per-repository layouts. The repository picker lists exactly the registered repositories (with nothing registered it offers only All Repos and the graph says how to register one), and when the selected repository is removed it switches to the first remaining one, or to All Repos. It can register a local path and run its initial scan; if indexing fails, the registration remains available for retry. Server-Sent Events refresh the view after indexing changes.
 
-The Communities card shows each repository's subsystems (Louvain communities over dependency and containment edges), with modularity and the bridges between them; the god-node list ranks by PageRank over dependency edges once these are computed (CALLS edges are resolved by name, so widely used generic method names such as get or close can rank high). A canvas toggle colors nodes by community. DevGraph computes all of this itself — no Neo4j plugin — and the agent refreshes it after indexing; `devgraph insights <repo_id>` recomputes on demand.
+The Communities card shows each repository's subsystems (Louvain communities over dependency and containment edges), with modularity and the bridges between them; the god-node list ranks by PageRank over dependency edges once these are computed (CALLS edges that match by name only or at package confidence, and IMPORTS edges at package confidence, are left out). A canvas toggle colors nodes by community. DevGraph computes all of this itself — no Neo4j plugin — and the agent refreshes it after indexing; `devgraph insights <repo_id>` recomputes on demand.
 
-The service binds to loopback and has no authentication because it is intended as a single-user local tool. The browser never receives Neo4j credentials; graph queries run through the FastAPI backend. Use `DEVGRAPH_DASHBOARD_ENABLED=false` to disable it or `DEVGRAPH_DASHBOARD_PORT` to choose another port.
+The page loads no script from the network: Cytoscape.js is vendored in the package (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)), so the dashboard works offline.
+
+The service binds to loopback and has no authentication because it is intended as a single-user local tool. The browser never receives Neo4j credentials; graph queries run through the FastAPI backend. Use `DEVGRAPH_DASHBOARD_ENABLED=false` to disable it or `DEVGRAPH_DASHBOARD_PORT` to choose another port. If another program already holds the port, the agent keeps running without the dashboard and says so: a warning in its log naming the port, `dashboard port <port> in use` in the tray tooltip, and a line under `Dashboard` in `devgraph status`. `devgraph dashboard` checks the port answers as DevGraph (`GET /api/health`) and will not open a browser on another program's page.
 
 Because there is no authentication, the dashboard answers only requests addressed to the local machine: the `Host` header must name `127.0.0.1`, `localhost`, `[::1]`, or the configured `DEVGRAPH_DASHBOARD_HOST`; anything else gets `403 host not allowed`. This stops a web page from reaching the dashboard through DNS rebinding (re-pointing its own domain at 127.0.0.1). A wildcard bind (`0.0.0.0` or `::`) does not widen this list; to reach the dashboard by a LAN address, set `DEVGRAPH_DASHBOARD_HOST` to that address rather than a wildcard. Registering a repository, saving a layout, running console Cypher, and Config page writes additionally refuse cross-origin browser requests. The tray menu and `devgraph dashboard` link a wildcard bind to its loopback address (`http://127.0.0.1:<port>`, or `http://[::1]:<port>` for `::`, which binds IPv6-only).
 
@@ -379,7 +434,7 @@ The Database & memory card samples Neo4j every 15 seconds and keeps the last hou
 - `devgraph pr-source` and `devgraph issue-source` control the explicit opt-ins for external PR and issue ingestion.
 - `devgraph index-history` initializes or manually refreshes local commit history; after initialization, the watcher reconciles history automatically when git state changes.
 
-External PR and issue ingestion remains opt-in and requires a configured source. Enabling its registry flag does not itself contact a remote service.
+External PR and issue ingestion remains opt-in and requires a configured source. Enabling its registry flag does not itself contact a remote service. While a repository's source is off, `find_related_prs` and `issue_history_for` return an empty result with a `notice` naming the command that enables it; they never fall back to `gh` or any other network call.
 
 ## Containerized deployment
 
@@ -394,12 +449,14 @@ Bind-mount each allowed repository under `/repos` before registering it. The loc
 
 ## Current limitations
 
-- Call edges are name-based rather than fully type-resolved, so common method names can over-link.
-- Import resolution is a best-effort same-repository guess. C++ extraction is intentionally structural because reliable include resolution needs build-system context.
-- A full scan resolves code, docs-note, API, and mention edges in one pass regardless of file order. Live (watcher) indexing of a file that adds new symbols or notes also re-indexes the files that already referred to them by name — docs notes that supersede/link them, route files whose handler stubs they implement, and same-directory Java/Kotlin subtypes — and links Markdown that mentions them (at most 25 files per save; the rest link on the next rescan). Other referrers indexed before their target existed (an import or a supertype in another directory naming a newly added file, for example) stay unlinked until they change or `devgraph rescan` runs, as do mentions that should change when a duplicate name is deleted; with `mentions_ambiguous_mode="skip"`, adding a second node with an already-mentioned name leaves the existing `MENTIONS` edges in place until a rescan. A compose service's `USES` edge to a named volume declared in a different compose file, and git-history `MODIFIES` / PR `RESOLVES` edges (written outside the file indexer), are not covered by these guarantees.
-- Two stale results survive even a full rescan: a service removed from a compose file stays in the graph, and so does a `MENTIONS` edge whose mention was removed from a Markdown file. Removing the repository (`devgraph remove`) and registering it again clears them.
+- Call edges in every language are resolved through scope, imports (for JS/TS, tsconfig/jsconfig path aliases; for Go, go.mod module paths; for Rust, Cargo.toml crate names) and simple types, and carry a `confidence` (`resolved`, `package`, or `name` for a method on a value nothing types, which still links by name). A tsconfig, go.mod or Cargo.toml change re-indexes the files it affects. C# calls into another file resolve at `package` confidence: a C# file's text names namespaces, not files, so two classes of one name in different namespaces both get the edge, and a class in a file not named after it is not found.
+- Import resolution is a best-effort same-repository guess (for Python, every candidate file under the importer's ancestor directories, so flat, `src/` and nested layouts resolve without configuration). C++ extraction is intentionally structural because reliable include resolution needs build-system context.
+- A full scan resolves code, docs-note, API, and mention edges in one pass regardless of file order. Live (watcher) indexing of a file that adds new symbols or notes also links the files that already referred to them by name, in any directory: imports, supertypes, calls, docs notes that supersede/link them, and route files whose handlers they implement. Markdown that mentions them is linked too, at most 25 files per save; the rest link on the next rescan.
+- Deleting a file doesn't relink. Mentions that should change when a duplicate name is deleted wait for `devgraph rescan`. With `mentions_ambiguous_mode="skip"`, adding a second node with an already-mentioned name leaves the existing `MENTIONS` edges in place until the Markdown file changes or a rescan runs.
+- Other known gaps: same-named functions in one file (for example two methods called `run` in different classes) still share one node; Go and Rust methods defined in a different file from their type, and C++ methods defined outside their class, get no `CONTAINS` edge; a C#/TypeScript partial class gets `EXTENDS` only on the file that declares the base; a docs note whose `id` changes in place leaves a node under the old id until the repository is removed and registered again. A compose service's `USES` edge to a named volume declared in a different compose file, and git-history `MODIFIES` / PR `RESOLVES` edges (written outside the file indexer), are not covered by these guarantees.
 - The agent reads a repository's git history in one go the first time it watches it (unless it was registered with `--full`), and live updates for that repository wait until it finishes: minutes for a history of thousands of commits.
-- `compare_branches` is registered but remains a stub; use `impact_analysis_for_diff` for local-ref impact analysis.
+- `compare_branches` detects renames only when the content is identical (a renamed and edited file shows as removed plus added), and its `impacted_callers` come from the last index of the working tree, not from either ref.
+- `impact_analysis_for_diff` compares the same way and traces dependents of the functions and classes changed or removed (added ones are listed apart: nothing depends on them yet). Its dependents also come from the last index of the working tree, so a symbol the index has never seen has none.
 - Enterprise federation and semantic search are design directions rather than shipped capabilities.
 
 ## Contributing

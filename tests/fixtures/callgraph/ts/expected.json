@@ -1,0 +1,446 @@
+{
+  "language": "ts",
+  "description": "Vite + React + TypeScript app: api/ barrel, @/* alias via tsconfig references, .js-extension imports, ctor parameter properties, classic script files.",
+  "calls": [
+    {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "loadSession",
+      "callee_file": "src/lib/session.ts",
+      "note": "js-extension-alias"
+    },
+    {
+      "caller": "loadSession",
+      "caller_file": "src/lib/session.ts",
+      "callee": "getItem",
+      "callee_file": "src/lib/storage.ts"
+    },
+    {
+      "caller": "loadSession",
+      "caller_file": "src/lib/session.ts",
+      "callee": "parseSession",
+      "callee_file": "src/lib/session.ts"
+    },
+    {
+      "caller": "save",
+      "caller_file": "src/lib/helpers.js",
+      "callee": "setItem",
+      "callee_file": "src/lib/storage.ts",
+      "note": "js-imports-ts"
+    },
+    {
+      "caller": "save",
+      "caller_file": "src/api/users.ts",
+      "callee": "put",
+      "callee_file": "src/api/http.ts",
+      "note": "namespace-import"
+    },
+    {
+      "caller": "fetchUser",
+      "caller_file": "src/api/users.ts",
+      "callee": "get",
+      "callee_file": "src/api/http.ts",
+      "note": "namespace-import"
+    },
+    {
+      "caller": "fetchPosts",
+      "caller_file": "src/api/posts.ts",
+      "callee": "get",
+      "callee_file": "src/api/http.ts",
+      "note": "js-extension-relative"
+    },
+    {
+      "caller": "get",
+      "caller_file": "src/api/http.ts",
+      "callee": "check",
+      "callee_file": "src/api/http.ts"
+    },
+    {
+      "caller": "put",
+      "caller_file": "src/api/http.ts",
+      "callee": "check",
+      "callee_file": "src/api/http.ts"
+    },
+    {
+      "caller": "persistProfile",
+      "caller_file": "src/pages/Profile.tsx",
+      "callee": "save",
+      "callee_file": "src/api/users.ts",
+      "not_files": [
+        "src/lib/helpers.js",
+        "src/services/UserRepo.ts"
+      ],
+      "note": "profile-save"
+    },
+    {
+      "caller": "loadPosts",
+      "caller_file": "src/pages/Profile.tsx",
+      "callee": "fetchPosts",
+      "callee_file": "src/api/posts.ts",
+      "not_files": [
+        "src/api/index.ts"
+      ],
+      "note": "barrel"
+    },
+    {
+      "caller": "Profile",
+      "caller_file": "src/pages/Profile.tsx",
+      "callee": "capitalize",
+      "callee_file": "src/lib/text.ts",
+      "note": "alias-paths"
+    },
+    {
+      "caller": "loadSettings",
+      "caller_file": "src/pages/Settings.tsx",
+      "callee": "fetchUser",
+      "callee_file": "src/api/users.ts",
+      "not_files": [
+        "src/api/index.ts"
+      ],
+      "note": "barrel-namespace"
+    },
+    {
+      "caller": "keepDraft",
+      "caller_file": "src/pages/Settings.tsx",
+      "callee": "save",
+      "callee_file": "src/lib/helpers.js",
+      "not_files": [
+        "src/api/users.ts",
+        "src/services/UserRepo.ts"
+      ],
+      "note": "renamed-import"
+    },
+    {
+      "caller": "renameUser",
+      "caller_file": "src/pages/Settings.tsx",
+      "callee": "rename",
+      "callee_file": "src/services/UserService.ts",
+      "note": "new-typed-local"
+    },
+    {
+      "caller": "rename",
+      "caller_file": "src/services/UserService.ts",
+      "callee": "find",
+      "callee_file": "src/services/UserRepo.ts",
+      "note": "ctor-param-properties"
+    },
+    {
+      "caller": "rename",
+      "caller_file": "src/services/UserService.ts",
+      "callee": "info",
+      "callee_file": "src/lib/logger.ts",
+      "note": "ctor-param-properties"
+    },
+    {
+      "caller": "rename",
+      "caller_file": "src/services/UserService.ts",
+      "callee": "save",
+      "callee_file": "src/services/UserRepo.ts",
+      "not_files": [
+        "src/api/users.ts",
+        "src/lib/helpers.js"
+      ],
+      "note": "ctor-param-properties"
+    },
+    {
+      "caller": "count",
+      "caller_file": "src/services/UserService.ts",
+      "callee": "all",
+      "callee_file": "src/services/UserRepo.ts",
+      "note": "ctor-param-properties"
+    },
+    {
+      "caller": "label",
+      "caller_file": "src/services/UserService.ts",
+      "callee": "describe",
+      "callee_file": "src/services/UserService.ts"
+    },
+    {
+      "caller": "label",
+      "caller_file": "src/services/UserService.ts",
+      "callee": "find",
+      "callee_file": "src/services/UserRepo.ts",
+      "note": "ctor-param-properties"
+    },
+    {
+      "caller": "initLegacy",
+      "caller_file": "public/legacy.js",
+      "callee": "formatDate",
+      "callee_file": "public/legacy.js",
+      "not_files": [
+        "src/lib/text.ts"
+      ],
+      "note": "script-globals"
+    },
+    {
+      "caller": "initLegacy",
+      "caller_file": "public/legacy.js",
+      "callee": "trackEvent",
+      "callee_file": "public/analytics.js",
+      "note": "script-globals"
+    }
+  ],
+  "imports": [
+    {
+      "from_file": "src/main.tsx",
+      "to_file": "src/App.tsx"
+    },
+    {
+      "from_file": "src/App.tsx",
+      "to_file": "src/pages/Profile.tsx",
+      "kind": "alias"
+    },
+    {
+      "from_file": "src/App.tsx",
+      "to_file": "src/lib/session.ts",
+      "kind": "alias",
+      "note": "js-extension-alias"
+    },
+    {
+      "from_file": "src/lib/session.ts",
+      "to_file": "src/lib/storage.ts"
+    },
+    {
+      "from_file": "src/lib/session.ts",
+      "to_file": "src/types.ts",
+      "kind": "type-only"
+    },
+    {
+      "from_file": "src/lib/helpers.js",
+      "to_file": "src/lib/storage.ts"
+    },
+    {
+      "from_file": "src/api/index.ts",
+      "to_file": "src/api/users.ts",
+      "kind": "re-export"
+    },
+    {
+      "from_file": "src/api/index.ts",
+      "to_file": "src/api/posts.ts",
+      "kind": "re-export"
+    },
+    {
+      "from_file": "src/api/users.ts",
+      "to_file": "src/api/http.ts"
+    },
+    {
+      "from_file": "src/api/users.ts",
+      "to_file": "src/types.ts",
+      "kind": "type-only"
+    },
+    {
+      "from_file": "src/api/posts.ts",
+      "to_file": "src/api/http.ts",
+      "note": "js-extension-relative"
+    },
+    {
+      "from_file": "src/pages/Profile.tsx",
+      "to_file": "src/api/users.ts"
+    },
+    {
+      "from_file": "src/pages/Profile.tsx",
+      "to_file": "src/api/index.ts",
+      "note": "barrel"
+    },
+    {
+      "from_file": "src/pages/Profile.tsx",
+      "to_file": "src/lib/text.ts",
+      "kind": "alias"
+    },
+    {
+      "from_file": "src/pages/Profile.tsx",
+      "to_file": "src/types.ts",
+      "kind": "type-only"
+    },
+    {
+      "from_file": "src/pages/Settings.tsx",
+      "to_file": "src/api/index.ts",
+      "kind": "alias"
+    },
+    {
+      "from_file": "src/pages/Settings.tsx",
+      "to_file": "src/lib/helpers.js"
+    },
+    {
+      "from_file": "src/pages/Settings.tsx",
+      "to_file": "src/services/UserService.ts",
+      "kind": "alias"
+    },
+    {
+      "from_file": "src/pages/Settings.tsx",
+      "to_file": "src/services/UserRepo.ts",
+      "kind": "alias"
+    },
+    {
+      "from_file": "src/pages/Settings.tsx",
+      "to_file": "src/lib/logger.ts",
+      "kind": "alias"
+    },
+    {
+      "from_file": "src/services/UserService.ts",
+      "to_file": "src/services/UserRepo.ts"
+    },
+    {
+      "from_file": "src/services/UserService.ts",
+      "to_file": "src/lib/logger.ts",
+      "kind": "alias"
+    },
+    {
+      "from_file": "src/services/UserService.ts",
+      "to_file": "src/types.ts",
+      "kind": "type-only"
+    },
+    {
+      "from_file": "src/services/UserRepo.ts",
+      "to_file": "src/types.ts",
+      "kind": "type-only"
+    }
+  ],
+  "no_edge": [
+    {
+      "caller": "mount",
+      "caller_file": "src/main.tsx",
+      "callee": "createRoot",
+      "note": "external-package"
+    },
+    {
+      "caller": "mount",
+      "caller_file": "src/main.tsx",
+      "callee": "render",
+      "note": "external-package"
+    },
+    {
+      "caller": "Profile",
+      "caller_file": "src/pages/Profile.tsx",
+      "callee": "useState",
+      "note": "external-package"
+    },
+    {
+      "caller": "Settings",
+      "caller_file": "src/pages/Settings.tsx",
+      "callee": "useState",
+      "note": "external-package"
+    },
+    {
+      "caller": "parseSession",
+      "caller_file": "src/lib/session.ts",
+      "callee": "parse"
+    },
+    {
+      "caller": "getItem",
+      "caller_file": "src/lib/storage.ts",
+      "callee": "getItem",
+      "note": "self-name-builtin"
+    },
+    {
+      "caller": "setItem",
+      "caller_file": "src/lib/storage.ts",
+      "callee": "setItem",
+      "note": "self-name-builtin"
+    },
+    {
+      "caller": "formatName",
+      "caller_file": "src/lib/helpers.js",
+      "callee": "capitalize",
+      "note": "lodash"
+    },
+    {
+      "caller": "save",
+      "caller_file": "src/lib/helpers.js",
+      "callee": "stringify"
+    },
+    {
+      "caller": "get",
+      "caller_file": "src/api/http.ts",
+      "callee": "fetch"
+    },
+    {
+      "caller": "put",
+      "caller_file": "src/api/http.ts",
+      "callee": "fetch"
+    },
+    {
+      "caller": "put",
+      "caller_file": "src/api/http.ts",
+      "callee": "stringify"
+    },
+    {
+      "caller": "check",
+      "caller_file": "src/api/http.ts",
+      "callee": "json"
+    },
+    {
+      "caller": "find",
+      "caller_file": "src/services/UserRepo.ts",
+      "callee": "find",
+      "note": "self-name-builtin"
+    },
+    {
+      "caller": "save",
+      "caller_file": "src/services/UserRepo.ts",
+      "callee": "push"
+    },
+    {
+      "caller": "all",
+      "caller_file": "src/services/UserRepo.ts",
+      "callee": "slice"
+    },
+    {
+      "caller": "info",
+      "caller_file": "src/lib/logger.ts",
+      "callee": "info",
+      "note": "self-name-builtin"
+    },
+    {
+      "caller": "capitalize",
+      "caller_file": "src/lib/text.ts",
+      "callee": "charAt"
+    },
+    {
+      "caller": "capitalize",
+      "caller_file": "src/lib/text.ts",
+      "callee": "slice"
+    },
+    {
+      "caller": "formatDate",
+      "caller_file": "src/lib/text.ts",
+      "callee": "toLocaleDateString"
+    },
+    {
+      "caller": "formatDate",
+      "caller_file": "public/legacy.js",
+      "callee": "toISOString"
+    },
+    {
+      "caller": "initLegacy",
+      "caller_file": "public/legacy.js",
+      "callee": "getElementById"
+    },
+    {
+      "caller": "trackEvent",
+      "caller_file": "public/analytics.js",
+      "callee": "sendBeacon"
+    }
+  ],
+  "notes": {
+    "js-extension-alias": "`@/lib/session.js` names a file that does not exist: under moduleResolution bundler/node16 TypeScript maps a `.js` specifier to the `.ts` source, so the target is src/lib/session.ts. The `@/*` alias comes from tsconfig.app.json, reached only through tsconfig.json `references` (Vite layout); tsconfig.json itself has no compilerOptions. tsconfig.app.json is JSONC (comment + trailing comma).",
+    "js-extension-relative": "`./http.js` resolves to src/api/http.ts (same .js -> .ts mapping, relative form).",
+    "js-imports-ts": "helpers.js is plain JS in an allowJs project; its extensionless `./storage` import resolves to storage.ts.",
+    "namespace-import": "`import * as http from './http'` then `http.put()` / `http.get()` bind to the exported functions of http.ts.",
+    "profile-save": "Profile.tsx imports `save` from `../api/users`; src/lib/helpers.js also exports a `save` and UserRepo has a `save` method. Only api/users.ts is bound.",
+    "barrel": "`fetchPosts` imported from the `../api` barrel (src/api/index.ts) is defined in src/api/posts.ts; the call target is the defining file, the barrel itself defines nothing. The IMPORTS edge goes to the barrel file the specifier names.",
+    "barrel-namespace": "`import * as api from '@/api'`; `api.fetchUser` comes through `export * from './users'`.",
+    "renamed-import": "`import { save as saveDraft } from '../lib/helpers.js'`: the call site says saveDraft, the callee is the function `save` in helpers.js (a real .js file this time).",
+    "new-typed-local": "`const svc = new UserService(...)`, so `svc.rename` is UserService.rename. Constructor invocations (`new X()`) are not listed as calls.",
+    "ctor-param-properties": "`constructor(private repo: UserRepo, private readonly log: Logger) {}` declares fields repo/log; `this.repo.find` / `this.repo.save` / `this.repo.all` bind to UserRepo, `this.log.info` to Logger. `this.repo.save` must not go to api/users.ts or helpers.js.",
+    "script-globals": "public/legacy.js and public/analytics.js are classic scripts (no import/export) loaded by index.html, so their top-level functions share the global scope. `formatDate` binds to legacy.js's own declaration, not to the module export in src/lib/text.ts; `trackEvent` binds to analytics.js. The `initLegacy` reference passed to addEventListener is not a call.",
+    "alias-paths": "`@/lib/text` -> src/lib/text.ts via `paths` in tsconfig.app.json (relative to its baseUrl `.`).",
+    "external-package": "react / react-dom are bare specifiers with no alias: external, no repo target.",
+    "self-name-builtin": "A built-in method (Storage.getItem, Array.find, console.info) called from a repo method of the same name: must not become a self-loop.",
+    "lodash": "`_.capitalize` is lodash, not src/lib/text.ts capitalize.",
+    "type-only": "`import type` is erased at runtime but is still a source import of that file.",
+    "alias": "Specifier resolved through the `@/*` path alias.",
+    "re-export": "`export ... from` lines are imports of the re-exported file.",
+    "scope": "JSX element usage (`<Profile />`, `<App />`) is a value reference, not a call, and is not listed. Calls inside anonymous arrows (onChange handler, Array.find predicate) are not listed. vite.config.ts only makes a module-level external call. index.html is not source."
+  }
+}

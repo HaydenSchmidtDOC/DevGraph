@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from devgraph.graph.engine import GraphEngine
+from devgraph.indexer.dispatch import index_paths
 from devgraph.indexer.python.extractor import index_file
 from devgraph.mcp.tools import get_source
 from devgraph.registry.store import RepoRegistry
@@ -120,3 +121,82 @@ def test_get_source_refuses_file_outside_the_repo(repo_with_sibling, file_value)
 
     assert result["source"] is None
     assert result["file"] is None
+
+
+@pytest.fixture
+def two_helpers(engine):
+    """`helper` defined in a.py and b.py, each with a `run` that calls `target`."""
+    with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as regdir:
+        repo_root = Path(tmpdir)
+        (repo_root / ".git").mkdir()
+        for stem in ("a", "b"):
+            (repo_root / f"{stem}.py").write_text(
+                f"def helper():\n    return '{stem}'\n\n\ndef run():\n    from t import target\n    return target()\n", encoding="utf-8"
+            )
+        (repo_root / "t.py").write_text("def target():\n    return 1\n", encoding="utf-8")
+        registry = RepoRegistry(Path(regdir) / "registry.db")
+        record = registry.add_repo(repo_root, repo_id="_smoketest_get_source_two")
+        engine.delete_repository(record.repo_id)
+        engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
+        for name in ("t.py", "a.py", "b.py"):
+            index_file(engine, record.repo_id, repo_root / name, repo_root=repo_root)
+        try:
+            yield engine, registry, record.repo_id, repo_root
+        finally:
+            engine.delete_repository(record.repo_id)
+            registry.close()
+
+
+def test_an_ambiguous_name_returns_candidates_not_one_at_random(two_helpers):
+    engine, registry, repo_id, _root = two_helpers
+    result = get_source(engine, registry, repo_id, "helper")
+    assert result["status"] == "ambiguous"
+    assert result["source"] is None
+    assert result["count"] == 2 and result["truncated"] is False
+    assert result["candidates"] == [
+        {"label": "Function", "name": "helper", "file": "a.py"},
+        {"label": "Function", "name": "helper", "file": "b.py"},
+    ]
+
+
+def test_file_picks_one_of_several_same_named_nodes(two_helpers):
+    engine, registry, repo_id, _root = two_helpers
+    result = get_source(engine, registry, repo_id, "helper", file="b.py")
+    assert "status" not in result
+    assert result["file"] == "b.py"
+    assert "return 'b'" in result["source"]
+
+
+def test_a_file_that_is_not_utf8_is_decoded_not_raised(two_helpers):
+    engine, registry, repo_id, root = two_helpers
+    (root / "b.py").write_bytes(b"def helper():\n    return 'caf\xe9'\n")  # Latin-1, as on disk
+    result = get_source(engine, registry, repo_id, "helper", file="b.py")
+    assert result["source"] == "def helper():\n    return 'café'"  # as the indexer decodes it
+    assert "UTF-8" in result["notice"] and "cp1252" in result["notice"]
+
+
+def test_get_source_honours_a_pep_263_declaration(two_helpers):
+    engine, registry, repo_id, root = two_helpers
+    (root / "b.py").write_bytes("# -*- coding: latin-1 -*-\ndef helper():\n    return 'café'\n".encode("latin-1"))
+    index_paths(engine, repo_id, root, {root / "b.py"})  # the def moved down a line
+    result = get_source(engine, registry, repo_id, "helper", file="b.py")
+    assert result["source"] == "def helper():\n    return 'café'"
+    assert "notice" not in result  # declared, so read as intended
+
+
+def test_find_callers_keeps_same_named_callers_in_different_files_apart(two_helpers):
+    from devgraph.mcp.tools import find_callers
+
+    engine, _registry, repo_id, _root = two_helpers
+    result = find_callers(engine, repo_id, "target")
+    rows = [(r["name"], r["file"]) for r in result["results"]]
+    assert ("run", "a.py") in rows and ("run", "b.py") in rows
+
+
+def test_get_source_notes_when_a_declared_codec_did_not_decode_the_file(two_helpers):
+    engine, registry, repo_id, root = two_helpers
+    (root / "b.py").write_bytes("# coding: ascii\ndef helper():\n    return 'café'\n".encode())
+    index_paths(engine, repo_id, root, {root / "b.py"})
+    result = get_source(engine, registry, repo_id, "helper", file="b.py")
+    assert result["source"] == "def helper():\n    return 'café'"
+    assert "ascii" in result["notice"] and "utf-8" in result["notice"]

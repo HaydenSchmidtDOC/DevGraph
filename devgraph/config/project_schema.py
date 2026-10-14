@@ -46,6 +46,7 @@ from devgraph.config.project_switch import project_config_enabled
 from devgraph.config.project_tools import YAML_LOAD_ERRORS
 from devgraph.config.yaml_bound import bounded_safe_load
 from devgraph.graph.schema import (
+    NAMED_LABELS,
     NODE_LABELS,
     RELATIONSHIP_TYPES,
     RESERVED_NODE_PROPERTIES,
@@ -649,8 +650,9 @@ class ProjectSchema(BaseModel):
     def _check_labels(self) -> ProjectSchema:
         # Case-insensitive, and unconditional on `extends`: constraint names
         # are lower-cased, and built-in constraints exist in the same Neo4j
-        # database whether or not this document inherits them.
-        builtin_by_fold = {label.casefold(): label for label in NODE_LABELS}
+        # database whether or not this document inherits them. Cache, which
+        # the datastore extractor writes, counts too (NAMED_LABELS).
+        builtin_by_fold = {label.casefold(): label for label in (*NODE_LABELS, *NAMED_LABELS)}
         seen: dict[str, str] = {}
         for node_type in self.node_types:
             folded = node_type.label.casefold()

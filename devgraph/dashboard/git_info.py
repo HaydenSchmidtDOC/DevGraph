@@ -16,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from git import Repo
+from devgraph.indexer.git_history import open_repo
 
 
 def get_git_log(repo_path: Path, limit: int) -> list[dict[str, Any]]:
@@ -29,7 +29,7 @@ def get_git_log(repo_path: Path, limit: int) -> list[dict[str, Any]]:
     (`len(parents) > 1`) and lane layout are derived client-side from this
     real parent graph.
     """
-    with Repo(str(repo_path)) as repo:
+    with open_repo(repo_path) as repo:
         try:
             commits = list(repo.iter_commits(max_count=limit))
         except ValueError:
@@ -57,7 +57,7 @@ def get_git_status(repo_path: Path) -> dict[str, Any]:
     APIs, which is simpler to get right for the modified/untracked/staged
     distinction the porcelain format already encodes per-line.
     """
-    with Repo(str(repo_path)) as repo:
+    with open_repo(repo_path) as repo:
         try:
             branch = repo.active_branch.name
         except TypeError:

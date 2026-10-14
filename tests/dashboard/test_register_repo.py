@@ -491,3 +491,26 @@ def test_registration_scans_and_stamps_under_run_exclusive_at_the_scans_start(
     assert res.status_code == 201, res.text
     assert exclusive == [("sample-repo", t0.isoformat())]
     assert res.json()["last_indexed"] == t0.isoformat()
+
+
+def test_a_scan_cut_by_shutdown_is_logged_at_info_and_left_for_the_next_start(
+    client, registry, engine, tmp_path, monkeypatch, caplog
+):
+    """The engine refusing sessions because the agent is quitting is not a
+    failure to warn about: the repository stays unstamped, and the next start
+    indexes it in full."""
+    from devgraph.graph.engine import EngineClosed
+
+    def cut(*args, **kwargs):
+        raise EngineClosed("the graph engine is closed")
+
+    monkeypatch.setattr(routes, "full_scan", cut)
+    repo = _make_git_repo(tmp_path)
+    with caplog.at_level("INFO", logger="devgraph.dashboard.routes"):
+        res = client.post("/api/repos", json={"path": str(repo)})
+
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["indexed"] is False and body["last_indexed"] is None
+    assert "next start" in body["warning"]
+    assert [r.levelname for r in caplog.records if "sample-repo" in r.getMessage()] == ["INFO"]

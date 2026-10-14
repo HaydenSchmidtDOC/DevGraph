@@ -86,7 +86,10 @@ MIN_ARGS = {
 
 
 # Where each body receives repo_id: after the engine, or after engine and registry.
-REPO_ARG_INDEX = {name: 2 if name in {"impact_analysis_for_diff", "get_source"} else 1 for name in MIN_ARGS}
+REPO_ARG_INDEX = {
+    name: 2 if name in {"impact_analysis_for_diff", "get_source", "compare_branches", "find_communities", "key_nodes"} else 1
+    for name in MIN_ARGS
+}
 
 
 def payload(name):
@@ -132,7 +135,7 @@ def engine():
 
 @pytest.fixture
 def make_server(tmp_path, monkeypatch, engine):
-    settings = Settings(registry_db_path=tmp_path / "r.sqlite3", enable_run_cypher=True)
+    settings = Settings(registry_db_path=tmp_path / "r.sqlite3", enable_run_cypher=True, allow_cross_repo=True)
     monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
 
     def make(session_repo=None, session_source="none", registry=None, session_pinned=None):
@@ -155,7 +158,7 @@ def _builtins_with_repo_id():
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp, pytest.MonkeyPatch.context() as mp:
-        settings = Settings(registry_db_path=Path(tmp) / "r.sqlite3", enable_run_cypher=True)
+        settings = Settings(registry_db_path=Path(tmp) / "r.sqlite3", enable_run_cypher=True, allow_cross_repo=True)
         mp.setattr(mcp_server, "get_settings", lambda: settings)
         from devgraph.config import global_tools
 
@@ -186,10 +189,10 @@ def test_builtins_with_repo_id_are_exactly_the_25():
 
 
 @pytest.mark.parametrize("name", NAMES)
-@pytest.mark.parametrize("repo_id", ["other", "demo", "", "  ", "*"])
+@pytest.mark.parametrize("repo_id", ["other", "demo"])
 def test_explicit_calls_are_unchanged(name, repo_id, tmp_path, calls, make_server):
     session = demo(tmp_path)
-    registry = Registry([session])  # shared, so registry-taking bodies see equal arguments
+    registry = Registry([session, demo(tmp_path, "other")])  # shared, so registry-taking bodies see equal arguments
     servers = [make_server(session, "env", registry), make_server(None, "none", registry)]
     dumps, recorded = [], []
     for server in servers:
@@ -204,6 +207,18 @@ def test_explicit_calls_are_unchanged(name, repo_id, tmp_path, calls, make_serve
         dumps.append(result.model_dump_json())
     assert recorded[0] == recorded[1]
     assert dumps[0] == dumps[1]
+
+
+@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("repo_id", ["nope", "", "  ", "*"])
+def test_an_explicit_unregistered_repo_id_errors_and_runs_nothing(name, repo_id, tmp_path, calls, make_server):
+    session = demo(tmp_path)
+    for server in (make_server(session, "env"), make_server(None, "none")):
+        calls.clear()
+        result = call_over_wire(server, name, {"repo_id": repo_id, **MIN_ARGS[name]})
+        assert result.is_error is True
+        assert f"no such repo_id: {repo_id!r}" in error_text(result)
+        assert calls == []
 
 
 # ── the default ────────────────────────────────────────────────────────────
@@ -310,9 +325,12 @@ def test_removed_session_repo_errors(still_registered_inactive, tmp_path, calls,
     assert calls == []
 
     registry.list_calls.clear()
-    explicit = call(server, "god_nodes", {"repo_id": "demo"})
+    explicit = call(server, "god_nodes", {"repo_id": "other"})
     assert explicit.is_error is False and explicit.structured_content == DICT_PAYLOAD
     assert registry.list_calls == []
+    if not still_registered_inactive:
+        # An explicit repo_id must still be registered.
+        assert "no such repo_id: 'demo'" in error_text(call_over_wire(server, "god_nodes", {"repo_id": "demo"}))
 
     session.active = True
     if not still_registered_inactive:
@@ -458,6 +476,7 @@ def test_explicit_wins_over_every_unscoped_branch(kind, name, tmp_path, calls, r
     registry, env, cwd = unscoped_scenario(kind, tmp_path)
     unscoped = resolved(registry, env, cwd)
     baseline = make_server(None, "none", registry)
+    registry.repos.append(Repo("a", tmp_path / "elsewhere", active=False))  # known to the explicit call only
     dumps, recorded = [], []
     for server in (unscoped, baseline):
         calls.clear()

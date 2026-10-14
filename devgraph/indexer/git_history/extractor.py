@@ -15,15 +15,18 @@ this codebase; see indexer/python/extractor.py's index_file for precedent).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from git import Repo
+from git import GitCommandError, Repo
 
 from devgraph.config.settings import get_settings
+from devgraph.indexer.git_history import open_repo
 from devgraph.indexer.git_history.blame import compute_function_recency
+from devgraph.indexer.walk import check_repo_root
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +81,10 @@ class GitHistoryExtractor:
             preserves history order.
         """
         result = ExtractionResult()
-        repo = Repo(str(self.repo_path))
+        unreadable = 0
+        repo = open_repo(self.repo_path)
         try:
+            shallow = _shallow_boundary(repo)
             commits = list(repo.iter_commits(max_count=max_count))
             commits.reverse()  # iter_commits is newest-first; we want oldest-first
 
@@ -108,7 +113,11 @@ class GitHistoryExtractor:
                     )
                 )
 
-                for changed_path in _changed_paths(commit):
+                changed = _changed_paths(commit, boundary=sha in shallow)
+                if changed is None:
+                    unreadable += 1
+                    changed = []
+                for changed_path in changed:
                     # git already reports paths relative to the repo root
                     # with forward slashes — this must match how Module
                     # nodes are keyed (python/extractor.py's index_file:
@@ -127,22 +136,59 @@ class GitHistoryExtractor:
         finally:
             repo.close()
 
+        if unreadable:
+            logger.warning(
+                f"{self.repo_id}: {unreadable} commit(s) could not be read: their trees are missing from this "
+                "clone (a partial clone, or a damaged one); recorded without MODIFIES edges (DevGraph never "
+                "fetches them); after fetching them, run `devgraph rescan --full`"
+            )
         return result
 
 
-def _changed_paths(commit) -> list[str]:
-    """Return file paths touched by a commit (diff against its first parent, or full tree for a root commit)."""
-    if commit.parents:
-        diffs = commit.parents[0].diff(commit)
+def _shallow_boundary(repo: Repo) -> set[str]:
+    """The commits a shallow clone ends at (`.git/shallow`): their parents
+    are not in the clone. Empty for a full clone."""
+    try:
+        return set(Path(repo.common_dir, "shallow").read_text(encoding="ascii").split())
+    except OSError:
+        return set()
+
+
+def _shallow_digest(repo: Repo) -> str | None:
+    """sha256 of `.git/shallow`, or None for a full clone: it changes when
+    the clone is deepened or unshallowed."""
+    try:
+        data = Path(repo.common_dir, "shallow").read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
+def _changed_paths(commit, boundary: bool = False) -> list[str] | None:
+    """Return file paths touched by a commit (diff against its first parent, or full tree for a root commit).
+
+    A shallow clone's `boundary` commit is read like a root commit: its
+    parents are not in the clone (git itself shows it without them), so every
+    file it has counts as touched.
+
+    Rename detection is off: a rename still yields both paths, and detecting it
+    reads blobs a blobless partial clone lacks. None when a tree is missing
+    (a `tree:0` partial clone), which the caller counts and logs.
+    """
+    if commit.parents and not boundary:
+        try:
+            diffs = commit.parents[0].diff(commit, no_renames=True)
+        except GitCommandError:
+            return None
     else:
         # Root commit: diff against the empty tree isn't directly exposed;
-        # fall back to a tree walk. A root commit with no tree (or a tree
-        # that fails to traverse) is treated as touching nothing rather than
+        # fall back to a tree walk. A tree that fails to traverse (missing
+        # from a partial clone) is reported like a failed diff rather than
         # aborting the whole history sync.
         try:
             diffs = [d for d in commit.tree.traverse() if d.type == "blob"]
         except Exception:
-            return []
+            return None
         return [d.path for d in diffs]
 
     paths = set()
@@ -296,7 +342,7 @@ def _current_py_files(engine, repo_id: str) -> set[str]:
 
 def _apply_function_recency(
     engine, repo: Repo, repo_id: str, file_path: str, overwrite: bool
-) -> None:
+) -> Exception | None:
     """Blame `file_path` once and stage/set recency on each Function/Class
     node whose stored line range overlaps a blamed hunk.
 
@@ -310,6 +356,9 @@ def _apply_function_recency(
     calling once per hunk in blame's line order would leave whichever hunk
     happens to be processed last as the final value — not necessarily the
     most recent one. Picking the max up front is correct for both paths.
+
+    Returns the blame's exception when it fails (the caller logs failures
+    once per sync), else None.
     """
     if not file_path.endswith(".py"):
         return
@@ -336,8 +385,7 @@ def _apply_function_recency(
     try:
         hunks = compute_function_recency(repo, file_path)
     except Exception as exc:
-        logger.warning(f"git blame failed for {file_path!r}, skipping: {exc}")
-        return
+        return exc
 
     track_author = get_settings().git_recency_track_author
     write = engine.set_recency if overwrite else engine.stage_recency
@@ -395,12 +443,14 @@ def sync_git_history(
 
     Raises:
         ValueError: If repo_id is not registered.
+        RepoRootUnavailable: The repository folder is missing or unreadable.
     """
     repo_record = registry.get(repo_id)
     if repo_record is None:
         raise ValueError(f"no such repo_id: {repo_id}")
+    check_repo_root(repo_record.path)
 
-    repo = Repo(str(repo_record.path))
+    repo = open_repo(repo_record.path)
     try:
         try:
             head_sha = repo.head.commit.hexsha
@@ -409,13 +459,17 @@ def sync_git_history(
             # a freshly-initialized repo, not an error. Nothing to sync.
             return {"mode": "noop", "commits_indexed": 0, "commits_deleted": 0}
         last = repo_record.last_indexed_commit
+        shallow = _shallow_digest(repo)
+        # A shallow clone deepened (or unshallowed) since: commits read as
+        # boundaries then, with every file as touched, have parents now.
+        reshaped = last is not None and shallow != repo_record.last_indexed_shallow
 
-        if last == head_sha and not force:
+        if last == head_sha and not force and not reshaped:
             return {"mode": "noop", "commits_indexed": 0, "commits_deleted": 0}
 
         if last is None:
             mode = "initial"
-        elif force or not _is_ancestor(repo, last, head_sha):
+        elif force or reshaped or not _is_ancestor(repo, last, head_sha):
             mode = "reconcile"
         else:
             mode = "fast"
@@ -425,12 +479,16 @@ def sync_git_history(
             on_initial(count if max_count is None else min(count, max_count))
 
         extractor = GitHistoryExtractor(repo_id, repo_record.path)
+        blame_failures: dict[str, Exception | None] = {}
 
         if mode == "reconcile":
             # Full reachable-set walk, no cap — correctness matters more
             # than speed for what should be a rare event, and capping it
             # risks leaving real orphans undetected.
             result = extractor.extract_new_commits(since_sha=None, max_count=None)
+            # Each commit's MODIFIES edges are written again, not added to: a
+            # former shallow boundary keeps only the files it changed.
+            engine.delete_commit_modifies(repo_id, [c.sha for c in result.commits])
             _upsert_extraction_result(engine, repo_id, result)
 
             reachable_shas = {c.sha for c in result.commits}
@@ -446,7 +504,7 @@ def sync_git_history(
 
             _reconcile_module_recency(engine, repo_id)
             for file_path in _current_py_files(engine, repo_id):
-                _apply_function_recency(engine, repo, repo_id, file_path, overwrite=True)
+                blame_failures[file_path] = _apply_function_recency(engine, repo, repo_id, file_path, overwrite=True)
 
             commits_indexed = len(result.commits)
             commits_deleted = len(orphans)
@@ -461,12 +519,20 @@ def sync_git_history(
                 rel.target_name for rel in result.relationships if rel.target_name.endswith(".py")
             }
             for file_path in touched_py_files:
-                _apply_function_recency(engine, repo, repo_id, file_path, overwrite=False)
+                blame_failures[file_path] = _apply_function_recency(engine, repo, repo_id, file_path, overwrite=False)
 
             commits_indexed = len(result.commits)
             commits_deleted = 0
 
-        registry.set_last_indexed_commit(repo_id, head_sha)
+        failed = sorted(path for path, exc in blame_failures.items() if exc is not None)
+        if failed:
+            # One line per sync: a blobless partial clone fails the blame of every file.
+            logger.warning(
+                f"{repo_id}: git blame failed for {len(failed)} file(s), recency skipped for them "
+                f"(first {failed[0]!r}: {blame_failures[failed[0]]})"
+            )
+
+        registry.set_last_indexed_commit(repo_id, head_sha, shallow)
         return {"mode": mode, "commits_indexed": commits_indexed, "commits_deleted": commits_deleted}
     finally:
         repo.close()

@@ -9,7 +9,7 @@ from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
 from devgraph.mcp.tools import declared_node_labels, search_component
 
-BUILTIN_PREDICATE = "(n:Service OR n:Module OR n:Class OR n:Function OR n:Endpoint)"
+BUILTIN_LABELS = ("Service", "Module", "Class", "Function", "Endpoint")
 SCHEMA = """
     version: 1
     node_types:
@@ -28,6 +28,9 @@ class StubEngine:
         self.queries.append((query, params or {}))
         return []
 
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        return self.run_cypher(query, params), False
+
 
 @dataclass
 class Repo:
@@ -42,24 +45,29 @@ class StubRegistry:
         return self.repos.get(repo_id)
 
 
-def test_without_extra_labels_the_query_is_unchanged():
+def _searched(query):
+    """The labels a search query's per-label branches match, in order."""
+    import re
+
+    return tuple(re.findall(r"MATCH \(n:`(\w+)`\)", query))
+
+
+def test_without_extra_labels_the_builtin_labels_are_searched():
     engine = StubEngine()
     search_component(engine, "demo", "widget")
-    assert BUILTIN_PREDICATE in engine.queries[0][0]
+    assert all(_searched(q) == BUILTIN_LABELS for q, _ in engine.queries)
 
 
 def test_extra_labels_join_the_label_predicate():
     engine = StubEngine()
     search_component(engine, "demo", "readme", extra_labels=("File", "Folder"))
-    query = engine.queries[0][0]
-    assert "(n:Service OR n:Module OR n:Class OR n:Function OR n:Endpoint OR n:File OR n:Folder)" in query
+    assert all(_searched(q) == (*BUILTIN_LABELS, "File", "Folder") for q, _ in engine.queries)
 
 
 def test_labels_that_are_not_identifiers_are_never_interpolated():
     engine = StubEngine()
     search_component(engine, "demo", "x", extra_labels=("File", "Bad) DETACH DELETE n //"))
-    query = engine.queries[0][0]
-    assert "DETACH" not in query and "n:File" in query
+    assert all("DETACH" not in q and "n:`File`" in q for q, _ in engine.queries)
 
 
 def test_declared_labels_come_from_the_repo_schema(tmp_path):
@@ -82,4 +90,4 @@ def test_the_mcp_tool_searches_declared_labels(tmp_path, monkeypatch):
     engine = StubEngine()
     server = mcp_server.build_server(engine, StubRegistry({"demo": Repo(tmp_path)}))
     asyncio.run(server.call_tool("search_component", {"repo_id": "demo", "query": "readme"}))
-    assert any("n:File" in q for q, _ in engine.queries)
+    assert any("n:`File`" in q for q, _ in engine.queries)

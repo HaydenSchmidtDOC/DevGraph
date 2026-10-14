@@ -90,6 +90,13 @@ class Settings(BaseSettings):
         return Path.home() / ".devgraph" / "registry.sqlite3"
 
     watch_debounce_ms: int = 500
+    # The longest a batch of file or git events waits while events keep
+    # arriving within the debounce of each other (a log or build output
+    # written every few hundred milliseconds): it is flushed at least this often.
+    watch_max_wait_ms: int = 5000
+    # Files larger than this many bytes are not extracted (a minified bundle
+    # or a generated module would otherwise become tens of thousands of nodes).
+    max_file_bytes: int = 1024 * 1024
     health_check_interval_s: int = 30
 
     log_file: Path | None = None

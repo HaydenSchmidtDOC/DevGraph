@@ -17,7 +17,6 @@ from devgraph.mcp.tools import (
     find_callers,
     find_related_files,
     summarise_repository,
-    compare_branches,
     impact_analysis,
     explain_architecture,
     list_services,
@@ -170,6 +169,43 @@ class TestFindCallers:
             assert result["truncated"] is True
             assert len(result["results"]) <= 1
 
+    def test_find_callers_ranks_by_confidence_and_can_keep_only_resolved(self, engine):
+        """Each caller once, with its best confidence, resolved callers first;
+        resolved_only drops bare-name matches and edges with no confidence."""
+        repo_id = "_smoketest_call_confidence"
+        engine.delete_repository(repo_id)
+        engine.upsert_repository(repo_id, "Confidence Test Repo", "/path/to/repo")
+        engine.upsert_nodes([
+            {"label": "Function", "repo_id": repo_id, "name": "helper", "properties": {"file": f}}
+            for f in ("lib/a.py", "lib/b.py")
+        ] + [
+            {"label": "Function", "repo_id": repo_id, "name": caller, "properties": {"file": "app.py"}}
+            for caller in ("by_name", "both", "legacy", "in_package", "resolved")
+        ])
+
+        def calls(caller, to_file, confidence):
+            return {
+                "from_label": "Function", "from_name": caller, "from_file": "app.py", "rel_type": "CALLS",
+                "to_label": "Function", "to_name": "helper", "to_file": to_file, "repo_id": repo_id,
+                "properties": {"confidence": confidence} if confidence else None,
+            }
+
+        engine.upsert_relationships([
+            calls("by_name", "lib/a.py", "name"), calls("both", "lib/a.py", "name"),
+            calls("both", "lib/b.py", "resolved"), calls("legacy", "lib/a.py", None),
+            calls("in_package", "lib/b.py", "package"), calls("resolved", "lib/a.py", "resolved"),
+        ])
+        try:
+            ranked = find_callers(engine, repo_id, "helper", max_results=10)["results"]
+            assert [(r["name"], r["confidence"]) for r in ranked] == [
+                ("both", "resolved"), ("resolved", "resolved"), ("in_package", "package"),
+                ("legacy", None), ("by_name", "name"),
+            ]
+            resolved = find_callers(engine, repo_id, "helper", max_results=10, resolved_only=True)["results"]
+            assert [r["name"] for r in resolved] == ["both", "resolved", "in_package"]
+        finally:
+            engine.delete_repository(repo_id)
+
     def test_find_callers_scope_to_class_narrows_results(self, engine):
         """scope_to_class filters callers to those whose CALLS edge carries a
         matching caller_class property (set by the Python extractor for
@@ -276,14 +312,6 @@ class TestSummariseRepository:
             assert elapsed < 5.0, f"summarise_repository took {elapsed:.2f}s — possible cartesian-product regression"
         finally:
             engine.delete_repository(repo_id)
-
-
-class TestCompareBranches:
-    def test_compare_branches_stub(self, seeded_graph):
-        """Test that compare_branches returns placeholder (Phase 3)."""
-        result = compare_branches(seeded_graph, "test_repo_a", "main", "dev")
-        assert "note" in result
-        assert "Phase 3" in result["note"]
 
 
 class TestImpactAnalysis:

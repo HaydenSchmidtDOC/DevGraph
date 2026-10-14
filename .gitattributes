@@ -1,0 +1,2 @@
+# Vendored third-party files ship byte-for-byte (their hash is pinned): no line-ending conversion.
+devgraph/dashboard/static/vendor/** -text

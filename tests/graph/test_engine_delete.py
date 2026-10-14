@@ -112,3 +112,17 @@ class TestDeleteNodesBySourceFile:
             assert remaining[0]["c"] == 1
         finally:
             engine.delete_repository(repo_id)
+
+
+def test_graph_repo_ids_includes_nodes_left_without_a_repository_node(engine):
+    """A write that lands after `devgraph remove` deleted the graph leaves
+    nodes whose Repository node is gone; `prune` and `doctor` find them here."""
+    import uuid
+
+    orphan = f"_smoketest_orphan_{uuid.uuid4().hex[:8]}"
+    engine.upsert_node("Module", orphan, "late.py", {"type": "module", "source_file": "late.py"})
+    try:
+        assert orphan in engine.graph_repo_ids()
+    finally:
+        engine.delete_repository(orphan)
+    assert orphan not in engine.graph_repo_ids()

@@ -1,0 +1,347 @@
+{
+  "language": "cpp",
+  "description": "CMake C++17 inventory tool with include/ + src/, same-stem header/source pairs, two log.h headers in different dirs, platform-specific definitions and STL name clashes.",
+  "calls": [
+    {
+      "caller": "add",
+      "caller_file": "src/inventory.cpp",
+      "callee": "trim",
+      "callee_file": "src/util/strings.cpp",
+      "note": "header-plus-source"
+    },
+    {
+      "caller": "add",
+      "caller_file": "src/inventory.cpp",
+      "callee": "log_info",
+      "callee_file": "include/util/log.h",
+      "not_files": [
+        "src/net/log.h"
+      ],
+      "note": "two-log-h"
+    },
+    {
+      "caller": "open",
+      "caller_file": "src/net/conn.cpp",
+      "callee": "log_info",
+      "callee_file": "src/net/log.h",
+      "not_files": [
+        "include/util/log.h"
+      ],
+      "note": "two-log-h"
+    },
+    {
+      "caller": "open",
+      "caller_file": "src/net/conn.cpp",
+      "callee": "now_ms",
+      "callee_file": "src/platform_posix.cpp",
+      "ambiguous": true,
+      "note": "platform-variants"
+    },
+    {
+      "caller": "open",
+      "caller_file": "src/net/conn.cpp",
+      "callee": "now_ms",
+      "callee_file": "src/platform_win.cpp",
+      "ambiguous": true,
+      "note": "platform-variants"
+    },
+    {
+      "caller": "close",
+      "caller_file": "src/net/conn.cpp",
+      "callee": "log_info",
+      "callee_file": "src/net/log.h",
+      "not_files": [
+        "include/util/log.h"
+      ],
+      "note": "two-log-h"
+    },
+    {
+      "caller": "print_report",
+      "caller_file": "src/report.cpp",
+      "callee": "upper",
+      "callee_file": "src/util/strings.cpp",
+      "note": "header-plus-source"
+    },
+    {
+      "caller": "print_report",
+      "caller_file": "src/report.cpp",
+      "callee": "size",
+      "callee_file": "include/inventory.h",
+      "note": "inline-in-header"
+    },
+    {
+      "caller": "print_report",
+      "caller_file": "src/report.cpp",
+      "callee": "total",
+      "callee_file": "src/inventory.cpp",
+      "note": "header-plus-source"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main.cpp",
+      "callee": "add",
+      "callee_file": "src/inventory.cpp",
+      "note": "header-plus-source"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main.cpp",
+      "callee": "find",
+      "callee_file": "src/inventory.cpp",
+      "note": "header-plus-source"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main.cpp",
+      "callee": "known",
+      "callee_file": "src/main.cpp"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main.cpp",
+      "callee": "log_info",
+      "callee_file": "include/util/log.h",
+      "not_files": [
+        "src/net/log.h"
+      ],
+      "note": "two-log-h"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main.cpp",
+      "callee": "open",
+      "callee_file": "src/net/conn.cpp"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main.cpp",
+      "callee": "print_report",
+      "callee_file": "src/report.cpp",
+      "note": "header-plus-source"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main.cpp",
+      "callee": "close",
+      "callee_file": "src/net/conn.cpp"
+    },
+    {
+      "caller": "main",
+      "caller_file": "tests/inventory_test.cpp",
+      "callee": "add",
+      "callee_file": "src/inventory.cpp"
+    },
+    {
+      "caller": "main",
+      "caller_file": "tests/inventory_test.cpp",
+      "callee": "total",
+      "callee_file": "src/inventory.cpp"
+    },
+    {
+      "caller": "main",
+      "caller_file": "tests/inventory_test.cpp",
+      "callee": "size",
+      "callee_file": "include/inventory.h",
+      "note": "inline-in-header"
+    }
+  ],
+  "imports": [
+    {
+      "from_file": "src/inventory.cpp",
+      "to_file": "include/inventory.h",
+      "kind": "include",
+      "note": "include-search"
+    },
+    {
+      "from_file": "src/inventory.cpp",
+      "to_file": "include/util/log.h",
+      "kind": "include",
+      "note": "two-log-h"
+    },
+    {
+      "from_file": "src/inventory.cpp",
+      "to_file": "include/util/strings.h",
+      "kind": "include",
+      "note": "include-search"
+    },
+    {
+      "from_file": "src/util/strings.cpp",
+      "to_file": "include/util/strings.h",
+      "kind": "include",
+      "note": "include-search"
+    },
+    {
+      "from_file": "src/net/conn.cpp",
+      "to_file": "src/net/conn.h",
+      "kind": "include",
+      "note": "include-search"
+    },
+    {
+      "from_file": "src/net/conn.cpp",
+      "to_file": "src/net/log.h",
+      "kind": "include",
+      "note": "two-log-h"
+    },
+    {
+      "from_file": "src/net/conn.cpp",
+      "to_file": "include/platform.h",
+      "kind": "include",
+      "note": "include-search"
+    },
+    {
+      "from_file": "src/platform_posix.cpp",
+      "to_file": "include/platform.h",
+      "kind": "include"
+    },
+    {
+      "from_file": "src/platform_win.cpp",
+      "to_file": "include/platform.h",
+      "kind": "include"
+    },
+    {
+      "from_file": "src/report.h",
+      "to_file": "include/inventory.h",
+      "kind": "include",
+      "note": "include-search"
+    },
+    {
+      "from_file": "src/report.cpp",
+      "to_file": "src/report.h",
+      "kind": "include",
+      "note": "include-search"
+    },
+    {
+      "from_file": "src/report.cpp",
+      "to_file": "include/util/strings.h",
+      "kind": "include"
+    },
+    {
+      "from_file": "src/main.cpp",
+      "to_file": "include/inventory.h",
+      "kind": "include"
+    },
+    {
+      "from_file": "src/main.cpp",
+      "to_file": "src/net/conn.h",
+      "kind": "include",
+      "note": "include-search"
+    },
+    {
+      "from_file": "src/main.cpp",
+      "to_file": "src/report.h",
+      "kind": "include",
+      "note": "include-search"
+    },
+    {
+      "from_file": "src/main.cpp",
+      "to_file": "include/util/log.h",
+      "kind": "include",
+      "note": "two-log-h"
+    },
+    {
+      "from_file": "tests/inventory_test.cpp",
+      "to_file": "include/inventory.h",
+      "kind": "include"
+    }
+  ],
+  "no_edge": [
+    {
+      "caller": "size",
+      "caller_file": "include/inventory.h",
+      "callee": "size",
+      "note": "stl-self-name"
+    },
+    {
+      "caller": "add",
+      "caller_file": "src/inventory.cpp",
+      "callee": "push_back"
+    },
+    {
+      "caller": "find",
+      "caller_file": "src/inventory.cpp",
+      "callee": "find_if"
+    },
+    {
+      "caller": "find",
+      "caller_file": "src/inventory.cpp",
+      "callee": "begin"
+    },
+    {
+      "caller": "find",
+      "caller_file": "src/inventory.cpp",
+      "callee": "end"
+    },
+    {
+      "caller": "trim",
+      "caller_file": "src/util/strings.cpp",
+      "callee": "find_first_not_of"
+    },
+    {
+      "caller": "trim",
+      "caller_file": "src/util/strings.cpp",
+      "callee": "find_last_not_of"
+    },
+    {
+      "caller": "trim",
+      "caller_file": "src/util/strings.cpp",
+      "callee": "substr"
+    },
+    {
+      "caller": "upper",
+      "caller_file": "src/util/strings.cpp",
+      "callee": "transform"
+    },
+    {
+      "caller": "open",
+      "caller_file": "src/net/conn.cpp",
+      "callee": "to_string"
+    },
+    {
+      "caller": "known",
+      "caller_file": "src/main.cpp",
+      "callee": "find",
+      "note": "stl-find"
+    },
+    {
+      "caller": "known",
+      "caller_file": "src/main.cpp",
+      "callee": "begin"
+    },
+    {
+      "caller": "known",
+      "caller_file": "src/main.cpp",
+      "callee": "end"
+    },
+    {
+      "caller": "print_report",
+      "caller_file": "src/report.cpp",
+      "callee": "printf"
+    },
+    {
+      "caller": "print_report",
+      "caller_file": "src/report.cpp",
+      "callee": "c_str"
+    },
+    {
+      "caller": "now_ms",
+      "caller_file": "src/platform_win.cpp",
+      "callee": "GetTickCount64"
+    },
+    {
+      "caller": "main",
+      "caller_file": "tests/inventory_test.cpp",
+      "callee": "puts"
+    }
+  ],
+  "notes": {
+    "include-search": "Quoted includes search the including file's own directory first, then the -I directories (CMake target_include_directories: include/). So `#include \"inventory.h\"` from src/ is include/inventory.h, `\"conn.h\"` from src/net/ is src/net/conn.h, `\"net/conn.h\"` and `\"report.h\"` from src/main.cpp are src/net/conn.h and src/report.h, `\"platform.h\"` from src/net/ is include/platform.h. Angle-bracket system headers are external.",
+    "two-log-h": "There are two log.h files, include/util/log.h (util::log_info) and src/net/log.h (net::log_info). src/net/conn.cpp's `#include \"log.h\"` finds src/net/log.h first (own directory), and its unqualified log_info inside namespace net is net::log_info. src/main.cpp and src/inventory.cpp include \"util/log.h\", which does not exist under src/ so comes from include/, and call util::log_info.",
+    "header-plus-source": "Member functions declared in a header (include/inventory.h, include/util/strings.h, src/report.h) are defined in the same-stem source file; the call target is the definition (src/inventory.cpp, src/util/strings.cpp, src/report.cpp), not the declaring header.",
+    "inline-in-header": "Inventory::size is defined inline in include/inventory.h, so the header is the target.",
+    "platform-variants": "now_ms is declared in include/platform.h and defined in both platform_posix.cpp and platform_win.cpp; CMake compiles exactly one depending on WIN32. Ambiguous at file granularity.",
+    "stl-self-name": "`items_.size()` inside Inventory::size is std::vector::size: must not become a self-loop.",
+    "stl-find": "`std::find(...)` in known() is the STL algorithm, not Inventory::find.",
+    "imports-format": "IMPORTS rows are quoted #include directives resolved to an in-repo file by the search rule above, kind `include`.",
+    "scope": "Constructors (`net::Connection conn(...)`, `Inventory inv;`) are not listed as calls. Calls inside lambdas are not listed."
+  }
+}

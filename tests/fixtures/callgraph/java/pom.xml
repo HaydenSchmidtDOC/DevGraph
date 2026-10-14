@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.acme</groupId>
+  <artifactId>shop-parent</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+  <!-- third_party/acme-util is a vendored copy kept for reference; it is not a module of this build. -->
+  <modules>
+    <module>core</module>
+    <module>app</module>
+  </modules>
+</project>

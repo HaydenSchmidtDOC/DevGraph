@@ -137,7 +137,8 @@ class ContainerExtractor:
             filename: The name of the compose file for context.
 
         Returns:
-            ExtractionResult containing extracted Service, Container, Network, and Volume nodes.
+            ExtractionResult containing extracted Service, Container, Network, and Volume nodes,
+            and Service RUNS/USES/DEPENDS_ON relationships.
         """
         result = ExtractionResult()
 
@@ -204,6 +205,23 @@ class ContainerExtractor:
                     )
                     result.relationships.append(relationship)
 
+                # Service DEPENDS_ON Service, from `depends_on` (a list, or a
+                # dict keyed by service name) and legacy `links` ("db" or
+                # "db:alias"). Both ends are pinned to this compose file:
+                # compose resolves these names among its own services.
+                for dependency in self._service_dependencies(service_config):
+                    result.relationships.append(
+                        Relationship(
+                            source_label="Service",
+                            source_name=service_name,
+                            relationship_type="DEPENDS_ON",
+                            target_label="Service",
+                            target_name=dependency,
+                            from_file=filename,
+                            to_file=filename,
+                        )
+                    )
+
                 # Extract volumes referenced by this service
                 volumes = service_config.get("volumes", [])
                 if isinstance(volumes, list):
@@ -245,6 +263,18 @@ class ContainerExtractor:
                 result.volumes.append(volume)
 
         return result
+
+    @staticmethod
+    def _service_dependencies(service_config: dict) -> list[str]:
+        """The service names a compose service's `depends_on` and `links` name, deduplicated, in order."""
+        names: list[str] = []
+        depends_on = service_config.get("depends_on")
+        if isinstance(depends_on, (list, dict)):
+            names += [name for name in depends_on if isinstance(name, str)]
+        links = service_config.get("links")
+        if isinstance(links, list):
+            names += [link.split(":", 1)[0] for link in links if isinstance(link, str)]
+        return [name for name in dict.fromkeys(name.strip() for name in names) if name]
 
     @staticmethod
     def _extract_build_context(build_config) -> Optional[str]:

@@ -21,8 +21,27 @@ adapted to Go's grammar. Extracts:
     stretch of EXTENDS' original meaning: embedding is composition, not
     inheritance, but DevGraph's schema has no dedicated "composes"
     relationship type and EXTENDS is the nearest existing one.
-  - IMPORTS (import declarations, resolved against go.mod's module path
-    when available).
+  - IMPORTS: an import path resolves by the longest in-repository module
+    path (every go.mod's `module`, and the local `replace`s of go.mod and
+    go.work; resolver_config.ResolverConfig.go_package_dir) to its package's
+    directory, written as a directory pin to that directory's non-test Go
+    files (`dir/.?.go!_test.go`). Any other import is external: no edge.
+  - CALLS, by the first tier that applies (see
+    docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md):
+    `f()` declared in this file -> this file; any other `f()` -> the
+    file's package directory (a builtin links nothing); `pkg.F()` -> the
+    imported package's directory, nothing for an external one (an
+    unaliased in-repo import whose path name the file never uses is the
+    package an unknown qualifier names, since its package clause can differ
+    from its directory); `x.m()` on a typed `x` (receiver, parameter, `var
+    x T`, `x := T{}`/`&T{}`/`new(T)`, a struct field of this file, what an
+    in-file function returns, or what a package's function returned) ->
+    this file when the type and `m` are declared here, else the type's
+    package directory at package confidence (`~`); an untyped receiver ->
+    a bare-name edge that never ends at the caller, nothing for a
+    stoplisted method (calls.STOP_METHODS["go"]). Pins to the package's
+    own files leave tests out from a non-test file; an external test
+    package (`package x_test`) reaches only its directory's test files.
   - `//` doc comments immediately preceding a declaration, Go's doc-comment
     convention (a contiguous comment block directly above the declaration,
     conventionally starting with the declared identifier's name) — stored
@@ -36,12 +55,21 @@ module docstring) — this is that generalization for Go.
 from __future__ import annotations
 
 import logging
+import posixpath
+import re
 from pathlib import Path
 
 import tree_sitter_go as tsgo
 from tree_sitter import Language, Node, Parser
 
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship
+from devgraph.indexer.calls import STOP_METHODS, CallSites, import_rows
+from devgraph.indexer.common import (
+    ExtractionResult,
+    GraphNode,
+    GraphRelationship,
+    own_edges,
+)
+from devgraph.indexer.resolver_config import ResolverConfig
 
 logger = logging.getLogger(__name__)
 
@@ -103,58 +131,6 @@ def _docstring_summary(full_text: str, max_chars: int = 120) -> str:
     return first_line
 
 
-def _callee_simple_name(func_node: Node, source: bytes) -> str | None:
-    """Resolve a call expression's `function` field to a simple callee name.
-
-    - `foo()` -> 'foo'
-    - `obj.foo()` -> 'foo' (the selector's field name — no type info, so
-      this over-links same-named methods across structs/packages rather
-      than under-linking, matching the Python extractor's `self.foo()`
-      handling).
-    - `get()()` (chained/immediately-invoked call) -> resolves to the outer
-      call's own callee name by recursing on its function field.
-    """
-    if func_node.type == "identifier":
-        return _text(func_node, source)
-    if func_node.type == "selector_expression":
-        field = func_node.child_by_field_name("field")
-        if field is not None:
-            return _text(field, source)
-    if func_node.type == "call_expression":
-        inner = func_node.child_by_field_name("function")
-        if inner is not None:
-            return _callee_simple_name(inner, source)
-    if func_node.type == "parenthesized_expression" and func_node.named_children:
-        return _callee_simple_name(func_node.named_children[0], source)
-    return None
-
-
-def _extract_call_targets(body: Node, source: bytes) -> list[str]:
-    """Walk a function/method body for call expressions, returning each
-    callee's simple name. Does not descend into a nested named function/
-    method declaration (Go doesn't actually allow declaring these nested,
-    but the guard is kept defensive and mirrors the Python extractor's
-    scope-boundary behavior); anonymous func literals ARE descended into
-    since DevGraph has no separate node to attribute their calls to.
-    """
-    targets: list[str] = []
-
-    def walk(node: Node) -> None:
-        if node.type in ("function_declaration", "method_declaration"):
-            return
-        if node.type == "call_expression":
-            func = node.child_by_field_name("function")
-            if func is not None:
-                name = _callee_simple_name(func, source)
-                if name:
-                    targets.append(name)
-        for child in node.children:
-            walk(child)
-
-    walk(body)
-    return targets
-
-
 def _receiver_type_name(method_node: Node, source: bytes) -> str | None:
     """Extract the struct name a method's receiver is attached to.
 
@@ -199,69 +175,471 @@ def _embedded_field_type_name(field_decl: Node, source: bytes) -> str | None:
     return None
 
 
-def _extract_imports(root: Node, source: bytes) -> list[str]:
-    """Extract each import spec's raw import path string (e.g.
-    'fmt', 'path/to/pkg', 'github.com/someone/pkg')."""
-    paths: list[str] = []
+def _extract_imports(root: Node, source: bytes) -> list[tuple[str | None, str]]:
+    """Each import spec as (its name, if given: an alias, `.` or `_`; the
+    import path), e.g. (None, 'fmt'), ('db', 'example.com/app/legacydb')."""
+    imports: list[tuple[str | None, str]] = []
 
     def walk(node: Node) -> None:
         if node.type == "import_spec":
             path_node = node.child_by_field_name("path")
+            name_node = node.child_by_field_name("name")
             if path_node is not None:
                 # interpreted_string_literal includes the surrounding quotes.
-                raw = _text(path_node, source)
-                paths.append(raw.strip('"'))
+                path = _text(path_node, source).strip('"`')
+                imports.append((_text(name_node, source) if name_node is not None else None, path))
         for child in node.children:
             walk(child)
 
     walk(root)
-    return paths
+    return imports
 
 
-def _resolve_import_targets(import_path: str, module_path: str | None) -> list[str]:
-    """Guess the Module node name(s) an import path should resolve to.
+_MAJOR_VERSION = re.compile(r"v[0-9]+")
 
-    Always includes the bare import path itself (kept for compatibility/
-    introspection, same as the Python extractor keeps the bare dotted
-    name). When `module_path` (go.mod's `module` directive) is known:
-      - an intra-module import ('mymod/pkg/sub' under module 'mymod') gets
-        an additional same-repo file-path guess: the import path's
-        directory, reinterpreted as '<dir>/<last-segment>.go' — Go's
-        convention that an import path mirrors the package's directory
-        structure relative to the module root, guessing the package's
-        primary file is named after its own directory (true for many small
-        packages, not guaranteed for larger multi-file ones).
-      - a non-intra-module import (e.g. 'github.com/someone/pkg') gets NO
-        extra guess — it's genuinely external, so there's nothing to guess
-        at, same as Python's third-party-import behavior.
-    When `module_path` is unknown (no go.mod found), every import gets the
-    same last-path-segment same-repo guess, since we can't tell intra-repo
-    imports from external ones without the module directive.
 
-    Either way, a wrong guess simply never materializes an edge —
-    upsert_relationship only MATCHes real existing nodes on both ends.
-    """
-    candidates = [import_path]
+def _default_import_name(import_path: str, module: str | None = None) -> str:
+    """The name an unaliased import is used by, as far as its path tells:
+    the last path element, skipping a major-version element and a
+    gopkg.in-style `.vN` (`yaml.v3` is `yaml`). For an in-repository import
+    (`module` the module path it resolved by) the last element is a major
+    version only when it is the module's own (`example.com/shop/v2` is
+    `shop`; `example.com/shop/v2/apis/apps/v1` is a directory, `package
+    v1`); for an external one (`module` None) any `vN` is (`chi/v5` is
+    `chi`). A package clause may name it otherwise (`legacydb/` declaring
+    `package db`); see `_GoResolver.qualifier_dirs`."""
+    parts = [part for part in import_path.split("/") if part]
+    if len(parts) > 1 and _MAJOR_VERSION.fullmatch(parts[-1]) and (module is None or import_path == module):
+        parts.pop()
+    name = parts[-1] if parts else import_path
+    name = re.sub(r"\.v[0-9]+$", "", name)
+    if name.startswith("go-"):
+        name = name[3:]
+    return name.removesuffix("-go").replace("-", "_").replace(".", "_")
 
-    if module_path is not None:
-        if import_path == module_path or import_path.startswith(module_path + "/"):
-            rel = import_path[len(module_path) :].lstrip("/")
-            if rel:
-                last = rel.rsplit("/", 1)[-1]
-                candidates.append(f"{rel}/{last}.go")
-        # else: external (outside this repo's module) — no guess.
-    else:
-        last = import_path.rsplit("/", 1)[-1]
-        candidates.append(f"{last}/{last}.go")
 
-    return candidates
+# Go's predeclared types and builtin functions: no file of the repository
+# declares one.
+_BUILTIN_TYPES = frozenset({
+    "any", "bool", "byte", "comparable", "complex64", "complex128", "error", "float32", "float64", "int", "int8",
+    "int16", "int32", "int64", "rune", "string", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
+})
+_BUILTIN_FUNCS = frozenset({
+    "append", "cap", "clear", "close", "complex", "copy", "delete", "imag", "len", "make", "max", "min", "new",
+    "panic", "print", "println", "real", "recover",
+})
+
+
+def _dir_pin(folder: str, only: str, not_suffix: str = "", loose: bool = False) -> str:
+    """A directory pin (graph/schema.py `split_pin`) to the Go files of
+    `folder` ("" the root): `only` the suffix they end with, less
+    `not_suffix`; `loose` at package confidence."""
+    pin = f"{folder}/." if folder else "."
+    return pin + ("~" if loose else "") + f"?{only}" + (f"!{not_suffix}" if not_suffix else "")
+
+
+# A type, as the resolver knows it: ("local", T) a type named T of the file's
+# own package; ("pkg", directories, T or None) a type of an imported in-repo
+# package, which the directories can hold (None: some type of it, such as
+# what its function returned); ("ext",) a builtin or external type, whose
+# methods link nothing.
+GoType = tuple
+
+
+class _GoResolver:
+    """Resolves one Go file's call sites to path pins: see the module
+    docstring's tiers."""
+
+    def __init__(self, root: Node, source: bytes, file_path: str, config: ResolverConfig | None) -> None:
+        self.source = source
+        self.file_path = file_path
+        self.folder = posixpath.dirname(file_path)
+        package = next((c for c in root.named_children if c.type == "package_clause"), None)
+        package_name = ""
+        if package is not None:
+            ident = next((c for c in package.named_children if c.type == "package_identifier"), None)
+            package_name = _text(ident, source) if ident is not None else ""
+        is_test = file_path.endswith("_test.go")
+        # The files of the file's own package: an external test package
+        # (`package x_test`) is its directory's other test files.
+        if is_test and package_name.endswith("_test"):
+            self.own = ("_test.go", "")
+        elif is_test:
+            self.own = (".go", "")
+        else:
+            self.own = (".go", "_test.go")
+        # Imports: name -> its package's directory, or None for an external one.
+        self.bindings: dict[str, str | None] = {}
+        self.dot_dirs: list[str] = []
+        self.import_pins: set[str] = set()
+        unnamed: list[tuple[str, str]] = []  # (default name, directory) of in-repo unaliased imports
+        for name, path in _extract_imports(root, source):
+            found = config.go_package(path) if config is not None else None
+            module, folder = found if found is not None else (None, None)
+            if folder is not None:
+                self.import_pins.add(_dir_pin(folder, ".go", "_test.go"))
+            if name == "_":
+                continue
+            if name == ".":
+                if folder is not None:
+                    self.dot_dirs.append(folder)
+                continue
+            binding = name or _default_import_name(path, module)
+            self.bindings[binding] = folder
+            if name is None and folder is not None:
+                unnamed.append((binding, folder))
+        # The file's declarations: top-level functions (with their first
+        # result type), types, each type's methods and struct fields.
+        self.functions: dict[str, Node | None] = {}
+        self.types: set[str] = set()
+        self.methods: dict[str, set[str]] = {}
+        self.fields: dict[str, dict[str, Node]] = {}
+        for node in root.named_children:
+            if node.type == "function_declaration":
+                name_node = node.child_by_field_name("name")
+                if name_node is not None:
+                    self.functions[_text(name_node, source)] = _first_result(node)
+            elif node.type == "method_declaration":
+                receiver = _receiver_type_name(node, source)
+                name_node = node.child_by_field_name("name")
+                if receiver and name_node is not None:
+                    self.methods.setdefault(receiver, set()).add(_text(name_node, source))
+            elif node.type == "type_declaration":
+                for spec in node.named_children:
+                    if spec.type not in ("type_spec", "type_alias"):
+                        continue
+                    name_node = spec.child_by_field_name("name")
+                    if name_node is None:
+                        continue
+                    type_name = _text(name_node, source)
+                    self.types.add(type_name)
+                    body = spec.child_by_field_name("type")
+                    if body is not None and body.type == "struct_type":
+                        self.fields[type_name] = _struct_fields(body, source)
+        # An unaliased in-repo import whose path name the file never uses as
+        # a qualifier is used by its package clause's name instead (every
+        # import must be used). An unknown qualifier (no import, type or name
+        # the file declares) may be one of them, or a package-level variable
+        # of another file: only when the unknown qualifiers and those imports
+        # are as many are they taken to be them (resolved); otherwise an
+        # unknown qualifier reaches them at package confidence (`~`).
+        qualifiers: set[str] = set()
+        declared: set[str] = set()
+
+        def walk(node: Node) -> None:
+            if node.type in ("selector_expression", "qualified_type"):
+                operand = node.child_by_field_name("operand") or node.child_by_field_name("package")
+                if operand is not None and operand.type in ("identifier", "package_identifier"):
+                    qualifiers.add(_text(operand, source))
+            elif node.type in ("short_var_declaration", "range_clause"):
+                left = node.child_by_field_name("left")
+                for name in (left.named_children if left is not None and left.type == "expression_list"
+                             else [left] if left is not None else []):
+                    if name.type == "identifier":
+                        declared.add(_text(name, source))
+            elif node.type in ("var_spec", "const_spec", "parameter_declaration",
+                               "variadic_parameter_declaration"):
+                declared.update(_text(name, source) for name in node.children_by_field_name("name"))
+            for child in node.children:
+                walk(child)
+
+        walk(root)
+        self.renamed = sorted({folder for name, folder in unnamed if name not in qualifiers})
+        unknown = qualifiers - self.bindings.keys() - self.types - declared - set(self.functions)
+        self.renamed_loose = len(unknown) != len(self.renamed)
+
+    # --- pins ----------------------------------------------------------------
+
+    def _own_dir(self, loose: bool = False) -> str:
+        only, not_suffix = self.own
+        return _dir_pin(self.folder, only, not_suffix, loose)
+
+    def _package_pins(self, folder: str, loose: bool = False) -> list[str]:
+        return [_dir_pin(folder, ".go", "_test.go", loose)]
+
+    def method_pins(self, go_type: GoType, method: str) -> list[str] | None:
+        """Where `method` of `go_type` can be declared; None when nowhere in
+        the repository (a builtin or external type)."""
+        if go_type[0] == "local":
+            if method in self.methods.get(go_type[1], ()):
+                return [self.file_path]
+            return [self._own_dir(loose=True)]
+        if go_type[0] == "pkg":
+            return [pin for folder in go_type[1] for pin in self._package_pins(folder, loose=True)]
+        return None
+
+    def qualifier_dirs(self, qualifier: str) -> tuple[str, ...] | None:
+        """The package directories a qualifier `q.` (not a local name) can
+        name: an import's, () for an external import, the renamed imports'
+        for one the file does not import by that name (`renamed`), else
+        None (a package-level variable, say)."""
+        if qualifier in self.bindings:
+            folder = self.bindings[qualifier]
+            return (folder,) if folder is not None else ()
+        if self.renamed:
+            return tuple(self.renamed)
+        return None
+
+    def qualifier_loose(self, qualifier: str) -> bool:
+        """Whether `qualifier_dirs` reaches its directories only at package
+        confidence: a renamed import an unknown qualifier may not be."""
+        return qualifier not in self.bindings and self.renamed_loose
+
+    def bare_pins(self, name: str) -> list[str] | None:
+        """Where an unqualified `name()` is declared: this file, else its
+        package (and any dot-imported one); None for a builtin."""
+        if name in self.functions:
+            return [self.file_path]
+        if name in _BUILTIN_FUNCS:
+            return None
+        pins = [self._own_dir()]
+        for folder in self.dot_dirs:
+            pins += self._package_pins(folder)
+        return pins
+
+    # --- types ---------------------------------------------------------------
+
+    def type_of(self, node: Node | None) -> GoType | None:
+        """A type expression as a GoType; None when it is not one."""
+        if node is None:
+            return None
+        if node.type in ("pointer_type", "parenthesized_type"):
+            inner = node.named_children[-1] if node.named_children else None
+            return self.type_of(inner)
+        if node.type == "generic_type":
+            return self.type_of(node.child_by_field_name("type"))
+        if node.type == "type_identifier":
+            name = _text(node, self.source)
+            return ("ext",) if name in _BUILTIN_TYPES else ("local", name)
+        if node.type == "qualified_type":
+            package = node.child_by_field_name("package")
+            name = node.child_by_field_name("name")
+            if package is None or name is None:
+                return None
+            folders = self.qualifier_dirs(_text(package, self.source))
+            return ("pkg", folders, _text(name, self.source)) if folders else ("ext",)
+        if node.type in ("slice_type", "array_type", "map_type", "channel_type", "function_type",
+                         "interface_type", "struct_type"):
+            return ("ext",)
+        return None
+
+    def value_type(self, node: Node | None, scope: dict[str, GoType | None]) -> GoType | None:
+        """The type of the expression `node`, as far as this file tells."""
+        if node is None:
+            return None
+        if node.type in ("parenthesized_expression",) and node.named_children:
+            return self.value_type(node.named_children[0], scope)
+        if node.type == "unary_expression":
+            return self.value_type(node.child_by_field_name("operand"), scope)
+        if node.type == "composite_literal":
+            return self.type_of(node.child_by_field_name("type"))
+        if node.type == "identifier":
+            return scope.get(_text(node, self.source))
+        if node.type == "selector_expression":
+            return self.field_type(node, scope)
+        if node.type == "call_expression":
+            func = node.child_by_field_name("function")
+            if func is None:
+                return None
+            if func.type == "identifier":
+                name = _text(func, self.source)
+                if name == "new":
+                    args = node.child_by_field_name("arguments")
+                    return self.type_of(args.named_children[0]) if args is not None and args.named_children else None
+                if name in scope:
+                    return None
+                if name in self.functions:
+                    return self.type_of(self.functions[name])
+                if name in _BUILTIN_FUNCS:
+                    return ("ext",)
+                # A function of the package declared elsewhere: some type of it.
+                return ("local", "")
+            if func.type == "selector_expression":
+                operand = func.child_by_field_name("operand")
+                if operand is not None and operand.type == "identifier":
+                    qualifier = _text(operand, self.source)
+                    if qualifier not in scope and qualifier not in self.types:
+                        folders = self.qualifier_dirs(qualifier)
+                        if folders is not None:
+                            return ("pkg", folders, None) if folders else ("ext",)
+        return None
+
+    def field_type(self, node: Node, scope: dict[str, GoType | None]) -> GoType | None:
+        """The type of `x.f` (a field of a typed value), as far as the
+        struct declarations of this file tell."""
+        operand = node.child_by_field_name("operand")
+        field = node.child_by_field_name("field")
+        if operand is None or field is None:
+            return None
+        if operand.type == "identifier":
+            qualifier = _text(operand, self.source)
+            if qualifier not in scope and qualifier not in self.types:
+                # A package-level variable of another package.
+                folders = self.qualifier_dirs(qualifier)
+                if folders is not None:
+                    return ("pkg", folders, None) if folders else ("ext",)
+        owner = self.value_type(operand, scope)
+        if owner is None or owner[0] != "local" or owner[1] not in self.fields:
+            return None if owner is None or owner[0] != "ext" else ("ext",)
+        declared = self.fields[owner[1]].get(_text(field, self.source))
+        return self.type_of(declared) if declared is not None else None
+
+    # --- calls ---------------------------------------------------------------
+
+    def resolve(self, call: Node, scope: dict[str, GoType | None]) -> tuple[str, list[str] | None, bool] | None:
+        """One call site as (callee name, its pins or None for a bare-name
+        row, whether it is a member call); None when it links nothing."""
+        func = call.child_by_field_name("function")
+        if func is None:
+            return None
+        if func.type == "parenthesized_expression" and func.named_children:
+            func = func.named_children[0]
+        if func.type == "identifier":
+            name = _text(func, self.source)
+            if name in scope:
+                return None  # a function value
+            pins = self.bare_pins(name)
+            return (name, pins, False) if pins else None
+        if func.type != "selector_expression":
+            return None
+        field = func.child_by_field_name("field")
+        operand = func.child_by_field_name("operand")
+        if field is None or operand is None:
+            return None
+        name = _text(field, self.source)
+        if operand.type == "identifier":
+            qualifier = _text(operand, self.source)
+            if qualifier not in scope:
+                if qualifier in self.types:
+                    return name, self.method_pins(("local", qualifier), name), True
+                folders = self.qualifier_dirs(qualifier)
+                if folders is not None:
+                    loose = self.qualifier_loose(qualifier)
+                    pins = [pin for folder in folders for pin in self._package_pins(folder, loose)]
+                    return (name, pins, False) if pins else None
+        receiver = self.value_type(operand, scope)
+        if receiver is not None:
+            pins = self.method_pins(receiver, name)
+            return (name, pins, True) if pins else None
+        if name in STOP_METHODS["go"]:
+            return None
+        return name, None, True
+
+
+def _first_result(func: Node) -> Node | None:
+    """A function declaration's (first) result type node, if any."""
+    result = func.child_by_field_name("result")
+    if result is not None and result.type == "parameter_list":
+        first = next((c for c in result.named_children if c.type == "parameter_declaration"), None)
+        return first.child_by_field_name("type") if first is not None else None
+    return result
+
+
+def _struct_fields(struct: Node, source: bytes) -> dict[str, Node]:
+    """A struct type's named fields and their type nodes."""
+    fields: dict[str, Node] = {}
+    body = next((c for c in struct.named_children if c.type == "field_declaration_list"), None)
+    for decl in body.named_children if body is not None else []:
+        if decl.type != "field_declaration":
+            continue
+        type_node = decl.child_by_field_name("type")
+        for child in decl.children_by_field_name("name"):
+            if type_node is not None:
+                fields[_text(child, source)] = type_node
+    return fields
+
+
+def _bind(scope: dict, names: list[Node], values: list[Node | None], resolver: _GoResolver, source: bytes,
+          declared: Node | None = None) -> None:
+    """Add declared names to `scope` with their types: the declared type,
+    else each value's when names and values pair up, else unknown."""
+    for i, name in enumerate(names):
+        if name.type != "identifier":
+            continue
+        text = _text(name, source)
+        if text == "_":
+            continue
+        if declared is not None:
+            scope[text] = resolver.type_of(declared)
+        elif len(values) == len(names):
+            scope[text] = resolver.value_type(values[i], scope)
+        else:
+            scope[text] = None
+
+
+def _function_scope(func: Node, resolver: _GoResolver, source: bytes) -> dict:
+    """A function's parameters and receiver, with their types."""
+    scope: dict = {}
+    for field_name in ("receiver", "parameters"):
+        params = func.child_by_field_name(field_name)
+        for param in params.named_children if params is not None else []:
+            if param.type in ("parameter_declaration", "variadic_parameter_declaration"):
+                declared = param.child_by_field_name("type")
+                if param.type == "variadic_parameter_declaration":
+                    declared = None
+                for name in param.children_by_field_name("name"):
+                    text = _text(name, source)
+                    if text != "_":
+                        scope[text] = resolver.type_of(declared) if declared is not None else None
+    return scope
+
+
+def _collect_calls(body: Node, scope: dict, resolver: _GoResolver, source: bytes, found: list) -> None:
+    """Walk a function body in order, binding local variables as they are
+    declared and resolving each call against the scope at that point.
+    Anonymous functions are walked as part of their enclosing function (no
+    node of their own to attribute calls to)."""
+
+    def expressions(node: Node | None) -> list[Node]:
+        if node is None:
+            return []
+        return list(node.named_children) if node.type == "expression_list" else [node]
+
+    def walk(node: Node) -> None:
+        if node.type == "call_expression":
+            # Arguments and the callee's own operand first, as evaluated.
+            for child in node.children:
+                walk(child)
+            site = resolver.resolve(node, scope)
+            if site is not None:
+                found.append(site)
+            return
+        if node.type == "short_var_declaration":
+            right = node.child_by_field_name("right")
+            if right is not None:
+                walk(right)
+            _bind(scope, expressions(node.child_by_field_name("left")), expressions(right), resolver, source)
+            return
+        if node.type == "var_spec":
+            value = node.child_by_field_name("value")
+            if value is not None:
+                walk(value)
+            _bind(scope, node.children_by_field_name("name"), expressions(value), resolver, source,
+                  node.child_by_field_name("type"))
+            return
+        if node.type == "range_clause":
+            right = node.child_by_field_name("right")
+            if right is not None:
+                walk(right)
+            _bind(scope, expressions(node.child_by_field_name("left")), [], resolver, source)
+            return
+        if node.type == "func_literal":
+            params = node.child_by_field_name("parameters")
+            for param in params.named_children if params is not None else []:
+                declared = param.child_by_field_name("type")
+                for name in param.children_by_field_name("name"):
+                    scope[_text(name, source)] = resolver.type_of(declared) if declared is not None else None
+        for child in node.children:
+            walk(child)
+
+    walk(body)
 
 
 def extract_go_file(
     source_code: str,
     file_path: str,
     repo_id: str,
-    module_path: str | None = None,
+    config: ResolverConfig | None = None,
 ) -> ExtractionResult:
     """Parse a Go file and extract nodes and relationships.
 
@@ -270,11 +648,10 @@ def extract_go_file(
         file_path: The Module node's identity — the file's path relative to
             the repo root, using forward slashes (e.g. 'pkg/service/main.go').
         repo_id: Repository ID for scoping nodes.
-        module_path: The repo's go.mod `module` directive value, if known
-            (e.g. 'github.com/someone/myrepo'). Used to tell intra-module
-            imports apart from external ones when guessing IMPORTS targets
-            (see `_resolve_import_targets`). Optional — pass None when no
-            go.mod was found or this file isn't part of a module.
+        config: The repository's resolver configuration (its go.mod and
+            go.work files), read once per batch: an import path resolves by
+            the longest in-repository module path it is under. None makes
+            every import external.
 
     Returns:
         ExtractionResult containing lists of nodes and relationships. On a
@@ -311,18 +688,9 @@ def extract_go_file(
     )
     result.nodes.append(module_node)
 
-    for import_path in _extract_imports(root, source_bytes):
-        for target in _resolve_import_targets(import_path, module_path):
-            result.relationships.append(
-                GraphRelationship(
-                    from_label="Module",
-                    from_name=file_path,
-                    rel_type="IMPORTS",
-                    to_label="Module",
-                    to_name=target,
-                    repo_id=repo_id,
-                )
-            )
+    resolver = _GoResolver(root, source_bytes, file_path, config)
+    result.relationships += import_rows(file_path, repo_id, set(), resolver.import_pins)
+    sites = CallSites()
 
     def _emit_contains(parent_label: str, parent_name: str, child_label: str, child_name: str) -> None:
         result.relationships.append(
@@ -338,19 +706,11 @@ def extract_go_file(
             )
         )
 
-    def _emit_call(caller_name: str, caller_label: str, target_name: str, caller_class: str | None) -> None:
-        properties = {"caller_class": caller_class} if caller_class else None
-        result.relationships.append(
-            GraphRelationship(
-                from_label=caller_label,
-                from_name=caller_name,
-                rel_type="CALLS",
-                to_label="Function",
-                to_name=target_name,
-                repo_id=repo_id,
-                properties=properties,
-            )
-        )
+    def _record_calls(node: Node, body: Node, caller_name: str, caller_class: str | None) -> None:
+        found: list = []
+        _collect_calls(body, _function_scope(node, resolver, source_bytes), resolver, source_bytes, found)
+        for name, pins, member in found:
+            sites.add("Function", caller_name, caller_class, name, pins, member)
 
     def _visit_struct(type_spec: Node) -> None:
         name_node = type_spec.child_by_field_name("name")
@@ -433,8 +793,7 @@ def extract_go_file(
         _emit_contains("Module", file_path, "Function", func_name)
 
         if body_node is not None:
-            for target in _extract_call_targets(body_node, source_bytes):
-                _emit_call(func_name, "Function", target, caller_class=None)
+            _record_calls(node, body_node, func_name, None)
 
     def _visit_method(node: Node) -> None:
         name_node = node.child_by_field_name("name")
@@ -465,8 +824,7 @@ def extract_go_file(
             _emit_contains("Module", file_path, "Function", method_name)
 
         if body_node is not None:
-            for target in _extract_call_targets(body_node, source_bytes):
-                _emit_call(method_name, "Function", target, caller_class=receiver_type)
+            _record_calls(node, body_node, method_name, receiver_type)
 
     for node in root.named_children:
         if node.type == "type_declaration":
@@ -477,23 +835,9 @@ def extract_go_file(
             _visit_function(node)
         elif node.type == "method_declaration":
             _visit_method(node)
+    result.relationships += sites.rows(file_path, repo_id)
 
-    return result
-
-
-def _find_module_path(repo_root: Path) -> str | None:
-    """Read go.mod's `module` directive from the repo root, if present."""
-    go_mod = repo_root / "go.mod"
-    if not go_mod.exists():
-        return None
-    try:
-        for line in go_mod.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if line.startswith("module "):
-                return line[len("module ") :].strip()
-    except OSError:
-        return None
-    return None
+    return own_edges(result, file_path)
 
 
 def index_file(
@@ -513,10 +857,10 @@ def index_file(
         repo_id: Repository ID for scoping.
         file_path: Path to the Go file to index.
         repo_root: The repository's root directory. When given, the Module
-            node is keyed by file_path's path relative to repo_root, and
-            go.mod (if present at repo_root) is read to resolve intra-module
-            imports. When omitted, falls back to the bare filename and no
-            go.mod-based import resolution.
+            node is keyed by file_path's path relative to repo_root, and the
+            repository's go.mod and go.work files resolve its imports. When
+            omitted, falls back to the bare filename and every import is
+            external.
 
     Raises:
         FileNotFoundError: If the file does not exist.
@@ -527,7 +871,7 @@ def index_file(
 
     source_code = file_path.read_text(encoding="utf-8")
 
-    module_path = None
+    config = None
     if repo_root is not None:
         repo_root = Path(repo_root)
         try:
@@ -535,11 +879,11 @@ def index_file(
             module_name = rel.as_posix()
         except ValueError:
             module_name = file_path.name
-        module_path = _find_module_path(repo_root)
+        config = ResolverConfig(repo_root)
     else:
         module_name = file_path.name
 
-    result = extract_go_file(source_code, module_name, repo_id, module_path)
+    result = extract_go_file(source_code, module_name, repo_id, config)
 
     engine.upsert_nodes([node.to_dict() for node in result.nodes])
     engine.upsert_relationships([rel.to_dict() for rel in result.relationships])

@@ -40,6 +40,7 @@ class Rig:
         self.registry = MagicMock()
         self.registry.get.return_value = RepoRecord(REPO, root, True, True, None, docs_path=None)
         self.engine = MagicMock()
+        self.engine.index_format.return_value = dispatch.INDEX_FORMAT
         self.events: list[dict] = []
         self.requests: list[tuple] = []
         self.sync = RepoSync(
@@ -80,6 +81,35 @@ def test_a_batch_stamps_its_start(rig, indexing):
     rig.sync.on_changes(REPO, {rig.root / "a.py"}, set())
     assert rig.stamps() == [T0]
     rig.registry.mark_indexed.assert_called_once_with(REPO, at=T0)
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_a_gitignore_change_catches_up_from_the_batch_start(rig, indexing, deleted):
+    """A .gitignore edit changes which files are indexed: the batch is
+    followed by a catch-up, which prunes what is now ignored and indexes what
+    no longer is."""
+    indexing["catch_up"].return_value = CatchUp(indexed=2, pruned=3, checked=9)
+    gitignore = rig.root / "web" / ".gitignore"
+    changed, gone = (set(), {gitignore}) if deleted else ({gitignore}, set())
+    rig.sync.on_changes(REPO, changed, gone)
+    assert indexing["catch_up"].call_args.args[:4] == (rig.engine, REPO, rig.root, T0)
+    assert rig.events[-1] == {"type": "reindexed", "repo_id": REPO, "changed": 2 + (0 if deleted else 1),
+                              "deleted": 3 + (1 if deleted else 0)}
+
+
+def test_a_batch_checks_the_resolver_configuration(rig, indexing):
+    """Every batch hands its changed and deleted paths to
+    sync_resolver_config, whose re-indexed files count as changed."""
+    config, gone = rig.root / "tsconfig.json", rig.root / "old.ts"
+    with patch.object(sync, "sync_resolver_config", return_value=5) as resync:
+        rig.sync.on_changes(REPO, {config}, {gone})
+    assert resync.call_args.args == (rig.engine, REPO, rig.root, {config, gone})
+    assert rig.events[-1] == {"type": "reindexed", "repo_id": REPO, "changed": 1 + 5, "deleted": 1}
+
+
+def test_a_batch_without_a_gitignore_does_not_catch_up(rig, indexing):
+    rig.sync.on_changes(REPO, {rig.root / "a.py"}, set())
+    indexing["catch_up"].assert_not_called()
 
 
 def test_a_failed_batch_sets_the_floor_and_asks_for_a_catch_up(rig, indexing):
@@ -339,3 +369,17 @@ def test_on_catch_up_reports_whether_it_succeeded(rig, indexing):
     assert rig.sync.on_catch_up(REPO, T0) is False
     rig.registry.get.return_value = None
     assert rig.sync.on_catch_up(REPO, T0) is False
+
+
+def test_a_removed_repo_is_purged_and_forgotten(tmp_path):
+    """The watcher calls `on_removed` once a removed repo's jobs are done:
+    whatever they wrote after `devgraph remove` deleted the graph goes too,
+    and its failure floor with it."""
+    rig = Rig(tmp_path)
+    rig.sync._failed(REPO, T0, RuntimeError("neo4j down"))
+    rig.registry.get.return_value = None
+    rig.sync.on_removed(REPO)
+    rig.engine.delete_repository.assert_called_once_with(REPO)
+    rig.requests.clear()
+    rig.sync.retry_failed()
+    assert rig.requests == []

@@ -15,6 +15,7 @@ import asyncio
 import json
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.config.settings import Settings
 from devgraph.graph import schema
@@ -34,6 +35,9 @@ class _StubEngine:
         self.calls.append((cypher, params or {}))
         return self.rows
 
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        return self.run_cypher(query, params), False
+
     @property
     def cypher(self) -> str:
         assert len(self.calls) == 1, f"expected exactly one query, got {len(self.calls)}"
@@ -46,7 +50,10 @@ class _StubEngine:
 
 
 class _StubRegistry:
-    """build_server only stows the registry away for tools needing a repo root."""
+    """Knows repository `demo`; no tool here needs its root."""
+
+    def get(self, repo_id):
+        return object() if repo_id == "demo" else None
 
 
 def _node(name, *, repo_id="demo", file="src/app.py", labels=("Module",)):
@@ -113,7 +120,7 @@ class TestQueryConstruction:
 
     @pytest.mark.parametrize(
         "requested,expected",
-        [(0, 2), (1, 2), (2, 2), (5, 5), (8, 8), (9, 8), (500, 8), (-3, 2)],
+        [(2, 2), (5, 5), (8, 8), (9, 8), (500, 8)],
     )
     def test_max_length_is_clamped_to_2_through_8(self, requested, expected):
         engine = _StubEngine()
@@ -146,7 +153,7 @@ class TestRelationshipValidation:
     def test_an_unsupported_relationship_raises_before_any_query_runs(self, relationship):
         engine = _StubEngine()
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ToolError):
             find_dependency_cycles(engine, "demo", relationship=relationship)
 
         assert engine.calls == []
@@ -154,20 +161,21 @@ class TestRelationshipValidation:
     def test_an_injection_attempt_never_reaches_the_engine(self):
         engine = _StubEngine()
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ToolError):
             find_dependency_cycles(engine, "demo", relationship="IMPORTS] ) DETACH DELETE n //")
 
         assert engine.calls == []
 
-    def test_the_error_does_not_echo_the_rejected_input_back(self):
-        """The message lands in a model's context; the argument is
-        caller-controlled and unbounded, so it is described, not repeated."""
+    def test_the_error_echoes_at_most_100_characters_of_the_rejected_input(self):
+        """The message lands in a model's context and the argument is
+        caller-controlled and unbounded, so the echo is capped."""
         engine = _StubEngine()
 
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(ToolError) as excinfo:
             find_dependency_cycles(engine, "demo", relationship="zz-" + "x" * 5000)
 
-        assert "zz-" not in str(excinfo.value)
+        assert repr("zz-" + "x" * 97) in str(excinfo.value)
+        assert "x" * 98 not in str(excinfo.value)
         assert "IMPORTS" in str(excinfo.value)
 
 
@@ -183,16 +191,18 @@ class TestRepositoryScoping:
         assert "start.repo_id = $repo_id" in engine.cypher
         assert engine.params == {"repo_id": "demo"}
 
-    def test_cross_repo_drops_every_repo_predicate(self):
+    def test_cross_repo_drops_the_single_repo_predicate(self):
         engine = _StubEngine()
 
         find_dependency_cycles(engine, "demo", cross_repo=True)
 
         # The projection still reports each node's repo_id; what goes is every
-        # predicate that would restrict the match to one repository.
+        # predicate that would restrict the match to one repository. What stays
+        # is the bound to the registered repositories (None here: a direct call,
+        # not through the MCP server's cross-repo gate).
         assert "$repo_id" not in engine.cypher
-        assert "ALL(n IN nodes(path)" not in engine.cypher
-        assert engine.params == {}
+        assert "$cross_repo_ids" in engine.cypher
+        assert engine.params == {"cross_repo_ids": None}
 
 
 class TestCanonicalisation:
@@ -327,13 +337,14 @@ class TestEnvelope:
         assert len(result["results"]) == 3
         assert result["truncated"] is True
 
-    def test_max_results_is_clamped_to_at_least_one(self):
-        engine = _StubEngine([_closed_path("a", "b"), _closed_path("c", "d")])
+    @pytest.mark.parametrize("max_length", [1, 0, -3])
+    def test_a_max_length_below_two_is_an_error(self, max_length):
+        with pytest.raises(ToolError, match=f"max_length must be at least 2, not {max_length}"):
+            find_dependency_cycles(_StubEngine(), "demo", max_length=max_length)
 
-        result = find_dependency_cycles(engine, "demo", max_results=0)
-
-        assert result["count"] == 2
-        assert len(result["results"]) == 1
+    def test_a_max_results_below_one_is_an_error(self):
+        with pytest.raises(ToolError, match="max_results must be at least 1, not 0"):
+            find_dependency_cycles(_StubEngine(), "demo", max_results=0)
 
     def test_hitting_the_raw_path_cap_reports_truncated_even_when_count_is_small(self):
         """All 500 raw paths are rotations of one cycle, so the deduplicated

@@ -131,3 +131,14 @@ def test_front_matter_that_yaml_cannot_construct_is_skipped():
     content = "---\ntype: requirement\nid: 2001-13-45\n---\n# Title\n"
     result = DocsExtractor("test-repo").extract_from_source(content, "bad-date.md")
     assert result.docs == []
+
+
+def test_the_note_unclaim_is_anchored_on_every_note_label():
+    """G2 set (d) scans only docs-note nodes (a label scan, not every node in
+    the graph), and covers each label the extractor writes."""
+    from devgraph.graph.engine import _UNCLAIM_DOC_NOTE_EDGES_CYPHER
+    from devgraph.indexer.docs.extractor import _TYPE_TO_LABEL, DOC_NOTE_LABELS
+
+    assert set(DOC_NOTE_LABELS) == set(_TYPE_TO_LABEL.values())
+    first_match = _UNCLAIM_DOC_NOTE_EDGES_CYPHER.split("CALL", 1)[0]
+    assert first_match.startswith(f"MATCH (n:{'|'.join(DOC_NOTE_LABELS)} {{")

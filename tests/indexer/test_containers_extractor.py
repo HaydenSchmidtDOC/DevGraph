@@ -285,3 +285,56 @@ def test_compose_file_that_yaml_cannot_construct_is_skipped():
     content = "services:\n  web:\n    image: app\n    labels:\n      built: 2001-13-45\n"
     result = ContainerExtractor("test-repo").extract_from_compose_file(content)
     assert result.services == []
+
+
+def _depends_on(content: str) -> set[tuple[str, str, str | None, str | None]]:
+    result = ContainerExtractor("test-repo").extract_from_compose_file(content, "deploy/compose.yaml")
+    return {
+        (r.source_name, r.target_name, r.from_file, r.to_file)
+        for r in result.relationships
+        if r.relationship_type == "DEPENDS_ON"
+    }
+
+
+def test_compose_depends_on_list_and_dict_forms_and_links():
+    content = """
+services:
+  web:
+    image: nginx
+    depends_on: [api, cache]
+    links: ["api:backend", "cache"]
+  api:
+    image: python
+    depends_on:
+      db:
+        condition: service_healthy
+  worker:
+    image: python
+    links:
+      - db:database
+  db:
+    image: postgres
+  cache:
+    image: redis
+"""
+    pinned = "deploy/compose.yaml"
+    assert _depends_on(content) == {
+        ("web", "api", pinned, pinned),
+        ("web", "cache", pinned, pinned),
+        ("api", "db", pinned, pinned),
+        ("worker", "db", pinned, pinned),
+    }
+
+
+def test_compose_dependency_forms_that_name_no_service_are_ignored():
+    content = """
+services:
+  web:
+    image: nginx
+    depends_on: api
+    links: {api: x}
+  odd:
+    image: nginx
+    depends_on: [3, {api: 1}, ""]
+"""
+    assert _depends_on(content) == set()

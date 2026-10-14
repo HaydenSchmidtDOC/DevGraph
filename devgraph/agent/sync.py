@@ -19,7 +19,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from devgraph.indexer.dispatch import catch_up, index_paths, remove_paths
+from devgraph.indexer.dispatch import (
+    catch_up,
+    index_paths,
+    remove_paths,
+    sync_resolver_config,
+)
+from devgraph.indexer.gitignore import GITIGNORE
+from devgraph.indexer.walk import RepoRootUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +62,8 @@ class RepoSync:
         self._now = now
         self._lock = threading.Lock()  # guards _floors and _running
         self._floors: dict[str, datetime] = {}
+        # Repositories whose root folder is missing or looks unmounted, warned about once.
+        self._root_warned: set[str] = set()
         # repo_id -> when the current failure streak last warned
         self._warned: dict[str, datetime] = {}
         self._running = 0
@@ -88,8 +97,25 @@ class RepoSync:
                 )
             if deleted_paths:
                 removed = remove_paths(self._engine, repo_id, repo.path, deleted_paths)
+            # A tsconfig, go.mod or Cargo.toml change re-indexes every file it can resolve differently.
+            indexed += sync_resolver_config(
+                self._engine, repo_id, repo.path, changed_paths | deleted_paths,
+                docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
+            )
+            if any(Path(p).name == GITIGNORE for p in changed_paths | deleted_paths):
+                # A .gitignore edit changes which files are indexed anywhere
+                # below it: catch up, which prunes the files now ignored and
+                # indexes the ones no longer ignored, as a fresh scan would.
+                result = catch_up(
+                    self._engine, repo_id, repo.path, started,
+                    docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
+                )
+                indexed += result.indexed
+                removed += result.pruned
             self._registry.mark_indexed(repo_id, at=self._held_back(repo_id, started))
             self._publish({"type": "reindexed", "repo_id": repo_id, "changed": indexed, "deleted": removed})
+        except RepoRootUnavailable as exc:
+            self._skip_unavailable_root(repo_id, exc)
         except Exception as exc:
             # The batch's events can predate `started` by as long as it waited
             # on the batch lock (a catch-up or schema rescan can hold it for
@@ -104,7 +130,9 @@ class RepoSync:
         Returns whether it did (False when it failed, or the repository is gone).
 
         `reason` is "start" (the watcher started watching), "git" (after a
-        git operation) or "retry" (after a failure); it only changes the logs.
+        git operation), "overflow" (the OS dropped events), "unwatched" (a
+        folder couldn't be watched) or "retry" (after a failure); it only
+        changes the logs.
         """
         with self._lock:
             floor = self._floors.get(repo_id)
@@ -132,6 +160,8 @@ class RepoSync:
                     del self._floors[repo_id]
                     self._warned.pop(repo_id, None)
             self._registry.mark_indexed(repo_id, at=self._held_back(repo_id, started))
+            with self._lock:
+                self._root_warned.discard(repo_id)
         except Exception as exc:
             error: Exception | None = exc
         else:
@@ -142,7 +172,10 @@ class RepoSync:
                 self._running -= 1
         if error is not None:
             self._publish({"type": "catch_up", "repo_id": repo_id, "state": "failed", "changed": 0, "deleted": 0})
-            self._failed(repo_id, since, error)
+            if isinstance(error, RepoRootUnavailable):
+                self._skip_unavailable_root(repo_id, error)
+            else:
+                self._failed(repo_id, since, error)
             return False
         elapsed = time.monotonic() - clock
         self._publish({
@@ -154,6 +187,17 @@ class RepoSync:
             self._publish({"type": "reindexed", "repo_id": repo_id, "changed": result.indexed, "deleted": result.pruned})
         self._log_result(repo_id, reason, result, found, elapsed)
         return True
+
+    def on_removed(self, repo_id: str) -> None:
+        """Delete the graph data of a repository no longer registered, and
+        forget its floor. The watcher calls this under the batch lock once the
+        repository's last job is done: `devgraph remove` deletes the graph
+        from another process, and a batch running then can write after it."""
+        self._engine.delete_repository(repo_id)
+        with self._lock:
+            self._floors.pop(repo_id, None)
+            self._warned.pop(repo_id, None)
+            self._root_warned.discard(repo_id)
 
     def retry_failed(self) -> None:
         """Ask for a catch-up of every repository with a floor (the health
@@ -167,6 +211,16 @@ class RepoSync:
         with self._lock:
             floor = self._floors.get(repo_id)
         return started if floor is None or started <= floor else floor
+
+    def _skip_unavailable_root(self, repo_id: str, error: RepoRootUnavailable) -> None:
+        """Skip a repository whose root folder is missing, unreadable or looks
+        unmounted: nothing was changed, and nothing is retried (the next
+        start, or `devgraph rescan`, tries again). Warns once per repository."""
+        with self._lock:
+            first = repo_id not in self._root_warned
+            self._root_warned.add(repo_id)
+        level = logging.WARNING if first and not self.stopping else logging.DEBUG
+        logger.log(level, "Skipping %s: %s", repo_id, error)
 
     def _failed(self, repo_id: str, start: datetime, error: Exception) -> None:
         """Hold the repository's stamps back to `start`, warn (unless

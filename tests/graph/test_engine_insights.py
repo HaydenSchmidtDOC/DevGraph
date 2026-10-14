@@ -64,6 +64,34 @@ def test_load_returns_only_relevant_edges_and_their_nodes(engine):
     assert len(edges) == 7 and {e["type"] for e in edges} == {"CALLS"}
 
 
+def test_load_leaves_out_python_calls_matched_by_name_or_package(engine):
+    build_two_subsystems(engine)
+    engine.run_cypher(
+        "UNWIND $pairs AS pair "
+        "MATCH (s:Function {repo_id: $repo, name: pair[0]}), (t:Function {repo_id: $repo, name: pair[1]}) "
+        "MATCH (s)-[r:CALLS]->(t) SET r.confidence = pair[2]",
+        {"repo": REPO, "pairs": [["a", "b", "resolved"], ["b", "c", "name"], ["a", "c", "package"]]},
+    )
+    _nodes, edges = engine.load_insight_graph(REPO, COMMUNITY_RELATIONSHIPS)
+    # The resolved edge and the four without a confidence stay.
+    assert len(edges) == 5
+
+
+def test_load_leaves_out_imports_at_package_confidence(engine):
+    """A package-confidence IMPORTS edge (a C# class reached in any C#
+    file, a Java class file found by suffix in another module) can fan one
+    import out to many same-named targets, as a package CALLS edge can."""
+    build_two_subsystems(engine)
+    engine.run_cypher(
+        "UNWIND $rows AS row "
+        "MERGE (m:Module {repo_id: $repo, name: row[0]}) MERGE (t:Module {repo_id: $repo, name: row[1]}) "
+        "CREATE (m)-[r:IMPORTS]->(t) SET r.confidence = row[2]",
+        {"repo": REPO, "rows": [["m.py", "n.py", "resolved"], ["m.py", "o.py", "package"], ["m.py", "p.py", None]]},
+    )
+    _nodes, edges = engine.load_insight_graph(REPO, COMMUNITY_RELATIONSHIPS)
+    assert sum(e["type"] == "IMPORTS" for e in edges) == 2
+
+
 def test_refresh_writes_node_and_repository_properties(engine):
     build_two_subsystems(engine)
     summary = refresh_insights(engine, REPO)
@@ -129,3 +157,16 @@ def test_communities_json_is_capped_at_fifty(engine):
     assert summary["community_count"] == 60
     raw = engine.read_insights_summary(REPO)
     assert len(json.loads(raw["communities"])) == 50
+
+
+def test_a_refresh_of_a_deleted_repository_does_not_recreate_it(engine):
+    """A refresh that lands after `devgraph remove` deleted the graph only
+    updates nodes that still exist: it never brings back a Repository node."""
+    import uuid
+
+    repo = f"_smoketest_insights_removed_{uuid.uuid4().hex[:8]}"
+    try:
+        refresh_insights(engine, repo)
+        assert engine.run_cypher("MATCH (n {repo_id: $r}) RETURN count(n) AS c", {"r": repo}) == [{"c": 0}]
+    finally:
+        engine.delete_repository(repo)

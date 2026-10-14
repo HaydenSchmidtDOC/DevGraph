@@ -26,7 +26,11 @@ class FunctionNode:
 
 @dataclass
 class Relationship:
-    """Represents a relationship between nodes."""
+    """Represents a relationship between nodes.
+
+    `to_file` pins the target: a file matches that file's node, "" the
+    file-less handler stub, and None (Django) every node of the name.
+    """
 
     source_label: str
     source_name: str
@@ -34,6 +38,7 @@ class Relationship:
     target_label: str
     target_name: str
     properties: dict = field(default_factory=dict)
+    to_file: str | None = None
 
 
 @dataclass
@@ -43,6 +48,24 @@ class ExtractionResult:
     endpoints: List[EndpointNode] = field(default_factory=list)
     functions: List[FunctionNode] = field(default_factory=list)
     relationships: List[Relationship] = field(default_factory=list)
+
+
+def _pinned_implements(endpoint_id: str, handler_name: str, filename: str) -> list[Relationship]:
+    """A FastAPI/Flask Endpoint's IMPLEMENTS edges: the handler `def` follows
+    its decorator in the route's own file, so the target is that file's
+    Function and the file-less handler stub, never a same-named Function in
+    another file."""
+    return [
+        Relationship(
+            source_label="Endpoint",
+            source_name=endpoint_id,
+            relationship_type="IMPLEMENTS",
+            target_label="Function",
+            target_name=handler_name,
+            to_file=to_file,
+        )
+        for to_file in (filename, "")
+    ]
 
 
 class APIExtractor:
@@ -121,15 +144,7 @@ class APIExtractor:
                     properties={"type": "handler", "source": filename},
                 )
                 result.functions.append(function)
-
-                relationship = Relationship(
-                    source_label="Endpoint",
-                    source_name=endpoint_id,
-                    relationship_type="IMPLEMENTS",
-                    target_label="Function",
-                    target_name=handler_name,
-                )
-                result.relationships.append(relationship)
+                result.relationships.extend(_pinned_implements(endpoint_id, handler_name, filename))
 
     def _extract_flask_routes(
         self, content: str, result: ExtractionResult, filename: str
@@ -176,15 +191,7 @@ class APIExtractor:
                         properties={"type": "handler", "source": filename},
                     )
                     result.functions.append(function)
-
-                    relationship = Relationship(
-                        source_label="Endpoint",
-                        source_name=endpoint_id,
-                        relationship_type="IMPLEMENTS",
-                        target_label="Function",
-                        target_name=handler_name,
-                    )
-                    result.relationships.append(relationship)
+                    result.relationships.extend(_pinned_implements(endpoint_id, handler_name, filename))
 
     def _extract_django_urls(
         self, content: str, result: ExtractionResult, filename: str

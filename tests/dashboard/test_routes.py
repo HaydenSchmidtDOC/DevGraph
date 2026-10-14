@@ -99,6 +99,23 @@ def test_list_repos(client):
     assert repo_a["node_count"] >= 4  # 2 services + 1 module + 1 class
 
 
+def test_list_repos_marks_a_missing_repository_folder(seeded_graph, registry, tmp_path):
+    present, gone = tmp_path / "a", tmp_path / "b"
+    for path in (present, gone):
+        path.mkdir()
+        _init_git_repo(path)
+    registry.add_repo(present, repo_id="dash_repo_a")
+    gone = registry.add_repo(gone, repo_id="dash_repo_b").path  # the registry's own (resolved) spelling
+    import shutil
+
+    shutil.rmtree(gone)
+    client = TestClient(build_app(seeded_graph, registry, EventBroadcaster()), base_url="http://127.0.0.1")
+    repos = {r["repo_id"]: r for r in client.get("/api/repos").json()["repos"]}
+    assert repos["dash_repo_a"]["path_missing"] is False
+    assert repos["dash_repo_b"]["path_missing"] is True
+    assert repos["dash_repo_b"]["issue"] == f"path missing: repository folder not found: {gone}"
+
+
 def test_summary_counts_known_seeded_data(client):
     res = client.get("/api/repos/dash_repo_a/summary")
     assert res.status_code == 200
@@ -397,6 +414,16 @@ def test_schema_without_a_file_is_the_builtins(client):
     assert counts["Service"] == 2 and counts["Module"] == 1
 
 
+def test_schema_serves_the_hidden_properties(client):
+    """The node inspector hides the same bookkeeping properties describe_node
+    does, and the edge inspector an edge's `origins`."""
+    from devgraph.graph.schema import INTERNAL_EDGE_PROPERTIES, INTERNAL_NODE_PROPERTIES
+
+    body = client.get("/api/repos/dash_repo_a/schema").json()
+    assert body["hidden_properties"] == sorted(INTERNAL_NODE_PROPERTIES | INTERNAL_EDGE_PROPERTIES)
+    assert {"claims", "name_refs", "name_ref_targets", "name_ref_sources", "origins"} <= set(body["hidden_properties"])
+
+
 def test_schema_applied_lists_project_types_with_colours_and_counts(schema_repo):
     client, _, _ = schema_repo
     body = client.get("/api/repos/dash_schema/schema").json()
@@ -567,3 +594,22 @@ def test_pending_only_label_is_gated_until_rescanned(schema_repo, engine):
 def test_search_is_not_available_for_the_all_scope(client):
     assert client.get("/api/repos/__all__/search", params={"q": "x"}).status_code == 404
     assert client.get("/api/repos/nope/search", params={"q": "x"}).status_code == 404
+
+
+def _dashboard_god_nodes_query(where: str) -> str:
+    """The degree fallback the dashboard's Overview panel runs, with its `${where}` filled in."""
+    import re
+
+    html = (Path(__file__).resolve().parents[2] / "devgraph" / "dashboard" / "static" / "index.html").read_text()
+    (template,) = re.findall(r"const godJson = await runCypher\(`([^`]*)`\)", html)
+    return template.replace("${where}", where)
+
+
+def test_dashboard_god_nodes_degree_query_runs_on_neo4j_5(client):
+    query = _dashboard_god_nodes_query('WHERE n.repo_id = "dash_repo_a" ')
+    res = client.post("/api/cypher", json={"query": query, "repo_id": "dash_repo_a"})
+    body = res.json()
+    assert body["errors"] == []
+    rows = [d["row"] for d in body["results"][0]["data"]]
+    assert rows and all(isinstance(row[2], int) for row in rows)
+    assert max(row[2] for row in rows) >= 1

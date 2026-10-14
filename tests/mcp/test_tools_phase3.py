@@ -3,6 +3,7 @@ issue_history_for.
 """
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.mcp.tools import blame_component, find_related_prs, issue_history_for
@@ -74,6 +75,17 @@ class TestBlameComponent:
         shas = {r["sha"] for r in result}
         assert "sha_b" in shas
 
+    def test_blame_an_unknown_file_is_not_found(self, seeded_graph):
+        """Like the other tools: an empty list read as "no commits touched it"."""
+        with pytest.raises(ToolError, match=r"no file named 'auth' in repository 'test_repo_a'.*name='auth\.py'"):
+            blame_component(seeded_graph, "test_repo_a", "auth")
+        with pytest.raises(ToolError, match="no file named 'nowhere.py' in any repository"):
+            blame_component(seeded_graph, "test_repo_a", "nowhere.py", cross_repo=True)
+
+    def test_blame_a_file_no_commit_touched_is_empty(self, seeded_graph):
+        seeded_graph.upsert_node("Module", "test_repo_a", "untouched.py")
+        assert blame_component(seeded_graph, "test_repo_a", "untouched.py") == []
+
 
 class TestFindRelatedPrs:
     def test_find_related_prs_basic(self, seeded_graph):
@@ -84,13 +96,13 @@ class TestFindRelatedPrs:
 
     def test_find_related_prs_truncation(self, seeded_graph):
         """Test that truncated flag is set when total count exceeds max_results."""
-        result = find_related_prs(seeded_graph, "test_repo_a", "auth.py", max_results=0)
+        result = find_related_prs(seeded_graph, "test_repo_a", "auth.py", max_results=1)
         assert "truncated" in result
         assert "count" in result
-        # If count > max_results (0), truncated should be True
-        if result["count"] > 0:
+        # If count > max_results (1), truncated should be True
+        if result["count"] > 1:
             assert result["truncated"] is True
-            assert len(result["results"]) == 0
+            assert len(result["results"]) == 1
 
 
 class TestIssueHistoryFor:
@@ -106,10 +118,10 @@ class TestIssueHistoryFor:
 
     def test_issue_history_truncation(self, seeded_graph):
         """Test that truncated flag is set when total count exceeds max_results."""
-        result = issue_history_for(seeded_graph, "test_repo_a", "auth.py", max_results=0)
+        result = issue_history_for(seeded_graph, "test_repo_a", "auth.py", max_results=1)
         assert "truncated" in result
         assert "count" in result
-        # If count > max_results (0), truncated should be True
-        if result["count"] > 0:
+        # If count > max_results (1), truncated should be True
+        if result["count"] > 1:
             assert result["truncated"] is True
-            assert len(result["results"]) == 0
+            assert len(result["results"]) == 1

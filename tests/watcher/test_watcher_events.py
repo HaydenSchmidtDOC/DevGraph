@@ -137,6 +137,20 @@ def test_move_into_ignored_dir_is_a_delete(h, root):
     assert h.one_batch() == (set(), {"pkg/a.py"})
 
 
+def test_a_gitignored_file_is_not_queued_but_the_gitignore_is(h, root):
+    _write(root / ".gitignore", "*.log\nout/\n")
+    _write(root / "pkg/debug.log")
+    _write(root / "out/bundle.js")
+    _write(root / "pkg/a.py")
+    h.send(
+        FileModifiedEvent(h.p("pkg/debug.log")),
+        FileCreatedEvent(h.p("out/bundle.js")),
+        FileModifiedEvent(h.p("pkg/a.py")),
+        FileModifiedEvent(h.p(".gitignore")),
+    )
+    assert h.one_batch() == ({"pkg/a.py", ".gitignore"}, set())
+
+
 def test_move_out_of_repo_is_a_delete(h, root, tmp_path):
     outside = _write(tmp_path / "outside/a.py")
     h.send(FileMovedEvent(h.p("pkg/a.py"), str(outside)))
@@ -435,3 +449,87 @@ def test_indexable_paths_under_does_not_follow_symlinked_dirs(tree):
     assert indexable_paths_under(tree, tree / "pkg/link") == set()
     found = {p.relative_to(tree).as_posix() for p in indexable_paths_under(tree, tree / "pkg")}
     assert found == {"pkg/a.py", "pkg/sub/b.py"}
+
+
+# --- review fixes: a raising handler, and self-ignoring .gitignore files -----
+
+
+def test_events_that_raise_are_counted_warned_every_few_minutes_and_caught_up(root, monkeypatch, caplog):
+    now = [1000.0]
+    requests = []
+    harness = Harness(root)
+    handler = _RepoEventHandler(
+        "repo", root, 500, lambda *a: None, timer_factory=lambda *a: FakeTimer(*a), batch_lock=threading.Lock(),
+        request_catch_up=lambda *a: requests.append(a), clock=lambda: now[0],
+    )
+    real = handler._queue_rel
+    monkeypatch.setattr(handler, "_queue_rel", lambda raw: (_ for _ in ()).throw(RuntimeError("boom")))
+    with caplog.at_level("DEBUG", logger="devgraph.watcher.manager"):
+        for name in ("a", "b", "c"):
+            handler.dispatch(FileDeletedEvent(harness.p(f"pkg/{name}.py")))
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1 and warnings[0].exc_info
+        now[0] += manager_module.DISPATCH_WARNING_INTERVAL_S
+        handler.dispatch(FileDeletedEvent(harness.p("pkg/d.py")))
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2 and "3 more" in warnings[1].getMessage() and "boom" in warnings[1].getMessage()
+    assert len(requests) == 4 and all(r[0] == "repo" and r[3] == "retry" for r in requests)
+
+    monkeypatch.setattr(handler, "_queue_rel", real)
+    batches = []
+    handler._on_changes = lambda repo_id, changed, deleted: batches.append(deleted)
+    handler.dispatch(FileDeletedEvent(harness.p("pkg/e.py")))
+    handler.flush()
+    assert batches == [{root / "pkg/e.py"}]
+
+
+def test_a_raising_handler_leaves_a_real_observer_alive(root, monkeypatch):
+    import time
+
+    from watchdog.observers import Observer
+
+    calls = []
+
+    def boom(path):
+        calls.append(path)
+        raise RuntimeError("boom")
+
+    harness = Harness(root)
+    monkeypatch.setattr(harness.handler, "_is_tracked_path", boom)
+    observer = Observer()
+    observer.schedule(harness.handler, str(root), recursive=True)
+    observer.start()
+    try:
+        _write(root / "pkg/x.py")
+        deadline = time.monotonic() + 10
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert calls
+        time.sleep(0.2)
+        assert observer.is_alive()
+    finally:
+        observer.stop()
+        observer.join(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("ignores", "rel"),
+    [({"pkg/.gitignore": "*\n"}, "pkg/.gitignore"), ({".gitignore": ".*\n"}, ".gitignore")],
+)
+def test_a_gitignore_that_ignores_itself_is_still_queued(h, root, ignores, rel):
+    for path, text in ignores.items():
+        _write(root / path, text)
+    h.send(FileModifiedEvent(h.p(rel)))
+    assert h.one_batch() == ({rel}, set())
+    h.batches.clear()
+    (root / rel).unlink()
+    h.send(FileDeletedEvent(h.p(rel)))
+    assert h.one_batch() == (set(), {rel})
+
+
+def test_a_gitignore_inside_an_ignored_folder_is_not_queued(h, root):
+    _write(root / ".gitignore", ".mypy_cache/\n")
+    _write(root / ".mypy_cache/.gitignore", "*\n")
+    h.send(FileModifiedEvent(h.p(".mypy_cache/.gitignore")))
+    h.handler.flush()
+    assert h.batches == []

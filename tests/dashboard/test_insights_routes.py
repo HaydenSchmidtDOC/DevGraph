@@ -26,8 +26,8 @@ class StubEngine:
         return {"computed_at": "2026-10-01T00:00:00+00:00", "node_count": 40, "community_count": 12,
                 "modularity": 0.41, "communities": json.dumps(COMMUNITIES)}
 
-    def run_cypher(self, query, params=None):
-        return [dict(TOP[0], name=f"hub-{params['limit']}")]
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        return [dict(TOP[0], name=f"hub-{params['limit']}")], False
 
     def load_insight_graph(self, repo_id, types):
         if self.fail:

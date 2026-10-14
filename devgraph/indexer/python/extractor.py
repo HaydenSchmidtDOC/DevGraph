@@ -20,12 +20,15 @@ GraphEngine.upsert_node/upsert_relationship. All nodes are keyed on
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship
+from devgraph.indexer.calls import STOP_METHODS, call_rows
+from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.python.resolve import Bindings, absolute_module, relative_module
 
 logger = logging.getLogger(__name__)
 
@@ -69,57 +72,425 @@ def _extract_decorator_names(decorator_nodes: list[Node], source: bytes) -> list
     return names
 
 
-def _extract_call_targets(body: Node, source: bytes) -> list[str]:
-    """Walk a function/method body for call expressions and return the
-    callee's simple name (the identifier a Function node would be keyed on).
+def _call_functions(body: Node) -> list[Node]:
+    """The `function` field of every call expression in a function/class/
+    module-level body, in source order.
 
-    - `foo()` -> 'foo'
-    - `self.foo()` / `obj.foo()` -> 'foo' (the attribute name — this is a
-      structural choice, not a type-resolved one: Tree-sitter has no type
-      info, so 'self.foo()' and a free-standing 'foo()' both target the
-      Function node named 'foo'. This intentionally over-links same-named
-      methods across classes rather than under-linking everything, matching
-      how find_callers/impact_analysis are meant to be used (a name-based,
-      not fully type-resolved, call graph).
-    - Nested/chained calls (`foo()()`, `a.b.c()`) resolve to the innermost
-      call's callee name only.
-    - Does not descend into nested function/class definitions — those are
-      walked separately by the caller so calls are attributed to the
-      correct enclosing scope, not hoisted to the outer function.
+    Does not descend into nested function/class definitions — those are
+    walked separately by the caller so calls are attributed to the correct
+    enclosing scope, not hoisted to the outer function. A call whose
+    function is itself a call (`get_handler()()`) is left to that inner
+    call, which the walk reaches on its own.
     """
-    targets: list[str] = []
+    functions: list[Node] = []
 
     def walk(node: Node) -> None:
         if node.type in ("function_definition", "class_definition"):
             return  # nested scope — attributed separately by the caller
         if node.type == "call":
             func = node.child_by_field_name("function")
-            if func is not None:
-                name = _callee_simple_name(func, source)
-                if name:
-                    targets.append(name)
+            if func is not None and func.type != "call":
+                functions.append(func)
         for child in node.children:
             walk(child)
 
     walk(body)
-    return targets
+    return functions
 
 
-def _callee_simple_name(func_node: Node, source: bytes) -> str | None:
-    """Resolve a call expression's `function` field to a simple callee name."""
-    if func_node.type == "identifier":
-        return _text(func_node, source)
-    if func_node.type == "attribute":
-        attr = func_node.child_by_field_name("attribute")
-        if attr is not None:
-            return _text(attr, source)
-    if func_node.type == "call":
-        # Chained/immediately-invoked call, e.g. `get_handler()()` — resolve
-        # to the outer call's own callee by recursing on its function field.
-        inner_func = func_node.child_by_field_name("function")
-        if inner_func is not None:
-            return _callee_simple_name(inner_func, source)
+def _pure_dotted(node: Node, source: bytes) -> str | None:
+    """`a`, `a.b.c` as text; None for anything that isn't plain names and dots."""
+    if node.type == "identifier":
+        return _text(node, source)
+    if node.type == "attribute":
+        obj = node.child_by_field_name("object")
+        attr = node.child_by_field_name("attribute")
+        head = _pure_dotted(obj, source) if obj is not None else None
+        if head is not None and attr is not None:
+            return f"{head}.{_text(attr, source)}"
     return None
+
+
+#: Receivers that are literals: `"".join(...)`, `{}.get(...)`.
+_LITERAL_RECEIVERS = frozenset({
+    "string", "concatenated_string", "integer", "float", "true", "false", "none", "dictionary", "list", "set",
+    "tuple", "list_comprehension", "dictionary_comprehension", "set_comprehension", "generator_expression",
+})
+
+#: Python's builtin names (3.13), as a fixed set so an edge never depends on
+#: the interpreter that indexed it. A bare call of one links nothing.
+_BUILTIN_NAMES = frozenset({
+    "ArithmeticError", "AssertionError", "AttributeError", "BaseException", "BaseExceptionGroup",
+    "BlockingIOError", "BrokenPipeError", "BufferError", "BytesWarning", "ChildProcessError",
+    "ConnectionAbortedError", "ConnectionError", "ConnectionRefusedError", "ConnectionResetError",
+    "DeprecationWarning", "EOFError", "Ellipsis", "EncodingWarning", "EnvironmentError", "Exception",
+    "ExceptionGroup", "False", "FileExistsError", "FileNotFoundError", "FloatingPointError", "FutureWarning",
+    "GeneratorExit", "IOError", "ImportError", "ImportWarning", "IndentationError", "IndexError",
+    "InterruptedError", "IsADirectoryError", "KeyError", "KeyboardInterrupt", "LookupError", "MemoryError",
+    "ModuleNotFoundError", "NameError", "None", "NotADirectoryError", "NotImplemented", "NotImplementedError",
+    "OSError", "OverflowError", "PendingDeprecationWarning", "PermissionError", "ProcessLookupError",
+    "PythonFinalizationError", "RecursionError", "ReferenceError", "ResourceWarning", "RuntimeError",
+    "RuntimeWarning", "StopAsyncIteration", "StopIteration", "SyntaxError", "SyntaxWarning", "SystemError",
+    "SystemExit", "TabError", "TimeoutError", "True", "TypeError", "UnboundLocalError", "UnicodeDecodeError",
+    "UnicodeEncodeError", "UnicodeError", "UnicodeTranslateError", "UnicodeWarning", "UserWarning",
+    "ValueError", "Warning", "ZeroDivisionError", "__build_class__", "__import__", "abs", "aiter", "all",
+    "anext", "any", "ascii", "bin", "bool", "breakpoint", "bytearray", "bytes", "callable", "chr",
+    "classmethod", "compile", "complex", "copyright", "credits", "delattr", "dict", "dir", "divmod",
+    "enumerate", "eval", "exec", "exit", "filter", "float", "format", "frozenset", "getattr", "globals",
+    "hasattr", "hash", "help", "hex", "id", "input", "int", "isinstance", "issubclass", "iter", "len",
+    "license", "list", "locals", "map", "max", "memoryview", "min", "next", "object", "oct", "open", "ord",
+    "pow", "print", "property", "quit", "range", "repr", "reversed", "round", "set", "setattr", "slice",
+    "sorted", "staticmethod", "str", "sum", "super", "tuple", "type", "vars", "zip",
+})
+
+_TYPE_WRAPPERS = frozenset({"Optional", "typing.Optional", "Union", "typing.Union"})
+
+#: Annotations that type nothing: a receiver annotated with one is untyped.
+_UNTYPED_ANNOTATIONS = frozenset({"None", "Any", "object"})
+
+
+def _types_something(name: str) -> bool:
+    """False for `None`, `Any`, `typing.Any`, `t.Any` and `object`."""
+    return name.rsplit(".", 1)[-1] not in _UNTYPED_ANNOTATIONS
+
+
+def _type_names(node: Node | None, source: bytes) -> list[str]:
+    """The class names an annotation can name: `X`, `m.X`, `X | None`,
+    `Optional[X]`, `Union[X, Y]` and the same quoted. Anything else (a
+    container like `list[X]`) names none."""
+    if node is None:
+        return []
+    if node.type in ("type", "type_parameter"):
+        return [name for child in node.named_children for name in _type_names(child, source)]
+    if node.type in ("identifier", "attribute"):
+        text = _pure_dotted(node, source)
+        return [text] if text and _types_something(text) else []
+    if node.type == "binary_operator":
+        return _type_names(node.child_by_field_name("left"), source) + _type_names(
+            node.child_by_field_name("right"), source
+        )
+    if node.type == "generic_type" and node.named_children:
+        if _text(node.named_children[0], source) in _TYPE_WRAPPERS:
+            return [name for child in node.named_children[1:] for name in _type_names(child, source)]
+        return []
+    if node.type == "subscript":
+        value = node.child_by_field_name("value")
+        if value is not None and _pure_dotted(value, source) in _TYPE_WRAPPERS:
+            return [
+                name for child in node.children_by_field_name("subscript") for name in _type_names(child, source)
+            ]
+        return []
+    if node.type == "string":
+        content = "".join(_text(c, source) for c in node.named_children if c.type == "string_content")
+        parts = [part.strip() for part in content.split("|")]
+        return [
+            part for part in parts
+            if part and _types_something(part) and all(seg.isidentifier() for seg in part.split("."))
+        ]
+    return []
+
+
+def _constructed(node: Node | None, source: bytes) -> str | None:
+    """`X` for a call `X(...)` or `m.X(...)` of a capitalised callable (read
+    as a constructor), else None."""
+    called = node.child_by_field_name("function") if node is not None and node.type == "call" else None
+    name = _pure_dotted(called, source) if called is not None else None
+    return name if name and name.rsplit(".", 1)[-1][:1].isupper() else None
+
+
+def _local_types(
+    func: Node, body: Node, source: bytes, fixtures: dict[str, list[str]] | None = None
+) -> dict[str, list[str]]:
+    """The class names a function's own variables are typed with: annotated
+    parameters, a parameter named after one of this file's pytest
+    `fixtures`, annotated assignments and `x = X(...)` (a capitalised
+    callable, read as a constructor). Nested defs are not looked into."""
+    types: dict[str, set[str]] = {}
+    params = func.child_by_field_name("parameters")
+    for param in params.named_children if params is not None else []:
+        if param.type == "typed_parameter":
+            name_node = next((c for c in param.named_children if c.type == "identifier"), None)
+        elif param.type == "typed_default_parameter":
+            name_node = param.child_by_field_name("name")
+        else:
+            name_node = param if param.type == "identifier" else param.child_by_field_name("name")
+            if name_node is not None and fixtures and _text(name_node, source) in fixtures:
+                types.setdefault(_text(name_node, source), set()).update(fixtures[_text(name_node, source)])
+            continue
+        if name_node is not None:
+            types.setdefault(_text(name_node, source), set()).update(
+                _type_names(param.child_by_field_name("type"), source)
+            )
+
+    def walk(node: Node) -> None:
+        if node.type in ("function_definition", "class_definition", "lambda"):
+            return
+        if node.type == "assignment":
+            left = node.child_by_field_name("left")
+            if left is not None and left.type == "identifier":
+                annotated = _type_names(node.child_by_field_name("type"), source)
+                constructor = _constructed(node.child_by_field_name("right"), source)
+                names = annotated or ([constructor] if constructor else [])
+                if names:
+                    types.setdefault(_text(left, source), set()).update(names)
+        for child in node.children:
+            walk(child)
+
+    walk(body)
+    return {name: sorted(found) for name, found in types.items() if found}
+
+
+def _parameter_names(func: Node, source: bytes) -> set[str]:
+    """Every parameter name of a function (`*args`/`**kwargs` included)."""
+    names = set()
+    params = func.child_by_field_name("parameters")
+    for param in params.named_children if params is not None else []:
+        if param.type == "identifier":
+            names.add(_text(param, source))
+            continue
+        name_node = param.child_by_field_name("name")
+        if name_node is None:
+            name_node = next((c for c in param.named_children if c.type == "identifier"), None)
+        if name_node is not None:
+            names.add(_text(name_node, source))
+    return names
+
+
+def _fixture_types(root: Node, source: bytes) -> dict[str, list[str]]:
+    """This file's module-level pytest fixtures and the class names their
+    value is built with: a return annotation, or a returned or yielded
+    `X(...)` or variable typed as in `_local_types`. A test's parameter of
+    that name is the fixture's value, so it is typed by it."""
+    fixtures: dict[str, list[str]] = {}
+    for node in root.named_children:
+        definition = node.child_by_field_name("definition") if node.type == "decorated_definition" else None
+        if definition is None or definition.type != "function_definition":
+            continue
+        decorators = _extract_decorator_names([c for c in node.named_children if c.type == "decorator"], source)
+        name_node = definition.child_by_field_name("name")
+        body = definition.child_by_field_name("body")
+        if name_node is None or body is None or not any(d.rsplit(".", 1)[-1] == "fixture" for d in decorators):
+            continue
+        local = _local_types(definition, body, source)
+        found = set(_type_names(definition.child_by_field_name("return_type"), source))
+
+        def walk(n: Node) -> None:
+            if n.type in ("function_definition", "class_definition", "lambda"):
+                return
+            if n.type in ("return_statement", "yield"):
+                for value in n.named_children:
+                    if value.type == "identifier":
+                        found.update(local.get(_text(value, source), []))
+                    elif (constructor := _constructed(value, source)) is not None:
+                        found.add(constructor)
+            for child in n.children:
+                walk(child)
+
+        walk(body)
+        if found:
+            fixtures[_text(name_node, source)] = sorted(found)
+    return fixtures
+
+
+def _direct_defs(block: Node | None, source: bytes) -> set[str]:
+    """Names of the functions defined directly in a block (decorated or not)."""
+    names: set[str] = set()
+    for node in block.named_children if block is not None else []:
+        definition = node.child_by_field_name("definition") if node.type == "decorated_definition" else node
+        if definition is not None and definition.type == "function_definition":
+            name_node = definition.child_by_field_name("name")
+            if name_node is not None:
+                names.add(_text(name_node, source))
+    return names
+
+
+@dataclass
+class _ClassInfo:
+    methods: set[str] = field(default_factory=set)
+    bases: list[str] = field(default_factory=list)
+
+
+def _class_table(root: Node, source: bytes) -> dict[str, _ClassInfo]:
+    """Every class in the file, at any depth: its own methods and its bases.
+    Same-named classes merge (one Class node per name and file anyway)."""
+    classes: dict[str, _ClassInfo] = {}
+
+    def walk(node: Node) -> None:
+        if node.type == "class_definition":
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                info = classes.setdefault(_text(name_node, source), _ClassInfo())
+                info.methods |= _direct_defs(node.child_by_field_name("body"), source)
+                for base in _extract_base_class_names(node.child_by_field_name("superclasses"), source):
+                    if base not in info.bases:
+                        info.bases.append(base)
+        for child in node.children:
+            walk(child)
+
+    walk(root)
+    return classes
+
+
+@dataclass
+class _Scope:
+    """What a call's names can mean where it is made: the functions defined
+    in this scope, its variables' types, and the class `self` belongs to."""
+
+    defs: set[str]
+    types: dict[str, list[str]]
+    cls: str | None
+    parent: _Scope | None = None
+    params: set[str] = field(default_factory=set)
+
+    def defines(self, name: str) -> bool:
+        scope: _Scope | None = self
+        while scope is not None:
+            if name in scope.defs:
+                return True
+            scope = scope.parent
+        return False
+
+    def is_parameter(self, name: str) -> bool:
+        """A parameter of this or an enclosing function, not redefined by a
+        nearer def."""
+        scope: _Scope | None = self
+        while scope is not None:
+            if name in scope.defs:
+                return False
+            if name in scope.params:
+                return True
+            scope = scope.parent
+        return False
+
+    def types_of(self, name: str) -> list[str] | None:
+        scope: _Scope | None = self
+        while scope is not None:
+            if name in scope.types:
+                return scope.types[name]
+            scope = scope.parent
+        return None
+
+
+class _CallResolver:
+    """Resolves a call to the files its callee can be in (see the module
+    docstring): each target is (callee name, pin), the pin a file, a package
+    directory ending in "/", or None for a bare name match."""
+
+    def __init__(self, file_path: str, bindings: Bindings, classes: dict[str, _ClassInfo], source: bytes):
+        self.file_path = file_path
+        self.bindings = bindings
+        self.classes = classes
+        self.source = source
+
+    def _module_pins(self, receiver: str) -> list[str] | None:
+        """Where a name read off an imported module or a from-imported name can be."""
+        ref = self.bindings.modules.get(receiver)
+        if ref is not None:
+            return ref.files() + ref.dirs()
+        symbol = self.bindings.symbols.get(receiver)
+        if symbol is not None:
+            return (
+                symbol.module.files() + symbol.submodule.files() + symbol.module.dirs() + symbol.submodule.dirs()
+            )
+        return None
+
+    def _class_pins(self, type_name: str, method: str) -> list[str] | None:
+        """Where `method` of the class `type_name` (as written) can be. An
+        in-file class is walked like `self.method()` (see _method_pins)."""
+        if type_name in self.classes:
+            return self._method_pins(type_name, method, own=True)
+        if "." in type_name:
+            return self._module_pins(type_name.rsplit(".", 1)[0])
+        symbol = self.bindings.symbols.get(type_name)
+        if symbol is not None:
+            return symbol.module.files() + symbol.module.dirs()
+        return None
+
+    def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
+        """Where `self.method()` (own) or `super().method()` in `cls` can go:
+        this file when `cls` or an in-file base defines it, and the files of
+        each imported base (not followed further). None when nothing does."""
+        if own and method in self.classes[cls].methods:
+            return [self.file_path]
+        pins: set[str] = set()
+        found = False
+        seen = {cls}
+
+        def bases_of(name: str) -> None:
+            nonlocal found
+            for base in self.classes[name].bases:
+                if base in self.classes:
+                    if base in seen:
+                        continue
+                    seen.add(base)
+                    if method in self.classes[base].methods:
+                        pins.add(self.file_path)
+                        found = True
+                    else:
+                        bases_of(base)
+                elif (base_pins := self._class_pins(base, method)) is not None:
+                    pins.update(base_pins)
+                    found = True
+
+        bases_of(cls)
+        return sorted(pins) if found else None
+
+    def _receiver_pins(self, receiver: str, method: str, scope: _Scope) -> list[str] | None:
+        if "." not in receiver:
+            types = scope.types_of(receiver)
+            if types:
+                found = [pins for name in types if (pins := self._class_pins(name, method)) is not None]
+                if found:
+                    return sorted({pin for pins in found for pin in pins})
+            if receiver in self.classes:
+                return self._class_pins(receiver, method)
+        if scope.is_parameter(receiver.split(".", 1)[0]):
+            return None  # a parameter shadows the import of its name
+        return self._module_pins(receiver)
+
+    def resolve(self, func: Node, scope: _Scope) -> list[tuple[str, str | None]]:
+        source = self.source
+        if func.type == "identifier":
+            name = _text(func, source)
+            if scope.defines(name):
+                return [(name, self.file_path)]
+            if scope.is_parameter(name):
+                return []  # calling a parameter: nothing to resolve, and it shadows any import
+            symbol = self.bindings.symbols.get(name)
+            if symbol is not None:
+                return [(symbol.name, pin) for pin in symbol.module.files() + symbol.module.dirs()]
+            if name in self.bindings.modules or name in _BUILTIN_NAMES:
+                return []
+            return [(name, pin) for star in self.bindings.stars for pin in star.files() + star.dirs()]
+        if func.type != "attribute":
+            return []
+        obj = func.child_by_field_name("object")
+        attr_node = func.child_by_field_name("attribute")
+        if obj is None or attr_node is None:
+            return []
+        attr = _text(attr_node, source)
+        own_receiver = obj.type == "identifier" and _text(obj, source) in ("self", "cls")
+        super_call = (
+            obj.type == "call"
+            and (inner := obj.child_by_field_name("function")) is not None
+            and inner.type == "identifier"
+            and _text(inner, source) == "super"
+        )
+        if (own_receiver or super_call) and scope.cls in self.classes:
+            pins = self._method_pins(scope.cls, attr, own=own_receiver)
+            if pins is not None:
+                return [(attr, pin) for pin in pins]
+        elif (receiver := _pure_dotted(obj, source)) is not None:
+            pins = self._receiver_pins(receiver, attr, scope)
+            if pins is not None:
+                return [(attr, pin) for pin in pins]
+        elif (constructor := _constructed(obj, source)) is not None:
+            pins = self._class_pins(constructor, attr)  # `Fake().run()`
+            if pins is not None:
+                return [(attr, pin) for pin in pins]
+        if obj.type in _LITERAL_RECEIVERS or attr in STOP_METHODS["python"]:
+            return []
+        return [(attr, None)]
 
 
 def _extract_docstring(body: Node, source: bytes) -> str | None:
@@ -193,159 +564,66 @@ def _extract_base_class_names(superclasses_node: Node | None, source: bytes) -> 
     return names
 
 
-def _extract_imports(root: Node, source: bytes, current_dir: str = "") -> list[tuple[str, list[str]]]:
-    """Extract import statements from the parse tree.
+def _extract_imports(root: Node, source: bytes, file_path: str) -> Bindings:
+    """Every import statement in the file, function-local ones included, as
+    its bindings and IMPORTS targets (see resolve.py).
 
-    Args:
-        current_dir: The importing file's directory, relative to the repo
-            root, using forward slashes ('' for repo-root files, 'services/api'
-            for a nested file). Needed to resolve relative imports to a
-            repo-relative Module path — Module nodes are keyed by full
-            repo-relative path (e.g. 'services/api/main.py'), not bare
-            filename, specifically so multi-level relative imports and
-            same-named files in different directories both resolve/key
-            correctly.
-
-    Returns:
-        A list of (import_target, [imported_names]) tuples, where
-        import_target is the graph-node name IMPORTS should point at:
-
-        - 'import X.Y.Z' / 'from X.Y import Z' (dotted, not relative) ->
-          TWO targets are emitted: the bare dotted name 'X.Y.Z' (kept for
-          compatibility/introspection) AND 'X/Y/Z.py' (the dotted path
-          reinterpreted as a same-repo file path, e.g.
-          'services.api_gateway.clients' -> 'services/api_gateway/clients.py').
-          This is the common real-world style (absolute intra-repo imports
-          like 'from services.api_gateway.clients import X', not dot-relative
-          'from .clients import X') — without this second candidate, imports
-          written this way could never resolve to a same-repo Module node at
-          all. Emitting a same-repo-shaped guess is safe even when the
-          import is genuinely external/third-party (e.g. 'from google.cloud
-          import storage'): upsert_relationship only MATCHes an edge into
-          existence when both endpoints already exist as real nodes, so a
-          guessed target that happens not to correspond to any indexed file
-          simply never materializes an edge — same as any other import
-          DevGraph can't resolve.
-        - 'import X' (single segment, no dots) -> target 'X' only (no file-
-          path guess to make beyond what index_file already does for a
-          repo-root single-file module).
-        - 'from . import Y' (bare relative) -> each imported name IS a
-          sibling module in the *same directory* as the importing file:
-          target is '{current_dir}/{name}.py' (or '{name}.py' at repo root).
-        - 'from .pkg import Y' / 'from .sub.pkg import Y' (relative with a
-          named module) -> the module being imported from is a file at
-          '{current_dir}/{dots-adjusted}/{pkg/sub/pkg}.py'; Y is a name
-          *inside* it, not a module itself.
-        - 'from ..other import Y' (multiple leading dots) -> each extra dot
-          beyond the first walks up one directory level from current_dir
-          before resolving the module name, per Python's relative-import
-          semantics (one dot = same package/dir, each additional dot = one
-          parent up).
+    `file_path` is the importing file's repo-relative path with forward
+    slashes ('services/api/main.py', or 'main.py' at the repo root): absolute
+    imports are tried under each of its ancestor directories and relative
+    ones against its own directory. Each import targets every candidate
+    file, `p.py` and `p/__init__.py`; only the ones that exist as Modules
+    ever become edges. `from P import n` also targets the submodule `P.n`.
     """
-    imports: list[tuple[str, list[str]]] = []
+    bindings = Bindings()
+    current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
 
     def walk(node: Node) -> None:
         if node.type == "import_statement":
             # import X [as Y] [, Z [as W]]
             for child in node.named_children:
                 if child.type == "dotted_name":
-                    mod_name = _text(child, source)
-                    imports.append((mod_name, [mod_name]))
-                    file_guess = _dotted_to_file_path(mod_name)
-                    if file_guess:
-                        imports.append((file_guess, [mod_name]))
+                    bindings.add_import(_text(child, source), None, file_path)
                 elif child.type == "aliased_import":
                     name_node = child.child_by_field_name("name")
                     alias_node = child.child_by_field_name("alias")
                     if name_node is not None:
-                        mod_name = _text(name_node, source)
-                        alias = _text(alias_node, source) if alias_node else mod_name
-                        imports.append((mod_name, [alias]))
-                        file_guess = _dotted_to_file_path(mod_name)
-                        if file_guess:
-                            imports.append((file_guess, [alias]))
+                        alias = _text(alias_node, source) if alias_node else None
+                        bindings.add_import(_text(name_node, source), alias, file_path)
         elif node.type == "import_from_statement":
             # from X import Y [as Z][, ...] | from . import Y | from X import *
             module_node = node.child_by_field_name("module_name")
             module_name = _text(module_node, source) if module_node else ""
-            is_relative = module_name.startswith(".")
             # tree_sitter's Python bindings hand back a fresh Node wrapper
             # object on every accessor call, so `child is module_node`
             # never matches even for the same underlying tree node —
-            # compare byte spans instead to actually exclude the module-name
-            # dotted_name from the imported-names list (without this, 'from
-            # typing import List' produced imported_names=['typing', 'List']
-            # instead of ['List'], corrupting every from-import's name list).
+            # compare byte spans instead to keep the module-name
+            # dotted_name out of the imported names.
             module_span = (module_node.start_byte, module_node.end_byte) if module_node else None
 
-            imported_names: list[str] = []
+            names: list[tuple[str, str | None]] = []
+            star = False
             for child in node.named_children:
                 if child.type == "dotted_name" and (child.start_byte, child.end_byte) != module_span:
-                    imported_names.append(_text(child, source))
+                    names.append((_text(child, source), None))
                 elif child.type == "aliased_import":
                     name_node = child.child_by_field_name("name")
                     alias_node = child.child_by_field_name("alias")
                     if name_node is not None:
-                        imported_names.append(_text(name_node, source))
+                        names.append((_text(name_node, source), _text(alias_node, source) if alias_node else None))
                 elif child.type == "wildcard_import":
-                    imported_names.append("*")
+                    star = True
 
-            if is_relative:
-                dot_count = len(module_name) - len(module_name.lstrip("."))
-                remainder = module_name[dot_count:]  # e.g. 'sub.pkg' in '..sub.pkg'
-                base_dir = _resolve_relative_dir(current_dir, dot_count)
-
-                if remainder:
-                    # 'from .pkg import Y' / 'from ..sub.pkg import Y' — the
-                    # sibling module is the named path itself.
-                    sub_path = remainder.replace(".", "/")
-                    target = f"{base_dir}/{sub_path}.py" if base_dir else f"{sub_path}.py"
-                    imports.append((target, imported_names))
-                else:
-                    # 'from . import utils[, helpers]' / 'from .. import x' —
-                    # each imported name IS a sibling module in base_dir.
-                    for name in imported_names:
-                        if name != "*":
-                            target = f"{base_dir}/{name}.py" if base_dir else f"{name}.py"
-                            imports.append((target, [name]))
+            if module_name.startswith("."):
+                bindings.add_from(relative_module(module_name, current_dir), names, star)
             elif module_name:
-                imports.append((module_name, imported_names))
-                file_guess = _dotted_to_file_path(module_name)
-                if file_guess:
-                    imports.append((file_guess, imported_names))
+                bindings.add_from(absolute_module(module_name, file_path), names, star)
 
         for child in node.children:
             walk(child)
 
     walk(root)
-    return imports
-
-
-def _dotted_to_file_path(dotted_name: str) -> str | None:
-    """Reinterpret a dotted import name as a same-repo file path guess.
-
-    'services.api_gateway.clients' -> 'services/api_gateway/clients.py'.
-    Returns None for a single-segment name ('os', 'requests') — no
-    additional guess beyond the bare name is useful there; a real absolute
-    intra-repo import is meaningfully dotted (package.module), while a
-    single bare name importing a same-repo file is already handled by
-    module_name being used directly.
-    """
-    if "." not in dotted_name:
-        return None
-    return dotted_name.replace(".", "/") + ".py"
-
-
-def _resolve_relative_dir(current_dir: str, dot_count: int) -> str:
-    """Resolve a relative import's leading-dot count against the importing
-    file's directory. One dot = current_dir itself; each additional dot
-    walks up one parent directory, matching Python's relative-import rules.
-    """
-    parts = [p for p in current_dir.split("/") if p]
-    levels_up = dot_count - 1
-    if levels_up > 0:
-        parts = parts[:-levels_up] if levels_up <= len(parts) else []
-    return "/".join(parts)
+    return bindings
 
 
 def extract_python_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
@@ -394,77 +672,75 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
     )
     result.nodes.append(module_node)
 
-    # Extract imports at the module level. file_path is expected to be the
-    # repo-relative path with forward slashes (e.g. 'services/api/main.py');
-    # current_dir is everything but the filename, needed to resolve relative
-    # imports against this file's actual location in the repo.
-    current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
-    imports = _extract_imports(root, source_bytes, current_dir)
-    for module_name, imported_names in imports:
-        for _imp_name in imported_names:
-            result.relationships.append(
-                GraphRelationship(
-                    from_label="Module",
-                    from_name=file_path,
-                    rel_type="IMPORTS",
-                    to_label="Module",
-                    to_name=module_name,
-                    repo_id=repo_id,
-                )
-            )
-
-    def _emit_call(
-        caller_name: str, caller_label: str, target_name: str, caller_class: str | None = None
-    ) -> None:
-        # caller_class records the enclosing class of a method-body call (None
-        # for module-level/free-function calls) so find_callers can optionally
-        # narrow results via scope_to_class — an opt-in query-time filter,
-        # not a change to which edges get emitted (see Implementation Plan #3,
-        # Item 2: a same-file MRO-suppression filter turned out to require a
-        # Function-node schema change to express, so this ships as query-time
-        # narrowing on data recorded at extraction time instead).
-        properties = {"caller_class": caller_class} if caller_class else None
+    # IMPORTS edges to every candidate file of every import (see resolve.py).
+    # file_path is expected to be the repo-relative path with forward
+    # slashes (e.g. 'services/api/main.py'), which the candidates hang off.
+    # A package's `from . import x` names its own __init__.py, never an edge.
+    bindings = _extract_imports(root, source_bytes, file_path)
+    for target in sorted(bindings.targets - {file_path}):
         result.relationships.append(
             GraphRelationship(
-                from_label=caller_label,
-                from_name=caller_name,
-                rel_type="CALLS",
-                to_label="Function",
-                to_name=target_name,
+                from_label="Module",
+                from_name=file_path,
+                rel_type="IMPORTS",
+                to_label="Module",
+                to_name=target,
                 repo_id=repo_id,
-                properties=properties,
             )
         )
 
-    def visit_block(block: Node, parent_name: str | None, parent_label: str) -> None:
-        """Visit statements in a block (module body, class body, function body)."""
+    resolver = _CallResolver(file_path, bindings, _class_table(root, source_bytes), source_bytes)
+    fixtures = _fixture_types(root, source_bytes)
+    # (caller label, caller name) -> callee name -> [pins, bare?, caller classes]
+    calls: dict[tuple[str, str], dict[str, list]] = {}
+
+    def record_calls(caller_label: str, caller_name: str, body: Node, scope: _Scope, caller_class: str | None) -> None:
+        # caller_class records the enclosing class of a method-body call (None
+        # for module-level/free-function calls) so find_callers can optionally
+        # narrow results via scope_to_class — an opt-in query-time filter
+        # (Implementation Plan #3, Item 2).
+        by_name = calls.setdefault((caller_label, caller_name), {})
+        for func in _call_functions(body):
+            for name, pin in resolver.resolve(func, scope):
+                entry = by_name.setdefault(name, [set(), False, set()])
+                if pin is None:
+                    entry[1] = True
+                else:
+                    entry[0].add(pin)
+                if caller_class:
+                    entry[2].add(caller_class)
+
+    def visit_block(block: Node, parent_name: str | None, parent_label: str, scope: _Scope) -> None:
+        """Visit statements in a block (module body, class body, function body).
+        A class body's defs are methods: they see the class's enclosing scope."""
+        def_scope, def_cls = (scope.parent, parent_name) if parent_label == "Class" else (scope, scope.cls)
         for node in block.named_children:
             if node.type == "class_definition":
-                _visit_class(node, parent_name, parent_label)
+                _visit_class(node, parent_name, parent_label, scope)
             elif node.type in ("function_definition",):
-                _visit_function(node, parent_name, parent_label)
+                _visit_function(node, parent_name, parent_label, def_scope, def_cls)
             elif node.type == "decorated_definition":
                 # decorated_definition wraps decorator(s) + the actual definition.
                 definition = node.child_by_field_name("definition")
                 decorators = [c for c in node.named_children if c.type == "decorator"]
                 if definition is not None and definition.type == "class_definition":
-                    _visit_class(definition, parent_name, parent_label, extra_decorators=decorators)
+                    _visit_class(definition, parent_name, parent_label, scope, extra_decorators=decorators)
                 elif definition is not None and definition.type == "function_definition":
-                    _visit_function(definition, parent_name, parent_label, extra_decorators=decorators)
-            elif node.type not in ("class_definition", "function_definition", "decorated_definition"):
+                    _visit_function(
+                        definition, parent_name, parent_label, def_scope, def_cls, extra_decorators=decorators
+                    )
+            else:
                 # Module/class-body-level statement (not a def) — attribute
                 # any call expressions in it to the enclosing scope (usually
                 # the Module, for top-level script code / constant setup).
                 caller_class = parent_name if parent_label == "Class" else None
-                for target in _extract_call_targets(node, source_bytes):
-                    _emit_call(
-                        parent_name if parent_name else file_path, parent_label, target, caller_class
-                    )
+                record_calls(parent_label, parent_name if parent_name else file_path, node, scope, caller_class)
 
     def _visit_class(
         node: Node,
         parent_name: str | None,
         parent_label: str,
+        scope: _Scope,
         extra_decorators: list[Node] | None = None,
     ) -> None:
         name_node = node.child_by_field_name("name")
@@ -527,12 +803,14 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
             )
 
         if body_node is not None:
-            visit_block(body_node, class_name, "Class")
+            visit_block(body_node, class_name, "Class", _Scope(set(), {}, None, scope))
 
     def _visit_function(
         node: Node,
         parent_name: str | None,
         parent_label: str,
+        enclosing: _Scope,
+        cls: str | None,
         extra_decorators: list[Node] | None = None,
     ) -> None:
         name_node = node.child_by_field_name("name")
@@ -581,26 +859,37 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
 
         # Nested function definitions (rare, but Tree-sitter walks these fine),
         # and CALLS edges for every call expression made directly in this
-        # function's body (not inside a nested def — _extract_call_targets
-        # stops descending at nested function/class scopes so those calls
-        # get attributed to the nested function itself, not hoisted here).
+        # function's body (not inside a nested def — _call_functions stops
+        # descending at nested function/class scopes so those calls get
+        # attributed to the nested function itself, not hoisted here).
         if body_node is not None:
+            scope = _Scope(
+                _direct_defs(body_node, source_bytes), _local_types(node, body_node, source_bytes, fixtures), cls,
+                enclosing, _parameter_names(node, source_bytes),
+            )
             caller_class = parent_name if parent_label == "Class" else None
-            for target in _extract_call_targets(body_node, source_bytes):
-                _emit_call(func_name, "Function", target, caller_class)
+            record_calls("Function", func_name, body_node, scope, caller_class)
 
             for child in body_node.named_children:
                 if child.type == "function_definition":
-                    _visit_function(child, func_name, "Function")
+                    _visit_function(child, func_name, "Function", scope, cls)
                 elif child.type == "decorated_definition":
                     definition = child.child_by_field_name("definition")
                     decos = [c for c in child.named_children if c.type == "decorator"]
                     if definition is not None and definition.type == "function_definition":
-                        _visit_function(definition, func_name, "Function", extra_decorators=decos)
+                        _visit_function(definition, func_name, "Function", scope, cls, extra_decorators=decos)
 
-    visit_block(root, None, "Module")
+    visit_block(root, None, "Module", _Scope(_direct_defs(root, source_bytes), {}, None))
+    for (caller_label, caller_name), by_name in sorted(calls.items()):
+        for name, (pins, bare, classes) in sorted(by_name.items()):
+            result.relationships.extend(
+                call_rows(
+                    caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id,
+                    no_self=True,  # every bare Python call site is `x.m()` on an untyped receiver
+                )
+            )
 
-    return result
+    return own_edges(result, file_path)
 
 
 def index_file(

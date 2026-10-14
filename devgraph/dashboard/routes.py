@@ -56,13 +56,19 @@ from devgraph.config.yaml_bound import bounded_safe_load
 from devgraph.dashboard import queries
 from devgraph.dashboard.config_model import GLOBAL_SCOPE, build_config, build_global, build_project, form_entry, scrub
 from devgraph.dashboard.db_metrics import MetricsHistory
-from devgraph.dashboard.events import EventBroadcaster
+from devgraph.dashboard.events import CLOSED, EventBroadcaster
 from devgraph.dashboard.git_info import get_git_log, get_git_status
 from devgraph.dashboard.layout_store import load_layout, save_layout
 from devgraph.dashboard.query_log import QueryLog
-from devgraph.graph.engine import GraphEngine, identity_key, provision_repository_schema
-from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+from devgraph.graph.engine import EngineClosed, GraphEngine, identity_key, provision_repository_schema
+from devgraph.graph.schema import (
+    INTERNAL_EDGE_PROPERTIES,
+    INTERNAL_NODE_PROPERTIES,
+    NODE_LABELS,
+    RELATIONSHIP_TYPES,
+)
 from devgraph.indexer.dispatch import full_scan
+from devgraph.indexer.walk import repo_root_problem
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.registry.store import RepoRegistry
 
@@ -277,19 +283,26 @@ def build_router(
     @router.get("/repos")
     def list_repos() -> dict[str, Any]:
         repo_issues = _get_repo_issues()
+        repos = []
+        for repo in registry.list_repos():
+            # A missing or unreadable folder (an unmounted drive, a moved
+            # repo): every scan refuses it, so its graph is kept but stale.
+            problem = repo_root_problem(repo.path)
+            issue = repo_issues.get(repo.repo_id)
+            if problem is not None:
+                issue = repo_issues[repo.repo_id] = f"path missing: repository folder {problem}: {repo.path}"
+            repos.append({
+                "repo_id": repo.repo_id,
+                "path": str(repo.path),
+                "active": repo.active,
+                "watch_enabled": repo.watch_enabled,
+                "last_indexed": repo.last_indexed,
+                "node_count": queries.count_nodes(engine, repo.repo_id),
+                "path_missing": problem is not None,
+                "issue": issue,  # Include issue if any
+            })
         return {
-            "repos": [
-                {
-                    "repo_id": repo.repo_id,
-                    "path": str(repo.path),
-                    "active": repo.active,
-                    "watch_enabled": repo.watch_enabled,
-                    "last_indexed": repo.last_indexed,
-                    "node_count": queries.count_nodes(engine, repo.repo_id),
-                    "issue": repo_issues.get(repo.repo_id),  # Include issue if any
-                }
-                for repo in registry.list_repos()
-            ],
+            "repos": repos,
             "issues": repo_issues,  # Also return all issues as a summary
         }
 
@@ -336,6 +349,11 @@ def build_router(
             # this stamp.
             files_indexed = run_exclusive(record.repo_id, scan_and_stamp)
             indexed = True
+        except EngineClosed:
+            # The agent is shutting down. Never stamped, so its next start
+            # indexes the repository in full.
+            logger.info("registered %s; shutdown cut its initial scan, which the next start redoes", record.repo_id)
+            warning = "Registered, but DevGraph shut down during the initial scan; it finishes on the next start."
         except Exception as exc:
             # Registration already committed to SQLite; an indexing failure
             # (e.g. Neo4j down) must not undo it -- same call as the CLI's,
@@ -563,6 +581,7 @@ def build_router(
             "relationship_types": relationship_types,
             "schema_state": state,
             "notices": notices,
+            "hidden_properties": sorted(INTERNAL_NODE_PROPERTIES | INTERNAL_EDGE_PROPERTIES),
         }
 
     def _insights_payload(repo_id: str) -> dict[str, Any]:
@@ -679,6 +698,12 @@ def build_router(
 
         The query is arbitrary Cypher, writes included, so this gets the same
         cross-site check as the other state-changing routes.
+
+        `preview: true` runs the query in a read transaction instead, so the
+        server refuses any write. The console's live preview (fired while the
+        user is still typing) sends only this; a write runs only from Run,
+        behind the console's destructive-query confirm. Previews are never
+        recorded.
         """
         _reject_cross_site(request)
         query = (payload.get("query") or "").strip()
@@ -686,11 +711,13 @@ def build_router(
             raise HTTPException(status_code=400, detail="query is required")
         params = payload.get("params") or {}
         repo_id = payload.get("repo_id")
-        should_record = bool(payload.get("record"))
+        preview = bool(payload.get("preview"))
+        should_record = bool(payload.get("record")) and not preview
+        run = engine.preview_cypher_graph if preview else engine.run_cypher_graph
 
         start = time.monotonic()
         try:
-            result = engine.run_cypher_graph(query, params)
+            result = run(query, params)
         except Exception as exc:  # neo4j driver raises its own exception hierarchy
             if should_record:
                 query_log.record(
@@ -1114,6 +1141,8 @@ def build_router(
                         # doesn't silently drop a quiet connection.
                         yield ": keep-alive\n\n"
                         continue
+                    if event is CLOSED:
+                        break  # the agent is shutting down
                     yield f"data: {json.dumps(event)}\n\n"
             finally:
                 events.unsubscribe(queue)

@@ -1,7 +1,6 @@
 """`devgraph config tools` (list/add/edit/delete/reset) and global-tool reporting."""
 
 import json
-import sys
 import textwrap
 
 import pytest

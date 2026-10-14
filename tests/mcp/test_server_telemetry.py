@@ -31,12 +31,20 @@ class _StubEngine:
             raise self.raises
         return []
 
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        return self.run_cypher(query, params), False
+
 
 class _StubRegistry:
-    """build_server only stows the registry away for tools needing a repo root."""
+    """Knows the one repository these calls name; no tool here needs its root."""
+
+    def __init__(self, known="demo"):
+        self.known = known
 
     def get(self, repo_id):
-        return None
+        if repo_id != self.known:
+            return None
+        return type("Record", (), {"repo_id": repo_id, "path": Path(__file__).parent / "no-such-dir"})()
 
 
 @pytest.fixture
@@ -47,8 +55,8 @@ def settings(tmp_path, monkeypatch):
     return fake
 
 
-def _build(engine=None):
-    return mcp_server.build_server(engine or _StubEngine(), _StubRegistry())
+def _build(engine=None, registry=None):
+    return mcp_server.build_server(engine or _StubEngine(), registry or _StubRegistry())
 
 
 def test_a_tool_call_records_exactly_one_successful_entry(settings):
@@ -97,7 +105,7 @@ def test_the_original_exception_propagates_unchanged(settings):
 def test_no_arguments_cypher_or_results_are_recorded(settings):
     distinctive_argument = "zz-not-a-real-component-name-zz"
     distinctive_repo_id = "zz-not-a-real-repo-id-zz"
-    server = _build()
+    server = _build(registry=_StubRegistry(distinctive_repo_id))
 
     asyncio.run(
         server.call_tool(

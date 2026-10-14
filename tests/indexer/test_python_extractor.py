@@ -78,8 +78,8 @@ def process_data(data: List[str]) -> None:
     assert ("Class", "UserService", "EXTENDS", "Class", "BaseService") in rel_tuples
 
     # Module IMPORTS
-    assert ("Module", "test_module.py", "IMPORTS", "Module", "os") in rel_tuples
-    assert ("Module", "test_module.py", "IMPORTS", "Module", "typing") in rel_tuples
+    assert ("Module", "test_module.py", "IMPORTS", "Module", "os.py") in rel_tuples
+    assert ("Module", "test_module.py", "IMPORTS", "Module", "typing/__init__.py") in rel_tuples
 
 
 def test_extract_with_decorators():
@@ -193,14 +193,14 @@ def test_relative_import_targets_resolve_to_module_filenames():
     assert "connect.py" not in targets
 
 
-def test_absolute_import_targets_are_bare_module_names():
-    """Absolute imports (stdlib/third-party/top-level) keep their bare name as
-    the target — they're expected not to resolve to a same-repo Module node,
-    unlike relative imports.
+def test_absolute_import_targets_are_candidate_files():
+    """Absolute imports (stdlib/third-party/top-level) target their candidate
+    files like any other import; a bare dotted name never matches a Module,
+    so none is emitted. Only a candidate that exists in the repo links.
     """
     result = extract_python_file("import os\nimport requests\n", "main.py", "test_repo")
     targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert targets == {"os", "requests"}
+    assert targets == {"os.py", "os/__init__.py", "requests.py", "requests/__init__.py"}
 
 
 def test_all_nodes_scoped_to_repo():
@@ -265,7 +265,7 @@ def test_calls_edge_carries_caller_class_for_method_body_calls():
     """
     source_code = """
 def free_call():
-    helper()
+    obj.helper()
 
 class Service:
     def process(self):
@@ -278,8 +278,8 @@ class Service:
     calls_by_pair = {
         (r.from_name, r.to_name): r.properties for r in result.relationships if r.rel_type == "CALLS"
     }
-    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service"}
-    assert calls_by_pair[("free_call", "helper")] is None
+    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service", "confidence": "resolved"}
+    assert calls_by_pair[("free_call", "helper")] == {"confidence": "name"}
 
 
 def test_calls_edge_attributed_to_correct_nested_scope():
@@ -289,8 +289,8 @@ def test_calls_edge_attributed_to_correct_nested_scope():
     source_code = """
 def outer():
     def inner():
-        deep_call()
-    outer_call()
+        x.deep_call()
+    x.outer_call()
 """
     result = extract_python_file(source_code, "x.py", "test_repo")
     calls = {(r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}
@@ -322,26 +322,27 @@ def test_from_import_names_exclude_the_module_name():
     the original Tree-sitter migration. Fixed by comparing byte spans.
     """
     result = extract_python_file("from typing import List\n", "x.py", "test_repo")
-    imports_rels = [r for r in result.relationships if r.rel_type == "IMPORTS"]
-    # Exactly one edge (one imported name), not two (module name duplicated in).
-    assert len(imports_rels) == 1
+    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
+    # The module and the one imported name as its submodule, never the
+    # module name duplicated in as a submodule of itself ('typing/typing.py').
+    assert targets == {"typing.py", "typing/__init__.py", "typing/List.py", "typing/List/__init__.py"}
 
 
 def test_dotted_absolute_import_resolves_to_same_repo_file_path():
     """'from services.api_gateway.clients import Foo' — a same-repo absolute
     dotted import (the common real-world style, not dot-relative) — must
-    ALSO emit a same-repo-file-path target so it can resolve to the actual
-    Module node, alongside the original bare-dotted-name target kept for
-    compatibility. Confirmed necessary: RAG4 (a real ~1300-node repo) uses
+    emit a same-repo-file-path target so it can resolve to the actual
+    Module node. Confirmed necessary: RAG4 (a real ~1300-node repo) uses
     this style exclusively and had zero resolvable same-repo IMPORTS edges
-    before this fix.
+    before this fix. The bare dotted name never matches a Module node, so it
+    is not emitted.
     """
     result = extract_python_file(
         "from services.api_gateway.clients import Foo\n", "services/api_gateway/main.py", "test_repo"
     )
     targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "services.api_gateway.clients" in targets  # kept for compatibility
-    assert "services/api_gateway/clients.py" in targets  # new: resolvable target
+    assert "services.api_gateway.clients" not in targets
+    assert "services/api_gateway/clients.py" in targets
 
 
 def test_dotted_import_statement_also_resolves():
@@ -351,13 +352,12 @@ def test_dotted_import_statement_also_resolves():
     assert "shared/utils.py" in targets
 
 
-def test_single_segment_import_has_no_extra_file_guess():
-    """A bare single-word import ('import os') shouldn't gain an extra
-    file-path guess — there's no dotted structure to reinterpret.
-    """
-    result = extract_python_file("import os\n", "app.py", "test_repo")
+def test_single_segment_import_targets_its_file_and_package():
+    """A bare single-word import ('import os') targets 'os.py' and
+    'os/__init__.py' under each ancestor directory of the importer."""
+    result = extract_python_file("import os\n", "app/main.py", "test_repo")
     targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert targets == {"os"}
+    assert targets == {"os.py", "os/__init__.py", "app/os.py", "app/os/__init__.py"}
 
 
 def test_calls_targets_are_function_label():

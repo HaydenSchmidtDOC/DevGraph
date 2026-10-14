@@ -25,7 +25,7 @@ from devgraph.dashboard.db_metrics import MetricsHistory
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.dashboard.query_log import QueryLog
 from devgraph.dashboard.routes import build_router
-from devgraph.dashboard.url import WILDCARD_HOSTNAMES
+from devgraph.dashboard.url import DASHBOARD_IDENTITY, WILDCARD_HOSTNAMES
 from devgraph.graph.engine import GraphEngine
 from devgraph.registry.store import RepoRegistry
 
@@ -129,6 +129,11 @@ def build_app(
     # Hand-written HTML/CSS/JS, no build step -- StaticFiles serves them
     # as-is (see Implementation Plan #5: no frontend framework in v1).
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    @app.get("/api/health")
+    def health() -> dict[str, str]:
+        """Identifies this server, so `devgraph dashboard` never opens another program's page."""
+        return dict(DASHBOARD_IDENTITY)
 
     @app.get("/")
     def index() -> FileResponse:

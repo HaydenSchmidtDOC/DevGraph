@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en">
-<head><script type="application/json" data-od-external-dependencies>["https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"]</script>
+<head><script type="application/json" data-od-external-dependencies>[]</script>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>DevGraph · Live Dashboard</title>
@@ -197,6 +197,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); height: 14px; }
 .switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; z-index: 2; }
 .switch .track { position: absolute; inset: 0; background: rgba(255,255,255,0.12); border-radius: 999px; transition: background var(--motion-fast); pointer-events: none; }
 .switch .thumb { position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--muted); transition: transform var(--motion-fast), background var(--motion-fast); pointer-events: none; }
+.switch input:focus-visible + .track { box-shadow: var(--focus-ring); }
 .switch input:checked + .track { background: color-mix(in oklab, var(--accent), transparent 25%); }
 .switch input:checked + .track + .thumb { transform: translateX(13px); background: var(--accent); }
 
@@ -342,6 +343,8 @@ table.logtable tbody tr:hover { background: color-mix(in oklab, var(--accent), t
 .leaderboard-row .lb-type { font-family: var(--font-mono); font-size: 9.5px; color: var(--meta); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; flex-shrink: 0; }
 .leaderboard-row .lb-val { font-family: var(--font-mono); font-size: 12px; color: var(--fg); flex-shrink: 0; }
 .topology-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+.repo-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 3; max-width: 420px; padding: 16px 20px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface); color: var(--fg-2); font-size: 13px; line-height: 1.6; text-align: center; pointer-events: auto; }
+.repo-empty code { font-family: var(--font-mono); color: var(--fg); }
 .placeholder-note { font-size: 11px; color: var(--meta); line-height: 1.5; margin-top: 6px; }
 
 .settings-overlay { position: fixed; inset: 0; z-index: 80; background: var(--bg); display: none; overflow-y: auto; }
@@ -460,7 +463,7 @@ table.dstable input[type="text"] { width: 100%; }
 
 <header class="topnav" data-od-id="topnav">
   <div class="topnav-inner">
-    <button class="icon-btn" id="btnOpenSettings" title="Settings" data-od-id="btn-settings-cog">
+    <button class="icon-btn" id="btnOpenSettings" title="Settings" aria-label="Settings" data-od-id="btn-settings-cog">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
     <div class="brand" data-od-id="brand"><span class="mark">DG</span>DevGraph<span class="ver" title="Read from pyproject.toml — wire to real build metadata later">v0.1.0</span><span class="beta">Beta</span></div>
@@ -468,7 +471,6 @@ table.dstable input[type="text"] { width: 100%; }
     <div class="repo-select-wrap">
       <select id="repoSelect" data-od-id="repo-select">
         <option value="__all__">All Repos</option>
-        <option value="devgraph" selected>devgraph</option>
       </select>
     </div>
     <button class="btn btn-sm" id="btnRegister" title="Add a repo below in Settings → Repos">+ Register repo</button>
@@ -490,6 +492,7 @@ table.dstable input[type="text"] { width: 100%; }
   </div>
   <canvas id="glowCanvas"></canvas>
   <div id="cy"></div>
+  <div id="repoEmptyState" class="repo-empty" hidden>No repositories registered yet. Register one with <code>devgraph register &lt;path&gt;</code>, or with <b>+ Register repo</b> above.</div>
   <div class="control-flyout" id="controlFlyout" data-od-id="graph-control-panel">
     <div class="control-panel-body">
       <div class="control-panel-scroll">
@@ -559,7 +562,7 @@ table.dstable input[type="text"] { width: 100%; }
   <div class="details-card" id="detailsCard" data-od-id="node-details-card">
     <div class="card-head">
       <h3 id="detailsTitle">Details</h3>
-      <button class="icon-btn" id="btnCloseDetails" title="Close" style="width:22px;height:22px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+      <button class="icon-btn" id="btnCloseDetails" title="Close" aria-label="Close details" style="width:22px;height:22px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
     </div>
     <div id="detailsBody"></div>
   </div>
@@ -572,7 +575,7 @@ table.dstable input[type="text"] { width: 100%; }
       <div class="count-note" id="schemaPendingHint" style="display:none"></div>
       <div class="count-note">Document nodes: <span id="docCount" style="color:var(--fg-2)">—</span></div>
       <div class="fc-subsection" data-od-id="god-nodes-section">
-        <div class="fc-subhead">Top god nodes <span class="lb-type" id="godNodesBasis">degree</span><span class="qmark" data-tip="PageRank over dependency edges (calls, imports, extends, implements, uses, depends-on) once graph insights are computed; until then, raw degree — size((n)--()) — which containment and history edges inflate. CALLS edges are resolved by name, so widely used generic method names (such as get or close) can rank high.">?</span></div>
+        <div class="fc-subhead">Top god nodes <span class="lb-type" id="godNodesBasis">degree</span><span class="qmark" data-tip="PageRank over dependency edges (calls, imports, extends, implements, uses, depends-on) once graph insights are computed; until then, raw degree — COUNT { (n)--() } — which containment and history edges inflate. CALLS edges are resolved by name, so widely used generic method names (such as get or close) can rank high.">?</span></div>
         <div id="godNodes"></div>
       </div>
     </div>
@@ -587,7 +590,7 @@ table.dstable input[type="text"] { width: 100%; }
   <div class="below-layout" data-od-id="view-graph">
     <div class="canvas-col">
       <div class="graph-reload-wrap">
-        <button class="icon-btn graph-reload-btn" id="btnGraphReload" title="Re-settle the graph from its current layout" data-od-id="graph-reload-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button>
+        <button class="icon-btn graph-reload-btn" id="btnGraphReload" title="Re-settle the graph from its current layout" aria-label="Re-settle the graph" data-od-id="graph-reload-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button>
       </div>
       <div class="card" data-od-id="cypher-card">
         <div class="card-head"><h3>Cypher query</h3></div>
@@ -687,7 +690,7 @@ table.dstable input[type="text"] { width: 100%; }
 <footer class="pagefoot" data-od-id="footer"><span>DevGraph dashboard prototype · design phase</span><span>Node/relationship types from each repository's schema · git history is the real <code>devgraph</code> log</span></footer>
 
 <div class="settings-overlay" id="settingsOverlay" data-od-id="settings-overlay">
-  <div class="settings-topbar"><button class="icon-btn" id="btnCloseSettings" title="Back to graph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button><h2>Settings</h2></div>
+  <div class="settings-topbar"><button class="icon-btn" id="btnCloseSettings" title="Back to graph" aria-label="Back to graph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button><h2>Settings</h2></div>
   <div class="settings-body">
     <div class="settings-layout">
       <nav class="settings-nav" data-od-id="settings-nav">
@@ -844,58 +847,159 @@ table.dstable input[type="text"] { width: 100%; }
 <div id="tooltipBubble"></div>
 <div id="gitHoverCard"></div>
 
-<script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<script src="/static/vendor/cytoscape-3.30.2.min.js"></script>
 <script>
 /* ── global fixed tooltip (not clipped by scroll containers) ─────── */
+/* Each trigger is focusable and described by the one shared bubble, which
+   shows on hover or focus and hides on leave, blur or Escape. */
 const tip = document.getElementById("tooltipBubble");
-function wireTooltip(q) {
-  q.addEventListener("mouseenter", () => {
-    tip.textContent = q.dataset.tip;
-    const r = q.getBoundingClientRect();
-    tip.style.left = Math.min(r.left - 100, window.innerWidth - 226) + "px";
-    tip.style.top = (r.top - 10) + "px";
-    tip.style.transform = "translateY(-100%)";
-    tip.classList.add("show");
-  });
-  q.addEventListener("mouseleave", () => tip.classList.remove("show"));
+tip.setAttribute("role", "tooltip");
+function showTip(q) {
+  tip.textContent = q.dataset.tip;
+  const r = q.getBoundingClientRect();
+  tip.style.left = Math.min(r.left - 100, window.innerWidth - 226) + "px";
+  tip.style.top = (r.top - 10) + "px";
+  tip.style.transform = "translateY(-100%)";
+  tip.classList.add("show");
 }
+function hideTip() { tip.classList.remove("show"); }
+function wireTooltip(q) {
+  q.tabIndex = 0;
+  q.setAttribute("role", "button");
+  if (q.textContent.trim() === "?") q.setAttribute("aria-label", "Help");
+  q.setAttribute("aria-describedby", "tooltipBubble");
+  q.addEventListener("mouseenter", () => showTip(q));
+  q.addEventListener("mouseleave", hideTip);
+  q.addEventListener("focus", () => showTip(q));
+  q.addEventListener("blur", hideTip);
+}
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && tip.classList.contains("show")) { hideTip(); e.preventDefault(); }
+});
 document.querySelectorAll(".qmark").forEach(wireTooltip);
 
-/* ── themed custom <select> (replaces the OS-default white popup list) ── */
-function themeSelect(select) {
+/* ── themed custom <select> (replaces the OS-default white popup list) ──
+   The trigger is an ARIA select-only combobox: focus stays on it while the
+   arrow keys, Home/End and type-ahead move the active option, announced via
+   aria-activedescendant. The native <select> keeps the value but is taken out
+   of the tab order and the accessibility tree. */
+let cselSeq = 0;
+function themeSelect(select, label) {
+  const uid = "csel" + (++cselSeq);
   const wrap = document.createElement("div"); wrap.className = "csel";
   select.parentNode.insertBefore(wrap, select);
   wrap.appendChild(select);
   select.classList.add("csel-native");
+  select.tabIndex = -1;
+  select.setAttribute("aria-hidden", "true");
   const btn = document.createElement("button"); btn.type = "button"; btn.className = "csel-btn";
   const list = document.createElement("div"); list.className = "csel-list";
+  list.id = uid + "-list";
+  list.setAttribute("role", "listbox");
+  list.setAttribute("aria-label", label);
+  btn.setAttribute("role", "combobox");
+  btn.setAttribute("aria-haspopup", "listbox");
+  btn.setAttribute("aria-expanded", "false");
+  btn.setAttribute("aria-controls", list.id);
+  btn.setAttribute("aria-label", label);
+  let active = -1, typed = "", typedAt = 0;
   function labelFor(v) { const o = [...select.options].find(o => o.value === v); return o ? o.textContent : v; }
+  const isOpen = () => list.classList.contains("show");
+  function setActive(i) {
+    const items = list.children;
+    if (!items.length) return;
+    active = Math.max(0, Math.min(items.length - 1, i));
+    [...items].forEach((it, j) => it.classList.toggle("active", j === active));
+    btn.setAttribute("aria-activedescendant", items[active].id);
+    items[active].scrollIntoView?.({ block: "nearest" });
+  }
+  function open() {
+    document.querySelectorAll(".csel-list.show").forEach(l => { if (l !== list) l.classList.remove("show"); });
+    list.classList.add("show");
+    btn.setAttribute("aria-expanded", "true");
+    setActive(select.selectedIndex);
+  }
+  function close() {
+    list.classList.remove("show");
+    btn.setAttribute("aria-expanded", "false");
+    btn.removeAttribute("aria-activedescendant");
+  }
+  function choose(o) {
+    select.value = o.value;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    btn.textContent = o.textContent;
+    close();
+    renderList();
+  }
   function renderList() {
     list.innerHTML = "";
-    [...select.options].forEach(o => {
+    [...select.options].forEach((o, i) => {
       const item = document.createElement("div");
-      item.className = "csel-item" + (o.value === select.value ? " active" : "");
+      const selected = o.value === select.value;
+      item.className = "csel-item" + (selected ? " active" : "");
+      item.id = uid + "-opt-" + i;
+      item.setAttribute("role", "option");
+      item.setAttribute("aria-selected", String(selected));
       item.textContent = o.textContent;
-      item.addEventListener("mousedown", e => {
-        e.preventDefault();
-        select.value = o.value;
-        select.dispatchEvent(new Event("change", { bubbles: true }));
-        btn.textContent = o.textContent;
-        list.classList.remove("show");
-        renderList();
-      });
+      // An option's title (why a repository isn't watched) would otherwise be
+      // lost with the native select, which is hidden.
+      if (o.title) { item.title = o.title; item.setAttribute("aria-description", o.title); }
+      item.addEventListener("mousedown", e => { e.preventDefault(); choose(o); });
       list.appendChild(item);
     });
   }
+  /* Type-ahead: letters typed within half a second build one search string;
+     repeating a single letter cycles through the options it starts. */
+  function typeAhead(ch) {
+    const now = Date.now();
+    typed = now - typedAt > 500 ? ch : typed + ch;
+    typedAt = now;
+    const names = [...select.options].map(o => o.textContent.toLowerCase());
+    const cycling = typed.length > 1 && [...typed].every(c => c === typed[0]);
+    const needle = cycling ? typed[0] : typed;
+    const from = typed.length === 1 || cycling ? active + 1 : active;
+    for (let k = 0; k < names.length; k++) {
+      const i = (from + k) % names.length;
+      if (names[i].startsWith(needle)) { setActive(i); return; }
+    }
+  }
+  btn.addEventListener("keydown", e => {
+    const k = e.key;
+    if (!isOpen()) {
+      if (["ArrowDown", "ArrowUp", "Enter", " ", "Home", "End"].includes(k)) {
+        e.preventDefault();
+        open();
+        if (k === "Home") setActive(0);
+        if (k === "End") setActive(list.children.length - 1);
+      } else if (k.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault(); open(); typeAhead(k.toLowerCase());
+      }
+      return;
+    }
+    if (k === "ArrowDown") { e.preventDefault(); setActive(active + 1); }
+    else if (k === "ArrowUp") { e.preventDefault(); setActive(active - 1); }
+    else if (k === "Home" || k === "PageUp") { e.preventDefault(); setActive(0); }
+    else if (k === "End" || k === "PageDown") { e.preventDefault(); setActive(list.children.length - 1); }
+    else if (k === "Enter" || (k === " " && Date.now() - typedAt > 500)) {
+      e.preventDefault();
+      const o = select.options[active];
+      if (o) choose(o); else close();
+    }
+    else if (k === "Escape") { e.preventDefault(); e.stopPropagation(); close(); }
+    else if (k === "Tab") close();
+    else if (k.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); typeAhead(k.toLowerCase()); }
+  });
   btn.textContent = labelFor(select.value);
   renderList();
-  btn.addEventListener("click", () => { document.querySelectorAll(".csel-list.show").forEach(l => { if (l !== list) l.classList.remove("show"); }); list.classList.toggle("show"); });
-  document.addEventListener("click", e => { if (!wrap.contains(e.target)) list.classList.remove("show"); });
+  btn.addEventListener("click", () => { if (isOpen()) close(); else open(); });
+  btn.addEventListener("blur", close);
+  document.addEventListener("click", e => { if (!wrap.contains(e.target)) close(); });
   wrap.appendChild(btn);
   wrap.appendChild(list);
-  select.themeRefresh = () => { btn.textContent = labelFor(select.value); renderList(); };
+  select.themeRefresh = () => { btn.textContent = labelFor(select.value); renderList(); if (isOpen()) setActive(select.selectedIndex); };
 }
-["repoSelect","layoutSelect","chartInterval","chartSpan"].forEach(id => themeSelect(document.getElementById(id)));
+[["repoSelect", "Repository"], ["layoutSelect", "Layout algorithm"], ["chartInterval", "Chart interval"], ["chartSpan", "Chart time span"]]
+  .forEach(([id, label]) => themeSelect(document.getElementById(id), label));
 
 /* The built-in types as the dashboard has always drawn them: the order,
    category and colour of each row a repository with no schema file shows.
@@ -1088,6 +1192,7 @@ renderTypeLists();
    "user:" + label, coloured from the payload, so it isolates, highlights and
    colours on its own. Nothing of the previous repo's survives the swap. */
 function applySchemaTypes(schema) {
+  HIDDEN_PROPS = new Set(schema.hidden_properties || []);
   const counts = Object.fromEntries((schema.node_types || []).map(t => [t.label, t.count]));
   Object.keys(CAT_COLORS).filter(k => k.startsWith("user:")).forEach(k => { delete CAT_COLORS[k]; delete brightCache[k]; });
   Object.keys(REL_COLORS).forEach(k => delete REL_COLORS[k]);
@@ -1384,9 +1489,14 @@ cy.on("mouseout", "node", e => {
 const detailsCard = document.getElementById("detailsCard");
 const detailsTitle = document.getElementById("detailsTitle");
 const detailsBody = document.getElementById("detailsBody");
-function renderPropsRows(props) {
-  if (!props || !Object.keys(props).length) return `<div class="placeholder-note">No properties.</div>`;
-  return Object.entries(props).map(([k, v]) => `<div class="metric-row"><span class="metric-label">${escapeHtmlVal(k)}</span><span class="metric-val" style="overflow-wrap:anywhere;text-align:right;white-space:normal">${formatCell(v)}</span></div>`).join("");
+/* Node and edge properties that are pipeline bookkeeping (graph/schema.py's
+   INTERNAL_NODE_PROPERTIES and INTERNAL_EDGE_PROPERTIES, served by the schema
+   route): the inspector hides them, as describe_node does for nodes. */
+let HIDDEN_PROPS = new Set();
+function renderPropsRows(props, hidden = new Set()) {
+  const entries = Object.entries(props || {}).filter(([k]) => !hidden.has(k));
+  if (!entries.length) return `<div class="placeholder-note">No properties.</div>`;
+  return entries.map(([k, v]) => `<div class="metric-row"><span class="metric-label">${escapeHtmlVal(k)}</span><span class="metric-val" style="overflow-wrap:anywhere;text-align:right;white-space:normal">${formatCell(v)}</span></div>`).join("");
 }
 function edgeDetailsQuery(ele) {
   const m = /^live-e:(\d+)$/.exec(ele.id());
@@ -1443,12 +1553,12 @@ function showDetailsCard(ele, isEdge) {
         `<div class="metric-row"><span class="metric-label">Type</span><span class="metric-val">${escapeHtmlVal(type)}</span></div>` +
         `<div class="metric-row"><span class="metric-label">From</span><span class="metric-val">${escapeHtmlVal(s?.name || s?.repo_id || "—")}</span></div>` +
         `<div class="metric-row"><span class="metric-label">To</span><span class="metric-val">${escapeHtmlVal(t?.name || t?.repo_id || "—")}</span></div>` +
-        renderPropsRows(props);
+        renderPropsRows(props, HIDDEN_PROPS);
     } else {
       const [labels, props] = row;
       detailsBody.innerHTML =
         `<div class="metric-row"><span class="metric-label">Label</span><span class="metric-val">${escapeHtmlVal((labels||[]).join(", "))}</span></div>` +
-        renderPropsRows(props);
+        renderPropsRows(props, HIDDEN_PROPS);
     }
   }).catch(() => { if (detailsCard.classList.contains("open")) detailsBody.innerHTML = `<div class="placeholder-note">Request failed.</div>`; });
 }
@@ -2345,11 +2455,15 @@ function buildQueryFromState(runMode) {
 }
 
 /* ── cypher syntax highlighting (overlay <pre> behind a transparent textarea) ── */
-function escapeHtml(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+/* Quotes escaped too, so the only raw quotes in highlightCypher's output are
+   its own attribute quotes: matching string literals on raw `"` used to wrap
+   the comment span's class="tok-cm" in a string span. &apos;, not &#39;, so
+   the number rule below has no digits to match. */
+function escapeHtml(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;"); }
 function highlightCypher(text) {
   let t = escapeHtml(text);
   t = t.replace(/(\/\/[^\n]*)/g, '<span class="tok-cm">$1</span>');
-  t = t.replace(/"([^"]*)"/g, '<span class="tok-str">"$1"</span>');
+  t = t.replace(/&quot;((?:(?!&quot;)[^\n])*)&quot;/g, '<span class="tok-str">&quot;$1&quot;</span>');
   t = t.replace(/\b(MATCH|OPTIONAL MATCH|WHERE|RETURN|LIMIT|WITH|ORDER BY|AND|OR|NOT|AS|DISTINCT|COUNT|IN)\b/g, '<span class="tok-kw">$1</span>');
   t = t.replace(/:(\w+)/g, ':<span class="tok-label">$1</span>');
   t = t.replace(/\b(\d+)\b/g, '<span class="tok-num">$1</span>');
@@ -2378,7 +2492,10 @@ neo4jStatus.id = "neo4jStatus"; neo4jStatus.style.cssText = "margin-right:auto; 
 document.querySelector(".cypher-foot").prepend(neo4jStatus);
 neo4jStatus.textContent = "checking…"; neo4jStatus.style.color = "var(--meta)";
 
-function escapeHtmlVal(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+/* Escapes for both text and quoted-attribute contexts: graph, git, filesystem
+   and registry strings come from indexed repositories, not from the user, and
+   an attribute such as title="${...}" breaks out on a bare quote. */
+function escapeHtmlVal(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
 /* RETURN n (a whole node/relationship) comes back with EVERY stored property —
    for devgraph that includes docstring_full on Module/Class/Function nodes,
    which can run to paragraphs of text per node. JSON.stringify-ing that raw
@@ -2524,6 +2641,8 @@ async function runCypher(statement, opts) {
       query: statement,
       repo_id: document.getElementById("repoSelect")?.value || null,
       record: !!opts?.record,
+      // read transaction server-side: the server refuses any write
+      preview: !!opts?.preview,
     }),
   });
   return res.json();
@@ -2545,10 +2664,17 @@ function escapeCypherStr(s) { return String(s).replace(/["\\]/g, "\\$&"); }
    or re-deriving the filter client-side. Every relationship this query
    returns already satisfies WHERE, so it's a match by construction --
    no separate edge-side check needed. */
+/* "All Repos" means every registered repository (populateRealRepos keeps the
+   list), never a repo_id left in the graph after it was unregistered or by a
+   stray test run -- the same bound an MCP cross_repo call gets. */
+let REGISTERED_REPO_IDS = [];
+function allReposClause(alias) {
+  return `${alias}.repo_id IN [${REGISTERED_REPO_IDS.map(id => `"${escapeCypherStr(id)}"`).join(", ")}]`;
+}
 function currentStateQuery() {
   const repo = document.getElementById("repoSelect").value;
   const isolatedEntityId = state.isolatedEntity;
-  const nodeWhere = [repo === "__all__" ? "true" : `n.repo_id = "${escapeCypherStr(repo)}"`];
+  const nodeWhere = [repo === "__all__" ? allReposClause("n") : `n.repo_id = "${escapeCypherStr(repo)}"`];
   if (isolatedEntityId) nodeWhere.push(`labels(n)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
   // A ceiling maxed out (the default) means "no cap" -- leave its LIMIT out
   // of the query entirely rather than spelling out the current real total,
@@ -2706,8 +2832,15 @@ async function previewQueryGlow(text) {
   const trimmed = (text||"").trim();
   const mySeq = ++glowRequestSeq;
   if (!trimmed) { animateGlowTo([]); focusRotation(null, 60); return; }
+  /* Only a query that opens with a plain read clause, and calls nothing, is
+     previewed: a read transaction still runs LOAD CSV (fetching a URL or a
+     file), SHOW, TERMINATE and procedure CALLs. Leading comments are skipped. */
+  const body = trimmed.replace(/^(?:\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|\s+)+/, "");
+  if (!/^(?:OPTIONAL\s+MATCH|MATCH|WITH|RETURN|UNWIND)\b/i.test(body)) return;
+  if (/\b(?:CALL|LOAD\s+CSV|TERMINATE|SHOW)\b/i.test(body)) return;
   try {
-    const json = await runCypher(trimmed);
+    // preview: fired while the user is still typing, so it must never write
+    const json = await runCypher(trimmed, { preview: true });
     if (mySeq !== glowRequestSeq) return; // superseded by a newer query before this one came back
     if (json.errors?.length) return; // mid-typing/invalid — leave current glow state alone
     const { nodeIds, edgeIds } = extractGraphIds(json.results[0].data);
@@ -2770,15 +2903,33 @@ async function populateRealRepos(fireChangeEvent) {
   if (!resp.ok) return;
   const json = await resp.json();
   const ids = (json.repos || []).filter(r => r.active).map(r => r.repo_id).sort();
-  if (!ids.length) return;
+  REGISTERED_REPO_IDS = ids;
+  // Built even when empty: an early return here used to leave the static
+  // markup's options in place, showing a repository that doesn't exist.
+  document.getElementById("repoEmptyState").hidden = ids.length > 0;
+  // A repo whose folder is missing (an unmounted drive, a moved folder)
+  // keeps its graph -- every scan refuses it -- so it stays selectable, flagged.
+  const missing = new Set((json.repos || []).filter(r => r.path_missing).map(r => r.repo_id));
+  // One the agent's watcher isn't watching (say an inotify limit was reached)
+  // is browsable too, but not kept live: flagged, with the reason as tooltip.
+  const unwatched = new Map((json.repos || []).filter(r => r.issue && !r.path_missing).map(r => [r.repo_id, r.issue]));
+  const optionLabel = id => missing.has(id) ? " (path missing)" : unwatched.has(id) ? " (not watched)" : "";
+  const optionTitle = id => unwatched.has(id) ? ` title="${escapeHtmlVal(unwatched.get(id))}"` : "";
   const select = document.getElementById("repoSelect");
   // A saved repo (from a prior reload) wins over whatever the select's
   // current value happens to be -- on first boot that's just the static
   // markup's default option, not a real user choice.
   const saved = localStorage.getItem(SELECTED_REPO_KEY);
   const current = saved || select.value;
-  select.innerHTML = '<option value="__all__">All Repos</option>' + ids.map(id => `<option value="${escapeHtmlVal(id)}">${escapeHtmlVal(id)}</option>`).join("");
-  select.value = (current === "__all__" || ids.includes(current)) ? current : (ids.includes("devgraph") ? "devgraph" : ids[0]);
+  select.innerHTML = '<option value="__all__">All Repos</option>' + ids.map(id => `<option value="${escapeHtmlVal(id)}"${optionTitle(id)}>${escapeHtmlVal(id)}${optionLabel(id)}</option>`).join("");
+  // A saved All Repos is kept; a selection that is no longer registered (or
+  // no saved choice at all) falls back to the first repository, or to All
+  // Repos when none is left.
+  select.value = ids.includes(current) || (current === "__all__" && saved) ? current : (ids[0] ?? "__all__");
+  // Only a user's choice is remembered: a saved repository that is gone is
+  // forgotten, and the fallback is not saved in its place -- saving All Repos
+  // on an empty registry used to pin it after the first registration.
+  if (saved && saved !== select.value) localStorage.removeItem(SELECTED_REPO_KEY);
   select.themeRefresh?.();
   // Boot passes fireChangeEvent:false and does its own explicit, awaited
   // refreshGraph call right after (see below) -- dispatching here too used
@@ -2788,7 +2939,11 @@ async function populateRealRepos(fireChangeEvent) {
   // dimmed instead of reconciled. The SSE registry_changed handler is the
   // only other caller and still wants the dispatch -- nothing else reloads
   // the graph after it changes the repo list.
-  if (fireChangeEvent !== false) select.dispatchEvent(new Event("change", { bubbles: true }));
+  if (fireChangeEvent !== false) {
+    const change = new Event("change", { bubbles: true });
+    change.automatic = true; // onRepoSelectChange: not the user's choice, don't save it
+    select.dispatchEvent(change);
+  }
 }
 const legendStatus = document.getElementById("neo4jStatusLegend");
 /* Named rather than an inline IIFE so the boot path -- including the
@@ -3000,7 +3155,7 @@ document.getElementById("graphSearch").addEventListener("input", e => {
 document.getElementById("pullTab").addEventListener("click", () => document.getElementById("controlFlyout").classList.toggle("open"));
 async function onRepoSelectChange(e) {
   const v = e.target.value;
-  localStorage.setItem(SELECTED_REPO_KEY, v);
+  if (!e.automatic) localStorage.setItem(SELECTED_REPO_KEY, v);
   applyCatchUpPill(null);
   if (neo4jConnected) await loadSchemaTypes(v); // before the graph fetch, so a type the new repo lacks is no longer isolated
   const loaded = await refreshGraph("full", true, true); // switching repos is a deliberate scope change, not an incremental update -- always caps the displayed set to it, even in highlight mode
@@ -5014,7 +5169,7 @@ function currentWordRange() {
   return { start, end: pos, word: val.slice(start, pos) };
 }
 function renderAC() {
-  ac.innerHTML = acItems.map((it,i) => `<div class="ac-item${i===acIndex?' active':''}" data-i="${i}"><span>${escapeHtmlVal(it.text)}</span><span class="k">${it.kind}</span></div>`).join("");
+  ac.innerHTML = acItems.map((it,i) => `<div class="ac-item${i===acIndex?' active':''}" data-i="${i}"><span>${escapeHtmlVal(it.text)}</span><span class="k">${escapeHtmlVal(it.kind)}</span></div>`).join("");
   ac.classList.toggle("show", acItems.length > 0);
 }
 function selectAC(i) {
@@ -5163,7 +5318,7 @@ function loadQueryFromHistory(cypherText) {
   runCypherAndDisplay(cypherText, { skipConfirm: true });
   cypherInput.focus();
 }
-function renderLog(filter) { logBody.innerHTML = ""; logRows.filter(r => !filter || (r.tool+r.repo+r.cypher).toLowerCase().includes(filter)).forEach(r => { const tr = document.createElement("tr"); tr.title = "Load this query into the Cypher box"; tr.innerHTML = `<td class="mono">${r.t}</td><td>${r.tool}</td><td class="mono">${escapeHtmlVal(r.repo)}</td><td class="mono">${escapeHtmlVal(r.cypher)}</td>`; tr.addEventListener("click", () => loadQueryFromHistory(r.cypher)); logBody.appendChild(tr); }); }
+function renderLog(filter) { logBody.innerHTML = ""; logRows.filter(r => !filter || (r.tool+r.repo+r.cypher).toLowerCase().includes(filter)).forEach(r => { const tr = document.createElement("tr"); tr.title = "Load this query into the Cypher box"; tr.innerHTML = `<td class="mono">${escapeHtmlVal(r.t)}</td><td>${escapeHtmlVal(r.tool)}</td><td class="mono">${escapeHtmlVal(r.repo)}</td><td class="mono">${escapeHtmlVal(r.cypher)}</td>`; tr.addEventListener("click", () => loadQueryFromHistory(r.cypher)); logBody.appendChild(tr); }); }
 document.getElementById("logSearch").addEventListener("input", e => renderLog(e.target.value.trim().toLowerCase()));
 /* The card reads its two independent sources together: the chart/console log
    below, and the MCP tool-call telemetry the endpoint serves from the local
@@ -5255,7 +5410,7 @@ function renderGitList() {
   COMMITS.forEach((c,i) => {
     const row = document.createElement("div"); row.className = "commit-row";
     const dateStr = new Date(c.date).toLocaleDateString(undefined, {year:"numeric",month:"short",day:"numeric"});
-    row.innerHTML = `<div class="commit-rail"><div class="commit-dot${c.merge?" merge":""}"></div>${i<COMMITS.length-1?'<div class="commit-line"></div>':''}</div><div class="commit-body"><div class="commit-top"><span class="commit-hash">${c.short_hash}</span>${c.merge?'<span class="commit-branch merge-badge">merge</span>':''}</div><div class="commit-msg">${escapeHtmlVal(c.title)}</div><div class="commit-meta">${escapeHtmlVal(c.author||"—")} · ${dateStr}</div><div class="commit-detail">commit ${c.hash}\nAuthor: ${c.author||"—"}\nDate: ${dateStr}\n\n${c.title}${c.body?'\n\n'+c.body:''}</div></div>`;
+    row.innerHTML = `<div class="commit-rail"><div class="commit-dot${c.merge?" merge":""}"></div>${i<COMMITS.length-1?'<div class="commit-line"></div>':''}</div><div class="commit-body"><div class="commit-top"><span class="commit-hash">${escapeHtmlVal(c.short_hash)}</span>${c.merge?'<span class="commit-branch merge-badge">merge</span>':''}</div><div class="commit-msg">${escapeHtmlVal(c.title)}</div><div class="commit-meta">${escapeHtmlVal(c.author||"—")} · ${dateStr}</div><div class="commit-detail">commit ${escapeHtmlVal(c.hash)}\nAuthor: ${escapeHtmlVal(c.author||"—")}\nDate: ${dateStr}\n\n${escapeHtmlVal(c.title)}${c.body?'\n\n'+escapeHtmlVal(c.body):''}</div></div>`;
     row.addEventListener("click", () => row.classList.toggle("open"));
     wrap.appendChild(row);
   });
@@ -5294,11 +5449,11 @@ function renderGitTree() {
       return;
     }
     const title = c.title.length > 30 ? c.title.slice(0,30)+"…" : c.title;
-    if (c.merge) parts += `<rect x="${p.x-3.5}" y="${p.y-3.5}" width="7" height="7" fill="var(--success)" transform="rotate(45 ${p.x} ${p.y})" class="tree-hit tree-node" data-hash="${c.hash}"/>`;
-    else parts += `<circle cx="${p.x}" cy="${p.y}" r="3.5" fill="${laneColorOf[c.hash]}" class="tree-hit tree-node" data-hash="${c.hash}"/>`;
-    parts += `<text x="${labelX}" y="${p.y-2}" font-size="7.5" fill="var(--meta)" font-family="var(--font-mono)">${c.short_hash}</text>`;
+    if (c.merge) parts += `<rect x="${p.x-3.5}" y="${p.y-3.5}" width="7" height="7" fill="var(--success)" transform="rotate(45 ${p.x} ${p.y})" class="tree-hit tree-node" data-hash="${escapeHtmlVal(c.hash)}"/>`;
+    else parts += `<circle cx="${p.x}" cy="${p.y}" r="3.5" fill="${laneColorOf[c.hash]}" class="tree-hit tree-node" data-hash="${escapeHtmlVal(c.hash)}"/>`;
+    parts += `<text x="${labelX}" y="${p.y-2}" font-size="7.5" fill="var(--meta)" font-family="var(--font-mono)">${escapeHtmlVal(c.short_hash)}</text>`;
     parts += `<text x="${labelX}" y="${p.y+9}" font-size="8.5" fill="var(--fg-2)">${escapeHtmlVal(title)}</text>`;
-    parts += `<circle cx="${p.x}" cy="${p.y}" r="10" fill="transparent" class="tree-hit" data-hash="${c.hash}"/>`;
+    parts += `<circle cx="${p.x}" cy="${p.y}" r="10" fill="transparent" class="tree-hit" data-hash="${escapeHtmlVal(c.hash)}"/>`;
   });
   svg.innerHTML = parts;
   svg.setAttribute("width", treeBaseW);
@@ -5319,7 +5474,7 @@ function showGitCard(hash, x, y) {
   } else {
     const full = c.body ? `${c.title}\n\n${c.body}` : c.title;
     const truncated = full.length > bodyLimit;
-    html = `<div class="h-hash">${c.short_hash}</div><div class="h-title">${escapeHtmlVal(c.title)}</div>` + (c.body ? `<div class="h-body" data-full="${encodeURIComponent(full)}">${escapeHtmlVal(truncated ? full.slice(0,bodyLimit)+"…" : full)}</div>` + (truncated ? `<span class="h-more">show more</span>` : "") : "");
+    html = `<div class="h-hash">${escapeHtmlVal(c.short_hash)}</div><div class="h-title">${escapeHtmlVal(c.title)}</div>` + (c.body ? `<div class="h-body" data-full="${encodeURIComponent(full)}">${escapeHtmlVal(truncated ? full.slice(0,bodyLimit)+"…" : full)}</div>` + (truncated ? `<span class="h-more">show more</span>` : "") : "");
   }
   gitHoverCard.innerHTML = html;
   const more = gitHoverCard.querySelector(".h-more");
@@ -5791,7 +5946,7 @@ async function loadTopologyCounts() {
   const repo = document.getElementById("repoSelect").value;
   const isolatedEntityId = state.isolatedEntity;
   const nodeFilters = [];
-  if (repo !== "__all__") nodeFilters.push(`n.repo_id = "${escapeCypherStr(repo)}"`);
+  nodeFilters.push(repo === "__all__" ? allReposClause("n") : `n.repo_id = "${escapeCypherStr(repo)}"`);
   if (isolatedEntityId) nodeFilters.push(`labels(n)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
   const where = nodeFilters.length ? `WHERE ${nodeFilters.join(" AND ")} ` : "";
   try {
@@ -5830,7 +5985,7 @@ async function loadTopologyCounts() {
       }
     }
     const relFilters = [];
-    if (repo !== "__all__") relFilters.push(`a.repo_id = "${escapeCypherStr(repo)}"`);
+    relFilters.push(repo === "__all__" ? allReposClause("a") : `a.repo_id = "${escapeCypherStr(repo)}"`);
     if (isolatedEntityId) relFilters.push(`labels(a)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
     const relWhere = relFilters.length ? `WHERE ${relFilters.join(" AND ")} ` : "";
     const relJson = await runCypher(`MATCH (a)-[r]->() ${relWhere}RETURN type(r) AS t, count(*) AS n`);
@@ -5872,10 +6027,10 @@ async function loadTopologyCounts() {
         state.relCeiling = relTotal;
       }
     }
-    const godJson = await runCypher(`MATCH (n) ${where}RETURN coalesce(n.name, n.repo_id, labels(n)[0]) AS name, labels(n)[0] AS label, size((n)--()) AS degree ORDER BY degree DESC LIMIT 6`);
+    const godJson = await runCypher(`MATCH (n) ${where}RETURN coalesce(n.name, n.repo_id, labels(n)[0]) AS name, labels(n)[0] AS label, COUNT { (n)--() } AS degree ORDER BY degree DESC LIMIT 6`);
     const godEl = document.getElementById("godNodes");
     if (!godJson.errors?.length && godJson.results[0].data.length) {
-      godEl.innerHTML = godJson.results[0].data.map((d,i) => `<div class="leaderboard-row"><span class="lb-rank">${i+1}</span><span class="lb-name">${escapeHtmlVal(d.row[0])}</span><span class="lb-type">${escapeHtmlVal(d.row[1]||"")}</span><span class="lb-val">${d.row[2]}</span></div>`).join("");
+      godEl.innerHTML = godJson.results[0].data.map((d,i) => `<div class="leaderboard-row"><span class="lb-rank">${i+1}</span><span class="lb-name">${escapeHtmlVal(d.row[0])}</span><span class="lb-type">${escapeHtmlVal(d.row[1]||"")}</span><span class="lb-val">${escapeHtmlVal(d.row[2])}</span></div>`).join("");
       document.getElementById("godNodesBasis").textContent = "degree";
     } else {
       godEl.innerHTML = `<div class="count-note">No nodes for this scope yet.</div>`;

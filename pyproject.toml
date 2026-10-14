@@ -15,7 +15,7 @@ dependencies = [
     "tree-sitter-kotlin>=1.1,<1.2",
     "tree-sitter-rust>=0.21,<0.22",
     "tree-sitter-go>=0.23,<0.24",
-    "watchdog>=5.0,<7",
+    "watchdog>=6.0,<7",
     "typer>=0.13",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
@@ -45,6 +45,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["devgraph*"]
+
+[tool.setuptools.package-data]
+# The dashboard's page and its vendored scripts (no CDN at runtime).
+"devgraph.dashboard" = ["static/*.html", "static/vendor/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

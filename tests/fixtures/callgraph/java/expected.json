@@ -1,0 +1,341 @@
+{
+  "language": "java",
+  "description": "Maven multi-module shop (core + app) with wildcard, static nested imports, a same-package subtype, interface dispatch and a vendored duplicate FQCN.",
+  "calls": [
+    {
+      "caller": "add",
+      "caller_file": "core/src/main/java/com/acme/core/repo/Repo.java",
+      "callee": "validate",
+      "callee_file": "core/src/main/java/com/acme/core/repo/Repo.java"
+    },
+    {
+      "caller": "validate",
+      "caller_file": "core/src/main/java/com/acme/core/repo/Repo.java",
+      "callee": "getName",
+      "callee_file": "core/src/main/java/com/acme/core/model/Item.java"
+    },
+    {
+      "caller": "add",
+      "caller_file": "core/src/main/java/com/acme/core/repo/AuditedRepo.java",
+      "callee": "add",
+      "callee_file": "core/src/main/java/com/acme/core/repo/Repo.java",
+      "not_files": [
+        "core/src/main/java/com/acme/core/repo/AuditedRepo.java"
+      ],
+      "note": "super-call"
+    },
+    {
+      "caller": "add",
+      "caller_file": "core/src/main/java/com/acme/core/repo/AuditedRepo.java",
+      "callee": "info",
+      "callee_file": "core/src/main/java/com/acme/core/util/Log.java",
+      "note": "wildcard"
+    },
+    {
+      "caller": "add",
+      "caller_file": "core/src/main/java/com/acme/core/repo/AuditedRepo.java",
+      "callee": "getName",
+      "callee_file": "core/src/main/java/com/acme/core/model/Item.java"
+    },
+    {
+      "caller": "addAll",
+      "caller_file": "core/src/main/java/com/acme/core/repo/AuditedRepo.java",
+      "callee": "add",
+      "callee_file": "core/src/main/java/com/acme/core/repo/AuditedRepo.java",
+      "note": "virtual-this"
+    },
+    {
+      "caller": "check",
+      "caller_file": "core/src/main/java/com/acme/core/repo/AuditedRepo.java",
+      "callee": "validate",
+      "callee_file": "core/src/main/java/com/acme/core/repo/Repo.java",
+      "note": "same-package-subtype"
+    },
+    {
+      "caller": "place",
+      "caller_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "callee": "slug",
+      "callee_file": "core/src/main/java/com/acme/core/util/Strings.java",
+      "not_files": [
+        "third_party/acme-util/src/main/java/com/acme/core/util/Strings.java"
+      ],
+      "note": "vendored-duplicate"
+    },
+    {
+      "caller": "place",
+      "caller_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "callee": "add",
+      "callee_file": "core/src/main/java/com/acme/core/repo/AuditedRepo.java",
+      "not_files": [
+        "core/src/main/java/com/acme/core/repo/Repo.java"
+      ],
+      "note": "typed-field"
+    },
+    {
+      "caller": "place",
+      "caller_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "callee": "send",
+      "callee_file": "core/src/main/java/com/acme/core/notify/Notifier.java",
+      "ambiguous": true,
+      "note": "interface-dispatch"
+    },
+    {
+      "caller": "place",
+      "caller_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "callee": "send",
+      "callee_file": "core/src/main/java/com/acme/core/notify/EmailNotifier.java",
+      "ambiguous": true,
+      "note": "interface-dispatch"
+    },
+    {
+      "caller": "place",
+      "caller_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "callee": "send",
+      "callee_file": "core/src/main/java/com/acme/core/notify/SmsNotifier.java",
+      "ambiguous": true,
+      "note": "interface-dispatch"
+    },
+    {
+      "caller": "place",
+      "caller_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "callee": "getName",
+      "callee_file": "core/src/main/java/com/acme/core/model/Item.java"
+    },
+    {
+      "caller": "pages",
+      "caller_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "callee": "size",
+      "callee_file": "core/src/main/java/com/acme/core/repo/Repo.java",
+      "note": "inherited-method"
+    },
+    {
+      "caller": "pages",
+      "caller_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "callee": "pageSize",
+      "callee_file": "core/src/main/java/com/acme/core/config/Settings.java",
+      "note": "nested-static-import"
+    },
+    {
+      "caller": "names",
+      "caller_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "callee": "getName",
+      "callee_file": "core/src/main/java/com/acme/core/model/Item.java"
+    },
+    {
+      "caller": "main",
+      "caller_file": "app/src/main/java/com/acme/app/App.java",
+      "callee": "place",
+      "callee_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "note": "same-package-no-import"
+    },
+    {
+      "caller": "main",
+      "caller_file": "app/src/main/java/com/acme/app/App.java",
+      "callee": "pages",
+      "callee_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "note": "same-package-no-import"
+    },
+    {
+      "caller": "main",
+      "caller_file": "app/src/main/java/com/acme/app/App.java",
+      "callee": "pageSize",
+      "callee_file": "core/src/main/java/com/acme/core/config/Settings.java",
+      "note": "nested-static-import"
+    },
+    {
+      "caller": "main",
+      "caller_file": "app/src/main/java/com/acme/app/App.java",
+      "callee": "print",
+      "callee_file": "app/src/main/java/com/acme/app/Report.java",
+      "note": "same-package-no-import"
+    },
+    {
+      "caller": "print",
+      "caller_file": "app/src/main/java/com/acme/app/Report.java",
+      "callee": "pages",
+      "callee_file": "app/src/main/java/com/acme/app/OrderService.java"
+    },
+    {
+      "caller": "slug",
+      "caller_file": "third_party/acme-util/src/main/java/com/acme/core/util/Strings.java",
+      "callee": "collapse",
+      "callee_file": "third_party/acme-util/src/main/java/com/acme/core/util/Strings.java",
+      "note": "vendored-duplicate"
+    },
+    {
+      "caller": "addsItem",
+      "caller_file": "core/src/test/java/com/acme/core/repo/RepoTest.java",
+      "callee": "add",
+      "callee_file": "core/src/main/java/com/acme/core/repo/Repo.java",
+      "note": "test-source-root"
+    },
+    {
+      "caller": "addsItem",
+      "caller_file": "core/src/test/java/com/acme/core/repo/RepoTest.java",
+      "callee": "size",
+      "callee_file": "core/src/main/java/com/acme/core/repo/Repo.java",
+      "note": "test-source-root"
+    }
+  ],
+  "imports": [
+    {
+      "from_file": "core/src/main/java/com/acme/core/repo/Repo.java",
+      "to_file": "core/src/main/java/com/acme/core/model/Item.java"
+    },
+    {
+      "from_file": "core/src/main/java/com/acme/core/repo/AuditedRepo.java",
+      "to_file": "core/src/main/java/com/acme/core/model/Item.java"
+    },
+    {
+      "from_file": "core/src/main/java/com/acme/core/repo/AuditedRepo.java",
+      "to_file": "core/src/main/java/com/acme/core/util/Log.java",
+      "kind": "wildcard",
+      "note": "wildcard"
+    },
+    {
+      "from_file": "core/src/main/java/com/acme/core/repo/AuditedRepo.java",
+      "to_file": "core/src/main/java/com/acme/core/util/Strings.java",
+      "kind": "wildcard",
+      "note": "wildcard"
+    },
+    {
+      "from_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "to_file": "core/src/main/java/com/acme/core/config/Settings.java",
+      "kind": "static",
+      "note": "nested-static-import"
+    },
+    {
+      "from_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "to_file": "core/src/main/java/com/acme/core/model/Item.java"
+    },
+    {
+      "from_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "to_file": "core/src/main/java/com/acme/core/notify/Notifier.java"
+    },
+    {
+      "from_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "to_file": "core/src/main/java/com/acme/core/repo/AuditedRepo.java"
+    },
+    {
+      "from_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "to_file": "core/src/main/java/com/acme/core/util/Log.java",
+      "kind": "wildcard",
+      "note": "wildcard"
+    },
+    {
+      "from_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "to_file": "core/src/main/java/com/acme/core/util/Strings.java",
+      "kind": "wildcard",
+      "note": "wildcard"
+    },
+    {
+      "from_file": "app/src/main/java/com/acme/app/App.java",
+      "to_file": "core/src/main/java/com/acme/core/config/Settings.java",
+      "note": "nested-static-import"
+    },
+    {
+      "from_file": "app/src/main/java/com/acme/app/App.java",
+      "to_file": "core/src/main/java/com/acme/core/notify/EmailNotifier.java"
+    },
+    {
+      "from_file": "core/src/test/java/com/acme/core/repo/RepoTest.java",
+      "to_file": "core/src/main/java/com/acme/core/model/Item.java"
+    }
+  ],
+  "no_edge": [
+    {
+      "caller": "add",
+      "caller_file": "core/src/main/java/com/acme/core/repo/Repo.java",
+      "callee": "add",
+      "note": "jdk-collection"
+    },
+    {
+      "caller": "size",
+      "caller_file": "core/src/main/java/com/acme/core/repo/Repo.java",
+      "callee": "size",
+      "note": "jdk-collection"
+    },
+    {
+      "caller": "validate",
+      "caller_file": "core/src/main/java/com/acme/core/repo/Repo.java",
+      "callee": "isEmpty"
+    },
+    {
+      "caller": "info",
+      "caller_file": "core/src/main/java/com/acme/core/util/Log.java",
+      "callee": "println"
+    },
+    {
+      "caller": "slug",
+      "caller_file": "core/src/main/java/com/acme/core/util/Strings.java",
+      "callee": "trim"
+    },
+    {
+      "caller": "slug",
+      "caller_file": "core/src/main/java/com/acme/core/util/Strings.java",
+      "callee": "toLowerCase"
+    },
+    {
+      "caller": "slug",
+      "caller_file": "core/src/main/java/com/acme/core/util/Strings.java",
+      "callee": "replace"
+    },
+    {
+      "caller": "send",
+      "caller_file": "core/src/main/java/com/acme/core/notify/EmailNotifier.java",
+      "callee": "println"
+    },
+    {
+      "caller": "send",
+      "caller_file": "core/src/main/java/com/acme/core/notify/SmsNotifier.java",
+      "callee": "println"
+    },
+    {
+      "caller": "names",
+      "caller_file": "app/src/main/java/com/acme/app/OrderService.java",
+      "callee": "add",
+      "note": "jdk-collection"
+    },
+    {
+      "caller": "main",
+      "caller_file": "app/src/main/java/com/acme/app/App.java",
+      "callee": "println"
+    },
+    {
+      "caller": "print",
+      "caller_file": "app/src/main/java/com/acme/app/Report.java",
+      "callee": "printf"
+    },
+    {
+      "caller": "slug",
+      "caller_file": "third_party/acme-util/src/main/java/com/acme/core/util/Strings.java",
+      "callee": "strip"
+    },
+    {
+      "caller": "collapse",
+      "caller_file": "third_party/acme-util/src/main/java/com/acme/core/util/Strings.java",
+      "callee": "replaceAll"
+    },
+    {
+      "caller": "addsItem",
+      "caller_file": "core/src/test/java/com/acme/core/repo/RepoTest.java",
+      "callee": "assertEquals"
+    }
+  ],
+  "notes": {
+    "jdk-collection": "`items` is a java.util.List<Item>, so `items.add(item)` / `items.size()` / `out.add(...)` are JDK methods. Repo.add calling items.add must not become a Repo.add self-loop, nor link to AuditedRepo.add.",
+    "super-call": "`super.add(item)` in AuditedRepo.add is Repo.add, never AuditedRepo.add itself.",
+    "virtual-this": "Unqualified `add(i)` in AuditedRepo.addAll is this.add, which AuditedRepo overrides; no subclass of AuditedRepo exists, so the runtime target is AuditedRepo.add.",
+    "same-package-subtype": "AuditedRepo extends Repo from the same package (no import). `validate(item)` is inherited, declared only in Repo.java.",
+    "inherited-method": "`repo` is an AuditedRepo; size() is not overridden, so the target is Repo.size in Repo.java.",
+    "typed-field": "Field `AuditedRepo repo`, so `repo.add` is AuditedRepo.add (the override), not Repo.add.",
+    "wildcard": "`import com.acme.core.util.*;` makes every type of the package visible. IMPORTS lists every file of that package in the built modules (Log.java, Strings.java under core/), never the vendored third_party copy.",
+    "vendored-duplicate": "third_party/acme-util holds another com.acme.core.util.Strings (same FQCN). The parent pom does not list it as a module and no module depends on it, so it is never on the compile classpath: Strings.slug from app binds to core/.../util/Strings.java. The vendored file's own internal call (slug -> collapse) is still a real same-class call.",
+    "interface-dispatch": "`notifier` is declared as the interface Notifier. The compiler binds the call to Notifier.send (Notifier.java, abstract); at run time it dispatches to EmailNotifier or SmsNotifier depending on the injected object (App injects EmailNotifier, but OrderService alone cannot know). All three files are plausible targets.",
+    "nested-static-import": "`import static com.acme.core.config.Settings.Defaults.pageSize;` and `import com.acme.core.config.Settings.Defaults;` both name the nested class Defaults inside Settings, which lives in Settings.java (the first capitalised segment picks the file).",
+    "same-package-no-import": "App, OrderService and Report share package com.acme.app; no import needed. Report is package-private.",
+    "test-source-root": "RepoTest is in core/src/test/java but declares package com.acme.core.repo, the same package as Repo (different source root, same package).",
+    "multi-module": "Maven reactor: core and app are modules; app depends on core. Imports from app resolve into core/src/main/java by FQCN.",
+    "scope": "Constructor invocations (`new Item(...)`) are not listed as calls. Imports of JDK / JUnit types are external and not listed."
+  }
+}

@@ -31,11 +31,12 @@ from devgraph.config.edits import project_config_notes as _project_config_notes
 from devgraph.config.edits import removed_types as _removed_types  # noqa: F401  (kept importable from here)
 from devgraph.config.schema_findings import project_schema_findings as _project_schema_findings
 from devgraph.dashboard import queries as dashboard_queries
-from devgraph.dashboard.url import dashboard_url
+from devgraph.dashboard.url import dashboard_url, probe_dashboard
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
+from devgraph.indexer.walk import TOO_LARGE, RepoRootUnavailable, check_repo_root, repo_root_problem
 from devgraph.paths import is_within, read_bounded
 from devgraph.registry.store import RepoRegistry
 
@@ -50,10 +51,38 @@ app.add_typer(tray_app, name="tray")
 console = Console(emoji=False)
 
 
+@app.callback()
+def _cli() -> None:
+    # A command reports a Neo4j failure as one line; each retry before it is detail.
+    from devgraph.graph import engine as engine_module
+
+    engine_module.RETRY_LOG_LEVEL = logging.INFO
+
+
 def _get_registry() -> RepoRegistry:
     """Get or create the registry from configured path."""
     settings = get_settings()
     return RepoRegistry(settings.registry_db_path)
+
+
+def _neo4j_problem(exc: Exception, settings) -> str:
+    """One line for a failed Neo4j call, naming the setting to check and the file it lives in."""
+    from neo4j.exceptions import AuthError, ServiceUnavailable
+
+    from devgraph.config.settings import devgraph_home
+
+    env_file = devgraph_home() / ".env"
+    if isinstance(exc, AuthError):
+        return (
+            f"Neo4j at {settings.neo4j_uri} refused the username or password; check "
+            f"DEVGRAPH_NEO4J_USER and DEVGRAPH_NEO4J_PASSWORD in {env_file} (or the environment)"
+        )
+    if isinstance(exc, ServiceUnavailable):
+        return (
+            f"nothing answers at {settings.neo4j_uri}; start Neo4j, or set DEVGRAPH_NEO4J_URI in {env_file} "
+            "(or the environment)"
+        )
+    return " ".join(str(exc).split())
 
 
 @app.command()
@@ -91,9 +120,14 @@ def add(
                     provision_repository_schema(engine, record.path)
                     engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
                     started = datetime.now(timezone.utc)
-                    count = full_scan(engine, record.repo_id, record.path, docs_path=record.docs_path, mentions_enabled=record.mentions_enabled)
+                    skipped: dict[str, str] = {}
+                    count = full_scan(
+                        engine, record.repo_id, record.path, docs_path=record.docs_path,
+                        mentions_enabled=record.mentions_enabled, skipped=skipped,
+                    )
                     registry.mark_indexed(record.repo_id, at=started)
                     console.print(f"[green][OK][/green] Indexed {count} file(s)")
+                    _print_skipped(skipped)
 
                     if full:
                         try:
@@ -111,11 +145,15 @@ def add(
                 # indexing failure (e.g. Neo4j unreachable) shouldn't undo that.
                 # `devgraph rescan <repo_id>` retries the scan once Neo4j is up.
                 console.print(
-                    f"[yellow]Registered but initial scan failed:[/yellow] {escape(str(e))}\n"
-                    f"  Run 'devgraph rescan {escape(record.repo_id)}' once Neo4j is reachable."
+                    f"[yellow]Registered but initial scan failed:[/yellow] {escape(_neo4j_problem(e, settings))}\n"
+                    f"  Fix that, then run 'devgraph rescan {escape(record.repo_id)}' to index it.",
+                    soft_wrap=True,
                 )
+                raise typer.Exit(code=1)
         finally:
             registry.close()
+    except typer.Exit:
+        raise
     except ValueError as e:
         console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
@@ -124,9 +162,33 @@ def add(
         raise typer.Exit(code=1)
 
 
+#: How many skipped files `_print_skipped` names before summarising the rest.
+_SKIPPED_SHOWN = 20
+
+
+def _print_skipped(skipped: dict[str, str]) -> None:
+    """The files a scan left out (too large, binary, minified or generated),
+    each with why. Files a .gitignore ignores are not walked, so not listed."""
+    if not skipped:
+        return
+    console.print(f"[yellow]Skipped {len(skipped)} file(s)[/yellow] (not indexed):")
+    for rel in sorted(skipped)[:_SKIPPED_SHOWN]:
+        console.print(f"  {escape(rel)} ({escape(skipped[rel])})", soft_wrap=True)
+    if len(skipped) > _SKIPPED_SHOWN:
+        console.print(f"  … and {escape(str(len(skipped) - _SKIPPED_SHOWN))} more")
+    if TOO_LARGE in skipped.values():
+        console.print("  Set DEVGRAPH_MAX_FILE_BYTES to index larger files.")
+
+
 @app.command()
-def remove(repo_id: str) -> None:
-    """Unregister a repository.
+def remove(
+    repo_id: str,
+    keep_graph: bool = typer.Option(
+        False, "--keep-graph",
+        help="Only unregister: leave the repository's graph data in Neo4j (for when Neo4j is down).",
+    ),
+) -> None:
+    """Unregister a repository and delete its graph data.
 
     Args:
         repo_id: The repository ID (shown by 'devgraph list').
@@ -137,19 +199,41 @@ def remove(repo_id: str) -> None:
             if registry.get(repo_id) is None:
                 raise ValueError(f"no such repo_id: {repo_id}")
 
+            if keep_graph:
+                registry.remove_repo(repo_id)
+                console.print(
+                    f"[green][OK][/green] Removed: {escape(repo_id)} (registry entry; graph data kept). "
+                    "Run 'devgraph prune' once Neo4j is up to delete its graph data.",
+                    soft_wrap=True,
+                )
+                return
+
             settings = get_settings()
-            engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+            engine = None
             try:
+                engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
                 recorded = engine.read_applied_schema(repo_id) or {}
                 engine.delete_repository(repo_id)
                 _release_labels(engine, recorded.get("labels") or [])
+            except Exception as e:
+                console.print(
+                    f"[red][X] Could not delete the graph data of {escape(repo_id)}:[/red] "
+                    f"{escape(_neo4j_problem(e, settings))}\n"
+                    f"  {escape(repo_id)} is still registered. To unregister it and leave its graph data, "
+                    f"run 'devgraph remove {escape(repo_id)} --keep-graph'.",
+                    soft_wrap=True,
+                )
+                raise typer.Exit(code=1)
             finally:
-                engine.close()
+                if engine is not None:
+                    engine.close()
 
             registry.remove_repo(repo_id)
             console.print(f"[green][OK][/green] Removed: {escape(repo_id)} (registry entry and graph data)")
         finally:
             registry.close()
+    except typer.Exit:
+        raise
     except ValueError as e:
         console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
@@ -238,6 +322,12 @@ def rescan(
         help="Apply a changed devgraph.schema.yaml right away instead of waiting for the agent's "
         "5-minute quiet period. A CLI rescan always applies immediately; this states it explicitly.",
     ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Rescan even though the repository folder has no indexable files while the graph has files "
+        "for it, pruning them all. Without it such a rescan is refused, since that is what an unmounted "
+        "drive looks like.",
+    ),
 ) -> None:
     """Run a full re-index of a registered repository.
 
@@ -255,6 +345,10 @@ def rescan(
     A changed devgraph.schema.yaml is applied by this command immediately;
     --now says so explicitly (the agent applies it only after a quiet period).
 
+    A repository folder that is missing or unreadable is refused with a
+    non-zero exit and nothing changed; so is one with no indexable files
+    while the graph has files for it, unless --force.
+
     Args:
         repo_id: The repository ID to rescan.
     """
@@ -265,6 +359,7 @@ def rescan(
             if not repo:
                 console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
                 raise typer.Exit(code=1)
+            check_repo_root(repo.path)
 
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
@@ -272,9 +367,14 @@ def rescan(
                 provision_repository_schema(engine, repo.path)
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
                 started = datetime.now(timezone.utc)
-                count = full_scan(engine, repo_id, repo.path, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled)
+                skipped: dict[str, str] = {}
+                count = full_scan(
+                    engine, repo_id, repo.path, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
+                    force=force, skipped=skipped,
+                )
                 registry.mark_indexed(repo_id, at=started)
                 console.print(f"[green][OK][/green] Rescanned {escape(repo_id)}: {count} file(s) indexed")
+                _print_skipped(skipped)
 
                 # Always reconcile git history on a rescan — not just with
                 # --full. sync_git_history is a cheap no-op when HEAD hasn't
@@ -302,6 +402,9 @@ def rescan(
             registry.close()
     except typer.Exit:
         raise
+    except RepoRootUnavailable as e:
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}", soft_wrap=True)
+        raise typer.Exit(code=1)
     except Exception as e:
         console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
@@ -392,15 +495,40 @@ def tray_start() -> None:
     the same way, so most workflows never need to run this by hand — it's
     here for manual control (checking in on it, or running it without an
     MCP client attached).
+
+    With no display or no system tray (a server, an SSH session), the same
+    process runs the headless agent instead: no icon, same watcher, indexer
+    and dashboard. Reports OK only once the agent has written its first
+    heartbeat; exits non-zero if it exits or stays silent.
     """
+    problem = lifecycle.tray_ui_problem()
+    since = datetime.now(timezone.utc)
     started_pid = lifecycle.start_tray_if_not_running()
     if started_pid is None:
         existing_pid = lifecycle.read_tray_pid()
         console.print(f"[yellow]Tray app already running[/yellow] (pid {existing_pid})")
         return
 
-    console.print(f"[green][OK][/green] Tray app started (pid {started_pid})")
-    console.print("  Run 'devgraph status' to confirm the heartbeat once it's up.")
+    what = "Tray app"
+    if problem is not None:
+        what = "Headless agent"
+        console.print(
+            f"[yellow]No system tray available[/yellow] ({escape(problem)}); running the headless agent "
+            "instead: no icon, same watcher, indexer and dashboard. Stop it with 'devgraph tray stop'."
+        )
+    console.print(f"Waiting for the agent's first heartbeat (pid {started_pid})...")
+    outcome = lifecycle.wait_for_tray(started_pid, since)
+    if outcome == "running":
+        console.print(f"[green][OK][/green] {what} started (pid {started_pid})")
+        return
+    if outcome == "exited":
+        console.print(f"[red][X] {what} exited during startup[/red] (pid {started_pid}). See 'devgraph logs'.")
+    else:
+        console.print(
+            f"[red][X] {what} sent no heartbeat within {lifecycle.TRAY_START_TIMEOUT_S:.0f}s[/red] (pid {started_pid}). "
+            "See 'devgraph logs'; 'devgraph tray status' shows whether it is still up."
+        )
+    raise typer.Exit(code=1)
 
 
 @tray_app.command("stop")
@@ -431,12 +559,16 @@ def tray_stop() -> None:
 
 @tray_app.command("status")
 def tray_status() -> None:
-    """Report whether the background tray process (per the PID file) is alive."""
+    """Report whether the background tray process (per the PID file) is alive.
+
+    Exits non-zero when it is not running.
+    """
     pid = lifecycle.read_tray_pid()
     if pid is not None and lifecycle.pid_is_running(pid):
         console.print(f"[green][OK] running[/green] (pid {pid})")
     else:
         console.print("[yellow]not running[/yellow] (start with 'devgraph tray start')")
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -636,9 +768,46 @@ def _tray_liveness_text(settings) -> str:
     return "stale (process may have crashed)"
 
 
+def _watcher_issues(settings) -> dict[str, str]:
+    """The repositories the running agent's watcher isn't watching, and why
+    (a missing folder, an inotify limit), from the repo_issues.json it writes
+    with its heartbeat; only those still registered, active and watched (the
+    file can predate a `remove` or `watch disable`)."""
+    try:
+        issues = json.loads((settings.registry_db_path.parent / "repo_issues.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(issues, dict):
+        return {}
+    try:
+        registry = RepoRegistry(settings.registry_db_path)
+        try:
+            watched = {r.repo_id for r in registry.list_repos(active_only=True) if r.watch_enabled}
+        finally:
+            registry.close()
+    except Exception:
+        watched = set(map(str, issues))
+    return {str(k): str(v) for k, v in issues.items() if str(k) in watched}
+
+
+def _print_unwatched_repos(settings, mark: str) -> int:
+    """Under a running watcher: the repositories it isn't watching, each
+    flagged with `mark`. Returns how many."""
+    issues = _watcher_issues(settings)
+    if issues:
+        noun = "repository" if len(issues) == 1 else "repositories"
+        console.print(f"  [yellow][!] running, but not watching {len(issues)} {noun}[/yellow]")
+        for repo_id, problem in sorted(issues.items()):
+            console.print(f"    [yellow]{escape(mark)} {escape(repo_id)}:[/yellow] {escape(problem)}", soft_wrap=True)
+    return len(issues)
+
+
 @app.command()
 def status() -> None:
-    """Check DevGraph status: Neo4j connectivity and repository counts."""
+    """Check DevGraph status: Neo4j connectivity and repository counts.
+
+    Exits non-zero when Neo4j is unreachable or the registry cannot be read.
+    """
     settings = get_settings()
     console.print()
 
@@ -648,13 +817,19 @@ def status() -> None:
     try:
         engine.verify_connectivity()
         console.print(f"  [green][OK] Reachable[/green] at {escape(str(settings.neo4j_uri))}")
+        reachable = True
     except Exception as e:
-        console.print(f"  [red][X] Not reachable:[/red] {escape(str(e))}")
+        console.print(f"  [red][X] Not reachable:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
+        reachable = False
+    try:
+        if reachable:
+            _print_graph_index(engine)
     finally:
         engine.close()
 
     # Repository counts
     console.print("[bold]Registered Repositories[/bold]")
+    registry_ok = True
     try:
         registry = _get_registry()
         try:
@@ -665,32 +840,84 @@ def status() -> None:
         finally:
             registry.close()
     except Exception as e:
-        console.print(f"  [red]Error:[/red] {escape(str(e))}")
+        console.print(f"  [red]Error:[/red] {escape(str(e))}", soft_wrap=True)
+        registry_ok = False
 
     # Live watcher (tray app) liveness
     console.print("[bold]Live Watcher[/bold]")
     liveness = _tray_liveness_text(settings)
     if liveness == "running":
-        console.print("  [green][OK] running[/green]")
+        if not _print_unwatched_repos(settings, "[!]"):
+            console.print("  [green][OK] running[/green]")
     elif liveness == "not running":
         console.print("  [yellow]not running[/yellow] (no heartbeat file — start with 'devgraph tray start')")
     else:
         console.print(f"  [red]{liveness}[/red]")
 
-    # Repo issues (missing paths, etc.)
-    issues_path = settings.registry_db_path.parent / "repo_issues.json"
-    if issues_path.exists():
-        try:
-            import json
-            issues = json.loads(issues_path.read_text(encoding="utf-8"))
-            if issues:
-                console.print("[bold]⚠️  Repository Issues[/bold]")
-                for repo_id, error_msg in issues.items():
-                    console.print(f"  [yellow]{escape(str(repo_id))}:[/yellow] {escape(str(error_msg))}")
-        except Exception:
-            pass
+    _print_dashboard_status(settings)
 
     console.print()
+    # Non-zero when DevGraph cannot work: Neo4j or the registry is unusable.
+    if not (reachable and registry_ok):
+        raise typer.Exit(code=1)
+
+
+def _dashboard_port_hint(settings) -> str:
+    from devgraph.config.settings import devgraph_home
+
+    return f"set DEVGRAPH_DASHBOARD_PORT in {devgraph_home() / '.env'} and restart the agent"
+
+
+_OUTDATED_AGENT_HINT = "restart it to update it ('devgraph tray stop', then 'devgraph tray start')"
+
+
+def _print_dashboard_status(settings) -> None:
+    """The `status` "Dashboard" section: whether DevGraph's dashboard answers on its port."""
+    console.print("[bold]Dashboard[/bold]")
+    if not settings.dashboard_enabled:
+        console.print("  disabled (DEVGRAPH_DASHBOARD_ENABLED)")
+        return
+    url = dashboard_url(settings)
+    found = probe_dashboard(url)
+    if found == "devgraph":
+        console.print(f"  [green][OK] serving[/green] at {escape(url)}")
+    elif found == "outdated":
+        console.print(f"  [yellow]an older DevGraph agent is serving[/yellow] at {escape(url)}; {escape(_OUTDATED_AGENT_HINT)}")
+    elif found == "other":
+        console.print(
+            f"  [red][X] port {escape(str(settings.dashboard_port))} is held by another program[/red]; "
+            f"{escape(_dashboard_port_hint(settings))}"
+        )
+    else:
+        console.print(f"  [yellow]not serving[/yellow] at {escape(url)} (it runs inside the agent: 'devgraph tray start')")
+
+
+def _print_graph_index(engine: GraphEngine) -> None:
+    """The `status` "Graph Index" section: active, indexed repositories whose
+    index predates the current format and so await an automatic rescan."""
+    from devgraph.indexer.dispatch import index_outdated
+
+    console.print("[bold]Graph Index[/bold]")
+    try:
+        registry = _get_registry()
+        try:
+            repos = [r for r in registry.list_repos() if r.active]
+        finally:
+            registry.close()
+        # A never-indexed repo's first scan (add/rescan) stamps the format.
+        pending = [r for r in repos if r.last_indexed and index_outdated(engine, r.repo_id)]
+    except Exception as e:
+        console.print(f"  [red]Error:[/red] {escape(str(e))}")
+        return
+    for repo in pending:
+        console.print(f"  [yellow]{escape(repo.repo_id)}: rescan pending[/yellow] ", end="")
+        # The agent's automatic upgrade skips repositories it does not watch.
+        if repo.watch_enabled:
+            console.print("(the agent rescans it automatically, or run 'devgraph rescan')")
+        else:
+            console.print("(not watched: run 'devgraph rescan')")
+    if not pending:
+        console.print("  up to date")
 
 
 def _registered_repo_id(root: Path) -> str:
@@ -919,9 +1146,10 @@ def doctor() -> None:
 
     Checks Python version, the installed `mcp` package, MCP server
     importability, Neo4j reachability + schema, Podman container state, the
-    repo registry, each repository's optional `devgraph.schema.yaml`, and tray
-    liveness — continuing past non-fatal failures so one run surfaces
-    everything at once. Intended for bootstrap/troubleshooting moments;
+    repo registry, each registered repository's folder (present and
+    readable), each repository's optional `devgraph.schema.yaml`, graph data
+    of unregistered repositories, and tray liveness — continuing past
+    non-fatal failures so one run surfaces everything at once. Intended for bootstrap/troubleshooting moments;
     `status` stays the fast/lightweight command for quick glances.
     """
     settings = get_settings()
@@ -988,10 +1216,13 @@ def doctor() -> None:
     finally:
         engine.close()
 
-    # 6. Podman container state
+    # 6. Podman container state. Only a problem when Neo4j isn't answering:
+    # with it reachable, Neo4j runs some other way (Docker, a native install).
     console.print("[bold]Podman[/bold]")
     podman_path = resolve_podman()
-    if podman_path is None:
+    if podman_path is None and neo4j_reachable:
+        console.print("  podman not found (not needed: Neo4j is reachable)")
+    elif podman_path is None:
         console.print("  [red][X] podman not found[/red] on PATH or %LOCALAPPDATA%\\Programs\\Podman")
         any_failed = True
     else:
@@ -1006,16 +1237,21 @@ def doctor() -> None:
             else:
                 console.print(f"  [green][OK][/green] {escape(output)}")
         except Exception as e:
-            console.print(f"  [red][X] podman ps failed:[/red] {escape(str(e))}")
-            any_failed = True
+            if neo4j_reachable:
+                console.print(f"  podman ps failed (not needed: Neo4j is reachable): {escape(str(e))}")
+            else:
+                console.print(f"  [red][X] podman ps failed:[/red] {escape(str(e))}")
+                any_failed = True
 
     # 7. Registry reachability
     console.print("[bold]Registry[/bold]")
     registered_repos: list[Any] = []
+    registry_read = False
     try:
         registry = _get_registry()
         try:
             registered_repos = registry.list_repos()
+            registry_read = True
             console.print(f"  [green][OK][/green] {len(registered_repos)} repo(s) registered at {escape(str(settings.registry_db_path))}")
         finally:
             registry.close()
@@ -1023,13 +1259,36 @@ def doctor() -> None:
         console.print(f"  [red][X] Registry error:[/red] {escape(str(e))}")
         any_failed = True
 
+    # 7a. Every registered repository's folder must exist and be readable: a
+    # missing one (an unmounted drive, a moved folder) is refused by every scan.
+    console.print("[bold]Repository folders[/bold]")
+    if not registered_repos:
+        console.print("  [green][OK][/green] no registered repositories to check")
+    missing_ids: set[str] = set()
+    for repo in sorted(registered_repos, key=lambda r: r.repo_id):
+        problem = repo_root_problem(repo.path)
+        subject = escape(str(repo.repo_id))
+        if problem is None:
+            console.print(f"  [green][OK][/green] {subject}: {escape(str(repo.path))}", soft_wrap=True)
+            continue
+        missing_ids.add(repo.repo_id)
+        console.print(
+            f"  [red][X] {subject}:[/red] path missing: repository folder {escape(problem)}: {escape(str(repo.path))}",
+            soft_wrap=True,
+        )
+        any_failed = True
+    # The file-based checks below would misreport a missing folder as having no
+    # schema or tools file, so they look only at the folders that are there.
+    present_repos = [r for r in registered_repos if r.repo_id not in missing_ids]
+    nothing_to_check = "no reachable repositories to check" if registered_repos else "no registered repositories to check"
+
     # 7b. Per-repository project schemas. Filesystem-only, and reuses the list
     # section 7 already read: an unreadable registry is reported once, there,
     # and leaves this section with nothing to check rather than crashing.
     console.print("[bold]Project schemas[/bold]")
-    schema_findings = _project_schema_findings(registered_repos)
+    schema_findings = _project_schema_findings(present_repos)
     if not schema_findings:
-        console.print("  [green][OK][/green] no registered repositories to check")
+        console.print(f"  [green][OK][/green] {escape(nothing_to_check)}")
     for finding in schema_findings:
         subject = escape(str(finding["repo_id"] or "conflict"))
         if finding["status"] == "disabled":
@@ -1042,7 +1301,7 @@ def doctor() -> None:
     # Markdown front-matter sources: links are checked against the graph only when it is up.
     docs_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password) if neo4j_reachable else None
     try:
-        docs_findings = _docs_source_findings(registered_repos, docs_engine)
+        docs_findings = _docs_source_findings(present_repos, docs_engine)
     finally:
         if docs_engine is not None:
             docs_engine.close()
@@ -1056,9 +1315,9 @@ def doctor() -> None:
             console.print(f"  [yellow][!] {subject}:[/yellow] {detail}", soft_wrap=True)
 
     console.print("[bold]Project tools[/bold]")
-    tools_findings = _project_tools_findings(registered_repos)
+    tools_findings = _project_tools_findings(present_repos)
     if not tools_findings:
-        console.print("  [green][OK][/green] no registered repositories to check")
+        console.print(f"  [green][OK][/green] {escape(nothing_to_check)}")
     for finding in tools_findings:
         subject = escape(str(finding["repo_id"]))
         if finding["failed"]:
@@ -1070,7 +1329,7 @@ def doctor() -> None:
             console.print(f"  [green][OK][/green] {subject}: {escape(finding['detail'])}")
 
     console.print("[bold]Global tools[/bold]")
-    global_findings = _global_tools_findings(registered_repos)
+    global_findings = _global_tools_findings(present_repos)
     if not global_findings:
         console.print("  [green][OK][/green] no global tools")
     for finding in global_findings:
@@ -1090,7 +1349,7 @@ def doctor() -> None:
     else:
         drift_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
         try:
-            drift = _schema_drift_findings(drift_engine, registered_repos)
+            drift = _schema_drift_findings(drift_engine, present_repos)
         finally:
             drift_engine.close()
         if not drift:
@@ -1113,7 +1372,9 @@ def doctor() -> None:
         recorded_keys: dict[tuple[str, str], tuple[str, tuple[str, ...] | None]] = {}
         try:
             stale = _stale_schema_objects(constraint_engine, registered_repos)
-            drift = constraint_drift(constraint_engine)
+            # registered repositories only: one left in the graph by a removed
+            # repository or an interrupted test run is not the user's to fix
+            drift = constraint_drift(constraint_engine, {r.repo_id for r in registered_repos})
             if any(finding["status"] == "conflict" for finding in drift):
                 for folded, entries in recorded_declarations(constraint_engine).items():
                     recorded_keys.update(((repo, folded), (label, key)) for repo, label, key in entries)
@@ -1164,11 +1425,38 @@ def doctor() -> None:
                 )
             console.print(f"  [yellow][!] {subject}:[/yellow] {detail}", soft_wrap=True)
 
+    # 7e. Graph data of repositories no longer registered: a removal while
+    # Neo4j was down (`remove --keep-graph`), or a write that landed after
+    # `devgraph remove` deleted the graph. Needs the graph and the registry.
+    console.print("[bold]Orphaned graph data[/bold]")
+    if not neo4j_reachable or not registry_read:
+        console.print("  [yellow]skipped[/yellow]: needs both Neo4j and the registry")
+    else:
+        orphan_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+        try:
+            orphaned = sorted(orphan_engine.graph_repo_ids() - {r.repo_id for r in registered_repos})
+        except Exception as e:
+            orphaned = None
+            console.print(f"  [yellow][!][/yellow] could not check: {escape(str(e))}")
+        finally:
+            orphan_engine.close()
+        if orphaned == []:
+            console.print("  [green][OK][/green] no graph data of unregistered repositories")
+        elif orphaned:
+            console.print(
+                f"  [yellow][!][/yellow] graph data of {len(orphaned)} unregistered repo_id(s): "
+                f"{escape(', '.join(orphaned))}; delete it with `devgraph prune`",
+                soft_wrap=True,
+            )
+
     # 8. Tray/watcher liveness
     console.print("[bold]Live Watcher[/bold]")
     liveness = _tray_liveness_text(settings)
     if liveness == "running":
-        console.print("  [green][OK] running[/green]")
+        if _print_unwatched_repos(settings, "[X]"):
+            any_failed = True
+        else:
+            console.print("  [green][OK] running[/green]")
     elif liveness == "not running":
         console.print("  [yellow]not running[/yellow] (expected if the tray app isn't started)")
     else:
@@ -1235,20 +1523,76 @@ def _register_vscode(python_path: Path, repo_root: Path) -> bool:
     return True
 
 
+#: Claude Code scope DevGraph registers in: one registration serves every
+#: project. A bare `claude mcp add` registers in local scope, which is tied to
+#: the directory it ran in (the DevGraph checkout) and so serves no other repository.
+CLAUDE_MCP_SCOPE = "user"
+
+
+def _claude_mcp_add_line(python_path: Path) -> str:
+    return f'claude mcp add -s {CLAUDE_MCP_SCOPE} devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
+
+
+def _claude_mcp_registration(claude_path: str, repo_root: Path) -> tuple[str | None, str]:
+    """Where Claude Code has 'devgraph' registered, and `claude mcp get`'s output.
+
+    The scope is "user", "local", "project", "unknown" (registered, but the
+    output names no scope this recognises, or `claude mcp get` did not answer
+    within 60 seconds) or None (not registered). Run from
+    the checkout so a local registration made there by an older `mcp add` is
+    seen, the same answer for `mcp add` and `mcp doctor` wherever they start.
+    """
+    try:
+        # `mcp get` health-checks the server, which can hang
+        result = subprocess.run(
+            [claude_path, "mcp", "get", "devgraph"], cwd=str(repo_root), capture_output=True, text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return "unknown", "'claude mcp get devgraph' did not answer within 60s"
+    if result.returncode != 0:
+        return None, ""
+    output = result.stdout if isinstance(result.stdout, str) else ""
+    for line in output.splitlines():
+        if line.strip().lower().startswith("scope:"):
+            described = line.split(":", 1)[1].strip().lower()
+            for scope in ("user", "local", "project"):
+                if described.startswith(scope):
+                    return scope, output
+    return "unknown", output
+
+
+def _wrong_scope_help(scope: str, repo_root: Path) -> str:
+    """How to move a non-user 'devgraph' registration to user scope."""
+    return (
+        f"'devgraph' is registered with Claude Code in {scope} scope, which serves only "
+        f"{'this checkout' if scope == 'local' else 'projects with that .mcp.json'}, not every repository. "
+        f"To move it to user scope, run 'claude mcp remove devgraph -s {scope}' in {repo_root}, "
+        "then 'devgraph mcp add'."
+    )
+
+
 def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path) -> bool:
-    """Register 'devgraph' with Claude Code via `claude mcp add`, skipping if already registered."""
-    already_registered = subprocess.run(
-        [claude_path, "mcp", "get", "devgraph"],
-        cwd=str(repo_root),
-        capture_output=True,
-    ).returncode == 0
-    if already_registered:
+    """Register 'devgraph' with Claude Code in user scope via `claude mcp add`.
+
+    Skips an existing user-scope registration. A local- or project-scope one
+    is reported with how to move it, and nothing is added: Claude Code
+    prefers it over a user-scope entry in that folder.
+    """
+    scope, output = _claude_mcp_registration(claude_path, repo_root)
+    if scope == "user":
         console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
         return True
-    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
-    console.print(f"\n[bold]Running:[/bold] {escape(mcp_add_line)}")
+    if scope == "unknown":
+        # registered in a scope this can't read, or `mcp get` timed out: leave it alone
+        console.print(f"[yellow][!][/yellow] Claude Code: not adding 'devgraph'; its registration is unclear: {escape(output.strip())}", soft_wrap=True)
+        return True
+    if scope is not None:
+        console.print(f"[yellow][!][/yellow] {escape(_wrong_scope_help(scope, repo_root))}", soft_wrap=True)
+        return False
+    console.print(f"\n[bold]Running:[/bold] {escape(_claude_mcp_add_line(python_path))}")
     result = subprocess.run(
-        [claude_path, "mcp", "add", "devgraph", "--", str(python_path), *MCP_SERVER_ARGS],
+        [claude_path, "mcp", "add", "-s", CLAUDE_MCP_SCOPE, "devgraph", "--", str(python_path), *MCP_SERVER_ARGS],
         cwd=str(repo_root),
     )
     return result.returncode == 0
@@ -1260,7 +1604,7 @@ app.add_typer(mcp_app, name="mcp")
 
 @mcp_app.command(name="add")
 def mcp_add() -> None:
-    """Register DevGraph as an MCP server with Claude Code (runs 'claude mcp add')."""
+    """Register DevGraph as an MCP server for every Claude Code project (runs 'claude mcp add -s user')."""
     claude_path = shutil.which("claude")
     if claude_path is None:
         console.print("[red][X] Error:[/red] 'claude' not found on PATH")
@@ -1271,12 +1615,12 @@ def mcp_add() -> None:
 
 @mcp_app.command(name="remove")
 def mcp_remove() -> None:
-    """Unregister DevGraph's MCP server from Claude Code (runs 'claude mcp remove')."""
+    """Unregister DevGraph's user-scope MCP server from Claude Code (runs 'claude mcp remove -s user')."""
     claude_path = shutil.which("claude")
     if claude_path is None:
         console.print("[red][X] Error:[/red] 'claude' not found on PATH")
         raise typer.Exit(code=1)
-    result = subprocess.run([claude_path, "mcp", "remove", "devgraph"])
+    result = subprocess.run([claude_path, "mcp", "remove", "-s", CLAUDE_MCP_SCOPE, "devgraph"])
     if result.returncode != 0:
         raise typer.Exit(code=1)
     console.print("[green][OK][/green] Removed 'devgraph' from Claude Code")
@@ -1293,12 +1637,14 @@ def mcp_doctor() -> None:
         any_failed = True
     else:
         console.print(f"[green][OK][/green] claude CLI at {escape(claude_path)}")
-        result = subprocess.run(
-            [claude_path, "mcp", "get", "devgraph"], capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            console.print("[green][OK][/green] 'devgraph' registered")
-            console.print(escape(result.stdout.strip()))
+        repo_root = resolve_repo_root()
+        scope, output = _claude_mcp_registration(claude_path, repo_root)
+        if scope in ("user", "unknown"):
+            console.print(f"[green][OK][/green] 'devgraph' registered{' (user scope)' if scope == 'user' else ''}")
+            console.print(escape(output.strip()))
+        elif scope is not None:
+            console.print(f"[red][X][/red] {escape(_wrong_scope_help(scope, repo_root))}", soft_wrap=True)
+            any_failed = True
         else:
             console.print("[red][X][/red] 'devgraph' not registered (run 'devgraph mcp add')")
             any_failed = True
@@ -1340,7 +1686,7 @@ def client_config(
 
     python_path = resolve_venv_python()
     repo_root = resolve_repo_root()
-    mcp_add_line = f'claude mcp add devgraph -- "{python_path}" {" ".join(MCP_SERVER_ARGS)}'
+    mcp_add_line = _claude_mcp_add_line(python_path)
     want_claude = target in ("claude", "both")
     want_vscode = target in ("vscode", "both")
 
@@ -1428,6 +1774,15 @@ def dashboard(
     if url_only:
         console.print(escape(url))
     elif open_browser:
+        found = probe_dashboard(url)
+        if found == "outdated":
+            console.print(f"[yellow]An older DevGraph agent is serving the dashboard;[/yellow] {escape(_OUTDATED_AGENT_HINT)}")
+        if found == "other":
+            console.print(
+                f"[red][X] Port {escape(str(settings.dashboard_port))} is held by another program,[/red] not DevGraph's "
+                f"dashboard; not opening it. {escape(_dashboard_port_hint(settings))}."
+            )
+            raise typer.Exit(code=1)
         console.print(f"Opening {escape(url)} ...")
         webbrowser.open(url)
     else:
@@ -1516,8 +1871,8 @@ def info(
             console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
             raise typer.Exit(code=1)
 
-        # Node count from Neo4j
-        node_count = 0
+        # Node count from Neo4j; None (shown as unknown, never 0) when it can't be read.
+        node_count: int | None = None
         engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
         try:
             node_count = dashboard_queries.count_nodes(engine, repo_id)
@@ -1525,6 +1880,7 @@ def info(
             pass
         finally:
             engine.close()
+        path_problem = repo_root_problem(repo.path)
 
         # Git status
         git_status: dict[str, Any] = {}
@@ -1556,6 +1912,7 @@ def info(
                 "pr_source_enabled": repo.pr_source_enabled,
                 "issue_source_enabled": repo.issue_source_enabled,
                 "node_count": node_count,
+                "path_missing": path_problem is not None,
                 "git_branch": git_status.get("branch"),
                 "uncommitted_changes": len(git_status.get("uncommitted", [])),
                 "issue": repo_issues.get(repo_id),
@@ -1563,6 +1920,8 @@ def info(
         else:
             console.print(f"\n[bold]Repository: {escape(repo.repo_id, before_tag=True)}[/bold]")
             console.print(f"  Path: {escape(str(repo.path))}")
+            if path_problem:
+                console.print(f"  [red]Path missing:[/red] repository folder {escape(path_problem)}")
             console.print(f"  Active: {'[OK]' if repo.active else '[X]'}")
             console.print(f"  Watch: {'[OK]' if repo.watch_enabled else '[X]'}")
             console.print(f"  Last indexed: {escape(str(repo.last_indexed or '-'))}")
@@ -1571,7 +1930,7 @@ def info(
             console.print(f"  Mentions: {'[OK]' if repo.mentions_enabled else '[X]'}")
             console.print(f"  PR source: {'[OK]' if repo.pr_source_enabled else '[X]'}")
             console.print(f"  Issue source: {'[OK]' if repo.issue_source_enabled else '[X]'}")
-            console.print(f"  Nodes in graph: {node_count}")
+            console.print(f"  Nodes in graph: {'unknown (Neo4j unreachable)' if node_count is None else node_count}")
             console.print(f"  Git branch: {escape(str(git_status.get('branch', '-')))}")
             uncommitted = git_status.get("uncommitted", [])
             console.print(f"  Uncommitted changes: {len(uncommitted)}")
@@ -1607,21 +1966,25 @@ def update(
     """Pull latest from git, reinstall dependencies, and verify.
 
     Port of scripts/update.ps1 into Python. Runs git pull --ff-only,
-    reinstalls the editable package, runs doctor, and restarts the tray
-    if it was running.
+    reinstalls the editable package (`uv sync` in a uv environment, else
+    pip), runs doctor, and restarts the tray if it was running, even when
+    the reinstall or doctor fails.
     """
     repo_root = resolve_repo_root()
     python_path = resolve_venv_python()
+    reinstall = _reinstall_command(Path(sys.prefix), python_path)
 
-    # 1. Check working tree
+    # 1. Check working tree. uv sync writes uv.lock, which the repository
+    # does not track, so an untracked uv.lock is not a local change.
     if not force:
         result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=str(repo_root), capture_output=True, text=True,
         )
-        if result.stdout.strip():
+        changes = [line for line in result.stdout.splitlines() if line.strip() and line.strip() != "?? uv.lock"]
+        if changes:
             console.print("[red][X] Local changes present[/red] — commit, stash, or use --force.")
-            console.print(escape(result.stdout))
+            console.print(escape("\n".join(changes)))
             raise typer.Exit(code=1)
 
     # 2. Check tray liveness
@@ -1653,38 +2016,60 @@ def update(
             cwd=str(repo_root),
         )
 
-    # 5. Reinstall
-    console.print("[bold]Reinstalling dependencies...[/bold]")
-    result = subprocess.run(
-        [str(python_path), "-m", "pip", "install", "-e", ".[dev]"],
-        cwd=str(repo_root), capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        console.print(f"[red][X] pip install failed:[/red] {escape(result.stderr.strip())}")
-        raise typer.Exit(code=1)
-    console.print("[green][OK][/green] Dependencies reinstalled.")
-
-    # 6. Doctor
-    console.print("[bold]Verifying environment...[/bold]")
-    result = subprocess.run(
-        [str(python_path), "-P", "-m", "devgraph.cli.main", "doctor"],
-        cwd=str(repo_root), capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        console.print("[red]doctor reported issues:[/red]")
-        console.print(escape(result.stdout))
-        raise typer.Exit(code=1)
-    console.print("[green][OK][/green] All checks passed.")
-
-    # 7. Restart tray
-    if was_running:
-        console.print("[bold]Restarting tray app...[/bold]")
-        subprocess.run(
-            [str(python_path), "-P", "-m", "devgraph.cli.main", "tray", "start"],
-            cwd=str(repo_root),
+    try:
+        # 5. Reinstall
+        console.print(f"[bold]Reinstalling dependencies[/bold] ({escape(' '.join(reinstall[1:3]))})...")
+        # UV_PROJECT_ENVIRONMENT: sync the environment DevGraph runs from,
+        # not a fresh .venv, when that is somewhere else
+        result = subprocess.run(
+            reinstall, cwd=str(repo_root), capture_output=True, text=True,
+            env={**os.environ, "UV_PROJECT_ENVIRONMENT": sys.prefix},
         )
+        if result.returncode != 0:
+            console.print(f"[red][X] {escape(' '.join(reinstall[1:3]))} failed:[/red] {escape(result.stderr.strip())}")
+            raise typer.Exit(code=1)
+        console.print("[green][OK][/green] Dependencies reinstalled.")
+
+        # 6. Doctor
+        console.print("[bold]Verifying environment...[/bold]")
+        result = subprocess.run(
+            [str(python_path), "-P", "-m", "devgraph.cli.main", "doctor"],
+            cwd=str(repo_root), capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            console.print("[red]doctor reported issues:[/red]")
+            console.print(escape(result.stdout))
+            raise typer.Exit(code=1)
+        console.print("[green][OK][/green] All checks passed.")
+    finally:
+        # 7. Restart the tray this command stopped, whatever happened above:
+        # a failed reinstall used to leave it stopped.
+        if was_running:
+            console.print("[bold]Restarting tray app...[/bold]")
+            subprocess.run(
+                [str(python_path), "-P", "-m", "devgraph.cli.main", "tray", "start"],
+                cwd=str(repo_root),
+            )
 
     console.print("[green]Update complete.[/green]")
+
+
+def _reinstall_command(venv: Path, python_path: Path) -> list[str]:
+    """How `update` reinstalls DevGraph into the environment at `venv`.
+
+    `uv sync --extra dev` when uv created it (its pyvenv.cfg has a `uv`
+    line; such an environment has no pip) and uv is on PATH, else
+    `python -m pip install -e .[dev]`.
+    """
+    uv = shutil.which("uv")
+    try:
+        cfg = (venv / "pyvenv.cfg").read_text(encoding="utf-8")
+    except OSError:
+        cfg = ""
+    made_by_uv = any(line.split("=", 1)[0].strip() == "uv" for line in cfg.splitlines())
+    if uv and made_by_uv:
+        return [uv, "sync", "--extra", "dev"]
+    return [str(python_path), "-m", "pip", "install", "-e", ".[dev]"]
 
 
 class _ConfigGroup(TyperGroup):
@@ -2868,12 +3253,9 @@ def prune(
         raise typer.Exit(code=1)
 
     try:
-        # Find all Repository nodes in Neo4j
-        repo_rows = engine.run_cypher(
-            "MATCH (n:Repository) RETURN n.repo_id AS repo_id"
-        )
-        neo4j_ids = {row["repo_id"] for row in repo_rows if row.get("repo_id")}
-        orphaned = neo4j_ids - registered_ids
+        # Every repo_id in the graph, including nodes left without their
+        # Repository node by a write that landed after a removal.
+        orphaned = engine.graph_repo_ids() - registered_ids
 
         if not orphaned:
             console.print("[green]No orphaned repos found.[/green]")

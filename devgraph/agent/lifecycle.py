@@ -12,6 +12,8 @@ import os
 import signal
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -236,6 +238,68 @@ def _start_tray_if_not_running_locked() -> Optional[int]:
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(process.pid), encoding="utf-8")
     return process.pid
+
+
+def tray_ui_problem() -> Optional[str]:
+    """Why no tray icon can be shown in this session, or None when it can.
+
+    pystray picks its backend at import, and on Linux with no display (or no
+    tray backend for the desktop) the import itself raises; the tray process
+    then runs the headless agent instead (devgraph/agent/tray.py `main`).
+    """
+    try:
+        import pystray  # noqa: F401
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+#: How long `devgraph tray start` waits for the agent's first heartbeat.
+TRAY_START_TIMEOUT_S = 30.0
+
+
+def _exited(pid: int) -> bool:
+    """Whether `pid` is gone. Reaps it first when it is this process's own
+    child: a child that died stays a zombie, which signal 0 still reports alive."""
+    if sys.platform != "win32":
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done == pid:
+                return True
+        except ChildProcessError:
+            pass  # not our child; the liveness probe below decides
+        except OSError:
+            return True
+    return not pid_is_running(pid)
+
+
+def _heartbeat_at() -> Optional[datetime]:
+    path = tray_pid_path().parent / "tray_heartbeat.txt"
+    try:
+        return datetime.fromisoformat(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def wait_for_tray(pid: int, since: datetime, timeout_s: float = TRAY_START_TIMEOUT_S) -> str:
+    """Wait for the agent `pid` to write its first heartbeat after `since` (UTC).
+
+    "running" once a fresh heartbeat lands and the process is still alive a
+    second later (a tray that dies on its icon does so just after the health
+    thread's first beat); "exited" when the process ends first; "timeout"
+    when no heartbeat comes within `timeout_s`.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if _exited(pid):
+            return "exited"
+        beat = _heartbeat_at()
+        if beat is not None and beat >= since:
+            time.sleep(1.0)
+            return "exited" if _exited(pid) else "running"
+        if time.monotonic() >= deadline:
+            return "timeout"
+        time.sleep(0.25)
 
 
 def stop_tray_if_last_holder(holder_pid: Optional[int] = None) -> bool:

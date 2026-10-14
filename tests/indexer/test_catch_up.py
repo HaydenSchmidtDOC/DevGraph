@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from devgraph.graph.engine import GraphEngine, provision_repository_schema
+from devgraph.graph.engine import EngineClosed, GraphEngine, provision_repository_schema
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import CATCH_UP_MARGIN_NS, CatchUp, _change_stamp_ns, catch_up, full_scan
 from tests.indexer.docs_live_helpers import assert_matches_fresh_apply
@@ -36,8 +36,12 @@ def stubbed(monkeypatch):
 
     monkeypatch.setattr(dispatch, "prune_stale_files", lambda *a, **k: state["pruned"])
     monkeypatch.setattr(dispatch, "schema_pending", lambda *a, **k: False)
+    monkeypatch.setattr(dispatch, "index_outdated", lambda *a, **k: False)
     monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: set(state["known"]))
     monkeypatch.setattr(dispatch, "_docs_note_files", lambda *a, **k: set(state["known"]))
+    monkeypatch.setattr(dispatch, "_extracted_files", lambda *a, **k: set(state["known"]))
+    monkeypatch.setattr(dispatch, "_skip_marks", lambda *a, **k: {})
+    monkeypatch.setattr(dispatch, "sync_resolver_config", lambda *a, **k: 0)
 
     def index(engine, repo_id, root, paths, docs_path=None, mentions_enabled=False):
         state["offered"].append({p.relative_to(root).as_posix() for p in paths})
@@ -187,7 +191,7 @@ def _routed_by_index_single_path(root, path, docs_root, mentions_enabled):
     )}
     return dispatch._index_single_path(
         MagicMock(), "r", root, resolved, resolved.relative_to(root.resolve()).as_posix(),
-        docs_root, mentions_enabled, None, batch_services=set(), **lists, **extractions,
+        docs_root, mentions_enabled, config=None, batch_services=set(), **lists, **extractions,
     ) > 0
 
 
@@ -513,9 +517,8 @@ def _extract(kind: str, rel: str, content: str):
     extractors = {
         "py": extract_python_file, "ts": extract_js_file, "js": extract_js_file, "cs": extract_csharp_file,
         "cpp": extract_cpp_file, "java": extract_java_file, "rs": extract_rust_file, "kt": extract_kotlin_file,
+        "go": extract_go_file,
     }
-    if kind == "go":
-        return extract_go_file(content, rel, "r", "example.com/app")
     return extractors[kind](content, rel, "r")
 
 
@@ -599,3 +602,109 @@ def test_a_bare_note_key_naming_a_real_root_file_is_rekeyed(engine, tmp_path, he
     assert _note_files(engine) == [("overview", "docs/README.md")]
     _scan_docs(engine, root, FRESH)
     assert snapshot(engine, REPO) == snapshot(engine, FRESH)
+
+
+def test_catch_up_upgrades_an_outdated_index(engine, repo):
+    scan(engine, repo)
+    engine.run_cypher(
+        "MATCH (a:Class {repo_id: $r, name: 'Alpha'}) MATCH (b:Class {repo_id: $r, name: 'Beta'}) "
+        "MERGE (a)-[:EXTENDS]->(b)",
+        {"r": REPO},
+    )
+    engine.run_cypher("MATCH (r:Repository {repo_id: $r}) REMOVE r.index_format", {"r": REPO})
+    assert dispatch.index_outdated(engine, REPO)
+
+    result = catch_up(engine, REPO, repo, datetime.now(timezone.utc) + timedelta(hours=1))
+
+    assert result.indexed > 0 and (result.pruned, result.checked, result.offered, result.unknown) == (0, 0, 0, 0)
+    assert not dispatch.index_outdated(engine, REPO)
+    scan_fresh = snapshot(engine, REPO)
+    assert scan_fresh[1] == snapshot_of_fresh(engine, repo)
+
+
+def snapshot_of_fresh(engine, root):
+    scan(engine, root, FRESH)
+    return snapshot(engine, FRESH)[1]
+
+
+# --- shutdown: the engine closing under a catch-up or a rescan
+
+
+def _close_at_first_file(monkeypatch, engine):
+    """The agent's shutdown closes `engine` as the first file is indexed."""
+    real = dispatch._index_single_path
+
+    def closing(*args, **kwargs):
+        engine.close()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch, "_index_single_path", closing)
+
+
+def _open_engine():
+    return GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
+
+
+class _Registry:
+    """The registry's stamp, for RepoSync."""
+
+    def __init__(self, root):
+        self.root = root
+        self.last_indexed = None
+
+    def get(self, repo_id):
+        from devgraph.registry.store import RepoRecord
+
+        return RepoRecord(repo_id, self.root, True, True, self.last_indexed, docs_path=None)
+
+    def mark_indexed(self, repo_id, at=None):
+        self.last_indexed = (at or datetime.now(timezone.utc)).isoformat()
+
+
+def test_a_catch_up_cut_by_shutdown_stamps_nothing_and_the_next_one_indexes_the_edit(
+    engine, repo, monkeypatch, caplog
+):
+    from devgraph.agent.sync import RepoSync
+
+    registry = _Registry(repo)
+    scan(engine, repo)
+    registry.mark_indexed(REPO)
+    before = registry.last_indexed
+    (repo / "pkg" / "a.py").write_text("class Alpha:\n    pass\n\nclass Gamma:\n    pass\n")
+    (repo / "pkg" / "c.py").write_text("def gamma():\n    return 3\n")
+    (repo / "pkg" / "d.py").write_text("def delta():\n    return 4\n")
+
+    closing = _open_engine()
+    _close_at_first_file(monkeypatch, closing)
+    stopping = RepoSync(closing, registry, lambda event: None, lambda *a: None)
+    stopping.stopping = True
+    with caplog.at_level("WARNING"):
+        assert stopping.on_catch_up(REPO, datetime.fromisoformat(before)) is False
+    assert registry.last_indexed == before
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and r.name.startswith("devgraph")]
+    assert warnings == []  # no traceback per remaining file
+
+    monkeypatch.undo()
+    restarted = RepoSync(engine, registry, lambda event: None, lambda *a: None)
+    assert restarted.on_catch_up(REPO, datetime.fromisoformat(registry.last_indexed)) is True
+    names = {row["name"] for row in engine.run_cypher(
+        "MATCH (n {repo_id: $r}) WHERE n:Class OR n:Function RETURN n.name AS name", {"r": REPO}
+    )}
+    assert {"Gamma", "gamma", "delta"} <= names
+
+
+def test_a_schema_rescan_cut_by_shutdown_is_redone_by_the_next_catch_up(engine, repo, monkeypatch):
+    scan(engine, repo)
+    schema = repo / "devgraph.schema.yaml"
+    schema.write_text(schema.read_text().replace("ZZ_SUPERSEDES", "ZZ_REPLACES"))
+
+    closing = _open_engine()
+    _close_at_first_file(monkeypatch, closing)
+    with pytest.raises(EngineClosed):
+        full_scan(closing, REPO, repo)  # the schema rescan, cut after the schema is recorded
+    monkeypatch.undo()
+
+    catch_up(engine, REPO, repo, datetime.now(timezone.utc) + timedelta(minutes=1))
+    scan(engine, repo, FRESH)
+    assert snapshot(engine, REPO) == snapshot(engine, FRESH)
+    assert any(rel[2] == "ZZ_REPLACES" for rel in snapshot(engine, REPO)[1])

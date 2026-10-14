@@ -201,6 +201,35 @@ def get_data():
         assert impl_rel.source_label == "Endpoint"
         assert impl_rel.target_label == "Function"
 
+    def test_fastapi_and_flask_implements_are_pinned_to_the_route_file(self):
+        """The handler `def` follows its decorator in the same file, so IMPLEMENTS
+        targets that file's Function and the file-less handler stub ("")."""
+        code = """
+@router.post("/items")
+def save():
+    return {}
+
+@app.route("/legacy", methods=["GET"])
+def legacy():
+    return {}
+"""
+        result = self.extractor.extract_from_source(code, "api/routes.py")
+        targets = sorted(
+            (r.source_name, r.target_name, r.to_file) for r in result.relationships if r.relationship_type == "IMPLEMENTS"
+        )
+        assert targets == [
+            ("GET /legacy", "legacy", ""),
+            ("GET /legacy", "legacy", "api/routes.py"),
+            ("POST /items", "save", ""),
+            ("POST /items", "save", "api/routes.py"),
+        ]
+
+    def test_django_implements_stays_bare_name(self):
+        """A Django view is usually imported from views.py, so its target stays unpinned."""
+        result = self.extractor.extract_from_source('urlpatterns = [path("search/", search)]\n', "app/urls.py")
+        (rel,) = result.relationships
+        assert (rel.source_name, rel.target_name, rel.to_file) == ("* search/", "search", None)
+
     def test_async_handler_detection(self):
         """Test detection of async handler functions."""
         code = """

@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
@@ -32,12 +33,32 @@ class StubEngine:
         self.queries.append((query, params or {}))
         return self.rows
 
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        return self.run_cypher(query, params), False
+
+
+class _Known:
+    def get(self, repo_id):
+        return object() if repo_id == "demo" else None
+
+
+REGISTRY = _Known()
+
+
+@pytest.mark.parametrize("call", [find_communities, key_nodes])
+def test_an_unknown_repo_id_is_named_before_any_query(call):
+    engine = StubEngine(summary=None)
+    with pytest.raises(ToolError) as excinfo:
+        call(engine, REGISTRY, "nope")
+    assert str(excinfo.value) == "no such repo_id: 'nope'; run devgraph list to see registered repositories"
+    assert engine.queries == []
+
 
 def test_communities_with_members_for_the_shown_ones_only():
     members = [{"community": 0, "members": [{"name": "login\x07", "labels": ["Function"], "file": "auth/a.py", "pagerank": 0.4}]},
                {"community": 1, "members": []}]
     engine = StubEngine(rows=members)
-    result = find_communities(engine, "demo", max_results=2, members_per_community=3)
+    result = find_communities(engine, REGISTRY, "demo", max_results=2, members_per_community=3)
     assert result["count"] == 3 and result["truncated"] is True
     assert [r["label"] for r in result["results"]] == ["auth", "billing"]
     assert result["results"][0]["top_members"][0]["name"] == "login"  # control char stripped
@@ -48,17 +69,17 @@ def test_communities_with_members_for_the_shown_ones_only():
 
 def test_members_per_community_is_clamped():
     engine = StubEngine(rows=[])
-    find_communities(engine, "demo", members_per_community=500)
+    find_communities(engine, REGISTRY, "demo", members_per_community=500)
     assert engine.queries[0][1]["k"] == 20
-    find_communities(engine, "demo", members_per_community=0)
-    assert engine.queries[1][1]["k"] == 1
+    with pytest.raises(ToolError, match="members_per_community must be at least 1, not 0"):
+        find_communities(engine, REGISTRY, "demo", members_per_community=0)
 
 
 def test_never_computed_is_an_error_that_names_the_command():
-    with pytest.raises(ValueError, match="devgraph insights"):
-        find_communities(StubEngine(summary=None), "demo")
-    with pytest.raises(ValueError, match="devgraph insights"):
-        key_nodes(StubEngine(summary=None), "demo")
+    with pytest.raises(ToolError, match="devgraph insights"):
+        find_communities(StubEngine(summary=None), REGISTRY, "demo")
+    with pytest.raises(ToolError, match="devgraph insights"):
+        key_nodes(StubEngine(summary=None), REGISTRY, "demo")
 
 
 def test_computed_but_empty_is_an_empty_envelope_not_an_error():
@@ -66,25 +87,25 @@ def test_computed_but_empty_is_an_empty_envelope_not_an_error():
         def read_insights_summary(self, repo_id):
             return {"computed_at": "x", "node_count": 0, "community_count": 0, "modularity": 0.0, "communities": "[]"}
 
-    assert find_communities(Empty(), "demo") == {"count": 0, "results": [], "truncated": False}
-    assert key_nodes(Empty(), "demo") == {"count": 0, "results": [], "truncated": False}
+    assert find_communities(Empty(), REGISTRY, "demo") == {"count": 0, "results": [], "truncated": False}
+    assert key_nodes(Empty(), REGISTRY, "demo") == {"count": 0, "results": [], "truncated": False}
 
 
 @pytest.mark.parametrize(("metric", "prop"), [("pagerank", "insight_pagerank"), ("BETWEENNESS", "insight_betweenness")])
 def test_key_nodes_queries_the_allow_listed_property(metric, prop):
     engine = StubEngine(rows=[{"name": "hub", "labels": ["Class"], "file": "a.py", "score": 0.5, "community": 0}])
-    result = key_nodes(engine, "demo", metric=metric, max_results=5)
+    result = key_nodes(engine, REGISTRY, "demo", metric=metric, max_results=5)
     assert result["count"] == 1 and result["results"][0]["name"] == "hub"
     (query, params), = engine.queries
     assert f"n.{prop}" in query and params["repo_id"] == "demo"
 
 
 @pytest.mark.parametrize("metric", ["degree", "pagerank; MATCH (x) DETACH DELETE x", "", None, 3])
-def test_key_nodes_rejects_other_metrics_without_echoing_them(metric):
+def test_key_nodes_rejects_other_metrics_before_any_query(metric):
     engine = StubEngine()
-    with pytest.raises(ValueError) as excinfo:
-        key_nodes(engine, "demo", metric=metric)
-    assert "DETACH" not in str(excinfo.value)
+    with pytest.raises(ToolError) as excinfo:
+        key_nodes(engine, REGISTRY, "demo", metric=metric)
+    assert str(excinfo.value) == f"metric must be pagerank or betweenness, not {str(metric)!r}"
     assert engine.queries == []
 
 

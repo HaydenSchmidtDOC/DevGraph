@@ -40,6 +40,10 @@ const fnSrc = [
   grab(/^function currentStateQuery\(/m, "\n}"),
   grab(/^function acCandidates\(/m, "\n}"),
   grab(/^async function onRepoSelectChange\(/m, "\n}"),
+  grab(/^let HIDDEN_PROPS = /m, "\n"),
+  grab(/^function renderPropsRows\(/m, "\n}"),
+  grab(/^function truncateDeep\(/m, "\n}"),
+  grab(/^function formatCell\(/m, "\n}"),
 ].join("\n");
 const bootSrc = grab(/^async function bootConnect\(\)/m, "\n}");
 const renderAcSrc = grab(/^function renderAC\(/m, "\n}");
@@ -70,12 +74,15 @@ const SNAPSHOT_RELS = ["CONTAINS", "CALLS", "IMPORTS", "USES", "RUNS", "WRITES_T
 const BACKEND_LABELS = ["Repository", "Container", "Service", "Module", "Class", "Function", "Endpoint",
   "Database", "VectorStore", "Queue", "Requirement", "DesignDecision", "ArchitectureNote", "Document",
   "Commit", "PullRequest", "Issue"];
+// graph/schema.py's INTERNAL_NODE_PROPERTIES and INTERNAL_EDGE_PROPERTIES, as the schema route serves them.
+const HIDDEN = ["claims", "extractor", "name_ref_sources", "name_ref_targets", "name_refs", "origins"];
 const builtins = () => BACKEND_LABELS.map((label, i) => ({ label, origin: "builtin", color: null, count: i }));
 const builtinRels = () => SNAPSHOT_RELS.map(type => ({ type, origin: "builtin", color: null }));
 const payload = (extraNodes, extraRels, state) => ({
   node_types: [...builtins(), ...extraNodes.map(([label, color, count]) => ({ label, origin: "project", color, count }))],
   relationship_types: [...builtinRels(), ...extraRels.map(([type, color]) => ({ type, origin: "project", color }))],
   schema_state: state,
+  hidden_properties: HIDDEN,
   notices: state === "pending" ? ["alpha: schema file changed since it was applied; rescan to apply it"]
     : state === "invalid" ? ["broken: schema file is invalid: <b>node_types</b> must be a list"] : [],
 });
@@ -168,7 +175,7 @@ const api = new Function(...Object.keys(globals),
   tablesSrc + "\n" + fnSrc +
   "\nreturn { NODE_TYPES, REL_TYPES, CAT_COLORS, BUILTIN_NODE_TYPES, renderTypeLists, applySchemaTypes," +
   " loadSchemaTypes, currentStateQuery, mapGraphResultToElements, acCandidates, onRepoSelectChange, refreshIsolateUI," +
-  " connectLiveEvents, relSelector };")(
+  " connectLiveEvents, relSelector, renderPropsRows, hiddenProps: () => HIDDEN_PROPS };")(
   ...Object.values(globals));
 
 // --- helpers ------------------------------------------------------------
@@ -391,6 +398,24 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
     api.relSelector('A"] , node[x = "\\') === '[label = "A\\"] , node[x = \\"\\\\"]', api.relSelector('A"] , node[x = "\\'));
   check("the hover and isolate paths use the escaped selector",
     !/\[label = "\$\{(?!String\(rel)/.test(html), "a raw [label = \"${...}\"] selector remains in index.html");
+
+  // 10c. the node inspector hides the bookkeeping properties the schema route lists
+  await api.loadSchemaTypes("alpha");
+  const nodeProps = { file: "src/app.py", claims: ["a.py"], extractor: "filesystem", name_refs: ["CALLS\u001fx"],
+    name_ref_targets: ["helper"], name_ref_sources: ["Foo"] };
+  const shown = api.renderPropsRows(nodeProps, api.hiddenProps());
+  check("the node inspector shows ordinary properties", shown.includes("src/app.py"), shown);
+  check("...and hides claims, extractor and every name_ref* property",
+    !/claims|extractor|name_ref/.test(shown), shown);
+  const edgeRows = api.renderPropsRows({ weight: 2, origins: ["a.py"] }, api.hiddenProps());
+  check("the edge inspector shows ordinary edge properties", edgeRows.includes("weight"), edgeRows);
+  check("...and hides the edge's origins", !/origins/.test(edgeRows), edgeRows);
+  check("the node and edge lookups both render through the hidden list",
+    (html.match(/renderPropsRows\(props, HIDDEN_PROPS\)/g) || []).length === 2,
+    "the node and edge inspectors do not both pass HIDDEN_PROPS");
+  check("only bookkeeping is hidden: a node with nothing else says so",
+    /No properties/.test(api.renderPropsRows({ claims: ["a.py"] }, api.hiddenProps())),
+    api.renderPropsRows({ claims: ["a.py"] }, api.hiddenProps()));
 
   // 11. wiring: boot loads the schema before the first graph fetch
   check("boot loads the selected repo's schema before the first graph fetch",

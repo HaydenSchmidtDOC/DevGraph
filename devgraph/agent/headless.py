@@ -19,11 +19,13 @@ from datetime import datetime, timezone
 import uvicorn
 
 from devgraph.agent.schema_rescan import SchemaRescanScheduler
+from devgraph.agent.shutdown import shutdown
 from devgraph.agent.sync import RepoSync
 from devgraph.analytics.insights import InsightsScheduler
 from devgraph.config import get_settings
 from devgraph.dashboard.app import build_app
 from devgraph.dashboard.events import EventBroadcaster
+from devgraph.dashboard.serving import DashboardFailure, serve_dashboard
 from devgraph.dashboard.url import dashboard_url
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.git_history.extractor import sync_git_history
@@ -74,8 +76,11 @@ class HeadlessAgent:
             on_changes=self._sync.on_changes,
             on_git_state_changed=self._on_git_state_changed,
             on_catch_up=self._sync.on_catch_up,
+            on_removed=self._sync.on_removed,
         )
         self._healthy = True
+        self._schema_ready = False
+        self._preparing = False
         self._stop_event = threading.Event()
         self._last_seen_registry_change = self._registry.last_changed_at()
         self._schema_rescans = SchemaRescanScheduler(
@@ -84,6 +89,7 @@ class HeadlessAgent:
         )
         self._insights = InsightsScheduler(self._engine, self._registry, on_refreshed=self._on_insights_refreshed)
         self._dashboard_server: uvicorn.Server | None = None
+        self._dashboard_problem: DashboardFailure | None = None
         self._dashboard_thread: threading.Thread | None = None
 
     def _on_schema_rescanned(self, repo_id: str, files: int) -> None:
@@ -130,17 +136,53 @@ class HeadlessAgent:
         except Exception:
             logger.warning("git history sync failed for %s", repo_id, exc_info=True)
 
+    def _provision_schema(self) -> None:
+        """Create the built-in constraints and indexes and wait until they are
+        built (`GraphEngine.init_schema`), so an upgraded database has its
+        lookup indexes before the first catch-up. Retried by the health check
+        while it fails."""
+        try:
+            self._engine.init_schema()
+            self._schema_ready = True
+        except Exception:
+            if self._stop_event.is_set():
+                return  # the engine refuses new sessions once shutdown closes it
+            logger.warning("could not provision the graph schema; retrying when Neo4j is reachable", exc_info=True)
+
+    def _start_watching(self) -> None:
+        """Provision the graph indexes and wait for them, then start the
+        watcher and the schedulers. Run on its own thread from `start`, so
+        an upgrade's index build (up to minutes) never holds up signal handling."""
+        try:
+            self._provision_schema()
+        finally:
+            self._preparing = False
+        if self._stop_event.is_set():
+            return
+        self._watcher.start()
+        self._schema_rescans.start()
+        self._insights.start()
+
     def _health_check_loop(self) -> None:
+        # Beat once before the first Neo4j check, which can take a while
+        # (driver retries): `devgraph tray start` waits for this to say OK.
+        self._write_heartbeat()
         while not self._stop_event.is_set():
             try:
                 self._engine.verify_connectivity()
                 recovered = not self._healthy
                 self._healthy = True
+                if not self._schema_ready and not self._preparing:
+                    self._provision_schema()
                 if recovered:
                     self._sync.retry_failed()
             except Exception:
+                if self._stop_event.is_set():
+                    break  # the engine refuses new sessions once shutdown closes it
                 logger.warning("Neo4j health check failed", exc_info=True)
                 self._healthy = False
+            if self._stop_event.is_set():
+                break
             self._check_registry_changes()
             self._write_heartbeat()
             self._stop_event.wait(self._settings.health_check_interval_s)
@@ -182,12 +224,17 @@ class HeadlessAgent:
             loop="asyncio",
             log_level="critical",
             access_log=False,
+            # An open /api/events stream ends when shutdown closes the
+            # broadcaster; this bounds any other connection still open.
+            timeout_graceful_shutdown=1,
         )
         server = uvicorn.Server(config)
         self._dashboard_server = server
         try:
             logger.info("dashboard on %s", dashboard_url(self._settings))
-            loop.run_until_complete(server.serve())
+            self._dashboard_problem = serve_dashboard(server, loop)
+            if self._dashboard_problem is not None:
+                logger.warning("%s", self._dashboard_problem.detail)
         except Exception:
             logger.warning("dashboard failed to start; continuing without it", exc_info=True)
         finally:
@@ -196,20 +243,16 @@ class HeadlessAgent:
     def stop(self) -> None:
         self._stop_event.set()
         self._sync.stopping = True
-        self._watcher.stop()
-        self._schema_rescans.stop()
-        self._insights.stop()
-        if self._dashboard_server is not None:
-            self._dashboard_server.should_exit = True
-            if self._dashboard_thread is not None:
-                self._dashboard_thread.join(timeout=5)
-        self._engine.close()
+        shutdown(
+            self._engine, self._watcher, self._schema_rescans, self._insights,
+            dashboard_server=self._dashboard_server, dashboard_thread=self._dashboard_thread,
+            events=self._events,
+        )
         self._registry.close()
 
     def start(self) -> None:
-        self._watcher.start()
-        self._schema_rescans.start()
-        self._insights.start()
+        self._preparing = True
+        threading.Thread(target=self._start_watching, daemon=True).start()
         health_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         health_thread.start()
 

@@ -120,11 +120,12 @@ def repo(tmp_path, engine, live_agent):
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "Start")
     root = root.resolve()
+    live_helpers.sweep_stale_live_repos(engine, "zz-watcher-live")
 
     live_agent.registry_path.parent.mkdir(parents=True)
     registry = RepoRegistry(live_agent.registry_path)
     try:
-        repo_id = registry.add_repo(root, repo_id=f"zz-watcher-live-{_TOKEN}-{uuid.uuid4().hex[:6]}").repo_id
+        repo_id = registry.add_repo(root, repo_id=live_helpers.live_repo_id("zz-watcher-live")).repo_id
         engine.delete_repository(repo_id)
         provision_repository_schema(engine, root)
         engine.upsert_repository(repo_id, repo_id, str(root))
@@ -134,9 +135,13 @@ def repo(tmp_path, engine, live_agent):
     finally:
         registry.close()
     yield root, repo_id
-    live_agent.stop_all()
-    engine.delete_repository(repo_id)
-    engine.delete_repository(f"{repo_id}_fresh")
+    try:
+        live_agent.stop_all()
+    finally:
+        # even when stopping the agent fails: a raise here used to skip these,
+        # leaving every test's repository in the shared graph
+        engine.delete_repository(repo_id)
+        engine.delete_repository(f"{repo_id}_fresh")
 
 
 def catch_up_states(agent, repo_id):
@@ -246,6 +251,27 @@ def test_edits_made_while_off_are_caught_up_on_start(engine, repo, live_agent):
     assert states[:2] == ["running", "done"], second.events
 
 
+def test_an_import_target_deleted_and_restored(engine, repo, live_agent):
+    root, repo_id = repo
+    (root / "tools" / "use.py").write_text("from pkg.sub.util import helper\n\n\ndef go():\n    return helper()\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "Use the helper")
+    start(live_agent, repo_id)
+
+    (root / "pkg" / "sub" / "util.py").unlink()
+    converges(engine, repo_id, root)
+    git(root, "checkout", "--", "pkg/sub/util.py")
+    converges(engine, repo_id, root)
+
+    # The same, through a branch switch.
+    git(root, "checkout", "-q", "-b", "without-util")
+    git(root, "rm", "-q", "pkg/sub/util.py")
+    git(root, "commit", "-q", "-m", "Drop the helper")
+    converges(engine, repo_id, root)
+    git(root, "checkout", "-q", "main")
+    converges(engine, repo_id, root)
+
+
 def git_synced(agent, repo_id, count):
     """Wait until the agent has synced git history `count` times for the repo:
     the sync runs after the post-git catch-up, in the same job."""
@@ -338,3 +364,52 @@ def test_a_commit_made_while_off_is_synced_on_start(engine, repo, live_agent, tm
     second = start(live_agent, repo_id)
     git_synced(second, repo_id, 1)
     synced_like_a_fresh_scan(engine, repo_id, root, tmp_path)
+
+
+def test_devgraph_remove_under_a_running_batch_leaves_no_graph_data(engine, repo, live_agent, monkeypatch):
+    """`devgraph remove` deletes the graph from another process, then
+    unregisters it, while a batch is running: the batch writes after the
+    delete. Once the agent sees the removal, it stops watching, waits for that
+    batch and deletes what it wrote, so no node of the repo is left."""
+    import threading
+
+    from devgraph.agent import sync
+
+    root, repo_id = repo
+    agent = start(live_agent, repo_id)
+    in_batch, removed, batch_done = threading.Event(), threading.Event(), threading.Event()
+    real_index_paths = sync.index_paths
+
+    def index_paths(*args, **kwargs):
+        in_batch.set()
+        removed.wait(EVENT_DEADLINE_S)  # past its registry check, writing after the delete
+        try:
+            return real_index_paths(*args, **kwargs)
+        finally:
+            batch_done.set()
+
+    monkeypatch.setattr(sync, "index_paths", index_paths)
+    (root / "pkg" / "late.py").write_text("def late():\n    return 1\n")
+    assert in_batch.wait(EVENT_DEADLINE_S)
+    # What `devgraph remove` does, with its own connections.
+    cli_engine = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
+    cli_registry = RepoRegistry(live_agent.registry_path)
+    try:
+        cli_engine.delete_repository(repo_id)
+        cli_registry.remove_repo(repo_id)
+    finally:
+        cli_registry.close()
+        cli_engine.close()
+    agent._check_registry_changes()  # the health loop's poll; the batch is still waiting
+    removed.set()
+    assert batch_done.wait(EVENT_DEADLINE_S)
+    deadline = time.monotonic() + EVENT_DEADLINE_S
+    while True:
+        left = engine.run_cypher("MATCH (n {repo_id: $r}) RETURN labels(n) AS l, count(*) AS c", {"r": repo_id})
+        if not left:
+            break
+        if time.monotonic() > deadline:
+            pytest.fail(f"graph data of the removed {repo_id} left: {left}")
+        time.sleep(0.2)
+    live_agent.stop(agent)
+    assert engine.run_cypher("MATCH (n {repo_id: $r}) RETURN count(n) AS c", {"r": repo_id}) == [{"c": 0}]

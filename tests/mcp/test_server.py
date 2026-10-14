@@ -9,6 +9,8 @@ end. These tests call through the real MCPServer API so a similar mismatch
 fails the test suite instead of only surfacing when a real client connects.
 """
 
+from pathlib import Path
+
 import pytest
 
 from devgraph.graph.engine import GraphEngine
@@ -114,9 +116,18 @@ class TestServerResources:
         assert catalog_names == tool_names
 
 
+class _Registry:
+    """The one repository these calls name; no tool here needs its root."""
+
+    def get(self, repo_id):
+        if repo_id != "_smoketest_mcp_server":
+            return None
+        return type("Record", (), {"repo_id": repo_id, "path": Path(__file__).parent / "no-such-dir"})()
+
+
 class TestServerToolCall:
     def test_summarise_repository_via_server(self, seeded_graph):
-        server = build_server(seeded_graph)
+        server = build_server(seeded_graph, _Registry())
         import asyncio
 
         result = asyncio.run(
@@ -127,7 +138,7 @@ class TestServerToolCall:
         assert result.structured_content["module_count"] == 1
 
     def test_search_component_via_server(self, seeded_graph):
-        server = build_server(seeded_graph)
+        server = build_server(seeded_graph, _Registry())
         import asyncio
 
         result = asyncio.run(
@@ -147,7 +158,7 @@ class TestServerToolCall:
         seeded_graph.upsert_node(
             "Service", "_smoketest_mcp_server", "TestService", {"last_modified_at": "2026-01-01T00:00:00"}
         )
-        server = build_server(seeded_graph)
+        server = build_server(seeded_graph, _Registry())
         import asyncio
 
         result = asyncio.run(
@@ -166,7 +177,7 @@ class TestServerToolCall:
         seeded_graph.upsert_repository("_smoketest_mcp_server_b", "Other", "/tmp/other")
         seeded_graph.upsert_node("Service", "_smoketest_mcp_server_b", "OtherService", {})
 
-        server = build_server(seeded_graph)
+        server = build_server(seeded_graph, _Registry())
         import asyncio
 
         try:
@@ -179,3 +190,22 @@ class TestServerToolCall:
             assert all(item["repo_id"] == "_smoketest_mcp_server" for item in payload)
         finally:
             seeded_graph.delete_repository("_smoketest_mcp_server_b")
+
+
+def test_mcp_startup_does_not_wait_for_the_graph_indexes():
+    """An MCP client's handshake times out in about 30 s; building the
+    indexes of an upgraded database can take minutes. The server provisions
+    them without waiting, and its queries wait for an index on their own."""
+    from unittest.mock import MagicMock, patch
+
+    from devgraph.mcp import server as server_module
+
+    with patch.object(server_module, "get_settings", return_value=MagicMock()), \
+         patch.object(server_module, "GraphEngine") as engine_cls, \
+         patch.object(server_module, "RepoRegistry"), \
+         patch.object(server_module, "lifecycle"), \
+         patch.object(server_module, "resolve_session_repo", return_value=(None, None)), \
+         patch.object(server_module, "build_server"), \
+         patch.object(server_module.anyio, "run"):
+        server_module.main()
+    engine_cls.return_value.init_schema.assert_called_once_with(wait=False)

@@ -94,6 +94,7 @@ class TestWiring:
         kwargs = tray.WatcherManager.call_args.kwargs
         assert kwargs["on_changes"] == tray_app._sync.on_changes
         assert kwargs["on_catch_up"] == tray_app._sync.on_catch_up
+        assert kwargs["on_removed"] == tray_app._sync.on_removed
         since = datetime(2026, 10, 7, tzinfo=timezone.utc)
         tray_app._sync.retry_failed()  # nothing floored yet
         tray_app._watcher.request_catch_up.assert_not_called()
@@ -155,3 +156,63 @@ class TestOpenDashboard:
         with patch("devgraph.agent.tray.webbrowser.open") as mock_open:
             tray_app._open_dashboard(MagicMock(), MagicMock())
         mock_open.assert_called_once_with("http://127.0.0.1:8765")
+
+
+class TestSchemaAtStart:
+    def _start_while_the_indexes_build(self, tray_app):
+        """Start with init_schema blocked, as on an upgraded database."""
+        import threading
+
+        building = threading.Event()
+        release = threading.Event()
+        order = []
+
+        def init_schema():
+            building.set()
+            release.wait(5)
+            order.append("schema")
+
+        tray_app._engine.init_schema.side_effect = init_schema
+        tray_app._watcher.start.side_effect = lambda: order.append("watch")
+        tray_app._settings.dashboard_enabled = False
+        tray_app._health_check_loop = lambda: None
+        seen = {}
+
+        def run_icon():
+            assert building.wait(5)
+            seen["title"] = tray_app._status_text()
+            seen["order"] = list(order)
+            release.set()
+
+        with patch("devgraph.agent.tray.pystray") as pystray_mod:
+            pystray_mod.Icon.return_value.run.side_effect = run_icon
+            tray_app.start()
+        return seen, order
+
+    def test_the_icon_runs_while_the_indexes_build_and_the_watcher_waits_for_them(self, tray_app):
+        import time
+
+        seen, order = self._start_while_the_indexes_build(tray_app)
+        assert seen == {"title": "DevGraph (preparing graph indexes...)", "order": []}
+        deadline = time.monotonic() + 5
+        while order != ["schema", "watch"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert order == ["schema", "watch"]
+        assert tray_app._status_text() != "DevGraph (preparing graph indexes...)"
+
+    def test_resume_while_preparing_leaves_the_watcher_to_the_start_thread(self, tray_app):
+        tray_app._preparing = True
+        tray_app._paused = True
+        tray_app._toggle_pause(MagicMock(), MagicMock())
+        tray_app._watcher.start.assert_not_called()
+
+    def test_a_schema_failure_at_start_is_retried_when_neo4j_recovers(self, tray_app):
+        tray_app._engine.init_schema.side_effect = RuntimeError("Neo4j down")
+        tray_app._start_watching()  # does not raise, and still starts watching
+        tray_app._watcher.start.assert_called_once_with()
+        tray_app._engine.init_schema.side_effect = None
+        tray_app._engine.init_schema.reset_mock()
+        tray_app._healthy = False
+        tray_app._stop_event.wait = lambda _interval: tray_app._stop_event.set()
+        tray_app._health_check_loop()
+        tray_app._engine.init_schema.assert_called_once_with()

@@ -1,0 +1,370 @@
+{
+  "language": "csharp",
+  "description": ".NET 8 solution (Core, App, Tests) with namespaces unlike folders, two User.cs in different namespaces, file-scoped and block namespaces, global usings, a partial class and a dynamic call.",
+  "calls": [
+    {
+      "caller": "Display",
+      "caller_file": "src/Shop.Core/Models/User.cs",
+      "callee": "Title",
+      "callee_file": "src/Shop.Core/Utils/Formatting.cs",
+      "note": "global-using"
+    },
+    {
+      "caller": "Describe",
+      "caller_file": "src/Shop.Core/Mapping/Mappers.cs",
+      "callee": "Display",
+      "callee_file": "src/Shop.Core/Legacy/User.cs",
+      "not_files": [
+        "src/Shop.Core/Models/User.cs"
+      ],
+      "note": "two-users-using"
+    },
+    {
+      "caller": "Register",
+      "caller_file": "src/Shop.Core/Services/UserService.cs",
+      "callee": "IsValid",
+      "callee_file": "src/Shop.Core/Models/User.cs",
+      "note": "enclosing-namespace-wins"
+    },
+    {
+      "caller": "Register",
+      "caller_file": "src/Shop.Core/Services/UserService.cs",
+      "callee": "Write",
+      "callee_file": "src/Shop.Core/Services/AuditLog.cs",
+      "note": "block-namespace"
+    },
+    {
+      "caller": "Register",
+      "caller_file": "src/Shop.Core/Services/UserService.cs",
+      "callee": "Display",
+      "callee_file": "src/Shop.Core/Models/User.cs",
+      "not_files": [
+        "src/Shop.Core/Legacy/User.cs"
+      ],
+      "note": "enclosing-namespace-wins"
+    },
+    {
+      "caller": "Badge",
+      "caller_file": "src/Shop.Core/Services/UserService.cs",
+      "callee": "Initials",
+      "callee_file": "src/Shop.Core/Extensions/UserExtensions.cs",
+      "note": "extension-method"
+    },
+    {
+      "caller": "Badge",
+      "caller_file": "src/Shop.Core/Services/UserService.cs",
+      "callee": "Mask",
+      "callee_file": "src/Shop.Core/Utils/Formatting.cs",
+      "note": "global-using"
+    },
+    {
+      "caller": "Total",
+      "caller_file": "src/Shop.Core/Orders/Order.cs",
+      "callee": "Subtotal",
+      "callee_file": "src/Shop.Core/Orders/Order.Pricing.cs",
+      "note": "partial-class"
+    },
+    {
+      "caller": "Total",
+      "caller_file": "src/Shop.Core/Orders/Order.cs",
+      "callee": "Tax",
+      "callee_file": "src/Shop.Core/Orders/Order.Pricing.cs",
+      "note": "partial-class"
+    },
+    {
+      "caller": "Show",
+      "caller_file": "src/Shop.Core/Interop/DynamicBridge.cs",
+      "callee": "Display",
+      "callee_file": "src/Shop.Core/Models/User.cs",
+      "ambiguous": true,
+      "note": "dynamic"
+    },
+    {
+      "caller": "Show",
+      "caller_file": "src/Shop.Core/Interop/DynamicBridge.cs",
+      "callee": "Display",
+      "callee_file": "src/Shop.Core/Legacy/User.cs",
+      "ambiguous": true,
+      "note": "dynamic"
+    },
+    {
+      "caller": "Main",
+      "caller_file": "src/Shop.App/Program.cs",
+      "callee": "Parse",
+      "callee_file": "src/Shop.Core/Legacy/User.cs",
+      "not_files": [
+        "src/Shop.Core/Models/User.cs"
+      ],
+      "note": "using-alias"
+    },
+    {
+      "caller": "Main",
+      "caller_file": "src/Shop.App/Program.cs",
+      "callee": "ToDomain",
+      "callee_file": "src/Shop.Core/Mapping/Mappers.cs",
+      "note": "class-not-named-after-file"
+    },
+    {
+      "caller": "Main",
+      "caller_file": "src/Shop.App/Program.cs",
+      "callee": "Register",
+      "callee_file": "src/Shop.Core/Services/UserService.cs"
+    },
+    {
+      "caller": "Main",
+      "caller_file": "src/Shop.App/Program.cs",
+      "callee": "Describe",
+      "callee_file": "src/Shop.Core/Mapping/Mappers.cs",
+      "note": "class-not-named-after-file"
+    },
+    {
+      "caller": "Main",
+      "caller_file": "src/Shop.App/Program.cs",
+      "callee": "AddLine",
+      "callee_file": "src/Shop.Core/Orders/Order.cs",
+      "note": "partial-class"
+    },
+    {
+      "caller": "Main",
+      "caller_file": "src/Shop.App/Program.cs",
+      "callee": "Total",
+      "callee_file": "src/Shop.Core/Orders/Order.cs",
+      "note": "partial-class"
+    },
+    {
+      "caller": "Main",
+      "caller_file": "src/Shop.App/Program.cs",
+      "callee": "Render",
+      "callee_file": "src/Shop.App/Banner.cs",
+      "note": "same-namespace"
+    },
+    {
+      "caller": "Main",
+      "caller_file": "src/Shop.App/Program.cs",
+      "callee": "Count",
+      "callee_file": "src/Shop.Core/Services/UserService.cs"
+    },
+    {
+      "caller": "Render",
+      "caller_file": "src/Shop.App/Banner.cs",
+      "callee": "Title",
+      "callee_file": "src/Shop.Core/Utils/Formatting.cs",
+      "note": "global-using"
+    },
+    {
+      "caller": "Render",
+      "caller_file": "src/Shop.App/Banner.cs",
+      "callee": "Stamp",
+      "callee_file": "src/Shop.App/Banner.cs"
+    },
+    {
+      "caller": "RegisterAddsUser",
+      "caller_file": "tests/Shop.Tests/UserServiceTests.cs",
+      "callee": "Register",
+      "callee_file": "src/Shop.Core/Services/UserService.cs"
+    },
+    {
+      "caller": "RegisterAddsUser",
+      "caller_file": "tests/Shop.Tests/UserServiceTests.cs",
+      "callee": "Count",
+      "callee_file": "src/Shop.Core/Services/UserService.cs"
+    }
+  ],
+  "imports": [
+    {
+      "from_file": "src/Shop.Core/Models/User.cs",
+      "to_file": "src/Shop.Core/Utils/Formatting.cs",
+      "kind": "type-ref",
+      "note": "global-using"
+    },
+    {
+      "from_file": "src/Shop.Core/Mapping/Mappers.cs",
+      "to_file": "src/Shop.Core/Legacy/User.cs",
+      "kind": "type-ref",
+      "note": "two-users-using"
+    },
+    {
+      "from_file": "src/Shop.Core/Mapping/Mappers.cs",
+      "to_file": "src/Shop.Core/Models/User.cs",
+      "kind": "type-ref",
+      "note": "qualified-name"
+    },
+    {
+      "from_file": "src/Shop.Core/Services/UserService.cs",
+      "to_file": "src/Shop.Core/Models/User.cs",
+      "kind": "type-ref",
+      "note": "enclosing-namespace-wins"
+    },
+    {
+      "from_file": "src/Shop.Core/Services/UserService.cs",
+      "to_file": "src/Shop.Core/Services/AuditLog.cs",
+      "kind": "type-ref"
+    },
+    {
+      "from_file": "src/Shop.Core/Services/UserService.cs",
+      "to_file": "src/Shop.Core/Extensions/UserExtensions.cs",
+      "kind": "type-ref",
+      "note": "extension-method"
+    },
+    {
+      "from_file": "src/Shop.Core/Services/UserService.cs",
+      "to_file": "src/Shop.Core/Utils/Formatting.cs",
+      "kind": "type-ref",
+      "note": "global-using"
+    },
+    {
+      "from_file": "src/Shop.Core/Extensions/UserExtensions.cs",
+      "to_file": "src/Shop.Core/Models/User.cs",
+      "kind": "type-ref"
+    },
+    {
+      "from_file": "src/Shop.App/Program.cs",
+      "to_file": "src/Shop.Core/Services/UserService.cs",
+      "kind": "type-ref"
+    },
+    {
+      "from_file": "src/Shop.App/Program.cs",
+      "to_file": "src/Shop.Core/Legacy/User.cs",
+      "kind": "type-ref",
+      "note": "using-alias"
+    },
+    {
+      "from_file": "src/Shop.App/Program.cs",
+      "to_file": "src/Shop.Core/Mapping/Mappers.cs",
+      "kind": "type-ref",
+      "note": "class-not-named-after-file"
+    },
+    {
+      "from_file": "src/Shop.App/Program.cs",
+      "to_file": "src/Shop.Core/Orders/Order.cs",
+      "kind": "type-ref",
+      "note": "partial-class"
+    },
+    {
+      "from_file": "src/Shop.App/Program.cs",
+      "to_file": "src/Shop.Core/Orders/Order.Pricing.cs",
+      "kind": "type-ref",
+      "note": "partial-class"
+    },
+    {
+      "from_file": "src/Shop.App/Program.cs",
+      "to_file": "src/Shop.App/Banner.cs",
+      "kind": "type-ref",
+      "note": "same-namespace"
+    },
+    {
+      "from_file": "src/Shop.App/Banner.cs",
+      "to_file": "src/Shop.Core/Utils/Formatting.cs",
+      "kind": "type-ref",
+      "note": "global-using"
+    },
+    {
+      "from_file": "tests/Shop.Tests/UserServiceTests.cs",
+      "to_file": "src/Shop.Core/Services/UserService.cs",
+      "kind": "type-ref"
+    },
+    {
+      "from_file": "tests/Shop.Tests/UserServiceTests.cs",
+      "to_file": "src/Shop.Core/Models/User.cs",
+      "kind": "type-ref"
+    }
+  ],
+  "no_edge": [
+    {
+      "caller": "IsValid",
+      "caller_file": "src/Shop.Core/Models/User.cs",
+      "callee": "IsNullOrWhiteSpace"
+    },
+    {
+      "caller": "Display",
+      "caller_file": "src/Shop.Core/Legacy/User.cs",
+      "callee": "ToUpperInvariant"
+    },
+    {
+      "caller": "Parse",
+      "caller_file": "src/Shop.Core/Legacy/User.cs",
+      "callee": "Trim"
+    },
+    {
+      "caller": "Title",
+      "caller_file": "src/Shop.Core/Utils/Formatting.cs",
+      "callee": "ToUpper"
+    },
+    {
+      "caller": "Title",
+      "caller_file": "src/Shop.Core/Utils/Formatting.cs",
+      "callee": "Substring"
+    },
+    {
+      "caller": "Initials",
+      "caller_file": "src/Shop.Core/Extensions/UserExtensions.cs",
+      "callee": "Substring"
+    },
+    {
+      "caller": "Register",
+      "caller_file": "src/Shop.Core/Services/UserService.cs",
+      "callee": "Add",
+      "note": "bcl-collection"
+    },
+    {
+      "caller": "Find",
+      "caller_file": "src/Shop.Core/Services/UserService.cs",
+      "callee": "FirstOrDefault",
+      "note": "bcl-collection"
+    },
+    {
+      "caller": "Write",
+      "caller_file": "src/Shop.Core/Services/AuditLog.cs",
+      "callee": "WriteLine"
+    },
+    {
+      "caller": "AddLine",
+      "caller_file": "src/Shop.Core/Orders/Order.cs",
+      "callee": "Add",
+      "note": "bcl-collection"
+    },
+    {
+      "caller": "Subtotal",
+      "caller_file": "src/Shop.Core/Orders/Order.Pricing.cs",
+      "callee": "Sum",
+      "note": "bcl-collection"
+    },
+    {
+      "caller": "Tax",
+      "caller_file": "src/Shop.Core/Orders/Order.Pricing.cs",
+      "callee": "Round"
+    },
+    {
+      "caller": "Main",
+      "caller_file": "src/Shop.App/Program.cs",
+      "callee": "WriteLine"
+    },
+    {
+      "caller": "Stamp",
+      "caller_file": "src/Shop.App/Banner.cs",
+      "callee": "ToString"
+    },
+    {
+      "caller": "RegisterAddsUser",
+      "caller_file": "tests/Shop.Tests/UserServiceTests.cs",
+      "callee": "Equal"
+    }
+  ],
+  "notes": {
+    "namespaces-not-folders": "Namespaces deliberately do not follow folders: Models/User.cs is Shop.Domain, Legacy/User.cs is Legacy.Accounts, Utils/Formatting.cs is Shop.Text, Mapping/Mappers.cs is Shop.Mapping, Extensions/ is Shop.Domain, src/Shop.App is Shop.Cli.",
+    "two-users-using": "Two classes named User live in two User.cs files. Mappers.cs is in Shop.Mapping with `using Legacy.Accounts;` and no route to Shop.Domain.User by simple name, so `User` there is Legacy.Accounts.User (Legacy/User.cs) and `legacy.Display()` is its Display.",
+    "enclosing-namespace-wins": "UserService.cs has `using Legacy.Accounts;` yet sits in namespace Shop.Domain.Services. C# name lookup walks the enclosing namespaces (Shop.Domain.Services, then Shop.Domain) before it reaches the compilation unit's using directives, so `User` is Shop.Domain.User (Models/User.cs). A resolver that trusts the using directive picks the wrong file.",
+    "dynamic": "`account` is `dynamic`: the call is bound at run time to whatever object is passed. Both User classes have Display, so both files are plausible. This is the only C# call here whose target the compiler does not fix; the two-User.cs calls above are statically unambiguous for the compiler, just not from file names.",
+    "global-using": "`global using Shop.Text;` (one GlobalUsings.cs per project, each applies to its own project) makes Formatting visible without a per-file using.",
+    "block-namespace": "AuditLog.cs uses a block namespace `namespace Shop.Domain.Services { ... }`; UserService.cs uses the file-scoped form of the same namespace. Same namespace, no using needed.",
+    "extension-method": "`user.Initials()` is the extension method UserExtensions.Initials (namespace Shop.Domain, found by walking enclosing namespaces from Shop.Domain.Services). The IMPORTS row records the dependency on UserExtensions.cs even though the type name is never written.",
+    "partial-class": "Order is partial over Order.cs and Order.Pricing.cs. Subtotal/Tax are declared only in Order.Pricing.cs, AddLine/Total only in Order.cs; a reference to the type Order depends on both files.",
+    "class-not-named-after-file": "Mappers.cs declares UserMapper; there is no UserMapper.cs.",
+    "using-alias": "`using LegacyUser = Legacy.Accounts.User;` so `LegacyUser.Parse` is Legacy/User.cs.",
+    "same-namespace": "Banner is internal in namespace Shop.Cli in the same project as Program.",
+    "qualified-name": "`Shop.Domain.User` written fully qualified (constructor only, no call).",
+    "bcl-collection": "List<T>.Add / LINQ Sum, FirstOrDefault are BCL; must not link to repo functions.",
+    "imports-format": "C# has no file imports: a using directive names a namespace. IMPORTS truth is the file-level dependency the compiler resolves: from_file -> each other in-repo file declaring a type (or extension method) this file references, kind `type-ref`. Using directives alone, with nothing referenced, give no row.",
+    "scope": "Constructor invocations (`new UserService()`, `new User(...)`) are not listed as calls. Properties (`_users.Count`, `Name`) are not calls. .csproj/.sln are not source."
+  }
+}

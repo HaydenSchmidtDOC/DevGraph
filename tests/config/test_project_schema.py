@@ -344,6 +344,25 @@ def test_user_label_cannot_shadow_a_builtin_label_by_case(tmp_path):
         load_project_schema(repo)
 
 
+def test_user_label_cannot_be_the_datastore_cache_label(tmp_path):
+    # The datastore extractor writes Cache nodes (not in NODE_LABELS), with
+    # their own built-in indexes.
+    repo = write_schema(
+        tmp_path,
+        """
+        version: 1
+        node_types:
+          - label: cache
+            key: [slug]
+            metadata:
+              - name: slug
+        """,
+    )
+
+    with pytest.raises(ProjectSchemaError, match="built-in label 'Cache'"):
+        load_project_schema(repo)
+
+
 def test_user_labels_differing_only_by_case_are_rejected(tmp_path):
     repo = write_schema(
         tmp_path,

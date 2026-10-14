@@ -145,8 +145,9 @@ class Service {
     calls_by_pair = {
         (r.from_name, r.to_name): r.properties for r in result.relationships if r.rel_type == "CALLS"
     }
-    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service"}
-    assert calls_by_pair[("freeCall", "helper")] is None
+    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service", "confidence": "resolved"}
+    # A classic script (no import/export): its bare calls keep a by-name edge.
+    assert calls_by_pair[("freeCall", "helper")] == {"confidence": "name"}
 
 
 def test_calls_edge_attributed_to_correct_nested_scope():
@@ -287,10 +288,9 @@ def test_relative_import_resolving_to_repo_root_has_no_dangling_dot_extension():
     assert "index.js" in targets
 
 
-def test_bare_import_resolves_to_node_modules_guess():
+def test_a_bare_import_is_an_external_package_with_no_edge():
     result = extract_js_file("import lodash from 'lodash';\n", "app.js", "test_repo")
-    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "node_modules/lodash" in targets
+    assert [r for r in result.relationships if r.rel_type == "IMPORTS"] == []
 
 
 def test_require_import_resolves_relative_target():
@@ -421,3 +421,64 @@ function Component() {
     result = extract_js_file(source_code, "x.tsx", "test_repo")
     node_names = {(n.label, n.name) for n in result.nodes}
     assert ("Function", "Component") in node_names
+
+
+def _import_targets(source_code: str, path: str) -> set[str]:
+    result = extract_js_file(source_code, path, "test_repo")
+    return {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
+
+
+def test_explicit_js_extension_maps_to_typescript_sources():
+    """TypeScript's NodeNext style names the emitted `.js`; the source is `.ts`/`.tsx`."""
+    targets = _import_targets("import { a } from './util.js';\n", "src/main.ts")
+    assert {"src/util.ts", "src/util.tsx", "src/util.js"} <= targets
+    assert not any(t.startswith("src/util.js.") for t in targets)
+
+
+def test_explicit_extension_require_maps_too():
+    targets = _import_targets("const h = require('./h.js');\n", "lib/app.js")
+    assert {"lib/h.js", "lib/h.ts"} <= targets
+    assert "lib/h.js.js" not in targets
+
+
+def test_explicit_module_extensions_map_to_their_typescript_twins():
+    assert {"esm.mts", "esm.mjs"} <= _import_targets("import x from './esm.mjs';\n", "a.mts")
+    assert {"cjs.cts", "cjs.cjs"} <= _import_targets("const c = require('./cjs.cjs');\n", "a.cts")
+    assert {"view.tsx", "view.jsx"} <= _import_targets("import V from './view.jsx';\n", "a.tsx")
+
+
+def test_explicit_extension_lists_mapped_candidates_then_directory_index():
+    """A directory named like a file (`./lib.js/`) still resolves through its index."""
+    result = extract_js_file("import { a } from './util.js';\n", "main.ts", "test_repo")
+    targets = [r.to_name for r in result.relationships if r.rel_type == "IMPORTS"]
+    assert targets[:3] == ["util.ts", "util.tsx", "util.js"]
+    assert set(targets[3:]) == {f"util.js/index.{ext}" for ext in ("js", "jsx", "ts", "tsx")}
+
+
+def test_query_and_hash_are_stripped_before_resolving():
+    assert {"src/worker.ts", "src/worker.js"} <= _import_targets("import W from './worker.js?worker';\n", "src/a.ts")
+    assert "src/util.ts" in _import_targets("import u from './util#frag';\n", "src/a.ts")
+    assert not any("?" in t or "#" in t for t in _import_targets("import s from './s.css?inline';\n", "a.ts"))
+
+
+def test_a_dotted_basename_without_a_known_extension_still_gets_extensions():
+    targets = _import_targets("import { s } from './user.service';\n", "main.ts")
+    assert "user.service.ts" in targets
+
+
+def test_module_typescript_files_parse_with_the_typescript_grammar():
+    from devgraph.indexer.jsts import extractor
+
+    assert extractor._language_for_extension(".mts") is extractor._TS_LANGUAGE
+    assert extractor._language_for_extension(".cts") is extractor._TS_LANGUAGE
+    assert extractor._language_for_extension(".mjs") is extractor._JS_LANGUAGE
+    assert extractor._language_for_extension(".cjs") is extractor._JS_LANGUAGE
+    result = extract_js_file("export function plain(x) {\n  return x;\n}\n", "a.mjs", "test_repo")
+    assert ("Function", "plain") in {(n.label, n.name) for n in result.nodes}
+
+
+def test_module_suffixes_are_routed_to_the_js_extractor():
+    from devgraph.indexer.dispatch import _CODE_ROUTES
+
+    for suffix in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"):
+        assert _CODE_ROUTES[suffix] == "js", suffix

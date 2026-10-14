@@ -25,15 +25,16 @@ import threading
 import webbrowser
 from datetime import datetime, timezone
 
-import pystray
 import uvicorn
 from PIL import Image, ImageDraw
 
 from devgraph.agent.schema_rescan import SchemaRescanScheduler
+from devgraph.agent.shutdown import shutdown
 from devgraph.agent.sync import RepoSync
 from devgraph.analytics.insights import InsightsScheduler
 from devgraph.config import get_settings
 from devgraph.dashboard.app import build_app
+from devgraph.dashboard.serving import DashboardFailure, serve_dashboard
 from devgraph.dashboard.url import dashboard_url
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.graph.engine import GraphEngine
@@ -42,6 +43,27 @@ from devgraph.registry.store import RepoRegistry
 from devgraph.watcher.manager import WatcherManager
 
 logger = logging.getLogger(__name__)
+
+try:
+    import pystray
+except Exception as _exc:  # no display (Xlib DisplayNameError), or no tray backend for this desktop
+    pystray = None
+    _PYSTRAY_PROBLEM: str | None = f"{type(_exc).__name__}: {_exc}"
+else:
+    _PYSTRAY_PROBLEM = None
+
+#: Typographic characters the tray's own text uses, spelled in ASCII.
+_ASCII_PUNCTUATION = str.maketrans({"…": "...", "—": "-", "–": "-", "‘": "'", "’": "'", "“": '"', "”": '"'})
+
+
+def pystray_text(text: str) -> str:
+    """`text` made safe for every pystray backend: pystray's X11 backend
+    encodes the icon title as latin-1 and raised UnicodeEncodeError on the
+    ellipsis in "preparing graph indexes…", killing the tray on start. Common
+    punctuation becomes its ASCII spelling; anything else outside latin-1
+    becomes "?". Every string handed to pystray goes through here."""
+    return text.translate(_ASCII_PUNCTUATION).encode("latin-1", "replace").decode("latin-1")
+
 
 _OK_COLOR = (46, 160, 67)
 _WARN_COLOR = (200, 60, 60)
@@ -102,9 +124,12 @@ class TrayApp:
             on_changes=self._sync.on_changes,
             on_git_state_changed=self._on_git_state_changed,
             on_catch_up=self._sync.on_catch_up,
+            on_removed=self._sync.on_removed,
         )
         self._paused = False
         self._healthy = True
+        self._schema_ready = False
+        self._preparing = False
         self._stop_event = threading.Event()
         self._icon: pystray.Icon | None = None  # type: ignore[valid-type]
         self._last_seen_registry_change = self._registry.last_changed_at()
@@ -115,6 +140,7 @@ class TrayApp:
         self._insights = InsightsScheduler(self._engine, self._registry, on_refreshed=self._on_insights_refreshed)
         self._dashboard_loop: asyncio.AbstractEventLoop | None = None
         self._dashboard_server: uvicorn.Server | None = None
+        self._dashboard_problem: DashboardFailure | None = None
         self._dashboard_thread: threading.Thread | None = None
 
     def _on_schema_rescanned(self, repo_id: str, files: int) -> None:
@@ -170,17 +196,56 @@ class TrayApp:
         except Exception:
             logger.warning("git history sync failed for %s", repo_id, exc_info=True)
 
+    def _provision_schema(self) -> None:
+        """Create the built-in constraints and indexes and wait until they are
+        built (`GraphEngine.init_schema`), so an upgraded database has its
+        lookup indexes before the first catch-up. Retried by the health check
+        while it fails."""
+        try:
+            self._engine.init_schema()
+            self._schema_ready = True
+        except Exception:
+            if self._stop_event.is_set():
+                return  # the engine refuses new sessions once shutdown closes it
+            logger.warning("could not provision the graph schema; retrying when Neo4j is reachable", exc_info=True)
+
+    def _start_watching(self) -> None:
+        """Provision the graph indexes and wait for them, then start the
+        watcher and the schedulers. Run on its own thread from `start`, so
+        an upgrade's index build (up to minutes) never holds up the tray
+        icon and its Quit."""
+        try:
+            self._provision_schema()
+        finally:
+            self._preparing = False
+        if self._stop_event.is_set():
+            return
+        if not self._paused:
+            self._watcher.start()
+        self._schema_rescans.start()
+        self._insights.start()
+        self._refresh_icon()
+
     def _health_check_loop(self) -> None:
+        # Beat once before the first Neo4j check, which can take a while
+        # (driver retries): `devgraph tray start` waits for this to say OK.
+        self._write_heartbeat()
         while not self._stop_event.is_set():
             try:
                 self._engine.verify_connectivity()
                 recovered = not self._healthy
                 self._healthy = True
+                if not self._schema_ready and not self._preparing:
+                    self._provision_schema()
                 if recovered:
                     self._sync.retry_failed()
             except Exception:
+                if self._stop_event.is_set():
+                    break  # the engine refuses new sessions once shutdown closes it
                 logger.warning("Neo4j health check failed", exc_info=True)
                 self._healthy = False
+            if self._stop_event.is_set():
+                break
             # Each of these is individually guarded: a failure in any one
             # (e.g. a registry read race, a watcher issue-scan error, or a
             # pystray icon mutation) must not escape this daemon thread and
@@ -268,15 +333,19 @@ class TrayApp:
             return
         color = _OK_COLOR if self._healthy else _WARN_COLOR
         self._icon.icon = _make_icon(color)
-        self._icon.title = self._status_text()
+        self._icon.title = pystray_text(self._status_text())
 
     def _status_text(self) -> str:
-        if self._paused:
+        if self._preparing:
+            state = "preparing graph indexes..."
+        elif self._paused:
             state = "paused"
         elif not self._healthy:
             state = "warning"
         else:
             state = "catching up" if self._sync.running else "ok"
+        if self._dashboard_problem is not None:
+            state = f"{state}; {self._dashboard_problem.summary}"
         return f"DevGraph ({state})"
 
     def _toggle_pause(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
@@ -284,8 +353,10 @@ class TrayApp:
         self._sync.stopping = self._paused
         try:
             if self._paused:
+                # Waits up to STOP_WAIT_S (3 s) for a running batch or
+                # catch-up, so the menu can block that long.
                 self._watcher.stop()
-            else:
+            elif not self._preparing:  # else _start_watching starts it, once the indexes are built
                 self._watcher.start()
         except Exception:
             # A watcher start/stop failure (e.g. a repo path vanished) must
@@ -330,12 +401,19 @@ class TrayApp:
             loop="asyncio",
             log_level="critical",
             access_log=False,
+            # An open /api/events stream ends when shutdown closes the
+            # broadcaster; this bounds any other connection still open.
+            timeout_graceful_shutdown=1,
         )
         server = uvicorn.Server(config)
         self._dashboard_server = server
         try:
             logger.info("dashboard on %s", dashboard_url(self._settings))
-            loop.run_until_complete(server.serve())
+            self._dashboard_problem = serve_dashboard(server, loop)
+            if self._dashboard_problem is not None:
+                # A port another program holds: said once, and shown on the icon.
+                logger.warning("%s", self._dashboard_problem.detail)
+                self._refresh_icon()
         except Exception:
             # Additive feature: a bind failure (port already in use, another
             # instance already running, etc.) must not take down the
@@ -352,19 +430,16 @@ class TrayApp:
     def _quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
         self._stop_event.set()
         self._sync.stopping = True
-        self._watcher.stop()
-        self._schema_rescans.stop()
-        self._insights.stop()
-        if self._dashboard_server is not None:
-            self._dashboard_server.should_exit = True
-            if self._dashboard_thread is not None:
-                self._dashboard_thread.join(timeout=5)
         # Best-effort teardown: a failure closing the engine/registry must
         # not prevent the tray icon from stopping (which would leave a
         # zombie tray process the PID file still points at). Each close is
         # guarded so one failure doesn't mask the others.
         try:
-            self._engine.close()
+            shutdown(
+                self._engine, self._watcher, self._schema_rescans, self._insights,
+                dashboard_server=self._dashboard_server, dashboard_thread=self._dashboard_thread,
+                events=self._events,
+            )
         except Exception:
             logger.warning("error closing graph engine on quit", exc_info=True)
         try:
@@ -374,9 +449,8 @@ class TrayApp:
         icon.stop()
 
     def start(self) -> None:
-        self._watcher.start()
-        self._schema_rescans.start()
-        self._insights.start()
+        self._preparing = True
+        threading.Thread(target=self._start_watching, daemon=True).start()
         health_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         health_thread.start()
 
@@ -385,25 +459,27 @@ class TrayApp:
             self._dashboard_thread.start()
 
         menu = pystray.Menu(
-            pystray.MenuItem(lambda item: self._status_text(), self._open_dashboard),
+            pystray.MenuItem(lambda item: pystray_text(self._status_text()), self._open_dashboard),
             pystray.MenuItem(
-                lambda item: "Resume watching" if self._paused else "Pause watching",
+                lambda item: pystray_text("Resume watching" if self._paused else "Pause watching"),
                 self._toggle_pause,
             ),
-            pystray.MenuItem("Quit", self._quit),
+            pystray.MenuItem(pystray_text("Quit"), self._quit),
         )
-        self._icon = pystray.Icon("devgraph", _make_icon(_OK_COLOR), "DevGraph", menu)
+        self._icon = pystray.Icon("devgraph", _make_icon(_OK_COLOR), pystray_text(self._status_text()), menu)
         try:
             if self._icon:
                 self._icon.run()
         except Exception:
             logger.critical("pystray event loop crashed", exc_info=True)
+            self._stop_event.set()
             self._sync.stopping = True
-            self._watcher.stop()
-            self._schema_rescans.stop()
-            self._insights.stop()
             try:
-                self._engine.close()
+                shutdown(
+                    self._engine, self._watcher, self._schema_rescans, self._insights,
+                    dashboard_server=self._dashboard_server, dashboard_thread=self._dashboard_thread,
+                    events=self._events,
+                )
             except Exception:
                 logger.warning("error closing graph engine after crash", exc_info=True)
             try:
@@ -414,6 +490,15 @@ class TrayApp:
 
 def main() -> None:
     _configure_logging()
+    if pystray is None:
+        # No display or no tray backend (a server, an SSH session, a desktop
+        # without a tray): run the same agent without an icon rather than
+        # failing. `devgraph tray stop` stops it the same way (SIGTERM).
+        from devgraph.agent import headless
+
+        logger.warning("no system tray available (%s); running the headless agent instead", _PYSTRAY_PROBLEM)
+        headless.main()
+        return
     try:
         TrayApp().start()
     except Exception:

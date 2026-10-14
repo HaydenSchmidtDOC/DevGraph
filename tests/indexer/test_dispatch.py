@@ -95,14 +95,10 @@ class TestIndexPaths:
             engine.delete_repository(repo_id)
 
     def test_reindexing_a_file_also_refreshes_its_direct_importers(self, engine, temp_repo):
-        """Renaming a function in file A must update file B's CALLS edge even
-        though only A was passed to index_paths — B is a direct importer of
-        A (via an IMPORTS edge already in the graph), so it should be
-        transparently pulled into the same reindex batch.
-
-        Without this, upsert_relationship's MATCH-MATCH semantics mean B's
-        stale CALLS edge to the old function name just silently never
-        re-resolves until B itself is edited or a full rescan runs.
+        """Renaming a function in file A must drop file B's CALLS edge to it
+        even though only A was passed to index_paths: the old function's node
+        goes with A's re-index, taking B's edge with it, so B needs no
+        re-index of its own.
         """
         repo_id = "_smoketest_dispatch_reverse_deps"
         a_file = temp_repo / "a.py"
@@ -888,15 +884,15 @@ _SCAN_AND_EXPORT = textwrap.dedent(
 )
 
 
-class _NoImportersEngine:
-    def find_importing_modules(self, repo_id, module_name):
-        return []
-
+class _UnitEngine:
     def list_file_nodes(self, repo_id, files):
         return set()
 
     def read_applied_schema(self, repo_id):
         return None
+
+    def update_skipped_files(self, repo_id, add=None, drop=(), replace=False):
+        pass
 
 
 class TestDeterministicIndexOrder:
@@ -914,7 +910,7 @@ class TestDeterministicIndexOrder:
             return 1
 
         monkeypatch.setattr(dispatch, "_index_single_path", record)
-        index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {temp_repo / rel for rel in _ORDER_FIXTURE})
+        index_paths(_UnitEngine(), "_unit_order", temp_repo, {temp_repo / rel for rel in _ORDER_FIXTURE})
 
         assert seen == sorted(_ORDER_FIXTURE)
 
@@ -959,7 +955,7 @@ class TestDeterministicIndexOrder:
         with monkeypatch.context() as m:
             m.chdir(temp_repo)
             # As raw strings "/tmp/.../b.py" sorts before "a.py".
-            index_paths(_NoImportersEngine(), "_unit_order", temp_repo, {Path("a.py"), (temp_repo / "b.py").resolve()})
+            index_paths(_UnitEngine(), "_unit_order", temp_repo, {Path("a.py"), (temp_repo / "b.py").resolve()})
 
         assert seen == ["a.py", "b.py"]
 
@@ -1343,7 +1339,7 @@ class TestFieldKeyedDocsApply:
         spec, files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
         engine.extracted_entries = lambda repo_id, extractor, labels: {("Adr", "ADR-1", "decisions/adr-1.md")}
-        engine.list_file_nodes = lambda repo_id, files: {("Adr", "ADR-1")}
+        engine.list_file_nodes = lambda repo_id, files: {("Adr", "ADR-1", "decisions/adr-1.md")}
         copy = "decisions/adr-1 copy.md"
         batch = dispatch._read_docs_batch(engine, "demo", temp_repo, spec, {copy: files[copy]}, set())
         assert sorted(batch.selected) == ["decisions/adr-1 copy.md", "decisions/adr-1.md"]
@@ -1432,7 +1428,7 @@ def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
     outside = tmp_path / "outside.py"
     outside.write_text("y = 2\n")
     # As a junction to `outside` would be walked: linked, so keyed by its resolved target.
-    monkeypatch.setattr(walk, "_walk", lambda root: iter([(repo / "a.py", "a.py", False), (outside, "j/outside.py", True)]))
+    monkeypatch.setattr(walk, "_walk", lambda root, unreadable=None: iter([(repo / "a.py", "a.py", False), (outside, "j/outside.py", True)]))
     removed = []
     monkeypatch.setattr(dispatch, "remove_paths", lambda engine, repo_id, root, paths: removed.append(paths) or len(paths))
 
@@ -1449,5 +1445,172 @@ def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
         def delete_bare_modules(self, repo_id):
             return 0
 
+        def delete_bare_class_stubs(self, repo_id):
+            return 0
+
     assert dispatch.prune_stale_files(FakeEngine(), "r", repo) == 1
     assert removed == [{repo / "gone.py"}]
+
+
+def test_name_refs_are_compact():
+    """A Module's name_refs hold each by-name edge once, as a short string, in
+    a fixed order: no keys, no repo id, far smaller than the edge dicts. A
+    call resolved to several candidate files is one entry listing them."""
+    import json
+    import random
+
+    from devgraph.indexer.common import name_ref_properties
+    from devgraph.indexer.python.extractor import extract_python_file
+
+    # A fixed module: 40 functions, each with a bare-name call, a call
+    # resolved through an import, a same-file call and a builtin's method.
+    source = "import os\nfrom pkg import util\n\n\nclass Child(Base):\n    pass\n\n" + "".join(
+        f"\ndef f{i}():\n    obj.helper{i % 7}()\n    util.run{i % 3}()\n    f{(i + 1) % 40}()\n"
+        f"    return os.path.join('a')\n\n"
+        for i in range(40)
+    )
+    repo_id = "zz-compact-repo"
+    rels = [r.to_dict() for r in extract_python_file(source, "pkg/fixture.py", repo_id).relationships]
+    props = name_ref_properties(rels)
+    refs = props["name_refs"]
+    # One entry per bare-name call and one per resolved call (the same-file
+    # calls are not by-name, and `join` on an untyped value links nothing),
+    # plus the 12 import candidates and the EXTENDS.
+    assert len(refs) == 93 and refs == sorted(set(refs))
+    assert not any("{" in entry or repo_id in entry for entry in refs)
+    # The stored size: each string's UTF-8 bytes (JSON would escape every separator as \u001f).
+    stored = sum(len(entry.encode()) for values in props.values() for entry in values)
+    assert stored < 20_000 and stored * 5 < len(json.dumps(rels))
+    shuffled = list(rels)
+    random.Random(7).shuffle(shuffled)
+    assert name_ref_properties(shuffled) == props
+
+
+def _rel(to_name, to_file=None, origin="app.py", **properties):
+    return {
+        "from_label": "Function", "from_name": "main", "from_file": "app.py", "rel_type": "CALLS",
+        "to_label": "Function", "to_name": to_name, "repo_id": "r", "to_file": to_file, "origin": origin,
+        "properties": properties or None,
+    }
+
+
+def test_name_refs_record_cross_file_pins_once_per_target_name():
+    from devgraph.indexer.common import name_ref_properties, parse_name_ref
+
+    refs = name_ref_properties([
+        _rel("f", "pkg/__init__.py", confidence="resolved", caller_class="C"),
+        _rel("f", "pkg/", confidence="package", caller_class="C"),
+        _rel("f", "pkg.py", confidence="resolved", caller_class="C"),
+        _rel("local", "app.py", confidence="resolved"),  # the writer's own file: nothing can add it
+        _rel("stub", ""),  # the file-less node, from a pinned source
+        _rel("g", confidence="name"),
+    ])["name_refs"]
+    parsed = sorted(parse_name_ref(entry) for entry in refs)
+    assert parsed == [
+        # Each pin's confidence is its kind's, not one value for the entry.
+        (["CALLS", "Function", "main", "app.py", "Function", "f", "C"], ["pkg.py", "pkg/", "pkg/__init__.py"],
+         "pin"),
+        (["CALLS", "Function", "main", "app.py", "Function", "g", ""], None, "name"),
+    ]
+
+
+def test_name_refs_keep_a_fileless_pin_apart_from_unpinned():
+    from devgraph.indexer.common import name_ref_properties, parse_name_ref
+
+    unpinned_source = {**_rel("Display", ""), "from_label": "Class", "from_name": "Foo", "from_file": None}
+    (entry,) = name_ref_properties([unpinned_source])["name_refs"]
+    assert parse_name_ref(entry) == (["CALLS", "Class", "Foo", "", "Function", "Display", ""], [""], "")
+
+
+def test_a_legacy_name_ref_entry_parses_as_unpinned():
+    from devgraph.indexer.common import NAME_REF_SEP, parse_name_ref
+
+    legacy = NAME_REF_SEP.join(["CALLS", "Function", "main", "a.py", "Function", "helper", "Svc"])
+    assert parse_name_ref(legacy) == (["CALLS", "Function", "main", "a.py", "Function", "helper", "Svc"], None, "")
+
+
+def test_a_directory_pin_is_tested_before_the_fileless_pin():
+    from devgraph.graph.engine import _end_match, _group_rels_by_triple, _pin
+
+    assert [_pin(f) for f in (None, "", "pkg/", "pkg/a.py")] == ["name", "fileless", "prefix", "file"]
+    groups = _group_rels_by_triple([_rel("f", "pkg/a.py"), {**_rel("f", "pkg/"), "exclude": ["pkg/a.py"]}])
+    assert {key[4] for key in groups} == {"file", "prefix"}
+    (prefix_row,) = groups[("Function", "CALLS", "Function", "file", "prefix")]
+    assert prefix_row["targets"] == [{
+        "to_name": "f", "to_file": "pkg/", "pin": {"k": "prefix", "v": "pkg/", "ns": "", "os": [], "nv": [], "nr": []},
+        "ex_files": ["pkg/a.py"], "ex_pins": [],
+    }]
+    match = _end_match("b", "Function", "to", "prefix", "t")
+    # A prefix range of the file-keyed index (S10 fan-in); a suffix pin seeks by name.
+    assert "USING INDEX SEEK b:Function(repo_id, name, file)" in match and "b.file STARTS WITH t.pin.v" in match
+    assert "USING INDEX SEEK b:Function(repo_id, name) " in _end_match("b", "Function", "to", "suffix", "t")
+    assert "WHEN 'prefix' THEN b.file STARTS WITH t.pin.v" in match
+    assert "NOT b.file IN t.ex_files" in match and "NOT any(x IN t.ex_pins WHERE" in match
+
+
+def test_edges_out_of_one_source_share_a_row():
+    from devgraph.graph.engine import _group_rels_by_triple
+
+    rels = [_rel(name, f"lib/{name}.py", confidence="resolved") for name in ("f", "g")]
+    rels += [_rel("h", "lib/h.py", confidence="package"), {**_rel("f", "lib/f.py"), "from_name": "other"}]
+    (rows,) = _group_rels_by_triple(rels).values()
+    assert [(row["from_name"], row["properties"], [t["to_name"] for t in row["targets"]]) for row in rows] == [
+        ("main", {"confidence": "resolved"}, ["f", "g"]),
+        ("main", {"confidence": "package"}, ["h"]),
+        ("other", {}, ["f"]),
+    ]
+
+
+def test_a_source_end_pinned_to_a_package_directory_is_refused():
+    import pytest as _pytest
+
+    from devgraph.graph.engine import _group_rels_by_triple
+
+    with _pytest.raises(ValueError, match="source end"):
+        _group_rels_by_triple([{**_rel("f"), "from_file": "pkg/"}])
+
+
+@pytest.mark.parametrize("module", ["devgraph.indexer.python.extractor", "devgraph.indexer.common"])
+def test_an_indexer_module_imports_first_in_a_fresh_interpreter(module):
+    import subprocess
+    import sys
+
+    done = subprocess.run([sys.executable, "-c", f"import {module}"], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_a_save_while_the_indexes_build_fails_its_batch_instead_of_skipping_the_file(
+    engine, temp_repo, monkeypatch, deleted
+):
+    """A hinted query fails outright while its index is POPULATING. If that
+    outlasts the wait, the batch must fail (so it is retried and never
+    stamped), not log and skip the file as a per-file failure would."""
+    import neo4j
+
+    import devgraph.graph.engine as engine_module
+
+    repo_id = "_smoketest_dispatch_index_building" + ("_rm" if deleted else "")
+    source = temp_repo / "a.py"
+    source.write_text("def f():\n    return 1\n")
+    try:
+        full_scan(engine, repo_id, temp_repo)
+        source.write_text("def g():\n    return 1\n")
+        if deleted:
+            source.unlink()
+        monkeypatch.setattr(engine_module, "INDEX_WAIT_S", 0.0)
+        for cls in (neo4j.ManagedTransaction, neo4j.Session):
+            def run(self, query, *args, _original=cls.run, **kwargs):
+                if "USING INDEX SEEK" in query:
+                    raise neo4j.exceptions.ClientError("Failed to fulfil the hints of the query.")
+                return _original(self, query, *args, **kwargs)
+
+            monkeypatch.setattr(cls, "run", run)
+        with pytest.raises(engine_module.IndexesNotReady):
+            if deleted:
+                remove_paths(engine, repo_id, temp_repo, {source})
+            else:
+                index_paths(engine, repo_id, temp_repo, {source})
+    finally:
+        monkeypatch.undo()
+        engine.delete_repository(repo_id)

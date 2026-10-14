@@ -340,7 +340,8 @@ def _with_repo_default(
     the wrapper's signature is `fn`'s with every parameter keyword-only (MCP always calls by
     keyword) and `repo_id: str | None = None`; nothing else in the tool's schema changes.
 
-    An explicit `repo_id` (anything but None) calls `fn` untouched and returns its result as is.
+    An explicit `repo_id` (anything but None) must be registered (else the ToolError
+    "no such repo_id"); `fn` is then called untouched and its result returned as is.
     Omitted or None: one `list_repos(active_only=True)` read; if the session repository is in
     it, `fn` runs against it and a dict result gains `repo_id` and a notice. With no session
     repository `unscoped_error(active_repos)` is raised, and with one no longer active
@@ -359,6 +360,7 @@ def _with_repo_default(
     @functools.wraps(fn)
     def wrapper(**kwargs: Any) -> Any:
         if kwargs.get("repo_id") is not None:
+            devgraph_tools._registered(registry, kwargs["repo_id"])
             return fn(**kwargs)
         active = registry.list_repos(active_only=True)
         if session_repo is None:
@@ -374,6 +376,38 @@ def _with_repo_default(
         return result
 
     wrapper.__signature__ = signature.replace(parameters=parameters)  # type: ignore[attr-defined]
+    return wrapper
+
+
+CROSS_REPO_DISABLED = (
+    "cross_repo is disabled: results from other repositories are off unless the user sets "
+    "DEVGRAPH_ALLOW_CROSS_REPO=true for the DevGraph MCP server. Call again without cross_repo "
+    "to answer for this repository."
+)
+
+
+def _with_cross_repo_gate(fn: Callable[..., Any], allow: bool, registry: Any) -> Callable[..., Any]:
+    """Enforce `Settings.allow_cross_repo` on a built-in that takes `cross_repo`.
+
+    `cross_repo=True` raises the ToolError `CROSS_REPO_DISABLED` while the setting
+    is off; `fn` never runs. With it on, `fn` runs with `tools.cross_repo_ids` set to
+    every active registered repository's id (the dashboard's All Repos set), so a cross-repo query never reaches a
+    repository left in the graph after it was unregistered. Calls without
+    `cross_repo` pass through untouched. MCP always calls by keyword.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if not kwargs.get("cross_repo"):
+            return fn(*args, **kwargs)
+        if not allow:
+            raise ToolError(CROSS_REPO_DISABLED)
+        token = devgraph_tools.cross_repo_ids.set([r.repo_id for r in registry.list_repos(active_only=True)])
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            devgraph_tools.cross_repo_ids.reset(token)
+
     return wrapper
 
 
@@ -463,7 +497,11 @@ def build_server(
         return lambda fn: register(
             _instrument(
                 _with_shadow_notices(
-                    _with_repo_default(fn, session_repo, session_source, registry, unscoped_error),
+                    _with_cross_repo_gate(
+                        _with_repo_default(fn, session_repo, session_source, registry, unscoped_error),
+                        settings.allow_cross_repo,
+                        registry,
+                    ),
                     lambda: status.shadowed,
                 )
             )
@@ -479,8 +517,15 @@ def build_server(
         max_results: int = 15,
         modified_within_commits: int | None = None,
     ) -> dict[str, Any]:
-        """Search for components by name/description; returns {count, results, truncated}.
-        Pass modified_within_commits to restrict to components touched within the last
+        """Search for components by name/description; returns {count, results, truncated},
+        each result with name, labels, repo_id, description and file. Ranked: exact name,
+        then name prefix, then name substring, then description only. count is the true
+        number of matches, unless count_is_lower_bound is true (exact and prefix matches
+        alone filled max_results). max_results is capped at 200. A snake_case query such as
+        user_service also matches as a whole word. An exact name in unusual case (gEt for
+        get) is found by the substring scan, so it can be missed when exact and prefix
+        matches alone fill max_results. A route's file-less handler stub is left out when a
+        real node has its name. Pass modified_within_commits to restrict to components touched within the last
         N commits repo-wide (requires git-history recency staging; entities never staged
         are excluded, not silently included).
         Also searches node types the repository's devgraph.schema.yaml declares (for
@@ -500,7 +545,14 @@ def build_server(
         """Return the most-connected nodes in the graph — the core abstractions
         a new agent should look at first to orient itself in an unfamiliar repo.
         Returns {count, results, truncated} with degree (number of direct relationships)."""
-        return devgraph_tools.god_nodes(engine, repo_id, cross_repo, max_results)
+        return devgraph_tools.god_nodes(
+            engine, repo_id, cross_repo, max_results,
+            declared_labels=(
+                devgraph_tools.all_declared_node_labels(registry)
+                if cross_repo
+                else devgraph_tools.declared_node_labels(registry, repo_id)
+            ),
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def find_dependency_cycles(
@@ -531,7 +583,7 @@ def build_server(
         {community, label, size, top_members}. top_members (highest PageRank first) is
         filled for the communities within max_results. Errors if graph insights have
         never been computed for the repository (the agent computes them after indexing)."""
-        return devgraph_tools.find_communities(engine, repo_id, max_results, members_per_community)
+        return devgraph_tools.find_communities(engine, registry, repo_id, max_results, members_per_community)
 
     @server.tool(annotations=_READ_ONLY)
     def key_nodes(
@@ -546,7 +598,7 @@ def build_server(
         CALLS edges are resolved by name, so widely used generic method names (such as get or
         close) can rank high.
         Errors if graph insights have never been computed for the repository."""
-        return devgraph_tools.key_nodes(engine, repo_id, metric, max_results)
+        return devgraph_tools.key_nodes(engine, registry, repo_id, metric, max_results)
 
     @server.tool(annotations=_READ_ONLY)
     def list_recent_changes(
@@ -559,19 +611,24 @@ def build_server(
         """List entities touched within the last N commits repo-wide, most-recently-modified
         first; returns {count, results, truncated}. Requires git-history recency staging —
         entities never staged with last_modified_at are excluded. entity_type optionally
-        restricts to one node label (validated against NODE_LABELS)."""
+        restricts to one node label (validated against NODE_LABELS). within_commits must
+        be at least 1."""
         return devgraph_tools.list_recent_changes(
             engine, repo_id, within_commits, entity_type, cross_repo, max_results
         )
 
     @server.tool(annotations=_READ_ONLY)
     def trace_request_flow(repo_id: str, start_endpoint: str, cross_repo: bool = False) -> dict[str, Any]:
-        """Trace the request flow from an endpoint through services, datastores, and queues."""
+        """Trace the request flow from an endpoint through services, datastores, and queues
+        (every node within five hops). start_endpoint is an endpoint name like
+        "GET /users/<id>", or a bare path like "/users/<id>" to start from that path's
+        endpoint for every method. An unknown endpoint is an error with similar names."""
         return devgraph_tools.trace_request_flow(engine, repo_id, start_endpoint, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
     def get_service_dependencies(repo_id: str, service_name: str, cross_repo: bool = False) -> dict[str, Any]:
-        """Get all dependencies (services, datastores, queues) for a given service."""
+        """Get all dependencies (services, datastores, queues) for a given service. An
+        unknown service is an error with similar names."""
         return devgraph_tools.get_service_dependencies(engine, repo_id, service_name, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
@@ -582,16 +639,23 @@ def build_server(
         max_results: int = 15,
         scope_to_class: str | None = None,
         modified_within_commits: int | None = None,
+        resolved_only: bool = False,
     ) -> dict[str, Any]:
-        """Find all callers of a target; returns {count, results, truncated}. CALLS is
-        name-based, not type-resolved — pass scope_to_class to narrow to callers made
-        from within a specific class's own methods and cut noise from unrelated
-        same-named methods elsewhere in the repo. Pass modified_within_commits to
-        restrict to targets touched within the last N commits repo-wide (requires
-        git-history recency staging; entities never staged are excluded, not silently
-        included)."""
+        """Find all callers of a target; returns {count, results, truncated}, each caller
+        with its name, type, repo_id, file and confidence, most certain first. Calls
+        in every language are resolved through the caller's scope, imports and types:
+        confidence "resolved" (callee in a file the caller names), "package" (in a
+        file the caller's imports reach less exactly, e.g. under an imported package
+        or a class file found by suffix) or "name" (a method on an untyped receiver,
+        matched by name only). Pass resolved_only to keep only "resolved"/"package"
+        callers, or scope_to_class to narrow to callers made from within a specific
+        class's own methods. Pass
+        modified_within_commits to restrict to targets touched within the last N
+        commits repo-wide (requires git-history recency staging; entities never staged
+        are excluded, not silently included)."""
         return devgraph_tools.find_callers(
-            engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits
+            engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits,
+            resolved_only,
         )
 
     @server.tool(annotations=_READ_ONLY)
@@ -606,12 +670,26 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def compare_branches(repo_id: str, branch_a: str, branch_b: str) -> dict[str, Any]:
-        """Compare architecture between two branches. Stub until git metadata is fully wired (Phase 3)."""
-        return devgraph_tools.compare_branches(engine, repo_id, branch_a, branch_b)
+        """What changed on branch_b (the head) since it diverged from branch_a (the base),
+        compared from their merge base like `git diff branch_a...branch_b` (what a pull
+        request from branch_b into branch_a shows). Both refs (branch, tag, SHA, HEAD~2...)
+        must exist locally; never fetches. Lists the changed files (added, removed,
+        modified, exact-content renamed) and, for Python, JS/TS, C#, C++, Java, Rust,
+        Kotlin and Go files, the functions and classes added, removed and changed, with
+        line numbers. Capped (200 files, 50 symbols per list, 1,000 symbols, 16 MiB
+        parsed, 20 s); `truncated` and `truncated_reasons` say when a cap was hit.
+        impacted_callers are the graph's callers of the changed and removed symbols,
+        from the last index of the working tree, not from either ref: read them as a
+        hint. The merge-base step has a timeout on POSIX only. files and
+        impacted_callers are {count, results, truncated}."""
+        return devgraph_tools.compare_branches(engine, registry, repo_id, branch_a, branch_b)
 
     @server.tool(annotations=_READ_ONLY)
     def impact_analysis(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Analyze component impact; dependents wrapped in {count, results, truncated} envelopes."""
+        """Analyze component impact: direct dependents (one CALLS/USES/DEPENDS_ON hop) and
+        transitive ones (two to four hops; further ones are not followed). Dependents
+        wrapped in {count, results, truncated} envelopes. An unknown component is an
+        error with similar names."""
         return devgraph_tools.impact_analysis(engine, repo_id, component_name, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
@@ -622,10 +700,16 @@ def build_server(
         cross_repo: bool = False,
         max_results: int = 15,
     ) -> dict[str, Any]:
-        """Analyze the combined impact of every component changed between two git refs
-        (e.g. a PR's base/head branches). Composes a local git diff with the same
-        dependent-tracing impact_analysis uses, across every changed component at once.
-        Both refs must already exist locally — never fetches from a remote. Dependents
+        """What a change between two local git refs could break. Compares head_ref with
+        its merge base with base_ref, like `git diff base_ref...head_ref` (what a pull
+        request shows), as compare_branches does, and lists the functions and classes
+        added, changed and removed (added_symbols, changed_symbols, removed_symbols).
+        Dependents of the changed and removed ones are traced, direct (one
+        CALLS/USES/DEPENDS_ON hop) and transitive (two to four hops); added ones have no
+        dependents yet. A changed code file whose symbols weren't diffed (past the
+        200-file cap, unreadable, or renamed) counts every indexed symbol in it, with a
+        notice; a changed symbol the index doesn't have is named in a notice. Never fetches; same ref rules and caps as
+        compare_branches. Dependents come from the last index of the working tree and are
         wrapped in {count, results, truncated} envelopes."""
         return devgraph_tools.impact_analysis_for_diff(
             engine, registry, repo_id, base_ref, head_ref, cross_repo, max_results
@@ -643,7 +727,8 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def explain_decision(repo_id: str, decision_name: str, cross_repo: bool = False) -> dict[str, Any]:
-        """Explain a design decision: its rationale, what it documents, and what it supersedes."""
+        """Explain a design decision: its rationale, what it documents, and what it supersedes.
+        An unknown decision name is an error with similar names."""
         return devgraph_tools.explain_decision(engine, repo_id, decision_name, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
@@ -667,8 +752,12 @@ def build_server(
     ) -> dict[str, Any]:
         """Find Documents mentioning an entity or what a Document mentions; returns {count, results, truncated}.
         direction="mentioned_by" (default): find Documents mentioning the entity named name.
-        direction="mentions": find what the Document at repo-relative path name mentions."""
-        return devgraph_tools.find_mentions(engine, repo_id, name, label, direction, cross_repo, max_results)
+        direction="mentions": find what the Document at repo-relative path name mentions.
+        With the repository's mentions indexing off, the envelope is empty and a `notice`
+        says how to enable it."""
+        return devgraph_tools.find_mentions(
+            engine, repo_id, name, label, direction, cross_repo, max_results, registry
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def blame_component(repo_id: str, component_name: str, cross_repo: bool = False) -> list[dict[str, Any]]:
@@ -678,22 +767,29 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def find_related_prs(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Find related PRs; returns {count, results, truncated}. Falls back to gh CLI
-        when PR ingestion is not configured."""
+        """Find related PRs; returns {count, results, truncated}. With the repository's PR
+        ingestion off, the envelope is empty and a `notice` says how to enable it (never
+        contacts the network)."""
         return devgraph_tools.find_related_prs(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
     def issue_history_for(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Find issue history; returns {count, results, truncated}. Falls back to gh CLI
-        when issue ingestion is not configured."""
+        """Find issue history; returns {count, results, truncated}. With the repository's
+        issue ingestion off, the envelope is empty and a `notice` says how to enable it
+        (never contacts the network)."""
         return devgraph_tools.issue_history_for(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
-    def get_source(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
+    def get_source(
+        repo_id: str, component_name: str, cross_repo: bool = False, file: str | None = None
+    ) -> dict[str, Any]:
         """Fetch a Function or Class's actual source text and full docstring (when present),
         using the graph's last-indexed line range. Reads live from disk — rescan first if
-        the file may have changed since the last index."""
-        return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo)
+        the file may have changed since the last index. When several nodes share the name,
+        returns status "ambiguous" with candidates ({label, name, file}) instead of
+        picking one: pass file (repo-relative path) to choose. A file that is not valid
+        UTF-8 is decoded with replacement characters, and a notice says so."""
+        return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo, file)
 
     @server.tool(annotations=_READ_ONLY)
     def describe_node(
@@ -838,7 +934,9 @@ def main() -> None:
     settings = get_settings()
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
     engine.verify_connectivity()
-    engine.init_schema()
+    # Not waiting for indexes an upgrade is still building: that can outlast
+    # the client's handshake timeout, and each query waits for its own.
+    engine.init_schema(wait=False)
     registry = RepoRegistry(settings.registry_db_path)
 
     try:

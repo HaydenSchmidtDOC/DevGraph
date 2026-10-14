@@ -251,10 +251,11 @@ const newB = node(22, "fresh_two", "new.py");
         it must keep doing so. */
   reset();
   const d7 = deferred(), d8 = deferred();
-  cypherImpl = q => (q === "OLD" ? d7.promise : d8.promise);
+  // real read queries: the preview only sends text that opens with a read clause
+  cypherImpl = q => (q === "MATCH (o) RETURN o" ? d7.promise : d8.promise);
   canvas.set(nodeId(newA), mkEle(nodeId(newA), false));
-  const g1 = api.previewQueryGlow("OLD");
-  const g2 = api.previewQueryGlow("NEW");
+  const g1 = api.previewQueryGlow("MATCH (o) RETURN o");
+  const g2 = api.previewQueryGlow("MATCH (n) RETURN n");
   d8.resolve(stateJson([newA], [newA.id]));
   await g2;
   d7.resolve(stateJson([oldA, oldB], [oldA.id]));

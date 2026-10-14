@@ -17,12 +17,15 @@ from collections.abc import Callable
 from typing import Any
 
 from devgraph.config.project_schema import ProjectSchemaError, resolve_effective_schema, schema_file_hash
-from devgraph.indexer.dispatch import full_scan, schema_pending
+from devgraph.indexer.dispatch import full_scan, index_outdated, schema_pending
+from devgraph.indexer.walk import RepoRootUnavailable
 
 logger = logging.getLogger(__name__)
 
 QUIET_PERIOD_S = 300.0
 CHECK_INTERVAL_S = 30.0
+#: A failing index upgrade is retried after one interval, then doubling up to this.
+UPGRADE_BACKOFF_MAX_S = 1800.0
 
 
 class SchemaRescanScheduler:
@@ -55,6 +58,8 @@ class SchemaRescanScheduler:
         self._invalid: dict[str, str] = {}
         # repos whose last check raised; warn once per streak
         self._failing: set[str] = set()
+        # repo_id -> (next upgrade attempt, current delay) after a failed upgrade
+        self._upgrade_backoff: dict[str, tuple[float, float]] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -73,6 +78,33 @@ class SchemaRescanScheduler:
             if not repo.watch_enabled:
                 continue
             try:
+                # A never-indexed repo has no stamp either: its first scan
+                # (devgraph add / rescan, maybe running now) is left to them.
+                if repo.last_indexed and index_outdated(self._engine, repo.repo_id):
+                    # An index from an older format: upgrade it now, no quiet
+                    # period; a failing upgrade backs off (reset on success).
+                    backoff = self._upgrade_backoff.get(repo.repo_id)
+                    if backoff is not None and now < backoff[0]:
+                        continue
+                    try:
+                        result = self._exclusive(repo.repo_id, lambda: self._upgrade(repo))
+                    except Exception:
+                        delay = min(backoff[1] * 2, UPGRADE_BACKOFF_MAX_S) if backoff else self._interval_s
+                        self._upgrade_backoff[repo.repo_id] = (now + delay, delay)
+                        raise
+                    self._upgrade_backoff.pop(repo.repo_id, None)
+                    self._failing.discard(repo.repo_id)
+                    if result is None:
+                        continue
+                    count, _ = result
+                    rescanned.append(repo.repo_id)
+                    logger.info("upgraded the graph index of %s with a full rescan (%d files)", repo.repo_id, count)
+                    if self._on_rescanned is not None:
+                        try:
+                            self._on_rescanned(repo.repo_id, count)
+                        except Exception:
+                            logger.debug("schema rescan callback failed for %s", repo.repo_id, exc_info=True)
+                    continue
                 if not schema_pending(self._engine, repo.repo_id, repo.path):
                     self._seen.pop(repo.repo_id, None)
                     self._invalid.pop(repo.repo_id, None)
@@ -91,7 +123,10 @@ class SchemaRescanScheduler:
                     self._invalid[repo.repo_id] = current
                     logger.warning("project schema for %s is invalid; rescan skipped until it changes: %s", repo.repo_id, exc)
                     continue
-                count, applied = self._run_exclusive(repo.repo_id, lambda: self._rescan(repo))
+                result = self._exclusive(repo.repo_id, lambda: self._rescan(repo))
+                if result is None:
+                    continue
+                count, applied = result
                 self._failing.discard(repo.repo_id)
                 if not applied:
                     self._invalid[repo.repo_id] = current
@@ -107,14 +142,39 @@ class SchemaRescanScheduler:
                         self._on_rescanned(repo.repo_id, count)
                     except Exception:
                         logger.debug("schema rescan callback failed for %s", repo.repo_id, exc_info=True)
-            except Exception:
+            except RepoRootUnavailable as exc:
+                # A missing or unmounted folder: one line, no traceback.
                 first = repo.repo_id not in self._failing
+                self._failing.add(repo.repo_id)
+                logger.log(logging.WARNING if first else logging.DEBUG, "schema rescan skipped for %s: %s", repo.repo_id, exc)
+            except Exception:
+                # A scan interrupted by shutdown (the engine refuses new
+                # sessions once it closes) is not a failure worth a warning.
+                first = repo.repo_id not in self._failing and not self._stop.is_set()
                 self._failing.add(repo.repo_id)
                 logger.log(
                     logging.WARNING if first else logging.DEBUG,
                     "schema rescan check failed for %s", repo.repo_id, exc_info=True,
                 )
         return rescanned
+
+    def _exclusive(self, repo_id: str, fn: Callable[[], Any]) -> Any:
+        """`fn` under the batch lock, or None if stop came while waiting for it
+        (the agent closes the graph engine right after stop) or the repo was
+        removed meanwhile (its scan would outlive the removal's delete)."""
+        def run() -> Any:
+            if self._stop.is_set() or self._registry.get(repo_id) is None:
+                return None
+            return fn()
+
+        return self._run_exclusive(repo_id, run)
+
+    def _upgrade(self, repo: Any) -> tuple[int, bool] | None:
+        """`_rescan` unless the index got upgraded while this pass waited on
+        the batch lock (the start catch-up or a registration scan); None then."""
+        if not index_outdated(self._engine, repo.repo_id):
+            return None
+        return self._rescan(repo)
 
     def _rescan(self, repo: Any) -> tuple[int, bool]:
         """Full-scan `repo` and, if its schema got applied, stamp the scan's
@@ -136,11 +196,11 @@ class SchemaRescanScheduler:
         self._thread = threading.Thread(target=self._run, name="devgraph-schema-rescan", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
         thread, self._thread = self._thread, None
         if thread is not None:
-            thread.join(timeout=5)
+            thread.join(timeout=timeout)
 
     def _run(self) -> None:
         while not self._stop.is_set():

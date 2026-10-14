@@ -372,11 +372,80 @@ def test_cli_status(runner, temp_registry_db, temp_git_repo):
     with patch.object(config_module, "get_settings", return_value=settings), \
          patch.object(cli_main, "get_settings", return_value=settings):
         result = runner.invoke(app, ["status"])
-        # Should exit successfully even if Neo4j is unreachable
-        assert result.exit_code == 0
+        # Still reports everything else, then exits non-zero: Neo4j is unreachable
+        assert result.exit_code == 1
         assert "Registered Repositories" in result.stdout
         # Just check that total is present (may vary due to other tests)
         assert "Total:" in result.stdout
+
+
+def test_status_shows_rescan_pending(runner, temp_registry_db, temp_git_repo):
+    """'devgraph status' lists an active repository whose index is outdated."""
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.mark_indexed(repo_id)
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    settings = _mock_settings(db_path)
+    outdated = {repo_id}
+    with patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine") as engine_cls, \
+         patch("devgraph.indexer.dispatch.index_outdated", side_effect=lambda e, r: r in outdated):
+        engine_cls.return_value.verify_connectivity.return_value = None
+        pending = runner.invoke(app, ["status"])
+        outdated.clear()
+        current = runner.invoke(app, ["status"])
+
+    assert pending.exit_code == 0 and current.exit_code == 0
+    assert "Graph Index" in pending.stdout
+    assert f"{repo_id}: rescan pending" in pending.stdout
+    assert "devgraph rescan" in pending.stdout
+    assert "up to date" in current.stdout and "rescan pending" not in current.stdout
+
+
+def test_status_tells_an_unwatched_repo_to_rescan(runner, temp_registry_db, temp_git_repo):
+    """An unwatched repository is never rescanned by the agent: status says to run 'devgraph rescan'."""
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.disable_watch(repo_id)
+    registry.mark_indexed(repo_id)
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    settings = _mock_settings(db_path)
+    with patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine") as engine_cls, \
+         patch("devgraph.indexer.dispatch.index_outdated", return_value=True):
+        engine_cls.return_value.verify_connectivity.return_value = None
+        result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    assert f"{repo_id}: rescan pending" in result.stdout
+    assert "run 'devgraph rescan'" in result.stdout
+    assert "automatically" not in result.stdout.split("Graph Index", 1)[1]
+
+
+def test_status_does_not_call_a_never_indexed_repo_pending(runner, temp_registry_db, temp_git_repo):
+    """A repo whose first scan hasn't finished has no format stamp yet: that
+    scan stamps it, so status doesn't offer an upgrade rescan for it."""
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    settings = _mock_settings(db_path)
+    with patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine") as engine_cls, \
+         patch("devgraph.indexer.dispatch.index_outdated", return_value=True):
+        engine_cls.return_value.verify_connectivity.return_value = None
+        result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    assert f"{repo_id}: rescan pending" not in result.stdout
 
 
 def test_cli_annotate_set_docs_path(runner, temp_git_repo, temp_registry_db):
@@ -646,7 +715,7 @@ def test_cli_client_config_mcp_add_only(runner, temp_registry_db):
         # Rich's console may soft-wrap a long line across multiple terminal
         # rows — join before asserting on content rather than counting lines.
         collapsed = " ".join(l.strip() for l in result.stdout.strip().splitlines())
-        assert collapsed.startswith("claude mcp add devgraph")
+        assert collapsed.startswith("claude mcp add -s user devgraph")
         assert collapsed.endswith('" -P -m devgraph.mcp.server')
 
 
@@ -766,7 +835,7 @@ def test_cli_tray_status_not_running(runner, temp_registry_db):
     with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
          patch.object(lifecycle, "get_settings", return_value=_mock_settings(db_path)):
         result = runner.invoke(app, ["tray", "status"])
-        assert result.exit_code == 0, f"stdout: {result.stdout}"
+        assert result.exit_code == 1, f"stdout: {result.stdout}"
         assert "not running" in result.stdout
         assert "devgraph tray start" in result.stdout
 
@@ -797,7 +866,9 @@ def test_cli_tray_start_then_status_then_stop(runner, temp_registry_db):
          patch.object(lifecycle.subprocess, "Popen", return_value=fake_process), \
          patch.object(lifecycle, "pid_is_running", side_effect=lambda pid: pid in alive), \
          patch.object(lifecycle, "resolve_venv_python", return_value=Path("python")), \
-         patch.object(lifecycle, "resolve_repo_root", return_value=Path(".")):
+         patch.object(lifecycle, "resolve_repo_root", return_value=Path(".")), \
+         patch.object(lifecycle, "wait_for_tray", return_value="running"), \
+         patch.object(lifecycle, "tray_ui_problem", return_value=None):
         start_result = runner.invoke(app, ["tray", "start"])
         assert start_result.exit_code == 0, f"stdout: {start_result.stdout}"
         assert str(fake_pid) in start_result.stdout
@@ -1026,7 +1097,7 @@ def test_cli_add_with_an_invalid_schema_keeps_the_repo_registered(
          patch.object(cli_main, "full_scan", lambda *a, **k: scans.append(a)):
         result = runner.invoke(app, ["add", str(repo)])
 
-    assert result.exit_code == 0, f"stdout: {result.stdout}"
+    assert result.exit_code == 1, f"stdout: {result.stdout}"
     collapsed = _collapsed(result.stdout)
     assert "Registered but initial scan failed" in collapsed
     assert "invalid project schema" in collapsed
@@ -1089,6 +1160,41 @@ def test_cli_add_and_rescan_stamp_the_start_of_the_scan(runner, temp_registry_db
         assert verify.get("plain").last_indexed == t0.isoformat()
     finally:
         verify.close()
+
+
+@pytest.mark.parametrize("command", ["add", "rescan"])
+def test_cli_add_and_rescan_report_skipped_files(runner, temp_registry_db, tmp_path, command):
+    db_path, registry = temp_registry_db
+    repo = _repo_with_schema(tmp_path, "plain")
+    if command == "rescan":
+        registry.add_repo(repo)
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    def scan(*a, skipped=None, **k):
+        skipped.update({
+            "static/js/app.min.js": "too large",
+            "gen/big_pb2.py": "minified or generated",
+            "assets/blob.py": "binary",
+        })
+        return 4
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", lambda *a, **k: _StubEngine()), \
+         patch.object(cli_main, "full_scan", scan), \
+         patch.object(cli_main, "sync_git_history",
+                      lambda *a, **k: {"commits_indexed": 0, "commits_deleted": 0}):
+        result = runner.invoke(app, [command, "plain" if command == "rescan" else str(repo)])
+
+    assert result.exit_code == 0, f"stdout: {result.stdout}"
+    out = " ".join(result.stdout.split())
+    assert "Skipped 3 file(s)" in out
+    assert "static/js/app.min.js (too large)" in out
+    assert "gen/big_pb2.py (minified or generated)" in out
+    assert "assets/blob.py (binary)" in out
 
 
 def test_project_schema_findings_report_absent_valid_and_invalid(temp_registry_db, tmp_path):
@@ -1697,11 +1803,20 @@ def test_cli_remove_releases_the_constraints_of_the_repos_labels(runner, temp_re
     assert not _has_constraint(engine, name)
 
 
-def test_cli_doctor_reports_a_missing_or_blocked_generated_constraint(runner, temp_registry_db, stale_label):
+def _register_ids(registry, tmp_path, *repo_ids):
+    """Register `repo_ids` (doctor's constraint check reads registered repositories only), then close."""
+    for repo_id in repo_ids:
+        root = tmp_path / repo_id
+        (root / ".git").mkdir(parents=True)
+        registry.add_repo(root, repo_id=repo_id)
+    registry.close()
+
+
+def test_cli_doctor_reports_a_missing_or_blocked_generated_constraint(runner, temp_registry_db, stale_label, tmp_path):
     engine, label, name = stale_label  # constraint on (repo_id, slug)
     db_path, registry = temp_registry_db
-    registry.close()
     blocked, missing = f"_smoketest_blocked_{label.lower()}", f"_smoketest_missing_{label.lower()}"
+    _register_ids(registry, tmp_path, blocked, missing)
     other = f"{label}b"
     try:
         engine.upsert_repository(blocked, blocked, "/tmp/blocked")
@@ -1720,11 +1835,11 @@ def test_cli_doctor_reports_a_missing_or_blocked_generated_constraint(runner, te
     assert f"devgraph rescan {missing} --now" in doctor
 
 
-def test_cli_doctor_reports_a_key_conflict_between_repositories(runner, temp_registry_db, stale_label):
+def test_cli_doctor_reports_a_key_conflict_between_repositories(runner, temp_registry_db, stale_label, tmp_path):
     engine, label, _name = stale_label  # constraint on (repo_id, slug)
     db_path, registry = temp_registry_db
-    registry.close()
     keyed, declaring = f"_smoketest_keyed_{label.lower()}", f"_smoketest_declaring_{label.lower()}"
+    _register_ids(registry, tmp_path, keyed, declaring)
     try:
         engine.upsert_repository(keyed, keyed, "/tmp/keyed")
         engine.record_applied_schema(keyed, "sha256:x", [label], [], [f"{label}:code"])
@@ -1741,11 +1856,11 @@ def test_cli_doctor_reports_a_key_conflict_between_repositories(runner, temp_reg
     ) in doctor
 
 
-def test_cli_doctor_names_a_third_key_and_an_unrecorded_one_in_a_key_conflict(runner, temp_registry_db, stale_label):
+def test_cli_doctor_names_a_third_key_and_an_unrecorded_one_in_a_key_conflict(runner, temp_registry_db, stale_label, tmp_path):
     engine, label, _name = stale_label  # constraint on (repo_id, slug), which nobody declares
     db_path, registry = temp_registry_db
-    registry.close()
     keyed, third, unknown = (f"_smoketest_{word}_{label.lower()}" for word in ("keyed", "third", "unknown"))
+    _register_ids(registry, tmp_path, keyed, third, unknown)
     try:
         engine.upsert_repository(keyed, keyed, "/tmp/keyed")
         engine.record_applied_schema(keyed, "sha256:x", [label], [], [f"{label}:code"])
@@ -1764,13 +1879,13 @@ def test_cli_doctor_names_a_third_key_and_an_unrecorded_one_in_a_key_conflict(ru
     ) in doctor
 
 
-def test_cli_doctor_says_a_label_spelled_differently_is_the_conflict(runner, temp_registry_db, stale_label):
+def test_cli_doctor_says_a_label_spelled_differently_is_the_conflict(runner, temp_registry_db, stale_label, tmp_path):
     # Same key, label differing only in case: realign_keys still won't replace
     # the constraint, so this is a conflict, but not one of identification.
     engine, label, _name = stale_label  # constraint on (repo_id, slug)
     db_path, registry = temp_registry_db
-    registry.close()
     keyed, spelled = f"_smoketest_keyed_{label.lower()}", f"_smoketest_spelled_{label.lower()}"
+    _register_ids(registry, tmp_path, keyed, spelled)
     shouted = label.upper()
     try:
         engine.upsert_repository(keyed, keyed, "/tmp/keyed")
@@ -1907,3 +2022,262 @@ def test_generated_mcp_command_ignores_devgraph_package_in_working_directory(tmp
     assert safe.returncode != 0
     assert "ServiceUnavailable" in safe.stderr  # reached the real server
     assert str(workdir) not in safe.stderr
+
+
+def test_cli_rescan_refuses_a_missing_or_empty_repo_folder(runner, temp_registry_db, tmp_path, purge_registered_repos):
+    """A missing folder (a moved repo, an unmounted drive) or an empty one (a
+    mount point with nothing mounted) never wipes the repository's graph."""
+    import shutil
+
+    from devgraph.cli import main as cli_main
+    from devgraph.graph.engine import GraphEngine
+
+    db_path, registry = temp_registry_db
+    root = tmp_path / "widget"
+    root.mkdir()
+    subprocess.run(["git", "init"], cwd=root, capture_output=True, check=True)
+    (root / "widget.py").write_text("class Widget:\n    pass\n")
+    record = registry.add_repo(root)
+    repo_id, root = record.repo_id, record.path  # the registry's own (resolved) spelling
+    registry.close()
+
+    def rescan(*args):
+        with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+             patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+            return runner.invoke(app, ["rescan", repo_id, *args])
+
+    engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
+
+    def nodes():
+        return engine.run_cypher("MATCH (n {repo_id: $r}) RETURN count(n) AS c", {"r": repo_id})[0]["c"]
+
+    try:
+        config_module.get_settings.cache_clear()
+        assert rescan().exit_code == 0
+        before = nodes()
+        assert before > 1
+
+        shutil.rmtree(root)
+        missing = rescan()
+        assert missing.exit_code == 1
+        assert f"repository folder not found: {root}; nothing was changed" in " ".join(missing.stdout.split())
+        assert "[OK]" not in missing.stdout
+        assert nodes() == before
+
+        root.mkdir()
+        empty = rescan()
+        assert empty.exit_code == 1
+        assert "no indexable files" in empty.stdout and "--force" in empty.stdout
+        assert nodes() == before
+
+        forced = rescan("--force")
+        assert forced.exit_code == 0, forced.stdout
+        assert nodes() < before
+    finally:
+        engine.close()
+
+
+def test_cli_doctor_fails_a_missing_repository_folder(runner, temp_registry_db, tmp_path, monkeypatch):
+    import shutil
+
+    from devgraph.config import project_switch
+
+    db_path, registry = temp_registry_db
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db_path)
+    present = registry.add_repo(_repo_with_schema(tmp_path, "present")).repo_id
+    gone_root = _repo_with_schema(tmp_path, "gone")
+    gone_record = registry.add_repo(gone_root)
+    gone, gone_root = gone_record.repo_id, gone_record.path  # the registry's own (resolved) spelling
+    registry.close()
+    shutil.rmtree(gone_root)
+
+    result = _doctor_with_engine(runner, db_path, _stub_engine(None))
+    collapsed = _collapsed(result.stdout)
+    assert result.exit_code == 1
+    assert f"[X] {gone}: path missing: repository folder not found: {gone_root}" in collapsed
+    assert f"[OK] {present}:" in collapsed
+    # Not misreported as a repository without a schema file, or as pending drift.
+    assert f"{gone}: no devgraph.schema.yaml" not in collapsed
+    assert f"{gone}: no devgraph.tools.yaml" not in collapsed
+    assert f"devgraph rescan {gone} --now" not in collapsed
+
+
+def _info_with_neo4j_down(runner, db_path, *args):
+    from devgraph.cli import main as cli_main
+
+    class DownEngine:
+        def __init__(self, *a, **k):
+            pass
+
+        def run_cypher(self, *a, **k):
+            from neo4j.exceptions import ServiceUnavailable
+
+            raise ServiceUnavailable("connection refused")
+
+        def close(self):
+            pass
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", DownEngine):
+        return runner.invoke(app, ["info", *args])
+
+
+def test_cli_info_with_neo4j_down_says_the_node_count_is_unknown(runner, temp_registry_db, temp_git_repo):
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.close()
+
+    table = _info_with_neo4j_down(runner, db_path, repo_id)
+    assert table.exit_code == 0, table.stdout
+    assert "Nodes in graph: unknown (Neo4j unreachable)" in table.stdout
+    as_json = _info_with_neo4j_down(runner, db_path, repo_id, "--json")
+    assert json.loads(as_json.stdout)["node_count"] is None
+
+
+def test_cli_doctor_with_every_repository_folder_missing_says_none_are_reachable(
+    runner, temp_registry_db, tmp_path, monkeypatch
+):
+    import shutil
+
+    from devgraph.config import project_switch
+
+    db_path, registry = temp_registry_db
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db_path)
+    shutil.rmtree(registry.add_repo(_repo_with_schema(tmp_path, "gone")).path)
+    registry.close()
+
+    collapsed = _collapsed(_doctor_with_engine(runner, db_path, _stub_engine(None)).stdout)
+    assert "no registered repositories to check" not in collapsed
+    assert collapsed.count("[OK] no reachable repositories to check") >= 2
+
+
+def _agent_running_with_issues(db_path, issues):
+    """A fresh tray heartbeat and the repo_issues.json the agent writes."""
+    from datetime import datetime, timezone
+
+    (db_path.parent / "tray_heartbeat.txt").write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+    (db_path.parent / "repo_issues.json").write_text(json.dumps(issues), encoding="utf-8")
+    settings = _mock_settings(db_path)
+    settings.health_check_interval_s = 30
+    return settings
+
+
+UNWATCHED = "watching unavailable: inotify limit reached (too many inotify instances, fs.inotify.max_user_instances)"
+
+
+def test_status_says_a_running_watcher_is_not_watching_a_repository(runner, temp_registry_db, temp_git_repo):
+    """The agent can be alive while a repository's watch failed to start:
+    "running" alone hid that nothing there was being picked up."""
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.close()
+    settings = _agent_running_with_issues(db_path, {repo_id: UNWATCHED})
+
+    from devgraph.cli import main as cli_main
+
+    with patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine") as engine_cls:
+        engine_cls.return_value.verify_connectivity.return_value = None
+        result = runner.invoke(app, ["status"])
+
+    watcher = _collapsed(result.stdout.split("Live Watcher", 1)[1].split("Dashboard", 1)[0])
+    assert "running, but not watching 1 repository" in watcher
+    assert f"{repo_id}: {UNWATCHED}" in watcher
+
+
+def test_doctor_fails_a_repository_the_watcher_is_not_watching(runner, temp_registry_db, temp_git_repo):
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.close()
+    settings = _agent_running_with_issues(db_path, {repo_id: UNWATCHED})
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=settings), \
+         patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine", _stub_engine(None)), \
+         patch.object(cli_main, "resolve_podman", return_value=None):
+        result = runner.invoke(app, ["doctor"])
+
+    watcher = _collapsed(result.stdout.split("Live Watcher", 1)[1])
+    assert "running, but not watching 1 repository" in watcher
+    assert f"[X] {repo_id}: {UNWATCHED}" in watcher
+    assert result.exit_code == 1
+
+
+def test_status_and_doctor_ignore_issues_of_repositories_no_longer_watched(runner, temp_registry_db, temp_git_repo):
+    """repo_issues.json is written by the agent every few seconds: an issue
+    of a repository removed, deactivated or unwatched since is stale."""
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.disable_watch(repo_id)
+    registry.close()
+    settings = _agent_running_with_issues(db_path, {repo_id: UNWATCHED, "removed-repo": UNWATCHED})
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=settings), \
+         patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine", _stub_engine(None)), \
+         patch.object(cli_main, "resolve_podman", return_value=None):
+        status = runner.invoke(app, ["status"])
+        doctor = runner.invoke(app, ["doctor"])
+
+    for result in (status, doctor):
+        watcher = _collapsed(result.stdout.split("Live Watcher", 1)[1])
+        assert "[OK] running" in watcher and "not watching" not in watcher, watcher
+
+
+def _orphan_engine(graph_ids, deleted):
+    stub = _stub_engine(None)
+
+    class OrphanEngine(stub):
+        def graph_repo_ids(self):
+            return set(graph_ids)
+
+        def delete_repository(self, repo_id):
+            deleted.append(repo_id)
+
+        def close(self, timeout=None):
+            pass
+
+    return OrphanEngine
+
+
+def test_cli_doctor_reports_graph_data_of_unregistered_repos(runner, temp_registry_db, tmp_path):
+    """Nodes a write left after `devgraph remove` (with or without their
+    Repository node) are reported, with the command that deletes them."""
+    db_path, registry = temp_registry_db
+    kept = registry.add_repo(_repo_with_schema(tmp_path, "kept")).repo_id
+    registry.close()
+
+    collapsed = _collapsed(_doctor_with_engine(runner, db_path, _orphan_engine({kept, "gone-repo"}, [])).stdout)
+    assert "Orphaned graph data" in collapsed
+    assert "gone-repo" in collapsed and "devgraph prune" in collapsed
+
+    clean = _collapsed(_doctor_with_engine(runner, db_path, _orphan_engine({kept}, [])).stdout)
+    assert "no graph data of unregistered repositories" in clean
+
+
+def test_cli_prune_deletes_nodes_left_without_a_repository_node(runner, temp_registry_db, tmp_path):
+    from devgraph.cli import main as cli_main
+
+    db_path, registry = temp_registry_db
+    kept = registry.add_repo(_repo_with_schema(tmp_path, "kept")).repo_id
+    registry.close()
+    deleted: list[str] = []
+    engine_cls = _orphan_engine({kept, "gone-repo"}, deleted)
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", engine_cls):
+        dry = runner.invoke(app, ["prune", "--dry-run"])
+        assert "gone-repo" in dry.stdout and deleted == []
+        result = runner.invoke(app, ["prune"])
+    assert result.exit_code == 0, result.stdout
+    assert deleted == ["gone-repo"]

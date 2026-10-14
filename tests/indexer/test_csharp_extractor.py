@@ -74,9 +74,9 @@ namespace MyApp.Services
 
     assert ("Class", "UserService", "EXTENDS", "Class", "BaseService") in rel_tuples
 
-    assert ("Module", "MyApp/Services/UserService.cs", "IMPORTS", "Module", "System") in rel_tuples
-    assert ("Module", "MyApp/Services/UserService.cs", "IMPORTS", "Module", "MyApp.Data") in rel_tuples
-    assert ("Module", "MyApp/Services/UserService.cs", "IMPORTS", "Module", "MyApp/Data.cs") in rel_tuples
+    # A using names a namespace, no file: the IMPORTS are the classes the
+    # file references (none here but library types and its own).
+    assert not any(r[2] == "IMPORTS" for r in rel_tuples)
 
 
 def test_extract_with_attributes():
@@ -160,21 +160,12 @@ def test_extract_empty_file():
     assert module_nodes[0].name == "Empty.cs"
 
 
-def test_using_single_segment_has_no_extra_file_guess():
-    """A single-segment `using System;` shouldn't gain an extra file-path
-    guess — there's no dotted structure to reinterpret."""
-    result = extract_csharp_file("using System;\n", "App.cs", "test_repo")
-    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert targets == {"System"}
-
-
-def test_using_dotted_namespace_resolves_to_folder_guess():
-    """`using MyApp.Services.Foo;` emits both the bare dotted namespace
-    (kept for compatibility) and the folder-guess file-path target."""
-    result = extract_csharp_file("using MyApp.Services.Foo;\n", "App.cs", "test_repo")
-    targets = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
-    assert "MyApp.Services.Foo" in targets
-    assert "MyApp/Services/Foo.cs" in targets
+def test_a_using_imports_no_file():
+    """`using MyApp.Services.Foo;` names a namespace, which can live in any
+    file: no IMPORTS target, neither the dotted name nor a folder guess."""
+    for source in ("using System;\n", "using MyApp.Services.Foo;\n"):
+        result = extract_csharp_file(source, "App.cs", "test_repo")
+        assert [r for r in result.relationships if r.rel_type == "IMPORTS"] == []
 
 
 def test_all_nodes_scoped_to_repo():
@@ -250,7 +241,7 @@ public class Service
     calls_by_pair = {
         (r.from_name, r.to_name): r.properties for r in result.relationships if r.rel_type == "CALLS"
     }
-    assert calls_by_pair[("Process", "Helper")] == {"caller_class": "Service"}
+    assert calls_by_pair[("Process", "Helper")] == {"caller_class": "Service", "confidence": "resolved"}
 
 
 def test_calls_edge_not_hoisted_into_local_function():

@@ -55,7 +55,7 @@ exceptions are listed under "Limits" below. No new config knob.
 | W2 | **Deletes are expanded to exact file paths in `remove_paths`**, from the graph's own file list, which includes provider paths. Directory creates and in-repo moves are walked. |
 | W3 | **Top-level directory changes trigger a watch reconcile**, which runs on its own thread, replaces dead or stale watches, then walks new folders. **Handler code never takes `manager._lock`.** |
 | W4 | **One batch lock per repository, owned by the manager**, shared by live batches, catch-up, the schema rescan and dashboard registration. Events keep collecting while a batch runs. |
-| W5 | **Catch-up is incremental**, with `since` snapshotted before the watch starts. It runs whenever the watcher starts watching a repository. A never-indexed repository is not scanned. |
+| W5 | **Catch-up is incremental**, with `since` snapshotted before the watch starts. It runs whenever the watcher starts watching a repository. A never-indexed repository is scanned in full only when watching starts with the agent (start or Resume). |
 | W6 | **The debounce is enough for delivered events. A git operation also triggers a catch-up**, from the start of the git burst, to repair dropped events. |
 | W7 | **`last_indexed` is the start of the work it covers**, held back by a per-repository floor while a batch has failed. |
 | W8 | **Docs provider unchanged.** The watcher delivers the pair; front-matter keys already handle both orders. |
@@ -278,10 +278,16 @@ files and `unknown` those of them the graph had no file for.
     catch-up.
 - **Inside the lock, a `None` snapshot is re-read.** Registration in this
   process may have just finished under the same lock.
-- **Never indexed** (`last_indexed` still `None`). Skip, and log
-  `DevGraph hasn't indexed <repo> yet; run "devgraph rescan <repo>"`.
-  `devgraph add`, `rescan` and dashboard registration own the first scan, so
-  there is never a parallel `full_scan`.
+- **Never indexed** (`last_indexed` still `None`). When watching started
+  with the agent (start or Resume), catch up from the epoch, which a missing
+  or unstamped index format makes a `full_scan`, and log
+  `DevGraph hasn't finished indexing <repo>; indexing it in full`: this repairs
+  a first scan the agent's last shutdown cut. A repository picked up by
+  `refresh()` is skipped, with
+  `DevGraph hasn't indexed <repo> yet; run "devgraph rescan <repo>"`:
+  `devgraph add` in another process may be scanning it right now. A
+  `devgraph add` still running when the agent starts or resumes can therefore
+  overlap a second `full_scan`.
 - **Live events that arrive during a catch-up** queue behind it and re-index
   whatever they name. Indexing is idempotent.
 
@@ -510,6 +516,7 @@ Log lines, at INFO unless noted:
   only for what the live batches can't have handled: files the graph had no
   file for, and files pruned. Otherwise DEBUG.
 - `DevGraph hasn't indexed <repo> yet; run "devgraph rescan <repo>"`
+- `DevGraph hasn't finished indexing <repo>; indexing it in full`
 - WARNING `Couldn't update <repo>; DevGraph will retry, or run "devgraph rescan <repo>"`,
   with `exc_info`, once per failure streak; while it keeps failing, again
   every 5 minutes without the traceback, and at DEBUG in between. Not logged

@@ -38,7 +38,7 @@ TypeScript, C#, C++, Java, Kotlin, Rust, and Go source**, detected per file by
 extension (a repo doesn't need to be single-language; each file is routed
 to the matching extractor automatically) — and exposes it through purpose-built MCP tools
 (`search_component`, `describe_node`, `find_callers`, `impact_analysis`,
-`impact_analysis_for_diff`, `explain_architecture`, `blame_component`,
+`impact_analysis_for_diff`, `compare_branches`, `explain_architecture`, `blame_component`,
 `find_requirements_for`, `find_mentions`, `list_recent_changes`, `god_nodes`,
 `get_source`, and others), plus the opt-in `run_cypher` escape hatch. Read
 `devgraph://tool-catalog` for the live tool list and identifier expectations.
@@ -185,14 +185,20 @@ not this literal text):
 - **args**: -P -m devgraph.mcp.server
 - **cwd**: <resolved DevGraph repo root>
 
-claude mcp add devgraph -- "<resolved venv python.exe>" -P -m devgraph.mcp.server
+claude mcp add -s user devgraph -- "<resolved venv python.exe>" -P -m devgraph.mcp.server
 
 VS Code (user mcp.json at <resolved path>):
 { "servers": { "devgraph": { "type": "stdio", "command": "...", "args": [...], "cwd": "..." } } }
 ```
 
-A Claude Code registration made before `-P` was added is left as-is by
-`--run` (an existing entry is skipped); run `claude mcp remove devgraph` and
+Claude Code registration is user-scoped (`-s user`), so one registration
+serves every project; `devgraph mcp add`, `client-config --run`, `mcp doctor`
+and `mcp remove` all use that scope. Older versions ran a bare `claude mcp
+add`, which registers in local scope, for the DevGraph checkout folder only:
+`devgraph mcp add` and `mcp doctor` detect such a registration and print how to
+move it (`claude mcp remove devgraph -s local` in the checkout, then `devgraph
+mcp add`). A user-scope registration made before `-P` was added is left as-is
+by `--run` (an existing entry is skipped); run `devgraph mcp remove` and
 register again to pick it up. The VS Code entry is rewritten in place.
 
 `devgraph client-config --claude-mcp-add-only` prints just the Claude Code
@@ -231,7 +237,9 @@ The server instructions name it, and so does `devgraph://project-tools`.
 
 Never pass `cross_repo: true` unless the user explicitly asks for a
 cross-repository answer — the default is (and must stay) scoped to one
-repository only.
+repository only. It is also refused (a ToolError naming
+`DEVGRAPH_ALLOW_CROSS_REPO`) unless the user has turned that setting on; when
+it is on, results cover registered repositories only.
 
 **Identifier-type nuance**: `find_callers`, `impact_analysis`, and
 `find_related_files` match against function/class **names** only (a file
@@ -253,8 +261,16 @@ before assuming you've seen everything. `find_related_files` and
 `impact_analysis` apply the same envelope to each of their list-valued
 fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
 `max_results` (default 15) to widen the sample when you genuinely need more
-than the default. `search_component`'s `count` maxes out at 50 (its own
-Cypher cap) even if more matches exist beyond that. `describe_node`'s
+than the default. `search_component` ranks exact name matches first, then
+name prefixes, then other substrings, then description-only matches; each
+result carries its `file`, and a route's file-less handler stub is dropped
+when a real function of that name exists. Its `count` is the true number of
+matches, except when exact and prefix matches alone fill `max_results`: then
+the response adds `count_is_lower_bound: true`. `max_results` is capped at
+200. The whole query and each of its words (`user_service`, underscores kept)
+are matched as well as its tokens. An exact name in unusual case (`gEt` for
+`get`) is only found by the substring scan, so it can be missed when exact and
+prefix matches alone fill the page. `describe_node`'s
 response is not itself an envelope: each relationship group inside its
 `outgoing` and `incoming` maps is one (`{"count", "results", "truncated"}`).
 
@@ -304,19 +320,43 @@ Prefer these over re-reading files when the question is structural:
 | "What calls X?" | `find_callers` (name, not path) |
 | "What calls X, but only recently modified?" | `find_callers` with `modified_within_commits=N` (filters results to entities touched in the last N commits) |
 | "What calls X, but only from within class Y?" | `find_callers` with `scope_to_class=Y` (cuts noise from unrelated same-named methods elsewhere in the repo) |
+| "What definitely calls X?" | `find_callers` with `resolved_only=True` (Python callers resolved through scope or imports) |
 | "What breaks if I change X?" | `impact_analysis` (name, not path) |
 | "What breaks across this whole PR/diff?" | `impact_analysis_for_diff` (base_ref/head_ref, both must exist locally — never fetches) |
 | "What does X depend on?" | `get_service_dependencies` (service name), `find_related_files` (function/class name, not path) |
-| "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name) |
+| "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name like `GET /users/<id>`, or a bare path like `/users/<id>` for every method) |
 | "What changed recently?" | `list_recent_changes` (lists entities touched in the last N commits, most-recent first; filters by optional entity type) |
 | "What's the overall architecture?" | `explain_architecture`, `summarise_repository` |
-| "What changed between two branches?" | `compare_branches` — **stub**: registered and callable, but not yet fully wired to git metadata; treat results as unreliable until DevGraph's own docs say otherwise |
+| "What changed between my branch and main?" | `compare_branches(branch_a="main", branch_b="<branch>")`: files, per-file symbols added, removed and changed, and the graph callers of what changed |
 | "Why was X built this way?" | `explain_decision`, `trace_design_rationale` |
 | "What requirements does X satisfy?" | `find_requirements_for` |
-| "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled) |
+| "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled; otherwise an empty result whose `notice` names the enable command) |
 | "Who changed X and when?" | `blame_component` (file path, not name) |
-| "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2) |
-| "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed) |
+| "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2; otherwise they return an empty result whose `notice` names the enable command, and never contact GitHub) |
+| "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed; a name defined in several files returns `status: "ambiguous"` with `candidates`, so pass `file` to pick one) |
+
+`compare_branches` and `impact_analysis_for_diff` both take two local refs
+and never fetch. `compare_branches` compares from the merge base, like
+`git diff main...branch` (what a pull request shows), and names the functions
+and classes added, removed and changed in each file, with line numbers. Its
+`impacted_callers` come from the last index of the working tree, not from
+either ref, so read them as a hint. `impact_analysis_for_diff` compares the same
+way and traces dependents, direct and transitive, of the functions and classes
+changed or removed; added ones are listed in `added_symbols`, since nothing
+depends on them yet. A changed code file whose symbols weren't diffed (past the
+200-file cap, unreadable, or renamed) counts every indexed symbol in it, and a
+notice says so; so does a changed symbol the index doesn't have, whose
+dependents are then unknown. An unknown repository or ref is an error. Use `compare_branches` for "what did my
+branch change?" and `impact_analysis_for_diff` for "what could this diff
+break?".
+
+Mistakes are errors, not empty answers: an unregistered `repo_id` fails with
+`no such repo_id`; `impact_analysis`, `get_service_dependencies`,
+`trace_request_flow` and `explain_decision` on a name the graph doesn't have
+fail with `no ... named ...` and up to five similar names; and a count
+argument below its minimum (`max_results`, `within_commits`,
+`modified_within_commits`, `members_per_community`, `max_per_type` below 1,
+`max_length` below 2) fails and names the argument.
 
 If a tool returns empty/sparse results, check whether the repo has actually
 been scanned (step 1/2) before concluding the graph has nothing to say — an
@@ -369,33 +409,40 @@ call edges, `explain_architecture` returning no `uses`/`calls`, and relative
 imports not resolving) have been fixed and checked against a reference repository.
 Two things worth knowing about how they work:
 
-- **Call graph is name-based, not type-resolved, in every language
-  DevGraph supports.** `self.foo()`, `this->foo()`, `obj.Foo()`, and a bare
-  `foo()` all link to whichever `Function` node is named `foo` — there's no
-  type inference, so same-named methods on unrelated classes/types will
-  over-link rather than under-link. Treat `find_callers` results as "things
-  that call something named X", not a guaranteed-precise call graph. When a
-  call was made from inside a method body, its `CALLS` edge records the
-  caller's enclosing class as `caller_class` — pass
-  `find_callers(..., scope_to_class="ThatClass")` to filter down to just
-  that class's own callers when a common method name (`get`, `run`,
-  `close`) is otherwise drowning in unrelated matches.
-- **Import/include resolution is a same-repo best-effort guess, per
-  language, and it fails silently by design.** Each language extractor
-  resolves its own dominant intra-repo import convention (Python's dotted
-  imports, JS/TS's relative paths and `node_modules`, C#'s namespace/folder
-  convention, Java's package/folder convention, Rust's `mod`/`use`, Go's
-  module-path convention) to a same-repo file guess. A wrong guess doesn't
-  corrupt the graph — it simply never becomes an edge (`IMPORTS` edges only
-  materialize when the guessed target actually exists as an indexed node) —
-  but it does mean `find_related_files`'s `imported_modules` can legitimately
-  under-report for any language, not just Python. **C++ is a special case:**
-  `#include` resolution has no build-system truth to lean on (no compiler
-  flags/include paths available to DevGraph), so only same-directory quoted
-  includes (`#include "local.h"`) get a guess at all — angle-bracket
-  includes (`#include <foo.h>`) are skipped entirely. Treat C++'s `IMPORTS`
-  graph as thin by design, not as a sign indexing failed; its
-  Module/Class/Function/CALLS/EXTENDS extraction is unaffected by this.
+- **Calls are resolved through scope, imports and types, in every
+  language.** A call links to the file its callee can be in: a function of
+  the same file, the module, package, class file, crate module or header an
+  import, `use` or `#include` names, `self`/`this`/`super` methods in the
+  class or its bases, and methods on a value whose type a parameter, a
+  local, a field or a constructor call gives. Each `CALLS` edge has a
+  `confidence`: `resolved` (a file the caller names), `package` (a file its
+  imports reach less exactly: under an imported package, a class file found
+  by path suffix in another module, a C# class file `/T.cs`, a C++ header's
+  same-stem source) or `name` (a method on a value nothing types, linked to
+  every `Function` of that name, never back to its own caller). A library
+  type's method (`.get`, `.push_back`, `List.Add`) on such a value, a call
+  through a library type or an external package, and a bare name nothing
+  defines or imports link nothing. `find_callers` returns each caller's
+  `confidence`, most certain first; pass `resolved_only=True` to keep only
+  `resolved`/`package` callers. When a call was made from inside a method
+  body, its `CALLS` edge records the caller's enclosing class as
+  `caller_class` — pass `find_callers(..., scope_to_class="ThatClass")` to
+  filter down to just that class's own callers. Graph insights (PageRank,
+  communities) leave out `name` and `package` calls and `package`
+  imports. What stays out of reach: a C# class in a file not named after it, two C# types of one name
+  in different namespaces (both get the edge), and a method a type inherits
+  from a base declared in another file.
+- **Import/include resolution reads only the importing file and the
+  repository's resolver configuration** (tsconfig/jsconfig, go.mod/go.work,
+  Cargo.toml). Python, JS/TS, Go, Java, Kotlin and Rust imports name files
+  by each language's own rules; a C# `using` names a namespace, so C#
+  `IMPORTS` edges go to the classes a file references; a C++ quoted
+  `#include` names the file beside the includer, else the same path under
+  another directory (a bare `"x.h"` only under an `include/` or `src/`
+  directory), and `#include <...>` is never resolved (no compiler
+  flags are available to DevGraph). An import of something outside the
+  repository gets no edge, and a target that doesn't exist yet links when
+  it is added.
 - **Service cross-linking depends on the compose file's `build`/`context`
   matching each service's actual source directory.** If a compose service
   has no `build:` key (image-only services like databases) or an

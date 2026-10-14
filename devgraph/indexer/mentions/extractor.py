@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from devgraph.indexer.source_text import read_source
 
 logger = logging.getLogger(__name__)
 
@@ -115,9 +118,13 @@ class MentionsExtractor:
         # Track which entities we've already linked (to avoid duplicates)
         linked_entities = set()
 
+        # Only names that occur in the text can match; the rest skip the
+        # per-name regexes, which cost a pass over the whole text each.
+        candidates = _candidate_names(content, entity_map)
+
         # Check each known entity name
         for name, label in known_entities:
-            if name in linked_entities:
+            if name in linked_entities or name not in candidates:
                 continue
 
             # Check for matches in the content
@@ -246,6 +253,24 @@ def _parse_inline_code(line: str) -> list[tuple[int, int]]:
     return regions
 
 
+_WORD = re.compile(r"\w+")
+
+
+def _candidate_names(content: str, names: Iterable[str]) -> set[str]:
+    """The subset of `names` that _find_matches could match in `content`.
+
+    Every pattern _find_matches tries puts \\b (or whitespace) before the
+    name and \\b, \\s or "(" after it, and code regions start and end at a
+    backtick or a line break. So a name made only of word characters can
+    match only where it is a whole \\w+ run of the text: one set lookup
+    against the text's runs, found in a single pass. Any other name is kept
+    when it occurs in the text at all. Both are necessary conditions only;
+    _find_matches still decides.
+    """
+    words = set(_WORD.findall(content))
+    return {name for name in names if name in words or (not _WORD.fullmatch(name) and name in content)}
+
+
 def _find_matches(content: str, name: str, code_regions: list[tuple[int, int]]) -> bool:
     """Check if a name appears in a code-like context in the content.
 
@@ -263,7 +288,7 @@ def _find_matches(content: str, name: str, code_regions: list[tuple[int, int]]) 
     # Check declaration syntax: keyword\s+Name\b (same line only, not across newlines)
     declaration_pattern = r"\b(" + "|".join(re.escape(kw) for kw in _DECLARATION_KEYWORDS) + r")\s+" + re.escape(name) + r"\b"
     for line in content.splitlines():
-        if re.search(declaration_pattern, line):
+        if name in line and re.search(declaration_pattern, line):
             return True
 
     return False
@@ -279,7 +304,7 @@ def _find_in_code_regions(content: str, name: str, code_regions: list[tuple[int,
 
     for start, end in code_regions:
         region_text = content[start:end]
-        if re.search(pattern, region_text):
+        if name in region_text and re.search(pattern, region_text):
             return True
 
     return False
@@ -290,7 +315,7 @@ def mentions_any(content: str, names: set[str]) -> bool:
     would match it (code span, call or declaration syntax). A cheap
     pre-check: lets a caller skip re-indexing a file that can't gain an
     edge to any of these names."""
-    candidates = [name for name in names if name in content]
+    candidates = _candidate_names(content, names)
     if not candidates:
         return False
     code_regions = _parse_code_regions(content)
@@ -328,11 +353,12 @@ def upsert_document_node(engine, repo_id: str, file_path: str | Path, repo_root:
 
     Lets a batch create every Document node before any file's mentions are
     resolved, so a file mentioning a Document (or anything else) indexed
-    later in the same batch still gets its edge. index_file then adds the
-    edges (and re-upserts the same node idempotently).
+    later in the same batch still gets its edge. index_file then replaces
+    the Document's MENTIONS edges with the current ones (and re-upserts the
+    same node idempotently).
     """
     file_path = Path(file_path)
-    content = file_path.read_text(encoding="utf-8")
+    content = read_source(file_path)
     result = MentionsExtractor(repo_id).extract_from_source(content, _document_name(file_path, repo_root), [])
     _upsert_documents(engine, result)
 
@@ -359,7 +385,9 @@ def index_file(
         ambiguous_mode: How to handle ambiguous names: "all" (link all) or "skip" (skip).
         names: When given, only match entities with one of these names -- for
             linking an unchanged file to newly added entities without
-            re-matching every name in the repo. Existing edges are kept.
+            re-matching every name in the repo. Existing edges are kept
+            (additive). Without `names`, the Document's MENTIONS are replaced,
+            so a mention removed from the file loses its edge.
 
     Raises:
         FileNotFoundError: If the file does not exist.
@@ -368,36 +396,35 @@ def index_file(
     if not file_path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
 
-    content = file_path.read_text(encoding="utf-8")
+    content = read_source(file_path)
     doc_name = _document_name(file_path, repo_root)
 
-    # Query all entity names/labels in this repo (or just `names`)
-    query = """
-    MATCH (n {repo_id: $repo_id})
-    WHERE n.name IS NOT NULL AND ($names IS NULL OR n.name IN $names)
-    RETURN DISTINCT n.name as name, labels(n)[0] as label
-    """
-    results = engine.run_cypher(query, {"repo_id": repo_id, "names": sorted(names) if names is not None else None})
-    known_entities = [(row["name"], row["label"]) for row in results]
+    # Every entity name/label in this repo (or just `names`)
+    known_entities = engine.entity_names(repo_id, sorted(names) if names is not None else None)
 
     # Extract mentions
     extractor = MentionsExtractor(repo_id, ambiguous_mode=ambiguous_mode)
     result = extractor.extract_from_source(content, doc_name, known_entities)
 
-    _upsert_documents(engine, result)
-
-    # Upsert relationships
-    engine.upsert_relationships(
-        [
-            {
-                "from_label": rel.source_label,
-                "from_name": rel.source_name,
-                "rel_type": rel.relationship_type,
-                "to_label": rel.target_label,
-                "to_name": rel.target_name,
-                "repo_id": repo_id,
-                "properties": {},
-            }
-            for rel in result.relationships
-        ]
-    )
+    nodes = [
+        {"label": doc.label, "repo_id": doc.repo_id, "name": doc.name, "properties": doc.properties}
+        for doc in result.documents
+    ]
+    rels = [
+        {
+            "from_label": rel.source_label,
+            "from_name": rel.source_name,
+            "rel_type": rel.relationship_type,
+            "to_label": rel.target_label,
+            "to_name": rel.target_name,
+            "repo_id": repo_id,
+            "properties": {},
+            "origin": doc_name,
+        }
+        for rel in result.relationships
+    ]
+    if names is None:
+        engine.replace_mentions(repo_id, doc_name, nodes, rels)
+    else:
+        engine.upsert_nodes(nodes)
+        engine.upsert_relationships(rels)

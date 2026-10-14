@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 # handful of not-yet-delivered events around.
 _QUEUE_MAXSIZE = 32
 
+#: Queued by `EventBroadcaster.close`: the stream reading it ends.
+CLOSED = None
+
 
 class EventBroadcaster:
     """Holds subscriber queues; safe to publish into from any thread."""
@@ -35,6 +38,7 @@ class EventBroadcaster:
         self._queues: set[asyncio.Queue] = set()
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._closed = False
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Register the dashboard's event loop. Called once, from the
@@ -63,7 +67,26 @@ class EventBroadcaster:
         queue: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
         with self._lock:
             self._queues.add(queue)
+            if self._closed:
+                queue.put_nowait(CLOSED)
         return queue
+
+    def close(self) -> None:
+        """End every client's stream (each queue gets `CLOSED`), now and for
+        any client subscribing later. Called when the agent shuts down: an
+        open stream would otherwise hold uvicorn's graceful shutdown until its
+        timeout. Safe to call from any thread."""
+        with self._lock:
+            self._closed = True
+            loop = self._loop
+            queues = list(self._queues)
+        if loop is None:
+            return
+        for queue in queues:
+            try:
+                loop.call_soon_threadsafe(_put_dropping_oldest, queue, CLOSED)
+            except RuntimeError:
+                return  # the loop has closed: no stream is left to end
 
     def unsubscribe(self, queue: asyncio.Queue) -> None:
         with self._lock:

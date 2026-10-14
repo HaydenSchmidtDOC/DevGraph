@@ -6,6 +6,7 @@ live Neo4j instance, asserts repo_id scoping holds, cleans up after.
 """
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.mcp.tools import (
@@ -135,8 +136,8 @@ class TestExplainDecision:
         assert "note-perf" in result["backed_by"]
 
     def test_explain_decision_not_found(self, seeded_graph):
-        result = explain_decision(seeded_graph, "test_repo_a", "nonexistent")
-        assert result["documents"] == []
+        with pytest.raises(ToolError, match="no design decision named 'nonexistent' in repository 'test_repo_a'"):
+            explain_decision(seeded_graph, "test_repo_a", "nonexistent")
 
 
 class TestFindRequirementsFor:

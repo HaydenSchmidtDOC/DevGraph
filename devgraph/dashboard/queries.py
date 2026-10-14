@@ -14,12 +14,6 @@ from typing import Any
 
 from devgraph.graph.engine import GraphEngine
 
-# Same label set search_component (mcp/tools.py) searches over -- these are
-# the "nameable component" labels a human would plausibly type into a
-# search box, as opposed to e.g. Commit/PullRequest/Requirement rows.
-_SEARCHABLE_LABELS = "n:Service OR n:Module OR n:Class OR n:Function OR n:Endpoint"
-
-
 def count_nodes(engine: GraphEngine, repo_id: str) -> int:
     """Cheap total node count for a repo, used by the `/api/repos` list."""
     results = engine.run_cypher(
@@ -107,27 +101,24 @@ def search_components(
     max_results: int,
     project_labels: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Lightweight rows for the node browser's search box.
+    """Lightweight rows for the node browser's search box, best first.
 
-    Same match logic `mcp.tools.search_component` uses (name/description
-    substring over the same label set), trimmed to the {id, name, label,
-    file} shape the dashboard actually renders. `project_labels` are a repo's
-    applied schema labels, searched in addition to the built-in set; the caller
-    must take them from the applied schema (never from user input) since a
-    label cannot be parameterized.
+    Ranked the way `mcp.tools.search_component` ranks (`ranked_search`: exact
+    name, then name prefix, then substring, then description), over the same
+    label set, for the whole query as one case-insensitive term, trimmed to
+    the {id, name, label, file} shape the dashboard actually renders.
+    `project_labels` are a repo's applied schema labels, searched in addition
+    to the built-in set; the caller must take them from the applied schema
+    (never from user input) since a label cannot be parameterized.
     """
-    searchable = _SEARCHABLE_LABELS + "".join(f" OR n:`{label}`" for label in project_labels or [])
-    rows = engine.run_cypher(
-        f"MATCH (n {{repo_id: $repo_id}}) "
-        f"WHERE ({searchable}) "
-        "AND (toLower(n.name) CONTAINS toLower($query) "
-        "OR toLower(n.description) CONTAINS toLower($query)) "
-        "RETURN elementId(n) AS id, n.name AS name, labels(n)[0] AS label, "
-        "coalesce(n.source_file, n.file, n.source) AS file "
-        "LIMIT $limit",
-        {"repo_id": repo_id, "query": query, "limit": max_results},
+    from devgraph.mcp.tools import _SEARCH_LABELS, _name_variants, ranked_search
+
+    terms = [query.lower()]
+    labels = _SEARCH_LABELS + tuple(label for label in project_labels or [] if label not in _SEARCH_LABELS)
+    rows, _count, _lower_bound = ranked_search(
+        engine, labels, terms, _name_variants(query, terms), max(1, max_results), repo_id=repo_id
     )
-    return rows
+    return [{"id": r["id"], "name": r["name"], "label": r["labels"][0], "file": r["file"]} for r in rows]
 
 
 def total_counts(engine: GraphEngine) -> dict[str, Any]:
