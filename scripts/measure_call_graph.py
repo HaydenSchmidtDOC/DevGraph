@@ -368,7 +368,7 @@ def measure_m6(engine: GraphEngine, repo_id: str, timings: dict) -> dict:
 # --- fixture mode ----------------------------------------------------------------
 
 FIXTURES = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "callgraph"
-FIXTURE_LANGUAGES = ["ts", "go", "java", "kotlin", "csharp", "rust", "cpp"]
+FIXTURE_LANGUAGES = ["ts", "react", "go", "java", "kotlin", "csharp", "rust", "cpp"]
 
 # M4: callee names that must never rank in a fixture's PageRank top five (the
 # container, string and runtime methods every language's stoplist drops).

@@ -19,6 +19,9 @@ Parses a .js/.jsx/.mjs/.cjs/.ts/.tsx/.mts/.cts file and extracts:
   - CONTAINS relationships (Module/Class -> Class/Function)
   - CALLS relationships, name-resolved the same way as the Python extractor:
     `foo()` -> 'foo', `obj.foo()`/`this.foo()` -> 'foo' (the member name).
+    A JSX element rendering a component (`<Button />`, `<Ui.Button>`; not
+    an intrinsic `<div>`) is a call of it, resolved like `Button()` but
+    never by bare name alone.
   - IMPORTS relationships from ES module `import`/`export ... from` syntax
     and CommonJS `require()` calls.
   - JSDoc (`/** ... */`) comments immediately preceding a class/function as
@@ -203,12 +206,30 @@ def _docstring_summary(full_text: str, max_chars: int = 120) -> str:
     return first_line
 
 
+#: A JSX element's opening tag: `<Button>` and `<Button />`.
+_JSX_TAGS = ("jsx_opening_element", "jsx_self_closing_element")
+
+
+def _jsx_component(node: Node) -> Node | None:
+    """The name of a JSX element that renders a component, a call of it:
+    a capitalised identifier (`<Button />`) or a member expression
+    (`<Ui.Button>`); None for an intrinsic tag (`<div>`, `<svg:rect>`)."""
+    name = node.child_by_field_name("name")
+    if name is None:
+        return None
+    if name.type == "member_expression" or (name.type == "identifier" and name.text[:1].isupper()):
+        return name
+    return None
+
+
 def _call_functions(body: Node) -> list[Node]:
-    """The `function` node of every call expression in `body`, not descending
-    into nested function/class scopes - those are walked separately so calls
-    are attributed to the correct enclosing scope rather than hoisted to the
-    outer function (mirrors the Python extractor's `_call_functions`).
-    `require(...)` is module-system syntax, captured by `_extract_imports`."""
+    """The `function` node of every call expression in `body`, and the name
+    of every JSX element rendering a component (`_jsx_component`), not
+    descending into nested function/class scopes - those are walked
+    separately so calls are attributed to the correct enclosing scope rather
+    than hoisted to the outer function (mirrors the Python extractor's
+    `_call_functions`). `require(...)` is module-system syntax, captured by
+    `_extract_imports`."""
     found: list[Node] = []
 
     def walk(node: Node) -> None:
@@ -218,6 +239,8 @@ def _call_functions(body: Node) -> list[Node]:
             func = node.child_by_field_name("function")
             if func is not None and not (func.type == "identifier" and func.text == b"require"):
                 found.append(func)
+        elif node.type in _JSX_TAGS and (name := _jsx_component(node)) is not None:
+            found.append(name)
         for child in node.children:
             walk(child)
 
@@ -1085,7 +1108,10 @@ def extract_js_file(
     ) -> None:
         by_name = calls.setdefault((caller_label, caller_name, caller_owner), {})
         for func in _call_functions(body):
+            jsx = func.parent is not None and func.parent.type in _JSX_TAGS
             for name, pin, member in resolver.resolve(func, scope):
+                if pin is None and jsx:
+                    continue  # a component nothing resolves links nothing, never by name alone
                 entry = by_name.setdefault(name, [set(), False, set(), True])
                 if pin is None:
                     entry[1] = True

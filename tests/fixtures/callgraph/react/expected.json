@@ -1,0 +1,241 @@
+{
+  "language": "react",
+  "description": "A small React + TypeScript app: components rendered by JSX (self-closing, paired, in a fragment and in a prop, through a barrel and a namespace import, a default export, .jsx files), next to intrinsic tags, a prop component, a class component and external components.",
+  "calls": [
+    {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "Header",
+      "callee_file": "src/layout/Header.jsx",
+      "note": "jsx-component"
+    },
+    {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "Card",
+      "callee_file": "src/components/Button.tsx",
+      "note": "barrel"
+    },
+    {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "Button",
+      "callee_file": "src/components/Button.tsx",
+      "not_files": [
+        "src/layout/Header.jsx"
+      ],
+      "note": "barrel"
+    },
+    {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "Icon",
+      "callee_file": "src/components/icons/Icon.tsx",
+      "note": "namespace-member"
+    },
+    {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "Toast",
+      "callee_file": "src/Toast.tsx",
+      "note": "default-export"
+    },
+    {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "Footer",
+      "callee_file": "src/App.tsx",
+      "note": "same-file"
+    },
+    {
+      "caller": "Header",
+      "caller_file": "src/layout/Header.jsx",
+      "callee": "Button",
+      "callee_file": "src/components/Button.tsx",
+      "note": "jsx-file"
+    },
+    {
+      "caller": "Header",
+      "caller_file": "src/layout/Header.jsx",
+      "callee": "Title",
+      "callee_file": "src/layout/Header.jsx",
+      "note": "jsx-file"
+    },
+    {
+      "caller": "Root",
+      "caller_file": "src/main.tsx",
+      "callee": "App",
+      "callee_file": "src/App.tsx",
+      "note": "jsx-component"
+    },
+    {
+      "caller": "useCart",
+      "caller_file": "src/hooks/useCart.ts",
+      "callee": "formatPrice",
+      "callee_file": "src/lib/format.ts"
+    },
+    {
+      "caller": "CartPage",
+      "caller_file": "src/pages/CartPage.tsx",
+      "callee": "useCart",
+      "callee_file": "src/hooks/useCart.ts",
+      "note": "hook"
+    },
+    {
+      "caller": "CartPage",
+      "caller_file": "src/pages/CartPage.tsx",
+      "callee": "Card",
+      "callee_file": "src/components/Button.tsx",
+      "note": "fragment"
+    },
+    {
+      "caller": "CartPage",
+      "caller_file": "src/pages/CartPage.tsx",
+      "callee": "Button",
+      "callee_file": "src/components/Button.tsx",
+      "not_files": [
+        "src/layout/Header.jsx"
+      ],
+      "note": "fragment"
+    },
+    {
+      "caller": "HomePage",
+      "caller_file": "src/pages/HomePage.jsx",
+      "callee": "Header",
+      "callee_file": "src/layout/Header.jsx",
+      "note": "jsx-file"
+    },
+    {
+      "caller": "AppRoutes",
+      "caller_file": "src/routes.tsx",
+      "callee": "HomePage",
+      "callee_file": "src/pages/HomePage.jsx",
+      "note": "element-prop"
+    },
+    {
+      "caller": "AppRoutes",
+      "caller_file": "src/routes.tsx",
+      "callee": "CartPage",
+      "callee_file": "src/pages/CartPage.tsx",
+      "note": "element-prop"
+    }
+  ],
+  "imports": [
+    {
+      "from_file": "src/App.tsx",
+      "to_file": "src/components/index.ts"
+    },
+    {
+      "from_file": "src/App.tsx",
+      "to_file": "src/Modal.tsx"
+    },
+    {
+      "from_file": "src/App.tsx",
+      "to_file": "src/Toast.tsx"
+    },
+    {
+      "from_file": "src/App.tsx",
+      "to_file": "src/layout/Header.jsx"
+    },
+    {
+      "from_file": "src/layout/Header.jsx",
+      "to_file": "src/components/Button.tsx"
+    },
+    {
+      "from_file": "src/main.tsx",
+      "to_file": "src/App.tsx"
+    },
+    {
+      "from_file": "src/components/index.ts",
+      "to_file": "src/components/Button.tsx",
+      "kind": "re-export"
+    },
+    {
+      "from_file": "src/components/index.ts",
+      "to_file": "src/components/icons/Icon.tsx",
+      "kind": "re-export"
+    },
+    {
+      "from_file": "src/hooks/useCart.ts",
+      "to_file": "src/lib/format.ts"
+    },
+    {
+      "from_file": "src/pages/CartPage.tsx",
+      "to_file": "src/hooks/useCart.ts"
+    },
+    {
+      "from_file": "src/pages/CartPage.tsx",
+      "to_file": "src/components/index.ts"
+    },
+    {
+      "from_file": "src/pages/HomePage.jsx",
+      "to_file": "src/layout/Header.jsx"
+    },
+    {
+      "from_file": "src/routes.tsx",
+      "to_file": "src/pages/CartPage.tsx"
+    },
+    {
+      "from_file": "src/routes.tsx",
+      "to_file": "src/pages/HomePage.jsx"
+    }
+  ],
+  "no_edge": [
+    {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "Slot",
+      "note": "prop-component"
+    },
+    {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "Modal",
+      "note": "class-component"
+    },
+    {
+      "caller": "Footer",
+      "caller_file": "src/App.tsx",
+      "callee": "Link",
+      "note": "external-component"
+    },
+    {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "map"
+    },
+    {
+      "caller": "AppRoutes",
+      "caller_file": "src/routes.tsx",
+      "callee": "Route",
+      "note": "external-component"
+    },
+    {
+      "caller": "AppRoutes",
+      "caller_file": "src/routes.tsx",
+      "callee": "Routes",
+      "note": "external-component"
+    },
+    {
+      "caller": "formatPrice",
+      "caller_file": "src/lib/format.ts",
+      "callee": "toFixed"
+    }
+  ],
+  "notes": {
+    "jsx-component": "A JSX element whose tag is a capitalised name or a member expression renders that component: a call of it, resolved like `Header()`.",
+    "barrel": "Imported through components/index.ts, which re-exports Button.tsx: the barrel's prefix reaches the defining file (package confidence).",
+    "namespace-member": "`<Ui.Icon />` on `import * as Ui from './components'` is the namespace's member, reached through the barrel's `export *`.",
+    "default-export": "A default-exported function component rendered under its import name.",
+    "same-file": "A component defined in the same file.",
+    "jsx-file": "A .jsx file (the JavaScript grammar) renders components the same way.",
+    "prop-component": "`<Slot />` renders a parameter: no repository function.",
+    "class-component": "`<Modal />` renders a class component, a Class node: no Function edge.",
+    "external-component": "`<Link />` comes from react-router-dom, outside the repository.",
+    "scope": "Intrinsic tags (`<main>`, `<li>`, `<svg>`, `<path>`) are no calls. Elements inside an anonymous arrow (the `rows.map` callback, Root's `Slot` arrow) are not attributed to anyone, as calls there are not; none of them renders a component here.",
+    "imports-format": "In-repo ES imports and `export ... from` re-exports, file to file; external packages give none.",
+    "hook": "A hook is a plain function call.",
+    "fragment": "Components inside a fragment (`<>...</>`, which has no tag) render as anywhere else.",
+    "element-prop": "`element={<HomePage />}` renders HomePage from AppRoutes: a JSX attribute's expression is no nested scope."
+  }
+}

@@ -274,6 +274,20 @@ Tiers, first match wins:
 A parameter shadows an import of its name, as in Python. Calls inside an
 anonymous function (a callback, an IIFE) are still not attributed to anyone.
 
+**JSX** (index format 16, audit 5 item 4). An opening or self-closing JSX
+element whose tag is a capitalised identifier (`<Button />`) or a member
+expression (`<Ui.Button>`) renders that component: a call site of its
+name, in `.jsx`, `.tsx` and `.js` files alike, resolved by the tiers above
+(the file's own, an import with a barrel's prefix, a namespace member). A
+tag nothing resolves (a parameter `<Slot />`, an external package's
+`<Link />`, `<this.Foo />`) links nothing: no bare-name row. An intrinsic
+tag (`<div>`, `<svg:rect>`) and a fragment are no calls, and a class
+component is a Class, which no `CALLS` row reaches. As for calls, an
+element inside an anonymous arrow (`items.map(i => <Row />)`) is not
+attributed. The ts fixture's two renders link (precision unchanged at
+100 %), and a React fixture (`tests/fixtures/callgraph/react`) goes from
+2 of 16 calls to 16 of 16, linked precision 100 %.
+
 ## Kotlin parse recovery (`devgraph/indexer/kotlin/extractor.py`)
 
 1. When the tree has errors, reparse a same-length patch that turns ` }`

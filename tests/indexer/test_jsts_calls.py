@@ -182,6 +182,52 @@ def test_a_resolved_call_suppresses_the_bare_row_of_the_same_name():
 # --- live: the INDEX_FORMAT 6 upgrade ------------------------------------------
 
 
+JSX = """
+    import { Button } from './components/Button';
+    import * as Ui from './ui';
+    import Card from './Card';
+    import { Link } from 'react-router-dom';
+
+    function Local() { return <span />; }
+
+    export function App({ Slot }) {
+      return (
+        <div>
+          <Button label="x" />
+          <Ui.Panel><Card /></Ui.Panel>
+          <Local />
+          <Slot />
+          <Link to="/" />
+          <this.Foo />
+          <Missing />
+          <svg:rect />
+          {[1].map((i) => <Button key={i} />)}
+        </div>
+      );
+    }
+"""
+
+
+def test_a_jsx_component_is_a_call_of_it():
+    """A capitalised or member-expression tag renders a component: a call,
+    resolved like one (an import, a namespace member, a default import, the
+    file's own); a parameter, an external package's component, a tag
+    nothing binds and an intrinsic tag link nothing, never a bare name."""
+    found = calls(JSX, "src/App.tsx")
+    assert {(n, f, conf) for c, n, f, conf in found if c == "App"} == (
+        {("Button", f, "resolved") for f in candidates("src/components/Button")}
+        | {("Button", "src/components/Button/", "package")}
+        | {("Card", f, "resolved") for f in candidates("src/Card")} | {("Card", "src/Card/", "package")}
+        | {("Panel", f, "resolved") for f in candidates("src/ui")} | {("Panel", "src/ui/", "package")}
+        | {("Local", "src/App.tsx", "resolved")}
+    )
+    # A .jsx file (the JavaScript grammar) renders the same way.
+    jsx = "import { Button } from './Button';\nexport function Bar() { return <nav><Button /></nav>; }\n"
+    assert targets(jsx, "Bar", "Button", "src/Bar.jsx") == (
+        {(f, "resolved") for f in candidates("src/Button")} | {("src/Button/", "package")}
+    )
+
+
 def test_the_index_upgrade_replaces_bare_js_calls(tmp_path, monkeypatch):
     """A graph indexed before format 6 has bare JS CALLS with no confidence,
     Modules without `dir`/`basename` and no resolver fingerprint; catch_up's
@@ -261,4 +307,60 @@ def test_the_index_upgrade_replaces_bare_js_calls(tmp_path, monkeypatch):
     finally:
         for each in (repo_id, f"{repo_id}_fresh"):
             engine.delete_repository(each)
+        engine.close()
+
+
+def test_a_rendered_component_follows_its_definition(tmp_path):
+    """`<Card />` links Card where it is defined; it goes when Card does and
+    comes back when Card is defined again, as a fresh scan."""
+    import uuid
+
+    import pytest
+
+    from devgraph.graph.engine import GraphEngine, provision_repository_schema
+    from devgraph.indexer.dispatch import full_scan, index_paths
+    from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
+
+    engine = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
+    try:
+        engine.verify_connectivity()
+    except Exception as e:
+        pytest.skip(f"Neo4j not available: {e}")
+    repo_id = f"zz-jsx-{uuid.uuid4().hex[:8]}"
+    try:
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src/App.tsx").write_text(
+            "import { Card } from './Card';\n\nexport function App() {\n  return <main><Card /></main>;\n}\n"
+        )
+        card = tmp_path / "src/Card.tsx"
+        card.write_text("export const Card = () => <section />;\n")
+        provision_repository_schema(engine, tmp_path)
+        engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+        full_scan(engine, repo_id, tmp_path)
+
+        def edges():
+            rows = engine.run_cypher(
+                "MATCH (:Function {repo_id: $r, name: 'App'})-[c:CALLS]->(b) RETURN b.name AS n, b.file AS f, "
+                "c.confidence AS c",
+                {"r": repo_id},
+            )
+            return sorted((row["n"], row["f"], row["c"]) for row in rows)
+
+        def equals_fresh():
+            expected, actual = fresh_snapshot(engine, repo_id, tmp_path), graph_snapshot(engine, repo_id)
+            if actual != expected:
+                pytest.fail("graph does not equal a fresh full_scan:\n" + snapshot_diff(expected, actual))
+
+        assert edges() == [("Card", "src/Card.tsx", "resolved")]
+        card.write_text("export const other = 1;\n")
+        index_paths(engine, repo_id, tmp_path, {card})
+        assert edges() == []
+        equals_fresh()
+        card.write_text("export function Card() {\n  return <section />;\n}\n")
+        index_paths(engine, repo_id, tmp_path, {card})
+        assert edges() == [("Card", "src/Card.tsx", "resolved")]
+        equals_fresh()
+    finally:
+        engine.delete_repository(repo_id)
+        engine.delete_repository(f"{repo_id}_fresh")
         engine.close()

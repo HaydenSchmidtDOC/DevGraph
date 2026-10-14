@@ -143,7 +143,8 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: 16: Python absolute imports also tried under each ancestor's `src/` and
 #: the source roots a pyproject.toml declares; Rust calls and imports
 #: through `pub use` re-exports (resolver configuration); a Kotlin
-#: anonymous companion object's members (owner `Class.Companion`).
+#: anonymous companion object's members (owner `Class.Companion`); JSX
+#: component elements as calls.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 16
 
