@@ -739,7 +739,8 @@ def test_cli_client_config_vscode_creates_new_mcp_json(runner, temp_registry_db,
         data = json.loads(mcp_json.read_text(encoding="utf-8"))
         assert data["servers"]["devgraph"]["args"] == ["-P", "-m", "devgraph.mcp.server"]
         assert data["servers"]["devgraph"]["type"] == "stdio"
-        assert Path(data["servers"]["devgraph"]["cwd"]).is_absolute()
+        # The open workspace, as Claude Code's session uses its project folder; never the DevGraph checkout.
+        assert data["servers"]["devgraph"]["cwd"] == "${workspaceFolder}"
 
 
 def test_cli_client_config_vscode_preserves_existing_servers(runner, temp_registry_db, monkeypatch):

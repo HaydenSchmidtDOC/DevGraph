@@ -1553,7 +1553,13 @@ def _vscode_mcp_config_path() -> Path:
     return config_home / "Code" / "User" / "mcp.json"
 
 
-def _register_vscode(python_path: Path, repo_root: Path) -> bool:
+#: VS Code's working folder for the server: the open workspace, so the session
+#: answers for the repository being edited (as Claude Code's does), not for
+#: the DevGraph checkout.
+VSCODE_SERVER_CWD = "${workspaceFolder}"
+
+
+def _register_vscode(python_path: Path) -> bool:
     """Upsert a 'devgraph' entry into VS Code's user-level mcp.json.
 
     Merges into any existing file rather than overwriting it — other
@@ -1577,7 +1583,7 @@ def _register_vscode(python_path: Path, repo_root: Path) -> bool:
         "type": "stdio",
         "command": str(python_path),
         "args": list(MCP_SERVER_ARGS),
-        "cwd": str(repo_root),
+        "cwd": VSCODE_SERVER_CWD,
     }
 
     try:
@@ -1640,17 +1646,75 @@ def _wrong_scope_help(scope: str, repo_root: Path) -> str:
     )
 
 
-def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path) -> bool:
+def _registered_command(output: str) -> str | None:
+    """The server command in `claude mcp get`'s output (its `Command:` line), or None."""
+    for line in output.splitlines():
+        if line.strip().lower().startswith("command:"):
+            command = line.split(":", 1)[1].strip()
+            # An output that puts the arguments on the same line
+            marker = f" {' '.join(MCP_SERVER_ARGS)}"
+            return command.split(marker, 1)[0].strip().strip('"') or None
+    return None
+
+
+def _same_path(a: str, b: Path) -> bool:
+    """Same path as written (symlinks not followed: every venv's python links to
+    the same interpreter)."""
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(str(b)))
+
+
+#: Re-registers a user-scope entry that names another checkout's Python.
+MCP_REPLACE_HINT = "devgraph mcp add --replace"
+
+
+def _stale_registration(output: str, python_path: Path) -> tuple[str, str] | None:
+    """("missing" | "other", the registered command) when the user-scope entry
+    doesn't run this checkout's Python, else None. "missing": the command no
+    longer exists (the checkout or its .venv was moved or deleted), so Claude
+    Code can't start the server; "other": another existing checkout's."""
+    command = _registered_command(output)
+    if command is None or _same_path(command, python_path):
+        return None
+    return ("other" if Path(command).exists() else "missing"), command
+
+
+def _stale_help(kind: str, command: str, python_path: Path) -> str:
+    if kind == "missing":
+        return (
+            f"'devgraph' is registered with Claude Code to run {command}, which no longer exists, so the "
+            f"server can't start. To register this checkout ({python_path}) instead, run '{MCP_REPLACE_HINT}'."
+        )
+    return (
+        f"'devgraph' is registered with Claude Code to run another checkout's Python ({command}), not this "
+        f"one ({python_path}). To switch to this checkout, run '{MCP_REPLACE_HINT}'."
+    )
+
+
+def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path, replace: bool = False) -> bool:
     """Register 'devgraph' with Claude Code in user scope via `claude mcp add`.
 
-    Skips an existing user-scope registration. A local- or project-scope one
-    is reported with how to move it, and nothing is added: Claude Code
-    prefers it over a user-scope entry in that folder.
+    Skips an existing user-scope registration of this checkout. One that runs
+    another checkout's Python is reported with the fix (failing when that
+    Python no longer exists), or with `replace` removed and added again. A
+    local- or project-scope one is reported with how to move it, and nothing
+    is added: Claude Code prefers it over a user-scope entry in that folder.
     """
     scope, output = _claude_mcp_registration(claude_path, repo_root)
     if scope == "user":
-        console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
-        return True
+        stale = _stale_registration(output, python_path)
+        if stale is None:
+            console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
+            return True
+        kind, command = stale
+        if not replace:
+            marker = "[red][X][/red]" if kind == "missing" else "[yellow][!][/yellow]"
+            console.print(f"{marker} {escape(_stale_help(kind, command, python_path))}", soft_wrap=True)
+            return kind != "missing"
+        console.print(f"\n[bold]Running:[/bold] claude mcp remove -s {CLAUDE_MCP_SCOPE} devgraph")
+        removed = subprocess.run([claude_path, "mcp", "remove", "-s", CLAUDE_MCP_SCOPE, "devgraph"], cwd=str(repo_root))
+        if removed.returncode != 0:
+            return False
+        scope = None
     if scope == "unknown":
         # registered in a scope this can't read, or `mcp get` timed out: leave it alone
         console.print(f"[yellow][!][/yellow] Claude Code: not adding 'devgraph'; its registration is unclear: {escape(output.strip())}", soft_wrap=True)
@@ -1671,13 +1735,18 @@ app.add_typer(mcp_app, name="mcp")
 
 
 @mcp_app.command(name="add")
-def mcp_add() -> None:
+def mcp_add(
+    replace: bool = typer.Option(
+        False, "--replace",
+        help="Replace a user-scope registration that runs another checkout's Python (or one that no longer exists).",
+    ),
+) -> None:
     """Register DevGraph as an MCP server for every Claude Code project (runs 'claude mcp add -s user')."""
     claude_path = shutil.which("claude")
     if claude_path is None:
         console.print("[red][X] Error:[/red] 'claude' not found on PATH")
         raise typer.Exit(code=1)
-    if not _run_claude_mcp_add(claude_path, resolve_venv_python(), resolve_repo_root()):
+    if not _run_claude_mcp_add(claude_path, resolve_venv_python(), resolve_repo_root(), replace=replace):
         raise typer.Exit(code=1)
 
 
@@ -1707,7 +1776,14 @@ def mcp_doctor() -> None:
         console.print(f"[green][OK][/green] claude CLI at {escape(claude_path)}")
         repo_root = resolve_repo_root()
         scope, output = _claude_mcp_registration(claude_path, repo_root)
-        if scope in ("user", "unknown"):
+        stale = _stale_registration(output, resolve_venv_python()) if scope == "user" else None
+        if stale is not None:
+            kind, command = stale
+            marker = "[red][X][/red]" if kind == "missing" else "[yellow][!][/yellow]"
+            console.print(f"{marker} {escape(_stale_help(kind, command, resolve_venv_python()))}", soft_wrap=True)
+            console.print(escape(output.strip()))
+            any_failed = any_failed or kind == "missing"
+        elif scope in ("user", "unknown"):
             console.print(f"[green][OK][/green] 'devgraph' registered{' (user scope)' if scope == 'user' else ''}")
             console.print(escape(output.strip()))
         elif scope is not None:
@@ -1764,7 +1840,7 @@ def client_config(
         console.print("## Connect DevGraph as an MCP server\n")
         console.print(f"- **command**: {escape(str(python_path))}")
         console.print(f"- **args**: {' '.join(MCP_SERVER_ARGS)}")
-        console.print(f"- **cwd**: {escape(str(repo_root))}\n")
+        console.print("- **cwd**: the repository you are working in (VS Code: ${workspaceFolder})\n")
         if want_claude:
             console.print("```bash")
             console.print(escape(mcp_add_line), soft_wrap=True)
@@ -1777,7 +1853,7 @@ def client_config(
                     "type": "stdio",
                     "command": str(python_path),
                     "args": list(MCP_SERVER_ARGS),
-                    "cwd": str(repo_root),
+                    "cwd": VSCODE_SERVER_CWD,
                 }}},
                 indent=2,
             )))
@@ -1793,7 +1869,7 @@ def client_config(
             elif not _run_claude_mcp_add(claude_path, python_path, repo_root):
                 any_failed = True
         if want_vscode:
-            if not _register_vscode(python_path, repo_root):
+            if not _register_vscode(python_path):
                 any_failed = True
         if any_failed:
             raise typer.Exit(code=1)

@@ -179,3 +179,90 @@ def test_a_hanging_mcp_get_is_bounded_and_reads_as_unknown(claude, monkeypatch):
     monkeypatch.setattr(cli_main.subprocess, "run", hang)
     scope, output = cli_main._claude_mcp_registration("/usr/bin/claude", claude.root)
     assert scope == "unknown" and seen["timeout"] == 60
+
+
+# --- a registration left pointing at another or a deleted checkout ----------------
+
+
+def _registered_at(command):
+    return _USER_GET.replace("Command: /venv/bin/python", f"Command: {command}")
+
+
+def test_mcp_add_fails_on_a_registration_whose_python_no_longer_exists(claude, tmp_path):
+    gone = tmp_path / "old-clone" / ".venv" / "bin" / "python"
+    claude.registered(_registered_at(gone))
+    result = _invoke("mcp", "add")
+    assert result.exit_code == 1
+    out = " ".join(result.stdout.split())
+    assert "no longer exists" in out and str(gone) in out
+    assert "devgraph mcp add --replace" in out
+    assert _adds(claude) == []
+
+
+def test_mcp_add_warns_about_another_checkouts_registration(claude, tmp_path):
+    other = tmp_path / "other-clone" / "python"
+    other.parent.mkdir()
+    other.write_text("")
+    claude.registered(_registered_at(other))
+    result = _invoke("mcp", "add")
+    assert result.exit_code == 0, result.stdout
+    out = " ".join(result.stdout.split())
+    assert "another checkout" in out and "devgraph mcp add --replace" in out
+    assert _adds(claude) == []
+
+
+def test_mcp_add_replace_removes_and_adds_this_checkout(claude, tmp_path):
+    claude.registered(_registered_at(tmp_path / "gone" / "python"))
+    result = _invoke("mcp", "add", "--replace")
+    assert result.exit_code == 0, result.stdout
+    ops = [c[1:3] + c[3:5] for c in claude.calls() if c[1:3] in (["mcp", "remove"], ["mcp", "add"])]
+    assert ops == [["mcp", "remove", "-s", "user"], ["mcp", "add", "-s", "user"]]
+    (add,) = _adds(claude)
+    assert add[add.index("--") + 1] == "/venv/bin/python"
+
+
+def test_mcp_add_replace_leaves_this_checkouts_registration_alone(claude):
+    claude.registered(_USER_GET)
+    result = _invoke("mcp", "add", "--replace")
+    assert result.exit_code == 0, result.stdout
+    assert "already registered" in result.stdout
+    assert [c for c in claude.calls() if c[1:3] != ["mcp", "get"]] == []
+
+
+def test_mcp_doctor_fails_a_registration_whose_python_no_longer_exists(claude, tmp_path):
+    gone = tmp_path / "moved" / "python"
+    claude.registered(_registered_at(gone))
+    result = _invoke("mcp", "doctor")
+    assert result.exit_code == 1
+    out = " ".join(result.stdout.split())
+    assert "no longer exists" in out and "devgraph mcp add --replace" in out
+
+
+def test_mcp_doctor_warns_but_passes_for_another_existing_checkout(claude, tmp_path):
+    other = tmp_path / "python"
+    other.write_text("")
+    claude.registered(_registered_at(other))
+    result = _invoke("mcp", "doctor")
+    out = " ".join(result.stdout.split())
+    assert "another checkout" in out and "devgraph mcp add --replace" in out
+    assert result.exit_code == 0, out
+
+
+def test_vscode_entry_round_trips_with_the_workspace_folder(claude, tmp_path, monkeypatch):
+    config = tmp_path / "Code" / "User" / "mcp.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"servers": {
+        "devgraph": {"type": "stdio", "command": "/old/python", "args": [], "cwd": "/old/checkout"},
+        "other": {"type": "stdio", "command": "x"},
+    }}), encoding="utf-8")
+    monkeypatch.setattr(cli_main, "_vscode_mcp_config_path", lambda: config)
+    for _ in range(2):
+        result = _invoke("client-config", "--target", "vscode", "--run")
+        assert result.exit_code == 0, result.stdout
+    data = json.loads(config.read_text(encoding="utf-8"))
+    assert data["servers"]["devgraph"] == {
+        "type": "stdio", "command": "/venv/bin/python",
+        "args": ["-P", "-m", "devgraph.mcp.server"], "cwd": "${workspaceFolder}",
+    }
+    assert data["servers"]["other"] == {"type": "stdio", "command": "x"}
+    assert str(claude.root) not in config.read_text(encoding="utf-8")

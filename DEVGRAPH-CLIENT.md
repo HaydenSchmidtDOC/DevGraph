@@ -183,12 +183,12 @@ not this literal text):
 
 - **command**: <resolved path to DevGraph's venv python.exe>
 - **args**: -P -m devgraph.mcp.server
-- **cwd**: <resolved DevGraph repo root>
+- **cwd**: the repository you are working in (VS Code: ${workspaceFolder})
 
 claude mcp add -s user devgraph -- "<resolved venv python.exe>" -P -m devgraph.mcp.server
 
 VS Code (user mcp.json at <resolved path>):
-{ "servers": { "devgraph": { "type": "stdio", "command": "...", "args": [...], "cwd": "..." } } }
+{ "servers": { "devgraph": { "type": "stdio", "command": "...", "args": [...], "cwd": "${workspaceFolder}" } } }
 ```
 
 Claude Code registration is user-scoped (`-s user`), so one registration
@@ -199,7 +199,12 @@ add`, which registers in local scope, for the DevGraph checkout folder only:
 move it (`claude mcp remove devgraph -s local` in the checkout, then `devgraph
 mcp add`). A user-scope registration made before `-P` was added is left as-is
 by `--run` (an existing entry is skipped); run `devgraph mcp remove` and
-register again to pick it up. The VS Code entry is rewritten in place.
+register again to pick it up. A user-scope registration whose command is
+another checkout's Python is reported by `devgraph mcp add` and `mcp doctor`,
+and fails both when that Python no longer exists (a moved or deleted
+checkout); `devgraph mcp add --replace` removes it and registers this
+checkout. The VS Code entry is rewritten in place; its `cwd` is
+`${workspaceFolder}`, so a VS Code session answers for the open workspace.
 
 `devgraph client-config --claude-mcp-add-only` prints just the Claude Code
 one-liner; `devgraph client-config --run` also executes registration for the
