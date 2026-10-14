@@ -13,9 +13,9 @@ incremental one extract every file under the same configuration.
 A configuration file under a path the walk ignores (an ignored directory, or a
 `.gitignore` rule) is treated as absent.
 
-C#'s configuration is its projects (`csharp_projects`): each `.csproj` (its
-`<Using>` items and `<ProjectReference>`s), the nearest Directory.Build.props
-and Directory.Build.targets above it, and every `.cs` file whose head
+C#'s configuration is its projects (`csharp_projects`): each `.csproj` and
+the nearest Directory.Build.props and Directory.Build.targets above it (their
+`<Using>` items and `<ProjectReference>`s), and every `.cs` file whose head
 (`cs_global_usings`) holds a `global using`.
 """
 
@@ -31,7 +31,7 @@ from collections.abc import Callable
 from dataclasses import astuple, dataclass, replace
 from pathlib import Path
 
-from devgraph.indexer.gitignore import is_gitignored
+from devgraph.indexer.gitignore import IGNORECASE, is_gitignored
 from devgraph.indexer.walk import indexable_paths, is_ignored_path
 
 __all__ = [
@@ -177,8 +177,10 @@ class CsProject:
     `global using` directives in the heads (`cs_global_usings`) of the
     project's own .cs files, not those of a nested project. Both are sorted
     and without repeats. `references` are the directories of the projects
-    its project files' `<ProjectReference>`s reach, transitively, sorted,
-    its own left out (`_cs_project_references`)."""
+    its project files' and its nearest Directory.Build files'
+    `<ProjectReference>`s reach, transitively, sorted, its own left out
+    (`_cs_project_references`; compared case-folded where the file system
+    ignores case, `_case_key`)."""
 
     dir: str
     csproj: tuple[str, ...]
@@ -269,16 +271,20 @@ def _cs_using_items(text: str | None) -> list[tuple[str, CsUsing]]:
     return items
 
 
-def _cs_project_references(text: str | None, rel: str) -> list[str]:
-    """The project files the `<ProjectReference>` items of the project file
-    `rel` name, repo-relative and sorted: each `Include` read relative to
-    `rel`'s directory, `\\` taken as `/`. As with `<Using>` nothing is
+#: An MSBuild escape (`%20`, `%3B`) in an item's `Include`.
+_MSBUILD_ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
+#: A drive-qualified (`C:/x`) path, absolute on Windows.
+_DRIVE_PATH = re.compile(r"[A-Za-z]:/")
+
+
+def _cs_reference_items(text: str | None) -> list[str]:
+    """The `Include` paths of a project or Directory.Build file's
+    `<ProjectReference>` items, as written but with `\\` taken as `/` and
+    MSBuild's `%XX` escapes decoded, sorted. As with `<Using>` nothing is
     evaluated: an item under a `Condition` counts as if it held, and a path
-    holding a property, item or metadata reference or a wildcard is left
-    out, as is an absolute one or one leaving the repository. Only a
-    `.csproj` is read for them, not a Directory.Build file (whose relative
-    paths MSBuild reads from each importing project). A malformed file has
-    none."""
+    holding a property, item or metadata reference (`$(`, `@(`, `%(`) or a
+    wildcard (`*`, `?`) is left out, as is an absolute or drive-qualified
+    one. A malformed file has none."""
     try:
         root = ET.fromstring(text or "")
     except (ET.ParseError, ValueError):
@@ -288,12 +294,30 @@ def _cs_project_references(text: str | None, rel: str) -> list[str]:
         if not isinstance(element.tag, str) or element.tag.rpartition("}")[2] != "ProjectReference":
             continue
         for name in element.attrib.get("Include", "").split(";"):
-            name = name.strip().replace("\\", "/")
-            if not name or any(c in name for c in "$@%*:") or name.startswith("/"):
+            name = name.strip()
+            if not name or any(each in name for each in ("$(", "@(", "%(", "*", "?")):
                 continue
-            if (path := _join(posixpath.dirname(rel), name)) is not None:
-                found.add(path)
+            name = _MSBUILD_ESCAPE.sub(lambda match: chr(int(match.group(1), 16)), name).replace("\\", "/")
+            if not name.startswith("/") and not _DRIVE_PATH.match(name):
+                found.add(name)
     return sorted(found)
+
+
+def _cs_project_references(items: list[str], folder: str) -> list[str]:
+    """`_cs_reference_items`' paths read from the directory `folder` of the
+    project that imports them, repo-relative: a `.csproj`'s own, and those
+    of the nearest Directory.Build.props/.targets above it, whose relative
+    paths MSBuild also reads from each importing project. One leaving the
+    repository is left out."""
+    return sorted({path for item in items if (path := _join(folder, item)) is not None})
+
+
+def _case_key(path: str) -> str:
+    """How a referenced project file's path is compared with the
+    repository's: case-folded where the file system ignores case (as
+    `.gitignore` matching does, gitignore.IGNORECASE), so
+    `..\\core\\core.csproj` names `Core/Core.csproj` there."""
+    return path.casefold() if IGNORECASE else path
 
 
 @dataclass(frozen=True)
@@ -641,9 +665,8 @@ class ResolverConfig:
         if rel.endswith(".cs"):
             return [list(astuple(each)) for each in cs_global_usings(self.root / rel)]
         text = self._text(rel)
-        references = _cs_project_references(text, rel) if rel.endswith(".csproj") else []
         return [[op, *astuple(each)] for op, each in _cs_using_items(text)] + [
-            ["ProjectReference", path] for path in references
+            ["ProjectReference", path] for path in _cs_reference_items(text)
         ]
 
     def cs_projects(self) -> dict[str, CsProject]:
@@ -660,12 +683,15 @@ class ResolverConfig:
                     csproj.setdefault(posixpath.dirname(rel), []).append(rel)
             build = {rel for rel in files if posixpath.basename(rel) in _CS_BUILD_FILES}
 
-            def nearest(folder: str, name: str) -> list[tuple[str, CsUsing]]:
+            def nearest(folder: str, name: str) -> str | None:
                 for each in _ancestors(folder):
                     rel = f"{each}/{name}" if each else name
                     if rel in build:
-                        return _cs_using_items(self._text(rel))
-                return []
+                        return rel
+                return None
+
+            def wrapping(folder: str) -> tuple[str | None, str | None]:
+                return nearest(folder, _CS_BUILD_FILES[0]), nearest(folder, _CS_BUILD_FILES[1])
 
             global_usings: dict[str, set[CsUsing]] = {folder: set() for folder in csproj}
             for rel in files:
@@ -673,7 +699,7 @@ class ResolverConfig:
                     global_usings[owner].update(cs_global_usings(self.root / rel))
             projects = {}
             for folder, paths in sorted(csproj.items()):
-                props, targets = nearest(folder, _CS_BUILD_FILES[0]), nearest(folder, _CS_BUILD_FILES[1])
+                props, targets = (_cs_using_items(self._text(rel)) if rel else [] for rel in wrapping(folder))
                 usings: set[CsUsing] = set()
                 for path in paths:
                     kept: dict[CsUsing, None] = {}
@@ -688,13 +714,17 @@ class ResolverConfig:
                 )
             # A reference to a project file the repository does not hold
             # (missing, ignored, outside it) reaches nothing; a cycle ends
-            # where it comes back.
-            owners = {path: folder for folder, paths in csproj.items() for path in paths}
-            direct = {
-                folder: {owners[ref] for path in paths for ref in _cs_project_references(self._text(path), path)
-                         if ref in owners}
-                for folder, paths in csproj.items()
-            }
+            # where it comes back. The nearest Directory.Build files' are
+            # read from each project they wrap.
+            owners = {_case_key(path): folder for folder, paths in csproj.items() for path in paths}
+            direct = {}
+            for folder, paths in csproj.items():
+                items = [item for rel in [*paths, *wrapping(folder)] if rel
+                         for item in _cs_reference_items(self._text(rel))]
+                direct[folder] = {
+                    owners[key] for ref in _cs_project_references(items, folder)
+                    if (key := _case_key(ref)) in owners
+                }
             for folder, project in projects.items():
                 reached, todo = set(), list(direct[folder])
                 while todo:
@@ -756,8 +786,8 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
     `references` reach; for Go each go.mod's `module` line and the local
     `replace` directives of each go.mod and go.work; for Rust each
     Cargo.toml's library crate name and root (`_cargo_entries`); for C# each
-    project file's and Directory.Build.props/.targets' `<Using>` items, each
-    project file's `<ProjectReference>` paths and the `global using`
+    project file's and Directory.Build.props/.targets' `<Using>` items and
+    `<ProjectReference>` paths and the `global using`
     directives of each project's .cs files
     (`_cs_inputs`). A compiler flag, a `require` bump or a dependency or
     version change counts for nothing."""

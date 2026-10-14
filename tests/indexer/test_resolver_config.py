@@ -365,6 +365,42 @@ def test_a_backslashed_reference_and_its_change_count_in_the_fingerprint(tmp_pat
     assert fingerprints(tmp_path)["csharp"] == before
 
 
+def test_a_reference_matches_case_folded_only_where_the_file_system_ignores_case(tmp_path, monkeypatch):
+    from devgraph.indexer import resolver_config
+
+    write(tmp_path, "src/App/App.csproj", csproj(r'<ProjectReference Include="..\core\core.csproj" />'))
+    write(tmp_path, "src/Core/Core.csproj", csproj())
+    monkeypatch.setattr(resolver_config, "IGNORECASE", False)
+    assert _references(tmp_path)["src/App"] == ()
+    monkeypatch.setattr(resolver_config, "IGNORECASE", True)
+    assert _references(tmp_path)["src/App"] == ("src/Core",)
+
+
+def test_reference_paths_decode_escapes_and_keep_only_unevaluated_relative_paths(tmp_path):
+    write(tmp_path, "app/App.csproj", csproj(
+        '<ProjectReference Include="../My%20Lib/My Lib.csproj;../a$b/A.csproj;../c@d/C.csproj" />',
+        '<ProjectReference Include="../Gen/G?.csproj;$(Root)/X.csproj;C:/abs/Y.csproj;/abs/Z.csproj" />',
+    ))
+    for rel in ("My Lib/My Lib.csproj", "a$b/A.csproj", "c@d/C.csproj", "Gen/G1.csproj"):
+        write(tmp_path, rel, csproj())
+    assert _references(tmp_path)["app"] == ("My Lib", "a$b", "c@d")
+
+
+def test_directory_build_references_are_read_from_each_project_they_wrap(tmp_path):
+    write(tmp_path, "src/Directory.Build.props", csproj('<ProjectReference Include="../Shared/Shared.csproj" />'))
+    write(tmp_path, "src/Shared/Shared.csproj", csproj())
+    write(tmp_path, "Shared/Shared.csproj", csproj())  # what the path names from the props file itself
+    write(tmp_path, "src/App/App.csproj", csproj())
+    write(tmp_path, "src/Web/Web.csproj", csproj())
+    before = fingerprints(tmp_path)["csharp"]
+    references = _references(tmp_path)
+    assert references["src/App"] == references["src/Web"] == ("src/Shared",)
+    assert references["src/Shared"] == ()  # its own reference to itself
+    write(tmp_path, "src/Directory.Build.props", csproj())
+    assert _references(tmp_path)["src/App"] == ()
+    assert fingerprints(tmp_path)["csharp"]["fingerprint"] != before["fingerprint"]
+
+
 # --- live ----------------------------------------------------------------------
 
 
