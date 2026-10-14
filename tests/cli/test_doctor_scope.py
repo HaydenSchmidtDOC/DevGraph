@@ -234,3 +234,29 @@ def test_doctor_without_wait_checks_once(tmp_path):
 
     out, result = _doctor(tmp_path, Down, None)
     assert "Waiting for Neo4j" not in out and len(tries) == 1
+
+
+@pytest.mark.parametrize("code", [
+    "Neo.ClientError.Security.AuthenticationRateLimit", "Neo.ClientError.Security.CredentialsExpired",
+])
+def test_any_security_refusal_is_a_login_problem(tmp_path, code):
+    from neo4j.exceptions import Neo4jError
+
+    class Refused(_ReachableEngine):
+        def verify_connectivity(self):
+            raise Neo4jError._hydrate_neo4j(code=code, message="The client has provided incorrect credentials too many times")
+
+    out, result = _doctor(tmp_path, Refused, None)
+    neo4j = out.split("Neo4j", 1)[1].split("Podman", 1)[0]
+    assert "Refused the login" in neo4j and "DEVGRAPH_NEO4J_PASSWORD" in neo4j
+    assert "[X]" not in _podman_lines(out)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake podman is a shell script")
+def test_a_podman_failure_that_does_not_name_the_machine_gets_no_machine_claim(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli_main.sys, "platform", "darwin")
+    podman = _fake_podman(tmp_path, stderr="Error: connection refused", code=125)
+    out, _ = _doctor(tmp_path, _DownEngine, podman)
+    lines = _podman_lines(out)
+    assert "The Podman machine is stopped" not in lines
+    assert "If the Podman machine is stopped" in lines and "podman machine start" in lines

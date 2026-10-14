@@ -65,6 +65,15 @@ def _get_registry() -> RepoRegistry:
     return RepoRegistry(settings.registry_db_path)
 
 
+def _is_login_refusal(exc: Exception) -> bool:
+    """Neo4j answered and refused the login: a wrong password, too many failed
+    attempts, expired credentials (any `Neo.ClientError.Security.*`)."""
+    from neo4j.exceptions import AuthError
+
+    code = getattr(exc, "code", None)
+    return isinstance(exc, AuthError) or (isinstance(code, str) and code.startswith("Neo.ClientError.Security."))
+
+
 def _neo4j_problem(exc: Exception, settings) -> str:
     """One line for a failed Neo4j call, naming the setting to check and the file it lives in."""
     from neo4j.exceptions import AuthError, ServiceUnavailable
@@ -75,6 +84,13 @@ def _neo4j_problem(exc: Exception, settings) -> str:
     if isinstance(exc, AuthError):
         return (
             f"Neo4j at {settings.neo4j_uri} refused the username or password; check "
+            f"DEVGRAPH_NEO4J_USER and DEVGRAPH_NEO4J_PASSWORD in {env_file} (or the environment)"
+        )
+    if _is_login_refusal(exc):
+        # Too many failed logins, expired credentials and the like
+        reason = " ".join(str(getattr(exc, "message", None) or exc).split())
+        return (
+            f"Neo4j at {settings.neo4j_uri} refused the login ({reason}); check "
             f"DEVGRAPH_NEO4J_USER and DEVGRAPH_NEO4J_PASSWORD in {env_file} (or the environment)"
         )
     if isinstance(exc, ServiceUnavailable):
@@ -1248,9 +1264,7 @@ def doctor(
             console.print(f"  [red][X] Schema init failed:[/red] {escape(str(e))}")
             any_failed = True
     except Exception as e:
-        from neo4j.exceptions import AuthError
-
-        if isinstance(e, AuthError):
+        if _is_login_refusal(e):
             neo4j_answers = True
             console.print(f"  [red][X] Refused the login:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         else:
@@ -1285,10 +1299,15 @@ def doctor(
                     console.print(f"  podman ps failed (not needed: Neo4j is reachable): {escape(detail)}", soft_wrap=True)
                 else:
                     console.print(f"  [red][X] podman ps failed:[/red] {escape(detail)}", soft_wrap=True)
-                    if "machine" in detail.lower() or sys.platform in ("win32", "darwin"):
+                    if "machine" in detail.lower():
                         console.print(
                             "       The Podman machine is stopped. Start it with 'podman machine start', "
                             "then 'podman start devgraph-neo4j'."
+                        )
+                    elif sys.platform in ("win32", "darwin"):
+                        console.print(
+                            "       If the Podman machine is stopped (it does not start again after a reboot), "
+                            "start it with 'podman machine start', then 'podman start devgraph-neo4j'."
                         )
                     any_failed = True
             elif not output:
