@@ -7,6 +7,7 @@ repository left in the graph by an earlier test run or a removed repository,
 none of which the user has registered.
 """
 
+import sys
 import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -71,6 +72,87 @@ def test_missing_podman_fails_when_neo4j_is_unreachable(tmp_path):
     out, result = _doctor(tmp_path, _UnreachableEngine, None)
     assert "[X] podman not found" in _podman_lines(out)
     assert result.exit_code == 1
+
+
+
+# --- first-run failures: a refused login, a stopped machine, a stopped container ----
+
+
+class _RefusedEngine(_ReachableEngine):
+    def verify_connectivity(self):
+        from neo4j.exceptions import AuthError
+
+        raise AuthError("{neo4j_code: Neo.ClientError.Security.Unauthorized} {message: The client is unauthorized}")
+
+
+class _DownEngine(_ReachableEngine):
+    def verify_connectivity(self):
+        from neo4j.exceptions import ServiceUnavailable
+
+        raise ServiceUnavailable("Couldn't connect to 127.0.0.1:7687")
+
+
+def _fake_podman(tmp_path, stdout="", stderr="", code=0):
+    """A `podman` that prints what a real one would and exits with `code`."""
+    (tmp_path / "podman.out").write_text(stdout, encoding="utf-8")
+    (tmp_path / "podman.err").write_text(stderr, encoding="utf-8")
+    script = tmp_path / "podman"
+    script.write_text(
+        f"#!/bin/sh\ncat '{tmp_path}/podman.out'\ncat '{tmp_path}/podman.err' >&2\nexit {code}\n", encoding="utf-8"
+    )
+    script.chmod(0o755)
+    return script
+
+
+def test_a_refused_login_names_the_settings_to_check(tmp_path):
+    out, result = _doctor(tmp_path, _RefusedEngine, None)
+    neo4j = out.split("Neo4j", 1)[1].split("Podman", 1)[0]
+    assert "Refused the login" in neo4j and "Not reachable" not in neo4j
+    assert "DEVGRAPH_NEO4J_USER" in neo4j and "DEVGRAPH_NEO4J_PASSWORD" in neo4j and ".env" in neo4j
+    assert "Unauthorized" not in neo4j
+    # Neo4j answered, so a missing podman is not the problem.
+    assert "[X]" not in _podman_lines(out)
+    assert result.exit_code == 1
+
+
+def test_an_unreachable_neo4j_says_what_to_start_or_set(tmp_path):
+    out, result = _doctor(tmp_path, _DownEngine, None)
+    neo4j = out.split("Neo4j", 1)[1].split("Podman", 1)[0]
+    assert "Not reachable" in neo4j and "DEVGRAPH_NEO4J_URI" in neo4j
+    assert result.exit_code == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake podman is a shell script")
+def test_a_stopped_podman_machine_says_to_start_it(tmp_path):
+    podman = _fake_podman(
+        tmp_path,
+        stderr="Error: unable to connect to Podman socket: Cannot connect to Podman. "
+        "Please verify your connection to the Linux system, or try `podman machine start`",
+        code=125,
+    )
+    out, result = _doctor(tmp_path, _DownEngine, podman)
+    lines = _podman_lines(out)
+    assert "container not found" not in lines
+    assert "[X] podman ps failed" in lines and "Podman machine is stopped" in lines
+    assert "podman machine start" in lines
+    assert result.exit_code == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake podman is a shell script")
+def test_an_exited_container_is_reported_stopped_with_the_start_command(tmp_path):
+    podman = _fake_podman(tmp_path, stdout="devgraph-neo4j\texited\n")
+    out, result = _doctor(tmp_path, _DownEngine, podman)
+    lines = _podman_lines(out)
+    assert "[OK]" not in lines
+    assert "[X] devgraph-neo4j is exited" in lines and "podman start devgraph-neo4j" in lines
+    assert result.exit_code == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake podman is a shell script")
+def test_a_running_container_is_ok(tmp_path):
+    podman = _fake_podman(tmp_path, stdout="devgraph-neo4j\trunning\n")
+    out, result = _doctor(tmp_path, _ReachableEngine, podman)
+    assert "[OK] devgraph-neo4j running" in _podman_lines(out)
 
 
 # --- live: only registered repositories count -------------------------------------

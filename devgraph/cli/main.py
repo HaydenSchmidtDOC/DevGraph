@@ -1208,6 +1208,8 @@ def doctor() -> None:
     # 4 & 5. Neo4j reachability + schema
     console.print("[bold]Neo4j[/bold]")
     neo4j_reachable = False
+    # Neo4j answers but refuses the login: running, so Podman is not the problem.
+    neo4j_answers = False
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
     try:
         engine.verify_connectivity()
@@ -1220,7 +1222,13 @@ def doctor() -> None:
             console.print(f"  [red][X] Schema init failed:[/red] {escape(str(e))}")
             any_failed = True
     except Exception as e:
-        console.print(f"  [red][X] Not reachable:[/red] {escape(str(e))}")
+        from neo4j.exceptions import AuthError
+
+        if isinstance(e, AuthError):
+            neo4j_answers = True
+            console.print(f"  [red][X] Refused the login:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
+        else:
+            console.print(f"  [red][X] Not reachable:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         any_failed = True
     finally:
         engine.close()
@@ -1229,7 +1237,8 @@ def doctor() -> None:
     # with it reachable, Neo4j runs some other way (Docker, a native install).
     console.print("[bold]Podman[/bold]")
     podman_path = resolve_podman()
-    if podman_path is None and neo4j_reachable:
+    neo4j_up = neo4j_reachable or neo4j_answers
+    if podman_path is None and neo4j_up:
         console.print("  podman not found (not needed: Neo4j is reachable)")
     elif podman_path is None:
         console.print("  [red][X] podman not found[/red] on PATH or %LOCALAPPDATA%\\Programs\\Podman")
@@ -1237,16 +1246,39 @@ def doctor() -> None:
     else:
         try:
             result = subprocess.run(
-                [str(podman_path), "ps", "-a", "--filter", "name=devgraph-neo4j", "--format", "{{.Names}}\t{{.State}}"],
+                [str(podman_path), "ps", "-a", "--filter", "name=^devgraph-neo4j$", "--format", "{{.Names}}\t{{.State}}"],
                 capture_output=True, text=True, timeout=15,
             )
             output = result.stdout.strip()
-            if not output:
+            state = output.split("\t", 1)[1].strip() if "\t" in output else ""
+            if result.returncode != 0:
+                # Exit 125 with the Podman machine stopped (Windows and macOS
+                # after every reboot; --restart=always can't restart the VM).
+                detail = " ".join(result.stderr.split()) or f"exit {result.returncode}"
+                if neo4j_up:
+                    console.print(f"  podman ps failed (not needed: Neo4j is reachable): {escape(detail)}", soft_wrap=True)
+                else:
+                    console.print(f"  [red][X] podman ps failed:[/red] {escape(detail)}", soft_wrap=True)
+                    if "machine" in detail.lower() or sys.platform in ("win32", "darwin"):
+                        console.print(
+                            "       The Podman machine is stopped. Start it with 'podman machine start', "
+                            "then 'podman start devgraph-neo4j'."
+                        )
+                    any_failed = True
+            elif not output:
                 console.print("  [yellow]devgraph-neo4j container not found[/yellow]")
+            elif state != "running" and not neo4j_up:
+                console.print(
+                    f"  [red][X] devgraph-neo4j is {escape(state or 'not running')}[/red]: "
+                    "start it with 'podman start devgraph-neo4j'"
+                )
+                any_failed = True
+            elif state != "running":
+                console.print(f"  devgraph-neo4j is {escape(state)} (not needed: Neo4j is reachable)")
             else:
                 console.print(f"  [green][OK][/green] {escape(output)}")
         except Exception as e:
-            if neo4j_reachable:
+            if neo4j_up:
                 console.print(f"  podman ps failed (not needed: Neo4j is reachable): {escape(str(e))}")
             else:
                 console.print(f"  [red][X] podman ps failed:[/red] {escape(str(e))}")
