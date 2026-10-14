@@ -108,10 +108,12 @@ def test_src_layout_resolves_under_the_src_root():
 
 
 def test_src_layout_resolves_from_outside_src(tmp_path):
-    """A `src` directory holding Python files is an import root of the files
-    under its parent: tests/ and scripts/ beside src/ reach the package, as a
-    monorepo project's tests reach its own src/ (and no other project's)."""
-    for rel in ("src/pkg/api.py", "packages/foo/src/foo/x.py", "packages/bar/src/bar/y.py", "crates/a/src/lib.rs"):
+    """A `src` directory holding Python files beside a Python project file
+    is an import root of the files under its parent: tests/ and scripts/
+    beside src/ reach the package, as a monorepo project's tests reach its
+    own src/ (and no other project's)."""
+    for rel in ("src/pkg/api.py", "packages/foo/src/foo/x.py", "packages/bar/src/bar/y.py", "crates/a/src/lib.rs",
+                "pyproject.toml", "packages/foo/setup.py", "packages/bar/setup.cfg", "crates/a/setup.py"):
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / rel).write_text("")
     config = ResolverConfig(tmp_path)
@@ -125,6 +127,20 @@ def test_src_layout_resolves_from_outside_src(tmp_path):
     assert "packages/foo/src/foo/x.py" in test_x
     assert not any(t.startswith("packages/bar/src/") for t in test_x)
     assert config.python_roots("crates/a/build.py") == ("src/",)  # a src/ with no Python is none
+
+
+def test_a_src_directory_beside_no_python_project_is_no_root(tmp_path):
+    """A JavaScript app's stray `src/utils.py` makes src/ no root: only a
+    `src` directory beside a pyproject.toml, setup.py or setup.cfg is one."""
+    for rel in ("package.json", "src/App.tsx", "src/utils.py", "tools/gen.py"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("")
+    config = ResolverConfig(tmp_path)
+    assert config.python_roots("tools/gen.py") == ()
+    found = {r.to_name for r in extract_python_file("import utils\n", "tools/gen.py", "repo", config).relationships}
+    assert "src/utils.py" not in found
+    (tmp_path / "setup.cfg").write_text("[metadata]\nname = app\n")
+    assert ResolverConfig(tmp_path).python_roots("tools/gen.py") == ("src/",)
 
 
 def test_a_pyproject_source_root_is_an_import_root_of_the_files_under_it(tmp_path):

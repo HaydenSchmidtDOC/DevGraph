@@ -69,10 +69,11 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   (`dispatch.sync_resolver_config`).
 - **Python** (index format 16). Each `pyproject.toml`'s declared source
   roots apply to the Python files at or under its directory, and each
-  directory named `src` holding a Python file to the files under its parent
+  directory named `src` holding a Python file beside a `pyproject.toml`,
+  `setup.py` or `setup.cfg` to the files under its parent
   (`ResolverConfig.python_roots`; see the Roots bullet of
   2026-10-10-python-call-resolution-design.md). The inputs are the
-  pyproject.toml files and those `src` directories, the digest each
+  project files and those `src` directories, the digest each
   pyproject's roots, and a batch extracts Python under the inputs its
   fingerprint found.
 - **Go.** The Go fingerprint covers each go.mod's `module` line and the
@@ -284,10 +285,14 @@ name, in `.jsx`, `.tsx` and `.js` files alike, resolved by the tiers above
 (the file's own, an import with a barrel's prefix, a namespace member). A
 tag nothing resolves (a parameter `<Slot />`, an external package's
 `<Link />`, `<this.Foo />`) links nothing: no bare-name row. An intrinsic
-tag (`<div>`, `<svg:rect>`) and a fragment are no calls, and a class
-component is a Class, which no `CALLS` row reaches. As for calls, an
-element inside an anonymous arrow (`items.map(i => <Row />)`) is not
-attributed. The ts fixture's two renders link (precision unchanged at
+tag (`<div>`, `<svg:rect>`) and a fragment are no calls. Limits: an
+element inside an anonymous arrow (`items.map(i => <Row />)`, an inline
+render prop, a `useCallback` body) is attributed to no one, as calls there
+are not, so a list's row component has no caller; a class component
+(`class Modal extends React.Component`) is a Class, which no `CALLS` row
+reaches, so rendering one adds no edge (its methods' own calls are kept);
+a component made by a call (`React.memo(...)`, `forwardRef(...)`,
+`styled.div`) has no Function node, so its renders link nothing. The ts fixture's two renders link (precision unchanged at
 100 %), and a React fixture (`tests/fixtures/callgraph/react`) goes from
 2 of 16 calls to 16 of 16, linked precision 100 %.
 
@@ -440,8 +445,12 @@ Java code), so its members are owned by `Repo.Companion`, as a named
 companion's are by `Repo.Factory`. They used to be dropped with the
 anonymous companion. `Repo.create()` on a class declared in the file
 reaches a member of its companion when the class itself has none of the
-name (an owned pin to `Repo.Companion`); from another file it reaches
-Repo's files like any member of Repo (tier 4).
+name (an owned pin to `Repo.Companion`), and so does a bare `create()`
+inside Repo or inside its companion; from another file it reaches Repo's
+files like any member of Repo (tier 4). Companions are keyed by their
+members' owner, so two classes' anonymous companions in one file stay
+apart. `get_source` and `describe_node` take `Repo.create` (or
+`owner="Repo"`) for the companion's member when Repo has none of the name.
 
 ## Rust (`devgraph/indexer/rust/extractor.py`)
 
@@ -515,9 +524,17 @@ top-level `use` binds is that use's path. An item `X` reached through
 module M (a path, a `use` binding, a typed receiver's type, a glob import's
 module) is pinned to M's files and, when a file of M re-exports `X` (`pub
 use a::X;`, `pub use a::Y as X;`, or a glob `pub use a::*;` unless the
-file also re-exports `X` by name, Rust's shadowing rule), to the defining
-module's pins too, following that module's own re-exports (at most nine
-hops; a cycle ends). A function re-exported under another name (`pub use
+file also re-exports `X` by name, Rust's shadowing rule), to the module
+it names too, and on through that module's own re-exports (at most nine
+hops; a cycle ends): every module on the way stays a possible definer
+(`a` may define `X` beside its own glob). What a glob reaches is linked
+at package confidence: its module's files as package-confidence pins on
+their names (`a/.~?util.rs`) and its directory's recursive prefix
+(`a/util/`, so anything under it of the name), each leaving out the
+re-exporting module's own files, which stay resolved. An item M itself
+defines hides a glob's in Rust, and M's text is not the caller's: this
+way a function added to M is no configuration change, and the glob's
+module only ranks below it. A function re-exported under another name (`pub use
 a::fetch as get;`) is called by its own name: `shop_core::get()` is a
 `CALLS` row to `fetch`, as is `get()` after a private `use a::fetch as
 get;` (whose row used to name `get`, which no function is). A `use` of a re-exported item also imports the

@@ -28,8 +28,9 @@ source file's content (no filesystem check in the extractor). A removed target g
   That covers a flat layout, a `src/` layout from inside `src/` and a
   monorepo's nested projects. Since index format 16 (audit 5, item 2) the
   configured roots are tried after them (`resolve.import_roots`): every
-  directory named `src` that holds a Python file, for the files under its
-  parent (`tests/` and `scripts/` beside `src/` reach the package, and
+  directory named `src` that holds a Python file and whose parent holds a
+  `pyproject.toml`, `setup.py` or `setup.cfg` (so a JavaScript app's stray
+  `src/utils.py` makes no root), for the files under that parent (`tests/` and `scripts/` beside `src/` reach the package, and
   `packages/foo/tests/` reaches `packages/foo/src/foo/` but not another
   project's `src/`), and the roots a `pyproject.toml` at or above the
   importer declares: setuptools' `[tool.setuptools] package-dir` (`"" =
@@ -38,12 +39,13 @@ source file's content (no filesystem check in the extractor). A removed target g
   the directories of Hatch's `[tool.hatch.build.targets.wheel] packages`,
   each relative to the `pyproject.toml`. They are resolver configuration
   (2026-10-11-nonpython-call-resolution-design.md): the fingerprint is each
-  `pyproject.toml`'s roots and the list of `src` directories holding Python
-  files, so a version bump changes nothing, and a changed root, or a `src`
-  directory gaining its first Python file or losing its last, re-indexes
-  every Python file (a live batch recomputes the fingerprint for a Python
-  file created under a `src` directory that is no root yet, or deleted under
-  one). `setup.cfg` and `setup.py` are not read. A first cut tried every
+  `pyproject.toml`'s roots and the list of project files and qualifying
+  `src` directories, so a version bump changes nothing, and a changed root,
+  a project file added or removed, or a `src` directory gaining its first
+  Python file or losing its last, re-indexes every Python file (a live
+  batch recomputes the fingerprint for a Python file created under a
+  project's `src` directory that is no root yet, or a file or directory
+  deleted under a root: the watcher reports a deleted directory alone). `setup.cfg` and `setup.py` are not read. A first cut tried every
   ancestor's `src/` without reading the tree: it doubled each import's
   candidate rows, and DevGraph's own full scan went from 76 s to 109 s with
   `name_refs` from 7.2 MB to 13.5 MB, so roots are discovered instead.

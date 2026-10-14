@@ -649,9 +649,11 @@ def test_a_pyproject_root_change_re_indexes_the_python_files(engine, repo_id, tm
 
 
 def test_a_src_directory_is_a_python_root_while_it_holds_python(engine, repo_id, tmp_path):
-    """tests/ reaches src/'s package once src/ holds a Python file: its first
-    file, created in a live batch, re-indexes the Python files, and so does
-    deleting its last; every step equals a fresh scan."""
+    """tests/ reaches src/'s package once src/ holds a Python file (beside a
+    setup.cfg): its first file, created in a live batch, re-indexes the
+    Python files, and so does deleting its last, or the directory holding
+    it (the watcher passes the directory); every step equals a fresh scan."""
+    write(tmp_path, "setup.cfg", "[metadata]\nname = pkg\n")
     write(tmp_path, "tests/test_api.py", "import pkg.api\n")
     write(tmp_path, "pkg_other/x.py", "X = 1\n")
     provision_repository_schema(engine, tmp_path)
@@ -666,14 +668,28 @@ def test_a_src_directory_is_a_python_root_while_it_holds_python(engine, repo_id,
     index_paths(engine, repo_id, tmp_path, {api})
     assert sync_resolver_config(engine, repo_id, tmp_path, {api}) == 3
     assert imports(engine, repo_id, "tests/test_api.py") == ["src/pkg/api.py"]
-    assert engine.read_resolver_config(repo_id)["python"]["inputs"] == ["src"]
+    assert engine.read_resolver_config(repo_id)["python"]["inputs"] == ["setup.cfg", "src"]
     equals_fresh(engine, repo_id, tmp_path)
 
     api.write_text("def run():\n    return 2\n")
-    assert not touches_config("src/pkg/api.py", ["src"], tmp_path)  # an edit changes no root
+    assert not touches_config("src/pkg/api.py", {"setup.cfg", "src"}, tmp_path)  # an edit changes no root
     api.unlink()
-    assert touches_config("src/pkg/api.py", ["src"], tmp_path)
+    assert touches_config("src/pkg/api.py", {"setup.cfg", "src"}, tmp_path)
     remove_paths(engine, repo_id, tmp_path, {api})
     sync_resolver_config(engine, repo_id, tmp_path, {api})
-    assert engine.read_resolver_config(repo_id)["python"]["inputs"] == []
+    assert engine.read_resolver_config(repo_id)["python"]["inputs"] == ["setup.cfg"]
+    equals_fresh(engine, repo_id, tmp_path)
+
+    # The package comes back, then its directory goes in one event.
+    api = write(tmp_path, "src/pkg/api.py", "def run():\n    return 1\n")
+    index_paths(engine, repo_id, tmp_path, {api})
+    sync_resolver_config(engine, repo_id, tmp_path, {api})
+    assert imports(engine, repo_id, "tests/test_api.py") == ["src/pkg/api.py"]
+    import shutil
+
+    shutil.rmtree(tmp_path / "src/pkg")
+    assert touches_config("src/pkg", {"setup.cfg", "src"}, tmp_path)
+    remove_paths(engine, repo_id, tmp_path, {tmp_path / "src/pkg"})
+    assert sync_resolver_config(engine, repo_id, tmp_path, {tmp_path / "src/pkg"}) > 0
+    assert engine.read_resolver_config(repo_id)["python"]["inputs"] == ["setup.cfg"]
     equals_fresh(engine, repo_id, tmp_path)

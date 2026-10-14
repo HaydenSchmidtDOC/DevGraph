@@ -430,6 +430,7 @@ def test_an_untyped_member_call_never_links_its_own_caller(engine, repo_id, tmp_
 
 
 def test_tests_and_scripts_reach_a_src_layout_package(engine, repo_id, tmp_path):
+    write(tmp_path, "pyproject.toml", '[project]\nname = "pkg"\n')
     write(tmp_path, "src/pkg/__init__.py", "")
     core = write(tmp_path, "src/pkg/core.py", "def helper():\n    return 1\n")
     write(tmp_path, "src/pkg/api.py", "from pkg.core import helper\n\n\ndef run():\n    return helper()\n")

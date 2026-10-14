@@ -2236,7 +2236,7 @@ def sync_resolver_config(
     """
     stored = engine.read_resolver_config(repo_id)
     if touched is not None:
-        inputs = [rel for entry in stored.values() for rel in entry.get("inputs", [])]
+        inputs = {rel for entry in stored.values() for rel in entry.get("inputs", [])}
         rels = {rel for path in touched if (rel := _repo_relative(repo_root, Path(path))) is not None}
         if not any(touches_config(rel, inputs, repo_root) for rel in rels):
             return 0

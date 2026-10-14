@@ -10,9 +10,10 @@ fixed seeds of 15 steps. `DEVGRAPH_ACCURACY_FUZZ_SEEDS` (a comma list) and
 Python files import and call in every style the call resolution reads
 (docs/superpowers/specs/2026-10-10-python-call-resolution-design.md): plain,
 aliased, relative and star imports, a package re-exporting from its module,
-a src/ layout reached from tests/ outside it, its modules moving between
-src/, the repository root and a root a pyproject.toml declares (which comes
-and goes), calls through modules, aliases and untyped values, and
+a src/ layout (beside a setup.cfg) reached from tests/ outside it, its
+modules moving between src/, the repository root and a root a
+pyproject.toml declares (which comes and goes), and its whole folder
+deleted or moved, reported as the folder alone, as the watcher does, calls through modules, aliases and untyped values, and
 `self.shared()` reaching a base in the same or another file. A class `Twin`
 comes and goes beside another class of a file, repeating its method names
 (both nest a `Meta` with its own base), and so do a top-level `act` and one
@@ -383,6 +384,7 @@ def initial_repo() -> dict:
         "pkg/other.py": File("py", funcs={"spare": []}),
         "src/lib/core.py": File("py", imports=["from lib import util"], funcs={"core": ["util.render()"]}),
         "src/lib/util.py": File("py", funcs={"render": []}),
+        "setup.cfg": File("static", head="[metadata]\nname = fz\n"),
         "tests/test_lib.py": File("py", imports=["from lib.core import core", "import lib.util"],
                                   funcs={"test_core": ["core()", "lib.util.render()"]}),
         "rs/foo.rs": File("rs", extra=RS_FOO, funcs={"parse": ["render"]}),
@@ -540,8 +542,10 @@ class Fuzz:
         self.counter = 0
         # (old, new) paths of the docs notes renamed in the current step.
         self.moved_notes: list[tuple[str, str]] = []
-        # Folders deleted whole in the current step.
+        # Folders deleted whole in the current step, and those of them a
+        # batch is given as the folder alone (not its files).
         self.removed_dirs: list[str] = []
+        self.dir_only: list[str] = []
 
     def _fresh(self, prefix: str) -> str:
         self.counter += 1
@@ -758,6 +762,27 @@ class Fuzz:
             return None
         self.files[new] = self.files.pop(path)
         return f"move {path} to {new}", {path, new}
+
+    def op_src_dir(self):
+        """Delete the package `lib`'s folder under one of its roots, or move
+        it to another root: the watcher reports the old folder alone."""
+        roots = sorted({root for p in self.files for root in PY_ROOTS if p.startswith(f"{root}lib/")})
+        if not roots:
+            return None
+        old = self.rng.choice(roots)
+        folder = f"{old}lib"
+        paths = sorted(p for p in self.files if p.startswith(folder + "/"))
+        others = [r for r in PY_ROOTS if r != old and not any(p.startswith(f"{r}lib/") for p in self.files)]
+        self.removed_dirs.append(folder)
+        self.dir_only.append(folder)
+        if others and self.rng.random() < 0.5:
+            new = self.rng.choice(others)
+            for path in paths:
+                self.files[new + path[len(old):]] = self.files.pop(path)
+            return f"move folder {folder} to {new}lib", set(paths) | {new + p[len(old):] for p in paths}
+        for path in paths:
+            self.deleted.append((path, self.files.pop(path)))
+        return f"delete folder {folder}", set(paths)
 
     def op_move_java_module(self):
         """Move a Java class to the same package under another source root."""
@@ -1122,7 +1147,7 @@ class Fuzz:
         "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move", "cs_namespace", "cs_move_class",
         "cs_dup_class", "cs_shadow", "cs_shadow", "cs_reference", "cs_reference", "cs_project_move", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route",
         "route",
-        "route_change", "route_move", "src_move", "src_move", "rs_reexport", "rs_reexport", "rs_reexport",
+        "route_change", "route_move", "src_move", "src_move", "src_dir", "src_dir", "rs_reexport", "rs_reexport", "rs_reexport",
     ]
 
     def draw(self):
@@ -1222,6 +1247,7 @@ def test_graph_accuracy_fuzz(engine, repo_id, tmp_path, seed):
     for step in range(STEPS):
         fuzz.moved_notes = []
         fuzz.removed_dirs = []
+        fuzz.dir_only = []
         # The foreign-source edge (set (b)) is toggled on every seed.
         ops = [fuzz.op_impl()] if step == 0 else []
         ops += [fuzz.draw() for _ in range(rng.randint(1, 3))]
@@ -1231,6 +1257,10 @@ def test_graph_accuracy_fuzz(engine, repo_id, tmp_path, seed):
         for folder in sorted(folders, reverse=True):
             if (root / folder).is_dir() and not any((root / folder).iterdir()):
                 (root / folder).rmdir()
+        # A folder reported alone stands for its files (`op_src_dir`).
+        hidden = {rel for rel in touched if rel not in fuzz.files and any(
+            rel.startswith(d + "/") for d in fuzz.dir_only if d in folders)}
+        touched -= hidden
         gone = {rel for rel in touched if rel not in fuzz.files}
         changed = touched - gone
         split = rng.random() < 0.5
