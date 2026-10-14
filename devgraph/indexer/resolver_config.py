@@ -14,6 +14,11 @@ incremental one extract every file under the same configuration.
 A configuration file under a path the walk ignores (an ignored directory, or a
 `.gitignore` rule) is treated as absent.
 
+Rust's configuration is each Cargo.toml's library crate and every .rs file
+that re-exports (`pub use`, `rust_reexports`): a call through
+`shop_core::Client` reaches the file that defines `Client` only through
+the re-exporting file's text.
+
 C#'s configuration is its projects (`csharp_projects`): each `.csproj` and
 the nearest Directory.Build.props and Directory.Build.targets above it (their
 `<Using>` items and `<ProjectReference>`s), and every `.cs` file whose head
@@ -63,7 +68,8 @@ def config_language(name: str) -> str | None:
     tsconfig*.json or jsconfig.json, a go.mod or go.work, a Cargo.toml, a
     *.csproj or Directory.Build.props/.targets, a pyproject.toml), else
     None. A .cs file
-    holding a `global using` is C# configuration by its head, not its name
+    holding a `global using` is C# configuration by its head, not its name,
+    and a .rs file re-exporting is Rust's by its `pub use`s
     (see `touches_config`). A
     config reached only through `extends` can have any name; it is followed
     by path (see `ResolverConfig.read`)."""
@@ -87,11 +93,14 @@ def touches_config(rel: str, inputs: list[str], repo_root: Path) -> bool:
     .cs file of a project (a `.csproj` among `inputs` at or above it) whose
     head now holds a `global using` (one whose head held one is an input; a
     file of no project counts for nothing until a `.csproj` above it, itself
-    a change, makes it one)."""
+    a change, makes it one), or a .rs file that now re-exports (one that
+    did is an input)."""
     if config_language(posixpath.basename(rel)):
         return True
     if any(each == rel or each.startswith(rel + "/") for each in inputs):
         return True
+    if rel.endswith(".rs"):
+        return bool(_rust_file_reexports(Path(repo_root) / rel))
     if not rel.endswith(".cs"):
         return False
     project_dirs = {posixpath.dirname(each) for each in inputs if each.endswith(".csproj")}
@@ -346,7 +355,8 @@ class ResolverConfig:
     fingerprint the batch extracts under found them (`fingerprints`'
     `inputs`), when a Go file first asks (`go_modules`); None, or a None
     answer, walks the repository for them. `rust_files` does the same for
-    the Cargo.toml files (`rust_crates`), `cs_files` for the C#
+    the Cargo.toml files and the re-exporting .rs files (`rust_crates`,
+    `rust_reexports`), `cs_files` for the C#
     project files and the .cs files holding a `global using`
     (`cs_projects`), and `python_files` for the pyproject.toml files
     (`python_roots`)."""
@@ -368,6 +378,7 @@ class ResolverConfig:
         self._rust_files = rust_files
         self._rust_crates: dict[str, list[str]] | None = None
         self._rust_packages: set[str] = set()
+        self._rust_reexports: dict[str, list[list]] | None = None
         self._cs_files = cs_files
         self._cs_projects: dict[str, CsProject] | None = None
         self._python_files = python_files
@@ -642,18 +653,19 @@ class ResolverConfig:
         return [(crate, root)] if root and crate else []
 
     def _rust_digest(self, rel: str) -> object:
+        if rel.endswith(".rs"):
+            return _rust_file_reexports(self.root / rel)
         return sorted(self._cargo_entries(rel))
+
+    def _rust_inputs(self) -> list[str]:
+        files = self._rust_files() if self._rust_files is not None else None
+        return _rust_inputs(self.root) if files is None else files
 
     def rust_crates(self) -> dict[str, list[str]]:
         """Every in-repository library crate's name and its root files (two
         packages can share a name)."""
         if self._rust_crates is None:
-            files = self._rust_files() if self._rust_files is not None else None
-            if files is None:
-                files = sorted(
-                    path.relative_to(self.root).as_posix() for path in indexable_paths(self.root)
-                    if path.name == "Cargo.toml"
-                )
+            files = [rel for rel in self._rust_inputs() if posixpath.basename(rel) == "Cargo.toml"]
             crates: dict[str, set[str]] = {}
             for rel in files:
                 for crate, root in self._cargo_entries(rel):
@@ -667,6 +679,17 @@ class ResolverConfig:
         for the repository root)."""
         self.rust_crates()
         return self._rust_packages
+
+    def rust_reexports(self) -> dict[str, list[list]]:
+        """Every re-exporting .rs file's module-level re-exports, by its
+        repo-relative path (`rust.extractor.reexports`)."""
+        if self._rust_reexports is None:
+            found = {}
+            for rel in self._rust_inputs():
+                if rel.endswith(".rs") and (each := _rust_file_reexports(self.root / rel)):
+                    found[rel] = each
+            self._rust_reexports = found
+        return self._rust_reexports
 
     # --- pyproject.toml --------------------------------------------------------------
 
@@ -847,6 +870,36 @@ def _cs_inputs(root: Path, walked: list[str] | None = None) -> list[str]:
     return sorted(found)
 
 
+def _rust_file_reexports(path: Path) -> list[list]:
+    """The re-exports of the .rs file at `path` (none when it is missing,
+    unreadable or larger than a configuration file may be)."""
+    from devgraph.indexer.rust.extractor import reexports  # the extractor imports this module
+
+    try:
+        if not path.is_file() or path.stat().st_size > _MAX_CONFIG_BYTES:
+            return []
+        return reexports(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return []
+
+
+def _rust_inputs(root: Path, walked: list[str] | None = None) -> list[str]:
+    """The Rust configuration files of the repository at `root` (its
+    indexable paths, or `walked`): every Cargo.toml and every .rs file
+    that re-exports, sorted."""
+    if walked is None:
+        walked = []
+        for path in indexable_paths(root):
+            try:
+                walked.append(path.relative_to(root).as_posix())
+            except ValueError:
+                continue
+    return sorted(
+        rel for rel in walked
+        if posixpath.basename(rel) == "Cargo.toml" or (rel.endswith(".rs") and _rust_file_reexports(root / rel))
+    )
+
+
 def csharp_projects(repo_root: Path) -> list[CsProject]:
     """Every C# project of the repository at `repo_root`, by directory (see
     `CsProject` and `ResolverConfig.cs_project`)."""
@@ -860,7 +913,8 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
     `references`, `baseUrl` and `paths`, with every config its `extends` and
     `references` reach; for Go each go.mod's `module` line and the local
     `replace` directives of each go.mod and go.work; for Rust each
-    Cargo.toml's library crate name and root (`_cargo_entries`); for C# each
+    Cargo.toml's library crate name and root (`_cargo_entries`) and each
+    re-exporting .rs file's re-exports (`_rust_inputs`); for C# each
     project file's and Directory.Build.props/.targets' `<Using>` items and
     `<ProjectReference>` paths and the `global using`
     directives of each project's .cs files
@@ -880,6 +934,7 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
         if lang is not None:
             found[lang].add(walked[-1])
     found["csharp"] = set(_cs_inputs(root, walked))
+    found["rust"] = set(_rust_inputs(root, walked))
     result = {}
     for lang, files in found.items():
         config.read = set()

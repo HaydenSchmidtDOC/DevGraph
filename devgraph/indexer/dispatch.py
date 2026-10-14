@@ -141,7 +141,8 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: Function `proj` and C# path-pinned rows limited to the projects their
 #: file's project references (`visible`, a Module's `name_ref_visible`);
 #: 16: Python absolute imports also tried under each ancestor's `src/` and
-#: the source roots a pyproject.toml declares.
+#: the source roots a pyproject.toml declares; Rust calls and imports
+#: through `pub use` re-exports (resolver configuration).
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 16
 
@@ -705,7 +706,8 @@ def index_paths(
             the graph, as a full scan would leave it out.
         resolver: The resolver configuration's fingerprints to extract
             under (resolver_config.fingerprints: the go.mod, go.work,
-            Cargo.toml, C# and pyproject.toml files it found); None reads the
+            Cargo.toml, re-exporting .rs, C# and pyproject.toml files it
+            found); None reads the
             ones the graph was built with.
 
     Returns:
@@ -751,7 +753,7 @@ def index_paths(
 
     config = ResolverConfig(
         repo_root, go_files=lambda: config_files("go", ("go.mod", "go.work")),
-        rust_files=lambda: config_files("rust", ("Cargo.toml",)), cs_files=lambda: config_files("csharp"),
+        rust_files=lambda: config_files("rust"), cs_files=lambda: config_files("csharp"),
         python_files=lambda: config_files("python", ("pyproject.toml",)),
     )
     # Markdown files whose cross-file edges are resolved after every other

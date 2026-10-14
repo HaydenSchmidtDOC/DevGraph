@@ -459,7 +459,8 @@ name give no edge, and a `use` of an inline module of the file none.
    `shop_core::f()`, `Type::f()`: the module's files, and the recursive
    prefix of its directory (package: an item re-exported from a submodule).
    `Type::f()` on a type declared in the file, and `Self::f()`, is this
-   file. A path through std or an external crate links nothing, nor does a
+   file. An item the module re-exports (below) also names the module
+  defining it. A path through std or an external crate links nothing, nor does a
    library type's (`Vec::new()`, `HashMap::new()`, `String::from()`:
    `STOP_TYPES["rust"]`), nor a bare `f()` nothing declares or imports (a
    glob import's modules excepted).
@@ -471,6 +472,29 @@ name give no edge, and a `use` of an inline module of the file none.
    declared here, else the type's module; a library type links nothing.
 4. Anything else: a bare-name row off its caller, unless the method is in
    `STOP_METHODS["rust"]`.
+
+**Re-exports** (index format 16, audit 5 item 6). A `lib.rs` facade (`pub
+use net::client::Client;`) is the usual shape of a Rust library, and its
+callers name the item through the crate root (`shop_core::Client::new`),
+which pinned only `lib.rs`. Each file's top-level `pub use` (any `pub`
+visibility; `rust.extractor.reexports`) is resolver configuration: the
+fingerprint's inputs are the Cargo.toml files and every `.rs` file holding
+one, its digest each file's re-exports, so a function added beside them
+changes nothing and a re-export added, removed or retargeted re-indexes
+every Rust file (a live batch reads a changed `.rs` file for a `pub use`,
+as a `.cs` file's head for a `global using`). A re-export's path is read in
+its own file: a module it declares (`mod net;`) is `self::net`, a name a
+top-level `use` binds is that use's path. An item `X` reached through
+module M (a path, a `use` binding, a typed receiver's type, a glob import's
+module) is pinned to M's files and, when a file of M re-exports `X` (`pub
+use a::X;`, `pub use a::Y as X;`, or a glob `pub use a::*;` unless the
+file also re-exports `X` by name, Rust's shadowing rule), to the defining
+module's pins too, following that module's own re-exports (at most nine
+hops; a cycle ends). A function re-exported under another name (`pub use
+a::fetch as get;`) is called by its own name: `shop_core::get()` is a
+`CALLS` row to `fetch`. A `use` of a re-exported item also imports the
+defining module's file. An inline module's `pub use`, and a re-exported
+module (`pub use a::b;` then `crate::b::f()`), are not followed.
 
 The arguments of a macro invocation (`println!("{}", shop_core::version())`,
 `assert_eq!(user.total(), 500)`) are reparsed as a call's arguments, so the

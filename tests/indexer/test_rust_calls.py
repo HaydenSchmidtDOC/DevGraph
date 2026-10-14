@@ -377,6 +377,109 @@ def test_the_cargo_fingerprint_follows_only_crate_names(tmp_path):
     assert ResolverConfig(tmp_path).rust_crates() == {"shop_app": ["crates/app/src/lib.rs"]}
 
 
+def test_reexports_are_read_from_a_files_top_level():
+    from devgraph.indexer.rust.extractor import reexports
+
+    source = textwrap.dedent("""\
+        pub mod net;
+        mod util;
+        use crate::models as m;
+        pub use net::Client;
+        pub(crate) use util::{text::*, money::format as fmt};
+        pub use m::User;
+        use net::Hidden;
+        pub use std::fmt::Display;
+        mod inner { pub use super::net::Inner; }
+        """)
+    assert reexports(source) == [
+        ["*", ["self", "util", "text"]],
+        ["Client", ["self", "net", "Client"]],
+        ["Display", ["std", "fmt", "Display"]],
+        ["User", ["crate", "models", "User"]],
+        ["fmt", ["self", "util", "money", "format"]],
+    ]
+    assert reexports("pub fn use_it() {}\nuse a::b;\n") == []
+
+
+REEXPORTS = {
+    **WORKSPACE,
+    "crates/core/src/lib.rs": textwrap.dedent("""\
+        pub mod net;
+        pub mod util;
+        pub use net::Client;
+        pub use util::*;
+        pub use net::client::fetch_all as get_all;
+        """),
+    "crates/core/src/net/mod.rs": "pub mod client;\npub use self::client::Client;\n",
+    "crates/core/src/util.rs": "pub fn tidy() {}\npub fn new() {}\n",
+}
+FACADE = ["crates/core/src/lib.rs", "crates/core/src/net/mod.rs", "crates/core/src/net/client.rs",
+        "crates/core/src/util.rs", "crates/app/src/main.rs"]
+
+
+def test_a_crate_root_reexport_reaches_the_defining_file(tmp_path):
+    """`pub use` in lib.rs, followed through net/mod.rs's own `pub use`:
+    `shop_core::Client::new` and a method on the value it makes reach
+    net/client.rs; a glob re-export reaches its module unless the name is
+    re-exported by name; a renamed function is called by its own name."""
+    config = _config(tmp_path, REEXPORTS)
+    source = """\
+        use shop_core::Client;
+        use shop_core::get_all;
+
+        fn main() {
+            let c = Client::new("u");
+            c.fetch();
+            shop_core::Client::new("v");
+            shop_core::tidy();
+            get_all();
+        }
+        """
+    path = "crates/app/src/main.rs"
+    # lib.rs is pinned too (it links nothing: it defines no `new`).
+    lib = {"crates/core/src/lib.rs": "resolved"}
+    client = {**lib, "crates/core/src/net/client.rs": "resolved"}
+    assert reached(source, path, "main", "new", FACADE, config) == client
+    assert reached(source, path, "main", "fetch", FACADE, config) == client
+    assert reached(source, path, "main", "tidy", FACADE, config) == {**lib, "crates/core/src/util.rs": "resolved"}
+    assert reached(source, path, "main", "fetch_all", FACADE, config) == {"crates/core/src/net/client.rs": "resolved"}
+    assert reached(source, path, "main", "get_all", FACADE, config) == lib
+    assert imported(source, path, FACADE, config) == {"crates/core/src/lib.rs", "crates/core/src/net/client.rs"}
+    # Within the crate, through `crate::`.
+    inner = "fn go() { crate::Client::new(\"w\"); }\n"
+    assert reached(inner, "crates/core/src/util.rs", "go", "new", FACADE, config) == client
+    # Without the configuration's re-exports, only lib.rs.
+    plain = ResolverConfig(tmp_path, rust_files=lambda: [rel for rel in REEXPORTS if rel.endswith("Cargo.toml")])
+    assert reached(source, path, "main", "new", FACADE, plain) == lib
+
+
+def test_reexport_cycles_and_external_paths_end(tmp_path):
+    config = _config(tmp_path, {
+        **WORKSPACE,
+        "crates/core/src/lib.rs": "pub mod a;\npub use a::X;\npub use serde::Y;\n",
+        "crates/core/src/a.rs": "pub use crate::X;\n",
+    })
+    source = "use shop_core::{X, Y};\n\nfn main() { X::go(); Y::go(); }\n"
+    found = reached(source, "crates/app/src/main.rs", "main", "go", ["crates/core/src/lib.rs", "crates/core/src/a.rs"],
+                    config)
+    assert found == {"crates/core/src/lib.rs": "resolved"}
+
+
+def test_reexports_are_rust_configuration(tmp_path):
+    _config(tmp_path, REEXPORTS)
+    before = fingerprints(tmp_path)["rust"]
+    assert {"crates/core/src/lib.rs", "crates/core/src/net/mod.rs"} <= set(before["inputs"])
+    assert "crates/core/src/util.rs" not in before["inputs"]
+    (tmp_path / "crates/core/src/lib.rs").write_text(REEXPORTS["crates/core/src/lib.rs"] + "pub fn version() {}\n")
+    assert fingerprints(tmp_path)["rust"] == before  # a new function changes nothing
+    (tmp_path / "crates/core/src/lib.rs").write_text("pub mod net;\npub mod util;\npub use net::Client as C;\n")
+    assert fingerprints(tmp_path)["rust"]["fingerprint"] != before["fingerprint"]
+    from devgraph.indexer.resolver_config import touches_config
+
+    assert touches_config("crates/core/src/lib.rs", [], tmp_path)  # it re-exports
+    assert not touches_config("crates/core/src/util.rs", [], tmp_path)
+
+
 # --- live --------------------------------------------------------------------------
 
 
@@ -520,3 +623,36 @@ def test_the_index_upgrade_replaces_bare_rust_csharp_and_cpp_calls(engine, repo_
         ("cpp/main.cpp", "cpp/jobs.h", "resolved"),
     }
     assert not dispatch.index_outdated(engine, repo_id)
+
+
+def test_a_reexport_change_re_indexes_its_users(engine, repo_id, tmp_path):
+    """lib.rs re-exports Client from net, then from models, then nothing:
+    each change re-indexes the Rust files, so main's call moves with it,
+    and every step equals a fresh scan."""
+    _config(tmp_path, REEXPORTS)
+    _write(tmp_path, "crates/core/src/net/client.rs", "pub struct Client;\nimpl Client { pub fn new() {} }\n")
+    _write(tmp_path, "crates/core/src/models.rs", "pub struct Client;\nimpl Client { pub fn new() {} }\n")
+    _write(tmp_path, "crates/app/src/main.rs", "use shop_core::Client;\n\nfn main() { Client::new(); }\n")
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+    via_net = ("crates/app/src/main.rs", "main", "crates/core/src/net/client.rs", "new", "resolved")
+    via_models = ("crates/app/src/main.rs", "main", "crates/core/src/models.rs", "new", "resolved")
+    calls = _edges(engine, repo_id, "CALLS")
+    assert via_net in calls and via_models not in calls
+
+    lib = _write(tmp_path, "crates/core/src/lib.rs", "pub mod net;\npub mod models;\npub use models::Client;\n")
+    index_paths(engine, repo_id, tmp_path, {lib})
+    assert sync_resolver_config(engine, repo_id, tmp_path, {lib}) > 0
+    calls = _edges(engine, repo_id, "CALLS")
+    assert via_models in calls and via_net not in calls
+    _equals_fresh(engine, repo_id, tmp_path)
+
+    # net/mod.rs stops re-exporting: no file's text but its own changed.
+    net = _write(tmp_path, "crates/core/src/net/mod.rs", "pub mod client;\n")
+    _write(tmp_path, "crates/core/src/lib.rs", "pub mod net;\npub mod models;\npub use net::Client;\n")
+    index_paths(engine, repo_id, tmp_path, {lib, net})
+    sync_resolver_config(engine, repo_id, tmp_path, {lib, net})
+    calls = _edges(engine, repo_id, "CALLS")
+    assert via_net not in calls and via_models not in calls
+    _equals_fresh(engine, repo_id, tmp_path)

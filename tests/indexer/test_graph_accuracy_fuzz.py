@@ -49,7 +49,10 @@ crate, namespace or class, on `this`/`base`, on a typed or an untyped value);
 a function moves between files of its Go or Kotlin package (and a C# method
 to another file's class), a Java class moves to the same package under
 another source root (another module), and a Rust crate's Cargo.toml renames
-it, moves its root file or stops declaring it. An image
+it, moves its root file or stops declaring it, and its lib.rs and util.rs
+gain and lose `pub use` re-exports (by name, glob or alias, util.rs's
+re-exporting deep.rs's, so lib.rs's reach it through util.rs) that other
+files call through `shop_core::`. An image
 moves between the Dockerfile and a compose service in one step, so its
 shared Container changes claimant.
 
@@ -385,10 +388,12 @@ def initial_repo() -> dict:
         "rs/foo.rs": File("rs", extra=RS_FOO, funcs={"parse": ["render"]}),
         "rs/display.rs": File("rs", extra="pub trait Display {}\n", funcs={"render": []}),
         "rs/conv.rs": File("rs", imports=["use crate::display::Display;"], impl=True,
-                           funcs={"convert": ["parse", "shop_core::run"]}),
+                           funcs={"convert": ["parse", "shop_core::run", "shop_core::neat", "shop_core::dig"]}),
         "crates/core/Cargo.toml": File("static", head=TS_CONFIGS["crates/core/Cargo.toml"][0]),
-        "crates/core/src/lib.rs": File("rs", imports=["pub mod util;"], funcs={"run": ["util::tidy"]}),
+        "crates/core/src/lib.rs": File("rs", imports=["pub mod util;", "pub mod deep;"],
+                                       funcs={"run": ["util::tidy"]}),
         "crates/core/src/util.rs": File("rs", funcs={"tidy": []}),
+        "crates/core/src/deep.rs": File("rs", funcs={"dig": []}),
         "cs/Shop.csproj": File("static", head=CS_CONFIGS["cs/Shop.csproj"][0]),
         "cs/Jobs.cs": File("cs", head="Shop", bases={"Jobs": None}, funcs={"Run": [], "Stop": []}),
         "cs/Program.cs": File("cs", head="Shop.App", imports=["using Shop;"], bases={"Program": "Jobs"},
@@ -498,6 +503,12 @@ CPP_CALLS = ["{n}", "util::{n}", "w.{n}", "obj->{n}"]
 # C++ out-of-class method definitions: of a header's class, of a class
 # declared nowhere, and through a namespace.
 CPP_METHODS = ["Widget::draw", "Widget::size", "Gadget::run", "Missing::stop", "ui::Widget::paint"]
+# The `pub use` re-exports lib.rs and util.rs of crates/core toggle.
+RS_REEXPORTS = {
+    "crates/core/src/lib.rs": ["pub use util::tidy;", "pub use util::*;", "pub use util::tidy as neat;",
+                               "pub use util::dig;", "pub use deep::dig as neat;"],
+    "crates/core/src/util.rs": ["pub use crate::deep::dig;", "pub use crate::deep::*;", "pub use super::deep::dig;"],
+}
 # The roots the Python package `lib` moves between.
 PY_ROOTS = ["src/", "", "code/"]
 # The source roots a Java file moves between (another Maven module).
@@ -783,6 +794,17 @@ class Fuzz:
             return f"remove one-line class {name} in {path}", {path}
         bases[name] = None
         return f"add one-line class {name} in {path}", {path}
+
+    def op_rs_reexport(self):
+        """Add or remove a `pub use` re-export of lib.rs or util.rs."""
+        path = self.rng.choice(sorted(p for p in RS_REEXPORTS if p in self.files))
+        line = self.rng.choice(RS_REEXPORTS[path])
+        imports = self.files[path].imports
+        if line in imports:
+            imports.remove(line)
+            return f"remove {line!r} in {path}", {path}
+        imports.append(line)
+        return f"add {line!r} in {path}", {path}
 
     def op_config(self):
         """Rewrite, create or delete a resolver configuration file."""
@@ -1100,7 +1122,7 @@ class Fuzz:
         "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move", "cs_namespace", "cs_move_class",
         "cs_dup_class", "cs_shadow", "cs_shadow", "cs_reference", "cs_reference", "cs_project_move", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route",
         "route",
-        "route_change", "route_move", "src_move", "src_move",
+        "route_change", "route_move", "src_move", "src_move", "rs_reexport", "rs_reexport", "rs_reexport",
     ]
 
     def draw(self):
