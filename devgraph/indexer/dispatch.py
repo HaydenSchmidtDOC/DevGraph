@@ -1448,7 +1448,10 @@ def _relink_name_refs(
     against the node's `match_keys`), with that pin's confidence, when a
     path pin's node is visible to the entry's file's project (its
     Module's `name_ref_visible` against the node's `projects`,
-    common.visible_to); every edge it writes carries that `visible`. A pinned
+    common.visible_to): such an edge is pinned to the node's file, so the
+    test is made here, not by the engine. The rows a tiered group's re-run
+    and an added unpinned source write keep the entry's path pins, and
+    carry that `visible` for the engine to test (`_visible`). A pinned
     Module target is found by an added Module's directory, directory name or
     basename (the row's `to_name`, see common.module_pin_name) and relinked
     by its path. Each edge gets back the entry's `caller_class`, and its

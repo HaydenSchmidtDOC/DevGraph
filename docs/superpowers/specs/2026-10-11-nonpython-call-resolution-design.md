@@ -81,16 +81,20 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   nearest Directory.Build.props and before the nearest
   Directory.Build.targets, and the `global using` directives in the heads of
   its own .cs files (not a nested project's), whatever the file is called.
-  A project's references are the projects its `.csproj` files'
-  `<ProjectReference Include>` paths name (read relative to the
-  `.csproj`, `\` as `/`; a Directory.Build file's are not read, as MSBuild
-  reads their relative paths from each importing project), closed
-  transitively (`CsProject.references`; a cycle ends where it comes back,
-  and a path naming no `.csproj` of the repository, missing, ignored,
-  absolute or outside it, reaches nothing until one is there). Nothing is
-  evaluated: an `<Import>` is not followed, an item under a `Condition`
-  counts as if the condition held, and a name or path holding `$(`, `@(`,
-  `%(` or a wildcard is left out. `ImplicitUsings` (only `System.*` and
+  A project's references are the projects named by the
+  `<ProjectReference Include>` paths of its `.csproj` files and of its
+  nearest Directory.Build.props/.targets, each read relative to the
+  project's own directory as MSBuild reads an imported file's relative
+  paths (`\` as `/`, `%XX` escapes decoded), closed transitively
+  (`CsProject.references`; a cycle ends where it comes back, and a path
+  naming no `.csproj` of the repository, missing, ignored, absolute,
+  drive-qualified or outside it, reaches nothing until one is there). On
+  a case-insensitive platform (Windows, macOS: `gitignore.IGNORECASE`)
+  paths are compared case-folded, so `..\core\core.csproj` names
+  `Core/Core.csproj`. Nothing is evaluated: an `<Import>` is not
+  followed, an item under a `Condition` counts as if the condition held,
+  and a name or path holding `$(`, `@(`, `%(` or a wildcard (`*`, `?`) is
+  left out (a `$(MSBuildThisFileDirectory)` reference too). `ImplicitUsings` (only `System.*` and
   `Microsoft.*`) and `RootNamespace` are not read.
   A file's *head* is read from its start, at most its first 32 KiB, for as
   long as it holds only whitespace, comments, preprocessor lines (`#if`,
@@ -695,7 +699,7 @@ between projects is a new path, so its nodes are added and removed.
 
 **Row side.** Every path-pinned `CALLS` and `IMPORTS` row of a file in a
 project carries `visible`, its project's and its references' `proj`s,
-sorted (`GraphRelationship.visible`). The engine sends it once per row
+sorted (`GraphRelationship.visible`); other edge types carry none. The engine sends it once per row
 (`vis`, beside `targets`), not per pin, and a path-pinned end of a Class
 or Function keeps a node only when `row.vis IS NULL OR coalesce(n.proj,
 '') = '' OR n.proj IN row.vis` (`_visible`; `common.visible_to` is its
@@ -705,6 +709,18 @@ node of no project, or of another language, is seen by every row. A row
 pinned to a file (the writer's own) or by bare name is not limited.
 Like a tiered row, such a row waits for pass 2, when every node's `proj`
 is final.
+
+**Limits.** What MSBuild would make of a reference beyond its path is not
+read: `PrivateAssets="all"` and `DisableTransitiveProjectReferences`
+(which stop a reference flowing on to the referencing project's own
+referrers) are ignored, so the closure can be wider than the compiler's;
+a `<ProjectReference Remove>` or `Update` is not applied (only `Include`
+items count); and a project's default compile globs are not applied, so
+a .cs file belongs to its nearest `.csproj` even where a parent project
+would also compile it (`EnableDefaultCompileItems`, explicit `<Compile>`
+items and nested-project exclusions unread; ruling N2). A route's
+`IMPLEMENTS` rows are not limited, only `CALLS` and `IMPORTS`, the edges
+a changed `proj` retracts.
 
 **Shadow tiers.** A nearer tier's node shadows only when it is visible to
 the row: the `NOT EXISTS` of `_shadow_free` tests `shadow` with

@@ -1545,8 +1545,11 @@ def extract_csharp_file(
             each.properties["proj"] = proj
     if project is not None:
         visible = sorted({proj, *(_project_key(each) for each in project.references)})
+        # CALLS and IMPORTS only, the edges a node's changed `proj` retracts
+        # (graph/engine.py MATCH_KEY_EDGE_TYPES); a route's IMPLEMENTS is not limited.
         for rel in result.relationships:
-            if rel.to_file is not None and pin_kind(rel.to_file) not in ("file", "fileless"):
+            if (rel.rel_type in ("CALLS", "IMPORTS") and rel.to_file is not None
+                    and pin_kind(rel.to_file) not in ("file", "fileless")):
                 rel.visible = visible
 
     return own_edges(result, file_path)
