@@ -203,8 +203,13 @@ register again to pick it up. A user-scope registration whose command is
 another checkout's Python is reported by `devgraph mcp add` and `mcp doctor`,
 and fails both when that Python no longer exists (a moved or deleted
 checkout); `devgraph mcp add --replace` removes it and registers this
-checkout. The VS Code entry is rewritten in place; its `cwd` is
-`${workspaceFolder}`, so a VS Code session answers for the open workspace.
+checkout (the old entry is added back if that fails); a command set up
+outside DevGraph (`uvx`, `pipx`, a console script) is left alone. The VS
+Code entry is rewritten in place; its `cwd` is `${workspaceFolder}`, so a VS
+Code session answers for the open workspace. That variable names one folder:
+in a multi-root workspace, or a window with no folder open, it doesn't name
+the repository you mean (or anything), so set `DEVGRAPH_MCP_REPO` in the
+entry's `env` there.
 
 `devgraph client-config --claude-mcp-add-only` prints just the Claude Code
 one-liner; `devgraph client-config --run` also executes registration for the

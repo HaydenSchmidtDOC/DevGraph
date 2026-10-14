@@ -1684,10 +1684,27 @@ def _registered_command(output: str) -> str | None:
     return None
 
 
-def _same_path(a: str, b: Path) -> bool:
-    """Same path as written (symlinks not followed: every venv's python links to
-    the same interpreter)."""
-    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(str(b)))
+def _registered_args(output: str) -> list[str]:
+    """The server arguments in `claude mcp get`'s output (its `Args:` line)."""
+    for line in output.splitlines():
+        if line.strip().lower().startswith("args:"):
+            return line.split(":", 1)[1].split()
+    return []
+
+
+def _same_venv(command: str, python_path: Path) -> bool:
+    """Whether `command` is an interpreter of the same environment as
+    `python_path`: the same folder (`python` and `python3` in one .venv are the
+    same), compared as written, since every venv's python links to the same
+    base interpreter."""
+    def folder(path) -> str:
+        return os.path.normcase(os.path.abspath(Path(path).parent))
+
+    return folder(command) == folder(python_path)
+
+
+def _is_python(command: str) -> bool:
+    return Path(command).name.lower().startswith("python")
 
 
 #: Re-registers a user-scope entry that names another checkout's Python.
@@ -1695,13 +1712,28 @@ MCP_REPLACE_HINT = "devgraph mcp add --replace"
 
 
 def _stale_registration(output: str, python_path: Path) -> tuple[str, str] | None:
-    """("missing" | "other", the registered command) when the user-scope entry
-    doesn't run this checkout's Python, else None. "missing": the command no
-    longer exists (the checkout or its .venv was moved or deleted), so Claude
-    Code can't start the server; "other": another existing checkout's."""
+    """How the user-scope entry's command differs from this checkout's Python,
+    as (kind, command), or None when it runs this checkout's environment.
+
+    "missing": an absolute path to a Python that no longer exists (its
+    checkout or .venv was moved or deleted), so Claude Code can't start the
+    server. "other": another existing environment's Python. "custom": anything
+    else, such as `uv`, `uvx`, `pipx` or a console script, which the user set
+    up on purpose and DevGraph leaves alone. A command without a folder is
+    looked up on PATH first.
+    """
     command = _registered_command(output)
-    if command is None or _same_path(command, python_path):
+    if command is None:
         return None
+    if not os.path.isabs(command):
+        found = shutil.which(command)
+        if found is None or not _is_python(found):
+            return "custom", command
+        command = found
+    if _same_venv(command, python_path):
+        return None
+    if not _is_python(command):
+        return "custom", command
     return ("other" if Path(command).exists() else "missing"), command
 
 
@@ -1711,10 +1743,40 @@ def _stale_help(kind: str, command: str, python_path: Path) -> str:
             f"'devgraph' is registered with Claude Code to run {command}, which no longer exists, so the "
             f"server can't start. To register this checkout ({python_path}) instead, run '{MCP_REPLACE_HINT}'."
         )
-    return (
-        f"'devgraph' is registered with Claude Code to run another checkout's Python ({command}), not this "
-        f"one ({python_path}). To switch to this checkout, run '{MCP_REPLACE_HINT}'."
+    if kind == "other":
+        return (
+            f"'devgraph' is registered with Claude Code to run another checkout's Python ({command}), not this "
+            f"one ({python_path}). To switch to this checkout, run '{MCP_REPLACE_HINT}'."
+        )
+    return f"'devgraph' is registered with Claude Code to run {command}, a command set up outside DevGraph; left as it is."
+
+
+def _replace_claude_registration(claude_path: str, python_path: Path, repo_root: Path, output: str) -> bool:
+    """Swap the user-scope entry for this checkout's. Claude Code refuses a
+    second entry of the same name, so the old one is removed first, and added
+    back as it was when the new one can't be added."""
+    old = [_registered_command(output) or "", *_registered_args(output)]
+    console.print(f"\n[bold]Running:[/bold] claude mcp remove -s {CLAUDE_MCP_SCOPE} devgraph")
+    removed = subprocess.run([claude_path, "mcp", "remove", "-s", CLAUDE_MCP_SCOPE, "devgraph"], cwd=str(repo_root))
+    if removed.returncode != 0:
+        return False
+    console.print(f"\n[bold]Running:[/bold] {escape(_claude_mcp_add_line(python_path))}")
+    added = subprocess.run(
+        [claude_path, "mcp", "add", "-s", CLAUDE_MCP_SCOPE, "devgraph", "--", str(python_path), *MCP_SERVER_ARGS],
+        cwd=str(repo_root),
     )
+    if added.returncode == 0:
+        return True
+    restored = subprocess.run(
+        [claude_path, "mcp", "add", "-s", CLAUDE_MCP_SCOPE, "devgraph", "--", *old], cwd=str(repo_root),
+    )
+    restore_note = "restored" if restored.returncode == 0 else "could not be restored"
+    console.print(
+        f"[red][X][/red] Claude Code: adding this checkout failed; the previous entry {restore_note}: "
+        f"{escape(' '.join(old))}",
+        soft_wrap=True,
+    )
+    return False
 
 
 def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path, replace: bool = False) -> bool:
@@ -1722,9 +1784,11 @@ def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path, re
 
     Skips an existing user-scope registration of this checkout. One that runs
     another checkout's Python is reported with the fix (failing when that
-    Python no longer exists), or with `replace` removed and added again. A
-    local- or project-scope one is reported with how to move it, and nothing
-    is added: Claude Code prefers it over a user-scope entry in that folder.
+    Python no longer exists), or with `replace` swapped for this checkout's.
+    A command set up outside DevGraph (`uvx`, a console script) is left
+    alone. A local- or project-scope one is reported with how to move it, and
+    nothing is added: Claude Code prefers it over a user-scope entry in that
+    folder.
     """
     scope, output = _claude_mcp_registration(claude_path, repo_root)
     if scope == "user":
@@ -1733,15 +1797,11 @@ def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path, re
             console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
             return True
         kind, command = stale
-        if not replace:
-            marker = "[red][X][/red]" if kind == "missing" else "[yellow][!][/yellow]"
-            console.print(f"{marker} {escape(_stale_help(kind, command, python_path))}", soft_wrap=True)
-            return kind != "missing"
-        console.print(f"\n[bold]Running:[/bold] claude mcp remove -s {CLAUDE_MCP_SCOPE} devgraph")
-        removed = subprocess.run([claude_path, "mcp", "remove", "-s", CLAUDE_MCP_SCOPE, "devgraph"], cwd=str(repo_root))
-        if removed.returncode != 0:
-            return False
-        scope = None
+        if replace and kind != "custom":
+            return _replace_claude_registration(claude_path, python_path, repo_root, output)
+        marker = {"missing": "[red][X][/red]", "other": "[yellow][!][/yellow]"}.get(kind, "[green][OK][/green]")
+        console.print(f"{marker} {escape(_stale_help(kind, command, python_path))}", soft_wrap=True)
+        return kind != "missing"
     if scope == "unknown":
         # registered in a scope this can't read, or `mcp get` timed out: leave it alone
         console.print(f"[yellow][!][/yellow] Claude Code: not adding 'devgraph'; its registration is unclear: {escape(output.strip())}", soft_wrap=True)
@@ -1806,7 +1866,7 @@ def mcp_doctor() -> None:
         stale = _stale_registration(output, resolve_venv_python()) if scope == "user" else None
         if stale is not None:
             kind, command = stale
-            marker = "[red][X][/red]" if kind == "missing" else "[yellow][!][/yellow]"
+            marker = {"missing": "[red][X][/red]", "other": "[yellow][!][/yellow]"}.get(kind, "[green][OK][/green]")
             console.print(f"{marker} {escape(_stale_help(kind, command, resolve_venv_python()))}", soft_wrap=True)
             console.print(escape(output.strip()))
             any_failed = any_failed or kind == "missing"

@@ -50,6 +50,8 @@ def claude(tmp_path, monkeypatch):
         "#!/usr/bin/env python3\n"
         "import json, os, sys\n"
         f"open({str(log)!r}, 'a').write(json.dumps([os.getcwd(), *sys.argv[1:]]) + '\\n')\n"
+        f"if sys.argv[1:3] == ['mcp', 'add'] and '/venv/bin/python' in sys.argv and os.path.exists({str(tmp_path / 'fail-add')!r}):\n"
+        "    sys.exit(1)\n"
         "if sys.argv[1:3] == ['mcp', 'get']:\n"
         f"    if not os.path.exists({str(get_reply)!r}):\n"
         "        print('No MCP server found with name: devgraph', file=sys.stderr); sys.exit(1)\n"
@@ -266,3 +268,41 @@ def test_vscode_entry_round_trips_with_the_workspace_folder(claude, tmp_path, mo
     }
     assert data["servers"]["other"] == {"type": "stdio", "command": "x"}
     assert str(claude.root) not in config.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("command", ["uvx", "pipx", "devgraph-mcp-wrapper", "/opt/tools/devgraph-mcp"])
+def test_a_command_set_up_outside_devgraph_is_left_alone(claude, command):
+    """`uvx devgraph`, a console script: not a DevGraph checkout's Python, so
+    neither stale nor something --replace should touch."""
+    claude.registered(_registered_at(command))
+    add = _invoke("mcp", "add")
+    doctor = _invoke("mcp", "doctor")
+    for result in (add, doctor):
+        out = " ".join(result.stdout.split())
+        assert result.exit_code == 0, out
+        assert "--replace" not in out and "no longer exists" not in out
+    assert _adds(claude) == []
+    _invoke("mcp", "add", "--replace")
+    assert [c for c in claude.calls() if c[1:3] in (["mcp", "add"], ["mcp", "remove"])] == []
+
+
+def test_another_interpreter_name_in_the_same_venv_is_this_checkout(claude):
+    claude.registered(_registered_at("/venv/bin/python3"))
+    result = _invoke("mcp", "add")
+    assert result.exit_code == 0 and "already registered" in result.stdout
+    doctor = _invoke("mcp", "doctor")
+    assert doctor.exit_code == 0 and "another checkout" not in doctor.stdout
+
+
+def test_replace_restores_the_old_entry_when_the_new_one_cannot_be_added(claude, tmp_path):
+    old = tmp_path / "old" / "python"
+    claude.registered(_registered_at(old))
+    (tmp_path / "fail-add").write_text("")
+    result = _invoke("mcp", "add", "--replace")
+    assert result.exit_code == 1
+    adds = _adds(claude)
+    assert [a[a.index("--") + 1:] for a in adds] == [
+        ["/venv/bin/python", "-P", "-m", "devgraph.mcp.server"],
+        [str(old), "-P", "-m", "devgraph.mcp.server"],
+    ]
+    assert "restored" in " ".join(result.stdout.split())
