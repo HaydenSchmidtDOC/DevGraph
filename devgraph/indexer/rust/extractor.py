@@ -634,9 +634,10 @@ class _RustResolver:
         module, its name there), the re-exports of each followed in turn
         (`pub use a::X;` in lib.rs and `pub use self::b::X;` in a/mod.rs
         reach a/b.rs); a glob's module may define it or re-export it in
-        turn, unless the file also re-exports it by name. Empty when `module` re-exports no such name (resolver
-        configuration: `ResolverConfig.rust_reexports`). An inline module
-        of this file re-exports nothing: only a file's top level is read."""
+        turn, unless the file also re-exports it by name. Empty when
+        `module` re-exports no such name (resolver configuration:
+        `ResolverConfig.rust_reexports`). An inline module of this file
+        re-exports nothing: only a file's top level is read."""
         if (module, name) in seen or len(seen) > 8 or (
             not module.crate.cross and module.crate.root == self.crate.root and module.path in self.inline
             and module.path != self.module
@@ -657,19 +658,11 @@ class _RustResolver:
                 target, rest = start
                 if bound == "*":
                     target = _Module(target.crate, target.path + tuple(rest))
-                    item = name
-                    found.append((target, item))
+                    found.append((target, name))
+                    found += self.reexported(target, name, seen)
                 elif rest:
                     target, item = _Module(target.crate, target.path + tuple(rest[:-1])), rest[-1]
-                else:
-                    continue
-                deeper = self.reexported(target, item, seen)
-                if bound != "*" and deeper:
-                    found += deeper
-                elif bound != "*":
-                    found.append((target, item))
-                else:
-                    found += deeper
+                    found += self.reexported(target, item, seen) or [(target, item)]
         return list(dict.fromkeys(found))
 
     def _walk(self, start: tuple[_Module, list[str]]) -> tuple[_Module, list[str]]:
@@ -692,7 +685,8 @@ class _RustResolver:
         """The function a path call names (`a::f`, `T::f`,
         `crate::m::T::f`), as (its name, its pins) pairs: one, or another
         for a function re-exported under another name (`pub use a::f as
-        g;`, `g()` calls `f`). None when it is outside the repository."""
+        g;`, `g()` calls `f`, as after `use a::f as g;`). None when it is
+        outside the repository."""
         name = segs[-1]
         if len(segs) == 2 and segs[0] in self.types:
             # The type's own associated function when an impl here defines it.
@@ -709,10 +703,11 @@ class _RustResolver:
         module, rest = self._walk(start)
         if not rest:
             return None
-        found = {rest[-1] if len(rest) == 1 else name: self.pins(module)}
+        # A function bound or re-exported under another name (`use a::f as
+        # g;`, `pub use a::f as g;`) is called by its own.
+        found = {rest[-1]: self.pins(module)}
         for target, item in self.reexported(module, rest[0]):
-            # A function re-exported under another name is called by its own.
-            callee = item if len(rest) == 1 else name
+            callee = item if len(rest) == 1 else rest[-1]
             found.setdefault(callee, [])
             found[callee] += [pin for pin in self.pins(target) if pin not in found[callee]]
         return list(found.items())

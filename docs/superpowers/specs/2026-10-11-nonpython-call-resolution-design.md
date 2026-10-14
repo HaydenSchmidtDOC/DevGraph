@@ -516,7 +516,8 @@ file also re-exports `X` by name, Rust's shadowing rule), to the defining
 module's pins too, following that module's own re-exports (at most nine
 hops; a cycle ends). A function re-exported under another name (`pub use
 a::fetch as get;`) is called by its own name: `shop_core::get()` is a
-`CALLS` row to `fetch`. A `use` of a re-exported item also imports the
+`CALLS` row to `fetch`, as is `get()` after a private `use a::fetch as
+get;` (whose row used to name `get`, which no function is). A `use` of a re-exported item also imports the
 defining module's file. An inline module's `pub use`, and a re-exported
 module (`pub use a::b;` then `crate::b::f()`), are not followed.
 

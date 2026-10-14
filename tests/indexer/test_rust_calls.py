@@ -445,6 +445,9 @@ def test_a_crate_root_reexport_reaches_the_defining_file(tmp_path):
     assert reached(source, path, "main", "fetch_all", FACADE, config) == {"crates/core/src/net/client.rs": "resolved"}
     assert reached(source, path, "main", "get_all", FACADE, config) == lib
     assert imported(source, path, FACADE, config) == {"crates/core/src/lib.rs", "crates/core/src/net/client.rs"}
+    # A local `use .. as` alias is called by the function's own name too.
+    aliased = "use shop_core::util::tidy as neat;\n\nfn main() { neat(); }\n"
+    assert reached(aliased, path, "main", "tidy", FACADE, config) == {"crates/core/src/util.rs": "resolved"}
     # Within the crate, through `crate::`.
     inner = "fn go() { crate::Client::new(\"w\"); }\n"
     assert reached(inner, "crates/core/src/util.rs", "go", "new", FACADE, config) == client
