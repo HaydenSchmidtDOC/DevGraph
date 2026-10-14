@@ -738,6 +738,39 @@ def _retry_transient(fn, *args, **kwargs):
             delay *= 2
 
 
+#: How long first-run setup waits for a just-started Neo4j to answer Bolt. A
+#: fresh container accepts TCP at once (the port forwarder) but answers Bolt
+#: only after about 20 s on Linux, longer in a Podman machine.
+BOLT_WAIT_S = 90.0
+
+
+def wait_for_bolt(engine, timeout_s: float = BOLT_WAIT_S, on_wait=None, poll_s: float = 2.0) -> bool:
+    """Poll `engine.verify_connectivity` until Neo4j answers or `timeout_s` passes.
+
+    True once Neo4j answers, a refused login included (it is up; the caller's
+    own check reports the login); False when it still doesn't answer by the
+    deadline. Only "not answering yet" errors are waited out. `on_wait(elapsed_s)`
+    is called after each failed try, for a progress message.
+    """
+    started = time.monotonic()
+    while True:
+        try:
+            engine.verify_connectivity()
+            return True
+        except EngineClosed:
+            raise
+        except _RETRYABLE_EXCEPTIONS:
+            pass
+        except Neo4jError:
+            return True
+        elapsed = time.monotonic() - started
+        if elapsed >= timeout_s:
+            return False
+        if on_wait is not None:
+            on_wait(elapsed)
+        time.sleep(min(poll_s, max(0.0, timeout_s - elapsed)))
+
+
 def _run(session, query: str, **params: Any) -> Any:
     """Run one autocommit statement and consume it, both inside `_retry_transient`;
     return its summary.

@@ -27,12 +27,12 @@ podman run -d --name devgraph-neo4j --restart=always \
   -e NEO4J_AUTH=neo4j/devgraph-local-dev \
   -v devgraph_neo4j_data:/data -v devgraph_neo4j_logs:/logs \
   docker.io/library/neo4j:5.26-community
-uv run devgraph doctor
+uv run devgraph doctor --wait 90
 uv run devgraph register ~/code/my-repo --full
 uv run devgraph mcp add
 ```
 
-`docker run` takes the same arguments. `devgraph mcp add` registers DevGraph with Claude Code for every project (user scope); `devgraph client-config` prints the VS Code entry. Activate the environment (`source .venv/bin/activate`) to drop the `uv run` prefix. Without a desktop tray, the agent runs headless (see `devgraph tray start` below).
+`docker run` takes the same arguments. A new Neo4j container takes about 20 seconds before it answers, so `doctor --wait 90` first waits up to 90 seconds for it (saying so every 10 seconds); `register` run before then fails its initial scan. `devgraph mcp add` registers DevGraph with Claude Code for every project (user scope); `devgraph client-config` prints the VS Code entry. Activate the environment (`source .venv/bin/activate`) to drop the `uv run` prefix. Without a desktop tray, the agent runs headless (see `devgraph tray start` below).
 
 ### Windows
 
@@ -42,7 +42,7 @@ The interactive installer targets Windows PowerShell and requires Python 3.13 or
 irm https://raw.githubusercontent.com/HaydenSchmidtDOC/DevGraph/master/scripts/install.ps1 | iex
 ```
 
-It clones DevGraph, creates its Python environment, starts Neo4j, verifies the installation, and offers to register DevGraph with detected Claude Code and VS Code clients.
+It clones DevGraph, creates its Python environment, starts Neo4j, waits up to 90 seconds for it to answer, verifies the installation, and offers to register DevGraph with detected Claude Code and VS Code clients.
 
 From an existing clone, run:
 

@@ -1149,8 +1149,32 @@ def _docs_source_findings(repos: list[Any], engine: Any) -> list[dict[str, Any]]
     return findings
 
 
+def _wait_for_neo4j(engine, settings, timeout_s: float) -> None:
+    """Wait up to `timeout_s` for Neo4j to answer, saying so every 10 s."""
+    from devgraph.graph.engine import wait_for_bolt
+
+    said = [-1]
+
+    def progress(elapsed: float) -> None:
+        if said[0] < 0:
+            console.print(
+                f"  Waiting for Neo4j at {escape(str(settings.neo4j_uri))} to answer (up to {timeout_s:.0f} s)..."
+            )
+        elif int(elapsed) // 10 > said[0] // 10:
+            console.print(f"  still waiting ({elapsed:.0f} s)")
+        said[0] = int(elapsed)
+
+    if wait_for_bolt(engine, timeout_s, on_wait=progress) and said[0] >= 0:
+        console.print("  Neo4j answered")
+
+
 @app.command()
-def doctor() -> None:
+def doctor(
+    wait: float = typer.Option(
+        0, "--wait", metavar="SECONDS",
+        help="First wait up to SECONDS for Neo4j to answer (a container just started takes about 20 s).",
+    ),
+) -> None:
     """Run a heavier environment-drift diagnostic than `status`.
 
     Checks Python version, the installed `mcp` package, MCP server
@@ -1212,6 +1236,8 @@ def doctor() -> None:
     neo4j_answers = False
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
     try:
+        if wait > 0:
+            _wait_for_neo4j(engine, settings, wait)
         engine.verify_connectivity()
         neo4j_reachable = True
         console.print(f"  [green][OK] Reachable[/green] at {escape(str(settings.neo4j_uri))}")

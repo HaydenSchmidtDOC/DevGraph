@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Shared bootstrap core: venv, editable install, Neo4j container, schema init, doctor.
+    Shared bootstrap core: venv, editable install, Neo4j container, wait for Neo4j, doctor (schema init included).
 .DESCRIPTION
     Dot-sourced by both bootstrap.ps1 and setup-menu.ps1 so this logic exists
     in exactly one place. Not meant to be run directly. Expects $RepoRoot and
@@ -61,38 +61,12 @@ function Invoke-BootstrapCore {
         }
     }
 
-    # Health wait loop
-    Write-Step "Waiting for Neo4j Bolt to become reachable"
-    $maxAttempts = 15
-    $attempt = 0
-    $healthy = $false
-    while ($attempt -lt $maxAttempts) {
-        $attempt++
-        try {
-            $tcp = New-Object System.Net.Sockets.TcpClient
-            $tcp.Connect("127.0.0.1", 7687)
-            $tcp.Close()
-            $healthy = $true
-            break
-        } catch {
-            Start-Sleep -Seconds 2
-        }
-    }
-    if (-not $healthy) {
-        Write-Fail "Neo4j did not become reachable on 127.0.0.1:7687 after $($maxAttempts * 2)s"
-        return $false
-    }
-    Write-Ok "Neo4j Bolt reachable"
-
-    # Schema init
-    Write-Step "Initializing schema"
-    & $venvPython -c "from devgraph.graph.engine import GraphEngine; e = GraphEngine('bolt://127.0.0.1:7687', 'neo4j', 'devgraph-local-dev'); e.init_schema(); e.close()" | Out-Host
-    if ($LASTEXITCODE -ne 0) { Write-Fail "schema init failed"; return $false }
-    Write-Ok "schema initialized"
-
-    # Final verification
-    Write-Step "Running devgraph doctor"
-    & $venvPython -P -m devgraph.cli.main doctor | Out-Host
+    # Wait for Neo4j, schema init and final verification in one step: a
+    # fresh container accepts TCP at once (Podman's port forwarder) but
+    # answers Bolt only after ~20 s, longer in a Podman machine, so doctor
+    # --wait polls Bolt itself before it checks (and creates) the schema.
+    Write-Step "Waiting for Neo4j, then running devgraph doctor"
+    & $venvPython -P -m devgraph.cli.main doctor --wait 90 | Out-Host
     $doctorExit = $LASTEXITCODE
 
     if ($doctorExit -ne 0) {

@@ -48,12 +48,16 @@ class _UnreachableEngine(_ReachableEngine):
 
 
 def _doctor(tmp_path, engine_cls, podman):
+    return _doctor_args(tmp_path, engine_cls, podman, [])
+
+
+def _doctor_args(tmp_path, engine_cls, podman, args):
     with patch.object(cli_main, "get_settings", return_value=_settings(tmp_path)), \
          patch.object(cli_main, "GraphEngine", engine_cls), \
          patch.object(cli_main, "resolve_podman", return_value=podman), \
          patch.object(cli_main, "_stale_schema_objects", return_value=[]), \
          patch("devgraph.indexer.schema_constraints.constraint_drift", return_value=[]):
-        result = CliRunner().invoke(cli_main.app, ["doctor"])
+        result = CliRunner().invoke(cli_main.app, ["doctor", *args])
     return " ".join(result.stdout.split()), result
 
 
@@ -198,3 +202,35 @@ def test_constraint_check_ignores_unregistered_repositories(engine, tmp_path):
     assert f"devgraph rescan {registered} --now" in constraints
     assert orphan not in constraints
     assert orphan in out.split("Orphaned graph data", 1)[1]
+
+
+def test_doctor_wait_waits_for_neo4j_before_checking(tmp_path, monkeypatch):
+    from devgraph.graph import engine as engine_module
+
+    monkeypatch.setattr(engine_module.time, "sleep", lambda s: None)
+    tries = []
+
+    class Starting(_ReachableEngine):
+        def verify_connectivity(self):
+            tries.append(1)
+            if len(tries) <= 3:
+                from neo4j.exceptions import ServiceUnavailable
+
+                raise ServiceUnavailable("Connection reset by peer")
+
+    out, result = _doctor_args(tmp_path, Starting, None, ["--wait", "90"])
+    assert "Waiting for Neo4j" in out and "Neo4j answered" in out
+    assert "[OK] Reachable" in out
+    assert result.exit_code == 0, out
+
+
+def test_doctor_without_wait_checks_once(tmp_path):
+    tries = []
+
+    class Down(_DownEngine):
+        def verify_connectivity(self):
+            tries.append(1)
+            super().verify_connectivity()
+
+    out, result = _doctor(tmp_path, Down, None)
+    assert "Waiting for Neo4j" not in out and len(tries) == 1
