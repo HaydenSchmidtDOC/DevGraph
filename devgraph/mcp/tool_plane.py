@@ -160,10 +160,16 @@ def _sanitize_deep(value: Any) -> Any:
     return _sanitize_value(value)
 
 
-def _failure(tool: CypherTool, exc: Exception, layer: str = "project") -> ToolError:
-    """A client-safe error: the Neo4j status code only, never the raw message. `layer` is "project" or "global"."""
+def _failure(tool: CypherTool, exc: Exception, layer: str = "project", uri: str | None = None) -> ToolError:
+    """A client-safe error: the Neo4j status code only, never the raw message, or how
+    to reach Neo4j at `uri` when it is down. `layer` is "project" or "global"."""
     from neo4j.exceptions import Neo4jError
 
+    from devgraph.mcp.tools import neo4j_unavailable
+
+    unavailable = neo4j_unavailable(exc, uri) if uri else None
+    if unavailable is not None:
+        return unavailable
     if isinstance(exc, Neo4jError):
         code = str(getattr(exc, "code", None) or "unknown")
         if "TransactionTimedOut" in code:
@@ -194,7 +200,7 @@ def make_tool_function(
                 tool.cypher, params, timeout_s=tool.timeout_s, max_rows=tool.max_rows
             )
         except Exception as exc:  # the driver raises its own hierarchy
-            raise _failure(tool, exc, layer) from exc
+            raise _failure(tool, exc, layer, getattr(engine, "uri", None)) from exc
         results = [_sanitize_deep(row) for row in rows]
         envelope: dict[str, Any] = {"count": len(results), "results": results, "truncated": truncated}
         if notices:

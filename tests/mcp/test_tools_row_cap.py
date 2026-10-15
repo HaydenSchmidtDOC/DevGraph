@@ -14,6 +14,8 @@ class _Overflowing:
 
     def run_read_cypher(self, query, params, *, timeout_s, max_rows):
         self.queries.append((query, max_rows))
+        if "AS label, n.file AS file" in query:  # find_callers' target lookup: one target
+            return [{"label": "Function", "file": "a.py"}], False
         if max_rows != tools.LIST_ROW_LIMIT:  # list_recent_changes' commit cutoff lookup
             return [], False
         return [{"name": f"n{i}", "type": ["Function"], "repo_id": "demo", "file": "a.py"} for i in range(max_rows)], True
@@ -41,8 +43,9 @@ def test_a_list_tool_over_the_cap_returns_a_truncated_envelope(name):
     assert max_rows == tools.LIST_ROW_LIMIT and f"LIMIT {tools.LIST_ROW_LIMIT + 1}" in query
 
 
-def test_blame_component_returns_at_most_the_cap():
+def test_blame_component_returns_a_truncated_envelope():
     engine = _Overflowing()
-    rows = tools.blame_component(engine, "demo", "a.py")
-    assert len(rows) == tools.LIST_ROW_LIMIT
+    result = tools.blame_component(engine, "demo", "a.py")
+    assert result["count"] == tools.LIST_ROW_LIMIT and len(result["results"]) == 15 and result["truncated"] is True
+    assert f"more than {tools.LIST_ROW_LIMIT}" in result["notice"]
     assert f"LIMIT {tools.LIST_ROW_LIMIT + 1}" in engine.queries[-1][0]

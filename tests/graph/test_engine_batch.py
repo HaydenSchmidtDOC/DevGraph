@@ -219,20 +219,22 @@ class TestBatchingReducesRoundTrips:
 
         try:
             engine.replace_file_nodes(repo_id, "big.py", nodes, rels)
-            # 1 read of the Module's old name_ref_sources (none here, so no
-            # foreign-source unclaim) + 1 delete + 1 unclaim (source-tracked
-            # nodes) + 1 UNWIND per node label (just "Function") + 1 UNWIND
-            # per relationship (from_label, rel_type, to_label) triple (just
-            # one triple here) = 5 tx.run calls total, independent of the 20
-            # nodes / 19 edges — not the 39+ calls the old per-item loop cost.
-            assert call_count["n"] == 5
+            # 1 read of the Module's recorded shared claims + 1 read of its
+            # old name_ref_sources (none here, so no foreign-source unclaim)
+            # + 1 delete + 1 unclaim (source-tracked nodes) + 1 UNWIND per
+            # node label (just "Function") + 1 UNWIND per relationship
+            # (from_label, rel_type, to_label) triple (just one triple here)
+            # = 6 tx.run calls total, independent of the 20 nodes / 19 edges
+            # — not the 39+ calls the old per-item loop cost.
+            assert call_count["n"] == 6
         finally:
             engine.delete_repository(repo_id)
 
 
 class TestNameLookupIndexes:
     """Bare-name edge ends and describe_node match Class/Function/Service on
-    (repo_id, name); their uniqueness constraint indexes (repo_id, name, file)."""
+    (repo_id, name); their uniqueness constraint indexes (repo_id, name,
+    file, owner)."""
 
     def test_init_schema_provisions_one_per_file_scoped_label(self, engine):
         from devgraph.graph.schema import FILE_SCOPED_LABELS
@@ -261,13 +263,45 @@ class TestNameLookupIndexes:
         assert any(op.startswith("NodeIndexSeek") for op in ops), ops
         assert not any(op.startswith("NodeByLabelScan") for op in ops), ops
 
+    def test_an_end_pinned_to_a_file_seeks_the_owner_keyed_constraint(self, engine):
+        """With or without the owner, a pinned end is one unique-index seek
+        (`owner IS NOT NULL` stands in for an unnamed owner), and there is no
+        (repo_id, name, file) index an older version's constraint of that
+        shape would collide with."""
+        from devgraph.graph.engine import _end_match
+
+        def operators(node):
+            yield node["operatorType"]
+            for child in node.get("children", []):
+                yield from operators(child)
+
+        # A pre-release build's (repo_id, name, file) index goes at the next start.
+        engine.run_cypher(
+            "CREATE INDEX function_repo_name_file_lookup IF NOT EXISTS FOR (n:Function) ON (n.repo_id, n.name, n.file)"
+        )
+        engine.init_schema()
+        with engine._driver.session() as session:
+            for owner in (None, "A"):
+                summary = session.run(
+                    "EXPLAIN WITH {repo_id: $r, to_name: $n, to_file: $f, to_owner: $o} AS row "
+                    + _end_match("b", "Function", "to", "file") + "RETURN b",
+                    r="r", n="g", f="a.py", o=owner,
+                ).consume()
+                ops = list(operators(summary.plan))
+                assert any(op.startswith("NodeUniqueIndexSeek") for op in ops), ops
+        rows = engine.run_cypher(
+            "SHOW INDEXES YIELD labelsOrTypes, properties, owningConstraint "
+            "WHERE properties = ['repo_id', 'name', 'file'] AND owningConstraint IS NULL RETURN labelsOrTypes"
+        )
+        assert not [row for row in rows if row["labelsOrTypes"][0] in ("Class", "Function", "Service")]
+
     def test_a_file_scoped_end_is_hinted_to_seek_its_index(self):
         """A plan made from index statistics sampled while the label was
         near-empty estimates 0 rows and can scan a whole index per row even
         under a plain USING INDEX hint (seen in CI: a 5,000-module relink at
         20 s instead of 0.5 s), so each end of a file-scoped label is hinted
-        to seek: a pinned end the (repo_id, name, file) index, a bare-name end
-        the (repo_id, name) one."""
+        to seek: a pinned end the (repo_id, name, file, owner) unique one, a
+        bare-name end the (repo_id, name) one."""
         from devgraph.graph.engine import _upsert_relationships_tx
 
         class Tx:
@@ -283,8 +317,8 @@ class TestNameLookupIndexes:
             rel | {"from_label": "Module", "from_name": "a.py", "to_label": "Function", "to_name": "g"},
         ])
         pinned, bare = Tx.queries
-        assert "USING INDEX SEEK a:Function(repo_id, name, file)" in pinned
-        assert "USING INDEX SEEK b:Function(repo_id, name, file)" in pinned
+        assert "USING INDEX SEEK a:Function(repo_id, name, file, owner)" in pinned
+        assert "USING INDEX SEEK b:Function(repo_id, name, file, owner)" in pinned
         assert "USING INDEX SEEK b:Function(repo_id, name) " in bare
         assert "USING INDEX SEEK a:" not in bare
 
@@ -337,7 +371,7 @@ class TestIndexesStillBuilding:
                 {"label": "Function", "repo_id": repo_id, "name": "f", "properties": {"file": "a.py"}},
             ], [])
             assert left["n"] == 0
-            assert engine.list_file_nodes(repo_id, ["a.py"]) == {("Function", "f", "a.py")}
+            assert engine.list_file_nodes(repo_id, ["a.py"]) == {("Function", "f", "a.py", "", None, False, None)}
         finally:
             monkeypatch.undo()
             engine.delete_repository(repo_id)

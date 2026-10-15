@@ -11,12 +11,13 @@ fresh `full_scan`, edges and edge properties included
 
 ## Principle
 
-Every Python edge is a pure function of its writer file's text and of
-whether a target node exists. The extractor turns names into *candidate*
+Every Python edge is a pure function of its writer file's text, of the
+source roots the repository's `src` directories and `pyproject.toml` files
+give (resolver configuration, since index format 16) and of whether a target node exists.
+The extractor turns names into *candidate*
 target files and emits a pinned row per candidate; only the candidates that
 exist become edges, the rule `IMPORTS` already followed. No edge reads another
-file's content or any repository-level state (no `pyproject.toml` roots, no
-filesystem check in the extractor). A removed target goes with the
+source file's content (no filesystem check in the extractor). A removed target goes with the
 `DETACH DELETE` of its node, and an added one is relinked from the writer's
 `name_refs`, so the same edges come out whatever order files are indexed in.
 
@@ -24,9 +25,33 @@ filesystem check in the extractor). A removed target goes with the
 
 - **Roots.** An absolute import is tried under every ancestor directory of the
   importer: `import a.b` in `x/y/f.py` names `a/b`, `x/a/b` and `x/y/a/b`.
-  That covers a flat layout, a `src/` layout and a monorepo's nested projects.
-  Configured roots were rejected: they are repository state, and a change to
-  them would need a forced rescan.
+  That covers a flat layout, a `src/` layout from inside `src/` and a
+  monorepo's nested projects. Since index format 16 (audit 5, item 2) the
+  configured roots are tried after them (`resolve.import_roots`): every
+  directory named `src` that holds a Python file and whose parent holds a
+  `pyproject.toml`, `setup.py` or `setup.cfg` (so a JavaScript app's stray
+  `src/utils.py` makes no root), for the files under that parent (`tests/` and `scripts/` beside `src/` reach the package, and
+  `packages/foo/tests/` reaches `packages/foo/src/foo/` but not another
+  project's `src/`), and the roots a `pyproject.toml` at or above the
+  importer declares: setuptools' `[tool.setuptools] package-dir` (`"" =
+  "lib"`, or `pkg = "lib/pkg"`, whose root is `lib/`) and
+  `[tool.setuptools.packages.find] where`, Poetry's `packages` `from`, and
+  the directories of Hatch's `[tool.hatch.build.targets.wheel] packages`,
+  each relative to the `pyproject.toml`. They are resolver configuration
+  (2026-10-11-nonpython-call-resolution-design.md): the fingerprint is each
+  `pyproject.toml`'s roots and the list of project files and qualifying
+  `src` directories, so a version bump changes nothing, and a changed root,
+  a project file added or removed, or a `src` directory gaining its first
+  Python file or losing its last, re-indexes every Python file (a live
+  batch recomputes the fingerprint for a Python file created under a
+  project's `src` directory that is no root yet, or a Python file or a
+  directory (a path with no suffix) deleted under a root: the watcher
+  reports a deleted directory alone, and an editor's swap file or a
+  moved-away temp file triggers nothing). A project file under an ignored
+  or gitignored path counts for nothing, as in the walk. `setup.cfg` and `setup.py` are not read. A first cut tried every
+  ancestor's `src/` without reading the tree: it doubled each import's
+  candidate rows, and DevGraph's own full scan went from 76 s to 109 s with
+  `name_refs` from 7.2 MB to 13.5 MB, so roots are discovered instead.
 - **Candidates.** A module path `p` names `p.py` and `p/__init__.py`. `from P
   import n` names P's candidates and the submodule `P/n`'s (n may be either).
   A relative import resolves against the importer's directory: `from . import

@@ -10,6 +10,7 @@ Usage:
     <venv python> scripts/measure_call_graph.py <repo_id> [--root PATH] [--scan] [--cleanup]
     <venv python> scripts/measure_call_graph.py --fixture <lang>
     <venv python> scripts/measure_call_graph.py --fan-in
+    <venv python> scripts/measure_call_graph.py --cs-synthetic [--projects N] [--seed S]
 
 `--fixture` measures one of the ground-truth fixtures under
 tests/fixtures/callgraph instead (see `measure_fixture` and
@@ -20,6 +21,12 @@ repository again.
 
 `--fan-in` measures one save among 400 same-named Go packages (M6's S10 row,
 `measure_fan_in`).
+
+`--cs-synthetic` generates a seeded multi-project C# repository whose
+projects all declare the same class names in their own namespaces, scans it
+and reports linked CALLS and IMPORTS against the generator's truth, the
+cross-project wrong-link rate among them, the scan time and the largest
+`name_refs` (`measure_cs_synthetic`).
 
 `--scan` deletes `<repo_id>` and full-scans `--root` (default: the current
 directory) into it first, timing the scan and an incremental save of
@@ -36,6 +43,7 @@ import ast
 import json
 import os
 import posixpath
+import random
 import shutil
 import sys
 import tempfile
@@ -340,22 +348,27 @@ def measure_m5(engine: GraphEngine, repo_id: str, root: Path, py_files: list[str
 
 
 def measure_m6(engine: GraphEngine, repo_id: str, timings: dict) -> dict:
-    sizes = [
-        (row["name"], sum(len(e.encode("utf-8")) for e in row["refs"]))
-        for row in _rows(
-            engine, "MATCH (m:Module {repo_id: $r}) RETURN m.name AS name, coalesce(m.name_refs, []) AS refs",
-            r=repo_id,
-        )
-    ]
+    """The scan's `timings`, the largest and total `name_refs`, and the
+    largest and total C# visible sets a Module stores beside them
+    (`name_ref_visible`, its projects as a list)."""
+    rows = _rows(
+        engine, "MATCH (m:Module {repo_id: $r}) RETURN m.name AS name, coalesce(m.name_refs, []) AS refs, "
+        "coalesce(m.name_ref_visible, []) AS visible",
+        r=repo_id,
+    )
+    sizes = [(row["name"], sum(len(e.encode("utf-8")) for e in row["refs"])) for row in rows]
+    visible = [sum(len(e.encode("utf-8")) for e in row["visible"]) for row in rows]
     name, size = max(sizes, key=lambda pair: pair[1]) if sizes else (None, 0)
     return {**timings, "largest_name_refs_module": name, "largest_name_refs_bytes": size,
-            "total_name_refs_bytes": sum(s for _n, s in sizes)}
+            "total_name_refs_bytes": sum(s for _n, s in sizes),
+            "largest_visible_projects": max((len(row["visible"]) for row in rows), default=0),
+            "largest_visible_bytes": max(visible, default=0), "total_visible_bytes": sum(visible)}
 
 
 # --- fixture mode ----------------------------------------------------------------
 
 FIXTURES = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "callgraph"
-FIXTURE_LANGUAGES = ["ts", "go", "java", "kotlin", "csharp", "rust", "cpp"]
+FIXTURE_LANGUAGES = ["ts", "react", "go", "java", "kotlin", "csharp", "rust", "cpp"]
 
 # M4: callee names that must never rank in a fixture's PageRank top five (the
 # container, string and runtime methods every language's stoplist drops).
@@ -639,6 +652,217 @@ def measure_fan_in(engine: GraphEngine, packages: int = 400, callers: int = 30) 
     }
 
 
+# --- synthetic multi-project C# --------------------------------------------------
+
+#: The projects of one `generate_cs_synthetic` cluster, which reference each other and no other cluster.
+_CS_CLUSTER = 5
+_CS_PROJECT = '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n{}  </ItemGroup>\n</Project>\n'
+# The library namespaces a synthetic project's global usings and its files' usings name besides its own.
+_CS_GLOBAL_LIBRARIES = ["System", "System.Linq", "System.Collections.Generic", "System.Threading.Tasks",
+                        "Microsoft.Extensions.Logging", "Microsoft.Extensions.DependencyInjection"]
+_CS_FILE_LIBRARIES = ["System.Text", "System.IO", "System.Net.Http", "System.Text.Json", "System.Diagnostics",
+                      "Microsoft.AspNetCore.Mvc", "Microsoft.Extensions.Options", "System.Threading"]
+
+
+def generate_cs_synthetic(
+    root: Path, projects: int = 10, services: int = 12, seed: int = 1,
+) -> tuple[set[tuple[str, str, str, str]], set[tuple[str, str]]]:
+    """Write a seeded C# repository of `projects` library projects and an
+    App project under `root`, and return its truth: every (caller, caller
+    file, callee, callee file) call and every (file, file) IMPORTS.
+
+    Every library project `Co.P<i>` declares the same classes in its own
+    namespaces (`Models.User`, a partial `Models.Order` over two files,
+    `Util.Text`, the extension class `Models.UserExtensions` of User, and
+    `Api.Gateway`), one class named after it (`Api.Module<i>`, whose `Start()`
+    every project has), and `services` service classes (`Services.Service<k>`),
+    each calling them through typed receivers, a static type, an extension
+    method and its own helper, and one other project's `Gateway.Send()`
+    through a `using` of it (a cross-project edge). Each project's
+    GlobalUsings.cs holds ten `global using`s (six `System`/`Microsoft`
+    ones, its `Util`, and three more of its own); `Models` is in scope by
+    the file's `using` or, for some projects, a `<Using>` item; a service
+    file has 8 to 15 usings, the rest `System`/`Microsoft` ones and other
+    projects' `Contracts` (each project declares `Contracts.Contract<i>`). The App project's Program.cs calls a dozen projects'
+    `Module<j>.Start()` through a `using` of each Api namespace, its
+    Startup.cs half of them through a `using` of every project's (more than
+    32 match keys once there are more than about 30 projects: its sites
+    then link by path alone, to every project's `Start()`).
+    The fixed names repeated in every project are what a resolver that
+    reads no namespace links to every project.
+
+    The projects come in clusters of `_CS_CLUSTER` (`P0`-`P4`, `P5`-`P9`,
+    ...): each but a cluster's first `<ProjectReference>`s one or two
+    earlier members of its cluster (written with `\\`, as Visual Studio
+    does), so it reaches the first transitively, and no cluster references
+    another; the App project references every project. The other project
+    a service calls `Gateway.Send()` of is one its project reaches (its
+    own, for a cluster's first). A cluster's first project also declares
+    `Co.Shared.Clock` (`Co.Shared` is a global using of every project), so
+    every cluster has a `Clock` of the same namespace and name, and each
+    service's `Clock.Now()` means its own cluster's: the same type in
+    projects that do not reference each other."""
+    rng = random.Random(seed)
+    calls: set[tuple[str, str, str, str]] = set()
+    imports: set[tuple[str, str]] = set()
+
+    def write(rel: str, text: str) -> None:
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    reaches: dict[int, set[int]] = {}
+    for i in range(projects):
+        base, ns = f"src/P{i}", f"Co.P{i}"
+        item = rng.random() < 0.5  # Models by a <Using> item, else by each file's using
+        first = i - i % _CS_CLUSTER
+        references = sorted(set(rng.sample(range(first, i), min(i - first, rng.randint(1, 2))))) if i > first else []
+        reaches[i] = set(references).union(*(reaches[j] for j in references))
+        write(f"{base}/P{i}.csproj", _CS_PROJECT.format(
+            (f'    <Using Include="{ns}.Models" />\n' if item else "")
+            + "".join(f'    <ProjectReference Include="..\\P{j}\\P{j}.csproj" />\n' for j in references)
+        ))
+        clock = f"src/P{first}/Shared/Clock.cs"
+        if i == first:
+            write(clock, "namespace Co.Shared;\n\npublic static class Clock\n{\n    public static void Now() { }\n}\n")
+        globals = [*_CS_GLOBAL_LIBRARIES, f"{ns}.Util", f"{ns}.Abstractions", "Co.Common", "Co.Shared"]
+        write(f"{base}/GlobalUsings.cs", "".join(f"global using {each};\n" for each in globals))
+        write(f"{base}/Contracts/Contract{i}.cs", f"namespace {ns}.Contracts;\n\npublic class Contract{i} {{ }}\n")
+        write(f"{base}/Models/User.cs", f"namespace {ns}.Models;\n\npublic class User\n{{\n"
+              "    public string Display() => \"\";\n\n    public void Save() { }\n}\n")
+        write(f"{base}/Models/Order.cs", f"namespace {ns}.Models;\n\npublic partial class Order\n{{\n"
+              "    public decimal Total() => Subtotal();\n}\n")
+        write(f"{base}/Models/Order.Pricing.cs", f"namespace {ns}.Models;\n\npublic partial class Order\n{{\n"
+              "    private decimal Subtotal() => 0m;\n}\n")
+        write(f"{base}/Models/UserExtensions.cs", f"namespace {ns}.Models;\n\npublic static class UserExtensions\n{{\n"
+              "    public static string Initials(this User user) => \"\";\n}\n")
+        write(f"{base}/Util/Text.cs", f"namespace {ns}.Util;\n\npublic static class Text\n{{\n"
+              "    public static string Clean(string s) => s;\n}\n")
+        write(f"{base}/Api/Gateway.cs", f"namespace {ns}.Api;\n\npublic static class Gateway\n{{\n"
+              "    public static void Send() { }\n}\n")
+        write(f"{base}/Api/Module{i}.cs", f"namespace {ns}.Api;\n\npublic static class Module{i}\n{{\n"
+              "    public static void Start() { }\n}\n")
+        calls.add(("Total", f"{base}/Models/Order.cs", "Subtotal", f"{base}/Models/Order.Pricing.cs"))
+        imports.add((f"{base}/Models/UserExtensions.cs", f"{base}/Models/User.cs"))
+        for k in range(services):
+            rel = f"{base}/Services/Service{k}.cs"
+            other = rng.choice(sorted(reaches[i])) if reaches[i] else i
+            usings = ([] if item else [f"{ns}.Models"]) + [f"Co.P{other}.Api"]
+            count = rng.randint(8, 15)
+            libraries = rng.sample(_CS_FILE_LIBRARIES, min(len(_CS_FILE_LIBRARIES), (count - len(usings) + 1) // 2))
+            contracts = [f"Co.P{j}.Contracts" for j in rng.sample(range(projects), min(projects, count))]
+            usings = [f"using {each};\n" for each in (usings + libraries + contracts)[:count]]
+            write(rel, "".join(usings) + f"\nnamespace {ns}.Services;\n\npublic class Service{k}\n{{\n"
+                  f"    public void Run{k}(User user, Order order)\n    {{\n"
+                  "        user.Display();\n        user.Save();\n        user.Initials();\n"
+                  "        order.Total();\n        Text.Clean(\"\");\n        Gateway.Send();\n"
+                  f"        Clock.Now();\n        Helper{k}();\n    }}\n\n    private void Helper{k}() {{ }}\n}}\n")
+            caller = f"Run{k}"
+            calls |= {
+                (caller, rel, "Display", f"{base}/Models/User.cs"), (caller, rel, "Save", f"{base}/Models/User.cs"),
+                (caller, rel, "Initials", f"{base}/Models/UserExtensions.cs"),
+                (caller, rel, "Total", f"{base}/Models/Order.cs"), (caller, rel, "Clean", f"{base}/Util/Text.cs"),
+                (caller, rel, "Send", f"src/P{other}/Api/Gateway.cs"), (caller, rel, f"Helper{k}", rel),
+                (caller, rel, "Now", clock),
+            }
+            imports |= {(rel, f"{base}/Models/{name}.cs") for name in ("User", "Order", "Order.Pricing", "UserExtensions")}
+            imports |= {(rel, f"{base}/Util/Text.cs"), (rel, f"src/P{other}/Api/Gateway.cs"), (rel, clock)}
+    write("src/App/App.csproj", _CS_PROJECT.format(
+        "".join(f'    <ProjectReference Include="..\\P{j}\\P{j}.csproj" />\n' for j in range(projects))
+    ))
+    for name, count in (("Program", min(projects, 12)), ("Startup", projects)):
+        chosen = sorted(rng.sample(range(projects), count))
+        if name == "Startup":
+            used, chosen = chosen, sorted(rng.sample(chosen, (count + 1) // 2))
+        else:
+            used = chosen
+        rel = f"src/App/{name}.cs"
+        body = "".join(f"        Module{j}.Start();\n" for j in chosen)
+        write(rel, "".join(f"using Co.P{j}.Api;\n" for j in used)
+              + f"\nnamespace Co.App;\n\npublic static class {name}\n{{\n    public static void Main()\n    {{\n"
+              + body + "    }\n}\n")
+        calls |= {("Main", rel, "Start", f"src/P{j}/Api/Module{j}.cs") for j in chosen}
+        imports |= {(rel, f"src/P{j}/Api/Module{j}.cs") for j in chosen}
+    return calls, imports
+
+
+def _cs_pin_shapes(root: Path) -> dict:
+    """How the C# CALLS rows of the repository at `root` pin their targets:
+    `keyed` (`/.?.cs^@...`), `any_cs_file` (`/.?.cs^`, a key group over the
+    cap before the class-file fallback) and `class_file` (`/T.cs^`: before
+    match keys, or a group over the cap since)."""
+    from devgraph.indexer.csharp.extractor import extract_csharp_file
+    from devgraph.indexer.resolver_config import ResolverConfig
+
+    config = ResolverConfig(root)
+    shapes = {"keyed": 0, "any_cs_file": 0, "class_file": 0}
+    for path in sorted(root.rglob("*.cs")):
+        rel = path.relative_to(root).as_posix()
+        for row in extract_csharp_file(path.read_text(), rel, "measure", config).relationships:
+            pin = row.to_file or ""
+            if row.rel_type != "CALLS" or not pin.startswith("/"):
+                continue
+            shape = "keyed" if pin.startswith("/.?.cs^@") else "any_cs_file" if pin == "/.?.cs^" else "class_file"
+            shapes[shape] += 1
+    return shapes
+
+
+def measure_cs_synthetic(engine: GraphEngine, projects: int = 10, services: int = 12, seed: int = 1) -> dict:
+    """Scan `generate_cs_synthetic`'s repository into a scratch repository
+    and measure it: linked (resolved or package) CALLS against the truth,
+    the wrong ones, those of them to another project than the truth's
+    target (the cross-project wrong-link rate is their share of linked
+    edges), the same for Startup.cs alone, IMPORTS file to file, the scan
+    time, the largest `name_refs`, and how CALLS rows pin (`_cs_pin_shapes`).
+    The repository and the folder are
+    deleted afterwards."""
+    root = Path(tempfile.mkdtemp(prefix="devgraph-measure-cs-"))
+    repo_id = f"zz-measure-cs-{uuid.uuid4().hex[:8]}"
+    try:
+        truth, import_truth = generate_cs_synthetic(root, projects, services, seed)
+        shapes = _cs_pin_shapes(root)
+        provision_repository_schema(engine, root)
+        engine.upsert_repository(repo_id, repo_id, str(root))
+        started = time.perf_counter()
+        full_scan(engine, repo_id, root)
+        timings = {"full_scan_s": round(time.perf_counter() - started, 2)}
+        edges = _graph_calls(engine, repo_id)
+        imports = _graph_imports(engine, repo_id)
+        m6 = measure_m6(engine, repo_id, timings)
+    finally:
+        engine.delete_repository(repo_id)
+        shutil.rmtree(root, ignore_errors=True)
+
+    def project(path: str) -> str:
+        return "/".join(path.split("/")[:2])
+
+    linked = {key for key, conf in edges if conf in ("resolved", "package")}
+    targets: dict[tuple, set[str]] = {}
+    for a, af, b, bf in truth:
+        targets.setdefault((a, af, b), set()).add(project(bf))
+    wrong = linked - truth
+    cross = {(a, af, b, bf) for a, af, b, bf in wrong if project(bf) not in targets.get((a, af, b), set())}
+
+    def rates(keys: set, wrong_keys: set, cross_keys: set) -> dict:
+        return {"linked": len(keys), "wrong": len(wrong_keys), "cross_project_wrong": len(cross_keys),
+                "cross_project_wrong_rate": _ratio(len(cross_keys), len(keys)),
+                "precision": _ratio(len(keys & truth), len(keys))}
+
+    startup = {key for key in linked if key[1] == "src/App/Startup.cs"}
+    return {
+        "projects": projects, "services": services, "seed": seed,
+        "files": len({af for _a, af, _b, _bf in truth} | {b for _a, b in import_truth}),
+        "calls": {**rates(linked, wrong, cross), "recall_linked": _ratio(len(linked & truth), len(truth)),
+                  "by_confidence": {conf: sum(1 for _k, c in edges if c == conf) for conf in sorted({c for _k, c in edges})}},
+        "startup_calls": rates(startup, startup & wrong, startup & cross),
+        "call_pins": shapes,
+        "imports": {"graph": len(imports), "truth": len(import_truth),
+                    "precision": _ratio(len(imports & import_truth), len(imports)),
+                    "recall": _ratio(len(imports & import_truth), len(import_truth))},
+        "M6": m6,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("repo_id", nargs="?")
@@ -647,15 +871,25 @@ def main() -> int:
     parser.add_argument("--scan", action="store_true", help="delete the repo id and full-scan --root into it first")
     parser.add_argument("--cleanup", action="store_true", help="delete the repo id afterwards")
     parser.add_argument("--fan-in", action="store_true", help="measure M6's S10 fan-in (one save among 400 packages)")
+    parser.add_argument("--cs-synthetic", action="store_true", help="measure a seeded multi-project C# repository")
+    parser.add_argument("--projects", type=int, default=10, help="--cs-synthetic's library projects")
+    parser.add_argument("--seed", type=int, default=1, help="--cs-synthetic's seed")
     args = parser.parse_args()
-    if not args.fixture and not args.repo_id and not args.fan_in:
-        parser.error("give a repo_id, --fixture or --fan-in")
+    if not args.fixture and not args.repo_id and not args.fan_in and not args.cs_synthetic:
+        parser.error("give a repo_id, --fixture, --fan-in or --cs-synthetic")
     root = args.root.resolve()
     engine = GraphEngine(
         uri=os.environ.get("DEVGRAPH_NEO4J_URI", "bolt://127.0.0.1:7687"),
         user=os.environ.get("DEVGRAPH_NEO4J_USER", "neo4j"),
         password=os.environ.get("DEVGRAPH_NEO4J_PASSWORD", "devgraph-local-dev"),
     )
+    if args.cs_synthetic:
+        try:
+            json.dump(measure_cs_synthetic(engine, args.projects, seed=args.seed), sys.stdout, indent=1)
+            print()
+        finally:
+            engine.close()
+        return 0
     if args.fan_in:
         try:
             json.dump(measure_fan_in(engine), sys.stdout, indent=1)

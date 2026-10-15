@@ -1,5 +1,6 @@
 package com.acme.notes
 
+import com.acme.notes.data.Note
 import com.acme.notes.data.NoteRepository
 import com.acme.notes.export.MarkdownExporter
 import com.acme.notes.report.runReport
@@ -13,5 +14,6 @@ fun main() {
     tags.add("kotlin")
     println("Created ${ slugify(note.title) } at ${formatStamp(note.createdAt)}")
     println(MarkdownExporter().export(repo.all()))
+    println(Note.draft("Later").title)
     runReport(repo)
 }

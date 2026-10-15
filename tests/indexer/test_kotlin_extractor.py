@@ -208,6 +208,37 @@ object Registry {
     assert "Registry" in class_names
 
 
+def test_companion_objects_are_classes_owned_by_their_class():
+    """An anonymous companion is `Companion`, Kotlin's own name for it; its
+    members, and a named companion's, are owned by `Class.Companion`."""
+    source_code = """
+package com.example.foo
+
+class Repo(val name: String) {
+    companion object {
+        const val LIMIT = 3
+        fun create(name: String): Repo = Repo(name)
+    }
+    fun save() {}
+}
+
+class Store {
+    companion object Factory {
+        fun create(): Store = Store()
+    }
+}
+"""
+    result = extract_kotlin_file(source_code, "src/main/java/com/example/foo/Repo.kt", "test_repo")
+    owned = {(n.label, n.name, n.properties["owner"]) for n in result.nodes if n.label != "Module"}
+    assert {
+        ("Class", "Repo", ""), ("Class", "Companion", "Repo"), ("Function", "create", "Repo.Companion"),
+        ("Function", "save", "Repo"), ("Class", "Store", ""), ("Class", "Factory", "Store"),
+        ("Function", "create", "Store.Factory"),
+    } <= owned
+    contains = {(r.from_name, r.to_name, r.to_owner) for r in result.relationships if r.rel_type == "CONTAINS"}
+    assert ("Repo", "Companion", "Repo") in contains and ("Companion", "create", "Repo.Companion") in contains
+
+
 def test_extension_function_extracted_as_function():
     source_code = """
 package com.example.foo

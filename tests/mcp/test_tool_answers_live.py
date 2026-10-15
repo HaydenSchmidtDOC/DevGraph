@@ -60,10 +60,9 @@ def engine():
     test_engine.close()
 
 
-@pytest.fixture
-def client(engine, tmp_path, monkeypatch):
+def _make_client(engine, tmp_path, monkeypatch, **sources):
     monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3", allow_cross_repo=True))
-    record = _Repo(REPO, tmp_path)
+    record = _Repo(REPO, tmp_path, **sources)
     server = mcp_server.build_server(engine, _Registry([record]), session_repo=record, session_source="env")
 
     def call(name, arguments, *, error):
@@ -77,6 +76,16 @@ def client(engine, tmp_path, monkeypatch):
         return content.text
 
     return call
+
+
+@pytest.fixture
+def client(engine, tmp_path, monkeypatch):
+    return _make_client(engine, tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def sourced_client(engine, tmp_path, monkeypatch):
+    return _make_client(engine, tmp_path, monkeypatch, pr_source_enabled=True, issue_source_enabled=True)
 
 
 def _error(client, name, arguments):
@@ -175,3 +184,34 @@ def test_a_cross_repo_miss_says_where_its_suggestions_come_from(client):
     text = _error(client, "impact_analysis", {"component_name": "validate", "cross_repo": True})
     assert "no component named 'validate' in any repository." in text
     assert f"Similar names in repository '{REPO}': label='Function', name='validate_token'" in text
+
+
+@pytest.mark.parametrize(
+    "tool", ["find_callers", "find_related_files", "find_requirements_for", "trace_design_rationale"]
+)
+def test_a_misspelled_component_is_an_error_with_suggestions(client, tool):
+    key = "target_name" if tool == "find_callers" else "component_name"
+    text = _error(client, tool, {key: "validate_tokne"})
+    assert f"no component named 'validate_tokne' in repository '{REPO}'" in text
+    text = _error(client, tool, {key: "validate"})
+    assert "name='validate_token'" in text
+
+
+def test_a_known_name_with_no_answers_is_still_empty(client):
+    assert _answer(client, "find_callers", {"target_name": "validate_token"})["count"] == 0
+    assert _answer(client, "find_requirements_for", {"component_name": "validate_token"})["count"] == 0
+    related = _answer(client, "find_related_files", {"component_name": "validate_token"})
+    assert related["related_components"]["count"] == 0
+
+
+@pytest.mark.parametrize("tool", ["find_related_prs", "issue_history_for"])
+def test_an_unknown_file_for_prs_and_issues_is_an_error(sourced_client, tool):
+    text = _error(sourced_client, tool, {"component_name": "auth/token.py"})
+    assert f"no file named 'auth/token.py' in repository '{REPO}'" in text
+    assert "name='auth/tokens.py'" in _error(sourced_client, tool, {"component_name": "auth/token"})
+    assert _answer(sourced_client, tool, {"component_name": "auth/tokens.py"})["count"] == 0
+
+
+def test_an_unknown_entity_type_names_the_valid_ones(client):
+    text = _error(client, "list_recent_changes", {"within_commits": 5, "entity_type": "Funktion"})
+    assert "unknown entity_type 'Funktion'; use one of:" in text and "Function" in text

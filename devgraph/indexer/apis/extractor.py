@@ -30,6 +30,9 @@ class Relationship:
 
     `to_file` pins the target: a file matches that file's node, "" the
     file-less handler stub, and None (Django) every node of the name.
+    `to_owner` narrows a pinned file's nodes to the one of that owner (a
+    module-level handler's "", a class-based view's class); None matches
+    every one.
     """
 
     source_label: str
@@ -39,6 +42,7 @@ class Relationship:
     target_name: str
     properties: dict = field(default_factory=dict)
     to_file: str | None = None
+    to_owner: str | None = None
 
 
 @dataclass
@@ -50,11 +54,35 @@ class ExtractionResult:
     relationships: List[Relationship] = field(default_factory=list)
 
 
-def _pinned_implements(endpoint_id: str, handler_name: str, filename: str) -> list[Relationship]:
+def _handler_owner(content: str, decorator_at: int) -> str | None:
+    """The owner of the handler a route decorator at `decorator_at` decorates
+    (devgraph/indexer/common.py `member_owner`): "" for one at the top level,
+    the class for a method of a top-level class, else None (unknown)."""
+    line_start = content.rfind("\n", 0, decorator_at) + 1
+    indent = len(content[line_start:decorator_at]) - len(content[line_start:decorator_at].lstrip())
+    if content[line_start:decorator_at].strip():
+        return None  # not the first thing on its line
+    if indent == 0:
+        return ""
+    for line in reversed(content[:line_start].splitlines()):
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith(("#", "@")):
+            continue
+        if len(line) - len(stripped) >= indent:
+            continue
+        found = re.match(r"class\s+(\w+)", stripped)
+        return found.group(1) if found and len(line) == len(stripped) else None
+    return None
+
+
+def _pinned_implements(
+    endpoint_id: str, handler_name: str, filename: str, owner: str | None = None
+) -> list[Relationship]:
     """A FastAPI/Flask Endpoint's IMPLEMENTS edges: the handler `def` follows
     its decorator in the route's own file, so the target is that file's
-    Function and the file-less handler stub, never a same-named Function in
-    another file."""
+    Function of the handler's `owner` (`_handler_owner`) and the file-less
+    handler stub, never a same-named Function in another file or a
+    same-named method of another class."""
     return [
         Relationship(
             source_label="Endpoint",
@@ -63,6 +91,7 @@ def _pinned_implements(endpoint_id: str, handler_name: str, filename: str) -> li
             target_label="Function",
             target_name=handler_name,
             to_file=to_file,
+            to_owner=owner if to_file else None,
         )
         for to_file in (filename, "")
     ]
@@ -144,7 +173,9 @@ class APIExtractor:
                     properties={"type": "handler", "source": filename},
                 )
                 result.functions.append(function)
-                result.relationships.extend(_pinned_implements(endpoint_id, handler_name, filename))
+                result.relationships.extend(
+                    _pinned_implements(endpoint_id, handler_name, filename, _handler_owner(content, match.start()))
+                )
 
     def _extract_flask_routes(
         self, content: str, result: ExtractionResult, filename: str
@@ -191,7 +222,9 @@ class APIExtractor:
                         properties={"type": "handler", "source": filename},
                     )
                     result.functions.append(function)
-                    result.relationships.extend(_pinned_implements(endpoint_id, handler_name, filename))
+                    result.relationships.extend(
+                    _pinned_implements(endpoint_id, handler_name, filename, _handler_owner(content, match.start()))
+                )
 
     def _extract_django_urls(
         self, content: str, result: ExtractionResult, filename: str

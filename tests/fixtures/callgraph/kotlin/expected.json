@@ -136,6 +136,27 @@
       "callee": "slugify",
       "callee_file": "src/main/kotlin/util/Text.kt",
       "note": "test-same-package"
+    },
+    {
+      "caller": "main",
+      "caller_file": "src/main/kotlin/Main.kt",
+      "callee": "draft",
+      "callee_file": "src/main/kotlin/data/Note.kt",
+      "note": "companion"
+    },
+    {
+      "caller": "asDraft",
+      "caller_file": "src/main/kotlin/data/Note.kt",
+      "callee": "draft",
+      "callee_file": "src/main/kotlin/data/Note.kt",
+      "note": "companion"
+    },
+    {
+      "caller": "draft",
+      "caller_file": "src/main/kotlin/data/Note.kt",
+      "callee": "normalizeTitle",
+      "callee_file": "src/main/kotlin/data/Note.kt",
+      "note": "companion"
     }
   ],
   "imports": [
@@ -202,6 +223,10 @@
       "to_file": "src/main/kotlin/util/Clock.kt",
       "kind": "wildcard",
       "note": "wildcard"
+    },
+    {
+      "from_file": "src/main/kotlin/Main.kt",
+      "to_file": "src/main/kotlin/data/Note.kt"
     }
   ],
   "no_edge": [
@@ -296,6 +321,11 @@
       "caller": "slugifies",
       "caller_file": "src/test/kotlin/util/TextTest.kt",
       "callee": "assertEquals"
+    },
+    {
+      "caller": "normalizeTitle",
+      "caller_file": "src/main/kotlin/data/Note.kt",
+      "callee": "trim"
     }
   ],
   "symbols": [
@@ -363,6 +393,21 @@
       "name": "truncate",
       "file": "src/main/kotlin/util/Text.kt",
       "kind": "function"
+    },
+    {
+      "name": "Companion",
+      "file": "src/main/kotlin/data/Note.kt",
+      "kind": "class"
+    },
+    {
+      "name": "draft",
+      "file": "src/main/kotlin/data/Note.kt",
+      "kind": "function"
+    },
+    {
+      "name": "normalizeTitle",
+      "file": "src/main/kotlin/data/Note.kt",
+      "kind": "function"
     }
   ],
   "notes": {
@@ -378,6 +423,7 @@
     "typed-param": "`repo: NoteRepository` parameter.",
     "stdlib-collection": "`notes.add(note)` / `tags.add(...)` are MutableList/MutableSet.add. TagSet.add calling tags.add must not self-loop, and NoteRepository.create's notes.add must not link to TagSet.add.",
     "test-same-package": "Test files declare the same package as the code under test, so no import is needed.",
-    "scope": "Constructor calls (`Note(...)`, `Clock()`, `TagSet()`, `MarkdownExporter()`) are not listed as calls. Lambda bodies contain no repo calls. .kts build scripts are not source."
+    "scope": "Constructor calls (`Note(...)`, `Clock()`, `TagSet()`, `MarkdownExporter()`) are not listed as calls. Lambda bodies contain no repo calls. .kts build scripts are not source.",
+    "companion": "Note's anonymous `companion object` is the Class `Companion` owned by `Note`, its members owned by `Note.Companion`. `Note.draft(...)` from Main.kt and from Note's own method reach it; inside the companion `normalizeTitle` is a function of the file."
   }
 }

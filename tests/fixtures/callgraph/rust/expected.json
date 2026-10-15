@@ -163,6 +163,44 @@
       "callee": "format",
       "callee_file": "crates/core/src/util/money.rs",
       "note": "macro-args"
+    },
+    {
+      "caller": "summary",
+      "caller_file": "crates/app/src/report.rs",
+      "callee": "new",
+      "callee_file": "crates/core/src/net/client.rs",
+      "not_files": [
+        "crates/core/src/models/user.rs",
+        "crates/core/src/models/order.rs"
+      ],
+      "note": "crate-root-reexport"
+    },
+    {
+      "caller": "summary",
+      "caller_file": "crates/app/src/report.rs",
+      "callee": "fetch_user",
+      "callee_file": "crates/core/src/net/client.rs",
+      "note": "crate-root-reexport"
+    },
+    {
+      "caller": "summary",
+      "caller_file": "crates/app/src/report.rs",
+      "callee": "total",
+      "callee_file": "crates/core/src/models/user.rs"
+    },
+    {
+      "caller": "summary",
+      "caller_file": "crates/app/src/report.rs",
+      "callee": "normalize",
+      "callee_file": "crates/core/src/util/text.rs",
+      "note": "glob-reexport"
+    },
+    {
+      "caller": "summary",
+      "caller_file": "crates/app/src/report.rs",
+      "callee": "format",
+      "callee_file": "crates/core/src/util/money.rs",
+      "note": "renamed-reexport"
     }
   ],
   "imports": [
@@ -274,6 +312,42 @@
       "to_file": "crates/core/src/util/money.rs",
       "kind": "use",
       "note": "sibling-crate"
+    },
+    {
+      "from_file": "crates/app/src/report.rs",
+      "to_file": "crates/core/src/lib.rs",
+      "kind": "use",
+      "note": "crate-root-reexport"
+    },
+    {
+      "from_file": "crates/app/src/report.rs",
+      "to_file": "crates/core/src/net/client.rs",
+      "kind": "use",
+      "note": "crate-root-reexport"
+    },
+    {
+      "from_file": "crates/app/src/report.rs",
+      "to_file": "crates/core/src/util/text.rs",
+      "kind": "use",
+      "note": "glob-reexport"
+    },
+    {
+      "from_file": "crates/core/src/lib.rs",
+      "to_file": "crates/core/src/net/client.rs",
+      "kind": "use",
+      "note": "crate-root-reexport"
+    },
+    {
+      "from_file": "crates/core/src/lib.rs",
+      "to_file": "crates/core/src/util/text.rs",
+      "kind": "use",
+      "note": "glob-reexport"
+    },
+    {
+      "from_file": "crates/core/src/lib.rs",
+      "to_file": "crates/core/src/util/money.rs",
+      "kind": "use",
+      "note": "renamed-reexport"
     }
   ],
   "no_edge": [
@@ -377,7 +451,10 @@
     "sibling-crate": "crates/app depends on the sibling workspace crate shop-core (path dependency); `use shop_core::...` resolves into crates/core/src. `use shop_core::util::money` imports the module money -> util/money.rs.",
     "mod-decl": "`mod cli;` / `mod report;` in crates/app/src/main.rs -> crates/app/src/cli.rs and report.rs.",
     "typed-loop-var": "`for order in &self.orders` with `orders: Vec<Order>`, so `order.amount()` is Order::amount.",
-    "imports-format": "IMPORTS rows are `mod x;` declarations (kind `mod`) and `use` paths (kind `use`) that resolve to another in-repo file; the target is the file of the module the path names (for `use a::b::Item`, the file of module a::b). A pair present for both reasons is listed once (kind `mod+use`). Paths written inline in expressions (`super::super::text::normalize(...)`) are not imports. A `use` of an inline module in the same file gives no row.",
-    "scope": "Struct literals (`User { ... }`) are not calls. std/core items are external."
+    "imports-format": "IMPORTS rows are `mod x;` declarations (kind `mod`) and `use` paths (kind `use`) that resolve to another in-repo file; the target is the file of the module the path names (for `use a::b::Item`, the file of module a::b). A pair present for both reasons is listed once (kind `mod+use`). Paths written inline in expressions (`super::super::text::normalize(...)`) are not imports. A `use` of an inline module in the same file gives no row. A `use` of an item the crate root re-exports also names the file of the module defining it (report.rs's `use shop_core::{.., Client}` imports lib.rs and net/client.rs).",
+    "scope": "Struct literals (`User { ... }`) are not calls. std/core items are external.",
+    "crate-root-reexport": "lib.rs re-exports Client from net, which re-exports it from net::client (`pub use self::client::Client;`). `Client::new` and the method on the value it returns reach net/client.rs, the file defining the type, through both re-exports; never models/user.rs's `new`.",
+    "glob-reexport": "`pub use util::text::*;` in lib.rs: `shop_core::normalize` is util/text.rs's function.",
+    "renamed-reexport": "`pub use util::money::format as format_money;`: a call to `format_money` calls money.rs's `format`, under its own name."
   }
 }

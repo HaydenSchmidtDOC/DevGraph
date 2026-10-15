@@ -24,7 +24,7 @@ class _StubEngine:
     def __init__(self):
         self.queries = []
 
-    def run_cypher_graph(self, query, params=None):
+    def run_cypher_graph(self, query, params=None, **bounds):
         self.queries.append(query)
         return {"data": []}
 

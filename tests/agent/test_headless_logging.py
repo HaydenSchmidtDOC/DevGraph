@@ -12,7 +12,11 @@ import sys
 import types
 from contextlib import contextmanager
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from unittest.mock import MagicMock, patch
+
+import pytest
+from typer.testing import CliRunner
 
 try:  # pystray binds to an X display as a side effect of import (see
     # tests/conftest.py); `devgraph.agent.__init__` pulls it in transitively.
@@ -21,6 +25,8 @@ except Exception:  # pragma: no cover — depends on the host having a display
     sys.modules["pystray"] = types.ModuleType("pystray")
 
 from devgraph.agent import headless
+from devgraph.cli import main as cli_main
+from devgraph.config.settings import LOG_BACKUP_COUNT, LOG_MAX_BYTES
 
 _EXPECTED_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
@@ -108,3 +114,215 @@ def test_main_starts_the_agent_when_no_log_file_is_configured():
         assert root.handlers == []
 
     agent.start.assert_called_once_with()
+
+
+@pytest.mark.parametrize("module", ["headless", "tray"])
+def test_the_agent_log_rotates_with_a_size_cap_and_a_few_backups(tmp_path, module):
+    """One agent log line per live batch adds up; the file must not grow forever."""
+    if module == "tray":
+        from devgraph.agent import tray as agent
+    else:
+        agent = headless
+    log_path = tmp_path / "devgraph.log"
+    settings = MagicMock()
+    settings.log_file = log_path
+
+    with _isolated_root_logger() as root, \
+         patch.object(agent, "get_settings", return_value=settings), \
+         patch.object(agent, "LOG_MAX_BYTES", 2000):
+        agent._configure_logging()
+        [handler] = root.handlers
+        assert isinstance(handler, RotatingFileHandler)
+        assert handler.maxBytes == 2000 and handler.backupCount == LOG_BACKUP_COUNT
+        for i in range(200):
+            logging.getLogger("devgraph.agent").info("batch %03d done", i)
+        handler.flush()
+
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == ["devgraph.log"] + [f"devgraph.log.{n}" for n in range(1, LOG_BACKUP_COUNT + 1)]
+    assert all(p.stat().st_size <= 2000 for p in tmp_path.iterdir())
+    assert "batch 199 done" in log_path.read_text(encoding="utf-8")
+    assert LOG_MAX_BYTES == 5 * 1024 * 1024 and LOG_BACKUP_COUNT == 3
+
+
+def test_devgraph_logs_reads_across_a_rollover(tmp_path):
+    """Just after a rollover the current file holds a line or two; the
+    requested tail comes from the newest older file too, in order."""
+    log_path = tmp_path / "devgraph.log"
+    (tmp_path / "devgraph.log.2").write_text("2026-01-01 INFO x: ancient\n", encoding="utf-8")
+    (tmp_path / "devgraph.log.1").write_text(
+        "".join(f"2026-01-02 INFO x: old {i}\n" for i in range(5)), encoding="utf-8"
+    )
+    log_path.write_text("2026-01-03 INFO x: new 0\n", encoding="utf-8")
+    settings = MagicMock()
+    settings.log_file = log_path
+
+    with patch.object(cli_main, "get_settings", return_value=settings):
+        result = CliRunner().invoke(cli_main.app, ["logs", "-n", "3"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == [
+        "2026-01-02 INFO x: old 3", "2026-01-02 INFO x: old 4", "2026-01-03 INFO x: new 0",
+    ]
+
+
+def test_a_rollover_the_os_refuses_loses_no_record_and_moves_no_backup(tmp_path, monkeypatch):
+    """On Windows another process holding the file open makes its rename fail."""
+    from devgraph.agent import log_file
+
+    log_path = tmp_path / "devgraph.log"
+    (tmp_path / "devgraph.log.1").write_text("older\n", encoding="utf-8")
+    now = [1000.0]
+    monkeypatch.setattr(log_file.time, "monotonic", lambda: now[0])
+    real_replace = os.replace
+    attempts = []
+
+    def held(src, dst):
+        if os.fspath(src) == str(log_path):
+            attempts.append(dst)
+            raise PermissionError("the file is in use by another process")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(log_file.os, "replace", held)
+    handler = log_file.AgentLogHandler(log_path, maxBytes=200, backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("devgraph.test.rollover")
+    logger.propagate = False
+    logger.addHandler(handler)
+    try:
+        for i in range(40):
+            logger.warning("record %02d of the batch", i)
+        assert len(attempts) == 1  # tried once, then not again until retry_s has passed
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["devgraph.log", "devgraph.log.1"]
+        assert (tmp_path / "devgraph.log.1").read_text(encoding="utf-8") == "older\n"
+        written = log_path.read_text(encoding="utf-8").splitlines()
+        assert written == [f"record {i:02d} of the batch" for i in range(40)]
+
+        # Once the file is free and retry_s has passed, it rolls over as usual.
+        monkeypatch.setattr(log_file.os, "replace", real_replace)
+        now[0] += handler.retry_s + 1
+        logger.warning("after the retry")
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["devgraph.log", "devgraph.log.1", "devgraph.log.2"]
+    assert (tmp_path / "devgraph.log.2").read_text(encoding="utf-8") == "older\n"
+    assert log_path.read_text(encoding="utf-8") == "after the retry\n"
+
+
+def test_devgraph_logs_skips_a_file_that_vanishes_under_it(tmp_path, monkeypatch):
+    """A rollover can rename a file between the check and the read."""
+    log_path = tmp_path / "devgraph.log"
+    log_path.write_text("2026-01-03 INFO x: new 0\n", encoding="utf-8")
+    (tmp_path / "devgraph.log.1").write_text("2026-01-02 INFO x: old\n", encoding="utf-8")
+    real_read = Path.read_text
+
+    def racing(self, *args, **kwargs):
+        if self.name == "devgraph.log.1":
+            raise FileNotFoundError(self)
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", racing)
+    settings = MagicMock()
+    settings.log_file = log_path
+    with patch.object(cli_main, "get_settings", return_value=settings):
+        result = CliRunner().invoke(cli_main.app, ["logs"])
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == ["2026-01-03 INFO x: new 0"]
+
+
+def _failing_replace(monkeypatch, log_file, fails):
+    """Make os.replace raise PermissionError for (source suffix, target suffix)
+    pairs in `fails`, a set the test can change; suffixes after `devgraph.log`."""
+    real = os.replace
+
+    def replace(src, dst):
+        pair = (os.fspath(src).rsplit("devgraph.log", 1)[1], os.fspath(dst).rsplit("devgraph.log", 1)[1])
+        if pair in fails:
+            raise PermissionError(f"in use: {pair}")
+        return real(src, dst)
+
+    monkeypatch.setattr(log_file.os, "replace", replace)
+
+
+def _logger(handler, name):
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger(name)
+    logger.propagate = False
+    logger.addHandler(handler)
+    return logger
+
+
+def _all_lines(folder):
+    return sorted(line for p in folder.iterdir() for line in p.read_text(encoding="utf-8").splitlines())
+
+
+@pytest.mark.parametrize("restore_fails", [False, True], ids=["restored", "restore refused too"])
+def test_a_rollover_failing_half_way_loses_nothing(tmp_path, monkeypatch, restore_fails):
+    """Stage 2 (into .1) refused after the current file moved aside; the move
+    back may be refused as well. No line is lost, the record that triggered
+    the rollover included, and logging carries on."""
+    from devgraph.agent import log_file
+
+    log_path = tmp_path / "devgraph.log"
+    (tmp_path / "devgraph.log.1").write_text("older\n", encoding="utf-8")
+    now = [1000.0]
+    monkeypatch.setattr(log_file.time, "monotonic", lambda: now[0])
+    fails = {(".rolling", ".1")} | ({(".rolling", "")} if restore_fails else set())
+    _failing_replace(monkeypatch, log_file, fails)
+    handler = log_file.AgentLogHandler(log_path, maxBytes=200, backupCount=3, encoding="utf-8")
+    logger = _logger(handler, f"devgraph.test.half.{restore_fails}")
+    expected = ["older"]
+    try:
+        for i in range(30):
+            logger.warning("record %02d of the batch", i)
+            expected.append(f"record {i:02d} of the batch")
+        handler.flush()
+        assert _all_lines(tmp_path) == sorted(expected)
+        names = sorted(p.name for p in tmp_path.iterdir())
+        if restore_fails:
+            assert names == ["devgraph.log", "devgraph.log.2", "devgraph.log.rolling"]
+        else:
+            assert names == ["devgraph.log", "devgraph.log.2"]
+
+        # The file is free again and retry_s has passed: it rolls over, a
+        # leftover .rolling first, and nothing is shifted twice or lost.
+        fails.clear()
+        now[0] += handler.retry_s + 1
+        logger.warning("after the retry")
+        expected.append("after the retry")
+        handler.flush()
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+    assert _all_lines(tmp_path) == sorted(expected)
+    assert log_path.read_text(encoding="utf-8") == "after the retry\n"
+    assert not (tmp_path / "devgraph.log.rolling").exists()
+    assert (tmp_path / f"devgraph.log.{3 if restore_fails else 2}").read_text(encoding="utf-8") == "older\n"
+
+
+def test_a_rolling_file_left_by_a_crash_is_kept(tmp_path, monkeypatch):
+    """Missing current file: moved back at start. Present: folded in as the
+    newest backup at the next rollover, never overwritten."""
+    from devgraph.agent import log_file
+
+    rolling = tmp_path / "devgraph.log.rolling"
+    rolling.write_text("from the crash\n", encoding="utf-8")
+    handler = log_file.AgentLogHandler(tmp_path / "devgraph.log", maxBytes=100, backupCount=3, encoding="utf-8")
+    handler.close()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["devgraph.log"]
+    assert (tmp_path / "devgraph.log").read_text(encoding="utf-8") == "from the crash\n"
+
+    rolling.write_text("from another crash\n", encoding="utf-8")
+    handler = log_file.AgentLogHandler(tmp_path / "devgraph.log", maxBytes=100, backupCount=3, encoding="utf-8")
+    logger = _logger(handler, "devgraph.test.leftover")
+    try:
+        logger.warning("x" * 120)
+        handler.flush()
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["devgraph.log", "devgraph.log.1", "devgraph.log.2"]
+    assert (tmp_path / "devgraph.log.2").read_text(encoding="utf-8") == "from another crash\n"
+    assert (tmp_path / "devgraph.log.1").read_text(encoding="utf-8") == "from the crash\n"
+    assert (tmp_path / "devgraph.log").read_text(encoding="utf-8") == "x" * 120 + "\n"

@@ -160,3 +160,15 @@ def test_duplicates_fall_back_to_order_after_identical_bodies():
     added, removed, changed = diff_symbols(extract_symbols("S.java", old), extract_symbols("S.java", new))
     assert added == removed == []
     assert [(e["kind"], e["start_line"], e["old_start_line"]) for e in changed] == [("Class", 1, 1), ("Function", 2, 2)]
+
+
+def test_a_member_entry_names_its_owner():
+    """A changed method carries its node's owner, which keys the graph lookup
+    of its callers apart from a same-named method of another class."""
+    old = "class A:\n    def save(self):\n        return 1\n\n\nclass B:\n    def save(self):\n        return 2\n"
+    new = old.replace("return 2", "return 3")
+    _added, _removed, changed = diff_symbols(extract_symbols("m.py", old), extract_symbols("m.py", new))
+    assert [(e["kind"], e["name"], e.get("owner")) for e in changed] == [("Class", "B", None), ("Function", "save", "B")]
+    go = "package m\n\ntype T struct{}\n\nfunc (t T) Get() int { return 1 }\n"
+    (entry,) = [e for e in diff_symbols([], extract_symbols("m.go", go))[0] if e["name"] == "Get"]
+    assert entry["owner"] == "T" and entry["container"] is None

@@ -8,6 +8,7 @@ hardcoding label strings.
 """
 
 import re
+from collections.abc import Iterable
 from typing import NamedTuple
 
 NODE_LABELS: tuple[str, ...] = (
@@ -64,10 +65,21 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # the value the pipeline writes. `extractor` marks nodes a schema-declared
 # provider owns (see devgraph/indexer/providers/). `name_refs`,
 # `name_ref_targets` and `name_ref_sources` record a code Module's by-name
-# edges (see devgraph/indexer/common.py `name_ref_properties`).
+# edges (see devgraph/indexer/common.py `name_ref_properties`),
+# `name_ref_visible` the C# projects its file's sites see (`visible_to`), and
+# `shared_claims` the shared nodes its file claims (graph/engine.py
+# `SHARED_CLAIM_SEP`). `mkeys` is a
+# code symbol's match keys, which a pin's `@` flag tests (see `split_pin`),
+# and `mkeys_stale` marks one whose edges a batch has yet to relink after
+# they changed (see graph/engine.py `write_match_keys`). A code symbol's
+# `owner` (its identity within its file, see FILE_SCOPED_LABELS) and a C#
+# symbol's `proj` (its project's directory) are not reserved: only a node
+# with a `file` has one, which no declared type's node has, so a declared
+# `owner` field (a runbook's front matter) stays the user's.
 RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
     "repo_id", "name", "file", "source_file", "source", "sources", "claims", "extractor",
-    "name_refs", "name_ref_targets", "name_ref_sources",
+    "name_refs", "name_ref_targets", "name_ref_sources", "name_ref_visible", "mkeys", "mkeys_stale",
+    "shared_claims",
 })
 
 # The pipeline's own bookkeeping among those, plus the Repository node's
@@ -75,7 +87,8 @@ RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
 # hidden wherever a node's properties are shown (describe_node, the
 # dashboard's node inspector).
 INTERNAL_NODE_PROPERTIES: frozenset[str] = frozenset({
-    "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources", "skipped_files",
+    "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources", "name_ref_visible", "mkeys",
+    "mkeys_stale", "shared_claims", "skipped_files",
 })
 
 # An extracted edge's bookkeeping: `origins`, the files that wrote it
@@ -85,7 +98,7 @@ INTERNAL_EDGE_PROPERTIES: frozenset[str] = frozenset({"origins"})
 
 # Labels other than Repository must be uniquely keyed on (repo_id, name)
 # so incremental MERGE writes update in place instead of duplicating.
-_REPO_SCOPED_LABELS = tuple(l for l in NODE_LABELS if l != "Repository")
+_REPO_SCOPED_LABELS = tuple(label for label in NODE_LABELS if label != "Repository")
 
 # Class/Function/Service are keyed on (repo_id, name, file) instead: a bare
 # name isn't unique across files (two files can each define a function
@@ -96,7 +109,11 @@ _REPO_SCOPED_LABELS = tuple(l for l in NODE_LABELS if l != "Repository")
 # (Endpoint, Database, ...), so it doesn't need the extra key component —
 # and Container deliberately stays bare-name keyed too, since it represents
 # a shared base image, not a per-file entity (see
-# indexer/dispatch.py:_upsert_container_result).
+# indexer/dispatch.py:_upsert_container_result). Within a file a node is
+# also keyed by its `owner`, the dotted chain of the types it is declared in
+# ("" at the top level, and always for a Service), so two classes' same-named
+# methods in one file are two nodes (see devgraph/indexer/common.py
+# `member_owner`).
 FILE_SCOPED_LABELS = ("Class", "Function", "Service")
 
 # The labels a file's own nodes can carry, by the property that names the
@@ -129,11 +146,14 @@ def constraint_statements() -> list[str]:
     """Cypher to create uniqueness constraints for every node label.
 
     Idempotent — `IF NOT EXISTS` makes this safe to run on every startup.
-    Class/Function additionally DROP their old two-property constraint
-    first: changing a constraint's definition in place isn't something
-    `CREATE CONSTRAINT ... IF NOT EXISTS` can do (a same-named constraint
-    with a different definition is just left alone), so an explicit drop is
-    the only way an already-provisioned Neo4j instance picks up the new key.
+    Class/Function/Service additionally DROP their older two- and
+    three-property constraints first: changing a constraint's definition in
+    place isn't something `CREATE CONSTRAINT ... IF NOT EXISTS` can do (a
+    same-named constraint with a different definition is just left alone),
+    so an explicit drop is the only way an already-provisioned Neo4j
+    instance picks up the new key. A node an older index wrote without
+    `owner` is outside the new constraint until the automatic rescan gives
+    it one (see graph/engine.py `_replace_file_nodes_tx`).
     """
     statements = [
         "CREATE CONSTRAINT repository_id IF NOT EXISTS "
@@ -142,9 +162,10 @@ def constraint_statements() -> list[str]:
     for label in _REPO_SCOPED_LABELS:
         if label in FILE_SCOPED_LABELS:
             statements.append(f"DROP CONSTRAINT {label.lower()}_repo_name IF EXISTS")
+            statements.append(f"DROP CONSTRAINT {label.lower()}_repo_name_file IF EXISTS")
             statements.append(
-                f"CREATE CONSTRAINT {label.lower()}_repo_name_file IF NOT EXISTS "
-                f"FOR (n:{label}) REQUIRE (n.repo_id, n.name, n.file) IS UNIQUE"
+                f"CREATE CONSTRAINT {label.lower()}_repo_name_file_owner IF NOT EXISTS "
+                f"FOR (n:{label}) REQUIRE (n.repo_id, n.name, n.file, n.owner) IS UNIQUE"
             )
         else:
             statements.append(
@@ -158,9 +179,13 @@ def lookup_index_statements() -> list[str]:
     """Cypher for the RANGE lookup indexes the built-in queries seek.
 
     A `(repo_id, name)` index on each file-scoped label: their uniqueness
-    constraint indexes `(repo_id, name, file)`, which a bare-name match (an
-    edge's target end, `describe_node`) can't seek, so without these it
-    scans every node of the label; the same on Cache, which has no
+    constraint indexes `(repo_id, name, file, owner)`, which a bare-name
+    match (an edge's target end, `describe_node`) can't seek, so without
+    these it scans every node of the label (an end pinned to a file seeks
+    the constraint's index, with `owner IS NOT NULL` when the row names no
+    owner; no separate `(repo_id, name, file)` index exists, which an older
+    DevGraph's constraint of that shape would collide with); the same on
+    Cache, which has no
     constraint (named so it never reads as a user type's generated index).
     Module's `(repo_id, dir)`, `(repo_id, dir_name)` and `(repo_id,
     basename)`, which a pinned IMPORTS row seeks (see engine._end_match). Then the provenance indexes a per-file re-index seeks (`(repo_id, file)`,
@@ -171,6 +196,12 @@ def lookup_index_statements() -> list[str]:
     user-type constraint or index (built-in labels can't be redeclared).
     """
     statements = [
+        # A pre-release build of owner identity created these; they would
+        # block an older DevGraph's (repo_id, name, file) constraint.
+        f"DROP INDEX {label.lower()}_repo_name_file_lookup IF EXISTS"
+        for label in FILE_SCOPED_LABELS
+    ]
+    statements += [
         f"CREATE INDEX {label.lower()}_repo_name_lookup IF NOT EXISTS FOR (n:{label}) ON (n.repo_id, n.name)"
         for label in FILE_SCOPED_LABELS
     ]
@@ -196,6 +227,12 @@ NAME_REF_SEP = "\x1f"
 NAME_REF_PIN_SEP = "\x1e"
 #: A target pin to the file-less node ("" as a `to_file`).
 NAME_REF_FILELESS = "\x1d"
+#: Joins a pin and the owner of the target in the files it matches, in an
+#: *owned pin* (see devgraph/indexer/common.py `owned_pin`).
+OWNER_PIN_SEP = "\x1c"
+#: The last field of a `name_refs` entry written since owners (index format
+#: 11), which no older entry's last field can be: its layout is then fixed.
+NAME_REF_OWNED = "\x1b"
 
 
 # Path pins: a relationship row's `to_file` (see devgraph/indexer/common.py
@@ -227,7 +264,9 @@ TEST_ROOTS: tuple[str, ...] = (
 )
 #: The characters that start a path pin's flags (see `split_pin`); a resolver
 #: never writes a path pin whose own path holds one.
-PIN_FLAG_CHARS = "~?^!"
+PIN_FLAG_CHARS = "~?^!@"
+#: The most match keys a pin's `@` flag carries (see `scoped_pin`).
+MAX_SCOPE_KEYS = 32
 
 
 class PinParts(NamedTuple):
@@ -239,13 +278,17 @@ class PinParts(NamedTuple):
     skip: tuple[str, ...] = ()
     not_suffix: str = ""
     skip_roots: tuple[str, ...] = ()
+    scope: tuple[str, ...] = ()
+    ranks: tuple[int, ...] = ()
 
 
 def _is_path_pin(pin: str) -> bool:
     return pin == "." or pin.startswith("/") or pin.endswith(("/", "/."))
 
 
-_PIN_FLAGS = re.compile(r"(~)?(?:\?([^~?^!/]*))?(\^t?)?(?:!([^~?^!/]*))?")
+_PIN_FLAGS = re.compile(
+    r"(~)?(?:\?([^~?^!@/]*))?(\^t?)?(?:!([^~?^!@/]*))?(?:@([\w.+]+:[\w.+]+(?:[,;][\w.+]+:[\w.+]+)*))?"
+)
 
 
 def split_pin(pin: str) -> PinParts:
@@ -254,9 +297,12 @@ def split_pin(pin: str) -> PinParts:
     end with one of these suffixes: a language's extensions), `^` (no
     directory of the source root a matched file is under, the part of its
     path before what the pin matches, is vendored: `VENDORED_DIRS`; `^t`
-    nor a test root: `TEST_ROOTS`) and `!x` (a matched file must not end with
-    `x`): `go/b/.~?.go!_test.go` is the Go files directly in go/b/, tests
-    left out, at package confidence. Only a path pin (no repository-relative
+    nor a test root: `TEST_ROOTS`), `!x` (a matched file must not end with
+    `x`) and `@k1,k2` (the matched node's `mkeys` must hold one of these
+    match keys, each `namespace:name`, maybe in tiers separated by `;`,
+    nearest first; see `scoped_pin` and `tiered_pin`):
+    `go/b/.~?.go!_test.go` is the Go files directly in go/b/, tests left
+    out, at package confidence. Only a path pin (no repository-relative
     path is `.`, starts with "/" or ends with "/" or "/.") takes flags, so a
     file named `a!b.go` stays a file pin. A path pin whose own path holds a
     flag character (a directory named `x!y`) would be split there, so it is
@@ -265,12 +311,58 @@ def split_pin(pin: str) -> PinParts:
         if char in PIN_FLAG_CHARS and _is_path_pin(pin[:i]):
             flags = _PIN_FLAGS.fullmatch(pin, i)
             if flags:
-                loose, only, skip, not_suffix = flags.groups()
+                loose, only, skip, not_suffix, scope = flags.groups()
+                tiers = scope.split(";") if scope else []
+                rank: dict[str, int] = {}
+                for tier, keys in enumerate(tiers):
+                    for key in keys.split(","):
+                        rank.setdefault(key, tier)
+                keys = tuple(sorted(rank))
                 return PinParts(
                     pin[:i], bool(loose), tuple(s for s in (only or "").split(",") if s),
                     VENDORED_DIRS if skip else (), not_suffix or "", TEST_ROOTS if skip == "^t" else (),
+                    keys, tuple(rank[key] for key in keys) if len(tiers) > 1 else (),
                 )
     return PinParts(pin)
+
+
+def scoped_pin(pin: str, keys: Iterable[str]) -> str:
+    """The path pin `pin` (no `@` flag of its own) limited to the nodes whose
+    `mkeys` hold one of `keys`, written canonically (sorted, without
+    repeats). With no keys, or more than MAX_SCOPE_KEYS, it is `pin` as it
+    is: the site links by its path alone."""
+    return tiered_pin(pin, [keys])
+
+
+def tiered_pin(pin: str, tiers: Iterable[Iterable[str]]) -> str:
+    """`scoped_pin` with its keys in tiers, nearest first: a node holding a
+    key of a farther tier is linked only when no node of its name the pin's
+    path matches holds one of a nearer tier (C#'s shadowing, see
+    devgraph/indexer/common.py `shadowed`). Canonical: each key once, in
+    its nearest tier, sorted within it, empty tiers dropped (one tier is
+    `scoped_pin`'s form), `;` between tiers. MAX_SCOPE_KEYS counts every
+    tier's keys."""
+    seen: set[str] = set()
+    groups = []
+    for tier in tiers:
+        group = sorted(set(tier) - seen)
+        seen.update(group)
+        if group:
+            groups.append(",".join(group))
+    return pin + "@" + ";".join(groups) if 0 < len(seen) <= MAX_SCOPE_KEYS else pin
+
+
+def unscoped_pin(pin: str) -> tuple[str, str]:
+    """`pin` less its `@` flag's keys (the flag itself kept, as "@"), and
+    those keys, canonical, in their tiers (see `tiered_pin`): a `name_refs`
+    entry stores them once, not with each pin."""
+    parts = split_pin(pin)
+    if not parts.scope:
+        return pin, ""
+    tiers: dict[int, list[str]] = {}
+    for key, rank in zip(parts.scope, parts.ranks or [0] * len(parts.scope)):
+        tiers.setdefault(rank, []).append(key)
+    return pin.rsplit("@", 1)[0] + "@", ";".join(",".join(tiers[rank]) for rank in sorted(tiers))
 
 
 def pin_root(pin: str, path: str) -> str:
@@ -315,7 +407,9 @@ def pin_value(pin: str) -> dict:
     `v` the path, directory or suffix it tests, `ns` the suffix a file must
     not end with, `os` the suffixes it must end with one of (empty: any),
     `nv` the directory names its source root may not hold, `pin_root`, `nr`
-    the fragments it may not contain, wrapped in "/"): a
+    the fragments it may not contain, wrapped in "/", `sc` the match keys
+    one of which the node's `mkeys` must hold (empty: any node), `sr` each
+    of those keys' tier, nearest 0, for a tiered pin (empty otherwise)): a
     directory pin's `v` is the directory with its trailing "/" ("" for the
     root), so `dir` and `suffix_dir` drop the final "."; a `loose_dir`
     matches as a `dir`."""
@@ -325,6 +419,6 @@ def pin_value(pin: str) -> dict:
     value = parts.base[:-1] if kind in ("dir", "suffix_dir") else parts.base
     return {
         "k": kind, "v": value, "ns": parts.not_suffix, "os": list(parts.only), "nv": list(parts.skip),
-        "nr": list(parts.skip_roots),
+        "nr": list(parts.skip_roots), "sc": list(parts.scope), "sr": list(parts.ranks),
     }
 

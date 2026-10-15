@@ -1,18 +1,23 @@
 """Resolve a Python file's imports to the repository files they can name.
 
-Everything here is a pure function of the importing file's path and text: no
-filesystem, no other file, no repository configuration. An import names a
-set of *candidate* files, and the graph links only the candidates that exist
-as Modules, so an edge never depends on anything but the writer's text and
-whether its target exists (see
+Everything here is a pure function of the importing file's path and text
+and of the source roots the repository holds or its pyproject.toml files
+declare (resolver configuration): no filesystem, no other source file. An import names a set
+of *candidate* files, and the graph links only the candidates that exist as
+Modules, so an edge never depends on anything but the writer's text, the
+configuration and whether its target exists (see
 docs/superpowers/specs/2026-10-10-python-call-resolution-design.md).
 
 Absolute imports are tried under every ancestor directory of the importer:
 `import a.b` in `x/y/f.py` names `a/b`, `x/a/b` and `x/y/a/b`. That covers a
-flat layout, a `src/` layout and a monorepo's nested projects without
-reading any configuration. A module path `p` is the file `p.py` or the
-package `p/__init__.py`; the package's directory `p/` is its prefix, which a
-re-exported name can live anywhere under.
+flat layout, a `src/` layout from inside `src/` and a monorepo's nested
+projects. The configured roots come after them: every `src/` directory
+holding Python files beside an ancestor (`src/` for `tests/test_a.py`,
+`packages/foo/src/` for `packages/foo/tests/test_a.py`), and the roots a
+pyproject.toml at or above the importer declares (`package-dir`,
+`packages.find` `where`, Poetry's `from`, Hatch's wheel `packages`). A module path `p` is
+the file `p.py` or the package `p/__init__.py`; the package's directory `p/`
+is its prefix, which a re-exported name can live anywhere under.
 """
 
 from __future__ import annotations
@@ -21,10 +26,23 @@ from dataclasses import dataclass, field
 
 
 def ancestor_roots(file_path: str) -> tuple[str, ...]:
-    """The directories an absolute import is tried under, outermost first:
-    `x/y/f.py` gives `""`, `"x/"`, `"x/y/"`."""
+    """The directories above a file, outermost first: `x/y/f.py` gives
+    `""`, `"x/"`, `"x/y/"`."""
     parts = file_path.split("/")[:-1]
     return tuple("/".join(parts[:i]) + "/" if i else "" for i in range(len(parts) + 1))
+
+
+def import_roots(file_path: str, configured: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """The directories an absolute import is tried under: each ancestor
+    directory, outermost first, then the `configured` roots
+    (`ResolverConfig.python_roots`), without repeats. `x/f.py` with
+    `("src/",)` gives `""`, `"x/"`, `"src/"`."""
+    found: dict[str, None] = {}
+    for root in ancestor_roots(file_path):
+        found[root] = None
+    for root in configured:
+        found[root] = None
+    return tuple(found)
 
 
 def relative_dir(current_dir: str, dot_count: int) -> str:
@@ -64,10 +82,11 @@ class ModuleRef:
         return ModuleRef(tuple(f"{path}/{name}" if path else name for path in self.paths))
 
 
-def absolute_module(dotted: str, file_path: str) -> ModuleRef:
-    """`import a.b` written in `file_path`: `a/b` under each ancestor root."""
+def absolute_module(dotted: str, file_path: str, configured: tuple[str, ...] = ()) -> ModuleRef:
+    """`import a.b` written in `file_path`: `a/b` under each import root
+    (`import_roots`)."""
     rel = dotted.replace(".", "/")
-    return ModuleRef(tuple(f"{root}{rel}" for root in ancestor_roots(file_path)))
+    return ModuleRef(tuple(f"{root}{rel}" for root in import_roots(file_path, configured)))
 
 
 def relative_module(module_text: str, current_dir: str) -> ModuleRef:
@@ -107,16 +126,17 @@ class Bindings:
     symbols: dict[str, Symbol] = field(default_factory=dict)
     stars: list[ModuleRef] = field(default_factory=list)
     targets: set[str] = field(default_factory=set)
+    roots: tuple[str, ...] = ()  # the configured import roots (`import_roots`)
 
     def add_import(self, dotted: str, alias: str | None, file_path: str) -> None:
         """`import a.b [as x]`: binds the receiver `a.b` (or `x`). Without an
         alias it also binds the top package `a`, as Python does; only `a.b`
         is an import target."""
-        ref = absolute_module(dotted, file_path)
+        ref = absolute_module(dotted, file_path, self.roots)
         self.modules[alias or dotted] = ref
         if alias is None and "." in dotted:
             top = dotted.split(".", 1)[0]
-            self.modules.setdefault(top, absolute_module(top, file_path))
+            self.modules.setdefault(top, absolute_module(top, file_path, self.roots))
         self.targets.update(ref.files())
 
     def add_from(self, module: ModuleRef, names: list[tuple[str, str | None]], star: bool) -> None:

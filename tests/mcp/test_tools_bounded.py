@@ -179,6 +179,55 @@ def test_impact_on_a_hub_is_fast_and_counts_distinct_dependents(engine, hub):
     assert not any(n.startswith("l5_") for n in transitive)  # five hops away
 
 
+#: A name defined in this many files, each called by every node of the layer above.
+MANY_TARGETS = 300
+
+
+@pytest.fixture
+def many_targets(engine):
+    """`MANY_TARGETS` functions named `get`, each in its own file, all called by
+    `WIDTH` callers, which `WIDTH` more call in turn: about 60k CALLS edges."""
+    repo_id = f"zz-impact-many-{uuid.uuid4().hex[:8]}"
+    engine.run_cypher(
+        "UNWIND range(1, $n) AS i CREATE (:Function {repo_id: $r, name: 'get', file: 'get' + i + '.py'})",
+        {"r": repo_id, "n": MANY_TARGETS},
+    )
+    engine.run_cypher(
+        "UNWIND range(1, $w) AS i CREATE (:Function {repo_id: $r, name: 'c' + i, file: 'c.py'})"
+        "-[:CALLS]->(:Function {repo_id: $r, name: 'top' + i, file: 'top.py'})",
+        {"r": repo_id, "w": WIDTH},
+    )
+    engine.run_cypher(
+        "MATCH (c:Function {repo_id: $r, file: 'c.py'}), (g:Function {repo_id: $r, name: 'get'}) CREATE (c)-[:CALLS]->(g)",
+        {"r": repo_id},
+    )
+    engine.run_cypher(
+        "MATCH (t:Function {repo_id: $r, file: 'top.py'}), (c:Function {repo_id: $r, file: 'c.py'}) "
+        "WHERE substring(t.name, 3) = substring(c.name, 1) CREATE (c)<-[:CALLS]-(t)",
+        {"r": repo_id},
+    )
+    yield repo_id
+    engine.delete_repository(repo_id)
+
+
+def test_impact_on_a_name_many_files_define_is_one_expansion(engine, many_targets):
+    import time
+
+    started = time.monotonic()
+    result = impact_analysis(engine, many_targets, "get")
+    elapsed = time.monotonic() - started
+    assert elapsed < 3.0, f"impact_analysis took {elapsed:.2f}s on {MANY_TARGETS} same-named targets"
+    assert result["direct_dependents"]["count"] == WIDTH
+    assert result["ambiguous_targets"]["count"] == MANY_TARGETS and result["ambiguous_targets"]["truncated"] is True
+    assert "defined in 300 files" in result["notices"][0] and "Pass file" in result["notices"][0]
+    assert "target_files" not in result["direct_dependents"]["results"][0]
+
+
+def test_find_callers_caps_each_rows_target_files(engine, many_targets):
+    row = tools.find_callers(engine, many_targets, "get")["results"][0]
+    assert len(row["target_files"]) == 10 and row["target_file_count"] == MANY_TARGETS
+
+
 def test_impact_for_diff_on_a_hub_is_fast(engine, hub, tmp_path):
     import subprocess
     import time

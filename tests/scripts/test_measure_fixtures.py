@@ -22,10 +22,7 @@ _spec.loader.exec_module(measure)
 #: Languages whose resolution has not landed yet.
 PENDING: set[str] = set()
 #: Languages whose resolution has landed short of the targets, and why.
-SHORT = {
-    "csharp": "a caller's text cannot tell two User.cs apart nor find a class in a file named otherwise "
-    "(see the spec's C# section)",
-}
+SHORT: dict[str, str] = {}
 #: Named sites no resolver that reads only its own file can reach (see the
 #: spec's slice B results): `repo.size()` on an `AuditedRepo` field is the
 #: `size` AuditedRepo inherits from Repo, which only AuditedRepo.java says.
@@ -76,3 +73,18 @@ def test_fixture_meets_the_targets(engine, lang):
     ):
         failures = [f for f in failures if f != cross]
     assert failures == [], result
+
+
+def test_the_synthetic_csharp_repository_is_seeded(tmp_path):
+    """`--cs-synthetic`'s repository and truth depend on its seed alone, and
+    every truth call names files it wrote."""
+    first = measure.generate_cs_synthetic(tmp_path / "a", 4, 3, seed=7)
+    again = measure.generate_cs_synthetic(tmp_path / "b", 4, 3, seed=7)
+    assert first == again
+    files = {p.relative_to(tmp_path / "a").as_posix(): p.read_text() for p in (tmp_path / "a").rglob("*") if p.is_file()}
+    assert files == {p.relative_to(tmp_path / "b").as_posix(): p.read_text()
+                     for p in (tmp_path / "b").rglob("*") if p.is_file()}
+    calls, imports = first
+    assert {f for _a, af, _b, bf in calls for f in (af, bf)} | {f for pair in imports for f in pair} <= set(files)
+    # Every service reaches another project's Gateway.
+    assert any(af.split("/")[1] != bf.split("/")[1] for _a, af, b, bf in calls if b == "Send")

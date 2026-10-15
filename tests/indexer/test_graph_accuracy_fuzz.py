@@ -10,15 +10,39 @@ fixed seeds of 15 steps. `DEVGRAPH_ACCURACY_FUZZ_SEEDS` (a comma list) and
 Python files import and call in every style the call resolution reads
 (docs/superpowers/specs/2026-10-10-python-call-resolution-design.md): plain,
 aliased, relative and star imports, a package re-exporting from its module,
-a src/ layout, calls through modules, aliases and untyped values, and
-`self.shared()` reaching a base in the same or another file.
+a src/ layout (beside a setup.cfg) reached from tests/ outside it, its
+modules moving between src/, the repository root and a root a
+pyproject.toml declares (which comes and goes), and its whole folder
+deleted or moved, reported as the folder alone, as the watcher does, calls through modules, aliases and untyped values, and
+`self.shared()` reaching a base in the same or another file. A class `Twin`
+comes and goes beside another class of a file, repeating its method names
+(both nest a `Meta` with its own base), and so do a top-level `act` and one
+nested in a function, so same-named symbols of one file are told apart by
+their owner; another file calls `b.Twin().act()` and `b.Base().act()`, one
+owner's member across files. go/b gains a type whose methods are named like
+the package's functions, which other files call by package.
 
 TS files import through a tsconfig path alias, and the resolver configuration
 changes under them: the tsconfig is rewritten (its own `paths`, `extends` to
 an odd-named base, `references`), its base is edited or its folder deleted, a
 root or nested go.mod comes and goes, and a config under an ignored folder is
 edited. After every batch the fuzz runs what a live batch does,
-`sync_resolver_config`. Kotlin files hold adjacent one-line classes, which
+`sync_resolver_config`. C# projects change the same way: a .csproj or
+Directory.Build file is written, created or deleted, and a C# file gains or
+loses a `global using` (written behind a comment, `#if`, a byte order mark,
+CRLF or `extern alias`), or moves to another project's folder or out of
+every project (scripts/); a C# Module records its project's usings
+(`_with_cs_projects`), so a change that did not re-index every C# file
+would leave one stale. A C# file's namespace changes, two files swap their
+classes, and a class takes the name of another file's class in another
+namespace, so C# match keys change under the edges `@` pins gave them;
+cs/Shadow.cs comes, goes, changes namespace and renames its class, a
+`Jobs` or `Base` nearer some callers than the one they reach otherwise,
+so the shadow tiers of their pins hide and restore edges into files
+outside the batch. A project file gains or loses a `<ProjectReference>`
+(cs/ and cs/Models to cs2/, cs2/ to cs/Models), and a file whose class
+another folder's declares too (cs2/'s own Shop.Jobs) moves between
+projects, so a site sees a project's types and stops seeing them. Kotlin files hold adjacent one-line classes, which
 the extractor recovers from tree-sitter-kotlin's error nodes, and import a
 function or package of another one. Go, Java, Kotlin, Rust, C# and C++ calls
 come in every style their resolvers read (bare, through a package, module,
@@ -26,7 +50,10 @@ crate, namespace or class, on `this`/`base`, on a typed or an untyped value);
 a function moves between files of its Go or Kotlin package (and a C# method
 to another file's class), a Java class moves to the same package under
 another source root (another module), and a Rust crate's Cargo.toml renames
-it, moves its root file or stops declaring it. An image
+it, moves its root file or stops declaring it, and its lib.rs and util.rs
+gain and lose `pub use` re-exports (by name, glob or alias, util.rs's
+re-exporting deep.rs's, so lib.rs's reach it through util.rs) that other
+files call through `shop_core::`. An image
 moves between the Dockerfile and a compose service in one step, so its
 shared Container changes claimant.
 
@@ -38,10 +65,13 @@ kind is written, relinked and removed as files come and go.
 
 The spec's "Out of scope" gaps are left out by construction:
 - compose services have `image:` only, never `build:`;
-- no datastore or route code (so no handler stub either);
+- no datastore code, and routes only in Express (TS) and Spring (Java) files,
+  which add, drop and change routes and move a handler (`op_route`,
+  `op_route_change`, `op_route_move`), each Endpoint and handler stub
+  claimed by every file routing it;
 - no method moves out of its type's file: only free functions move, and the
   Go method and Rust inherent `impl` stay with their type;
-- no C#/TS partial classes;
+- no TS partial classes (C#'s Jobs is partial over two files);
 - the default `mentions_ambiguous_mode` (`all`);
 - a docs note's `id` never changes in place;
 - a renamed docs note's old path is removed before its new path is indexed,
@@ -120,21 +150,28 @@ class File:
     supersedes: str | None = None
     pins: list = field(default_factory=list)  # py: "calls <name> <pin>" / "imports <pin>"
     methods: list = field(default_factory=list)  # cpp: out-of-class definitions, "Widget::draw"
+    block: bool = False  # cs: a block namespace, its `using`s inside it
+    routes: list = field(default_factory=list)  # ts/java: (method, path, handler) routes
 
     def copy(self):
         return replace(
             self, imports=list(self.imports), bases=dict(self.bases),
             funcs={k: list(v) for k, v in self.funcs.items()}, services=dict(self.services),
             froms=list(self.froms), mentions=list(self.mentions), links=list(self.links), pins=list(self.pins),
-            methods=list(self.methods),
+            methods=list(self.methods), routes=list(self.routes),
         )
 
 
 def py_class(name: str, base: str | None) -> str:
-    """A class whose `act` calls `self.shared()`, which only `Base` defines."""
+    """A class whose `act` calls `self.shared()`, which only `Base` and
+    `Twin` define: a `Twin` beside another class in one file repeats its
+    method names (two `act`s, maybe two `shared`s, each its own node)."""
     head = f"\n\nclass {name}({base}):\n" if base else f"\n\nclass {name}:\n"
-    shared = "\n    def shared(self):\n        return 0\n" if name == "Base" else ""
-    return head + "    def act(self):\n        return self.shared()\n" + shared
+    shared = "\n    def shared(self):\n        return 0\n" if name in ("Base", "Twin") else ""
+    # Both also nest a `Meta` (two same-named classes of one file, each
+    # with its own EXTENDS and `act`).
+    meta = "\n    class Meta(Child):\n        def act(self):\n            return 1\n" if shared else ""
+    return head + "    def act(self):\n        return self.shared()\n" + shared + meta
 
 
 def render(f: File) -> str:
@@ -147,6 +184,7 @@ def render(f: File) -> str:
             f"\n\ndef {name}():\n" + "".join(f"    {g}\n" for g in calls) + "    return 0\n"
             for name, calls in f.funcs.items()
         ]
+        parts.append(f.extra)
         return "".join(parts) or "X = 1\n"
     if f.kind == "rs":
         parts = [f"{m}\n" for m in f.imports]
@@ -159,15 +197,24 @@ def render(f: File) -> str:
         ]
         return "".join(parts)
     if f.kind == "cs":
-        # One class per file, its methods calling in every style.
+        # One class per file (Jobs partial), with a field and a parameter
+        # its methods call through as well as every other style, then any
+        # fixed code (`extra`), in a file-scoped, block or no namespace.
         ((cls, base),) = f.bases.items()
-        parts = [f"{m}\n" for m in f.imports] + [f"namespace {f.head};\n\npublic class {cls}"]
-        parts.append((f" : {base}" if base else "") + "\n{\n")
-        parts += [
-            f"    public void {name}()\n    {{\n" + "".join(f"        {g}();\n" for g in calls) + "    }\n"
+        inner = [m for m in f.imports if f.block and f.head and m.startswith("using ")]
+        head = "".join(f"{m}\n" for m in f.imports if m not in inner)
+        body = f"public {'partial ' if cls == 'Jobs' else ''}class {cls}" + (f" : {base}" if base else "") + "\n{\n"
+        body += "    private Jobs _jobs;\n"
+        body += "".join(
+            f"    public void {name}(Base p)\n    {{\n" + "".join(f"        {g}();\n" for g in calls) + "    }\n"
             for name, calls in f.funcs.items()
-        ]
-        return "".join(parts) + "}\n"
+        )
+        body += "}\n" + f.extra
+        if not f.head:
+            return head + body
+        if f.block:
+            return head + f"namespace {f.head}\n{{\n" + "".join(f"{m}\n" for m in inner) + body + "}\n"
+        return head + f"namespace {f.head};\n\n" + body
     if f.kind == "cpp":
         # Classes, out-of-class method definitions (a Class stub for their
         # qualifier), and free functions with a typed local, so a typed
@@ -191,11 +238,17 @@ def render(f: File) -> str:
         ]
         return "".join(parts)
     if f.kind == "java":
+        # A file with routes is a Spring controller under /api, each route
+        # a mapping on its handler method (one the class no longer has maps nothing).
         ((cls, base),) = f.bases.items()
         parts = [f"package {f.head};\n\n"] + [f"import {m};\n" for m in f.imports]
+        if f.routes:
+            parts.append('\n@RestController\n@RequestMapping("/api")')
         parts.append(f"\npublic class {cls}" + (f" extends {base}" if base else "") + " {\n")
+        mapped = {handler: (method, path) for method, path, handler in f.routes}
         parts += [
-            f"    void {name}() {{\n" + "".join(f"        {g}();\n" for g in calls) + "    }\n"
+            (f'    @{SPRING_MAPPINGS[mapped[name][0]]}("{mapped[name][1]}")\n' if name in mapped else "")
+            + f"    void {name}() {{\n" + "".join(f"        {g}();\n" for g in calls) + "    }\n"
             for name, calls in f.funcs.items()
         ]
         return "".join(parts) + "}\n"
@@ -214,6 +267,15 @@ def render(f: File) -> str:
             f"\nexport function {name}() {{\n" + "".join(f"  {g}();\n" for g in calls) + "}\n"
             for name, calls in f.funcs.items()
         ]
+        if f.routes:
+            # An Express app's routes, a router's it mounts and an unmounted
+            # router's: a handler of the file, an imported one, a namespace's
+            # member, a name nothing defines, or inline.
+            parts.append("\nconst app = express();\nconst router = Router();\napp.use('/r', router);\n")
+            parts += [
+                f"{TS_ROUTERS.get(path, 'app')}.{method}('{path}', {handler});\n"
+                for method, path, handler in f.routes
+            ]
         return "".join(parts) or "export {};\n"
     if f.kind == "compose":
         return "services:\n" + "".join(f"  {s}:\n    image: {i}\n" for s, i in f.services.items()) if f.services \
@@ -254,17 +316,58 @@ TS_CONFIGS = {
     "go.mod": [None, "module example.com/top\n", "module example.com/other\n"],
     "go/b/go.mod": [None, "module example.com/bee\n"],
     "go.work": [None, "go 1.22\n\nuse ./go\n\nreplace example.com/ext => ./go/b\n"],
+    # pyproject.toml makes code/ a source root, or nothing.
+    "pyproject.toml": [None, '[tool.setuptools]\npackage-dir = {"" = "code"}\n', '[project]\nname = "fz"\n'],
     # crates/core is the crate shop_core, renamed, given another root file, or not a package at all.
     "crates/core/Cargo.toml": [
         '[package]\nname = "shop-core"\n', '[package]\nname = "store-core"\nversion = "0.2.0"\n',
         '[package]\nname = "shop-core"\n\n[lib]\npath = "src/main.rs"\n', "[workspace]\n", None,
     ],
 }
+# The C# projects' versions: cs/ is a project (of one or two .csproj
+# files), cs/Models a nested one when its .csproj exists, and the nearest
+# Directory.Build.props/.targets wrap their `<Using>` items (cs/Models' own
+# props shadowing the root one). scripts/ is under no project.
+CS_PROJECT = '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n{}  </ItemGroup>\n</Project>\n'
+CS_CONFIGS = {
+    "cs/Shop.csproj": [
+        CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop.Models" />\n'),
+        CS_PROJECT.format('    <Using Include="Shop.Jobs" Static="true" />\n    <Using Include="Shop.Jobs" Alias="J" />\n'),
+        CS_PROJECT.format('    <Using Remove="Shop" />\n    <Using Include="Shop.App" />\n'), None,
+    ],
+    "cs/Shop.Tests.csproj": [None, CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop.Tests" />\n')],
+    "cs/Models/Models.csproj": [None, CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop" />\n')],
+    "Directory.Build.props": [None, CS_PROJECT.format('    <Using Include="Shop" />\n')],
+    "cs/Models/Directory.Build.props": [None, CS_PROJECT.format('    <Using Include="Shop.Text" />\n')],
+    "cs/Directory.Build.targets": [None, CS_PROJECT.format('    <Using Remove="Shop.Models" />\n')],
+}
+# A C# file's `global using`s, with what may come before one in a file's
+# head (a byte order mark only counts first; elsewhere it ends the head, as
+# a comment inside a directive does).
+CS_GLOBAL_USINGS = [
+    "global using Shop.Models;", "// Shared.\nglobal using static Shop.Jobs;", "#if NET8_0\nglobal using J = Shop.Jobs;\n#endif",
+    "\ufeffglobal using Shop.Text;", "// CRLF\r\nglobal using Shop.Data;\r", "extern alias Legacy;\nglobal using Shop.Legacy;",
+    "global using unsafe P = int*;", "global using Shop // cut\n.Cut;",
+]
+# The `<ProjectReference>` each C# project file may gain or lose: cs/ and
+# cs/Models to cs2/ (another project declaring Shop.Jobs), cs2/ back to
+# cs/Models (a cycle through cs/Models' reference).
+CS_REFERENCES = {
+    "cs/Shop.csproj": '    <ProjectReference Include="..\\cs2\\Lib.csproj" />\n',
+    "cs/Models/Models.csproj": '    <ProjectReference Include="../../cs2/Lib.csproj" />\n',
+    "cs2/Lib.csproj": '    <ProjectReference Include="..\\cs\\Models\\Models.csproj" />\n',
+}
+# The folders a C# file moves between: three projects and no project.
+CS_DIRS = ["cs/", "cs/Models/", "cs2/", "scripts/"]
 # Folders holding a configuration file, which the fuzz may delete whole.
-CONFIG_DIRS = ["ts/configs", "go/b", "crates/core"]
+CONFIG_DIRS = ["ts/configs", "go/b", "crates/core", "cs/Models"]
 
 RS_FOO = "pub struct Foo;\n\nimpl Foo {\n    pub fn new() -> Foo {\n        Foo\n    }\n}\n"
 GO_SERVER = "type Server struct{}\n\nfunc (s *Server) Run() {\n\tServe()\n}\n"
+# Methods named like go/b's functions Serve and Stop.
+GO_TWIN = "\ntype Twin struct{}\n\nfunc (t Twin) Serve() {}\n\nfunc (t *Twin) Stop() {\n\tt.Serve()\n}\n"
+# A function nested in another, named like the classes' methods.
+PY_NESTED = "\n\ndef outer():\n    def act():\n        return shared()\n    return act()\n"
 
 
 def initial_repo() -> dict:
@@ -281,31 +384,53 @@ def initial_repo() -> dict:
         "pkg/other.py": File("py", funcs={"spare": []}),
         "src/lib/core.py": File("py", imports=["from lib import util"], funcs={"core": ["util.render()"]}),
         "src/lib/util.py": File("py", funcs={"render": []}),
+        "setup.cfg": File("static", head="[metadata]\nname = fz\n"),
+        "tests/test_lib.py": File("py", imports=["from lib.core import core", "import lib.util"],
+                                  funcs={"test_core": ["core()", "lib.util.render()"]}),
         "rs/foo.rs": File("rs", extra=RS_FOO, funcs={"parse": ["render"]}),
         "rs/display.rs": File("rs", extra="pub trait Display {}\n", funcs={"render": []}),
         "rs/conv.rs": File("rs", imports=["use crate::display::Display;"], impl=True,
-                           funcs={"convert": ["parse", "shop_core::run"]}),
+                           funcs={"convert": ["parse", "shop_core::run", "shop_core::neat", "shop_core::dig"]}),
         "crates/core/Cargo.toml": File("static", head=TS_CONFIGS["crates/core/Cargo.toml"][0]),
-        "crates/core/src/lib.rs": File("rs", imports=["pub mod util;"], funcs={"run": ["util::tidy"]}),
+        "crates/core/src/lib.rs": File("rs", imports=["pub mod util;", "pub mod deep;"],
+                                       funcs={"run": ["util::tidy"]}),
         "crates/core/src/util.rs": File("rs", funcs={"tidy": []}),
+        "crates/core/src/deep.rs": File("rs", funcs={"dig": []}),
+        "cs/Shop.csproj": File("static", head=CS_CONFIGS["cs/Shop.csproj"][0]),
         "cs/Jobs.cs": File("cs", head="Shop", bases={"Jobs": None}, funcs={"Run": [], "Stop": []}),
         "cs/Program.cs": File("cs", head="Shop.App", imports=["using Shop;"], bases={"Program": "Jobs"},
                               funcs={"Main": ["Jobs.Run", "Stop", "new Jobs().Stop"]}),
-        "cs/Models/Base.cs": File("cs", head="Shop.Models", bases={"Base": None}, funcs={"Helper": []}),
+        "cs/Models/Base.cs": File("cs", head="Shop.Models", bases={"Base": None}, funcs={"Helper": []},
+                                  extra=CS_NESTED),
+        # Jobs's other part, its extension methods, a block namespace with a
+        # relative `using Models;` (Shop.App.Models or Shop.Models), the
+        # global namespace, and more namespaces in scope than a pin's keys.
+        "cs/Jobs.Part.cs": File("cs", head="Shop", bases={"Jobs": None}, funcs={"Halt": ["Run", "Tidy"]}),
+        "cs/JobsExtensions.cs": File("cs", head="Shop", bases={"Ext": None}, funcs={"Use": ["_jobs.Tidy"]},
+                                     extra=CS_EXTENSIONS),
+        "cs/Block.cs": File("cs", head="Shop.App", block=True, imports=["using Models;", "using Shop;"],
+                            bases={"Block": None}, funcs={"Go": ["p.Helper", "_jobs.Tidy", "Outer.Inner.Run"]}),
+        "cs/Global.cs": File("cs", head="", bases={"Root": None}, funcs={"Run": ["Jobs.Run", "_jobs.Stop"]}),
+        "cs/Wide.cs": File("cs", head="Shop.Wide", imports=[f"using N{i};" for i in range(40)] + ["using Shop;"],
+                           bases={"Wide": None}, funcs={"Spread": ["Jobs.Run", "_jobs.Stop", "p.Helper"]}),
+        "scripts/Tool.cs": File("cs", head="Tools", imports=["global using Shop.Models;"], bases={"Tool": None}),
+        # Another project's Shop.Jobs, which cs/ sees only through a reference.
+        "cs2/Lib.csproj": File("static", head=CS_PROJECT.format("")),
+        "cs2/Jobs.cs": File("cs", head="Shop", bases={"Jobs": None}, funcs={"Run": [], "Stop": ["Run"]}),
         "cpp/util/strings.h": File("cpp", funcs={"trim": []}),
         "cpp/util/strings.cpp": File("cpp", imports=['#include "strings.h"'], methods=["Widget::draw"],
                                      funcs={"upper": ["trim"]}),
         "cpp/widget.h": File("cpp", bases={"Widget": None, "Gadget": "Widget"}),
         "cpp/main.cpp": File("cpp", imports=['#include "util/strings.h"'], funcs={"main": ["util::upper", "trim"]}),
         "java/app/K.java": File("java", head="app", imports=["base.Base"], bases={"K": "Base"},
-                                funcs={"run": ["helper", "assist"]}),
+                                funcs={"run": ["helper", "assist"]}, routes=[("get", "/items", "run")]),
         "java/base/Base.java": File("java", head="base", bases={"Base": None}, funcs={"assist": []}),
         "go/go.mod": File("static", head="module example.com/fz\n\ngo 1.22\n"),
         "go.mod": File("static", head="module example.com/top\n"),
         "ts/tsconfig.json": File("static", head=TS_CONFIGS["ts/tsconfig.json"][0]),
         "ts/configs/base.cfg": File("static", head=TS_CONFIGS["ts/configs/base.cfg"][0]),
         "ts/app.ts": File("ts", imports=["import { f } from '@/lib';", "import * as u from '@/util';"],
-                          funcs={"main": ["f", "u.g"]}),
+                          funcs={"main": ["f", "u.g"]}, routes=[("get", "/items", "main"), ("post", "/api/items", "f")]),
         "ts/src/lib.ts": File("ts", funcs={"f": []}),
         "ts/src/util.ts": File("ts", imports=["import { f } from './lib';"], funcs={"g": ["f"]}),
         "ts/other/lib.ts": File("ts", funcs={"f": [], "g": []}),
@@ -333,7 +458,7 @@ IMPORTS = {
     ],
     "rs": ["use crate::display::Display;", "use crate::foo::Foo;", "use shop_core::util;", "mod display;",
            "use crate::util::tidy;", "use super::display::render;"],
-    "cs": ["using Shop;", "using Shop.Models;", "using static Shop.Jobs;", "using J = Shop.Jobs;"],
+    "cs": ["using Shop;", "using Shop.Models;", "using static Shop.Jobs;", "using J = Shop.Jobs;", "using Models;"],
     "cpp": ['#include "util/strings.h"', '#include "strings.h"', '#include "widget.h"',
             '#include "../cpp/util/strings.h"', "#include <vector>"],
     "go": ["example.com/fz/a", "example.com/fz/b", "example.com/top/go/b", "example.com/bee", "example.com/ext"],
@@ -348,7 +473,8 @@ BASES = {
 }
 # How a Python call to `{n}` is written: bare, through a module or alias, on
 # an untyped value, on `self`, or on a literal.
-PY_CALLS = ["{n}()", "b.{n}()", "c.{n}()", "obj.{n}()", "pkg.impl.{n}()", "alias.{n}()", "self.{n}()", "''.{n}()"]
+PY_CALLS = ["{n}()", "b.{n}()", "c.{n}()", "obj.{n}()", "pkg.impl.{n}()", "alias.{n}()", "self.{n}()", "''.{n}()",
+            "b.Twin().{n}()", "b.Base().{n}()"]
 # Path pins of every kind over the fuzz's own paths (renames add `_rN` to a stem).
 CALL_PINS = ["py/.", ".", "pkg/.!other.py", "/b.py", "/lib/util.py", "/py/.", "/lib/.", "src/", "pkg/", "py/b.py"]
 IMPORT_PINS = ["py/.", "pkg/.", ".", "src/lib/.!core.py", "/b.py", "/util.py", "/impl.py"]
@@ -365,23 +491,47 @@ KT_CALLS = ["{n}", "Clock().{n}", "x.{n}"]
 RS_CALLS = ["{n}", "display::{n}", "crate::foo::{n}", "shop_core::{n}", "shop_core::util::{n}", "Foo::{n}",
             "x.{n}"]
 # How a C# call to `{n}` is written: bare, on `this`/`base`, static, through
-# an alias, on a new or an untyped object.
-CS_CALLS = ["{n}", "this.{n}", "base.{n}", "Jobs.{n}", "J.{n}", "new Jobs().{n}", "obj.{n}"]
+# an alias, a qualified name or a nested type, on a new object, a typed field
+# or parameter, or an untyped object.
+CS_CALLS = ["{n}", "this.{n}", "base.{n}", "Jobs.{n}", "J.{n}", "Shop.Models.Base.{n}", "Outer.Inner.{n}",
+            "new Jobs().{n}", "_jobs.{n}", "p.{n}", "obj.{n}"]
+# The namespaces a C# file's class moves between ("" the global one).
+CS_NAMESPACES = ["Shop", "Shop.App", "Shop.Models", "Tools", "Legacy", ""]
+# A C# extension class of Jobs, and a nested type, as fixed code after a file's class.
+CS_EXTENSIONS = "\npublic static class JobsExtensions\n{\n    public static void Tidy(this Jobs jobs) { }\n}\n"
+CS_NESTED = "\npublic class Outer\n{\n    public class Inner\n    {\n        public static void Run() { }\n    }\n}\n"
 # How a C++ call to `{n}` is written: bare, namespace-qualified, on a typed or an untyped value.
 CPP_CALLS = ["{n}", "util::{n}", "w.{n}", "obj->{n}"]
 # C++ out-of-class method definitions: of a header's class, of a class
 # declared nowhere, and through a namespace.
 CPP_METHODS = ["Widget::draw", "Widget::size", "Gadget::run", "Missing::stop", "ui::Widget::paint"]
+# The `pub use` re-exports lib.rs and util.rs of crates/core toggle.
+RS_REEXPORTS = {
+    "crates/core/src/lib.rs": ["pub use util::tidy;", "pub use util::*;", "pub use util::tidy as neat;",
+                               "pub use util::dig;", "pub use deep::dig as neat;"],
+    "crates/core/src/util.rs": ["pub use crate::deep::dig;", "pub use crate::deep::*;", "pub use super::deep::dig;"],
+}
+# The roots the Python package `lib` moves between.
+PY_ROOTS = ["src/", "", "code/"]
 # The source roots a Java file moves between (another Maven module).
 JAVA_ROOTS = ["java/", "lib/src/main/java/"]
 SERVICES = ["api", "web", "worker", "db"]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
-EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing"]
+EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing", "act", "shared"]
 CODE = ("py", "rs", "go", "java", "ts", "kt", "cs", "cpp")
 # Free functions, and C# methods (one class per file, so a method moves to another class);
 # a Java method stays in its class.
 MOVABLE = ("py", "rs", "go", "ts", "kt", "cs", "cpp")
 KT_CLASSES = ["Clock", "Stopwatch", "Tag", "Index"]
+# Routes: Express paths (some meeting a Spring controller's under /api) and
+# handlers beyond the file's own functions, and Spring's mappings.
+ROUTE_METHODS = ["get", "post", "put"]
+TS_ROUTE_PATHS = ["/items", "/items/:id", "/api/items", "/api/orders", "/health", "/loose"]
+# `/items/:id` goes on the router the file mounts, `/loose` on one another file mounts.
+TS_ROUTERS = {"/items/:id": "router", "/loose": "looseRouter"}
+JAVA_ROUTE_PATHS = ["/items", "/orders", "/items/{id}"]
+TS_HANDLERS = ["f", "g", "u.g", "missing", "(req, res) => res.end()"]
+SPRING_MAPPINGS = {"get": "GetMapping", "post": "PostMapping", "put": "PutMapping"}
 
 
 class Fuzz:
@@ -392,8 +542,10 @@ class Fuzz:
         self.counter = 0
         # (old, new) paths of the docs notes renamed in the current step.
         self.moved_notes: list[tuple[str, str]] = []
-        # Folders deleted whole in the current step.
+        # Folders deleted whole in the current step, and those of them a
+        # batch is given as the folder alone (not its files).
         self.removed_dirs: list[str] = []
+        self.dir_only: list[str] = []
 
     def _fresh(self, prefix: str) -> str:
         self.counter += 1
@@ -404,7 +556,7 @@ class Fuzz:
         return self.rng.choice(paths) if paths else None
 
     def _func_names(self) -> list:
-        return sorted({n for f in self.files.values() for n in f.funcs} | {"Run", "new", "missing_fn"})
+        return sorted({n for f in self.files.values() for n in f.funcs} | {"Run", "new", "missing_fn", "Tidy", "act", "shared"})
 
     @staticmethod
     def _styled(kind: str, names: list) -> list:
@@ -443,6 +595,53 @@ class Fuzz:
             return f"remove base of {cls} in {path}", {path}
         f.bases[cls] = self.rng.choice([b for b in BASES[f.kind] if b != cls])
         return f"set base {cls}({f.bases[cls]}) in {path}", {path}
+
+    def op_twin(self):
+        """A Python file with a class gains or loses a second class, `Twin`,
+        whose methods share the first one's names."""
+        path = self._pick(lambda f: f.kind == "py" and f.bases)
+        if not path:
+            return None
+        f = self.files[path]
+        if "Twin" in f.bases:
+            del f.bases["Twin"]
+            return f"remove class Twin from {path}", {path}
+        beside = sorted(f.bases)[0]
+        f.bases["Twin"] = None
+        return f"add class Twin beside {beside} in {path}", {path}
+
+    def op_shadow(self):
+        """A Python file with a class gains or loses a top-level `act`, the
+        name its classes' methods have."""
+        path = self._pick(lambda f: f.kind == "py" and f.bases)
+        if not path:
+            return None
+        f = self.files[path]
+        if "act" in f.funcs:
+            del f.funcs["act"]
+            return f"remove top-level act from {path}", {path}
+        f.funcs["act"] = ["shared()"]
+        return f"add top-level act in {path}", {path}
+
+    def op_nested(self):
+        """A Python file gains or loses `outer`, with an `act` nested in it
+        (owned by `outer`) calling `shared`."""
+        path = self._pick(lambda f: f.kind == "py")
+        if not path:
+            return None
+        f = self.files[path]
+        f.extra = "" if f.extra else PY_NESTED
+        return f"{'add' if f.extra else 'remove'} nested act in {path}", {path}
+
+    def op_go_twin(self):
+        """go/b/b.go gains or loses a type `Twin` whose methods are named
+        like the package's functions `Serve` and `Stop`."""
+        path = "go/b/b.go"
+        if path not in self.files:
+            return None
+        f = self.files[path]
+        f.extra = GO_SERVER if f.extra != GO_SERVER else GO_SERVER + GO_TWIN
+        return f"{'add' if f.extra != GO_SERVER else 'remove'} type Twin in {path}", {path}
 
     def op_import(self):
         path = self._pick(lambda f: f.kind in IMPORTS)
@@ -551,6 +750,40 @@ class Fuzz:
         self.files[target].funcs[name] = self.files[source].funcs.pop(name)
         return f"move function {name} from {source} to {target}", {source, target}
 
+    def op_src_move(self):
+        """Move a module of the package `lib` between src/, the repository
+        root and code/ (a source root while pyproject.toml declares it)."""
+        moving = sorted((p, root) for p in self.files for root in PY_ROOTS if p.startswith(f"{root}lib/"))
+        if not moving:
+            return None
+        path, old = self.rng.choice(moving)
+        new = self.rng.choice([root for root in PY_ROOTS if root != old]) + path[len(old):]
+        if new in self.files:
+            return None
+        self.files[new] = self.files.pop(path)
+        return f"move {path} to {new}", {path, new}
+
+    def op_src_dir(self):
+        """Delete the package `lib`'s folder under one of its roots, or move
+        it to another root: the watcher reports the old folder alone."""
+        roots = sorted({root for p in self.files for root in PY_ROOTS if p.startswith(f"{root}lib/")})
+        if not roots:
+            return None
+        old = self.rng.choice(roots)
+        folder = f"{old}lib"
+        paths = sorted(p for p in self.files if p.startswith(folder + "/"))
+        others = [r for r in PY_ROOTS if r != old and not any(p.startswith(f"{r}lib/") for p in self.files)]
+        self.removed_dirs.append(folder)
+        self.dir_only.append(folder)
+        if others and self.rng.random() < 0.5:
+            new = self.rng.choice(others)
+            for path in paths:
+                self.files[new + path[len(old):]] = self.files.pop(path)
+            return f"move folder {folder} to {new}lib", set(paths) | {new + p[len(old):] for p in paths}
+        for path in paths:
+            self.deleted.append((path, self.files.pop(path)))
+        return f"delete folder {folder}", set(paths)
+
     def op_move_java_module(self):
         """Move a Java class to the same package under another source root."""
         path = self._pick(lambda f: f.kind == "java")
@@ -587,6 +820,17 @@ class Fuzz:
         bases[name] = None
         return f"add one-line class {name} in {path}", {path}
 
+    def op_rs_reexport(self):
+        """Add or remove a `pub use` re-export of lib.rs or util.rs."""
+        path = self.rng.choice(sorted(p for p in RS_REEXPORTS if p in self.files))
+        line = self.rng.choice(RS_REEXPORTS[path])
+        imports = self.files[path].imports
+        if line in imports:
+            imports.remove(line)
+            return f"remove {line!r} in {path}", {path}
+        imports.append(line)
+        return f"add {line!r} in {path}", {path}
+
     def op_config(self):
         """Rewrite, create or delete a resolver configuration file."""
         path = self.rng.choice(sorted(TS_CONFIGS))
@@ -598,6 +842,135 @@ class Fuzz:
         self.files[path] = File("static", head=text)
         return f"write config {path}: {text!r}", {path}
 
+    def op_cs_csproj(self):
+        """Write, create or delete a C# project file or a Directory.Build file."""
+        path = self.rng.choice(sorted(CS_CONFIGS))
+        current = self.files[path].head if path in self.files else None
+        text = self.rng.choice([t for t in CS_CONFIGS[path] if t != current])
+        if text is None:
+            del self.files[path]
+            return f"delete {path}", {path}
+        self.files[path] = File("static", head=text)
+        return f"write {path}: {text!r}", {path}
+
+    def op_cs_global_using(self):
+        """Add or remove a `global using` at the top of a C# file."""
+        path = self._pick(lambda f: f.kind == "cs")
+        if not path:
+            return None
+        imports = self.files[path].imports
+        using = self.rng.choice(CS_GLOBAL_USINGS)
+        if using in imports:
+            imports.remove(using)
+            return f"remove {using!r} in {path}", {path}
+        imports.insert(0, using)
+        return f"add {using!r} in {path}", {path}
+
+    def op_cs_move(self):
+        """Move a C# file to another project's folder, or out of every project."""
+        path = self._pick(lambda f: f.kind == "cs")
+        if not path:
+            return None
+        folder, _sep, name = path.rpartition("/")
+        new = self.rng.choice([d for d in CS_DIRS if d != folder + "/"]) + name
+        if new in self.files:
+            return None
+        self.files[new] = self.files.pop(path)
+        return f"move {path} to {new}", {path, new}
+
+    def op_cs_reference(self):
+        """Add or remove a C# project file's `<ProjectReference>` (one
+        written with `\\`, one with `/`)."""
+        paths = sorted(p for p in CS_REFERENCES if p in self.files)
+        if not paths:
+            return None
+        path = self.rng.choice(paths)
+        f, line = self.files[path], CS_REFERENCES[path]
+        if line in f.head:
+            f.head = f.head.replace(line, "")
+            return f"remove the reference in {path}", {path}
+        f.head = f.head.replace("<ItemGroup>\n", "<ItemGroup>\n" + line, 1)
+        return f"add a reference in {path}", {path}
+
+    def op_cs_project_move(self):
+        """Move a C# file whose class another folder's file declares too (a
+        Jobs) to another project's folder, or out of every project."""
+        names = {}
+        for p, f in self.files.items():
+            if f.kind == "cs":
+                for cls in f.bases:
+                    names.setdefault(cls, set()).add(p.rpartition("/")[0])
+        path = self._pick(lambda f: f.kind == "cs" and any(len(names[cls]) > 1 for cls in f.bases))
+        if not path:
+            return None
+        folder, _sep, name = path.rpartition("/")
+        new = self.rng.choice([d for d in CS_DIRS if d != folder + "/"]) + name
+        if new in self.files:
+            return None
+        self.files[new] = self.files.pop(path)
+        return f"move {path} to {new}", {path, new}
+
+    def op_cs_namespace(self):
+        """Change a C# file's namespace."""
+        path = self._pick(lambda f: f.kind == "cs")
+        if not path:
+            return None
+        f = self.files[path]
+        f.head = self.rng.choice([n for n in CS_NAMESPACES if n != f.head])
+        return f"namespace of {path} to {f.head}", {path}
+
+    def op_cs_move_class(self):
+        """Swap two C# files' classes (name, base and methods), each file
+        keeping its namespace."""
+        paths = sorted(p for p, f in self.files.items() if f.kind == "cs")
+        if len(paths) < 2:
+            return None
+        a, b = self.rng.sample(paths, 2)
+        fa, fb = self.files[a], self.files[b]
+        fa.bases, fb.bases = fb.bases, fa.bases
+        fa.funcs, fb.funcs = fb.funcs, fa.funcs
+        return f"swap the classes of {a} and {b}", {a, b}
+
+    def op_cs_dup_class(self):
+        """Give a C# file's class the name of another file's class, in
+        another namespace."""
+        paths = sorted(p for p, f in self.files.items() if f.kind == "cs")
+        if len(paths) < 2:
+            return None
+        a, b = self.rng.sample(paths, 2)
+        ((name, _base),) = self.files[a].bases.items()
+        fb = self.files[b]
+        ((_old, base),) = fb.bases.items()
+        fb.bases = {name: base}
+        if fb.head == self.files[a].head:
+            fb.head = self.rng.choice([n for n in CS_NAMESPACES if n != fb.head])
+        return f"class of {b} named {name} in namespace {fb.head}", {b}
+
+    def op_cs_shadow(self):
+        """Add, rekey, rename or remove cs/Shadow.cs, whose class is named
+        like a type other C# files reach farther out (`Jobs` in Shop, `Base`
+        through Block.cs's `using Models;`), in a namespace enclosing some
+        of them (Shop.App) or not: a nearer type hides the farther one's
+        edges until it moves away or goes."""
+        path = "cs/Shadow.cs"
+        f = self.files.get(path)
+        if f is None:
+            cls = self.rng.choice(["Jobs", "Base"])
+            head = self.rng.choice(["Shop.App", "Shop.App", "Shop", "Tools", ""])
+            self.files[path] = File("cs", head=head, bases={cls: None},
+                                    funcs={name: [] for name in ("Run", "Stop", "Helper", "Tidy")})
+            return f"add shadowing class {cls} in namespace {head!r} as {path}", {path}
+        pick = self.rng.random()
+        if pick < 0.35:
+            del self.files[path]
+            return f"remove {path}", {path}
+        if pick < 0.7:
+            f.head = self.rng.choice([n for n in ["Shop.App", "Shop", "Tools", ""] if n != f.head])
+            return f"namespace of {path} to {f.head!r}", {path}
+        ((cls, base),) = f.bases.items()
+        f.bases = {"Base" if cls == "Jobs" else "Jobs": base}
+        return f"rename the class of {path} to {next(iter(f.bases))}", {path}
+
     def op_delete_dir(self):
         """Delete a folder holding a configuration file, with everything in it."""
         folder = self.rng.choice(CONFIG_DIRS)
@@ -608,6 +981,68 @@ class Fuzz:
             self.deleted.append((path, self.files.pop(path)))
         self.removed_dirs.append(folder)
         return f"delete folder {folder}", set(paths)
+
+    def _route_handlers(self, path: str) -> list:
+        f = self.files[path]
+        if f.kind == "java":  # a method of the class not mapped yet
+            return sorted(set(f.funcs) - {handler for _m, _p, handler in f.routes})
+        return sorted(f.funcs) + TS_HANDLERS
+
+    def op_route(self):
+        """Add or remove an Express or Spring route."""
+        path = self._pick(lambda f: f.kind in ("ts", "java"))
+        if not path:
+            return None
+        f = self.files[path]
+        if f.routes and self.rng.random() < 0.4:
+            gone = f.routes.pop(self.rng.randrange(len(f.routes)))
+            return f"remove route {gone} in {path}", {path}
+        handlers = self._route_handlers(path)
+        if not handlers:
+            return None
+        paths = JAVA_ROUTE_PATHS if f.kind == "java" else TS_ROUTE_PATHS
+        route = (self.rng.choice(ROUTE_METHODS), self.rng.choice(paths), self.rng.choice(handlers))
+        f.routes.append(route)
+        return f"add route {route} in {path}", {path}
+
+    def op_route_change(self):
+        """Change a route's method or path."""
+        path = self._pick(lambda f: f.routes)
+        if not path:
+            return None
+        routes = self.files[path].routes
+        at = self.rng.randrange(len(routes))
+        method, route_path, handler = routes[at]
+        if self.rng.random() < 0.5:
+            method = self.rng.choice([m for m in ROUTE_METHODS if m != method])
+        else:
+            paths = JAVA_ROUTE_PATHS if self.files[path].kind == "java" else TS_ROUTE_PATHS
+            route_path = self.rng.choice([p for p in paths if p != route_path])
+        routes[at] = (method, route_path, handler)
+        return f"change route {at} to {routes[at]} in {path}", {path}
+
+    def op_route_move(self):
+        """Move a route's handler to another file of its language: a Spring
+        handler method with its mapping to another controller, an Express
+        handler function out of its router's file (the route then names it
+        unresolved) or the route itself to another router."""
+        path = self._pick(lambda f: f.routes)
+        if not path:
+            return None
+        f = self.files[path]
+        route = self.rng.choice(f.routes)
+        handler = route[2]
+        target = self._pick(lambda o: o.kind == f.kind and o is not f and handler not in o.funcs)
+        if not target or (f.kind == "java" and handler not in f.funcs):
+            return None
+        if f.kind == "java" or handler not in f.funcs or self.rng.random() < 0.5:
+            f.routes.remove(route)
+            self.files[target].routes.append(route)
+            if f.kind == "java":
+                self.files[target].funcs[handler] = f.funcs.pop(handler)
+            return f"move route {route} from {path} to {target}", {path, target}
+        self.files[target].funcs[handler] = f.funcs.pop(handler)
+        return f"move handler {handler} from {path} to {target}", {path, target}
 
     def op_delete(self):
         path = self._pick(lambda f: True)
@@ -709,6 +1144,10 @@ class Fuzz:
         "call", "base", "import", "import_style", "impl", "add_function", "remove_function", "move_function",
         "rename", "delete", "restore", "service", "from", "move_image", "mention", "link", "supersedes", "pin", "pin",
         "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module", "method", "method",
+        "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move", "cs_namespace", "cs_move_class",
+        "cs_dup_class", "cs_shadow", "cs_shadow", "cs_reference", "cs_reference", "cs_project_move", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route",
+        "route",
+        "route_change", "route_move", "src_move", "src_move", "src_dir", "src_dir", "rs_reexport", "rs_reexport", "rs_reexport",
     ]
 
     def draw(self):
@@ -733,8 +1172,8 @@ def _with_pin_comments(monkeypatch):
     collapse per callee (calls.call_rows), imports per file (calls.import_rows)."""
     real = dispatch.extract_python_file
 
-    def extract(content, rel_path, repo_id):
-        result = real(content, rel_path, repo_id)
+    def extract(content, rel_path, repo_id, config=None):
+        result = real(content, rel_path, repo_id, config)
         calls: dict[str, set] = {}
         imports: set = set()
         for line in content.splitlines():
@@ -756,6 +1195,26 @@ def _with_pin_comments(monkeypatch):
         return result
 
     monkeypatch.setattr(dispatch, "extract_python_file", extract)
+
+
+@pytest.fixture(autouse=True)
+def _with_cs_projects(monkeypatch):
+    """A C# file's Module records its project's usings and references (`fz_usings`), so its
+    extraction depends on all of the C# configuration, not only the part its
+    resolved edges show: a configuration change that does not re-index
+    every C# file leaves a stale one."""
+    real = dispatch.extract_csharp_file
+
+    def extract(content, rel_path, repo_id, config=None):
+        result = real(content, rel_path, repo_id, config)
+        project = config.cs_project(rel_path)
+        usings = [] if project is None else [
+            project.dir, *project.csproj, *project.references, *project.usings, *project.global_usings,
+        ]
+        result.nodes[0].properties["fz_usings"] = [str(each) for each in usings]
+        return result
+
+    monkeypatch.setattr(dispatch, "extract_csharp_file", extract)
 
 
 def check(engine, repo_id, root, seed, step, log):
@@ -788,6 +1247,7 @@ def test_graph_accuracy_fuzz(engine, repo_id, tmp_path, seed):
     for step in range(STEPS):
         fuzz.moved_notes = []
         fuzz.removed_dirs = []
+        fuzz.dir_only = []
         # The foreign-source edge (set (b)) is toggled on every seed.
         ops = [fuzz.op_impl()] if step == 0 else []
         ops += [fuzz.draw() for _ in range(rng.randint(1, 3))]
@@ -797,6 +1257,10 @@ def test_graph_accuracy_fuzz(engine, repo_id, tmp_path, seed):
         for folder in sorted(folders, reverse=True):
             if (root / folder).is_dir() and not any((root / folder).iterdir()):
                 (root / folder).rmdir()
+        # A folder reported alone stands for its files (`op_src_dir`).
+        hidden = {rel for rel in touched if rel not in fuzz.files and any(
+            rel.startswith(d + "/") for d in fuzz.dir_only if d in folders)}
+        touched -= hidden
         gone = {rel for rel in touched if rel not in fuzz.files}
         changed = touched - gone
         split = rng.random() < 0.5
@@ -820,3 +1284,109 @@ def test_graph_accuracy_fuzz(engine, repo_id, tmp_path, seed):
                             mentions_enabled=True)
             resync(touched | folders)
         check(engine, repo_id, root, seed, step, log)
+
+
+class _Scripted:
+    """An rng whose choices are given in advance: each `choice` or `sample`
+    returns the next of `picks`, which must be one the call could make."""
+
+    def __init__(self, picks):
+        self.picks = list(picks)
+
+    def choice(self, options):
+        pick = self.picks.pop(0)
+        assert pick in options, (pick, options)
+        return pick
+
+    def sample(self, options, k):
+        pick = self.picks.pop(0)
+        assert len(pick) == k and set(pick) <= set(options), (pick, options)
+        return pick
+
+    def random(self):
+        return self.picks.pop(0)
+
+
+def test_cs_shadow_op_hides_and_restores_callers_edges_in_other_files(engine, repo_id, tmp_path):
+    """cs/Shadow.cs's Jobs in Shop.App is nearer Program.cs (Shop.App) than
+    cs/Jobs.cs's in Shop: Program's `Jobs.Run` leaves Jobs.cs for it, and
+    goes back when it moves to another namespace or goes, cs/Shadow.cs
+    alone in each batch. Every step equals a fresh scan."""
+    fuzz = Fuzz(random.Random(0))
+    root = tmp_path
+    fuzz.write(root, set(fuzz.files))
+    provision_repository_schema(engine, root)
+    engine.upsert_repository(repo_id, repo_id, str(root))
+    full_scan(engine, repo_id, root, docs_path=DOCS, mentions_enabled=True)
+
+    def run_targets():
+        return {row["f"] for row in engine.run_cypher(
+            "MATCH (:Function {repo_id: $r, name: 'Main', file: 'cs/Program.cs'})-[:CALLS]->(b:Function {name: 'Run'}) "
+            "RETURN b.file AS f", {"r": repo_id},
+        )}
+
+    assert "cs/Jobs.cs" in run_targets()
+    steps = [
+        (["Jobs", "Shop.App"], {"cs/Shadow.cs"}),  # added: it hides Jobs.cs's
+        ([0.5, "Tools"], {"cs/Jobs.cs"}),  # rekeyed away
+        ([0.5, "Shop.App"], {"cs/Shadow.cs"}),  # rekeyed back
+        ([0.1], {"cs/Jobs.cs"}),  # removed
+    ]
+    for step, (picks, want) in enumerate(steps):
+        fuzz.rng = _Scripted(picks)
+        description, touched = fuzz.op_cs_shadow()
+        fuzz.write(root, touched)
+        if "cs/Shadow.cs" in fuzz.files:
+            index_paths(engine, repo_id, root, {root / rel for rel in touched}, docs_path=DOCS, mentions_enabled=True)
+        else:
+            remove_paths(engine, repo_id, root, {root / rel for rel in touched})
+        assert run_targets() == want, description
+        check(engine, repo_id, root, "scripted", step, [description])
+
+
+def test_cs_rekey_ops_retract_callers_in_other_files(engine, repo_id, tmp_path, monkeypatch):
+    """Each C# rekeying operation changes a node's match keys under edges
+    other files' `@` pins gave it: the batch retracts those edges and the
+    graph still equals a fresh scan. A method that moves to another class
+    is another node (its owner changed), not a rekeyed one: its old node
+    goes with its edges, and the new one is added and relinked."""
+    retracted = []
+    real = GraphEngine.write_match_keys
+
+    def write_match_keys(self, repo, nodes):
+        for label, name, file, owner, _keys, _proj, retract in nodes:
+            if retract:
+                retracted.append(self.run_cypher(
+                    f"MATCH (a)-[r:CALLS|IMPORTS]->(b:{label} {{repo_id: $r, name: $n, file: $f, owner: $o}}) "
+                    "WHERE coalesce(a.file, a.source_file) <> $f RETURN count(r) AS n",
+                    {"r": repo, "n": name, "f": file, "o": owner},
+                )[0]["n"])
+        return real(self, repo, nodes)
+
+    monkeypatch.setattr(GraphEngine, "write_match_keys", write_match_keys)
+    fuzz = Fuzz(random.Random(0))
+    root = tmp_path
+    fuzz.write(root, set(fuzz.files))
+    provision_repository_schema(engine, root)
+    engine.upsert_repository(repo_id, repo_id, str(root))
+    full_scan(engine, repo_id, root, docs_path=DOCS, mentions_enabled=True)
+    steps = [
+        # Jobs.cs's Run becomes Root's (owner Jobs to Root): another node, under Program's and Wide's Jobs.Run.
+        ("cs_move_class", [["cs/Jobs.cs", "cs/Global.cs"]], False),
+        # Base.cs's class is named Jobs: its Helper is another node, under Block's and Wide's p.Helper.
+        ("cs_dup_class", [["cs/Global.cs", "cs/Models/Base.cs"]], False),
+        # Tidy's extension key moves to the global namespace under Block's and Use's _jobs.Tidy.
+        ("cs_namespace", ["cs/JobsExtensions.cs", ""], True),
+        # Jobs (now in Global.cs) moves from the global namespace to Shop under the Jobs.Run calls.
+        ("cs_namespace", ["cs/Global.cs", "Shop"], True),
+    ]
+    for step, (op, picks, rekeys) in enumerate(steps):
+        fuzz.rng = _Scripted(picks)
+        description, touched = getattr(fuzz, f"op_{op}")()
+        retracted.clear()
+        fuzz.write(root, touched)
+        index_paths(engine, repo_id, root, {root / rel for rel in touched}, docs_path=DOCS, mentions_enabled=True)
+        if rekeys:
+            assert any(retracted), f"{description}: no edge from another file retracted"
+        check(engine, repo_id, root, "scripted", step, [description])
+

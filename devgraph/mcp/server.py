@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -274,6 +275,64 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def _with_neo4j_errors(fn: Callable[..., Any], uri: str) -> Callable[..., Any]:
+    """Wrap a built-in tool so Neo4j being down or refusing the login reaches the
+    client as a ToolError saying what to do (see `tools.neo4j_unavailable`), not
+    as the driver's bare error; every other exception passes through."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            error = devgraph_tools.neo4j_unavailable(exc, uri)
+            if error is None:
+                raise
+            raise error from exc
+
+    return wrapper
+
+
+class _SchemaProvisioner:
+    """Runs `init_schema` once, for a server that started with Neo4j down (its
+    startup could not). Thread-safe; marked done only when it succeeded."""
+
+    def __init__(self, engine: GraphEngine) -> None:
+        self._engine = engine
+        self._lock = threading.Lock()
+        self.ready = False
+
+    def ensure(self) -> None:
+        """Provision the schema unless done. Neo4j still unreachable raises the
+        driver's error at once (one probe, not retried); any other failure is
+        logged and retried on the next call."""
+        if self.ready:
+            return
+        with self._lock:
+            if self.ready:
+                return
+            self._engine.probe_connectivity()
+            try:
+                self._engine.init_schema(wait=False)
+            except Exception:
+                logger.warning("provisioning the graph schema failed; retrying on the next call", exc_info=True)
+                return
+            self.ready = True
+
+
+def _with_schema(fn: Callable[..., Any], provisioner: _SchemaProvisioner | None) -> Callable[..., Any]:
+    """Wrap a built-in tool so `provisioner` (if any) runs before the call."""
+    if provisioner is None:
+        return fn
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        provisioner.ensure()
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
 def _with_shadow_notices(fn: Callable[..., Any], shadowed: Callable[[], dict[str, list[str]]]) -> Callable[..., Any]:
     """Wrap a built-in tool so its dict result carries the notices for declared tools its name shadows.
 
@@ -418,6 +477,7 @@ def build_server(
     session_repo: Any | None = None,
     session_source: str = "none",
     session_pinned: str | None = None,
+    provision_schema: bool = False,
 ) -> MCPServer:
     """Construct an MCPServer with every DevGraph tool registered against `engine`.
 
@@ -431,6 +491,10 @@ def build_server(
     `devgraph://project-tools` resource. `session_pinned` is the raw
     DEVGRAPH_MCP_REPO value, used only in the unmatched-value notice and the
     no-session error.
+
+    `provision_schema` (the server started with Neo4j down) makes the first
+    built-in call that finds Neo4j reachable run `init_schema` first; see
+    `_SchemaProvisioner`.
 
     The same `session_repo` is the default `repo_id` for every built-in tool
     called without one (see `_with_repo_default`), and the `instructions` name
@@ -466,6 +530,8 @@ def build_server(
         ),
     )
 
+    neo4j_uri = getattr(engine, "uri", None) or settings.neo4j_uri
+    provisioner = _SchemaProvisioner(engine) if provision_schema else None
     # Single chokepoint for tool-call telemetry: every `@server.tool(...)`
     # registration below goes through this rebound decorator, including any
     # tool added later, so instrumentation can't be forgotten on a new tool
@@ -496,18 +562,30 @@ def build_server(
         # `status` (the tool plane's, assigned below) is looked up at call time.
         return lambda fn: register(
             _instrument(
-                _with_shadow_notices(
-                    _with_cross_repo_gate(
-                        _with_repo_default(fn, session_repo, session_source, registry, unscoped_error),
-                        settings.allow_cross_repo,
-                        registry,
+                _with_neo4j_errors(
+                    _with_schema(
+                        _with_shadow_notices(
+                            _with_cross_repo_gate(
+                                _with_repo_default(fn, session_repo, session_source, registry, unscoped_error),
+                                settings.allow_cross_repo,
+                                registry,
+                            ),
+                            lambda: status.shadowed,
+                        ),
+                        provisioner,
                     ),
-                    lambda: status.shadowed,
+                    neo4j_uri,
                 )
             )
         )
 
     server.tool = _instrumented_tool  # type: ignore[method-assign]
+
+    def declared(repo_id: str, cross_repo: bool) -> tuple[str, ...]:
+        """The declared labels a component lookup adds: the repository's, or every registered one's."""
+        if cross_repo:
+            return devgraph_tools.all_declared_node_labels(registry)
+        return devgraph_tools.declared_node_labels(registry, repo_id)
 
     @server.tool(annotations=_READ_ONLY)
     def search_component(
@@ -611,8 +689,8 @@ def build_server(
         """List entities touched within the last N commits repo-wide, most-recently-modified
         first; returns {count, results, truncated}. Requires git-history recency staging —
         entities never staged with last_modified_at are excluded. entity_type optionally
-        restricts to one node label (validated against NODE_LABELS). within_commits must
-        be at least 1."""
+        restricts to one node label; an unknown label is an error naming the valid ones.
+        within_commits must be at least 1."""
         return devgraph_tools.list_recent_changes(
             engine, repo_id, within_commits, entity_type, cross_repo, max_results
         )
@@ -640,6 +718,7 @@ def build_server(
         scope_to_class: str | None = None,
         modified_within_commits: int | None = None,
         resolved_only: bool = False,
+        file: str | None = None,
     ) -> dict[str, Any]:
         """Find all callers of a target; returns {count, results, truncated}, each caller
         with its name, type, repo_id, file and confidence, most certain first. Calls
@@ -652,16 +731,27 @@ def build_server(
         class's own methods. Pass
         modified_within_commits to restrict to targets touched within the last N
         commits repo-wide (requires git-history recency staging; entities never staged
-        are excluded, not silently included)."""
+        are excluded, not silently included). An unknown target is an error with similar
+        names; a known one nothing calls is count 0. When the name is defined in several
+        files, pass file (the target's repo-relative path) to pick one; without it each
+        caller adds target_files (the files of the targets it calls, at most 10) and
+        ambiguous_targets lists the definitions."""
         return devgraph_tools.find_callers(
             engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits,
-            resolved_only,
+            resolved_only, file, declared(repo_id, cross_repo),
         )
 
     @server.tool(annotations=_READ_ONLY)
-    def find_related_files(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Find related files; each list returns {count, results, truncated} envelope."""
-        return devgraph_tools.find_related_files(engine, repo_id, component_name, cross_repo, max_results)
+    def find_related_files(
+        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None
+    ) -> dict[str, Any]:
+        """Find related files; each list returns {count, results, truncated} envelope. An
+        unknown component is an error with similar names. When the name is defined in
+        several files, pass file (repo-relative path) to pick one; without it each row is
+        {name, target_files} and ambiguous_targets lists them."""
+        return devgraph_tools.find_related_files(
+            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo)
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def summarise_repository(repo_id: str) -> dict[str, Any]:
@@ -685,12 +775,21 @@ def build_server(
         return devgraph_tools.compare_branches(engine, registry, repo_id, branch_a, branch_b)
 
     @server.tool(annotations=_READ_ONLY)
-    def impact_analysis(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
+    def impact_analysis(
+        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None
+    ) -> dict[str, Any]:
         """Analyze component impact: direct dependents (one CALLS/USES/DEPENDS_ON hop) and
         transitive ones (two to four hops; further ones are not followed). Dependents
         wrapped in {count, results, truncated} envelopes. An unknown component is an
-        error with similar names."""
-        return devgraph_tools.impact_analysis(engine, repo_id, component_name, cross_repo, max_results)
+        error with similar names. When the name is defined in several files, pass file
+        (repo-relative path) to pick one; without it ambiguous_targets lists them, and for
+        up to five files each is traced apart (every dependent adds target_files, the
+        targets it depends on, and risk_level is the riskiest one's); past five, their
+        dependents are listed together, with a notice. Another same-named definition
+        can itself appear as a dependent."""
+        return devgraph_tools.impact_analysis(
+            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo)
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def impact_analysis_for_diff(
@@ -716,9 +815,11 @@ def build_server(
         )
 
     @server.tool(annotations=_READ_ONLY)
-    def explain_architecture(repo_id: str) -> dict[str, Any]:
-        """Generate a high-level architectural explanation of the repository."""
-        return devgraph_tools.explain_architecture(engine, repo_id)
+    def explain_architecture(repo_id: str, max_results: int = 15) -> dict[str, Any]:
+        """Generate a high-level architectural explanation of the repository:
+        services_and_datastores ({service, uses}) and endpoints ({endpoints, calls}, only
+        services some endpoint calls), each a {count, results, truncated} envelope."""
+        return devgraph_tools.explain_architecture(engine, repo_id, max_results)
 
     @server.tool(annotations=_READ_ONLY)
     def list_services(repo_id: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
@@ -732,14 +833,22 @@ def build_server(
         return devgraph_tools.explain_decision(engine, repo_id, decision_name, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
-    def find_requirements_for(repo_id: str, component_name: str, cross_repo: bool = False) -> list[dict[str, Any]]:
-        """Find requirements a component (module/service/etc.) satisfies."""
-        return devgraph_tools.find_requirements_for(engine, repo_id, component_name, cross_repo)
+    def find_requirements_for(
+        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15
+    ) -> dict[str, Any]:
+        """Find requirements a component (module/service/etc.) satisfies; returns
+        {count, results, truncated}. An unknown component is an error with similar names."""
+        return devgraph_tools.find_requirements_for(
+            engine, repo_id, component_name, cross_repo, max_results, declared(repo_id, cross_repo)
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def trace_design_rationale(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
-        """Trace the design rationale (requirements, decisions, notes) behind a component."""
-        return devgraph_tools.trace_design_rationale(engine, repo_id, component_name, cross_repo)
+        """Trace the design rationale (requirements, decisions, notes) behind a component.
+        An unknown component is an error with similar names."""
+        return devgraph_tools.trace_design_rationale(
+            engine, repo_id, component_name, cross_repo, declared(repo_id, cross_repo)
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def find_mentions(
@@ -760,36 +869,41 @@ def build_server(
         )
 
     @server.tool(annotations=_READ_ONLY)
-    def blame_component(repo_id: str, component_name: str, cross_repo: bool = False) -> list[dict[str, Any]]:
+    def blame_component(
+        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15
+    ) -> dict[str, Any]:
         """Find commits that modified a component's file, most recent first
-        (pass a file path, not a function name)."""
-        return devgraph_tools.blame_component(engine, repo_id, component_name, cross_repo)
+        (pass a file path, not a function name); returns {count, results, truncated}."""
+        return devgraph_tools.blame_component(engine, repo_id, component_name, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
     def find_related_prs(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
         """Find related PRs; returns {count, results, truncated}. With the repository's PR
         ingestion off, the envelope is empty and a `notice` says how to enable it (never
-        contacts the network)."""
+        contacts the network). An unknown file is an error with similar names."""
         return devgraph_tools.find_related_prs(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
     def issue_history_for(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
         """Find issue history; returns {count, results, truncated}. With the repository's
         issue ingestion off, the envelope is empty and a `notice` says how to enable it
-        (never contacts the network)."""
+        (never contacts the network). An unknown file is an error with similar names."""
         return devgraph_tools.issue_history_for(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
     def get_source(
-        repo_id: str, component_name: str, cross_repo: bool = False, file: str | None = None
+        repo_id: str, component_name: str, cross_repo: bool = False, file: str | None = None,
+        owner: str | None = None,
     ) -> dict[str, Any]:
         """Fetch a Function or Class's actual source text and full docstring (when present),
         using the graph's last-indexed line range. Reads live from disk — rescan first if
         the file may have changed since the last index. When several nodes share the name,
-        returns status "ambiguous" with candidates ({label, name, file}) instead of
-        picking one: pass file (repo-relative path) to choose. A file that is not valid
-        UTF-8 is decoded with replacement characters, and a notice says so."""
-        return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo, file)
+        returns status "ambiguous" with candidates ({label, name, file, owner}) instead of
+        picking one: pass the candidate's file (repo-relative path) and owner (the classes
+        or functions it is declared in, "" at the top level) to choose. A method may also
+        be named with its class, "A.save" or "A::save". A file that is not valid UTF-8 is
+        decoded with replacement characters, and a notice says so."""
+        return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo, file, owner)
 
     @server.tool(annotations=_READ_ONLY)
     def describe_node(
@@ -801,16 +915,20 @@ def build_server(
         relationship_types: list[str] | None = None,
         neighbor_labels: list[str] | None = None,
         max_per_type: int = 10,
+        owner: str | None = None,
     ) -> dict[str, Any]:
         """Look at one node: its properties and its relationships grouped by type and
         direction, with each neighbour's identity. A file, folder or docs node is named by
-        its repo-relative path or id. An ambiguous name returns candidates; call again with
-        label and file. Each ref in the result is the next call's arguments. One hop per
-        call, at most 50 neighbours per type; direction, relationship_types, neighbor_labels
-        and max_per_type narrow it."""
+        its repo-relative path or id; a method may be named with its class, "A.save" or
+        "A::save". An ambiguous name returns candidates; call again with label, file and
+        owner. A code symbol's ref carries owner (the classes or functions it is declared
+        in, "" at the top level), which picks it from a same-named one in its file. Each
+        ref in the result is the next call's
+        arguments. One hop per call, at most 50 neighbours per type; direction,
+        relationship_types, neighbor_labels and max_per_type narrow it."""
         return devgraph_tools.describe_node(
             engine, repo_id, name, label, file, direction, relationship_types, neighbor_labels, max_per_type,
-            declared_labels=devgraph_tools.declared_node_labels(registry, repo_id),
+            declared_labels=devgraph_tools.declared_node_labels(registry, repo_id), owner=owner,
         )
 
     if settings.enable_run_cypher:
@@ -908,6 +1026,25 @@ def build_server(
     return server
 
 
+#: How long the MCP server's engine may take to get a connection (see
+#: `GraphEngine`, which it runs `fail_fast`: a read that failed once connected
+#: is retried once, one that could not connect is not). With Neo4j down a call
+#: fails in about this long on every platform, not after the driver's default
+#: 30 s of retries.
+MCP_CONNECTION_TIMEOUT_S = 2.0
+
+
+def mcp_engine(settings: Any) -> GraphEngine:
+    """The MCP server's engine: `settings`' Neo4j, with the short limits above."""
+    return GraphEngine(
+        settings.neo4j_uri,
+        settings.neo4j_user,
+        settings.neo4j_password,
+        fail_fast=True,
+        connection_timeout_s=MCP_CONNECTION_TIMEOUT_S,
+    )
+
+
 def main() -> None:
     """Entry point: connect to Neo4j, initialize schema, run the stdio MCP server.
 
@@ -932,11 +1069,23 @@ def main() -> None:
     Run with: `.venv/Scripts/python -P -m devgraph.mcp.server`
     """
     settings = get_settings()
-    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
-    engine.verify_connectivity()
-    # Not waiting for indexes an upgrade is still building: that can outlast
-    # the client's handshake timeout, and each query waits for its own.
-    engine.init_schema(wait=False)
+    engine = mcp_engine(settings)
+    provision_schema = False
+    try:
+        # One check, not retried, so a server with Neo4j down starts serving at once.
+        engine.probe_connectivity()
+        # Not waiting for indexes an upgrade is still building: that can outlast
+        # the client's handshake timeout, and each query waits for its own.
+        engine.init_schema(wait=False)
+    except Exception as exc:
+        # Neo4j down (or refusing the login) at startup: serve anyway, so the
+        # client gets each tool's error saying how to fix it, and provision the
+        # schema on the first call that finds Neo4j reachable.
+        error = devgraph_tools.neo4j_unavailable(exc, settings.neo4j_uri)
+        if error is None:
+            raise
+        logger.warning("%s; serving anyway, each tool answers with this until Neo4j is reachable", error)
+        provision_schema = True
     registry = RepoRegistry(settings.registry_db_path)
 
     try:
@@ -957,6 +1106,7 @@ def main() -> None:
             session_repo=session_repo,
             session_source=source,
             session_pinned=os.environ.get(SESSION_REPO_ENV),
+            provision_schema=provision_schema,
         )
         anyio.run(run_stdio, server)
     finally:

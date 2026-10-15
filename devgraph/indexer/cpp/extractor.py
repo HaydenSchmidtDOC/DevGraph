@@ -53,13 +53,16 @@ conditionals (`#ifdef`/`#ifndef`/`#if`/`#else`/`#elif`) are flattened the
 same way, since `preproc_ifdef` etc. wrap their body as direct named
 children in Tree-sitter's cpp grammar — this lets include-guarded headers
 (the overwhelming majority of real-world .h files) parse normally instead of
-losing every declaration inside the guard.
+losing every declaration inside the guard. A `template<...>` declaration is
+walked through to the class, struct or function it declares, at file scope,
+in a namespace or as a member template.
 
 Out-of-class method definitions (`ClassName::MethodName(...) { ... }`,
 common in .cpp files that implement a class declared in the matching .h)
-are attributed to Class ClassName via a text split on '::' on the qualified
-declarator (e.g. 'Outer::Inner::method' -> class 'Inner', method 'method';
-'A::~A' -> class 'A', method '~A') — the segment immediately before the
+are attributed to Class ClassName via the segments of the qualified
+declarator, template arguments dropped (e.g. 'Outer::Inner::method' -> class
+'Inner', method 'method'; 'A::~A' -> class 'A', method '~A';
+'Stack<T>::push' -> class 'Stack') — the segment immediately before the
 final name, not the leftmost one, since the leftmost segment is more likely
 to be an enclosing namespace than the class itself. This is a textual
 heuristic, not a semantic one: it does not require (or verify) that a class
@@ -85,7 +88,7 @@ import tree_sitter_cpp as tscpp
 from tree_sitter import Language, Node, Parser
 
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, member_owner, own_edges
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +106,7 @@ _TRANSPARENT_CONTAINER_TYPES = (
     "preproc_else",
     "linkage_specification",  # extern "C" { ... }
     "declaration_list",  # the body of the above / of a namespace
+    "template_declaration",  # template<...> class/struct/function, its parameters skipped
 )
 
 
@@ -444,10 +448,12 @@ class _CppResolver:
         body = node.child_by_field_name("body")
         if name is None or body is None:
             return
-        cls = _text(name, self.source)
+        cls = _class_name(name, self.source)
         methods = self.methods.setdefault(cls, set())
         fields = self.fields.setdefault(cls, {})
         for member in body.named_children:
+            if member.type == "template_declaration":  # a member template: what it declares
+                member = next((c for c in member.named_children if c.type != "template_parameter_list"), member)
             if member.type == "function_definition":
                 method = _function_name(member, self.source)
                 if method:
@@ -490,6 +496,55 @@ class _CppResolver:
             for ext in (".h", ".hpp", ".cpp", ".cc")
         ]
         return conventional + self.included()
+
+
+def _class_name(name_node: Node, source: bytes) -> str:
+    """A class specifier's name: an explicit specialisation's
+    (`template<> class Stack<int>`) is its template's, `Stack`."""
+    if name_node.type == "template_type":
+        name_node = name_node.child_by_field_name("name") or name_node
+    return _text(name_node, source)
+
+
+def _nested_class(declaration: Node) -> Node | None:
+    """The class or struct a member declaration defines with a body
+    (`class Inner { ... };` in a class), or None."""
+    declared = declaration.child_by_field_name("type")
+    if declared is not None and declared.type in ("class_specifier", "struct_specifier") and \
+            declared.child_by_field_name("body") is not None:
+        return declared
+    return None
+
+
+def _namespaces(root: Node, source: bytes) -> set[str]:
+    """Every namespace name the file declares (`namespace a::b` both)."""
+    found = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "namespace_definition":
+            name = node.child_by_field_name("name")
+            if name is not None:
+                found.update(part.strip() for part in _text(name, source).split("::"))
+        stack.extend(node.named_children)
+    return found
+
+
+def _qualified_parts(node: Node, source: bytes) -> list[str]:
+    """A `qualified_identifier`'s segments, each scope without its template
+    arguments: `Stack<std::map<K, V>>::push` is `["Stack", "push"]` (an
+    out-of-class member of a class template), `Widget::operator<` is
+    `["Widget", "operator<"]`."""
+    parts = []
+    while node is not None and node.type == "qualified_identifier":
+        scope = node.child_by_field_name("scope")
+        if scope is not None:
+            named = scope.child_by_field_name("name") if scope.type == "template_type" else scope
+            parts.append(_text(named if named is not None else scope, source))
+        node = node.child_by_field_name("name")
+    if node is not None:
+        parts.append(_text(node, source))
+    return parts
 
 
 def _function_name(node: Node, source: bytes) -> str | None:
@@ -648,6 +703,7 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
     result.nodes.append(module_node)
 
     resolver = _CppResolver(root, source_bytes, file_path)
+    namespaces = _namespaces(root, source_bytes)
     result.relationships += import_rows(
         file_path, repo_id,
         {each.beside for each in resolver.includes if each.beside},
@@ -655,11 +711,17 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
     )
     sites = CallSites()
 
-    def _record_calls(body: Node, caller_label: str, caller_name: str, cls: str | None, variables: dict) -> None:
+    def _record_calls(
+        body: Node, caller_label: str, caller_name: str, cls: str | None, variables: dict, caller_owner: str | None,
+    ) -> None:
         collector = _CppCalls(resolver, cls, variables)
         collector.walk(body)
         for name, pins, member in collector.found:
-            sites.add(caller_label, caller_name, cls, name, pins, member)
+            sites.add(caller_label, caller_name, cls, name, pins, member, caller_owner)
+
+    # The owner (common.member_owner) of the class being visited, innermost
+    # last; "" at the Module (a namespace is no owner).
+    owners = [""]
 
     classes_emitted: set[str] = set()
 
@@ -693,26 +755,34 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                     visit_block(body, parent_name, parent_label)
             elif node.type in _TRANSPARENT_CONTAINER_TYPES:
                 visit_block(node, parent_name, parent_label)
-            elif node.type in ("comment", "preproc_include", "preproc_def", "preproc_call"):
+            elif node.type in ("comment", "preproc_include", "preproc_def", "preproc_call", "template_parameter_list"):
                 continue
+            elif node.type == "field_declaration" and (nested := _nested_class(node)) is not None:
+                _visit_class(nested, parent_name, parent_label)  # `class Inner { ... };` in a class body
             else:
                 caller_class = parent_name if parent_label == "Class" else None
-                _record_calls(node, parent_label, parent_name if parent_name else file_path, caller_class, {})
+                _record_calls(
+                    node, parent_label, parent_name if parent_name else file_path, caller_class, {},
+                    owners[-1] if parent_label == "Class" else None,
+                )
 
     def _visit_class(node: Node, parent_name: str | None, parent_label: str) -> None:
         name_node = node.child_by_field_name("name")
         if name_node is None:
             return
-        class_name = _text(name_node, source_bytes)
+        class_name = _class_name(name_node, source_bytes)
 
         base_clause = node.child_by_field_name("base_class_clause") or next(
             (c for c in node.named_children if c.type == "base_class_clause"), None
         )
         base_classes = _extract_base_class_names(base_clause, source_bytes)
 
+        parent_owner = owners[-1] if parent_label == "Class" else None
+        owner = member_owner(parent_label, parent_name, parent_owner)
         class_properties: dict = {
             "type": "class",
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -736,6 +806,8 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=parent_owner,
+                to_owner=owner,
             )
         )
 
@@ -748,12 +820,15 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                     to_label="Class",
                     to_name=base_class,
                     repo_id=repo_id,
+                    from_owner=owner,
                 )
             )
 
         body_node = node.child_by_field_name("body")
         if body_node is not None:
+            owners.append(owner)
             visit_block(body_node, class_name, "Class")
+            owners.pop()
 
     def _visit_recovered_macro_class(
         node: Node, class_name: str, base_names: list[str], parent_name: str | None, parent_label: str
@@ -762,9 +837,12 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
         `_recover_macro_prefixed_class` — no member walk, see that
         function's docstring for why.
         """
+        parent_owner = owners[-1] if parent_label == "Class" else None
+        owner = member_owner(parent_label, parent_name, parent_owner)
         class_properties: dict = {
             "type": "class",
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -787,6 +865,8 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=parent_owner,
+                to_owner=owner,
             )
         )
         for base_class in base_names:
@@ -798,6 +878,7 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                     to_label="Class",
                     to_name=base_class,
                     repo_id=repo_id,
+                    from_owner=owner,
                 )
             )
 
@@ -810,15 +891,21 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             return
 
         class_name: str | None = None
+        qualifier: list[str] = []
         if inner.type == "qualified_identifier":
             # Out-of-class definition, e.g. 'ClassName::method' or
             # 'Outer::Inner::method' — see module docstring for the
             # class-attribution heuristic (last segment before the name).
-            qualified_text = _text(inner, source_bytes)
-            parts = qualified_text.split("::")
+            parts = _qualified_parts(inner, source_bytes)
             func_name = parts[-1]
             if len(parts) >= 2:
                 class_name = parts[-2]
+                # Its owner is the qualifier's classes, `Outer.Inner`, as for
+                # a member defined in a nested class; leading segments that
+                # name a namespace of the file are no owner.
+                qualifier = parts[:-1]
+                while len(qualifier) > 1 and qualifier[0] in namespaces:
+                    qualifier = qualifier[1:]
         elif inner.type in ("identifier", "field_identifier", "destructor_name", "operator_name"):
             func_name = _text(inner, source_bytes)
             class_name = parent_name if parent_label == "Class" else None
@@ -833,10 +920,18 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             contains_label, contains_name = "Class", class_name
         else:
             contains_label, contains_name = parent_label, (parent_name if parent_name else file_path)
+        # An out-of-class definition is owned by its qualifier's classes; a
+        # member defined in its class by the class's owner chain.
+        in_class = parent_label == "Class" and inner.type != "qualified_identifier"
+        if qualifier:
+            owner = ".".join(qualifier)
+        else:
+            owner = member_owner("Class", class_name, owners[-1] if in_class else None) if class_name else ""
 
         func_properties: dict = {
             "type": "function",
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -859,12 +954,16 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                 repo_id=repo_id,
                 from_file=file_path if contains_label == "Class" else None,
                 to_file=file_path,
+                from_owner=owners[-1] if in_class else None,
+                to_owner=owner,
             )
         )
 
         body_node = node.child_by_field_name("body")
         if body_node is not None:
-            _record_calls(body_node, "Function", func_name, class_name, _function_variables(node, source_bytes))
+            _record_calls(
+                body_node, "Function", func_name, class_name, _function_variables(node, source_bytes), owner,
+            )
 
     visit_block(root, None, "Module")
     result.relationships += sites.rows(file_path, repo_id)

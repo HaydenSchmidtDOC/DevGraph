@@ -27,8 +27,17 @@ import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
 from devgraph.indexer.calls import STOP_METHODS, call_rows
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.common import (
+    ExtractionResult,
+    GraphNode,
+    GraphRelationship,
+    member_owner,
+    own_edges,
+    owned_pin,
+    split_owned_pin,
+)
 from devgraph.indexer.python.resolve import Bindings, absolute_module, relative_module
+from devgraph.indexer.resolver_config import ResolverConfig
 
 logger = logging.getLogger(__name__)
 
@@ -308,26 +317,42 @@ def _direct_defs(block: Node | None, source: bytes) -> set[str]:
 class _ClassInfo:
     methods: set[str] = field(default_factory=set)
     bases: list[str] = field(default_factory=list)
+    # What its members are owned by (common.member_owner): its own owner
+    # chain and its name, one per class of the name in the file.
+    members_owners: set[str] = field(default_factory=set)
+
+    def members_owner(self) -> str | None:
+        """The owner of the class's members, None when several classes of
+        the file share its name (their methods are told apart by nothing
+        a call names)."""
+        return next(iter(self.members_owners)) if len(self.members_owners) == 1 else None
 
 
 def _class_table(root: Node, source: bytes) -> dict[str, _ClassInfo]:
     """Every class in the file, at any depth: its own methods and its bases.
-    Same-named classes merge (one Class node per name and file anyway)."""
+    Same-named classes merge."""
     classes: dict[str, _ClassInfo] = {}
 
-    def walk(node: Node) -> None:
-        if node.type == "class_definition":
+    def walk(node: Node, label: str, name: str | None, owner: str) -> None:
+        if node.type in ("class_definition", "function_definition"):
             name_node = node.child_by_field_name("name")
             if name_node is not None:
-                info = classes.setdefault(_text(name_node, source), _ClassInfo())
-                info.methods |= _direct_defs(node.child_by_field_name("body"), source)
-                for base in _extract_base_class_names(node.child_by_field_name("superclasses"), source):
-                    if base not in info.bases:
-                        info.bases.append(base)
+                own = member_owner(label, name, owner)
+                if node.type == "function_definition":
+                    label, name, owner = "Function", _text(name_node, source), own
+                else:
+                    class_name = _text(name_node, source)
+                    info = classes.setdefault(class_name, _ClassInfo())
+                    info.methods |= _direct_defs(node.child_by_field_name("body"), source)
+                    info.members_owners.add(member_owner("Class", class_name, own))
+                    for base in _extract_base_class_names(node.child_by_field_name("superclasses"), source):
+                        if base not in info.bases:
+                            info.bases.append(base)
+                    label, name, owner = "Class", class_name, own
         for child in node.children:
-            walk(child)
+            walk(child, label, name, owner)
 
-    walk(root)
+    walk(root, "Module", None, "")
     return classes
 
 
@@ -383,24 +408,32 @@ class _CallResolver:
         self.source = source
 
     def _module_pins(self, receiver: str) -> list[str] | None:
-        """Where a name read off an imported module or a from-imported name can be."""
+        """Where a name read off an imported module or a from-imported name
+        can be, as owned pins (common.owned_pin): a module's attribute is a
+        top-level one (owner ""), and so is a submodule's; one read off a
+        from-imported name that is no module (a class, an instance) is any
+        of the name in its module, since a class can inherit it from a base
+        of that file."""
         ref = self.bindings.modules.get(receiver)
         if ref is not None:
-            return ref.files() + ref.dirs()
+            return [owned_pin(pin, "") for pin in ref.files() + ref.dirs()]
         symbol = self.bindings.symbols.get(receiver)
         if symbol is not None:
-            return (
-                symbol.module.files() + symbol.submodule.files() + symbol.module.dirs() + symbol.submodule.dirs()
-            )
+            return symbol.module.files() + symbol.module.dirs() + [
+                owned_pin(pin, "") for pin in symbol.submodule.files() + symbol.submodule.dirs()
+            ]
         return None
 
     def _class_pins(self, type_name: str, method: str) -> list[str] | None:
         """Where `method` of the class `type_name` (as written) can be. An
-        in-file class is walked like `self.method()` (see _method_pins)."""
+        in-file class is walked like `self.method()` (see _method_pins); an
+        imported one's method is any of the name in its files (its owner is
+        unknown: the class can inherit it from a base of its file)."""
         if type_name in self.classes:
             return self._method_pins(type_name, method, own=True)
         if "." in type_name:
-            return self._module_pins(type_name.rsplit(".", 1)[0])
+            pins = self._module_pins(type_name.rsplit(".", 1)[0])
+            return [split_owned_pin(pin)[0] for pin in pins] if pins is not None else None
         symbol = self.bindings.symbols.get(type_name)
         if symbol is not None:
             return symbol.module.files() + symbol.module.dirs()
@@ -408,10 +441,11 @@ class _CallResolver:
 
     def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
         """Where `self.method()` (own) or `super().method()` in `cls` can go:
-        this file when `cls` or an in-file base defines it, and the files of
-        each imported base (not followed further). None when nothing does."""
+        this file when `cls` or an in-file base defines it, as that class's
+        member (common.owned_pin), and the files of each imported base (not
+        followed further). None when nothing does."""
         if own and method in self.classes[cls].methods:
-            return [self.file_path]
+            return [owned_pin(self.file_path, self.classes[cls].members_owner())]
         pins: set[str] = set()
         found = False
         seen = {cls}
@@ -424,7 +458,7 @@ class _CallResolver:
                         continue
                     seen.add(base)
                     if method in self.classes[base].methods:
-                        pins.add(self.file_path)
+                        pins.add(owned_pin(self.file_path, self.classes[base].members_owner()))
                         found = True
                     else:
                         bases_of(base)
@@ -457,11 +491,12 @@ class _CallResolver:
             if scope.is_parameter(name):
                 return []  # calling a parameter: nothing to resolve, and it shadows any import
             symbol = self.bindings.symbols.get(name)
+            # A from-imported (or star-imported) name is a module's top-level one.
             if symbol is not None:
-                return [(symbol.name, pin) for pin in symbol.module.files() + symbol.module.dirs()]
+                return [(symbol.name, owned_pin(pin, "")) for pin in symbol.module.files() + symbol.module.dirs()]
             if name in self.bindings.modules or name in _BUILTIN_NAMES:
                 return []
-            return [(name, pin) for star in self.bindings.stars for pin in star.files() + star.dirs()]
+            return [(name, owned_pin(pin, "")) for star in self.bindings.stars for pin in star.files() + star.dirs()]
         if func.type != "attribute":
             return []
         obj = func.child_by_field_name("object")
@@ -526,10 +561,10 @@ def _clean_docstring(raw: str) -> str:
     lines = text.split("\n")
     # Dedent using the minimum indentation of non-blank lines after the first
     # (PEP 257: the first line typically starts right after the opening quote).
-    non_first = [l for l in lines[1:] if l.strip()]
+    non_first = [line for line in lines[1:] if line.strip()]
     if non_first:
-        indent = min(len(l) - len(l.lstrip()) for l in non_first)
-        lines = [lines[0]] + [l[indent:] if len(l) >= indent else l for l in lines[1:]]
+        indent = min(len(line) - len(line.lstrip()) for line in non_first)
+        lines = [lines[0]] + [line[indent:] if len(line) >= indent else line for line in lines[1:]]
     return "\n".join(lines).strip()
 
 
@@ -564,18 +599,18 @@ def _extract_base_class_names(superclasses_node: Node | None, source: bytes) -> 
     return names
 
 
-def _extract_imports(root: Node, source: bytes, file_path: str) -> Bindings:
+def _extract_imports(root: Node, source: bytes, file_path: str, roots: tuple[str, ...] = ()) -> Bindings:
     """Every import statement in the file, function-local ones included, as
     its bindings and IMPORTS targets (see resolve.py).
 
     `file_path` is the importing file's repo-relative path with forward
     slashes ('services/api/main.py', or 'main.py' at the repo root): absolute
-    imports are tried under each of its ancestor directories and relative
-    ones against its own directory. Each import targets every candidate
+    imports are tried under each of its ancestor directories and the
+    configured `roots` (`src/` directories beside them, pyproject roots), and relative ones against its own directory. Each import targets every candidate
     file, `p.py` and `p/__init__.py`; only the ones that exist as Modules
     ever become edges. `from P import n` also targets the submodule `P.n`.
     """
-    bindings = Bindings()
+    bindings = Bindings(roots=roots)
     current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
 
     def walk(node: Node) -> None:
@@ -617,7 +652,7 @@ def _extract_imports(root: Node, source: bytes, file_path: str) -> Bindings:
             if module_name.startswith("."):
                 bindings.add_from(relative_module(module_name, current_dir), names, star)
             elif module_name:
-                bindings.add_from(absolute_module(module_name, file_path), names, star)
+                bindings.add_from(absolute_module(module_name, file_path, roots), names, star)
 
         for child in node.children:
             walk(child)
@@ -626,7 +661,9 @@ def _extract_imports(root: Node, source: bytes, file_path: str) -> Bindings:
     return bindings
 
 
-def extract_python_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
+def extract_python_file(
+    source_code: str, file_path: str, repo_id: str, config: ResolverConfig | None = None,
+) -> ExtractionResult:
     """Parse a Python file and extract nodes and relationships.
 
     Args:
@@ -641,6 +678,10 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
             otherwise merge into one Module node) — index_file() computes
             the correct repo-relative form automatically.
         repo_id: Repository ID for scoping nodes.
+        config: The repository's resolver configuration (its pyproject.toml
+            files and `src/` directories), read once per batch: the source
+            roots are import roots of the files they apply to. None reads no
+            roots besides each ancestor directory.
 
     Returns:
         ExtractionResult containing lists of nodes and relationships. On a
@@ -676,7 +717,8 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
     # file_path is expected to be the repo-relative path with forward
     # slashes (e.g. 'services/api/main.py'), which the candidates hang off.
     # A package's `from . import x` names its own __init__.py, never an edge.
-    bindings = _extract_imports(root, source_bytes, file_path)
+    roots = config.python_roots(file_path) if config is not None else ()
+    bindings = _extract_imports(root, source_bytes, file_path, roots)
     for target in sorted(bindings.targets - {file_path}):
         result.relationships.append(
             GraphRelationship(
@@ -691,15 +733,19 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
 
     resolver = _CallResolver(file_path, bindings, _class_table(root, source_bytes), source_bytes)
     fixtures = _fixture_types(root, source_bytes)
-    # (caller label, caller name) -> callee name -> [pins, bare?, caller classes]
-    calls: dict[tuple[str, str], dict[str, list]] = {}
+    # (caller label, caller name, caller owner) -> callee name -> [pins, bare?, caller classes]
+    calls: dict[tuple[str, str, str | None], dict[str, list]] = {}
 
-    def record_calls(caller_label: str, caller_name: str, body: Node, scope: _Scope, caller_class: str | None) -> None:
+    def record_calls(
+        caller_label: str, caller_name: str, body: Node, scope: _Scope, caller_class: str | None,
+        caller_owner: str | None,
+    ) -> None:
         # caller_class records the enclosing class of a method-body call (None
         # for module-level/free-function calls) so find_callers can optionally
         # narrow results via scope_to_class — an opt-in query-time filter
-        # (Implementation Plan #3, Item 2).
-        by_name = calls.setdefault((caller_label, caller_name), {})
+        # (Implementation Plan #3, Item 2). caller_owner tells same-named
+        # callers of the file apart (None for the Module).
+        by_name = calls.setdefault((caller_label, caller_name, caller_owner), {})
         for func in _call_functions(body):
             for name, pin in resolver.resolve(func, scope):
                 entry = by_name.setdefault(name, [set(), False, set()])
@@ -710,37 +756,45 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 if caller_class:
                     entry[2].add(caller_class)
 
-    def visit_block(block: Node, parent_name: str | None, parent_label: str, scope: _Scope) -> None:
-        """Visit statements in a block (module body, class body, function body).
-        A class body's defs are methods: they see the class's enclosing scope."""
+    def visit_block(block: Node, parent_name: str | None, parent_label: str, scope: _Scope, parent_owner: str) -> None:
+        """Visit statements in a block (module body, class body, function body)
+        whose own owner is `parent_owner`. A class body's defs are methods:
+        they see the class's enclosing scope."""
         def_scope, def_cls = (scope.parent, parent_name) if parent_label == "Class" else (scope, scope.cls)
         for node in block.named_children:
             if node.type == "class_definition":
-                _visit_class(node, parent_name, parent_label, scope)
+                _visit_class(node, parent_name, parent_label, scope, parent_owner)
             elif node.type in ("function_definition",):
-                _visit_function(node, parent_name, parent_label, def_scope, def_cls)
+                _visit_function(node, parent_name, parent_label, def_scope, def_cls, parent_owner)
             elif node.type == "decorated_definition":
                 # decorated_definition wraps decorator(s) + the actual definition.
                 definition = node.child_by_field_name("definition")
                 decorators = [c for c in node.named_children if c.type == "decorator"]
                 if definition is not None and definition.type == "class_definition":
-                    _visit_class(definition, parent_name, parent_label, scope, extra_decorators=decorators)
+                    _visit_class(
+                        definition, parent_name, parent_label, scope, parent_owner, extra_decorators=decorators
+                    )
                 elif definition is not None and definition.type == "function_definition":
                     _visit_function(
-                        definition, parent_name, parent_label, def_scope, def_cls, extra_decorators=decorators
+                        definition, parent_name, parent_label, def_scope, def_cls, parent_owner,
+                        extra_decorators=decorators,
                     )
             else:
                 # Module/class-body-level statement (not a def) — attribute
                 # any call expressions in it to the enclosing scope (usually
                 # the Module, for top-level script code / constant setup).
                 caller_class = parent_name if parent_label == "Class" else None
-                record_calls(parent_label, parent_name if parent_name else file_path, node, scope, caller_class)
+                record_calls(
+                    parent_label, parent_name if parent_name else file_path, node, scope, caller_class,
+                    parent_owner if parent_label != "Module" else None,
+                )
 
     def _visit_class(
         node: Node,
         parent_name: str | None,
         parent_label: str,
         scope: _Scope,
+        parent_owner: str,
         extra_decorators: list[Node] | None = None,
     ) -> None:
         name_node = node.child_by_field_name("name")
@@ -754,10 +808,12 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         superclasses_node = node.child_by_field_name("superclasses")
         base_classes = _extract_base_class_names(superclasses_node, source_bytes)
 
+        owner = member_owner(parent_label, parent_name, parent_owner)
         class_properties: dict = {
             "type": "class",
             "decorators": decorators,
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -787,6 +843,8 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=parent_owner if parent_label != "Module" else None,
+                to_owner=owner,
             )
         )
 
@@ -799,11 +857,12 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                     to_label="Class",
                     to_name=base_class,
                     repo_id=repo_id,
+                    from_owner=owner,
                 )
             )
 
         if body_node is not None:
-            visit_block(body_node, class_name, "Class", _Scope(set(), {}, None, scope))
+            visit_block(body_node, class_name, "Class", _Scope(set(), {}, None, scope), owner)
 
     def _visit_function(
         node: Node,
@@ -811,6 +870,7 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         parent_label: str,
         enclosing: _Scope,
         cls: str | None,
+        parent_owner: str,
         extra_decorators: list[Node] | None = None,
     ) -> None:
         name_node = node.child_by_field_name("name")
@@ -821,10 +881,12 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         decorator_nodes = extra_decorators or []
         decorators = _extract_decorator_names(decorator_nodes, source_bytes)
 
+        owner = member_owner(parent_label, parent_name, parent_owner)
         func_properties: dict = {
             "type": "function",
             "decorators": decorators,
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -854,6 +916,8 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=parent_owner if parent_label != "Module" else None,
+                to_owner=owner,
             )
         )
 
@@ -868,24 +932,27 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 enclosing, _parameter_names(node, source_bytes),
             )
             caller_class = parent_name if parent_label == "Class" else None
-            record_calls("Function", func_name, body_node, scope, caller_class)
+            record_calls("Function", func_name, body_node, scope, caller_class, owner)
 
             for child in body_node.named_children:
                 if child.type == "function_definition":
-                    _visit_function(child, func_name, "Function", scope, cls)
+                    _visit_function(child, func_name, "Function", scope, cls, owner)
                 elif child.type == "decorated_definition":
                     definition = child.child_by_field_name("definition")
                     decos = [c for c in child.named_children if c.type == "decorator"]
                     if definition is not None and definition.type == "function_definition":
-                        _visit_function(definition, func_name, "Function", scope, cls, extra_decorators=decos)
+                        _visit_function(definition, func_name, "Function", scope, cls, owner, extra_decorators=decos)
 
-    visit_block(root, None, "Module", _Scope(_direct_defs(root, source_bytes), {}, None))
-    for (caller_label, caller_name), by_name in sorted(calls.items()):
+    visit_block(root, None, "Module", _Scope(_direct_defs(root, source_bytes), {}, None), "")
+    for (caller_label, caller_name, caller_owner), by_name in sorted(
+        calls.items(), key=lambda item: (item[0][0], item[0][1], item[0][2] or "")
+    ):
         for name, (pins, bare, classes) in sorted(by_name.items()):
             result.relationships.extend(
                 call_rows(
                     caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id,
                     no_self=True,  # every bare Python call site is `x.m()` on an untyped receiver
+                    caller_owner=caller_owner,
                 )
             )
 

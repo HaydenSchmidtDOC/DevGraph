@@ -328,7 +328,8 @@ def test_a_queue_overflow_asks_for_a_catch_up(tmp_path):
 
 def test_a_folder_that_hits_the_watch_limit_mid_session_is_reported(tmp_path, monkeypatch):
     """A folder created once the watch limit is reached gets no watch; that
-    is a repository issue (with the sysctl to raise), and a catch-up runs."""
+    is a repository issue (with the sysctl to raise) saying the repository
+    is partly watched, not unwatched, and a catch-up runs."""
     w = Watching(tmp_path, make_repo(tmp_path, "repo", 1), git=False)
     w.registry.mark_indexed(w.repo_id)
     catch_ups: list[str] = []
@@ -341,8 +342,52 @@ def test_a_folder_that_hits_the_watch_limit_mid_session_is_reported(tmp_path, mo
         (w.root / "pkg0/new").mkdir()
         wait_for(lambda: w.repo_id in w.manager.get_repo_issues(), "the issue")
         issue = w.manager.get_repo_issues()[w.repo_id]
-        assert issue.startswith("watching unavailable: inotify limit reached") and "max_user_watches" in issue
+        assert issue.startswith("partly watched: a new folder isn't watched, inotify limit reached"), issue
+        assert "max_user_watches" in issue
         wait_for(lambda: "unwatched" in catch_ups, lambda: f"a catch-up; got {catch_ups}")
+    finally:
+        w.close()
+
+
+def test_a_limit_reported_as_the_watch_starts_is_kept(tmp_path):
+    """A report from the new watch's reader can land before `_start_single`
+    returns; clearing the old issue after the start erased it. The old
+    issue is still cleared."""
+    w = Watching(tmp_path, make_repo(tmp_path, "repo", 1), git=False)
+    new_observer = w.manager._new_observer
+
+    def reporting_observer(repo_id, root, *, watch_git):
+        observer = new_observer(repo_id, root, watch_git=watch_git)
+        start = observer.start
+
+        def start_then_report():
+            start()
+            w.manager._inotify_problem(repo_id, "limit", OSError(errno.ENOSPC, "No space left on device"))
+
+        observer.start = start_then_report
+        return observer
+
+    w.manager._new_observer = reporting_observer
+    w.manager._repo_issues[w.repo_id] = "watching unavailable: an earlier start's"
+    w.manager.start()
+    try:
+        issue = w.manager.get_repo_issues().get(w.repo_id, "")
+        assert issue.startswith("partly watched: "), issue
+    finally:
+        w.close()
+
+
+def test_a_limit_report_never_replaces_a_worse_issue(tmp_path):
+    """A partial watch is recorded over nothing or another partial watch,
+    never over a watch that stopped altogether."""
+    w = Watching(tmp_path, make_repo(tmp_path, "repo", 1), git=False)
+    limit = OSError(errno.ENOSPC, "No space left on device")
+    try:
+        w.manager._inotify_problem(w.repo_id, "limit", limit)
+        assert w.manager.get_repo_issues()[w.repo_id].startswith("partly watched: ")
+        w.manager._inotify_problem(w.repo_id, "broken", KeyError("x"))
+        w.manager._inotify_problem(w.repo_id, "limit", limit)
+        assert w.manager.get_repo_issues()[w.repo_id].startswith("watching stopped: KeyError")
     finally:
         w.close()
 

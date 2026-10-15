@@ -183,12 +183,12 @@ not this literal text):
 
 - **command**: <resolved path to DevGraph's venv python.exe>
 - **args**: -P -m devgraph.mcp.server
-- **cwd**: <resolved DevGraph repo root>
+- **cwd**: the repository you are working in (VS Code: ${workspaceFolder})
 
 claude mcp add -s user devgraph -- "<resolved venv python.exe>" -P -m devgraph.mcp.server
 
 VS Code (user mcp.json at <resolved path>):
-{ "servers": { "devgraph": { "type": "stdio", "command": "...", "args": [...], "cwd": "..." } } }
+{ "servers": { "devgraph": { "type": "stdio", "command": "...", "args": [...], "cwd": "${workspaceFolder}" } } }
 ```
 
 Claude Code registration is user-scoped (`-s user`), so one registration
@@ -199,7 +199,17 @@ add`, which registers in local scope, for the DevGraph checkout folder only:
 move it (`claude mcp remove devgraph -s local` in the checkout, then `devgraph
 mcp add`). A user-scope registration made before `-P` was added is left as-is
 by `--run` (an existing entry is skipped); run `devgraph mcp remove` and
-register again to pick it up. The VS Code entry is rewritten in place.
+register again to pick it up. A user-scope registration whose command is
+another checkout's Python is reported by `devgraph mcp add` and `mcp doctor`,
+and fails both when that Python no longer exists (a moved or deleted
+checkout); `devgraph mcp add --replace` removes it and registers this
+checkout (the old entry is added back if that fails); a command set up
+outside DevGraph (`uvx`, `pipx`, a console script) is left alone. The VS
+Code entry is rewritten in place; its `cwd` is `${workspaceFolder}`, so a VS
+Code session answers for the open workspace. That variable names one folder:
+in a multi-root workspace, or a window with no folder open, it doesn't name
+the repository you mean (or anything), so set `DEVGRAPH_MCP_REPO` in the
+entry's `env` there.
 
 `devgraph client-config --claude-mcp-add-only` prints just the Claude Code
 one-liner; `devgraph client-config --run` also executes registration for the
@@ -224,9 +234,6 @@ The server instructions name it, and so does `devgraph://project-tools`.
   this session's repository.
 - When you omit it, the response carries `repo_id` and a notice saying which
   repository was used. Check them before relying on the answer.
-- `find_requirements_for` and `blame_component` return lists, which carry no notice.
-  For those, the repository is the one named in the server instructions and
-  in `devgraph://project-tools`.
 - Pass `repo_id` explicitly when you want a different repository, or when
   working across several repositories. An explicit `repo_id` is used exactly
   as given.
@@ -253,13 +260,33 @@ id (for example `ADR-013`). Passing the wrong
 kind of identifier looks like an empty/broken result but is a usage
 mismatch, not a graph gap.
 
+**Same-named targets**: `find_callers`, `impact_analysis` and
+`find_related_files` take an optional `file` (the target's repo-relative
+path) to pick one of several functions or classes with the same name. Without
+it, a name defined in more than one file is answered for all of them, with the
+same rows as before, and the response adds `ambiguous_targets`, a
+`{count, results, truncated}` envelope of the definitions' `{label, file}`
+(`file` is null for a file-less one, such as a route's handler stub; `repo_id`
+is added with `cross_repo`). Every `find_callers` and `find_related_files` row
+adds `target_files`, the files of the targets it belongs to (at most 10, with
+`target_file_count` past that; a file-less target is never listed); in
+`find_related_files` a row becomes `{"name", "target_files"}`.
+`impact_analysis` traces each file's target apart for up to five files: every
+dependent adds `target_files` and `risk_level` is the riskiest one's. For a
+name in more files (`get`, `run`) the dependents of all of them are listed
+together, with a notice to pass `file`. Another definition of the same name
+can itself appear as a dependent. A name defined in one file answers as
+before, with no `target_files`. `file` takes `\` or `/`, with or without a
+leading `./`.
+
 **Response shape (`count`/`results`/`truncated`)**: `search_component`,
-`find_callers`, `list_services`, `find_related_prs`, `issue_history_for`
-return `{"count": N, "results": [...], "truncated": bool}` instead of a bare
+`find_callers`, `list_services`, `find_related_prs`, `issue_history_for`,
+`find_requirements_for` and `blame_component` return
+`{"count": N, "results": [...], "truncated": bool}` instead of a bare
 list — read the match set from `result["results"]`, and check `truncated`
-before assuming you've seen everything. `find_related_files` and
-`impact_analysis` apply the same envelope to each of their list-valued
-fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
+before assuming you've seen everything. `find_related_files`,
+`explain_architecture` and `impact_analysis` apply the same envelope to each
+of their list-valued fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
 `max_results` (default 15) to widen the sample when you genuinely need more
 than the default. `search_component` ranks exact name matches first, then
 name prefixes, then other substrings, then description-only matches; each
@@ -297,8 +324,8 @@ global tool '<name>': <reason>` (the global tool is served because the project
 tool of that name could not be). A built-in tool whose name a project or global
 tool also uses says so in a `notices` list in each response:
 `ignored: project tool '<name>' shadows a locked tool; using the fixed
-implementation` (or `global tool`). Built-ins that return a list
-(`find_requirements_for`, `blame_component`, `run_cypher`) can't carry it;
+implementation` (or `global tool`). `run_cypher`, which returns a list,
+can't carry it;
 `devgraph://project-tools` reports it for them. `devgraph://project-tools` lists each served
 tool's origin and the global tools file.
 
@@ -333,7 +360,7 @@ Prefer these over re-reading files when the question is structural:
 | "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled; otherwise an empty result whose `notice` names the enable command) |
 | "Who changed X and when?" | `blame_component` (file path, not name) |
 | "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2; otherwise they return an empty result whose `notice` names the enable command, and never contact GitHub) |
-| "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed; a name defined in several files returns `status: "ambiguous"` with `candidates`, so pass `file` to pick one) |
+| "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed; a name defined in several files returns `status: "ambiguous"` with `candidates`, so pass `file` to pick one; each candidate carries `owner`, which `get_source` also takes, to pick one of several same-named functions in one file; a method can be named `A.save` or `A::save`, and a Kotlin companion's member `Repo.create`) |
 
 `compare_branches` and `impact_analysis_for_diff` both take two local refs
 and never fetch. `compare_branches` compares from the merge base, like
@@ -351,12 +378,21 @@ branch change?" and `impact_analysis_for_diff` for "what could this diff
 break?".
 
 Mistakes are errors, not empty answers: an unregistered `repo_id` fails with
-`no such repo_id`; `impact_analysis`, `get_service_dependencies`,
-`trace_request_flow` and `explain_decision` on a name the graph doesn't have
-fail with `no ... named ...` and up to five similar names; and a count
+`no such repo_id`; `find_callers`, `find_related_files`, `impact_analysis`,
+`get_service_dependencies`, `trace_request_flow`, `explain_decision`,
+`find_requirements_for` and `trace_design_rationale` on a name the graph
+doesn't have, and `blame_component`, `find_related_prs` and `issue_history_for`
+on a file it doesn't have, fail with `no ... named ...` and up to five similar
+names (a name that exists but has no answer, such as a function nothing calls,
+is still `count: 0`); `list_recent_changes` with an unknown `entity_type` fails
+and lists the valid labels; and a count
 argument below its minimum (`max_results`, `within_commits`,
 `modified_within_commits`, `members_per_community`, `max_per_type` below 1,
 `max_length` below 2) fails and names the argument.
+
+If Neo4j is down, every tool fails within a few seconds with `Neo4j isn't
+reachable at <uri>; start Neo4j ...`: tell the user to start Neo4j (or run
+`devgraph doctor`) rather than retrying the call in a loop.
 
 If a tool returns empty/sparse results, check whether the repo has actually
 been scanned (step 1/2) before concluding the graph has nothing to say — an
@@ -388,7 +424,11 @@ Things to know:
   `Module` and a `File` on the same path, or a `main` function in two
   files). The response lists the `candidates`; pick one and call
   `describe_node(**candidate)`. A candidate carries `file` only when it has
-  one (a `Module` doesn't), so pass the candidate as it is.
+  one (a `Module` doesn't), and then `owner` too: the classes or functions
+  it is declared in, `""` at the top level, which tells a top-level `save`,
+  `A.save` and `B.save` of one file apart. Pass the candidate as it is. A
+  method can also be named with its class: `describe_node(name="A.save")`
+  or `"A::save"`.
 - A name that matches nothing is an error that names the repository it
   searched and suggests up to five nodes whose name or path contains it
   (partial-name matches, not fuzzy ones).

@@ -154,8 +154,8 @@ def test_an_ambiguous_name_returns_candidates_not_one_at_random(two_helpers):
     assert result["source"] is None
     assert result["count"] == 2 and result["truncated"] is False
     assert result["candidates"] == [
-        {"label": "Function", "name": "helper", "file": "a.py"},
-        {"label": "Function", "name": "helper", "file": "b.py"},
+        {"label": "Function", "name": "helper", "file": "a.py", "owner": ""},
+        {"label": "Function", "name": "helper", "file": "b.py", "owner": ""},
     ]
 
 

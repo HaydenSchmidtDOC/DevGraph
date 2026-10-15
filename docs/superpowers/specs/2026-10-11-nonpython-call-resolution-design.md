@@ -54,22 +54,83 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   configuration file the walk finds (for TS: `baseUrl`, `paths`, `extends`,
   `references`, with every config those reach, whatever its name; for Go:
   each go.mod's `module` line and each go.work; for Rust: each Cargo.toml's
-  library crate name and root file; a compiler flag, a `require` bump or a
-  dependency or version change never counts), stored on the Repository node
-  (`resolver_config`) with the list of paths it looked at, found or not.
+  library crate name and root file; for C#: see below; a compiler flag, a
+  `require` bump or a dependency or version change never counts), stored on
+  the Repository node (`resolver_config`) with the list of paths it looked
+  at, found or not.
 - **Triggers.** A live batch (`RepoSync.on_changes`) that changes or deletes a
-  path on that list, a directory holding one, or a path named like a
-  configuration file recomputes the fingerprint; `catch_up` recomputes it after
+  path on that list, a directory holding one, a path named like a
+  configuration file, or a .cs file whose head now holds a `global using`
+  recomputes the fingerprint; `catch_up` recomputes it after
   its walk. When it differs, every graph file of that language is re-indexed in
   one more batch, and the new fingerprint is stored only once that batch
   succeeds (never after a batch cut short by shutdown). `full_scan` takes it
   before reading any file and stores it at the end
   (`dispatch.sync_resolver_config`).
+- **Python** (index format 16). Each `pyproject.toml`'s declared source
+  roots apply to the Python files at or under its directory, and each
+  directory named `src` holding a Python file beside a `pyproject.toml`,
+  `setup.py` or `setup.cfg` to the files under its parent
+  (`ResolverConfig.python_roots`; see the Roots bullet of
+  2026-10-10-python-call-resolution-design.md). The inputs are the
+  project files and those `src` directories, the digest each
+  pyproject's roots, and a batch extracts Python under the inputs its
+  fingerprint found.
 - **Go.** The Go fingerprint covers each go.mod's `module` line and the
   local `replace` directives (`=> ../shared`) of every go.mod and go.work. A
   batch extracts Go files under the go.mod and go.work paths its fingerprint
   found (the graph's, or the newer one `sync_resolver_config` re-indexes
   under), so no batch walks the repository for them.
+- **C#** (`csharp_projects`, `ResolverConfig.cs_project`). A .cs file
+  belongs to the project of the nearest directory at or above it holding a
+  `.csproj` (several there are one project, their items unioned); a file
+  with none above it has no project and no configuration. A project's
+  configuration is its `<Using>` items (`Include`, `Remove`, `Static`,
+  `Alias`, as attributes or child elements), applied in order after the
+  nearest Directory.Build.props and before the nearest
+  Directory.Build.targets, and the `global using` directives in the heads of
+  its own .cs files (not a nested project's), whatever the file is called.
+  A project's references are the projects named by the
+  `<ProjectReference Include>` paths of its `.csproj` files and of its
+  nearest Directory.Build.props/.targets, each read relative to the
+  project's own directory as MSBuild reads an imported file's relative
+  paths (`\` as `/`, `%XX` escapes decoded), closed transitively
+  (`CsProject.references`; a cycle ends where it comes back, and a path
+  naming no `.csproj` of the repository, missing, ignored, absolute,
+  drive-qualified or outside it, reaches nothing until one is there). On
+  a case-insensitive platform (Windows, macOS: `gitignore.IGNORECASE`)
+  paths are compared case-folded, so `..\core\core.csproj` names
+  `Core/Core.csproj`. Nothing is evaluated: an `<Import>` is not
+  followed, an item under a `Condition` counts as if the condition held,
+  and a name or path holding `$(`, `@(`, `%(` or a wildcard (`*`, `?`) is
+  left out (a `$(MSBuildThisFileDirectory)` reference too). `ImplicitUsings` (only `System.*` and
+  `Microsoft.*`) and `RootNamespace` are not read.
+  A file's *head* is read from its start, at most its first 32 KiB, for as
+  long as it holds only whitespace, comments, preprocessor lines (`#if`,
+  `#region`, `#nullable`, ...), `extern alias` and using directives, global
+  or not, `using unsafe P = int*;` included (the compiler allows a `global
+  using` nowhere else); a directive
+  under an `#if` counts whatever the condition, and anything else ends the
+  head (an attribute, a namespace, a type, a top-level `using var`, a
+  directive with a comment inside). The fingerprint's inputs are every
+  `.csproj` and Directory.Build file and every .cs file of a project whose
+  head holds a `global using`; the digest is each project file's `<Using>`
+  items and each such file's `global using`s, so a package bump changes
+  nothing; each `.csproj`'s `<ProjectReference>` paths count too, so adding
+  or removing one re-indexes every C# file. A live batch reads a changed .cs file's head only when a stored
+  `.csproj` is at or above it: a file of no project cannot change the
+  digest, and the `.csproj` that would make it one is a change itself.
+  Every catch-up and full scan reads every .cs file's head (about 45 ms for
+  500 files, 5.5 MB; no cache). A batch extracts C# under the inputs its
+  fingerprint found. A configuration change re-indexes every C# file. The
+  C# resolver reads a file's project's `<Using>` items and `global using`s
+  as usings of the file (see the C# section); the legacy
+  `csharp/extractor.py` indexing entry point reads the repository's
+  projects too, and `symbols.EXTRACTORS` needs none (it keeps nodes only,
+  whose match keys come from the file's text). `ImplicitUsings` stays
+  unread: it adds only `System.*` and `Microsoft.*` namespaces, which hold
+  no repository type (if it is ever read, it is one more `<PropertyGroup>`
+  input of the digest).
 
 Fresh is then extract(text, configuration), and an incremental run re-extracts
 every dependent when the configuration changes.
@@ -99,9 +160,40 @@ agree):
   language, and `pkg/.` would also match the `.md` beside the Go files), `^`
   (no directory of the matched file's source root, the path before what the
   pin matches, is a vendored one such as `third_party` or `vendor`; `^t`
-  nor is that root a conventional test root) and `!_test.go` (the matched file must not end
-  with it). The kind is read after the flags are stripped; a resolver never
-  writes a path pin whose own path holds a flag character.
+  nor is that root a conventional test root), `!_test.go` (the matched file must not end
+  with it) and `@Shop:User,.:User` (the matched node's `mkeys`, its match
+  keys, must hold one of these; each key holds a `:`, so a name starting
+  with `@`, such as an npm scope, is no flag). The kind is read after the
+  flags are stripped; a resolver never writes a path pin whose own path
+  holds a flag character.
+- **Match keys** (`@`, for C# namespaces; see the C# section) are written
+  canonically, sorted and without repeats, by `schema.scoped_pin`, which
+  drops the flag when there are more than 32: the site then links by its
+  path alone. The keys may come in tiers, nearest first, separated by `;`
+  (`schema.tiered_pin`): a node is then linked only when no node of its
+  name the pin's path matches holds a key of a nearer tier than its own
+  (C# shadow tiers, see the C# section). A Class or Function that carries `mkeys` always carries them,
+  sorted, even when empty; a node without them (any other language, or a
+  graph written before them) matches no `@` pin and every other one. The
+  Cypher reads them as `coalesce(n.mkeys, [])`, and an `@` flag with no
+  keys does not exist. A node keeps its identity, `(name, file)`, when its
+  keys change, so the edges `@` pins gave it would go stale. A batch's
+  pass-1 node writes leave the keys as they were; after pass 1,
+  `engine.write_match_keys` writes every changed node's keys (removing them from one written
+  without any), a few hundred nodes per transaction, before pass 2 tests
+  them. A kept node whose keys match differently (no keys and none, `[]`,
+  match alike) loses its incoming `CALLS` and `IMPORTS` edges (the types a
+  resolver writes `@` pins on, whatever pin or bare name wrote them) in
+  the same transaction and is marked `mkeys_stale`. Pass 2 writes the
+  batch's edges again, and the relink writes other files' again under the
+  new keys, as for an added node; then the mark goes. A batch that fails
+  in between leaves the mark, so running it again (or any batch holding
+  the node's file) retracts and relinks the node again: its new keys alone
+  would no longer tell. Such a node is not added otherwise (no referrer,
+  docs edge or mention depends on its keys), and its `MODIFIES` and
+  `MENTIONS` edges stay. A batch file whose extraction fails loses its
+  edges into such a node until it is indexed again, as it loses its other
+  edges.
 - **Confidence is the pin kind's**, so it never depends on which other pins a
   row was written with. Precedence runs down the table: each row's pin leaves
   out every file a higher-precedence pin of the same call (the same caller and
@@ -127,7 +219,13 @@ agree):
   inside a method `m` never links the method to itself. A collapsed row has it
   only when every one of its call sites had it.
 
-`name_refs` keeps its format (pins are strings). A pinned entry no longer
+`name_refs` keeps its format (pins are strings), with one field more for
+an entry whose pins carry match keys: they are stored once, after the
+confidence, each such pin keeping only its `@`. One call's pins with
+different keys (`a.Save()` and `b.Save()` on receivers of two types) are
+entries of their own, one per key set, and relink takes the pinned
+entries of one source and name together again, so each pin still leaves
+out what a stronger one matches. A pinned entry no longer
 stores one confidence for all its pins: its confidence field is `pin` when its
 edges carry one, and relink gives each pin its kind's (`common.best_pin`
 picks the strongest pin matching the added file, as the writer's `exclude`
@@ -179,6 +277,24 @@ Tiers, first match wins:
 
 A parameter shadows an import of its name, as in Python. Calls inside an
 anonymous function (a callback, an IIFE) are still not attributed to anyone.
+
+**JSX** (index format 16, audit 5 item 4). An opening or self-closing JSX
+element whose tag is a capitalised identifier (`<Button />`) or a member
+expression (`<Ui.Button>`) renders that component: a call site of its
+name, in `.jsx`, `.tsx` and `.js` files alike, resolved by the tiers above
+(the file's own, an import with a barrel's prefix, a namespace member). A
+tag nothing resolves (a parameter `<Slot />`, an external package's
+`<Link />`, `<this.Foo />`) links nothing: no bare-name row. An intrinsic
+tag (`<div>`, `<svg:rect>`) and a fragment are no calls. Limits: an
+element inside an anonymous arrow (`items.map(i => <Row />)`, an inline
+render prop, a `useCallback` body) is attributed to no one, as calls there
+are not, so a list's row component has no caller; a class component
+(`class Modal extends React.Component`) is a Class, which no `CALLS` row
+reaches, so rendering one adds no edge (its methods' own calls are kept);
+a component made by a call (`React.memo(...)`, `forwardRef(...)`,
+`styled.div`) has no Function node, so its renders link nothing. The ts fixture's two renders link (precision unchanged at
+100 %), and a React fixture (`tests/fixtures/callgraph/react`) goes from
+2 of 16 calls to 16 of 16, linked precision 100 %.
 
 ## Kotlin parse recovery (`devgraph/indexer/kotlin/extractor.py`)
 
@@ -322,6 +438,25 @@ files, as in Java. Calls, first match wins:
    directory pins, package confidence).
 5. Anything else: a bare-name row off its caller, unless stoplisted.
 
+**Companion objects** (index format 16, audit 5 item 5). A `companion
+object` is a Class owned by its class; an anonymous one is named
+`Companion`, Kotlin's own name for it (`Repo.Companion` in Kotlin and
+Java code), so its members are owned by `Repo.Companion`, as a named
+companion's are by `Repo.Factory`. They used to be dropped with the
+anonymous companion. `Repo.create()` on a class declared in the file
+reaches a member of its companion when the class itself has none of the
+name (an owned pin to `Repo.Companion`), and so does a bare `create()`
+inside Repo when neither Repo nor a base declared in the file has one (an
+inherited member comes first, as in Kotlin); inside the companion a bare
+call or `this.m()` reaches its own members, then its bases', and its
+typed properties type their receivers; from another file it reaches
+Repo's files like any member of Repo (tier 4). Companions are keyed by
+their members' owner, so two classes' anonymous companions in one file
+stay apart. A companion's Class node carries `kind: companion`, and
+`get_source` and `describe_node` take `Repo.create` (or `owner="Repo"`)
+for a member of Repo's companion, anonymous or named, when Repo has none
+of the name.
+
 ## Rust (`devgraph/indexer/rust/extractor.py`)
 
 **Crates and modules.** A configured library's root file (its `[lib] path`
@@ -365,7 +500,8 @@ name give no edge, and a `use` of an inline module of the file none.
    `shop_core::f()`, `Type::f()`: the module's files, and the recursive
    prefix of its directory (package: an item re-exported from a submodule).
    `Type::f()` on a type declared in the file, and `Self::f()`, is this
-   file. A path through std or an external crate links nothing, nor does a
+   file. An item the module re-exports (below) also names the module
+  defining it. A path through std or an external crate links nothing, nor does a
    library type's (`Vec::new()`, `HashMap::new()`, `String::from()`:
    `STOP_TYPES["rust"]`), nor a bare `f()` nothing declares or imports (a
    glob import's modules excepted).
@@ -378,6 +514,46 @@ name give no edge, and a `use` of an inline module of the file none.
 4. Anything else: a bare-name row off its caller, unless the method is in
    `STOP_METHODS["rust"]`.
 
+**Re-exports** (index format 16, audit 5 item 6). A `lib.rs` facade (`pub
+use net::client::Client;`) is the usual shape of a Rust library, and its
+callers name the item through the crate root (`shop_core::Client::new`),
+which pinned only `lib.rs`. Each file's top-level `pub use` (any `pub`
+visibility; `rust.extractor.reexports`) is resolver configuration: the
+fingerprint's inputs are the Cargo.toml files and every `.rs` file holding
+one, its digest each file's re-exports, so a function added beside them
+changes nothing and a re-export added, removed or retargeted re-indexes
+every Rust file (a live batch reads a changed `.rs` file for a `pub use`,
+as a `.cs` file's head for a `global using`). A re-export's path is read in
+its own file: a module it declares (`mod net;`) is `self::net`, a name a
+top-level `use` binds is that use's path. An item `X` reached through
+module M (a path, a `use` binding, a typed receiver's type, a glob import's
+module) is pinned to M's files and, when a file of M re-exports `X` (`pub
+use a::X;`, `pub use a::Y as X;`, or a glob `pub use a::*;` unless the
+file also re-exports `X` by name, Rust's shadowing rule), to the module
+it names too, and on through that module's own re-exports (at most nine
+hops; a cycle ends): every module on the way stays a possible definer
+(`a` may define `X` beside its own glob). What a glob reaches is linked
+at package confidence: its module's files as suffix pins of their whole
+paths (`/a/util.rs`, which `a/my_util.rs` does not match) and its
+directory's recursive prefix
+(`a/util/`, so anything under it of the name), each leaving out the
+re-exporting module's own files, which stay resolved. An associated call
+through a re-exported type (`shop_core::Client::new()`) names the type as
+the owner of every module the re-exports reach, so `net/mod.rs`, which
+only passes `Client` on, links its own `Pool::new` no more than
+`client.rs` does; a method on a value of that type (`c.fetch()`) is not
+narrowed by owner (a trait's default method is owned by the trait), so a
+module on the way that defines a same-named function of another type
+links it too. An item M itself
+defines hides a glob's in Rust, and M's text is not the caller's: this
+way a function added to M is no configuration change, and the glob's
+module only ranks below it. A function re-exported under another name (`pub use
+a::fetch as get;`) is called by its own name: `shop_core::get()` is a
+`CALLS` row to `fetch`, as is `get()` after a private `use a::fetch as
+get;` (whose row used to name `get`, which no function is). A `use` of a re-exported item also imports the
+defining module's file. An inline module's `pub use`, and a re-exported
+module (`pub use a::b;` then `crate::b::f()`), are not followed.
+
 The arguments of a macro invocation (`println!("{}", shop_core::version())`,
 `assert_eq!(user.total(), 500)`) are reparsed as a call's arguments, so the
 calls in them are found; the macro itself (`format!`) is no call. A method
@@ -389,52 +565,271 @@ declared in the file, and links the type's module otherwise.
 
 A C# file's text says which namespaces it uses, not which files hold them:
 nothing ties a namespace to a folder, nor (beyond convention, SA1649) a
-class to a file named after it. Where another file's type `T` lives is
-therefore its class file by suffix, `/T.cs^` (no vendored copy), at package
-confidence: two namespaces can each hold a `User.cs`, and only an index of
-every file's namespace could tell them apart, which would make an edge
-depend on the target file's text (a namespace edit keeps the target's nodes,
-so edges into it would go stale). The design's partial-class rule (a
-suffix-directory pin to the class's folder) is dropped; a method of
-another part of a partial class keeps a bare-name row.
+class to a file named after it. Each declaration therefore carries its
+namespace as *match keys* (`mkeys`, see Engine: path pins), and a reference
+to another file's type `T` is one pin to any C# file, `/.?.cs^`, limited
+with `@` to the nodes holding a key the reference can mean, at package
+confidence, and to the projects the writer's project sees (see Project
+visibility). The keys come from the target's own text,
+so a namespace edit keeps the target's nodes and only changes their keys:
+the engine retracts and relinks the edges into them.
 
-**Calls**, first match wins:
+**Match keys** (target side). A class `Ns:Name` (`.` for the global
+namespace; a nested class `Ns:Outer.Inner`); a method or constructor
+`Ns:Owner`, and an extension method also `Ns:+T`, `T` the simple name of
+its `this` parameter's type. `Ns` is the file's block namespaces joined
+(`namespace A { namespace B.C` is `A.B.C`) or its file-scoped one. Every
+part of a partial class has the same key (the compiler puts all parts in
+one namespace). A file's same-named declarations (overloads, a method
+name in two classes, one class name in two namespaces) are one node: its
+keys are their union. `mkeys` is always written on a C# Class and Function,
+sorted, even empty, and never derived from the configuration.
+
+**Candidate namespaces per site** (the writer's text and its project): the
+enclosing namespaces, innermost first, then their parents, then `.`; the
+usings of the enclosing namespace blocks and of the compilation unit; the
+project's `<Using>` items and the `global using`s of its files (resolver
+configuration). A using inside a namespace block (or after a file-scoped
+namespace) is also read relative to each enclosing namespace
+(`namespace Contoso.Web { using Services; }`: `Services`,
+`Contoso.Web.Services`, `Contoso.Services`), and its aliases are that
+block's alone; `using global::A.B;` stays absolute. `System`, `Microsoft`
+and the namespaces under them are left out, the framework's in a typical
+repository and most of a typical file's usings, unless the site's own
+namespace is under the same root (the framework's own repositories:
+`Microsoft.AspNetCore.Http` using `Microsoft.AspNetCore.Routing` keeps it);
+this applies to the project's `<Using>` items and `global using`s alike.
+A type `T` written unqualified at the site is `Ns:T` for each
+candidate, `Ns:Outer.T` for each enclosing class `Outer`, or an alias's
+target alone. A dotted name (an alias's target, a `using static` type, a
+qualified `A.B.T`) is keyed at every split, since a type can be nested:
+`A.B:T`, `A:B.T`, `.:A.B.T`; a qualified name's splits also under each
+enclosing namespace `P` (`P.A.B:T`, `P.A:B.T`), and `Ns:A.B.T` for each
+candidate (`A` a type there); `global::A.B.T`, and a call `global::T.M()`,
+only at the global namespace.
+A verbatim identifier's `@` is left out of every key.
+
+**Pins.** A site writes at most two `@` pins: its types' keys and, for a
+typed receiver, their extension methods' `Ns:+T`, each capped at 32 keys
+(`schema.MAX_SCOPE_KEYS`) on its own. A group over the cap falls back to
+the class files the resolver pinned before match keys, `/T.cs^` and
+`/TExtensions.cs^`, so a site never links worse than before; its
+extension `IMPORTS` are then left out.
+
+**Calls**, first match wins (each pin's keys the union of what the tier
+found):
 
 1. An unqualified `M()`, `this.M()`, `base.M()`: this file when an
    enclosing class declared here, innermost first, or an in-file base has
-   M; else its other bases' class files; else a `using static` type's
-   class file. A local function or a delegate variable links nothing.
-2. `T.M()` on a type (an alias's target, the last name of a qualified
-   `A.B.T.M()`) and a typed receiver (a parameter, a field or property of
-   the enclosing classes, `T x`, `var x = new T()`, `new T().M()`, a
-   `foreach` element of a `List<T>` or array): this file when T is declared
-   here and has M; else `/T.cs^`, and for a receiver also
-   `/TExtensions.cs^`, the conventional class of T's extension methods. A
-   library type (`STOP_TYPES["csharp"]`: `Console`, `List`, `Math`, ...) or
-   a predefined one (`string.IsNullOrEmpty`) links nothing.
+   M; else the keys of its out-of-file bases, of the class itself when it
+   is partial (another part, in another file, has M), and, for an
+   unqualified `M()`, of the `using static` types. A local function
+   (declared anywhere in the method) or a delegate variable links nothing.
+2. `T.M()` on a type (an alias's target, a qualified `A.B.T.M()`) and a
+   typed receiver (a parameter, a field or property of the enclosing
+   classes, `T x`, `var x = new T()`, `new T().M()`, a `foreach` element
+   of a `List<T>` or array; a generic `Svc<int>.M()` by `Svc`): this file
+   when T is declared here and has M
+   (else, for a class declared here, tier 1's keys for it); else T's keys,
+   and for a receiver also `Ns:+T` for each candidate namespace (the
+   extension methods in scope). A library type (`STOP_TYPES["csharp"]`:
+   `Console`, `List`, `Math`, ..., also as the leftmost qualifier such as
+   `DateTime.UtcNow`, not `Contoso.Directory.UserStore`) or a predefined one (`string.IsNullOrEmpty`) links
+   nothing.
 3. Anything else, `dynamic` and `x?.M()` included: a bare-name row, off its
    caller for a member call, none for a stoplisted method.
 
 **`IMPORTS`** are the classes a file references: an edge to the Class `T`
 for each type it writes (a base, a field, property, parameter, local or
 return type, `new T()`, a cast, `typeof`, a generic argument, a static
-receiver, an alias's target, a `using static` type it calls through),
-declared in any C# file (the suffix-directory pin `/.?.cs^`, package), not
-in this file, and no library type, as Kotlin's imports name symbols. A
-partial class's every part and a class in a file named otherwise are
-reached; a `using` of a namespace, the bare dotted name and the old
-`A/B.cs` folder guess are gone. An extension method's class, which the
-caller never names, is not imported.
+receiver, an alias's target, a `using static` type it calls through), under
+the keys the reference can mean, not declared in this file, and no library
+type. A partial class's every part and a class in a file named otherwise
+are reached; a `using` of a namespace imports nothing. A typed receiver's
+call `x.M()` also imports the Function `M` under the `Ns:+T` keys alone
+(the file depends on an extension class it never names), unless the file
+declares an `M` itself.
 
-**Limits, and a follow-up.** Two classes of one name in different
-namespaces both get every call and import of the name (the caller's
-`using`s and enclosing namespace cannot pick one by path), and a call into a
-class declared in a file not named after it (`UserMapper` in `Mappers.cs`)
-links nothing. Both need a mechanism that knows each file's namespace and
-classes, read from the project (`.csproj` files and the declarations of
-every C# file) and kept current as the target files change, so that an edge
-stays a function of the configuration and the target's existence; that is
-a follow-up, not part of slice C.
+**Limits.** Two visible `Ns.T` (one compilation's error CS0433, or a
+project's own type beside a referenced one, which C# prefers with warning
+CS0436) both link. A key group over the cap links by class file
+name, as before match keys, and is not tiered (see Shadow tiers).
+`ImplicitUsings` is not read. An extension method is keyed by its `this`
+parameter's type's simple name (`Ns:+T`), or by a type parameter's first
+constraint naming a type (`this T x where T : class, IRepo`: `+IRepo`); a
+receiver typed with a class implementing that interface (`Repo r;
+r.Touch()`) looks for `+Repo` and misses it, and a type parameter
+constrained by no type (`class`, `struct`, `new()`) keeps `+T`.
+
+### Shadow tiers (index format 14)
+
+C# finds a simple type name by tiers, and the first tier holding the name
+hides every farther one: the types nested in the enclosing classes
+(innermost first), then, for each enclosing namespace innermost first, the
+namespace's own types and then the usings of the namespace declaration
+for it in this file, and last the global namespace's types and then the
+compilation unit's usings (with the project's `<Using>` items and `global
+using`s, which act as the compilation unit's). `UserService` in
+`Shop.Domain.Services` with `using Legacy.Accounts` means `Shop.Domain.User`
+whenever that type exists, and `Legacy.Accounts.User` only when it does
+not. Stage 1 wrote a site's candidate keys as one union, so it linked both.
+
+**Encoding.** An `@` flag's keys are written in tiers, nearest first,
+separated by `;` (`@Shop.Domain.Services:User;Shop.Domain:User;Shop:User;.:User;Legacy.Accounts:User`):
+each key once, in its nearest tier, sorted within it, empty tiers
+dropped, so a pin is canonical (`schema.tiered_pin`; `scoped_pin` is the
+one-tier case and writes what Stage 1 wrote). The 32-key cap counts the
+keys of every tier. `split_pin` gives `scope` (every key, sorted, as before)
+and `ranks` (each key's tier; empty for one tier), and `pin_value` sends
+`sr` beside `sc`.
+
+**Matching.** A tiered pin links a node when the pin matches it as before
+(its path and flags, and one of its keys) and no node of its label and
+name that the pin's path and flags match (keys and the row's exclusions
+aside) holds a key of a nearer tier than the node's own nearest
+(`common.shadowed`; the engine's `NOT EXISTS` in `_end_match`, which the
+randomized Python-vs-Cypher test covers). Equal nearest tiers link alike,
+as an ambiguity in C# is an error the graph still shows. Rows with a tiered
+pin are grouped apart (`_group_rels_by_triple`), so no other row's Cypher
+tests it, and a node of the nearest tier a row reaches skips the
+subquery.
+
+The shadow is tested on the callee itself, not on the type: `user.Display()`
+is shadowed by a `Display` keyed `Shop.Domain:User`, so a nearer `User`
+without `Display` (whose `Display` an unread base declares) leaves the
+farther `User`'s linked, as Stage 1 did. Testing the type would need a
+second name per row and a relink keyed by it; the callee is what the
+relink already looks up by.
+
+**What is tiered.** One type lookup: an unqualified type name (a typed
+receiver, a static `T.M()`, an `IMPORTS` of a referenced type, a class's
+base), its keys in the tiers above; a qualified `A.B.T` the same way, by
+the namespace each enclosing level reads `A` in (`N.A.B:T`, `N.A:B.T`,
+`N:A.B.T` at level `N`, `U:A.B.T` for its usings `U`, the splits at the
+global level); and a receiver's extension keys `Ns:+T`, one tier per
+enclosing namespace with its usings (C# looks for extension methods per
+namespace declaration, its own namespace and its usings together). A
+using alias for the name (or for a qualified name's first part) belongs
+to its declaration's level: after that level's namespace's own types, in
+place of its using-namespace imports, its target split at each dot as one
+tier, and the lookup ends there (C# resolves an alias before a using's
+types, and nothing farther is reached). `global::A.B.T` and a `using
+static` type are one tier. A
+pin that unions several lookups (a class's several bases, a partial
+class's own keys with a base's, several `using static` types) is one tier:
+one type's nearer candidate must not hide another type's. A key group
+over the cap falls back to its class file pins, un-tiered, as before.
+
+**Keeping incremental equal to a fresh scan.** A tiered row's edges
+depend on every node of its target's name, not only on the one it links,
+so three things change:
+
+- *Pass 1 writes no tiered row.* Between the batch's files the graph is
+  half old: a node a later file adds, removes or rekeys would decide the
+  shadow, and pass 2 only adds edges. Pass 2 writes them once every node
+  and match key of the batch is final.
+- *A tiered group is recorded whole.* A group is one source's rows to one
+  name, the set `call_rows` collapses; its `name_refs` entries keep every
+  pin, its own file's included (which `name_ref_properties` otherwise
+  leaves out), so the group can be written again from the graph alone.
+- *Changed names re-run their tiered groups.* For each label and name with
+  a node the batch adds, removes (`previous_nodes - batch_nodes`) or rekeys,
+  each tiered group outside the batch to that name one of whose pins holds
+  one of those nodes' keys, old or new, is re-run after pass 2, 200 groups
+  per transaction (`engine.rerun_edges`): a node holding none of a pin's
+  keys neither links nor shadows under it, so the other groups cannot
+  change, and a node without keys (any language but C#) touches none.
+  Re-running a group means its edges (from its source, of
+  its type, to that name, written by its file) lose that file from their
+  `origins`, and its rows are written again exactly as the writer's. This
+  covers both directions: a nearer node added retracts the farther edges,
+  one removed or rekeyed away restores them, and a move between namespaces
+  or files is both. `remove_paths` lists the deleted files' nodes first and
+  re-runs their names' groups after deleting, only when a deleted file is
+  a `.cs` file (no other language writes match keys). A tiered group never takes
+  the additive relink (`best_pin` on the added node alone), which would
+  link a shadowed node. Other groups keep it.
+
+As with the additive relink, a batch that fails between pass 1 and the
+re-run leaves the outside groups as they were until their files are
+indexed again or a full scan runs (a rekeyed node, marked `mkeys_stale`,
+is re-run by the next batch holding it).
+
+**Cost.** Each matched node of a farther tier tests the name's nodes once
+through the `(repo_id, name)` index; a nearest-tier match does not. The
+nearer keys are computed once per matched node (`WITH`), and the test is
+`size(nearer) = 0 OR NOT EXISTS {...}`, which Neo4j plans as a
+select-or-anti-semi-apply seeking the index; a first cut wrapping the
+`NOT EXISTS` in a `CASE` was evaluated as an expression scanning every
+node of the label, and made the 10-project synthetic scan 5x slower. A
+touched name re-runs those of its tiered callers outside the batch whose
+keys it holds, a retraction and a write per group, where the additive
+relink wrote one edge. A batch of another language costs nothing more:
+its nodes have no keys, so it looks up no `name_refs` for them.
+
+### Project visibility (index format 15)
+
+Stage 2 of the namespace design (ruling N1): two projects of one
+repository can declare the same namespace and type, and a site sees only
+its own project's and those its project references, transitively.
+
+**Node side.** A C# Class and Function carry `proj`, their project's
+directory (`CsProject.dir`; "." for a project at the repository root, so
+it is never ""), or "" for a file of no project. It comes from the
+configuration, never the text, and is written beside the node's match
+keys after pass 1 (`engine.write_match_keys`): a kept node whose `proj`
+changes is retracted, stale-marked and relinked exactly as one whose
+keys change, and the shadow tiers of its name re-run for its keys. Only a
+`.csproj` added, deleted or moved changes a node's `proj`, and that is a
+configuration change re-indexing every C# file anyway; a .cs file moving
+between projects is a new path, so its nodes are added and removed.
+
+**Row side.** Every path-pinned `CALLS` and `IMPORTS` row of a file in a
+project carries `visible`, its project's and its references' `proj`s,
+sorted (`GraphRelationship.visible`); other edge types carry none. The engine sends it once per row
+(`vis`, beside `targets`), not per pin, and a path-pinned end of a Class
+or Function keeps a node only when `row.vis IS NULL OR coalesce(n.proj,
+'') = '' OR n.proj IN row.vis` (`_visible`; `common.visible_to` is its
+Python mirror, which the randomized shadow test checks against the
+Cypher). A file of no project writes no `visible` and sees every node; a
+node of no project, or of another language, is seen by every row. A row
+pinned to a file (the writer's own) or by bare name is not limited.
+Like a tiered row, such a row waits for pass 2, when every node's `proj`
+is final.
+
+**Limits.** What MSBuild would make of a reference beyond its path is not
+read: `PrivateAssets="all"` and `DisableTransitiveProjectReferences`
+(which stop a reference flowing on to the referencing project's own
+referrers) are ignored, so the closure can be wider than the compiler's;
+a `<ProjectReference Remove>` or `Update` is not applied (only `Include`
+items count); and a project's default compile globs are not applied, so
+a .cs file belongs to its nearest `.csproj` even where a parent project
+would also compile it (`EnableDefaultCompileItems`, explicit `<Compile>`
+items and nested-project exclusions unread; ruling N2). A route's
+`IMPLEMENTS` rows are not limited, only `CALLS` and `IMPORTS`, the edges
+a changed `proj` retracts.
+
+**Shadow tiers.** A nearer tier's node shadows only when it is visible to
+the row: the `NOT EXISTS` of `_shadow_free` tests `shadow` with
+`_visible` too, so an unreferenced project's nearer `User` neither links
+nor hides the referenced farther one.
+
+**Relink.** The visible set is stored once per file, as the Module's
+`name_ref_visible` (`name_ref_properties`), not in each `name_refs`
+entry, so entries are unchanged in size. `find_name_refs` returns it
+with the entries; the additive relink tests an added or rekeyed node's
+`proj` against it before linking through a path pin, and a tiered
+group's re-run rows carry it as `visible`.
+
+**Incremental equals fresh.** A `<ProjectReference>` added or removed,
+and a project added or deleted, change the C# fingerprint, so every C#
+file is re-indexed under the new references (and nodes under their new
+`proj`). A .cs file moving between projects deletes its old nodes and
+adds new ones, relinked from other files' `name_refs` through their
+visible sets, and re-runs the tiered groups its keys meet. The fuzz
+toggles a `<ProjectReference>` (one written with `\`, a cycle through
+two projects) and moves a file declaring a type another project's file
+declares too between projects.
 
 ## C++ (`devgraph/indexer/cpp/extractor.py`)
 
@@ -479,10 +874,169 @@ A function defined once per platform (`now_ms` in `platform_posix.cpp` and
 `platform_win.cpp`, declared in `platform.h`) is reached by neither: its
 sources are not named after the header.
 
+## Audit 4 extractor fixes (index format 11)
+
+Four constructs were dropped or misattributed before any call was resolved:
+
+- **C++ templates.** A `template_declaration` is walked through to the
+  class, struct or function it declares, at file scope, in a namespace and
+  as a member template (the class table reads member templates too). An
+  out-of-class member of a class template names the template
+  (`template<class T> void Stack<T>::push()` belongs to `Stack`).
+- **Java records** are types like classes, with their methods and a compact
+  canonical constructor (`P { ... }`, a constructor named `P`).
+- **TS/TSX class-field arrow functions.** tree-sitter-typescript names a
+  field `name`, tree-sitter-javascript `property`; both are read.
+- **Go methods on a pointer to a generic type** (`func (s *Stack[T]) Push`)
+  belong to `Stack`, like a value receiver, so their `CONTAINS` has a real
+  source and the method table resolves typed calls into them.
+
+The same format keys each Class and Function by its owner within its file
+(2026-10-08-graph-accuracy-design.md, owner identity, O3 for the full
+list), and a resolver that knows the owner of a call's target names it: a
+typed receiver's or `this`/`self` call to a class declared in the file
+links that class's member (Python, JS/TS, Java, Kotlin, C#, Go, Rust; C++
+resolves by function name alone and still links every same-named member of
+the file); across files, an imported top-level function (a Python
+from-import or module attribute, a JS/TS ES named import or namespace
+member, a Go package's function) links the top-level one, never a method
+of its name. A method of another file's class still links every member of
+the name there (a subclass can inherit it from a base of that file), and so
+does a call through a JS/TS default import or `require`. C# narrows by
+owner through its match keys already. The measurement fixtures are
+unchanged by it (M1 to M5 equal; `name_refs` 3 to 8 % larger).
+
+A C++ explicit specialisation is its template's class, a class nested in
+a class body is extracted, and an out-of-class member is owned by its
+qualifier's classes (less the file's namespaces).
+
+## Routes beyond Python (index format 13)
+
+Audit 4, item 9: `Endpoint` nodes came from Python alone, so
+`trace_request_flow` and `explain_architecture` were empty for Express,
+Spring, ASP.NET Core and Go services. Each extractor now finds its
+framework's statically detectable routes and writes them through
+`devgraph/indexer/apis/routes.py` `add_route`, in the shape a FastAPI route
+has:
+
+- An `Endpoint` named `"<METHOD> <path>"` (`*` for every method), with
+  `framework` and `source`, claimed by the file (a shared node, as before:
+  two files routing `GET /x` both claim it).
+- A file-less handler stub `Function` (`type: handler`, `source`), claimed
+  the same way, and `IMPLEMENTS` to it (`to_file` "").
+- `IMPLEMENTS` to the handler. A handler declared in the route's file is
+  pinned to that file and its owner (a Spring or ASP.NET action's class, a
+  top-level JS function's ""), so the file writes both ends. A handler
+  declared elsewhere is pinned where a call to it would go: `call_rows`
+  with `rel_type="IMPLEMENTS"` over the pins the language's call resolver
+  gives the name (an ES named import's candidate files and folder at owner
+  "", a default import's or a typed value's member at any owner, a Go
+  identifier's own file or package directory, a Go `pkg.H` the package's).
+  Such an edge is pinned to another file, so `name_ref_properties` records
+  it and G5 relinks it when a batch adds the handler; nothing else is new
+  for incremental equals fresh. A name nothing resolves keeps only the stub.
+  An inline handler (arrow function, lambda, function literal) has no node:
+  its `Endpoint` implements nothing.
+
+A route on a router or group whose mount its file doesn't show has an
+unknown prefix. Its Endpoint is the file's own, named
+`"<METHOD> ?<path> (<file>)"` (`routes.unmounted_endpoint`), so no two files'
+`GET /` meet in one Endpoint that no request reaches as such, and
+`trace_request_flow` never starts from such a hub (a bare `/` does not
+match it; its full name does). Unknown means: an Express router (a
+`Router()`, a Koa `new Router()`, a name-only `router`/`...Router`) the
+file doesn't mount on its app; a Go receiver of a router package's group
+type (`*gin.RouterGroup`, `gin.IRouter`, `*echo.Group`) or one nothing
+types; an
+ASP.NET builder that is no `WebApplication` (`IEndpointRouteBuilder`
+parameters). A name-only `app`/`fastify`, an `express()`/`Fastify()` app,
+a router package's root constructor or type (`gin.Default()`,
+`*gin.Engine`, `http.NewServeMux()`, `chi.NewRouter()`, `mux.NewRouter()`,
+a gorilla `*mux.Router` or `chi.Router` parameter or struct field,
+`echo.New()`, `fiber.New()`) and a `WebApplication` are roots.
+
+A receiver is followed to its nearest declaration before the call: in
+the same function, then the enclosing ones, then the file's (Go and
+ASP.NET; a same-named group in another function is another group, and in
+Go one declared in a block or function literal that doesn't hold the
+call is not it). A Go receiver declared from another (`v := s.router`)
+is followed to it; an ASP.NET chained receiver
+(`app.MapGroup("/x").MapGet(...)`) is read as its group. Only a router
+package itself (or its major version, `chi/v5`) names routers, never one
+of its subpackages (`fiber/v2/middleware/cache`); a dot import of a
+router package is not read; and a verb-named call on another package
+(`cache.Get("/k", load)`) is no route. An absolute ASP.NET action route
+is one Endpoint whatever the class's `[Route]`s.
+
+Forms read, all with literal paths only (a variable, constant or
+concatenation in a path or prefix skips the route):
+
+| Framework | Forms | Prefix |
+|---|---|---|
+| Express (and Koa-router, Fastify) | `r.get/post/put/delete/patch/options/head/all('/x', ..., h)`, `r.route('/x').get(h)`, Koa's named `r.get('name', '/x', h)`; `r` an app or router the file makes (`express()`, `Router()`, `new Router()`, `Fastify()`, held by a name or a class's `this.router`) or named `app`, `router`, `fastify`, `...Router`; the path starts with "/" and the last argument is the handler | `app.use('/api', r)` in the same file |
+| Spring (Java, Kotlin) | methods of a `@RestController`/`@Controller` class with `@GetMapping`...`@PatchMapping` or `@RequestMapping(method = ...)` (none: `*`), `value`/`path`, arrays | the class's `@RequestMapping` |
+| ASP.NET Core | actions of an `[ApiController]`, `[Route]` or `...Controller` class with `[HttpGet("x")]`... or `[Route("x")]` (`*`), every one of repeated attributes, `[controller]`/`[action]` filled in in any case (`Async` dropped), a template starting with "/" or "~/" absolute; `app.MapGet/MapPost/MapPut/MapDelete/MapPatch("/x", h)`, `h` a method group of the file | each of the class's `[Route]`s; a `MapGroup("/x")` declaration (or assignment) of the same scope |
+| Go (a file importing `net/http` or gin, echo, chi, gorilla/mux, httprouter, fiber) | `Handle`/`HandleFunc` with a Go 1.22 pattern (`"GET /x"`, no method `*`, a host dropped, a subtree's trailing "/" kept), gorilla's chained `.Methods("GET", ...)`, gin/echo `GET`...`Any`, chi/fiber `Get`..., gin `Handle("GET", "/x", h)`, chi `Method("GET", "/x", h)`; `http.HandlerFunc(h)` is `h`; a verb-named call counts only on a router or with a handler that is a function of the file, an imported package's exported name or a typed value's method, and never with a string after the path (`client.Post("/x", "text/plain", b)`, `cache.Get("/k", v)` are no routes) | gin/echo `v := r.Group("/x")`, gorilla `r.PathPrefix("/x").Subrouter()`, chi `r.Route("/x", func(r chi.Router) {...})`, in the same function or an enclosing one |
+
+Not read: Fastify's `route({...})` object form, echo's `Add`, chi
+`Mount`, Koa's `app.use(router.routes())` as a mount, ASP.NET `MapMethods`
+and conventional routing, Spring functional routes (`RouterFunction`),
+Kotlin Ktor. Express, Koa and Fastify routes all carry `framework:
+Express`. A compose change (a `build:` added or moved) leaves the
+Endpoint `CALLS` Service edges as they were until the route files are
+indexed again, as for Python (the graph-accuracy design's out-of-scope
+compose-only batch).
+
+The dispatcher treats these files as it treats a Python file. Their replace
+is a `service_api` one (`engine.SERVICE_API_SUFFIXES`, also checked on
+deletion), so set (c) of the graph-accuracy design unclaims the Endpoint
+edges they wrote. Their extraction's `Endpoint` nodes join the
+owning-service pass (`_endpoint_service_relationships`), so a service's
+Endpoints `CALLS` its compose `Service` as Python's do. Index format 13
+makes an older graph rescan to gain them. The accuracy fuzz adds, removes
+and changes Express and Spring routes and moves their handlers
+(`op_route`, `op_route_change`, `op_route_move`), and
+`tests/indexer/test_routes_live.py` checks `explain_architecture` and
+`trace_request_flow` per framework.
+
+**Cost.** A file's replace used to find the shared nodes it claimed by
+reading every shared node of the repository (`_UNCLAIM_SOURCE_CYPHER`), and
+a route file's set (c) every Endpoint's edges, so a full scan was quadratic
+in the repository's Endpoints and stubs. A code file's Module now records
+the shared nodes its replace claimed (`shared_claims`, hidden and reserved
+like `claims`), and the next replace or delete seeks just those by name; a
+code file with no Module yet claims nothing, and a file with no record (a
+compose file, a Module an older index wrote) still takes the scan. The
+record is read under the Module's write lock (a no-op `SET`), so two
+overlapping writes of one file, from two processes, take turns: the second
+unclaims what the first claimed. A record can still lose a claim (a version
+without the lock, a write cut between claim and record); a full scan heals
+it, rebuilding every code Module's record from the shared nodes' own
+`sources` before it prunes deleted files or writes (`rebuild_claim_records`,
+one read and a write of only the records that differ, so a scan that
+changes nothing locks no Module), and a file's delete reads every claim,
+not its record (deletes are rare).
+Set (c)'s `USES` unclaim runs for Python files only, the only writers of
+`USES`. Python
+route files gain the same. Measured on a synthetic repository of 2,000
+files (400 each of TS, Java, Go, C# and Python, a quarter of the first four
+with routes: 1,600 Endpoints), `full_scan` against the shared local Neo4j:
+
+| | before (format 12) | routes, scan unclaim | routes, recorded claims |
+|---|---|---|---|
+| 2,000 files, no routes in them | 74-75 s | | 75-76 s |
+| 2,000 files, 1,600 Endpoints | 74-75 s (none extracted) | 113-116 s | 89-93 s |
+| 1,000 files, 800 Endpoints (the same files without routes: 41 s) | not run | 52 s | 46 s |
+
+A repository with no routes costs the same. What remains is linear in the
+routes (their Endpoint and stub claims, about 5.5 ms per label per route
+file, and their edges).
+
 ## No reverse dependents
 
 With Go, Java and Kotlin resolved, every code edge is a function of its
-writer's text, its resolver configuration and whether its target exists, so
+writer's text, its resolver configuration and whether its target exists
+(for a C# shadow tier, which nodes of its target's name exist), so
 `index_paths` no longer re-indexes a changed file's importers
 (`_expand_with_reverse_dependents`, which followed Java's `IMPORTS` edges, is
 gone) nor rescans a JVM file's directory for subtypes of a class it added
@@ -824,3 +1378,152 @@ AFTER (`full_scan_s` is one cold run of the script):
 Python on DevGraph is as after slice A (resolved precision, `IMPORTS` and
 `find_callers` recall unchanged; 15 fewer self-loops than before `no_self`).
 
+### Results after C# match keys (index format 10)
+
+Stage 1 of the C# namespace design (`.superpowers/csharp-ns-design.md`):
+match keys and one `/.?.cs^@keys` pin per site, the project's `<Using>`
+items and `global using`s read, no `<ProjectReference>` and no shadow
+tiers. BEFORE is this branch's code before the extractor change.
+
+| csharp fixture | Target | BEFORE | AFTER | |
+|---|---|---|---|---|
+| M1 resolved multi-target | < 2 % | 0 % (1 resolved, 18 package, 4 name) | 0 % (1 resolved, 21 package, 2 name) | met |
+| M2 linked precision | ≥ 98 %, 0 | 89 % (17/19); 0 | 95 % (21/22); 0 | short |
+| M3 `IMPORTS` precision / recall | ≥ 98 % / 95 % | 80 % / 94 % (16/17) | 94 % (17/18) / 100 % (17/17) | short |
+| M4 `CALLS` recall | ≥ 95 % | 90 % (linked 81 %) | 100 % (linked 100 %) | met |
+| M5 named sites | all | 27/31 | 30/31 | short |
+| M6 largest `name_refs` | < 1 MiB | 1,109 B | 4,612 B | met |
+
+- **What is left is shadowing.** `UserService.Register` (namespace
+  `Shop.Domain.Services`, `using Legacy.Accounts`) still links both
+  `User`s' `Display`, and `UserService.cs` imports both `User.cs`: the
+  enclosing namespace's `User` hides the using's in C#, but the pin's keys
+  are a union. Everything else the slice C notes listed is fixed:
+  `UserMapper.Describe` links only Legacy's `Display`, `UserMapper` is
+  found in `Mappers.cs`, the partial `Order`'s `Subtotal`/`Tax` link
+  `Order.Pricing.cs`, the alias `LegacyUser` imports Legacy's `User` alone,
+  and `user.Initials()` imports `UserExtensions.cs`. These match the
+  design's estimates (M2 ~96-97 %, M3 17/18 and 17/17, M5 30/31);
+  `test_measure_fixtures` keeps C# a strict xfail until shadow tiers.
+- **Synthetic multi-project repository** (`measure_call_graph.py
+  --cs-synthetic`, seed 1): N library projects declaring the same class
+  names in their own namespaces, each service calling its own project's
+  types and one other project's `Gateway.Send()`, with realistic usings
+  (ten `global using`s per project, six of them `System`/`Microsoft`; 8 to
+  15 usings per service file); linked `CALLS` against the generator's
+  truth. BEFORE is the code before match keys, FIRST CUT the first match
+  key change (one pin per site, its type and extension keys together,
+  dropping the `@` over 32 keys, `System` usings counted), AFTER this one.
+  A capped row is a key-pinned CALLS row whose group went over 32 keys.
+
+| `--cs-synthetic` | BEFORE | FIRST CUT | AFTER |
+|---|---|---|---|
+| 10 projects: capped rows / key-pinned rows | n/a | 64 % (480 / 745) | 0 % (0 / 1,225) |
+| 10 projects: cross-project wrong links / linked | 88.3 % (6,480 / 7,335) | 83.3 % (4,320 / 5,185) | 0 % (0 / 865) |
+| 10 projects: linked precision, recall; `IMPORTS` P / R | 11.7 %, 98.8 %; 10.2 % / 83.9 % | 16.7 %, 100 %; 100 % / 100 % | 100 %, 100 %; 100 % / 100 % |
+| 50 projects: capped rows / key-pinned rows | n/a | 66 % (2,401 / 3,663) | 0.4 % (25 / 6,087) |
+| 50 projects: cross-project wrong links / linked | 97.7 % (176,400 / 180,637) | 96.5 % (117,625 / 121,912) | 0 % (0 / 4,287) |
+| 50 projects: linked precision, recall; `IMPORTS` P / R | 2.3 %, 98.8 %; 2.0 % / 83.7 % | 3.5 %, 100 %; 100 % / 100 % | 100 %, 100 %; 100 % / 100 % |
+| 50 projects: largest `name_refs` (gate < 1 MiB) | 1,955 B | 8,802 B | 8,802 B (total 0.54 MB to 4.0 MB) |
+| 50 projects: `full_scan` | 92.5 s | 82.1 s | 70.0 s (fewer edges) |
+
+  The 25 capped rows at 50 projects are `Startup.cs`'s: it has a `using`
+  of every project's Api namespace (over 50 candidates), so its
+  `ModuleN.Start()` sites fall back to `/ModuleN.cs^`, which is right
+  here; the first cut linked every project's `Start()` from them (25
+  wrong). With the realistic usings the first cut overflowed two thirds
+  of its keyed rows (a typed receiver counted each namespace twice, and
+  `System` usings counted) and linked any C# file from them, worse than
+  BEFORE's class file pins.
+- **Cost.** The fixture's `full_scan`, BEFORE and AFTER alternating in
+  their own processes (12 scans after two warm-ups each, two series, the
+  shared Neo4j otherwise idle): fastest 0.97 s and 1.03 s (+6 %); the
+  medians are bimodal (about 1.0 s or 1.6 s, the index-wait polling of
+  `provision_repository_schema`) and were 1.03/1.81 s and 1.61/2.37 s, so
+  they settle nothing. A profiled scan of each issues the same queries
+  bar two (the match-key write and its settle) and spends 0.07 s more
+  upserting relationships (the extension `IMPORTS` rows and the `@` test).
+  Extraction alone, 202 synthetic files: 0.22 s to 0.32 s. On the
+  synthetic repositories the scan got faster (see the table: far fewer
+  edges). C# `name_refs` grow about 4x to 7x (the fixture's largest 1.1 KB
+  to 4.6 KB), as each entry stores its keys once.
+
+
+### Results after C# shadow tiers (index format 14)
+
+See the C# section's Shadow tiers. BEFORE is index format 13 (match keys,
+one union per site), AFTER this branch.
+
+| csharp fixture | Target | BEFORE | AFTER | |
+|---|---|---|---|---|
+| M1 resolved multi-target | < 2 % | 0 % | 0 % | met |
+| M2 linked precision | ≥ 98 %, 0 | 95 % (21/22); 0 | 100 %; 0 | met |
+| M3 `IMPORTS` precision / recall | ≥ 98 % / 95 % | 94 % (17/18) / 100 % | 100 % (17/17) / 100 % | met |
+| M4 `CALLS` recall | ≥ 95 % | 100 % (linked 100 %) | 100 % (linked 100 %) | met |
+| M5 named sites | all | 30/31 | 31/31 | met |
+| M6 largest `name_refs` | < 1 MiB | 4,771 B (total 13,192 B) | 4,925 B (total 13,346 B) | met |
+
+- `UserService.Register` now links Shop.Domain's `User.Display` alone and
+  `UserService.cs` imports only Models/User.cs; `test_measure_fixtures`
+  has no C# xfail left. The `name_refs` grow a little where an alias is
+  used (its pin also names the namespaces nearer than its declaration).
+  After the review fixes (reruns limited to the groups a node's keys meet,
+  the alias at its level) the 50-project synthetic scanned in 61.7 s, its
+  links and `name_refs` unchanged.
+- **Synthetic multi-project repository** (`--cs-synthetic`, seed 1):
+  nothing in it shadows, so links are unchanged (precision, recall and
+  `IMPORTS` 100 %, 0 cross-project wrong links at 10 and 50 projects; 25
+  capped rows at 50, Startup.cs's, un-tiered as before). A `;` takes a
+  `,`'s place in a tiered pin, so `name_refs` are byte for byte the same
+  size: largest 7,549 B (10 projects) and 8,970 B (50; total 4.10 MB).
+- **Cost**, BEFORE and AFTER alternating in their own processes on the
+  otherwise idle shared Neo4j: `full_scan` of the 10-project synthetic
+  12.0/11.1 s before, 10.8/10.7 s after; 50 projects 76.9/69.1 s before,
+  63.9/64.4 s after (pass 1 no longer writes the tiered rows that pass 2
+  writes again). The fixture, 12 scans after two warm-ups, two series:
+  fastest 0.92 s before and 0.90 s after, medians 0.97/1.00 s and
+  0.94/0.94 s.
+- Seeds 1 to 12 of the graph-accuracy fuzz (15 steps each, `cs_shadow`
+  among its operations) and a scripted run of that operation equal a
+  fresh scan after every step.
+
+### Results after C# project visibility (index format 15)
+
+See the C# section's Project visibility. BEFORE is index format 14
+(shadow tiers), AFTER this branch, both measured on the generator as
+extended here: `--cs-synthetic` now groups its projects in clusters of
+five that `<ProjectReference>` earlier members of their cluster (one or
+two each, written with `\`, so each reaches the first transitively, and
+no cluster another), the App project references every project, a
+service's cross-project `Gateway.Send()` goes to a project its own
+reaches, and each cluster's first project declares `Co.Shared.Clock`
+(`Co.Shared` a global using of every project), which every service calls:
+the same namespace and type in projects that do not reference each other.
+
+| | BEFORE | AFTER |
+|---|---|---|
+| csharp fixture (App and Tests reference Core) | all targets met; M2 100 %, `IMPORTS` 100 % / 100 %, 31/31 | the same |
+| 10 projects: linked precision (wrong, all cross-project) | 89.1 % (120 / 1,105) | 100 % (0 / 985) |
+| 10 projects: `IMPORTS` precision / recall | 87.8 % / 100 % | 100 % / 100 % |
+| 50 projects: linked precision (wrong, all cross-project) | 47.5 % (5,400 / 10,287) | 100 % (0 / 4,887) |
+| 50 projects: `IMPORTS` precision / recall | 44.3 % / 100 % | 100 % / 100 % |
+| CALLS recall (10 and 50 projects) | 100 % | 100 % |
+| 50 projects: largest / total `name_refs` | 9,027 B / 4.55 MB | the same |
+| 50 projects: largest / total `name_ref_visible` | none | 51 projects, 347 B (App) / 13.8 KB |
+
+- The wrong links BEFORE are every other cluster's `Clock.Now()` and
+  `Clock` import (the namespace and name match; only the project tells
+  them apart). The visible set is stored once per Module, so `name_refs`
+  are byte for byte the same; the largest visible set is the App
+  project's (itself and the 50 it references).
+- **Cost**, BEFORE and AFTER alternating in their own processes on the
+  otherwise idle shared Neo4j: the fixture's `full_scan`, eight scans
+  each after a warm-up, fastest 0.93 s and 0.93 s, medians 0.98 s and
+  0.97 s; the 10-project synthetic 11.2/10.7 s before, 10.8/10.6 s after;
+  50 projects 73.3/80.5 s before, 67.3/68.4 s after (fewer edges to
+  write). Pass 1 no longer writes a project file's path-pinned rows,
+  which pass 2 writes anyway.
+- Seeds 1 to 12 of the graph-accuracy fuzz (15 steps each, with
+  `cs_reference` toggling a `<ProjectReference>`, a cycle included, and
+  `cs_project_move` moving a file whose class another project declares
+  too) and the scripted fuzz runs equal a fresh scan after every step.

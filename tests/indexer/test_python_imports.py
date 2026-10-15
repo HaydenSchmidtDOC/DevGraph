@@ -13,11 +13,13 @@ import pytest
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.python.extractor import extract_python_file
+from devgraph.indexer.resolver_config import ResolverConfig
 from devgraph.indexer.python.resolve import (
     ModuleRef,
     Symbol,
     absolute_module,
     ancestor_roots,
+    import_roots,
     relative_dir,
     relative_module,
 )
@@ -41,6 +43,12 @@ def bindings(source: str, file_path: str):
 def test_ancestor_roots_are_every_directory_above_the_file():
     assert ancestor_roots("main.py") == ("",)
     assert ancestor_roots("x/y/f.py") == ("", "x/", "x/y/")
+
+
+def test_import_roots_are_the_ancestors_then_the_configured_roots():
+    assert import_roots("x/f.py") == ("", "x/")
+    # A repeat is left out, a configured root comes last.
+    assert import_roots("src/f.py", ("lib/", "src/")) == ("", "src/", "lib/")
 
 
 def test_relative_dir_walks_up_one_parent_per_extra_dot():
@@ -97,6 +105,54 @@ def test_a_name_imported_from_a_package_can_live_in_its_init():
 def test_src_layout_resolves_under_the_src_root():
     found = targets("from mylib.core import run\n", "src/mylib/cli.py")
     assert {"src/mylib/core.py", "src/mylib/core/__init__.py"} <= found
+
+
+def test_src_layout_resolves_from_outside_src(tmp_path):
+    """A `src` directory holding Python files beside a Python project file
+    is an import root of the files under its parent: tests/ and scripts/
+    beside src/ reach the package, as a monorepo project's tests reach its
+    own src/ (and no other project's)."""
+    for rel in ("src/pkg/api.py", "packages/foo/src/foo/x.py", "packages/bar/src/bar/y.py", "crates/a/src/lib.rs",
+                "pyproject.toml", "packages/foo/setup.py", "packages/bar/setup.cfg", "crates/a/setup.py"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("")
+    config = ResolverConfig(tmp_path)
+
+    def found(source, file_path):
+        return {r.to_name for r in extract_python_file(source, file_path, "repo", config).relationships}
+
+    assert {"src/pkg/api.py", "src/pkg/api/__init__.py"} <= found("import pkg.api\n", "tests/test_api.py")
+    assert "src/pkg/core.py" in found("from pkg import core\n", "scripts/run.py")
+    test_x = found("import foo.x\n", "packages/foo/tests/test_x.py")
+    assert "packages/foo/src/foo/x.py" in test_x
+    assert not any(t.startswith("packages/bar/src/") for t in test_x)
+    assert config.python_roots("crates/a/build.py") == ("src/",)  # a src/ with no Python is none
+
+
+def test_a_src_directory_beside_no_python_project_is_no_root(tmp_path):
+    """A JavaScript app's stray `src/utils.py` makes src/ no root: only a
+    `src` directory beside a pyproject.toml, setup.py or setup.cfg is one."""
+    for rel in ("package.json", "src/App.tsx", "src/utils.py", "tools/gen.py"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("")
+    config = ResolverConfig(tmp_path)
+    assert config.python_roots("tools/gen.py") == ()
+    found = {r.to_name for r in extract_python_file("import utils\n", "tools/gen.py", "repo", config).relationships}
+    assert "src/utils.py" not in found
+    (tmp_path / "setup.cfg").write_text("[metadata]\nname = app\n")
+    assert ResolverConfig(tmp_path).python_roots("tools/gen.py") == ("src/",)
+
+
+def test_a_pyproject_source_root_is_an_import_root_of_the_files_under_it(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[tool.setuptools]\npackage-dir = {"" = "lib"}\n')
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other/pyproject.toml").write_text('[tool.setuptools.packages.find]\nwhere = ["code"]\n')
+    config = ResolverConfig(tmp_path)
+    found = {r.to_name for r in extract_python_file("import pkg.api\n", "tests/t.py", "repo", config).relationships}
+    assert "lib/pkg/api.py" in found
+    assert "other/code/pkg/api.py" not in found  # another project's root
+    found = {r.to_name for r in extract_python_file("import pkg.api\n", "other/t.py", "repo", config).relationships}
+    assert {"lib/pkg/api.py", "other/code/pkg/api.py"} <= found
 
 
 def test_nested_monorepo_root_resolves():

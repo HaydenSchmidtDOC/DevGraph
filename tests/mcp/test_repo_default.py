@@ -53,8 +53,6 @@ class Engine:
 
 
 DICT_PAYLOAD = {"count": 1, "results": [{"name": "X"}], "truncated": False}
-LIST_PAYLOAD = [{"name": "X"}]
-LIST_TOOLS = {"find_requirements_for", "blame_component"}
 
 MIN_ARGS = {
     "search_component": {"query": "X"},
@@ -92,12 +90,8 @@ REPO_ARG_INDEX = {
 }
 
 
-def payload(name):
-    return LIST_PAYLOAD if name in LIST_TOOLS else DICT_PAYLOAD
-
-
 def structured(name):
-    return {"result": LIST_PAYLOAD} if name in LIST_TOOLS else DICT_PAYLOAD
+    return DICT_PAYLOAD
 
 
 def registered_fn(server, name):
@@ -119,9 +113,7 @@ def calls(monkeypatch):
     for name in MIN_ARGS:
         def recorder(*args, _name=name, **kwargs):
             log.append((_name, args, kwargs))
-            return [dict(r) for r in LIST_PAYLOAD] if _name in LIST_TOOLS else {
-                **DICT_PAYLOAD, "results": [dict(r) for r in DICT_PAYLOAD["results"]]
-            }
+            return {**DICT_PAYLOAD, "results": [dict(r) for r in DICT_PAYLOAD["results"]]}
 
         monkeypatch.setattr(devgraph_tools, name, recorder)
     monkeypatch.setattr(devgraph_tools, "declared_node_labels", lambda registry, repo_id: [])
@@ -275,21 +267,7 @@ def test_omitted_repo_id_uses_the_session_repo(name, tmp_path, calls, make_serve
     assert result.is_error is False
     (_, args, _), = calls
     assert args[REPO_ARG_INDEX[name]] == "demo"
-    if name in LIST_TOOLS:
-        assert result.structured_content == {"result": LIST_PAYLOAD}
-    else:
-        assert result.structured_content == {**DICT_PAYLOAD, "repo_id": "demo", "notices": [ENV_NOTICE]}
-
-
-@pytest.mark.parametrize("name", sorted(LIST_TOOLS))
-def test_defaulted_list_payload_is_unchanged(name, tmp_path, calls, make_server):
-    server = make_server(demo(tmp_path), "env")
-    explicit = call(server, name, {"repo_id": "demo", **MIN_ARGS[name]})
-    defaulted = call(server, name, dict(MIN_ARGS[name]))
-    assert explicit.model_dump_json() == defaulted.model_dump_json()
-    for result in (explicit, defaulted):
-        dumped = result.model_dump_json()
-        assert '"repo_id"' not in dumped and '"notices"' not in dumped
+    assert result.structured_content == {**DICT_PAYLOAD, "repo_id": "demo", "notices": [ENV_NOTICE]}
 
 
 def test_session_repo_still_active_defaults_normally(tmp_path, calls, make_server):

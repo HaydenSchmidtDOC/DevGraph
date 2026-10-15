@@ -1,7 +1,8 @@
 # Call-graph ground-truth fixtures
 
-One small, realistic project per language (`ts`, `go`, `java`, `kotlin`,
-`csharp`, `rust`, `cpp`), each with an `expected.json` that says which calls
+One small, realistic project per language (`ts`, `react`, `go`, `java`,
+`kotlin`, `csharp`, `rust`, `cpp`; `react` is a React app whose JSX renders
+are its calls), each with an `expected.json` that says which calls
 and imports the language itself binds. The truth was written from each
 language's own name-resolution rules (compiler, linker, runtime), not from
 DevGraph's resolver, so it can be used to measure that resolver.
@@ -53,8 +54,8 @@ repository root).
 - `notes`: one explanation per tricky case; `note` fields refer to its keys.
 
 Not listed anywhere: constructor invocations (`new T()`, `T()` in Kotlin,
-struct literals), JSX element usage, function values passed without being
-called, calls inside anonymous lambdas/closures, and module-level code outside
+struct literals), intrinsic JSX tags (`<div>`; a component's tag, `<Button />`,
+renders it and is a call), function values passed without being called, calls inside anonymous lambdas/closures, and module-level code outside
 any function.
 
 ## Using a fixture

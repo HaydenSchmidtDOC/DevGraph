@@ -17,58 +17,64 @@ param(
     [string]$Path = (Join-Path $env:USERPROFILE "devgraph")
 )
 
-$ErrorActionPreference = "Stop"
+# Under `irm ... | iex` this script runs in the caller's own session, where
+# `exit` would close the window (taking any failure message with it) and a
+# script-level $ErrorActionPreference would stay set. So the body runs in its
+# own script block and stops with `return`, leaving the status in
+# $LASTEXITCODE (setup-menu.ps1, run as a script file, sets it too).
+& {
+    $ErrorActionPreference = "Stop"
 
-function Write-Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
-function Write-Ok($msg) { Write-Host "  [OK] $msg" -ForegroundColor Green }
-function Write-Fail($msg) { Write-Host "  [FAIL] $msg" -ForegroundColor Red }
+    function Write-Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
+    function Write-Ok($msg) { Write-Host "  [OK] $msg" -ForegroundColor Green }
+    function Write-Fail($msg) { Write-Host "  [FAIL] $msg" -ForegroundColor Red }
 
-$RepoUrl = "https://github.com/HaydenSchmidtDOC/DevGraph.git"
+    $RepoUrl = "https://github.com/HaydenSchmidtDOC/DevGraph.git"
 
-# Already inside a DevGraph checkout (e.g. a developer who cloned manually
-# and is running this script directly) -- use that checkout, don't re-clone.
-$currentRoot = $null
-$probe = Get-Location
-while ($probe) {
-    if (Test-Path (Join-Path $probe "pyproject.toml")) {
-        $marker = Get-Content (Join-Path $probe "pyproject.toml") -Raw -ErrorAction SilentlyContinue
-        if ($marker -match "devgraph") {
-            $currentRoot = $probe.Path
-            break
+    # Already inside a DevGraph checkout (e.g. a developer who cloned manually
+    # and is running this script directly) -- use that checkout, don't re-clone.
+    $currentRoot = $null
+    $probe = Get-Location
+    while ($probe) {
+        if (Test-Path (Join-Path $probe "pyproject.toml")) {
+            $marker = Get-Content (Join-Path $probe "pyproject.toml") -Raw -ErrorAction SilentlyContinue
+            if ($marker -match "devgraph") {
+                $currentRoot = $probe.Path
+                break
+            }
         }
-    }
-    $parent = Split-Path -Parent $probe
-    if (-not $parent -or $parent -eq $probe) { break }
-    $probe = $parent
-}
-
-if ($currentRoot) {
-    Write-Step "Already inside a DevGraph checkout"
-    Write-Ok "$currentRoot"
-    $RepoRoot = $currentRoot
-} else {
-    Write-Step "Cloning DevGraph"
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    if (-not $git) {
-        Write-Fail "git not found on PATH. Install Git and re-run."
-        exit 1
+        $parent = Split-Path -Parent $probe
+        if (-not $parent -or $parent -eq $probe) { break }
+        $probe = $parent
     }
 
-    if (Test-Path $Path) {
-        if (Test-Path (Join-Path $Path ".git")) {
-            Write-Ok "$Path already exists and is a git checkout, reusing"
-        } else {
-            Write-Fail "$Path already exists and is not a git checkout. Pass -Path to choose a different location."
-            exit 1
-        }
+    if ($currentRoot) {
+        Write-Step "Already inside a DevGraph checkout"
+        Write-Ok "$currentRoot"
+        $RepoRoot = $currentRoot
     } else {
-        git clone $RepoUrl $Path
-        if ($LASTEXITCODE -ne 0) { Write-Fail "git clone failed"; exit 1 }
-        Write-Ok "cloned to $Path"
-    }
-    $RepoRoot = (Resolve-Path $Path).Path
-}
+        Write-Step "Cloning DevGraph"
+        $git = Get-Command git -ErrorAction SilentlyContinue
+        if (-not $git) {
+            Write-Fail "git not found on PATH. Install Git and re-run."
+            $global:LASTEXITCODE = 1; return
+        }
 
-Write-Step "Launching setup"
-& (Join-Path $RepoRoot "scripts\setup-menu.ps1")
-exit $LASTEXITCODE
+        if (Test-Path $Path) {
+            if (Test-Path (Join-Path $Path ".git")) {
+                Write-Ok "$Path already exists and is a git checkout, reusing"
+            } else {
+                Write-Fail "$Path already exists and is not a git checkout. Pass -Path to choose a different location."
+                $global:LASTEXITCODE = 1; return
+            }
+        } else {
+            git clone $RepoUrl $Path
+            if ($LASTEXITCODE -ne 0) { Write-Fail "git clone failed"; $global:LASTEXITCODE = 1; return }
+            Write-Ok "cloned to $Path"
+        }
+        $RepoRoot = (Resolve-Path $Path).Path
+    }
+
+    Write-Step "Launching setup"
+    & (Join-Path $RepoRoot "scripts\setup-menu.ps1")
+}

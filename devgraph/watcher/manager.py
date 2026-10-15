@@ -218,20 +218,33 @@ class _GitStateEventHandler(FileSystemEventHandler):
         self._on_burst(self._repo_id, burst_start)
 
 
-def _watch_problem(error: Exception) -> str:
+#: How a partly-watched repository's issue starts: its watch is running, but
+#: an inotify limit kept a folder created since from being watched.
+#: `status`, `doctor` and the dashboard tell it from a watch that never
+#: started (see `is_partly_watched`).
+PARTLY_WATCHED = "partly watched: "
+
+
+def is_partly_watched(issue: object) -> bool:
+    """Whether a repository issue is a partial watch, not a failed one (an
+    issue read back from repo_issues.json may be any JSON value)."""
+    return str(issue).startswith(PARTLY_WATCHED)
+
+
+def _watch_problem(error: Exception, prefix: str = "watching unavailable: ") -> str:
     """The issue `status`, `doctor` and the dashboard show for a repository
-    that couldn't be watched."""
+    that couldn't be watched (or, with `PARTLY_WATCHED`, only partly)."""
     if isinstance(error, OSError) and error.errno == errno.EMFILE:
         return (
-            "watching unavailable: inotify limit reached (too many inotify instances, "
+            f"{prefix}inotify limit reached (too many inotify instances, "
             "fs.inotify.max_user_instances, or open files); restart the agent once others are closed"
         )
     if isinstance(error, OSError) and error.errno == errno.ENOSPC:
         return (
-            "watching unavailable: inotify limit reached (too many watched folders, "
+            f"{prefix}inotify limit reached (too many watched folders, "
             "fs.inotify.max_user_watches); raise it, then restart the agent"
         )
-    return f"watching unavailable: {error}"
+    return f"{prefix}{error}"
 
 
 def _discard_observer(observer: Any) -> None:
@@ -740,6 +753,10 @@ class WatcherManager:
 
             # Read before the observer starts (W5): see _start_catch_up.
             snapshot = self._last_indexed(repo.repo_id) if self._on_catch_up is not None else None
+            # Any old issue is cleared before the start, not after it: the new
+            # watch can report one (a limit) as soon as it runs.
+            with self._issues_lock:
+                self._repo_issues.pop(repo.repo_id, None)
             observer.start()
         except Exception as e:
             # Whatever did start (emitters, their inotify instances) is
@@ -760,9 +777,6 @@ class WatcherManager:
             self._root_watches[repo.repo_id] = root_watch
         if git_handler is not None:
             self._git_handlers[repo.repo_id] = git_handler
-        # Clear any cached issues now that watch started successfully
-        with self._issues_lock:
-            self._repo_issues.pop(repo.repo_id, None)
         logger.debug(f"Started watcher for {repo.repo_id} at {repo.path}")
         if self._on_catch_up is not None:
             repo_id = repo.repo_id
@@ -835,8 +849,8 @@ class WatcherManager:
             return
         if kind == "limit":
             # A folder found later stays unwatched until a restart; catch up
-            # on what it holds now.
-            problem = _watch_problem(error)
+            # on what it holds now. The rest of the repository stays watched.
+            problem = _watch_problem(error, PARTLY_WATCHED + "a new folder isn't watched, ")
             logger.warning("%s: %s", repo_id, problem)
             since = self._last_indexed(repo_id)
             if since is not None:
@@ -847,6 +861,10 @@ class WatcherManager:
         else:
             return
         with self._issues_lock:
+            # A partial watch never hides a worse issue (a stopped reader).
+            old = self._repo_issues.get(repo_id)
+            if kind == "limit" and old is not None and not is_partly_watched(old):
+                return
             self._repo_issues[repo_id] = problem
 
     def _desired_dirs(self, root: Path) -> set[Path]:

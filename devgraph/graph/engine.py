@@ -18,7 +18,7 @@ from pathlib import Path
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-from neo4j import Driver, GraphDatabase, NotificationDisabledClassification, READ_ACCESS, unit_of_work
+from neo4j import Driver, GraphDatabase, NotificationDisabledClassification, Query, READ_ACCESS, unit_of_work
 from neo4j.exceptions import Neo4jError, ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
@@ -36,6 +36,7 @@ from devgraph.graph.schema import (
     lookup_index_statements,
     pin_kind,
     pin_value,
+    split_pin,
 )
 from devgraph.indexer.docs.extractor import DOC_NOTE_LABELS
 
@@ -102,13 +103,59 @@ _DELETE_BY_SOURCE_FILE_CYPHER = _union(_owned_branches("= $f")) + "DETACH DELETE
 # instead of each overwriting the others from a stale read.
 _LOCK_AND_READ = "SET n.name = n.name RETURN elementId(n) AS id, properties(n) AS props"
 
-_UNCLAIM_SOURCE_CYPHER = (
-    _union(_CLAIMED_BRANCHES)
-    + "WITH n WHERE n.file IS NULL AND n.source_file IS NULL "
+_UNCLAIM_FILTER = (
+    "WITH n WHERE n.file IS NULL AND n.source_file IS NULL "
     "  AND (n.source = $file_name OR $file_name IN coalesce(n.sources, [])) "
     "  AND NOT any(p IN $keep WHERE labels(n)[0] = p[0] AND n.name = p[1]) "
-    + _LOCK_AND_READ
 )
+_UNCLAIM_SOURCE_CYPHER = _union(_CLAIMED_BRANCHES) + _UNCLAIM_FILTER + _LOCK_AND_READ
+
+# A code file's Module records the shared nodes its last replace claimed
+# (`shared_claims`, "<label>\x1f<name>" entries), so its next replace or
+# delete seeks just those by name instead of every shared node of the
+# repository, whose count grows with the repository (each file's write
+# scanned them all: quadratic in a full scan of a repository with many
+# routes). A code file not indexed before (no Module yet) claims nothing; a
+# file with no record (a compose file or Containerfile, which has no Module,
+# or a Module an older index wrote) is unclaimed by the scan.
+SHARED_CLAIM_SEP = "\x1f"
+# Read under the Module's write lock (the no-op SET takes it), so two
+# overlapping writes of one file run one after the other: the second reads
+# the record the first wrote, never the one both started from.
+_RECORDED_CLAIMS_CYPHER = (
+    "MATCH (m:Module {repo_id: $repo_id, name: $file_name}) SET m.name = m.name "
+    "RETURN properties(m)['shared_claims'] AS claims"
+)
+# Every code Module's record rewritten from the shared nodes' own `sources`
+# (`rebuild_claim_records`).
+_CLAIM_SOURCES_CYPHER = (
+    _union(_CLAIMED_BRANCHES) + "WITH n WHERE n.file IS NULL AND n.source_file IS NULL "
+    "RETURN labels(n)[0] AS label, n.name AS name, coalesce(n.sources, [n.source]) AS sources"
+)
+# Only a record that differs is written, so a scan that changes nothing
+# locks no Module.
+_WRITE_CLAIM_RECORDS_CYPHER = (
+    "MATCH (m:Module) USING INDEX SEEK m:Module(repo_id, name) "
+    "WHERE m.repo_id = $repo_id AND m.name IS NOT NULL AND properties(m)['shared_claims'] IS NOT NULL "
+    "WITH m, coalesce($claims[m.name], []) AS claims WHERE m.shared_claims <> claims "
+    "SET m.shared_claims = claims"
+)
+_UNCLAIM_RECORDED_CYPHER = (
+    _union(_seek(label, "name", f"IN $claimed_{i}") for i, label in enumerate(CLAIMED_LABELS))
+    + _UNCLAIM_FILTER + _LOCK_AND_READ
+)
+
+
+def _recorded_claims(tx, repo_id: str, file_name: str, code: bool = False) -> list[list[str]] | None:
+    """The [label, name] pairs of the shared nodes `file_name`'s Module
+    recorded claiming, None when it recorded none (see SHARED_CLAIM_SEP).
+    A `code` file (one writing its Module) with no Module yet claims none."""
+    record = tx.run(_RECORDED_CLAIMS_CYPHER, repo_id=repo_id, file_name=file_name).single()
+    if record is None:
+        return [] if code else None
+    if record["claims"] is None:
+        return None
+    return [entry.split(SHARED_CLAIM_SEP, 1) for entry in record["claims"]]
 
 # Shared nodes are attributed to their first source, whatever order the files
 # claim them in (watcher spec W10). `claims` is a JSON string (Neo4j has no
@@ -208,22 +255,53 @@ def _claim_nodes_tx(tx, label: str, rows: list[dict[str, Any]]) -> None:
     )
 
 
+# The files whose replace is a `service_api` one: Python's (its owning-service
+# and API edges) and the languages whose routes are extracted
+# (indexer/apis/routes.py: their Endpoint and owning-service CALLS edges).
+SERVICE_API_SUFFIXES = (
+    ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".java", ".kt", ".cs", ".go",
+)
+
+
+def _rebuild_claim_records_tx(tx, repo_id: str) -> None:
+    claims: dict[str, set[str]] = {}
+    for record in tx.run(_CLAIM_SOURCES_CYPHER, repo_id=repo_id):
+        for source in record["sources"] or []:
+            claims.setdefault(source, set()).add(SHARED_CLAIM_SEP.join((record["label"], record["name"])))
+    tx.run(_WRITE_CLAIM_RECORDS_CYPHER, repo_id=repo_id,
+           claims={source: sorted(entries) for source, entries in claims.items()})
+
+
 def _delete_by_source_file_tx(tx, repo_id: str, file_name: str) -> None:
+    # Every claim is read, not the record: deletes are rare, and so a claim
+    # a record lost goes with its file.
+    recorded = None
     _unclaim_foreign_sources_tx(tx, repo_id, file_name)
-    if file_name.endswith(".py"):
-        _unclaim_service_api_edges_tx(tx, repo_id, file_name)
+    if file_name.endswith(SERVICE_API_SUFFIXES):
+        _unclaim_service_api_edges_tx(tx, repo_id, file_name, recorded)
     tx.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, f=file_name)
-    _unclaim_source_tx(tx, repo_id, file_name, [])
+    _unclaim_source_tx(tx, repo_id, file_name, [], recorded)
 
 
-def _unclaim_source_tx(tx, repo_id: str, file_name: str, keep: list[list[str]]) -> None:
+def _unclaim_source_tx(
+    tx, repo_id: str, file_name: str, keep: list[list[str]], recorded: list[list[str]] | None = None
+) -> None:
     """Drop `file_name`'s claim on every shared node except the `keep` ones
     ([label, name] pairs the file still claims, which the upsert that follows
     re-claims in place): re-attribute the node from the new first source, or
-    delete it when no claim is left."""
+    delete it when no claim is left. `recorded` (`_recorded_claims`) limits
+    the search to the nodes the file recorded claiming; None searches all."""
     gone: list[str] = []
     kept: list[dict[str, Any]] = []
-    for record in tx.run(_UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name, keep=keep):
+    if recorded is None:
+        records = tx.run(_UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name, keep=keep)
+    else:
+        names = {
+            f"claimed_{i}": sorted({name for each, name in recorded if each == label})
+            for i, label in enumerate(CLAIMED_LABELS)
+        }
+        records = tx.run(_UNCLAIM_RECORDED_CYPHER, repo_id=repo_id, file_name=file_name, keep=keep, **names)
+    for record in records:
         props = dict(record["props"])
         claims = _claims_of(props)
         before = _attribution(claims)
@@ -261,15 +339,25 @@ _UNCLAIM_EDGE = (
 # (MODIFIES from git history, MENTIONS from docs, cross-file CALLS/IMPORTS),
 # which a blanket delete-then-recreate silently destroyed. The Module node
 # (the file itself) is always kept and MERGEd in place. `keep` is a list of
-# [label, name] pairs for the file-scoped nodes the current extraction still
-# produces; an empty list (file now has no classes/functions) correctly
-# deletes them all.
+# [label, name, owner] triples for the file-scoped nodes the current
+# extraction still produces; an empty list (file now has no
+# classes/functions) correctly deletes them all. A node an index older than
+# owners wrote (with `file` but no `owner`) is given the owner "" first, so
+# a top-level symbol keeps its node and its incoming edges, and the upsert
+# below MERGEs onto it instead of beside it; a method's old node is not kept
+# (its owner is its class now) and is replaced.
 _REPLACE_OWNED_NODES_CYPHER = (
     _union(_owned_branches("= $f"))
     + "CALL (n) { MATCH (n)-[r]->() " + _UNCLAIM_EDGE + " } "
     "WITH n WHERE NOT n:Module "
-    "  AND NOT any(pair IN $keep WHERE labels(n)[0] = pair[0] AND n.name = pair[1]) "
-    "DETACH DELETE n"
+    "WITH n, any(key IN $keep WHERE labels(n)[0] = key[0] AND n.name = key[1] "
+    "  AND coalesce(n.owner, '') = key[2]) AS kept "
+    # A node is either given its owner or deleted, never both: one that
+    # gains the owner key and goes in one transaction is left behind in the
+    # transaction's view of the (repo_id, name, file, owner) index.
+    "FOREACH (_ IN CASE WHEN kept AND n.file IS NOT NULL AND n.owner IS NULL THEN [1] ELSE [] END | "
+    "  SET n.owner = '') "
+    "FOREACH (_ IN CASE WHEN kept THEN [] ELSE [1] END | DETACH DELETE n)"
 )
 
 # G2 set (d): every edge a docs note writes touches one of the note's own
@@ -306,8 +394,9 @@ def _unclaim_foreign_sources_tx(tx, repo_id: str, file_name: str) -> None:
         tx.run(_UNCLAIM_FOREIGN_SOURCES_CYPHER, repo_id=repo_id, f=file_name, sources=sources)
 
 
-# G2 set (c): the edges a Python file writes out of nodes it doesn't own,
-# the owning-service USES/CALLS and the API pass's Endpoint edges. Only the
+# G2 set (c): the edges a Python file (or another route file,
+# SERVICE_API_SUFFIXES) writes out of nodes it doesn't own, the
+# owning-service USES/CALLS and the API pass's Endpoint edges. Only the
 # edges that list the file (or list no writer) are touched.
 # The repository's Services and Endpoints are sought by repo_id on their
 # `(repo_id, name)` index (every node has a name); a plain `{repo_id}` match
@@ -322,12 +411,29 @@ _UNCLAIM_ENDPOINT_EDGES_CYPHER = (
 )
 
 
-def _unclaim_service_api_edges_tx(tx, repo_id: str, file_name: str) -> None:
+# Set (c)'s Endpoint edges when the file recorded its claims (SHARED_CLAIM_SEP):
+# every Endpoint edge a file writes (its routes', its owning-service CALLS,
+# their relinks) goes out of an Endpoint it claims.
+_UNCLAIM_RECORDED_ENDPOINT_EDGES_CYPHER = (
+    "MATCH (e:Endpoint)-[r:CALLS|IMPLEMENTS]->() USING INDEX SEEK e:Endpoint(repo_id, name) "
+    "WHERE e.repo_id = $repo_id AND e.name IN $endpoints AND $f IN coalesce(r.origins, [$f]) " + _UNCLAIM_EDGE
+)
+
+
+def _unclaim_service_api_edges_tx(
+    tx, repo_id: str, file_name: str, recorded: list[list[str]] | None = None
+) -> None:
     # The owning-service edges come back only in index_paths' final service
     # pass, which needs every compose file in the batch, so between this
     # file's replace and that pass a reader can briefly miss them.
-    tx.run(_UNCLAIM_SERVICE_USES_CYPHER, repo_id=repo_id, f=file_name)
-    tx.run(_UNCLAIM_ENDPOINT_EDGES_CYPHER, repo_id=repo_id, f=file_name)
+    if file_name.endswith(".py"):  # only a Python file writes USES
+        tx.run(_UNCLAIM_SERVICE_USES_CYPHER, repo_id=repo_id, f=file_name)
+    if recorded is None:
+        tx.run(_UNCLAIM_ENDPOINT_EDGES_CYPHER, repo_id=repo_id, f=file_name)
+    else:
+        endpoints = sorted({name for label, name in recorded if label == "Endpoint"})
+        if endpoints:
+            tx.run(_UNCLAIM_RECORDED_ENDPOINT_EDGES_CYPHER, repo_id=repo_id, f=file_name, endpoints=endpoints)
 
 
 # Nodes a schema-declared provider owns (devgraph/indexer/providers/) are
@@ -339,14 +445,17 @@ def _unclaim_service_api_edges_tx(tx, repo_id: str, file_name: str) -> None:
 # lifecycle. Path-scoped queries match `path`; `keep` lists match the key.
 # A path matches its own node and, as a directory, everything below it --
 # the trailing '/' keeps `src` from matching `src2/...`.
+# Each one follows the candidates GraphEngine._provider_nodes yields as `n`
+# (the repository's nodes of its applied schema's labels), never a match on
+# `{repo_id}` alone, which scanned every node in the database.
 _EXTRACTED_AT_OR_BELOW = (
-    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
+    "WITH n WHERE n.extractor = $extractor "
     "AND (n.path IN $paths OR any(p IN $paths WHERE n.path STARTS WITH p + '/')) "
 )
 _DELETE_EXTRACTED_PATHS_CYPHER = _EXTRACTED_AT_OR_BELOW + "DETACH DELETE n"
 _EXTRACTED_NODES_AT_CYPHER = _EXTRACTED_AT_OR_BELOW + "RETURN DISTINCT labels(n)[0] AS label, n.name AS name"
 _PRUNE_EXTRACTED_CYPHER = (
-    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
+    "WITH n WHERE n.extractor = $extractor "
     "AND NOT (labels(n)[0] + ':' + n.name) IN $keep "
     "DETACH DELETE n RETURN count(n) AS pruned"
 )
@@ -354,23 +463,21 @@ _PRUNE_EXTRACTED_CYPHER = (
 # exact paths are candidates (never anything below them), so a batch of
 # changed files can't prune the rest of the provider's nodes.
 _PRUNE_EXTRACTED_AT_CYPHER = (
-    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND n.path IN $paths "
+    "WITH n WHERE n.extractor = $extractor AND n.path IN $paths "
     "AND NOT (labels(n)[0] + ':' + n.name) IN $keep "
     "DETACH DELETE n RETURN count(n) AS pruned"
 )
 # A provider's own edges are the outgoing ones of a non-built-in type; incoming
 # edges belong to whoever wrote them. A null $paths means the whole repo.
 _DELETE_EXTRACTED_EDGES_CYPHER = (
-    "MATCH (a {repo_id: $repo_id})-[r]->() WHERE a.extractor = $extractor "
-    "AND ($paths IS NULL OR a.path IN $paths) AND NOT type(r) IN $builtin_types "
+    "WITH n WHERE n.extractor = $extractor AND ($paths IS NULL OR n.path IN $paths) "
+    "MATCH (n)-[r]->() WHERE NOT type(r) IN $builtin_types "
     "DELETE r RETURN count(r) AS deleted"
 )
 # Property keys present on one provider label, for clearing the ones the
 # schema no longer declares (see GraphEngine.clear_extracted_properties).
-_EXTRACTED_PROPERTY_KEYS_CYPHER = (
-    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] = $label "
-    "UNWIND keys(n) AS key RETURN DISTINCT key"
-)
+_EXTRACTED_OF_LABEL = "WITH n WHERE n.extractor = $extractor AND labels(n)[0] = $label "
+_EXTRACTED_PROPERTY_KEYS_CYPHER = _EXTRACTED_OF_LABEL + "UNWIND keys(n) AS key RETURN DISTINCT key"
 
 # Which project schema the repository's graph was last built with (see
 # dispatch.apply_project_schema). Kept on the Repository node so every
@@ -452,6 +559,11 @@ _MAX_RETRIES = 3
 #: the final one-line error, not every try.
 RETRY_LOG_LEVEL = logging.WARNING
 _BASE_DELAY_S = 0.5
+
+
+#: How long a fail-fast `GraphEngine.run_read_cypher` waits before its one
+#: retry of a transient failure (see `GraphEngine`'s `fail_fast`).
+FAIL_FAST_RETRY_PAUSE_S = 0.5
 
 
 #: How long `GraphEngine.close` waits, by default, for open sessions to end.
@@ -626,6 +738,53 @@ def _retry_transient(fn, *args, **kwargs):
             delay *= 2
 
 
+#: How long first-run setup waits for a just-started Neo4j to answer Bolt. A
+#: fresh container accepts TCP at once (the port forwarder) but answers Bolt
+#: only after about 20 s on Linux, longer in a Podman machine.
+BOLT_WAIT_S = 90.0
+
+
+#: Each try's connection budget, so a wait never runs much past its deadline.
+BOLT_ATTEMPT_S = 5.0
+
+
+def wait_for_bolt(
+    uri: str, user: str, password: str, timeout_s: float = BOLT_WAIT_S, on_wait=None, poll_s: float = 2.0,
+) -> bool:
+    """Poll Neo4j at `uri` until it answers Bolt or `timeout_s` passes.
+
+    True once Neo4j answers, a refused login included (it is up; the caller's
+    own check reports the login); False when it still doesn't answer by the
+    deadline. Only "not answering yet" errors are waited out. Each try is one
+    bare `verify_connectivity` on a driver whose connection timeout is
+    BOLT_ATTEMPT_S (no retries inside a try), so the wait ends within about
+    that of its deadline. `on_wait(elapsed_s)` is called after each failed
+    try, for a progress message.
+    """
+    started = time.monotonic()
+    driver = GraphDatabase.driver(
+        uri, auth=(user, password),
+        connection_timeout=BOLT_ATTEMPT_S, connection_acquisition_timeout=BOLT_ATTEMPT_S,
+    )
+    try:
+        while True:
+            try:
+                driver.verify_connectivity()
+                return True
+            except _RETRYABLE_EXCEPTIONS:
+                pass
+            except Neo4jError:
+                return True
+            elapsed = time.monotonic() - started
+            if elapsed >= timeout_s:
+                return False
+            if on_wait is not None:
+                on_wait(elapsed)
+            time.sleep(min(poll_s, max(0.0, timeout_s - elapsed)))
+    finally:
+        driver.close()
+
+
 def _run(session, query: str, **params: Any) -> Any:
     """Run one autocommit statement and consume it, both inside `_retry_transient`;
     return its summary.
@@ -672,16 +831,24 @@ def _group_nodes_by_label(
     node — see Design Brief follow-up on cross-file symbol collisions).
     Folding `file` into the MERGE key for just that population fixes the
     collision without touching the many labels that don't need it.
+    Within a file a node is also keyed by its `owner` (the types it is
+    declared in, "" at the top level), so two classes' same-named methods in
+    one file are two nodes; a file-scoped row always writes it, "" when the
+    extractor set none.
     """
     groups: dict[tuple[str, bool], list[dict[str, Any]]] = {}
     for node in nodes:
         properties = node.get("properties") or {}
         file = properties.get("file")
-        groups.setdefault((node["label"], _is_file_scoped(file)), []).append(
+        file_scoped = _is_file_scoped(file)
+        if file_scoped:
+            properties = {**properties, "owner": properties.get("owner") or ""}
+        groups.setdefault((node["label"], file_scoped), []).append(
             {
                 "repo_id": node["repo_id"],
                 "name": node["name"],
                 "file": file,
+                "owner": properties.get("owner"),
                 "properties": properties,
             }
         )
@@ -696,7 +863,7 @@ def _group_nodes_by_label(
 _IDENTITY_KEY_SEP = "\x1f"
 
 
-def identity_key(label: str, repo_id: str, name: str, file: str | None) -> str:
+def identity_key(label: str, repo_id: str, name: str, file: str | None, owner: str | None = None) -> str:
     """Stable, server-derived cache key for a node — independent of Neo4j's
     internal elementId(), which is a storage-slot pointer that shifts on any
     full re-index, restore, or delete/recreate and would silently invalidate
@@ -705,11 +872,15 @@ def identity_key(label: str, repo_id: str, name: str, file: str | None) -> str:
     Mirrors the MERGE key `_upsert_nodes_tx` actually writes with: file is
     folded in only when `_is_file_scoped` says this node's MERGE key includes
     it, so the dashboard never has to reimplement that conditional itself
-    (and risk it drifting from the Cypher above).
+    (and risk it drifting from the Cypher above). The `owner` is folded in
+    after it only when it is not "", so a top-level node keeps the key it
+    had before owners.
     """
     parts = [label, repo_id, name]
     if _is_file_scoped(file) and file is not None:
         parts.append(file)
+        if owner:
+            parts.append(owner)
     return _IDENTITY_KEY_SEP.join(parts)
 
 
@@ -727,8 +898,16 @@ def _pin(file: str | None) -> str:
     return pin_kind(file)
 
 
+#: The edge types a resolver writes with a pin's `@` flag, whose edges into a
+#: node therefore depend on its match keys (see GraphEngine.write_match_keys).
+MATCH_KEY_EDGE_TYPES = ("CALLS", "IMPORTS")
+#: The most nodes GraphEngine.write_match_keys handles in one transaction.
+RETRACT_NODES = 500
 #: The pin kinds that match a set of files rather than one (see `_pin`).
 _PATH_PINS = frozenset({"dir", "loose_dir", "suffix", "suffix_dir", "prefix"})
+#: Marks the to-pin of a `_group_rels_by_triple` group whose path pins'
+#: `@` keys come in tiers (see `_shadow_free`).
+_TIERED = "@"
 #: The path pins whose files all start with the pin's own path (`pin_value`'s
 #: `v`): a target seeks them as a prefix range of its file-keyed index.
 _ANCHORED_PINS = frozenset({"dir", "loose_dir", "prefix"})
@@ -750,12 +929,19 @@ def _group_rels_by_triple(
 
     Within a group, the edges out of one source with the same properties and
     `origin` (the file that wrote them, None for a writer that doesn't record
-    one) share a row, whose `targets` lists each edge's `to_name` and
-    `to_file`; for a path pin also `pin` (as graph/schema.py `pin_value`
-    gives it) and the pins its `exclude` leaves out, split into `ex_files`
+    one), and for a source pinned to a file the same `from_owner`, share a
+    row, whose `targets` lists each edge's `to_name` and `to_file`; for a
+    target pinned to a file or a path also `to_owner`; for a path pin also `pin` (as
+    graph/schema.py `pin_value` gives it) and the pins its `exclude` leaves
+    out, split into `ex_files`
     (files, a list test) and `ex_pins` (other pins, as `pin_value` gives
     them); for a bare name also `no_self` (the edge may not end at its
-    source). Only the keys its group's Cypher reads are sent. The source is
+    source). A path pin whose `@` keys come in tiers (graph/schema.py
+    `tiered_pin`) is grouped apart, its kind marked with `_TIERED`, so only
+    its group's Cypher tests the shadow (see `_end_match`). Only the keys
+    its group's Cypher reads are sent. A row also carries its edges'
+    `visible` (C# project visibility) as `vis`, once, which a path-pinned
+    target tests (`_visible`). The source is
     then matched once for all of them: a resolved call names several
     candidate files per callee.
     """
@@ -763,30 +949,41 @@ def _group_rels_by_triple(
     for rel in rels:
         from_file = rel.get("from_file")
         to_file = rel.get("to_file")
-        key = (rel["from_label"], rel["rel_type"], rel["to_label"], _pin(from_file), _pin(to_file))
+        to_pin = _pin(to_file)
+        if to_pin in _PATH_PINS and split_pin(to_file).ranks:
+            to_pin += _TIERED
+        key = (rel["from_label"], rel["rel_type"], rel["to_label"], _pin(from_file), to_pin)
+        to_pin = to_pin.removesuffix(_TIERED)
         if key[3] in _PATH_PINS:
             raise ValueError(f"a source end can't be pinned to a set of files: {from_file!r}")
         properties = rel.get("properties") or {}
         origin = rel.get("origin")
+        from_owner = rel.get("from_owner") if key[3] == "file" else None
+        visible = sorted(rel.get("visible") or []) or None
         source = (
-            rel["repo_id"], rel["from_name"], from_file, origin, json.dumps(properties, sort_keys=True, default=str)
+            rel["repo_id"], rel["from_name"], from_file, from_owner, origin,
+            json.dumps(properties, sort_keys=True, default=str), tuple(visible or ()),
         )
         row = groups.setdefault(key, {}).setdefault(source, {
             "repo_id": rel["repo_id"],
             "from_name": rel["from_name"],
             "from_file": from_file,
+            "from_owner": from_owner,
             "properties": properties,
             "origin": origin,
+            "vis": visible,
             "targets": [],
         })
         target = {"to_name": rel["to_name"], "to_file": to_file}
-        if key[4] in _PATH_PINS:
+        if to_pin == "file" or to_pin in _PATH_PINS:
+            target["to_owner"] = rel.get("to_owner")
+        if to_pin in _PATH_PINS:
             # File pins are left out by a plain list test, other pins by `_pin_test`.
             excluded = rel.get("exclude") or []
             target["pin"] = pin_value(to_file)
             target["ex_files"] = [pin for pin in excluded if pin_kind(pin) == "file"]
             target["ex_pins"] = [pin_value(pin) for pin in excluded if pin_kind(pin) != "file"]
-        elif key[4] == "name":
+        elif to_pin == "name":
             target["no_self"] = bool(rel.get("no_self"))
         row["targets"].append(target)
     return {key: list(rows.values()) for key, rows in groups.items()}
@@ -795,7 +992,7 @@ def _group_rels_by_triple(
 def _upsert_nodes_tx(tx, nodes: list[dict[str, Any]]) -> None:
     for (label, file_scoped), rows in _group_nodes_by_label(nodes).items():
         merge_key = (
-            "{repo_id: row.repo_id, name: row.name, file: row.file}"
+            "{repo_id: row.repo_id, name: row.name, file: row.file, owner: row.owner}"
             if file_scoped
             else "{repo_id: row.repo_id, name: row.name}"
         )
@@ -842,9 +1039,10 @@ _ADD_ORIGIN = (
 )
 
 
-def _pin_test(pin: str, file: str) -> str:
-    """Cypher for graph/schema.py's `pin_value` map `pin` matching the path
-    `file`, as devgraph/indexer/common.py `pin_matches` defines it."""
+def _pin_test(pin: str, file: str, node: str, keys: bool = True) -> str:
+    """Cypher for graph/schema.py's `pin_value` map `pin` matching the node
+    `node` at the path `file`, as devgraph/indexer/common.py `pin_matches`
+    defines it (the node's `mkeys` are its keys; not tested without `keys`)."""
     name = f"last(split({file}, '/'))"
     # graph/schema.py pin_root: the part of the path before what the pin matches.
     def cut(length: str) -> str:  # never a negative length, which left() rejects
@@ -859,7 +1057,9 @@ def _pin_test(pin: str, file: str) -> str:
         f"(({pin}.ns = '' OR NOT {file} ENDS WITH {pin}.ns) "
         f"AND (size({pin}.os) = 0 OR any(s IN {pin}.os WHERE {file} ENDS WITH s)) "
         f"AND (size({pin}.nv) = 0 OR NOT any(s IN split({root}, '/') WHERE s IN {pin}.nv)) "
-        f"AND (size({pin}.nr) = 0 OR NOT any(s IN {pin}.nr WHERE '/' + {root} + '/' CONTAINS s)) AND CASE {pin}.k "
+        f"AND (size({pin}.nr) = 0 OR NOT any(s IN {pin}.nr WHERE '/' + {root} + '/' CONTAINS s)) "
+        + (f"AND (size({pin}.sc) = 0 OR any(s IN {pin}.sc WHERE s IN coalesce({node}.mkeys, []))) " if keys else "")
+        + f"AND CASE {pin}.k "
         f"WHEN 'file' THEN {file} = {pin}.v "
         f"WHEN 'dir' THEN {file} STARTS WITH {pin}.v AND NOT substring({file}, size({pin}.v)) CONTAINS '/' "
         f"WHEN 'suffix' THEN '/' + {file} ENDS WITH {pin}.v "
@@ -869,35 +1069,79 @@ def _pin_test(pin: str, file: str) -> str:
     )
 
 
-def _path_pin_conditions(ref: str, path: str) -> list[str]:
+def _path_pin_conditions(ref: str, path: str, node: str) -> list[str]:
     """Cypher conditions for a path-pinned target `ref` (see
-    `_group_rels_by_triple`) matching the path `path`: its `pin` matches and
-    no exclusion does."""
+    `_group_rels_by_triple`) matching the node `node` at the path `path`: its
+    `pin` matches and no exclusion does."""
     return [
-        _pin_test(f"{ref}.pin", path), f"NOT {path} IN {ref}.ex_files",
-        f"NOT any(x IN {ref}.ex_pins WHERE {_pin_test('x', path)})",
+        _pin_test(f"{ref}.pin", path, node), f"NOT {path} IN {ref}.ex_files",
+        f"NOT any(x IN {ref}.ex_pins WHERE {_pin_test('x', path, node)})",
     ]
+
+
+def _visible(var: str) -> str:
+    """Cypher keeping the node `var` only when it is visible to the row's
+    project (`row.vis`, see `_group_rels_by_triple`), as
+    devgraph/indexer/common.py `visible_to` defines it: a row without `vis`
+    sees every node, and a node without `proj` (or "") is seen by every
+    row. Tested once per row, not per pin."""
+    return f"(row.vis IS NULL OR coalesce({var}.proj, '') = '' OR {var}.proj IN row.vis)"
+
+
+def _shadow_free(ref: str, var: str, label: str) -> str:
+    """Cypher, after the MATCH of the node `var` (`label`), keeping it only
+    when the tiered pin `{ref}.pin` (graph/schema.py `tiered_pin`) does not
+    shadow it, as devgraph/indexer/common.py `shadowed` defines it: no node
+    of its label and name that the pin's path and flags match holds a key
+    of a nearer tier than `var`'s nearest and is visible to the row
+    (`_visible`). The keys of the nearer tiers are
+    computed once per node, and a node of the nearest tier (none nearer)
+    skips the subquery, which seeks the name's nodes as `_end_match` does
+    (an `OR NOT EXISTS`, planned as a select-or-anti-semi-apply; inside a
+    CASE it was not, and scanned every node of the label)."""
+    pin = f"{ref}.pin"
+    every = f"range(0, size({pin}.sc) - 1)"
+    rank = (
+        f"reduce(tier_r = size({pin}.sc), tier_i IN {every} | CASE WHEN {pin}.sr[tier_i] < tier_r "
+        f"AND {pin}.sc[tier_i] IN coalesce({var}.mkeys, []) THEN {pin}.sr[tier_i] ELSE tier_r END)"
+    )
+    return (
+        f"WITH *, {rank} AS {var}_tier "
+        f"WITH *, [tier_i IN {every} WHERE {pin}.sr[tier_i] < {var}_tier | {pin}.sc[tier_i]] AS {var}_nearer "
+        f"WHERE size({var}_nearer) = 0 OR NOT EXISTS {{ "
+        f"MATCH (shadow:{label} {{repo_id: {var}.repo_id, name: {var}.name}}) "
+        f"USING INDEX SEEK shadow:{label}(repo_id, name) "
+        f"WHERE any(key IN {var}_nearer WHERE key IN coalesce(shadow.mkeys, [])) "
+        f"AND {_visible('shadow')} AND {_pin_test(pin, 'shadow.file', 'shadow', keys=False)} }} "
+    )
 
 
 def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also: str | None = None) -> str:
     """The MATCH for one end of an edge row (`pin` from `_pin`), reading its
     `{end}_name`/`{end}_file` off `ref` (the row, or one of its targets). An
     end of a file-scoped label is hinted to seek its index: the (repo_id,
-    name, file) unique one when pinned to a file, the (repo_id, name) lookup
-    one otherwise (a file-less end then keeps only `file IS NULL`). A plan
+    name, file, owner) unique one when pinned to a file (any owner, `owner
+    IS NOT NULL`, unless the row names one), the (repo_id, name) lookup one
+    otherwise (a file-less end then keeps only `file IS NULL`). A plan
     made from index statistics sampled while the label was near-empty
     estimates 0 rows, and can then scan a whole index per row (a plain USING
     INDEX allows that scan) after the label has filled; in CI that made a
     5,000-module relink take 20 s instead of under 1 s. A path pin seeks by
     name and keeps the nodes whose file its `pin` matches and no `exclude`
     pin does (`ex_files`, `ex_pins`); a directory or prefix pin seeks the
-    (repo_id, name, file) index from its path (`STARTS WITH`), so its cost
+    (repo_id, name, file, owner) index from its path (`STARTS WITH`), so its cost
     follows the directory's nodes of the name, not the repository's; on a Module target it seeks the
     Module's `dir` (a directory pin), `dir_name` (a suffix-directory pin:
     the last name of its directory) or `basename` (a suffix pin), the row's
     `to_name`, and tests the Module's path. `also` is one more condition on
-    the match."""
+    the match. An end pinned to a file or a path with an `{end}_owner` keeps
+    only the nodes of that `owner` (two classes' same-named methods in one
+    file). A path-pinned end of a file-scoped label keeps only the nodes
+    visible to the row's project (`_visible`). A path pin marked `_TIERED`
+    also keeps only the nodes its tiers do not shadow (`_shadow_free`)."""
     conditions = [also] if also else []
+    tiered = pin.endswith(_TIERED)
+    pin = pin.removesuffix(_TIERED)
     if pin in _PATH_PINS:
         if label == "Module":
             key = {"dir": "dir", "suffix_dir": "dir_name", "suffix": "basename"}.get(pin)
@@ -913,19 +1157,30 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
             match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
             if label in FILE_SCOPED_LABELS and pin in _ANCHORED_PINS:
                 # The files under one directory are a prefix range of the
-                # unique (repo_id, name, file) index: a package's own `Get`,
-                # not every `Get` of the repository (S10 fan-in).
-                match += f"USING INDEX SEEK {var}:{label}(repo_id, name, file) "
-                conditions.insert(0, f"{path} STARTS WITH {ref}.pin.v")
+                # unique (repo_id, name, file, owner) index: a package's own
+                # `Get`, not every `Get` of the repository (S10 fan-in).
+                match += f"USING INDEX SEEK {var}:{label}(repo_id, name, file, owner) "
+                conditions[:0] = [f"{path} STARTS WITH {ref}.pin.v", f"{var}.owner IS NOT NULL"]
             elif label in FILE_SCOPED_LABELS:
                 match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
-        conditions[:0] = _path_pin_conditions(ref, path)
-        return match + "WHERE " + " AND ".join(conditions) + " "
+            if label in FILE_SCOPED_LABELS:
+                # The members of one owner in the files the pin matches, when the row names it.
+                conditions.append(f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)")
+                conditions.append(_visible(var))
+        conditions[:0] = _path_pin_conditions(ref, path, var)
+        return match + "WHERE " + " AND ".join(conditions) + " " + (_shadow_free(ref, var, label) if tiered else "")
     pinned = pin == "file"
-    keys = "repo_id, name, file" if pinned else "repo_id, name"
+    keys = "repo_id, name, file, owner" if pinned else "repo_id, name"
     hint = f"USING INDEX SEEK {var}:{label}({keys}) " if label in FILE_SCOPED_LABELS else ""
     if pinned:
         match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name, file: {ref}.{end}_file}}) "
+        if label in FILE_SCOPED_LABELS:
+            # One of the file's same-named siblings, when the row names its
+            # owner; every one of them otherwise. A node an index older than
+            # owners wrote is left out until the upgrade rescan gives it one.
+            conditions[:0] = [
+                f"{var}.owner IS NOT NULL", f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)",
+            ]
     else:
         match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
         if pin == "fileless":
@@ -944,6 +1199,27 @@ def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
             "SET r += row.properties " + _ADD_ORIGIN,
             rows=rows,
         )
+
+
+def _rerun_edges_tx(
+    tx, repo_id: str, groups: dict[tuple[str, str, str], list[dict[str, Any]]], rels: list[dict[str, Any]],
+) -> None:
+    """GraphEngine.rerun_edges' transaction."""
+    for (from_label, rel_type, to_label), rows in sorted(groups.items()):
+        hint = f"USING INDEX SEEK a:{from_label}(repo_id, name) " if from_label in FILE_SCOPED_LABELS else ""
+        tx.run(
+            f"UNWIND $rows AS row MATCH (a:{from_label} {{repo_id: $repo_id, name: row.from_name}}) {hint}"
+            "WHERE (row.from_file IS NULL OR a.file = row.from_file) "
+            "AND (row.from_owner IS NULL OR a.owner = row.from_owner) "
+            f"MATCH (a)-[r:{rel_type}]->(b:{to_label} {{repo_id: $repo_id, name: row.to_name}}) "
+            "WHERE row.origin IN coalesce(r.origins, [row.origin]) "
+            "WITH r, [x IN coalesce(r.origins, [row.origin]) WHERE x <> row.origin] AS left "
+            "FOREACH (_ IN CASE WHEN size(left) = 0 THEN [1] ELSE [] END | DELETE r) "
+            "FOREACH (_ IN CASE WHEN size(left) > 0 THEN [1] ELSE [] END | SET r.origins = left)",
+            repo_id=repo_id,
+            rows=rows,
+        )
+    _upsert_relationships_tx(tx, rels)
 
 
 def _write_insights_tx(tx, repo_id: str, rows: list[dict[str, Any]], summary: dict[str, Any]) -> None:
@@ -974,7 +1250,7 @@ def _replace_file_nodes_tx(
     # git-history MODIFIES edges silently vanished for any file re-indexed
     # after history was synced.
     keep = [
-        [node["label"], node["name"]]
+        [node["label"], node["name"], (node.get("properties") or {}).get("owner") or ""]
         for node in nodes
         if node["label"] != "Module"
         and (
@@ -982,10 +1258,12 @@ def _replace_file_nodes_tx(
             or (node.get("properties") or {}).get("source_file") == file_name
         )
     ]
+    code = any(node["label"] == "Module" and node["name"] == file_name for node in nodes)
+    recorded = _recorded_claims(tx, repo_id, file_name, code)
     _unclaim_foreign_sources_tx(tx, repo_id, file_name)
     tx.run(_REPLACE_OWNED_NODES_CYPHER, repo_id=repo_id, f=file_name, keep=keep)
     if service_api:
-        _unclaim_service_api_edges_tx(tx, repo_id, file_name)
+        _unclaim_service_api_edges_tx(tx, repo_id, file_name, recorded)
     # Shared nodes the file still claims are re-claimed in place by the
     # upsert below, not deleted and recreated, so a single-claimant
     # Container or Datastore keeps its incoming edges (MENTIONS, USES).
@@ -995,7 +1273,14 @@ def _replace_file_nodes_tx(
         if not (node.get("properties") or {}).get("file")
         and (node.get("properties") or {}).get("source") == file_name
     ]
-    _unclaim_source_tx(tx, repo_id, file_name, claimed)
+    _unclaim_source_tx(tx, repo_id, file_name, claimed, recorded)
+    # The file's Module records what it claims now, for its next write.
+    record = sorted({SHARED_CLAIM_SEP.join(pair) for pair in claimed})
+    nodes = [
+        {**node, "properties": {**(node.get("properties") or {}), "shared_claims": record}}
+        if node["label"] == "Module" and node["name"] == file_name else node
+        for node in nodes
+    ]
     _upsert_nodes_tx(tx, nodes)
     _upsert_relationships_tx(tx, rels)
 
@@ -1054,12 +1339,42 @@ def repository_constraint_statements(effective: EffectiveSchema | None = None) -
 
 
 class GraphEngine:
-    def __init__(self, uri: str, user: str, password: str) -> None:
+    def __init__(
+        self,
+        uri: str,
+        user: str,
+        password: str,
+        *,
+        fail_fast: bool = False,
+        connection_timeout_s: float | None = None,
+    ) -> None:
+        """Omitted, both keep the driver's defaults: a managed transaction is
+        retried for up to 30 s, and getting a connection may take 30-60 s.
+
+        `connection_timeout_s` bounds getting a connection: opening it, the Bolt
+        handshake, or waiting for a pooled one. `fail_fast` turns the driver's
+        retries off; `run_read_cypher` then retries a read once,
+        `FAIL_FAST_RETRY_PAUSE_S` later, when it failed once connected (a
+        transient error, an expired session, the connection lost mid-query),
+        and never when no connection could be had at all (refused, timed out).
+        The MCP server sets both, so a request fails within a few seconds when
+        Neo4j is down."""
+        self.uri = uri
+        self._fail_fast = fail_fast
+        limits: dict[str, float] = {}
+        if fail_fast:
+            # Negative: the driver retries while `elapsed > limit` is false, and
+            # a coarse clock can make the elapsed time exactly 0.
+            limits["max_transaction_retry_time"] = -1
+        if connection_timeout_s is not None:
+            limits["connection_timeout"] = connection_timeout_s
+            limits["connection_acquisition_timeout"] = connection_timeout_s
         # Hint notifications are off: a hinted index an older database hasn't
         # built yet (init_schema creates it) would log one per query.
         self._driver = _GatedDriver(GraphDatabase.driver(
             uri, auth=(user, password),
             notifications_disabled_classifications=[NotificationDisabledClassification.HINT],
+            **limits,
         ))
 
     def close(self, timeout: float = CLOSE_WAIT_S) -> None:
@@ -1192,6 +1507,31 @@ class GraphEngine:
         with self._driver.session() as session:
             session.execute_write(_upsert_relationships_tx, rels)
 
+    def rerun_edges(self, repo_id: str, groups: list[dict[str, Any]], rels: list[dict[str, Any]]) -> None:
+        """Write these groups' edges again, in one transaction: each group
+        (`rel_type`, `from_label`, `from_name`, `from_file` and `from_owner`
+        when known, `to_label`, `to_name`, `origin`) first unclaims its
+        `origin` from the edges of its type out of its source to nodes of
+        its `to_name` (an edge no file writes any more goes), then `rels`
+        are upserted. A tiered pin's edges depend on every node of its
+        name (graph/schema.py `tiered_pin`), so the relink writes such a
+        group whole rather than adding an edge (dispatch
+        `_relink_name_refs`)."""
+        by_type: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for group in groups:
+            by_type.setdefault((group["from_label"], group["rel_type"], group["to_label"]), []).append(group)
+        with self._driver.session() as session:
+            session.execute_write(_rerun_edges_tx, repo_id, by_type, rels)
+
+    def rebuild_claim_records(self, repo_id: str) -> None:
+        """Rewrite every code Module's `shared_claims` from the claims the
+        shared nodes themselves hold (their `sources`), in one read and one
+        write: a full scan starts with it, so a record that lost a claim (a
+        write that failed between its claim and its record, or a version
+        without the record's lock) is healed before the scan relies on it."""
+        with self._driver.session() as session:
+            session.execute_write(_rebuild_claim_records_tx, repo_id)
+
     def replace_file_nodes(
         self,
         repo_id: str,
@@ -1209,7 +1549,7 @@ class GraphEngine:
         read-committed isolation it sees either the pre-reindex state or the
         fully-rebuilt state, never in between.
 
-        `service_api` (a Python file) also unclaims the file from the
+        `service_api` (a file of SERVICE_API_SUFFIXES) also unclaims the file from the
         owning-service USES and the Endpoint CALLS/IMPLEMENTS edges it wrote,
         which `nodes`/`rels` and index_paths' service pass write again. The
         file is always unclaimed from the edges it wrote out of other files'
@@ -1258,9 +1598,12 @@ class GraphEngine:
         """Delete one provider's nodes at these repo-relative paths, or below them."""
         if not paths:
             return
+        nodes = self._provider_nodes(repo_id)
+        if nodes is None:
+            return
         with self._driver.session() as session:
             _run(
-                session, _DELETE_EXTRACTED_PATHS_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
+                session, nodes + _DELETE_EXTRACTED_PATHS_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
             )
 
     def extracted_nodes_at(self, repo_id: str, extractor: str, paths: list[str]) -> set[tuple[str, str]]:
@@ -1268,9 +1611,12 @@ class GraphEngine:
         the nodes delete_extracted_nodes would delete."""
         if not paths:
             return set()
+        nodes = self._provider_nodes(repo_id)
+        if nodes is None:
+            return set()
         with self._driver.session() as session:
             result = _run_records(
-                session, _EXTRACTED_NODES_AT_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
+                session, nodes + _EXTRACTED_NODES_AT_CYPHER, repo_id=repo_id, extractor=extractor, paths=paths
             )
             return {(record["label"], record["name"]) for record in result or []}
 
@@ -1278,10 +1624,13 @@ class GraphEngine:
         """(label, name, path) of every node one provider wrote under these labels in a repo."""
         if not labels:
             return set()
+        nodes = self._provider_nodes(repo_id, labels)
+        if nodes is None:
+            return set()
         with self._driver.session() as session:
             result = _run_records(
                 session,
-                "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] IN $labels "
+                nodes + "WITH n WHERE n.extractor = $extractor AND labels(n)[0] IN $labels "
                 "RETURN labels(n)[0] AS label, n.name AS name, n.path AS path",
                 repo_id=repo_id, extractor=extractor, labels=labels,
             )
@@ -1291,10 +1640,13 @@ class GraphEngine:
         """The `path` of every node one provider wrote in a repo, only under
         these labels when `labels` is given: the provider's side of the graph's
         file list (see dispatch._graph_files)."""
+        nodes = self._provider_nodes(repo_id, labels or ())
+        if nodes is None:
+            return set()
         with self._driver.session() as session:
             result = _run_records(
                 session,
-                "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor "
+                nodes + "WITH n WHERE n.extractor = $extractor "
                 "AND ($labels IS NULL OR labels(n)[0] IN $labels) AND n.path IS NOT NULL "
                 "RETURN DISTINCT n.path AS path",
                 repo_id=repo_id, extractor=extractor, labels=labels,
@@ -1307,9 +1659,12 @@ class GraphEngine:
         The full-scan reconcile for provider-owned nodes: it also removes nodes
         of a label the schema no longer declares.
         """
+        nodes = self._provider_nodes(repo_id, [entry.split(":", 1)[0] for entry in keep])
+        if nodes is None:
+            return 0
         with self._driver.session() as session:
             result = _run_records(
-                session, _PRUNE_EXTRACTED_CYPHER, repo_id=repo_id, extractor=extractor, keep=keep
+                session, nodes + _PRUNE_EXTRACTED_CYPHER, repo_id=repo_id, extractor=extractor, keep=keep
             )
             records = [record.data() for record in result or []]
         return records[0]["pruned"] if records else 0
@@ -1318,9 +1673,12 @@ class GraphEngine:
         """Delete one provider's nodes at exactly these paths, except `keep` ("Label:name")."""
         if not paths:
             return 0
+        nodes = self._provider_nodes(repo_id, [entry.split(":", 1)[0] for entry in keep])
+        if nodes is None:
+            return 0
         with self._driver.session() as session:
             result = _run_records(
-                session, _PRUNE_EXTRACTED_AT_CYPHER,
+                session, nodes + _PRUNE_EXTRACTED_AT_CYPHER,
                 repo_id=repo_id, extractor=extractor, paths=paths, keep=keep,
             )
             records = [record.data() for record in result or []]
@@ -1331,9 +1689,12 @@ class GraphEngine:
         or across the whole repo when `paths` is None."""
         if paths is not None and not paths:
             return 0
+        nodes = self._provider_nodes(repo_id)
+        if nodes is None:
+            return 0
         with self._driver.session() as session:
             result = _run_records(
-                session, _DELETE_EXTRACTED_EDGES_CYPHER, repo_id=repo_id, extractor=extractor,
+                session, nodes + _DELETE_EXTRACTED_EDGES_CYPHER, repo_id=repo_id, extractor=extractor,
                 paths=paths, builtin_types=list(RELATIONSHIP_TYPES),
             )
             records = [record.data() for record in result or []]
@@ -1351,9 +1712,12 @@ class GraphEngine:
         # Runtime import: see the TYPE_CHECKING note at the top of this module.
         from devgraph.config.project_schema import PROPERTY_NAME_PATTERN
 
+        nodes = self._provider_nodes(repo_id, [label])
+        if nodes is None:
+            return []
         params = {"repo_id": repo_id, "extractor": extractor, "label": label}
         with self._driver.session() as session:
-            result = _run_records(session, _EXTRACTED_PROPERTY_KEYS_CYPHER, **params)
+            result = _run_records(session, nodes + _EXTRACTED_PROPERTY_KEYS_CYPHER, **params)
             present = [record["key"] for record in result or []]
             stale = sorted(
                 key for key in present
@@ -1364,12 +1728,7 @@ class GraphEngine:
             )
             if stale:
                 removals = ", ".join(f"n.`{key}`" for key in stale)
-                _run(
-                    session,
-                    "MATCH (n {repo_id: $repo_id}) WHERE n.extractor = $extractor AND labels(n)[0] = $label "
-                    f"REMOVE {removals}",
-                    **params,
-                )
+                _run(session, nodes + _EXTRACTED_OF_LABEL + f"REMOVE {removals}", **params)
         return stale
 
     def read_applied_schema(self, repo_id: str) -> dict[str, Any] | None:
@@ -1458,6 +1817,16 @@ class GraphEngine:
         with self._driver.session() as session:
             result = _run_records(session, _READ_ALL_APPLIED_SCHEMAS_CYPHER)
             return [record.data() for record in result or []]
+
+    def record_schema_labels(self, repo_id: str, labels: list[str]) -> None:
+        """Record the user labels the repository's graph may hold, ahead of a
+        schema apply that writes them (see dispatch._apply_project_schema)."""
+        with self._driver.session() as session:
+            _run(
+                session,
+                "MERGE (r:Repository {repo_id: $repo_id}) SET r.schema_labels = $labels",
+                repo_id=repo_id, labels=labels,
+            )
 
     def record_applied_schema(
         self,
@@ -1686,6 +2055,61 @@ class GraphEngine:
             if label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or "")
         ]
 
+    def _user_labels_in_use(self) -> list[str]:
+        """Every label the database knows (`CALL db.labels()`) that is no
+        built-in one: a provider node can carry a label no schema records any
+        more (written before a crash cut its apply short, then dropped from
+        the schema), and a console-made node any label at all. Validated,
+        since they are interpolated. User labels are few, and each is matched
+        by its own label scan."""
+        from devgraph.config.project_schema import LABEL_PATTERN  # runtime import: see TYPE_CHECKING above
+
+        with self._driver.session() as session:
+            result = _run_records(session, "CALL db.labels() YIELD label RETURN label")
+        return [
+            record["label"] for record in result or []
+            if record["label"] not in NAMED_LABELS and record["label"] != "Repository"
+            and LABEL_PATTERN.fullmatch(record["label"] or "")
+        ]
+
+    def _provider_nodes(self, repo_id: str, labels: Iterable[str] = ()) -> str | None:
+        """The repository's nodes of every label a provider node can carry, as
+        a `_union` yielding `n`, each label matched on its own: its applied
+        schema's labels, `labels` (one being written before the schema is
+        recorded) and every other non-built-in label in use, which catches
+        nodes of a label no record names any more. None when there are no
+        such labels, so there is nothing to match. Labels that aren't a valid
+        user label are dropped, since they are interpolated."""
+        from devgraph.config.project_schema import LABEL_PATTERN  # runtime import: see TYPE_CHECKING above
+
+        extra = [label for label in labels if label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or "")]
+        names = sorted(set(self._schema_labels(repo_id)) | set(extra) | set(self._user_labels_in_use()))
+        if not names:
+            return None
+        return _union(f"MATCH (n:{label}) WHERE n.repo_id = $repo_id RETURN n" for label in names)
+
+    def repository_nodes(self, repo_ids: list[str]) -> str:
+        """Every node of these repositories (the query's `$repo_ids`) as a
+        `_union` yielding `n`: each named label through its `(repo_id, name)`
+        index, the Repository nodes, and every other label in use (their
+        applied schemas' and any a node carries without a record, see
+        `_user_labels_in_use`), each by its own label scan. For
+        whole-repository reads (the dashboard's counts), which matched
+        `{repo_id}` alone and so scanned every node in the database.
+
+        A built-in node without a `name` is left out: the `(repo_id, name)`
+        index doesn't hold it, and finding one would scan every node of its
+        label. Only a console or manual write makes one; the extractors key
+        every node on its name."""
+        user = sorted(
+            {label for repo_id in repo_ids for label in self._schema_labels(repo_id)} | set(self._user_labels_in_use())
+        )
+        return _union(
+            [f"MATCH (n:{label}) WHERE n.repo_id IN $repo_ids AND n.name IS NOT NULL RETURN n" for label in NAMED_LABELS]
+            + ["MATCH (n:Repository) WHERE n.repo_id IN $repo_ids RETURN n"]
+            + [f"MATCH (n:{label}) WHERE n.repo_id IN $repo_ids RETURN n" for label in user]
+        )
+
     def entity_names(self, repo_id: str, names: list[str] | None) -> list[tuple[str, str]]:
         """(name, label) of every named node of the repository, or only of
         those named one of `names`: the mentions extractor's known entities.
@@ -1704,19 +2128,31 @@ class GraphEngine:
         records = self.run_cypher(query, {"repo_id": repo_id, "names": names})
         return [(record["name"], record["label"]) for record in records]
 
-    def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str, str]]:
-        """Return (label, name, file) for every node whose file provenance
+    def list_file_nodes(
+        self, repo_id: str, files: list[str],
+    ) -> set[tuple[str, str, str, str, tuple[str, ...] | None, bool, str | None]]:
+        """Return (label, name, file, owner, mkeys, stale, proj) for every node whose file provenance
         (`source_file`/`file`, a `Module` named by its path, or a schema
         provider's node, which its `path` owns) is one of `files`. `file` is
         that provenance: the Module's name, else `file`, `source_file` or
         `path`, in that order. A shared node one of `files` claims (in its
         `sources`: a `Container`, `Datastore`, `Endpoint` or handler stub) is
         returned with `file` "", besides any row for its own provenance.
+        `owner` is a code symbol's (graph/schema.py FILE_SCOPED_LABELS), ""
+        for any node without a `file`, and None for one an index older than
+        owners wrote: the batch then counts the node it writes as added, so
+        other files' edges into it are relinked (a file that failed during
+        the upgrade rescan, indexed again). `mkeys` is the node's match keys,
+        sorted (None when it has none), and `stale` whether a batch that
+        changed them has yet to finish relinking its edges (see
+        write_match_keys); `proj` is its C# project (None when it has
+        none), which decides its edges as its keys do.
 
         index_paths snapshots this before re-indexing a batch so it can tell
         which nodes the batch *adds* -- only those can be the missing
         target of an edge from a file outside the batch. A node moving
-        between two of the batch's files counts as added.
+        between two of the batch's files counts as added. It also tells
+        which kept nodes' match keys change (see write_match_keys).
 
         Each label is matched on its own: the built-in ones through their
         provenance indexes, a provider's through the labels the repository's
@@ -1741,20 +2177,79 @@ class GraphEngine:
                 "   any(s IN coalesce(n.sources, []) WHERE s IN $files) AS claimed "
                 "WHERE owned OR claimed "
                 "RETURN DISTINCT labels(n)[0] AS label, n.name AS name, owned, claimed, "
-                "CASE WHEN n:Module THEN n.name ELSE coalesce(n.file, n.source_file, n.path) END AS file",
+                "CASE WHEN n:Module THEN n.name ELSE coalesce(n.file, n.source_file, n.path) END AS file, "
+                "CASE WHEN n.file IS NULL THEN '' ELSE n.owner END AS owner, "
+                "n.mkeys AS mkeys, coalesce(n.mkeys_stale, false) AS stale, n.proj AS proj",
                 repo_id=repo_id,
                 files=files,
             )
-            records = list(result or [])
-            return {(r["label"], r["name"], r["file"]) for r in records if r["owned"]} | {
-                (r["label"], r["name"], "") for r in records if r["claimed"]
-            }
+            records = [(r, None if r["mkeys"] is None else tuple(sorted(set(r["mkeys"])))) for r in result or []]
+            return {
+                (r["label"], r["name"], r["file"], r["owner"], keys, r["stale"], r["proj"])
+                for r, keys in records if r["owned"]
+            } | {(r["label"], r["name"], "", "", keys, r["stale"], r["proj"]) for r, keys in records if r["claimed"]}
 
-    def find_name_refs(self, repo_id: str, names: list[str], skip: list[str]) -> list[tuple[str, list[str]]]:
-        """(Module name, entries) for every Module outside `skip` whose
+    def write_match_keys(
+        self, repo_id: str, nodes: list[tuple[str, str, str, str, tuple[str, ...] | None, str | None, bool]],
+    ) -> None:
+        """Write these (label, name, file, owner, mkeys, proj, retract) nodes' match keys
+        (`mkeys`; None removes them) and C# project (`proj`, which a row's
+        `vis` tests, see `_visible`; None removes it), which a batch's own
+        node writes leave as they were until now, so a pin's `@` flag
+        (graph/schema.py `split_pin`) only ever sees one node's old keys
+        with its old edges.
+        A node to `retract` loses its CALLS and IMPORTS edges, which those
+        pins linked under its old keys, in the same transaction, and stays
+        `mkeys_stale` until settle_match_keys: the batch writes them again
+        under the new keys, the way it writes an added node's, and a batch
+        that fails before then finds it stale and does it again. Each
+        label's (repo_id, name, file, owner) index is hinted to seek, for the reason
+        _end_match gives, and RETRACT_NODES nodes go per transaction, so a
+        format upgrade that rekeys a whole repository never holds one
+        transaction over all of it. Every other edge stays."""
+        self._per_label_chunk(
+            repo_id, [((label, name, file, owner), {"mkeys": list(keys) if keys is not None else None,
+                                                    "proj": proj, "retract": retract})
+                      for label, name, file, owner, keys, proj, retract in nodes],
+            "SET b.mkeys = row.mkeys, b.proj = row.proj, b.mkeys_stale = CASE WHEN row.retract THEN true END "
+            f"WITH b, row WHERE row.retract MATCH ()-[r:{'|'.join(MATCH_KEY_EDGE_TYPES)}]->(b) DELETE r",
+        )
+
+    def settle_match_keys(self, repo_id: str, nodes: list[tuple[str, str, str, str]]) -> None:
+        """Clear `mkeys_stale` (see write_match_keys) off these (label, name,
+        file, owner) nodes once their edges are written again."""
+        self._per_label_chunk(repo_id, [(node, {}) for node in nodes], "REMOVE b.mkeys_stale")
+
+    def _per_label_chunk(
+        self, repo_id: str, nodes: list[tuple[tuple[str, str, str, str], dict]], update: str
+    ) -> None:
+        """Run `update` on each (label, name, file, owner) node `b`, with its own
+        `row` fields, RETRACT_NODES nodes per transaction (see
+        write_match_keys), each consumed inside its retry (`_run`), so a
+        chunk that fails, the last one included, raises."""
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for (label, name, file, owner), fields in nodes:
+            groups.setdefault(label, []).append({"name": name, "file": file, "owner": owner, **fields})
+        with self._driver.session() as session:
+            for label, rows in sorted(groups.items()):
+                for start in range(0, len(rows), RETRACT_NODES):
+                    _run(
+                        session,
+                        f"UNWIND $rows AS row MATCH (b:{label} "
+                        "{repo_id: $repo_id, name: row.name, file: row.file, owner: row.owner}) "
+                        f"USING INDEX SEEK b:{label}(repo_id, name, file, owner) " + update,
+                        repo_id=repo_id,
+                        rows=rows[start:start + RETRACT_NODES],
+                    )
+
+    def find_name_refs(
+        self, repo_id: str, names: list[str], skip: list[str],
+    ) -> list[tuple[str, list[str], list[str]]]:
+        """(Module name, entries, visible) for every Module outside `skip` whose
         `name_refs` (see indexer/common.py `name_ref_properties`) target, or
         come from an unpinned source, named one of `names`, with just those
-        entries. The short `name_ref_targets`/`name_ref_sources` lists filter
+        entries, and the projects its file's sites see (its
+        `name_ref_visible`, empty for every project). The short `name_ref_targets`/`name_ref_sources` lists filter
         the Modules before any entry is split. The Module index is hinted to
         seek, for the reason _end_match gives."""
         with self._driver.session() as session:
@@ -1765,14 +2260,15 @@ class GraphEngine:
                 "  AND (any(t IN m.name_ref_targets WHERE t IN $names) "
                 "       OR any(s IN m.name_ref_sources WHERE s IN $names)) "
                 "RETURN m.name AS origin, "
-                "       [e IN m.name_refs WHERE split(e, $sep)[5] IN $names OR split(e, $sep)[2] IN $names] AS refs",
+                "       [e IN m.name_refs WHERE split(e, $sep)[5] IN $names OR split(e, $sep)[2] IN $names] AS refs, "
+                "       coalesce(m.name_ref_visible, []) AS visible",
                 repo_id=repo_id,
                 names=names,
                 skip=skip,
                 sep=NAME_REF_SEP,
             )
             records = result or []
-            return [(record["origin"], list(record["refs"])) for record in records]
+            return [(record["origin"], list(record["refs"]), list(record["visible"])) for record in records]
 
     def find_mentioning_documents(
         self, repo_id: str, pairs: list[tuple[str, str]], batch_keys: list[str]
@@ -2041,8 +2537,11 @@ class GraphEngine:
         plane for `devgraph.tools.yaml` tools.
         """
 
+        connected = []
+
         @unit_of_work(timeout=timeout_s)
         def work(tx):
+            connected.append(True)
             rows: list[dict] = []
             for record in tx.run(query, parameters):
                 if len(rows) == max_rows:
@@ -2050,10 +2549,34 @@ class GraphEngine:
                 rows.append(record.data())
             return rows, False
 
+        if not self._fail_fast:
+            with self._driver.session(default_access_mode=READ_ACCESS) as session:
+                return session.execute_read(work)
+        try:
+            with self._driver.session(default_access_mode=READ_ACCESS) as session:
+                return session.execute_read(work)
+        except ABORTS_BATCH:
+            raise
+        except _RETRYABLE_EXCEPTIONS as exc:
+            timed_out = "TransactionTimedOut" in str(getattr(exc, "code", None) or "")
+            if not connected or timed_out:  # Neo4j can't be reached, or the query ran out of time
+                raise
+        time.sleep(FAIL_FAST_RETRY_PAUSE_S)
         with self._driver.session(default_access_mode=READ_ACCESS) as session:
             return session.execute_read(work)
 
-    def run_cypher_graph(self, query: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+    def probe_connectivity(self) -> None:
+        """One connectivity check, not retried: raises at once when Neo4j can't be reached."""
+        self._driver.verify_connectivity()
+
+    def run_cypher_graph(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        timeout_s: float | None = None,
+        max_rows: int | None = None,
+    ) -> dict[str, Any]:
         """Same escape hatch as `run_cypher`, but preserves node/relationship
         graph structure instead of flattening records with `.data()`.
 
@@ -2070,28 +2593,48 @@ class GraphEngine:
         `element_id` here would silently break that round trip. Same gating
         rule as `run_cypher`: never wire this up as a default/unauthenticated
         path.
+
+        `timeout_s` is the server-side transaction timeout; `max_rows` stops
+        pulling rows after that many (see `_graph_shaped`).
         """
         with self._driver.session() as session:
-            return _graph_shaped(session.run(query, parameters or {}))  # type: ignore[arg-type]
+            result = session.run(Query(query, timeout=timeout_s), parameters or {})  # type: ignore[arg-type]
+            return _graph_shaped(result, max_rows)
 
-    def preview_cypher_graph(self, query: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+    def preview_cypher_graph(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        timeout_s: float | None = None,
+        max_rows: int | None = None,
+    ) -> dict[str, Any]:
         """`run_cypher_graph`, but in a read transaction: the server refuses
         any write. Backs the console's live preview, which fires while the
         user is still typing and so must never change the graph."""
 
+        @unit_of_work(timeout=timeout_s)
         def work(tx):
-            return _graph_shaped(tx.run(query, parameters or {}))
+            return _graph_shaped(tx.run(query, parameters or {}), max_rows)
 
         with self._driver.session(default_access_mode=READ_ACCESS) as session:
             return session.execute_read(work)
 
 
-def _graph_shaped(result: Any) -> dict[str, Any]:
+def _graph_shaped(result: Any, max_rows: int | None = None) -> dict[str, Any]:
     """A Cypher result as Neo4j's HTTP `["row","graph"]` shape (see
-    `GraphEngine.run_cypher_graph`), consumed fully before returning."""
+    `GraphEngine.run_cypher_graph`), consumed fully before returning, or only
+    its first `max_rows` rows: `truncated` says whether more existed."""
     columns = list(result.keys())
     data: list[dict[str, Any]] = []
+    truncated = False
     for record in result:
+        if max_rows is not None and len(data) == max_rows:
+            # The rest is discarded, not sent; the query still runs to its end
+            # (bounded by the transaction timeout), and a failure there is raised.
+            result.consume()
+            truncated = True
+            break
         nodes: dict[int, dict[str, Any]] = {}
         rels: dict[int, dict[str, Any]] = {}
 
@@ -2120,6 +2663,7 @@ def _graph_shaped(result: Any) -> dict[str, Any]:
                         properties.get("repo_id") or "",
                         name,
                         properties.get("file"),
+                        properties.get("owner"),
                     ) if isinstance(name, str) else None,
                 }
             elif isinstance(value, Relationship):
@@ -2148,7 +2692,7 @@ def _graph_shaped(result: Any) -> dict[str, Any]:
                 "graph": {"nodes": list(nodes.values()), "relationships": list(rels.values())},
             }
         )
-    return {"columns": columns, "data": data}
+    return {"columns": columns, "data": data, "truncated": truncated}
 
 
 def provision_repository_schema(engine: GraphEngine, repo_root: Path | str) -> None:

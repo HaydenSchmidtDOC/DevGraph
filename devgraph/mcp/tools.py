@@ -99,6 +99,10 @@ BUILTIN_TIMEOUT_S = 30
 #: or aggregates, so this only guards against an unbounded result.
 BUILTIN_MAX_ROWS = 100_000
 
+#: Most files whose same-named targets `impact_analysis` traces apart; past it
+#: one expansion covers them all (with a notice to pass `file`).
+IMPACT_MAX_SPLIT = 5
+
 #: How many CALLS/USES/DEPENDS_ON hops `impact_analysis` and
 #: `impact_analysis_for_diff` follow for transitive dependents. An unbounded
 #: variable-length path hangs on a real repository's call graph, and a
@@ -106,12 +110,13 @@ BUILTIN_MAX_ROWS = 100_000
 IMPACT_MAX_DEPTH = 4
 
 
-def _impact_expansion(cross_repo: bool) -> str:
+def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     """Cypher continuing from `WITH collect(n) AS l0` (the changed nodes): one
     CALL per hop collecting the distinct nodes with a CALLS/USES/DEPENDS_ON edge
     into the previous hop's nodes, never one seen at an earlier hop, then
     returning `direct_dependents` (hop 1), `transitive_dependents` (hops 2 to
-    `IMPACT_MAX_DEPTH`), `direct_count` and `matched` (the changed nodes' {name, file}).
+    `IMPACT_MAX_DEPTH`), `direct_count` and `matched` (the changed nodes' {name, file, owner}).
+    `with_ids` adds each dependent's `id` (its elementId).
 
     Expanding distinct nodes hop by hop does work proportional to the nodes
     and edges within reach; a variable-length path enumerates every path, which
@@ -128,10 +133,11 @@ def _impact_expansion(cross_repo: bool) -> str:
             f"RETURN collect(DISTINCT d) AS l{hop} }}"
         )
     transitive = " + ".join(f"l{k}" for k in range(2, IMPACT_MAX_DEPTH + 1))
+    ref = "{name: d.name, type: labels(d)[0]" + (", id: elementId(d)}" if with_ids else "}")
     parts.append(
-        "RETURN [d IN l1 | {name: d.name, type: labels(d)[0]}] AS direct_dependents, "
-        f"[d IN {transitive} | {{name: d.name, type: labels(d)[0]}}] AS transitive_dependents, "
-        "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file}] AS matched"
+        f"RETURN [d IN l1 | {ref}] AS direct_dependents, "
+        f"[d IN {transitive} | {ref}] AS transitive_dependents, "
+        "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched"
     )
     return "\n".join(parts)
 
@@ -147,6 +153,27 @@ def _timeouts_as_tool_errors() -> Iterator[None]:
         if "TransactionTimedOut" in str(getattr(exc, "code", None) or ""):
             raise ToolError(f"query timed out after {BUILTIN_TIMEOUT_S} s; narrow the request") from exc
         raise
+
+
+def neo4j_unavailable(exc: BaseException, uri: str) -> ToolError | None:
+    """A ToolError saying how to reach Neo4j at `uri` when `exc` is the driver
+    failing to connect or authenticate; None for anything else. A closing
+    engine or an index still being built is not a connection problem."""
+    from neo4j.exceptions import AuthError, ServiceUnavailable
+
+    from devgraph.graph.engine import EngineClosed, IndexesNotReady
+
+    if isinstance(exc, AuthError):
+        return ToolError(
+            f"Neo4j at {uri} refused the username or password; check DEVGRAPH_NEO4J_USER and "
+            "DEVGRAPH_NEO4J_PASSWORD (`devgraph doctor` checks the connection)"
+        )
+    if isinstance(exc, ServiceUnavailable) and not isinstance(exc, (EngineClosed, IndexesNotReady)):
+        return ToolError(
+            f"Neo4j isn't reachable at {uri}; start Neo4j (`podman start devgraph-neo4j`; on Windows "
+            "and macOS run `podman machine start` first), then retry (`devgraph doctor` checks the connection)"
+        )
+    return None
 
 
 #: Repository ids a cross_repo query may reach. The MCP server sets it, per
@@ -323,7 +350,7 @@ _SEARCH_TIER = (
 _SEARCH_FILE = "CASE WHEN coalesce(n.file, '') <> '' THEN n.file ELSE coalesce(n.path, n.source_file, n.source) END"
 _SEARCH_ROW = (
     "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, description: n.description, "
-    f"file: {_SEARCH_FILE}}}"
+    f"file: {_SEARCH_FILE}, owner: CASE WHEN n.file IS NOT NULL THEN coalesce(n.owner, '') END}}"
 )
 
 
@@ -459,6 +486,13 @@ _DESCRIBE_NEIGHBOUR = (
     "AND ($types IS NULL OR type(r) IN $types) "
     "AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))"
 )
+#: The labels whose `owner` keys a node within its file (the declarations it
+#: is in, "" at the top level; see devgraph/graph/schema.py FILE_SCOPED_LABELS).
+_OWNED_LABELS = schema.FILE_SCOPED_LABELS
+#: Cypher for node `{v}`'s owner: "" for a top-level symbol, null for any node
+#: without a `file` (a declared type's `owner` field is its own).
+_OWNER_OF = "CASE WHEN {v}.file IS NOT NULL THEN coalesce({v}.owner, '') END"
+
 _DESCRIBE_GROUPS = f"""
 MATCH (n) WHERE elementId(n) = $id
 CALL (n) {{
@@ -482,9 +516,11 @@ CALL (n, dir, rel) {{
   WITH m WHERE m.repo_id = $repo_id AND NOT m:Repository
     AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))
   WITH DISTINCT m
-  ORDER BY m.name, coalesce(m.file, m.path)
+  ORDER BY m.name, coalesce(m.file, m.path), m.owner
   LIMIT $cap
-  RETURN collect({{label: labels(m)[0], name: m.name, file: coalesce(m.file, m.path)}}) AS refs
+  RETURN collect({{
+    label: labels(m)[0], name: m.name, file: coalesce(m.file, m.path), owner: {_OWNER_OF.format(v="m")}
+  }}) AS refs
 }}
 RETURN dir, rel, total, refs
 """
@@ -545,9 +581,47 @@ def _lookup_cypher(labels: tuple[str, ...], declared: frozenset[str]) -> str:
     return (
         f"CALL () {{\n{body}\n}}\n"
         "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, "
-        "coalesce(n.file, n.path) AS file, properties(n) AS properties\n"
+        f"coalesce(n.file, n.path) AS file, {_OWNER_OF.format(v='n')} AS owner, properties(n) AS properties\n"
         f"LIMIT {_DESCRIBE_MAX_CANDIDATES + 1}"
     )
+
+
+def _owned_lookup_cypher(labels: tuple[str, ...], companion: bool = False) -> str:
+    """`_lookup_cypher`'s match for a name qualified with its owner: the
+    Class or Function of `labels` named `$member` whose owner is `$owner`,
+    or with `companion` a member of `$owner`'s Kotlin companion."""
+    owned = _COMPANION_MEMBER.format() if companion else "n.owner = $owner"
+    body = "\n  UNION\n".join(
+        f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.name = $member AND {owned} "
+        "AND ($file IS NULL OR n.file = $file) RETURN n"
+        for label in labels if label in _OWNED_LABELS
+    )
+    return (
+        f"CALL () {{\n{body}\n}}\n"
+        "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, "
+        f"n.file AS file, n.owner AS owner, properties(n) AS properties\n"
+        f"LIMIT {_DESCRIBE_MAX_CANDIDATES + 1}"
+    )
+
+
+#: A member of `$owner`'s Kotlin companion object (anonymous `Companion` or
+#: named), which a caller names through the class (`Repo.create` for owner
+#: `Repo.Companion` or `Repo.Factory`): the companion is a Class of kind
+#: `companion` owned by `$owner` in the member's file.
+_COMPANION_MEMBER = (
+    "n.owner STARTS WITH $owner + '.' AND EXISTS {{ MATCH (c:Class) WHERE c.repo_id = n.repo_id "
+    "AND c.file = n.file AND c.owner = $owner AND c.kind = 'companion' AND n.owner = $owner + '.' + c.name }}"
+)
+
+
+def _owner_split(name: str) -> tuple[str, str] | None:
+    """`A.save` (`Outer.Inner.run`, `A::save`, `Outer::Inner::run`) as
+    (owner, member), the owner dotted: a symbol named with the declarations
+    it is in (see devgraph/indexer/common.py `member_owner`); None for a name
+    with neither separator."""
+    separator = "::" if "::" in name else "."
+    owner, found, member = name.rpartition(separator)
+    return (owner.replace("::", "."), member) if found and owner and member else None
 
 
 def _suggestions_cypher(labels: tuple[str, ...]) -> str:
@@ -587,11 +661,150 @@ def _not_found(
     )
 
 
+def _named_nodes(labels: tuple[str, ...], param: str, cross_repo: bool, var: str = "n") -> str:
+    """`CALL () { ... }` returning `var`: every node of `labels` whose name is
+    `$param`, in the repository (or in any of `cross_repo_ids`), one branch per
+    label so each can seek its `(repo_id, name)` index, never scanning every
+    node in the database. Labels are validated identifiers."""
+    scope = _cross_scope(var) if cross_repo else f"{var}.repo_id = $repo_id"
+    body = "\n  UNION\n".join(
+        f"  MATCH ({var}:`{label}`) WHERE {var}.name = ${param} AND {scope} RETURN {var}" for label in labels
+    )
+    return f"CALL () {{\n{body}\n}}\n"
+
+
+def component_labels(extra_labels: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """The labels a component name is looked up under: every built-in one but
+    Repository (`schema.NAMED_LABELS`), then the valid ones of `extra_labels`
+    (a repository's declared labels)."""
+    extra = (label for label in extra_labels if LABEL_PATTERN.fullmatch(label) and label not in schema.NAMED_LABELS)
+    return schema.NAMED_LABELS + tuple(dict.fromkeys(extra))
+
+
+def _exists(engine: GraphEngine, repo_id: str, name: str, labels: tuple[str, ...], cross_repo: bool = False) -> bool:
+    """Whether a node of `labels` is named `name` in the repository (any repository when cross_repo)."""
+    params = {"name": name} if cross_repo else {"name": name, "repo_id": repo_id}
+    return bool(_query(engine, _named_nodes(labels, "name", cross_repo) + "RETURN 1 LIMIT 1", params))
+
+
+#: Most files a row's `target_files` lists; past it the row adds `target_file_count`.
+_MAX_TARGET_FILES = 10
+
+_TARGETS_RETURN = (
+    "WITH DISTINCT labels(n)[0] AS label, n.file AS file, n.repo_id AS repo_id "
+    "RETURN label, file, repo_id ORDER BY repo_id, file, label"
+)
+
+
+def _normalize_file(file: str | None) -> str | None:
+    """A repo-relative path as the graph stores it: `/` separators, no leading `./`."""
+    if file is None:
+        return None
+    file = file.replace("\\", "/")
+    while file.startswith("./"):
+        file = file[2:]
+    return file
+
+
+#: How long the lookup under undeclared labels may take before it gives up.
+_UNDECLARED_LOOKUP_TIMEOUT_S = 3
+
+
+def _undeclared_targets(engine: GraphEngine, params: dict[str, Any], cross_repo: bool) -> list[dict]:
+    """`_TARGETS_RETURN` rows for the nodes named `$name` under a label in use that
+    is no built-in one, one label scan per label (never every node), within
+    `_UNDECLARED_LOOKUP_TIMEOUT_S`; [] when there are none or it ran out of time."""
+    from neo4j.exceptions import Neo4jError
+
+    in_use = _query(engine, "CALL db.labels() YIELD label RETURN label", {})
+    labels = [
+        r["label"] for r in in_use
+        if r["label"] not in schema.NAMED_LABELS and r["label"] != "Repository" and LABEL_PATTERN.fullmatch(r["label"])
+    ]
+    if not labels:
+        return []
+    cypher = _named_nodes(tuple(labels), "name", cross_repo) + _TARGETS_RETURN
+    try:
+        rows, _ = engine.run_read_cypher(
+            cypher, _with_cross_ids(cypher, params), timeout_s=_UNDECLARED_LOOKUP_TIMEOUT_S, max_rows=BUILTIN_MAX_ROWS
+        )
+    except Neo4jError as exc:
+        if "TransactionTimedOut" in str(getattr(exc, "code", None) or ""):
+            return []
+        raise
+    return rows
+
+
+def _resolve_targets(
+    engine: GraphEngine,
+    repo_id: str,
+    name: str,
+    cross_repo: bool,
+    file: str | None,
+    labels: tuple[str, ...],
+    describe: bool = True,
+) -> tuple[dict[str, Any] | None, tuple[str, ...], int]:
+    """Look up the nodes named `name`. Returns `ambiguous_targets` (an envelope of
+    their `{label, file}`, `repo_id` too when cross_repo, a file-less one with
+    `file` None) when they lie in more than one file and no `file` narrows them,
+    else None; the labels to look the name up under; and how many files they lie in.
+
+    The lookup seeks `labels`. When it finds nothing it falls back to the labels
+    in use that are no built-in one (`_undeclared_targets`), so a node whose label
+    the repository does not declare (any more) is still found, and its label is
+    added to the returned ones. `describe` False skips building the envelope.
+
+    Raises:
+        ToolError: no node has that name, or none of them is in `file`.
+    """
+    params = {"name": name} if cross_repo else {"name": name, "repo_id": repo_id}
+    rows = _query(engine, _named_nodes(labels, "name", cross_repo) + _TARGETS_RETURN, params)
+    if not rows:
+        rows = _undeclared_targets(engine, params, cross_repo)
+        if not rows:
+            raise _not_found(engine, repo_id, "component", name, labels, cross_repo)
+        found = (row["label"] for row in rows if LABEL_PATTERN.fullmatch(row["label"]))
+        labels = tuple(dict.fromkeys((*labels, *found)))
+    files = sorted({row["file"] for row in rows if row["file"] is not None})
+    if file is not None:
+        if file not in files:
+            shown = ", ".join(_echo(f) for f in files[:_DESCRIBE_MAX_CANDIDATES]) or "no file"
+            raise ToolError(f"no component named {_echo(name)} in file {_echo(file)}; it is defined in: {shown}")
+        return None, labels, 1
+    if len(files) < 2 or not describe:
+        return None, labels, len(files)
+    refs = [
+        {"label": row["label"], "file": row["file"], **({"repo_id": row["repo_id"]} if cross_repo else {})}
+        for row in rows
+    ]
+    ambiguous = {
+        "count": len(refs),
+        "results": [_sanitize_row(ref) for ref in refs[:_DESCRIBE_MAX_CANDIDATES]],
+        "truncated": len(refs) > _DESCRIBE_MAX_CANDIDATES,
+    }
+    return ambiguous, labels, len(files)
+
+
+def _with_target_files(row: dict[str, Any], files: Any) -> dict[str, Any]:
+    """`row` plus `target_files`: the sorted distinct non-null `files`, at most
+    `_MAX_TARGET_FILES`, and `target_file_count` when there are more."""
+    distinct = sorted({f for f in files if f is not None})
+    labelled = {**row, "target_files": distinct[:_MAX_TARGET_FILES]}
+    if len(distinct) > _MAX_TARGET_FILES:
+        labelled["target_file_count"] = len(distinct)
+    return labelled
+
+
 def _node_ref(row: dict[str, Any]) -> dict[str, Any]:
-    """`{label, name, file}` from raw values, so it re-describes exactly this node."""
+    """`{label, name, file, owner}` from raw values, so it re-describes exactly
+    this node: `file` when it has one, and then `owner` too (the declarations
+    it is in, "" at the top level), which tells it from a same-named
+    member of another declaration of its file."""
     ref = {"label": row["label"], "name": row["name"]}
     if row.get("file") is not None:
         ref["file"] = row["file"]
+    if row.get("owner") is not None:
+        ref["owner"] = row["owner"]
     return ref
 
 
@@ -616,6 +829,9 @@ def _read(engine: GraphEngine, cypher: str, params: dict[str, Any], max_rows: in
     try:
         return engine.run_read_cypher(cypher, _with_cross_ids(cypher, params), timeout_s=DEFAULT_TIMEOUT_S, max_rows=max_rows)
     except Neo4jError as exc:
+        unavailable = neo4j_unavailable(exc, getattr(engine, "uri", "the configured URI"))
+        if unavailable is not None:  # a refused login is a Neo4jError too
+            raise unavailable from exc
         code = str(getattr(exc, "code", None) or "unknown")
         if "TransactionTimedOut" in code:
             raise ToolError(
@@ -636,6 +852,7 @@ def describe_node(
     neighbor_labels: list[str] | None = None,
     max_per_type: int = 10,
     declared_labels: tuple[str, ...] = (),
+    owner: str | None = None,
 ) -> dict[str, Any]:
     """One node's properties and its relationships, grouped by type, one hop out.
 
@@ -643,7 +860,10 @@ def describe_node(
         engine: GraphEngine instance
         repo_id: Repository to look in
         name: The node's exact name; a file, folder or docs node may also be
-            named by its repo-relative path
+            named by its repo-relative path; a method or nested class by its
+            name qualified with its owner (`A.save`), when no node has that
+            exact name (a Kotlin companion's member by its class's,
+            `Repo.create` for `Repo.Companion.create`)
         label: Only nodes of this label
         file: Only nodes whose file, path or source_file is this
         direction: "both", "out" or "in"
@@ -652,14 +872,18 @@ def describe_node(
         max_per_type: Neighbours listed per relationship type, clamped to 1..50
         declared_labels: The repository's schema-declared labels to search as
             well; anything that isn't a valid label identifier is ignored
+        owner: Only the Class or Function declared in this owner (the dotted
+            classes around it, as a ref's `owner` gives it); "" for a top-level one
 
     Returns:
         `{"status": "found", "node", "outgoing", "incoming", "groups_truncated"}`,
         each group a `{count, results, truncated}` envelope of `{label, name, file}`
-        refs; or `{"status": "ambiguous", "count", "candidates", "truncated"}`.
+        refs (and `owner` for a method or nested class); or `{"status":
+        "ambiguous", "count", "candidates", "truncated"}`.
         No match raises ToolError with suggestions. `Repository` nodes are never
         matched or listed.
     """
+    file = _normalize_file(file)
     if not name.strip():
         raise ToolError("name is empty; pass a node's exact name, or search_component to find one")
     _at_least(1, max_per_type=max_per_type)
@@ -680,21 +904,33 @@ def describe_node(
     cap = max(1, min(_DESCRIBE_MAX_PER_TYPE, int(max_per_type)))
 
     params = {"repo_id": repo_id, "name": name, "file": file}
-    rows, _more = _read(engine, _lookup_cypher(labels, path_labels), params, _DESCRIBE_MAX_CANDIDATES + 1)
+    owned = (owner, name) if owner is not None else None
+    rows = []
+    if owned is None:
+        rows, _more = _read(engine, _lookup_cypher(labels, path_labels), params, _DESCRIBE_MAX_CANDIDATES + 1)
+        owned = _owner_split(name) if not rows else None
+    if owned is not None and any(each in _OWNED_LABELS for each in labels):
+        params = {**params, "owner": owned[0], "member": owned[1]}
+        rows, _more = _read(engine, _owned_lookup_cypher(labels), params, _DESCRIBE_MAX_CANDIDATES + 1)
+        if not rows:
+            # `Repo.create` written as Kotlin calls it: the member of Repo's companion.
+            rows, _more = _read(engine, _owned_lookup_cypher(labels, True), params, _DESCRIBE_MAX_CANDIDATES + 1)
 
     if not rows:
         suggestions, _ = _read(
             engine, _suggestions_cypher(labels), {"repo_id": repo_id, "name": name}, _DESCRIBE_MAX_SUGGESTIONS
         )
         filters = "".join(
-            f", {key}={_echo(value)}" for key, value in (("label", label), ("file", file)) if value is not None
+            f", {key}={_echo(value)}" for key, value in (("label", label), ("file", file), ("owner", owner))
+            if value is not None
         )
         message = f"no node named {_echo(name)}{filters} in repository {_echo(repo_id)}.{_did_you_mean(suggestions)}"
         raise ToolError(f"{message} {_DESCRIBE_HINT}.")
 
     if len(rows) > 1:
         candidates = sorted(
-            (_node_ref(row) for row in rows), key=lambda r: (r["label"], r["name"], r.get("file") or "")
+            (_node_ref(row) for row in rows),
+            key=lambda r: (r["label"], r["name"], r.get("file") or "", r.get("owner") or ""),
         )
         return {
             "status": "ambiguous",
@@ -1052,7 +1288,9 @@ def trace_request_flow(
         repo_id: Repository ID (or cross-repo search if cross_repo=True)
         start_endpoint: The endpoint's name, `"<METHOD> <path>"` (`"GET /users/<id>"`),
             or a bare path (`"/users/<id>"`), which starts from that path's endpoint
-            for every method
+            for every method. A route on a router whose mount its file doesn't show
+            is its file's own endpoint, `"<METHOD> ?<path> (<file>)"`
+            (`"GET ?/:id (routes/users.js)"`), reached by that full name only
         cross_repo: If True, cross repository boundaries
 
     Returns:
@@ -1135,6 +1373,8 @@ def find_callers(
     scope_to_class: str | None = None,
     modified_within_commits: int | None = None,
     resolved_only: bool = False,
+    file: str | None = None,
+    extra_labels: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Find all functions, services, or endpoints that call a given target.
 
@@ -1171,37 +1411,51 @@ def find_callers(
         resolved_only: If True, only return callers whose edge confidence is
             "resolved" or "package" (dropping bare-name matches and every
             edge without a confidence)
+        file: Repo-relative path of the target's defining file, to pick one of
+            several same-named targets
+        extra_labels: The repository's declared labels, looked up besides the built-in ones
 
     Returns:
         Dict with count, results, and truncated flag containing callers with their
         types, repo_id, file and confidence (same-named callers in different files
-        are separate rows)
+        are separate rows); count 0 for a known target nothing calls. When targets
+        of that name lie in several files and `file` is not given, each row adds
+        `target_files`, the files of the targets it calls (at most 10, with
+        `target_file_count` past that; a file-less target is never listed), and
+        the dict adds `ambiguous_targets`, a {count, results, truncated} envelope of their
+        {label, file} (file None for a file-less one; repo_id too when cross_repo)
+
+    Raises:
+        ToolError: no node has that name, or none in `file`.
     """
     _at_least(1, max_results=max_results, modified_within_commits=modified_within_commits)
     cutoff = None
     if modified_within_commits is not None:
         cutoff = _resolve_recency_cutoff(engine, repo_id, modified_within_commits)
+    file = _normalize_file(file)
+    ambiguous, labels, _ = _resolve_targets(engine, repo_id, target_name, cross_repo, file, component_labels(extra_labels))
+    target_files = ", collect(DISTINCT target.file) AS target_files" if ambiguous else ""
 
-    repo_filter = _cross_scope("target", "AND") if cross_repo else "AND target.repo_id = $repo_id"
     class_filter = "AND rel.caller_class = $scope_to_class" if scope_to_class else ""
     recency_filter = "AND target.last_modified_at >= $cutoff" if cutoff is not None else ""
     resolved_filter = "AND rel.confidence IN ['resolved', 'package']" if resolved_only else ""
     cypher = f"""
+    {_named_nodes(labels, "target_name", cross_repo, "target")}
     MATCH (caller)-[rel:CALLS]->(target)
-    WHERE target.name = $target_name
-    {repo_filter}
+    WHERE true
     {class_filter}
     {recency_filter}
     {resolved_filter}
+    AND ($file IS NULL OR target.file = $file)
     WITH caller, min(CASE rel.confidence WHEN 'resolved' THEN 0 WHEN 'package' THEN 1 WHEN 'name' THEN 3
-                     ELSE 2 END) AS rank
+                     ELSE 2 END) AS rank{target_files}
     RETURN caller.name as name, labels(caller) as type, caller.repo_id as repo_id,
            coalesce(caller.file, caller.source_file) as file,
-           CASE rank WHEN 0 THEN 'resolved' WHEN 1 THEN 'package' WHEN 3 THEN 'name' END as confidence
+           CASE rank WHEN 0 THEN 'resolved' WHEN 1 THEN 'package' WHEN 3 THEN 'name' END as confidence{target_files and ", target_files"}
     ORDER BY rank, name, file
     LIMIT {LIST_ROW_LIMIT + 1}
     """
-    params = {"target_name": target_name}
+    params = {"target_name": target_name, "file": file}
     if not cross_repo:
         params["repo_id"] = repo_id
     if scope_to_class:
@@ -1210,7 +1464,12 @@ def find_callers(
         params["cutoff"] = cutoff
 
     results, more = _list_query(engine, cypher, params)
-    return _capped_envelope(results, more, max_results)
+    if ambiguous:
+        results = [_with_target_files(row, row["target_files"]) for row in results]
+    envelope = _capped_envelope(results, more, max_results)
+    if ambiguous:
+        envelope["ambiguous_targets"] = ambiguous
+    return envelope
 
 
 def find_related_files(
@@ -1219,6 +1478,8 @@ def find_related_files(
     component_name: str,
     cross_repo: bool = False,
     max_results: int = 15,
+    file: str | None = None,
+    extra_labels: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Find all files related to a component (via CONTAINS, IMPORTS, CALLS relationships).
 
@@ -1230,43 +1491,59 @@ def find_related_files(
         component_name: Name of the component
         cross_repo: If True, include cross-repo relationships
         max_results: Maximum number of results per list to return in the envelope
+        file: Repo-relative path of the component's defining file, to pick one of
+            several same-named components
+        extra_labels: The repository's declared labels, looked up besides the built-in ones
 
     Returns:
         Dict with containing_modules, imported_modules, and related_components,
         each wrapped as {count, results, truncated} envelope objects.
         imported_modules are the names of what `component_name` IMPORTS: a
-        Module's path, or, for a Kotlin import, the Class or Function it names
+        Module's path, or, for a Kotlin import, the Class or Function it names.
+        When components of that name lie in several files and `file` is not
+        given, each row is `{name, target_files}` (the files of the components it
+        is related to, capped as in find_callers) instead of a bare name, and the
+        dict adds `ambiguous_targets`, a {count, results, truncated} envelope of their
+        {label, file} (file None for a file-less one; repo_id too when cross_repo)
+
+    Raises:
+        ToolError: no node has that name, or none in `file`.
     """
     _at_least(1, max_results=max_results)
-    repo_filter = _cross_scope("n", "WHERE") if cross_repo else "WHERE n.repo_id = $repo_id"
+    file = _normalize_file(file)
+    ambiguous, labels, _ = _resolve_targets(
+        engine, repo_id, component_name, cross_repo, file, component_labels(extra_labels)
+    )
     cypher = f"""
-    MATCH (n {{name: $component_name}})
-    {repo_filter}
+    {_named_nodes(labels, "component_name", cross_repo)}
+    WITH n WHERE $file IS NULL OR n.file = $file
     OPTIONAL MATCH (m:Module)-[:CONTAINS*]->(n)
     OPTIONAL MATCH (n)-[:IMPORTS]->(imported)
     OPTIONAL MATCH (n)-[:CALLS]->(related)
-    RETURN
+    WITH CASE WHEN $split THEN n.file END AS target_file, m, imported, related
+    RETURN target_file,
         COLLECT(DISTINCT m.name) as containing_modules,
         COLLECT(DISTINCT imported.name) as imported_modules,
         COLLECT(DISTINCT related.name) as related_components
+    ORDER BY target_file
     """
-    params = {"component_name": component_name}
+    params = {"component_name": component_name, "file": file, "split": bool(ambiguous)}
     if not cross_repo:
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if results:
-        row = results[0]
-        return {
-            "containing_modules": _envelope(row["containing_modules"], max_results),
-            "imported_modules": _envelope(row["imported_modules"], max_results),
-            "related_components": _envelope(row["related_components"], max_results),
-        }
-    return {
-        "containing_modules": _envelope([], max_results),
-        "imported_modules": _envelope([], max_results),
-        "related_components": _envelope([], max_results),
-    }
+    keys = ("containing_modules", "imported_modules", "related_components")
+    if not ambiguous:
+        return {key: _envelope(results[0][key], max_results) for key in keys}
+    answer: dict[str, Any] = {}
+    for key in keys:
+        by_name: dict[str, list[str]] = {}
+        for row in results:
+            for name in row[key]:
+                by_name.setdefault(name, []).append(row["target_file"])
+        answer[key] = _envelope([_with_target_files({"name": name}, f) for name, f in by_name.items()], max_results)
+    answer["ambiguous_targets"] = ambiguous
+    return answer
 
 
 def summarise_repository(
@@ -1325,15 +1602,19 @@ _COMPARE_LISTS = ("added", "removed", "changed")
 _COMPARE_CALLERS_CYPHER = """
 UNWIND $targets AS t
 CALL (t) {
-  MATCH (n:Function {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+  MATCH (n:Function {repo_id: $repo_id, name: t.name, file: t.file}) WHERE n.owner IS NULL OR n.owner = t.owner
+  RETURN n
   UNION
-  MATCH (n:Class {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+  MATCH (n:Class {repo_id: $repo_id, name: t.name, file: t.file}) WHERE n.owner IS NULL OR n.owner = t.owner
+  RETURN n
 }
 MATCH (caller)-[:CALLS]->(n)
 WHERE caller.repo_id = $repo_id
 RETURN DISTINCT caller.name AS caller, labels(caller)[0] AS caller_type,
-       caller.file AS caller_file, n.name AS calls, n.file AS calls_file
-ORDER BY caller_file, caller, calls_file, calls
+       caller.file AS caller_file,
+       CASE WHEN caller.file IS NOT NULL THEN coalesce(caller.owner, '') END AS caller_owner,
+       n.name AS calls, n.file AS calls_file, coalesce(n.owner, '') AS calls_owner
+ORDER BY caller_file, caller_owner, caller, calls_file, calls_owner, calls
 """
 
 
@@ -1417,7 +1698,7 @@ def compare_branches(
             symbol_counts[name] += len(change.symbols[name])
         for name in ("changed", "removed"):
             for entry in change.symbols[name]:
-                target = {"name": entry["name"], "file": change.path}
+                target = {"name": entry["name"], "file": change.path, "owner": entry.get("owner", "")}
                 if target not in targets:
                     targets.append(target)
     callers, notices = _compare_callers(engine, repo_id, targets, git_compare._COMPARE_MAX_CALLERS)
@@ -1446,6 +1727,8 @@ def impact_analysis(
     component_name: str,
     cross_repo: bool = False,
     max_results: int = 15,
+    file: str | None = None,
+    extra_labels: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Analyze the impact of changing a component on the rest of the system.
 
@@ -1459,33 +1742,85 @@ def impact_analysis(
         component_name: Name of the component to analyze
         cross_repo: If True, include cross-repo impacts
         max_results: Maximum number of results per dependents list to return in the envelope
+        file: Repo-relative path of the component's defining file, to pick one of
+            several same-named components
+        extra_labels: The repository's declared labels, looked up besides the built-in ones
 
     Returns:
         Dict with direct_dependents and transitive_dependents wrapped as {count, results, truncated}
         envelopes, plus risk_level (computed from true untruncated count). Transitive
         dependents are 2 to `IMPACT_MAX_DEPTH` hops away; a node is listed at its
-        nearest hop only, so a direct dependent is never also transitive.
+        nearest hop only, so a direct dependent is never also transitive. When
+        components of that name lie in several files and `file` is not given, the
+        dict adds `ambiguous_targets`, a {count, results, truncated} envelope of their
+        {label, file} (file None for a file-less one; repo_id too when cross_repo). Up to `IMPACT_MAX_SPLIT` files, each file's are traced
+        apart: a dependent is listed at its nearest hop to any of them, with
+        `target_files` (capped as in find_callers): for a direct dependent the
+        files of the targets it depends on directly, for a transitive one those of
+        every target that reaches it within `IMPACT_MAX_DEPTH` hops; risk_level is
+        the riskiest target's. Past that, one expansion covers them all, as for a
+        single target, with a notice to pass `file`. Another same-named target can
+        itself be listed as a dependent.
+
+    Raises:
+        ToolError: no node has that name, or none in `file`.
     """
     _at_least(1, max_results=max_results)
-    repo_filter = _cross_scope("n", "WHERE") if cross_repo else "WHERE n.repo_id = $repo_id"
+    file = _normalize_file(file)
+    ambiguous, labels, files = _resolve_targets(
+        engine, repo_id, component_name, cross_repo, file, component_labels(extra_labels)
+    )
+    # Each file's targets are traced apart only for a few files: the expansion
+    # runs once per file, and a name like `get` is defined in hundreds.
+    split = ambiguous is not None and files <= IMPACT_MAX_SPLIT
     cypher = f"""
-    MATCH (n {{name: $component_name}})
-    {repo_filter}
-    WITH collect(n) AS l0
-    {_impact_expansion(cross_repo)}
+    {_named_nodes(labels, "component_name", cross_repo)}
+    WITH n WHERE $file IS NULL OR n.file = $file
+    WITH CASE WHEN $split THEN n.file END AS target_file, collect(n) AS l0
+    CALL (l0) {{
+    {_impact_expansion(cross_repo, with_ids=split)}
+    }}
+    RETURN target_file, direct_dependents, transitive_dependents, direct_count
+    ORDER BY target_file
     """
-    params = {"component_name": component_name}
+    params = {"component_name": component_name, "file": file, "split": split}
     if not cross_repo:
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if not results or not results[0]["matched"]:
-        raise _not_found(engine, repo_id, "component", component_name, _DESCRIBE_BUILTIN_LABELS, cross_repo)
-    row = results[0]
+    if not split:
+        row = results[0]
+        answer = {
+            "direct_dependents": _envelope(row["direct_dependents"], max_results),
+            "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
+            "risk_level": _risk_level(row["direct_count"]),
+        }
+        if ambiguous:
+            answer["ambiguous_targets"] = ambiguous
+            answer["notices"] = [
+                f"{_echo(component_name)} is defined in {files} files; their dependents are listed together "
+                "and risk_level is theirs together. Pass file to analyse one."
+            ]
+        return answer
+    # A dependent is listed once, at its nearest hop to any target (as the union of
+    # the targets would list it), with the files of every target it depends on.
+    direct_ids = {d["id"] for row in results for d in row["direct_dependents"]}
+    dependents: dict[str, dict[str, Any]] = {}
+    for row in results:
+        for key in ("direct_dependents", "transitive_dependents"):
+            for d in row[key]:
+                if key == "transitive_dependents" and d["id"] in direct_ids:
+                    continue
+                entry = dependents.setdefault(d["id"], {"key": key, "row": {"name": d["name"], "type": d["type"]}, "files": []})
+                entry["files"].append(row["target_file"])
+    lists = {
+        key: [_with_target_files(d["row"], d["files"]) for d in dependents.values() if d["key"] == key]
+        for key in ("direct_dependents", "transitive_dependents")
+    }
     return {
-        "direct_dependents": _envelope(row["direct_dependents"], max_results),
-        "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
-        "risk_level": _risk_level(row["direct_count"]),
+        **{key: _envelope(rows, max_results) for key, rows in lists.items()},
+        "risk_level": _risk_level(max(row["direct_count"] for row in results)),
+        "ambiguous_targets": ambiguous,
     }
 
 
@@ -1497,9 +1832,11 @@ _DIFF_TARGETS_CYPHER = """
 CALL () {
   UNWIND $targets AS t
   CALL (t) {
-    MATCH (n:Function {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+    MATCH (n:Function {repo_id: $repo_id, name: t.name, file: t.file}) WHERE n.owner IS NULL OR n.owner = t.owner
+    RETURN n
     UNION
-    MATCH (n:Class {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+    MATCH (n:Class {repo_id: $repo_id, name: t.name, file: t.file}) WHERE n.owner IS NULL OR n.owner = t.owner
+    RETURN n
   }
   RETURN n
   UNION
@@ -1516,9 +1853,10 @@ WITH collect(DISTINCT n) AS l0
 
 
 def _diff_symbol(entry: dict[str, Any], path: str) -> dict[str, Any]:
-    return _sanitize_row(
-        {"name": entry["name"], "kind": entry["kind"], "container": entry["container"], "file": path}
-    )
+    return _sanitize_row({
+        "name": entry["name"], "kind": entry["kind"], "container": entry["container"], "file": path,
+        **({"owner": entry["owner"]} if "owner" in entry else {}),
+    })
 
 
 def impact_analysis_for_diff(
@@ -1614,7 +1952,7 @@ def impact_analysis_for_diff(
             symbols[name] += [_diff_symbol(entry, change.path) for entry in change.symbols[name]]
         for name in ("changed", "removed"):
             for entry in change.symbols[name]:
-                target = {"name": entry["name"], "file": change.path}
+                target = {"name": entry["name"], "file": change.path, "owner": entry.get("owner", "")}
                 if target not in targets:
                     targets.append(target)
     if fallback["unread"] and not detail_failed:
@@ -1640,8 +1978,8 @@ def impact_analysis_for_diff(
         rows = _query(engine, cypher, {"repo_id": repo_id, "targets": targets, "files": files})
         if rows:
             row = rows[0]
-    found = {(m["name"], m["file"]) for m in row["matched"]}
-    missing = [t for t in targets if (t["name"], t["file"]) not in found]
+    found = {(m["name"], m["file"], m["owner"]) for m in row["matched"]}
+    missing = [t for t in targets if (t["name"], t["file"], t["owner"]) not in found]
     if missing:
         shown = ", ".join(f"{t['name']} ({t['file']})" for t in missing[:_DESCRIBE_MAX_SUGGESTIONS])
         more = f" and {len(missing) - _DESCRIBE_MAX_SUGGESTIONS} more" if len(missing) > _DESCRIBE_MAX_SUGGESTIONS else ""
@@ -1668,34 +2006,54 @@ def impact_analysis_for_diff(
 def explain_architecture(
     engine: GraphEngine,
     repo_id: str,
+    max_results: int = 15,
 ) -> dict[str, Any]:
     """Generate a high-level architectural explanation of the repository.
 
     Args:
         engine: GraphEngine instance
         repo_id: Repository ID
+        max_results: Maximum number of results per list to return in the envelope
 
     Returns:
-        Dict with layers, key services, data flow overview
+        Dict with services_and_datastores ({service, uses}) and endpoints
+        ({endpoints, calls}, only services some endpoint calls), each a
+        {count, results, truncated} envelope; past `LIST_ROW_LIMIT` services
+        both are truncated, with a notice
     """
-    cypher = """
-    MATCH (s:Service {repo_id: $repo_id})
+    from devgraph.mcp.tool_plane import _sanitize_deep
+
+    _at_least(1, max_results=max_results)
+    cypher = f"""
+    MATCH (s:Service {{repo_id: $repo_id}})
     OPTIONAL MATCH (s)-[:USES]->(ds:Database|VectorStore|Queue)
     WITH s, COLLECT(DISTINCT ds.name) as datastore_names
-    OPTIONAL MATCH (ep:Endpoint {repo_id: $repo_id})-[:CALLS]->(s)
+    OPTIONAL MATCH (ep:Endpoint {{repo_id: $repo_id}})-[:CALLS]->(s)
     WITH s, datastore_names, COLLECT(DISTINCT ep.name) as endpoint_names
-    RETURN
-        COLLECT(DISTINCT {service: s.name, uses: datastore_names}) as services_and_datastores,
-        COLLECT(DISTINCT {endpoints: endpoint_names, calls: s.name}) as endpoints
-    LIMIT 1
+    RETURN s.name as service, datastore_names, endpoint_names
+    ORDER BY service
+    LIMIT {LIST_ROW_LIMIT + 1}
     """
-    results = _query(engine, cypher, {"repo_id": repo_id})
-    if results:
-        return {
-            "services_and_datastores": results[0].get("services_and_datastores", []),
-            "endpoints": results[0].get("endpoints", []),
-        }
-    return {"services_and_datastores": [], "endpoints": []}
+    rows, more = _list_query(engine, cypher, {"repo_id": repo_id})
+    services: list[dict[str, Any]] = []
+    endpoints: list[dict[str, Any]] = []
+    seen_services: set[tuple[Any, ...]] = set()
+    seen_endpoints: set[tuple[Any, ...]] = set()
+    for row in rows:  # two same-named services with the same lists are one entry, as before
+        service = _sanitize_deep({"service": row["service"], "uses": row["datastore_names"]})
+        key = (service["service"], tuple(service["uses"]))
+        if key not in seen_services:
+            seen_services.add(key)
+            services.append(service)
+        called = _sanitize_deep({"endpoints": row["endpoint_names"], "calls": row["service"]})
+        key = (called["calls"], tuple(called["endpoints"]))
+        if called["endpoints"] and key not in seen_endpoints:
+            seen_endpoints.add(key)
+            endpoints.append(called)
+    return {
+        "services_and_datastores": _capped_envelope(services, more, max_results),
+        "endpoints": _capped_envelope(endpoints, more, max_results),
+    }
 
 
 def list_services(
@@ -1781,7 +2139,9 @@ def find_requirements_for(
     repo_id: str,
     component_name: str,
     cross_repo: bool = False,
-) -> list[dict[str, Any]]:
+    max_results: int = 15,
+    extra_labels: tuple[str, ...] = (),
+) -> dict[str, Any]:
     """Find requirements a component (Module/Service/etc.) satisfies.
 
     Args:
@@ -1789,24 +2149,33 @@ def find_requirements_for(
         repo_id: Repository ID
         component_name: Name of the component
         cross_repo: If True, search across repos
+        max_results: Maximum number of results to return in the envelope
+        extra_labels: The repository's declared labels, looked up besides the built-in ones
 
     Returns:
-        List of Requirement notes satisfied by this component
+        Dict with count, results, and truncated flag containing the Requirement
+        notes ({name, title, body}) satisfied by this component
+
+    Raises:
+        ToolError: no node has that name.
     """
-    repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
+    _at_least(1, max_results=max_results)
+    _, labels, _ = _resolve_targets(
+        engine, repo_id, component_name, cross_repo, None, component_labels(extra_labels), describe=False
+    )
     cypher = f"""
-    MATCH (n {{name: $component_name}})-[:SATISFIES]->(r:Requirement)
-    WHERE true
-    {repo_filter}
+    {_named_nodes(labels, "component_name", cross_repo)}
+    MATCH (n)-[:SATISFIES]->(r:Requirement)
     RETURN r.name as name, r.title as title, r.body as body
     ORDER BY r.name
+    LIMIT {LIST_ROW_LIMIT + 1}
     """
     params = {"component_name": component_name}
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = _query(engine, cypher, params)
-    return [_sanitize_row(r) for r in results]
+    results, more = _list_query(engine, cypher, params)
+    return _capped_envelope(results, more, max_results)
 
 
 def trace_design_rationale(
@@ -1814,6 +2183,7 @@ def trace_design_rationale(
     repo_id: str,
     component_name: str,
     cross_repo: bool = False,
+    extra_labels: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Trace the design rationale (decisions, notes, requirements) behind a component.
 
@@ -1822,16 +2192,20 @@ def trace_design_rationale(
         repo_id: Repository ID
         component_name: Name of the component (Module/Service/Class/etc.)
         cross_repo: If True, search across repos
+        extra_labels: The repository's declared labels, looked up besides the built-in ones
 
     Returns:
         Dict grouping every Requirement/DesignDecision/ArchitectureNote linked
         to this component via SATISFIES or DOCUMENTED_BY.
+
+    Raises:
+        ToolError: no node has that name.
     """
-    repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
+    _, labels, _ = _resolve_targets(
+        engine, repo_id, component_name, cross_repo, None, component_labels(extra_labels), describe=False
+    )
     cypher = f"""
-    MATCH (n {{name: $component_name}})
-    WHERE true
-    {repo_filter}
+    {_named_nodes(labels, "component_name", cross_repo)}
     OPTIONAL MATCH (n)-[:SATISFIES]->(req:Requirement)
     OPTIONAL MATCH (n)-[:DOCUMENTED_BY]->(doc)
     RETURN n.name as component,
@@ -1844,9 +2218,7 @@ def trace_design_rationale(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if results:
-        return _sanitize_row(results[0])
-    return {"component": component_name, "requirements": [], "notes": []}
+    return _sanitize_row(results[0])
 
 
 def blame_component(
@@ -1854,7 +2226,8 @@ def blame_component(
     repo_id: str,
     component_name: str,
     cross_repo: bool = False,
-) -> list[dict[str, Any]]:
+    max_results: int = 15,
+) -> dict[str, Any]:
     """Find commits that modified a component's file, most recent first.
 
     Args:
@@ -1862,11 +2235,13 @@ def blame_component(
         repo_id: Repository ID
         component_name: Name of the Module (file) to look up commit history for
         cross_repo: If True, search across repos
+        max_results: Maximum number of results to return in the envelope
 
     Returns:
-        List of commits (sha, message, author, authored_date) that modified
-        this component, ordered most-recent-first; empty for a file no
-        recorded commit touched.
+        Dict with count, results, and truncated flag containing the commits
+        (sha, message, author, authored_date) that modified this component,
+        most recent first; count 0 for a file no recorded commit touched.
+        Past `LIST_ROW_LIMIT` commits it is truncated, with a notice.
 
     Raises:
         ToolError: no file (Module) has that path.
@@ -1885,15 +2260,24 @@ def blame_component(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results, _more = _list_query(engine, cypher, params)  # at most LIST_ROW_LIMIT commits
-    if not results:
-        module_filter = _cross_scope("m", "AND") if cross_repo else "AND m.repo_id = $repo_id"
-        found = _query(
-            engine, f"MATCH (m:Module {{name: $component_name}}) WHERE true {module_filter} RETURN m LIMIT 1", params
-        )
-        if not found:
-            raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
-    return [_sanitize_row(r) for r in results]
+    _at_least(1, max_results=max_results)
+    results, more = _list_query(engine, cypher, params)
+    if not results and not _exists(engine, repo_id, component_name, ("Module",), cross_repo):
+        raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
+    return _capped_envelope(results, more, max_results)
+
+
+def _off_source_file_check(engine: GraphEngine, repo_id: str, path: str, cross_repo: bool) -> None:
+    """With a repository's source off: the not-found error for a path no Module has,
+    unless Neo4j can't be reached, when the source-off notice comes first."""
+    try:
+        exists = _exists(engine, repo_id, path, ("Module",), cross_repo)
+    except Exception as exc:
+        if neo4j_unavailable(exc, getattr(engine, "uri", "")) is not None:
+            return
+        raise
+    if not exists:
+        raise _not_found(engine, repo_id, "file", path, ("Module",), cross_repo)
 
 
 def find_related_prs(
@@ -1922,9 +2306,14 @@ def find_related_prs(
         Dict with count, results, and truncated flag containing PullRequests linked
         (via RESOLVES on an Issue referenced by a commit that touched this component)
         to the component.
+
+    Raises:
+        ToolError: no file (Module) has that path.
     """
     _at_least(1, max_results=max_results)
+    component_name = _normalize_file(component_name)
     if _source_off(registry, repo_id, "pr_source_enabled"):
+        _off_source_file_check(engine, repo_id, component_name, cross_repo)
         return _source_off_notice(max_results, "PR", "pr-source", repo_id)
 
     repo_filter = _cross_scope("m", "AND") if cross_repo else "AND m.repo_id = $repo_id"
@@ -1943,6 +2332,8 @@ def find_related_prs(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
+    if not results and not _exists(engine, repo_id, component_name, ("Module",), cross_repo):
+        raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
     return _envelope(results, max_results)
 
 
@@ -1971,9 +2362,14 @@ def issue_history_for(
     Returns:
         Dict with count, results, and truncated flag containing Issues referenced
         by commits that modified this component.
+
+    Raises:
+        ToolError: no file (Module) has that path.
     """
     _at_least(1, max_results=max_results)
+    component_name = _normalize_file(component_name)
     if _source_off(registry, repo_id, "issue_source_enabled"):
+        _off_source_file_check(engine, repo_id, component_name, cross_repo)
         return _source_off_notice(max_results, "Issue", "issue-source", repo_id)
 
     repo_filter = _cross_scope("m", "AND") if cross_repo else "AND m.repo_id = $repo_id"
@@ -1992,6 +2388,8 @@ def issue_history_for(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
+    if not results and not _exists(engine, repo_id, component_name, ("Module",), cross_repo):
+        raise _not_found(engine, repo_id, "file", component_name, ("Module",), cross_repo)
     return _envelope(results, max_results)
 
 
@@ -2002,6 +2400,7 @@ def get_source(
     component_name: str,
     cross_repo: bool = False,
     file: str | None = None,
+    owner: str | None = None,
 ) -> dict[str, Any]:
     """Fetch a Function or Class's actual source text by reading its last-indexed line range.
 
@@ -2013,40 +2412,64 @@ def get_source(
         engine: GraphEngine instance
         registry: RepoRegistry, used to resolve repo_id to its registered root path
         repo_id: Repository ID
-        component_name: Name of the Function or Class to fetch source for
+        component_name: Name of the Function or Class to fetch source for; a
+            method may be named with the declarations it is in, `A.save`
+            (`Outer.Inner.run`, `A::save`), when no node has that exact name;
+            a Kotlin companion's member by its class's (`Repo.create` for
+            `Repo.Companion.create`, and `owner="Repo"` likewise)
         cross_repo: If True, search across repos (the file is still read from
             whichever repo actually owns the matched node, via its own registry entry)
         file: Repo-relative path of the defining file, to pick one of several
             same-named Functions or Classes
+        owner: The declarations the Function or Class is in, as a candidate's
+            `owner` gives it ("" for a top-level one), to pick one of several
+            same-named ones in one file
 
     Returns:
         Dict with name, label, file, start_line, end_line, source, and
         docstring_full (when present). Empty/None fields if no match found.
         When several nodes match, `source` is None and the dict adds
         `status: "ambiguous"`, `count`, `truncated` and `candidates`
-        ({label, name, file}; repo_id too when cross_repo): pass one's `file`.
+        ({label, name, file, owner}; repo_id too when cross_repo): pass one's
+        `file` and `owner`. The result names its `owner` too.
         A file is decoded as the indexer decodes it (`source_text`): a
         Python coding line, else UTF-8, else cp1252 or Latin-1; when an
         undeclared file is not valid UTF-8, or a file isn't valid in its
         declared codec, the dict adds a `notice` saying how it was decoded.
     """
+    file = _normalize_file(file)
     repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
-    cypher = f"""
+    def lookup(match: str) -> list[dict[str, Any]]:
+        return _query(engine, f"""
     MATCH (n)
-    WHERE (n:Function OR n:Class) AND n.name = $component_name
+    WHERE (n:Function OR n:Class) AND {match}
     {repo_filter}
     AND ($file IS NULL OR n.file = $file)
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
-           n.file as file, n.start_line as start_line, n.end_line as end_line,
+           n.file as file, {_OWNER_OF.format(v="n")} as owner, n.start_line as start_line, n.end_line as end_line,
            n.docstring_full as docstring_full
     ORDER BY n.repo_id, n.file, n.start_line
     LIMIT {_DESCRIBE_MAX_CANDIDATES + 1}
-    """
+    """, params)
+
     params: dict[str, Any] = {"component_name": component_name, "file": file}
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = _query(engine, cypher, params)
+    if owner is not None:
+        params["owner"] = owner
+        results = lookup("n.name = $component_name AND coalesce(n.owner, '') = $owner AND n.file IS NOT NULL")
+        if not results:
+            # `owner="Repo"` for a member of Repo's Kotlin companion.
+            results = lookup(f"n.name = $component_name AND {_COMPANION_MEMBER.format()}")
+    else:
+        results = lookup("n.name = $component_name")
+    if not results and owner is None and (owned := _owner_split(component_name)) is not None:
+        params["owner"], params["member"] = owned
+        results = lookup("n.name = $member AND n.owner = $owner")
+        if not results:
+            # `Repo.create` written as Kotlin calls it: the member of Repo's companion.
+            results = lookup(f"n.name = $member AND {_COMPANION_MEMBER.format()}")
     empty = {
         "name": component_name, "label": None, "file": None,
         "start_line": None, "end_line": None, "source": None, "docstring_full": None,
@@ -2055,11 +2478,15 @@ def get_source(
         return empty
 
     def label_of(row: dict[str, Any]) -> str:
-        return next((l for l in row["labels"] if l in ("Function", "Class")), row["labels"][0])
+        return next((label for label in row["labels"] if label in ("Function", "Class")), row["labels"][0])
 
     if len(results) > 1:
         candidates = [
-            {"label": label_of(r), "name": r["name"], "file": r["file"], **({"repo_id": r["repo_id"]} if cross_repo else {})}
+            {
+                "label": label_of(r), "name": r["name"], "file": r["file"],
+                **({"owner": r["owner"]} if r["owner"] is not None else {}),
+                **({"repo_id": r["repo_id"]} if cross_repo else {}),
+            }
             for r in results[:_DESCRIBE_MAX_CANDIDATES]
         ]
         return {
@@ -2116,6 +2543,8 @@ def get_source(
         "source": source_text,
         "docstring_full": row.get("docstring_full"),
     }
+    if row["owner"] is not None:
+        result["owner"] = row["owner"]
     if notice is not None:
         result["notice"] = notice
     return result
@@ -2217,7 +2646,7 @@ def list_recent_changes(
         engine: GraphEngine instance
         repo_id: Repository ID
         within_commits: Only include entities modified within this many most-recent commits
-        entity_type: Optional node label filter (validates against NODE_LABELS)
+        entity_type: Optional node label filter; a label not in NODE_LABELS is a ToolError
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
 
@@ -2226,21 +2655,23 @@ def list_recent_changes(
         name, type (labels), repo_id, and last_modified_at, ordered most-recently-modified first.
     """
     _at_least(1, within_commits=within_commits, max_results=max_results)
-    # Validate and reject unrecognized labels
     if entity_type is not None and entity_type not in schema.NODE_LABELS:
-        return _envelope([], max_results)
+        raise ToolError(f"unknown entity_type {_echo(entity_type)}; use one of: {', '.join(schema.NODE_LABELS)}")
 
     cutoff = _resolve_recency_cutoff(engine, repo_id, within_commits)
     recency_filter = "AND n.last_modified_at >= $cutoff" if cutoff is not None else "AND n.last_modified_at IS NOT NULL"
 
-    repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
-    label_filter = "AND $entity_type IN labels(n)" if entity_type else ""
+    scope = _cross_scope("n") if cross_repo else "n.repo_id = $repo_id"
+    # One branch per label, each seeking its `(repo_id, name)` index (recency is
+    # staged by name, so a staged node always has one).
+    branches = "\n  UNION\n".join(
+        f"  MATCH (n:`{label}`) WHERE {scope} AND n.name IS NOT NULL {recency_filter} RETURN n"
+        for label in ((entity_type,) if entity_type else schema.NAMED_LABELS)
+    )
     cypher = f"""
-    MATCH (n)
-    WHERE true
-    {recency_filter}
-    {repo_filter}
-    {label_filter}
+    CALL () {{
+    {branches}
+    }}
     RETURN n.name as name, labels(n) as type, n.repo_id as repo_id,
            n.last_modified_at as last_modified_at
     ORDER BY n.last_modified_at DESC
@@ -2251,8 +2682,6 @@ def list_recent_changes(
         params["cutoff"] = cutoff
     if not cross_repo:
         params["repo_id"] = repo_id
-    if entity_type is not None:
-        params["entity_type"] = entity_type
 
     results, more = _list_query(engine, cypher, params)
     return _capped_envelope(results, more, max_results)

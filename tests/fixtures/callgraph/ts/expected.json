@@ -178,6 +178,20 @@
       "callee": "trackEvent",
       "callee_file": "public/analytics.js",
       "note": "script-globals"
+    },
+    {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "Profile",
+      "callee_file": "src/pages/Profile.tsx",
+      "note": "jsx-component"
+    },
+    {
+      "caller": "mount",
+      "caller_file": "src/main.tsx",
+      "callee": "App",
+      "callee_file": "src/App.tsx",
+      "note": "jsx-component"
     }
   ],
   "imports": [
@@ -441,6 +455,7 @@
     "type-only": "`import type` is erased at runtime but is still a source import of that file.",
     "alias": "Specifier resolved through the `@/*` path alias.",
     "re-export": "`export ... from` lines are imports of the re-exported file.",
-    "scope": "JSX element usage (`<Profile />`, `<App />`) is a value reference, not a call, and is not listed. Calls inside anonymous arrows (onChange handler, Array.find predicate) are not listed. vite.config.ts only makes a module-level external call. index.html is not source."
+    "scope": "Calls inside anonymous arrows (onChange handler, Array.find predicate) are not listed. vite.config.ts only makes a module-level external call. index.html is not source.",
+    "jsx-component": "A JSX element with a capitalised tag renders that component: a call of it, resolved like `Profile()` (`<Profile />` through the @/ alias, `<App />` through a relative import). Intrinsic tags (`<h1>`, `<input>`) are no calls."
   }
 }

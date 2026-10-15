@@ -279,7 +279,9 @@ def test_a_package_row_leaves_out_the_exact_files_and_this_file():
     assert prefix.exclude == sorted({"pkg.py", "pkg/__init__.py", "pkg/pkg.py", "pkg/pkg/__init__.py", "pkg/user.py"})
 
 
-def test_call_sites_collapse_to_one_caller_class_per_callee():
+def test_same_named_callers_in_two_classes_are_two_callers():
+    """Each class's `run` is its own node (its owner), so each keeps its own
+    caller_class instead of collapsing into one caller."""
     source = """\
         class B:
             def run(self):
@@ -290,7 +292,7 @@ def test_call_sites_collapse_to_one_caller_class_per_callee():
             def run(self):
                 obj.work()
         """
-    assert calls(source) == {("run", "work", None, "name", "A")}
+    assert calls(source) == {("run", "work", None, "name", "A"), ("run", "work", None, "name", "B")}
 
 
 # --- live ---------------------------------------------------------------------
@@ -388,8 +390,8 @@ def test_the_index_upgrade_replaces_bare_python_calls(engine, repo_id, tmp_path,
     write(tmp_path, "other.py", "def helper():\n    return 2\n")
     real = dispatch.extract_python_file
 
-    def old_extract(content, rel_path, repo_id):
-        result = real(content, rel_path, repo_id)
+    def old_extract(content, rel_path, repo_id, config=None):
+        result = real(content, rel_path, repo_id, config)
         for rel in result.relationships:
             if rel.rel_type == "CALLS":
                 rel.to_file, rel.exclude, rel.properties = None, None, None
@@ -424,4 +426,40 @@ def test_an_untyped_member_call_never_links_its_own_caller(engine, repo_id, tmp_
     engine.upsert_repository(repo_id, repo_id, str(tmp_path))
     full_scan(engine, repo_id, tmp_path)
     assert caller_edges(engine, repo_id, "save") == [("save", "store.py", "name")]
+    equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_tests_and_scripts_reach_a_src_layout_package(engine, repo_id, tmp_path):
+    write(tmp_path, "pyproject.toml", '[project]\nname = "pkg"\n')
+    write(tmp_path, "src/pkg/__init__.py", "")
+    core = write(tmp_path, "src/pkg/core.py", "def helper():\n    return 1\n")
+    write(tmp_path, "src/pkg/api.py", "from pkg.core import helper\n\n\ndef run():\n    return helper()\n")
+    write(tmp_path, "tests/test_api.py", """\
+        import pkg.core
+        from pkg.api import run
+
+
+        def test_run():
+            run()
+            pkg.core.helper()
+        """)
+    write(tmp_path, "scripts/go.py", "from pkg import core\n\n\ndef main():\n    core.helper()\n")
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+    assert caller_edges(engine, repo_id, "test_run") == [
+        ("helper", "src/pkg/core.py", "resolved"), ("run", "src/pkg/api.py", "resolved"),
+    ]
+    assert caller_edges(engine, repo_id, "main") == [("helper", "src/pkg/core.py", "resolved")]
+    rows = engine.run_cypher(
+        "MATCH (:Module {repo_id: $r, name: 'tests/test_api.py'})-[:IMPORTS]->(b) RETURN b.name AS n", {"r": repo_id}
+    )
+    assert sorted(row["n"] for row in rows) == ["src/pkg/api.py", "src/pkg/core.py"]
+
+    # The package moves out of src/: the tests follow it, as a fresh scan would.
+    core.unlink()
+    moved = write(tmp_path, "pkg/core.py", "def helper():\n    return 1\n")
+    remove_paths(engine, repo_id, tmp_path, {core})
+    index_paths(engine, repo_id, tmp_path, {moved})
+    assert ("helper", "pkg/core.py", "resolved") in caller_edges(engine, repo_id, "test_run")
     equals_fresh(engine, repo_id, tmp_path)

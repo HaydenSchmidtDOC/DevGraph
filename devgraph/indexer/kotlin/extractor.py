@@ -30,9 +30,10 @@ Known limitations (v1 scope, structural parity — documented, not to be
     distinguishing modifier is recorded in the `modifiers` property rather
     than modeled as separate node labels (DevGraph's schema has no
     DataClass/SealedClass/Enum/Object labels).
-  - `companion object` declarations are treated as Class nodes when they
-    carry an identifier; an anonymous `companion object { ... }` is skipped
-    (no name to key a node on).
+  - `companion object` declarations are Class nodes owned by their class;
+    an anonymous `companion object { ... }` is named `Companion`, Kotlin's
+    own name for it, so its members are owned by `Repo.Companion` (a named
+    one's by `Repo.Factory`), and `Repo.create()` resolves to them.
   - Constructors (`primary_constructor`, `secondary_constructor`) are NOT
     extracted as Function nodes — Kotlin's primary constructor is part of the
     class header, not a named `fun`, and secondary constructors are uncommon.
@@ -64,6 +65,7 @@ from pathlib import Path
 import tree_sitter_kotlin as tskotlin
 from tree_sitter import Language, Node, Parser, Range
 
+from devgraph.indexer.apis.routes import add_route, spring_routes
 from devgraph.indexer.calls import (
     STOP_METHODS,
     STOP_TYPES,
@@ -75,7 +77,9 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    member_owner,
     own_edges,
+    owned_pin,
 )
 from devgraph.indexer.jvm import JvmLayout, type_segment
 
@@ -437,12 +441,27 @@ class _KotlinResolver:
         self.methods: dict[str, set[str]] = {}
         self.bases: dict[str, list[str]] = {}
         self.properties: dict[str, dict[str, str | None]] = {}
+        # What each class's members are owned by (_owner_of): one per class of the name in the file.
+        self.owners: dict[str, set[str]] = {}
+        # A class's companion objects (one per class of the name in the
+        # file), each by its members' owner (`Repo.Companion`): the key its
+        # methods, bases and properties are under, so two classes'
+        # anonymous companions stay apart.
+        self.companions: dict[str, set[str]] = {}
 
-        def walk(node: Node, owner: str | None) -> None:
+        def walk(node: Node, owner: str | None, enclosing: tuple[str, ...] = ()) -> None:
             if node.type in _TYPE_DECL_TYPES:
-                name_node = node.child_by_field_name("name") or _child_of_type(node, "identifier")
-                if name_node is not None:
-                    owner = _text(name_node, source)
+                name = _type_decl_name(node, source)
+                if name is not None:
+                    enclosing = (name, *enclosing)
+                    if node.type == "companion_object":
+                        key = _owner_of(enclosing)
+                        if owner is not None:
+                            self.companions.setdefault(owner, set()).add(key)
+                        owner = key
+                    else:
+                        owner = name
+                    self.owners.setdefault(owner, set()).add(_owner_of(enclosing))
                     self.methods.setdefault(owner, set())
                     self.bases[owner] = _extract_supertype_names(node, source)
                     props = self.properties.setdefault(owner, {})
@@ -463,13 +482,14 @@ class _KotlinResolver:
                 name_node = node.child_by_field_name("name")
                 if name_node is not None:
                     self.functions.add(_text(name_node, source))
-                    if owner is not None:
+                    if owner is not None and not _extension_receiver(node, source):
                         self.methods[owner].add(_text(name_node, source))
             for child in node.children:
-                walk(child, owner)
+                walk(child, owner, enclosing)
 
         for node in top_level:
             walk(node, None)
+        self.companion_keys = {key for keys in self.companions.values() for key in keys}
         # Imports: a class (the first capitalised segment) or a function by
         # the name it is used by, and wildcard packages.
         self.types: dict[str, tuple[list[str], str]] = {}
@@ -573,12 +593,30 @@ class _KotlinResolver:
             return None
         if cls in self.methods:
             if method in self.methods[cls]:
-                return [self.file_path]
+                owners = self.owners.get(cls, set())
+                return [owned_pin(self.file_path, next(iter(owners)) if len(owners) == 1 else None)]
+            if pins := self.companion_pins(cls, method):
+                return pins  # `Repo.create()`: a member of Repo's companion
             pins = []
             for base in self.bases.get(cls, []):
                 pins += self.member_pins(base, method, seen | {cls}) or []
             return pins or None
         return self.type_pins(cls)
+
+    def keys(self, classes: list[str]) -> list[str]:
+        """The enclosing classes (innermost first, as declared: a companion
+        is `Companion`) as the keys their members are recorded under: a
+        companion's is its owner (`A.Companion`)."""
+        return [
+            owner if (owner := _owner_of(classes[i:])) in self.companion_keys else cls
+            for i, cls in enumerate(classes)
+        ]
+
+    def companion_pins(self, cls: str, method: str) -> list[str]:
+        """This file, as the member of each companion of the class `cls`
+        declared here that defines `method` (owned by `Repo.Companion`)."""
+        return [owned_pin(self.file_path, key) for key in sorted(self.companions.get(cls, ()))
+                if method in self.methods.get(key, ())]
 
     # --- calls ---------------------------------------------------------------
 
@@ -592,12 +630,27 @@ class _KotlinResolver:
             name = _text(callee, self.source)
             if name in scope:
                 return None  # a function value
+            keys = self.keys(classes)
+            if keys and keys[0] in self.companion_keys:
+                # Inside a companion: its own member, else its bases'.
+                if pins := self.member_pins(keys[0], name):
+                    return name, pins, False
+            elif keys and name not in self.methods.get(keys[0], ()):
+                # Inside class C without such a member: an in-file base's,
+                # else C's companion's (`create()` in Repo is
+                # `Repo.Companion.create`).
+                inherited = [pin for base in self.bases.get(keys[0], []) if base in self.methods
+                             for pin in self.member_pins(base, name) or []]
+                if inherited:
+                    return name, inherited, False
+                if pins := self.companion_pins(keys[0], name):
+                    return name, pins, False
             if name in self.functions:
                 return name, [self.file_path], False
             if name in self.imported_functions:
                 return name, self.imported_functions[name], False
             pins = []
-            for cls in classes:
+            for cls in self.keys(classes):
                 for base in self.bases.get(cls, []):
                     pins += self.member_pins(base, name) or []
             pins += self.function_pins(self.layout.package)
@@ -611,11 +664,12 @@ class _KotlinResolver:
         if not names or receiver is None or receiver is names[-1]:
             return None
         name = _text(names[-1], self.source)
+        keys = self.keys(classes)
         if receiver.type == "this_expression":
-            pins = self.member_pins(classes[0], name) if classes else None
+            pins = self.member_pins(keys[0], name) if keys else None
             return (name, pins, False) if pins else None
         if receiver.type == "super_expression":
-            pins = [pin for base in (self.bases.get(classes[0], []) if classes else [])
+            pins = [pin for base in (self.bases.get(keys[0], []) if keys else [])
                     for pin in self.member_pins(base, name) or []]
             return (name, pins, False) if pins else None
         if name in self.imported_functions:
@@ -660,7 +714,7 @@ def _kotlin_scope(node: Node, classes: list[str], resolver: _KotlinResolver, sou
     properties (innermost wins), the parameters and every local (a lambda
     or loop variable untyped unless annotated)."""
     scope: dict[str, str | None] = {}
-    for cls in reversed(classes):
+    for cls in reversed(resolver.keys(classes)):
         scope.update(resolver.properties.get(cls, {}))
 
     def walk(n: Node) -> None:
@@ -688,6 +742,34 @@ def _kotlin_scope(node: Node, classes: list[str], resolver: _KotlinResolver, sou
     return scope
 
 
+def _type_decl_name(node: Node, source: bytes) -> str | None:
+    """A class, object or companion declaration's name: its `name` field,
+    else an explicit `identifier` child (`companion object Factory`), else
+    `Companion` for an anonymous companion (Kotlin's own name for it);
+    None for anything else without a name."""
+    name = node.child_by_field_name("name") or _child_of_type(node, "identifier")
+    if name is not None:
+        return _text(name, source)
+    return "Companion" if node.type == "companion_object" else None
+
+
+def _extension_receiver(node: Node, source: bytes) -> str | None:
+    """An extension function's receiver type, as its simple name
+    (`fun a.b.Repo<T>?.save()`: Repo); None for any other function."""
+    children = node.children
+    for i, child in enumerate(children[1:], 1):
+        if child.type == "." and i + 1 < len(children) and children[i + 1].type == "identifier":
+            return _kotlin_type(children[i - 1], source)
+    return None
+
+
+def _owner_of(classes: list[str] | tuple[str, ...]) -> str:
+    """The owner (common.member_owner) of a member of the innermost of
+    `classes`, the enclosing classes innermost first: their names, outermost
+    first, dotted ("" at the top level)."""
+    return ".".join(reversed(classes))
+
+
 def _kotlin_calls(body: Node) -> list[Node]:
     """The `call_expression`s of a body, not descending into nested
     function, class or object declarations (attributed separately)."""
@@ -704,6 +786,70 @@ def _kotlin_calls(body: Node) -> list[Node]:
     for child in body.children:
         walk(child)
     return found
+
+
+def _annotations(node: Node, source: bytes) -> dict[str, dict[str, list[str] | None]]:
+    """A declaration's annotations by name, each as its `value` (the
+    positional argument, or `value =`/`path =`: its string literals, None
+    when one is not a literal) and `method` (the RequestMethod names) when
+    given (apis/routes.py `spring_routes`)."""
+    found: dict[str, dict[str, list[str] | None]] = {}
+    modifiers = _child_of_type(node, "modifiers")
+    for annotation in modifiers.named_children if modifiers is not None else []:
+        if annotation.type != "annotation" or not annotation.named_children:
+            continue
+        invocation = annotation.named_children[0]
+        name = invocation if invocation.type == "user_type" else _child_of_type(invocation, "user_type")
+        if name is None:
+            continue
+        args: dict[str, list[str] | None] = {}
+        arguments = _child_of_type(invocation, "value_arguments")
+        for arg in arguments.named_children if arguments is not None else []:
+            parts = arg.named_children
+            key = "value"
+            if len(parts) == 2 and parts[0].type == "identifier":
+                key = _text(parts[0], source)
+            if not parts:
+                continue
+            value = parts[-1]
+            items = value.named_children if value.type == "collection_literal" else [value]
+            if value.type == "call_expression" and _text(value, source).startswith("arrayOf("):
+                arguments_node = _child_of_type(value, "value_arguments")
+                items = [a.named_children[-1] for a in arguments_node.named_children] if arguments_node else []
+            if key == "method":
+                args["method"] = [_text(item, source).rsplit(".", 1)[-1] for item in items]
+            elif key in ("value", "path"):
+                literal = all(
+                    item.type == "string_literal" and not _text(item, source).startswith('"""')
+                    and all(part.type == "string_content" for part in item.named_children)
+                    for item in items
+                )
+                args["value"] = [_text(item, source)[1:-1] for item in items] if literal else None
+        found[_text(name, source).rsplit(".", 1)[-1]] = args
+    return found
+
+
+def _spring_routes(top_level: list[Node], source: bytes, result: ExtractionResult, file_path: str, repo_id: str) -> None:
+    """A Spring controller's mapped functions as Endpoints (apis/routes.py),
+    each implemented by its function, owned by its class."""
+
+    def walk(nodes: list[Node], classes: list[str]) -> None:
+        for node in nodes:
+            name = node.child_by_field_name("name") or _child_of_type(node, "identifier")
+            body = _child_of_type(node, "class_body")
+            if node.type not in _TYPE_DECL_TYPES or name is None or body is None:
+                continue
+            inner = [_text(name, source), *classes]
+            mapped = _annotations(node, source)
+            for member in body.named_children:
+                function = member.child_by_field_name("name")
+                if member.type == "function_declaration" and function is not None:
+                    for http_method, path in spring_routes(mapped, _annotations(member, source)):
+                        add_route(result, repo_id, file_path, "Spring", http_method, path, _text(function, source),
+                                  _owner_of(inner))
+            walk(body.named_children, inner)
+
+    walk(top_level, [])
 
 
 def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
@@ -751,34 +897,39 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
         )
     sites = CallSites()
 
-    def _record_calls(node: Node, body: Node, caller_label: str, caller_name: str, classes: list[str]) -> None:
+    def _record_calls(
+        node: Node, body: Node, caller_label: str, caller_name: str, classes: list[str],
+        caller_owner: str | None = None,
+    ) -> None:
         scope = _kotlin_scope(node, classes, resolver, source_bytes)
         caller_class = classes[0] if classes else None
+        # A function's owner is given; a class (a property initializer's
+        # caller) is owned by the classes around it; the Module by nothing.
+        if caller_label == "Class":
+            caller_owner = _owner_of(classes[1:])
         for call in _kotlin_calls(body):
             site = resolver.resolve(call, classes, scope)
             if site is not None:
                 name, pins, member = site
-                sites.add(caller_label, caller_name, caller_class, name, pins, member)
+                sites.add(caller_label, caller_name, caller_class, name, pins, member, caller_owner)
 
     def _visit_type_decl(
         node: Node, parent_name: str | None, parent_label: str, prev_sibling: Node | None, classes: list[str]
     ) -> None:
-        name_node = node.child_by_field_name("name")
-        if name_node is None:
-            # `companion object { ... }` has no name field; fall back to an
-            # explicit `identifier` child, else skip (anonymous companion).
-            name_node = _child_of_type(node, "identifier")
-        if name_node is None:
+        class_name = _type_decl_name(node, source_bytes)
+        if class_name is None:
             return
-        class_name = _text(name_node, source_bytes)
 
         class_properties: dict = {
             "type": "class",
             "decorators": _extract_annotation_names(node, source_bytes),
             "file": file_path,
+            "owner": _owner_of(classes),
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
+        if node.type == "companion_object":
+            class_properties["kind"] = "companion"  # its members are found by its class's name (mcp/tools.py)
         kdoc = _preceding_kdoc(node, prev_sibling, source_bytes)
         if kdoc:
             class_properties["description"] = _docstring_summary(kdoc)
@@ -797,6 +948,8 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=_owner_of(classes[1:]) if parent_label == "Class" else None,
+                to_owner=_owner_of(classes),
             )
         )
 
@@ -809,6 +962,7 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
                     to_label="Class",
                     to_name=supertype,
                     repo_id=repo_id,
+                    from_owner=_owner_of(classes),
                 )
             )
 
@@ -821,17 +975,29 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
             visit_block(body_node, class_name, "Class", [class_name, *classes])
 
     def _visit_function(
-        node: Node, parent_name: str | None, parent_label: str, prev_sibling: Node | None, classes: list[str]
+        node: Node, parent_name: str | None, parent_label: str, prev_sibling: Node | None, classes: list[str],
+        parent_owner: str | None = None,
     ) -> None:
+        """`parent_owner` is a parent function's own owner."""
         name_node = node.child_by_field_name("name")
         if name_node is None:
             return
         func_name = _text(name_node, source_bytes)
+        # Declared in its classes, or in a function; an extension function
+        # is owned by its receiver type besides (`fun A.save()`: A), as a Go
+        # method by its receiver's.
+        owner = (
+            member_owner("Function", parent_name, parent_owner) if parent_label == "Function" else _owner_of(classes)
+        )
+        receiver = _extension_receiver(node, source_bytes)
+        if receiver:
+            owner = f"{owner}.{receiver}" if owner else receiver
 
         func_properties: dict = {
             "type": "function",
             "decorators": _extract_annotation_names(node, source_bytes),
             "file": file_path,
+            "owner": owner,
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -853,6 +1019,9 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=_owner_of(classes[1:]) if parent_label == "Class" else parent_owner
+                if parent_label == "Function" else None,
+                to_owner=owner,
             )
         )
 
@@ -860,7 +1029,7 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
         # `function_body` child (the `name` field exists, `body` does not).
         body_node = node.child_by_field_name("body") or _child_of_type(node, "function_body")
         if body_node is not None:
-            _record_calls(node, body_node, "Function", func_name, classes)
+            _record_calls(node, body_node, "Function", func_name, classes, owner)
 
             # Nested function declarations (a `fun` declared inside this
             # function's body) are visited with this function as their parent,
@@ -869,11 +1038,11 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
             # function/class scopes, mirroring Python's nested-function walk.
             for child in body_node.named_children:
                 if child.type == "function_declaration":
-                    _visit_function(child, func_name, "Function", None, classes)
+                    _visit_function(child, func_name, "Function", None, classes, owner)
                 elif child.type == "block":
                     for grandchild in child.named_children:
                         if grandchild.type == "function_declaration":
-                            _visit_function(grandchild, func_name, "Function", None, classes)
+                            _visit_function(grandchild, func_name, "Function", None, classes, owner)
 
     def visit_block(
         block: Node, parent_name: str | None, parent_label: str, classes: list[str],
@@ -898,6 +1067,7 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
 
     visit_block(root, None, "Module", [], top_level)
     result.relationships += sites.rows(file_path, repo_id)
+    _spring_routes(top_level, source_bytes, result, file_path, repo_id)
 
     return own_edges(result, file_path)
 

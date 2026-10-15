@@ -115,6 +115,13 @@ class Settings(BaseSettings):
         return value
 
 
+# The agent's log file (`Settings.log_file`) rolls over at this size, keeping
+# this many older files beside it (`devgraph.log.1` the newest of them), so a
+# long-running agent can't fill the disk; `devgraph logs` reads across them.
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+
+
 @lru_cache
 def get_settings() -> Settings:
     s = Settings()

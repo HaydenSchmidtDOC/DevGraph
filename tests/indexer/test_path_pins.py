@@ -15,10 +15,19 @@ import uuid
 import pytest
 
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
-from devgraph.graph.schema import pin_kind
+from devgraph.graph.schema import MAX_SCOPE_KEYS, pin_kind, scoped_pin, split_pin, tiered_pin, unscoped_pin
 from devgraph.indexer import dispatch
 from devgraph.indexer.calls import call_rows, import_rows
-from devgraph.indexer.common import best_pin, module_pin_name, pin_excludes, pin_matches
+from devgraph.indexer.common import (
+    best_pin,
+    module_pin_name,
+    name_ref_properties,
+    parse_name_ref,
+    pin_excludes,
+    pin_matches,
+    shadowed,
+    visible_to,
+)
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
@@ -30,6 +39,9 @@ from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_
     ("/a/B.java", "suffix"), ("/a/b/.", "suffix_dir"), ("a/b/", "prefix"), ("a/b/.!_test.go", "dir"),
     ("/a/.!_test.go", "suffix_dir"), ("a/b/.~", "loose_dir"), ("a/b/.~?.go!_test.go", "loose_dir"),
     ("/a/B.java^", "suffix"), ("/a/.?.kt,.java^t", "suffix_dir"), ("a~", "file"), ("a?b.go", "file"),
+    # `@` match keys, last; a name starting with "@" (an npm scope) is no flag: a key holds ":".
+    ("/.?.cs^@Shop:User,.:User", "suffix_dir"), ("a/b/.@N:+T", "dir"), ("a/@b.go", "file"), ("/@s/x.ts", "suffix"),
+    ("a/@s/", "prefix"), ("@s/.", "dir"), ("/a/.?.cs@bad", "suffix"),
 ])
 def test_pin_kinds(pin, kind):
     assert pin_kind(pin) == kind
@@ -62,6 +74,129 @@ def test_pin_kinds(pin, kind):
 ])
 def test_pin_matches(pin, path, matches):
     assert pin_matches(pin, path) is matches
+
+
+@pytest.mark.parametrize(("pin", "keys", "matches"), [
+    ("/.?.cs^@N:A", ["N:A"], True), ("/.?.cs^@N:A", ["M:A", "N:A"], True), ("/.?.cs^@N:A,.:A", [".:A"], True),
+    ("/.?.cs^@N:A", ["N:B"], False), ("/.?.cs^@N:A", [], False), ("/.?.cs^", [], True), ("/.?.cs^", ["N:B"], True),
+])
+def test_an_at_flag_matches_a_node_holding_one_of_its_keys(pin, keys, matches):
+    assert pin_matches(pin, "x/User.cs", keys) is matches
+    assert pin_matches(pin, "x/User.md", keys) is False
+
+
+def test_at_keys_are_canonical_and_capped():
+    assert split_pin("/.?.cs^@b:X,a:Y,b:X").scope == ("a:Y", "b:X")
+    assert split_pin("/a/.?.cs!_g.cs@N:T") == split_pin("/a/.?.cs!_g.cs")._replace(scope=("N:T",))
+    assert split_pin("/a/.?.cs@N:T").only == (".cs",)  # "@" ends the `?` suffixes
+    assert scoped_pin("/.?.cs^", ["b:X", "a:Y", "b:X"]) == "/.?.cs^@a:Y,b:X"
+    assert scoped_pin("/.?.cs^", []) == "/.?.cs^"
+    keys = [f"N:T{i}" for i in range(MAX_SCOPE_KEYS)]
+    assert scoped_pin("/.?.cs^", keys + keys[:5]).count(",") == MAX_SCOPE_KEYS - 1  # 32 once deduplicated
+    assert scoped_pin("/.?.cs^", [*keys, "N:X"]) == "/.?.cs^"  # more than 32: the pin alone
+
+
+def test_tiered_keys_are_canonical_nearest_first():
+    """Each key in its nearest tier, sorted within it, empty tiers dropped;
+    one tier is `scoped_pin`'s form; the cap counts every tier's keys."""
+    pin = tiered_pin("/.?.cs^", [["b:T", "a:T"], ["a:T"], [], ["c:T", ".:T"]])
+    assert pin == "/.?.cs^@a:T,b:T;.:T,c:T"
+    assert split_pin(pin).scope == (".:T", "a:T", "b:T", "c:T")
+    assert split_pin(pin).ranks == (1, 0, 0, 1)
+    assert tiered_pin("/.?.cs^", [["b:T"], ["b:T", "a:T"]]) == "/.?.cs^@b:T;a:T"
+    assert tiered_pin("/.?.cs^", [["b:T", "a:T"], ["b:T"]]) == scoped_pin("/.?.cs^", ["a:T", "b:T"])
+    assert split_pin(scoped_pin("/.?.cs^", ["a:T", "b:T"])).ranks == ()
+    keys = [f"N:T{i}" for i in range(MAX_SCOPE_KEYS)]
+    assert tiered_pin("/.?.cs^", [keys[:20], keys[20:]]).count(";") == 1
+    assert tiered_pin("/.?.cs^", [keys[:20], [*keys[20:], "N:X"]]) == "/.?.cs^"
+    # name_refs keep a pin's keys once, canonical and in their tiers.
+    assert unscoped_pin("/.?.cs^@b:T,a:T;c:T") == ("/.?.cs^@", "a:T,b:T;c:T")
+    assert unscoped_pin("/.?.cs^@b:T,a:T") == ("/.?.cs^@", "a:T,b:T")
+    entry = name_ref_properties(_cs_rows({"/.?.cs^@b:T;a:T"}))["name_refs"][0]
+    assert parse_name_ref(entry)[1] == ["/.?.cs^@b:T;a:T"]
+
+
+@pytest.mark.parametrize(("keys", "others", "left_out"), [
+    (["a:T"], [], False),  # the nearest tier: never left out
+    (["c:T"], [("x/U.cs", ["a:T"])], True),
+    (["c:T"], [("x/U.cs", ["b:T"])], True),
+    (["b:T"], [("x/U.cs", ["b:T"])], False),  # the same tier: both link
+    (["b:T", "a:T"], [("x/U.cs", ["a:T"])], False),  # its nearest key counts
+    (["c:T"], [("x/U.md", ["a:T"])], False),  # a file the pin's path leaves out shadows nothing ...
+    (["c:T"], [("vendor/U.cs", ["a:T"])], False),  # ... nor a vendored one
+    (["c:T"], [("x/U.cs", ["z:T"]), ("y/U.cs", [])], False),
+    (None, [("x/U.cs", ["a:T"])], True),  # a node without keys is matched by none, shadowed by any
+    (["c:T"], [("x/U.cs", None), (None, ["a:T"]), ("", ["a:T"])], False),  # no keys; file-less
+])
+def test_a_nearer_tier_shadows_a_farther_one(keys, others, left_out):
+    pin = "/.?.cs^@a:T;b:T;c:T"
+    assert shadowed(pin, keys, others) is left_out
+    assert shadowed(scoped_pin("/.?.cs^", ["a:T", "b:T", "c:T"]), keys, others) is False
+
+
+def test_best_pin_tests_at_keys_against_the_nodes():
+    pins = {"lib/a.cs", "/.?.cs^@N:A"}
+    assert best_pin(pins, "x/a.cs", "app.cs", ["N:A"]) == "/.?.cs^@N:A"
+    assert best_pin(pins, "x/a.cs", "app.cs", ["N:B"]) is None
+    assert best_pin(pins, "lib/a.cs", "app.cs", ["N:A"]) == "lib/a.cs"
+    # An `@` exclusion leaves out only the nodes holding its keys.
+    assert best_pin({"x/.@N:A", "/.?.cs"}, "x/a.cs", "app.cs", ["N:B"]) == "/.?.cs"
+    assert best_pin({"x/.@N:A", "/.?.cs"}, "x/a.cs", "app.cs", ["N:A"]) == "x/.@N:A"
+
+
+def _cs_rows(pins):
+    rows = [r.to_dict() for r in call_rows("Function", "main", "f", set(pins), False, None, "app.cs", "r")]
+    for row in rows:
+        row["from_file"] = row["origin"] = "app.cs"
+    return rows
+
+
+def test_name_refs_store_each_set_of_at_keys_once():
+    """Two call sites on receivers of two types give one call two `@` pins
+    with different keys: an entry per key set, each storing its keys once,
+    which relink takes together again."""
+    from devgraph.indexer.dispatch import _with_scopes_merged
+
+    refs = name_ref_properties(_cs_rows({"a/f.cs", "/.?.cs^@N:A,.:A", "lib/.@N:A,.:A", "/.?.cs^@B:Y"}))["name_refs"]
+    head = ["CALLS", "Function", "main", "app.cs", "Function", "f", "", None]
+    assert all(entry.count("N:A") <= 1 for entry in refs)
+    assert sorted(parse_name_ref(entry) for entry in refs) == [
+        (head, ["/.?.cs^@.:A,N:A", "lib/.@.:A,N:A"], "pin"),
+        (head, ["/.?.cs^@B:Y"], "pin"),
+        (head, ["a/f.cs"], "pin"),
+    ]
+    # Every entry since owners has the same twelve fields, its keys' empty when it has none.
+    assert [len(entry.split("\x1f")) for entry in sorted(refs)] == [12, 12, 12]
+    assert _with_scopes_merged([parse_name_ref(entry) for entry in refs]) == [
+        (head, ["/.?.cs^@.:A,N:A", "/.?.cs^@B:Y", "a/f.cs", "lib/.@.:A,N:A"], "pin"),
+    ]
+
+
+def test_relink_takes_a_calls_entries_of_different_at_keys_together():
+    """A node an exact file pin and a weaker `@` pin of the same call both
+    match is relinked once, through the file pin, as the writer's rows left
+    it out of the `@` pin's."""
+    from devgraph.indexer.dispatch import _relink_name_refs
+
+    refs = name_ref_properties(_cs_rows({"lib/a.cs", "/lib/.@N:A", "/lib/.@N:B"}))["name_refs"]
+
+    class Engine:
+        def __init__(self):
+            self.rels = []
+
+        def find_name_refs(self, repo_id, names, skip):
+            return [("app.cs", refs, [])]
+
+        def upsert_relationships(self, rels):
+            self.rels += rels
+
+    engine = Engine()
+    _relink_name_refs(engine, "r", {("Function", "f", "lib/a.cs", ""), ("Function", "f", "lib/b.cs", "")}, set(), {
+        ("Function", "f", "lib/a.cs", ""): ("N:A",), ("Function", "f", "lib/b.cs", ""): ("N:B",),
+    })
+    assert sorted((rel["to_file"], rel["properties"]["confidence"]) for rel in engine.rels) == [
+        ("lib/a.cs", "resolved"), ("lib/b.cs", "package"),
+    ]
 
 
 def test_each_pin_leaves_out_what_a_stronger_pin_matches():
@@ -132,9 +267,12 @@ def engine():
     test_engine.close()
 
 
-#: Segments that share prefixes, so `a/b/` must not match `a/bc/`.
-_SEGMENTS = ["a", "ab", "b", "bc", "m", "vendor", "third_party", "test", "src", "java"]
-_NAMES = ["C.java", "a.py", "a_test.go", "x.go", "ab.py", "K.kt"]
+#: Segments that share prefixes, so `a/b/` must not match `a/bc/`; names
+#: starting with "@" (an npm scope), which a pin's `@` flag must not take.
+_SEGMENTS = ["a", "ab", "b", "bc", "m", "vendor", "third_party", "test", "src", "java", "@s"]
+_NAMES = ["C.java", "a.py", "a_test.go", "x.go", "ab.py", "K.kt", "@x.ts"]
+#: Match keys, for a pin's `@` flag and a node's `mkeys`.
+_KEYS = ["N:A", "N:B", ".:A", "N.M:+A"]
 
 
 def _random_path(rng: random.Random) -> str:
@@ -162,7 +300,14 @@ def _random_pin(rng: random.Random, kinds=("file", "dir", "suffix", "suffix_dir"
             pin += rng.choice(["^", "^t"])
         if rng.random() < 0.3:
             pin += rng.choice(["!_test.go", "!.py"])
+        if rng.random() < 0.3:
+            pin += "@" + ",".join(rng.sample(_KEYS, rng.randint(1, 2)))
     return pin
+
+
+def _random_keys(rng: random.Random) -> list[str] | None:
+    """A node's `mkeys`: none at all (an older node), or some of `_KEYS`."""
+    return None if rng.random() < 0.2 else sorted(rng.sample(_KEYS, rng.randint(0, 2)))
 
 
 def _random_cases(rng: random.Random, kinds, count: int, loose=True) -> list[tuple[str, list[str]]]:
@@ -173,34 +318,41 @@ def _random_cases(rng: random.Random, kinds, count: int, loose=True) -> list[tup
     ]
 
 
-def _expected(pin: str, exclude: list[str], path: str) -> bool:
-    return pin_matches(pin, path) and not any(pin_matches(other, path) for other in exclude)
+def _expected(pin: str, exclude: list[str], path: str, keys=()) -> bool:
+    keys = keys or ()
+    return pin_matches(pin, path, keys) and not any(pin_matches(other, path, keys) for other in exclude)
 
 
 def test_the_cypher_pin_test_agrees_with_pin_matches(engine):
     """A path pin and its exclusions, sent as `_group_rels_by_triple` sends
-    them (`pin`, `ex_files`, `ex_pins`), match in Cypher exactly the paths
-    `pin_matches` says."""
+    them (`pin`, `ex_files`, `ex_pins`), match in Cypher exactly the nodes
+    (paths and match keys) `pin_matches` says."""
     from devgraph.graph.engine import _group_rels_by_triple, _path_pin_conditions
 
     rng = random.Random(11)
     cases, expected = [], {}
-    for i, (pin, exclude) in enumerate(_random_cases(rng, ("dir", "suffix", "suffix_dir", "prefix"), 3000)):
-        path = _random_path(rng)
+    for i, (pin, exclude) in enumerate(_random_cases(rng, ("dir", "suffix", "suffix_dir", "prefix"), 8000)):
+        path, keys = _random_path(rng), _random_keys(rng)
         (rows,) = _group_rels_by_triple([{
             "from_label": "Function", "from_name": "f", "rel_type": "CALLS", "to_label": "Function",
             "to_name": "g", "repo_id": "r", "to_file": pin, "exclude": exclude,
         }]).values()
-        cases.append({"i": i, "t": rows[0]["targets"][0], "f": path})
-        expected[i] = (pin, exclude, path, _expected(pin, exclude, path))
+        cases.append({"i": i, "t": rows[0]["targets"][0], "f": path, "mkeys": keys})
+        expected[i] = (pin, exclude, path, keys, _expected(pin, exclude, path, keys))
     rows = engine.run_cypher(
         "UNWIND $cases AS c WITH c, c.t AS t RETURN c.i AS i, "
-        + " AND ".join(_path_pin_conditions("t", "c.f")) + " AS m",
+        + " AND ".join(_path_pin_conditions("t", "c.f", "c")) + " AS m",
         {"cases": cases},
     )
-    wrong = [expected[row["i"]][:3] for row in rows if row["m"] is not expected[row["i"]][3]]
+    wrong = [expected[row["i"]][:4] for row in rows if row["m"] is not expected[row["i"]][4]]
     assert len(rows) == len(cases) and wrong == []
-    assert 100 < sum(e[3] for e in expected.values()) < 2900  # both outcomes well represented
+    assert 100 < sum(e[4] for e in expected.values()) < 7900  # both outcomes well represented
+    # ... for the `@` flag (its path matching, its keys deciding) and the "@" names too.
+    scoped = [
+        e[4] for e in expected.values() if split_pin(e[0]).scope and _expected(e[0].rsplit("@", 1)[0], *e[1:4])
+    ]
+    assert 15 < sum(scoped) < len(scoped) - 15
+    assert sum(e[4] for e in expected.values() if "@" in e[2]) > 30
 
 
 def test_module_pins_seek_by_directory_and_basename_as_pin_matches_says(engine, repo_id):
@@ -234,6 +386,85 @@ def test_module_pins_seek_by_directory_and_basename_as_pin_matches_says(engine, 
     assert wrong == [] and linked > 20
 
 
+def test_the_cypher_shadow_test_agrees_with_shadowed(engine, repo_id):
+    """Random tiered pins (every path kind but a file, with flags, an owner
+    and exclusions) on CALLS rows to Functions and IMPORTS rows to Classes
+    link, among random nodes of their name (paths, owners and match keys),
+    exactly those `pin_matches`, `visible_to` and `shadowed` say: the row's
+    pin matches the node, its owner is the row's (when it names one), no
+    exclusion matches, the node's project (`proj`) is visible to the row
+    (`visible`), and no node its path and flags match and the row sees,
+    of any owner, holds a nearer tier's key. A fifth of the pins have one
+    tier, which shadows nothing but still sees by project."""
+    rng = random.Random(7)
+    keys = ["N:A", "M:A", ".:A", "N.M:A", "N:+A"]
+    projects = [".", "p", "q"]
+    nodes, rels, expected = [], [], set()
+    shadows = hidden = 0
+    for i in range(1500):
+        name = f"g{i}"
+        label = rng.choice(["Function", "Class"])
+        base = rng.choice(["/.", "/a/.", "a/.", ".", "a/", "/ab/", "/.cs"])
+        pin = base
+        if base.endswith(".") and not base.startswith("/") and rng.random() < 0.3:
+            pin += "~"
+        if rng.random() < 0.5:
+            pin += "?.cs"
+        if rng.random() < 0.4:
+            pin += rng.choice(["^", "^t"])
+        if rng.random() < 0.3:
+            pin += "!_g.cs"
+        if base == "/.cs":  # a suffix pin: a file named `.cs`, never one of these
+            pin = "/C.java" + pin[len(base):]
+        tiers = 1 if rng.random() < 0.2 else rng.randint(2, 4)
+        pin = tiered_pin(pin, [rng.sample(keys, rng.randint(1, 2)) for _ in range(tiers)])
+        visible = None if rng.random() < 0.3 else sorted(rng.sample(projects, rng.randint(1, 2)))
+        candidates, proj = {}, {}
+        for _ in range(rng.randint(1, 5)):
+            path = _random_path(rng)
+            path = path if rng.random() < 0.3 else path.rsplit(".", 1)[0] + rng.choice([".cs", "_g.cs"])
+            owner = rng.choice(["", "A", "B"])
+            candidates[(path, owner)] = None if rng.random() < 0.1 else sorted(rng.sample(keys, rng.randint(0, 2)))
+            proj[(path, owner)] = rng.choice([None, "", *projects])
+        exclude = sorted({rng.choice(sorted(candidates))[0]}) if rng.random() < 0.2 else []
+        to_owner = rng.choice([None, None, "A"])
+        nodes += [
+            {"label": label, "repo_id": repo_id, "name": name,
+             "properties": {"file": path, "owner": owner, **({"mkeys": mkeys} if mkeys is not None else {}),
+                            **({"proj": proj[(path, owner)]} if proj[(path, owner)] is not None else {})}}
+            for (path, owner), mkeys in candidates.items()
+        ]
+        rels.append({
+            "from_label": "Module", "from_name": "origin.cs", "rel_type": "CALLS" if label == "Function" else "IMPORTS",
+            "to_label": label, "to_name": name, "repo_id": repo_id, "to_file": pin, "exclude": exclude,
+            "origin": "origin.cs", "to_owner": to_owner, "visible": visible,
+        })
+        others = [(path, mkeys, proj[(path, owner)]) for (path, owner), mkeys in candidates.items()]
+        for (path, owner), mkeys in candidates.items():
+            if _expected(pin, exclude, path, mkeys) and to_owner in (None, owner):
+                if not visible_to(proj[(path, owner)], visible):
+                    hidden += 1
+                elif shadowed(pin, mkeys, others, visible):
+                    shadows += 1
+                else:
+                    expected.add((name, path, owner))
+    engine.upsert_nodes(
+        nodes + [{"label": "Module", "repo_id": repo_id, "name": "origin.cs", "properties": {"source_file": "origin.cs"}}]
+    )
+    engine.upsert_relationships(rels)
+    got = {
+        (row["n"], row["f"], row["o"]) for row in engine.run_cypher(
+            "MATCH (:Module {repo_id: $r, name: 'origin.cs'})-[:CALLS|IMPORTS]->(b) "
+            "RETURN b.name AS n, b.file AS f, b.owner AS o",
+            {"r": repo_id},
+        )
+    }
+    assert sorted(got ^ expected) == []
+    assert len(expected) > 100 and shadows > 15
+    assert hidden > 25
+
+
+
 # --- live writes and relinks per pin kind -----------------------------------------
 
 
@@ -259,8 +490,8 @@ def _inject(monkeypatch, calls=(), imports=(), files=()):
     `files` by path and `imports` (Module pins), whatever its text."""
     real = dispatch.extract_python_file
 
-    def extract(content, rel_path, repo_id):
-        result = real(content, rel_path, repo_id)
+    def extract(content, rel_path, repo_id, config=None):
+        result = real(content, rel_path, repo_id, config)
         if rel_path == "app.py":
             for rel in call_rows("Function", "main", "f", set(calls), False, None, "app.py", repo_id):
                 rel.from_file = rel.origin = "app.py"
@@ -336,6 +567,199 @@ def test_a_path_pinned_call_writes_and_relinks(engine, repo_id, tmp_path, monkey
     remove_paths(engine, repo_id, tmp_path, {gone})
     assert _calls(engine, repo_id) == [(rel, conf) for rel, conf in after if rel != before[0]]
     _equals_fresh(engine, repo_id, tmp_path)
+
+
+#: Each caller file's `main` calls `f` through these pins (and app.py also
+#: imports it so): `@` pins (two.py's from two call sites on receivers of
+#: two types), a bare name, an exact file beside a weaker `@` pin.
+_KEYED_CALLERS = {
+    "app.py": {scoped_pin("lib/.", ["N:A"])},
+    "two.py": {scoped_pin("lib/.", ["N:A"]), scoped_pin("lib/.", ["N:B"])},
+    "bare.py": set(),
+    "exact.py": {"lib/a.py", scoped_pin("/lib/.", ["N:A"])},
+}
+
+
+def _inject_match_keys(monkeypatch) -> dict:
+    """A `# mkeys k1,k2` first line gives a file's Functions those match
+    keys (and every lib/ file's none, [], while the returned settings'
+    `empty` is true); the `_KEYED_CALLERS` files call (and app.py imports)
+    `f`."""
+    real = dispatch.extract_python_file
+    settings = {"empty": False}
+
+    def extract(content, rel_path, repo_id, config=None):
+        result = real(content, rel_path, repo_id, config)
+        keys = None
+        if content.startswith("# mkeys "):
+            keys = sorted(set(content.splitlines()[0][len("# mkeys "):].split(",")))
+        elif settings["empty"] and rel_path.startswith("lib/"):
+            keys = []
+        if keys is not None:
+            for node in result.nodes:
+                if node.label == "Function":
+                    node.properties["mkeys"] = keys
+        pins = _KEYED_CALLERS.get(rel_path)
+        if pins is not None:
+            sources = [("CALLS", ("Function", "main"))]
+            if rel_path == "app.py":
+                sources.append(("IMPORTS", ("Module", rel_path)))
+            for kind, source in sources:
+                for rel in call_rows(*source, "f", set(pins), not pins, None, rel_path, repo_id, rel_type=kind):
+                    rel.origin = rel_path
+                    rel.from_file = rel_path if kind == "CALLS" else None
+                    result.relationships.append(rel)
+        return result
+
+    monkeypatch.setattr(dispatch, "extract_python_file", extract)
+    return settings
+
+
+def _keyed_links(engine, repo_id):
+    rows = engine.run_cypher(
+        "MATCH (a {repo_id: $r})-[x:CALLS|IMPORTS]->(b:Function {name: 'f'}) "
+        "RETURN coalesce(a.file, a.name) AS a, type(x) AS t, b.file AS f, x.confidence AS c",
+        {"r": repo_id},
+    )
+    return sorted((row["a"], row["t"], row["f"], row["c"]) for row in rows)
+
+
+def _f(keys=None):
+    return (f"# mkeys {keys}\n" if keys else "") + "def f():\n    return 0\n"
+
+
+def test_a_nodes_new_match_keys_retract_and_relink_its_edges(engine, repo_id, tmp_path, monkeypatch):
+    """When an edit moves N:A from lib/a.py's `f` to lib/b.py's, the edges
+    into both go and are written again under the new keys: `@` pins (two
+    sites with different keys among them), a bare name and an exact file,
+    from callers outside the batch or in it, as a fresh scan has them. A
+    node written without keys loses the ones it had. A commit's MODIFIES
+    edge survives."""
+    _inject_match_keys(monkeypatch)
+    monkeypatch.setattr("devgraph.graph.engine.RETRACT_NODES", 1)  # a transaction per node
+    callers = {rel: _write(tmp_path, rel, "def main():\n    return 0\n") for rel in _KEYED_CALLERS}
+    a = _write(tmp_path, "lib/a.py", _f("N:A,.:A"))
+    b = _write(tmp_path, "lib/b.py", _f("N:B"))
+    _scan(engine, repo_id, tmp_path)
+    engine.run_cypher(
+        "MATCH (m:Module {repo_id: $r, name: 'lib/a.py'}) CREATE (:Commit {repo_id: $r, name: 'c1'})-[:MODIFIES]->(m)",
+        {"r": repo_id},
+    )
+    fixed = [
+        ("bare.py", "CALLS", "lib/a.py", "name"), ("bare.py", "CALLS", "lib/b.py", "name"),
+        ("exact.py", "CALLS", "lib/a.py", "resolved"),  # the file pin, whatever a's keys
+    ]
+
+    def keyed(app, two):
+        # exact.py's `@` pin links only b: a is its stronger file pin's.
+        return sorted(fixed + [("app.py", t, f, "resolved") for f in app for t in ("CALLS", "IMPORTS")]
+                      + [("two.py", "CALLS", f, "resolved") for f in two]
+                      + [("exact.py", "CALLS", "lib/b.py", "package") for f in app if f == "lib/b.py"])
+
+    assert _keyed_links(engine, repo_id) == keyed(["lib/a.py"], ["lib/a.py", "lib/b.py"])
+    _equals_fresh(engine, repo_id, tmp_path)
+
+    # Callers outside the batch: relinked from their name_refs.
+    _write(tmp_path, "lib/a.py", _f("N:C"))
+    _write(tmp_path, "lib/b.py", _f("N:A"))
+    index_paths(engine, repo_id, tmp_path, {a, b})
+    assert _keyed_links(engine, repo_id) == keyed(["lib/b.py"], ["lib/b.py"])
+    _equals_fresh(engine, repo_id, tmp_path)
+
+    # A caller in the batch: written again by pass 2.
+    _write(tmp_path, "lib/a.py", _f(".:A,N:A"))
+    _write(tmp_path, "app.py", "def main():\n    return 1\n")
+    index_paths(engine, repo_id, tmp_path, {a, callers["app.py"]})
+    assert _keyed_links(engine, repo_id) == keyed(["lib/a.py", "lib/b.py"], ["lib/a.py", "lib/b.py"])
+    _equals_fresh(engine, repo_id, tmp_path)
+
+    # Written without keys: it has none, and no `@` pin links it.
+    _write(tmp_path, "lib/a.py", _f())
+    index_paths(engine, repo_id, tmp_path, {a})
+    assert _keyed_links(engine, repo_id) == keyed(["lib/b.py"], ["lib/b.py"])
+    _equals_fresh(engine, repo_id, tmp_path)
+    assert engine.run_cypher(
+        "MATCH (n:Function {repo_id: $r, name: 'f', file: 'lib/a.py'}) RETURN n.mkeys AS k", {"r": repo_id}
+    ) == [{"k": None}]
+    assert engine.run_cypher(
+        "MATCH (:Commit {repo_id: $r, name: 'c1'})-[x:MODIFIES]->(:Module {name: 'lib/a.py'}) RETURN count(x) AS n",
+        {"r": repo_id},
+    ) == [{"n": 1}]
+
+
+@pytest.mark.parametrize("fails", ["keys", "pass 2", "settle"])
+def test_a_batch_that_fails_after_writing_match_keys_rekeys_again(engine, repo_id, tmp_path, monkeypatch, fails):
+    """A batch that dies once the first node's keys are written (and its
+    edges gone), in pass 2, or just before its rekeyed nodes are settled
+    leaves them `mkeys_stale`: running it again retracts and relinks them,
+    as a fresh scan has them."""
+    from devgraph.graph import engine as engine_module
+
+    _inject_match_keys(monkeypatch)
+    monkeypatch.setattr(engine_module, "RETRACT_NODES", 1)
+    for rel in _KEYED_CALLERS:
+        _write(tmp_path, rel, "def main():\n    return 0\n")
+    a = _write(tmp_path, "lib/a.py", _f("N:A,.:A"))
+    b = _write(tmp_path, "lib/b.py", _f("N:B"))
+    _scan(engine, repo_id, tmp_path)
+
+    _write(tmp_path, "lib/a.py", _f())
+    _write(tmp_path, "lib/b.py", _f("N:A"))
+    with monkeypatch.context() as patch:
+        if fails == "keys":
+            real, calls = engine_module._run, []
+
+            def flaky(session, query, **params):
+                if "mkeys_stale = CASE" in query:
+                    calls.append(query)
+                    if len(calls) == 2:
+                        raise RuntimeError("down")
+                return real(session, query, **params)
+
+            patch.setattr(engine_module, "_run", flaky)
+        else:
+            method = "upsert_relationships" if fails == "pass 2" else "settle_match_keys"
+            patch.setattr(type(engine), method, lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("down")))
+        with pytest.raises(RuntimeError):
+            index_paths(engine, repo_id, tmp_path, {a, b})
+    assert engine.run_cypher(
+        "MATCH (n:Function {repo_id: $r, name: 'f'}) WHERE n.mkeys_stale RETURN n.file AS f", {"r": repo_id}
+    )
+    index_paths(engine, repo_id, tmp_path, {a, b})
+    assert ("app.py", "CALLS", "lib/b.py", "resolved") in _keyed_links(engine, repo_id)
+    _equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_keys_that_still_match_the_same_write_no_edge_again(engine, repo_id, tmp_path, monkeypatch):
+    """A node stored without keys and written with none ([]) or back keeps
+    every edge into it: the keys match the same nodes either way. The
+    property follows, as a fresh scan has it."""
+    settings = _inject_match_keys(monkeypatch)
+    for rel in _KEYED_CALLERS:
+        _write(tmp_path, rel, "def main():\n    return 0\n")
+    a = _write(tmp_path, "lib/a.py", _f())
+    _write(tmp_path, "lib/b.py", _f("N:A"))
+    _scan(engine, repo_id, tmp_path)
+
+    def edges():
+        return engine.run_cypher(
+            "MATCH ()-[x:CALLS|IMPORTS]->(n:Function {repo_id: $r, name: 'f', file: 'lib/a.py'}) "
+            "RETURN elementId(x) AS x ORDER BY x",
+            {"r": repo_id},
+        )
+
+    def keys():
+        return engine.run_cypher(
+            "MATCH (n:Function {repo_id: $r, name: 'f', file: 'lib/a.py'}) RETURN n.mkeys AS k", {"r": repo_id}
+        )
+
+    before = edges()
+    assert len(before) == 2 and keys() == [{"k": None}]  # bare.py's and exact.py's
+    for empty, stored in ((True, []), (False, None)):
+        settings["empty"] = empty
+        index_paths(engine, repo_id, tmp_path, {a})
+        assert edges() == before and keys() == [{"k": stored}]
+        _equals_fresh(engine, repo_id, tmp_path)
 
 
 def test_module_pins_import_by_directory_and_suffix_and_relink(engine, repo_id, tmp_path, monkeypatch):
@@ -475,3 +899,27 @@ def test_a_directory_pin_plan_cached_on_a_tiny_graph_is_replanned_once_it_grows(
     finally:
         engine.delete_repository(f"{repo_id}-tiny")
     assert sum(hits) < 15_000, hits
+
+
+def test_python_removals_read_no_name_refs(engine, repo_id, tmp_path, monkeypatch):
+    """Only C# writes match keys, so only a C# node's removal can change what
+    a tiered pin links: a Python symbol's removal and a Python file's
+    deletion look up no `name_refs`."""
+    calls = []
+    real = GraphEngine.find_name_refs
+
+    def find_name_refs(self, *args, **kwargs):
+        calls.append(args)
+        return real(self, *args, **kwargs)
+
+    a = _write(tmp_path, "a.py", "def f():\n    return 0\n\n\ndef g():\n    return 0\n")
+    _write(tmp_path, "b.py", "from a import f\n\n\ndef main():\n    return f()\n")
+    c = _write(tmp_path, "c.py", "def h():\n    return 0\n")
+    _scan(engine, repo_id, tmp_path)
+    monkeypatch.setattr(GraphEngine, "find_name_refs", find_name_refs)
+    a.write_text("def f():\n    return 0\n")
+    index_paths(engine, repo_id, tmp_path, {a})
+    c.unlink()
+    remove_paths(engine, repo_id, tmp_path, {c})
+    assert calls == []
+    _equals_fresh(engine, repo_id, tmp_path)

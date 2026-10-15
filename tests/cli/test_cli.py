@@ -714,7 +714,7 @@ def test_cli_client_config_mcp_add_only(runner, temp_registry_db):
         assert result.exit_code == 0, f"stdout: {result.stdout}"
         # Rich's console may soft-wrap a long line across multiple terminal
         # rows — join before asserting on content rather than counting lines.
-        collapsed = " ".join(l.strip() for l in result.stdout.strip().splitlines())
+        collapsed = " ".join(line.strip() for line in result.stdout.strip().splitlines())
         assert collapsed.startswith("claude mcp add -s user devgraph")
         assert collapsed.endswith('" -P -m devgraph.mcp.server')
 
@@ -739,7 +739,8 @@ def test_cli_client_config_vscode_creates_new_mcp_json(runner, temp_registry_db,
         data = json.loads(mcp_json.read_text(encoding="utf-8"))
         assert data["servers"]["devgraph"]["args"] == ["-P", "-m", "devgraph.mcp.server"]
         assert data["servers"]["devgraph"]["type"] == "stdio"
-        assert Path(data["servers"]["devgraph"]["cwd"]).is_absolute()
+        # The open workspace, as Claude Code's session uses its project folder; never the DevGraph checkout.
+        assert data["servers"]["devgraph"]["cwd"] == "${workspaceFolder}"
 
 
 def test_cli_client_config_vscode_preserves_existing_servers(runner, temp_registry_db, monkeypatch):
@@ -865,6 +866,8 @@ def test_cli_tray_start_then_status_then_stop(runner, temp_registry_db):
          patch.object(lifecycle, "get_settings", return_value=_mock_settings(db_path)), \
          patch.object(lifecycle.subprocess, "Popen", return_value=fake_process), \
          patch.object(lifecycle, "pid_is_running", side_effect=lambda pid: pid in alive), \
+         patch.object(lifecycle, "process_identity", side_effect=lambda pid: f"start-{pid}" if pid in alive else None), \
+         patch.object(lifecycle, "process_command", return_value=f"python -m {lifecycle.AGENT_MODULE}"), \
          patch.object(lifecycle, "resolve_venv_python", return_value=Path("python")), \
          patch.object(lifecycle, "resolve_repo_root", return_value=Path(".")), \
          patch.object(lifecycle, "wait_for_tray", return_value="running"), \
@@ -1980,7 +1983,27 @@ def _write_shadow_package(workdir: Path, marker: str) -> None:
     (pkg / "server.py").write_text(f"print({marker!r})\n")
 
 
-def test_generated_mcp_command_ignores_devgraph_package_in_working_directory(tmp_path):
+@pytest.fixture
+def stops_its_tray(tmp_path):
+    """The real server starts the tray under this test's home; however the test
+    ends (a timeout included), kill the tray its pid file names."""
+    import os
+    import signal
+
+    from devgraph.agent.lifecycle import process_identity
+
+    yield
+    pid_file = tmp_path / "home" / ".devgraph" / "tray.pid"
+    try:
+        pid_text, identity = pid_file.read_text(encoding="utf-8").split()
+        pid = int(pid_text)
+    except (OSError, ValueError):
+        return
+    if process_identity(pid) == identity:
+        os.kill(pid, signal.SIGTERM)
+
+
+def test_generated_mcp_command_ignores_devgraph_package_in_working_directory(tmp_path, stops_its_tray):
     """The generated server command must import the installed DevGraph even
     when started from a directory that contains its own `devgraph/` package."""
     import os
@@ -2002,8 +2025,8 @@ def test_generated_mcp_command_ignores_devgraph_package_in_working_directory(tmp
         "HOME": str(home),
         "USERPROFILE": str(home),
         "DEVGRAPH_REGISTRY_DB_PATH": str(home / ".devgraph" / "registry.sqlite3"),
-        # Unreachable, so the real server exits at its connectivity check
-        # before starting anything else.
+        # Unreachable: the real server says so on stderr, then serves until
+        # stdin (closed here) ends.
         "DEVGRAPH_NEO4J_URI": "bolt://127.0.0.1:1",
     })
 
@@ -2019,8 +2042,7 @@ def test_generated_mcp_command_ignores_devgraph_package_in_working_directory(tmp
 
     safe = run(list(MCP_SERVER_ARGS))
     assert marker not in safe.stdout
-    assert safe.returncode != 0
-    assert "ServiceUnavailable" in safe.stderr  # reached the real server
+    assert "Neo4j isn't reachable at bolt://127.0.0.1:1" in safe.stderr  # reached the real server
     assert str(workdir) not in safe.stderr
 
 
@@ -2206,6 +2228,42 @@ def test_doctor_fails_a_repository_the_watcher_is_not_watching(runner, temp_regi
     assert "running, but not watching 1 repository" in watcher
     assert f"[X] {repo_id}: {UNWATCHED}" in watcher
     assert result.exit_code == 1
+
+
+PARTLY = (
+    "partly watched: a new folder isn't watched, inotify limit reached (too many watched folders, "
+    "fs.inotify.max_user_watches); raise it, then restart the agent"
+)
+
+
+def test_doctor_warns_about_a_partly_watched_repository_and_status_says_so(
+    runner, temp_registry_db, temp_git_repo
+):
+    """A limit reached on a folder created after the watch started leaves the
+    rest of the repository watched: a warning, not a failure that would also
+    fail `devgraph update`, and never "not watching"."""
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.close()
+    settings = _agent_running_with_issues(db_path, {repo_id: PARTLY})
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=settings), \
+         patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine", _stub_engine(None)), \
+         patch.object(cli_main, "resolve_podman", return_value=None):
+        status = runner.invoke(app, ["status"])
+        doctor = runner.invoke(app, ["doctor"])
+
+    for result in (status, doctor):
+        watcher = _collapsed(result.stdout.split("Live Watcher", 1)[1].split("Dashboard", 1)[0])
+        assert "running, but only partly watching 1 repository" in watcher, watcher
+        assert f"[!] {repo_id}: {PARTLY}" in watcher
+        assert "not watching" not in watcher and "[X]" not in watcher and "[OK] running" not in watcher
+    assert "All checks passed." in doctor.stdout
+    assert doctor.exit_code == 0
 
 
 def test_status_and_doctor_ignore_issues_of_repositories_no_longer_watched(runner, temp_registry_db, temp_git_repo):

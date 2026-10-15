@@ -113,6 +113,8 @@ def test_a_failed_statement_is_retried_not_the_one_after_it(monkeypatch):
     """clear_extracted_properties reads the keys, then removes the stale ones:
     a failure of the read is retried as the read."""
     engine, driver = fake_engine(monkeypatch, [TransientError("deadlock"), None, None], [{"key": "stale"}])
+    monkeypatch.setattr(engine, "_schema_labels", lambda repo_id: [])  # the labels' own read is not under test
+    monkeypatch.setattr(engine, "_user_labels_in_use", lambda: [])
     assert engine.clear_extracted_properties("r", "fs", "Doc", keep=[]) == ["stale"]
     assert len(driver.runs) == 3
     assert driver.runs[0] == driver.runs[1] != driver.runs[2]
@@ -120,9 +122,37 @@ def test_a_failed_statement_is_retried_not_the_one_after_it(monkeypatch):
 
 
 def test_records_failing_as_they_are_read_are_retried(monkeypatch):
-    engine, driver = fake_engine(monkeypatch, [TransientError("deadlock"), None], [{"repo_id": "r"}])
-    assert engine.graph_repo_ids() == {"r"}
+    engine, driver = fake_engine(monkeypatch, [TransientError("deadlock"), None], [{"label": "Module", "name": "m"}])
+    monkeypatch.setattr(engine, "_schema_labels", lambda repo_id: ["Doc"])  # the labels' own read is not under test
+    monkeypatch.setattr(engine, "_user_labels_in_use", lambda: [])
+    assert engine.extracted_nodes_at("r", "fs", ["m"]) == {("Module", "m")}
     assert len(driver.runs) == 2
+
+
+def _rekeyed(count: int) -> list:
+    return [("Function", f"f{i}", "a.cs", "", ("Ns:A",), "a", True) for i in range(count)]
+
+
+def test_a_match_key_chunk_failing_as_it_executes_is_retried(monkeypatch):
+    """write_match_keys runs one statement per chunk of nodes: the last
+    chunk's deadlock is retried as that chunk, not lost when the session
+    closes."""
+    monkeypatch.setattr(engine_module, "RETRACT_NODES", 2)
+    engine, driver = fake_engine(monkeypatch, [None, TransientError("deadlock"), None])
+    engine.write_match_keys("r", _rekeyed(3))
+    assert len(driver.runs) == 3
+    assert driver.runs[1] == driver.runs[2]
+
+
+def test_a_match_key_chunk_that_keeps_failing_raises(monkeypatch):
+    monkeypatch.setattr(engine_module, "RETRACT_NODES", 2)
+    engine, driver = fake_engine(monkeypatch, [None] + [TransientError("lock timeout")] * 10)
+    with pytest.raises(TransientError):
+        engine.write_match_keys("r", _rekeyed(3))
+    assert len(driver.runs) == 1 + engine_module._MAX_RETRIES + 1
+    engine, driver = fake_engine(monkeypatch, [ConstraintError("bad")])
+    with pytest.raises(ConstraintError):
+        engine.settle_match_keys("r", [("Function", "f", "a.cs", "")])
 
 
 @pytest.fixture

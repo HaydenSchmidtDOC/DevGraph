@@ -54,7 +54,9 @@ def test_callers_of_changed_and_removed_symbols(tmp_path, engine):
     callers = result["impacted_callers"]
     assert callers["truncated"] is False
     assert callers["results"] == [
-        {"caller": "use_edit", "caller_type": "Function", "caller_file": "uses.py", "calls": "edit", "calls_file": "lib.py"},
-        {"caller": "use_gone", "caller_type": "Function", "caller_file": "uses.py", "calls": "gone", "calls_file": "lib.py"},
+        {"caller": "use_edit", "caller_type": "Function", "caller_file": "uses.py", "caller_owner": "", "calls": "edit",
+         "calls_file": "lib.py", "calls_owner": ""},
+        {"caller": "use_gone", "caller_type": "Function", "caller_file": "uses.py", "caller_owner": "", "calls": "gone",
+         "calls_file": "lib.py", "calls_owner": ""},
     ]
     assert result["notices"] == ["impacted_callers come from the last index of the working tree, not from either ref"]

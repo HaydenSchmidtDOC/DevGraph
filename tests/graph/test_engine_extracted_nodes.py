@@ -24,6 +24,11 @@ def engine():
 
 
 def seed(engine, repo, label, paths, extractor="filesystem"):
+    # Provider nodes exist only under labels the repository's applied schema
+    # records, and the engine matches them through those labels.
+    labels = (engine.read_applied_schema(repo) or {}).get("labels") or []
+    if label not in labels:
+        engine.record_applied_schema(repo, "test", [*labels, label], [])
     engine.upsert_nodes([
         {"label": label, "repo_id": repo, "name": p, "properties": {"path": p, "extractor": extractor}}
         for p in paths
@@ -31,7 +36,9 @@ def seed(engine, repo, label, paths, extractor="filesystem"):
 
 
 def names(engine, repo):
-    rows = engine.run_cypher("MATCH (n {repo_id: $r}) RETURN labels(n)[0] + ':' + n.name AS k", {"r": repo})
+    rows = engine.run_cypher(
+        "MATCH (n {repo_id: $r}) WHERE NOT n:Repository RETURN labels(n)[0] + ':' + n.name AS k", {"r": repo}
+    )
     return sorted(r["k"] for r in rows)
 
 
@@ -246,6 +253,7 @@ def test_existing_node_names_returns_only_names_this_repo_has_under_the_label(en
 
 
 def seed_keyed(engine, repo=REPO, extractor="docs"):
+    engine.record_applied_schema(repo, "test", ["Adr"], [])
     engine.upsert_nodes([{"label": "Adr", "repo_id": repo, "name": "ADR-012", "properties": {
         "path": "decisions/a.md", "extractor": extractor, "adr_id": "ADR-012",
     }}])
@@ -280,7 +288,7 @@ def test_list_file_nodes_finds_a_keyed_node_by_its_path(engine):
     seed_keyed(engine)
     # Provider nodes are looked up by the labels the applied schema records.
     engine.record_applied_schema(REPO, "h", ["Adr"], [], ["Adr:adr_id"])
-    assert engine.list_file_nodes(REPO, ["decisions/a.md"]) == {("Adr", "ADR-012", "decisions/a.md")}
+    assert engine.list_file_nodes(REPO, ["decisions/a.md"]) == {("Adr", "ADR-012", "decisions/a.md", "", None, False, None)}
     assert engine.list_file_nodes(REPO, ["ADR-012"]) == set()
 
 

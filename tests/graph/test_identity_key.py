@@ -37,3 +37,13 @@ def test_identity_key_is_file_scoped_exactly_when_merge_key_is():
             key = identity_key(label, row["repo_id"], row["name"], row["file"])
             has_file_in_key = key.count("\x1f") == 3
             assert has_file_in_key == file_scoped
+
+
+def test_owner_joins_the_key_only_when_set():
+    """Two classes' same-named methods in one file get two keys; a top-level
+    symbol keeps the key it had before owners."""
+    a = identity_key("Function", "repo1", "save", "models.py", "A")
+    b = identity_key("Function", "repo1", "save", "models.py", "B")
+    assert a == "Function\x1frepo1\x1fsave\x1fmodels.py\x1fA" and a != b
+    assert identity_key("Function", "repo1", "main", "app.py", "") == identity_key("Function", "repo1", "main", "app.py")
+    assert identity_key("Service", "repo1", "api", None, "A") == "Service\x1frepo1\x1fapi"

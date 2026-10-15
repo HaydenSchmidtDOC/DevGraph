@@ -144,7 +144,7 @@ def test_builtin_module_and_function(engine):
 
     module = describe(engine, name="src/app.py", label="Module")
     assert module["status"] == "found"
-    assert {"label": "Function", "name": "main", "file": "src/app.py"} in refs(module, "outgoing", "CONTAINS")
+    assert {"label": "Function", "name": "main", "file": "src/app.py", "owner": ""} in refs(module, "outgoing", "CONTAINS")
 
 
 def test_filesystem_nodes(engine):
@@ -163,8 +163,8 @@ def test_docs_path_keyed_node(engine):
     assert result["status"] == "found"
     assert result["node"]["properties"]["owner"] == "platform-team"
     assert refs(result, "outgoing", FOR) == [
-        {"label": "Service", "name": "api", "file": "deploy/docker-compose.yml"},
-        {"label": "Service", "name": "api", "file": "docker-compose.yml"},
+        {"label": "Service", "name": "api", "file": "deploy/docker-compose.yml", "owner": ""},
+        {"label": "Service", "name": "api", "file": "docker-compose.yml", "owner": ""},
     ]
 
 
@@ -203,8 +203,8 @@ def test_repository_name_is_not_ambiguous(engine, tmp_path_factory):
     result = describe(engine, name="api", label="Service")
     assert result["status"] == "ambiguous"
     assert result["candidates"] == [
-        {"label": "Service", "name": "api", "file": "deploy/docker-compose.yml"},
-        {"label": "Service", "name": "api", "file": "docker-compose.yml"},
+        {"label": "Service", "name": "api", "file": "deploy/docker-compose.yml", "owner": ""},
+        {"label": "Service", "name": "api", "file": "docker-compose.yml", "owner": ""},
     ]
     anywhere = describe(engine, name="api")
     assert all(c["label"] != "Repository" for c in anywhere["candidates"])
@@ -324,7 +324,7 @@ def test_a_self_loop_shows_in_both_directions(engine):
          "to_label": "Function", "to_name": "recurse", "to_file": "loop.py", "repo_id": REPO},
     ])
     result = describe(engine, name="recurse", label="Function", file="loop.py")
-    me = {"label": "Function", "name": "recurse", "file": "loop.py"}
+    me = {"label": "Function", "name": "recurse", "file": "loop.py", "owner": ""}
     assert result["outgoing"] == {"CALLS": {"count": 1, "results": [me], "truncated": False}}
     assert result["incoming"] == {"CALLS": {"count": 1, "results": [me], "truncated": False}}
 

@@ -746,8 +746,10 @@ table.dstable input[type="text"] { width: 100%; }
           <p class="desc">Global start/stop calls the same path as <code>devgraph tray start/stop</code> — there's no separate global-watch flag independent of per-repo toggles.</p>
           <div class="card" style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px"><div><div style="font-weight:510">Tray watcher</div><span class="status-live">running</span></div><button class="btn btn-sm">Stop</button></div>
           <div class="card field-grid">
-            <div class="field"><label><span class="lbl-txt">watch_debounce_ms<span class="qmark" data-tip="Milliseconds the watcher waits after a filesystem event before triggering a re-index.">?</span></span></label><input type="number" value="500" /></div>
-            <div class="field"><label><span class="lbl-txt">health_check_interval_s<span class="qmark" data-tip="How often the tray checks that the watcher process is still alive and responsive.">?</span></span></label><input type="number" value="30" /></div>
+            <p class="desc" style="grid-column:1/-1">Read-only: set with <code>DEVGRAPH_WATCH_DEBOUNCE_MS</code>, <code>DEVGRAPH_WATCH_MAX_WAIT_MS</code> and <code>DEVGRAPH_HEALTH_CHECK_INTERVAL_S</code> (environment or <code>.env</code>).<span id="watcherSettingsError" hidden> Couldn't load settings.</span></p>
+            <div class="field"><label><span class="lbl-txt">watch_debounce_ms<span class="qmark" data-tip="Milliseconds the watcher waits after a filesystem event before triggering a re-index.">?</span></span></label><input type="number" id="cfgWatchDebounceMs" disabled /></div>
+            <div class="field"><label><span class="lbl-txt">watch_max_wait_ms<span class="qmark" data-tip="The longest a file change waits while events keep arriving within the debounce of each other (a log or build output written continuously): it is re-indexed at least this often. DEVGRAPH_WATCH_MAX_WAIT_MS.">?</span></span></label><input type="number" id="cfgWatchMaxWaitMs" disabled /></div>
+            <div class="field"><label><span class="lbl-txt">health_check_interval_s<span class="qmark" data-tip="How often the tray checks that the watcher process is still alive and responsive.">?</span></span></label><input type="number" id="cfgHealthCheckIntervalS" disabled /></div>
           </div>
         </div>
 
@@ -1509,7 +1511,7 @@ function nodeDetailsQuery(ele) {
   // \u001f is the separator identity_key joins on (engine.py) -- chosen
   // because it cannot occur in a label, repo id, name or path. Written as an
   // escape here rather than as the literal control character it is.
-  const [label, repoId, name, file] = key.split("\u001f");
+  const [label, repoId, name, file, owner] = key.split("\u001f");
   // The label is interpolated, not matched as a value, so nothing but a plain
   // identifier may reach the query. It always is one -- it comes from
   // labels(n)[0] -- but a query built by concatenation shouldn't rely on that.
@@ -1523,6 +1525,9 @@ function nodeDetailsQuery(ele) {
     // first -- the same collision the file-scoped key exists to prevent.
     file === undefined ? "n.file IS NULL" : `n.file = "${escapeCypherStr(file)}"`,
   ];
+  // A file-scoped key carries the owner only when it isn't "" (two classes'
+  // same-named methods in one file); a key without one is a top-level symbol.
+  if (file !== undefined) where.push(`coalesce(n.owner, "") = "${escapeCypherStr(owner || "")}"`);
   return `MATCH (n:${label}) WHERE ${where.join(" AND ")} RETURN labels(n) AS labels, properties(n) AS props LIMIT 1`;
 }
 function showDetailsCard(ele, isEdge) {
@@ -2813,6 +2818,7 @@ async function refreshGraph(mode, record, structural) {
   try {
     const res = await runQueryAndUpdateGraph(q, { record, mode, replace });
     ok = res.ok;
+    if (!res.superseded && res.json?.results?.[0]) showTruncatedNotice(res.json.results[0]);
   } catch (e) { /* network hiccup -- leave whatever's on screen alone */ }
   return ok;
 }
@@ -2827,6 +2833,28 @@ async function refreshGraph(mode, record, structural) {
    before awaiting, and only applies its result if it's still the latest. ── */
 let previewDebounce = null;
 let glowRequestSeq = 0;
+/* At most one preview in flight: a pause in typing while one is still running
+   on Neo4j queues its text (the newest wins) for when that one returns, rather
+   than stacking another query beside it, and marks the running one stale so
+   its reply is ignored. A Run or canvas refresh issued after the text was
+   queued is newer than it, so the queued preview is then dropped rather than
+   sent (sending would supersede that reply). The server stops a preview after
+   5 s regardless. */
+let previewInFlight = null;
+let previewQueued = null;
+let previewQueuedSeq = 0;
+function schedulePreview(text) {
+  if (previewInFlight) { previewQueued = text; previewQueuedSeq = ++glowRequestSeq; return previewInFlight; }
+  previewInFlight = (async () => {
+    try { await previewQueryGlow(text); } finally { previewInFlight = null; }
+    if (previewQueued !== null) {
+      const next = previewQueued;
+      previewQueued = null;
+      if (glowRequestSeq === previewQueuedSeq) await schedulePreview(next);
+    }
+  })();
+  return previewInFlight;
+}
 async function previewQueryGlow(text) {
   if (!neo4jConnected) return;
   const trimmed = (text||"").trim();
@@ -2891,7 +2919,7 @@ cypherInput.addEventListener("input", () => {
   syncCypherHighlight();
   syncSlidersFromCypherText(cypherInput.value);
   clearTimeout(previewDebounce);
-  previewDebounce = setTimeout(() => previewQueryGlow(cypherInput.value), 450);
+  previewDebounce = setTimeout(() => schedulePreview(cypherInput.value), 450);
 });
 
 async function populateRealRepos(fireChangeEvent) {
@@ -2912,8 +2940,11 @@ async function populateRealRepos(fireChangeEvent) {
   const missing = new Set((json.repos || []).filter(r => r.path_missing).map(r => r.repo_id));
   // One the agent's watcher isn't watching (say an inotify limit was reached)
   // is browsable too, but not kept live: flagged, with the reason as tooltip.
+  // One watched but for a folder created since (a limit reached adding it) is
+  // flagged as partly watched.
   const unwatched = new Map((json.repos || []).filter(r => r.issue && !r.path_missing).map(r => [r.repo_id, r.issue]));
-  const optionLabel = id => missing.has(id) ? " (path missing)" : unwatched.has(id) ? " (not watched)" : "";
+  const partly = new Set((json.repos || []).filter(r => r.partly_watched).map(r => r.repo_id));
+  const optionLabel = id => missing.has(id) ? " (path missing)" : partly.has(id) ? " (partly watched)" : unwatched.has(id) ? " (not watched)" : "";
   const optionTitle = id => unwatched.has(id) ? ` title="${escapeHtmlVal(unwatched.get(id))}"` : "";
   const select = document.getElementById("repoSelect");
   // A saved repo (from a prior reload) wins over whatever the select's
@@ -3083,6 +3114,18 @@ const DESTRUCTIVE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP)\b/i;
    banner, results table). skipConfirm is used by the non-button callers so
    a destructive-looking sample/history query doesn't need a button in hand
    to trigger the same confirm() dialog Run would. */
+/* The server caps a result's rows (and says `truncated`): say so, rather than
+   show part of a result as the whole of it. A later result that isn't capped
+   clears the notice, and only the notice, never an error shown since. */
+let shownTruncatedNotice = null;
+function showTruncatedNotice(result) {
+  if (result.truncated) {
+    shownTruncatedNotice = `Showing the first ${result.data.length.toLocaleString()} rows: the query returned more. Add a LIMIT or narrow the MATCH.`;
+    cypherErrorEl.textContent = shownTruncatedNotice;
+  } else if (shownTruncatedNotice !== null && cypherErrorEl.textContent === shownTruncatedNotice) {
+    cypherErrorEl.textContent = "";
+  }
+}
 async function runCypherAndDisplay(text, opts) {
   if (!text) return;
   if (!opts?.skipConfirm && DESTRUCTIVE_RE.test(text) && !confirm("This looks like a write query (CREATE/DELETE/SET/MERGE/REMOVE/DROP) against your real local Neo4j graph. Run it?")) return;
@@ -3103,6 +3146,7 @@ async function runCypherAndDisplay(text, opts) {
     const result = res.json.results[0];
     const rows = result.data.map(d => d.row);
     cypherResultsEl.innerHTML = renderResultTable(result.columns, rows);
+    showTruncatedNotice(result);
     btnToggleResults.textContent = `Show results (${rows.length})`;
     btnToggleResults.style.display = "inline-flex";
   } catch (e) {
@@ -6046,12 +6090,17 @@ async function loadTopologyCounts() {
    backend or shown here; the masked dots are just a placeholder. ── */
 async function loadDashboardSettings() {
   try {
-    const s = await fetch("/api/settings").then(r => r.json());
+    const resp = await fetch("/api/settings");
+    if (!resp.ok) throw new Error(`/api/settings: ${resp.status}`);
+    const s = await resp.json();
     const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
     setVal("cfgNeo4jUri", s.neo4j_uri);
     setVal("cfgNeo4jUser", s.neo4j_user);
     setVal("cfgDashboardHost", s.dashboard_host);
     setVal("cfgDashboardPort", s.dashboard_port);
+    setVal("cfgWatchDebounceMs", s.watch_debounce_ms);
+    setVal("cfgWatchMaxWaitMs", s.watch_max_wait_ms);
+    setVal("cfgHealthCheckIntervalS", s.health_check_interval_s);
     const globalFields = {
       telemetry_enabled: s.telemetry_enabled,
       cloud_sync: s.cloud_sync,
@@ -6066,7 +6115,11 @@ async function loadDashboardSettings() {
       if (!input) return;
       if (input.type === "checkbox") input.checked = !!value; else input.value = value;
     });
-  } catch (e) { /* panes fall back to their static placeholder values */ }
+  } catch (e) {
+    // The other panes fall back to their static placeholder values; the
+    // Watcher pane's timings have none, so it says why they are empty.
+    document.getElementById("watcherSettingsError").hidden = false;
+  }
 }
 loadDashboardSettings();
 

@@ -38,14 +38,17 @@ from devgraph.config.project_schema import (
     schema_file_hash,
 )
 from devgraph.graph.engine import ABORTS_BATCH, GraphEngine, provision_repository_schema
-from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES
+from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES, pin_kind, split_pin
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.common import (
     best_pin,
     name_ref_properties,
+    owners_by_pin,
     parse_name_ref,
     pin_confidence,
     pin_excludes,
+    tiered,
+    visible_to,
 )
 from devgraph.indexer.containers.extractor import ContainerExtractor, ExtractionResult
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
@@ -122,9 +125,28 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: Rust, C# and C++ CALLS and IMPORTS resolved through crate roots and
 #: Cargo crate names, referenced types and quoted includes; 9: a C++
 #: out-of-class method's Class stub claimed by its file, and the unclaimed
-#: stubs an older index left deleted). An index stamped lower, or not at
-#: all, is rescanned automatically.
-INDEX_FORMAT = 9
+#: stubs an older index left deleted; 10: C# Class and Function match keys
+#: (`mkeys`) and C# CALLS and IMPORTS narrowed by namespace through them;
+#: 11: Class and Function keyed by their `owner` within a file, so two
+#: classes' same-named methods are two nodes, `name_refs` recording the
+#: source's owner; C++ templates, Java records, TS class-field arrow
+#: functions and Go methods on a pointer to a generic type extracted; 12:
+#: `name_refs` entries of one marked layout recording both ends' owners, a
+#: nested function's owner including its functions, and calls to another
+#: file's top-level function narrowed to it; 13: routes beyond Python as
+#: `Endpoint` nodes, with their handlers' IMPLEMENTS and owning-service CALLS
+#: (apis/routes.py), and a code Module's `shared_claims`); 14: C# match keys
+#: in shadow tiers (an enclosing namespace's type hides a using's), a
+#: tiered group's every pin recorded in `name_refs`; 15: C# Class and
+#: Function `proj` and C# path-pinned rows limited to the projects their
+#: file's project references (`visible`, a Module's `name_ref_visible`);
+#: 16: Python absolute imports also tried under a `src/` directory beside
+#: an ancestor and the source roots a pyproject.toml declares; Rust calls and imports
+#: through `pub use` re-exports (resolver configuration); a Kotlin
+#: anonymous companion object's members (owner `Class.Companion`); JSX
+#: component elements as calls.
+#: An index stamped lower, or not at all, is rescanned automatically.
+INDEX_FORMAT = 16
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -201,6 +223,11 @@ def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) ->
         label for label in previous.get("labels") or []
         if label not in labels and label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or "")
     ]
+    # Recorded before anything is written: a crash part-way then never leaves
+    # a label's nodes without a record naming it, so the next apply deletes
+    # them if the schema has dropped the label. The final record below
+    # replaces it with `labels`.
+    engine.record_schema_labels(repo_id, list(dict.fromkeys([*(previous.get("labels") or []), *labels])))
     for label in removed_labels:
         engine.delete_label_nodes(repo_id, label)
     for rel_type in previous.get("relationship_types") or []:
@@ -663,7 +690,9 @@ def index_paths(
             files recorded to an added node (see _relink_name_refs). No
             importer is re-indexed: every code edge is a function of its
             writer's text, its resolver configuration and whether its target
-            exists.
+            exists (a tiered pin's, which nodes of its target's name exist:
+            other files' tiered groups to a name whose nodes the batch adds,
+            removes or rekeys are written again).
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
         sync_provider: Write schema-provider nodes and edges for `paths`
@@ -678,9 +707,10 @@ def index_paths(
             a file that grows past the size limit or becomes ignored leaves
             the graph, as a full scan would leave it out.
         resolver: The resolver configuration's fingerprints to extract
-            under (resolver_config.fingerprints: the go.mod, go.work and
-            Cargo.toml files it found); None reads the ones the graph was
-            built with.
+            under (resolver_config.fingerprints: the go.mod, go.work,
+            Cargo.toml, re-exporting .rs, C# and pyproject.toml files it
+            found); None reads the
+            ones the graph was built with.
 
     Returns:
         Number of files actually indexed, including those referrers
@@ -694,11 +724,9 @@ def index_paths(
     py_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     # Same two-pass cross-link machinery as py_files/py_extractions above,
     # kept as parallel lists rather than merged with the Python one:
-    # datastore/API extraction (_datastore_nodes/_api_nodes_and_rels/
-    # _owning_service_relationships below) is still keyed to Python source
-    # conventions (regex/AST patterns tuned for Python), so non-Python files
-    # don't participate in those passes — only in their own node/edge
-    # re-upsert pass.
+    # datastore extraction (_datastore_nodes) is still keyed to Python source
+    # conventions, so non-Python files join the owning-service pass below
+    # only with the Endpoints their own extractor found (apis/routes.py).
     js_files: list[str] = []  # rel_path, for the cross-link pass below
     js_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     cs_files: list[str] = []
@@ -715,19 +743,20 @@ def index_paths(
     go_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     # The resolver configuration (tsconfig path aliases, go.mod module
-    # paths, Cargo crate names), read once for the batch under the fingerprint it was taken for
+    # paths, Cargo crate names, C# projects, pyproject source roots), read once for the batch under the fingerprint it was taken for
     # (the graph's, unless the caller has a newer one); see
     # sync_resolver_config for when a change to it re-indexes.
-    def config_files(lang: str, names: tuple[str, ...]) -> list[str] | None:
+    def config_files(lang: str, names: tuple[str, ...] | None = None) -> list[str] | None:
         stored = resolver if resolver is not None else engine.read_resolver_config(repo_id)
         entry = stored.get(lang)
         if entry is None:
             return None
-        return [rel for rel in entry.get("inputs", []) if posixpath.basename(rel) in names]
+        return [rel for rel in entry.get("inputs", []) if names is None or posixpath.basename(rel) in names]
 
     config = ResolverConfig(
         repo_root, go_files=lambda: config_files("go", ("go.mod", "go.work")),
-        rust_files=lambda: config_files("rust", ("Cargo.toml",)),
+        rust_files=lambda: config_files("rust"), cs_files=lambda: config_files("csharp"),
+        python_files=lambda: config_files("python"),
     )
     # Markdown files whose cross-file edges are resolved after every other
     # node in the batch exists (see the docs/mentions passes below).
@@ -811,7 +840,11 @@ def index_paths(
     # What the batch's files produced before this run, so the referrer step
     # below can tell which nodes the batch adds.
     batch_keys = sorted(by_rel_path)
-    previous_nodes = engine.list_file_nodes(repo_id, batch_keys)
+    previous = engine.list_file_nodes(repo_id, batch_keys)
+    previous_nodes = {node[:4] for node in previous}
+    previous_keys = {node[:4]: node[4] for node in previous}
+    previous_projects = {node[:4]: node[6] for node in previous}
+    stale = {node[:4] for node in previous if node[5]}
     # The claims on the shared nodes the batch's files claim (see
     # _written_back_shared).
     claims_before = engine.list_shared_claims(repo_id, batch_keys) if any(not n[2] for n in previous_nodes) else {}
@@ -858,17 +891,49 @@ def index_paths(
     batch_nodes = _batch_nodes(
         repo_id, root_resolved, code_extractions, docs_files, mention_files, batch_services, provider_nodes,
     )
-    # A node is added when no node of its label and name was at its file
-    # before, so one moving between two of the batch's files is added too.
+    # A node is added when no node of its label, name and owner was at its
+    # file before, so one moving between two of the batch's files, or to
+    # another class of its file, is added too.
     # A field-keyed docs entry already in the graph (moving between files)
     # is not: its edges move with it.
     added = batch_nodes - previous_nodes
     if claims_before:
         written_back = _written_back_shared(claims_before, engine.list_shared_claims(repo_id, batch_keys), batch_keys)
-        added |= {(label, name, "") for label, name in written_back} & batch_nodes
+        added |= {(label, name, "", "") for label, name in written_back} & batch_nodes
     if docs_batch:
         added -= {node for node in batch_nodes if node[:2] in docs_batch.existing}
     added_nodes = {node[:2] for node in added}
+    # Match keys and C# projects, which pass 1 left as they were, are
+    # written now, before pass 2 tests them. A kept node whose keys or
+    # project changed (no keys and none, no project and "", being the
+    # same) was linked by `@` pins under its old keys, and by rows that
+    # could see its old project: its CALLS/IMPORTS edges go with them, and
+    # pass 2 and the relink below write them again under the new ones, as
+    # for an added node; one a failed batch left stale goes again. It is
+    # not added otherwise: no referrer, docs or mention depends on them.
+    match_keys = _match_keys(code_extractions)
+    projects = _projects(code_extractions)
+    rekeyed = {
+        node for node, keys in match_keys.items()
+        if node in stale or (node in previous_keys and (
+            (previous_keys[node] or ()) != (keys or ()) or (previous_projects[node] or "") != (projects[node] or "")
+        ))
+    }
+    rewritten = sorted(
+        (*node, keys, projects[node], node in rekeyed) for node, keys in match_keys.items()
+        if node in rekeyed or previous_keys.get(node) != keys or previous_projects.get(node) != projects[node]
+    )
+    if rewritten:
+        engine.write_match_keys(repo_id, rewritten)
+    # The match keys, old and new, of the nodes the batch adds, removes or
+    # rekeys, by name: a tiered pin's edges to such a name depend on all its
+    # nodes, so the relink writes the groups whose keys meet them again (see
+    # _relink_name_refs). A node with no keys (any other language's) can
+    # neither link nor shadow under an `@` pin, so it touches none.
+    shadow_names = _shadow_keys(
+        (node, previous_keys.get(node), match_keys.get(node))
+        for node in added | rekeyed | (previous_nodes - batch_nodes)
+    )
     referrers = _find_referrers(engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path))
     for rel_path in sorted(referrers):
         index_one(rel_path, root_resolved / rel_path)
@@ -953,7 +1018,11 @@ def index_paths(
     # edges straight from the graph, with no file read. A full scan has no
     # file outside the batch.
     if relink_outside:
-        _relink_name_refs(engine, repo_id, added, set(by_rel_path) | referrers)
+        _relink_name_refs(
+            engine, repo_id, added | rekeyed, set(by_rel_path) | referrers, match_keys, shadow_names, projects,
+        )
+    if rekeyed:
+        engine.settle_match_keys(repo_id, sorted(rekeyed))
 
     # Service cross-linking runs as a final pass, after every file in this
     # batch (including any compose file) has been indexed — Service nodes'
@@ -964,11 +1033,20 @@ def index_paths(
     # once per file, since it can't have changed mid-batch (Services are
     # only written by the Containerfile/compose branches above, already run
     # by this point).
-    if py_files:
+    # Another language's routes are its extraction's Endpoint nodes.
+    route_endpoints = {
+        rel_path: [node["name"] for node in nodes if node["label"] == "Endpoint"]
+        for extractions in code_extractions[1:]
+        for rel_path, (nodes, _rels) in extractions.items()
+    }
+    route_endpoints = {rel_path: names for rel_path, names in route_endpoints.items() if names}
+    if py_files or route_endpoints:
         services = _load_services_with_build_context(engine, repo_id)
         service_rels: list[dict] = []
         for rel_path, content in py_files:
             service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
+        for rel_path, names in sorted(route_endpoints.items()):
+            service_rels.extend(_endpoint_service_relationships(repo_id, rel_path, names, services))
         engine.upsert_relationships(service_rels)
 
     if providers_ok and fs_spec is not None:
@@ -1058,11 +1136,16 @@ def _routes(resolved: Path, docs_root: Path | None, mentions_enabled: bool) -> l
 def _with_name_refs(nodes: list[dict], rels: list[dict], rel_path: str) -> list[dict]:
     """A copy of a code file's `nodes` whose Module carries the file's
     by-name edges (see name_ref_properties), for its pass-1 replace only:
-    pass 2 re-upserts the plain `nodes`, so it never writes them again."""
+    pass 2 re-upserts the plain `nodes`, so it never writes them again. Its
+    symbols' match keys are left out: index_paths writes them after pass 1
+    (engine.write_match_keys), with the edges they decide, and so is their
+    C# project (`proj`)."""
     refs = name_ref_properties(rels)
     return [
         {**node, "properties": {**node["properties"], **refs}}
-        if node["label"] == "Module" and node["name"] == rel_path else node
+        if node["label"] == "Module" and node["name"] == rel_path
+        else {**node, "properties": {k: v for k, v in node["properties"].items() if k not in ("mkeys", "proj")}}
+        if "mkeys" in node["properties"] or "proj" in node["properties"] else node
         for node in nodes
     ]
 
@@ -1111,7 +1194,7 @@ def _index_single_path(
     routes = _routes(resolved, docs_root, mentions_enabled)
     if "py" in routes:
         content = read_source(resolved)
-        result = extract_python_file(content, rel_path, repo_id)
+        result = extract_python_file(content, rel_path, repo_id, config)
         # Datastore/API extraction reads the same content, so it runs
         # alongside the Python indexer rather than as a separate dispatch
         # branch. Passed the repo-relative path (not bare filename) so
@@ -1146,20 +1229,29 @@ def _index_single_path(
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-reupsert rationale as the .py branch above:
         # prune this file's previously-indexed nodes/edges and write the
-        # freshly-extracted ones in one transaction.
-        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
+        # freshly-extracted ones in one transaction. Its routes' Endpoint
+        # edges go as a Python file's do (`service_api`).
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
         js_files.append(rel_path)
         js_extractions[rel_path] = (nodes, rels)
     elif "cs" in routes:
         content = read_source(resolved)
-        result = extract_csharp_file(content, rel_path, repo_id)
+        result = extract_csharp_file(content, rel_path, repo_id, config)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above:
         # prune this file's stale nodes/edges in one transaction, then
-        # re-upsert in pass 2 once every file in the batch has a node.
-        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
+        # re-upsert in pass 2 once every file in the batch has a node. A
+        # row with tiered match keys waits for pass 2: whether a nearer
+        # node shadows its target depends on nodes a later file of the
+        # batch may still add, remove or rekey, and pass 2 only adds edges.
+        # So does a row limited to its project's references (`visible`):
+        # a node's `proj` is written with its match keys, after pass 1.
+        engine.replace_file_nodes(
+            repo_id, rel_path, _with_name_refs(nodes, rels, rel_path),
+            [rel for rel in rels if not tiered(rel.get("to_file")) and not rel.get("visible")], service_api=True,
+        )
         indexed += 1
         cs_files.append(rel_path)
         cs_extractions[rel_path] = (nodes, rels)
@@ -1180,7 +1272,7 @@ def _index_single_path(
         # Same replace-then-cross-link-reupsert pattern as the .py
         # branch above (see its comment for why replace_file_nodes runs
         # first, in one transaction, rather than plain upsert).
-        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
         java_files.append((rel_path, content))
         java_extractions[rel_path] = (nodes, rels)
@@ -1204,7 +1296,7 @@ def _index_single_path(
         # Same replace-then-re-upsert rationale as the .py branch above: a
         # class/function removed from the file must not survive in the graph
         # as a stale node.
-        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
         kt_files.append(rel_path)
         kt_extractions[rel_path] = (nodes, rels)
@@ -1216,7 +1308,7 @@ def _index_single_path(
         # Same replace-then-re-upsert rationale as the .py branch above:
         # a struct/func/method removed from the file must not survive in
         # the graph as a stale node.
-        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
         go_extractions[rel_path] = (nodes, rels)
     elif "docs" in routes:
@@ -1250,24 +1342,28 @@ def _batch_nodes(
     mention_files: list[Path],
     services: set[tuple[str, str, str]],
     provider_nodes: set[tuple[str, str, str]],
-) -> set[tuple[str, str, str]]:
-    """(label, name, file) of every file-provenance node this batch wrote:
+) -> set[tuple[str, str, str, str]]:
+    """(label, name, file, owner) of every file-provenance node this batch wrote:
     code symbols and Modules, docs notes, Markdown Document nodes, compose
     Services and schema-provider nodes -- the same provenance, with the same
     `file`, that list_file_nodes snapshots. A shared node a batch file claims
     (a `Datastore`, `Endpoint`, handler stub or C++ out-of-class method's
     Class stub, or a compose/Containerfile `Container`) has `file` "", as
     list_file_nodes gives it, so one whose last claim went and came back is
-    added."""
+    added. Only a code symbol has an owner (common.member_owner); every
+    other node's is ""."""
     nodes = {
-        (node["label"], node["name"], rel_path if node["label"] == "Module" else node["properties"]["file"])
+        (
+            node["label"], node["name"], rel_path if node["label"] == "Module" else node["properties"]["file"],
+            node["properties"].get("owner") or "",
+        )
         for extractions in code_extractions
         for rel_path, (file_nodes, _rels) in extractions.items()
         for node in file_nodes
         if node["label"] == "Module" or node["properties"].get("file")
     }
     nodes |= {
-        (node["label"], node["name"], "")
+        (node["label"], node["name"], "", "")
         for extractions in code_extractions
         for rel_path, (file_nodes, _rels) in extractions.items()
         for node in file_nodes
@@ -1278,58 +1374,134 @@ def _batch_nodes(
         # writes the repo-relative path as the note's `source_file`.
         result = DocsExtractor(repo_id).extract_from_source(_read_text(path), path.name)
         rel = path.relative_to(root).as_posix()
-        nodes |= {(doc.label, doc.name, rel) for doc in result.docs}
-    nodes |= {("Document", rel, rel) for rel in (path.relative_to(root).as_posix() for path in mention_files)}
-    nodes |= services
-    nodes |= provider_nodes
+        nodes |= {(doc.label, doc.name, rel, "") for doc in result.docs}
+    nodes |= {("Document", rel, rel, "") for rel in (path.relative_to(root).as_posix() for path in mention_files)}
+    nodes |= {(*node, "") for node in services | provider_nodes}
     return nodes
 
 
+def _match_keys(
+    code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
+) -> dict[tuple[str, str, str, str], tuple[str, ...] | None]:
+    """(label, name, file, owner) -> sorted `mkeys` (graph/schema.py `split_pin`'s
+    `@` flag tests them) of every code symbol this batch wrote, None for
+    one written without them, as list_file_nodes gives them."""
+    return {
+        (node["label"], node["name"], node["properties"]["file"], node["properties"].get("owner") or ""): (
+            None if node["properties"].get("mkeys") is None else tuple(sorted(set(node["properties"]["mkeys"])))
+        )
+        for extractions in code_extractions
+        for _rel_path, (file_nodes, _rels) in extractions.items()
+        for node in file_nodes
+        if node["properties"].get("file")
+    }
+
+
+def _projects(
+    code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
+) -> dict[tuple[str, str, str, str], str | None]:
+    """(label, name, file, owner) -> the C# project (`proj`, which a row's
+    `visible` tests, see common.visible_to) of every code symbol this batch
+    wrote, None for one written without one, as list_file_nodes gives it."""
+    return {
+        (node["label"], node["name"], node["properties"]["file"], node["properties"].get("owner") or ""):
+            node["properties"].get("proj")
+        for extractions in code_extractions
+        for _rel_path, (file_nodes, _rels) in extractions.items()
+        for node in file_nodes
+        if node["properties"].get("file")
+    }
+
+
+def _shadow_keys(nodes) -> dict[tuple[str, str], set[str]]:
+    """(label, name) -> the match keys of these (node, old mkeys, new mkeys)
+    of a file-scoped label, old and new together; a name whose nodes hold
+    none is left out."""
+    found: dict[tuple[str, str], set[str]] = {}
+    for node, old, new in nodes:
+        keys = set(old or ()) | set(new or ())
+        if keys and node[0] in FILE_SCOPED_LABELS:
+            found.setdefault(node[:2], set()).update(keys)
+    return found
+
+
+#: The most tiered groups `_relink_name_refs` writes again per transaction.
+RERUN_GROUPS = 200
+
+
 def _relink_name_refs(
-    engine: GraphEngine, repo_id: str, added: set[tuple[str, str, str]], skip: set[str]
+    engine: GraphEngine, repo_id: str, added: set[tuple[str, str, str, str]], skip: set[str],
+    match_keys: dict[tuple[str, str, str, str], tuple[str, ...] | None] | None = None,
+    shadow_names: Mapping[tuple[str, str], set[str]] | None = None,
+    projects: dict[tuple[str, str, str, str], str | None] | None = None,
 ) -> None:
     """Re-write the by-name edges that code files outside `skip` recorded in
     their Modules' `name_refs` (see name_ref_properties) and that meet a node
-    in `added`: by their target, or by an unpinned non-Module source (a Rust
-    `impl Trait for Foo` whose `Foo` was just added). Those files were
-    indexed before the node existed, so the edge was skipped then. One graph
-    read and one upsert, no file read; each edge's origin is its file.
+    in `added` ((label, name, file, owner)): by their target, or by an
+    unpinned non-Module source (a Rust `impl Trait for Foo` whose `Foo` was
+    just added). Those files were indexed before the node existed, so the
+    edge was skipped then (or, for a node whose match keys changed, its
+    edges were retracted). One graph read and one upsert, no file read; each
+    edge's origin is its file.
 
     The end that met an added node is pinned to it when its label is keyed
-    by file. Its edges to same-named nodes that were already there exist
-    (they were written when the file was indexed, or relinked when that node
-    was added), and a bare-name match can't use the file-keyed index. An
-    entry with target pins relinks only an added node a pin of its links
-    (common.best_pin: the strongest pin that matches its file, as the
-    writer's rows leave out what a stronger pin matches), with that pin's
-    confidence. A pinned Module target is found by an added Module's
-    directory, directory name or basename (the row's `to_name`, see
-    common.module_pin_name) and relinked by its path. Each edge gets back the entry's `caller_class`.
+    by file: to its file and its owner, so a sibling of its name in that
+    file is never linked by it. Its edges to same-named nodes that were
+    already there exist (they were written when the file was indexed, or
+    relinked when that node was added), and a bare-name match can't use the
+    file-keyed index. An entry with target pins relinks only an added node a
+    pin of its links (common.best_pin: the strongest pin that matches its
+    file, as the writer's rows leave out what a stronger pin matches, tested
+    against the node's `match_keys`), with that pin's confidence, when a
+    path pin's node is visible to the entry's file's project (its
+    Module's `name_ref_visible` against the node's `projects`,
+    common.visible_to): such an edge is pinned to the node's file, so the
+    test is made here, not by the engine. The rows a tiered group's re-run
+    and an added unpinned source write keep the entry's path pins, and
+    carry that `visible` for the engine to test (`_visible`). A pinned
+    Module target is found by an added Module's directory, directory name or
+    basename (the row's `to_name`, see common.module_pin_name) and relinked
+    by its path. Each edge gets back the entry's `caller_class`, and its
+    source the entry's owner.
+
+    A group (one source's entries to one name) with a tiered pin
+    (graph/schema.py `tiered_pin`) is never relinked edge by edge: whether
+    it links a node depends on every node of the name. When one of its
+    pins' keys is among `shadow_names`' keys for its (to_label, to_name)
+    (the old and new match keys of the nodes of that name the batch added,
+    removed or rekeyed) it is written again whole, as its writer wrote it
+    (engine.rerun_edges: its file's edges of the group go first),
+    RERUN_GROUPS groups per transaction; else it stays as it is: a node
+    holding none of a pin's keys neither links nor shadows under it.
     """
-    if not added:
+    shadow_names = shadow_names or {}
+    if not added and not shadow_names:
         return
-    pinned: dict[tuple[str, str], set[str | None]] = {}
+    pinned: dict[tuple[str, str], set[tuple[str | None, str | None]]] = {}
     modules: set[str] = set()
-    for label, name, file in added:
-        pinned.setdefault((label, name), set()).add(file if label in FILE_SCOPED_LABELS else None)
+    for label, name, file, owner in added:
+        pinned.setdefault((label, name), set()).add((file, owner) if label in FILE_SCOPED_LABELS else (None, None))
         if label == "Module":
             modules.add(name)
     rels = []
+    rerun: list[tuple[dict, list[dict]]] = []
 
-    def relink(origin, fields, from_file, to_file, confidence, exclude=(), to_name=None):
-        rel_type, from_label, from_name, _from_file, to_label, field_to_name, caller_class = fields
+    def relink(origin, fields, from_file, to_file, confidence, exclude=(), to_name=None, from_owner=None,
+               to_owner=None, visible=None):
+        rel_type, from_label, from_name, _from_file, to_label, field_to_name, caller_class, _owner = fields
         properties = {key: value for key, value in (("caller_class", caller_class), ("confidence", confidence)) if value}
         rels.append({
             "from_label": from_label, "from_name": from_name, "rel_type": rel_type,
             "to_label": to_label, "to_name": to_name or field_to_name, "repo_id": repo_id,
             "properties": properties or None,
             "from_file": from_file or None, "to_file": to_file, "origin": origin, "exclude": list(exclude),
+            "from_owner": from_owner, "to_owner": to_owner, "visible": visible or None,
         })
 
-    names = {name for _label, name in pinned}
+    names = {name for _label, name in pinned} | {name for _label, name in shadow_names}
     names |= {key for module in modules for key in _module_pin_keys(module)}
-    for origin, refs in engine.find_name_refs(repo_id, sorted(names), sorted(skip)):
-        parsed = [parse_name_ref(entry) for entry in refs]
+    for origin, refs, visible in engine.find_name_refs(repo_id, sorted(names), sorted(skip)):
+        parsed = _with_scopes_merged(_parsed_name_refs(origin, refs))
         # Every Module a source imports, by path or by pin, as calls.import_rows
         # collapsed them: a pinned Module target leaves out what a stronger
         # one of them matches.
@@ -1338,30 +1510,109 @@ def _relink_name_refs(
             if fields[4] == "Module":
                 imported.setdefault(tuple(fields[:4]), set()).update(pins if pins is not None else [fields[5]])
         for fields, pins, confidence in parsed:
-            _rel_type, from_label, from_name, from_file, to_label, to_name, _caller_class = fields
+            _rel_type, from_label, from_name, from_file, to_label, to_name, _caller_class, from_owner = fields
+            # A source pinned to its file keeps the entry's owner (one of the
+            # file's same-named siblings); one whose owner was not known
+            # (an entry written before owners) matches them all.
+            owner = from_owner if from_file else None
+            owners = owners_by_pin(pins) if pins is not None else {}
+            if pins is not None and any(tiered(pin) for pin in owners):
+                touched = shadow_names.get((to_label, to_name), set())
+                if any(touched & set(split_pin(pin).scope) for pin in owners):
+                    group = {
+                        "rel_type": fields[0], "from_label": from_label, "from_name": from_name,
+                        "from_file": from_file or None, "from_owner": owner, "to_label": to_label,
+                        "to_name": to_name, "origin": origin,
+                    }
+                    # The writer's rows (calls.call_rows).
+                    start = len(rels)
+                    for pin, exclude in pin_excludes(owners, origin).items():
+                        for to_owner in [None] if None in owners[pin] else sorted(owners[pin]):
+                            relink(
+                                origin, fields, from_file, pin, pin_confidence(pin, confidence), exclude,
+                                from_owner=owner, to_owner=to_owner, visible=visible,
+                            )
+                    rerun.append((group, rels[start:]))
+                    del rels[start:]
+                continue
             if pins is None:
-                for to_file in pinned.get((to_label, to_name), ()):
-                    relink(origin, fields, from_file, to_file, confidence)
+                for to_file, to_owner in pinned.get((to_label, to_name), ()):
+                    relink(origin, fields, from_file, to_file, confidence, from_owner=owner, to_owner=to_owner)
             elif to_label == "Module":
                 # A directory or suffix pin: to_name is what it seeks.
                 for module in sorted(modules):
                     if to_name in _module_pin_keys(module):
                         pin = best_pin(imported[tuple(fields[:4])], module, origin)
                         if pin in pins:
-                            relink(origin, fields, from_file, None, pin_confidence(pin, confidence), to_name=module)
+                            relink(
+                                origin, fields, from_file, None, pin_confidence(pin, confidence), to_name=module,
+                                from_owner=owner,
+                            )
             else:
-                for to_file in pinned.get((to_label, to_name), ()):
-                    pin = best_pin(pins, to_file or "", origin) if to_file is not None else None
-                    if pin is not None:
-                        relink(origin, fields, from_file, to_file, pin_confidence(pin, confidence))
+                for to_file, to_owner in pinned.get((to_label, to_name), ()):
+                    node = (to_label, to_name, to_file, to_owner)
+                    keys = (match_keys or {}).get(node) or ()
+                    pin = best_pin(owners, to_file or "", origin, keys) if to_file is not None else None
+                    # A path pin's row sees only its project's references (graph/engine.py `_visible`).
+                    if pin is not None and pin_kind(pin) not in ("file", "fileless"):
+                        pin = pin if visible_to((projects or {}).get(node), visible) else None
+                    # A pin that named its target's owner links only that owner's member.
+                    if pin is not None and (None in owners[pin] or to_owner in owners[pin]):
+                        relink(
+                            origin, fields, from_file, to_file, pin_confidence(pin, confidence), from_owner=owner,
+                            to_owner=to_owner,
+                        )
             if not from_file and from_label != "Module":
-                excludes = pin_excludes(pins, origin) if pins is not None else {None: ()}
-                for source_file in pinned.get((from_label, from_name), ()):
+                excludes = pin_excludes(owners, origin) if pins is not None else {None: ()}
+                for source_file, source_owner in pinned.get((from_label, from_name), ()):
                     for to_file, exclude in excludes.items():
                         conf = confidence if to_file is None else pin_confidence(to_file, confidence)
-                        relink(origin, fields, source_file, to_file, conf, exclude)
+                        pin_owners = owners.get(to_file, {None})
+                        for to_owner in [None] if None in pin_owners else sorted(pin_owners):
+                            relink(
+                                origin, fields, source_file, to_file, conf, exclude, from_owner=source_owner,
+                                to_owner=to_owner, visible=visible,
+                            )
+    for start in range(0, len(rerun), RERUN_GROUPS):
+        chunk = rerun[start:start + RERUN_GROUPS]
+        engine.rerun_edges(repo_id, [group for group, _rows in chunk], [row for _group, rows in chunk for row in rows])
     if rels:
         engine.upsert_relationships(rels)
+
+
+def _parsed_name_refs(origin: str, refs: list[str]) -> list[tuple[list, list[str] | None, str]]:
+    """`refs` (a Module's `name_refs` entries) parsed, leaving out, with a
+    debug line, any entry no layout reads: one an index older than owners
+    wrote in a shape `parse_name_ref` does not know never stops a batch."""
+    parsed = []
+    for entry in refs:
+        try:
+            parsed.append(parse_name_ref(entry))
+        except ValueError:
+            logger.debug("skipping an unreadable name_refs entry of %s: %r", origin, entry)
+    return parsed
+
+
+def _with_scopes_merged(
+    parsed: list[tuple[list[str], list[str] | None, str]],
+) -> list[tuple[list[str], list[str] | None, str]]:
+    """`name_refs` entries (parse_name_ref's) with the pinned entries of one
+    source and name taken together: its pins with different match keys are
+    entries of their own (name_ref_properties), and each of one call's pins
+    leaves out what a stronger one of them matches, as the writer's rows
+    did. Every other entry is as it was."""
+    merged: dict[tuple[str, ...], tuple[set[str], set[str]]] = {}
+    unpinned = []
+    for fields, pins, confidence in parsed:
+        if pins is None:
+            unpinned.append((fields, pins, confidence))
+        else:
+            all_pins, confidences = merged.setdefault(tuple(fields), (set(), set()))
+            all_pins.update(pins)
+            confidences.add(confidence)
+    return unpinned + [
+        (list(fields), sorted(pins), min(confidences)) for fields, (pins, confidences) in merged.items()
+    ]
 
 
 def _module_pin_keys(module: str) -> tuple[str, str, str]:
@@ -1619,7 +1870,9 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     and recreated in one batch keeps its recreated files. Language nodes are
     deleted per exact path; the provider passes get the exact paths, plus
     each deleted path that holds no indexable file on disk, so that its now
-    empty folder nodes go.
+    empty folder nodes go. The tiered groups of other files to the deleted
+    symbols' names are written again (`_relink_name_refs`): a farther node
+    the deleted one hid is linked again.
 
     Args:
         engine: A GraphEngine instance.
@@ -1645,6 +1898,13 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     removed = {f for f in below if not _present(repo_root, f, listings)}
     removed |= {key for key in keys if not _holds_present_file(repo_root, key, listings)}
 
+    # The names and match keys of the symbols that go: a tiered pin's edges
+    # to such a name depend on all its nodes (see _relink_name_refs). Only
+    # C# writes match keys, so only a deleted .cs file is looked at.
+    gone_cs = sorted(rel for rel in removed if rel.endswith(".cs"))
+    shadow_names = _shadow_keys(
+        (node[:4], node[4], None) for node in (engine.list_file_nodes(repo_id, gone_cs) if gone_cs else ())
+    )
     # Must match the repo-relative key index_paths() writes for every
     # extractor (Module/Class/Function/Document nodes, and shared nodes'
     # `sources`).
@@ -1652,6 +1912,8 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
         engine.delete_nodes_by_source_file(repo_id, rel)
     if removed:
         engine.update_skipped_files(repo_id, drop=removed)
+    if shadow_names:
+        _relink_name_refs(engine, repo_id, set(), removed, shadow_names=shadow_names)
 
     ok, fs_spec, docs_spec = specs
     if removed:
@@ -1959,23 +2221,24 @@ def sync_resolver_config(
     mentions_enabled: bool = False,
 ) -> int:
     """Re-index every graph file of a language whose resolver configuration
-    (tsconfig/jsconfig, go.mod/go.work, Cargo.toml; see
-    resolver_config.fingerprints)
+    (tsconfig/jsconfig, go.mod/go.work, Cargo.toml, C# projects and
+    `global using`s, pyproject.toml; see resolver_config.fingerprints)
     changed since the graph was built, and record the new fingerprints.
 
     `touched` are a live batch's changed and deleted paths: nothing is
     checked unless one of them can change the configuration (named like a
-    configuration file, read by the last fingerprint, or a folder holding
-    one; resolver_config.touches_config). None (a catch-up) always checks.
+    configuration file, read by the last fingerprint, a folder holding
+    one, or a .cs file whose head now holds a `global using`;
+    resolver_config.touches_config). None (a catch-up) always checks.
     The fingerprints are taken before the re-index reads any file and
     recorded only once it has succeeded, so a batch cut short is redone.
     Returns the number of files re-indexed.
     """
     stored = engine.read_resolver_config(repo_id)
     if touched is not None:
-        inputs = [rel for entry in stored.values() for rel in entry.get("inputs", [])]
+        inputs = {rel for entry in stored.values() for rel in entry.get("inputs", [])}
         rels = {rel for path in touched if (rel := _repo_relative(repo_root, Path(path))) is not None}
-        if not any(touches_config(rel, inputs) for rel in rels):
+        if not any(touches_config(rel, inputs, repo_root) for rel in rels):
             return 0
     current = fingerprints(repo_root)
     changed = [
@@ -2040,6 +2303,9 @@ def full_scan(
     """
     check_repo_root(repo_root)
     docs_cache.forget(repo_root)
+    # The shared-claim records the writes below unclaim through are rebuilt
+    # from the shared nodes first, so a full scan heals any that drifted.
+    engine.rebuild_claim_records(repo_id)
     prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force)
     engine.set_index_format(repo_id, 0)
     resolver = fingerprints(repo_root)  # before extraction reads the configuration
@@ -2105,6 +2371,7 @@ def _relationship_dict(rel, repo_id: str, origin: str) -> dict:
         "properties": getattr(rel, "properties", None) or {},
         "from_file": getattr(rel, "from_file", None),
         "to_file": getattr(rel, "to_file", None),
+        "to_owner": getattr(rel, "to_owner", None),
         "origin": origin,
     }
 
@@ -2222,23 +2489,32 @@ def _owning_service_relationships(
         )
 
     api_result = APIExtractor(repo_id).extract_from_source(content, rel_path)
-    for endpoint in api_result.endpoints:
-        endpoint_id = f"{endpoint.method} {endpoint.path}"
-        rels.append(
-            {
-                "from_label": "Endpoint",
-                "from_name": endpoint_id,
-                "rel_type": "CALLS",
-                "to_label": "Service",
-                "to_name": owning_service,
-                "to_file": owning_service_file,
-                "repo_id": repo_id,
-                "properties": {},
-                "origin": rel_path,
-            }
-        )
+    endpoints = [f"{endpoint.method} {endpoint.path}" for endpoint in api_result.endpoints]
+    return rels + _endpoint_service_relationships(repo_id, rel_path, endpoints, services)
 
-    return rels
+
+def _endpoint_service_relationships(
+    repo_id: str, rel_path: str, endpoints: list[str], services: dict[str, tuple[str, str]]
+) -> list[dict]:
+    """CALLS from each of the file's Endpoints (by name) to the compose
+    Service that owns the file (`_owning_service_relationships`)."""
+    owning_service = _match_owning_service(services, rel_path)
+    if owning_service is None:
+        return []
+    return [
+        {
+            "from_label": "Endpoint",
+            "from_name": endpoint_id,
+            "rel_type": "CALLS",
+            "to_label": "Service",
+            "to_name": owning_service,
+            "to_file": services[owning_service][1],
+            "repo_id": repo_id,
+            "properties": {},
+            "origin": rel_path,
+        }
+        for endpoint_id in endpoints
+    ]
 
 
 def _api_nodes_and_rels(repo_id: str, rel_path: str, content: str) -> tuple[list[dict], list[dict]]:

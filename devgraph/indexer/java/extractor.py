@@ -32,12 +32,14 @@ from pathlib import Path
 import tree_sitter_java as tsjava
 from tree_sitter import Language, Node, Parser
 
+from devgraph.indexer.apis.routes import add_route, spring_routes
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
 from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
     own_edges,
+    owned_pin,
 )
 from devgraph.indexer.jvm import JvmLayout, type_segment
 
@@ -45,12 +47,13 @@ logger = logging.getLogger(__name__)
 
 _JAVA_LANGUAGE = Language(tsjava.language())
 
-# class_declaration, interface_declaration, and enum_declaration are all
-# treated as "Class" nodes (Java has no separate interface/enum label in
-# the graph schema, matching how the generic Class/Function/Module labels
-# are meant to generalize across languages).
-_TYPE_DECL_TYPES = ("class_declaration", "interface_declaration", "enum_declaration")
-_METHOD_DECL_TYPES = ("method_declaration", "constructor_declaration")
+# class_declaration, interface_declaration, enum_declaration and
+# record_declaration are all treated as "Class" nodes (Java has no separate
+# interface/enum/record label in the graph schema, matching how the generic
+# Class/Function/Module labels are meant to generalize across languages). A
+# record's compact canonical constructor (`P { ... }`) is a constructor.
+_TYPE_DECL_TYPES = ("class_declaration", "interface_declaration", "enum_declaration", "record_declaration")
+_METHOD_DECL_TYPES = ("method_declaration", "constructor_declaration", "compact_constructor_declaration")
 
 
 def _make_parser() -> Parser:
@@ -254,13 +257,17 @@ class _JavaResolver:
         self.methods: dict[str, set[str]] = {}
         self.bases: dict[str, list[str]] = {}
         self.fields: dict[str, dict[str, str | None]] = {}
+        # What each type's members are owned by (_owner_of): one per type of the name in the file.
+        self.owners: dict[str, set[str]] = {}
 
-        def walk(node: Node) -> None:
-            if node.type in _TYPE_DECL_TYPES or node.type == "record_declaration":
+        def walk(node: Node, enclosing: tuple[str, ...]) -> None:
+            if node.type in _TYPE_DECL_TYPES:
                 name_node = node.child_by_field_name("name")
                 body = node.child_by_field_name("body")
                 if name_node is not None:
                     name = _text(name_node, source)
+                    enclosing = (name, *enclosing)
+                    self.owners.setdefault(name, set()).add(_owner_of(enclosing))
                     self.methods.setdefault(name, set())
                     self.bases[name] = _extract_supertype_names(node, source)
                     fields = self.fields.setdefault(name, {})
@@ -276,9 +283,9 @@ class _JavaResolver:
                                 if field_name is not None:
                                     fields[_text(field_name, source)] = declared
             for child in node.children:
-                walk(child)
+                walk(child, enclosing)
 
-        walk(root)
+        walk(root, ())
         # Imports: a simple name -> its class's package and class (the
         # first capitalised segment picks the file); static members the same;
         # wildcard packages, and the classes of static wildcards.
@@ -357,16 +364,21 @@ class _JavaResolver:
     def member_pins(self, cls: str, method: str, seen: frozenset = frozenset()) -> list[str] | None:
         """Where `method` of the class `cls` can be: this file when the class
         is declared here and has it, else its bases', else the class's own
-        file for a class declared elsewhere."""
+        file for a class declared elsewhere. A method of this file names its
+        class as its owner (common.owned_pin), unless two classes of the file
+        share the name."""
         if cls in seen:
             return None
         if cls in self.methods:
             if method in self.methods[cls]:
-                return [self.file_path]
+                owners = self.owners.get(cls, set())
+                return [owned_pin(self.file_path, next(iter(owners)) if len(owners) == 1 else None)]
             pins = []
             for base in self.bases.get(cls, []):
                 pins += self.member_pins(base, method, seen | {cls}) or []
             return pins or None
+        # Another file's class: any method of the name there (the class can
+        # inherit it from a base of its file).
         return self.type_pins(cls)
 
     # --- calls ---------------------------------------------------------------
@@ -476,11 +488,18 @@ def _method_scope(node: Node, classes: list[str], resolver: _JavaResolver, sourc
                 if p.type == "identifier":
                     scope[_text(p, source)] = None
         for child in n.children:
-            if child.type not in (*_TYPE_DECL_TYPES, "record_declaration"):
+            if child.type not in _TYPE_DECL_TYPES:
                 walk(child)
 
     walk(node)
     return scope
+
+
+def _owner_of(classes: list[str] | tuple[str, ...]) -> str:
+    """The owner (common.member_owner) of a member of the innermost of
+    `classes`, the enclosing classes innermost first: their names, outermost
+    first, dotted ("" for a top-level type)."""
+    return ".".join(reversed(classes))
 
 
 def _invocations(body: Node) -> list[Node]:
@@ -489,7 +508,7 @@ def _invocations(body: Node) -> list[Node]:
     found: list[Node] = []
 
     def walk(node: Node) -> None:
-        if node.type in (*_TYPE_DECL_TYPES, "record_declaration", *_METHOD_DECL_TYPES):
+        if node.type in (*_TYPE_DECL_TYPES, *_METHOD_DECL_TYPES):
             return
         if node.type == "method_invocation":
             found.append(node)
@@ -499,6 +518,60 @@ def _invocations(body: Node) -> list[Node]:
     for child in body.children:
         walk(child)
     return found
+
+
+def _annotations(node: Node, source: bytes) -> dict[str, dict[str, list[str] | None]]:
+    """A declaration's annotations by name, each as its `value` (the
+    positional argument, or `value =`/`path =`: its string literals, None
+    when one is not a literal) and `method` (the RequestMethod names) when
+    given (apis/routes.py `spring_routes`)."""
+    found: dict[str, dict[str, list[str] | None]] = {}
+    modifiers = _child_of_type(node, "modifiers")
+    for annotation in modifiers.named_children if modifiers is not None else []:
+        name = annotation.child_by_field_name("name")
+        if annotation.type not in ("marker_annotation", "annotation") or name is None:
+            continue
+        args: dict[str, list[str] | None] = {}
+        arguments = annotation.child_by_field_name("arguments")
+        for arg in arguments.named_children if arguments is not None else []:
+            key, value = "value", arg
+            if arg.type == "element_value_pair":
+                key_node, value = arg.child_by_field_name("key"), arg.child_by_field_name("value")
+                key = _text(key_node, source) if key_node is not None else ""
+            if value is None:
+                continue
+            items = value.named_children if value.type == "element_value_array_initializer" else [value]
+            if key == "method":
+                args["method"] = [_text(item, source).rsplit(".", 1)[-1] for item in items]
+            elif key in ("value", "path"):
+                literal = all(item.type == "string_literal" and not _text(item, source).startswith('"""')
+                              for item in items)
+                args["value"] = [_text(item, source)[1:-1] for item in items] if literal else None
+        found[_text(name, source).rsplit(".", 1)[-1]] = args
+    return found
+
+
+def _spring_routes(root: Node, source: bytes, result: ExtractionResult, file_path: str, repo_id: str) -> None:
+    """A Spring controller's mapped methods as Endpoints (apis/routes.py),
+    each implemented by its method, owned by its class."""
+
+    def walk(block: Node, classes: list[str]) -> None:
+        for node in block.named_children:
+            name = node.child_by_field_name("name")
+            body = node.child_by_field_name("body")
+            if node.type not in _TYPE_DECL_TYPES or name is None or body is None:
+                continue
+            inner = [_text(name, source), *classes]
+            mapped = _annotations(node, source)
+            for member in body.named_children:
+                method = member.child_by_field_name("name")
+                if member.type == "method_declaration" and method is not None:
+                    for http_method, path in spring_routes(mapped, _annotations(member, source)):
+                        add_route(result, repo_id, file_path, "Spring", http_method, path, _text(method, source),
+                                  _owner_of(inner))
+            walk(body, inner)
+
+    walk(root, [])
 
 
 def extract_java_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
@@ -545,11 +618,14 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
     ) -> None:
         scope = _method_scope(node, classes, resolver, source_bytes)
         caller_class = classes[0] if classes else None
+        # A method is owned by its classes; a class (a field initializer's
+        # caller) by the classes around it; the Module by nothing.
+        caller_owner = {"Function": _owner_of(classes), "Class": _owner_of(classes[1:])}.get(caller_label)
         for call in _invocations(body):
             site = resolver.resolve(call, classes, scope)
             if site is not None:
                 name, pins, member = site
-                sites.add(caller_label, caller_name, caller_class, name, pins, member)
+                sites.add(caller_label, caller_name, caller_class, name, pins, member, caller_owner)
 
     def visit_block(block: Node, parent_name: str | None, parent_label: str, classes: list[str]) -> None:
         """Visit statements in a block (module/class/interface/enum body);
@@ -583,6 +659,7 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
             "type": "class",
             "decorators": _extract_annotation_names(node, source_bytes),
             "file": file_path,
+            "owner": _owner_of(classes),
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -604,6 +681,8 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=_owner_of(classes[1:]) if parent_label == "Class" else None,
+                to_owner=_owner_of(classes),
             )
         )
 
@@ -616,6 +695,7 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
                     to_label="Class",
                     to_name=supertype,
                     repo_id=repo_id,
+                    from_owner=_owner_of(classes),
                 )
             )
 
@@ -635,6 +715,7 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
             "type": "function",
             "decorators": _extract_annotation_names(node, source_bytes),
             "file": file_path,
+            "owner": _owner_of(classes),
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
@@ -656,6 +737,8 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
                 repo_id=repo_id,
                 from_file=file_path if parent_label == "Class" else None,
                 to_file=file_path,
+                from_owner=_owner_of(classes[1:]) if parent_label == "Class" else None,
+                to_owner=_owner_of(classes),
             )
         )
 
@@ -665,6 +748,7 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
 
     visit_block(root, None, "Module", [])
     result.relationships += sites.rows(file_path, repo_id)
+    _spring_routes(root, source_bytes, result, file_path, repo_id)
 
     return own_edges(result, file_path)
 

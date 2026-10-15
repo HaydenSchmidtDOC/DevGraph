@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +66,15 @@ def _get_registry() -> RepoRegistry:
     return RepoRegistry(settings.registry_db_path)
 
 
+def _is_login_refusal(exc: Exception) -> bool:
+    """Neo4j answered and refused the login: a wrong password, too many failed
+    attempts, expired credentials (any `Neo.ClientError.Security.*`)."""
+    from neo4j.exceptions import AuthError
+
+    code = getattr(exc, "code", None)
+    return isinstance(exc, AuthError) or (isinstance(code, str) and code.startswith("Neo.ClientError.Security."))
+
+
 def _neo4j_problem(exc: Exception, settings) -> str:
     """One line for a failed Neo4j call, naming the setting to check and the file it lives in."""
     from neo4j.exceptions import AuthError, ServiceUnavailable
@@ -75,6 +85,13 @@ def _neo4j_problem(exc: Exception, settings) -> str:
     if isinstance(exc, AuthError):
         return (
             f"Neo4j at {settings.neo4j_uri} refused the username or password; check "
+            f"DEVGRAPH_NEO4J_USER and DEVGRAPH_NEO4J_PASSWORD in {env_file} (or the environment)"
+        )
+    if _is_login_refusal(exc):
+        # Too many failed logins, expired credentials and the like
+        reason = " ".join(str(getattr(exc, "message", None) or exc).split())
+        return (
+            f"Neo4j at {settings.neo4j_uri} refused the login ({reason}); check "
             f"DEVGRAPH_NEO4J_USER and DEVGRAPH_NEO4J_PASSWORD in {env_file} (or the environment)"
         )
     if isinstance(exc, ServiceUnavailable):
@@ -542,9 +559,8 @@ def tray_stop() -> None:
     """
     pid = lifecycle.read_tray_pid()
     lifecycle.clear_tray_holders()
-    if pid is None or not lifecycle.pid_is_running(pid):
-        console.print("[yellow]Tray app is not running[/yellow] (no live PID on record)")
-        lifecycle.tray_pid_path().unlink(missing_ok=True)
+    if pid is None:
+        console.print("[yellow]Tray app is not running[/yellow] (no live agent on record)")
         return
 
     try:
@@ -561,10 +577,12 @@ def tray_stop() -> None:
 def tray_status() -> None:
     """Report whether the background tray process (per the PID file) is alive.
 
-    Exits non-zero when it is not running.
+    The PID counts only while it is still the agent that file recorded (same
+    start time and command); a stale record is removed. Exits non-zero when
+    it is not running.
     """
     pid = lifecycle.read_tray_pid()
-    if pid is not None and lifecycle.pid_is_running(pid):
+    if pid is not None:
         console.print(f"[green][OK] running[/green] (pid {pid})")
     else:
         console.print("[yellow]not running[/yellow] (start with 'devgraph tray start')")
@@ -769,8 +787,9 @@ def _tray_liveness_text(settings) -> str:
 
 
 def _watcher_issues(settings) -> dict[str, str]:
-    """The repositories the running agent's watcher isn't watching, and why
-    (a missing folder, an inotify limit), from the repo_issues.json it writes
+    """The repositories the running agent's watcher isn't watching, or only
+    partly, and why (a missing folder, an inotify limit), from the
+    repo_issues.json it writes
     with its heartbeat; only those still registered, active and watched (the
     file can predate a `remove` or `watch disable`)."""
     try:
@@ -790,16 +809,23 @@ def _watcher_issues(settings) -> dict[str, str]:
     return {str(k): str(v) for k, v in issues.items() if str(k) in watched}
 
 
-def _print_unwatched_repos(settings, mark: str) -> int:
+def _print_unwatched_repos(settings, mark: str) -> tuple[int, int]:
     """Under a running watcher: the repositories it isn't watching, each
-    flagged with `mark`. Returns how many."""
+    flagged with `mark`, then those it watches only partly (an inotify limit
+    reached on a folder created since), each flagged `[!]`. Returns how many
+    of each."""
+    from devgraph.watcher.manager import is_partly_watched
+
     issues = _watcher_issues(settings)
-    if issues:
-        noun = "repository" if len(issues) == 1 else "repositories"
-        console.print(f"  [yellow][!] running, but not watching {len(issues)} {noun}[/yellow]")
-        for repo_id, problem in sorted(issues.items()):
-            console.print(f"    [yellow]{escape(mark)} {escape(repo_id)}:[/yellow] {escape(problem)}", soft_wrap=True)
-    return len(issues)
+    unwatched = {k: v for k, v in issues.items() if not is_partly_watched(v)}
+    partly = {k: v for k, v in issues.items() if is_partly_watched(v)}
+    for found, flag, what in ((unwatched, mark, "not watching"), (partly, "[!]", "only partly watching")):
+        if found:
+            noun = "repository" if len(found) == 1 else "repositories"
+            console.print(f"  [yellow][!] running, but {what} {len(found)} {noun}[/yellow]")
+            for repo_id, problem in sorted(found.items()):
+                console.print(f"    [yellow]{escape(flag)} {escape(repo_id)}:[/yellow] {escape(problem)}", soft_wrap=True)
+    return len(unwatched), len(partly)
 
 
 @app.command()
@@ -847,7 +873,7 @@ def status() -> None:
     console.print("[bold]Live Watcher[/bold]")
     liveness = _tray_liveness_text(settings)
     if liveness == "running":
-        if not _print_unwatched_repos(settings, "[!]"):
+        if not any(_print_unwatched_repos(settings, "[!]")):
             console.print("  [green][OK] running[/green]")
     elif liveness == "not running":
         console.print("  [yellow]not running[/yellow] (no heartbeat file — start with 'devgraph tray start')")
@@ -1140,8 +1166,39 @@ def _docs_source_findings(repos: list[Any], engine: Any) -> list[dict[str, Any]]
     return findings
 
 
+def _wait_for_neo4j(settings, timeout_s: float) -> None:
+    """Wait up to `timeout_s` for Neo4j to answer, saying so every 10 s."""
+    from devgraph.graph.engine import wait_for_bolt
+
+    said = [-1]
+
+    def progress(elapsed: float) -> None:
+        if said[0] < 0:
+            console.print(
+                f"  Waiting for Neo4j at {escape(str(settings.neo4j_uri))} to answer (up to {timeout_s:.0f} s)..."
+            )
+        elif int(elapsed) // 10 > said[0] // 10:
+            console.print(f"  still waiting ({elapsed:.0f} s)")
+        said[0] = int(elapsed)
+
+    started = time.monotonic()
+    answered = wait_for_bolt(
+        settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password, timeout_s, on_wait=progress
+    )
+    waited = time.monotonic() - started
+    if not answered:
+        console.print(f"  Neo4j did not answer after waiting {waited:.0f} s")
+    elif said[0] >= 0:
+        console.print(f"  Neo4j answered after {waited:.0f} s")
+
+
 @app.command()
-def doctor() -> None:
+def doctor(
+    wait: float = typer.Option(
+        0, "--wait", metavar="SECONDS",
+        help="First wait up to SECONDS for Neo4j to answer (a container just started takes about 20 s).",
+    ),
+) -> None:
     """Run a heavier environment-drift diagnostic than `status`.
 
     Checks Python version, the installed `mcp` package, MCP server
@@ -1199,8 +1256,12 @@ def doctor() -> None:
     # 4 & 5. Neo4j reachability + schema
     console.print("[bold]Neo4j[/bold]")
     neo4j_reachable = False
+    # Neo4j answers but refuses the login: running, so Podman is not the problem.
+    neo4j_answers = False
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
     try:
+        if wait > 0:
+            _wait_for_neo4j(settings, wait)
         engine.verify_connectivity()
         neo4j_reachable = True
         console.print(f"  [green][OK] Reachable[/green] at {escape(str(settings.neo4j_uri))}")
@@ -1211,7 +1272,11 @@ def doctor() -> None:
             console.print(f"  [red][X] Schema init failed:[/red] {escape(str(e))}")
             any_failed = True
     except Exception as e:
-        console.print(f"  [red][X] Not reachable:[/red] {escape(str(e))}")
+        if _is_login_refusal(e):
+            neo4j_answers = True
+            console.print(f"  [red][X] Refused the login:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
+        else:
+            console.print(f"  [red][X] Not reachable:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         any_failed = True
     finally:
         engine.close()
@@ -1220,7 +1285,8 @@ def doctor() -> None:
     # with it reachable, Neo4j runs some other way (Docker, a native install).
     console.print("[bold]Podman[/bold]")
     podman_path = resolve_podman()
-    if podman_path is None and neo4j_reachable:
+    neo4j_up = neo4j_reachable or neo4j_answers
+    if podman_path is None and neo4j_up:
         console.print("  podman not found (not needed: Neo4j is reachable)")
     elif podman_path is None:
         console.print("  [red][X] podman not found[/red] on PATH or %LOCALAPPDATA%\\Programs\\Podman")
@@ -1228,16 +1294,44 @@ def doctor() -> None:
     else:
         try:
             result = subprocess.run(
-                [str(podman_path), "ps", "-a", "--filter", "name=devgraph-neo4j", "--format", "{{.Names}}\t{{.State}}"],
+                [str(podman_path), "ps", "-a", "--filter", "name=^devgraph-neo4j$", "--format", "{{.Names}}\t{{.State}}"],
                 capture_output=True, text=True, timeout=15,
             )
             output = result.stdout.strip()
-            if not output:
+            state = output.split("\t", 1)[1].strip() if "\t" in output else ""
+            if result.returncode != 0:
+                # Exit 125 with the Podman machine stopped (Windows and macOS
+                # after every reboot; --restart=always can't restart the VM).
+                detail = " ".join(result.stderr.split()) or f"exit {result.returncode}"
+                if neo4j_up:
+                    console.print(f"  podman ps failed (not needed: Neo4j is reachable): {escape(detail)}", soft_wrap=True)
+                else:
+                    console.print(f"  [red][X] podman ps failed:[/red] {escape(detail)}", soft_wrap=True)
+                    if "machine" in detail.lower():
+                        console.print(
+                            "       The Podman machine is stopped. Start it with 'podman machine start', "
+                            "then 'podman start devgraph-neo4j'."
+                        )
+                    elif sys.platform in ("win32", "darwin"):
+                        console.print(
+                            "       If the Podman machine is stopped (it does not start again after a reboot), "
+                            "start it with 'podman machine start', then 'podman start devgraph-neo4j'."
+                        )
+                    any_failed = True
+            elif not output:
                 console.print("  [yellow]devgraph-neo4j container not found[/yellow]")
+            elif state != "running" and not neo4j_up:
+                console.print(
+                    f"  [red][X] devgraph-neo4j is {escape(state or 'not running')}[/red]: "
+                    "start it with 'podman start devgraph-neo4j'"
+                )
+                any_failed = True
+            elif state != "running":
+                console.print(f"  devgraph-neo4j is {escape(state)} (not needed: Neo4j is reachable)")
             else:
                 console.print(f"  [green][OK][/green] {escape(output)}")
         except Exception as e:
-            if neo4j_reachable:
+            if neo4j_up:
                 console.print(f"  podman ps failed (not needed: Neo4j is reachable): {escape(str(e))}")
             else:
                 console.print(f"  [red][X] podman ps failed:[/red] {escape(str(e))}")
@@ -1453,9 +1547,10 @@ def doctor() -> None:
     console.print("[bold]Live Watcher[/bold]")
     liveness = _tray_liveness_text(settings)
     if liveness == "running":
-        if _print_unwatched_repos(settings, "[X]"):
+        unwatched, partly = _print_unwatched_repos(settings, "[X]")
+        if unwatched:
             any_failed = True
-        else:
+        elif not partly:
             console.print("  [green][OK] running[/green]")
     elif liveness == "not running":
         console.print("  [yellow]not running[/yellow] (expected if the tray app isn't started)")
@@ -1485,7 +1580,13 @@ def _vscode_mcp_config_path() -> Path:
     return config_home / "Code" / "User" / "mcp.json"
 
 
-def _register_vscode(python_path: Path, repo_root: Path) -> bool:
+#: VS Code's working folder for the server: the open workspace, so the session
+#: answers for the repository being edited (as Claude Code's does), not for
+#: the DevGraph checkout.
+VSCODE_SERVER_CWD = "${workspaceFolder}"
+
+
+def _register_vscode(python_path: Path) -> bool:
     """Upsert a 'devgraph' entry into VS Code's user-level mcp.json.
 
     Merges into any existing file rather than overwriting it — other
@@ -1509,7 +1610,7 @@ def _register_vscode(python_path: Path, repo_root: Path) -> bool:
         "type": "stdio",
         "command": str(python_path),
         "args": list(MCP_SERVER_ARGS),
-        "cwd": str(repo_root),
+        "cwd": VSCODE_SERVER_CWD,
     }
 
     try:
@@ -1572,17 +1673,135 @@ def _wrong_scope_help(scope: str, repo_root: Path) -> str:
     )
 
 
-def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path) -> bool:
+def _registered_command(output: str) -> str | None:
+    """The server command in `claude mcp get`'s output (its `Command:` line), or None."""
+    for line in output.splitlines():
+        if line.strip().lower().startswith("command:"):
+            command = line.split(":", 1)[1].strip()
+            # An output that puts the arguments on the same line
+            marker = f" {' '.join(MCP_SERVER_ARGS)}"
+            return command.split(marker, 1)[0].strip().strip('"') or None
+    return None
+
+
+def _registered_args(output: str) -> list[str]:
+    """The server arguments in `claude mcp get`'s output (its `Args:` line)."""
+    for line in output.splitlines():
+        if line.strip().lower().startswith("args:"):
+            return line.split(":", 1)[1].split()
+    return []
+
+
+def _same_venv(command: str, python_path: Path) -> bool:
+    """Whether `command` is an interpreter of the same environment as
+    `python_path`: the same folder (`python` and `python3` in one .venv are the
+    same), compared as written, since every venv's python links to the same
+    base interpreter."""
+    def folder(path) -> str:
+        return os.path.normcase(os.path.abspath(Path(path).parent))
+
+    return folder(command) == folder(python_path)
+
+
+def _is_python(command: str) -> bool:
+    return Path(command).name.lower().startswith("python")
+
+
+#: Re-registers a user-scope entry that names another checkout's Python.
+MCP_REPLACE_HINT = "devgraph mcp add --replace"
+
+
+def _stale_registration(output: str, python_path: Path) -> tuple[str, str] | None:
+    """How the user-scope entry's command differs from this checkout's Python,
+    as (kind, command), or None when it runs this checkout's environment.
+
+    "missing": an absolute path to a Python that no longer exists (its
+    checkout or .venv was moved or deleted), so Claude Code can't start the
+    server. "other": another existing environment's Python. "custom": anything
+    else, such as `uv`, `uvx`, `pipx` or a console script, which the user set
+    up on purpose and DevGraph leaves alone. A command without a folder is
+    looked up on PATH first.
+    """
+    command = _registered_command(output)
+    if command is None:
+        return None
+    if not os.path.isabs(command):
+        found = shutil.which(command)
+        if found is None or not _is_python(found):
+            return "custom", command
+        command = found
+    if _same_venv(command, python_path):
+        return None
+    if not _is_python(command):
+        return "custom", command
+    return ("other" if Path(command).exists() else "missing"), command
+
+
+def _stale_help(kind: str, command: str, python_path: Path) -> str:
+    if kind == "missing":
+        return (
+            f"'devgraph' is registered with Claude Code to run {command}, which no longer exists, so the "
+            f"server can't start. To register this checkout ({python_path}) instead, run '{MCP_REPLACE_HINT}'."
+        )
+    if kind == "other":
+        return (
+            f"'devgraph' is registered with Claude Code to run another checkout's Python ({command}), not this "
+            f"one ({python_path}). To switch to this checkout, run '{MCP_REPLACE_HINT}'."
+        )
+    return f"'devgraph' is registered with Claude Code to run {command}, a command set up outside DevGraph; left as it is."
+
+
+def _replace_claude_registration(claude_path: str, python_path: Path, repo_root: Path, output: str) -> bool:
+    """Swap the user-scope entry for this checkout's. Claude Code refuses a
+    second entry of the same name, so the old one is removed first, and added
+    back as it was when the new one can't be added."""
+    old = [_registered_command(output) or "", *_registered_args(output)]
+    console.print(f"\n[bold]Running:[/bold] claude mcp remove -s {CLAUDE_MCP_SCOPE} devgraph")
+    removed = subprocess.run([claude_path, "mcp", "remove", "-s", CLAUDE_MCP_SCOPE, "devgraph"], cwd=str(repo_root))
+    if removed.returncode != 0:
+        return False
+    console.print(f"\n[bold]Running:[/bold] {escape(_claude_mcp_add_line(python_path))}")
+    added = subprocess.run(
+        [claude_path, "mcp", "add", "-s", CLAUDE_MCP_SCOPE, "devgraph", "--", str(python_path), *MCP_SERVER_ARGS],
+        cwd=str(repo_root),
+    )
+    if added.returncode == 0:
+        return True
+    restored = subprocess.run(
+        [claude_path, "mcp", "add", "-s", CLAUDE_MCP_SCOPE, "devgraph", "--", *old], cwd=str(repo_root),
+    )
+    restore_note = "restored" if restored.returncode == 0 else "could not be restored"
+    console.print(
+        f"[red][X][/red] Claude Code: adding this checkout failed; the previous entry {restore_note}: "
+        f"{escape(' '.join(old))}",
+        soft_wrap=True,
+    )
+    return False
+
+
+def _run_claude_mcp_add(claude_path: str, python_path: Path, repo_root: Path, replace: bool = False) -> bool:
     """Register 'devgraph' with Claude Code in user scope via `claude mcp add`.
 
-    Skips an existing user-scope registration. A local- or project-scope one
-    is reported with how to move it, and nothing is added: Claude Code
-    prefers it over a user-scope entry in that folder.
+    Skips an existing user-scope registration of this checkout. One that runs
+    another checkout's Python is reported with the fix (failing when that
+    Python no longer exists), or with `replace` swapped for this checkout's.
+    A command set up outside DevGraph (`uvx`, a console script) is left
+    alone. A local- or project-scope one is reported with how to move it, and
+    nothing is added: Claude Code prefers it over a user-scope entry in that
+    folder.
     """
     scope, output = _claude_mcp_registration(claude_path, repo_root)
     if scope == "user":
-        console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
-        return True
+        stale = _stale_registration(output, python_path)
+        if stale is None:
+            console.print("[green][OK][/green] Claude Code: 'devgraph' already registered")
+            return True
+        kind, command = stale
+        if replace and kind != "custom":
+            return _replace_claude_registration(claude_path, python_path, repo_root, output)
+        marker = {"missing": "[red][X][/red]", "other": "[yellow][!][/yellow]"}.get(kind, "[green][OK][/green]")
+        console.print(f"{marker} {escape(_stale_help(kind, command, python_path))}", soft_wrap=True)
+        return kind != "missing"
     if scope == "unknown":
         # registered in a scope this can't read, or `mcp get` timed out: leave it alone
         console.print(f"[yellow][!][/yellow] Claude Code: not adding 'devgraph'; its registration is unclear: {escape(output.strip())}", soft_wrap=True)
@@ -1603,13 +1822,18 @@ app.add_typer(mcp_app, name="mcp")
 
 
 @mcp_app.command(name="add")
-def mcp_add() -> None:
+def mcp_add(
+    replace: bool = typer.Option(
+        False, "--replace",
+        help="Replace a user-scope registration that runs another checkout's Python (or one that no longer exists).",
+    ),
+) -> None:
     """Register DevGraph as an MCP server for every Claude Code project (runs 'claude mcp add -s user')."""
     claude_path = shutil.which("claude")
     if claude_path is None:
         console.print("[red][X] Error:[/red] 'claude' not found on PATH")
         raise typer.Exit(code=1)
-    if not _run_claude_mcp_add(claude_path, resolve_venv_python(), resolve_repo_root()):
+    if not _run_claude_mcp_add(claude_path, resolve_venv_python(), resolve_repo_root(), replace=replace):
         raise typer.Exit(code=1)
 
 
@@ -1639,7 +1863,14 @@ def mcp_doctor() -> None:
         console.print(f"[green][OK][/green] claude CLI at {escape(claude_path)}")
         repo_root = resolve_repo_root()
         scope, output = _claude_mcp_registration(claude_path, repo_root)
-        if scope in ("user", "unknown"):
+        stale = _stale_registration(output, resolve_venv_python()) if scope == "user" else None
+        if stale is not None:
+            kind, command = stale
+            marker = {"missing": "[red][X][/red]", "other": "[yellow][!][/yellow]"}.get(kind, "[green][OK][/green]")
+            console.print(f"{marker} {escape(_stale_help(kind, command, resolve_venv_python()))}", soft_wrap=True)
+            console.print(escape(output.strip()))
+            any_failed = any_failed or kind == "missing"
+        elif scope in ("user", "unknown"):
             console.print(f"[green][OK][/green] 'devgraph' registered{' (user scope)' if scope == 'user' else ''}")
             console.print(escape(output.strip()))
         elif scope is not None:
@@ -1696,7 +1927,7 @@ def client_config(
         console.print("## Connect DevGraph as an MCP server\n")
         console.print(f"- **command**: {escape(str(python_path))}")
         console.print(f"- **args**: {' '.join(MCP_SERVER_ARGS)}")
-        console.print(f"- **cwd**: {escape(str(repo_root))}\n")
+        console.print("- **cwd**: the repository you are working in (VS Code: ${workspaceFolder})\n")
         if want_claude:
             console.print("```bash")
             console.print(escape(mcp_add_line), soft_wrap=True)
@@ -1709,7 +1940,7 @@ def client_config(
                     "type": "stdio",
                     "command": str(python_path),
                     "args": list(MCP_SERVER_ARGS),
-                    "cwd": str(repo_root),
+                    "cwd": VSCODE_SERVER_CWD,
                 }}},
                 indent=2,
             )))
@@ -1725,7 +1956,7 @@ def client_config(
             elif not _run_claude_mcp_add(claude_path, python_path, repo_root):
                 any_failed = True
         if want_vscode:
-            if not _register_vscode(python_path, repo_root):
+            if not _register_vscode(python_path):
                 any_failed = True
         if any_failed:
             raise typer.Exit(code=1)
@@ -3205,8 +3436,17 @@ def logs(
     }
     min_level = level_map.get(level.upper(), logging.INFO)
 
+    # The agent rotates the file (see LOG_MAX_BYTES): just after a rollover the
+    # current file holds only a few lines, so the newest older file is read
+    # before it, oldest first.
+    previous = log_path.with_name(log_path.name + ".1")
     try:
-        text = log_path.read_text(encoding="utf-8")
+        text = ""
+        for path in (previous, log_path):
+            try:
+                text += path.read_text(encoding="utf-8")
+            except FileNotFoundError:  # absent, or renamed by a rollover since
+                continue
     except OSError as e:
         console.print(f"[red][X] Error reading log file:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)

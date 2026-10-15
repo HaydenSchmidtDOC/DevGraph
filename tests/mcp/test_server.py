@@ -98,7 +98,7 @@ class TestServerResources:
         # Built-ins default repo_id to the session's repository; the guide must not contradict that.
         assert "Always pass this repo's" not in text
         assert "omit `repo_id`" in text and "this session's repository" in text
-        assert "`find_requirements_for` and `blame_component` return lists, which carry no notice" in text
+        assert "`find_requirements_for` and `blame_component` return" in text
         assert "describe_node" in text and "ambiguous" in text and "one hop" in text
 
     def test_tool_catalog_resource_lists_every_registered_tool(self, engine):

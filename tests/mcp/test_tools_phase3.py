@@ -62,17 +62,16 @@ def seeded_graph(engine):
 class TestBlameComponent:
     def test_blame_returns_commits_most_recent_first(self, seeded_graph):
         result = blame_component(seeded_graph, "test_repo_a", "auth.py")
-        # blame_component is not changed (not in Item 1 scope), should still return list
-        shas = [r["sha"] for r in result]
+        shas = [r["sha"] for r in result["results"]]
         assert shas == ["sha2", "sha1"]
 
     def test_blame_no_cross_repo_leakage(self, seeded_graph):
         result = blame_component(seeded_graph, "test_repo_a", "auth.py")
-        assert all(r["sha"] != "sha_b" for r in result)
+        assert all(r["sha"] != "sha_b" for r in result["results"])
 
     def test_blame_cross_repo_opt_in(self, seeded_graph):
         result = blame_component(seeded_graph, "test_repo_a", "auth.py", cross_repo=True)
-        shas = {r["sha"] for r in result}
+        shas = {r["sha"] for r in result["results"]}
         assert "sha_b" in shas
 
     def test_blame_an_unknown_file_is_not_found(self, seeded_graph):
@@ -84,7 +83,7 @@ class TestBlameComponent:
 
     def test_blame_a_file_no_commit_touched_is_empty(self, seeded_graph):
         seeded_graph.upsert_node("Module", "test_repo_a", "untouched.py")
-        assert blame_component(seeded_graph, "test_repo_a", "untouched.py") == []
+        assert blame_component(seeded_graph, "test_repo_a", "untouched.py") == {"count": 0, "results": [], "truncated": False}
 
 
 class TestFindRelatedPrs:

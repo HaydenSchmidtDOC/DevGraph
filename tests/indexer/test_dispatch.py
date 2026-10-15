@@ -1339,7 +1339,7 @@ class TestFieldKeyedDocsApply:
         spec, files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
         engine.extracted_entries = lambda repo_id, extractor, labels: {("Adr", "ADR-1", "decisions/adr-1.md")}
-        engine.list_file_nodes = lambda repo_id, files: {("Adr", "ADR-1", "decisions/adr-1.md")}
+        engine.list_file_nodes = lambda repo_id, files: {("Adr", "ADR-1", "decisions/adr-1.md", "", None, False, None)}
         copy = "decisions/adr-1 copy.md"
         batch = dispatch._read_docs_batch(engine, "demo", temp_repo, spec, {copy: files[copy]}, set())
         assert sorted(batch.selected) == ["decisions/adr-1 copy.md", "decisions/adr-1.md"]
@@ -1508,9 +1508,10 @@ def test_name_refs_record_cross_file_pins_once_per_target_name():
     parsed = sorted(parse_name_ref(entry) for entry in refs)
     assert parsed == [
         # Each pin's confidence is its kind's, not one value for the entry.
-        (["CALLS", "Function", "main", "app.py", "Function", "f", "C"], ["pkg.py", "pkg/", "pkg/__init__.py"],
+        # No owner known for the source: None.
+        (["CALLS", "Function", "main", "app.py", "Function", "f", "C", None], ["pkg.py", "pkg/", "pkg/__init__.py"],
          "pin"),
-        (["CALLS", "Function", "main", "app.py", "Function", "g", ""], None, "name"),
+        (["CALLS", "Function", "main", "app.py", "Function", "g", "", None], None, "name"),
     ]
 
 
@@ -1519,14 +1520,15 @@ def test_name_refs_keep_a_fileless_pin_apart_from_unpinned():
 
     unpinned_source = {**_rel("Display", ""), "from_label": "Class", "from_name": "Foo", "from_file": None}
     (entry,) = name_ref_properties([unpinned_source])["name_refs"]
-    assert parse_name_ref(entry) == (["CALLS", "Class", "Foo", "", "Function", "Display", ""], [""], "")
+    assert parse_name_ref(entry) == (["CALLS", "Class", "Foo", "", "Function", "Display", "", None], [""], "")
 
 
 def test_a_legacy_name_ref_entry_parses_as_unpinned():
     from devgraph.indexer.common import NAME_REF_SEP, parse_name_ref
 
     legacy = NAME_REF_SEP.join(["CALLS", "Function", "main", "a.py", "Function", "helper", "Svc"])
-    assert parse_name_ref(legacy) == (["CALLS", "Function", "main", "a.py", "Function", "helper", "Svc"], None, "")
+    # Its source's owner is unknown: written before owners.
+    assert parse_name_ref(legacy) == (["CALLS", "Function", "main", "a.py", "Function", "helper", "Svc", None], None, "")
 
 
 def test_a_directory_pin_is_tested_before_the_fileless_pin():
@@ -1537,12 +1539,13 @@ def test_a_directory_pin_is_tested_before_the_fileless_pin():
     assert {key[4] for key in groups} == {"file", "prefix"}
     (prefix_row,) = groups[("Function", "CALLS", "Function", "file", "prefix")]
     assert prefix_row["targets"] == [{
-        "to_name": "f", "to_file": "pkg/", "pin": {"k": "prefix", "v": "pkg/", "ns": "", "os": [], "nv": [], "nr": []},
+        "to_name": "f", "to_file": "pkg/", "to_owner": None,
+        "pin": {"k": "prefix", "v": "pkg/", "ns": "", "os": [], "nv": [], "nr": [], "sc": [], "sr": []},
         "ex_files": ["pkg/a.py"], "ex_pins": [],
     }]
     match = _end_match("b", "Function", "to", "prefix", "t")
     # A prefix range of the file-keyed index (S10 fan-in); a suffix pin seeks by name.
-    assert "USING INDEX SEEK b:Function(repo_id, name, file)" in match and "b.file STARTS WITH t.pin.v" in match
+    assert "USING INDEX SEEK b:Function(repo_id, name, file, owner)" in match and "b.file STARTS WITH t.pin.v" in match
     assert "USING INDEX SEEK b:Function(repo_id, name) " in _end_match("b", "Function", "to", "suffix", "t")
     assert "WHEN 'prefix' THEN b.file STARTS WITH t.pin.v" in match
     assert "NOT b.file IN t.ex_files" in match and "NOT any(x IN t.ex_pins WHERE" in match
@@ -1614,3 +1617,81 @@ def test_a_save_while_the_indexes_build_fails_its_batch_instead_of_skipping_the_
     finally:
         monkeypatch.undo()
         engine.delete_repository(repo_id)
+
+
+def test_name_refs_keep_same_named_sources_of_two_owners_apart():
+    from devgraph.indexer.common import name_ref_properties, parse_name_ref
+
+    refs = name_ref_properties([
+        {**_rel("f", "lib.py"), "from_owner": "A"}, {**_rel("f", "lib.py"), "from_owner": "B"},
+    ])["name_refs"]
+    assert sorted(parse_name_ref(entry)[0][7] for entry in refs) == ["A", "B"]
+
+
+def test_legacy_pinned_and_keyed_name_ref_entries_parse_as_written_before_owners():
+    """Entries an index of format 10 wrote: nine fields (pinned), ten (an `@`
+    pin with its match keys). Their source owner is unknown and their pins
+    name no owner."""
+    from devgraph.indexer.common import NAME_REF_PIN_SEP, NAME_REF_SEP, parse_name_ref
+
+    pinned = NAME_REF_SEP.join(
+        ["CALLS", "Function", "main", "a.py", "Function", "f", "C", NAME_REF_PIN_SEP.join(["pkg.py", "pkg/"]), "pin"]
+    )
+    keyed = NAME_REF_SEP.join(
+        ["CALLS", "Function", "Main", "app.cs", "Function", "Run", "Program", "/.?.cs^@", "pin", ".:Jobs,Shop:Jobs"]
+    )
+    assert parse_name_ref(pinned) == (
+        ["CALLS", "Function", "main", "a.py", "Function", "f", "C", None], ["pkg.py", "pkg/"], "pin",
+    )
+    assert parse_name_ref(keyed) == (
+        ["CALLS", "Function", "Main", "app.cs", "Function", "Run", "Program", None], ["/.?.cs^@.:Jobs,Shop:Jobs"], "pin",
+    )
+
+
+def test_an_unreadable_name_ref_entry_is_skipped_not_fatal():
+    from devgraph.indexer.common import NAME_REF_SEP, name_ref_properties
+    from devgraph.indexer.dispatch import _relink_name_refs
+
+    good = name_ref_properties([_rel("f", "lib.py", confidence="resolved")])["name_refs"]
+
+    class Engine:
+        rels: list = []
+
+        def find_name_refs(self, repo_id, names, skip):
+            return [("app.py", [NAME_REF_SEP.join(["CALLS", "Function", "x"]), *good], [])]
+
+        def upsert_relationships(self, rels):
+            self.rels += rels
+
+    engine = Engine()
+    _relink_name_refs(engine, "r", {("Function", "f", "lib.py", "")}, set())
+    assert [(rel["to_file"], rel["to_owner"]) for rel in engine.rels] == [("lib.py", "")]
+
+
+def test_an_owned_pin_relinks_only_its_owners_member():
+    """A call another file resolved to `A.save` in lib.py relinks an added
+    `A.save` there, never an added `B.save`; a pin naming no owner, both."""
+    from devgraph.indexer.common import name_ref_properties
+    from devgraph.indexer.dispatch import _relink_name_refs
+
+    refs = name_ref_properties([
+        {**_rel("save", "lib.py", confidence="resolved"), "to_owner": "A", "from_owner": ""},
+        {**_rel("load", "lib.py", confidence="resolved"), "from_owner": ""},
+    ])["name_refs"]
+
+    class Engine:
+        def __init__(self):
+            self.rels = []
+
+        def find_name_refs(self, repo_id, names, skip):
+            return [("app.py", refs, [])]
+
+        def upsert_relationships(self, rels):
+            self.rels += rels
+
+    engine = Engine()
+    added = {("Function", name, "lib.py", owner) for name in ("save", "load") for owner in ("A", "B")}
+    _relink_name_refs(engine, "r", added, set())
+    assert sorted((rel["to_name"], rel["to_owner"], rel["from_owner"]) for rel in engine.rels) == [
+        ("load", "A", ""), ("load", "B", ""), ("save", "A", ""),
+    ]

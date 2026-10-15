@@ -1,6 +1,7 @@
 """Shared pytest configuration for environments without a desktop display."""
 
 import os
+import re
 import socket
 import sys
 from urllib.parse import urlparse
@@ -220,3 +221,77 @@ def real_project_trust():
     from devgraph.config import project_trust
 
     return project_trust
+
+
+#: Repository ids only tests make. The session-end sweep below deletes one only
+#: when it is unique to its creation (`_UNIQUE_PART`), this process passed it to
+#: Neo4j and it didn't exist when the session started, so it never touches a
+#: real repository, one a test was already holding before this run, or a fixed
+#: id (`test-repo`, `_smoketest_fs_provider`) another session may be using.
+_TEST_REPO_PREFIXES = ("zz-", "zz_", "_smoketest_", "test_repo_", "test-repo", "dash_repo_")
+#: A random part: a run of 8 or more hex characters, digits among them (a uuid
+#: slice, an epoch stamp), standing between separators.
+_UNIQUE_PART = re.compile(r"(?:^|[-_])(?=[0-9a-f]*[0-9])[0-9a-f]{8,}(?=$|[-_])")
+
+
+def _test_repo_ids(parameters) -> set[str]:
+    """The sweepable test repository ids among a query's parameters (one level of lists)."""
+    found = set()
+    for value in (parameters or {}).values():
+        for item in value if isinstance(value, (list, tuple)) else (value,):
+            if isinstance(item, str) and item.startswith(_TEST_REPO_PREFIXES) and _UNIQUE_PART.search(item):
+                found.add(item)
+    return found
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _sweep_leaked_test_repos(_local_neo4j_reachable):
+    """At the end of the session, delete the test repositories this process
+    wrote that a test left behind (a teardown that never ran, or none), so they
+    don't pile up in the shared Neo4j for `devgraph doctor` to report.
+
+    Under pytest-xdist each worker sweeps what it wrote once all its tests are
+    done."""
+    if not _local_neo4j_reachable:
+        yield
+        return
+    from neo4j import ManagedTransaction, Session
+
+    from devgraph.graph.engine import GraphEngine
+
+    engine = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
+    try:
+        before = engine.graph_repo_ids()
+    except Exception:  # Neo4j went away: nothing to sweep against
+        engine.close()
+        yield
+        return
+    touched: set[str] = set()
+
+    def recording(run):
+        def record(self, query, parameters=None, *args, **kwargs):
+            touched.update(_test_repo_ids(parameters if isinstance(parameters, dict) else None))
+            touched.update(_test_repo_ids(kwargs))
+            return run(self, query, parameters, *args, **kwargs)
+        return record
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Session, "run", recording(Session.run))
+        mp.setattr(ManagedTransaction, "run", recording(ManagedTransaction.run))
+        yield
+    try:
+        from devgraph.indexer.schema_constraints import release_labels
+
+        leaked = sorted((touched - before) & engine.graph_repo_ids())
+        labels = set()
+        for repo_id in leaked:
+            labels.update((engine.read_applied_schema(repo_id) or {}).get("labels") or [])
+            engine.delete_repository(repo_id)
+        if labels:
+            release_labels(engine, labels)
+        if leaked:
+            sys.stderr.write(f"\nSwept {len(leaked)} test repositories left in Neo4j: {', '.join(leaked)}\n")
+    except Exception as exc:  # never fail a run over its cleanup
+        sys.stderr.write(f"\nCould not sweep leaked test repositories: {exc}\n")
+    finally:
+        engine.close()

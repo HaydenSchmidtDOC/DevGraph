@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import webbrowser
 from datetime import datetime, timezone
@@ -28,11 +29,13 @@ from datetime import datetime, timezone
 import uvicorn
 from PIL import Image, ImageDraw
 
+from devgraph.agent.log_file import AgentLogHandler
 from devgraph.agent.schema_rescan import SchemaRescanScheduler
 from devgraph.agent.shutdown import shutdown
 from devgraph.agent.sync import RepoSync
 from devgraph.analytics.insights import InsightsScheduler
 from devgraph.config import get_settings
+from devgraph.config.settings import LOG_BACKUP_COUNT, LOG_MAX_BYTES
 from devgraph.dashboard.app import build_app
 from devgraph.dashboard.serving import DashboardFailure, serve_dashboard
 from devgraph.dashboard.url import dashboard_url
@@ -70,7 +73,8 @@ _WARN_COLOR = (200, 60, 60)
 
 
 def _configure_logging() -> None:
-    """Wire Python logging to a file handler at `settings.log_file`.
+    """Wire Python logging to a rotating file handler at `settings.log_file`
+    (rolled over at `LOG_MAX_BYTES`, keeping `LOG_BACKUP_COUNT` older files).
 
     The tray runs detached (pythonw.exe, stdout/stderr = DEVNULL), so a
     failure inside a background thread — e.g. the dashboard failing to bind
@@ -88,7 +92,9 @@ def _configure_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+        handlers=[
+            AgentLogHandler(log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
+        ],
     )
 
 
@@ -490,6 +496,22 @@ class TrayApp:
 
 def main() -> None:
     _configure_logging()
+    try:
+        _run()
+    finally:
+        # However the agent ends (Quit, a failed start, a crash out of
+        # pystray's loop, the headless agent stopping), drop its PID file so
+        # a stale PID can't later name an unrelated process. Only our own
+        # record: a newer agent's is left alone.
+        try:
+            from devgraph.agent import lifecycle
+
+            lifecycle.forget_tray_pid(os.getpid())
+        except Exception:
+            pass
+
+
+def _run() -> None:
     if pystray is None:
         # No display or no tray backend (a server, an SSH session, a desktop
         # without a tray): run the same agent without an icon rather than
@@ -503,18 +525,10 @@ def main() -> None:
         TrayApp().start()
     except Exception:
         # Last line of defense: if the tray fails to start (or crashes out of
-        # pystray's loop before its own cleanup runs), log it and clear the
-        # PID file so a stale PID doesn't make `devgraph tray start`/the MCP
-        # auto-start think a dead tray is still running. Re-raise so the
-        # process exits non-zero and the failure is visible to whoever
-        # launched it.
+        # pystray's loop before its own cleanup runs), log it and re-raise so
+        # the process exits non-zero and the failure is visible to whoever
+        # launched it; `main` clears the PID file.
         logger.critical("tray app failed to start", exc_info=True)
-        try:
-            from devgraph.agent import lifecycle
-
-            lifecycle.tray_pid_path().unlink(missing_ok=True)
-        except Exception:
-            pass
         raise
 
 
