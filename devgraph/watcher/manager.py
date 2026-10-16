@@ -509,9 +509,11 @@ class WatcherManager:
         """From a long `run_exclusive` job of `repo_id` on this thread (a
         first git-history sync): release the repo's batch lock for
         YIELD_S, so the live batches and jobs waiting for it run, then take
-        it back. False once the watcher is stopping: the job should end, as
-        a job does that finds the stop flag when it takes the lock. On a
-        thread running no such job, nothing is released."""
+        it back. False once the watcher is stopping or the repository is no
+        longer watched or registered (a removal's purge may have run during
+        the yield): the job should end, as a job does that finds those when
+        it takes the lock. On a thread running no such job, nothing is
+        released."""
         with self._lock:
             lock = self._batch_locks.get(repo_id)
         me = threading.get_ident()
@@ -523,7 +525,14 @@ class WatcherManager:
             finally:
                 lock.acquire()
                 self._exclusive_owners[repo_id] = me
-        return not self._catch_up_stopped
+        return self._git_sync_wanted(repo_id)
+
+    def _git_sync_wanted(self, repo_id: str) -> bool:
+        """Whether a git-history sync of `repo_id` may write: the watcher is
+        not stopping and the repository is still watched and registered."""
+        return not (
+            self._catch_up_stopped or repo_id not in self._git_handlers or self._registry.get(repo_id) is None
+        )
 
     def _sync_git_state(self, repo_id: str) -> None:
         """`on_git_state_changed`, one at a time per repository: called while
@@ -535,10 +544,10 @@ class WatcherManager:
             return
         self._git_syncing.add(repo_id)
         try:
-            while True:
+            while self._git_sync_wanted(repo_id):
                 self._git_resync.discard(repo_id)
                 self._on_git_state_changed(repo_id)
-                if repo_id not in self._git_resync or self._catch_up_stopped:
+                if repo_id not in self._git_resync:
                     return
         finally:
             self._git_syncing.discard(repo_id)

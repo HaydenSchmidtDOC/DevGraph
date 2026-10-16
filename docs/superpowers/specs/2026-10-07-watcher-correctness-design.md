@@ -362,9 +362,12 @@ mtime.
   already waiting run, then taken back. A catch-up let in that way does not
   sync the same history under the running sync (`_sync_git_state`): it
   asks that sync to run once more when it ends, for commits made
-  meanwhile. Once the watcher is stopping, the yield answers False and the
-  sync ends without recording HEAD; every write is a MERGE or an
-  idempotent recency write, so the next sync redoes it.
+  meanwhile. Once the watcher is stopping, or the repository is no longer
+  watched or registered (a removal's purge may have run during the yield),
+  the yield answers False and the sync ends without recording HEAD or
+  writing the removed repository's Commits again; every write is a MERGE
+  or an idempotent recency write, so the next sync redoes it. A requested
+  re-run checks the same before it starts.
   `stop()` cancels a pending git burst; the next start covers it.
 - When nothing was missed it costs about 0.04 s plus re-indexing what the
   checkout touched, which is bounded by the files git wrote.
