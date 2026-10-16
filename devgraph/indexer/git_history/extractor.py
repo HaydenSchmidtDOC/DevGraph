@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +30,36 @@ from devgraph.indexer.git_history.blame import compute_function_recency
 from devgraph.indexer.walk import check_repo_root
 
 logger = logging.getLogger(__name__)
+
+#: Rows per batched graph write: Commit nodes, MODIFIES edges, recency.
+CHUNK_ROWS = 1000
+#: How often, at most, a sync offers its batch lock to waiting live
+#: batches (`between_chunks`).
+YIELD_EVERY_S = 0.5
+
+
+class _Stopped(Exception):
+    """`between_chunks` said to stop: the sync ends without recording HEAD."""
+
+
+class _Pacer:
+    """Calls `between_chunks` at a chunk boundary at most every
+    YIELD_EVERY_S; raises `_Stopped` when it answers False."""
+
+    def __init__(self, between_chunks: Callable[[], bool] | None) -> None:
+        self._between = between_chunks
+        self._last = time.monotonic()
+
+    def __call__(self) -> None:
+        if self._between is None or time.monotonic() - self._last < YIELD_EVERY_S:
+            return
+        if not self._between():
+            raise _Stopped
+        self._last = time.monotonic()
+
+
+def _chunks(rows: list) -> list[list]:
+    return [rows[i:i + CHUNK_ROWS] for i in range(0, len(rows), CHUNK_ROWS)]
 
 
 @dataclass
@@ -222,18 +253,7 @@ def index_repo_history(engine, registry, repo_id: str, max_count: int | None = N
     extractor = GitHistoryExtractor(repo_id, repo.path)
     result = extractor.extract_new_commits(since_sha=repo.last_indexed_commit, max_count=max_count)
 
-    for commit_node in result.commits:
-        engine.upsert_node("Commit", commit_node.repo_id, commit_node.sha, commit_node.properties)
-
-    for rel in result.relationships:
-        engine.upsert_relationship(
-            rel.source_label,
-            rel.source_name,
-            rel.relationship_type,
-            rel.target_label,
-            rel.target_name,
-            repo_id,
-        )
+    _upsert_extraction_result(engine, repo_id, result)
 
     if result.commits:
         registry.set_last_indexed_commit(repo_id, result.commits[-1].sha)
@@ -241,18 +261,25 @@ def index_repo_history(engine, registry, repo_id: str, max_count: int | None = N
     return len(result.commits)
 
 
-def _upsert_extraction_result(engine, repo_id: str, result: ExtractionResult) -> None:
-    for commit_node in result.commits:
-        engine.upsert_node("Commit", repo_id, commit_node.sha, commit_node.properties)
-    for rel in result.relationships:
-        engine.upsert_relationship(
-            rel.source_label,
-            rel.source_name,
-            rel.relationship_type,
-            rel.target_label,
-            rel.target_name,
-            repo_id,
+def _upsert_extraction_result(engine, repo_id: str, result: ExtractionResult, pace: _Pacer | None = None) -> None:
+    """Write the Commit nodes, then their MODIFIES edges, CHUNK_ROWS per
+    statement (MERGEs, so idempotent), `pace` called after each chunk."""
+    for chunk in _chunks(result.commits):
+        engine.upsert_nodes(
+            [{"label": "Commit", "repo_id": repo_id, "name": c.sha, "properties": c.properties} for c in chunk]
         )
+        if pace is not None:
+            pace()
+    for chunk in _chunks(result.relationships):
+        engine.upsert_modifies(repo_id, [(rel.source_name, rel.target_name) for rel in chunk])
+        if pace is not None:
+            pace()
+
+
+def _write_recency(engine, label: str, repo_id: str, rows: list[dict], overwrite: bool, pace: _Pacer) -> None:
+    for chunk in _chunks(rows):
+        engine.write_recency(label, repo_id, chunk, overwrite=overwrite)
+        pace()
 
 
 def _is_ancestor(repo: Repo, candidate_sha: str, rev_sha: str) -> bool:
@@ -269,7 +296,7 @@ def _is_ancestor(repo: Repo, candidate_sha: str, rev_sha: str) -> bool:
         return False
 
 
-def _stage_module_recency(engine, repo_id: str, result: ExtractionResult) -> None:
+def _stage_module_recency(engine, repo_id: str, result: ExtractionResult, pace: _Pacer) -> None:
     """Ratchet Module recency from one extraction batch's own commits.
 
     min/max `authored_date` is computed only among *this batch's* commits —
@@ -281,6 +308,7 @@ def _stage_module_recency(engine, repo_id: str, result: ExtractionResult) -> Non
     commit_props = {c.sha: c.properties for c in result.commits}
 
     touched: dict[str, list[str]] = {}
+    rows: list[dict] = []
     for rel in result.relationships:
         touched.setdefault(rel.target_name, []).append(rel.source_name)
 
@@ -293,17 +321,12 @@ def _stage_module_recency(engine, repo_id: str, result: ExtractionResult) -> Non
         min_iso = min(iso for iso, _ in dated)
         max_iso, max_sha = max(dated, key=lambda pair: pair[0])
         author = commit_props[max_sha].get("author") if track_author else None
-        engine.stage_recency(
-            "Module",
-            repo_id,
-            module_name,
-            created_at=min_iso,
-            last_modified_at=max_iso,
-            last_modified_by=author,
-        )
+        rows.append({"name": module_name, "file": None, "created_at": min_iso, "last_modified_at": max_iso,
+                     "last_modified_by": author})
+    _write_recency(engine, "Module", repo_id, rows, False, pace)
 
 
-def _reconcile_module_recency(engine, repo_id: str) -> None:
+def _reconcile_module_recency(engine, repo_id: str, pace: _Pacer) -> None:
     """Recompute every tracked Module's recency from scratch (fresh Cypher
     aggregation over the full, now-reconciled Commit set) and overwrite via
     `set_recency` — the reconcile path's authoritative truth.
@@ -318,15 +341,12 @@ def _reconcile_module_recency(engine, repo_id: str) -> None:
         "commits[-1].author AS last_modified_by",
         {"repo_id": repo_id},
     )
-    for row in rows:
-        engine.set_recency(
-            "Module",
-            repo_id,
-            row["module"],
-            created_at=row["created_at"],
-            last_modified_at=row["last_modified_at"],
-            last_modified_by=row["last_modified_by"] if track_author else None,
-        )
+    _write_recency(engine, "Module", repo_id, [
+        {"name": row["module"], "file": None, "created_at": row["created_at"],
+         "last_modified_at": row["last_modified_at"],
+         "last_modified_by": row["last_modified_by"] if track_author else None}
+        for row in rows
+    ], True, pace)
 
 
 def _current_py_files(engine, repo_id: str) -> set[str]:
@@ -388,7 +408,7 @@ def _apply_function_recency(
         return exc
 
     track_author = get_settings().git_recency_track_author
-    write = engine.set_recency if overwrite else engine.stage_recency
+    rows: dict[str, list[dict]] = {"Function": [], "Class": []}
 
     for entity in entities:
         start_line, end_line = entity.get("start_line"), entity.get("end_line")
@@ -399,19 +419,68 @@ def _apply_function_recency(
             continue
         latest = max(overlapping, key=lambda h: h.last_modified_at)
         label = "Function" if "Function" in entity["labels"] else "Class"
-        write(
-            label,
-            repo_id,
-            entity["name"],
-            last_modified_at=latest.last_modified_at,
-            last_modified_by=latest.last_modified_by if track_author else None,
-            file=file_path,
+        rows[label].append({
+            "name": entity["name"], "file": file_path, "created_at": None,
+            "last_modified_at": latest.last_modified_at,
+            "last_modified_by": latest.last_modified_by if track_author else None,
+        })
+    # One statement per label: each row's node is its own (name, file), so
+    # their order across labels does not matter.
+    for label, label_rows in rows.items():
+        engine.write_recency(label, repo_id, label_rows, overwrite=overwrite)
+
+
+def _sync(
+    engine, repo: Repo, repo_id: str, extractor: GitHistoryExtractor, mode: str, last: str | None,
+    max_count: int | None, blame_failures: dict[str, Exception | None], pace: _Pacer,
+) -> tuple[int, int]:
+    """`sync_git_history`'s writes for `mode`: (commits indexed, commits
+    deleted). Records each blamed file's failure in `blame_failures`."""
+    if mode == "reconcile":
+        # Full reachable-set walk, no cap — correctness matters more
+        # than speed for what should be a rare event, and capping it
+        # risks leaving real orphans undetected.
+        result = extractor.extract_new_commits(since_sha=None, max_count=None)
+        # Each commit's MODIFIES edges are written again, not added to: a
+        # former shallow boundary keeps only the files it changed.
+        engine.delete_commit_modifies(repo_id, [c.sha for c in result.commits])
+        _upsert_extraction_result(engine, repo_id, result, pace)
+
+        reachable_shas = {c.sha for c in result.commits}
+        # Commit nodes are keyed on (repo_id, name) with the SHA stored
+        # under `name`, not a separate `sha` property — see
+        # GraphEngine.delete_commits's docstring.
+        graphed = engine.run_cypher(
+            "MATCH (c:Commit {repo_id: $repo_id}) RETURN c.name AS sha",
+            {"repo_id": repo_id},
         )
+        orphans = [row["sha"] for row in graphed if row["sha"] not in reachable_shas]
+        engine.delete_commits(repo_id, orphans)
+
+        _reconcile_module_recency(engine, repo_id, pace)
+        for file_path in _current_py_files(engine, repo_id):
+            blame_failures[file_path] = _apply_function_recency(engine, repo, repo_id, file_path, overwrite=True)
+            pace()
+        return len(result.commits), len(orphans)
+
+    since_sha = None if mode == "initial" else last
+    batch_max_count = max_count if mode == "initial" else None
+    result = extractor.extract_new_commits(since_sha=since_sha, max_count=batch_max_count)
+    _upsert_extraction_result(engine, repo_id, result, pace)
+    _stage_module_recency(engine, repo_id, result, pace)
+
+    touched_py_files = {
+        rel.target_name for rel in result.relationships if rel.target_name.endswith(".py")
+    }
+    for file_path in touched_py_files:
+        blame_failures[file_path] = _apply_function_recency(engine, repo, repo_id, file_path, overwrite=False)
+        pace()
+    return len(result.commits), 0
 
 
 def sync_git_history(
     engine, registry, repo_id: str, max_count: int | None = None, force: bool = False,
-    on_initial: Callable[[int], None] | None = None,
+    on_initial: Callable[[int], None] | None = None, between_chunks: Callable[[], bool] | None = None,
 ) -> dict:
     """Bring a repo's Commit graph and staged recency up to date with HEAD.
 
@@ -435,11 +504,18 @@ def sync_git_history(
             normal fast/noop path would otherwise never re-create them.
         on_initial: Called with the number of commits a *first* sync is about
             to read, before it reads them (the agent logs it: a first sync of
-            a long history takes minutes, holding the batch lock).
+            a long history takes a while).
+        between_chunks: Called between the batched writes (CHUNK_ROWS rows
+            each) and the files blamed, at most every YIELD_EVERY_S: the
+            agent lets waiting live batches run there
+            (WatcherManager.yield_batch_lock). False stops the sync, HEAD
+            unrecorded, so the next one does it again (every write is a
+            MERGE or an idempotent recency write).
 
     Returns:
-        A dict with `mode` (`"noop"`, `"initial"`, `"fast"`, or
-        `"reconcile"`), `commits_indexed`, and `commits_deleted`.
+        A dict with `mode` (`"noop"`, `"initial"`, `"fast"`, `"reconcile"`,
+        or `"stopped"` when `between_chunks` stopped it), `commits_indexed`,
+        and `commits_deleted`.
 
     Raises:
         ValueError: If repo_id is not registered.
@@ -480,49 +556,12 @@ def sync_git_history(
 
         extractor = GitHistoryExtractor(repo_id, repo_record.path)
         blame_failures: dict[str, Exception | None] = {}
-
-        if mode == "reconcile":
-            # Full reachable-set walk, no cap — correctness matters more
-            # than speed for what should be a rare event, and capping it
-            # risks leaving real orphans undetected.
-            result = extractor.extract_new_commits(since_sha=None, max_count=None)
-            # Each commit's MODIFIES edges are written again, not added to: a
-            # former shallow boundary keeps only the files it changed.
-            engine.delete_commit_modifies(repo_id, [c.sha for c in result.commits])
-            _upsert_extraction_result(engine, repo_id, result)
-
-            reachable_shas = {c.sha for c in result.commits}
-            # Commit nodes are keyed on (repo_id, name) with the SHA stored
-            # under `name`, not a separate `sha` property — see
-            # GraphEngine.delete_commits's docstring.
-            graphed = engine.run_cypher(
-                "MATCH (c:Commit {repo_id: $repo_id}) RETURN c.name AS sha",
-                {"repo_id": repo_id},
-            )
-            orphans = [row["sha"] for row in graphed if row["sha"] not in reachable_shas]
-            engine.delete_commits(repo_id, orphans)
-
-            _reconcile_module_recency(engine, repo_id)
-            for file_path in _current_py_files(engine, repo_id):
-                blame_failures[file_path] = _apply_function_recency(engine, repo, repo_id, file_path, overwrite=True)
-
-            commits_indexed = len(result.commits)
-            commits_deleted = len(orphans)
-        else:
-            since_sha = None if mode == "initial" else last
-            batch_max_count = max_count if mode == "initial" else None
-            result = extractor.extract_new_commits(since_sha=since_sha, max_count=batch_max_count)
-            _upsert_extraction_result(engine, repo_id, result)
-            _stage_module_recency(engine, repo_id, result)
-
-            touched_py_files = {
-                rel.target_name for rel in result.relationships if rel.target_name.endswith(".py")
-            }
-            for file_path in touched_py_files:
-                blame_failures[file_path] = _apply_function_recency(engine, repo, repo_id, file_path, overwrite=False)
-
-            commits_indexed = len(result.commits)
-            commits_deleted = 0
+        pace = _Pacer(between_chunks)
+        try:
+            commits_indexed, commits_deleted = _sync(engine, repo, repo_id, extractor, mode, last, max_count,
+                                                     blame_failures, pace)
+        except _Stopped:
+            return {"mode": "stopped", "commits_indexed": 0, "commits_deleted": 0}
 
         failed = sorted(path for path, exc in blame_failures.items() if exc is not None)
         if failed:

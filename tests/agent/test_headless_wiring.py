@@ -36,14 +36,17 @@ def _agent():
 def _sync_logs(caplog, result, initial=None):
     agent = _agent()
 
-    def sync(engine, registry, repo_id, on_initial=None):
+    def sync(engine, registry, repo_id, on_initial=None, between_chunks=None):
         if initial is not None:
             on_initial(initial)
+        between_chunks()
         return result
 
     with patch("devgraph.agent.headless.sync_git_history", side_effect=sync), \
          caplog.at_level("DEBUG", logger="devgraph.agent.headless"):
         agent._on_git_state_changed("r")
+    # The sync yields the repository's batch lock between its writes.
+    agent._watcher.yield_batch_lock.assert_called_with("r")
     return [(rec.levelname, rec.getMessage()) for rec in caplog.records if "git history" in rec.getMessage()]
 
 
@@ -52,12 +55,17 @@ def test_a_sync_with_head_unmoved_logs_only_at_debug(caplog):
     assert logs and all(level == "DEBUG" for level, _message in logs)
 
 
-def test_a_first_sync_says_live_updates_wait_for_it(caplog):
+def test_a_first_sync_says_live_updates_go_on(caplog):
     logs = _sync_logs(caplog, {"mode": "initial", "commits_indexed": 412, "commits_deleted": 0}, initial=412)
     assert (
         "INFO",
-        "Reading the git history of r for the first time (412 commits); live updates resume when it finishes",
+        "Reading the git history of r for the first time (412 commits); live updates go on between its writes",
     ) in logs
+
+
+def test_a_sync_a_stop_cut_short_logs_only_at_debug(caplog):
+    logs = _sync_logs(caplog, {"mode": "stopped", "commits_indexed": 0, "commits_deleted": 0})
+    assert logs and all(level == "DEBUG" for level, _message in logs)
 
 
 def test_start_returns_to_signal_handling_while_the_indexes_build():
