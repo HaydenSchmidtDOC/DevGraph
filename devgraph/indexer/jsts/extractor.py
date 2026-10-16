@@ -56,9 +56,10 @@ Known limitations (v1 scope cuts, documented per Implementation Plan #8):
     MATCH-links real existing nodes). A bare specifier the file's
     tsconfig.json/jsconfig.json maps (`paths`, `baseUrl`, through `extends`
     and `references`; see resolver_config.py) names the same candidates
-    under the mapped path; any other bare specifier (`import x from
-    'lodash'`) is an external package, with no IMPORTS edge. No pnpm/yarn
-    workspace resolution.
+    under the mapped path, and so does the name of a workspace package (the
+    root package.json's `workspaces` or pnpm-workspace.yaml's `packages`)
+    under that package's entry point or subpath; any other bare specifier
+    (`import x from 'lodash'`) is an external package, with no IMPORTS edge.
 """
 
 from __future__ import annotations
@@ -364,16 +365,18 @@ def _resolve_module_specifier(
     match a real indexed Module node simply never produces an edge).
 
     A bare specifier the importing file's tsconfig maps (`paths`, else
-    `baseUrl`; see resolver_config.ResolverConfig.ts_alias, given `config`)
-    names the same candidates for each path it maps to. Any other bare
-    specifier (`lodash`, `@scope/pkg`) is an external package: no candidate.
+    `baseUrl`), or that names a workspace package (`@acme/utils`, its entry
+    point; `@acme/utils/x`, that subpath; see
+    resolver_config.ResolverConfig.bare_import, given `config`), names the
+    same candidates for each path it maps to. Any other bare specifier
+    (`lodash`, `@scope/pkg`) is an external package: no candidate.
     """
     # A bundler query or fragment (`./worker.js?worker`, `./x#frag`) names no file.
     specifier = specifier.split("?", 1)[0].split("#", 1)[0]
     if specifier.startswith("."):
         return _base_candidates(_resolve_relative_base(current_dir, specifier))
-    if config is not None and (aliased := config.ts_alias(specifier, file_path)) is not None:
-        return [candidate for base in aliased for candidate in _base_candidates(base)]
+    if config is not None and (found := config.bare_import(specifier, file_path)) is not None:
+        return list(dict.fromkeys(candidate for base in found[0] for candidate in _base_candidates(base)))
     return []
 
 
@@ -383,12 +386,15 @@ def _specifier_pins(
     """Where a name imported from `specifier` can be defined: its candidate
     files (`_resolve_module_specifier`) and the recursive prefix of each path
     it names, so a barrel's re-export reaches the defining file (as
-    "package"; never the repository root). None for an external package."""
+    "package"; never the repository root), and of a workspace package's
+    directory, whose entry point re-exports from anywhere in it. None for
+    an external package."""
     specifier = specifier.split("?", 1)[0].split("#", 1)[0]
+    packages: list[str] = []
     if specifier.startswith("."):
         bases = [_resolve_relative_base(current_dir, specifier)]
-    elif config is not None and (aliased := config.ts_alias(specifier, file_path)) is not None:
-        bases = aliased
+    elif config is not None and (found := config.bare_import(specifier, file_path)) is not None:
+        bases, packages = found
     else:
         return None
     pins = []
@@ -398,6 +404,7 @@ def _specifier_pins(
         folder = stem if dot and "/" not in ext and f".{ext}" in _EXPLICIT_EXTENSIONS and stem else base
         if folder and "!" not in folder:  # graph/schema.py split_pin: no "!" in a path pin
             pins.append(folder + "/")
+    pins += [folder + "/" for folder in packages if "!" not in folder]
     return list(dict.fromkeys(pins))
 
 

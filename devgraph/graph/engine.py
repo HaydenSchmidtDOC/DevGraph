@@ -805,6 +805,37 @@ def _run_records(session, query: str, **params: Any) -> list:
     return _retry_transient(lambda: list(session.run(query, **params)))
 
 
+def _recency_row(
+    name: str, created_at: str | None, last_modified_at: str | None, last_modified_by: str | None, file: str | None,
+    owner: str = "",
+) -> dict[str, Any]:
+    """One row of `GraphEngine.write_recency`."""
+    return {
+        "name": name, "file": file, "owner": owner, "created_at": created_at, "last_modified_at": last_modified_at,
+        "last_modified_by": last_modified_by,
+    }
+
+
+#: `stage_recency`'s ratchet, per `write_recency` row.
+_STAGE_RECENCY = (
+    "SET n.created_at = CASE WHEN row.created_at IS NULL THEN n.created_at "
+    "WHEN n.created_at IS NULL OR row.created_at < n.created_at THEN row.created_at "
+    "ELSE n.created_at END, "
+    "n.last_modified_at = CASE WHEN row.last_modified_at IS NULL THEN n.last_modified_at "
+    "WHEN n.last_modified_at IS NULL OR row.last_modified_at > n.last_modified_at THEN row.last_modified_at "
+    "ELSE n.last_modified_at END, "
+    "n.last_modified_by = CASE "
+    "WHEN row.last_modified_by IS NULL THEN n.last_modified_by "
+    "WHEN n.last_modified_at IS NULL OR row.last_modified_at > n.last_modified_at THEN row.last_modified_by "
+    "ELSE n.last_modified_by END"
+)
+#: `set_recency`'s overwrite, per `write_recency` row: a None author keeps the old one.
+_SET_RECENCY = (
+    "SET n.created_at = row.created_at, n.last_modified_at = row.last_modified_at, "
+    "n.last_modified_by = coalesce(row.last_modified_by, n.last_modified_by)"
+)
+
+
 def _is_file_scoped(file: str | None) -> bool:
     """The single predicate for "does this node's MERGE key include `file`".
 
@@ -2344,12 +2375,14 @@ class GraphEngine:
         last_modified_at: str | None = None,
         last_modified_by: str | None = None,
         file: str | None = None,
+        owner: str = "",
     ) -> None:
         """Ratchet-merge git-derived recency onto a node: `created_at` only
         moves earlier and `last_modified_at` only moves later, so this is
         safe to call repeatedly and out of chronological order (e.g. across
         incremental batches). See `set_recency` for the plain-overwrite
-        variant used during reconciliation.
+        variant used during reconciliation, and `write_recency` for many
+        nodes in one statement.
 
         Both only annotate a node that already exists (MATCH, not MERGE): a
         commit also touches files that have no node (a README, an image, a
@@ -2361,35 +2394,16 @@ class GraphEngine:
         commit's author with an older one's.
 
         Pass `file` for Function/Class labels (whose nodes are MERGE-keyed
-        on (repo_id, name, file) — see _group_nodes_by_label) so this
+        on (repo_id, name, file, owner) — see _group_nodes_by_label) so this
         doesn't fall back to a bare-name match that could hit every
-        same-named function across every file in the repo at once. Omit it
-        for Module (whose `name` is already the unique file path).
+        same-named function across every file in the repo at once, and
+        `owner` ("" at the top level) so two same-named methods of one file
+        are told apart. Omit both for Module (whose `name` is already the
+        unique file path).
         """
-        merge_key = (
-            "{repo_id: $repo_id, name: $name, file: $file}" if file is not None else "{repo_id: $repo_id, name: $name}"
+        self.write_recency(
+            label, repo_id, [_recency_row(name, created_at, last_modified_at, last_modified_by, file, owner)]
         )
-        with self._driver.session() as session:
-            _run(
-                session,
-                f"MATCH (n:{label} {merge_key}) "
-                "SET n.created_at = CASE WHEN $created_at IS NULL THEN n.created_at "
-                "WHEN n.created_at IS NULL OR $created_at < n.created_at THEN $created_at "
-                "ELSE n.created_at END, "
-                "n.last_modified_at = CASE WHEN $last_modified_at IS NULL THEN n.last_modified_at "
-                "WHEN n.last_modified_at IS NULL OR $last_modified_at > n.last_modified_at THEN $last_modified_at "
-                "ELSE n.last_modified_at END, "
-                "n.last_modified_by = CASE "
-                "WHEN $last_modified_by IS NULL THEN n.last_modified_by "
-                "WHEN n.last_modified_at IS NULL OR $last_modified_at > n.last_modified_at THEN $last_modified_by "
-                "ELSE n.last_modified_by END",
-                repo_id=repo_id,
-                name=name,
-                file=file,
-                created_at=created_at,
-                last_modified_at=last_modified_at,
-                last_modified_by=last_modified_by,
-            )
 
     def set_recency(
         self,
@@ -2400,35 +2414,66 @@ class GraphEngine:
         last_modified_at: str | None = None,
         last_modified_by: str | None = None,
         file: str | None = None,
+        owner: str = "",
     ) -> None:
         """Overwrite recency from scratch — used only by the reconcile path,
         where the caller has just recomputed the authoritative value from a
         fresh full walk and must be able to move a value backward, not just
         forward (`stage_recency`'s ratchet deliberately can't).
 
-        `last_modified_by` is only included in the SET when not None, so a
+        `last_modified_by` is only set when not None, so a
         caller running with `git_recency_track_author` off (always passing
         `last_modified_by=None`) never nulls out a previously-tracked author.
 
         See `stage_recency` for why `file` matters for Function/Class labels.
         """
-        merge_key = (
-            "{repo_id: $repo_id, name: $name, file: $file}" if file is not None else "{repo_id: $repo_id, name: $name}"
+        self.write_recency(
+            label, repo_id, [_recency_row(name, created_at, last_modified_at, last_modified_by, file, owner)],
+            overwrite=True,
         )
-        set_clauses = ["n.created_at = $created_at", "n.last_modified_at = $last_modified_at"]
-        if last_modified_by is not None:
-            set_clauses.append("n.last_modified_by = $last_modified_by")
+
+    def write_recency(self, label: str, repo_id: str, rows: list[dict[str, Any]], overwrite: bool = False) -> None:
+        """`stage_recency` (or, with `overwrite`, `set_recency`) for many
+        nodes of `label` in one statement, applied in the order of `rows`.
+        Each row holds `name`, `created_at`, `last_modified_at` and
+        `last_modified_by` (`_recency_row`), and `file`: every row of one
+        call has one (a Function or Class, matched with its `owner`, ""
+        when absent, on the unique (repo_id, name, file, owner) index) or
+        none (a Module)."""
+        if not rows:
+            return
+        if any(row["file"] is not None for row in rows) and any(row["file"] is None for row in rows):
+            raise ValueError("write_recency rows must all have a file or all have none")
+        merge_key = (
+            "{repo_id: $repo_id, name: row.name, file: row.file, owner: coalesce(row.owner, '')}"
+            if rows[0]["file"] is not None
+            else "{repo_id: $repo_id, name: row.name}"
+        )
         with self._driver.session() as session:
             _run(
                 session,
-                f"MATCH (n:{label} {merge_key}) "
-                f"SET {', '.join(set_clauses)}",
+                f"UNWIND $rows AS row MATCH (n:{label} {merge_key}) "
+                + (_SET_RECENCY if overwrite else _STAGE_RECENCY),
                 repo_id=repo_id,
-                name=name,
-                file=file,
-                created_at=created_at,
-                last_modified_at=last_modified_at,
-                last_modified_by=last_modified_by,
+                rows=rows,
+            )
+
+    def upsert_modifies(self, repo_id: str, rows: list[tuple[str, str]]) -> None:
+        """MERGE a Commit -MODIFIES-> Module edge for each (commit SHA,
+        module path) of `rows` in one statement: `upsert_relationship`'s
+        MATCH-MATCH-MERGE for many rows, so an edge to a Module the graph
+        does not hold is skipped."""
+        if not rows:
+            return
+        with self._driver.session() as session:
+            _run(
+                session,
+                "UNWIND $rows AS row "
+                "MATCH (a:Commit {repo_id: $repo_id, name: row[0]}) "
+                "MATCH (b:Module {repo_id: $repo_id, name: row[1]}) "
+                "MERGE (a)-[:MODIFIES]->(b)",
+                repo_id=repo_id,
+                rows=[list(row) for row in rows],
             )
 
     def delete_commits(self, repo_id: str, shas: list[str]) -> None:

@@ -73,6 +73,26 @@ def test_an_alias_resolves_through_the_tsconfig(tmp_path):
     assert ("src/lib/text.ts", "resolved") in got and ("src/lib/text/", "package") in got
 
 
+def test_a_workspace_package_resolves_to_its_entry_and_directory(tmp_path):
+    (tmp_path / "package.json").write_text('{"workspaces": ["packages/*"]}')
+    (tmp_path / "packages/utils").mkdir(parents=True)
+    (tmp_path / "packages/utils/package.json").write_text('{"name": "@acme/utils", "main": "src/index.js"}')
+    source = """
+        import { formatName } from '@acme/utils';
+        import * as f from '@acme/utils/src/format';
+        export function greet(n) { formatName(n); return f.trim(n); }
+    """
+    config = ResolverConfig(tmp_path)
+    got = targets(source, "greet", "formatName", "packages/app/src/greet.ts", config)
+    # The entry, a barrel, and anything under the package it re-exports.
+    assert ("packages/utils/src/index.ts", "resolved") in got and ("packages/utils/", "package") in got
+    got = targets(source, "greet", "trim", "packages/app/src/greet.ts", config)
+    assert ("packages/utils/src/format.ts", "resolved") in got
+    # Without the workspace declaration the name is an external package.
+    (tmp_path / "package.json").write_text('{"name": "root"}')
+    assert targets(source, "greet", "formatName", "packages/app/src/greet.ts", ResolverConfig(tmp_path)) == set()
+
+
 def test_an_external_package_links_nothing():
     source = """
         import _ from 'lodash';

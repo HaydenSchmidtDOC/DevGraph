@@ -9,6 +9,7 @@ hardcoding label strings.
 
 import re
 from collections.abc import Iterable
+from functools import lru_cache
 from typing import NamedTuple
 
 NODE_LABELS: tuple[str, ...] = (
@@ -291,6 +292,13 @@ _PIN_FLAGS = re.compile(
 )
 
 
+#: How many distinct pins `split_pin` and `pin_kind` remember: a batch
+#: writes the same few thousand pins over and over (on a full scan they were
+#: about 15 % of its time), and both are pure functions of the string.
+_PIN_CACHE_SIZE = 1 << 16
+
+
+@lru_cache(maxsize=_PIN_CACHE_SIZE)
 def split_pin(pin: str) -> PinParts:
     """A pin and its flags, in this order after the path: `~` (a directory
     pin at package confidence, kind `loose_dir`), `?a,b` (a matched file must
@@ -380,6 +388,7 @@ def pin_root(pin: str, path: str) -> str:
     return path
 
 
+@lru_cache(maxsize=_PIN_CACHE_SIZE)
 def pin_kind(pin: str | None) -> str:
     """How a `to_file` matches: "name" (None: by name alone), "fileless" (""),
     "file", "dir" (`a/b/.`: files directly in a/b/; `.`: the root's files),

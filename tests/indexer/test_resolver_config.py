@@ -179,9 +179,119 @@ def test_pyproject_source_roots_and_their_fingerprint(tmp_path):
     assert fingerprints(tmp_path)["python"]["fingerprint"] != before["fingerprint"]
 
 
+# --- JS/TS workspace packages ----------------------------------------------------
+
+
+def workspace(tmp_path):
+    write(tmp_path, "package.json", '{"private": true, "workspaces": ["packages/*", "!packages/skip"]}')
+    write(tmp_path, "pnpm-workspace.yaml", "packages:\n  - 'tools/**'\n")
+    write(tmp_path, "packages/utils/package.json", json.dumps({
+        "name": "@acme/utils", "version": "1.0.0", "main": "dist/index.js",
+        "exports": {".": {"types": "./src/index.ts", "default": "./dist/index.js"}, "./fmt": "./src/fmt.ts",
+                    "./ext/*": "./src/ext/*.ts"},
+    }))
+    write(tmp_path, "packages/plain/package.json", '{"name": "plain", "main": "lib/main.js"}')
+    write(tmp_path, "packages/bare/package.json", '{"name": "@acme/bare"}')
+    write(tmp_path, "packages/skip/package.json", '{"name": "skipped"}')
+    write(tmp_path, "packages/nameless/package.json", '{"private": true}')
+    write(tmp_path, "tools/deep/cli/package.json", '{"name": "@acme/cli", "module": "./index.mjs"}')
+    write(tmp_path, "node_modules/react/package.json", '{"name": "react"}')
+    write(tmp_path, "other/package.json", '{"name": "other"}')  # under no workspace glob
+
+
+def test_workspace_packages_are_named_by_their_package_json(tmp_path):
+    workspace(tmp_path)
+    assert ResolverConfig(tmp_path).js_workspaces() == {
+        "@acme/bare": ["packages/bare"], "@acme/cli": ["tools/deep/cli"], "@acme/utils": ["packages/utils"],
+        "plain": ["packages/plain"],
+    }
+    write(tmp_path, "package.json", '{"workspaces": {"packages": ["packages/plain"]}}')  # Yarn's form
+    (tmp_path / "pnpm-workspace.yaml").unlink()
+    assert ResolverConfig(tmp_path).js_workspaces() == {"plain": ["packages/plain"]}
+
+
+def test_a_workspace_import_names_its_entry_or_subpath(tmp_path):
+    workspace(tmp_path)
+    config = ResolverConfig(tmp_path)
+    # exports: every condition's target (a build output's also as its
+    # source), an exact subpath, a `*` subpath; else the subpath itself.
+    assert config.workspace_import("@acme/utils") == (
+        ["packages/utils/src/index.ts", "packages/utils/dist/index.js", "packages/utils/src/index.js"],
+        ["packages/utils"],
+    )
+    assert config.workspace_import("@acme/utils/fmt") == (["packages/utils/src/fmt.ts"], ["packages/utils"])
+    assert config.workspace_import("@acme/utils/ext/a") == (["packages/utils/src/ext/a.ts"], ["packages/utils"])
+    assert config.workspace_import("@acme/utils/src/x") == (["packages/utils/src/x"], ["packages/utils"])
+    # types, module and main, and src/index; index too when none is declared.
+    assert config.workspace_import("plain") == (
+        ["packages/plain/lib/main.js", "packages/plain/src/main.js", "packages/plain/src/index"], ["packages/plain"]
+    )
+    assert config.workspace_import("@acme/cli") == (
+        ["tools/deep/cli/index.mjs", "tools/deep/cli/src/index"], ["tools/deep/cli"]
+    )
+    assert config.workspace_import("@acme/bare")[0] == ["packages/bare/src/index", "packages/bare/index"]
+    for external in ("react", "skipped", "other", "@acme/utilsx", "plainly"):
+        assert config.workspace_import(external) is None
+
+
+def test_a_built_entry_names_its_source_and_a_null_export_blocks(tmp_path):
+    write(tmp_path, "package.json", '{"workspaces": ["packages/*"]}')
+    write(tmp_path, "packages/ui/package.json", json.dumps({
+        "name": "@acme/ui", "types": "dist/index.d.ts", "main": "build/index.cjs",
+        "exports": {"./button": {"import": "./dist/button.mjs"}, "./internal/*": None, "./*": "./lib/*.js"},
+    }))
+    config = ResolverConfig(tmp_path)
+    # No "." export: types and main, each also under src/, and src/index.
+    assert config.workspace_import("@acme/ui")[0] == [
+        "packages/ui/dist/index.d.ts", "packages/ui/src/index", "packages/ui/build/index.cjs",
+        "packages/ui/src/index.cjs",
+    ]
+    assert config.workspace_import("@acme/ui/button")[0] == ["packages/ui/dist/button.mjs", "packages/ui/src/button.mjs"]
+    assert config.workspace_import("@acme/ui/theme")[0] == ["packages/ui/lib/theme.js", "packages/ui/src/theme.js"]
+    assert config.workspace_import("@acme/ui/internal/x") == ([], [])  # blocked: no file, no directory pin
+
+
+def test_a_batch_names_workspace_packages_from_the_fingerprint_inputs(tmp_path, monkeypatch):
+    workspace(tmp_path)
+    inputs = fingerprints(tmp_path)["ts"]["inputs"]
+    config = ResolverConfig(tmp_path, ts_files=lambda: inputs)
+    monkeypatch.setattr(config, "_glob_dirs", lambda pattern: pytest.fail("globbed again"))
+    assert config.js_workspaces() == ResolverConfig(tmp_path).js_workspaces()
+
+
+def test_tsconfig_paths_beat_a_workspace_package_which_beats_base_url(tmp_path):
+    workspace(tmp_path)
+    write(tmp_path, "tsconfig.json", '{"compilerOptions": {"baseUrl": ".", "paths": {"@acme/cli": ["vendor/cli"]}}}')
+    config = ResolverConfig(tmp_path)
+    assert config.bare_import("@acme/cli", "a.ts") == (["vendor/cli"], [])
+    assert config.bare_import("plain", "a.ts")[1] == ["packages/plain"]
+    assert config.bare_import("lodash", "a.ts") == (["lodash"], [])
+
+
+def test_workspace_fingerprints_follow_names_and_entries(tmp_path):
+    workspace(tmp_path)
+    before = fingerprints(tmp_path)["ts"]
+    assert {"package.json", "pnpm-workspace.yaml", "packages/utils/package.json",
+            "tools/deep/cli/package.json"} <= set(before["inputs"])
+    for outside in ("other/package.json", "node_modules/react/package.json", "packages/skip/package.json"):
+        assert outside not in before["inputs"]
+
+    utils = json.loads((tmp_path / "packages/utils/package.json").read_text())
+    write(tmp_path, "packages/utils/package.json", json.dumps({**utils, "version": "2.0.0"}))
+    write(tmp_path, "other/package.json", '{"name": "renamed"}')
+    assert fingerprints(tmp_path)["ts"] == before  # a version bump, a package outside the workspaces
+    write(tmp_path, "packages/plain/package.json", '{"name": "plain", "main": "lib/other.js"}')
+    moved = fingerprints(tmp_path)["ts"]
+    assert moved["fingerprint"] != before["fingerprint"]
+    write(tmp_path, "packages/bare/package.json", '{"name": "@acme/naked"}')
+    assert fingerprints(tmp_path)["ts"]["fingerprint"] != moved["fingerprint"]
+
+
 def test_what_can_touch_the_configuration(tmp_path):
     inputs = ["web/tsconfig.json", "configs/base.cfg", "app/Usings.cs"]
     assert touches_config("tsconfig.app.json", [], tmp_path)
+    assert touches_config("packages/new/package.json", [], tmp_path)
+    assert touches_config("pnpm-workspace.yaml", [], tmp_path)
     assert touches_config("a/go.mod", [], tmp_path)
     assert touches_config("src/App.csproj", [], tmp_path)
     assert touches_config("Directory.Build.targets", [], tmp_path)
@@ -521,6 +631,35 @@ def test_a_tsconfig_edit_re_indexes_the_files_it_resolves(engine, repo_id, tmp_p
     sync_resolver_config(engine, repo_id, tmp_path, {config})
     assert imports(engine, repo_id, "app.ts") == []
     equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_a_workspace_package_change_re_indexes_its_importers(engine, repo_id, tmp_path):
+    write(tmp_path, "package.json", '{"private": true, "workspaces": ["packages/*"]}')
+    manifest = write(tmp_path, "packages/utils/package.json", '{"name": "@acme/utils", "main": "src/index.ts"}')
+    write(tmp_path, "packages/utils/src/index.ts", "export { formatName } from './format';\n")
+    write(tmp_path, "packages/utils/src/format.ts", "export function formatName(n) { return n; }\n")
+    write(tmp_path, "packages/app/src/greet.ts",
+          "import { formatName } from '@acme/utils';\nexport function greet(n) { return formatName(n); }\n")
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+    greet = "packages/app/src/greet.ts"
+    assert imports(engine, repo_id, greet) == ["packages/utils/src/index.ts"]
+    rows = engine.run_cypher(
+        "MATCH (:Function {repo_id: $r, name: 'greet'})-[:CALLS]->(f:Function) RETURN f.file AS file", {"r": repo_id}
+    )
+    assert [row["file"] for row in rows] == ["packages/utils/src/format.ts"]  # through the barrel
+
+    for text, expected in (
+        ('{"name": "@acme/tools", "main": "src/index.ts"}', []),  # renamed: nothing imports it by that name
+        ('{"name": "@acme/utils", "main": "src/format.ts"}', ["packages/utils/src/format.ts",
+                                                             "packages/utils/src/index.ts"]),
+    ):
+        write(tmp_path, "packages/utils/package.json", text)
+        index_paths(engine, repo_id, tmp_path, {manifest})
+        assert sync_resolver_config(engine, repo_id, tmp_path, {manifest}) == 3
+        assert imports(engine, repo_id, greet) == expected
+        equals_fresh(engine, repo_id, tmp_path)
 
 
 def test_a_cut_short_re_index_keeps_the_old_fingerprint(engine, repo_id, tmp_path, monkeypatch):

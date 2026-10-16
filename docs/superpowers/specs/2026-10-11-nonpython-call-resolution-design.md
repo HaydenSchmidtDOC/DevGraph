@@ -50,9 +50,22 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   `baseUrl` resolve against the config that defines them; `paths` win over
   `baseUrl`. A config under a path the walk ignores (a `.gitignore`, a
   `node_modules`) is treated as absent.
+- **JS/TS workspace packages** (index format 17, audit 5 item 3). The
+  repository root's `package.json` `workspaces` (an array, or Yarn's
+  `{"packages": [...]}`) and `pnpm-workspace.yaml` `packages` are globs of
+  package directories (`packages/*`, `apps/**`, a literal path; a `!` one
+  excludes; a symlinked, ignored or gitignored directory is never
+  entered); each matched directory whose `package.json` has a `name` is
+  that package (`ResolverConfig.js_workspaces`; two directories may share
+  a name and both count). A nested `package.json`'s own `workspaces`, and
+  a `package.json` under no glob, declare nothing.
 - **Fingerprint.** Per language, a hash of the relevant content of every
   configuration file the walk finds (for TS: `baseUrl`, `paths`, `extends`,
-  `references`, with every config those reach, whatever its name; for Go:
+  `references`, with every config those reach, whatever its name, and the
+  root `package.json`'s and `pnpm-workspace.yaml`'s workspace globs and
+  each workspace package's `package.json` `name`, `exports`, `types`,
+  `module` and `main`, only those present being inputs, since one created
+  later is configuration by its name; for Go:
   each go.mod's `module` line and each go.work; for Rust: each Cargo.toml's
   library crate name and root file; for C#: see below; a compiler flag, a
   `require` bump or a dependency or version change never counts), stored on
@@ -252,7 +265,31 @@ specifier also names the `.ts`/`.tsx` source), plus the recursive prefix of
 its directory form, so a barrel re-export reaches the defining file at package
 confidence (never the repository root as a prefix). An aliased specifier
 resolves through the file's tsconfig (`paths` first, then `baseUrl`) to the
-same candidates. Any other bare specifier (`react`, `lodash`) is external: no
+same candidates. A bare specifier naming a workspace package (the longest
+package name it equals or starts with followed by `/`;
+`ResolverConfig.workspace_import`) resolves after `paths` and before
+`baseUrl` (TypeScript tries `node_modules`, where the package is linked,
+when a `baseUrl` lookup fails; not checking the disk, the package goes
+first): the package itself to every target of its `exports` `"."` entry
+(a string, or the conditions `types`, `import`, `module`, `default`,
+`require`, `node`, then any other, nested, an array's in order), else to
+its `types`, `module` and `main` and `src/index` (and `index` when it
+declares none of them); a subpath (`@acme/utils/fmt`) to its exact
+`exports` key's targets or the longest single-`*` pattern's, else to that
+path in the package. A `null` target blocks the specifier: nothing links,
+not even the directory. A target under `dist/`, `lib/` or `build/` is also
+tried as the same path under `src/` (a `.d.ts` dropped), the common
+TypeScript layout whose build output is not in the repository. Every
+candidate is offered and only existing files link: the disk is never
+checked, so the result depends on the configuration alone and a source file
+created later is relinked like any target. Each names the same candidates
+as a relative specifier (`.js` mapped to its source), and the binding is
+also pinned to the package directory as a prefix, so a name the entry
+point re-exports reaches its defining file at package confidence. A batch
+takes the workspace packages from its fingerprint's inputs (the
+`package.json` files besides the root's are exactly the workspace
+packages'), so only a fingerprint globs the directories.
+Any other bare specifier (`react`, `lodash`) is external: no
 `IMPORTS` edge (the old `node_modules/<name>` guess never matched, the walk
 skipping `node_modules`), and a call through its binding links nothing.
 
@@ -1527,3 +1564,26 @@ the same namespace and type in projects that do not reference each other.
   `cs_reference` toggling a `<ProjectReference>`, a cycle included, and
   `cs_project_move` moving a file whose class another project declares
   too) and the scripted fuzz runs equal a fresh scan after every step.
+
+### Results after JS/TS workspace packages (index format 17)
+
+See the Resolver configuration's JS/TS workspace packages and the JS/TS
+section. BEFORE is index format 16, AFTER this change, measured with
+`--fixture`. A new fixture, `tests/fixtures/callgraph/tsmono`, is an npm
+workspaces monorepo (`packages/*`, `apps/*`) with no tsconfig `paths`:
+imports by package name through `main`, `module`, an `exports` condition
+and subpath, a package subpath, barrels and a namespace import, a
+`package.json` under no workspace glob (external), and lodash.
+
+| | BEFORE | AFTER |
+|---|---|---|
+| ts fixture | all targets met; `IMPORTS` 100 % / 100 %, CALLS recall 100 %, 43/43 | the same |
+| tsmono fixture: `IMPORTS` precision / recall | 100 % / 38.5 % | 100 % / 100 % |
+| tsmono fixture: CALLS recall, linked precision | 35.7 %, 100 % | 100 %, 100 % |
+| tsmono fixture: named sites | 3/12 | 12/12 |
+
+The fuzz holds a workspace package (`ws/utils`, imported by name and by
+a subpath from `ws/app`, its entry a barrel): it is renamed, its `main`
+moves between entries or goes, the root `package.json` switches between
+the array and Yarn's form or stops declaring workspaces, a
+`pnpm-workspace.yaml` comes and goes, and the package's folder is deleted.
