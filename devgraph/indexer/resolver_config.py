@@ -376,47 +376,74 @@ def _case_key(path: str) -> str:
 _EXPORT_CONDITIONS = ("types", "import", "module", "default", "require", "node")
 
 
-def _export_target(value: object) -> str | None:
-    """The path an `exports` value names: itself, a condition's
-    (`_EXPORT_CONDITIONS`, nested), or an array's first; None for `null`."""
+def _export_targets(value: object) -> list[str]:
+    """Every path an `exports` value names, in the order it is tried: itself,
+    its conditions' (`_EXPORT_CONDITIONS` first, nested), an array's in
+    order. A `null` names none."""
     if isinstance(value, str):
-        return value
+        return [value]
     if isinstance(value, list):
-        return next((found for each in value if (found := _export_target(each)) is not None), None)
+        return [target for each in value for target in _export_targets(each)]
     if isinstance(value, dict):
         keys = [key for key in _EXPORT_CONDITIONS if key in value] + [k for k in value if k not in _EXPORT_CONDITIONS]
-        return next((found for key in keys if (found := _export_target(value[key])) is not None), None)
-    return None
+        return [target for key in keys for target in _export_targets(value[key])]
+    return []
 
 
-def _package_entry(data: dict, sub: str) -> list[str]:
+#: The build output folders an entry point commonly names; its source is the
+#: same path under `src/` (`_with_sources`).
+_BUILD_DIRS = ("dist/", "lib/", "build/")
+_DECLARATION = re.compile(r"\.d\.[mc]?ts$")
+
+
+def _with_sources(targets: list[str]) -> list[str]:
+    """`targets`, each followed, when it is under a build folder
+    (`_BUILD_DIRS`), by the same path under `src/` (a declaration file's
+    `.d.ts` dropped): `dist/index.js` is built from `src/index.ts`. Both are
+    candidates, the disk unchecked, so whichever exists links and the
+    result never depends on a file other than the configuration."""
+    found: list[str] = []
+    for target in targets:
+        found.append(target)
+        rel = target.removeprefix("./")
+        for folder in _BUILD_DIRS:
+            if rel.startswith(folder):
+                found.append(_DECLARATION.sub("", "src/" + rel[len(folder):]))
+    return list(dict.fromkeys(found))
+
+
+def _package_entry(data: dict, sub: str) -> list[str] | None:
     """The paths, relative to a workspace package's directory, the package
-    (`sub` "") or its subpath `sub` names (see `workspace_import`): its
-    `exports` entry, else for the package itself the first of `types`,
-    `module` and `main`, else `src/index` and `index`; for a subpath, the
-    subpath itself."""
+    (`sub` "") or its subpath `sub` names (see `workspace_import`): every
+    target of its `exports` entry (an exact key, else the longest single-`*`
+    pattern), else for the package itself its `types`, `module` and `main`
+    and `src/index` (and `index` when it declares none of them), for a
+    subpath the subpath itself; a target under a build folder also as its
+    source (`_with_sources`). None when `exports` blocks it (a `null`
+    target)."""
     key = f"./{sub}" if sub else "."
     exports = data.get("exports")
     if isinstance(exports, dict) and any(isinstance(k, str) and k.startswith(".") for k in exports):
         entries = {k: v for k, v in exports.items() if isinstance(k, str) and k.startswith(".")}
     else:
         entries = {".": exports} if exports is not None else {}
-    target = _export_target(entries[key]) if key in entries else None
-    if target is None:
-        best = None
-        for pattern, value in entries.items():
-            prefix, star, suffix = pattern.partition("*")
-            if star and "*" not in suffix and key.startswith(prefix) and key.endswith(suffix) \
-                    and len(key) >= len(prefix) + len(suffix) and (best is None or len(prefix) > len(best[0])):
-                best = (prefix, suffix, value)
-        if best is not None and (found := _export_target(best[2])) is not None:
-            target = found.replace("*", key[len(best[0]): len(key) - len(best[1])])
-    if target is not None:
-        return [target]
+    if key in entries:
+        targets = _export_targets(entries[key])
+        return _with_sources(targets) if targets else None
+    best = None
+    for pattern, value in entries.items():
+        prefix, star, suffix = pattern.partition("*")
+        if star and "*" not in suffix and key.startswith(prefix) and key.endswith(suffix) \
+                and len(key) >= len(prefix) + len(suffix) and (best is None or len(prefix) > len(best[0])):
+            best = (prefix, suffix, value)
+    if best is not None:
+        captured = key[len(best[0]): len(key) - len(best[1])]
+        targets = [target.replace("*", captured) for target in _export_targets(best[2])]
+        return _with_sources(targets) if targets else None
     if sub:
         return [sub]
-    main = next((data[k] for k in ("types", "module", "main") if isinstance(data.get(k), str) and data[k]), None)
-    return [main] if main is not None else ["src/index", "index"]
+    declared = [data[k] for k in ("types", "module", "main") if isinstance(data.get(k), str) and data[k]]
+    return _with_sources(declared) + [each for each in ("src/index", "index") if each == "src/index" or not declared]
 
 
 @dataclass(frozen=True)
@@ -443,14 +470,17 @@ class ResolverConfig:
     the Cargo.toml files and the re-exporting .rs files (`rust_crates`,
     `rust_reexports`), `cs_files` for the C#
     project files and the .cs files holding a `global using`
-    (`cs_projects`), and `python_files` for the pyproject.toml files and
-    the `src` directories holding Python files (`python_roots`)."""
+    (`cs_projects`), `python_files` for the pyproject.toml files and
+    the `src` directories holding Python files (`python_roots`), and
+    `ts_files` for the TS inputs, whose workspace package.json files name
+    the workspace packages (`js_workspaces`), so no batch globs for them."""
 
     def __init__(
         self, repo_root: Path, go_files: Callable[[], list[str] | None] | None = None,
         rust_files: Callable[[], list[str] | None] | None = None,
         cs_files: Callable[[], list[str] | None] | None = None,
         python_files: Callable[[], list[str] | None] | None = None,
+        ts_files: Callable[[], list[str] | None] | None = None,
     ) -> None:
         self.root = Path(repo_root)
         self.read: set[str] = set()
@@ -470,6 +500,7 @@ class ResolverConfig:
         self._python_roots: dict[str, list[str]] | None = None
         self._python_src: list[str] = []
         self._dirs: dict[str, list[str]] = {}
+        self._ts_files = ts_files
         self._js_workspaces: dict[str, list[str]] | None = None
 
     # --- files ---------------------------------------------------------------
@@ -732,15 +763,21 @@ class ResolverConfig:
         directory the workspace globs (`_workspace_globs`) match, less those
         a `!` glob matches, whose package.json has a `name`. Only the
         repository root's package.json and pnpm-workspace.yaml declare
-        workspaces."""
+        workspaces. With `ts_files`, the directories are those of the
+        package.json files among the fingerprint's inputs (only
+        `js_workspaces` reads one, the root's aside), not globbed again."""
         if self._js_workspaces is None:
-            included: set[str] = set()
-            excluded: set[str] = set()
-            for each in self._workspace_globs():
-                if each.startswith("!"):
-                    excluded |= self._glob_dirs(each[1:])
-                else:
-                    included |= self._glob_dirs(each)
+            files = self._ts_files() if self._ts_files is not None else None
+            if files is not None:
+                included = {posixpath.dirname(rel) for rel in files if posixpath.basename(rel) == "package.json"}
+                excluded = {""}
+            else:
+                included, excluded = set(), set()
+                for each in self._workspace_globs():
+                    if each.startswith("!"):
+                        excluded |= self._glob_dirs(each[1:])
+                    else:
+                        included |= self._glob_dirs(each)
             packages: dict[str, list[str]] = {}
             for folder in sorted(included - excluded):
                 name = (parse_jsonc(self._js_text(f"{folder}/package.json") or "") or {}).get("name")
@@ -757,8 +794,9 @@ class ResolverConfig:
         package). In each directory, the package's `exports` entry for the
         specifier's subpath (`"."` for the package itself; an exact key, or
         one with a single `*`), else for the package itself its `types`,
-        `module` or `main`, else `src/index` and `index`, and a subpath as a
-        path in the package (`_package_entry`)."""
+        `module`, `main` and `src/index`, and a subpath as a path in the
+        package (`_package_entry`). A directory whose `exports` blocks the
+        specifier (`null`) names nothing and is left out."""
         packages = self.js_workspaces()
         name = max(
             (each for each in packages if specifier == each or specifier.startswith(each + "/")),
@@ -768,12 +806,17 @@ class ResolverConfig:
             return None
         sub = specifier[len(name) + 1:]
         bases: list[str] = []
+        folders: list[str] = []
         for folder in packages[name]:
             data = parse_jsonc(self._text(f"{folder}/package.json") or "") or {}
-            for target in _package_entry(data, sub):
+            targets = _package_entry(data, sub)
+            if targets is None:
+                continue
+            folders.append(folder)
+            for target in targets:
                 if (rel := _join(folder, target)) is not None and rel not in bases:
                     bases.append(rel)
-        return bases, list(packages[name])
+        return bases, folders
 
     def _js_digest(self, rel: str) -> object:
         """What a package.json or pnpm-workspace.yaml says about workspace

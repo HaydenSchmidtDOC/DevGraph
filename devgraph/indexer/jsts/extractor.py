@@ -376,7 +376,7 @@ def _resolve_module_specifier(
     if specifier.startswith("."):
         return _base_candidates(_resolve_relative_base(current_dir, specifier))
     if config is not None and (found := config.bare_import(specifier, file_path)) is not None:
-        return [candidate for base in found[0] for candidate in _base_candidates(base)]
+        return list(dict.fromkeys(candidate for base in found[0] for candidate in _base_candidates(base)))
     return []
 
 

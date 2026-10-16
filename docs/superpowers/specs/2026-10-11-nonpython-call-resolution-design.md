@@ -270,16 +270,25 @@ package name it equals or starts with followed by `/`;
 `ResolverConfig.workspace_import`) resolves after `paths` and before
 `baseUrl` (TypeScript tries `node_modules`, where the package is linked,
 when a `baseUrl` lookup fails; not checking the disk, the package goes
-first): the package itself to its `exports` `"."` entry (a string, or the
-first of the conditions `types`, `import`, `module`, `default`, `require`,
-`node`, then any other), else its `types`, `module` or `main`, else
-`src/index` and `index`; a subpath (`@acme/utils/fmt`) to its exact
-`exports` key or a single-`*` pattern's, else to that path in the package.
-Each names the same candidates as a relative specifier (`.js` mapped to its
-source), and the binding is also pinned to the package directory as a
-prefix, so a name the entry point re-exports reaches its defining file at
-package confidence. An entry naming a build output (`dist/index.js`) not in
-the repository links no `IMPORTS`; the directory pin still resolves calls.
+first): the package itself to every target of its `exports` `"."` entry
+(a string, or the conditions `types`, `import`, `module`, `default`,
+`require`, `node`, then any other, nested, an array's in order), else to
+its `types`, `module` and `main` and `src/index` (and `index` when it
+declares none of them); a subpath (`@acme/utils/fmt`) to its exact
+`exports` key's targets or the longest single-`*` pattern's, else to that
+path in the package. A `null` target blocks the specifier: nothing links,
+not even the directory. A target under `dist/`, `lib/` or `build/` is also
+tried as the same path under `src/` (a `.d.ts` dropped), the common
+TypeScript layout whose build output is not in the repository. Every
+candidate is offered and only existing files link: the disk is never
+checked, so the result depends on the configuration alone and a source file
+created later is relinked like any target. Each names the same candidates
+as a relative specifier (`.js` mapped to its source), and the binding is
+also pinned to the package directory as a prefix, so a name the entry
+point re-exports reaches its defining file at package confidence. A batch
+takes the workspace packages from its fingerprint's inputs (the
+`package.json` files besides the root's are exactly the workspace
+packages'), so only a fingerprint globs the directories.
 Any other bare specifier (`react`, `lodash`) is external: no
 `IMPORTS` edge (the old `node_modules/<name>` guess never matched, the walk
 skipping `node_modules`), and a call through its binding links nothing.

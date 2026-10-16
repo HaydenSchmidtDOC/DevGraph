@@ -213,17 +213,50 @@ def test_workspace_packages_are_named_by_their_package_json(tmp_path):
 def test_a_workspace_import_names_its_entry_or_subpath(tmp_path):
     workspace(tmp_path)
     config = ResolverConfig(tmp_path)
-    # exports: a condition, an exact subpath, a `*` subpath; else the subpath itself.
-    assert config.workspace_import("@acme/utils") == (["packages/utils/src/index.ts"], ["packages/utils"])
+    # exports: every condition's target (a build output's also as its
+    # source), an exact subpath, a `*` subpath; else the subpath itself.
+    assert config.workspace_import("@acme/utils") == (
+        ["packages/utils/src/index.ts", "packages/utils/dist/index.js", "packages/utils/src/index.js"],
+        ["packages/utils"],
+    )
     assert config.workspace_import("@acme/utils/fmt") == (["packages/utils/src/fmt.ts"], ["packages/utils"])
     assert config.workspace_import("@acme/utils/ext/a") == (["packages/utils/src/ext/a.ts"], ["packages/utils"])
     assert config.workspace_import("@acme/utils/src/x") == (["packages/utils/src/x"], ["packages/utils"])
-    # main or module, else src/index and index.
-    assert config.workspace_import("plain") == (["packages/plain/lib/main.js"], ["packages/plain"])
-    assert config.workspace_import("@acme/cli") == (["tools/deep/cli/index.mjs"], ["tools/deep/cli"])
+    # types, module and main, and src/index; index too when none is declared.
+    assert config.workspace_import("plain") == (
+        ["packages/plain/lib/main.js", "packages/plain/src/main.js", "packages/plain/src/index"], ["packages/plain"]
+    )
+    assert config.workspace_import("@acme/cli") == (
+        ["tools/deep/cli/index.mjs", "tools/deep/cli/src/index"], ["tools/deep/cli"]
+    )
     assert config.workspace_import("@acme/bare")[0] == ["packages/bare/src/index", "packages/bare/index"]
     for external in ("react", "skipped", "other", "@acme/utilsx", "plainly"):
         assert config.workspace_import(external) is None
+
+
+def test_a_built_entry_names_its_source_and_a_null_export_blocks(tmp_path):
+    write(tmp_path, "package.json", '{"workspaces": ["packages/*"]}')
+    write(tmp_path, "packages/ui/package.json", json.dumps({
+        "name": "@acme/ui", "types": "dist/index.d.ts", "main": "build/index.cjs",
+        "exports": {"./button": {"import": "./dist/button.mjs"}, "./internal/*": None, "./*": "./lib/*.js"},
+    }))
+    config = ResolverConfig(tmp_path)
+    # No "." export: types and main, each also under src/, and src/index.
+    assert config.workspace_import("@acme/ui")[0] == [
+        "packages/ui/dist/index.d.ts", "packages/ui/src/index", "packages/ui/build/index.cjs",
+        "packages/ui/src/index.cjs",
+    ]
+    assert config.workspace_import("@acme/ui/button")[0] == ["packages/ui/dist/button.mjs", "packages/ui/src/button.mjs"]
+    assert config.workspace_import("@acme/ui/theme")[0] == ["packages/ui/lib/theme.js", "packages/ui/src/theme.js"]
+    assert config.workspace_import("@acme/ui/internal/x") == ([], [])  # blocked: no file, no directory pin
+
+
+def test_a_batch_names_workspace_packages_from_the_fingerprint_inputs(tmp_path, monkeypatch):
+    workspace(tmp_path)
+    inputs = fingerprints(tmp_path)["ts"]["inputs"]
+    config = ResolverConfig(tmp_path, ts_files=lambda: inputs)
+    monkeypatch.setattr(config, "_glob_dirs", lambda pattern: pytest.fail("globbed again"))
+    assert config.js_workspaces() == ResolverConfig(tmp_path).js_workspaces()
 
 
 def test_tsconfig_paths_beat_a_workspace_package_which_beats_base_url(tmp_path):
@@ -231,7 +264,7 @@ def test_tsconfig_paths_beat_a_workspace_package_which_beats_base_url(tmp_path):
     write(tmp_path, "tsconfig.json", '{"compilerOptions": {"baseUrl": ".", "paths": {"@acme/cli": ["vendor/cli"]}}}')
     config = ResolverConfig(tmp_path)
     assert config.bare_import("@acme/cli", "a.ts") == (["vendor/cli"], [])
-    assert config.bare_import("plain", "a.ts") == (["packages/plain/lib/main.js"], ["packages/plain"])
+    assert config.bare_import("plain", "a.ts")[1] == ["packages/plain"]
     assert config.bare_import("lodash", "a.ts") == (["lodash"], [])
 
 
@@ -619,7 +652,8 @@ def test_a_workspace_package_change_re_indexes_its_importers(engine, repo_id, tm
 
     for text, expected in (
         ('{"name": "@acme/tools", "main": "src/index.ts"}', []),  # renamed: nothing imports it by that name
-        ('{"name": "@acme/utils", "main": "src/format.ts"}', ["packages/utils/src/format.ts"]),
+        ('{"name": "@acme/utils", "main": "src/format.ts"}', ["packages/utils/src/format.ts",
+                                                             "packages/utils/src/index.ts"]),
     ):
         write(tmp_path, "packages/utils/package.json", text)
         index_paths(engine, repo_id, tmp_path, {manifest})

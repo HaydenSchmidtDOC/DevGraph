@@ -758,7 +758,7 @@ def index_paths(
     config = ResolverConfig(
         repo_root, go_files=lambda: config_files("go", ("go.mod", "go.work")),
         rust_files=lambda: config_files("rust"), cs_files=lambda: config_files("csharp"),
-        python_files=lambda: config_files("python"),
+        python_files=lambda: config_files("python"), ts_files=lambda: config_files("ts"),
     )
     # Markdown files whose cross-file edges are resolved after every other
     # node in the batch exists (see the docs/mentions passes below).

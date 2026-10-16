@@ -368,9 +368,10 @@ CS_REFERENCES = {
 CS_DIRS = ["cs/", "cs/Models/", "cs2/", "scripts/"]
 # Folders holding a configuration file, which the fuzz may delete whole.
 CONFIG_DIRS = ["ts/configs", "go/b", "crates/core", "cs/Models", "ws/utils"]
-# The workspace package ws/utils's names and the entries its `main` moves between (None: no `main`).
+# The workspace package ws/utils's names and the entries its `main` moves between (None: no `main`;
+# dist/fmt.js, a build output, is src/fmt.ts).
 WS_NAMES = ["@fz/utils", "@fz/tools"]
-WS_MAINS = [None, "src/index.ts", "lib/main.js"]
+WS_MAINS = [None, "src/index.ts", "lib/main.js", "dist/fmt.js"]
 
 RS_FOO = "pub struct Foo;\n\nimpl Foo {\n    pub fn new() -> Foo {\n        Foo\n    }\n}\n"
 GO_SERVER = "type Server struct{}\n\nfunc (s *Server) Run() {\n\tServe()\n}\n"
