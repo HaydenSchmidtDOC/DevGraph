@@ -5,8 +5,10 @@ description = "Local-first developer knowledge graph platform"
 requires-python = ">=3.13"
 dependencies = [
     "neo4j>=5.26",
-    # The driver's Rust packer, a drop-in for its pure-Python one (each release pins its `neo4j`).
-    "neo4j-rust-ext>=5.26",
+    # The driver's Rust packer, a drop-in for its pure-Python one (each release pins its `neo4j`),
+    # only where it ships wheels: elsewhere the pure-Python driver is used, never a Rust build.
+    # No standard marker names a free-threaded build, which has no wheel either.
+    "neo4j-rust-ext>=5.26; platform_python_implementation == 'CPython' and (sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')))",
     "tree-sitter>=0.23,<0.24",
     "tree-sitter-python>=0.23,<0.24",
     "tree-sitter-javascript>=0.23,<0.24",

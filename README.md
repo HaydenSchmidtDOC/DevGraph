@@ -32,7 +32,7 @@ uv run devgraph register ~/code/my-repo --full
 uv run devgraph mcp add
 ```
 
-`docker run` takes the same arguments. A new Neo4j container takes about 20 seconds before it answers, so `doctor --wait 90` first waits up to 90 seconds for it (saying so every 10 seconds); `register` run before then fails its initial scan. `devgraph mcp add` registers DevGraph with Claude Code for every project (user scope); `devgraph client-config` prints the VS Code entry. Activate the environment (`source .venv/bin/activate`) to drop the `uv run` prefix. Without a desktop tray, the agent runs headless (see `devgraph tray start` below).
+`docker run` takes the same arguments. A new Neo4j container takes about 20 seconds before it answers, so `doctor --wait 90` first waits up to 90 seconds for it (saying so every 10 seconds); `register` run before then fails its initial scan. `devgraph mcp add` registers DevGraph with Claude Code for every project (user scope); `devgraph client-config` prints the VS Code entry. Activate the environment (`source .venv/bin/activate`) to drop the `uv run` prefix. On CPython for Windows, macOS and Linux x86_64/aarch64 the install includes `neo4j-rust-ext`, the Neo4j driver's faster Rust encoder (about a fifth off a full scan); elsewhere it is left out and the pure-Python driver is used. Without a desktop tray, the agent runs headless (see `devgraph tray start` below).
 
 ### Windows
 
