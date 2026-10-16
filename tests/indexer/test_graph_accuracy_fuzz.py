@@ -26,7 +26,10 @@ TS files import through a tsconfig path alias, and the resolver configuration
 changes under them: the tsconfig is rewritten (its own `paths`, `extends` to
 an odd-named base, `references`), its base is edited or its folder deleted, a
 root or nested go.mod comes and goes, and a config under an ignored folder is
-edited. After every batch the fuzz runs what a live batch does,
+edited. A workspace package ws/utils (the root package.json's `workspaces`,
+or pnpm-workspace.yaml's `packages`) is imported by name from ws/app and
+through its barrel: it is renamed, its `main` moves between entries or goes,
+and the workspace declarations change or go. After every batch the fuzz runs what a live batch does,
 `sync_resolver_config`. C# projects change the same way: a .csproj or
 Directory.Build file is written, created or deleted, and a C# file gains or
 loses a `global using` (written behind a comment, `#if`, a byte order mark,
@@ -79,6 +82,7 @@ The spec's "Out of scope" gaps are left out by construction:
   leaves the old path in its edges' `origins`).
 """
 
+import json
 import os
 import random
 from dataclasses import dataclass, field, replace
@@ -310,6 +314,9 @@ TS_CONFIGS = {
     ],
     "ts/tsconfig.app.json": [None, '{"extends": "./configs/base.cfg"}', '{"compilerOptions": {"baseUrl": "other"}}'],
     "ignored/tsconfig.json": ['{"compilerOptions": {"baseUrl": "."}}', '{"compilerOptions": {"baseUrl": ".."}}'],
+    # The root package.json declares ws/* workspaces, Yarn's form only ws/utils, or nothing; pnpm's file ws/**.
+    "package.json": ['{"workspaces": ["ws/*"]}', '{"workspaces": {"packages": ["ws/utils"]}}', '{"name": "fz"}', None],
+    "pnpm-workspace.yaml": [None, "packages:\n  - 'ws/**'\n"],
     # go/go.mod (example.com/fz) holds go/a and go/b; a root go.mod is
     # another module around it, a nested go/b/go.mod takes go/b out of it,
     # and go.work's `replace` names go/b by a third path.
@@ -360,7 +367,10 @@ CS_REFERENCES = {
 # The folders a C# file moves between: three projects and no project.
 CS_DIRS = ["cs/", "cs/Models/", "cs2/", "scripts/"]
 # Folders holding a configuration file, which the fuzz may delete whole.
-CONFIG_DIRS = ["ts/configs", "go/b", "crates/core", "cs/Models"]
+CONFIG_DIRS = ["ts/configs", "go/b", "crates/core", "cs/Models", "ws/utils"]
+# The workspace package ws/utils's names and the entries its `main` moves between (None: no `main`).
+WS_NAMES = ["@fz/utils", "@fz/tools"]
+WS_MAINS = [None, "src/index.ts", "lib/main.js"]
 
 RS_FOO = "pub struct Foo;\n\nimpl Foo {\n    pub fn new() -> Foo {\n        Foo\n    }\n}\n"
 GO_SERVER = "type Server struct{}\n\nfunc (s *Server) Run() {\n\tServe()\n}\n"
@@ -434,6 +444,14 @@ def initial_repo() -> dict:
         "ts/src/lib.ts": File("ts", funcs={"f": []}),
         "ts/src/util.ts": File("ts", imports=["import { f } from './lib';"], funcs={"g": ["f"]}),
         "ts/other/lib.ts": File("ts", funcs={"f": [], "g": []}),
+        # A workspace package: its barrel re-exports fmt, another entry
+        # defines its own; ws/app imports it by name and by a subpath.
+        "package.json": File("static", head=TS_CONFIGS["package.json"][0]),
+        "ws/utils/package.json": File("static", head='{"name": "@fz/utils", "main": "src/index.ts"}'),
+        "ws/utils/src/index.ts": File("ts", imports=["export { fmt } from './fmt';"]),
+        "ws/utils/src/fmt.ts": File("ts", funcs={"fmt": []}),
+        "ws/utils/lib/main.ts": File("ts", funcs={"fmt": [], "lead": []}),
+        "ws/app/greet.ts": File("ts", imports=["import { fmt } from '@fz/utils';"], funcs={"greet": ["fmt"]}),
         "kt/Models.kt": File("kt", head="kt", bases={"Clock": None, "Stopwatch": None}, funcs={"helper": []}),
         "kt/Main.kt": File("kt", head="kt", imports=["kt.util.slug"], funcs={"main": ["helper", "clockRun", "slug"]}),
         "kt/util/Text.kt": File("kt", head="kt.util", funcs={"slug": []}),
@@ -463,7 +481,9 @@ IMPORTS = {
             '#include "../cpp/util/strings.h"', "#include <vector>"],
     "go": ["example.com/fz/a", "example.com/fz/b", "example.com/top/go/b", "example.com/bee", "example.com/ext"],
     "ts": ["import { f } from '@/lib';", "import * as u from '@/util';", "import { g } from './src/util';",
-           "import { f } from './other/lib';", "import { f } from 'lib';", "import { g } from './src';"],
+           "import { f } from './other/lib';", "import { f } from 'lib';", "import { g } from './src';",
+           "import { fmt } from '@fz/utils';", "import * as u from '@fz/tools';",
+           "import { lead } from '@fz/utils/lib/main';"],
     "java": ["base.Base", "app.K", "base.*"],
     "kt": ["kt.util.slug", "kt.util.*", "kt.Clock", "kt.helper"],
 }
@@ -842,6 +862,29 @@ class Fuzz:
         self.files[path] = File("static", head=text)
         return f"write config {path}: {text!r}", {path}
 
+    def op_ws_rename(self):
+        """Rename the workspace package ws/utils."""
+        path = "ws/utils/package.json"
+        if path not in self.files:
+            return None
+        data = json.loads(self.files[path].head)
+        data["name"] = self.rng.choice([n for n in WS_NAMES if n != data["name"]])
+        self.files[path] = File("static", head=json.dumps(data))
+        return f"rename workspace package {path} to {data['name']}", {path}
+
+    def op_ws_main(self):
+        """Point ws/utils's `main` at another entry, or drop it (src/index then)."""
+        path = "ws/utils/package.json"
+        if path not in self.files:
+            return None
+        data = json.loads(self.files[path].head)
+        main = self.rng.choice([m for m in WS_MAINS if m != data.get("main")])
+        data.pop("main", None)
+        if main is not None:
+            data["main"] = main
+        self.files[path] = File("static", head=json.dumps(data))
+        return f"set main of {path} to {main}", {path}
+
     def op_cs_csproj(self):
         """Write, create or delete a C# project file or a Directory.Build file."""
         path = self.rng.choice(sorted(CS_CONFIGS))
@@ -1148,6 +1191,7 @@ class Fuzz:
         "cs_dup_class", "cs_shadow", "cs_shadow", "cs_reference", "cs_reference", "cs_project_move", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route",
         "route",
         "route_change", "route_move", "src_move", "src_move", "src_dir", "src_dir", "rs_reexport", "rs_reexport", "rs_reexport",
+        "ws_rename", "ws_rename", "ws_main", "ws_main",
     ]
 
     def draw(self):

@@ -144,9 +144,11 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: an ancestor and the source roots a pyproject.toml declares; Rust calls and imports
 #: through `pub use` re-exports (resolver configuration); a Kotlin
 #: anonymous companion object's members (owner `Class.Companion`); JSX
-#: component elements as calls.
+#: component elements as calls; 17: JS/TS imports of a workspace package
+#: (package.json `workspaces`, pnpm-workspace.yaml) resolved to its entry
+#: point or subpath and its directory (resolver configuration).
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 16
+INDEX_FORMAT = 17
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:

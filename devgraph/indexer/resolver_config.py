@@ -23,12 +23,20 @@ C#'s configuration is its projects (`csharp_projects`): each `.csproj` and
 the nearest Directory.Build.props and Directory.Build.targets above it (their
 `<Using>` items and `<ProjectReference>`s), and every `.cs` file whose head
 (`cs_global_usings`) holds a `global using`.
+
+JS/TS's configuration also holds the repository's workspace packages
+(`js_workspaces`): the root package.json's `workspaces` and
+pnpm-workspace.yaml's `packages` globs, and the package.json of each
+directory they match, its `name` and entry points. An import of
+`@acme/utils` reaches that package's files only through them.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
+import os
 import posixpath
 import re
 import tomllib
@@ -36,6 +44,8 @@ import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import astuple, dataclass, replace
 from pathlib import Path
+
+import yaml
 
 from devgraph.indexer.gitignore import IGNORECASE, is_gitignored
 from devgraph.indexer.walk import indexable_paths, is_ignored_path
@@ -67,9 +77,15 @@ _MAX_CONFIG_BYTES = 1024 * 1024
 _CS_BUILD_FILES = ("Directory.Build.props", "Directory.Build.targets")
 
 
+#: The files that declare JS/TS workspace packages (`js_workspaces`): the
+#: root's package.json and pnpm-workspace.yaml, and each package's package.json.
+_JS_WORKSPACE_FILES = ("package.json", "pnpm-workspace.yaml")
+
+
 def config_language(name: str) -> str | None:
     """The language a file named `name` configures by its name alone (a
-    tsconfig*.json or jsconfig.json, a go.mod or go.work, a Cargo.toml, a
+    tsconfig*.json or jsconfig.json, a package.json or pnpm-workspace.yaml,
+    a go.mod or go.work, a Cargo.toml, a
     *.csproj or Directory.Build.props/.targets, a pyproject.toml, setup.py
     or setup.cfg), else
     None. A .cs file
@@ -79,6 +95,8 @@ def config_language(name: str) -> str | None:
     config reached only through `extends` can have any name; it is followed
     by path (see `ResolverConfig.read`)."""
     if name == "jsconfig.json" or (name.startswith("tsconfig") and name.endswith(".json")):
+        return "ts"
+    if name in _JS_WORKSPACE_FILES:
         return "ts"
     if name in ("go.mod", "go.work"):
         return "go"
@@ -353,6 +371,54 @@ def _case_key(path: str) -> str:
     return path.casefold() if IGNORECASE else path
 
 
+#: The `exports` conditions a target is taken from first, in this order;
+#: then any other, in the order written.
+_EXPORT_CONDITIONS = ("types", "import", "module", "default", "require", "node")
+
+
+def _export_target(value: object) -> str | None:
+    """The path an `exports` value names: itself, a condition's
+    (`_EXPORT_CONDITIONS`, nested), or an array's first; None for `null`."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return next((found for each in value if (found := _export_target(each)) is not None), None)
+    if isinstance(value, dict):
+        keys = [key for key in _EXPORT_CONDITIONS if key in value] + [k for k in value if k not in _EXPORT_CONDITIONS]
+        return next((found for key in keys if (found := _export_target(value[key])) is not None), None)
+    return None
+
+
+def _package_entry(data: dict, sub: str) -> list[str]:
+    """The paths, relative to a workspace package's directory, the package
+    (`sub` "") or its subpath `sub` names (see `workspace_import`): its
+    `exports` entry, else for the package itself the first of `types`,
+    `module` and `main`, else `src/index` and `index`; for a subpath, the
+    subpath itself."""
+    key = f"./{sub}" if sub else "."
+    exports = data.get("exports")
+    if isinstance(exports, dict) and any(isinstance(k, str) and k.startswith(".") for k in exports):
+        entries = {k: v for k, v in exports.items() if isinstance(k, str) and k.startswith(".")}
+    else:
+        entries = {".": exports} if exports is not None else {}
+    target = _export_target(entries[key]) if key in entries else None
+    if target is None:
+        best = None
+        for pattern, value in entries.items():
+            prefix, star, suffix = pattern.partition("*")
+            if star and "*" not in suffix and key.startswith(prefix) and key.endswith(suffix) \
+                    and len(key) >= len(prefix) + len(suffix) and (best is None or len(prefix) > len(best[0])):
+                best = (prefix, suffix, value)
+        if best is not None and (found := _export_target(best[2])) is not None:
+            target = found.replace("*", key[len(best[0]): len(key) - len(best[1])])
+    if target is not None:
+        return [target]
+    if sub:
+        return [sub]
+    main = next((data[k] for k in ("types", "module", "main") if isinstance(data.get(k), str) and data[k]), None)
+    return [main] if main is not None else ["src/index", "index"]
+
+
 @dataclass(frozen=True)
 class _TsProject:
     """One tsconfig's resolved options, its `extends` chain applied: the
@@ -403,6 +469,8 @@ class ResolverConfig:
         self._python_files = python_files
         self._python_roots: dict[str, list[str]] | None = None
         self._python_src: list[str] = []
+        self._dirs: dict[str, list[str]] = {}
+        self._js_workspaces: dict[str, list[str]] | None = None
 
     # --- files ---------------------------------------------------------------
 
@@ -422,6 +490,15 @@ class ResolverConfig:
         # Looked for, found or not: creating it later can change the result.
         self.read.add(rel)
         return self._texts[rel]
+
+    def _js_text(self, rel: str) -> str | None:
+        """`_text` for a package.json or pnpm-workspace.yaml (`_JS_WORKSPACE_FILES`),
+        read only when present: one created later is configuration by its
+        name (`config_language`), so its absence need not be an input."""
+        text = self._text(rel)
+        if text is None:
+            self.read.discard(rel)
+        return text
 
     def _config_file(self, folder: str, target: str) -> str | None:
         """An `extends` or `references` target: a file, the same with `.json`
@@ -526,12 +603,12 @@ class ResolverConfig:
         self._nearest[folder] = projects
         return projects
 
-    def ts_alias(self, specifier: str, file_path: str) -> list[str] | None:
+    def ts_alias(self, specifier: str, file_path: str, base_url: bool = True) -> list[str] | None:
         """The repo-relative paths (extension not yet applied) a bare
         specifier names through the importing file's tsconfig: the first
         project with a `paths` pattern matching it (an exact pattern, else
-        the longest prefix), else the first with a `baseUrl`. None when
-        none applies: the specifier is external."""
+        the longest prefix), else (unless not `base_url`) the first with a
+        `baseUrl`. None when none applies: the specifier is external."""
         projects = self._ts_projects(posixpath.dirname(file_path))
         for project in projects:
             best = None
@@ -554,11 +631,163 @@ class ResolverConfig:
                     if (rel := _join(project.paths_base or "", target.replace("*", captured))) is not None
                 ]
                 return found
-        for project in projects:
+        for project in projects if base_url else []:
             if project.base_url is not None:
                 rel = _join(project.base_url, specifier)
                 return [rel] if rel is not None else []
         return None
+
+    def bare_import(self, specifier: str, file_path: str) -> tuple[list[str], list[str]] | None:
+        """What a bare specifier names, as the repo-relative paths (extension
+        not yet applied) and the directories of the workspace packages it
+        reaches (empty unless one): the importing file's tsconfig `paths`
+        (`ts_alias`), else a workspace package (`workspace_import`), else
+        its tsconfig `baseUrl`. TypeScript tries a failed `baseUrl` lookup
+        in `node_modules`, where a workspace package is linked; not checking
+        the disk, a workspace package's name goes first. None: external."""
+        aliased = self.ts_alias(specifier, file_path, base_url=False)
+        if aliased is not None:
+            return aliased, []
+        found = self.workspace_import(specifier)
+        if found is not None:
+            return found
+        aliased = self.ts_alias(specifier, file_path)
+        return (aliased, []) if aliased is not None else None
+
+    # --- package.json workspaces ------------------------------------------------
+
+    def _subdirs(self, folder: str) -> list[str]:
+        """The directories directly in `folder` (repo-relative) the walk
+        enters: no symlink, ignored or gitignored one; sorted."""
+        if folder not in self._dirs:
+            found = []
+            try:
+                entries = list(os.scandir(self.root / folder if folder else self.root))
+            except OSError:
+                entries = []
+            for entry in entries:
+                rel = f"{folder}/{entry.name}" if folder else entry.name
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_dir and not is_ignored_path(Path(rel)) and not is_gitignored(self.root, rel, is_dir=True):
+                    found.append(rel)
+            self._dirs[folder] = sorted(found)
+        return self._dirs[folder]
+
+    def _glob_dirs(self, pattern: str) -> set[str]:
+        """The directories a workspace glob matches (`packages/*`,
+        `apps/**`, `tools/cli`), repo-relative; a segment holds `*`, `?` or
+        `[...]`, and `**` is any number of directories. A pattern leaving
+        the repository matches none."""
+        parts = [part for part in pattern.split("/") if part not in ("", ".")]
+        found: set[str] = set()
+        seen: set[tuple[str, int]] = set()
+
+        def visit(folder: str, i: int) -> None:
+            if (folder, i) in seen:
+                return
+            seen.add((folder, i))
+            if i == len(parts):
+                found.add(folder)
+                return
+            part = parts[i]
+            if part == "**":
+                visit(folder, i + 1)
+                for child in self._subdirs(folder):
+                    visit(child, i)
+            elif part == "..":
+                return
+            else:
+                for child in self._subdirs(folder):
+                    if fnmatch.fnmatchcase(posixpath.basename(child), part):
+                        visit(child, i + 1)
+
+        visit("", 0)
+        found.discard("")
+        return found
+
+    def _workspace_globs(self) -> list[str]:
+        """The workspace globs: the root package.json's `workspaces` (an
+        array, or Yarn's `{"packages": [...]}`) and pnpm-workspace.yaml's
+        `packages`, a `!` before one that excludes."""
+        globs: list[str] = []
+        data = parse_jsonc(self._js_text("package.json") or "") or {}
+        workspaces = data.get("workspaces")
+        if isinstance(workspaces, dict):
+            workspaces = workspaces.get("packages")
+        globs += [each for each in workspaces if isinstance(each, str)] if isinstance(workspaces, list) else []
+        try:
+            pnpm = yaml.safe_load(self._js_text("pnpm-workspace.yaml") or "")
+        except yaml.YAMLError:
+            pnpm = None
+        packages = pnpm.get("packages") if isinstance(pnpm, dict) else None
+        globs += [each for each in packages if isinstance(each, str)] if isinstance(packages, list) else []
+        return globs
+
+    def js_workspaces(self) -> dict[str, list[str]]:
+        """Every workspace package of the repository, by its package.json
+        `name`, and its directories, sorted (two can share a name): each
+        directory the workspace globs (`_workspace_globs`) match, less those
+        a `!` glob matches, whose package.json has a `name`. Only the
+        repository root's package.json and pnpm-workspace.yaml declare
+        workspaces."""
+        if self._js_workspaces is None:
+            included: set[str] = set()
+            excluded: set[str] = set()
+            for each in self._workspace_globs():
+                if each.startswith("!"):
+                    excluded |= self._glob_dirs(each[1:])
+                else:
+                    included |= self._glob_dirs(each)
+            packages: dict[str, list[str]] = {}
+            for folder in sorted(included - excluded):
+                name = (parse_jsonc(self._js_text(f"{folder}/package.json") or "") or {}).get("name")
+                if isinstance(name, str) and name:
+                    packages.setdefault(name, []).append(folder)
+            self._js_workspaces = packages
+        return self._js_workspaces
+
+    def workspace_import(self, specifier: str) -> tuple[list[str], list[str]] | None:
+        """The repo-relative paths (extension not yet applied) a bare
+        specifier names in a workspace package (`js_workspaces`), by the
+        longest package name it is or starts with followed by `/`, and that
+        package's directories; None when it names none (an external
+        package). In each directory, the package's `exports` entry for the
+        specifier's subpath (`"."` for the package itself; an exact key, or
+        one with a single `*`), else for the package itself its `types`,
+        `module` or `main`, else `src/index` and `index`, and a subpath as a
+        path in the package (`_package_entry`)."""
+        packages = self.js_workspaces()
+        name = max(
+            (each for each in packages if specifier == each or specifier.startswith(each + "/")),
+            key=len, default=None,
+        )
+        if name is None:
+            return None
+        sub = specifier[len(name) + 1:]
+        bases: list[str] = []
+        for folder in packages[name]:
+            data = parse_jsonc(self._text(f"{folder}/package.json") or "") or {}
+            for target in _package_entry(data, sub):
+                if (rel := _join(folder, target)) is not None and rel not in bases:
+                    bases.append(rel)
+        return bases, list(packages[name])
+
+    def _js_digest(self, rel: str) -> object:
+        """What a package.json or pnpm-workspace.yaml says about workspace
+        packages: the workspace globs, a package's name and entry points."""
+        if posixpath.basename(rel) == "pnpm-workspace.yaml":
+            try:
+                data = yaml.safe_load(self._text(rel) or "")
+            except yaml.YAMLError:
+                return None
+            return data.get("packages") if isinstance(data, dict) else None
+        data = parse_jsonc(self._text(rel) or "")
+        if data is None:
+            return None
+        return {key: data.get(key) for key in ("workspaces", "name", "exports", "types", "module", "main")}
 
     # --- fingerprints ------------------------------------------------------------
 
@@ -996,7 +1225,10 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
     project file's and Directory.Build.props/.targets' `<Using>` items and
     `<ProjectReference>` paths and the `global using`
     directives of each project's .cs files
-    (`_cs_inputs`); for Python each pyproject.toml's source roots
+    (`_cs_inputs`); for TS also the root package.json's and
+    pnpm-workspace.yaml's workspace globs and each workspace package's
+    package.json `name` and entry points (`js_workspaces`, `_js_digest`);
+    for Python each pyproject.toml's source roots
     (`_pyproject_roots`), and every Python project file and `src`
     directory holding Python files beside one (`_python_inputs`). A compiler flag, a `require` bump or a dependency or
     version change counts for nothing."""
@@ -1010,7 +1242,7 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
         except ValueError:
             continue
         lang = config_language(path.name)
-        if lang is not None:
+        if lang is not None and path.name not in _JS_WORKSPACE_FILES:  # only those js_workspaces reads
             found[lang].add(walked[-1])
     found["csharp"] = set(_cs_inputs(root, walked))
     found["rust"] = set(_rust_inputs(root, walked))
@@ -1022,7 +1254,12 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
             for rel in sorted(files):
                 config._ts_projects(posixpath.dirname(rel))  # reads extends and references
                 config._ts_options(rel)
-            digest = [[rel, config._ts_digest(rel)] for rel in sorted(config.read | files)]
+            config.js_workspaces()
+            digest = [
+                [rel, config._js_digest(rel) if posixpath.basename(rel) in _JS_WORKSPACE_FILES
+                 else config._ts_digest(rel)]
+                for rel in sorted(config.read | files)
+            ]
         elif lang == "go":
             digest = [[rel, config._go_digest(rel)] for rel in sorted(files)]
         elif lang == "csharp":
