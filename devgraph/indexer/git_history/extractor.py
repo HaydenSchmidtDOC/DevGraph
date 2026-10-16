@@ -385,7 +385,7 @@ def _apply_function_recency(
 
     entities = engine.run_cypher(
         "MATCH (n {repo_id: $repo_id, file: $file_path}) WHERE n:Function OR n:Class "
-        "RETURN labels(n) AS labels, n.name AS name, "
+        "RETURN labels(n) AS labels, n.name AS name, coalesce(n.owner, '') AS owner, "
         "n.start_line AS start_line, n.end_line AS end_line",
         {"repo_id": repo_id, "file_path": file_path},
     )
@@ -420,12 +420,12 @@ def _apply_function_recency(
         latest = max(overlapping, key=lambda h: h.last_modified_at)
         label = "Function" if "Function" in entity["labels"] else "Class"
         rows[label].append({
-            "name": entity["name"], "file": file_path, "created_at": None,
+            "name": entity["name"], "file": file_path, "owner": entity.get("owner") or "", "created_at": None,
             "last_modified_at": latest.last_modified_at,
             "last_modified_by": latest.last_modified_by if track_author else None,
         })
-    # One statement per label: each row's node is its own (name, file), so
-    # their order across labels does not matter.
+    # One statement per label: each row's node is its own (name, file,
+    # owner), so their order does not matter.
     for label, label_rows in rows.items():
         engine.write_recency(label, repo_id, label_rows, overwrite=overwrite)
 

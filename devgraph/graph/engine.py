@@ -807,10 +807,11 @@ def _run_records(session, query: str, **params: Any) -> list:
 
 def _recency_row(
     name: str, created_at: str | None, last_modified_at: str | None, last_modified_by: str | None, file: str | None,
+    owner: str = "",
 ) -> dict[str, Any]:
     """One row of `GraphEngine.write_recency`."""
     return {
-        "name": name, "file": file, "created_at": created_at, "last_modified_at": last_modified_at,
+        "name": name, "file": file, "owner": owner, "created_at": created_at, "last_modified_at": last_modified_at,
         "last_modified_by": last_modified_by,
     }
 
@@ -2374,6 +2375,7 @@ class GraphEngine:
         last_modified_at: str | None = None,
         last_modified_by: str | None = None,
         file: str | None = None,
+        owner: str = "",
     ) -> None:
         """Ratchet-merge git-derived recency onto a node: `created_at` only
         moves earlier and `last_modified_at` only moves later, so this is
@@ -2392,12 +2394,16 @@ class GraphEngine:
         commit's author with an older one's.
 
         Pass `file` for Function/Class labels (whose nodes are MERGE-keyed
-        on (repo_id, name, file) — see _group_nodes_by_label) so this
+        on (repo_id, name, file, owner) — see _group_nodes_by_label) so this
         doesn't fall back to a bare-name match that could hit every
-        same-named function across every file in the repo at once. Omit it
-        for Module (whose `name` is already the unique file path).
+        same-named function across every file in the repo at once, and
+        `owner` ("" at the top level) so two same-named methods of one file
+        are told apart. Omit both for Module (whose `name` is already the
+        unique file path).
         """
-        self.write_recency(label, repo_id, [_recency_row(name, created_at, last_modified_at, last_modified_by, file)])
+        self.write_recency(
+            label, repo_id, [_recency_row(name, created_at, last_modified_at, last_modified_by, file, owner)]
+        )
 
     def set_recency(
         self,
@@ -2408,6 +2414,7 @@ class GraphEngine:
         last_modified_at: str | None = None,
         last_modified_by: str | None = None,
         file: str | None = None,
+        owner: str = "",
     ) -> None:
         """Overwrite recency from scratch — used only by the reconcile path,
         where the caller has just recomputed the authoritative value from a
@@ -2421,7 +2428,8 @@ class GraphEngine:
         See `stage_recency` for why `file` matters for Function/Class labels.
         """
         self.write_recency(
-            label, repo_id, [_recency_row(name, created_at, last_modified_at, last_modified_by, file)], overwrite=True
+            label, repo_id, [_recency_row(name, created_at, last_modified_at, last_modified_by, file, owner)],
+            overwrite=True,
         )
 
     def write_recency(self, label: str, repo_id: str, rows: list[dict[str, Any]], overwrite: bool = False) -> None:
@@ -2429,13 +2437,16 @@ class GraphEngine:
         nodes of `label` in one statement, applied in the order of `rows`.
         Each row holds `name`, `created_at`, `last_modified_at` and
         `last_modified_by` (`_recency_row`), and `file`: every row of one
-        call has one (a Function or Class) or none (a Module)."""
+        call has one (a Function or Class, matched with its `owner`, ""
+        when absent, on the unique (repo_id, name, file, owner) index) or
+        none (a Module)."""
         if not rows:
             return
         if any(row["file"] is not None for row in rows) and any(row["file"] is None for row in rows):
             raise ValueError("write_recency rows must all have a file or all have none")
         merge_key = (
-            "{repo_id: $repo_id, name: row.name, file: row.file}" if rows[0]["file"] is not None
+            "{repo_id: $repo_id, name: row.name, file: row.file, owner: coalesce(row.owner, '')}"
+            if rows[0]["file"] is not None
             else "{repo_id: $repo_id, name: row.name}"
         )
         with self._driver.session() as session:
