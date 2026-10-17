@@ -650,3 +650,60 @@ def test_a_route_handler_inherited_by_an_imported_class_relinks_on_a_base_change
     index_paths(engine, repo_id, root, {ctrl})
     assert implemented() == []
     equals_fresh(engine, repo_id, root)
+
+
+def test_a_call_through_an_alias_or_instance_links_what_it_did_before_owners(engine, repo):
+    """A CapWords instance or alias names its class's members as before
+    owners narrowed them: `Registry = _Registry()`, `UserModel = User`, a
+    JS `export const UserService = new UserServiceImpl()` and `export
+    default new Client()`; one naming no class of its file, or a class with
+    a base outside it, still links every member of the name there."""
+    root, _registry, repo_id = repo
+    write(root, "shop/models.py", """\
+        from lib import Model
+
+
+        class _Registry:
+            def register(self):
+                return 1
+
+
+        class User:
+            def save(self):
+                return 2
+
+
+        class Remote(Model):
+            pass
+
+
+        def sync():
+            return 3
+
+
+        Registry = _Registry()
+        UserModel = User
+        Factory = make()
+        """)
+    write(root, "shop/jobs.py", """\
+        from shop.models import Registry, UserModel, Factory, Remote
+
+
+        def run():
+            Registry.register()
+            UserModel().save()
+            Factory.sync()
+            Remote().sync()
+        """)
+    write(root, "web/svc.ts", "export class UserServiceImpl { find() { return 1; } }\n"
+                              "export const UserService = new UserServiceImpl();\n")
+    write(root, "web/client.ts", "class Client { get() { return 1; } }\nexport default new Client();\n")
+    write(root, "web/main.ts", "import { UserService } from './svc';\nimport Client from './client';\n\n"
+                               "export function go() {\n  UserService.find();\n  Client.get();\n}\n")
+    full_scan(engine, repo_id, root)
+    assert _targets(engine, repo_id, "run") == [
+        ("register", "shop/models.py", "_Registry"), ("save", "shop/models.py", "User"),
+        ("sync", "shop/models.py", ""),
+    ]
+    assert _targets(engine, repo_id, "go") == [("find", "web/svc.ts", "UserServiceImpl"), ("get", "web/client.ts", "Client")]
+    equals_fresh(engine, repo_id, root)

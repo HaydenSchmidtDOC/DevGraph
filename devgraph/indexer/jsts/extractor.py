@@ -78,6 +78,7 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    UNKNOWN_BASE,
     add_heir_keys,
     class_member_pin,
     member_owner,
@@ -595,24 +596,66 @@ class _Scope:
 
 
 #: The owner a default import's class names (`import Thing from './thing';
-#: new Thing().start()`): `export default class ThingImpl` is its heir, so
-#: ThingImpl's members, and those it inherits, hold its heir key
-#: (common.heir_keys). No class can be named `default`.
+#: new Thing().start()`): the default export is its heir (`_module_heirs`),
+#: so `export default class ThingImpl`'s members, and those it inherits,
+#: hold its heir key (common.heir_keys). No class can be named `default`.
 DEFAULT_EXPORT = "default"
 
 
-def _default_export(root: Node, source: bytes, classes: dict[str, _ClassInfo]) -> str | None:
-    """The class a file's `export default` names (`export default class
-    X`, `export default X;`), or None."""
+def _module_heirs(root: Node, source: bytes, classes: dict[str, _ClassInfo]) -> list[tuple[str, str, list, tuple]]:
+    """The file's module-level aliases and instances of a class, as
+    member-less class declarations common.heir_keys reads: a CapWords
+    `const` (`export const UserService = new UserServiceImpl()`, `const
+    UserModel = User`) and the default export (`export default class X`,
+    `export default X;`, `export default new Client()`, `export { Impl as
+    default }`, `module.exports = X`), DEFAULT_EXPORT, are heirs of the
+    class they name. One naming no class of the file (a factory's result,
+    a function, an anonymous class, whose members are no nodes) is a class
+    of common.UNKNOWN_BASE too, open, so a call through it links what it
+    did before owners."""
+    found: list[tuple[str, str, list, tuple]] = []
+
+    def heir(name: str, value: Node | None) -> None:
+        if value is not None and value.type == "new_expression":
+            value = value.child_by_field_name("constructor")
+        if value is not None and value.type in (*_CLASS_TYPES, "class"):
+            named = value.child_by_field_name("name")
+            if named is None or _text(named, source) not in classes:
+                found.append((name, name, [*_extract_base_class_names(value, source), UNKNOWN_BASE], ()))
+                return
+            value = named
+        known = value is not None and value.type in ("identifier", "type_identifier") and _text(value, source) in classes
+        found.append((name, name, [_text(value, source) if known else UNKNOWN_BASE], ()))
+
     for node in root.named_children:
-        if node.type != "export_statement" or not any(child.type == "default" for child in node.children):
+        statement = node
+        if node.type == "export_statement":
+            if any(child.type == "default" for child in node.children):
+                heir(DEFAULT_EXPORT, node.child_by_field_name("declaration") or node.child_by_field_name("value"))
+                continue
+            for clause in (c for c in node.named_children if c.type == "export_clause"):
+                for spec in clause.named_children:
+                    alias = spec.child_by_field_name("alias")
+                    if alias is not None and alias.text == b"default":
+                        heir(DEFAULT_EXPORT, spec.child_by_field_name("name"))
+            statement = node.child_by_field_name("declaration")
+        if statement is None:
             continue
-        target = node.child_by_field_name("declaration") or node.child_by_field_name("value")
-        if target is not None and target.type in _CLASS_TYPES:
-            target = target.child_by_field_name("name")
-        if target is not None and target.type in ("identifier", "type_identifier") and _text(target, source) in classes:
-            return _text(target, source)
-    return None
+        if statement.type in ("lexical_declaration", "variable_declaration"):
+            for declarator in statement.named_children:
+                name, value = declarator.child_by_field_name("name"), declarator.child_by_field_name("value")
+                if (
+                    declarator.type == "variable_declarator" and name is not None and name.type == "identifier"
+                    and _class_like(_text(name, source)) and _text(name, source) not in classes
+                    and value is not None and _function_value(value) is None
+                ):
+                    heir(_text(name, source), value)
+        elif statement.type == "expression_statement" and statement.named_children:
+            assignment = statement.named_children[0]
+            left = assignment.child_by_field_name("left") if assignment.type == "assignment_expression" else None
+            if left is not None and left.text == b"module.exports":
+                heir(DEFAULT_EXPORT, assignment.child_by_field_name("right"))
+    return found
 
 
 def _class_like(name: str) -> bool:
@@ -1489,10 +1532,9 @@ def extract_js_file(
                 no_self=no_self, caller_owner=caller_owner,
             ))
     _express_routes(root, source_bytes, resolver, result, file_path, repo_id)
-    default = _default_export(root, source_bytes, class_table)
     add_heir_keys(result, [
         (name, owner, info.bases, info.methods) for name, info in class_table.items() for owner in info.members_owners
-    ] + ([(DEFAULT_EXPORT, DEFAULT_EXPORT, [default], ())] if default else []))
+    ] + _module_heirs(root, source_bytes, class_table))
 
     return own_edges(result, file_path)
 

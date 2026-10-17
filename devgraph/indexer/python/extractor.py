@@ -31,6 +31,7 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    UNKNOWN_BASE,
     add_heir_keys,
     class_member_pin,
     member_owner,
@@ -364,6 +365,53 @@ def _class_table(root: Node, source: bytes) -> dict[str, _ClassInfo]:
     return classes
 
 
+def _class_declarations(root: Node, source: bytes) -> list[tuple[str, str, list[str], set[str]]]:
+    """Every class declaration of the file, each on its own (two nested
+    `Meta`s of two classes stay apart), as common.heir_keys reads them:
+    (name, its members' owner, its bases as written, its methods); then
+    each module-level alias or instance of a class (`UserModel = User`,
+    `Registry = _Registry()`, a CapWords name) as a member-less declaration
+    of that class, or of common.UNKNOWN_BASE when no class of the file is
+    named, so a call through it links what it did before owners."""
+    found: list[tuple[str, str, list[str], set[str]]] = []
+
+    def walk(node: Node, label: str, name: str | None, owner: str) -> None:
+        if node.type in ("class_definition", "function_definition"):
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                own = member_owner(label, name, owner)
+                if node.type == "function_definition":
+                    label, name, owner = "Function", _text(name_node, source), own
+                else:
+                    class_name = _text(name_node, source)
+                    found.append((
+                        class_name, member_owner("Class", class_name, own),
+                        _extract_base_class_names(node.child_by_field_name("superclasses"), source),
+                        _direct_defs(node.child_by_field_name("body"), source),
+                    ))
+                    label, name, owner = "Class", class_name, own
+        for child in node.children:
+            walk(child, label, name, owner)
+
+    walk(root, "Module", None, "")
+    classes = {each[0] for each in found}
+    for statement in root.named_children:
+        assignment = statement.named_children[0] if statement.type == "expression_statement" and (
+            statement.named_children) else None
+        if assignment is None or assignment.type != "assignment":
+            continue
+        left, right = assignment.child_by_field_name("left"), assignment.child_by_field_name("right")
+        if left is None or left.type != "identifier" or right is None:
+            continue
+        alias = _text(left, source)
+        if not _class_like(alias) or alias in classes:
+            continue
+        target = right.child_by_field_name("function") if right.type == "call" else right
+        named = _text(target, source) if target is not None and target.type == "identifier" else None
+        found.append((alias, alias, [named if named in classes else UNKNOWN_BASE], set()))
+    return found
+
+
 @dataclass
 class _Scope:
     """What a call's names can mean where it is made: the functions defined
@@ -607,6 +655,8 @@ def _extract_base_class_names(superclasses_node: Node | None, source: bytes) -> 
         return []
     names = []
     for child in superclasses_node.named_children:
+        if child.type == "subscript":  # `Base[int]`, `typing.Generic[T]`: the base is its value
+            child = child.child_by_field_name("value") or child
         if child.type in ("identifier", "attribute"):
             names.append(_dotted_name(child, source))
         elif child.type == "keyword_argument":
@@ -973,9 +1023,7 @@ def extract_python_file(
                 )
             )
 
-    add_heir_keys(result, [
-        (name, owner, info.bases, info.methods) for name, info in class_table.items() for owner in info.members_owners
-    ])
+    add_heir_keys(result, _class_declarations(root, source_bytes), c3=True)
     return own_edges(result, file_path)
 
 

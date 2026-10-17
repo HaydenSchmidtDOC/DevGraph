@@ -357,3 +357,131 @@ def test_a_route_implements_its_handlers_owner():
     result = APIExtractor("repo").extract_from_source(source, "api/routes.py")
     pinned = {(r.source_name, r.to_owner) for r in result.relationships if r.to_file == "api/routes.py"}
     assert pinned == {("GET /items", ""), ("GET /users", "Views")}
+
+
+def _function_keys(result):
+    return {(n.name, n.properties["owner"]): n.properties.get("mkeys") for n in result.nodes if n.label == "Function"}
+
+
+def test_python_heir_keys_follow_c3_in_a_diamond():
+    """`class D(B, C)` where only C overrides A's `f`: C3 puts C before A,
+    so D inherits C.f; JS and Java keep the depth-first walk."""
+    classes = [("A", "A", [], ["f"]), ("B", "B", ["A"], []), ("C", "C", ["A"], ["f"]), ("D", "D", ["B", "C"], [])]
+    assert heir_keys(classes, c3=True) == {("f", "A"): ["<B"], ("f", "C"): ["<D"]}
+    assert heir_keys(classes) == {("f", "A"): ["<B", "<D"]}
+    keys = _function_keys(extract_python_file(textwrap.dedent("""\
+        class A:
+            def f(self):
+                pass
+
+
+        class B(A):
+            pass
+
+
+        class C(A):
+            def f(self):
+                pass
+
+
+        class D(B, C):
+            pass
+        """), "m.py", "repo"))
+    assert keys[("f", "C")] == ["<D"] and keys[("f", "A")] == ["<B"]
+
+
+def test_a_subscripted_base_is_its_value():
+    """`class User(Base[int])` and `typing.Generic[T]` keep their base."""
+    result = extract_python_file(textwrap.dedent("""\
+        import typing
+
+
+        class Base:
+            def save(self):
+                pass
+
+
+        class User(Base[int], typing.Generic[T]):
+            pass
+        """), "m.py", "repo")
+    assert ("Base", "typing.Generic") == tuple(
+        r.to_name for r in result.relationships if r.rel_type == "EXTENDS" and r.from_name == "User"
+    )
+    assert "<User" in _function_keys(result)[("save", "Base")]
+
+
+def test_same_named_python_classes_keep_their_own_heirs():
+    """Two nested `Meta`s, one of base `Base`: only that one inherits `save`."""
+    keys = _function_keys(extract_python_file(textwrap.dedent("""\
+        class Base:
+            def save(self):
+                pass
+
+
+        class A:
+            class Meta(Base):
+                pass
+
+
+        class B:
+            class Meta:
+                def run(self):
+                    pass
+        """), "m.py", "repo"))
+    assert keys[("save", "Base")] == ["<A.Meta"]
+    assert keys[("run", "B.Meta")] is None
+
+
+def test_python_aliases_and_instances_are_heirs_of_their_class():
+    """`Registry = _Registry()` and `UserModel = User` hold their class's
+    members' keys; `Other = make()`, which names no class of the file, and
+    a class with a base outside it, hold every other Function's, so a call
+    through them links what an owner-less pin did."""
+    keys = _function_keys(extract_python_file(textwrap.dedent("""\
+        from x import Model
+
+
+        class _Registry:
+            def register(self):
+                pass
+
+
+        class User:
+            def save(self):
+                pass
+
+
+        class Remote(Model):
+            def own(self):
+                pass
+
+
+        def helper():
+            pass
+
+
+        Registry = _Registry()
+        UserModel = User
+        Other = make()
+        """), "m.py", "repo"))
+    assert keys[("register", "_Registry")] == ["<Other", "<Registry", "<Remote"]
+    assert keys[("save", "User")] == ["<Other", "<Remote", "<UserModel"]
+    assert keys[("own", "Remote")] == ["<Other"]
+    assert keys[("helper", "")] == ["<Other", "<Remote"]
+
+
+@pytest.mark.parametrize("source, name, owner, key", [
+    ("export class UserServiceImpl { find() {} }\nexport const UserService = new UserServiceImpl();\n",
+     "find", "UserServiceImpl", "<UserService"),
+    ("class Client { get() {} }\nexport default new Client();\n", "get", "Client", "<default"),
+    ("class Impl { go() {} }\nexport { Impl as default };\n", "go", "Impl", "<default"),
+    ("class Base { start() {} }\nexport default class extends Base {}\n", "start", "Base", "<default"),
+    ("class Svc { run() {} }\nmodule.exports = Svc;\n", "run", "Svc", "<default"),
+    ("class User { save() {} }\nexport const UserModel = User;\n", "save", "User", "<UserModel"),
+    # Naming no class of the file: every Function holds the key.
+    ("export const Api = makeApi();\nexport function get() {}\n", "get", "", "<Api"),
+    ("export default function Page() {}\nfunction load() {}\n", "load", "", "<default"),
+])
+def test_js_aliases_instances_and_default_exports_are_heirs(source, name, owner, key):
+    keys = _function_keys(extract_js_file(source, "web/m.ts", "repo"))
+    assert key in keys[(name, owner)]
