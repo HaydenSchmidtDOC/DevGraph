@@ -26,6 +26,7 @@ from devgraph.graph.schema import (
     CLAIMED_LABELS,
     FILE_LABELS,
     FILE_SCOPED_LABELS,
+    HEIR_KEY,
     NAME_REF_SEP,
     NAMED_LABELS,
     NODE_LABELS,
@@ -1147,6 +1148,15 @@ def _shadow_free(ref: str, var: str, label: str) -> str:
     )
 
 
+def _owner_test(ref: str, end: str, var: str) -> str:
+    """Cypher keeping the node `var` when the end's `{end}_owner` is unset
+    or names it: its own owner, or, for a target, a class of its file that
+    inherits it (the node's heir key, graph/schema.py `HEIR_KEY`)."""
+    owner = f"{ref}.{end}_owner"
+    heir = f" OR '{HEIR_KEY}' + {owner} IN coalesce({var}.mkeys, [])" if end == "to" else ""
+    return f"({owner} IS NULL OR {var}.owner = {owner}{heir})"
+
+
 def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also: str | None = None) -> str:
     """The MATCH for one end of an edge row (`pin` from `_pin`), reading its
     `{end}_name`/`{end}_file` off `ref` (the row, or one of its targets). An
@@ -1167,7 +1177,8 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     `to_name`, and tests the Module's path. `also` is one more condition on
     the match. An end pinned to a file or a path with an `{end}_owner` keeps
     only the nodes of that `owner` (two classes' same-named methods in one
-    file). A path-pinned end of a file-scoped label keeps only the nodes
+    file), or a target its heir keys say that owner inherits
+    (`_owner_test`). A path-pinned end of a file-scoped label keeps only the nodes
     visible to the row's project (`_visible`). A path pin marked `_TIERED`
     also keeps only the nodes its tiers do not shadow (`_shadow_free`)."""
     conditions = [also] if also else []
@@ -1196,7 +1207,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
                 match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
             if label in FILE_SCOPED_LABELS:
                 # The members of one owner in the files the pin matches, when the row names it.
-                conditions.append(f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)")
+                conditions.append(_owner_test(ref, end, var))
                 conditions.append(_visible(var))
         conditions[:0] = _path_pin_conditions(ref, path, var)
         return match + "WHERE " + " AND ".join(conditions) + " " + (_shadow_free(ref, var, label) if tiered else "")
@@ -1210,7 +1221,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
             # owner; every one of them otherwise. A node an index older than
             # owners wrote is left out until the upgrade rescan gives it one.
             conditions[:0] = [
-                f"{var}.owner IS NOT NULL", f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)",
+                f"{var}.owner IS NOT NULL", _owner_test(ref, end, var),
             ]
     else:
         match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "

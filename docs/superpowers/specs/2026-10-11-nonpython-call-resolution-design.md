@@ -937,9 +937,11 @@ resolves by function name alone and still links every same-named member of
 the file); across files, an imported top-level function (a Python
 from-import or module attribute, a JS/TS ES named import or namespace
 member, a Go package's function) links the top-level one, never a method
-of its name. A method of another file's class still links every member of
-the name there (a subclass can inherit it from a base of that file), and so
-does a call through a JS/TS default import or `require`. C# narrows by
+of its name. A method of another file's Python, JS/TS or Java class names
+that class (index format 19), which reaches its own member or the one it
+inherits from a base of that file (heir keys: graph-accuracy spec, O3
+(c)); a call through a JS/TS default import or `require` still links
+every member of the name there. C# narrows by
 owner through its match keys already. The measurement fixtures are
 unchanged by it (M1 to M5 equal; `name_refs` 3 to 8 % larger).
 

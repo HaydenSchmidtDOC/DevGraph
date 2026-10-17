@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 from devgraph.graph.schema import (
     FILE_SCOPED_LABELS,
+    HEIR_KEY,
     NAME_REF_FILELESS,
     NAME_REF_OWNED,
     NAME_REF_PIN_SEP,
@@ -34,13 +35,17 @@ __all__ = [
     "ExtractionResult",
     "GraphNode",
     "GraphRelationship",
+    "add_heir_keys",
     "best_pin",
+    "class_member_pin",
+    "heir_keys",
     "member_owner",
     "module_pin_name",
     "name_ref_properties",
     "own_edges",
     "owned_pin",
     "owners_by_pin",
+    "owner_matches",
     "parse_name_ref",
     "pin_confidence",
     "pin_excludes",
@@ -189,6 +194,15 @@ def owned_pin(pin: str, owner: str | None) -> str:
     return f"{pin}{OWNER_PIN_SEP}{owner}" if owner is not None else pin
 
 
+def class_member_pin(pin: str, cls: str | None) -> str:
+    """A pin to the members of another file's class `cls` (common.owned_pin):
+    owned by `cls` in the files `pin` names, the class's own or one it
+    inherits from a class of its file (`heir_keys`). A recursive prefix (a
+    package or barrel directory) stays owner-less: the class's file is one
+    of many there, and a base it imports from a sibling is found by name."""
+    return owned_pin(pin, None if pin_kind(pin) == "prefix" else cls)
+
+
 def split_owned_pin(pin: str | None) -> tuple[str | None, str | None]:
     """An `owned_pin` as (pin, owner); any other pin as (pin, None)."""
     if pin is None or OWNER_PIN_SEP not in pin:
@@ -205,6 +219,70 @@ def owners_by_pin(pins: Iterable[str]) -> dict[str, set[str | None]]:
         base, owner = split_owned_pin(pin)
         found.setdefault(base, set()).add(owner)
     return found
+
+
+def heir_keys(
+    classes: Iterable[tuple[str, str | None, Iterable[str], Iterable[str]]],
+) -> dict[tuple[str, str], list[str]]:
+    """Which of a file's classes inherit each member from another class of
+    the file. `classes` are the file's classes as (name, the owner of its
+    members or None when unknown, its bases as written, its members'
+    names). Returns (member name, defining owner) -> the sorted heir keys
+    (graph/schema.py `HEIR_KEY` and the heir's members' owner) of every
+    class that defines no member of the name itself and whose nearest base
+    declared in the file defining one (bases walked depth first, left to
+    right, each once) is that owner's: `Base.save` gets `<User` for `class
+    User(Base)`, and so an owned pin to `User` (`from m import User;
+    User().save()`) reaches it. A base no class of the file is named is
+    not followed; several classes of one name are each walked."""
+    by_name: dict[str, list[tuple[str | None, list[str], set[str]]]] = {}
+    for name, owner, bases, members in classes:
+        by_name.setdefault(name, []).append((owner, list(bases), set(members)))
+    found: dict[tuple[str, str], set[str]] = {}
+    for name, infos in by_name.items():
+        for owner, bases, members in infos:
+            if owner is None:
+                continue
+            seen = {name}
+            resolved = set(members)
+
+            def walk(names: list[str]) -> None:
+                for base in names:
+                    if base in seen or base not in by_name:
+                        continue
+                    seen.add(base)
+                    for base_owner, _bases, base_members in by_name[base]:
+                        if base_owner is not None and base_owner != owner:
+                            for member in base_members - resolved:
+                                found.setdefault((member, base_owner), set()).add(HEIR_KEY + owner)
+                    resolved.update(member for _owner, _bases, each in by_name[base] for member in each)
+                    for _owner, base_bases, _members in by_name[base]:
+                        walk(base_bases)
+
+            walk(bases)
+    return {key: sorted(heirs) for key, heirs in found.items()}
+
+
+def add_heir_keys(
+    result: ExtractionResult, classes: Iterable[tuple[str, str | None, Iterable[str], Iterable[str]]],
+) -> None:
+    """Give each of `result`'s Functions the heir keys (`heir_keys`) of
+    `classes`, the file's classes, as its `mkeys`; a member no class of the
+    file inherits gets none."""
+    keys = heir_keys(classes)
+    for node in result.nodes:
+        heirs = keys.get((node.name, node.properties.get("owner") or "")) if node.label == "Function" else None
+        if heirs:
+            node.properties["mkeys"] = heirs
+
+
+def owner_matches(owners: Iterable[str | None], node_owner: str | None, keys: Iterable[str] = ()) -> bool:
+    """Whether a target end naming one of `owners` (None: any) links the
+    node of owner `node_owner` whose `mkeys` are `keys`: its own owner, or
+    one its heir keys (`heir_keys`) say inherits it. The engine's Cypher
+    mirrors this (graph/engine.py `_owner_test`)."""
+    keys = set(keys)
+    return any(owner is None or owner == node_owner or HEIR_KEY + owner in keys for owner in owners)
 
 
 def own_edges(result: ExtractionResult, file_path: str) -> ExtractionResult:

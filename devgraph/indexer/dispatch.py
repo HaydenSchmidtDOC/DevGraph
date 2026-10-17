@@ -38,11 +38,12 @@ from devgraph.config.project_schema import (
     schema_file_hash,
 )
 from devgraph.graph.engine import ABORTS_BATCH, GraphEngine, provision_repository_schema
-from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES, pin_kind, split_pin
+from devgraph.graph.schema import FILE_SCOPED_LABELS, HEIR_KEY, NODE_LABELS, RELATIONSHIP_TYPES, pin_kind, split_pin
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.common import (
     best_pin,
     name_ref_properties,
+    owner_matches,
     owners_by_pin,
     parse_name_ref,
     pin_confidence,
@@ -146,9 +147,12 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: anonymous companion object's members (owner `Class.Companion`); JSX
 #: component elements as calls; 17: JS/TS imports of a workspace package
 #: (package.json `workspaces`, pnpm-workspace.yaml) resolved to its entry
-#: point or subpath and its directory (resolver configuration).
+#: point or subpath and its directory (resolver configuration); 19: a
+#: method called on another file's Python, JS/TS or Java class narrowed to
+#: that class's member, its own or one it inherits from a class of its
+#: file (heir keys in `mkeys`).
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 17
+INDEX_FORMAT = 19
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -1417,11 +1421,12 @@ def _projects(
 
 def _shadow_keys(nodes) -> dict[tuple[str, str], set[str]]:
     """(label, name) -> the match keys of these (node, old mkeys, new mkeys)
-    of a file-scoped label, old and new together; a name whose nodes hold
-    none is left out."""
+    of a file-scoped label, old and new together, heir keys
+    (graph/schema.py `HEIR_KEY`) aside, which no `@` pin holds; a name
+    whose nodes hold none is left out."""
     found: dict[tuple[str, str], set[str]] = {}
     for node, old, new in nodes:
-        keys = set(old or ()) | set(new or ())
+        keys = {key for key in (*(old or ()), *(new or ())) if not key.startswith(HEIR_KEY)}
         if keys and node[0] in FILE_SCOPED_LABELS:
             found.setdefault(node[:2], set()).update(keys)
     return found
@@ -1558,8 +1563,9 @@ def _relink_name_refs(
                     # A path pin's row sees only its project's references (graph/engine.py `_visible`).
                     if pin is not None and pin_kind(pin) not in ("file", "fileless"):
                         pin = pin if visible_to((projects or {}).get(node), visible) else None
-                    # A pin that named its target's owner links only that owner's member.
-                    if pin is not None and (None in owners[pin] or to_owner in owners[pin]):
+                    # A pin that named its target's owner links only that owner's member,
+                    # its own or one it inherits from a class of its file.
+                    if pin is not None and owner_matches(owners[pin], to_owner, keys):
                         relink(
                             origin, fields, from_file, to_file, pin_confidence(pin, confidence), from_owner=owner,
                             to_owner=to_owner,

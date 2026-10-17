@@ -31,6 +31,8 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    add_heir_keys,
+    class_member_pin,
     member_owner,
     own_edges,
     owned_pin,
@@ -301,6 +303,12 @@ def _fixture_types(root: Node, source: bytes) -> dict[str, list[str]]:
     return fixtures
 
 
+def _class_like(name: str) -> bool:
+    """Whether a from-imported name reads as a class (CapWords), not an
+    instance (`config`, `DEFAULTS`)."""
+    return name[:1].isupper() and not name.isupper()
+
+
 def _direct_defs(block: Node | None, source: bytes) -> set[str]:
     """Names of the functions defined directly in a block (decorated or not)."""
     names: set[str] = set()
@@ -411,15 +419,17 @@ class _CallResolver:
         """Where a name read off an imported module or a from-imported name
         can be, as owned pins (common.owned_pin): a module's attribute is a
         top-level one (owner ""), and so is a submodule's; one read off a
-        from-imported name that is no module (a class, an instance) is any
-        of the name in its module, since a class can inherit it from a base
-        of that file."""
+        from-imported class (a CapWords name, `User.create()`) is the
+        class's member, its own or one it inherits from a class of its file
+        (common.heir_keys); one read off any other from-imported name (an
+        instance) is any of the name in its module."""
         ref = self.bindings.modules.get(receiver)
         if ref is not None:
             return [owned_pin(pin, "") for pin in ref.files() + ref.dirs()]
         symbol = self.bindings.symbols.get(receiver)
         if symbol is not None:
-            return symbol.module.files() + symbol.module.dirs() + [
+            owner = symbol.name if _class_like(symbol.name) else None
+            return [class_member_pin(pin, owner) for pin in symbol.module.files() + symbol.module.dirs()] + [
                 owned_pin(pin, "") for pin in symbol.submodule.files() + symbol.submodule.dirs()
             ]
         return None
@@ -427,16 +437,22 @@ class _CallResolver:
     def _class_pins(self, type_name: str, method: str) -> list[str] | None:
         """Where `method` of the class `type_name` (as written) can be. An
         in-file class is walked like `self.method()` (see _method_pins); an
-        imported one's method is any of the name in its files (its owner is
-        unknown: the class can inherit it from a base of its file)."""
+        imported one's method is the class's member in its files (its own,
+        or one it inherits from a class of its file, common.heir_keys); a
+        class read off a from-imported name (`x.User`) any of the name
+        there."""
         if type_name in self.classes:
             return self._method_pins(type_name, method, own=True)
         if "." in type_name:
-            pins = self._module_pins(type_name.rsplit(".", 1)[0])
-            return [split_owned_pin(pin)[0] for pin in pins] if pins is not None else None
+            head, cls = type_name.rsplit(".", 1)
+            pins = self._module_pins(head)
+            if pins is None:
+                return None
+            # A module's top-level class (owner "" pins) owns its members.
+            return [class_member_pin(base, cls if owner == "" else None) for base, owner in map(split_owned_pin, pins)]
         symbol = self.bindings.symbols.get(type_name)
         if symbol is not None:
-            return symbol.module.files() + symbol.module.dirs()
+            return [class_member_pin(pin, symbol.name) for pin in symbol.module.files() + symbol.module.dirs()]
         return None
 
     def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
@@ -731,7 +747,8 @@ def extract_python_file(
             )
         )
 
-    resolver = _CallResolver(file_path, bindings, _class_table(root, source_bytes), source_bytes)
+    class_table = _class_table(root, source_bytes)
+    resolver = _CallResolver(file_path, bindings, class_table, source_bytes)
     fixtures = _fixture_types(root, source_bytes)
     # (caller label, caller name, caller owner) -> callee name -> [pins, bare?, caller classes]
     calls: dict[tuple[str, str, str | None], dict[str, list]] = {}
@@ -956,6 +973,9 @@ def extract_python_file(
                 )
             )
 
+    add_heir_keys(result, [
+        (name, owner, info.bases, info.methods) for name, info in class_table.items() for owner in info.members_owners
+    ])
     return own_edges(result, file_path)
 
 

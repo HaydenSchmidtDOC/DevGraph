@@ -11,6 +11,7 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    heir_keys,
     member_owner,
     own_edges,
     owned_pin,
@@ -245,7 +246,9 @@ def test_cpp_specialisation_qualifier_and_nested_class_owners():
 
 def test_a_cross_file_call_names_the_owner_its_resolver_knows():
     """Python: an imported function is top-level (""); a method of an
-    imported class or instance names no owner (the class can inherit it)."""
+    imported class is the class's (its own or one it inherits from a class
+    of its file, which the heir keys there tell), but under a package
+    directory owner-less; a method of an imported instance names no owner."""
     result = extract_python_file(textwrap.dedent("""\
         from shop.models import Order, save, client
 
@@ -256,6 +259,9 @@ def test_a_cross_file_call_names_the_owner_its_resolver_knows():
 
         def sync():
             Order().save()
+
+
+        def push():
             client.save()
         """), "shop/jobs.py", "repo")
 
@@ -266,7 +272,33 @@ def test_a_cross_file_call_names_the_owner_its_resolver_knows():
         }
 
     assert ("shop/models.py", "") in rows("run") and ("shop/models.py", None) not in rows("run")
-    assert ("shop/models.py", None) in rows("sync") and ("shop/models.py", "Order") not in rows("sync")
+    assert ("shop/models.py", "Order") in rows("sync") and ("shop/models.py", None) not in rows("sync")
+    assert ("shop/models/", None) in rows("sync")
+    assert ("shop/models.py", None) in rows("push")
+
+
+def test_heir_keys_name_the_classes_inheriting_a_member_from_the_nearest_base():
+    assert heir_keys([
+        ("Base", "Base", [], ["save", "check"]), ("Mid", "Mid", ["Base"], ["check"]),
+        ("User", "User", ["Mid", "Missing"], []), ("Admin", "Admin", ["User"], ["save"]),
+        ("Local", None, ["Base"], []),
+    ]) == {
+        ("save", "Base"): ["<Mid", "<User"], ("check", "Mid"): ["<Admin", "<User"],
+    }
+
+
+@pytest.mark.parametrize("lang", ["python", "ts", "java"])
+def test_an_inherited_member_carries_its_heirs_keys(lang):
+    extract, path, source = {
+        "python": (extract_python_file, "app/m.py",
+                   "class Base:\n    def save(self):\n        pass\n\n\nclass User(Base):\n    pass\n"),
+        "ts": (extract_js_file, "app/m.ts", "class Base { save() {} }\nclass User extends Base {}\n"),
+        "java": (extract_java_file, "app/m/User.java",
+                 "package m;\nclass Base { void save() {} }\npublic class User extends Base {}\n"),
+    }[lang]
+    result = extract(source, path, "repo")
+    (save,) = [n for n in result.nodes if n.label == "Function" and n.name == "save"]
+    assert save.properties["owner"] == "Base" and save.properties["mkeys"] == ["<User"]
 
 
 def test_a_route_implements_its_handlers_owner():

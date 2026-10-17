@@ -71,6 +71,7 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # `shared_claims` the shared nodes its file claims (graph/engine.py
 # `SHARED_CLAIM_SEP`). `mkeys` is a
 # code symbol's match keys, which a pin's `@` flag tests (see `split_pin`),
+# and its heir keys (`HEIR_KEY`), which an owned target end tests,
 # and `mkeys_stale` marks one whose edges a batch has yet to relink after
 # they changed (see graph/engine.py `write_match_keys`). A code symbol's
 # `owner` (its identity within its file, see FILE_SCOPED_LABELS) and a C#
@@ -234,6 +235,12 @@ OWNER_PIN_SEP = "\x1c"
 #: The last field of a `name_refs` entry written since owners (index format
 #: 11), which no older entry's last field can be: its layout is then fixed.
 NAME_REF_OWNED = "\x1b"
+#: Starts a member's *heir key* among its `mkeys`: `Base.save` holds `<User`
+#: when `User`, a class of its file, inherits `save` from `Base`, the
+#: nearest base of the file defining it (common.heir_keys). A target end
+#: owned by `User` (an owned pin) links it too (graph/engine.py
+#: `_owner_test`). No C# match key starts with it.
+HEIR_KEY = "<"
 
 
 # Path pins: a relationship row's `to_file` (see devgraph/indexer/common.py

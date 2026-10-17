@@ -38,6 +38,8 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    add_heir_keys,
+    class_member_pin,
     own_edges,
     owned_pin,
 )
@@ -290,6 +292,7 @@ class _JavaResolver:
         # first capitalised segment picks the file); static members the same;
         # wildcard packages, and the classes of static wildcards.
         self.types: dict[str, tuple[list[str], str]] = {}
+        self.type_owners: dict[str, str] = {}
         self.statics: dict[str, tuple[list[str], str]] = {}
         self.static_wildcards: list[tuple[list[str], str]] = []
         self.wildcards: list[list[str]] = []
@@ -317,6 +320,8 @@ class _JavaResolver:
                     self.statics[segments[-1]] = owner
             elif not is_wildcard:
                 self.types[segments[-1]] = owner
+                # Its members' owner: a nested class's is dotted (`Settings.Defaults`).
+                self.type_owners[segments[-1]] = ".".join(segments[at:])
 
     # --- imports -------------------------------------------------------------
 
@@ -366,7 +371,7 @@ class _JavaResolver:
         is declared here and has it, else its bases', else the class's own
         file for a class declared elsewhere. A method of this file names its
         class as its owner (common.owned_pin), unless two classes of the file
-        share the name."""
+        share the name; another file's class's member names that class."""
         if cls in seen:
             return None
         if cls in self.methods:
@@ -377,9 +382,11 @@ class _JavaResolver:
             for base in self.bases.get(cls, []):
                 pins += self.member_pins(base, method, seen | {cls}) or []
             return pins or None
-        # Another file's class: any method of the name there (the class can
-        # inherit it from a base of its file).
-        return self.type_pins(cls)
+        # Another file's class: its member there, its own or one it inherits
+        # from a class of its file (common.heir_keys).
+        pins = self.type_pins(cls)
+        owner = self.type_owners.get(cls, cls)
+        return [class_member_pin(pin, owner) for pin in pins] if pins is not None else None
 
     # --- calls ---------------------------------------------------------------
 
@@ -749,6 +756,10 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
     visit_block(root, None, "Module", [])
     result.relationships += sites.rows(file_path, repo_id)
     _spring_routes(root, source_bytes, result, file_path, repo_id)
+    add_heir_keys(result, [
+        (name, owner, resolver.bases.get(name, []), methods)
+        for name, methods in resolver.methods.items() for owner in resolver.owners.get(name, ())
+    ])
 
     return own_edges(result, file_path)
 

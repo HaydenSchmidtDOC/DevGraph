@@ -78,6 +78,8 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    add_heir_keys,
+    class_member_pin,
     member_owner,
     own_edges,
     owned_pin,
@@ -519,6 +521,12 @@ class _Scope:
         return _Scope(self.cls, self.params | params, {**outer, **types})
 
 
+def _class_like(name: str) -> bool:
+    """Whether an imported name reads as a class (CapWords), not an
+    instance or a module object (`api`, `DEFAULTS`)."""
+    return name[:1].isupper() and not name.isupper()
+
+
 #: Globals a classic script calls that are never a script's own function.
 _JS_GLOBALS = frozenset({
     "fetch", "setTimeout", "setInterval", "clearTimeout", "clearInterval", "requestAnimationFrame", "parseInt",
@@ -779,9 +787,12 @@ class _CallResolver:
         head, dot, rest = type_name.partition(".")
         binding = self.bindings.get(head)
         if binding is not None and (dot == "" or binding.namespace):
-            # An imported class's method: any of the name there, since the
-            # class can inherit it from a base of its file.
-            return list(binding.pins or ())
+            # An imported class's method: the class's member there, its own
+            # or one it inherits from a class of its file (common.heir_keys);
+            # any of the name through a default import or a require, which
+            # can bind a class of another name.
+            owner = (rest if "." not in rest else None) if dot else binding.name
+            return [class_member_pin(pin, owner if binding.top_level else None) for pin in binding.pins or ()]
         return None
 
     def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
@@ -830,8 +841,11 @@ class _CallResolver:
             return None  # an untyped parameter shadows any import of its name
         binding = self.bindings.get(receiver)
         if binding is not None:
-            # An ES namespace's member is a module's top-level one; anything
-            # else's (a require, an imported class's static) any of the name.
+            # An ES namespace's member is a module's top-level one, a named
+            # import's of a class (a CapWords name) the class's (`_class_pins`);
+            # anything else's (a require, an instance) any of the name.
+            if binding.top_level and not binding.namespace and _class_like(binding.name):
+                return self._class_pins(receiver, method)
             owner = "" if binding.namespace and binding.top_level else None
             return [owned_pin(pin, owner) for pin in binding.pins or ()]
         if receiver in self.classes:
@@ -1098,9 +1112,9 @@ def extract_js_file(
             )
 
     bindings, module = _bindings(root, source_bytes, current_dir, config, file_path)
+    class_table = _class_table(root, source_bytes)
     resolver = _CallResolver(
-        file_path, bindings, _class_table(root, source_bytes), _defined_functions(root, source_bytes),
-        not module, source_bytes,
+        file_path, bindings, class_table, _defined_functions(root, source_bytes), not module, source_bytes,
     )
     # (caller label, caller name, caller owner)
     #   -> callee name -> [pins, bare?, caller classes, every bare site a member call?]
@@ -1359,6 +1373,9 @@ def extract_js_file(
                 no_self=no_self, caller_owner=caller_owner,
             ))
     _express_routes(root, source_bytes, resolver, result, file_path, repo_id)
+    add_heir_keys(result, [
+        (name, owner, info.bases, info.methods) for name, info in class_table.items() for owner in info.members_owners
+    ])
 
     return own_edges(result, file_path)
 

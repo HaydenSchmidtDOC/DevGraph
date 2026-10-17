@@ -156,6 +156,7 @@ class File:
     methods: list = field(default_factory=list)  # cpp: out-of-class definitions, "Widget::draw"
     block: bool = False  # cs: a block namespace, its `using`s inside it
     routes: list = field(default_factory=list)  # ts/java: (method, path, handler) routes
+    shared_on: str = "Base"  # py: the class defining `shared` besides Twin (`op_move_shared`)
 
     def copy(self):
         return replace(
@@ -166,12 +167,14 @@ class File:
         )
 
 
-def py_class(name: str, base: str | None) -> str:
-    """A class whose `act` calls `self.shared()`, which only `Base` and
-    `Twin` define: a `Twin` beside another class in one file repeats its
-    method names (two `act`s, maybe two `shared`s, each its own node)."""
+def py_class(name: str, base: str | None, shared_on: str = "Base") -> str:
+    """A class whose `act` calls `self.shared()`, which only `Twin` and
+    `shared_on` (`Base`, or `Mid` once it moved) define: a `Twin` beside
+    another class in one file repeats its method names (two `act`s, maybe
+    two `shared`s, each its own node), and a class of the file without one
+    inherits it from a base of the file that has it (its heir keys)."""
     head = f"\n\nclass {name}({base}):\n" if base else f"\n\nclass {name}:\n"
-    shared = "\n    def shared(self):\n        return 0\n" if name in ("Base", "Twin") else ""
+    shared = "\n    def shared(self):\n        return 0\n" if name in (shared_on, "Twin") else ""
     # Both also nest a `Meta` (two same-named classes of one file, each
     # with its own EXTENDS and `act`).
     meta = "\n    class Meta(Child):\n        def act(self):\n            return 1\n" if shared else ""
@@ -183,7 +186,7 @@ def render(f: File) -> str:
         # A Python file's imports are whole statements and its calls whole
         # call expressions (`helper()`, `b.helper()`, `obj.helper()`).
         parts = [f"{m}\n" for m in f.imports] + [f"# pin {p}\n" for p in f.pins]
-        parts += [py_class(c, b) for c, b in f.bases.items()]
+        parts += [py_class(c, b, f.shared_on) for c, b in f.bases.items()]
         parts += [
             f"\n\ndef {name}():\n" + "".join(f"    {g}\n" for g in calls) + "    return 0\n"
             for name, calls in f.funcs.items()
@@ -473,7 +476,7 @@ IMPORTS = {
     "py": [
         "import py.b", "import py.c as c", "from py.b import helper", "from py import b", "from .c import util",
         "from . import a", "from pkg import helper", "from pkg import *", "from py.b import *",
-        "from lib import util", "import pkg.impl", "from pkg.impl import pkgfn as alias",
+        "from lib import util", "import pkg.impl", "from pkg.impl import pkgfn as alias", "from py.b import Heir",
     ],
     "rs": ["use crate::display::Display;", "use crate::foo::Foo;", "use shop_core::util;", "mod display;",
            "use crate::util::tidy;", "use super::display::render;"],
@@ -489,13 +492,13 @@ IMPORTS = {
     "kt": ["kt.util.slug", "kt.util.*", "kt.Clock", "kt.helper"],
 }
 BASES = {
-    "py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "java": ["Base", "K"],
+    "py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base", "Mid"], "java": ["Base", "K"],
     "cs": ["Jobs", "Base", "Program", "Missing"], "cpp": ["Widget", "Gadget", "Missing"],
 }
 # How a Python call to `{n}` is written: bare, through a module or alias, on
 # an untyped value, on `self`, or on a literal.
 PY_CALLS = ["{n}()", "b.{n}()", "c.{n}()", "obj.{n}()", "pkg.impl.{n}()", "alias.{n}()", "self.{n}()", "''.{n}()",
-            "b.Twin().{n}()", "b.Base().{n}()"]
+            "b.Twin().{n}()", "b.Base().{n}()", "b.Heir().{n}()", "Heir().{n}()"]
 # Path pins of every kind over the fuzz's own paths (renames add `_rN` to a stem).
 CALL_PINS = ["py/.", ".", "pkg/.!other.py", "/b.py", "/lib/util.py", "/py/.", "/lib/.", "src/", "pkg/", "py/b.py"]
 IMPORT_PINS = ["py/.", "pkg/.", ".", "src/lib/.!core.py", "/b.py", "/util.py", "/impl.py"]
@@ -630,6 +633,31 @@ class Fuzz:
         beside = sorted(f.bases)[0]
         f.bases["Twin"] = None
         return f"add class Twin beside {beside} in {path}", {path}
+
+    def op_heir(self):
+        """A Python file with a class gains or loses `Mid` (of base `Base`)
+        or `Heir` (of base `Mid`), which inherit `shared` from a base of the
+        file; `op_base` changes their bases."""
+        path = self._pick(lambda f: f.kind == "py" and f.bases)
+        if not path:
+            return None
+        f = self.files[path]
+        name = self.rng.choice(["Mid", "Heir"])
+        if name in f.bases:
+            del f.bases[name]
+            return f"remove class {name} from {path}", {path}
+        f.bases[name] = {"Mid": "Base", "Heir": "Mid"}[name]
+        return f"add class {name}({f.bases[name]}) in {path}", {path}
+
+    def op_move_shared(self):
+        """`shared` moves between `Base` and `Mid` in a Python file, so the
+        classes inheriting it inherit it from another base."""
+        path = self._pick(lambda f: f.kind == "py" and f.bases)
+        if not path:
+            return None
+        f = self.files[path]
+        f.shared_on = "Mid" if f.shared_on == "Base" else "Base"
+        return f"move shared to {f.shared_on} in {path}", {path}
 
     def op_shadow(self):
         """A Python file with a class gains or loses a top-level `act`, the
@@ -843,7 +871,10 @@ class Fuzz:
 
     def op_rs_reexport(self):
         """Add or remove a `pub use` re-export of lib.rs or util.rs."""
-        path = self.rng.choice(sorted(p for p in RS_REEXPORTS if p in self.files))
+        paths = sorted(p for p in RS_REEXPORTS if p in self.files)
+        if not paths:
+            return None  # crates/core was deleted
+        path = self.rng.choice(paths)
         line = self.rng.choice(RS_REEXPORTS[path])
         imports = self.files[path].imports
         if line in imports:
@@ -1189,7 +1220,7 @@ class Fuzz:
         "rename", "delete", "restore", "service", "from", "move_image", "mention", "link", "supersedes", "pin", "pin",
         "config", "config", "delete_dir", "kt_class", "move_within_package", "move_java_module", "method", "method",
         "cs_csproj", "cs_csproj", "cs_global_using", "cs_global_using", "cs_move", "cs_namespace", "cs_move_class",
-        "cs_dup_class", "cs_shadow", "cs_shadow", "cs_reference", "cs_reference", "cs_project_move", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route",
+        "cs_dup_class", "cs_shadow", "cs_shadow", "cs_reference", "cs_reference", "cs_project_move", "twin", "twin", "heir", "heir", "move_shared", "move_shared", "shadow", "nested", "go_twin", "go_twin", "route",
         "route",
         "route_change", "route_move", "src_move", "src_move", "src_dir", "src_dir", "rs_reexport", "rs_reexport", "rs_reexport",
         "ws_rename", "ws_rename", "ws_main", "ws_main",

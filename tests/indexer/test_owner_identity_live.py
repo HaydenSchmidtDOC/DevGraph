@@ -443,9 +443,9 @@ def test_a_nested_function_is_owned_by_its_enclosing_functions(engine, repo):
 
 def test_a_call_into_another_file_reaches_the_owner_it_names(engine, repo):
     """`from m import A, save`: `save()` links the top-level `save` only;
-    `A().save()` every method `save` there (`A` could inherit it), never the
-    top-level one; and an incremental index, adding the siblings after the
-    caller, equals a fresh scan."""
+    `A().save()` A's method, never B's or the top-level one; and an
+    incremental index, adding the siblings after the caller, equals a fresh
+    scan."""
     root, _registry, repo_id = repo
     models = write(root, "shop/models.py", "def other():\n    return 0\n")
     write(root, "shop/jobs.py", """\
@@ -464,9 +464,7 @@ def test_a_call_into_another_file_reaches_the_owner_it_names(engine, repo):
         "RETURN b.owner AS owner, x.confidence AS confidence",
         {"r": repo_id},
     )
-    assert sorted((row["owner"], row["confidence"]) for row in rows) == [
-        ("", "resolved"), ("A", "resolved"), ("B", "resolved"),
-    ]
+    assert sorted((row["owner"], row["confidence"]) for row in rows) == [("", "resolved"), ("A", "resolved")]
     equals_fresh(engine, repo_id, root)
 
 
@@ -498,8 +496,9 @@ def _targets(engine, repo_id, caller):
 
 
 def test_a_method_of_another_files_class_links_as_before_owners(engine, repo):
-    """The owner of a method called on another file's class or instance is
-    unknown to the caller: an inherited `save`/`create`, an ALL_CAPS
+    """An inherited `save`/`create` of an imported class links the base of
+    its file that defines it (its heir keys); the owner of a method called
+    on another file's instance is unknown to the caller: an ALL_CAPS
     instance's method, a `require`d class's static, a default import of a
     class of another name all still link every member of the name there."""
     root, _registry, repo_id = repo
@@ -544,4 +543,80 @@ def test_a_method_of_another_files_class_links_as_before_owners(engine, repo):
     ]
     assert _targets(engine, repo_id, "build") == [("make", "web/svc.js", "Base")]
     assert _targets(engine, repo_id, "go") == [("start", "web/thing.ts", "ThingImpl")]
+    equals_fresh(engine, repo_id, root)
+
+
+INHERITED = """\
+    class Base:
+        def save(self):
+            return 1
+
+
+    class Mid(Base):
+        def check(self):
+            return 2
+
+
+    class User(Mid):
+        pass
+
+
+    class Other:
+        def save(self):
+            return 3
+
+        def check(self):
+            return 4
+    """
+
+
+@pytest.mark.parametrize("rel, source, caller_rel, caller", [
+    ("shop/models.py", INHERITED, "shop/jobs.py",
+     "from shop.models import User\n\n\ndef run():\n    User().save()\n    User().check()\n"),
+    ("web/models.ts",
+     "export class Base { save() { return 1; } }\nexport class Mid extends Base { check() { return 2; } }\n"
+     "export class User extends Mid {}\nexport class Other { save() { return 3; } check() { return 4; } }\n",
+     "web/jobs.ts", "import { User } from './models';\n\nexport function run() {\n  new User().save();\n"
+     "  new User().check();\n}\n"),
+    ("src/main/java/shop/User.java",
+     "package shop;\n\nclass Base { void save() {} }\n\nclass Mid extends Base { void check() {} }\n\n"
+     "public class User extends Mid {}\n\nclass Other { void save() {} void check() {} }\n",
+     "src/main/java/app/Jobs.java", "package app;\n\nimport shop.User;\n\npublic class Jobs {\n"
+     "    void run() { new User().save(); new User().check(); }\n}\n"),
+])
+def test_an_imported_classs_method_reaches_the_base_of_its_file_defining_it(
+    engine, repo, rel, source, caller_rel, caller,
+):
+    """`User().save()` on an imported `User` links the nearest base of
+    User's file defining `save` (Base), and `check` Mid's, never Other's
+    same-named members; a base-list change and an inherited method moving
+    between classes relink the caller, which is not re-indexed, as a fresh
+    scan links it."""
+    root, _registry, repo_id = repo
+    models = write(root, rel, source)
+    write(root, caller_rel, caller)
+    full_scan(engine, repo_id, root)
+    assert [(n, o) for n, _f, o in _targets(engine, repo_id, "run")] == [("check", "Mid"), ("save", "Base")]
+    equals_fresh(engine, repo_id, root)
+    # User no longer extends Mid: nothing of its file defines save or check for it.
+    models.write_text(models.read_text().replace("User(Mid)", "User").replace("User extends Mid", "User"))
+    index_paths(engine, repo_id, root, {models})
+    assert _targets(engine, repo_id, "run") == []
+    equals_fresh(engine, repo_id, root)
+    # Back, then `save` moves from Base to Mid (Base keeps none).
+    models.write_text(textwrap.dedent(source) if rel.endswith(".py") else source)
+    index_paths(engine, repo_id, root, {models})
+    assert [(n, o) for n, _f, o in _targets(engine, repo_id, "run")] == [("check", "Mid"), ("save", "Base")]
+    moved = models.read_text()
+    if rel.endswith(".py"):
+        moved = moved.replace("    def save(self):\n        return 1\n", "    pass\n", 1).replace(
+            "    def check(self):\n        return 2\n", "    def check(self):\n        return 2\n\n"
+            "    def save(self):\n        return 1\n", 1)
+    else:
+        moved = moved.replace("save() {", "unused() {", 1).replace("check() {", "save() { return 1; } check() {", 1) \
+            if rel.endswith(".ts") else moved.replace("void save() {}", "void unused() {}", 1).replace(
+                "void check() {}", "void save() {} void check() {}", 1)
+    models.write_text(moved)
+    index_paths(engine, repo_id, root, {models})
+    assert [(n, o) for n, _f, o in _targets(engine, repo_id, "run")] == [("check", "Mid"), ("save", "Mid")]
     equals_fresh(engine, repo_id, root)
