@@ -55,7 +55,8 @@ to another file's class), a Java class moves to the same package under
 another source root (another module), and a Rust crate's Cargo.toml renames
 it, moves its root file or stops declaring it, and its lib.rs and util.rs
 gain and lose `pub use` re-exports (by name, glob or alias, util.rs's
-re-exporting deep.rs's, so lib.rs's reach it through util.rs) that other
+re-exporting deep.rs's, so lib.rs's reach it through util.rs; a module
+re-exported as `below`; an inline `mod api` re-exporting) that other
 files call through `shop_core::`. An image
 moves between the Dockerfile and a compose service in one step, so its
 shared Container changes claimant.
@@ -513,7 +514,7 @@ KT_CALLS = ["{n}", "Clock().{n}", "x.{n}"]
 # How a Rust call to `{n}` is written: bare, through a module, a crate path,
 # another crate, a type, or on an untyped value.
 RS_CALLS = ["{n}", "display::{n}", "crate::foo::{n}", "shop_core::{n}", "shop_core::util::{n}", "Foo::{n}",
-            "x.{n}"]
+            "x.{n}", "shop_core::below::{n}", "shop_core::api::{n}", "crate::below::{n}"]
 # How a C# call to `{n}` is written: bare, on `this`/`base`, static, through
 # an alias, a qualified name or a nested type, on a new object, a typed field
 # or parameter, or an untyped object.
@@ -532,7 +533,9 @@ CPP_METHODS = ["Widget::draw", "Widget::size", "Gadget::run", "Missing::stop", "
 # The `pub use` re-exports lib.rs and util.rs of crates/core toggle.
 RS_REEXPORTS = {
     "crates/core/src/lib.rs": ["pub use util::tidy;", "pub use util::*;", "pub use util::tidy as neat;",
-                               "pub use util::dig;", "pub use deep::dig as neat;"],
+                               "pub use util::dig;", "pub use deep::dig as neat;", "pub use deep as below;",
+                               "pub use self::util as below;", "pub mod api { pub use crate::deep::dig; }",
+                               "pub mod api { pub use super::util::*; }"],
     "crates/core/src/util.rs": ["pub use crate::deep::dig;", "pub use crate::deep::*;", "pub use super::deep::dig;"],
 }
 # The roots the Python package `lib` moves between.

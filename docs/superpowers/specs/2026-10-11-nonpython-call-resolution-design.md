@@ -591,8 +591,19 @@ module only ranks below it. A function re-exported under another name (`pub use
 a::fetch as get;`) is called by its own name: `shop_core::get()` is a
 `CALLS` row to `fetch`, as is `get()` after a private `use a::fetch as
 get;` (whose row used to name `get`, which no function is). A `use` of a re-exported item also imports the
-defining module's file. An inline module's `pub use`, and a re-exported
-module (`pub use a::b;` then `crate::b::f()`), are not followed.
+defining module's file. Since index format 19, an inline module's `pub
+use` is read too: `reexports` records it as `[name, path, "a::b"]`, the
+inline module's path in its file, its head read in that module (its own
+`mod`s and `use`s), and a module `M::a::b` reads the re-exports a file of
+`M` records for `a::b` (`_reexport_entries`), so `mod api { pub use
+crate::net::fetch; }` in lib.rs makes `api::fetch()` there and
+`shop_core::api::fetch()` elsewhere reach net.rs. A re-exported module
+is followed as a path's module: walking a path (`_walk`), a lowercase
+segment is its child module and, when the module re-exports a module of
+the name (`pub use net::client;`), that module too (a glob's at package
+confidence), so `crate::client::fetch()`, `shop_core::client::fetch()`
+and `use shop_core::client;` then `client::fetch()` reach
+`net/client.rs`, which that `use` also imports.
 
 The arguments of a macro invocation (`println!("{}", shop_core::version())`,
 `assert_eq!(user.total(), 500)`) are reparsed as a call's arguments, so the
