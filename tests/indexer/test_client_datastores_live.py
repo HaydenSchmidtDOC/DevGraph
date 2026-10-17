@@ -62,7 +62,7 @@ SERVICES = {
         import org.apache.kafka.clients.producer.KafkaProducer;
 
         public class Events {
-            String url = "jdbc:postgresql://db:5432/billing";
+            Connection db = DriverManager.getConnection("jdbc:postgresql://db:5432/billing");
         }
         """, {("Queue", "Kafka"), ("Database", "PostgreSQL")}),
     "ledger": ("ledger/Store.kt", """\

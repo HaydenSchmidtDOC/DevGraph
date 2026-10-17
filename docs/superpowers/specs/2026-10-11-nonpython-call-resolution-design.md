@@ -1076,15 +1076,28 @@ file, and their edges).
 `get_service_dependencies` and `explain_architecture` listed no store for a
 JS/TS, Java, Kotlin, C# or Go service. `datastores/extractor.py`
 `client_datastores` now reads those languages' clients, by literal text only
-(a URL, driver or namespace built at run time is not read):
+(a URL, driver or namespace built at run time is not read). The text is the
+file's code with its comments removed and its string literals masked
+(`_masked`, a small lexer per family: `'`/`"`, `` ` `` in JS/TS and Go,
+Java/Kotlin text blocks, C# verbatim strings), so a comment never counts
+and a string counts only as an import specifier (an ES `import`/`export
+... from`, not a type-only `import type`/`export type`; `require`/`import()`;
+a Go import path) or, for a connection URL, a JDBC URL or a Go driver
+name, as an argument passed straight to a call (`new Pool('postgres://...')`,
+`DriverManager.getConnection("jdbc:...")`, `sql.Open("postgres", ...)`; a URL
+assigned to a variable or field first is not read). A Spring Data
+repository counts only in supertype position (after `extends`,
+`implements` or `:`, maybe after other supertypes). A file under a
+conventional test folder (`test/`, `tests/`, `__tests__/`, `src/test/`,
+`*.Tests/`) names no store, its fixtures being no service's use:
 
 | Language | Read |
 |---|---|
 | JS/TS | a module specifier (`import`, `from`, `require`, `import()`) of `pg`, `postgres`, `mysql`, `mysql2`, `mongodb`, `mongoose`, `sqlite3`, `better-sqlite3`, `neo4j-driver`, `@prisma/client`, `redis`, `ioredis`, `kafkajs`, `amqplib`, `@aws-sdk/client-s3`, `@aws-sdk/client-sqs` (or a subpath: `mysql2/promise`) |
-| Java, Kotlin | an import of (or below) `org.postgresql`, `com.mongodb`, Spring Data's `mongodb`/`jpa`/`neo4j`/`redis`, `org.neo4j.driver`, `redis.clients.jedis` (Jedis), `io.lettuce.core` (Lettuce), `org.apache.kafka.clients`, `org.springframework.kafka`, `com.rabbitmq.client`, `org.springframework.amqp`, the AWS SDK's `s3`/`sqs`; a JDBC URL literal (`"jdbc:postgresql:`, `mysql`, `mariadb`, `sqlserver`, `sqlite`, `oracle`, `h2`); a Spring Data repository supertype (`JpaRepository<`, `MongoRepository<`, `ReactiveMongoRepository<`, `Neo4jRepository<`, `CassandraRepository<`, `ElasticsearchRepository<`) |
+| Java, Kotlin | an import of (or below) `org.postgresql`, `com.mongodb`, Spring Data's `mongodb`/`jpa`/`neo4j`/`redis`, `org.neo4j.driver`, `redis.clients.jedis` (Jedis), `io.lettuce.core` (Lettuce), `org.apache.kafka.clients`, `org.springframework.kafka`, `com.rabbitmq.client`, `org.springframework.amqp`, the AWS SDK's `s3`/`sqs`; a JDBC URL passed to a call (`"jdbc:postgresql:`, `mysql`, `mariadb`, `sqlserver`, `sqlite`, `oracle`, `h2`); a Spring Data repository supertype (`JpaRepository<`, `MongoRepository<`, `ReactiveMongoRepository<`, `Neo4jRepository<`, `CassandraRepository<`, `ElasticsearchRepository<`) |
 | C# | a `using` of (or below) `Npgsql`, `Microsoft.Data.SqlClient`/`System.Data.SqlClient`, `Microsoft.Data.Sqlite`, `MySqlConnector`, `MySql.Data`, `MongoDB.Driver`, `StackExchange.Redis`, `Confluent.Kafka`, `RabbitMQ.Client`, `Amazon.S3`, `Amazon.SQS`; an EF Core provider call (`.UseNpgsql(`, `UseSqlServer`, `UseSqlite`, `UseMySql`, `UseCosmos`, `UseOracle`) and a `DbContext` subclass |
 | Go | an import of (or below) `github.com/lib/pq`, `github.com/jackc/pgx`, `github.com/go-sql-driver/mysql`, `github.com/mattn/go-sqlite3`, `modernc.org/sqlite`, `go.mongodb.org/mongo-driver`, `github.com/redis/go-redis`, `github.com/go-redis/redis`, `github.com/IBM/sarama`, `github.com/Shopify/sarama`, `github.com/segmentio/kafka-go`, `github.com/rabbitmq/amqp091-go`, the AWS SDK v2's `s3`/`sqs`; `sql.Open("<driver>", ...)` with a literal driver (`postgres`, `pgx`, `mysql`, `sqlite3`, `sqlserver`) |
-| all five | a connection URL at the start of a string literal: `postgres://`, `postgresql://`, `mysql://`, `mongodb://`, `mongodb+srv://`, `redis://`, `rediss://`, `amqp://`, `amqps://` |
+| all five | a connection URL passed to a call, at the start of its string literal: `postgres://`, `postgresql://`, `mysql://`, `mongodb://`, `mongodb+srv://`, `redis://`, `rediss://`, `amqp://`, `amqps://` |
 
 A store's identity is a Python client's: its provider, under its type's
 label (`Database`, `Cache`, `Queue`; `VectorStore` has no client here), so
