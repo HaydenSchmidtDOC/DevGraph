@@ -277,7 +277,19 @@ name in more files (`get`, `run`) the dependents of all of them are listed
 together, with a notice to pass `file`. Another definition of the same name
 can itself appear as a dependent. A name defined in one file answers as
 before, with no `target_files`. `file` takes `\` or `/`, with or without a
-leading `./`.
+leading `./` (`get_source` also takes an absolute path inside the repository).
+
+**Where an answer is, and one class's method**: every `find_callers` row
+names the caller's `file`, `owner` (the classes or functions it is declared
+in, `""` at the top level) and `start_line`, so `A.run` and `B.run` of one
+file are two rows told apart; a Module caller has no owner or line. Every
+`impact_analysis` dependent is `{name, type, file, owner}` (file and owner
+left out when it has none). `find_callers`, `impact_analysis` and
+`find_related_files` take `owner` to pick one class's method, as `get_source`
+and `describe_node` do, or a method named with its class (`A.run`,
+`A::run`) when no node has that exact name; an owner with no such member is
+an error. `get_source` on an unknown name (or one not in `file`, or of no
+such `owner`) is an error with similar names, never an all-null answer.
 
 **Response shape (`count`/`results`/`truncated`)**: `search_component`,
 `find_callers`, `list_services`, `list_endpoints`, `find_related_prs`, `issue_history_for`,

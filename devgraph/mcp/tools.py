@@ -14,6 +14,7 @@ query strings.
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 import os
@@ -133,13 +134,22 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
             f"RETURN collect(DISTINCT d) AS l{hop} }}"
         )
     transitive = " + ".join(f"l{k}" for k in range(2, IMPACT_MAX_DEPTH + 1))
-    ref = "{name: d.name, type: labels(d)[0]" + (", id: elementId(d)}" if with_ids else "}")
+    ref = (
+        "{name: d.name, type: labels(d)[0], file: coalesce(d.file, d.source_file), owner: "
+        + _OWNER_OF.format(v="d") + (", id: elementId(d)}" if with_ids else "}")
+    )
     parts.append(
         f"RETURN [d IN l1 | {ref}] AS direct_dependents, "
         f"[d IN {transitive} | {ref}] AS transitive_dependents, "
         "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched"
     )
     return "\n".join(parts)
+
+
+def _located(row: dict[str, Any]) -> dict[str, Any]:
+    """A result row without its unknown location: `file`, `owner` and
+    `start_line` dropped when None (a Module has no owner, a Service no line)."""
+    return {k: v for k, v in row.items() if v is not None or k not in ("file", "owner", "start_line")}
 
 
 @contextmanager
@@ -696,10 +706,16 @@ _TARGETS_RETURN = (
 )
 
 
-def _normalize_file(file: str | None) -> str | None:
-    """A repo-relative path as the graph stores it: `/` separators, no leading `./`."""
+def _normalize_file(file: str | None, root: Path | None = None) -> str | None:
+    """A repo-relative path as the graph stores it: `/` separators, no leading
+    `./`, and, given the repository's `root`, an absolute path inside it made
+    relative to it (case-insensitively on Windows)."""
     if file is None:
         return None
+    if root is not None and os.path.isabs(file):
+        prefix = os.path.normcase(os.path.normpath(str(root))) + os.sep
+        if os.path.normcase(os.path.normpath(file)).startswith(prefix):
+            file = os.path.normpath(file)[len(prefix):]
     file = file.replace("\\", "/")
     while file.startswith("./"):
         file = file[2:]
@@ -735,6 +751,29 @@ def _undeclared_targets(engine: GraphEngine, params: dict[str, Any], cross_repo:
     return rows
 
 
+def _owned_target(
+    engine: GraphEngine, repo_id: str, name: str, owner: str | None, cross_repo: bool, labels: tuple[str, ...]
+) -> tuple[str, str | None]:
+    """The (name, owner) a caller means: `owner` as given; else, when no node
+    is named `name` but it is a member named with its declarations (`A.run`,
+    `Outer::Inner.run`, `_owner_split`) and such a member exists, that
+    member and owner; else `name` with no owner."""
+    if owner is not None or _exists(engine, repo_id, name, labels, cross_repo):
+        return name, owner
+    owned = _owner_split(name)
+    if owned is None:
+        return name, None
+    split_owner, member = owned
+    params = {"name": member, "owner": split_owner, **({} if cross_repo else {"repo_id": repo_id})}
+    cypher = _named_nodes(labels, "name", cross_repo) + f"WITH n WHERE {_OWNER_MATCH} RETURN 1 LIMIT 1"
+    return (member, split_owner) if _query(engine, cypher, params) else (name, None)
+
+
+#: A node of `$owner` (`n.owner`, "" at the top level; only a node with a
+#: file has one), or any node when `$owner` is null.
+_OWNER_MATCH = "($owner IS NULL OR (n.file IS NOT NULL AND coalesce(n.owner, '') = $owner))"
+
+
 def _resolve_targets(
     engine: GraphEngine,
     repo_id: str,
@@ -743,6 +782,7 @@ def _resolve_targets(
     file: str | None,
     labels: tuple[str, ...],
     describe: bool = True,
+    owner: str | None = None,
 ) -> tuple[dict[str, Any] | None, tuple[str, ...], int]:
     """Look up the nodes named `name`. Returns `ambiguous_targets` (an envelope of
     their `{label, file}`, `repo_id` too when cross_repo, a file-less one with
@@ -753,12 +793,19 @@ def _resolve_targets(
     in use that are no built-in one (`_undeclared_targets`), so a node whose label
     the repository does not declare (any more) is still found, and its label is
     added to the returned ones. `describe` False skips building the envelope.
+    `owner` keeps only the nodes of that owner (`_OWNER_MATCH`).
 
     Raises:
-        ToolError: no node has that name, or none of them is in `file`.
+        ToolError: no node has that name (of `owner`), or none of them is in `file`.
     """
-    params = {"name": name} if cross_repo else {"name": name, "repo_id": repo_id}
-    rows = _query(engine, _named_nodes(labels, "name", cross_repo) + _TARGETS_RETURN, params)
+    params = {"name": name, "owner": owner, **({} if cross_repo else {"repo_id": repo_id})}
+    rows = _query(engine, _named_nodes(labels, "name", cross_repo) + f"WITH n WHERE {_OWNER_MATCH} " + _TARGETS_RETURN, params)
+    if not rows and owner is not None:
+        where = "any repository" if cross_repo else f"repository {_echo(repo_id)}"
+        raise ToolError(
+            f"no component named {_echo(name)} with owner {_echo(owner)} in {where}; "
+            "describe_node or get_source without owner lists the candidates with theirs."
+        )
     if not rows:
         rows = _undeclared_targets(engine, params, cross_repo)
         if not rows:
@@ -1375,6 +1422,7 @@ def find_callers(
     resolved_only: bool = False,
     file: str | None = None,
     extra_labels: tuple[str, ...] = (),
+    owner: str | None = None,
 ) -> dict[str, Any]:
     """Find all functions, services, or endpoints that call a given target.
 
@@ -1414,11 +1462,16 @@ def find_callers(
         file: Repo-relative path of the target's defining file, to pick one of
             several same-named targets
         extra_labels: The repository's declared labels, looked up besides the built-in ones
+        owner: The declarations the target is in ("" for a top-level one), to
+            pick a method of one class (`describe_node`'s `owner`); a target
+            named with them (`A.run`, `A::run`) does the same when no node has
+            that exact name
 
     Returns:
         Dict with count, results, and truncated flag containing callers with their
-        types, repo_id, file and confidence (same-named callers in different files
-        are separate rows); count 0 for a known target nothing calls. When targets
+        types, repo_id, file, owner and start_line (when the caller has them: a
+        Module has neither) and confidence (same-named callers are separate
+        rows, told apart by file and owner); count 0 for a known target nothing calls. When targets
         of that name lie in several files and `file` is not given, each row adds
         `target_files`, the files of the targets it calls (at most 10, with
         `target_file_count` past that; a file-less target is never listed), and
@@ -1433,7 +1486,9 @@ def find_callers(
     if modified_within_commits is not None:
         cutoff = _resolve_recency_cutoff(engine, repo_id, modified_within_commits)
     file = _normalize_file(file)
-    ambiguous, labels, _ = _resolve_targets(engine, repo_id, target_name, cross_repo, file, component_labels(extra_labels))
+    labels = component_labels(extra_labels)
+    target_name, owner = _owned_target(engine, repo_id, target_name, owner, cross_repo, labels)
+    ambiguous, labels, _ = _resolve_targets(engine, repo_id, target_name, cross_repo, file, labels, owner=owner)
     target_files = ", collect(DISTINCT target.file) AS target_files" if ambiguous else ""
 
     class_filter = "AND rel.caller_class = $scope_to_class" if scope_to_class else ""
@@ -1447,15 +1502,17 @@ def find_callers(
     {recency_filter}
     {resolved_filter}
     AND ($file IS NULL OR target.file = $file)
+    AND {_OWNER_MATCH.replace("n.", "target.")}
     WITH caller, min(CASE rel.confidence WHEN 'resolved' THEN 0 WHEN 'package' THEN 1 WHEN 'name' THEN 3
                      ELSE 2 END) AS rank{target_files}
     RETURN caller.name as name, labels(caller) as type, caller.repo_id as repo_id,
            coalesce(caller.file, caller.source_file) as file,
+           {_OWNER_OF.format(v="caller")} as owner, caller.start_line as start_line,
            CASE rank WHEN 0 THEN 'resolved' WHEN 1 THEN 'package' WHEN 3 THEN 'name' END as confidence{target_files and ", target_files"}
     ORDER BY rank, name, file
     LIMIT {LIST_ROW_LIMIT + 1}
     """
-    params = {"target_name": target_name, "file": file}
+    params = {"target_name": target_name, "file": file, "owner": owner}
     if not cross_repo:
         params["repo_id"] = repo_id
     if scope_to_class:
@@ -1464,6 +1521,7 @@ def find_callers(
         params["cutoff"] = cutoff
 
     results, more = _list_query(engine, cypher, params)
+    results = [_located(row) for row in results]
     if ambiguous:
         results = [_with_target_files(row, row["target_files"]) for row in results]
     envelope = _capped_envelope(results, more, max_results)
@@ -1480,6 +1538,7 @@ def find_related_files(
     max_results: int = 15,
     file: str | None = None,
     extra_labels: tuple[str, ...] = (),
+    owner: str | None = None,
 ) -> dict[str, Any]:
     """Find all files related to a component (via CONTAINS, IMPORTS, CALLS relationships).
 
@@ -1494,6 +1553,7 @@ def find_related_files(
         file: Repo-relative path of the component's defining file, to pick one of
             several same-named components
         extra_labels: The repository's declared labels, looked up besides the built-in ones
+        owner: The declarations the component is in, as in find_callers (`A.run` too)
 
     Returns:
         Dict with containing_modules, imported_modules, and related_components,
@@ -1511,12 +1571,12 @@ def find_related_files(
     """
     _at_least(1, max_results=max_results)
     file = _normalize_file(file)
-    ambiguous, labels, _ = _resolve_targets(
-        engine, repo_id, component_name, cross_repo, file, component_labels(extra_labels)
-    )
+    labels = component_labels(extra_labels)
+    component_name, owner = _owned_target(engine, repo_id, component_name, owner, cross_repo, labels)
+    ambiguous, labels, _ = _resolve_targets(engine, repo_id, component_name, cross_repo, file, labels, owner=owner)
     cypher = f"""
     {_named_nodes(labels, "component_name", cross_repo)}
-    WITH n WHERE $file IS NULL OR n.file = $file
+    WITH n WHERE ($file IS NULL OR n.file = $file) AND {_OWNER_MATCH}
     OPTIONAL MATCH (m:Module)-[:CONTAINS*]->(n)
     OPTIONAL MATCH (n)-[:IMPORTS]->(imported)
     OPTIONAL MATCH (n)-[:CALLS]->(related)
@@ -1527,7 +1587,7 @@ def find_related_files(
         COLLECT(DISTINCT related.name) as related_components
     ORDER BY target_file
     """
-    params = {"component_name": component_name, "file": file, "split": bool(ambiguous)}
+    params = {"component_name": component_name, "file": file, "owner": owner, "split": bool(ambiguous)}
     if not cross_repo:
         params["repo_id"] = repo_id
 
@@ -1729,6 +1789,7 @@ def impact_analysis(
     max_results: int = 15,
     file: str | None = None,
     extra_labels: tuple[str, ...] = (),
+    owner: str | None = None,
 ) -> dict[str, Any]:
     """Analyze the impact of changing a component on the rest of the system.
 
@@ -1745,9 +1806,11 @@ def impact_analysis(
         file: Repo-relative path of the component's defining file, to pick one of
             several same-named components
         extra_labels: The repository's declared labels, looked up besides the built-in ones
+        owner: The declarations the component is in, as in find_callers (`A.run` too)
 
     Returns:
-        Dict with direct_dependents and transitive_dependents wrapped as {count, results, truncated}
+        Dict with direct_dependents and transitive_dependents ({name, type, file,
+        owner}, file and owner left out when the dependent has none) wrapped as {count, results, truncated}
         envelopes, plus risk_level (computed from true untruncated count). Transitive
         dependents are 2 to `IMPACT_MAX_DEPTH` hops away; a node is listed at its
         nearest hop only, so a direct dependent is never also transitive. When
@@ -1767,15 +1830,17 @@ def impact_analysis(
     """
     _at_least(1, max_results=max_results)
     file = _normalize_file(file)
+    labels = component_labels(extra_labels)
+    component_name, owner = _owned_target(engine, repo_id, component_name, owner, cross_repo, labels)
     ambiguous, labels, files = _resolve_targets(
-        engine, repo_id, component_name, cross_repo, file, component_labels(extra_labels)
+        engine, repo_id, component_name, cross_repo, file, labels, owner=owner
     )
     # Each file's targets are traced apart only for a few files: the expansion
     # runs once per file, and a name like `get` is defined in hundreds.
     split = ambiguous is not None and files <= IMPACT_MAX_SPLIT
     cypher = f"""
     {_named_nodes(labels, "component_name", cross_repo)}
-    WITH n WHERE $file IS NULL OR n.file = $file
+    WITH n WHERE ($file IS NULL OR n.file = $file) AND {_OWNER_MATCH}
     WITH CASE WHEN $split THEN n.file END AS target_file, collect(n) AS l0
     CALL (l0) {{
     {_impact_expansion(cross_repo, with_ids=split)}
@@ -1783,7 +1848,7 @@ def impact_analysis(
     RETURN target_file, direct_dependents, transitive_dependents, direct_count
     ORDER BY target_file
     """
-    params = {"component_name": component_name, "file": file, "split": split}
+    params = {"component_name": component_name, "file": file, "owner": owner, "split": split}
     if not cross_repo:
         params["repo_id"] = repo_id
 
@@ -1791,8 +1856,8 @@ def impact_analysis(
     if not split:
         row = results[0]
         answer = {
-            "direct_dependents": _envelope(row["direct_dependents"], max_results),
-            "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
+            "direct_dependents": _envelope([_located(d) for d in row["direct_dependents"]], max_results),
+            "transitive_dependents": _envelope([_located(d) for d in row["transitive_dependents"]], max_results),
             "risk_level": _risk_level(row["direct_count"]),
         }
         if ambiguous:
@@ -1811,7 +1876,8 @@ def impact_analysis(
             for d in row[key]:
                 if key == "transitive_dependents" and d["id"] in direct_ids:
                     continue
-                entry = dependents.setdefault(d["id"], {"key": key, "row": {"name": d["name"], "type": d["type"]}, "files": []})
+                located = _located({k: v for k, v in d.items() if k != "id"})
+                entry = dependents.setdefault(d["id"], {"key": key, "row": located, "files": []})
                 entry["files"].append(row["target_file"])
     lists = {
         key: [_with_target_files(d["row"], d["files"]) for d in dependents.values() if d["key"] == key]
@@ -1994,8 +2060,8 @@ def impact_analysis_for_diff(
         "changed_symbols": symbols["changed"],
         "removed_symbols": symbols["removed"],
         "changed_components": sorted({m["name"] for m in row["matched"] if m["name"] is not None}),
-        "direct_dependents": _envelope(row["direct_dependents"], max_results),
-        "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
+        "direct_dependents": _envelope([_located(d) for d in row["direct_dependents"]], max_results),
+        "transitive_dependents": _envelope([_located(d) for d in row["transitive_dependents"]], max_results),
         "risk_level": _risk_level(row["direct_count"]),
         "truncated": bool(reasons),
         "truncated_reasons": list(reasons),
@@ -2536,8 +2602,8 @@ def get_source(
 
     Returns:
         Dict with name, label, file, start_line, end_line, source, and
-        docstring_full (when present). Empty/None fields if no match found.
-        When several nodes match, `source` is None and the dict adds
+        docstring_full (when present); source None when the file can't be
+        read. When several nodes match, `source` is None and the dict adds
         `status: "ambiguous"`, `count`, `truncated` and `candidates`
         ({label, name, file, owner}; repo_id too when cross_repo): pass one's
         `file` and `owner`. The result names its `owner` too.
@@ -2545,8 +2611,14 @@ def get_source(
         Python coding line, else UTF-8, else cp1252 or Latin-1; when an
         undeclared file is not valid UTF-8, or a file isn't valid in its
         declared codec, the dict adds a `notice` saying how it was decoded.
+
+    Raises:
+        ToolError: no Function or Class has that name (of `owner`, in `file`),
+            with similar names. An absolute `file` inside the repository is
+            read as its repo-relative path.
     """
-    file = _normalize_file(file)
+    session_repo = None if cross_repo else registry.get(repo_id)
+    file = _normalize_file(file, session_repo.path if session_repo is not None else None)
     repo_filter = _cross_scope("n", "AND") if cross_repo else "AND n.repo_id = $repo_id"
     def lookup(match: str) -> list[dict[str, Any]]:
         return _query(engine, f"""
@@ -2584,7 +2656,12 @@ def get_source(
         "start_line": None, "end_line": None, "source": None, "docstring_full": None,
     }
     if not results:
-        return empty
+        where = f" in file {_echo(file)}" if file is not None else ""
+        whose = f" with owner {_echo(owner)}" if owner is not None else ""
+        error = _not_found(engine, repo_id, "Function or Class", component_name, ("Function", "Class"), cross_repo)
+        if where or whose:
+            raise ToolError(f"no Function or Class named {_echo(component_name)}{whose}{where}. {error}")
+        raise error
 
     def label_of(row: dict[str, Any]) -> str:
         return next((label for label in row["labels"] if label in ("Function", "Class")), row["labels"][0])
