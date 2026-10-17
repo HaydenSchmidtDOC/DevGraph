@@ -11,6 +11,7 @@ from devgraph.graph.engine import GraphEngine
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import apply_project_schema, full_scan, index_paths, schema_pending
 from devgraph.indexer.schema_constraints import constraint_drift, generated_objects
+from tests.helpers import stub
 from tests.indexer.docs_live_helpers import assert_matches_fresh_apply
 
 REPO = "_smoketest_schema_apply"
@@ -274,7 +275,7 @@ def test_a_failed_apply_writes_no_docs_edges(engine, noted, monkeypatch):
     def refuse(*args, **kwargs):
         raise RuntimeError("provisioning refused")
 
-    monkeypatch.setattr(dispatch, "provision_repository_schema", refuse)
+    stub(monkeypatch, dispatch, "provision_repository_schema", refuse)
     full_scan(engine, REPO, noted)
     assert not schema_pending(engine, REPO, noted)  # still the applied schema: only apply's result gates it
     assert note_edges(engine) == []
@@ -429,7 +430,7 @@ def test_a_first_apply_under_another_repos_path_constraint_writes_unique_ids(
     write_schema(repo, keyed_schema("adr_id"))
     deferred = []
     real = dispatch._deferred_docs_labels
-    monkeypatch.setattr(dispatch, "_deferred_docs_labels", lambda *a: deferred.append(real(*a)) or deferred[-1])
+    stub(monkeypatch, dispatch, "_deferred_docs_labels", lambda *a: deferred.append(real(*a)) or deferred[-1])
 
     with caplog.at_level(logging.WARNING):
         scan(engine, repo)

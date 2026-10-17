@@ -19,6 +19,7 @@ import pytest
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
+from tests.helpers import stub
 
 
 @pytest.fixture
@@ -401,7 +402,7 @@ class TestRemovePaths:
             (temp_repo / "pkg" / "mod.py").unlink()
             calls = []
             original = engine.list_indexed_files
-            monkeypatch.setattr(engine, "list_indexed_files", lambda r: calls.append(r) or original(r))
+            stub(monkeypatch, engine, "list_indexed_files", lambda r: calls.append(r) or original(r))
             remove_paths(engine, repo_id, temp_repo, {temp_repo / "pkg" / "mod.py"})
             assert calls == [repo_id]
         finally:
@@ -909,7 +910,7 @@ class TestDeterministicIndexOrder:
             seen.append(rel_path)
             return 1
 
-        monkeypatch.setattr(dispatch, "_index_single_path", record)
+        stub(monkeypatch, dispatch, "_index_single_path", record)
         index_paths(_UnitEngine(), "_unit_order", temp_repo, {temp_repo / rel for rel in _ORDER_FIXTURE})
 
         assert seen == sorted(_ORDER_FIXTURE)
@@ -950,7 +951,7 @@ class TestDeterministicIndexOrder:
             seen.append(rel_path)
             return 1
 
-        monkeypatch.setattr(dispatch, "_index_single_path", record)
+        stub(monkeypatch, dispatch, "_index_single_path", record)
         # Leave the directory before temp_repo removes it: Windows can't delete the working directory.
         with monkeypatch.context() as m:
             m.chdir(temp_repo)
@@ -1082,7 +1083,7 @@ def _record_indexed(monkeypatch) -> list[str]:
         seen.append(rel_path)
         return original(engine, repo_id, repo_root, resolved, rel_path, *args)
 
-    monkeypatch.setattr(dispatch, "_index_single_path", record)
+    stub(monkeypatch, dispatch, "_index_single_path", record)
     return seen
 
 
@@ -1208,7 +1209,7 @@ class TestMentionRelinkBound:
                 relinked.append(Path(path).name)
             return original(engine, repo_id, path, repo_root, **kwargs)
 
-        monkeypatch.setattr(dispatch, "index_mentions_file", record)
+        stub(monkeypatch, dispatch, "index_mentions_file", record)
         return relinked
 
     def _mentioning(self, engine, repo_id: str, name: str) -> int:
@@ -1223,7 +1224,7 @@ class TestMentionRelinkBound:
         monkeypatch.setattr(dispatch, "_MAX_MENTION_RELINKS", 3)
         text_scans: list[set[str]] = []
         original = dispatch.mentions_any
-        monkeypatch.setattr(dispatch, "mentions_any", lambda content, names: text_scans.append(names) or original(content, names))
+        stub(monkeypatch, dispatch, "mentions_any", lambda content, names: text_scans.append(names) or original(content, names))
         try:
             full_scan(engine, repo_id, temp_repo, mentions_enabled=True)
             seen = _record_indexed(monkeypatch)
@@ -1327,7 +1328,7 @@ class TestFieldKeyedDocsApply:
 
         spec, files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
-        monkeypatch.setattr(dispatch, "schema_pending", lambda *args: False)
+        stub(monkeypatch, dispatch, "schema_pending", lambda *args: False)
         selected = docs.read_selected(spec, files)
         owners = docs.keyed_owners(docs.keyed_claims(spec, selected))
         dispatch._sync_docs_edges(engine, "demo", temp_repo, (spec, selected, owners))
@@ -1364,7 +1365,7 @@ class TestDeferredLabelWarning:
             "    metadata: [{name: path}, {name: adr_id}]\n",
             Path("devgraph.schema.yaml"),
         ))
-        monkeypatch.setattr(dispatch, "recorded_declarations", lambda engine: {"adr": [
+        stub(monkeypatch, dispatch, "recorded_declarations", lambda engine: {"adr": [
             ("demo", "Adr", ("adr_id",)), ("b", "Adr", ("path",)), ("c", "ADR", ("adr_id",)),
         ]})
         engine = _RecordingEngine()
@@ -1428,9 +1429,9 @@ def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
     outside = tmp_path / "outside.py"
     outside.write_text("y = 2\n")
     # As a junction to `outside` would be walked: linked, so keyed by its resolved target.
-    monkeypatch.setattr(walk, "_walk", lambda root, unreadable=None: iter([(repo / "a.py", "a.py", False), (outside, "j/outside.py", True)]))
+    stub(monkeypatch, walk, "_walk", lambda root, unreadable=None: iter([(repo / "a.py", "a.py", False), (outside, "j/outside.py", True)]))
     removed = []
-    monkeypatch.setattr(dispatch, "remove_paths", lambda engine, repo_id, root, paths: removed.append(paths) or len(paths))
+    stub(monkeypatch, dispatch, "remove_paths", lambda engine, repo_id, root, paths: removed.append(paths) or len(paths))
 
     class FakeEngine:
         def list_indexed_files(self, repo_id):

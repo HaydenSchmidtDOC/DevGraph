@@ -16,6 +16,7 @@ from devgraph.agent.sync import FAILURE_RETRY_DELAY_S, RepoSync
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import CatchUp
 from devgraph.registry.store import RepoRecord
+from tests.helpers import stub
 
 T0 = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
 REPO = "r"
@@ -237,9 +238,9 @@ def test_counts_come_from_index_paths(rig, monkeypatch, caplog):
     """3 files are due; index_paths indexed 7 (referrers included)."""
     for name in ("a.py", "b.py", "c.py"):
         (rig.root / name).write_text("x = 1\n")
-    monkeypatch.setattr(dispatch, "prune_stale_files", lambda *a, **k: 0)
-    monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: set())
-    monkeypatch.setattr(dispatch, "index_paths", lambda *a, **k: 7)
+    stub(monkeypatch, dispatch, "prune_stale_files", lambda *a, **k: 0)
+    stub(monkeypatch, dispatch, "_graph_files", lambda *a, **k: set())
+    stub(monkeypatch, dispatch, "index_paths", lambda *a, **k: 7)
     with caplog.at_level(logging.INFO, logger="devgraph.agent.sync"):
         rig.sync.on_catch_up(REPO, T0)
     assert rig.events[1]["changed"] == 7
@@ -296,8 +297,8 @@ def real_catch_up(rig, monkeypatch):
     """sync.catch_up is the real one over rig.root, with the graph stubbed:
     every walked file is known. Returns the files offered to index_paths."""
     offered: list[set[str]] = []
-    monkeypatch.setattr(dispatch, "prune_stale_files", lambda *a, **k: 0)
-    monkeypatch.setattr(dispatch, "schema_pending", lambda *a, **k: False)
+    stub(monkeypatch, dispatch, "prune_stale_files", lambda *a, **k: 0)
+    stub(monkeypatch, dispatch, "schema_pending", lambda *a, **k: False)
     monkeypatch.setattr(
         dispatch, "_graph_files", lambda *a, **k: {p.name for p in rig.root.iterdir() if p.is_file()}
     )
@@ -306,7 +307,7 @@ def real_catch_up(rig, monkeypatch):
         offered.append({p.name for p in paths})
         return len(paths)
 
-    monkeypatch.setattr(dispatch, "index_paths", index)
+    stub(monkeypatch, dispatch, "index_paths", index)
     return offered
 
 

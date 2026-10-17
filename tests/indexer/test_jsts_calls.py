@@ -12,6 +12,7 @@ import textwrap
 
 from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.resolver_config import ResolverConfig
+from tests.helpers import stub
 
 
 def calls(source, file_path="src/app.ts", config=None):
@@ -292,7 +293,7 @@ def test_the_index_upgrade_replaces_bare_js_calls(tmp_path, monkeypatch):
             return result
 
         with monkeypatch.context() as old:
-            old.setattr(dispatch, "extract_js_file", old_extract)
+            stub(old, dispatch, "extract_js_file", old_extract)
             provision_repository_schema(engine, tmp_path)
             engine.upsert_repository(repo_id, repo_id, str(tmp_path))
             dispatch.full_scan(engine, repo_id, tmp_path)

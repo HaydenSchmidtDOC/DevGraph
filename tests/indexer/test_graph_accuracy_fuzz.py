@@ -98,6 +98,7 @@ from devgraph.indexer.dispatch import (
     remove_paths,
     sync_resolver_config,
 )
+from tests.helpers import stub
 from tests.watcher.live_helpers import (
     fresh_snapshot,
     graph_snapshot,
@@ -1239,7 +1240,7 @@ def _with_pin_comments(monkeypatch):
         result.relationships += rows
         return result
 
-    monkeypatch.setattr(dispatch, "extract_python_file", extract)
+    stub(monkeypatch, dispatch, "extract_python_file", extract)
 
 
 @pytest.fixture(autouse=True)
@@ -1259,7 +1260,7 @@ def _with_cs_projects(monkeypatch):
         result.nodes[0].properties["fz_usings"] = [str(each) for each in usings]
         return result
 
-    monkeypatch.setattr(dispatch, "extract_csharp_file", extract)
+    stub(monkeypatch, dispatch, "extract_csharp_file", extract)
 
 
 def check(engine, repo_id, root, seed, step, log):
@@ -1408,7 +1409,7 @@ def test_cs_rekey_ops_retract_callers_in_other_files(engine, repo_id, tmp_path, 
                 )[0]["n"])
         return real(self, repo, nodes)
 
-    monkeypatch.setattr(GraphEngine, "write_match_keys", write_match_keys)
+    stub(monkeypatch, GraphEngine, "write_match_keys", write_match_keys)
     fuzz = Fuzz(random.Random(0))
     root = tmp_path
     fuzz.write(root, set(fuzz.files))

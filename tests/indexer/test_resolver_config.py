@@ -31,6 +31,7 @@ from devgraph.indexer.resolver_config import (
     parse_jsonc,
     touches_config,
 )
+from tests.helpers import stub
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 
@@ -678,7 +679,7 @@ def test_a_cut_short_re_index_keeps_the_old_fingerprint(engine, repo_id, tmp_pat
     def closed(*args, **kwargs):
         raise EngineClosed("shutting down")
 
-    monkeypatch.setattr(dispatch, "index_paths", closed)
+    stub(monkeypatch, dispatch, "index_paths", closed)
     with pytest.raises(EngineClosed):
         sync_resolver_config(engine, repo_id, tmp_path, {config})
     assert engine.read_resolver_config(repo_id) == stored

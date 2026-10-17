@@ -11,6 +11,7 @@ from devgraph.graph import engine as engine_module
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph.schema import RESERVED_NODE_PROPERTIES
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
+from tests.helpers import stub
 
 _RUN = uuid.uuid4().hex[:8]
 
@@ -185,7 +186,7 @@ def _write_insight_during(monkeypatch, engine, repo_id, step):
             thread.join(timeout=0.5)  # blocks on the node's lock when the read took it
         return original(props)
 
-    monkeypatch.setattr(engine_module, "_claims_of", claims_of)
+    stub(monkeypatch, engine_module, "_claims_of", claims_of)
     step()
     writer[0].join()
 

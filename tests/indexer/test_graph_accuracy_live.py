@@ -19,6 +19,7 @@ from devgraph.indexer.apis import extractor as apis_extractor
 from devgraph.indexer.apis.extractor import Relationship
 from devgraph.indexer.common import GraphRelationship
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
+from tests.helpers import stub
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 _TOKEN = uuid.uuid4().hex[:8]
@@ -1169,7 +1170,7 @@ def test_relink_reads_no_files(engine, repo_id, tmp_path, monkeypatch):
         return real_dispatch_read(path)
 
     monkeypatch.setattr(Path, "read_text", read_text)
-    monkeypatch.setattr(dispatch, "_read_text", dispatch_read)
+    stub(monkeypatch, dispatch, "_read_text", dispatch_read)
     index_paths(engine, repo_id, tmp_path, {b})
     monkeypatch.undo()
 
@@ -1199,7 +1200,7 @@ def _with_pinned_calls(monkeypatch, rows):
             ]
         return result
 
-    monkeypatch.setattr(dispatch, "extract_python_file", extract)
+    stub(monkeypatch, dispatch, "extract_python_file", extract)
 
 
 def _call_props(engine, repo_id):
@@ -1516,7 +1517,7 @@ def test_per_file_save_cost_ignores_other_repositories(engine, repo_id, tmp_path
         seen.append(rel_path)
         return original(engine, repo_id, repo_root, resolved, rel_path, *args)
 
-    monkeypatch.setattr(dispatch, "_index_single_path", record)
+    stub(monkeypatch, dispatch, "_index_single_path", record)
     elapsed = {}
     for rel in _SAVE_COST_FIXTURE:
         # Locally the fastest of three saves, to keep a busy machine's noise out.
@@ -1577,7 +1578,7 @@ def test_failed_full_scan_leaves_the_index_unstamped(engine, repo_id, tmp_path, 
     def broken(*args, **kwargs):
         raise RuntimeError("scan interrupted")
 
-    monkeypatch.setattr(dispatch, "index_paths", broken)
+    stub(monkeypatch, dispatch, "index_paths", broken)
     with pytest.raises(RuntimeError, match="scan interrupted"):
         scan(engine, repo_id, tmp_path)
     assert not engine.index_format(repo_id)  # 0: unstamped while the scan ran

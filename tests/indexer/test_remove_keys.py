@@ -7,6 +7,7 @@ import pytest
 
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import _gone_key, _present, remove_paths
+from tests.helpers import stub
 
 
 class _GraphFilesEngine:
@@ -49,8 +50,8 @@ def providers(monkeypatch):
     """Both provider passes declared; records what each one is given."""
     seen: dict[str, set[str]] = {}
     fs_spec = SimpleNamespace(file_label="File", folder_label="Folder")
-    monkeypatch.setattr(dispatch, "_provider_specs", lambda root: (True, fs_spec, SimpleNamespace(types=[])))
-    monkeypatch.setattr(dispatch, "schema_pending", lambda engine, repo_id, root: False)
+    stub(monkeypatch, dispatch, "_provider_specs", lambda root: (True, fs_spec, SimpleNamespace(types=[])))
+    stub(monkeypatch, dispatch, "schema_pending", lambda engine, repo_id, root: False)
     monkeypatch.setattr(
         dispatch.filesystem, "sync_absent",
         lambda engine, repo_id, root, spec, paths, **kw: seen.__setitem__("filesystem", set(paths)),
@@ -156,7 +157,7 @@ def test_a_recreated_file_below_a_gone_folder_is_kept(tmp_path, providers):
 
 def test_one_schema_resolve_per_call(tmp_path, monkeypatch):
     calls = []
-    monkeypatch.setattr(dispatch, "schema_pending", lambda engine, repo_id, root: calls.append("pending") or False)
-    monkeypatch.setattr(dispatch, "_provider_specs", lambda root: calls.append("specs") or (True, None, None))
+    stub(monkeypatch, dispatch, "schema_pending", lambda engine, repo_id, root: calls.append("pending") or False)
+    stub(monkeypatch, dispatch, "_provider_specs", lambda root: calls.append("specs") or (True, None, None))
     remove_paths(_GraphFilesEngine({"pkg/x.py"}), "_unit", tmp_path, {tmp_path / "pkg"})
     assert calls == ["pending", "specs"]

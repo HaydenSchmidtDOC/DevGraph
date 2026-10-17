@@ -13,6 +13,7 @@ from devgraph.dashboard import queries
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import full_scan
+from tests.helpers import stub
 
 URI, AUTH = "bolt://127.0.0.1:7687", ("neo4j", "devgraph-local-dev")
 # Unique per run: the schema's generated constraints are database-wide.
@@ -198,7 +199,7 @@ def test_an_apply_cut_short_records_its_labels_first(engine, repo_id, tmp_path, 
     def crash(*args, **kwargs):
         raise RuntimeError("killed")
 
-    monkeypatch.setattr(engine, "record_applied_schema", crash)
+    stub(monkeypatch, engine, "record_applied_schema", crash)
     with pytest.raises(RuntimeError):
         dispatch.apply_project_schema(engine, repo_id, tmp_path)
     monkeypatch.undo()
