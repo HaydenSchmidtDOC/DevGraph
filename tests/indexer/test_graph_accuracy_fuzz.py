@@ -67,7 +67,8 @@ Module's pinned CALLS and IMPORTS rows (`_with_pin_comments`), so every pin
 kind is written, relinked and removed as files come and go.
 
 The spec's "Out of scope" gaps are left out by construction:
-- compose services have `image:` only, never `build:`;
+- a compose service's `build:` context comes, moves and goes (`op_build`),
+  so the files under it change owning Service;
 - datastore clients only as imports (`op_datastore`), and routes only in
   Express (TS) and Spring (Java) files,
   which add, drop and change routes and move a handler (`op_route`,
@@ -157,13 +158,14 @@ class File:
     methods: list = field(default_factory=list)  # cpp: out-of-class definitions, "Widget::draw"
     block: bool = False  # cs: a block namespace, its `using`s inside it
     routes: list = field(default_factory=list)  # ts/java: (method, path, handler) routes
+    builds: dict = field(default_factory=dict)  # compose: service -> build context
 
     def copy(self):
         return replace(
             self, imports=list(self.imports), bases=dict(self.bases),
             funcs={k: list(v) for k, v in self.funcs.items()}, services=dict(self.services),
             froms=list(self.froms), mentions=list(self.mentions), links=list(self.links), pins=list(self.pins),
-            methods=list(self.methods), routes=list(self.routes),
+            methods=list(self.methods), routes=list(self.routes), builds=dict(self.builds),
         )
 
 
@@ -283,8 +285,10 @@ def render(f: File) -> str:
             ]
         return "".join(parts) or "export {};\n"
     if f.kind == "compose":
-        return "services:\n" + "".join(f"  {s}:\n    image: {i}\n" for s, i in f.services.items()) if f.services \
-            else "services: {}\n"
+        return "services:\n" + "".join(
+            f"  {s}:\n    image: {i}\n" + (f"    build: ./{f.builds[s]}\n" if s in f.builds else "")
+            for s, i in f.services.items()
+        ) if f.services else "services: {}\n"
     if f.kind == "docker":
         return "".join(f"FROM {i}\nRUN true\n" for i in f.froms) or "# No stages.\n"
     if f.kind == "notes":
@@ -462,7 +466,7 @@ def initial_repo() -> dict:
         "go/a/a.go": File("go", head="a", imports=["example.com/fz/b"], funcs={"Start": ["Serve"]}),
         "go/b/b.go": File("go", head="b", extra=GO_SERVER, funcs={"Serve": [], "Stop": []}),
         "go/b/halt.go": File("go", head="b", funcs={"Halt": ["Stop"]}),
-        "compose.yaml": File("compose", services={"api": "alpine:3.20", "web": "nginx:1.27"}),
+        "compose.yaml": File("compose", services={"api": "alpine:3.20", "web": "nginx:1.27"}, builds={"api": "ts", "web": "py"}),
         "Dockerfile": File("docker", froms=["python:3.12"]),
         "notes.md": File("notes", mentions=["helper", "Foo", "Base", "K", "Serve", "api", "python", "nginx"]),
         "docs/adr-1.md": File("note", head="ADR-1", links=["py/a.py"]),
@@ -547,6 +551,8 @@ PY_ROOTS = ["src/", "", "code/"]
 # The source roots a Java file moves between (another Maven module).
 JAVA_ROOTS = ["java/", "lib/src/main/java/"]
 SERVICES = ["api", "web", "worker", "db"]
+# The folders a compose service builds from (ts/src inside ts: the nearest wins).
+BUILD_CONTEXTS = ["py", "ts", "ts/src", "java", "go", "cs", "kt", "pkg"]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
 EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing", "act", "shared"]
 CODE = ("py", "rs", "go", "java", "ts", "kt", "cs", "cpp")
@@ -867,7 +873,10 @@ class Fuzz:
 
     def op_rs_reexport(self):
         """Add or remove a `pub use` re-export of lib.rs or util.rs."""
-        path = self.rng.choice(sorted(p for p in RS_REEXPORTS if p in self.files))
+        paths = sorted(p for p in RS_REEXPORTS if p in self.files)
+        if not paths:  # both deleted
+            return None
+        path = self.rng.choice(paths)
         line = self.rng.choice(RS_REEXPORTS[path])
         imports = self.files[path].imports
         if line in imports:
@@ -1138,6 +1147,21 @@ class Fuzz:
         services[name] = self.rng.choice(IMAGES)
         return f"add service {name} ({services[name]}) in {path}", {path}
 
+    def op_build(self):
+        """Give a compose service a build context, move it or take it away:
+        the files under it change owning Service (their Endpoints' CALLS and
+        their stores' USES), the nearest context winning."""
+        path = self._pick(lambda f: f.kind == "compose" and f.services)
+        if not path:
+            return None
+        f = self.files[path]
+        name = self.rng.choice(sorted(f.services))
+        if name in f.builds and self.rng.random() < 0.4:
+            del f.builds[name]
+            return f"remove build of {name} in {path}", {path}
+        f.builds[name] = self.rng.choice(BUILD_CONTEXTS)
+        return f"build {name} from {f.builds[name]} in {path}", {path}
+
     def op_from(self):
         path = self._pick(lambda f: f.kind == "docker")
         if not path:
@@ -1217,6 +1241,7 @@ class Fuzz:
         "route",
         "route_change", "route_move", "src_move", "src_move", "src_dir", "src_dir", "rs_reexport", "rs_reexport", "rs_reexport",
         "ws_rename", "ws_rename", "ws_main", "ws_main", "datastore", "datastore",
+        "build", "build", "build",
     ]
 
     def draw(self):

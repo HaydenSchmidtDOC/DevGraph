@@ -40,6 +40,7 @@ from devgraph.config.project_schema import (
 from devgraph.graph.engine import (
     ABORTS_BATCH,
     OWNING_SERVICE_TARGETS,
+    SERVICE_API_SUFFIXES,
     GraphEngine,
     provision_repository_schema,
 )
@@ -1068,6 +1069,10 @@ def index_paths(
         for rel_path, stores in sorted(client_stores.items()):
             service_rels.extend(_datastore_service_relationships(repo_id, rel_path, stores, services))
         engine.upsert_relationships(service_rels)
+    # A compose file changed which Service owns which folder: the files
+    # outside the batch that wrote owning-service edges are owned anew.
+    if relink_outside and any(_is_compose(rel_path) for rel_path in by_rel_path):
+        _relink_owning_services(engine, repo_id, set(by_rel_path) | referrers)
 
     if providers_ok and fs_spec is not None:
         filesystem.sync_present(engine, repo_id, fs_spec, present)
@@ -1936,6 +1941,8 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
         engine.update_skipped_files(repo_id, drop=removed)
     if shadow_names:
         _relink_name_refs(engine, repo_id, set(), removed, shadow_names=shadow_names)
+    if any(_is_compose(rel) for rel in removed):
+        _relink_owning_services(engine, repo_id, set())
 
     ok, fs_spec, docs_spec = specs
     if removed:
@@ -2414,7 +2421,8 @@ def _upsert_container_result(engine: GraphEngine, repo_id: str, rel_path: str, r
         {"label": "Container", "repo_id": repo_id, "name": c.name, "properties": {**c.properties, "image": c.image}}
         for c in result.containers
     ] + [
-        {"label": "Service", "repo_id": repo_id, "name": s.name, "properties": s.properties}
+        # A build context the service no longer has is cleared (a None removes it).
+        {"label": "Service", "repo_id": repo_id, "name": s.name, "properties": {"build_context": None, **s.properties}}
         for s in result.services
     ]
     # A replace, so a service or stage the file no longer declares is
@@ -2432,6 +2440,51 @@ def _datastore_nodes(repo_id: str, rel_path: str, content: str, language: str = 
     else:
         datastores = client_datastores(content, language, repo_id, rel_path)
     return [{"label": ds.datastore_type, "repo_id": repo_id, "name": ds.name, "properties": ds.properties} for ds in datastores]
+
+
+def _is_compose(rel_path: str) -> bool:
+    """Whether a repo-relative path is a compose file (`_routes`)."""
+    return posixpath.basename(rel_path).lower() in _COMPOSE_NAMES
+
+
+def _relink_owning_services(engine: GraphEngine, repo_id: str, skip: set[str]) -> None:
+    """Re-derive the owning-service edges of the files outside `skip` after a
+    compose change: each claimed Endpoint's `CALLS` and datastore's `USES`
+    (`_endpoint_service_relationships`, `_datastore_service_relationships`)
+    are a function of its claiming file's path and the repository's Services'
+    build contexts, so a file the change gives another owning Service (or
+    none) is unclaimed from its old edges and writes its new ones, as a
+    fresh scan would have them. Read from the graph: no file is read. The
+    files in `skip` (the batch's) wrote theirs already."""
+    services = _load_services_with_build_context(engine, repo_id)
+    claims, edges = engine.owning_service_state(repo_id)
+    expected = set()
+    for label, name, sources in claims:
+        for source in sources:
+            owner = _match_owning_service(services, source)
+            if source not in skip and source.endswith(SERVICE_API_SUFFIXES) and owner is not None:
+                expected.add((label, name, owner, services[owner][1], source))
+    written = {
+        (edge["label"], edge["name"], edge["service"], edge["service_file"], origin)
+        for edge in edges for origin in edge["origins"] or [] if origin not in skip
+    }
+    engine.unclaim_owning_service_edges(repo_id, [
+        dict(zip(("label", "name", "service", "service_file", "origin"), row)) for row in sorted(written - expected)
+    ])
+    rels = []
+    for label, name, service, service_file, origin in sorted(expected - written):
+        if label == "Endpoint":
+            rels.append({
+                "from_label": "Endpoint", "from_name": name, "rel_type": "CALLS", "to_label": "Service",
+                "to_name": service, "to_file": service_file, "repo_id": repo_id, "properties": {}, "origin": origin,
+            })
+        else:
+            rels.append({
+                "from_label": "Service", "from_name": service, "from_file": service_file, "rel_type": "USES",
+                "to_label": label, "to_name": name, "repo_id": repo_id, "properties": {}, "origin": origin,
+            })
+    if rels:
+        engine.upsert_relationships(rels)
 
 
 def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict[str, tuple[str, str]]:

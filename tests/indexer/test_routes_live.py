@@ -278,3 +278,43 @@ def test_two_writes_of_one_file_take_turns_on_its_record(engine, repo_id, tmp_pa
     assert done.is_set()
     assert _endpoint_sources(engine, repo_id) == [("GET /orders", ("web/routes.ts",))]
     incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def _owners(engine, repo_id):
+    return sorted(
+        (row["e"], row["s"], tuple(row["o"]))
+        for row in engine.run_cypher(
+            "MATCH (e:Endpoint {repo_id: $r})-[c:CALLS]->(s:Service) RETURN e.name AS e, s.name AS s, c.origins AS o "
+            "UNION ALL MATCH (s:Service {repo_id: $r})-[c:USES]->(d) RETURN d.name AS e, s.name AS s, c.origins AS o",
+            {"r": repo_id},
+        )
+    )
+
+
+def test_a_compose_change_re_owns_the_files_outside_its_batch(engine, repo_id, tmp_path):
+    """A compose file's `build:` change alone (the route and client files
+    unchanged) moves their Endpoints' CALLS and stores' USES to the Service
+    that owns them now, as a fresh scan has them; deleting it drops them."""
+    compose = write(tmp_path, "compose.yaml", "services:\n  shop:\n    build: ./services\n")
+    write(tmp_path, "services/shop/routes.ts", ROUTED)
+    write(tmp_path, "services/shop/db.py", "import redis\n")
+    write(tmp_path, "services/admin/main.go", (
+        'package main\n\nimport "net/http"\n\nfunc main() {\n\thttp.HandleFunc("GET /admin", h)\n}\n\n'
+        "func h(w http.ResponseWriter, r *http.Request) {}\n"
+    ))
+    _scan(engine, repo_id, tmp_path)
+    assert {owner for _e, owner, _o in _owners(engine, repo_id)} == {"shop"}
+
+    for text in (
+        "services:\n  shop:\n    build: ./services/shop\n  admin:\n    build: ./services/admin\n",
+        "services:\n  shop:\n    build: ./services/shop\n  admin:\n    build: ./services\n",
+        "services:\n  shop:\n    image: shop:1\n  admin:\n    build: ./services\n",
+    ):
+        write(tmp_path, "compose.yaml", text)
+        index_paths(engine, repo_id, tmp_path, {compose})
+        incremental_equals_fresh(engine, repo_id, tmp_path)
+    assert {owner for _e, owner, _o in _owners(engine, repo_id)} == {"admin"}
+    compose.unlink()
+    remove_paths(engine, repo_id, tmp_path, {compose})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+    assert _owners(engine, repo_id) == []

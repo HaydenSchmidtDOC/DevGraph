@@ -2009,6 +2009,63 @@ class GraphEngine:
             )
             return {(record["label"], record["name"]): set(record["sources"]) for record in result or []}
 
+    def owning_service_state(self, repo_id: str) -> tuple[list[tuple[str, str, list[str]]], list[dict[str, Any]]]:
+        """What the owning-service pass (indexer/dispatch.py) wrote, for a
+        compose change to re-derive: every claimed Endpoint and datastore
+        node as (label, name, its claiming files), and every Endpoint
+        `CALLS` Service and Service `USES` datastore edge as {label, name
+        (the Endpoint or datastore), service, service_file, origins}."""
+        labels = ("Endpoint", *OWNING_SERVICE_TARGETS)
+        with self._driver.session() as session:
+            claims = _run_records(
+                session,
+                _union(_seek(label, "source", "IS NOT NULL") for label in labels)
+                + "WITH n WHERE n.file IS NULL "
+                "RETURN labels(n)[0] AS label, n.name AS name, coalesce(n.sources, [n.source]) AS sources",
+                repo_id=repo_id,
+            )
+            edges = _run_records(
+                session,
+                "MATCH (s:Service) USING INDEX SEEK s:Service(repo_id, name) "
+                "WHERE s.repo_id = $repo_id AND s.name IS NOT NULL "
+                "CALL (s) { "
+                "  MATCH (e:Endpoint)-[r:CALLS]->(s) RETURN 'Endpoint' AS label, e.name AS name, r.origins AS origins "
+                "  UNION "
+                "  MATCH (s)-[r:USES]->(d) WHERE " + " OR ".join(f"d:{label}" for label in OWNING_SERVICE_TARGETS)
+                + "  RETURN labels(d)[0] AS label, d.name AS name, r.origins AS origins "
+                "} "
+                "RETURN label, name, s.name AS service, s.file AS service_file, origins",
+                repo_id=repo_id,
+            )
+        return (
+            [(record["label"], record["name"], list(record["sources"])) for record in claims],
+            [dict(record) for record in edges],
+        )
+
+    def unclaim_owning_service_edges(self, repo_id: str, rows: list[dict[str, Any]]) -> None:
+        """Drop `origin` from each owning-service edge of `rows` ({label, name,
+        service, service_file, origin}, as `owning_service_state` lists the
+        edges), deleting an edge left with none."""
+        if not rows:
+            return
+        calls = [row for row in rows if row["label"] == "Endpoint"]
+        uses = [row for row in rows if row["label"] != "Endpoint"]
+        unclaim = (
+            "WITH r, row, [x IN coalesce(r.origins, [row.origin]) WHERE x <> row.origin] AS left "
+            "FOREACH (_ IN CASE WHEN size(left) = 0 THEN [1] ELSE [] END | DELETE r) "
+            "FOREACH (_ IN CASE WHEN size(left) > 0 THEN [1] ELSE [] END | SET r.origins = left)"
+        )
+        service = "(s:Service {repo_id: $repo_id, name: row.service, file: row.service_file})"
+        with self._driver.session() as session:
+            if calls:
+                _run(session, "UNWIND $rows AS row "
+                     f"MATCH (e:Endpoint {{repo_id: $repo_id, name: row.name}})-[r:CALLS]->{service} " + unclaim,
+                     repo_id=repo_id, rows=calls)
+            for label in sorted({row["label"] for row in uses}):
+                _run(session, "UNWIND $rows AS row "
+                     f"MATCH {service}-[r:USES]->(d:{label} {{repo_id: $repo_id, name: row.name}}) " + unclaim,
+                     repo_id=repo_id, rows=[row for row in uses if row["label"] == label])
+
     def delete_bare_modules(self, repo_id: str) -> int:
         """Delete this repo's `Module` nodes that have no file key at all (no
         `source_file`, `file` or `path`), with their edges, and return how

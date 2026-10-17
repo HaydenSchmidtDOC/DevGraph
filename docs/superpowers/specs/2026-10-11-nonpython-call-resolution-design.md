@@ -1019,10 +1019,9 @@ Not read: Fastify's `route({...})` object form, echo's `Add`, chi
 `Mount`, Koa's `app.use(router.routes())` as a mount, ASP.NET `MapMethods`
 and conventional routing, Spring functional routes (`RouterFunction`),
 Kotlin Ktor. Express, Koa and Fastify routes all carry `framework:
-Express`. A compose change (a `build:` added or moved) leaves the
-Endpoint `CALLS` Service edges as they were until the route files are
-indexed again, as for Python (the graph-accuracy design's out-of-scope
-compose-only batch).
+Express`. A compose change (a `build:` added, moved or dropped) re-owns
+the route files outside its batch (below, "Compose changes re-own the files
+outside the batch").
 
 The dispatcher treats these files as it treats a Python file. Their replace
 is a `service_api` one (`engine.SERVICE_API_SUFFIXES`, also checked on
@@ -1108,6 +1107,33 @@ edge are functions of the file's text and the compose files. The fuzz
 toggles clients' imports in Python, TS, Java, Kotlin, C# and Go files
 (`op_datastore`); `tests/indexer/test_client_datastores_live.py` scans one
 service per language. C++ and Rust clients are not read.
+
+## Compose changes re-own the files outside the batch
+
+The owning-service edges (`Endpoint -CALLS-> Service`, `Service -USES->`
+a datastore) were written only for the batch's own files, so a batch of a
+compose file alone, giving a service a `build:`, moving it or taking it
+away, left every other file's edges at its old owner (the graph-accuracy
+design's out-of-scope "compose-only batch"). Those edges are a function of
+two things the graph holds: which files claim each Endpoint and datastore
+node (its `sources`) and the Services' build contexts (the longest one
+containing the file wins, `_match_owning_service`). So a batch holding a
+compose file (`_is_compose`), and a `remove_paths` deleting one, run
+`dispatch._relink_owning_services` after the owning-service pass: one read
+of every claimed Endpoint and datastore node with its claiming files and of
+every owning-service edge with its `origins` (`engine.owning_service_state`),
+then, for each claiming file outside the batch, the edges it should write
+now are compared with the ones listing it: a stale one is unclaimed (the
+file leaves its `origins`, the edge goes with the last,
+`unclaim_owning_service_edges`) and a missing one written with the file as
+origin. No file is read. A full scan skips it (no file is outside its
+batch). A compose replace also clears a `build_context` the service no
+longer has: the node is updated in place (`SET +=`), so the stale property
+kept its old owner before. The cost is one read proportional to the
+repository's Endpoints and datastore claims per batch holding a compose
+file; other batches pay nothing. The fuzz gives compose services `build:`
+contexts that come, move (to nested folders: the nearest wins) and go
+(`op_build`); `tests/indexer/test_routes_live.py` moves one by hand.
 
 ## No reverse dependents
 
