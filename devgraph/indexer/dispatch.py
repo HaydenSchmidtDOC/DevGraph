@@ -19,6 +19,7 @@ import logging
 import os
 import posixpath
 import sys
+import threading
 from collections import Counter
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -824,7 +825,8 @@ def index_paths(
                 if reason != GITIGNORED or rel_path in spellings:
                     engine.delete_nodes_by_source_file(repo_id, rel_path)
                 return
-            indexed += _index_single_path(
+            single = partial(
+                _index_single_path,
                 engine, repo_id, repo_root, resolved, rel_path,
                 docs_root, mentions_enabled, config,
                 py_files, py_extractions, js_files, js_extractions,
@@ -833,9 +835,23 @@ def index_paths(
                 kt_files, kt_extractions, go_extractions,
                 docs_files, mention_files, batch_services,
             )
+            try:
+                indexed += single()
+            except RecursionError:
+                # Extraction raises before it writes, so this is a clean retry.
+                indexed += _run_deep(single)
             read.add(rel_path)
         except ABORTS_BATCH:
             raise  # shutdown or an index still building: leave the work, and its stamp, for later
+        except RecursionError as exc:
+            # Deeper than even `_run_deep` allows: left out of the graph and
+            # reported, as a fresh scan leaves it, not kept as it was.
+            _log_file_failure("indexing failed", repo_id, rel_path, exc)
+            shown = min(supplied.get(rel_path, []), default=rel_path)
+            if skipped is not None:
+                skipped[shown] = TOO_DEEP
+            judged[rel_path] = [TOO_DEEP, max_bytes, _change_stamp_ns(os.stat(resolved))]
+            engine.delete_nodes_by_source_file(repo_id, rel_path)
         except Exception as exc:
             _log_file_failure("indexing failed", repo_id, rel_path, exc)
 
@@ -1095,6 +1111,48 @@ def index_paths(
             _log_file_failure("mentions relink failed", repo_id, path, exc)
 
     return indexed
+
+
+# Deeply nested code (a long `else if` chain, a generated `a + b + ...`
+# expression) is one tree level per branch or term, and the extractors walk
+# the tree recursively: about 500 branches or 1,000 terms pass the default
+# recursion limit. Such a file is extracted again on a thread of its own with
+# a large stack and the limit raised, so it is indexed in full; one deeper
+# still is skipped as TOO_DEEP.
+_DEEP_RECURSION_LIMIT = 200_000
+_DEEP_STACK_BYTES = 512 * 1024 * 1024
+TOO_DEEP = "too deeply nested"
+_deep_lock = threading.Lock()
+
+
+def _run_deep(fn: Callable[[], int]) -> int:
+    """`fn()` on a thread with `_DEEP_STACK_BYTES` of stack, the recursion
+    limit raised to `_DEEP_RECURSION_LIMIT` meanwhile. One at a time: the
+    limit is the interpreter's, not the thread's."""
+    outcome: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            outcome["value"] = fn()
+        except BaseException as exc:  # re-raised on the calling thread
+            outcome["error"] = exc
+
+    with _deep_lock:
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(max(limit, _DEEP_RECURSION_LIMIT))
+        try:
+            stack = threading.stack_size(_DEEP_STACK_BYTES)
+            try:
+                thread = threading.Thread(target=run, name="devgraph-deep-extract")
+                thread.start()
+            finally:
+                threading.stack_size(stack)
+            thread.join()
+        finally:
+            sys.setrecursionlimit(limit)
+    if "error" in outcome:
+        raise outcome["error"]  # type: ignore[misc]
+    return outcome["value"]  # type: ignore[return-value]
 
 
 def _log_file_failure(what: str, repo_id: str, path: object, exc: Exception) -> None:
