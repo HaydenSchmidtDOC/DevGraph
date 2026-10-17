@@ -37,7 +37,12 @@ from devgraph.config.project_schema import (
     resolve_effective_schema,
     schema_file_hash,
 )
-from devgraph.graph.engine import ABORTS_BATCH, GraphEngine, provision_repository_schema
+from devgraph.graph.engine import (
+    ABORTS_BATCH,
+    OWNING_SERVICE_TARGETS,
+    GraphEngine,
+    provision_repository_schema,
+)
 from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES, pin_kind, split_pin
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.common import (
@@ -51,7 +56,7 @@ from devgraph.indexer.common import (
     visible_to,
 )
 from devgraph.indexer.containers.extractor import ContainerExtractor, ExtractionResult
-from devgraph.indexer.datastores.extractor import DatastoreExtractor
+from devgraph.indexer.datastores.extractor import DatastoreExtractor, client_datastores
 from devgraph.indexer.docs.extractor import DocsExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.csharp.extractor import extract_csharp_file
@@ -146,9 +151,12 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: anonymous companion object's members (owner `Class.Companion`); JSX
 #: component elements as calls; 17: JS/TS imports of a workspace package
 #: (package.json `workspaces`, pnpm-workspace.yaml) resolved to its entry
-#: point or subpath and its directory (resolver configuration).
+#: point or subpath and its directory (resolver configuration); 18:
+#: datastore clients of JS/TS, Java, Kotlin, C# and Go files as the shared
+#: datastore nodes their files claim, with their owning service's USES
+#: (datastores/extractor.py `client_datastores`).
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 17
+INDEX_FORMAT = 18
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -725,10 +733,11 @@ def index_paths(
     # by pass 2 so it re-upserts without re-parsing the file a second time.
     py_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     # Same two-pass cross-link machinery as py_files/py_extractions above,
-    # kept as parallel lists rather than merged with the Python one:
-    # datastore extraction (_datastore_nodes) is still keyed to Python source
-    # conventions, so non-Python files join the owning-service pass below
-    # only with the Endpoints their own extractor found (apis/routes.py).
+    # kept as parallel lists rather than merged with the Python one: a
+    # Python file's owning-service edges are read again from its content,
+    # while other files join the owning-service pass below with the
+    # Endpoints (apis/routes.py) and datastore nodes (`_datastore_nodes`)
+    # of their extraction.
     js_files: list[str] = []  # rel_path, for the cross-link pass below
     js_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     cs_files: list[str] = []
@@ -1035,20 +1044,29 @@ def index_paths(
     # once per file, since it can't have changed mid-batch (Services are
     # only written by the Containerfile/compose branches above, already run
     # by this point).
-    # Another language's routes are its extraction's Endpoint nodes.
+    # Another language's routes and datastores are its extraction's
+    # Endpoint and datastore nodes.
     route_endpoints = {
         rel_path: [node["name"] for node in nodes if node["label"] == "Endpoint"]
         for extractions in code_extractions[1:]
         for rel_path, (nodes, _rels) in extractions.items()
     }
     route_endpoints = {rel_path: names for rel_path, names in route_endpoints.items() if names}
-    if py_files or route_endpoints:
+    client_stores = {
+        rel_path: [(node["label"], node["name"]) for node in nodes if node["label"] in DATASTORE_LABELS]
+        for extractions in code_extractions[1:]
+        for rel_path, (nodes, _rels) in extractions.items()
+    }
+    client_stores = {rel_path: stores for rel_path, stores in client_stores.items() if stores}
+    if py_files or route_endpoints or client_stores:
         services = _load_services_with_build_context(engine, repo_id)
         service_rels: list[dict] = []
         for rel_path, content in py_files:
             service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
         for rel_path, names in sorted(route_endpoints.items()):
             service_rels.extend(_endpoint_service_relationships(repo_id, rel_path, names, services))
+        for rel_path, stores in sorted(client_stores.items()):
+            service_rels.extend(_datastore_service_relationships(repo_id, rel_path, stores, services))
         engine.upsert_relationships(service_rels)
 
     if providers_ok and fs_spec is not None:
@@ -1105,6 +1123,8 @@ def _log_file_failure(what: str, repo_id: str, path: object, exc: Exception) -> 
 
 
 _MARKDOWN_SUFFIXES = (".md", ".markdown")
+#: The labels a datastore node takes (datastores/extractor.py DatastoreType).
+DATASTORE_LABELS = frozenset(OWNING_SERVICE_TARGETS)
 _CODE_ROUTES = {
     ".py": "py", ".cs": "cs", ".java": "java", ".rs": "rs", ".kt": "kt", ".go": "go",
     **{suffix: "js" for suffix in _JS_SUFFIXES},
@@ -1227,7 +1247,7 @@ def _index_single_path(
     elif "js" in routes:
         content = read_source(resolved)
         result = extract_js_file(content, rel_path, repo_id, config)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "js")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-reupsert rationale as the .py branch above:
         # prune this file's previously-indexed nodes/edges and write the
@@ -1240,7 +1260,7 @@ def _index_single_path(
     elif "cs" in routes:
         content = read_source(resolved)
         result = extract_csharp_file(content, rel_path, repo_id, config)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "cs")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above:
         # prune this file's stale nodes/edges in one transaction, then
@@ -1269,7 +1289,7 @@ def _index_single_path(
     elif "java" in routes:
         content = read_source(resolved)
         result = extract_java_file(content, rel_path, repo_id)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "java")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-cross-link-reupsert pattern as the .py
         # branch above (see its comment for why replace_file_nodes runs
@@ -1293,7 +1313,7 @@ def _index_single_path(
     elif "kt" in routes:
         content = read_source(resolved)
         result = extract_kotlin_file(content, rel_path, repo_id)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "kt")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above: a
         # class/function removed from the file must not survive in the graph
@@ -1305,7 +1325,7 @@ def _index_single_path(
     elif "go" in routes:
         content = read_source(resolved)
         result = extract_go_file(content, rel_path, repo_id, config)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "go")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above:
         # a struct/func/method removed from the file must not survive in
@@ -2403,9 +2423,15 @@ def _upsert_container_result(engine: GraphEngine, repo_id: str, rel_path: str, r
     engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
 
 
-def _datastore_nodes(repo_id: str, rel_path: str, content: str) -> list[dict]:
-    result = DatastoreExtractor(repo_id).extract_from_source(content, rel_path)
-    return [{"label": ds.datastore_type, "repo_id": repo_id, "name": ds.name, "properties": ds.properties} for ds in result.datastores]
+def _datastore_nodes(repo_id: str, rel_path: str, content: str, language: str = "py") -> list[dict]:
+    """The datastore nodes a source file's clients claim: a Python file's
+    (DatastoreExtractor), another language's (`client_datastores`, by its
+    `_routes` name)."""
+    if language == "py":
+        datastores = DatastoreExtractor(repo_id).extract_from_source(content, rel_path).datastores
+    else:
+        datastores = client_datastores(content, language, repo_id, rel_path)
+    return [{"label": ds.datastore_type, "repo_id": repo_id, "name": ds.name, "properties": ds.properties} for ds in datastores]
 
 
 def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict[str, tuple[str, str]]:
@@ -2472,27 +2498,37 @@ def _owning_service_relationships(
         return []
     _owning_context, owning_service_file = services[owning_service]
 
-    rels: list[dict] = []
-
     datastore_result = DatastoreExtractor(repo_id).extract_from_source(content, rel_path)
-    for ds in datastore_result.datastores:
-        rels.append(
-            {
-                "from_label": "Service",
-                "from_name": owning_service,
-                "from_file": owning_service_file,
-                "rel_type": "USES",
-                "to_label": ds.datastore_type,
-                "to_name": ds.name,
-                "repo_id": repo_id,
-                "properties": {},
-                "origin": rel_path,
-            }
-        )
-
+    datastores = [(ds.datastore_type, ds.name) for ds in datastore_result.datastores]
     api_result = APIExtractor(repo_id).extract_from_source(content, rel_path)
     endpoints = [f"{endpoint.method} {endpoint.path}" for endpoint in api_result.endpoints]
-    return rels + _endpoint_service_relationships(repo_id, rel_path, endpoints, services)
+    return _datastore_service_relationships(repo_id, rel_path, datastores, services) + _endpoint_service_relationships(
+        repo_id, rel_path, endpoints, services
+    )
+
+
+def _datastore_service_relationships(
+    repo_id: str, rel_path: str, datastores: list[tuple[str, str]], services: dict[str, tuple[str, str]]
+) -> list[dict]:
+    """USES from the compose Service that owns the file to each of its
+    datastores ((label, name)), as `_owning_service_relationships` writes them."""
+    owning_service = _match_owning_service(services, rel_path)
+    if owning_service is None:
+        return []
+    return [
+        {
+            "from_label": "Service",
+            "from_name": owning_service,
+            "from_file": services[owning_service][1],
+            "rel_type": "USES",
+            "to_label": label,
+            "to_name": name,
+            "repo_id": repo_id,
+            "properties": {},
+            "origin": rel_path,
+        }
+        for label, name in datastores
+    ]
 
 
 def _endpoint_service_relationships(

@@ -68,7 +68,8 @@ kind is written, relinked and removed as files come and go.
 
 The spec's "Out of scope" gaps are left out by construction:
 - compose services have `image:` only, never `build:`;
-- no datastore code, and routes only in Express (TS) and Spring (Java) files,
+- datastore clients only as imports (`op_datastore`), and routes only in
+  Express (TS) and Spring (Java) files,
   which add, drop and change routes and move a handler (`op_route`,
   `op_route_change`, `op_route_move`), each Endpoint and handler stub
   claimed by every file routing it;
@@ -488,6 +489,15 @@ IMPORTS = {
     "java": ["base.Base", "app.K", "base.*"],
     "kt": ["kt.util.slug", "kt.util.*", "kt.Clock", "kt.helper"],
 }
+# Datastore clients' imports, as each language writes one (several naming one store).
+CLIENTS = {
+    "py": ["import redis", "import psycopg2"],
+    "ts": ["import Redis from 'ioredis';", "import { Pool } from 'pg';", "const { Kafka } = require('kafkajs');"],
+    "java": ["redis.clients.jedis.Jedis", "org.apache.kafka.clients.producer.KafkaProducer"],
+    "kt": ["io.lettuce.core.RedisClient", "org.postgresql.Driver"],
+    "cs": ["using StackExchange.Redis;", "using Npgsql;"],
+    "go": ["github.com/lib/pq", "github.com/segmentio/kafka-go", "github.com/redis/go-redis/v9"],
+}
 BASES = {
     "py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "java": ["Base", "K"],
     "cs": ["Jobs", "Base", "Program", "Missing"], "cpp": ["Widget", "Gadget", "Missing"],
@@ -675,6 +685,20 @@ class Fuzz:
             return f"remove import {m} in {path}", {path}
         f.imports.append(m)
         return f"add import {m} in {path}", {path}
+
+    def op_datastore(self):
+        """Add or remove a datastore client's import: the file claims the
+        store's shared node (one provider's, whichever language)."""
+        path = self._pick(lambda f: f.kind in CLIENTS)
+        if not path:
+            return None
+        f = self.files[path]
+        m = self.rng.choice(CLIENTS[f.kind])
+        if m in f.imports:
+            f.imports.remove(m)
+            return f"remove client {m} in {path}", {path}
+        f.imports.append(m)
+        return f"add client {m} in {path}", {path}
 
     def op_import_style(self):
         """Write one of a Python file's imports another way."""
@@ -1192,7 +1216,7 @@ class Fuzz:
         "cs_dup_class", "cs_shadow", "cs_shadow", "cs_reference", "cs_reference", "cs_project_move", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route",
         "route",
         "route_change", "route_move", "src_move", "src_move", "src_dir", "src_dir", "rs_reexport", "rs_reexport", "rs_reexport",
-        "ws_rename", "ws_rename", "ws_main", "ws_main",
+        "ws_rename", "ws_rename", "ws_main", "ws_main", "datastore", "datastore",
     ]
 
     def draw(self):

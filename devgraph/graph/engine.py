@@ -255,9 +255,14 @@ def _claim_nodes_tx(tx, label: str, rows: list[dict[str, Any]]) -> None:
     )
 
 
+# The datastore labels a Service `USES` through the owning-service pass
+# (indexer/datastores/extractor.py DatastoreType).
+OWNING_SERVICE_TARGETS = ("Database", "VectorStore", "Queue", "Cache")
+
 # The files whose replace is a `service_api` one: Python's (its owning-service
-# and API edges) and the languages whose routes are extracted
-# (indexer/apis/routes.py: their Endpoint and owning-service CALLS edges).
+# and API edges) and the languages whose routes and datastore clients are
+# extracted (indexer/apis/routes.py, datastores/extractor.py
+# `client_datastores`: their Endpoint and owning-service CALLS/USES edges).
 SERVICE_API_SUFFIXES = (
     ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".java", ".kt", ".cs", ".go",
 )
@@ -426,8 +431,7 @@ def _unclaim_service_api_edges_tx(
     # The owning-service edges come back only in index_paths' final service
     # pass, which needs every compose file in the batch, so between this
     # file's replace and that pass a reader can briefly miss them.
-    if file_name.endswith(".py"):  # only a Python file writes USES
-        tx.run(_UNCLAIM_SERVICE_USES_CYPHER, repo_id=repo_id, f=file_name)
+    tx.run(_UNCLAIM_SERVICE_USES_CYPHER, repo_id=repo_id, f=file_name)
     if recorded is None:
         tx.run(_UNCLAIM_ENDPOINT_EDGES_CYPHER, repo_id=repo_id, f=file_name)
     else:

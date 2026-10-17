@@ -1053,8 +1053,9 @@ it, rebuilding every code Module's record from the shared nodes' own
 one read and a write of only the records that differ, so a scan that
 changes nothing locks no Module), and a file's delete reads every claim,
 not its record (deletes are rare).
-Set (c)'s `USES` unclaim runs for Python files only, the only writers of
-`USES`. Python
+Set (c)'s `USES` unclaim ran for Python files only, the only writers of
+`USES` until index format 18 (datastore clients beyond Python, below); it
+now runs for every `service_api` file. Python
 route files gain the same. Measured on a synthetic repository of 2,000
 files (400 each of TS, Java, Go, C# and Python, a quarter of the first four
 with routes: 1,600 Endpoints), `full_scan` against the shared local Neo4j:
@@ -1068,6 +1069,45 @@ with routes: 1,600 Endpoints), `full_scan` against the shared local Neo4j:
 A repository with no routes costs the same. What remains is linear in the
 routes (their Endpoint and stub claims, about 5.5 ms per label per route
 file, and their edges).
+
+## Datastore clients beyond Python (index format 18)
+
+`Service -USES->` a datastore came from Python files alone, so
+`get_service_dependencies` and `explain_architecture` listed no store for a
+JS/TS, Java, Kotlin, C# or Go service. `datastores/extractor.py`
+`client_datastores` now reads those languages' clients, by literal text only
+(a URL, driver or namespace built at run time is not read):
+
+| Language | Read |
+|---|---|
+| JS/TS | a module specifier (`import`, `from`, `require`, `import()`) of `pg`, `postgres`, `mysql`, `mysql2`, `mongodb`, `mongoose`, `sqlite3`, `better-sqlite3`, `neo4j-driver`, `@prisma/client`, `redis`, `ioredis`, `kafkajs`, `amqplib`, `@aws-sdk/client-s3`, `@aws-sdk/client-sqs` (or a subpath: `mysql2/promise`) |
+| Java, Kotlin | an import of (or below) `org.postgresql`, `com.mongodb`, Spring Data's `mongodb`/`jpa`/`neo4j`/`redis`, `org.neo4j.driver`, `redis.clients.jedis` (Jedis), `io.lettuce.core` (Lettuce), `org.apache.kafka.clients`, `org.springframework.kafka`, `com.rabbitmq.client`, `org.springframework.amqp`, the AWS SDK's `s3`/`sqs`; a JDBC URL literal (`"jdbc:postgresql:`, `mysql`, `mariadb`, `sqlserver`, `sqlite`, `oracle`, `h2`); a Spring Data repository supertype (`JpaRepository<`, `MongoRepository<`, `ReactiveMongoRepository<`, `Neo4jRepository<`, `CassandraRepository<`, `ElasticsearchRepository<`) |
+| C# | a `using` of (or below) `Npgsql`, `Microsoft.Data.SqlClient`/`System.Data.SqlClient`, `Microsoft.Data.Sqlite`, `MySqlConnector`, `MySql.Data`, `MongoDB.Driver`, `StackExchange.Redis`, `Confluent.Kafka`, `RabbitMQ.Client`, `Amazon.S3`, `Amazon.SQS`; an EF Core provider call (`.UseNpgsql(`, `UseSqlServer`, `UseSqlite`, `UseMySql`, `UseCosmos`, `UseOracle`) and a `DbContext` subclass |
+| Go | an import of (or below) `github.com/lib/pq`, `github.com/jackc/pgx`, `github.com/go-sql-driver/mysql`, `github.com/mattn/go-sqlite3`, `modernc.org/sqlite`, `go.mongodb.org/mongo-driver`, `github.com/redis/go-redis`, `github.com/go-redis/redis`, `github.com/IBM/sarama`, `github.com/Shopify/sarama`, `github.com/segmentio/kafka-go`, `github.com/rabbitmq/amqp091-go`, the AWS SDK v2's `s3`/`sqs`; `sql.Open("<driver>", ...)` with a literal driver (`postgres`, `pgx`, `mysql`, `sqlite3`, `sqlserver`) |
+| all five | a connection URL at the start of a string literal: `postgres://`, `postgresql://`, `mysql://`, `mongodb://`, `mongodb+srv://`, `redis://`, `rediss://`, `amqp://`, `amqps://` |
+
+A store's identity is a Python client's: its provider, under its type's
+label (`Database`, `Cache`, `Queue`; `VectorStore` has no client here), so
+every file and service using PostgreSQL meets one shared `PostgreSQL`
+`Database`, whatever the language, and the URL's host, database name or
+environment variable never splits it. An ORM whose store is configured
+outside the code is named by the ORM (`Prisma`, `JPA`, `EF Core`), as a
+Python LangChain vector store is `LangChain`; S3 is a `Database` named
+`S3`, SQS a `Queue`. A file's node per provider takes the alphabetically
+first of its clients of that provider as its `library`, and its `source`.
+
+The dispatcher appends these nodes to the file's extraction
+(`_datastore_nodes(..., language)`), so its replace claims them as a Python
+file's (G3: re-claimed in place, a store's incoming edges kept). Their
+`USES` from the owning compose `Service` are written in the owning-service
+pass (`_datastore_service_relationships`, the edge a Python file's
+`_owning_service_relationships` writes), with the file as origin; set (c)'s
+`USES` unclaim now runs for every `service_api` file, on a replace and on a
+delete. Nothing else is new for incremental equals fresh: a node and its
+edge are functions of the file's text and the compose files. The fuzz
+toggles clients' imports in Python, TS, Java, Kotlin, C# and Go files
+(`op_datastore`); `tests/indexer/test_client_datastores_live.py` scans one
+service per language. C++ and Rust clients are not read.
 
 ## No reverse dependents
 
