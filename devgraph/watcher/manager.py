@@ -816,7 +816,7 @@ class WatcherManager:
                     # moves neither HEAD nor a branch), and a recursive one on
                     # .git/refs/heads. Remote-tracking refs and tags stay unwatched,
                     # so a background fetch triggers nothing. (The root watch
-                    # covers the same three, see inotify.ignored_folder_filter.)
+                    # covers the same three, see folder_filter.ignored_folder_filter.)
                     refs = git_dir / "refs"
                     if refs.is_dir():
                         observer.schedule(git_handler, str(refs), recursive=False)

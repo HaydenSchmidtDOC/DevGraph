@@ -6,7 +6,7 @@ per user by default, shared with every other program that watches files.
 with about 100 of them used up the limit. On Linux it now watches each
 repository with one recursive watch on its root through this emitter, which:
 
-- leaves out folders the indexer skips (by name, `IGNORED_DIR_NAMES`, or by a
+- leaves out folders the indexer skips (`folder_filter`: by name or place, or by a
   .gitignore), at any depth, when watching starts and when a folder is created
   or moved in, so `.venv`, `node_modules` and build output cost no kernel
   watches;
@@ -50,8 +50,7 @@ from watchdog.observers.inotify_c import DEFAULT_EVENT_BUFFER_SIZE, Inotify, Ino
 from watchdog.utils import BaseThread
 from watchdog.utils.delayed_queue import DelayedQueue
 
-from devgraph.indexer.gitignore import is_gitignored
-from devgraph.indexer.walk import is_ignored_path
+from devgraph.watcher.folder_filter import ignored_folder_filter
 
 logger = logging.getLogger(__name__)
 
@@ -102,31 +101,6 @@ def _parse_event_buffer(event_buffer: bytes) -> Iterator[tuple[int, int, int, by
 if SUPPORTED:
     _watchdog_parse_event_buffer = Inotify._parse_event_buffer
     Inotify._parse_event_buffer = staticmethod(_parse_event_buffer)  # type: ignore[method-assign]
-
-
-#: The folders of a repository's git state the root watch keeps, with
-#: everything below the last: `.git` (HEAD, packed-refs, index.lock),
-#: `.git/refs` (refs/stash) and `.git/refs/heads` (branch tips). Remote-
-#: tracking refs and tags stay unwatched, so a background fetch triggers nothing.
-_GIT_STATE = ((".git",), (".git", "refs"), (".git", "refs", "heads"))
-
-
-def ignored_folder_filter(root: Path, *, watch_git: bool = False) -> Callable[[bytes], bool]:
-    """Whether a folder under `root` is one the indexer never enters, and,
-    with `watch_git`, not part of the git state (`_GIT_STATE`)."""
-
-    def ignored(path: bytes) -> bool:
-        try:
-            rel = Path(os.fsdecode(path)).relative_to(root)
-        except ValueError:
-            return False
-        if not rel.parts:
-            return False
-        if watch_git and rel.parts[0] == ".git":
-            return not (rel.parts in _GIT_STATE or rel.parts[:3] == _GIT_STATE[2])
-        return is_ignored_path(rel, root) or is_gitignored(root, rel.as_posix(), is_dir=True)
-
-    return ignored
 
 
 class _FilteredInotify(Inotify):

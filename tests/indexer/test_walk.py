@@ -68,7 +68,7 @@ def test_build_output_names_are_ignored_only_where_a_build_writes_them(tmp_path)
 
 
 def test_the_inotify_filter_ignores_the_folders_the_walk_skips(tmp_path):
-    from devgraph.watcher.inotify import ignored_folder_filter
+    from devgraph.watcher.folder_filter import ignored_folder_filter
 
     _touch(tmp_path, "Cargo.toml", "src/bin/cli.rs", "target/x", "pkg/build/x.py", "web/package.json", "web/dist/x")
     ignored = ignored_folder_filter(tmp_path)
