@@ -827,6 +827,28 @@ def build_server(
         return devgraph_tools.list_services(engine, repo_id, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
+    def list_endpoints(
+        repo_id: str,
+        method: str | None = None,
+        path_prefix: str | None = None,
+        framework: str | None = None,
+        service: str | None = None,
+        cross_repo: bool = False,
+        max_results: int = 15,
+    ) -> dict[str, Any]:
+        """List API endpoints (routes); returns {count, results, truncated}, each result
+        {name, method, path, mounted, framework, files, handlers ({name, file, owner}),
+        services, repo_id}. Filters: method ("GET", "*" for an every-method route),
+        path_prefix (whole segments: "/api" matches "/api/users", not "/apis"), framework
+        (ASP.NET Core, Django, Express, FastAPI, Flask, Go, Spring) and service (the compose
+        service an endpoint CALLS). A route whose mount its file doesn't show has mounted
+        false, its own path, and a name like "GET ?/:id (routes/users.js)"; no path_prefix
+        matches it. An unknown method or framework, or an unknown service, is an error."""
+        return devgraph_tools.list_endpoints(
+            engine, repo_id, method, path_prefix, framework, service, cross_repo, max_results
+        )
+
+    @server.tool(annotations=_READ_ONLY)
     def explain_decision(repo_id: str, decision_name: str, cross_repo: bool = False) -> dict[str, Any]:
         """Explain a design decision: its rationale, what it documents, and what it supersedes.
         An unknown decision name is an error with similar names."""

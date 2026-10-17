@@ -2094,6 +2094,115 @@ def list_services(
     return _envelope(results, max_results)
 
 
+#: The `framework` an Endpoint carries, by the extractors that write them
+#: (indexer/apis/extractor.py, and the add_route callers of indexer/apis/routes.py).
+ENDPOINT_FRAMEWORKS = ("ASP.NET Core", "Django", "Express", "FastAPI", "Flask", "Go", "Spring")
+_ENDPOINT_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD", "*")
+
+
+def _endpoint_row(row: dict[str, Any]) -> dict[str, Any]:
+    """A list_endpoints result: an Endpoint's name split into its method and
+    path, `mounted` False for a route under a prefix its file doesn't know
+    (`"<METHOD> ?<path> (<file>)"`, whose path is the route's own). Its
+    handlers are the Functions it IMPLEMENTS that have a file; one that
+    resolved to none is its file-less stub, with file and owner None."""
+    method, _, rest = row["name"].partition(" ")
+    mounted = not rest.startswith("?")
+    path = rest if mounted else rest[1:].rsplit(" (", 1)[0]
+    handlers = [h for h in row["handlers"] if h["file"]] or [
+        {"name": h["name"], "file": None, "owner": None} for h in row["handlers"]
+    ]
+    return {
+        "name": row["name"], "method": method, "path": path, "mounted": mounted, "framework": row["framework"],
+        "files": row["files"],
+        "handlers": sorted(handlers, key=lambda h: (h["file"] or "", h["owner"] or "", h["name"])),
+        "services": sorted(row["services"]), "repo_id": row["repo_id"],
+    }
+
+
+def list_endpoints(
+    engine: GraphEngine,
+    repo_id: str,
+    method: str | None = None,
+    path_prefix: str | None = None,
+    framework: str | None = None,
+    service: str | None = None,
+    cross_repo: bool = False,
+    max_results: int = 15,
+) -> dict[str, Any]:
+    """List the repository's API endpoints (or every repository's, with cross_repo).
+
+    Args:
+        engine: GraphEngine instance
+        repo_id: Repository ID. Filters when cross_repo is False; when True it
+            only decides ordering (this repo's endpoints first)
+        method: Only this HTTP method (any case; "*" is a route for every method)
+        path_prefix: Only paths at or below this prefix, by whole segments
+            ("/api" matches "/api" and "/api/users", not "/apis"); a route
+            whose mount prefix is unknown (`mounted` False) never matches
+        framework: Only this framework (any case), one of ENDPOINT_FRAMEWORKS
+        service: Only endpoints that CALLS this compose service
+        cross_repo: If True, list endpoints from every repository
+        max_results: Maximum number of results to return in the envelope
+
+    Returns:
+        {count, results, truncated}, each result {name, method, path, mounted,
+        framework, files (the files routing it), handlers ({name, file, owner}),
+        services (the compose services it CALLS), repo_id}, ordered by name;
+        past `LIST_ROW_LIMIT` matches it is truncated, with a notice
+
+    Raises:
+        ToolError: an unknown method or framework, or no service of that name.
+    """
+    _at_least(1, max_results=max_results)
+    if method is not None:
+        method = method.upper()
+        if method not in _ENDPOINT_METHODS:
+            raise ToolError(f"method must be one of {', '.join(_ENDPOINT_METHODS)}, not {_echo(method)}")
+    if framework is not None:
+        known = {each.lower(): each for each in ENDPOINT_FRAMEWORKS}
+        if framework.lower() not in known:
+            raise ToolError(f"framework must be one of {', '.join(ENDPOINT_FRAMEWORKS)}, not {_echo(framework)}")
+        framework = known[framework.lower()]
+    if service is not None and not _exists(engine, repo_id, service, ("Service",), cross_repo):
+        raise _not_found(engine, repo_id, "service", service, ("Service",), cross_repo)
+    prefix = None if path_prefix is None else "/" + path_prefix.strip("/")
+    if cross_repo:
+        match = f"MATCH (e:Endpoint) WHERE e.name IS NOT NULL {_cross_scope('e', 'AND')}"
+    else:
+        match = (
+            "MATCH (e:Endpoint) USING INDEX SEEK e:Endpoint(repo_id, name) "
+            "WHERE e.repo_id = $repo_id AND e.name IS NOT NULL"
+        )
+    # A Django pattern has no leading "/": `path` adds one, so a prefix matches it too.
+    cypher = f"""
+    {match}
+    WITH e, split(e.name, ' ')[0] AS method, substring(e.name, size(split(e.name, ' ')[0]) + 1) AS rest
+    WITH e, method, rest, CASE WHEN rest STARTS WITH '/' THEN rest ELSE '/' + rest END AS path
+    WHERE ($method IS NULL OR method = $method)
+      AND ($framework IS NULL OR e.framework = $framework)
+      AND ($prefix IS NULL OR (NOT rest STARTS WITH '?'
+           AND ($prefix = '/' OR path = $prefix OR path STARTS WITH $prefix + '/')))
+      AND ($service IS NULL OR EXISTS {{ MATCH (e)-[:CALLS]->(s:Service) WHERE s.name = $service }})
+    CALL (e) {{
+        OPTIONAL MATCH (e)-[:IMPLEMENTS]->(f:Function)
+        RETURN [h IN collect(DISTINCT {{name: f.name, file: f.file, owner: f.owner}}) WHERE h.name IS NOT NULL]
+               AS handlers
+    }}
+    CALL (e) {{
+        OPTIONAL MATCH (e)-[:CALLS]->(s:Service)
+        RETURN [n IN collect(DISTINCT s.name) WHERE n IS NOT NULL] AS services
+    }}
+    RETURN e.name AS name, e.framework AS framework, coalesce(e.sources, [e.source]) AS files,
+           handlers, services, e.repo_id AS repo_id
+    ORDER BY (e.repo_id = $repo_id) DESC, e.repo_id, e.name
+    LIMIT {LIST_ROW_LIMIT + 1}
+    """
+    params = {"repo_id": repo_id, "method": method, "framework": framework, "prefix": prefix, "service": service}
+    rows, more = _list_query(engine, cypher, params)
+    return _capped_envelope([_endpoint_row(row) for row in rows], more, max_results)
+
+
 def explain_decision(
     engine: GraphEngine,
     repo_id: str,

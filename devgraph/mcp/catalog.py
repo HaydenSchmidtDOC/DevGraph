@@ -23,6 +23,7 @@ TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "impact_analysis_for_diff", "identifier_kind": "two local git refs (base_ref, head_ref; compared from their merge base, like git diff base...head)", "envelope": True, "phase": 3, "note": "traces dependents of the changed and removed functions/classes only; added ones are listed apart; transitive dependents stop at 4 hops"},
     {"name": "explain_architecture", "identifier_kind": None, "envelope": False, "phase": 1, "note": "the response is not an envelope; services_and_datastores and endpoints inside it are {count, results, truncated}"},
     {"name": "list_services", "identifier_kind": None, "envelope": True, "phase": 1},
+    {"name": "list_endpoints", "identifier_kind": "optional filters: method, path_prefix (whole segments), framework, service name", "envelope": True, "phase": 1, "note": "a route under a mount prefix its file doesn't show is listed with mounted false and its own path"},
     {"name": "explain_decision", "identifier_kind": "DesignDecision name/id", "envelope": False, "phase": 2},
     {"name": "find_requirements_for", "identifier_kind": "component name", "envelope": True, "phase": 2},
     {"name": "trace_design_rationale", "identifier_kind": "component name", "envelope": False, "phase": 2},
