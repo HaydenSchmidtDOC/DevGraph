@@ -319,6 +319,31 @@ def test_a_destructured_parameter_or_a_local_is_no_class_component():
     assert ("C", "render") not in rows and ("C", "Panel") not in rows
 
 
+def test_a_block_local_shadows_a_tag_only_in_its_block():
+    """A `const` in a nested block doesn't shadow the import outside it (the
+    element still renders the import, as before locals shadowed); a
+    `for (const Row of ...)` head and a `catch (Err)` shadow inside their
+    block only."""
+    source = """
+        import { Widget, Row, Err } from './ui';
+
+        export function A(x) {
+          if (x) { const Widget = 1; }
+          return <Widget />;
+        }
+        export function B(rows) {
+          for (const Row of rows) { use(<Row />); }
+          try { run(); } catch (Err) { return <Err />; }
+          return null;
+        }
+        export function C() { return [<Row />, <Err />]; }
+    """
+    found = {(c, n) for c, n, _f, _conf in calls(source, "src/A.tsx")}
+    assert ("A", "Widget") in found
+    assert ("B", "Row") not in found and ("B", "Err") not in found
+    assert ("C", "Row") in found and ("C", "Err") in found
+
+
 def test_memo_forward_ref_and_styled_components_are_functions():
     """`memo(fn)`, `forwardRef(fn)` (and `React.` ones, nested) make the
     declarator a Function of the wrapped function's body; a styled

@@ -301,18 +301,56 @@ def _bound_names(func: Node) -> set[bytes]:
     return _pattern_names(func.child_by_field_name("parameters") or func.child_by_field_name("parameter"))
 
 
+def _declared_names(declaration: Node) -> set[bytes]:
+    """The names a `const`/`let`/`var` declaration binds to anything but a
+    function (`const Widget = pick()`, `const { Row } = parts`)."""
+    return {
+        name for declarator in declaration.named_children if declarator.type == "variable_declarator"
+        and _function_value(declarator.child_by_field_name("value")) is None
+        for name in _pattern_names(declarator.child_by_field_name("name"))
+    }
+
+
+def _decode(names: set[bytes]) -> set[str]:
+    return {name.decode("utf-8", errors="replace") for name in names}
+
+
 def _local_names(body: Node) -> set[str]:
-    """The names a function body's declarations bind to anything but a
-    function (`const Widget = pick()`, `const { Row } = parts`), not those
-    of nested functions: they shadow an import or a class of their name."""
+    """The names a function body binds throughout (`_declared_names`): its
+    own block's `const`/`let` and every `var` of it, not those of nested
+    functions. A nested block's `const`/`let` shadows only inside it
+    (`_block_names`). They shadow an import or class of their name."""
     found: set[bytes] = set()
     pending = [body]
     while pending:
         node = pending.pop()
-        if node.type == "variable_declarator" and _function_value(node.child_by_field_name("value")) is None:
-            found |= _pattern_names(node.child_by_field_name("name"))
+        if node.type == "variable_declaration" or (node.type == "lexical_declaration" and node.parent == body):
+            found |= _declared_names(node)
         pending += [child for child in node.named_children if child.type not in _NESTED_SCOPE_TYPES]
-    return {name.decode("utf-8", errors="replace") for name in found}
+    return _decode(found)
+
+
+def _block_names(site: Node, body: Node) -> set[str]:
+    """The names the blocks between `site` and its function's `body` bind
+    for it: each enclosing block's `const`/`let`, a `for (const W of ...)`
+    or `for (let i = ...)` head's, a `catch (W)` parameter's."""
+    found: set[bytes] = set()
+    child, node = site, site.parent
+    while node is not None and node != body:
+        if node.type == "statement_block":
+            for statement in node.named_children:
+                if statement.type == "lexical_declaration":
+                    found |= _declared_names(statement)
+        elif node.type == "for_in_statement" and child == node.child_by_field_name("body"):
+            found |= _pattern_names(node.child_by_field_name("left"))
+        elif node.type == "for_statement" and child == node.child_by_field_name("body"):
+            initializer = node.child_by_field_name("initializer")
+            if initializer is not None and initializer.type == "lexical_declaration":
+                found |= _declared_names(initializer)
+        elif node.type == "catch_clause" and child == node.child_by_field_name("body"):
+            found |= _pattern_names(node.child_by_field_name("parameter"))
+        child, node = node, node.parent
+    return _decode(found)
 
 
 def _call_functions(body: Node) -> list[Node]:
@@ -1313,9 +1351,12 @@ def extract_js_file(
         by_name = calls.setdefault((caller_label, caller_name, caller_owner), {})
         for func in _call_functions(body):
             jsx = func.parent is not None and func.parent.type in _JSX_TAGS
+            # A block's own locals shadow there only.
+            block = _block_names(func, body)
+            site = _Scope(scope.cls, scope.params | block, scope.types) if block else scope
             # A class component renders through its `render`, which its class owns.
-            rendered = [("render", pin, False) for pin in resolver.render_pins(func, scope)] if jsx else []
-            for name, pin, member in resolver.resolve(func, scope) + rendered:
+            rendered = [("render", pin, False) for pin in resolver.render_pins(func, site)] if jsx else []
+            for name, pin, member in resolver.resolve(func, site) + rendered:
                 if pin is None and jsx:
                     continue  # a component nothing resolves links nothing, never by name alone
                 entry = by_name.setdefault(name, [set(), False, set(), True])

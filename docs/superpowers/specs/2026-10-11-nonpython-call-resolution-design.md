@@ -370,7 +370,9 @@ Since index format 19:
   imported one's links nothing, owning no `render`. A function's
   destructured parameters (not a default value's names) and its locals
   bound to anything but a function (`const Widget = pick()`) shadow an
-  import or class of their name, for a tag and a call alike.
+  import or class of their name, for a tag and a call alike: a `const`
+  or `let` only inside its block (a `for (const W of ...)` head and a
+  `catch (W)` parameter inside theirs), a `var` throughout.
 - A component made by a wrapper is a Function of the declarator's name:
   `memo(fn)`, `forwardRef(fn)` (`React.` ones, nested) of the wrapped
   function's body, and a styled component (`styled.div`...``,
