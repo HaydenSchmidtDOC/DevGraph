@@ -124,11 +124,16 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   project file's `Sdk` implies come before its `<Using>` items, so a
   `<Using Remove>` removes one: Microsoft.NET.Sdk's `System`,
   `System.Collections.Generic`, `System.IO`, `System.Linq`,
-  `System.Net.Http`, `System.Threading` and `System.Threading.Tasks`;
-  Microsoft.NET.Sdk.Worker adds `Microsoft.Extensions.Configuration`,
+  `System.Net.Http`, `System.Threading` and `System.Threading.Tasks`
+  (Microsoft.NET.Sdk.Razor's the same); Microsoft.NET.Sdk.BlazorWebAssembly
+  adds `System.Net.Http.Json`,
+  `Microsoft.AspNetCore.Components.WebAssembly.Hosting`,
+  `Microsoft.Extensions.Configuration`, `.DependencyInjection` and
+  `.Logging`; Microsoft.NET.Sdk.Worker adds `Microsoft.Extensions.Configuration`,
   `.DependencyInjection`, `.Hosting` and `.Logging`; Microsoft.NET.Sdk.Web
   those and `System.Net.Http.Json` and `Microsoft.AspNetCore.Builder`,
-  `.Hosting`, `.Http` and `.Routing`. Another SDK adds none.
+  `.Hosting`, `.Http` and `.Routing`. Another SDK adds none (WindowsDesktop's
+  depend on `UseWPF`/`UseWindowsForms`, not read).
   A file's *head* is read from its start, at most its first 32 KiB, for as
   long as it holds only whitespace, comments, preprocessor lines (`#if`,
   `#region`, `#nullable`, ...), `extern alias` and using directives, global
@@ -362,7 +367,10 @@ Since index format 19:
   heir keys reaching an inherited `render`); an owner-less pin (a
   `require`, a barrel's prefix) is left out, as it would link every
   `render` there. A function component of the file adds no such row; an
-  imported one's links nothing, owning no `render`.
+  imported one's links nothing, owning no `render`. A function's
+  destructured parameters (not a default value's names) and its locals
+  bound to anything but a function (`const Widget = pick()`) shadow an
+  import or class of their name, for a tag and a call alike.
 - A component made by a wrapper is a Function of the declarator's name:
   `memo(fn)`, `forwardRef(fn)` (`React.` ones, nested) of the wrapped
   function's body, and a styled component (`styled.div`...``,

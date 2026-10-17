@@ -1908,7 +1908,8 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
 
     # The names and match keys of the symbols that go: a tiered pin's edges
     # to such a name depend on all its nodes (see _relink_name_refs). Only
-    # C# writes match keys, so only a deleted .cs file is looked at.
+    # C# writes the keys a tiered pin tests (other languages' heir keys
+    # shadow nothing, _shadow_keys), so only a deleted .cs file is looked at.
     gone_cs = sorted(rel for rel in removed if rel.endswith(".cs"))
     shadow_names = _shadow_keys(
         (node[:4], node[4], None) for node in (engine.list_file_nodes(repo_id, gone_cs) if gone_cs else ())

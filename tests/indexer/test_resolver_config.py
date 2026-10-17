@@ -428,7 +428,8 @@ def test_implicit_usings_are_the_sdks_global_usings(tmp_path):
     """`<ImplicitUsings>enable</ImplicitUsings>` adds the project SDK's
     global usings before every `<Using>` item, so a `Remove` removes one;
     the last setting wins, a Directory.Build.props' and .targets' included;
-    an SDK without a known set, or no setting, adds none; the property and
+    the Razor SDK adds Microsoft.NET.Sdk's; an SDK without a known set, or no
+    setting, adds none; the property and
     the SDK are configuration."""
     base = ("System", "System.Collections.Generic", "System.IO", "System.Linq", "System.Net.Http",
             "System.Threading", "System.Threading.Tasks")
@@ -455,7 +456,10 @@ def test_implicit_usings_are_the_sdks_global_usings(tmp_path):
     assert names("worker/X.cs") == set(base + hosting)
     write(tmp_path, "razor/Razor.csproj", '<Project Sdk="Microsoft.NET.Sdk.Razor">' + implicit.format("enable")
           + "</Project>")
-    assert names("razor/X.cs") == set()
+    assert names("razor/X.cs") == set(base)
+    write(tmp_path, "desk/Desk.csproj", '<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">' + implicit.format("enable")
+          + "</Project>")
+    assert names("desk/X.cs") == set()
     # Directory.Build files: the props' setting applies, the targets' (read after the project) wins.
     write(tmp_path, "lib/Directory.Build.props", "<Project>" + implicit.format("enable") + "</Project>")
     write(tmp_path, "lib/a/A.csproj", csproj())

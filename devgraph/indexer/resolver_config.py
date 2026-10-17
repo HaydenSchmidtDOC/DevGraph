@@ -326,8 +326,9 @@ def _cs_using_items(text: str | None) -> list[tuple[str, CsUsing]]:
 
 
 #: The global usings an SDK adds when `ImplicitUsings` is `enable` (or
-#: `true`), by the project's `Sdk`: Microsoft.NET.Sdk's, and the Web and
-#: Worker SDKs' on top of them.
+#: `true`), by the project's `Sdk`: Microsoft.NET.Sdk's (Razor's too), and
+#: the Web, Worker and BlazorWebAssembly SDKs' on top of them. The
+#: WindowsDesktop SDK's depend on `UseWPF`/`UseWindowsForms` and are not read.
 _CS_SDK_USINGS = {
     "Microsoft.NET.Sdk": (
         "System", "System.Collections.Generic", "System.IO", "System.Linq", "System.Net.Http", "System.Threading",
@@ -337,6 +338,11 @@ _CS_SDK_USINGS = {
 _CS_SDK_USINGS["Microsoft.NET.Sdk.Worker"] = _CS_SDK_USINGS["Microsoft.NET.Sdk"] + (
     "Microsoft.Extensions.Configuration", "Microsoft.Extensions.DependencyInjection", "Microsoft.Extensions.Hosting",
     "Microsoft.Extensions.Logging",
+)
+_CS_SDK_USINGS["Microsoft.NET.Sdk.Razor"] = _CS_SDK_USINGS["Microsoft.NET.Sdk"]
+_CS_SDK_USINGS["Microsoft.NET.Sdk.BlazorWebAssembly"] = _CS_SDK_USINGS["Microsoft.NET.Sdk"] + (
+    "System.Net.Http.Json", "Microsoft.AspNetCore.Components.WebAssembly.Hosting",
+    "Microsoft.Extensions.Configuration", "Microsoft.Extensions.DependencyInjection", "Microsoft.Extensions.Logging",
 )
 _CS_SDK_USINGS["Microsoft.NET.Sdk.Web"] = _CS_SDK_USINGS["Microsoft.NET.Sdk.Worker"] + (
     "System.Net.Http.Json", "Microsoft.AspNetCore.Builder", "Microsoft.AspNetCore.Hosting",
