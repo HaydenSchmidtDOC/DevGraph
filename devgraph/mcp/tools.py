@@ -147,9 +147,10 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
 
 
 def _located(row: dict[str, Any]) -> dict[str, Any]:
-    """A result row without its unknown location: `file`, `owner` and
-    `start_line` dropped when None (a Module has no owner, a Service no line)."""
-    return {k: v for k, v in row.items() if v is not None or k not in ("file", "owner", "start_line")}
+    """A result row without the location keys it has no value for: `owner`
+    and `start_line` dropped when None (a Module has no owner, a Service no
+    line); `file` is always kept, null for a file-less node."""
+    return {k: v for k, v in row.items() if v is not None or k not in ("owner", "start_line")}
 
 
 @contextmanager
@@ -1810,7 +1811,7 @@ def impact_analysis(
 
     Returns:
         Dict with direct_dependents and transitive_dependents ({name, type, file,
-        owner}, file and owner left out when the dependent has none) wrapped as {count, results, truncated}
+        owner}, owner left out and file null when the dependent has none) wrapped as {count, results, truncated}
         envelopes, plus risk_level (computed from true untruncated count). Transitive
         dependents are 2 to `IMPACT_MAX_DEPTH` hops away; a node is listed at its
         nearest hop only, so a direct dependent is never also transitive. When
@@ -2163,7 +2164,8 @@ def list_services(
 #: The `framework` an Endpoint carries, by the extractors that write them
 #: (indexer/apis/extractor.py, and the add_route callers of indexer/apis/routes.py).
 ENDPOINT_FRAMEWORKS = ("ASP.NET Core", "Django", "Express", "FastAPI", "Flask", "Go", "Spring")
-_ENDPOINT_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD", "*")
+#: A method filter: an HTTP method token (`GET`, `PROPFIND`), or "*".
+_ENDPOINT_METHOD = re.compile(r"[A-Z][A-Z-]*|\*")
 
 
 def _endpoint_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -2175,6 +2177,7 @@ def _endpoint_row(row: dict[str, Any]) -> dict[str, Any]:
     method, _, rest = row["name"].partition(" ")
     mounted = not rest.startswith("?")
     path = rest if mounted else rest[1:].rsplit(" (", 1)[0]
+    path = path if path.startswith("/") else "/" + path  # a Django pattern has no leading "/"
     handlers = [h for h in row["handlers"] if h["file"]] or [
         {"name": h["name"], "file": None, "owner": None} for h in row["handlers"]
     ]
@@ -2202,7 +2205,8 @@ def list_endpoints(
         engine: GraphEngine instance
         repo_id: Repository ID. Filters when cross_repo is False; when True it
             only decides ordering (this repo's endpoints first)
-        method: Only this HTTP method (any case; "*" is a route for every method)
+        method: Only this HTTP method token (any case: GET, PROPFIND...; "*" is a
+            route for every method)
         path_prefix: Only paths at or below this prefix, by whole segments
             ("/api" matches "/api" and "/api/users", not "/apis"); a route
             whose mount prefix is unknown (`mounted` False) never matches
@@ -2212,7 +2216,8 @@ def list_endpoints(
         max_results: Maximum number of results to return in the envelope
 
     Returns:
-        {count, results, truncated}, each result {name, method, path, mounted,
+        {count, results, truncated}, each result {name, method, path (always with a
+        leading "/", a Django pattern's added), mounted,
         framework, files (the files routing it), handlers ({name, file, owner}),
         services (the compose services it CALLS), repo_id}, ordered by name;
         past `LIST_ROW_LIMIT` matches it is truncated, with a notice
@@ -2223,8 +2228,8 @@ def list_endpoints(
     _at_least(1, max_results=max_results)
     if method is not None:
         method = method.upper()
-        if method not in _ENDPOINT_METHODS:
-            raise ToolError(f"method must be one of {', '.join(_ENDPOINT_METHODS)}, not {_echo(method)}")
+        if not _ENDPOINT_METHOD.fullmatch(method):
+            raise ToolError(f"method must be an HTTP method like GET or PROPFIND, or *, not {_echo(method)}")
     if framework is not None:
         known = {each.lower(): each for each in ENDPOINT_FRAMEWORKS}
         if framework.lower() not in known:

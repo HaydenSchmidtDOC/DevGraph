@@ -283,8 +283,8 @@ leading `./` (`get_source` also takes an absolute path inside the repository).
 names the caller's `file`, `owner` (the classes or functions it is declared
 in, `""` at the top level) and `start_line`, so `A.run` and `B.run` of one
 file are two rows told apart; a Module caller has no owner or line. Every
-`impact_analysis` dependent is `{name, type, file, owner}` (file and owner
-left out when it has none). `find_callers`, `impact_analysis` and
+`impact_analysis` dependent is `{name, type, file, owner}` (owner left out
+and file null when it has none). `find_callers`, `impact_analysis` and
 `find_related_files` take `owner` to pick one class's method, as `get_source`
 and `describe_node` do, or a method named with its class (`A.run`,
 `A::run`) when no node has that exact name; an owner with no such member is
@@ -398,8 +398,8 @@ doesn't have, and `blame_component`, `find_related_prs` and `issue_history_for`
 on a file it doesn't have, fail with `no ... named ...` and up to five similar
 names (a name that exists but has no answer, such as a function nothing calls,
 is still `count: 0`); `list_recent_changes` with an unknown `entity_type` fails
-and lists the valid labels; `list_endpoints` with an unknown `method` or
-`framework` fails naming the valid ones, and with an unknown `service` like
+and lists the valid labels; `list_endpoints` with a `method` that is no HTTP
+method token, or an unknown `framework` (naming the valid ones), fails, and with an unknown `service` like
 `get_service_dependencies`; and a count
 argument below its minimum (`max_results`, `within_commits`,
 `modified_within_commits`, `members_per_community`, `max_per_type` below 1,

@@ -787,7 +787,7 @@ def build_server(
     ) -> dict[str, Any]:
         """Analyze component impact: direct dependents (one CALLS/USES/DEPENDS_ON hop) and
         transitive ones (two to four hops; further ones are not followed), each {name, type,
-        file, owner} (file and owner left out when it has none), wrapped in {count,
+        file, owner} (owner left out and file null when it has none), wrapped in {count,
         results, truncated} envelopes. Pass owner, or name a method "A.run", to pick one
         class's method. An unknown component is an
         error with similar names. When the name is defined in several files, pass file
@@ -852,7 +852,9 @@ def build_server(
         (ASP.NET Core, Django, Express, FastAPI, Flask, Go, Spring) and service (the compose
         service an endpoint CALLS). A route whose mount its file doesn't show has mounted
         false, its own path, and a name like "GET ?/:id (routes/users.js)"; no path_prefix
-        matches it. An unknown method or framework, or an unknown service, is an error."""
+        matches it; a Django pattern's path gains its leading "/". method takes any HTTP
+        method token (PROPFIND too). A method that is no token, an unknown framework,
+        or an unknown service is an error."""
         return devgraph_tools.list_endpoints(
             engine, repo_id, method, path_prefix, framework, service, cross_repo, max_results
         )
