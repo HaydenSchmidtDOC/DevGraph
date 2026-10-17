@@ -622,3 +622,31 @@ def test_an_imported_classs_method_reaches_the_base_of_its_file_defining_it(
     index_paths(engine, repo_id, root, {models})
     assert [(n, o) for n, _f, o in _targets(engine, repo_id, "run")] == [("check", "Mid"), ("save", "Mid")]
     equals_fresh(engine, repo_id, root)
+
+
+def test_a_route_handler_inherited_by_an_imported_class_relinks_on_a_base_change(engine, repo):
+    """`app.get('/x', Ctrl.list)` on an imported `Ctrl` implements the
+    `list` Ctrl inherits from a base of its file (heir keys); when Ctrl
+    stops extending it, the route file, not re-indexed, loses that
+    IMPLEMENTS as a fresh scan does."""
+    root, _registry, repo_id = repo
+    ctrl = write(root, "web/ctrl.ts", "export class Base { static list() { return 1; } }\n"
+                                      "export class Ctrl extends Base {}\nexport class Other { static list() {} }\n")
+    write(root, "web/app.ts", "import express from 'express';\nimport { Ctrl } from './ctrl';\n\n"
+                              "const app = express();\napp.get('/x', Ctrl.list);\n")
+    full_scan(engine, repo_id, root)
+
+    def implemented():
+        rows = engine.run_cypher(
+            "MATCH (:Endpoint {repo_id: $r})-[:IMPLEMENTS]->(f:Function {repo_id: $r}) WHERE f.file IS NOT NULL "
+            "RETURN f.owner AS o",
+            {"r": repo_id},
+        )
+        return sorted(row["o"] for row in rows)
+
+    assert implemented() == ["Base"]
+    equals_fresh(engine, repo_id, root)
+    ctrl.write_text(ctrl.read_text().replace("Ctrl extends Base", "Ctrl"))
+    index_paths(engine, repo_id, root, {ctrl})
+    assert implemented() == []
+    equals_fresh(engine, repo_id, root)

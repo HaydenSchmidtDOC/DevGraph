@@ -913,7 +913,7 @@ def index_paths(
     # written now, before pass 2 tests them. A kept node whose keys or
     # project changed (no keys and none, no project and "", being the
     # same) was linked by `@` pins under its old keys, and by rows that
-    # could see its old project: its CALLS/IMPORTS edges go with them, and
+    # could see its old project: its CALLS/IMPORTS/IMPLEMENTS edges go with them, and
     # pass 2 and the relink below write them again under the new ones, as
     # for an added node; one a failed batch left stale goes again. It is
     # not added otherwise: no referrer, docs or mention depends on them.

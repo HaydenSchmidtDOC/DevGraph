@@ -930,9 +930,11 @@ def _pin(file: str | None) -> str:
     return pin_kind(file)
 
 
-#: The edge types a resolver writes with a pin's `@` flag, whose edges into a
-#: node therefore depend on its match keys (see GraphEngine.write_match_keys).
-MATCH_KEY_EDGE_TYPES = ("CALLS", "IMPORTS")
+#: The edge types a resolver writes with a pin's `@` flag or an owned end an
+#: heir key can match (graph/schema.py `HEIR_KEY`: a route's IMPLEMENTS of an
+#: imported class's method too), whose edges into a node therefore depend on
+#: its match keys (see GraphEngine.write_match_keys).
+MATCH_KEY_EDGE_TYPES = ("CALLS", "IMPORTS", "IMPLEMENTS")
 #: The most nodes GraphEngine.write_match_keys handles in one transaction.
 RETRACT_NODES = 500
 #: The pin kinds that match a set of files rather than one (see `_pin`).
@@ -2240,8 +2242,8 @@ class GraphEngine:
         node writes leave as they were until now, so a pin's `@` flag
         (graph/schema.py `split_pin`) only ever sees one node's old keys
         with its old edges.
-        A node to `retract` loses its CALLS and IMPORTS edges, which those
-        pins linked under its old keys, in the same transaction, and stays
+        A node to `retract` loses its CALLS, IMPORTS and IMPLEMENTS edges
+        (MATCH_KEY_EDGE_TYPES), which those pins linked under its old keys, in the same transaction, and stays
         `mkeys_stale` until settle_match_keys: the batch writes them again
         under the new keys, the way it writes an added node's, and a batch
         that fails before then finds it stale and does it again. Each

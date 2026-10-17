@@ -208,8 +208,10 @@ agree):
   `engine.write_match_keys` writes every changed node's keys (removing them from one written
   without any), a few hundred nodes per transaction, before pass 2 tests
   them. A kept node whose keys match differently (no keys and none, `[]`,
-  match alike) loses its incoming `CALLS` and `IMPORTS` edges (the types a
-  resolver writes `@` pins on, whatever pin or bare name wrote them) in
+  match alike) loses its incoming `CALLS`, `IMPORTS` and (since index
+  format 19, whose heir keys an owned route handler can match)
+  `IMPLEMENTS` edges (the types a resolver writes `@` pins or owned ends
+  on, whatever pin or bare name wrote them) in
   the same transaction and is marked `mkeys_stale`. Pass 2 writes the
   batch's edges again, and the relink writes other files' again under the
   new keys, as for an added node; then the mark goes. A batch that fails
