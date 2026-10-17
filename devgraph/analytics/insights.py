@@ -12,10 +12,12 @@ process already read.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import posixpath
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -169,12 +171,42 @@ def _repo_lock(repo_id: str) -> threading.Lock:
         return _locks.setdefault(repo_id, threading.Lock())
 
 
-def refresh_insights(engine: Any, repo_id: str, *, blocking: bool = True) -> dict[str, Any] | None:
+def graph_fingerprint(
+    nodes: list[dict[str, Any]], edges: list[dict[str, Any]], community: dict[str, Any] | None = None
+) -> str:
+    """A digest of a loaded insight graph by node identity, not `elementId`
+    (which changes when a file is re-indexed), with each node's stored
+    community, or `community`'s for it when given (what a write just stored).
+    Equal digests mean a recompute would store exactly what is stored now."""
+    ident = {
+        n["id"]: (
+            sorted(n.get("labels") or []), n.get("name"), n.get("file"), n.get("owner"),
+            community.get(n["id"]) if community is not None else n.get("community"),
+        )
+        for n in nodes
+    }
+    payload = json.dumps(
+        [
+            sorted(ident.values(), key=repr),
+            sorted(((ident.get(e["source"]), e["type"], ident.get(e["target"])) for e in edges), key=repr),
+        ],
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def refresh_insights(
+    engine: Any, repo_id: str, *, blocking: bool = True, unless_fingerprint: str | None = None
+) -> dict[str, Any] | None:
     """Load, compute and store one repository's insights.
 
     Serialized per repository within this process (the agent's scheduler and
     the dashboard share one). With `blocking=False`, returns None instead of
     waiting when a run is already in progress.
+
+    The summary stores the graph's `fingerprint` as written. When the loaded
+    graph's fingerprint equals `unless_fingerprint`, nothing is computed or
+    written and the result is `{"computed_at", "fingerprint", "unchanged": True}`.
     """
     lock = _repo_lock(repo_id)
     if not lock.acquire(blocking=blocking):
@@ -183,6 +215,8 @@ def refresh_insights(engine: Any, repo_id: str, *, blocking: bool = True) -> dic
         # Stamped before loading so an index finishing mid-run is not marked covered.
         started = datetime.now(timezone.utc).isoformat()
         nodes, edges = engine.load_insight_graph(repo_id, COMMUNITY_RELATIONSHIPS)
+        if unless_fingerprint is not None and graph_fingerprint(nodes, edges) == unless_fingerprint:
+            return {"computed_at": started, "fingerprint": unless_fingerprint, "unchanged": True}
         result = compute_insights(nodes, edges)
         stored = result.communities[:_MAX_STORED_COMMUNITIES]
         summary = {
@@ -191,6 +225,7 @@ def refresh_insights(engine: Any, repo_id: str, *, blocking: bool = True) -> dic
             "community_count": len(result.communities),
             "modularity": result.modularity,
             "communities": json.dumps(stored),
+            "fingerprint": graph_fingerprint(nodes, edges, {row["id"]: row["community"] for row in result.node_rows}),
         }
         engine.write_insights(repo_id, result.node_rows, summary)
         logger.info(
@@ -261,15 +296,33 @@ def community_members(
 # ── scheduling ───────────────────────────────────────────────────────────
 
 _SCHEDULER_INTERVAL_S = 30.0
+# A repository's insights are recomputed once its indexing has been quiet for
+# _SETTLE_S, or, while edits go on, once they are _MAX_LAG_S behind it. A run
+# that took T is followed by none for _DURATION_FACTOR * T, so a repository
+# whose refresh is slow is not recomputed continuously.
+_SETTLE_S = 60.0
+_MAX_LAG_S = 600.0
+_DURATION_FACTOR = 5.0
+
+
+def _seconds_since(now: datetime, stamp: str) -> float:
+    at = datetime.fromisoformat(stamp)
+    return (now - (at if at.tzinfo else at.replace(tzinfo=timezone.utc))).total_seconds()
 
 
 class InsightsScheduler:
-    """Keeps every active repository's insights no older than its last index.
+    """Keeps every active repository's insights no older than its last index,
+    within the timing above.
 
     One rule covers every way a repository gets indexed -- watcher batches in
     this agent, CLI rescans, dashboard registrations -- because they all
     stamp `last_indexed` in the registry. The first pass runs as soon as the
     thread starts, which also backfills repositories never computed.
+
+    A save that changed nothing insights read (a comment, a docstring, a
+    function body whose calls are the same) is found by the graph's
+    fingerprint: the graph is loaded, but nothing is computed or written and
+    no `insights_refreshed` is published.
     """
 
     def __init__(
@@ -279,11 +332,22 @@ class InsightsScheduler:
         on_refreshed: Callable[[str], None] | None = None,
         *,
         interval_s: float = _SCHEDULER_INTERVAL_S,
+        settle_s: float = _SETTLE_S,
+        max_lag_s: float = _MAX_LAG_S,
+        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._engine = engine
         self._registry = registry
         self._on_refreshed = on_refreshed
         self._interval_s = interval_s
+        self._settle_s = settle_s
+        self._max_lag_s = max_lag_s
+        self._clock = clock
+        self._monotonic = monotonic
+        # When a run found the graph unchanged: covers `last_indexed` like `computed_at`.
+        self._checked_at: dict[str, str] = {}
+        self._not_before: dict[str, float] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -291,13 +355,26 @@ class InsightsScheduler:
     def running(self) -> bool:
         return self._thread is not None
 
-    def is_stale(self, repo: Any) -> bool:
-        if not repo.last_indexed:
-            return False
-        summary = self._engine.read_insights_summary(repo.repo_id)
+    def _due(self, repo: Any) -> tuple[bool, str | None]:
+        """Whether it is stale (insights older than its last index) and its
+        edits have settled or the insights lag too far behind them; and the
+        stored fingerprint."""
+        if not repo.last_indexed or self._monotonic() < self._not_before.get(repo.repo_id, float("-inf")):
+            return False, None
+        summary = self._engine.read_insights_summary(repo.repo_id) or {}
+        stamps = [s for s in (summary.get("computed_at"), self._checked_at.get(repo.repo_id)) if s]
+        covered = max(stamps) if stamps else None
         # Both are UTC ISO-8601 strings from datetime.isoformat(), so they
         # order correctly as strings.
-        return summary is None or (summary.get("computed_at") or "") < repo.last_indexed
+        if covered is not None and covered >= repo.last_indexed:
+            return False, None
+        now = self._clock()
+        due = (
+            _seconds_since(now, repo.last_indexed) >= self._settle_s
+            or covered is None
+            or _seconds_since(now, covered) >= self._max_lag_s
+        )
+        return due, summary.get("fingerprint")
 
     def run_once(self) -> list[str]:
         refreshed: list[str] = []
@@ -305,10 +382,18 @@ class InsightsScheduler:
             if self._stop.is_set():
                 break
             try:
-                if not self.is_stale(repo):
+                due, fingerprint = self._due(repo)
+                if not due:
                     continue
-                if refresh_insights(self._engine, repo.repo_id, blocking=False) is None:
+                started = self._monotonic()
+                result = refresh_insights(self._engine, repo.repo_id, blocking=False, unless_fingerprint=fingerprint)
+                if result is None:
                     continue  # another caller is computing it right now
+                finished = self._monotonic()
+                self._not_before[repo.repo_id] = finished + _DURATION_FACTOR * (finished - started)
+                if result.get("unchanged"):
+                    self._checked_at[repo.repo_id] = result["computed_at"]
+                    continue
             except Exception:
                 # Interrupted by shutdown (the engine refuses new sessions
                 # once it closes): not a failure worth a warning.

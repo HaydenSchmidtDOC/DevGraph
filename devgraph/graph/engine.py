@@ -522,7 +522,8 @@ _LOAD_INSIGHT_EDGES_CYPHER = (
 )
 _LOAD_INSIGHT_NODES_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) WHERE elementId(n) IN $ids "
-    "RETURN elementId(n) AS id, n.name AS name, labels(n) AS labels, n.file AS file"
+    "RETURN elementId(n) AS id, n.name AS name, labels(n) AS labels, n.file AS file, n.owner AS owner, "
+    "n.insight_community AS community"
 )
 _CLEAR_INSIGHTS_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) "
@@ -541,13 +542,13 @@ _WRITE_INSIGHTS_SUMMARY_CYPHER = (
     "MATCH (r:Repository {repo_id: $repo_id}) "
     "SET r.insights_computed_at = $computed_at, r.insights_node_count = $node_count, "
     "r.insights_community_count = $community_count, r.insights_modularity = $modularity, "
-    "r.insights_communities = $communities"
+    "r.insights_communities = $communities, r.insights_fingerprint = $fingerprint"
 )
 _READ_INSIGHTS_SUMMARY_CYPHER = (
     "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.insights_computed_at IS NOT NULL "
     "RETURN r.insights_computed_at AS computed_at, r.insights_node_count AS node_count, "
     "r.insights_community_count AS community_count, r.insights_modularity AS modularity, "
-    "r.insights_communities AS communities"
+    "r.insights_communities AS communities, r.insights_fingerprint AS fingerprint"
 )
 
 # Transient Neo4j failures worth retrying: a connection blip, an expired
