@@ -1250,6 +1250,7 @@ async function loadSchemaTypes(repo) {
    graph, and counts all move together. Falls back to the old client-only
    glow-filter when Neo4j isn't reachable (demo mode has nothing to fetch). */
 function isolateChanged() {
+  nodeCeilingUncapped = false;
   refreshIsolateUI();
   if (neo4jConnected) refreshGraph("full", true);
   else applyState(false, "full");
@@ -2689,6 +2690,12 @@ function allReposClause(alias) {
 const CANVAS_NODE_CAP = 1500;
 let nodeCeilingUncapped = false;
 let scopeNodeTotal = 0;
+/* Releasing the slider at its max lifts the cap only where there is one to
+   lift; the choice lasts for this scope, and a repository or isolation
+   change starts the next scope capped again. */
+function uncapRequested(value, max) {
+  return value >= max && max > CANVAS_NODE_CAP;
+}
 function seededNodeCeiling(total) {
   return nodeCeilingUncapped ? total : Math.min(total, CANVAS_NODE_CAP);
 }
@@ -3131,8 +3138,8 @@ async function runLiveRefresh() {
     }
   } finally {
     liveRefreshRunning = false;
+    if (liveRefreshPending) { liveRefreshPending = false; scheduleLiveRefresh(); }
   }
-  if (liveRefreshPending) { liveRefreshPending = false; scheduleLiveRefresh(); }
 }
 /* ── end Live refresh ── */
 function connectLiveEvents() {
@@ -3246,7 +3253,7 @@ document.querySelectorAll('#linkOpenConfig').forEach(l => l.addEventListener("cl
    from Neo4j instead of just un-hiding elements that were never fetched. */
 document.getElementById("ctlNodeCeiling").addEventListener("input", e => { state.nodeCeiling = +e.target.value; document.getElementById("valNodeCeiling").textContent = e.target.value; applyState(); });
 document.getElementById("ctlRelCeiling").addEventListener("input", e => { state.relCeiling = +e.target.value; document.getElementById("valRelCeiling").textContent = e.target.value; applyState(); });
-document.getElementById("ctlNodeCeiling").addEventListener("change", e => { nodeCeilingUncapped = +e.target.value >= +e.target.max; if (neo4jConnected) refreshGraph(undefined, true); });
+document.getElementById("ctlNodeCeiling").addEventListener("change", e => { nodeCeilingUncapped = uncapRequested(+e.target.value, +e.target.max); if (neo4jConnected) refreshGraph(undefined, true); });
 document.getElementById("ctlRelCeiling").addEventListener("change", () => { if (neo4jConnected) refreshGraph(undefined, true); });
 
 document.getElementById("layoutSelect").addEventListener("change", () => {
@@ -3270,6 +3277,7 @@ document.getElementById("graphSearch").addEventListener("input", e => {
 document.getElementById("pullTab").addEventListener("click", () => document.getElementById("controlFlyout").classList.toggle("open"));
 async function onRepoSelectChange(e) {
   const v = e.target.value;
+  nodeCeilingUncapped = false;
   if (!e.automatic) localStorage.setItem(SELECTED_REPO_KEY, v);
   applyCatchUpPill(null);
   if (neo4jConnected) await loadSchemaTypes(v); // before the graph fetch, so a type the new repo lacks is no longer isolated

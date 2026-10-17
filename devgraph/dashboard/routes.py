@@ -148,7 +148,17 @@ def _canvas_result(result: dict[str, Any]) -> dict[str, Any]:
 
 def neo4j_down_message(exc: BaseException, uri: str) -> str | None:
     """The MCP tools' wording for Neo4j being unreachable at `uri` or refusing
-    the login, when `exc` is that; None for any other error."""
+    the login, when `exc` is that; None for any other error. A connection
+    lost mid-session (`SessionExpired`) reads as unreachable, and any
+    `Neo.ClientError.Security.*` refusal (too many attempts, expired
+    credentials) as a refused login."""
+    from neo4j.exceptions import AuthError, ServiceUnavailable, SessionExpired
+
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code.startswith("Neo.ClientError.Security.") and not isinstance(exc, AuthError):
+        exc = AuthError(code)
+    elif isinstance(exc, SessionExpired):
+        exc = ServiceUnavailable(str(exc))
     error = devgraph_tools.neo4j_unavailable(exc, uri)
     return str(error) if error is not None else None
 
@@ -421,8 +431,15 @@ def build_router(
             # (e.g. Neo4j down) must not undo it -- same call as the CLI's,
             # and `devgraph rescan <repo_id>` is the same retry.
             logger.warning("registered %s but the initial scan failed: %s", record.repo_id, exc)
+            # The driver's text (addresses, internals) stays in the log; our
+            # own errors (an invalid schema file) say what to fix.
+            from neo4j.exceptions import DriverError, Neo4jError
+
+            reason = neo4j_down_message(exc, neo4j_uri) or (
+                type(exc).__name__ if isinstance(exc, (DriverError, Neo4jError)) else str(exc)
+            )
             warning = (
-                f"Registered, but the initial scan failed: {exc}. "
+                f"Registered, but the initial scan failed: {reason}. "
                 f"Run 'devgraph rescan {record.repo_id}' once Neo4j is reachable."
             )
 

@@ -78,3 +78,33 @@ def test_a_refused_login_names_the_settings(registry):
     c = client(registry, DownEngine(AuthError("The client is unauthorized")))
     assert "DEVGRAPH_NEO4J_PASSWORD" in c.get("/api/repos").json()["graph_unavailable"]
     assert "DEVGRAPH_NEO4J_PASSWORD" in c.post("/api/cypher", json={"query": "RETURN 1"}).json()["errors"][0]["message"]
+
+
+def test_a_lost_session_reads_as_unreachable(registry):
+    from neo4j.exceptions import SessionExpired
+
+    c = client(registry, DownEngine(SessionExpired(RAW)))
+    assert c.get("/api/repos").json()["graph_unavailable"].startswith(f"Neo4j isn't reachable at {URI}")
+    res = c.get("/api/repos/alpha/summary")
+    assert res.status_code == 503 and res.json()["detail"].startswith("Neo4j isn't reachable")
+
+
+def test_a_security_refusal_names_the_settings(registry):
+    from neo4j.exceptions import ClientError
+
+    refusal = ClientError._hydrate_neo4j(code="Neo.ClientError.Security.AuthenticationRateLimit", message="too many")
+    c = client(registry, DownEngine(refusal))
+    res = c.get("/api/repos/alpha/schema")
+    assert res.status_code == 503 and "DEVGRAPH_NEO4J_PASSWORD" in res.json()["detail"]
+    assert "DEVGRAPH_NEO4J_PASSWORD" in c.post("/api/cypher", json={"query": "RETURN 1"}).json()["errors"][0]["message"]
+
+
+def test_registration_warning_carries_no_driver_text(registry, tmp_path):
+    repo = tmp_path / "gamma"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    res = client(registry).post("/api/repos", json={"path": str(repo)})
+    assert res.status_code == 201
+    warning = res.json()["warning"]
+    assert warning.startswith(f"Registered, but the initial scan failed: Neo4j isn't reachable at {URI}")
+    assert "ResolvedIPv4Address" not in warning

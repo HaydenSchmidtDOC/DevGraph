@@ -22,6 +22,7 @@ const src = [
   grab(/^const CANVAS_NODE_CAP = /m, "\n"),
   grab(/^let nodeCeilingUncapped = /m, "\n"),
   grab(/^let scopeNodeTotal = /m, "\n"),
+  grab(/^function uncapRequested\(/m, "\n}"),
   grab(/^function seededNodeCeiling\(/m, "\n}"),
   grab(/^function canvasCapNotice\(/m, "\n}"),
   grab(/^function currentStateQuery\(/m, "\n}"),
@@ -33,17 +34,21 @@ const els = {
   ctlNodeCeiling: { max: 52021 }, ctlRelCeiling: { max: 136000 },
 };
 const timers = [];
-let refreshes = 0, release = null;
+let refreshes = 0, release = null, failRefresh = false;
 const globals = {
   document: { getElementById: id => els[id] || null },
   state: { isolatedEntity: null, isolatedRel: null, nodeCeiling: 0, relCeiling: 136000 },
   neo4jConnected: true,
   loadSchemaTypes: async () => {},
-  refreshGraph: async () => { refreshes++; await new Promise(r => { release = r; }); },
+  refreshGraph: async () => {
+    refreshes++;
+    await new Promise(r => { release = r; });
+    if (failRefresh) throw new Error("network hiccup");
+  },
   setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
 };
 const api = new Function(...Object.keys(globals), src +
-  "\nreturn { CANVAS_NODE_CAP, seededNodeCeiling, canvasCapNotice, currentStateQuery, scheduleLiveRefresh," +
+  "\nreturn { CANVAS_NODE_CAP, uncapRequested, seededNodeCeiling, canvasCapNotice, currentStateQuery, scheduleLiveRefresh," +
   " liveRefreshDelay, setUncapped: v => { nodeCeilingUncapped = v; }, setTotal: v => { scopeNodeTotal = v; } };")(
   ...Object.values(globals));
 
@@ -76,8 +81,15 @@ const check = (label, cond, detail) => {
   check("an explicit max follows the total", api.seededNodeCeiling(52021) === 52021, api.seededNodeCeiling(52021));
   api.setUncapped(false);
   check("the slider release handler is what lifts the cap",
-    /ctlNodeCeiling"\)\.addEventListener\("change", e => \{ nodeCeilingUncapped = \+e\.target\.value >= \+e\.target\.max;/.test(html),
+    /ctlNodeCeiling"\)\.addEventListener\("change", e => \{ nodeCeilingUncapped = uncapRequested\(\+e\.target\.value, \+e\.target\.max\);/.test(html),
     "change handler does not set nodeCeilingUncapped");
+  check("releasing at a max above the cap lifts it", api.uncapRequested(52021, 52021) === true, "");
+  check("releasing at a max within the cap does not", api.uncapRequested(800, 800) === false, "");
+  check("releasing below the max does not", api.uncapRequested(1500, 52021) === false, "");
+  for (const fn of ["onRepoSelectChange", "isolateChanged"]) {
+    const body = grab(new RegExp("^(?:async )?function " + fn + "\\(", "m"), "\n}");
+    check(`${fn} starts the new scope capped again`, /nodeCeilingUncapped = false;/.test(body), body);
+  }
 
   // 4. live refreshes are coalesced: one per window, never two at once
   api.setTotal(52021);
@@ -100,6 +112,19 @@ const check = (label, cond, detail) => {
   await new Promise(r => setImmediate(r));
   check("...which then runs", refreshes === 2, refreshes);
   release();
+  await new Promise(r => setImmediate(r));
+
+  // 5. a refresh that fails still runs the one queued behind it
+  api.scheduleLiveRefresh();
+  const failing = timers.shift().fn().catch(() => {});
+  await new Promise(r => setImmediate(r));
+  api.scheduleLiveRefresh();
+  timers.shift().fn();
+  failRefresh = true;
+  release();
+  await failing;
+  check("a failed refresh still schedules the one queued behind it", timers.length === 1, timers.length);
+  failRefresh = false;
 
   if (failures) { console.log(`\n${failures} check(s) failed`); process.exit(1); }
   console.log("\nall checks passed");
