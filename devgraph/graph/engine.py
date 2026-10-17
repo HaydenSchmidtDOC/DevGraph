@@ -1163,11 +1163,16 @@ def _owner_test(ref: str, end: str, var: str, label: str) -> str:
         return f"({owner} IS NULL OR {var}.owner = {owner})"
     heir = f" OR '{HEIR_KEY}' + {owner} IN coalesce({var}.mkeys, [])"
     if label == "Function":
+        # Both subqueries are hinted to seek, for the reason _end_match gives:
+        # a plan from other statistics scanned an index per row on CI.
         heir += (
             f" OR (EXISTS {{ MATCH ({var}_mod:Module {{repo_id: {var}.repo_id, name: {var}.file}}) "
+            f"USING INDEX SEEK {var}_mod:Module(repo_id, name) "
             f"WHERE {owner} IN coalesce({var}_mod.heir_open, []) }} "
             f"AND NOT EXISTS {{ MATCH ({var}_sib:Function {{repo_id: {var}.repo_id, name: {var}.name, file: {var}.file}}) "
-            f"WHERE {var}_sib.owner = {owner} OR '{HEIR_KEY}' + {owner} IN coalesce({var}_sib.mkeys, []) }})"
+            f"USING INDEX SEEK {var}_sib:Function(repo_id, name, file, owner) "
+            f"WHERE {var}_sib.owner IS NOT NULL "
+            f"AND ({var}_sib.owner = {owner} OR '{HEIR_KEY}' + {owner} IN coalesce({var}_sib.mkeys, [])) }})"
         )
     return f"({owner} IS NULL OR {var}.owner = {owner}{heir})"
 
