@@ -357,29 +357,39 @@ def heir_keys(classes: Iterable[ClassDecl], c3: bool = False) -> dict[tuple[str,
 
 def add_heir_keys(result: ExtractionResult, classes: Iterable[ClassDecl], c3: bool = False) -> None:
     """Give each of `result`'s Functions the heir keys (`heir_keys`) of
-    `classes`, the file's class declarations, as its `mkeys`. An open class
-    (`_heirs`: a base outside the file) can have any member its file doesn't
-    name for it, so every Function of the file named otherwise than its
-    known members gets its key too: an owned pin to it then links what an
-    owner-less one did before owners narrowed it. A member no class of the
-    file inherits gets none."""
+    `classes`, the file's class declarations, as its `mkeys` (a member no
+    class of the file inherits gets none), and its Module the file's open
+    classes (`_heirs`) as `heir_open`, always written: an open class can
+    have any member its file doesn't name for it, so an owned end to it
+    also links a Function of its name when no Function of that name there
+    is its own or inherited member (`owner_matches`), what an owner-less
+    end linked before owners narrowed it."""
     found, open_owners = _heirs(classes, c3)
     for node in result.nodes:
-        if node.label != "Function":
-            continue
-        heirs = set(found.get((node.name, node.properties.get("owner") or ""), ()))
-        heirs.update(HEIR_KEY + owner for owner, known in open_owners.items() if node.name not in known)
-        if heirs:
+        if node.label == "Module":
+            node.properties["heir_open"] = sorted(open_owners)
+        elif node.label == "Function" and (heirs := found.get((node.name, node.properties.get("owner") or ""))):
             node.properties["mkeys"] = sorted(heirs)
 
 
-def owner_matches(owners: Iterable[str | None], node_owner: str | None, keys: Iterable[str] = ()) -> bool:
+def owner_matches(
+    owners: Iterable[str | None], node_owner: str | None, keys: Iterable[str] = (),
+    open_owners: Iterable[str] = (), siblings: Iterable[tuple[str | None, Iterable[str]]] = (),
+) -> bool:
     """Whether a target end naming one of `owners` (None: any) links the
-    node of owner `node_owner` whose `mkeys` are `keys`: its own owner, or
-    one its heir keys (`heir_keys`) say inherits it. The engine's Cypher
-    mirrors this (graph/engine.py `_owner_test`)."""
-    keys = set(keys)
-    return any(owner is None or owner == node_owner or HEIR_KEY + owner in keys for owner in owners)
+    Function of owner `node_owner` whose `mkeys` are `keys`: its own owner,
+    one its heir keys (`heir_keys`) say inherits it, or an open class of its
+    file (`open_owners`, its Module's `heir_open`) none of the Functions of
+    its name there (`siblings`: their (owner, mkeys)) is or inherits. The
+    engine's Cypher mirrors this (graph/engine.py `_owner_test`)."""
+    keys, open_owners = set(keys), set(open_owners)
+    siblings = [(owner, set(each)) for owner, each in siblings]
+    return any(
+        owner is None or owner == node_owner or HEIR_KEY + owner in keys or (
+            owner in open_owners and not any(o == owner or HEIR_KEY + owner in k for o, k in siblings)
+        )
+        for owner in owners
+    )
 
 
 def own_edges(result: ExtractionResult, file_path: str) -> ExtractionResult:

@@ -925,12 +925,20 @@ def index_paths(
             (previous_keys[node] or ()) != (keys or ()) or (previous_projects[node] or "") != (projects[node] or "")
         ))
     }
+    # A file's open classes (its Module's `heir_open`, common.add_heir_keys)
+    # decide which of its Functions an owned end links too, as keys do.
+    new_open = _heir_open(code_extractions)
+    old_open = engine.file_heir_open(repo_id, sorted(new_open)) if new_open else {}
+    rekeyed |= _open_rekeyed(old_open, new_open, previous_keys, match_keys)
     rewritten = sorted(
         (*node, keys, projects[node], node in rekeyed) for node, keys in match_keys.items()
         if node in rekeyed or previous_keys.get(node) != keys or previous_projects.get(node) != projects[node]
     )
     if rewritten:
         engine.write_match_keys(repo_id, rewritten)
+    # Written after the retraction marks (`mkeys_stale`), so a batch cut
+    # short in between finds the old list and retracts again.
+    engine.write_heir_open(repo_id, {f: o for f, o in new_open.items() if old_open.get(f) != o})
     # The match keys, old and new, of the nodes the batch adds, removes or
     # rekeys, by name: a tiered pin's edges to such a name depend on all its
     # nodes, so the relink writes the groups whose keys meet them again (see
@@ -1026,6 +1034,7 @@ def index_paths(
     if relink_outside:
         _relink_name_refs(
             engine, repo_id, added | rekeyed, set(by_rel_path) | referrers, match_keys, shadow_names, projects,
+            _open_info(new_open, match_keys),
         )
     if rekeyed:
         engine.settle_match_keys(repo_id, sorted(rekeyed))
@@ -1145,10 +1154,10 @@ def _with_name_refs(nodes: list[dict], rels: list[dict], rel_path: str) -> list[
     pass 2 re-upserts the plain `nodes`, so it never writes them again. Its
     symbols' match keys are left out: index_paths writes them after pass 1
     (engine.write_match_keys), with the edges they decide, and so is their
-    C# project (`proj`)."""
+    C# project (`proj`), and its Module's open classes (`heir_open`)."""
     refs = name_ref_properties(rels)
     return [
-        {**node, "properties": {**node["properties"], **refs}}
+        {**node, "properties": {**{k: v for k, v in node["properties"].items() if k != "heir_open"}, **refs}}
         if node["label"] == "Module" and node["name"] == rel_path
         else {**node, "properties": {k: v for k, v in node["properties"].items() if k not in ("mkeys", "proj")}}
         if "mkeys" in node["properties"] or "proj" in node["properties"] else node
@@ -1419,6 +1428,68 @@ def _projects(
     }
 
 
+def _heir_open(
+    code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
+) -> dict[str, tuple[str, ...]]:
+    """File -> its Module's open classes (`heir_open`, common.add_heir_keys)
+    for every code file of the batch whose extractor writes them."""
+    return {
+        node["name"]: tuple(sorted(node["properties"]["heir_open"]))
+        for extractions in code_extractions
+        for _rel_path, (file_nodes, _rels) in extractions.items()
+        for node in file_nodes
+        if node["label"] == "Module" and "heir_open" in node["properties"]
+    }
+
+
+def _open_rekeyed(
+    old_open: dict[str, tuple[str, ...]], new_open: dict[str, tuple[str, ...]],
+    previous_keys: dict[tuple[str, str, str, str], tuple[str, ...] | None],
+    match_keys: dict[tuple[str, str, str, str], tuple[str, ...] | None],
+) -> set[tuple[str, str, str, str]]:
+    """The batch's Functions whose incoming owned edges an open class of
+    their file (graph/engine.py `_owner_test`) may have linked otherwise:
+    every Function of a file whose open classes changed, and of a file with
+    open classes, every Function of a name whose Functions an open class
+    now has or inherits otherwise than before (one added, removed, or
+    rekeyed). They are retracted and relinked as rekeyed nodes are."""
+    def functions(keys, file):
+        return [(node, each or ()) for node, each in keys.items() if node[0] == "Function" and node[2] == file]
+
+    found: set[tuple[str, str, str, str]] = set()
+    for file in set(old_open) | set(new_open):
+        owners_old, owners_new = set(old_open.get(file, ())), set(new_open.get(file, ()))
+        new = functions(match_keys, file)
+        if owners_old != owners_new:
+            found.update(node for node, _keys in new)
+            continue
+        if not owners_new:
+            continue
+        old = functions(previous_keys, file)
+
+        def has(nodes, name, owner):
+            return any(node[1] == name and (node[3] == owner or HEIR_KEY + owner in keys) for node, keys in nodes)
+
+        for name in {node[1] for node, _keys in new} | {node[1] for node, _keys in old}:
+            if any(has(old, name, owner) != has(new, name, owner) for owner in owners_new):
+                found.update(node for node, _keys in new if node[1] == name)
+    return found
+
+
+def _open_info(
+    new_open: dict[str, tuple[str, ...]], match_keys: dict[tuple[str, str, str, str], tuple[str, ...] | None],
+) -> dict[str, tuple[tuple[str, ...], dict[str, list]]]:
+    """File -> (its open classes, name -> its Functions' (owner, mkeys)),
+    which common.owner_matches reads, for the batch's files with open classes."""
+    info: dict[str, tuple[tuple[str, ...], dict[str, list]]] = {
+        file: (owners, {}) for file, owners in new_open.items() if owners
+    }
+    for (label, name, file, owner), keys in match_keys.items():
+        if label == "Function" and file in info:
+            info[file][1].setdefault(name, []).append((owner, keys or ()))
+    return info
+
+
 def _shadow_keys(nodes) -> dict[tuple[str, str], set[str]]:
     """(label, name) -> the match keys of these (node, old mkeys, new mkeys)
     of a file-scoped label, old and new together, heir keys
@@ -1441,6 +1512,7 @@ def _relink_name_refs(
     match_keys: dict[tuple[str, str, str, str], tuple[str, ...] | None] | None = None,
     shadow_names: Mapping[tuple[str, str], set[str]] | None = None,
     projects: dict[tuple[str, str, str, str], str | None] | None = None,
+    open_info: dict[str, tuple[tuple[str, ...], dict[str, list]]] | None = None,
 ) -> None:
     """Re-write the by-name edges that code files outside `skip` recorded in
     their Modules' `name_refs` (see name_ref_properties) and that meet a node
@@ -1459,7 +1531,9 @@ def _relink_name_refs(
     file-keyed index. An entry with target pins relinks only an added node a
     pin of its links (common.best_pin: the strongest pin that matches its
     file, as the writer's rows leave out what a stronger pin matches, tested
-    against the node's `match_keys`), with that pin's confidence, when a
+    against the node's `match_keys`; an owned pin's owner as
+    common.owner_matches reads it, with `open_info`, the batch files' open
+    classes and their Functions), with that pin's confidence, when a
     path pin's node is visible to the entry's file's project (its
     Module's `name_ref_visible` against the node's `projects`,
     common.visible_to): such an edge is pinned to the node's file, so the
@@ -1565,7 +1639,9 @@ def _relink_name_refs(
                         pin = pin if visible_to((projects or {}).get(node), visible) else None
                     # A pin that named its target's owner links only that owner's member,
                     # its own or one it inherits from a class of its file.
-                    if pin is not None and owner_matches(owners[pin], to_owner, keys):
+                    opened, siblings = (open_info or {}).get(to_file or "", ((), {})) if to_label == "Function" \
+                        else ((), {})
+                    if pin is not None and owner_matches(owners[pin], to_owner, keys, opened, siblings.get(to_name, ())):
                         relink(
                             origin, fields, from_file, to_file, pin_confidence(pin, confidence), from_owner=owner,
                             to_owner=to_owner,

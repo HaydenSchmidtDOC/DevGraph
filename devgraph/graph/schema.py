@@ -71,7 +71,8 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # `shared_claims` the shared nodes its file claims (graph/engine.py
 # `SHARED_CLAIM_SEP`). `mkeys` is a
 # code symbol's match keys, which a pin's `@` flag tests (see `split_pin`),
-# and its heir keys (`HEIR_KEY`), which an owned target end tests,
+# and its heir keys (`HEIR_KEY`), which an owned target end tests, as it
+# tests a code Module's `heir_open` (its file's open classes),
 # and `mkeys_stale` marks one whose edges a batch has yet to relink after
 # they changed (see graph/engine.py `write_match_keys`). A code symbol's
 # `owner` (its identity within its file, see FILE_SCOPED_LABELS) and a C#
@@ -81,7 +82,7 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
     "repo_id", "name", "file", "source_file", "source", "sources", "claims", "extractor",
     "name_refs", "name_ref_targets", "name_ref_sources", "name_ref_visible", "mkeys", "mkeys_stale",
-    "shared_claims",
+    "shared_claims", "heir_open",
 })
 
 # The pipeline's own bookkeeping among those, plus the Repository node's
@@ -90,7 +91,7 @@ RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
 # dashboard's node inspector).
 INTERNAL_NODE_PROPERTIES: frozenset[str] = frozenset({
     "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources", "name_ref_visible", "mkeys",
-    "mkeys_stale", "shared_claims", "skipped_files",
+    "mkeys_stale", "shared_claims", "skipped_files", "heir_open",
 })
 
 # An extracted edge's bookkeeping: `origins`, the files that wrote it

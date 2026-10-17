@@ -786,3 +786,29 @@ def test_a_class_whose_members_the_file_cant_name_keeps_the_links_it_had(engine,
         assert _targets(engine, repo_id, caller) == [("extra", "shop/models.py", "")], caller
     assert _targets(engine, repo_id, "b") == [("table", "shop/models.py", "Meta")]
     equals_fresh(engine, repo_id, root)
+
+
+def test_an_open_classes_fallback_follows_its_file(engine, repo):
+    """`Remote().sync()` on an open `Remote` (a base outside its file) links
+    the file's `sync` while Remote neither has nor inherits one there; a
+    `sync` added to Remote takes the link over, removing it gives it back,
+    and closing Remote (no outside base) drops it, each without
+    re-indexing the caller, as a fresh scan links it."""
+    root, _registry, repo_id = repo
+    models = write(root, "shop/models.py", "from lib import Model\n\n\nclass Remote(Model):\n    pass\n\n\n"
+                                           "def sync():\n    return 1\n")
+    write(root, "shop/jobs.py", "from shop.models import Remote\n\n\ndef run():\n    Remote().sync()\n")
+    full_scan(engine, repo_id, root)
+    steps = [
+        (models.read_text(), [("sync", "shop/models.py", "")]),
+        (models.read_text().replace("    pass\n", "    def sync(self):\n        return 2\n", 1),
+         [("sync", "shop/models.py", "Remote")]),
+        (models.read_text(), [("sync", "shop/models.py", "")]),
+        (models.read_text().replace("class Remote(Model):", "class Remote:"), []),
+        (models.read_text(), [("sync", "shop/models.py", "")]),
+    ]
+    for text, expected in steps:
+        models.write_text(text)
+        index_paths(engine, repo_id, root, {models})
+        assert _targets(engine, repo_id, "run") == expected
+        equals_fresh(engine, repo_id, root)

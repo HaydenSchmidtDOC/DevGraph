@@ -1150,12 +1150,25 @@ def _shadow_free(ref: str, var: str, label: str) -> str:
     )
 
 
-def _owner_test(ref: str, end: str, var: str) -> str:
+def _owner_test(ref: str, end: str, var: str, label: str) -> str:
     """Cypher keeping the node `var` when the end's `{end}_owner` is unset
     or names it: its own owner, or, for a target, a class of its file that
-    inherits it (the node's heir key, graph/schema.py `HEIR_KEY`)."""
+    inherits it (the node's heir key, graph/schema.py `HEIR_KEY`), or, for a
+    target Function, an *open* class of its file (its Module's `heir_open`)
+    when no Function of its name there is that class's own or inherited
+    member: what an owner-less end linked. devgraph/indexer/common.py
+    `owner_matches` mirrors this."""
     owner = f"{ref}.{end}_owner"
-    heir = f" OR '{HEIR_KEY}' + {owner} IN coalesce({var}.mkeys, [])" if end == "to" else ""
+    if end != "to":
+        return f"({owner} IS NULL OR {var}.owner = {owner})"
+    heir = f" OR '{HEIR_KEY}' + {owner} IN coalesce({var}.mkeys, [])"
+    if label == "Function":
+        heir += (
+            f" OR (EXISTS {{ MATCH ({var}_mod:Module {{repo_id: {var}.repo_id, name: {var}.file}}) "
+            f"WHERE {owner} IN coalesce({var}_mod.heir_open, []) }} "
+            f"AND NOT EXISTS {{ MATCH ({var}_sib:Function {{repo_id: {var}.repo_id, name: {var}.name, file: {var}.file}}) "
+            f"WHERE {var}_sib.owner = {owner} OR '{HEIR_KEY}' + {owner} IN coalesce({var}_sib.mkeys, []) }})"
+        )
     return f"({owner} IS NULL OR {var}.owner = {owner}{heir})"
 
 
@@ -1209,7 +1222,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
                 match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
             if label in FILE_SCOPED_LABELS:
                 # The members of one owner in the files the pin matches, when the row names it.
-                conditions.append(_owner_test(ref, end, var))
+                conditions.append(_owner_test(ref, end, var, label))
                 conditions.append(_visible(var))
         conditions[:0] = _path_pin_conditions(ref, path, var)
         return match + "WHERE " + " AND ".join(conditions) + " " + (_shadow_free(ref, var, label) if tiered else "")
@@ -1223,7 +1236,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
             # owner; every one of them otherwise. A node an index older than
             # owners wrote is left out until the upgrade rescan gives it one.
             conditions[:0] = [
-                f"{var}.owner IS NOT NULL", _owner_test(ref, end, var),
+                f"{var}.owner IS NOT NULL", _owner_test(ref, end, var, label),
             ]
     else:
         match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
@@ -2258,6 +2271,29 @@ class GraphEngine:
             "SET b.mkeys = row.mkeys, b.proj = row.proj, b.mkeys_stale = CASE WHEN row.retract THEN true END "
             f"WITH b, row WHERE row.retract MATCH ()-[r:{'|'.join(MATCH_KEY_EDGE_TYPES)}]->(b) DELETE r",
         )
+
+    def file_heir_open(self, repo_id: str, files: list[str]) -> dict[str, tuple[str, ...]]:
+        """Each of `files`' Module's `heir_open` (the open classes of its
+        file, see _owner_test), sorted; a Module without one is left out."""
+        with self._driver.session() as session:
+            rows = _run_records(
+                session,
+                "UNWIND $files AS f MATCH (m:Module {repo_id: $repo_id, name: f}) WHERE m.heir_open IS NOT NULL "
+                "RETURN m.name AS f, m.heir_open AS o",
+                repo_id=repo_id, files=files,
+            )
+            return {row["f"]: tuple(sorted(row["o"])) for row in rows or []}
+
+    def write_heir_open(self, repo_id: str, opens: dict[str, list[str]]) -> None:
+        """Write these files' Modules' `heir_open`, which a batch's pass-1
+        node writes leave as they were (see write_match_keys)."""
+        if opens:
+            with self._driver.session() as session:
+                _run(
+                    session,
+                    "UNWIND $rows AS row MATCH (m:Module {repo_id: $repo_id, name: row.f}) SET m.heir_open = row.o",
+                    repo_id=repo_id, rows=[{"f": f, "o": list(o)} for f, o in sorted(opens.items())],
+                )
 
     def settle_match_keys(self, repo_id: str, nodes: list[tuple[str, str, str, str]]) -> None:
         """Clear `mkeys_stale` (see write_match_keys) off these (label, name,

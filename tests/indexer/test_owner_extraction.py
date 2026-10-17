@@ -359,6 +359,11 @@ def test_a_route_implements_its_handlers_owner():
     assert pinned == {("GET /items", ""), ("GET /users", "Views")}
 
 
+def _heir_open(result):
+    (module,) = [n for n in result.nodes if n.label == "Module"]
+    return module.properties["heir_open"]
+
+
 def _function_keys(result):
     return {(n.name, n.properties["owner"]): n.properties.get("mkeys") for n in result.nodes if n.label == "Function"}
 
@@ -435,9 +440,9 @@ def test_same_named_python_classes_keep_their_own_heirs():
 def test_python_aliases_and_instances_are_heirs_of_their_class():
     """`Registry = _Registry()` and `UserModel = User` hold their class's
     members' keys; `Other = make()`, which names no class of the file, and
-    a class with a base outside it, hold every other Function's, so a call
+    a class with a base outside it, are its file's open classes, so a call
     through them links what an owner-less pin did."""
-    keys = _function_keys(extract_python_file(textwrap.dedent("""\
+    result = extract_python_file(textwrap.dedent("""\
         from x import Model
 
 
@@ -463,11 +468,12 @@ def test_python_aliases_and_instances_are_heirs_of_their_class():
         Registry = _Registry()
         UserModel = User
         Other = make()
-        """), "m.py", "repo"))
-    assert keys[("register", "_Registry")] == ["<Other", "<Registry", "<Remote"]
-    assert keys[("save", "User")] == ["<Other", "<Remote", "<UserModel"]
-    assert keys[("own", "Remote")] == ["<Other"]
-    assert keys[("helper", "")] == ["<Other", "<Remote"]
+        """), "m.py", "repo")
+    keys = _function_keys(result)
+    assert keys[("register", "_Registry")] == ["<Registry"]
+    assert keys[("save", "User")] == ["<UserModel"]
+    assert keys[("own", "Remote")] is None and keys[("helper", "")] is None
+    assert _heir_open(result) == ["Other", "Remote"]
 
 
 @pytest.mark.parametrize("source, name, owner, key", [
@@ -478,20 +484,23 @@ def test_python_aliases_and_instances_are_heirs_of_their_class():
     ("class Base { start() {} }\nexport default class extends Base {}\n", "start", "Base", "<default"),
     ("class Svc { run() {} }\nmodule.exports = Svc;\n", "run", "Svc", "<default"),
     ("class User { save() {} }\nexport const UserModel = User;\n", "save", "User", "<UserModel"),
-    # Naming no class of the file: every Function holds the key.
-    ("export const Api = makeApi();\nexport function get() {}\n", "get", "", "<Api"),
-    ("export default function Page() {}\nfunction load() {}\n", "load", "", "<default"),
+    # Naming no class of the file: an open class of it.
+    ("export const Api = makeApi();\nexport function get() {}\n", "get", "", "Api"),
+    ("export default function Page() {}\nfunction load() {}\n", "load", "", "default"),
 ])
 def test_js_aliases_instances_and_default_exports_are_heirs(source, name, owner, key):
-    keys = _function_keys(extract_js_file(source, "web/m.ts", "repo"))
-    assert key in keys[(name, owner)]
+    result = extract_js_file(source, "web/m.ts", "repo")
+    if key.startswith("<"):
+        assert key in _function_keys(result)[(name, owner)]
+    else:
+        assert key in _heir_open(result)
 
 
 def test_open_keys_skip_nested_classes_type_aliases_and_exception_bases():
     """Only a top-level class or alias is open; a type expression, a literal
     or a `TypeVar` is no alias; a builtin exception base supplies no
     sibling's member."""
-    keys = _function_keys(extract_python_file(textwrap.dedent("""\
+    result = extract_python_file(textwrap.dedent("""\
         from typing import Literal, TypeVar
         from lib import Model
 
@@ -514,6 +523,15 @@ def test_open_keys_skip_nested_classes_type_aliases_and_exception_bases():
 
         def helper():
             pass
-        """), "m.py", "repo"))
-    assert keys[("helper", "")] == ["<Kind"]
-    assert keys[("code", "Error")] == ["<Kind"]
+        """), "m.py", "repo")
+    assert _heir_open(result) == ["Kind"]
+
+
+def test_owner_matches_falls_back_to_an_open_class_its_file_names_no_member_of():
+    from devgraph.indexer.common import owner_matches
+
+    assert owner_matches(["Remote"], "", (), ["Remote"], [("", ())])
+    # A Function of the name Remote has, or inherits, takes the link.
+    assert not owner_matches(["Remote"], "", (), ["Remote"], [("", ()), ("Remote", ())])
+    assert not owner_matches(["Remote"], "", (), ["Remote"], [("", ()), ("Base", ("<Remote",))])
+    assert not owner_matches(["Remote"], "", (), [], [("", ())])
