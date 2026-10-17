@@ -938,7 +938,8 @@ def index_paths(
         engine.write_match_keys(repo_id, rewritten)
     # Written after the retraction marks (`mkeys_stale`), so a batch cut
     # short in between finds the old list and retracts again.
-    engine.write_heir_open(repo_id, {f: o for f, o in new_open.items() if old_open.get(f) != o})
+    if opened := {f: o for f, o in new_open.items() if old_open.get(f) != o}:
+        engine.write_heir_open(repo_id, opened)
     # The match keys, old and new, of the nodes the batch adds, removes or
     # rekeys, by name: a tiered pin's edges to such a name depend on all its
     # nodes, so the relink writes the groups whose keys meet them again (see
