@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 from starlette.responses import PlainTextResponse
@@ -24,7 +24,7 @@ from devgraph.config.settings import get_settings
 from devgraph.dashboard.db_metrics import MetricsHistory
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.dashboard.query_log import QueryLog
-from devgraph.dashboard.routes import build_router
+from devgraph.dashboard.routes import build_router, neo4j_down_message
 from devgraph.dashboard.url import DASHBOARD_IDENTITY, WILDCARD_HOSTNAMES
 from devgraph.graph.engine import GraphEngine
 from devgraph.registry.store import RepoRegistry
@@ -126,6 +126,17 @@ def build_app(
     app.state.metrics = metrics
     app.add_middleware(_LocalHostOnlyMiddleware, allowed_hostnames=_allowed_hostnames(dashboard_host))
     app.include_router(build_router(engine, registry, events, QueryLog(), metrics, run_exclusive))
+
+    # Any route Neo4j being down (or refusing the login) fails answers 503
+    # with the MCP tools' wording, not a bare 500.
+    from neo4j.exceptions import AuthError, ServiceUnavailable
+
+    async def neo4j_down(_request: Any, exc: Exception) -> JSONResponse:
+        message = neo4j_down_message(exc, getattr(engine, "uri", None) or settings.neo4j_uri)
+        return JSONResponse(status_code=503, content={"detail": message or "graph unavailable"})
+
+    app.add_exception_handler(ServiceUnavailable, neo4j_down)
+    app.add_exception_handler(AuthError, neo4j_down)
     # Hand-written HTML/CSS/JS, no build step -- StaticFiles serves them
     # as-is (see Implementation Plan #5: no frontend framework in v1).
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")

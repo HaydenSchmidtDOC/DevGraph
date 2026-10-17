@@ -18,6 +18,7 @@ const grab = (startRe, endMarker) => {
 const src = [
   'const SELECTED_REPO_KEY = "devgraph.selectedRepo";',
   grab(/^function escapeHtmlVal\(/m, "\n"),
+  grab(/^function showNeo4jDown\(/m, "\n}"),
   grab(/^async function populateRealRepos\(/m, "\n}"),
 ].join("\n");
 
@@ -25,7 +26,7 @@ const select = { innerHTML: "", value: "", dispatchEvent: () => {} };
 const emptyState = { hidden: false };
 let repos = [];
 const sandboxGlobals = {
-  document: { getElementById: id => ({ repoSelect: select, repoEmptyState: emptyState })[id] ?? null },
+  document: { getElementById: id => ({ repoSelect: select, repoEmptyState: emptyState, neo4jDownState: { hidden: true } })[id] ?? null },
   fetch: async () => ({ ok: true, json: async () => ({ repos }) }),
   localStorage: { getItem: () => null },
   Event: function Event() {},

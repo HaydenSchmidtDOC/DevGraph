@@ -146,6 +146,13 @@ def _canvas_result(result: dict[str, Any]) -> dict[str, Any]:
     return {**result, "data": data}
 
 
+def neo4j_down_message(exc: BaseException, uri: str) -> str | None:
+    """The MCP tools' wording for Neo4j being unreachable at `uri` or refusing
+    the login, when `exc` is that; None for any other error."""
+    error = devgraph_tools.neo4j_unavailable(exc, uri)
+    return str(error) if error is not None else None
+
+
 def _reject_cross_site(request: Request) -> None:
     """Refuse a state-changing request that another site's page initiated.
 
@@ -298,6 +305,8 @@ def build_router(
     # Unstarted, it takes a fresh reading per request.
     metrics = metrics if metrics is not None else MetricsHistory(engine, None)
 
+    neo4j_uri = getattr(engine, "uri", None) or get_settings().neo4j_uri
+
     def _require_repo(repo_id: str) -> None:
         """Ensure repo_id is registered. Raises 404 if not."""
         if registry.get(repo_id) is None:
@@ -319,6 +328,21 @@ def build_router(
     def list_repos() -> dict[str, Any]:
         repo_issues = _get_repo_issues()
         repos = []
+        # The registry is SQLite and answers with Neo4j down: the list still
+        # comes back, with no node counts and the reason. One failed count
+        # stops the rest, so a down Neo4j costs one connection attempt.
+        graph_unavailable: str | None = None
+
+        def _count_nodes(repo_id: str) -> int | None:
+            nonlocal graph_unavailable
+            try:
+                return queries.count_nodes(engine, repo_id)
+            except Exception as exc:  # neo4j driver raises its own exception hierarchy
+                graph_unavailable = neo4j_down_message(exc, neo4j_uri)
+                if graph_unavailable is None:
+                    raise
+                return None
+
         for repo in registry.list_repos():
             # A missing or unreadable folder (an unmounted drive, a moved
             # repo): every scan refuses it, so its graph is kept but stale.
@@ -332,7 +356,7 @@ def build_router(
                 "active": repo.active,
                 "watch_enabled": repo.watch_enabled,
                 "last_indexed": repo.last_indexed,
-                "node_count": queries.count_nodes(engine, repo.repo_id),
+                "node_count": None if graph_unavailable is not None else _count_nodes(repo.repo_id),
                 "path_missing": problem is not None,
                 "issue": issue,  # Include issue if any
                 # Watched, but for a folder an inotify limit kept unwatched.
@@ -341,6 +365,7 @@ def build_router(
         return {
             "repos": repos,
             "issues": repo_issues,  # Also return all issues as a summary
+            "graph_unavailable": graph_unavailable,
         }
 
     def _register_repo(path: str, repo_id: str | None) -> dict[str, Any]:
@@ -716,7 +741,7 @@ def build_router(
         return {"ok": True}
 
     @router.post("/cypher")
-    def run_cypher(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    def run_cypher(payload: dict[str, Any], request: Request) -> Any:
         """Server-side Cypher execution for the dashboard's Cypher console.
 
         Replaces the prototype's direct browser->Neo4j HTTP connection (see
@@ -776,6 +801,11 @@ def build_router(
                     "Narrow the MATCH or add a LIMIT."
                 )
                 return {"results": [], "errors": [{"code": "Timeout", "message": message}]}
+            down = neo4j_down_message(exc, neo4j_uri)
+            if down is not None:
+                return JSONResponse(
+                    status_code=503, content={"results": [], "errors": [{"code": "Neo4jUnavailable", "message": down}]}
+                )
             return {"results": [], "errors": [{"code": exc.__class__.__name__, "message": str(exc)}]}
 
         if should_record:

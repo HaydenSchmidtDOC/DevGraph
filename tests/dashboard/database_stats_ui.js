@@ -81,6 +81,7 @@ const api = new Function(...Object.keys(sandboxGlobals),
   ...Object.values(sandboxGlobals));
 
 let probe = async () => ({ results: [{ data: [{ row: [1] }] }] });
+const shownDown = [];
 const bootGlobals = {
   ...sandboxGlobals,
   runCypher: async q => probe(q),
@@ -88,6 +89,7 @@ const bootGlobals = {
   neo4jStatus: mkEl(""),
   legendStatus: mkEl(""),
   populateRealRepos: async () => {},
+  showNeo4jDown: message => { shownDown.push(message); },
   loadSchemaTypes: async () => {},
   refreshGraph: async () => {},
   loadGitHistory: () => {},
@@ -329,6 +331,16 @@ const opNames = id => els[id].ops.map(o => o[0]).filter(n => n === "moveTo" || n
       els.memNote.textContent);
     check(`boot with ${label}: pill is not stuck on Checking…`, els.memPill.textContent !== "Checking…", els.memPill.textContent);
   }
+
+  // Neo4j down, as the server words it: the banner shows that message.
+  reset();
+  shownDown.length = 0;
+  probe = async () => ({ errors: [{ code: "Neo4jUnavailable", message: "Neo4j isn't reachable at bolt://x; start Neo4j" }] });
+  serveStats(FULL);
+  await boot.bootConnect();
+  await flush();
+  check("boot with Neo4j unreachable shows the server's message in the banner",
+    shownDown.length === 1 && shownDown[0].startsWith("Neo4j isn't reachable"), JSON.stringify(shownDown));
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);

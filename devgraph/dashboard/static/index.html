@@ -345,6 +345,7 @@ table.logtable tbody tr:hover { background: color-mix(in oklab, var(--accent), t
 .topology-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
 .repo-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 3; max-width: 420px; padding: 16px 20px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface); color: var(--fg-2); font-size: 13px; line-height: 1.6; text-align: center; pointer-events: auto; }
 .repo-empty code { font-family: var(--font-mono); color: var(--fg); }
+.neo4j-down { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 4; max-width: 560px; padding: 10px 16px; border: 1px solid var(--danger); border-radius: var(--radius-md); background: var(--surface); color: var(--fg); font-size: 13px; line-height: 1.5; }
 .placeholder-note { font-size: 11px; color: var(--meta); line-height: 1.5; margin-top: 6px; }
 
 .settings-overlay { position: fixed; inset: 0; z-index: 80; background: var(--bg); display: none; overflow-y: auto; }
@@ -492,6 +493,7 @@ table.dstable input[type="text"] { width: 100%; }
   </div>
   <canvas id="glowCanvas"></canvas>
   <div id="cy"></div>
+  <div id="neo4jDownState" class="neo4j-down" role="alert" hidden></div>
   <div id="repoEmptyState" class="repo-empty" hidden>No repositories registered yet. Register one with <code>devgraph register &lt;path&gt;</code>, or with <b>+ Register repo</b> above.</div>
   <div class="control-flyout" id="controlFlyout" data-od-id="graph-control-panel">
     <div class="control-panel-body">
@@ -2940,6 +2942,13 @@ cypherInput.addEventListener("input", () => {
   previewDebounce = setTimeout(() => schedulePreview(cypherInput.value), 450);
 });
 
+/* One banner over the canvas while Neo4j can't be reached (or refuses the
+   login): the server's message, which names what to start or check. */
+function showNeo4jDown(message) {
+  const el = document.getElementById("neo4jDownState");
+  el.textContent = message || "";
+  el.hidden = !message;
+}
 async function populateRealRepos(fireChangeEvent) {
   // Registered repos (SQLite registry, via /api/repos) are the source of
   // truth for what's selectable here -- not a direct Neo4j query, which
@@ -2948,6 +2957,9 @@ async function populateRealRepos(fireChangeEvent) {
   const resp = await fetch("/api/repos");
   if (!resp.ok) return;
   const json = await resp.json();
+  // The list comes from the registry whether or not Neo4j answers; when it
+  // doesn't, the server says why (graph_unavailable), in the MCP's wording.
+  showNeo4jDown(json.graph_unavailable || null);
   const ids = (json.repos || []).filter(r => r.active).map(r => r.repo_id).sort();
   REGISTERED_REPO_IDS = ids;
   // Built even when empty: an early return here used to leave the static
@@ -3002,7 +3014,11 @@ const legendStatus = document.getElementById("neo4jStatusLegend");
 async function bootConnect() {
   try {
     const json = await runCypher("RETURN 1 AS ok");
-    if (json.errors?.length) throw new Error(json.errors[0].message);
+    if (json.errors?.length) {
+      if (json.errors[0].code === "Neo4jUnavailable") showNeo4jDown(json.errors[0].message);
+      throw new Error(json.errors[0].message);
+    }
+    showNeo4jDown(null);
     neo4jConnected = true;
     neo4jStatus.textContent = "● Neo4j connected (via dashboard proxy)";
     neo4jStatus.style.color = "var(--success)";
@@ -3027,6 +3043,8 @@ async function bootConnect() {
        can still be live. Polling picks Neo4j back up if it returns. */
     attemptMemoryMetrics({ neo4jDown: true });
     startMemoryPolling();
+    // The registered repositories still list (the registry needs no Neo4j).
+    try { await populateRealRepos(false); } catch (e2) { /* the dashboard server itself is gone */ }
     cy.add(buildElements());
     forceDirectedSettle(() => focusRotation(null, 60));
   }
