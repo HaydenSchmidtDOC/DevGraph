@@ -25,6 +25,7 @@ from devgraph.indexer.dispatch import (
 )
 from devgraph.indexer.go.extractor import extract_go_file
 from devgraph.indexer.resolver_config import ResolverConfig
+from tests.helpers import stub
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 
@@ -408,7 +409,7 @@ def test_the_index_upgrade_replaces_bare_go_calls(engine, repo_id, tmp_path, mon
         return result
 
     with monkeypatch.context() as old:
-        old.setattr(dispatch, "extract_go_file", old_extract)
+        stub(old, dispatch, "extract_go_file", old_extract)
         provision_repository_schema(engine, tmp_path)
         engine.upsert_repository(repo_id, repo_id, str(tmp_path))
         full_scan(engine, repo_id, tmp_path)

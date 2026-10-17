@@ -19,6 +19,7 @@ import pytest
 from devgraph.graph.engine import EngineClosed, GraphEngine, provision_repository_schema
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import CATCH_UP_MARGIN_NS, CatchUp, _change_stamp_ns, catch_up, full_scan
+from tests.helpers import stub
 from tests.indexer.docs_live_helpers import assert_matches_fresh_apply
 
 NOW = datetime.now(timezone.utc)
@@ -34,29 +35,31 @@ def stubbed(monkeypatch):
     files offered to `index_paths`, as repo-relative strings."""
     state = {"known": set(), "offered": [], "pruned": 0}
 
-    monkeypatch.setattr(dispatch, "prune_stale_files", lambda *a, **k: state["pruned"])
-    monkeypatch.setattr(dispatch, "schema_pending", lambda *a, **k: False)
-    monkeypatch.setattr(dispatch, "index_outdated", lambda *a, **k: False)
-    monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: set(state["known"]))
-    monkeypatch.setattr(dispatch, "_docs_note_files", lambda *a, **k: set(state["known"]))
-    monkeypatch.setattr(dispatch, "_extracted_files", lambda *a, **k: set(state["known"]))
-    monkeypatch.setattr(dispatch, "_skip_marks", lambda *a, **k: {})
-    monkeypatch.setattr(dispatch, "sync_resolver_config", lambda *a, **k: 0)
+    stub(monkeypatch, dispatch, "prune_stale_files", lambda *a, **k: state["pruned"])
+    stub(monkeypatch, dispatch, "schema_pending", lambda *a, **k: False)
+    stub(monkeypatch, dispatch, "index_outdated", lambda *a, **k: False)
+    stub(monkeypatch, dispatch, "_graph_files", lambda *a, **k: set(state["known"]))
+    stub(monkeypatch, dispatch, "_docs_note_files", lambda *a, **k: set(state["known"]))
+    stub(monkeypatch, dispatch, "_extracted_files", lambda *a, **k: set(state["known"]))
+    stub(monkeypatch, dispatch, "_skip_marks", lambda *a, **k: {})
+    stub(monkeypatch, dispatch, "sync_resolver_config", lambda *a, **k: 0)
 
     def index(engine, repo_id, root, paths, docs_path=None, mentions_enabled=False):
         state["offered"].append({p.relative_to(root).as_posix() for p in paths})
         return len(paths) * 10
 
-    monkeypatch.setattr(dispatch, "index_paths", index)
+    stub(monkeypatch, dispatch, "index_paths", index)
     return state
 
 
-def test_change_stamp_takes_the_later_of_mtime_and_the_change_time():
-    if sys.platform == "win32":
+@pytest.mark.parametrize("platform", ["win32", "linux", "darwin"])
+def test_change_stamp_takes_the_later_of_mtime_and_the_change_time(monkeypatch, platform):
+    monkeypatch.setattr(dispatch, "sys", SimpleNamespace(platform=platform))
+    if platform == "win32":  # the creation time; st_ctime is deprecated there
         st = SimpleNamespace(st_mtime_ns=5, st_ctime_ns=99, st_birthtime_ns=7)
         assert _change_stamp_ns(st) == 7
     else:
-        st = SimpleNamespace(st_mtime_ns=5, st_ctime_ns=7)
+        st = SimpleNamespace(st_mtime_ns=5, st_ctime_ns=7, st_birthtime_ns=99)
         assert _change_stamp_ns(st) == 7
     assert _change_stamp_ns(SimpleNamespace(st_mtime_ns=9, st_ctime_ns=7, st_birthtime_ns=7)) == 9
 
@@ -88,7 +91,7 @@ def test_the_margin_is_five_seconds(tmp_path, stubbed, monkeypatch, before_s, du
     stubbed["known"] = {"a.py"}
     since = NOW
     stamp = _ns(since) - before_s * 1_000_000_000
-    monkeypatch.setattr(dispatch, "_change_stamp_ns", lambda st: stamp)
+    stub(monkeypatch, dispatch, "_change_stamp_ns", lambda st: stamp)
     catch_up(None, "r", tmp_path, since)
     assert stubbed["offered"] == ([{"a.py"}] if due else [])
 
@@ -173,7 +176,7 @@ def test_declared_providers_make_their_files_offered(tmp_path, stubbed):
 def test_a_pending_schema_offers_no_provider_files(tmp_path, stubbed, monkeypatch):
     (tmp_path / "devgraph.schema.yaml").write_text(textwrap.dedent(FS_SCHEMA))
     (tmp_path / "notes.txt").write_text("")
-    monkeypatch.setattr(dispatch, "schema_pending", lambda *a, **k: True)
+    stub(monkeypatch, dispatch, "schema_pending", lambda *a, **k: True)
     catch_up(None, "r", tmp_path, NOW)
     assert stubbed["offered"] == []
 
@@ -227,7 +230,7 @@ def test_would_index_routes_exactly_as_index_single_path(tmp_path, mentions_enab
         (root / rel).symlink_to(target)
     docs_root = (root / "docs").resolve()
     no_specs = (False, None, None)
-    with patch.object(dispatch, "get_settings", return_value=MagicMock(mentions_ambiguous_mode="all")):
+    with patch.object(dispatch, "get_settings", autospec=True, return_value=MagicMock(mentions_ambiguous_mode="all")):
         verdicts = {
             rel: (
                 dispatch._would_index(path, rel, docs_root, mentions_enabled, no_specs),
@@ -246,7 +249,7 @@ def test_a_docs_note_known_only_through_its_mentions_document_is_offered(tmp_pat
     (tmp_path / "docs" / "note.md").write_text("---\ntype: requirement\nid: r\n---\n# R\n")
     (tmp_path / "docs" / "page.md").write_text("# Just a page\n")
     stubbed["known"] = {"docs/note.md", "docs/page.md"}
-    monkeypatch.setattr(dispatch, "_docs_note_files", lambda *a, **k: set())
+    stub(monkeypatch, dispatch, "_docs_note_files", lambda *a, **k: set())
     result = catch_up(None, "r", tmp_path, NOW + timedelta(hours=1), docs_path="docs", mentions_enabled=True)
     assert stubbed["offered"] == [{"docs/note.md"}]
     assert (result.offered, result.unknown) == (1, 1)
@@ -639,7 +642,7 @@ def _close_at_first_file(monkeypatch, engine):
         engine.close()
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(dispatch, "_index_single_path", closing)
+    stub(monkeypatch, dispatch, "_index_single_path", closing)
 
 
 def _open_engine():

@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 from devgraph.cli.main import app
 from devgraph.registry.store import RepoRegistry
 from devgraph import config as config_module
+from tests.helpers import stub
 
 
 @pytest.fixture
@@ -116,7 +117,7 @@ def _block_real_registry(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli_main, "get_settings", _fallback_get_settings)
     monkeypatch.setattr(config_module, "get_settings", _fallback_get_settings)
-    monkeypatch.setattr(lifecycle, "get_settings", _fallback_get_settings)
+    stub(monkeypatch, lifecycle, "get_settings", _fallback_get_settings)
 
 
 def _mock_settings(db_path):
@@ -392,7 +393,7 @@ def test_status_shows_rescan_pending(runner, temp_registry_db, temp_git_repo):
     outdated = {repo_id}
     with patch.object(cli_main, "get_settings", return_value=settings), \
          patch.object(cli_main, "GraphEngine") as engine_cls, \
-         patch("devgraph.indexer.dispatch.index_outdated", side_effect=lambda e, r: r in outdated):
+         patch("devgraph.indexer.dispatch.index_outdated", autospec=True, side_effect=lambda e, r: r in outdated):
         engine_cls.return_value.verify_connectivity.return_value = None
         pending = runner.invoke(app, ["status"])
         outdated.clear()
@@ -418,7 +419,7 @@ def test_status_tells_an_unwatched_repo_to_rescan(runner, temp_registry_db, temp
     settings = _mock_settings(db_path)
     with patch.object(cli_main, "get_settings", return_value=settings), \
          patch.object(cli_main, "GraphEngine") as engine_cls, \
-         patch("devgraph.indexer.dispatch.index_outdated", return_value=True):
+         patch("devgraph.indexer.dispatch.index_outdated", autospec=True, return_value=True):
         engine_cls.return_value.verify_connectivity.return_value = None
         result = runner.invoke(app, ["status"])
 
@@ -440,7 +441,7 @@ def test_status_does_not_call_a_never_indexed_repo_pending(runner, temp_registry
     settings = _mock_settings(db_path)
     with patch.object(cli_main, "get_settings", return_value=settings), \
          patch.object(cli_main, "GraphEngine") as engine_cls, \
-         patch("devgraph.indexer.dispatch.index_outdated", return_value=True):
+         patch("devgraph.indexer.dispatch.index_outdated", autospec=True, return_value=True):
         engine_cls.return_value.verify_connectivity.return_value = None
         result = runner.invoke(app, ["status"])
 

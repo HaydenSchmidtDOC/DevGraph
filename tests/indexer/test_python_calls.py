@@ -16,6 +16,7 @@ import pytest
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 from devgraph.indexer.python.extractor import extract_python_file
+from tests.helpers import stub
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 
@@ -398,7 +399,7 @@ def test_the_index_upgrade_replaces_bare_python_calls(engine, repo_id, tmp_path,
         return result
 
     with monkeypatch.context() as old_extractor:
-        old_extractor.setattr(dispatch, "extract_python_file", old_extract)
+        stub(old_extractor, dispatch, "extract_python_file", old_extract)
         provision_repository_schema(engine, tmp_path)
         engine.upsert_repository(repo_id, repo_id, str(tmp_path))
         full_scan(engine, repo_id, tmp_path)

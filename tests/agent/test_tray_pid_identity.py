@@ -16,12 +16,13 @@ import pytest
 from typer.testing import CliRunner
 
 from devgraph.agent import lifecycle
+from tests.helpers import stub
 
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     settings = SimpleNamespace(registry_db_path=tmp_path / "registry.sqlite3")
-    monkeypatch.setattr(lifecycle, "get_settings", lambda: settings)
+    stub(monkeypatch, lifecycle, "get_settings", lambda: settings)
     return tmp_path
 
 
@@ -94,8 +95,8 @@ def test_stop_never_signals_the_unrelated_process(home, unrelated, write_record)
 def test_start_proceeds_past_the_stale_record(home, unrelated, write_record, monkeypatch):
     write_record(unrelated.pid)
     new_agent = SimpleNamespace(pid=unrelated.pid + 1)
-    monkeypatch.setattr(lifecycle, "resolve_venv_python", lambda: Path(sys.executable))
-    monkeypatch.setattr(lifecycle, "resolve_repo_root", lambda: home)
+    stub(monkeypatch, lifecycle, "resolve_venv_python", lambda: Path(sys.executable))
+    stub(monkeypatch, lifecycle, "resolve_repo_root", lambda: home)
     with patch.object(lifecycle.subprocess, "Popen", return_value=new_agent) as popen:
         assert lifecycle.start_tray_if_not_running() == new_agent.pid
     popen.assert_called_once()
@@ -159,8 +160,8 @@ def test_a_pre_upgrade_record_of_the_running_agent_is_adopted_and_stoppable(home
 def test_on_windows_a_pre_upgrade_record_counts_only_with_a_fresh_heartbeat(home, monkeypatch):
     from datetime import datetime, timedelta, timezone
 
-    monkeypatch.setattr(lifecycle, "process_command", lambda pid: None)  # as on Windows
-    monkeypatch.setattr(lifecycle, "process_identity", lambda pid: "win:132" if pid == 4242 else None)
+    stub(monkeypatch, lifecycle, "process_command", lambda pid: None)  # as on Windows
+    stub(monkeypatch, lifecycle, "process_identity", lambda pid: "win:132" if pid == 4242 else None)
     beat = home / "tray_heartbeat.txt"
 
     beat.write_text((datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(), encoding="utf-8")
@@ -178,7 +179,7 @@ def test_on_windows_a_pre_upgrade_record_counts_only_with_a_fresh_heartbeat(home
 def test_an_agent_whose_identity_could_not_be_read_is_still_recognised(home, monkeypatch, caplog):
     agent = _sleeper("-m", lifecycle.AGENT_MODULE)
     try:
-        with patch.object(lifecycle, "process_identity", return_value=None):
+        with patch.object(lifecycle, "process_identity", autospec=True, return_value=None):
             lifecycle.record_tray_pid(agent.pid)
         assert "start time" in caplog.text
         assert lifecycle.read_tray_pid() == agent.pid
@@ -198,8 +199,8 @@ def test_a_stale_check_never_deletes_a_record_written_meanwhile(home, monkeypatc
             return None
         return "start-5151"
 
-    monkeypatch.setattr(lifecycle, "process_identity", identity)
-    monkeypatch.setattr(lifecycle, "pid_is_running", lambda pid: False)
+    stub(monkeypatch, lifecycle, "process_identity", identity)
+    stub(monkeypatch, lifecycle, "pid_is_running", lambda pid: False)
     assert lifecycle.read_tray_pid() is None
     assert lifecycle.tray_pid_path().read_text(encoding="utf-8") == fresh
 

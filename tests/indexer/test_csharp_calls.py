@@ -25,6 +25,7 @@ from devgraph.indexer.common import best_pin, shadowed
 from devgraph.indexer.csharp.extractor import extract_csharp_file
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 from devgraph.indexer.resolver_config import ResolverConfig
+from tests.helpers import stub
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 #: Candidate files, each with the match keys of the methods it declares.
@@ -801,7 +802,7 @@ def test_a_touched_name_reruns_only_the_groups_its_keys_meet(engine, repo_id, tm
         groups.extend((group["from_name"], group["to_name"]) for group in rerun)
         return real(self, repo, rerun, rels)
 
-    monkeypatch.setattr(GraphEngine, "rerun_edges", rerun_edges)
+    stub(monkeypatch, GraphEngine, "rerun_edges", rerun_edges)
     repo = "namespace {}\n{{\n    public class Repo {{ public void Get() {{ }} }}\n}}\n"
     _write(tmp_path, "Models/Repo.cs", repo.format("Shop.Domain"))
     _write(tmp_path, "App/Svc.cs", "namespace Shop.Domain.Services;\n\n"

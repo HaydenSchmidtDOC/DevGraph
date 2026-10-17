@@ -23,6 +23,7 @@ from devgraph.indexer.common import best_pin
 from devgraph.indexer.dispatch import full_scan, index_paths, sync_resolver_config
 from devgraph.indexer.resolver_config import ResolverConfig, fingerprints
 from devgraph.indexer.rust.extractor import extract_rust_file
+from tests.helpers import stub
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 WORKSPACE = {
@@ -710,7 +711,7 @@ def test_the_index_upgrade_replaces_bare_rust_csharp_and_cpp_calls(engine, repo_
 
     with monkeypatch.context() as patched:
         for name in ("extract_rust_file", "extract_csharp_file", "extract_cpp_file"):
-            patched.setattr(dispatch, name, old(getattr(dispatch, name)))
+            stub(patched, dispatch, name, old(getattr(dispatch, name)))
         provision_repository_schema(engine, tmp_path)
         engine.upsert_repository(repo_id, repo_id, str(tmp_path))
         full_scan(engine, repo_id, tmp_path)

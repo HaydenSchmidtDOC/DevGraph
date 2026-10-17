@@ -21,6 +21,7 @@ from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.kotlin.extractor import extract_kotlin_file
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
+from tests.helpers import stub
 from tests.indexer.deep_sources import DEEP_FUNCTIONS, DEEP_SOURCES
 from tests.watcher.live_helpers import (
     fresh_snapshot,
@@ -163,7 +164,7 @@ def test_index_paths_skips_a_file_whose_retry_cannot_start(tmp_path, monkeypatch
         raise RecursionError("maximum recursion depth exceeded")
 
     (tmp_path / "deep.py").write_text("x = 1\n")
-    monkeypatch.setattr(dispatch, "_index_single_path", too_deep)
+    stub(monkeypatch, dispatch, "_index_single_path", too_deep)
     monkeypatch.setattr(dispatch.threading, "stack_size", refuse)
     skipped: dict[str, str] = {}
     index_paths(Engine(), "_unit_deep", tmp_path, {tmp_path / "deep.py"}, skipped=skipped)

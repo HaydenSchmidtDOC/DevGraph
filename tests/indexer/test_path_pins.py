@@ -29,6 +29,7 @@ from devgraph.indexer.common import (
     visible_to,
 )
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
+from tests.helpers import stub
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 # --- unit ----------------------------------------------------------------------
@@ -501,7 +502,7 @@ def _inject(monkeypatch, calls=(), imports=(), files=()):
                 result.relationships.append(rel)
         return result
 
-    monkeypatch.setattr(dispatch, "extract_python_file", extract)
+    stub(monkeypatch, dispatch, "extract_python_file", extract)
 
 
 def _scan(engine, repo_id, root):
@@ -611,7 +612,7 @@ def _inject_match_keys(monkeypatch) -> dict:
                     result.relationships.append(rel)
         return result
 
-    monkeypatch.setattr(dispatch, "extract_python_file", extract)
+    stub(monkeypatch, dispatch, "extract_python_file", extract)
     return settings
 
 
@@ -716,10 +717,10 @@ def test_a_batch_that_fails_after_writing_match_keys_rekeys_again(engine, repo_i
                         raise RuntimeError("down")
                 return real(session, query, **params)
 
-            patch.setattr(engine_module, "_run", flaky)
+            stub(patch, engine_module, "_run", flaky)
         else:
             method = "upsert_relationships" if fails == "pass 2" else "settle_match_keys"
-            patch.setattr(type(engine), method, lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("down")))
+            stub(patch, type(engine), method, lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("down")))
         with pytest.raises(RuntimeError):
             index_paths(engine, repo_id, tmp_path, {a, b})
     assert engine.run_cypher(
@@ -916,7 +917,7 @@ def test_python_removals_read_no_name_refs(engine, repo_id, tmp_path, monkeypatc
     _write(tmp_path, "b.py", "from a import f\n\n\ndef main():\n    return f()\n")
     c = _write(tmp_path, "c.py", "def h():\n    return 0\n")
     _scan(engine, repo_id, tmp_path)
-    monkeypatch.setattr(GraphEngine, "find_name_refs", find_name_refs)
+    stub(monkeypatch, GraphEngine, "find_name_refs", find_name_refs)
     a.write_text("def f():\n    return 0\n")
     index_paths(engine, repo_id, tmp_path, {a})
     c.unlink()
