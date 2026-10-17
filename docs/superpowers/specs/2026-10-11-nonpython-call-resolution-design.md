@@ -391,7 +391,11 @@ Tiers, first match wins:
    `db`). The method resolves to this file when its type and the method are
    declared here, else to the type's package directory at package confidence
    (`~`: methods are named bare, so another type of the package can have one
-   of the name). A builtin or external type links nothing.
+   of the name). An unqualified exported type the file doesn't declare,
+   and what an unqualified function of another file returned, may be a
+   dot-imported package's (`import . "pkg"`, index format 19): that
+   package's directory at package confidence too. A builtin or external
+   type links nothing.
 5. Anything else: a bare-name row that never ends at its caller, unless the
    method is in `STOP_METHODS["go"]`.
 
@@ -1017,8 +1021,12 @@ call is not it). A Go receiver declared from another (`v := s.router`)
 is followed to it; an ASP.NET chained receiver
 (`app.MapGroup("/x").MapGet(...)`) is read as its group. Only a router
 package itself (or its major version, `chi/v5`) names routers, never one
-of its subpackages (`fiber/v2/middleware/cache`); a dot import of a
-router package is not read; and a verb-named call on another package
+of its subpackages (`fiber/v2/middleware/cache`). A dot import of one
+(index format 19) is the qualifier "": its bare constructor (`r :=
+NewRouter()`, unless the file declares the name) is a root router, its
+bare router type (`m *Mux`) a root or mounted one as a qualified one, and
+with a dot-imported net/http a bare `HandleFunc`/`Handle` (unless the
+file declares it) registers on the DefaultServeMux. A verb-named call on another package
 (`cache.Get("/k", load)`) is no route. An absolute ASP.NET action route
 is one Endpoint whatever the class's `[Route]`s.
 

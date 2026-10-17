@@ -366,7 +366,12 @@ class _GoResolver:
         if go_type[0] == "local":
             if method in self.methods.get(go_type[1], ()):
                 return [owned_pin(self.file_path, go_type[1])]  # the type's own method
-            return [self._own_dir(loose=True)]
+            pins = [self._own_dir(loose=True)]
+            if go_type[1] not in self.types and (not go_type[1] or go_type[1][:1].isupper()):
+                # An exported type the file doesn't declare (or what an
+                # unqualified function returned) can be a dot-imported package's.
+                pins += [pin for folder in self.dot_dirs for pin in self._package_pins(folder, loose=True)]
+            return pins
         if go_type[0] == "pkg":
             return [pin for folder in go_type[1] for pin in self._package_pins(folder, loose=True)]
         return None
@@ -614,6 +619,10 @@ def _collect_calls(
             field = func.child_by_field_name("field") if func is not None and func.type == "selector_expression" else None
             if routes is not None and field is not None and _text(field, source) in _ROUTE_CALLS:
                 routes.append((node, dict(scope)))
+            elif routes is not None and func is not None and func.type == "identifier" and (
+                _text(func, source) in ("Handle", "HandleFunc")
+            ):
+                routes.append((node, dict(scope)))  # a dot-imported net/http's own (`_go_routes`)
             # Arguments and the callee's own operand first, as evaluated.
             for child in node.children:
                 walk(child)
@@ -727,16 +736,18 @@ def _go_routes(
     function literal implements nothing."""
     imports = _extract_imports(root, source)
     # A router package itself (or its major version, `chi/v5`), never one of
-    # its subpackages (`fiber/v2/middleware/cache`). A dot import of one is
-    # not read: its names have no qualifier to tell them by.
+    # its subpackages (`fiber/v2/middleware/cache`). A dot import of one
+    # (`import . "net/http"`) is the qualifier "": its names are written bare.
     routers = {
-        name or _default_import_name(path)
+        "" if name == "." else name or _default_import_name(path)
         for name, path in imports
-        if name != "." and (path == "net/http" or any(
+        if path == "net/http" or any(
             path == each or _MAJOR_VERSION.fullmatch(path[len(each) + 1:]) and path.startswith(each + "/")
             for each in _ROUTER_PACKAGES
-        ))
+        )
     }
+    # The bare `Handle`/`HandleFunc` of a dot-imported net/http (its DefaultServeMux).
+    dot_http = any(name == "." and path == "net/http" for name, path in imports)
     if not routers:
         return
 
@@ -858,6 +869,10 @@ def _go_routes(
         if node.type in ("identifier", "selector_expression"):
             return kind(node, node, depth + 1)  # `v := s.router`
         func = node.child_by_field_name("function") if node.type == "call_expression" else None
+        if func is not None and func.type == "identifier" and "" in routers and (
+            _text(func, source) in _ROUTER_FACTORIES and _text(func, source) not in resolver.functions
+        ):
+            return ("root", "")  # a dot-imported router package's `NewRouter()`
         if func is None or func.type != "selector_expression":
             return ("none", None)
         operand, field = func.child_by_field_name("operand"), _text(func.child_by_field_name("field"), source)
@@ -896,10 +911,15 @@ def _go_routes(
 
     for call, scope in calls:
         func = call.child_by_field_name("function")
-        operand, field = func.child_by_field_name("operand"), _text(func.child_by_field_name("field"), source)
+        if func.type == "identifier":
+            if not dot_http or _text(func, source) in resolver.functions or _text(func, source) in scope:
+                continue  # the file's own `Handle`, or no dot-imported net/http
+            operand, field = None, _text(func, source)
+        else:
+            operand, field = func.child_by_field_name("operand"), _text(func.child_by_field_name("field"), source)
         args = call.child_by_field_name("arguments")
         values = [a for a in args.named_children if a.type != "comment"] if args is not None else []
-        if len(values) < 2 or operand is None:
+        if len(values) < 2 or (operand is None and func.type != "identifier"):
             continue
         methods, path, handlers, pattern = None, "", [], False
         first, second = _go_literal(values[0], source), _go_literal(values[1], source)
@@ -930,7 +950,7 @@ def _go_routes(
             wrapper = handler.child_by_field_name("function")
             if wrapper is not None and _text(wrapper, source).endswith("HandlerFunc") and len(wrapped.named_children) == 1:
                 handler = wrapped.named_children[0]  # http.HandlerFunc(h)
-        receiver = kind(operand, call)
+        receiver = kind(operand, call) if operand is not None else ("root", "")
         if receiver[0] == "skip":
             continue  # a dynamic prefix
         if field not in _PATTERN_CALLS and receiver[0] == "none" and (
