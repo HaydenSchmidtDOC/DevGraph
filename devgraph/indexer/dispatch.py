@@ -80,7 +80,7 @@ from devgraph.indexer.source_text import read_source
 from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
 from devgraph.indexer.walk import GITIGNORED, RepoRootEmpty, RepoRootUnavailable, check_repo_root, content_skip_reason
 from devgraph.indexer.walk import indexable_paths as _indexable_paths
-from devgraph.indexer.walk import gitignore_hides_files, indexable_paths_under
+from devgraph.indexer.walk import forget_manifests, gitignore_hides_files, indexable_paths_under
 from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
 from devgraph.indexer.walk import is_ignored_path as is_ignored_path
 from devgraph.indexer.walk import is_indexable_file as _is_indexable_file
@@ -853,7 +853,9 @@ def index_paths(
             shown = min(supplied.get(rel_path, []), default=rel_path)
             if skipped is not None:
                 skipped[shown] = TOO_DEEP
-            judged[rel_path] = [TOO_DEEP, max_bytes, _change_stamp_ns(os.stat(resolved))]
+            stamp = _stamp_or_none(resolved)  # gone or locked since: no mark, the next catch-up looks again
+            if stamp is not None:
+                judged[rel_path] = [TOO_DEEP, max_bytes, stamp]
             engine.delete_nodes_by_source_file(repo_id, rel_path)
         except Exception as exc:
             _log_file_failure("indexing failed", repo_id, rel_path, exc)
@@ -1123,7 +1125,8 @@ def index_paths(
 # a large stack and the limit raised, so it is indexed in full; one deeper
 # still is skipped as TOO_DEEP.
 _DEEP_RECURSION_LIMIT = 200_000
-_DEEP_STACK_BYTES = 512 * 1024 * 1024
+# Under 256 MiB: CPython on Windows refuses a larger thread stack.
+_DEEP_STACK_BYTES = 255 * 1024 * 1024
 TOO_DEEP = "too deeply nested"
 _deep_lock = threading.Lock()
 
@@ -1131,7 +1134,9 @@ _deep_lock = threading.Lock()
 def _run_deep(fn: Callable[[], int]) -> int:
     """`fn()` on a thread with `_DEEP_STACK_BYTES` of stack, the recursion
     limit raised to `_DEEP_RECURSION_LIMIT` meanwhile. One at a time: the
-    limit is the interpreter's, not the thread's."""
+    limit is the interpreter's, not the thread's. A platform that can't give
+    the thread that stack raises RecursionError, so the file takes the
+    TOO_DEEP path as it would on any other failure of the retry."""
     outcome: dict[str, object] = {}
 
     def run() -> None:
@@ -1144,12 +1149,15 @@ def _run_deep(fn: Callable[[], int]) -> int:
         limit = sys.getrecursionlimit()
         sys.setrecursionlimit(max(limit, _DEEP_RECURSION_LIMIT))
         try:
-            stack = threading.stack_size(_DEEP_STACK_BYTES)
             try:
-                thread = threading.Thread(target=run, name="devgraph-deep-extract")
-                thread.start()
-            finally:
-                threading.stack_size(stack)
+                stack = threading.stack_size(_DEEP_STACK_BYTES)
+                try:
+                    thread = threading.Thread(target=run, name="devgraph-deep-extract")
+                    thread.start()
+                finally:
+                    threading.stack_size(stack)
+            except (ValueError, RuntimeError, MemoryError) as exc:
+                raise RecursionError(f"no thread with a {_DEEP_STACK_BYTES >> 20} MiB stack: {exc}") from exc
             thread.join()
         finally:
             sys.setrecursionlimit(limit)
@@ -1729,9 +1737,11 @@ def _docs_note_referrers(
         return set()
     found = set()
     for path in sorted(docs_root.rglob("*")):
-        if path.suffix not in (".md", ".markdown") or not _is_indexable_file(path) or is_ignored_path(path):
+        if path.suffix not in (".md", ".markdown") or not _is_indexable_file(path):
             continue
         rel_path = path.relative_to(root).as_posix()
+        if is_ignored_path(Path(rel_path), root):
+            continue
         if rel_path in batch:
             continue
         result = DocsExtractor(repo_id).extract_from_source(_read_text(path), path.name)
@@ -2214,6 +2224,7 @@ def catch_up(
             engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
         )
         return CatchUp(indexed=indexed, pruned=0, checked=0, offered=0, unknown=0)
+    forget_manifests()  # build manifests may have come or gone while nothing watched
     pruned = prune_stale_files(
         engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
     )
@@ -2366,6 +2377,7 @@ def full_scan(
     """
     check_repo_root(repo_root)
     docs_cache.forget(repo_root)
+    forget_manifests()
     # The shared-claim records the writes below unclaim through are rebuilt
     # from the shared nodes first, so a full scan heals any that drifted.
     engine.rebuild_claim_records(repo_id)

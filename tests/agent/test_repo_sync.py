@@ -97,6 +97,18 @@ def test_a_gitignore_change_catches_up_from_the_batch_start(rig, indexing, delet
                               "deleted": 3 + (1 if deleted else 0)}
 
 
+@pytest.mark.parametrize("name", ["pyproject.toml", "Cargo.toml", "App.csproj"])
+@pytest.mark.parametrize("deleted", [False, True])
+def test_a_build_manifest_change_catches_up(rig, indexing, name, deleted):
+    """A build manifest added or removed decides whether the build output
+    folders beside it are walked (walk.is_build_output), as a .gitignore
+    decides what it names: the batch is followed by a catch-up."""
+    manifest = rig.root / "tools" / name
+    changed, gone = (set(), {manifest}) if deleted else ({manifest}, set())
+    rig.sync.on_changes(REPO, changed, gone)
+    assert indexing["catch_up"].call_args.args[:4] == (rig.engine, REPO, rig.root, T0)
+
+
 def test_a_batch_checks_the_resolver_configuration(rig, indexing):
     """Every batch hands its changed and deleted paths to
     sync_resolver_config, whose re-indexed files count as changed."""

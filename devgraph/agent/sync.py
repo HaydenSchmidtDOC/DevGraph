@@ -26,6 +26,7 @@ from devgraph.indexer.dispatch import (
     sync_resolver_config,
 )
 from devgraph.indexer.gitignore import GITIGNORE
+from devgraph.indexer.walk import is_build_manifest
 from devgraph.indexer.walk import RepoRootUnavailable
 
 logger = logging.getLogger(__name__)
@@ -102,10 +103,14 @@ class RepoSync:
                 self._engine, repo_id, repo.path, changed_paths | deleted_paths,
                 docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
             )
-            if any(Path(p).name == GITIGNORE for p in changed_paths | deleted_paths):
+            if any(
+                Path(p).name == GITIGNORE or is_build_manifest(Path(p).name) for p in changed_paths | deleted_paths
+            ):
                 # A .gitignore edit changes which files are indexed anywhere
-                # below it: catch up, which prunes the files now ignored and
-                # indexes the ones no longer ignored, as a fresh scan would.
+                # below it, and a build manifest added or removed whether the
+                # build output folders beside it are (walk.is_build_output):
+                # catch up, which prunes the files now ignored and indexes the
+                # ones no longer ignored, as a fresh scan would.
                 result = catch_up(
                     self._engine, repo_id, repo.path, started,
                     docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,

@@ -189,12 +189,38 @@ def is_ignored_dir_name(name: str) -> bool:
     return name in IGNORED_DIR_NAMES or name.endswith(".egg-info")
 
 
+def is_build_manifest(name: str) -> bool:
+    """Whether a file named `name` makes its folder's build output names
+    build output (`is_build_output`): adding, removing or renaming one
+    changes what the walk enters, as a .gitignore edit does."""
+    return name in BUILD_MANIFESTS or name.endswith(BUILD_MANIFEST_SUFFIXES)
+
+
+# Folder -> whether it holds a build manifest. Asked for every path with a
+# build output name in it, by the walk and by the watcher's filters; cleared
+# by `forget_manifests` when a scan or catch-up starts and when the watcher
+# sees a manifest change.
+_manifest_cache: dict[str, bool] = {}
+_MANIFEST_CACHE_MAX = 4096
+
+
+def forget_manifests() -> None:
+    _manifest_cache.clear()
+
+
 def _holds_manifest(folder: Path) -> bool:
-    try:
-        with os.scandir(folder) as entries:
-            return any(e.name in BUILD_MANIFESTS or e.name.endswith(BUILD_MANIFEST_SUFFIXES) for e in entries)
-    except OSError:
-        return False
+    key = os.fspath(folder)
+    held = _manifest_cache.get(key)
+    if held is None:
+        try:
+            with os.scandir(folder) as entries:
+                held = any(is_build_manifest(e.name) for e in entries)
+        except OSError:
+            held = False
+        if len(_manifest_cache) >= _MANIFEST_CACHE_MAX:
+            _manifest_cache.clear()
+        _manifest_cache[key] = held
+    return held
 
 
 def is_build_output(parent: Path, name: str, at_root: bool) -> bool:

@@ -32,7 +32,14 @@ from watchdog.observers.api import ObservedWatch
 from devgraph.config import get_settings
 from devgraph.indexer.dispatch import is_ignored_path
 from devgraph.indexer.gitignore import GITIGNORE, is_gitignored
-from devgraph.indexer.walk import _junction_inside, indexable_paths_under, is_build_output, is_ignored_dir_name
+from devgraph.indexer.walk import (
+    _junction_inside,
+    forget_manifests,
+    indexable_paths_under,
+    is_build_manifest,
+    is_build_output,
+    is_ignored_dir_name,
+)
 from devgraph.registry.store import RepoRegistry, RepoRecord
 
 logger = logging.getLogger(__name__)
@@ -1350,7 +1357,10 @@ class _RepoEventHandler(FileSystemEventHandler):
                 self._changed[key] = path
             self._folder_events.update(folders or {})
             self._reset_debounce()
-        if self._request_rewatch is not None and any(p.name == GITIGNORE for p in changed + deleted):
+        manifests = any(is_build_manifest(p.name) for p in changed + deleted)
+        if manifests:
+            forget_manifests()  # before anything asks again whether a build output folder is ignored
+        if self._request_rewatch is not None and (manifests or any(p.name == GITIGNORE for p in changed + deleted)):
             self._request_rewatch(self._repo_id)
 
     def _has_deleted_ancestor(self, path: Path) -> bool:

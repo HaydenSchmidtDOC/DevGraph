@@ -120,3 +120,53 @@ def test_a_file_too_deep_even_for_the_retry_is_left_out_live_and_fresh(engine, r
     full_scan(engine, repo_id, tmp_path, skipped=rescanned)
     assert rescanned == {"deep.py": TOO_DEEP}
     assert functions(engine, repo_id) == {"other.py": {"other"}}
+
+
+@pytest.mark.parametrize("error", [ValueError("size not valid"), RuntimeError("can't start new thread"), MemoryError()])
+def test_a_platform_that_refuses_the_large_stack_takes_the_too_deep_path(error, monkeypatch):
+    """Windows refuses a thread stack of 256 MiB or more, and any platform can
+    fail to start the thread: the retry then raises RecursionError, which
+    `index_paths` turns into a TOO_DEEP skip, so live still equals fresh."""
+    def refuse(size=0):
+        if size:
+            raise error
+        return 0
+
+    monkeypatch.setattr(dispatch.threading, "stack_size", refuse)
+    with pytest.raises(RecursionError):
+        dispatch._run_deep(lambda: 1)
+
+
+def test_the_deep_stack_is_one_windows_accepts():
+    assert dispatch._DEEP_STACK_BYTES < 256 * 1024 * 1024
+
+
+def test_index_paths_skips_a_file_whose_retry_cannot_start(tmp_path, monkeypatch):
+    from tests.indexer.test_file_failures import _QuietEngine
+
+    class Engine(_QuietEngine):
+        deleted: list[str] = []
+        marks: dict = {}
+
+        def update_skipped_files(self, repo_id, add=None, drop=(), replace=False):
+            Engine.marks = dict(add or {})
+
+        def delete_nodes_by_source_file(self, repo_id, rel):
+            Engine.deleted.append(rel)
+
+    def refuse(size=0):
+        if size:
+            raise ValueError("size not valid")
+        return 0
+
+    def too_deep(*args):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    (tmp_path / "deep.py").write_text("x = 1\n")
+    monkeypatch.setattr(dispatch, "_index_single_path", too_deep)
+    monkeypatch.setattr(dispatch.threading, "stack_size", refuse)
+    skipped: dict[str, str] = {}
+    index_paths(Engine(), "_unit_deep", tmp_path, {tmp_path / "deep.py"}, skipped=skipped)
+    assert skipped == {"deep.py": TOO_DEEP}
+    assert Engine.deleted == ["deep.py"]
+    assert Engine.marks["deep.py"][0] == TOO_DEEP
