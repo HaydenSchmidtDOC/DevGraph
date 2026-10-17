@@ -38,7 +38,7 @@ TypeScript, C#, C++, Java, Kotlin, Rust, and Go source**, detected per file by
 extension (a repo doesn't need to be single-language; each file is routed
 to the matching extractor automatically) — and exposes it through purpose-built MCP tools
 (`search_component`, `describe_node`, `find_callers`, `impact_analysis`,
-`impact_analysis_for_diff`, `compare_branches`, `explain_architecture`, `blame_component`,
+`impact_analysis_for_diff`, `compare_branches`, `explain_architecture`, `list_endpoints`, `blame_component`,
 `find_requirements_for`, `find_mentions`, `list_recent_changes`, `god_nodes`,
 `get_source`, and others), plus the opt-in `run_cypher` escape hatch. Read
 `devgraph://tool-catalog` for the live tool list and identifier expectations.
@@ -277,10 +277,22 @@ name in more files (`get`, `run`) the dependents of all of them are listed
 together, with a notice to pass `file`. Another definition of the same name
 can itself appear as a dependent. A name defined in one file answers as
 before, with no `target_files`. `file` takes `\` or `/`, with or without a
-leading `./`.
+leading `./` (`get_source` also takes an absolute path inside the repository).
+
+**Where an answer is, and one class's method**: every `find_callers` row
+names the caller's `file`, `owner` (the classes or functions it is declared
+in, `""` at the top level) and `start_line`, so `A.run` and `B.run` of one
+file are two rows told apart; a Module caller has no owner or line. Every
+`impact_analysis` dependent is `{name, type, file, owner}` (owner left out
+and file null when it has none). `find_callers`, `impact_analysis` and
+`find_related_files` take `owner` to pick one class's method, as `get_source`
+and `describe_node` do, or a method named with its class (`A.run`,
+`A::run`) when no node has that exact name; an owner with no such member is
+an error. `get_source` on an unknown name (or one not in `file`, or of no
+such `owner`) is an error with similar names, never an all-null answer.
 
 **Response shape (`count`/`results`/`truncated`)**: `search_component`,
-`find_callers`, `list_services`, `find_related_prs`, `issue_history_for`,
+`find_callers`, `list_services`, `list_endpoints`, `find_related_prs`, `issue_history_for`,
 `find_requirements_for` and `blame_component` return
 `{"count": N, "results": [...], "truncated": bool}` instead of a bare
 list — read the match set from `result["results"]`, and check `truncated`
@@ -354,6 +366,7 @@ Prefer these over re-reading files when the question is structural:
 | "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name like `GET /users/<id>`, or a bare path like `/users/<id>` for every method) |
 | "What changed recently?" | `list_recent_changes` (lists entities touched in the last N commits, most-recent first; filters by optional entity type) |
 | "What's the overall architecture?" | `explain_architecture`, `summarise_repository` |
+| "Which routes does this service expose?" | `list_endpoints` (filters: `method`, `path_prefix` by whole segments, `framework`, `service`; each route with its handlers and owning service; a route whose mount its file doesn't show has `mounted: false` and a name like `GET ?/:id (routes/users.js)`) |
 | "What changed between my branch and main?" | `compare_branches(branch_a="main", branch_b="<branch>")`: files, per-file symbols added, removed and changed, and the graph callers of what changed |
 | "Why was X built this way?" | `explain_decision`, `trace_design_rationale` |
 | "What requirements does X satisfy?" | `find_requirements_for` |
@@ -385,7 +398,9 @@ doesn't have, and `blame_component`, `find_related_prs` and `issue_history_for`
 on a file it doesn't have, fail with `no ... named ...` and up to five similar
 names (a name that exists but has no answer, such as a function nothing calls,
 is still `count: 0`); `list_recent_changes` with an unknown `entity_type` fails
-and lists the valid labels; and a count
+and lists the valid labels; `list_endpoints` with a `method` that is no HTTP
+method token, or an unknown `framework` (naming the valid ones), fails, and with an unknown `service` like
+`get_service_dependencies`; and a count
 argument below its minimum (`max_results`, `within_commits`,
 `modified_within_commits`, `members_per_community`, `max_per_type` below 1,
 `max_length` below 2) fails and names the argument.

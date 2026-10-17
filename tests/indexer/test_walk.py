@@ -290,7 +290,7 @@ class _FakeEngine:
 def test_prune_stale_files_tolerates_a_junction_out_of_the_repository(junction_tree, monkeypatch):
     repo = junction_tree
     removed = []
-    monkeypatch.setattr(dispatch, "remove_paths", lambda engine, repo_id, root, paths: removed.append(paths) or len(paths))
+    monkeypatch.setattr(dispatch, "remove_paths", lambda engine, repo_id, root, paths, *a: removed.append(paths) or len(paths))
     engine = _FakeEngine({"docs/a.md", "docs/deep/b.md", "src/x.py", "gone.md"})
 
     assert dispatch.prune_stale_files(engine, "r", repo) == 1

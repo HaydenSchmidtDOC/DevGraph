@@ -719,9 +719,11 @@ def build_server(
         modified_within_commits: int | None = None,
         resolved_only: bool = False,
         file: str | None = None,
+        owner: str | None = None,
     ) -> dict[str, Any]:
         """Find all callers of a target; returns {count, results, truncated}, each caller
-        with its name, type, repo_id, file and confidence, most certain first. Calls
+        with its name, type, repo_id, file, owner and start_line (a module caller has
+        neither) and confidence, most certain first. Calls
         in every language are resolved through the caller's scope, imports and types:
         confidence "resolved" (callee in a file the caller names), "package" (in a
         file the caller's imports reach less exactly, e.g. under an imported package
@@ -735,22 +737,26 @@ def build_server(
         names; a known one nothing calls is count 0. When the name is defined in several
         files, pass file (the target's repo-relative path) to pick one; without it each
         caller adds target_files (the files of the targets it calls, at most 10) and
-        ambiguous_targets lists the definitions."""
+        ambiguous_targets lists the definitions. To pick one class's method, pass owner
+        (the classes or functions it is declared in, "" at the top level) or name it
+        "A.run" / "A::run"."""
         return devgraph_tools.find_callers(
             engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits,
-            resolved_only, file, declared(repo_id, cross_repo),
+            resolved_only, file, declared(repo_id, cross_repo), owner,
         )
 
     @server.tool(annotations=_READ_ONLY)
     def find_related_files(
-        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None
+        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None,
+        owner: str | None = None,
     ) -> dict[str, Any]:
         """Find related files; each list returns {count, results, truncated} envelope. An
         unknown component is an error with similar names. When the name is defined in
         several files, pass file (repo-relative path) to pick one; without it each row is
-        {name, target_files} and ambiguous_targets lists them."""
+        {name, target_files} and ambiguous_targets lists them. Pass owner, or name a
+        method "A.run", to pick one class's method."""
         return devgraph_tools.find_related_files(
-            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo)
+            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo), owner
         )
 
     @server.tool(annotations=_READ_ONLY)
@@ -776,11 +782,14 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def impact_analysis(
-        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None
+        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None,
+        owner: str | None = None,
     ) -> dict[str, Any]:
         """Analyze component impact: direct dependents (one CALLS/USES/DEPENDS_ON hop) and
-        transitive ones (two to four hops; further ones are not followed). Dependents
-        wrapped in {count, results, truncated} envelopes. An unknown component is an
+        transitive ones (two to four hops; further ones are not followed), each {name, type,
+        file, owner} (owner left out and file null when it has none), wrapped in {count,
+        results, truncated} envelopes. Pass owner, or name a method "A.run", to pick one
+        class's method. An unknown component is an
         error with similar names. When the name is defined in several files, pass file
         (repo-relative path) to pick one; without it ambiguous_targets lists them, and for
         up to five files each is traced apart (every dependent adds target_files, the
@@ -788,7 +797,7 @@ def build_server(
         dependents are listed together, with a notice. Another same-named definition
         can itself appear as a dependent."""
         return devgraph_tools.impact_analysis(
-            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo)
+            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo), owner
         )
 
     @server.tool(annotations=_READ_ONLY)
@@ -825,6 +834,30 @@ def build_server(
     def list_services(repo_id: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
         """List all services; returns {count, results, truncated}."""
         return devgraph_tools.list_services(engine, repo_id, cross_repo, max_results)
+
+    @server.tool(annotations=_READ_ONLY)
+    def list_endpoints(
+        repo_id: str,
+        method: str | None = None,
+        path_prefix: str | None = None,
+        framework: str | None = None,
+        service: str | None = None,
+        cross_repo: bool = False,
+        max_results: int = 15,
+    ) -> dict[str, Any]:
+        """List API endpoints (routes); returns {count, results, truncated}, each result
+        {name, method, path, mounted, framework, files, handlers ({name, file, owner}),
+        services, repo_id}. Filters: method ("GET", "*" for an every-method route),
+        path_prefix (whole segments: "/api" matches "/api/users", not "/apis"), framework
+        (ASP.NET Core, Django, Express, FastAPI, Flask, Go, Spring) and service (the compose
+        service an endpoint CALLS). A route whose mount its file doesn't show has mounted
+        false, its own path, and a name like "GET ?/:id (routes/users.js)"; no path_prefix
+        matches it; a Django pattern's path gains its leading "/". method takes any HTTP
+        method token (PROPFIND too). A method that is no token, an unknown framework,
+        or an unknown service is an error."""
+        return devgraph_tools.list_endpoints(
+            engine, repo_id, method, path_prefix, framework, service, cross_repo, max_results
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def explain_decision(repo_id: str, decision_name: str, cross_repo: bool = False) -> dict[str, Any]:
@@ -902,7 +935,9 @@ def build_server(
         picking one: pass the candidate's file (repo-relative path) and owner (the classes
         or functions it is declared in, "" at the top level) to choose. A method may also
         be named with its class, "A.save" or "A::save". A file that is not valid UTF-8 is
-        decoded with replacement characters, and a notice says so."""
+        decoded with replacement characters, and a notice says so. An unknown name (or
+        none of it in file, of owner) is an error with similar names; file may be
+        repo-relative or an absolute path inside the repository."""
         return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo, file, owner)
 
     @server.tool(annotations=_READ_ONLY)

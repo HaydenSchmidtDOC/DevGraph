@@ -38,9 +38,16 @@ from devgraph.config.project_schema import (
     resolve_effective_schema,
     schema_file_hash,
 )
-from devgraph.graph.engine import ABORTS_BATCH, GraphEngine, provision_repository_schema
+from devgraph.graph.engine import (
+    ABORTS_BATCH,
+    OWNING_SERVICE_TARGETS,
+    SERVICE_API_SUFFIXES,
+    GraphEngine,
+    provision_repository_schema,
+)
 from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES, pin_kind, split_pin
 from devgraph.indexer.apis.extractor import APIExtractor
+from devgraph.indexer.apis.routes import MountTable, mount_routes
 from devgraph.indexer.common import (
     best_pin,
     name_ref_properties,
@@ -52,7 +59,7 @@ from devgraph.indexer.common import (
     visible_to,
 )
 from devgraph.indexer.containers.extractor import ContainerExtractor, ExtractionResult
-from devgraph.indexer.datastores.extractor import DatastoreExtractor
+from devgraph.indexer.datastores.extractor import DatastoreExtractor, client_datastores
 from devgraph.indexer.docs.extractor import DocsExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.csharp.extractor import extract_csharp_file
@@ -147,12 +154,17 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: anonymous companion object's members (owner `Class.Companion`); JSX
 #: component elements as calls; 17: JS/TS imports of a workspace package
 #: (package.json `workspaces`, pnpm-workspace.yaml) resolved to its entry
-#: point or subpath and its directory (resolver configuration); 20: build
+#: point or subpath and its directory (resolver configuration); 18:
+#: datastore clients of JS/TS, Java, Kotlin, C# and Go files as the shared
+#: datastore nodes their files claim, with their owning service's USES
+#: (datastores/extractor.py `client_datastores`), and Express routers
+#: mounted from another file named by those mounts (apis/routes.py
+#: MountTable); and build
 #: output folder names (`build`, `dist`, `bin`, `obj`, `target`) ignored only
 #: at the root or beside a project manifest (walk.is_build_output), so Rust's
 #: `src/bin/` and source packages named `build` are indexed.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 20
+INDEX_FORMAT = 18
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -676,6 +688,64 @@ def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, applied
         logger.warning("docs edge pass failed for %s; the next rescan retries it", repo_id, exc_info=True)
 
 
+class _Mounts:
+    """The repository's Express mounts across files (apis/routes.py
+    MountTable) for one batch: read from the graph when a file first needs
+    them, then kept current with each JS/TS file the batch writes."""
+
+    def __init__(self, engine: GraphEngine, repo_id: str):
+        self.engine, self.repo_id = engine, repo_id
+        self.table: MountTable | None = None
+        self.pending: dict[str, list[str] | None] = {}  # the batch's files' mounts before the read
+        self.touched = False  # whether a batch file has mounts or routes another file mounts
+
+    def written(self, rel_path: str, mounts: list[str] | None, exports: list[str] | None) -> None:
+        """Record a JS/TS file's `route_mounts` as the batch writes it."""
+        self.touched |= bool(mounts or exports)
+        if self.table is None:
+            self.pending[rel_path] = mounts
+        else:
+            self.table.set(rel_path, mounts)
+
+    def prefixes(self, rel_path: str, exports: list[str] | None) -> list[str] | None:
+        """The `route_prefixes` of a file with these `route_exports`."""
+        if not exports:
+            return None
+        if self.table is None:
+            self.reload()
+        return self.table.route_prefixes(rel_path, exports)
+
+    def reload(self) -> dict[str, tuple[list[str] | None, list[str] | None, list[str] | None]]:
+        """Read every Module's mounts from the graph again (the batch's
+        pending ones over them) and return the state read."""
+        state = self.engine.route_mount_state(self.repo_id)
+        mounts = {module: entries for module, (entries, _exports, _prefixes) in state.items() if entries}
+        self.table = MountTable({**mounts, **self.pending})
+        self.pending = {}
+        return state
+
+
+def _mounted(nodes: list[dict], rels: list[dict], rel_path: str, mounts: _Mounts) -> tuple[list[dict], list[dict]]:
+    """A JS/TS file's extraction with its exported routers' routes named by
+    the mounts that reach them (apis/routes.py `mount_routes`), its Module
+    recording the prefixes used (`route_prefixes`)."""
+    module = next(node for node in nodes if node["label"] == "Module" and node["name"] == rel_path)
+    props = module["properties"]
+    mounts.written(rel_path, props.get("route_mounts"), props.get("route_exports"))
+    prefixes = mounts.prefixes(rel_path, props.get("route_exports"))
+    nodes, rels = mount_routes(nodes, rels, rel_path, props.get("route_exports"), prefixes)
+    props["route_prefixes"] = prefixes
+    return nodes, rels
+
+
+def _stale_mounts(state: dict, table: MountTable) -> set[str]:
+    """The Modules whose `route_prefixes` differ from what `table` gives their `route_exports`."""
+    return {
+        module for module, (_mounts, exports, prefixes) in state.items()
+        if (prefixes or None) != table.route_prefixes(module, exports)
+    }
+
+
 def index_paths(
     engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
     mentions_enabled: bool = False, sync_provider: bool = True, relink_outside: bool = True,
@@ -698,7 +768,9 @@ def index_paths(
             writer's text, its resolver configuration and whether its target
             exists (a tiered pin's, which nodes of its target's name exist:
             other files' tiered groups to a name whose nodes the batch adds,
-            removes or rekeys are written again).
+            removes or rekeys are written again). An Express router file
+            whose mounts in other files changed under it (apis/routes.py)
+            is indexed again with the batch (`_stale_mounts`).
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
         sync_provider: Write schema-provider nodes and edges for `paths`
@@ -729,10 +801,11 @@ def index_paths(
     # by pass 2 so it re-upserts without re-parsing the file a second time.
     py_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     # Same two-pass cross-link machinery as py_files/py_extractions above,
-    # kept as parallel lists rather than merged with the Python one:
-    # datastore extraction (_datastore_nodes) is still keyed to Python source
-    # conventions, so non-Python files join the owning-service pass below
-    # only with the Endpoints their own extractor found (apis/routes.py).
+    # kept as parallel lists rather than merged with the Python one: a
+    # Python file's owning-service edges are read again from its content,
+    # while other files join the owning-service pass below with the
+    # Endpoints (apis/routes.py) and datastore nodes (`_datastore_nodes`)
+    # of their extraction.
     js_files: list[str] = []  # rel_path, for the cross-link pass below
     js_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     cs_files: list[str] = []
@@ -801,6 +874,7 @@ def index_paths(
         supplied.setdefault(rel, []).append(_own_rel(repo_root, Path(path)) or rel)
 
     max_bytes = _max_file_bytes()
+    mounts = _Mounts(engine, repo_id)
     # Files left out by their content, for catch_up (see `_skip_marks`).
     judged: dict[str, list] = {}
     read: set[str] = set()  # files extracted, whose old marks go
@@ -828,6 +902,7 @@ def index_paths(
                 if reason != GITIGNORED or rel_path in spellings:
                     engine.delete_nodes_by_source_file(repo_id, rel_path)
                 return
+            # A router file the mounts pass indexes again counts once.
             single = partial(
                 _index_single_path,
                 engine, repo_id, repo_root, resolved, rel_path,
@@ -836,13 +911,14 @@ def index_paths(
                 cs_files, cs_extractions, cpp_files, cpp_extractions,
                 java_files, java_extractions, rs_files, rs_extractions,
                 kt_files, kt_extractions, go_extractions,
-                docs_files, mention_files, batch_services,
+                docs_files, mention_files, batch_services, mounts,
             )
             try:
-                indexed += single()
+                count = single()
             except RecursionError:
                 # Extraction raises before it writes, so this is a clean retry.
-                indexed += _run_deep(single)
+                count = _run_deep(single)
+            indexed += 0 if rel_path in read else count
             read.add(rel_path)
         except ABORTS_BATCH:
             raise  # shutdown or an index still building: leave the work, and its stamp, for later
@@ -863,14 +939,28 @@ def index_paths(
     # What the batch's files produced before this run, so the referrer step
     # below can tell which nodes the batch adds.
     batch_keys = sorted(by_rel_path)
-    previous = engine.list_file_nodes(repo_id, batch_keys)
-    previous_nodes = {node[:4] for node in previous}
-    previous_keys = {node[:4]: node[4] for node in previous}
-    previous_projects = {node[:4]: node[6] for node in previous}
-    stale = {node[:4] for node in previous if node[5]}
-    # The claims on the shared nodes the batch's files claim (see
-    # _written_back_shared).
-    claims_before = engine.list_shared_claims(repo_id, batch_keys) if any(not n[2] for n in previous_nodes) else {}
+    previous_nodes: set = set()
+    previous_keys: dict = {}
+    previous_projects: dict = {}
+    stale: set = set()
+    claims_before: dict = {}
+
+    def snapshot(keys: list[str]) -> None:
+        previous = engine.list_file_nodes(repo_id, keys)
+        nodes = {node[:4] for node in previous}
+        previous_nodes.update(nodes)
+        previous_keys.update({node[:4]: node[4] for node in previous})
+        previous_projects.update({node[:4]: node[6] for node in previous})
+        stale.update(node[:4] for node in previous if node[5])
+        # The claims on the shared nodes the batch's files claim (see
+        # _written_back_shared).
+        if any(not n[2] for n in nodes):
+            for key, sources in engine.list_shared_claims(repo_id, keys).items():
+                claims_before.setdefault(key, set()).update(sources)
+
+    snapshot(batch_keys)
+    # Whether a batch file held Express mounts across files before (see _settle below).
+    mounts.touched = bool(engine.route_mount_state(repo_id, batch_keys))
 
     # The schema providers' specs, resolved once for the batch. The docs
     # nodes are read now, so the relink below can tell which ones are new;
@@ -902,6 +992,19 @@ def index_paths(
 
     for rel_path in sorted(by_rel_path):
         index_one(rel_path, by_rel_path[rel_path])
+    # An Express router file another file mounts is named by those mounts
+    # (apis/routes.py), which the batch may have changed (or written after
+    # it, in path order): every router file whose `route_prefixes` no
+    # longer match is indexed again, joining the batch.
+    if mounts.touched:
+        settle = _stale_mounts(mounts.reload(), mounts.table)
+        outside = sorted(settle - set(by_rel_path))
+        if outside:
+            snapshot(outside)
+            by_rel_path.update({rel: root_resolved / rel for rel in outside})
+            batch_keys = sorted(by_rel_path)
+        for rel_path in sorted(settle):
+            index_one(rel_path, by_rel_path[rel_path])
 
     # Files outside the batch that refer by name to a node the batch just
     # added were indexed before that node existed, so their edge to it was
@@ -1056,21 +1159,34 @@ def index_paths(
     # once per file, since it can't have changed mid-batch (Services are
     # only written by the Containerfile/compose branches above, already run
     # by this point).
-    # Another language's routes are its extraction's Endpoint nodes.
+    # Another language's routes and datastores are its extraction's
+    # Endpoint and datastore nodes.
     route_endpoints = {
         rel_path: [node["name"] for node in nodes if node["label"] == "Endpoint"]
         for extractions in code_extractions[1:]
         for rel_path, (nodes, _rels) in extractions.items()
     }
     route_endpoints = {rel_path: names for rel_path, names in route_endpoints.items() if names}
-    if py_files or route_endpoints:
+    client_stores = {
+        rel_path: [(node["label"], node["name"]) for node in nodes if node["label"] in DATASTORE_LABELS]
+        for extractions in code_extractions[1:]
+        for rel_path, (nodes, _rels) in extractions.items()
+    }
+    client_stores = {rel_path: stores for rel_path, stores in client_stores.items() if stores}
+    if py_files or route_endpoints or client_stores:
         services = _load_services_with_build_context(engine, repo_id)
         service_rels: list[dict] = []
         for rel_path, content in py_files:
             service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
         for rel_path, names in sorted(route_endpoints.items()):
             service_rels.extend(_endpoint_service_relationships(repo_id, rel_path, names, services))
+        for rel_path, stores in sorted(client_stores.items()):
+            service_rels.extend(_datastore_service_relationships(repo_id, rel_path, stores, services))
         engine.upsert_relationships(service_rels)
+    # A compose file changed which Service owns which folder: the files
+    # outside the batch that wrote owning-service edges are owned anew.
+    if relink_outside and any(_is_compose(rel_path) for rel_path in by_rel_path):
+        _relink_owning_services(engine, repo_id, set(by_rel_path) | referrers)
 
     if providers_ok and fs_spec is not None:
         filesystem.sync_present(engine, repo_id, fs_spec, present)
@@ -1174,6 +1290,8 @@ def _log_file_failure(what: str, repo_id: str, path: object, exc: Exception) -> 
 
 
 _MARKDOWN_SUFFIXES = (".md", ".markdown")
+#: The labels a datastore node takes (datastores/extractor.py DatastoreType).
+DATASTORE_LABELS = frozenset(OWNING_SERVICE_TARGETS)
 _CODE_ROUTES = {
     ".py": "py", ".cs": "cs", ".java": "java", ".rs": "rs", ".kt": "kt", ".go": "go",
     **{suffix: "js" for suffix in _JS_SUFFIXES},
@@ -1248,6 +1366,7 @@ def _index_single_path(
     docs_files: list[Path],
     mention_files: list[Path],
     batch_services: set[tuple[str, str, str]],
+    mounts: _Mounts,
 ) -> int:
     """Extract and upsert one file's graph output, routing by name/extension.
 
@@ -1296,20 +1415,22 @@ def _index_single_path(
     elif "js" in routes:
         content = read_source(resolved)
         result = extract_js_file(content, rel_path, repo_id, config)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "js")
         rels = [r.to_dict() for r in result.relationships]
+        nodes, rels = _mounted(nodes, rels, rel_path, mounts)
         # Same replace-then-reupsert rationale as the .py branch above:
         # prune this file's previously-indexed nodes/edges and write the
         # freshly-extracted ones in one transaction. Its routes' Endpoint
         # edges go as a Python file's do (`service_api`).
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
-        js_files.append(rel_path)
+        if rel_path not in js_extractions:  # once, though the mounts pass may index it again
+            js_files.append(rel_path)
         js_extractions[rel_path] = (nodes, rels)
     elif "cs" in routes:
         content = read_source(resolved)
         result = extract_csharp_file(content, rel_path, repo_id, config)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "cs")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above:
         # prune this file's stale nodes/edges in one transaction, then
@@ -1338,7 +1459,7 @@ def _index_single_path(
     elif "java" in routes:
         content = read_source(resolved)
         result = extract_java_file(content, rel_path, repo_id)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "java")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-cross-link-reupsert pattern as the .py
         # branch above (see its comment for why replace_file_nodes runs
@@ -1362,7 +1483,7 @@ def _index_single_path(
     elif "kt" in routes:
         content = read_source(resolved)
         result = extract_kotlin_file(content, rel_path, repo_id)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "kt")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above: a
         # class/function removed from the file must not survive in the graph
@@ -1374,7 +1495,7 @@ def _index_single_path(
     elif "go" in routes:
         content = read_source(resolved)
         result = extract_go_file(content, rel_path, repo_id, config)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "go")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above:
         # a struct/func/method removed from the file must not survive in
@@ -1933,7 +2054,10 @@ def _folders_above(rel: str) -> list[str]:
     return ["/".join(parts[:i]) for i in range(1, len(parts))]
 
 
-def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path]) -> int:
+def remove_paths(
+    engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
+    mentions_enabled: bool = False,
+) -> int:
     """Remove graph nodes whose provenance is one of these now-deleted paths.
 
     A path may be a file or a folder: each is keyed lexically (`_gone_key`)
@@ -1945,7 +2069,11 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     each deleted path that holds no indexable file on disk, so that its now
     empty folder nodes go. The tiered groups of other files to the deleted
     symbols' names are written again (`_relink_name_refs`): a farther node
-    the deleted one hid is linked again.
+    the deleted one hid is linked again. Deleting a file that mounted
+    another file's Express router re-indexes that router file
+    (`_stale_mounts`), with `docs_path` and `mentions_enabled` as
+    index_paths takes them; a compose file's deletion re-owns the files
+    under it (`_relink_owning_services`).
 
     Args:
         engine: A GraphEngine instance.
@@ -1978,6 +2106,8 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     shadow_names = _shadow_keys(
         (node[:4], node[4], None) for node in (engine.list_file_nodes(repo_id, gone_cs) if gone_cs else ())
     )
+    # Express mounts the deleted files held (apis/routes.py).
+    mounted = engine.route_mount_state(repo_id, sorted(removed)) if removed else {}
     # Must match the repo-relative key index_paths() writes for every
     # extractor (Module/Class/Function/Document nodes, and shared nodes'
     # `sources`).
@@ -1987,6 +2117,16 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
         engine.update_skipped_files(repo_id, drop=removed)
     if shadow_names:
         _relink_name_refs(engine, repo_id, set(), removed, shadow_names=shadow_names)
+    if any(_is_compose(rel) for rel in removed):
+        _relink_owning_services(engine, repo_id, set())
+    if mounted:
+        mounts = _Mounts(engine, repo_id)
+        settle = _stale_mounts(mounts.reload(), mounts.table)
+        if settle:
+            index_paths(
+                engine, repo_id, repo_root, {repo_root / rel for rel in settle}, docs_path=docs_path,
+                mentions_enabled=mentions_enabled, sync_provider=False,
+            )
 
     ok, fs_spec, docs_spec = specs
     if removed:
@@ -2092,7 +2232,7 @@ def prune_stale_files(
     if not stale:
         return 0
     stale_paths = {repo_root / p for p in stale}
-    return remove_paths(engine, repo_id, repo_root, stale_paths)
+    return remove_paths(engine, repo_id, repo_root, stale_paths, docs_path, mentions_enabled)
 
 
 #: How far before `since` a change stamp still makes a file due: FAT and SMB
@@ -2467,7 +2607,8 @@ def _upsert_container_result(engine: GraphEngine, repo_id: str, rel_path: str, r
         {"label": "Container", "repo_id": repo_id, "name": c.name, "properties": {**c.properties, "image": c.image}}
         for c in result.containers
     ] + [
-        {"label": "Service", "repo_id": repo_id, "name": s.name, "properties": s.properties}
+        # A build context the service no longer has is cleared (a None removes it).
+        {"label": "Service", "repo_id": repo_id, "name": s.name, "properties": {"build_context": None, **s.properties}}
         for s in result.services
     ]
     # A replace, so a service or stage the file no longer declares is
@@ -2476,9 +2617,60 @@ def _upsert_container_result(engine: GraphEngine, repo_id: str, rel_path: str, r
     engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
 
 
-def _datastore_nodes(repo_id: str, rel_path: str, content: str) -> list[dict]:
-    result = DatastoreExtractor(repo_id).extract_from_source(content, rel_path)
-    return [{"label": ds.datastore_type, "repo_id": repo_id, "name": ds.name, "properties": ds.properties} for ds in result.datastores]
+def _datastore_nodes(repo_id: str, rel_path: str, content: str, language: str = "py") -> list[dict]:
+    """The datastore nodes a source file's clients claim: a Python file's
+    (DatastoreExtractor), another language's (`client_datastores`, by its
+    `_routes` name)."""
+    if language == "py":
+        datastores = DatastoreExtractor(repo_id).extract_from_source(content, rel_path).datastores
+    else:
+        datastores = client_datastores(content, language, repo_id, rel_path)
+    return [{"label": ds.datastore_type, "repo_id": repo_id, "name": ds.name, "properties": ds.properties} for ds in datastores]
+
+
+def _is_compose(rel_path: str) -> bool:
+    """Whether a repo-relative path is a compose file (`_routes`)."""
+    return posixpath.basename(rel_path).lower() in _COMPOSE_NAMES
+
+
+def _relink_owning_services(engine: GraphEngine, repo_id: str, skip: set[str]) -> None:
+    """Re-derive the owning-service edges of the files outside `skip` after a
+    compose change: each claimed Endpoint's `CALLS` and datastore's `USES`
+    (`_endpoint_service_relationships`, `_datastore_service_relationships`)
+    are a function of its claiming file's path and the repository's Services'
+    build contexts, so a file the change gives another owning Service (or
+    none) is unclaimed from its old edges and writes its new ones, as a
+    fresh scan would have them. Read from the graph: no file is read. The
+    files in `skip` (the batch's) wrote theirs already."""
+    services = _load_services_with_build_context(engine, repo_id)
+    claims, edges = engine.owning_service_state(repo_id)
+    expected = set()
+    for label, name, sources in claims:
+        for source in sources:
+            owner = _match_owning_service(services, source)
+            if source not in skip and source.endswith(SERVICE_API_SUFFIXES) and owner is not None:
+                expected.add((label, name, owner, services[owner][1], source))
+    written = {
+        (edge["label"], edge["name"], edge["service"], edge["service_file"], origin)
+        for edge in edges for origin in edge["origins"] or [] if origin not in skip
+    }
+    engine.unclaim_owning_service_edges(repo_id, [
+        dict(zip(("label", "name", "service", "service_file", "origin"), row)) for row in sorted(written - expected)
+    ])
+    rels = []
+    for label, name, service, service_file, origin in sorted(expected - written):
+        if label == "Endpoint":
+            rels.append({
+                "from_label": "Endpoint", "from_name": name, "rel_type": "CALLS", "to_label": "Service",
+                "to_name": service, "to_file": service_file, "repo_id": repo_id, "properties": {}, "origin": origin,
+            })
+        else:
+            rels.append({
+                "from_label": "Service", "from_name": service, "from_file": service_file, "rel_type": "USES",
+                "to_label": label, "to_name": name, "repo_id": repo_id, "properties": {}, "origin": origin,
+            })
+    if rels:
+        engine.upsert_relationships(rels)
 
 
 def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict[str, tuple[str, str]]:
@@ -2545,27 +2737,37 @@ def _owning_service_relationships(
         return []
     _owning_context, owning_service_file = services[owning_service]
 
-    rels: list[dict] = []
-
     datastore_result = DatastoreExtractor(repo_id).extract_from_source(content, rel_path)
-    for ds in datastore_result.datastores:
-        rels.append(
-            {
-                "from_label": "Service",
-                "from_name": owning_service,
-                "from_file": owning_service_file,
-                "rel_type": "USES",
-                "to_label": ds.datastore_type,
-                "to_name": ds.name,
-                "repo_id": repo_id,
-                "properties": {},
-                "origin": rel_path,
-            }
-        )
-
+    datastores = [(ds.datastore_type, ds.name) for ds in datastore_result.datastores]
     api_result = APIExtractor(repo_id).extract_from_source(content, rel_path)
     endpoints = [f"{endpoint.method} {endpoint.path}" for endpoint in api_result.endpoints]
-    return rels + _endpoint_service_relationships(repo_id, rel_path, endpoints, services)
+    return _datastore_service_relationships(repo_id, rel_path, datastores, services) + _endpoint_service_relationships(
+        repo_id, rel_path, endpoints, services
+    )
+
+
+def _datastore_service_relationships(
+    repo_id: str, rel_path: str, datastores: list[tuple[str, str]], services: dict[str, tuple[str, str]]
+) -> list[dict]:
+    """USES from the compose Service that owns the file to each of its
+    datastores ((label, name)), as `_owning_service_relationships` writes them."""
+    owning_service = _match_owning_service(services, rel_path)
+    if owning_service is None:
+        return []
+    return [
+        {
+            "from_label": "Service",
+            "from_name": owning_service,
+            "from_file": services[owning_service][1],
+            "rel_type": "USES",
+            "to_label": label,
+            "to_name": name,
+            "repo_id": repo_id,
+            "properties": {},
+            "origin": rel_path,
+        }
+        for label, name in datastores
+    ]
 
 
 def _endpoint_service_relationships(

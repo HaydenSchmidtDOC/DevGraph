@@ -157,9 +157,9 @@ its edge. That is now in scope (G2).
   call precision. These are the handover's open items 1 and 2. The first is
   resolved by owner identity (index formats 11 and 12, below), except the
   cases its Limits list.
-- **A compose-only batch that adds `build:`.** It gets no owning-service
-  `USES`/`CALLS` until the owned Python files are re-indexed. The fuzz
-  excludes it.
+- ~~**A compose-only batch that adds `build:`.**~~ Closed by index format
+  18 (2026-10-11-nonpython-call-resolution-design.md, "Compose changes
+  re-own the files outside the batch"); the fuzz moves build contexts.
 - **Go/Rust methods defined in another file than their type.** Their
   `CONTAINS` is pinned to the method's file, where the type doesn't live,
   so it is never created (fresh and incremental alike). The C++

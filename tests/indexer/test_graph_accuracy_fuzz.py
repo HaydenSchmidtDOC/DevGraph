@@ -67,8 +67,12 @@ Module's pinned CALLS and IMPORTS rows (`_with_pin_comments`), so every pin
 kind is written, relinked and removed as files come and go.
 
 The spec's "Out of scope" gaps are left out by construction:
-- compose services have `image:` only, never `build:`;
-- no datastore code, and routes only in Express (TS) and Spring (Java) files,
+- a compose service's `build:` context comes, moves and goes (`op_build`),
+  so the files under it change owning Service;
+- datastore clients only as imports (`op_datastore`), and routes only in
+  Express (TS) and Spring (Java) files, a TS file mounting another's
+  exported looseRouter (`op_mount`, `op_mount_prefix`, `op_export_router`,
+  `op_move_router`, chains and cycles included),
   which add, drop and change routes and move a handler (`op_route`,
   `op_route_change`, `op_route_move`), each Endpoint and handler stub
   claimed by every file routing it;
@@ -84,6 +88,7 @@ The spec's "Out of scope" gaps are left out by construction:
 
 import json
 import os
+import posixpath
 import random
 from dataclasses import dataclass, field, replace
 
@@ -156,13 +161,17 @@ class File:
     methods: list = field(default_factory=list)  # cpp: out-of-class definitions, "Widget::draw"
     block: bool = False  # cs: a block namespace, its `using`s inside it
     routes: list = field(default_factory=list)  # ts/java: (method, path, handler) routes
+    builds: dict = field(default_factory=dict)  # compose: service -> build context
+    mounts: list = field(default_factory=list)  # ts: (app or router, prefix, router file) Express mounts
+    exported: bool = False  # ts: `export default looseRouter`
 
     def copy(self):
         return replace(
             self, imports=list(self.imports), bases=dict(self.bases),
             funcs={k: list(v) for k, v in self.funcs.items()}, services=dict(self.services),
             froms=list(self.froms), mentions=list(self.mentions), links=list(self.links), pins=list(self.pins),
-            methods=list(self.methods), routes=list(self.routes),
+            methods=list(self.methods), routes=list(self.routes), builds=dict(self.builds),
+            mounts=list(self.mounts),
         )
 
 
@@ -178,7 +187,13 @@ def py_class(name: str, base: str | None) -> str:
     return head + "    def act(self):\n        return self.shared()\n" + shared + meta
 
 
-def render(f: File) -> str:
+def ts_specifier(path: str, target: str) -> str:
+    """The relative specifier `path` imports the TS file `target` by."""
+    spec = posixpath.relpath(target.rsplit(".", 1)[0], posixpath.dirname(path))
+    return spec if spec.startswith("../") else f"./{spec}"
+
+
+def render(f: File, path: str = "") -> str:
     if f.kind == "py":
         # A Python file's imports are whole statements and its calls whole
         # call expressions (`helper()`, `b.helper()`, `obj.helper()`).
@@ -267,6 +282,11 @@ def render(f: File) -> str:
         return "".join(parts)
     if f.kind == "ts":
         parts = [f"{m}\n" for m in f.imports]
+        # Another file's router, imported by its path as the file stands now (a
+        # moved router file is no longer found).
+        parts += [
+            f"import m{k} from '{ts_specifier(path, target)}';\n" for k, (_parent, _prefix, target) in enumerate(f.mounts)
+        ]
         parts += [
             f"\nexport function {name}() {{\n" + "".join(f"  {g}();\n" for g in calls) + "}\n"
             for name, calls in f.funcs.items()
@@ -280,10 +300,15 @@ def render(f: File) -> str:
                 f"{TS_ROUTERS.get(path, 'app')}.{method}('{path}', {handler});\n"
                 for method, path, handler in f.routes
             ]
+        parts += [f"{parent}.use('{prefix}', m{k});\n" for k, (parent, prefix, _target) in enumerate(f.mounts)]
+        if f.exported:
+            parts.append("export default looseRouter;\n")
         return "".join(parts) or "export {};\n"
     if f.kind == "compose":
-        return "services:\n" + "".join(f"  {s}:\n    image: {i}\n" for s, i in f.services.items()) if f.services \
-            else "services: {}\n"
+        return "services:\n" + "".join(
+            f"  {s}:\n    image: {i}\n" + (f"    build: ./{f.builds[s]}\n" if s in f.builds else "")
+            for s, i in f.services.items()
+        ) if f.services else "services: {}\n"
     if f.kind == "docker":
         return "".join(f"FROM {i}\nRUN true\n" for i in f.froms) or "# No stages.\n"
     if f.kind == "notes":
@@ -441,9 +466,11 @@ def initial_repo() -> dict:
         "ts/tsconfig.json": File("static", head=TS_CONFIGS["ts/tsconfig.json"][0]),
         "ts/configs/base.cfg": File("static", head=TS_CONFIGS["ts/configs/base.cfg"][0]),
         "ts/app.ts": File("ts", imports=["import { f } from '@/lib';", "import * as u from '@/util';"],
+                          mounts=[("app", "/m", "ts/src/util.ts")],
                           funcs={"main": ["f", "u.g"]}, routes=[("get", "/items", "main"), ("post", "/api/items", "f")]),
         "ts/src/lib.ts": File("ts", funcs={"f": []}),
-        "ts/src/util.ts": File("ts", imports=["import { f } from './lib';"], funcs={"g": ["f"]}),
+        "ts/src/util.ts": File("ts", imports=["import { f } from './lib';"], funcs={"g": ["f"]},
+                               routes=[("get", "/loose", "g")], exported=True),
         "ts/other/lib.ts": File("ts", funcs={"f": [], "g": []}),
         # A workspace package: its barrel re-exports fmt, another entry
         # defines its own; ws/app imports it by name and by a subpath.
@@ -461,7 +488,7 @@ def initial_repo() -> dict:
         "go/a/a.go": File("go", head="a", imports=["example.com/fz/b"], funcs={"Start": ["Serve"]}),
         "go/b/b.go": File("go", head="b", extra=GO_SERVER, funcs={"Serve": [], "Stop": []}),
         "go/b/halt.go": File("go", head="b", funcs={"Halt": ["Stop"]}),
-        "compose.yaml": File("compose", services={"api": "alpine:3.20", "web": "nginx:1.27"}),
+        "compose.yaml": File("compose", services={"api": "alpine:3.20", "web": "nginx:1.27"}, builds={"api": "ts", "web": "py"}),
         "Dockerfile": File("docker", froms=["python:3.12"]),
         "notes.md": File("notes", mentions=["helper", "Foo", "Base", "K", "Serve", "api", "python", "nginx"]),
         "docs/adr-1.md": File("note", head="ADR-1", links=["py/a.py"]),
@@ -487,6 +514,15 @@ IMPORTS = {
            "import { lead } from '@fz/utils/lib/main';"],
     "java": ["base.Base", "app.K", "base.*"],
     "kt": ["kt.util.slug", "kt.util.*", "kt.Clock", "kt.helper"],
+}
+# Datastore clients' imports, as each language writes one (several naming one store).
+CLIENTS = {
+    "py": ["import redis", "import psycopg2"],
+    "ts": ["import Redis from 'ioredis';", "import { Pool } from 'pg';", "const { Kafka } = require('kafkajs');"],
+    "java": ["redis.clients.jedis.Jedis", "org.apache.kafka.clients.producer.KafkaProducer"],
+    "kt": ["io.lettuce.core.RedisClient", "org.postgresql.Driver"],
+    "cs": ["using StackExchange.Redis;", "using Npgsql;"],
+    "go": ["github.com/lib/pq", "github.com/segmentio/kafka-go", "github.com/redis/go-redis/v9"],
 }
 BASES = {
     "py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "java": ["Base", "K"],
@@ -537,6 +573,8 @@ PY_ROOTS = ["src/", "", "code/"]
 # The source roots a Java file moves between (another Maven module).
 JAVA_ROOTS = ["java/", "lib/src/main/java/"]
 SERVICES = ["api", "web", "worker", "db"]
+# The folders a compose service builds from (ts/src inside ts: the nearest wins).
+BUILD_CONTEXTS = ["py", "ts", "ts/src", "java", "go", "cs", "kt", "pkg"]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
 EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing", "act", "shared"]
 CODE = ("py", "rs", "go", "java", "ts", "kt", "cs", "cpp")
@@ -550,6 +588,8 @@ ROUTE_METHODS = ["get", "post", "put"]
 TS_ROUTE_PATHS = ["/items", "/items/:id", "/api/items", "/api/orders", "/health", "/loose"]
 # `/items/:id` goes on the router the file mounts, `/loose` on one another file mounts.
 TS_ROUTERS = {"/items/:id": "router", "/loose": "looseRouter"}
+# The prefixes a TS file mounts another file's router at.
+MOUNT_PREFIXES = ["/m", "/api/m", "/n"]
 JAVA_ROUTE_PATHS = ["/items", "/orders", "/items/{id}"]
 TS_HANDLERS = ["f", "g", "u.g", "missing", "(req, res) => res.end()"]
 SPRING_MAPPINGS = {"get": "GetMapping", "post": "PostMapping", "put": "PutMapping"}
@@ -675,6 +715,20 @@ class Fuzz:
             return f"remove import {m} in {path}", {path}
         f.imports.append(m)
         return f"add import {m} in {path}", {path}
+
+    def op_datastore(self):
+        """Add or remove a datastore client's import: the file claims the
+        store's shared node (one provider's, whichever language)."""
+        path = self._pick(lambda f: f.kind in CLIENTS)
+        if not path:
+            return None
+        f = self.files[path]
+        m = self.rng.choice(CLIENTS[f.kind])
+        if m in f.imports:
+            f.imports.remove(m)
+            return f"remove client {m} in {path}", {path}
+        f.imports.append(m)
+        return f"add client {m} in {path}", {path}
 
     def op_import_style(self):
         """Write one of a Python file's imports another way."""
@@ -843,7 +897,10 @@ class Fuzz:
 
     def op_rs_reexport(self):
         """Add or remove a `pub use` re-export of lib.rs or util.rs."""
-        path = self.rng.choice(sorted(p for p in RS_REEXPORTS if p in self.files))
+        paths = sorted(p for p in RS_REEXPORTS if p in self.files)
+        if not paths:  # both deleted
+            return None
+        path = self.rng.choice(paths)
         line = self.rng.choice(RS_REEXPORTS[path])
         imports = self.files[path].imports
         if line in imports:
@@ -1114,6 +1171,69 @@ class Fuzz:
         services[name] = self.rng.choice(IMAGES)
         return f"add service {name} ({services[name]}) in {path}", {path}
 
+    def op_build(self):
+        """Give a compose service a build context, move it or take it away:
+        the files under it change owning Service (their Endpoints' CALLS and
+        their stores' USES), the nearest context winning."""
+        path = self._pick(lambda f: f.kind == "compose" and f.services)
+        if not path:
+            return None
+        f = self.files[path]
+        name = self.rng.choice(sorted(f.services))
+        if name in f.builds and self.rng.random() < 0.4:
+            del f.builds[name]
+            return f"remove build of {name} in {path}", {path}
+        f.builds[name] = self.rng.choice(BUILD_CONTEXTS)
+        return f"build {name} from {f.builds[name]} in {path}", {path}
+
+    def op_mount(self):
+        """Mount another TS file's router on the file's app or its own
+        router, or unmount one: the router file's routes take (or lose) the
+        prefix, through up to two files."""
+        path = self._pick(lambda f: f.kind == "ts")
+        if not path:
+            return None
+        f = self.files[path]
+        if f.mounts and self.rng.random() < 0.4:
+            gone = f.mounts.pop(self.rng.randrange(len(f.mounts)))
+            return f"unmount {gone} in {path}", {path}
+        target = self._pick(lambda o: o.kind == "ts" and o is not f)
+        if not target:
+            return None
+        mount = (self.rng.choice(["app", "looseRouter"]), self.rng.choice(MOUNT_PREFIXES), target)
+        f.mounts.append(mount)
+        return f"mount {mount} in {path}", {path}
+
+    def op_mount_prefix(self):
+        """Change a mount's prefix."""
+        path = self._pick(lambda f: f.mounts)
+        if not path:
+            return None
+        mounts = self.files[path].mounts
+        at = self.rng.randrange(len(mounts))
+        parent, prefix, target = mounts[at]
+        mounts[at] = (parent, self.rng.choice([p for p in MOUNT_PREFIXES if p != prefix]), target)
+        return f"change mount {at} to {mounts[at]} in {path}", {path}
+
+    def op_export_router(self):
+        """Export a TS file's looseRouter, or stop exporting it."""
+        path = self._pick(lambda f: f.kind == "ts")
+        if not path:
+            return None
+        f = self.files[path]
+        f.exported = not f.exported
+        return f"{'export' if f.exported else 'unexport'} looseRouter in {path}", {path}
+
+    def op_move_router(self):
+        """Move a mounted router file to another TS folder (its mounts' imports then miss it)."""
+        targets = sorted({t for f in self.files.values() for _p, _x, t in f.mounts if t in self.files})
+        if not targets:
+            return None
+        old = self.rng.choice(targets)
+        new = self.rng.choice(["ts/", "ts/src/", "ts/other/", "ws/app/"]) + self._fresh("router") + ".ts"
+        self.files[new] = self.files.pop(old)
+        return f"move {old} to {new}", {old, new}
+
     def op_from(self):
         path = self._pick(lambda f: f.kind == "docker")
         if not path:
@@ -1192,7 +1312,8 @@ class Fuzz:
         "cs_dup_class", "cs_shadow", "cs_shadow", "cs_reference", "cs_reference", "cs_project_move", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route",
         "route",
         "route_change", "route_move", "src_move", "src_move", "src_dir", "src_dir", "rs_reexport", "rs_reexport", "rs_reexport",
-        "ws_rename", "ws_rename", "ws_main", "ws_main",
+        "ws_rename", "ws_rename", "ws_main", "ws_main", "datastore", "datastore",
+        "build", "build", "build", "mount", "mount", "mount", "mount_prefix", "export_router", "move_router",
     ]
 
     def draw(self):
@@ -1206,7 +1327,7 @@ class Fuzz:
             path = root / rel
             if rel in self.files:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(render(self.files[rel]))
+                path.write_text(render(self.files[rel], rel))
             elif path.exists():
                 path.unlink()
 
@@ -1317,13 +1438,14 @@ def test_graph_accuracy_fuzz(engine, repo_id, tmp_path, seed):
                 order.sort(key=lambda rel: not (rel in gone and rel.startswith(f"{DOCS}/")))
             for rel in order + sorted(folders):
                 if rel in gone or rel in folders:
-                    remove_paths(engine, repo_id, root, {root / rel})
+                    remove_paths(engine, repo_id, root, {root / rel}, docs_path=DOCS, mentions_enabled=True)
                 else:
                     index_paths(engine, repo_id, root, {root / rel}, docs_path=DOCS, mentions_enabled=True)
                 resync({rel})
         else:
             if gone or folders:
-                remove_paths(engine, repo_id, root, {root / rel for rel in gone | folders})
+                remove_paths(engine, repo_id, root, {root / rel for rel in gone | folders}, docs_path=DOCS,
+                             mentions_enabled=True)
             if changed:
                 index_paths(engine, repo_id, root, {root / rel for rel in changed}, docs_path=DOCS,
                             mentions_enabled=True)

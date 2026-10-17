@@ -37,6 +37,9 @@ class _GraphFilesEngine:
     def list_file_nodes(self, repo_id, files):
         return set()
 
+    def route_mount_state(self, repo_id, names=None):
+        return {}
+
     def delete_nodes_by_source_file(self, repo_id, file_name):
         self.language.append(file_name)
 

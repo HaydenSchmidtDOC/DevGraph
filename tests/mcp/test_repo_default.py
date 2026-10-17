@@ -71,6 +71,7 @@ MIN_ARGS = {
     "impact_analysis_for_diff": {"base_ref": "a", "head_ref": "b"},
     "explain_architecture": {},
     "list_services": {},
+    "list_endpoints": {},
     "explain_decision": {"decision_name": "X"},
     "find_requirements_for": {"component_name": "X"},
     "trace_design_rationale": {"component_name": "X"},
@@ -174,8 +175,8 @@ def call(server, name, arguments):
 # ── characterization: explicit calls ───────────────────────────────────────
 
 
-def test_builtins_with_repo_id_are_exactly_the_25():
-    assert len(BUILTINS_WITH_REPO_ID) == 25
+def test_builtins_with_repo_id_are_exactly_the_26():
+    assert len(BUILTINS_WITH_REPO_ID) == 26
     assert "run_cypher" not in BUILTINS_WITH_REPO_ID
     assert set(MIN_ARGS) == BUILTINS_WITH_REPO_ID
 

@@ -61,7 +61,7 @@ def test_a_latin_1_python_file_keeps_its_identifier(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         _index_single_path(
             Engine(), "_unit_decode", tmp_path, path, "shop.py", None, False, None,
-            [], {}, [], {}, [], {}, [], {}, [], {}, [], {}, [], {}, {}, [], [], set(),
+            [], {}, [], {}, [], {}, [], {}, [], {}, [], {}, [], {}, {}, [], [], set(), dispatch._Mounts(Engine(), "_unit_decode"),
         )
     assert "café" in {node["name"] for node in nodes if node["label"] == "Function"}
 

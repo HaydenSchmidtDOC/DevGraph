@@ -976,7 +976,8 @@ has:
   its `Endpoint` implements nothing.
 
 A route on a router or group whose mount its file doesn't show has an
-unknown prefix. Its Endpoint is the file's own, named
+unknown prefix (an Express router another file mounts is resolved since
+index format 18: "Express routers mounted from another file", below). Its Endpoint is the file's own, named
 `"<METHOD> ?<path> (<file>)"` (`routes.unmounted_endpoint`), so no two files'
 `GET /` meet in one Endpoint that no request reaches as such, and
 `trace_request_flow` never starts from such a hub (a bare `/` does not
@@ -1019,10 +1020,9 @@ Not read: Fastify's `route({...})` object form, echo's `Add`, chi
 `Mount`, Koa's `app.use(router.routes())` as a mount, ASP.NET `MapMethods`
 and conventional routing, Spring functional routes (`RouterFunction`),
 Kotlin Ktor. Express, Koa and Fastify routes all carry `framework:
-Express`. A compose change (a `build:` added or moved) leaves the
-Endpoint `CALLS` Service edges as they were until the route files are
-indexed again, as for Python (the graph-accuracy design's out-of-scope
-compose-only batch).
+Express`. A compose change (a `build:` added, moved or dropped) re-owns
+the route files outside its batch (below, "Compose changes re-own the files
+outside the batch").
 
 The dispatcher treats these files as it treats a Python file. Their replace
 is a `service_api` one (`engine.SERVICE_API_SUFFIXES`, also checked on
@@ -1053,8 +1053,9 @@ it, rebuilding every code Module's record from the shared nodes' own
 one read and a write of only the records that differ, so a scan that
 changes nothing locks no Module), and a file's delete reads every claim,
 not its record (deletes are rare).
-Set (c)'s `USES` unclaim runs for Python files only, the only writers of
-`USES`. Python
+Set (c)'s `USES` unclaim ran for Python files only, the only writers of
+`USES` until index format 18 (datastore clients beyond Python, below); it
+now runs for every `service_api` file. Python
 route files gain the same. Measured on a synthetic repository of 2,000
 files (400 each of TS, Java, Go, C# and Python, a quarter of the first four
 with routes: 1,600 Endpoints), `full_scan` against the shared local Neo4j:
@@ -1068,6 +1069,160 @@ with routes: 1,600 Endpoints), `full_scan` against the shared local Neo4j:
 A repository with no routes costs the same. What remains is linear in the
 routes (their Endpoint and stub claims, about 5.5 ms per label per route
 file, and their edges).
+
+## Datastore clients beyond Python (index format 18)
+
+`Service -USES->` a datastore came from Python files alone, so
+`get_service_dependencies` and `explain_architecture` listed no store for a
+JS/TS, Java, Kotlin, C# or Go service. `datastores/extractor.py`
+`client_datastores` now reads those languages' clients, by literal text only
+(a URL, driver or namespace built at run time is not read). The text is the
+file's code with its comments removed and its string literals masked
+(`_masked`, a small lexer per family: `'`/`"`, `` ` `` in JS/TS and Go,
+Java/Kotlin text blocks, C# verbatim strings), so a comment never counts
+and a string counts only as an import specifier (an ES `import`/`export
+... from`, not a type-only `import type`/`export type`; `require`/`import()`;
+a Go import path) or, for a connection URL, a JDBC URL or a Go driver
+name, as an argument passed straight to a call (`new Pool('postgres://...')`,
+`DriverManager.getConnection("jdbc:...")`, `sql.Open("postgres", ...)`; a URL
+assigned to a variable or field first is not read). A Spring Data
+repository counts only in supertype position (after `extends`,
+`implements` or `:`, maybe after other supertypes). A file under a
+conventional test folder (`test/`, `tests/`, `__tests__/`, `src/test/`,
+`*.Tests/`) names no store, its fixtures being no service's use:
+
+| Language | Read |
+|---|---|
+| JS/TS | a module specifier (`import`, `from`, `require`, `import()`) of `pg`, `postgres`, `mysql`, `mysql2`, `mongodb`, `mongoose`, `sqlite3`, `better-sqlite3`, `neo4j-driver`, `@prisma/client`, `redis`, `ioredis`, `kafkajs`, `amqplib`, `@aws-sdk/client-s3`, `@aws-sdk/client-sqs` (or a subpath: `mysql2/promise`) |
+| Java, Kotlin | an import of (or below) `org.postgresql`, `com.mongodb`, Spring Data's `mongodb`/`jpa`/`neo4j`/`redis`, `org.neo4j.driver`, `redis.clients.jedis` (Jedis), `io.lettuce.core` (Lettuce), `org.apache.kafka.clients`, `org.springframework.kafka`, `com.rabbitmq.client`, `org.springframework.amqp`, the AWS SDK's `s3`/`sqs`; a JDBC URL passed to a call (`"jdbc:postgresql:`, `mysql`, `mariadb`, `sqlserver`, `sqlite`, `oracle`, `h2`); a Spring Data repository supertype (`JpaRepository<`, `MongoRepository<`, `ReactiveMongoRepository<`, `Neo4jRepository<`, `CassandraRepository<`, `ElasticsearchRepository<`) |
+| C# | a `using` of (or below) `Npgsql`, `Microsoft.Data.SqlClient`/`System.Data.SqlClient`, `Microsoft.Data.Sqlite`, `MySqlConnector`, `MySql.Data`, `MongoDB.Driver`, `StackExchange.Redis`, `Confluent.Kafka`, `RabbitMQ.Client`, `Amazon.S3`, `Amazon.SQS`; an EF Core provider call (`.UseNpgsql(`, `UseSqlServer`, `UseSqlite`, `UseMySql`, `UseCosmos`, `UseOracle`) and a `DbContext` subclass |
+| Go | an import of (or below) `github.com/lib/pq`, `github.com/jackc/pgx`, `github.com/go-sql-driver/mysql`, `github.com/mattn/go-sqlite3`, `modernc.org/sqlite`, `go.mongodb.org/mongo-driver`, `github.com/redis/go-redis`, `github.com/go-redis/redis`, `github.com/IBM/sarama`, `github.com/Shopify/sarama`, `github.com/segmentio/kafka-go`, `github.com/rabbitmq/amqp091-go`, the AWS SDK v2's `s3`/`sqs`; `sql.Open("<driver>", ...)` with a literal driver (`postgres`, `pgx`, `mysql`, `sqlite3`, `sqlserver`) |
+| all five | a connection URL passed to a call, at the start of its string literal: `postgres://`, `postgresql://`, `mysql://`, `mongodb://`, `mongodb+srv://`, `redis://`, `rediss://`, `amqp://`, `amqps://` |
+
+A store's identity is a Python client's: its provider, under its type's
+label (`Database`, `Cache`, `Queue`; `VectorStore` has no client here), so
+every file and service using PostgreSQL meets one shared `PostgreSQL`
+`Database`, whatever the language, and the URL's host, database name or
+environment variable never splits it. An ORM whose store is configured
+outside the code is named by the ORM (`Prisma`, `JPA`, `EF Core`), as a
+Python LangChain vector store is `LangChain`; S3 is a `Database` named
+`S3`, SQS a `Queue`. A file's node per provider takes the alphabetically
+first of its clients of that provider as its `library`, and its `source`.
+
+The dispatcher appends these nodes to the file's extraction
+(`_datastore_nodes(..., language)`), so its replace claims them as a Python
+file's (G3: re-claimed in place, a store's incoming edges kept). Their
+`USES` from the owning compose `Service` are written in the owning-service
+pass (`_datastore_service_relationships`, the edge a Python file's
+`_owning_service_relationships` writes), with the file as origin; set (c)'s
+`USES` unclaim now runs for every `service_api` file, on a replace and on a
+delete. Nothing else is new for incremental equals fresh: a node and its
+edge are functions of the file's text and the compose files. The fuzz
+toggles clients' imports in Python, TS, Java, Kotlin, C# and Go files
+(`op_datastore`); `tests/indexer/test_client_datastores_live.py` scans one
+service per language. C++ and Rust clients are not read.
+
+## Express routers mounted from another file (index format 18)
+
+`app.use('/api', usersRouter)`, with `usersRouter` imported from
+`routes/users.js`, left that file's routes unmounted: `GET ?/:id
+(routes/users.js)`. A route's full path now comes from both files, and
+must still equal a fresh scan whichever of them changes, so neither file's
+extraction reads the other: each records its half on its Module, and the
+dispatcher joins them.
+
+- **The mounting file** records `route_mounts`, one entry per mount of an
+  imported router (`app.use('/p', x)`, the last argument, so middleware
+  before it is skipped; `x` a default or named ES import, a `require` or
+  its destructured name, or an inline `require('./r')`): its base, the
+  prefix, the export name (`default` for a default import or a whole
+  `require`) and the files the specifier can name
+  (`_resolve_module_specifier`: every candidate, none checked against the
+  disk, so a mount is a function of the file's text and resolver
+  configuration). The base is "" and the prefix the full one when the
+  router it is mounted on has a known prefix (an app, or a router the file
+  mounts itself); it is an export name of the file's own router when that
+  router is exported and not mounted in the file (the prefix is then
+  relative to that router's mounts: a chain); otherwise the mount is not
+  recorded.
+- **The router file** records `route_exports`: (export name, method, path)
+  for each route on a router it exports (`export default r`, `export const
+  r`, `export { r as x }`, `module.exports = r`, `module.exports = { r }`,
+  `exports.x = r`) and doesn't mount itself. Its extraction still names
+  them `?` Endpoints; a route whose `?` name another unmounted route of the
+  file shares is not deferred.
+- **The dispatcher** (`index_paths`) keeps a `MountTable` of every Module's
+  `route_mounts` (read once per batch when a file first needs it, then kept
+  current with each JS/TS file the batch writes). A router file's prefixes
+  per export are the mounts naming one of its candidate files and that
+  export, a base other than "" followed to the mounting file's own mounts,
+  at most `MAX_MOUNT_HOPS` (2) cross-file mounts in all: an app mounting an
+  api router that mounts the users router resolves; a third level stays
+  unmounted, and a cycle ends there. `mount_routes` renames each deferred
+  route's Endpoint (and its `IMPLEMENTS`, and so its owning-service `CALLS`)
+  to one per prefix, `"<METHOD> <prefix><path>"`; a router mounted nowhere
+  keeps its `?` Endpoint. The Module records the prefixes it used as
+  `route_prefixes`. The three properties are lists, absent when empty,
+  hidden and reserved like `name_refs`.
+- **Settling.** A router file's output depends on other files' mounts, so
+  after pass 1 (when a batch file had or has any of the three properties)
+  the batch reads every Module holding one, rebuilds the table and
+  re-indexes each file whose `route_prefixes` differ from what the table
+  gives its `route_exports` (`_stale_mounts`): a router file the batch
+  wrote before the file mounting it (path order), and router files outside
+  the batch whose mounts the batch changed, which join the batch (their
+  previous nodes snapshotted first, so "added" stays exact). The records
+  themselves are text, so one round settles. `remove_paths` does the same
+  after deleting a file that held one (with `docs_path`/`mentions_enabled`,
+  which it now takes, as the watcher passes them). Moving a router file is a
+  delete and an add: the mount's candidates name the old path, so the moved
+  router is unmounted (fresh and incremental alike), and a mount's own
+  change re-indexes the routers under both its old and new targets.
+
+Cost: a batch with no mounts or exported routes before or after pays one
+indexed read of its own Modules; one that has them reads every Module of
+the repository holding a mount property (one indexed scan) and re-indexes
+only the router files whose prefixes changed. A full scan re-indexes the
+router files that sort before the file mounting them. The fuzz mounts
+another TS file's exported router on an app or on the file's own exported
+router (so chains and cycles), unmounts it, changes the prefix, stops
+exporting it, and moves the router file (`op_mount`, `op_mount_prefix`,
+`op_export_router`, `op_move_router`); `tests/indexer/test_express_mounts_live.py`
+walks a two-level chain through prefix changes, a second mount, an
+unexported middle, a move and deletions.
+
+Not read: a mount through a variable path, a router held in an object
+(`routers.users`), a namespace import's member (`app.use('/x', ns.r)`),
+`export default Router()` (no name to route on), Koa's
+`app.use(router.routes())`, and other frameworks' cross-file groups (a gin
+`*gin.RouterGroup` parameter, ASP.NET `IEndpointRouteBuilder`).
+
+## Compose changes re-own the files outside the batch
+
+The owning-service edges (`Endpoint -CALLS-> Service`, `Service -USES->`
+a datastore) were written only for the batch's own files, so a batch of a
+compose file alone, giving a service a `build:`, moving it or taking it
+away, left every other file's edges at its old owner (the graph-accuracy
+design's out-of-scope "compose-only batch"). Those edges are a function of
+two things the graph holds: which files claim each Endpoint and datastore
+node (its `sources`) and the Services' build contexts (the longest one
+containing the file wins, `_match_owning_service`). So a batch holding a
+compose file (`_is_compose`), and a `remove_paths` deleting one, run
+`dispatch._relink_owning_services` after the owning-service pass: one read
+of every claimed Endpoint and datastore node with its claiming files and of
+every owning-service edge with its `origins` (`engine.owning_service_state`),
+then, for each claiming file outside the batch, the edges it should write
+now are compared with the ones listing it: a stale one is unclaimed (the
+file leaves its `origins`, the edge goes with the last,
+`unclaim_owning_service_edges`) and a missing one written with the file as
+origin. No file is read. A full scan skips it (no file is outside its
+batch). A compose replace also clears a `build_context` the service no
+longer has: the node is updated in place (`SET +=`), so the stale property
+kept its old owner before. The cost is one read proportional to the
+repository's Endpoints and datastore claims per batch holding a compose
+file; other batches pay nothing. The fuzz gives compose services `build:`
+contexts that come, move (to nested folders: the nearest wins) and go
+(`op_build`); `tests/indexer/test_routes_live.py` moves one by hand.
 
 ## No reverse dependents
 

@@ -191,7 +191,8 @@ def _routed_by_index_single_path(root, path, docs_root, mentions_enabled):
     )}
     return dispatch._index_single_path(
         MagicMock(), "r", root, resolved, resolved.relative_to(root.resolve()).as_posix(),
-        docs_root, mentions_enabled, config=None, batch_services=set(), **lists, **extractions,
+        docs_root, mentions_enabled, config=None, batch_services=set(), mounts=dispatch._Mounts(MagicMock(), "r"),
+        **lists, **extractions,
     ) > 0
 
 
