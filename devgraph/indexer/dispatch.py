@@ -898,7 +898,8 @@ def index_paths(
                 if reason != GITIGNORED or rel_path in spellings:
                     engine.delete_nodes_by_source_file(repo_id, rel_path)
                 return
-            indexed += _index_single_path(
+            # A router file the mounts pass indexes again counts once.
+            count = _index_single_path(
                 engine, repo_id, repo_root, resolved, rel_path,
                 docs_root, mentions_enabled, config,
                 py_files, py_extractions, js_files, js_extractions,
@@ -907,6 +908,7 @@ def index_paths(
                 kt_files, kt_extractions, go_extractions,
                 docs_files, mention_files, batch_services, mounts,
             )
+            indexed += 0 if rel_path in read else count
             read.add(rel_path)
         except ABORTS_BATCH:
             raise  # shutdown or an index still building: leave the work, and its stamp, for later
@@ -1353,7 +1355,8 @@ def _index_single_path(
         # edges go as a Python file's do (`service_api`).
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
-        js_files.append(rel_path)
+        if rel_path not in js_extractions:  # once, though the mounts pass may index it again
+            js_files.append(rel_path)
         js_extractions[rel_path] = (nodes, rels)
     elif "cs" in routes:
         content = read_source(resolved)

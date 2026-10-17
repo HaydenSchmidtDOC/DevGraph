@@ -147,5 +147,10 @@ def test_a_chain_longer_than_two_mounts_stays_unmounted(engine, repo_id, tmp_pat
           "function h() {}\nexport default router;\n")
     provision_repository_schema(engine, tmp_path)
     engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    # a.js and b.js sort before the files mounting them, so the batch indexes them
+    # again once the mounts are known; each file still counts once.
+    paths = {tmp_path / name for name in ("app.js", "a.js", "b.js", "c.js")}
+    assert index_paths(engine, repo_id, tmp_path, paths) == 4
+    assert endpoints(engine, repo_id) == ["GET /a/a", "GET /a/b/b", "GET ?/c (c.js)"]
     full_scan(engine, repo_id, tmp_path)
     assert endpoints(engine, repo_id) == ["GET /a/a", "GET /a/b/b", "GET ?/c (c.js)"]
