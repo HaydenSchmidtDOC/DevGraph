@@ -32,7 +32,7 @@ from watchdog.observers.api import ObservedWatch
 from devgraph.config import get_settings
 from devgraph.indexer.dispatch import is_ignored_path
 from devgraph.indexer.gitignore import GITIGNORE, is_gitignored
-from devgraph.indexer.walk import _junction_inside, indexable_paths_under, is_ignored_dir_name
+from devgraph.indexer.walk import _junction_inside, indexable_paths_under, is_build_output, is_ignored_dir_name
 from devgraph.registry.store import RepoRegistry, RepoRecord
 
 logger = logging.getLogger(__name__)
@@ -943,7 +943,7 @@ class WatcherManager:
         resolved_root: Path | None = None
         with os.scandir(root) as entries:
             for entry in entries:
-                if is_ignored_dir_name(entry.name):
+                if is_ignored_dir_name(entry.name) or is_build_output(root, entry.name, True):
                     continue
                 try:
                     if not entry.is_dir(follow_symlinks=False):
@@ -1453,7 +1453,7 @@ class _RepoEventHandler(FileSystemEventHandler):
         inside the repository, not the root itself, and not ignored (by name
         or by a .gitignore, as the walk ignores it)."""
         rel = self._rel(raw)
-        if rel is None or not rel.parts or is_ignored_path(rel):
+        if rel is None or not rel.parts or is_ignored_path(rel, self._repo_root):
             return None
         # A .gitignore passes even when it ignores itself (its change is what
         # makes RepoSync catch up), unless its folder is ignored, as a tool

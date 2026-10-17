@@ -33,6 +33,49 @@ def test_is_ignored_path_checks_every_part():
     assert not is_ignored_path(Path("a/b/c.py"))
 
 
+def _touch(root, *rels):
+    for rel in rels:
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text("x\n")
+
+
+def test_build_output_names_are_ignored_only_where_a_build_writes_them(tmp_path):
+    """At the root or beside a manifest, a build output folder is left out;
+    anywhere else (Rust's src/bin, a Python package named build, pip's
+    operations/build) it is source (audit 6, item 4)."""
+    kept = [
+        "src/lib.rs", "src/bin/cli.rs", "pkg/build/x.py", "src/pip/_internal/operations/build/wheel.py",
+        "scripts/dist/release.py", "tools/target/aim.go", "app/obj/model.cs",
+    ]
+    left_out = [
+        "build/gen.py", "dist/app.js", "target/debug/out.rs", "bin/tool.py",
+        "crate/target/debug/build.rs", "proj/bin/Debug/x.cs", "proj/obj/x.cs",
+        "web/dist/bundle.js", "lib/build/out.py", "svc/bin/main.go",
+    ]
+    _touch(tmp_path, *kept, *left_out, "Cargo.toml", "crate/Cargo.toml", "proj/proj.csproj",
+           "web/package.json", "lib/pyproject.toml", "svc/go.mod")
+    found = {p.relative_to(tmp_path).as_posix() for p in indexable_paths(tmp_path)}
+    assert set(kept) <= found
+    assert not set(left_out) & found
+    for rel in kept:
+        assert not is_ignored_path(Path(rel), tmp_path), rel
+    for rel in left_out:
+        assert is_ignored_path(Path(rel), tmp_path), rel
+        assert is_ignored_path(tmp_path / rel), rel  # absolute: by its manifest, and the root's own
+    # src/bin is never build output, even beside a manifest.
+    _touch(tmp_path, "src/Cargo.toml")
+    assert not is_ignored_path(Path("src/bin/cli.rs"), tmp_path)
+
+
+def test_the_inotify_filter_ignores_the_folders_the_walk_skips(tmp_path):
+    from devgraph.watcher.inotify import ignored_folder_filter
+
+    _touch(tmp_path, "Cargo.toml", "src/bin/cli.rs", "target/x", "pkg/build/x.py", "web/package.json", "web/dist/x")
+    ignored = ignored_folder_filter(tmp_path)
+    for rel, expected in (("src/bin", False), ("target", True), ("pkg/build", False), ("web/dist", True)):
+        assert ignored(os.fsencode(tmp_path / rel)) is expected, rel
+
+
 def test_is_indexable_file_is_a_file_check_that_never_raises(tmp_path):
     (tmp_path / "a.md").write_text("x")
     (tmp_path / "d").mkdir()
@@ -86,13 +129,15 @@ def _old_keyed(repo):
         except (OSError, ValueError):
             return None
 
+    if is_ignored_path(repo):
+        return set(), set()
     paths = {
         p for p in repo.rglob("*")
-        if is_indexable_file(p) and not is_ignored_path(p) and not links_outside(p, repo)
+        if is_indexable_file(p) and not is_ignored_path(p.relative_to(repo), repo) and not links_outside(p, repo)
     }
     keyed = {
         (p, rel) for p in paths
-        if (rel := old_repo_relative(p)) is not None and not is_ignored_path(Path(rel))
+        if (rel := old_repo_relative(p)) is not None and not is_ignored_path(Path(rel), repo.resolve())
     }
     return paths, keyed
 
@@ -138,7 +183,7 @@ def test_keyed_indexable_paths_matches_the_old_walk_without_links(linked_tree):
 
 
 def test_keyed_indexable_paths_is_empty_under_an_ignored_root(tmp_path):
-    repo = tmp_path / "build" / "repo"
+    repo = tmp_path / ".venv" / "repo"
     repo.mkdir(parents=True)
     (repo / "a.md").write_text("a")
 

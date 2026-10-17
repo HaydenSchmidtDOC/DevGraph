@@ -147,9 +147,12 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: anonymous companion object's members (owner `Class.Companion`); JSX
 #: component elements as calls; 17: JS/TS imports of a workspace package
 #: (package.json `workspaces`, pnpm-workspace.yaml) resolved to its entry
-#: point or subpath and its directory (resolver configuration).
+#: point or subpath and its directory (resolver configuration); 20: build
+#: output folder names (`build`, `dist`, `bin`, `obj`, `target`) ignored only
+#: at the root or beside a project manifest (walk.is_build_output), so Rust's
+#: `src/bin/` and source packages named `build` are indexed.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 17
+INDEX_FORMAT = 20
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -323,7 +326,7 @@ def _is_provider_file(repo_root: Path, path: Path) -> bool:
     A .gitignore judges the file by its own path, as the walk and git do."""
     rel = _repo_relative(repo_root, path)
     return (
-        rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel))
+        rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel), repo_root)
         and not is_gitignored(repo_root, _own_rel(repo_root, path) or rel)
     )
 

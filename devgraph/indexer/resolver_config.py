@@ -511,7 +511,7 @@ class ResolverConfig:
         if rel not in self._texts:
             text = None
             path = self.root / rel
-            if rel and not is_ignored_path(Path(rel)) and not is_gitignored(self.root, rel):
+            if rel and not is_ignored_path(Path(rel), self.root) and not is_gitignored(self.root, rel):
                 try:
                     if path.is_file() and path.stat().st_size <= _MAX_CONFIG_BYTES:
                         text = path.read_text(encoding="utf-8-sig", errors="replace")
@@ -702,7 +702,7 @@ class ResolverConfig:
                     is_dir = entry.is_dir(follow_symlinks=False)
                 except OSError:
                     continue
-                if is_dir and not is_ignored_path(Path(rel)) and not is_gitignored(self.root, rel, is_dir=True):
+                if is_dir and not is_ignored_path(Path(rel), self.root) and not is_gitignored(self.root, rel, is_dir=True):
                     found.append(rel)
             self._dirs[folder] = sorted(found)
         return self._dirs[folder]
@@ -1180,7 +1180,7 @@ def _python_project(root: Path, folder: str) -> bool:
     it: one under an ignored or gitignored path does not count."""
     for name in _PY_PROJECT_FILES:
         rel = f"{folder}/{name}" if folder else name
-        if (root / rel).is_file() and not is_ignored_path(Path(rel)) and not is_gitignored(root, rel):
+        if (root / rel).is_file() and not is_ignored_path(Path(rel), root) and not is_gitignored(root, rel):
             return True
     return False
 

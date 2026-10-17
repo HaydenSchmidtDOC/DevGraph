@@ -124,7 +124,7 @@ def ignored_folder_filter(root: Path, *, watch_git: bool = False) -> Callable[[b
             return False
         if watch_git and rel.parts[0] == ".git":
             return not (rel.parts in _GIT_STATE or rel.parts[:3] == _GIT_STATE[2])
-        return is_ignored_path(rel) or is_gitignored(root, rel.as_posix(), is_dir=True)
+        return is_ignored_path(rel, root) or is_gitignored(root, rel.as_posix(), is_dir=True)
 
     return ignored
 

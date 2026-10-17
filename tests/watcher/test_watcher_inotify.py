@@ -113,6 +113,7 @@ def test_ignored_and_gitignored_folders_get_no_kernel_watch(tmp_path):
     (root / ".gitignore").write_text("generated/\n")
     for folder in ("node_modules/a/b", "pkg0/.venv/lib/site", "pkg1/build/out", "generated/x/y", "pkg1/sub/generated/z"):
         (root / folder).mkdir(parents=True)
+    (root / "pkg1/package.json").write_text("{}\n")  # pkg1/build is build output beside its manifest
     w = Watching(tmp_path, root, git=False)
     before = set(inotify_watches())
     w.manager.start()

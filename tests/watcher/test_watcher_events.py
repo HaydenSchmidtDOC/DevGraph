@@ -207,12 +207,12 @@ def test_windows_cross_folder_dir_move(h, root):
 
 def test_dir_move_walks_destination_and_sub_moves_add_nothing(h, root):
     _write(root / "pkg/sub2/b.py")
-    _write(root / "pkg/sub2/build/x.py")
+    _write(root / "pkg/sub2/node_modules/x.py")
     h.send(
         DirMovedEvent(h.p("pkg/sub"), h.p("pkg/sub2")),
         FileMovedEvent(h.p("pkg/sub/b.py"), h.p("pkg/sub2/b.py")),
-        DirMovedEvent(h.p("pkg/sub/build"), h.p("pkg/sub2/build")),
-        FileMovedEvent(h.p("pkg/sub/build/x.py"), h.p("pkg/sub2/build/x.py")),
+        DirMovedEvent(h.p("pkg/sub/node_modules"), h.p("pkg/sub2/node_modules")),
+        FileMovedEvent(h.p("pkg/sub/node_modules/x.py"), h.p("pkg/sub2/node_modules/x.py")),
     )
     assert h.one_batch() == ({"pkg/sub2/b.py"}, {"pkg/sub"})
 
@@ -426,7 +426,7 @@ def tree(tmp_path: Path) -> Path:
     _write(repo / "top.py")
     _write(repo / "pkg/a.py")
     _write(repo / "pkg/sub/b.py")
-    _write(repo / "pkg/build/x.py")
+    _write(repo / "pkg/node_modules/x.py")
     _write(repo / "other/c.py")
     return repo
 
@@ -440,7 +440,7 @@ def test_indexable_paths_under_matches_filtered_full_walk(tree):
 def test_indexable_paths_under_outside_or_ignored_is_empty(tree, tmp_path):
     _write(tmp_path / "elsewhere/e.py")
     assert indexable_paths_under(tree, tmp_path / "elsewhere") == set()
-    assert indexable_paths_under(tree, tree / "pkg/build") == set()
+    assert indexable_paths_under(tree, tree / "pkg/node_modules") == set()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
