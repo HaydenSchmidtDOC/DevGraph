@@ -885,6 +885,9 @@ _SCAN_AND_EXPORT = textwrap.dedent(
 
 
 class _UnitEngine:
+    def route_mount_state(self, repo_id, names=None):
+        return {}
+
     def list_file_nodes(self, repo_id, files):
         return set()
 
@@ -1430,7 +1433,7 @@ def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
     # As a junction to `outside` would be walked: linked, so keyed by its resolved target.
     monkeypatch.setattr(walk, "_walk", lambda root, unreadable=None: iter([(repo / "a.py", "a.py", False), (outside, "j/outside.py", True)]))
     removed = []
-    monkeypatch.setattr(dispatch, "remove_paths", lambda engine, repo_id, root, paths: removed.append(paths) or len(paths))
+    monkeypatch.setattr(dispatch, "remove_paths", lambda engine, repo_id, root, paths, *a: removed.append(paths) or len(paths))
 
     class FakeEngine:
         def list_indexed_files(self, repo_id):

@@ -72,7 +72,7 @@ import tree_sitter_javascript as tsjs
 import tree_sitter_typescript as tsts
 from tree_sitter import Language, Node, Parser
 
-from devgraph.indexer.apis.routes import add_route, join_route
+from devgraph.indexer.apis.routes import MOUNT_SEP, add_route, join_route, mount_entry, unmounted_endpoint
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, call_rows
 from devgraph.indexer.common import (
     ExtractionResult,
@@ -895,8 +895,104 @@ def _literal(node: Node | None, source: bytes) -> str | None:
     return None
 
 
+def _exported_names(root: Node, source: bytes) -> dict[str, set[str]]:
+    """The file's top-level names it exports, local name -> export names
+    ("default" for `export default x` and CommonJS `module.exports = x`):
+    `export const x = ...`, `export { x, y as z }`, `module.exports = { x,
+    z: y }`, `exports.z = y`, `module.exports.z = y`."""
+    exported: dict[str, set[str]] = {}
+
+    def add(local: Node | None, name: str) -> None:
+        if local is not None and local.type == "identifier":
+            exported.setdefault(_text(local, source), set()).add(name)
+
+    for node in root.named_children:
+        if node.type == "export_statement" and node.child_by_field_name("source") is None:
+            if any(child.type == "default" for child in node.children):
+                add(node.child_by_field_name("value"), "default")
+            declaration = node.child_by_field_name("declaration")
+            if declaration is not None and declaration.type in ("lexical_declaration", "variable_declaration"):
+                for declarator in declaration.named_children:
+                    name = declarator.child_by_field_name("name") if declarator.type == "variable_declarator" else None
+                    if name is not None:
+                        add(name, _text(name, source))
+            for clause in (c for c in node.named_children if c.type == "export_clause"):
+                for spec in (c for c in clause.named_children if c.type == "export_specifier"):
+                    name, alias = spec.child_by_field_name("name"), spec.child_by_field_name("alias")
+                    if name is not None:
+                        add(name, _text(alias or name, source))
+        elif node.type == "expression_statement" and node.named_children:
+            assign = node.named_children[0]
+            if assign.type != "assignment_expression":
+                continue
+            left, right = assign.child_by_field_name("left"), assign.child_by_field_name("right")
+            target = _dotted_name(left, source) if left is not None and left.type == "member_expression" else ""
+            if target == "module.exports" and right is not None and right.type == "object":
+                for prop in right.named_children:
+                    if prop.type == "shorthand_property_identifier":
+                        exported.setdefault(_text(prop, source), set()).add(_text(prop, source))
+                    elif prop.type == "pair":
+                        key = prop.child_by_field_name("key")
+                        if key is not None:
+                            add(prop.child_by_field_name("value"), _text(key, source))
+            elif target == "module.exports":
+                add(right, "default")
+            elif target.rsplit(".", 1)[0] in ("exports", "module.exports"):
+                add(right, target.rsplit(".", 1)[1])
+    return exported
+
+
+def _imported_routers(root: Node, source: bytes) -> dict[str, tuple[str, str]]:
+    """The names the file's imports bind to another module's export, local
+    name -> (export name, specifier): a default import or a whole `require`
+    is "default", `{ a as b }` and `const { a: b } = require(...)` are "a";
+    a namespace import is none."""
+    imported: dict[str, tuple[str, str]] = {}
+    for node in root.named_children:
+        if node.type == "import_statement" and (spec := node.child_by_field_name("source")) is not None:
+            specifier = _string_value(spec, source)
+            clause = next((c for c in node.named_children if c.type == "import_clause"), None)
+            for child in clause.named_children if clause is not None else []:
+                if child.type == "identifier":
+                    imported[_text(child, source)] = ("default", specifier)
+                elif child.type == "named_imports":
+                    for each in (c for c in child.named_children if c.type == "import_specifier"):
+                        name, alias = each.child_by_field_name("name"), each.child_by_field_name("alias")
+                        if name is not None:
+                            imported[_text(alias or name, source)] = (_text(name, source), specifier)
+        elif node.type in ("lexical_declaration", "variable_declaration"):
+            for declarator in (c for c in node.named_children if c.type == "variable_declarator"):
+                specifier = _required(declarator.child_by_field_name("value"), source)
+                name = declarator.child_by_field_name("name")
+                if specifier is None or name is None:
+                    continue
+                if name.type == "identifier":
+                    imported[_text(name, source)] = ("default", specifier)
+                elif name.type == "object_pattern":
+                    for prop in name.named_children:
+                        if prop.type == "shorthand_property_identifier_pattern":
+                            imported[_text(prop, source)] = (_text(prop, source), specifier)
+                        elif prop.type == "pair_pattern":
+                            key, local = prop.child_by_field_name("key"), prop.child_by_field_name("value")
+                            if key is not None and local is not None and local.type == "identifier":
+                                imported[_text(local, source)] = (_text(key, source), specifier)
+    return imported
+
+
+def _required(node: Node | None, source: bytes) -> str | None:
+    """The specifier of a `require('x')` call, None for anything else."""
+    if node is None or node.type != "call_expression":
+        return None
+    func, args = node.child_by_field_name("function"), node.child_by_field_name("arguments")
+    if func is None or func.type != "identifier" or func.text != b"require" or args is None:
+        return None
+    first = args.named_children[0] if args.named_children else None
+    return _string_value(first, source) if first is not None and first.type == "string" else None
+
+
 def _express_routes(
-    root: Node, source: bytes, resolver: _CallResolver, result: ExtractionResult, file_path: str, repo_id: str
+    root: Node, source: bytes, resolver: _CallResolver, result: ExtractionResult, file_path: str, repo_id: str,
+    config: ResolverConfig | None = None,
 ) -> None:
     """Express-style routes (`app.get('/x', h)`, `router.post(...)`,
     `app.route('/x').get(h)`; Koa-router's and Fastify's are the same
@@ -907,10 +1003,20 @@ def _express_routes(
     handler. An app's routes are at its root; a router's are under the
     literal prefix the file mounts it at (`app.use('/api', router)`), and
     a router the file doesn't mount on its app is mounted where the file
-    doesn't show (`unmounted_endpoint`)."""
+    doesn't show (`unmounted_endpoint`).
+
+    A router another file mounts is recorded on the Module (apis/routes.py
+    MOUNT_PROPERTIES): the file's mounts of an imported router (`app.use(
+    '/api', usersRouter)`, `app.use('/api', auth, require('./users'))`) as
+    `route_mounts`, and the routes of a router it exports and doesn't
+    mount itself as `route_exports`, for the dispatcher to name by the
+    mounts that reach them."""
     made: dict[str, bool] = {}  # receiver -> whether the file made an app (else a router)
     mounts: dict[str, tuple[str, str]] = {}  # router -> (the app or router it is mounted on, the prefix)
     routes: list[tuple[str, str, str, Node]] = []  # (receiver, method, path, handler)
+    imported = _imported_routers(root, source)
+    # (the app or router mounted on, the prefix, the export, its specifier)
+    foreign: list[tuple[str, str, str, str]] = []
 
     def key(node: Node | None) -> str | None:
         """A receiver as the file names it: `app`, or `this.router`."""
@@ -947,10 +1053,17 @@ def _express_routes(
             return
         obj, method = found
         values = [arg for arg in args.named_children if arg.type != "comment"]
-        if method == "use" and key(obj) is not None and len(values) == 2 and key(values[1]) is not None:
+        if method == "use" and key(obj) is not None and len(values) >= 2:
             mounted = _literal(values[0], source)
-            if mounted is not None and mounted.startswith("/"):
+            if mounted is None or not mounted.startswith("/"):
+                return
+            if len(values) == 2 and key(values[1]) is not None:
                 mounts[key(values[1])] = (key(obj), mounted)
+            last = values[-1]
+            if last.type == "identifier" and _text(last, source) in imported:
+                foreign.append((key(obj), mounted, *imported[_text(last, source)]))
+            elif (specifier := _required(last, source)) is not None:
+                foreign.append((key(obj), mounted, "default", specifier))
             return
         if method not in _ROUTE_METHODS:
             return
@@ -1012,15 +1125,52 @@ def _express_routes(
         above = prefix(parent, seen | {receiver})
         return None if above is None else join_route(above, mounted)
 
+    def routing(receiver: str) -> bool:
+        """Whether a receiver is an app or router (`_express_routes`)."""
+        return receiver in made or receiver in _ROUTER_NAMES or (
+            receiver.endswith("Router") and not receiver.startswith("this.")
+        )
+
+    exported = {
+        local: names for local, names in _exported_names(root, source).items() if routing(local) and not is_app(local)
+    }
+    current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
+    route_mounts = set()
+    for parent, mounted, export, specifier in foreign:
+        files = _resolve_module_specifier(specifier, current_dir, config, file_path)
+        above = prefix(parent) if routing(parent) else None
+        if not files or not routing(parent):
+            continue
+        if above is not None:
+            route_mounts.add(mount_entry("", join_route(above, mounted), export, files))
+        elif parent in exported:
+            route_mounts |= {mount_entry(name, join_route(mounted), export, files) for name in exported[parent]}
+    # An exported router's routes the file doesn't mount; one whose own
+    # Endpoint another unmounted route of the file shares stays unmounted.
+    deferred: dict[str, set[str]] = {}
+    kept: set[str] = set()
+    for receiver, method, path, _handler in routes:
+        if not routing(receiver) or prefix(receiver) is not None:
+            continue
+        own = unmounted_endpoint(method, join_route(path), file_path)
+        if receiver in exported:
+            deferred.setdefault(own, set()).update(
+                MOUNT_SEP.join((name, method, join_route(path))) for name in exported[receiver]
+            )
+        else:
+            kept.add(own)
+    route_exports = sorted(entry for own, entries in deferred.items() if own not in kept for entry in entries)
+    module = result.nodes[0].properties
+    module["route_mounts"] = sorted(route_mounts) or None
+    module["route_exports"] = route_exports or None
+
     # The file's functions, by name, with their owners.
     functions: dict[str, set[str]] = {}
     for node in result.nodes:
         if node.label == "Function" and node.properties.get("file") == file_path:
             functions.setdefault(node.name, set()).add(node.properties.get("owner") or "")
     for receiver, method, path, handler in routes:
-        if receiver not in made and receiver not in _ROUTER_NAMES and not (
-            receiver.endswith("Router") and not receiver.startswith("this.")
-        ):
+        if not routing(receiver):
             continue
         above = prefix(receiver)
         full = join_route(above or "", path)
@@ -1358,7 +1508,7 @@ def extract_js_file(
                 caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id,
                 no_self=no_self, caller_owner=caller_owner,
             ))
-    _express_routes(root, source_bytes, resolver, result, file_path, repo_id)
+    _express_routes(root, source_bytes, resolver, result, file_path, repo_id, config)
 
     return own_edges(result, file_path)
 

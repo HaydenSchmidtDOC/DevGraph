@@ -2042,6 +2042,25 @@ class GraphEngine:
             [dict(record) for record in edges],
         )
 
+    def route_mount_state(
+        self, repo_id: str, names: list[str] | None = None
+    ) -> dict[str, tuple[list[str] | None, list[str] | None, list[str] | None]]:
+        """Module -> its (`route_mounts`, `route_exports`, `route_prefixes`)
+        (indexer/apis/routes.py MOUNT_PROPERTIES), for every Module of the
+        repository holding one of them, or only those named in `names`."""
+        test = "IN $names" if names is not None else "IS NOT NULL"
+        with self._driver.session() as session:
+            records = _run_records(
+                session,
+                "MATCH (m:Module) USING INDEX SEEK m:Module(repo_id, name) "
+                f"WHERE m.repo_id = $repo_id AND m.name {test} "
+                "AND (m.route_mounts IS NOT NULL OR m.route_exports IS NOT NULL OR m.route_prefixes IS NOT NULL) "
+                "RETURN m.name AS name, m.route_mounts AS mounts, m.route_exports AS exports, "
+                "m.route_prefixes AS prefixes",
+                repo_id=repo_id, names=names,
+            )
+        return {r["name"]: (r["mounts"], r["exports"], r["prefixes"]) for r in records}
+
     def unclaim_owning_service_edges(self, repo_id: str, rows: list[dict[str, Any]]) -> None:
         """Drop `origin` from each owning-service edge of `rows` ({label, name,
         service, service_file, origin}, as `owning_service_state` lists the

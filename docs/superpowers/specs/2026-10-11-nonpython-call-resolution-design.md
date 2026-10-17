@@ -976,7 +976,8 @@ has:
   its `Endpoint` implements nothing.
 
 A route on a router or group whose mount its file doesn't show has an
-unknown prefix. Its Endpoint is the file's own, named
+unknown prefix (an Express router another file mounts is resolved since
+index format 18: "Express routers mounted from another file", below). Its Endpoint is the file's own, named
 `"<METHOD> ?<path> (<file>)"` (`routes.unmounted_endpoint`), so no two files'
 `GET /` meet in one Endpoint that no request reaches as such, and
 `trace_request_flow` never starts from such a hub (a bare `/` does not
@@ -1107,6 +1108,81 @@ edge are functions of the file's text and the compose files. The fuzz
 toggles clients' imports in Python, TS, Java, Kotlin, C# and Go files
 (`op_datastore`); `tests/indexer/test_client_datastores_live.py` scans one
 service per language. C++ and Rust clients are not read.
+
+## Express routers mounted from another file (index format 18)
+
+`app.use('/api', usersRouter)`, with `usersRouter` imported from
+`routes/users.js`, left that file's routes unmounted: `GET ?/:id
+(routes/users.js)`. A route's full path now comes from both files, and
+must still equal a fresh scan whichever of them changes, so neither file's
+extraction reads the other: each records its half on its Module, and the
+dispatcher joins them.
+
+- **The mounting file** records `route_mounts`, one entry per mount of an
+  imported router (`app.use('/p', x)`, the last argument, so middleware
+  before it is skipped; `x` a default or named ES import, a `require` or
+  its destructured name, or an inline `require('./r')`): its base, the
+  prefix, the export name (`default` for a default import or a whole
+  `require`) and the files the specifier can name
+  (`_resolve_module_specifier`: every candidate, none checked against the
+  disk, so a mount is a function of the file's text and resolver
+  configuration). The base is "" and the prefix the full one when the
+  router it is mounted on has a known prefix (an app, or a router the file
+  mounts itself); it is an export name of the file's own router when that
+  router is exported and not mounted in the file (the prefix is then
+  relative to that router's mounts: a chain); otherwise the mount is not
+  recorded.
+- **The router file** records `route_exports`: (export name, method, path)
+  for each route on a router it exports (`export default r`, `export const
+  r`, `export { r as x }`, `module.exports = r`, `module.exports = { r }`,
+  `exports.x = r`) and doesn't mount itself. Its extraction still names
+  them `?` Endpoints; a route whose `?` name another unmounted route of the
+  file shares is not deferred.
+- **The dispatcher** (`index_paths`) keeps a `MountTable` of every Module's
+  `route_mounts` (read once per batch when a file first needs it, then kept
+  current with each JS/TS file the batch writes). A router file's prefixes
+  per export are the mounts naming one of its candidate files and that
+  export, a base other than "" followed to the mounting file's own mounts,
+  at most `MAX_MOUNT_HOPS` (2) cross-file mounts in all: an app mounting an
+  api router that mounts the users router resolves; a third level stays
+  unmounted, and a cycle ends there. `mount_routes` renames each deferred
+  route's Endpoint (and its `IMPLEMENTS`, and so its owning-service `CALLS`)
+  to one per prefix, `"<METHOD> <prefix><path>"`; a router mounted nowhere
+  keeps its `?` Endpoint. The Module records the prefixes it used as
+  `route_prefixes`. The three properties are lists, absent when empty,
+  hidden and reserved like `name_refs`.
+- **Settling.** A router file's output depends on other files' mounts, so
+  after pass 1 (when a batch file had or has any of the three properties)
+  the batch reads every Module holding one, rebuilds the table and
+  re-indexes each file whose `route_prefixes` differ from what the table
+  gives its `route_exports` (`_stale_mounts`): a router file the batch
+  wrote before the file mounting it (path order), and router files outside
+  the batch whose mounts the batch changed, which join the batch (their
+  previous nodes snapshotted first, so "added" stays exact). The records
+  themselves are text, so one round settles. `remove_paths` does the same
+  after deleting a file that held one (with `docs_path`/`mentions_enabled`,
+  which it now takes, as the watcher passes them). Moving a router file is a
+  delete and an add: the mount's candidates name the old path, so the moved
+  router is unmounted (fresh and incremental alike), and a mount's own
+  change re-indexes the routers under both its old and new targets.
+
+Cost: a batch with no mounts or exported routes before or after pays one
+indexed read of its own Modules; one that has them reads every Module of
+the repository holding a mount property (one indexed scan) and re-indexes
+only the router files whose prefixes changed. A full scan re-indexes the
+router files that sort before the file mounting them. The fuzz mounts
+another TS file's exported router on an app or on the file's own exported
+router (so chains and cycles), unmounts it, changes the prefix, stops
+exporting it, and moves the router file (`op_mount`, `op_mount_prefix`,
+`op_export_router`, `op_move_router`); `tests/indexer/test_express_mounts_live.py`
+walks a two-level chain through prefix changes, a second mount, an
+unexported middle, a move and deletions.
+
+Not read: a mount through a variable path, a router held in an object
+(`routers.users`), a namespace import's member (`app.use('/x', ns.r)`),
+`export default Router()` (no name to route on), Koa's
+`app.use(router.routes())`, and other frameworks' cross-file groups (a gin
+`*gin.RouterGroup` parameter, ASP.NET `IEndpointRouteBuilder`).
 
 ## Compose changes re-own the files outside the batch
 

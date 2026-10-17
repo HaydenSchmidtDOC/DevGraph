@@ -10,6 +10,9 @@ from devgraph.indexer.dispatch import index_paths
 
 
 class _QuietEngine:
+    def route_mount_state(self, repo_id, names=None):
+        return {}
+
     def list_file_nodes(self, repo_id, files):
         return set()
 

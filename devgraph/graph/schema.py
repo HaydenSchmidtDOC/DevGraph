@@ -69,7 +69,8 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # edges (see devgraph/indexer/common.py `name_ref_properties`),
 # `name_ref_visible` the C# projects its file's sites see (`visible_to`), and
 # `shared_claims` the shared nodes its file claims (graph/engine.py
-# `SHARED_CLAIM_SEP`). `mkeys` is a
+# `SHARED_CLAIM_SEP`), and `route_mounts`/`route_exports`/`route_prefixes`
+# its Express routers' mounts across files (indexer/apis/routes.py). `mkeys` is a
 # code symbol's match keys, which a pin's `@` flag tests (see `split_pin`),
 # and `mkeys_stale` marks one whose edges a batch has yet to relink after
 # they changed (see graph/engine.py `write_match_keys`). A code symbol's
@@ -80,7 +81,7 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
     "repo_id", "name", "file", "source_file", "source", "sources", "claims", "extractor",
     "name_refs", "name_ref_targets", "name_ref_sources", "name_ref_visible", "mkeys", "mkeys_stale",
-    "shared_claims",
+    "shared_claims", "route_mounts", "route_exports", "route_prefixes",
 })
 
 # The pipeline's own bookkeeping among those, plus the Repository node's
@@ -89,7 +90,7 @@ RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
 # dashboard's node inspector).
 INTERNAL_NODE_PROPERTIES: frozenset[str] = frozenset({
     "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources", "name_ref_visible", "mkeys",
-    "mkeys_stale", "shared_claims", "skipped_files",
+    "mkeys_stale", "shared_claims", "route_mounts", "route_exports", "route_prefixes", "skipped_files",
 })
 
 # An extracted edge's bookkeeping: `origins`, the files that wrote it

@@ -76,6 +76,9 @@ def test_the_size_limit_is_a_setting_with_a_one_mib_default(monkeypatch):
 
 
 class _Engine:
+    def route_mount_state(self, repo_id, names=None):
+        return {}
+
     def __init__(self):
         self.deleted: list[str] = []
 

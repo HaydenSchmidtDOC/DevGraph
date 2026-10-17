@@ -96,7 +96,10 @@ class RepoSync:
                     docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
                 )
             if deleted_paths:
-                removed = remove_paths(self._engine, repo_id, repo.path, deleted_paths)
+                removed = remove_paths(
+                    self._engine, repo_id, repo.path, deleted_paths,
+                    docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
+                )
             # A tsconfig, go.mod or Cargo.toml change re-indexes every file it can resolve differently.
             indexed += sync_resolver_config(
                 self._engine, repo_id, repo.path, changed_paths | deleted_paths,
