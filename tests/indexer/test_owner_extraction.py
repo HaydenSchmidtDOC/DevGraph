@@ -485,3 +485,35 @@ def test_python_aliases_and_instances_are_heirs_of_their_class():
 def test_js_aliases_instances_and_default_exports_are_heirs(source, name, owner, key):
     keys = _function_keys(extract_js_file(source, "web/m.ts", "repo"))
     assert key in keys[(name, owner)]
+
+
+def test_open_keys_skip_nested_classes_type_aliases_and_exception_bases():
+    """Only a top-level class or alias is open; a type expression, a literal
+    or a `TypeVar` is no alias; a builtin exception base supplies no
+    sibling's member."""
+    keys = _function_keys(extract_python_file(textwrap.dedent("""\
+        from typing import Literal, TypeVar
+        from lib import Model
+
+
+        class Error(ValueError):
+            def code(self):
+                pass
+
+
+        class Holder:
+            class Inner(Model):
+                pass
+
+
+        Mode = Literal["a", "b"]
+        Either = Error | Holder
+        T2 = TypeVar("T2")
+        Kind = NewType("Kind", int)
+
+
+        def helper():
+            pass
+        """), "m.py", "repo"))
+    assert keys[("helper", "")] == ["<Kind"]
+    assert keys[("code", "Error")] == ["<Kind"]

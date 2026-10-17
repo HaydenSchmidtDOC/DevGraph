@@ -226,8 +226,22 @@ def owners_by_pin(pins: Iterable[str]) -> dict[str, set[str | None]]:
 #: `heir_keys`): an alias or instance of something the file doesn't declare
 #: (`Registry = make_registry()`) is a class of this one base.
 UNKNOWN_BASE = "?"
-#: Bases that add no member a call names (Python's `object`).
-_CLOSED_BASES = frozenset({"object"})
+#: Bases that supply no member another class of the file has: Python's
+#: `object`, `type` and builtin exceptions (and Java's `Exception`, whose
+#: members a sibling class's same-named method can't be).
+_CLOSED_BASES = frozenset({
+    "object", "type", "BaseException", "Exception", "ArithmeticError", "AssertionError", "AttributeError",
+    "BlockingIOError", "BrokenPipeError", "BufferError", "ChildProcessError", "ConnectionAbortedError",
+    "ConnectionError", "ConnectionRefusedError", "ConnectionResetError", "EOFError", "EnvironmentError",
+    "FileExistsError", "FileNotFoundError", "FloatingPointError", "GeneratorExit", "IOError", "ImportError",
+    "IndexError", "InterruptedError", "IsADirectoryError", "KeyError", "KeyboardInterrupt", "LookupError",
+    "MemoryError", "ModuleNotFoundError", "NameError", "NotADirectoryError", "NotImplementedError", "OSError",
+    "OverflowError", "PermissionError", "ProcessLookupError", "RecursionError", "ReferenceError", "RuntimeError",
+    "StopAsyncIteration", "StopIteration", "SyntaxError", "SystemError", "SystemExit", "TimeoutError", "TypeError",
+    "UnboundLocalError", "UnicodeDecodeError", "UnicodeEncodeError", "UnicodeError", "ValueError",
+    "ZeroDivisionError", "Warning", "UserWarning", "DeprecationWarning", "PendingDeprecationWarning",
+    "RuntimeWarning", "FutureWarning",
+})
 
 ClassDecl = tuple[str, "str | None", Iterable[str], Iterable[str]]
 
@@ -296,9 +310,10 @@ def _heirs(
     classes: Iterable[ClassDecl], c3: bool = False,
 ) -> tuple[dict[tuple[str, str], set[str]], dict[str, set[str]]]:
     """`heir_keys`' keys as sets, and each *open* class's owner with the
-    member names its file says it has: a class with a base, its own or an
-    in-file ancestor's, that no class of the file is named (another file's,
-    a library's, `UNKNOWN_BASE`), whose other members the file can't name."""
+    member names its file says it has: a top-level class or alias with a
+    base, its own or an in-file ancestor's, that no class of the file is
+    named and is not `_CLOSED_BASES` (another file's, a library's,
+    `UNKNOWN_BASE`), whose other members the file can't name."""
     by_name: dict[str, list[tuple[str | None, list[str], set[str]]]] = {}
     for name, owner, bases, members in classes:
         by_name.setdefault(name, []).append((owner, list(bases), set(members)))
@@ -317,7 +332,8 @@ def _heirs(
                             found.setdefault((member, base_owner), set()).add(HEIR_KEY + owner)
                 resolved.update(member for _owner, _bases, each in by_name[base] for member in each)
             written = list(bases) + [b for base in chain for _o, bs, _m in by_name[base] for b in bs]
-            if any(b not in by_name and b not in _CLOSED_BASES for b in written):
+            # Only a top-level class or alias (its members' owner its name) can be imported.
+            if owner == name and any(b not in by_name and b not in _CLOSED_BASES for b in written):
                 open_owners.setdefault(owner, set()).update(resolved)
     return found, open_owners
 

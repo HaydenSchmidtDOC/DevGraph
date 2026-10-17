@@ -707,3 +707,82 @@ def test_a_call_through_an_alias_or_instance_links_what_it_did_before_owners(eng
     ]
     assert _targets(engine, repo_id, "go") == [("find", "web/svc.ts", "UserServiceImpl"), ("get", "web/client.ts", "Client")]
     equals_fresh(engine, repo_id, root)
+
+
+def test_a_class_whose_members_the_file_cant_name_keeps_the_links_it_had(engine, repo):
+    """What a call through an imported class linked before owners it still
+    links unless provably wrong: a class built by a call (`with_metaclass`),
+    of a metaclass outside the file, decorated, or rebound (`Echo =
+    wrap(Echo)`) is open, so `extra` still reaches the file's `extra`; an
+    in-file metaclass's `table` is the class's, and the module-level
+    `table` it also reached before is provably not."""
+    root, _registry, repo_id = repo
+    write(root, "shop/models.py", """\
+        from six import with_metaclass
+        from abc import ABCMeta
+
+
+        class Meta(type):
+            def table(cls):
+                return 1
+
+
+        class Alpha(with_metaclass(Meta, object)):
+            pass
+
+
+        class Beta(metaclass=Meta):
+            pass
+
+
+        class Gamma(metaclass=ABCMeta):
+            pass
+
+
+        @register
+        class Delta:
+            pass
+
+
+        class Echo:
+            pass
+
+
+        Echo = wrap(Echo)
+
+
+        def table():
+            return 2
+
+
+        def extra():
+            return 3
+        """)
+    write(root, "shop/jobs.py", """\
+        from shop.models import Alpha, Beta, Gamma, Delta, Echo
+
+
+        def a():
+            Alpha().extra()
+
+
+        def b():
+            Beta.table()
+
+
+        def c():
+            Gamma().extra()
+
+
+        def d():
+            Delta().extra()
+
+
+        def e():
+            Echo().extra()
+        """)
+    full_scan(engine, repo_id, root)
+    for caller in ("a", "c", "d", "e"):
+        assert _targets(engine, repo_id, caller) == [("extra", "shop/models.py", "")], caller
+    assert _targets(engine, repo_id, "b") == [("table", "shop/models.py", "Meta")]
+    equals_fresh(engine, repo_id, root)

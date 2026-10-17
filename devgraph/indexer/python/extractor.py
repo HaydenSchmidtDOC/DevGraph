@@ -365,14 +365,54 @@ def _class_table(root: Node, source: bytes) -> dict[str, _ClassInfo]:
     return classes
 
 
+#: Class decorators that keep a class's members as written (`dataclass`
+#: adds dunders only): any other may replace the class (`common.UNKNOWN_BASE`).
+_SAFE_CLASS_DECORATORS = frozenset({"dataclass", "total_ordering", "final", "runtime_checkable", "unique"})
+#: Calls whose result is no class (`T = TypeVar("T")`): no alias of one.
+_NOT_CLASS_CALLS = frozenset({"TypeVar", "ParamSpec", "TypeVarTuple", "TypeAliasType"})
+#: Right-hand sides that are no class: a type expression (`Literal[...]`,
+#: `X | Y`, `Annotated[...]`) or a literal.
+_NOT_CLASS_VALUES = frozenset({
+    "subscript", "binary_operator", "string", "concatenated_string", "integer", "float", "true", "false", "none",
+    "list", "dictionary", "tuple", "set", "lambda", "list_comprehension", "dictionary_comprehension",
+    "set_comprehension", "generator_expression", "unary_operator", "comparison_operator", "boolean_operator",
+})
+
+
+def _heir_bases(superclasses: Node | None, source: bytes) -> list[str]:
+    """A class's bases as common.heir_keys reads them: an identifier or a
+    dotted name (a subscript's value, `Base[int]`), `metaclass=X`'s `X`
+    (its methods are the class's too), and common.UNKNOWN_BASE for any
+    other expression (`with_metaclass(...)`, `namedtuple(...)`, `X if c
+    else Y`, `*bases`), which can supply any member."""
+    found: list[str] = []
+    for child in superclasses.named_children if superclasses is not None else []:
+        if child.type == "keyword_argument":
+            name, value = child.child_by_field_name("name"), child.child_by_field_name("value")
+            if name is None or _text(name, source) != "metaclass":
+                continue
+            child = value
+        elif child.type == "subscript":
+            child = child.child_by_field_name("value")
+        if child is not None and child.type in ("identifier", "attribute"):
+            found.append(_dotted_name(child, source))
+        else:
+            found.append(UNKNOWN_BASE)
+    return found
+
+
 def _class_declarations(root: Node, source: bytes) -> list[tuple[str, str, list[str], set[str]]]:
     """Every class declaration of the file, each on its own (two nested
     `Meta`s of two classes stay apart), as common.heir_keys reads them:
-    (name, its members' owner, its bases as written, its methods); then
-    each module-level alias or instance of a class (`UserModel = User`,
-    `Registry = _Registry()`, a CapWords name) as a member-less declaration
-    of that class, or of common.UNKNOWN_BASE when no class of the file is
-    named, so a call through it links what it did before owners."""
+    (name, its members' owner, its bases (`_heir_bases`), its methods); a
+    class decorated otherwise than `_SAFE_CLASS_DECORATORS`, or rebound at
+    the module level (`X = register(X)`), also of common.UNKNOWN_BASE,
+    since the name may be another class. Then each module-level alias or
+    instance of a class (`UserModel = User`, `Registry = _Registry()`, a
+    CapWords name; not a type expression, a literal or a `TypeVar`) as a
+    member-less declaration of that class, or of common.UNKNOWN_BASE when
+    no class of the file is named, so a call through it links what it did
+    before owners."""
     found: list[tuple[str, str, list[str], set[str]]] = []
 
     def walk(node: Node, label: str, name: str | None, owner: str) -> None:
@@ -384,9 +424,16 @@ def _class_declarations(root: Node, source: bytes) -> list[tuple[str, str, list[
                     label, name, owner = "Function", _text(name_node, source), own
                 else:
                     class_name = _text(name_node, source)
+                    bases = _heir_bases(node.child_by_field_name("superclasses"), source)
+                    decorated = node.parent if node.parent is not None and node.parent.type == "decorated_definition" \
+                        else None
+                    decorators = _extract_decorator_names(
+                        [c for c in decorated.named_children if c.type == "decorator"], source,
+                    ) if decorated is not None else []
+                    if any(each.rsplit(".", 1)[-1] not in _SAFE_CLASS_DECORATORS for each in decorators):
+                        bases.append(UNKNOWN_BASE)
                     found.append((
-                        class_name, member_owner("Class", class_name, own),
-                        _extract_base_class_names(node.child_by_field_name("superclasses"), source),
+                        class_name, member_owner("Class", class_name, own), bases,
                         _direct_defs(node.child_by_field_name("body"), source),
                     ))
                     label, name, owner = "Class", class_name, own
@@ -395,6 +442,7 @@ def _class_declarations(root: Node, source: bytes) -> list[tuple[str, str, list[
 
     walk(root, "Module", None, "")
     classes = {each[0] for each in found}
+    rebound: set[str] = set()
     for statement in root.named_children:
         assignment = statement.named_children[0] if statement.type == "expression_statement" and (
             statement.named_children) else None
@@ -404,12 +452,21 @@ def _class_declarations(root: Node, source: bytes) -> list[tuple[str, str, list[
         if left is None or left.type != "identifier" or right is None:
             continue
         alias = _text(left, source)
-        if not _class_like(alias) or alias in classes:
+        if alias in classes:
+            if not (right.type == "identifier" and _text(right, source) == alias):
+                rebound.add(alias)
+            continue
+        if not _class_like(alias) or right.type in _NOT_CLASS_VALUES:
             continue
         target = right.child_by_field_name("function") if right.type == "call" else right
+        if right.type == "call" and target is not None and _text(target, source).rsplit(".", 1)[-1] in _NOT_CLASS_CALLS:
+            continue
         named = _text(target, source) if target is not None and target.type == "identifier" else None
         found.append((alias, alias, [named if named in classes else UNKNOWN_BASE], set()))
-    return found
+    return [
+        (name, owner, [*bases, UNKNOWN_BASE] if name in rebound and owner == name else bases, members)
+        for name, owner, bases, members in found
+    ]
 
 
 @dataclass
