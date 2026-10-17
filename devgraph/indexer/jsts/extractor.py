@@ -274,18 +274,45 @@ def _named_function(node: Node) -> bool:
     return defined is not None and (defined.start_byte, defined.end_byte) == (node.start_byte, node.end_byte)
 
 
-def _bound_names(func: Node) -> set[bytes]:
-    """Every name a function's parameters bind, destructured ones included."""
-    params = func.child_by_field_name("parameters") or func.child_by_field_name("parameter")
+def _pattern_names(pattern: Node | None) -> set[bytes]:
+    """The names a binding pattern binds: an identifier, and those of an
+    object, array or rest pattern, never a default value's (`{ a = b }`
+    binds `a`) nor a type annotation's."""
     found: set[bytes] = set()
-    pending = [params] if params is not None else []
+    pending = [pattern] if pattern is not None else []
     while pending:
         node = pending.pop()
         if node.type in ("identifier", "shorthand_property_identifier_pattern"):
             found.add(node.text)
-        else:
-            pending += [child for child in node.named_children if child.type != "type_annotation"]
-    return found
+        elif node.type in ("assignment_pattern", "object_assignment_pattern"):
+            pending.append(node.child_by_field_name("left"))
+        elif node.type == "pair_pattern":
+            pending.append(node.child_by_field_name("value"))
+        elif node.type in ("required_parameter", "optional_parameter"):
+            pending.append(node.child_by_field_name("pattern"))
+        elif node.type in ("object_pattern", "array_pattern", "rest_pattern", "formal_parameters"):
+            pending += node.named_children
+    return {name for name in found if name}
+
+
+def _bound_names(func: Node) -> set[bytes]:
+    """Every name a function's parameters bind, destructured ones included
+    (`_pattern_names`)."""
+    return _pattern_names(func.child_by_field_name("parameters") or func.child_by_field_name("parameter"))
+
+
+def _local_names(body: Node) -> set[str]:
+    """The names a function body's declarations bind to anything but a
+    function (`const Widget = pick()`, `const { Row } = parts`), not those
+    of nested functions: they shadow an import or a class of their name."""
+    found: set[bytes] = set()
+    pending = [body]
+    while pending:
+        node = pending.pop()
+        if node.type == "variable_declarator" and _function_value(node.child_by_field_name("value")) is None:
+            found |= _pattern_names(node.child_by_field_name("name"))
+        pending += [child for child in node.named_children if child.type not in _NESTED_SCOPE_TYPES]
+    return {name.decode("utf-8", errors="replace") for name in found}
 
 
 def _call_functions(body: Node) -> list[Node]:
@@ -1507,6 +1534,8 @@ def extract_js_file(
 
         caller_class = parent_name if parent_label == "Class" else None
         params, param_types, _fields = _parameters(node, source_bytes)
+        # Destructured parameters and non-function locals shadow too (a JSX tag's `render`).
+        params |= {name.decode("utf-8", errors="replace") for name in _bound_names(node)} | _local_names(body_node)
         inner = scope.nested(params, {**param_types, **_local_types(body_node, source_bytes)})
         record_calls("Function", func_name, body_node, inner, caller_class, owner)
 

@@ -301,6 +301,24 @@ def test_a_class_component_renders_through_its_render():
     assert ("src/Dialog.tsx", "Dialog") in rows and ("src/Sheet.tsx", "default") in rows
 
 
+def test_a_destructured_parameter_or_a_local_is_no_class_component():
+    """`<Widget />` naming a destructured parameter (not a default value's
+    name) or a local `const Widget = pick()` renders no imported class's
+    `render`, nor calls the import."""
+    source = """
+        import { Widget, Panel, Fallback } from './ui';
+
+        export function A({ Widget }) { return <Widget />; }
+        export function B({ item = Fallback }) { return <Fallback />; }
+        export function C() { const Panel = pick(); return <Panel />; }
+    """
+    result = extract_js_file(textwrap.dedent(source), "src/A.tsx", "repo")
+    rows = {(r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}
+    assert ("A", "render") not in rows and ("A", "Widget") not in rows
+    assert ("B", "render") in rows and ("B", "Fallback") in rows
+    assert ("C", "render") not in rows and ("C", "Panel") not in rows
+
+
 def test_memo_forward_ref_and_styled_components_are_functions():
     """`memo(fn)`, `forwardRef(fn)` (and `React.` ones, nested) make the
     declarator a Function of the wrapped function's body; a styled
