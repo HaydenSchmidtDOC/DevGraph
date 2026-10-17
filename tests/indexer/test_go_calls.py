@@ -74,6 +74,31 @@ def test_a_function_of_the_file_resolves_here_and_any_other_to_its_package():
     }
 
 
+def test_a_dot_imported_packages_names_resolve_unqualified(tmp_path):
+    """`import . "example.com/shop/v2/store"`: a bare `Open()` reaches the
+    package beside the file's own, and so does a method on what it
+    returned or on a value of an exported type the file doesn't declare."""
+    config = _config(tmp_path)
+    source = """
+        package main
+
+        import . "example.com/shop/v2/store"
+
+        func main() {
+            Open()
+            conn := Open()
+            conn.Close()
+            var s Store
+            s.Get()
+        }
+    """
+    store = ("store/.?.go!_test.go", "resolved")
+    assert targets(source, "main", "Open", config=config) == {(".?.go!_test.go", "resolved"), store}
+    loose = {(".~?.go!_test.go", "package"), ("store/.~?.go!_test.go", "package")}
+    assert targets(source, "main", "Close", config=config) == loose
+    assert targets(source, "main", "Get", config=config) == loose
+
+
 def test_a_test_file_reaches_its_package_and_an_external_test_package_only_its_tests():
     internal = "package store\n\nfunc TestGet() { New() }\n"
     assert targets(internal, "TestGet", "New", "internal/store/memory_test.go") == {

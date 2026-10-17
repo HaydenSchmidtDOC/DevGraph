@@ -2,7 +2,7 @@
 
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from devgraph.analytics import insights
 from devgraph.analytics.insights import InsightsScheduler

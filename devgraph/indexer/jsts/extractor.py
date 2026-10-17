@@ -78,9 +78,13 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    UNKNOWN_BASE,
+    add_heir_keys,
+    class_member_pin,
     member_owner,
     own_edges,
     owned_pin,
+    split_owned_pin,
 )
 from devgraph.indexer.resolver_config import ResolverConfig
 
@@ -223,29 +227,163 @@ def _jsx_component(node: Node) -> Node | None:
     return None
 
 
+#: Calls that wrap a function component (`memo(fn)`, `React.forwardRef(fn)`):
+#: `const Card = memo(() => ...)` is the component `Card`.
+_COMPONENT_WRAPPERS = frozenset({"memo", "forwardRef"})
+
+
+def _function_value(value: Node | None) -> Node | None:
+    """The function a declarator's value defines, the node a Function is
+    made of: a function or arrow; the one a component wrapper takes
+    (`memo(...)`, `forwardRef(...)`, nested); a styled component
+    (`styled.div`...``, `styled(Button)`...``), which has no body. None for
+    anything else."""
+    if value is None:
+        return None
+    if value.type in _FUNCTION_VALUE_TYPES:
+        return value
+    if value.type != "call_expression":
+        return None
+    func, args = value.child_by_field_name("function"), value.child_by_field_name("arguments")
+    if func is None or args is None:
+        return None
+    if args.type == "template_string":
+        callee = func  # `styled.div`, `styled(Button)`, `styled.div.attrs({})`, down to `styled`
+        while callee is not None and callee.type in ("member_expression", "call_expression"):
+            callee = callee.child_by_field_name("object" if callee.type == "member_expression" else "function")
+        return value if callee is not None and callee.type == "identifier" and callee.text == b"styled" else None
+    name = func.text.rsplit(b".", 1)[-1].decode("utf-8", errors="replace")
+    if name in _COMPONENT_WRAPPERS and args.named_children:
+        return _function_value(args.named_children[0])
+    return None
+
+
+def _named_function(node: Node) -> bool:
+    """Whether the function or arrow `node` is a Function of its own: a
+    declarator's (`_function_value`) or a class field's value."""
+    parent = node.parent
+    while parent is not None and parent.type in ("arguments", "call_expression", "parenthesized_expression"):
+        parent = parent.parent
+    if parent is None:
+        return False
+    if parent.type in ("field_definition", "public_field_definition"):
+        return True
+    if parent.type != "variable_declarator":
+        return False
+    defined = _function_value(parent.child_by_field_name("value"))
+    return defined is not None and (defined.start_byte, defined.end_byte) == (node.start_byte, node.end_byte)
+
+
+def _pattern_names(pattern: Node | None) -> set[bytes]:
+    """The names a binding pattern binds: an identifier, and those of an
+    object, array or rest pattern, never a default value's (`{ a = b }`
+    binds `a`) nor a type annotation's."""
+    found: set[bytes] = set()
+    pending = [pattern] if pattern is not None else []
+    while pending:
+        node = pending.pop()
+        if node.type in ("identifier", "shorthand_property_identifier_pattern"):
+            found.add(node.text)
+        elif node.type in ("assignment_pattern", "object_assignment_pattern"):
+            pending.append(node.child_by_field_name("left"))
+        elif node.type == "pair_pattern":
+            pending.append(node.child_by_field_name("value"))
+        elif node.type in ("required_parameter", "optional_parameter"):
+            pending.append(node.child_by_field_name("pattern"))
+        elif node.type in ("object_pattern", "array_pattern", "rest_pattern", "formal_parameters"):
+            pending += node.named_children
+    return {name for name in found if name}
+
+
+def _bound_names(func: Node) -> set[bytes]:
+    """Every name a function's parameters bind, destructured ones included
+    (`_pattern_names`)."""
+    return _pattern_names(func.child_by_field_name("parameters") or func.child_by_field_name("parameter"))
+
+
+def _declared_names(declaration: Node) -> set[bytes]:
+    """The names a `const`/`let`/`var` declaration binds to anything but a
+    function (`const Widget = pick()`, `const { Row } = parts`)."""
+    return {
+        name for declarator in declaration.named_children if declarator.type == "variable_declarator"
+        and _function_value(declarator.child_by_field_name("value")) is None
+        for name in _pattern_names(declarator.child_by_field_name("name"))
+    }
+
+
+def _decode(names: set[bytes]) -> set[str]:
+    return {name.decode("utf-8", errors="replace") for name in names}
+
+
+def _local_names(body: Node) -> set[str]:
+    """The names a function body binds throughout (`_declared_names`): its
+    own block's `const`/`let` and every `var` of it, not those of nested
+    functions. A nested block's `const`/`let` shadows only inside it
+    (`_block_names`). They shadow an import or class of their name."""
+    found: set[bytes] = set()
+    pending = [body]
+    while pending:
+        node = pending.pop()
+        if node.type == "variable_declaration" or (node.type == "lexical_declaration" and node.parent == body):
+            found |= _declared_names(node)
+        pending += [child for child in node.named_children if child.type not in _NESTED_SCOPE_TYPES]
+    return _decode(found)
+
+
+def _block_names(site: Node, body: Node) -> set[str]:
+    """The names the blocks between `site` and its function's `body` bind
+    for it: each enclosing block's `const`/`let`, a `for (const W of ...)`
+    or `for (let i = ...)` head's, a `catch (W)` parameter's."""
+    found: set[bytes] = set()
+    child, node = site, site.parent
+    while node is not None and node != body:
+        if node.type == "statement_block":
+            for statement in node.named_children:
+                if statement.type == "lexical_declaration":
+                    found |= _declared_names(statement)
+        elif node.type == "for_in_statement" and child == node.child_by_field_name("body"):
+            found |= _pattern_names(node.child_by_field_name("left"))
+        elif node.type == "for_statement" and child == node.child_by_field_name("body"):
+            initializer = node.child_by_field_name("initializer")
+            if initializer is not None and initializer.type == "lexical_declaration":
+                found |= _declared_names(initializer)
+        elif node.type == "catch_clause" and child == node.child_by_field_name("body"):
+            found |= _pattern_names(node.child_by_field_name("parameter"))
+        child, node = node, node.parent
+    return _decode(found)
+
+
 def _call_functions(body: Node) -> list[Node]:
     """The `function` node of every call expression in `body`, and the name
     of every JSX element rendering a component (`_jsx_component`), not
     descending into nested function/class scopes - those are walked
     separately so calls are attributed to the correct enclosing scope rather
     than hoisted to the outer function (mirrors the Python extractor's
-    `_call_functions`). `require(...)` is module-system syntax, captured by
-    `_extract_imports`."""
+    `_call_functions`). An anonymous function (a callback, `items.map(i =>
+    <Row />)`, an inline render prop; not one `_named_function` makes a
+    Function of its own) is walked for its JSX elements only, which render
+    from the enclosing function, unless their tag names a parameter of a
+    callback holding them. `require(...)` is module-system syntax, captured
+    by `_extract_imports`."""
     found: list[Node] = []
 
-    def walk(node: Node) -> None:
+    def walk(node: Node, shadowed: frozenset[bytes] | None) -> None:
         if node.type in _NESTED_SCOPE_TYPES:
-            return
-        if node.type == "call_expression":
+            if node.type not in _FUNCTION_VALUE_TYPES or _named_function(node):
+                return
+            shadowed = (shadowed or frozenset()) | _bound_names(node)
+        if node.type == "call_expression" and shadowed is None:
             func = node.child_by_field_name("function")
             if func is not None and not (func.type == "identifier" and func.text == b"require"):
                 found.append(func)
         elif node.type in _JSX_TAGS and (name := _jsx_component(node)) is not None:
-            found.append(name)
+            head = name if name.type == "identifier" else name.child_by_field_name("object")
+            if shadowed is None or head is None or head.text not in shadowed:
+                found.append(name)
         for child in node.children:
-            walk(child)
+            walk(child, shadowed)
 
-    walk(body)
+    walk(body, None)
     return found
 
 
@@ -482,12 +620,15 @@ class _Binding:
     whole module (`* as ns`, `const ns = require(...)`). `top_level` is
     true for an ES named import (`{a}`: a module's top-level function when
     called) and an ES namespace (`* as ns`: its members are top-level ones);
-    a default import or a `require` can bind anything."""
+    a default import or a `require` can bind anything. `default` marks an
+    ES default import: a class it binds is its module's default-exported
+    one, whatever the name (`DEFAULT_EXPORT`)."""
 
     name: str
     pins: tuple[str, ...] | None
     namespace: bool
     top_level: bool = False
+    default: bool = False
 
 
 @dataclass
@@ -517,6 +658,75 @@ class _Scope:
     def nested(self, params: set[str], types: dict[str, list[str]]) -> _Scope:
         outer = {name: t for name, t in self.types.items() if name not in params}
         return _Scope(self.cls, self.params | params, {**outer, **types})
+
+
+#: The owner a default import's class names (`import Thing from './thing';
+#: new Thing().start()`): the default export is its heir (`_module_heirs`),
+#: so `export default class ThingImpl`'s members, and those it inherits,
+#: hold its heir key (common.heir_keys). No class can be named `default`.
+DEFAULT_EXPORT = "default"
+
+
+def _module_heirs(root: Node, source: bytes, classes: dict[str, _ClassInfo]) -> list[tuple[str, str, list, tuple]]:
+    """The file's module-level aliases and instances of a class, as
+    member-less class declarations common.heir_keys reads: a CapWords
+    `const` (`export const UserService = new UserServiceImpl()`, `const
+    UserModel = User`) and the default export (`export default class X`,
+    `export default X;`, `export default new Client()`, `export { Impl as
+    default }`, `module.exports = X`), DEFAULT_EXPORT, are heirs of the
+    class they name. One naming no class of the file (a factory's result,
+    a function, an anonymous class, whose members are no nodes) is a class
+    of common.UNKNOWN_BASE too, open, so a call through it links what it
+    did before owners."""
+    found: list[tuple[str, str, list, tuple]] = []
+
+    def heir(name: str, value: Node | None) -> None:
+        if value is not None and value.type == "new_expression":
+            value = value.child_by_field_name("constructor")
+        if value is not None and value.type in (*_CLASS_TYPES, "class"):
+            named = value.child_by_field_name("name")
+            if named is None or _text(named, source) not in classes:
+                found.append((name, name, [*_extract_base_class_names(value, source), UNKNOWN_BASE], ()))
+                return
+            value = named
+        known = value is not None and value.type in ("identifier", "type_identifier") and _text(value, source) in classes
+        found.append((name, name, [_text(value, source) if known else UNKNOWN_BASE], ()))
+
+    for node in root.named_children:
+        statement = node
+        if node.type == "export_statement":
+            if any(child.type == "default" for child in node.children):
+                heir(DEFAULT_EXPORT, node.child_by_field_name("declaration") or node.child_by_field_name("value"))
+                continue
+            for clause in (c for c in node.named_children if c.type == "export_clause"):
+                for spec in clause.named_children:
+                    alias = spec.child_by_field_name("alias")
+                    if alias is not None and alias.text == b"default":
+                        heir(DEFAULT_EXPORT, spec.child_by_field_name("name"))
+            statement = node.child_by_field_name("declaration")
+        if statement is None:
+            continue
+        if statement.type in ("lexical_declaration", "variable_declaration"):
+            for declarator in statement.named_children:
+                name, value = declarator.child_by_field_name("name"), declarator.child_by_field_name("value")
+                if (
+                    declarator.type == "variable_declarator" and name is not None and name.type == "identifier"
+                    and _class_like(_text(name, source)) and _text(name, source) not in classes
+                    and value is not None and _function_value(value) is None
+                ):
+                    heir(_text(name, source), value)
+        elif statement.type == "expression_statement" and statement.named_children:
+            assignment = statement.named_children[0]
+            left = assignment.child_by_field_name("left") if assignment.type == "assignment_expression" else None
+            if left is not None and left.text == b"module.exports":
+                heir(DEFAULT_EXPORT, assignment.child_by_field_name("right"))
+    return found
+
+
+def _class_like(name: str) -> bool:
+    """Whether an imported name reads as a class (CapWords), not an
+    instance or a module object (`api`, `DEFAULTS`)."""
+    return name[:1].isupper() and not name.isupper()
 
 
 #: Globals a classic script calls that are never a script's own function.
@@ -671,9 +881,7 @@ def _defined_functions(root: Node, source: bytes) -> set[str]:
                 names.add(_text(name, source))
         elif node.type == "variable_declarator":
             name, value = node.child_by_field_name("name"), node.child_by_field_name("value")
-            if name is not None and name.type == "identifier" and value is not None and (
-                value.type in _FUNCTION_VALUE_TYPES
-            ):
+            if name is not None and name.type == "identifier" and _function_value(value) is not None:
                 names.add(_text(name, source))
         for child in node.children:
             walk(child)
@@ -708,7 +916,7 @@ def _bindings(
             for child in clause.named_children if clause is not None else []:
                 if child.type == "identifier":
                     name = _text(child, source)
-                    bindings[name] = _Binding(name, where, False)
+                    bindings[name] = _Binding(name, where, False, default=True)
                 elif child.type == "namespace_import":
                     ns = next((c for c in child.named_children if c.type == "identifier"), None)
                     if ns is not None:
@@ -779,9 +987,14 @@ class _CallResolver:
         head, dot, rest = type_name.partition(".")
         binding = self.bindings.get(head)
         if binding is not None and (dot == "" or binding.namespace):
-            # An imported class's method: any of the name there, since the
-            # class can inherit it from a base of its file.
-            return list(binding.pins or ())
+            # An imported class's method: the class's member there, its own
+            # or one it inherits from a class of its file (common.heir_keys);
+            # through a default import, the default-exported class's
+            # (DEFAULT_EXPORT); any of the name through a require.
+            owner = (rest if "." not in rest else None) if dot else binding.name
+            if not binding.top_level:
+                owner = DEFAULT_EXPORT if binding.default and not dot else None
+            return [class_member_pin(pin, owner) for pin in binding.pins or ()]
         return None
 
     def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
@@ -830,8 +1043,12 @@ class _CallResolver:
             return None  # an untyped parameter shadows any import of its name
         binding = self.bindings.get(receiver)
         if binding is not None:
-            # An ES namespace's member is a module's top-level one; anything
-            # else's (a require, an imported class's static) any of the name.
+            # An ES namespace's member is a module's top-level one, a named or
+            # default import's of a class (a CapWords name) the class's
+            # (`_class_pins`); anything else's (a require, an instance) any of
+            # the name.
+            if (binding.top_level and not binding.namespace or binding.default) and _class_like(receiver):
+                return self._class_pins(receiver, method)
             owner = "" if binding.namespace and binding.top_level else None
             return [owned_pin(pin, owner) for pin in binding.pins or ()]
         if receiver in self.classes:
@@ -839,6 +1056,24 @@ class _CallResolver:
         if receiver in STOP_TYPES["js"]:
             return []
         return None
+
+    def render_pins(self, tag: Node, scope: _Scope) -> list[str]:
+        """Where the `render` of the class component a JSX tag names can be:
+        a class of the file (or its in-file base), as `this.render()`
+        would go; an imported class's, as its member (`_class_pins`: a
+        named, default or namespace import's owner, never an owner-less
+        pin, which would link every `render` there). Empty for a function
+        component of the file, a parameter, or a name nothing imports."""
+        name = _text(tag, self.source)
+        head = name.split(".", 1)[0]
+        if head in scope.params or (head == name and name in self.defined and name not in self.classes):
+            return []
+        if name in self.classes:
+            return self._method_pins(name, "render", own=True) or []
+        binding = self.bindings.get(head)
+        if binding is None or (head == name and binding.namespace):
+            return []
+        return [pin for pin in self._class_pins(name, "render") or () if split_owned_pin(pin)[1] is not None]
 
     def _typed_pins(self, types: list[str], method: str) -> list[str] | None:
         found = [pins for name in types if (pins := self._class_pins(name, method)) is not None]
@@ -1248,9 +1483,9 @@ def extract_js_file(
             )
 
     bindings, module = _bindings(root, source_bytes, current_dir, config, file_path)
+    class_table = _class_table(root, source_bytes)
     resolver = _CallResolver(
-        file_path, bindings, _class_table(root, source_bytes), _defined_functions(root, source_bytes),
-        not module, source_bytes,
+        file_path, bindings, class_table, _defined_functions(root, source_bytes), not module, source_bytes,
     )
     # (caller label, caller name, caller owner)
     #   -> callee name -> [pins, bare?, caller classes, every bare site a member call?]
@@ -1266,7 +1501,12 @@ def extract_js_file(
         by_name = calls.setdefault((caller_label, caller_name, caller_owner), {})
         for func in _call_functions(body):
             jsx = func.parent is not None and func.parent.type in _JSX_TAGS
-            for name, pin, member in resolver.resolve(func, scope):
+            # A block's own locals shadow there only.
+            block = _block_names(func, body)
+            site = _Scope(scope.cls, scope.params | block, scope.types) if block else scope
+            # A class component renders through its `render`, which its class owns.
+            rendered = [("render", pin, False) for pin in resolver.render_pins(func, site)] if jsx else []
+            for name, pin, member in resolver.resolve(func, site) + rendered:
                 if pin is None and jsx:
                     continue  # a component nothing resolves links nothing, never by name alone
                 entry = by_name.setdefault(name, [set(), False, set(), True])
@@ -1312,8 +1552,7 @@ def extract_js_file(
                 is_named_fn = (
                     name_node is not None
                     and name_node.type == "identifier"
-                    and value_node is not None
-                    and value_node.type in _FUNCTION_VALUE_TYPES
+                    and _function_value(value_node) is not None
                 )
                 if is_named_fn:
                     _visit_variable_declarator(decl_node, parent_name, parent_label, node if first else None, scope)
@@ -1359,10 +1598,12 @@ def extract_js_file(
         value_node = decl_node.child_by_field_name("value")
         if name_node is None or name_node.type != "identifier" or value_node is None:
             return
-        if value_node.type in _FUNCTION_VALUE_TYPES:
+        if (function := _function_value(value_node)) is not None:
             # doc_anchor is None for a non-first declarator in a multi-name
             # `const a = ..., b = ...` statement - no JSDoc attributed to it.
-            _visit_function(value_node, parent_name, parent_label, doc_anchor or value_node, name_node, scope)
+            # A component wrapper's function (`memo(() => ...)`) is the
+            # declarator's; a styled component is one with no body.
+            _visit_function(function, parent_name, parent_label, doc_anchor or value_node, name_node, scope)
 
     def _visit_class(node: Node, parent_name: str | None, parent_label: str, doc_anchor: Node, scope: _Scope) -> None:
         name_node = node.child_by_field_name("name")
@@ -1484,6 +1725,8 @@ def extract_js_file(
 
         caller_class = parent_name if parent_label == "Class" else None
         params, param_types, _fields = _parameters(node, source_bytes)
+        # Destructured parameters and non-function locals shadow too (a JSX tag's `render`).
+        params |= {name.decode("utf-8", errors="replace") for name in _bound_names(node)} | _local_names(body_node)
         inner = scope.nested(params, {**param_types, **_local_types(body_node, source_bytes)})
         record_calls("Function", func_name, body_node, inner, caller_class, owner)
 
@@ -1509,6 +1752,9 @@ def extract_js_file(
                 no_self=no_self, caller_owner=caller_owner,
             ))
     _express_routes(root, source_bytes, resolver, result, file_path, repo_id, config)
+    add_heir_keys(result, [
+        (name, owner, info.bases, info.methods) for name, info in class_table.items() for owner in info.members_owners
+    ] + _module_heirs(root, source_bytes, class_table))
 
     return own_edges(result, file_path)
 

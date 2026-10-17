@@ -1,6 +1,6 @@
 {
   "language": "react",
-  "description": "A small React + TypeScript app: components rendered by JSX (self-closing, paired, in a fragment and in a prop, through a barrel and a namespace import, a default export, .jsx files), next to intrinsic tags, a prop component, a class component and external components.",
+  "description": "A small React + TypeScript app: components rendered by JSX (self-closing, paired, in a fragment and in a prop, through a barrel and a namespace import, a default export, .jsx files, inside a list callback and an inline render prop, made by memo, forwardRef and styled), next to intrinsic tags, a prop component, a class component (rendered through its render) and external components.",
   "calls": [
     {
       "caller": "App",
@@ -48,6 +48,20 @@
       "note": "same-file"
     },
     {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "ListRow",
+      "callee_file": "src/App.tsx",
+      "note": "callback-render"
+    },
+    {
+      "caller": "App",
+      "caller_file": "src/App.tsx",
+      "callee": "render",
+      "callee_file": "src/Modal.tsx",
+      "note": "class-component"
+    },
+    {
       "caller": "Header",
       "caller_file": "src/layout/Header.jsx",
       "callee": "Button",
@@ -67,6 +81,13 @@
       "callee": "App",
       "callee_file": "src/App.tsx",
       "note": "jsx-component"
+    },
+    {
+      "caller": "Root",
+      "caller_file": "src/main.tsx",
+      "callee": "Toast",
+      "callee_file": "src/Toast.tsx",
+      "note": "render-prop"
     },
     {
       "caller": "useCart",
@@ -99,6 +120,20 @@
       "note": "fragment"
     },
     {
+      "caller": "CartPage",
+      "caller_file": "src/pages/CartPage.tsx",
+      "callee": "Badge",
+      "callee_file": "src/components/Badge.tsx",
+      "note": "memo"
+    },
+    {
+      "caller": "CartPage",
+      "caller_file": "src/pages/CartPage.tsx",
+      "callee": "Field",
+      "callee_file": "src/components/Badge.tsx",
+      "note": "forward-ref"
+    },
+    {
       "caller": "HomePage",
       "caller_file": "src/pages/HomePage.jsx",
       "callee": "Header",
@@ -118,6 +153,20 @@
       "callee": "CartPage",
       "callee_file": "src/pages/CartPage.tsx",
       "note": "element-prop"
+    },
+    {
+      "caller": "Badge",
+      "caller_file": "src/components/Badge.tsx",
+      "callee": "Label",
+      "callee_file": "src/components/Badge.tsx",
+      "note": "styled"
+    },
+    {
+      "caller": "Field",
+      "caller_file": "src/components/Badge.tsx",
+      "callee": "Label",
+      "callee_file": "src/components/Badge.tsx",
+      "note": "styled"
     }
   ],
   "imports": [
@@ -146,6 +195,10 @@
       "to_file": "src/App.tsx"
     },
     {
+      "from_file": "src/main.tsx",
+      "to_file": "src/Toast.tsx"
+    },
+    {
       "from_file": "src/components/index.ts",
       "to_file": "src/components/Button.tsx",
       "kind": "re-export"
@@ -166,6 +219,10 @@
     {
       "from_file": "src/pages/CartPage.tsx",
       "to_file": "src/components/index.ts"
+    },
+    {
+      "from_file": "src/pages/CartPage.tsx",
+      "to_file": "src/components/Badge.tsx"
     },
     {
       "from_file": "src/pages/HomePage.jsx",
@@ -230,12 +287,17 @@
     "same-file": "A component defined in the same file.",
     "jsx-file": "A .jsx file (the JavaScript grammar) renders components the same way.",
     "prop-component": "`<Slot />` renders a parameter: no repository function.",
-    "class-component": "`<Modal />` renders a class component, a Class node: no Function edge.",
+    "class-component": "`<Modal />` renders a class component: a call of the `render` Modal owns (a default import: the default-exported class's), never of a Function named Modal.",
     "external-component": "`<Link />` comes from react-router-dom, outside the repository.",
-    "scope": "Intrinsic tags (`<main>`, `<li>`, `<svg>`, `<path>`) are no calls. Elements inside an anonymous arrow (the `rows.map` callback, Root's `Slot` arrow) are not attributed to anyone, as calls there are not; none of them renders a component here.",
+    "scope": "Intrinsic tags (`<main>`, `<li>`, `<svg>`, `<path>`, `<input>`) are no calls. An element inside an anonymous arrow (the `rows.map` callback, Root's `Slot` arrow) renders from the enclosing named function; calls there are still attributed to no one.",
     "imports-format": "In-repo ES imports and `export ... from` re-exports, file to file; external packages give none.",
     "hook": "A hook is a plain function call.",
     "fragment": "Components inside a fragment (`<>...</>`, which has no tag) render as anywhere else.",
-    "element-prop": "`element={<HomePage />}` renders HomePage from AppRoutes: a JSX attribute's expression is no nested scope."
+    "element-prop": "`element={<HomePage />}` renders HomePage from AppRoutes: a JSX attribute's expression is no nested scope.",
+    "callback-render": "`rows.map((row) => <ListRow ... />)` renders ListRow from App, the named function holding the callback.",
+    "render-prop": "`<App Slot={() => <Toast />} />`: an inline render prop's element renders from Root.",
+    "memo": "`const Badge = memo(function Badge(...) {...})` is the component Badge.",
+    "forward-ref": "`const Field = forwardRef((props, ref) => ...)` is the component Field, its arrow's elements its own.",
+    "styled": "`const Label = styled.span`...`` is a component with no body: rendering it is a call of it."
   }
 }

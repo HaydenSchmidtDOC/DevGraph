@@ -21,7 +21,8 @@ the re-exporting file's text.
 
 C#'s configuration is its projects (`csharp_projects`): each `.csproj` and
 the nearest Directory.Build.props and Directory.Build.targets above it (their
-`<Using>` items and `<ProjectReference>`s), and every `.cs` file whose head
+`<Using>` items and `<ProjectReference>`s, the `Sdk` and `ImplicitUsings`
+that decide the SDK's implicit usings), and every `.cs` file whose head
 (`cs_global_usings`) holds a `global using`.
 
 JS/TS's configuration also holds the repository's workspace packages
@@ -224,7 +225,9 @@ class CsProject:
     directory at or above it holding a `.csproj`; one with none above it
     has no project. `usings` are the `<Using>` items (after `Remove`s) of
     the project files, with the nearest Directory.Build.props before and the
-    nearest Directory.Build.targets after each, and `global_usings` the
+    nearest Directory.Build.targets after each, and before all of them the
+    SDK's implicit global usings when `ImplicitUsings` is enabled
+    (`_cs_implicit_usings`), and `global_usings` the
     `global using` directives in the heads (`cs_global_usings`) of the
     project's own .cs files, not those of a nested project. Both are sorted
     and without repeats. `references` are the directories of the projects
@@ -320,6 +323,70 @@ def _cs_using_items(text: str | None) -> list[tuple[str, CsUsing]]:
                 if name.strip() and not any(c in name for c in "$@%*"):
                     items.append((op, CsUsing(_cs_name(name), static, alias)))
     return items
+
+
+#: The global usings an SDK adds when `ImplicitUsings` is `enable` (or
+#: `true`), by the project's `Sdk`: Microsoft.NET.Sdk's (Razor's too), and
+#: the Web, Worker and BlazorWebAssembly SDKs' on top of them. The
+#: WindowsDesktop SDK's depend on `UseWPF`/`UseWindowsForms` and are not read.
+_CS_SDK_USINGS = {
+    "Microsoft.NET.Sdk": (
+        "System", "System.Collections.Generic", "System.IO", "System.Linq", "System.Net.Http", "System.Threading",
+        "System.Threading.Tasks",
+    ),
+}
+_CS_SDK_USINGS["Microsoft.NET.Sdk.Worker"] = _CS_SDK_USINGS["Microsoft.NET.Sdk"] + (
+    "Microsoft.Extensions.Configuration", "Microsoft.Extensions.DependencyInjection", "Microsoft.Extensions.Hosting",
+    "Microsoft.Extensions.Logging",
+)
+_CS_SDK_USINGS["Microsoft.NET.Sdk.Razor"] = _CS_SDK_USINGS["Microsoft.NET.Sdk"]
+_CS_SDK_USINGS["Microsoft.NET.Sdk.BlazorWebAssembly"] = _CS_SDK_USINGS["Microsoft.NET.Sdk"] + (
+    "System.Net.Http.Json", "Microsoft.AspNetCore.Components.WebAssembly.Hosting",
+    "Microsoft.Extensions.Configuration", "Microsoft.Extensions.DependencyInjection", "Microsoft.Extensions.Logging",
+)
+_CS_SDK_USINGS["Microsoft.NET.Sdk.Web"] = _CS_SDK_USINGS["Microsoft.NET.Sdk.Worker"] + (
+    "System.Net.Http.Json", "Microsoft.AspNetCore.Builder", "Microsoft.AspNetCore.Hosting",
+    "Microsoft.AspNetCore.Http", "Microsoft.AspNetCore.Routing",
+)
+
+
+def _cs_properties(text: str | None) -> list[tuple[str, str]]:
+    """A project or Directory.Build file's `Sdk` (the `<Project Sdk>`
+    attribute, a version after `/` dropped, or an `<Sdk Name>` element)
+    and `ImplicitUsings` (each `<ImplicitUsings>` property in document
+    order, the last one winning), as (name, value) pairs. Nothing is
+    evaluated: one under a `Condition` counts as if it held, and one
+    holding a property reference (`$(`) is left out. A malformed file has
+    none."""
+    try:
+        root = ET.fromstring(text or "")
+    except (ET.ParseError, ValueError):
+        return []
+    found = []
+    sdk = root.attrib.get("Sdk", "").split(";")[0].split("/")[0].strip()
+    if sdk:
+        found.append(("Sdk", sdk))
+    for element in root.iter():
+        tag = element.tag.rpartition("}")[2] if isinstance(element.tag, str) else ""
+        if tag == "Sdk" and element.attrib.get("Name") and not sdk:
+            sdk = element.attrib["Name"].strip()
+            found.append(("Sdk", sdk))
+        elif tag == "ImplicitUsings" and "$(" not in (element.text or ""):
+            found.append(("ImplicitUsings", (element.text or "").strip().lower()))
+    return found
+
+
+def _cs_implicit_usings(sdk_file: list[tuple[str, str]], files: list[list[tuple[str, str]]]) -> list[CsUsing]:
+    """The global usings a project's SDK adds (`_CS_SDK_USINGS`): its
+    project file's `Sdk` (`sdk_file`, `_cs_properties`), when the last
+    `ImplicitUsings` among `files` (its nearest Directory.Build.props, the
+    project file, its nearest Directory.Build.targets: MSBuild reads every
+    property before any item) is `enable` or `true`."""
+    sdk = next((value for name, value in sdk_file if name == "Sdk"), "")
+    implicit = [value for properties in files for name, value in properties if name == "ImplicitUsings"]
+    if not implicit or implicit[-1] not in ("enable", "true"):
+        return []
+    return [CsUsing(name) for name in _CS_SDK_USINGS.get(sdk, ())]
 
 
 #: An MSBuild escape (`%20`, `%3B`) in an item's `Include`.
@@ -1063,7 +1130,7 @@ class ResolverConfig:
         text = self._text(rel)
         return [[op, *astuple(each)] for op, each in _cs_using_items(text)] + [
             ["ProjectReference", path] for path in _cs_reference_items(text)
-        ]
+        ] + [list(each) for each in _cs_properties(text)]
 
     def cs_projects(self) -> dict[str, CsProject]:
         """Every C# project of the repository by its directory (see
@@ -1096,10 +1163,14 @@ class ResolverConfig:
             projects = {}
             for folder, paths in sorted(csproj.items()):
                 props, targets = (_cs_using_items(self._text(rel)) if rel else [] for rel in wrapping(folder))
+                properties = [_cs_properties(self._text(rel)) if rel else [] for rel in wrapping(folder)]
                 usings: set[CsUsing] = set()
                 for path in paths:
                     kept: dict[CsUsing, None] = {}
-                    for op, using in props + _cs_using_items(self._text(path)) + targets:
+                    own = _cs_properties(self._text(path))
+                    # The SDK's implicit usings come first, so a `<Using Remove>` removes one.
+                    implicit = [("Include", each) for each in _cs_implicit_usings(own, [properties[0], own, properties[1]])]
+                    for op, using in implicit + props + _cs_using_items(self._text(path)) + targets:
                         if op == "Include":
                             kept[using] = None
                         else:
@@ -1265,8 +1336,8 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
     `replace` directives of each go.mod and go.work; for Rust each
     Cargo.toml's library crate name and root (`_cargo_entries`) and each
     re-exporting .rs file's re-exports (`_rust_inputs`); for C# each
-    project file's and Directory.Build.props/.targets' `<Using>` items and
-    `<ProjectReference>` paths and the `global using`
+    project file's and Directory.Build.props/.targets' `<Using>` items,
+    `<ProjectReference>` paths, `Sdk` and `ImplicitUsings`, and the `global using`
     directives of each project's .cs files
     (`_cs_inputs`); for TS also the root package.json's and
     pnpm-workspace.yaml's workspace globs and each workspace package's

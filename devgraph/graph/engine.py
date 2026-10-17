@@ -26,6 +26,7 @@ from devgraph.graph.schema import (
     CLAIMED_LABELS,
     FILE_LABELS,
     FILE_SCOPED_LABELS,
+    HEIR_KEY,
     NAME_REF_SEP,
     NAMED_LABELS,
     NODE_LABELS,
@@ -934,9 +935,11 @@ def _pin(file: str | None) -> str:
     return pin_kind(file)
 
 
-#: The edge types a resolver writes with a pin's `@` flag, whose edges into a
-#: node therefore depend on its match keys (see GraphEngine.write_match_keys).
-MATCH_KEY_EDGE_TYPES = ("CALLS", "IMPORTS")
+#: The edge types a resolver writes with a pin's `@` flag or an owned end an
+#: heir key can match (graph/schema.py `HEIR_KEY`: a route's IMPLEMENTS of an
+#: imported class's method too), whose edges into a node therefore depend on
+#: its match keys (see GraphEngine.write_match_keys).
+MATCH_KEY_EDGE_TYPES = ("CALLS", "IMPORTS", "IMPLEMENTS")
 #: The most nodes GraphEngine.write_match_keys handles in one transaction.
 RETRACT_NODES = 500
 #: The pin kinds that match a set of files rather than one (see `_pin`).
@@ -1152,6 +1155,33 @@ def _shadow_free(ref: str, var: str, label: str) -> str:
     )
 
 
+def _owner_test(ref: str, end: str, var: str, label: str) -> str:
+    """Cypher keeping the node `var` when the end's `{end}_owner` is unset
+    or names it: its own owner, or, for a target, a class of its file that
+    inherits it (the node's heir key, graph/schema.py `HEIR_KEY`), or, for a
+    target Function, an *open* class of its file (its Module's `heir_open`)
+    when no Function of its name there is that class's own or inherited
+    member: what an owner-less end linked. devgraph/indexer/common.py
+    `owner_matches` mirrors this."""
+    owner = f"{ref}.{end}_owner"
+    if end != "to":
+        return f"({owner} IS NULL OR {var}.owner = {owner})"
+    heir = f" OR '{HEIR_KEY}' + {owner} IN coalesce({var}.mkeys, [])"
+    if label == "Function":
+        # Both subqueries are hinted to seek, for the reason _end_match gives:
+        # a plan from other statistics scanned an index per row on CI.
+        heir += (
+            f" OR (EXISTS {{ MATCH ({var}_mod:Module {{repo_id: {var}.repo_id, name: {var}.file}}) "
+            f"USING INDEX SEEK {var}_mod:Module(repo_id, name) "
+            f"WHERE {owner} IN coalesce({var}_mod.heir_open, []) }} "
+            f"AND NOT EXISTS {{ MATCH ({var}_sib:Function {{repo_id: {var}.repo_id, name: {var}.name, file: {var}.file}}) "
+            f"USING INDEX SEEK {var}_sib:Function(repo_id, name, file, owner) "
+            f"WHERE {var}_sib.owner IS NOT NULL "
+            f"AND ({var}_sib.owner = {owner} OR '{HEIR_KEY}' + {owner} IN coalesce({var}_sib.mkeys, [])) }})"
+        )
+    return f"({owner} IS NULL OR {var}.owner = {owner}{heir})"
+
+
 def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also: str | None = None) -> str:
     """The MATCH for one end of an edge row (`pin` from `_pin`), reading its
     `{end}_name`/`{end}_file` off `ref` (the row, or one of its targets). An
@@ -1172,7 +1202,8 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     `to_name`, and tests the Module's path. `also` is one more condition on
     the match. An end pinned to a file or a path with an `{end}_owner` keeps
     only the nodes of that `owner` (two classes' same-named methods in one
-    file). A path-pinned end of a file-scoped label keeps only the nodes
+    file), or a target its heir keys say that owner inherits
+    (`_owner_test`). A path-pinned end of a file-scoped label keeps only the nodes
     visible to the row's project (`_visible`). A path pin marked `_TIERED`
     also keeps only the nodes its tiers do not shadow (`_shadow_free`)."""
     conditions = [also] if also else []
@@ -1201,7 +1232,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
                 match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
             if label in FILE_SCOPED_LABELS:
                 # The members of one owner in the files the pin matches, when the row names it.
-                conditions.append(f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)")
+                conditions.append(_owner_test(ref, end, var, label))
                 conditions.append(_visible(var))
         conditions[:0] = _path_pin_conditions(ref, path, var)
         return match + "WHERE " + " AND ".join(conditions) + " " + (_shadow_free(ref, var, label) if tiered else "")
@@ -1215,7 +1246,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
             # owner; every one of them otherwise. A node an index older than
             # owners wrote is left out until the upgrade rescan gives it one.
             conditions[:0] = [
-                f"{var}.owner IS NOT NULL", f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)",
+                f"{var}.owner IS NOT NULL", _owner_test(ref, end, var, label),
             ]
     else:
         match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
@@ -2310,8 +2341,8 @@ class GraphEngine:
         node writes leave as they were until now, so a pin's `@` flag
         (graph/schema.py `split_pin`) only ever sees one node's old keys
         with its old edges.
-        A node to `retract` loses its CALLS and IMPORTS edges, which those
-        pins linked under its old keys, in the same transaction, and stays
+        A node to `retract` loses its CALLS, IMPORTS and IMPLEMENTS edges
+        (MATCH_KEY_EDGE_TYPES), which those pins linked under its old keys, in the same transaction, and stays
         `mkeys_stale` until settle_match_keys: the batch writes them again
         under the new keys, the way it writes an added node's, and a batch
         that fails before then finds it stale and does it again. Each
@@ -2326,6 +2357,29 @@ class GraphEngine:
             "SET b.mkeys = row.mkeys, b.proj = row.proj, b.mkeys_stale = CASE WHEN row.retract THEN true END "
             f"WITH b, row WHERE row.retract MATCH ()-[r:{'|'.join(MATCH_KEY_EDGE_TYPES)}]->(b) DELETE r",
         )
+
+    def file_heir_open(self, repo_id: str, files: list[str]) -> dict[str, tuple[str, ...]]:
+        """Each of `files`' Module's `heir_open` (the open classes of its
+        file, see _owner_test), sorted; a Module without one is left out."""
+        with self._driver.session() as session:
+            rows = _run_records(
+                session,
+                "UNWIND $files AS f MATCH (m:Module {repo_id: $repo_id, name: f}) WHERE m.heir_open IS NOT NULL "
+                "RETURN m.name AS f, m.heir_open AS o",
+                repo_id=repo_id, files=files,
+            )
+            return {row["f"]: tuple(sorted(row["o"])) for row in rows or []}
+
+    def write_heir_open(self, repo_id: str, opens: dict[str, list[str]]) -> None:
+        """Write these files' Modules' `heir_open`, which a batch's pass-1
+        node writes leave as they were (see write_match_keys)."""
+        if opens:
+            with self._driver.session() as session:
+                _run(
+                    session,
+                    "UNWIND $rows AS row MATCH (m:Module {repo_id: $repo_id, name: row.f}) SET m.heir_open = row.o",
+                    repo_id=repo_id, rows=[{"f": f, "o": list(o)} for f, o in sorted(opens.items())],
+                )
 
     def settle_match_keys(self, repo_id: str, nodes: list[tuple[str, str, str, str]]) -> None:
         """Clear `mkeys_stale` (see write_match_keys) off these (label, name,

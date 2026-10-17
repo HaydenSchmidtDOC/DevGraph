@@ -55,7 +55,8 @@ to another file's class), a Java class moves to the same package under
 another source root (another module), and a Rust crate's Cargo.toml renames
 it, moves its root file or stops declaring it, and its lib.rs and util.rs
 gain and lose `pub use` re-exports (by name, glob or alias, util.rs's
-re-exporting deep.rs's, so lib.rs's reach it through util.rs) that other
+re-exporting deep.rs's, so lib.rs's reach it through util.rs; a module
+re-exported as `below`; an inline `mod api` re-exporting) that other
 files call through `shop_core::`. An image
 moves between the Dockerfile and a compose service in one step, so its
 shared Container changes claimant.
@@ -164,6 +165,7 @@ class File:
     builds: dict = field(default_factory=dict)  # compose: service -> build context
     mounts: list = field(default_factory=list)  # ts: (app or router, prefix, router file) Express mounts
     exported: bool = False  # ts: `export default looseRouter`
+    shared_on: str = "Base"  # py: the class defining `shared` besides Twin (`op_move_shared`)
 
     def copy(self):
         return replace(
@@ -175,12 +177,14 @@ class File:
         )
 
 
-def py_class(name: str, base: str | None) -> str:
-    """A class whose `act` calls `self.shared()`, which only `Base` and
-    `Twin` define: a `Twin` beside another class in one file repeats its
-    method names (two `act`s, maybe two `shared`s, each its own node)."""
+def py_class(name: str, base: str | None, shared_on: str = "Base") -> str:
+    """A class whose `act` calls `self.shared()`, which only `Twin` and
+    `shared_on` (`Base`, or `Mid` once it moved) define: a `Twin` beside
+    another class in one file repeats its method names (two `act`s, maybe
+    two `shared`s, each its own node), and a class of the file without one
+    inherits it from a base of the file that has it (its heir keys)."""
     head = f"\n\nclass {name}({base}):\n" if base else f"\n\nclass {name}:\n"
-    shared = "\n    def shared(self):\n        return 0\n" if name in ("Base", "Twin") else ""
+    shared = "\n    def shared(self):\n        return 0\n" if name in (shared_on, "Twin") else ""
     # Both also nest a `Meta` (two same-named classes of one file, each
     # with its own EXTENDS and `act`).
     meta = "\n    class Meta(Child):\n        def act(self):\n            return 1\n" if shared else ""
@@ -198,7 +202,7 @@ def render(f: File, path: str = "") -> str:
         # A Python file's imports are whole statements and its calls whole
         # call expressions (`helper()`, `b.helper()`, `obj.helper()`).
         parts = [f"{m}\n" for m in f.imports] + [f"# pin {p}\n" for p in f.pins]
-        parts += [py_class(c, b) for c, b in f.bases.items()]
+        parts += [py_class(c, b, f.shared_on) for c, b in f.bases.items()]
         parts += [
             f"\n\ndef {name}():\n" + "".join(f"    {g}\n" for g in calls) + "    return 0\n"
             for name, calls in f.funcs.items()
@@ -359,18 +363,26 @@ TS_CONFIGS = {
 # The C# projects' versions: cs/ is a project (of one or two .csproj
 # files), cs/Models a nested one when its .csproj exists, and the nearest
 # Directory.Build.props/.targets wrap their `<Using>` items (cs/Models' own
-# props shadowing the root one). scripts/ is under no project.
+# props shadowing the root one, or enabling `ImplicitUsings`, as cs/'s Web
+# SDK project may). scripts/ is under no project.
 CS_PROJECT = '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n{}  </ItemGroup>\n</Project>\n'
 CS_CONFIGS = {
     "cs/Shop.csproj": [
         CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop.Models" />\n'),
         CS_PROJECT.format('    <Using Include="Shop.Jobs" Static="true" />\n    <Using Include="Shop.Jobs" Alias="J" />\n'),
         CS_PROJECT.format('    <Using Remove="Shop" />\n    <Using Include="Shop.App" />\n'), None,
+        # The Web SDK's implicit usings, one of them removed.
+        CS_PROJECT.replace("Microsoft.NET.Sdk", "Microsoft.NET.Sdk.Web").format(
+            '    <Using Remove="System.Linq" />\n').replace(
+            "<ItemGroup>", "<PropertyGroup>\n    <ImplicitUsings>enable</ImplicitUsings>\n  </PropertyGroup>\n  <ItemGroup>"),
     ],
     "cs/Shop.Tests.csproj": [None, CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop.Tests" />\n')],
     "cs/Models/Models.csproj": [None, CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop" />\n')],
     "Directory.Build.props": [None, CS_PROJECT.format('    <Using Include="Shop" />\n')],
-    "cs/Models/Directory.Build.props": [None, CS_PROJECT.format('    <Using Include="Shop.Text" />\n')],
+    "cs/Models/Directory.Build.props": [
+        None, CS_PROJECT.format('    <Using Include="Shop.Text" />\n'),
+        "<Project>\n  <PropertyGroup>\n    <ImplicitUsings>enable</ImplicitUsings>\n  </PropertyGroup>\n</Project>\n",
+    ],
     "cs/Directory.Build.targets": [None, CS_PROJECT.format('    <Using Remove="Shop.Models" />\n')],
 }
 # A C# file's `global using`s, with what may come before one in a file's
@@ -500,7 +512,7 @@ IMPORTS = {
     "py": [
         "import py.b", "import py.c as c", "from py.b import helper", "from py import b", "from .c import util",
         "from . import a", "from pkg import helper", "from pkg import *", "from py.b import *",
-        "from lib import util", "import pkg.impl", "from pkg.impl import pkgfn as alias",
+        "from lib import util", "import pkg.impl", "from pkg.impl import pkgfn as alias", "from py.b import Heir",
     ],
     "rs": ["use crate::display::Display;", "use crate::foo::Foo;", "use shop_core::util;", "mod display;",
            "use crate::util::tidy;", "use super::display::render;"],
@@ -525,13 +537,13 @@ CLIENTS = {
     "go": ["github.com/lib/pq", "github.com/segmentio/kafka-go", "github.com/redis/go-redis/v9"],
 }
 BASES = {
-    "py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "java": ["Base", "K"],
+    "py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base", "Mid"], "java": ["Base", "K"],
     "cs": ["Jobs", "Base", "Program", "Missing"], "cpp": ["Widget", "Gadget", "Missing"],
 }
 # How a Python call to `{n}` is written: bare, through a module or alias, on
 # an untyped value, on `self`, or on a literal.
 PY_CALLS = ["{n}()", "b.{n}()", "c.{n}()", "obj.{n}()", "pkg.impl.{n}()", "alias.{n}()", "self.{n}()", "''.{n}()",
-            "b.Twin().{n}()", "b.Base().{n}()"]
+            "b.Twin().{n}()", "b.Base().{n}()", "b.Heir().{n}()", "Heir().{n}()"]
 # Path pins of every kind over the fuzz's own paths (renames add `_rN` to a stem).
 CALL_PINS = ["py/.", ".", "pkg/.!other.py", "/b.py", "/lib/util.py", "/py/.", "/lib/.", "src/", "pkg/", "py/b.py"]
 IMPORT_PINS = ["py/.", "pkg/.", ".", "src/lib/.!core.py", "/b.py", "/util.py", "/impl.py"]
@@ -546,7 +558,7 @@ KT_CALLS = ["{n}", "Clock().{n}", "x.{n}"]
 # How a Rust call to `{n}` is written: bare, through a module, a crate path,
 # another crate, a type, or on an untyped value.
 RS_CALLS = ["{n}", "display::{n}", "crate::foo::{n}", "shop_core::{n}", "shop_core::util::{n}", "Foo::{n}",
-            "x.{n}"]
+            "x.{n}", "shop_core::below::{n}", "shop_core::api::{n}", "crate::below::{n}"]
 # How a C# call to `{n}` is written: bare, on `this`/`base`, static, through
 # an alias, a qualified name or a nested type, on a new object, a typed field
 # or parameter, or an untyped object.
@@ -565,7 +577,9 @@ CPP_METHODS = ["Widget::draw", "Widget::size", "Gadget::run", "Missing::stop", "
 # The `pub use` re-exports lib.rs and util.rs of crates/core toggle.
 RS_REEXPORTS = {
     "crates/core/src/lib.rs": ["pub use util::tidy;", "pub use util::*;", "pub use util::tidy as neat;",
-                               "pub use util::dig;", "pub use deep::dig as neat;"],
+                               "pub use util::dig;", "pub use deep::dig as neat;", "pub use deep as below;",
+                               "pub use self::util as below;", "pub mod api { pub use crate::deep::dig; }",
+                               "pub mod api { pub use super::util::*; }"],
     "crates/core/src/util.rs": ["pub use crate::deep::dig;", "pub use crate::deep::*;", "pub use super::deep::dig;"],
 }
 # The roots the Python package `lib` moves between.
@@ -670,6 +684,31 @@ class Fuzz:
         beside = sorted(f.bases)[0]
         f.bases["Twin"] = None
         return f"add class Twin beside {beside} in {path}", {path}
+
+    def op_heir(self):
+        """A Python file with a class gains or loses `Mid` (of base `Base`)
+        or `Heir` (of base `Mid`), which inherit `shared` from a base of the
+        file; `op_base` changes their bases."""
+        path = self._pick(lambda f: f.kind == "py" and f.bases)
+        if not path:
+            return None
+        f = self.files[path]
+        name = self.rng.choice(["Mid", "Heir"])
+        if name in f.bases:
+            del f.bases[name]
+            return f"remove class {name} from {path}", {path}
+        f.bases[name] = {"Mid": "Base", "Heir": "Mid"}[name]
+        return f"add class {name}({f.bases[name]}) in {path}", {path}
+
+    def op_move_shared(self):
+        """`shared` moves between `Base` and `Mid` in a Python file, so the
+        classes inheriting it inherit it from another base."""
+        path = self._pick(lambda f: f.kind == "py" and f.bases)
+        if not path:
+            return None
+        f = self.files[path]
+        f.shared_on = "Mid" if f.shared_on == "Base" else "Base"
+        return f"move shared to {f.shared_on} in {path}", {path}
 
     def op_shadow(self):
         """A Python file with a class gains or loses a top-level `act`, the
@@ -1314,6 +1353,7 @@ class Fuzz:
         "route_change", "route_move", "src_move", "src_move", "src_dir", "src_dir", "rs_reexport", "rs_reexport", "rs_reexport",
         "ws_rename", "ws_rename", "ws_main", "ws_main", "datastore", "datastore",
         "build", "build", "build", "mount", "mount", "mount", "mount_prefix", "export_router", "move_router",
+        "heir", "heir", "move_shared", "move_shared",
     ]
 
     def draw(self):

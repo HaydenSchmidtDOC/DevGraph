@@ -116,8 +116,24 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   `Core/Core.csproj`. Nothing is evaluated: an `<Import>` is not
   followed, an item under a `Condition` counts as if the condition held,
   and a name or path holding `$(`, `@(`, `%(` or a wildcard (`*`, `?`) is
-  left out (a `$(MSBuildThisFileDirectory)` reference too). `ImplicitUsings` (only `System.*` and
-  `Microsoft.*`) and `RootNamespace` are not read.
+  left out (a `$(MSBuildThisFileDirectory)` reference too). `RootNamespace`
+  is not read. `ImplicitUsings` is (index format 18): when the last
+  `<ImplicitUsings>` of the nearest Directory.Build.props, the project
+  file and the nearest Directory.Build.targets (MSBuild reads every
+  property before any item) is `enable` or `true`, the global usings the
+  project file's `Sdk` implies come before its `<Using>` items, so a
+  `<Using Remove>` removes one: Microsoft.NET.Sdk's `System`,
+  `System.Collections.Generic`, `System.IO`, `System.Linq`,
+  `System.Net.Http`, `System.Threading` and `System.Threading.Tasks`
+  (Microsoft.NET.Sdk.Razor's the same); Microsoft.NET.Sdk.BlazorWebAssembly
+  adds `System.Net.Http.Json`,
+  `Microsoft.AspNetCore.Components.WebAssembly.Hosting`,
+  `Microsoft.Extensions.Configuration`, `.DependencyInjection` and
+  `.Logging`; Microsoft.NET.Sdk.Worker adds `Microsoft.Extensions.Configuration`,
+  `.DependencyInjection`, `.Hosting` and `.Logging`; Microsoft.NET.Sdk.Web
+  those and `System.Net.Http.Json` and `Microsoft.AspNetCore.Builder`,
+  `.Hosting`, `.Http` and `.Routing`. Another SDK adds none (WindowsDesktop's
+  depend on `UseWPF`/`UseWindowsForms`, not read).
   A file's *head* is read from its start, at most its first 32 KiB, for as
   long as it holds only whitespace, comments, preprocessor lines (`#if`,
   `#region`, `#nullable`, ...), `extern alias` and using directives, global
@@ -140,10 +156,12 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   as usings of the file (see the C# section); the legacy
   `csharp/extractor.py` indexing entry point reads the repository's
   projects too, and `symbols.EXTRACTORS` needs none (it keeps nodes only,
-  whose match keys come from the file's text). `ImplicitUsings` stays
-  unread: it adds only `System.*` and `Microsoft.*` namespaces, which hold
-  no repository type (if it is ever read, it is one more `<PropertyGroup>`
-  input of the digest).
+  whose match keys come from the file's text). Each project and
+  Directory.Build file's `Sdk` and `ImplicitUsings` are inputs of the
+  digest too. The implicit usings are `System.*` and `Microsoft.*`
+  namespaces, left out at a site unless its own namespace is under the
+  same root (see the C# section), so they matter mostly in the
+  framework's own repositories.
 
 Fresh is then extract(text, configuration), and an incremental run re-extracts
 every dependent when the configuration changes.
@@ -195,8 +213,10 @@ agree):
   `engine.write_match_keys` writes every changed node's keys (removing them from one written
   without any), a few hundred nodes per transaction, before pass 2 tests
   them. A kept node whose keys match differently (no keys and none, `[]`,
-  match alike) loses its incoming `CALLS` and `IMPORTS` edges (the types a
-  resolver writes `@` pins on, whatever pin or bare name wrote them) in
+  match alike) loses its incoming `CALLS`, `IMPORTS` and (since index
+  format 18, whose heir keys an owned route handler can match)
+  `IMPLEMENTS` edges (the types a resolver writes `@` pins or owned ends
+  on, whatever pin or bare name wrote them) in
   the same transaction and is marked `mkeys_stale`. Pass 2 writes the
   batch's edges again, and the relink writes other files' again under the
   new keys, as for an added node; then the mark goes. A batch that fails
@@ -312,7 +332,10 @@ Tiers, first match wins:
    `export` or `require`), whose top-level declarations are globals (browser
    globals such as `fetch` excepted).
 
-A parameter shadows an import of its name, as in Python. Calls inside an
+A typed receiver's or `T.f()`'s method in another file is T's member
+there, its own or one it inherits from a class of that file (index format
+18; heir keys, graph-accuracy spec O3 (c)), so `u: User; u.save()` no
+longer links `Order.save` beside it. A parameter shadows an import of its name, as in Python. Calls inside an
 anonymous function (a callback, an IIFE) are still not attributed to anyone.
 
 **JSX** (index format 16, audit 5 item 4). An opening or self-closing JSX
@@ -322,16 +345,42 @@ name, in `.jsx`, `.tsx` and `.js` files alike, resolved by the tiers above
 (the file's own, an import with a barrel's prefix, a namespace member). A
 tag nothing resolves (a parameter `<Slot />`, an external package's
 `<Link />`, `<this.Foo />`) links nothing: no bare-name row. An intrinsic
-tag (`<div>`, `<svg:rect>`) and a fragment are no calls. Limits: an
-element inside an anonymous arrow (`items.map(i => <Row />)`, an inline
-render prop, a `useCallback` body) is attributed to no one, as calls there
-are not, so a list's row component has no caller; a class component
-(`class Modal extends React.Component`) is a Class, which no `CALLS` row
-reaches, so rendering one adds no edge (its methods' own calls are kept);
-a component made by a call (`React.memo(...)`, `forwardRef(...)`,
-`styled.div`) has no Function node, so its renders link nothing. The ts fixture's two renders link (precision unchanged at
+tag (`<div>`, `<svg:rect>`) and a fragment are no calls. The ts fixture's two renders link (precision unchanged at
 100 %), and a React fixture (`tests/fixtures/callgraph/react`) goes from
 2 of 16 calls to 16 of 16, linked precision 100 %.
+
+Since index format 18:
+
+- An element inside an anonymous function (`items.map(i => <Row />)`, an
+  inline render prop, a `useCallback` body, nested ones) renders from the
+  named function holding it (`_call_functions`), unless its tag names a
+  parameter of a callback holding it (`items.map(Comp => <Comp />)`).
+  Calls there are still attributed to no one. A function is named when
+  it is a declarator's or a class field's value (`_named_function`); its
+  elements are its own.
+- A class component (`class Modal extends React.Component`) renders
+  through the `render` it owns: a component tag is also a call of
+  `render` owned by the class (`render_pins`), as `this.render()` in the
+  class would be for a class of the file, and as a member of an imported
+  class for an import (a named import's owner its name, a namespace
+  member's its member, a default import's the default-exported class,
+  heir keys reaching an inherited `render`); an owner-less pin (a
+  `require`, a barrel's prefix) is left out, as it would link every
+  `render` there. A function component of the file adds no such row; an
+  imported one's links nothing, owning no `render`. A function's
+  destructured parameters (not a default value's names) and its locals
+  bound to anything but a function (`const Widget = pick()`) shadow an
+  import or class of their name, for a tag and a call alike: a `const`
+  or `let` only inside its block (a `for (const W of ...)` head and a
+  `catch (W)` parameter inside theirs), a `var` throughout.
+- A component made by a wrapper is a Function of the declarator's name:
+  `memo(fn)`, `forwardRef(fn)` (`React.` ones, nested) of the wrapped
+  function's body, and a styled component (`styled.div`...``,
+  `styled(Button)`...``) with no body (`_function_value`).
+
+The React fixture, extended with a list callback's and a render prop's
+elements, a class component, and memo, forwardRef and styled components,
+goes from 16 of 23 calls to 23 of 23, linked precision 100 %.
 
 ## Kotlin parse recovery (`devgraph/indexer/kotlin/extractor.py`)
 
@@ -388,7 +437,11 @@ Tiers, first match wins:
    `db`). The method resolves to this file when its type and the method are
    declared here, else to the type's package directory at package confidence
    (`~`: methods are named bare, so another type of the package can have one
-   of the name). A builtin or external type links nothing.
+   of the name). An unqualified exported type the file doesn't declare,
+   and what an unqualified function of another file returned, may be a
+   dot-imported package's (`import . "pkg"`, index format 18): that
+   package's directory at package confidence too. A builtin or external
+   type links nothing.
 5. Anything else: a bare-name row that never ends at its caller, unless the
    method is in `STOP_METHODS["go"]`.
 
@@ -588,8 +641,20 @@ module only ranks below it. A function re-exported under another name (`pub use
 a::fetch as get;`) is called by its own name: `shop_core::get()` is a
 `CALLS` row to `fetch`, as is `get()` after a private `use a::fetch as
 get;` (whose row used to name `get`, which no function is). A `use` of a re-exported item also imports the
-defining module's file. An inline module's `pub use`, and a re-exported
-module (`pub use a::b;` then `crate::b::f()`), are not followed.
+defining module's file. Since index format 18, an inline module's `pub
+use` is read too: `reexports` records it as `[name, path, "a::b"]`, the
+inline module's path in its file, its head read in that module (its own
+`mod`s and `use`s), and a module `M::a::b` reads the re-exports a file of
+`M` records for `a::b` (`_reexport_entries`), so `mod api { pub use
+crate::net::fetch; }` in lib.rs makes `api::fetch()` there and
+`shop_core::api::fetch()` elsewhere reach net.rs. A re-exported module
+is followed as a path's module: walking a path (`_walk`), a lowercase
+segment is its child module and, when the module re-exports a module of
+the name by name (`pub use net::client;`), that module too (a glob is not
+followed for a module: every path through its module would reach the
+glob's whole tree), so `crate::client::fetch()`, `shop_core::client::fetch()`
+and `use shop_core::client;` then `client::fetch()` reach
+`net/client.rs`, which that `use` also imports.
 
 The arguments of a macro invocation (`println!("{}", shop_core::version())`,
 `assert_eq!(user.total(), 500)`) are reparsed as a call's arguments, so the
@@ -691,7 +756,7 @@ declares an `M` itself.
 project's own type beside a referenced one, which C# prefers with warning
 CS0436) both link. A key group over the cap links by class file
 name, as before match keys, and is not tiered (see Shadow tiers).
-`ImplicitUsings` is not read. An extension method is keyed by its `this`
+An extension method is keyed by its `this`
 parameter's type's simple name (`Ns:+T`), or by a type parameter's first
 constraint naming a type (`this T x where T : class, IRepo`: `+IRepo`); a
 receiver typed with a class implementing that interface (`Repo r;
@@ -937,9 +1002,11 @@ resolves by function name alone and still links every same-named member of
 the file); across files, an imported top-level function (a Python
 from-import or module attribute, a JS/TS ES named import or namespace
 member, a Go package's function) links the top-level one, never a method
-of its name. A method of another file's class still links every member of
-the name there (a subclass can inherit it from a base of that file), and so
-does a call through a JS/TS default import or `require`. C# narrows by
+of its name. A method of another file's Python, JS/TS or Java class names
+that class (index format 18), which reaches its own member or the one it
+inherits from a base of that file (heir keys: graph-accuracy spec, O3
+(c)), a JS/TS default import's the default-exported class's; a call
+through a `require` still links every member of the name there. C# narrows by
 owner through its match keys already. The measurement fixtures are
 unchanged by it (M1 to M5 equal; `name_refs` 3 to 8 % larger).
 
@@ -967,7 +1034,8 @@ has:
   declared elsewhere is pinned where a call to it would go: `call_rows`
   with `rel_type="IMPLEMENTS"` over the pins the language's call resolver
   gives the name (an ES named import's candidate files and folder at owner
-  "", a default import's or a typed value's member at any owner, a Go
+  "", a default import's or a typed value's member at its class's owner
+  when the call resolver names one (index format 18), else any, a Go
   identifier's own file or package directory, a Go `pkg.H` the package's).
   Such an edge is pinned to another file, so `name_ref_properties` records
   it and G5 relinks it when a batch adds the handler; nothing else is new
@@ -1001,8 +1069,12 @@ call is not it). A Go receiver declared from another (`v := s.router`)
 is followed to it; an ASP.NET chained receiver
 (`app.MapGroup("/x").MapGet(...)`) is read as its group. Only a router
 package itself (or its major version, `chi/v5`) names routers, never one
-of its subpackages (`fiber/v2/middleware/cache`); a dot import of a
-router package is not read; and a verb-named call on another package
+of its subpackages (`fiber/v2/middleware/cache`). A dot import of one
+(index format 18) is the qualifier "": its bare constructor (`r :=
+NewRouter()`, unless the file declares the name) is a root router, its
+bare router type (`m *Mux`) a root or mounted one as a qualified one, and
+with a dot-imported net/http a bare `HandleFunc`/`Handle` (unless the
+file declares it) registers on the DefaultServeMux. A verb-named call on another package
 (`cache.Get("/k", load)`) is no route. An absolute ASP.NET action route
 is one Endpoint whatever the class's `[Route]`s.
 

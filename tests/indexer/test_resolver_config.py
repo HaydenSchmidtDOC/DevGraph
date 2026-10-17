@@ -424,6 +424,50 @@ def test_using_items_with_static_alias_and_remove(tmp_path):
     assert ResolverConfig(tmp_path).cs_project("src/Shop/Order.cs") == project
 
 
+def test_implicit_usings_are_the_sdks_global_usings(tmp_path):
+    """`<ImplicitUsings>enable</ImplicitUsings>` adds the project SDK's
+    global usings before every `<Using>` item, so a `Remove` removes one;
+    the last setting wins, a Directory.Build.props' and .targets' included;
+    the Razor SDK adds Microsoft.NET.Sdk's; an SDK without a known set, or no
+    setting, adds none; the property and
+    the SDK are configuration."""
+    base = ("System", "System.Collections.Generic", "System.IO", "System.Linq", "System.Net.Http",
+            "System.Threading", "System.Threading.Tasks")
+    hosting = ("Microsoft.Extensions.Configuration", "Microsoft.Extensions.DependencyInjection",
+               "Microsoft.Extensions.Hosting", "Microsoft.Extensions.Logging")
+    web = ("System.Net.Http.Json", "Microsoft.AspNetCore.Builder", "Microsoft.AspNetCore.Hosting",
+           "Microsoft.AspNetCore.Http", "Microsoft.AspNetCore.Routing")
+    implicit = "<PropertyGroup><ImplicitUsings>{}</ImplicitUsings></PropertyGroup>"
+
+    def names(rel):
+        return {each.name for each in ResolverConfig(tmp_path).cs_project(rel).usings}
+
+    write(tmp_path, "app/App.csproj", csproj())
+    before = fingerprints(tmp_path)["csharp"]["fingerprint"]
+    assert names("app/X.cs") == set()
+    write(tmp_path, "app/App.csproj", csproj(implicit.format("enable")))
+    assert names("app/X.cs") == set(base)
+    assert fingerprints(tmp_path)["csharp"]["fingerprint"] != before
+    write(tmp_path, "web/Web.csproj", csproj(implicit.format("true"), '<Using Remove="System.Net.Http" />')
+          .replace('Sdk="Microsoft.NET.Sdk"', 'Sdk="Microsoft.NET.Sdk.Web"'))
+    assert names("web/X.cs") == set(base + hosting + web) - {"System.Net.Http"}
+    write(tmp_path, "worker/Worker.csproj", '<Project Sdk="Microsoft.NET.Sdk.Worker/8.0.0">'
+          + implicit.format("enable") + "</Project>")
+    assert names("worker/X.cs") == set(base + hosting)
+    write(tmp_path, "razor/Razor.csproj", '<Project Sdk="Microsoft.NET.Sdk.Razor">' + implicit.format("enable")
+          + "</Project>")
+    assert names("razor/X.cs") == set(base)
+    write(tmp_path, "desk/Desk.csproj", '<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">' + implicit.format("enable")
+          + "</Project>")
+    assert names("desk/X.cs") == set()
+    # Directory.Build files: the props' setting applies, the targets' (read after the project) wins.
+    write(tmp_path, "lib/Directory.Build.props", "<Project>" + implicit.format("enable") + "</Project>")
+    write(tmp_path, "lib/a/A.csproj", csproj())
+    assert names("lib/a/X.cs") == set(base)
+    write(tmp_path, "lib/Directory.Build.targets", "<Project>" + implicit.format("disable") + "</Project>")
+    assert names("lib/a/X.cs") == set()
+
+
 def test_directory_build_files_wrap_each_project_and_only_the_nearest_counts(tmp_path):
     write(tmp_path, "Directory.Build.props", csproj('<Using Include="Far.Away" />'))
     write(tmp_path, "src/Directory.Build.props", csproj('<Using Include="Near.Props" />',
