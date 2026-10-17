@@ -312,7 +312,10 @@ Tiers, first match wins:
    `export` or `require`), whose top-level declarations are globals (browser
    globals such as `fetch` excepted).
 
-A parameter shadows an import of its name, as in Python. Calls inside an
+A typed receiver's or `T.f()`'s method in another file is T's member
+there, its own or one it inherits from a class of that file (index format
+19; heir keys, graph-accuracy spec O3 (c)), so `u: User; u.save()` no
+longer links `Order.save` beside it. A parameter shadows an import of its name, as in Python. Calls inside an
 anonymous function (a callback, an IIFE) are still not attributed to anyone.
 
 **JSX** (index format 16, audit 5 item 4). An opening or self-closing JSX
@@ -940,8 +943,8 @@ member, a Go package's function) links the top-level one, never a method
 of its name. A method of another file's Python, JS/TS or Java class names
 that class (index format 19), which reaches its own member or the one it
 inherits from a base of that file (heir keys: graph-accuracy spec, O3
-(c)); a call through a JS/TS default import or `require` still links
-every member of the name there. C# narrows by
+(c)), a JS/TS default import's the default-exported class's; a call
+through a `require` still links every member of the name there. C# narrows by
 owner through its match keys already. The measurement fixtures are
 unchanged by it (M1 to M5 equal; `name_refs` 3 to 8 % larger).
 
@@ -969,7 +972,8 @@ has:
   declared elsewhere is pinned where a call to it would go: `call_rows`
   with `rel_type="IMPLEMENTS"` over the pins the language's call resolver
   gives the name (an ES named import's candidate files and folder at owner
-  "", a default import's or a typed value's member at any owner, a Go
+  "", a default import's or a typed value's member at its class's owner
+  when the call resolver names one (index format 19), else any, a Go
   identifier's own file or package directory, a Go `pkg.H` the package's).
   Such an edge is pinned to another file, so `name_ref_properties` records
   it and G5 relinks it when a batch adds the handler; nothing else is new

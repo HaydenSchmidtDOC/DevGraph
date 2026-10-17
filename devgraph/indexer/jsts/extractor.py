@@ -484,12 +484,15 @@ class _Binding:
     whole module (`* as ns`, `const ns = require(...)`). `top_level` is
     true for an ES named import (`{a}`: a module's top-level function when
     called) and an ES namespace (`* as ns`: its members are top-level ones);
-    a default import or a `require` can bind anything."""
+    a default import or a `require` can bind anything. `default` marks an
+    ES default import: a class it binds is its module's default-exported
+    one, whatever the name (`DEFAULT_EXPORT`)."""
 
     name: str
     pins: tuple[str, ...] | None
     namespace: bool
     top_level: bool = False
+    default: bool = False
 
 
 @dataclass
@@ -519,6 +522,27 @@ class _Scope:
     def nested(self, params: set[str], types: dict[str, list[str]]) -> _Scope:
         outer = {name: t for name, t in self.types.items() if name not in params}
         return _Scope(self.cls, self.params | params, {**outer, **types})
+
+
+#: The owner a default import's class names (`import Thing from './thing';
+#: new Thing().start()`): `export default class ThingImpl` is its heir, so
+#: ThingImpl's members, and those it inherits, hold its heir key
+#: (common.heir_keys). No class can be named `default`.
+DEFAULT_EXPORT = "default"
+
+
+def _default_export(root: Node, source: bytes, classes: dict[str, _ClassInfo]) -> str | None:
+    """The class a file's `export default` names (`export default class
+    X`, `export default X;`), or None."""
+    for node in root.named_children:
+        if node.type != "export_statement" or not any(child.type == "default" for child in node.children):
+            continue
+        target = node.child_by_field_name("declaration") or node.child_by_field_name("value")
+        if target is not None and target.type in _CLASS_TYPES:
+            target = target.child_by_field_name("name")
+        if target is not None and target.type in ("identifier", "type_identifier") and _text(target, source) in classes:
+            return _text(target, source)
+    return None
 
 
 def _class_like(name: str) -> bool:
@@ -716,7 +740,7 @@ def _bindings(
             for child in clause.named_children if clause is not None else []:
                 if child.type == "identifier":
                     name = _text(child, source)
-                    bindings[name] = _Binding(name, where, False)
+                    bindings[name] = _Binding(name, where, False, default=True)
                 elif child.type == "namespace_import":
                     ns = next((c for c in child.named_children if c.type == "identifier"), None)
                     if ns is not None:
@@ -789,10 +813,12 @@ class _CallResolver:
         if binding is not None and (dot == "" or binding.namespace):
             # An imported class's method: the class's member there, its own
             # or one it inherits from a class of its file (common.heir_keys);
-            # any of the name through a default import or a require, which
-            # can bind a class of another name.
+            # through a default import, the default-exported class's
+            # (DEFAULT_EXPORT); any of the name through a require.
             owner = (rest if "." not in rest else None) if dot else binding.name
-            return [class_member_pin(pin, owner if binding.top_level else None) for pin in binding.pins or ()]
+            if not binding.top_level:
+                owner = DEFAULT_EXPORT if binding.default and not dot else None
+            return [class_member_pin(pin, owner) for pin in binding.pins or ()]
         return None
 
     def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
@@ -841,10 +867,11 @@ class _CallResolver:
             return None  # an untyped parameter shadows any import of its name
         binding = self.bindings.get(receiver)
         if binding is not None:
-            # An ES namespace's member is a module's top-level one, a named
-            # import's of a class (a CapWords name) the class's (`_class_pins`);
-            # anything else's (a require, an instance) any of the name.
-            if binding.top_level and not binding.namespace and _class_like(binding.name):
+            # An ES namespace's member is a module's top-level one, a named or
+            # default import's of a class (a CapWords name) the class's
+            # (`_class_pins`); anything else's (a require, an instance) any of
+            # the name.
+            if (binding.top_level and not binding.namespace or binding.default) and _class_like(receiver):
                 return self._class_pins(receiver, method)
             owner = "" if binding.namespace and binding.top_level else None
             return [owned_pin(pin, owner) for pin in binding.pins or ()]
@@ -1373,9 +1400,10 @@ def extract_js_file(
                 no_self=no_self, caller_owner=caller_owner,
             ))
     _express_routes(root, source_bytes, resolver, result, file_path, repo_id)
+    default = _default_export(root, source_bytes, class_table)
     add_heir_keys(result, [
         (name, owner, info.bases, info.methods) for name, info in class_table.items() for owner in info.members_owners
-    ])
+    ] + ([(DEFAULT_EXPORT, DEFAULT_EXPORT, [default], ())] if default else []))
 
     return own_edges(result, file_path)
 

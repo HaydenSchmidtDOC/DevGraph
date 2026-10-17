@@ -277,6 +277,45 @@ def test_a_cross_file_call_names_the_owner_its_resolver_knows():
     assert ("shop/models.py", None) in rows("push")
 
 
+@pytest.mark.parametrize("extract, path, source", [
+    (extract_python_file, "app/s.py", """\
+        from app.models import User
+
+
+        def register(u: User):
+            u.save()
+
+
+        def make():
+            u = User()
+            u.save()
+            User().save()
+        """),
+    (extract_js_file, "app/s.ts", """\
+        import { User } from './models';
+        import Account from './account';
+
+        class Svc {
+          constructor(private repo: User) {}
+          sync() { this.repo.save(); }
+        }
+        export function register(u: User) { u.save(); }
+        export function make() { const u = new User(); u.save(); new Account().save(); }
+        """),
+])
+def test_a_typed_receiver_of_an_imported_class_names_its_owner(extract, path, source):
+    """A receiver typed by an annotation, a constructor or a field, and a
+    constructed one, name the class as the owner of the method's every
+    file pin (a package or barrel prefix none); a default import names its
+    file's default-exported class (`default`)."""
+    result = extract(textwrap.dedent(source), path, "repo")
+    rows = [r for r in result.relationships if r.rel_type == "CALLS" and r.to_name == "save"]
+    assert rows
+    for row in rows:
+        expected = None if row.to_file.endswith("/") else "default" if "account" in row.to_file else "User"
+        assert row.to_owner == expected, row
+
+
 def test_heir_keys_name_the_classes_inheriting_a_member_from_the_nearest_base():
     assert heir_keys([
         ("Base", "Base", [], ["save", "check"]), ("Mid", "Mid", ["Base"], ["check"]),

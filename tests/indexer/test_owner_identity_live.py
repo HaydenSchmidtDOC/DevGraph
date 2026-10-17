@@ -497,10 +497,11 @@ def _targets(engine, repo_id, caller):
 
 def test_a_method_of_another_files_class_links_as_before_owners(engine, repo):
     """An inherited `save`/`create` of an imported class links the base of
-    its file that defines it (its heir keys); the owner of a method called
-    on another file's instance is unknown to the caller: an ALL_CAPS
-    instance's method, a `require`d class's static, a default import of a
-    class of another name all still link every member of the name there."""
+    its file that defines it (its heir keys), and a default import of a
+    class of another name the default-exported class's member; the owner
+    of a method called on another file's instance is unknown to the
+    caller: an ALL_CAPS instance's method and a `require`d class's static
+    still link every member of the name there."""
     root, _registry, repo_id = repo
     write(root, "shop/models.py", """\
         class Base:
@@ -534,7 +535,8 @@ def test_a_method_of_another_files_class_links_as_before_owners(engine, repo):
         """)
     write(root, "web/svc.js", "class Base { make() { return 1; } }\nclass Svc extends Base {}\nmodule.exports = Svc;\n")
     write(root, "web/app.js", "const Svc = require('./svc');\n\nfunction build() {\n  return Svc.make();\n}\n")
-    write(root, "web/thing.ts", "export default class ThingImpl {\n  start() { return 1; }\n}\n")
+    write(root, "web/thing.ts", "export default class ThingImpl {\n  start() { return 1; }\n}\n"
+                                "export class Other {\n  start() { return 2; }\n}\n")
     write(root, "web/main.ts", "import Thing from './thing';\n\nexport function go() {\n  return Thing.start();\n}\n")
     full_scan(engine, repo_id, root)
     assert _targets(engine, repo_id, "run") == [
