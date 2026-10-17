@@ -56,7 +56,8 @@ repository root).
 
 Not listed anywhere: constructor invocations (`new T()`, `T()` in Kotlin,
 struct literals), intrinsic JSX tags (`<div>`; a component's tag, `<Button />`,
-renders it and is a call), function values passed without being called, calls inside anonymous lambdas/closures, and module-level code outside
+renders it and is a call, from the named function holding it even inside
+an anonymous callback), function values passed without being called, calls inside anonymous lambdas/closures, and module-level code outside
 any function.
 
 ## Using a fixture

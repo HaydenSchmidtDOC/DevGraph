@@ -5,6 +5,10 @@ import Modal from './Modal';
 import Toast from './Toast';
 import { Header } from './layout/Header';
 
+function ListRow({ row }: { row: string }) {
+  return <li>{row}</li>;
+}
+
 function Footer() {
   return (
     <footer>
@@ -27,7 +31,7 @@ export function App({ Slot }: { Slot: () => JSX.Element }) {
       <Footer />
       <ul>
         {rows.map((row) => (
-          <li key={row}>{row}</li>
+          <ListRow key={row} row={row} />
         ))}
       </ul>
     </main>

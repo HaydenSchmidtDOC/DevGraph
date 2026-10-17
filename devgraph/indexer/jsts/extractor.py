@@ -83,6 +83,7 @@ from devgraph.indexer.common import (
     member_owner,
     own_edges,
     owned_pin,
+    split_owned_pin,
 )
 from devgraph.indexer.resolver_config import ResolverConfig
 
@@ -225,29 +226,98 @@ def _jsx_component(node: Node) -> Node | None:
     return None
 
 
+#: Calls that wrap a function component (`memo(fn)`, `React.forwardRef(fn)`):
+#: `const Card = memo(() => ...)` is the component `Card`.
+_COMPONENT_WRAPPERS = frozenset({"memo", "forwardRef"})
+
+
+def _function_value(value: Node | None) -> Node | None:
+    """The function a declarator's value defines, the node a Function is
+    made of: a function or arrow; the one a component wrapper takes
+    (`memo(...)`, `forwardRef(...)`, nested); a styled component
+    (`styled.div`...``, `styled(Button)`...``), which has no body. None for
+    anything else."""
+    if value is None:
+        return None
+    if value.type in _FUNCTION_VALUE_TYPES:
+        return value
+    if value.type != "call_expression":
+        return None
+    func, args = value.child_by_field_name("function"), value.child_by_field_name("arguments")
+    if func is None or args is None:
+        return None
+    if args.type == "template_string":
+        callee = func  # `styled.div`, `styled(Button)`, `styled.div.attrs({})`, down to `styled`
+        while callee is not None and callee.type in ("member_expression", "call_expression"):
+            callee = callee.child_by_field_name("object" if callee.type == "member_expression" else "function")
+        return value if callee is not None and callee.type == "identifier" and callee.text == b"styled" else None
+    name = func.text.rsplit(b".", 1)[-1].decode("utf-8", errors="replace")
+    if name in _COMPONENT_WRAPPERS and args.named_children:
+        return _function_value(args.named_children[0])
+    return None
+
+
+def _named_function(node: Node) -> bool:
+    """Whether the function or arrow `node` is a Function of its own: a
+    declarator's (`_function_value`) or a class field's value."""
+    parent = node.parent
+    while parent is not None and parent.type in ("arguments", "call_expression", "parenthesized_expression"):
+        parent = parent.parent
+    if parent is None:
+        return False
+    if parent.type in ("field_definition", "public_field_definition"):
+        return True
+    if parent.type != "variable_declarator":
+        return False
+    defined = _function_value(parent.child_by_field_name("value"))
+    return defined is not None and (defined.start_byte, defined.end_byte) == (node.start_byte, node.end_byte)
+
+
+def _bound_names(func: Node) -> set[bytes]:
+    """Every name a function's parameters bind, destructured ones included."""
+    params = func.child_by_field_name("parameters") or func.child_by_field_name("parameter")
+    found: set[bytes] = set()
+    pending = [params] if params is not None else []
+    while pending:
+        node = pending.pop()
+        if node.type in ("identifier", "shorthand_property_identifier_pattern"):
+            found.add(node.text)
+        else:
+            pending += [child for child in node.named_children if child.type != "type_annotation"]
+    return found
+
+
 def _call_functions(body: Node) -> list[Node]:
     """The `function` node of every call expression in `body`, and the name
     of every JSX element rendering a component (`_jsx_component`), not
     descending into nested function/class scopes - those are walked
     separately so calls are attributed to the correct enclosing scope rather
     than hoisted to the outer function (mirrors the Python extractor's
-    `_call_functions`). `require(...)` is module-system syntax, captured by
-    `_extract_imports`."""
+    `_call_functions`). An anonymous function (a callback, `items.map(i =>
+    <Row />)`, an inline render prop; not one `_named_function` makes a
+    Function of its own) is walked for its JSX elements only, which render
+    from the enclosing function, unless their tag names a parameter of a
+    callback holding them. `require(...)` is module-system syntax, captured
+    by `_extract_imports`."""
     found: list[Node] = []
 
-    def walk(node: Node) -> None:
+    def walk(node: Node, shadowed: frozenset[bytes] | None) -> None:
         if node.type in _NESTED_SCOPE_TYPES:
-            return
-        if node.type == "call_expression":
+            if node.type not in _FUNCTION_VALUE_TYPES or _named_function(node):
+                return
+            shadowed = (shadowed or frozenset()) | _bound_names(node)
+        if node.type == "call_expression" and shadowed is None:
             func = node.child_by_field_name("function")
             if func is not None and not (func.type == "identifier" and func.text == b"require"):
                 found.append(func)
         elif node.type in _JSX_TAGS and (name := _jsx_component(node)) is not None:
-            found.append(name)
+            head = name if name.type == "identifier" else name.child_by_field_name("object")
+            if shadowed is None or head is None or head.text not in shadowed:
+                found.append(name)
         for child in node.children:
-            walk(child)
+            walk(child, shadowed)
 
-    walk(body)
+    walk(body, None)
     return found
 
 
@@ -703,9 +773,7 @@ def _defined_functions(root: Node, source: bytes) -> set[str]:
                 names.add(_text(name, source))
         elif node.type == "variable_declarator":
             name, value = node.child_by_field_name("name"), node.child_by_field_name("value")
-            if name is not None and name.type == "identifier" and value is not None and (
-                value.type in _FUNCTION_VALUE_TYPES
-            ):
+            if name is not None and name.type == "identifier" and _function_value(value) is not None:
                 names.add(_text(name, source))
         for child in node.children:
             walk(child)
@@ -880,6 +948,24 @@ class _CallResolver:
         if receiver in STOP_TYPES["js"]:
             return []
         return None
+
+    def render_pins(self, tag: Node, scope: _Scope) -> list[str]:
+        """Where the `render` of the class component a JSX tag names can be:
+        a class of the file (or its in-file base), as `this.render()`
+        would go; an imported class's, as its member (`_class_pins`: a
+        named, default or namespace import's owner, never an owner-less
+        pin, which would link every `render` there). Empty for a function
+        component of the file, a parameter, or a name nothing imports."""
+        name = _text(tag, self.source)
+        head = name.split(".", 1)[0]
+        if head in scope.params or (head == name and name in self.defined and name not in self.classes):
+            return []
+        if name in self.classes:
+            return self._method_pins(name, "render", own=True) or []
+        binding = self.bindings.get(head)
+        if binding is None or (head == name and binding.namespace):
+            return []
+        return [pin for pin in self._class_pins(name, "render") or () if split_owned_pin(pin)[1] is not None]
 
     def _typed_pins(self, types: list[str], method: str) -> list[str] | None:
         found = [pins for name in types if (pins := self._class_pins(name, method)) is not None]
@@ -1157,7 +1243,9 @@ def extract_js_file(
         by_name = calls.setdefault((caller_label, caller_name, caller_owner), {})
         for func in _call_functions(body):
             jsx = func.parent is not None and func.parent.type in _JSX_TAGS
-            for name, pin, member in resolver.resolve(func, scope):
+            # A class component renders through its `render`, which its class owns.
+            rendered = [("render", pin, False) for pin in resolver.render_pins(func, scope)] if jsx else []
+            for name, pin, member in resolver.resolve(func, scope) + rendered:
                 if pin is None and jsx:
                     continue  # a component nothing resolves links nothing, never by name alone
                 entry = by_name.setdefault(name, [set(), False, set(), True])
@@ -1203,8 +1291,7 @@ def extract_js_file(
                 is_named_fn = (
                     name_node is not None
                     and name_node.type == "identifier"
-                    and value_node is not None
-                    and value_node.type in _FUNCTION_VALUE_TYPES
+                    and _function_value(value_node) is not None
                 )
                 if is_named_fn:
                     _visit_variable_declarator(decl_node, parent_name, parent_label, node if first else None, scope)
@@ -1250,10 +1337,12 @@ def extract_js_file(
         value_node = decl_node.child_by_field_name("value")
         if name_node is None or name_node.type != "identifier" or value_node is None:
             return
-        if value_node.type in _FUNCTION_VALUE_TYPES:
+        if (function := _function_value(value_node)) is not None:
             # doc_anchor is None for a non-first declarator in a multi-name
             # `const a = ..., b = ...` statement - no JSDoc attributed to it.
-            _visit_function(value_node, parent_name, parent_label, doc_anchor or value_node, name_node, scope)
+            # A component wrapper's function (`memo(() => ...)`) is the
+            # declarator's; a styled component is one with no body.
+            _visit_function(function, parent_name, parent_label, doc_anchor or value_node, name_node, scope)
 
     def _visit_class(node: Node, parent_name: str | None, parent_label: str, doc_anchor: Node, scope: _Scope) -> None:
         name_node = node.child_by_field_name("name")

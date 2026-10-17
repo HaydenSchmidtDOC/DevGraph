@@ -234,7 +234,7 @@ def test_a_jsx_component_is_a_call_of_it():
     file's own); a parameter, an external package's component, a tag
     nothing binds and an intrinsic tag link nothing, never a bare name."""
     found = calls(JSX, "src/App.tsx")
-    assert {(n, f, conf) for c, n, f, conf in found if c == "App"} == (
+    assert {(n, f, conf) for c, n, f, conf in found if c == "App" and n != "render"} == (
         {("Button", f, "resolved") for f in candidates("src/components/Button")}
         | {("Button", "src/components/Button/", "package")}
         | {("Card", f, "resolved") for f in candidates("src/Card")} | {("Card", "src/Card/", "package")}
@@ -246,6 +246,82 @@ def test_a_jsx_component_is_a_call_of_it():
     assert targets(jsx, "Bar", "Button", "src/Bar.jsx") == (
         {(f, "resolved") for f in candidates("src/Button")} | {("src/Button/", "package")}
     )
+
+
+def test_jsx_in_a_callback_or_render_prop_renders_from_the_enclosing_function():
+    """An element inside an anonymous arrow (a list callback, an inline
+    render prop, a nested one) renders from the named function holding it,
+    unless its tag is a callback's parameter; calls there stay unattributed,
+    and a named arrow's elements are its own."""
+    source = """
+        import { Row, Empty, Panel, format } from './ui';
+
+        export function List({ items }) {
+          const Item = () => <Empty />;
+          return (
+            <ul>
+              {items.map((i) => <Row key={i} label={format(i)} />)}
+              {items.map((Comp) => <Comp />)}
+              <Panel render={() => [1].map(() => <Empty />)} />
+            </ul>
+          );
+        }
+    """
+    found = calls(source, "src/List.tsx")
+    names = {n for c, n, _f, _conf in found if c == "List"}
+    assert {"Row", "Empty", "Panel"} <= names
+    assert "Comp" not in names and "format" not in names
+    assert {n for c, n, _f, _conf in found if c == "Item"} >= {"Empty"}
+
+
+def test_a_class_component_renders_through_its_render():
+    """`<Modal />` of a class component is a call of the `render` the class
+    owns: a class of the file (or the in-file base defining it) and an
+    imported one's (named, default or namespace), never an owner-less pin;
+    a function component of the file adds none."""
+    source = """
+        import React from 'react';
+        import { Dialog } from './Dialog';
+        import Sheet from './Sheet';
+        import * as Ui from './ui';
+
+        class Base extends React.Component { render() { return <div />; } }
+        class Local extends Base {}
+        function Plain() { return <span />; }
+
+        export function App() {
+          return <main><Local /><Plain /><Dialog /><Sheet /><Ui.Panel /></main>;
+        }
+    """
+    result = extract_js_file(textwrap.dedent(source), "src/App.tsx", "repo")
+    rows = {(r.to_file, r.to_owner) for r in result.relationships
+            if r.rel_type == "CALLS" and r.from_name == "App" and r.to_name == "render"}
+    assert ("src/App.tsx", "Base") in rows
+    assert {owner for _f, owner in rows} == {"Base", "Dialog", "default", "Panel"}
+    assert ("src/Dialog.tsx", "Dialog") in rows and ("src/Sheet.tsx", "default") in rows
+
+
+def test_memo_forward_ref_and_styled_components_are_functions():
+    """`memo(fn)`, `forwardRef(fn)` (and `React.` ones, nested) make the
+    declarator a Function of the wrapped function's body; a styled
+    component is a Function with no body. Rendering each links it."""
+    source = """
+        import React, { memo, forwardRef } from 'react';
+        import styled from 'styled-components';
+
+        const Title = styled.h1`color: red;`;
+        const Shell = styled(Title).attrs({})`margin: 0;`;
+        export const Card = memo(function Card() { return <Title />; });
+        export const Input = React.memo(forwardRef((props, ref) => <Shell ref={ref} />));
+        export function Page() { return <><Card /><Input /></>; }
+    """
+    result = extract_js_file(textwrap.dedent(source), "src/Page.tsx", "repo")
+    functions = {n.name for n in result.nodes if n.label == "Function"}
+    assert {"Title", "Shell", "Card", "Input", "Page"} <= functions
+    found = calls(source, "src/Page.tsx")
+    assert ("Card", "Title", "src/Page.tsx", "resolved") in found
+    assert ("Input", "Shell", "src/Page.tsx", "resolved") in found
+    assert {("Page", "Card", "src/Page.tsx", "resolved"), ("Page", "Input", "src/Page.tsx", "resolved")} <= found
 
 
 def test_the_index_upgrade_replaces_bare_js_calls(tmp_path, monkeypatch):

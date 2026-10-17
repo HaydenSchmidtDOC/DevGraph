@@ -338,16 +338,37 @@ name, in `.jsx`, `.tsx` and `.js` files alike, resolved by the tiers above
 (the file's own, an import with a barrel's prefix, a namespace member). A
 tag nothing resolves (a parameter `<Slot />`, an external package's
 `<Link />`, `<this.Foo />`) links nothing: no bare-name row. An intrinsic
-tag (`<div>`, `<svg:rect>`) and a fragment are no calls. Limits: an
-element inside an anonymous arrow (`items.map(i => <Row />)`, an inline
-render prop, a `useCallback` body) is attributed to no one, as calls there
-are not, so a list's row component has no caller; a class component
-(`class Modal extends React.Component`) is a Class, which no `CALLS` row
-reaches, so rendering one adds no edge (its methods' own calls are kept);
-a component made by a call (`React.memo(...)`, `forwardRef(...)`,
-`styled.div`) has no Function node, so its renders link nothing. The ts fixture's two renders link (precision unchanged at
+tag (`<div>`, `<svg:rect>`) and a fragment are no calls. The ts fixture's two renders link (precision unchanged at
 100 %), and a React fixture (`tests/fixtures/callgraph/react`) goes from
 2 of 16 calls to 16 of 16, linked precision 100 %.
+
+Since index format 19:
+
+- An element inside an anonymous function (`items.map(i => <Row />)`, an
+  inline render prop, a `useCallback` body, nested ones) renders from the
+  named function holding it (`_call_functions`), unless its tag names a
+  parameter of a callback holding it (`items.map(Comp => <Comp />)`).
+  Calls there are still attributed to no one. A function is named when
+  it is a declarator's or a class field's value (`_named_function`); its
+  elements are its own.
+- A class component (`class Modal extends React.Component`) renders
+  through the `render` it owns: a component tag is also a call of
+  `render` owned by the class (`render_pins`), as `this.render()` in the
+  class would be for a class of the file, and as a member of an imported
+  class for an import (a named import's owner its name, a namespace
+  member's its member, a default import's the default-exported class,
+  heir keys reaching an inherited `render`); an owner-less pin (a
+  `require`, a barrel's prefix) is left out, as it would link every
+  `render` there. A function component of the file adds no such row; an
+  imported one's links nothing, owning no `render`.
+- A component made by a wrapper is a Function of the declarator's name:
+  `memo(fn)`, `forwardRef(fn)` (`React.` ones, nested) of the wrapped
+  function's body, and a styled component (`styled.div`...``,
+  `styled(Button)`...``) with no body (`_function_value`).
+
+The React fixture, extended with a list callback's and a render prop's
+elements, a class component, and memo, forwardRef and styled components,
+goes from 16 of 23 calls to 23 of 23, linked precision 100 %.
 
 ## Kotlin parse recovery (`devgraph/indexer/kotlin/extractor.py`)
 
