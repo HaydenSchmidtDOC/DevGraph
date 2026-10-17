@@ -638,8 +638,9 @@ crate::net::fetch; }` in lib.rs makes `api::fetch()` there and
 `shop_core::api::fetch()` elsewhere reach net.rs. A re-exported module
 is followed as a path's module: walking a path (`_walk`), a lowercase
 segment is its child module and, when the module re-exports a module of
-the name (`pub use net::client;`), that module too (a glob's at package
-confidence), so `crate::client::fetch()`, `shop_core::client::fetch()`
+the name by name (`pub use net::client;`), that module too (a glob is not
+followed for a module: every path through its module would reach the
+glob's whole tree), so `crate::client::fetch()`, `shop_core::client::fetch()`
 and `use shop_core::client;` then `client::fetch()` reach
 `net/client.rs`, which that `use` also imports.
 

@@ -721,22 +721,23 @@ class _RustResolver:
     def _walk(self, start: tuple[_Module, list[str]], types: bool = False) -> list[tuple[_Module, list[str], bool]]:
         """Follow lowercase segments (any segment but the last, with
         `types`) as modules down to the last one or a type: each (module,
-        what is left: [item], [Type, item...] or [], reached through a
-        glob?). A segment is the child module of its name and, when the
-        module re-exports a module of the name (`pub use a::b;`, then
-        `crate::b::f()`; `reexported`), that module too, the first one
-        found first."""
-        found, pending = [], [(*start, False)]
+        what is left: [item], [Type, item...] or []). A segment is the
+        child module of its name and, when the module re-exports a module
+        of the name by name (`pub use a::b;`, then `crate::b::f()`;
+        `reexported`), that module too, the first one found first. A glob
+        is not followed for a module: every path through its module would
+        reach its whole tree too."""
+        found, pending = [], [start]
         while pending:
-            module, rest, glob = pending.pop(0)
+            module, rest = pending.pop(0)
             if len(rest) > 1 and (types or not _uppercase(rest[0])):
-                pending.append((_Module(module.crate, module.path + (rest[0],)), rest[1:], glob))
+                pending.append((_Module(module.crate, module.path + (rest[0],)), rest[1:]))
                 pending += [
-                    (_Module(target.crate, target.path + (item,)), rest[1:], glob or reached)
-                    for target, item, reached in self.reexported(module, rest[0])
+                    (_Module(target.crate, target.path + (item,)), rest[1:])
+                    for target, item, reached in self.reexported(module, rest[0]) if not reached
                 ]
-            elif (module, rest, glob) not in found:
-                found.append((module, rest, glob))
+            elif (module, rest) not in found:
+                found.append((module, rest))
         return found
 
     def _item_pins(self, module: _Module, item: str) -> list[str]:
@@ -767,17 +768,16 @@ class _RustResolver:
             ) else None
             return [(name, pins)] if pins else None
         found: dict[str, list[str]] = {}
-        for module, rest, loose in self._walk(start):
+        for module, rest in self._walk(start):
             if not rest:
                 continue
             # A function bound or re-exported under another name (`use a::f as
             # g;`, `pub use a::f as g;`) is called by its own.
-            own = self._reexport_pins(module, loose)
             found.setdefault(rest[-1], [])
-            found[rest[-1]] += [pin for pin in own if pin not in found[rest[-1]]]
+            found[rest[-1]] += [pin for pin in self.pins(module) if pin not in found[rest[-1]]]
             for target, item, glob in self.reexported(module, rest[0]):
                 callee = item if len(rest) == 1 else rest[-1]
-                pins = self._reexport_pins(target, glob or loose)
+                pins = self._reexport_pins(target, glob)
                 if len(rest) == 2:
                     # `Client::new()`: an associated function of the type as its
                     # module calls it, so a module the re-export passes through
@@ -817,9 +817,8 @@ class _RustResolver:
         if start is None:
             return self._glob_pins(scope, segs[0]) if len(segs) == 1 and unbound else None
         found = []
-        for module, rest, loose in self._walk(start, types=True):
-            pins = self._item_pins(module, rest[0]) if rest else []
-            found += [pin for pin in (_loose(pins) if loose else pins) if pin not in found]
+        for module, rest in self._walk(start, types=True):
+            found += [pin for pin in (self._item_pins(module, rest[0]) if rest else []) if pin not in found]
         return found or None
 
     # --- types ---------------------------------------------------------------------
@@ -871,7 +870,7 @@ class _RustResolver:
                 module, rest = start
                 modules.append(_Module(module.crate, module.path + tuple(rest)))
                 continue
-            for module, rest, _loose_walk in self._walk(start):
+            for module, rest in self._walk(start):
                 if not rest or rest[0] == "self":
                     modules.append(module)
                     continue
