@@ -152,7 +152,7 @@ const check = (label, cond, detail) => {
   //    one (a canvas refresh), and an error shown since is left alone.
   const errorEl = { textContent: "" };
   const notice = new Function("cypherErrorEl",
-    grab(/^let shownTruncatedNotice = null;/m, ";") + "\n" + grab(/^function showTruncatedNotice\(result\)/m, "\n}") +
+    grab(/^let shownTruncatedNotice = null;/m, ";") + "\n" + grab(/^function showTruncatedNotice\(result, capNotice\)/m, "\n}") +
     "\nreturn showTruncatedNotice;")(errorEl);
   notice({ truncated: true, data: new Array(3) });
   check("a capped result shows the notice", errorEl.textContent.startsWith("Showing the first 3 rows"), errorEl.textContent);
@@ -162,6 +162,11 @@ const check = (label, cond, detail) => {
   errorEl.textContent = "ClientError: bad query";
   notice({ truncated: false, data: [] });
   check("an error shown since is not cleared", errorEl.textContent === "ClientError: bad query", errorEl.textContent);
+  errorEl.textContent = "";
+  notice({ truncated: false, data: [] }, "Showing 1,500 of 52,021 nodes: narrow the view");
+  check("a capped canvas view says how much it shows", errorEl.textContent.startsWith("Showing 1,500 of 52,021 nodes"), errorEl.textContent);
+  notice({ truncated: false, data: [] }, null);
+  check("...and an uncapped one clears it", errorEl.textContent === "", errorEl.textContent);
 
   if (failures) { console.log(`\n${failures} check(s) failed`); process.exit(1); }
   console.log("\nall checks passed");

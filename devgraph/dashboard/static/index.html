@@ -2648,6 +2648,8 @@ async function runCypher(statement, opts) {
       record: !!opts?.record,
       // read transaction server-side: the server refuses any write
       preview: !!opts?.preview,
+      // only what the canvas draws: names and identity, no full properties
+      canvas: !!opts?.canvas,
     }),
   });
   return res.json();
@@ -2676,16 +2678,32 @@ let REGISTERED_REPO_IDS = [];
 function allReposClause(alias) {
   return `${alias}.repo_id IN [${REGISTERED_REPO_IDS.map(id => `"${escapeCypherStr(id)}"`).join(", ")}]`;
 }
+/* The canvas never fetches a whole large scope on its own: the node ceiling
+   is seeded at CANVAS_NODE_CAP (about what the canvas still draws smoothly),
+   so the default query always carries a LIMIT once the scope is bigger than
+   that, and the canvas says how much it is showing (canvasCapNotice). Only
+   releasing the slider at its max asks for everything; the console's row cap
+   and timeout still bound that. */
+const CANVAS_NODE_CAP = 1500;
+let nodeCeilingUncapped = false;
+let scopeNodeTotal = 0;
+function seededNodeCeiling(total) {
+  return nodeCeilingUncapped ? total : Math.min(total, CANVAS_NODE_CAP);
+}
+function canvasCapNotice(ceiling, total) {
+  if (!(ceiling < total)) return null;
+  return `Showing ${ceiling.toLocaleString()} of ${total.toLocaleString()} nodes: narrow the view by isolating an entity or relationship type, or raise the Node ceiling.`;
+}
 function currentStateQuery() {
   const repo = document.getElementById("repoSelect").value;
   const isolatedEntityId = state.isolatedEntity;
   const nodeWhere = [repo === "__all__" ? allReposClause("n") : `n.repo_id = "${escapeCypherStr(repo)}"`];
   if (isolatedEntityId) nodeWhere.push(`labels(n)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
-  // A ceiling maxed out (the default) means "no cap" -- leave its LIMIT out
-  // of the query entirely rather than spelling out the current real total,
-  // so the query stays correct as the real total changes instead of
-  // silently going stale. Only a slider deliberately dragged below its max
-  // adds a LIMIT.
+  // A ceiling maxed out means "no cap" -- leave its LIMIT out of the query
+  // entirely rather than spelling out the current real total, so the query
+  // stays correct as the real total changes instead of silently going
+  // stale. A slider below its max (the default for a scope larger than
+  // CANVAS_NODE_CAP, see seededNodeCeiling) adds a LIMIT.
   const nodeSlider = document.getElementById("ctlNodeCeiling");
   const relSlider = document.getElementById("ctlRelCeiling");
   const nodeLimited = state.nodeCeiling < +nodeSlider.max;
@@ -2748,7 +2766,7 @@ async function runQueryAndUpdateGraph(query, opts) {
   document.getElementById("cypherInput").value = query;
   syncCypherHighlight();
   const mySeq = ++glowRequestSeq;
-  const json = await runCypher(query, { record: !!opts?.record });
+  const json = await runCypher(query, { record: !!opts?.record, canvas: !!opts?.canvas });
   if (json.errors?.length) return { ok: false, json };
   const result = json.results[0];
   const elements = mapGraphResultToElements(result.data);
@@ -2816,9 +2834,9 @@ async function refreshGraph(mode, record, structural) {
   const replace = structural || !state.highlightMode;
   let ok = false;
   try {
-    const res = await runQueryAndUpdateGraph(q, { record, mode, replace });
+    const res = await runQueryAndUpdateGraph(q, { record, mode, replace, canvas: true });
     ok = res.ok;
-    if (!res.superseded && res.json?.results?.[0]) showTruncatedNotice(res.json.results[0]);
+    if (!res.superseded && res.json?.results?.[0]) showTruncatedNotice(res.json.results[0], canvasCapNotice(state.nodeCeiling, scopeNodeTotal));
   } catch (e) { /* network hiccup -- leave whatever's on screen alone */ }
   return ok;
 }
@@ -3063,6 +3081,42 @@ function applyCatchUpPill(event) {
    is already handled by loadFullGraph/mergeGraphElements (it auto-picks a
    "light", non-disruptive settle when only a small fraction of the graph
    changed), so a reindex event just re-triggers a normal load. */
+/* ── Live refresh ── */
+/* A save publishes "reindexed", and an open tab used to refetch its whole
+   view for every one. Live refreshes are coalesced instead: the first event
+   starts a timer and later ones join it, so the view refetches at most once
+   per window, never two at a time, and an event during a refresh queues one
+   more. A view whose scope is larger than the canvas cap waits longer. */
+const LIVE_REFRESH_DELAY_MS = 1500;
+const LIVE_REFRESH_LARGE_DELAY_MS = 15000;
+let liveRefreshTimer = null;
+let liveRefreshRunning = false;
+let liveRefreshPending = false;
+function liveRefreshDelay() {
+  return scopeNodeTotal > CANVAS_NODE_CAP ? LIVE_REFRESH_LARGE_DELAY_MS : LIVE_REFRESH_DELAY_MS;
+}
+function scheduleLiveRefresh() {
+  if (liveRefreshTimer !== null) return;
+  liveRefreshTimer = setTimeout(runLiveRefresh, liveRefreshDelay());
+}
+async function runLiveRefresh() {
+  liveRefreshTimer = null;
+  if (liveRefreshRunning) { liveRefreshPending = true; return; }
+  liveRefreshRunning = true;
+  try {
+    if (neo4jConnected) {
+      /* a rescan is also what applies a changed schema file, so reload the
+         types first: the pending hint clears and new labels get their rows
+         and colours before the graph that contains them is drawn. */
+      await loadSchemaTypes(document.getElementById("repoSelect").value);
+      await refreshGraph();
+    }
+  } finally {
+    liveRefreshRunning = false;
+  }
+  if (liveRefreshPending) { liveRefreshPending = false; scheduleLiveRefresh(); }
+}
+/* ── end Live refresh ── */
 function connectLiveEvents() {
   const es = new EventSource("/api/events");
   es.onmessage = async (e) => {
@@ -3081,15 +3135,12 @@ function connectLiveEvents() {
        that report a real diff, so a noisy/looping publisher on the backend
        can't turn this into a client-side request storm. */
     if (event.type === "reindexed" && (event.changed || event.deleted)) {
-      /* a rescan is also what applies a changed schema file, so reload the
-         types first: the pending hint clears and new labels get their rows
-         and colours before the graph that contains them is drawn. */
-      if (neo4jConnected) { await loadSchemaTypes(repo); refreshGraph(); }
+      if (neo4jConnected) scheduleLiveRefresh();
     } else if (event.type === "git_history_synced" && event.mode !== "noop") {
       loadGitHistory(repo);
     } else if (event.type === "insights_refreshed" && neo4jConnected) {
       // Refetching the graph also reloads insights and re-stamps community colours on existing nodes.
-      if (state.colorByCommunity) refreshGraph(); else loadInsights();
+      if (state.colorByCommunity) scheduleLiveRefresh(); else loadInsights();
     } else if (event.type === "registry_changed" && neo4jConnected) {
       populateRealRepos();
     }
@@ -3118,9 +3169,11 @@ const DESTRUCTIVE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP)\b/i;
    show part of a result as the whole of it. A later result that isn't capped
    clears the notice, and only the notice, never an error shown since. */
 let shownTruncatedNotice = null;
-function showTruncatedNotice(result) {
-  if (result.truncated) {
-    shownTruncatedNotice = `Showing the first ${result.data.length.toLocaleString()} rows: the query returned more. Add a LIMIT or narrow the MATCH.`;
+function showTruncatedNotice(result, capNotice) {
+  if (result.truncated || capNotice) {
+    shownTruncatedNotice = result.truncated
+      ? `Showing the first ${result.data.length.toLocaleString()} rows: the query returned more. Add a LIMIT or narrow the MATCH.`
+      : capNotice;
     cypherErrorEl.textContent = shownTruncatedNotice;
   } else if (shownTruncatedNotice !== null && cypherErrorEl.textContent === shownTruncatedNotice) {
     cypherErrorEl.textContent = "";
@@ -3175,7 +3228,7 @@ document.querySelectorAll('#linkOpenConfig').forEach(l => l.addEventListener("cl
    from Neo4j instead of just un-hiding elements that were never fetched. */
 document.getElementById("ctlNodeCeiling").addEventListener("input", e => { state.nodeCeiling = +e.target.value; document.getElementById("valNodeCeiling").textContent = e.target.value; applyState(); });
 document.getElementById("ctlRelCeiling").addEventListener("input", e => { state.relCeiling = +e.target.value; document.getElementById("valRelCeiling").textContent = e.target.value; applyState(); });
-document.getElementById("ctlNodeCeiling").addEventListener("change", () => { if (neo4jConnected) refreshGraph(undefined, true); });
+document.getElementById("ctlNodeCeiling").addEventListener("change", e => { nodeCeilingUncapped = +e.target.value >= +e.target.max; if (neo4jConnected) refreshGraph(undefined, true); });
 document.getElementById("ctlRelCeiling").addEventListener("change", () => { if (neo4jConnected) refreshGraph(undefined, true); });
 
 document.getElementById("layoutSelect").addEventListener("change", () => {
@@ -6019,13 +6072,15 @@ async function loadTopologyCounts() {
       const realTotal = Object.values(counts).reduce((a, b) => a + b, 0);
       document.getElementById("entityTotal").textContent = realTotal.toLocaleString();
       setRenderThresholdDefault(realTotal);
+      scopeNodeTotal = realTotal;
       const nodeSlider = document.getElementById("ctlNodeCeiling");
       const wasAtCeiling = +nodeSlider.value >= +nodeSlider.max;
       nodeSlider.max = realTotal;
       if (wasAtCeiling) {
-        nodeSlider.value = realTotal;
-        document.getElementById("valNodeCeiling").textContent = realTotal;
-        state.nodeCeiling = realTotal;
+        const seeded = seededNodeCeiling(realTotal);
+        nodeSlider.value = seeded;
+        document.getElementById("valNodeCeiling").textContent = seeded;
+        state.nodeCeiling = seeded;
       }
     }
     const relFilters = [];

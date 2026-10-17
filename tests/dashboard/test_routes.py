@@ -251,6 +251,34 @@ def test_cypher_graph_key_is_absent_for_an_unkeyable_node(client, seeded_graph):
         seeded_graph.run_cypher("MATCH (n:Scratch) DETACH DELETE n")
 
 
+def test_cypher_canvas_result_carries_only_what_the_canvas_draws(client, seeded_graph):
+    """The canvas's state query asks for `canvas: true`: nodes keep their name,
+    identity and community but not their documentation, relationships keep no
+    properties, and the row repeats no node, so a large view's payload stays
+    small. `matchedId` is kept: it is how the canvas tells n from m."""
+    seeded_graph.upsert_node(
+        "Function", "dash_repo_a", "handler",
+        {"file": "svc/api.py", "docstring_full": "x" * 5000, "insight_community": 3},
+    )
+    query = (
+        "MATCH (n) WHERE n.repo_id = 'dash_repo_a' "
+        "OPTIONAL MATCH (n)-[r]-(m) RETURN n, r, m, id(n) AS matchedId"
+    )
+    full = client.post("/api/cypher", json={"query": query}).json()["results"][0]
+    slim = client.post("/api/cypher", json={"query": query, "canvas": True}).json()["results"][0]
+    assert len(slim["data"]) == len(full["data"])
+    nodes = [n for row in slim["data"] for n in row["graph"]["nodes"]]
+    handler = next(n for n in nodes if n["properties"].get("name") == "handler")
+    assert handler["properties"] == {
+        "name": "handler", "repo_id": "dash_repo_a", "file": "svc/api.py", "owner": "", "insight_community": 3
+    }
+    assert handler["key"] == "Function\x1fdash_repo_a\x1fhandler\x1fsvc/api.py"
+    assert all(rel["properties"] == {} for row in slim["data"] for rel in row["graph"]["relationships"])
+    assert all(row["row"][:3] == [None, None, None] for row in slim["data"])
+    assert sorted(row["row"][3] for row in slim["data"]) == sorted(row["row"][3] for row in full["data"])
+    assert "docstring_full" not in str(slim)
+
+
 def test_cypher_endpoint_reports_errors_without_raising(client):
     res = client.post("/api/cypher", json={"query": "NOT VALID CYPHER"})
     assert res.status_code == 200

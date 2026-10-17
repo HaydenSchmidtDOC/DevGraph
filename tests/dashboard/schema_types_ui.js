@@ -31,6 +31,7 @@ const fnSrc = [
   grab(/^function relSelector\(/m, "\n}"),
   grab(/^let schemaRequestSeq = 0;/m, "\n}"),   // the sequence counter and loadSchemaTypes
   grab(/^\/\* ── Catch-up pill ── \*\//m, "/* ── end Catch-up pill ── */"),  // the live handler and repo switch update the pill
+  grab(/^\/\* ── Live refresh ── \*\//m, "/* ── end Live refresh ── */"),  // reindex events refresh through it
   grab(/^function connectLiveEvents\(/m, "\n}"),
   grab(/^function refreshIsolateUI\(/m, "\n}"),
   grab(/^function escapeCypherStr\(/m, "\n"),
@@ -147,6 +148,8 @@ let eventSource = null;
 let order = [];
 let refreshes = 0, isolations = 0, styleUpdates = 0;
 const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 100, relCeiling: 100 };
+const timers = [];
+const runTimers = async () => { while (timers.length) await timers.shift()(); };
 const globals = {
   document, state, console, brightCache: {},
   entityCounts: els.entityCounts, relTypes: els.relTypes,
@@ -170,6 +173,8 @@ const globals = {
   isolateChanged: () => { isolations++; },
   cy: { style: () => ({ update: () => { styleUpdates++; } }) },
   configModel: null, loadConfigPage: () => {},  // the Config page's live refresh, idle until it is opened
+  CANVAS_NODE_CAP: 1500, scopeNodeTotal: 0,
+  setTimeout: fn => { timers.push(fn); return timers.length; },  // live refreshes wait; runTimers fires them
 };
 const api = new Function(...Object.keys(globals),
   tablesSrc + "\n" + fnSrc +
@@ -366,6 +371,7 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
   order = [];
   const fetchesBefore = fetchCalls.length;
   await eventSource.onmessage({ data: JSON.stringify({ type: "reindexed", repo_id: "waiting", changed: 2, deleted: 0 }) });
+  await runTimers();
   check("a reindex event reloads the current repo's schema",
     fetchCalls.slice(fetchesBefore).includes("/api/repos/waiting/schema"), JSON.stringify(fetchCalls.slice(fetchesBefore)));
   check("...and then refreshes the graph", order.join() === "refreshGraph", order.join());

@@ -94,6 +94,9 @@ _CONSOLE_TIMEOUT_S = 60.0
 _CONSOLE_MAX_ROWS = 50_000
 _PREVIEW_TIMEOUT_S = 5.0
 _PREVIEW_MAX_ROWS = 5_000
+# What a `canvas: true` console result keeps of each node: what the canvas
+# draws and keys on. The inspector fetches the rest on click.
+_CANVAS_NODE_PROPERTIES = ("name", "repo_id", "file", "owner", "insight_community")
 # History window bounds for `/database-stats/history`: at least one minute,
 # at most what the in-memory ring buffer holds (one hour).
 _HISTORY_SECONDS_MIN = 60
@@ -118,6 +121,29 @@ _CONFIG_ERROR_STATUS = {
 # How much of the graph-insights summary the Community card shows.
 _INSIGHT_COMMUNITY_LIMIT = 8
 _INSIGHT_LIST_LIMIT = 6
+
+
+def _canvas_result(result: dict[str, Any]) -> dict[str, Any]:
+    """A console result cut down to what the canvas draws: node properties
+    limited to `_CANVAS_NODE_PROPERTIES`, no relationship properties, and the
+    row's node and relationship values (repeats of the graph's) dropped.
+    Scalars such as `matchedId` are kept."""
+    data = []
+    for item in result["data"]:
+        graph = item["graph"]
+        data.append({
+            "row": [None if isinstance(value, dict) else value for value in item["row"]],
+            "graph": {
+                "nodes": [
+                    {**node, "properties": {
+                        k: node["properties"][k] for k in _CANVAS_NODE_PROPERTIES if k in node["properties"]
+                    }}
+                    for node in graph["nodes"]
+                ],
+                "relationships": [{**rel, "properties": {}} for rel in graph["relationships"]],
+            },
+        })
+    return {**result, "data": data}
 
 
 def _reject_cross_site(request: Request) -> None:
@@ -716,6 +742,9 @@ def build_router(
         behind the console's destructive-query confirm. Previews are never
         recorded.
 
+        `canvas: true` (the canvas's own state query) returns only what the
+        canvas draws (see `_canvas_result`), not every property twice over.
+
         Both are bounded: a server-side transaction timeout, after which the
         query is stopped and a plain `Timeout` error says so, and a row cap,
         past which the rest is dropped and the result says `truncated`.
@@ -728,6 +757,7 @@ def build_router(
         repo_id = payload.get("repo_id")
         preview = bool(payload.get("preview"))
         should_record = bool(payload.get("record")) and not preview
+        canvas = bool(payload.get("canvas"))
         run = engine.preview_cypher_graph if preview else engine.run_cypher_graph
         timeout_s = _PREVIEW_TIMEOUT_S if preview else _CONSOLE_TIMEOUT_S
         max_rows = _PREVIEW_MAX_ROWS if preview else _CONSOLE_MAX_ROWS
@@ -752,7 +782,7 @@ def build_router(
             query_log.record(
                 repo_id=repo_id, query=query, duration_ms=(time.monotonic() - start) * 1000, ok=True
             )
-        return {"results": [result], "errors": []}
+        return {"results": [_canvas_result(result) if canvas else result], "errors": []}
 
     @router.get("/database-stats")
     def database_stats() -> dict[str, Any]:
