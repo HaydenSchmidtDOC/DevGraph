@@ -5,6 +5,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import git as git_pkg
 import pytest
@@ -14,6 +15,7 @@ from devgraph.indexer import symbols
 from devgraph.indexer.dispatch import _CODE_ROUTES
 from devgraph.indexer.git_history import compare
 from devgraph.indexer.git_history.compare import CompareError, open_comparison, symbol_detail
+from tests.helpers import stub
 from tests.indexer.git_compare_helpers import (
     commit_files,
     git,
@@ -481,12 +483,17 @@ def test_diff_entry_cap_and_deadline(tmp_path, monkeypatch):
     assert changes == []
     assert cmp.truncated_reasons == ["deadline"]
 
-    if sys.platform != "win32":
+    def merge_base_kwargs():
         calls = record_git_commands(monkeypatch)
         changes, cmp = changes_of(repo, clock=clock_from(0.0, compare._COMPARE_DEADLINE_S - 0.2))
         assert len(changes) == 5 and cmp.truncated_reasons == []
-        index = next(i for i, c in enumerate(calls) if subcommand(c) == "merge-base")
-        assert calls.kwargs[index]["kill_after_timeout"] == 1
+        return calls.kwargs[next(i for i, c in enumerate(calls) if subcommand(c) == "merge-base")]
+
+    if sys.platform != "win32":  # GitPython refuses kill_after_timeout on Windows
+        assert merge_base_kwargs()["kill_after_timeout"] == 1
+    # As on Windows, simulated everywhere: the merge base is found without one.
+    monkeypatch.setattr(compare, "sys", SimpleNamespace(platform="win32"))
+    assert "kill_after_timeout" not in merge_base_kwargs()
 
 
 # --- Task 2: symbols at both refs (C3, C5 per-file caps, C6) ---
@@ -1069,7 +1076,7 @@ def test_a_stray_value_error_is_not_a_missing_object(tmp_path, monkeypatch):
     def boom(old, new):
         raise ValueError("a bug, not git")
 
-    monkeypatch.setattr(compare, "diff_symbols", boom)
+    stub(monkeypatch, compare, "diff_symbols", boom)
     with pytest.raises(ValueError, match="a bug, not git") as err:
         detail(repo)
     assert not isinstance(err.value, CompareError)

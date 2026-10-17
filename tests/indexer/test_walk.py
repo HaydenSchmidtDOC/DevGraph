@@ -16,6 +16,7 @@ from devgraph.indexer.walk import (
     links_outside,
 )
 from devgraph.paths import is_within
+from tests.helpers import stub
 
 
 def test_ignored_dir_names_cover_venvs_build_output_and_worktrees():
@@ -163,13 +164,76 @@ def test_keyed_indexable_paths_resolves_the_root_once_and_only_links(tmp_path, m
     assert all(p in (repo, repo / "link.md") for p in resolved), resolved
 
 
-def _junction(link, target):
+def _real_junction(link, target):
     # mklink /J needs no admin rights or Developer Mode, unlike a symlink.
     subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
 
 
+class _JunctionEntry:
+    """A scandir entry for a simulated junction: a directory entry, as Windows
+    reports one, whose target is a real symlink's."""
+
+    def __init__(self, entry):
+        self._entry = entry
+
+    def __getattr__(self, name):
+        return getattr(self._entry, name)
+
+    def is_dir(self, *, follow_symlinks=True):
+        return True
+
+    def is_file(self, *, follow_symlinks=True):
+        return False
+
+    def is_symlink(self):
+        return False
+
+    def is_junction(self):
+        return True
+
+
+class _JunctionScandir:
+    def __init__(self, it, junctions):
+        self._it, self._junctions = it, junctions
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._it.close()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        entry = next(self._it)
+        return _JunctionEntry(entry) if Path(entry.path) in self._junctions else entry
+
+
+def _simulate_junctions(monkeypatch):
+    """Report the symlinked directories added to the returned set as Windows
+    reports junctions: to os.scandir (the walk, and rglob through glob) and to
+    Path.is_junction/is_symlink. The links still resolve to their targets."""
+    import glob
+
+    junctions = set()
+    real_scandir, real_is_junction, real_is_symlink = os.scandir, Path.is_junction, Path.is_symlink
+
+    def scandir(path="."):
+        return _JunctionScandir(real_scandir(path), junctions)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    monkeypatch.setattr(glob._StringGlobber, "scandir", staticmethod(scandir))
+    monkeypatch.setattr(Path, "is_junction", lambda self: self in junctions or real_is_junction(self))
+    monkeypatch.setattr(Path, "is_symlink", lambda self: self not in junctions and real_is_symlink(self))
+    return junctions
+
+
 @pytest.fixture
-def junction_tree(tmp_path):
+def junction_tree(tmp_path, monkeypatch):
+    """A repository with junctions into itself, into an ignored directory and out
+    of it: real ones on Windows, simulated elsewhere, so the walk's junction
+    handling runs on every platform."""
     repo = tmp_path / "repo"
     for rel in ("docs/a.md", "docs/deep/b.md", "vendor/v.md", "src/x.py"):
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -177,16 +241,21 @@ def junction_tree(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret.md").write_text("secret")
-    links = [repo / "docs-j", repo / "vendor-j", repo / "out-j"]
-    _junction(links[0], repo / "docs")
-    _junction(links[1], repo / "vendor")
-    _junction(links[2], outside)
+    links = {repo / "docs-j": repo / "docs", repo / "vendor-j": repo / "vendor", repo / "out-j": outside}
+    if os.name == "nt":
+        for link, target in links.items():
+            _real_junction(link, target)
+        yield repo
+        for link in links:
+            os.rmdir(link)  # removes the junction only, never its target's contents
+        return
+    junctions = _simulate_junctions(monkeypatch)
+    for link, target in links.items():
+        link.symlink_to(target, target_is_directory=True)
+        junctions.add(link)
     yield repo
-    for link in links:
-        os.rmdir(link)  # removes the junction only, never its target's contents
 
 
-@pytest.mark.skipif(os.name != "nt", reason="junctions are Windows-only")
 def test_junctions_are_walked_as_rglob_walks_them_and_keyed_by_target(junction_tree):
     repo = junction_tree
     assert (repo / "docs-j").is_junction() and not (repo / "docs-j").is_symlink()
@@ -211,7 +280,6 @@ def test_junctions_are_walked_as_rglob_walks_them_and_keyed_by_target(junction_t
     assert not any(path.is_relative_to(repo / "out-j") for path, _ in keyed)
 
 
-@pytest.mark.skipif(os.name != "nt", reason="junctions are Windows-only")
 def test_a_junction_out_of_the_repository_is_not_followed(junction_tree):
     repo = junction_tree
     paths = indexable_paths(repo)
@@ -241,11 +309,10 @@ class _FakeEngine:
         return 0
 
 
-@pytest.mark.skipif(os.name != "nt", reason="junctions are Windows-only")
 def test_prune_stale_files_tolerates_a_junction_out_of_the_repository(junction_tree, monkeypatch):
     repo = junction_tree
     removed = []
-    monkeypatch.setattr(dispatch, "remove_paths", lambda engine, repo_id, root, paths: removed.append(paths) or len(paths))
+    stub(monkeypatch, dispatch, "remove_paths", lambda engine, repo_id, root, paths: removed.append(paths) or len(paths))
     engine = _FakeEngine({"docs/a.md", "docs/deep/b.md", "src/x.py", "gone.md"})
 
     assert dispatch.prune_stale_files(engine, "r", repo) == 1
