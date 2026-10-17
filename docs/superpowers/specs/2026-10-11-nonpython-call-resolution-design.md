@@ -116,8 +116,19 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   `Core/Core.csproj`. Nothing is evaluated: an `<Import>` is not
   followed, an item under a `Condition` counts as if the condition held,
   and a name or path holding `$(`, `@(`, `%(` or a wildcard (`*`, `?`) is
-  left out (a `$(MSBuildThisFileDirectory)` reference too). `ImplicitUsings` (only `System.*` and
-  `Microsoft.*`) and `RootNamespace` are not read.
+  left out (a `$(MSBuildThisFileDirectory)` reference too). `RootNamespace`
+  is not read. `ImplicitUsings` is (index format 19): when the last
+  `<ImplicitUsings>` of the nearest Directory.Build.props, the project
+  file and the nearest Directory.Build.targets (MSBuild reads every
+  property before any item) is `enable` or `true`, the global usings the
+  project file's `Sdk` implies come before its `<Using>` items, so a
+  `<Using Remove>` removes one: Microsoft.NET.Sdk's `System`,
+  `System.Collections.Generic`, `System.IO`, `System.Linq`,
+  `System.Net.Http`, `System.Threading` and `System.Threading.Tasks`;
+  Microsoft.NET.Sdk.Worker adds `Microsoft.Extensions.Configuration`,
+  `.DependencyInjection`, `.Hosting` and `.Logging`; Microsoft.NET.Sdk.Web
+  those and `System.Net.Http.Json` and `Microsoft.AspNetCore.Builder`,
+  `.Hosting`, `.Http` and `.Routing`. Another SDK adds none.
   A file's *head* is read from its start, at most its first 32 KiB, for as
   long as it holds only whitespace, comments, preprocessor lines (`#if`,
   `#region`, `#nullable`, ...), `extern alias` and using directives, global
@@ -140,10 +151,12 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   as usings of the file (see the C# section); the legacy
   `csharp/extractor.py` indexing entry point reads the repository's
   projects too, and `symbols.EXTRACTORS` needs none (it keeps nodes only,
-  whose match keys come from the file's text). `ImplicitUsings` stays
-  unread: it adds only `System.*` and `Microsoft.*` namespaces, which hold
-  no repository type (if it is ever read, it is one more `<PropertyGroup>`
-  input of the digest).
+  whose match keys come from the file's text). Each project and
+  Directory.Build file's `Sdk` and `ImplicitUsings` are inputs of the
+  digest too. The implicit usings are `System.*` and `Microsoft.*`
+  namespaces, left out at a site unless its own namespace is under the
+  same root (see the C# section), so they matter mostly in the
+  framework's own repositories.
 
 Fresh is then extract(text, configuration), and an incremental run re-extracts
 every dependent when the configuration changes.
@@ -709,7 +722,7 @@ declares an `M` itself.
 project's own type beside a referenced one, which C# prefers with warning
 CS0436) both link. A key group over the cap links by class file
 name, as before match keys, and is not tiered (see Shadow tiers).
-`ImplicitUsings` is not read. An extension method is keyed by its `this`
+An extension method is keyed by its `this`
 parameter's type's simple name (`Ns:+T`), or by a type parameter's first
 constraint naming a type (`this T x where T : class, IRepo`: `+IRepo`); a
 receiver typed with a class implementing that interface (`Repo r;

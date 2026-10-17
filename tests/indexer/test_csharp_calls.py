@@ -854,6 +854,22 @@ def test_a_project_using_under_the_files_own_library_root_stays_a_candidate(tmp_
     assert not any(key.startswith("Microsoft.") for key in elsewhere)
 
 
+def test_an_implicit_using_under_the_files_own_library_root_is_a_candidate(tmp_path):
+    """A Web project with `ImplicitUsings` enabled has the SDK's usings
+    (Microsoft.AspNetCore.Routing among them) in scope, which count only
+    where the site's own namespace is under the same root."""
+    (tmp_path / "Http").mkdir()
+    (tmp_path / "Http" / "Http.csproj").write_text(
+        '<Project Sdk="Microsoft.NET.Sdk.Web"><PropertyGroup><ImplicitUsings>enable</ImplicitUsings>'
+        "</PropertyGroup></Project>"
+    )
+    config = ResolverConfig(tmp_path)
+    source = "namespace Microsoft.AspNetCore.Http;\nclass E { void Run() { RouteData.Make(); } }\n"
+    assert "Microsoft.AspNetCore.Routing:RouteData" in _call_keys(source, "Run", "Make", "Http/E.cs", config)
+    elsewhere = _call_keys(source.replace("Microsoft.AspNetCore.Http", "Shop"), "Run", "Make", "Http/E.cs", config)
+    assert not any(key.startswith(("Microsoft.", "System.")) for key in elsewhere)
+
+
 def test_an_extension_on_a_constrained_type_parameter_skips_constraints_naming_no_type():
     keys = _mkeys("""
         namespace Shop

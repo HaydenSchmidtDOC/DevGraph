@@ -97,9 +97,9 @@ Known scope cuts (documented, not silently dropped):
     class) are not modeled — there's no enclosing Function/Class to attach
     CALLS to, and this is a rare style in mid-size/library code, which is
     what the golden-repo parity bar targets.
-  - `ImplicitUsings` is not read (only System.* and Microsoft.*
-    namespaces), nor is a `<ProjectReference>`'s `Condition` or `$(...)`
-    evaluated (resolver_config).
+  - A `<ProjectReference>`'s `Condition` or `$(...)` is not evaluated
+    (resolver_config); `ImplicitUsings` is read for Microsoft.NET.Sdk and
+    its Web and Worker SDKs only.
 """
 
 from __future__ import annotations

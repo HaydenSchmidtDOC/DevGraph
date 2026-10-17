@@ -338,18 +338,26 @@ TS_CONFIGS = {
 # The C# projects' versions: cs/ is a project (of one or two .csproj
 # files), cs/Models a nested one when its .csproj exists, and the nearest
 # Directory.Build.props/.targets wrap their `<Using>` items (cs/Models' own
-# props shadowing the root one). scripts/ is under no project.
+# props shadowing the root one, or enabling `ImplicitUsings`, as cs/'s Web
+# SDK project may). scripts/ is under no project.
 CS_PROJECT = '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n{}  </ItemGroup>\n</Project>\n'
 CS_CONFIGS = {
     "cs/Shop.csproj": [
         CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop.Models" />\n'),
         CS_PROJECT.format('    <Using Include="Shop.Jobs" Static="true" />\n    <Using Include="Shop.Jobs" Alias="J" />\n'),
         CS_PROJECT.format('    <Using Remove="Shop" />\n    <Using Include="Shop.App" />\n'), None,
+        # The Web SDK's implicit usings, one of them removed.
+        CS_PROJECT.replace("Microsoft.NET.Sdk", "Microsoft.NET.Sdk.Web").format(
+            '    <Using Remove="System.Linq" />\n').replace(
+            "<ItemGroup>", "<PropertyGroup>\n    <ImplicitUsings>enable</ImplicitUsings>\n  </PropertyGroup>\n  <ItemGroup>"),
     ],
     "cs/Shop.Tests.csproj": [None, CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop.Tests" />\n')],
     "cs/Models/Models.csproj": [None, CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop" />\n')],
     "Directory.Build.props": [None, CS_PROJECT.format('    <Using Include="Shop" />\n')],
-    "cs/Models/Directory.Build.props": [None, CS_PROJECT.format('    <Using Include="Shop.Text" />\n')],
+    "cs/Models/Directory.Build.props": [
+        None, CS_PROJECT.format('    <Using Include="Shop.Text" />\n'),
+        "<Project>\n  <PropertyGroup>\n    <ImplicitUsings>enable</ImplicitUsings>\n  </PropertyGroup>\n</Project>\n",
+    ],
     "cs/Directory.Build.targets": [None, CS_PROJECT.format('    <Using Remove="Shop.Models" />\n')],
 }
 # A C# file's `global using`s, with what may come before one in a file's
