@@ -185,18 +185,12 @@ def _routed_by_index_single_path(root, path, docs_root, mentions_enabled):
     """Whether `index_paths` writes anything for this file through a built-in
     extractor: `_index_single_path` on its resolved path, with a mock graph."""
     resolved = path.resolve()
-    lists = {name: [] for name in (
-        "py_files", "js_files", "cs_files", "cpp_files", "java_files", "rs_files", "kt_files", "docs_files", "mention_files",
-    )}
-    extractions = {name: {} for name in (
-        "py_extractions", "js_extractions", "cs_extractions", "cpp_extractions", "java_extractions",
-        "rs_extractions", "kt_extractions", "go_extractions",
-    )}
-    return dispatch._index_single_path(
-        MagicMock(), "r", root, resolved, resolved.relative_to(root.resolve()).as_posix(),
-        docs_root, mentions_enabled, config=None, batch_services=set(), mounts=dispatch._Mounts(MagicMock(), "r"),
-        **lists, **extractions,
-    ) > 0
+    with dispatch._Extractions() as extractions:
+        return dispatch._index_single_path(
+            MagicMock(), "r", root, resolved, resolved.relative_to(root.resolve()).as_posix(),
+            docs_root, mentions_enabled, config=None, extractions=extractions, docs_files=[], mention_files=[],
+            batch_services=set(), mounts=dispatch._Mounts(MagicMock(), "r"),
+        ) > 0
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")

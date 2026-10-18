@@ -1598,3 +1598,59 @@ def test_cs_rekey_ops_retract_callers_in_other_files(engine, repo_id, tmp_path, 
             assert any(retracted), f"{description}: no edge from another file retracted"
         check(engine, repo_id, root, "scripted", step, [description])
 
+
+
+def test_pass_two_skipping_a_batch_files_node_writes_leaves_the_same_graph(engine, repo_id, tmp_path, monkeypatch):
+    """index_paths' pass 2 writes a batch file's edges again but not its nodes
+    (dispatch `_Extractions`): every step leaves the graph a second repository
+    gets when pass 2 writes every file's nodes again too, as it used to, after
+    a full scan, random batches, and a full scan over the changed graph."""
+    old = f"{repo_id}_fresh"  # deleted with repo_id by the fixture
+    real_add = dispatch._Extractions.add
+
+    def every_file_late(self, lang, rel_path, nodes, rels, content=None):
+        self.late = True
+        return real_add(self, lang, rel_path, nodes, rels, content)
+
+    def both(run):
+        run(repo_id)
+        with monkeypatch.context() as m:
+            stub(m, dispatch._Extractions, "add", every_file_late)
+            run(old)
+        actual, expected = graph_snapshot(engine, repo_id), graph_snapshot(engine, old)
+        assert actual[0], "the fixture should produce nodes"
+        if actual != expected:
+            pytest.fail(snapshot_diff(expected, actual))
+
+    rng = random.Random(5)
+    fuzz = Fuzz(rng)
+    root = tmp_path
+    fuzz.write(root, set(fuzz.files))
+    provision_repository_schema(engine, root)
+    for each in (repo_id, old):
+        engine.upsert_repository(each, each, str(root))
+    both(lambda rid: full_scan(engine, rid, root, docs_path=DOCS, mentions_enabled=True))
+    for _step in range(6):
+        fuzz.moved_notes, fuzz.removed_dirs, fuzz.dir_only = [], [], []
+        ops = [fuzz.draw() for _ in range(rng.randint(1, 3))]
+        touched = set().union(*(paths for _desc, paths in ops))
+        fuzz.write(root, touched)
+        folders = {d for d in fuzz.removed_dirs if not any(p.startswith(d + "/") for p in fuzz.files)}
+        for folder in sorted(folders, reverse=True):
+            if (root / folder).is_dir() and not any((root / folder).iterdir()):
+                (root / folder).rmdir()
+        touched -= {rel for rel in touched if rel not in fuzz.files and any(
+            rel.startswith(d + "/") for d in fuzz.dir_only if d in folders)}
+        gone = {rel for rel in touched if rel not in fuzz.files}
+
+        def batch(rid, gone=gone, changed=touched - gone, folders=folders, touched=touched):
+            if gone or folders:
+                remove_paths(engine, rid, root, {root / rel for rel in gone | folders}, docs_path=DOCS,
+                             mentions_enabled=True)
+            if changed:
+                index_paths(engine, rid, root, {root / rel for rel in changed}, docs_path=DOCS, mentions_enabled=True)
+            sync_resolver_config(engine, rid, root, {root / rel for rel in touched | folders}, docs_path=DOCS,
+                                 mentions_enabled=True)
+
+        both(batch)
+    both(lambda rid: full_scan(engine, rid, root, docs_path=DOCS, mentions_enabled=True))
