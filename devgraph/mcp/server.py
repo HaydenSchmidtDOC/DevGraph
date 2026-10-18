@@ -632,8 +632,10 @@ def build_server(
         modified_within_commits: int | None = None,
     ) -> dict[str, Any]:
         """Search for components by name/description; returns {count, results, truncated},
-        each result with name, labels, repo_id, description and file. Ranked: exact name,
-        then name prefix, then name substring, then description only. count is the true
+        each result with name, labels, repo_id, description and file. Ranked: the whole
+        query as the exact name, then the same ignoring case, then names starting with
+        or containing the whole query, then names equal to, starting with or containing
+        one of its words (run_cypher before run), then description only. count is the true
         number of matches, unless count_is_lower_bound is true (exact and prefix matches
         alone filled max_results). max_results is capped at 200. A snake_case query such as
         user_service also matches as a whole word. An exact name in unusual case (gEt for

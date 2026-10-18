@@ -312,8 +312,10 @@ def search_component(
         stopword-filtered — multi-word natural-language queries match any token,
         not the whole phrase — and the whole query and each of its words
         (underscores kept, so `user_service`) are terms too. Results are ranked:
-        exact name match > name starts-with > name contains > description
-        contains. At most `SEARCH_MAX_RESULTS` results are returned.
+        the whole query as the exact name > the same ignoring case > name starts
+        with the whole query > name contains it > name equal to one of its terms
+        (`run` for `run_cypher`) > name starts with a term > name contains one >
+        description contains one. At most `SEARCH_MAX_RESULTS` results are returned.
     """
     _at_least(1, max_results=max_results, modified_within_commits=modified_within_commits)
     max_results = min(max_results, SEARCH_MAX_RESULTS)
@@ -327,7 +329,7 @@ def search_component(
     )
     rows, count, lower_bound = ranked_search(
         engine, labels, tokens, _name_variants(query, tokens), max_results,
-        repo_id=None if cross_repo else repo_id, cutoff=cutoff,
+        repo_id=None if cross_repo else repo_id, cutoff=cutoff, query=query,
     )
     envelope = _envelope([{k: v for k, v in row.items() if k != "id"} for row in rows], max_results)
     envelope["count"] = count
@@ -351,12 +353,16 @@ def _search_terms(query: str) -> list[str]:
     whole = [query.strip().lower(), *(w.lower() for w in re.findall(r"[A-Za-z0-9_]+", query))]
     return list(dict.fromkeys([*_search_tokens(query), *(t for t in whole if t)]))
 
-# Rank of a matching node: exact name, name starts with a term, name contains
-# one, description only.
+# Rank of a matching node: the whole query as its name (`$exact`, trimmed),
+# the same ignoring case (`$whole`, lower-cased), a name starting with or
+# containing the whole query, a name equal to one of its terms (`run` for
+# `run_cypher`), starting with or containing a term, description only.
 _SEARCH_TIER = (
-    "CASE WHEN toLower(n.name) IN $terms THEN 0 "
-    "WHEN any(t IN $terms WHERE toLower(n.name) STARTS WITH t) THEN 1 "
-    "WHEN any(t IN $terms WHERE toLower(n.name) CONTAINS t) THEN 2 ELSE 3 END"
+    "CASE WHEN n.name = $exact THEN 0 WHEN toLower(n.name) = $whole THEN 1 "
+    "WHEN toLower(n.name) STARTS WITH $whole THEN 2 WHEN toLower(n.name) CONTAINS $whole THEN 3 "
+    "WHEN toLower(n.name) IN $terms THEN 4 "
+    "WHEN any(t IN $terms WHERE toLower(n.name) STARTS WITH t) THEN 5 "
+    "WHEN any(t IN $terms WHERE toLower(n.name) CONTAINS t) THEN 6 ELSE 7 END"
 )
 _SEARCH_FILE = "CASE WHEN coalesce(n.file, '') <> '' THEN n.file ELSE coalesce(n.path, n.source_file, n.source) END"
 _SEARCH_ROW = (
@@ -399,9 +405,12 @@ def ranked_search(
     limit: int,
     repo_id: str | None,
     cutoff: Any = None,
+    query: str = "",
 ) -> tuple[list[dict], int, bool]:
     """Nodes of `labels` whose name or description contains a (lower-case) term,
-    best first: exact name, name prefix, name substring, description only.
+    best first (`_SEARCH_TIER`): `query` itself as the name, then ignoring case,
+    then a name starting with or containing `query`, then a name equal to,
+    starting with or containing a term, description only.
 
     Names that start with one of `names` are found first through the
     `(repo_id, name)` indexes. Only when they don't fill `limit` does a substring
@@ -412,7 +421,11 @@ def ranked_search(
     scope = "n.repo_id = $repo_id" if repo_id is not None else _cross_scope("n")
     if cutoff is not None:
         scope += " AND n.last_modified_at >= $cutoff"
-    params: dict[str, Any] = {"repo_id": repo_id, "terms": terms, "names": names, "cutoff": cutoff}
+    exact = query.strip()
+    params: dict[str, Any] = {  # an empty query (None) matches no whole-query tier
+        "repo_id": repo_id, "terms": terms, "names": names, "cutoff": cutoff,
+        "exact": exact or None, "whole": exact.lower() or None,
+    }
     order = (
         f"WITH n, {_SEARCH_TIER} AS tier, {_SEARCH_FILE} AS file "
         "ORDER BY tier, n.name, file IS NULL, file, elementId(n)\n"
@@ -435,7 +448,7 @@ def ranked_search(
         {**params, "seen": [r["id"] for r in found], "fill": limit - len(found)},
     )
     row = rows[0] if rows else {"total": 0, "rest": []}
-    return _rank_search_results(found + row["rest"], terms), max(row["total"], len(found)), False
+    return _rank_search_results(found + row["rest"], terms, exact), max(row["total"], len(found)), False
 
 
 def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[str, ...]:
@@ -454,19 +467,33 @@ def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[s
     return tuple(node_type.label for node_type in effective.node_types)
 
 
-def _rank_search_results(results: list[dict], tokens: list[str]) -> list[dict]:
-    """Sort search rows: exact name match first, then name starts-with a token,
-    then name contains a token, then description-only matches last; by name and
-    file within a tier (no file last), as `ranked_search`'s queries order them."""
+def _rank_search_results(results: list[dict], tokens: list[str], query: str = "") -> list[dict]:
+    """Sort search rows in `_SEARCH_TIER`'s order: `query` as the exact name,
+    then ignoring case, then a name starting with or containing `query`, then a
+    name equal to, starting with or containing a token, then description-only
+    matches last; by name and file within a tier (no file last), as
+    `ranked_search`'s queries order them."""
+    exact = query.strip()
+    whole = exact.lower()
+
     def tier(row: dict) -> int:
-        name = (row.get("name") or "").lower()
-        if name in tokens:
+        raw = row.get("name") or ""
+        name = raw.lower()
+        if exact and raw == exact:
             return 0
-        if any(name.startswith(t) for t in tokens):
+        if whole and name == whole:
             return 1
-        if any(t in name for t in tokens):
+        if whole and name.startswith(whole):
             return 2
-        return 3
+        if whole and whole in name:
+            return 3
+        if name in tokens:
+            return 4
+        if any(name.startswith(t) for t in tokens):
+            return 5
+        if any(t in name for t in tokens):
+            return 6
+        return 7
     return sorted(
         results,
         key=lambda row: (tier(row), row.get("name") or "", row.get("file") is None, row.get("file") or ""),

@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 TOOL_CATALOG: list[dict[str, Any]] = [
-    {"name": "search_component", "identifier_kind": "name/description substring", "envelope": True, "phase": 1, "note": "exact name matches first, then prefixes, then substrings; each result has its file; count_is_lower_bound marks a count the substring scan never finished"},
+    {"name": "search_component", "identifier_kind": "name/description substring", "envelope": True, "phase": 1, "note": "the whole query as exact name first (then ignoring case), then names starting with or containing it, then names equal to, starting with or containing one of its words; each result has its file; count_is_lower_bound marks a count the substring scan never finished"},
     {"name": "list_recent_changes", "identifier_kind": "commit-count window (within_commits), optional entity_type label", "envelope": True, "phase": 3},
     {"name": "trace_request_flow", "identifier_kind": "endpoint name (\"GET /users/<id>\") or bare path (\"/users/<id>\", every method)", "envelope": False, "phase": 1},
     {"name": "get_service_dependencies", "identifier_kind": "service name", "envelope": False, "phase": 1},

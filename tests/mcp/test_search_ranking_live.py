@@ -170,3 +170,50 @@ def test_max_results_is_capped(seeded, tmp_path, monkeypatch):
     body = _call(seeded, tmp_path, monkeypatch, {"query": "get", "max_results": 100_000})
     assert len(body["results"]) == SEARCH_MAX_RESULTS
     assert body["count"] == FILLERS + 1 and body["truncated"] is True
+
+
+@pytest.fixture
+def tokens(engine):
+    """One `run_cypher` and one `get_user` behind twenty functions named after a
+    word of each (`run`, `cypher`, `Get`, `User`, `get`), which sort before them."""
+    repo = f"{REPO}_tokens"
+    nodes = [
+        {"label": "Function", "repo_id": repo, "name": name, "properties": {"file": f"m{i:02d}.py"}}
+        for name in ("run", "cypher", "Get", "User", "get")
+        for i in range(20)
+    ]
+    nodes += [
+        {"label": "Function", "repo_id": repo, "name": "run_cypher", "properties": {"file": "z/engine.py"}},
+        {"label": "Function", "repo_id": repo, "name": "run_cypher_batch", "properties": {"file": "z/engine.py"}},
+        {"label": "Function", "repo_id": repo, "name": "get_user", "properties": {"file": "z/users.py"}},
+        {"label": "Class", "repo_id": repo, "name": "Get_User", "properties": {"file": "z/models.py"}},
+    ]
+    engine.upsert_nodes(nodes)
+    yield engine, repo
+    engine.delete_repository(repo)
+
+
+def test_the_whole_query_outranks_names_equal_to_one_of_its_words(tokens, tmp_path, monkeypatch):
+    engine, repo = tokens
+    body = _call_repo(engine, repo, tmp_path, monkeypatch, {"query": "run_cypher"})
+    assert [r["name"] for r in body["results"][:3]] == ["run_cypher", "run_cypher_batch", "cypher"]
+    assert queries.search_components(engine, repo, "run_cypher", 5)[0]["name"] == "run_cypher"
+
+
+def test_an_exact_case_match_comes_before_a_case_insensitive_one(tokens, tmp_path, monkeypatch):
+    engine, repo = tokens
+    body = _call_repo(engine, repo, tmp_path, monkeypatch, {"query": "get_user"})
+    assert [r["name"] for r in body["results"][:2]] == ["get_user", "Get_User"]
+    body = _call_repo(engine, repo, tmp_path, monkeypatch, {"query": "Get_User"})
+    assert [r["name"] for r in body["results"][:2]] == ["Get_User", "get_user"]
+
+
+def test_rank_search_results_orders_by_the_whole_query_first():
+    from devgraph.mcp.tools import _rank_search_results, _search_terms
+
+    rows = [{"name": n, "file": "a.py"} for n in ("run", "Run_Cypher", "xrun_cypher", "running", "run_cypher_x", "run_cypher", "xcypher")]
+    rows.append({"name": "other", "file": "b.py", "description": "runs cypher"})
+    ranked = _rank_search_results(rows, _search_terms("run_cypher"), "run_cypher")
+    assert [r["name"] for r in ranked] == [
+        "run_cypher", "Run_Cypher", "run_cypher_x", "xrun_cypher", "run", "running", "xcypher", "other",
+    ]

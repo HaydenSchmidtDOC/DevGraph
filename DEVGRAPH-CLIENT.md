@@ -300,8 +300,11 @@ before assuming you've seen everything. `find_related_files`,
 `explain_architecture` and `impact_analysis` apply the same envelope to each
 of their list-valued fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
 `max_results` (default 15) to widen the sample when you genuinely need more
-than the default. `search_component` ranks exact name matches first, then
-name prefixes, then other substrings, then description-only matches; each
+than the default. `search_component` ranks the whole query as the exact name
+first (then the same name in other case), then names starting with or
+containing the whole query, then names equal to, starting with or containing
+one of its words (so `run_cypher` comes before the many functions named `run`),
+then description-only matches; each
 result carries its `file`, and a route's file-less handler stub is dropped
 when a real function of that name exists. Its `count` is the true number of
 matches, except when exact and prefix matches alone fill `max_results`: then
