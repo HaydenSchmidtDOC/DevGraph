@@ -18,8 +18,16 @@ import pytest
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer import dispatch
-from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
+from devgraph.indexer.dispatch import index_paths, remove_paths
 from tests.helpers import stub
+
+
+def full_scan(engine, repo_id, repo_root, **kwargs):
+    """`dispatch.full_scan` of a registered repository: registering creates
+    its Repository node first, and a full scan of a repository with none (a
+    removed one) scans nothing."""
+    engine.upsert_repository(repo_id, repo_id, str(repo_root))
+    return dispatch.full_scan(engine, repo_id, repo_root, **kwargs)
 
 
 @pytest.fixture
@@ -853,6 +861,7 @@ _SCAN_AND_EXPORT = textwrap.dedent(
     repo_root, repo_id = Path(sys.argv[1]), sys.argv[2]
     engine = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
     try:
+        engine.upsert_repository(repo_id, "scanned", str(repo_root))  # as registering does; one name for every seed
         full_scan(engine, repo_id, repo_root, docs_path="docs", mentions_enabled=True)
 
         def ident(labels, props):
