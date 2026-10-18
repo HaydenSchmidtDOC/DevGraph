@@ -17,7 +17,7 @@ from collections.abc import Callable
 from typing import Any
 
 from devgraph.config.project_schema import ProjectSchemaError, resolve_effective_schema, schema_file_hash
-from devgraph.indexer.dispatch import full_scan, full_scan_turn, index_outdated, schema_pending
+from devgraph.indexer.dispatch import full_scan, full_scan_elsewhere, full_scan_turn, index_outdated, schema_pending
 from devgraph.indexer.walk import RepoRootUnavailable
 
 logger = logging.getLogger(__name__)
@@ -82,6 +82,11 @@ class SchemaRescanScheduler:
             if not repo.watch_enabled:
                 continue
             try:
+                # Another process (`devgraph rescan`) is scanning it in full:
+                # its index reads as outdated until that scan restamps it, and
+                # the scan applies a changed schema too. Looked at again next pass.
+                if full_scan_elsewhere(self._engine, repo.repo_id):
+                    continue
                 # A never-indexed repo has no stamp either: its first scan
                 # (devgraph add / rescan, maybe running now) is left to them.
                 if repo.last_indexed and index_outdated(self._engine, repo.repo_id):
@@ -178,7 +183,7 @@ class SchemaRescanScheduler:
         the batch lock (the start catch-up or a registration scan); None then."""
         if not index_outdated(self._engine, repo.repo_id):
             return None
-        with full_scan_turn(repo.repo_id, lambda: self._waiting(repo.repo_id)):
+        with full_scan_turn(repo.repo_id, lambda: self._waiting(repo.repo_id), self._engine):
             if not index_outdated(self._engine, repo.repo_id):
                 return None  # upgraded by the scan this one waited for
             return self._rescan(repo)
@@ -194,7 +199,7 @@ class SchemaRescanScheduler:
         """Full-scan `repo` and, if its schema got applied, stamp the scan's
         start (W7). Returns (files indexed, applied)."""
         started = datetime.now(timezone.utc)
-        with full_scan_turn(repo.repo_id, lambda: self._waiting(repo.repo_id)):  # full_scan's own take is then at once
+        with full_scan_turn(repo.repo_id, lambda: self._waiting(repo.repo_id), self._engine):  # full_scan's own take is then at once
             count = full_scan(
                 self._engine, repo.repo_id, repo.path,
                 docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,

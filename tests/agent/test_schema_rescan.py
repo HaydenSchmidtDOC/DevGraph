@@ -47,6 +47,7 @@ class Clock:
 def setup(monkeypatch, tmp_path, *, valid=True):
     state = {"pending": True, "hash": "h1", "scans": [], "outdated": set()}
     monkeypatch.setattr(schema_rescan, "index_outdated", lambda e, r: r in state["outdated"])
+    monkeypatch.setattr(schema_rescan, "full_scan_elsewhere", lambda e, r: state.get("elsewhere"))
     monkeypatch.setattr(schema_rescan, "schema_pending", lambda e, r, p: state["pending"])
     monkeypatch.setattr(schema_rescan, "schema_file_hash", lambda p: state["hash"])
 
@@ -233,6 +234,24 @@ def test_the_stamp_is_the_scans_start_and_the_scan_runs_exclusively(monkeypatch,
     assert sched.run_once() == ["r"]
     assert exclusive == ["r"]
     assert registry.stamps == [T0]
+
+
+def test_a_full_scan_another_process_is_running_is_left_to_it(monkeypatch, tmp_path):
+    """`devgraph rescan` unstamps the index while it scans: an outdated index
+    with a fresh claim elsewhere is not scanned again, nor a pending schema;
+    once the claim is gone (finished, or stale after a crash) it is."""
+    state = setup(monkeypatch, tmp_path)
+    state["outdated"] = {"r"}
+    state["elsewhere"] = "4321@host/abcd1234"
+    clock = Clock()
+    sched = SchemaRescanScheduler(None, Registry([Repo("r", tmp_path)]), clock=clock)
+    assert sched.run_once() == []
+    state["outdated"] = set()
+    clock.now += 1000
+    assert sched.run_once() == [] and state["scans"] == []
+    state["outdated"] = {"r"}
+    state["elsewhere"] = None
+    assert sched.run_once() == ["r"] and state["scans"] == ["r"]
 
 
 def test_outdated_index_rescans_without_quiet_period(monkeypatch, tmp_path):

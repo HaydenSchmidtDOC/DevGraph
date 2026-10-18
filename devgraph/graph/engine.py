@@ -1814,6 +1814,66 @@ class GraphEngine:
                 repo_id=repo_id, version=version,
             )
 
+    def claim_full_scan(self, repo_id: str, owner: str, stale_s: float) -> str | None:
+        """Claim the repository's full scan for `owner` (see dispatch
+        `_claim_full_scan`): granted, returning None, when nobody holds it,
+        `owner` already does, or the holder's heartbeat is older than
+        `stale_s`; else the holder's name. The first SET takes the node's
+        write lock, so two processes' claims are decided one after the other.
+        Times are the database's clock, the one every process shares."""
+        with self._driver.session() as session:
+            records = _run_records(
+                session,
+                "MERGE (r:Repository {repo_id: $repo_id}) SET r.scan_claim_lock = true REMOVE r.scan_claim_lock "
+                "WITH r, r.scan_owner AS prior, timestamp() - coalesce(r.scan_heartbeat, 0) AS age "
+                "WITH r, prior, age, (prior IS NULL OR prior = $owner OR age > $stale_ms) AS granted "
+                "FOREACH (_ IN CASE WHEN granted THEN [1] ELSE [] END | "
+                "  SET r.scan_owner = $owner, r.scan_heartbeat = timestamp()) "
+                "RETURN granted, prior, age",
+                repo_id=repo_id, owner=owner, stale_ms=int(stale_s * 1000),
+            )
+        record = records[0]
+        if not record["granted"]:
+            return record["prior"]
+        if record["prior"] not in (None, owner):
+            logger.warning(
+                "%s: took over the full scan of %s, silent for %d s (stopped or crashed)",
+                repo_id, record["prior"], record["age"] // 1000,
+            )
+        return None
+
+    def beat_full_scan(self, repo_id: str, owner: str) -> None:
+        """Refresh `owner`'s full-scan claim heartbeat, if it still holds it."""
+        with self._driver.session() as session:
+            _run(
+                session,
+                "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.scan_owner = $owner SET r.scan_heartbeat = timestamp()",
+                repo_id=repo_id, owner=owner,
+            )
+
+    def release_full_scan(self, repo_id: str, owner: str) -> None:
+        """Drop `owner`'s full-scan claim, if it still holds it."""
+        with self._driver.session() as session:
+            _run(
+                session,
+                "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.scan_owner = $owner "
+                "REMOVE r.scan_owner, r.scan_heartbeat",
+                repo_id=repo_id, owner=owner,
+            )
+
+    def full_scan_holder(self, repo_id: str, stale_s: float) -> str | None:
+        """Who holds the repository's full-scan claim with a heartbeat at most
+        `stale_s` old, or None."""
+        with self._driver.session() as session:
+            records = _run_records(
+                session,
+                "MATCH (r:Repository {repo_id: $repo_id}) "
+                "WHERE r.scan_owner IS NOT NULL AND timestamp() - r.scan_heartbeat <= $stale_ms "
+                "RETURN r.scan_owner AS owner",
+                repo_id=repo_id, stale_ms=int(stale_s * 1000),
+            )
+        return records[0]["owner"] if records else None
+
     def read_resolver_config(self, repo_id: str) -> dict[str, dict]:
         """The resolver configuration fingerprints the repository's graph was
         built with, per language (see indexer/resolver_config.fingerprints);

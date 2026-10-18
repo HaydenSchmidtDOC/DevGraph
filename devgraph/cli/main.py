@@ -34,7 +34,7 @@ from devgraph.config.schema_findings import project_schema_findings as _project_
 from devgraph.dashboard import queries as dashboard_queries
 from devgraph.dashboard.url import dashboard_url, probe_dashboard
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
-from devgraph.indexer.dispatch import full_scan
+from devgraph.indexer.dispatch import full_scan, full_scan_elsewhere
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
 from devgraph.indexer.walk import TOO_LARGE, RepoRootUnavailable, check_repo_root, repo_root_problem
@@ -366,6 +366,9 @@ def rescan(
     non-zero exit and nothing changed; so is one with no indexable files
     while the graph has files for it, unless --force.
 
+    While another DevGraph process (usually the agent) is running a full
+    scan of the repository, the rescan says so and waits for it to finish.
+
     Args:
         repo_id: The repository ID to rescan.
     """
@@ -383,6 +386,16 @@ def rescan(
             try:
                 provision_repository_schema(engine, repo.path)
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
+                holder = full_scan_elsewhere(engine, repo_id)
+                if holder:
+                    # full_scan waits for it: scanning together, the two
+                    # deadlocked in Neo4j and did the work twice.
+                    console.print(
+                        f"[yellow]Another DevGraph process ({escape(holder)}), usually the agent, is already "
+                        f"running a full scan of {escape(repo_id)}.[/yellow] Waiting for it to finish, then "
+                        "rescanning; press Ctrl+C to stop waiting.",
+                        soft_wrap=True,
+                    )
                 started = datetime.now(timezone.utc)
                 skipped: dict[str, str] = {}
                 count = full_scan(
