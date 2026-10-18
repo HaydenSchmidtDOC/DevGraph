@@ -1296,8 +1296,10 @@ def test_pass_two_omits_name_refs(engine, repo_id, tmp_path, monkeypatch):
     a = write(tmp_path, "a.py", "def main():\n    return obj.helper()\n")
     calls = _spy(monkeypatch, GraphEngine, "upsert_nodes")
     index_paths(engine, repo_id, tmp_path, {a})
+    # Pass 2 writes no batch file's nodes now; any Module it does write (a
+    # referrer's) still leaves name_refs to pass 1.
     modules = [n for (nodes,) in calls for n in nodes if n["label"] == "Module"]
-    assert modules and not any("name_refs" in n["properties"] for n in modules)
+    assert not any("name_refs" in n["properties"] for n in modules)
     assert _module_name_refs(engine, repo_id, "a.py")[0] == [
         "CALLS\x1fFunction\x1fmain\x1fa.py\x1fFunction\x1fhelper\x1f\x1f=\x1f\x1fname\x1f\x1f\x1b"
     ]
