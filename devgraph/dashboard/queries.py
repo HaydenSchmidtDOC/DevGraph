@@ -100,8 +100,9 @@ def search_components(
 ) -> list[dict[str, Any]]:
     """Lightweight rows for the node browser's search box, best first.
 
-    Ranked the way `mcp.tools.search_component` ranks (`ranked_search`: exact
-    name, then name prefix, then substring, then description), over the same
+    Ranked the way `mcp.tools.search_component` ranks (`ranked_search`: the
+    query as the exact name, then ignoring case, then name prefix, then
+    substring, then description), over the same
     label set, for the whole query as one case-insensitive term, trimmed to
     the {id, name, label, file, owner} shape the dashboard actually renders
     (`owner`, the declarations a code symbol is in, tells same-named methods
@@ -115,7 +116,8 @@ def search_components(
     terms = [query.lower()]
     labels = _SEARCH_LABELS + tuple(label for label in project_labels or [] if label not in _SEARCH_LABELS)
     rows, _count, _lower_bound = ranked_search(
-        engine, labels, terms, _name_variants(query, terms), max(1, max_results), repo_id=repo_id
+        engine, labels, terms, _name_variants(query, terms), max(1, max_results), repo_id=repo_id,
+        query=query,
     )
     return [
         {"id": r["id"], "name": r["name"], "label": r["labels"][0], "file": r["file"], "owner": r.get("owner")}

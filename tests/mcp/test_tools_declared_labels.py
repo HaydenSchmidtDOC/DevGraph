@@ -9,7 +9,9 @@ from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
 from devgraph.mcp.tools import declared_node_labels, search_component
 
-BUILTIN_LABELS = ("Service", "Module", "Class", "Function", "Endpoint")
+BUILTIN_LABELS = (
+    "Service", "Module", "Class", "Function", "Endpoint", "Database", "VectorStore", "Queue", "Cache", "Container",
+)
 SCHEMA = """
     version: 1
     node_types:

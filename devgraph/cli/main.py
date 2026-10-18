@@ -2521,7 +2521,7 @@ def _schema_report(repo_root: Path | None) -> dict[str, Any]:
         resolve_declaration,
     )
     from devgraph.config.project_switch import project_config_enabled
-    from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+    from devgraph.graph.schema import BUILTIN_LABELS, RELATIONSHIP_TYPES
 
     enabled = True if repo_root is None else project_config_enabled(repo_root)
     declaration = None if repo_root is None else load_project_schema(repo_root)
@@ -2530,7 +2530,7 @@ def _schema_report(repo_root: Path | None) -> dict[str, Any]:
     inherits = effective.extends == "default"
 
     node_types: list[dict[str, Any]] = [
-        {"label": label, "origin": "built-in", "key": None, "color": None} for label in (NODE_LABELS if inherits else ())
+        {"label": label, "origin": "built-in", "key": None, "color": None} for label in (BUILTIN_LABELS if inherits else ())
     ]
     node_types += [
         {"label": n.label, "origin": SCHEMA_FILENAME, "key": list(n.key), "color": n.color} for n in effective.node_types
@@ -3255,7 +3255,7 @@ def config_schema_list(
     """List the effective node types and relationships, marked built-in or project."""
     from devgraph.config.project_schema import ProjectSchemaError, load_project_schema, resolve_declaration
     from devgraph.config.project_switch import project_config_enabled
-    from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+    from devgraph.graph.schema import BUILTIN_LABELS, RELATIONSHIP_TYPES
 
     root = _schema_scope(ctx, repo)
     try:
@@ -3267,7 +3267,7 @@ def config_schema_list(
     node_types: list[dict[str, Any]] = []
     relationships: list[dict[str, Any]] = []
     if declaration is None or declaration.extends == "default":
-        node_types += [{"label": n, "origin": "built-in", "key": None, "source": None, "color": None} for n in NODE_LABELS]
+        node_types += [{"label": n, "origin": "built-in", "key": None, "source": None, "color": None} for n in BUILTIN_LABELS]
         relationships += [
             {"type": t, "from": None, "to": None, "provider": "builtin", "field": None, "origin": "built-in", "color": None}
             for t in RELATIONSHIP_TYPES

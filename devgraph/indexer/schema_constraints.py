@@ -31,11 +31,11 @@ from devgraph.config.project_schema import (
     _user_constraint_statement,
 )
 from devgraph.graph.engine import GraphEngine
-from devgraph.graph.schema import NODE_LABELS
+from devgraph.graph.schema import BUILTIN_LABELS
 
 logger = logging.getLogger(__name__)
 
-_BUILTIN_LABELS = frozenset(label.casefold() for label in NODE_LABELS)
+_BUILTIN_LABELS = frozenset(label.casefold() for label in BUILTIN_LABELS)
 _UNIQUENESS_TYPES = ("UNIQUENESS", "NODE_PROPERTY_UNIQUENESS")
 _INDEX_PROPERTIES = ("repo_id", "name")
 

@@ -33,6 +33,7 @@ from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
 from devgraph.indexer.source_text import decode_source_as, declared_encoding, is_python_path
 from devgraph.paths import is_within
+from devgraph.test_paths import TEST_PATH_CYPHER, is_test_path
 from devgraph.registry.store import RepoRegistry
 from devgraph.analytics.insights import INSIGHT_METRICS, community_members, read_insights, top_nodes
 
@@ -144,6 +145,17 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
         "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched"
     )
     return "\n".join(parts)
+
+
+def _tests_last(
+    rows: list[dict[str, Any]], include_tests: bool, path: str = "file"
+) -> tuple[list[dict[str, Any]], int]:
+    """`rows` with the test-code ones (by their `path` key, devgraph/test_paths.py
+    `is_test_path`) after the rest, each part in its order, or left out when not
+    `include_tests`; and how many test rows there are."""
+    tests = [row for row in rows if is_test_path(row.get(path))]
+    production = [row for row in rows if not is_test_path(row.get(path))]
+    return (production + tests if include_tests else production), len(tests)
 
 
 def _located(row: dict[str, Any]) -> dict[str, Any]:
@@ -275,9 +287,12 @@ def _resolve_recency_cutoff(engine: GraphEngine, repo_id: str, modified_within_c
     return results[0]["d"]
 
 
-# Labels search_component always covers. A repository's schema-declared
-# labels are appended per call (see declared_node_labels).
-_SEARCH_LABELS: tuple[str, ...] = ("Service", "Module", "Class", "Function", "Endpoint")
+# Labels search_component always covers: code, routes, datastores (Cache
+# included) and compose containers. A repository's schema-declared labels
+# are appended per call (see declared_node_labels).
+_SEARCH_LABELS: tuple[str, ...] = (
+    "Service", "Module", "Class", "Function", "Endpoint", *schema.DATASTORE_LABELS, "Container",
+)
 
 
 def search_component(
@@ -289,7 +304,8 @@ def search_component(
     modified_within_commits: int | None = None,
     extra_labels: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Search for components (modules, services, classes, functions) by name or description.
+    """Search for components (services, modules, classes, functions, endpoints,
+    datastores of every type, Cache included, and containers) by name or description.
 
     Args:
         engine: GraphEngine instance
@@ -312,8 +328,10 @@ def search_component(
         stopword-filtered — multi-word natural-language queries match any token,
         not the whole phrase — and the whole query and each of its words
         (underscores kept, so `user_service`) are terms too. Results are ranked:
-        exact name match > name starts-with > name contains > description
-        contains. At most `SEARCH_MAX_RESULTS` results are returned.
+        the whole query as the exact name > the same ignoring case > name starts
+        with the whole query > name contains it > name equal to one of its terms
+        (`run` for `run_cypher`) > name starts with a term > name contains one >
+        description contains one. At most `SEARCH_MAX_RESULTS` results are returned.
     """
     _at_least(1, max_results=max_results, modified_within_commits=modified_within_commits)
     max_results = min(max_results, SEARCH_MAX_RESULTS)
@@ -327,7 +345,7 @@ def search_component(
     )
     rows, count, lower_bound = ranked_search(
         engine, labels, tokens, _name_variants(query, tokens), max_results,
-        repo_id=None if cross_repo else repo_id, cutoff=cutoff,
+        repo_id=None if cross_repo else repo_id, cutoff=cutoff, query=query,
     )
     envelope = _envelope([{k: v for k, v in row.items() if k != "id"} for row in rows], max_results)
     envelope["count"] = count
@@ -351,12 +369,16 @@ def _search_terms(query: str) -> list[str]:
     whole = [query.strip().lower(), *(w.lower() for w in re.findall(r"[A-Za-z0-9_]+", query))]
     return list(dict.fromkeys([*_search_tokens(query), *(t for t in whole if t)]))
 
-# Rank of a matching node: exact name, name starts with a term, name contains
-# one, description only.
+# Rank of a matching node: the whole query as its name (`$exact`, trimmed),
+# the same ignoring case (`$whole`, lower-cased), a name starting with or
+# containing the whole query, a name equal to one of its terms (`run` for
+# `run_cypher`), starting with or containing a term, description only.
 _SEARCH_TIER = (
-    "CASE WHEN toLower(n.name) IN $terms THEN 0 "
-    "WHEN any(t IN $terms WHERE toLower(n.name) STARTS WITH t) THEN 1 "
-    "WHEN any(t IN $terms WHERE toLower(n.name) CONTAINS t) THEN 2 ELSE 3 END"
+    "CASE WHEN n.name = $exact THEN 0 WHEN toLower(n.name) = $whole THEN 1 "
+    "WHEN toLower(n.name) STARTS WITH $whole THEN 2 WHEN toLower(n.name) CONTAINS $whole THEN 3 "
+    "WHEN toLower(n.name) IN $terms THEN 4 "
+    "WHEN any(t IN $terms WHERE toLower(n.name) STARTS WITH t) THEN 5 "
+    "WHEN any(t IN $terms WHERE toLower(n.name) CONTAINS t) THEN 6 ELSE 7 END"
 )
 _SEARCH_FILE = "CASE WHEN coalesce(n.file, '') <> '' THEN n.file ELSE coalesce(n.path, n.source_file, n.source) END"
 _SEARCH_ROW = (
@@ -373,19 +395,35 @@ def _name_variants(query: str, terms: list[str]) -> list[str]:
     return list(dict.fromkeys(variants))
 
 
+def _fold_target(var: str, out: str = "folded") -> str:
+    """Cypher `CALL` binding `out` to the real Function the route handler stub
+    `var` provably stands for, or to null: for any node that is no handler stub
+    (a file-less Function), and for a stub that stands for no single Function.
+    A stub stands for the one Function of its name its endpoint's handler
+    reference resolved to (both implement one Endpoint), or, when it resolved
+    to none, the one Function of its name in the route files that claim the
+    stub (its `sources`). Always one row: the aggregation has no grouping key.
+    Tools answer with that Function and leave the stub out; a stub that stands
+    for none stays visible (an unresolved handler)."""
+    return (
+        f"CALL ({var}) {{ WITH {var} WHERE {var}:Function AND coalesce({var}.file, '') = '' "
+        f"MATCH (twin:Function) WHERE twin.repo_id = {var}.repo_id AND twin.name = {var}.name AND twin.file <> '' "
+        f"WITH twin, EXISTS {{ ({var})<-[:IMPLEMENTS]-(:Endpoint)-[:IMPLEMENTS]->(twin) }} AS linked, "
+        f"twin.file IN coalesce({var}.sources, []) AS local "
+        "WITH collect(CASE WHEN linked THEN twin END) AS linked, collect(CASE WHEN local THEN twin END) AS local "
+        f"RETURN CASE WHEN size(linked) = 1 THEN linked[0] WHEN size(linked) = 0 AND size(local) = 1 THEN local[0] "
+        f"END AS {out} }}\n"
+    )
+
+
 def _search_branches(labels: tuple[str, ...], where: str, unwind: bool = False) -> str:
     """`CALL () { ... }` over one MATCH per label, so each can use its label's indexes.
 
-    A file-scoped label's file-less node (a route's handler stub) is left out when
-    a real node of that label shares its name."""
+    A route's handler stub is left out when it stands for a real Function
+    (`_fold_target`)."""
     branches = []
     for label in labels:
-        stub = (
-            f" AND NOT (coalesce(n.file, '') = '' AND EXISTS {{ MATCH (m:`{label}`) "
-            "WHERE m.repo_id = n.repo_id AND m.name = n.name AND m.file <> '' })"
-            if label in schema.FILE_SCOPED_LABELS
-            else ""
-        )
+        stub = f" {_fold_target('n')}  WITH n, folded WHERE folded IS NULL" if label == "Function" else ""
         unwound = "UNWIND $names AS p " if unwind else ""
         branches.append(f"  {unwound}MATCH (n:`{label}`) WHERE {where}{stub} RETURN n")
     return "CALL () {\n" + "\n  UNION\n".join(branches) + "\n}\n"
@@ -399,9 +437,12 @@ def ranked_search(
     limit: int,
     repo_id: str | None,
     cutoff: Any = None,
+    query: str = "",
 ) -> tuple[list[dict], int, bool]:
     """Nodes of `labels` whose name or description contains a (lower-case) term,
-    best first: exact name, name prefix, name substring, description only.
+    best first (`_SEARCH_TIER`): `query` itself as the name, then ignoring case,
+    then a name starting with or containing `query`, then a name equal to,
+    starting with or containing a term, description only.
 
     Names that start with one of `names` are found first through the
     `(repo_id, name)` indexes. Only when they don't fill `limit` does a substring
@@ -412,7 +453,11 @@ def ranked_search(
     scope = "n.repo_id = $repo_id" if repo_id is not None else _cross_scope("n")
     if cutoff is not None:
         scope += " AND n.last_modified_at >= $cutoff"
-    params: dict[str, Any] = {"repo_id": repo_id, "terms": terms, "names": names, "cutoff": cutoff}
+    exact = query.strip()
+    params: dict[str, Any] = {  # an empty query (None) matches no whole-query tier
+        "repo_id": repo_id, "terms": terms, "names": names, "cutoff": cutoff,
+        "exact": exact or None, "whole": exact.lower() or None,
+    }
     order = (
         f"WITH n, {_SEARCH_TIER} AS tier, {_SEARCH_FILE} AS file "
         "ORDER BY tier, n.name, file IS NULL, file, elementId(n)\n"
@@ -435,7 +480,7 @@ def ranked_search(
         {**params, "seen": [r["id"] for r in found], "fill": limit - len(found)},
     )
     row = rows[0] if rows else {"total": 0, "rest": []}
-    return _rank_search_results(found + row["rest"], terms), max(row["total"], len(found)), False
+    return _rank_search_results(found + row["rest"], terms, exact), max(row["total"], len(found)), False
 
 
 def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[str, ...]:
@@ -454,19 +499,33 @@ def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[s
     return tuple(node_type.label for node_type in effective.node_types)
 
 
-def _rank_search_results(results: list[dict], tokens: list[str]) -> list[dict]:
-    """Sort search rows: exact name match first, then name starts-with a token,
-    then name contains a token, then description-only matches last; by name and
-    file within a tier (no file last), as `ranked_search`'s queries order them."""
+def _rank_search_results(results: list[dict], tokens: list[str], query: str = "") -> list[dict]:
+    """Sort search rows in `_SEARCH_TIER`'s order: `query` as the exact name,
+    then ignoring case, then a name starting with or containing `query`, then a
+    name equal to, starting with or containing a token, then description-only
+    matches last; by name and file within a tier (no file last), as
+    `ranked_search`'s queries order them."""
+    exact = query.strip()
+    whole = exact.lower()
+
     def tier(row: dict) -> int:
-        name = (row.get("name") or "").lower()
-        if name in tokens:
+        raw = row.get("name") or ""
+        name = raw.lower()
+        if exact and raw == exact:
             return 0
-        if any(name.startswith(t) for t in tokens):
+        if whole and name == whole:
             return 1
-        if any(t in name for t in tokens):
+        if whole and name.startswith(whole):
             return 2
-        return 3
+        if whole and whole in name:
+            return 3
+        if name in tokens:
+            return 4
+        if any(name.startswith(t) for t in tokens):
+            return 5
+        if any(t in name for t in tokens):
+            return 6
+        return 7
     return sorted(
         results,
         key=lambda row: (tier(row), row.get("name") or "", row.get("file") is None, row.get("file") or ""),
@@ -486,16 +545,16 @@ _DESCRIBE_ECHO = 100
 _DESCRIBE_DIRECTIONS = ("both", "out", "in")
 # Shown elsewhere in the response, or extractor/insight bookkeeping that other tools serve.
 _DESCRIBE_HIDDEN = frozenset({"repo_id", "name"}) | schema.INTERNAL_NODE_PROPERTIES
-_DESCRIBE_BUILTIN_LABELS = tuple(label for label in schema.NODE_LABELS if label != "Repository")
+_DESCRIBE_BUILTIN_LABELS = schema.NAMED_LABELS  # every built-in label but Repository, Cache included
 _DESCRIBE_HINT = (
     "search_component searches by partial name; a file, folder or docs node is named by its "
     "repo-relative path or its id"
 )
 
 _DESCRIBE_NEIGHBOUR = (
-    "m.repo_id = $repo_id AND NOT m:Repository "
+    "raw.repo_id = $repo_id AND NOT raw:Repository "
     "AND ($types IS NULL OR type(r) IN $types) "
-    "AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))"
+    "AND ($labels IS NULL OR any(l IN labels(raw) WHERE l IN $labels))"
 )
 #: The labels whose `owner` keys a node within its file (the declarations it
 #: is in, "" at the top level; see devgraph/graph/schema.py FILE_SCOPED_LABELS).
@@ -504,29 +563,33 @@ _OWNED_LABELS = schema.FILE_SCOPED_LABELS
 #: without a `file` (a declared type's `owner` field is its own).
 _OWNER_OF = "CASE WHEN {v}.file IS NOT NULL THEN coalesce({v}.owner, '') END"
 
+# Each neighbour (`raw`) is listed as the Function it folds into when it is a
+# route's handler stub (`_fold_target`), so a handler is listed once.
 _DESCRIBE_GROUPS = f"""
-MATCH (n) WHERE elementId(n) = $id
+MATCH (n) WHERE elementId(n) IN $ids
 CALL (n) {{
-  MATCH (n)-[r]->(m)
+  MATCH (n)-[r]->(raw)
   WHERE $direction IN ['both','out'] AND {_DESCRIBE_NEIGHBOUR}
-  RETURN 'out' AS dir, type(r) AS rel, m
+  RETURN 'out' AS dir, type(r) AS rel, raw
   UNION
-  MATCH (n)<-[r]-(m)
+  MATCH (n)<-[r]-(raw)
   WHERE $direction IN ['both','in'] AND {_DESCRIBE_NEIGHBOUR}
-  RETURN 'in' AS dir, type(r) AS rel, m
+  RETURN 'in' AS dir, type(r) AS rel, raw
 }}
-WITH n, dir, rel, count(DISTINCT m) AS total
+{_fold_target("raw")}WITH dir, rel, coalesce(folded, raw) AS m
+WITH dir, rel, count(DISTINCT m) AS total
 ORDER BY dir, rel
 LIMIT {_DESCRIBE_MAX_GROUPS + 1}
-CALL (n, dir, rel) {{
+CALL (dir, rel) {{
+  MATCH (n) WHERE elementId(n) IN $ids
   CALL (n, dir, rel) {{
-    MATCH (n)-[r:$(rel)]->(m) WHERE dir = 'out' RETURN m
+    MATCH (n)-[r:$(rel)]->(raw) WHERE dir = 'out' RETURN raw
     UNION
-    MATCH (n)<-[r:$(rel)]-(m) WHERE dir = 'in' RETURN m
+    MATCH (n)<-[r:$(rel)]-(raw) WHERE dir = 'in' RETURN raw
   }}
-  WITH m WHERE m.repo_id = $repo_id AND NOT m:Repository
-    AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))
-  WITH DISTINCT m
+  WITH raw WHERE raw.repo_id = $repo_id AND NOT raw:Repository
+    AND ($labels IS NULL OR any(l IN labels(raw) WHERE l IN $labels))
+  {_fold_target("raw")}  WITH DISTINCT coalesce(folded, raw) AS m
   ORDER BY m.name, coalesce(m.file, m.path), m.owner
   LIMIT $cap
   RETURN collect({{
@@ -534,6 +597,16 @@ CALL (n, dir, rel) {{
   }}) AS refs
 }}
 RETURN dir, rel, total, refs
+"""
+
+
+#: The handler stubs that stand for the Function `$id` (`_fold_target`):
+#: describe_node lists their relationships as that Function's.
+_FOLDED_STUBS = f"""
+MATCH (real:Function) WHERE elementId(real) = $id
+MATCH (s:Function) WHERE s.repo_id = real.repo_id AND s.name = real.name AND coalesce(s.file, '') = ''
+{_fold_target("s")}WITH s, folded WHERE folded = real
+RETURN elementId(s) AS id
 """
 
 
@@ -581,11 +654,15 @@ def _lookup_cypher(labels: tuple[str, ...], declared: frozenset[str]) -> str:
     """One single-property branch per label, so each can seek on its own index.
 
     Every label gets a name branch; only declared (provider) labels carry
-    `path`, so only they get a path branch. Labels are validated identifiers.
+    `path`, so only they get a path branch. A route's handler stub is left out
+    when it stands for a real Function (`_fold_target`). Labels are validated
+    identifiers.
     """
     tail = "AND NOT n:Repository AND ($file IS NULL OR $file IN [n.file, n.path, n.source_file])"
+    unfolded = f" {_fold_target('n')}  WITH n, folded WHERE folded IS NULL"
     body = "\n  UNION\n".join(
-        f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.{key} = $name {tail} RETURN n"
+        f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.{key} = $name {tail}"
+        f"{unfolded if label == 'Function' else ''} RETURN n"
         for label in labels
         for key in (("name", "path") if label in declared else ("name",))
     )
@@ -856,6 +933,13 @@ def _node_ref(row: dict[str, Any]) -> dict[str, Any]:
     return ref
 
 
+def _unresolved_marked(ref: dict[str, Any]) -> dict[str, Any]:
+    """A candidate ref, with `unresolved_handler: true` when it is a route's
+    handler stub left visible because it folds into no single real Function
+    (`_fold_target`): a file-less Function."""
+    return {**ref, "unresolved_handler": True} if ref["label"] == "Function" and ref.get("file") is None else ref
+
+
 def _visible_properties(props: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """Properties minus bookkeeping, sanitised for display and capped; and whether any were dropped."""
     from devgraph.mcp.tool_plane import _sanitize_deep
@@ -929,7 +1013,12 @@ def describe_node(
         refs (and `owner` for a method or nested class); or `{"status":
         "ambiguous", "count", "candidates", "truncated"}`.
         No match raises ToolError with suggestions. `Repository` nodes are never
-        matched or listed.
+        matched or listed. A route's handler stub that folds into a real
+        Function (`_fold_target`: the one Function its endpoint's handler
+        reference resolved to, or else the one of its name in its route file) is not
+        matched, is listed as that Function among neighbours, and has its
+        relationships folded into that Function's groups; any other stub
+        stays visible (an unresolved handler, file null).
     """
     file = _normalize_file(file)
     if not name.strip():
@@ -945,7 +1034,7 @@ def describe_node(
             raise ToolError(f"invalid label {_echo(label)}")
         labels: tuple[str, ...] = (label,)
         # A built-in label carries no path; any other label may be a provider's.
-        path_labels = frozenset(labels) if label not in schema.NODE_LABELS or label in declared else frozenset()
+        path_labels = frozenset(labels) if label not in schema.BUILTIN_LABELS or label in declared else frozenset()
     else:
         labels = _DESCRIBE_BUILTIN_LABELS + tuple(d for d in declared if d not in _DESCRIBE_BUILTIN_LABELS)
         path_labels = frozenset(declared)
@@ -977,7 +1066,7 @@ def describe_node(
 
     if len(rows) > 1:
         candidates = sorted(
-            (_node_ref(row) for row in rows),
+            (_unresolved_marked(_node_ref(row)) for row in rows),
             key=lambda r: (r["label"], r["name"], r.get("file") or "", r.get("owner") or ""),
         )
         return {
@@ -989,11 +1078,15 @@ def describe_node(
 
     (row,) = rows
     properties, properties_truncated = _visible_properties(row["properties"])
-    node = {**_node_ref(row), "properties": properties, "properties_truncated": properties_truncated}
+    node = {**_unresolved_marked(_node_ref(row)), "properties": properties, "properties_truncated": properties_truncated}
+    ids = [row["id"]]
+    if row["label"] == "Function" and row.get("file"):
+        stubs, _ = _read(engine, _FOLDED_STUBS, {"id": row["id"]}, _DESCRIBE_MAX_CANDIDATES)
+        ids += [stub["id"] for stub in stubs]
     groups, groups_truncated = _read(
         engine,
         _DESCRIBE_GROUPS,
-        {"id": row["id"], "repo_id": repo_id, "direction": direction, "types": types,
+        {"ids": ids, "repo_id": repo_id, "direction": direction, "types": types,
          "labels": neighbour_labels, "cap": cap},
         _DESCRIBE_MAX_GROUPS,
     )
@@ -1343,12 +1436,18 @@ def trace_request_flow(
 
     Returns:
         Dict with `components` (the start endpoints and every node within five
-        hops, each {name, labels, repo_id}) and `edges` ({type} per relationship).
+        hops, each {name, labels, repo_id}) and `edges` ({type, from, to} per
+        relationship, `from`/`to` naming its components). A route's handler
+        stub that folds into a real Function (`_fold_target`) is listed as that
+        Function, its edges with it, and the flow goes on from the Function's
+        calls (four more hops); a stub that folds into none stays listed as it is.
 
     Raises:
         ToolError: no endpoint has that name or path.
     """
     repo_filter = _cross_scope("start", "AND") if cross_repo else "AND start.repo_id = $repo_id"
+    node = "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id}"
+    edge = "{id: elementId(r), type: type(r), start: elementId(startNode(r)), end: elementId(endNode(r))}"
     cypher = f"""
     MATCH (start:Endpoint)
     WHERE (start.name = $endpoint OR ($bare AND start.name ENDS WITH ' ' + $endpoint))
@@ -1360,19 +1459,40 @@ def trace_request_flow(
         UNWIND rels AS r
         RETURN collect(DISTINCT node) AS reached, collect(DISTINCT r) AS edges
     }}
-    RETURN
-        [n IN starts + [m IN reached WHERE NOT m IN starts] |
-         {{name: n.name, labels: labels(n), repo_id: n.repo_id}}] AS components,
-        [r IN edges | {{type: type(r)}}] AS edges
+    CALL (reached) {{
+        UNWIND reached AS raw
+        {_fold_target("raw")}
+        WITH raw, folded WHERE folded IS NOT NULL
+        RETURN collect({{stub: elementId(raw), target: elementId(folded)}}) AS folds, collect(DISTINCT folded) AS targets
+    }}
+    CALL (targets) {{
+        UNWIND targets AS t
+        MATCH (t)-[rels*1..4]->(node)
+        UNWIND rels AS r
+        RETURN collect(DISTINCT node) AS further, collect(DISTINCT r) AS further_edges
+    }}
+    RETURN [n IN starts | {node}] AS starts, [n IN reached + targets + further | {node}] AS nodes,
+        folds, [r IN edges + further_edges | {edge}] AS edges
     """
     params = {"endpoint": start_endpoint, "bare": not any(ch.isspace() for ch in start_endpoint.strip())}
     if not cross_repo:
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if not results or not results[0]["components"]:
+    if not results or not results[0]["starts"]:
         raise _not_found(engine, repo_id, "endpoint", start_endpoint, ("Endpoint",), cross_repo)
-    return results[0]
+    (row,) = results
+    fold = {f["stub"]: f["target"] for f in row["folds"]}
+    nodes: dict[str, dict[str, Any]] = {}
+    for n in row["starts"] + row["nodes"]:
+        if n["id"] not in fold:
+            nodes.setdefault(n["id"], {k: n[k] for k in ("name", "labels", "repo_id")})
+    edges: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for e in row["edges"]:
+        start, end = fold.get(e["start"], e["start"]), fold.get(e["end"], e["end"])
+        if start in nodes and end in nodes:
+            edges.setdefault((e["type"], start, end), {"type": e["type"], "from": nodes[start]["name"], "to": nodes[end]["name"]})
+    return {"components": list(nodes.values()), "edges": list(edges.values())}
 
 
 def get_service_dependencies(
@@ -1424,6 +1544,7 @@ def find_callers(
     file: str | None = None,
     extra_labels: tuple[str, ...] = (),
     owner: str | None = None,
+    include_tests: bool = True,
 ) -> dict[str, Any]:
     """Find all functions, services, or endpoints that call a given target.
 
@@ -1467,9 +1588,12 @@ def find_callers(
             pick a method of one class (`describe_node`'s `owner`); a target
             named with them (`A.run`, `A::run`) does the same when no node has
             that exact name
+        include_tests: If False, leave out callers in test code (`is_test_path`
+            of their file); either way they come after every other caller
 
     Returns:
-        Dict with count, results, and truncated flag containing callers with their
+        Dict with count, results, truncated flag and test_count (the callers in
+        test code, listed or not) containing callers with their
         types, repo_id, file, owner and start_line (when the caller has them: a
         Module has neither) and confidence (same-named callers are separate
         rows, told apart by file and owner); count 0 for a known target nothing calls. When targets
@@ -1495,7 +1619,7 @@ def find_callers(
     class_filter = "AND rel.caller_class = $scope_to_class" if scope_to_class else ""
     recency_filter = "AND target.last_modified_at >= $cutoff" if cutoff is not None else ""
     resolved_filter = "AND rel.confidence IN ['resolved', 'package']" if resolved_only else ""
-    cypher = f"""
+    callers = f"""
     {_named_nodes(labels, "target_name", cross_repo, "target")}
     MATCH (caller)-[rel:CALLS]->(target)
     WHERE true
@@ -1504,16 +1628,25 @@ def find_callers(
     {resolved_filter}
     AND ($file IS NULL OR target.file = $file)
     AND {_OWNER_MATCH.replace("n.", "target.")}
+    """
+    is_test = "coalesce(caller.file, caller.source_file, '') =~ $test_path"
+    cypher = f"""
+    {callers}
     WITH caller, min(CASE rel.confidence WHEN 'resolved' THEN 0 WHEN 'package' THEN 1 WHEN 'name' THEN 3
                      ELSE 2 END) AS rank{target_files}
+    WITH *, {is_test} AS is_test
+    WHERE $include_tests OR NOT is_test
     RETURN caller.name as name, labels(caller) as type, caller.repo_id as repo_id,
            coalesce(caller.file, caller.source_file) as file,
            {_OWNER_OF.format(v="caller")} as owner, caller.start_line as start_line,
            CASE rank WHEN 0 THEN 'resolved' WHEN 1 THEN 'package' WHEN 3 THEN 'name' END as confidence{target_files and ", target_files"}
-    ORDER BY rank, name, file
+    ORDER BY is_test, rank, name, file
     LIMIT {LIST_ROW_LIMIT + 1}
     """
-    params = {"target_name": target_name, "file": file, "owner": owner}
+    params = {
+        "target_name": target_name, "file": file, "owner": owner, "test_path": TEST_PATH_CYPHER,
+        "include_tests": include_tests,
+    }
     if not cross_repo:
         params["repo_id"] = repo_id
     if scope_to_class:
@@ -1521,11 +1654,14 @@ def find_callers(
     if cutoff is not None:
         params["cutoff"] = cutoff
 
+    # Counted apart from the capped rows, so it is exact however many there are.
+    tests = _query(engine, f"{callers} WITH DISTINCT caller WHERE {is_test} RETURN count(caller) AS tests", params)
     results, more = _list_query(engine, cypher, params)
     results = [_located(row) for row in results]
     if ambiguous:
         results = [_with_target_files(row, row["target_files"]) for row in results]
     envelope = _capped_envelope(results, more, max_results)
+    envelope["test_count"] = tests[0]["tests"] if tests else 0
     if ambiguous:
         envelope["ambiguous_targets"] = ambiguous
     return envelope
@@ -1540,6 +1676,7 @@ def find_related_files(
     file: str | None = None,
     extra_labels: tuple[str, ...] = (),
     owner: str | None = None,
+    include_tests: bool = True,
 ) -> dict[str, Any]:
     """Find all files related to a component (via CONTAINS, IMPORTS, CALLS relationships).
 
@@ -1555,10 +1692,14 @@ def find_related_files(
             several same-named components
         extra_labels: The repository's declared labels, looked up besides the built-in ones
         owner: The declarations the component is in, as in find_callers (`A.run` too)
+        include_tests: If False, leave out related modules and components in
+            test code (devgraph/test_paths.py, as in find_callers); either way
+            they come after the rest of each list
 
     Returns:
         Dict with containing_modules, imported_modules, and related_components,
-        each wrapped as {count, results, truncated} envelope objects.
+        each wrapped as {count, results, truncated, test_count} envelope
+        objects; test_count counts the list's entries in test code, listed or not.
         imported_modules are the names of what `component_name` IMPORTS: a
         Module's path, or, for a Kotlin import, the Class or Function it names.
         When components of that name lie in several files and `file` is not
@@ -1584,8 +1725,10 @@ def find_related_files(
     WITH CASE WHEN $split THEN n.file END AS target_file, m, imported, related
     RETURN target_file,
         COLLECT(DISTINCT m.name) as containing_modules,
-        COLLECT(DISTINCT imported.name) as imported_modules,
-        COLLECT(DISTINCT related.name) as related_components
+        COLLECT(DISTINCT CASE WHEN imported IS NOT NULL THEN {{name: imported.name,
+            path: coalesce(imported.file, imported.source_file, imported.name)}} END) as imported_modules,
+        COLLECT(DISTINCT CASE WHEN related IS NOT NULL THEN {{name: related.name,
+            path: coalesce(related.file, related.source_file)}} END) as related_components
     ORDER BY target_file
     """
     params = {"component_name": component_name, "file": file, "owner": owner, "split": bool(ambiguous)}
@@ -1594,16 +1737,22 @@ def find_related_files(
 
     results = _query(engine, cypher, params)
     keys = ("containing_modules", "imported_modules", "related_components")
-    if not ambiguous:
-        return {key: _envelope(results[0][key], max_results) for key in keys}
     answer: dict[str, Any] = {}
     for key in keys:
-        by_name: dict[str, list[str]] = {}
+        # One entry per name (a Module's name is its path), with the target
+        # files it was found for, in the order the rows list them.
+        by_name: dict[str, dict[str, Any]] = {}
         for row in results:
-            for name in row[key]:
-                by_name.setdefault(name, []).append(row["target_file"])
-        answer[key] = _envelope([_with_target_files({"name": name}, f) for name, f in by_name.items()], max_results)
-    answer["ambiguous_targets"] = ambiguous
+            for item in row[key]:
+                name, path = (item, item) if key == "containing_modules" else (item["name"], item["path"])
+                entry = by_name.setdefault(name, {"name": name, "path": None, "files": []})
+                entry["path"] = entry["path"] or path
+                entry["files"].append(row["target_file"])
+        shown, test_count = _tests_last(list(by_name.values()), include_tests, "path")
+        rows = [_with_target_files({"name": e["name"]}, e["files"]) if ambiguous else e["name"] for e in shown]
+        answer[key] = {**_envelope(rows, max_results), "test_count": test_count}
+    if ambiguous:
+        answer["ambiguous_targets"] = ambiguous
     return answer
 
 
@@ -1618,7 +1767,8 @@ def summarise_repository(
         repo_id: Repository ID to summarize
 
     Returns:
-        Summary with service count, module count, dependency graph stats
+        Summary with the repository's node counts by type: services, modules,
+        classes, functions, endpoints, databases, vector stores, queues and caches
     """
     # Each count runs as its own uncorrelated subquery (CALL {...}) rather
     # than chaining OPTIONAL MATCHes in one query. Chained OPTIONAL MATCHes
@@ -1636,10 +1786,11 @@ def summarise_repository(
     CALL () { MATCH (d:Database {repo_id: $repo_id}) RETURN COUNT(d) as database_count }
     CALL () { MATCH (v:VectorStore {repo_id: $repo_id}) RETURN COUNT(v) as vectorstore_count }
     CALL () { MATCH (q:Queue {repo_id: $repo_id}) RETURN COUNT(q) as queue_count }
+    CALL () { MATCH (k:Cache {repo_id: $repo_id}) RETURN COUNT(k) as cache_count }
     RETURN
         $repo_id as repo_name,
         service_count, module_count, class_count, function_count,
-        endpoint_count, database_count, vectorstore_count, queue_count
+        endpoint_count, database_count, vectorstore_count, queue_count, cache_count
     """
     results = _query(engine, count_cypher, {"repo_id": repo_id})
     if results:
@@ -1654,6 +1805,7 @@ def summarise_repository(
         "database_count": 0,
         "vectorstore_count": 0,
         "queue_count": 0,
+        "cache_count": 0,
     }
 
 
@@ -1791,6 +1943,7 @@ def impact_analysis(
     file: str | None = None,
     extra_labels: tuple[str, ...] = (),
     owner: str | None = None,
+    include_tests: bool = True,
 ) -> dict[str, Any]:
     """Analyze the impact of changing a component on the rest of the system.
 
@@ -1808,6 +1961,8 @@ def impact_analysis(
             several same-named components
         extra_labels: The repository's declared labels, looked up besides the built-in ones
         owner: The declarations the component is in, as in find_callers (`A.run` too)
+        include_tests: If False, leave out dependents in test code (as in
+            find_callers); either way they come after every other dependent
 
     Returns:
         Dict with direct_dependents and transitive_dependents ({name, type, file,
@@ -1824,13 +1979,22 @@ def impact_analysis(
         every target that reaches it within `IMPACT_MAX_DEPTH` hops; risk_level is
         the riskiest target's. Past that, one expansion covers them all, as for a
         single target, with a notice to pass `file`. Another same-named target can
-        itself be listed as a dependent.
+        itself be listed as a dependent. Each list is ordered by name, file and
+        owner, dependents in test code last, and its envelope adds
+        `test_count`, its dependents in test code (listed or not); risk_level
+        counts them too.
 
     Raises:
         ToolError: no node has that name, or none in `file`.
     """
     _at_least(1, max_results=max_results)
     file = _normalize_file(file)
+
+    def dependents_envelope(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        rows = sorted(rows, key=lambda d: (d["name"] or "", d.get("file") or "", d.get("owner") or "", d["type"] or ""))
+        shown, test_count = _tests_last(rows, include_tests)
+        return {**_envelope(shown, max_results), "test_count": test_count}
+
     labels = component_labels(extra_labels)
     component_name, owner = _owned_target(engine, repo_id, component_name, owner, cross_repo, labels)
     ambiguous, labels, files = _resolve_targets(
@@ -1857,8 +2021,8 @@ def impact_analysis(
     if not split:
         row = results[0]
         answer = {
-            "direct_dependents": _envelope([_located(d) for d in row["direct_dependents"]], max_results),
-            "transitive_dependents": _envelope([_located(d) for d in row["transitive_dependents"]], max_results),
+            "direct_dependents": dependents_envelope([_located(d) for d in row["direct_dependents"]]),
+            "transitive_dependents": dependents_envelope([_located(d) for d in row["transitive_dependents"]]),
             "risk_level": _risk_level(row["direct_count"]),
         }
         if ambiguous:
@@ -1885,7 +2049,7 @@ def impact_analysis(
         for key in ("direct_dependents", "transitive_dependents")
     }
     return {
-        **{key: _envelope(rows, max_results) for key, rows in lists.items()},
+        **{key: dependents_envelope(rows) for key, rows in lists.items()},
         "risk_level": _risk_level(max(row["direct_count"] for row in results)),
         "ambiguous_targets": ambiguous,
     }
@@ -2093,7 +2257,7 @@ def explain_architecture(
     _at_least(1, max_results=max_results)
     cypher = f"""
     MATCH (s:Service {{repo_id: $repo_id}})
-    OPTIONAL MATCH (s)-[:USES]->(ds:Database|VectorStore|Queue)
+    OPTIONAL MATCH (s)-[:USES]->(ds:{"|".join(schema.DATASTORE_LABELS)})
     WITH s, COLLECT(DISTINCT ds.name) as datastore_names
     OPTIONAL MATCH (ep:Endpoint {{repo_id: $repo_id}})-[:CALLS]->(s)
     WITH s, datastore_names, COLLECT(DISTINCT ep.name) as endpoint_names
@@ -2611,7 +2775,10 @@ def get_source(
         read. When several nodes match, `source` is None and the dict adds
         `status: "ambiguous"`, `count`, `truncated` and `candidates`
         ({label, name, file, owner}; repo_id too when cross_repo): pass one's
-        `file` and `owner`. The result names its `owner` too.
+        `file` and `owner`. The result names its `owner` too. A route's
+        handler stub that folds into a real Function (`_fold_target`) is left
+        out, so it never makes its handler ambiguous; any other stub is a
+        candidate with file None.
         A file is decoded as the indexer decodes it (`source_text`): a
         Python coding line, else UTF-8, else cp1252 or Latin-1; when an
         undeclared file is not valid UTF-8, or a file isn't valid in its
@@ -2631,6 +2798,7 @@ def get_source(
     WHERE (n:Function OR n:Class) AND {match}
     {repo_filter}
     AND ($file IS NULL OR n.file = $file)
+    {_fold_target("n")}WITH n, folded WHERE folded IS NULL
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
            n.file as file, {_OWNER_OF.format(v="n")} as owner, n.start_line as start_line, n.end_line as end_line,
            n.docstring_full as docstring_full
@@ -2680,6 +2848,7 @@ def get_source(
             }
             for r in results[:_DESCRIBE_MAX_CANDIDATES]
         ]
+        candidates = [_unresolved_marked(c) for c in candidates]
         return {
             **empty,
             "status": "ambiguous",
@@ -2760,7 +2929,7 @@ def find_mentions(
         engine: GraphEngine instance
         repo_id: Repository ID
         name: Entity name (for direction="mentioned_by") or Document repo-relative path (for direction="mentions")
-        label: Optional node label filter for the target entity (validates against NODE_LABELS)
+        label: Optional node label filter for the target entity (validates against BUILTIN_LABELS)
         direction: "mentioned_by" (default) to find Documents mentioning the entity, or
                    "mentions" to find what a Document mentions
         cross_repo: If True, search across repos
@@ -2774,7 +2943,7 @@ def find_mentions(
     if _source_off(registry, repo_id, "mentions_enabled"):
         return _source_off_notice(max_results, "Mentions", "mentions", repo_id)
     # Validate and reject unrecognized labels
-    if label is not None and label not in schema.NODE_LABELS:
+    if label is not None and label not in schema.BUILTIN_LABELS:
         return _envelope([], max_results)
 
     # Build label filter using node label check (not parameterized label in node pattern)
@@ -2837,7 +3006,8 @@ def list_recent_changes(
         engine: GraphEngine instance
         repo_id: Repository ID
         within_commits: Only include entities modified within this many most-recent commits
-        entity_type: Optional node label filter; a label not in NODE_LABELS is a ToolError
+        entity_type: Optional node label filter; a label not in BUILTIN_LABELS
+            (NODE_LABELS and Cache) is a ToolError
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
 
@@ -2846,8 +3016,8 @@ def list_recent_changes(
         name, type (labels), repo_id, and last_modified_at, ordered most-recently-modified first.
     """
     _at_least(1, within_commits=within_commits, max_results=max_results)
-    if entity_type is not None and entity_type not in schema.NODE_LABELS:
-        raise ToolError(f"unknown entity_type {_echo(entity_type)}; use one of: {', '.join(schema.NODE_LABELS)}")
+    if entity_type is not None and entity_type not in schema.BUILTIN_LABELS:
+        raise ToolError(f"unknown entity_type {_echo(entity_type)}; use one of: {', '.join(schema.BUILTIN_LABELS)}")
 
     cutoff = _resolve_recency_cutoff(engine, repo_id, within_commits)
     recency_filter = "AND n.last_modified_at >= $cutoff" if cutoff is not None else "AND n.last_modified_at IS NOT NULL"

@@ -124,7 +124,7 @@ def test_lookup_without_label_is_a_per_label_union():
         describe_node(engine, "demo", "x", declared_labels=("Runbook", "Folder"))
     lookup = engine.calls[0]["query"]
     branches = _branches(lookup)
-    builtins = [label for label in schema.NODE_LABELS if label != "Repository"]
+    builtins = list(schema.NAMED_LABELS)  # every built-in label but Repository, Cache included
     assert sorted(label for label, key in branches if key == "name") == sorted(builtins + ["Runbook", "Folder"])
     assert sorted(label for label, key in branches if key == "path") == ["Folder", "Runbook"]
     assert "`Repository`" not in lookup
@@ -159,7 +159,7 @@ def test_repository_is_excluded_everywhere():
 
     engine = StubEngine(([LOOKUP_ROW], False), ([], False))
     _found(engine)
-    assert "NOT m:Repository" in engine.calls[1]["query"]
+    assert "NOT raw:Repository" in engine.calls[1]["query"]
 
 
 def test_file_filter_is_a_parameter():
@@ -170,8 +170,10 @@ def test_file_filter_is_a_parameter():
     assert "src/app.py" not in lookup["query"]
     for prop in ("n.file", "n.path", "n.source_file"):
         assert prop in lookup["query"]
-    assert "n.source " not in lookup["query"] and "n.source]" not in lookup["query"]
-    assert "n.sources" not in lookup["query"]
+    # The file filter never matches a shared node's `source`/`sources` (only a
+    # handler stub's fold test reads `sources`).
+    filters = re.findall(r"\$file IN \[([^\]]*)\]", lookup["query"])
+    assert filters and set(filters) == {"n.file, n.path, n.source_file"}
 
     engine = StubEngine(([LOOKUP_ROW], False), ([], False))
     _found(engine)
@@ -253,12 +255,12 @@ def test_hostile_filters_never_reach_cypher(kwargs):
 
 def test_valid_filters_and_direction_are_parameters():
     engine = StubEngine(([LOOKUP_ROW], False), ([], False))
-    _found(engine, relationship_types=["RUNBOOK_FOR"], neighbor_labels=["Service"], direction="in")
+    _found(engine, relationship_types=["RUNBOOK_FOR"], neighbor_labels=["Ticket"], direction="in")
     groups = engine.calls[1]
     assert groups["params"]["types"] == ["RUNBOOK_FOR"]
-    assert groups["params"]["labels"] == ["Service"]
+    assert groups["params"]["labels"] == ["Ticket"]
     assert groups["params"]["direction"] == "in"
-    assert "RUNBOOK_FOR" not in groups["query"] and "Service" not in groups["query"]
+    assert "RUNBOOK_FOR" not in groups["query"] and "Ticket" not in groups["query"]
     assert "$direction IN ['both','out']" in groups["query"]
     assert "$direction IN ['both','in']" in groups["query"]
 
@@ -275,7 +277,11 @@ def test_groups_query_is_top_n_with_separate_count():
     assert "count(DISTINCT m)" in query
     subquery = query.index("CALL (n, dir, rel)")
     assert "LIMIT $cap" in query[subquery:]
-    assert "collect(" not in query[:subquery]
+    # Neighbours are only collected for the capped list; a handler stub's fold
+    # (`_fold_target`) collects its few same-named Functions, never neighbours.
+    from devgraph.mcp.tools import _fold_target
+
+    assert "collect(" not in query[:subquery].replace(_fold_target("raw"), "")
 
 
 @pytest.mark.parametrize("given, sent", [(1, 1), (500, 50), (10, 10)])

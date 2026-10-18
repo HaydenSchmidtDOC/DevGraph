@@ -146,6 +146,12 @@ CLAIMED_LABELS: tuple[str, ...] = (
 # constraint). A query over every node of a repository seeks these, never
 # `{repo_id}` alone.
 NAMED_LABELS: tuple[str, ...] = tuple(label for label in NODE_LABELS if label != "Repository") + ("Cache",)
+# Every built-in label: NODE_LABELS and Cache. Tools and the dashboard list,
+# describe, validate and search by these, never by NODE_LABELS alone.
+BUILTIN_LABELS: tuple[str, ...] = NODE_LABELS + ("Cache",)
+# The datastore labels the datastore extractor writes (indexer/datastores/
+# extractor.py DatastoreType), which a Service `USES`.
+DATASTORE_LABELS: tuple[str, ...] = ("Database", "VectorStore", "Queue", "Cache")
 
 
 def constraint_statements() -> list[str]:

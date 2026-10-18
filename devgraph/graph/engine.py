@@ -24,6 +24,7 @@ from neo4j.graph import Node, Relationship
 
 from devgraph.graph.schema import (
     CLAIMED_LABELS,
+    DATASTORE_LABELS,
     FILE_LABELS,
     FILE_SCOPED_LABELS,
     HEIR_KEY,
@@ -258,7 +259,7 @@ def _claim_nodes_tx(tx, label: str, rows: list[dict[str, Any]]) -> None:
 
 # The datastore labels a Service `USES` through the owning-service pass
 # (indexer/datastores/extractor.py DatastoreType).
-OWNING_SERVICE_TARGETS = ("Database", "VectorStore", "Queue", "Cache")
+OWNING_SERVICE_TARGETS = DATASTORE_LABELS
 
 # The files whose replace is a `service_api` one: Python's (its owning-service
 # and API edges) and the languages whose routes and datastore clients are

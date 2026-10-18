@@ -203,7 +203,10 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: merged into one node, and Java enum members; Python routes read from the
 #: syntax tree (one framework per decorator, Flask `methods` lists, no
 #: route from a comment or docstring); JS/TS object-literal methods,
-#: CommonJS exports and functions declared in blocks.
+#: CommonJS exports and functions declared in blocks. The datastore
+#: extractor also skips more test folders (`spec/`, `e2e/`, `__mocks__/`,
+#: `testdata/`, `fixtures/`, .NET `UnitTests`/`IntegrationTests`;
+#: devgraph/test_paths.py `TEST_DIR`).
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 19
 
