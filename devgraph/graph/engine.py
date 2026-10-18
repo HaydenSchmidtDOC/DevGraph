@@ -1303,6 +1303,14 @@ def _write_insights_tx(tx, repo_id: str, rows: list[dict[str, Any]], summary: di
     tx.run(_WRITE_INSIGHTS_SUMMARY_CYPHER, repo_id=repo_id, **summary)
 
 
+#: Properties an extractor writes on a file's Module, Class or Function only
+#: when the code has them (a docstring's summary and text, a Kotlin
+#: companion's `kind`): `_replace_file_nodes_tx` clears them on a kept node
+#: whose new extraction has none. Match keys and `proj` are written apart
+#: (`write_match_keys`).
+_OPTIONAL_CODE_PROPERTIES = ("description", "docstring_full", "kind")
+
+
 def _replace_file_nodes_tx(
     tx,
     repo_id: str,
@@ -1351,6 +1359,14 @@ def _replace_file_nodes_tx(
     nodes = [
         {**node, "properties": {**(node.get("properties") or {}), "shared_claims": record}}
         if node["label"] == "Module" and node["name"] == file_name else node
+        for node in nodes
+    ]
+    # A kept node's optional properties the new extraction leaves out (a
+    # removed docstring) are removed, as a fresh scan would never write them.
+    nodes = [
+        {**node, "properties": {**dict.fromkeys(_OPTIONAL_CODE_PROPERTIES), **(node.get("properties") or {})}}
+        if (node.get("properties") or {}).get("file") == file_name
+        or (node["label"] == "Module" and node["name"] == file_name) else node
         for node in nodes
     ]
     _upsert_nodes_tx(tx, nodes)

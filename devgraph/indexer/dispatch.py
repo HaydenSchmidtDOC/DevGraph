@@ -197,9 +197,15 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: that class's member, its own or one it inherits from a class of its
 #: file (heir keys in `mkeys`, a Module's `heir_open`); JSX rendered from
 #: callbacks, class components and wrappers; Rust module re-exports and
-#: inline-module `pub use`; C# ImplicitUsings; and Go dot imports.
+#: inline-module `pub use`; C# ImplicitUsings; and Go dot imports; 19:
+#: Python definitions under compound statements (`if`, `try`, `with`, ...)
+#: and classes defined in functions, same-named definitions of one scope
+#: merged into one node, and Java enum members; Python routes read from the
+#: syntax tree (one framework per decorator, Flask `methods` lists, no
+#: route from a comment or docstring); JS/TS object-literal methods,
+#: CommonJS exports and functions declared in blocks.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 18
+INDEX_FORMAT = 19
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -1177,7 +1183,19 @@ def _index_paths(
             # Read back only for a file a Service owns (the function's own first test).
             if _match_owning_service(services, rel_path) is not None:
                 content = extractions.load(entry)[2]
-                service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
+                owned = partial(_owning_service_relationships, repo_id, rel_path, content, services)
+                try:
+                    service_rels.extend(owned())
+                except RecursionError:
+                    # As pass 1 read it: again on a deep stack, and a file
+                    # deeper still writes none, never ending the batch.
+                    found: list[dict] = []
+                    try:
+                        _run_deep(lambda: len(found.extend(owned()) or found))
+                    except RecursionError as exc:
+                        _log_file_failure("owning-service edges skipped", repo_id, rel_path, exc)
+                        found = []
+                    service_rels.extend(found)
         for rel_path, names in sorted(route_endpoints.items()):
             service_rels.extend(_endpoint_service_relationships(repo_id, rel_path, names, services))
         for rel_path, stores in sorted(client_stores.items()):
@@ -1379,7 +1397,9 @@ def _index_single_path(
         # branch. Passed the repo-relative path (not bare filename) so
         # their 'source'/'file' provenance properties match what
         # delete_nodes_by_source_file looks up on file deletion.
-        api_nodes, api_rels = _api_nodes_and_rels(repo_id, rel_path, content)
+        api_nodes, api_rels = _api_nodes_and_rels(
+            repo_id, rel_path, content, config.python_roots(rel_path) if config is not None else (),
+        )
         nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content) + api_nodes
         rels = [r.to_dict() for r in result.relationships] + api_rels
         # Delete this file's previously-indexed nodes and write the
@@ -3186,8 +3206,10 @@ def _endpoint_service_relationships(
     ]
 
 
-def _api_nodes_and_rels(repo_id: str, rel_path: str, content: str) -> tuple[list[dict], list[dict]]:
-    result = APIExtractor(repo_id).extract_from_source(content, rel_path)
+def _api_nodes_and_rels(
+    repo_id: str, rel_path: str, content: str, roots: tuple[str, ...] = (),
+) -> tuple[list[dict], list[dict]]:
+    result = APIExtractor(repo_id).extract_from_source(content, rel_path, roots)
     nodes = [
         {"label": "Endpoint", "repo_id": repo_id, "name": f"{e.method} {e.path}", "properties": e.properties}
         for e in result.endpoints

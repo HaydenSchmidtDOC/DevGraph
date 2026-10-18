@@ -382,6 +382,49 @@ The React fixture, extended with a list callback's and a render prop's
 elements, a class component, and memo, forwardRef and styled components,
 goes from 16 of 23 calls to 23 of 23, linked precision 100 %.
 
+**Definitions beyond declarations** (index format 19, audit 7 item 6).
+Only class and function declarations and `const x = <function>` were
+Functions, so service objects, CommonJS handlers and functions declared in
+a block had no node and their calls were attributed to no one (an
+`export const` that defined no function even lost its module-level calls).
+
+- **Object literals.** A *defined* object literal (`_object_path`: a
+  declarator's value, `exports.x = {...}`, `module.exports = {...}`, an
+  object-valued property of one, through `( )`, `as` and `satisfies`)
+  makes a Function of each method (`async getUser() {}`, getters too) and
+  each function-valued property (`deleteUser: async () => ...`, through a
+  component wrapper), owned by the binding's name below the scope's own
+  owner (`userService`, `userService.admin`, `outer.local` in a function
+  `outer`; `module.exports`'s are top-level, owner "", or `exports`
+  (`EXPORTS_OWNER`) when a top-level function of the file has the name,
+  so `function create() {}` and `module.exports.create = function ...`
+  are two nodes, never one), with `CONTAINS`
+  from the scope. An object passed as an argument or returned defines
+  nothing. Its other properties' calls are the scope's.
+- **CommonJS exports.** At the module's top level, `exports.x = <function>`
+  and `module.exports.x = <function>` are a top-level Function `x` (owned
+  by `exports` when a top-level function of the file is named `x`).
+- **Blocks.** A definition inside `if`/`else`, `try`/`catch`/`finally`, a
+  loop, `switch` or a labelled statement (`_compound_statements`) is its
+  scope's own, at the module and in a function, as a direct one is. Two
+  definitions of one name in one scope are one node, the first
+  (`common.merge_same_nodes`, as in Python).
+- **Calls to them.** `userService.getUser()` on a module-level object
+  binding of the file, and `exports.handler()`/`module.exports.handler()`,
+  are pinned to the file and the member's owner, when the object (or the
+  exports) define that member; any other member (a shorthand `{ helper }`)
+  links as before. From another file the import binding's tiers apply:
+  a named import's or a `require`'s files, any member of the name there
+  (an import names no owner: an instance of a class bound to the same
+  name owns its members through its class). `this.m()` in an object
+  literal's method is a by-name call. `_named_function` treats exactly
+  these values as Functions, so the walk of the enclosing scope leaves
+  them out.
+
+The fuzz's `op_ts_service` adds and removes such a service (`svc`, with a
+nested object and a function declared in an `if`) in a TS file, which
+others call as `svc.run()`.
+
 ## Kotlin parse recovery (`devgraph/indexer/kotlin/extractor.py`)
 
 1. When the tree has errors, reparse a same-length patch that turns ` }`

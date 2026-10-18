@@ -231,6 +231,23 @@ _LIBRARY_TYPES = frozenset({
 _FUNC_TYPES = (*_METHOD_DECL_TYPES, "lambda_expression")
 
 
+def _members(body: Node) -> list[Node]:
+    """A type body's member declarations: an enum's methods, fields and
+    nested types sit in its `enum_body_declarations`, and an enum
+    constant's own body (`ACTIVE { void x() {} }`) declares members of the
+    enum too (one node per name and owner, as overloads are)."""
+    found: list[Node] = []
+    for child in body.named_children:
+        if child.type == "enum_body_declarations":
+            found += child.named_children
+        elif child.type == "enum_constant":
+            constant_body = child.child_by_field_name("body")
+            found += constant_body.named_children if constant_body is not None else []
+        else:
+            found.append(child)
+    return found
+
+
 def _type_name(node: Node | None, source: bytes) -> str | None:
     """A declared type as the simple name the resolver looks up (`List<X>`
     -> List, `a.b.C` -> C, `Outer.Inner` -> Inner); None for a primitive,
@@ -273,7 +290,7 @@ class _JavaResolver:
                     self.methods.setdefault(name, set())
                     self.bases[name] = _extract_supertype_names(node, source)
                     fields = self.fields.setdefault(name, {})
-                    for child in body.named_children if body is not None else []:
+                    for child in _members(body) if body is not None else []:
                         if child.type in _METHOD_DECL_TYPES:
                             method = child.child_by_field_name("name")
                             if method is not None:
@@ -570,7 +587,7 @@ def _spring_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
                 continue
             inner = [_text(name, source), *classes]
             mapped = _annotations(node, source)
-            for member in body.named_children:
+            for member in _members(body):
                 method = member.child_by_field_name("name")
                 if member.type == "method_declaration" and method is not None:
                     for http_method, path in spring_routes(mapped, _annotations(member, source)):
@@ -579,6 +596,30 @@ def _spring_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
             walk(body, inner)
 
     walk(root, [])
+
+
+def _merge_constant_members(result: ExtractionResult, constant_members: set[int]) -> None:
+    """An enum constant's body declares members of the enum (`ACTIVE {
+    boolean isActive() {...} }`), one identity with the enum's own member
+    of the name: such a node is dropped when the enum declares a member of
+    its identity itself, or an earlier constant does, so the first
+    declaration wins (as common.merge_same_nodes: its properties and
+    lines), the enum's own before any constant's. Its calls stay the
+    node's. Overloads the enum (or any class) declares itself stay
+    separate nodes, as everywhere in Java."""
+
+    def identity(node: GraphNode) -> tuple:
+        return node.label, node.name, node.properties.get("file"), node.properties.get("owner") or ""
+
+    seen = {identity(n) for n in result.nodes if id(n) not in constant_members and n.properties.get("file")}
+    nodes: list[GraphNode] = []
+    for node in result.nodes:
+        if id(node) in constant_members:
+            if identity(node) in seen:
+                continue
+            seen.add(identity(node))
+        nodes.append(node)
+    result.nodes = nodes
 
 
 def extract_java_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
@@ -619,6 +660,9 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
     resolver = _JavaResolver(root, source_bytes, file_path, _package_name(root, source_bytes))
     result.relationships += import_rows(file_path, repo_id, resolver.import_files, resolver.import_pins)
     sites = CallSites()
+    # The nodes of enum constants' bodies (`ACTIVE { ... }`), merged into
+    # the enum's member of their identity (`_merge_constant_members`).
+    constant_members: set[int] = set()
 
     def _record_calls(
         node: Node, body: Node, caller_label: str, caller_name: str, classes: list[str]
@@ -645,6 +689,17 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
                 _visit_function(node, parent_name, parent_label, prev_sibling, classes)
             elif node.type == "block_comment":
                 pass  # only relevant as a *following* node's javadoc, handled via prev_sibling
+            elif node.type == "enum_body_declarations":
+                visit_block(node, parent_name, parent_label, classes)  # an enum's methods, fields, nested types
+            elif node.type == "enum_constant" and node.child_by_field_name("body") is not None:
+                # A constant with a body: its arguments' calls are the
+                # enum's, its body's members the enum's members.
+                arguments = node.child_by_field_name("arguments")
+                if arguments is not None:
+                    _record_calls(node, arguments, parent_label, parent_name if parent_name else file_path, classes)
+                first = len(result.nodes)
+                visit_block(node.child_by_field_name("body"), parent_name, parent_label, classes)
+                constant_members.update(id(each) for each in result.nodes[first:])
             else:
                 # Field declarations, static/instance initializers, enum
                 # constants, etc: not a def, but may still contain calls
@@ -754,6 +809,7 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
             _record_calls(node, body_node, "Function", func_name, classes)
 
     visit_block(root, None, "Module", [])
+    _merge_constant_members(result, constant_members)
     result.relationships += sites.rows(file_path, repo_id)
     _spring_routes(root, source_bytes, result, file_path, repo_id)
     add_heir_keys(result, [

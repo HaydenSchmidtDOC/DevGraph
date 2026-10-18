@@ -41,6 +41,7 @@ __all__ = [
     "class_member_pin",
     "heir_keys",
     "member_owner",
+    "merge_same_nodes",
     "module_pin_name",
     "name_ref_properties",
     "own_edges",
@@ -390,6 +391,26 @@ def owner_matches(
         )
         for owner in owners
     )
+
+
+def merge_same_nodes(result: ExtractionResult) -> None:
+    """Merge, in place, the nodes of `result` that share one identity
+    (label, name, file and owner): two definitions of a name in one scope
+    (`try: def f(): ... except ImportError: def f(): ...`, a property and
+    its setter) are one node, whatever order the writes take. The first in
+    source order is that node, as it stands (its properties and its lines,
+    so the node never spans a definition between the two); a later one
+    adds only its calls, which the extractor records for the same node."""
+    seen: set[tuple] = set()
+    nodes: list[GraphNode] = []
+    for node in result.nodes:
+        file = node.properties.get("file")
+        key = (node.label, node.name, file, node.properties.get("owner") or "")
+        if file and key in seen:
+            continue
+        seen.add(key)
+        nodes.append(node)
+    result.nodes = nodes
 
 
 def own_edges(result: ExtractionResult, file_path: str) -> ExtractionResult:
