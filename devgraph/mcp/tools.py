@@ -31,9 +31,9 @@ from devgraph.config.project_schema import (
 from devgraph.config.project_tools import DEFAULT_TIMEOUT_S
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
-from devgraph.indexer.datastores.extractor import _TEST_DIR
 from devgraph.indexer.source_text import decode_source_as, declared_encoding, is_python_path
 from devgraph.paths import is_within
+from devgraph.test_paths import TEST_PATH_CYPHER, is_test_path
 from devgraph.registry.store import RepoRegistry
 from devgraph.analytics.insights import INSIGHT_METRICS, community_members, read_insights, top_nodes
 
@@ -147,31 +147,14 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     return "\n".join(parts)
 
 
-#: A test file's name: Python `test_*.py`, `*_test.py` and `conftest.py`, Go
-#: `*_test.go`, JS/TS `*.spec.ts`/`*.test.tsx` and the like, C#/Java/Kotlin
-#: `*Test.java`/`*Tests.cs`.
-_TEST_FILE = re.compile(
-    r"(?:^|/)(?:test_[^/]*\.py|[^/]*_test\.(?:py|go)|conftest\.py|[^/]*\.(?:spec|test)\.[cm]?[jt]sx?"
-    r"|[^/]*Tests?\.(?:cs|java|kt))$"
-)
-#: Test code by its repo-relative path: a file under a conventional test folder
-#: (the datastore extractor's `_TEST_DIR`: `test/`, `tests/`, `__tests__/`,
-#: `src/test/`, `*.Tests/`) or with a test file's name (`_TEST_FILE`).
-TEST_PATH = re.compile(f"{_TEST_DIR.pattern}|{_TEST_FILE.pattern}")
-#: `TEST_PATH` as a Cypher `=~` pattern, which must match the whole string.
-_TEST_PATH_CYPHER = f".*(?:{TEST_PATH.pattern}).*"
-
-
-def is_test_path(path: str | None) -> bool:
-    """Whether a repo-relative path is test code (`TEST_PATH`); None is not."""
-    return bool(path) and TEST_PATH.search(path) is not None
-
-
-def _tests_last(rows: list[dict[str, Any]], include_tests: bool) -> tuple[list[dict[str, Any]], int]:
-    """`rows` with the test-code ones (by `file`, `is_test_path`) after the rest,
-    in their order, or left out when not `include_tests`; and how many there are."""
-    tests = [row for row in rows if is_test_path(row.get("file"))]
-    production = [row for row in rows if not is_test_path(row.get("file"))]
+def _tests_last(
+    rows: list[dict[str, Any]], include_tests: bool, path: str = "file"
+) -> tuple[list[dict[str, Any]], int]:
+    """`rows` with the test-code ones (by their `path` key, devgraph/test_paths.py
+    `is_test_path`) after the rest, each part in its order, or left out when not
+    `include_tests`; and how many test rows there are."""
+    tests = [row for row in rows if is_test_path(row.get(path))]
+    production = [row for row in rows if not is_test_path(row.get(path))]
     return (production + tests if include_tests else production), len(tests)
 
 
@@ -412,28 +395,35 @@ def _name_variants(query: str, terms: list[str]) -> list[str]:
     return list(dict.fromkeys(variants))
 
 
-def _shadowed_stub(var: str = "n", labels: tuple[str, ...] = schema.FILE_SCOPED_LABELS) -> str:
-    """Cypher: node `var` is a file-less node of one of `labels` (file-scoped
-    ones: a route's handler stub Function, a C++ out-of-class method's Class
-    stub) while a node of its label and name in its repository has a file.
-    Tools answer with that real node and leave the stub out (fold it in); a
-    stub with no such real node (an unresolved handler) is kept."""
-    shadowed = " OR ".join(
-        f"({var}:`{label}` AND EXISTS {{ MATCH (twin:`{label}`) "
-        f"WHERE twin.repo_id = {var}.repo_id AND twin.name = {var}.name AND twin.file <> '' }})"
-        for label in labels if label in schema.FILE_SCOPED_LABELS
+def _fold_target(var: str, out: str = "folded") -> str:
+    """Cypher `CALL` binding `out` to the real Function the route handler stub
+    `var` provably stands for, or to null: for any node that is no handler stub
+    (a file-less Function), and for a stub that stands for no single Function.
+    A stub stands for the one Function of its name its endpoint's handler
+    reference resolved to (both implement one Endpoint), or, when it resolved
+    to none, the one Function of its name in the route files that claim the
+    stub (its `sources`). Always one row: the aggregation has no grouping key.
+    Tools answer with that Function and leave the stub out; a stub that stands
+    for none stays visible (an unresolved handler)."""
+    return (
+        f"CALL ({var}) {{ WITH {var} WHERE {var}:Function AND coalesce({var}.file, '') = '' "
+        f"MATCH (twin:Function) WHERE twin.repo_id = {var}.repo_id AND twin.name = {var}.name AND twin.file <> '' "
+        f"WITH twin, EXISTS {{ ({var})<-[:IMPLEMENTS]-(:Endpoint)-[:IMPLEMENTS]->(twin) }} AS linked, "
+        f"twin.file IN coalesce({var}.sources, []) AS local "
+        "WITH collect(CASE WHEN linked THEN twin END) AS linked, collect(CASE WHEN local THEN twin END) AS local "
+        f"RETURN CASE WHEN size(linked) = 1 THEN linked[0] WHEN size(linked) = 0 AND size(local) = 1 THEN local[0] "
+        f"END AS {out} }}\n"
     )
-    return f"(coalesce({var}.file, '') = '' AND ({shadowed}))" if shadowed else "false"
 
 
 def _search_branches(labels: tuple[str, ...], where: str, unwind: bool = False) -> str:
     """`CALL () { ... }` over one MATCH per label, so each can use its label's indexes.
 
-    A file-scoped label's file-less node (a route's handler stub) is left out when
-    a real node of that label shares its name (`_shadowed_stub`)."""
+    A route's handler stub is left out when it stands for a real Function
+    (`_fold_target`)."""
     branches = []
     for label in labels:
-        stub = f" AND NOT {_shadowed_stub('n', (label,))}" if label in schema.FILE_SCOPED_LABELS else ""
+        stub = f" {_fold_target('n')}  WITH n, folded WHERE folded IS NULL" if label == "Function" else ""
         unwound = "UNWIND $names AS p " if unwind else ""
         branches.append(f"  {unwound}MATCH (n:`{label}`) WHERE {where}{stub} RETURN n")
     return "CALL () {\n" + "\n  UNION\n".join(branches) + "\n}\n"
@@ -562,9 +552,9 @@ _DESCRIBE_HINT = (
 )
 
 _DESCRIBE_NEIGHBOUR = (
-    "m.repo_id = $repo_id AND NOT m:Repository AND NOT " + _shadowed_stub("m") + " "
+    "raw.repo_id = $repo_id AND NOT raw:Repository "
     "AND ($types IS NULL OR type(r) IN $types) "
-    "AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))"
+    "AND ($labels IS NULL OR any(l IN labels(raw) WHERE l IN $labels))"
 )
 #: The labels whose `owner` keys a node within its file (the declarations it
 #: is in, "" at the top level; see devgraph/graph/schema.py FILE_SCOPED_LABELS).
@@ -573,30 +563,33 @@ _OWNED_LABELS = schema.FILE_SCOPED_LABELS
 #: without a `file` (a declared type's `owner` field is its own).
 _OWNER_OF = "CASE WHEN {v}.file IS NOT NULL THEN coalesce({v}.owner, '') END"
 
+# Each neighbour (`raw`) is listed as the Function it folds into when it is a
+# route's handler stub (`_fold_target`), so a handler is listed once.
 _DESCRIBE_GROUPS = f"""
 MATCH (n) WHERE elementId(n) IN $ids
 CALL (n) {{
-  MATCH (n)-[r]->(m)
+  MATCH (n)-[r]->(raw)
   WHERE $direction IN ['both','out'] AND {_DESCRIBE_NEIGHBOUR}
-  RETURN 'out' AS dir, type(r) AS rel, m
+  RETURN 'out' AS dir, type(r) AS rel, raw
   UNION
-  MATCH (n)<-[r]-(m)
+  MATCH (n)<-[r]-(raw)
   WHERE $direction IN ['both','in'] AND {_DESCRIBE_NEIGHBOUR}
-  RETURN 'in' AS dir, type(r) AS rel, m
+  RETURN 'in' AS dir, type(r) AS rel, raw
 }}
+{_fold_target("raw")}WITH dir, rel, coalesce(folded, raw) AS m
 WITH dir, rel, count(DISTINCT m) AS total
 ORDER BY dir, rel
 LIMIT {_DESCRIBE_MAX_GROUPS + 1}
 CALL (dir, rel) {{
   MATCH (n) WHERE elementId(n) IN $ids
   CALL (n, dir, rel) {{
-    MATCH (n)-[r:$(rel)]->(m) WHERE dir = 'out' RETURN m
+    MATCH (n)-[r:$(rel)]->(raw) WHERE dir = 'out' RETURN raw
     UNION
-    MATCH (n)<-[r:$(rel)]-(m) WHERE dir = 'in' RETURN m
+    MATCH (n)<-[r:$(rel)]-(raw) WHERE dir = 'in' RETURN raw
   }}
-  WITH m WHERE m.repo_id = $repo_id AND NOT m:Repository AND NOT {_shadowed_stub("m")}
-    AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))
-  WITH DISTINCT m
+  WITH raw WHERE raw.repo_id = $repo_id AND NOT raw:Repository
+    AND ($labels IS NULL OR any(l IN labels(raw) WHERE l IN $labels))
+  {_fold_target("raw")}  WITH DISTINCT coalesce(folded, raw) AS m
   ORDER BY m.name, coalesce(m.file, m.path), m.owner
   LIMIT $cap
   RETURN collect({{
@@ -607,13 +600,12 @@ RETURN dir, rel, total, refs
 """
 
 
-#: The file-less stubs of `$name` (a route's handler stubs) when exactly one node
-#: of `label` and that name has a file: describe_node folds their
-#: relationships into that node's. `label` is a file-scoped label.
-_FOLDED_STUBS = """
-MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.name = $name AND n.file <> ''
-WITH count(n) AS real WHERE real = 1
-MATCH (s:`{label}`) WHERE s.repo_id = $repo_id AND s.name = $name AND coalesce(s.file, '') = ''
+#: The handler stubs that stand for the Function `$id` (`_fold_target`):
+#: describe_node lists their relationships as that Function's.
+_FOLDED_STUBS = f"""
+MATCH (real:Function) WHERE elementId(real) = $id
+MATCH (s:Function) WHERE s.repo_id = real.repo_id AND s.name = real.name AND coalesce(s.file, '') = ''
+{_fold_target("s")}WITH s, folded WHERE folded = real
 RETURN elementId(s) AS id
 """
 
@@ -662,13 +654,15 @@ def _lookup_cypher(labels: tuple[str, ...], declared: frozenset[str]) -> str:
     """One single-property branch per label, so each can seek on its own index.
 
     Every label gets a name branch; only declared (provider) labels carry
-    `path`, so only they get a path branch. A handler stub is left out when a
-    real node has its name (`_shadowed_stub`). Labels are validated identifiers.
+    `path`, so only they get a path branch. A route's handler stub is left out
+    when it stands for a real Function (`_fold_target`). Labels are validated
+    identifiers.
     """
     tail = "AND NOT n:Repository AND ($file IS NULL OR $file IN [n.file, n.path, n.source_file])"
+    unfolded = f" {_fold_target('n')}  WITH n, folded WHERE folded IS NULL"
     body = "\n  UNION\n".join(
         f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.{key} = $name {tail}"
-        f"{f' AND NOT {_shadowed_stub()}' if label in _OWNED_LABELS else ''} RETURN n"
+        f"{unfolded if label == 'Function' else ''} RETURN n"
         for label in labels
         for key in (("name", "path") if label in declared else ("name",))
     )
@@ -939,6 +933,13 @@ def _node_ref(row: dict[str, Any]) -> dict[str, Any]:
     return ref
 
 
+def _unresolved_marked(ref: dict[str, Any]) -> dict[str, Any]:
+    """A candidate ref, with `unresolved_handler: true` when it is a route's
+    handler stub left visible because it folds into no single real Function
+    (`_fold_target`): a file-less Function."""
+    return {**ref, "unresolved_handler": True} if ref["label"] == "Function" and ref.get("file") is None else ref
+
+
 def _visible_properties(props: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """Properties minus bookkeeping, sanitised for display and capped; and whether any were dropped."""
     from devgraph.mcp.tool_plane import _sanitize_deep
@@ -1012,10 +1013,12 @@ def describe_node(
         refs (and `owner` for a method or nested class); or `{"status":
         "ambiguous", "count", "candidates", "truncated"}`.
         No match raises ToolError with suggestions. `Repository` nodes are never
-        matched or listed. A route's file-less handler stub is neither matched
-        nor listed when a node of its label and name has a file
-        (`_shadowed_stub`); when exactly one such node does, the stub's
-        relationships are folded into its groups.
+        matched or listed. A route's handler stub that folds into a real
+        Function (`_fold_target`: the one Function its endpoint's handler
+        reference resolved to, or else the one of its name in its route file) is not
+        matched, is listed as that Function among neighbours, and has its
+        relationships folded into that Function's groups; any other stub
+        stays visible (an unresolved handler, file null).
     """
     file = _normalize_file(file)
     if not name.strip():
@@ -1063,7 +1066,7 @@ def describe_node(
 
     if len(rows) > 1:
         candidates = sorted(
-            (_node_ref(row) for row in rows),
+            (_unresolved_marked(_node_ref(row)) for row in rows),
             key=lambda r: (r["label"], r["name"], r.get("file") or "", r.get("owner") or ""),
         )
         return {
@@ -1075,12 +1078,11 @@ def describe_node(
 
     (row,) = rows
     properties, properties_truncated = _visible_properties(row["properties"])
-    node = {**_node_ref(row), "properties": properties, "properties_truncated": properties_truncated}
+    node = {**_unresolved_marked(_node_ref(row)), "properties": properties, "properties_truncated": properties_truncated}
     ids = [row["id"]]
-    if row["label"] in _OWNED_LABELS and row.get("file"):
-        # Fold in the handler stub of a node that is the only one of its name with a file.
-        stubs, _ = _read(engine, _FOLDED_STUBS.format(label=row["label"]), {"repo_id": repo_id, "name": row["name"]}, 2)
-        ids += [stub["id"] for stub in stubs if stub["id"] is not None]
+    if row["label"] == "Function" and row.get("file"):
+        stubs, _ = _read(engine, _FOLDED_STUBS, {"id": row["id"]}, _DESCRIBE_MAX_CANDIDATES)
+        ids += [stub["id"] for stub in stubs]
     groups, groups_truncated = _read(
         engine,
         _DESCRIBE_GROUPS,
@@ -1434,14 +1436,18 @@ def trace_request_flow(
 
     Returns:
         Dict with `components` (the start endpoints and every node within five
-        hops, each {name, labels, repo_id}) and `edges` ({type} per relationship).
-        A route's file-less handler stub is left out when a node of its name has
-        a file (`_shadowed_stub`), so each handler is listed once.
+        hops, each {name, labels, repo_id}) and `edges` ({type, from, to} per
+        relationship, `from`/`to` naming its components). A route's handler
+        stub that folds into a real Function (`_fold_target`) is listed as that
+        Function, its edges with it, and the flow goes on from the Function's
+        calls (four more hops); a stub that folds into none stays listed as it is.
 
     Raises:
         ToolError: no endpoint has that name or path.
     """
     repo_filter = _cross_scope("start", "AND") if cross_repo else "AND start.repo_id = $repo_id"
+    node = "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id}"
+    edge = "{id: elementId(r), type: type(r), start: elementId(startNode(r)), end: elementId(endNode(r))}"
     cypher = f"""
     MATCH (start:Endpoint)
     WHERE (start.name = $endpoint OR ($bare AND start.name ENDS WITH ' ' + $endpoint))
@@ -1450,23 +1456,43 @@ def trace_request_flow(
     CALL (starts) {{
         UNWIND starts AS s
         MATCH (s)-[rels*1..5]->(node)
-        WHERE NOT {_shadowed_stub("node")}
         UNWIND rels AS r
         RETURN collect(DISTINCT node) AS reached, collect(DISTINCT r) AS edges
     }}
-    RETURN
-        [n IN starts + [m IN reached WHERE NOT m IN starts] |
-         {{name: n.name, labels: labels(n), repo_id: n.repo_id}}] AS components,
-        [r IN edges | {{type: type(r)}}] AS edges
+    CALL (reached) {{
+        UNWIND reached AS raw
+        {_fold_target("raw")}
+        WITH raw, folded WHERE folded IS NOT NULL
+        RETURN collect({{stub: elementId(raw), target: elementId(folded)}}) AS folds, collect(DISTINCT folded) AS targets
+    }}
+    CALL (targets) {{
+        UNWIND targets AS t
+        MATCH (t)-[rels*1..4]->(node)
+        UNWIND rels AS r
+        RETURN collect(DISTINCT node) AS further, collect(DISTINCT r) AS further_edges
+    }}
+    RETURN [n IN starts | {node}] AS starts, [n IN reached + targets + further | {node}] AS nodes,
+        folds, [r IN edges + further_edges | {edge}] AS edges
     """
     params = {"endpoint": start_endpoint, "bare": not any(ch.isspace() for ch in start_endpoint.strip())}
     if not cross_repo:
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if not results or not results[0]["components"]:
+    if not results or not results[0]["starts"]:
         raise _not_found(engine, repo_id, "endpoint", start_endpoint, ("Endpoint",), cross_repo)
-    return results[0]
+    (row,) = results
+    fold = {f["stub"]: f["target"] for f in row["folds"]}
+    nodes: dict[str, dict[str, Any]] = {}
+    for n in row["starts"] + row["nodes"]:
+        if n["id"] not in fold:
+            nodes.setdefault(n["id"], {k: n[k] for k in ("name", "labels", "repo_id")})
+    edges: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for e in row["edges"]:
+        start, end = fold.get(e["start"], e["start"]), fold.get(e["end"], e["end"])
+        if start in nodes and end in nodes:
+            edges.setdefault((e["type"], start, end), {"type": e["type"], "from": nodes[start]["name"], "to": nodes[end]["name"]})
+    return {"components": list(nodes.values()), "edges": list(edges.values())}
 
 
 def get_service_dependencies(
@@ -1593,7 +1619,7 @@ def find_callers(
     class_filter = "AND rel.caller_class = $scope_to_class" if scope_to_class else ""
     recency_filter = "AND target.last_modified_at >= $cutoff" if cutoff is not None else ""
     resolved_filter = "AND rel.confidence IN ['resolved', 'package']" if resolved_only else ""
-    cypher = f"""
+    callers = f"""
     {_named_nodes(labels, "target_name", cross_repo, "target")}
     MATCH (caller)-[rel:CALLS]->(target)
     WHERE true
@@ -1602,9 +1628,14 @@ def find_callers(
     {resolved_filter}
     AND ($file IS NULL OR target.file = $file)
     AND {_OWNER_MATCH.replace("n.", "target.")}
+    """
+    is_test = "coalesce(caller.file, caller.source_file, '') =~ $test_path"
+    cypher = f"""
+    {callers}
     WITH caller, min(CASE rel.confidence WHEN 'resolved' THEN 0 WHEN 'package' THEN 1 WHEN 'name' THEN 3
                      ELSE 2 END) AS rank{target_files}
-    WITH *, coalesce(caller.file, caller.source_file, '') =~ $test_path AS is_test
+    WITH *, {is_test} AS is_test
+    WHERE $include_tests OR NOT is_test
     RETURN caller.name as name, labels(caller) as type, caller.repo_id as repo_id,
            coalesce(caller.file, caller.source_file) as file,
            {_OWNER_OF.format(v="caller")} as owner, caller.start_line as start_line,
@@ -1612,7 +1643,10 @@ def find_callers(
     ORDER BY is_test, rank, name, file
     LIMIT {LIST_ROW_LIMIT + 1}
     """
-    params = {"target_name": target_name, "file": file, "owner": owner, "test_path": _TEST_PATH_CYPHER}
+    params = {
+        "target_name": target_name, "file": file, "owner": owner, "test_path": TEST_PATH_CYPHER,
+        "include_tests": include_tests,
+    }
     if not cross_repo:
         params["repo_id"] = repo_id
     if scope_to_class:
@@ -1620,13 +1654,14 @@ def find_callers(
     if cutoff is not None:
         params["cutoff"] = cutoff
 
+    # Counted apart from the capped rows, so it is exact however many there are.
+    tests = _query(engine, f"{callers} WITH DISTINCT caller WHERE {is_test} RETURN count(caller) AS tests", params)
     results, more = _list_query(engine, cypher, params)
     results = [_located(row) for row in results]
     if ambiguous:
         results = [_with_target_files(row, row["target_files"]) for row in results]
-    results, test_count = _tests_last(results, include_tests)
     envelope = _capped_envelope(results, more, max_results)
-    envelope["test_count"] = test_count
+    envelope["test_count"] = tests[0]["tests"] if tests else 0
     if ambiguous:
         envelope["ambiguous_targets"] = ambiguous
     return envelope
@@ -1641,6 +1676,7 @@ def find_related_files(
     file: str | None = None,
     extra_labels: tuple[str, ...] = (),
     owner: str | None = None,
+    include_tests: bool = True,
 ) -> dict[str, Any]:
     """Find all files related to a component (via CONTAINS, IMPORTS, CALLS relationships).
 
@@ -1656,12 +1692,14 @@ def find_related_files(
             several same-named components
         extra_labels: The repository's declared labels, looked up besides the built-in ones
         owner: The declarations the component is in, as in find_callers (`A.run` too)
-        include_tests: If False, leave out dependents in test code (as in
-            find_callers); either way they come after every other dependent
+        include_tests: If False, leave out related modules and components in
+            test code (devgraph/test_paths.py, as in find_callers); either way
+            they come after the rest of each list
 
     Returns:
         Dict with containing_modules, imported_modules, and related_components,
-        each wrapped as {count, results, truncated} envelope objects.
+        each wrapped as {count, results, truncated, test_count} envelope
+        objects; test_count counts the list's entries in test code, listed or not.
         imported_modules are the names of what `component_name` IMPORTS: a
         Module's path, or, for a Kotlin import, the Class or Function it names.
         When components of that name lie in several files and `file` is not
@@ -1687,8 +1725,10 @@ def find_related_files(
     WITH CASE WHEN $split THEN n.file END AS target_file, m, imported, related
     RETURN target_file,
         COLLECT(DISTINCT m.name) as containing_modules,
-        COLLECT(DISTINCT imported.name) as imported_modules,
-        COLLECT(DISTINCT related.name) as related_components
+        COLLECT(DISTINCT CASE WHEN imported IS NOT NULL THEN {{name: imported.name,
+            path: coalesce(imported.file, imported.source_file, imported.name)}} END) as imported_modules,
+        COLLECT(DISTINCT CASE WHEN related IS NOT NULL THEN {{name: related.name,
+            path: coalesce(related.file, related.source_file)}} END) as related_components
     ORDER BY target_file
     """
     params = {"component_name": component_name, "file": file, "owner": owner, "split": bool(ambiguous)}
@@ -1697,16 +1737,22 @@ def find_related_files(
 
     results = _query(engine, cypher, params)
     keys = ("containing_modules", "imported_modules", "related_components")
-    if not ambiguous:
-        return {key: _envelope(results[0][key], max_results) for key in keys}
     answer: dict[str, Any] = {}
     for key in keys:
-        by_name: dict[str, list[str]] = {}
+        # One entry per name (a Module's name is its path), with the target
+        # files it was found for, in the order the rows list them.
+        by_name: dict[str, dict[str, Any]] = {}
         for row in results:
-            for name in row[key]:
-                by_name.setdefault(name, []).append(row["target_file"])
-        answer[key] = _envelope([_with_target_files({"name": name}, f) for name, f in by_name.items()], max_results)
-    answer["ambiguous_targets"] = ambiguous
+            for item in row[key]:
+                name, path = (item, item) if key == "containing_modules" else (item["name"], item["path"])
+                entry = by_name.setdefault(name, {"name": name, "path": None, "files": []})
+                entry["path"] = entry["path"] or path
+                entry["files"].append(row["target_file"])
+        shown, test_count = _tests_last(list(by_name.values()), include_tests, "path")
+        rows = [_with_target_files({"name": e["name"]}, e["files"]) if ambiguous else e["name"] for e in shown]
+        answer[key] = {**_envelope(rows, max_results), "test_count": test_count}
+    if ambiguous:
+        answer["ambiguous_targets"] = ambiguous
     return answer
 
 
@@ -1915,6 +1961,8 @@ def impact_analysis(
             several same-named components
         extra_labels: The repository's declared labels, looked up besides the built-in ones
         owner: The declarations the component is in, as in find_callers (`A.run` too)
+        include_tests: If False, leave out dependents in test code (as in
+            find_callers); either way they come after every other dependent
 
     Returns:
         Dict with direct_dependents and transitive_dependents ({name, type, file,
@@ -1931,7 +1979,8 @@ def impact_analysis(
         every target that reaches it within `IMPACT_MAX_DEPTH` hops; risk_level is
         the riskiest target's. Past that, one expansion covers them all, as for a
         single target, with a notice to pass `file`. Another same-named target can
-        itself be listed as a dependent. Each dependents envelope adds
+        itself be listed as a dependent. Each list is ordered by name, file and
+        owner, dependents in test code last, and its envelope adds
         `test_count`, its dependents in test code (listed or not); risk_level
         counts them too.
 
@@ -1942,6 +1991,7 @@ def impact_analysis(
     file = _normalize_file(file)
 
     def dependents_envelope(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        rows = sorted(rows, key=lambda d: (d["name"] or "", d.get("file") or "", d.get("owner") or "", d["type"] or ""))
         shown, test_count = _tests_last(rows, include_tests)
         return {**_envelope(shown, max_results), "test_count": test_count}
 
@@ -2726,8 +2776,9 @@ def get_source(
         `status: "ambiguous"`, `count`, `truncated` and `candidates`
         ({label, name, file, owner}; repo_id too when cross_repo): pass one's
         `file` and `owner`. The result names its `owner` too. A route's
-        file-less handler stub is left out when a node of its name has a file
-        (`_shadowed_stub`), so it never makes the handler ambiguous.
+        handler stub that folds into a real Function (`_fold_target`) is left
+        out, so it never makes its handler ambiguous; any other stub is a
+        candidate with file None.
         A file is decoded as the indexer decodes it (`source_text`): a
         Python coding line, else UTF-8, else cp1252 or Latin-1; when an
         undeclared file is not valid UTF-8, or a file isn't valid in its
@@ -2746,8 +2797,8 @@ def get_source(
     MATCH (n)
     WHERE (n:Function OR n:Class) AND {match}
     {repo_filter}
-    AND NOT {_shadowed_stub()}
     AND ($file IS NULL OR n.file = $file)
+    {_fold_target("n")}WITH n, folded WHERE folded IS NULL
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
            n.file as file, {_OWNER_OF.format(v="n")} as owner, n.start_line as start_line, n.end_line as end_line,
            n.docstring_full as docstring_full
@@ -2797,6 +2848,7 @@ def get_source(
             }
             for r in results[:_DESCRIBE_MAX_CANDIDATES]
         ]
+        candidates = [_unresolved_marked(c) for c in candidates]
         return {
             **empty,
             "status": "ambiguous",

@@ -60,7 +60,9 @@ def seeded(engine):
     ]
     nodes += [
         {"label": "Function", "repo_id": REPO, "name": "get", "properties": {"file": "api/client.py"}},
-        {"label": "Function", "repo_id": REPO, "name": "get", "properties": {"file": "", "type": "handler"}},
+        # The route in api/client.py naming `get`: a stub that stands for the real `get` there.
+        {"label": "Function", "repo_id": REPO, "name": "get",
+         "properties": {"file": "", "type": "handler", "source": "api/client.py", "sources": ["api/client.py"]}},
         {"label": "Function", "repo_id": REPO, "name": "orphan_handler", "properties": {"file": "", "type": "handler"}},
         {"label": "Function", "repo_id": REPO, "name": "invoice", "properties": {"file": "a/invoice.py"}},
         {"label": "Function", "repo_id": REPO, "name": "invoice", "properties": {"file": "b/invoice.py"}},

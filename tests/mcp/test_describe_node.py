@@ -159,7 +159,7 @@ def test_repository_is_excluded_everywhere():
 
     engine = StubEngine(([LOOKUP_ROW], False), ([], False))
     _found(engine)
-    assert "NOT m:Repository" in engine.calls[1]["query"]
+    assert "NOT raw:Repository" in engine.calls[1]["query"]
 
 
 def test_file_filter_is_a_parameter():
@@ -170,8 +170,10 @@ def test_file_filter_is_a_parameter():
     assert "src/app.py" not in lookup["query"]
     for prop in ("n.file", "n.path", "n.source_file"):
         assert prop in lookup["query"]
-    assert "n.source " not in lookup["query"] and "n.source]" not in lookup["query"]
-    assert "n.sources" not in lookup["query"]
+    # The file filter never matches a shared node's `source`/`sources` (only a
+    # handler stub's fold test reads `sources`).
+    filters = re.findall(r"\$file IN \[([^\]]*)\]", lookup["query"])
+    assert filters and set(filters) == {"n.file, n.path, n.source_file"}
 
     engine = StubEngine(([LOOKUP_ROW], False), ([], False))
     _found(engine)
@@ -275,7 +277,11 @@ def test_groups_query_is_top_n_with_separate_count():
     assert "count(DISTINCT m)" in query
     subquery = query.index("CALL (n, dir, rel)")
     assert "LIMIT $cap" in query[subquery:]
-    assert "collect(" not in query[:subquery]
+    # Neighbours are only collected for the capped list; a handler stub's fold
+    # (`_fold_target`) collects its few same-named Functions, never neighbours.
+    from devgraph.mcp.tools import _fold_target
+
+    assert "collect(" not in query[:subquery].replace(_fold_target("raw"), "")
 
 
 @pytest.mark.parametrize("given, sent", [(1, 1), (500, 50), (10, 10)])

@@ -171,7 +171,7 @@ def test_trace_request_flow_takes_a_bare_path_for_any_method(client):
     assert {"GET /users/<id>", "DELETE /users/<id>", "AuthService"} <= names
     get = _answer(client, "trace_request_flow", {"start_endpoint": "GET /users/<id>"})
     assert {c["name"] for c in get["components"]} == {"GET /users/<id>", "AuthService"}
-    assert get["edges"] == [{"type": "CALLS"}]
+    assert get["edges"] == [{"type": "CALLS", "from": "GET /users/<id>", "to": "AuthService"}]
 
 
 def test_trace_request_flow_on_an_unknown_endpoint_is_an_error(client):

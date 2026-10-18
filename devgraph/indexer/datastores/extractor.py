@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Set
 
+from devgraph.test_paths import TEST_DIR
+
 
 class DatastoreType(str, Enum):
     """Types of datastores that can be detected."""
@@ -352,8 +354,6 @@ _GO_IMPORT_SPEC = re.compile(r"^\s*(?:[\w.]+\s+)?" + _STRING, re.M)
 _CALL_ARGUMENT = re.compile(r"[(,]\s*" + _STRING)
 _URL_SCHEME = re.compile(r"(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?)://")
 _JDBC_URL = re.compile(r"jdbc:(\w+):")
-#: Conventional test folders, whose files' clients are not read.
-_TEST_DIR = re.compile(r"(?:^|/)(?:tests?|__tests__|src/test|[^/]+\.Tests)/")
 
 
 def _masked(content: str, family: str) -> tuple[str, list[str]]:
@@ -452,11 +452,12 @@ def client_datastores(content: str, language: str, repo_id: str, filename: str) 
     string counting only as an import specifier or, for a connection or
     JDBC URL or a Go driver name, as an argument passed straight to a call
     (`new Pool('postgres://...')`, not `url = 'postgres://...'`). A file under
-    a conventional test folder (`test/`, `tests/`, `__tests__/`, `src/test/`,
-    `*.Tests/`) names none. Its `library` is the alphabetically first of the
+    a conventional test folder (devgraph/test_paths.py `TEST_DIR`: `test/`,
+    `tests/`, `spec/`, `__tests__/`, `fixtures/`, `src/test/`, `*.Tests/` and
+    the like) names none. Its `library` is the alphabetically first of the
     file's clients of that provider."""
     family = CLIENT_LANGUAGES.get(language)
-    if family is None or _TEST_DIR.search(filename):
+    if family is None or TEST_DIR.search(filename):
         return []
     code, strings = _masked(content, family)
     found: set[tuple[str, str, str]] = set()

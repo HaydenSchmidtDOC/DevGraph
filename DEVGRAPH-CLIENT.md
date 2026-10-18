@@ -280,12 +280,18 @@ before, with no `target_files`. `file` takes `\` or `/`, with or without a
 leading `./` (`get_source` also takes an absolute path inside the repository).
 
 **Route handlers**: a route also writes a file-less handler stub of its
-handler's name. `get_source`, `describe_node` and `trace_request_flow` answer
-with the real function and leave the stub out, so a handler is never
-`ambiguous` with its own stub and a flow lists it once; `describe_node` folds
-the stub's relationships into the function's when that function is the only
-one of its name with a file. A stub is only answered when no function of its
-name has a file (the handler's definition wasn't found).
+handler's name. A stub is folded into the one real function it provably
+stands for: the one its endpoint's handler reference resolved to (an
+`IMPLEMENTS` edge from the same endpoint), or, when it resolved to none, the
+only function of that name in the route's own file. A folded stub is left out
+of `search_component`, `get_source` and `describe_node`, neighbour lists show
+the function in its place, `describe_node` on the function includes the
+stub's relationships, and `trace_request_flow` lists the function (and
+follows its calls) with the stub's edges moved to it. A stub that stands for
+no single function (its handler wasn't found, or several functions qualify)
+stays visible: `describe_node` and `get_source` mark it
+`unresolved_handler: true` (file null), never folding it into an unrelated
+function of the same name.
 
 **Where an answer is, and one class's method**: every `find_callers` row
 names the caller's `file`, `owner` (the classes or functions it is declared
@@ -313,8 +319,8 @@ first (then the same name in other case), then names starting with or
 containing the whole query, then names equal to, starting with or containing
 one of its words (so `run_cypher` comes before the many functions named `run`),
 then description-only matches; each
-result carries its `file`, and a route's file-less handler stub is dropped
-when a real function of that name exists. Its `count` is the true number of
+result carries its `file`, and a route's handler stub is dropped when it
+folds into a real function (see Route handlers). Its `count` is the true number of
 matches, except when exact and prefix matches alone fill `max_results`: then
 the response adds `count_is_lower_bound: true`. `max_results` is capped at
 200. The whole query and each of its words (`user_service`, underscores kept)
@@ -373,7 +379,7 @@ Prefer these over re-reading files when the question is structural:
 | "What definitely calls X?" | `find_callers` with `resolved_only=True` (Python callers resolved through scope or imports) |
 | "What breaks if I change X?" | `impact_analysis` (name, not path; test-code dependents come last in each list, with `test_count`, and `include_tests=False` leaves them out) |
 | "What breaks across this whole PR/diff?" | `impact_analysis_for_diff` (base_ref/head_ref, both must exist locally — never fetches) |
-| "What does X depend on?" | `get_service_dependencies` (service name), `find_related_files` (function/class name, not path) |
+| "What does X depend on?" | `get_service_dependencies` (service name), `find_related_files` (function/class name, not path; entries in test code come last in each list, with `test_count`, and `include_tests=False` leaves them out) |
 | "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name like `GET /users/<id>`, or a bare path like `/users/<id>` for every method) |
 | "What changed recently?" | `list_recent_changes` (lists entities touched in the last N commits, most-recent first; filters by optional entity type) |
 | "What's the overall architecture?" | `explain_architecture` (each service's datastores: databases, vector stores, queues and caches), `summarise_repository` (node counts, `cache_count` included) |

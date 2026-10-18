@@ -642,8 +642,8 @@ def build_server(
         alone filled max_results). max_results is capped at 200. A snake_case query such as
         user_service also matches as a whole word. An exact name in unusual case (gEt for
         get) is found by the substring scan, so it can be missed when exact and prefix
-        matches alone fill max_results. A route's file-less handler stub is left out when a
-        real node has its name. Pass modified_within_commits to restrict to components touched within the last
+        matches alone fill max_results. A route's handler stub is left out when it folds
+        into the one real function it stands for. Pass modified_within_commits to restrict to components touched within the last
         N commits repo-wide (requires git-history recency staging; entities never staged
         are excluded, not silently included).
         Also searches node types the repository's devgraph.schema.yaml declares (for
@@ -740,9 +740,10 @@ def build_server(
         """Trace the request flow from an endpoint through services, datastores, and queues
         (every node within five hops). start_endpoint is an endpoint name like
         "GET /users/<id>", or a bare path like "/users/<id>" to start from that path's
-        endpoint for every method. A route's handler is listed once (its file-less stub is
-        left out when the real function exists). An unknown endpoint is an error with
-        similar names."""
+        endpoint for every method. A route's handler stub is listed as the one real
+        function it stands for (whose calls are followed too), or as itself when it
+        stands for none; edges are {type, from, to} between listed components. An
+        unknown endpoint is an error with similar names."""
         return devgraph_tools.trace_request_flow(engine, repo_id, start_endpoint, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
@@ -794,15 +795,17 @@ def build_server(
     @server.tool(annotations=_READ_ONLY)
     def find_related_files(
         repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None,
-        owner: str | None = None,
+        owner: str | None = None, include_tests: bool = True,
     ) -> dict[str, Any]:
-        """Find related files; each list returns {count, results, truncated} envelope. An
+        """Find related files; each list returns {count, results, truncated, test_count} envelope. An
         unknown component is an error with similar names. When the name is defined in
         several files, pass file (repo-relative path) to pick one; without it each row is
         {name, target_files} and ambiguous_targets lists them. Pass owner, or name a
-        method "A.run", to pick one class's method."""
+        method "A.run", to pick one class's method. Entries in test code come last in each
+        list (test_count counts them); include_tests=false leaves them out."""
         return devgraph_tools.find_related_files(
-            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo), owner
+            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo), owner,
+            include_tests,
         )
 
     @server.tool(annotations=_READ_ONLY)
@@ -984,8 +987,9 @@ def build_server(
         returns status "ambiguous" with candidates ({label, name, file, owner}) instead of
         picking one: pass the candidate's file (repo-relative path) and owner (the classes
         or functions it is declared in, "" at the top level) to choose. A method may also
-        be named with its class, "A.save" or "A::save". A route's file-less handler stub
-        never makes a handler ambiguous. A file that is not valid UTF-8 is
+        be named with its class, "A.save" or "A::save". A route's handler stub never makes
+        the one function it stands for ambiguous; a stub standing for none is a
+        candidate marked unresolved_handler. A file that is not valid UTF-8 is
         decoded with replacement characters, and a notice says so. An unknown name (or
         none of it in file, of owner) is an error with similar names; file may be
         repo-relative or an absolute path inside the repository."""
@@ -1007,8 +1011,9 @@ def build_server(
         direction, with each neighbour's identity. A file, folder or docs node is named by
         its repo-relative path or id; a method may be named with its class, "A.save" or
         "A::save". An ambiguous name returns candidates; call again with label, file and
-        owner. A route handler answers as its real function, with its file-less stub's
-        relationships folded in. A code symbol's ref carries owner (the classes or functions it is declared
+        owner. A route handler answers as its real function, with its stub's
+        relationships folded in when the stub provably stands for it; a stub that
+        doesn't is marked unresolved_handler. A code symbol's ref carries owner (the classes or functions it is declared
         in, "" at the top level), which picks it from a same-named one in its file. Each
         ref in the result is the next call's
         arguments. One hop per call, at most 50 neighbours per type; direction,
