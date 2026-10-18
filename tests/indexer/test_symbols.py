@@ -69,15 +69,25 @@ def test_container_is_not_self():
 
 
 def test_innermost_container_and_ordinals():
-    src = "class A:\n    class B:\n        def f(self): pass\n        def f(self): pass\n    def f(self): pass\n"
+    src = "class A:\n    class B:\n        def f(self): pass\n    def f(self): pass\n"
     got = {(s.kind, s.container, s.name, s.ordinal) for s in extract_symbols("m.py", src)}
     assert got == {
         ("Class", None, "A", 0),
         ("Class", "A", "B", 0),
         ("Function", "B", "f", 0),
-        ("Function", "B", "f", 1),
         ("Function", "A", "f", 0),
     }
+    # Java overloads are one symbol each, told apart by ordinal.
+    src = "class A { void f() {} void f(int x) {} }\n"
+    got = {(s.kind, s.container, s.name, s.ordinal) for s in extract_symbols("A.java", src)}
+    assert ("Function", "A", "f", 1) in got
+
+
+def test_one_scopes_same_named_python_defs_are_one_symbol():
+    """Like the graph's one node (common.merge_same_nodes), spanning both."""
+    src = "try:\n    def f():\n        return 1\nexcept ImportError:\n    def f():\n        return 2\n"
+    (f,) = [s for s in extract_symbols("m.py", src) if s.name == "f"]
+    assert (f.ordinal, f.start_line, f.end_line) == (0, 2, 6)
 
 
 def test_changed_entry_carries_both_sides_lines():

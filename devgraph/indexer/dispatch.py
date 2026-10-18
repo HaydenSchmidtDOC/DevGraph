@@ -192,9 +192,12 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: that class's member, its own or one it inherits from a class of its
 #: file (heir keys in `mkeys`, a Module's `heir_open`); JSX rendered from
 #: callbacks, class components and wrappers; Rust module re-exports and
-#: inline-module `pub use`; C# ImplicitUsings; and Go dot imports.
+#: inline-module `pub use`; C# ImplicitUsings; and Go dot imports; 19:
+#: Python definitions under compound statements (`if`, `try`, `with`, ...)
+#: and classes defined in functions, same-named definitions of one scope
+#: merged into one node, and Java enum members.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 18
+INDEX_FORMAT = 19
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:

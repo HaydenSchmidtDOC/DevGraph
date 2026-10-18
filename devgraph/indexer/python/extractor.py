@@ -35,6 +35,7 @@ from devgraph.indexer.common import (
     add_heir_keys,
     class_member_pin,
     member_owner,
+    merge_same_nodes,
     own_edges,
     owned_pin,
     split_owned_pin,
@@ -310,10 +311,39 @@ def _class_like(name: str) -> bool:
     return name[:1].isupper() and not name.isupper()
 
 
+#: Compound statements, and their clauses and blocks, whose body runs in
+#: the scope around them: a def under one is the scope's, as a direct one is.
+_COMPOUND = frozenset({
+    "if_statement", "elif_clause", "else_clause", "try_statement", "except_clause", "except_group_clause",
+    "finally_clause", "with_statement", "for_statement", "while_statement", "match_statement", "case_clause", "block",
+})
+
+
+def _definitions(node: Node | None) -> list[Node]:
+    """The class and function definitions (decorated or not) of a block, or
+    of one compound statement in it, in source order: its direct ones and
+    those under its compound statements (`if`/`elif`/`else`, `try`/`except`/
+    `else`/`finally`, `with`, `for`, `while`, `match`/`case`), never those
+    inside another definition."""
+    found: list[Node] = []
+
+    def walk(each: Node) -> None:
+        for child in each.named_children:
+            if child.type in ("function_definition", "class_definition", "decorated_definition"):
+                found.append(child)
+            elif child.type in _COMPOUND:
+                walk(child)
+
+    if node is not None:
+        walk(node)
+    return found
+
+
 def _direct_defs(block: Node | None, source: bytes) -> set[str]:
-    """Names of the functions defined directly in a block (decorated or not)."""
+    """Names of the functions a block defines (decorated or not), under its
+    compound statements too (`_definitions`)."""
     names: set[str] = set()
-    for node in block.named_children if block is not None else []:
+    for node in _definitions(block):
         definition = node.child_by_field_name("definition") if node.type == "decorated_definition" else node
         if definition is not None and definition.type == "function_definition":
             name_node = definition.child_by_field_name("name")
@@ -886,32 +916,40 @@ def extract_python_file(
         they see the class's enclosing scope."""
         def_scope, def_cls = (scope.parent, parent_name) if parent_label == "Class" else (scope, scope.cls)
         for node in block.named_children:
-            if node.type == "class_definition":
-                _visit_class(node, parent_name, parent_label, scope, parent_owner)
-            elif node.type in ("function_definition",):
-                _visit_function(node, parent_name, parent_label, def_scope, def_cls, parent_owner)
-            elif node.type == "decorated_definition":
-                # decorated_definition wraps decorator(s) + the actual definition.
-                definition = node.child_by_field_name("definition")
-                decorators = [c for c in node.named_children if c.type == "decorator"]
-                if definition is not None and definition.type == "class_definition":
-                    _visit_class(
-                        definition, parent_name, parent_label, scope, parent_owner, extra_decorators=decorators
-                    )
-                elif definition is not None and definition.type == "function_definition":
-                    _visit_function(
-                        definition, parent_name, parent_label, def_scope, def_cls, parent_owner,
-                        extra_decorators=decorators,
-                    )
-            else:
-                # Module/class-body-level statement (not a def) — attribute
-                # any call expressions in it to the enclosing scope (usually
-                # the Module, for top-level script code / constant setup).
-                caller_class = parent_name if parent_label == "Class" else None
-                record_calls(
-                    parent_label, parent_name if parent_name else file_path, node, scope, caller_class,
-                    parent_owner if parent_label != "Module" else None,
-                )
+            if node.type in ("class_definition", "function_definition", "decorated_definition"):
+                visit_definition(node, parent_name, parent_label, scope, def_scope, def_cls, parent_owner)
+                continue
+            # Module/class-body-level statement (not a def) — attribute
+            # any call expressions in it to the enclosing scope (usually
+            # the Module, for top-level script code / constant setup).
+            caller_class = parent_name if parent_label == "Class" else None
+            record_calls(
+                parent_label, parent_name if parent_name else file_path, node, scope, caller_class,
+                parent_owner if parent_label != "Module" else None,
+            )
+            # A def under a compound statement (`try:`, `if`, `with`, ...)
+            # is the block's own, as a direct one is.
+            for definition in _definitions(node) if node.type in _COMPOUND else []:
+                visit_definition(definition, parent_name, parent_label, scope, def_scope, def_cls, parent_owner)
+
+    def visit_definition(
+        node: Node, parent_name: str | None, parent_label: str, scope: _Scope, def_scope: _Scope,
+        def_cls: str | None, parent_owner: str,
+    ) -> None:
+        """Visit one class or function definition (decorated or not) of a
+        block: a class sees `scope`, a function `def_scope` with `self` of
+        `def_cls`."""
+        decorators: list[Node] = []
+        if node.type == "decorated_definition":
+            # decorated_definition wraps decorator(s) + the actual definition.
+            decorators = [c for c in node.named_children if c.type == "decorator"]
+            node = node.child_by_field_name("definition")
+        if node is not None and node.type == "class_definition":
+            _visit_class(node, parent_name, parent_label, scope, parent_owner, extra_decorators=decorators)
+        elif node is not None and node.type == "function_definition":
+            _visit_function(
+                node, parent_name, parent_label, def_scope, def_cls, parent_owner, extra_decorators=decorators,
+            )
 
     def _visit_class(
         node: Node,
@@ -1045,11 +1083,11 @@ def extract_python_file(
             )
         )
 
-        # Nested function definitions (rare, but Tree-sitter walks these fine),
-        # and CALLS edges for every call expression made directly in this
-        # function's body (not inside a nested def — _call_functions stops
-        # descending at nested function/class scopes so those calls get
-        # attributed to the nested function itself, not hoisted here).
+        # Nested function and class definitions (under compound statements
+        # too), and CALLS edges for every call expression made directly in
+        # this function's body (not inside a nested def — _call_functions
+        # stops descending at nested function/class scopes so those calls
+        # get attributed to the nested definition itself, not hoisted here).
         if body_node is not None:
             scope = _Scope(
                 _direct_defs(body_node, source_bytes), _local_types(node, body_node, source_bytes, fixtures), cls,
@@ -1058,14 +1096,8 @@ def extract_python_file(
             caller_class = parent_name if parent_label == "Class" else None
             record_calls("Function", func_name, body_node, scope, caller_class, owner)
 
-            for child in body_node.named_children:
-                if child.type == "function_definition":
-                    _visit_function(child, func_name, "Function", scope, cls, owner)
-                elif child.type == "decorated_definition":
-                    definition = child.child_by_field_name("definition")
-                    decos = [c for c in child.named_children if c.type == "decorator"]
-                    if definition is not None and definition.type == "function_definition":
-                        _visit_function(definition, func_name, "Function", scope, cls, owner, extra_decorators=decos)
+            for child in _definitions(body_node):
+                visit_definition(child, func_name, "Function", scope, scope, cls, owner)
 
     visit_block(root, None, "Module", _Scope(_direct_defs(root, source_bytes), {}, None), "")
     for (caller_label, caller_name, caller_owner), by_name in sorted(
@@ -1080,6 +1112,7 @@ def extract_python_file(
                 )
             )
 
+    merge_same_nodes(result)
     add_heir_keys(result, _class_declarations(root, source_bytes), c3=True)
     return own_edges(result, file_path)
 

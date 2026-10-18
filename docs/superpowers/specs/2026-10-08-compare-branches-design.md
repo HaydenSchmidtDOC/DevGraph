@@ -198,6 +198,9 @@ which functions or classes were added, removed or edited.
   - `ordinal` is the symbol's position among symbols with the same
     `(kind, container, name)`, in source order. This tells apart Go methods
     on two types that share a name, and overloads (Java, C#, C++, Kotlin).
+    Two Python definitions of one name in one scope (a `try`/`except`
+    fallback, a property and its setter) are one node, so one symbol
+    spanning both (index format 19; graph-accuracy spec D3).
   - So a pure name-plus-kind comparison is exact whenever names are unique in
     a file, which is the common case. The tie-breakers only matter for
     duplicates.

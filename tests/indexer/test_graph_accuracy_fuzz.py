@@ -19,8 +19,10 @@ comes and goes beside another class of a file, repeating its method names
 (both nest a `Meta` with its own base), and so do a top-level `act` and one
 nested in a function, so same-named symbols of one file are told apart by
 their owner; another file calls `b.Twin().act()` and `b.Base().act()`, one
-owner's member across files. go/b gains a type whose methods are named like
-the package's functions, which other files call by package.
+owner's member across files. A function's def moves under an `if` or a
+`try` (defined again in its `except`) and back out. go/b gains a type whose
+methods are named like the package's functions, which other files call by
+package.
 
 TS files import through a tsconfig path alias, and the resolver configuration
 changes under them: the tsconfig is rewritten (its own `paths`, `extends` to
@@ -91,6 +93,7 @@ import json
 import os
 import posixpath
 import random
+import textwrap
 from dataclasses import dataclass, field, replace
 
 import pytest
@@ -167,6 +170,7 @@ class File:
     mounts: list = field(default_factory=list)  # ts: (app or router, prefix, router file) Express mounts
     exported: bool = False  # ts: `export default looseRouter`
     shared_on: str = "Base"  # py: the class defining `shared` besides Twin (`op_move_shared`)
+    guards: dict = field(default_factory=dict)  # py: function -> "if" or "try" around its def (`op_guard`)
 
     def copy(self):
         return replace(
@@ -174,7 +178,7 @@ class File:
             funcs={k: list(v) for k, v in self.funcs.items()}, services=dict(self.services),
             froms=list(self.froms), mentions=list(self.mentions), links=list(self.links), pins=list(self.pins),
             methods=list(self.methods), routes=list(self.routes), builds=dict(self.builds),
-            mounts=list(self.mounts),
+            mounts=list(self.mounts), guards=dict(self.guards),
         )
 
 
@@ -192,6 +196,18 @@ def py_class(name: str, base: str | None, shared_on: str = "Base") -> str:
     return head + "    def act(self):\n        return self.shared()\n" + shared + meta
 
 
+def py_def(name: str, calls: list, guard: str | None) -> str:
+    """A top-level function, bare or under an `if` or a `try` (whose
+    `except` defines it again: one node, both bodies' calls its own)."""
+    text = f"def {name}():\n" + "".join(f"    {g}\n" for g in calls) + "    return 0\n"
+    if guard == "if":
+        return "\n\nif True:\n" + textwrap.indent(text, "    ")
+    if guard == "try":
+        fallback = f"def {name}():\n    return helper()\n"
+        return "\n\ntry:\n" + textwrap.indent(text, "    ") + "except ImportError:\n" + textwrap.indent(fallback, "    ")
+    return "\n\n" + text
+
+
 def ts_specifier(path: str, target: str) -> str:
     """The relative specifier `path` imports the TS file `target` by."""
     spec = posixpath.relpath(target.rsplit(".", 1)[0], posixpath.dirname(path))
@@ -204,10 +220,7 @@ def render(f: File, path: str = "") -> str:
         # call expressions (`helper()`, `b.helper()`, `obj.helper()`).
         parts = [f"{m}\n" for m in f.imports] + [f"# pin {p}\n" for p in f.pins]
         parts += [py_class(c, b, f.shared_on) for c, b in f.bases.items()]
-        parts += [
-            f"\n\ndef {name}():\n" + "".join(f"    {g}\n" for g in calls) + "    return 0\n"
-            for name, calls in f.funcs.items()
-        ]
+        parts += [py_def(name, calls, f.guards.get(name)) for name, calls in f.funcs.items()]
         parts.append(f.extra)
         return "".join(parts) or "X = 1\n"
     if f.kind == "rs":
@@ -740,6 +753,20 @@ class Fuzz:
         f = self.files[path]
         f.extra = "" if f.extra else PY_NESTED
         return f"{'add' if f.extra else 'remove'} nested act in {path}", {path}
+
+    def op_guard(self):
+        """A Python function's def moves under an `if` or a `try` (defined
+        again in its `except`), or back out to the module level."""
+        path = self._pick(lambda f: f.kind == "py" and f.funcs)
+        if not path:
+            return None
+        f = self.files[path]
+        name = self.rng.choice(sorted(f.funcs))
+        if f.guards.get(name):
+            del f.guards[name]
+            return f"unguard {name} in {path}", {path}
+        f.guards[name] = self.rng.choice(["if", "try"])
+        return f"guard {name} with {f.guards[name]} in {path}", {path}
 
     def op_go_twin(self):
         """go/b/b.go gains or loses a type `Twin` whose methods are named
@@ -1361,7 +1388,7 @@ class Fuzz:
         "route_change", "route_move", "src_move", "src_move", "src_dir", "src_dir", "rs_reexport", "rs_reexport", "rs_reexport",
         "ws_rename", "ws_rename", "ws_main", "ws_main", "datastore", "datastore",
         "build", "build", "build", "mount", "mount", "mount", "mount_prefix", "export_router", "move_router",
-        "heir", "heir", "move_shared", "move_shared",
+        "heir", "heir", "move_shared", "move_shared", "guard", "guard", "guard",
     ]
 
     def draw(self):

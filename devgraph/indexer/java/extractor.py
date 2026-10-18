@@ -231,6 +231,23 @@ _LIBRARY_TYPES = frozenset({
 _FUNC_TYPES = (*_METHOD_DECL_TYPES, "lambda_expression")
 
 
+def _members(body: Node) -> list[Node]:
+    """A type body's member declarations: an enum's methods, fields and
+    nested types sit in its `enum_body_declarations`, and an enum
+    constant's own body (`ACTIVE { void x() {} }`) declares members of the
+    enum too (one node per name and owner, as overloads are)."""
+    found: list[Node] = []
+    for child in body.named_children:
+        if child.type == "enum_body_declarations":
+            found += child.named_children
+        elif child.type == "enum_constant":
+            constant_body = child.child_by_field_name("body")
+            found += constant_body.named_children if constant_body is not None else []
+        else:
+            found.append(child)
+    return found
+
+
 def _type_name(node: Node | None, source: bytes) -> str | None:
     """A declared type as the simple name the resolver looks up (`List<X>`
     -> List, `a.b.C` -> C, `Outer.Inner` -> Inner); None for a primitive,
@@ -273,7 +290,7 @@ class _JavaResolver:
                     self.methods.setdefault(name, set())
                     self.bases[name] = _extract_supertype_names(node, source)
                     fields = self.fields.setdefault(name, {})
-                    for child in body.named_children if body is not None else []:
+                    for child in _members(body) if body is not None else []:
                         if child.type in _METHOD_DECL_TYPES:
                             method = child.child_by_field_name("name")
                             if method is not None:
@@ -570,7 +587,7 @@ def _spring_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
                 continue
             inner = [_text(name, source), *classes]
             mapped = _annotations(node, source)
-            for member in body.named_children:
+            for member in _members(body):
                 method = member.child_by_field_name("name")
                 if member.type == "method_declaration" and method is not None:
                     for http_method, path in spring_routes(mapped, _annotations(member, source)):
@@ -645,6 +662,15 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
                 _visit_function(node, parent_name, parent_label, prev_sibling, classes)
             elif node.type == "block_comment":
                 pass  # only relevant as a *following* node's javadoc, handled via prev_sibling
+            elif node.type == "enum_body_declarations":
+                visit_block(node, parent_name, parent_label, classes)  # an enum's methods, fields, nested types
+            elif node.type == "enum_constant" and node.child_by_field_name("body") is not None:
+                # A constant with a body: its arguments' calls are the
+                # enum's, its body's members the enum's members.
+                arguments = node.child_by_field_name("arguments")
+                if arguments is not None:
+                    _record_calls(node, arguments, parent_label, parent_name if parent_name else file_path, classes)
+                visit_block(node.child_by_field_name("body"), parent_name, parent_label, classes)
             else:
                 # Field declarations, static/instance initializers, enum
                 # constants, etc: not a def, but may still contain calls

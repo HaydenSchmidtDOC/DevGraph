@@ -284,3 +284,23 @@ and `op_move_shared` moves `shared` between `Base` and `Mid`, so calls
 `b.Heir().shared()` and `Heir().shared()` follow heir keys as they change.
 Its incremental graph must equal a fresh scan, edges compared by `(label,
 name, file, owner)` at both ends.
+
+## Definitions the extractors dropped (index format 19)
+
+Audit 7, item 1. The Python extractor made nodes of a block's *direct*
+definitions only, and its call walk stops at every nested definition,
+expecting it to be visited on its own: a `def` under a `try:`, `if`,
+`with`, `for` or `while`, and a class defined in a function, were neither
+nodes nor callers, so their calls vanished too (149 of DevGraph's own 7,185
+definitions, 102 of them test fakes). The Java extractor never looked inside
+an enum's `enum_body_declarations`.
+
+| # | Decision |
+|---|---|
+| D1 | **Compound statements are transparent.** A definition under `if`/`elif`/`else`, `try`/`except`/`except*`/`else`/`finally`, `with`, `for`/`else`, `while` or `match`/`case`, at any depth of them, belongs to the scope around them, exactly as a direct one (`python/extractor.py` `_definitions`): its owner is that scope's (O1), a class body's is a method, and it is among the scope's defs for the scope tier of a bare call. The statement's own calls (its condition, the non-definition statements of its blocks) stay the scope's. |
+| D2 | **Local classes.** A class defined in a function is a Class owned by the function's chain (`member_owner("Function", ...)`): `class Fake` in `test_it` is owned by `test_it`, its methods by `test_it.Fake`; its body sees the function's scope. |
+| D3 | **One node per name in a scope.** Two definitions of one name in one scope (`try: def f(): ... except ImportError: def f(): ...`, `if`/`else` variants, a property and its setter) have one identity (O2) and are one node (`common.merge_same_nodes`): the first in source order gives each property it has, the others fill in only what it lacks, a list property (`decorators`) is the union in order, and `start_line`/`end_line` span every definition. Both bodies' calls come from it. The node is a pure function of the file's text, so no write order can make it flip. |
+| D4 | **Java enums.** An enum's `enum_body_declarations` is visited as its body (methods, fields, nested types), and so is an enum constant's body (`ACTIVE { boolean isActive() {...} }`): its members are the enum's, one node per name with the enum's own method of that name, as overloads are. A constant's arguments are the enum's calls (a field initializer's are its class's). The resolver's method table reads the same members. |
+
+The fuzz's `op_guard` moves a Python function's def under an `if`, or a
+`try` whose `except` defines it again (calling `helper()`), and back out.
