@@ -253,12 +253,12 @@ def test_hostile_filters_never_reach_cypher(kwargs):
 
 def test_valid_filters_and_direction_are_parameters():
     engine = StubEngine(([LOOKUP_ROW], False), ([], False))
-    _found(engine, relationship_types=["RUNBOOK_FOR"], neighbor_labels=["Service"], direction="in")
+    _found(engine, relationship_types=["RUNBOOK_FOR"], neighbor_labels=["Ticket"], direction="in")
     groups = engine.calls[1]
     assert groups["params"]["types"] == ["RUNBOOK_FOR"]
-    assert groups["params"]["labels"] == ["Service"]
+    assert groups["params"]["labels"] == ["Ticket"]
     assert groups["params"]["direction"] == "in"
-    assert "RUNBOOK_FOR" not in groups["query"] and "Service" not in groups["query"]
+    assert "RUNBOOK_FOR" not in groups["query"] and "Ticket" not in groups["query"]
     assert "$direction IN ['both','out']" in groups["query"]
     assert "$direction IN ['both','in']" in groups["query"]
 

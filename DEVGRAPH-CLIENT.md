@@ -279,6 +279,14 @@ can itself appear as a dependent. A name defined in one file answers as
 before, with no `target_files`. `file` takes `\` or `/`, with or without a
 leading `./` (`get_source` also takes an absolute path inside the repository).
 
+**Route handlers**: a route also writes a file-less handler stub of its
+handler's name. `get_source`, `describe_node` and `trace_request_flow` answer
+with the real function and leave the stub out, so a handler is never
+`ambiguous` with its own stub and a flow lists it once; `describe_node` folds
+the stub's relationships into the function's when that function is the only
+one of its name with a file. A stub is only answered when no function of its
+name has a file (the handler's definition wasn't found).
+
 **Where an answer is, and one class's method**: every `find_callers` row
 names the caller's `file`, `owner` (the classes or functions it is declared
 in, `""` at the top level) and `start_line`, so `A.run` and `B.run` of one

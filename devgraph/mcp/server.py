@@ -738,7 +738,9 @@ def build_server(
         """Trace the request flow from an endpoint through services, datastores, and queues
         (every node within five hops). start_endpoint is an endpoint name like
         "GET /users/<id>", or a bare path like "/users/<id>" to start from that path's
-        endpoint for every method. An unknown endpoint is an error with similar names."""
+        endpoint for every method. A route's handler is listed once (its file-less stub is
+        left out when the real function exists). An unknown endpoint is an error with
+        similar names."""
         return devgraph_tools.trace_request_flow(engine, repo_id, start_endpoint, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
@@ -972,7 +974,8 @@ def build_server(
         returns status "ambiguous" with candidates ({label, name, file, owner}) instead of
         picking one: pass the candidate's file (repo-relative path) and owner (the classes
         or functions it is declared in, "" at the top level) to choose. A method may also
-        be named with its class, "A.save" or "A::save". A file that is not valid UTF-8 is
+        be named with its class, "A.save" or "A::save". A route's file-less handler stub
+        never makes a handler ambiguous. A file that is not valid UTF-8 is
         decoded with replacement characters, and a notice says so. An unknown name (or
         none of it in file, of owner) is an error with similar names; file may be
         repo-relative or an absolute path inside the repository."""
@@ -994,7 +997,8 @@ def build_server(
         direction, with each neighbour's identity. A file, folder or docs node is named by
         its repo-relative path or id; a method may be named with its class, "A.save" or
         "A::save". An ambiguous name returns candidates; call again with label, file and
-        owner. A code symbol's ref carries owner (the classes or functions it is declared
+        owner. A route handler answers as its real function, with its file-less stub's
+        relationships folded in. A code symbol's ref carries owner (the classes or functions it is declared
         in, "" at the top level), which picks it from a same-named one in its file. Each
         ref in the result is the next call's
         arguments. One hop per call, at most 50 neighbours per type; direction,

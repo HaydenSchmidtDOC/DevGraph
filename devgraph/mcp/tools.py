@@ -379,19 +379,28 @@ def _name_variants(query: str, terms: list[str]) -> list[str]:
     return list(dict.fromkeys(variants))
 
 
+def _shadowed_stub(var: str = "n", labels: tuple[str, ...] = schema.FILE_SCOPED_LABELS) -> str:
+    """Cypher: node `var` is a file-less node of one of `labels` (file-scoped
+    ones: a route's handler stub Function, a C++ out-of-class method's Class
+    stub) while a node of its label and name in its repository has a file.
+    Tools answer with that real node and leave the stub out (fold it in); a
+    stub with no such real node (an unresolved handler) is kept."""
+    shadowed = " OR ".join(
+        f"({var}:`{label}` AND EXISTS {{ MATCH (twin:`{label}`) "
+        f"WHERE twin.repo_id = {var}.repo_id AND twin.name = {var}.name AND twin.file <> '' }})"
+        for label in labels if label in schema.FILE_SCOPED_LABELS
+    )
+    return f"(coalesce({var}.file, '') = '' AND ({shadowed}))" if shadowed else "false"
+
+
 def _search_branches(labels: tuple[str, ...], where: str, unwind: bool = False) -> str:
     """`CALL () { ... }` over one MATCH per label, so each can use its label's indexes.
 
     A file-scoped label's file-less node (a route's handler stub) is left out when
-    a real node of that label shares its name."""
+    a real node of that label shares its name (`_shadowed_stub`)."""
     branches = []
     for label in labels:
-        stub = (
-            f" AND NOT (coalesce(n.file, '') = '' AND EXISTS {{ MATCH (m:`{label}`) "
-            "WHERE m.repo_id = n.repo_id AND m.name = n.name AND m.file <> '' })"
-            if label in schema.FILE_SCOPED_LABELS
-            else ""
-        )
+        stub = f" AND NOT {_shadowed_stub('n', (label,))}" if label in schema.FILE_SCOPED_LABELS else ""
         unwound = "UNWIND $names AS p " if unwind else ""
         branches.append(f"  {unwound}MATCH (n:`{label}`) WHERE {where}{stub} RETURN n")
     return "CALL () {\n" + "\n  UNION\n".join(branches) + "\n}\n"
@@ -520,7 +529,7 @@ _DESCRIBE_HINT = (
 )
 
 _DESCRIBE_NEIGHBOUR = (
-    "m.repo_id = $repo_id AND NOT m:Repository "
+    "m.repo_id = $repo_id AND NOT m:Repository AND NOT " + _shadowed_stub("m") + " "
     "AND ($types IS NULL OR type(r) IN $types) "
     "AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))"
 )
@@ -532,7 +541,7 @@ _OWNED_LABELS = schema.FILE_SCOPED_LABELS
 _OWNER_OF = "CASE WHEN {v}.file IS NOT NULL THEN coalesce({v}.owner, '') END"
 
 _DESCRIBE_GROUPS = f"""
-MATCH (n) WHERE elementId(n) = $id
+MATCH (n) WHERE elementId(n) IN $ids
 CALL (n) {{
   MATCH (n)-[r]->(m)
   WHERE $direction IN ['both','out'] AND {_DESCRIBE_NEIGHBOUR}
@@ -542,16 +551,17 @@ CALL (n) {{
   WHERE $direction IN ['both','in'] AND {_DESCRIBE_NEIGHBOUR}
   RETURN 'in' AS dir, type(r) AS rel, m
 }}
-WITH n, dir, rel, count(DISTINCT m) AS total
+WITH dir, rel, count(DISTINCT m) AS total
 ORDER BY dir, rel
 LIMIT {_DESCRIBE_MAX_GROUPS + 1}
-CALL (n, dir, rel) {{
+CALL (dir, rel) {{
+  MATCH (n) WHERE elementId(n) IN $ids
   CALL (n, dir, rel) {{
     MATCH (n)-[r:$(rel)]->(m) WHERE dir = 'out' RETURN m
     UNION
     MATCH (n)<-[r:$(rel)]-(m) WHERE dir = 'in' RETURN m
   }}
-  WITH m WHERE m.repo_id = $repo_id AND NOT m:Repository
+  WITH m WHERE m.repo_id = $repo_id AND NOT m:Repository AND NOT {_shadowed_stub("m")}
     AND ($labels IS NULL OR any(l IN labels(m) WHERE l IN $labels))
   WITH DISTINCT m
   ORDER BY m.name, coalesce(m.file, m.path), m.owner
@@ -561,6 +571,17 @@ CALL (n, dir, rel) {{
   }}) AS refs
 }}
 RETURN dir, rel, total, refs
+"""
+
+
+#: The file-less stubs of `$name` (a route's handler stubs) when exactly one node
+#: of `label` and that name has a file: describe_node folds their
+#: relationships into that node's. `label` is a file-scoped label.
+_FOLDED_STUBS = """
+MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.name = $name AND n.file <> ''
+WITH count(n) AS real WHERE real = 1
+MATCH (s:`{label}`) WHERE s.repo_id = $repo_id AND s.name = $name AND coalesce(s.file, '') = ''
+RETURN elementId(s) AS id
 """
 
 
@@ -608,11 +629,13 @@ def _lookup_cypher(labels: tuple[str, ...], declared: frozenset[str]) -> str:
     """One single-property branch per label, so each can seek on its own index.
 
     Every label gets a name branch; only declared (provider) labels carry
-    `path`, so only they get a path branch. Labels are validated identifiers.
+    `path`, so only they get a path branch. A handler stub is left out when a
+    real node has its name (`_shadowed_stub`). Labels are validated identifiers.
     """
     tail = "AND NOT n:Repository AND ($file IS NULL OR $file IN [n.file, n.path, n.source_file])"
     body = "\n  UNION\n".join(
-        f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.{key} = $name {tail} RETURN n"
+        f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.{key} = $name {tail}"
+        f"{f' AND NOT {_shadowed_stub()}' if label in _OWNED_LABELS else ''} RETURN n"
         for label in labels
         for key in (("name", "path") if label in declared else ("name",))
     )
@@ -956,7 +979,10 @@ def describe_node(
         refs (and `owner` for a method or nested class); or `{"status":
         "ambiguous", "count", "candidates", "truncated"}`.
         No match raises ToolError with suggestions. `Repository` nodes are never
-        matched or listed.
+        matched or listed. A route's file-less handler stub is neither matched
+        nor listed when a node of its label and name has a file
+        (`_shadowed_stub`); when exactly one such node does, the stub's
+        relationships are folded into its groups.
     """
     file = _normalize_file(file)
     if not name.strip():
@@ -1017,10 +1043,15 @@ def describe_node(
     (row,) = rows
     properties, properties_truncated = _visible_properties(row["properties"])
     node = {**_node_ref(row), "properties": properties, "properties_truncated": properties_truncated}
+    ids = [row["id"]]
+    if row["label"] in _OWNED_LABELS and row.get("file"):
+        # Fold in the handler stub of a node that is the only one of its name with a file.
+        stubs, _ = _read(engine, _FOLDED_STUBS.format(label=row["label"]), {"repo_id": repo_id, "name": row["name"]}, 2)
+        ids += [stub["id"] for stub in stubs if stub["id"] is not None]
     groups, groups_truncated = _read(
         engine,
         _DESCRIBE_GROUPS,
-        {"id": row["id"], "repo_id": repo_id, "direction": direction, "types": types,
+        {"ids": ids, "repo_id": repo_id, "direction": direction, "types": types,
          "labels": neighbour_labels, "cap": cap},
         _DESCRIBE_MAX_GROUPS,
     )
@@ -1371,6 +1402,8 @@ def trace_request_flow(
     Returns:
         Dict with `components` (the start endpoints and every node within five
         hops, each {name, labels, repo_id}) and `edges` ({type} per relationship).
+        A route's file-less handler stub is left out when a node of its name has
+        a file (`_shadowed_stub`), so each handler is listed once.
 
     Raises:
         ToolError: no endpoint has that name or path.
@@ -1384,6 +1417,7 @@ def trace_request_flow(
     CALL (starts) {{
         UNWIND starts AS s
         MATCH (s)-[rels*1..5]->(node)
+        WHERE NOT {_shadowed_stub("node")}
         UNWIND rels AS r
         RETURN collect(DISTINCT node) AS reached, collect(DISTINCT r) AS edges
     }}
@@ -2638,7 +2672,9 @@ def get_source(
         read. When several nodes match, `source` is None and the dict adds
         `status: "ambiguous"`, `count`, `truncated` and `candidates`
         ({label, name, file, owner}; repo_id too when cross_repo): pass one's
-        `file` and `owner`. The result names its `owner` too.
+        `file` and `owner`. The result names its `owner` too. A route's
+        file-less handler stub is left out when a node of its name has a file
+        (`_shadowed_stub`), so it never makes the handler ambiguous.
         A file is decoded as the indexer decodes it (`source_text`): a
         Python coding line, else UTF-8, else cp1252 or Latin-1; when an
         undeclared file is not valid UTF-8, or a file isn't valid in its
@@ -2657,6 +2693,7 @@ def get_source(
     MATCH (n)
     WHERE (n:Function OR n:Class) AND {match}
     {repo_filter}
+    AND NOT {_shadowed_stub()}
     AND ($file IS NULL OR n.file = $file)
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
            n.file as file, {_OWNER_OF.format(v="n")} as owner, n.start_line as start_line, n.end_line as end_line,
