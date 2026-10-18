@@ -1,7 +1,8 @@
-"""Extraction gaps of audit 7 (items 1 and 3) against a live Neo4j:
-`find_callers` lists a caller defined under a `try:`, and a def moving into
-or out of one equals a fresh `full_scan`; `list_endpoints` reports a FastAPI
-and a Flask file's routes as written. Fixture code is fictional."""
+"""Extraction gaps of audit 7 (items 1, 3 and 6) against a live Neo4j:
+`find_callers` lists a caller defined under a `try:` or in an object
+literal, and a def moving into or out of one equals a fresh `full_scan`;
+`list_endpoints` reports a FastAPI and a Flask file's routes as written.
+Fixture code is fictional."""
 
 import textwrap
 import uuid
@@ -140,3 +141,49 @@ def test_list_endpoints_reports_python_routes_as_written(engine, repo_id, tmp_pa
     by_name = {row["name"]: row for row in rows}
     assert by_name["POST /users"]["handlers"] == [{"name": "create_user", "file": "api/main.py", "owner": ""}]
 
+
+SERVICE = """\
+    import { repo } from './repo';
+
+    export const userService = {
+      async getUser(id) { return repo.find(id); },
+      deleteUser: async (id) => repo.remove(id),
+    };
+"""
+
+PAGE = """\
+    import { userService } from './service';
+    const lambda = require('./lambda');
+
+    export function showUser(id) {
+      return userService.getUser(id);
+    }
+
+    export function trigger(event) {
+      return lambda.handler(event);
+    }
+"""
+
+LAMBDA = """\
+    exports.handler = async (event) => event;
+"""
+
+
+def test_object_literal_and_exported_functions_have_callers(engine, repo_id, tmp_path):
+    write(tmp_path, "src/repo.ts", "export const repo = { find(id) { return id; }, remove(id) { return id; } };\n")
+    service = write(tmp_path, "src/service.ts", SERVICE)
+    write(tmp_path, "src/page.ts", PAGE)
+    write(tmp_path, "src/lambda.js", LAMBDA)
+    _scan(engine, repo_id, tmp_path)
+    assert _callers(engine, repo_id, "getUser") == [("showUser", "src/page.ts")]
+    assert _callers(engine, repo_id, "find") == [("getUser", "src/service.ts")]
+    assert _callers(engine, repo_id, "handler") == [("trigger", "src/page.ts")]
+
+    # The service loses its object literal, then gets it back: incremental equals fresh.
+    write(tmp_path, "src/service.ts", "export const userService = null;\n")
+    index_paths(engine, repo_id, tmp_path, {service})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+    write(tmp_path, "src/service.ts", SERVICE)
+    index_paths(engine, repo_id, tmp_path, {service})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+    assert _callers(engine, repo_id, "getUser") == [("showUser", "src/page.ts")]

@@ -197,7 +197,8 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: and classes defined in functions, same-named definitions of one scope
 #: merged into one node, and Java enum members; Python routes read from the
 #: syntax tree (one framework per decorator, Flask `methods` lists, no
-#: route from a comment or docstring).
+#: route from a comment or docstring); JS/TS object-literal methods,
+#: CommonJS exports and functions declared in blocks.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 19
 

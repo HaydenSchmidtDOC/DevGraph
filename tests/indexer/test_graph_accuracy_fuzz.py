@@ -20,7 +20,9 @@ comes and goes beside another class of a file, repeating its method names
 nested in a function, so same-named symbols of one file are told apart by
 their owner; another file calls `b.Twin().act()` and `b.Base().act()`, one
 owner's member across files. A function's def moves under an `if` or a
-`try` (defined again in its `except`) and back out. go/b gains a type whose
+`try` (defined again in its `except`) and back out, and a TS file gains or
+loses an object-literal service, its methods called as `svc.run()` from
+files importing it, and a function declared in a block. go/b gains a type whose
 methods are named like the package's functions, which other files call by
 package.
 
@@ -171,6 +173,7 @@ class File:
     exported: bool = False  # ts: `export default looseRouter`
     shared_on: str = "Base"  # py: the class defining `shared` besides Twin (`op_move_shared`)
     guards: dict = field(default_factory=dict)  # py: function -> "if" or "try" around its def (`op_guard`)
+    service: bool = False  # ts: an object-literal service `svc` and a function declared in a block (`op_ts_service`)
 
     def copy(self):
         return replace(
@@ -319,6 +322,8 @@ def render(f: File, path: str = "") -> str:
                 for method, path, handler in f.routes
             ]
         parts += [f"{parent}.use('{prefix}', m{k});\n" for k, (parent, prefix, _target) in enumerate(f.mounts)]
+        if f.service:
+            parts.append(TS_SERVICE)
         if f.exported:
             parts.append("export default looseRouter;\n")
         return "".join(parts) or "export {};\n"
@@ -428,6 +433,12 @@ RS_FOO = "pub struct Foo;\n\nimpl Foo {\n    pub fn new() -> Foo {\n        Foo\
 GO_SERVER = "type Server struct{}\n\nfunc (s *Server) Run() {\n\tServe()\n}\n"
 # Methods named like go/b's functions Serve and Stop.
 GO_TWIN = "\ntype Twin struct{}\n\nfunc (t Twin) Serve() {}\n\nfunc (t *Twin) Stop() {\n\tt.Serve()\n}\n"
+# An object-literal service (its methods owned by `svc`, `tidy` by
+# `svc.nested`) and a function declared in a block.
+TS_SERVICE = (
+    "\nexport const svc = {\n  run() { return f(); },\n  stop: async () => svc.run(),\n"
+    "  nested: { tidy() { return g(); } },\n};\n\nif (ready) {\n  function boot() { return svc.stop(); }\n}\n"
+)
 # A function nested in another, named like the classes' methods.
 PY_NESTED = "\n\ndef outer():\n    def act():\n        return shared()\n    return act()\n"
 
@@ -544,7 +555,7 @@ IMPORTS = {
     "ts": ["import { f } from '@/lib';", "import * as u from '@/util';", "import { g } from './src/util';",
            "import { f } from './other/lib';", "import { f } from 'lib';", "import { g } from './src';",
            "import { fmt } from '@fz/utils';", "import * as u from '@fz/tools';",
-           "import { lead } from '@fz/utils/lib/main';"],
+           "import { lead } from '@fz/utils/lib/main';", "import { svc } from './src/util';"],
     "java": ["base.Base", "app.K", "base.*"],
     "kt": ["kt.util.slug", "kt.util.*", "kt.Clock", "kt.helper"],
 }
@@ -569,7 +580,7 @@ PY_CALLS = ["{n}()", "b.{n}()", "c.{n}()", "obj.{n}()", "pkg.impl.{n}()", "alias
 CALL_PINS = ["py/.", ".", "pkg/.!other.py", "/b.py", "/lib/util.py", "/py/.", "/lib/.", "src/", "pkg/", "py/b.py"]
 IMPORT_PINS = ["py/.", "pkg/.", ".", "src/lib/.!core.py", "/b.py", "/util.py", "/impl.py"]
 # How a TS call to `{n}` is written: bare, through a namespace import, on `this` or an untyped value.
-TS_CALLS = ["{n}", "u.{n}", "this.{n}", "obj.{n}"]
+TS_CALLS = ["{n}", "u.{n}", "this.{n}", "obj.{n}", "svc.{n}"]
 # How a Go call to `{n}` is written: bare, through a package, on a typed value or an untyped one.
 GO_CALLS = ["{n}", "b.{n}", "bee.{n}", "(&Server{{}}).{n}", "obj.{n}"]
 # How a Java call to `{n}` is written: bare, on `this`, static, on a new or an untyped object.
@@ -652,7 +663,10 @@ class Fuzz:
         return self.rng.choice(paths) if paths else None
 
     def _func_names(self) -> list:
-        return sorted({n for f in self.files.values() for n in f.funcs} | {"Run", "new", "missing_fn", "Tidy", "act", "shared"})
+        return sorted(
+            {n for f in self.files.values() for n in f.funcs}
+            | {"Run", "new", "missing_fn", "Tidy", "act", "shared", "run", "stop", "tidy"}
+        )
 
     @staticmethod
     def _styled(kind: str, names: list) -> list:
@@ -767,6 +781,17 @@ class Fuzz:
             return f"unguard {name} in {path}", {path}
         f.guards[name] = self.rng.choice(["if", "try"])
         return f"guard {name} with {f.guards[name]} in {path}", {path}
+
+    def op_ts_service(self):
+        """A TS file gains or loses an object-literal service `svc` (whose
+        methods other files call as `svc.run()`) and a function declared
+        in a block."""
+        path = self._pick(lambda f: f.kind == "ts")
+        if not path:
+            return None
+        f = self.files[path]
+        f.service = not f.service
+        return f"{'add' if f.service else 'remove'} object-literal service in {path}", {path}
 
     def op_go_twin(self):
         """go/b/b.go gains or loses a type `Twin` whose methods are named
@@ -1389,6 +1414,7 @@ class Fuzz:
         "ws_rename", "ws_rename", "ws_main", "ws_main", "datastore", "datastore",
         "build", "build", "build", "mount", "mount", "mount", "mount_prefix", "export_router", "move_router",
         "heir", "heir", "move_shared", "move_shared", "guard", "guard", "guard",
+        "ts_service", "ts_service", "ts_service",
     ]
 
     def draw(self):
