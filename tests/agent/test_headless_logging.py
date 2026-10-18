@@ -396,3 +396,38 @@ def test_devgraph_logs_refuses_an_unknown_level(tmp_path):
     result = _logs(tmp_path, "--level", "LOUD")
     assert result.exit_code == 2
     assert "DEBUG, INFO, WARNING, ERROR, CRITICAL" in " ".join(result.output.split())
+
+
+def test_devgraph_logs_takes_warn_and_fatal_for_their_levels(tmp_path):
+    lines = _logs(tmp_path, "--level", "warn").output.splitlines()
+    assert lines[0].endswith("schema rescan skipped for demo: not found") and len(lines) == 5
+    fatal = "2026-10-18 09:00:06,007 FATAL devgraph.agent: gave up\n"
+    assert _logs(tmp_path, "--level", "FATAL", current=_SAMPLE_LOG + fatal).output.splitlines() == [fatal.strip()]
+
+
+def test_a_record_with_a_level_name_of_its_own_still_ends_the_one_before(tmp_path):
+    custom = "2026-10-18 09:00:06,007 TRACE devgraph.plugin: probing\n"
+    lines = _logs(tmp_path, "--level", "ERROR", current=_SAMPLE_LOG + custom).output.splitlines()
+    assert lines[-1] == "ValueError: bad input"  # not "probing", taken for part of the traceback
+    assert _logs(tmp_path, "-n", "1", current=_SAMPLE_LOG + custom).output.splitlines() == [custom.strip()]
+
+
+def test_devgraph_logs_reads_a_rolling_file_between_the_backup_and_the_current_file(tmp_path):
+    """`.rolling` is the former current file, kept by a rollover whose last
+    rename failed: newer than `.1`, older than the current file."""
+    (tmp_path / "devgraph.log.rolling").write_text("2026-10-18 09:00:00,500 INFO x: middle\n", encoding="utf-8")
+    result = _logs(
+        tmp_path, current="2026-10-18 09:00:01,000 INFO x: newest\n", previous="2026-10-18 08:00:00,000 INFO x: oldest\n",
+    )
+    assert [line.rsplit(" ", 1)[1] for line in result.output.splitlines()] == ["oldest", "middle", "newest"]
+
+
+def test_devgraph_logs_shows_bytes_that_are_not_utf8_replaced(tmp_path):
+    log_path = tmp_path / "devgraph.log"
+    log_path.write_bytes(b"2026-10-18 09:00:00,000 INFO x: cut \xff\xfe short\n")
+    settings = MagicMock()
+    settings.log_file = log_path
+    with patch.object(cli_main, "get_settings", return_value=settings):
+        result = CliRunner().invoke(cli_main.app, ["logs"])
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == ["2026-10-18 09:00:00,000 INFO x: cut �� short"]

@@ -3431,11 +3431,19 @@ _LOG_LEVELS = {
     "ERROR": logging.ERROR,
     "CRITICAL": logging.CRITICAL,
 }
+#: Other names `logging` gives those levels.
+_LOG_LEVEL_ALIASES = {"WARN": logging.WARNING, "FATAL": logging.CRITICAL}
 
 #: A record's first line as the agent writes it, `%(asctime)s %(levelname)s
 #: %(name)s: %(message)s` (agent/tray.py, agent/headless.py): the level is the
-#: field after the timestamp's date and time.
-_LOG_RECORD_START = re.compile(r"^\d{4}-\d{2}-\d{2}(?: \S+)? (" + "|".join(_LOG_LEVELS) + r") ")
+#: word after the timestamp's date and time. A level name not listed above
+#: (a custom one) still starts a record, counted as INFO.
+_LOG_RECORD_START = re.compile(r"^\d{4}-\d{2}-\d{2}(?: \S+)? ([A-Z]+) ")
+
+
+def _log_level(name: str) -> int | None:
+    name = name.upper()
+    return _LOG_LEVELS.get(name, _LOG_LEVEL_ALIASES.get(name))
 
 
 def _log_records(text: str) -> list[tuple[int, list[str]]]:
@@ -3446,7 +3454,8 @@ def _log_records(text: str) -> list[tuple[int, list[str]]]:
     for line in text.splitlines():
         start = _LOG_RECORD_START.match(line)
         if start is not None:
-            records.append((_LOG_LEVELS[start.group(1)], [line]))
+            level = _log_level(start.group(1))
+            records.append((logging.INFO if level is None else level, [line]))
         elif records:
             records[-1][1].append(line)
         else:
@@ -3461,13 +3470,16 @@ def logs(
         help="Number of recent lines to show; the oldest record shown is shown whole, traceback included.",
     ),
     level: str = typer.Option(
-        "INFO", "--level", "-l", help="Minimum log level filter (DEBUG, INFO, WARNING, ERROR, CRITICAL)."
+        "INFO", "--level", "-l",
+        help="Minimum log level filter (DEBUG, INFO, WARNING or WARN, ERROR, CRITICAL or FATAL).",
     ),
 ) -> None:
     """Show recent log output from the DevGraph tray/dashboard process."""
-    min_level = _LOG_LEVELS.get(level.upper())
+    min_level = _log_level(level)
     if min_level is None:
-        raise typer.BadParameter(f"{level!r} is not one of {', '.join(_LOG_LEVELS)}.", param_hint="'--level'")
+        raise typer.BadParameter(
+            f"{level!r} is not one of {', '.join([*_LOG_LEVELS, *_LOG_LEVEL_ALIASES])}.", param_hint="'--level'"
+        )
     settings = get_settings()
     log_path = settings.log_file
     if not log_path or not log_path.exists():
@@ -3478,14 +3490,17 @@ def logs(
 
     # The agent rotates the file (see LOG_MAX_BYTES): just after a rollover the
     # current file holds only a few lines, so the newest older file is read
-    # before it, oldest first. Read as one text, a record a rollover split
-    # (a traceback at the top of the current file) stays whole.
-    previous = log_path.with_name(log_path.name + ".1")
+    # before it, oldest first. A rollover in progress, or one whose last
+    # rename failed, holds the former current file as `.rolling`, newer than
+    # `.1` (agent/log_file.py). Read as one text, a record a rollover split
+    # (a traceback at the top of the current file) stays whole. A byte that
+    # isn't UTF-8 (a write cut short) is shown replaced, not fatal.
+    older = [log_path.with_name(log_path.name + suffix) for suffix in (".1", ".rolling")]
     try:
         text = ""
-        for path in (previous, log_path):
+        for path in (*older, log_path):
             try:
-                content = path.read_text(encoding="utf-8")
+                content = path.read_text(encoding="utf-8", errors="replace")
             except FileNotFoundError:  # absent, or renamed by a rollover since
                 continue
             text += content if not content or content.endswith("\n") else content + "\n"
