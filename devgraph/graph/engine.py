@@ -791,6 +791,11 @@ def wait_for_bolt(
         driver.close()
 
 
+_RELEASE_FULL_SCAN = (
+    "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.scan_owner = $owner REMOVE r.scan_owner, r.scan_heartbeat"
+)
+
+
 def _run(session, query: str, **params: Any) -> Any:
     """Run one autocommit statement and consume it, both inside `_retry_transient`;
     return its summary.
@@ -1438,6 +1443,10 @@ class GraphEngine:
             limits["connection_acquisition_timeout"] = connection_timeout_s
         # Hint notifications are off: a hinted index an older database hasn't
         # built yet (init_schema creates it) would log one per query.
+        # (repo_id, owner) of the full-scan claims taken through this engine
+        # and not yet released: `close` releases them.
+        self._held_scan_claims: set[tuple[str, str]] = set()
+        self._claims_lock = threading.Lock()
         self._driver = _GatedDriver(GraphDatabase.driver(
             uri, auth=(user, password),
             notifications_disabled_classifications=[NotificationDisabledClassification.HINT],
@@ -1445,8 +1454,10 @@ class GraphEngine:
         ))
 
     def close(self, timeout: float = CLOSE_WAIT_S) -> None:
-        """Refuse new sessions, wait up to `timeout` for open ones, then close
-        the driver (see `_GatedDriver`). Safe to call again after a timeout."""
+        """Release the full-scan claims still held, then refuse new sessions,
+        wait up to `timeout` for open ones, and close the driver (see
+        `_GatedDriver`). Safe to call again after a timeout."""
+        self._release_held_scan_claims()
         self._driver.close(timeout)
 
     def verify_connectivity(self) -> None:
@@ -1814,52 +1825,78 @@ class GraphEngine:
                 repo_id=repo_id, version=version,
             )
 
-    def claim_full_scan(self, repo_id: str, owner: str, stale_s: float) -> str | None:
+    def claim_full_scan(
+        self, repo_id: str, owner: str, stale_s: float, replace: str | None = None
+    ) -> tuple[bool, str | None]:
         """Claim the repository's full scan for `owner` (see dispatch
-        `_claim_full_scan`): granted, returning None, when nobody holds it,
-        `owner` already does, or the holder's heartbeat is older than
-        `stale_s`; else the holder's name. The first SET takes the node's
-        write lock, so two processes' claims are decided one after the other.
-        Times are the database's clock, the one every process shares."""
+        `_claim_full_scan`): (True, None) when nobody holds it, `owner`
+        already does, the holder's heartbeat is older than `stale_s`, or the
+        holder is `replace` (a process known to be gone); else (False, the
+        holder). (False, None) when the repository has no Repository node:
+        removed, so nothing to scan, and the claim doesn't create it again.
+        The first SET takes the node's write lock, so two processes' claims
+        are decided one after the other. Times are the database's clock, the
+        one every process shares."""
         with self._driver.session() as session:
             records = _run_records(
                 session,
-                "MERGE (r:Repository {repo_id: $repo_id}) SET r.scan_claim_lock = true REMOVE r.scan_claim_lock "
+                "MATCH (r:Repository {repo_id: $repo_id}) SET r.scan_claim_lock = true REMOVE r.scan_claim_lock "
                 "WITH r, r.scan_owner AS prior, timestamp() - coalesce(r.scan_heartbeat, 0) AS age "
-                "WITH r, prior, age, (prior IS NULL OR prior = $owner OR age > $stale_ms) AS granted "
+                "WITH r, prior, age, "
+                "  (prior IS NULL OR prior = $owner OR prior = $replace OR age > $stale_ms) AS granted "
                 "FOREACH (_ IN CASE WHEN granted THEN [1] ELSE [] END | "
                 "  SET r.scan_owner = $owner, r.scan_heartbeat = timestamp()) "
                 "RETURN granted, prior, age",
-                repo_id=repo_id, owner=owner, stale_ms=int(stale_s * 1000),
+                repo_id=repo_id, owner=owner, stale_ms=int(stale_s * 1000), replace=replace,
             )
+        if not records:
+            return False, None
         record = records[0]
         if not record["granted"]:
-            return record["prior"]
-        if record["prior"] not in (None, owner):
+            return False, record["prior"]
+        with self._claims_lock:
+            self._held_scan_claims.add((repo_id, owner))
+        if record["prior"] not in (None, owner, replace):
             logger.warning(
                 "%s: took over the full scan of %s, silent for %d s (stopped or crashed)",
                 repo_id, record["prior"], record["age"] // 1000,
             )
-        return None
+        return True, None
 
-    def beat_full_scan(self, repo_id: str, owner: str) -> None:
-        """Refresh `owner`'s full-scan claim heartbeat, if it still holds it."""
+    def beat_full_scan(self, repo_id: str, owner: str) -> bool:
+        """Refresh `owner`'s full-scan claim heartbeat; whether it still holds
+        the claim (False once another process took it over, or the repository
+        was removed)."""
         with self._driver.session() as session:
-            _run(
+            records = _run_records(
                 session,
-                "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.scan_owner = $owner SET r.scan_heartbeat = timestamp()",
+                "OPTIONAL MATCH (r:Repository {repo_id: $repo_id}) WHERE r.scan_owner = $owner "
+                "SET r.scan_heartbeat = timestamp() RETURN r IS NOT NULL AS held",
                 repo_id=repo_id, owner=owner,
             )
+        return bool(records and records[0]["held"])
 
     def release_full_scan(self, repo_id: str, owner: str) -> None:
         """Drop `owner`'s full-scan claim, if it still holds it."""
+        with self._claims_lock:
+            self._held_scan_claims.discard((repo_id, owner))
         with self._driver.session() as session:
-            _run(
-                session,
-                "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.scan_owner = $owner "
-                "REMOVE r.scan_owner, r.scan_heartbeat",
-                repo_id=repo_id, owner=owner,
-            )
+            _run(session, _RELEASE_FULL_SCAN, repo_id=repo_id, owner=owner)
+
+    def _release_held_scan_claims(self) -> None:
+        """At close, before new sessions are refused: drop every full-scan
+        claim this engine still holds (a scan cut short by a shutdown), so
+        the next process need not wait for its heartbeat to go stale. One
+        try each: a database that is away lets them lapse instead."""
+        with self._claims_lock:
+            held, self._held_scan_claims = self._held_scan_claims, set()
+        for repo_id, owner in held:
+            try:
+                with self._driver.session() as session:
+                    session.run(_RELEASE_FULL_SCAN, repo_id=repo_id, owner=owner).consume()
+            except Exception:
+                logger.warning("%s: could not release the full-scan claim while closing; it lapses", repo_id,
+                               exc_info=True)
 
     def full_scan_holder(self, repo_id: str, stale_s: float) -> str | None:
         """Who holds the repository's full-scan claim with a heartbeat at most

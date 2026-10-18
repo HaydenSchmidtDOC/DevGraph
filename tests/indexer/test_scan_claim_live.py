@@ -4,6 +4,7 @@ catch-up or index upgrade in another wait for each other instead of scanning
 together. Live: the claim is on the Repository node in Neo4j."""
 
 import logging
+import socket
 import subprocess
 import sys
 import textwrap
@@ -69,6 +70,7 @@ def repo(tmp_path, engine):
     (root / "pkg").mkdir(parents=True)
     for i in range(5):
         (root / "pkg" / f"m{i}.py").write_text(f"def f{i}():\n    return {i}\n")
+    engine.upsert_repository(repo_id, repo_id, str(root))  # as registering it does
     yield repo_id, root
     engine.delete_repository(repo_id)
 
@@ -99,18 +101,56 @@ class _Registry:
 
 def test_a_claim_is_refused_while_fresh_and_taken_over_once_stale(engine, repo):
     repo_id, _root = repo
-    assert engine.claim_full_scan(repo_id, "1@a/x", 90) is None
-    assert engine.claim_full_scan(repo_id, "1@a/x", 90) is None  # its own: again granted
-    assert engine.claim_full_scan(repo_id, "2@b/y", 90) == "1@a/x"
-    assert engine.full_scan_holder(repo_id, 90) == "1@a/x"
-    assert full_scan_elsewhere(engine, repo_id) == "1@a/x"
+    assert engine.claim_full_scan(repo_id, "1@a/x", 90) == (True, None)
+    assert engine.claim_full_scan(repo_id, "1@a/x", 90) == (True, None)  # its own: again granted
+    assert engine.claim_full_scan(repo_id, "2@b/y", 90) == (False, "1@a/x")
+    assert engine.claim_full_scan(repo_id, "2@b/y", 90, replace="1@a/x") == (True, None)  # a holder known gone
+    assert engine.beat_full_scan(repo_id, "1@a/x") is False  # taken over: its scan stops
+    assert engine.full_scan_holder(repo_id, 90) == "2@b/y"
+    assert full_scan_elsewhere(engine, repo_id) == "2@b/y"
     time.sleep(1.2)
     assert engine.full_scan_holder(repo_id, 1) is None  # silent for over a second
-    assert engine.claim_full_scan(repo_id, "2@b/y", 1) is None  # taken over
-    engine.release_full_scan(repo_id, "1@a/x")  # no longer its claim: nothing changes
-    assert engine.full_scan_holder(repo_id, 90) == "2@b/y"
-    engine.beat_full_scan(repo_id, "2@b/y")
-    engine.release_full_scan(repo_id, "2@b/y")
+    assert engine.claim_full_scan(repo_id, "3@c/z", 1) == (True, None)  # taken over once stale
+    engine.release_full_scan(repo_id, "2@b/y")  # no longer its claim: nothing changes
+    assert engine.full_scan_holder(repo_id, 90) == "3@c/z"
+    assert engine.beat_full_scan(repo_id, "3@c/z") is True
+    engine.release_full_scan(repo_id, "3@c/z")
+    assert engine.full_scan_holder(repo_id, 90) is None
+
+
+def test_a_removed_repository_is_not_claimed_scanned_or_created_again(engine, repo):
+    repo_id, root = repo
+    engine.delete_repository(repo_id)
+    assert engine.claim_full_scan(repo_id, "1@a/x", 90) == (False, None)
+    assert dispatch.full_scan(engine, repo_id, root) == 0
+    assert repo_id not in engine.graph_repo_ids()
+
+
+def test_closing_the_engine_releases_a_claim_a_cut_short_scan_holds(engine, repo, caplog):
+    """The agent shutting down mid-scan: the engine refuses new sessions
+    once closing, so the scan's own release fails; the close released it."""
+    repo_id, _root = repo
+    closing = GraphEngine(URI, USER, PASSWORD)
+    with caplog.at_level(logging.WARNING):
+        with dispatch.full_scan_turn(repo_id, engine=closing):
+            assert engine.full_scan_holder(repo_id, 90) == dispatch._SCAN_OWNER
+            closing.close()
+            assert engine.full_scan_holder(repo_id, 90) is None
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert repo_id not in dispatch._scan_claims
+
+
+def test_a_claim_left_by_an_ended_process_on_this_host_is_taken_over_at_once(engine, repo, monkeypatch):
+    repo_id, root = repo
+    ended = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True, text=True)
+    holder = f"{int(ended.stdout)}@{socket.gethostname()}/0123abcd"
+    engine.set_index_format(repo_id, 0)  # its scan was cut short
+    assert engine.claim_full_scan(repo_id, holder, 90) == (True, None)
+    monkeypatch.setattr(dispatch, "FULL_SCAN_POLL_S", 5.0)
+    started = time.monotonic()
+    result = catch_up(engine, repo_id, root, datetime.now(timezone.utc))
+    assert time.monotonic() - started < 4  # no wait for its heartbeat to go stale
+    assert result.indexed == 5
     assert engine.full_scan_holder(repo_id, 90) is None
 
 
@@ -175,7 +215,7 @@ def test_a_crashed_scans_stale_claim_is_taken_over(engine, repo, monkeypatch):
     index; once its heartbeat is stale the agent's catch-up scans in full."""
     repo_id, root = repo
     engine.set_index_format(repo_id, 0)
-    assert engine.claim_full_scan(repo_id, "999@elsewhere/dead", 90) is None
+    assert engine.claim_full_scan(repo_id, "999@elsewhere/dead", 90) == (True, None)
     monkeypatch.setattr(dispatch, "FULL_SCAN_STALE_S", 1.0)
     monkeypatch.setattr(dispatch, "FULL_SCAN_POLL_S", 0.2)
     started = time.monotonic()

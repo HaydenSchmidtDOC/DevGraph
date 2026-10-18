@@ -19,6 +19,7 @@ import logging
 import os
 import pickle
 import posixpath
+import re
 import socket
 import sys
 import tempfile
@@ -50,6 +51,7 @@ from devgraph.graph.engine import (
     ABORTS_BATCH,
     OWNING_SERVICE_TARGETS,
     SERVICE_API_SUFFIXES,
+    EngineClosed,
     GraphEngine,
     provision_repository_schema,
 )
@@ -1017,6 +1019,7 @@ def _index_paths(
 
     total = len(by_rel_path)
     for done, rel_path in enumerate(sorted(by_rel_path), 1):
+        _check_full_scan_claim(repo_id)  # a full scan another process took over stops
         index_one(rel_path, by_rel_path[rel_path])
         if done % PROGRESS_EVERY == 0:
             logger.info("%s: indexed %d / %d files", repo_id, done, total)
@@ -2501,6 +2504,10 @@ def catch_up(
     """
     check_repo_root(repo_root)
     if index_outdated(engine, repo_id):
+        # The repository is registered (the agent checks): a graph that lost
+        # its Repository node (wiped) gets it back, or full_scan would take
+        # it for removed and scan nothing.
+        engine.upsert_repository(repo_id, repo_id, str(repo_root))
         with full_scan_turn(repo_id, while_waiting, engine):
             if index_outdated(engine, repo_id):
                 indexed = full_scan(
@@ -2631,42 +2638,88 @@ FULL_SCAN_POLL_S = 1.0
 #: `_claim_full_scan`): pid and host, and a random part so a reused pid is not
 #: taken for it.
 _SCAN_OWNER = f"{os.getpid()}@{socket.gethostname()}/{uuid.uuid4().hex[:8]}"
+_SCAN_OWNER_PARTS = re.compile(r"^(\d+)@(.+)/[0-9a-f]+$")
 
 #: How often a held full-scan claim's heartbeat is refreshed, and how old a
 #: heartbeat may be before another process takes the claim over (the holder
-#: crashed or was killed).
+#: hung, or crashed on another host).
 FULL_SCAN_HEARTBEAT_S = 15.0
 FULL_SCAN_STALE_S = 90.0
 
-#: repo_id -> (depth, heartbeat stop event) of the claims this process holds;
-#: only touched while holding `_FULL_SCAN_LOCK`.
-_scan_claims: dict[str, tuple[int, threading.Event]] = {}
+
+class FullScanClaimLost(BatchAborted):
+    """Another process took a running full scan's claim over (its heartbeat
+    looked stale): the scan stops before it stamps the index format."""
+
+
+class _Claim:
+    """A full-scan claim this process holds: how deeply it is taken, the
+    heartbeat's stop, set once the claim is lost, and the scanning thread."""
+
+    def __init__(self) -> None:
+        self.depth = 1
+        self.stop = threading.Event()
+        self.lost = threading.Event()
+        self.thread = threading.get_ident()
+
+
+#: repo_id -> the claim this process holds; changed only while holding
+#: `_FULL_SCAN_LOCK`.
+_scan_claims: dict[str, _Claim] = {}
+
+#: `_claim_full_scan` outcomes besides another process's name.
+_HELD = object()
+_NO_REPOSITORY = object()
+
+
+def _acquire_full_scan_lock(repo_id: str, while_waiting: Callable[[], bool] | None, log: bool) -> None:
+    if _FULL_SCAN_LOCK.acquire(blocking=False):
+        return
+    if log:
+        logger.info("%s: waiting for another repository's full scan to finish", repo_id)
+    while not _FULL_SCAN_LOCK.acquire(timeout=FULL_SCAN_POLL_S):
+        if while_waiting is not None and not while_waiting():
+            raise FullScanCancelled(f"{repo_id}: the full scan waiting its turn was called off")
 
 
 def _take_full_scan_lock(
     repo_id: str, while_waiting: Callable[[], bool] | None, engine: GraphEngine | None = None
-) -> None:
+) -> bool:
     """Take `_FULL_SCAN_LOCK`, logging a wait. While another scan holds it,
     `while_waiting` runs every `FULL_SCAN_POLL_S` (the watcher's
     `yield_batch_lock`: the repository's live batches run meanwhile); False
-    from it calls the scan off (`FullScanCancelled`). With `engine`, then
-    also the repository's claim across processes (`_claim_full_scan`)."""
-    if not _FULL_SCAN_LOCK.acquire(blocking=False):
-        logger.info("%s: waiting for another repository's full scan to finish", repo_id)
-        while not _FULL_SCAN_LOCK.acquire(timeout=FULL_SCAN_POLL_S):
-            if while_waiting is not None and not while_waiting():
-                raise FullScanCancelled(f"{repo_id}: the full scan waiting its turn was called off")
-    if engine is None:
-        return
-    try:
-        _claim_full_scan(engine, repo_id, while_waiting)
-    except BaseException:
+    from it calls the scan off (`FullScanCancelled`).
+
+    With `engine`, then also the repository's claim across processes
+    (`_claim_full_scan`). While another process holds that, the lock is let
+    go between tries, so at the outermost take this process's scans of other
+    repositories run meanwhile. False, holding nothing, when the repository
+    has no Repository node (removed): nothing to scan."""
+    first = True
+    while True:
+        _acquire_full_scan_lock(repo_id, while_waiting, log=first)
+        if engine is None:
+            return True
+        try:
+            outcome = _claim_full_scan(engine, repo_id)
+        except BaseException:
+            _FULL_SCAN_LOCK.release()
+            raise
+        if outcome is _HELD:
+            return True
         _FULL_SCAN_LOCK.release()
-        raise
+        if outcome is _NO_REPOSITORY:
+            return False
+        if first:
+            logger.info("%s: waiting for the full scan process %s is running", repo_id, outcome)
+            first = False
+        if while_waiting is not None and not while_waiting():
+            raise FullScanCancelled(f"{repo_id}: the full scan waiting for another process's was called off")
+        time.sleep(FULL_SCAN_POLL_S)
 
 
 def _release_full_scan_lock(repo_id: str, engine: GraphEngine | None = None) -> None:
-    """Undo one `_take_full_scan_lock`."""
+    """Undo one `_take_full_scan_lock` that returned True."""
     try:
         if engine is not None:
             _release_full_scan_claim(engine, repo_id)
@@ -2674,53 +2727,89 @@ def _release_full_scan_lock(repo_id: str, engine: GraphEngine | None = None) -> 
         _FULL_SCAN_LOCK.release()
 
 
-def _claim_full_scan(engine: GraphEngine, repo_id: str, while_waiting: Callable[[], bool] | None) -> None:
-    """Hold the repository's full-scan claim on its Repository node, so one
-    full scan of it runs at a time across processes: `devgraph rescan` and
-    the agent's catch-up or index upgrade no longer scan it together (their
-    writes deadlocked, and the work doubled). The claim is apart from the
-    index format, which a scan unstamps while it runs (see full_scan).
+def _claim_full_scan(engine: GraphEngine, repo_id: str) -> object:
+    """Try once to hold the repository's full-scan claim on its Repository
+    node, so one full scan of it runs at a time across processes: `devgraph
+    rescan` and the agent's catch-up or index upgrade no longer scan it
+    together (their writes deadlocked, and the work doubled). The claim is
+    apart from the index format, which a scan unstamps while it runs (see
+    full_scan).
 
-    Reentrant in this process. While another process holds it with a fresh
-    heartbeat, waits as `_take_full_scan_lock` does; a heartbeat older than
-    `FULL_SCAN_STALE_S` (its holder crashed) is taken over. A thread
-    refreshes the heartbeat every `FULL_SCAN_HEARTBEAT_S` until release."""
+    Reentrant in this process. Returns `_HELD`, `_NO_REPOSITORY`, or the
+    name of the other process holding it with a fresh heartbeat. A holder
+    on this host whose process is gone, or whose heartbeat is older than
+    `FULL_SCAN_STALE_S`, is taken over. A thread refreshes the heartbeat
+    every `FULL_SCAN_HEARTBEAT_S` until release, and marks the claim lost
+    if another process took it over (`_check_full_scan_claim`)."""
     held = _scan_claims.get(repo_id)
     if held is not None:
-        _scan_claims[repo_id] = (held[0] + 1, held[1])
-        return
-    holder = engine.claim_full_scan(repo_id, _SCAN_OWNER, FULL_SCAN_STALE_S)
-    if holder is not None:
-        logger.info("%s: waiting for the full scan process %s is running", repo_id, holder)
-        while holder is not None:
-            if while_waiting is not None and not while_waiting():
-                raise FullScanCancelled(f"{repo_id}: the full scan waiting for another process's was called off")
-            time.sleep(FULL_SCAN_POLL_S)
-            holder = engine.claim_full_scan(repo_id, _SCAN_OWNER, FULL_SCAN_STALE_S)
-    stop = threading.Event()
+        held.depth += 1
+        return _HELD
+    granted, holder = engine.claim_full_scan(repo_id, _SCAN_OWNER, FULL_SCAN_STALE_S)
+    if not granted and holder is not None and _holder_gone(holder):
+        logger.warning("%s: taking over the full scan of %s, whose process has ended", repo_id, holder)
+        granted, holder = engine.claim_full_scan(repo_id, _SCAN_OWNER, FULL_SCAN_STALE_S, replace=holder)
+    if not granted:
+        return holder if holder is not None else _NO_REPOSITORY
+    claim = _Claim()
     threading.Thread(
-        target=_beat_full_scan, args=(engine, repo_id, stop), name=f"devgraph-scan-heartbeat-{repo_id}", daemon=True
+        target=_beat_full_scan, args=(engine, repo_id, claim), name=f"devgraph-scan-heartbeat-{repo_id}", daemon=True
     ).start()
-    _scan_claims[repo_id] = (1, stop)
+    _scan_claims[repo_id] = claim
+    return _HELD
 
 
-def _beat_full_scan(engine: GraphEngine, repo_id: str, stop: threading.Event) -> None:
-    while not stop.wait(FULL_SCAN_HEARTBEAT_S):
+def _holder_gone(holder: str) -> bool:
+    """Whether a claim's holder is a process on this host that has ended."""
+    from devgraph.agent.lifecycle import pid_is_running  # the agent package imports dispatch
+
+    parts = _SCAN_OWNER_PARTS.match(holder)
+    if parts is None or parts.group(2) != socket.gethostname():
+        return False
+    pid = int(parts.group(1))
+    return pid != os.getpid() and not pid_is_running(pid)
+
+
+def _beat_full_scan(engine: GraphEngine, repo_id: str, claim: _Claim) -> None:
+    while not claim.stop.wait(FULL_SCAN_HEARTBEAT_S):
         try:
-            engine.beat_full_scan(repo_id, _SCAN_OWNER)
-        except Exception:  # Neo4j away, or the engine closed: the claim lapses
-            logger.debug("%s: full-scan heartbeat failed", repo_id, exc_info=True)
+            held = engine.beat_full_scan(repo_id, _SCAN_OWNER)
+        except EngineClosed:  # closing: it released the claim (GraphEngine.close)
+            return
+        except Exception:
+            logger.warning(
+                "%s: the full scan's heartbeat failed; another process may take the scan over after %.0f s",
+                repo_id, FULL_SCAN_STALE_S, exc_info=True,
+            )
+            continue
+        if not held:
+            claim.lost.set()
+            logger.warning(
+                "%s: another process took this full scan over (its heartbeat looked stale), or the repository "
+                "was removed; stopping it before it stamps the index", repo_id,
+            )
+            return
+
+
+def _check_full_scan_claim(repo_id: str) -> None:
+    """Raise `FullScanClaimLost` in the thread running the repository's full
+    scan once its claim is lost; anywhere else (a live batch), nothing."""
+    claim = _scan_claims.get(repo_id)
+    if claim is not None and claim.thread == threading.get_ident() and claim.lost.is_set():
+        raise FullScanClaimLost(f"{repo_id}: the full scan's claim was taken over by another process")
 
 
 def _release_full_scan_claim(engine: GraphEngine, repo_id: str) -> None:
-    depth, stop = _scan_claims[repo_id]
-    if depth > 1:
-        _scan_claims[repo_id] = (depth - 1, stop)
+    claim = _scan_claims[repo_id]
+    if claim.depth > 1:
+        claim.depth -= 1
         return
     del _scan_claims[repo_id]
-    stop.set()  # a beat still running only refreshes a claim of this process's
+    claim.stop.set()  # a beat still running only refreshes a claim of this process's
     try:
         engine.release_full_scan(repo_id, _SCAN_OWNER)
+    except EngineClosed:
+        pass  # it released the claim as it closed
     except Exception:
         logger.warning(
             "%s: could not release the full-scan claim; it lapses in %.0f s", repo_id, FULL_SCAN_STALE_S,
@@ -2742,12 +2831,14 @@ def full_scan_turn(
     """Hold this process's full-scan turn (`_take_full_scan_lock`) for the
     block, and with `engine` the repository's claim across processes: a
     caller that scans only if the index is still outdated checks that inside
-    it, after the wait, and its full_scan then runs at once."""
-    _take_full_scan_lock(repo_id, while_waiting, engine)
+    it, after the wait, and its full_scan then runs at once. A repository
+    with no Repository node holds nothing; its full_scan scans nothing."""
+    taken = _take_full_scan_lock(repo_id, while_waiting, engine)
     try:
         yield
     finally:
-        _release_full_scan_lock(repo_id, engine)
+        if taken:
+            _release_full_scan_lock(repo_id, engine)
 
 
 def full_scan_running() -> bool:
@@ -2806,9 +2897,12 @@ def full_scan(
     `_take_full_scan_lock`); live batches never take the lock. Across
     processes, one full scan of the repository runs at a time
     (`_claim_full_scan`): a `devgraph rescan` and the agent wait for each
-    other's.
+    other's. A repository with no Repository node (removed) is not scanned,
+    and not created again: callers that register one create it first.
     """
-    _take_full_scan_lock(repo_id, while_waiting, engine)
+    if not _take_full_scan_lock(repo_id, while_waiting, engine):
+        logger.info("%s: not in the graph (removed); nothing to scan", repo_id)
+        return 0
     try:
         check_repo_root(repo_root)
         docs_cache.forget(repo_root)
@@ -2839,6 +2933,7 @@ def full_scan(
         if applied:
             _sync_docs_edges(engine, repo_id, repo_root, applied_docs)
         engine.write_resolver_config(repo_id, resolver)
+        _check_full_scan_claim(repo_id)  # taken over meanwhile: that scan stamps it
         engine.set_index_format(repo_id, INDEX_FORMAT)
         return indexed
     finally:
