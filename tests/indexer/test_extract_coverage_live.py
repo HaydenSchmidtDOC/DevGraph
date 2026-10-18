@@ -1,7 +1,7 @@
-"""Definitions the Python extractor used to drop (audit 7, item 1) against a
-live Neo4j: `find_callers` lists a caller defined under a `try:`, and a def
-moving into or out of one equals a fresh `full_scan`. Fixture code is
-fictional."""
+"""Extraction gaps of audit 7 (items 1 and 3) against a live Neo4j:
+`find_callers` lists a caller defined under a `try:`, and a def moving into
+or out of one equals a fresh `full_scan`; `list_endpoints` reports a FastAPI
+and a Flask file's routes as written. Fixture code is fictional."""
 
 import textwrap
 import uuid
@@ -10,7 +10,7 @@ import pytest
 
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan, index_paths
-from devgraph.mcp.tools import find_callers
+from devgraph.mcp.tools import find_callers, list_endpoints
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 
@@ -96,4 +96,47 @@ def test_a_caller_defined_under_a_try_is_a_caller(engine, repo_id, tmp_path):
     write(tmp_path, "app/routes.py", ROUTES)
     index_paths(engine, repo_id, tmp_path, {routes})
     incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+FASTAPI = """\
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+
+    @app.get("/users/{uid}")
+    def get_user(uid):
+        \"\"\"Mirrors @app.get("/docs-only").\"\"\"
+        return uid
+
+
+    @app.post("/users")
+    def create_user():
+        return None
+"""
+
+FLASK = """\
+    from flask import Flask
+
+    app = Flask(__name__)
+
+
+    # @app.route("/commented")
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        return "ok"
+"""
+
+
+def test_list_endpoints_reports_python_routes_as_written(engine, repo_id, tmp_path):
+    write(tmp_path, "api/main.py", FASTAPI)
+    write(tmp_path, "web/app.py", FLASK)
+    _scan(engine, repo_id, tmp_path)
+    rows = list_endpoints(engine, repo_id, max_results=50)["results"]
+    assert sorted((row["name"], row["framework"]) for row in rows) == [
+        ("GET /login", "Flask"), ("GET /users/{uid}", "FastAPI"), ("POST /login", "Flask"),
+        ("POST /users", "FastAPI"),
+    ]
+    by_name = {row["name"]: row for row in rows}
+    assert by_name["POST /users"]["handlers"] == [{"name": "create_user", "file": "api/main.py", "owner": ""}]
 

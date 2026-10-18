@@ -304,3 +304,19 @@ an enum's `enum_body_declarations`.
 
 The fuzz's `op_guard` moves a Python function's def under an `if`, or a
 `try` whose `except` defines it again (calling `helper()`), and back out.
+
+## Python routes from the syntax tree (index format 19)
+
+Audit 7, item 3. `apis/extractor.py` ran a FastAPI regex and a Flask regex
+over every Python file's raw text. The Flask one also matched
+`@app.post(...)` and gave it its default GET, so each FastAPI write route
+made a phantom `GET` too (implemented by the same handler, and the shared
+Endpoint's `framework` became Flask); `methods=["GET", "POST"]` was read
+as GET (only `methods='GET,POST'` was understood); and a route quoted in a
+comment or docstring was an Endpoint.
+
+| # | Decision |
+|---|---|
+| R1 | **The tree, not the text.** Routes come from the file's tree-sitter Python tree: a route decorator is a `decorator` call on a decorated function (the handler, its owner the full O1 chain, so a Flask app factory's nested handler is owned by the factory), and a Django pattern a `path(...)`/`re_path(...)` call. Comments and strings are never read. |
+| R2 | **One framework per decorator.** `@<receiver>.<method>(path)` (get, post, put, delete, patch, options, head) makes that method's route, `@<receiver>.route(path, methods=...)` and FastAPI's `api_route` one per method listed (a list, tuple or set of literal strings, or one comma-separated string; GET when absent). The framework is the one the receiver's binding makes (`= FastAPI(...)`/`APIRouter(...)` or `= Flask(...)`/`Blueprint(...)`, any scope), else, for a receiver named `app` or `router`, the one framework the file imports, else Flask for `route` and FastAPI for a method's. A receiver neither bound so nor named so (`@cache.get("/k")`) makes no route. The path is the first argument (or `path=`/`rule=`) as a plain string literal; an f-string or a name makes none. |
+| R3 | **Django.** The view is a name's last segment (`views.search` is `search`; it was `views`) or a class-based view's class (`ArticleView.as_view()`); `include(...)` and any other call make no Endpoint. Its `IMPLEMENTS` stays unpinned, as before. |
