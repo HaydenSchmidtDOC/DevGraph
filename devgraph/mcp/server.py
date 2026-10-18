@@ -631,7 +631,9 @@ def build_server(
         max_results: int = 15,
         modified_within_commits: int | None = None,
     ) -> dict[str, Any]:
-        """Search for components by name/description; returns {count, results, truncated},
+        """Search for components (services, modules, classes, functions, endpoints,
+        databases, vector stores, queues, caches and compose containers) by
+        name/description; returns {count, results, truncated},
         each result with name, labels, repo_id, description and file. Ranked: the whole
         query as the exact name, then the same ignoring case, then names starting with
         or containing the whole query, then names equal to, starting with or containing
@@ -801,7 +803,8 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def summarise_repository(repo_id: str) -> dict[str, Any]:
-        """Get a high-level summary of a repository's architecture (node counts by type)."""
+        """Get a high-level summary of a repository's architecture (node counts by type,
+        cache_count included)."""
         return devgraph_tools.summarise_repository(engine, repo_id)
 
     @server.tool(annotations=_READ_ONLY)
@@ -865,7 +868,8 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def explain_architecture(repo_id: str, max_results: int = 15) -> dict[str, Any]:
-        """Generate a high-level architectural explanation of the repository:
+        """Generate a high-level architectural explanation of the repository (a service
+        uses databases, vector stores, queues and caches):
         services_and_datastores ({service, uses}) and endpoints ({endpoints, calls}, only
         services some endpoint calls), each a {count, results, truncated} envelope."""
         return devgraph_tools.explain_architecture(engine, repo_id, max_results)

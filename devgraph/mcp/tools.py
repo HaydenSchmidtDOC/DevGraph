@@ -275,9 +275,12 @@ def _resolve_recency_cutoff(engine: GraphEngine, repo_id: str, modified_within_c
     return results[0]["d"]
 
 
-# Labels search_component always covers. A repository's schema-declared
-# labels are appended per call (see declared_node_labels).
-_SEARCH_LABELS: tuple[str, ...] = ("Service", "Module", "Class", "Function", "Endpoint")
+# Labels search_component always covers: code, routes, datastores (Cache
+# included) and compose containers. A repository's schema-declared labels
+# are appended per call (see declared_node_labels).
+_SEARCH_LABELS: tuple[str, ...] = (
+    "Service", "Module", "Class", "Function", "Endpoint", *schema.DATASTORE_LABELS, "Container",
+)
 
 
 def search_component(
@@ -289,7 +292,8 @@ def search_component(
     modified_within_commits: int | None = None,
     extra_labels: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Search for components (modules, services, classes, functions) by name or description.
+    """Search for components (services, modules, classes, functions, endpoints,
+    datastores of every type, Cache included, and containers) by name or description.
 
     Args:
         engine: GraphEngine instance
@@ -522,7 +526,7 @@ _DESCRIBE_ECHO = 100
 _DESCRIBE_DIRECTIONS = ("both", "out", "in")
 # Shown elsewhere in the response, or extractor/insight bookkeeping that other tools serve.
 _DESCRIBE_HIDDEN = frozenset({"repo_id", "name"}) | schema.INTERNAL_NODE_PROPERTIES
-_DESCRIBE_BUILTIN_LABELS = tuple(label for label in schema.NODE_LABELS if label != "Repository")
+_DESCRIBE_BUILTIN_LABELS = schema.NAMED_LABELS  # every built-in label but Repository, Cache included
 _DESCRIBE_HINT = (
     "search_component searches by partial name; a file, folder or docs node is named by its "
     "repo-relative path or its id"
@@ -998,7 +1002,7 @@ def describe_node(
             raise ToolError(f"invalid label {_echo(label)}")
         labels: tuple[str, ...] = (label,)
         # A built-in label carries no path; any other label may be a provider's.
-        path_labels = frozenset(labels) if label not in schema.NODE_LABELS or label in declared else frozenset()
+        path_labels = frozenset(labels) if label not in schema.BUILTIN_LABELS or label in declared else frozenset()
     else:
         labels = _DESCRIBE_BUILTIN_LABELS + tuple(d for d in declared if d not in _DESCRIBE_BUILTIN_LABELS)
         path_labels = frozenset(declared)
@@ -1679,7 +1683,8 @@ def summarise_repository(
         repo_id: Repository ID to summarize
 
     Returns:
-        Summary with service count, module count, dependency graph stats
+        Summary with the repository's node counts by type: services, modules,
+        classes, functions, endpoints, databases, vector stores, queues and caches
     """
     # Each count runs as its own uncorrelated subquery (CALL {...}) rather
     # than chaining OPTIONAL MATCHes in one query. Chained OPTIONAL MATCHes
@@ -1697,10 +1702,11 @@ def summarise_repository(
     CALL () { MATCH (d:Database {repo_id: $repo_id}) RETURN COUNT(d) as database_count }
     CALL () { MATCH (v:VectorStore {repo_id: $repo_id}) RETURN COUNT(v) as vectorstore_count }
     CALL () { MATCH (q:Queue {repo_id: $repo_id}) RETURN COUNT(q) as queue_count }
+    CALL () { MATCH (k:Cache {repo_id: $repo_id}) RETURN COUNT(k) as cache_count }
     RETURN
         $repo_id as repo_name,
         service_count, module_count, class_count, function_count,
-        endpoint_count, database_count, vectorstore_count, queue_count
+        endpoint_count, database_count, vectorstore_count, queue_count, cache_count
     """
     results = _query(engine, count_cypher, {"repo_id": repo_id})
     if results:
@@ -1715,6 +1721,7 @@ def summarise_repository(
         "database_count": 0,
         "vectorstore_count": 0,
         "queue_count": 0,
+        "cache_count": 0,
     }
 
 
@@ -2154,7 +2161,7 @@ def explain_architecture(
     _at_least(1, max_results=max_results)
     cypher = f"""
     MATCH (s:Service {{repo_id: $repo_id}})
-    OPTIONAL MATCH (s)-[:USES]->(ds:Database|VectorStore|Queue)
+    OPTIONAL MATCH (s)-[:USES]->(ds:{"|".join(schema.DATASTORE_LABELS)})
     WITH s, COLLECT(DISTINCT ds.name) as datastore_names
     OPTIONAL MATCH (ep:Endpoint {{repo_id: $repo_id}})-[:CALLS]->(s)
     WITH s, datastore_names, COLLECT(DISTINCT ep.name) as endpoint_names
@@ -2824,7 +2831,7 @@ def find_mentions(
         engine: GraphEngine instance
         repo_id: Repository ID
         name: Entity name (for direction="mentioned_by") or Document repo-relative path (for direction="mentions")
-        label: Optional node label filter for the target entity (validates against NODE_LABELS)
+        label: Optional node label filter for the target entity (validates against BUILTIN_LABELS)
         direction: "mentioned_by" (default) to find Documents mentioning the entity, or
                    "mentions" to find what a Document mentions
         cross_repo: If True, search across repos
@@ -2838,7 +2845,7 @@ def find_mentions(
     if _source_off(registry, repo_id, "mentions_enabled"):
         return _source_off_notice(max_results, "Mentions", "mentions", repo_id)
     # Validate and reject unrecognized labels
-    if label is not None and label not in schema.NODE_LABELS:
+    if label is not None and label not in schema.BUILTIN_LABELS:
         return _envelope([], max_results)
 
     # Build label filter using node label check (not parameterized label in node pattern)
@@ -2901,7 +2908,8 @@ def list_recent_changes(
         engine: GraphEngine instance
         repo_id: Repository ID
         within_commits: Only include entities modified within this many most-recent commits
-        entity_type: Optional node label filter; a label not in NODE_LABELS is a ToolError
+        entity_type: Optional node label filter; a label not in BUILTIN_LABELS
+            (NODE_LABELS and Cache) is a ToolError
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
 
@@ -2910,8 +2918,8 @@ def list_recent_changes(
         name, type (labels), repo_id, and last_modified_at, ordered most-recently-modified first.
     """
     _at_least(1, within_commits=within_commits, max_results=max_results)
-    if entity_type is not None and entity_type not in schema.NODE_LABELS:
-        raise ToolError(f"unknown entity_type {_echo(entity_type)}; use one of: {', '.join(schema.NODE_LABELS)}")
+    if entity_type is not None and entity_type not in schema.BUILTIN_LABELS:
+        raise ToolError(f"unknown entity_type {_echo(entity_type)}; use one of: {', '.join(schema.BUILTIN_LABELS)}")
 
     cutoff = _resolve_recency_cutoff(engine, repo_id, within_commits)
     recency_filter = "AND n.last_modified_at >= $cutoff" if cutoff is not None else "AND n.last_modified_at IS NOT NULL"

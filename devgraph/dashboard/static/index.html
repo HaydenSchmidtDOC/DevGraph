@@ -1020,6 +1020,7 @@ const BUILTIN_NODE_TYPES = [
   { id:"Database",         cat:"database",     count:6 },
   { id:"VectorStore",      cat:"vectorstore",  count:3 },
   { id:"Queue",            cat:"queue",        count:2 },
+  { id:"Cache",            cat:"cache",        count:0 },
   { id:"Requirement",      cat:"phase2",       count:null },
   { id:"DesignDecision",   cat:"phase2",       count:null },
   { id:"ArchitectureNote", cat:"phase2",       count:null },
@@ -1047,6 +1048,7 @@ const CAT_COLORS = {
   database:    "#f0813c",
   vectorstore: "#dc2626",
   queue:       "#e0559e",
+  cache:       "#c084fc",
   phase2:      "#9299a6",
   phase3:      "#6b7280",
 };
@@ -1293,7 +1295,7 @@ function buildElements() {
   els.push({ data:{ source:"mod:0", target:"db:neo4j", label:"READS_FROM" } });
   return els;
 }
-const STRUCTURAL_CATS = new Set(["repo","service","database","vectorstore","queue","endpoint"]);
+const STRUCTURAL_CATS = new Set(["repo","service","database","vectorstore","queue","cache","endpoint"]);
 const cy = cytoscape({
   container: document.getElementById("cy"),
   /* starts empty, not seeded with the mock graph -- buildElements() is only

@@ -148,3 +148,57 @@ def test_trace_request_flow_lists_each_handler_once(engine, repo):
     assert "fetchUsers" in names
     result = tools.trace_request_flow(engine, repo_id, "GET /api/ghost")
     assert [c["name"] for c in result["components"]].count("ghostHandler") == 1  # a lone stub is kept
+
+
+def test_the_fixture_has_datastores_and_containers(engine, repo):
+    repo_id, _ = repo
+    rows = engine.run_cypher(
+        "MATCH (n) WHERE n.repo_id = $r AND (n:Cache OR n:Database OR n:Container) "
+        "RETURN labels(n)[0] AS label, n.name AS name ORDER BY label, name",
+        {"r": repo_id},
+    )
+    found = {(row["label"], row["name"]) for row in rows}
+    assert {("Cache", "Redis"), ("Database", "PostgreSQL"), ("Container", "redis"), ("Container", "postgres")} <= found
+
+
+def test_explain_architecture_lists_a_cache(engine, repo):
+    repo_id, _ = repo
+    services = tools.explain_architecture(engine, repo_id)["services_and_datastores"]["results"]
+    uses = {row["service"]: sorted(row["uses"]) for row in services}
+    assert uses["api"] == ["PostgreSQL", "Redis"]
+
+
+def test_summarise_repository_counts_caches(engine, repo):
+    repo_id, _ = repo
+    summary = tools.summarise_repository(engine, repo_id)
+    assert summary["cache_count"] == 1
+    assert summary["database_count"] == 1
+
+
+def test_describe_node_finds_a_cache_without_a_label(engine, repo):
+    repo_id, _ = repo
+    result = tools.describe_node(engine, repo_id, "Redis")
+    assert result["status"] == "found"
+    assert result["node"]["label"] == "Cache"
+    assert any(ref["name"] == "api" for ref in result["incoming"]["USES"]["results"])
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [("redis", {("Cache", "Redis"), ("Container", "redis")}),
+     ("postgres", {("Database", "PostgreSQL"), ("Container", "postgres")})],
+)
+def test_search_component_finds_datastores_and_containers(engine, repo, query, expected):
+    repo_id, _ = repo
+    result = tools.search_component(engine, repo_id, query)
+    assert expected <= {(r["labels"][0], r["name"]) for r in result["results"]}
+
+
+@pytest.mark.parametrize("tool", ["list_recent_changes", "find_mentions"])
+def test_cache_is_a_known_entity_type(engine, repo, tool):
+    repo_id, _ = repo
+    if tool == "list_recent_changes":
+        result = tools.list_recent_changes(engine, repo_id, within_commits=1, entity_type="Cache")
+    else:
+        result = tools.find_mentions(engine, repo_id, "Redis", label="Cache")
+    assert result["count"] == 0

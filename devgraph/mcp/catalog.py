@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 TOOL_CATALOG: list[dict[str, Any]] = [
-    {"name": "search_component", "identifier_kind": "name/description substring", "envelope": True, "phase": 1, "note": "the whole query as exact name first (then ignoring case), then names starting with or containing it, then names equal to, starting with or containing one of its words; each result has its file; count_is_lower_bound marks a count the substring scan never finished"},
+    {"name": "search_component", "identifier_kind": "name/description substring (code, endpoints, datastores including caches, containers)", "envelope": True, "phase": 1, "note": "the whole query as exact name first (then ignoring case), then names starting with or containing it, then names equal to, starting with or containing one of its words; each result has its file; count_is_lower_bound marks a count the substring scan never finished"},
     {"name": "list_recent_changes", "identifier_kind": "commit-count window (within_commits), optional entity_type label", "envelope": True, "phase": 3},
     {"name": "trace_request_flow", "identifier_kind": "endpoint name (\"GET /users/<id>\") or bare path (\"/users/<id>\", every method)", "envelope": False, "phase": 1, "note": "lists a route's handler once (its file-less stub is left out when the real function exists)"},
     {"name": "get_service_dependencies", "identifier_kind": "service name", "envelope": False, "phase": 1},
@@ -21,7 +21,7 @@ TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "compare_branches", "identifier_kind": "two local git refs (branch_a = base, branch_b = head; compared from their merge base, like git diff a...b)", "envelope": False, "phase": 3, "note": "the response is not an envelope; files and impacted_callers inside it are {count, results, truncated}"},
     {"name": "impact_analysis", "identifier_kind": "function/class name (not a file path), optional file and owner (or \"A.run\") to pick one of several", "envelope": True, "phase": 1, "note": "each dependent has its file and owner; transitive dependents stop at 4 hops; a name defined in several files is traced per file up to 5 files (each dependent with its target_files), together past that, plus ambiguous_targets"},
     {"name": "impact_analysis_for_diff", "identifier_kind": "two local git refs (base_ref, head_ref; compared from their merge base, like git diff base...head)", "envelope": True, "phase": 3, "note": "traces dependents of the changed and removed functions/classes only; added ones are listed apart; transitive dependents stop at 4 hops"},
-    {"name": "explain_architecture", "identifier_kind": None, "envelope": False, "phase": 1, "note": "the response is not an envelope; services_and_datastores and endpoints inside it are {count, results, truncated}"},
+    {"name": "explain_architecture", "identifier_kind": None, "envelope": False, "phase": 1, "note": "the response is not an envelope; services_and_datastores and endpoints inside it are {count, results, truncated}; a service uses Database, VectorStore, Queue and Cache nodes"},
     {"name": "list_services", "identifier_kind": None, "envelope": True, "phase": 1},
     {"name": "list_endpoints", "identifier_kind": "optional filters: method, path_prefix (whole segments), framework, service name", "envelope": True, "phase": 1, "note": "a route under a mount prefix its file doesn't show is listed with mounted false and its own path"},
     {"name": "explain_decision", "identifier_kind": "DesignDecision name/id", "envelope": False, "phase": 2},

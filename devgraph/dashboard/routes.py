@@ -63,9 +63,9 @@ from devgraph.dashboard.layout_store import load_layout, save_layout
 from devgraph.dashboard.query_log import QueryLog
 from devgraph.graph.engine import EngineClosed, GraphEngine, identity_key, provision_repository_schema
 from devgraph.graph.schema import (
+    BUILTIN_LABELS,
     INTERNAL_EDGE_PROPERTIES,
     INTERNAL_NODE_PROPERTIES,
-    NODE_LABELS,
     RELATIONSHIP_TYPES,
 )
 from devgraph.indexer.dispatch import full_scan, full_scan_running
@@ -632,7 +632,7 @@ def build_router(
         The one source of truth the schema, graph and search routes share; only
         labels in this list may be interpolated into Cypher.
         """
-        labels = list(NODE_LABELS)
+        labels = list(BUILTIN_LABELS)
         for record in _scope_records(repo_id):
             labels += [x for x in _applied_labels(record)[0] if x not in labels]
         return labels
@@ -657,11 +657,11 @@ def build_router(
             if _SCHEMA_STATE_RANK.index(info["state"]) > _SCHEMA_STATE_RANK.index(state):
                 state = info["state"]
 
-        builtin_labels = set(NODE_LABELS)
+        builtin_labels = set(BUILTIN_LABELS)
         builtin_rels = set(RELATIONSHIP_TYPES)
         node_types = [
             {"label": label, "origin": "builtin", "color": None, "count": counts.get(label, 0)}
-            for label in NODE_LABELS
+            for label in BUILTIN_LABELS
         ] + [
             {"label": label, "origin": "project", "color": colors.get(label) or _hash_color(label),
              "count": counts.get(label, 0)}
@@ -729,7 +729,7 @@ def build_router(
     def repo_search(repo_id: str, q: str, max_results: int = 15) -> dict[str, Any]:
         if repo_id == _ALL_REPOS_SCOPE:  # search is per-repo; `_scope_records` below does the one lookup
             raise HTTPException(status_code=404, detail=f"unknown repo: {repo_id}")
-        project_labels = [x for x in _allowed_labels(repo_id) if x not in NODE_LABELS]
+        project_labels = [x for x in _allowed_labels(repo_id) if x not in BUILTIN_LABELS]
         return {"results": queries.search_components(engine, repo_id, q, max_results, project_labels)}
 
     # The canvas's repo selector has an "All Repos" option that is not a

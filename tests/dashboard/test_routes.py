@@ -461,10 +461,11 @@ def test_schema_unknown_repo_404s(client):
 
 
 def test_schema_without_a_file_is_the_builtins(client):
-    from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+    from devgraph.graph.schema import BUILTIN_LABELS, RELATIONSHIP_TYPES
 
     body = client.get("/api/repos/dash_repo_a/schema").json()
-    assert [t["label"] for t in body["node_types"]] == list(NODE_LABELS)
+    assert [t["label"] for t in body["node_types"]] == list(BUILTIN_LABELS)
+    assert "Cache" in BUILTIN_LABELS
     assert all(t["origin"] == "builtin" and t["color"] is None for t in body["node_types"])
     assert [t["type"] for t in body["relationship_types"]] == list(RELATIONSHIP_TYPES)
     assert all(t["origin"] == "builtin" and t["color"] is None for t in body["relationship_types"])
