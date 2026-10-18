@@ -5,6 +5,7 @@ import importlib.metadata
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -34,7 +35,7 @@ from devgraph.config.schema_findings import project_schema_findings as _project_
 from devgraph.dashboard import queries as dashboard_queries
 from devgraph.dashboard.url import dashboard_url, probe_dashboard
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
-from devgraph.indexer.dispatch import full_scan
+from devgraph.indexer.dispatch import full_scan, full_scan_elsewhere
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
 from devgraph.indexer.walk import TOO_LARGE, RepoRootUnavailable, check_repo_root, repo_root_problem
@@ -366,6 +367,9 @@ def rescan(
     non-zero exit and nothing changed; so is one with no indexable files
     while the graph has files for it, unless --force.
 
+    While another DevGraph process (usually the agent) is running a full
+    scan of the repository, the rescan says so and waits for it to finish.
+
     Args:
         repo_id: The repository ID to rescan.
     """
@@ -383,6 +387,16 @@ def rescan(
             try:
                 provision_repository_schema(engine, repo.path)
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
+                holder = full_scan_elsewhere(engine, repo_id)
+                if holder:
+                    # full_scan waits for it: scanning together, the two
+                    # deadlocked in Neo4j and did the work twice.
+                    console.print(
+                        f"[yellow]Another DevGraph process ({escape(holder)}), usually the agent, is already "
+                        f"running a full scan of {escape(repo_id)}.[/yellow] Waiting for it to finish, then "
+                        "rescanning; press Ctrl+C to stop waiting.",
+                        soft_wrap=True,
+                    )
                 started = datetime.now(timezone.utc)
                 skipped: dict[str, str] = {}
                 count = full_scan(
@@ -3410,16 +3424,62 @@ def config_schema_reset(
     _schema_follow_up(root, result)
 
 
+_LOG_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+#: Other names `logging` gives those levels.
+_LOG_LEVEL_ALIASES = {"WARN": logging.WARNING, "FATAL": logging.CRITICAL}
+
+#: A record's first line as the agent writes it, `%(asctime)s %(levelname)s
+#: %(name)s: %(message)s` (agent/tray.py, agent/headless.py): the level is the
+#: word after the timestamp's date and time. A level name not listed above
+#: (a custom one) still starts a record, counted as INFO.
+_LOG_RECORD_START = re.compile(r"^\d{4}-\d{2}-\d{2}(?: \S+)? ([A-Z]+) ")
+
+
+def _log_level(name: str) -> int | None:
+    name = name.upper()
+    return _LOG_LEVELS.get(name, _LOG_LEVEL_ALIASES.get(name))
+
+
+def _log_records(text: str) -> list[tuple[int, list[str]]]:
+    """`text` as (level, lines) records: a line that doesn't start a record (a
+    traceback's) belongs to the one before it; lines before any record count
+    as INFO."""
+    records: list[tuple[int, list[str]]] = []
+    for line in text.splitlines():
+        start = _LOG_RECORD_START.match(line)
+        if start is not None:
+            level = _log_level(start.group(1))
+            records.append((logging.INFO if level is None else level, [line]))
+        elif records:
+            records[-1][1].append(line)
+        else:
+            records.append((logging.INFO, [line]))
+    return records
+
+
 @app.command()
 def logs(
     lines: int = typer.Option(
-        50, "--lines", "-n", help="Number of recent lines to show."
+        50, "--lines", "-n",
+        help="Number of recent lines to show; the oldest record shown is shown whole, traceback included.",
     ),
     level: str = typer.Option(
-        "INFO", "--level", "-l", help="Minimum log level filter (DEBUG, INFO, WARNING, ERROR)."
+        "INFO", "--level", "-l",
+        help="Minimum log level filter (DEBUG, INFO, WARNING or WARN, ERROR, CRITICAL or FATAL).",
     ),
 ) -> None:
     """Show recent log output from the DevGraph tray/dashboard process."""
+    min_level = _log_level(level)
+    if min_level is None:
+        raise typer.BadParameter(
+            f"{level!r} is not one of {', '.join([*_LOG_LEVELS, *_LOG_LEVEL_ALIASES])}.", param_hint="'--level'"
+        )
     settings = get_settings()
     log_path = settings.log_file
     if not log_path or not log_path.exists():
@@ -3428,47 +3488,38 @@ def logs(
         console.print("  The tray app must be started with file logging enabled.")
         return
 
-    level_map = {
-        "DEBUG": logging.DEBUG,
-        "INFO": logging.INFO,
-        "WARNING": logging.WARNING,
-        "ERROR": logging.ERROR,
-    }
-    min_level = level_map.get(level.upper(), logging.INFO)
-
     # The agent rotates the file (see LOG_MAX_BYTES): just after a rollover the
     # current file holds only a few lines, so the newest older file is read
-    # before it, oldest first.
-    previous = log_path.with_name(log_path.name + ".1")
+    # before it, oldest first. A rollover in progress, or one whose last
+    # rename failed, holds the former current file as `.rolling`, newer than
+    # `.1` (agent/log_file.py). Read as one text, a record a rollover split
+    # (a traceback at the top of the current file) stays whole. A byte that
+    # isn't UTF-8 (a write cut short) is shown replaced, not fatal.
+    older = [log_path.with_name(log_path.name + suffix) for suffix in (".1", ".rolling")]
     try:
         text = ""
-        for path in (previous, log_path):
+        for path in (*older, log_path):
             try:
-                text += path.read_text(encoding="utf-8")
+                content = path.read_text(encoding="utf-8", errors="replace")
             except FileNotFoundError:  # absent, or renamed by a rollover since
                 continue
+            text += content if not content or content.endswith("\n") else content + "\n"
     except OSError as e:
         console.print(f"[red][X] Error reading log file:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
-    # Parse log lines, filter by level, take last N
-    filtered: list[str] = []
-    for line in text.splitlines():
-        # Simple level detection from common log formats
-        line_upper = line.upper()
-        line_level = logging.INFO
-        if "ERROR" in line_upper:
-            line_level = logging.ERROR
-        elif "WARNING" in line_upper or "WARN" in line_upper:
-            line_level = logging.WARNING
-        elif "DEBUG" in line_upper:
-            line_level = logging.DEBUG
-        if line_level >= min_level:
-            filtered.append(line)
-
-    tail = filtered[-lines:] if lines > 0 else filtered
-    for line in tail:
-        console.print(escape(line))
+    # The newest records of at least `min_level`, whole, until `lines` lines.
+    shown: list[list[str]] = []
+    count = 0
+    for record_level, record_lines in reversed(_log_records(text)):
+        if lines > 0 and count >= lines:
+            break
+        if record_level >= min_level:
+            shown.append(record_lines)
+            count += len(record_lines)
+    for record_lines in reversed(shown):
+        for line in record_lines:
+            console.print(escape(line))
 
 
 @app.command()

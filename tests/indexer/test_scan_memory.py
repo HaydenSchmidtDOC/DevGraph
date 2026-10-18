@@ -39,6 +39,7 @@ class RecordingEngine:
         "run_cypher": [], "read_resolver_config": {}, "find_handler_stub_sources": set(), "find_name_refs": [],
         "find_mentioning_documents": set(), "list_indexed_files": set(), "list_claim_sources": set(),
         "list_extracted_paths": set(), "list_docs_note_files": set(), "read_skipped_files": {},
+        "claim_full_scan": (True, None), "beat_full_scan": True,
     }
 
     def __init__(self):
@@ -582,3 +583,110 @@ def test_schema_rescan_upgrade_checks_again_after_its_wait(monkeypatch):
     assert scheduler._waiting("r") is True
     scheduler._stop.set()
     assert scheduler._waiting("r") is False
+
+
+# --- the full-scan claim across processes ------------------------------------------------
+
+
+class ClaimedElsewhere(RecordingEngine):
+    """Another process holds the claim until `free` is set."""
+
+    def __init__(self):
+        super().__init__()
+        self.free = threading.Event()
+
+    def claim_full_scan(self, repo_id, owner, stale_s, replace=None):
+        return (True, None) if self.free.is_set() else (False, "4321@elsewhere/abcd1234")
+
+
+def test_waiting_on_another_process_lets_this_processs_other_scans_run(monkeypatch):
+    monkeypatch.setattr(dispatch, "FULL_SCAN_POLL_S", 0.01)
+    engine, waiting, entered = ClaimedElsewhere(), threading.Event(), []
+
+    def wait_for_x():
+        with dispatch.full_scan_turn("x", lambda: waiting.set() or True, engine):
+            entered.append("x")
+
+    thread = threading.Thread(target=wait_for_x)
+    thread.start()
+    try:
+        assert waiting.wait(5)
+
+        def scan_y():
+            with dispatch.full_scan_turn("y"):
+                entered.append("y")
+
+        other = threading.Thread(target=scan_y, daemon=True)
+        other.start()
+        other.join(5)
+        assert entered == ["y"]  # x's wait doesn't hold the turn
+    finally:
+        engine.free.set()
+        thread.join(5)
+    assert entered == ["y", "x"]
+    assert dispatch._FULL_SCAN_LOCK.acquire(blocking=False)
+    dispatch._FULL_SCAN_LOCK.release()
+
+
+def test_a_nested_wait_keeps_the_outer_turn(monkeypatch):
+    """Inside a turn already held, a wait for another process's claim lets
+    the lock go one level only: the outer turn still keeps others out."""
+    monkeypatch.setattr(dispatch, "FULL_SCAN_POLL_S", 0.01)
+    engine, polls = ClaimedElsewhere(), []
+
+    def poll():
+        polls.append(_held_by_another_thread())
+        engine.free.set()
+        return True
+
+    with dispatch.full_scan_turn("outer"):
+        with dispatch.full_scan_turn("x", poll, engine):
+            pass
+    assert polls == [True]
+
+
+def _held_by_another_thread():
+    seen = []
+    thread = threading.Thread(target=lambda: seen.append(dispatch.full_scan_running()))
+    thread.start()
+    thread.join(5)
+    return seen[0]
+
+
+def test_a_full_scan_whose_claim_is_taken_over_stops_before_stamping(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(dispatch, "FULL_SCAN_HEARTBEAT_S", 0.01)
+    (tmp_path / "x.py").write_text("x = 1\n")
+
+    class TakenOver(RecordingEngine):
+        def beat_full_scan(self, repo_id, owner):
+            return False
+
+    engine = TakenOver()
+
+    def slow(engine, repo_id, repo_root, paths, **kwargs):
+        time.sleep(0.3)
+        dispatch._check_full_scan_claim(repo_id)  # as index_paths does before each file
+        return 1
+
+    stub(monkeypatch, dispatch, "index_paths", slow)
+    stub(monkeypatch, dispatch, "prune_stale_files", lambda *a, **k: 0)
+    stub(monkeypatch, dispatch, "_apply_project_schema", lambda *a: (False, None))
+    with caplog.at_level(logging.WARNING, logger="devgraph.indexer.dispatch"):
+        with pytest.raises(dispatch.FullScanClaimLost):
+            full_scan(engine, "r", tmp_path)
+    assert engine.calls["set_index_format"] == [("r", 0)]  # unstamped, never restamped
+    assert "another process took this full scan over" in caplog.text
+    assert "r" not in dispatch._scan_claims
+
+
+def test_a_failing_heartbeat_warns(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(dispatch, "FULL_SCAN_HEARTBEAT_S", 0.01)
+
+    class Down(RecordingEngine):
+        def beat_full_scan(self, repo_id, owner):
+            raise RuntimeError("neo4j down")
+
+    with caplog.at_level(logging.WARNING, logger="devgraph.indexer.dispatch"):
+        with dispatch.full_scan_turn("r", engine=Down()):
+            time.sleep(0.1)
+    assert "the full scan's heartbeat failed" in caplog.text

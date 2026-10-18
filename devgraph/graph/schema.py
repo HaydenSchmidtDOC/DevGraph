@@ -87,13 +87,14 @@ RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
 })
 
 # The pipeline's own bookkeeping among those, plus the Repository node's
-# `skipped_files` (the files a scan left out, see dispatch `_skip_marks`):
+# `skipped_files` (the files a scan left out, see dispatch `_skip_marks`) and
+# its full-scan claim, `scan_owner` and `scan_heartbeat` (dispatch `_claim_full_scan`):
 # hidden wherever a node's properties are shown (describe_node, the
 # dashboard's node inspector).
 INTERNAL_NODE_PROPERTIES: frozenset[str] = frozenset({
     "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources", "name_ref_visible", "mkeys",
     "mkeys_stale", "shared_claims", "route_mounts", "route_exports", "route_prefixes", "skipped_files",
-    "heir_open",
+    "heir_open", "scan_owner", "scan_heartbeat",
 })
 
 # An extracted edge's bookkeeping: `origins`, the files that wrote it
