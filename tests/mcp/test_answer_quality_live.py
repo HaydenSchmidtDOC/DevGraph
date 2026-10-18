@@ -70,6 +70,33 @@ FILES = {
         export function listOrders(req, res) { res.json(loadOrders()); }
         function loadOrders() { return []; }
         """,
+    # A Flask app factory's nested handler (owned by `create_app`).
+    "api/factory.py": """\
+        from flask import Flask
+
+
+        def create_app():
+            app = Flask(__name__)
+
+            @app.route("/items")
+            def items():
+                return list_items()
+
+            return app
+
+
+        def list_items():
+            return []
+        """,
+    # A Django view, linked in the module it is imported from.
+    "site/shop/__init__.py": "",
+    "site/shop/urls.py": """\
+        from django.urls import path
+        from shop import views
+
+        urlpatterns = [path("search/", views.search)]
+        """,
+    "site/shop/views.py": "def search(request):\n    return []\n",
     # A `show` the route in app.js never names: not its handler.
     "web/views.js": "export function show() { return 1; }\n",
     # Two methods named like the route's handler, neither of them it.
@@ -121,10 +148,15 @@ def test_the_fixture_has_handler_stubs(engine, repo):
     rows = engine.run_cypher(
         "MATCH (n:Function {repo_id: $r}) WHERE n.file IS NULL RETURN n.name AS name ORDER BY name", {"r": repo_id}
     )
-    assert [row["name"] for row in rows] == ["get_user", "ghostHandler", "handle", "listOrders", "listUsers", "show"]
+    assert [row["name"] for row in rows] == [
+        "get_user", "ghostHandler", "handle", "items", "listOrders", "listUsers", "search", "show",
+    ]
 
 
-FOLDED = [("get_user", "api/main.py"), ("listUsers", "web/app.js"), ("listOrders", "web/orders.js")]
+FOLDED = [
+    ("get_user", "api/main.py"), ("listUsers", "web/app.js"), ("listOrders", "web/orders.js"),
+    ("items", "api/factory.py"), ("search", "site/shop/views.py"),
+]
 
 
 @pytest.mark.parametrize(("name", "file"), FOLDED)
@@ -199,6 +231,7 @@ def _consistent(result):
 
 @pytest.mark.parametrize(("endpoint", "handler", "callee"), [
     ("GET /api/users", "listUsers", "fetchUsers"), ("GET /api/orders", "listOrders", "loadOrders"),
+    ("GET /items", "items", "list_items"),
 ])
 def test_trace_request_flow_lists_each_handler_once(engine, repo, endpoint, handler, callee):
     repo_id, _ = repo

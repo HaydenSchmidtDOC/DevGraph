@@ -7,6 +7,7 @@ from pathlib import Path
 
 from devgraph.agent import schema_rescan
 from devgraph.agent.schema_rescan import SchemaRescanScheduler
+from tests.helpers import stub
 
 
 @dataclass
@@ -47,7 +48,7 @@ class Clock:
 def setup(monkeypatch, tmp_path, *, valid=True):
     state = {"pending": True, "hash": "h1", "scans": [], "outdated": set()}
     monkeypatch.setattr(schema_rescan, "index_outdated", lambda e, r: r in state["outdated"])
-    monkeypatch.setattr(schema_rescan, "full_scan_elsewhere", lambda e, r: state.get("elsewhere"))
+    stub(monkeypatch, schema_rescan, "full_scan_elsewhere", lambda e, r: state.get("elsewhere"))
     monkeypatch.setattr(schema_rescan, "schema_pending", lambda e, r, p: state["pending"])
     monkeypatch.setattr(schema_rescan, "schema_file_hash", lambda p: state["hash"])
 
