@@ -326,3 +326,73 @@ def test_a_rolling_file_left_by_a_crash_is_kept(tmp_path, monkeypatch):
     assert (tmp_path / "devgraph.log.2").read_text(encoding="utf-8") == "from another crash\n"
     assert (tmp_path / "devgraph.log.1").read_text(encoding="utf-8") == "from the crash\n"
     assert (tmp_path / "devgraph.log").read_text(encoding="utf-8") == "x" * 120 + "\n"
+
+
+_SAMPLE_LOG = (
+    "2026-10-18 09:00:00,001 INFO devgraph.watcher: indexed 2 file(s) (src/debug_panel.py, src/app.py)\n"
+    "2026-10-18 09:00:01,002 DEBUG devgraph.indexer: pass 2 for 2 file(s)\n"
+    "2026-10-18 09:00:02,003 INFO devgraph.watcher: indexed 1 file(s) (src/errors.py)\n"
+    "2026-10-18 09:00:03,004 WARNING devgraph.agent: schema rescan skipped for demo: not found\n"
+    "2026-10-18 09:00:04,005 ERROR devgraph.watcher: live batch failed\n"
+    "Traceback (most recent call last):\n"
+    '  File "src/app.py", line 3, in <module>\n'
+    "ValueError: bad input\n"
+    "2026-10-18 09:00:05,006 INFO devgraph.watcher: indexed 1 file(s) (src/app.py)\n"
+)
+
+
+def _logs(tmp_path, *args, current=_SAMPLE_LOG, previous=None):
+    log_path = tmp_path / "devgraph.log"
+    log_path.write_text(current, encoding="utf-8")
+    if previous is not None:
+        (tmp_path / "devgraph.log.1").write_text(previous, encoding="utf-8")
+    settings = MagicMock()
+    settings.log_file = log_path
+    with patch.object(cli_main, "get_settings", return_value=settings):
+        return CliRunner().invoke(cli_main.app, ["logs", *args])
+
+
+def test_devgraph_logs_filters_by_each_records_level_field(tmp_path):
+    """The level is the field after the timestamp, not any word in the line:
+    a path holding "debug" or "errors" doesn't change a record's level."""
+    result = _logs(tmp_path)
+    assert result.exit_code == 0, result.output
+    assert "src/debug_panel.py" in result.output and "src/errors.py" in result.output
+    assert "pass 2 for 2 file(s)" not in result.output
+    assert "pass 2 for 2 file(s)" in _logs(tmp_path, "--level", "debug").output
+
+
+def test_devgraph_logs_keeps_a_traceback_with_its_error_record(tmp_path):
+    result = _logs(tmp_path, "--level", "ERROR")
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == [
+        "2026-10-18 09:00:04,005 ERROR devgraph.watcher: live batch failed",
+        "Traceback (most recent call last):",
+        '  File "src/app.py", line 3, in <module>',
+        "ValueError: bad input",
+    ]
+    warnings = _logs(tmp_path, "--level", "WARNING").output.splitlines()
+    assert warnings[0].endswith("schema rescan skipped for demo: not found") and len(warnings) == 5
+
+
+def test_devgraph_logs_never_shows_part_of_a_record(tmp_path):
+    """-n counts lines from the end, but the oldest record shown is whole."""
+    lines = _logs(tmp_path, "-n", "3").output.splitlines()
+    assert lines[0] == "2026-10-18 09:00:04,005 ERROR devgraph.watcher: live batch failed"
+    assert lines[-1].endswith("indexed 1 file(s) (src/app.py)") and len(lines) == 5
+
+
+def test_devgraph_logs_follows_a_record_across_a_rollover(tmp_path):
+    """A rollover between a record's lines leaves its traceback at the top of
+    the current file: it keeps the level of its record in `.1`."""
+    head, _, tail = _SAMPLE_LOG.partition("Traceback")
+    result = _logs(tmp_path, "--level", "ERROR", current="Traceback" + tail, previous=head)
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[0].endswith("ERROR devgraph.watcher: live batch failed")
+    assert result.output.splitlines()[-1] == "ValueError: bad input"
+
+
+def test_devgraph_logs_refuses_an_unknown_level(tmp_path):
+    result = _logs(tmp_path, "--level", "LOUD")
+    assert result.exit_code == 2
+    assert "DEBUG, INFO, WARNING, ERROR, CRITICAL" in " ".join(result.output.split())

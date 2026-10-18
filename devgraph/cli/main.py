@@ -5,6 +5,7 @@ import importlib.metadata
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -3423,16 +3424,50 @@ def config_schema_reset(
     _schema_follow_up(root, result)
 
 
+_LOG_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+#: A record's first line as the agent writes it, `%(asctime)s %(levelname)s
+#: %(name)s: %(message)s` (agent/tray.py, agent/headless.py): the level is the
+#: field after the timestamp's date and time.
+_LOG_RECORD_START = re.compile(r"^\d{4}-\d{2}-\d{2}(?: \S+)? (" + "|".join(_LOG_LEVELS) + r") ")
+
+
+def _log_records(text: str) -> list[tuple[int, list[str]]]:
+    """`text` as (level, lines) records: a line that doesn't start a record (a
+    traceback's) belongs to the one before it; lines before any record count
+    as INFO."""
+    records: list[tuple[int, list[str]]] = []
+    for line in text.splitlines():
+        start = _LOG_RECORD_START.match(line)
+        if start is not None:
+            records.append((_LOG_LEVELS[start.group(1)], [line]))
+        elif records:
+            records[-1][1].append(line)
+        else:
+            records.append((logging.INFO, [line]))
+    return records
+
+
 @app.command()
 def logs(
     lines: int = typer.Option(
-        50, "--lines", "-n", help="Number of recent lines to show."
+        50, "--lines", "-n",
+        help="Number of recent lines to show; the oldest record shown is shown whole, traceback included.",
     ),
     level: str = typer.Option(
-        "INFO", "--level", "-l", help="Minimum log level filter (DEBUG, INFO, WARNING, ERROR)."
+        "INFO", "--level", "-l", help="Minimum log level filter (DEBUG, INFO, WARNING, ERROR, CRITICAL)."
     ),
 ) -> None:
     """Show recent log output from the DevGraph tray/dashboard process."""
+    min_level = _LOG_LEVELS.get(level.upper())
+    if min_level is None:
+        raise typer.BadParameter(f"{level!r} is not one of {', '.join(_LOG_LEVELS)}.", param_hint="'--level'")
     settings = get_settings()
     log_path = settings.log_file
     if not log_path or not log_path.exists():
@@ -3441,47 +3476,35 @@ def logs(
         console.print("  The tray app must be started with file logging enabled.")
         return
 
-    level_map = {
-        "DEBUG": logging.DEBUG,
-        "INFO": logging.INFO,
-        "WARNING": logging.WARNING,
-        "ERROR": logging.ERROR,
-    }
-    min_level = level_map.get(level.upper(), logging.INFO)
-
     # The agent rotates the file (see LOG_MAX_BYTES): just after a rollover the
     # current file holds only a few lines, so the newest older file is read
-    # before it, oldest first.
+    # before it, oldest first. Read as one text, a record a rollover split
+    # (a traceback at the top of the current file) stays whole.
     previous = log_path.with_name(log_path.name + ".1")
     try:
         text = ""
         for path in (previous, log_path):
             try:
-                text += path.read_text(encoding="utf-8")
+                content = path.read_text(encoding="utf-8")
             except FileNotFoundError:  # absent, or renamed by a rollover since
                 continue
+            text += content if not content or content.endswith("\n") else content + "\n"
     except OSError as e:
         console.print(f"[red][X] Error reading log file:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
-    # Parse log lines, filter by level, take last N
-    filtered: list[str] = []
-    for line in text.splitlines():
-        # Simple level detection from common log formats
-        line_upper = line.upper()
-        line_level = logging.INFO
-        if "ERROR" in line_upper:
-            line_level = logging.ERROR
-        elif "WARNING" in line_upper or "WARN" in line_upper:
-            line_level = logging.WARNING
-        elif "DEBUG" in line_upper:
-            line_level = logging.DEBUG
-        if line_level >= min_level:
-            filtered.append(line)
-
-    tail = filtered[-lines:] if lines > 0 else filtered
-    for line in tail:
-        console.print(escape(line))
+    # The newest records of at least `min_level`, whole, until `lines` lines.
+    shown: list[list[str]] = []
+    count = 0
+    for record_level, record_lines in reversed(_log_records(text)):
+        if lines > 0 and count >= lines:
+            break
+        if record_level >= min_level:
+            shown.append(record_lines)
+            count += len(record_lines)
+    for record_lines in reversed(shown):
+        for line in record_lines:
+            console.print(escape(line))
 
 
 @app.command()
