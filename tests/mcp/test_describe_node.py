@@ -124,7 +124,7 @@ def test_lookup_without_label_is_a_per_label_union():
         describe_node(engine, "demo", "x", declared_labels=("Runbook", "Folder"))
     lookup = engine.calls[0]["query"]
     branches = _branches(lookup)
-    builtins = [label for label in schema.NODE_LABELS if label != "Repository"]
+    builtins = list(schema.NAMED_LABELS)  # every built-in label but Repository, Cache included
     assert sorted(label for label, key in branches if key == "name") == sorted(builtins + ["Runbook", "Folder"])
     assert sorted(label for label, key in branches if key == "path") == ["Folder", "Runbook"]
     assert "`Repository`" not in lookup
