@@ -984,6 +984,40 @@ def _defined_functions(root: Node, source: bytes) -> set[str]:
     return names
 
 
+#: The owner of a CommonJS export named like a top-level function of its
+#: file (`function create() {}` and `module.exports.create = function ...`):
+#: two Functions, never one node.
+EXPORTS_OWNER = "exports"
+
+
+def _top_level_functions(root: Node) -> set[str]:
+    """The names of the module's own top-level Functions: function
+    declarations and `const f = <function>` declarators, exported or not."""
+    names: set[str] = set()
+    for node in root.named_children:
+        statement = node.child_by_field_name("declaration") if node.type == "export_statement" else node
+        if statement is None:
+            continue
+        if statement.type in ("function_declaration", "generator_function_declaration"):
+            name = statement.child_by_field_name("name")
+            if name is not None:
+                names.add(name.text.decode("utf-8", errors="replace"))
+        elif statement.type in ("lexical_declaration", "variable_declaration"):
+            for declarator in statement.named_children:
+                name = declarator.child_by_field_name("name")
+                if name is not None and name.type == "identifier" and _function_value(
+                    declarator.child_by_field_name("value")
+                ) is not None:
+                    names.add(name.text.decode("utf-8", errors="replace"))
+    return names
+
+
+def _export_owner(name: str, top_level: set[str]) -> str:
+    """A CommonJS export's owner: "" (a top-level Function), or
+    EXPORTS_OWNER when a top-level function of the file has its name."""
+    return EXPORTS_OWNER if name in top_level else ""
+
+
 def _object_members(obj: Node) -> set[str]:
     """The Functions a defined object literal's own members are: its
     methods and function-valued properties (`_visit_object`)."""
@@ -994,15 +1028,17 @@ def _object_members(obj: Node) -> set[str]:
     }
 
 
-def _module_objects(root: Node) -> dict[str, tuple[str, set[str]]]:
+def _module_objects(root: Node) -> dict[str, dict[str, str]]:
     """The receivers whose members are this file's Functions of a known
     owner: each module-level object literal binding (`const userService =
     {...}`, exported or not) by its name, and the module's CommonJS
     exports (`exports.x = ...`, `module.exports = {...}`) as `exports` and
-    `module.exports`, owned by "" (`_object_path`, `_export_path`). Each
-    maps to (the members' owner, the members' names)."""
-    found: dict[str, tuple[str, set[str]]] = {}
+    `module.exports`, owned by "" or EXPORTS_OWNER (`_object_path`,
+    `_export_path`, `_export_owner`). Each maps its members' names to
+    their owner."""
+    found: dict[str, dict[str, str]] = {}
     exported: set[str] = set()
+    top_level = _top_level_functions(root)
     for node in root.named_children:
         statement = node.child_by_field_name("declaration") if node.type == "export_statement" else node
         if statement is None:
@@ -1012,7 +1048,7 @@ def _module_objects(root: Node) -> dict[str, tuple[str, set[str]]]:
                 obj = _object_value(declarator.child_by_field_name("value"))
                 path = _object_path(obj) if obj is not None else None
                 if path is not None and len(path) == 1:
-                    found[path[0]] = (path[0], _object_members(obj))
+                    found[path[0]] = dict.fromkeys(_object_members(obj), path[0])
         elif statement.type == "expression_statement" and statement.named_children:
             assignment = statement.named_children[0]
             path = _export_path(assignment) if assignment.type == "assignment_expression" else None
@@ -1022,7 +1058,7 @@ def _module_objects(root: Node) -> dict[str, tuple[str, set[str]]]:
             elif path == () and (obj := _object_value(value)) is not None:
                 exported |= _object_members(obj)
     if exported:
-        found["exports"] = found["module.exports"] = ("", exported)
+        found["exports"] = found["module.exports"] = {name: _export_owner(name, top_level) for name in exported}
     return found
 
 
@@ -1099,7 +1135,7 @@ class _CallResolver:
 
     def __init__(
         self, file_path: str, bindings: dict[str, _Binding], classes: dict[str, _ClassInfo],
-        defined: set[str], script: bool, source: bytes, objects: dict[str, tuple[str, set[str]]] | None = None,
+        defined: set[str], script: bool, source: bytes, objects: dict[str, dict[str, str]] | None = None,
     ):
         self.file_path = file_path
         self.bindings = bindings
@@ -1202,8 +1238,8 @@ class _CallResolver:
         is that object's own; None for any other name, so a member the
         object holds another way (a shorthand `{ helper }`) links as
         before."""
-        owner, members = self.objects.get(receiver, (None, ()))
-        return [owned_pin(self.file_path, owner)] if method in members else None
+        members = self.objects.get(receiver, {})
+        return [owned_pin(self.file_path, members[method])] if method in members else None
 
     def render_pins(self, tag: Node, scope: _Scope) -> list[str]:
         """Where the `render` of the class component a JSX tag names can be:
@@ -1636,6 +1672,7 @@ def extract_js_file(
         file_path, bindings, class_table, _defined_functions(root, source_bytes), not module, source_bytes,
         _module_objects(root),
     )
+    top_level = _top_level_functions(root)
     # (caller label, caller name, caller owner)
     #   -> callee name -> [pins, bare?, caller classes, every bare site a member call?]
     calls: dict[tuple[str, str, str | None], dict[str, list]] = {}
@@ -1720,14 +1757,17 @@ def extract_js_file(
             if path and (function := _function_value(value_node)) is not None:
                 # `exports.handler = async (event) => ...`: a top-level Function.
                 name_node = assignment.child_by_field_name("left").child_by_field_name("property")
-                _visit_function(function, parent_name, parent_label, node, name_node, scope)
+                owner = _export_owner(path[0], top_level)
+                _visit_function(function, parent_name, parent_label, node, name_node, scope, (owner,) if owner else ())
                 return True
             if (obj := _object_value(value_node)) is not None:
-                _visit_object(obj, parent_name, parent_label, scope, path)
+                _visit_object(obj, parent_name, parent_label, scope, path, exported=True)
                 return True
         return False
 
-    def _visit_object(obj: Node, parent_name: str | None, parent_label: str, scope: _Scope, path: tuple) -> None:
+    def _visit_object(
+        obj: Node, parent_name: str | None, parent_label: str, scope: _Scope, path: tuple, exported: bool = False,
+    ) -> None:
         """A defined object literal's methods and function-valued
         properties (`_object_path`), owned by `path` below the scope's own
         owner, and those of its object-valued properties."""
@@ -1736,12 +1776,14 @@ def extract_js_file(
             if key is None:
                 continue
             name_node = member.child_by_field_name("key" if member.type == "pair" else "name")
+            # `module.exports = {...}`'s members are the module's exports.
+            own = path or ((EXPORTS_OWNER,) if exported and _export_owner(key, top_level) else ())
             if member.type == "method_definition":
-                _visit_function(member, parent_name, parent_label, member, name_node, scope, path)
+                _visit_function(member, parent_name, parent_label, member, name_node, scope, own)
                 continue
             value_node = member.child_by_field_name("value")
             if (function := _function_value(value_node)) is not None:
-                _visit_function(function, parent_name, parent_label, member, name_node, scope, path)
+                _visit_function(function, parent_name, parent_label, member, name_node, scope, own)
             elif (inner := _object_value(value_node)) is not None:
                 _visit_object(inner, parent_name, parent_label, scope, (*path, key))
 

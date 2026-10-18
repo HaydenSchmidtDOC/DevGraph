@@ -395,16 +395,20 @@ a block had no node and their calls were attributed to no one (an
   each function-valued property (`deleteUser: async () => ...`, through a
   component wrapper), owned by the binding's name below the scope's own
   owner (`userService`, `userService.admin`, `outer.local` in a function
-  `outer`; `module.exports`'s are top-level, owner ""), with `CONTAINS`
+  `outer`; `module.exports`'s are top-level, owner "", or `exports`
+  (`EXPORTS_OWNER`) when a top-level function of the file has the name,
+  so `function create() {}` and `module.exports.create = function ...`
+  are two nodes, never one), with `CONTAINS`
   from the scope. An object passed as an argument or returned defines
   nothing. Its other properties' calls are the scope's.
 - **CommonJS exports.** At the module's top level, `exports.x = <function>`
-  and `module.exports.x = <function>` are a top-level Function `x`.
+  and `module.exports.x = <function>` are a top-level Function `x` (owned
+  by `exports` when a top-level function of the file is named `x`).
 - **Blocks.** A definition inside `if`/`else`, `try`/`catch`/`finally`, a
   loop, `switch` or a labelled statement (`_compound_statements`) is its
   scope's own, at the module and in a function, as a direct one is. Two
-  definitions of one name in one scope are one node (`common.merge_same_nodes`,
-  as in Python).
+  definitions of one name in one scope are one node, the first
+  (`common.merge_same_nodes`, as in Python).
 - **Calls to them.** `userService.getUser()` on a module-level object
   binding of the file, and `exports.handler()`/`module.exports.handler()`,
   are pinned to the file and the member's owner, when the object (or the

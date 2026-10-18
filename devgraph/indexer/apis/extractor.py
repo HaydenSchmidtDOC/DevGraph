@@ -1,5 +1,6 @@
 """API extractor for parsing FastAPI, Flask, and Django route definitions."""
 
+import ast
 from dataclasses import dataclass, field
 from typing import List
 
@@ -7,6 +8,7 @@ import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
 from devgraph.indexer.common import member_owner
+from devgraph.indexer.python.extractor import _extract_imports
 
 _PY_LANGUAGE = Language(tspython.language())
 
@@ -95,10 +97,34 @@ def _text(node: Node, source: bytes) -> str:
 
 
 def _literal(node: Node | None, source: bytes) -> str | None:
-    """A plain string literal's text (no f-string interpolation), else None."""
+    """A string literal's value, else None: a plain or raw string, or
+    several written side by side (`"/a" "/b"`), escape sequences decoded
+    outside a raw string; never an f-string with an interpolation."""
+    if node is not None and node.type == "concatenated_string":
+        parts = [_literal(child, source) for child in node.named_children]
+        return None if any(part is None for part in parts) else "".join(parts)
     if node is None or node.type != "string" or any(c.type == "interpolation" for c in node.named_children):
         return None
-    return "".join(_text(c, source) for c in node.named_children if c.type == "string_content")
+    start = next((c for c in node.children if c.type == "string_start"), None)
+    raw = start is not None and "r" in _text(start, source).lower()
+    value = []
+    for content in (c for c in node.named_children if c.type == "string_content"):
+        at = content.start_byte
+        for escape in (c for c in content.named_children if c.type == "escape_sequence"):
+            value.append(source[at : escape.start_byte].decode("utf-8"))
+            text = _text(escape, source)
+            value.append(text if raw else _unescape(text))
+            at = escape.end_byte
+        value.append(source[at : content.end_byte].decode("utf-8"))
+    return "".join(value)
+
+
+def _unescape(escape: str) -> str:
+    """One escape sequence's character (`\\x2F` is "/")."""
+    try:
+        return ast.literal_eval(f'"{escape}"')
+    except (SyntaxError, ValueError):
+        return escape
 
 
 def _arguments(call: Node) -> tuple[list[Node], dict[str, Node]]:
@@ -136,9 +162,16 @@ class _Routes:
         self.imports: set[str] = set()  # "FastAPI", "Flask": the frameworks the file imports
         self.decorated: list[tuple[Node, str, str]] = []  # (decorator call, handler, handler owner)
         self.calls: list[Node] = []
-        self._walk(root, "Module", None, "")
+        # Iterative, in source order: a deeply nested expression (3,000 `+`
+        # terms) is read on any thread's stack.
+        pending: list[tuple[Node, str, str | None, str]] = [(root, "Module", None, "")]
+        while pending:
+            node, label, name, owner = pending.pop()
+            inner = self._visit(node, label, name, owner)
+            pending += [(child, *inner) for child in reversed(node.children)]
 
-    def _walk(self, node: Node, label: str, name: str | None, owner: str) -> None:
+    def _visit(self, node: Node, label: str, name: str | None, owner: str) -> tuple[str, str | None, str]:
+        """Read one node; return the (label, name, owner) its children are in."""
         source = self.source
         if node.type in ("import_statement", "import_from_statement"):
             for child in node.named_children:
@@ -172,8 +205,7 @@ class _Routes:
                 owner = member_owner(label, name, owner)
                 label = "Class" if node.type == "class_definition" else "Function"
                 name = _text(name_node, source)
-        for child in node.children:
-            self._walk(child, label, name, owner)
+        return label, name, owner
 
     def _framework(self, receiver: str, attr: str) -> str | None:
         """The framework of an app or router `receiver`'s `attr` decorator:
@@ -214,10 +246,11 @@ class _Routes:
             found += [(framework, method, path, handler, owner) for method in methods]
         return found
 
-    def django_routes(self) -> list[tuple[str, str]]:
-        """(pattern, view) per Django `path(...)`/`re_path(...)` call whose
-        pattern is a literal and whose view is a name (`views.search` is
-        `search`) or a class-based view's `as_view()` (the class)."""
+    def django_routes(self) -> list[tuple[str, str, str]]:
+        """(pattern, view, the view as written) per Django `path(...)`/
+        `re_path(...)` call whose pattern is a literal and whose view is a
+        name (`views.search` is `search`) or a class-based view's
+        `as_view()` (the class)."""
         found = []
         for call in self.calls:
             func = call.child_by_field_name("function")
@@ -234,8 +267,45 @@ class _Routes:
                 view = obj if inner is not None and _text(inner, self.source).endswith(".as_view") else None
             if pattern is None or view is None or view.type not in ("identifier", "attribute"):
                 continue
-            found.append((pattern, _text(view, self.source).rsplit(".", 1)[-1]))
+            written = _text(view, self.source)
+            found.append((pattern, written.rsplit(".", 1)[-1], written))
         return found
+
+
+def _django_implements(endpoint_id: str, view: str, written: str, bindings) -> list[Relationship]:
+    """A Django route's IMPLEMENTS edges: the file-less handler stub, and the
+    view in the module it is imported from, as a top-level function of
+    that module's candidate files (python/resolve.py): `views.search` with
+    `from . import views` is `<dir>/views.py`'s `search`, a from-imported
+    `search` its module's. A view read off a module nothing imports
+    links nothing but the stub; a bare name nothing imports (a view of the
+    file itself, a star import's) links every one of its name, as before."""
+    head = written.split(".")[0] if "." in written else None
+    pins: list[str] | None = None
+    if head is not None:
+        receiver = written.rsplit(".", 1)[0] if written.count(".") == 1 else None
+        module = bindings.modules.get(receiver) if receiver is not None else None
+        symbol = bindings.symbols.get(receiver) if receiver is not None else None
+        if module is not None:
+            pins = module.files()
+        elif symbol is not None:
+            pins = symbol.submodule.files()  # `from app import views`: the module app/views
+        else:
+            pins = []  # unresolved: the stub alone
+    elif (symbol := bindings.symbols.get(written)) is not None:
+        view, pins = symbol.name, symbol.module.files()
+    if pins is None:
+        return [Relationship(
+            source_label="Endpoint", source_name=endpoint_id, relationship_type="IMPLEMENTS",
+            target_label="Function", target_name=view,
+        )]
+    return [
+        Relationship(
+            source_label="Endpoint", source_name=endpoint_id, relationship_type="IMPLEMENTS",
+            target_label="Function", target_name=view, to_file=pin, to_owner="" if pin else None,
+        )
+        for pin in ["", *dict.fromkeys(pins)]
+    ]
 
 
 class APIExtractor:
@@ -249,7 +319,9 @@ class APIExtractor:
         """
         self.repo_id = repo_id
 
-    def extract_from_source(self, content: str, filename: str = "unknown.py") -> ExtractionResult:
+    def extract_from_source(
+        self, content: str, filename: str = "unknown.py", roots: tuple[str, ...] = (),
+    ) -> ExtractionResult:
         """Extract API endpoints from Python source code.
 
         Supports FastAPI, Flask, and Django patterns, read from the file's
@@ -262,28 +334,27 @@ class APIExtractor:
         Args:
             content: The Python source code content.
             filename: The source filename for context.
+            roots: The file's configured Python source roots
+                (`ResolverConfig.python_roots`), which a Django view's
+                module is also looked up under, as the Python extractor's
+                imports are.
 
         Returns:
             ExtractionResult containing extracted Endpoint and Function nodes.
         """
         result = ExtractionResult()
         source = content.encode("utf-8")
-        routes = _Routes(Parser(_PY_LANGUAGE).parse(source).root_node, source)
+        root = Parser(_PY_LANGUAGE).parse(source).root_node
+        routes = _Routes(root, source)
         for framework, method, path, handler, owner in routes.decorator_routes():
             self._add(result, framework, method, path, handler, filename, "handler")
             result.relationships.extend(_pinned_implements(f"{method} {path}", handler, filename, owner))
-        for pattern, view in routes.django_routes():
-            # Django's urls.py names no HTTP method (the view handles each);
-            # its view is usually imported from views.py, so the target
-            # stays unpinned.
+        django = routes.django_routes()
+        bindings = _extract_imports(root, source, filename, roots) if django else None
+        for pattern, view, written in django:
+            # Django's urls.py names no HTTP method (the view handles each).
             self._add(result, "Django", "*", pattern, view, filename, "view")
-            result.relationships.append(Relationship(
-                source_label="Endpoint",
-                source_name=f"* {pattern}",
-                relationship_type="IMPLEMENTS",
-                target_label="Function",
-                target_name=view,
-            ))
+            result.relationships += _django_implements(f"* {pattern}", view, written, bindings)
         return result
 
     def _add(

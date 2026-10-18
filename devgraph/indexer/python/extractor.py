@@ -359,6 +359,8 @@ class _ClassInfo:
     # What its members are owned by (common.member_owner): its own owner
     # chain and its name, one per class of the name in the file.
     members_owners: set[str] = field(default_factory=set)
+    # The owners of the classes themselves, one per class of the key.
+    own_owners: set[str] = field(default_factory=set)
 
     def members_owner(self) -> str | None:
         """The owner of the class's members, None when several classes of
@@ -367,31 +369,66 @@ class _ClassInfo:
         return next(iter(self.members_owners)) if len(self.members_owners) == 1 else None
 
 
-def _class_table(root: Node, source: bytes) -> dict[str, _ClassInfo]:
-    """Every class in the file, at any depth: its own methods and its bases.
-    Same-named classes merge."""
-    classes: dict[str, _ClassInfo] = {}
+def _class_nodes(root: Node, source: bytes) -> list[tuple[Node, str, str, str | None]]:
+    """Every class definition of the file, at any depth, in source order, as
+    (its node, its name, its own owner (common.member_owner), the chain of
+    the innermost function it is defined in or None)."""
+    found: list[tuple[Node, str, str, str | None]] = []
 
-    def walk(node: Node, label: str, name: str | None, owner: str) -> None:
+    def walk(node: Node, label: str, name: str | None, owner: str, fn: str | None) -> None:
         if node.type in ("class_definition", "function_definition"):
             name_node = node.child_by_field_name("name")
             if name_node is not None:
                 own = member_owner(label, name, owner)
-                if node.type == "function_definition":
-                    label, name, owner = "Function", _text(name_node, source), own
+                label, name, owner = (
+                    "Function" if node.type == "function_definition" else "Class", _text(name_node, source), own,
+                )
+                if node.type == "class_definition":
+                    found.append((node, name, own, fn))
                 else:
-                    class_name = _text(name_node, source)
-                    info = classes.setdefault(class_name, _ClassInfo())
-                    info.methods |= _direct_defs(node.child_by_field_name("body"), source)
-                    info.members_owners.add(member_owner("Class", class_name, own))
-                    for base in _extract_base_class_names(node.child_by_field_name("superclasses"), source):
-                        if base not in info.bases:
-                            info.bases.append(base)
-                    label, name, owner = "Class", class_name, own
+                    fn = member_owner("Function", name, own)
         for child in node.children:
-            walk(child, label, name, owner)
+            walk(child, label, name, owner, fn)
 
-    walk(root, "Module", None, "")
+    walk(root, "Module", None, "", None)
+    return found
+
+
+def _class_key(name: str, fn: str | None) -> str:
+    """A class's key in the file's class table: its name, or for a class
+    defined in a function (visible there only, as Python scopes it) the
+    function's chain and its name, `factory/User`, which no name or owner
+    can equal."""
+    return name if fn is None else f"{fn}/{name}"
+
+
+def _lookup_class(keys, name: str, fn: str | None) -> str | None:
+    """The key of the class `name` means in a function of chain `fn` (None
+    at the module or a module-level class body): the nearest enclosing
+    function's own class of the name, else the file's other classes'."""
+    while fn:
+        if f"{fn}/{name}" in keys:
+            return f"{fn}/{name}"
+        fn = fn.rsplit(".", 1)[0] if "." in fn else None
+    return name if name in keys else None
+
+
+def _class_table(root: Node, source: bytes) -> dict[str, _ClassInfo]:
+    """Every class in the file, at any depth, by its key (`_class_key`): its
+    own methods and its bases (each a class key when it names a class of
+    the file where it is written). Same-keyed classes merge."""
+    classes: dict[str, _ClassInfo] = {}
+    nodes = _class_nodes(root, source)
+    keys = {_class_key(name, fn) for _node, name, _own, fn in nodes}
+    for node, class_name, own, fn in nodes:
+        info = classes.setdefault(_class_key(class_name, fn), _ClassInfo())
+        info.methods |= _direct_defs(node.child_by_field_name("body"), source)
+        info.members_owners.add(member_owner("Class", class_name, own))
+        info.own_owners.add(own)
+        for base in _extract_base_class_names(node.child_by_field_name("superclasses"), source):
+            base = _lookup_class(keys, base, fn) or base
+            if base not in info.bases:
+                info.bases.append(base)
     return classes
 
 
@@ -434,7 +471,8 @@ def _heir_bases(superclasses: Node | None, source: bytes) -> list[str]:
 def _class_declarations(root: Node, source: bytes) -> list[tuple[str, str, list[str], set[str]]]:
     """Every class declaration of the file, each on its own (two nested
     `Meta`s of two classes stay apart), as common.heir_keys reads them:
-    (name, its members' owner, its bases (`_heir_bases`), its methods); a
+    (its key (`_class_key`), its members' owner, its bases (`_heir_bases`,
+    each a class key when it names a class of the file there), its methods); a
     class decorated otherwise than `_SAFE_CLASS_DECORATORS`, or rebound at
     the module level (`X = register(X)`), also of common.UNKNOWN_BASE,
     since the name may be another class. Then each module-level alias or
@@ -444,33 +482,23 @@ def _class_declarations(root: Node, source: bytes) -> list[tuple[str, str, list[
     no class of the file is named, so a call through it links what it did
     before owners."""
     found: list[tuple[str, str, list[str], set[str]]] = []
-
-    def walk(node: Node, label: str, name: str | None, owner: str) -> None:
-        if node.type in ("class_definition", "function_definition"):
-            name_node = node.child_by_field_name("name")
-            if name_node is not None:
-                own = member_owner(label, name, owner)
-                if node.type == "function_definition":
-                    label, name, owner = "Function", _text(name_node, source), own
-                else:
-                    class_name = _text(name_node, source)
-                    bases = _heir_bases(node.child_by_field_name("superclasses"), source)
-                    decorated = node.parent if node.parent is not None and node.parent.type == "decorated_definition" \
-                        else None
-                    decorators = _extract_decorator_names(
-                        [c for c in decorated.named_children if c.type == "decorator"], source,
-                    ) if decorated is not None else []
-                    if any(each.rsplit(".", 1)[-1] not in _SAFE_CLASS_DECORATORS for each in decorators):
-                        bases.append(UNKNOWN_BASE)
-                    found.append((
-                        class_name, member_owner("Class", class_name, own), bases,
-                        _direct_defs(node.child_by_field_name("body"), source),
-                    ))
-                    label, name, owner = "Class", class_name, own
-        for child in node.children:
-            walk(child, label, name, owner)
-
-    walk(root, "Module", None, "")
+    nodes = _class_nodes(root, source)
+    keys = {_class_key(name, fn) for _node, name, _own, fn in nodes}
+    for node, class_name, own, fn in nodes:
+        bases = [
+            _lookup_class(keys, base, fn) or base if base != UNKNOWN_BASE else base
+            for base in _heir_bases(node.child_by_field_name("superclasses"), source)
+        ]
+        decorated = node.parent if node.parent is not None and node.parent.type == "decorated_definition" else None
+        decorators = _extract_decorator_names(
+            [c for c in decorated.named_children if c.type == "decorator"], source,
+        ) if decorated is not None else []
+        if any(each.rsplit(".", 1)[-1] not in _SAFE_CLASS_DECORATORS for each in decorators):
+            bases.append(UNKNOWN_BASE)
+        found.append((
+            _class_key(class_name, fn), member_owner("Class", class_name, own), bases,
+            _direct_defs(node.child_by_field_name("body"), source),
+        ))
     classes = {each[0] for each in found}
     rebound: set[str] = set()
     for statement in root.named_children:
@@ -509,6 +537,7 @@ class _Scope:
     cls: str | None
     parent: _Scope | None = None
     params: set[str] = field(default_factory=set)
+    fn: str | None = None  # the chain of the function this scope is in (`_lookup_class`), None at the module
 
     def defines(self, name: str) -> bool:
         scope: _Scope | None = self
@@ -569,15 +598,16 @@ class _CallResolver:
             ]
         return None
 
-    def _class_pins(self, type_name: str, method: str) -> list[str] | None:
+    def _class_pins(self, type_name: str, method: str, fn: str | None = None) -> list[str] | None:
         """Where `method` of the class `type_name` (as written) can be. An
         in-file class is walked like `self.method()` (see _method_pins); an
         imported one's method is the class's member in its files (its own,
         or one it inherits from a class of its file, common.heir_keys); a
         class read off a from-imported name (`x.User`) any of the name
-        there."""
-        if type_name in self.classes:
-            return self._method_pins(type_name, method, own=True)
+        there. A bare name is looked up as Python scopes it from the
+        function of chain `fn` (`_lookup_class`)."""
+        if (key := _lookup_class(self.classes, type_name, fn)) is not None:
+            return self._method_pins(key, method, own=True)
         if "." in type_name:
             head, cls = type_name.rsplit(".", 1)
             pins = self._module_pins(head)
@@ -624,11 +654,11 @@ class _CallResolver:
         if "." not in receiver:
             types = scope.types_of(receiver)
             if types:
-                found = [pins for name in types if (pins := self._class_pins(name, method)) is not None]
+                found = [pins for name in types if (pins := self._class_pins(name, method, scope.fn)) is not None]
                 if found:
                     return sorted({pin for pins in found for pin in pins})
-            if receiver in self.classes:
-                return self._class_pins(receiver, method)
+            if _lookup_class(self.classes, receiver, scope.fn) is not None:
+                return self._class_pins(receiver, method, scope.fn)
         if scope.is_parameter(receiver.split(".", 1)[0]):
             return None  # a parameter shadows the import of its name
         return self._module_pins(receiver)
@@ -671,7 +701,7 @@ class _CallResolver:
             if pins is not None:
                 return [(attr, pin) for pin in pins]
         elif (constructor := _constructed(obj, source)) is not None:
-            pins = self._class_pins(constructor, attr)  # `Fake().run()`
+            pins = self._class_pins(constructor, attr, scope.fn)  # `Fake().run()`
             if pins is not None:
                 return [(attr, pin) for pin in pins]
         if obj.type in _LITERAL_RECEIVERS or attr in STOP_METHODS["python"]:
@@ -914,7 +944,9 @@ def extract_python_file(
         """Visit statements in a block (module body, class body, function body)
         whose own owner is `parent_owner`. A class body's defs are methods:
         they see the class's enclosing scope."""
-        def_scope, def_cls = (scope.parent, parent_name) if parent_label == "Class" else (scope, scope.cls)
+        def_scope, def_cls = (
+            (scope.parent, _class_key(parent_name, scope.fn)) if parent_label == "Class" else (scope, scope.cls)
+        )
         for node in block.named_children:
             if node.type in ("class_definition", "function_definition", "decorated_definition"):
                 visit_definition(node, parent_name, parent_label, scope, def_scope, def_cls, parent_owner)
@@ -1011,6 +1043,12 @@ def extract_python_file(
         )
 
         for base_class in base_classes:
+            # A base naming a class of this file where it is written (Python
+            # scoping, `_lookup_class`) is that class; any other by name.
+            key = _lookup_class(class_table, base_class, scope.fn)
+            local = class_table[key].own_owners if key is not None else set()
+            if base_class == class_name and local == {owner}:
+                continue  # `class X(X)` redefining X: one node, which extends no other of the file
             result.relationships.append(
                 GraphRelationship(
                     from_label="Class",
@@ -1020,11 +1058,13 @@ def extract_python_file(
                     to_name=base_class,
                     repo_id=repo_id,
                     from_owner=owner,
+                    to_file=file_path if len(local) == 1 else None,
+                    to_owner=next(iter(local)) if len(local) == 1 else None,
                 )
             )
 
         if body_node is not None:
-            visit_block(body_node, class_name, "Class", _Scope(set(), {}, None, scope), owner)
+            visit_block(body_node, class_name, "Class", _Scope(set(), {}, None, scope, fn=scope.fn), owner)
 
     def _visit_function(
         node: Node,
@@ -1091,7 +1131,7 @@ def extract_python_file(
         if body_node is not None:
             scope = _Scope(
                 _direct_defs(body_node, source_bytes), _local_types(node, body_node, source_bytes, fixtures), cls,
-                enclosing, _parameter_names(node, source_bytes),
+                enclosing, _parameter_names(node, source_bytes), member_owner("Function", func_name, owner),
             )
             caller_class = parent_name if parent_label == "Class" else None
             record_calls("Function", func_name, body_node, scope, caller_class, owner)

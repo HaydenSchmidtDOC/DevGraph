@@ -598,6 +598,30 @@ def _spring_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
     walk(root, [])
 
 
+def _merge_constant_members(result: ExtractionResult, constant_members: set[int]) -> None:
+    """An enum constant's body declares members of the enum (`ACTIVE {
+    boolean isActive() {...} }`), one identity with the enum's own member
+    of the name: such a node is dropped when the enum declares a member of
+    its identity itself, or an earlier constant does, so the first
+    declaration wins (as common.merge_same_nodes: its properties and
+    lines), the enum's own before any constant's. Its calls stay the
+    node's. Overloads the enum (or any class) declares itself stay
+    separate nodes, as everywhere in Java."""
+
+    def identity(node: GraphNode) -> tuple:
+        return node.label, node.name, node.properties.get("file"), node.properties.get("owner") or ""
+
+    seen = {identity(n) for n in result.nodes if id(n) not in constant_members and n.properties.get("file")}
+    nodes: list[GraphNode] = []
+    for node in result.nodes:
+        if id(node) in constant_members:
+            if identity(node) in seen:
+                continue
+            seen.add(identity(node))
+        nodes.append(node)
+    result.nodes = nodes
+
+
 def extract_java_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
     """Parse a Java file and extract nodes and relationships.
 
@@ -636,6 +660,9 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
     resolver = _JavaResolver(root, source_bytes, file_path, _package_name(root, source_bytes))
     result.relationships += import_rows(file_path, repo_id, resolver.import_files, resolver.import_pins)
     sites = CallSites()
+    # The nodes of enum constants' bodies (`ACTIVE { ... }`), merged into
+    # the enum's member of their identity (`_merge_constant_members`).
+    constant_members: set[int] = set()
 
     def _record_calls(
         node: Node, body: Node, caller_label: str, caller_name: str, classes: list[str]
@@ -670,7 +697,9 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
                 arguments = node.child_by_field_name("arguments")
                 if arguments is not None:
                     _record_calls(node, arguments, parent_label, parent_name if parent_name else file_path, classes)
+                first = len(result.nodes)
                 visit_block(node.child_by_field_name("body"), parent_name, parent_label, classes)
+                constant_members.update(id(each) for each in result.nodes[first:])
             else:
                 # Field declarations, static/instance initializers, enum
                 # constants, etc: not a def, but may still contain calls
@@ -780,6 +809,7 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
             _record_calls(node, body_node, "Function", func_name, classes)
 
     visit_block(root, None, "Module", [])
+    _merge_constant_members(result, constant_members)
     result.relationships += sites.rows(file_path, repo_id)
     _spring_routes(root, source_bytes, result, file_path, repo_id)
     add_heir_keys(result, [

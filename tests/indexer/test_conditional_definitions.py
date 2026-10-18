@@ -106,7 +106,7 @@ def test_a_class_defined_in_a_function_and_its_methods_are_owned_by_it():
     assert ("Fake", "test_it", "run", "test_it.Fake") in contains
 
 
-def test_conditional_duplicates_are_one_node_spanning_both():
+def test_conditional_duplicates_are_one_node_the_first_one():
     source = """\
         try:
             import json
@@ -114,6 +114,9 @@ def test_conditional_duplicates_are_one_node_spanning_both():
             def dumps(value):
                 return json.dumps(value)
         except ImportError:
+            def helper():
+                return 0
+
             @cached
             def dumps(value):
                 \"\"\"The fallback.\"\"\"
@@ -127,13 +130,41 @@ def test_conditional_duplicates_are_one_node_spanning_both():
     nodes = [n for n in result.nodes if n.name == "dumps"]
     assert len(nodes) == 1
     props = nodes[0].properties
-    assert (props["owner"], props["start_line"], props["end_line"]) == ("", 4, 10)
-    assert props["decorators"] == ["cached"]
-    assert props["description"] == "The fallback."
+    # The first definition's lines and properties: the node never spans
+    # `helper`, defined between the two.
+    assert (props["owner"], props["start_line"], props["end_line"]) == ("", 4, 5)
+    assert props["decorators"] == [] and "description" not in props
     # Both bodies' calls come from the one node, and the same text always
     # gives the same node.
     assert ("dumps", "", "fallback", "app/mod.py", None) in _calls(result)
     assert _python(source).to_dict() == result.to_dict()
+
+
+def test_a_merged_definition_never_contains_one_between():
+    from devgraph.indexer.symbols import extract_symbols
+
+    source = textwrap.dedent("""\
+        try:
+            from fast import Compat
+        except ImportError:
+            class Compat:
+                pass
+
+        def util():
+            pass
+
+        if not hasattr(Compat, "x"):
+            class Compat(Compat):
+                def x(self):
+                    pass
+        """)
+    result = extract_python_file(source, "app/mod.py", "repo")
+    (compat,) = [n for n in result.nodes if n.name == "Compat"]
+    assert (compat.properties["start_line"], compat.properties["end_line"]) == (4, 5)
+    # `class Compat(Compat)` extends no other class of the file (not itself).
+    assert [r for r in result.relationships if r.rel_type == "EXTENDS"] == []
+    containers = {s.name: s.container for s in extract_symbols("app/mod.py", source)}
+    assert containers["util"] is None
 
 
 def test_a_property_and_its_setter_are_one_node():
@@ -148,8 +179,43 @@ def test_a_property_and_its_setter_are_one_node():
                 pass
         """)
     (node,) = [n for n in result.nodes if n.name == "value"]
-    assert node.properties["decorators"] == ["property", "value.setter"]
-    assert (node.properties["start_line"], node.properties["end_line"]) == (3, 8)
+    assert node.properties["decorators"] == ["property"]
+    assert (node.properties["start_line"], node.properties["end_line"]) == (3, 4)
+
+
+def test_a_function_local_class_is_not_the_module_level_class_of_its_name():
+    result = _python("""\
+        class User:
+            def save(self):
+                pass
+
+
+        def factory():
+            class User:
+                def save(self):
+                    pass
+            u = User()
+            u.save()
+            return u
+
+
+        class Admin(User):
+            def go(self):
+                self.save()
+
+
+        def top():
+            User().save()
+        """)
+    calls = _calls(result)
+    assert ("factory", "", "save", "app/mod.py", "factory.User") in calls
+    assert ("go", "Admin", "save", "app/mod.py", "User") in calls
+    assert ("top", "", "save", "app/mod.py", "User") in calls
+    keys = {(n.properties["owner"], tuple(n.properties.get("mkeys", ()))) for n in result.nodes if n.name == "save"}
+    # Only the module-level User's save is inherited by Admin.
+    assert keys == {("User", ("<Admin",)), ("factory.User", ())}
+    (extends,) = [r for r in result.relationships if r.rel_type == "EXTENDS"]
+    assert (extends.to_name, extends.to_file, extends.to_owner) == ("User", "app/mod.py", "")
 
 
 def test_a_from_imported_conditional_def_is_a_top_level_target():

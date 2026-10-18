@@ -459,6 +459,72 @@ urlpatterns = [
 ]
 '''
     result = APIExtractor("repo").extract_from_source(code, "urls.py")
-    assert sorted((r.source_name, r.target_name) for r in result.relationships) == [
+    assert sorted({(r.source_name, r.target_name) for r in result.relationships}) == [
         ("* ^articles/$", "ArticleView"), ("* users/", "list_users"),
+    ]
+
+
+def test_concatenated_and_escaped_paths_are_their_values():
+    code = r'''
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/a"
+         "/b")
+def ab():
+    pass
+
+@app.get("/x\x2Fy")
+def escaped():
+    pass
+
+@app.get(r"/raw\d")
+def raw():
+    pass
+
+@app.get("/q" f"/{tail}")
+def interpolated():
+    pass
+'''
+    assert _routes(code) == [("GET /a/b", "FastAPI"), ("GET /raw\\d", "FastAPI"), ("GET /x/y", "FastAPI")]
+
+
+def test_a_deep_file_reads_without_recursion():
+    code = "from fastapi import FastAPI\napp = FastAPI()\nx = " + "+".join(["1"] * 3000) + (
+        "\n\n@app.get('/a')\ndef a():\n    pass\n"
+    )
+    assert _routes(code) == [("GET /a", "FastAPI")]
+
+
+def test_django_views_pin_to_the_module_they_are_imported_from():
+    code = '''
+from django.urls import path
+
+from . import views
+from app import api
+from .handlers import search
+
+urlpatterns = [
+    path("a/", views.show),
+    path("b/", api.list_items),
+    path("c/", search),
+    path("d/", unknown.view),
+    path("e/", local_view),
+]
+'''
+    result = APIExtractor("repo").extract_from_source(code, "shop/urls.py")
+    targets = sorted((r.source_name, r.target_name, r.to_file or "", r.to_owner) for r in result.relationships)
+    assert targets == [
+        ("* a/", "show", "", None), ("* a/", "show", "shop/views.py", ""),
+        ("* a/", "show", "shop/views/__init__.py", ""),
+        ("* b/", "list_items", "", None), ("* b/", "list_items", "app/api.py", ""),
+        ("* b/", "list_items", "app/api/__init__.py", ""), ("* b/", "list_items", "shop/app/api.py", ""),
+        ("* b/", "list_items", "shop/app/api/__init__.py", ""),
+        ("* c/", "search", "", None), ("* c/", "search", "shop/handlers.py", ""),
+        ("* c/", "search", "shop/handlers/__init__.py", ""),
+        # Read off nothing the file imports: the stub alone.
+        ("* d/", "view", "", None),
+        # A bare name nothing imports links every one of its name, as before.
+        ("* e/", "local_view", "", None),
     ]

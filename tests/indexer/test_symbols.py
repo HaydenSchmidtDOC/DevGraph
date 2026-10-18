@@ -84,10 +84,10 @@ def test_innermost_container_and_ordinals():
 
 
 def test_one_scopes_same_named_python_defs_are_one_symbol():
-    """Like the graph's one node (common.merge_same_nodes), spanning both."""
+    """Like the graph's one node (common.merge_same_nodes), the first definition."""
     src = "try:\n    def f():\n        return 1\nexcept ImportError:\n    def f():\n        return 2\n"
     (f,) = [s for s in extract_symbols("m.py", src) if s.name == "f"]
-    assert (f.ordinal, f.start_line, f.end_line) == (0, 2, 6)
+    assert (f.ordinal, f.start_line, f.end_line) == (0, 2, 3)
 
 
 def test_changed_entry_carries_both_sides_lines():

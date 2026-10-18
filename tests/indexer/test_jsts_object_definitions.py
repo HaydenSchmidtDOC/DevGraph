@@ -147,3 +147,29 @@ def test_an_imported_object_literals_member_is_reached_in_its_file():
     calls = _calls(result)
     assert ("show", "", "getUser", "src/svc.ts", None) in calls
     assert ("show", "", "handler", "src/lambda.js", None) in calls
+
+
+def test_a_commonjs_export_never_merges_into_a_top_level_function_of_its_name():
+    result = _extract("""\
+        function create(x) { return x; }
+        function remove(x) { return x; }
+        module.exports = { create, remove, update: function (x) { return create(x); } };
+        exports.extra = function () { return remove(1); };
+        module.exports.create = function (y) { return y; };
+        module.exports.check = { run() { return 1; } };
+        """, "src/crud.js")
+    nodes = [(n.name, n.properties["owner"], n.properties["start_line"]) for n in result.nodes if n.label == "Function"]
+    # The export named like a top-level function is owned by `exports`: two nodes.
+    assert sorted(nodes) == [
+        ("create", "", 1), ("create", "exports", 5), ("extra", "", 4), ("remove", "", 2), ("run", "check", 6),
+        ("update", "", 3),
+    ]
+
+
+def test_module_exports_receivers_reach_the_exports_owner():
+    result = _extract("""\
+        function create(x) { return x; }
+        module.exports.create = function (y) { return y; };
+        exports.helper = function () { return module.exports.create(1); };
+        """, "src/crud.js")
+    assert ("helper", "", "create", "src/crud.js", "exports") in _calls(result)
