@@ -75,6 +75,7 @@ class HeadlessAgent:
         self._sync = RepoSync(
             self._engine, self._registry, self._events.publish,
             request_catch_up=lambda *a: self._watcher.request_catch_up(*a),
+            yield_lock=lambda repo_id: self._watcher.yield_batch_lock(repo_id),
         )
         self._watcher = WatcherManager(
             self._registry,
@@ -91,6 +92,7 @@ class HeadlessAgent:
         self._schema_rescans = SchemaRescanScheduler(
             self._engine, self._registry, on_rescanned=self._on_schema_rescanned,
             run_exclusive=self._watcher.run_exclusive,
+            yield_lock=self._watcher.yield_batch_lock,
         )
         self._insights = InsightsScheduler(self._engine, self._registry, on_refreshed=self._on_insights_refreshed)
         self._dashboard_server: uvicorn.Server | None = None

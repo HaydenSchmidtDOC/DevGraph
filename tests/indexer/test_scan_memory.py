@@ -37,7 +37,8 @@ class RecordingEngine:
     _ANSWERS = {
         "route_mount_state": {}, "list_file_nodes": set(), "list_shared_claims": {}, "file_heir_open": {},
         "run_cypher": [], "read_resolver_config": {}, "find_handler_stub_sources": set(), "find_name_refs": [],
-        "find_mentioning_documents": set(),
+        "find_mentioning_documents": set(), "list_indexed_files": set(), "list_claim_sources": set(),
+        "list_extracted_paths": set(), "list_docs_note_files": set(), "read_skipped_files": {},
     }
 
     def __init__(self):
@@ -358,3 +359,226 @@ def test_a_failed_full_scan_lets_the_next_one_run(tmp_path, monkeypatch):
         full_scan(RecordingEngine(), "a", tmp_path)
     assert dispatch._FULL_SCAN_LOCK.acquire(blocking=False)
     dispatch._FULL_SCAN_LOCK.release()
+
+
+# --- a file-less claimed node keeps its C# project ------------------------------------
+
+
+def test_a_handler_stub_keeps_its_project_through_pass_one():
+    """An ASP.NET action's handler stub is file-less, so no match-key write
+    reaches it: its pass-1 replace writes its `proj`, as pass 2 used to."""
+    nodes = [_node("Module", "c.cs"),
+             _node("Function", "List", file="c.cs", owner="C", mkeys=["k"], proj="p"),
+             _node("Function", "List", type="handler", source="c.cs", proj="p")]
+    written = dispatch._with_name_refs(nodes, [], "c.cs")
+    assert "mkeys" not in written[1]["properties"] and "proj" not in written[1]["properties"]
+    assert written[2]["properties"]["proj"] == "p"
+
+
+def test_an_aspnet_controller_writes_its_stubs_project_in_pass_one(tmp_path):
+    (tmp_path / "ShopController.cs").write_text(
+        "namespace Shop;\n[ApiController]\n[Route(\"api/[controller]\")]\npublic class ShopController\n{\n"
+        "    [HttpGet(\"run\")]\n    public void List() { Jobs.Run(); }\n}\n"
+    )
+    engine = RecordingEngine()
+    _scan(engine, tmp_path)
+    (_repo, _rel, nodes, _rels, *_), = engine.calls["replace_file_nodes"]
+    stubs = [n for n in nodes if n["label"] == "Function" and not n["properties"].get("file")]
+    assert stubs and all("proj" in n["properties"] for n in stubs)
+
+
+# --- the spill file -------------------------------------------------------------------
+
+
+def test_the_spill_file_is_in_devgraphs_own_folder(monkeypatch):
+    from devgraph.config.settings import devgraph_home
+
+    folders = []
+    real = dispatch.tempfile.TemporaryFile
+
+    def temporary(*args, **kwargs):
+        folders.append(kwargs.get("dir"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch.tempfile, "TemporaryFile", temporary)
+    with _Extractions() as store:
+        store.add("py", "a.py", [], [])
+    assert folders == [devgraph_home() / "tmp"]
+    assert list((devgraph_home() / "tmp").iterdir()) == []  # anonymous: nothing left by name
+
+
+def _full_after(count):
+    """A spill file whose flush fails (a full disk) from its `count`-th call on."""
+    import io
+
+    class Full(io.BytesIO):
+        flushes = 0
+
+        def flush(self):
+            Full.flushes += 1
+            if Full.flushes >= count:
+                raise OSError(28, "No space left on device")
+
+    return lambda *args, **kwargs: Full()
+
+
+def test_a_full_disk_aborts_the_batch_before_that_file_is_written(tmp_path, monkeypatch):
+    for name in ("a", "b", "c"):
+        (tmp_path / f"{name}.py").write_text(f"def {name}():\n    return 1\n")
+    monkeypatch.setattr(dispatch.tempfile, "TemporaryFile", _full_after(2))
+    engine = RecordingEngine()
+    with pytest.raises(dispatch.ExtractionSpillFailed, match="b.py"):
+        _scan(engine, tmp_path)
+    assert [args[1] for args in engine.calls["replace_file_nodes"]] == ["a.py"]
+    assert engine.calls["update_skipped_files"] == []  # nothing stamped or recorded after it
+
+
+def test_a_spill_read_that_fails_aborts_the_batch(tmp_path, monkeypatch):
+    (tmp_path / "a.py").write_text("def a():\n    return 1\n")
+
+    def unreadable(self, entry):
+        raise dispatch.ExtractionSpillFailed("could not read back a kept extraction: boom")
+
+    stub(monkeypatch, _Extractions, "load", unreadable)
+    with pytest.raises(dispatch.ExtractionSpillFailed):
+        _scan(RecordingEngine(), tmp_path)
+
+
+def test_corrupt_spill_data_is_a_batch_abort():
+    with _Extractions() as store:
+        store.add("py", "a.py", [], [])
+        (_lang, _rel, entry), = store.entries()
+        store._spill.seek(entry.spill[0])
+        store._spill.write(b"\0" * entry.spill[1])
+        with pytest.raises(dispatch.ExtractionSpillFailed):
+            store.load(entry)
+
+
+def test_a_file_whose_graph_write_fails_keeps_its_earlier_extraction(tmp_path):
+    (tmp_path / "a.py").write_text("def a():\n    return 1\n")
+    (tmp_path / "b.py").write_text("def b():\n    return 2\n")
+
+    class Failing(RecordingEngine):
+        def __getattr__(self, name):
+            call = super().__getattr__(name)
+            if name != "replace_file_nodes":
+                return call
+
+            def replace(repo_id, rel, *args, **kwargs):
+                if rel == "b.py":
+                    raise RuntimeError("write failed")
+                return call(repo_id, rel, *args, **kwargs)
+
+            return replace
+
+    engine = Failing()
+    _scan(engine, tmp_path)
+    written = [rels for (rels,) in engine.calls["upsert_relationships"] if rels]  # the service pass writes []
+    assert [{rel["origin"] for rel in rels} for rels in written] == [{"a.py"}]  # b.py, never written, writes none
+    with _Extractions() as store:
+        store.add("js", "r.ts", [_node("Module", "r.ts", v=1)], [])
+        saved = store.saved("r.ts")
+        store.add("js", "r.ts", [_node("Module", "r.ts", v=2)], [])
+        store.restore("r.ts", saved)
+        (_lang, _rel, entry), = store.entries()
+        assert store.load(entry)[0][0]["properties"]["v"] == 1
+        store.restore("new.ts", store.saved("new.ts"))
+        assert [rel for _l, rel, _e in store.entries()] == ["r.ts"]
+
+
+# --- waiting for the full-scan turn -----------------------------------------------------
+
+
+@pytest.fixture
+def busy_turn(monkeypatch):
+    """Another thread holds the full-scan turn until `release` is set."""
+    monkeypatch.setattr(dispatch, "FULL_SCAN_POLL_S", 0.01)
+    holding, release = threading.Event(), threading.Event()
+
+    def hold():
+        with dispatch.full_scan_turn("other"):
+            holding.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert holding.wait(5)
+    yield release
+    release.set()
+    thread.join(5)
+
+
+def test_a_waiting_scan_runs_while_waiting_and_can_be_called_off(busy_turn):
+    calls = []
+
+    def waiting():
+        calls.append(1)
+        return len(calls) < 3
+
+    assert dispatch.full_scan_running()
+    with pytest.raises(dispatch.FullScanCancelled):
+        with dispatch.full_scan_turn("mine", waiting):
+            pass
+    assert len(calls) == 3
+    assert dispatch.ABORTS_BATCH and issubclass(dispatch.FullScanCancelled, dispatch.ABORTS_BATCH)
+
+
+def test_a_catch_up_that_waited_does_not_scan_an_index_upgraded_meanwhile(busy_turn, tmp_path, monkeypatch):
+    (tmp_path / "a.py").write_text("x = 1\n")
+    outdated = [True, False]  # outdated before the wait, upgraded by the scan it waited for
+    stub(monkeypatch, dispatch, "index_outdated", lambda engine, repo_id: outdated.pop(0) if outdated else False)
+    scans = []
+    stub(monkeypatch, dispatch, "full_scan", lambda *a, **k: scans.append(a) or 0)
+    stub(monkeypatch, dispatch, "prune_stale_files", lambda *a, **k: 0)
+    stub(monkeypatch, dispatch, "sync_resolver_config", lambda *a, **k: 0)
+    waited = threading.Event()
+
+    def waiting():
+        waited.set()
+        busy_turn.set()  # the other scan ends
+        return True
+
+    from datetime import datetime, timezone
+
+    dispatch.catch_up(RecordingEngine(), "r", tmp_path, datetime.now(timezone.utc), while_waiting=waiting)
+    assert waited.is_set() and scans == []
+
+
+def test_repo_sync_yields_its_lock_while_its_scan_waits_and_stops_on_removal():
+    from devgraph.agent.sync import RepoSync
+
+    yielded = []
+
+    class Registry:
+        present = True
+
+        def get(self, repo_id):
+            return object() if Registry.present else None
+
+    sync = RepoSync(None, Registry(), lambda event: None, lambda *a: None,
+                    yield_lock=lambda repo_id: yielded.append(repo_id) or False)
+    waiting = sync._while_waiting("r")
+    assert waiting() is True and yielded == ["r"]  # a repo without .git: the yield's False is not a stop
+    Registry.present = False
+    assert waiting() is False
+    Registry.present = True
+    sync.stopping = True
+    assert waiting() is False
+    assert RepoSync(None, Registry(), lambda event: None, lambda *a: None)._while_waiting("r") is None
+
+
+def test_schema_rescan_upgrade_checks_again_after_its_wait(monkeypatch):
+    from devgraph.agent import schema_rescan
+
+    checks = [True, False]
+    stub(monkeypatch, schema_rescan, "index_outdated", lambda engine, repo_id: checks.pop(0))
+    stub(monkeypatch, schema_rescan, "full_scan", lambda *a, **k: pytest.fail("scanned twice"))
+
+    class Repo:
+        repo_id = "r"
+
+    scheduler = schema_rescan.SchemaRescanScheduler(None, MagicMock(), yield_lock=lambda repo_id: True)
+    assert scheduler._upgrade(Repo()) is None
+    assert scheduler._waiting("r") is True
+    scheduler._stop.set()
+    assert scheduler._waiting("r") is False

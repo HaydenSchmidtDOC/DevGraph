@@ -25,12 +25,14 @@ import threading
 import zlib
 from collections import Counter
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import NamedTuple
 
 from devgraph.config import get_settings
+from devgraph.config.settings import devgraph_home
 from devgraph.config.project_schema import (
     ABSENT_SCHEMA_HASH,
     LABEL_PATTERN,
@@ -101,6 +103,25 @@ from devgraph.indexer.walk import repo_relative as _repo_relative
 from devgraph.paths import is_within
 
 logger = logging.getLogger(__name__)
+
+
+class BatchAborted(Exception):
+    """The indexer gives a whole batch or scan up, as it does a shutdown's
+    (`ABORTS_BATCH`): nothing is stamped, and the work is redone."""
+
+
+class ExtractionSpillFailed(BatchAborted):
+    """A batch's extractions could not be written to, or read back from, its
+    spill file (`_Extractions`): a full disk, say. Not one file's failure, so
+    not skipped as one: the batch's second pass would miss that file's edges."""
+
+
+class FullScanCancelled(BatchAborted):
+    """A full scan waiting its turn (`_FULL_SCAN_LOCK`) was called off: the
+    watcher is stopping, or the repository is no longer watched."""
+
+
+ABORTS_BATCH = (*ABORTS_BATCH, BatchAborted)
 
 _CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 
@@ -886,6 +907,7 @@ def _index_paths(
         # must not abort the whole batch: a full scan or watcher batch would
         # otherwise silently lose every file after the failure point. Log and
         # skip the offending file so the rest of the batch still indexes.
+        saved = _UNREAD
         try:
             spellings = sorted(supplied.get(rel_path, []))
             reason = _skip_reason(root_resolved, spellings, resolved, docs_root, mentions_enabled, max_bytes)
@@ -909,6 +931,7 @@ def _index_paths(
                 docs_root, mentions_enabled, config, extractions,
                 docs_files, mention_files, batch_services, mounts,
             )
+            saved = extractions.saved(rel_path)
             try:
                 count = single()
             except RecursionError:
@@ -932,6 +955,8 @@ def _index_paths(
             engine.delete_nodes_by_source_file(repo_id, rel_path)
         except Exception as exc:
             _log_file_failure("indexing failed", repo_id, rel_path, exc)
+            if saved is not _UNREAD:
+                extractions.restore(rel_path, saved)  # its graph write failed: pass 2 writes what the graph holds
 
     # What the batch's files produced before this run, so the referrer step
     # below can tell which nodes the batch adds.
@@ -1297,13 +1322,16 @@ def _with_name_refs(nodes: list[dict], rels: list[dict], rel_path: str) -> list[
     pass 2 writes no file's nodes but a referrer's, the plain `nodes`. Its
     symbols' match keys are left out: index_paths writes them after pass 1
     (engine.write_match_keys), with the edges they decide, and so is their
-    C# project (`proj`), and its Module's open classes (`heir_open`)."""
+    C# project (`proj`), and its Module's open classes (`heir_open`). A
+    file-less claimed node (an ASP.NET handler stub) keeps both: no match-key
+    write reaches it, and pass 2 no longer writes it again."""
     refs = name_ref_properties(rels)
     return [
         {**node, "properties": {**{k: v for k, v in node["properties"].items() if k != "heir_open"}, **refs}}
         if node["label"] == "Module" and node["name"] == rel_path
         else {**node, "properties": {k: v for k, v in node["properties"].items() if k not in ("mkeys", "proj")}}
-        if "mkeys" in node["properties"] or "proj" in node["properties"] else node
+        if node["properties"].get("file") and ("mkeys" in node["properties"] or "proj" in node["properties"])
+        else node
         for node in nodes
     ]
 
@@ -1360,13 +1388,14 @@ def _index_single_path(
         # the file still makes are re-claimed in place, not recreated. A
         # handler stub claims only a file-less Function (_claim_nodes_tx),
         # never the file-scoped one the extractor writes for the same def.
-        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
-        indexed += 1
         # API edges ride along in the re-upsert pass: an Endpoint's
         # IMPLEMENTS target can be a handler defined in a later file (e.g.
         # a Django urls.py naming a view from views.py). The content is
-        # kept for the owning-service pass.
+        # kept for the owning-service pass. Kept before the graph write, so
+        # a spill that fails aborts the batch with nothing written.
         extractions.add("py", rel_path, nodes, rels, content)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
+        indexed += 1
     elif "js" in routes:
         content = read_source(resolved)
         result = extract_js_file(content, rel_path, repo_id, config)
@@ -1377,9 +1406,9 @@ def _index_single_path(
         # prune this file's previously-indexed nodes/edges and write the
         # freshly-extracted ones in one transaction. Its routes' Endpoint
         # edges go as a Python file's do (`service_api`).
+        extractions.add("js", rel_path, nodes, rels)  # once, though the mounts pass may index it again
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
-        extractions.add("js", rel_path, nodes, rels)  # once, though the mounts pass may index it again
     elif "cs" in routes:
         content = read_source(resolved)
         result = extract_csharp_file(content, rel_path, repo_id, config)
@@ -1393,20 +1422,20 @@ def _index_single_path(
         # batch may still add, remove or rekey, and pass 2 only adds edges.
         # So does a row limited to its project's references (`visible`):
         # a node's `proj` is written with its match keys, after pass 1.
+        extractions.add("cs", rel_path, nodes, rels)
         engine.replace_file_nodes(
             repo_id, rel_path, _with_name_refs(nodes, rels, rel_path),
             [rel for rel in rels if not tiered(rel.get("to_file")) and not rel.get("visible")], service_api=True,
         )
         indexed += 1
-        extractions.add("cs", rel_path, nodes, rels)
     elif "cpp" in routes:
         content = read_source(resolved)
         result = extract_cpp_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
+        extractions.add("cpp", rel_path, nodes, rels)
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
         indexed += 1
-        extractions.add("cpp", rel_path, nodes, rels)
     elif "java" in routes:
         content = read_source(resolved)
         result = extract_java_file(content, rel_path, repo_id)
@@ -1415,9 +1444,9 @@ def _index_single_path(
         # Same replace-then-cross-link-reupsert pattern as the .py
         # branch above (see its comment for why replace_file_nodes runs
         # first, in one transaction, rather than plain upsert).
+        extractions.add("java", rel_path, nodes, rels)
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
-        extractions.add("java", rel_path, nodes, rels)
     elif "rs" in routes:
         content = read_source(resolved)
         result = extract_rust_file(content, rel_path, repo_id, config)
@@ -1426,9 +1455,9 @@ def _index_single_path(
         # Same replace-not-merely-upsert reasoning as the .py branch
         # above: a removed Function/Class must not survive in the graph
         # forever just because MERGE never deletes.
+        extractions.add("rs", rel_path, nodes, rels)
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
         indexed += 1
-        extractions.add("rs", rel_path, nodes, rels)
     elif "kt" in routes:
         content = read_source(resolved)
         result = extract_kotlin_file(content, rel_path, repo_id)
@@ -1437,9 +1466,9 @@ def _index_single_path(
         # Same replace-then-re-upsert rationale as the .py branch above: a
         # class/function removed from the file must not survive in the graph
         # as a stale node.
+        extractions.add("kt", rel_path, nodes, rels)
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
-        extractions.add("kt", rel_path, nodes, rels)
     elif "go" in routes:
         content = read_source(resolved)
         result = extract_go_file(content, rel_path, repo_id, config)
@@ -1448,9 +1477,9 @@ def _index_single_path(
         # Same replace-then-re-upsert rationale as the .py branch above:
         # a struct/func/method removed from the file must not survive in
         # the graph as a stale node.
+        extractions.add("go", rel_path, nodes, rels)
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
-        extractions.add("go", rel_path, nodes, rels)
     elif "docs" in routes:
         index_doc_file(engine, repo_id, resolved, repo_root)
         indexed += 1
@@ -1473,6 +1502,9 @@ def _index_single_path(
         indexed += 1
     return indexed
 
+
+#: `index_paths`' marker for a file whose extraction entry was not yet looked up.
+_UNREAD = object()
 
 #: index_paths logs its progress every this many files of a batch.
 PROGRESS_EVERY = 5_000
@@ -1498,6 +1530,10 @@ class _Extractions:
     pickled and compressed into an anonymous temporary file instead (a few
     KB a file), read back by pass 2, and only what the steps between the
     passes read stays in memory: each node's key fields (`_Extracted.nodes`).
+    The file is in DevGraph's own folder (`devgraph_home()/tmp`), not the
+    system's temporary folder, which may be memory (tmpfs); it has no name
+    (deleted on close, on Windows too), and a write or read that fails
+    aborts the batch (`ExtractionSpillFailed`).
 
     `files` is per language in pass 2's order, and per language in the order
     files were first added: a file added again (a router file the mounts
@@ -1519,11 +1555,17 @@ class _Extractions:
             self._spill.close()
 
     def add(self, lang: str, rel_path: str, nodes: list[dict], rels: list[dict], content: str | None = None) -> None:
-        if self._spill is None:
-            self._spill = tempfile.TemporaryFile()
         data = zlib.compress(pickle.dumps((nodes, rels, content), pickle.HIGHEST_PROTOCOL), 1)
-        offset = self._spill.seek(0, os.SEEK_END)
-        self._spill.write(data)
+        try:
+            if self._spill is None:
+                folder = devgraph_home() / "tmp"
+                folder.mkdir(parents=True, exist_ok=True)
+                self._spill = tempfile.TemporaryFile(dir=folder)
+            offset = self._spill.seek(0, os.SEEK_END)
+            self._spill.write(data)
+            self._spill.flush()  # a full disk fails this file, not a later one
+        except OSError as exc:
+            raise ExtractionSpillFailed(f"could not keep the extraction of {rel_path} for the batch: {exc}") from exc
         keys = []
         heir_open = []
         for node in nodes:
@@ -1540,8 +1582,23 @@ class _Extractions:
     def load(self, entry: _Extracted) -> tuple[list[dict], list[dict], str | None]:
         """(nodes, rels, content) of a file as `add` was given them."""
         offset, length = entry.spill
-        self._spill.seek(offset)
-        return pickle.loads(zlib.decompress(self._spill.read(length)))
+        try:
+            self._spill.seek(offset)
+            return pickle.loads(zlib.decompress(self._spill.read(length)))
+        except (OSError, EOFError, zlib.error, pickle.UnpicklingError) as exc:
+            raise ExtractionSpillFailed(f"could not read back a kept extraction: {exc}") from exc
+
+    def saved(self, rel_path: str) -> tuple[str, _Extracted] | None:
+        """The file's current entry, for `restore`."""
+        return next(((lang, files[rel_path]) for lang, files in self.files.items() if rel_path in files), None)
+
+    def restore(self, rel_path: str, saved: tuple[str, _Extracted] | None) -> None:
+        """Put back what `saved` returned: a file whose graph write failed
+        after its extraction was added keeps its earlier one, or none."""
+        if saved is None:
+            self.discard(rel_path)
+        else:
+            self.files[saved[0]][rel_path] = saved[1]  # a file's language never changes: its place is kept
 
     def discard(self, rel_path: str) -> None:
         """Forget a file left out after it was extracted, so pass 2 writes nothing for it."""
@@ -2417,6 +2474,7 @@ def catch_up(
     docs_path: str | None = None,
     mentions_enabled: bool = False,
     force: bool = False,
+    while_waiting: Callable[[], bool] | None = None,
 ) -> CatchUp:
     """Bring the graph up to date with changes made since `since`, while
     nothing was watching: an incremental `full_scan`.
@@ -2429,7 +2487,9 @@ def catch_up(
     filesystem type declared) is never offered.
 
     An index older than `INDEX_FORMAT` gets a `full_scan` instead, which
-    upgrades it. Last, a changed resolver configuration re-indexes its
+    upgrades it. It waits for its turn (`_take_full_scan_lock`, calling
+    `while_waiting`) before it checks the format again, so a scan that
+    another job (the schema rescan) ran meanwhile is not repeated. Last, a changed resolver configuration re-indexes its
     language's files (sync_resolver_config).
 
     A missing, unreadable or apparently unmounted root is refused as
@@ -2437,10 +2497,12 @@ def catch_up(
     """
     check_repo_root(repo_root)
     if index_outdated(engine, repo_id):
-        indexed = full_scan(
-            engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
-        )
-        return CatchUp(indexed=indexed, pruned=0, checked=0, offered=0, unknown=0)
+        with full_scan_turn(repo_id, while_waiting):
+            if index_outdated(engine, repo_id):
+                indexed = full_scan(
+                    engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
+                )
+                return CatchUp(indexed=indexed, pruned=0, checked=0, offered=0, unknown=0)
     forget_manifests()  # build manifests may have come or gone while nothing watched
     pruned = prune_stale_files(
         engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
@@ -2553,7 +2615,45 @@ def sync_resolver_config(
 
 
 #: Held for each full scan, so a process runs one at a time (see full_scan).
-_FULL_SCAN_LOCK = threading.Lock()
+#: Reentrant: catch_up takes it before it checks the index format again,
+#: then full_scan takes it once more.
+_FULL_SCAN_LOCK = threading.RLock()
+
+#: How often a full scan waiting its turn calls its `while_waiting`.
+FULL_SCAN_POLL_S = 1.0
+
+
+def _take_full_scan_lock(repo_id: str, while_waiting: Callable[[], bool] | None) -> None:
+    """Take `_FULL_SCAN_LOCK`, logging a wait. While another scan holds it,
+    `while_waiting` runs every `FULL_SCAN_POLL_S` (the watcher's
+    `yield_batch_lock`: the repository's live batches run meanwhile); False
+    from it calls the scan off (`FullScanCancelled`)."""
+    if _FULL_SCAN_LOCK.acquire(blocking=False):
+        return
+    logger.info("%s: waiting for another repository's full scan to finish", repo_id)
+    while not _FULL_SCAN_LOCK.acquire(timeout=FULL_SCAN_POLL_S):
+        if while_waiting is not None and not while_waiting():
+            raise FullScanCancelled(f"{repo_id}: the full scan waiting its turn was called off")
+
+
+@contextmanager
+def full_scan_turn(repo_id: str, while_waiting: Callable[[], bool] | None = None):
+    """Hold this process's full-scan turn (`_take_full_scan_lock`) for the
+    block: a caller that scans only if the index is still outdated checks
+    that inside it, after the wait, and its full_scan then runs at once."""
+    _take_full_scan_lock(repo_id, while_waiting)
+    try:
+        yield
+    finally:
+        _FULL_SCAN_LOCK.release()
+
+
+def full_scan_running() -> bool:
+    """Whether another thread of this process is running a full scan now."""
+    if not _FULL_SCAN_LOCK.acquire(blocking=False):
+        return True
+    _FULL_SCAN_LOCK.release()
+    return False
 
 
 def full_scan(
@@ -2564,6 +2664,7 @@ def full_scan(
     mentions_enabled: bool = False,
     force: bool = False,
     skipped: dict[str, str] | None = None,
+    while_waiting: Callable[[], bool] | None = None,
 ) -> int:
     """Walk every file under repo_root and index it, skipping VCS/build/venv noise. Used by `devgraph add`/`rescan`.
 
@@ -2599,11 +2700,10 @@ def full_scan(
     One full scan runs at a time in this process (`_FULL_SCAN_LOCK`): after
     an `INDEX_FORMAT` change every repository's start catch-up is a full
     scan, and run together their memory peaks added up. A scan waits for
-    the one running; live batches of other repositories never take the lock.
+    the one running, calling `while_waiting` meanwhile (see
+    `_take_full_scan_lock`); live batches never take the lock.
     """
-    if not _FULL_SCAN_LOCK.acquire(blocking=False):
-        logger.info("%s: waiting for another repository's full scan to finish", repo_id)
-        _FULL_SCAN_LOCK.acquire()
+    _take_full_scan_lock(repo_id, while_waiting)
     try:
         check_repo_root(repo_root)
         docs_cache.forget(repo_root)

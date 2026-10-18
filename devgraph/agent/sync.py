@@ -46,7 +46,10 @@ class RepoSync:
     """`publish(event)` is the dashboard's broadcaster; `request_catch_up(repo_id,
     since, delay_s)` is the watcher's, which runs `on_catch_up` later under the
     repository's batch lock. Set `stopping` while the agent pauses or quits, so
-    a failure caused by the shutdown is not reported as a warning."""
+    a failure caused by the shutdown is not reported as a warning.
+    `yield_lock(repo_id)` is the watcher's `yield_batch_lock`: a catch-up whose
+    full scan waits for another repository's (dispatch `full_scan_turn`) lets
+    its repository's live batches run meanwhile."""
 
     def __init__(
         self,
@@ -55,12 +58,14 @@ class RepoSync:
         publish: Callable[[dict], None],
         request_catch_up: Callable[[str, datetime, float], None],
         now: Callable[[], datetime] = _utcnow,
+        yield_lock: Callable[[str], bool] | None = None,
     ) -> None:
         self._engine = engine
         self._registry = registry
         self._publish = publish
         self._request_catch_up = request_catch_up
         self._now = now
+        self._yield_lock = yield_lock
         self._lock = threading.Lock()  # guards _floors and _running
         self._floors: dict[str, datetime] = {}
         # Repositories whose root folder is missing or looks unmounted, warned about once.
@@ -69,6 +74,19 @@ class RepoSync:
         self._warned: dict[str, datetime] = {}
         self._running = 0
         self.stopping = False
+
+    def _while_waiting(self, repo_id: str) -> Callable[[], bool] | None:
+        if self._yield_lock is None:
+            return None
+        yield_lock = self._yield_lock
+
+        def waiting() -> bool:
+            # yield_batch_lock's answer is about git syncs (False for a repo
+            # without .git): only stopping or a removal calls the scan off.
+            yield_lock(repo_id)
+            return not self.stopping and self._registry.get(repo_id) is not None
+
+        return waiting
 
     @property
     def running(self) -> int:
@@ -117,6 +135,7 @@ class RepoSync:
                 result = catch_up(
                     self._engine, repo_id, repo.path, started,
                     docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
+                    while_waiting=self._while_waiting(repo_id),
                 )
                 indexed += result.indexed
                 removed += result.pruned
@@ -162,6 +181,7 @@ class RepoSync:
             result = catch_up(
                 self._engine, repo_id, repo.path, since,
                 docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
+                while_waiting=self._while_waiting(repo_id),
             )
             with self._lock:
                 if repo_id in self._floors and since <= self._floors[repo_id]:

@@ -514,3 +514,43 @@ def test_a_scan_cut_by_shutdown_is_logged_at_info_and_left_for_the_next_start(
     assert body["indexed"] is False and body["last_indexed"] is None
     assert "next start" in body["warning"]
     assert [r.levelname for r in caplog.records if "sample-repo" in r.getMessage()] == ["INFO"]
+
+
+def test_registration_answers_at_once_while_another_full_scan_runs(
+    client, registry, engine, scan_calls, tmp_path, monkeypatch
+):
+    """Another repository's full scan holds the process's turn: the POST answers
+    without waiting for it, and the initial scan runs in the background."""
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def waiting_scan(repo_id, fn):
+        started.set()
+        release.wait(5)
+        return fn()
+
+    monkeypatch.setattr(routes, "full_scan_running", lambda: True)
+    app = FastAPI()
+    # `client` installed the stub full_scan; this app adds a run_exclusive that waits.
+    app.include_router(routes.build_router(engine, registry, EventBroadcaster(), run_exclusive=waiting_scan))
+    background = TestClient(app, base_url="http://127.0.0.1")
+    repo = _make_git_repo(tmp_path, "queued-repo")
+
+    resp = background.post("/api/repos", json={"path": str(repo)})
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["registered"] is True and body["indexed"] is False and body["files_indexed"] is None
+    assert "waits for another repository's full scan" in body["warning"]
+    assert started.wait(5)
+    assert scan_calls == []  # still waiting its turn after the answer
+    release.set()
+    for _ in range(100):
+        if registry.get(body["repo_id"]).last_indexed:
+            break
+        threading.Event().wait(0.05)
+    assert [c["repo_id"] for c in scan_calls] == [body["repo_id"]]
+    assert registry.get(body["repo_id"]).last_indexed
+

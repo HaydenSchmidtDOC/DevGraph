@@ -28,6 +28,7 @@ import inspect
 import json
 import logging
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,7 +68,7 @@ from devgraph.graph.schema import (
     NODE_LABELS,
     RELATIONSHIP_TYPES,
 )
-from devgraph.indexer.dispatch import full_scan
+from devgraph.indexer.dispatch import full_scan, full_scan_running
 from devgraph.indexer.walk import repo_root_problem
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.registry.store import RepoRegistry
@@ -416,11 +417,30 @@ def build_router(
                 registry.mark_indexed(record.repo_id, at=started)
                 return count
 
-            # Waits on the repository's batch lock (W4): a watcher that picks
-            # the new repository up mid-scan waits too, then catches up from
-            # this stamp.
-            files_indexed = run_exclusive(record.repo_id, scan_and_stamp)
-            indexed = True
+            if full_scan_running():
+                # Another repository's full scan holds this process's turn
+                # (dispatch `full_scan_turn`), possibly for a long time: answer
+                # now, and scan once that one ends.
+                def scan_later() -> None:
+                    try:
+                        run_exclusive(record.repo_id, scan_and_stamp)
+                    except EngineClosed:
+                        logger.info("registered %s; shutdown cut its initial scan, which the next start redoes",
+                                    record.repo_id)
+                    except Exception as exc:
+                        logger.warning("registered %s but the initial scan failed: %s", record.repo_id, exc)
+
+                threading.Thread(target=scan_later, name=f"devgraph-register-{record.repo_id}", daemon=True).start()
+                warning = (
+                    f"Registered {record.repo_id}; its initial scan waits for another repository's full scan "
+                    "to finish, then runs in the background."
+                )
+            else:
+                # Waits on the repository's batch lock (W4): a watcher that picks
+                # the new repository up mid-scan waits too, then catches up from
+                # this stamp.
+                files_indexed = run_exclusive(record.repo_id, scan_and_stamp)
+                indexed = True
         except EngineClosed:
             # The agent is shutting down. Never stamped, so its next start
             # indexes the repository in full.

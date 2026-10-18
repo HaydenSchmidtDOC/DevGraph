@@ -124,6 +124,7 @@ class TrayApp:
         self._sync = RepoSync(
             self._engine, self._registry, self._on_sync_event,
             request_catch_up=lambda *a: self._watcher.request_catch_up(*a),
+            yield_lock=lambda repo_id: self._watcher.yield_batch_lock(repo_id),
         )
         self._watcher = WatcherManager(
             self._registry,
@@ -142,6 +143,7 @@ class TrayApp:
         self._schema_rescans = SchemaRescanScheduler(
             self._engine, self._registry, on_rescanned=self._on_schema_rescanned,
             is_paused=lambda: self._paused, run_exclusive=self._watcher.run_exclusive,
+            yield_lock=self._watcher.yield_batch_lock,
         )
         self._insights = InsightsScheduler(self._engine, self._registry, on_refreshed=self._on_insights_refreshed)
         self._dashboard_loop: asyncio.AbstractEventLoop | None = None

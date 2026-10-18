@@ -462,6 +462,13 @@ def initial_repo() -> dict:
         "cs/Global.cs": File("cs", head="", bases={"Root": None}, funcs={"Run": ["Jobs.Run", "_jobs.Stop"]}),
         "cs/Wide.cs": File("cs", head="Shop.Wide", imports=[f"using N{i};" for i in range(40)] + ["using Shop;"],
                            bases={"Wide": None}, funcs={"Spread": ["Jobs.Run", "_jobs.Stop", "p.Helper"]}),
+        # An ASP.NET controller: its action's handler stub is a file-less
+        # claimed Function with a `proj`, and the action calls Jobs.Run by name.
+        "cs/ShopController.cs": File("static", head=(
+            "using Shop;\n\nnamespace Shop.App;\n\n[ApiController]\n[Route(\"api/[controller]\")]\n"
+            "public class ShopController\n{\n    [HttpGet(\"run\")]\n"
+            "    public void List() { Jobs.Run(); }\n}\n"
+        )),
         "scripts/Tool.cs": File("cs", head="Tools", imports=["global using Shop.Models;"], bases={"Tool": None}),
         # Another project's Shop.Jobs, which cs/ sees only through a reference.
         "cs2/Lib.csproj": File("static", head=CS_PROJECT.format("")),
