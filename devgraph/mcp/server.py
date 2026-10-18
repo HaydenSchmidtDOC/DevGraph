@@ -54,9 +54,10 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+import pydantic_core
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from devgraph.agent import lifecycle
 from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, global_tools_fingerprint
@@ -273,6 +274,41 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
             )
 
     return wrapper
+
+
+def compact_json(value: Any) -> str:
+    """`value` as compact JSON: no indentation or spaces after separators, key order and
+    non-ASCII text kept. Everything a client's model reads goes through this, so it pays
+    no tokens for whitespace."""
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def _compact_result(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a tool so a dict result reaches the client as one compact JSON text block.
+
+    Left to itself the SDK renders a returned dict with `indent=2`, about 40% of the
+    characters being indentation. The wrapper builds the `CallToolResult` itself: the
+    text block is `compact_json` of the result and `structuredContent` is the same
+    JSON-ready data the SDK would send (non-JSON values become strings, as the SDK's
+    `fallback=str` does), so the two still round-trip to each other and the declared
+    `dict[str, Any]` output schema still validates. Anything but a dict, and every
+    exception (a ToolError's message is plain text), passes through untouched.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        result = fn(*args, **kwargs)
+        if not isinstance(result, dict):
+            return result
+        data = pydantic_core.to_jsonable_python(result, fallback=str)
+        return CallToolResult(content=[TextContent(type="text", text=compact_json(data))], structured_content=data)
+
+    return wrapper
+
+
+def _served(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """What every served tool, built-in or declared, is wrapped in: telemetry, then compact JSON."""
+    return _compact_result(_instrument(fn))
 
 
 def _with_neo4j_errors(fn: Callable[..., Any], uri: str) -> Callable[..., Any]:
@@ -561,7 +597,7 @@ def build_server(
         register = _register_tool(*args, **kwargs)
         # `status` (the tool plane's, assigned below) is looked up at call time.
         return lambda fn: register(
-            _instrument(
+            _served(
                 _with_neo4j_errors(
                     _with_schema(
                         _with_shadow_notices(
@@ -979,12 +1015,12 @@ def build_server(
     fingerprint = tools_fingerprint(session_repo.path) if session_repo is not None else None
     global_fingerprint = global_tools_fingerprint()
     status = register_project_tools(
-        server, engine, session_repo, session_source, instrument=_instrument, annotations=_READ_ONLY, pinned=session_pinned,
+        server, engine, session_repo, session_source, instrument=_served, annotations=_READ_ONLY, pinned=session_pinned,
         registry=registry, fingerprint=fingerprint, global_fingerprint=global_fingerprint,
     )
     # main() polls this for tools-file and global-store reloads.
     server.devgraph_tool_plane = ProjectToolPlane(  # type: ignore[attr-defined]
-        server, engine, session_repo, status, instrument=_instrument, annotations=_READ_ONLY,
+        server, engine, session_repo, status, instrument=_served, annotations=_READ_ONLY,
         fingerprint=fingerprint, global_fingerprint=global_fingerprint,
     )
 
@@ -1001,7 +1037,7 @@ def build_server(
         mime_type="application/json",
     )
     def project_tools() -> str:
-        return json.dumps(status.to_dict(), indent=2)
+        return compact_json(status.to_dict())
 
     @server.resource(
         "devgraph://client-guide",
@@ -1056,7 +1092,7 @@ def build_server(
                 for n, params in status.parameter_names.items()
             ),
         ]
-        return json.dumps(catalog, indent=2)
+        return compact_json(catalog)
 
     return server
 
