@@ -367,11 +367,11 @@ Prefer these over re-reading files when the question is structural:
 | "What is X / where is it?" | `search_component` (code, routes, datastores including caches, and compose containers: `redis` finds the Redis cache and the `redis` container) |
 | "What is X connected to? / follow X's links" | `describe_node` (a name, or a path or id for file, folder and docs nodes) |
 | "What is X, but only recently modified?" | `search_component` with `modified_within_commits=N` (only matches entities touched in the last N commits) |
-| "What calls X?" | `find_callers` (name, not path) |
+| "What calls X?" | `find_callers` (name, not path; callers in test code come after production ones, `test_count` says how many there are, and `include_tests=False` leaves them out) |
 | "What calls X, but only recently modified?" | `find_callers` with `modified_within_commits=N` (filters results to entities touched in the last N commits) |
 | "What calls X, but only from within class Y?" | `find_callers` with `scope_to_class=Y` (cuts noise from unrelated same-named methods elsewhere in the repo) |
 | "What definitely calls X?" | `find_callers` with `resolved_only=True` (Python callers resolved through scope or imports) |
-| "What breaks if I change X?" | `impact_analysis` (name, not path) |
+| "What breaks if I change X?" | `impact_analysis` (name, not path; test-code dependents come last in each list, with `test_count`, and `include_tests=False` leaves them out) |
 | "What breaks across this whole PR/diff?" | `impact_analysis_for_diff` (base_ref/head_ref, both must exist locally — never fetches) |
 | "What does X depend on?" | `get_service_dependencies` (service name), `find_related_files` (function/class name, not path) |
 | "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name like `GET /users/<id>`, or a bare path like `/users/<id>` for every method) |

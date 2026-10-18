@@ -762,8 +762,9 @@ def build_server(
         resolved_only: bool = False,
         file: str | None = None,
         owner: str | None = None,
+        include_tests: bool = True,
     ) -> dict[str, Any]:
-        """Find all callers of a target; returns {count, results, truncated}, each caller
+        """Find all callers of a target; returns {count, results, truncated, test_count}, each caller
         with its name, type, repo_id, file, owner and start_line (a module caller has
         neither) and confidence, most certain first. Calls
         in every language are resolved through the caller's scope, imports and types:
@@ -781,10 +782,13 @@ def build_server(
         caller adds target_files (the files of the targets it calls, at most 10) and
         ambiguous_targets lists the definitions. To pick one class's method, pass owner
         (the classes or functions it is declared in, "" at the top level) or name it
-        "A.run" / "A::run"."""
+        "A.run" / "A::run". Callers in test code (under tests/, test/, __tests__/,
+        src/test/, or a test file such as test_*.py, *_test.go, *.spec.ts, *Test.java)
+        come after all others; test_count says how many there are, and
+        include_tests=false leaves them out."""
         return devgraph_tools.find_callers(
             engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits,
-            resolved_only, file, declared(repo_id, cross_repo), owner,
+            resolved_only, file, declared(repo_id, cross_repo), owner, include_tests,
         )
 
     @server.tool(annotations=_READ_ONLY)
@@ -826,7 +830,7 @@ def build_server(
     @server.tool(annotations=_READ_ONLY)
     def impact_analysis(
         repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None,
-        owner: str | None = None,
+        owner: str | None = None, include_tests: bool = True,
     ) -> dict[str, Any]:
         """Analyze component impact: direct dependents (one CALLS/USES/DEPENDS_ON hop) and
         transitive ones (two to four hops; further ones are not followed), each {name, type,
@@ -838,9 +842,11 @@ def build_server(
         up to five files each is traced apart (every dependent adds target_files, the
         targets it depends on, and risk_level is the riskiest one's); past five, their
         dependents are listed together, with a notice. Another same-named definition
-        can itself appear as a dependent."""
+        can itself appear as a dependent. Dependents in test code come after all others in
+        each list, which adds test_count; include_tests=false leaves them out."""
         return devgraph_tools.impact_analysis(
-            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo), owner
+            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo), owner,
+            include_tests,
         )
 
     @server.tool(annotations=_READ_ONLY)

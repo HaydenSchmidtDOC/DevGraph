@@ -31,6 +31,7 @@ from devgraph.config.project_schema import (
 from devgraph.config.project_tools import DEFAULT_TIMEOUT_S
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
+from devgraph.indexer.datastores.extractor import _TEST_DIR
 from devgraph.indexer.source_text import decode_source_as, declared_encoding, is_python_path
 from devgraph.paths import is_within
 from devgraph.registry.store import RepoRegistry
@@ -144,6 +145,34 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
         "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched"
     )
     return "\n".join(parts)
+
+
+#: A test file's name: Python `test_*.py`, `*_test.py` and `conftest.py`, Go
+#: `*_test.go`, JS/TS `*.spec.ts`/`*.test.tsx` and the like, C#/Java/Kotlin
+#: `*Test.java`/`*Tests.cs`.
+_TEST_FILE = re.compile(
+    r"(?:^|/)(?:test_[^/]*\.py|[^/]*_test\.(?:py|go)|conftest\.py|[^/]*\.(?:spec|test)\.[cm]?[jt]sx?"
+    r"|[^/]*Tests?\.(?:cs|java|kt))$"
+)
+#: Test code by its repo-relative path: a file under a conventional test folder
+#: (the datastore extractor's `_TEST_DIR`: `test/`, `tests/`, `__tests__/`,
+#: `src/test/`, `*.Tests/`) or with a test file's name (`_TEST_FILE`).
+TEST_PATH = re.compile(f"{_TEST_DIR.pattern}|{_TEST_FILE.pattern}")
+#: `TEST_PATH` as a Cypher `=~` pattern, which must match the whole string.
+_TEST_PATH_CYPHER = f".*(?:{TEST_PATH.pattern}).*"
+
+
+def is_test_path(path: str | None) -> bool:
+    """Whether a repo-relative path is test code (`TEST_PATH`); None is not."""
+    return bool(path) and TEST_PATH.search(path) is not None
+
+
+def _tests_last(rows: list[dict[str, Any]], include_tests: bool) -> tuple[list[dict[str, Any]], int]:
+    """`rows` with the test-code ones (by `file`, `is_test_path`) after the rest,
+    in their order, or left out when not `include_tests`; and how many there are."""
+    tests = [row for row in rows if is_test_path(row.get("file"))]
+    production = [row for row in rows if not is_test_path(row.get("file"))]
+    return (production + tests if include_tests else production), len(tests)
 
 
 def _located(row: dict[str, Any]) -> dict[str, Any]:
@@ -1489,6 +1518,7 @@ def find_callers(
     file: str | None = None,
     extra_labels: tuple[str, ...] = (),
     owner: str | None = None,
+    include_tests: bool = True,
 ) -> dict[str, Any]:
     """Find all functions, services, or endpoints that call a given target.
 
@@ -1532,9 +1562,12 @@ def find_callers(
             pick a method of one class (`describe_node`'s `owner`); a target
             named with them (`A.run`, `A::run`) does the same when no node has
             that exact name
+        include_tests: If False, leave out callers in test code (`is_test_path`
+            of their file); either way they come after every other caller
 
     Returns:
-        Dict with count, results, and truncated flag containing callers with their
+        Dict with count, results, truncated flag and test_count (the callers in
+        test code, listed or not) containing callers with their
         types, repo_id, file, owner and start_line (when the caller has them: a
         Module has neither) and confidence (same-named callers are separate
         rows, told apart by file and owner); count 0 for a known target nothing calls. When targets
@@ -1571,14 +1604,15 @@ def find_callers(
     AND {_OWNER_MATCH.replace("n.", "target.")}
     WITH caller, min(CASE rel.confidence WHEN 'resolved' THEN 0 WHEN 'package' THEN 1 WHEN 'name' THEN 3
                      ELSE 2 END) AS rank{target_files}
+    WITH *, coalesce(caller.file, caller.source_file, '') =~ $test_path AS is_test
     RETURN caller.name as name, labels(caller) as type, caller.repo_id as repo_id,
            coalesce(caller.file, caller.source_file) as file,
            {_OWNER_OF.format(v="caller")} as owner, caller.start_line as start_line,
            CASE rank WHEN 0 THEN 'resolved' WHEN 1 THEN 'package' WHEN 3 THEN 'name' END as confidence{target_files and ", target_files"}
-    ORDER BY rank, name, file
+    ORDER BY is_test, rank, name, file
     LIMIT {LIST_ROW_LIMIT + 1}
     """
-    params = {"target_name": target_name, "file": file, "owner": owner}
+    params = {"target_name": target_name, "file": file, "owner": owner, "test_path": _TEST_PATH_CYPHER}
     if not cross_repo:
         params["repo_id"] = repo_id
     if scope_to_class:
@@ -1590,7 +1624,9 @@ def find_callers(
     results = [_located(row) for row in results]
     if ambiguous:
         results = [_with_target_files(row, row["target_files"]) for row in results]
+    results, test_count = _tests_last(results, include_tests)
     envelope = _capped_envelope(results, more, max_results)
+    envelope["test_count"] = test_count
     if ambiguous:
         envelope["ambiguous_targets"] = ambiguous
     return envelope
@@ -1620,6 +1656,8 @@ def find_related_files(
             several same-named components
         extra_labels: The repository's declared labels, looked up besides the built-in ones
         owner: The declarations the component is in, as in find_callers (`A.run` too)
+        include_tests: If False, leave out dependents in test code (as in
+            find_callers); either way they come after every other dependent
 
     Returns:
         Dict with containing_modules, imported_modules, and related_components,
@@ -1859,6 +1897,7 @@ def impact_analysis(
     file: str | None = None,
     extra_labels: tuple[str, ...] = (),
     owner: str | None = None,
+    include_tests: bool = True,
 ) -> dict[str, Any]:
     """Analyze the impact of changing a component on the rest of the system.
 
@@ -1892,13 +1931,20 @@ def impact_analysis(
         every target that reaches it within `IMPACT_MAX_DEPTH` hops; risk_level is
         the riskiest target's. Past that, one expansion covers them all, as for a
         single target, with a notice to pass `file`. Another same-named target can
-        itself be listed as a dependent.
+        itself be listed as a dependent. Each dependents envelope adds
+        `test_count`, its dependents in test code (listed or not); risk_level
+        counts them too.
 
     Raises:
         ToolError: no node has that name, or none in `file`.
     """
     _at_least(1, max_results=max_results)
     file = _normalize_file(file)
+
+    def dependents_envelope(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        shown, test_count = _tests_last(rows, include_tests)
+        return {**_envelope(shown, max_results), "test_count": test_count}
+
     labels = component_labels(extra_labels)
     component_name, owner = _owned_target(engine, repo_id, component_name, owner, cross_repo, labels)
     ambiguous, labels, files = _resolve_targets(
@@ -1925,8 +1971,8 @@ def impact_analysis(
     if not split:
         row = results[0]
         answer = {
-            "direct_dependents": _envelope([_located(d) for d in row["direct_dependents"]], max_results),
-            "transitive_dependents": _envelope([_located(d) for d in row["transitive_dependents"]], max_results),
+            "direct_dependents": dependents_envelope([_located(d) for d in row["direct_dependents"]]),
+            "transitive_dependents": dependents_envelope([_located(d) for d in row["transitive_dependents"]]),
             "risk_level": _risk_level(row["direct_count"]),
         }
         if ambiguous:
@@ -1953,7 +1999,7 @@ def impact_analysis(
         for key in ("direct_dependents", "transitive_dependents")
     }
     return {
-        **{key: _envelope(rows, max_results) for key, rows in lists.items()},
+        **{key: dependents_envelope(rows) for key, rows in lists.items()},
         "risk_level": _risk_level(max(row["direct_count"] for row in results)),
         "ambiguous_targets": ambiguous,
     }

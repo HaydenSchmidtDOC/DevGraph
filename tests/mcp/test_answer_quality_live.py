@@ -202,3 +202,65 @@ def test_cache_is_a_known_entity_type(engine, repo, tool):
     else:
         result = tools.find_mentions(engine, repo_id, "Redis", label="Cache")
     assert result["count"] == 0
+
+
+CALLER_FILES = {
+    "core/scan.py": "def work():\n    return 1\n",
+    "app/cli.py": "from core.scan import work\n\n\ndef run():\n    return work()\n\n\ndef rerun():\n    return work()\n",
+    "tests/test_work.py": "from core.scan import work\n\n\n" + "".join(
+        f"def test_case_{i:02d}():\n    assert work()\n\n\n" for i in range(20)
+    ),
+}
+
+
+@pytest.fixture(scope="module")
+def callers_repo(engine, tmp_path_factory):
+    root = tmp_path_factory.mktemp("callers")
+    repo_id = f"zz-answers-callers-{uuid.uuid4().hex[:8]}"
+    for rel, text in CALLER_FILES.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    provision_repository_schema(engine, root)
+    engine.upsert_repository(repo_id, repo_id, str(root))
+    full_scan(engine, repo_id, root)
+    yield repo_id
+    engine.delete_repository(repo_id)
+
+
+def test_find_callers_lists_production_callers_before_tests(engine, callers_repo):
+    result = tools.find_callers(engine, callers_repo, "work", max_results=5)
+    assert result["count"] == 22 and result["test_count"] == 20
+    assert [(r["name"], r["file"]) for r in result["results"][:2]] == [("rerun", "app/cli.py"), ("run", "app/cli.py")]
+    assert all(r["file"] == "tests/test_work.py" for r in result["results"][2:])
+
+
+def test_find_callers_can_leave_tests_out(engine, callers_repo):
+    result = tools.find_callers(engine, callers_repo, "work", include_tests=False)
+    assert [r["name"] for r in result["results"]] == ["rerun", "run"]
+    assert result["count"] == 2 and result["test_count"] == 20 and result["truncated"] is False
+
+
+def test_impact_analysis_lists_production_dependents_before_tests(engine, callers_repo):
+    result = tools.impact_analysis(engine, callers_repo, "work", max_results=5)
+    direct = result["direct_dependents"]
+    assert direct["count"] == 22 and direct["test_count"] == 20
+    assert sorted(r["name"] for r in direct["results"][:2]) == ["rerun", "run"]
+    assert result["risk_level"] == "high"
+    without = tools.impact_analysis(engine, callers_repo, "work", include_tests=False)["direct_dependents"]
+    assert sorted(r["name"] for r in without["results"]) == ["rerun", "run"] and without["test_count"] == 20
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("tests/test_a.py", True), ("pkg/tests/helpers.py", True), ("test/a.js", True), ("web/__tests__/a.js", True),
+        ("app/src/test/java/a/A.java", True), ("Shop.Tests/Cart.cs", True), ("a/test_cli.py", True),
+        ("a/cli_test.py", True), ("conftest.py", True), ("pkg/x_test.go", True), ("web/a.spec.ts", True),
+        ("web/a.test.tsx", True), ("src/CartTest.java", True), ("src/CartTests.cs", True), ("src/CartTest.kt", True),
+        ("devgraph/indexer/dispatch.py", False), ("scripts/measure.py", False), ("contest.py", False),
+        ("latest/a.py", False), ("src/testing.py", False), ("attestation/x.go", False), (None, False), ("", False),
+    ],
+)
+def test_is_test_path(path, expected):
+    assert tools.is_test_path(path) is expected
