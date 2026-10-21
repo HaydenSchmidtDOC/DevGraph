@@ -2185,6 +2185,9 @@ def _git_pull_command(remote_branch: str) -> list[str]:
     return ["git", "pull", "--ff-only", remote, branch]
 
 
+_UPDATE_WAIT_PID = "DEVGRAPH_UPDATE_WAIT_PID"
+
+
 @app.command()
 def update(
     force: bool = typer.Option(
@@ -2201,6 +2204,11 @@ def update(
     pip), runs doctor, and restarts the tray if it was running, even when
     the reinstall or doctor fails.
     """
+    if _hand_off_update_from_launcher():
+        return
+    wait_pid = os.environ.pop(_UPDATE_WAIT_PID, None)
+    if wait_pid:
+        _wait_for_process_exit(int(wait_pid))
     repo_root = resolve_repo_root()
     python_path = resolve_venv_python()
     reinstall = _reinstall_command(Path(sys.prefix), python_path)
@@ -2283,6 +2291,45 @@ def update(
             )
 
     console.print("[green]Update complete.[/green]")
+
+
+def _running_from_windows_launcher() -> bool:
+    """True when this process was started through `devgraph.exe` on Windows.
+
+    The launcher passes its own path as `sys.argv[0]`, with the `.exe` dropped.
+    """
+    if os.name != "nt":
+        return False
+    argv0 = Path(sys.argv[0])
+    return argv0.suffix.lower() in ("", ".exe") and argv0.with_suffix(".exe").is_file()
+
+
+def _wait_for_process_exit(pid: int, timeout_s: float = 120.0) -> None:
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    synchronize = 0x00100000
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if handle:
+        kernel32.WaitForSingleObject(handle, int(timeout_s * 1000))
+        kernel32.CloseHandle(handle)
+
+
+def _hand_off_update_from_launcher() -> bool:
+    """Windows won't let pip replace a running `devgraph.exe`: the reinstall
+    fails with WinError 32 halfway and leaves the package uninstalled. So
+    `update` run through the exe starts itself again as `python -m` and exits
+    (the exe's launcher then exits too); the new process waits for that exit
+    before it reinstalls. Returns True when the caller should stop.
+    """
+    if os.environ.get(_UPDATE_WAIT_PID):
+        return False
+    if not _running_from_windows_launcher():
+        return False
+    env = {**os.environ, _UPDATE_WAIT_PID: str(os.getppid())}
+    subprocess.Popen([str(resolve_venv_python()), "-m", "devgraph.cli.main", *sys.argv[1:]], env=env)
+    console.print("Continuing the update in a new process so the running devgraph.exe can be replaced...")
+    return True
 
 
 def _reinstall_command(venv: Path, python_path: Path) -> list[str]:

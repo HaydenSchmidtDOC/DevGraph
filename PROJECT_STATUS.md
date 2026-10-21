@@ -93,7 +93,7 @@
 ## Commands
 
 - **Canonical setup**: the README installer launches `.\scripts\setup-menu.ps1`, which creates the Python environment, installs DevGraph, starts Neo4j, initializes schema, runs `devgraph doctor`, and offers MCP client registration. Idempotent.
-- **Update an existing checkout**: `devgraph update` — fast-forward pull, reinstall, `doctor`, and tray restart when needed. Commit or stash local changes first; `--force` only suppresses the dirty-tree guard. `.\scripts\update.ps1` remains as a compatibility entry point.
+- **Update an existing checkout**: `devgraph update` — fast-forward pull, reinstall, `doctor`, and tray restart when needed. Commit or stash local changes first; `--force` only suppresses the dirty-tree guard. On Windows, `devgraph update` run through `devgraph.exe` restarts itself as `python -m` and exits first (the prompt returns before it finishes), because pip can't replace a running exe. `.\scripts\update.ps1` remains as a compatibility entry point.
 - Manual equivalent (any platform): `uv sync --extra dev` (or `python -m venv .venv` and `python -m pip install -e ".[dev]"` with that environment's Python: `.venv/bin/python` on Linux and macOS, `.venv\Scripts\python` on Windows) → start Neo4j with Podman or Docker (`docker` takes the same arguments):
   `podman run -d --name devgraph-neo4j -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 -e NEO4J_AUTH=neo4j/devgraph-local-dev -v devgraph_neo4j_data:/data -v devgraph_neo4j_logs:/logs docker.io/library/neo4j:5.26-community`
   (`deploy/podman-compose.yml` is an untested alternative for compose-provider setups.) The README's Linux quickstart walks through the same steps.
