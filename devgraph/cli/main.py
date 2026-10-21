@@ -2207,8 +2207,9 @@ def update(
     if _hand_off_update_from_launcher():
         return
     wait_pid = os.environ.pop(_UPDATE_WAIT_PID, None)
-    if wait_pid:
-        _wait_for_process_exit(int(wait_pid))
+    if wait_pid and not _wait_for_process_exit(int(wait_pid)):
+        console.print("[red][X] devgraph.exe is still running, so it can't be replaced.[/red] Close it and run the update again.")
+        raise typer.Exit(code=1)
     repo_root = resolve_repo_root()
     python_path = resolve_venv_python()
     reinstall = _reinstall_command(Path(sys.prefix), python_path)
@@ -2304,14 +2305,18 @@ def _running_from_windows_launcher() -> bool:
     return argv0.suffix.lower() in ("", ".exe") and argv0.with_suffix(".exe").is_file()
 
 
-def _wait_for_process_exit(pid: int, timeout_s: float = 120.0) -> None:
+def _wait_for_process_exit(pid: int, timeout_s: float = 120.0) -> bool:
+    """True once `pid` has exited (or is already gone); False on timeout."""
     import ctypes
 
     kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
     synchronize = 0x00100000
     handle = kernel32.OpenProcess(synchronize, False, pid)
-    if handle:
-        kernel32.WaitForSingleObject(handle, int(timeout_s * 1000))
+    if not handle:
+        return True
+    try:
+        return kernel32.WaitForSingleObject(handle, int(timeout_s * 1000)) == 0
+    finally:
         kernel32.CloseHandle(handle)
 
 

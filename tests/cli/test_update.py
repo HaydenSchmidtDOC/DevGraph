@@ -154,7 +154,7 @@ def test_update_run_through_the_exe_hands_off_and_does_nothing_else(update_env, 
 def test_the_handed_off_update_waits_for_the_exe_then_runs_normally(update_env, monkeypatch):
     run, waited = _Recorder(), []
     monkeypatch.setattr(cli_main.subprocess, "run", run)
-    monkeypatch.setattr(cli_main, "_wait_for_process_exit", waited.append)
+    monkeypatch.setattr(cli_main, "_wait_for_process_exit", lambda pid: waited.append(pid) or True)
     monkeypatch.setattr(cli_main, "_running_from_windows_launcher", lambda: True)
     monkeypatch.setenv(cli_main._UPDATE_WAIT_PID, "4321")
     result = CliRunner().invoke(cli_main.app, ["update"])
@@ -184,3 +184,14 @@ def test_the_launcher_is_recognised_by_argv0(monkeypatch, argv0, has_exe, expect
     monkeypatch.setattr(cli_main.sys, "argv", [argv0, "update"])
     monkeypatch.setattr(cli_main.Path, "is_file", lambda self: has_exe)
     assert cli_main._running_from_windows_launcher() is expected
+
+
+def test_the_handed_off_update_stops_if_the_exe_never_exits(update_env, monkeypatch):
+    run = _Recorder()
+    monkeypatch.setattr(cli_main.subprocess, "run", run)
+    monkeypatch.setattr(cli_main, "_wait_for_process_exit", lambda pid: False)
+    monkeypatch.setattr(cli_main, "_running_from_windows_launcher", lambda: True)
+    monkeypatch.setenv(cli_main._UPDATE_WAIT_PID, "4321")
+    result = CliRunner().invoke(cli_main.app, ["update"])
+    assert result.exit_code == 1 and "still running" in result.stdout
+    assert run.commands == []
