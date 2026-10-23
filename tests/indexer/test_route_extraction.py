@@ -459,6 +459,52 @@ func Sync(cache *Cache, kv KV, store *Store, client *http.Client, ct string, bod
     assert _endpoints(extract_go_file(plain, "x/x.go", "r")) == {}
 
 
+def test_go_dot_imported_routers():
+    """`import . "net/http"` makes a bare `HandleFunc` the DefaultServeMux's
+    route, and a dot-imported router package's bare `NewRouter()` and
+    `*Mux` a root router; the file's own `Handle` is no route."""
+    from devgraph.indexer.go.extractor import extract_go_file
+
+    source = """\
+package web
+
+import (
+\t. "net/http"
+)
+
+func Routes() {
+\tHandleFunc("GET /health", health)
+\tHandle("/static/", files)
+}
+
+func health(w ResponseWriter, r *Request) {}
+"""
+    assert _endpoints(extract_go_file(source, "web/routes.go", "r")) == {"GET /health": "Go", "* /static/": "Go"}
+    chi = """\
+package web
+
+import (
+\t. "github.com/go-chi/chi/v5"
+)
+
+func Routes() {
+\tr := NewRouter()
+\tr.Get("/items", list)
+}
+
+func Mount(m *Mux) {
+\tm.Post("/items", create)
+}
+
+func list() {}
+func create() {}
+"""
+    assert _endpoints(extract_go_file(chi, "web/chi.go", "r")) == {"GET /items": "Go", "POST /items": "Go"}
+    own = "package web\n\nimport . \"net/http\"\n\nfunc Handle(p string, h func()) { Println(p) }\n\n" \
+          "func Routes() {\n\tHandle(\"/x\", Routes)\n}\n"
+    assert _endpoints(extract_go_file(own, "web/own.go", "r")) == {}
+
+
 def test_go_router_subpackages_fields_and_scopes():
     from devgraph.indexer.go.extractor import extract_go_file
 

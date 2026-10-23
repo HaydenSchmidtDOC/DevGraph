@@ -11,6 +11,7 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    heir_keys,
     member_owner,
     own_edges,
     owned_pin,
@@ -245,7 +246,9 @@ def test_cpp_specialisation_qualifier_and_nested_class_owners():
 
 def test_a_cross_file_call_names_the_owner_its_resolver_knows():
     """Python: an imported function is top-level (""); a method of an
-    imported class or instance names no owner (the class can inherit it)."""
+    imported class is the class's (its own or one it inherits from a class
+    of its file, which the heir keys there tell), but under a package
+    directory owner-less; a method of an imported instance names no owner."""
     result = extract_python_file(textwrap.dedent("""\
         from shop.models import Order, save, client
 
@@ -256,6 +259,9 @@ def test_a_cross_file_call_names_the_owner_its_resolver_knows():
 
         def sync():
             Order().save()
+
+
+        def push():
             client.save()
         """), "shop/jobs.py", "repo")
 
@@ -266,7 +272,72 @@ def test_a_cross_file_call_names_the_owner_its_resolver_knows():
         }
 
     assert ("shop/models.py", "") in rows("run") and ("shop/models.py", None) not in rows("run")
-    assert ("shop/models.py", None) in rows("sync") and ("shop/models.py", "Order") not in rows("sync")
+    assert ("shop/models.py", "Order") in rows("sync") and ("shop/models.py", None) not in rows("sync")
+    assert ("shop/models/", None) in rows("sync")
+    assert ("shop/models.py", None) in rows("push")
+
+
+@pytest.mark.parametrize("extract, path, source", [
+    (extract_python_file, "app/s.py", """\
+        from app.models import User
+
+
+        def register(u: User):
+            u.save()
+
+
+        def make():
+            u = User()
+            u.save()
+            User().save()
+        """),
+    (extract_js_file, "app/s.ts", """\
+        import { User } from './models';
+        import Account from './account';
+
+        class Svc {
+          constructor(private repo: User) {}
+          sync() { this.repo.save(); }
+        }
+        export function register(u: User) { u.save(); }
+        export function make() { const u = new User(); u.save(); new Account().save(); }
+        """),
+])
+def test_a_typed_receiver_of_an_imported_class_names_its_owner(extract, path, source):
+    """A receiver typed by an annotation, a constructor or a field, and a
+    constructed one, name the class as the owner of the method's every
+    file pin (a package or barrel prefix none); a default import names its
+    file's default-exported class (`default`)."""
+    result = extract(textwrap.dedent(source), path, "repo")
+    rows = [r for r in result.relationships if r.rel_type == "CALLS" and r.to_name == "save"]
+    assert rows
+    for row in rows:
+        expected = None if row.to_file.endswith("/") else "default" if "account" in row.to_file else "User"
+        assert row.to_owner == expected, row
+
+
+def test_heir_keys_name_the_classes_inheriting_a_member_from_the_nearest_base():
+    assert heir_keys([
+        ("Base", "Base", [], ["save", "check"]), ("Mid", "Mid", ["Base"], ["check"]),
+        ("User", "User", ["Mid", "Missing"], []), ("Admin", "Admin", ["User"], ["save"]),
+        ("Local", None, ["Base"], []),
+    ]) == {
+        ("save", "Base"): ["<Mid", "<User"], ("check", "Mid"): ["<Admin", "<User"],
+    }
+
+
+@pytest.mark.parametrize("lang", ["python", "ts", "java"])
+def test_an_inherited_member_carries_its_heirs_keys(lang):
+    extract, path, source = {
+        "python": (extract_python_file, "app/m.py",
+                   "class Base:\n    def save(self):\n        pass\n\n\nclass User(Base):\n    pass\n"),
+        "ts": (extract_js_file, "app/m.ts", "class Base { save() {} }\nclass User extends Base {}\n"),
+        "java": (extract_java_file, "app/m/User.java",
+                 "package m;\nclass Base { void save() {} }\npublic class User extends Base {}\n"),
+    }[lang]
+    result = extract(source, path, "repo")
+    (save,) = [n for n in result.nodes if n.label == "Function" and n.name == "save"]
+    assert save.properties["owner"] == "Base" and save.properties["mkeys"] == ["<User"]
 
 
 def test_a_route_implements_its_handlers_owner():
@@ -286,3 +357,181 @@ def test_a_route_implements_its_handlers_owner():
     result = APIExtractor("repo").extract_from_source(source, "api/routes.py")
     pinned = {(r.source_name, r.to_owner) for r in result.relationships if r.to_file == "api/routes.py"}
     assert pinned == {("GET /items", ""), ("GET /users", "Views")}
+
+
+def _heir_open(result):
+    (module,) = [n for n in result.nodes if n.label == "Module"]
+    return module.properties["heir_open"]
+
+
+def _function_keys(result):
+    return {(n.name, n.properties["owner"]): n.properties.get("mkeys") for n in result.nodes if n.label == "Function"}
+
+
+def test_python_heir_keys_follow_c3_in_a_diamond():
+    """`class D(B, C)` where only C overrides A's `f`: C3 puts C before A,
+    so D inherits C.f; JS and Java keep the depth-first walk."""
+    classes = [("A", "A", [], ["f"]), ("B", "B", ["A"], []), ("C", "C", ["A"], ["f"]), ("D", "D", ["B", "C"], [])]
+    assert heir_keys(classes, c3=True) == {("f", "A"): ["<B"], ("f", "C"): ["<D"]}
+    assert heir_keys(classes) == {("f", "A"): ["<B", "<D"]}
+    keys = _function_keys(extract_python_file(textwrap.dedent("""\
+        class A:
+            def f(self):
+                pass
+
+
+        class B(A):
+            pass
+
+
+        class C(A):
+            def f(self):
+                pass
+
+
+        class D(B, C):
+            pass
+        """), "m.py", "repo"))
+    assert keys[("f", "C")] == ["<D"] and keys[("f", "A")] == ["<B"]
+
+
+def test_a_subscripted_base_is_its_value():
+    """`class User(Base[int])` and `typing.Generic[T]` keep their base."""
+    result = extract_python_file(textwrap.dedent("""\
+        import typing
+
+
+        class Base:
+            def save(self):
+                pass
+
+
+        class User(Base[int], typing.Generic[T]):
+            pass
+        """), "m.py", "repo")
+    assert ("Base", "typing.Generic") == tuple(
+        r.to_name for r in result.relationships if r.rel_type == "EXTENDS" and r.from_name == "User"
+    )
+    assert "<User" in _function_keys(result)[("save", "Base")]
+
+
+def test_same_named_python_classes_keep_their_own_heirs():
+    """Two nested `Meta`s, one of base `Base`: only that one inherits `save`."""
+    keys = _function_keys(extract_python_file(textwrap.dedent("""\
+        class Base:
+            def save(self):
+                pass
+
+
+        class A:
+            class Meta(Base):
+                pass
+
+
+        class B:
+            class Meta:
+                def run(self):
+                    pass
+        """), "m.py", "repo"))
+    assert keys[("save", "Base")] == ["<A.Meta"]
+    assert keys[("run", "B.Meta")] is None
+
+
+def test_python_aliases_and_instances_are_heirs_of_their_class():
+    """`Registry = _Registry()` and `UserModel = User` hold their class's
+    members' keys; `Other = make()`, which names no class of the file, and
+    a class with a base outside it, are its file's open classes, so a call
+    through them links what an owner-less pin did."""
+    result = extract_python_file(textwrap.dedent("""\
+        from x import Model
+
+
+        class _Registry:
+            def register(self):
+                pass
+
+
+        class User:
+            def save(self):
+                pass
+
+
+        class Remote(Model):
+            def own(self):
+                pass
+
+
+        def helper():
+            pass
+
+
+        Registry = _Registry()
+        UserModel = User
+        Other = make()
+        """), "m.py", "repo")
+    keys = _function_keys(result)
+    assert keys[("register", "_Registry")] == ["<Registry"]
+    assert keys[("save", "User")] == ["<UserModel"]
+    assert keys[("own", "Remote")] is None and keys[("helper", "")] is None
+    assert _heir_open(result) == ["Other", "Remote"]
+
+
+@pytest.mark.parametrize("source, name, owner, key", [
+    ("export class UserServiceImpl { find() {} }\nexport const UserService = new UserServiceImpl();\n",
+     "find", "UserServiceImpl", "<UserService"),
+    ("class Client { get() {} }\nexport default new Client();\n", "get", "Client", "<default"),
+    ("class Impl { go() {} }\nexport { Impl as default };\n", "go", "Impl", "<default"),
+    ("class Base { start() {} }\nexport default class extends Base {}\n", "start", "Base", "<default"),
+    ("class Svc { run() {} }\nmodule.exports = Svc;\n", "run", "Svc", "<default"),
+    ("class User { save() {} }\nexport const UserModel = User;\n", "save", "User", "<UserModel"),
+    # Naming no class of the file: an open class of it.
+    ("export const Api = makeApi();\nexport function get() {}\n", "get", "", "Api"),
+    ("export default function Page() {}\nfunction load() {}\n", "load", "", "default"),
+])
+def test_js_aliases_instances_and_default_exports_are_heirs(source, name, owner, key):
+    result = extract_js_file(source, "web/m.ts", "repo")
+    if key.startswith("<"):
+        assert key in _function_keys(result)[(name, owner)]
+    else:
+        assert key in _heir_open(result)
+
+
+def test_open_keys_skip_nested_classes_type_aliases_and_exception_bases():
+    """Only a top-level class or alias is open; a type expression, a literal
+    or a `TypeVar` is no alias; a builtin exception base supplies no
+    sibling's member."""
+    result = extract_python_file(textwrap.dedent("""\
+        from typing import Literal, TypeVar
+        from lib import Model
+
+
+        class Error(ValueError):
+            def code(self):
+                pass
+
+
+        class Holder:
+            class Inner(Model):
+                pass
+
+
+        Mode = Literal["a", "b"]
+        Either = Error | Holder
+        T2 = TypeVar("T2")
+        Kind = NewType("Kind", int)
+
+
+        def helper():
+            pass
+        """), "m.py", "repo")
+    assert _heir_open(result) == ["Kind"]
+
+
+def test_owner_matches_falls_back_to_an_open_class_its_file_names_no_member_of():
+    from devgraph.indexer.common import owner_matches
+
+    assert owner_matches(["Remote"], "", (), ["Remote"], [("", ())])
+    # A Function of the name Remote has, or inherits, takes the link.
+    assert not owner_matches(["Remote"], "", (), ["Remote"], [("", ()), ("Remote", ())])
+    assert not owner_matches(["Remote"], "", (), ["Remote"], [("", ()), ("Base", ("<Remote",))])
+    assert not owner_matches(["Remote"], "", (), [], [("", ())])

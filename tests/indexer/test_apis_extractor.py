@@ -309,3 +309,222 @@ class MyClass:
         result = self.extractor.extract_from_source(code)
 
         assert len(result.endpoints) == 0
+
+
+def _routes(code: str, path: str = "app.py") -> list[tuple[str, str]]:
+    result = APIExtractor("repo").extract_from_source(code, path)
+    return sorted((f"{e.method} {e.path}", e.properties["framework"]) for e in result.endpoints)
+
+
+def test_fastapi_write_routes_make_no_get():
+    code = """
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.post("/items")
+def create():
+    pass
+
+@app.put("/items/{id}")
+def update(id):
+    pass
+
+@app.delete("/items/{id}")
+async def remove(id):
+    pass
+
+@app.get("/items")
+def read():
+    pass
+"""
+    assert _routes(code) == [
+        ("DELETE /items/{id}", "FastAPI"), ("GET /items", "FastAPI"), ("POST /items", "FastAPI"),
+        ("PUT /items/{id}", "FastAPI"),
+    ]
+
+
+def test_flask_methods_lists_tuples_and_strings_give_each_method():
+    code = """
+from flask import Flask, Blueprint
+
+app = Flask(__name__)
+bp = Blueprint("auth", __name__)
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    pass
+
+@bp.route("/logout", methods=("post",))
+def logout():
+    pass
+
+@app.route("/legacy", methods="GET,PUT")
+def legacy():
+    pass
+
+@app.route("/home")
+def home():
+    pass
+
+@app.post("/submit")
+def submit():
+    pass
+"""
+    assert _routes(code) == [
+        ("GET /home", "Flask"), ("GET /legacy", "Flask"), ("GET /login", "Flask"), ("POST /login", "Flask"),
+        ("POST /logout", "Flask"), ("POST /submit", "Flask"), ("PUT /legacy", "Flask"),
+    ]
+
+
+def test_routes_in_comments_and_docstrings_are_none():
+    code = '''
+"""Routes look like @app.get("/module-doc") and path("doc/", view)."""
+from fastapi import APIRouter
+
+router = APIRouter()
+
+# @router.get("/commented")
+
+@router.get("/real")
+def real():
+    """Unlike @router.post("/docstring"), which is an example."""
+    example = '@app.route("/in-a-string")'
+    return example
+
+# urlpatterns = [path("commented/", view)]
+'''
+    assert _routes(code) == [("GET /real", "FastAPI")]
+
+
+def test_framework_follows_the_app_or_router_binding():
+    code = """
+from fastapi import FastAPI
+from flask import Flask
+
+api = FastAPI()
+web = Flask(__name__)
+
+@api.get("/a")
+def a():
+    pass
+
+@web.get("/b")
+def b():
+    pass
+
+@api.api_route("/c", methods=["GET", "POST"])
+def c():
+    pass
+
+@cache.get("/not-a-route")
+def d():
+    pass
+"""
+    assert _routes(code) == [
+        ("GET /a", "FastAPI"), ("GET /b", "Flask"), ("GET /c", "FastAPI"), ("POST /c", "FastAPI"),
+    ]
+
+
+def test_a_handler_in_an_app_factory_is_owned_by_it():
+    code = """
+from flask import Flask
+
+def create_app():
+    app = Flask(__name__)
+
+    @app.route("/status")
+    def status():
+        return "ok"
+
+    return app
+"""
+    result = APIExtractor("repo").extract_from_source(code, "factory.py")
+    owned = [(r.target_name, r.to_owner) for r in result.relationships if r.to_file == "factory.py"]
+    assert owned == [("status", "create_app")]
+
+
+def test_django_views_by_name_and_class_but_not_include():
+    code = '''
+"""See path("docs/", views.nothing) in the docs."""
+from django.urls import include, path, re_path
+
+from . import views
+
+urlpatterns = [
+    path("users/", views.list_users),
+    re_path(r"^articles/$", views.ArticleView.as_view(), name="articles"),
+    path("api/", include("api.urls")),
+    # path("old/", views.old),
+]
+'''
+    result = APIExtractor("repo").extract_from_source(code, "urls.py")
+    assert sorted({(r.source_name, r.target_name) for r in result.relationships}) == [
+        ("* ^articles/$", "ArticleView"), ("* users/", "list_users"),
+    ]
+
+
+def test_concatenated_and_escaped_paths_are_their_values():
+    code = r'''
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/a"
+         "/b")
+def ab():
+    pass
+
+@app.get("/x\x2Fy")
+def escaped():
+    pass
+
+@app.get(r"/raw\d")
+def raw():
+    pass
+
+@app.get("/q" f"/{tail}")
+def interpolated():
+    pass
+'''
+    assert _routes(code) == [("GET /a/b", "FastAPI"), ("GET /raw\\d", "FastAPI"), ("GET /x/y", "FastAPI")]
+
+
+def test_a_deep_file_reads_without_recursion():
+    code = "from fastapi import FastAPI\napp = FastAPI()\nx = " + "+".join(["1"] * 3000) + (
+        "\n\n@app.get('/a')\ndef a():\n    pass\n"
+    )
+    assert _routes(code) == [("GET /a", "FastAPI")]
+
+
+def test_django_views_pin_to_the_module_they_are_imported_from():
+    code = '''
+from django.urls import path
+
+from . import views
+from app import api
+from .handlers import search
+
+urlpatterns = [
+    path("a/", views.show),
+    path("b/", api.list_items),
+    path("c/", search),
+    path("d/", unknown.view),
+    path("e/", local_view),
+]
+'''
+    result = APIExtractor("repo").extract_from_source(code, "shop/urls.py")
+    targets = sorted((r.source_name, r.target_name, r.to_file or "", r.to_owner) for r in result.relationships)
+    assert targets == [
+        ("* a/", "show", "", None), ("* a/", "show", "shop/views.py", ""),
+        ("* a/", "show", "shop/views/__init__.py", ""),
+        ("* b/", "list_items", "", None), ("* b/", "list_items", "app/api.py", ""),
+        ("* b/", "list_items", "app/api/__init__.py", ""), ("* b/", "list_items", "shop/app/api.py", ""),
+        ("* b/", "list_items", "shop/app/api/__init__.py", ""),
+        ("* c/", "search", "", None), ("* c/", "search", "shop/handlers.py", ""),
+        ("* c/", "search", "shop/handlers/__init__.py", ""),
+        # Read off nothing the file imports: the stub alone.
+        ("* d/", "view", "", None),
+        # A bare name nothing imports links every one of its name, as before.
+        ("* e/", "local_view", "", None),
+    ]

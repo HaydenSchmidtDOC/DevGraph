@@ -2,6 +2,7 @@
 
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from devgraph.analytics import insights
 from devgraph.analytics.insights import InsightsScheduler
@@ -27,17 +28,18 @@ class Engine:
 
     def __init__(self, computed_at=None, fail_read=()):
         self.computed_at = dict(computed_at or {})
+        self.fingerprint = {}
         self.fail_read = set(fail_read)
 
     def read_insights_summary(self, repo_id):
         if repo_id in self.fail_read:
             raise ConnectionError("neo4j down")
         at = self.computed_at.get(repo_id)
-        return None if at is None else {"computed_at": at}
+        return None if at is None else {"computed_at": at, "fingerprint": self.fingerprint.get(repo_id)}
 
 
 def fake_refresh(calls, result=True):
-    def refresh(engine, repo_id, *, blocking=True):
+    def refresh(engine, repo_id, *, blocking=True, unless_fingerprint=None):
         calls.append((repo_id, blocking))
         return {"computed_at": "x"} if result else None
 
@@ -106,3 +108,136 @@ def test_thread_keeps_running_through_failed_passes_and_stops():
     finally:
         scheduler.stop()
     assert not scheduler.running
+
+
+class Clock:
+    """A wall clock and a monotonic clock that move together."""
+
+    def __init__(self, start="2026-10-01T10:00:00+00:00"):
+        self.now = datetime.fromisoformat(start)
+        self.mono = 1000.0
+
+    def advance(self, seconds):
+        self.now += timedelta(seconds=seconds)
+        self.mono += seconds
+
+    def iso(self, offset=0.0):
+        return (self.now + timedelta(seconds=offset)).isoformat()
+
+
+class GraphRefresh:
+    """A refresh_insights stand-in over a 'graph' the test edits: it stores
+    the engine's computed_at and fingerprint, and answers unchanged when the
+    graph's fingerprint is the one it was given. `takes` seconds pass during
+    a run."""
+
+    def __init__(self, engine, clock, takes=0.0):
+        self.engine, self.clock, self.takes = engine, clock, takes
+        self.graph = "g1"
+        self.computes = []
+        self.checks = []
+
+    def __call__(self, engine, repo_id, *, blocking=True, unless_fingerprint=None):
+        started = self.clock.iso()
+        self.clock.advance(self.takes)
+        if unless_fingerprint == self.graph:
+            self.checks.append(repo_id)
+            return {"computed_at": started, "fingerprint": self.graph, "unchanged": True}
+        self.computes.append(repo_id)
+        self.engine.computed_at[repo_id] = started
+        self.engine.fingerprint[repo_id] = self.graph
+        return {"computed_at": started, "fingerprint": self.graph}
+
+
+def scheduler_for(monkeypatch, clock, takes=0.0, settle_s=60, max_lag_s=600):
+    engine = Engine()
+    repo = Repo("r", None)
+    refresh = GraphRefresh(engine, clock, takes)
+    monkeypatch.setattr(insights, "refresh_insights", refresh)
+    refreshed = []
+    scheduler = InsightsScheduler(
+        engine, Registry([repo]), on_refreshed=refreshed.append, settle_s=settle_s, max_lag_s=max_lag_s,
+        clock=lambda: clock.now, monotonic=lambda: clock.mono,
+    )
+    return scheduler, repo, refresh, refreshed
+
+
+def test_saves_in_quick_succession_cause_one_refresh_after_they_settle(monkeypatch):
+    clock = Clock()
+    scheduler, repo, refresh, refreshed = scheduler_for(monkeypatch, clock)
+    repo.last_indexed = clock.iso()
+    scheduler.run_once()  # never computed: backfilled at once
+    assert refresh.computes == ["r"]
+    for _ in range(5):  # a save every 10 s
+        clock.advance(10)
+        repo.last_indexed = clock.iso()
+        refresh.graph = f"g{clock.mono}"
+        assert scheduler.run_once() == []
+    clock.advance(59)
+    assert scheduler.run_once() == []
+    clock.advance(1)
+    assert scheduler.run_once() == ["r"]
+    assert refresh.computes == ["r", "r"]
+    assert refreshed == ["r", "r"]
+    assert scheduler.run_once() == []
+
+
+def test_continuous_edits_still_refresh_once_the_lag_reaches_the_maximum(monkeypatch):
+    clock = Clock()
+    scheduler, repo, refresh, _ = scheduler_for(monkeypatch, clock, max_lag_s=600)
+    repo.last_indexed = clock.iso()
+    scheduler.run_once()
+    runs = 0
+    for _ in range(130):  # a save every 10 s for 1,300 s, never settling
+        clock.advance(10)
+        repo.last_indexed = clock.iso()
+        refresh.graph = f"g{clock.mono}"
+        runs += len(scheduler.run_once())
+    assert runs == 2
+
+
+def test_a_save_that_changed_nothing_insights_read_is_checked_not_recomputed(monkeypatch):
+    clock = Clock()
+    scheduler, repo, refresh, refreshed = scheduler_for(monkeypatch, clock)
+    repo.last_indexed = clock.iso()
+    scheduler.run_once()
+    clock.advance(10)
+    repo.last_indexed = clock.iso()  # a comment edit: the graph is still g1
+    clock.advance(60)
+    assert scheduler.run_once() == []
+    assert refresh.computes == ["r"] and refresh.checks == ["r"]
+    assert refreshed == ["r"]  # no insights_refreshed for the check
+    # The check covers the save: nothing more until the next one.
+    clock.advance(600)
+    assert scheduler.run_once() == []
+    assert refresh.checks == ["r"]
+
+
+def test_a_slow_refresh_holds_off_the_next_for_a_multiple_of_its_duration(monkeypatch):
+    clock = Clock()
+    scheduler, repo, refresh, _ = scheduler_for(monkeypatch, clock, takes=30)
+    repo.last_indexed = clock.iso()
+    scheduler.run_once()
+    repo.last_indexed = clock.iso()
+    refresh.graph = "g2"
+    clock.advance(100)  # settled, but within 5 x 30 s of the last run's end
+    assert scheduler.run_once() == []
+    clock.advance(50)
+    assert scheduler.run_once() == ["r"]
+
+
+def test_the_stored_fingerprint_survives_a_restart(monkeypatch):
+    """A new scheduler (the agent restarted) checks against the fingerprint
+    the last refresh stored, so an unchanged graph is still not recomputed."""
+    clock = Clock()
+    scheduler, repo, refresh, _ = scheduler_for(monkeypatch, clock)
+    repo.last_indexed = clock.iso()
+    scheduler.run_once()
+    clock.advance(10)
+    repo.last_indexed = clock.iso()
+    clock.advance(60)
+    restarted = InsightsScheduler(
+        refresh.engine, Registry([repo]), clock=lambda: clock.now, monotonic=lambda: clock.mono,
+    )
+    assert restarted.run_once() == []
+    assert refresh.computes == ["r"] and refresh.checks == ["r"]

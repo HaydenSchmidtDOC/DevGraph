@@ -32,7 +32,14 @@ from watchdog.observers.api import ObservedWatch
 from devgraph.config import get_settings
 from devgraph.indexer.dispatch import is_ignored_path
 from devgraph.indexer.gitignore import GITIGNORE, is_gitignored
-from devgraph.indexer.walk import _junction_inside, indexable_paths_under, is_ignored_dir_name
+from devgraph.indexer.walk import (
+    _junction_inside,
+    forget_manifests,
+    indexable_paths_under,
+    is_build_manifest,
+    is_build_output,
+    is_ignored_dir_name,
+)
 from devgraph.registry.store import RepoRegistry, RepoRecord
 
 logger = logging.getLogger(__name__)
@@ -71,6 +78,10 @@ GIT_LOCK_WINDOW_S = 5.0
 #: sync already running. The timer threads are daemons, so a job slower than
 #: this (a hung database) cannot hold shutdown hostage.
 STOP_WAIT_S = 3.0
+
+#: How long `WatcherManager.yield_batch_lock` leaves the batch lock free: a
+#: thread already waiting for it wakes and takes it well within this.
+YIELD_S = 0.01
 
 #: `since` for the start catch-up of a repository never indexed: everything
 #: is due, and a missing or unstamped index format makes it a full scan.
@@ -386,6 +397,13 @@ class WatcherManager:
         # One per repo, created on demand and never dropped, so a handler
         # recreated by stop/start or refresh shares it with run_exclusive (W4).
         self._batch_locks: dict[str, threading.Lock] = {}
+        # The thread running a `run_exclusive` job, per repo, so only it
+        # yields that repo's lock (`yield_batch_lock`).
+        self._exclusive_owners: dict[str, int] = {}
+        # Repos whose git state sync is running (maybe yielding its lock),
+        # and those of them asked to run it again (`_sync_git_state`).
+        self._git_syncing: set[str] = set()
+        self._git_resync: set[str] = set()
         # Guards the reconcile bookkeeping below and _stopping. Handlers take
         # it (never _lock); it is never held while calling into an observer.
         self._reconcile_lock = threading.Lock()
@@ -481,11 +499,66 @@ class WatcherManager:
 
     def run_exclusive(self, repo_id: str, fn: Callable[[], Any]) -> Any:
         """Run `fn` under the repo's batch lock, so it never interleaves with
-        a live batch. `_lock` is held only to look the lock up."""
+        a live batch, unless it yields the lock (`yield_batch_lock`). `_lock`
+        is held only to look the lock up."""
         with self._lock:
             lock = self._batch_locks.setdefault(repo_id, threading.Lock())
         with lock:
-            return fn()
+            me = threading.get_ident()
+            self._exclusive_owners[repo_id] = me
+            try:
+                return fn()
+            finally:
+                if self._exclusive_owners.get(repo_id) == me:
+                    del self._exclusive_owners[repo_id]
+
+    def yield_batch_lock(self, repo_id: str) -> bool:
+        """From a long `run_exclusive` job of `repo_id` on this thread (a
+        first git-history sync): release the repo's batch lock for
+        YIELD_S, so the live batches and jobs waiting for it run, then take
+        it back. False once the watcher is stopping or the repository is no
+        longer watched or registered (a removal's purge may have run during
+        the yield): the job should end, as a job does that finds those when
+        it takes the lock. On a thread running no such job, nothing is
+        released."""
+        with self._lock:
+            lock = self._batch_locks.get(repo_id)
+        me = threading.get_ident()
+        if lock is not None and self._exclusive_owners.get(repo_id) == me:
+            del self._exclusive_owners[repo_id]
+            lock.release()
+            try:
+                time.sleep(YIELD_S)
+            finally:
+                lock.acquire()
+                self._exclusive_owners[repo_id] = me
+        return self._git_sync_wanted(repo_id)
+
+    def _git_sync_wanted(self, repo_id: str) -> bool:
+        """Whether a git-history sync of `repo_id` may write: the watcher is
+        not stopping and the repository is still watched and registered."""
+        return not (
+            self._catch_up_stopped or repo_id not in self._git_handlers or self._registry.get(repo_id) is None
+        )
+
+    def _sync_git_state(self, repo_id: str) -> None:
+        """`on_git_state_changed`, one at a time per repository: called while
+        one is yielding its lock (a catch-up that ran then), it asks that
+        one to run again once it ends, which then reads the commits made
+        meanwhile, instead of syncing the same history under it."""
+        if repo_id in self._git_syncing:
+            self._git_resync.add(repo_id)
+            return
+        self._git_syncing.add(repo_id)
+        try:
+            while self._git_sync_wanted(repo_id):
+                self._git_resync.discard(repo_id)
+                self._on_git_state_changed(repo_id)
+                if repo_id not in self._git_resync:
+                    return
+        finally:
+            self._git_syncing.discard(repo_id)
+            self._git_resync.discard(repo_id)
 
     def request_catch_up(self, repo_id: str, since: datetime, delay_s: float, reason: str = "retry") -> None:
         """Run `on_catch_up(repo_id, since)` in `delay_s`, under the repo's
@@ -545,7 +618,7 @@ class WatcherManager:
         """
         ok = self._on_catch_up(repo_id, since, reason)
         if ok is not False and self._on_git_state_changed is not None and repo_id in self._git_handlers:
-            self._on_git_state_changed(repo_id)
+            self._sync_git_state(repo_id)
 
     def _start_catch_up(self, repo_id: str, snapshot: datetime | None, index_if_never: bool = False) -> None:
         """The catch-up when watching starts, on its own thread (W5).
@@ -608,7 +681,7 @@ class WatcherManager:
             def run() -> None:
                 if self._catch_up_stopped or repo_id not in self._git_handlers or self._registry.get(repo_id) is None:
                     return  # stopped (or the repo unwatched or removed) while waiting for the lock
-                self._on_git_state_changed(repo_id)
+                self._sync_git_state(repo_id)
 
             self.run_exclusive(repo_id, run)
 
@@ -743,7 +816,7 @@ class WatcherManager:
                     # moves neither HEAD nor a branch), and a recursive one on
                     # .git/refs/heads. Remote-tracking refs and tags stay unwatched,
                     # so a background fetch triggers nothing. (The root watch
-                    # covers the same three, see inotify.ignored_folder_filter.)
+                    # covers the same three, see folder_filter.ignored_folder_filter.)
                     refs = git_dir / "refs"
                     if refs.is_dir():
                         observer.schedule(git_handler, str(refs), recursive=False)
@@ -877,7 +950,7 @@ class WatcherManager:
         resolved_root: Path | None = None
         with os.scandir(root) as entries:
             for entry in entries:
-                if is_ignored_dir_name(entry.name):
+                if is_ignored_dir_name(entry.name) or is_build_output(root, entry.name, True):
                     continue
                 try:
                     if not entry.is_dir(follow_symlinks=False):
@@ -1284,7 +1357,10 @@ class _RepoEventHandler(FileSystemEventHandler):
                 self._changed[key] = path
             self._folder_events.update(folders or {})
             self._reset_debounce()
-        if self._request_rewatch is not None and any(p.name == GITIGNORE for p in changed + deleted):
+        manifests = any(is_build_manifest(p.name) for p in changed + deleted)
+        if manifests:
+            forget_manifests()  # before anything asks again whether a build output folder is ignored
+        if self._request_rewatch is not None and (manifests or any(p.name == GITIGNORE for p in changed + deleted)):
             self._request_rewatch(self._repo_id)
 
     def _has_deleted_ancestor(self, path: Path) -> bool:
@@ -1387,7 +1463,7 @@ class _RepoEventHandler(FileSystemEventHandler):
         inside the repository, not the root itself, and not ignored (by name
         or by a .gitignore, as the walk ignores it)."""
         rel = self._rel(raw)
-        if rel is None or not rel.parts or is_ignored_path(rel):
+        if rel is None or not rel.parts or is_ignored_path(rel, self._repo_root):
             return None
         # A .gitignore passes even when it ignores itself (its change is what
         # makes RepoSync catch up), unless its folder is ignored, as a tool

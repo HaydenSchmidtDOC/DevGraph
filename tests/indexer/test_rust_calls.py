@@ -23,6 +23,7 @@ from devgraph.indexer.common import best_pin
 from devgraph.indexer.dispatch import full_scan, index_paths, sync_resolver_config
 from devgraph.indexer.resolver_config import ResolverConfig, fingerprints
 from devgraph.indexer.rust.extractor import extract_rust_file
+from tests.helpers import stub
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 WORKSPACE = {
@@ -377,7 +378,7 @@ def test_the_cargo_fingerprint_follows_only_crate_names(tmp_path):
     assert ResolverConfig(tmp_path).rust_crates() == {"shop_app": ["crates/app/src/lib.rs"]}
 
 
-def test_reexports_are_read_from_a_files_top_level():
+def test_reexports_are_read_from_a_files_top_level_and_inline_modules():
     from devgraph.indexer.rust.extractor import reexports
 
     source = textwrap.dedent("""\
@@ -389,13 +390,16 @@ def test_reexports_are_read_from_a_files_top_level():
         pub use m::User;
         use net::Hidden;
         pub use std::fmt::Display;
-        mod inner { pub use super::net::Inner; }
+        mod inner { mod deep; use crate::models as m; pub use super::net::Inner; pub use deep::f; pub use m::Order; }
         """)
     assert reexports(source) == [
         ["*", ["self", "util", "text"]],
         ["Client", ["self", "net", "Client"]],
         ["Display", ["std", "fmt", "Display"]],
+        ["Inner", ["super", "net", "Inner"], "inner"],
+        ["Order", ["crate", "models", "Order"], "inner"],
         ["User", ["crate", "models", "User"]],
+        ["f", ["self", "deep", "f"], "inner"],
         ["fmt", ["self", "util", "money", "format"]],
     ]
     assert reexports("pub fn use_it() {}\nuse a::b;\n") == []
@@ -474,6 +478,48 @@ def test_a_named_reexport_keeps_its_module_beside_that_modules_glob(tmp_path):
         "crates/core/src/lib.rs": "resolved", "crates/core/src/util.rs": "resolved",
         "crates/core/src/deep.rs": "package",
     }
+
+
+def test_a_reexported_module_is_followed_through_a_path(tmp_path):
+    """lib.rs `pub use net::client;`: `shop_core::client::fetch()` and
+    `use shop_core::client;` then `client::fetch()` reach net/client.rs, as
+    `crate::client::fetch()` does inside the crate, and the use imports it."""
+    files = {
+        **WORKSPACE,
+        "crates/core/src/lib.rs": "pub mod net;\npub use net::client;\n",
+        "crates/core/src/net/mod.rs": "pub mod client;\n",
+        "crates/core/src/net/client.rs": "pub fn fetch() {}\n",
+    }
+    config = _config(tmp_path, files)
+    paths = [rel for rel in files if rel.endswith(".rs")]
+    client = {"crates/core/src/net/client.rs": "resolved"}
+    found = reached("fn main() { shop_core::client::fetch(); }\n", "crates/app/src/main.rs", "main", "fetch", paths,
+                    config)
+    assert found == client
+    source = "use shop_core::client;\n\nfn main() { client::fetch(); }\n"
+    assert reached(source, "crates/app/src/main.rs", "main", "fetch", paths, config) == client
+    assert "crates/core/src/net/client.rs" in imported(source, "crates/app/src/main.rs", paths, config)
+    inside = "pub fn run() { crate::client::fetch(); }\n"
+    assert reached(inside, "crates/core/src/run.rs", "run", "fetch", paths, config) == client
+
+
+def test_an_inline_modules_reexport_is_followed(tmp_path):
+    """`mod api { pub use crate::net::fetch; }` in lib.rs: `api::fetch()` in
+    lib.rs and `shop_core::api::fetch()` from another crate reach net.rs."""
+    files = {
+        **WORKSPACE,
+        "crates/core/src/lib.rs": "pub mod net;\npub mod api { pub use crate::net::fetch; }\n\n"
+                                  "pub fn run() { api::fetch(); }\n",
+        "crates/core/src/net.rs": "pub fn fetch() {}\n",
+    }
+    config = _config(tmp_path, files)
+    paths = [rel for rel in files if rel.endswith(".rs")]
+    net = {"crates/core/src/net.rs": "resolved"}
+    lib = "crates/core/src/lib.rs"
+    assert reached(files[lib], lib, "run", "fetch", paths, config) == {lib: "resolved", **net}
+    found = reached("fn main() { shop_core::api::fetch(); }\n", "crates/app/src/main.rs", "main", "fetch", paths,
+                    config)
+    assert found == net
 
 
 def test_a_glob_reexport_ranks_below_the_reexporting_modules_own_items(tmp_path):
@@ -665,7 +711,7 @@ def test_the_index_upgrade_replaces_bare_rust_csharp_and_cpp_calls(engine, repo_
 
     with monkeypatch.context() as patched:
         for name in ("extract_rust_file", "extract_csharp_file", "extract_cpp_file"):
-            patched.setattr(dispatch, name, old(getattr(dispatch, name)))
+            stub(patched, dispatch, name, old(getattr(dispatch, name)))
         provision_repository_schema(engine, tmp_path)
         engine.upsert_repository(repo_id, repo_id, str(tmp_path))
         full_scan(engine, repo_id, tmp_path)

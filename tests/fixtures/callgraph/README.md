@@ -1,8 +1,9 @@
 # Call-graph ground-truth fixtures
 
-One small, realistic project per language (`ts`, `react`, `go`, `java`,
-`kotlin`, `csharp`, `rust`, `cpp`; `react` is a React app whose JSX renders
-are its calls), each with an `expected.json` that says which calls
+One small, realistic project per language (`ts`, `tsmono`, `react`, `go`,
+`java`, `kotlin`, `csharp`, `rust`, `cpp`; `tsmono` is an npm-workspaces
+monorepo whose packages import each other by name, `react` is a React app
+whose JSX renders are its calls), each with an `expected.json` that says which calls
 and imports the language itself binds. The truth was written from each
 language's own name-resolution rules (compiler, linker, runtime), not from
 DevGraph's resolver, so it can be used to measure that resolver.
@@ -55,7 +56,8 @@ repository root).
 
 Not listed anywhere: constructor invocations (`new T()`, `T()` in Kotlin,
 struct literals), intrinsic JSX tags (`<div>`; a component's tag, `<Button />`,
-renders it and is a call), function values passed without being called, calls inside anonymous lambdas/closures, and module-level code outside
+renders it and is a call, from the named function holding it even inside
+an anonymous callback), function values passed without being called, calls inside anonymous lambdas/closures, and module-level code outside
 any function.
 
 ## Using a fixture

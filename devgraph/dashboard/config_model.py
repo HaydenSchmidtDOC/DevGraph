@@ -19,7 +19,7 @@ from devgraph.config.project_schema import SCHEMA_FILENAME
 from devgraph.config.project_tools import TOOLS_FILENAME, ProjectToolsError, parse_project_tools
 from devgraph.config.project_trust import trust_command, untrusted_reason
 from devgraph.config.settings import get_settings
-from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+from devgraph.graph.schema import BUILTIN_LABELS, RELATIONSHIP_TYPES
 from devgraph.mcp.catalog import TOOL_CATALOG, builtin_tool_names, scoped_tool_id
 
 GLOBAL_SCOPE = "__global__"
@@ -165,7 +165,7 @@ def build_global(records: list[Any], resolutions: dict[str, Any] | None = None) 
             if origin == "project (overrides global)":
                 overridden.setdefault(name, []).append(repo_id)
     return {
-        "node_types": [{"label": label, "locked": True} for label in NODE_LABELS],
+        "node_types": [{"label": label, "locked": True} for label in BUILTIN_LABELS],
         "relationship_types": [{"type": rel, "locked": True} for rel in RELATIONSHIP_TYPES],
         "tools": {
             "file": GLOBAL_TOOLS_FILENAME,

@@ -378,37 +378,45 @@ _PUB_USE = re.compile(rb"\bpub\b[^;{}]*?\buse\b")
 
 
 def reexports(text: str) -> list[list]:
-    """A file's module-level re-exports (`pub use`, `pub(crate) use`, ...)
-    as sorted `[name, path segments]` pairs, `name` the name bound (an
-    alias's) or "*" for a glob. A path's head is read in the file: a
-    module it declares (`mod net;`) becomes `self::net`, and a name a
-    module-level `use` binds is replaced by that use's path, so the path
-    means the same from any file (`resolver_config`'s Rust input). Empty
-    when the file re-exports nothing."""
+    """A file's re-exports (`pub use`, `pub(crate) use`, ...), at its top
+    level and in its inline modules, as sorted `[name, path segments]`
+    pairs (`[name, path segments, inline module]` in an inline `mod a { mod
+    b { ... } }`, the module `a::b`), `name` the name bound (an alias's) or
+    "*" for a glob. A path's head is read in its own module: a module it
+    declares (`mod net;`) becomes `self::net`, and a name a `use` of that
+    module binds is replaced by that use's path, so the path means the same
+    from any file (`resolver_config`'s Rust input). Empty when the file
+    re-exports nothing."""
     source = text.encode("utf-8")
     if not _PUB_USE.search(source):
         return []
-    mods: set[str] = set()
-    bindings: dict[str, list[str]] = {}
-    exported: list[tuple[str, list[str]]] = []
-    for child in _make_parser().parse(source).root_node.named_children:
-        if child.type == "mod_item" and (name := child.child_by_field_name("name")) is not None:
-            mods.add(_text(name, source))
-        elif child.type == "use_declaration" and (argument := child.child_by_field_name("argument")) is not None:
-            public = any(c.type == "visibility_modifier" for c in child.children)
-            for segs, binding, glob in _use_tree(argument, source, []):
-                if not glob and binding and binding != "_":
-                    bindings[binding] = segs
-                if public and (glob or (binding and binding != "_")):
-                    exported.append(("*" if glob else binding, segs))
     found = []
-    for name, segs in exported:
-        head = segs[0] if segs else ""
-        if head in mods:
-            segs = ["self", *segs]
-        elif head in bindings and bindings[head] != segs and head not in ("crate", "self", "super"):
-            segs = bindings[head] + segs[1:]
-        found.append([name, segs])
+
+    def scope(node: Node, inline: tuple[str, ...]) -> None:
+        mods: set[str] = set()
+        bindings: dict[str, list[str]] = {}
+        exported: list[tuple[str, list[str]]] = []
+        for child in node.named_children:
+            if child.type == "mod_item" and (name := child.child_by_field_name("name")) is not None:
+                mods.add(_text(name, source))
+                if (body := child.child_by_field_name("body")) is not None:
+                    scope(body, (*inline, _text(name, source)))
+            elif child.type == "use_declaration" and (argument := child.child_by_field_name("argument")) is not None:
+                public = any(c.type == "visibility_modifier" for c in child.children)
+                for segs, binding, glob in _use_tree(argument, source, []):
+                    if not glob and binding and binding != "_":
+                        bindings[binding] = segs
+                    if public and (glob or (binding and binding != "_")):
+                        exported.append(("*" if glob else binding, segs))
+        for name, segs in exported:
+            head = segs[0] if segs else ""
+            if head in mods:
+                segs = ["self", *segs]
+            elif head in bindings and bindings[head] != segs and head not in ("crate", "self", "super"):
+                segs = bindings[head] + segs[1:]
+            found.append([name, segs, "::".join(inline)] if inline else [name, segs])
+
+    scope(_make_parser().parse(source).root_node, ())
     return sorted(found)
 
 
@@ -656,18 +664,13 @@ class _RustResolver:
         which this file cannot see: whatever a glob reaches is linked at
         package confidence (`_loose`), below the re-exporting module's own
         files. Empty when `module` re-exports no such name (resolver
-        configuration: `ResolverConfig.rust_reexports`). An inline module
-        of this file re-exports nothing: only a file's top level is read."""
-        if (module, name) in seen or len(seen) > 8 or (
-            not module.crate.cross and module.crate.root == self.crate.root and module.path in self.inline
-            and module.path != self.module
-        ):
+        configuration: `ResolverConfig.rust_reexports`)."""
+        if (module, name) in seen or len(seen) > 8:
             return []
         seen = seen | {(module, name)}
         found: list[tuple[_Module, str, bool]] = []
-        for file in self.files(module):
-            entries = self.reexports.get(file, [])
-            # A name the file re-exports by name hides its globs' (Rust's rule).
+        for entries in self._reexport_entries(module):
+            # A name the module re-exports by name hides its globs' (Rust's rule).
             named = any(bound == name for bound, _segs in entries)
             for bound, segs in entries:
                 if bound != name and (named or bound != "*"):
@@ -687,19 +690,55 @@ class _RustResolver:
                 found += self.reexported(target, item, seen, reached)
         return list(dict.fromkeys(found))
 
+    def _reexport_entries(self, module: _Module) -> list[list[tuple[str, list[str]]]]:
+        """The re-exports of `module`, per file it can be (`reexports`): a
+        file's top-level ones, or an inline module's of the file holding
+        it (`a::inner` is `mod inner { ... }` in a file of `a`)."""
+        found = []
+        for depth in range(len(module.path), -1, -1):
+            head, inner = _Module(module.crate, module.path[:depth]), "::".join(module.path[depth:])
+            if self._own_inline(head) and head.path != self.module:
+                continue  # one of this file's inline modules: read from the file's own module
+            for file in self.files(head):
+                entries = [
+                    (each[0], each[1]) for each in self.reexports.get(file, [])
+                    if (each[2] if len(each) > 2 else "") == inner
+                ]
+                if entries:
+                    found.append(entries)
+        return found
+
+    def _own_inline(self, module: _Module) -> bool:
+        """Whether `module` is this file's own module or one of its inline modules."""
+        return not module.crate.cross and module.crate.root == self.crate.root and module.path in self.inline
+
     def _reexport_pins(self, target: _Module, glob: bool) -> list[str]:
         """The pins of a module a re-export reaches (`reexported`): its
         own, at package confidence when a glob reached it (`_loose`)."""
         found = self.pins(target)
         return _loose(found) if glob else found
 
-    def _walk(self, start: tuple[_Module, list[str]]) -> tuple[_Module, list[str]]:
-        """Follow lowercase segments as modules down to the last one or a
-        type: (the module, what is left: [item], [Type, item...] or [])."""
-        module, rest = start
-        while len(rest) > 1 and not _uppercase(rest[0]):
-            module, rest = _Module(module.crate, module.path + (rest[0],)), rest[1:]
-        return module, rest
+    def _walk(self, start: tuple[_Module, list[str]], types: bool = False) -> list[tuple[_Module, list[str], bool]]:
+        """Follow lowercase segments (any segment but the last, with
+        `types`) as modules down to the last one or a type: each (module,
+        what is left: [item], [Type, item...] or []). A segment is the
+        child module of its name and, when the module re-exports a module
+        of the name by name (`pub use a::b;`, then `crate::b::f()`;
+        `reexported`), that module too, the first one found first. A glob
+        is not followed for a module: every path through its module would
+        reach its whole tree too."""
+        found, pending = [], [start]
+        while pending:
+            module, rest = pending.pop(0)
+            if len(rest) > 1 and (types or not _uppercase(rest[0])):
+                pending.append((_Module(module.crate, module.path + (rest[0],)), rest[1:]))
+                pending += [
+                    (_Module(target.crate, target.path + (item,)), rest[1:])
+                    for target, item, reached in self.reexported(module, rest[0]) if not reached
+                ]
+            elif (module, rest) not in found:
+                found.append((module, rest))
+        return found
 
     def _item_pins(self, module: _Module, item: str) -> list[str]:
         """The pins of `item` reached through `module`: the module's, then
@@ -728,23 +767,25 @@ class _RustResolver:
                 len(segs) == 1 or len(segs) == 2 and _uppercase(segs[0])
             ) else None
             return [(name, pins)] if pins else None
-        module, rest = self._walk(start)
-        if not rest:
-            return None
-        # A function bound or re-exported under another name (`use a::f as
-        # g;`, `pub use a::f as g;`) is called by its own.
-        found = {rest[-1]: self.pins(module)}
-        for target, item, glob in self.reexported(module, rest[0]):
-            callee = item if len(rest) == 1 else rest[-1]
-            pins = self._reexport_pins(target, glob)
-            if len(rest) == 2:
-                # `Client::new()`: an associated function of the type as its
-                # module calls it, so a module the re-export passes through
-                # links its own `Pool::new` no more than the definer does.
-                pins = [owned_pin(pin, item) for pin in pins]
-            found.setdefault(callee, [])
-            found[callee] += [pin for pin in pins if pin not in found[callee]]
-        return list(found.items())
+        found: dict[str, list[str]] = {}
+        for module, rest in self._walk(start):
+            if not rest:
+                continue
+            # A function bound or re-exported under another name (`use a::f as
+            # g;`, `pub use a::f as g;`) is called by its own.
+            found.setdefault(rest[-1], [])
+            found[rest[-1]] += [pin for pin in self.pins(module) if pin not in found[rest[-1]]]
+            for target, item, glob in self.reexported(module, rest[0]):
+                callee = item if len(rest) == 1 else rest[-1]
+                pins = self._reexport_pins(target, glob)
+                if len(rest) == 2:
+                    # `Client::new()`: an associated function of the type as its
+                    # module calls it, so a module the re-export passes through
+                    # links its own `Pool::new` no more than the definer does.
+                    pins = [owned_pin(pin, item) for pin in pins]
+                found.setdefault(callee, [])
+                found[callee] += [pin for pin in pins if pin not in found[callee]]
+        return list(found.items()) or None
 
     def _glob_pins(self, scope: tuple, item: str) -> list[str] | None:
         """The pins of `item` (a function or type nothing else binds)
@@ -775,10 +816,10 @@ class _RustResolver:
         start = self._start(segs, scope)
         if start is None:
             return self._glob_pins(scope, segs[0]) if len(segs) == 1 and unbound else None
-        module, rest = start
-        while len(rest) > 1:
-            module, rest = _Module(module.crate, module.path + (rest[0],)), rest[1:]
-        return self._item_pins(module, rest[0]) if rest else None
+        found = []
+        for module, rest in self._walk(start, types=True):
+            found += [pin for pin in (self._item_pins(module, rest[0]) if rest else []) if pin not in found]
+        return found or None
 
     # --- types ---------------------------------------------------------------------
 
@@ -825,29 +866,29 @@ class _RustResolver:
             start = self._start(segs, scope)
             if start is None:
                 continue
-            module, rest = start
             if glob:
+                module, rest = start
                 modules.append(_Module(module.crate, module.path + tuple(rest)))
                 continue
-            while len(rest) > 1 and not _uppercase(rest[0]):
-                module, rest = _Module(module.crate, module.path + (rest[0],)), rest[1:]
-            if not rest or rest[0] == "self":
-                modules.append(module)
-                continue
-            # A re-exported item: the module defining it too (not one that
-            # only re-exports it by name in turn).
-            modules += [
-                target for target, item, _glob in self.reexported(module, rest[0])
-                if not any(bound == item for each in self.files(target) for bound, _segs in self.reexports.get(each, []))
-            ]
-            if _uppercase(rest[0]):
-                modules.append(module)
-                continue
-            as_module, as_call = self._used_as(binding or rest[0])
-            if as_module or not as_call:
-                modules.append(_Module(module.crate, module.path + (rest[0],)))
-            if as_call or not as_module:
-                modules.append(module)
+            for module, rest in self._walk(start):
+                if not rest or rest[0] == "self":
+                    modules.append(module)
+                    continue
+                upper = _uppercase(rest[0])
+                as_module, as_call = (False, True) if upper else self._used_as(binding or rest[0])
+                # A re-exported item: the module defining it too (not one that
+                # only re-exports it by name in turn), or the module it is.
+                for target, item, _glob in self.reexported(module, rest[0]):
+                    if any(bound == item for entries in self._reexport_entries(target) for bound, _segs in entries):
+                        continue
+                    if as_call or not as_module:
+                        modules.append(target)
+                    if as_module or not as_call:
+                        modules.append(_Module(target.crate, target.path + (item,)))
+                if as_module or not as_call:
+                    modules.append(_Module(module.crate, module.path + (rest[0],)))
+                if as_call or not as_module:
+                    modules.append(module)
         files: set[str] = set()
         pins: set[str] = set()
         for module in modules:

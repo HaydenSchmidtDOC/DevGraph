@@ -1,5 +1,6 @@
 import { useCart } from '../hooks/useCart';
 import { Button, Card } from '../components';
+import { Badge, Field } from '../components/Badge';
 
 export function CartPage() {
   const { total } = useCart();
@@ -7,6 +8,8 @@ export function CartPage() {
     <>
       <Card title={total} />
       <Button label="pay" />
+      <Badge text={total} />
+      <Field name="coupon" />
     </>
   );
 }

@@ -50,9 +50,22 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   `baseUrl` resolve against the config that defines them; `paths` win over
   `baseUrl`. A config under a path the walk ignores (a `.gitignore`, a
   `node_modules`) is treated as absent.
+- **JS/TS workspace packages** (index format 17, audit 5 item 3). The
+  repository root's `package.json` `workspaces` (an array, or Yarn's
+  `{"packages": [...]}`) and `pnpm-workspace.yaml` `packages` are globs of
+  package directories (`packages/*`, `apps/**`, a literal path; a `!` one
+  excludes; a symlinked, ignored or gitignored directory is never
+  entered); each matched directory whose `package.json` has a `name` is
+  that package (`ResolverConfig.js_workspaces`; two directories may share
+  a name and both count). A nested `package.json`'s own `workspaces`, and
+  a `package.json` under no glob, declare nothing.
 - **Fingerprint.** Per language, a hash of the relevant content of every
   configuration file the walk finds (for TS: `baseUrl`, `paths`, `extends`,
-  `references`, with every config those reach, whatever its name; for Go:
+  `references`, with every config those reach, whatever its name, and the
+  root `package.json`'s and `pnpm-workspace.yaml`'s workspace globs and
+  each workspace package's `package.json` `name`, `exports`, `types`,
+  `module` and `main`, only those present being inputs, since one created
+  later is configuration by its name; for Go:
   each go.mod's `module` line and each go.work; for Rust: each Cargo.toml's
   library crate name and root file; for C#: see below; a compiler flag, a
   `require` bump or a dependency or version change never counts), stored on
@@ -103,8 +116,24 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   `Core/Core.csproj`. Nothing is evaluated: an `<Import>` is not
   followed, an item under a `Condition` counts as if the condition held,
   and a name or path holding `$(`, `@(`, `%(` or a wildcard (`*`, `?`) is
-  left out (a `$(MSBuildThisFileDirectory)` reference too). `ImplicitUsings` (only `System.*` and
-  `Microsoft.*`) and `RootNamespace` are not read.
+  left out (a `$(MSBuildThisFileDirectory)` reference too). `RootNamespace`
+  is not read. `ImplicitUsings` is (index format 18): when the last
+  `<ImplicitUsings>` of the nearest Directory.Build.props, the project
+  file and the nearest Directory.Build.targets (MSBuild reads every
+  property before any item) is `enable` or `true`, the global usings the
+  project file's `Sdk` implies come before its `<Using>` items, so a
+  `<Using Remove>` removes one: Microsoft.NET.Sdk's `System`,
+  `System.Collections.Generic`, `System.IO`, `System.Linq`,
+  `System.Net.Http`, `System.Threading` and `System.Threading.Tasks`
+  (Microsoft.NET.Sdk.Razor's the same); Microsoft.NET.Sdk.BlazorWebAssembly
+  adds `System.Net.Http.Json`,
+  `Microsoft.AspNetCore.Components.WebAssembly.Hosting`,
+  `Microsoft.Extensions.Configuration`, `.DependencyInjection` and
+  `.Logging`; Microsoft.NET.Sdk.Worker adds `Microsoft.Extensions.Configuration`,
+  `.DependencyInjection`, `.Hosting` and `.Logging`; Microsoft.NET.Sdk.Web
+  those and `System.Net.Http.Json` and `Microsoft.AspNetCore.Builder`,
+  `.Hosting`, `.Http` and `.Routing`. Another SDK adds none (WindowsDesktop's
+  depend on `UseWPF`/`UseWindowsForms`, not read).
   A file's *head* is read from its start, at most its first 32 KiB, for as
   long as it holds only whitespace, comments, preprocessor lines (`#if`,
   `#region`, `#nullable`, ...), `extern alias` and using directives, global
@@ -127,10 +156,12 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   as usings of the file (see the C# section); the legacy
   `csharp/extractor.py` indexing entry point reads the repository's
   projects too, and `symbols.EXTRACTORS` needs none (it keeps nodes only,
-  whose match keys come from the file's text). `ImplicitUsings` stays
-  unread: it adds only `System.*` and `Microsoft.*` namespaces, which hold
-  no repository type (if it is ever read, it is one more `<PropertyGroup>`
-  input of the digest).
+  whose match keys come from the file's text). Each project and
+  Directory.Build file's `Sdk` and `ImplicitUsings` are inputs of the
+  digest too. The implicit usings are `System.*` and `Microsoft.*`
+  namespaces, left out at a site unless its own namespace is under the
+  same root (see the C# section), so they matter mostly in the
+  framework's own repositories.
 
 Fresh is then extract(text, configuration), and an incremental run re-extracts
 every dependent when the configuration changes.
@@ -182,8 +213,10 @@ agree):
   `engine.write_match_keys` writes every changed node's keys (removing them from one written
   without any), a few hundred nodes per transaction, before pass 2 tests
   them. A kept node whose keys match differently (no keys and none, `[]`,
-  match alike) loses its incoming `CALLS` and `IMPORTS` edges (the types a
-  resolver writes `@` pins on, whatever pin or bare name wrote them) in
+  match alike) loses its incoming `CALLS`, `IMPORTS` and (since index
+  format 18, whose heir keys an owned route handler can match)
+  `IMPLEMENTS` edges (the types a resolver writes `@` pins or owned ends
+  on, whatever pin or bare name wrote them) in
   the same transaction and is marked `mkeys_stale`. Pass 2 writes the
   batch's edges again, and the relink writes other files' again under the
   new keys, as for an added node; then the mark goes. A batch that fails
@@ -252,7 +285,31 @@ specifier also names the `.ts`/`.tsx` source), plus the recursive prefix of
 its directory form, so a barrel re-export reaches the defining file at package
 confidence (never the repository root as a prefix). An aliased specifier
 resolves through the file's tsconfig (`paths` first, then `baseUrl`) to the
-same candidates. Any other bare specifier (`react`, `lodash`) is external: no
+same candidates. A bare specifier naming a workspace package (the longest
+package name it equals or starts with followed by `/`;
+`ResolverConfig.workspace_import`) resolves after `paths` and before
+`baseUrl` (TypeScript tries `node_modules`, where the package is linked,
+when a `baseUrl` lookup fails; not checking the disk, the package goes
+first): the package itself to every target of its `exports` `"."` entry
+(a string, or the conditions `types`, `import`, `module`, `default`,
+`require`, `node`, then any other, nested, an array's in order), else to
+its `types`, `module` and `main` and `src/index` (and `index` when it
+declares none of them); a subpath (`@acme/utils/fmt`) to its exact
+`exports` key's targets or the longest single-`*` pattern's, else to that
+path in the package. A `null` target blocks the specifier: nothing links,
+not even the directory. A target under `dist/`, `lib/` or `build/` is also
+tried as the same path under `src/` (a `.d.ts` dropped), the common
+TypeScript layout whose build output is not in the repository. Every
+candidate is offered and only existing files link: the disk is never
+checked, so the result depends on the configuration alone and a source file
+created later is relinked like any target. Each names the same candidates
+as a relative specifier (`.js` mapped to its source), and the binding is
+also pinned to the package directory as a prefix, so a name the entry
+point re-exports reaches its defining file at package confidence. A batch
+takes the workspace packages from its fingerprint's inputs (the
+`package.json` files besides the root's are exactly the workspace
+packages'), so only a fingerprint globs the directories.
+Any other bare specifier (`react`, `lodash`) is external: no
 `IMPORTS` edge (the old `node_modules/<name>` guess never matched, the walk
 skipping `node_modules`), and a call through its binding links nothing.
 
@@ -275,7 +332,10 @@ Tiers, first match wins:
    `export` or `require`), whose top-level declarations are globals (browser
    globals such as `fetch` excepted).
 
-A parameter shadows an import of its name, as in Python. Calls inside an
+A typed receiver's or `T.f()`'s method in another file is T's member
+there, its own or one it inherits from a class of that file (index format
+18; heir keys, graph-accuracy spec O3 (c)), so `u: User; u.save()` no
+longer links `Order.save` beside it. A parameter shadows an import of its name, as in Python. Calls inside an
 anonymous function (a callback, an IIFE) are still not attributed to anyone.
 
 **JSX** (index format 16, audit 5 item 4). An opening or self-closing JSX
@@ -285,16 +345,85 @@ name, in `.jsx`, `.tsx` and `.js` files alike, resolved by the tiers above
 (the file's own, an import with a barrel's prefix, a namespace member). A
 tag nothing resolves (a parameter `<Slot />`, an external package's
 `<Link />`, `<this.Foo />`) links nothing: no bare-name row. An intrinsic
-tag (`<div>`, `<svg:rect>`) and a fragment are no calls. Limits: an
-element inside an anonymous arrow (`items.map(i => <Row />)`, an inline
-render prop, a `useCallback` body) is attributed to no one, as calls there
-are not, so a list's row component has no caller; a class component
-(`class Modal extends React.Component`) is a Class, which no `CALLS` row
-reaches, so rendering one adds no edge (its methods' own calls are kept);
-a component made by a call (`React.memo(...)`, `forwardRef(...)`,
-`styled.div`) has no Function node, so its renders link nothing. The ts fixture's two renders link (precision unchanged at
+tag (`<div>`, `<svg:rect>`) and a fragment are no calls. The ts fixture's two renders link (precision unchanged at
 100 %), and a React fixture (`tests/fixtures/callgraph/react`) goes from
 2 of 16 calls to 16 of 16, linked precision 100 %.
+
+Since index format 18:
+
+- An element inside an anonymous function (`items.map(i => <Row />)`, an
+  inline render prop, a `useCallback` body, nested ones) renders from the
+  named function holding it (`_call_functions`), unless its tag names a
+  parameter of a callback holding it (`items.map(Comp => <Comp />)`).
+  Calls there are still attributed to no one. A function is named when
+  it is a declarator's or a class field's value (`_named_function`); its
+  elements are its own.
+- A class component (`class Modal extends React.Component`) renders
+  through the `render` it owns: a component tag is also a call of
+  `render` owned by the class (`render_pins`), as `this.render()` in the
+  class would be for a class of the file, and as a member of an imported
+  class for an import (a named import's owner its name, a namespace
+  member's its member, a default import's the default-exported class,
+  heir keys reaching an inherited `render`); an owner-less pin (a
+  `require`, a barrel's prefix) is left out, as it would link every
+  `render` there. A function component of the file adds no such row; an
+  imported one's links nothing, owning no `render`. A function's
+  destructured parameters (not a default value's names) and its locals
+  bound to anything but a function (`const Widget = pick()`) shadow an
+  import or class of their name, for a tag and a call alike: a `const`
+  or `let` only inside its block (a `for (const W of ...)` head and a
+  `catch (W)` parameter inside theirs), a `var` throughout.
+- A component made by a wrapper is a Function of the declarator's name:
+  `memo(fn)`, `forwardRef(fn)` (`React.` ones, nested) of the wrapped
+  function's body, and a styled component (`styled.div`...``,
+  `styled(Button)`...``) with no body (`_function_value`).
+
+The React fixture, extended with a list callback's and a render prop's
+elements, a class component, and memo, forwardRef and styled components,
+goes from 16 of 23 calls to 23 of 23, linked precision 100 %.
+
+**Definitions beyond declarations** (index format 19, audit 7 item 6).
+Only class and function declarations and `const x = <function>` were
+Functions, so service objects, CommonJS handlers and functions declared in
+a block had no node and their calls were attributed to no one (an
+`export const` that defined no function even lost its module-level calls).
+
+- **Object literals.** A *defined* object literal (`_object_path`: a
+  declarator's value, `exports.x = {...}`, `module.exports = {...}`, an
+  object-valued property of one, through `( )`, `as` and `satisfies`)
+  makes a Function of each method (`async getUser() {}`, getters too) and
+  each function-valued property (`deleteUser: async () => ...`, through a
+  component wrapper), owned by the binding's name below the scope's own
+  owner (`userService`, `userService.admin`, `outer.local` in a function
+  `outer`; `module.exports`'s are top-level, owner "", or `exports`
+  (`EXPORTS_OWNER`) when a top-level function of the file has the name,
+  so `function create() {}` and `module.exports.create = function ...`
+  are two nodes, never one), with `CONTAINS`
+  from the scope. An object passed as an argument or returned defines
+  nothing. Its other properties' calls are the scope's.
+- **CommonJS exports.** At the module's top level, `exports.x = <function>`
+  and `module.exports.x = <function>` are a top-level Function `x` (owned
+  by `exports` when a top-level function of the file is named `x`).
+- **Blocks.** A definition inside `if`/`else`, `try`/`catch`/`finally`, a
+  loop, `switch` or a labelled statement (`_compound_statements`) is its
+  scope's own, at the module and in a function, as a direct one is. Two
+  definitions of one name in one scope are one node, the first
+  (`common.merge_same_nodes`, as in Python).
+- **Calls to them.** `userService.getUser()` on a module-level object
+  binding of the file, and `exports.handler()`/`module.exports.handler()`,
+  are pinned to the file and the member's owner, when the object (or the
+  exports) define that member; any other member (a shorthand `{ helper }`)
+  links as before. From another file the import binding's tiers apply:
+  a named import's or a `require`'s files, any member of the name there
+  (an import names no owner: an instance of a class bound to the same
+  name owns its members through its class). `this.m()` in an object
+  literal's method is a by-name call. `_named_function` treats exactly
+  these values as Functions, so the walk of the enclosing scope leaves
+  them out.
+
+The fuzz's `op_ts_service` adds and removes such a service (`svc`, with a
+nested object and a function declared in an `if`) in a TS file, which
+others call as `svc.run()`.
 
 ## Kotlin parse recovery (`devgraph/indexer/kotlin/extractor.py`)
 
@@ -351,7 +480,11 @@ Tiers, first match wins:
    `db`). The method resolves to this file when its type and the method are
    declared here, else to the type's package directory at package confidence
    (`~`: methods are named bare, so another type of the package can have one
-   of the name). A builtin or external type links nothing.
+   of the name). An unqualified exported type the file doesn't declare,
+   and what an unqualified function of another file returned, may be a
+   dot-imported package's (`import . "pkg"`, index format 18): that
+   package's directory at package confidence too. A builtin or external
+   type links nothing.
 5. Anything else: a bare-name row that never ends at its caller, unless the
    method is in `STOP_METHODS["go"]`.
 
@@ -551,8 +684,20 @@ module only ranks below it. A function re-exported under another name (`pub use
 a::fetch as get;`) is called by its own name: `shop_core::get()` is a
 `CALLS` row to `fetch`, as is `get()` after a private `use a::fetch as
 get;` (whose row used to name `get`, which no function is). A `use` of a re-exported item also imports the
-defining module's file. An inline module's `pub use`, and a re-exported
-module (`pub use a::b;` then `crate::b::f()`), are not followed.
+defining module's file. Since index format 18, an inline module's `pub
+use` is read too: `reexports` records it as `[name, path, "a::b"]`, the
+inline module's path in its file, its head read in that module (its own
+`mod`s and `use`s), and a module `M::a::b` reads the re-exports a file of
+`M` records for `a::b` (`_reexport_entries`), so `mod api { pub use
+crate::net::fetch; }` in lib.rs makes `api::fetch()` there and
+`shop_core::api::fetch()` elsewhere reach net.rs. A re-exported module
+is followed as a path's module: walking a path (`_walk`), a lowercase
+segment is its child module and, when the module re-exports a module of
+the name by name (`pub use net::client;`), that module too (a glob is not
+followed for a module: every path through its module would reach the
+glob's whole tree), so `crate::client::fetch()`, `shop_core::client::fetch()`
+and `use shop_core::client;` then `client::fetch()` reach
+`net/client.rs`, which that `use` also imports.
 
 The arguments of a macro invocation (`println!("{}", shop_core::version())`,
 `assert_eq!(user.total(), 500)`) are reparsed as a call's arguments, so the
@@ -654,7 +799,7 @@ declares an `M` itself.
 project's own type beside a referenced one, which C# prefers with warning
 CS0436) both link. A key group over the cap links by class file
 name, as before match keys, and is not tiered (see Shadow tiers).
-`ImplicitUsings` is not read. An extension method is keyed by its `this`
+An extension method is keyed by its `this`
 parameter's type's simple name (`Ns:+T`), or by a type parameter's first
 constraint naming a type (`this T x where T : class, IRepo`: `+IRepo`); a
 receiver typed with a class implementing that interface (`Repo r;
@@ -900,9 +1045,11 @@ resolves by function name alone and still links every same-named member of
 the file); across files, an imported top-level function (a Python
 from-import or module attribute, a JS/TS ES named import or namespace
 member, a Go package's function) links the top-level one, never a method
-of its name. A method of another file's class still links every member of
-the name there (a subclass can inherit it from a base of that file), and so
-does a call through a JS/TS default import or `require`. C# narrows by
+of its name. A method of another file's Python, JS/TS or Java class names
+that class (index format 18), which reaches its own member or the one it
+inherits from a base of that file (heir keys: graph-accuracy spec, O3
+(c)), a JS/TS default import's the default-exported class's; a call
+through a `require` still links every member of the name there. C# narrows by
 owner through its match keys already. The measurement fixtures are
 unchanged by it (M1 to M5 equal; `name_refs` 3 to 8 % larger).
 
@@ -930,7 +1077,8 @@ has:
   declared elsewhere is pinned where a call to it would go: `call_rows`
   with `rel_type="IMPLEMENTS"` over the pins the language's call resolver
   gives the name (an ES named import's candidate files and folder at owner
-  "", a default import's or a typed value's member at any owner, a Go
+  "", a default import's or a typed value's member at its class's owner
+  when the call resolver names one (index format 18), else any, a Go
   identifier's own file or package directory, a Go `pkg.H` the package's).
   Such an edge is pinned to another file, so `name_ref_properties` records
   it and G5 relinks it when a batch adds the handler; nothing else is new
@@ -939,7 +1087,8 @@ has:
   its `Endpoint` implements nothing.
 
 A route on a router or group whose mount its file doesn't show has an
-unknown prefix. Its Endpoint is the file's own, named
+unknown prefix (an Express router another file mounts is resolved since
+index format 18: "Express routers mounted from another file", below). Its Endpoint is the file's own, named
 `"<METHOD> ?<path> (<file>)"` (`routes.unmounted_endpoint`), so no two files'
 `GET /` meet in one Endpoint that no request reaches as such, and
 `trace_request_flow` never starts from such a hub (a bare `/` does not
@@ -963,8 +1112,12 @@ call is not it). A Go receiver declared from another (`v := s.router`)
 is followed to it; an ASP.NET chained receiver
 (`app.MapGroup("/x").MapGet(...)`) is read as its group. Only a router
 package itself (or its major version, `chi/v5`) names routers, never one
-of its subpackages (`fiber/v2/middleware/cache`); a dot import of a
-router package is not read; and a verb-named call on another package
+of its subpackages (`fiber/v2/middleware/cache`). A dot import of one
+(index format 18) is the qualifier "": its bare constructor (`r :=
+NewRouter()`, unless the file declares the name) is a root router, its
+bare router type (`m *Mux`) a root or mounted one as a qualified one, and
+with a dot-imported net/http a bare `HandleFunc`/`Handle` (unless the
+file declares it) registers on the DefaultServeMux. A verb-named call on another package
 (`cache.Get("/k", load)`) is no route. An absolute ASP.NET action route
 is one Endpoint whatever the class's `[Route]`s.
 
@@ -982,10 +1135,9 @@ Not read: Fastify's `route({...})` object form, echo's `Add`, chi
 `Mount`, Koa's `app.use(router.routes())` as a mount, ASP.NET `MapMethods`
 and conventional routing, Spring functional routes (`RouterFunction`),
 Kotlin Ktor. Express, Koa and Fastify routes all carry `framework:
-Express`. A compose change (a `build:` added or moved) leaves the
-Endpoint `CALLS` Service edges as they were until the route files are
-indexed again, as for Python (the graph-accuracy design's out-of-scope
-compose-only batch).
+Express`. A compose change (a `build:` added, moved or dropped) re-owns
+the route files outside its batch (below, "Compose changes re-own the files
+outside the batch").
 
 The dispatcher treats these files as it treats a Python file. Their replace
 is a `service_api` one (`engine.SERVICE_API_SUFFIXES`, also checked on
@@ -1016,8 +1168,9 @@ it, rebuilding every code Module's record from the shared nodes' own
 one read and a write of only the records that differ, so a scan that
 changes nothing locks no Module), and a file's delete reads every claim,
 not its record (deletes are rare).
-Set (c)'s `USES` unclaim runs for Python files only, the only writers of
-`USES`. Python
+Set (c)'s `USES` unclaim ran for Python files only, the only writers of
+`USES` until index format 18 (datastore clients beyond Python, below); it
+now runs for every `service_api` file. Python
 route files gain the same. Measured on a synthetic repository of 2,000
 files (400 each of TS, Java, Go, C# and Python, a quarter of the first four
 with routes: 1,600 Endpoints), `full_scan` against the shared local Neo4j:
@@ -1031,6 +1184,160 @@ with routes: 1,600 Endpoints), `full_scan` against the shared local Neo4j:
 A repository with no routes costs the same. What remains is linear in the
 routes (their Endpoint and stub claims, about 5.5 ms per label per route
 file, and their edges).
+
+## Datastore clients beyond Python (index format 18)
+
+`Service -USES->` a datastore came from Python files alone, so
+`get_service_dependencies` and `explain_architecture` listed no store for a
+JS/TS, Java, Kotlin, C# or Go service. `datastores/extractor.py`
+`client_datastores` now reads those languages' clients, by literal text only
+(a URL, driver or namespace built at run time is not read). The text is the
+file's code with its comments removed and its string literals masked
+(`_masked`, a small lexer per family: `'`/`"`, `` ` `` in JS/TS and Go,
+Java/Kotlin text blocks, C# verbatim strings), so a comment never counts
+and a string counts only as an import specifier (an ES `import`/`export
+... from`, not a type-only `import type`/`export type`; `require`/`import()`;
+a Go import path) or, for a connection URL, a JDBC URL or a Go driver
+name, as an argument passed straight to a call (`new Pool('postgres://...')`,
+`DriverManager.getConnection("jdbc:...")`, `sql.Open("postgres", ...)`; a URL
+assigned to a variable or field first is not read). A Spring Data
+repository counts only in supertype position (after `extends`,
+`implements` or `:`, maybe after other supertypes). A file under a
+conventional test folder (`test/`, `tests/`, `__tests__/`, `src/test/`,
+`*.Tests/`) names no store, its fixtures being no service's use:
+
+| Language | Read |
+|---|---|
+| JS/TS | a module specifier (`import`, `from`, `require`, `import()`) of `pg`, `postgres`, `mysql`, `mysql2`, `mongodb`, `mongoose`, `sqlite3`, `better-sqlite3`, `neo4j-driver`, `@prisma/client`, `redis`, `ioredis`, `kafkajs`, `amqplib`, `@aws-sdk/client-s3`, `@aws-sdk/client-sqs` (or a subpath: `mysql2/promise`) |
+| Java, Kotlin | an import of (or below) `org.postgresql`, `com.mongodb`, Spring Data's `mongodb`/`jpa`/`neo4j`/`redis`, `org.neo4j.driver`, `redis.clients.jedis` (Jedis), `io.lettuce.core` (Lettuce), `org.apache.kafka.clients`, `org.springframework.kafka`, `com.rabbitmq.client`, `org.springframework.amqp`, the AWS SDK's `s3`/`sqs`; a JDBC URL passed to a call (`"jdbc:postgresql:`, `mysql`, `mariadb`, `sqlserver`, `sqlite`, `oracle`, `h2`); a Spring Data repository supertype (`JpaRepository<`, `MongoRepository<`, `ReactiveMongoRepository<`, `Neo4jRepository<`, `CassandraRepository<`, `ElasticsearchRepository<`) |
+| C# | a `using` of (or below) `Npgsql`, `Microsoft.Data.SqlClient`/`System.Data.SqlClient`, `Microsoft.Data.Sqlite`, `MySqlConnector`, `MySql.Data`, `MongoDB.Driver`, `StackExchange.Redis`, `Confluent.Kafka`, `RabbitMQ.Client`, `Amazon.S3`, `Amazon.SQS`; an EF Core provider call (`.UseNpgsql(`, `UseSqlServer`, `UseSqlite`, `UseMySql`, `UseCosmos`, `UseOracle`) and a `DbContext` subclass |
+| Go | an import of (or below) `github.com/lib/pq`, `github.com/jackc/pgx`, `github.com/go-sql-driver/mysql`, `github.com/mattn/go-sqlite3`, `modernc.org/sqlite`, `go.mongodb.org/mongo-driver`, `github.com/redis/go-redis`, `github.com/go-redis/redis`, `github.com/IBM/sarama`, `github.com/Shopify/sarama`, `github.com/segmentio/kafka-go`, `github.com/rabbitmq/amqp091-go`, the AWS SDK v2's `s3`/`sqs`; `sql.Open("<driver>", ...)` with a literal driver (`postgres`, `pgx`, `mysql`, `sqlite3`, `sqlserver`) |
+| all five | a connection URL passed to a call, at the start of its string literal: `postgres://`, `postgresql://`, `mysql://`, `mongodb://`, `mongodb+srv://`, `redis://`, `rediss://`, `amqp://`, `amqps://` |
+
+A store's identity is a Python client's: its provider, under its type's
+label (`Database`, `Cache`, `Queue`; `VectorStore` has no client here), so
+every file and service using PostgreSQL meets one shared `PostgreSQL`
+`Database`, whatever the language, and the URL's host, database name or
+environment variable never splits it. An ORM whose store is configured
+outside the code is named by the ORM (`Prisma`, `JPA`, `EF Core`), as a
+Python LangChain vector store is `LangChain`; S3 is a `Database` named
+`S3`, SQS a `Queue`. A file's node per provider takes the alphabetically
+first of its clients of that provider as its `library`, and its `source`.
+
+The dispatcher appends these nodes to the file's extraction
+(`_datastore_nodes(..., language)`), so its replace claims them as a Python
+file's (G3: re-claimed in place, a store's incoming edges kept). Their
+`USES` from the owning compose `Service` are written in the owning-service
+pass (`_datastore_service_relationships`, the edge a Python file's
+`_owning_service_relationships` writes), with the file as origin; set (c)'s
+`USES` unclaim now runs for every `service_api` file, on a replace and on a
+delete. Nothing else is new for incremental equals fresh: a node and its
+edge are functions of the file's text and the compose files. The fuzz
+toggles clients' imports in Python, TS, Java, Kotlin, C# and Go files
+(`op_datastore`); `tests/indexer/test_client_datastores_live.py` scans one
+service per language. C++ and Rust clients are not read.
+
+## Express routers mounted from another file (index format 18)
+
+`app.use('/api', usersRouter)`, with `usersRouter` imported from
+`routes/users.js`, left that file's routes unmounted: `GET ?/:id
+(routes/users.js)`. A route's full path now comes from both files, and
+must still equal a fresh scan whichever of them changes, so neither file's
+extraction reads the other: each records its half on its Module, and the
+dispatcher joins them.
+
+- **The mounting file** records `route_mounts`, one entry per mount of an
+  imported router (`app.use('/p', x)`, the last argument, so middleware
+  before it is skipped; `x` a default or named ES import, a `require` or
+  its destructured name, or an inline `require('./r')`): its base, the
+  prefix, the export name (`default` for a default import or a whole
+  `require`) and the files the specifier can name
+  (`_resolve_module_specifier`: every candidate, none checked against the
+  disk, so a mount is a function of the file's text and resolver
+  configuration). The base is "" and the prefix the full one when the
+  router it is mounted on has a known prefix (an app, or a router the file
+  mounts itself); it is an export name of the file's own router when that
+  router is exported and not mounted in the file (the prefix is then
+  relative to that router's mounts: a chain); otherwise the mount is not
+  recorded.
+- **The router file** records `route_exports`: (export name, method, path)
+  for each route on a router it exports (`export default r`, `export const
+  r`, `export { r as x }`, `module.exports = r`, `module.exports = { r }`,
+  `exports.x = r`) and doesn't mount itself. Its extraction still names
+  them `?` Endpoints; a route whose `?` name another unmounted route of the
+  file shares is not deferred.
+- **The dispatcher** (`index_paths`) keeps a `MountTable` of every Module's
+  `route_mounts` (read once per batch when a file first needs it, then kept
+  current with each JS/TS file the batch writes). A router file's prefixes
+  per export are the mounts naming one of its candidate files and that
+  export, a base other than "" followed to the mounting file's own mounts,
+  at most `MAX_MOUNT_HOPS` (2) cross-file mounts in all: an app mounting an
+  api router that mounts the users router resolves; a third level stays
+  unmounted, and a cycle ends there. `mount_routes` renames each deferred
+  route's Endpoint (and its `IMPLEMENTS`, and so its owning-service `CALLS`)
+  to one per prefix, `"<METHOD> <prefix><path>"`; a router mounted nowhere
+  keeps its `?` Endpoint. The Module records the prefixes it used as
+  `route_prefixes`. The three properties are lists, absent when empty,
+  hidden and reserved like `name_refs`.
+- **Settling.** A router file's output depends on other files' mounts, so
+  after pass 1 (when a batch file had or has any of the three properties)
+  the batch reads every Module holding one, rebuilds the table and
+  re-indexes each file whose `route_prefixes` differ from what the table
+  gives its `route_exports` (`_stale_mounts`): a router file the batch
+  wrote before the file mounting it (path order), and router files outside
+  the batch whose mounts the batch changed, which join the batch (their
+  previous nodes snapshotted first, so "added" stays exact). The records
+  themselves are text, so one round settles. `remove_paths` does the same
+  after deleting a file that held one (with `docs_path`/`mentions_enabled`,
+  which it now takes, as the watcher passes them). Moving a router file is a
+  delete and an add: the mount's candidates name the old path, so the moved
+  router is unmounted (fresh and incremental alike), and a mount's own
+  change re-indexes the routers under both its old and new targets.
+
+Cost: a batch with no mounts or exported routes before or after pays one
+indexed read of its own Modules; one that has them reads every Module of
+the repository holding a mount property (one indexed scan) and re-indexes
+only the router files whose prefixes changed. A full scan re-indexes the
+router files that sort before the file mounting them. The fuzz mounts
+another TS file's exported router on an app or on the file's own exported
+router (so chains and cycles), unmounts it, changes the prefix, stops
+exporting it, and moves the router file (`op_mount`, `op_mount_prefix`,
+`op_export_router`, `op_move_router`); `tests/indexer/test_express_mounts_live.py`
+walks a two-level chain through prefix changes, a second mount, an
+unexported middle, a move and deletions.
+
+Not read: a mount through a variable path, a router held in an object
+(`routers.users`), a namespace import's member (`app.use('/x', ns.r)`),
+`export default Router()` (no name to route on), Koa's
+`app.use(router.routes())`, and other frameworks' cross-file groups (a gin
+`*gin.RouterGroup` parameter, ASP.NET `IEndpointRouteBuilder`).
+
+## Compose changes re-own the files outside the batch
+
+The owning-service edges (`Endpoint -CALLS-> Service`, `Service -USES->`
+a datastore) were written only for the batch's own files, so a batch of a
+compose file alone, giving a service a `build:`, moving it or taking it
+away, left every other file's edges at its old owner (the graph-accuracy
+design's out-of-scope "compose-only batch"). Those edges are a function of
+two things the graph holds: which files claim each Endpoint and datastore
+node (its `sources`) and the Services' build contexts (the longest one
+containing the file wins, `_match_owning_service`). So a batch holding a
+compose file (`_is_compose`), and a `remove_paths` deleting one, run
+`dispatch._relink_owning_services` after the owning-service pass: one read
+of every claimed Endpoint and datastore node with its claiming files and of
+every owning-service edge with its `origins` (`engine.owning_service_state`),
+then, for each claiming file outside the batch, the edges it should write
+now are compared with the ones listing it: a stale one is unclaimed (the
+file leaves its `origins`, the edge goes with the last,
+`unclaim_owning_service_edges`) and a missing one written with the file as
+origin. No file is read. A full scan skips it (no file is outside its
+batch). A compose replace also clears a `build_context` the service no
+longer has: the node is updated in place (`SET +=`), so the stale property
+kept its old owner before. The cost is one read proportional to the
+repository's Endpoints and datastore claims per batch holding a compose
+file; other batches pay nothing. The fuzz gives compose services `build:`
+contexts that come, move (to nested folders: the nearest wins) and go
+(`op_build`); `tests/indexer/test_routes_live.py` moves one by hand.
 
 ## No reverse dependents
 
@@ -1527,3 +1834,26 @@ the same namespace and type in projects that do not reference each other.
   `cs_reference` toggling a `<ProjectReference>`, a cycle included, and
   `cs_project_move` moving a file whose class another project declares
   too) and the scripted fuzz runs equal a fresh scan after every step.
+
+### Results after JS/TS workspace packages (index format 17)
+
+See the Resolver configuration's JS/TS workspace packages and the JS/TS
+section. BEFORE is index format 16, AFTER this change, measured with
+`--fixture`. A new fixture, `tests/fixtures/callgraph/tsmono`, is an npm
+workspaces monorepo (`packages/*`, `apps/*`) with no tsconfig `paths`:
+imports by package name through `main`, `module`, an `exports` condition
+and subpath, a package subpath, barrels and a namespace import, a
+`package.json` under no workspace glob (external), and lodash.
+
+| | BEFORE | AFTER |
+|---|---|---|
+| ts fixture | all targets met; `IMPORTS` 100 % / 100 %, CALLS recall 100 %, 43/43 | the same |
+| tsmono fixture: `IMPORTS` precision / recall | 100 % / 38.5 % | 100 % / 100 % |
+| tsmono fixture: CALLS recall, linked precision | 35.7 %, 100 % | 100 %, 100 % |
+| tsmono fixture: named sites | 3/12 | 12/12 |
+
+The fuzz holds a workspace package (`ws/utils`, imported by name and by
+a subpath from `ws/app`, its entry a barrel): it is renamed, its `main`
+moves between entries or goes, the root `package.json` switches between
+the array and Yarn's form or stops declaring workspaces, a
+`pnpm-workspace.yaml` comes and goes, and the package's folder is deleted.

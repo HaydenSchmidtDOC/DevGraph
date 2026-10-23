@@ -28,6 +28,7 @@ import inspect
 import json
 import logging
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,12 +63,12 @@ from devgraph.dashboard.layout_store import load_layout, save_layout
 from devgraph.dashboard.query_log import QueryLog
 from devgraph.graph.engine import EngineClosed, GraphEngine, identity_key, provision_repository_schema
 from devgraph.graph.schema import (
+    BUILTIN_LABELS,
     INTERNAL_EDGE_PROPERTIES,
     INTERNAL_NODE_PROPERTIES,
-    NODE_LABELS,
     RELATIONSHIP_TYPES,
 )
-from devgraph.indexer.dispatch import full_scan
+from devgraph.indexer.dispatch import full_scan, full_scan_running
 from devgraph.indexer.walk import repo_root_problem
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.registry.store import RepoRegistry
@@ -94,6 +95,9 @@ _CONSOLE_TIMEOUT_S = 60.0
 _CONSOLE_MAX_ROWS = 50_000
 _PREVIEW_TIMEOUT_S = 5.0
 _PREVIEW_MAX_ROWS = 5_000
+# What a `canvas: true` console result keeps of each node: what the canvas
+# draws and keys on. The inspector fetches the rest on click.
+_CANVAS_NODE_PROPERTIES = ("name", "repo_id", "file", "owner", "insight_community")
 # History window bounds for `/database-stats/history`: at least one minute,
 # at most what the in-memory ring buffer holds (one hour).
 _HISTORY_SECONDS_MIN = 60
@@ -118,6 +122,46 @@ _CONFIG_ERROR_STATUS = {
 # How much of the graph-insights summary the Community card shows.
 _INSIGHT_COMMUNITY_LIMIT = 8
 _INSIGHT_LIST_LIMIT = 6
+
+
+def _canvas_result(result: dict[str, Any]) -> dict[str, Any]:
+    """A console result cut down to what the canvas draws: node properties
+    limited to `_CANVAS_NODE_PROPERTIES`, no relationship properties, and the
+    row's node and relationship values (repeats of the graph's) dropped.
+    Scalars such as `matchedId` are kept."""
+    data = []
+    for item in result["data"]:
+        graph = item["graph"]
+        data.append({
+            "row": [None if isinstance(value, dict) else value for value in item["row"]],
+            "graph": {
+                "nodes": [
+                    {**node, "properties": {
+                        k: node["properties"][k] for k in _CANVAS_NODE_PROPERTIES if k in node["properties"]
+                    }}
+                    for node in graph["nodes"]
+                ],
+                "relationships": [{**rel, "properties": {}} for rel in graph["relationships"]],
+            },
+        })
+    return {**result, "data": data}
+
+
+def neo4j_down_message(exc: BaseException, uri: str) -> str | None:
+    """The MCP tools' wording for Neo4j being unreachable at `uri` or refusing
+    the login, when `exc` is that; None for any other error. A connection
+    lost mid-session (`SessionExpired`) reads as unreachable, and any
+    `Neo.ClientError.Security.*` refusal (too many attempts, expired
+    credentials) as a refused login."""
+    from neo4j.exceptions import AuthError, ServiceUnavailable, SessionExpired
+
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code.startswith("Neo.ClientError.Security.") and not isinstance(exc, AuthError):
+        exc = AuthError(code)
+    elif isinstance(exc, SessionExpired):
+        exc = ServiceUnavailable(str(exc))
+    error = devgraph_tools.neo4j_unavailable(exc, uri)
+    return str(error) if error is not None else None
 
 
 def _reject_cross_site(request: Request) -> None:
@@ -272,6 +316,8 @@ def build_router(
     # Unstarted, it takes a fresh reading per request.
     metrics = metrics if metrics is not None else MetricsHistory(engine, None)
 
+    neo4j_uri = getattr(engine, "uri", None) or get_settings().neo4j_uri
+
     def _require_repo(repo_id: str) -> None:
         """Ensure repo_id is registered. Raises 404 if not."""
         if registry.get(repo_id) is None:
@@ -293,6 +339,21 @@ def build_router(
     def list_repos() -> dict[str, Any]:
         repo_issues = _get_repo_issues()
         repos = []
+        # The registry is SQLite and answers with Neo4j down: the list still
+        # comes back, with no node counts and the reason. One failed count
+        # stops the rest, so a down Neo4j costs one connection attempt.
+        graph_unavailable: str | None = None
+
+        def _count_nodes(repo_id: str) -> int | None:
+            nonlocal graph_unavailable
+            try:
+                return queries.count_nodes(engine, repo_id)
+            except Exception as exc:  # neo4j driver raises its own exception hierarchy
+                graph_unavailable = neo4j_down_message(exc, neo4j_uri)
+                if graph_unavailable is None:
+                    raise
+                return None
+
         for repo in registry.list_repos():
             # A missing or unreadable folder (an unmounted drive, a moved
             # repo): every scan refuses it, so its graph is kept but stale.
@@ -306,7 +367,7 @@ def build_router(
                 "active": repo.active,
                 "watch_enabled": repo.watch_enabled,
                 "last_indexed": repo.last_indexed,
-                "node_count": queries.count_nodes(engine, repo.repo_id),
+                "node_count": None if graph_unavailable is not None else _count_nodes(repo.repo_id),
                 "path_missing": problem is not None,
                 "issue": issue,  # Include issue if any
                 # Watched, but for a folder an inotify limit kept unwatched.
@@ -315,6 +376,7 @@ def build_router(
         return {
             "repos": repos,
             "issues": repo_issues,  # Also return all issues as a summary
+            "graph_unavailable": graph_unavailable,
         }
 
     def _register_repo(path: str, repo_id: str | None) -> dict[str, Any]:
@@ -355,11 +417,30 @@ def build_router(
                 registry.mark_indexed(record.repo_id, at=started)
                 return count
 
-            # Waits on the repository's batch lock (W4): a watcher that picks
-            # the new repository up mid-scan waits too, then catches up from
-            # this stamp.
-            files_indexed = run_exclusive(record.repo_id, scan_and_stamp)
-            indexed = True
+            if full_scan_running():
+                # Another repository's full scan holds this process's turn
+                # (dispatch `full_scan_turn`), possibly for a long time: answer
+                # now, and scan once that one ends.
+                def scan_later() -> None:
+                    try:
+                        run_exclusive(record.repo_id, scan_and_stamp)
+                    except EngineClosed:
+                        logger.info("registered %s; shutdown cut its initial scan, which the next start redoes",
+                                    record.repo_id)
+                    except Exception as exc:
+                        logger.warning("registered %s but the initial scan failed: %s", record.repo_id, exc)
+
+                threading.Thread(target=scan_later, name=f"devgraph-register-{record.repo_id}", daemon=True).start()
+                warning = (
+                    f"Registered {record.repo_id}; its initial scan waits for another repository's full scan "
+                    "to finish, then runs in the background."
+                )
+            else:
+                # Waits on the repository's batch lock (W4): a watcher that picks
+                # the new repository up mid-scan waits too, then catches up from
+                # this stamp.
+                files_indexed = run_exclusive(record.repo_id, scan_and_stamp)
+                indexed = True
         except EngineClosed:
             # The agent is shutting down. Never stamped, so its next start
             # indexes the repository in full.
@@ -370,8 +451,15 @@ def build_router(
             # (e.g. Neo4j down) must not undo it -- same call as the CLI's,
             # and `devgraph rescan <repo_id>` is the same retry.
             logger.warning("registered %s but the initial scan failed: %s", record.repo_id, exc)
+            # The driver's text (addresses, internals) stays in the log; our
+            # own errors (an invalid schema file) say what to fix.
+            from neo4j.exceptions import DriverError, Neo4jError
+
+            reason = neo4j_down_message(exc, neo4j_uri) or (
+                type(exc).__name__ if isinstance(exc, (DriverError, Neo4jError)) else str(exc)
+            )
             warning = (
-                f"Registered, but the initial scan failed: {exc}. "
+                f"Registered, but the initial scan failed: {reason}. "
                 f"Run 'devgraph rescan {record.repo_id}' once Neo4j is reachable."
             )
 
@@ -544,7 +632,7 @@ def build_router(
         The one source of truth the schema, graph and search routes share; only
         labels in this list may be interpolated into Cypher.
         """
-        labels = list(NODE_LABELS)
+        labels = list(BUILTIN_LABELS)
         for record in _scope_records(repo_id):
             labels += [x for x in _applied_labels(record)[0] if x not in labels]
         return labels
@@ -569,11 +657,11 @@ def build_router(
             if _SCHEMA_STATE_RANK.index(info["state"]) > _SCHEMA_STATE_RANK.index(state):
                 state = info["state"]
 
-        builtin_labels = set(NODE_LABELS)
+        builtin_labels = set(BUILTIN_LABELS)
         builtin_rels = set(RELATIONSHIP_TYPES)
         node_types = [
             {"label": label, "origin": "builtin", "color": None, "count": counts.get(label, 0)}
-            for label in NODE_LABELS
+            for label in BUILTIN_LABELS
         ] + [
             {"label": label, "origin": "project", "color": colors.get(label) or _hash_color(label),
              "count": counts.get(label, 0)}
@@ -641,7 +729,7 @@ def build_router(
     def repo_search(repo_id: str, q: str, max_results: int = 15) -> dict[str, Any]:
         if repo_id == _ALL_REPOS_SCOPE:  # search is per-repo; `_scope_records` below does the one lookup
             raise HTTPException(status_code=404, detail=f"unknown repo: {repo_id}")
-        project_labels = [x for x in _allowed_labels(repo_id) if x not in NODE_LABELS]
+        project_labels = [x for x in _allowed_labels(repo_id) if x not in BUILTIN_LABELS]
         return {"results": queries.search_components(engine, repo_id, q, max_results, project_labels)}
 
     # The canvas's repo selector has an "All Repos" option that is not a
@@ -690,7 +778,7 @@ def build_router(
         return {"ok": True}
 
     @router.post("/cypher")
-    def run_cypher(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    def run_cypher(payload: dict[str, Any], request: Request) -> Any:
         """Server-side Cypher execution for the dashboard's Cypher console.
 
         Replaces the prototype's direct browser->Neo4j HTTP connection (see
@@ -716,6 +804,9 @@ def build_router(
         behind the console's destructive-query confirm. Previews are never
         recorded.
 
+        `canvas: true` (the canvas's own state query) returns only what the
+        canvas draws (see `_canvas_result`), not every property twice over.
+
         Both are bounded: a server-side transaction timeout, after which the
         query is stopped and a plain `Timeout` error says so, and a row cap,
         past which the rest is dropped and the result says `truncated`.
@@ -728,6 +819,7 @@ def build_router(
         repo_id = payload.get("repo_id")
         preview = bool(payload.get("preview"))
         should_record = bool(payload.get("record")) and not preview
+        canvas = bool(payload.get("canvas"))
         run = engine.preview_cypher_graph if preview else engine.run_cypher_graph
         timeout_s = _PREVIEW_TIMEOUT_S if preview else _CONSOLE_TIMEOUT_S
         max_rows = _PREVIEW_MAX_ROWS if preview else _CONSOLE_MAX_ROWS
@@ -746,13 +838,18 @@ def build_router(
                     "Narrow the MATCH or add a LIMIT."
                 )
                 return {"results": [], "errors": [{"code": "Timeout", "message": message}]}
+            down = neo4j_down_message(exc, neo4j_uri)
+            if down is not None:
+                return JSONResponse(
+                    status_code=503, content={"results": [], "errors": [{"code": "Neo4jUnavailable", "message": down}]}
+                )
             return {"results": [], "errors": [{"code": exc.__class__.__name__, "message": str(exc)}]}
 
         if should_record:
             query_log.record(
                 repo_id=repo_id, query=query, duration_ms=(time.monotonic() - start) * 1000, ok=True
             )
-        return {"results": [result], "errors": []}
+        return {"results": [_canvas_result(result) if canvas else result], "errors": []}
 
     @router.get("/database-stats")
     def database_stats() -> dict[str, Any]:

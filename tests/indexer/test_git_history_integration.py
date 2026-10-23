@@ -484,3 +484,51 @@ def test_deepening_a_shallow_clone_corrects_its_history(graph_engine, registry, 
         assert sync_git_history(graph_engine, registry, record.repo_id)["mode"] == "noop"
     finally:
         graph_engine.delete_repository(record.repo_id)
+
+
+def test_same_named_methods_of_one_file_each_get_their_own_recency(graph_engine, registry, tmp_path):
+    """Two classes' `act` in one file are two nodes (owners A and B): each
+    gets the date of the commit that last touched its own lines, whatever
+    order the rows are written in."""
+    from devgraph.graph.engine import provision_repository_schema
+    from devgraph.indexer.dispatch import full_scan
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    _run_git(root, "init")
+    _run_git(root, "config", "user.email", "test@example.com")
+    _run_git(root, "config", "user.name", "Test Author")
+    (root / "svc.py").write_text("class A:\n    def act(self):\n        return 1\n")
+    _run_git(root, "add", "svc.py")
+    _run_git(root, "commit", "-m", "Add A", "--date", "2020-01-01T00:00:00+00:00")
+    (root / "svc.py").write_text(
+        "class A:\n    def act(self):\n        return 1\n\n\nclass B:\n    def act(self):\n        return 2\n"
+    )
+    _run_git(root, "commit", "-am", "Add B", "--date", "2021-01-01T00:00:00+00:00")
+    record = registry.add_repo(root, repo_id="_smoketest_sync_owner")
+
+    def recency():
+        rows = graph_engine.run_cypher(
+            "MATCH (f:Function {repo_id: $r, name: 'act'}) RETURN f.owner AS owner, f.last_modified_at AS at",
+            {"r": record.repo_id},
+        )
+        return {row["owner"]: (row["at"] or "")[:4] for row in rows}
+
+    try:
+        provision_repository_schema(graph_engine, root)
+        graph_engine.upsert_repository(record.repo_id, record.repo_id, str(root))
+        full_scan(graph_engine, record.repo_id, root)
+        assert sync_git_history(graph_engine, registry, record.repo_id)["mode"] == "initial"
+        assert recency() == {"A": "2020", "B": "2021"}
+        assert sync_git_history(graph_engine, registry, record.repo_id, force=True)["mode"] == "reconcile"
+        assert recency() == {"A": "2020", "B": "2021"}
+        rows = [
+            {"name": "act", "file": "svc.py", "owner": owner, "created_at": None, "last_modified_at": at,
+             "last_modified_by": None}
+            for owner, at in (("A", "2019-01-01"), ("B", "2018-01-01"))
+        ]
+        for ordered in (rows, rows[::-1]):
+            graph_engine.write_recency("Function", record.repo_id, ordered, overwrite=True)
+            assert recency() == {"A": "2019", "B": "2018"}
+    finally:
+        graph_engine.delete_repository(record.repo_id)

@@ -170,3 +170,33 @@ def test_a_refresh_of_a_deleted_repository_does_not_recreate_it(engine):
         assert engine.run_cypher("MATCH (n {repo_id: $r}) RETURN count(n) AS c", {"r": repo}) == [{"c": 0}]
     finally:
         engine.delete_repository(repo)
+
+
+def test_an_unchanged_graph_is_checked_without_recomputing(engine):
+    """The fingerprint a refresh returns is the graph as it stored it, so the
+    next check of the same graph is `unchanged` (nothing written), a
+    re-created node that lost its insight properties is not, and neither is an
+    edge change."""
+    build_two_subsystems(engine)
+    first = refresh_insights(engine, REPO)
+    assert read_insights(engine, REPO)["fingerprint"] == first["fingerprint"]
+    before = read_insights(engine, REPO)["computed_at"]
+    check = refresh_insights(engine, REPO, unless_fingerprint=first["fingerprint"])
+    assert check["unchanged"] is True and check["fingerprint"] == first["fingerprint"]
+    assert read_insights(engine, REPO)["computed_at"] == before
+
+    engine.run_cypher(
+        "MATCH (n:Function {repo_id: $repo, name: 'b'}) "
+        "REMOVE n.insight_community, n.insight_pagerank, n.insight_betweenness",
+        {"repo": REPO},
+    )
+    second = refresh_insights(engine, REPO, unless_fingerprint=first["fingerprint"])
+    assert "unchanged" not in second and second["fingerprint"] == first["fingerprint"]
+
+    engine.run_cypher(
+        "MATCH (s:Function {repo_id: $repo, name: 'f'}), (t:Function {repo_id: $repo, name: 'a'}) "
+        "CREATE (s)-[:CALLS]->(t)",
+        {"repo": REPO},
+    )
+    third = refresh_insights(engine, REPO, unless_fingerprint=first["fingerprint"])
+    assert "unchanged" not in third and third["fingerprint"] != first["fingerprint"]

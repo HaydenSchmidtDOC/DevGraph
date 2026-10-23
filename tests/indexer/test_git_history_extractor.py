@@ -179,3 +179,74 @@ def test_a_shallow_clone_deepened_later_reads_only_new_commits(five_commit_origi
     head = GitHistoryExtractor("shallow", clone).extract_new_commits().commits[-1].sha
     _run_git(clone, "fetch", "--quiet", "--deepen=2")
     assert GitHistoryExtractor("shallow", clone).extract_new_commits(since_sha=head).commits == []
+
+
+def _history(tmp_path, commits: int) -> Path:
+    """A repository of `commits` commits, the i-th adding notes/n{i}.txt and editing log.md."""
+    import os
+
+    root = tmp_path / "repo"
+    (root / "notes").mkdir(parents=True)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "A", "GIT_AUTHOR_EMAIL": "a@example.com",
+           "GIT_COMMITTER_NAME": "A", "GIT_COMMITTER_EMAIL": "a@example.com",
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    git = lambda *a: subprocess.run(["git", "-c", "commit.gpgsign=false", *a], cwd=root, check=True,  # noqa: E731
+                                    capture_output=True, env=env)
+    git("init", "-q", "-b", "main")
+    for i in range(commits):
+        (root / "notes" / f"n{i}.txt").write_text(f"{i}\n")
+        (root / "log.md").write_text(f"{i}\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", f"c{i}")
+    return root
+
+
+def test_a_sync_writes_in_chunks_not_rows(tmp_path, monkeypatch):
+    """Commits, MODIFIES edges and recency go in one statement per chunk of
+    rows, with the lock offered between chunks; nothing is written a row at
+    a time."""
+    from unittest.mock import MagicMock
+
+    from devgraph.indexer.git_history import extractor
+    from devgraph.registry.store import RepoRegistry
+
+    monkeypatch.setattr(extractor, "CHUNK_ROWS", 10)
+    monkeypatch.setattr(extractor, "YIELD_EVERY_S", 0)
+    root = _history(tmp_path, 25)
+    registry = RepoRegistry(tmp_path / "registry.db")
+    try:
+        repo_id = registry.add_repo(root).repo_id
+        engine = MagicMock()
+        offered = []
+        result = extractor.sync_git_history(engine, registry, repo_id, between_chunks=lambda: offered.append(1) or True)
+        assert result == {"mode": "initial", "commits_indexed": 25, "commits_deleted": 0}
+        # 25 commits, 50 MODIFIES edges (n{i}.txt and log.md each), 26 modules.
+        assert [len(c.args[0]) for c in engine.upsert_nodes.call_args_list] == [10, 10, 5]
+        assert [len(c.args[1]) for c in engine.upsert_modifies.call_args_list] == [10] * 5
+        assert [len(c.args[2]) for c in engine.write_recency.call_args_list] == [10, 10, 6]
+        assert len(offered) == 3 + 5 + 3
+        for single in (engine.upsert_node, engine.upsert_relationship, engine.stage_recency, engine.set_recency):
+            single.assert_not_called()
+    finally:
+        registry.close()
+
+
+def test_a_sync_told_to_stop_records_no_head(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from devgraph.indexer.git_history import extractor
+    from devgraph.registry.store import RepoRegistry
+
+    monkeypatch.setattr(extractor, "YIELD_EVERY_S", 0)
+    root = _history(tmp_path, 3)
+    registry = RepoRegistry(tmp_path / "registry.db")
+    try:
+        repo_id = registry.add_repo(root).repo_id
+        engine = MagicMock()
+        result = extractor.sync_git_history(engine, registry, repo_id, between_chunks=lambda: False)
+        assert result["mode"] == "stopped"
+        assert engine.upsert_nodes.call_count == 1 and not engine.upsert_modifies.called
+        assert registry.get(repo_id).last_indexed_commit is None  # the next sync reads it all again
+        assert extractor.sync_git_history(engine, registry, repo_id)["mode"] == "initial"
+    finally:
+        registry.close()

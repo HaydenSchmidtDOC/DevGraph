@@ -13,6 +13,7 @@ from devgraph.graph.engine import GraphEngine
 from devgraph.indexer import dispatch, walk
 from devgraph.indexer.dispatch import catch_up, full_scan, index_paths, remove_paths
 from devgraph.indexer.walk import BINARY, GENERATED, TOO_LARGE, content_skip_reason
+from tests.helpers import stub
 
 LIMIT = 4096
 
@@ -76,6 +77,9 @@ def test_the_size_limit_is_a_setting_with_a_one_mib_default(monkeypatch):
 
 
 class _Engine:
+    def route_mount_state(self, repo_id, names=None):
+        return {}
+
     def __init__(self):
         self.deleted: list[str] = []
 
@@ -94,7 +98,7 @@ class _Engine:
 
 @pytest.fixture
 def small_limit(monkeypatch):
-    monkeypatch.setattr(dispatch, "_max_file_bytes", lambda: LIMIT)
+    stub(monkeypatch, dispatch, "_max_file_bytes", lambda: LIMIT)
 
 
 def test_index_paths_skips_and_reports_filtered_files_and_clears_their_nodes(tmp_path, monkeypatch, small_limit):
@@ -105,7 +109,7 @@ def test_index_paths_skips_and_reports_filtered_files_and_clears_their_nodes(tmp
     (tmp_path / "out").mkdir()
     (tmp_path / "out" / "gen.py").write_text("x = 1\n")
     seen = []
-    monkeypatch.setattr(dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
+    stub(monkeypatch, dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
     engine = _Engine()
     skipped: dict[str, str] = {}
 
@@ -122,7 +126,7 @@ def test_index_paths_skips_and_reports_filtered_files_and_clears_their_nodes(tmp
 
 def test_a_file_no_extractor_reads_is_not_judged_by_its_content(tmp_path, monkeypatch, small_limit):
     (tmp_path / "logo.png").write_bytes(b"\x89PNG\x00" * 2000)
-    monkeypatch.setattr(dispatch, "_index_single_path", lambda *a: 0)
+    stub(monkeypatch, dispatch, "_index_single_path", lambda *a: 0)
     skipped: dict[str, str] = {}
     index_paths(_Engine(), "_unit_guards", tmp_path, {tmp_path / "logo.png"}, skipped=skipped)
     assert skipped == {}
@@ -150,12 +154,12 @@ class _CatchUpEngine:
 def caught_up(monkeypatch, small_limit):
     """catch_up with the graph stubbed; returns the files offered to index_paths."""
     offered: list = []
-    monkeypatch.setattr(dispatch, "prune_stale_files", lambda *a, **k: 0)
-    monkeypatch.setattr(dispatch, "schema_pending", lambda *a, **k: False)
-    monkeypatch.setattr(dispatch, "index_outdated", lambda *a, **k: False)
-    monkeypatch.setattr(dispatch, "_docs_note_files", lambda *a, **k: set())
-    monkeypatch.setattr(dispatch, "index_paths", lambda e, r, root, paths, **k: offered.append(paths) or len(paths))
-    monkeypatch.setattr(dispatch, "sync_resolver_config", lambda *a, **k: 0)
+    stub(monkeypatch, dispatch, "prune_stale_files", lambda *a, **k: 0)
+    stub(monkeypatch, dispatch, "schema_pending", lambda *a, **k: False)
+    stub(monkeypatch, dispatch, "index_outdated", lambda *a, **k: False)
+    stub(monkeypatch, dispatch, "_docs_note_files", lambda *a, **k: set())
+    stub(monkeypatch, dispatch, "index_paths", lambda e, r, root, paths, **k: offered.append(paths) or len(paths))
+    stub(monkeypatch, dispatch, "sync_resolver_config", lambda *a, **k: 0)
     return offered
 
 
@@ -167,8 +171,8 @@ def test_catch_up_does_not_re_judge_a_file_skipped_under_the_same_limit(tmp_path
     (tmp_path / "a.py").write_text("x = 1\n")
     (tmp_path / "big.py").write_text("x = 1\n" * 1000)
     engine = _CatchUpEngine(skips={"big.py": [TOO_LARGE, LIMIT, _stamp(tmp_path / "big.py")]})
-    monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: set())
-    monkeypatch.setattr(dispatch, "content_skip_reason", lambda *a: pytest.fail("re-read a skipped file"))
+    stub(monkeypatch, dispatch, "_graph_files", lambda *a, **k: set())
+    stub(monkeypatch, dispatch, "content_skip_reason", lambda *a: pytest.fail("re-read a skipped file"))
 
     result = catch_up(engine, "_unit_guards", tmp_path, datetime.now(UTC))
 
@@ -181,7 +185,7 @@ def test_catch_up_offers_a_skipped_file_again_when_its_judgement_may_change(tmp_
     (tmp_path / "big.py").write_text("x = 1\n" * 1000)
     mark = [TOO_LARGE, LIMIT * 2 if change == "limit" else LIMIT, _stamp(tmp_path / "big.py") - (change == "stamp")]
     engine = _CatchUpEngine(skips={} if change == "unmarked" else {"big.py": mark})
-    monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: set())
+    stub(monkeypatch, dispatch, "_graph_files", lambda *a, **k: set())
     catch_up(engine, "_unit_guards", tmp_path, datetime.now(UTC))
     assert caught_up == [{tmp_path / "big.py"}]
 
@@ -191,8 +195,8 @@ def test_a_provider_file_node_does_not_make_a_code_file_known(tmp_path, monkeypa
     raised it must still be offered, so only extraction nodes count."""
     (tmp_path / "big.py").write_text("x = 1\n" * 1000)
     engine = _CatchUpEngine(skips={"big.py": [TOO_LARGE, LIMIT // 2, 0]})
-    monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: {"big.py"})  # its File node
-    monkeypatch.setattr(dispatch, "_change_stamp_ns", lambda st: 0)  # older than `since`
+    stub(monkeypatch, dispatch, "_graph_files", lambda *a, **k: {"big.py"})  # its File node
+    stub(monkeypatch, dispatch, "_change_stamp_ns", lambda st: 0)  # older than `since`
     catch_up(engine, "_unit_guards", tmp_path, datetime.now(UTC))
     assert caught_up == [{tmp_path / "big.py"}]
 
@@ -403,7 +407,7 @@ def test_raising_the_limit_lets_catch_up_index_a_file_with_a_provider_node(engin
     (root / "a.py").write_text("def alpha():\n    return 1\n")
     (root / "big.py").write_text("def big():\n    return 2\n" + "# padding\n" * 600)
     try:
-        monkeypatch.setattr(dispatch, "_max_file_bytes", lambda: LIMIT)
+        stub(monkeypatch, dispatch, "_max_file_bytes", lambda: LIMIT)
         provision_repository_schema(engine, root)
         engine.upsert_repository(live, live, str(root))
         full_scan(engine, live, root)
@@ -414,7 +418,7 @@ def test_raising_the_limit_lets_catch_up_index_a_file_with_a_provider_node(engin
         later = datetime.now(UTC) + timedelta(minutes=1)  # nothing is due by its stamps
         assert catch_up(engine, live, root, later).offered == 0  # judged under this limit, unchanged
 
-        monkeypatch.setattr(dispatch, "_max_file_bytes", lambda: 1024 * 1024)
+        stub(monkeypatch, dispatch, "_max_file_bytes", lambda: 1024 * 1024)
         result = catch_up(engine, live, root, later)
         assert (result.offered, result.unknown) == (1, 1)
         assert ("Function", "big", "big.py") in _graph(engine, live)
@@ -431,7 +435,7 @@ def test_a_symlink_is_judged_by_its_own_path_not_its_target(tmp_path, monkeypatc
     (tmp_path / "link.py").symlink_to(tmp_path / "out" / "real.py")
     (tmp_path / ".gitignore").write_text("out/\n")
     seen = []
-    monkeypatch.setattr(dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
+    stub(monkeypatch, dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
     engine = _Engine()
     skipped: dict[str, str] = {}
     index_paths(engine, "_unit_guards", tmp_path, {tmp_path / "link.py"}, skipped=skipped)
@@ -446,7 +450,7 @@ def test_an_ignored_symlink_is_skipped_without_touching_its_target(tmp_path, mon
     (tmp_path / "link.py").symlink_to(tmp_path / "real.py")
     (tmp_path / ".gitignore").write_text("link.py\n")
     seen = []
-    monkeypatch.setattr(dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
+    stub(monkeypatch, dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
     engine = _Engine()
     skipped: dict[str, str] = {}
     index_paths(engine, "_unit_guards", tmp_path, {tmp_path / "link.py"}, skipped=skipped)
@@ -491,7 +495,7 @@ def test_a_link_and_its_ignored_target_in_one_batch_keep_the_link_spelling(tmp_p
     (tmp_path / "link.py").symlink_to(tmp_path / "out" / "real.py")
     (tmp_path / ".gitignore").write_text("out/\n")
     seen = []
-    monkeypatch.setattr(dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
+    stub(monkeypatch, dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
     engine = _Engine()
     index_paths(engine, "_unit_guards", tmp_path, {tmp_path / "link.py", tmp_path / "out" / "real.py"})
     assert seen == ["out/real.py"] and engine.deleted == []
@@ -502,9 +506,9 @@ def test_referrers_are_not_judged_by_gitignore(tmp_path, monkeypatch, small_limi
     (tmp_path / "out" / "dep.py").write_text("x = 1\n")
     (tmp_path / "a.py").write_text("x = 1\n")
     (tmp_path / ".gitignore").write_text("out/\n")
-    monkeypatch.setattr(dispatch, "_find_referrers", lambda *a: {"out/dep.py"})
+    stub(monkeypatch, dispatch, "_find_referrers", lambda *a: {"out/dep.py"})
     seen = []
-    monkeypatch.setattr(dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
+    stub(monkeypatch, dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
     engine = _Engine()
     index_paths(engine, "_unit_guards", tmp_path, {tmp_path / "a.py"})
     assert seen == ["a.py", "out/dep.py"] and engine.deleted == []
@@ -549,7 +553,7 @@ def test_an_idle_catch_up_offers_nothing_even_for_files_without_extraction_nodes
     (root / "compose.yaml").write_text("volumes:\n  data: {}\n")  # no services
     (root / "Dockerfile").write_text("# no FROM\n")
     (root / "big.py").write_text("x = 1\n" * 1000)
-    monkeypatch.setattr(dispatch, "_max_file_bytes", lambda: LIMIT)
+    stub(monkeypatch, dispatch, "_max_file_bytes", lambda: LIMIT)
     _scan(engine, live, root)
     assert catch_up(engine, live, root, datetime.now(UTC) + LATER).offered == 0
 
@@ -561,7 +565,7 @@ def test_lowering_the_limit_lets_catch_up_drop_a_now_too_large_file(provider_rep
     _scan(engine, live, root)
     assert ("Function", "big", "big.py") in _graph(engine, live)
 
-    monkeypatch.setattr(dispatch, "_max_file_bytes", lambda: LIMIT)
+    stub(monkeypatch, dispatch, "_max_file_bytes", lambda: LIMIT)
     result = catch_up(engine, live, root, datetime.now(UTC) + LATER)
     assert result.offered == 1
     assert ("Function", "big", "big.py") not in _graph(engine, live)

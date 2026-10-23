@@ -54,9 +54,10 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+import pydantic_core
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from devgraph.agent import lifecycle
 from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, global_tools_fingerprint
@@ -273,6 +274,41 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
             )
 
     return wrapper
+
+
+def compact_json(value: Any) -> str:
+    """`value` as compact JSON: no indentation or spaces after separators, key order and
+    non-ASCII text kept. Everything a client's model reads goes through this, so it pays
+    no tokens for whitespace."""
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def _compact_result(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a tool so a dict result reaches the client as one compact JSON text block.
+
+    Left to itself the SDK renders a returned dict with `indent=2`, about 40% of the
+    characters being indentation. The wrapper builds the `CallToolResult` itself: the
+    text block is `compact_json` of the result and `structuredContent` is the same
+    JSON-ready data the SDK would send (non-JSON values become strings, as the SDK's
+    `fallback=str` does), so the two still round-trip to each other and the declared
+    `dict[str, Any]` output schema still validates. Anything but a dict, and every
+    exception (a ToolError's message is plain text), passes through untouched.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        result = fn(*args, **kwargs)
+        if not isinstance(result, dict):
+            return result
+        data = pydantic_core.to_jsonable_python(result, fallback=str)
+        return CallToolResult(content=[TextContent(type="text", text=compact_json(data))], structured_content=data)
+
+    return wrapper
+
+
+def _served(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """What every served tool, built-in or declared, is wrapped in: telemetry, then compact JSON."""
+    return _compact_result(_instrument(fn))
 
 
 def _with_neo4j_errors(fn: Callable[..., Any], uri: str) -> Callable[..., Any]:
@@ -561,7 +597,7 @@ def build_server(
         register = _register_tool(*args, **kwargs)
         # `status` (the tool plane's, assigned below) is looked up at call time.
         return lambda fn: register(
-            _instrument(
+            _served(
                 _with_neo4j_errors(
                     _with_schema(
                         _with_shadow_notices(
@@ -595,15 +631,19 @@ def build_server(
         max_results: int = 15,
         modified_within_commits: int | None = None,
     ) -> dict[str, Any]:
-        """Search for components by name/description; returns {count, results, truncated},
-        each result with name, labels, repo_id, description and file. Ranked: exact name,
-        then name prefix, then name substring, then description only. count is the true
+        """Search for components (services, modules, classes, functions, endpoints,
+        databases, vector stores, queues, caches and compose containers) by
+        name/description; returns {count, results, truncated},
+        each result with name, labels, repo_id, description and file. Ranked: the whole
+        query as the exact name, then the same ignoring case, then names starting with
+        or containing the whole query, then names equal to, starting with or containing
+        one of its words (run_cypher before run), then description only. count is the true
         number of matches, unless count_is_lower_bound is true (exact and prefix matches
         alone filled max_results). max_results is capped at 200. A snake_case query such as
         user_service also matches as a whole word. An exact name in unusual case (gEt for
         get) is found by the substring scan, so it can be missed when exact and prefix
-        matches alone fill max_results. A route's file-less handler stub is left out when a
-        real node has its name. Pass modified_within_commits to restrict to components touched within the last
+        matches alone fill max_results. A route's handler stub is left out when it folds
+        into the one real function it stands for. Pass modified_within_commits to restrict to components touched within the last
         N commits repo-wide (requires git-history recency staging; entities never staged
         are excluded, not silently included).
         Also searches node types the repository's devgraph.schema.yaml declares (for
@@ -700,7 +740,10 @@ def build_server(
         """Trace the request flow from an endpoint through services, datastores, and queues
         (every node within five hops). start_endpoint is an endpoint name like
         "GET /users/<id>", or a bare path like "/users/<id>" to start from that path's
-        endpoint for every method. An unknown endpoint is an error with similar names."""
+        endpoint for every method. A route's handler stub is listed as the one real
+        function it stands for (whose calls are followed too), or as itself when it
+        stands for none; edges are {type, from, to} between listed components. An
+        unknown endpoint is an error with similar names."""
         return devgraph_tools.trace_request_flow(engine, repo_id, start_endpoint, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
@@ -719,9 +762,12 @@ def build_server(
         modified_within_commits: int | None = None,
         resolved_only: bool = False,
         file: str | None = None,
+        owner: str | None = None,
+        include_tests: bool = True,
     ) -> dict[str, Any]:
-        """Find all callers of a target; returns {count, results, truncated}, each caller
-        with its name, type, repo_id, file and confidence, most certain first. Calls
+        """Find all callers of a target; returns {count, results, truncated, test_count}, each caller
+        with its name, type, repo_id, file, owner and start_line (a module caller has
+        neither) and confidence, most certain first. Calls
         in every language are resolved through the caller's scope, imports and types:
         confidence "resolved" (callee in a file the caller names), "package" (in a
         file the caller's imports reach less exactly, e.g. under an imported package
@@ -735,27 +781,37 @@ def build_server(
         names; a known one nothing calls is count 0. When the name is defined in several
         files, pass file (the target's repo-relative path) to pick one; without it each
         caller adds target_files (the files of the targets it calls, at most 10) and
-        ambiguous_targets lists the definitions."""
+        ambiguous_targets lists the definitions. To pick one class's method, pass owner
+        (the classes or functions it is declared in, "" at the top level) or name it
+        "A.run" / "A::run". Callers in test code (under tests/, test/, __tests__/,
+        src/test/, or a test file such as test_*.py, *_test.go, *.spec.ts, *Test.java)
+        come after all others; test_count says how many there are, and
+        include_tests=false leaves them out."""
         return devgraph_tools.find_callers(
             engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits,
-            resolved_only, file, declared(repo_id, cross_repo),
+            resolved_only, file, declared(repo_id, cross_repo), owner, include_tests,
         )
 
     @server.tool(annotations=_READ_ONLY)
     def find_related_files(
-        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None
+        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None,
+        owner: str | None = None, include_tests: bool = True,
     ) -> dict[str, Any]:
-        """Find related files; each list returns {count, results, truncated} envelope. An
+        """Find related files; each list returns {count, results, truncated, test_count} envelope. An
         unknown component is an error with similar names. When the name is defined in
         several files, pass file (repo-relative path) to pick one; without it each row is
-        {name, target_files} and ambiguous_targets lists them."""
+        {name, target_files} and ambiguous_targets lists them. Pass owner, or name a
+        method "A.run", to pick one class's method. Entries in test code come last in each
+        list (test_count counts them); include_tests=false leaves them out."""
         return devgraph_tools.find_related_files(
-            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo)
+            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo), owner,
+            include_tests,
         )
 
     @server.tool(annotations=_READ_ONLY)
     def summarise_repository(repo_id: str) -> dict[str, Any]:
-        """Get a high-level summary of a repository's architecture (node counts by type)."""
+        """Get a high-level summary of a repository's architecture (node counts by type,
+        cache_count included)."""
         return devgraph_tools.summarise_repository(engine, repo_id)
 
     @server.tool(annotations=_READ_ONLY)
@@ -776,19 +832,24 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def impact_analysis(
-        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None
+        repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None,
+        owner: str | None = None, include_tests: bool = True,
     ) -> dict[str, Any]:
         """Analyze component impact: direct dependents (one CALLS/USES/DEPENDS_ON hop) and
-        transitive ones (two to four hops; further ones are not followed). Dependents
-        wrapped in {count, results, truncated} envelopes. An unknown component is an
+        transitive ones (two to four hops; further ones are not followed), each {name, type,
+        file, owner} (owner left out and file null when it has none), wrapped in {count,
+        results, truncated} envelopes. Pass owner, or name a method "A.run", to pick one
+        class's method. An unknown component is an
         error with similar names. When the name is defined in several files, pass file
         (repo-relative path) to pick one; without it ambiguous_targets lists them, and for
         up to five files each is traced apart (every dependent adds target_files, the
         targets it depends on, and risk_level is the riskiest one's); past five, their
         dependents are listed together, with a notice. Another same-named definition
-        can itself appear as a dependent."""
+        can itself appear as a dependent. Dependents in test code come after all others in
+        each list, which adds test_count; include_tests=false leaves them out."""
         return devgraph_tools.impact_analysis(
-            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo)
+            engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo), owner,
+            include_tests,
         )
 
     @server.tool(annotations=_READ_ONLY)
@@ -816,7 +877,8 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def explain_architecture(repo_id: str, max_results: int = 15) -> dict[str, Any]:
-        """Generate a high-level architectural explanation of the repository:
+        """Generate a high-level architectural explanation of the repository (a service
+        uses databases, vector stores, queues and caches):
         services_and_datastores ({service, uses}) and endpoints ({endpoints, calls}, only
         services some endpoint calls), each a {count, results, truncated} envelope."""
         return devgraph_tools.explain_architecture(engine, repo_id, max_results)
@@ -825,6 +887,30 @@ def build_server(
     def list_services(repo_id: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
         """List all services; returns {count, results, truncated}."""
         return devgraph_tools.list_services(engine, repo_id, cross_repo, max_results)
+
+    @server.tool(annotations=_READ_ONLY)
+    def list_endpoints(
+        repo_id: str,
+        method: str | None = None,
+        path_prefix: str | None = None,
+        framework: str | None = None,
+        service: str | None = None,
+        cross_repo: bool = False,
+        max_results: int = 15,
+    ) -> dict[str, Any]:
+        """List API endpoints (routes); returns {count, results, truncated}, each result
+        {name, method, path, mounted, framework, files, handlers ({name, file, owner}),
+        services, repo_id}. Filters: method ("GET", "*" for an every-method route),
+        path_prefix (whole segments: "/api" matches "/api/users", not "/apis"), framework
+        (ASP.NET Core, Django, Express, FastAPI, Flask, Go, Spring) and service (the compose
+        service an endpoint CALLS). A route whose mount its file doesn't show has mounted
+        false, its own path, and a name like "GET ?/:id (routes/users.js)"; no path_prefix
+        matches it; a Django pattern's path gains its leading "/". method takes any HTTP
+        method token (PROPFIND too). A method that is no token, an unknown framework,
+        or an unknown service is an error."""
+        return devgraph_tools.list_endpoints(
+            engine, repo_id, method, path_prefix, framework, service, cross_repo, max_results
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def explain_decision(repo_id: str, decision_name: str, cross_repo: bool = False) -> dict[str, Any]:
@@ -901,8 +987,12 @@ def build_server(
         returns status "ambiguous" with candidates ({label, name, file, owner}) instead of
         picking one: pass the candidate's file (repo-relative path) and owner (the classes
         or functions it is declared in, "" at the top level) to choose. A method may also
-        be named with its class, "A.save" or "A::save". A file that is not valid UTF-8 is
-        decoded with replacement characters, and a notice says so."""
+        be named with its class, "A.save" or "A::save". A route's handler stub never makes
+        the one function it stands for ambiguous; a stub standing for none is a
+        candidate marked unresolved_handler. A file that is not valid UTF-8 is
+        decoded with replacement characters, and a notice says so. An unknown name (or
+        none of it in file, of owner) is an error with similar names; file may be
+        repo-relative or an absolute path inside the repository."""
         return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo, file, owner)
 
     @server.tool(annotations=_READ_ONLY)
@@ -921,7 +1011,9 @@ def build_server(
         direction, with each neighbour's identity. A file, folder or docs node is named by
         its repo-relative path or id; a method may be named with its class, "A.save" or
         "A::save". An ambiguous name returns candidates; call again with label, file and
-        owner. A code symbol's ref carries owner (the classes or functions it is declared
+        owner. A route handler answers as its real function, with its stub's
+        relationships folded in when the stub provably stands for it; a stub that
+        doesn't is marked unresolved_handler. A code symbol's ref carries owner (the classes or functions it is declared
         in, "" at the top level), which picks it from a same-named one in its file. Each
         ref in the result is the next call's
         arguments. One hop per call, at most 50 neighbours per type; direction,
@@ -944,12 +1036,12 @@ def build_server(
     fingerprint = tools_fingerprint(session_repo.path) if session_repo is not None else None
     global_fingerprint = global_tools_fingerprint()
     status = register_project_tools(
-        server, engine, session_repo, session_source, instrument=_instrument, annotations=_READ_ONLY, pinned=session_pinned,
+        server, engine, session_repo, session_source, instrument=_served, annotations=_READ_ONLY, pinned=session_pinned,
         registry=registry, fingerprint=fingerprint, global_fingerprint=global_fingerprint,
     )
     # main() polls this for tools-file and global-store reloads.
     server.devgraph_tool_plane = ProjectToolPlane(  # type: ignore[attr-defined]
-        server, engine, session_repo, status, instrument=_instrument, annotations=_READ_ONLY,
+        server, engine, session_repo, status, instrument=_served, annotations=_READ_ONLY,
         fingerprint=fingerprint, global_fingerprint=global_fingerprint,
     )
 
@@ -966,7 +1058,7 @@ def build_server(
         mime_type="application/json",
     )
     def project_tools() -> str:
-        return json.dumps(status.to_dict(), indent=2)
+        return compact_json(status.to_dict())
 
     @server.resource(
         "devgraph://client-guide",
@@ -1021,7 +1113,7 @@ def build_server(
                 for n, params in status.parameter_names.items()
             ),
         ]
-        return json.dumps(catalog, indent=2)
+        return compact_json(catalog)
 
     return server
 

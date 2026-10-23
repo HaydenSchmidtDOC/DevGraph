@@ -63,7 +63,9 @@ class TestOnChanges:
             deleted = {repo_path / "gone.py"}
             tray_app._sync.on_changes(repo_id, set(), deleted)
 
-            mock_remove_paths.assert_called_once_with(tray_app._engine, repo_id, repo_path, deleted)
+            mock_remove_paths.assert_called_once_with(
+                tray_app._engine, repo_id, repo_path, deleted, docs_path=None, mentions_enabled=False,
+            )
             mock_index_paths.assert_not_called()
 
     def test_unknown_repo_id_is_a_noop(self, tray_app):

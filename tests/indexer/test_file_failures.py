@@ -7,9 +7,13 @@ import pytest
 from devgraph.graph.engine import EngineClosed
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import index_paths
+from tests.helpers import stub
 
 
 class _QuietEngine:
+    def route_mount_state(self, repo_id, names=None):
+        return {}
+
     def list_file_nodes(self, repo_id, files):
         return set()
 
@@ -26,7 +30,7 @@ def test_a_failing_file_logs_one_line_and_the_traceback_only_at_debug(tmp_path, 
     def fail(*args):
         raise PermissionError(13, "Permission denied")
 
-    monkeypatch.setattr(dispatch, "_index_single_path", fail)
+    stub(monkeypatch, dispatch, "_index_single_path", fail)
     with caplog.at_level(logging.DEBUG, logger="devgraph.indexer.dispatch"):
         index_paths(_QuietEngine(), "_unit_failures", tmp_path, {tmp_path / "locked.py"})
 
@@ -44,6 +48,6 @@ def test_engine_closed_is_still_raised(tmp_path, monkeypatch):
     def closed(*args):
         raise EngineClosed()
 
-    monkeypatch.setattr(dispatch, "_index_single_path", closed)
+    stub(monkeypatch, dispatch, "_index_single_path", closed)
     with pytest.raises(EngineClosed):
         index_paths(_QuietEngine(), "_unit_failures", tmp_path, {tmp_path / "a.py"})

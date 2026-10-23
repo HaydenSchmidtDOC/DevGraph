@@ -12,6 +12,7 @@ import textwrap
 
 from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.resolver_config import ResolverConfig
+from tests.helpers import stub
 
 
 def calls(source, file_path="src/app.ts", config=None):
@@ -71,6 +72,26 @@ def test_an_alias_resolves_through_the_tsconfig(tmp_path):
     source = "import { capitalize } from '@/lib/text';\nexport function title(s) { return capitalize(s); }\n"
     got = targets(source, "title", "capitalize", "src/pages/P.tsx", ResolverConfig(tmp_path))
     assert ("src/lib/text.ts", "resolved") in got and ("src/lib/text/", "package") in got
+
+
+def test_a_workspace_package_resolves_to_its_entry_and_directory(tmp_path):
+    (tmp_path / "package.json").write_text('{"workspaces": ["packages/*"]}')
+    (tmp_path / "packages/utils").mkdir(parents=True)
+    (tmp_path / "packages/utils/package.json").write_text('{"name": "@acme/utils", "main": "src/index.js"}')
+    source = """
+        import { formatName } from '@acme/utils';
+        import * as f from '@acme/utils/src/format';
+        export function greet(n) { formatName(n); return f.trim(n); }
+    """
+    config = ResolverConfig(tmp_path)
+    got = targets(source, "greet", "formatName", "packages/app/src/greet.ts", config)
+    # The entry, a barrel, and anything under the package it re-exports.
+    assert ("packages/utils/src/index.ts", "resolved") in got and ("packages/utils/", "package") in got
+    got = targets(source, "greet", "trim", "packages/app/src/greet.ts", config)
+    assert ("packages/utils/src/format.ts", "resolved") in got
+    # Without the workspace declaration the name is an external package.
+    (tmp_path / "package.json").write_text('{"name": "root"}')
+    assert targets(source, "greet", "formatName", "packages/app/src/greet.ts", ResolverConfig(tmp_path)) == set()
 
 
 def test_an_external_package_links_nothing():
@@ -214,7 +235,7 @@ def test_a_jsx_component_is_a_call_of_it():
     file's own); a parameter, an external package's component, a tag
     nothing binds and an intrinsic tag link nothing, never a bare name."""
     found = calls(JSX, "src/App.tsx")
-    assert {(n, f, conf) for c, n, f, conf in found if c == "App"} == (
+    assert {(n, f, conf) for c, n, f, conf in found if c == "App" and n != "render"} == (
         {("Button", f, "resolved") for f in candidates("src/components/Button")}
         | {("Button", "src/components/Button/", "package")}
         | {("Card", f, "resolved") for f in candidates("src/Card")} | {("Card", "src/Card/", "package")}
@@ -226,6 +247,125 @@ def test_a_jsx_component_is_a_call_of_it():
     assert targets(jsx, "Bar", "Button", "src/Bar.jsx") == (
         {(f, "resolved") for f in candidates("src/Button")} | {("src/Button/", "package")}
     )
+
+
+def test_jsx_in_a_callback_or_render_prop_renders_from_the_enclosing_function():
+    """An element inside an anonymous arrow (a list callback, an inline
+    render prop, a nested one) renders from the named function holding it,
+    unless its tag is a callback's parameter; calls there stay unattributed,
+    and a named arrow's elements are its own."""
+    source = """
+        import { Row, Empty, Panel, format } from './ui';
+
+        export function List({ items }) {
+          const Item = () => <Empty />;
+          return (
+            <ul>
+              {items.map((i) => <Row key={i} label={format(i)} />)}
+              {items.map((Comp) => <Comp />)}
+              <Panel render={() => [1].map(() => <Empty />)} />
+            </ul>
+          );
+        }
+    """
+    found = calls(source, "src/List.tsx")
+    names = {n for c, n, _f, _conf in found if c == "List"}
+    assert {"Row", "Empty", "Panel"} <= names
+    assert "Comp" not in names and "format" not in names
+    assert {n for c, n, _f, _conf in found if c == "Item"} >= {"Empty"}
+
+
+def test_a_class_component_renders_through_its_render():
+    """`<Modal />` of a class component is a call of the `render` the class
+    owns: a class of the file (or the in-file base defining it) and an
+    imported one's (named, default or namespace), never an owner-less pin;
+    a function component of the file adds none."""
+    source = """
+        import React from 'react';
+        import { Dialog } from './Dialog';
+        import Sheet from './Sheet';
+        import * as Ui from './ui';
+
+        class Base extends React.Component { render() { return <div />; } }
+        class Local extends Base {}
+        function Plain() { return <span />; }
+
+        export function App() {
+          return <main><Local /><Plain /><Dialog /><Sheet /><Ui.Panel /></main>;
+        }
+    """
+    result = extract_js_file(textwrap.dedent(source), "src/App.tsx", "repo")
+    rows = {(r.to_file, r.to_owner) for r in result.relationships
+            if r.rel_type == "CALLS" and r.from_name == "App" and r.to_name == "render"}
+    assert ("src/App.tsx", "Base") in rows
+    assert {owner for _f, owner in rows} == {"Base", "Dialog", "default", "Panel"}
+    assert ("src/Dialog.tsx", "Dialog") in rows and ("src/Sheet.tsx", "default") in rows
+
+
+def test_a_destructured_parameter_or_a_local_is_no_class_component():
+    """`<Widget />` naming a destructured parameter (not a default value's
+    name) or a local `const Widget = pick()` renders no imported class's
+    `render`, nor calls the import."""
+    source = """
+        import { Widget, Panel, Fallback } from './ui';
+
+        export function A({ Widget }) { return <Widget />; }
+        export function B({ item = Fallback }) { return <Fallback />; }
+        export function C() { const Panel = pick(); return <Panel />; }
+    """
+    result = extract_js_file(textwrap.dedent(source), "src/A.tsx", "repo")
+    rows = {(r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}
+    assert ("A", "render") not in rows and ("A", "Widget") not in rows
+    assert ("B", "render") in rows and ("B", "Fallback") in rows
+    assert ("C", "render") not in rows and ("C", "Panel") not in rows
+
+
+def test_a_block_local_shadows_a_tag_only_in_its_block():
+    """A `const` in a nested block doesn't shadow the import outside it (the
+    element still renders the import, as before locals shadowed); a
+    `for (const Row of ...)` head and a `catch (Err)` shadow inside their
+    block only."""
+    source = """
+        import { Widget, Row, Err } from './ui';
+
+        export function A(x) {
+          if (x) { const Widget = 1; }
+          return <Widget />;
+        }
+        export function B(rows) {
+          for (const Row of rows) { use(<Row />); }
+          try { run(); } catch (Err) { return <Err />; }
+          return null;
+        }
+        export function C() { return [<Row />, <Err />]; }
+    """
+    found = {(c, n) for c, n, _f, _conf in calls(source, "src/A.tsx")}
+    assert ("A", "Widget") in found
+    assert ("B", "Row") not in found and ("B", "Err") not in found
+    assert ("C", "Row") in found and ("C", "Err") in found
+
+
+def test_memo_forward_ref_and_styled_components_are_functions():
+    """`memo(fn)`, `forwardRef(fn)` (and `React.` ones, nested) make the
+    declarator a Function of the wrapped function's body; a styled
+    component is a Function with no body. Rendering each links it."""
+    source = """
+        import React, { memo, forwardRef } from 'react';
+        import styled from 'styled-components';
+
+        const Title = styled.h1`color: red;`;
+        const Shell = styled(Title).attrs({})`margin: 0;`;
+        export const Card = memo(function Card() { return <Title />; });
+        export const Input = React.memo(forwardRef((props, ref) => <Shell ref={ref} />));
+        export function Page() { return <><Card /><Input /></>; }
+    """
+    result = extract_js_file(textwrap.dedent(source), "src/Page.tsx", "repo")
+    functions = {n.name for n in result.nodes if n.label == "Function"}
+    assert {"Title", "Shell", "Card", "Input", "Page"} <= functions
+    found = calls(source, "src/Page.tsx")
+    assert ("Card", "Title", "src/Page.tsx", "resolved") in found
+    assert ("Input", "Shell", "src/Page.tsx", "resolved") in found
+    assert {("Page", "Card", "src/Page.tsx", "resolved"), ("Page", "Input", "src/Page.tsx", "resolved")} <= found
 
 
 def test_the_index_upgrade_replaces_bare_js_calls(tmp_path, monkeypatch):
@@ -272,7 +412,7 @@ def test_the_index_upgrade_replaces_bare_js_calls(tmp_path, monkeypatch):
             return result
 
         with monkeypatch.context() as old:
-            old.setattr(dispatch, "extract_js_file", old_extract)
+            stub(old, dispatch, "extract_js_file", old_extract)
             provision_repository_schema(engine, tmp_path)
             engine.upsert_repository(repo_id, repo_id, str(tmp_path))
             dispatch.full_scan(engine, repo_id, tmp_path)

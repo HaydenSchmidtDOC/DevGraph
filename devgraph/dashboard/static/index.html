@@ -345,6 +345,7 @@ table.logtable tbody tr:hover { background: color-mix(in oklab, var(--accent), t
 .topology-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
 .repo-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 3; max-width: 420px; padding: 16px 20px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface); color: var(--fg-2); font-size: 13px; line-height: 1.6; text-align: center; pointer-events: auto; }
 .repo-empty code { font-family: var(--font-mono); color: var(--fg); }
+.neo4j-down { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 4; max-width: 560px; padding: 10px 16px; border: 1px solid var(--danger); border-radius: var(--radius-md); background: var(--surface); color: var(--fg); font-size: 13px; line-height: 1.5; }
 .placeholder-note { font-size: 11px; color: var(--meta); line-height: 1.5; margin-top: 6px; }
 
 .settings-overlay { position: fixed; inset: 0; z-index: 80; background: var(--bg); display: none; overflow-y: auto; }
@@ -492,6 +493,7 @@ table.dstable input[type="text"] { width: 100%; }
   </div>
   <canvas id="glowCanvas"></canvas>
   <div id="cy"></div>
+  <div id="neo4jDownState" class="neo4j-down" role="alert" hidden></div>
   <div id="repoEmptyState" class="repo-empty" hidden>No repositories registered yet. Register one with <code>devgraph register &lt;path&gt;</code>, or with <b>+ Register repo</b> above.</div>
   <div class="control-flyout" id="controlFlyout" data-od-id="graph-control-panel">
     <div class="control-panel-body">
@@ -1018,6 +1020,7 @@ const BUILTIN_NODE_TYPES = [
   { id:"Database",         cat:"database",     count:6 },
   { id:"VectorStore",      cat:"vectorstore",  count:3 },
   { id:"Queue",            cat:"queue",        count:2 },
+  { id:"Cache",            cat:"cache",        count:0 },
   { id:"Requirement",      cat:"phase2",       count:null },
   { id:"DesignDecision",   cat:"phase2",       count:null },
   { id:"ArchitectureNote", cat:"phase2",       count:null },
@@ -1045,6 +1048,7 @@ const CAT_COLORS = {
   database:    "#f0813c",
   vectorstore: "#dc2626",
   queue:       "#e0559e",
+  cache:       "#c084fc",
   phase2:      "#9299a6",
   phase3:      "#6b7280",
 };
@@ -1248,6 +1252,7 @@ async function loadSchemaTypes(repo) {
    graph, and counts all move together. Falls back to the old client-only
    glow-filter when Neo4j isn't reachable (demo mode has nothing to fetch). */
 function isolateChanged() {
+  nodeCeilingUncapped = false;
   refreshIsolateUI();
   if (neo4jConnected) refreshGraph("full", true);
   else applyState(false, "full");
@@ -1290,7 +1295,7 @@ function buildElements() {
   els.push({ data:{ source:"mod:0", target:"db:neo4j", label:"READS_FROM" } });
   return els;
 }
-const STRUCTURAL_CATS = new Set(["repo","service","database","vectorstore","queue","endpoint"]);
+const STRUCTURAL_CATS = new Set(["repo","service","database","vectorstore","queue","cache","endpoint"]);
 const cy = cytoscape({
   container: document.getElementById("cy"),
   /* starts empty, not seeded with the mock graph -- buildElements() is only
@@ -2648,6 +2653,8 @@ async function runCypher(statement, opts) {
       record: !!opts?.record,
       // read transaction server-side: the server refuses any write
       preview: !!opts?.preview,
+      // only what the canvas draws: names and identity, no full properties
+      canvas: !!opts?.canvas,
     }),
   });
   return res.json();
@@ -2676,16 +2683,38 @@ let REGISTERED_REPO_IDS = [];
 function allReposClause(alias) {
   return `${alias}.repo_id IN [${REGISTERED_REPO_IDS.map(id => `"${escapeCypherStr(id)}"`).join(", ")}]`;
 }
+/* The canvas never fetches a whole large scope on its own: the node ceiling
+   is seeded at CANVAS_NODE_CAP (about what the canvas still draws smoothly),
+   so the default query always carries a LIMIT once the scope is bigger than
+   that, and the canvas says how much it is showing (canvasCapNotice). Only
+   releasing the slider at its max asks for everything; the console's row cap
+   and timeout still bound that. */
+const CANVAS_NODE_CAP = 1500;
+let nodeCeilingUncapped = false;
+let scopeNodeTotal = 0;
+/* Releasing the slider at its max lifts the cap only where there is one to
+   lift; the choice lasts for this scope, and a repository or isolation
+   change starts the next scope capped again. */
+function uncapRequested(value, max) {
+  return value >= max && max > CANVAS_NODE_CAP;
+}
+function seededNodeCeiling(total) {
+  return nodeCeilingUncapped ? total : Math.min(total, CANVAS_NODE_CAP);
+}
+function canvasCapNotice(ceiling, total) {
+  if (!(ceiling < total)) return null;
+  return `Showing ${ceiling.toLocaleString()} of ${total.toLocaleString()} nodes: narrow the view by isolating an entity or relationship type, or raise the Node ceiling.`;
+}
 function currentStateQuery() {
   const repo = document.getElementById("repoSelect").value;
   const isolatedEntityId = state.isolatedEntity;
   const nodeWhere = [repo === "__all__" ? allReposClause("n") : `n.repo_id = "${escapeCypherStr(repo)}"`];
   if (isolatedEntityId) nodeWhere.push(`labels(n)[0] = "${escapeCypherStr(isolatedEntityId)}"`);
-  // A ceiling maxed out (the default) means "no cap" -- leave its LIMIT out
-  // of the query entirely rather than spelling out the current real total,
-  // so the query stays correct as the real total changes instead of
-  // silently going stale. Only a slider deliberately dragged below its max
-  // adds a LIMIT.
+  // A ceiling maxed out means "no cap" -- leave its LIMIT out of the query
+  // entirely rather than spelling out the current real total, so the query
+  // stays correct as the real total changes instead of silently going
+  // stale. A slider below its max (the default for a scope larger than
+  // CANVAS_NODE_CAP, see seededNodeCeiling) adds a LIMIT.
   const nodeSlider = document.getElementById("ctlNodeCeiling");
   const relSlider = document.getElementById("ctlRelCeiling");
   const nodeLimited = state.nodeCeiling < +nodeSlider.max;
@@ -2748,7 +2777,7 @@ async function runQueryAndUpdateGraph(query, opts) {
   document.getElementById("cypherInput").value = query;
   syncCypherHighlight();
   const mySeq = ++glowRequestSeq;
-  const json = await runCypher(query, { record: !!opts?.record });
+  const json = await runCypher(query, { record: !!opts?.record, canvas: !!opts?.canvas });
   if (json.errors?.length) return { ok: false, json };
   const result = json.results[0];
   const elements = mapGraphResultToElements(result.data);
@@ -2816,9 +2845,9 @@ async function refreshGraph(mode, record, structural) {
   const replace = structural || !state.highlightMode;
   let ok = false;
   try {
-    const res = await runQueryAndUpdateGraph(q, { record, mode, replace });
+    const res = await runQueryAndUpdateGraph(q, { record, mode, replace, canvas: true });
     ok = res.ok;
-    if (!res.superseded && res.json?.results?.[0]) showTruncatedNotice(res.json.results[0]);
+    if (!res.superseded && res.json?.results?.[0]) showTruncatedNotice(res.json.results[0], canvasCapNotice(state.nodeCeiling, scopeNodeTotal));
   } catch (e) { /* network hiccup -- leave whatever's on screen alone */ }
   return ok;
 }
@@ -2922,6 +2951,13 @@ cypherInput.addEventListener("input", () => {
   previewDebounce = setTimeout(() => schedulePreview(cypherInput.value), 450);
 });
 
+/* One banner over the canvas while Neo4j can't be reached (or refuses the
+   login): the server's message, which names what to start or check. */
+function showNeo4jDown(message) {
+  const el = document.getElementById("neo4jDownState");
+  el.textContent = message || "";
+  el.hidden = !message;
+}
 async function populateRealRepos(fireChangeEvent) {
   // Registered repos (SQLite registry, via /api/repos) are the source of
   // truth for what's selectable here -- not a direct Neo4j query, which
@@ -2930,6 +2966,9 @@ async function populateRealRepos(fireChangeEvent) {
   const resp = await fetch("/api/repos");
   if (!resp.ok) return;
   const json = await resp.json();
+  // The list comes from the registry whether or not Neo4j answers; when it
+  // doesn't, the server says why (graph_unavailable), in the MCP's wording.
+  showNeo4jDown(json.graph_unavailable || null);
   const ids = (json.repos || []).filter(r => r.active).map(r => r.repo_id).sort();
   REGISTERED_REPO_IDS = ids;
   // Built even when empty: an early return here used to leave the static
@@ -2984,7 +3023,11 @@ const legendStatus = document.getElementById("neo4jStatusLegend");
 async function bootConnect() {
   try {
     const json = await runCypher("RETURN 1 AS ok");
-    if (json.errors?.length) throw new Error(json.errors[0].message);
+    if (json.errors?.length) {
+      if (json.errors[0].code === "Neo4jUnavailable") showNeo4jDown(json.errors[0].message);
+      throw new Error(json.errors[0].message);
+    }
+    showNeo4jDown(null);
     neo4jConnected = true;
     neo4jStatus.textContent = "● Neo4j connected (via dashboard proxy)";
     neo4jStatus.style.color = "var(--success)";
@@ -3009,6 +3052,8 @@ async function bootConnect() {
        can still be live. Polling picks Neo4j back up if it returns. */
     attemptMemoryMetrics({ neo4jDown: true });
     startMemoryPolling();
+    // The registered repositories still list (the registry needs no Neo4j).
+    try { await populateRealRepos(false); } catch (e2) { /* the dashboard server itself is gone */ }
     cy.add(buildElements());
     forceDirectedSettle(() => focusRotation(null, 60));
   }
@@ -3063,6 +3108,42 @@ function applyCatchUpPill(event) {
    is already handled by loadFullGraph/mergeGraphElements (it auto-picks a
    "light", non-disruptive settle when only a small fraction of the graph
    changed), so a reindex event just re-triggers a normal load. */
+/* ── Live refresh ── */
+/* A save publishes "reindexed", and an open tab used to refetch its whole
+   view for every one. Live refreshes are coalesced instead: the first event
+   starts a timer and later ones join it, so the view refetches at most once
+   per window, never two at a time, and an event during a refresh queues one
+   more. A view whose scope is larger than the canvas cap waits longer. */
+const LIVE_REFRESH_DELAY_MS = 1500;
+const LIVE_REFRESH_LARGE_DELAY_MS = 15000;
+let liveRefreshTimer = null;
+let liveRefreshRunning = false;
+let liveRefreshPending = false;
+function liveRefreshDelay() {
+  return scopeNodeTotal > CANVAS_NODE_CAP ? LIVE_REFRESH_LARGE_DELAY_MS : LIVE_REFRESH_DELAY_MS;
+}
+function scheduleLiveRefresh() {
+  if (liveRefreshTimer !== null) return;
+  liveRefreshTimer = setTimeout(runLiveRefresh, liveRefreshDelay());
+}
+async function runLiveRefresh() {
+  liveRefreshTimer = null;
+  if (liveRefreshRunning) { liveRefreshPending = true; return; }
+  liveRefreshRunning = true;
+  try {
+    if (neo4jConnected) {
+      /* a rescan is also what applies a changed schema file, so reload the
+         types first: the pending hint clears and new labels get their rows
+         and colours before the graph that contains them is drawn. */
+      await loadSchemaTypes(document.getElementById("repoSelect").value);
+      await refreshGraph();
+    }
+  } finally {
+    liveRefreshRunning = false;
+    if (liveRefreshPending) { liveRefreshPending = false; scheduleLiveRefresh(); }
+  }
+}
+/* ── end Live refresh ── */
 function connectLiveEvents() {
   const es = new EventSource("/api/events");
   es.onmessage = async (e) => {
@@ -3081,15 +3162,12 @@ function connectLiveEvents() {
        that report a real diff, so a noisy/looping publisher on the backend
        can't turn this into a client-side request storm. */
     if (event.type === "reindexed" && (event.changed || event.deleted)) {
-      /* a rescan is also what applies a changed schema file, so reload the
-         types first: the pending hint clears and new labels get their rows
-         and colours before the graph that contains them is drawn. */
-      if (neo4jConnected) { await loadSchemaTypes(repo); refreshGraph(); }
+      if (neo4jConnected) scheduleLiveRefresh();
     } else if (event.type === "git_history_synced" && event.mode !== "noop") {
       loadGitHistory(repo);
     } else if (event.type === "insights_refreshed" && neo4jConnected) {
       // Refetching the graph also reloads insights and re-stamps community colours on existing nodes.
-      if (state.colorByCommunity) refreshGraph(); else loadInsights();
+      if (state.colorByCommunity) scheduleLiveRefresh(); else loadInsights();
     } else if (event.type === "registry_changed" && neo4jConnected) {
       populateRealRepos();
     }
@@ -3118,9 +3196,11 @@ const DESTRUCTIVE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP)\b/i;
    show part of a result as the whole of it. A later result that isn't capped
    clears the notice, and only the notice, never an error shown since. */
 let shownTruncatedNotice = null;
-function showTruncatedNotice(result) {
-  if (result.truncated) {
-    shownTruncatedNotice = `Showing the first ${result.data.length.toLocaleString()} rows: the query returned more. Add a LIMIT or narrow the MATCH.`;
+function showTruncatedNotice(result, capNotice) {
+  if (result.truncated || capNotice) {
+    shownTruncatedNotice = result.truncated
+      ? `Showing the first ${result.data.length.toLocaleString()} rows: the query returned more. Add a LIMIT or narrow the MATCH.`
+      : capNotice;
     cypherErrorEl.textContent = shownTruncatedNotice;
   } else if (shownTruncatedNotice !== null && cypherErrorEl.textContent === shownTruncatedNotice) {
     cypherErrorEl.textContent = "";
@@ -3175,7 +3255,7 @@ document.querySelectorAll('#linkOpenConfig').forEach(l => l.addEventListener("cl
    from Neo4j instead of just un-hiding elements that were never fetched. */
 document.getElementById("ctlNodeCeiling").addEventListener("input", e => { state.nodeCeiling = +e.target.value; document.getElementById("valNodeCeiling").textContent = e.target.value; applyState(); });
 document.getElementById("ctlRelCeiling").addEventListener("input", e => { state.relCeiling = +e.target.value; document.getElementById("valRelCeiling").textContent = e.target.value; applyState(); });
-document.getElementById("ctlNodeCeiling").addEventListener("change", () => { if (neo4jConnected) refreshGraph(undefined, true); });
+document.getElementById("ctlNodeCeiling").addEventListener("change", e => { nodeCeilingUncapped = uncapRequested(+e.target.value, +e.target.max); if (neo4jConnected) refreshGraph(undefined, true); });
 document.getElementById("ctlRelCeiling").addEventListener("change", () => { if (neo4jConnected) refreshGraph(undefined, true); });
 
 document.getElementById("layoutSelect").addEventListener("change", () => {
@@ -3199,6 +3279,7 @@ document.getElementById("graphSearch").addEventListener("input", e => {
 document.getElementById("pullTab").addEventListener("click", () => document.getElementById("controlFlyout").classList.toggle("open"));
 async function onRepoSelectChange(e) {
   const v = e.target.value;
+  nodeCeilingUncapped = false;
   if (!e.automatic) localStorage.setItem(SELECTED_REPO_KEY, v);
   applyCatchUpPill(null);
   if (neo4jConnected) await loadSchemaTypes(v); // before the graph fetch, so a type the new repo lacks is no longer isolated
@@ -6019,13 +6100,15 @@ async function loadTopologyCounts() {
       const realTotal = Object.values(counts).reduce((a, b) => a + b, 0);
       document.getElementById("entityTotal").textContent = realTotal.toLocaleString();
       setRenderThresholdDefault(realTotal);
+      scopeNodeTotal = realTotal;
       const nodeSlider = document.getElementById("ctlNodeCeiling");
       const wasAtCeiling = +nodeSlider.value >= +nodeSlider.max;
       nodeSlider.max = realTotal;
       if (wasAtCeiling) {
-        nodeSlider.value = realTotal;
-        document.getElementById("valNodeCeiling").textContent = realTotal;
-        state.nodeCeiling = realTotal;
+        const seeded = seededNodeCeiling(realTotal);
+        nodeSlider.value = seeded;
+        document.getElementById("valNodeCeiling").textContent = seeded;
+        state.nodeCeiling = seeded;
       }
     }
     const relFilters = [];

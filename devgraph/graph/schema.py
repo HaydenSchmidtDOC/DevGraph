@@ -9,6 +9,7 @@ hardcoding label strings.
 
 import re
 from collections.abc import Iterable
+from functools import lru_cache
 from typing import NamedTuple
 
 NODE_LABELS: tuple[str, ...] = (
@@ -68,8 +69,11 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # edges (see devgraph/indexer/common.py `name_ref_properties`),
 # `name_ref_visible` the C# projects its file's sites see (`visible_to`), and
 # `shared_claims` the shared nodes its file claims (graph/engine.py
-# `SHARED_CLAIM_SEP`). `mkeys` is a
+# `SHARED_CLAIM_SEP`), and `route_mounts`/`route_exports`/`route_prefixes`
+# its Express routers' mounts across files (indexer/apis/routes.py). `mkeys` is a
 # code symbol's match keys, which a pin's `@` flag tests (see `split_pin`),
+# and its heir keys (`HEIR_KEY`), which an owned target end tests, as it
+# tests a code Module's `heir_open` (its file's open classes),
 # and `mkeys_stale` marks one whose edges a batch has yet to relink after
 # they changed (see graph/engine.py `write_match_keys`). A code symbol's
 # `owner` (its identity within its file, see FILE_SCOPED_LABELS) and a C#
@@ -79,16 +83,18 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
     "repo_id", "name", "file", "source_file", "source", "sources", "claims", "extractor",
     "name_refs", "name_ref_targets", "name_ref_sources", "name_ref_visible", "mkeys", "mkeys_stale",
-    "shared_claims",
+    "shared_claims", "route_mounts", "route_exports", "route_prefixes", "heir_open",
 })
 
 # The pipeline's own bookkeeping among those, plus the Repository node's
-# `skipped_files` (the files a scan left out, see dispatch `_skip_marks`):
+# `skipped_files` (the files a scan left out, see dispatch `_skip_marks`) and
+# its full-scan claim, `scan_owner` and `scan_heartbeat` (dispatch `_claim_full_scan`):
 # hidden wherever a node's properties are shown (describe_node, the
 # dashboard's node inspector).
 INTERNAL_NODE_PROPERTIES: frozenset[str] = frozenset({
     "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources", "name_ref_visible", "mkeys",
-    "mkeys_stale", "shared_claims", "skipped_files",
+    "mkeys_stale", "shared_claims", "route_mounts", "route_exports", "route_prefixes", "skipped_files",
+    "heir_open", "scan_owner", "scan_heartbeat",
 })
 
 # An extracted edge's bookkeeping: `origins`, the files that wrote it
@@ -140,6 +146,12 @@ CLAIMED_LABELS: tuple[str, ...] = (
 # constraint). A query over every node of a repository seeks these, never
 # `{repo_id}` alone.
 NAMED_LABELS: tuple[str, ...] = tuple(label for label in NODE_LABELS if label != "Repository") + ("Cache",)
+# Every built-in label: NODE_LABELS and Cache. Tools and the dashboard list,
+# describe, validate and search by these, never by NODE_LABELS alone.
+BUILTIN_LABELS: tuple[str, ...] = NODE_LABELS + ("Cache",)
+# The datastore labels the datastore extractor writes (indexer/datastores/
+# extractor.py DatastoreType), which a Service `USES`.
+DATASTORE_LABELS: tuple[str, ...] = ("Database", "VectorStore", "Queue", "Cache")
 
 
 def constraint_statements() -> list[str]:
@@ -233,6 +245,12 @@ OWNER_PIN_SEP = "\x1c"
 #: The last field of a `name_refs` entry written since owners (index format
 #: 11), which no older entry's last field can be: its layout is then fixed.
 NAME_REF_OWNED = "\x1b"
+#: Starts a member's *heir key* among its `mkeys`: `Base.save` holds `<User`
+#: when `User`, a class of its file, inherits `save` from `Base`, the
+#: nearest base of the file defining it (common.heir_keys). A target end
+#: owned by `User` (an owned pin) links it too (graph/engine.py
+#: `_owner_test`). No C# match key starts with it.
+HEIR_KEY = "<"
 
 
 # Path pins: a relationship row's `to_file` (see devgraph/indexer/common.py
@@ -291,6 +309,13 @@ _PIN_FLAGS = re.compile(
 )
 
 
+#: How many distinct pins `split_pin` and `pin_kind` remember: a batch
+#: writes the same few thousand pins over and over (on a full scan they were
+#: about 15 % of its time), and both are pure functions of the string.
+_PIN_CACHE_SIZE = 1 << 16
+
+
+@lru_cache(maxsize=_PIN_CACHE_SIZE)
 def split_pin(pin: str) -> PinParts:
     """A pin and its flags, in this order after the path: `~` (a directory
     pin at package confidence, kind `loose_dir`), `?a,b` (a matched file must
@@ -380,6 +405,7 @@ def pin_root(pin: str, path: str) -> str:
     return path
 
 
+@lru_cache(maxsize=_PIN_CACHE_SIZE)
 def pin_kind(pin: str | None) -> str:
     """How a `to_file` matches: "name" (None: by name alone), "fileless" (""),
     "file", "dir" (`a/b/.`: files directly in a/b/; `.`: the root's files),

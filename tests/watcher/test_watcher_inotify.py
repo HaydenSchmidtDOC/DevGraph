@@ -113,6 +113,7 @@ def test_ignored_and_gitignored_folders_get_no_kernel_watch(tmp_path):
     (root / ".gitignore").write_text("generated/\n")
     for folder in ("node_modules/a/b", "pkg0/.venv/lib/site", "pkg1/build/out", "generated/x/y", "pkg1/sub/generated/z"):
         (root / folder).mkdir(parents=True)
+    (root / "pkg1/package.json").write_text("{}\n")  # pkg1/build is build output beside its manifest
     w = Watching(tmp_path, root, git=False)
     before = set(inotify_watches())
     w.manager.start()
@@ -162,6 +163,33 @@ def test_a_folder_no_longer_gitignored_is_watched(tmp_path):
             return "gen/deep/g.py" in w.seen()
 
         wait_for(edit_seen, lambda: f"the edit under gen/; got {w.seen()}")
+    finally:
+        w.close()
+
+
+def test_a_build_output_folder_no_longer_beside_a_manifest_is_watched(tmp_path):
+    """Removing the manifest beside `tools/dist` makes it source: it gets a
+    watch, and its files are offered, as a folder no longer gitignored is."""
+    root = make_repo(tmp_path, "repo", 1)
+    (root / "tools/dist/deep").mkdir(parents=True)
+    (root / "tools/dist/deep/g.py").write_text("g = 1\n")
+    (root / "tools/pyproject.toml").write_text("[project]\nname = 'tools'\n")
+    w = Watching(tmp_path, root, git=False)
+    w.manager.start()
+    try:
+        time.sleep(0.3)
+        assert "tools/dist/deep/g.py" not in w.seen()
+        (root / "tools/pyproject.toml").unlink()
+        # The rewatch the removal asks for offers the folder's files.
+        wait_for(lambda: "tools/dist/deep/g.py" in w.seen(), lambda: f"the folder's files offered; got {w.seen()}")
+        w.batches.clear()
+
+        def edit_seen() -> bool:
+            (root / "tools/dist/deep/g.py").write_text(f"g = {time.monotonic()}\n")
+            time.sleep(0.8)
+            return "tools/dist/deep/g.py" in w.seen()
+
+        wait_for(edit_seen, lambda: f"the edit under tools/dist/; got {w.seen()}")
     finally:
         w.close()
 

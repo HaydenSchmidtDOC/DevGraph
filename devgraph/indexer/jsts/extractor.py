@@ -56,9 +56,10 @@ Known limitations (v1 scope cuts, documented per Implementation Plan #8):
     MATCH-links real existing nodes). A bare specifier the file's
     tsconfig.json/jsconfig.json maps (`paths`, `baseUrl`, through `extends`
     and `references`; see resolver_config.py) names the same candidates
-    under the mapped path; any other bare specifier (`import x from
-    'lodash'`) is an external package, with no IMPORTS edge. No pnpm/yarn
-    workspace resolution.
+    under the mapped path, and so does the name of a workspace package (the
+    root package.json's `workspaces` or pnpm-workspace.yaml's `packages`)
+    under that package's entry point or subpath; any other bare specifier
+    (`import x from 'lodash'`) is an external package, with no IMPORTS edge.
 """
 
 from __future__ import annotations
@@ -71,15 +72,20 @@ import tree_sitter_javascript as tsjs
 import tree_sitter_typescript as tsts
 from tree_sitter import Language, Node, Parser
 
-from devgraph.indexer.apis.routes import add_route, join_route
+from devgraph.indexer.apis.routes import MOUNT_SEP, add_route, join_route, mount_entry, unmounted_endpoint
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, call_rows
 from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    UNKNOWN_BASE,
+    add_heir_keys,
+    class_member_pin,
     member_owner,
+    merge_same_nodes,
     own_edges,
     owned_pin,
+    split_owned_pin,
 )
 from devgraph.indexer.resolver_config import ResolverConfig
 
@@ -222,29 +228,256 @@ def _jsx_component(node: Node) -> Node | None:
     return None
 
 
+#: Calls that wrap a function component (`memo(fn)`, `React.forwardRef(fn)`):
+#: `const Card = memo(() => ...)` is the component `Card`.
+_COMPONENT_WRAPPERS = frozenset({"memo", "forwardRef"})
+
+
+def _function_value(value: Node | None) -> Node | None:
+    """The function a declarator's value defines, the node a Function is
+    made of: a function or arrow; the one a component wrapper takes
+    (`memo(...)`, `forwardRef(...)`, nested); a styled component
+    (`styled.div`...``, `styled(Button)`...``), which has no body. None for
+    anything else."""
+    if value is None:
+        return None
+    if value.type in _FUNCTION_VALUE_TYPES:
+        return value
+    if value.type != "call_expression":
+        return None
+    func, args = value.child_by_field_name("function"), value.child_by_field_name("arguments")
+    if func is None or args is None:
+        return None
+    if args.type == "template_string":
+        callee = func  # `styled.div`, `styled(Button)`, `styled.div.attrs({})`, down to `styled`
+        while callee is not None and callee.type in ("member_expression", "call_expression"):
+            callee = callee.child_by_field_name("object" if callee.type == "member_expression" else "function")
+        return value if callee is not None and callee.type == "identifier" and callee.text == b"styled" else None
+    name = func.text.rsplit(b".", 1)[-1].decode("utf-8", errors="replace")
+    if name in _COMPONENT_WRAPPERS and args.named_children:
+        return _function_value(args.named_children[0])
+    return None
+
+
+def _named_function(node: Node) -> bool:
+    """Whether the function or arrow `node` is a Function of its own: a
+    declarator's (`_function_value`), a class field's, a defined object
+    literal's property (`_object_path`) or a module-level export's
+    (`exports.x = ...`, `_export_path`) value."""
+    parent = node.parent
+    while parent is not None and parent.type in ("arguments", "call_expression", "parenthesized_expression"):
+        parent = parent.parent
+    if parent is None:
+        return False
+    if parent.type in ("field_definition", "public_field_definition"):
+        return True
+    if parent.type == "variable_declarator":
+        value = parent.child_by_field_name("value")
+    elif parent.type == "pair" and _member_key(parent) is not None and _object_path(parent.parent) is not None:
+        value = parent.child_by_field_name("value")
+    elif parent.type == "assignment_expression" and _export_path(parent) is not None:
+        value = parent.child_by_field_name("right")
+    else:
+        return False
+    defined = _function_value(value)
+    return defined is not None and (defined.start_byte, defined.end_byte) == (node.start_byte, node.end_byte)
+
+
+#: Wrappers an object literal's value can sit in (`{...} as const`).
+_OBJECT_WRAPPERS = ("parenthesized_expression", "as_expression", "satisfies_expression")
+
+
+def _object_value(value: Node | None) -> Node | None:
+    """The object literal `value` is, through `_OBJECT_WRAPPERS`; else None."""
+    while value is not None and value.type in _OBJECT_WRAPPERS and value.named_children:
+        value = value.named_children[0]
+    return value if value is not None and value.type == "object" else None
+
+
+def _member_key(pair: Node) -> str | None:
+    """A `pair`'s or object `method_definition`'s name when it is a plain
+    property name (`getUser: ...`, `async getUser() {}`), else None."""
+    key = pair.child_by_field_name("key" if pair.type == "pair" else "name")
+    return key.text.decode("utf-8", errors="replace") if key is not None and key.type == "property_identifier" else None
+
+
+def _export_path(assignment: Node) -> tuple[str, ...] | None:
+    """What a module-level CommonJS export assignment defines: `exports.x =
+    ...` and `module.exports.x = ...` the top-level name `x` (`("x",)`),
+    `module.exports = ...` the module's own exports (`()`); None for any
+    other assignment, or one not a statement of the module itself."""
+    statement = assignment.parent
+    if statement is None or statement.type != "expression_statement" or statement.parent is None or (
+        statement.parent.type != "program"
+    ):
+        return None
+    left = assignment.child_by_field_name("left")
+    if left is None or left.type != "member_expression":
+        return None
+    if left.text == b"module.exports":
+        return ()
+    obj, prop = left.child_by_field_name("object"), left.child_by_field_name("property")
+    if obj is not None and obj.text in (b"exports", b"module.exports") and prop is not None and (
+        prop.type == "property_identifier"
+    ):
+        return (prop.text.decode("utf-8", errors="replace"),)
+    return None
+
+
+def _object_path(obj: Node | None) -> tuple[str, ...] | None:
+    """The names an object literal's methods are owned by, below the scope
+    it is defined in: its declarator's (`const userService = {...}`:
+    `("userService",)`), an export's (`exports.api = {...}`: `("api",)`,
+    `module.exports = {...}`: none, its members top-level ones), and a
+    property's of such an object (`{ admin: {...} }` adds `"admin"`); None
+    for any other object (an argument, a returned value)."""
+    parent = obj.parent if obj is not None else None
+    while parent is not None and parent.type in _OBJECT_WRAPPERS:
+        parent = parent.parent
+    if parent is None:
+        return None
+    if parent.type == "variable_declarator":
+        name = parent.child_by_field_name("name")
+        return (name.text.decode("utf-8", errors="replace"),) if name is not None and name.type == "identifier" else None
+    if parent.type == "assignment_expression":
+        return _export_path(parent)
+    if parent.type == "pair":
+        outer, key = _object_path(parent.parent), _member_key(parent)
+        return (*outer, key) if outer is not None and key is not None else None
+    return None
+
+
+#: Statements whose blocks run in the scope around them: a function
+#: declared in one is that scope's, as a direct one is.
+_COMPOUND_STATEMENTS = frozenset({
+    "if_statement", "else_clause", "try_statement", "catch_clause", "finally_clause", "for_statement",
+    "for_in_statement", "while_statement", "do_statement", "switch_statement", "switch_body", "switch_case",
+    "switch_default", "labeled_statement", "statement_block",
+})
+
+
+def _compound_statements(node: Node) -> list[Node]:
+    """The statements (and heads) inside a compound statement's blocks and
+    clauses, at any depth of them, not inside a function or class."""
+    found: list[Node] = []
+    for child in node.named_children:
+        if child.type in _COMPOUND_STATEMENTS:
+            found += _compound_statements(child)
+        else:
+            found.append(child)
+    return found
+
+
+def _pattern_names(pattern: Node | None) -> set[bytes]:
+    """The names a binding pattern binds: an identifier, and those of an
+    object, array or rest pattern, never a default value's (`{ a = b }`
+    binds `a`) nor a type annotation's."""
+    found: set[bytes] = set()
+    pending = [pattern] if pattern is not None else []
+    while pending:
+        node = pending.pop()
+        if node.type in ("identifier", "shorthand_property_identifier_pattern"):
+            found.add(node.text)
+        elif node.type in ("assignment_pattern", "object_assignment_pattern"):
+            pending.append(node.child_by_field_name("left"))
+        elif node.type == "pair_pattern":
+            pending.append(node.child_by_field_name("value"))
+        elif node.type in ("required_parameter", "optional_parameter"):
+            pending.append(node.child_by_field_name("pattern"))
+        elif node.type in ("object_pattern", "array_pattern", "rest_pattern", "formal_parameters"):
+            pending += node.named_children
+    return {name for name in found if name}
+
+
+def _bound_names(func: Node) -> set[bytes]:
+    """Every name a function's parameters bind, destructured ones included
+    (`_pattern_names`)."""
+    return _pattern_names(func.child_by_field_name("parameters") or func.child_by_field_name("parameter"))
+
+
+def _declared_names(declaration: Node) -> set[bytes]:
+    """The names a `const`/`let`/`var` declaration binds to anything but a
+    function (`const Widget = pick()`, `const { Row } = parts`)."""
+    return {
+        name for declarator in declaration.named_children if declarator.type == "variable_declarator"
+        and _function_value(declarator.child_by_field_name("value")) is None
+        for name in _pattern_names(declarator.child_by_field_name("name"))
+    }
+
+
+def _decode(names: set[bytes]) -> set[str]:
+    return {name.decode("utf-8", errors="replace") for name in names}
+
+
+def _local_names(body: Node) -> set[str]:
+    """The names a function body binds throughout (`_declared_names`): its
+    own block's `const`/`let` and every `var` of it, not those of nested
+    functions. A nested block's `const`/`let` shadows only inside it
+    (`_block_names`). They shadow an import or class of their name."""
+    found: set[bytes] = set()
+    pending = [body]
+    while pending:
+        node = pending.pop()
+        if node.type == "variable_declaration" or (node.type == "lexical_declaration" and node.parent == body):
+            found |= _declared_names(node)
+        pending += [child for child in node.named_children if child.type not in _NESTED_SCOPE_TYPES]
+    return _decode(found)
+
+
+def _block_names(site: Node, body: Node) -> set[str]:
+    """The names the blocks between `site` and its function's `body` bind
+    for it: each enclosing block's `const`/`let`, a `for (const W of ...)`
+    or `for (let i = ...)` head's, a `catch (W)` parameter's."""
+    found: set[bytes] = set()
+    child, node = site, site.parent
+    while node is not None and node != body:
+        if node.type == "statement_block":
+            for statement in node.named_children:
+                if statement.type == "lexical_declaration":
+                    found |= _declared_names(statement)
+        elif node.type == "for_in_statement" and child == node.child_by_field_name("body"):
+            found |= _pattern_names(node.child_by_field_name("left"))
+        elif node.type == "for_statement" and child == node.child_by_field_name("body"):
+            initializer = node.child_by_field_name("initializer")
+            if initializer is not None and initializer.type == "lexical_declaration":
+                found |= _declared_names(initializer)
+        elif node.type == "catch_clause" and child == node.child_by_field_name("body"):
+            found |= _pattern_names(node.child_by_field_name("parameter"))
+        child, node = node, node.parent
+    return _decode(found)
+
+
 def _call_functions(body: Node) -> list[Node]:
     """The `function` node of every call expression in `body`, and the name
     of every JSX element rendering a component (`_jsx_component`), not
     descending into nested function/class scopes - those are walked
     separately so calls are attributed to the correct enclosing scope rather
     than hoisted to the outer function (mirrors the Python extractor's
-    `_call_functions`). `require(...)` is module-system syntax, captured by
-    `_extract_imports`."""
+    `_call_functions`). An anonymous function (a callback, `items.map(i =>
+    <Row />)`, an inline render prop; not one `_named_function` makes a
+    Function of its own) is walked for its JSX elements only, which render
+    from the enclosing function, unless their tag names a parameter of a
+    callback holding them. `require(...)` is module-system syntax, captured
+    by `_extract_imports`."""
     found: list[Node] = []
 
-    def walk(node: Node) -> None:
+    def walk(node: Node, shadowed: frozenset[bytes] | None) -> None:
         if node.type in _NESTED_SCOPE_TYPES:
-            return
-        if node.type == "call_expression":
+            if node.type not in _FUNCTION_VALUE_TYPES or _named_function(node):
+                return
+            shadowed = (shadowed or frozenset()) | _bound_names(node)
+        if node.type == "call_expression" and shadowed is None:
             func = node.child_by_field_name("function")
             if func is not None and not (func.type == "identifier" and func.text == b"require"):
                 found.append(func)
         elif node.type in _JSX_TAGS and (name := _jsx_component(node)) is not None:
-            found.append(name)
+            head = name if name.type == "identifier" else name.child_by_field_name("object")
+            if shadowed is None or head is None or head.text not in shadowed:
+                found.append(name)
         for child in node.children:
-            walk(child)
+            walk(child, shadowed)
 
-    walk(body)
+    walk(body, None)
     return found
 
 
@@ -364,16 +597,18 @@ def _resolve_module_specifier(
     match a real indexed Module node simply never produces an edge).
 
     A bare specifier the importing file's tsconfig maps (`paths`, else
-    `baseUrl`; see resolver_config.ResolverConfig.ts_alias, given `config`)
-    names the same candidates for each path it maps to. Any other bare
-    specifier (`lodash`, `@scope/pkg`) is an external package: no candidate.
+    `baseUrl`), or that names a workspace package (`@acme/utils`, its entry
+    point; `@acme/utils/x`, that subpath; see
+    resolver_config.ResolverConfig.bare_import, given `config`), names the
+    same candidates for each path it maps to. Any other bare specifier
+    (`lodash`, `@scope/pkg`) is an external package: no candidate.
     """
     # A bundler query or fragment (`./worker.js?worker`, `./x#frag`) names no file.
     specifier = specifier.split("?", 1)[0].split("#", 1)[0]
     if specifier.startswith("."):
         return _base_candidates(_resolve_relative_base(current_dir, specifier))
-    if config is not None and (aliased := config.ts_alias(specifier, file_path)) is not None:
-        return [candidate for base in aliased for candidate in _base_candidates(base)]
+    if config is not None and (found := config.bare_import(specifier, file_path)) is not None:
+        return list(dict.fromkeys(candidate for base in found[0] for candidate in _base_candidates(base)))
     return []
 
 
@@ -383,12 +618,15 @@ def _specifier_pins(
     """Where a name imported from `specifier` can be defined: its candidate
     files (`_resolve_module_specifier`) and the recursive prefix of each path
     it names, so a barrel's re-export reaches the defining file (as
-    "package"; never the repository root). None for an external package."""
+    "package"; never the repository root), and of a workspace package's
+    directory, whose entry point re-exports from anywhere in it. None for
+    an external package."""
     specifier = specifier.split("?", 1)[0].split("#", 1)[0]
+    packages: list[str] = []
     if specifier.startswith("."):
         bases = [_resolve_relative_base(current_dir, specifier)]
-    elif config is not None and (aliased := config.ts_alias(specifier, file_path)) is not None:
-        bases = aliased
+    elif config is not None and (found := config.bare_import(specifier, file_path)) is not None:
+        bases, packages = found
     else:
         return None
     pins = []
@@ -398,6 +636,7 @@ def _specifier_pins(
         folder = stem if dot and "/" not in ext and f".{ext}" in _EXPLICIT_EXTENSIONS and stem else base
         if folder and "!" not in folder:  # graph/schema.py split_pin: no "!" in a path pin
             pins.append(folder + "/")
+    pins += [folder + "/" for folder in packages if "!" not in folder]
     return list(dict.fromkeys(pins))
 
 
@@ -475,12 +714,15 @@ class _Binding:
     whole module (`* as ns`, `const ns = require(...)`). `top_level` is
     true for an ES named import (`{a}`: a module's top-level function when
     called) and an ES namespace (`* as ns`: its members are top-level ones);
-    a default import or a `require` can bind anything."""
+    a default import or a `require` can bind anything. `default` marks an
+    ES default import: a class it binds is its module's default-exported
+    one, whatever the name (`DEFAULT_EXPORT`)."""
 
     name: str
     pins: tuple[str, ...] | None
     namespace: bool
     top_level: bool = False
+    default: bool = False
 
 
 @dataclass
@@ -510,6 +752,75 @@ class _Scope:
     def nested(self, params: set[str], types: dict[str, list[str]]) -> _Scope:
         outer = {name: t for name, t in self.types.items() if name not in params}
         return _Scope(self.cls, self.params | params, {**outer, **types})
+
+
+#: The owner a default import's class names (`import Thing from './thing';
+#: new Thing().start()`): the default export is its heir (`_module_heirs`),
+#: so `export default class ThingImpl`'s members, and those it inherits,
+#: hold its heir key (common.heir_keys). No class can be named `default`.
+DEFAULT_EXPORT = "default"
+
+
+def _module_heirs(root: Node, source: bytes, classes: dict[str, _ClassInfo]) -> list[tuple[str, str, list, tuple]]:
+    """The file's module-level aliases and instances of a class, as
+    member-less class declarations common.heir_keys reads: a CapWords
+    `const` (`export const UserService = new UserServiceImpl()`, `const
+    UserModel = User`) and the default export (`export default class X`,
+    `export default X;`, `export default new Client()`, `export { Impl as
+    default }`, `module.exports = X`), DEFAULT_EXPORT, are heirs of the
+    class they name. One naming no class of the file (a factory's result,
+    a function, an anonymous class, whose members are no nodes) is a class
+    of common.UNKNOWN_BASE too, open, so a call through it links what it
+    did before owners."""
+    found: list[tuple[str, str, list, tuple]] = []
+
+    def heir(name: str, value: Node | None) -> None:
+        if value is not None and value.type == "new_expression":
+            value = value.child_by_field_name("constructor")
+        if value is not None and value.type in (*_CLASS_TYPES, "class"):
+            named = value.child_by_field_name("name")
+            if named is None or _text(named, source) not in classes:
+                found.append((name, name, [*_extract_base_class_names(value, source), UNKNOWN_BASE], ()))
+                return
+            value = named
+        known = value is not None and value.type in ("identifier", "type_identifier") and _text(value, source) in classes
+        found.append((name, name, [_text(value, source) if known else UNKNOWN_BASE], ()))
+
+    for node in root.named_children:
+        statement = node
+        if node.type == "export_statement":
+            if any(child.type == "default" for child in node.children):
+                heir(DEFAULT_EXPORT, node.child_by_field_name("declaration") or node.child_by_field_name("value"))
+                continue
+            for clause in (c for c in node.named_children if c.type == "export_clause"):
+                for spec in clause.named_children:
+                    alias = spec.child_by_field_name("alias")
+                    if alias is not None and alias.text == b"default":
+                        heir(DEFAULT_EXPORT, spec.child_by_field_name("name"))
+            statement = node.child_by_field_name("declaration")
+        if statement is None:
+            continue
+        if statement.type in ("lexical_declaration", "variable_declaration"):
+            for declarator in statement.named_children:
+                name, value = declarator.child_by_field_name("name"), declarator.child_by_field_name("value")
+                if (
+                    declarator.type == "variable_declarator" and name is not None and name.type == "identifier"
+                    and _class_like(_text(name, source)) and _text(name, source) not in classes
+                    and value is not None and _function_value(value) is None
+                ):
+                    heir(_text(name, source), value)
+        elif statement.type == "expression_statement" and statement.named_children:
+            assignment = statement.named_children[0]
+            left = assignment.child_by_field_name("left") if assignment.type == "assignment_expression" else None
+            if left is not None and left.text == b"module.exports":
+                heir(DEFAULT_EXPORT, assignment.child_by_field_name("right"))
+    return found
+
+
+def _class_like(name: str) -> bool:
+    """Whether an imported name reads as a class (CapWords), not an
+    instance or a module object (`api`, `DEFAULTS`)."""
+    return name[:1].isupper() and not name.isupper()
 
 
 #: Globals a classic script calls that are never a script's own function.
@@ -664,15 +975,91 @@ def _defined_functions(root: Node, source: bytes) -> set[str]:
                 names.add(_text(name, source))
         elif node.type == "variable_declarator":
             name, value = node.child_by_field_name("name"), node.child_by_field_name("value")
-            if name is not None and name.type == "identifier" and value is not None and (
-                value.type in _FUNCTION_VALUE_TYPES
-            ):
+            if name is not None and name.type == "identifier" and _function_value(value) is not None:
                 names.add(_text(name, source))
         for child in node.children:
             walk(child)
 
     walk(root)
     return names
+
+
+#: The owner of a CommonJS export named like a top-level function of its
+#: file (`function create() {}` and `module.exports.create = function ...`):
+#: two Functions, never one node.
+EXPORTS_OWNER = "exports"
+
+
+def _top_level_functions(root: Node) -> set[str]:
+    """The names of the module's own top-level Functions: function
+    declarations and `const f = <function>` declarators, exported or not."""
+    names: set[str] = set()
+    for node in root.named_children:
+        statement = node.child_by_field_name("declaration") if node.type == "export_statement" else node
+        if statement is None:
+            continue
+        if statement.type in ("function_declaration", "generator_function_declaration"):
+            name = statement.child_by_field_name("name")
+            if name is not None:
+                names.add(name.text.decode("utf-8", errors="replace"))
+        elif statement.type in ("lexical_declaration", "variable_declaration"):
+            for declarator in statement.named_children:
+                name = declarator.child_by_field_name("name")
+                if name is not None and name.type == "identifier" and _function_value(
+                    declarator.child_by_field_name("value")
+                ) is not None:
+                    names.add(name.text.decode("utf-8", errors="replace"))
+    return names
+
+
+def _export_owner(name: str, top_level: set[str]) -> str:
+    """A CommonJS export's owner: "" (a top-level Function), or
+    EXPORTS_OWNER when a top-level function of the file has its name."""
+    return EXPORTS_OWNER if name in top_level else ""
+
+
+def _object_members(obj: Node) -> set[str]:
+    """The Functions a defined object literal's own members are: its
+    methods and function-valued properties (`_visit_object`)."""
+    return {
+        key for member in obj.named_children if member.type in ("pair", "method_definition")
+        and (key := _member_key(member)) is not None
+        and (member.type == "method_definition" or _function_value(member.child_by_field_name("value")) is not None)
+    }
+
+
+def _module_objects(root: Node) -> dict[str, dict[str, str]]:
+    """The receivers whose members are this file's Functions of a known
+    owner: each module-level object literal binding (`const userService =
+    {...}`, exported or not) by its name, and the module's CommonJS
+    exports (`exports.x = ...`, `module.exports = {...}`) as `exports` and
+    `module.exports`, owned by "" or EXPORTS_OWNER (`_object_path`,
+    `_export_path`, `_export_owner`). Each maps its members' names to
+    their owner."""
+    found: dict[str, dict[str, str]] = {}
+    exported: set[str] = set()
+    top_level = _top_level_functions(root)
+    for node in root.named_children:
+        statement = node.child_by_field_name("declaration") if node.type == "export_statement" else node
+        if statement is None:
+            continue
+        if statement.type in ("lexical_declaration", "variable_declaration"):
+            for declarator in statement.named_children:
+                obj = _object_value(declarator.child_by_field_name("value"))
+                path = _object_path(obj) if obj is not None else None
+                if path is not None and len(path) == 1:
+                    found[path[0]] = dict.fromkeys(_object_members(obj), path[0])
+        elif statement.type == "expression_statement" and statement.named_children:
+            assignment = statement.named_children[0]
+            path = _export_path(assignment) if assignment.type == "assignment_expression" else None
+            value = assignment.child_by_field_name("right") if path is not None else None
+            if path and _function_value(value) is not None:
+                exported.add(path[0])
+            elif path == () and (obj := _object_value(value)) is not None:
+                exported |= _object_members(obj)
+    if exported:
+        found["exports"] = found["module.exports"] = {name: _export_owner(name, top_level) for name in exported}
+    return found
 
 
 def _bindings(
@@ -701,7 +1088,7 @@ def _bindings(
             for child in clause.named_children if clause is not None else []:
                 if child.type == "identifier":
                     name = _text(child, source)
-                    bindings[name] = _Binding(name, where, False)
+                    bindings[name] = _Binding(name, where, False, default=True)
                 elif child.type == "namespace_import":
                     ns = next((c for c in child.named_children if c.type == "identifier"), None)
                     if ns is not None:
@@ -748,7 +1135,7 @@ class _CallResolver:
 
     def __init__(
         self, file_path: str, bindings: dict[str, _Binding], classes: dict[str, _ClassInfo],
-        defined: set[str], script: bool, source: bytes,
+        defined: set[str], script: bool, source: bytes, objects: dict[str, dict[str, str]] | None = None,
     ):
         self.file_path = file_path
         self.bindings = bindings
@@ -756,6 +1143,7 @@ class _CallResolver:
         self.defined = defined
         self.script = script
         self.source = source
+        self.objects = objects or {}
 
     def _binding_pins(self, name: str) -> list[str] | None:
         binding = self.bindings.get(name)
@@ -772,9 +1160,14 @@ class _CallResolver:
         head, dot, rest = type_name.partition(".")
         binding = self.bindings.get(head)
         if binding is not None and (dot == "" or binding.namespace):
-            # An imported class's method: any of the name there, since the
-            # class can inherit it from a base of its file.
-            return list(binding.pins or ())
+            # An imported class's method: the class's member there, its own
+            # or one it inherits from a class of its file (common.heir_keys);
+            # through a default import, the default-exported class's
+            # (DEFAULT_EXPORT); any of the name through a require.
+            owner = (rest if "." not in rest else None) if dot else binding.name
+            if not binding.top_level:
+                owner = DEFAULT_EXPORT if binding.default and not dot else None
+            return [class_member_pin(pin, owner) for pin in binding.pins or ()]
         return None
 
     def _method_pins(self, cls: str, method: str, own: bool) -> list[str] | None:
@@ -811,7 +1204,7 @@ class _CallResolver:
             if inner is not None and inner.type == "this" and prop is not None and scope.cls in self.classes:
                 held = self.classes[scope.cls].fields.get(_text(prop, source), [])
                 return self._typed_pins(held, method)
-            return None
+            return self._object_pins(_text(obj, source), method)
         if (constructed := _constructed(obj, source)) is not None:
             return self._class_pins(constructed, method)
         if obj.type != "identifier":
@@ -823,15 +1216,48 @@ class _CallResolver:
             return None  # an untyped parameter shadows any import of its name
         binding = self.bindings.get(receiver)
         if binding is not None:
-            # An ES namespace's member is a module's top-level one; anything
-            # else's (a require, an imported class's static) any of the name.
+            # An ES namespace's member is a module's top-level one, a named or
+            # default import's of a class (a CapWords name) the class's
+            # (`_class_pins`); anything else's (a require, an instance) any of
+            # the name.
+            if (binding.top_level and not binding.namespace or binding.default) and _class_like(receiver):
+                return self._class_pins(receiver, method)
             owner = "" if binding.namespace and binding.top_level else None
             return [owned_pin(pin, owner) for pin in binding.pins or ()]
         if receiver in self.classes:
             return self._class_pins(receiver, method)
+        if (pins := self._object_pins(receiver, method)) is not None:
+            return pins
         if receiver in STOP_TYPES["js"]:
             return []
         return None
+
+    def _object_pins(self, receiver: str, method: str) -> list[str] | None:
+        """A module-level object literal's (or the CommonJS exports')
+        member of this file (`_module_objects`): `userService.getUser()`
+        is that object's own; None for any other name, so a member the
+        object holds another way (a shorthand `{ helper }`) links as
+        before."""
+        members = self.objects.get(receiver, {})
+        return [owned_pin(self.file_path, members[method])] if method in members else None
+
+    def render_pins(self, tag: Node, scope: _Scope) -> list[str]:
+        """Where the `render` of the class component a JSX tag names can be:
+        a class of the file (or its in-file base), as `this.render()`
+        would go; an imported class's, as its member (`_class_pins`: a
+        named, default or namespace import's owner, never an owner-less
+        pin, which would link every `render` there). Empty for a function
+        component of the file, a parameter, or a name nothing imports."""
+        name = _text(tag, self.source)
+        head = name.split(".", 1)[0]
+        if head in scope.params or (head == name and name in self.defined and name not in self.classes):
+            return []
+        if name in self.classes:
+            return self._method_pins(name, "render", own=True) or []
+        binding = self.bindings.get(head)
+        if binding is None or (head == name and binding.namespace):
+            return []
+        return [pin for pin in self._class_pins(name, "render") or () if split_owned_pin(pin)[1] is not None]
 
     def _typed_pins(self, types: list[str], method: str) -> list[str] | None:
         found = [pins for name in types if (pins := self._class_pins(name, method)) is not None]
@@ -888,8 +1314,104 @@ def _literal(node: Node | None, source: bytes) -> str | None:
     return None
 
 
+def _exported_names(root: Node, source: bytes) -> dict[str, set[str]]:
+    """The file's top-level names it exports, local name -> export names
+    ("default" for `export default x` and CommonJS `module.exports = x`):
+    `export const x = ...`, `export { x, y as z }`, `module.exports = { x,
+    z: y }`, `exports.z = y`, `module.exports.z = y`."""
+    exported: dict[str, set[str]] = {}
+
+    def add(local: Node | None, name: str) -> None:
+        if local is not None and local.type == "identifier":
+            exported.setdefault(_text(local, source), set()).add(name)
+
+    for node in root.named_children:
+        if node.type == "export_statement" and node.child_by_field_name("source") is None:
+            if any(child.type == "default" for child in node.children):
+                add(node.child_by_field_name("value"), "default")
+            declaration = node.child_by_field_name("declaration")
+            if declaration is not None and declaration.type in ("lexical_declaration", "variable_declaration"):
+                for declarator in declaration.named_children:
+                    name = declarator.child_by_field_name("name") if declarator.type == "variable_declarator" else None
+                    if name is not None:
+                        add(name, _text(name, source))
+            for clause in (c for c in node.named_children if c.type == "export_clause"):
+                for spec in (c for c in clause.named_children if c.type == "export_specifier"):
+                    name, alias = spec.child_by_field_name("name"), spec.child_by_field_name("alias")
+                    if name is not None:
+                        add(name, _text(alias or name, source))
+        elif node.type == "expression_statement" and node.named_children:
+            assign = node.named_children[0]
+            if assign.type != "assignment_expression":
+                continue
+            left, right = assign.child_by_field_name("left"), assign.child_by_field_name("right")
+            target = _dotted_name(left, source) if left is not None and left.type == "member_expression" else ""
+            if target == "module.exports" and right is not None and right.type == "object":
+                for prop in right.named_children:
+                    if prop.type == "shorthand_property_identifier":
+                        exported.setdefault(_text(prop, source), set()).add(_text(prop, source))
+                    elif prop.type == "pair":
+                        key = prop.child_by_field_name("key")
+                        if key is not None:
+                            add(prop.child_by_field_name("value"), _text(key, source))
+            elif target == "module.exports":
+                add(right, "default")
+            elif target.rsplit(".", 1)[0] in ("exports", "module.exports"):
+                add(right, target.rsplit(".", 1)[1])
+    return exported
+
+
+def _imported_routers(root: Node, source: bytes) -> dict[str, tuple[str, str]]:
+    """The names the file's imports bind to another module's export, local
+    name -> (export name, specifier): a default import or a whole `require`
+    is "default", `{ a as b }` and `const { a: b } = require(...)` are "a";
+    a namespace import is none."""
+    imported: dict[str, tuple[str, str]] = {}
+    for node in root.named_children:
+        if node.type == "import_statement" and (spec := node.child_by_field_name("source")) is not None:
+            specifier = _string_value(spec, source)
+            clause = next((c for c in node.named_children if c.type == "import_clause"), None)
+            for child in clause.named_children if clause is not None else []:
+                if child.type == "identifier":
+                    imported[_text(child, source)] = ("default", specifier)
+                elif child.type == "named_imports":
+                    for each in (c for c in child.named_children if c.type == "import_specifier"):
+                        name, alias = each.child_by_field_name("name"), each.child_by_field_name("alias")
+                        if name is not None:
+                            imported[_text(alias or name, source)] = (_text(name, source), specifier)
+        elif node.type in ("lexical_declaration", "variable_declaration"):
+            for declarator in (c for c in node.named_children if c.type == "variable_declarator"):
+                specifier = _required(declarator.child_by_field_name("value"), source)
+                name = declarator.child_by_field_name("name")
+                if specifier is None or name is None:
+                    continue
+                if name.type == "identifier":
+                    imported[_text(name, source)] = ("default", specifier)
+                elif name.type == "object_pattern":
+                    for prop in name.named_children:
+                        if prop.type == "shorthand_property_identifier_pattern":
+                            imported[_text(prop, source)] = (_text(prop, source), specifier)
+                        elif prop.type == "pair_pattern":
+                            key, local = prop.child_by_field_name("key"), prop.child_by_field_name("value")
+                            if key is not None and local is not None and local.type == "identifier":
+                                imported[_text(local, source)] = (_text(key, source), specifier)
+    return imported
+
+
+def _required(node: Node | None, source: bytes) -> str | None:
+    """The specifier of a `require('x')` call, None for anything else."""
+    if node is None or node.type != "call_expression":
+        return None
+    func, args = node.child_by_field_name("function"), node.child_by_field_name("arguments")
+    if func is None or func.type != "identifier" or func.text != b"require" or args is None:
+        return None
+    first = args.named_children[0] if args.named_children else None
+    return _string_value(first, source) if first is not None and first.type == "string" else None
+
+
 def _express_routes(
-    root: Node, source: bytes, resolver: _CallResolver, result: ExtractionResult, file_path: str, repo_id: str
+    root: Node, source: bytes, resolver: _CallResolver, result: ExtractionResult, file_path: str, repo_id: str,
+    config: ResolverConfig | None = None,
 ) -> None:
     """Express-style routes (`app.get('/x', h)`, `router.post(...)`,
     `app.route('/x').get(h)`; Koa-router's and Fastify's are the same
@@ -900,10 +1422,20 @@ def _express_routes(
     handler. An app's routes are at its root; a router's are under the
     literal prefix the file mounts it at (`app.use('/api', router)`), and
     a router the file doesn't mount on its app is mounted where the file
-    doesn't show (`unmounted_endpoint`)."""
+    doesn't show (`unmounted_endpoint`).
+
+    A router another file mounts is recorded on the Module (apis/routes.py
+    MOUNT_PROPERTIES): the file's mounts of an imported router (`app.use(
+    '/api', usersRouter)`, `app.use('/api', auth, require('./users'))`) as
+    `route_mounts`, and the routes of a router it exports and doesn't
+    mount itself as `route_exports`, for the dispatcher to name by the
+    mounts that reach them."""
     made: dict[str, bool] = {}  # receiver -> whether the file made an app (else a router)
     mounts: dict[str, tuple[str, str]] = {}  # router -> (the app or router it is mounted on, the prefix)
     routes: list[tuple[str, str, str, Node]] = []  # (receiver, method, path, handler)
+    imported = _imported_routers(root, source)
+    # (the app or router mounted on, the prefix, the export, its specifier)
+    foreign: list[tuple[str, str, str, str]] = []
 
     def key(node: Node | None) -> str | None:
         """A receiver as the file names it: `app`, or `this.router`."""
@@ -940,10 +1472,17 @@ def _express_routes(
             return
         obj, method = found
         values = [arg for arg in args.named_children if arg.type != "comment"]
-        if method == "use" and key(obj) is not None and len(values) == 2 and key(values[1]) is not None:
+        if method == "use" and key(obj) is not None and len(values) >= 2:
             mounted = _literal(values[0], source)
-            if mounted is not None and mounted.startswith("/"):
+            if mounted is None or not mounted.startswith("/"):
+                return
+            if len(values) == 2 and key(values[1]) is not None:
                 mounts[key(values[1])] = (key(obj), mounted)
+            last = values[-1]
+            if last.type == "identifier" and _text(last, source) in imported:
+                foreign.append((key(obj), mounted, *imported[_text(last, source)]))
+            elif (specifier := _required(last, source)) is not None:
+                foreign.append((key(obj), mounted, "default", specifier))
             return
         if method not in _ROUTE_METHODS:
             return
@@ -1005,15 +1544,52 @@ def _express_routes(
         above = prefix(parent, seen | {receiver})
         return None if above is None else join_route(above, mounted)
 
+    def routing(receiver: str) -> bool:
+        """Whether a receiver is an app or router (`_express_routes`)."""
+        return receiver in made or receiver in _ROUTER_NAMES or (
+            receiver.endswith("Router") and not receiver.startswith("this.")
+        )
+
+    exported = {
+        local: names for local, names in _exported_names(root, source).items() if routing(local) and not is_app(local)
+    }
+    current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
+    route_mounts = set()
+    for parent, mounted, export, specifier in foreign:
+        files = _resolve_module_specifier(specifier, current_dir, config, file_path)
+        above = prefix(parent) if routing(parent) else None
+        if not files or not routing(parent):
+            continue
+        if above is not None:
+            route_mounts.add(mount_entry("", join_route(above, mounted), export, files))
+        elif parent in exported:
+            route_mounts |= {mount_entry(name, join_route(mounted), export, files) for name in exported[parent]}
+    # An exported router's routes the file doesn't mount; one whose own
+    # Endpoint another unmounted route of the file shares stays unmounted.
+    deferred: dict[str, set[str]] = {}
+    kept: set[str] = set()
+    for receiver, method, path, _handler in routes:
+        if not routing(receiver) or prefix(receiver) is not None:
+            continue
+        own = unmounted_endpoint(method, join_route(path), file_path)
+        if receiver in exported:
+            deferred.setdefault(own, set()).update(
+                MOUNT_SEP.join((name, method, join_route(path))) for name in exported[receiver]
+            )
+        else:
+            kept.add(own)
+    route_exports = sorted(entry for own, entries in deferred.items() if own not in kept for entry in entries)
+    module = result.nodes[0].properties
+    module["route_mounts"] = sorted(route_mounts) or None
+    module["route_exports"] = route_exports or None
+
     # The file's functions, by name, with their owners.
     functions: dict[str, set[str]] = {}
     for node in result.nodes:
         if node.label == "Function" and node.properties.get("file") == file_path:
             functions.setdefault(node.name, set()).add(node.properties.get("owner") or "")
     for receiver, method, path, handler in routes:
-        if receiver not in made and receiver not in _ROUTER_NAMES and not (
-            receiver.endswith("Router") and not receiver.startswith("this.")
-        ):
+        if not routing(receiver):
             continue
         above = prefix(receiver)
         full = join_route(above or "", path)
@@ -1091,10 +1667,12 @@ def extract_js_file(
             )
 
     bindings, module = _bindings(root, source_bytes, current_dir, config, file_path)
+    class_table = _class_table(root, source_bytes)
     resolver = _CallResolver(
-        file_path, bindings, _class_table(root, source_bytes), _defined_functions(root, source_bytes),
-        not module, source_bytes,
+        file_path, bindings, class_table, _defined_functions(root, source_bytes), not module, source_bytes,
+        _module_objects(root),
     )
+    top_level = _top_level_functions(root)
     # (caller label, caller name, caller owner)
     #   -> callee name -> [pins, bare?, caller classes, every bare site a member call?]
     calls: dict[tuple[str, str, str | None], dict[str, list]] = {}
@@ -1109,7 +1687,12 @@ def extract_js_file(
         by_name = calls.setdefault((caller_label, caller_name, caller_owner), {})
         for func in _call_functions(body):
             jsx = func.parent is not None and func.parent.type in _JSX_TAGS
-            for name, pin, member in resolver.resolve(func, scope):
+            # A block's own locals shadow there only.
+            block = _block_names(func, body)
+            site = _Scope(scope.cls, scope.params | block, scope.types) if block else scope
+            # A class component renders through its `render`, which its class owns.
+            rendered = [("render", pin, False) for pin in resolver.render_pins(func, site)] if jsx else []
+            for name, pin, member in resolver.resolve(func, site) + rendered:
                 if pin is None and jsx:
                     continue  # a component nothing resolves links nothing, never by name alone
                 entry = by_name.setdefault(name, [set(), False, set(), True])
@@ -1155,15 +1738,54 @@ def extract_js_file(
                 is_named_fn = (
                     name_node is not None
                     and name_node.type == "identifier"
-                    and value_node is not None
-                    and value_node.type in _FUNCTION_VALUE_TYPES
+                    and _function_value(value_node) is not None
                 )
                 if is_named_fn:
                     _visit_variable_declarator(decl_node, parent_name, parent_label, node if first else None, scope)
                     handled = True
+                elif (obj := _object_value(value_node)) is not None and (path := _object_path(obj)) is not None:
+                    _visit_object(obj, parent_name, parent_label, scope, path)
+                    handled = True
                 first = False
             return handled
+        if target.type == "expression_statement" and target.named_children:
+            assignment = target.named_children[0]
+            path = _export_path(assignment) if assignment.type == "assignment_expression" else None
+            if path is None:
+                return False
+            value_node = assignment.child_by_field_name("right")
+            if path and (function := _function_value(value_node)) is not None:
+                # `exports.handler = async (event) => ...`: a top-level Function.
+                name_node = assignment.child_by_field_name("left").child_by_field_name("property")
+                owner = _export_owner(path[0], top_level)
+                _visit_function(function, parent_name, parent_label, node, name_node, scope, (owner,) if owner else ())
+                return True
+            if (obj := _object_value(value_node)) is not None:
+                _visit_object(obj, parent_name, parent_label, scope, path, exported=True)
+                return True
         return False
+
+    def _visit_object(
+        obj: Node, parent_name: str | None, parent_label: str, scope: _Scope, path: tuple, exported: bool = False,
+    ) -> None:
+        """A defined object literal's methods and function-valued
+        properties (`_object_path`), owned by `path` below the scope's own
+        owner, and those of its object-valued properties."""
+        for member in obj.named_children:
+            key = _member_key(member) if member.type in ("pair", "method_definition") else None
+            if key is None:
+                continue
+            name_node = member.child_by_field_name("key" if member.type == "pair" else "name")
+            # `module.exports = {...}`'s members are the module's exports.
+            own = path or ((EXPORTS_OWNER,) if exported and _export_owner(key, top_level) else ())
+            if member.type == "method_definition":
+                _visit_function(member, parent_name, parent_label, member, name_node, scope, own)
+                continue
+            value_node = member.child_by_field_name("value")
+            if (function := _function_value(value_node)) is not None:
+                _visit_function(function, parent_name, parent_label, member, name_node, scope, own)
+            elif (inner := _object_value(value_node)) is not None:
+                _visit_object(inner, parent_name, parent_label, scope, (*path, key))
 
     def _visit_statement(node: Node, parent_name: str | None, parent_label: str, scope: _Scope) -> None:
         """Visit a Module-top-level statement: definitions become Class/
@@ -1171,15 +1793,35 @@ def extract_js_file(
         attributed to the enclosing Module (mirrors the Python extractor's
         module-level-statement handling, e.g. `setup();` at top level).
         """
-        if _try_visit_definition(node, parent_name, parent_label, scope):
-            return
-        if node.type == "export_statement":
-            return  # declaration-less export - nothing left to scan for calls
         caller_class = parent_name if parent_label == "Class" else None
-        record_calls(
-            parent_label, parent_name if parent_name else file_path, node, scope, caller_class,
-            owners[-1] if parent_label != "Module" else None,
-        )
+        caller = (parent_label, parent_name if parent_name else file_path)
+        caller_owner = owners[-1] if parent_label != "Module" else None
+        if _try_visit_definition(node, parent_name, parent_label, scope):
+            # A definition's own calls are its own; what else the statement
+            # computes is the scope's (`const a = () => f(), b = g()`'s
+            # `g()`, a defined object's non-function properties).
+            target = node.child_by_field_name("declaration") if node.type == "export_statement" else node
+            if target is not None and target.type in ("lexical_declaration", "variable_declaration"):
+                for declarator in target.named_children:
+                    if declarator.type == "variable_declarator" and _function_value(
+                        declarator.child_by_field_name("value")
+                    ) is None:
+                        record_calls(*caller, declarator, scope, caller_class, caller_owner)
+            elif target is not None and target.type == "expression_statement" and _function_value(
+                target.named_children[0].child_by_field_name("right")
+            ) is None:
+                record_calls(*caller, target, scope, caller_class, caller_owner)
+            return
+        if node.type == "export_statement" and node.child_by_field_name("declaration") is None and (
+            node.child_by_field_name("value") is None
+        ):
+            return  # `export {...}` / `export * from '...'` - nothing to scan for calls
+        record_calls(*caller, node, scope, caller_class, caller_owner)
+        # A function declared in a block (`if (x) { function f() {} }`) is
+        # the scope's own, as a direct one is; the scan above left it out.
+        if node.type in _COMPOUND_STATEMENTS:
+            for statement in _compound_statements(node):
+                _try_visit_definition(statement, parent_name, parent_label, scope)
 
     def _visit_nested_defs(container: Node, parent_name: str, parent_label: str, scope: _Scope) -> None:
         """Visit a function body's direct statement children for nested
@@ -1188,12 +1830,15 @@ def extract_js_file(
         `record_calls` over the whole body once, recursively
         (excluding nested scopes). Re-scanning non-definition statements
         here would double-emit CALLS edges for that body's top-level calls.
-        Only direct children are checked (not statements nested inside an
-        if/for/while block) - the same one-level limitation the Python
-        extractor has for nested `def`s.
+        A definition inside a block (`if`, `try`, a loop, `switch`) is
+        the function's own, as a direct one is.
         """
         for node in container.named_children:
-            _try_visit_definition(node, parent_name, parent_label, scope)
+            if node.type in _COMPOUND_STATEMENTS:
+                for statement in _compound_statements(node):
+                    _try_visit_definition(statement, parent_name, parent_label, scope)
+            else:
+                _try_visit_definition(node, parent_name, parent_label, scope)
 
     def _visit_variable_declarator(
         decl_node: Node, parent_name: str | None, parent_label: str, doc_anchor: Node | None, scope: _Scope
@@ -1202,10 +1847,12 @@ def extract_js_file(
         value_node = decl_node.child_by_field_name("value")
         if name_node is None or name_node.type != "identifier" or value_node is None:
             return
-        if value_node.type in _FUNCTION_VALUE_TYPES:
+        if (function := _function_value(value_node)) is not None:
             # doc_anchor is None for a non-first declarator in a multi-name
             # `const a = ..., b = ...` statement - no JSDoc attributed to it.
-            _visit_function(value_node, parent_name, parent_label, doc_anchor or value_node, name_node, scope)
+            # A component wrapper's function (`memo(() => ...)`) is the
+            # declarator's; a styled component is one with no body.
+            _visit_function(function, parent_name, parent_label, doc_anchor or value_node, name_node, scope)
 
     def _visit_class(node: Node, parent_name: str | None, parent_label: str, doc_anchor: Node, scope: _Scope) -> None:
         name_node = node.child_by_field_name("name")
@@ -1285,12 +1932,15 @@ def extract_js_file(
                     _visit_function(value_node, class_name, "Class", member, f_name_node, class_scope)
 
     def _visit_function(
-        node: Node, parent_name: str | None, parent_label: str, doc_anchor: Node, name_node: Node, scope: _Scope
+        node: Node, parent_name: str | None, parent_label: str, doc_anchor: Node, name_node: Node, scope: _Scope,
+        path: tuple = (),
     ) -> None:
+        """A Function; `path` names the object literal it is a member of
+        (`_object_path`), which owns it below the scope's own owner."""
         func_name = _text(name_node, source_bytes)
 
         parent_owner = owners[-1] if parent_label != "Module" else None
-        owner = member_owner(parent_label, parent_name, parent_owner)
+        owner = ".".join(part for part in (member_owner(parent_label, parent_name, parent_owner), *path) if part)
         func_properties: dict = {
             "type": "function",
             "file": file_path,
@@ -1327,6 +1977,8 @@ def extract_js_file(
 
         caller_class = parent_name if parent_label == "Class" else None
         params, param_types, _fields = _parameters(node, source_bytes)
+        # Destructured parameters and non-function locals shadow too (a JSX tag's `render`).
+        params |= {name.decode("utf-8", errors="replace") for name in _bound_names(node)} | _local_names(body_node)
         inner = scope.nested(params, {**param_types, **_local_types(body_node, source_bytes)})
         record_calls("Function", func_name, body_node, inner, caller_class, owner)
 
@@ -1351,7 +2003,11 @@ def extract_js_file(
                 caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id,
                 no_self=no_self, caller_owner=caller_owner,
             ))
-    _express_routes(root, source_bytes, resolver, result, file_path, repo_id)
+    _express_routes(root, source_bytes, resolver, result, file_path, repo_id, config)
+    merge_same_nodes(result)
+    add_heir_keys(result, [
+        (name, owner, info.bases, info.methods) for name, info in class_table.items() for owner in info.members_owners
+    ] + _module_heirs(root, source_bytes, class_table))
 
     return own_edges(result, file_path)
 

@@ -209,7 +209,7 @@ const COMPUTED = {
   check("connectLiveEvents handles insights_refreshed", liveBody.includes("insights_refreshed"), "missing from connectLiveEvents");
   check("loadTopologyCounts does not reference an event", !topoBody.includes("insights_refreshed") && !/\bevent\./.test(topoBody), "event handling leaked into loadTopologyCounts");
   check("loadTopologyCounts resets the basis label to degree", topoBody.includes('godNodesBasis").textContent = "degree"'), "missing from loadTopologyCounts");
-  check("insights_refreshed refreshes the graph when colouring by community", /insights_refreshed[\s\S]{0,200}state\.colorByCommunity[\s\S]{0,80}refreshGraph\(\)/.test(liveBody), "missing refreshGraph under colorByCommunity");
+  check("insights_refreshed refreshes the graph when colouring by community", /insights_refreshed[\s\S]{0,200}state\.colorByCommunity[\s\S]{0,80}scheduleLiveRefresh\(\)/.test(liveBody), "missing scheduleLiveRefresh under colorByCommunity");
   check("loadTopologyCounts resets the basis in the empty branch too", /No nodes for this scope yet[\s\S]{0,120}godNodesBasis"\)\.textContent = "degree"/.test(topoBody), "empty branch does not reset the basis");
   check("connectLiveEvents does not touch the basis label", !liveBody.includes("godNodesBasis"), "misplaced in connectLiveEvents");
 

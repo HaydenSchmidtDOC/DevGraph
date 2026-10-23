@@ -17,16 +17,26 @@ from __future__ import annotations
 
 import logging
 import os
+import pickle
 import posixpath
+import re
+import socket
 import sys
+import tempfile
+import threading
+import time
+import uuid
+import zlib
 from collections import Counter
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import NamedTuple
 
 from devgraph.config import get_settings
+from devgraph.config.settings import devgraph_home
 from devgraph.config.project_schema import (
     ABSENT_SCHEMA_HASH,
     LABEL_PATTERN,
@@ -37,12 +47,21 @@ from devgraph.config.project_schema import (
     resolve_effective_schema,
     schema_file_hash,
 )
-from devgraph.graph.engine import ABORTS_BATCH, GraphEngine, provision_repository_schema
-from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES, pin_kind, split_pin
+from devgraph.graph.engine import (
+    ABORTS_BATCH,
+    OWNING_SERVICE_TARGETS,
+    SERVICE_API_SUFFIXES,
+    EngineClosed,
+    GraphEngine,
+    provision_repository_schema,
+)
+from devgraph.graph.schema import FILE_SCOPED_LABELS, HEIR_KEY, NODE_LABELS, RELATIONSHIP_TYPES, pin_kind, split_pin
 from devgraph.indexer.apis.extractor import APIExtractor
+from devgraph.indexer.apis.routes import MountTable, mount_routes
 from devgraph.indexer.common import (
     best_pin,
     name_ref_properties,
+    owner_matches,
     owners_by_pin,
     parse_name_ref,
     pin_confidence,
@@ -51,7 +70,7 @@ from devgraph.indexer.common import (
     visible_to,
 )
 from devgraph.indexer.containers.extractor import ContainerExtractor, ExtractionResult
-from devgraph.indexer.datastores.extractor import DatastoreExtractor
+from devgraph.indexer.datastores.extractor import DatastoreExtractor, client_datastores
 from devgraph.indexer.docs.extractor import DocsExtractor
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.csharp.extractor import extract_csharp_file
@@ -79,7 +98,7 @@ from devgraph.indexer.source_text import read_source
 from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
 from devgraph.indexer.walk import GITIGNORED, RepoRootEmpty, RepoRootUnavailable, check_repo_root, content_skip_reason
 from devgraph.indexer.walk import indexable_paths as _indexable_paths
-from devgraph.indexer.walk import gitignore_hides_files, indexable_paths_under
+from devgraph.indexer.walk import forget_manifests, gitignore_hides_files, indexable_paths_under
 from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
 from devgraph.indexer.walk import is_ignored_path as is_ignored_path
 from devgraph.indexer.walk import is_indexable_file as _is_indexable_file
@@ -89,6 +108,25 @@ from devgraph.indexer.walk import repo_relative as _repo_relative
 from devgraph.paths import is_within
 
 logger = logging.getLogger(__name__)
+
+
+class BatchAborted(Exception):
+    """The indexer gives a whole batch or scan up, as it does a shutdown's
+    (`ABORTS_BATCH`): nothing is stamped, and the work is redone."""
+
+
+class ExtractionSpillFailed(BatchAborted):
+    """A batch's extractions could not be written to, or read back from, its
+    spill file (`_Extractions`): a full disk, say. Not one file's failure, so
+    not skipped as one: the batch's second pass would miss that file's edges."""
+
+
+class FullScanCancelled(BatchAborted):
+    """A full scan waiting its turn (`_FULL_SCAN_LOCK`) was called off: the
+    watcher is stopping, or the repository is no longer watched."""
+
+
+ABORTS_BATCH = (*ABORTS_BATCH, BatchAborted)
 
 _CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 
@@ -144,9 +182,33 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: an ancestor and the source roots a pyproject.toml declares; Rust calls and imports
 #: through `pub use` re-exports (resolver configuration); a Kotlin
 #: anonymous companion object's members (owner `Class.Companion`); JSX
-#: component elements as calls.
+#: component elements as calls; 17: JS/TS imports of a workspace package
+#: (package.json `workspaces`, pnpm-workspace.yaml) resolved to its entry
+#: point or subpath and its directory (resolver configuration); 18:
+#: datastore clients of JS/TS, Java, Kotlin, C# and Go files as the shared
+#: datastore nodes their files claim, with their owning service's USES
+#: (datastores/extractor.py `client_datastores`), and Express routers
+#: mounted from another file named by those mounts (apis/routes.py
+#: MountTable); build
+#: output folder names (`build`, `dist`, `bin`, `obj`, `target`) ignored only
+#: at the root or beside a project manifest (walk.is_build_output), so Rust's
+#: `src/bin/` and source packages named `build` are indexed; a
+#: method called on another file's Python, JS/TS or Java class narrowed to
+#: that class's member, its own or one it inherits from a class of its
+#: file (heir keys in `mkeys`, a Module's `heir_open`); JSX rendered from
+#: callbacks, class components and wrappers; Rust module re-exports and
+#: inline-module `pub use`; C# ImplicitUsings; and Go dot imports; 19:
+#: Python definitions under compound statements (`if`, `try`, `with`, ...)
+#: and classes defined in functions, same-named definitions of one scope
+#: merged into one node, and Java enum members; Python routes read from the
+#: syntax tree (one framework per decorator, Flask `methods` lists, no
+#: route from a comment or docstring); JS/TS object-literal methods,
+#: CommonJS exports and functions declared in blocks. The datastore
+#: extractor also skips more test folders (`spec/`, `e2e/`, `__mocks__/`,
+#: `testdata/`, `fixtures/`, .NET `UnitTests`/`IntegrationTests`;
+#: devgraph/test_paths.py `TEST_DIR`).
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 16
+INDEX_FORMAT = 19
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -320,7 +382,7 @@ def _is_provider_file(repo_root: Path, path: Path) -> bool:
     A .gitignore judges the file by its own path, as the walk and git do."""
     rel = _repo_relative(repo_root, path)
     return (
-        rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel))
+        rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel), repo_root)
         and not is_gitignored(repo_root, _own_rel(repo_root, path) or rel)
     )
 
@@ -670,6 +732,64 @@ def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, applied
         logger.warning("docs edge pass failed for %s; the next rescan retries it", repo_id, exc_info=True)
 
 
+class _Mounts:
+    """The repository's Express mounts across files (apis/routes.py
+    MountTable) for one batch: read from the graph when a file first needs
+    them, then kept current with each JS/TS file the batch writes."""
+
+    def __init__(self, engine: GraphEngine, repo_id: str):
+        self.engine, self.repo_id = engine, repo_id
+        self.table: MountTable | None = None
+        self.pending: dict[str, list[str] | None] = {}  # the batch's files' mounts before the read
+        self.touched = False  # whether a batch file has mounts or routes another file mounts
+
+    def written(self, rel_path: str, mounts: list[str] | None, exports: list[str] | None) -> None:
+        """Record a JS/TS file's `route_mounts` as the batch writes it."""
+        self.touched |= bool(mounts or exports)
+        if self.table is None:
+            self.pending[rel_path] = mounts
+        else:
+            self.table.set(rel_path, mounts)
+
+    def prefixes(self, rel_path: str, exports: list[str] | None) -> list[str] | None:
+        """The `route_prefixes` of a file with these `route_exports`."""
+        if not exports:
+            return None
+        if self.table is None:
+            self.reload()
+        return self.table.route_prefixes(rel_path, exports)
+
+    def reload(self) -> dict[str, tuple[list[str] | None, list[str] | None, list[str] | None]]:
+        """Read every Module's mounts from the graph again (the batch's
+        pending ones over them) and return the state read."""
+        state = self.engine.route_mount_state(self.repo_id)
+        mounts = {module: entries for module, (entries, _exports, _prefixes) in state.items() if entries}
+        self.table = MountTable({**mounts, **self.pending})
+        self.pending = {}
+        return state
+
+
+def _mounted(nodes: list[dict], rels: list[dict], rel_path: str, mounts: _Mounts) -> tuple[list[dict], list[dict]]:
+    """A JS/TS file's extraction with its exported routers' routes named by
+    the mounts that reach them (apis/routes.py `mount_routes`), its Module
+    recording the prefixes used (`route_prefixes`)."""
+    module = next(node for node in nodes if node["label"] == "Module" and node["name"] == rel_path)
+    props = module["properties"]
+    mounts.written(rel_path, props.get("route_mounts"), props.get("route_exports"))
+    prefixes = mounts.prefixes(rel_path, props.get("route_exports"))
+    nodes, rels = mount_routes(nodes, rels, rel_path, props.get("route_exports"), prefixes)
+    props["route_prefixes"] = prefixes
+    return nodes, rels
+
+
+def _stale_mounts(state: dict, table: MountTable) -> set[str]:
+    """The Modules whose `route_prefixes` differ from what `table` gives their `route_exports`."""
+    return {
+        module for module, (_mounts, exports, prefixes) in state.items()
+        if (prefixes or None) != table.route_prefixes(module, exports)
+    }
+
+
 def index_paths(
     engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
     mentions_enabled: bool = False, sync_provider: bool = True, relink_outside: bool = True,
@@ -692,7 +812,9 @@ def index_paths(
             writer's text, its resolver configuration and whether its target
             exists (a tiered pin's, which nodes of its target's name exist:
             other files' tiered groups to a name whose nodes the batch adds,
-            removes or rekeys are written again).
+            removes or rekeys are written again). An Express router file
+            whose mounts in other files changed under it (apis/routes.py)
+            is indexed again with the batch (`_stale_mounts`).
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
         sync_provider: Write schema-provider nodes and edges for `paths`
@@ -716,31 +838,22 @@ def index_paths(
         Number of files actually indexed, including those referrers
         (skipped/unrecognized files and Markdown relinks don't count).
     """
+    with _Extractions() as extractions:
+        return _index_paths(
+            engine, repo_id, repo_root, paths, docs_path, mentions_enabled, sync_provider, relink_outside,
+            skipped, resolver, extractions,
+        )
+
+
+def _index_paths(
+    engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None,
+    mentions_enabled: bool, sync_provider: bool, relink_outside: bool, skipped: dict[str, str] | None,
+    resolver: dict[str, dict] | None, extractions: _Extractions,
+) -> int:
+    """index_paths, holding the code files' pass-1 extractions in `extractions`
+    for the passes after it (see _Extractions)."""
     indexed = 0
     docs_root = (repo_root / docs_path).resolve() if docs_path else None
-    py_files: list[tuple[str, str]] = []  # (rel_path, content), for the cross-link pass below
-    # (rel_path -> (node dicts, rel dicts)) from pass 1's extraction, reused
-    # by pass 2 so it re-upserts without re-parsing the file a second time.
-    py_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
-    # Same two-pass cross-link machinery as py_files/py_extractions above,
-    # kept as parallel lists rather than merged with the Python one:
-    # datastore extraction (_datastore_nodes) is still keyed to Python source
-    # conventions, so non-Python files join the owning-service pass below
-    # only with the Endpoints their own extractor found (apis/routes.py).
-    js_files: list[str] = []  # rel_path, for the cross-link pass below
-    js_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
-    cs_files: list[str] = []
-    cs_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
-    cpp_files: list[str] = []
-    cpp_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
-    java_files: list[tuple[str, str]] = []
-    java_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
-    rs_files: list[str] = []
-    rs_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
-    kt_files: list[str] = []
-    kt_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
-
-    go_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
 
     # The resolver configuration (tsconfig path aliases, go.mod module
     # paths, Cargo crate names, C# projects, pyproject source roots), read once for the batch under the fingerprint it was taken for
@@ -756,7 +869,7 @@ def index_paths(
     config = ResolverConfig(
         repo_root, go_files=lambda: config_files("go", ("go.mod", "go.work")),
         rust_files=lambda: config_files("rust"), cs_files=lambda: config_files("csharp"),
-        python_files=lambda: config_files("python"),
+        python_files=lambda: config_files("python"), ts_files=lambda: config_files("ts"),
     )
     # Markdown files whose cross-file edges are resolved after every other
     # node in the batch exists (see the docs/mentions passes below).
@@ -795,6 +908,7 @@ def index_paths(
         supplied.setdefault(rel, []).append(_own_rel(repo_root, Path(path)) or rel)
 
     max_bytes = _max_file_bytes()
+    mounts = _Mounts(engine, repo_id)
     # Files left out by their content, for catch_up (see `_skip_marks`).
     judged: dict[str, list] = {}
     read: set[str] = set()  # files extracted, whose old marks go
@@ -807,10 +921,12 @@ def index_paths(
         # must not abort the whole batch: a full scan or watcher batch would
         # otherwise silently lose every file after the failure point. Log and
         # skip the offending file so the rest of the batch still indexes.
+        saved = _UNREAD
         try:
             spellings = sorted(supplied.get(rel_path, []))
             reason = _skip_reason(root_resolved, spellings, resolved, docs_root, mentions_enabled, max_bytes)
             if reason is not None:
+                extractions.discard(rel_path)  # a router file the mounts pass found changed since
                 shown = spellings[0] if spellings else rel_path
                 logger.debug("%s: skipping %s (%s)", repo_id, shown, reason)
                 if skipped is not None:
@@ -822,32 +938,65 @@ def index_paths(
                 if reason != GITIGNORED or rel_path in spellings:
                     engine.delete_nodes_by_source_file(repo_id, rel_path)
                 return
-            indexed += _index_single_path(
+            # A router file the mounts pass indexes again counts once.
+            single = partial(
+                _index_single_path,
                 engine, repo_id, repo_root, resolved, rel_path,
-                docs_root, mentions_enabled, config,
-                py_files, py_extractions, js_files, js_extractions,
-                cs_files, cs_extractions, cpp_files, cpp_extractions,
-                java_files, java_extractions, rs_files, rs_extractions,
-                kt_files, kt_extractions, go_extractions,
-                docs_files, mention_files, batch_services,
+                docs_root, mentions_enabled, config, extractions,
+                docs_files, mention_files, batch_services, mounts,
             )
+            saved = extractions.saved(rel_path)
+            try:
+                count = single()
+            except RecursionError:
+                # Extraction raises before it writes, so this is a clean retry.
+                count = _run_deep(single)
+            indexed += 0 if rel_path in read else count
             read.add(rel_path)
         except ABORTS_BATCH:
             raise  # shutdown or an index still building: leave the work, and its stamp, for later
+        except RecursionError as exc:
+            # Deeper than even `_run_deep` allows: left out of the graph and
+            # reported, as a fresh scan leaves it, not kept as it was.
+            _log_file_failure("indexing failed", repo_id, rel_path, exc)
+            shown = min(supplied.get(rel_path, []), default=rel_path)
+            if skipped is not None:
+                skipped[shown] = TOO_DEEP
+            stamp = _stamp_or_none(resolved)  # gone or locked since: no mark, the next catch-up looks again
+            if stamp is not None:
+                judged[rel_path] = [TOO_DEEP, max_bytes, stamp]
+            extractions.discard(rel_path)
+            engine.delete_nodes_by_source_file(repo_id, rel_path)
         except Exception as exc:
             _log_file_failure("indexing failed", repo_id, rel_path, exc)
+            if saved is not _UNREAD:
+                extractions.restore(rel_path, saved)  # its graph write failed: pass 2 writes what the graph holds
 
     # What the batch's files produced before this run, so the referrer step
     # below can tell which nodes the batch adds.
     batch_keys = sorted(by_rel_path)
-    previous = engine.list_file_nodes(repo_id, batch_keys)
-    previous_nodes = {node[:4] for node in previous}
-    previous_keys = {node[:4]: node[4] for node in previous}
-    previous_projects = {node[:4]: node[6] for node in previous}
-    stale = {node[:4] for node in previous if node[5]}
-    # The claims on the shared nodes the batch's files claim (see
-    # _written_back_shared).
-    claims_before = engine.list_shared_claims(repo_id, batch_keys) if any(not n[2] for n in previous_nodes) else {}
+    previous_nodes: set = set()
+    previous_keys: dict = {}
+    previous_projects: dict = {}
+    stale: set = set()
+    claims_before: dict = {}
+
+    def snapshot(keys: list[str]) -> None:
+        previous = engine.list_file_nodes(repo_id, keys)
+        nodes = {node[:4] for node in previous}
+        previous_nodes.update(nodes)
+        previous_keys.update({node[:4]: node[4] for node in previous})
+        previous_projects.update({node[:4]: node[6] for node in previous})
+        stale.update(node[:4] for node in previous if node[5])
+        # The claims on the shared nodes the batch's files claim (see
+        # _written_back_shared).
+        if any(not n[2] for n in nodes):
+            for key, sources in engine.list_shared_claims(repo_id, keys).items():
+                claims_before.setdefault(key, set()).update(sources)
+
+    snapshot(batch_keys)
+    # Whether a batch file held Express mounts across files before (see _settle below).
+    mounts.touched = bool(engine.route_mount_state(repo_id, batch_keys))
 
     # The schema providers' specs, resolved once for the batch. The docs
     # nodes are read now, so the relink below can tell which ones are new;
@@ -877,19 +1026,32 @@ def index_paths(
     if fs_spec is not None and fs_spec.file_label:
         provider_nodes |= {(fs_spec.file_label, rel, rel) for rel in present}
 
-    for rel_path in sorted(by_rel_path):
+    total = len(by_rel_path)
+    for done, rel_path in enumerate(sorted(by_rel_path), 1):
+        _check_full_scan_claim(repo_id)  # a full scan another process took over stops
         index_one(rel_path, by_rel_path[rel_path])
+        if done % PROGRESS_EVERY == 0:
+            logger.info("%s: indexed %d / %d files", repo_id, done, total)
+    # An Express router file another file mounts is named by those mounts
+    # (apis/routes.py), which the batch may have changed (or written after
+    # it, in path order): every router file whose `route_prefixes` no
+    # longer match is indexed again, joining the batch.
+    if mounts.touched:
+        settle = _stale_mounts(mounts.reload(), mounts.table)
+        outside = sorted(settle - set(by_rel_path))
+        if outside:
+            snapshot(outside)
+            by_rel_path.update({rel: root_resolved / rel for rel in outside})
+            batch_keys = sorted(by_rel_path)
+        for rel_path in sorted(settle):
+            index_one(rel_path, by_rel_path[rel_path])
 
     # Files outside the batch that refer by name to a node the batch just
     # added were indexed before that node existed, so their edge to it was
     # skipped. Index them now as part of this batch (one level, no
     # recursion); the passes below then link them like any batch file.
-    code_extractions = [
-        py_extractions, js_extractions, cs_extractions, cpp_extractions,
-        java_extractions, rs_extractions, kt_extractions, go_extractions,
-    ]
     batch_nodes = _batch_nodes(
-        repo_id, root_resolved, code_extractions, docs_files, mention_files, batch_services, provider_nodes,
+        repo_id, root_resolved, extractions, docs_files, mention_files, batch_services, provider_nodes,
     )
     # A node is added when no node of its label, name and owner was at its
     # file before, so one moving between two of the batch's files, or to
@@ -907,24 +1069,33 @@ def index_paths(
     # written now, before pass 2 tests them. A kept node whose keys or
     # project changed (no keys and none, no project and "", being the
     # same) was linked by `@` pins under its old keys, and by rows that
-    # could see its old project: its CALLS/IMPORTS edges go with them, and
+    # could see its old project: its CALLS/IMPORTS/IMPLEMENTS edges go with them, and
     # pass 2 and the relink below write them again under the new ones, as
     # for an added node; one a failed batch left stale goes again. It is
     # not added otherwise: no referrer, docs or mention depends on them.
-    match_keys = _match_keys(code_extractions)
-    projects = _projects(code_extractions)
+    match_keys = _match_keys(extractions)
+    projects = _projects(extractions)
     rekeyed = {
         node for node, keys in match_keys.items()
         if node in stale or (node in previous_keys and (
             (previous_keys[node] or ()) != (keys or ()) or (previous_projects[node] or "") != (projects[node] or "")
         ))
     }
+    # A file's open classes (its Module's `heir_open`, common.add_heir_keys)
+    # decide which of its Functions an owned end links too, as keys do.
+    new_open = _heir_open(extractions)
+    old_open = engine.file_heir_open(repo_id, sorted(new_open)) if new_open else {}
+    rekeyed |= _open_rekeyed(old_open, new_open, previous_keys, match_keys)
     rewritten = sorted(
         (*node, keys, projects[node], node in rekeyed) for node, keys in match_keys.items()
         if node in rekeyed or previous_keys.get(node) != keys or previous_projects.get(node) != projects[node]
     )
     if rewritten:
         engine.write_match_keys(repo_id, rewritten)
+    # Written after the retraction marks (`mkeys_stale`), so a batch cut
+    # short in between finds the old list and retracts again.
+    if opened := {f: o for f, o in new_open.items() if old_open.get(f) != o}:
+        engine.write_heir_open(repo_id, opened)
     # The match keys, old and new, of the nodes the batch adds, removes or
     # rekeys, by name: a tiered pin's edges to such a name depend on all its
     # nodes, so the relink writes the groups whose keys meet them again (see
@@ -935,6 +1106,7 @@ def index_paths(
         for node in added | rekeyed | (previous_nodes - batch_nodes)
     )
     referrers = _find_referrers(engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path))
+    extractions.late = True  # written after the match keys above: pass 2 writes their nodes again
     for rel_path in sorted(referrers):
         index_one(rel_path, root_resolved / rel_path)
     if judged or read:
@@ -951,66 +1123,27 @@ def index_paths(
             )
         ]
 
-    # Second pass: re-upsert every .py file's already-extracted nodes/edges
-    # (no re-parse, no re-prune). Batch order is path order, not dependency
+    # Second pass: write every code file's already-extracted edges again (no
+    # re-parse, no re-prune). Batch order is path order, not dependency
     # order, so a CALLS/IMPORTS edge from file X to file Y within the
     # SAME batch can silently fail to materialize on the first pass if X
     # happens to sort before Y — upsert_relationships only
     # MATCH-MATCHes existing endpoint nodes, it doesn't create them, so Y's
-    # node isn't there yet when X's edges are upserted. Re-upserting (not
-    # re-pruning) every file's cached extraction a second time is idempotent
-    # (see test_index_file_creates_idempotent_nodes) and guarantees every
-    # node in the batch exists before every file's edges are attempted at
-    # least once, regardless of first-pass order.
-    for rel_path, _content in py_files:
-        nodes, rels = py_extractions[rel_path]
-        engine.upsert_nodes(nodes)
-        engine.upsert_relationships(rels)
-
-    # Same same-batch cross-link guarantee as the .py re-upsert pass above,
-    # for JS/TS files.
-    for rel_path in js_files:
-        nodes, rels = js_extractions[rel_path]
-        engine.upsert_nodes(nodes)
-        engine.upsert_relationships(rels)
-
-    # Same re-upsert pass for C# files, same rationale as above.
-    for rel_path in cs_files:
-        nodes, rels = cs_extractions[rel_path]
-        engine.upsert_nodes(nodes)
-        engine.upsert_relationships(rels)
-
-    # Same second-pass re-upsert, for the same reason, for this batch's C++
-    # files (a stub Class node from an out-of-class method definition — see
-    # cpp/extractor.py — is exactly the kind of same-batch endpoint an
-    # IMPORTS/CONTAINS edge could otherwise miss on the first pass).
-    for rel_path in cpp_files:
-        nodes, rels = cpp_extractions[rel_path]
-        engine.upsert_nodes(nodes)
-        engine.upsert_relationships(rels)
-
-    # Same cross-link re-upsert as above, for the Java files in this batch.
-    for rel_path, _content in java_files:
-        nodes, rels = java_extractions[rel_path]
-        engine.upsert_nodes(nodes)
-        engine.upsert_relationships(rels)
-
-    # Same second-pass re-upsert for Rust files, for the same reason.
-    for rel_path in rs_files:
-        nodes, rels = rs_extractions[rel_path]
-        engine.upsert_nodes(nodes)
-        engine.upsert_relationships(rels)
-
-    # Same second-pass re-upsert for Kotlin files, for the same reason.
-    for rel_path in kt_files:
-        nodes, rels = kt_extractions[rel_path]
-        engine.upsert_nodes(nodes)
-        engine.upsert_relationships(rels)
-
-    # Same second-pass rationale as the .py loop above, for Go's CALLS/
-    # IMPORTS edges within this batch.
-    for rel_path, (nodes, rels) in go_extractions.items():
-        engine.upsert_nodes(nodes)
+    # node isn't there yet when X's edges are upserted. Upserting every
+    # file's edges a second time is idempotent and guarantees every node in
+    # the batch exists before every file's edges are attempted at least
+    # once, regardless of first-pass order (a C# row with tiered match keys
+    # or a project limit is only written here).
+    # A file's nodes are not written again: its pass-1 replace wrote them,
+    # nothing since deleted one (another file's replace deletes only that
+    # file's nodes, and a shared node keeps this file's claim), and the
+    # properties pass 1 left out (`mkeys`, `proj`, `heir_open`) were written
+    # just above, as these nodes hold them (sorted, without repeats). Only a
+    # referrer, written after those, has its nodes written again here.
+    for _lang, _rel_path, entry in extractions.entries():
+        nodes, rels, _content = extractions.load(entry)
+        if entry.late:
+            engine.upsert_nodes(nodes)
         engine.upsert_relationships(rels)
 
     # Code files outside the batch whose by-name edges meet an added node
@@ -1020,6 +1153,7 @@ def index_paths(
     if relink_outside:
         _relink_name_refs(
             engine, repo_id, added | rekeyed, set(by_rel_path) | referrers, match_keys, shadow_names, projects,
+            _open_info(new_open, match_keys),
         )
     if rekeyed:
         engine.settle_match_keys(repo_id, sorted(rekeyed))
@@ -1033,21 +1167,47 @@ def index_paths(
     # once per file, since it can't have changed mid-batch (Services are
     # only written by the Containerfile/compose branches above, already run
     # by this point).
-    # Another language's routes are its extraction's Endpoint nodes.
+    # Another language's routes and datastores are its extraction's
+    # Endpoint and datastore nodes.
+    others = [(rel_path, entry) for lang, rel_path, entry in extractions.entries() if lang != "py"]
     route_endpoints = {
-        rel_path: [node["name"] for node in nodes if node["label"] == "Endpoint"]
-        for extractions in code_extractions[1:]
-        for rel_path, (nodes, _rels) in extractions.items()
+        rel_path: [node[1] for node in entry.nodes if node[0] == "Endpoint"] for rel_path, entry in others
     }
     route_endpoints = {rel_path: names for rel_path, names in route_endpoints.items() if names}
-    if py_files or route_endpoints:
+    client_stores = {
+        rel_path: [node[:2] for node in entry.nodes if node[0] in DATASTORE_LABELS] for rel_path, entry in others
+    }
+    client_stores = {rel_path: stores for rel_path, stores in client_stores.items() if stores}
+    py_files = extractions.files["py"]
+    if py_files or route_endpoints or client_stores:
         services = _load_services_with_build_context(engine, repo_id)
         service_rels: list[dict] = []
-        for rel_path, content in py_files:
-            service_rels.extend(_owning_service_relationships(repo_id, rel_path, content, services))
+        for rel_path, entry in py_files.items():
+            # Read back only for a file a Service owns (the function's own first test).
+            if _match_owning_service(services, rel_path) is not None:
+                content = extractions.load(entry)[2]
+                owned = partial(_owning_service_relationships, repo_id, rel_path, content, services)
+                try:
+                    service_rels.extend(owned())
+                except RecursionError:
+                    # As pass 1 read it: again on a deep stack, and a file
+                    # deeper still writes none, never ending the batch.
+                    found: list[dict] = []
+                    try:
+                        _run_deep(lambda: len(found.extend(owned()) or found))
+                    except RecursionError as exc:
+                        _log_file_failure("owning-service edges skipped", repo_id, rel_path, exc)
+                        found = []
+                    service_rels.extend(found)
         for rel_path, names in sorted(route_endpoints.items()):
             service_rels.extend(_endpoint_service_relationships(repo_id, rel_path, names, services))
+        for rel_path, stores in sorted(client_stores.items()):
+            service_rels.extend(_datastore_service_relationships(repo_id, rel_path, stores, services))
         engine.upsert_relationships(service_rels)
+    # A compose file changed which Service owns which folder: the files
+    # outside the batch that wrote owning-service edges are owned anew.
+    if relink_outside and any(_is_compose(rel_path) for rel_path in by_rel_path):
+        _relink_owning_services(engine, repo_id, set(by_rel_path) | referrers)
 
     if providers_ok and fs_spec is not None:
         filesystem.sync_present(engine, repo_id, fs_spec, present)
@@ -1095,6 +1255,54 @@ def index_paths(
     return indexed
 
 
+# Deeply nested code (a long `else if` chain, a generated `a + b + ...`
+# expression) is one tree level per branch or term, and the extractors walk
+# the tree recursively: about 500 branches or 1,000 terms pass the default
+# recursion limit. Such a file is extracted again on a thread of its own with
+# a large stack and the limit raised, so it is indexed in full; one deeper
+# still is skipped as TOO_DEEP.
+_DEEP_RECURSION_LIMIT = 200_000
+# Under 256 MiB: CPython on Windows refuses a larger thread stack.
+_DEEP_STACK_BYTES = 255 * 1024 * 1024
+TOO_DEEP = "too deeply nested"
+_deep_lock = threading.Lock()
+
+
+def _run_deep(fn: Callable[[], int]) -> int:
+    """`fn()` on a thread with `_DEEP_STACK_BYTES` of stack, the recursion
+    limit raised to `_DEEP_RECURSION_LIMIT` meanwhile. One at a time: the
+    limit is the interpreter's, not the thread's. A platform that can't give
+    the thread that stack raises RecursionError, so the file takes the
+    TOO_DEEP path as it would on any other failure of the retry."""
+    outcome: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            outcome["value"] = fn()
+        except BaseException as exc:  # re-raised on the calling thread
+            outcome["error"] = exc
+
+    with _deep_lock:
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(max(limit, _DEEP_RECURSION_LIMIT))
+        try:
+            try:
+                stack = threading.stack_size(_DEEP_STACK_BYTES)
+                try:
+                    thread = threading.Thread(target=run, name="devgraph-deep-extract")
+                    thread.start()
+                finally:
+                    threading.stack_size(stack)
+            except (ValueError, RuntimeError, MemoryError) as exc:
+                raise RecursionError(f"no thread with a {_DEEP_STACK_BYTES >> 20} MiB stack: {exc}") from exc
+            thread.join()
+        finally:
+            sys.setrecursionlimit(limit)
+    if "error" in outcome:
+        raise outcome["error"]  # type: ignore[misc]
+    return outcome["value"]  # type: ignore[return-value]
+
+
 def _log_file_failure(what: str, repo_id: str, path: object, exc: Exception) -> None:
     """One line for a file the batch skips (a locked or unparseable file is
     not a crash); the traceback only at debug level."""
@@ -1103,6 +1311,8 @@ def _log_file_failure(what: str, repo_id: str, path: object, exc: Exception) -> 
 
 
 _MARKDOWN_SUFFIXES = (".md", ".markdown")
+#: The labels a datastore node takes (datastores/extractor.py DatastoreType).
+DATASTORE_LABELS = frozenset(OWNING_SERVICE_TARGETS)
 _CODE_ROUTES = {
     ".py": "py", ".cs": "cs", ".java": "java", ".rs": "rs", ".kt": "kt", ".go": "go",
     **{suffix: "js" for suffix in _JS_SUFFIXES},
@@ -1136,16 +1346,19 @@ def _routes(resolved: Path, docs_root: Path | None, mentions_enabled: bool) -> l
 def _with_name_refs(nodes: list[dict], rels: list[dict], rel_path: str) -> list[dict]:
     """A copy of a code file's `nodes` whose Module carries the file's
     by-name edges (see name_ref_properties), for its pass-1 replace only:
-    pass 2 re-upserts the plain `nodes`, so it never writes them again. Its
+    pass 2 writes no file's nodes but a referrer's, the plain `nodes`. Its
     symbols' match keys are left out: index_paths writes them after pass 1
     (engine.write_match_keys), with the edges they decide, and so is their
-    C# project (`proj`)."""
+    C# project (`proj`), and its Module's open classes (`heir_open`). A
+    file-less claimed node (an ASP.NET handler stub) keeps both: no match-key
+    write reaches it, and pass 2 no longer writes it again."""
     refs = name_ref_properties(rels)
     return [
-        {**node, "properties": {**node["properties"], **refs}}
+        {**node, "properties": {**{k: v for k, v in node["properties"].items() if k != "heir_open"}, **refs}}
         if node["label"] == "Module" and node["name"] == rel_path
         else {**node, "properties": {k: v for k, v in node["properties"].items() if k not in ("mkeys", "proj")}}
-        if "mkeys" in node["properties"] or "proj" in node["properties"] else node
+        if node["properties"].get("file") and ("mkeys" in node["properties"] or "proj" in node["properties"])
+        else node
         for node in nodes
     ]
 
@@ -1159,31 +1372,18 @@ def _index_single_path(
     docs_root: Path | None,
     mentions_enabled: bool,
     config: ResolverConfig,
-    py_files: list[tuple[str, str]],
-    py_extractions: dict[str, tuple[list[dict], list[dict]]],
-    js_files: list[str],
-    js_extractions: dict[str, tuple[list[dict], list[dict]]],
-    cs_files: list[str],
-    cs_extractions: dict[str, tuple[list[dict], list[dict]]],
-    cpp_files: list[str],
-    cpp_extractions: dict[str, tuple[list[dict], list[dict]]],
-    java_files: list[tuple[str, str]],
-    java_extractions: dict[str, tuple[list[dict], list[dict]]],
-    rs_files: list[str],
-    rs_extractions: dict[str, tuple[list[dict], list[dict]]],
-    kt_files: list[str],
-    kt_extractions: dict[str, tuple[list[dict], list[dict]]],
-    go_extractions: dict[str, tuple[list[dict], list[dict]]],
+    extractions: _Extractions,
     docs_files: list[Path],
     mention_files: list[Path],
     batch_services: set[tuple[str, str, str]],
+    mounts: _Mounts,
 ) -> int:
     """Extract and upsert one file's graph output, routing by name/extension.
 
     Extracted into its own function so `index_paths` can wrap each file in a
     try/except: one unparseable/locked file (or a transient Neo4j error
-    mid-batch) must not abort the whole batch. The per-language accumulator
-    lists are passed in so the second-pass cross-linking below still sees
+    mid-batch) must not abort the whole batch. The batch's extraction
+    store is passed in so the second-pass cross-linking below still sees
     every file that *did* extract successfully.
 
     Returns the number of indexing actions performed (0 for a file that
@@ -1200,7 +1400,9 @@ def _index_single_path(
         # branch. Passed the repo-relative path (not bare filename) so
         # their 'source'/'file' provenance properties match what
         # delete_nodes_by_source_file looks up on file deletion.
-        api_nodes, api_rels = _api_nodes_and_rels(repo_id, rel_path, content)
+        api_nodes, api_rels = _api_nodes_and_rels(
+            repo_id, rel_path, content, config.python_roots(rel_path) if config is not None else (),
+        )
         nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content) + api_nodes
         rels = [r.to_dict() for r in result.relationships] + api_rels
         # Delete this file's previously-indexed nodes and write the
@@ -1215,30 +1417,31 @@ def _index_single_path(
         # the file still makes are re-claimed in place, not recreated. A
         # handler stub claims only a file-less Function (_claim_nodes_tx),
         # never the file-scoped one the extractor writes for the same def.
-        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
-        indexed += 1
-        py_files.append((rel_path, content))
         # API edges ride along in the re-upsert pass: an Endpoint's
         # IMPLEMENTS target can be a handler defined in a later file (e.g.
-        # a Django urls.py naming a view from views.py).
-        py_extractions[rel_path] = (nodes, rels)
+        # a Django urls.py naming a view from views.py). The content is
+        # kept for the owning-service pass. Kept before the graph write, so
+        # a spill that fails aborts the batch with nothing written.
+        extractions.add("py", rel_path, nodes, rels, content)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
+        indexed += 1
     elif "js" in routes:
         content = read_source(resolved)
         result = extract_js_file(content, rel_path, repo_id, config)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "js")
         rels = [r.to_dict() for r in result.relationships]
+        nodes, rels = _mounted(nodes, rels, rel_path, mounts)
         # Same replace-then-reupsert rationale as the .py branch above:
         # prune this file's previously-indexed nodes/edges and write the
         # freshly-extracted ones in one transaction. Its routes' Endpoint
         # edges go as a Python file's do (`service_api`).
+        extractions.add("js", rel_path, nodes, rels)  # once, though the mounts pass may index it again
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
-        js_files.append(rel_path)
-        js_extractions[rel_path] = (nodes, rels)
     elif "cs" in routes:
         content = read_source(resolved)
         result = extract_csharp_file(content, rel_path, repo_id, config)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "cs")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above:
         # prune this file's stale nodes/edges in one transaction, then
@@ -1248,34 +1451,31 @@ def _index_single_path(
         # batch may still add, remove or rekey, and pass 2 only adds edges.
         # So does a row limited to its project's references (`visible`):
         # a node's `proj` is written with its match keys, after pass 1.
+        extractions.add("cs", rel_path, nodes, rels)
         engine.replace_file_nodes(
             repo_id, rel_path, _with_name_refs(nodes, rels, rel_path),
             [rel for rel in rels if not tiered(rel.get("to_file")) and not rel.get("visible")], service_api=True,
         )
         indexed += 1
-        cs_files.append(rel_path)
-        cs_extractions[rel_path] = (nodes, rels)
     elif "cpp" in routes:
         content = read_source(resolved)
         result = extract_cpp_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
+        extractions.add("cpp", rel_path, nodes, rels)
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
         indexed += 1
-        cpp_files.append(rel_path)
-        cpp_extractions[rel_path] = (nodes, rels)
     elif "java" in routes:
         content = read_source(resolved)
         result = extract_java_file(content, rel_path, repo_id)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "java")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-cross-link-reupsert pattern as the .py
         # branch above (see its comment for why replace_file_nodes runs
         # first, in one transaction, rather than plain upsert).
+        extractions.add("java", rel_path, nodes, rels)
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
-        java_files.append((rel_path, content))
-        java_extractions[rel_path] = (nodes, rels)
     elif "rs" in routes:
         content = read_source(resolved)
         result = extract_rust_file(content, rel_path, repo_id, config)
@@ -1284,33 +1484,31 @@ def _index_single_path(
         # Same replace-not-merely-upsert reasoning as the .py branch
         # above: a removed Function/Class must not survive in the graph
         # forever just because MERGE never deletes.
+        extractions.add("rs", rel_path, nodes, rels)
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
         indexed += 1
-        rs_files.append(rel_path)
-        rs_extractions[rel_path] = (nodes, rels)
     elif "kt" in routes:
         content = read_source(resolved)
         result = extract_kotlin_file(content, rel_path, repo_id)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "kt")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above: a
         # class/function removed from the file must not survive in the graph
         # as a stale node.
+        extractions.add("kt", rel_path, nodes, rels)
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
-        kt_files.append(rel_path)
-        kt_extractions[rel_path] = (nodes, rels)
     elif "go" in routes:
         content = read_source(resolved)
         result = extract_go_file(content, rel_path, repo_id, config)
-        nodes = [n.to_dict() for n in result.nodes]
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "go")
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-re-upsert rationale as the .py branch above:
         # a struct/func/method removed from the file must not survive in
         # the graph as a stale node.
+        extractions.add("go", rel_path, nodes, rels)
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
-        go_extractions[rel_path] = (nodes, rels)
     elif "docs" in routes:
         index_doc_file(engine, repo_id, resolved, repo_root)
         indexed += 1
@@ -1334,10 +1532,119 @@ def _index_single_path(
     return indexed
 
 
+#: `index_paths`' marker for a file whose extraction entry was not yet looked up.
+_UNREAD = object()
+
+#: index_paths logs its progress every this many files of a batch.
+PROGRESS_EVERY = 5_000
+
+
+class _Extracted(NamedTuple):
+    """One code file's pass-1 extraction as `_Extractions` holds it."""
+
+    spill: tuple[int, int]  # (offset, length) of its pickled (nodes, rels, content) in the spill file
+    # (label, name, file, owner, mkeys, proj, source) of each node, its
+    # properties' values or None: what the steps between the passes read.
+    nodes: tuple[tuple, ...]
+    heir_open: tuple[tuple[str, tuple[str, ...]], ...]  # (Module, its open classes) of each Module with `heir_open`
+    late: bool  # written after the batch's match keys (a referrer)
+
+
+class _Extractions:
+    """The code files' pass-1 extractions of one index_paths batch, for the passes after it.
+
+    Pass 2 writes every file's edges again once every node exists, so each
+    extraction is needed until then. Held as node and edge dicts, a full
+    scan kept every file's (about 120 KB a file) to its end. Each one is
+    pickled and compressed into an anonymous temporary file instead (a few
+    KB a file), read back by pass 2, and only what the steps between the
+    passes read stays in memory: each node's key fields (`_Extracted.nodes`).
+    The file is in DevGraph's own folder (`devgraph_home()/tmp`), not the
+    system's temporary folder, which may be memory (tmpfs); it has no name
+    (deleted on close, on Windows too), and a write or read that fails
+    aborts the batch (`ExtractionSpillFailed`).
+
+    `files` is per language in pass 2's order, and per language in the order
+    files were first added: a file added again (a router file the mounts
+    pass indexes again) keeps its place and its latest extraction.
+    """
+
+    LANGUAGES = ("py", "js", "cs", "cpp", "java", "rs", "kt", "go")
+
+    def __init__(self) -> None:
+        self.files: dict[str, dict[str, _Extracted]] = {lang: {} for lang in self.LANGUAGES}
+        self.late = False  # set once the batch's match keys are written
+        self._spill = None
+
+    def __enter__(self) -> _Extractions:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._spill is not None:
+            self._spill.close()
+
+    def add(self, lang: str, rel_path: str, nodes: list[dict], rels: list[dict], content: str | None = None) -> None:
+        data = zlib.compress(pickle.dumps((nodes, rels, content), pickle.HIGHEST_PROTOCOL), 1)
+        try:
+            if self._spill is None:
+                folder = devgraph_home() / "tmp"
+                folder.mkdir(parents=True, exist_ok=True)
+                self._spill = tempfile.TemporaryFile(dir=folder)
+            offset = self._spill.seek(0, os.SEEK_END)
+            self._spill.write(data)
+            self._spill.flush()  # a full disk fails this file, not a later one
+        except OSError as exc:
+            raise ExtractionSpillFailed(f"could not keep the extraction of {rel_path} for the batch: {exc}") from exc
+        keys = []
+        heir_open = []
+        for node in nodes:
+            props = node["properties"]
+            mkeys = props.get("mkeys")
+            keys.append((
+                node["label"], node["name"], props.get("file"), props.get("owner"),
+                None if mkeys is None else tuple(mkeys), props.get("proj"), props.get("source"),
+            ))
+            if node["label"] == "Module" and "heir_open" in props:
+                heir_open.append((node["name"], tuple(sorted(props["heir_open"]))))
+        self.files[lang][rel_path] = _Extracted((offset, len(data)), tuple(keys), tuple(heir_open), self.late)
+
+    def load(self, entry: _Extracted) -> tuple[list[dict], list[dict], str | None]:
+        """(nodes, rels, content) of a file as `add` was given them."""
+        offset, length = entry.spill
+        try:
+            self._spill.seek(offset)
+            return pickle.loads(zlib.decompress(self._spill.read(length)))
+        except (OSError, EOFError, zlib.error, pickle.UnpicklingError) as exc:
+            raise ExtractionSpillFailed(f"could not read back a kept extraction: {exc}") from exc
+
+    def saved(self, rel_path: str) -> tuple[str, _Extracted] | None:
+        """The file's current entry, for `restore`."""
+        return next(((lang, files[rel_path]) for lang, files in self.files.items() if rel_path in files), None)
+
+    def restore(self, rel_path: str, saved: tuple[str, _Extracted] | None) -> None:
+        """Put back what `saved` returned: a file whose graph write failed
+        after its extraction was added keeps its earlier one, or none."""
+        if saved is None:
+            self.discard(rel_path)
+        else:
+            self.files[saved[0]][rel_path] = saved[1]  # a file's language never changes: its place is kept
+
+    def discard(self, rel_path: str) -> None:
+        """Forget a file left out after it was extracted, so pass 2 writes nothing for it."""
+        for files in self.files.values():
+            files.pop(rel_path, None)
+
+    def entries(self):
+        """(language, rel_path, entry) of every file, in pass 2's order."""
+        for lang, files in self.files.items():
+            for rel_path, entry in files.items():
+                yield lang, rel_path, entry
+
+
 def _batch_nodes(
     repo_id: str,
     root: Path,
-    code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
+    extractions: _Extractions,
     docs_files: list[Path],
     mention_files: list[Path],
     services: set[tuple[str, str, str]],
@@ -1353,21 +1660,16 @@ def _batch_nodes(
     added. Only a code symbol has an owner (common.member_owner); every
     other node's is ""."""
     nodes = {
-        (
-            node["label"], node["name"], rel_path if node["label"] == "Module" else node["properties"]["file"],
-            node["properties"].get("owner") or "",
-        )
-        for extractions in code_extractions
-        for rel_path, (file_nodes, _rels) in extractions.items()
-        for node in file_nodes
-        if node["label"] == "Module" or node["properties"].get("file")
+        (label, name, rel_path if label == "Module" else file, owner or "")
+        for _lang, rel_path, entry in extractions.entries()
+        for label, name, file, owner, _mkeys, _proj, _source in entry.nodes
+        if label == "Module" or file
     }
     nodes |= {
-        (node["label"], node["name"], "", "")
-        for extractions in code_extractions
-        for rel_path, (file_nodes, _rels) in extractions.items()
-        for node in file_nodes
-        if not node["properties"].get("file") and node["properties"].get("source") == rel_path
+        (label, name, "", "")
+        for _lang, rel_path, entry in extractions.entries()
+        for label, name, file, _owner, _mkeys, _proj, source in entry.nodes
+        if not file and source == rel_path
     }
     for path in docs_files:
         # The extraction is keyed by the file name, but index_doc_file
@@ -1380,46 +1682,92 @@ def _batch_nodes(
     return nodes
 
 
-def _match_keys(
-    code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
-) -> dict[tuple[str, str, str, str], tuple[str, ...] | None]:
+def _match_keys(extractions: _Extractions) -> dict[tuple[str, str, str, str], tuple[str, ...] | None]:
     """(label, name, file, owner) -> sorted `mkeys` (graph/schema.py `split_pin`'s
     `@` flag tests them) of every code symbol this batch wrote, None for
     one written without them, as list_file_nodes gives them."""
     return {
-        (node["label"], node["name"], node["properties"]["file"], node["properties"].get("owner") or ""): (
-            None if node["properties"].get("mkeys") is None else tuple(sorted(set(node["properties"]["mkeys"])))
-        )
-        for extractions in code_extractions
-        for _rel_path, (file_nodes, _rels) in extractions.items()
-        for node in file_nodes
-        if node["properties"].get("file")
+        (label, name, file, owner or ""): None if mkeys is None else tuple(sorted(set(mkeys)))
+        for _lang, _rel_path, entry in extractions.entries()
+        for label, name, file, owner, mkeys, _proj, _source in entry.nodes
+        if file
     }
 
 
-def _projects(
-    code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
-) -> dict[tuple[str, str, str, str], str | None]:
+def _projects(extractions: _Extractions) -> dict[tuple[str, str, str, str], str | None]:
     """(label, name, file, owner) -> the C# project (`proj`, which a row's
     `visible` tests, see common.visible_to) of every code symbol this batch
     wrote, None for one written without one, as list_file_nodes gives it."""
     return {
-        (node["label"], node["name"], node["properties"]["file"], node["properties"].get("owner") or ""):
-            node["properties"].get("proj")
-        for extractions in code_extractions
-        for _rel_path, (file_nodes, _rels) in extractions.items()
-        for node in file_nodes
-        if node["properties"].get("file")
+        (label, name, file, owner or ""): proj
+        for _lang, _rel_path, entry in extractions.entries()
+        for label, name, file, owner, _mkeys, proj, _source in entry.nodes
+        if file
     }
+
+
+def _heir_open(extractions: _Extractions) -> dict[str, tuple[str, ...]]:
+    """File -> its Module's open classes (`heir_open`, common.add_heir_keys)
+    for every code file of the batch whose extractor writes them."""
+    return {module: opens for _lang, _rel_path, entry in extractions.entries() for module, opens in entry.heir_open}
+
+
+def _open_rekeyed(
+    old_open: dict[str, tuple[str, ...]], new_open: dict[str, tuple[str, ...]],
+    previous_keys: dict[tuple[str, str, str, str], tuple[str, ...] | None],
+    match_keys: dict[tuple[str, str, str, str], tuple[str, ...] | None],
+) -> set[tuple[str, str, str, str]]:
+    """The batch's Functions whose incoming owned edges an open class of
+    their file (graph/engine.py `_owner_test`) may have linked otherwise:
+    every Function of a file whose open classes changed, and of a file with
+    open classes, every Function of a name whose Functions an open class
+    now has or inherits otherwise than before (one added, removed, or
+    rekeyed). They are retracted and relinked as rekeyed nodes are."""
+    def functions(keys, file):
+        return [(node, each or ()) for node, each in keys.items() if node[0] == "Function" and node[2] == file]
+
+    found: set[tuple[str, str, str, str]] = set()
+    for file in set(old_open) | set(new_open):
+        owners_old, owners_new = set(old_open.get(file, ())), set(new_open.get(file, ()))
+        new = functions(match_keys, file)
+        if owners_old != owners_new:
+            found.update(node for node, _keys in new)
+            continue
+        if not owners_new:
+            continue
+        old = functions(previous_keys, file)
+
+        def has(nodes, name, owner):
+            return any(node[1] == name and (node[3] == owner or HEIR_KEY + owner in keys) for node, keys in nodes)
+
+        for name in {node[1] for node, _keys in new} | {node[1] for node, _keys in old}:
+            if any(has(old, name, owner) != has(new, name, owner) for owner in owners_new):
+                found.update(node for node, _keys in new if node[1] == name)
+    return found
+
+
+def _open_info(
+    new_open: dict[str, tuple[str, ...]], match_keys: dict[tuple[str, str, str, str], tuple[str, ...] | None],
+) -> dict[str, tuple[tuple[str, ...], dict[str, list]]]:
+    """File -> (its open classes, name -> its Functions' (owner, mkeys)),
+    which common.owner_matches reads, for the batch's files with open classes."""
+    info: dict[str, tuple[tuple[str, ...], dict[str, list]]] = {
+        file: (owners, {}) for file, owners in new_open.items() if owners
+    }
+    for (label, name, file, owner), keys in match_keys.items():
+        if label == "Function" and file in info:
+            info[file][1].setdefault(name, []).append((owner, keys or ()))
+    return info
 
 
 def _shadow_keys(nodes) -> dict[tuple[str, str], set[str]]:
     """(label, name) -> the match keys of these (node, old mkeys, new mkeys)
-    of a file-scoped label, old and new together; a name whose nodes hold
-    none is left out."""
+    of a file-scoped label, old and new together, heir keys
+    (graph/schema.py `HEIR_KEY`) aside, which no `@` pin holds; a name
+    whose nodes hold none is left out."""
     found: dict[tuple[str, str], set[str]] = {}
     for node, old, new in nodes:
-        keys = set(old or ()) | set(new or ())
+        keys = {key for key in (*(old or ()), *(new or ())) if not key.startswith(HEIR_KEY)}
         if keys and node[0] in FILE_SCOPED_LABELS:
             found.setdefault(node[:2], set()).update(keys)
     return found
@@ -1434,6 +1782,7 @@ def _relink_name_refs(
     match_keys: dict[tuple[str, str, str, str], tuple[str, ...] | None] | None = None,
     shadow_names: Mapping[tuple[str, str], set[str]] | None = None,
     projects: dict[tuple[str, str, str, str], str | None] | None = None,
+    open_info: dict[str, tuple[tuple[str, ...], dict[str, list]]] | None = None,
 ) -> None:
     """Re-write the by-name edges that code files outside `skip` recorded in
     their Modules' `name_refs` (see name_ref_properties) and that meet a node
@@ -1452,7 +1801,9 @@ def _relink_name_refs(
     file-keyed index. An entry with target pins relinks only an added node a
     pin of its links (common.best_pin: the strongest pin that matches its
     file, as the writer's rows leave out what a stronger pin matches, tested
-    against the node's `match_keys`), with that pin's confidence, when a
+    against the node's `match_keys`; an owned pin's owner as
+    common.owner_matches reads it, with `open_info`, the batch files' open
+    classes and their Functions), with that pin's confidence, when a
     path pin's node is visible to the entry's file's project (its
     Module's `name_ref_visible` against the node's `projects`,
     common.visible_to): such an edge is pinned to the node's file, so the
@@ -1556,8 +1907,11 @@ def _relink_name_refs(
                     # A path pin's row sees only its project's references (graph/engine.py `_visible`).
                     if pin is not None and pin_kind(pin) not in ("file", "fileless"):
                         pin = pin if visible_to((projects or {}).get(node), visible) else None
-                    # A pin that named its target's owner links only that owner's member.
-                    if pin is not None and (None in owners[pin] or to_owner in owners[pin]):
+                    # A pin that named its target's owner links only that owner's member,
+                    # its own or one it inherits from a class of its file.
+                    opened, siblings = (open_info or {}).get(to_file or "", ((), {})) if to_label == "Function" \
+                        else ((), {})
+                    if pin is not None and owner_matches(owners[pin], to_owner, keys, opened, siblings.get(to_name, ())):
                         relink(
                             origin, fields, from_file, to_file, pin_confidence(pin, confidence), from_owner=owner,
                             to_owner=to_owner,
@@ -1666,9 +2020,11 @@ def _docs_note_referrers(
         return set()
     found = set()
     for path in sorted(docs_root.rglob("*")):
-        if path.suffix not in (".md", ".markdown") or not _is_indexable_file(path) or is_ignored_path(path):
+        if path.suffix not in (".md", ".markdown") or not _is_indexable_file(path):
             continue
         rel_path = path.relative_to(root).as_posix()
+        if is_ignored_path(Path(rel_path), root):
+            continue
         if rel_path in batch:
             continue
         result = DocsExtractor(repo_id).extract_from_source(_read_text(path), path.name)
@@ -1860,7 +2216,10 @@ def _folders_above(rel: str) -> list[str]:
     return ["/".join(parts[:i]) for i in range(1, len(parts))]
 
 
-def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path]) -> int:
+def remove_paths(
+    engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
+    mentions_enabled: bool = False,
+) -> int:
     """Remove graph nodes whose provenance is one of these now-deleted paths.
 
     A path may be a file or a folder: each is keyed lexically (`_gone_key`)
@@ -1872,7 +2231,11 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     each deleted path that holds no indexable file on disk, so that its now
     empty folder nodes go. The tiered groups of other files to the deleted
     symbols' names are written again (`_relink_name_refs`): a farther node
-    the deleted one hid is linked again.
+    the deleted one hid is linked again. Deleting a file that mounted
+    another file's Express router re-indexes that router file
+    (`_stale_mounts`), with `docs_path` and `mentions_enabled` as
+    index_paths takes them; a compose file's deletion re-owns the files
+    under it (`_relink_owning_services`).
 
     Args:
         engine: A GraphEngine instance.
@@ -1900,11 +2263,14 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
 
     # The names and match keys of the symbols that go: a tiered pin's edges
     # to such a name depend on all its nodes (see _relink_name_refs). Only
-    # C# writes match keys, so only a deleted .cs file is looked at.
+    # C# writes the keys a tiered pin tests (other languages' heir keys
+    # shadow nothing, _shadow_keys), so only a deleted .cs file is looked at.
     gone_cs = sorted(rel for rel in removed if rel.endswith(".cs"))
     shadow_names = _shadow_keys(
         (node[:4], node[4], None) for node in (engine.list_file_nodes(repo_id, gone_cs) if gone_cs else ())
     )
+    # Express mounts the deleted files held (apis/routes.py).
+    mounted = engine.route_mount_state(repo_id, sorted(removed)) if removed else {}
     # Must match the repo-relative key index_paths() writes for every
     # extractor (Module/Class/Function/Document nodes, and shared nodes'
     # `sources`).
@@ -1914,6 +2280,16 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
         engine.update_skipped_files(repo_id, drop=removed)
     if shadow_names:
         _relink_name_refs(engine, repo_id, set(), removed, shadow_names=shadow_names)
+    if any(_is_compose(rel) for rel in removed):
+        _relink_owning_services(engine, repo_id, set())
+    if mounted:
+        mounts = _Mounts(engine, repo_id)
+        settle = _stale_mounts(mounts.reload(), mounts.table)
+        if settle:
+            index_paths(
+                engine, repo_id, repo_root, {repo_root / rel for rel in settle}, docs_path=docs_path,
+                mentions_enabled=mentions_enabled, sync_provider=False,
+            )
 
     ok, fs_spec, docs_spec = specs
     if removed:
@@ -2019,7 +2395,7 @@ def prune_stale_files(
     if not stale:
         return 0
     stale_paths = {repo_root / p for p in stale}
-    return remove_paths(engine, repo_id, repo_root, stale_paths)
+    return remove_paths(engine, repo_id, repo_root, stale_paths, docs_path, mentions_enabled)
 
 
 #: How far before `since` a change stamp still makes a file due: FAT and SMB
@@ -2127,6 +2503,7 @@ def catch_up(
     docs_path: str | None = None,
     mentions_enabled: bool = False,
     force: bool = False,
+    while_waiting: Callable[[], bool] | None = None,
 ) -> CatchUp:
     """Bring the graph up to date with changes made since `since`, while
     nothing was watching: an incremental `full_scan`.
@@ -2139,7 +2516,10 @@ def catch_up(
     filesystem type declared) is never offered.
 
     An index older than `INDEX_FORMAT` gets a `full_scan` instead, which
-    upgrades it. Last, a changed resolver configuration re-indexes its
+    upgrades it. It waits for its turn (`_take_full_scan_lock`, calling
+    `while_waiting`) before it checks the format again, so a scan that
+    another job (the schema rescan, or another process's `devgraph rescan`:
+    see `_claim_full_scan`) ran meanwhile is not repeated. Last, a changed resolver configuration re-indexes its
     language's files (sync_resolver_config).
 
     A missing, unreadable or apparently unmounted root is refused as
@@ -2147,10 +2527,17 @@ def catch_up(
     """
     check_repo_root(repo_root)
     if index_outdated(engine, repo_id):
-        indexed = full_scan(
-            engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
-        )
-        return CatchUp(indexed=indexed, pruned=0, checked=0, offered=0, unknown=0)
+        # The repository is registered (the agent checks): a graph that lost
+        # its Repository node (wiped) gets it back, or full_scan would take
+        # it for removed and scan nothing.
+        engine.upsert_repository(repo_id, repo_id, str(repo_root))
+        with full_scan_turn(repo_id, while_waiting, engine):
+            if index_outdated(engine, repo_id):
+                indexed = full_scan(
+                    engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
+                )
+                return CatchUp(indexed=indexed, pruned=0, checked=0, offered=0, unknown=0)
+    forget_manifests()  # build manifests may have come or gone while nothing watched
     pruned = prune_stale_files(
         engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
     )
@@ -2261,6 +2648,230 @@ def sync_resolver_config(
     return indexed
 
 
+#: Held for each full scan, so a process runs one at a time (see full_scan).
+#: Reentrant: catch_up takes it before it checks the index format again,
+#: then full_scan takes it once more.
+_FULL_SCAN_LOCK = threading.RLock()
+
+#: How often a full scan waiting its turn calls its `while_waiting`.
+FULL_SCAN_POLL_S = 1.0
+
+
+#: This process's name on a repository's full-scan claim (see
+#: `_claim_full_scan`): pid and host, and a random part so a reused pid is not
+#: taken for it.
+_SCAN_OWNER = f"{os.getpid()}@{socket.gethostname()}/{uuid.uuid4().hex[:8]}"
+_SCAN_OWNER_PARTS = re.compile(r"^(\d+)@(.+)/[0-9a-f]+$")
+
+#: How often a held full-scan claim's heartbeat is refreshed, and how old a
+#: heartbeat may be before another process takes the claim over (the holder
+#: hung, or crashed on another host).
+FULL_SCAN_HEARTBEAT_S = 15.0
+FULL_SCAN_STALE_S = 90.0
+
+
+class FullScanClaimLost(BatchAborted):
+    """Another process took a running full scan's claim over (its heartbeat
+    looked stale): the scan stops before it stamps the index format."""
+
+
+class _Claim:
+    """A full-scan claim this process holds: how deeply it is taken, the
+    heartbeat's stop, set once the claim is lost, and the scanning thread."""
+
+    def __init__(self) -> None:
+        self.depth = 1
+        self.stop = threading.Event()
+        self.lost = threading.Event()
+        self.thread = threading.get_ident()
+
+
+#: repo_id -> the claim this process holds; changed only while holding
+#: `_FULL_SCAN_LOCK`.
+_scan_claims: dict[str, _Claim] = {}
+
+#: `_claim_full_scan` outcomes besides another process's name.
+_HELD = object()
+_NO_REPOSITORY = object()
+
+
+def _acquire_full_scan_lock(repo_id: str, while_waiting: Callable[[], bool] | None, log: bool) -> None:
+    if _FULL_SCAN_LOCK.acquire(blocking=False):
+        return
+    if log:
+        logger.info("%s: waiting for another repository's full scan to finish", repo_id)
+    while not _FULL_SCAN_LOCK.acquire(timeout=FULL_SCAN_POLL_S):
+        if while_waiting is not None and not while_waiting():
+            raise FullScanCancelled(f"{repo_id}: the full scan waiting its turn was called off")
+
+
+def _take_full_scan_lock(
+    repo_id: str, while_waiting: Callable[[], bool] | None, engine: GraphEngine | None = None
+) -> bool:
+    """Take `_FULL_SCAN_LOCK`, logging a wait. While another scan holds it,
+    `while_waiting` runs every `FULL_SCAN_POLL_S` (the watcher's
+    `yield_batch_lock`: the repository's live batches run meanwhile); False
+    from it calls the scan off (`FullScanCancelled`).
+
+    With `engine`, then also the repository's claim across processes
+    (`_claim_full_scan`). While another process holds that, the lock is let
+    go between tries, so at the outermost take this process's scans of other
+    repositories run meanwhile. False, holding nothing, when the repository
+    has no Repository node (removed): nothing to scan."""
+    first = True
+    while True:
+        _acquire_full_scan_lock(repo_id, while_waiting, log=first)
+        if engine is None:
+            return True
+        try:
+            outcome = _claim_full_scan(engine, repo_id)
+        except BaseException:
+            _FULL_SCAN_LOCK.release()
+            raise
+        if outcome is _HELD:
+            return True
+        _FULL_SCAN_LOCK.release()
+        if outcome is _NO_REPOSITORY:
+            return False
+        if first:
+            logger.info("%s: waiting for the full scan process %s is running", repo_id, outcome)
+            first = False
+        if while_waiting is not None and not while_waiting():
+            raise FullScanCancelled(f"{repo_id}: the full scan waiting for another process's was called off")
+        time.sleep(FULL_SCAN_POLL_S)
+
+
+def _release_full_scan_lock(repo_id: str, engine: GraphEngine | None = None) -> None:
+    """Undo one `_take_full_scan_lock` that returned True."""
+    try:
+        if engine is not None:
+            _release_full_scan_claim(engine, repo_id)
+    finally:
+        _FULL_SCAN_LOCK.release()
+
+
+def _claim_full_scan(engine: GraphEngine, repo_id: str) -> object:
+    """Try once to hold the repository's full-scan claim on its Repository
+    node, so one full scan of it runs at a time across processes: `devgraph
+    rescan` and the agent's catch-up or index upgrade no longer scan it
+    together (their writes deadlocked, and the work doubled). The claim is
+    apart from the index format, which a scan unstamps while it runs (see
+    full_scan).
+
+    Reentrant in this process. Returns `_HELD`, `_NO_REPOSITORY`, or the
+    name of the other process holding it with a fresh heartbeat. A holder
+    on this host whose process is gone, or whose heartbeat is older than
+    `FULL_SCAN_STALE_S`, is taken over. A thread refreshes the heartbeat
+    every `FULL_SCAN_HEARTBEAT_S` until release, and marks the claim lost
+    if another process took it over (`_check_full_scan_claim`)."""
+    held = _scan_claims.get(repo_id)
+    if held is not None:
+        held.depth += 1
+        return _HELD
+    granted, holder = engine.claim_full_scan(repo_id, _SCAN_OWNER, FULL_SCAN_STALE_S)
+    if not granted and holder is not None and _holder_gone(holder):
+        logger.warning("%s: taking over the full scan of %s, whose process has ended", repo_id, holder)
+        granted, holder = engine.claim_full_scan(repo_id, _SCAN_OWNER, FULL_SCAN_STALE_S, replace=holder)
+    if not granted:
+        return holder if holder is not None else _NO_REPOSITORY
+    claim = _Claim()
+    threading.Thread(
+        target=_beat_full_scan, args=(engine, repo_id, claim), name=f"devgraph-scan-heartbeat-{repo_id}", daemon=True
+    ).start()
+    _scan_claims[repo_id] = claim
+    return _HELD
+
+
+def _holder_gone(holder: str) -> bool:
+    """Whether a claim's holder is a process on this host that has ended."""
+    from devgraph.agent.lifecycle import pid_is_running  # the agent package imports dispatch
+
+    parts = _SCAN_OWNER_PARTS.match(holder)
+    if parts is None or parts.group(2) != socket.gethostname():
+        return False
+    pid = int(parts.group(1))
+    return pid != os.getpid() and not pid_is_running(pid)
+
+
+def _beat_full_scan(engine: GraphEngine, repo_id: str, claim: _Claim) -> None:
+    while not claim.stop.wait(FULL_SCAN_HEARTBEAT_S):
+        try:
+            held = engine.beat_full_scan(repo_id, _SCAN_OWNER)
+        except EngineClosed:  # closing: it released the claim (GraphEngine.close)
+            return
+        except Exception:
+            logger.warning(
+                "%s: the full scan's heartbeat failed; another process may take the scan over after %.0f s",
+                repo_id, FULL_SCAN_STALE_S, exc_info=True,
+            )
+            continue
+        if not held:
+            claim.lost.set()
+            logger.warning(
+                "%s: another process took this full scan over (its heartbeat looked stale), or the repository "
+                "was removed; stopping it before it stamps the index", repo_id,
+            )
+            return
+
+
+def _check_full_scan_claim(repo_id: str) -> None:
+    """Raise `FullScanClaimLost` in the thread running the repository's full
+    scan once its claim is lost; anywhere else (a live batch), nothing."""
+    claim = _scan_claims.get(repo_id)
+    if claim is not None and claim.thread == threading.get_ident() and claim.lost.is_set():
+        raise FullScanClaimLost(f"{repo_id}: the full scan's claim was taken over by another process")
+
+
+def _release_full_scan_claim(engine: GraphEngine, repo_id: str) -> None:
+    claim = _scan_claims[repo_id]
+    if claim.depth > 1:
+        claim.depth -= 1
+        return
+    del _scan_claims[repo_id]
+    claim.stop.set()  # a beat still running only refreshes a claim of this process's
+    try:
+        engine.release_full_scan(repo_id, _SCAN_OWNER)
+    except EngineClosed:
+        pass  # it released the claim as it closed
+    except Exception:
+        logger.warning(
+            "%s: could not release the full-scan claim; it lapses in %.0f s", repo_id, FULL_SCAN_STALE_S,
+            exc_info=True,
+        )
+
+
+def full_scan_elsewhere(engine: GraphEngine, repo_id: str) -> str | None:
+    """The other process running a full scan of the repository now (its
+    claim's heartbeat is fresh), or None."""
+    holder = engine.full_scan_holder(repo_id, FULL_SCAN_STALE_S)
+    return holder if holder != _SCAN_OWNER else None
+
+
+@contextmanager
+def full_scan_turn(
+    repo_id: str, while_waiting: Callable[[], bool] | None = None, engine: GraphEngine | None = None
+):
+    """Hold this process's full-scan turn (`_take_full_scan_lock`) for the
+    block, and with `engine` the repository's claim across processes: a
+    caller that scans only if the index is still outdated checks that inside
+    it, after the wait, and its full_scan then runs at once. A repository
+    with no Repository node holds nothing; its full_scan scans nothing."""
+    taken = _take_full_scan_lock(repo_id, while_waiting, engine)
+    try:
+        yield
+    finally:
+        if taken:
+            _release_full_scan_lock(repo_id, engine)
+
+
+def full_scan_running() -> bool:
+    """Whether another thread of this process is running a full scan now."""
+    if not _FULL_SCAN_LOCK.acquire(blocking=False):
+        return True
+    _FULL_SCAN_LOCK.release()
+    return False
+
+
 def full_scan(
     engine: GraphEngine,
     repo_id: str,
@@ -2269,6 +2880,7 @@ def full_scan(
     mentions_enabled: bool = False,
     force: bool = False,
     skipped: dict[str, str] | None = None,
+    while_waiting: Callable[[], bool] | None = None,
 ) -> int:
     """Walk every file under repo_root and index it, skipping VCS/build/venv noise. Used by `devgraph add`/`rescan`.
 
@@ -2300,37 +2912,55 @@ def full_scan(
     at its end, so a scan cut short (the agent shutting down mid-rescan, say)
     leaves the index outdated and the next catch-up redoes it in full: the
     schema is recorded as applied before the files are written.
+
+    One full scan runs at a time in this process (`_FULL_SCAN_LOCK`): after
+    an `INDEX_FORMAT` change every repository's start catch-up is a full
+    scan, and run together their memory peaks added up. A scan waits for
+    the one running, calling `while_waiting` meanwhile (see
+    `_take_full_scan_lock`); live batches never take the lock. Across
+    processes, one full scan of the repository runs at a time
+    (`_claim_full_scan`): a `devgraph rescan` and the agent wait for each
+    other's. A repository with no Repository node (removed) is not scanned,
+    and not created again: callers that register one create it first.
     """
-    check_repo_root(repo_root)
-    docs_cache.forget(repo_root)
-    # The shared-claim records the writes below unclaim through are rebuilt
-    # from the shared nodes first, so a full scan heals any that drifted.
-    engine.rebuild_claim_records(repo_id)
-    prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force)
-    engine.set_index_format(repo_id, 0)
-    resolver = fingerprints(repo_root)  # before extraction reads the configuration
-    all_files = _indexable_paths(repo_root)
-    applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)
-    left_out: dict[str, str] = {} if skipped is None else skipped
-    engine.update_skipped_files(repo_id, replace=True)  # every file is judged again below
-    indexed = index_paths(
-        engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
-        sync_provider=False,  # applied just above
-        relink_outside=False,  # every file is in the batch
-        skipped=left_out,
-        resolver=resolver,
-    )
-    if left_out:
-        counts = Counter(left_out.values())
-        logger.info(
-            "%s: skipped %d file(s) (%s); see `devgraph rescan %s`",
-            repo_id, len(left_out), ", ".join(f"{n} {reason}" for reason, n in sorted(counts.items())), repo_id,
+    if not _take_full_scan_lock(repo_id, while_waiting, engine):
+        logger.info("%s: not in the graph (removed); nothing to scan", repo_id)
+        return 0
+    try:
+        check_repo_root(repo_root)
+        docs_cache.forget(repo_root)
+        forget_manifests()
+        # The shared-claim records the writes below unclaim through are rebuilt
+        # from the shared nodes first, so a full scan heals any that drifted.
+        engine.rebuild_claim_records(repo_id)
+        prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force)
+        engine.set_index_format(repo_id, 0)
+        resolver = fingerprints(repo_root)  # before extraction reads the configuration
+        all_files = _indexable_paths(repo_root)
+        applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)
+        left_out: dict[str, str] = {} if skipped is None else skipped
+        engine.update_skipped_files(repo_id, replace=True)  # every file is judged again below
+        indexed = index_paths(
+            engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
+            sync_provider=False,  # applied just above
+            relink_outside=False,  # every file is in the batch
+            skipped=left_out,
+            resolver=resolver,
         )
-    if applied:
-        _sync_docs_edges(engine, repo_id, repo_root, applied_docs)
-    engine.write_resolver_config(repo_id, resolver)
-    engine.set_index_format(repo_id, INDEX_FORMAT)
-    return indexed
+        if left_out:
+            counts = Counter(left_out.values())
+            logger.info(
+                "%s: skipped %d file(s) (%s); see `devgraph rescan %s`",
+                repo_id, len(left_out), ", ".join(f"{n} {reason}" for reason, n in sorted(counts.items())), repo_id,
+            )
+        if applied:
+            _sync_docs_edges(engine, repo_id, repo_root, applied_docs)
+        engine.write_resolver_config(repo_id, resolver)
+        _check_full_scan_claim(repo_id)  # taken over meanwhile: that scan stamps it
+        engine.set_index_format(repo_id, INDEX_FORMAT)
+        return indexed
+    finally:
+        _release_full_scan_lock(repo_id, engine)
 
 
 def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> ExtractionResult:
@@ -2392,7 +3022,8 @@ def _upsert_container_result(engine: GraphEngine, repo_id: str, rel_path: str, r
         {"label": "Container", "repo_id": repo_id, "name": c.name, "properties": {**c.properties, "image": c.image}}
         for c in result.containers
     ] + [
-        {"label": "Service", "repo_id": repo_id, "name": s.name, "properties": s.properties}
+        # A build context the service no longer has is cleared (a None removes it).
+        {"label": "Service", "repo_id": repo_id, "name": s.name, "properties": {"build_context": None, **s.properties}}
         for s in result.services
     ]
     # A replace, so a service or stage the file no longer declares is
@@ -2401,9 +3032,60 @@ def _upsert_container_result(engine: GraphEngine, repo_id: str, rel_path: str, r
     engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
 
 
-def _datastore_nodes(repo_id: str, rel_path: str, content: str) -> list[dict]:
-    result = DatastoreExtractor(repo_id).extract_from_source(content, rel_path)
-    return [{"label": ds.datastore_type, "repo_id": repo_id, "name": ds.name, "properties": ds.properties} for ds in result.datastores]
+def _datastore_nodes(repo_id: str, rel_path: str, content: str, language: str = "py") -> list[dict]:
+    """The datastore nodes a source file's clients claim: a Python file's
+    (DatastoreExtractor), another language's (`client_datastores`, by its
+    `_routes` name)."""
+    if language == "py":
+        datastores = DatastoreExtractor(repo_id).extract_from_source(content, rel_path).datastores
+    else:
+        datastores = client_datastores(content, language, repo_id, rel_path)
+    return [{"label": ds.datastore_type, "repo_id": repo_id, "name": ds.name, "properties": ds.properties} for ds in datastores]
+
+
+def _is_compose(rel_path: str) -> bool:
+    """Whether a repo-relative path is a compose file (`_routes`)."""
+    return posixpath.basename(rel_path).lower() in _COMPOSE_NAMES
+
+
+def _relink_owning_services(engine: GraphEngine, repo_id: str, skip: set[str]) -> None:
+    """Re-derive the owning-service edges of the files outside `skip` after a
+    compose change: each claimed Endpoint's `CALLS` and datastore's `USES`
+    (`_endpoint_service_relationships`, `_datastore_service_relationships`)
+    are a function of its claiming file's path and the repository's Services'
+    build contexts, so a file the change gives another owning Service (or
+    none) is unclaimed from its old edges and writes its new ones, as a
+    fresh scan would have them. Read from the graph: no file is read. The
+    files in `skip` (the batch's) wrote theirs already."""
+    services = _load_services_with_build_context(engine, repo_id)
+    claims, edges = engine.owning_service_state(repo_id)
+    expected = set()
+    for label, name, sources in claims:
+        for source in sources:
+            owner = _match_owning_service(services, source)
+            if source not in skip and source.endswith(SERVICE_API_SUFFIXES) and owner is not None:
+                expected.add((label, name, owner, services[owner][1], source))
+    written = {
+        (edge["label"], edge["name"], edge["service"], edge["service_file"], origin)
+        for edge in edges for origin in edge["origins"] or [] if origin not in skip
+    }
+    engine.unclaim_owning_service_edges(repo_id, [
+        dict(zip(("label", "name", "service", "service_file", "origin"), row)) for row in sorted(written - expected)
+    ])
+    rels = []
+    for label, name, service, service_file, origin in sorted(expected - written):
+        if label == "Endpoint":
+            rels.append({
+                "from_label": "Endpoint", "from_name": name, "rel_type": "CALLS", "to_label": "Service",
+                "to_name": service, "to_file": service_file, "repo_id": repo_id, "properties": {}, "origin": origin,
+            })
+        else:
+            rels.append({
+                "from_label": "Service", "from_name": service, "from_file": service_file, "rel_type": "USES",
+                "to_label": label, "to_name": name, "repo_id": repo_id, "properties": {}, "origin": origin,
+            })
+    if rels:
+        engine.upsert_relationships(rels)
 
 
 def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict[str, tuple[str, str]]:
@@ -2470,27 +3152,37 @@ def _owning_service_relationships(
         return []
     _owning_context, owning_service_file = services[owning_service]
 
-    rels: list[dict] = []
-
     datastore_result = DatastoreExtractor(repo_id).extract_from_source(content, rel_path)
-    for ds in datastore_result.datastores:
-        rels.append(
-            {
-                "from_label": "Service",
-                "from_name": owning_service,
-                "from_file": owning_service_file,
-                "rel_type": "USES",
-                "to_label": ds.datastore_type,
-                "to_name": ds.name,
-                "repo_id": repo_id,
-                "properties": {},
-                "origin": rel_path,
-            }
-        )
-
+    datastores = [(ds.datastore_type, ds.name) for ds in datastore_result.datastores]
     api_result = APIExtractor(repo_id).extract_from_source(content, rel_path)
     endpoints = [f"{endpoint.method} {endpoint.path}" for endpoint in api_result.endpoints]
-    return rels + _endpoint_service_relationships(repo_id, rel_path, endpoints, services)
+    return _datastore_service_relationships(repo_id, rel_path, datastores, services) + _endpoint_service_relationships(
+        repo_id, rel_path, endpoints, services
+    )
+
+
+def _datastore_service_relationships(
+    repo_id: str, rel_path: str, datastores: list[tuple[str, str]], services: dict[str, tuple[str, str]]
+) -> list[dict]:
+    """USES from the compose Service that owns the file to each of its
+    datastores ((label, name)), as `_owning_service_relationships` writes them."""
+    owning_service = _match_owning_service(services, rel_path)
+    if owning_service is None:
+        return []
+    return [
+        {
+            "from_label": "Service",
+            "from_name": owning_service,
+            "from_file": services[owning_service][1],
+            "rel_type": "USES",
+            "to_label": label,
+            "to_name": name,
+            "repo_id": repo_id,
+            "properties": {},
+            "origin": rel_path,
+        }
+        for label, name in datastores
+    ]
 
 
 def _endpoint_service_relationships(
@@ -2517,8 +3209,10 @@ def _endpoint_service_relationships(
     ]
 
 
-def _api_nodes_and_rels(repo_id: str, rel_path: str, content: str) -> tuple[list[dict], list[dict]]:
-    result = APIExtractor(repo_id).extract_from_source(content, rel_path)
+def _api_nodes_and_rels(
+    repo_id: str, rel_path: str, content: str, roots: tuple[str, ...] = (),
+) -> tuple[list[dict], list[dict]]:
+    result = APIExtractor(repo_id).extract_from_source(content, rel_path, roots)
     nodes = [
         {"label": "Endpoint", "repo_id": repo_id, "name": f"{e.method} {e.path}", "properties": e.properties}
         for e in result.endpoints

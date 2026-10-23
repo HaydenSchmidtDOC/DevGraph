@@ -31,6 +31,7 @@ const fnSrc = [
   grab(/^function relSelector\(/m, "\n}"),
   grab(/^let schemaRequestSeq = 0;/m, "\n}"),   // the sequence counter and loadSchemaTypes
   grab(/^\/\* ── Catch-up pill ── \*\//m, "/* ── end Catch-up pill ── */"),  // the live handler and repo switch update the pill
+  grab(/^\/\* ── Live refresh ── \*\//m, "/* ── end Live refresh ── */"),  // reindex events refresh through it
   grab(/^function connectLiveEvents\(/m, "\n}"),
   grab(/^function refreshIsolateUI\(/m, "\n}"),
   grab(/^function escapeCypherStr\(/m, "\n"),
@@ -57,22 +58,22 @@ const topologySrc = grab(/^async function loadTopologyCounts\(/m, "\n}");
 const SNAPSHOT_NODES = [
   ["Repository", "repo"], ["Container", "repo"], ["Service", "service"], ["Module", "module"], ["Class", "class"],
   ["Function", "function"], ["Endpoint", "endpoint"], ["Database", "database"],
-  ["VectorStore", "vectorstore"], ["Queue", "queue"], ["Requirement", "phase2"],
+  ["VectorStore", "vectorstore"], ["Queue", "queue"], ["Cache", "cache"], ["Requirement", "phase2"],
   ["DesignDecision", "phase2"], ["ArchitectureNote", "phase2"], ["Document", "phase2"],
   ["Commit", "phase3"], ["PullRequest", "phase3"], ["Issue", "phase3"],
 ];
 const SNAPSHOT_COLORS = {
   repo: "#b7b3ff", service: "#7c8dff", module: "#22c3e6", class: "#22c55e", function: "#a3e635",
-  endpoint: "#fbbf24", database: "#f0813c", vectorstore: "#dc2626", queue: "#e0559e",
+  endpoint: "#fbbf24", database: "#f0813c", vectorstore: "#dc2626", queue: "#e0559e", cache: "#c084fc",
   phase2: "#9299a6", phase3: "#6b7280",
 };
 const SNAPSHOT_RELS = ["CONTAINS", "CALLS", "IMPORTS", "USES", "RUNS", "WRITES_TO", "READS_FROM",
   "IMPLEMENTS", "DEPENDS_ON", "EXTENDS", "SATISFIES", "DOCUMENTED_BY", "DECIDED_BY", "SUPERSEDES",
   "MENTIONS", "MODIFIES", "RESOLVES", "REFERENCES"];
 
-// What the backend actually serves for built-ins: graph/schema.py's order.
+// What the backend actually serves for built-ins: graph/schema.py's BUILTIN_LABELS order.
 const BACKEND_LABELS = ["Repository", "Container", "Service", "Module", "Class", "Function", "Endpoint",
-  "Database", "VectorStore", "Queue", "Requirement", "DesignDecision", "ArchitectureNote", "Document",
+  "Database", "VectorStore", "Queue", "Cache", "Requirement", "DesignDecision", "ArchitectureNote", "Document",
   "Commit", "PullRequest", "Issue"];
 // graph/schema.py's INTERNAL_NODE_PROPERTIES and INTERNAL_EDGE_PROPERTIES, as the schema route serves them.
 const HIDDEN = ["claims", "extractor", "name_ref_sources", "name_ref_targets", "name_refs", "origins"];
@@ -147,6 +148,8 @@ let eventSource = null;
 let order = [];
 let refreshes = 0, isolations = 0, styleUpdates = 0;
 const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 100, relCeiling: 100 };
+const timers = [];
+const runTimers = async () => { while (timers.length) await timers.shift()(); };
 const globals = {
   document, state, console, brightCache: {},
   entityCounts: els.entityCounts, relTypes: els.relTypes,
@@ -170,6 +173,8 @@ const globals = {
   isolateChanged: () => { isolations++; },
   cy: { style: () => ({ update: () => { styleUpdates++; } }) },
   configModel: null, loadConfigPage: () => {},  // the Config page's live refresh, idle until it is opened
+  CANVAS_NODE_CAP: 1500, scopeNodeTotal: 0,
+  setTimeout: fn => { timers.push(fn); return timers.length; },  // live refreshes wait; runTimers fires them
 };
 const api = new Function(...Object.keys(globals),
   tablesSrc + "\n" + fnSrc +
@@ -195,7 +200,7 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
 (async () => {
   // 0. before any schema arrives the page renders today's lists (demo mode)
   api.renderTypeLists();
-  check("before any schema loads the rows are today's 17 labels",
+  check("before any schema loads the rows are today's 18 labels",
     JSON.stringify(rowLabels()) === JSON.stringify(SNAPSHOT_NODES.map(n => n[0])), JSON.stringify(rowLabels()));
   check("...and today's 18 relationship chips",
     JSON.stringify(chipTypes()) === JSON.stringify(SNAPSHOT_RELS), JSON.stringify(chipTypes()));
@@ -300,7 +305,7 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
 
   // 5. a repo with no schema file looks exactly like the hardcoded lists did
   await switchTo("plain");
-  check("a no-file payload renders exactly today's 17 labels",
+  check("a no-file payload renders exactly today's 18 labels",
     JSON.stringify(rowLabels()) === JSON.stringify(SNAPSHOT_NODES.map(n => n[0])), JSON.stringify(rowLabels()));
   check("...with today's categories and colours",
     SNAPSHOT_NODES.every(([label, cat]) => rowFor(label).dataset.cat === cat &&
@@ -366,6 +371,7 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
   order = [];
   const fetchesBefore = fetchCalls.length;
   await eventSource.onmessage({ data: JSON.stringify({ type: "reindexed", repo_id: "waiting", changed: 2, deleted: 0 }) });
+  await runTimers();
   check("a reindex event reloads the current repo's schema",
     fetchCalls.slice(fetchesBefore).includes("/api/repos/waiting/schema"), JSON.stringify(fetchCalls.slice(fetchesBefore)));
   check("...and then refreshes the graph", order.join() === "refreshGraph", order.join());

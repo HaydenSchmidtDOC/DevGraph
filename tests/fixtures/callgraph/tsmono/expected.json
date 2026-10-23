@@ -1,0 +1,198 @@
+{
+  "language": "tsmono",
+  "description": "npm workspaces monorepo (packages/*, apps/*) with no tsconfig paths: imports of sibling packages by name, through `main`, `module`, `exports` (a condition and a subpath), a package subpath, and barrels.",
+  "calls": [
+    {
+      "caller": "formatName",
+      "caller_file": "packages/utils/src/format.ts",
+      "callee": "capitalize",
+      "callee_file": "packages/utils/src/format.ts"
+    },
+    {
+      "caller": "record",
+      "caller_file": "packages/logger/src/index.ts",
+      "callee": "write",
+      "callee_file": "packages/logger/src/index.ts"
+    },
+    {
+      "caller": "record",
+      "caller_file": "packages/logger/src/index.ts",
+      "callee": "levelName",
+      "callee_file": "packages/logger/src/levels.ts"
+    },
+    {
+      "caller": "fetchJson",
+      "caller_file": "packages/api-client/lib/client.ts",
+      "callee": "record",
+      "callee_file": "packages/logger/src/index.ts",
+      "note": "workspace-class"
+    },
+    {
+      "caller": "loadUser",
+      "caller_file": "packages/api-client/lib/users.ts",
+      "callee": "fetchJson",
+      "callee_file": "packages/api-client/lib/client.ts"
+    },
+    {
+      "caller": "loadUser",
+      "caller_file": "packages/api-client/lib/users.ts",
+      "callee": "formatName",
+      "callee_file": "packages/utils/src/format.ts",
+      "note": "workspace-barrel"
+    },
+    {
+      "caller": "start",
+      "caller_file": "apps/web/src/main.ts",
+      "callee": "loadUser",
+      "callee_file": "packages/api-client/lib/users.ts",
+      "note": "workspace-subpath"
+    },
+    {
+      "caller": "start",
+      "caller_file": "apps/web/src/main.ts",
+      "callee": "clamp",
+      "callee_file": "packages/utils/src/math.ts",
+      "note": "workspace-barrel"
+    },
+    {
+      "caller": "start",
+      "caller_file": "apps/web/src/main.ts",
+      "callee": "levelName",
+      "callee_file": "packages/logger/src/levels.ts",
+      "note": "workspace-exports-subpath"
+    },
+    {
+      "caller": "start",
+      "caller_file": "apps/web/src/main.ts",
+      "callee": "render",
+      "callee_file": "apps/web/src/view.ts"
+    },
+    {
+      "caller": "render",
+      "caller_file": "apps/web/src/view.ts",
+      "callee": "slugify",
+      "callee_file": "packages/utils/src/format.ts",
+      "note": "workspace-barrel"
+    },
+    {
+      "caller": "run",
+      "caller_file": "apps/cli/src/run.ts",
+      "callee": "sum",
+      "callee_file": "packages/utils/src/math.ts",
+      "note": "workspace-namespace"
+    },
+    {
+      "caller": "run",
+      "caller_file": "apps/cli/src/run.ts",
+      "callee": "clamp",
+      "callee_file": "packages/utils/src/math.ts",
+      "note": "workspace-namespace"
+    },
+    {
+      "caller": "run",
+      "caller_file": "apps/cli/src/run.ts",
+      "callee": "createLogger",
+      "callee_file": "packages/logger/src/index.ts",
+      "note": "workspace-exports"
+    }
+  ],
+  "imports": [
+    {
+      "from_file": "packages/utils/src/index.ts",
+      "to_file": "packages/utils/src/format.ts",
+      "kind": "re-export"
+    },
+    {
+      "from_file": "packages/utils/src/index.ts",
+      "to_file": "packages/utils/src/math.ts",
+      "kind": "re-export"
+    },
+    {
+      "from_file": "packages/logger/src/index.ts",
+      "to_file": "packages/logger/src/levels.ts"
+    },
+    {
+      "from_file": "packages/api-client/lib/client.ts",
+      "to_file": "packages/logger/src/index.ts",
+      "kind": "workspace-exports"
+    },
+    {
+      "from_file": "packages/api-client/lib/users.ts",
+      "to_file": "packages/api-client/lib/client.ts"
+    },
+    {
+      "from_file": "packages/api-client/lib/users.ts",
+      "to_file": "packages/utils/src/index.ts",
+      "kind": "workspace-main"
+    },
+    {
+      "from_file": "apps/web/src/main.ts",
+      "to_file": "packages/api-client/lib/users.ts",
+      "kind": "workspace-subpath"
+    },
+    {
+      "from_file": "apps/web/src/main.ts",
+      "to_file": "packages/utils/src/index.ts",
+      "kind": "workspace-main"
+    },
+    {
+      "from_file": "apps/web/src/main.ts",
+      "to_file": "packages/logger/src/levels.ts",
+      "kind": "workspace-exports-subpath"
+    },
+    {
+      "from_file": "apps/web/src/main.ts",
+      "to_file": "apps/web/src/view.ts"
+    },
+    {
+      "from_file": "apps/web/src/view.ts",
+      "to_file": "packages/utils/src/index.ts",
+      "kind": "workspace-main"
+    },
+    {
+      "from_file": "apps/cli/src/run.ts",
+      "to_file": "packages/utils/src/index.ts",
+      "kind": "workspace-main"
+    },
+    {
+      "from_file": "apps/cli/src/run.ts",
+      "to_file": "packages/logger/src/index.ts",
+      "kind": "workspace-exports"
+    }
+  ],
+  "no_edge": [
+    {
+      "caller": "render",
+      "caller_file": "apps/web/src/view.ts",
+      "callee": "capitalize",
+      "note": "lodash"
+    },
+    {
+      "caller": "run",
+      "caller_file": "apps/cli/src/run.ts",
+      "callee": "build",
+      "note": "not-a-workspace"
+    },
+    {
+      "caller": "fetchJson",
+      "caller_file": "packages/api-client/lib/client.ts",
+      "callee": "fetch",
+      "note": "global"
+    }
+  ],
+  "notes": {
+    "imports-format": "Every in-repo file a module specifier names: relative specifiers, `export ... from` re-exports, and workspace package names resolved to the entry point or subpath file.",
+    "workspace-main": "`@acme/utils` is a workspace package (root package.json `workspaces: [\"packages/*\", \"apps/*\"]`) whose package.json `main` is src/index.ts; there is no tsconfig `paths`, so only the workspace declaration resolves it.",
+    "workspace-barrel": "The name comes from @acme/utils's entry src/index.ts, a barrel that re-exports it from format.ts or math.ts (`export *`); the call target is the defining file.",
+    "workspace-namespace": "`import * as utils from '@acme/utils'`; `utils.sum` and `utils.clamp` come through the barrel's `export * from './math'`.",
+    "workspace-exports": "@acme/logger has no `main`: its `exports[\".\"]` condition `types` names ./src/index.ts (the `import` condition's dist/ is a build output not in the repository).",
+    "workspace-exports-subpath": "`@acme/logger/levels` is the `exports` subpath `./levels`, mapped to ./src/levels.ts.",
+    "workspace-subpath": "`api-client/lib/users` names a file inside the unscoped workspace package api-client, which has no `exports`, so the subpath is a path in the package.",
+    "workspace-class": "`new Logger()` with Logger imported from @acme/logger types the local, so `log.record` is Logger.record.",
+    "re-export": "`export ... from` lines are imports of the re-exported file.",
+    "lodash": "`_.capitalize` is lodash, not the unexported capitalize in @acme/utils's format.ts.",
+    "not-a-workspace": "tools/scripts has a package.json named @acme/scripts, but no workspace glob matches tools/: the import is an external package.",
+    "global": "`fetch` is the platform global.",
+    "scope": "Calls inside anonymous arrows (the reduce callback) are not listed; constructor invocations (`new Logger()`) are not calls."
+  }
+}

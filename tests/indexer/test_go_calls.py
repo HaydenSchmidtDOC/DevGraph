@@ -25,6 +25,7 @@ from devgraph.indexer.dispatch import (
 )
 from devgraph.indexer.go.extractor import extract_go_file
 from devgraph.indexer.resolver_config import ResolverConfig
+from tests.helpers import stub
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 
@@ -72,6 +73,31 @@ def test_a_function_of_the_file_resolves_here_and_any_other_to_its_package():
     assert targets(in_dir, "Get", "normalize", "internal/store/memory.go") == {
         ("internal/store/.?.go!_test.go", "resolved")
     }
+
+
+def test_a_dot_imported_packages_names_resolve_unqualified(tmp_path):
+    """`import . "example.com/shop/v2/store"`: a bare `Open()` reaches the
+    package beside the file's own, and so does a method on what it
+    returned or on a value of an exported type the file doesn't declare."""
+    config = _config(tmp_path)
+    source = """
+        package main
+
+        import . "example.com/shop/v2/store"
+
+        func main() {
+            Open()
+            conn := Open()
+            conn.Close()
+            var s Store
+            s.Get()
+        }
+    """
+    store = ("store/.?.go!_test.go", "resolved")
+    assert targets(source, "main", "Open", config=config) == {(".?.go!_test.go", "resolved"), store}
+    loose = {(".~?.go!_test.go", "package"), ("store/.~?.go!_test.go", "package")}
+    assert targets(source, "main", "Close", config=config) == loose
+    assert targets(source, "main", "Get", config=config) == loose
 
 
 def test_a_test_file_reaches_its_package_and_an_external_test_package_only_its_tests():
@@ -383,7 +409,7 @@ def test_the_index_upgrade_replaces_bare_go_calls(engine, repo_id, tmp_path, mon
         return result
 
     with monkeypatch.context() as old:
-        old.setattr(dispatch, "extract_go_file", old_extract)
+        stub(old, dispatch, "extract_go_file", old_extract)
         provision_repository_schema(engine, tmp_path)
         engine.upsert_repository(repo_id, repo_id, str(tmp_path))
         full_scan(engine, repo_id, tmp_path)

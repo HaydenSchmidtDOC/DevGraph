@@ -17,6 +17,7 @@ from devgraph.cli import main as cli_main
 from devgraph.cli.main import app
 from devgraph.config.settings import Settings
 from devgraph.registry.store import RepoRegistry
+from tests.helpers import stub
 
 # Windows forbids ':' in a file name and treats '\' as the separator, so the
 # Windows path gets its backslashes from the separators alone.
@@ -43,7 +44,7 @@ def markup_repo(tmp_path, monkeypatch):
     def unreachable(self):
         raise ConnectionError(f"Neo4j is unreachable from {root}")
 
-    monkeypatch.setattr(cli_main.GraphEngine, "verify_connectivity", unreachable)
+    stub(monkeypatch, cli_main.GraphEngine, "verify_connectivity", unreachable)
     monkeypatch.chdir(root)
     return root.resolve()
 

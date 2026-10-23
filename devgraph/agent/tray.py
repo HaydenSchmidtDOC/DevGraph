@@ -124,6 +124,7 @@ class TrayApp:
         self._sync = RepoSync(
             self._engine, self._registry, self._on_sync_event,
             request_catch_up=lambda *a: self._watcher.request_catch_up(*a),
+            yield_lock=lambda repo_id: self._watcher.yield_batch_lock(repo_id),
         )
         self._watcher = WatcherManager(
             self._registry,
@@ -142,6 +143,7 @@ class TrayApp:
         self._schema_rescans = SchemaRescanScheduler(
             self._engine, self._registry, on_rescanned=self._on_schema_rescanned,
             is_paused=lambda: self._paused, run_exclusive=self._watcher.run_exclusive,
+            yield_lock=self._watcher.yield_batch_lock,
         )
         self._insights = InsightsScheduler(self._engine, self._registry, on_refreshed=self._on_insights_refreshed)
         self._dashboard_loop: asyncio.AbstractEventLoop | None = None
@@ -168,7 +170,9 @@ class TrayApp:
         """Route git state change events to the git history syncer.
 
         Called by WatcherManager after every catch-up of a git repository
-        (on start, after a git operation, on a retry), under its batch lock. Syncs git history and updates recency
+        (on start, after a git operation, on a retry), under its batch lock,
+        which the sync yields between its batched writes so live updates
+        are not held up by a long first sync. Syncs git history and updates recency
         accordingly — handles append-only fast path as well as history rewrites
         (rebase, reset, amend).
         """
@@ -178,12 +182,14 @@ class TrayApp:
                 self._engine, self._registry, repo_id,
                 on_initial=lambda count: logger.info(
                     "Reading the git history of %s for the first time (%s commits); "
-                    "live updates resume when it finishes", repo_id, f"{count:,}",
+                    "live updates go on between its writes", repo_id, f"{count:,}",
                 ),
+                between_chunks=lambda: self._watcher.yield_batch_lock(repo_id),
             )
-            # Every catch-up ends with a sync, so one with HEAD unmoved is quiet.
+            # Every catch-up ends with a sync, so one with HEAD unmoved is
+            # quiet, as is one a stop cut short.
             logger.log(
-                logging.DEBUG if result.get("mode") == "noop" else logging.INFO,
+                logging.DEBUG if result.get("mode") in ("noop", "stopped") else logging.INFO,
                 "git history synced for %s: mode=%s, indexed=%d, deleted=%d",
                 repo_id,
                 result.get("mode"),

@@ -12,7 +12,7 @@ from devgraph.indexer import gitignore
 from devgraph.indexer.walk import is_ignored_path
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "callgraph"
-LANGUAGES = ["ts", "react", "go", "java", "kotlin", "csharp", "rust", "cpp"]
+LANGUAGES = ["ts", "tsmono", "react", "go", "java", "kotlin", "csharp", "rust", "cpp"]
 
 _CALL_KEYS = {"caller", "caller_file", "callee", "callee_file"}
 _CALL_OPTIONAL = {"ambiguous", "not_files", "note"}

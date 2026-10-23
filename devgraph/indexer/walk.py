@@ -33,14 +33,9 @@ IGNORED_DIR_NAMES = {
     ".venv",
     "venv",
     "__pycache__",
-    "build",
-    "dist",
     ".pytest_cache",
     ".devgraph",
     "node_modules",
-    "bin",
-    "obj",
-    "target",
     "vendor",
     # Kotlin/Gradle build + tool scratch (Kotlin extractor, "motonav" plan):
     # .gradle is the venv-equivalent (build cache + expanded AAR dependency
@@ -69,6 +64,19 @@ IGNORED_DIR_NAMES = {
     "worktrees",
 }
 
+
+# Build output names, ignored only where a build writes them: at the
+# repository root, or beside a project manifest (`target` beside Cargo.toml
+# or pom.xml, `bin`/`obj` beside a .csproj, `build`/`dist` beside
+# package.json or pyproject.toml). Anywhere else such a folder is source:
+# Rust's `src/bin/`, a Python package named `build`, a `scripts/build/`. A
+# .gitignore still leaves out any of them it names.
+BUILD_OUTPUT_DIR_NAMES = {"build", "dist", "bin", "obj", "target"}
+BUILD_MANIFESTS = {
+    "Cargo.toml", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+    "package.json", "pyproject.toml", "setup.py", "setup.cfg", "CMakeLists.txt", "go.mod",
+}
+BUILD_MANIFEST_SUFFIXES = (".csproj", ".fsproj", ".vbproj", ".sln")
 
 #: Why a file is left out of extraction (`content_skip_reason`, or a .gitignore).
 TOO_LARGE = "too large"
@@ -176,11 +184,68 @@ def check_repo_root(repo_root: Path) -> None:
 
 
 def is_ignored_dir_name(name: str) -> bool:
+    """A name ignored wherever it is (`IGNORED_DIR_NAMES`); build output
+    names depend on where they are (`is_build_output`)."""
     return name in IGNORED_DIR_NAMES or name.endswith(".egg-info")
 
 
-def is_ignored_path(path: Path) -> bool:
-    return any(is_ignored_dir_name(part) for part in path.parts)
+def is_build_manifest(name: str) -> bool:
+    """Whether a file named `name` makes its folder's build output names
+    build output (`is_build_output`): adding, removing or renaming one
+    changes what the walk enters, as a .gitignore edit does."""
+    return name in BUILD_MANIFESTS or name.endswith(BUILD_MANIFEST_SUFFIXES)
+
+
+# Folder -> whether it holds a build manifest. Asked for every path with a
+# build output name in it, by the walk and by the watcher's filters; cleared
+# by `forget_manifests` when a scan or catch-up starts and when the watcher
+# sees a manifest change.
+_manifest_cache: dict[str, bool] = {}
+_MANIFEST_CACHE_MAX = 4096
+
+
+def forget_manifests() -> None:
+    _manifest_cache.clear()
+
+
+def _holds_manifest(folder: Path) -> bool:
+    key = os.fspath(folder)
+    held = _manifest_cache.get(key)
+    if held is None:
+        try:
+            with os.scandir(folder) as entries:
+                held = any(is_build_manifest(e.name) for e in entries)
+        except OSError:
+            held = False
+        if len(_manifest_cache) >= _MANIFEST_CACHE_MAX:
+            _manifest_cache.clear()
+        _manifest_cache[key] = held
+    return held
+
+
+def is_build_output(parent: Path, name: str, at_root: bool) -> bool:
+    """Whether `name` in the folder `parent` is build output: one of
+    `BUILD_OUTPUT_DIR_NAMES` at the repository root (`at_root`) or beside a
+    project manifest, and never `src/bin`."""
+    if name not in BUILD_OUTPUT_DIR_NAMES or (name == "bin" and parent.name == "src"):
+        return False
+    return at_root or _holds_manifest(parent)
+
+
+def is_ignored_path(path: Path, root: Path | None = None) -> bool:
+    """Whether the walk never enters `path`: a part of it has an ignored name,
+    or is build output (`is_build_output`). `path` is relative to the
+    repository `root`, or absolute when `root` is None (then no part counts
+    as at the root)."""
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if is_ignored_dir_name(part):
+            return True
+        if part in BUILD_OUTPUT_DIR_NAMES:
+            parent = Path(*parts[:i])
+            if is_build_output(root / parent if root is not None else parent, part, root is not None and i == 0):
+                return True
+    return False
 
 
 def is_indexable_file(path: Path) -> bool:
@@ -230,7 +295,7 @@ def keyed_indexable_paths(
                 rel = path.resolve().relative_to(root).as_posix()
             except (OSError, ValueError):
                 continue
-            if not keep_ignored_targets and is_ignored_path(Path(rel)):
+            if not keep_ignored_targets and is_ignored_path(Path(rel), root):
                 continue
         keyed.append((path, rel))
     return keyed
@@ -267,7 +332,7 @@ def _walk(
             rel = start.relative_to(repo_root)
         except ValueError:
             return
-        if is_ignored_path(rel) or start.is_symlink():
+        if is_ignored_path(rel, repo_root) or start.is_symlink():
             return
         chain = gitignore.chain_to(repo_root, rel.as_posix())
         if chain is None:
@@ -293,7 +358,7 @@ def _walk(
             if rules:
                 chain = (*chain, (prefix, rules))
         for entry in entries:
-            if is_ignored_dir_name(entry.name):
+            if is_ignored_dir_name(entry.name) or is_build_output(directory, entry.name, prefix == ""):
                 continue
             path = directory / entry.name
             try:
@@ -330,7 +395,7 @@ def _junction_inside(path: Path, root: Path) -> bool:
     except (OSError, ValueError):
         logger.debug("skipping %s: junction target is outside %s", path, root)
         return False
-    return not is_ignored_path(rel)
+    return not is_ignored_path(rel, root)
 
 
 def repo_relative(repo_root: Path, path: Path) -> str | None:

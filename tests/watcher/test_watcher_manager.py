@@ -254,7 +254,9 @@ def test_watcher_manager_never_accepts_raw_paths(temp_registry_db, temp_git_repo
 
     # All public methods should operate on registry-fetched repos only
     public_methods = {m for m in dir(watcher) if not m.startswith("_")}
-    allowed_methods = {"start", "stop", "refresh", "get_repo_issues", "run_exclusive", "request_catch_up"}
+    allowed_methods = {
+        "start", "stop", "refresh", "get_repo_issues", "run_exclusive", "request_catch_up", "yield_batch_lock",
+    }
     extra_methods = public_methods - allowed_methods
     assert not extra_methods, f"Unexpected public methods: {extra_methods}"
 
@@ -573,6 +575,110 @@ def test_watcher_manager_stop_keeps_a_waiting_never_indexed_git_sync_from_starti
     burst.join(5)
     holder.join(5)
     assert syncs == []
+
+
+def test_a_job_yielding_its_lock_lets_a_waiting_job_run(temp_registry_db, temp_git_repo):
+    """A long run_exclusive job (a first git-history sync) yields the batch
+    lock between its chunks: a job waiting for the lock runs then, and the
+    long one takes the lock back; a thread running no job yields nothing."""
+    registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    watcher = WatcherManager(registry, lambda *a: None, on_catch_up=lambda *a: False)
+    watcher.start()
+    order: list[str] = []
+    started = threading.Event()
+
+    def long_job() -> None:
+        order.append("long starts")
+        started.set()
+        for _ in range(500):
+            assert watcher.yield_batch_lock(repo_id)
+            if "waiting ran" in order:
+                break
+        order.append("long ends")
+
+    holder = threading.Thread(target=watcher.run_exclusive, args=(repo_id, long_job))
+    holder.start()
+    assert started.wait(5)
+    watcher.run_exclusive(repo_id, lambda: order.append("waiting ran"))
+    holder.join(5)
+    assert order == ["long starts", "waiting ran", "long ends"]
+    # Outside a job of the repository there is nothing to yield.
+    assert watcher.yield_batch_lock(repo_id) is True
+    assert watcher.run_exclusive(repo_id, lambda: "free") == "free"
+    watcher.stop()
+
+
+def test_a_git_sync_asked_for_while_one_yields_runs_after_it(temp_registry_db, temp_git_repo):
+    """A catch-up that runs while the git-history sync yields its lock does
+    not sync the same history under it: the running sync runs once more
+    when it ends. A stop makes a yield answer False."""
+    registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    calls: list[str] = []
+    watcher: WatcherManager
+
+    def sync(rid: str) -> None:
+        calls.append("sync")
+        if len(calls) == 1:
+            watcher._sync_git_state(rid)  # what a catch-up let in by a yield asks for
+            calls.append("yielded")
+
+    # The start catch-up "fails", so it syncs nothing itself.
+    watcher = WatcherManager(registry, lambda *a: None, on_git_state_changed=sync, on_catch_up=lambda *a: False)
+    watcher.start()
+    watcher.run_exclusive(repo_id, lambda: watcher._sync_git_state(repo_id))
+    assert calls == ["sync", "yielded", "sync"]
+    watcher.stop()
+    assert watcher.run_exclusive(repo_id, lambda: watcher.yield_batch_lock(repo_id)) is False
+
+
+def test_a_repository_removed_during_a_yield_gets_no_commits_back(temp_registry_db, temp_git_repo, monkeypatch):
+    """A removal's purge can run while the git-history sync yields its lock:
+    the yield then answers False, so the sync stops without writing the
+    removed repository's Commits again, and raises nothing."""
+    from devgraph.graph.engine import GraphEngine
+    from devgraph.indexer.git_history import extractor
+
+    engine = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
+    try:
+        engine.verify_connectivity()
+    except Exception as e:
+        pytest.skip(f"Neo4j not available: {e}")
+    import subprocess
+
+    monkeypatch.setattr(extractor, "YIELD_EVERY_S", 0)
+    git = ["git", "-c", "user.name=A", "-c", "user.email=a@example.com", "-c", "commit.gpgsign=false"]
+    for i in range(3):
+        (temp_git_repo / "a.txt").write_text(f"{i}\n")
+        subprocess.run([*git, "add", "a.txt"], cwd=temp_git_repo, capture_output=True, check=True)
+        subprocess.run([*git, "commit", "-q", "-m", f"c{i}"], cwd=temp_git_repo, capture_output=True, check=True)
+    registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    engine.delete_repository(repo_id)
+    results: list[dict] = []
+    watcher: WatcherManager
+
+    def between() -> bool:
+        if registry.get(repo_id) is not None:
+            # What RepoSync.on_removed does once it has the lock.
+            registry.remove_repo(repo_id)
+            engine.delete_repository(repo_id)
+        return watcher.yield_batch_lock(repo_id)
+
+    def sync(rid: str) -> None:
+        results.append(extractor.sync_git_history(engine, registry, rid, between_chunks=between))
+
+    watcher = WatcherManager(registry, lambda *a: None, on_git_state_changed=sync, on_catch_up=lambda *a: False)
+    watcher.start()
+    try:
+        watcher.run_exclusive(repo_id, lambda: watcher._sync_git_state(repo_id))
+        assert [r["mode"] for r in results] == ["stopped"]
+        assert engine.run_cypher("MATCH (c:Commit {repo_id: $r}) RETURN count(c) AS n", {"r": repo_id})[0]["n"] == 0
+    finally:
+        watcher.stop()
+        engine.delete_repository(repo_id)
+        engine.close()
 
 
 def test_refresh_drops_the_issue_of_a_repo_no_longer_watched(temp_registry_db, tmp_path):

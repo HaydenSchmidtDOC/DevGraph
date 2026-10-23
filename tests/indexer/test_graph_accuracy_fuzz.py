@@ -19,14 +19,21 @@ comes and goes beside another class of a file, repeating its method names
 (both nest a `Meta` with its own base), and so do a top-level `act` and one
 nested in a function, so same-named symbols of one file are told apart by
 their owner; another file calls `b.Twin().act()` and `b.Base().act()`, one
-owner's member across files. go/b gains a type whose methods are named like
-the package's functions, which other files call by package.
+owner's member across files. A function's def moves under an `if` or a
+`try` (defined again in its `except`) and back out, and a TS file gains or
+loses an object-literal service, its methods called as `svc.run()` from
+files importing it, and a function declared in a block. go/b gains a type whose
+methods are named like the package's functions, which other files call by
+package.
 
 TS files import through a tsconfig path alias, and the resolver configuration
 changes under them: the tsconfig is rewritten (its own `paths`, `extends` to
 an odd-named base, `references`), its base is edited or its folder deleted, a
 root or nested go.mod comes and goes, and a config under an ignored folder is
-edited. After every batch the fuzz runs what a live batch does,
+edited. A workspace package ws/utils (the root package.json's `workspaces`,
+or pnpm-workspace.yaml's `packages`) is imported by name from ws/app and
+through its barrel: it is renamed, its `main` moves between entries or goes,
+and the workspace declarations change or go. After every batch the fuzz runs what a live batch does,
 `sync_resolver_config`. C# projects change the same way: a .csproj or
 Directory.Build file is written, created or deleted, and a C# file gains or
 loses a `global using` (written behind a comment, `#if`, a byte order mark,
@@ -52,7 +59,8 @@ to another file's class), a Java class moves to the same package under
 another source root (another module), and a Rust crate's Cargo.toml renames
 it, moves its root file or stops declaring it, and its lib.rs and util.rs
 gain and lose `pub use` re-exports (by name, glob or alias, util.rs's
-re-exporting deep.rs's, so lib.rs's reach it through util.rs) that other
+re-exporting deep.rs's, so lib.rs's reach it through util.rs; a module
+re-exported as `below`; an inline `mod api` re-exporting) that other
 files call through `shop_core::`. An image
 moves between the Dockerfile and a compose service in one step, so its
 shared Container changes claimant.
@@ -64,8 +72,12 @@ Module's pinned CALLS and IMPORTS rows (`_with_pin_comments`), so every pin
 kind is written, relinked and removed as files come and go.
 
 The spec's "Out of scope" gaps are left out by construction:
-- compose services have `image:` only, never `build:`;
-- no datastore code, and routes only in Express (TS) and Spring (Java) files,
+- a compose service's `build:` context comes, moves and goes (`op_build`),
+  so the files under it change owning Service;
+- datastore clients only as imports (`op_datastore`), and routes only in
+  Express (TS) and Spring (Java) files, a TS file mounting another's
+  exported looseRouter (`op_mount`, `op_mount_prefix`, `op_export_router`,
+  `op_move_router`, chains and cycles included),
   which add, drop and change routes and move a handler (`op_route`,
   `op_route_change`, `op_route_move`), each Endpoint and handler stub
   claimed by every file routing it;
@@ -79,8 +91,11 @@ The spec's "Out of scope" gaps are left out by construction:
   leaves the old path in its edges' `origins`).
 """
 
+import json
 import os
+import posixpath
 import random
+import textwrap
 from dataclasses import dataclass, field, replace
 
 import pytest
@@ -94,6 +109,7 @@ from devgraph.indexer.dispatch import (
     remove_paths,
     sync_resolver_config,
 )
+from tests.helpers import stub
 from tests.watcher.live_helpers import (
     fresh_snapshot,
     graph_snapshot,
@@ -152,38 +168,62 @@ class File:
     methods: list = field(default_factory=list)  # cpp: out-of-class definitions, "Widget::draw"
     block: bool = False  # cs: a block namespace, its `using`s inside it
     routes: list = field(default_factory=list)  # ts/java: (method, path, handler) routes
+    builds: dict = field(default_factory=dict)  # compose: service -> build context
+    mounts: list = field(default_factory=list)  # ts: (app or router, prefix, router file) Express mounts
+    exported: bool = False  # ts: `export default looseRouter`
+    shared_on: str = "Base"  # py: the class defining `shared` besides Twin (`op_move_shared`)
+    guards: dict = field(default_factory=dict)  # py: function -> "if" or "try" around its def (`op_guard`)
+    service: bool = False  # ts: an object-literal service `svc` and a function declared in a block (`op_ts_service`)
 
     def copy(self):
         return replace(
             self, imports=list(self.imports), bases=dict(self.bases),
             funcs={k: list(v) for k, v in self.funcs.items()}, services=dict(self.services),
             froms=list(self.froms), mentions=list(self.mentions), links=list(self.links), pins=list(self.pins),
-            methods=list(self.methods), routes=list(self.routes),
+            methods=list(self.methods), routes=list(self.routes), builds=dict(self.builds),
+            mounts=list(self.mounts), guards=dict(self.guards),
         )
 
 
-def py_class(name: str, base: str | None) -> str:
-    """A class whose `act` calls `self.shared()`, which only `Base` and
-    `Twin` define: a `Twin` beside another class in one file repeats its
-    method names (two `act`s, maybe two `shared`s, each its own node)."""
+def py_class(name: str, base: str | None, shared_on: str = "Base") -> str:
+    """A class whose `act` calls `self.shared()`, which only `Twin` and
+    `shared_on` (`Base`, or `Mid` once it moved) define: a `Twin` beside
+    another class in one file repeats its method names (two `act`s, maybe
+    two `shared`s, each its own node), and a class of the file without one
+    inherits it from a base of the file that has it (its heir keys)."""
     head = f"\n\nclass {name}({base}):\n" if base else f"\n\nclass {name}:\n"
-    shared = "\n    def shared(self):\n        return 0\n" if name in ("Base", "Twin") else ""
+    shared = "\n    def shared(self):\n        return 0\n" if name in (shared_on, "Twin") else ""
     # Both also nest a `Meta` (two same-named classes of one file, each
     # with its own EXTENDS and `act`).
     meta = "\n    class Meta(Child):\n        def act(self):\n            return 1\n" if shared else ""
     return head + "    def act(self):\n        return self.shared()\n" + shared + meta
 
 
-def render(f: File) -> str:
+def py_def(name: str, calls: list, guard: str | None) -> str:
+    """A top-level function, bare or under an `if` or a `try` (whose
+    `except` defines it again: one node, both bodies' calls its own)."""
+    text = f"def {name}():\n" + "".join(f"    {g}\n" for g in calls) + "    return 0\n"
+    if guard == "if":
+        return "\n\nif True:\n" + textwrap.indent(text, "    ")
+    if guard == "try":
+        fallback = f"def {name}():\n    return helper()\n"
+        return "\n\ntry:\n" + textwrap.indent(text, "    ") + "except ImportError:\n" + textwrap.indent(fallback, "    ")
+    return "\n\n" + text
+
+
+def ts_specifier(path: str, target: str) -> str:
+    """The relative specifier `path` imports the TS file `target` by."""
+    spec = posixpath.relpath(target.rsplit(".", 1)[0], posixpath.dirname(path))
+    return spec if spec.startswith("../") else f"./{spec}"
+
+
+def render(f: File, path: str = "") -> str:
     if f.kind == "py":
         # A Python file's imports are whole statements and its calls whole
         # call expressions (`helper()`, `b.helper()`, `obj.helper()`).
         parts = [f"{m}\n" for m in f.imports] + [f"# pin {p}\n" for p in f.pins]
-        parts += [py_class(c, b) for c, b in f.bases.items()]
-        parts += [
-            f"\n\ndef {name}():\n" + "".join(f"    {g}\n" for g in calls) + "    return 0\n"
-            for name, calls in f.funcs.items()
-        ]
+        parts += [py_class(c, b, f.shared_on) for c, b in f.bases.items()]
+        parts += [py_def(name, calls, f.guards.get(name)) for name, calls in f.funcs.items()]
         parts.append(f.extra)
         return "".join(parts) or "X = 1\n"
     if f.kind == "rs":
@@ -263,6 +303,11 @@ def render(f: File) -> str:
         return "".join(parts)
     if f.kind == "ts":
         parts = [f"{m}\n" for m in f.imports]
+        # Another file's router, imported by its path as the file stands now (a
+        # moved router file is no longer found).
+        parts += [
+            f"import m{k} from '{ts_specifier(path, target)}';\n" for k, (_parent, _prefix, target) in enumerate(f.mounts)
+        ]
         parts += [
             f"\nexport function {name}() {{\n" + "".join(f"  {g}();\n" for g in calls) + "}\n"
             for name, calls in f.funcs.items()
@@ -276,10 +321,17 @@ def render(f: File) -> str:
                 f"{TS_ROUTERS.get(path, 'app')}.{method}('{path}', {handler});\n"
                 for method, path, handler in f.routes
             ]
+        parts += [f"{parent}.use('{prefix}', m{k});\n" for k, (parent, prefix, _target) in enumerate(f.mounts)]
+        if f.service:
+            parts.append(TS_SERVICE)
+        if f.exported:
+            parts.append("export default looseRouter;\n")
         return "".join(parts) or "export {};\n"
     if f.kind == "compose":
-        return "services:\n" + "".join(f"  {s}:\n    image: {i}\n" for s, i in f.services.items()) if f.services \
-            else "services: {}\n"
+        return "services:\n" + "".join(
+            f"  {s}:\n    image: {i}\n" + (f"    build: ./{f.builds[s]}\n" if s in f.builds else "")
+            for s, i in f.services.items()
+        ) if f.services else "services: {}\n"
     if f.kind == "docker":
         return "".join(f"FROM {i}\nRUN true\n" for i in f.froms) or "# No stages.\n"
     if f.kind == "notes":
@@ -310,6 +362,9 @@ TS_CONFIGS = {
     ],
     "ts/tsconfig.app.json": [None, '{"extends": "./configs/base.cfg"}', '{"compilerOptions": {"baseUrl": "other"}}'],
     "ignored/tsconfig.json": ['{"compilerOptions": {"baseUrl": "."}}', '{"compilerOptions": {"baseUrl": ".."}}'],
+    # The root package.json declares ws/* workspaces, Yarn's form only ws/utils, or nothing; pnpm's file ws/**.
+    "package.json": ['{"workspaces": ["ws/*"]}', '{"workspaces": {"packages": ["ws/utils"]}}', '{"name": "fz"}', None],
+    "pnpm-workspace.yaml": [None, "packages:\n  - 'ws/**'\n"],
     # go/go.mod (example.com/fz) holds go/a and go/b; a root go.mod is
     # another module around it, a nested go/b/go.mod takes go/b out of it,
     # and go.work's `replace` names go/b by a third path.
@@ -327,18 +382,26 @@ TS_CONFIGS = {
 # The C# projects' versions: cs/ is a project (of one or two .csproj
 # files), cs/Models a nested one when its .csproj exists, and the nearest
 # Directory.Build.props/.targets wrap their `<Using>` items (cs/Models' own
-# props shadowing the root one). scripts/ is under no project.
+# props shadowing the root one, or enabling `ImplicitUsings`, as cs/'s Web
+# SDK project may). scripts/ is under no project.
 CS_PROJECT = '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n{}  </ItemGroup>\n</Project>\n'
 CS_CONFIGS = {
     "cs/Shop.csproj": [
         CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop.Models" />\n'),
         CS_PROJECT.format('    <Using Include="Shop.Jobs" Static="true" />\n    <Using Include="Shop.Jobs" Alias="J" />\n'),
         CS_PROJECT.format('    <Using Remove="Shop" />\n    <Using Include="Shop.App" />\n'), None,
+        # The Web SDK's implicit usings, one of them removed.
+        CS_PROJECT.replace("Microsoft.NET.Sdk", "Microsoft.NET.Sdk.Web").format(
+            '    <Using Remove="System.Linq" />\n').replace(
+            "<ItemGroup>", "<PropertyGroup>\n    <ImplicitUsings>enable</ImplicitUsings>\n  </PropertyGroup>\n  <ItemGroup>"),
     ],
     "cs/Shop.Tests.csproj": [None, CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop.Tests" />\n')],
     "cs/Models/Models.csproj": [None, CS_PROJECT.format(""), CS_PROJECT.format('    <Using Include="Shop" />\n')],
     "Directory.Build.props": [None, CS_PROJECT.format('    <Using Include="Shop" />\n')],
-    "cs/Models/Directory.Build.props": [None, CS_PROJECT.format('    <Using Include="Shop.Text" />\n')],
+    "cs/Models/Directory.Build.props": [
+        None, CS_PROJECT.format('    <Using Include="Shop.Text" />\n'),
+        "<Project>\n  <PropertyGroup>\n    <ImplicitUsings>enable</ImplicitUsings>\n  </PropertyGroup>\n</Project>\n",
+    ],
     "cs/Directory.Build.targets": [None, CS_PROJECT.format('    <Using Remove="Shop.Models" />\n')],
 }
 # A C# file's `global using`s, with what may come before one in a file's
@@ -360,12 +423,22 @@ CS_REFERENCES = {
 # The folders a C# file moves between: three projects and no project.
 CS_DIRS = ["cs/", "cs/Models/", "cs2/", "scripts/"]
 # Folders holding a configuration file, which the fuzz may delete whole.
-CONFIG_DIRS = ["ts/configs", "go/b", "crates/core", "cs/Models"]
+CONFIG_DIRS = ["ts/configs", "go/b", "crates/core", "cs/Models", "ws/utils"]
+# The workspace package ws/utils's names and the entries its `main` moves between (None: no `main`;
+# dist/fmt.js, a build output, is src/fmt.ts).
+WS_NAMES = ["@fz/utils", "@fz/tools"]
+WS_MAINS = [None, "src/index.ts", "lib/main.js", "dist/fmt.js"]
 
 RS_FOO = "pub struct Foo;\n\nimpl Foo {\n    pub fn new() -> Foo {\n        Foo\n    }\n}\n"
 GO_SERVER = "type Server struct{}\n\nfunc (s *Server) Run() {\n\tServe()\n}\n"
 # Methods named like go/b's functions Serve and Stop.
 GO_TWIN = "\ntype Twin struct{}\n\nfunc (t Twin) Serve() {}\n\nfunc (t *Twin) Stop() {\n\tt.Serve()\n}\n"
+# An object-literal service (its methods owned by `svc`, `tidy` by
+# `svc.nested`) and a function declared in a block.
+TS_SERVICE = (
+    "\nexport const svc = {\n  run() { return f(); },\n  stop: async () => svc.run(),\n"
+    "  nested: { tidy() { return g(); } },\n};\n\nif (ready) {\n  function boot() { return svc.stop(); }\n}\n"
+)
 # A function nested in another, named like the classes' methods.
 PY_NESTED = "\n\ndef outer():\n    def act():\n        return shared()\n    return act()\n"
 
@@ -413,6 +486,13 @@ def initial_repo() -> dict:
         "cs/Global.cs": File("cs", head="", bases={"Root": None}, funcs={"Run": ["Jobs.Run", "_jobs.Stop"]}),
         "cs/Wide.cs": File("cs", head="Shop.Wide", imports=[f"using N{i};" for i in range(40)] + ["using Shop;"],
                            bases={"Wide": None}, funcs={"Spread": ["Jobs.Run", "_jobs.Stop", "p.Helper"]}),
+        # An ASP.NET controller: its action's handler stub is a file-less
+        # claimed Function with a `proj`, and the action calls Jobs.Run by name.
+        "cs/ShopController.cs": File("static", head=(
+            "using Shop;\n\nnamespace Shop.App;\n\n[ApiController]\n[Route(\"api/[controller]\")]\n"
+            "public class ShopController\n{\n    [HttpGet(\"run\")]\n"
+            "    public void List() { Jobs.Run(); }\n}\n"
+        )),
         "scripts/Tool.cs": File("cs", head="Tools", imports=["global using Shop.Models;"], bases={"Tool": None}),
         # Another project's Shop.Jobs, which cs/ sees only through a reference.
         "cs2/Lib.csproj": File("static", head=CS_PROJECT.format("")),
@@ -430,10 +510,20 @@ def initial_repo() -> dict:
         "ts/tsconfig.json": File("static", head=TS_CONFIGS["ts/tsconfig.json"][0]),
         "ts/configs/base.cfg": File("static", head=TS_CONFIGS["ts/configs/base.cfg"][0]),
         "ts/app.ts": File("ts", imports=["import { f } from '@/lib';", "import * as u from '@/util';"],
+                          mounts=[("app", "/m", "ts/src/util.ts")],
                           funcs={"main": ["f", "u.g"]}, routes=[("get", "/items", "main"), ("post", "/api/items", "f")]),
         "ts/src/lib.ts": File("ts", funcs={"f": []}),
-        "ts/src/util.ts": File("ts", imports=["import { f } from './lib';"], funcs={"g": ["f"]}),
+        "ts/src/util.ts": File("ts", imports=["import { f } from './lib';"], funcs={"g": ["f"]},
+                               routes=[("get", "/loose", "g")], exported=True),
         "ts/other/lib.ts": File("ts", funcs={"f": [], "g": []}),
+        # A workspace package: its barrel re-exports fmt, another entry
+        # defines its own; ws/app imports it by name and by a subpath.
+        "package.json": File("static", head=TS_CONFIGS["package.json"][0]),
+        "ws/utils/package.json": File("static", head='{"name": "@fz/utils", "main": "src/index.ts"}'),
+        "ws/utils/src/index.ts": File("ts", imports=["export { fmt } from './fmt';"]),
+        "ws/utils/src/fmt.ts": File("ts", funcs={"fmt": []}),
+        "ws/utils/lib/main.ts": File("ts", funcs={"fmt": [], "lead": []}),
+        "ws/app/greet.ts": File("ts", imports=["import { fmt } from '@fz/utils';"], funcs={"greet": ["fmt"]}),
         "kt/Models.kt": File("kt", head="kt", bases={"Clock": None, "Stopwatch": None}, funcs={"helper": []}),
         "kt/Main.kt": File("kt", head="kt", imports=["kt.util.slug"], funcs={"main": ["helper", "clockRun", "slug"]}),
         "kt/util/Text.kt": File("kt", head="kt.util", funcs={"slug": []}),
@@ -442,7 +532,7 @@ def initial_repo() -> dict:
         "go/a/a.go": File("go", head="a", imports=["example.com/fz/b"], funcs={"Start": ["Serve"]}),
         "go/b/b.go": File("go", head="b", extra=GO_SERVER, funcs={"Serve": [], "Stop": []}),
         "go/b/halt.go": File("go", head="b", funcs={"Halt": ["Stop"]}),
-        "compose.yaml": File("compose", services={"api": "alpine:3.20", "web": "nginx:1.27"}),
+        "compose.yaml": File("compose", services={"api": "alpine:3.20", "web": "nginx:1.27"}, builds={"api": "ts", "web": "py"}),
         "Dockerfile": File("docker", froms=["python:3.12"]),
         "notes.md": File("notes", mentions=["helper", "Foo", "Base", "K", "Serve", "api", "python", "nginx"]),
         "docs/adr-1.md": File("note", head="ADR-1", links=["py/a.py"]),
@@ -454,7 +544,7 @@ IMPORTS = {
     "py": [
         "import py.b", "import py.c as c", "from py.b import helper", "from py import b", "from .c import util",
         "from . import a", "from pkg import helper", "from pkg import *", "from py.b import *",
-        "from lib import util", "import pkg.impl", "from pkg.impl import pkgfn as alias",
+        "from lib import util", "import pkg.impl", "from pkg.impl import pkgfn as alias", "from py.b import Heir",
     ],
     "rs": ["use crate::display::Display;", "use crate::foo::Foo;", "use shop_core::util;", "mod display;",
            "use crate::util::tidy;", "use super::display::render;"],
@@ -463,23 +553,34 @@ IMPORTS = {
             '#include "../cpp/util/strings.h"', "#include <vector>"],
     "go": ["example.com/fz/a", "example.com/fz/b", "example.com/top/go/b", "example.com/bee", "example.com/ext"],
     "ts": ["import { f } from '@/lib';", "import * as u from '@/util';", "import { g } from './src/util';",
-           "import { f } from './other/lib';", "import { f } from 'lib';", "import { g } from './src';"],
+           "import { f } from './other/lib';", "import { f } from 'lib';", "import { g } from './src';",
+           "import { fmt } from '@fz/utils';", "import * as u from '@fz/tools';",
+           "import { lead } from '@fz/utils/lib/main';", "import { svc } from './src/util';"],
     "java": ["base.Base", "app.K", "base.*"],
     "kt": ["kt.util.slug", "kt.util.*", "kt.Clock", "kt.helper"],
 }
+# Datastore clients' imports, as each language writes one (several naming one store).
+CLIENTS = {
+    "py": ["import redis", "import psycopg2"],
+    "ts": ["import Redis from 'ioredis';", "import { Pool } from 'pg';", "const { Kafka } = require('kafkajs');"],
+    "java": ["redis.clients.jedis.Jedis", "org.apache.kafka.clients.producer.KafkaProducer"],
+    "kt": ["io.lettuce.core.RedisClient", "org.postgresql.Driver"],
+    "cs": ["using StackExchange.Redis;", "using Npgsql;"],
+    "go": ["github.com/lib/pq", "github.com/segmentio/kafka-go", "github.com/redis/go-redis/v9"],
+}
 BASES = {
-    "py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "java": ["Base", "K"],
+    "py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base", "Mid"], "java": ["Base", "K"],
     "cs": ["Jobs", "Base", "Program", "Missing"], "cpp": ["Widget", "Gadget", "Missing"],
 }
 # How a Python call to `{n}` is written: bare, through a module or alias, on
 # an untyped value, on `self`, or on a literal.
 PY_CALLS = ["{n}()", "b.{n}()", "c.{n}()", "obj.{n}()", "pkg.impl.{n}()", "alias.{n}()", "self.{n}()", "''.{n}()",
-            "b.Twin().{n}()", "b.Base().{n}()"]
+            "b.Twin().{n}()", "b.Base().{n}()", "b.Heir().{n}()", "Heir().{n}()"]
 # Path pins of every kind over the fuzz's own paths (renames add `_rN` to a stem).
 CALL_PINS = ["py/.", ".", "pkg/.!other.py", "/b.py", "/lib/util.py", "/py/.", "/lib/.", "src/", "pkg/", "py/b.py"]
 IMPORT_PINS = ["py/.", "pkg/.", ".", "src/lib/.!core.py", "/b.py", "/util.py", "/impl.py"]
 # How a TS call to `{n}` is written: bare, through a namespace import, on `this` or an untyped value.
-TS_CALLS = ["{n}", "u.{n}", "this.{n}", "obj.{n}"]
+TS_CALLS = ["{n}", "u.{n}", "this.{n}", "obj.{n}", "svc.{n}"]
 # How a Go call to `{n}` is written: bare, through a package, on a typed value or an untyped one.
 GO_CALLS = ["{n}", "b.{n}", "bee.{n}", "(&Server{{}}).{n}", "obj.{n}"]
 # How a Java call to `{n}` is written: bare, on `this`, static, on a new or an untyped object.
@@ -489,7 +590,7 @@ KT_CALLS = ["{n}", "Clock().{n}", "x.{n}"]
 # How a Rust call to `{n}` is written: bare, through a module, a crate path,
 # another crate, a type, or on an untyped value.
 RS_CALLS = ["{n}", "display::{n}", "crate::foo::{n}", "shop_core::{n}", "shop_core::util::{n}", "Foo::{n}",
-            "x.{n}"]
+            "x.{n}", "shop_core::below::{n}", "shop_core::api::{n}", "crate::below::{n}"]
 # How a C# call to `{n}` is written: bare, on `this`/`base`, static, through
 # an alias, a qualified name or a nested type, on a new object, a typed field
 # or parameter, or an untyped object.
@@ -508,7 +609,9 @@ CPP_METHODS = ["Widget::draw", "Widget::size", "Gadget::run", "Missing::stop", "
 # The `pub use` re-exports lib.rs and util.rs of crates/core toggle.
 RS_REEXPORTS = {
     "crates/core/src/lib.rs": ["pub use util::tidy;", "pub use util::*;", "pub use util::tidy as neat;",
-                               "pub use util::dig;", "pub use deep::dig as neat;"],
+                               "pub use util::dig;", "pub use deep::dig as neat;", "pub use deep as below;",
+                               "pub use self::util as below;", "pub mod api { pub use crate::deep::dig; }",
+                               "pub mod api { pub use super::util::*; }"],
     "crates/core/src/util.rs": ["pub use crate::deep::dig;", "pub use crate::deep::*;", "pub use super::deep::dig;"],
 }
 # The roots the Python package `lib` moves between.
@@ -516,6 +619,8 @@ PY_ROOTS = ["src/", "", "code/"]
 # The source roots a Java file moves between (another Maven module).
 JAVA_ROOTS = ["java/", "lib/src/main/java/"]
 SERVICES = ["api", "web", "worker", "db"]
+# The folders a compose service builds from (ts/src inside ts: the nearest wins).
+BUILD_CONTEXTS = ["py", "ts", "ts/src", "java", "go", "cs", "kt", "pkg"]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
 EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing", "act", "shared"]
 CODE = ("py", "rs", "go", "java", "ts", "kt", "cs", "cpp")
@@ -529,6 +634,8 @@ ROUTE_METHODS = ["get", "post", "put"]
 TS_ROUTE_PATHS = ["/items", "/items/:id", "/api/items", "/api/orders", "/health", "/loose"]
 # `/items/:id` goes on the router the file mounts, `/loose` on one another file mounts.
 TS_ROUTERS = {"/items/:id": "router", "/loose": "looseRouter"}
+# The prefixes a TS file mounts another file's router at.
+MOUNT_PREFIXES = ["/m", "/api/m", "/n"]
 JAVA_ROUTE_PATHS = ["/items", "/orders", "/items/{id}"]
 TS_HANDLERS = ["f", "g", "u.g", "missing", "(req, res) => res.end()"]
 SPRING_MAPPINGS = {"get": "GetMapping", "post": "PostMapping", "put": "PutMapping"}
@@ -556,7 +663,10 @@ class Fuzz:
         return self.rng.choice(paths) if paths else None
 
     def _func_names(self) -> list:
-        return sorted({n for f in self.files.values() for n in f.funcs} | {"Run", "new", "missing_fn", "Tidy", "act", "shared"})
+        return sorted(
+            {n for f in self.files.values() for n in f.funcs}
+            | {"Run", "new", "missing_fn", "Tidy", "act", "shared", "run", "stop", "tidy"}
+        )
 
     @staticmethod
     def _styled(kind: str, names: list) -> list:
@@ -610,6 +720,31 @@ class Fuzz:
         f.bases["Twin"] = None
         return f"add class Twin beside {beside} in {path}", {path}
 
+    def op_heir(self):
+        """A Python file with a class gains or loses `Mid` (of base `Base`)
+        or `Heir` (of base `Mid`), which inherit `shared` from a base of the
+        file; `op_base` changes their bases."""
+        path = self._pick(lambda f: f.kind == "py" and f.bases)
+        if not path:
+            return None
+        f = self.files[path]
+        name = self.rng.choice(["Mid", "Heir"])
+        if name in f.bases:
+            del f.bases[name]
+            return f"remove class {name} from {path}", {path}
+        f.bases[name] = {"Mid": "Base", "Heir": "Mid"}[name]
+        return f"add class {name}({f.bases[name]}) in {path}", {path}
+
+    def op_move_shared(self):
+        """`shared` moves between `Base` and `Mid` in a Python file, so the
+        classes inheriting it inherit it from another base."""
+        path = self._pick(lambda f: f.kind == "py" and f.bases)
+        if not path:
+            return None
+        f = self.files[path]
+        f.shared_on = "Mid" if f.shared_on == "Base" else "Base"
+        return f"move shared to {f.shared_on} in {path}", {path}
+
     def op_shadow(self):
         """A Python file with a class gains or loses a top-level `act`, the
         name its classes' methods have."""
@@ -633,6 +768,31 @@ class Fuzz:
         f.extra = "" if f.extra else PY_NESTED
         return f"{'add' if f.extra else 'remove'} nested act in {path}", {path}
 
+    def op_guard(self):
+        """A Python function's def moves under an `if` or a `try` (defined
+        again in its `except`), or back out to the module level."""
+        path = self._pick(lambda f: f.kind == "py" and f.funcs)
+        if not path:
+            return None
+        f = self.files[path]
+        name = self.rng.choice(sorted(f.funcs))
+        if f.guards.get(name):
+            del f.guards[name]
+            return f"unguard {name} in {path}", {path}
+        f.guards[name] = self.rng.choice(["if", "try"])
+        return f"guard {name} with {f.guards[name]} in {path}", {path}
+
+    def op_ts_service(self):
+        """A TS file gains or loses an object-literal service `svc` (whose
+        methods other files call as `svc.run()`) and a function declared
+        in a block."""
+        path = self._pick(lambda f: f.kind == "ts")
+        if not path:
+            return None
+        f = self.files[path]
+        f.service = not f.service
+        return f"{'add' if f.service else 'remove'} object-literal service in {path}", {path}
+
     def op_go_twin(self):
         """go/b/b.go gains or loses a type `Twin` whose methods are named
         like the package's functions `Serve` and `Stop`."""
@@ -654,6 +814,20 @@ class Fuzz:
             return f"remove import {m} in {path}", {path}
         f.imports.append(m)
         return f"add import {m} in {path}", {path}
+
+    def op_datastore(self):
+        """Add or remove a datastore client's import: the file claims the
+        store's shared node (one provider's, whichever language)."""
+        path = self._pick(lambda f: f.kind in CLIENTS)
+        if not path:
+            return None
+        f = self.files[path]
+        m = self.rng.choice(CLIENTS[f.kind])
+        if m in f.imports:
+            f.imports.remove(m)
+            return f"remove client {m} in {path}", {path}
+        f.imports.append(m)
+        return f"add client {m} in {path}", {path}
 
     def op_import_style(self):
         """Write one of a Python file's imports another way."""
@@ -822,7 +996,10 @@ class Fuzz:
 
     def op_rs_reexport(self):
         """Add or remove a `pub use` re-export of lib.rs or util.rs."""
-        path = self.rng.choice(sorted(p for p in RS_REEXPORTS if p in self.files))
+        paths = sorted(p for p in RS_REEXPORTS if p in self.files)
+        if not paths:  # both deleted
+            return None
+        path = self.rng.choice(paths)
         line = self.rng.choice(RS_REEXPORTS[path])
         imports = self.files[path].imports
         if line in imports:
@@ -841,6 +1018,29 @@ class Fuzz:
             return f"delete config {path}", {path}
         self.files[path] = File("static", head=text)
         return f"write config {path}: {text!r}", {path}
+
+    def op_ws_rename(self):
+        """Rename the workspace package ws/utils."""
+        path = "ws/utils/package.json"
+        if path not in self.files:
+            return None
+        data = json.loads(self.files[path].head)
+        data["name"] = self.rng.choice([n for n in WS_NAMES if n != data["name"]])
+        self.files[path] = File("static", head=json.dumps(data))
+        return f"rename workspace package {path} to {data['name']}", {path}
+
+    def op_ws_main(self):
+        """Point ws/utils's `main` at another entry, or drop it (src/index then)."""
+        path = "ws/utils/package.json"
+        if path not in self.files:
+            return None
+        data = json.loads(self.files[path].head)
+        main = self.rng.choice([m for m in WS_MAINS if m != data.get("main")])
+        data.pop("main", None)
+        if main is not None:
+            data["main"] = main
+        self.files[path] = File("static", head=json.dumps(data))
+        return f"set main of {path} to {main}", {path}
 
     def op_cs_csproj(self):
         """Write, create or delete a C# project file or a Directory.Build file."""
@@ -1070,6 +1270,69 @@ class Fuzz:
         services[name] = self.rng.choice(IMAGES)
         return f"add service {name} ({services[name]}) in {path}", {path}
 
+    def op_build(self):
+        """Give a compose service a build context, move it or take it away:
+        the files under it change owning Service (their Endpoints' CALLS and
+        their stores' USES), the nearest context winning."""
+        path = self._pick(lambda f: f.kind == "compose" and f.services)
+        if not path:
+            return None
+        f = self.files[path]
+        name = self.rng.choice(sorted(f.services))
+        if name in f.builds and self.rng.random() < 0.4:
+            del f.builds[name]
+            return f"remove build of {name} in {path}", {path}
+        f.builds[name] = self.rng.choice(BUILD_CONTEXTS)
+        return f"build {name} from {f.builds[name]} in {path}", {path}
+
+    def op_mount(self):
+        """Mount another TS file's router on the file's app or its own
+        router, or unmount one: the router file's routes take (or lose) the
+        prefix, through up to two files."""
+        path = self._pick(lambda f: f.kind == "ts")
+        if not path:
+            return None
+        f = self.files[path]
+        if f.mounts and self.rng.random() < 0.4:
+            gone = f.mounts.pop(self.rng.randrange(len(f.mounts)))
+            return f"unmount {gone} in {path}", {path}
+        target = self._pick(lambda o: o.kind == "ts" and o is not f)
+        if not target:
+            return None
+        mount = (self.rng.choice(["app", "looseRouter"]), self.rng.choice(MOUNT_PREFIXES), target)
+        f.mounts.append(mount)
+        return f"mount {mount} in {path}", {path}
+
+    def op_mount_prefix(self):
+        """Change a mount's prefix."""
+        path = self._pick(lambda f: f.mounts)
+        if not path:
+            return None
+        mounts = self.files[path].mounts
+        at = self.rng.randrange(len(mounts))
+        parent, prefix, target = mounts[at]
+        mounts[at] = (parent, self.rng.choice([p for p in MOUNT_PREFIXES if p != prefix]), target)
+        return f"change mount {at} to {mounts[at]} in {path}", {path}
+
+    def op_export_router(self):
+        """Export a TS file's looseRouter, or stop exporting it."""
+        path = self._pick(lambda f: f.kind == "ts")
+        if not path:
+            return None
+        f = self.files[path]
+        f.exported = not f.exported
+        return f"{'export' if f.exported else 'unexport'} looseRouter in {path}", {path}
+
+    def op_move_router(self):
+        """Move a mounted router file to another TS folder (its mounts' imports then miss it)."""
+        targets = sorted({t for f in self.files.values() for _p, _x, t in f.mounts if t in self.files})
+        if not targets:
+            return None
+        old = self.rng.choice(targets)
+        new = self.rng.choice(["ts/", "ts/src/", "ts/other/", "ws/app/"]) + self._fresh("router") + ".ts"
+        self.files[new] = self.files.pop(old)
+        return f"move {old} to {new}", {old, new}
+
     def op_from(self):
         path = self._pick(lambda f: f.kind == "docker")
         if not path:
@@ -1148,6 +1411,10 @@ class Fuzz:
         "cs_dup_class", "cs_shadow", "cs_shadow", "cs_reference", "cs_reference", "cs_project_move", "twin", "twin", "shadow", "nested", "go_twin", "go_twin", "route",
         "route",
         "route_change", "route_move", "src_move", "src_move", "src_dir", "src_dir", "rs_reexport", "rs_reexport", "rs_reexport",
+        "ws_rename", "ws_rename", "ws_main", "ws_main", "datastore", "datastore",
+        "build", "build", "build", "mount", "mount", "mount", "mount_prefix", "export_router", "move_router",
+        "heir", "heir", "move_shared", "move_shared", "guard", "guard", "guard",
+        "ts_service", "ts_service", "ts_service",
     ]
 
     def draw(self):
@@ -1161,7 +1428,7 @@ class Fuzz:
             path = root / rel
             if rel in self.files:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(render(self.files[rel]))
+                path.write_text(render(self.files[rel], rel))
             elif path.exists():
                 path.unlink()
 
@@ -1194,7 +1461,7 @@ def _with_pin_comments(monkeypatch):
         result.relationships += rows
         return result
 
-    monkeypatch.setattr(dispatch, "extract_python_file", extract)
+    stub(monkeypatch, dispatch, "extract_python_file", extract)
 
 
 @pytest.fixture(autouse=True)
@@ -1214,7 +1481,7 @@ def _with_cs_projects(monkeypatch):
         result.nodes[0].properties["fz_usings"] = [str(each) for each in usings]
         return result
 
-    monkeypatch.setattr(dispatch, "extract_csharp_file", extract)
+    stub(monkeypatch, dispatch, "extract_csharp_file", extract)
 
 
 def check(engine, repo_id, root, seed, step, log):
@@ -1272,13 +1539,14 @@ def test_graph_accuracy_fuzz(engine, repo_id, tmp_path, seed):
                 order.sort(key=lambda rel: not (rel in gone and rel.startswith(f"{DOCS}/")))
             for rel in order + sorted(folders):
                 if rel in gone or rel in folders:
-                    remove_paths(engine, repo_id, root, {root / rel})
+                    remove_paths(engine, repo_id, root, {root / rel}, docs_path=DOCS, mentions_enabled=True)
                 else:
                     index_paths(engine, repo_id, root, {root / rel}, docs_path=DOCS, mentions_enabled=True)
                 resync({rel})
         else:
             if gone or folders:
-                remove_paths(engine, repo_id, root, {root / rel for rel in gone | folders})
+                remove_paths(engine, repo_id, root, {root / rel for rel in gone | folders}, docs_path=DOCS,
+                             mentions_enabled=True)
             if changed:
                 index_paths(engine, repo_id, root, {root / rel for rel in changed}, docs_path=DOCS,
                             mentions_enabled=True)
@@ -1363,7 +1631,7 @@ def test_cs_rekey_ops_retract_callers_in_other_files(engine, repo_id, tmp_path, 
                 )[0]["n"])
         return real(self, repo, nodes)
 
-    monkeypatch.setattr(GraphEngine, "write_match_keys", write_match_keys)
+    stub(monkeypatch, GraphEngine, "write_match_keys", write_match_keys)
     fuzz = Fuzz(random.Random(0))
     root = tmp_path
     fuzz.write(root, set(fuzz.files))
@@ -1390,3 +1658,59 @@ def test_cs_rekey_ops_retract_callers_in_other_files(engine, repo_id, tmp_path, 
             assert any(retracted), f"{description}: no edge from another file retracted"
         check(engine, repo_id, root, "scripted", step, [description])
 
+
+
+def test_pass_two_skipping_a_batch_files_node_writes_leaves_the_same_graph(engine, repo_id, tmp_path, monkeypatch):
+    """index_paths' pass 2 writes a batch file's edges again but not its nodes
+    (dispatch `_Extractions`): every step leaves the graph a second repository
+    gets when pass 2 writes every file's nodes again too, as it used to, after
+    a full scan, random batches, and a full scan over the changed graph."""
+    old = f"{repo_id}_fresh"  # deleted with repo_id by the fixture
+    real_add = dispatch._Extractions.add
+
+    def every_file_late(self, lang, rel_path, nodes, rels, content=None):
+        self.late = True
+        return real_add(self, lang, rel_path, nodes, rels, content)
+
+    def both(run):
+        run(repo_id)
+        with monkeypatch.context() as m:
+            stub(m, dispatch._Extractions, "add", every_file_late)
+            run(old)
+        actual, expected = graph_snapshot(engine, repo_id), graph_snapshot(engine, old)
+        assert actual[0], "the fixture should produce nodes"
+        if actual != expected:
+            pytest.fail(snapshot_diff(expected, actual))
+
+    rng = random.Random(5)
+    fuzz = Fuzz(rng)
+    root = tmp_path
+    fuzz.write(root, set(fuzz.files))
+    provision_repository_schema(engine, root)
+    for each in (repo_id, old):
+        engine.upsert_repository(each, each, str(root))
+    both(lambda rid: full_scan(engine, rid, root, docs_path=DOCS, mentions_enabled=True))
+    for _step in range(6):
+        fuzz.moved_notes, fuzz.removed_dirs, fuzz.dir_only = [], [], []
+        ops = [fuzz.draw() for _ in range(rng.randint(1, 3))]
+        touched = set().union(*(paths for _desc, paths in ops))
+        fuzz.write(root, touched)
+        folders = {d for d in fuzz.removed_dirs if not any(p.startswith(d + "/") for p in fuzz.files)}
+        for folder in sorted(folders, reverse=True):
+            if (root / folder).is_dir() and not any((root / folder).iterdir()):
+                (root / folder).rmdir()
+        touched -= {rel for rel in touched if rel not in fuzz.files and any(
+            rel.startswith(d + "/") for d in fuzz.dir_only if d in folders)}
+        gone = {rel for rel in touched if rel not in fuzz.files}
+
+        def batch(rid, gone=gone, changed=touched - gone, folders=folders, touched=touched):
+            if gone or folders:
+                remove_paths(engine, rid, root, {root / rel for rel in gone | folders}, docs_path=DOCS,
+                             mentions_enabled=True)
+            if changed:
+                index_paths(engine, rid, root, {root / rel for rel in changed}, docs_path=DOCS, mentions_enabled=True)
+            sync_resolver_config(engine, rid, root, {root / rel for rel in touched | folders}, docs_path=DOCS,
+                                 mentions_enabled=True)
+
+        both(batch)
+    both(lambda rid: full_scan(engine, rid, root, docs_path=DOCS, mentions_enabled=True))

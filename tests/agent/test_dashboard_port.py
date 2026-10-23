@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -215,8 +216,33 @@ def test_bind_listens_and_matches_asyncio_address_rules():
             assert wildcard.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only socket option")
-def test_bind_takes_the_port_exclusively_on_windows():
+def test_bind_takes_the_port_exclusively_on_windows(monkeypatch):
+    """Simulated, so it runs everywhere: as on Windows, the exclusive-use option
+    is set and SO_REUSEADDR (which there lets two servers share a port) is not."""
+    from devgraph.dashboard import serving
+
+    options = []
+
+    class RecordingSocket(socket.socket):
+        def setsockopt(self, level, option, value, *rest):
+            options.append((level, option, value))
+            if option != EXCLUSIVE:  # unknown to this OS unless it is Windows
+                super().setsockopt(level, option, value, *rest)
+
+    EXCLUSIVE = getattr(socket, "SO_EXCLUSIVEADDRUSE", -1)
+    monkeypatch.setattr(socket, "SO_EXCLUSIVEADDRUSE", EXCLUSIVE, raising=False)
+    monkeypatch.setattr(serving, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(serving.socket, "socket", RecordingSocket)
+
+    (sock,) = serving._bind("127.0.0.1", 0)
+    with sock:
+        assert _is_listening(sock)
+    assert (socket.SOL_SOCKET, EXCLUSIVE, 1) in options
+    assert not any(option == socket.SO_REUSEADDR for _, option, _ in options)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the real socket option exists only on Windows")
+def test_bind_takes_the_port_exclusively_on_real_windows():
     from devgraph.dashboard.serving import _bind
 
     (sock,) = _bind("127.0.0.1", 0)

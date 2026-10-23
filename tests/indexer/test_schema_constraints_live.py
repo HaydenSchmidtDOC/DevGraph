@@ -15,6 +15,7 @@ from devgraph.graph.schema import constraint_statements
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import apply_project_schema
 from devgraph.indexer.schema_constraints import constraint_drift, release_labels, stale_generated_objects
+from tests.helpers import stub
 
 
 def _token():
@@ -178,7 +179,7 @@ def test_a_key_change_blocked_by_duplicate_nodes_never_drops_the_constraint(engi
     )
     statements = []
     run = engine.run_schema_statement
-    monkeypatch.setattr(engine, "run_schema_statement", lambda stmt: (statements.append(stmt), run(stmt))[1])
+    stub(monkeypatch, engine, "run_schema_statement", lambda stmt: (statements.append(stmt), run(stmt))[1])
 
     declare(root, label, key="code")
     with caplog.at_level(logging.WARNING, logger="devgraph.indexer.schema_constraints"):
@@ -308,3 +309,10 @@ def test_drift_reports_a_conflict_when_another_repo_records_an_unknown_key(engin
         "repo_id": a_id, "label": label, "status": "conflict", "key": ("adr_id",),
         "constraint_key": ("path",), "declared_by": [b_id],
     }]
+
+
+def test_cache_is_a_built_in_label_not_a_user_one():
+    from devgraph.indexer.schema_constraints import _is_user_label
+
+    assert not _is_user_label("Cache") and not _is_user_label("cache")
+    assert _is_user_label("Ticket")

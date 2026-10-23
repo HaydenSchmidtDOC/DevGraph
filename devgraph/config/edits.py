@@ -382,7 +382,7 @@ def locate_entry(text: str, name: str, node_type: bool = False, relationship: bo
     """The section (`node_types`/`relationships`) that `name` addresses."""
     from devgraph.config.list_edit import ListEditError, entries
     from devgraph.config.project_schema import SCHEMA_FILENAME
-    from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+    from devgraph.graph.schema import BUILTIN_LABELS, RELATIONSHIP_TYPES
 
     if node_type and relationship:
         raise ConfigEditError("use either --node-type or --relationship, not both", "invalid")
@@ -403,7 +403,7 @@ def locate_entry(text: str, name: str, node_type: bool = False, relationship: bo
             f"{name!r} is both a node type and a relationship type; pass --node-type or --relationship", "ambiguous"
         )
     if not found:
-        hint = "; built-in schema entries cannot be changed" if name in NODE_LABELS + RELATIONSHIP_TYPES else ""
+        hint = "; built-in schema entries cannot be changed" if name in BUILTIN_LABELS + RELATIONSHIP_TYPES else ""
         raise ConfigEditError(f"no node type or relationship named {name!r} in {SCHEMA_FILENAME}{hint}", "not_found")
     return found[0]
 

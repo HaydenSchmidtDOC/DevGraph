@@ -443,9 +443,9 @@ def test_a_nested_function_is_owned_by_its_enclosing_functions(engine, repo):
 
 def test_a_call_into_another_file_reaches_the_owner_it_names(engine, repo):
     """`from m import A, save`: `save()` links the top-level `save` only;
-    `A().save()` every method `save` there (`A` could inherit it), never the
-    top-level one; and an incremental index, adding the siblings after the
-    caller, equals a fresh scan."""
+    `A().save()` A's method, never B's or the top-level one; and an
+    incremental index, adding the siblings after the caller, equals a fresh
+    scan."""
     root, _registry, repo_id = repo
     models = write(root, "shop/models.py", "def other():\n    return 0\n")
     write(root, "shop/jobs.py", """\
@@ -464,9 +464,7 @@ def test_a_call_into_another_file_reaches_the_owner_it_names(engine, repo):
         "RETURN b.owner AS owner, x.confidence AS confidence",
         {"r": repo_id},
     )
-    assert sorted((row["owner"], row["confidence"]) for row in rows) == [
-        ("", "resolved"), ("A", "resolved"), ("B", "resolved"),
-    ]
+    assert sorted((row["owner"], row["confidence"]) for row in rows) == [("", "resolved"), ("A", "resolved")]
     equals_fresh(engine, repo_id, root)
 
 
@@ -498,10 +496,12 @@ def _targets(engine, repo_id, caller):
 
 
 def test_a_method_of_another_files_class_links_as_before_owners(engine, repo):
-    """The owner of a method called on another file's class or instance is
-    unknown to the caller: an inherited `save`/`create`, an ALL_CAPS
-    instance's method, a `require`d class's static, a default import of a
-    class of another name all still link every member of the name there."""
+    """An inherited `save`/`create` of an imported class links the base of
+    its file that defines it (its heir keys), and a default import of a
+    class of another name the default-exported class's member; the owner
+    of a method called on another file's instance is unknown to the
+    caller: an ALL_CAPS instance's method and a `require`d class's static
+    still link every member of the name there."""
     root, _registry, repo_id = repo
     write(root, "shop/models.py", """\
         class Base:
@@ -535,7 +535,8 @@ def test_a_method_of_another_files_class_links_as_before_owners(engine, repo):
         """)
     write(root, "web/svc.js", "class Base { make() { return 1; } }\nclass Svc extends Base {}\nmodule.exports = Svc;\n")
     write(root, "web/app.js", "const Svc = require('./svc');\n\nfunction build() {\n  return Svc.make();\n}\n")
-    write(root, "web/thing.ts", "export default class ThingImpl {\n  start() { return 1; }\n}\n")
+    write(root, "web/thing.ts", "export default class ThingImpl {\n  start() { return 1; }\n}\n"
+                                "export class Other {\n  start() { return 2; }\n}\n")
     write(root, "web/main.ts", "import Thing from './thing';\n\nexport function go() {\n  return Thing.start();\n}\n")
     full_scan(engine, repo_id, root)
     assert _targets(engine, repo_id, "run") == [
@@ -545,3 +546,269 @@ def test_a_method_of_another_files_class_links_as_before_owners(engine, repo):
     assert _targets(engine, repo_id, "build") == [("make", "web/svc.js", "Base")]
     assert _targets(engine, repo_id, "go") == [("start", "web/thing.ts", "ThingImpl")]
     equals_fresh(engine, repo_id, root)
+
+
+INHERITED = """\
+    class Base:
+        def save(self):
+            return 1
+
+
+    class Mid(Base):
+        def check(self):
+            return 2
+
+
+    class User(Mid):
+        pass
+
+
+    class Other:
+        def save(self):
+            return 3
+
+        def check(self):
+            return 4
+    """
+
+
+@pytest.mark.parametrize("rel, source, caller_rel, caller", [
+    ("shop/models.py", INHERITED, "shop/jobs.py",
+     "from shop.models import User\n\n\ndef run():\n    User().save()\n    User().check()\n"),
+    ("web/models.ts",
+     "export class Base { save() { return 1; } }\nexport class Mid extends Base { check() { return 2; } }\n"
+     "export class User extends Mid {}\nexport class Other { save() { return 3; } check() { return 4; } }\n",
+     "web/jobs.ts", "import { User } from './models';\n\nexport function run() {\n  new User().save();\n"
+     "  new User().check();\n}\n"),
+    ("src/main/java/shop/User.java",
+     "package shop;\n\nclass Base { void save() {} }\n\nclass Mid extends Base { void check() {} }\n\n"
+     "public class User extends Mid {}\n\nclass Other { void save() {} void check() {} }\n",
+     "src/main/java/app/Jobs.java", "package app;\n\nimport shop.User;\n\npublic class Jobs {\n"
+     "    void run() { new User().save(); new User().check(); }\n}\n"),
+])
+def test_an_imported_classs_method_reaches_the_base_of_its_file_defining_it(
+    engine, repo, rel, source, caller_rel, caller,
+):
+    """`User().save()` on an imported `User` links the nearest base of
+    User's file defining `save` (Base), and `check` Mid's, never Other's
+    same-named members; a base-list change and an inherited method moving
+    between classes relink the caller, which is not re-indexed, as a fresh
+    scan links it."""
+    root, _registry, repo_id = repo
+    models = write(root, rel, source)
+    write(root, caller_rel, caller)
+    full_scan(engine, repo_id, root)
+    assert [(n, o) for n, _f, o in _targets(engine, repo_id, "run")] == [("check", "Mid"), ("save", "Base")]
+    equals_fresh(engine, repo_id, root)
+    # User no longer extends Mid: nothing of its file defines save or check for it.
+    models.write_text(models.read_text().replace("User(Mid)", "User").replace("User extends Mid", "User"))
+    index_paths(engine, repo_id, root, {models})
+    assert _targets(engine, repo_id, "run") == []
+    equals_fresh(engine, repo_id, root)
+    # Back, then `save` moves from Base to Mid (Base keeps none).
+    models.write_text(textwrap.dedent(source) if rel.endswith(".py") else source)
+    index_paths(engine, repo_id, root, {models})
+    assert [(n, o) for n, _f, o in _targets(engine, repo_id, "run")] == [("check", "Mid"), ("save", "Base")]
+    moved = models.read_text()
+    if rel.endswith(".py"):
+        moved = moved.replace("    def save(self):\n        return 1\n", "    pass\n", 1).replace(
+            "    def check(self):\n        return 2\n", "    def check(self):\n        return 2\n\n"
+            "    def save(self):\n        return 1\n", 1)
+    else:
+        moved = moved.replace("save() {", "unused() {", 1).replace("check() {", "save() { return 1; } check() {", 1) \
+            if rel.endswith(".ts") else moved.replace("void save() {}", "void unused() {}", 1).replace(
+                "void check() {}", "void save() {} void check() {}", 1)
+    models.write_text(moved)
+    index_paths(engine, repo_id, root, {models})
+    assert [(n, o) for n, _f, o in _targets(engine, repo_id, "run")] == [("check", "Mid"), ("save", "Mid")]
+    equals_fresh(engine, repo_id, root)
+
+
+def test_a_route_handler_inherited_by_an_imported_class_relinks_on_a_base_change(engine, repo):
+    """`app.get('/x', Ctrl.list)` on an imported `Ctrl` implements the
+    `list` Ctrl inherits from a base of its file (heir keys); when Ctrl
+    stops extending it, the route file, not re-indexed, loses that
+    IMPLEMENTS as a fresh scan does."""
+    root, _registry, repo_id = repo
+    ctrl = write(root, "web/ctrl.ts", "export class Base { static list() { return 1; } }\n"
+                                      "export class Ctrl extends Base {}\nexport class Other { static list() {} }\n")
+    write(root, "web/app.ts", "import express from 'express';\nimport { Ctrl } from './ctrl';\n\n"
+                              "const app = express();\napp.get('/x', Ctrl.list);\n")
+    full_scan(engine, repo_id, root)
+
+    def implemented():
+        rows = engine.run_cypher(
+            "MATCH (:Endpoint {repo_id: $r})-[:IMPLEMENTS]->(f:Function {repo_id: $r}) WHERE f.file IS NOT NULL "
+            "RETURN f.owner AS o",
+            {"r": repo_id},
+        )
+        return sorted(row["o"] for row in rows)
+
+    assert implemented() == ["Base"]
+    equals_fresh(engine, repo_id, root)
+    ctrl.write_text(ctrl.read_text().replace("Ctrl extends Base", "Ctrl"))
+    index_paths(engine, repo_id, root, {ctrl})
+    assert implemented() == []
+    equals_fresh(engine, repo_id, root)
+
+
+def test_a_call_through_an_alias_or_instance_links_what_it_did_before_owners(engine, repo):
+    """A CapWords instance or alias names its class's members as before
+    owners narrowed them: `Registry = _Registry()`, `UserModel = User`, a
+    JS `export const UserService = new UserServiceImpl()` and `export
+    default new Client()`; one naming no class of its file, or a class with
+    a base outside it, still links every member of the name there."""
+    root, _registry, repo_id = repo
+    write(root, "shop/models.py", """\
+        from lib import Model
+
+
+        class _Registry:
+            def register(self):
+                return 1
+
+
+        class User:
+            def save(self):
+                return 2
+
+
+        class Remote(Model):
+            pass
+
+
+        def sync():
+            return 3
+
+
+        Registry = _Registry()
+        UserModel = User
+        Factory = make()
+        """)
+    write(root, "shop/jobs.py", """\
+        from shop.models import Registry, UserModel, Factory, Remote
+
+
+        def run():
+            Registry.register()
+            UserModel().save()
+            Factory.sync()
+            Remote().sync()
+        """)
+    write(root, "web/svc.ts", "export class UserServiceImpl { find() { return 1; } }\n"
+                              "export const UserService = new UserServiceImpl();\n")
+    write(root, "web/client.ts", "class Client { get() { return 1; } }\nexport default new Client();\n")
+    write(root, "web/main.ts", "import { UserService } from './svc';\nimport Client from './client';\n\n"
+                               "export function go() {\n  UserService.find();\n  Client.get();\n}\n")
+    full_scan(engine, repo_id, root)
+    assert _targets(engine, repo_id, "run") == [
+        ("register", "shop/models.py", "_Registry"), ("save", "shop/models.py", "User"),
+        ("sync", "shop/models.py", ""),
+    ]
+    assert _targets(engine, repo_id, "go") == [("find", "web/svc.ts", "UserServiceImpl"), ("get", "web/client.ts", "Client")]
+    equals_fresh(engine, repo_id, root)
+
+
+def test_a_class_whose_members_the_file_cant_name_keeps_the_links_it_had(engine, repo):
+    """What a call through an imported class linked before owners it still
+    links unless provably wrong: a class built by a call (`with_metaclass`),
+    of a metaclass outside the file, decorated, or rebound (`Echo =
+    wrap(Echo)`) is open, so `extra` still reaches the file's `extra`; an
+    in-file metaclass's `table` is the class's, and the module-level
+    `table` it also reached before is provably not."""
+    root, _registry, repo_id = repo
+    write(root, "shop/models.py", """\
+        from six import with_metaclass
+        from abc import ABCMeta
+
+
+        class Meta(type):
+            def table(cls):
+                return 1
+
+
+        class Alpha(with_metaclass(Meta, object)):
+            pass
+
+
+        class Beta(metaclass=Meta):
+            pass
+
+
+        class Gamma(metaclass=ABCMeta):
+            pass
+
+
+        @register
+        class Delta:
+            pass
+
+
+        class Echo:
+            pass
+
+
+        Echo = wrap(Echo)
+
+
+        def table():
+            return 2
+
+
+        def extra():
+            return 3
+        """)
+    write(root, "shop/jobs.py", """\
+        from shop.models import Alpha, Beta, Gamma, Delta, Echo
+
+
+        def a():
+            Alpha().extra()
+
+
+        def b():
+            Beta.table()
+
+
+        def c():
+            Gamma().extra()
+
+
+        def d():
+            Delta().extra()
+
+
+        def e():
+            Echo().extra()
+        """)
+    full_scan(engine, repo_id, root)
+    for caller in ("a", "c", "d", "e"):
+        assert _targets(engine, repo_id, caller) == [("extra", "shop/models.py", "")], caller
+    assert _targets(engine, repo_id, "b") == [("table", "shop/models.py", "Meta")]
+    equals_fresh(engine, repo_id, root)
+
+
+def test_an_open_classes_fallback_follows_its_file(engine, repo):
+    """`Remote().sync()` on an open `Remote` (a base outside its file) links
+    the file's `sync` while Remote neither has nor inherits one there; a
+    `sync` added to Remote takes the link over, removing it gives it back,
+    and closing Remote (no outside base) drops it, each without
+    re-indexing the caller, as a fresh scan links it."""
+    root, _registry, repo_id = repo
+    models = write(root, "shop/models.py", "from lib import Model\n\n\nclass Remote(Model):\n    pass\n\n\n"
+                                           "def sync():\n    return 1\n")
+    write(root, "shop/jobs.py", "from shop.models import Remote\n\n\ndef run():\n    Remote().sync()\n")
+    full_scan(engine, repo_id, root)
+    steps = [
+        (models.read_text(), [("sync", "shop/models.py", "")]),
+        (models.read_text().replace("    pass\n", "    def sync(self):\n        return 2\n", 1),
+         [("sync", "shop/models.py", "Remote")]),
+        (models.read_text(), [("sync", "shop/models.py", "")]),
+        (models.read_text().replace("class Remote(Model):", "class Remote:"), []),
+        (models.read_text(), [("sync", "shop/models.py", "")]),
+    ]
+    for text, expected in steps:
+        models.write_text(text)
+        index_paths(engine, repo_id, root, {models})
+        assert _targets(engine, repo_id, "run") == expected
+        equals_fresh(engine, repo_id, root)

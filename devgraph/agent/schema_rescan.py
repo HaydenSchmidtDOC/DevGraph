@@ -17,7 +17,7 @@ from collections.abc import Callable
 from typing import Any
 
 from devgraph.config.project_schema import ProjectSchemaError, resolve_effective_schema, schema_file_hash
-from devgraph.indexer.dispatch import full_scan, index_outdated, schema_pending
+from devgraph.indexer.dispatch import full_scan, full_scan_elsewhere, full_scan_turn, index_outdated, schema_pending
 from devgraph.indexer.walk import RepoRootUnavailable
 
 logger = logging.getLogger(__name__)
@@ -40,10 +40,13 @@ class SchemaRescanScheduler:
         clock: Callable[[], float] = time.monotonic,
         is_paused: Callable[[], bool] | None = None,
         run_exclusive: Callable[[str, Callable[[], Any]], Any] | None = None,
+        yield_lock: Callable[[str], bool] | None = None,
     ) -> None:
         """`run_exclusive(repo_id, fn)` is the watcher's: it runs the scan
         under the repository's batch lock, so it never interleaves with a
-        live batch (W4)."""
+        live batch (W4). `yield_lock(repo_id)` is the watcher's
+        `yield_batch_lock`: while a scan waits for another repository's
+        (dispatch `full_scan_turn`), the repository's live batches run."""
         self._engine = engine
         self._registry = registry
         self._on_rescanned = on_rescanned
@@ -52,6 +55,7 @@ class SchemaRescanScheduler:
         self._clock = clock
         self._is_paused = is_paused
         self._run_exclusive = run_exclusive or (lambda repo_id, fn: fn())
+        self._yield_lock = yield_lock
         # repo_id -> (pending hash, when it was first seen)
         self._seen: dict[str, tuple[str, float]] = {}
         # repo_id -> hash that failed to resolve; skipped until the file changes
@@ -78,6 +82,11 @@ class SchemaRescanScheduler:
             if not repo.watch_enabled:
                 continue
             try:
+                # Another process (`devgraph rescan`) is scanning it in full:
+                # its index reads as outdated until that scan restamps it, and
+                # the scan applies a changed schema too. Looked at again next pass.
+                if full_scan_elsewhere(self._engine, repo.repo_id):
+                    continue
                 # A never-indexed repo has no stamp either: its first scan
                 # (devgraph add / rescan, maybe running now) is left to them.
                 if repo.last_indexed and index_outdated(self._engine, repo.repo_id):
@@ -174,16 +183,27 @@ class SchemaRescanScheduler:
         the batch lock (the start catch-up or a registration scan); None then."""
         if not index_outdated(self._engine, repo.repo_id):
             return None
-        return self._rescan(repo)
+        with full_scan_turn(repo.repo_id, lambda: self._waiting(repo.repo_id), self._engine):
+            if not index_outdated(self._engine, repo.repo_id):
+                return None  # upgraded by the scan this one waited for
+            return self._rescan(repo)
+
+    def _waiting(self, repo_id: str) -> bool:
+        """While a scan waits its turn: let the repository's live batches run;
+        False (call the scan off) once stopping."""
+        if self._yield_lock is not None:
+            self._yield_lock(repo_id)  # its answer is about git syncs, not this scan
+        return not self._stop.is_set() and self._registry.get(repo_id) is not None
 
     def _rescan(self, repo: Any) -> tuple[int, bool]:
         """Full-scan `repo` and, if its schema got applied, stamp the scan's
         start (W7). Returns (files indexed, applied)."""
         started = datetime.now(timezone.utc)
-        count = full_scan(
-            self._engine, repo.repo_id, repo.path,
-            docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
-        )
+        with full_scan_turn(repo.repo_id, lambda: self._waiting(repo.repo_id), self._engine):  # full_scan's own take is then at once
+            count = full_scan(
+                self._engine, repo.repo_id, repo.path,
+                docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
+            )
         if schema_pending(self._engine, repo.repo_id, repo.path):
             return count, False
         self._registry.mark_indexed(repo.repo_id, at=started)

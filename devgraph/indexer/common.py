@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 from devgraph.graph.schema import (
     FILE_SCOPED_LABELS,
+    HEIR_KEY,
     NAME_REF_FILELESS,
     NAME_REF_OWNED,
     NAME_REF_PIN_SEP,
@@ -31,16 +32,22 @@ __all__ = [
     "NAME_REF_PIN_SEP",
     "NAME_REF_SEP",
     "PIN_BY_KIND",
+    "UNKNOWN_BASE",
     "ExtractionResult",
     "GraphNode",
     "GraphRelationship",
+    "add_heir_keys",
     "best_pin",
+    "class_member_pin",
+    "heir_keys",
     "member_owner",
+    "merge_same_nodes",
     "module_pin_name",
     "name_ref_properties",
     "own_edges",
     "owned_pin",
     "owners_by_pin",
+    "owner_matches",
     "parse_name_ref",
     "pin_confidence",
     "pin_excludes",
@@ -189,6 +196,15 @@ def owned_pin(pin: str, owner: str | None) -> str:
     return f"{pin}{OWNER_PIN_SEP}{owner}" if owner is not None else pin
 
 
+def class_member_pin(pin: str, cls: str | None) -> str:
+    """A pin to the members of another file's class `cls` (common.owned_pin):
+    owned by `cls` in the files `pin` names, the class's own or one it
+    inherits from a class of its file (`heir_keys`). A recursive prefix (a
+    package or barrel directory) stays owner-less: the class's file is one
+    of many there, and a base it imports from a sibling is found by name."""
+    return owned_pin(pin, None if pin_kind(pin) == "prefix" else cls)
+
+
 def split_owned_pin(pin: str | None) -> tuple[str | None, str | None]:
     """An `owned_pin` as (pin, owner); any other pin as (pin, None)."""
     if pin is None or OWNER_PIN_SEP not in pin:
@@ -205,6 +221,196 @@ def owners_by_pin(pins: Iterable[str]) -> dict[str, set[str | None]]:
         base, owner = split_owned_pin(pin)
         found.setdefault(base, set()).add(owner)
     return found
+
+
+#: A base name no class of a file has, which makes a class *open* (see
+#: `heir_keys`): an alias or instance of something the file doesn't declare
+#: (`Registry = make_registry()`) is a class of this one base.
+UNKNOWN_BASE = "?"
+#: Bases that supply no member another class of the file has: Python's
+#: `object`, `type` and builtin exceptions (and Java's `Exception`, whose
+#: members a sibling class's same-named method can't be).
+_CLOSED_BASES = frozenset({
+    "object", "type", "BaseException", "Exception", "ArithmeticError", "AssertionError", "AttributeError",
+    "BlockingIOError", "BrokenPipeError", "BufferError", "ChildProcessError", "ConnectionAbortedError",
+    "ConnectionError", "ConnectionRefusedError", "ConnectionResetError", "EOFError", "EnvironmentError",
+    "FileExistsError", "FileNotFoundError", "FloatingPointError", "GeneratorExit", "IOError", "ImportError",
+    "IndexError", "InterruptedError", "IsADirectoryError", "KeyError", "KeyboardInterrupt", "LookupError",
+    "MemoryError", "ModuleNotFoundError", "NameError", "NotADirectoryError", "NotImplementedError", "OSError",
+    "OverflowError", "PermissionError", "ProcessLookupError", "RecursionError", "ReferenceError", "RuntimeError",
+    "StopAsyncIteration", "StopIteration", "SyntaxError", "SystemError", "SystemExit", "TimeoutError", "TypeError",
+    "UnboundLocalError", "UnicodeDecodeError", "UnicodeEncodeError", "UnicodeError", "ValueError",
+    "ZeroDivisionError", "Warning", "UserWarning", "DeprecationWarning", "PendingDeprecationWarning",
+    "RuntimeWarning", "FutureWarning",
+})
+
+ClassDecl = tuple[str, "str | None", Iterable[str], Iterable[str]]
+
+
+def _linearization(
+    by_name: dict[str, list[tuple[str | None, list[str], set[str]]]], name: str, bases: list[str], c3: bool,
+) -> list[str]:
+    """The in-file classes a class `name` of bases `bases` inherits from,
+    nearest first: Python's C3 method resolution order with `c3` (depth
+    first when its merge fails, as for a cycle), else depth first, left to
+    right, each once. A base no class of the file is named is left out."""
+
+    def bases_of(each: str) -> list[str]:
+        return list(dict.fromkeys(b for _o, bs, _m in by_name.get(each, ()) for b in bs if b in by_name))
+
+    def dfs() -> list[str]:
+        found, seen = [], {name}
+
+        def walk(names: list[str]) -> None:
+            for base in names:
+                if base in seen or base not in by_name:
+                    continue
+                seen.add(base)
+                found.append(base)
+                walk(bases_of(base))
+
+        walk(bases)
+        return found
+
+    if not c3:
+        return dfs()
+    memo: dict[str, list[str] | None] = {}
+
+    def c3_of(each: str, own: list[str], active: frozenset) -> list[str] | None:
+        if each in active:
+            return None
+        if each in memo and own is None:
+            return memo[each]
+        parents = [b for b in (own if own is not None else bases_of(each)) if b in by_name and b != each]
+        lists = []
+        for parent in parents:
+            line = c3_of(parent, None, active | {each})
+            if line is None:
+                return None
+            lists.append(list(line))
+        lists.append(list(parents))
+        result = [each]
+        while any(lists):
+            for line in lists:
+                head = line[0] if line else None
+                if head is not None and not any(head in other[1:] for other in lists):
+                    break
+            else:
+                return None  # no consistent order
+            result.append(head)
+            lists = [line[1:] if line and line[0] == head else line for line in lists]
+        if own is None:
+            memo[each] = result
+        return result
+
+    order = c3_of(name, list(bases), frozenset())
+    return order[1:] if order is not None else dfs()
+
+
+def _heirs(
+    classes: Iterable[ClassDecl], c3: bool = False,
+) -> tuple[dict[tuple[str, str], set[str]], dict[str, set[str]]]:
+    """`heir_keys`' keys as sets, and each *open* class's owner with the
+    member names its file says it has: a top-level class or alias with a
+    base, its own or an in-file ancestor's, that no class of the file is
+    named and is not `_CLOSED_BASES` (another file's, a library's,
+    `UNKNOWN_BASE`), whose other members the file can't name."""
+    by_name: dict[str, list[tuple[str | None, list[str], set[str]]]] = {}
+    for name, owner, bases, members in classes:
+        by_name.setdefault(name, []).append((owner, list(bases), set(members)))
+    found: dict[tuple[str, str], set[str]] = {}
+    open_owners: dict[str, set[str]] = {}
+    for name, infos in by_name.items():
+        for owner, bases, members in infos:
+            if owner is None:
+                continue
+            resolved = set(members)
+            chain = _linearization(by_name, name, bases, c3)
+            for base in chain:
+                for base_owner, _bases, base_members in by_name[base]:
+                    if base_owner is not None and base_owner != owner:
+                        for member in base_members - resolved:
+                            found.setdefault((member, base_owner), set()).add(HEIR_KEY + owner)
+                resolved.update(member for _owner, _bases, each in by_name[base] for member in each)
+            written = list(bases) + [b for base in chain for _o, bs, _m in by_name[base] for b in bs]
+            # Only a top-level class or alias (its members' owner its name) can be imported.
+            if owner == name and any(b not in by_name and b not in _CLOSED_BASES for b in written):
+                open_owners.setdefault(owner, set()).update(resolved)
+    return found, open_owners
+
+
+def heir_keys(classes: Iterable[ClassDecl], c3: bool = False) -> dict[tuple[str, str], list[str]]:
+    """Which of a file's classes inherit each member from another class of
+    the file. `classes` are the file's class declarations as (name, the
+    owner of its members or None when unknown, its bases as written, its
+    members' names); a module-level alias or instance of a class (`UserModel
+    = User`, `Registry = _Registry()`, JS's `export default new Client()`)
+    is a member-less declaration of that one base. Returns (member name,
+    defining owner) -> the sorted heir keys (graph/schema.py `HEIR_KEY` and
+    the heir's members' owner) of every class that defines no member of the
+    name itself and whose nearest in-file base defining one is that owner's,
+    nearest in Python's C3 order with `c3`, else depth first, left to right
+    (`_linearization`): `Base.save` gets `<User` for `class User(Base)`, and
+    so an owned pin to `User` (`from m import User; User().save()`) reaches
+    it. Several declarations of one name are each walked."""
+    return {key: sorted(heirs) for key, heirs in _heirs(classes, c3)[0].items()}
+
+
+def add_heir_keys(result: ExtractionResult, classes: Iterable[ClassDecl], c3: bool = False) -> None:
+    """Give each of `result`'s Functions the heir keys (`heir_keys`) of
+    `classes`, the file's class declarations, as its `mkeys` (a member no
+    class of the file inherits gets none), and its Module the file's open
+    classes (`_heirs`) as `heir_open`, always written: an open class can
+    have any member its file doesn't name for it, so an owned end to it
+    also links a Function of its name when no Function of that name there
+    is its own or inherited member (`owner_matches`), what an owner-less
+    end linked before owners narrowed it."""
+    found, open_owners = _heirs(classes, c3)
+    for node in result.nodes:
+        if node.label == "Module":
+            node.properties["heir_open"] = sorted(open_owners)
+        elif node.label == "Function" and (heirs := found.get((node.name, node.properties.get("owner") or ""))):
+            node.properties["mkeys"] = sorted(heirs)
+
+
+def owner_matches(
+    owners: Iterable[str | None], node_owner: str | None, keys: Iterable[str] = (),
+    open_owners: Iterable[str] = (), siblings: Iterable[tuple[str | None, Iterable[str]]] = (),
+) -> bool:
+    """Whether a target end naming one of `owners` (None: any) links the
+    Function of owner `node_owner` whose `mkeys` are `keys`: its own owner,
+    one its heir keys (`heir_keys`) say inherits it, or an open class of its
+    file (`open_owners`, its Module's `heir_open`) none of the Functions of
+    its name there (`siblings`: their (owner, mkeys)) is or inherits. The
+    engine's Cypher mirrors this (graph/engine.py `_owner_test`)."""
+    keys, open_owners = set(keys), set(open_owners)
+    siblings = [(owner, set(each)) for owner, each in siblings]
+    return any(
+        owner is None or owner == node_owner or HEIR_KEY + owner in keys or (
+            owner in open_owners and not any(o == owner or HEIR_KEY + owner in k for o, k in siblings)
+        )
+        for owner in owners
+    )
+
+
+def merge_same_nodes(result: ExtractionResult) -> None:
+    """Merge, in place, the nodes of `result` that share one identity
+    (label, name, file and owner): two definitions of a name in one scope
+    (`try: def f(): ... except ImportError: def f(): ...`, a property and
+    its setter) are one node, whatever order the writes take. The first in
+    source order is that node, as it stands (its properties and its lines,
+    so the node never spans a definition between the two); a later one
+    adds only its calls, which the extractor records for the same node."""
+    seen: set[tuple] = set()
+    nodes: list[GraphNode] = []
+    for node in result.nodes:
+        file = node.properties.get("file")
+        key = (node.label, node.name, file, node.properties.get("owner") or "")
+        if file and key in seen:
+            continue
+        seen.add(key)
+        nodes.append(node)
+    result.nodes = nodes
 
 
 def own_edges(result: ExtractionResult, file_path: str) -> ExtractionResult:

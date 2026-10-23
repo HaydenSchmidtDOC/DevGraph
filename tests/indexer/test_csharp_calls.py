@@ -25,6 +25,7 @@ from devgraph.indexer.common import best_pin, shadowed
 from devgraph.indexer.csharp.extractor import extract_csharp_file
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 from devgraph.indexer.resolver_config import ResolverConfig
+from tests.helpers import stub
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 #: Candidate files, each with the match keys of the methods it declares.
@@ -801,7 +802,7 @@ def test_a_touched_name_reruns_only_the_groups_its_keys_meet(engine, repo_id, tm
         groups.extend((group["from_name"], group["to_name"]) for group in rerun)
         return real(self, repo, rerun, rels)
 
-    monkeypatch.setattr(GraphEngine, "rerun_edges", rerun_edges)
+    stub(monkeypatch, GraphEngine, "rerun_edges", rerun_edges)
     repo = "namespace {}\n{{\n    public class Repo {{ public void Get() {{ }} }}\n}}\n"
     _write(tmp_path, "Models/Repo.cs", repo.format("Shop.Domain"))
     _write(tmp_path, "App/Svc.cs", "namespace Shop.Domain.Services;\n\n"
@@ -852,6 +853,22 @@ def test_a_project_using_under_the_files_own_library_root_stays_a_candidate(tmp_
     assert "Microsoft.AspNetCore.Routing:RouteData" in keys and "Microsoft.Extensions.Logging:RouteData" in keys
     elsewhere = _call_keys(source.replace("Microsoft.AspNetCore.Http", "Shop"), "Run", "Make", "Http/E.cs", config)
     assert not any(key.startswith("Microsoft.") for key in elsewhere)
+
+
+def test_an_implicit_using_under_the_files_own_library_root_is_a_candidate(tmp_path):
+    """A Web project with `ImplicitUsings` enabled has the SDK's usings
+    (Microsoft.AspNetCore.Routing among them) in scope, which count only
+    where the site's own namespace is under the same root."""
+    (tmp_path / "Http").mkdir()
+    (tmp_path / "Http" / "Http.csproj").write_text(
+        '<Project Sdk="Microsoft.NET.Sdk.Web"><PropertyGroup><ImplicitUsings>enable</ImplicitUsings>'
+        "</PropertyGroup></Project>"
+    )
+    config = ResolverConfig(tmp_path)
+    source = "namespace Microsoft.AspNetCore.Http;\nclass E { void Run() { RouteData.Make(); } }\n"
+    assert "Microsoft.AspNetCore.Routing:RouteData" in _call_keys(source, "Run", "Make", "Http/E.cs", config)
+    elsewhere = _call_keys(source.replace("Microsoft.AspNetCore.Http", "Shop"), "Run", "Make", "Http/E.cs", config)
+    assert not any(key.startswith(("Microsoft.", "System.")) for key in elsewhere)
 
 
 def test_an_extension_on_a_constrained_type_parameter_skips_constraints_naming_no_type():

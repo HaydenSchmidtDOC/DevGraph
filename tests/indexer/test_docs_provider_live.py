@@ -22,6 +22,7 @@ from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths, schema_pending
 from devgraph.indexer.providers import docs, docs_cache
 from devgraph.indexer.walk import indexable_paths
+from tests.helpers import stub
 from tests.indexer.docs_live_helpers import (  # noqa: F401  (cache_off and cache_on are pytest fixtures)
     assert_matches_fresh_apply,
     cache_off,
@@ -675,9 +676,9 @@ def test_without_docs_sources_the_graph_is_unchanged(engine, repo, monkeypatch):
 
     with_change = build(repo)
     engine.delete_repository(REPO)
-    monkeypatch.setattr(dispatch, "_prune_docs", lambda *a, **k: ([], None, {}))
+    stub(monkeypatch, dispatch, "_prune_docs", lambda *a, **k: ([], None, {}))
     for name in ("_read_docs_batch", "_sync_docs", "_relink_docs", "_sync_docs_edges"):
-        monkeypatch.setattr(dispatch, name, lambda *a, **k: None)
+        stub(monkeypatch, dispatch, name, lambda *a, **k: None)
     assert build(repo) == with_change
 
 
@@ -976,7 +977,7 @@ def test_a_long_chain_of_stale_entries_is_chased_with_a_fixed_number_of_lookups(
     calls = []
     for name in ("extracted_nodes_at", "extracted_entries", "existing_node_names", "list_file_nodes"):
         real = getattr(engine, name)
-        monkeypatch.setattr(engine, name, lambda *args, _real=real, _name=name: calls.append(_name) or _real(*args))
+        stub(monkeypatch, engine, name, lambda *args, _real=real, _name=name: calls.append(_name) or _real(*args))
     index_paths(engine, REPO, keyed, {q})
 
     assert len(calls) <= 4, calls  # the batch's snapshot and fetch, the pulled-in owners, the relink's fetch
@@ -1152,7 +1153,7 @@ def path_lists(engine, monkeypatch):
                 seen.append((_name, list(args[_position])))
             return _real(*args)
 
-        monkeypatch.setattr(engine, name, spy)
+        stub(monkeypatch, engine, name, spy)
     return seen
 
 

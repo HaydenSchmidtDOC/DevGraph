@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 import pytest
+from tests.helpers import stub
 
 
 if not os.environ.get("DISPLAY"):
@@ -144,7 +145,7 @@ def _fail_fast_without_neo4j(_local_neo4j_reachable, monkeypatch):
     def unreachable(self):
         raise ServiceUnavailable("no Neo4j listening on 127.0.0.1:7687")
 
-    monkeypatch.setattr(GraphEngine, "verify_connectivity", unreachable)
+    stub(monkeypatch, GraphEngine, "verify_connectivity", unreachable)
 
 
 def _fail_neo4j_skip(report, required):
@@ -295,3 +296,15 @@ def _sweep_leaked_test_repos(_local_neo4j_reachable):
         sys.stderr.write(f"\nCould not sweep leaked test repositories: {exc}\n")
     finally:
         engine.close()
+
+
+@pytest.fixture(autouse=True)
+def _fail_on_stub_signature_mismatch():
+    """Fail a test whose `tests.helpers.stub` was called in a way the real
+    function would refuse, even if the code under test caught the TypeError."""
+    from tests.helpers import signature_mismatches
+
+    seen = len(signature_mismatches)
+    yield
+    if len(signature_mismatches) > seen:
+        pytest.fail("a stub was called against its real signature:\n" + "\n".join(signature_mismatches[seen:]), pytrace=False)

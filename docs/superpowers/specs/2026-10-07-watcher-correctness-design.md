@@ -354,6 +354,20 @@ mtime.
   all; the next start's sync covers both. With HEAD unmoved the sync is a
   no-op. A failed catch-up (`on_catch_up` returns False) skips it: a
   fast-mode sync never revisits its commits, so it waits for the retry.
+- **The sync yields the batch lock between its writes** (audit 5 item 10).
+  It writes Commit nodes, `MODIFIES` edges and recency in `UNWIND` chunks of
+  1,000 rows, and between chunks and blamed files, at most every 0.5 s,
+  calls `WatcherManager.yield_batch_lock`: from the `run_exclusive` job on
+  its own thread, the lock is released for 10 ms, so the batches and jobs
+  already waiting run, then taken back. A catch-up let in that way does not
+  sync the same history under the running sync (`_sync_git_state`): it
+  asks that sync to run once more when it ends, for commits made
+  meanwhile. Once the watcher is stopping, or the repository is no longer
+  watched or registered (a removal's purge may have run during the yield),
+  the yield answers False and the sync ends without recording HEAD or
+  writing the removed repository's Commits again; every write is a MERGE
+  or an idempotent recency write, so the next sync redoes it. A requested
+  re-run checks the same before it starts.
   `stop()` cancels a pending git burst; the next start covers it.
 - When nothing was missed it costs about 0.04 s plus re-indexing what the
   checkout touched, which is bounded by the files git wrote.

@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 from devgraph.cli import main as cli_main
 from devgraph.graph.engine import GraphEngine
 from devgraph.registry.store import RepoRegistry
+from tests.helpers import stub
 
 
 def _settings(tmp_path):
@@ -231,7 +232,7 @@ def test_doctor_wait_waits_for_neo4j_before_checking(tmp_path, monkeypatch):
 def test_doctor_wait_says_how_long_it_waited_when_neo4j_never_answers(tmp_path, monkeypatch):
     from devgraph.graph import engine as engine_module
 
-    monkeypatch.setattr(engine_module, "wait_for_bolt", lambda *a, **k: False)
+    stub(monkeypatch, engine_module, "wait_for_bolt", lambda *a, **k: False)
     out, result = _doctor_args(tmp_path, _DownEngine, None, ["--wait", "1"])
     assert "did not answer after waiting" in out
     assert result.exit_code == 1

@@ -13,7 +13,7 @@ from devgraph.cli.main import app
 from devgraph.config.project_schema import SCHEMA_FILENAME, load_project_schema, starter_schema_text
 from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.config.settings import Settings
-from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+from devgraph.graph.schema import BUILTIN_LABELS, NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.registry.store import RepoRegistry
 
 # Written before the per-repository opt-in: these tests assume project tools are served.
@@ -209,7 +209,7 @@ def show_json(runner, *args):
 def test_show_without_a_file_is_the_builtin_schema(runner, settings, tmp_path):
     data = show_json(runner, "--repo", str(tmp_path))
     assert data["status"] == "absent" and data["extends"] == "default"
-    assert [n["label"] for n in data["node_types"]] == list(NODE_LABELS)
+    assert [n["label"] for n in data["node_types"]] == list(BUILTIN_LABELS)
     assert {n["origin"] for n in data["node_types"]} == {"built-in"}
     assert [r["type"] for r in data["relationships"]] == list(RELATIONSHIP_TYPES)
 

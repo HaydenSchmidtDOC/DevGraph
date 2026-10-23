@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 from starlette.responses import PlainTextResponse
@@ -24,7 +24,7 @@ from devgraph.config.settings import get_settings
 from devgraph.dashboard.db_metrics import MetricsHistory
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.dashboard.query_log import QueryLog
-from devgraph.dashboard.routes import build_router
+from devgraph.dashboard.routes import build_router, neo4j_down_message
 from devgraph.dashboard.url import DASHBOARD_IDENTITY, WILDCARD_HOSTNAMES
 from devgraph.graph.engine import GraphEngine
 from devgraph.registry.store import RepoRegistry
@@ -126,6 +126,21 @@ def build_app(
     app.state.metrics = metrics
     app.add_middleware(_LocalHostOnlyMiddleware, allowed_hostnames=_allowed_hostnames(dashboard_host))
     app.include_router(build_router(engine, registry, events, QueryLog(), metrics, run_exclusive))
+
+    # Any route Neo4j being down (or refusing the login) fails answers 503
+    # with the MCP tools' wording, not a bare 500.
+    from neo4j.exceptions import Neo4jError, ServiceUnavailable, SessionExpired
+
+    async def neo4j_down(_request: Any, exc: Exception) -> JSONResponse:
+        message = neo4j_down_message(exc, getattr(engine, "uri", None) or settings.neo4j_uri)
+        if message is None and isinstance(exc, Neo4jError) and not isinstance(exc, ServiceUnavailable):
+            # Any other server error is a bug, as it was before: a plain 500.
+            return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+        return JSONResponse(status_code=503, content={"detail": message or "graph unavailable"})
+
+    # Neo4jError covers AuthError and every Neo.ClientError.Security.* refusal.
+    for exc_type in (ServiceUnavailable, SessionExpired, Neo4jError):
+        app.add_exception_handler(exc_type, neo4j_down)
     # Hand-written HTML/CSS/JS, no build step -- StaticFiles serves them
     # as-is (see Implementation Plan #5: no frontend framework in v1).
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")

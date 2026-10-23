@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.dispatch import index_paths
@@ -74,11 +75,23 @@ def test_get_source_returns_class_text(repo_with_indexed_file):
     assert result["docstring_full"] == "Greets people."
 
 
-def test_get_source_unknown_component_returns_empty(repo_with_indexed_file):
+def test_get_source_unknown_component_is_an_error_with_similar_names(repo_with_indexed_file):
     engine, registry, repo_id = repo_with_indexed_file
-    result = get_source(engine, registry, repo_id, "does_not_exist")
-    assert result["source"] is None
-    assert result["file"] is None
+    with pytest.raises(ToolError, match="no Function or Class named 'does_not_exist'"):
+        get_source(engine, registry, repo_id, "does_not_exist")
+    with pytest.raises(ToolError, match="Did you mean: .*label='Function', name='greet'"):
+        get_source(engine, registry, repo_id, "gree")
+    with pytest.raises(ToolError, match="no Function or Class named 'greet' in file 'nope.py'"):
+        get_source(engine, registry, repo_id, "greet", file="nope.py")
+
+
+def test_get_source_reads_an_absolute_file_inside_the_repository(repo_with_indexed_file):
+    engine, registry, repo_id = repo_with_indexed_file
+    relative = get_source(engine, registry, repo_id, "greet")
+    absolute = str(registry.get(repo_id).path / relative["file"])
+    assert get_source(engine, registry, repo_id, "greet", file=absolute)["source"] == relative["source"]
+    with pytest.raises(ToolError, match="no Function or Class named 'greet' in file"):
+        get_source(engine, registry, repo_id, "greet", file="/elsewhere/" + relative["file"])
 
 
 @pytest.fixture

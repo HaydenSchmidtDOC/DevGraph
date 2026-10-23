@@ -88,7 +88,9 @@ def test_impact_analysis_traces_each_target_apart(engine):
     assert result["ambiguous_targets"] == TARGETS
     direct = sorted((d["name"], sorted(d["target_files"])) for d in result["direct_dependents"]["results"])
     assert direct == [("caller", ["other.py"]), ("use_a", ["models.py"]), ("use_both", ["models.py", "other.py"])]
-    assert result["transitive_dependents"]["results"] == [{"name": "top", "type": "Function", "target_files": ["models.py"]}]
+    assert result["transitive_dependents"]["results"] == [
+        {"name": "top", "type": "Function", "file": "top.py", "owner": "", "target_files": ["models.py"]}
+    ]
     narrowed = tools.impact_analysis(engine, REPO, "save", file="other.py")
     assert sorted(d["name"] for d in narrowed["direct_dependents"]["results"]) == ["caller", "use_both"]
     assert narrowed["transitive_dependents"]["count"] == 0 and "ambiguous_targets" not in narrowed

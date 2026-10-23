@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 from devgraph.cli.main import app
 from devgraph.registry.store import RepoRegistry
 from devgraph import config as config_module
+from tests.helpers import stub
 
 
 @pytest.fixture
@@ -116,7 +117,7 @@ def _block_real_registry(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli_main, "get_settings", _fallback_get_settings)
     monkeypatch.setattr(config_module, "get_settings", _fallback_get_settings)
-    monkeypatch.setattr(lifecycle, "get_settings", _fallback_get_settings)
+    stub(monkeypatch, lifecycle, "get_settings", _fallback_get_settings)
 
 
 def _mock_settings(db_path):
@@ -392,7 +393,7 @@ def test_status_shows_rescan_pending(runner, temp_registry_db, temp_git_repo):
     outdated = {repo_id}
     with patch.object(cli_main, "get_settings", return_value=settings), \
          patch.object(cli_main, "GraphEngine") as engine_cls, \
-         patch("devgraph.indexer.dispatch.index_outdated", side_effect=lambda e, r: r in outdated):
+         patch("devgraph.indexer.dispatch.index_outdated", autospec=True, side_effect=lambda e, r: r in outdated):
         engine_cls.return_value.verify_connectivity.return_value = None
         pending = runner.invoke(app, ["status"])
         outdated.clear()
@@ -418,7 +419,7 @@ def test_status_tells_an_unwatched_repo_to_rescan(runner, temp_registry_db, temp
     settings = _mock_settings(db_path)
     with patch.object(cli_main, "get_settings", return_value=settings), \
          patch.object(cli_main, "GraphEngine") as engine_cls, \
-         patch("devgraph.indexer.dispatch.index_outdated", return_value=True):
+         patch("devgraph.indexer.dispatch.index_outdated", autospec=True, return_value=True):
         engine_cls.return_value.verify_connectivity.return_value = None
         result = runner.invoke(app, ["status"])
 
@@ -440,7 +441,7 @@ def test_status_does_not_call_a_never_indexed_repo_pending(runner, temp_registry
     settings = _mock_settings(db_path)
     with patch.object(cli_main, "get_settings", return_value=settings), \
          patch.object(cli_main, "GraphEngine") as engine_cls, \
-         patch("devgraph.indexer.dispatch.index_outdated", return_value=True):
+         patch("devgraph.indexer.dispatch.index_outdated", autospec=True, return_value=True):
         engine_cls.return_value.verify_connectivity.return_value = None
         result = runner.invoke(app, ["status"])
 
@@ -964,6 +965,9 @@ class _StubEngine:
     def upsert_repository(self, repo_id, name, path):
         self.calls.append("upsert_repository")
 
+    def full_scan_holder(self, repo_id, stale_s):
+        return None
+
     def close(self):
         self.calls.append("close")
 
@@ -1016,6 +1020,30 @@ def test_cli_rescan_provisions_the_repositorys_declared_constraints(
     builtins = constraint_statements()
     assert statements[: len(builtins)] == builtins
     assert statements[len(builtins):] == [WIDGET_CONSTRAINT]
+
+
+def test_cli_rescan_says_it_waits_for_a_full_scan_another_process_is_running(runner, temp_registry_db, tmp_path):
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(_repo_with_schema(tmp_path, "busy")).repo_id
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    engine = _StubEngine()
+    engine.full_scan_holder = lambda repo_id, stale_s: "4321@buildbox/abcd1234"
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", lambda *a, **k: engine), \
+         patch.object(cli_main, "full_scan", lambda *a, **k: 3), \
+         patch.object(cli_main, "sync_git_history",
+                      lambda *a, **k: {"commits_indexed": 0, "commits_deleted": 0}):
+        result = runner.invoke(app, ["rescan", repo_id])
+
+    assert result.exit_code == 0, f"stdout: {result.stdout}"
+    out = _collapsed(result.stdout)
+    assert "Another DevGraph process (4321@buildbox/abcd1234), usually the agent, is already running a full scan" in out
+    assert "Waiting for it to finish" in out and "Rescanned busy: 3 file(s)" in out
 
 
 def test_cli_rescan_without_a_schema_file_provisions_only_the_builtins(

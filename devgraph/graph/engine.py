@@ -24,8 +24,10 @@ from neo4j.graph import Node, Relationship
 
 from devgraph.graph.schema import (
     CLAIMED_LABELS,
+    DATASTORE_LABELS,
     FILE_LABELS,
     FILE_SCOPED_LABELS,
+    HEIR_KEY,
     NAME_REF_SEP,
     NAMED_LABELS,
     NODE_LABELS,
@@ -255,9 +257,14 @@ def _claim_nodes_tx(tx, label: str, rows: list[dict[str, Any]]) -> None:
     )
 
 
+# The datastore labels a Service `USES` through the owning-service pass
+# (indexer/datastores/extractor.py DatastoreType).
+OWNING_SERVICE_TARGETS = DATASTORE_LABELS
+
 # The files whose replace is a `service_api` one: Python's (its owning-service
-# and API edges) and the languages whose routes are extracted
-# (indexer/apis/routes.py: their Endpoint and owning-service CALLS edges).
+# and API edges) and the languages whose routes and datastore clients are
+# extracted (indexer/apis/routes.py, datastores/extractor.py
+# `client_datastores`: their Endpoint and owning-service CALLS/USES edges).
 SERVICE_API_SUFFIXES = (
     ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".java", ".kt", ".cs", ".go",
 )
@@ -426,8 +433,7 @@ def _unclaim_service_api_edges_tx(
     # The owning-service edges come back only in index_paths' final service
     # pass, which needs every compose file in the batch, so between this
     # file's replace and that pass a reader can briefly miss them.
-    if file_name.endswith(".py"):  # only a Python file writes USES
-        tx.run(_UNCLAIM_SERVICE_USES_CYPHER, repo_id=repo_id, f=file_name)
+    tx.run(_UNCLAIM_SERVICE_USES_CYPHER, repo_id=repo_id, f=file_name)
     if recorded is None:
         tx.run(_UNCLAIM_ENDPOINT_EDGES_CYPHER, repo_id=repo_id, f=file_name)
     else:
@@ -522,7 +528,8 @@ _LOAD_INSIGHT_EDGES_CYPHER = (
 )
 _LOAD_INSIGHT_NODES_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) WHERE elementId(n) IN $ids "
-    "RETURN elementId(n) AS id, n.name AS name, labels(n) AS labels, n.file AS file"
+    "RETURN elementId(n) AS id, n.name AS name, labels(n) AS labels, n.file AS file, n.owner AS owner, "
+    "n.insight_community AS community"
 )
 _CLEAR_INSIGHTS_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) "
@@ -541,13 +548,13 @@ _WRITE_INSIGHTS_SUMMARY_CYPHER = (
     "MATCH (r:Repository {repo_id: $repo_id}) "
     "SET r.insights_computed_at = $computed_at, r.insights_node_count = $node_count, "
     "r.insights_community_count = $community_count, r.insights_modularity = $modularity, "
-    "r.insights_communities = $communities"
+    "r.insights_communities = $communities, r.insights_fingerprint = $fingerprint"
 )
 _READ_INSIGHTS_SUMMARY_CYPHER = (
     "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.insights_computed_at IS NOT NULL "
     "RETURN r.insights_computed_at AS computed_at, r.insights_node_count AS node_count, "
     "r.insights_community_count AS community_count, r.insights_modularity AS modularity, "
-    "r.insights_communities AS communities"
+    "r.insights_communities AS communities, r.insights_fingerprint AS fingerprint"
 )
 
 # Transient Neo4j failures worth retrying: a connection blip, an expired
@@ -785,6 +792,11 @@ def wait_for_bolt(
         driver.close()
 
 
+_RELEASE_FULL_SCAN = (
+    "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.scan_owner = $owner REMOVE r.scan_owner, r.scan_heartbeat"
+)
+
+
 def _run(session, query: str, **params: Any) -> Any:
     """Run one autocommit statement and consume it, both inside `_retry_transient`;
     return its summary.
@@ -803,6 +815,37 @@ def _run_records(session, query: str, **params: Any) -> list:
     """`_run` for a statement whose records the caller reads: they are
     buffered inside the retry, so an execution error is retried or raised."""
     return _retry_transient(lambda: list(session.run(query, **params)))
+
+
+def _recency_row(
+    name: str, created_at: str | None, last_modified_at: str | None, last_modified_by: str | None, file: str | None,
+    owner: str = "",
+) -> dict[str, Any]:
+    """One row of `GraphEngine.write_recency`."""
+    return {
+        "name": name, "file": file, "owner": owner, "created_at": created_at, "last_modified_at": last_modified_at,
+        "last_modified_by": last_modified_by,
+    }
+
+
+#: `stage_recency`'s ratchet, per `write_recency` row.
+_STAGE_RECENCY = (
+    "SET n.created_at = CASE WHEN row.created_at IS NULL THEN n.created_at "
+    "WHEN n.created_at IS NULL OR row.created_at < n.created_at THEN row.created_at "
+    "ELSE n.created_at END, "
+    "n.last_modified_at = CASE WHEN row.last_modified_at IS NULL THEN n.last_modified_at "
+    "WHEN n.last_modified_at IS NULL OR row.last_modified_at > n.last_modified_at THEN row.last_modified_at "
+    "ELSE n.last_modified_at END, "
+    "n.last_modified_by = CASE "
+    "WHEN row.last_modified_by IS NULL THEN n.last_modified_by "
+    "WHEN n.last_modified_at IS NULL OR row.last_modified_at > n.last_modified_at THEN row.last_modified_by "
+    "ELSE n.last_modified_by END"
+)
+#: `set_recency`'s overwrite, per `write_recency` row: a None author keeps the old one.
+_SET_RECENCY = (
+    "SET n.created_at = row.created_at, n.last_modified_at = row.last_modified_at, "
+    "n.last_modified_by = coalesce(row.last_modified_by, n.last_modified_by)"
+)
 
 
 def _is_file_scoped(file: str | None) -> bool:
@@ -898,9 +941,11 @@ def _pin(file: str | None) -> str:
     return pin_kind(file)
 
 
-#: The edge types a resolver writes with a pin's `@` flag, whose edges into a
-#: node therefore depend on its match keys (see GraphEngine.write_match_keys).
-MATCH_KEY_EDGE_TYPES = ("CALLS", "IMPORTS")
+#: The edge types a resolver writes with a pin's `@` flag or an owned end an
+#: heir key can match (graph/schema.py `HEIR_KEY`: a route's IMPLEMENTS of an
+#: imported class's method too), whose edges into a node therefore depend on
+#: its match keys (see GraphEngine.write_match_keys).
+MATCH_KEY_EDGE_TYPES = ("CALLS", "IMPORTS", "IMPLEMENTS")
 #: The most nodes GraphEngine.write_match_keys handles in one transaction.
 RETRACT_NODES = 500
 #: The pin kinds that match a set of files rather than one (see `_pin`).
@@ -1116,6 +1161,33 @@ def _shadow_free(ref: str, var: str, label: str) -> str:
     )
 
 
+def _owner_test(ref: str, end: str, var: str, label: str) -> str:
+    """Cypher keeping the node `var` when the end's `{end}_owner` is unset
+    or names it: its own owner, or, for a target, a class of its file that
+    inherits it (the node's heir key, graph/schema.py `HEIR_KEY`), or, for a
+    target Function, an *open* class of its file (its Module's `heir_open`)
+    when no Function of its name there is that class's own or inherited
+    member: what an owner-less end linked. devgraph/indexer/common.py
+    `owner_matches` mirrors this."""
+    owner = f"{ref}.{end}_owner"
+    if end != "to":
+        return f"({owner} IS NULL OR {var}.owner = {owner})"
+    heir = f" OR '{HEIR_KEY}' + {owner} IN coalesce({var}.mkeys, [])"
+    if label == "Function":
+        # Both subqueries are hinted to seek, for the reason _end_match gives:
+        # a plan from other statistics scanned an index per row on CI.
+        heir += (
+            f" OR (EXISTS {{ MATCH ({var}_mod:Module {{repo_id: {var}.repo_id, name: {var}.file}}) "
+            f"USING INDEX SEEK {var}_mod:Module(repo_id, name) "
+            f"WHERE {owner} IN coalesce({var}_mod.heir_open, []) }} "
+            f"AND NOT EXISTS {{ MATCH ({var}_sib:Function {{repo_id: {var}.repo_id, name: {var}.name, file: {var}.file}}) "
+            f"USING INDEX SEEK {var}_sib:Function(repo_id, name, file, owner) "
+            f"WHERE {var}_sib.owner IS NOT NULL "
+            f"AND ({var}_sib.owner = {owner} OR '{HEIR_KEY}' + {owner} IN coalesce({var}_sib.mkeys, [])) }})"
+        )
+    return f"({owner} IS NULL OR {var}.owner = {owner}{heir})"
+
+
 def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also: str | None = None) -> str:
     """The MATCH for one end of an edge row (`pin` from `_pin`), reading its
     `{end}_name`/`{end}_file` off `ref` (the row, or one of its targets). An
@@ -1136,7 +1208,8 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     `to_name`, and tests the Module's path. `also` is one more condition on
     the match. An end pinned to a file or a path with an `{end}_owner` keeps
     only the nodes of that `owner` (two classes' same-named methods in one
-    file). A path-pinned end of a file-scoped label keeps only the nodes
+    file), or a target its heir keys say that owner inherits
+    (`_owner_test`). A path-pinned end of a file-scoped label keeps only the nodes
     visible to the row's project (`_visible`). A path pin marked `_TIERED`
     also keeps only the nodes its tiers do not shadow (`_shadow_free`)."""
     conditions = [also] if also else []
@@ -1165,7 +1238,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
                 match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
             if label in FILE_SCOPED_LABELS:
                 # The members of one owner in the files the pin matches, when the row names it.
-                conditions.append(f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)")
+                conditions.append(_owner_test(ref, end, var, label))
                 conditions.append(_visible(var))
         conditions[:0] = _path_pin_conditions(ref, path, var)
         return match + "WHERE " + " AND ".join(conditions) + " " + (_shadow_free(ref, var, label) if tiered else "")
@@ -1179,7 +1252,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
             # owner; every one of them otherwise. A node an index older than
             # owners wrote is left out until the upgrade rescan gives it one.
             conditions[:0] = [
-                f"{var}.owner IS NOT NULL", f"({ref}.{end}_owner IS NULL OR {var}.owner = {ref}.{end}_owner)",
+                f"{var}.owner IS NOT NULL", _owner_test(ref, end, var, label),
             ]
     else:
         match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
@@ -1231,6 +1304,14 @@ def _write_insights_tx(tx, repo_id: str, rows: list[dict[str, Any]], summary: di
     tx.run(_WRITE_INSIGHTS_SUMMARY_CYPHER, repo_id=repo_id, **summary)
 
 
+#: Properties an extractor writes on a file's Module, Class or Function only
+#: when the code has them (a docstring's summary and text, a Kotlin
+#: companion's `kind`): `_replace_file_nodes_tx` clears them on a kept node
+#: whose new extraction has none. Match keys and `proj` are written apart
+#: (`write_match_keys`).
+_OPTIONAL_CODE_PROPERTIES = ("description", "docstring_full", "kind")
+
+
 def _replace_file_nodes_tx(
     tx,
     repo_id: str,
@@ -1279,6 +1360,14 @@ def _replace_file_nodes_tx(
     nodes = [
         {**node, "properties": {**(node.get("properties") or {}), "shared_claims": record}}
         if node["label"] == "Module" and node["name"] == file_name else node
+        for node in nodes
+    ]
+    # A kept node's optional properties the new extraction leaves out (a
+    # removed docstring) are removed, as a fresh scan would never write them.
+    nodes = [
+        {**node, "properties": {**dict.fromkeys(_OPTIONAL_CODE_PROPERTIES), **(node.get("properties") or {})}}
+        if (node.get("properties") or {}).get("file") == file_name
+        or (node["label"] == "Module" and node["name"] == file_name) else node
         for node in nodes
     ]
     _upsert_nodes_tx(tx, nodes)
@@ -1371,6 +1460,10 @@ class GraphEngine:
             limits["connection_acquisition_timeout"] = connection_timeout_s
         # Hint notifications are off: a hinted index an older database hasn't
         # built yet (init_schema creates it) would log one per query.
+        # (repo_id, owner) of the full-scan claims taken through this engine
+        # and not yet released: `close` releases them.
+        self._held_scan_claims: set[tuple[str, str]] = set()
+        self._claims_lock = threading.Lock()
         self._driver = _GatedDriver(GraphDatabase.driver(
             uri, auth=(user, password),
             notifications_disabled_classifications=[NotificationDisabledClassification.HINT],
@@ -1378,8 +1471,10 @@ class GraphEngine:
         ))
 
     def close(self, timeout: float = CLOSE_WAIT_S) -> None:
-        """Refuse new sessions, wait up to `timeout` for open ones, then close
-        the driver (see `_GatedDriver`). Safe to call again after a timeout."""
+        """Release the full-scan claims still held, then refuse new sessions,
+        wait up to `timeout` for open ones, and close the driver (see
+        `_GatedDriver`). Safe to call again after a timeout."""
+        self._release_held_scan_claims()
         self._driver.close(timeout)
 
     def verify_connectivity(self) -> None:
@@ -1747,6 +1842,92 @@ class GraphEngine:
                 repo_id=repo_id, version=version,
             )
 
+    def claim_full_scan(
+        self, repo_id: str, owner: str, stale_s: float, replace: str | None = None
+    ) -> tuple[bool, str | None]:
+        """Claim the repository's full scan for `owner` (see dispatch
+        `_claim_full_scan`): (True, None) when nobody holds it, `owner`
+        already does, the holder's heartbeat is older than `stale_s`, or the
+        holder is `replace` (a process known to be gone); else (False, the
+        holder). (False, None) when the repository has no Repository node:
+        removed, so nothing to scan, and the claim doesn't create it again.
+        The first SET takes the node's write lock, so two processes' claims
+        are decided one after the other. Times are the database's clock, the
+        one every process shares."""
+        with self._driver.session() as session:
+            records = _run_records(
+                session,
+                "MATCH (r:Repository {repo_id: $repo_id}) SET r.scan_claim_lock = true REMOVE r.scan_claim_lock "
+                "WITH r, r.scan_owner AS prior, timestamp() - coalesce(r.scan_heartbeat, 0) AS age "
+                "WITH r, prior, age, "
+                "  (prior IS NULL OR prior = $owner OR prior = $replace OR age > $stale_ms) AS granted "
+                "FOREACH (_ IN CASE WHEN granted THEN [1] ELSE [] END | "
+                "  SET r.scan_owner = $owner, r.scan_heartbeat = timestamp()) "
+                "RETURN granted, prior, age",
+                repo_id=repo_id, owner=owner, stale_ms=int(stale_s * 1000), replace=replace,
+            )
+        if not records:
+            return False, None
+        record = records[0]
+        if not record["granted"]:
+            return False, record["prior"]
+        with self._claims_lock:
+            self._held_scan_claims.add((repo_id, owner))
+        if record["prior"] not in (None, owner, replace):
+            logger.warning(
+                "%s: took over the full scan of %s, silent for %d s (stopped or crashed)",
+                repo_id, record["prior"], record["age"] // 1000,
+            )
+        return True, None
+
+    def beat_full_scan(self, repo_id: str, owner: str) -> bool:
+        """Refresh `owner`'s full-scan claim heartbeat; whether it still holds
+        the claim (False once another process took it over, or the repository
+        was removed)."""
+        with self._driver.session() as session:
+            records = _run_records(
+                session,
+                "OPTIONAL MATCH (r:Repository {repo_id: $repo_id}) WHERE r.scan_owner = $owner "
+                "SET r.scan_heartbeat = timestamp() RETURN r IS NOT NULL AS held",
+                repo_id=repo_id, owner=owner,
+            )
+        return bool(records and records[0]["held"])
+
+    def release_full_scan(self, repo_id: str, owner: str) -> None:
+        """Drop `owner`'s full-scan claim, if it still holds it."""
+        with self._claims_lock:
+            self._held_scan_claims.discard((repo_id, owner))
+        with self._driver.session() as session:
+            _run(session, _RELEASE_FULL_SCAN, repo_id=repo_id, owner=owner)
+
+    def _release_held_scan_claims(self) -> None:
+        """At close, before new sessions are refused: drop every full-scan
+        claim this engine still holds (a scan cut short by a shutdown), so
+        the next process need not wait for its heartbeat to go stale. One
+        try each: a database that is away lets them lapse instead."""
+        with self._claims_lock:
+            held, self._held_scan_claims = self._held_scan_claims, set()
+        for repo_id, owner in held:
+            try:
+                with self._driver.session() as session:
+                    session.run(_RELEASE_FULL_SCAN, repo_id=repo_id, owner=owner).consume()
+            except Exception:
+                logger.warning("%s: could not release the full-scan claim while closing; it lapses", repo_id,
+                               exc_info=True)
+
+    def full_scan_holder(self, repo_id: str, stale_s: float) -> str | None:
+        """Who holds the repository's full-scan claim with a heartbeat at most
+        `stale_s` old, or None."""
+        with self._driver.session() as session:
+            records = _run_records(
+                session,
+                "MATCH (r:Repository {repo_id: $repo_id}) "
+                "WHERE r.scan_owner IS NOT NULL AND timestamp() - r.scan_heartbeat <= $stale_ms "
+                "RETURN r.scan_owner AS owner",
+                repo_id=repo_id, stale_ms=int(stale_s * 1000),
+            )
+        return records[0]["owner"] if records else None
+
     def read_resolver_config(self, repo_id: str) -> dict[str, dict]:
         """The resolver configuration fingerprints the repository's graph was
         built with, per language (see indexer/resolver_config.fingerprints);
@@ -1974,6 +2155,82 @@ class GraphEngine:
             )
             return {(record["label"], record["name"]): set(record["sources"]) for record in result or []}
 
+    def owning_service_state(self, repo_id: str) -> tuple[list[tuple[str, str, list[str]]], list[dict[str, Any]]]:
+        """What the owning-service pass (indexer/dispatch.py) wrote, for a
+        compose change to re-derive: every claimed Endpoint and datastore
+        node as (label, name, its claiming files), and every Endpoint
+        `CALLS` Service and Service `USES` datastore edge as {label, name
+        (the Endpoint or datastore), service, service_file, origins}."""
+        labels = ("Endpoint", *OWNING_SERVICE_TARGETS)
+        with self._driver.session() as session:
+            claims = _run_records(
+                session,
+                _union(_seek(label, "source", "IS NOT NULL") for label in labels)
+                + "WITH n WHERE n.file IS NULL "
+                "RETURN labels(n)[0] AS label, n.name AS name, coalesce(n.sources, [n.source]) AS sources",
+                repo_id=repo_id,
+            )
+            edges = _run_records(
+                session,
+                "MATCH (s:Service) USING INDEX SEEK s:Service(repo_id, name) "
+                "WHERE s.repo_id = $repo_id AND s.name IS NOT NULL "
+                "CALL (s) { "
+                "  MATCH (e:Endpoint)-[r:CALLS]->(s) RETURN 'Endpoint' AS label, e.name AS name, r.origins AS origins "
+                "  UNION "
+                "  MATCH (s)-[r:USES]->(d) WHERE " + " OR ".join(f"d:{label}" for label in OWNING_SERVICE_TARGETS)
+                + "  RETURN labels(d)[0] AS label, d.name AS name, r.origins AS origins "
+                "} "
+                "RETURN label, name, s.name AS service, s.file AS service_file, origins",
+                repo_id=repo_id,
+            )
+        return (
+            [(record["label"], record["name"], list(record["sources"])) for record in claims],
+            [dict(record) for record in edges],
+        )
+
+    def route_mount_state(
+        self, repo_id: str, names: list[str] | None = None
+    ) -> dict[str, tuple[list[str] | None, list[str] | None, list[str] | None]]:
+        """Module -> its (`route_mounts`, `route_exports`, `route_prefixes`)
+        (indexer/apis/routes.py MOUNT_PROPERTIES), for every Module of the
+        repository holding one of them, or only those named in `names`."""
+        test = "IN $names" if names is not None else "IS NOT NULL"
+        with self._driver.session() as session:
+            records = _run_records(
+                session,
+                "MATCH (m:Module) USING INDEX SEEK m:Module(repo_id, name) "
+                f"WHERE m.repo_id = $repo_id AND m.name {test} "
+                "AND (m.route_mounts IS NOT NULL OR m.route_exports IS NOT NULL OR m.route_prefixes IS NOT NULL) "
+                "RETURN m.name AS name, m.route_mounts AS mounts, m.route_exports AS exports, "
+                "m.route_prefixes AS prefixes",
+                repo_id=repo_id, names=names,
+            )
+        return {r["name"]: (r["mounts"], r["exports"], r["prefixes"]) for r in records}
+
+    def unclaim_owning_service_edges(self, repo_id: str, rows: list[dict[str, Any]]) -> None:
+        """Drop `origin` from each owning-service edge of `rows` ({label, name,
+        service, service_file, origin}, as `owning_service_state` lists the
+        edges), deleting an edge left with none."""
+        if not rows:
+            return
+        calls = [row for row in rows if row["label"] == "Endpoint"]
+        uses = [row for row in rows if row["label"] != "Endpoint"]
+        unclaim = (
+            "WITH r, row, [x IN coalesce(r.origins, [row.origin]) WHERE x <> row.origin] AS left "
+            "FOREACH (_ IN CASE WHEN size(left) = 0 THEN [1] ELSE [] END | DELETE r) "
+            "FOREACH (_ IN CASE WHEN size(left) > 0 THEN [1] ELSE [] END | SET r.origins = left)"
+        )
+        service = "(s:Service {repo_id: $repo_id, name: row.service, file: row.service_file})"
+        with self._driver.session() as session:
+            if calls:
+                _run(session, "UNWIND $rows AS row "
+                     f"MATCH (e:Endpoint {{repo_id: $repo_id, name: row.name}})-[r:CALLS]->{service} " + unclaim,
+                     repo_id=repo_id, rows=calls)
+            for label in sorted({row["label"] for row in uses}):
+                _run(session, "UNWIND $rows AS row "
+                     f"MATCH {service}-[r:USES]->(d:{label} {{repo_id: $repo_id, name: row.name}}) " + unclaim,
+                     repo_id=repo_id, rows=[row for row in uses if row["label"] == label])
+
     def delete_bare_modules(self, repo_id: str) -> int:
         """Delete this repo's `Module` nodes that have no file key at all (no
         `source_file`, `file` or `path`), with their edges, and return how
@@ -2198,8 +2455,8 @@ class GraphEngine:
         node writes leave as they were until now, so a pin's `@` flag
         (graph/schema.py `split_pin`) only ever sees one node's old keys
         with its old edges.
-        A node to `retract` loses its CALLS and IMPORTS edges, which those
-        pins linked under its old keys, in the same transaction, and stays
+        A node to `retract` loses its CALLS, IMPORTS and IMPLEMENTS edges
+        (MATCH_KEY_EDGE_TYPES), which those pins linked under its old keys, in the same transaction, and stays
         `mkeys_stale` until settle_match_keys: the batch writes them again
         under the new keys, the way it writes an added node's, and a batch
         that fails before then finds it stale and does it again. Each
@@ -2214,6 +2471,29 @@ class GraphEngine:
             "SET b.mkeys = row.mkeys, b.proj = row.proj, b.mkeys_stale = CASE WHEN row.retract THEN true END "
             f"WITH b, row WHERE row.retract MATCH ()-[r:{'|'.join(MATCH_KEY_EDGE_TYPES)}]->(b) DELETE r",
         )
+
+    def file_heir_open(self, repo_id: str, files: list[str]) -> dict[str, tuple[str, ...]]:
+        """Each of `files`' Module's `heir_open` (the open classes of its
+        file, see _owner_test), sorted; a Module without one is left out."""
+        with self._driver.session() as session:
+            rows = _run_records(
+                session,
+                "UNWIND $files AS f MATCH (m:Module {repo_id: $repo_id, name: f}) WHERE m.heir_open IS NOT NULL "
+                "RETURN m.name AS f, m.heir_open AS o",
+                repo_id=repo_id, files=files,
+            )
+            return {row["f"]: tuple(sorted(row["o"])) for row in rows or []}
+
+    def write_heir_open(self, repo_id: str, opens: dict[str, list[str]]) -> None:
+        """Write these files' Modules' `heir_open`, which a batch's pass-1
+        node writes leave as they were (see write_match_keys)."""
+        if opens:
+            with self._driver.session() as session:
+                _run(
+                    session,
+                    "UNWIND $rows AS row MATCH (m:Module {repo_id: $repo_id, name: row.f}) SET m.heir_open = row.o",
+                    repo_id=repo_id, rows=[{"f": f, "o": list(o)} for f, o in sorted(opens.items())],
+                )
 
     def settle_match_keys(self, repo_id: str, nodes: list[tuple[str, str, str, str]]) -> None:
         """Clear `mkeys_stale` (see write_match_keys) off these (label, name,
@@ -2344,12 +2624,14 @@ class GraphEngine:
         last_modified_at: str | None = None,
         last_modified_by: str | None = None,
         file: str | None = None,
+        owner: str = "",
     ) -> None:
         """Ratchet-merge git-derived recency onto a node: `created_at` only
         moves earlier and `last_modified_at` only moves later, so this is
         safe to call repeatedly and out of chronological order (e.g. across
         incremental batches). See `set_recency` for the plain-overwrite
-        variant used during reconciliation.
+        variant used during reconciliation, and `write_recency` for many
+        nodes in one statement.
 
         Both only annotate a node that already exists (MATCH, not MERGE): a
         commit also touches files that have no node (a README, an image, a
@@ -2361,35 +2643,16 @@ class GraphEngine:
         commit's author with an older one's.
 
         Pass `file` for Function/Class labels (whose nodes are MERGE-keyed
-        on (repo_id, name, file) — see _group_nodes_by_label) so this
+        on (repo_id, name, file, owner) — see _group_nodes_by_label) so this
         doesn't fall back to a bare-name match that could hit every
-        same-named function across every file in the repo at once. Omit it
-        for Module (whose `name` is already the unique file path).
+        same-named function across every file in the repo at once, and
+        `owner` ("" at the top level) so two same-named methods of one file
+        are told apart. Omit both for Module (whose `name` is already the
+        unique file path).
         """
-        merge_key = (
-            "{repo_id: $repo_id, name: $name, file: $file}" if file is not None else "{repo_id: $repo_id, name: $name}"
+        self.write_recency(
+            label, repo_id, [_recency_row(name, created_at, last_modified_at, last_modified_by, file, owner)]
         )
-        with self._driver.session() as session:
-            _run(
-                session,
-                f"MATCH (n:{label} {merge_key}) "
-                "SET n.created_at = CASE WHEN $created_at IS NULL THEN n.created_at "
-                "WHEN n.created_at IS NULL OR $created_at < n.created_at THEN $created_at "
-                "ELSE n.created_at END, "
-                "n.last_modified_at = CASE WHEN $last_modified_at IS NULL THEN n.last_modified_at "
-                "WHEN n.last_modified_at IS NULL OR $last_modified_at > n.last_modified_at THEN $last_modified_at "
-                "ELSE n.last_modified_at END, "
-                "n.last_modified_by = CASE "
-                "WHEN $last_modified_by IS NULL THEN n.last_modified_by "
-                "WHEN n.last_modified_at IS NULL OR $last_modified_at > n.last_modified_at THEN $last_modified_by "
-                "ELSE n.last_modified_by END",
-                repo_id=repo_id,
-                name=name,
-                file=file,
-                created_at=created_at,
-                last_modified_at=last_modified_at,
-                last_modified_by=last_modified_by,
-            )
 
     def set_recency(
         self,
@@ -2400,35 +2663,66 @@ class GraphEngine:
         last_modified_at: str | None = None,
         last_modified_by: str | None = None,
         file: str | None = None,
+        owner: str = "",
     ) -> None:
         """Overwrite recency from scratch — used only by the reconcile path,
         where the caller has just recomputed the authoritative value from a
         fresh full walk and must be able to move a value backward, not just
         forward (`stage_recency`'s ratchet deliberately can't).
 
-        `last_modified_by` is only included in the SET when not None, so a
+        `last_modified_by` is only set when not None, so a
         caller running with `git_recency_track_author` off (always passing
         `last_modified_by=None`) never nulls out a previously-tracked author.
 
         See `stage_recency` for why `file` matters for Function/Class labels.
         """
-        merge_key = (
-            "{repo_id: $repo_id, name: $name, file: $file}" if file is not None else "{repo_id: $repo_id, name: $name}"
+        self.write_recency(
+            label, repo_id, [_recency_row(name, created_at, last_modified_at, last_modified_by, file, owner)],
+            overwrite=True,
         )
-        set_clauses = ["n.created_at = $created_at", "n.last_modified_at = $last_modified_at"]
-        if last_modified_by is not None:
-            set_clauses.append("n.last_modified_by = $last_modified_by")
+
+    def write_recency(self, label: str, repo_id: str, rows: list[dict[str, Any]], overwrite: bool = False) -> None:
+        """`stage_recency` (or, with `overwrite`, `set_recency`) for many
+        nodes of `label` in one statement, applied in the order of `rows`.
+        Each row holds `name`, `created_at`, `last_modified_at` and
+        `last_modified_by` (`_recency_row`), and `file`: every row of one
+        call has one (a Function or Class, matched with its `owner`, ""
+        when absent, on the unique (repo_id, name, file, owner) index) or
+        none (a Module)."""
+        if not rows:
+            return
+        if any(row["file"] is not None for row in rows) and any(row["file"] is None for row in rows):
+            raise ValueError("write_recency rows must all have a file or all have none")
+        merge_key = (
+            "{repo_id: $repo_id, name: row.name, file: row.file, owner: coalesce(row.owner, '')}"
+            if rows[0]["file"] is not None
+            else "{repo_id: $repo_id, name: row.name}"
+        )
         with self._driver.session() as session:
             _run(
                 session,
-                f"MATCH (n:{label} {merge_key}) "
-                f"SET {', '.join(set_clauses)}",
+                f"UNWIND $rows AS row MATCH (n:{label} {merge_key}) "
+                + (_SET_RECENCY if overwrite else _STAGE_RECENCY),
                 repo_id=repo_id,
-                name=name,
-                file=file,
-                created_at=created_at,
-                last_modified_at=last_modified_at,
-                last_modified_by=last_modified_by,
+                rows=rows,
+            )
+
+    def upsert_modifies(self, repo_id: str, rows: list[tuple[str, str]]) -> None:
+        """MERGE a Commit -MODIFIES-> Module edge for each (commit SHA,
+        module path) of `rows` in one statement: `upsert_relationship`'s
+        MATCH-MATCH-MERGE for many rows, so an edge to a Module the graph
+        does not hold is skipped."""
+        if not rows:
+            return
+        with self._driver.session() as session:
+            _run(
+                session,
+                "UNWIND $rows AS row "
+                "MATCH (a:Commit {repo_id: $repo_id, name: row[0]}) "
+                "MATCH (b:Module {repo_id: $repo_id, name: row[1]}) "
+                "MERGE (a)-[:MODIFIES]->(b)",
+                repo_id=repo_id,
+                rows=[list(row) for row in rows],
             )
 
     def delete_commits(self, repo_id: str, shas: list[str]) -> None:

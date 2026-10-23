@@ -22,6 +22,7 @@ const grab = (startRe, endMarker) => {
 const src = [
   grab(/^function escapeHtmlVal\(/m, "}"),
   grab(/^let REGISTERED_REPO_IDS = /m, "\n"),
+  grab(/^function showNeo4jDown\(/m, "\n}"),
   grab(/^async function populateRealRepos\(/m, "\n}"),
   grab(/^async function onRepoSelectChange\(/m, "\n}"),
 ].join("\n");
@@ -45,12 +46,13 @@ const mkSelect = () => {
 const els = {};
 let onChange = null;  // the page's change listener, wired once api exists
 let registry = [];
+let graphUnavailable = null;
 const storage = new Map();
 const globals = {
   document: { getElementById: id => els[id] || null },
   fetch: async url => {
     if (url !== "/api/repos") throw new Error("unexpected " + url);
-    return { ok: true, json: async () => ({ repos: registry }) };
+    return { ok: true, json: async () => ({ repos: registry, graph_unavailable: graphUnavailable }) };
   },
   localStorage: {
     getItem: k => (storage.has(k) ? storage.get(k) : null),
@@ -78,6 +80,8 @@ const fresh = () => {
   els.repoSelect = mkSelect();
   els.repoSelect.innerHTML = grab(/<select id="repoSelect"/, "</select>");
   els.repoEmptyState = { hidden: true };
+  els.neo4jDownState = { hidden: true, textContent: "" };
+  graphUnavailable = null;
   storage.clear();
 };
 const values = () => els.repoSelect.options.map(o => o.value);
@@ -159,6 +163,20 @@ const values = () => els.repoSelect.options.map(o => o.value);
   // 6. The call to action says how to register.
   const cta = grab(/<div id="repoEmptyState"/, "</div>");
   check("the call to action names the register command", /devgraph register &lt;path&gt;/.test(cta), cta);
+
+  // Neo4j down: the registry still lists every repository, and one banner says why.
+  fresh();
+  registry = [repo("alpha"), repo("beta")];
+  graphUnavailable = "Neo4j isn't reachable at bolt://127.0.0.1:7699; start Neo4j";
+  await api.populateRealRepos(false);
+  check("with Neo4j down the registered repositories still list",
+    JSON.stringify(values()) === '["__all__","alpha","beta"]', JSON.stringify(values()));
+  check("...and the banner says Neo4j isn't reachable",
+    els.neo4jDownState.hidden === false && els.neo4jDownState.textContent.startsWith("Neo4j isn't reachable"),
+    JSON.stringify(els.neo4jDownState));
+  graphUnavailable = null;
+  await api.populateRealRepos(false);
+  check("...and goes once Neo4j answers", els.neo4jDownState.hidden === true, JSON.stringify(els.neo4jDownState));
 
   if (failures) { console.log(`\n${failures} check(s) failed`); process.exit(1); }
   console.log("\nall checks passed");
