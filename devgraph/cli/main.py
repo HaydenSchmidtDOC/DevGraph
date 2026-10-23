@@ -3653,18 +3653,18 @@ def self_test(
     for rid in repo_ids:
         console.print(f"\n[bold]Checking: {escape(str(rid), before_tag=True)}[/bold]")
 
-        # 1. Every Module node has a file property
+        # 1. Every Module node has a source_file property (Modules carry no `file`)
         try:
             bad = engine.run_cypher(
-                "MATCH (n:Module {repo_id: $rid}) WHERE n.file IS NULL "
+                "MATCH (n:Module {repo_id: $rid}) WHERE n.source_file IS NULL "
                 "RETURN count(*) AS c", {"rid": rid}
             )
             count = bad[0]["c"] if bad else 0
             if count:
-                console.print(f"  [red][X] {count} Module(s) missing 'file' property[/red]")
+                console.print(f"  [red][X] {count} Module(s) missing 'source_file' property[/red]")
                 all_passed = False
             else:
-                console.print("  [green][OK][/green] All Module nodes have 'file'")
+                console.print("  [green][OK][/green] All Module nodes have 'source_file'")
         except Exception as e:
             console.print(f"  [red][X] Check failed:[/red] {escape(str(e))}")
             all_passed = False
