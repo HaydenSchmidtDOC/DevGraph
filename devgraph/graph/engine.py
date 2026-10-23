@@ -1458,15 +1458,22 @@ class GraphEngine:
         if connection_timeout_s is not None:
             limits["connection_timeout"] = connection_timeout_s
             limits["connection_acquisition_timeout"] = connection_timeout_s
-        # Hint notifications are off: a hinted index an older database hasn't
-        # built yet (init_schema creates it) would log one per query.
         # (repo_id, owner) of the full-scan claims taken through this engine
         # and not yet released: `close` releases them.
         self._held_scan_claims: set[tuple[str, str]] = set()
         self._claims_lock = threading.Lock()
+        # Hint notifications are off: a hinted index an older database hasn't
+        # built yet (init_schema creates it) would log one per query.
+        # Unrecognized ones too: queries read optional properties (proj, mkeys,
+        # extractor, ...) that a graph may never have been written with, and
+        # each read would log the whole query as a "property key does not
+        # exist" warning on every scan.
         self._driver = _GatedDriver(GraphDatabase.driver(
             uri, auth=(user, password),
-            notifications_disabled_classifications=[NotificationDisabledClassification.HINT],
+            notifications_disabled_classifications=[
+                NotificationDisabledClassification.HINT,
+                NotificationDisabledClassification.UNRECOGNIZED,
+            ],
             **limits,
         ))
 
