@@ -494,3 +494,19 @@ def test_class_field_arrow_functions_in_every_dialect():
         assert {("Function", "render"), ("Function", "close")} <= {(n.label, n.name) for n in result.nodes}, path
         rels = {(r.from_name, r.rel_type, r.to_name) for r in result.relationships}
         assert {("Panel", "CONTAINS", "render"), ("render", "CALLS", "close")} <= rels, path
+
+
+def test_export_type_star_is_not_a_syntax_error(caplog):
+    """TS 5.0's `export type * from` re-exports like `export * from`, with no
+    syntax-error warning; a real syntax error still warns."""
+    source = 'export type * from "./a";\nexport type * as ns from "./b";\n'
+    with caplog.at_level("WARNING"):
+        typed = extract_js_file(source, "src/i.ts", "r")
+    assert "Syntax errors" not in caplog.text
+    plain = extract_js_file(source.replace("type ", ""), "src/i.ts", "r")
+    assert typed.relationships == plain.relationships
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        extract_js_file("export type * from;\nconst = ;\n", "src/j.ts", "r")
+    assert "Syntax errors" in caplog.text

@@ -129,6 +129,31 @@ def _make_parser(language: Language) -> Parser:
     return Parser(language)
 
 
+def _is_type_star_export(node: Node) -> bool:
+    """An ERROR that is only the `type` of TS 5.0's `export type * [as ns] from`,
+    which tree-sitter-typescript 0.23 doesn't parse; the rest of the statement
+    parses as `export * [as ns] from`, so nothing is lost."""
+    after = node.next_sibling
+    return (
+        node.text == b"type"
+        and node.parent is not None
+        and node.parent.type == "export_statement"
+        and after is not None
+        and after.type in ("*", "namespace_export")
+    )
+
+
+def _has_syntax_error(node: Node) -> bool:
+    """Like `node.has_error`, but not for `export type *` alone (see above)."""
+    if not node.has_error:
+        return False
+    if node.is_missing:
+        return True
+    if node.type == "ERROR":
+        return not _is_type_star_export(node)
+    return any(_has_syntax_error(child) for child in node.children)
+
+
 def _language_for_extension(suffix: str) -> Language:
     suffix = suffix.lower()
     if suffix in (".ts", ".mts", ".cts"):
@@ -1641,7 +1666,7 @@ def extract_js_file(
     tree = parser.parse(source_bytes)
     root = tree.root_node
 
-    if root.has_error:
+    if _has_syntax_error(root):
         logger.warning(f"Syntax errors while parsing {file_path}; extracting best-effort result")
 
     module_node = GraphNode(
