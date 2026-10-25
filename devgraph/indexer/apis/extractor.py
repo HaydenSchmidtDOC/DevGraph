@@ -188,7 +188,7 @@ class _Routes:
         self.imports: set[str] = set()  # "FastAPI", "Flask": the frameworks the file imports
         self.decorated: list[tuple[Node, str, str]] = []  # (decorator call, handler, handler owner)
         self.calls: list[Node] = []
-        self.local: dict[str, tuple[str, str, str | None]] = {}  # router -> (mounted on, framework, prefix)
+        self.local: dict[str, list[tuple[str, str, str | None]]] = {}  # router -> its (mounted on, framework, prefix)
         # Iterative, in source order: a deeply nested expression (3,000 `+`
         # terms) is read on any thread's stack.
         pending: list[tuple[Node, str, str | None, str]] = [(root, "Module", None, "")]
@@ -317,24 +317,25 @@ class _Routes:
     def _is_app(self, receiver: str) -> bool:
         return receiver in self.apps or (receiver == "app" and receiver not in self.bindings)
 
-    def prefix(self, receiver: str, seen: frozenset = frozenset()) -> str | None:
-        """The full prefix of an app's or router's routes: "" for an app's,
-        a router's own joined to those of the mounts the file shows
-        (`local`) up to an app; None when the file mounts it on no app, or
-        its own prefix is not a literal (its routes are then under none, and
-        no mount renames them: `exports` gives none)."""
+    def prefixes(self, receiver: str, seen: frozenset = frozenset()) -> set[str]:
+        """The full prefixes of an app's or router's routes: "" for an
+        app's, a router's own joined to those of each chain of mounts the
+        file shows (`local`) up to an app; none when the file mounts it on
+        no app, or its own prefix is not a literal (its routes are then
+        under none, and no mount renames them: `exports` gives none)."""
         if self._is_app(receiver):
-            return ""
+            return {""}
         own = self.own.get(receiver, "")
-        if own is None or receiver not in self.local or receiver in seen:
-            return None
-        parent, framework, mounted = self.local[receiver]
-        above = self.prefix(parent, seen | {receiver})
-        if above is None:
-            return None
-        if framework == "Flask":
-            return join_route(above, own if mounted is None else mounted)
-        return join_route(above, mounted or "", own)
+        if own is None or receiver in seen:
+            return set()
+        found = set()
+        for parent, framework, mounted in self.local.get(receiver, ()):
+            for above in self.prefixes(parent, seen | {receiver}):
+                if framework == "Flask":
+                    found.add(join_route(above, own if mounted is None else mounted))
+                else:
+                    found.add(join_route(above, mounted or "", own))
+        return found
 
     def exports(self, receiver: str) -> list[tuple[str, str]]:
         """(export name, the prefix its routes are under) of a router
@@ -479,7 +480,7 @@ class APIExtractor:
         foreign = []
         for framework, parent, prefix, router in routes.mount_calls():
             if router.type == "identifier" and _text(router, source) in routes.own:
-                routes.local[_text(router, source)] = (parent, framework, prefix)
+                routes.local.setdefault(_text(router, source), []).append((parent, framework, prefix))
             else:
                 foreign.append((framework, parent, prefix, router))
         django = routes.django_routes()
@@ -491,11 +492,10 @@ class APIExtractor:
         deferred: dict[str, set[str]] = {}
         kept: set[str] = set()
         for framework, method, path, handler, owner, receiver in routes.decorator_routes():
-            above = routes.prefix(receiver)
-            if above is not None:
-                full = path if above == "" else join_route(above, path)
-            else:
-                # A router whose own prefix is not a literal: under none.
+            aboves = routes.prefixes(receiver)
+            fulls = sorted(path if above == "" else join_route(above, path) for above in aboves)
+            if not aboves:
+                # Mounted where the file doesn't show: under its own prefix (none when not a literal).
                 full = join_route(routes.own.get(receiver) or "", path)
                 own = unmounted_endpoint(method, full, filename)
                 if exports := routes.exports(receiver):
@@ -507,8 +507,10 @@ class APIExtractor:
                     )
                 else:
                     kept.add(own)
-            endpoint = self._add(result, framework, method, full, handler, filename, "handler", above is not None)
-            result.relationships.extend(_pinned_implements(endpoint, handler, filename, owner))
+                fulls = [full]
+            for full in fulls:
+                endpoint = self._add(result, framework, method, full, handler, filename, "handler", bool(aboves))
+                result.relationships.extend(_pinned_implements(endpoint, handler, filename, owner))
         result.route_exports = sorted(
             entry for own, entries in deferred.items() if own not in kept for entry in entries
         ) or None
@@ -520,10 +522,9 @@ class APIExtractor:
             export, files = target
             if framework == "Flask" and prefix is not None:
                 export += REPLACED
-            above = routes.prefix(parent)
-            if above is not None:
-                route_mounts.add(mount_entry("", join_route(above, prefix or ""), export, files))
-            else:
+            aboves = routes.prefixes(parent)
+            route_mounts |= {mount_entry("", join_route(above, prefix or ""), export, files) for above in aboves}
+            if not aboves:
                 route_mounts |= {
                     mount_entry(name, join_route(under, prefix or ""), export, files)
                     for name, under in routes.exports(parent)

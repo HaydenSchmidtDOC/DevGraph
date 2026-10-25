@@ -337,3 +337,32 @@ def test_an_unmounted_route_sharing_an_endpoint_with_an_exported_one_stays_unmou
     result = _extract(code, "r.py")
     assert _names(code, "r.py") == ["GET ?/x (r.py)"]
     assert result.route_exports is None
+
+
+def test_a_router_mounted_twice_in_one_file_has_a_route_per_mount():
+    code = """
+        from fastapi import FastAPI, APIRouter
+        from .users import router as users_router
+
+        app = FastAPI()
+        api = APIRouter(prefix="/items")
+
+        @api.get("/{item_id}")
+        def get_item(item_id: int):
+            pass
+
+        app.include_router(api, prefix="/v1")
+        app.include_router(api, prefix="/v2")
+        v = APIRouter()
+        v.include_router(users_router, prefix="/u")
+        app.include_router(v, prefix="/a")
+        app.include_router(v, prefix="/b")
+    """
+    assert _names(code, "svc/main.py") == [
+        "GET /v1/items/{item_id}",
+        "GET /v2/items/{item_id}",
+    ]
+    # A router mounted twice mounts another file's router at both prefixes.
+    assert [
+        entry[:2] for entry in _split(_extract(code, "svc/main.py").route_mounts)
+    ] == [("", "/a/u"), ("", "/b/u")]
