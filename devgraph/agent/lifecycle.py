@@ -271,15 +271,6 @@ def has_tray_holders() -> bool:
     return len(_live_holder_pids()) > 0
 
 
-def clear_tray_holders() -> None:
-    """Wipe all recorded holders, e.g. before a forced 'devgraph tray stop'."""
-    holders_dir = _holders_dir()
-    if not holders_dir.exists():
-        return
-    for marker in holders_dir.iterdir():
-        marker.unlink(missing_ok=True)
-
-
 def _start_lock_path() -> Path:
     return tray_pid_path().parent / "tray_start.lock"
 

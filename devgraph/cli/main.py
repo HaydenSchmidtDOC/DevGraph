@@ -569,10 +569,10 @@ def tray_stop() -> None:
     Every connected MCP client's server process holds a "hold" on the tray
     (see devgraph/agent/lifecycle.py) so a single client disconnecting
     doesn't stop indexing for the others — this command overrides that and
-    stops it outright, clearing all recorded holders in the process.
+    stops it outright. The holds are kept: 'devgraph update' stops and
+    starts the agent under sessions that stay open and never register again.
     """
     pid = lifecycle.read_tray_pid()
-    lifecycle.clear_tray_holders()
     if pid is None:
         console.print("[yellow]Tray app is not running[/yellow] (no live agent on record)")
         return
