@@ -55,11 +55,45 @@ def test_dockerfile_fallback_is_resolved_in_a_nested_compose_file():
               dockerfile: ingestion/Dockerfile
     """
     assert _context(compose, "services/compose.yml") == "services/ingestion"
-    # Another context than the compose file's folder is the service's own.
+    # A Dockerfile without a folder leaves the context the service's own.
     assert (
-        _context(compose.replace("context: .", "context: .."), "services/compose.yml")
-        == ""
+        _context(
+            compose.replace("ingestion/Dockerfile", "Dockerfile"),
+            "services/compose.yml",
+        )
+        == "services"
     )
+
+
+def test_dockerfile_fallback_applies_to_any_shared_context():
+    """`context: ..` one level down with per-service Dockerfiles: each
+    service owns its Dockerfile's folder, not the whole repository, so one
+    service's datastores never go to another."""
+    compose = """\
+        services:
+          api:
+            build:
+              context: ..
+              dockerfile: services/api/Dockerfile
+          worker:
+            build:
+              context: ..
+              dockerfile: services/worker/Dockerfile
+          agent:
+            build:
+              context: ..
+              dockerfile: Dockerfile
+    """
+    services = (
+        ContainerExtractor("repo")
+        .extract_from_compose_file(textwrap.dedent(compose), "deploy/compose.yml")
+        .services
+    )
+    assert {s.name: s.properties["build_context"] for s in services} == {
+        "api": "services/api",
+        "worker": "services/worker",
+        "agent": "",
+    }
 
 
 def test_a_root_context_owns_every_file_no_deeper_context_claims():

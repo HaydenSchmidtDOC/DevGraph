@@ -287,12 +287,12 @@ class ContainerExtractor:
         Handles:
         - shorthand ('build: ./services/api')
         - long form with a real context ('build: {context: ./services/api}')
-        - long form where context is the compose file's own folder but the
-          dockerfile points into a subdirectory ('build: {context: .,
-          dockerfile: services/ingestion/Dockerfile}') — a common compose
-          pattern (single shared build context, per-service Dockerfile)
-          where the actual service source lives at the Dockerfile's own
-          directory (relative to the context), not at the context itself.
+        - long form where the dockerfile points into a subdirectory of the
+          context ('build: {context: .., dockerfile:
+          services/ingestion/Dockerfile}') — a common compose pattern
+          (single shared build context, per-service Dockerfile) where the
+          actual service source lives at the Dockerfile's own directory
+          (relative to the context), not at the context itself.
 
         Returns None for services with no `build` key (image-only services
         like databases/brokers — those correctly have no source directory of
@@ -312,10 +312,10 @@ class ContainerExtractor:
         if context_dir is None:
             return None
 
-        # The compose file's own folder as a shared context: the Dockerfile's
-        # own directory, which is where the per-service source lives.
+        # A shared context with a per-service Dockerfile in a folder of it:
+        # the Dockerfile's own directory, which is where the service's source lives.
         dockerfile = build_config.get("dockerfile")
-        if context_dir == compose_dir and isinstance(dockerfile, str):
+        if isinstance(dockerfile, str):
             dockerfile_dir = dockerfile.replace("\\", "/").rsplit("/", 1)
             if len(dockerfile_dir) == 2:
                 resolved = ContainerExtractor._resolve_build_dir(context_dir, dockerfile_dir[0])
