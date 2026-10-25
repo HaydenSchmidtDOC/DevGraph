@@ -206,9 +206,13 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: CommonJS exports and functions declared in blocks. The datastore
 #: extractor also skips more test folders (`spec/`, `e2e/`, `__mocks__/`,
 #: `testdata/`, `fixtures/`, .NET `UnitTests`/`IntegrationTests`;
-#: devgraph/test_paths.py `TEST_DIR`).
+#: devgraph/test_paths.py `TEST_DIR`); 20: a Django class-based view's
+#: route (`View.as_view()`, DRF's `APIView.as_view()` and a ViewSet's
+#: `as_view({...})`) IMPLEMENTS its Class and the request-handling methods
+#: of it (apis/extractor.py `_django_implements`), not a Function of the
+#: class's name.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 19
+INDEX_FORMAT = 20
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -2038,9 +2042,10 @@ def _docs_note_referrers(
 
 def _handler_stub_referrers(engine: GraphEngine, repo_id: str, added: set[tuple[str, str]]) -> set[str]:
     """Route files whose Endpoint IMPLEMENTS a handler that only existed as
-    a file-less stub until the batch added a real Function of that name.
-    One graph lookup, only when the batch added Functions."""
-    functions = sorted(name for label, name in added if label == "Function")
+    a file-less stub until the batch added a real Function (or, for a
+    Django class-based view, Class) of that name. One graph lookup, only
+    when the batch added Functions or Classes."""
+    functions = sorted({name for label, name in added if label in ("Function", "Class")})
     if not functions:
         return set()
     return engine.find_handler_stub_sources(repo_id, functions)

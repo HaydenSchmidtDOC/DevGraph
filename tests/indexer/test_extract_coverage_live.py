@@ -11,7 +11,7 @@ import pytest
 
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan, index_paths
-from devgraph.mcp.tools import find_callers, list_endpoints
+from devgraph.mcp.tools import describe_node, find_callers, list_endpoints, trace_request_flow
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 
@@ -139,7 +139,9 @@ def test_list_endpoints_reports_python_routes_as_written(engine, repo_id, tmp_pa
         ("POST /users", "FastAPI"),
     ]
     by_name = {row["name"]: row for row in rows}
-    assert by_name["POST /users"]["handlers"] == [{"name": "create_user", "file": "api/main.py", "owner": ""}]
+    assert by_name["POST /users"]["handlers"] == [
+        {"label": "Function", "name": "create_user", "file": "api/main.py", "owner": ""}
+    ]
 
 
 SERVICE = """\
@@ -254,6 +256,142 @@ def test_a_django_view_is_the_imported_modules(engine, repo_id, tmp_path):
     index_paths(engine, repo_id, tmp_path, {views})
     incremental_equals_fresh(engine, repo_id, tmp_path)
     assert ("* search/", "shop/views.py") in _implemented(engine, repo_id)
+
+
+CBV_URLS = """\
+    from django.urls import path
+
+    from . import views
+
+    urlpatterns = [path("orders/", views.OrderView.as_view())]
+"""
+
+ORDER_VIEW = """\
+    class BaseView:
+        def head(self, request):
+            return None
+
+
+    class OrderView(BaseView):
+        def get(self, request):
+            return load_orders()
+
+        def render(self):
+            return None
+
+
+    def load_orders():
+        return []
+"""
+
+
+def _cbv_handlers(engine, repo_id):
+    return sorted(
+        (row["label"], row["name"], row["file"] or "", row["owner"])
+        for row in engine.run_cypher(
+            "MATCH (:Endpoint {repo_id: $r, name: '* orders/'})-[:IMPLEMENTS]->(f) "
+            "RETURN labels(f)[0] AS label, f.name AS name, f.file AS file, f.owner AS owner",
+            {"r": repo_id},
+        )
+    )
+
+
+def test_a_class_based_view_is_its_class(engine, repo_id, tmp_path):
+    write(tmp_path, "shop/urls.py", CBV_URLS)
+    write(tmp_path, "shop/views.py", ORDER_VIEW)
+    # A same-named class elsewhere is not the view.
+    write(tmp_path, "other/views.py", "class OrderView:\n    def get(self, request):\n        return 1\n")
+    _scan(engine, repo_id, tmp_path)
+    assert _cbv_handlers(engine, repo_id) == [
+        ("Class", "OrderView", "shop/views.py", ""),
+        ("Function", "OrderView", "", None),  # the route's stub
+        ("Function", "get", "shop/views.py", "OrderView"),
+        # Inherited from a class of its file.
+        ("Function", "head", "shop/views.py", "BaseView"),
+    ]
+
+    # describe_node answers with the Class: the stub folds into it.
+    found = describe_node(engine, repo_id, "OrderView", file="shop/views.py")
+    assert found["status"] == "found"
+    assert found["node"]["label"] == "Class"
+    assert found["incoming"]["IMPLEMENTS"]["results"] == [{"label": "Endpoint", "name": "* orders/"}]
+    both = describe_node(engine, repo_id, "OrderView")
+    assert both["status"] == "ambiguous"
+    assert sorted((c["label"], c.get("file")) for c in both["candidates"]) == [
+        ("Class", "other/views.py"), ("Class", "shop/views.py"),
+    ]
+    assert not any(c.get("unresolved_handler") for c in both["candidates"])
+
+    # trace_request_flow lists the Class once, no stub, and goes on to the calls.
+    flow = trace_request_flow(engine, repo_id, "* orders/")
+    names = sorted((c["name"], c["labels"][0]) for c in flow["components"])
+    assert ("OrderView", "Class") in names and ("OrderView", "Function") not in names
+    assert {"type": "IMPLEMENTS", "from": "* orders/", "to": "OrderView"} in flow["edges"]
+    assert {"type": "CALLS", "from": "get", "to": "load_orders"} in flow["edges"]
+
+    # list_endpoints names the Class and its HTTP method handlers.
+    (endpoint,) = list_endpoints(engine, repo_id)["results"]
+    assert endpoint["handlers"] == [
+        {"label": "Class", "name": "OrderView", "file": "shop/views.py", "owner": ""},
+        {"label": "Function", "name": "head", "file": "shop/views.py", "owner": "BaseView"},
+        {"label": "Function", "name": "get", "file": "shop/views.py", "owner": "OrderView"},
+    ]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_a_moved_or_renamed_class_based_view_equals_fresh(engine, repo_id, tmp_path):
+    from devgraph.indexer.dispatch import remove_paths
+
+    urls = write(tmp_path, "shop/urls.py", CBV_URLS)
+    views = write(tmp_path, "shop/views.py", ORDER_VIEW)
+    _scan(engine, repo_id, tmp_path)
+
+    # Renamed: the route's name no longer resolves, only the stub is left.
+    write(tmp_path, "shop/views.py", ORDER_VIEW.replace("OrderView", "OrderPage"))
+    index_paths(engine, repo_id, tmp_path, {views})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+    assert _cbv_handlers(engine, repo_id) == [("Function", "OrderView", "", None)]
+
+    # The route follows the rename.
+    write(tmp_path, "shop/urls.py", CBV_URLS.replace("OrderView", "OrderPage"))
+    index_paths(engine, repo_id, tmp_path, {urls})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+    assert ("Class", "OrderPage", "shop/views.py", "") in _cbv_handlers(engine, repo_id)
+
+    # Back to its old name, in a views package whose __init__ the route's import names.
+    views.unlink()
+    package = write(tmp_path, "shop/views/__init__.py", ORDER_VIEW)
+    remove_paths(engine, repo_id, tmp_path, {views})
+    index_paths(engine, repo_id, tmp_path, {package})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+    write(tmp_path, "shop/urls.py", CBV_URLS)
+    index_paths(engine, repo_id, tmp_path, {urls})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+    assert _cbv_handlers(engine, repo_id) == [
+        ("Class", "OrderView", "shop/views/__init__.py", ""),
+        ("Function", "OrderView", "", None),
+        ("Function", "get", "shop/views/__init__.py", "OrderView"),
+        ("Function", "head", "shop/views/__init__.py", "BaseView"),
+    ]
+
+    # Its module goes and comes back, the route unchanged: relinked.
+    package.unlink()
+    remove_paths(engine, repo_id, tmp_path, {package})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+    assert _cbv_handlers(engine, repo_id) == [("Function", "OrderView", "", None)]
+    write(tmp_path, "shop/views.py", ORDER_VIEW)
+    index_paths(engine, repo_id, tmp_path, {views})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+    assert ("Function", "get", "shop/views.py", "OrderView") in _cbv_handlers(engine, repo_id)
+
+    # A method gained and lost.
+    write(tmp_path, "shop/views.py", ORDER_VIEW.replace("def render(self)", "def post(self, request)"))
+    index_paths(engine, repo_id, tmp_path, {views})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+    assert ("Function", "post", "shop/views.py", "OrderView") in _cbv_handlers(engine, repo_id)
+    write(tmp_path, "shop/views.py", ORDER_VIEW)
+    index_paths(engine, repo_id, tmp_path, {views})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
 
 
 def test_a_deep_route_file_of_a_service_scans(engine, repo_id, tmp_path):

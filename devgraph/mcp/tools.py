@@ -399,17 +399,21 @@ def _fold_target(var: str, out: str = "folded") -> str:
     """Cypher `CALL` binding `out` to the real Function the route handler stub
     `var` provably stands for, or to null: for any node that is no handler stub
     (a file-less Function), and for a stub that stands for no single Function.
-    A stub stands for the one Function of its name its endpoint's handler
-    reference resolved to (both implement one Endpoint), or, when it resolved
-    to none, the one Function of its name in the route files that claim the
-    stub (its `sources`). Always one row: the aggregation has no grouping key.
-    Tools answer with that Function and leave the stub out; a stub that stands
-    for none stays visible (an unresolved handler)."""
+    A stub stands for the one Function (or Class: a Django class-based view's)
+    of its name its endpoint's handler reference resolved to (both implement
+    one Endpoint), or, when it resolved to none, the one Function of its name
+    in the route files that claim the stub (its `sources`). Always one row:
+    the aggregation has no grouping key. Tools answer with that Function or
+    Class and leave the stub out; a stub that stands for none stays visible
+    (an unresolved handler)."""
+    twin = f"twin.repo_id = {var}.repo_id AND twin.name = {var}.name AND twin.file <> ''"
+    linked = f"EXISTS {{ ({var})<-[:IMPLEMENTS]-(:Endpoint)-[:IMPLEMENTS]->(twin) }}"
     return (
         f"CALL ({var}) {{ WITH {var} WHERE {var}:Function AND coalesce({var}.file, '') = '' "
-        f"MATCH (twin:Function) WHERE twin.repo_id = {var}.repo_id AND twin.name = {var}.name AND twin.file <> '' "
-        f"WITH twin, EXISTS {{ ({var})<-[:IMPLEMENTS]-(:Endpoint)-[:IMPLEMENTS]->(twin) }} AS linked, "
-        f"twin.file IN coalesce({var}.sources, []) AS local "
+        f"CALL ({var}) {{ MATCH (twin:Function) WHERE {twin} RETURN twin "
+        f"UNION MATCH (twin:Class) WHERE {twin} AND {linked} RETURN twin }} "
+        f"WITH twin, {linked} AS linked, "
+        f"twin:Function AND twin.file IN coalesce({var}.sources, []) AS local "
         "WITH collect(CASE WHEN linked THEN twin END) AS linked, collect(CASE WHEN local THEN twin END) AS local "
         f"RETURN CASE WHEN size(linked) = 1 THEN linked[0] WHEN size(linked) = 0 AND size(local) = 1 THEN local[0] "
         f"END AS {out} }}\n"
@@ -600,10 +604,10 @@ RETURN dir, rel, total, refs
 """
 
 
-#: The handler stubs that stand for the Function `$id` (`_fold_target`):
-#: describe_node lists their relationships as that Function's.
+#: The handler stubs that stand for the Function or Class `$id` (`_fold_target`):
+#: describe_node lists their relationships as that node's.
 _FOLDED_STUBS = f"""
-MATCH (real:Function) WHERE elementId(real) = $id
+MATCH (real) WHERE elementId(real) = $id AND (real:Function OR real:Class)
 MATCH (s:Function) WHERE s.repo_id = real.repo_id AND s.name = real.name AND coalesce(s.file, '') = ''
 {_fold_target("s")}WITH s, folded WHERE folded = real
 RETURN elementId(s) AS id
@@ -1080,7 +1084,7 @@ def describe_node(
     properties, properties_truncated = _visible_properties(row["properties"])
     node = {**_unresolved_marked(_node_ref(row)), "properties": properties, "properties_truncated": properties_truncated}
     ids = [row["id"]]
-    if row["label"] == "Function" and row.get("file"):
+    if row["label"] in ("Function", "Class") and row.get("file"):
         stubs, _ = _read(engine, _FOLDED_STUBS, {"id": row["id"]}, _DESCRIBE_MAX_CANDIDATES)
         ids += [stub["id"] for stub in stubs]
     groups, groups_truncated = _read(
@@ -2336,14 +2340,15 @@ def _endpoint_row(row: dict[str, Any]) -> dict[str, Any]:
     """A list_endpoints result: an Endpoint's name split into its method and
     path, `mounted` False for a route under a prefix its file doesn't know
     (`"<METHOD> ?<path> (<file>)"`, whose path is the route's own). Its
-    handlers are the Functions it IMPLEMENTS that have a file; one that
-    resolved to none is its file-less stub, with file and owner None."""
+    handlers are the Functions (and a Django class-based view's Class) it
+    IMPLEMENTS that have a file; one that resolved to none is its file-less
+    stub, with file and owner None."""
     method, _, rest = row["name"].partition(" ")
     mounted = not rest.startswith("?")
     path = rest if mounted else rest[1:].rsplit(" (", 1)[0]
     path = path if path.startswith("/") else "/" + path  # a Django pattern has no leading "/"
     handlers = [h for h in row["handlers"] if h["file"]] or [
-        {"name": h["name"], "file": None, "owner": None} for h in row["handlers"]
+        {"label": h["label"], "name": h["name"], "file": None, "owner": None} for h in row["handlers"]
     ]
     return {
         "name": row["name"], "method": method, "path": path, "mounted": mounted, "framework": row["framework"],
@@ -2382,7 +2387,8 @@ def list_endpoints(
     Returns:
         {count, results, truncated}, each result {name, method, path (always with a
         leading "/", a Django pattern's added), mounted,
-        framework, files (the files routing it), handlers ({name, file, owner}),
+        framework, files (the files routing it), handlers ({label, name, file, owner}:
+        a Function, or a Django class-based view's Class and its HTTP method handlers),
         services (the compose services it CALLS), repo_id}, ordered by name;
         past `LIST_ROW_LIMIT` matches it is truncated, with a notice
 
@@ -2420,8 +2426,9 @@ def list_endpoints(
            AND ($prefix = '/' OR path = $prefix OR path STARTS WITH $prefix + '/')))
       AND ($service IS NULL OR EXISTS {{ MATCH (e)-[:CALLS]->(s:Service) WHERE s.name = $service }})
     CALL (e) {{
-        OPTIONAL MATCH (e)-[:IMPLEMENTS]->(f:Function)
-        RETURN [h IN collect(DISTINCT {{name: f.name, file: f.file, owner: f.owner}}) WHERE h.name IS NOT NULL]
+        OPTIONAL MATCH (e)-[:IMPLEMENTS]->(f) WHERE f:Function OR f:Class
+        RETURN [h IN collect(DISTINCT {{label: labels(f)[0], name: f.name, file: f.file, owner: f.owner}})
+                WHERE h.name IS NOT NULL]
                AS handlers
     }}
     CALL (e) {{
