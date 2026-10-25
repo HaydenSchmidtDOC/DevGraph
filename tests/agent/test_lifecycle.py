@@ -67,6 +67,19 @@ def test_stale_holder_marker_from_crashed_process_is_ignored(settings):
         assert not (lifecycle._holders_dir() / str(dead_pid)).exists()
 
 
+def test_a_holder_whose_pid_was_reused_is_ignored(settings):
+    """The marker records its holder's start identity, as tray.pid does: a
+    live process that reused a dead holder's pid holds nothing."""
+    pid = 434343
+    with patch.object(lifecycle, "pid_is_running", return_value=True):
+        with patch.object(lifecycle, "process_identity", return_value="start-1"):
+            lifecycle.register_tray_holder(holder_pid=pid)
+            assert lifecycle.has_tray_holders() is True
+        with patch.object(lifecycle, "process_identity", return_value="start-2"):
+            assert lifecycle.has_tray_holders() is False
+    assert not (lifecycle._holders_dir() / str(pid)).exists()
+
+
 def _record_agent(pid):
     """Write `tray.pid` as the starter does, for a fake agent `pid`."""
     with patch.object(lifecycle, "process_identity", return_value=f"start-{pid}"):

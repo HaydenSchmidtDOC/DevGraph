@@ -237,10 +237,15 @@ def _live_holder_pids() -> set[int]:
             pid = int(marker.name)
         except ValueError:
             continue
-        if pid_is_running(pid):
+        try:
+            recorded = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            recorded = ""
+        # An empty identity: written before identities were recorded, or unreadable then.
+        if pid_is_running(pid) and (not recorded or process_identity(pid) == recorded):
             live.add(pid)
         else:
-            marker.unlink(missing_ok=True)  # stale marker from a crashed holder
+            marker.unlink(missing_ok=True)  # stale marker from a crashed holder, or a reused pid
     return live
 
 
@@ -252,7 +257,8 @@ def register_tray_holder(holder_pid: Optional[int] = None) -> None:
     holder_pid = holder_pid if holder_pid is not None else os.getpid()
     holders_dir = _holders_dir()
     holders_dir.mkdir(parents=True, exist_ok=True)
-    (holders_dir / str(holder_pid)).touch()
+    # Its start identity, as `tray.pid` keeps: a reused pid is not this holder.
+    (holders_dir / str(holder_pid)).write_text(process_identity(holder_pid) or "", encoding="utf-8")
 
 
 def unregister_tray_holder(holder_pid: Optional[int] = None) -> None:
