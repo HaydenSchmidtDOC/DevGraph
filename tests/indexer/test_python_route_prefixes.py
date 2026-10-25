@@ -446,3 +446,89 @@ def test_a_route_keeps_its_trailing_slash_under_another_files_mount():
         nodes, [], "svc/r.py", router_file.route_exports, prefixes, keep_slash=True
     )
     assert sorted(node["name"] for node in mounted) == ["GET /api", "GET /api/"]
+
+
+ROUTER_FACTORY = """
+    from fastapi import APIRouter
+
+    def build_router(engine):
+        router = APIRouter(prefix="/api")
+
+        @router.get("/repos")
+        def list_repos():
+            pass
+
+        return router
+"""
+
+
+def test_a_router_a_function_returns_is_exported_as_the_call_not_its_variable():
+    result = _extract(ROUTER_FACTORY, "web/routes.py")
+    assert sorted({e.name for e in result.endpoints}) == [
+        "GET ?/api/repos (web/routes.py)"
+    ]
+    # The function-local `router` is no name another module can import.
+    assert _split(result.route_exports) == [("build_router()", "GET", "/api/repos")]
+
+
+def test_a_router_function_called_in_its_own_file_is_mounted_there():
+    code = (
+        ROUTER_FACTORY
+        + """
+    from fastapi import FastAPI
+
+    def create_app(engine):
+        app = FastAPI()
+        app.include_router(build_router(engine), prefix="/v1")
+        return app
+    """
+    )
+    result = _extract(code, "web/routes.py")
+    assert sorted({e.name for e in result.endpoints}) == ["GET /v1/api/repos"]
+    assert result.route_exports is None
+
+
+def test_a_call_of_an_imported_router_function_is_a_mount_of_its_export():
+    code = """
+        from fastapi import FastAPI
+        from web.routes import build_router
+        from web import admin
+
+        def create_app(engine):
+            app = FastAPI()
+            app.include_router(build_router(engine))
+            app.include_router(admin.make_router(), prefix="/admin")
+            return app
+    """
+    mounts = _split(_extract(code, "web/app.py").route_mounts)
+    assert [entry[:3] for entry in mounts] == [
+        ("", "/", "build_router()"),
+        ("", "/admin", "make_router()"),
+    ]
+
+
+def test_a_router_function_mounted_from_another_file_takes_its_mount():
+    router_file = _extract(ROUTER_FACTORY, "web/routes.py")
+    main = _extract(
+        """
+        from fastapi import FastAPI
+        from web.routes import build_router
+
+        def create_app(engine):
+            app = FastAPI()
+            app.include_router(build_router(engine))
+            return app
+        """,
+        "web/app.py",
+    )
+    prefixes = MountTable({"web/app.py": main.route_mounts}).route_prefixes(
+        "web/routes.py", router_file.route_exports
+    )
+    nodes = [
+        {"label": "Endpoint", "name": e.name, "properties": {}}
+        for e in router_file.endpoints
+    ]
+    mounted, _rels = mount_routes(
+        nodes, [], "web/routes.py", router_file.route_exports, prefixes, keep_slash=True
+    )
+    assert [node["name"] for node in mounted] == ["GET /api/repos"]

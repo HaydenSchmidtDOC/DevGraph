@@ -185,6 +185,10 @@ class _Routes:
         self.bindings: dict[str, str] = {}  # app or router variable -> its framework
         self.apps: set[str] = set()  # the app variables (`FastAPI()`, `Flask()`)
         self.own: dict[str, str | None] = {}  # router variable -> its own prefix, None when not a literal
+        # router variable -> where it is bound: "" the module's top level, a
+        # top-level function's name, None anywhere else
+        self.scope: dict[str, str | None] = {}
+        self.returns: dict[str, set[str]] = {}  # top-level function -> the names it returns
         self.imports: set[str] = set()  # "FastAPI", "Flask": the frameworks the file imports
         self.decorated: list[tuple[Node, str, str]] = []  # (decorator call, handler, handler owner)
         self.calls: list[Node] = []
@@ -217,6 +221,9 @@ class _Routes:
                 if framework is not None:
                     target = _text(left, source)
                     self.bindings[target] = framework
+                    self.scope[target] = "" if label == "Module" else (
+                        name if label == "Function" and not owner else None
+                    )
                     if factory in _OWN_PREFIX:
                         given = _arguments(right)[1].get(_OWN_PREFIX[factory])
                         self.own[target] = "" if given is None else _literal(given, source)
@@ -226,6 +233,10 @@ class _Routes:
                         self.own.pop(target, None)
         elif node.type == "call":
             self.calls.append(node)
+        elif node.type == "return_statement" and label == "Function" and not owner and name is not None:
+            value = node.named_children[0] if node.named_children else None
+            if value is not None and value.type == "identifier":
+                self.returns.setdefault(name, set()).add(_text(value, source))
         elif node.type == "decorated_definition":
             definition = node.child_by_field_name("definition")
             handler = definition.child_by_field_name("name") if definition is not None else None
@@ -337,16 +348,27 @@ class _Routes:
                     found.add(join_route(above, mounted or "", own))
         return found
 
+    def factories(self, function: str) -> list[str]:
+        """The router variables a top-level `function` binds and returns."""
+        return sorted(
+            receiver for receiver in self.returns.get(function, ())
+            if receiver in self.own and self.scope.get(receiver) == function
+        )
+
     def exports(self, receiver: str) -> list[tuple[str, str]]:
         """(export name, the prefix its routes are under) of a router
-        variable another module can import and mount: its name with its own
-        prefix, and a Flask blueprint's also with REPLACED and none."""
+        another module can import and mount: a top-level variable's name, and
+        `f()` for a top-level function `f` that binds and returns it, each
+        with its own prefix, and a Flask blueprint's each also with
+        REPLACED and none."""
         own = self.own.get(receiver)
         if own is None or not receiver.isidentifier():
             return []
+        names = [receiver] if self.scope.get(receiver) == "" else []
+        names += [f"{function}()" for function in sorted(self.returns) if receiver in self.factories(function)]
         if self.bindings[receiver] == "Flask":
-            return [(receiver, own), (receiver + REPLACED, "")]
-        return [(receiver, own)]
+            return [variant for each in names for variant in ((each, own), (each + REPLACED, ""))]
+        return [(each, own) for each in names]
 
     def django_routes(self) -> list[tuple[str, str, str]]:
         """(pattern, view, the view as written) per Django `path(...)`/
@@ -379,7 +401,13 @@ def _imported_router(node: Node, source: bytes, bindings) -> tuple[str, list[str
     as `include_router`/`register_blueprint` names it: a from-imported name
     (`from .users import router`) the module's name, `users.router` of an
     imported module (`from . import users`, `import app.users as users`)
-    its `router`; None when no import names it."""
+    its `router`, and a call of such a function (`build_router(engine)`)
+    `f()`, as the file defining it exports the router it returns
+    (`_Routes.exports`); None when no import names it."""
+    if node.type == "call":
+        func = node.child_by_field_name("function")
+        target = _imported_router(func, source, bindings) if func is not None else None
+        return None if target is None else (f"{target[0]}()", target[1])
     text = _text(node, source)
     if node.type == "identifier" and (symbol := bindings.symbols.get(text)) is not None:
         return symbol.name, list(dict.fromkeys(symbol.module.files()))
@@ -479,8 +507,13 @@ class APIExtractor:
         routes = _Routes(root, source)
         foreign = []
         for framework, parent, prefix, router in routes.mount_calls():
+            func = router.child_by_field_name("function") if router.type == "call" else None
             if router.type == "identifier" and _text(router, source) in routes.own:
                 routes.local.setdefault(_text(router, source), []).append((parent, framework, prefix))
+            elif func is not None and func.type == "identifier" and routes.factories(_text(func, source)):
+                # `include_router(build_router(...))` of the file's own function.
+                for made in routes.factories(_text(func, source)):
+                    routes.local.setdefault(made, []).append((parent, framework, prefix))
             else:
                 foreign.append((framework, parent, prefix, router))
         django = routes.django_routes()

@@ -248,3 +248,32 @@ def test_flask_blueprint_registered_from_another_file(engine, repo_id, tmp_path)
     index_paths(engine, repo_id, tmp_path, {shop})
     incremental_equals_fresh(engine, repo_id, tmp_path)
     assert _endpoints(engine, repo_id) == ["GET /s/basket", "POST /s/basket"]
+
+
+def test_devgraphs_own_dashboard_routes_are_under_api(engine, repo_id, tmp_path):
+    """The dashboard's router is built by `build_router()` and included as
+    `app.include_router(build_router(...))` (devgraph/dashboard/app.py)."""
+    import shutil
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / "devgraph" / "dashboard"
+    target = tmp_path / "devgraph" / "dashboard"
+    target.mkdir(parents=True)
+    for name in ("__init__.py", "app.py", "routes.py"):
+        shutil.copy(source / name, target / name)
+    write(tmp_path, "devgraph/__init__.py", "")
+    _scan(engine, repo_id, tmp_path)
+    names = sorted(
+        row["name"]
+        for row in engine.run_cypher(
+            "MATCH (e:Endpoint {repo_id: $r, source: 'devgraph/dashboard/routes.py'}) RETURN e.name AS name",
+            {"r": repo_id},
+        )
+    )
+    assert len(names) >= 30 and all(
+        name.split(" ", 1)[1].startswith("/api/") for name in names
+    ), names
+    listed = list_endpoints(engine, repo_id, path_prefix="/api", max_results=500)
+    assert not listed["truncated"] and set(names) <= {
+        row["name"] for row in listed["results"]
+    }
