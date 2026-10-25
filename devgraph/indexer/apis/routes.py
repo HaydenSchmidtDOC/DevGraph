@@ -46,6 +46,13 @@ def join_route(*parts: str) -> str:
     return "/" + "/".join(segment for part in parts for segment in part.split("/") if segment)
 
 
+def join_python_route(prefix: str, path: str) -> str:
+    """`join_route` keeping the route's trailing slash, as FastAPI and Flask
+    serve it: `""` under "/o" is "/o", and `"/"` is "/o/"."""
+    joined = join_route(prefix, path)
+    return joined + "/" if path.endswith("/") and joined != "/" else joined
+
+
 def unmounted_endpoint(method: str, path: str, file_path: str) -> str:
     """The Endpoint name of a route under a prefix its file doesn't know."""
     return f"{method} ?{path} ({file_path})"
@@ -200,12 +207,15 @@ class MountTable:
 
 
 def mount_routes(
-    nodes: list[dict], rels: list[dict], file_path: str, exports: list[str] | None, prefixes: list[str] | None
+    nodes: list[dict], rels: list[dict], file_path: str, exports: list[str] | None, prefixes: list[str] | None,
+    keep_slash: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """A router file's extraction (node and relationship dicts) with each
     route of an exported router renamed from its own Endpoint
     (`unmounted_endpoint`) to one per prefix it is mounted at (`prefixes`,
-    `MountTable.route_prefixes`); a route mounted nowhere keeps its own."""
+    `MountTable.route_prefixes`); a route mounted nowhere keeps its own.
+    `keep_slash` (a Python file's) joins with `join_python_route`."""
+    join = join_python_route if keep_slash else join_route
     by_export: dict[str, list[str]] = {}
     for entry in prefixes or []:
         export, prefix = entry.split(MOUNT_SEP)
@@ -215,7 +225,7 @@ def mount_routes(
         export, method, path, *own = entry.split(MOUNT_SEP)
         for prefix in by_export.get(export, ()):
             renamed.setdefault(unmounted_endpoint(method, own[0] if own else path, file_path), set()).add(
-                f"{method} {join_route(prefix, path)}"
+                f"{method} {join(prefix, path)}"
             )
     if not renamed:
         return nodes, rels

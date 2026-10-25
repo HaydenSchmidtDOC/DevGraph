@@ -114,15 +114,15 @@ def test_include_router_across_files_and_its_edits(engine, repo_id, tmp_path):
     _scan(engine, repo_id, tmp_path)
     # Two routers' `GET /` stay apart, each under its full path.
     assert _endpoints(engine, repo_id) == [
-        "GET /api/orders",
+        "GET /api/orders/",
         "GET /api/orders/{order_id}",
-        "GET /api/users",
+        "GET /api/users/",
     ]
     listed = list_endpoints(engine, repo_id, path_prefix="/api")["results"]
     assert [row["name"] for row in listed] == [
-        "GET /api/orders",
+        "GET /api/orders/",
         "GET /api/orders/{order_id}",
-        "GET /api/users",
+        "GET /api/users/",
     ]
     assert all(row["mounted"] and row["services"] == ["shop"] for row in listed)
     flow = trace_request_flow(engine, repo_id, "GET /api/orders/{order_id}")
@@ -131,9 +131,9 @@ def test_include_router_across_files_and_its_edits(engine, repo_id, tmp_path):
     ]
     calls = explain_architecture(engine, repo_id)["endpoints"]["results"]
     assert sorted(calls[0]["endpoints"]) == [
-        "GET /api/orders",
+        "GET /api/orders/",
         "GET /api/orders/{order_id}",
-        "GET /api/users",
+        "GET /api/users/",
     ]
 
     # The mount's prefix changes in the mounting file alone.
@@ -159,9 +159,9 @@ def test_include_router_across_files_and_its_edits(engine, repo_id, tmp_path):
     remove_paths(engine, repo_id, tmp_path, {main})
     incremental_equals_fresh(engine, repo_id, tmp_path)
     assert _endpoints(engine, repo_id) == [
-        "GET ?/purchases (shop/routers/orders.py)",
+        "GET ?/purchases/ (shop/routers/orders.py)",
         "GET ?/purchases/{order_id} (shop/routers/orders.py)",
-        "GET ?/users (shop/routers/users.py)",
+        "GET ?/users/ (shop/routers/users.py)",
     ]
 
     # And comes back.
@@ -196,12 +196,12 @@ def test_nested_routers_across_three_files(engine, repo_id, tmp_path):
     """,
     )
     _scan(engine, repo_id, tmp_path)
-    assert _endpoints(engine, repo_id) == ["GET /api/v1/admin/users"]
+    assert _endpoints(engine, repo_id) == ["GET /api/v1/admin/users/"]
 
     write(tmp_path, "app/api.py", api.read_text().replace('"/v1"', '"/v2"'))
     index_paths(engine, repo_id, tmp_path, {api})
     incremental_equals_fresh(engine, repo_id, tmp_path)
-    assert _endpoints(engine, repo_id) == ["GET /api/v2/admin/users"]
+    assert _endpoints(engine, repo_id) == ["GET /api/v2/admin/users/"]
 
 
 def test_flask_blueprint_registered_from_another_file(engine, repo_id, tmp_path):

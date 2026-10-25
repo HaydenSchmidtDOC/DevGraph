@@ -51,7 +51,7 @@ def test_fastapi_router_prefix_and_include_router_prefix_join():
     assert _names(code) == [
         "GET /api/orders/{order_id}",
         "GET /health",
-        "POST /api/orders",
+        "POST /api/orders/",
     ]
     result = _extract(code)
     implements = {
@@ -133,10 +133,10 @@ def test_same_relative_path_on_two_routers_stays_two_endpoints():
             pass
     """
     two = one.replace("/orders", "/users")
-    assert _names(one, "a/one.py") == ["GET ?/orders (a/one.py)"]
-    assert _names(two, "a/two.py") == ["GET ?/users (a/two.py)"]
+    assert _names(one, "a/one.py") == ["GET ?/orders/ (a/one.py)"]
+    assert _names(two, "a/two.py") == ["GET ?/users/ (a/two.py)"]
     assert _split(_extract(one, "a/one.py").route_exports) == [
-        ("router", "GET", "/orders")
+        ("router", "GET", "/orders/")
     ]
 
 
@@ -159,7 +159,7 @@ def test_two_routers_of_one_file_mounted_at_their_prefixes_stay_apart():
         app.include_router(orders)
         app.include_router(users)
     """
-    assert _names(code) == ["GET /orders", "GET /users"]
+    assert _names(code) == ["GET /orders/", "GET /users/"]
 
 
 def test_a_router_with_a_dynamic_prefix_is_unmounted_and_a_dynamic_mount_is_none():
@@ -366,3 +366,83 @@ def test_a_router_mounted_twice_in_one_file_has_a_route_per_mount():
     assert [
         entry[:2] for entry in _split(_extract(code, "svc/main.py").route_mounts)
     ] == [("", "/a/u"), ("", "/b/u")]
+
+
+def test_a_route_keeps_its_trailing_slash_under_a_prefix():
+    """As FastAPI serves them: "" under /o is /o, and "/" is /o/."""
+    code = """
+        from fastapi import FastAPI, APIRouter
+
+        app = FastAPI()
+        router = APIRouter(prefix="/o")
+        loose = APIRouter(prefix="/l")
+
+        @router.get("")
+        def index():
+            pass
+
+        @router.get("/")
+        def slash():
+            pass
+
+        @router.get("/items/")
+        def items():
+            pass
+
+        @loose.get("")
+        def loose_index():
+            pass
+
+        @loose.get("/")
+        def loose_slash():
+            pass
+
+        app.include_router(router)
+    """
+    assert _names(code) == [
+        "GET /o",
+        "GET /o/",
+        "GET /o/items/",
+        "GET ?/l (app.py)",
+        "GET ?/l/ (app.py)",
+    ]
+
+
+def test_a_route_keeps_its_trailing_slash_under_another_files_mount():
+    router_file = _extract(
+        """
+        from fastapi import APIRouter
+
+        router = APIRouter()
+
+        @router.get("")
+        def index():
+            pass
+
+        @router.get("/")
+        def slash():
+            pass
+        """,
+        "svc/r.py",
+    )
+    main = _extract(
+        """
+        from fastapi import FastAPI
+        from .r import router
+
+        app = FastAPI()
+        app.include_router(router, prefix="/api")
+        """,
+        "svc/main.py",
+    )
+    prefixes = MountTable({"svc/main.py": main.route_mounts}).route_prefixes(
+        "svc/r.py", router_file.route_exports
+    )
+    nodes = [
+        {"label": "Endpoint", "name": e.name, "properties": {}}
+        for e in router_file.endpoints
+    ]
+    mounted, _rels = mount_routes(
+        nodes, [], "svc/r.py", router_file.route_exports, prefixes, keep_slash=True
+    )
+    assert sorted(node["name"] for node in mounted) == ["GET /api", "GET /api/"]

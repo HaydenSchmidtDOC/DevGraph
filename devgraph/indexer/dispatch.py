@@ -777,15 +777,18 @@ class _Mounts:
         return state
 
 
-def _mounted(nodes: list[dict], rels: list[dict], rel_path: str, mounts: _Mounts) -> tuple[list[dict], list[dict]]:
+def _mounted(
+    nodes: list[dict], rels: list[dict], rel_path: str, mounts: _Mounts, keep_slash: bool = False,
+) -> tuple[list[dict], list[dict]]:
     """A JS/TS or Python file's extraction with its exported routers' routes named by
     the mounts that reach them (apis/routes.py `mount_routes`), its Module
-    recording the prefixes used (`route_prefixes`)."""
+    recording the prefixes used (`route_prefixes`); `keep_slash` for a
+    Python file's, whose routes keep their trailing slash."""
     module = next(node for node in nodes if node["label"] == "Module" and node["name"] == rel_path)
     props = module["properties"]
     mounts.written(rel_path, props.get("route_mounts"), props.get("route_exports"))
     prefixes = mounts.prefixes(rel_path, props.get("route_exports"))
-    nodes, rels = mount_routes(nodes, rels, rel_path, props.get("route_exports"), prefixes)
+    nodes, rels = mount_routes(nodes, rels, rel_path, props.get("route_exports"), prefixes, keep_slash)
     props["route_prefixes"] = prefixes
     return nodes, rels
 
@@ -1418,7 +1421,7 @@ def _index_single_path(
         next(node for node in nodes if node["label"] == "Module" and node["name"] == rel_path)["properties"].update(
             route_props
         )
-        nodes, rels = _mounted(nodes, rels, rel_path, mounts)
+        nodes, rels = _mounted(nodes, rels, rel_path, mounts, keep_slash=True)
         # Delete this file's previously-indexed nodes and write the
         # freshly-extracted ones in one transaction, not just
         # MERGE-upsert the current contents: a Function/Class removed

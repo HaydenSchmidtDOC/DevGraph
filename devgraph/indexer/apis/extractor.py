@@ -7,7 +7,7 @@ from typing import List
 import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
-from devgraph.indexer.apis.routes import MOUNT_SEP, join_route, mount_entry, unmounted_endpoint
+from devgraph.indexer.apis.routes import MOUNT_SEP, join_python_route, join_route, mount_entry, unmounted_endpoint
 from devgraph.indexer.common import member_owner
 from devgraph.indexer.python.extractor import _extract_imports
 
@@ -493,17 +493,17 @@ class APIExtractor:
         kept: set[str] = set()
         for framework, method, path, handler, owner, receiver in routes.decorator_routes():
             aboves = routes.prefixes(receiver)
-            fulls = sorted(path if above == "" else join_route(above, path) for above in aboves)
+            fulls = sorted(path if above == "" else join_python_route(above, path) for above in aboves)
             if not aboves:
                 # Mounted where the file doesn't show: under its own prefix (none when not a literal).
-                full = join_route(routes.own.get(receiver) or "", path)
+                full = join_python_route(routes.own.get(receiver) or "", path)
                 own = unmounted_endpoint(method, full, filename)
                 if exports := routes.exports(receiver):
                     deferred.setdefault(own, set()).update(
-                        MOUNT_SEP.join((name, method, join_route(under, path), *(
-                            [full] if join_route(under, path) != full else []
-                        )))
+                        MOUNT_SEP.join((name, method, exported, *([full] if exported != full else [])))
                         for name, under in exports
+                        # A bare "" stays one: under "/api" it is "/api", where "/" is "/api/".
+                        for exported in ["" if not under.strip("/") and not path else join_python_route(under, path)]
                     )
                 else:
                     kept.add(own)
