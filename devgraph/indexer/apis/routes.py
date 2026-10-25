@@ -22,8 +22,8 @@ has an unknown prefix: its Endpoint is the file's own, named
 `"<METHOD> ?<path> (<file>)"` (`unmounted_endpoint`), never merged with
 another file's route of the same path (every `GET /` would otherwise meet
 in one Endpoint that no request reaches as such). An exported Express
-router another file mounts is then named by those mounts (`MountTable`,
-below).
+router, or a FastAPI router or Flask blueprint (apis/extractor.py), another
+file mounts is then named by those mounts (`MountTable`, below).
 """
 
 from __future__ import annotations
@@ -122,13 +122,16 @@ def spring_routes(
     return routes
 
 
-# --- Express routers another file mounts --------------------------------------
+# --- Express, FastAPI and Flask routers another file mounts -------------------
 #
 # A router file's routes on a router it exports, and that it doesn't mount
 # itself, have an unknown prefix in its own text: their Endpoints are its
 # own (`unmounted_endpoint`) and its Module records them as `route_exports`
-# entries (export name, method, path). A file mounting an imported router
-# (`app.use('/api', usersRouter)`) records the mount in its Module's
+# entries (export name, method, path, and the path its own Endpoint has
+# when that differs: a Flask blueprint's export for a mount replacing its
+# own prefix, apis/extractor.py REPLACED). A file mounting an imported router
+# (`app.use('/api', usersRouter)`, `app.include_router(users.router,
+# prefix='/api')`) records the mount in its Module's
 # `route_mounts`: (base, prefix, export, the files its import can name),
 # base "" when the router it is mounted on is at a known prefix (prefix is
 # then the full one), else the name under which the file exports that
@@ -209,9 +212,9 @@ def mount_routes(
         by_export.setdefault(export, []).append(prefix)
     renamed: dict[str, set[str]] = {}
     for entry in exports or []:
-        export, method, path = entry.split(MOUNT_SEP)
+        export, method, path, *own = entry.split(MOUNT_SEP)
         for prefix in by_export.get(export, ()):
-            renamed.setdefault(unmounted_endpoint(method, path, file_path), set()).add(
+            renamed.setdefault(unmounted_endpoint(method, own[0] if own else path, file_path), set()).add(
                 f"{method} {join_route(prefix, path)}"
             )
     if not renamed:

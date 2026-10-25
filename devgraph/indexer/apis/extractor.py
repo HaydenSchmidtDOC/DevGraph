@@ -7,6 +7,7 @@ from typing import List
 import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
+from devgraph.indexer.apis.routes import MOUNT_SEP, join_route, mount_entry, unmounted_endpoint
 from devgraph.indexer.common import member_owner
 from devgraph.indexer.python.extractor import _extract_imports
 
@@ -15,12 +16,22 @@ _PY_LANGUAGE = Language(tspython.language())
 
 @dataclass
 class EndpointNode:
-    """Represents an API Endpoint node."""
+    """Represents an API Endpoint node. `mounted` False is a route on a
+    router whose mount the file doesn't show (apis/routes.py
+    `unmounted_endpoint`)."""
 
     path: str
     method: str
     repo_id: str
     properties: dict = field(default_factory=dict)
+    mounted: bool = True
+
+    @property
+    def name(self) -> str:
+        """The Endpoint's node name."""
+        return f"{self.method} {self.path}" if self.mounted else unmounted_endpoint(
+            self.method, self.path, self.properties["source"],
+        )
 
 
 @dataclass
@@ -55,11 +66,15 @@ class Relationship:
 
 @dataclass
 class ExtractionResult:
-    """Result of API extraction."""
+    """Result of API extraction. `route_mounts` and `route_exports` are the
+    file's Module properties of its routers another file mounts, as an
+    Express file's are (apis/routes.py MOUNT_PROPERTIES), None when empty."""
 
     endpoints: List[EndpointNode] = field(default_factory=list)
     functions: List[FunctionNode] = field(default_factory=list)
     relationships: List[Relationship] = field(default_factory=list)
+    route_mounts: list[str] | None = None
+    route_exports: list[str] | None = None
 
 
 def _pinned_implements(
@@ -90,6 +105,15 @@ _METHOD_DECORATORS = frozenset({"get", "post", "put", "delete", "patch", "option
 _FACTORIES = {"FastAPI": "FastAPI", "APIRouter": "FastAPI", "Flask": "Flask", "Blueprint": "Flask"}
 #: Receivers read as an app or router without a binding the file shows.
 _ROUTER_NAMES = frozenset({"app", "router"})
+#: A router factory's keyword giving its own prefix (an app has none: FastAPI's `root_path` is no route prefix).
+_OWN_PREFIX = {"APIRouter": "prefix", "Blueprint": "url_prefix"}
+#: The calls mounting a router on an app or router: (framework, the keyword giving the mount's prefix).
+_MOUNT_CALLS = {"include_router": ("FastAPI", "prefix"), "register_blueprint": ("Flask", "url_prefix")}
+#: The suffix of a Flask blueprint's export name for a mount that replaces
+#: its own `url_prefix` (`register_blueprint(bp, url_prefix=...)`): Flask
+#: puts the blueprint's routes under that prefix instead of its own, where
+#: FastAPI joins `include_router`'s prefix to the router's.
+REPLACED = ":replaced"
 
 
 def _text(node: Node, source: bytes) -> str:
@@ -159,9 +183,12 @@ class _Routes:
     def __init__(self, root: Node, source: bytes):
         self.source = source
         self.bindings: dict[str, str] = {}  # app or router variable -> its framework
+        self.apps: set[str] = set()  # the app variables (`FastAPI()`, `Flask()`)
+        self.own: dict[str, str | None] = {}  # router variable -> its own prefix, None when not a literal
         self.imports: set[str] = set()  # "FastAPI", "Flask": the frameworks the file imports
         self.decorated: list[tuple[Node, str, str]] = []  # (decorator call, handler, handler owner)
         self.calls: list[Node] = []
+        self.local: dict[str, tuple[str, str, str | None]] = {}  # router -> (mounted on, framework, prefix)
         # Iterative, in source order: a deeply nested expression (3,000 `+`
         # terms) is read on any thread's stack.
         pending: list[tuple[Node, str, str | None, str]] = [(root, "Module", None, "")]
@@ -185,9 +212,18 @@ class _Routes:
             left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
             called = right.child_by_field_name("function") if right is not None and right.type == "call" else None
             if left is not None and called is not None:
-                framework = _FACTORIES.get(_text(called, source).rsplit(".", 1)[-1])
+                factory = _text(called, source).rsplit(".", 1)[-1]
+                framework = _FACTORIES.get(factory)
                 if framework is not None:
-                    self.bindings[_text(left, source)] = framework
+                    target = _text(left, source)
+                    self.bindings[target] = framework
+                    if factory in _OWN_PREFIX:
+                        given = _arguments(right)[1].get(_OWN_PREFIX[factory])
+                        self.own[target] = "" if given is None else _literal(given, source)
+                        self.apps.discard(target)
+                    else:
+                        self.apps.add(target)
+                        self.own.pop(target, None)
         elif node.type == "call":
             self.calls.append(node)
         elif node.type == "decorated_definition":
@@ -220,10 +256,12 @@ class _Routes:
             return next(iter(self.imports))
         return "Flask" if attr == "route" else "FastAPI"
 
-    def decorator_routes(self) -> list[tuple[str, str, str, str, str]]:
-        """(framework, method, path, handler, handler owner) per route a
-        decorator makes: `@app.get("/x")` its method, `@app.route("/x",
-        methods=[...])` and FastAPI's `api_route` each method listed."""
+    def decorator_routes(self) -> list[tuple[str, str, str, str, str, str]]:
+        """(framework, method, path, handler, handler owner, receiver) per
+        route a decorator makes: `@app.get("/x")` its method,
+        `@app.route("/x", methods=[...])` and FastAPI's `api_route` each
+        method listed. The path is the decorator's own: `prefix` gives the
+        receiver's."""
         found = []
         for call, handler, owner in self.decorated:
             func = call.child_by_field_name("function")
@@ -235,7 +273,8 @@ class _Routes:
             attr_name = _text(attr, self.source)
             if attr_name not in _METHOD_DECORATORS and attr_name not in ("route", "api_route"):
                 continue
-            framework = self._framework(_text(receiver, self.source), attr_name)
+            receiver_text = _text(receiver, self.source)
+            framework = self._framework(receiver_text, attr_name)
             positional, keywords = _arguments(call)
             path = _literal(positional[0] if positional else keywords.get("path") or keywords.get("rule"), self.source)
             if framework is None or path is None:
@@ -243,8 +282,69 @@ class _Routes:
             methods = [attr_name.upper()] if attr_name in _METHOD_DECORATORS else _methods(
                 keywords.get("methods"), self.source,
             )
-            found += [(framework, method, path, handler, owner) for method in methods]
+            found += [(framework, method, path, handler, owner, receiver_text) for method in methods]
         return found
+
+    def mount_calls(self) -> list[tuple[str, str, str | None, Node]]:
+        """(framework, the app or router mounted on, the prefix, the router
+        mounted) per `include_router(router, prefix=...)` and
+        `register_blueprint(bp, url_prefix=...)` call on an app or router,
+        the prefix None when not given; one whose prefix is not a literal
+        is none."""
+        found = []
+        for call in self.calls:
+            func = call.child_by_field_name("function")
+            if func is None or func.type != "attribute":
+                continue
+            obj, attr = func.child_by_field_name("object"), func.child_by_field_name("attribute")
+            if obj is None or attr is None or _text(attr, self.source) not in _MOUNT_CALLS:
+                continue
+            framework, keyword = _MOUNT_CALLS[_text(attr, self.source)]
+            positional, keywords = _arguments(call)
+            router = positional[0] if positional else keywords.get("router" if framework == "FastAPI" else "blueprint")
+            given = keywords.get(keyword)
+            prefix = None if given is None else _literal(given, self.source)
+            parent = _text(obj, self.source)
+            if router is None or (given is not None and prefix is None) or not self._routing(parent):
+                continue
+            found.append((framework, parent, prefix, router))
+        return found
+
+    def _routing(self, receiver: str) -> bool:
+        """Whether a receiver is an app or router (`_framework`)."""
+        return receiver in self.bindings or receiver in _ROUTER_NAMES
+
+    def _is_app(self, receiver: str) -> bool:
+        return receiver in self.apps or (receiver == "app" and receiver not in self.bindings)
+
+    def prefix(self, receiver: str, seen: frozenset = frozenset()) -> str | None:
+        """The full prefix of an app's or router's routes: "" for an app's,
+        a router's own joined to those of the mounts the file shows
+        (`local`) up to an app; None when the file mounts it on no app, or
+        its own prefix is not a literal."""
+        if self._is_app(receiver):
+            return ""
+        own = self.own.get(receiver, "")
+        if own is None or receiver not in self.local or receiver in seen:
+            return None
+        parent, framework, mounted = self.local[receiver]
+        above = self.prefix(parent, seen | {receiver})
+        if above is None:
+            return None
+        if framework == "Flask":
+            return join_route(above, own if mounted is None else mounted)
+        return join_route(above, mounted or "", own)
+
+    def exports(self, receiver: str) -> list[tuple[str, str]]:
+        """(export name, the prefix its routes are under) of a router
+        variable another module can import and mount: its name with its own
+        prefix, and a Flask blueprint's also with REPLACED and none."""
+        own = self.own.get(receiver)
+        if own is None or not receiver.isidentifier():
+            return []
+        if self.bindings[receiver] == "Flask":
+            return [(receiver, own), (receiver + REPLACED, "")]
+        return [(receiver, own)]
 
     def django_routes(self) -> list[tuple[str, str, str]]:
         """(pattern, view, the view as written) per Django `path(...)`/
@@ -270,6 +370,24 @@ class _Routes:
             written = _text(view, self.source)
             found.append((pattern, written.rsplit(".", 1)[-1], written))
         return found
+
+
+def _imported_router(node: Node, source: bytes, bindings) -> tuple[str, list[str]] | None:
+    """(export, the files it can be in) of a router another module defines,
+    as `include_router`/`register_blueprint` names it: a from-imported name
+    (`from .users import router`) the module's name, `users.router` of an
+    imported module (`from . import users`, `import app.users as users`)
+    its `router`; None when no import names it."""
+    text = _text(node, source)
+    if node.type == "identifier" and (symbol := bindings.symbols.get(text)) is not None:
+        return symbol.name, list(dict.fromkeys(symbol.module.files()))
+    if node.type == "attribute":
+        receiver, export = text.rsplit(".", 1)
+        if (module := bindings.modules.get(receiver)) is not None:
+            return export, list(dict.fromkeys(module.files()))
+        if (symbol := bindings.symbols.get(receiver)) is not None:
+            return export, list(dict.fromkeys(symbol.submodule.files()))
+    return None
 
 
 def _django_implements(endpoint_id: str, view: str, written: str, bindings) -> list[Relationship]:
@@ -331,13 +449,24 @@ class APIExtractor:
         `@app.post` is POST alone, and Flask's `methods=[...]` gives each
         method listed.
 
+        A router's routes are under its own literal prefix (`APIRouter(
+        prefix=...)`, `Blueprint(url_prefix=...)`) and those of the mounts
+        the file shows up to an app (`include_router(router, prefix=...)`,
+        joined to the router's; `register_blueprint(bp, url_prefix=...)`,
+        replacing the blueprint's). A router the file mounts on no app is
+        mounted where the file doesn't show (`unmounted_endpoint`); one
+        another module can import is recorded in `route_exports`, and the
+        file's mounts of another module's routers in `route_mounts`, for
+        the dispatcher to name by the mounts that reach them, as an Express
+        router is (apis/routes.py MountTable).
+
         Args:
             content: The Python source code content.
             filename: The source filename for context.
             roots: The file's configured Python source roots
                 (`ResolverConfig.python_roots`), which a Django view's
-                module is also looked up under, as the Python extractor's
-                imports are.
+                module and a mounted router's are also looked up under, as
+                the Python extractor's imports are.
 
         Returns:
             ExtractionResult containing extracted Endpoint and Function nodes.
@@ -346,11 +475,60 @@ class APIExtractor:
         source = content.encode("utf-8")
         root = Parser(_PY_LANGUAGE).parse(source).root_node
         routes = _Routes(root, source)
-        for framework, method, path, handler, owner in routes.decorator_routes():
-            self._add(result, framework, method, path, handler, filename, "handler")
-            result.relationships.extend(_pinned_implements(f"{method} {path}", handler, filename, owner))
+        foreign = []
+        for framework, parent, prefix, router in routes.mount_calls():
+            if router.type == "identifier" and _text(router, source) in routes.own:
+                routes.local[_text(router, source)] = (parent, framework, prefix)
+            else:
+                foreign.append((framework, parent, prefix, router))
         django = routes.django_routes()
-        bindings = _extract_imports(root, source, filename, roots) if django else None
+        bindings = _extract_imports(root, source, filename, roots) if django or foreign else None
+        # A route on a router the file mounts on no app is the file's own
+        # (`unmounted_endpoint`); one of a router another module can import
+        # is also a `route_exports` entry, unless another unmounted route of
+        # the file shares its Endpoint.
+        deferred: dict[str, set[str]] = {}
+        kept: set[str] = set()
+        for framework, method, path, handler, owner, receiver in routes.decorator_routes():
+            if routes.own.get(receiver, "") is None:
+                continue  # a router whose own prefix is not a literal
+            above = routes.prefix(receiver)
+            if above is not None:
+                full = path if above == "" else join_route(above, path)
+            else:
+                full = join_route(routes.own.get(receiver, ""), path)
+                own = unmounted_endpoint(method, full, filename)
+                if exports := routes.exports(receiver):
+                    deferred.setdefault(own, set()).update(
+                        MOUNT_SEP.join((name, method, join_route(under, path), *(
+                            [full] if join_route(under, path) != full else []
+                        )))
+                        for name, under in exports
+                    )
+                else:
+                    kept.add(own)
+            endpoint = self._add(result, framework, method, full, handler, filename, "handler", above is not None)
+            result.relationships.extend(_pinned_implements(endpoint, handler, filename, owner))
+        result.route_exports = sorted(
+            entry for own, entries in deferred.items() if own not in kept for entry in entries
+        ) or None
+        route_mounts = set()
+        for framework, parent, prefix, router in foreign:
+            target = _imported_router(router, source, bindings)
+            if target is None:
+                continue
+            export, files = target
+            if framework == "Flask" and prefix is not None:
+                export += REPLACED
+            above = routes.prefix(parent)
+            if above is not None:
+                route_mounts.add(mount_entry("", join_route(above, prefix or ""), export, files))
+            else:
+                route_mounts |= {
+                    mount_entry(name, join_route(under, prefix or ""), export, files)
+                    for name, under in routes.exports(parent)
+                }
+        result.route_mounts = sorted(route_mounts) or None
         for pattern, view, written in django:
             # Django's urls.py names no HTTP method (the view handles each).
             self._add(result, "Django", "*", pattern, view, filename, "view")
@@ -359,12 +537,15 @@ class APIExtractor:
 
     def _add(
         self, result: ExtractionResult, framework: str, method: str, path: str, handler: str, filename: str,
-        kind: str,
-    ) -> None:
-        """One route's Endpoint and its handler stub."""
-        result.endpoints.append(EndpointNode(
+        kind: str, mounted: bool = True,
+    ) -> str:
+        """One route's Endpoint and its handler stub; returns the Endpoint's name."""
+        endpoint = EndpointNode(
             path=path, method=method, repo_id=self.repo_id, properties={"framework": framework, "source": filename},
-        ))
+            mounted=mounted,
+        )
+        result.endpoints.append(endpoint)
         result.functions.append(FunctionNode(
             name=handler, repo_id=self.repo_id, properties={"type": kind, "source": filename},
         ))
+        return endpoint.name
