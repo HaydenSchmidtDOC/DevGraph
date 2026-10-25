@@ -22,6 +22,10 @@ from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import index_paths, remove_paths
 from tests.helpers import stub
 
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
+
 
 def full_scan(engine, repo_id, repo_root, **kwargs):
     """`dispatch.full_scan` of a registered repository: registering creates
@@ -51,7 +55,7 @@ def temp_repo():
 
 class TestIndexPaths:
     def test_indexes_python_file(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_python"
+        repo_id = f"_smoketest_dispatch_python_{_TOKEN}"
         py_file = temp_repo / "service.py"
         py_file.write_text("class MyService:\n    pass\n")
 
@@ -77,7 +81,7 @@ class TestIndexPaths:
         re-extracting, or a removed symbol lingers forever until the whole
         repo is deleted and re-added.
         """
-        repo_id = "_smoketest_dispatch_prune"
+        repo_id = f"_smoketest_dispatch_prune_{_TOKEN}"
         py_file = temp_repo / "service.py"
         py_file.write_text("def keep():\n    pass\n\ndef remove_me():\n    pass\n")
 
@@ -110,7 +114,7 @@ class TestIndexPaths:
         goes with A's re-index, taking B's edge with it, so B needs no
         re-index of its own.
         """
-        repo_id = "_smoketest_dispatch_reverse_deps"
+        repo_id = f"_smoketest_dispatch_reverse_deps_{_TOKEN}"
         a_file = temp_repo / "a.py"
         b_file = temp_repo / "b.py"
         a_file.write_text("def do_thing():\n    pass\n")
@@ -142,7 +146,7 @@ class TestIndexPaths:
             engine.delete_repository(repo_id)
 
     def test_indexes_datastore_usage_from_same_python_file(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_datastore"
+        repo_id = f"_smoketest_dispatch_datastore_{_TOKEN}"
         py_file = temp_repo / "db.py"
         py_file.write_text("import redis\ncache = redis.Redis()\n")
 
@@ -158,7 +162,7 @@ class TestIndexPaths:
             engine.delete_repository(repo_id)
 
     def test_indexes_dockerfile(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_container"
+        repo_id = f"_smoketest_dispatch_container_{_TOKEN}"
         dockerfile = temp_repo / "Dockerfile"
         dockerfile.write_text("FROM python:3.13\n")
 
@@ -173,7 +177,7 @@ class TestIndexPaths:
             engine.delete_repository(repo_id)
 
     def test_indexes_docs_note_under_docs_path(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_docs"
+        repo_id = f"_smoketest_dispatch_docs_{_TOKEN}"
         docs_dir = temp_repo / "docs"
         docs_dir.mkdir()
         note = docs_dir / "req.md"
@@ -191,7 +195,7 @@ class TestIndexPaths:
             engine.delete_repository(repo_id)
 
     def test_sibling_directory_sharing_the_repo_name_prefix_is_skipped(self, engine):
-        repo_id = "_smoketest_dispatch_sibling_prefix"
+        repo_id = f"_smoketest_dispatch_sibling_prefix_{_TOKEN}"
         with tempfile.TemporaryDirectory() as parent:
             repo_root = Path(parent) / "proj"
             repo_root.mkdir()
@@ -213,7 +217,7 @@ class TestIndexPaths:
                 engine.delete_repository(repo_id)
 
     def test_markdown_outside_docs_path_is_skipped(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_docs_skip"
+        repo_id = f"_smoketest_dispatch_docs_skip_{_TOKEN}"
         note = temp_repo / "README.md"
         note.write_text("---\ntype: requirement\nid: req-skip\n---\n# Should not be indexed\n")
 
@@ -224,7 +228,7 @@ class TestIndexPaths:
             engine.delete_repository(repo_id)
 
     def test_markdown_in_sibling_of_docs_path_is_skipped(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_docs_sibling_prefix"
+        repo_id = f"_smoketest_dispatch_docs_sibling_prefix_{_TOKEN}"
         (temp_repo / "docs").mkdir()
         (temp_repo / "docs-private").mkdir()
         note = temp_repo / "docs-private" / "note.md"
@@ -237,7 +241,7 @@ class TestIndexPaths:
             engine.delete_repository(repo_id)
 
     def test_path_outside_repo_root_is_skipped(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_outside"
+        repo_id = f"_smoketest_dispatch_outside_{_TOKEN}"
         with tempfile.TemporaryDirectory() as other_dir:
             outside_file = Path(other_dir) / "evil.py"
             outside_file.write_text("class ShouldNotAppear:\n    pass\n")
@@ -254,7 +258,7 @@ class TestIndexPaths:
 
 class TestRemovePaths:
     def test_sibling_directory_sharing_the_repo_name_prefix_is_skipped(self, engine):
-        repo_id = "_smoketest_dispatch_remove_sibling_prefix"
+        repo_id = f"_smoketest_dispatch_remove_sibling_prefix_{_TOKEN}"
         with tempfile.TemporaryDirectory() as parent:
             repo_root = Path(parent) / "proj"
             repo_root.mkdir()
@@ -276,7 +280,7 @@ class TestRemovePaths:
                 engine.delete_repository(repo_id)
 
     def test_removes_nodes_for_deleted_python_file(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_remove"
+        repo_id = f"_smoketest_dispatch_remove_{_TOKEN}"
         py_file = temp_repo / "gone.py"
         py_file.write_text("class Gone:\n    pass\n")
 
@@ -307,7 +311,7 @@ class TestRemovePaths:
         indexing side (_index_single_path) but not to remove_paths, so a
         deleted Kotlin file left stale nodes in the graph forever.
         """
-        repo_id = "_smoketest_dispatch_remove_kt"
+        repo_id = f"_smoketest_dispatch_remove_kt_{_TOKEN}"
         kt_file = temp_repo / "Gone.kt"
         kt_file.write_text("class Gone {\n    fun gone() {}\n}\n")
 
@@ -339,7 +343,7 @@ class TestRemovePaths:
         nodes keyed by repo-relative path (e.g., 'docs/guide.md') wouldn't be
         found when deleting by bare filename ('guide.md').
         """
-        repo_id = "_smoketest_dispatch_remove_md_subdir"
+        repo_id = f"_smoketest_dispatch_remove_md_subdir_{_TOKEN}"
 
         # Create a Python file with a known entity
         py_file = temp_repo / "service.py"
@@ -379,7 +383,7 @@ class TestRemovePaths:
 
 
     def test_a_deleted_directory_removes_its_language_nodes(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_remove_dir"
+        repo_id = f"_smoketest_dispatch_remove_dir_{_TOKEN}"
         fresh = f"{repo_id}_fresh"
         (temp_repo / "pkg" / "sub").mkdir(parents=True)
         (temp_repo / "pkg" / "mod.py").write_text("class Widget:\n    pass\n")
@@ -403,7 +407,7 @@ class TestRemovePaths:
             engine.delete_repository(fresh)
 
     def test_one_graph_files_query_per_call(self, engine, temp_repo, monkeypatch):
-        repo_id = "_smoketest_dispatch_remove_one_query"
+        repo_id = f"_smoketest_dispatch_remove_one_query_{_TOKEN}"
         (temp_repo / "pkg").mkdir()
         (temp_repo / "pkg" / "mod.py").write_text("class Widget:\n    pass\n")
         try:
@@ -418,7 +422,7 @@ class TestRemovePaths:
             engine.delete_repository(repo_id)
 
     def test_a_deleted_service_folder_unclaims_its_dockerfile(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_remove_dockerfile_dir"
+        repo_id = f"_smoketest_dispatch_remove_dockerfile_dir_{_TOKEN}"
         fresh = f"{repo_id}_fresh"
         (temp_repo / "svc").mkdir()
         (temp_repo / "svc" / "Dockerfile").write_text("FROM python:3.12\n")
@@ -436,7 +440,7 @@ class TestRemovePaths:
             engine.delete_repository(fresh)
 
     def test_a_containerfile_deleted_while_away_is_pruned(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_prune_containerfile"
+        repo_id = f"_smoketest_dispatch_prune_containerfile_{_TOKEN}"
         fresh = f"{repo_id}_fresh"
         (temp_repo / "Containerfile").write_text("FROM python:3.12\n")
         (temp_repo / "app.py").write_text("def main():\n    pass\n")
@@ -481,7 +485,7 @@ def _graph(engine, repo_id):
 
 class TestFullScan:
     def test_full_scan_indexes_multiple_files(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_fullscan"
+        repo_id = f"_smoketest_dispatch_fullscan_{_TOKEN}"
         (temp_repo / "a.py").write_text("class A:\n    pass\n")
         (temp_repo / "b.py").write_text("class B:\n    pass\n")
         (temp_repo / ".git").mkdir()
@@ -504,7 +508,7 @@ class TestFullScan:
         """A file the OS refuses to stat (locked, broken symlink, Windows
         reparse point) must be skipped, not abort the whole scan — this is
         what WinError 1920 on a HuggingFace-cache symlink used to do."""
-        repo_id = "_smoketest_dispatch_unstatable"
+        repo_id = f"_smoketest_dispatch_unstatable_{_TOKEN}"
         (temp_repo / "a.py").write_text("class A:\n    pass\n")
         cursed = temp_repo / "cursed.bin"
         cursed.write_bytes(b"")
@@ -525,7 +529,7 @@ class TestFullScan:
             engine.delete_repository(repo_id)
 
     def test_full_scan_skips_symlink_pointing_outside_the_repo(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_symlink_out"
+        repo_id = f"_smoketest_dispatch_symlink_out_{_TOKEN}"
         (temp_repo / "a.py").write_text("class A:\n    pass\n")
         with tempfile.TemporaryDirectory() as other_dir:
             outside_file = Path(other_dir) / "outside.py"
@@ -545,7 +549,7 @@ class TestFullScan:
                 engine.delete_repository(repo_id)
 
     def test_full_scan_follows_symlink_within_the_repo(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_symlink_in"
+        repo_id = f"_smoketest_dispatch_symlink_in_{_TOKEN}"
         (temp_repo / "pkg").mkdir()
         (temp_repo / "pkg" / "a.py").write_text("class A:\n    pass\n")
         (temp_repo / "alias.py").symlink_to(temp_repo / "pkg" / "a.py")
@@ -565,7 +569,7 @@ class TestFullScan:
         """A file deleted while the watcher was down must have its nodes
         pruned by the next full_scan — a rescan reconciles the graph to
         disk, it doesn't just add/update what's current."""
-        repo_id = "_smoketest_dispatch_prune"
+        repo_id = f"_smoketest_dispatch_prune_{_TOKEN}"
         py_file = temp_repo / "gone.py"
         py_file.write_text("class Gone:\n    pass\n")
         keep_file = temp_repo / "keep.py"
@@ -597,7 +601,7 @@ class TestFullScan:
         pruned by a rescan even though they were indexed before the ignore
         rule existed — the disk-vs-graph diff uses the same ignore filter as
         the index walk."""
-        repo_id = "_smoketest_dispatch_prune_ignored"
+        repo_id = f"_smoketest_dispatch_prune_ignored_{_TOKEN}"
         scratch = temp_repo / ".playwright-mcp"
         scratch.mkdir()
         scratch_file = scratch / "dump.txt"
@@ -640,7 +644,7 @@ class TestServiceCrossLinking:
     """
 
     def test_full_scan_links_service_to_datastore_it_uses(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_service_link"
+        repo_id = f"_smoketest_dispatch_service_link_{_TOKEN}"
         (temp_repo / "docker-compose.yml").write_text(
             "services:\n"
             "  api:\n"
@@ -663,7 +667,7 @@ class TestServiceCrossLinking:
             engine.delete_repository(repo_id)
 
     def test_full_scan_links_endpoint_to_owning_service(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_endpoint_link"
+        repo_id = f"_smoketest_dispatch_endpoint_link_{_TOKEN}"
         (temp_repo / "docker-compose.yml").write_text(
             "services:\n"
             "  web:\n"
@@ -688,7 +692,7 @@ class TestServiceCrossLinking:
             engine.delete_repository(repo_id)
 
     def test_file_outside_any_build_context_is_not_linked(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_no_link"
+        repo_id = f"_smoketest_dispatch_no_link_{_TOKEN}"
         (temp_repo / "docker-compose.yml").write_text(
             "services:\n"
             "  api:\n"
@@ -713,7 +717,7 @@ class TestServiceCrossLinking:
 class TestMentionsIntegration:
     def test_mentions_enabled_creates_document_and_edge(self, engine, temp_repo):
         """With mentions_enabled=True, a .md file mentioning a known entity creates Document and MENTIONS edge."""
-        repo_id = "_smoketest_dispatch_mentions_enabled"
+        repo_id = f"_smoketest_dispatch_mentions_enabled_{_TOKEN}"
 
         # First, create a Python file with a Function
         py_file = temp_repo / "service.py"
@@ -750,7 +754,7 @@ class TestMentionsIntegration:
 
     def test_mentions_disabled_skips_markdown_outside_docs_path(self, engine, temp_repo):
         """With mentions_enabled=False (default), .md files outside docs_root are not scanned at all."""
-        repo_id = "_smoketest_dispatch_mentions_disabled"
+        repo_id = f"_smoketest_dispatch_mentions_disabled_{_TOKEN}"
 
         # Create a Python file with a Function
         py_file = temp_repo / "service.py"
@@ -786,7 +790,7 @@ class TestMentionsIntegration:
 
     def test_mentions_integration_across_file_types(self, engine, temp_repo):
         """Indexing Python files first, then Markdown files with mentions enabled."""
-        repo_id = "_smoketest_dispatch_mentions_integration"
+        repo_id = f"_smoketest_dispatch_mentions_integration_{_TOKEN}"
 
         # Create a Python file with classes and functions
         py_file = temp_repo / "service.py"
@@ -1106,7 +1110,7 @@ def _missing_edges(engine, repo_id: str) -> list[str]:
 
 class TestCrossFileEdgesIndependentOfOrder:
     def test_full_scan_creates_edges_whose_referrer_sorts_before_its_target(self, engine, temp_repo):
-        repo_id = "_smoketest_dispatch_referrer_first_full"
+        repo_id = f"_smoketest_dispatch_referrer_first_full_{_TOKEN}"
         _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
         try:
             full_scan(engine, repo_id, temp_repo, docs_path="docs", mentions_enabled=True)
@@ -1118,7 +1122,7 @@ class TestCrossFileEdgesIndependentOfOrder:
         """An incremental batch that adds only target files re-indexes the
         referrers indexed earlier, so their edges form without the referrer
         changing or a full rescan."""
-        repo_id = "_smoketest_dispatch_referrer_first_incremental"
+        repo_id = f"_smoketest_dispatch_referrer_first_incremental_{_TOKEN}"
         _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
         try:
             index_paths(engine, repo_id, temp_repo, {temp_repo / r for r in _REFERRERS}, docs_path="docs", mentions_enabled=True)
@@ -1133,7 +1137,7 @@ class TestCrossFileEdgesIndependentOfOrder:
     @pytest.mark.parametrize("kind", sorted(_RELINK_KINDS))
     def test_each_lookup_kind_relinks_its_referrers(self, engine, temp_repo, kind):
         referrers, targets, edges = _RELINK_KINDS[kind]
-        repo_id = "_smoketest_dispatch_relink_" + kind.replace(" ", "_")
+        repo_id = f"_smoketest_dispatch_relink_{kind.replace(' ', '_')}_{_TOKEN}"
         _write_fixture(temp_repo, {rel: _REFERRER_FIRST_FIXTURE[rel] for rel in referrers | targets})
         mentions_enabled = kind == "mentions"
         try:
@@ -1146,7 +1150,7 @@ class TestCrossFileEdgesIndependentOfOrder:
     def test_batches_that_add_no_targets_index_no_extra_files(self, engine, temp_repo, monkeypatch):
         """Cost guard: a full scan indexes each file once, and re-indexing
         unchanged target files (they add no new nodes) pulls in no referrers."""
-        repo_id = "_smoketest_dispatch_relink_cost"
+        repo_id = f"_smoketest_dispatch_relink_cost_{_TOKEN}"
         _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
         seen = _record_indexed(monkeypatch)
         try:
@@ -1165,7 +1169,7 @@ class TestCrossFileEdgesIndependentOfOrder:
         """Cost guard: a C++ out-of-class method definition emits a Class stub
         with no file provenance; re-saving the file unchanged must not count
         it as an added node and re-index the docs that mention it."""
-        repo_id = "_smoketest_dispatch_relink_cost_cpp"
+        repo_id = f"_smoketest_dispatch_relink_cost_cpp_{_TOKEN}"
         _write_fixture(temp_repo, {
             "w/widget.cpp": '#include "widget.h"\nvoid Widget::draw() {}\n',
             "README.md": "# Readme\n\nUses `Widget`.\n",
@@ -1190,7 +1194,7 @@ class TestCrossFileEdgesIndependentOfOrder:
     def test_an_existing_file_gaining_a_symbol_relinks_its_referrers(self, engine, temp_repo, target, before, edge):
         """The watcher's common case: the target file is already indexed and an
         edit adds (or renames to) the symbol a referrer names."""
-        repo_id = "_smoketest_dispatch_relink_gain_" + Path(target).stem
+        repo_id = f"_smoketest_dispatch_relink_gain_{Path(target).stem}_{_TOKEN}"
         _write_fixture(temp_repo, _REFERRER_FIRST_FIXTURE)
         (temp_repo / target).write_text(before)
         try:
@@ -1232,7 +1236,7 @@ class TestMentionRelinkBound:
         )[0]["c"]
 
     def test_a_name_that_already_exists_finds_referrers_in_the_graph(self, engine, temp_repo, monkeypatch):
-        repo_id = "_smoketest_dispatch_relink_bound_existing"
+        repo_id = f"_smoketest_dispatch_relink_bound_existing_{_TOKEN}"
         self._repo(temp_repo)
         monkeypatch.setattr(dispatch, "_MAX_MENTION_RELINKS", 3)
         text_scans: list[set[str]] = []
@@ -1254,7 +1258,7 @@ class TestMentionRelinkBound:
             engine.delete_repository(repo_id)
 
     def test_a_name_new_to_the_graph_is_text_scanned_up_to_the_cap(self, engine, temp_repo, monkeypatch, caplog):
-        repo_id = "_smoketest_dispatch_relink_bound_new"
+        repo_id = f"_smoketest_dispatch_relink_bound_new_{_TOKEN}"
         self._repo(temp_repo)
         monkeypatch.setattr(dispatch, "_MAX_MENTION_RELINKS", 3)
         try:
@@ -1607,7 +1611,7 @@ def test_a_save_while_the_indexes_build_fails_its_batch_instead_of_skipping_the_
 
     import devgraph.graph.engine as engine_module
 
-    repo_id = "_smoketest_dispatch_index_building" + ("_rm" if deleted else "")
+    repo_id = f"_smoketest_dispatch_index_building{'_rm' if deleted else ''}_{_TOKEN}"
     source = temp_repo / "a.py"
     source.write_text("def f():\n    return 1\n")
     try:

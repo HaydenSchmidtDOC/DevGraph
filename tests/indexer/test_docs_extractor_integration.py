@@ -1,12 +1,17 @@
 """Integration tests for the docs extractor with live Neo4j database."""
 
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.docs.extractor import index_file
+
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
 
 
 @pytest.fixture
@@ -29,7 +34,7 @@ def graph_engine():
 
 def test_index_requirement_links_to_existing_module(graph_engine):
     """A Requirement note linking to a Module upserts the SATISFIES edge."""
-    repo_id = "_smoketest_docs_extractor"
+    repo_id = f"_smoketest_docs_extractor_{_TOKEN}"
 
     graph_engine.upsert_node("Module", repo_id, "AuthService", {})
 
@@ -70,7 +75,7 @@ def test_index_requirement_links_to_existing_module(graph_engine):
 
 def test_index_file_idempotent(graph_engine):
     """Re-indexing the same note doesn't create duplicate nodes."""
-    repo_id = "_smoketest_docs_idempotence"
+    repo_id = f"_smoketest_docs_idempotence_{_TOKEN}"
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".md", delete=False, encoding="utf-8"

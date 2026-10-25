@@ -1,12 +1,17 @@
 """Integration tests for Python extractor with live Neo4j database."""
 
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.python.extractor import index_file
+
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
 
 
 @pytest.fixture
@@ -31,7 +36,7 @@ def graph_engine():
 
 def test_index_python_file_end_to_end(graph_engine):
     """Test indexing a Python file and verifying it in Neo4j."""
-    repo_id = "_smoketest_python_extractor"
+    repo_id = f"_smoketest_python_extractor_{_TOKEN}"
 
     # Create a temporary Python file
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -133,7 +138,7 @@ def process_batch(items: List[str]) -> None:
 
 def test_index_file_creates_idempotent_nodes(graph_engine):
     """Test that re-indexing the same file doesn't create duplicates."""
-    repo_id = "_smoketest_idempotence"
+    repo_id = f"_smoketest_idempotence_{_TOKEN}"
 
     # Create a temporary Python file
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -167,7 +172,7 @@ def test_relative_import_edge_resolves_to_indexed_module(graph_engine):
     real Module node name, so find_related_files' imported_modules was
     always empty regardless of what got indexed.
     """
-    repo_id = "_smoketest_relative_imports"
+    repo_id = f"_smoketest_relative_imports_{_TOKEN}"
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write("from . import utils\n")
@@ -202,7 +207,7 @@ def test_calls_edges_make_find_callers_work_end_to_end(graph_engine):
     """
     from devgraph.mcp.tools import find_callers, impact_analysis
 
-    repo_id = "_smoketest_calls_edges"
+    repo_id = f"_smoketest_calls_edges_{_TOKEN}"
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(
@@ -246,7 +251,7 @@ def test_dotted_absolute_import_edge_resolves_end_to_end(graph_engine):
     (real repo, absolute-dotted-import style exclusively) having zero
     resolvable same-repo IMPORTS edges.
     """
-    repo_id = "_smoketest_dotted_absolute_import"
+    repo_id = f"_smoketest_dotted_absolute_import_{_TOKEN}"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         repo_root = Path(tmpdir)

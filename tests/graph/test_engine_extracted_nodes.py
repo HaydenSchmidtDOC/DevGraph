@@ -1,11 +1,17 @@
 """delete_extracted_nodes / prune_extracted_nodes against a live Neo4j."""
 
+import uuid
+
 import pytest
 
 from devgraph.graph.engine import GraphEngine
 
-REPO = "_smoketest_extracted_nodes"
-OTHER = "_smoketest_extracted_nodes_other"
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
+
+REPO = f"_smoketest_extracted_nodes_{_TOKEN}"
+OTHER = f"_smoketest_extracted_nodes_other_{_TOKEN}"
 
 
 @pytest.fixture

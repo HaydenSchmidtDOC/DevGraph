@@ -2,9 +2,15 @@
 cleanup path that was previously entirely missing (only whole-repo
 delete_repository existed)."""
 
+import uuid
+
 import pytest
 
 from devgraph.graph.engine import GraphEngine
+
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
 
 
 @pytest.fixture
@@ -21,7 +27,7 @@ def engine():
 
 class TestDeleteNodesBySourceFile:
     def test_deletes_nodes_matching_source_file_property(self, engine):
-        repo_id = "_smoketest_delete_source_file"
+        repo_id = f"_smoketest_delete_source_file_{_TOKEN}"
         engine.upsert_node("Module", repo_id, "gone.py", {"type": "module", "source_file": "gone.py"})
         engine.upsert_node("Class", repo_id, "GoneClass", {"file": "gone.py"})
         engine.upsert_node("Module", repo_id, "kept.py", {"type": "module", "source_file": "kept.py"})
@@ -39,7 +45,7 @@ class TestDeleteNodesBySourceFile:
 
     def test_matches_source_property_variant(self, engine):
         """datastores/apis/containers extractors use `source` instead of `source_file`/`file`."""
-        repo_id = "_smoketest_delete_source_variant"
+        repo_id = f"_smoketest_delete_source_variant_{_TOKEN}"
         engine.upsert_node("Database", repo_id, "PostgreSQL", {"source": "db.py"})
 
         try:
@@ -52,8 +58,8 @@ class TestDeleteNodesBySourceFile:
             engine.delete_repository(repo_id)
 
     def test_scoped_to_repo_id(self, engine):
-        repo_a = "_smoketest_delete_scope_a"
-        repo_b = "_smoketest_delete_scope_b"
+        repo_a = f"_smoketest_delete_scope_a_{_TOKEN}"
+        repo_b = f"_smoketest_delete_scope_b_{_TOKEN}"
         engine.upsert_node("Module", repo_a, "shared_name.py", {"source_file": "shared_name.py"})
         engine.upsert_node("Module", repo_b, "shared_name.py", {"source_file": "shared_name.py"})
 
@@ -78,7 +84,7 @@ class TestDeleteNodesBySourceFile:
         service). Deleting one producing file must not destroy a node the
         other file still produces — only delete once every claiming file is
         gone."""
-        repo_id = "_smoketest_delete_multi_source"
+        repo_id = f"_smoketest_delete_multi_source_{_TOKEN}"
         engine.upsert_node("Service", repo_id, "web", {"source": "docker-compose.yml"})
         engine.upsert_node("Service", repo_id, "web", {"source": "docker-compose.override.yml"})
 
@@ -101,7 +107,7 @@ class TestDeleteNodesBySourceFile:
             engine.delete_repository(repo_id)
 
     def test_no_match_is_a_no_op(self, engine):
-        repo_id = "_smoketest_delete_no_match"
+        repo_id = f"_smoketest_delete_no_match_{_TOKEN}"
         engine.upsert_node("Module", repo_id, "kept.py", {"source_file": "kept.py"})
 
         try:

@@ -18,7 +18,6 @@ from devgraph.indexer.dispatch import (
 from devgraph.indexer.providers import filesystem
 from tests.indexer.docs_live_helpers import assert_matches_fresh_apply
 
-REPO = "_smoketest_fs_provider"
 WORKTREE = """
     version: 1
     node_types:
@@ -40,6 +39,7 @@ WORKTREE = """
 # Unique per run: these tests drop and re-create the labels' generated
 # constraints, which are database-wide and shared with real repositories.
 _TOKEN = uuid.uuid4().hex[:8]
+REPO = f"_smoketest_fs_provider_{_TOKEN}"
 FILE, FOLDER, ENTRY, NOTE = (f"ZzFile{_TOKEN}", f"ZzFolder{_TOKEN}", f"ZzEntry{_TOKEN}", f"ZzNote{_TOKEN}")
 _SHOWN = {FILE: "File", FOLDER: "Folder", ENTRY: "Entry", NOTE: "Note"}
 FRESH = f"{REPO}_fresh_{_TOKEN}"

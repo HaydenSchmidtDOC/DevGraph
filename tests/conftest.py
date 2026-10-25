@@ -228,7 +228,7 @@ def real_project_trust():
 #: when it is unique to its creation (`_UNIQUE_PART`), this process passed it to
 #: Neo4j and it didn't exist when the session started, so it never touches a
 #: real repository, one a test was already holding before this run, or a fixed
-#: id (`test-repo`, `_smoketest_fs_provider`) another session may be using.
+#: id (`test-repo`) another session may be using.
 _TEST_REPO_PREFIXES = ("zz-", "zz_", "_smoketest_", "test_repo_", "test-repo", "dash_repo_")
 #: A random part: a run of 8 or more hex characters, digits among them (a uuid
 #: slice, an epoch stamp), standing between separators.

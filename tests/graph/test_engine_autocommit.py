@@ -7,12 +7,18 @@ inside the wrong statement's retry, and the session's close swallowed it into
 a warning, so the indexer carried on as if the write had happened. The fake
 session here mimics the driver on both counts."""
 
+import uuid
+
 import pytest
 from neo4j.exceptions import ConstraintError, TransientError
 
 from devgraph.graph import engine as engine_module
 from devgraph.graph.engine import GraphEngine
 from tests.helpers import stub
+
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
 
 # Captured at import: without a local Neo4j, conftest's `_fail_fast_without_neo4j`
 # replaces GraphEngine.verify_connectivity for each test.
@@ -174,7 +180,7 @@ def test_a_write_violating_a_constraint_after_its_first_rows_raises(engine):
     the write itself; unconsumed, the session's close only logged it. (Neo4j
     reports most other failures with the RUN, so this shape is the one that
     fails late on demand.)"""
-    repo_id = "_smoketest_autocommit_late_failure"
+    repo_id = f"_smoketest_autocommit_late_failure_{_TOKEN}"
     query = (
         "UNWIND range(1, 3000) AS i "
         "CREATE (:Repository {repo_id: $repo_id + '_' + CASE WHEN i = 2999 THEN 1 ELSE i END}) RETURN i"

@@ -467,7 +467,7 @@ def test_deepening_a_shallow_clone_corrects_its_history(graph_engine, registry, 
     _run_git(origin, "commit", "-am", "Edit a")
     clone = tmp_path / "clone"
     subprocess.run(["git", "clone", "--quiet", "--depth=1", f"file://{origin}", str(clone)], check=True)
-    record = registry.add_repo(clone, repo_id="_shallow_deepen_test")
+    record = registry.add_repo(clone, repo_id=f"_smoketest_shallow_deepen_{_TOKEN}")
     for name in ("a", "b", "c", "d"):
         graph_engine.upsert_node("Module", record.repo_id, f"{name}.py", {})
 

@@ -1,11 +1,17 @@
 """run_read_cypher: read access mode, timeout, row cap. Live Neo4j."""
 
+import uuid
+
 import pytest
 from neo4j.exceptions import Neo4jError
 
 from devgraph.graph.engine import GraphEngine
 
-REPO = "_smoketest_read_cypher"
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
+
+REPO = f"_smoketest_read_cypher_{_TOKEN}"
 
 
 @pytest.fixture

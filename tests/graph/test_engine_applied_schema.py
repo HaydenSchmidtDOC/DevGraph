@@ -1,11 +1,17 @@
 """Applied-schema state and removed-type cleanup on a live Neo4j."""
 
+import uuid
+
 import pytest
 
 from devgraph.graph.engine import GraphEngine
 
-REPO = "_smoketest_applied_schema"
-OTHER = "_smoketest_applied_schema_other"
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
+
+REPO = f"_smoketest_applied_schema_{_TOKEN}"
+OTHER = f"_smoketest_applied_schema_other_{_TOKEN}"
 
 
 @pytest.fixture
