@@ -1,5 +1,6 @@
 """Container extractor for parsing Containerfile, Dockerfile, and docker-compose/podman-compose files."""
 
+import posixpath
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -159,11 +160,12 @@ class ContainerExtractor:
                     continue
 
                 # Create Service node. build_context (when present) is the
-                # service's source directory relative to the compose file —
-                # used by devgraph/indexer/dispatch.py to link a Python
-                # file's Database/Endpoint nodes back to the Service that
-                # owns it, via directory containment.
-                build_context = self._extract_build_context(service_config.get("build"))
+                # service's source directory relative to the repository
+                # ("" its root), resolved from the compose file's folder —
+                # used by devgraph/indexer/dispatch.py to link a file's
+                # datastore/Endpoint nodes back to the Service that owns
+                # it, via directory containment.
+                build_context = self._extract_build_context(service_config.get("build"), posixpath.dirname(filename))
                 # `file` (in addition to `source`) is what makes
                 # _upsert_nodes_tx key this Service on (repo_id, name, file)
                 # instead of bare (repo_id, name) -- two compose files
@@ -277,61 +279,64 @@ class ContainerExtractor:
         return [name for name in dict.fromkeys(name.strip() for name in names) if name]
 
     @staticmethod
-    def _extract_build_context(build_config) -> Optional[str]:
-        """Normalize a compose service's `build` field to a relative directory.
+    def _extract_build_context(build_config, compose_dir: str = "") -> Optional[str]:
+        """A compose service's `build` field as a repository-relative
+        directory ("" the repository root), resolved from `compose_dir`, the
+        compose file's own folder, as compose resolves it.
 
         Handles:
         - shorthand ('build: ./services/api')
         - long form with a real context ('build: {context: ./services/api}')
-        - long form where context is the repo root but dockerfile points
-          into a subdirectory ('build: {context: ., dockerfile:
-          services/ingestion/Dockerfile}') — a common compose pattern (single
-          shared build context, per-service Dockerfile) where the actual
-          service source lives at the Dockerfile's own directory, not at
-          context itself. Uses the Dockerfile's parent directory in that case.
+        - long form where context is the compose file's own folder but the
+          dockerfile points into a subdirectory ('build: {context: .,
+          dockerfile: services/ingestion/Dockerfile}') — a common compose
+          pattern (single shared build context, per-service Dockerfile)
+          where the actual service source lives at the Dockerfile's own
+          directory (relative to the context), not at the context itself.
 
         Returns None for services with no `build` key (image-only services
         like databases/brokers — those correctly have no source directory of
-        their own to attribute Python files to) or when nothing resolvable
-        is found.
+        their own to attribute files to), or a context outside the
+        repository or not a folder (an absolute path, a Git URL).
         """
-        if build_config is None:
-            return None
-
         if isinstance(build_config, str):
-            return ContainerExtractor._normalize_build_dir(build_config)
+            return ContainerExtractor._resolve_build_dir(compose_dir, build_config)
 
         if not isinstance(build_config, dict):
             return None
 
-        context = build_config.get("context")
-        context_dir = (
-            ContainerExtractor._normalize_build_dir(context) if isinstance(context, str) else None
-        )
-        if context_dir is not None:
-            return context_dir
+        context = build_config.get("context", ".")
+        if not isinstance(context, str):
+            return None
+        context_dir = ContainerExtractor._resolve_build_dir(compose_dir, context)
+        if context_dir is None:
+            return None
 
-        # context is repo-root (or absent) — fall back to the Dockerfile's
-        # own directory, which is where the actual per-service source lives
-        # in a single-shared-context layout.
+        # The compose file's own folder as a shared context: the Dockerfile's
+        # own directory, which is where the per-service source lives.
         dockerfile = build_config.get("dockerfile")
-        if isinstance(dockerfile, str):
+        if context_dir == compose_dir and isinstance(dockerfile, str):
             dockerfile_dir = dockerfile.replace("\\", "/").rsplit("/", 1)
             if len(dockerfile_dir) == 2:
-                return ContainerExtractor._normalize_build_dir(dockerfile_dir[0])
+                resolved = ContainerExtractor._resolve_build_dir(context_dir, dockerfile_dir[0])
+                if resolved is not None:
+                    return resolved
 
-        return None
+        return context_dir
 
     @staticmethod
-    def _normalize_build_dir(raw: str) -> Optional[str]:
-        """Strip leading './', collapse to forward slashes, drop a bare '.'
-        (repo root — no meaningful subdirectory to attribute files to)."""
+    def _resolve_build_dir(base: str, raw: str) -> Optional[str]:
+        """`raw`, a build directory written relative to the repository
+        directory `base`, as a normalized repository-relative one ("" the
+        root); None for an empty, absolute or URL one, or one leaving the
+        repository."""
         normalized = raw.replace("\\", "/").strip()
-        if normalized in (".", "./", ""):
+        if not normalized or normalized.startswith("/") or "://" in normalized:
             return None
-        if normalized.startswith("./"):
-            normalized = normalized[2:]
-        return normalized.rstrip("/") or None
+        resolved = posixpath.normpath(posixpath.join(base, normalized))
+        if resolved == ".." or resolved.startswith("../"):
+            return None
+        return "" if resolved == "." else resolved
 
     @staticmethod
     def _extract_image_name(image_ref: str) -> str:

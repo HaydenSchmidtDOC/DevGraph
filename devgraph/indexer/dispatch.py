@@ -211,7 +211,10 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: `include_router(prefix=)`, Flask `Blueprint(url_prefix=)` and
 #: `register_blueprint(url_prefix=)`), a router another file mounts named by
 #: those mounts (apis/routes.py MountTable) and one mounted nowhere the file
-#: shows an Endpoint of its own file (`unmounted_endpoint`).
+#: shows an Endpoint of its own file (`unmounted_endpoint`); and a compose
+#: service's build context resolved from the compose file's folder, the
+#: repository root (`build: .` at the root, `context: ..` one level down)
+#: owning every file no deeper context claims.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 20
 
@@ -3126,13 +3129,14 @@ def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict
 
 
 def _match_owning_service(services: dict[str, tuple[str, str]], rel_path: str) -> str | None:
-    """Find the Service whose build_context is the longest prefix of rel_path's directory."""
+    """Find the Service whose build_context is the longest prefix of rel_path's
+    directory; a context of "" (the repository root) holds every file."""
     file_dir = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
 
     best_match: str | None = None
     best_match_len = -1
     for name, (context, _file) in services.items():
-        if file_dir == context or file_dir.startswith(context + "/"):
+        if context == "" or file_dir == context or file_dir.startswith(context + "/"):
             if len(context) > best_match_len:
                 best_match = name
                 best_match_len = len(context)
