@@ -7,6 +7,7 @@ entry point into the same engine.
 """
 
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,12 @@ from devgraph.dashboard.app import build_app
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.graph.engine import GraphEngine
 from devgraph.registry.store import RepoRegistry
+
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
+REPO_A, REPO_B = f"dash_repo_a_{_TOKEN}", f"dash_repo_b_{_TOKEN}"
+SCHEMA_REPO, NEVER_REPO = f"dash_repo_schema_{_TOKEN}", f"dash_repo_never_{_TOKEN}"
 
 
 @pytest.fixture
@@ -37,21 +44,21 @@ def engine():
 
 @pytest.fixture
 def seeded_graph(engine):
-    engine.upsert_repository("dash_repo_a", "Dash Repo A", "/path/to/repo_a")
-    engine.upsert_node("Service", "dash_repo_a", "UserService")
-    engine.upsert_node("Service", "dash_repo_a", "AuthService")
-    engine.upsert_node("Module", "dash_repo_a", "auth.py")
-    engine.upsert_node("Class", "dash_repo_a", "AuthHandler")
-    engine.upsert_relationship("Service", "UserService", "CALLS", "Service", "AuthService", "dash_repo_a")
-    engine.upsert_relationship("Module", "auth.py", "CONTAINS", "Class", "AuthHandler", "dash_repo_a")
+    engine.upsert_repository(REPO_A, "Dash Repo A", "/path/to/repo_a")
+    engine.upsert_node("Service", REPO_A, "UserService")
+    engine.upsert_node("Service", REPO_A, "AuthService")
+    engine.upsert_node("Module", REPO_A, "auth.py")
+    engine.upsert_node("Class", REPO_A, "AuthHandler")
+    engine.upsert_relationship("Service", "UserService", "CALLS", "Service", "AuthService", REPO_A)
+    engine.upsert_relationship("Module", "auth.py", "CONTAINS", "Class", "AuthHandler", REPO_A)
 
-    engine.upsert_repository("dash_repo_b", "Dash Repo B", "/path/to/repo_b")
-    engine.upsert_node("Service", "dash_repo_b", "NotificationService")
+    engine.upsert_repository(REPO_B, "Dash Repo B", "/path/to/repo_b")
+    engine.upsert_node("Service", REPO_B, "NotificationService")
 
     yield engine
 
-    engine.delete_repository("dash_repo_a")
-    engine.delete_repository("dash_repo_b")
+    engine.delete_repository(REPO_A)
+    engine.delete_repository(REPO_B)
 
 
 @pytest.fixture
@@ -73,15 +80,15 @@ def client(seeded_graph, registry):
     # add_repo requires a real (empty is fine) git repo on disk and
     # slugifies its name into a repo_id -- register two throwaway repos
     # under explicit repo_ids matching the fixture graph's seeded data
-    # ("dash_repo_a"/"dash_repo_b") rather than letting it derive one from
+    # (REPO_A/REPO_B) rather than letting it derive one from
     # a temp directory name.
     with tempfile.TemporaryDirectory() as dir_a, tempfile.TemporaryDirectory() as dir_b:
         _init_git_repo(Path(dir_a))
         _init_git_repo(Path(dir_b))
-        record_a = registry.add_repo(dir_a, repo_id="dash_repo_a")
-        record_b = registry.add_repo(dir_b, repo_id="dash_repo_b")
-        assert record_a.repo_id == "dash_repo_a"
-        assert record_b.repo_id == "dash_repo_b"
+        record_a = registry.add_repo(dir_a, repo_id=REPO_A)
+        record_b = registry.add_repo(dir_b, repo_id=REPO_B)
+        assert record_a.repo_id == REPO_A
+        assert record_b.repo_id == REPO_B
 
         events = EventBroadcaster()
         app = build_app(seeded_graph, registry, events)
@@ -95,8 +102,8 @@ def test_list_repos(client):
     assert "repos" in body
     assert "issues" in body
     repo_ids = {r["repo_id"] for r in body["repos"]}
-    assert {"dash_repo_a", "dash_repo_b"} <= repo_ids
-    repo_a = next(r for r in body["repos"] if r["repo_id"] == "dash_repo_a")
+    assert {REPO_A, REPO_B} <= repo_ids
+    repo_a = next(r for r in body["repos"] if r["repo_id"] == REPO_A)
     assert repo_a["node_count"] >= 4  # 2 services + 1 module + 1 class
 
 
@@ -105,16 +112,16 @@ def test_list_repos_marks_a_missing_repository_folder(seeded_graph, registry, tm
     for path in (present, gone):
         path.mkdir()
         _init_git_repo(path)
-    registry.add_repo(present, repo_id="dash_repo_a")
-    gone = registry.add_repo(gone, repo_id="dash_repo_b").path  # the registry's own (resolved) spelling
+    registry.add_repo(present, repo_id=REPO_A)
+    gone = registry.add_repo(gone, repo_id=REPO_B).path  # the registry's own (resolved) spelling
     import shutil
 
     shutil.rmtree(gone)
     client = TestClient(build_app(seeded_graph, registry, EventBroadcaster()), base_url="http://127.0.0.1")
     repos = {r["repo_id"]: r for r in client.get("/api/repos").json()["repos"]}
-    assert repos["dash_repo_a"]["path_missing"] is False
-    assert repos["dash_repo_b"]["path_missing"] is True
-    assert repos["dash_repo_b"]["issue"] == f"path missing: repository folder not found: {gone}"
+    assert repos[REPO_A]["path_missing"] is False
+    assert repos[REPO_B]["path_missing"] is True
+    assert repos[REPO_B]["issue"] == f"path missing: repository folder not found: {gone}"
 
 
 def test_list_repos_tells_a_partly_watched_repository_from_an_unwatched_one(client, tmp_path, monkeypatch):
@@ -125,22 +132,22 @@ def test_list_repos_tells_a_partly_watched_repository_from_an_unwatched_one(clie
     settings = get_settings().model_copy(update={"registry_db_path": tmp_path / "registry.sqlite3"})
     monkeypatch.setattr(routes, "get_settings", lambda: settings)
     (tmp_path / "repo_issues.json").write_text(json.dumps({
-        "dash_repo_a": "partly watched: a new folder isn't watched, inotify limit reached",
-        "dash_repo_b": "watching unavailable: inotify limit reached",
+        REPO_A: "partly watched: a new folder isn't watched, inotify limit reached",
+        REPO_B: "watching unavailable: inotify limit reached",
     }))
     repos = {r["repo_id"]: r for r in client.get("/api/repos").json()["repos"]}
-    assert repos["dash_repo_a"]["partly_watched"] is True
-    assert repos["dash_repo_b"]["partly_watched"] is False
-    assert repos["dash_repo_b"]["issue"] == "watching unavailable: inotify limit reached"
+    assert repos[REPO_A]["partly_watched"] is True
+    assert repos[REPO_B]["partly_watched"] is False
+    assert repos[REPO_B]["issue"] == "watching unavailable: inotify limit reached"
 
     # A hand-edited or corrupt file's non-string issue is not an error.
-    (tmp_path / "repo_issues.json").write_text(json.dumps({"dash_repo_a": 7}))
+    (tmp_path / "repo_issues.json").write_text(json.dumps({REPO_A: 7}))
     repos = {r["repo_id"]: r for r in client.get("/api/repos").json()["repos"]}
-    assert repos["dash_repo_a"]["partly_watched"] is False
+    assert repos[REPO_A]["partly_watched"] is False
 
 
 def test_summary_counts_known_seeded_data(client):
-    res = client.get("/api/repos/dash_repo_a/summary")
+    res = client.get(f"/api/repos/{REPO_A}/summary")
     assert res.status_code == 200
     body = res.json()
     assert body["nodes_by_label"]["Service"] == 2
@@ -151,14 +158,14 @@ def test_summary_counts_known_seeded_data(client):
 
 
 def test_summary_does_not_leak_cross_repo(client):
-    res = client.get("/api/repos/dash_repo_a/summary")
+    res = client.get(f"/api/repos/{REPO_A}/summary")
     body = res.json()
     assert "NotificationService" not in body["nodes_by_label"]
     assert body["nodes_by_label"].get("Service") == 2  # not 3
 
 
 def test_graph_endpoint_shape(client):
-    res = client.get("/api/repos/dash_repo_a/graph")
+    res = client.get(f"/api/repos/{REPO_A}/graph")
     assert res.status_code == 200
     body = res.json()
     assert set(body.keys()) == {"nodes", "edges"}
@@ -170,25 +177,25 @@ def test_graph_endpoint_shape(client):
 
 
 def test_graph_endpoint_label_filter(client):
-    res = client.get("/api/repos/dash_repo_a/graph", params={"label": "Service"})
+    res = client.get(f"/api/repos/{REPO_A}/graph", params={"label": "Service"})
     assert res.status_code == 200
     body = res.json()
     assert all(n["data"]["label"] == "Service" for n in body["nodes"])
 
 
 def test_graph_endpoint_unknown_label_rejected(client):
-    res = client.get("/api/repos/dash_repo_a/graph", params={"label": "NotARealLabel"})
+    res = client.get(f"/api/repos/{REPO_A}/graph", params={"label": "NotARealLabel"})
     assert res.status_code == 400
 
 
 def test_graph_endpoint_limit_capping(client):
-    res = client.get("/api/repos/dash_repo_a/graph", params={"limit": 1})
+    res = client.get(f"/api/repos/{REPO_A}/graph", params={"limit": 1})
     assert res.status_code == 200
     assert len(res.json()["nodes"]) <= 1
 
 
 def test_search_endpoint(client):
-    res = client.get("/api/repos/dash_repo_a/search", params={"q": "Auth"})
+    res = client.get(f"/api/repos/{REPO_A}/search", params={"q": "Auth"})
     assert res.status_code == 200
     names = [r["name"] for r in res.json()["results"]]
     assert "AuthService" in names
@@ -208,7 +215,7 @@ def test_unknown_repo_id_404s(client):
 def test_cypher_endpoint_returns_neo4j_http_shaped_graph(client):
     res = client.post(
         "/api/cypher",
-        json={"query": "MATCH (n:Service {repo_id: 'dash_repo_a'}) RETURN n ORDER BY n.name"},
+        json={"query": f"MATCH (n:Service {{repo_id: '{REPO_A}'}}) RETURN n ORDER BY n.name"},
     )
     assert res.status_code == 200
     body = res.json()
@@ -225,30 +232,30 @@ def test_cypher_graph_nodes_carry_the_identity_key(client, seeded_graph):
     the file-scoped and non-file-scoped forms are exercised over real HTTP
     against a real node rather than as a unit call."""
     seeded_graph.upsert_node(
-        "Function", "dash_repo_a", "handler", {"file": "svc/api.py"}
+        "Function", REPO_A, "handler", {"file": "svc/api.py"}
     )
     res = client.post(
         "/api/cypher",
-        json={"query": "MATCH (n {repo_id: 'dash_repo_a'}) WHERE n:Service OR n:Function RETURN n"},
+        json={"query": f"MATCH (n {{repo_id: '{REPO_A}'}}) WHERE n:Service OR n:Function RETURN n"},
     )
     keys = {n["key"] for row in res.json()["results"][0]["data"] for n in row["graph"]["nodes"]}
-    assert "Service\x1fdash_repo_a\x1fUserService" in keys
-    assert "Function\x1fdash_repo_a\x1fhandler\x1fsvc/api.py" in keys
+    assert f"Service\x1f{REPO_A}\x1fUserService" in keys
+    assert f"Function\x1f{REPO_A}\x1fhandler\x1fsvc/api.py" in keys
 
 
 def test_cypher_graph_key_is_absent_for_an_unkeyable_node(client, seeded_graph):
     """A node with no `name` cannot be keyed. It must come back as null
     rather than as a key built from an empty string, which would collide
     with every other nameless node of the same label."""
-    seeded_graph.run_cypher("CREATE (:Scratch {repo_id: 'dash_repo_a'})")
+    seeded_graph.run_cypher(f"CREATE (:Scratch {{repo_id: '{REPO_A}'}})")
     try:
         res = client.post(
-            "/api/cypher", json={"query": "MATCH (n:Scratch) RETURN n"}
+            "/api/cypher", json={"query": f"MATCH (n:Scratch {{repo_id: '{REPO_A}'}}) RETURN n"}
         )
         nodes = [n for row in res.json()["results"][0]["data"] for n in row["graph"]["nodes"]]
         assert nodes and all(n["key"] is None for n in nodes)
     finally:
-        seeded_graph.run_cypher("MATCH (n:Scratch) DETACH DELETE n")
+        seeded_graph.run_cypher(f"MATCH (n:Scratch {{repo_id: '{REPO_A}'}}) DETACH DELETE n")
 
 
 def test_cypher_canvas_result_carries_only_what_the_canvas_draws(client, seeded_graph):
@@ -257,11 +264,11 @@ def test_cypher_canvas_result_carries_only_what_the_canvas_draws(client, seeded_
     properties, and the row repeats no node, so a large view's payload stays
     small. `matchedId` is kept: it is how the canvas tells n from m."""
     seeded_graph.upsert_node(
-        "Function", "dash_repo_a", "handler",
+        "Function", REPO_A, "handler",
         {"file": "svc/api.py", "docstring_full": "x" * 5000, "insight_community": 3},
     )
     query = (
-        "MATCH (n) WHERE n.repo_id = 'dash_repo_a' "
+        f"MATCH (n) WHERE n.repo_id = '{REPO_A}' "
         "OPTIONAL MATCH (n)-[r]-(m) RETURN n, r, m, id(n) AS matchedId"
     )
     full = client.post("/api/cypher", json={"query": query}).json()["results"][0]
@@ -270,9 +277,9 @@ def test_cypher_canvas_result_carries_only_what_the_canvas_draws(client, seeded_
     nodes = [n for row in slim["data"] for n in row["graph"]["nodes"]]
     handler = next(n for n in nodes if n["properties"].get("name") == "handler")
     assert handler["properties"] == {
-        "name": "handler", "repo_id": "dash_repo_a", "file": "svc/api.py", "owner": "", "insight_community": 3
+        "name": "handler", "repo_id": REPO_A, "file": "svc/api.py", "owner": "", "insight_community": 3
     }
-    assert handler["key"] == "Function\x1fdash_repo_a\x1fhandler\x1fsvc/api.py"
+    assert handler["key"] == f"Function\x1f{REPO_A}\x1fhandler\x1fsvc/api.py"
     assert all(rel["properties"] == {} for row in slim["data"] for rel in row["graph"]["relationships"])
     assert all(row["row"][:3] == [None, None, None] for row in slim["data"])
     assert sorted(row["row"][3] for row in slim["data"]) == sorted(row["row"][3] for row in full["data"])
@@ -296,11 +303,11 @@ def test_cypher_endpoint_only_logs_when_record_true(client):
     client.post("/api/cypher", json={"query": "RETURN 1", "record": False})
     assert client.get("/api/query-log").json()["entries"] == []
 
-    client.post("/api/cypher", json={"query": "RETURN 1", "repo_id": "dash_repo_a", "record": True})
+    client.post("/api/cypher", json={"query": "RETURN 1", "repo_id": REPO_A, "record": True})
     entries = client.get("/api/query-log").json()["entries"]
     assert len(entries) == 1
     assert entries[0]["query"] == "RETURN 1"
-    assert entries[0]["repo_id"] == "dash_repo_a"
+    assert entries[0]["repo_id"] == REPO_A
     assert entries[0]["ok"] is True
 
 
@@ -326,13 +333,13 @@ def test_mcp_tools_endpoint_has_real_descriptions(client):
 
 def test_git_log_endpoint_on_empty_repo_returns_empty_list(client):
     # The client fixture's registered repos are `git init`-only, no commits.
-    res = client.get("/api/repos/dash_repo_a/git-log")
+    res = client.get(f"/api/repos/{REPO_A}/git-log")
     assert res.status_code == 200
     assert res.json() == []
 
 
 def test_git_status_endpoint_shape(client):
-    res = client.get("/api/repos/dash_repo_a/git-status")
+    res = client.get(f"/api/repos/{REPO_A}/git-status")
     assert res.status_code == 200
     body = res.json()
     assert "branch" in body
@@ -355,17 +362,17 @@ def fake_layout_settings(tmp_path, monkeypatch):
 
 
 def test_layout_endpoint_empty_when_unsaved(client, fake_layout_settings):
-    res = client.get("/api/repos/dash_repo_a/layout")
+    res = client.get(f"/api/repos/{REPO_A}/layout")
     assert res.status_code == 200
     assert res.json() == {}
 
 
 def test_layout_round_trips_through_put_and_get(client, fake_layout_settings):
-    positions = {"Service\x1fdash_repo_a\x1fUserService": [10, 20]}
-    put_res = client.put("/api/repos/dash_repo_a/layout", json=positions)
+    positions = {f"Service\x1f{REPO_A}\x1fUserService": [10, 20]}
+    put_res = client.put(f"/api/repos/{REPO_A}/layout", json=positions)
     assert put_res.status_code == 200
 
-    get_res = client.get("/api/repos/dash_repo_a/layout")
+    get_res = client.get(f"/api/repos/{REPO_A}/layout")
     assert get_res.status_code == 200
     assert get_res.json() == positions
 
@@ -379,21 +386,21 @@ def test_all_repos_layout_scope_is_accepted(client, fake_layout_settings):
     """The canvas's "All Repos" view is not a registered repo but still has a
     layout worth persisting, so its reserved id bypasses the registry check
     that every other id goes through."""
-    positions = {"Service\x1fdash_repo_a\x1fUserService": [3, 4]}
+    positions = {f"Service\x1f{REPO_A}\x1fUserService": [3, 4]}
     assert client.put("/api/repos/__all__/layout", json=positions).status_code == 200
     assert client.get("/api/repos/__all__/layout").json() == positions
 
 
 def test_all_repos_layout_is_separate_from_a_real_repos(client, fake_layout_settings):
     client.put("/api/repos/__all__/layout", json={"k": [1, 1]})
-    client.put("/api/repos/dash_repo_a/layout", json={"k": [2, 2]})
+    client.put(f"/api/repos/{REPO_A}/layout", json={"k": [2, 2]})
     assert client.get("/api/repos/__all__/layout").json() == {"k": [1, 1]}
-    assert client.get("/api/repos/dash_repo_a/layout").json() == {"k": [2, 2]}
+    assert client.get(f"/api/repos/{REPO_A}/layout").json() == {"k": [2, 2]}
 
 
 def test_layout_put_rejects_oversized_payload(client, fake_layout_settings):
     huge = {f"key-{i}": [0, 0] for i in range(200_000)}
-    res = client.put("/api/repos/dash_repo_a/layout", json=huge)
+    res = client.put(f"/api/repos/{REPO_A}/layout", json=huge)
     assert res.status_code == 413
 
 
@@ -446,14 +453,14 @@ def schema_repo(engine, registry, tmp_path):
     _init_git_repo(root)
     (root / "a.txt").write_text("x")
     (root / "devgraph.schema.yaml").write_text(_FS_SCHEMA)
-    record = registry.add_repo(str(root), repo_id="dash_schema")
+    record = registry.add_repo(str(root), repo_id=SCHEMA_REPO)
     try:
-        engine.upsert_repository("dash_schema", "Dash Schema", str(root))
-        full_scan(engine, "dash_schema", root)
+        engine.upsert_repository(SCHEMA_REPO, "Dash Schema", str(root))
+        full_scan(engine, SCHEMA_REPO, root)
         client = TestClient(build_app(engine, registry, EventBroadcaster()), base_url="http://127.0.0.1")
         yield client, root, record
     finally:
-        engine.delete_repository("dash_schema")
+        engine.delete_repository(SCHEMA_REPO)
 
 
 def test_schema_unknown_repo_404s(client):
@@ -463,7 +470,7 @@ def test_schema_unknown_repo_404s(client):
 def test_schema_without_a_file_is_the_builtins(client):
     from devgraph.graph.schema import BUILTIN_LABELS, RELATIONSHIP_TYPES
 
-    body = client.get("/api/repos/dash_repo_a/schema").json()
+    body = client.get(f"/api/repos/{REPO_A}/schema").json()
     assert [t["label"] for t in body["node_types"]] == list(BUILTIN_LABELS)
     assert "Cache" in BUILTIN_LABELS
     assert all(t["origin"] == "builtin" and t["color"] is None for t in body["node_types"])
@@ -480,14 +487,14 @@ def test_schema_serves_the_hidden_properties(client):
     does, and the edge inspector an edge's `origins`."""
     from devgraph.graph.schema import INTERNAL_EDGE_PROPERTIES, INTERNAL_NODE_PROPERTIES
 
-    body = client.get("/api/repos/dash_repo_a/schema").json()
+    body = client.get(f"/api/repos/{REPO_A}/schema").json()
     assert body["hidden_properties"] == sorted(INTERNAL_NODE_PROPERTIES | INTERNAL_EDGE_PROPERTIES)
     assert {"claims", "name_refs", "name_ref_targets", "name_ref_sources", "origins"} <= set(body["hidden_properties"])
 
 
 def test_schema_applied_lists_project_types_with_colours_and_counts(schema_repo):
     client, _, _ = schema_repo
-    body = client.get("/api/repos/dash_schema/schema").json()
+    body = client.get(f"/api/repos/{SCHEMA_REPO}/schema").json()
     assert body["schema_state"] == "applied" and body["notices"] == []
     project = {t["label"]: t for t in body["node_types"] if t["origin"] == "project"}
     assert set(project) == {"File", "Folder"}
@@ -499,7 +506,7 @@ def test_schema_applied_lists_project_types_with_colours_and_counts(schema_repo)
     rels = {t["type"]: t for t in body["relationship_types"] if t["origin"] == "project"}
     assert set(rels) == {"IS_CHILD_OF"} and rels["IS_CHILD_OF"]["color"]
     # Deterministic: asking again gives the same colours.
-    again = client.get("/api/repos/dash_schema/schema").json()
+    again = client.get(f"/api/repos/{SCHEMA_REPO}/schema").json()
     assert again == body
 
 
@@ -511,7 +518,7 @@ def test_schema_changed_after_apply_is_pending_and_hides_new_labels(schema_repo)
             "  - label: Widget\n    key: [sku]\n    metadata: [{name: sku}]\nrelationships:",
         )
     )
-    body = client.get("/api/repos/dash_schema/schema").json()
+    body = client.get(f"/api/repos/{SCHEMA_REPO}/schema").json()
     assert body["schema_state"] == "pending"
     labels = {t["label"] for t in body["node_types"]}
     assert "Widget" not in labels and {"File", "Folder"} <= labels
@@ -521,7 +528,7 @@ def test_schema_changed_after_apply_is_pending_and_hides_new_labels(schema_repo)
 def test_schema_invalid_file_reports_invalid_with_notice(schema_repo):
     client, root, _ = schema_repo
     (root / "devgraph.schema.yaml").write_text("version: [unclosed")
-    body = client.get("/api/repos/dash_schema/schema").json()
+    body = client.get(f"/api/repos/{SCHEMA_REPO}/schema").json()
     assert body["schema_state"] == "invalid"
     assert body["notices"] and "invalid" in body["notices"][0].lower()
     assert {"File", "Folder"} <= {t["label"] for t in body["node_types"]}
@@ -529,8 +536,8 @@ def test_schema_invalid_file_reports_invalid_with_notice(schema_repo):
 
 def test_schema_disabled_repo_shows_builtins_only(schema_repo, registry):
     client, _, _ = schema_repo
-    registry.set_project_config_enabled("dash_schema", False)
-    body = client.get("/api/repos/dash_schema/schema").json()
+    registry.set_project_config_enabled(SCHEMA_REPO, False)
+    body = client.get(f"/api/repos/{SCHEMA_REPO}/schema").json()
     assert body["schema_state"] == "disabled"
     assert all(t["origin"] == "builtin" for t in body["node_types"])
     assert all(t["origin"] == "builtin" for t in body["relationship_types"])
@@ -541,15 +548,15 @@ def test_schema_never_applied_file_shows_builtins(engine, registry, tmp_path):
     root.mkdir()
     _init_git_repo(root)
     (root / "devgraph.schema.yaml").write_text(_FS_SCHEMA)
-    registry.add_repo(str(root), repo_id="dash_never")
+    registry.add_repo(str(root), repo_id=NEVER_REPO)
     try:
-        engine.upsert_repository("dash_never", "Dash Never", str(root))
+        engine.upsert_repository(NEVER_REPO, "Dash Never", str(root))
         c = TestClient(build_app(engine, registry, EventBroadcaster()), base_url="http://127.0.0.1")
-        body = c.get("/api/repos/dash_never/schema").json()
+        body = c.get(f"/api/repos/{NEVER_REPO}/schema").json()
         assert body["schema_state"] == "never"
         assert all(t["origin"] == "builtin" for t in body["node_types"])
     finally:
-        engine.delete_repository("dash_never")
+        engine.delete_repository(NEVER_REPO)
 
 
 def test_schema_all_repos_is_the_union(schema_repo):
@@ -566,21 +573,21 @@ def test_schema_all_repos_is_the_union(schema_repo):
 
 def test_graph_accepts_a_declared_label(schema_repo):
     client, _, _ = schema_repo
-    res = client.get("/api/repos/dash_schema/graph", params={"label": "File"})
+    res = client.get(f"/api/repos/{SCHEMA_REPO}/graph", params={"label": "File"})
     assert res.status_code == 200
     nodes = res.json()["nodes"]
     assert nodes and all(n["data"]["label"] == "File" for n in nodes)
-    assert client.get("/api/repos/dash_schema/graph", params={"label": "Service"}).status_code == 200
-    assert client.get("/api/repos/dash_schema/graph", params={"label": "Nope`"}).status_code == 400
+    assert client.get(f"/api/repos/{SCHEMA_REPO}/graph", params={"label": "Service"}).status_code == 200
+    assert client.get(f"/api/repos/{SCHEMA_REPO}/graph", params={"label": "Nope`"}).status_code == 400
 
 
 def test_graph_rejects_a_label_the_repo_did_not_declare(client):
-    assert client.get("/api/repos/dash_repo_a/graph", params={"label": "File"}).status_code == 400
+    assert client.get(f"/api/repos/{REPO_A}/graph", params={"label": "File"}).status_code == 400
 
 
 def test_search_finds_a_declared_label_node_by_name(schema_repo):
     client, _, _ = schema_repo
-    results = client.get("/api/repos/dash_schema/search", params={"q": "a.txt"}).json()["results"]
+    results = client.get(f"/api/repos/{SCHEMA_REPO}/search", params={"q": "a.txt"}).json()["results"]
     assert any(r["label"] == "File" and r["name"] == "a.txt" for r in results)
 
 
@@ -595,13 +602,13 @@ def test_schema_counts_do_not_scan_relationships(schema_repo, monkeypatch):
 
     monkeypatch.setattr(queries, "summary_counts", boom)
     client, _, _ = schema_repo
-    body = client.get("/api/repos/dash_schema/schema").json()
+    body = client.get(f"/api/repos/{SCHEMA_REPO}/schema").json()
     assert {t["label"]: t["count"] for t in body["node_types"]}["File"] == 2
 
 
 def test_schema_all_repos_sums_counts_across_two_repos(schema_repo, client):
-    one = client.get("/api/repos/dash_repo_a/schema").json()
-    two = schema_repo[0].get("/api/repos/dash_schema/schema").json()
+    one = client.get(f"/api/repos/{REPO_A}/schema").json()
+    two = schema_repo[0].get(f"/api/repos/{SCHEMA_REPO}/schema").json()
     both = schema_repo[0].get("/api/repos/__all__/schema").json()
     count = lambda b: {t["label"]: t["count"] for t in b["node_types"]}  # noqa: E731
     expected = {k: count(one).get(k, 0) + count(two).get(k, 0) for k in count(both)}
@@ -613,7 +620,7 @@ def test_schema_all_repos_sums_counts_across_two_repos(schema_repo, client):
 def test_node_counts_by_label_counts_only_nodes(engine, schema_repo):
     from devgraph.dashboard import queries
 
-    counts = queries.node_counts_by_label(engine, ["dash_schema"])
+    counts = queries.node_counts_by_label(engine, [SCHEMA_REPO])
     assert counts["File"] == 2
     assert queries.node_counts_by_label(engine, []) == {}
 
@@ -622,14 +629,14 @@ def test_unsafe_applied_label_is_filtered(schema_repo, engine):
     client, _, _ = schema_repo
     from devgraph.indexer.dispatch import full_scan  # noqa: F401
 
-    applied = engine.read_applied_schema("dash_schema")
+    applied = engine.read_applied_schema(SCHEMA_REPO)
     engine.record_applied_schema(
-        "dash_schema", applied["hash"], ["File", "Bad`Label"], ["IS_CHILD_OF", "bad-rel"]
+        SCHEMA_REPO, applied["hash"], ["File", "Bad`Label"], ["IS_CHILD_OF", "bad-rel"]
     )
-    body = client.get("/api/repos/dash_schema/schema").json()
+    body = client.get(f"/api/repos/{SCHEMA_REPO}/schema").json()
     assert "Bad`Label" not in {t["label"] for t in body["node_types"]}
     assert "bad-rel" not in {t["type"] for t in body["relationship_types"]}
-    assert client.get("/api/repos/dash_schema/graph", params={"label": "Bad`Label"}).status_code == 400
+    assert client.get(f"/api/repos/{SCHEMA_REPO}/graph", params={"label": "Bad`Label"}).status_code == 400
 
 
 def test_pending_only_label_is_gated_until_rescanned(schema_repo, engine):
@@ -642,14 +649,14 @@ def test_pending_only_label_is_gated_until_rescanned(schema_repo, engine):
             "  - label: Widget\n    key: [sku]\n    metadata: [{name: sku}]\nrelationships:",
         )
     )
-    assert client.get("/api/repos/dash_schema/graph", params={"label": "Widget"}).status_code == 400
+    assert client.get(f"/api/repos/{SCHEMA_REPO}/graph", params={"label": "Widget"}).status_code == 400
     engine.run_cypher(
-        "CREATE (:Widget {repo_id: 'dash_schema', name: 'sprocket', file: 'w'})", {}
+        f"CREATE (:Widget {{repo_id: '{SCHEMA_REPO}', name: 'sprocket', file: 'w'}})", {}
     )
-    results = client.get("/api/repos/dash_schema/search", params={"q": "sprocket"}).json()["results"]
+    results = client.get(f"/api/repos/{SCHEMA_REPO}/search", params={"q": "sprocket"}).json()["results"]
     assert not any(r["label"] == "Widget" for r in results)
-    full_scan(engine, "dash_schema", root)
-    assert client.get("/api/repos/dash_schema/graph", params={"label": "Widget"}).status_code == 200
+    full_scan(engine, SCHEMA_REPO, root)
+    assert client.get(f"/api/repos/{SCHEMA_REPO}/graph", params={"label": "Widget"}).status_code == 200
 
 
 def test_search_is_not_available_for_the_all_scope(client):
@@ -667,8 +674,8 @@ def _dashboard_god_nodes_query(where: str) -> str:
 
 
 def test_dashboard_god_nodes_degree_query_runs_on_neo4j_5(client):
-    query = _dashboard_god_nodes_query('WHERE n.repo_id = "dash_repo_a" ')
-    res = client.post("/api/cypher", json={"query": query, "repo_id": "dash_repo_a"})
+    query = _dashboard_god_nodes_query(f"WHERE n.repo_id = '{REPO_A}' ")
+    res = client.post("/api/cypher", json={"query": query, "repo_id": REPO_A})
     body = res.json()
     assert body["errors"] == []
     rows = [d["row"] for d in body["results"][0]["data"]]

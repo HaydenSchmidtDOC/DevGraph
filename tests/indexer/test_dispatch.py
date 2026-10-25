@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import uuid
 from pathlib import Path
 
 import pytest
@@ -936,7 +937,7 @@ class TestDeterministicIndexOrder:
 
         exports = []
         for seed in ("1", "2", "3"):
-            repo_id = f"_smoketest_dispatch_hashseed_{seed}"
+            repo_id = f"_smoketest_dispatch_hashseed_{seed}_{uuid.uuid4().hex[:8]}"
             proc = subprocess.run(
                 [sys.executable, "-c", _SCAN_AND_EXPORT, str(temp_repo), repo_id],
                 env={**os.environ, "PYTHONHASHSEED": seed},

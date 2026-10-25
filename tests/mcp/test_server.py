@@ -9,12 +9,18 @@ end. These tests call through the real MCPServer API so a similar mismatch
 fails the test suite instead of only surfacing when a real client connects.
 """
 
+import uuid
 from pathlib import Path
 
 import pytest
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.mcp.server import build_server
+
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
+REPO, REPO_B = f"_smoketest_mcp_server_{_TOKEN}", f"_smoketest_mcp_server_b_{_TOKEN}"
 
 
 @pytest.fixture
@@ -31,14 +37,14 @@ def engine():
 
 @pytest.fixture
 def seeded_graph(engine):
-    engine.upsert_repository("_smoketest_mcp_server", "Smoke Test", "/tmp/smoketest")
-    engine.upsert_node("Service", "_smoketest_mcp_server", "TestService", {})
-    engine.upsert_node("Module", "_smoketest_mcp_server", "app.py", {})
+    engine.upsert_repository(REPO, "Smoke Test", "/tmp/smoketest")
+    engine.upsert_node("Service", REPO, "TestService", {})
+    engine.upsert_node("Module", REPO, "app.py", {})
     engine.upsert_relationship(
-        "Module", "app.py", "CONTAINS", "Service", "TestService", "_smoketest_mcp_server"
+        "Module", "app.py", "CONTAINS", "Service", "TestService", REPO
     )
     yield engine
-    engine.delete_repository("_smoketest_mcp_server")
+    engine.delete_repository(REPO)
 
 
 class TestServerBuild:
@@ -121,7 +127,7 @@ class _Registry:
     """The one repository these calls name; no tool here needs its root."""
 
     def get(self, repo_id):
-        if repo_id != "_smoketest_mcp_server":
+        if repo_id != REPO:
             return None
         return type("Record", (), {"repo_id": repo_id, "path": Path(__file__).parent / "no-such-dir"})()
 
@@ -132,7 +138,7 @@ class TestServerToolCall:
         import asyncio
 
         result = asyncio.run(
-            server.call_tool("summarise_repository", {"repo_id": "_smoketest_mcp_server"})
+            server.call_tool("summarise_repository", {"repo_id": REPO})
         )
         assert result.is_error is False
         assert result.structured_content["service_count"] == 1
@@ -144,7 +150,7 @@ class TestServerToolCall:
 
         result = asyncio.run(
             server.call_tool(
-                "search_component", {"repo_id": "_smoketest_mcp_server", "query": "TestService"}
+                "search_component", {"repo_id": REPO, "query": "TestService"}
             )
         )
         assert result.is_error is False
@@ -157,7 +163,7 @@ class TestServerToolCall:
 
     def test_list_recent_changes_via_server(self, seeded_graph):
         seeded_graph.upsert_node(
-            "Service", "_smoketest_mcp_server", "TestService", {"last_modified_at": "2026-01-01T00:00:00"}
+            "Service", REPO, "TestService", {"last_modified_at": "2026-01-01T00:00:00"}
         )
         server = build_server(seeded_graph, _Registry())
         import asyncio
@@ -165,7 +171,7 @@ class TestServerToolCall:
         result = asyncio.run(
             server.call_tool(
                 "list_recent_changes",
-                {"repo_id": "_smoketest_mcp_server", "within_commits": 100},
+                {"repo_id": REPO, "within_commits": 100},
             )
         )
         assert result.is_error is False
@@ -175,8 +181,8 @@ class TestServerToolCall:
         assert "truncated" in payload
 
     def test_cross_repo_scoping_default_false(self, seeded_graph):
-        seeded_graph.upsert_repository("_smoketest_mcp_server_b", "Other", "/tmp/other")
-        seeded_graph.upsert_node("Service", "_smoketest_mcp_server_b", "OtherService", {})
+        seeded_graph.upsert_repository(REPO_B, "Other", "/tmp/other")
+        seeded_graph.upsert_node("Service", REPO_B, "OtherService", {})
 
         server = build_server(seeded_graph, _Registry())
         import asyncio
@@ -184,13 +190,13 @@ class TestServerToolCall:
         try:
             result = asyncio.run(
                 server.call_tool(
-                    "search_component", {"repo_id": "_smoketest_mcp_server", "query": "Service"}
+                    "search_component", {"repo_id": REPO, "query": "Service"}
                 )
             )
             payload = result.structured_content["results"]
-            assert all(item["repo_id"] == "_smoketest_mcp_server" for item in payload)
+            assert all(item["repo_id"] == REPO for item in payload)
         finally:
-            seeded_graph.delete_repository("_smoketest_mcp_server_b")
+            seeded_graph.delete_repository(REPO_B)
 
 
 def test_mcp_startup_does_not_wait_for_the_graph_indexes():
