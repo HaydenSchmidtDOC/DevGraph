@@ -315,6 +315,32 @@ def test_sync_git_history_force_resyncs_even_when_head_unchanged(graph_engine, t
         graph_engine.delete_repository(record.repo_id)
 
 
+def test_sync_git_history_restores_history_after_the_graph_is_wiped(graph_engine, temp_git_repo, registry):
+    """A wiped or replaced graph no longer holds the commit the registry
+    recorded; the next sync must read history again, not report a noop."""
+    repo_id = "_smoketest_sync_wiped"
+    record = registry.add_repo(temp_git_repo, repo_id=repo_id)
+    graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
+
+    try:
+        sync_git_history(graph_engine, registry, record.repo_id)
+
+        # The wipe: the graph loses everything, the registry keeps its HEAD.
+        graph_engine.delete_repository(record.repo_id)
+        graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
+
+        outcome = sync_git_history(graph_engine, registry, record.repo_id)
+        assert outcome["mode"] == "initial"
+        result = graph_engine.run_cypher(
+            "MATCH (c:Commit {repo_id: $repo_id})-[:MODIFIES]->(m:Module {name: 'service.py'}) "
+            "RETURN COUNT(*) as count",
+            {"repo_id": record.repo_id},
+        )
+        assert result[0]["count"] == 1
+    finally:
+        graph_engine.delete_repository(record.repo_id)
+
+
 def test_sync_git_history_unknown_repo_raises(graph_engine, registry):
     with pytest.raises(ValueError):
         sync_git_history(graph_engine, registry, "nonexistent")

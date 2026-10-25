@@ -250,3 +250,24 @@ def test_a_sync_told_to_stop_records_no_head(tmp_path, monkeypatch):
         assert extractor.sync_git_history(engine, registry, repo_id)["mode"] == "initial"
     finally:
         registry.close()
+
+
+def test_a_sync_reads_history_again_when_the_graph_lacks_the_recorded_commit(tmp_path):
+    """The graph was wiped or replaced: the registry's last commit is not in
+    it, so the sync is a first one again, not a noop."""
+    from unittest.mock import MagicMock
+
+    from devgraph.indexer.git_history import extractor
+    from devgraph.registry.store import RepoRegistry
+
+    root = _history(tmp_path, 3)
+    registry = RepoRegistry(tmp_path / "registry.db")
+    try:
+        repo_id = registry.add_repo(root).repo_id
+        assert extractor.sync_git_history(MagicMock(), registry, repo_id)["mode"] == "initial"
+        engine = MagicMock()
+        engine.run_cypher.return_value = []  # no Commit node for the recorded SHA
+        result = extractor.sync_git_history(engine, registry, repo_id)
+        assert result == {"mode": "initial", "commits_indexed": 3, "commits_deleted": 0}
+    finally:
+        registry.close()
