@@ -162,7 +162,10 @@ def test_two_routers_of_one_file_mounted_at_their_prefixes_stay_apart():
     assert _names(code) == ["GET /orders", "GET /users"]
 
 
-def test_a_router_with_a_dynamic_prefix_has_no_routes_and_a_dynamic_mount_is_none():
+def test_a_router_with_a_dynamic_prefix_is_unmounted_and_a_dynamic_mount_is_none():
+    """A prefix read from settings is unknown: the router's routes are the
+    file's own, under no prefix, and no mount from another file renames
+    them (they are no `route_exports`), even mounted on the file's app."""
     code = """
         from fastapi import FastAPI, APIRouter
 
@@ -179,8 +182,12 @@ def test_a_router_with_a_dynamic_prefix_has_no_routes_and_a_dynamic_mount_is_non
             pass
 
         app.include_router(router, prefix=settings.API)
+        app.include_router(dynamic)
     """
-    assert _names(code) == ["GET ?/r/y (app.py)"]
+    assert _names(code) == ["GET ?/r/y (app.py)", "GET ?/x (app.py)"]
+    assert [entry.split(MOUNT_SEP)[0] for entry in _extract(code).route_exports] == [
+        "router"
+    ]
 
 
 def test_mounts_of_imported_routers_are_route_mounts():

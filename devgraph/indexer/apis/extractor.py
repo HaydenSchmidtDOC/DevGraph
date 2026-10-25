@@ -321,7 +321,8 @@ class _Routes:
         """The full prefix of an app's or router's routes: "" for an app's,
         a router's own joined to those of the mounts the file shows
         (`local`) up to an app; None when the file mounts it on no app, or
-        its own prefix is not a literal."""
+        its own prefix is not a literal (its routes are then under none, and
+        no mount renames them: `exports` gives none)."""
         if self._is_app(receiver):
             return ""
         own = self.own.get(receiver, "")
@@ -490,13 +491,12 @@ class APIExtractor:
         deferred: dict[str, set[str]] = {}
         kept: set[str] = set()
         for framework, method, path, handler, owner, receiver in routes.decorator_routes():
-            if routes.own.get(receiver, "") is None:
-                continue  # a router whose own prefix is not a literal
             above = routes.prefix(receiver)
             if above is not None:
                 full = path if above == "" else join_route(above, path)
             else:
-                full = join_route(routes.own.get(receiver, ""), path)
+                # A router whose own prefix is not a literal: under none.
+                full = join_route(routes.own.get(receiver) or "", path)
                 own = unmounted_endpoint(method, full, filename)
                 if exports := routes.exports(receiver):
                     deferred.setdefault(own, set()).update(
