@@ -39,7 +39,7 @@ from devgraph.indexer.dispatch import full_scan, full_scan_elsewhere
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
 from devgraph.indexer.walk import TOO_LARGE, RepoRootUnavailable, check_repo_root, repo_root_problem
-from devgraph.paths import is_within, read_bounded
+from devgraph.paths import is_within, read_bounded, same_directory
 from devgraph.registry.store import RepoRegistry
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
@@ -966,7 +966,7 @@ def _registered_repo_id(root: Path) -> str:
     registry = _get_registry()
     try:
         for repo in registry.list_repos():
-            if Path(repo.path).expanduser().resolve() == target:
+            if same_directory(Path(repo.path).expanduser().resolve(), target):
                 return repo.repo_id
     finally:
         registry.close()

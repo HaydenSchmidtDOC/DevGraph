@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 from pathlib import Path
 
 
@@ -14,6 +15,32 @@ def is_within(resolved_path: Path, root: Path) -> bool:
     not contain `/x/proj-private/...`.
     """
     return resolved_path.is_relative_to(root.resolve())
+
+
+def same_directory(a: Path, b: Path) -> bool:
+    """True if two resolved paths name the same directory.
+
+    macOS's default file system ignores case, and `resolve()` there keeps the
+    case as typed, so two paths that differ only in case are compared on disk.
+    """
+    if a == b:
+        return True
+    if sys.platform != "darwin" or str(a).casefold() != str(b).casefold():
+        return False
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def is_within_directory(resolved_path: Path, resolved_root: Path) -> bool:
+    """`is_within` for two resolved paths, matching the root as `same_directory` does."""
+    if resolved_path.is_relative_to(resolved_root):
+        return True
+    depth = len(resolved_root.parts)
+    if len(resolved_path.parts) < depth:
+        return False
+    return same_directory(Path(*resolved_path.parts[:depth]), resolved_root)
 
 
 #: The largest config file (tools file, schema file, global store) DevGraph reads.

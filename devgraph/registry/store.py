@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from devgraph.paths import same_directory
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS repos (
     repo_id TEXT PRIMARY KEY,
@@ -195,11 +197,10 @@ class RepoRegistry:
             raise ValueError(f"not a git repository: {resolved}")
 
         with self._lock:
-            existing = self._conn.execute(
-                "SELECT repo_id FROM repos WHERE path = ?", (str(resolved),)
-            ).fetchone()
-            if existing:
-                raise ValueError(f"already registered as '{existing[0]}': {resolved}")
+            rows = self._conn.execute("SELECT repo_id, path FROM repos").fetchall()
+            for existing, stored in rows:
+                if same_directory(Path(stored), resolved):
+                    raise ValueError(f"already registered as '{existing}': {resolved}")
 
             candidate = _slugify(repo_id or resolved.name)
             final_id = candidate
