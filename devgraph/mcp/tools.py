@@ -132,16 +132,41 @@ _ENDPOINT_FIELDS = (
 )
 
 
+def _capped_endpoints(pairs: str) -> str:
+    """Cypher binding `endpoint_count` and `endpoints` from `pairs`, a list of
+    {e, file} maps (an Endpoint and the file of a target it reaches): how many
+    distinct Endpoints there are, and the first `$max_results` of them by
+    repository and name, as `_ENDPOINT_FIELDS` maps them plus `target_files`
+    (their targets' files). Only those leave the database, however many
+    routes a shared helper is under."""
+    fields = _ENDPOINT_FIELDS[:-1] + ", target_files: target_files}"
+    return f"""CALL ({pairs}) {{
+  UNWIND {pairs} AS p
+  WITH p.e AS e, collect(p.file) AS target_files
+  ORDER BY e.repo_id, e.name
+  WITH collect({{e: e, target_files: target_files}}) AS ranked
+  RETURN size(ranked) AS endpoint_count, ranked[..$max_results] AS shown
+}}
+CALL (shown) {{
+  UNWIND shown AS s
+  WITH s.e AS e, s.target_files AS target_files
+  {_ENDPOINT_DETAILS}
+  RETURN collect({fields}) AS endpoints
+}}
+"""
+
+
 def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     """Cypher continuing from `WITH collect(n) AS l0` (the changed nodes): one
     CALL per hop collecting the distinct nodes with a CALLS/USES/DEPENDS_ON edge
     into the previous hop's nodes, never one seen at an earlier hop, then
     returning `direct_dependents` (hop 1), `transitive_dependents` (hops 2 to
     `IMPACT_MAX_DEPTH`), `direct_count`, `matched` (the changed nodes' {name, file, owner})
-    and `endpoints`: the Endpoints that IMPLEMENTS a changed node or a dependent
-    (an API route reaches its handler that way, one step past it), as
-    `_ENDPOINT_FIELDS` maps; they are not dependents, so `direct_count` leaves
-    them out. `with_ids` adds each dependent's `id` (its elementId).
+    and `endpoint_nodes`: the Endpoints that IMPLEMENTS a changed node or a
+    dependent (an API route reaches its handler that way, one step past it),
+    which `_capped_endpoints` reads; they are not dependents, so
+    `direct_count` leaves them out. `with_ids` adds each dependent's `id` (its
+    elementId).
 
     Expanding distinct nodes hop by hop does work proportional to the nodes
     and edges within reach; a variable-length path enumerates every path, which
@@ -161,8 +186,8 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     endpoint_scope = _cross_scope("e", "AND") if cross_repo else "AND e.repo_id = $repo_id"
     parts.append(
         f"CALL ({', '.join(levels)}) {{ UNWIND {' + '.join(levels)} AS m "
-        f"MATCH (e:Endpoint)-[:IMPLEMENTS]->(m) WHERE true {endpoint_scope} WITH DISTINCT e "
-        f"{_ENDPOINT_DETAILS} RETURN collect({_ENDPOINT_FIELDS}) AS endpoints }}"
+        f"MATCH (e:Endpoint)-[:IMPLEMENTS]->(m) WHERE true {endpoint_scope} "
+        "RETURN collect(DISTINCT e) AS endpoint_nodes }"
     )
     transitive = " + ".join(f"l{k}" for k in range(2, IMPACT_MAX_DEPTH + 1))
     ref = (
@@ -173,7 +198,7 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
         f"RETURN [d IN l1 | {ref}] AS direct_dependents, "
         f"[d IN {transitive} | {ref}] AS transitive_dependents, "
         "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched, "
-        "endpoints"
+        "endpoint_nodes"
     )
     return "\n".join(parts)
 
@@ -1755,18 +1780,18 @@ def find_callers(
     {recency_filter}
     AND ($file IS NULL OR target.file = $file)
     AND {_OWNER_MATCH.replace("n.", "target.")}
-    WITH DISTINCT e
-    {_ENDPOINT_DETAILS}
-    RETURN {_ENDPOINT_FIELDS} AS endpoint
+    WITH collect({{e: e, file: target.file}}) AS pairs
+    {_capped_endpoints("pairs")}
+    RETURN endpoint_count, endpoints
     """
-    routed_by = [row["endpoint"] for row in _query(engine, routes, params)]
+    routed_by = next(iter(_query(engine, routes, {**params, "max_results": max_results})), None)
     results, more = _list_query(engine, cypher, params)
     results = [_located(row) for row in results]
     if ambiguous:
         results = [_with_target_files(row, row["target_files"]) for row in results]
     envelope = _capped_envelope(results, more, max_results)
     envelope["test_count"] = tests[0]["tests"] if tests else 0
-    envelope["routed_by"] = _endpoints_envelope(routed_by, max_results)
+    envelope["routed_by"] = _endpoints_envelope(routed_by or {"endpoint_count": 0, "endpoints": []}, max_results)
     if ambiguous:
         envelope["ambiguous_targets"] = ambiguous
     return envelope
@@ -2118,20 +2143,27 @@ def impact_analysis(
     CALL (l0) {{
     {_impact_expansion(cross_repo, with_ids=split)}
     }}
-    RETURN target_file, direct_dependents, transitive_dependents, direct_count, endpoints
-    ORDER BY target_file
+    WITH collect({{target_file: target_file, direct_dependents: direct_dependents,
+                  transitive_dependents: transitive_dependents, direct_count: direct_count}}) AS rows,
+         collect([e IN endpoint_nodes | {{e: e, file: target_file}}]) AS nested
+    WITH rows, reduce(acc = [], each IN nested | acc + each) AS pairs
+    {_capped_endpoints("pairs")}
+    RETURN rows, endpoint_count, endpoints
     """
-    params = {"component_name": component_name, "file": file, "owner": owner, "split": split}
+    params = {
+        "component_name": component_name, "file": file, "owner": owner, "split": split, "max_results": max_results,
+    }
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = _query(engine, cypher, params)
+    (answer_row,) = _query(engine, cypher, params)
+    results = sorted(answer_row["rows"], key=lambda r: r["target_file"] or "")
     if not split:
         row = results[0]
         answer = {
             "direct_dependents": dependents_envelope([_located(d) for d in row["direct_dependents"]]),
             "transitive_dependents": dependents_envelope([_located(d) for d in row["transitive_dependents"]]),
-            "endpoints": _endpoints_envelope(row["endpoints"], max_results),
+            "endpoints": _endpoints_envelope(answer_row, max_results),
             "risk_level": _risk_level(row["direct_count"]),
         }
         if ambiguous:
@@ -2159,7 +2191,7 @@ def impact_analysis(
     }
     return {
         **{key: dependents_envelope(rows) for key, rows in lists.items()},
-        "endpoints": _endpoints_envelope([e for row in results for e in row["endpoints"]], max_results),
+        "endpoints": _endpoints_envelope(answer_row, max_results),
         "risk_level": _risk_level(max(row["direct_count"] for row in results)),
         "ambiguous_targets": ambiguous,
     }
@@ -2169,11 +2201,14 @@ def _risk_level(direct_count: int) -> str:
     return "high" if direct_count > 10 else "medium" if direct_count > 3 else "low"
 
 
-def _endpoints_envelope(rows: list[dict[str, Any]], max_results: int) -> dict[str, Any]:
-    """The distinct Endpoints of `rows` (`_ENDPOINT_FIELDS`), each as list_endpoints
-    lists it, ordered by repository and name, in a {count, results, truncated} envelope."""
-    distinct = {(row["repo_id"], row["name"]): row for row in rows}
-    return _envelope([_endpoint_row(distinct[key]) for key in sorted(distinct)], max_results)
+def _endpoints_envelope(row: dict[str, Any], max_results: int) -> dict[str, Any]:
+    """A {count, results, truncated} envelope of the Endpoints `_capped_endpoints`
+    read into `row`, each as list_endpoints lists it, ordered by repository and name."""
+    shown = sorted(row["endpoints"], key=lambda e: (e["repo_id"], e["name"]))
+    envelope = _envelope([_endpoint_row(e) for e in shown], max_results)
+    envelope["count"] = row["endpoint_count"]
+    envelope["truncated"] = row["endpoint_count"] > len(envelope["results"])
+    return envelope
 
 
 _DIFF_TARGETS_CYPHER = """
@@ -2321,10 +2356,19 @@ def impact_analysis_for_diff(
         )
     files = list(dict.fromkeys(f for paths in fallback.values() for f in paths))
 
-    row = {"direct_dependents": [], "transitive_dependents": [], "direct_count": 0, "matched": [], "endpoints": []}
+    row = {
+        "direct_dependents": [], "transitive_dependents": [], "direct_count": 0, "matched": [],
+        "endpoint_count": 0, "endpoints": [],
+    }
     if targets or files:
-        cypher = _DIFF_TARGETS_CYPHER + _impact_expansion(cross_repo)
-        rows = _query(engine, cypher, {"repo_id": repo_id, "targets": targets, "files": files})
+        cypher = (
+            f"CALL () {{\n{_DIFF_TARGETS_CYPHER}{_impact_expansion(cross_repo)}\n}}\n"
+            "WITH *, [e IN endpoint_nodes | {e: e, file: null}] AS pairs\n"
+            f"{_capped_endpoints('pairs')}"
+            "RETURN direct_dependents, transitive_dependents, direct_count, matched, endpoint_count, endpoints"
+        )
+        params = {"repo_id": repo_id, "targets": targets, "files": files, "max_results": max_results}
+        rows = _query(engine, cypher, params)
         if rows:
             row = rows[0]
     found = {(m["name"], m["file"], m["owner"]) for m in row["matched"]}
@@ -2345,7 +2389,7 @@ def impact_analysis_for_diff(
         "changed_components": sorted({m["name"] for m in row["matched"] if m["name"] is not None}),
         "direct_dependents": _envelope([_located(d) for d in row["direct_dependents"]], max_results),
         "transitive_dependents": _envelope([_located(d) for d in row["transitive_dependents"]], max_results),
-        "endpoints": _endpoints_envelope(row["endpoints"], max_results),
+        "endpoints": _endpoints_envelope(row, max_results),
         "risk_level": _risk_level(row["direct_count"]),
         "truncated": bool(reasons),
         "truncated_reasons": list(reasons),
