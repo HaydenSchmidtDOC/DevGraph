@@ -339,6 +339,42 @@ def test_a_class_based_view_is_its_class(engine, repo_id, tmp_path):
     incremental_equals_fresh(engine, repo_id, tmp_path)
 
 
+def test_a_class_based_view_of_the_route_file_is_its_own(engine, repo_id, tmp_path):
+    write(tmp_path, "shop/urls.py", """\
+        from django.urls import path
+
+
+        class LocalView:
+            def get(self, request):
+                return None
+
+
+        urlpatterns = [path("local/", LocalView.as_view())]
+    """)
+    write(tmp_path, "other/x.py", "class LocalView:\n    def get(self, request):\n        return 1\n")
+    _scan(engine, repo_id, tmp_path)
+    handlers = sorted(
+        (row["label"], row["name"], row["file"] or "", row["owner"])
+        for row in engine.run_cypher(
+            "MATCH (:Endpoint {repo_id: $r, name: '* local/'})-[:IMPLEMENTS]->(f) "
+            "RETURN labels(f)[0] AS label, f.name AS name, f.file AS file, f.owner AS owner",
+            {"r": repo_id},
+        )
+    )
+    assert handlers == [
+        ("Class", "LocalView", "shop/urls.py", ""),
+        ("Function", "LocalView", "", None),
+        ("Function", "get", "shop/urls.py", "LocalView"),
+    ]
+    found = describe_node(engine, repo_id, "LocalView", file="shop/urls.py")
+    assert found["status"] == "found" and found["node"]["label"] == "Class"
+    both = describe_node(engine, repo_id, "LocalView")
+    assert sorted((c["label"], c.get("file")) for c in both["candidates"]) == [
+        ("Class", "other/x.py"), ("Class", "shop/urls.py"),
+    ]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
 def test_a_moved_or_renamed_class_based_view_equals_fresh(engine, repo_id, tmp_path):
     from devgraph.indexer.dispatch import remove_paths
 

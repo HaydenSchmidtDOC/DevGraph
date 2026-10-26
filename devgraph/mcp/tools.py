@@ -401,8 +401,8 @@ def _fold_target(var: str, out: str = "folded") -> str:
     (a file-less Function), and for a stub that stands for no single Function.
     A stub stands for the one Function (or Class: a Django class-based view's)
     of its name its endpoint's handler reference resolved to (both implement
-    one Endpoint), or, when it resolved to none, the one Function of its name
-    in the route files that claim the stub (its `sources`). Always one row:
+    one Endpoint), or, when it resolved to none, the one Function or Class of
+    its name in the route files that claim the stub (its `sources`). Always one row:
     the aggregation has no grouping key. Tools answer with that Function or
     Class and leave the stub out; a stub that stands for none stays visible
     (an unresolved handler)."""
@@ -411,9 +411,9 @@ def _fold_target(var: str, out: str = "folded") -> str:
     return (
         f"CALL ({var}) {{ WITH {var} WHERE {var}:Function AND coalesce({var}.file, '') = '' "
         f"CALL ({var}) {{ MATCH (twin:Function) WHERE {twin} RETURN twin "
-        f"UNION MATCH (twin:Class) WHERE {twin} AND {linked} RETURN twin }} "
-        f"WITH twin, {linked} AS linked, "
-        f"twin:Function AND twin.file IN coalesce({var}.sources, []) AS local "
+        f"UNION MATCH (twin:Class) WHERE {twin} AND ({linked} OR twin.file IN coalesce({var}.sources, [])) "
+        "RETURN twin } "
+        f"WITH twin, {linked} AS linked, twin.file IN coalesce({var}.sources, []) AS local "
         "WITH collect(CASE WHEN linked THEN twin END) AS linked, collect(CASE WHEN local THEN twin END) AS local "
         f"RETURN CASE WHEN size(linked) = 1 THEN linked[0] WHEN size(linked) = 0 AND size(local) = 1 THEN local[0] "
         f"END AS {out} }}\n"

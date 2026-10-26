@@ -1199,8 +1199,10 @@ answer showed as an unresolved handler beside the `Class`
   function view is (graph-accuracy spec R3): `views.X` with `from . import
   views` is `<dir>/views.py`'s or `views/__init__.py`'s, a from-imported
   `X` its module's (under the name it imports, an alias's too, which the
-  stub now also takes). A bare name nothing imports links every `Class`
-  of its name, unpinned, and the stub.
+  stub now also takes). A bare name nothing imports is the route file's
+  own top-level class when it defines one, pinned to that file; any other
+  (a star import's) links every `Class` of its name, unpinned, and the
+  stub.
 - **Its HTTP method handlers.** The same pins also link the class's
   methods (owner the class) that serve the route: Django's
   `View.http_method_names` (`get`, `post`, `put`, `patch`, `delete`,
@@ -1209,13 +1211,13 @@ answer showed as an unresolved handler beside the `Class`
   method links when the class defines it or inherits it from a class of
   its own file (an owned pin's heir keys, index format 18); one inherited
   from Django itself or from another file has no node of the class and
-  links nothing. A bare-name view links no method: an unpinned owner
-  would match every class's. The Class alone would leave
+  links nothing. An unpinned bare-name view links no method: an unpinned
+  owner would match every class's. The Class alone would leave
   `trace_request_flow` to reach the code through `CONTAINS`; the methods
   say which code serves a request and put it in `list_endpoints`.
 - **Folding.** `_fold_target` folds a stub into the one Function or Class
-  of its name that its Endpoint also implements; the route-file fallback
-  stays Function-only. `describe_node` of the Class lists its stubs'
+  of its name that its Endpoint also implements, else the one Function or
+  Class of its name in its route files. `describe_node` of the Class lists its stubs'
   relationships as its own (`_FOLDED_STUBS`), and `list_endpoints` gives
   each handler's `label`.
 - **DRF.** `APIView.as_view()` is the same shape. A ViewSet registered on

@@ -162,6 +162,7 @@ class _Routes:
         self.imports: set[str] = set()  # "FastAPI", "Flask": the frameworks the file imports
         self.decorated: list[tuple[Node, str, str]] = []  # (decorator call, handler, handler owner)
         self.calls: list[Node] = []
+        self.classes: set[str] = set()  # the file's top-level classes
         # Iterative, in source order: a deeply nested expression (3,000 `+`
         # terms) is read on any thread's stack.
         pending: list[tuple[Node, str, str | None, str]] = [(root, "Module", None, "")]
@@ -201,6 +202,8 @@ class _Routes:
                         self.decorated.append((target, _text(handler, source), member_owner(label, name, owner)))
         if node.type in ("class_definition", "function_definition"):
             name_node = node.child_by_field_name("name")
+            if name_node is not None and node.type == "class_definition" and label == "Module":
+                self.classes.add(_text(name_node, source))
             if name_node is not None:
                 owner = member_owner(label, name, owner)
                 label = "Class" if node.type == "class_definition" else "Function"
@@ -299,6 +302,7 @@ _HTTP_METHOD_HANDLERS = ("get", "post", "put", "patch", "delete", "head", "optio
 
 def _django_implements(
     endpoint_id: str, view: str, written: str, bindings, methods: tuple[str, ...] | None = None,
+    filename: str = "", classes: frozenset[str] | set[str] = frozenset(),
 ) -> tuple[str, list[Relationship]]:
     """A Django route's view name and IMPLEMENTS edges: the file-less handler
     stub (named as the view is where it is defined: a from-import's alias
@@ -308,10 +312,13 @@ def _django_implements(
     `from . import views` is `<dir>/views.py`'s `search`, a from-imported
     `search` its module's. A class-based view (`methods` not None) is the
     top-level Class there instead, with its `methods` there (owner the
-    class) that it defines itself or inherits from a class of its file. A
-    view read off a module nothing imports links nothing but the stub; a
-    bare name nothing imports (a view of the file itself, a star import's)
-    links every function (or class) of its name, as before, and no method."""
+    class) that it defines itself or inherits from a class of its file; a
+    bare class-based view nothing imports that is a top-level class of the
+    route's own `filename` (one of its `classes`) is that file's. A view
+    read off a module nothing imports links nothing but the stub; any other
+    bare name nothing imports (a star import's, a function of the file
+    itself) links every function (or class) of its name, as before, and
+    no method."""
     head = written.split(".")[0] if "." in written else None
     label = "Function" if methods is None else "Class"
     pins: list[str] | None = None
@@ -327,6 +334,8 @@ def _django_implements(
             pins = []  # unresolved: the stub alone
     elif (symbol := bindings.symbols.get(written)) is not None:
         view, pins = symbol.name, symbol.module.files()
+    elif methods is not None and written in classes:
+        pins = [filename]
 
     def implements(target_label, target_name, to_file=None, to_owner=None):
         return Relationship(
@@ -388,7 +397,9 @@ class APIExtractor:
         django = routes.django_routes()
         bindings = _extract_imports(root, source, filename, roots) if django else None
         for pattern, view, written, methods in django:
-            view, implements = _django_implements(f"* {pattern}", view, written, bindings, methods)
+            view, implements = _django_implements(
+                f"* {pattern}", view, written, bindings, methods, filename, routes.classes,
+            )
             # Django's urls.py names no HTTP method (the view handles each).
             self._add(result, "Django", "*", pattern, view, filename, "view")
             result.relationships += implements

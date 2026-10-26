@@ -581,3 +581,23 @@ urlpatterns = [
 
 
 _API_VIEWS = ("api/views.py", "api/views/__init__.py", "shop/api/views.py", "shop/api/views/__init__.py")
+
+
+def test_a_class_based_view_of_the_route_file_is_pinned_to_it():
+    code = '''
+from django.urls import path
+
+
+class LocalView:
+    def get(self, request):
+        return None
+
+
+urlpatterns = [path("local/", LocalView.as_view({"get": "get"}))]
+'''
+    result = APIExtractor("repo").extract_from_source(code, "shop/urls.py")
+    assert sorted((r.target_label, r.target_name, r.to_file, r.to_owner) for r in result.relationships) == [
+        ("Class", "LocalView", "shop/urls.py", ""),
+        ("Function", "LocalView", "", None),
+        ("Function", "get", "shop/urls.py", "LocalView"),
+    ]
