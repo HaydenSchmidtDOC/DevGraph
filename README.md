@@ -194,7 +194,7 @@ Every indexable file becomes a `File` node and every directory containing one a 
 Two terms first:
 
 - **Declarative provider**: a way to fill a node type from data DevGraph already reads, described entirely in `devgraph.schema.yaml` (or the Config page form). You say which files to look at and which values to copy; DevGraph never runs code from the repository to do it. The filesystem provider above is one; the docs source is the second.
-- **Docs source**: a node type with `source: {provider: docs, ...}`. Each matching Markdown file becomes one node (for a type keyed on an id, only the file that owns the id: a file missing the id, or using one another file keeps, is left out), filled from its *front matter*: the block between two `---` lines at the very top of the file.
+- **Docs source**: a node type with `source: {provider: docs, ...}`. Each matching Markdown file becomes one node (for a type keyed on an id, only the file that owns the id: a file missing the id, or using one another file keeps, is left out), filled from its *front matter*: the block between two `---` lines at the very top of the file (after a UTF-8 byte-order mark, if the editor wrote one; so for `devgraph annotate` notes).
 
 #### Example: runbooks linked to the services they cover
 

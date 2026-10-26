@@ -36,7 +36,9 @@ _TYPE_TO_LABEL = {
 #: Every label a docs note is written with.
 DOC_NOTE_LABELS = tuple(_TYPE_TO_LABEL.values())
 
-_FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
+#: Front matter, after a UTF-8 byte-order mark if there is one (Visual
+#: Studio and PowerShell 5's `-Encoding UTF8` write one; decoding keeps it).
+_FRONTMATTER_RE = re.compile(r"\A\ufeff?---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
 
 
 @dataclass
