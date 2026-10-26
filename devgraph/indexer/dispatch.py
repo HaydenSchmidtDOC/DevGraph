@@ -232,7 +232,9 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: or a variable holds, its routes under the mount's prefix; C# top-level
 #: statements' local functions as top-level Functions, and a minimal-API
 #: handler resolved as a call to it (another file's class's method), and
-#: ASP.NET `MapMethods` routes.
+#: ASP.NET `MapMethods` routes; Spring mappings declared on an interface,
+#: implemented by the methods of the controllers implementing it (their
+#: `mkeys`, apis/routes.py `spring_interface_pins`).
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 21
 

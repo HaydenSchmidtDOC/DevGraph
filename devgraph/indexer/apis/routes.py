@@ -28,8 +28,9 @@ file mounts is then named by those mounts (`MountTable`, below).
 
 from __future__ import annotations
 
+from devgraph.graph.schema import scoped_pin
 from devgraph.indexer.calls import call_rows
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship
+from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, owned_pin
 
 #: Spring's mapping annotations and the method each maps (None: RequestMapping's `method`).
 SPRING_MAPPINGS: dict[str, str | None] = {
@@ -37,6 +38,9 @@ SPRING_MAPPINGS: dict[str, str | None] = {
     "PatchMapping": "PATCH", "RequestMapping": None,
 }
 SPRING_CONTROLLERS = frozenset({"RestController", "Controller"})
+#: The Java and Kotlin files, vendored code and test roots left out, an
+#: interface's routes are implemented in (`spring_interface_pins`).
+_SPRING_SOURCES = "/.?.java,.kt^t"
 
 
 def join_route(*parts: str) -> str:
@@ -105,15 +109,20 @@ def add_route(
 def spring_routes(
     class_annotations: dict[str, dict[str, list[str] | None]],
     method_annotations: dict[str, dict[str, list[str] | None]],
+    interface: bool = False,
 ) -> list[tuple[str, str]]:
-    """The (method, path) pairs a Spring controller method maps.
+    """The (method, path) pairs a Spring controller method maps, or with
+    `interface` an interface's method (the OpenAPI-generator pattern, see
+    `spring_interface_pins`; a Feign client's are no routes).
 
     Each annotation is given as its arguments: `value` (the positional one,
     or `value=`/`path=`) as its literal strings, None when one of them is
     not a literal, absent when not given; `method` as the RequestMethod
     names. The class's RequestMapping paths prefix the method's; a
     RequestMapping with no `method` maps every method ("*")."""
-    if not SPRING_CONTROLLERS & set(class_annotations):
+    if interface and "FeignClient" in class_annotations:
+        return []  # a client's declaration of another service's routes
+    if not interface and not SPRING_CONTROLLERS & set(class_annotations):
         return []
     prefixes = class_annotations.get("RequestMapping", {}).get("value", [""])
     routes: list[tuple[str, str]] = []
@@ -127,6 +136,20 @@ def spring_routes(
         methods = [http_method] if http_method else sorted(args.get("method") or ["*"])
         routes += [(each, join_route(prefix, path)) for prefix in prefixes for path in paths for each in methods]
     return routes
+
+
+def spring_implementer_key(interface: str) -> str:
+    """The match key (`mkeys`) a controller class's methods carry for each
+    interface it implements, by the interface's simple name."""
+    return f"spring:{interface}"
+
+
+def spring_interface_pins(file_path: str, owner: str, interface: str) -> set[str]:
+    """Where the handler of a route an interface `interface` (its members'
+    owner `owner`) of `file_path` maps is: the interface's own method, and
+    the same-named method of every controller class implementing it, in
+    any file (`spring_implementer_key`)."""
+    return {owned_pin(file_path, owner), scoped_pin(_SPRING_SOURCES, [spring_implementer_key(interface)])}
 
 
 # --- Express, FastAPI and Flask routers another file mounts -------------------

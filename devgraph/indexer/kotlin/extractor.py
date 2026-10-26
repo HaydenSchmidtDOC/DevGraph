@@ -65,7 +65,13 @@ from pathlib import Path
 import tree_sitter_kotlin as tskotlin
 from tree_sitter import Language, Node, Parser, Range
 
-from devgraph.indexer.apis.routes import add_route, spring_routes
+from devgraph.indexer.apis.routes import (
+    SPRING_CONTROLLERS,
+    add_route,
+    spring_implementer_key,
+    spring_interface_pins,
+    spring_routes,
+)
 from devgraph.indexer.calls import (
     STOP_METHODS,
     STOP_TYPES,
@@ -831,7 +837,11 @@ def _annotations(node: Node, source: bytes) -> dict[str, dict[str, list[str] | N
 
 def _spring_routes(top_level: list[Node], source: bytes, result: ExtractionResult, file_path: str, repo_id: str) -> None:
     """A Spring controller's mapped functions as Endpoints (apis/routes.py),
-    each implemented by its function, owned by its class."""
+    each implemented by its function, owned by its class; an interface's
+    mapped functions too, implemented by its function and each implementing
+    controller's (`spring_interface_pins`), whose functions carry a match
+    key (`spring_implementer_key`) for each of its class's supertypes."""
+    keys: dict[tuple[str, str], set[str]] = {}
 
     def walk(nodes: list[Node], classes: list[str]) -> None:
         for node in nodes:
@@ -841,15 +851,25 @@ def _spring_routes(top_level: list[Node], source: bytes, result: ExtractionResul
                 continue
             inner = [_text(name, source), *classes]
             mapped = _annotations(node, source)
+            interface = _child_of_type(node, "interface") is not None
+            supertypes = _extract_supertype_names(node, source) if SPRING_CONTROLLERS & set(mapped) else []
             for member in body.named_children:
                 function = member.child_by_field_name("name")
                 if member.type == "function_declaration" and function is not None:
-                    for http_method, path in spring_routes(mapped, _annotations(member, source)):
+                    pins = spring_interface_pins(file_path, _owner_of(inner), inner[0]) if interface else None
+                    for http_method, path in spring_routes(mapped, _annotations(member, source), interface):
                         add_route(result, repo_id, file_path, "Spring", http_method, path, _text(function, source),
-                                  _owner_of(inner))
+                                  _owner_of(inner), pins)
+                    if supertypes:
+                        keys.setdefault((_text(function, source), _owner_of(inner)), set()).update(
+                            spring_implementer_key(each) for each in supertypes
+                        )
             walk(body.named_children, inner)
 
     walk(top_level, [])
+    for node in result.nodes:
+        if node.label == "Function" and (found := keys.get((node.name, node.properties.get("owner")))):
+            node.properties["mkeys"] = sorted(found)
 
 
 def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
